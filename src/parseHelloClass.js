@@ -94,7 +94,6 @@ function buildReferenceMap(ast) {
                     referenceMap[referencedClass] = [];
                   }
                   referenceMap[referencedClass].push({
-                    instruction: codeItem.instruction,
                     context: `${className}.${methodName}`,
                     index: index
                   });
@@ -112,6 +111,23 @@ function buildReferenceMap(ast) {
 
 const referenceMap = buildReferenceMap(convertedAst);
 console.log("Reference Map:", JSON.stringify(referenceMap, null, 2));
+
+// Iterate over the reference map and print the instruction using context and index
+Object.entries(referenceMap).forEach(([referencedClass, references]) => {
+  references.forEach(({ context, index }) => {
+    const [className, methodName] = context.split('.');
+    const cls = convertedAst.classes.find(c => c.className === className);
+    if (cls) {
+      const method = cls.items.find(item => item.type === "method" && item.method.name === methodName);
+      if (method) {
+        const instruction = method.method.attributes
+          .find(attr => attr.type === "code")
+          .code.codeItems[index].instruction;
+        console.log(`In ${context}, instruction at index ${index}:`, instruction);
+      }
+    }
+  });
+});
 
 // Find and attempt to load all class references with context
 const classReferencesWithContext = findClassReferencesWithContext(convertedAst);
