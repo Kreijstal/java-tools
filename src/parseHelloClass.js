@@ -32,6 +32,19 @@ function findClassReferences(ast) {
                   const className = arg[1];
                   classReferences.add(className);
                 }
+                // Parse method descriptor to include return and parameter types
+                const descriptor = codeItem.instruction.arg[2][1];
+                const referencedClasses = parseDescriptor(descriptor);
+                referencedClasses.forEach((referencedClass) => {
+                  if (!referenceMap[referencedClass]) {
+                    referenceMap[referencedClass] = [];
+                  }
+                  referenceMap[referencedClass].push({
+                    context: `${className}.${methodName}`,
+                    index: index,
+                    partIndex: 'descriptor' // Indicate it's from the descriptor
+                  });
+                });
               }
             });
           }
@@ -71,6 +84,16 @@ function findClassReferencesWithContext(ast) {
   });
 
   return classReferences;
+}
+
+function parseDescriptor(descriptor) {
+  const regex = /L([^;]+);/g;
+  const matches = [];
+  let match;
+  while ((match = regex.exec(descriptor)) !== null) {
+    matches.push(match[1].replace(/\./g, "/"));
+  }
+  return matches;
 }
 
 function buildReferenceMap(ast) {
