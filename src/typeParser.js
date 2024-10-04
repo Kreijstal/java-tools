@@ -46,22 +46,12 @@ function parseDescriptor(descriptor) {
     return { params, returnType };
   }
 
-  const methodDescriptor = parseMethodDescriptor(descriptor);
-  const classNames = [];
-
-  // Collect class names from parameter types
-  methodDescriptor.params.forEach(param => {
-    if (param.includes('/')) {
-      classNames.push(param.replace(/\./g, '/'));
-    }
-  });
-
-  // Collect class name from return type
-  if (methodDescriptor.returnType.includes('/')) {
-    classNames.push(methodDescriptor.returnType.replace(/\./g, '/'));
+  if (descriptor.startsWith('(')) {
+    return parseMethodDescriptor(descriptor);
+  } else {
+    const { type } = parseType(descriptor, 0);
+    return [type];
   }
-
-  return classNames;
 }
 
 function descriptorToString(descriptorAST) {
