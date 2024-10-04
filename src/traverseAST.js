@@ -17,11 +17,11 @@ const convertedAst = convertJson(ast.ast, ast.constantPool);
 
 function traverseAST(ast) {
   ast.classes.forEach((cls) => {
-    console.log(`Class reference found: ${cls.className}`);
+    console.log(`Class reference found at path ${path.join('.')}: ${cls.className}`);
     cls.items.forEach((item) => {
       if (item.type === "method") {
         const methodName = item.method.name;
-        console.log(`Method reference found: ${methodName}`);
+        console.log(`Method reference found at path ${path.join('.')}: ${methodName}`);
         const descriptorAST = parseDescriptor(item.method.descriptor);
         const referencedClasses = Array.isArray(descriptorAST)
           ? descriptorAST
@@ -39,7 +39,7 @@ function traverseAST(ast) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg) && arg.length > 1) {
                   const className = arg[1];
-                  console.log(`Class reference found in instruction: ${className}`);
+                  console.log(`Class reference found in instruction at path ${path.join('.')}: ${className}`);
                 }
                 if (Array.isArray(arg) && arg.length > 2) {
                   const descriptor = arg[2][1];
