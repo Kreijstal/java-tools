@@ -201,11 +201,38 @@ const newarrayTypes = [
   "long"
 ];
 
-function traverseAndPrintTypes(node, path = []) {
+function traverseAndPrintTypes(node, path = [], context = '') {
   if (typeof node === 'object' && node !== null) {
     for (const [key, value] of Object.entries(node)) {
-      if (key === 'className' || key === 'descriptor') {
+      if (key === 'className') {
         console.log(`Type found at ${path.join('.')}: ${value}`);
+        if (!referenceMap[value]) {
+          referenceMap[value] = [];
+        }
+        referenceMap[value].push({
+          context,
+          index: path[path.length - 1],
+          partIndex: 'className'
+        });
+      }
+      if (key === 'descriptor') {
+        const descriptorAST = parseDescriptor(value);
+        const referencedClasses = Array.isArray(descriptorAST)
+          ? descriptorAST
+          : [...descriptorAST.params, descriptorAST.returnType];
+        referencedClasses
+          .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
+          .forEach(referencedClass => {
+            console.log(`Type found at ${path.join('.')}: ${referencedClass}`);
+            if (!referenceMap[referencedClass]) {
+              referenceMap[referencedClass] = [];
+            }
+            referenceMap[referencedClass].push({
+              context,
+              index: path[path.length - 1],
+              partIndex: 'descriptor'
+            });
+          });
       }
       if (key === 'instruction' && value && value.op) {
         if (refOrTaggedConstInstructions.includes(value.op) || ldcInstructions.includes(value.op)) {
@@ -227,11 +254,11 @@ function traverseAndPrintTypes(node, path = []) {
           }
         }
       }
-      traverseAndPrintTypes(value, [...path, key]);
+      traverseAndPrintTypes(value, [...path, key], context);
     }
   } else if (Array.isArray(node)) {
     node.forEach((item, index) => {
-      traverseAndPrintTypes(item, [...path, index]);
+      traverseAndPrintTypes(item, [...path, index], context);
     });
   }
 }
