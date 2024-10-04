@@ -176,24 +176,6 @@ Object.entries(referenceMap).forEach(([referencedClass, references]) => {
   });
 });
 
-console.log("Reference Map:", JSON.stringify(referenceMap, null, 2));
-
-// Iterate over the reference map and print the instruction using context and index
-Object.entries(referenceMap).forEach(([referencedClass, references]) => {
-  references.forEach(({ context, index, partIndex }) => {
-    const [className, methodName] = context.split('.');
-    const cls = convertedAst.classes.find(c => c.className === className);
-    if (cls) {
-      const method = cls.items.find(item => item.type === "method" && item.method.name === methodName);
-      if (method) {
-        const instruction = method.method.attributes
-          .find(attr => attr.type === "code")
-          .code.codeItems[index].instruction;
-        console.log(`In ${context}, instruction at index ${index}:`, JSON.stringify(instruction, null, 2));
-      }
-    }
-  });
-});
 
 const refOrTaggedConstInstructions = [
   "getfield",
