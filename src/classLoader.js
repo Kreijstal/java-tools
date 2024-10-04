@@ -12,25 +12,30 @@ function loadClass(className, classPath) {
     return null;
   }
 
-  // Construct the class file path
-  const classFilePath = path.join(classPath, `${className.replace(/\./g, '/')}.class`);
+  // Split the class path by ';' to handle multiple paths
+  const classPaths = classPath.split(';');
 
-  // Check if the class file exists
-  if (!fs.existsSync(classFilePath)) {
-    console.error(`Class file not found: ${classFilePath}`);
-    return null;
+  for (const cp of classPaths) {
+    // Construct the class file path
+    const classFilePath = path.join(cp, `${className.replace(/\./g, '/')}.class`);
+
+    // Check if the class file exists
+    if (fs.existsSync(classFilePath)) {
+      // Read the class file content
+      const classFileContent = fs.readFileSync(classFilePath);
+
+      // Generate the AST
+      const ast = getAST(new Uint8Array(classFileContent));
+
+      // Convert the AST
+      const convertedAst = convertJson(ast.ast, ast.constantPool);
+
+      return convertedAst;
+    }
   }
 
-  // Read the class file content
-  const classFileContent = fs.readFileSync(classFilePath);
-
-  // Generate the AST
-  const ast = getAST(new Uint8Array(classFileContent));
-
-  // Convert the AST
-  const convertedAst = convertJson(ast.ast, ast.constantPool);
-
-  return convertedAst;
+  console.error(`Class file not found for class: ${className}`);
+  return null;
 }
 
 module.exports = { loadClass };
