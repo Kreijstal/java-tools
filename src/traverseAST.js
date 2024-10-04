@@ -144,5 +144,18 @@ function addSelfReferences(referenceObj) {
   printReferees(referenceObj);
 }
 
+function followPath(ast, path) {
+  const pathParts = path.split(/\.|\[|\]/).filter(Boolean);
+  let current = ast;
+  for (const part of pathParts) {
+    if (current && typeof current === 'object') {
+      current = current[part];
+    } else {
+      return undefined;
+    }
+  }
+  return current;
+}
+
 console.log("Traversing AST for references:");
 traverseAST(convertedAst);
