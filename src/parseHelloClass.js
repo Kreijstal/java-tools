@@ -177,6 +177,24 @@ Object.entries(referenceMap).forEach(([referencedClass, references]) => {
   });
 });
 
+function traverseAndPrintTypes(node, path = []) {
+  if (typeof node === 'object' && node !== null) {
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'type') {
+        console.log(`Type found at ${path.join('.')}: ${value}`);
+      }
+      traverseAndPrintTypes(value, [...path, key]);
+    }
+  } else if (Array.isArray(node)) {
+    node.forEach((item, index) => {
+      traverseAndPrintTypes(item, [...path, index]);
+    });
+  }
+}
+
+console.log("Traversing AST for types:");
+traverseAndPrintTypes(convertedAst);
+
 // Find and attempt to load all class references with context
 const classReferencesWithContext = findClassReferencesWithContext(convertedAst);
 classReferencesWithContext.forEach(({ className, context }) => {
