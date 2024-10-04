@@ -1,0 +1,565 @@
+function convertJson(inputJson, constantPool) {
+  // Map accessFlags to flags based on context (class, method, or field)
+  const accessFlagMap = {
+    class: {
+      1: "public",
+      16: "final",
+      32: "super",
+      512: "interface",
+      1024: "abstract",
+      4096: "enum",
+      8192: "module",
+      16384: "synthetic"
+    },
+    method: {
+      1: "public",
+      2: "private",
+      4: "protected",
+      8: "static",
+      16: "final",
+      32: "synchronized",
+      64: "bridge",
+      128: "varargs",
+      256: "native",
+      1024: "abstract",
+      2048: "strictfp",
+      4096: "synthetic"
+    },
+    field: {
+      1: "public",
+      2: "private",
+      4: "protected",
+      8: "static",
+      16: "final",
+      64: "volatile",
+      128: "transient",
+      4096: "enum",
+      8192: "synthetic"
+    }
+  };
+
+  const outputJson = {
+    classes: [
+      {
+        version: [
+          {
+            major: inputJson.major_version.toString(),
+            minor: inputJson.minor_version.toString()
+          }
+        ],
+        flags: getFlags(inputJson.accessFlags, "class"),
+        className: inputJson.className.replace(/\./g, "/"),
+        superClass: inputJson.superClassName
+          ? inputJson.superClassName.replace(/\./g, "/")
+          : null,
+        interfaces: [], // Assuming no interfaces, adjust if needed
+        items: []
+      }
+    ]
+  };
+
+  function getFlags(accessFlags, context) {
+    const flags = [];
+    for (const [flagValue, flagName] of Object.entries(
+      accessFlagMap[context]
+    )) {
+      if (accessFlags & flagValue) {
+        flags.push(flagName);
+      }
+    }
+    return flags;
+  }
+
+  // Helper function to resolve indices in the constant pool
+  function resolveConstant(index) {
+    const entry = constantPool[index];
+    if (!entry) return { value: null, type: "unknown" };
+    switch (entry.tag) {
+      case 1: // Utf8
+        return { value: entry.info.bytes, type: "Utf8" };
+      case 3: // Integer
+        return { value: entry.info.bytes, type: "Integer" };
+      case 4: // Float
+        return { value: entry.info.bytes, type: "Float" };
+      case 5: // Long
+        return {
+          value: entry.info.high_bytes * Math.pow(2, 32) + entry.info.low_bytes,
+          type: "Long"
+        };
+      case 6: // Double
+        return {
+          value: entry.info.high_bytes * Math.pow(2, 32) + entry.info.low_bytes,
+          type: "Double"
+        };
+      case 7: // Class
+        return {
+          value: resolveConstant(entry.info.name_index).value,
+          type: "Class"
+        };
+      case 8: // String
+        return {
+          value: resolveConstant(entry.info.string_index).value,
+          type: "String"
+        };
+      case 9: // Fieldref
+      case 10: // Methodref
+      case 11: // InterfaceMethodref
+        const className = resolveConstant(entry.info.class_index).value;
+        const nameAndType = resolveConstant(
+          entry.info.name_and_type_index
+        ).value;
+        return {
+          value: { className, nameAndType },
+          type:
+            entry.tag === 9
+              ? "Fieldref"
+              : entry.tag === 10
+              ? "Methodref"
+              : "InterfaceMethodref"
+        };
+      case 12: // NameAndType
+        const name = resolveConstant(entry.info.name_index).value;
+        const descriptor = resolveConstant(entry.info.descriptor_index).value;
+        return { value: { name, descriptor }, type: "NameAndType" };
+      default:
+        return { value: null, type: "unknown" };
+    }
+  }
+
+  // Convert fields
+  inputJson.fields.forEach((field) => {
+    const fieldItem = {
+      type: "field",
+      field: {
+        flags: getFlags(field.accessFlags, "field"),
+        name: field.name,
+        descriptor: field.descriptor,
+        value: null, // Assuming no value, adjust if needed
+        attrs: null // Assuming no attrs, adjust if needed
+      }
+    };
+    outputJson.classes[0].items.push(fieldItem);
+  });
+
+  // Convert methods
+  inputJson.methods.forEach((method) => {
+    const methodItem = {
+      type: "method",
+      method: {
+        flags: getFlags(method.accessFlags, "method"),
+        name: method.name,
+        descriptor: method.descriptor,
+        attributes: []
+      }
+    };
+
+    // Convert code attribute if exists
+    if (method.code) {
+      const codeAttr = {
+        type: "code",
+        code: {
+          long: false, // Assuming not long, adjust if needed
+          stackSize: method.code.maxStack.toString(),
+          localsSize: method.code.maxLocals.toString(),
+          codeItems: [],
+          attributes: []
+        }
+      };
+
+      // Build a map for labels to program counters
+      const labelMap = {};
+      //let latest;
+      method.code.instructions.forEach((instr, idx) => {
+        labelMap[instr.pc] = `L${instr.pc}`;
+        //latest=instr.pc;
+      });
+      labelMap[method.code.codeLength] = `L${method.code.codeLength}`;
+
+      // Convert instructions
+      method.code.instructions.forEach((instr) => {
+        const codeItem = {};
+        const labelDef = `L${instr.pc}:`;
+        codeItem.labelDef = labelDef;
+
+        // Handle different opcodes
+        switch (instr.opcodeName) {
+          case "invokespecial":
+          case "invokevirtual":
+          case "invokestatic":
+          case "invokeinterface":
+            const methodRef = resolveConstant(instr.operands.index);
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: [
+                instr.opcodeName === "invokeinterface"
+                  ? "InterfaceMethod"
+                  : "Method",
+                methodRef.value.className.replace(/\./g, "/"),
+                [
+                  methodRef.value.nameAndType.name,
+                  methodRef.value.nameAndType.descriptor
+                ]
+              ]
+            };
+            if (instr.opcodeName === "invokeinterface") {
+              codeItem.instruction.count = instr.operands.count.toString();
+            }
+            break;
+
+          case "getfield":
+          case "putfield":
+          case "getstatic":
+          case "putstatic":
+            const fieldRef = resolveConstant(instr.operands.index);
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: [
+                "Field",
+                fieldRef.value.className.replace(/\./g, "/"),
+                [
+                  fieldRef.value.nameAndType.name,
+                  fieldRef.value.nameAndType.descriptor
+                ]
+              ]
+            };
+            break;
+
+          case "ldc":
+            const ldcConstant = resolveConstant(instr.operands.index);
+            codeItem.instruction = {
+              op: "ldc",
+              arg:
+                ldcConstant.type === "Class"
+                  ? ["Class", ldcConstant.value]
+                  : JSON.stringify(ldcConstant.value)
+            };
+            break;
+
+          case "goto":
+          case "ifnonnull":
+          case "ifne":
+          case "if_icmpge":
+          case "ifnull":
+            const targetPc = instr.pc + instr.operands.branchoffset;
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: labelMap[targetPc]
+            };
+            break;
+
+          case "tableswitch":
+            const defaultPc = instr.pc + instr.operands.default;
+            const jumpOffsets = instr.operands.jumpOffsets.map(
+              (offset) => labelMap[instr.pc + offset]
+            );
+            codeItem.instruction = {
+              op: "tableswitch",
+              low: instr.operands.low.toString(),
+              labels: jumpOffsets,
+              defaultLbl: "L" + instr.operands.default
+            };
+            break;
+
+          case "iinc":
+            codeItem.instruction = {
+              op: "iinc",
+              varnum: instr.operands.index.toString(),
+              incr: instr.operands.const.toString()
+            };
+            break;
+
+          case "new":
+          case "checkcast":
+            const classInfo = resolveConstant(instr.operands.index);
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: classInfo.value.replace(/\./g, "/")
+            };
+            break;
+
+          default:
+            // For simple instructions without operands
+            codeItem.instruction = instr.opcodeName;
+            break;
+        }
+
+        codeAttr.code.codeItems.push(codeItem);
+      });
+
+      codeAttr.code.codeItems.push({
+        labelDef: labelMap[method.code.codeLength] + ":",
+        instruction: null
+      });
+
+      // Handle exception table entries (Add after instructions)
+      if (method.code.exceptionTable && method.code.exceptionTable.length > 0) {
+        method.code.exceptionTable.forEach((ex) => {
+          const catchItem = {
+            type: "catch",
+            clsref: resolveConstant(ex.catch_type).value,
+            fromLbl: labelMap[ex.start_pc],
+            toLbl: labelMap[ex.end_pc],
+            usingLbl: labelMap[ex.handler_pc]
+          };
+          const lastLabelIndex = codeAttr.code.codeItems.findIndex(
+            (item) =>
+              item.labelDef === labelMap[catchItem.fromLbl.substr(1)] + ":"
+          );
+          codeAttr.code.codeItems.splice(lastLabelIndex, 0, catchItem);
+        });
+      }
+
+      // Convert attributes
+      if (method.code.attributes) {
+        method.code.attributes.forEach((attr) => {
+          const attrName = resolveConstant(
+            attr.attribute_name_index.index
+          ).value;
+          if (attrName === "LineNumberTable") {
+            const lineAttr = {
+              type: "linenumbertable",
+              lines: []
+            };
+            attr.info.line_number_table.forEach((line) => {
+              const label = labelMap[line.start_pc];
+              const lineNumber = line.line_number.toString();
+              lineAttr.lines.push({
+                label,
+                lineNumber
+              });
+            });
+            codeAttr.code.attributes.push(lineAttr);
+          } else if (attrName === "LocalVariableTable") {
+            const varAttr = {
+              type: "localvariabletable",
+              vars: []
+            };
+            attr.info.local_variable_table.forEach((varInfo) => {
+              const varName = resolveConstant(varInfo.name_index).value;
+              const varDescriptor = resolveConstant(
+                varInfo.descriptor_index
+              ).value;
+              const varItem = {
+                index: varInfo.index.toString(),
+                name: varName,
+                descriptor: varDescriptor,
+                startLbl: labelMap[varInfo.start_pc],
+                endLbl: labelMap[varInfo.start_pc + varInfo.length]
+              };
+              varAttr.vars.push(varItem);
+            });
+            codeAttr.code.attributes.push(varAttr);
+          }
+        });
+      }
+
+      methodItem.method.attributes.push(codeAttr);
+    }
+
+    // Convert exceptions
+    if (method.exceptions && method.exceptions.length > 0) {
+      const exAttr = {
+        type: "exceptions",
+        exceptions: method.exceptions.map((exceptionName) =>
+          exceptionName.replace(/\./g, "/")
+        )
+      };
+      methodItem.method.attributes.push(exAttr);
+    }
+
+    outputJson.classes[0].items.push(methodItem);
+  });
+
+  // Add sourcefile attribute
+  outputJson.classes[0].items.push({
+    type: "attribute",
+    attribute: {
+      type: "sourcefile",
+      value: `"${inputJson.sourceFile}"`
+    }
+  });
+
+  return outputJson;
+}
+
+function unparseDataStructures(root) {
+  function formatInstruction(instr) {
+    if (typeof instr === "string") {
+      return instr;
+    } else if (instr.op === "tableswitch") {
+      // Prioritize tableswitch check
+      const labelsStr = instr.labels
+        .map((label) => `            ${label}`)
+        .join("\n");
+      return `${instr.op} ${instr.low}\n${labelsStr}\n            default : ${instr.defaultLbl}`; // Format tableswitch with labels and default label
+    } else if (instr.op === "iinc") {
+      // Handle iinc instruction with arguments
+      return `${instr.op} ${instr.varnum} ${instr.incr}`;
+    } else if (instr.op !== undefined && instr.arg !== undefined) {
+      const argStr = formatInstructionArg(instr.arg);
+      if (instr.op === "invokeinterface" && instr.count !== undefined) {
+        return `${instr.op} ${argStr} ${instr.count}`; // Include the count for invokeinterface
+      } else {
+        return `${instr.op} ${argStr}`;
+      }
+    } else {
+      return instr.op || "";
+    }
+  }
+
+  function formatInstructionArg(arg) {
+    if (typeof arg === "string") {
+      return arg;
+    } else if (Array.isArray(arg)) {
+      // Recursively format each item and join with spaces
+      return arg.map(formatInstructionArg).join(" ");
+    } else if (typeof arg === "object") {
+      // For object arguments, check if it's a sourcefile attribute
+      if (arg.type === "sourcefile") {
+        return arg.value; // Return the value directly without further formatting
+      } else {
+        // For other object arguments, format their values
+        return Object.values(arg).map(formatInstructionArg).join(" ");
+      }
+    } else {
+      return String(arg);
+    }
+  }
+
+  function formatCodeAttribute(attr) {
+    if (attr.type === "linenumbertable") {
+      const lines = [
+        `        .linenumbertable`,
+        ...attr.lines.map(
+          (line) => `            ${line.label} ${line.lineNumber}`
+        ),
+        `        .end linenumbertable`
+      ];
+      return lines.join("\n");
+    } else if (attr.type === "localvariabletable") {
+      const vars = [
+        `        .localvariabletable`,
+        ...attr.vars.map(
+          (v) =>
+            `            ${v.index} is ${v.name} ${v.descriptor} from ${v.startLbl} to ${v.endLbl}`
+        ),
+        `        .end localvariabletable`
+      ];
+      return vars.join("\n");
+    }
+    // Add more cases as needed
+    return "";
+  }
+
+  return root.classes
+    .map((cls) => {
+      // Include the .version directive if present
+      const headerLines = [];
+
+      if (cls.version && cls.version.length > 0) {
+        headerLines.push(
+          `.version ${cls.version[0].major} ${cls.version[0].minor}`
+        );
+      }
+
+      headerLines.push(`.class ${cls.flags.join(" ")} ${cls.className}`);
+      headerLines.push(`.super ${cls.superClass}`);
+
+      // Handle interfaces
+      if (cls.interfaces && cls.interfaces.length > 0) {
+        headerLines.push(
+          cls.interfaces.map((iface) => `.implements ${iface}`).join("\n")
+        );
+      }
+
+      // Fields
+      const fields = cls.items
+        .filter((item) => item.type === "field")
+        .map((item) => {
+          const field = item.field;
+          return `.field ${field.name} ${field.descriptor};`;
+        })
+        .join("\n\n");
+
+      // Methods
+      const methods = cls.items
+        .filter((item) => item.type === "method")
+        .map((item) => {
+          const method = item.method;
+          const methodHeader = `.method ${method.flags.join(" ")} ${
+            method.name
+          } : ${method.descriptor}`;
+
+          // Code attribute
+          const codeAttribute = method.attributes.find(
+            (attr) => attr.type === "code"
+          );
+          let codeSection = "";
+          if (codeAttribute && codeAttribute.code) {
+            const codeLines = [
+              `    .code stack ${codeAttribute.code.stackSize} locals ${codeAttribute.code.localsSize}`,
+              ...codeAttribute.code.codeItems.flatMap((ci) => {
+                let line = "";
+                if (ci.labelDef) {
+                  line += `${ci.labelDef}`;
+                }
+                if (ci.instruction) {
+                  if (line.length > 0) {
+                    line += "    ";
+                  }
+                  line += formatInstruction(ci.instruction);
+                }
+                if (ci.type === "catch") {
+                  line = `    .catch ${ci.clsref} from ${ci.fromLbl} to ${ci.toLbl} using ${ci.usingLbl}`;
+                }
+                return line ? [line] : [];
+              }),
+              ...codeAttribute.code.attributes.map((attr) =>
+                formatCodeAttribute(attr)
+              ),
+              `    .end code`
+            ];
+            codeSection = codeLines.join("\n");
+          }
+
+          // Exceptions
+          const exceptionsAttribute = method.attributes.find(
+            (attr) => attr.type === "exceptions"
+          );
+          let exceptionsSection = "";
+          if (exceptionsAttribute) {
+            exceptionsSection = `    .exceptions ${exceptionsAttribute.exceptions.join(
+              " "
+            )}`;
+          }
+
+          return [methodHeader, codeSection, exceptionsSection, `.end method`]
+            .filter(Boolean)
+            .join("\n");
+        })
+        .join("\n\n");
+
+      // Source file
+      const sourceFileAttribute = cls.items.find(
+        (item) => item.attribute && item.attribute.type === "sourcefile"
+      );
+      let sourceFileLine = "";
+      if (sourceFileAttribute) {
+        sourceFileLine = `.sourcefile ${sourceFileAttribute.attribute.value}`;
+      }
+
+      // Combine all parts
+      return [
+        headerLines.filter(Boolean).join("\n"),
+        fields,
+        methods,
+        sourceFileLine,
+        `.end class`
+      ]
+        .filter(Boolean)
+        .join("\n");
+    })
+    .join("\n\n");
+}
+
+module.exports={unparseDataStructures,convertJson};
