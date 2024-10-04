@@ -43,6 +43,8 @@ function traverseAST(ast) {
                     console.log(`Class reference found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${className}`);
                   }
                   if (arg.length > 2) {
+                    const fieldNameOrMethodName = arg[2][0];
+                    console.log(`Field or method name found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${fieldNameOrMethodName}`);
                     const descriptor = arg[2][1];
                     const descriptorAST = parseDescriptor(descriptor);
                     const referencedClasses = Array.isArray(descriptorAST)
