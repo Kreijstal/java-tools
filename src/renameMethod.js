@@ -25,6 +25,17 @@ function renameMethod(referenceObj, className, oldMethodName, newMethodName) {
       pathParts[methodIndex] = newMethodName;
       const newPath = pathParts.join('.');
       referenceObj[className].children[newMethodName].referees.push(newPath);
+
+      // Update the method name in the convertedAst using the referee path
+      let current = convertedAst;
+      for (const part of pathParts) {
+        if (current && typeof current === 'object') {
+          current = current[part];
+        }
+      }
+      if (current && current.method) {
+        current.method.name = newMethodName;
+      }
     }
   });
 
