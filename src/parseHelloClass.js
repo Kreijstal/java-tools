@@ -14,7 +14,7 @@ const classFileContent = fs.readFileSync(classFilePath);
 const ast = getAST(new Uint8Array(classFileContent));
 
 const convertedAst = convertJson(ast.ast, ast.constantPool);
-console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
+/* console.log("Converted AST:", JSON.stringify(convertedAst, null, 2)); */
 
 // Function to traverse the AST and find class references
 function findClassReferences(ast) {
