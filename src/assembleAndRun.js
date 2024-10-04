@@ -12,8 +12,8 @@ function assembleClasses(root) {
     const jContent = unparseDataStructures(cls);
     fs.writeFileSync(jFileName, jContent);
 
-    // Assemble the .j file into a .class file
-    execSync(`krak2 asm ${jFileName} --out ${classFileName}`);
+    // Log the unparsed .j file content instead of assembling and executing
+    console.log(`Unparsed content for ${className}:\n${jContent}\n`);
   });
 }
 
