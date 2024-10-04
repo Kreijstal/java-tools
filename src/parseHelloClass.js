@@ -207,7 +207,7 @@ function traverseAndPrintTypes(node, path = []) {
       if (key === 'className' || key === 'descriptor') {
         console.log(`Type found at ${path.join('.')}: ${value}`);
       }
-      if (key === 'instruction' && value.op) {
+      if (key === 'instruction' && value && value.op) {
         if (refOrTaggedConstInstructions.includes(value.op) || ldcInstructions.includes(value.op)) {
           console.log(`Type found in instruction at ${path.join('.')}: ${JSON.stringify(value.arg)}`);
         }
