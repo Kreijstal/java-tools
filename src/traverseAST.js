@@ -37,21 +37,23 @@ function traverseAST(ast) {
             attr.code.codeItems.forEach((codeItem, codeItemIndex) => {
               if (codeItem.instruction && codeItem.instruction.arg) {
                 const arg = codeItem.instruction.arg;
-                if (Array.isArray(arg) && arg.length > 1) {
-                  const className = arg[1];
-                  console.log(`Class reference found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${className}`);
-                }
-                if (Array.isArray(arg) && arg.length > 2) {
-                  const descriptor = arg[2][1];
-                  const descriptorAST = parseDescriptor(descriptor);
-                  const referencedClasses = Array.isArray(descriptorAST)
-                    ? descriptorAST
-                    : [...descriptorAST.params, descriptorAST.returnType];
-                  referencedClasses
-                    .filter(referencedClass => typeof referencedClass === 'string')
-                    .forEach(referencedClass => {
-                      console.log(`Type found in instruction descriptor at classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${referencedClass}`);
-                    });
+                if (Array.isArray(arg)) {
+                  if (arg.length > 1) {
+                    const className = arg[1];
+                    console.log(`Class reference found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${className}`);
+                  }
+                  if (arg.length > 2) {
+                    const descriptor = arg[2][1];
+                    const descriptorAST = parseDescriptor(descriptor);
+                    const referencedClasses = Array.isArray(descriptorAST)
+                      ? descriptorAST
+                      : [...descriptorAST.params, descriptorAST.returnType];
+                    referencedClasses
+                      .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
+                      .forEach(referencedClass => {
+                        console.log(`Type found in instruction descriptor at classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${referencedClass}`);
+                      });
+                  }
                 }
               }
             });
