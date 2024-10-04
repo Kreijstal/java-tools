@@ -93,9 +93,18 @@ function buildReferenceMap(ast) {
                   if (!referenceMap[referencedClass]) {
                     referenceMap[referencedClass] = [];
                   }
-                  referenceMap[referencedClass].push({
-                    context: `${className}.${methodName}`,
-                    index: index
+                  arg.forEach((part, partIndex) => {
+                    if (typeof part === 'string' && part.includes('/')) {
+                      const referencedClass = part;
+                      if (!referenceMap[referencedClass]) {
+                        referenceMap[referencedClass] = [];
+                      }
+                      referenceMap[referencedClass].push({
+                        context: `${className}.${methodName}`,
+                        index: index,
+                        partIndex: partIndex // Track which part of the instruction references the class
+                      });
+                    }
                   });
                 }
               }
@@ -114,7 +123,7 @@ console.log("Reference Map:", JSON.stringify(referenceMap, null, 2));
 
 // Iterate over the reference map and print the instruction using context and index
 Object.entries(referenceMap).forEach(([referencedClass, references]) => {
-  references.forEach(({ context, index }) => {
+  references.forEach(({ context, index, partIndex }) => {
     const [className, methodName] = context.split('.');
     const cls = convertedAst.classes.find(c => c.className === className);
     if (cls) {
@@ -123,7 +132,8 @@ Object.entries(referenceMap).forEach(([referencedClass, references]) => {
         const instruction = method.method.attributes
           .find(attr => attr.type === "code")
           .code.codeItems[index].instruction;
-        console.log(`In ${context}, instruction at index ${index}:`, instruction);
+        const part = instruction.arg[partIndex];
+        console.log(`In ${context}, instruction at index ${index}, part ${partIndex} references class:`, part);
       }
     }
   });
