@@ -3,6 +3,7 @@ const path = require('path');
 const { getAST } = require('jvm_parser');
 const { unparseDataStructures, convertJson } = require('./convert_tree');
 const { loadClass } = require('./classLoader');
+const { parseDescriptor } = require('./typeParser');
 
 // Path to the compiled Hello.class file
 const classFilePath = path.join(__dirname, '../sources/Hello.class');
@@ -91,15 +92,6 @@ function findClassReferencesWithContext(ast) {
   return classReferences;
 }
 
-function parseDescriptor(descriptor) {
-  const regex = /\[?L([^;]+);/g;
-  const matches = [];
-  let match;
-  while ((match = regex.exec(descriptor)) !== null) {
-    matches.push(match[1].replace(/\./g, "/"));
-  }
-  return matches;
-}
 
 function buildReferenceMap(ast) {
   const referenceMap = {};
