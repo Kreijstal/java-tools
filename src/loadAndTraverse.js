@@ -5,17 +5,18 @@ const { convertJson } = require('./convert_tree');
 const { getReferenceObjFromClass } = require('./traverseAST');
 const { loadClass } = require('./classLoader');
 
-function loadAndTraverse(classFilePath) {
-  const classFileContent = fs.readFileSync(classFilePath);
-  const ast = getAST(new Uint8Array(classFileContent));
-  const convertedAst = convertJson(ast.ast, ast.constantPool);
+function loadAndTraverse(className,classPath) {
+ 
+  const convertedAst = loadClass(className,classPath);
 
   const loadedClasses = new Set();
-  const referenceObj = getReferenceObjFromClass(convertedAst, 0);
+  let referenceObj={};
+  getReferenceObjFromClass(convertedAst, 0,referenceObj);
 
   Object.keys(referenceObj).forEach(className => {
     if (!loadedClasses.has(className)) {
-      loadClass(className);
+      let newclass=loadClass(className,classPath);
+      convertedAst.classes.push(newclass.classes[0]);//appending
       loadedClasses.add(className);
       // Optionally, append the loaded class to convertedAst if needed
     }
