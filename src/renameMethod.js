@@ -1,8 +1,14 @@
 const fs = require('fs');
 
 function renameMethod(convertedAst, referenceObj, className, oldMethodName, newMethodName) {
-  if (!referenceObj[className] || !referenceObj[className].children[oldMethodName]) {
+  if (!referenceObj[className]) {
+    console.error(`Class ${className} not found in referenceObj`);
+    return;
+  }
+  
+  if (!referenceObj[className].children[oldMethodName]) {
     console.error(`Method ${oldMethodName} not found in class ${className}`);
+    console.log(`Available methods: ${Object.keys(referenceObj[className].children).join(', ')}`);
     return;
   }
 
