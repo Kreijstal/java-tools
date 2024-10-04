@@ -6,7 +6,7 @@ const { getReferenceObjFromClass } = require('./traverseAST');
 const { assembleClasses, runClass } = require('./assembleAndRun');
 const { loadClass } = require('./classLoader');
 
-function loadAndTraverse(className,classPath) {
+function loadAndTraverse(className, classPath, mainClassName = 'TestMethodsRunner') {
  
   const convertedAst = loadClass(className,classPath);
 
@@ -29,7 +29,7 @@ function loadAndTraverse(className,classPath) {
   });
   console.log(JSON.stringify(referenceObj,null,1));
   assembleClasses(convertedAst);
-  runClass('TestMethodsRunner');
+  runClass(mainClassName);
 }
 
 module.exports = { loadAndTraverse };
