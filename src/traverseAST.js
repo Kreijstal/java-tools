@@ -17,48 +17,39 @@ const ast = getAST(new Uint8Array(classFileContent));
 const convertedAst = convertJson(ast.ast, ast.constantPool);
 
 function traverseAST(ast) {
+  const referenceObj = {};
+
   ast.classes.forEach((cls, classIndex) => {
-    const classRef = new Reference(cls.className, 'class');
-    console.log(`Class reference found at path classes.${classIndex}: ${classRef.name}`);
+    if (!referenceObj[cls.className]) {
+      referenceObj[cls.className] = { children: {}, referees: [] };
+    }
+    referenceObj[cls.className].referees.push(`classes.${classIndex}`);
+
     cls.items.forEach((item, itemIndex) => {
       if (item.type === "method") {
         const methodName = item.method.name;
         const methodDescriptor = item.method.descriptor;
-        const methodRef = new Reference(methodName, 'method', classRef);
-        classRef.addChild(methodRef);
-        console.log(`Method reference found at path classes.${classIndex}.items.${itemIndex}.method: ${methodRef.name}, Descriptor: ${methodDescriptor}`);
-        const descriptorAST = parseDescriptor(item.method.descriptor);
-        const referencedClasses = Array.isArray(descriptorAST)
-          ? descriptorAST
-          : [...descriptorAST.params, descriptorAST.returnType];
-        referencedClasses
-          .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
-          .forEach(referencedClass => {
-            console.log(`Type found in method descriptor at classes.${classIndex}.items.${itemIndex}.method.descriptor: ${referencedClass}`);
-          });
+        referenceObj[cls.className].children[methodName] = {
+          descriptor: methodDescriptor,
+          referees: [`classes.${classIndex}.items.${itemIndex}.method`]
+        };
 
         item.method.attributes.forEach((attr, attrIndex) => {
           if (attr.type === "code") {
             attr.code.codeItems.forEach((codeItem, codeItemIndex) => {
               if (codeItem.instruction && codeItem.instruction.arg) {
                 const arg = codeItem.instruction.arg;
-                if (Array.isArray(arg)) {
-                  if (arg.length > 2) {
-                    const [fieldNameOrMethodName, descriptor] = arg[2];
-                    const fieldOrMethodRef = new Reference(fieldNameOrMethodName, 'fieldOrMethod', methodRef);
-                    methodRef.addChild(fieldOrMethodRef);
-                    console.log(`Field or method name found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${fieldOrMethodRef.name}, Parent class: ${arg[1]}, Type: ${descriptor}`);
-                    const methodDescriptor = arg[2][1];
-                    const descriptorAST = parseDescriptor(methodDescriptor);
-                    const referencedClasses = Array.isArray(descriptorAST)
-                      ? descriptorAST
-                      : [...descriptorAST.params, descriptorAST.returnType];
-                    referencedClasses
-                      .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
-                      .forEach(referencedClass => {
-                        console.log(`Type found in instruction descriptor at classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${referencedClass}`);
-                      });
+                if (Array.isArray(arg) && arg.length > 2) {
+                  const [fieldNameOrMethodName, descriptor] = arg[2];
+                  const parentClass = arg[1];
+
+                  if (!referenceObj[parentClass]) {
+                    referenceObj[parentClass] = { children: {}, referees: [] };
                   }
+                  referenceObj[parentClass].children[fieldNameOrMethodName] = {
+                    descriptor: descriptor,
+                    referees: [`classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`]
+                  };
                 }
               }
             });
@@ -67,6 +58,8 @@ function traverseAST(ast) {
       }
     });
   });
+
+  console.log("Reference Object:", JSON.stringify(referenceObj, null, 2));
 }
 
 console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
