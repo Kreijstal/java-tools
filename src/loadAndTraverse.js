@@ -3,6 +3,7 @@ const path = require('path');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('./convert_tree');
 const { getReferenceObjFromClass } = require('./traverseAST');
+const { assembleClasses, runClass } = require('./assembleAndRun');
 const { loadClass } = require('./classLoader');
 
 function loadAndTraverse(className,classPath) {
@@ -27,6 +28,8 @@ function loadAndTraverse(className,classPath) {
     }
   });
   console.log(JSON.stringify(referenceObj,null,1));
+  assembleClasses(convertedAst);
+  runClass('TestMethodsRunner');
 }
 
 module.exports = { loadAndTraverse };
