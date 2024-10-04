@@ -18,6 +18,7 @@ function loadAndTraverse(className,classPath) {
       let newclass=loadClass(className,classPath);
       if (newclass) {
         convertedAst.classes.push(newclass.classes[0]); //appending
+        getReferenceObjFromClass(convertedAst, 1, referenceObj);
         loadedClasses.add(className);
       } else {
         console.error(`Failed to load class: ${className}`);
@@ -25,7 +26,7 @@ function loadAndTraverse(className,classPath) {
       // Optionally, append the loaded class to convertedAst if needed
     }
   });
-  console.log()
+  console.log(JSON.stringify(referenceObj,null,1));
 }
 
 module.exports = { loadAndTraverse };
