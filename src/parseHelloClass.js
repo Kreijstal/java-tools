@@ -73,6 +73,48 @@ function findClassReferencesWithContext(ast) {
   return classReferences;
 }
 
+function buildReferenceMap(ast) {
+  const referenceMap = {};
+
+  ast.classes.forEach((cls) => {
+    const className = cls.className;
+    referenceMap[className] = { methods: {}, fields: {} };
+
+    cls.items.forEach((item) => {
+      if (item.type === "method") {
+        const methodName = item.method.name;
+        referenceMap[className].methods[methodName] = [];
+
+        item.method.attributes.forEach((attr) => {
+          if (attr.type === "code") {
+            attr.code.codeItems.forEach((codeItem) => {
+              if (codeItem.instruction && codeItem.instruction.arg) {
+                const arg = codeItem.instruction.arg;
+                if (Array.isArray(arg) && arg.length > 1) {
+                  const referencedClass = arg[1];
+                  referenceMap[className].methods[methodName].push({
+                    instruction: codeItem.instruction,
+                    references: referencedClass
+                  });
+                }
+              }
+            });
+          }
+        });
+      } else if (item.type === "field") {
+        const fieldName = item.field.name;
+        referenceMap[className].fields[fieldName] = [];
+        // Add logic to populate field references if needed
+      }
+    });
+  });
+
+  return referenceMap;
+}
+
+const referenceMap = buildReferenceMap(convertedAst);
+console.log("Reference Map:", JSON.stringify(referenceMap, null, 2));
+
 // Find and attempt to load all class references with context
 const classReferencesWithContext = findClassReferencesWithContext(convertedAst);
 classReferencesWithContext.forEach(({ className, context }) => {
