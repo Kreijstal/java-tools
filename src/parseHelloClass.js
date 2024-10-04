@@ -92,7 +92,7 @@ function findClassReferencesWithContext(ast) {
 }
 
 function parseDescriptor(descriptor) {
-  const regex = /L([^;]+);/g;
+  const regex = /\[?L([^;]+);/g;
   const matches = [];
   let match;
   while ((match = regex.exec(descriptor)) !== null) {
