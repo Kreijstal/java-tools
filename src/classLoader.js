@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { getAST } = require('./astGenerator'); // Assuming this is the correct module
+const { getAST } = require('jvm_parser'); 
 const { convertJson } = require('./convert_tree');
 
 function loadClass(className, classPath) {
