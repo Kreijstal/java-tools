@@ -209,8 +209,14 @@ function traverseAndPrintTypes(node, path = []) {
       }
       if (key === 'instruction' && value && value.op) {
         if (refOrTaggedConstInstructions.includes(value.op) || ldcInstructions.includes(value.op)) {
-          if (typeof value.arg !== 'string') {
-            console.log(`Type found in instruction at ${path.join('.')}: ${JSON.stringify(value.arg)}`);
+          if (Array.isArray(value.arg) && value.arg.length > 2) {
+            const descriptor = value.arg[2][1];
+            const referencedClasses = parseDescriptor(descriptor);
+            referencedClasses
+              .filter(referencedClass => referencedClass.includes('/'))
+              .forEach(referencedClass => {
+                console.log(`Type found in instruction at ${path.join('.')}: ${referencedClass}`);
+              });
           }
         }
       }
