@@ -12,7 +12,6 @@ const classFileContent = fs.readFileSync(classFilePath);
 // Get the AST of the class file
 const ast = getAST(new Uint8Array(classFileContent));
 
-console.log("AST structure:", JSON.stringify(ast, null, 2));
 const convertedAst = convertJson(ast.ast, ast.constantPool);
 const asmSyntax = unparseDataStructures(convertedAst);
 
