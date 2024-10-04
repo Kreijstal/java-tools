@@ -124,15 +124,30 @@ function buildReferenceMap(ast) {
                   }
                   arg.forEach((part, partIndex) => {
                     console.log(`Resolving part: ${part} at index: ${index}, partIndex: ${partIndex}`);
-                    if (typeof part === 'string' && part.includes('/')) {
-                      const referencedClass = part;
-                      if (!referenceMap[referencedClass]) {
-                        referenceMap[referencedClass] = [];
+                    if (typeof part === 'string') {
+                      // Check if the part is a class reference
+                      if (part.includes('/')) {
+                        const referencedClass = part;
+                        if (!referenceMap[referencedClass]) {
+                          referenceMap[referencedClass] = [];
+                        }
+                        referenceMap[referencedClass].push({
+                          context: `${className}.${methodName}`,
+                          index: index,
+                          partIndex: partIndex // Track which part of the instruction references the class
+                        });
                       }
-                      referenceMap[referencedClass].push({
-                        context: `${className}.${methodName}`,
-                        index: index,
-                        partIndex: partIndex // Track which part of the instruction references the class
+                      // Check if the part is a descriptor
+                      const descriptorMatches = parseDescriptor(part);
+                      descriptorMatches.forEach((descriptorClass) => {
+                        if (!referenceMap[descriptorClass]) {
+                          referenceMap[descriptorClass] = [];
+                        }
+                        referenceMap[descriptorClass].push({
+                          context: `${className}.${methodName}`,
+                          index: index,
+                          partIndex: 'descriptor' // Indicate it's from the descriptor
+                        });
                       });
                     }
                   });
