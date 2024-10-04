@@ -267,18 +267,26 @@ function traverseAndPrintTypes(node, path = [], context = '') {
           if (Array.isArray(value.arg) && value.arg.length > 1) {
             const className = value.arg[1];
             console.log(`Type found in instruction at ${path.join('.')}: ${className}`);
-          }
-          if (Array.isArray(value.arg) && value.arg.length > 2) {
-            const descriptor = value.arg[2][1];
-            const descriptorAST = parseDescriptor(descriptor);
-            const referencedClasses = Array.isArray(descriptorAST)
-              ? descriptorAST
-              : [...descriptorAST.params, descriptorAST.returnType];
-            referencedClasses
-              .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
-              .forEach(referencedClass => {
-                console.log(`Type found in instruction at ${path.join('.')}: ${referencedClass}`);
-              });
+            if (Array.isArray(value.arg) && value.arg.length > 2) {
+              const descriptor = value.arg[2][1];
+              const descriptorAST = parseDescriptor(descriptor);
+              const referencedClasses = Array.isArray(descriptorAST)
+                ? descriptorAST
+                : [...descriptorAST.params, descriptorAST.returnType];
+              referencedClasses
+                .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
+                .forEach(referencedClass => {
+                  console.log(`Type found in instruction at ${path.join('.')}: ${referencedClass}`);
+                  if (!referenceMap[referencedClass]) {
+                    referenceMap[referencedClass] = [];
+                  }
+                  referenceMap[referencedClass].push({
+                    context,
+                    index: path[path.length - 1],
+                    partIndex: 'descriptor'
+                  });
+                });
+            }
           }
         }
       }
