@@ -16,6 +16,36 @@ const ast = getAST(new Uint8Array(classFileContent));
 
 const convertedAst = convertJson(ast.ast, ast.constantPool);
 
+function addDescriptorReferences(referenceObj) {
+  Object.keys(referenceObj).forEach(className => {
+    const classObj = referenceObj[className];
+    Object.keys(classObj.children).forEach(childName => {
+      const child = classObj.children[childName];
+      const descriptor = child.descriptor;
+      const descriptorAST = parseDescriptor(descriptor);
+
+      // Check if the descriptor is a method descriptor
+      if (descriptorAST.params) {
+        descriptorAST.params.forEach(paramType => {
+          if (referenceObj[paramType]) {
+            referenceObj[paramType].referees.push(`${className}.${childName}.descriptor`);
+          }
+        });
+        if (referenceObj[descriptorAST.returnType]) {
+          referenceObj[descriptorAST.returnType].referees.push(`${className}.${childName}.descriptor`);
+        }
+      } else {
+        // It's a field descriptor
+        descriptorAST.forEach(type => {
+          if (referenceObj[type]) {
+            referenceObj[type].referees.push(`${className}.${childName}.descriptor`);
+          }
+        });
+      }
+    });
+  });
+}
+
 function traverseAST(ast) {
   const referenceObj = {};
 
@@ -59,7 +89,8 @@ function traverseAST(ast) {
     });
   });
 
-  console.log("Reference Object:", JSON.stringify(referenceObj, null, 2));
+  addDescriptorReferences(referenceObj);
+  console.log("Reference Object after descriptor pass:", JSON.stringify(referenceObj, null, 2));
 }
 
 console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
