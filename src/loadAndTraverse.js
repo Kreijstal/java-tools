@@ -6,7 +6,7 @@ const { getReferenceObjFromClass } = require('./traverseAST');
 const { assembleClasses, runClass } = require('./assembleAndRun');
 const { loadClass } = require('./classLoader');
 
-function loadAndTraverse(className, classPath, mainClassName = 'TestMethodsRunner') {
+function loadAndTraverse(className, classPath, mainClassName) {
  
   const convertedAst = loadClass(className,classPath);
 
