@@ -19,10 +19,10 @@ function loadAndTraverse(className,classPath) {
       if (newclass) {
         console.log('Loaded class:', newclass);
         convertedAst.classes.push(newclass.classes[0]); //appending
+        loadedClasses.add(className);
       } else {
         console.error(`Failed to load class: ${className}`);
       }
-      loadedClasses.add(className);
       // Optionally, append the loaded class to convertedAst if needed
     }
   });
