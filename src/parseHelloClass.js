@@ -78,12 +78,10 @@ function buildReferenceMap(ast) {
 
   ast.classes.forEach((cls) => {
     const className = cls.className;
-    referenceMap[className] = { methods: {}, fields: {} };
 
     cls.items.forEach((item) => {
       if (item.type === "method") {
         const methodName = item.method.name;
-        referenceMap[className].methods[methodName] = [];
 
         item.method.attributes.forEach((attr) => {
           if (attr.type === "code") {
@@ -92,19 +90,18 @@ function buildReferenceMap(ast) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg) && arg.length > 1) {
                   const referencedClass = arg[1];
-                  referenceMap[className].methods[methodName].push({
+                  if (!referenceMap[referencedClass]) {
+                    referenceMap[referencedClass] = [];
+                  }
+                  referenceMap[referencedClass].push({
                     instruction: codeItem.instruction,
-                    references: referencedClass
+                    context: `${className}.${methodName}`
                   });
                 }
               }
             });
           }
         });
-      } else if (item.type === "field") {
-        const fieldName = item.field.name;
-        referenceMap[className].fields[fieldName] = [];
-        // Add logic to populate field references if needed
       }
     });
   });
