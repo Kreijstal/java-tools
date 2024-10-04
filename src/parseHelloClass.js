@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
-const { unparseDataStructures } = require('./convert_tree');
+const { unparseDataStructures, convertJson } = require('./convert_tree');
 
 // Path to the compiled Hello.class file
 const classFilePath = path.join(__dirname, '../sources/Hello.class');
@@ -13,7 +13,8 @@ const classFileContent = fs.readFileSync(classFilePath);
 const ast = getAST(new Uint8Array(classFileContent));
 
 console.log("AST structure:", JSON.stringify(ast, null, 2));
-const asmSyntax = unparseDataStructures(ast);
+const convertedAst = convertJson(ast.ast, ast.constantPool);
+const asmSyntax = unparseDataStructures(convertedAst);
 
 // Output the ASM syntax
 console.log(asmSyntax);
