@@ -17,7 +17,6 @@ function loadAndTraverse(className,classPath) {
     if (!loadedClasses.has(className)) {
       let newclass=loadClass(className,classPath);
       if (newclass) {
-        console.log('Loaded class:', newclass);
         convertedAst.classes.push(newclass.classes[0]); //appending
         loadedClasses.add(className);
       } else {
