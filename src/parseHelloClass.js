@@ -12,7 +12,7 @@ const classFileContent = fs.readFileSync(classFilePath);
 // Get the AST of the class file
 const ast = getAST(new Uint8Array(classFileContent));
 
-// Convert the AST to ASM syntax
+console.log("AST structure:", JSON.stringify(ast, null, 2));
 const asmSyntax = unparseDataStructures(ast);
 
 // Output the ASM syntax
