@@ -20,7 +20,6 @@ function addDescriptorReferences(referenceObj) {
   Object.keys(referenceObj).forEach(className => {
     const classObj = referenceObj[className];
     Object.entries(classObj.children).forEach(([childName, child]) => {
-      const child = classObj.children[childName];
       const descriptor = child.descriptor;
       const descriptorAST = parseDescriptor(descriptor);
 
