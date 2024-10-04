@@ -76,7 +76,8 @@ function addSelfReferences(referenceObj) {
     });
   });
 }
-  const referenceObj = {};
+  function traverseAST(ast) {
+    const referenceObj = {};
 
   ast.classes.forEach((cls, classIndex) => {
     if (!referenceObj[cls.className]) {
