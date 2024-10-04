@@ -25,6 +25,7 @@ function loadAndTraverse(className,classPath) {
       // Optionally, append the loaded class to convertedAst if needed
     }
   });
+  console.log()
 }
 
 module.exports = { loadAndTraverse };

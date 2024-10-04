@@ -8,8 +8,8 @@ const { Reference } = require('./referenceInterface');
 // Path to the compiled Hello.class file
 const nativeTypes = new Set(["byte", "char", "double", "float", "int", "long", "short", "boolean", "void"]);
 
-function getReferenceObjFromClass(convertedAst, classIndex, addSelfRefs = false) {
-  const referenceObj = traverseAST(convertedAst, classIndex);
+function getReferenceObjFromClass(convertedAst, classIndex,referenceObj, addSelfRefs = false) {
+  traverseAST(convertedAst, classIndex,referenceObj);
 
   if (addSelfRefs) {
     addSelfReferences(referenceObj);
@@ -81,12 +81,11 @@ function addSelfReferences(referenceObj) {
     });
   });
 }
-function traverseAST(convertedAst, classIndex) {
-  const referenceObj = {};
-  const cls = convertedAst[classIndex];
-  const referenceObj = {};
+function traverseAST(convertedAst, classIndex,referenceObj) {
+  //console.log("convertedAst",convertedAst,classIndex)
+  const cls = convertedAst.classes[classIndex];
 
-  ast.classes.forEach((cls, classIndex) => {
+  ((cls, classIndex) => {
       if (!referenceObj[cls.className]) {
         referenceObj[cls.className] = { children: {}, referees: [] };
       }
@@ -124,7 +123,7 @@ function traverseAST(convertedAst, classIndex) {
           });
         }
       });
-    });
+    })(cls,classIndex);
 
     addDescriptorReferences(referenceObj);
     return referenceObj;
