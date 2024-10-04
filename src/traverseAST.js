@@ -87,7 +87,9 @@ function traverseAST(convertedAst, classIndex,referenceObj) {
 
   ((cls, classIndex) => {
       if (!referenceObj[cls.className]) {
-        referenceObj[cls.className] = { children: {}, referees: [] };
+        if (!referenceObj[cls.className]) {
+          referenceObj[cls.className] = { children: {}, referees: [] };
+        }
       }
       referenceObj[cls.className].referees.push(`classes.${classIndex}`);
 
@@ -95,10 +97,13 @@ function traverseAST(convertedAst, classIndex,referenceObj) {
         if (item.type === "method") {
           const methodName = item.method.name;
           const methodDescriptor = item.method.descriptor;
-          referenceObj[cls.className].children[methodName] = {
-            descriptor: methodDescriptor,
-            referees: [`classes.${classIndex}.items.${itemIndex}.method`]
-          };
+          if (!referenceObj[cls.className].children[methodName]) {
+            referenceObj[cls.className].children[methodName] = {
+              descriptor: methodDescriptor,
+              referees: []
+            };
+          }
+          referenceObj[cls.className].children[methodName].referees.push(`classes.${classIndex}.items.${itemIndex}.method`);
 
           item.method.attributes.forEach((attr, attrIndex) => {
             if (attr.type === "code") {
@@ -112,10 +117,13 @@ function traverseAST(convertedAst, classIndex,referenceObj) {
                     if (!referenceObj[parentClass]) {
                       referenceObj[parentClass] = { children: {}, referees: [] };
                     }
-                    referenceObj[parentClass].children[fieldNameOrMethodName] = {
-                      descriptor: descriptor,
-                      referees: [`classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`]
-                    };
+                    if (!referenceObj[parentClass].children[fieldNameOrMethodName]) {
+                      referenceObj[parentClass].children[fieldNameOrMethodName] = {
+                        descriptor: descriptor,
+                        referees: []
+                      };
+                    }
+                    referenceObj[parentClass].children[fieldNameOrMethodName].referees.push(`classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`);
                   }
                 }
               });
