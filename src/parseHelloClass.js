@@ -296,6 +296,9 @@ traverseAndPrintTypes(convertedAst);
 
 // Find and attempt to load all class references with context
 const classReferencesWithContext = findClassReferencesWithContext(convertedAst);
+console.log("Final Reference Map:");
+console.log(JSON.stringify(referenceMap, null, 2));
+
 classReferencesWithContext.forEach(({ className, context }) => {
   console.log(`In ${context}, attempt to load class ${className}`);
   loadClass(className);
