@@ -20,7 +20,7 @@ function loadAndTraverse(className,classPath) {
         convertedAst.classes.push(newclass.classes[0]); //appending
         getReferenceObjFromClass(convertedAst, 1, referenceObj);
         loadedClasses.add(className);
-      } else {
+      } else if (!className.startsWith('java/')) {
         console.error(`Failed to load class: ${className}`);
       }
       // Optionally, append the loaded class to convertedAst if needed
