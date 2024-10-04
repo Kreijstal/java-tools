@@ -17,11 +17,11 @@ const convertedAst = convertJson(ast.ast, ast.constantPool);
 
 function traverseAST(ast) {
   ast.classes.forEach((cls) => {
-    console.log(`Class reference found at path ${path.join('.')}: ${cls.className}`);
+    console.log(`Class reference found at path ${cls.className}: ${cls.className}`);
     cls.items.forEach((item) => {
       if (item.type === "method") {
         const methodName = item.method.name;
-        console.log(`Method reference found at path ${path.join('.')}: ${methodName}`);
+        console.log(`Method reference found at path ${cls.className}.${methodName}: ${methodName}`);
         const descriptorAST = parseDescriptor(item.method.descriptor);
         const referencedClasses = Array.isArray(descriptorAST)
           ? descriptorAST
@@ -39,7 +39,7 @@ function traverseAST(ast) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg) && arg.length > 1) {
                   const className = arg[1];
-                  console.log(`Class reference found in instruction at path ${path.join('.')}: ${className}`);
+                  console.log(`Class reference found in instruction at path ${cls.className}.${methodName}: ${className}`);
                 }
                 if (Array.isArray(arg) && arg.length > 2) {
                   const descriptor = arg[2][1];
@@ -50,7 +50,7 @@ function traverseAST(ast) {
                   referencedClasses
                     .filter(referencedClass => typeof referencedClass === 'string')
                     .forEach(referencedClass => {
-                      console.log(`Type found in instruction descriptor: ${referencedClass}`);
+                      console.log(`Type found in instruction descriptor at ${cls.className}.${methodName}: ${referencedClass}`);
                     });
                 }
               }
