@@ -54,6 +54,7 @@ function renameMethod(convertedAst, referenceObj, className, oldMethodName, newM
 
   // Clear old referees
   methodRef.referees = [];
+  // console.log(JSON.stringify(referenceObj, null, 1));
   console.log(`Renamed method ${oldMethodName} to ${newMethodName} in class ${className}`);
 
   console.log(`Renamed method ${oldMethodName} to ${newMethodName} in class ${className}`);
