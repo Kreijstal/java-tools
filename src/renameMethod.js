@@ -1,6 +1,6 @@
 const fs = require('fs');
 
-function renameMethod(referenceObj, className, oldMethodName, newMethodName) {
+function renameMethod(convertedAst, referenceObj, className, oldMethodName, newMethodName) {
   if (!referenceObj[className] || !referenceObj[className].children[oldMethodName]) {
     console.error(`Method ${oldMethodName} not found in class ${className}`);
     return;
@@ -42,7 +42,7 @@ function renameMethod(referenceObj, className, oldMethodName, newMethodName) {
   // Remove old referees
   referenceObj[className].children[newMethodName].referees = referenceObj[className].children[newMethodName].referees.filter(refereePath => !refereePath.includes(oldMethodName));
 
-  console.log(`Renamed method ${oldMethodName} to ${newMethodName} in class ${className}`);
+  // console.log(`Renamed method ${oldMethodName} to ${newMethodName} in class ${className}`);
 }
 
 module.exports = { renameMethod };

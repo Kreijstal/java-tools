@@ -29,7 +29,7 @@ function loadAndTraverse(className, classPath) {
     }
   });
   // Example call to renameMethod
-  renameMethod(referenceObj, 'TestMethods', 'publicMethod1', 'asfsdsdgre');
+  renameMethod(convertedAst, referenceObj, 'TestMethods', 'publicMethod1', 'asfsdsdgre');
   assembleClasses(convertedAst);
   runClass(className);
 }
