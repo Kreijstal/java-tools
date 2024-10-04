@@ -1,0 +1,15 @@
+{
+  "name": "jvm_tools",
+  "version": "0.0.1",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "kreijstal",
+  "license": "AGPLv3",
+  "description": "",
+  "dependencies": {
+    "jvm_parser": "^0.0.3"
+  }
+}
