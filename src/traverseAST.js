@@ -19,7 +19,7 @@ const convertedAst = convertJson(ast.ast, ast.constantPool);
 function addDescriptorReferences(referenceObj) {
   Object.keys(referenceObj).forEach(className => {
     const classObj = referenceObj[className];
-    Object.keys(classObj.children).forEach(childName => {
+    Object.entries(classObj.children).forEach(([childName, child]) => {
       const child = classObj.children[childName];
       const descriptor = child.descriptor;
       const descriptorAST = parseDescriptor(descriptor);
@@ -28,17 +28,17 @@ function addDescriptorReferences(referenceObj) {
       if (descriptorAST.params) {
         descriptorAST.params.forEach(paramType => {
           if (referenceObj[paramType]) {
-            referenceObj[paramType].referees.push(`${className}.${childName}.descriptor`);
+            referenceObj[paramType].referees.push(`${className}.children.${childName}.descriptor`);
           }
         });
         if (referenceObj[descriptorAST.returnType]) {
-          referenceObj[descriptorAST.returnType].referees.push(`${className}.${childName}.descriptor`);
+          referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
         }
       } else {
         // It's a field descriptor
         descriptorAST.forEach(type => {
           if (referenceObj[type]) {
-            referenceObj[type].referees.push(`${className}.${childName}.descriptor`);
+            referenceObj[type].referees.push(`${className}.children.${childName}.descriptor`);
           }
         });
       }
@@ -93,6 +93,5 @@ function traverseAST(ast) {
   console.log("Reference Object after descriptor pass:", JSON.stringify(referenceObj, null, 2));
 }
 
-console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
 console.log("Traversing AST for references:");
 traverseAST(convertedAst);
