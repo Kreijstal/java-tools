@@ -26,6 +26,17 @@ function traverseAST(node, path = []) {
       if (key === 'methodName') {
         console.log(`Method reference found at ${path.join('.')}: ${value}`);
       }
+      if (key === 'descriptor') {
+        const descriptorAST = parseDescriptor(value);
+        const referencedClasses = Array.isArray(descriptorAST)
+          ? descriptorAST
+          : [...descriptorAST.params, descriptorAST.returnType];
+        referencedClasses
+          .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
+          .forEach(referencedClass => {
+            console.log(`Type found at ${path.join('.')}: ${referencedClass}`);
+          });
+      }
       traverseAST(value, [...path, key]);
     }
   } else if (Array.isArray(node)) {
