@@ -451,6 +451,10 @@ function unparseDataStructures(root) {
     return "";
   }
 
+  if (!root || !root.classes) {
+    throw new Error("Invalid AST structure: 'classes' is undefined.");
+  }
+
   return root.classes
     .map((cls) => {
       // Include the .version directive if present
