@@ -21,7 +21,8 @@ function traverseAST(ast) {
     cls.items.forEach((item, itemIndex) => {
       if (item.type === "method") {
         const methodName = item.method.name;
-        console.log(`Method reference found at path classes.${classIndex}.items.${itemIndex}.method: ${methodName}`);
+        const methodDescriptor = item.method.descriptor;
+        console.log(`Method reference found at path classes.${classIndex}.items.${itemIndex}.method: ${methodName}, Descriptor: ${methodDescriptor}`);
         const descriptorAST = parseDescriptor(item.method.descriptor);
         const referencedClasses = Array.isArray(descriptorAST)
           ? descriptorAST
