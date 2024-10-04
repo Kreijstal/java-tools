@@ -162,8 +162,7 @@ Object.entries(referenceMap).forEach(([referencedClass, references]) => {
         const instruction = method.method.attributes
           .find(attr => attr.type === "code")
           .code.codeItems[index].instruction;
-        const part = instruction.arg[partIndex];
-        console.log(`In ${context}, instruction at index ${index}, part ${partIndex} references class:`, part);
+        console.log(`In ${context}, instruction at index ${index}:`, JSON.stringify(instruction, null, 2));
       }
     }
   });
