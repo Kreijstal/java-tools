@@ -61,26 +61,26 @@ function findClassReferences(ast) {
               index: path[path.length - 1],
               partIndex: 'instruction'
             });
-          }
-          if (Array.isArray(value.arg) && value.arg.length > 2) {
-            const descriptor = value.arg[2][1];
-            const descriptorAST = parseDescriptor(descriptor);
-            const referencedClasses = Array.isArray(descriptorAST)
-              ? descriptorAST
-              : [...descriptorAST.params, descriptorAST.returnType];
-            referencedClasses
-              .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
-              .forEach(referencedClass => {
-                console.log(`Type found in instruction at ${path.join('.')}: ${referencedClass}`);
-                if (!referenceMap[referencedClass]) {
-                  referenceMap[referencedClass] = [];
-                }
-                referenceMap[referencedClass].push({
-                  context,
-                  index: path[path.length - 1],
-                  partIndex: 'descriptor'
+            if (Array.isArray(value.arg) && value.arg.length > 2) {
+              const descriptor = value.arg[2][1];
+              const descriptorAST = parseDescriptor(descriptor);
+              const referencedClasses = Array.isArray(descriptorAST)
+                ? descriptorAST
+                : [...descriptorAST.params, descriptorAST.returnType];
+              referencedClasses
+                .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
+                .forEach(referencedClass => {
+                  console.log(`Type found in instruction at ${path.join('.')}: ${referencedClass}`);
+                  if (!referenceMap[referencedClass]) {
+                    referenceMap[referencedClass] = [];
+                  }
+                  referenceMap[referencedClass].push({
+                    context,
+                    index: path[path.length - 1],
+                    partIndex: 'descriptor'
+                  });
                 });
-              });
+            }
           }
         });
       }
