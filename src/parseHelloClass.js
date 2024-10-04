@@ -177,11 +177,40 @@ Object.entries(referenceMap).forEach(([referencedClass, references]) => {
   });
 });
 
+const refOrTaggedConstInstructions = [
+  "getfield",
+  "getstatic",
+  "invokedynamic",
+  "invokespecial",
+  "invokestatic",
+  "invokevirtual",
+  "putfield",
+  "putstatic"
+];
+
+const ldcInstructions = ["ldc", "ldc_w", "ldc2_w"];
+
+const newarrayTypes = [
+  "boolean",
+  "char",
+  "float",
+  "double",
+  "byte",
+  "short",
+  "int",
+  "long"
+];
+
 function traverseAndPrintTypes(node, path = []) {
   if (typeof node === 'object' && node !== null) {
     for (const [key, value] of Object.entries(node)) {
       if (key === 'className' || key === 'descriptor') {
         console.log(`Type found at ${path.join('.')}: ${value}`);
+      }
+      if (key === 'instruction' && value.op) {
+        if (refOrTaggedConstInstructions.includes(value.op) || ldcInstructions.includes(value.op)) {
+          console.log(`Type found in instruction at ${path.join('.')}: ${JSON.stringify(value.arg)}`);
+        }
       }
       traverseAndPrintTypes(value, [...path, key]);
     }
