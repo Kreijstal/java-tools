@@ -16,8 +16,12 @@ function loadAndTraverse(className,classPath) {
   Object.keys(referenceObj).forEach(className => {
     if (!loadedClasses.has(className)) {
       let newclass=loadClass(className,classPath);
-      console.log('Loaded class:', newclass);
-      convertedAst.classes.push(newclass.classes[0]); //appending
+      if (newclass) {
+        console.log('Loaded class:', newclass);
+        convertedAst.classes.push(newclass.classes[0]); //appending
+      } else {
+        console.error(`Failed to load class: ${className}`);
+      }
       loadedClasses.add(className);
       // Optionally, append the loaded class to convertedAst if needed
     }
