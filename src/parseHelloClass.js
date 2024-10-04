@@ -180,7 +180,7 @@ Object.entries(referenceMap).forEach(([referencedClass, references]) => {
 function traverseAndPrintTypes(node, path = []) {
   if (typeof node === 'object' && node !== null) {
     for (const [key, value] of Object.entries(node)) {
-      if (key === 'type') {
+      if (key === 'className' || key === 'descriptor') {
         console.log(`Type found at ${path.join('.')}: ${value}`);
       }
       traverseAndPrintTypes(value, [...path, key]);
