@@ -127,6 +127,21 @@ function addSelfReferences(referenceObj) {
   addDescriptorReferences(referenceObj);
   addSelfReferences(referenceObj);
   console.log("Reference Object after self-reference pass:", JSON.stringify(referenceObj, null, 2));
+
+  function printReferees(referenceObj) {
+    Object.entries(referenceObj).forEach(([className, classObj]) => {
+      console.log(`Class: ${className}`);
+      console.log(`  Referees: ${classObj.referees.join(', ')}`);
+      Object.entries(classObj.children).forEach(([childName, childObj]) => {
+        console.log(`  Child: ${childName}`);
+        console.log(`    Descriptor: ${childObj.descriptor}`);
+        console.log(`    Referees: ${childObj.referees.join(', ')}`);
+      });
+    });
+  }
+
+  console.log("Traversing Reference Object:");
+  printReferees(referenceObj);
 }
 
 console.log("Traversing AST for references:");
