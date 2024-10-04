@@ -95,8 +95,7 @@ function buildReferenceMap(ast) {
                   }
                   referenceMap[referencedClass].push({
                     instruction: codeItem.instruction,
-                    context: `${className}.${methodName}`,
-                    index: index
+                    context: `${className}.${methodName}`
                   });
                 }
               }
