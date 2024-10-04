@@ -43,10 +43,6 @@ function traverseAST(ast) {
               if (codeItem.instruction && codeItem.instruction.arg) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg)) {
-                  if (arg.length > 1) {
-                    const className = arg[1];
-                    console.log(`Class reference found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${className}`);
-                  }
                   if (arg.length > 2) {
                     const [fieldNameOrMethodName, descriptor] = arg[2];
                     const fieldOrMethodRef = new Reference(fieldNameOrMethodName, 'fieldOrMethod', methodRef);
