@@ -6,11 +6,18 @@ function renameMethod(referenceObj, className, oldMethodName, newMethodName) {
     return;
   }
 
-  // Rename the method in the reference object
+  // Rename the method in the convertedAst
+  const classObj = convertedAst.classes.find(cls => cls.className === className);
+  if (classObj) {
+    const methodObj = classObj.items.find(item => item.type === "method" && item.method.name === oldMethodName);
+    if (methodObj) {
+      methodObj.method.name = newMethodName;
+    }
+  }
   referenceObj[className].children[newMethodName] = referenceObj[className].children[oldMethodName];
   delete referenceObj[className].children[oldMethodName];
 
-  // Update all referees
+  // Rename the method in the reference object
   referenceObj[className].children[oldMethodName].referees.forEach(refereePath => {
     const pathParts = refereePath.split('.');
     const methodIndex = pathParts.findIndex(part => part === oldMethodName);
