@@ -33,7 +33,7 @@ function addDescriptorReferences(referenceObj) {
           }
         });
         if (!nativeTypes.has(descriptorAST.returnType) && referenceObj[descriptorAST.returnType]) {
-          referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
+          referenceObj[descriptorAST.returnType].referees.push(`refobj.${className}.children.${childName}.descriptor`);
         }
       } else {
         // It's a field descriptor
@@ -61,7 +61,7 @@ function addSelfReferences(referenceObj) {
           if (!nativeTypes.has(paramType) && !referenceObj[paramType]) {
             referenceObj[paramType] = { children: {}, referees: [] };
           }
-          referenceObj[paramType].referees.push(`${className}.children.${childName}.descriptor`);
+          referenceObj[paramType].referees.push(`refobj.${className}.children.${childName}.descriptor`);
         });
         if (!nativeTypes.has(descriptorAST.returnType)) {
           if (!referenceObj[descriptorAST.returnType]) {
@@ -75,7 +75,7 @@ function addSelfReferences(referenceObj) {
           if (!nativeTypes.has(type) && !referenceObj[type]) {
             referenceObj[type] = { children: {}, referees: [] };
           }
-          referenceObj[type].referees.push(`${className}.children.${childName}.descriptor`);
+          referenceObj[type].referees.push(`refobj.${className}.children.${childName}.descriptor`);
         });
       }
     });
