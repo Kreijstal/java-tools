@@ -11,7 +11,7 @@ function renameMethod(referenceObj, className, oldMethodName, newMethodName) {
   delete referenceObj[className].children[oldMethodName];
 
   // Update all referees
-  referenceObj[className].children[newMethodName].referees.forEach(refereePath => {
+  referenceObj[className].children[oldMethodName].referees.forEach(refereePath => {
     const pathParts = refereePath.split('.');
     const methodIndex = pathParts.findIndex(part => part === oldMethodName);
     if (methodIndex !== -1) {

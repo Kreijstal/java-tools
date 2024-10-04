@@ -14,6 +14,7 @@ function assembleClasses(root) {
 
     // Log the unparsed .j file content instead of assembling and executing
     console.log(`Unparsed content for ${className}:\n${jContent}\n`);
+    // execSync(`krak2 asm ${jFileName} --out ${classFileName}`);
   });
 }
 
