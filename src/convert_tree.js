@@ -382,7 +382,7 @@ function convertJson(inputJson, constantPool) {
   return outputJson;
 }
 
-function unparseDataStructures(root) {
+function unparseDataStructures(cls) {
   function formatInstruction(instr) {
     if (typeof instr === "string") {
       return instr;
@@ -451,12 +451,7 @@ function unparseDataStructures(root) {
     return "";
   }
 
-  if (!root || !root.classes) {
-    throw new Error("Invalid AST structure: 'classes' is undefined.");
-  }
-
-  return root.classes
-    .map((cls) => {
+  return ((cls) => {
       // Include the .version directive if present
       const headerLines = [];
 
@@ -563,7 +558,7 @@ function unparseDataStructures(root) {
         .filter(Boolean)
         .join("\n");
     })
-    .join("\n\n");
+})(cls);
 }
 
 module.exports={unparseDataStructures,convertJson};
