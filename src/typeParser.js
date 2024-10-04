@@ -22,7 +22,7 @@ function parseDescriptor(descriptor) {
       const semicolonIndex = descriptor.indexOf(';', index);
       const className = descriptor.substring(index + 1, semicolonIndex).replace(/\//g, '.');
       index = semicolonIndex + 1;
-      return { type: className + '[]'.repeat(arrayDepth), index };
+      return { type: className, index };
     }
 
     const type = types[descriptor[index]];

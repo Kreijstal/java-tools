@@ -131,16 +131,18 @@ function buildReferenceMap(ast) {
                       }
                       // Check if the part is a descriptor
                       const descriptorMatches = parseDescriptor(part);
-                      descriptorMatches.forEach((descriptorClass) => {
-                        if (!referenceMap[descriptorClass]) {
-                          referenceMap[descriptorClass] = [];
-                        }
-                        referenceMap[descriptorClass].push({
-                          context: `${className}.${methodName}`,
-                          index: index,
-                          partIndex: 'descriptor' // Indicate it's from the descriptor
+                      descriptorMatches
+                        .filter(descriptorClass => descriptorClass.includes('/'))
+                        .forEach((descriptorClass) => {
+                          if (!referenceMap[descriptorClass]) {
+                            referenceMap[descriptorClass] = [];
+                          }
+                          referenceMap[descriptorClass].push({
+                            context: `${className}.${methodName}`,
+                            index: index,
+                            partIndex: 'descriptor' // Indicate it's from the descriptor
+                          });
                         });
-                      });
                     }
                   });
                 }
