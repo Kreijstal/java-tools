@@ -33,22 +33,23 @@ function renameMethod(convertedAst, referenceObj, className, oldMethodName, newM
   // Update all referees
   methodRef.referees.forEach(refereePath => {
     const pathParts = refereePath.split('.');
-    const methodIndex = pathParts.findIndex(part => part === oldMethodName);
-    if (methodIndex !== -1) {
-      pathParts[methodIndex] = newMethodName;
-      const newPath = pathParts.join('.');
-      referenceObj[className].children[newMethodName].referees.push(newPath);
+    pathParts.forEach((part, index) => {
+      if (part === oldMethodName) {
+        pathParts[index] = newMethodName;
+      }
+    });
+    const newPath = pathParts.join('.');
+    referenceObj[className].children[newMethodName].referees.push(newPath);
 
-      // Update the method name in the convertedAst using the referee path
-      let current = convertedAst;
-      for (const part of pathParts) {
-        if (current && typeof current === 'object') {
-          current = current[part];
-        }
+    // Update the method name in the convertedAst using the referee path
+    let current = convertedAst;
+    for (const part of pathParts) {
+      if (current && typeof current === 'object') {
+        current = current[part];
       }
-      if (current && current.method) {
-        current.method.name = newMethodName;
-      }
+    }
+    if (current && current.method) {
+      current.method.name = newMethodName;
     }
   });
 
