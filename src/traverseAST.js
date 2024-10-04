@@ -135,7 +135,12 @@ function addSelfReferences(referenceObj) {
       Object.entries(classObj.children).forEach(([childName, childObj]) => {
         console.log(`  Child: ${childName}`);
         console.log(`    Descriptor: ${childObj.descriptor}`);
-        console.log(`    Referees: ${childObj.referees.join(', ')}`);
+        console.log(`    Referees:`);
+        childObj.referees.forEach(refereePath => {
+          console.log(`      Path: ${refereePath}`);
+          const refereeObject = followPath(convertedAst, refereePath);
+          console.log(`      Object: ${JSON.stringify(refereeObject, null, 2)}`);
+        });
       });
     });
   }
