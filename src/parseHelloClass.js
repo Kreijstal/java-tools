@@ -43,8 +43,39 @@ function findClassReferences(ast) {
   return classReferences;
 }
 
-// Find and attempt to load all class references
-const classReferences = findClassReferences(convertedAst);
-classReferences.forEach((className) => {
+function findClassReferencesWithContext(ast) {
+  const classReferences = [];
+
+  ast.classes.forEach((cls) => {
+    cls.items.forEach((item) => {
+      if (item.type === "method") {
+        const methodName = item.method.name;
+        item.method.attributes.forEach((attr) => {
+          if (attr.type === "code") {
+            attr.code.codeItems.forEach((codeItem) => {
+              if (codeItem.instruction && codeItem.instruction.arg) {
+                const arg = codeItem.instruction.arg;
+                if (Array.isArray(arg) && arg.length > 1) {
+                  const className = arg[1];
+                  classReferences.push({
+                    className,
+                    context: `${cls.className}.${methodName}`
+                  });
+                }
+              }
+            });
+          }
+        });
+      }
+    });
+  });
+
+  return classReferences;
+}
+
+// Find and attempt to load all class references with context
+const classReferencesWithContext = findClassReferencesWithContext(convertedAst);
+classReferencesWithContext.forEach(({ className, context }) => {
+  console.log(`In ${context}, attempt to load class ${className}`);
   loadClass(className);
 });
