@@ -211,9 +211,12 @@ function traverseAndPrintTypes(node, path = []) {
         if (refOrTaggedConstInstructions.includes(value.op) || ldcInstructions.includes(value.op)) {
           if (Array.isArray(value.arg) && value.arg.length > 2) {
             const descriptor = value.arg[2][1];
-            const referencedClasses = parseDescriptor(descriptor);
+            const descriptorAST = parseDescriptor(descriptor);
+            const referencedClasses = Array.isArray(descriptorAST)
+              ? descriptorAST
+              : [...descriptorAST.params, descriptorAST.returnType];
             referencedClasses
-              .filter(referencedClass => referencedClass.includes('/'))
+              .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
               .forEach(referencedClass => {
                 console.log(`Type found in instruction at ${path.join('.')}: ${referencedClass}`);
               });
