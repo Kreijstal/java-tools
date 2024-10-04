@@ -45,8 +45,8 @@ function traverseAST(ast) {
                   if (arg.length > 2) {
                     const [fieldNameOrMethodName, descriptor] = arg[2];
                     console.log(`Field or method name found in instruction at path classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}: ${fieldNameOrMethodName}, Parent class: ${arg[1]}, Type: ${descriptor}`);
-                    const descriptor = arg[2][1];
-                    const descriptorAST = parseDescriptor(descriptor);
+                    const methodDescriptor = arg[2][1];
+                    const descriptorAST = parseDescriptor(methodDescriptor);
                     const referencedClasses = Array.isArray(descriptorAST)
                       ? descriptorAST
                       : [...descriptorAST.params, descriptorAST.returnType];
