@@ -48,7 +48,7 @@ function traverseAST(ast) {
                     ? descriptorAST
                     : [...descriptorAST.params, descriptorAST.returnType];
                   referencedClasses
-                    .filter(referencedClass => typeof referencedClass === 'string' && referencedClass.includes('/'))
+                    .filter(referencedClass => typeof referencedClass === 'string')
                     .forEach(referencedClass => {
                       console.log(`Type found in instruction descriptor: ${referencedClass}`);
                     });
