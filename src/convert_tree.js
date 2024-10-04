@@ -557,8 +557,7 @@ function unparseDataStructures(cls) {
       ]
         .filter(Boolean)
         .join("\n");
-    })
-})(cls);
+    })(cls);
 }
 
 module.exports={unparseDataStructures,convertJson};
