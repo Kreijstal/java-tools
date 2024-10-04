@@ -28,6 +28,7 @@ function findClassReferences(ast) {
             attr.code.codeItems.forEach((codeItem, index) => {
               if (codeItem.instruction && codeItem.instruction.arg) {
                 const arg = codeItem.instruction.arg;
+                console.log(`Processing instruction: ${JSON.stringify(codeItem.instruction)}`);
                 if (Array.isArray(arg) && arg.length > 1) {
                   const className = arg[1];
                   classReferences.add(className);
@@ -35,7 +36,9 @@ function findClassReferences(ast) {
                 if (Array.isArray(arg) && arg.length > 2) {
                   // Parse method descriptor to include return and parameter types
                   const descriptor = arg[2][1];
+                  console.log(`Parsing descriptor: ${descriptor}`);
                   const referencedClasses = parseDescriptor(descriptor);
+                  console.log(`Referenced classes from descriptor: ${referencedClasses}`);
                   referencedClasses.forEach((referencedClass) => {
                     if (!referenceMap[referencedClass]) {
                       referenceMap[referencedClass] = [];
@@ -115,6 +118,7 @@ function buildReferenceMap(ast) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg) && arg.length > 1) {
                   const referencedClass = arg[1];
+                  console.log(`Found referenced class: ${referencedClass}`);
                   if (!referenceMap[referencedClass]) {
                     referenceMap[referencedClass] = [];
                   }
