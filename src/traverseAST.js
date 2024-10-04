@@ -8,12 +8,8 @@ const { Reference } = require('./referenceInterface');
 // Path to the compiled Hello.class file
 const nativeTypes = new Set(["byte", "char", "double", "float", "int", "long", "short", "boolean", "void"]);
 
-function getReferenceObjFromClass(classFilePath, addSelfRefs = false) {
-  const classFileContent = fs.readFileSync(classFilePath);
-  const ast = getAST(new Uint8Array(classFileContent));
-  const convertedAst = convertJson(ast.ast, ast.constantPool);
-
-  const referenceObj = traverseAST(convertedAst);
+function getReferenceObjFromClass(convertedAst, classIndex, addSelfRefs = false) {
+  const referenceObj = traverseAST(convertedAst, classIndex);
 
   if (addSelfRefs) {
     addSelfReferences(referenceObj);
@@ -85,7 +81,9 @@ function addSelfReferences(referenceObj) {
     });
   });
 }
-function traverseAST(ast) {
+function traverseAST(convertedAst, classIndex) {
+  const referenceObj = {};
+  const cls = convertedAst[classIndex];
   const referenceObj = {};
 
   ast.classes.forEach((cls, classIndex) => {
