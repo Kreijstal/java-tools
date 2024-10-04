@@ -6,17 +6,21 @@ const { parseDescriptor } = require('./typeParser');
 const { Reference } = require('./referenceInterface');
 
 // Path to the compiled Hello.class file
-const classFilePath = path.join(__dirname, '../sources/Hello.class');
-
-// Read the binary content of the class file
-const classFileContent = fs.readFileSync(classFilePath);
-
-// Get the AST of the class file
-const ast = getAST(new Uint8Array(classFileContent));
-
-const convertedAst = convertJson(ast.ast, ast.constantPool);
-
 const nativeTypes = new Set(["byte", "char", "double", "float", "int", "long", "short", "boolean", "void"]);
+
+function getReferenceObjFromClass(classFilePath, addSelfRefs = false) {
+  const classFileContent = fs.readFileSync(classFilePath);
+  const ast = getAST(new Uint8Array(classFileContent));
+  const convertedAst = convertJson(ast.ast, ast.constantPool);
+
+  const referenceObj = traverseAST(convertedAst);
+
+  if (addSelfRefs) {
+    addSelfReferences(referenceObj);
+  }
+
+  return referenceObj;
+}
 
 function addDescriptorReferences(referenceObj) {
   Object.keys(referenceObj).forEach(className => {
@@ -81,72 +85,70 @@ function addSelfReferences(referenceObj) {
     });
   });
 }
-  function traverseAST(ast) {
-    const referenceObj = {};
+function traverseAST(ast) {
+  const referenceObj = {};
 
   ast.classes.forEach((cls, classIndex) => {
-    if (!referenceObj[cls.className]) {
-      referenceObj[cls.className] = { children: {}, referees: [] };
-    }
-    referenceObj[cls.className].referees.push(`classes.${classIndex}`);
-
-    cls.items.forEach((item, itemIndex) => {
-      if (item.type === "method") {
-        const methodName = item.method.name;
-        const methodDescriptor = item.method.descriptor;
-        referenceObj[cls.className].children[methodName] = {
-          descriptor: methodDescriptor,
-          referees: [`classes.${classIndex}.items.${itemIndex}.method`]
-        };
-
-        item.method.attributes.forEach((attr, attrIndex) => {
-          if (attr.type === "code") {
-            attr.code.codeItems.forEach((codeItem, codeItemIndex) => {
-              if (codeItem.instruction && codeItem.instruction.arg) {
-                const arg = codeItem.instruction.arg;
-                if (Array.isArray(arg) && arg.length > 2) {
-                  const [fieldNameOrMethodName, descriptor] = arg[2];
-                  const parentClass = arg[1];
-
-                  if (!referenceObj[parentClass]) {
-                    referenceObj[parentClass] = { children: {}, referees: [] };
-                  }
-                  referenceObj[parentClass].children[fieldNameOrMethodName] = {
-                    descriptor: descriptor,
-                    referees: [`classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`]
-                  };
-                }
-              }
-            });
-          }
-        });
+      if (!referenceObj[cls.className]) {
+        referenceObj[cls.className] = { children: {}, referees: [] };
       }
-    });
-  });
+      referenceObj[cls.className].referees.push(`classes.${classIndex}`);
 
-  addDescriptorReferences(referenceObj);
-  addSelfReferences(referenceObj);
-  console.log("Reference Object after self-reference pass:", JSON.stringify(referenceObj, null, 2));
+      cls.items.forEach((item, itemIndex) => {
+        if (item.type === "method") {
+          const methodName = item.method.name;
+          const methodDescriptor = item.method.descriptor;
+          referenceObj[cls.className].children[methodName] = {
+            descriptor: methodDescriptor,
+            referees: [`classes.${classIndex}.items.${itemIndex}.method`]
+          };
 
-  function printReferees(referenceObj) {
-    Object.entries(referenceObj).forEach(([className, classObj]) => {
-      console.log(`Class: ${className}`);
-      console.log(`  Referees: ${classObj.referees.join(', ')}`);
-      Object.entries(classObj.children).forEach(([childName, childObj]) => {
-        console.log(`  Child: ${childName}`);
-        console.log(`    Descriptor: ${childObj.descriptor}`);
-        console.log(`    Referees:`);
-        childObj.referees.forEach(refereePath => {
-          // console.log(`      Path: ${refereePath}`);
-          // const refereeObject = followPath(convertedAst, refereePath);
-          // console.log(`      Object: ${JSON.stringify(refereeObject, null, 2)}`);
-        });
+          item.method.attributes.forEach((attr, attrIndex) => {
+            if (attr.type === "code") {
+              attr.code.codeItems.forEach((codeItem, codeItemIndex) => {
+                if (codeItem.instruction && codeItem.instruction.arg) {
+                  const arg = codeItem.instruction.arg;
+                  if (Array.isArray(arg) && arg.length > 2) {
+                    const [fieldNameOrMethodName, descriptor] = arg[2];
+                    const parentClass = arg[1];
+
+                    if (!referenceObj[parentClass]) {
+                      referenceObj[parentClass] = { children: {}, referees: [] };
+                    }
+                    referenceObj[parentClass].children[fieldNameOrMethodName] = {
+                      descriptor: descriptor,
+                      referees: [`classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`]
+                    };
+                  }
+                }
+              });
+            }
+          });
+        }
       });
     });
-  }
 
-  console.log("Traversing Reference Object:");
-  printReferees(referenceObj);
+    addDescriptorReferences(referenceObj);
+    return referenceObj;
+}
+
+function printReferees(referenceObj, debug = false) {
+  Object.entries(referenceObj).forEach(([className, classObj]) => {
+    console.log(`Class: ${className}`);
+    console.log(`  Referees: ${classObj.referees.join(', ')}`);
+    Object.entries(classObj.children).forEach(([childName, childObj]) => {
+      console.log(`  Child: ${childName}`);
+      console.log(`    Descriptor: ${childObj.descriptor}`);
+      console.log(`    Referees:`);
+      childObj.referees.forEach(refereePath => {
+        if (debug) {
+          console.log(`      Path: ${refereePath}`);
+          const refereeObject = followPath(convertedAst, refereePath);
+          console.log(`      Object: ${JSON.stringify(refereeObject, null, 2)}`);
+        }
+      });
+    });
+  });
 }
 
 function followPath(ast, path) {
@@ -162,5 +164,8 @@ function followPath(ast, path) {
   return current;
 }
 
-console.log("Traversing AST for references:");
-traverseAST(convertedAst);
+module.exports = {
+  getReferenceObjFromClass,
+  printReferees,
+  addSelfReferences
+};
