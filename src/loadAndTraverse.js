@@ -9,7 +9,6 @@ function loadAndTraverse(className,classPath) {
  
   const convertedAst = loadClass(className,classPath);
 
-  const loadedClasses = new Set();
   const loadedClasses = new Set([className]);
   let referenceObj = {};
   getReferenceObjFromClass(convertedAst, 0, referenceObj);
