@@ -52,7 +52,7 @@ function findClassReferencesWithContext(ast) {
         const methodName = item.method.name;
         item.method.attributes.forEach((attr) => {
           if (attr.type === "code") {
-            attr.code.codeItems.forEach((codeItem) => {
+            attr.code.codeItems.forEach((codeItem, index) => {
               if (codeItem.instruction && codeItem.instruction.arg) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg) && arg.length > 1) {
