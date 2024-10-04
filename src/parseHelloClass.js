@@ -25,7 +25,7 @@ function findClassReferences(ast) {
       if (item.type === "method") {
         item.method.attributes.forEach((attr) => {
           if (attr.type === "code") {
-            attr.code.codeItems.forEach((codeItem) => {
+            attr.code.codeItems.forEach((codeItem, index) => {
               if (codeItem.instruction && codeItem.instruction.arg) {
                 const arg = codeItem.instruction.arg;
                 if (Array.isArray(arg) && arg.length > 1) {
@@ -95,7 +95,8 @@ function buildReferenceMap(ast) {
                   }
                   referenceMap[referencedClass].push({
                     instruction: codeItem.instruction,
-                    context: `${className}.${methodName}`
+                    context: `${className}.${methodName}`,
+                    index: index
                   });
                 }
               }
