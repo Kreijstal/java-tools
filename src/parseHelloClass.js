@@ -32,19 +32,21 @@ function findClassReferences(ast) {
                   const className = arg[1];
                   classReferences.add(className);
                 }
-                // Parse method descriptor to include return and parameter types
-                const descriptor = codeItem.instruction.arg[2][1];
-                const referencedClasses = parseDescriptor(descriptor);
-                referencedClasses.forEach((referencedClass) => {
-                  if (!referenceMap[referencedClass]) {
-                    referenceMap[referencedClass] = [];
-                  }
-                  referenceMap[referencedClass].push({
-                    context: `${className}.${methodName}`,
-                    index: index,
-                    partIndex: 'descriptor' // Indicate it's from the descriptor
+                if (Array.isArray(arg) && arg.length > 2) {
+                  // Parse method descriptor to include return and parameter types
+                  const descriptor = arg[2][1];
+                  const referencedClasses = parseDescriptor(descriptor);
+                  referencedClasses.forEach((referencedClass) => {
+                    if (!referenceMap[referencedClass]) {
+                      referenceMap[referencedClass] = [];
+                    }
+                    referenceMap[referencedClass].push({
+                      context: `${className}.${methodName}`,
+                      index: index,
+                      partIndex: 'descriptor' // Indicate it's from the descriptor
+                    });
                   });
-                });
+                }
               }
             });
           }
