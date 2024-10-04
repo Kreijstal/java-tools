@@ -13,7 +13,4 @@ const classFileContent = fs.readFileSync(classFilePath);
 const ast = getAST(new Uint8Array(classFileContent));
 
 const convertedAst = convertJson(ast.ast, ast.constantPool);
-const asmSyntax = unparseDataStructures(convertedAst);
-
-// Output the ASM syntax
-console.log(asmSyntax);
+console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
