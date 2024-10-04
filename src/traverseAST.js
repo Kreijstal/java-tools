@@ -35,5 +35,6 @@ function traverseAST(node, path = []) {
   }
 }
 
+console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
 console.log("Traversing AST for references:");
 traverseAST(convertedAst);
