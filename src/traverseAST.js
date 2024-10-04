@@ -16,6 +16,8 @@ const ast = getAST(new Uint8Array(classFileContent));
 
 const convertedAst = convertJson(ast.ast, ast.constantPool);
 
+const nativeTypes = new Set(["byte", "char", "double", "float", "int", "long", "short", "boolean", "void"]);
+
 function addDescriptorReferences(referenceObj) {
   Object.keys(referenceObj).forEach(className => {
     const classObj = referenceObj[className];
@@ -26,17 +28,17 @@ function addDescriptorReferences(referenceObj) {
       // Check if the descriptor is a method descriptor
       if (descriptorAST.params) {
         descriptorAST.params.forEach(paramType => {
-          if (referenceObj[paramType]) {
+          if (!nativeTypes.has(paramType) && referenceObj[paramType]) {
             referenceObj[paramType].referees.push(`${className}.children.${childName}.descriptor`);
           }
         });
-        if (referenceObj[descriptorAST.returnType]) {
+        if (!nativeTypes.has(descriptorAST.returnType) && referenceObj[descriptorAST.returnType]) {
           referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
         }
       } else {
         // It's a field descriptor
         descriptorAST.forEach(type => {
-          if (referenceObj[type]) {
+          if (!nativeTypes.has(type) && referenceObj[type]) {
             referenceObj[type].referees.push(`${className}.children.${childName}.descriptor`);
           }
         });
@@ -46,6 +48,7 @@ function addDescriptorReferences(referenceObj) {
 }
 
 function addSelfReferences(referenceObj) {
+  const nativeTypes = new Set(["byte", "char", "double", "float", "int", "long", "short", "boolean", "void"]);
   Object.keys(referenceObj).forEach(className => {
     const classObj = referenceObj[className];
     Object.entries(classObj.children).forEach(([childName, child]) => {
@@ -55,19 +58,19 @@ function addSelfReferences(referenceObj) {
       // Check if the descriptor is a method descriptor
       if (descriptorAST.params) {
         descriptorAST.params.forEach(paramType => {
-          if (!referenceObj[paramType]) {
+          if (!nativeTypes.has(paramType) && !referenceObj[paramType]) {
             referenceObj[paramType] = { children: {}, referees: [] };
           }
           referenceObj[paramType].referees.push(`${className}.children.${childName}.descriptor`);
         });
-        if (!referenceObj[descriptorAST.returnType]) {
+        if (!nativeTypes.has(descriptorAST.returnType) && !referenceObj[descriptorAST.returnType]) {
           referenceObj[descriptorAST.returnType] = { children: {}, referees: [] };
         }
         referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
       } else {
         // It's a field descriptor
         descriptorAST.forEach(type => {
-          if (!referenceObj[type]) {
+          if (!nativeTypes.has(type) && !referenceObj[type]) {
             referenceObj[type] = { children: {}, referees: [] };
           }
           referenceObj[type].referees.push(`${className}.children.${childName}.descriptor`);
