@@ -28,7 +28,7 @@ function loadAndTraverse(className, classPath) {
       // Optionally, append the loaded class to convertedAst if needed
     }
   });
-  // console.log(JSON.stringify(referenceObj, null, 1));
+  console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
   renameMethod(convertedAst, referenceObj, 'TestMethods', 'publicMethod1', 'asfsdsdgre');
   assembleClasses(convertedAst);
   runClass(className);
