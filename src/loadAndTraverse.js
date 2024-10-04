@@ -5,6 +5,7 @@ const { convertJson } = require('./convert_tree');
 const { getReferenceObjFromClass } = require('./traverseAST');
 const { assembleClasses, runClass } = require('./assembleAndRun');
 const { loadClass } = require('./classLoader');
+const { renameMethod } = require('./renameMethod');
 
 function loadAndTraverse(className, classPath) {
  
@@ -27,7 +28,8 @@ function loadAndTraverse(className, classPath) {
       // Optionally, append the loaded class to convertedAst if needed
     }
   });
-  console.log(JSON.stringify(referenceObj,null,1));
+  // Example call to renameMethod
+  renameMethod(referenceObj, 'TestMethods', 'publicMethod1', 'asfsdsdgre');
   assembleClasses(convertedAst);
   runClass(className);
 }
