@@ -123,6 +123,7 @@ function buildReferenceMap(ast) {
                     referenceMap[referencedClass] = [];
                   }
                   arg.forEach((part, partIndex) => {
+                    console.log(`Resolving part: ${part} at index: ${index}, partIndex: ${partIndex}`);
                     if (typeof part === 'string' && part.includes('/')) {
                       const referencedClass = part;
                       if (!referenceMap[referencedClass]) {
