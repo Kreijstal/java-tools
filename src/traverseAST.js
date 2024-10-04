@@ -45,7 +45,37 @@ function addDescriptorReferences(referenceObj) {
   });
 }
 
-function traverseAST(ast) {
+function addSelfReferences(referenceObj) {
+  Object.keys(referenceObj).forEach(className => {
+    const classObj = referenceObj[className];
+    Object.entries(classObj.children).forEach(([childName, child]) => {
+      const descriptor = child.descriptor;
+      const descriptorAST = parseDescriptor(descriptor);
+
+      // Check if the descriptor is a method descriptor
+      if (descriptorAST.params) {
+        descriptorAST.params.forEach(paramType => {
+          if (!referenceObj[paramType]) {
+            referenceObj[paramType] = { children: {}, referees: [] };
+          }
+          referenceObj[paramType].referees.push(`${className}.children.${childName}.descriptor`);
+        });
+        if (!referenceObj[descriptorAST.returnType]) {
+          referenceObj[descriptorAST.returnType] = { children: {}, referees: [] };
+        }
+        referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
+      } else {
+        // It's a field descriptor
+        descriptorAST.forEach(type => {
+          if (!referenceObj[type]) {
+            referenceObj[type] = { children: {}, referees: [] };
+          }
+          referenceObj[type].referees.push(`${className}.children.${childName}.descriptor`);
+        });
+      }
+    });
+  });
+}
   const referenceObj = {};
 
   ast.classes.forEach((cls, classIndex) => {
@@ -89,7 +119,8 @@ function traverseAST(ast) {
   });
 
   addDescriptorReferences(referenceObj);
-  console.log("Reference Object after descriptor pass:", JSON.stringify(referenceObj, null, 2));
+  addSelfReferences(referenceObj);
+  console.log("Reference Object after self-reference pass:", JSON.stringify(referenceObj, null, 2));
 }
 
 console.log("Traversing AST for references:");
