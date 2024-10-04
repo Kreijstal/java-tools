@@ -63,10 +63,12 @@ function addSelfReferences(referenceObj) {
           }
           referenceObj[paramType].referees.push(`${className}.children.${childName}.descriptor`);
         });
-        if (!nativeTypes.has(descriptorAST.returnType) && !referenceObj[descriptorAST.returnType]) {
-          referenceObj[descriptorAST.returnType] = { children: {}, referees: [] };
+        if (!nativeTypes.has(descriptorAST.returnType)) {
+          if (!referenceObj[descriptorAST.returnType]) {
+            referenceObj[descriptorAST.returnType] = { children: {}, referees: [] };
+          }
+          referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
         }
-        referenceObj[descriptorAST.returnType].referees.push(`${className}.children.${childName}.descriptor`);
       } else {
         // It's a field descriptor
         descriptorAST.forEach(type => {
