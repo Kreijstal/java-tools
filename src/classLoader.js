@@ -38,4 +38,24 @@ function loadClass(className, classPath) {
   return null;
 }
 
-module.exports = { loadClass };
+function loadClassByPath(classFilePath) {
+  console.log(`Attempt to load class from file: ${classFilePath}`);
+
+  if (!fs.existsSync(classFilePath)) {
+    console.error(`Class file not found: ${classFilePath}`);
+    return null;
+  }
+
+  // Read the class file content
+  const classFileContent = fs.readFileSync(classFilePath);
+
+  // Generate the AST
+  const ast = getAST(new Uint8Array(classFileContent));
+
+  // Convert the AST
+  const convertedAst = convertJson(ast.ast, ast.constantPool);
+
+  return convertedAst;
+}
+
+module.exports = { loadClass, loadClassByPath };
