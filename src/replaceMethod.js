@@ -19,13 +19,13 @@ module.exports.replaceMethod = function replaceMethod(mainClass,className, class
 if (require.main === module) {
   function main() {
     const args = process.argv.slice(2);
-    if (args.length !== 4) {
-      console.error('Usage: node replaceMethod.js <className> <classPath> <oldMethodName> <newMethodName>');
+    if (args.length !== 5) {
+      console.error('Usage: node replaceMethod.js <mainClass> <className> <classPath> <oldMethodName> <newMethodName> <targetPath>');
       process.exit(1);
     }
 
-    const [className, classPath, oldMethodName, newMethodName] = args;
-    replaceMethod(className, classPath, oldMethodName, newMethodName);
+    const [mainClass, className, classPath, oldMethodName, newMethodName, targetPath] = args;
+    replaceMethod(mainClass, className, classPath, oldMethodName, newMethodName, targetPath);
   }
 
   main();
