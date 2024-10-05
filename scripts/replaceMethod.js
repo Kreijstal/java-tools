@@ -4,7 +4,10 @@ const { renameMethod } = require('../src/renameMethod');
 function replaceMethod(className, classPath, oldMethodName, newMethodName) {
   const convertedAst = loadAndTraverse(className, classPath);
   let referenceObj = {};
+  console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
+  console.log("Reference Object before renaming:", JSON.stringify(referenceObj, null, 2));
   renameMethod(convertedAst, referenceObj, className, oldMethodName, newMethodName);
+  console.log("Reference Object after renaming:", JSON.stringify(referenceObj, null, 2));
 }
 
 function main() {
