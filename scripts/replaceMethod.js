@@ -4,7 +4,7 @@ const { assembleClasses } = require('../src/assembleAndRun');
 const { getReferenceObjFromClass } = require('../src/traverseAST');
 const { renameMethod } = require('../src/renameMethod');
 
-function replaceMethod(className, classPath, oldMethodName, newMethodName) {
+module.exports.replaceMethod = function replaceMethod(className, classPath, oldMethodName, newMethodName) {
   const convertedAst = loadClass(className, classPath);
   console.log("Loaded AST:", JSON.stringify(convertedAst, null, 2));
 
