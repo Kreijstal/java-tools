@@ -18,6 +18,7 @@ function runTest() {
   });
 
   // Perform the method renaming
+  console.log(`Calling replaceMethod with: className=TestMethods, classPath=${tempDir}, oldMethodName=publicMethod1, newMethodName=newMethodName`);
   replaceMethod('TestMethods', tempDir, 'publicMethod1', 'newMethodName');
 
   // Verify the method has been renamed
