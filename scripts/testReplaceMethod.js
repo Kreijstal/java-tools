@@ -18,23 +18,29 @@ function runTest() {
   });
 
   // Perform the method renaming
-  replaceMethod('TestMethods', sourceDir, 'publicMethod1', 'newMethodName');
+  replaceMethod('TestMethods', tempDir, 'publicMethod1', 'newMethodName');
 
   // Verify the method has been renamed
-  const classFilePath = path.join(sourceDir, 'TestMethods.class');
+  const classFilePath = path.join(tempDir, 'TestMethods.class');
   const classDetails = execSync(`node scripts/listClassDetails.js ${classFilePath}`).toString();
   if (!classDetails.includes('newMethodName')) {
     console.error('Method renaming failed.');
     process.exit(1);
   }
 
+  // Change directory to temp directory
+  process.chdir(tempDir);
+
   // Run the Java class
   try {
-    const output = execSync(`java -cp ${sourceDir} TestMethods`).toString();
+    const output = execSync(`java -cp . TestMethods`).toString();
     console.log('Java program output:', output);
   } catch (error) {
     console.error('Error running Java program:', error);
     process.exit(1);
+  } finally {
+    // Change back to the original directory
+    process.chdir(__dirname);
   }
 }
 
