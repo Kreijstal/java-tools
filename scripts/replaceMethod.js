@@ -1,5 +1,6 @@
 const { loadAndTraverse } = require('../src/loadAndTraverse');
 const { loadClass } = require('../src/classLoader');
+const { assembleClasses } = require('../src/assembleAndRun');
 const { getReferenceObjFromClass } = require('../src/traverseAST');
 const { renameMethod } = require('../src/renameMethod');
 
