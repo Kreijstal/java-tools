@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { replaceMethod } = require('../src/replaceMethod');
+const { replaceMethod } = require('./replaceMethod');
 
 function runTest() {
   const tempDir = path.join(__dirname, 'tempTestDir');
