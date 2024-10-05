@@ -23,7 +23,7 @@ function listClassDetails(classFilePath) {
   } else {
     console.log('No classes found in class data.');
   }
-  classData.items.forEach(item => {
+  classData.classes[0].items.forEach(item => {
     if (item.type === 'field') {
       classDetails.fields.push({
         name: item.field.name,
