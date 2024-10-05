@@ -6,10 +6,12 @@ const { renameMethod } = require('../src/renameMethod');
 
 function replaceMethod(className, classPath, oldMethodName, newMethodName) {
   const convertedAst = loadClass(className, classPath);
+  console.log("Loaded AST:", JSON.stringify(convertedAst, null, 2));
 
   const loadedClasses = new Set([className]);
   let referenceObj = {};
   getReferenceObjFromClass(convertedAst, 0, referenceObj);
+  console.log("Initial Reference Object:", JSON.stringify(referenceObj, null, 2));
 
   Object.keys(referenceObj).forEach(className => {
     if (!loadedClasses.has(className)) {
@@ -25,9 +27,11 @@ function replaceMethod(className, classPath, oldMethodName, newMethodName) {
   });
 
   assembleClasses(convertedAst);
+  console.log("Assembled Classes:", JSON.stringify(convertedAst, null, 2));
   // console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
   // console.log("Reference Object before renaming:", JSON.stringify(referenceObj, null, 2));
   renameMethod(convertedAst, referenceObj, className, oldMethodName, newMethodName);
+  console.log("Reference Object after renaming:", JSON.stringify(referenceObj, null, 2));
   // console.log("Reference Object after renaming:", JSON.stringify(referenceObj, null, 2));
 }
 
