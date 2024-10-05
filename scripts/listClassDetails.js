@@ -3,7 +3,7 @@ const { parseDescriptor } = require('../src/typeParser');
 
 function listClassDetails(classFilePath) {
   const classData = loadClassByPath(classFilePath);
-  console.log('Loaded class data:', classData);
+  console.log('Loaded class data:', JSON.stringify(classData, null, 2));
   if (!classData) {
     console.error(`Failed to load class from file: ${classFilePath}`);
     process.exit(1);
@@ -18,7 +18,11 @@ function listClassDetails(classFilePath) {
     }
   };
 
-  console.log('Class data items:', classData.items);
+  if (classData.classes && classData.classes.length > 0) {
+    console.log('Class data items:', JSON.stringify(classData.classes[0].items, null, 2));
+  } else {
+    console.log('No classes found in class data.');
+  }
   classData.items.forEach(item => {
     if (item.type === 'field') {
       classDetails.fields.push({
