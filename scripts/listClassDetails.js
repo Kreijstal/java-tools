@@ -1,8 +1,8 @@
-const { loadClass } = require('../src/classLoader');
+const { loadClassByPath } = require('../src/classLoader');
 const { parseDescriptor } = require('../src/typeParser');
 
 function listClassDetails(classFilePath) {
-  const classData = loadClass(classFilePath);
+  const classData = loadClassByPath(classFilePath);
   if (!classData) {
     console.error(`Failed to load class from file: ${classFilePath}`);
     process.exit(1);
