@@ -25,10 +25,10 @@ function replaceMethod(className, classPath, oldMethodName, newMethodName) {
   });
 
   assembleClasses(convertedAst);
-  console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
-  console.log("Reference Object before renaming:", JSON.stringify(referenceObj, null, 2));
+  // console.log("Converted AST:", JSON.stringify(convertedAst, null, 2));
+  // console.log("Reference Object before renaming:", JSON.stringify(referenceObj, null, 2));
   renameMethod(convertedAst, referenceObj, className, oldMethodName, newMethodName);
-  console.log("Reference Object after renaming:", JSON.stringify(referenceObj, null, 2));
+  // console.log("Reference Object after renaming:", JSON.stringify(referenceObj, null, 2));
 }
 
 function main() {
