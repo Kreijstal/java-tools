@@ -17,32 +17,25 @@ function runTest() {
     fs.copyFileSync(srcFile, destFile);
   });
 
-  // Change directory to temp directory
-  process.chdir(tempDir);
-
   // Perform the method renaming
-  replaceMethod('TestMethods', '.', 'publicMethod1', 'newMethodName');
+  replaceMethod('TestMethods', sourceDir, 'publicMethod1', 'newMethodName');
 
   // Verify the method has been renamed
-  const classFileContent = fs.readFileSync('TestMethods.java', 'utf8');
-  if (!classFileContent.includes('newMethodName')) {
+  const classFilePath = path.join(sourceDir, 'TestMethods.class');
+  const classDetails = execSync(`node scripts/listClassDetails.js ${classFilePath}`).toString();
+  if (!classDetails.includes('newMethodName')) {
     console.error('Method renaming failed.');
     process.exit(1);
   }
 
-  // Compile and run the Java class
+  // Run the Java class
   try {
-    execSync('javac TestMethods.java');
-    const output = execSync('java TestMethods').toString();
+    const output = execSync(`java -cp ${sourceDir} TestMethods`).toString();
     console.log('Java program output:', output);
   } catch (error) {
     console.error('Error running Java program:', error);
     process.exit(1);
   }
-
-  // Clean up
-  process.chdir(__dirname);
-  fs.rmSync(tempDir, { recursive: true, force: true });
 }
 
 runTest();
