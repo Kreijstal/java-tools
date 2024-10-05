@@ -1,4 +1,5 @@
 const { loadAndTraverse } = require('../src/loadAndTraverse');
+const { loadClass } = require('../src/classLoader');
 const { renameMethod } = require('../src/renameMethod');
 
 function replaceMethod(className, classPath, oldMethodName, newMethodName) {
