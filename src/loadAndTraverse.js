@@ -29,7 +29,7 @@ function loadAndTraverse(className, classPath) {
     }
   });
   assembleClasses(convertedAst);
-  return convertedAst;
+  return {convertedAst,referenceObj};
 }
 
 module.exports = { loadAndTraverse };
