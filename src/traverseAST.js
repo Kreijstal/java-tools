@@ -3,7 +3,7 @@ const path = require('path');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('./convert_tree');
 const { parseDescriptor } = require('./typeParser');
-const { Reference } = require('./referenceInterface');
+//const { Reference } = require('./referenceInterface');
 
 // Path to the compiled Hello.class file
 const nativeTypes = new Set(["byte", "char", "double", "float", "int", "long", "short", "boolean", "void"]);
