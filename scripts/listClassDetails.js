@@ -34,7 +34,7 @@ function listClassDetails(classFilePath) {
         name: item.method.name,
         descriptor: item.method.descriptor
       };
-      const flags = parseDescriptor(item.method.descriptor).flags;
+      const flags = item.method.flags;
       if (flags.includes('public')) {
         classDetails.methods.public.push(methodDetails);
       } else if (flags.includes('private')) {
