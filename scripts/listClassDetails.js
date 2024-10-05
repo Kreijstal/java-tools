@@ -12,10 +12,7 @@ function listClassDetails(classFilePath) {
   const classDetails = {
     className: classData.className,
     fields: [],
-    methods: {
-      public: [],
-      private: []
-    }
+    methods: []
   };
 
   if (classData.classes && classData.classes.length > 0) {
@@ -27,19 +24,16 @@ function listClassDetails(classFilePath) {
     if (item.type === 'field') {
       classDetails.fields.push({
         name: item.field.name,
-        descriptor: item.field.descriptor
+        descriptor: item.field.descriptor,
+        flags: item.field.flags
       });
     } else if (item.type === 'method') {
       const methodDetails = {
         name: item.method.name,
         descriptor: item.method.descriptor
       };
-      const flags = item.method.flags;
-      if (flags.includes('public')) {
-        classDetails.methods.public.push(methodDetails);
-      } else if (flags.includes('private')) {
-        classDetails.methods.private.push(methodDetails);
-      }
+      methodDetails.flags = item.method.flags;
+      classDetails.methods.push(methodDetails);
     }
   });
 
