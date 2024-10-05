@@ -35,15 +35,17 @@ function replaceMethod(className, classPath, oldMethodName, newMethodName) {
   // console.log("Reference Object after renaming:", JSON.stringify(referenceObj, null, 2));
 }
 
-function main() {
-  const args = process.argv.slice(2);
-  if (args.length !== 4) {
-    console.error('Usage: node replaceMethod.js <className> <classPath> <oldMethodName> <newMethodName>');
-    process.exit(1);
+if (require.main === module) {
+  function main() {
+    const args = process.argv.slice(2);
+    if (args.length !== 4) {
+      console.error('Usage: node replaceMethod.js <className> <classPath> <oldMethodName> <newMethodName>');
+      process.exit(1);
+    }
+
+    const [className, classPath, oldMethodName, newMethodName] = args;
+    replaceMethod(className, classPath, oldMethodName, newMethodName);
   }
 
-  const [className, classPath, oldMethodName, newMethodName] = args;
-  replaceMethod(className, classPath, oldMethodName, newMethodName);
+  main();
 }
-
-main();
