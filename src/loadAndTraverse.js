@@ -28,7 +28,7 @@ function loadAndTraverse(className, classPath) {
       // Optionally, append the loaded class to convertedAst if needed
     }
   });
-  assembleClasses(convertedAst);
+  //assembleClasses(convertedAst);
   return {convertedAst,referenceObj};
 }
 
