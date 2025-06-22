@@ -38,8 +38,10 @@ function loadClass(className, classPath) {
   return null;
 }
 
-function loadClassByPath(classFilePath) {
-  console.log(`Attempt to load class from file: ${classFilePath}`);
+function loadClassByPath(classFilePath, options = {}) {
+  if (!options.silent) {
+    console.log(`Attempt to load class from file: ${classFilePath}`);
+  }
 
   if (!fs.existsSync(classFilePath)) {
     console.error(`Class file not found: ${classFilePath}`);
