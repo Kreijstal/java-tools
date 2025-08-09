@@ -162,6 +162,7 @@ function convertJson(inputJson, constantPool) {
           stackSize: method.code.maxStack.toString(),
           localsSize: method.code.maxLocals.toString(),
           codeItems: [],
+          exceptionTable: [],
           attributes: []
         }
       };
@@ -291,21 +292,20 @@ function convertJson(inputJson, constantPool) {
         instruction: null
       });
 
-      // Handle exception table entries (Add after instructions)
+      // Handle exception table entries
       if (method.code.exceptionTable && method.code.exceptionTable.length > 0) {
-        method.code.exceptionTable.forEach((ex) => {
-          const catchItem = {
-            type: "catch",
-            clsref: resolveConstant(ex.catch_type).value,
-            fromLbl: labelMap[ex.start_pc],
-            toLbl: labelMap[ex.end_pc],
-            usingLbl: labelMap[ex.handler_pc]
+        codeAttr.code.exceptionTable = method.code.exceptionTable.map((ex) => {
+          const catchTypeIndex = ex.catch_type;
+          const catchType = catchTypeIndex === 0
+            ? "any"
+            : resolveConstant(catchTypeIndex).value.replace(/\./g, "/");
+
+          return {
+            start_pc: ex.start_pc,
+            end_pc: ex.end_pc,
+            handler_pc: ex.handler_pc,
+            catch_type: catchType,
           };
-          const lastLabelIndex = codeAttr.code.codeItems.findIndex(
-            (item) =>
-              item.labelDef === labelMap[catchItem.fromLbl.substr(1)] + ":"
-          );
-          codeAttr.code.codeItems.splice(lastLabelIndex, 0, catchItem);
         });
       }
 

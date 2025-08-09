@@ -33,6 +33,11 @@ class Stack {
   size() {
     return this.items.length;
   }
+
+  // Clear the stack
+  clear() {
+    this.items = [];
+  }
 }
 
 module.exports = Stack;
