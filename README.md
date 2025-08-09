@@ -126,8 +126,9 @@ The JVM implementation currently supports a comprehensive set of Java bytecode i
 ### Local Variable Operations  
 - `iload_0`, `iload_1`, `iload_2`, `iload_3` - Load integers from local variables
 - `istore_0`, `istore_1`, `istore_2`, `istore_3` - Store integers to local variables
-- `aload_0`, `aload_1` - Load object references from local variables
-- `astore_0`, `astore_1` - Store object references to local variables
+- `aload_0`, `aload_1`, `aload_2`, `aload_3` - Load object references from local variables
+- `astore_0`, `astore_1`, `astore_2`, `astore_3` - Store object references to local variables
+- `aload`, `astore` - Load/store object references from/to any local variable index
 
 ### Arithmetic Operations
 - `iadd` - Integer addition
@@ -142,7 +143,7 @@ The JVM implementation currently supports a comprehensive set of Java bytecode i
 
 ### Method Invocation
 - `invokestatic` - Invoke static methods
-- `invokevirtual` - Invoke virtual methods (including System.out.println)
+- `invokevirtual` - Invoke virtual methods (including System.out.println and String.concat)
 - `invokespecial` - Invoke constructors and private methods
 
 ### Field Access
@@ -160,3 +161,28 @@ The following Java programs are included as test cases:
 - **SmallDivisionTest.java** - Shows integer division and remainder
 - **ConstantsTest.java** - Tests all integer constant instructions
 - **Calculator.java** - Static method calls with parameters
+- **SimpleStringConcat.java** - Simple string concatenation (compile-time optimized)
+- **StringConcatMethod.java** - String concatenation using String.concat() method calls
+
+### String Concatenation Support
+
+The JVM supports string concatenation through multiple approaches:
+
+1. **Compile-time optimized concatenation**: When string literals are concatenated directly (e.g., `"Hello" + " " + "World"`), the Java compiler optimizes this into a single string constant.
+
+2. **String.concat() method calls**: For runtime string concatenation, the JVM supports calling the `String.concat()` method on string objects.
+
+**Example usage:**
+```java
+public class StringConcatMethod {
+    public static void main(String[] args) {
+        String hello = "Hello";
+        String space = " ";
+        String world = "World";
+        String result = hello.concat(space).concat(world);
+        System.out.println(result); // Prints: Hello World
+    }
+}
+```
+
+**Note**: Modern Java (9+) uses `invokedynamic` instructions for the `+` operator on variables, which this JVM does not currently support. Use explicit `String.concat()` calls for variable concatenation.

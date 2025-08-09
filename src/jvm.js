@@ -97,7 +97,17 @@ class JVM {
           args.unshift(frame.stack.pop());
         }
         const obj = frame.stack.pop();
-        if (obj[className] && obj[className][methodName]) {
+        
+        // Handle built-in Java methods
+        if (className === 'java/lang/String') {
+          if (methodName === 'concat') {
+            const result = obj + args[0];
+            frame.stack.push(result);
+            // console.log(`String.concat: "${obj}" + "${args[0]}" = "${result}"`);
+          } else {
+            console.error(`Unsupported String method: ${methodName}`);
+          }
+        } else if (obj[className] && obj[className][methodName]) {
           obj[className][methodName](...args);
         }
         break;
@@ -234,11 +244,23 @@ class JVM {
       case 'aload_1':
         frame.stack.push(frame.locals[1]);
         break;
+      case 'aload_2':
+        frame.stack.push(frame.locals[2]);
+        break;
+      case 'aload_3':
+        frame.stack.push(frame.locals[3]);
+        break;
       case 'astore_0':
         frame.locals[0] = frame.stack.pop();
         break;
       case 'astore_1':
         frame.locals[1] = frame.stack.pop();
+        break;
+      case 'astore_2':
+        frame.locals[2] = frame.stack.pop();
+        break;
+      case 'astore_3':
+        frame.locals[3] = frame.stack.pop();
         break;
       case 'dup':
         const topValue = frame.stack.peek();
@@ -276,6 +298,12 @@ class JVM {
         const index = parseInt(arg, 10);
         const ref = frame.stack.pop();
         frame.locals[index] = ref;
+        break;
+      }
+      case 'aload': {
+        const index = parseInt(arg, 10);
+        const ref = frame.locals[index];
+        frame.stack.push(ref);
         break;
       }
       case 'astore_1':
