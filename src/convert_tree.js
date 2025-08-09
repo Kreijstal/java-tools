@@ -284,6 +284,23 @@ function convertJson(inputJson, constantPool) {
             };
             break;
 
+          case "astore":
+          case "aload":
+          case "istore":
+          case "iload":
+          case "lstore":
+          case "lload":
+          case "fstore":
+          case "fload":
+          case "dstore":
+          case "dload":
+            // Instructions that take a local variable index
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: instr.operands.index.toString()
+            };
+            break;
+
           default:
             // For simple instructions without operands
             codeItem.instruction = instr.opcodeName;

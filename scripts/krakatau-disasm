@@ -1,0 +1,3 @@
+#!/bin/bash
+# Convenience wrapper for Krakatau disassembler
+"/home/runner/work/java-tools/java-tools/tools/krakatau/Krakatau/target/release/krak2" dis "$@"
