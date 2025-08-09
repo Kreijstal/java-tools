@@ -9,6 +9,7 @@ class Frame {
     const code = method.attributes.find(attr => attr.type === 'code').code;
     this.locals = new Array(parseInt(code.localsSize, 10)).fill(undefined);
     this.instructions = code.codeItems;
+    this.exceptionTable = code.exceptionTable;
     this.pc = 0;
   }
 }
@@ -55,11 +56,19 @@ class JVM {
         continue;
       }
 
-      const instruction = frame.instructions[frame.pc].instruction;
+      const instructionItem = frame.instructions[frame.pc];
+      const instruction = instructionItem.instruction;
+      const label = instructionItem.labelDef;
+      // The pc is the bytecode offset, which we get from the label `L<pc>:`
+      const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       frame.pc++;
 
-      if (instruction) {
-        this.executeInstruction(instruction, frame);
+      try {
+        if (instruction) {
+          this.executeInstruction(instruction, frame);
+        }
+      } catch (e) {
+        this.handleException(e, currentPc);
       }
     }
   }
@@ -181,6 +190,9 @@ class JVM {
       case 'idiv': {
         const value2 = frame.stack.pop();
         const value1 = frame.stack.pop();
+        if (value2 === 0) {
+          throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+        }
         frame.stack.push(Math.floor(value1 / value2));
         break;
       }
@@ -243,7 +255,47 @@ class JVM {
           for (let i = 0; i < params.length; i++) {
             frame.stack.pop();
           }
-          frame.stack.pop(); // pop object reference
+          const objRef = frame.stack.pop(); // pop object reference
+          // In a real JVM, this would initialize the object.
+          // For now, we do nothing.
+        }
+        break;
+      }
+      case 'new': {
+        const className = arg;
+        // In a real JVM, this would be a more complex object representation.
+        const objRef = { type: className, fields: {} };
+        frame.stack.push(objRef);
+        break;
+      }
+      case 'athrow': {
+        const exception = frame.stack.pop();
+        throw exception;
+      }
+      case 'astore': {
+        const index = parseInt(arg, 10);
+        const ref = frame.stack.pop();
+        frame.locals[index] = ref;
+        break;
+      }
+      case 'astore_1':
+          frame.locals[1] = frame.stack.pop();
+          break;
+      case 'areturn': {
+        const returnValue = frame.stack.pop();
+        this.callStack.pop();
+        if (!this.callStack.isEmpty()) {
+          this.callStack.peek().stack.push(returnValue);
+        }
+        break;
+      }
+      case 'goto': {
+        const label = arg;
+        const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+        if (targetPc !== -1) {
+          frame.pc = targetPc;
+        } else {
+          throw new Error(`Label ${label} not found`);
         }
         break;
       }
@@ -276,6 +328,50 @@ class JVM {
              item.method.descriptor === descriptor;
     });
     return method ? method.method : null;
+  }
+
+  handleException(exception, pc) {
+    if (this.callStack.isEmpty()) {
+      console.error('Unhandled exception:', exception);
+      return;
+    }
+    const frame = this.callStack.peek();
+
+    let pcToCheck = pc;
+    if (pc === -1) {
+      // Unwinding from a called method. The pc is the one of the call site.
+      const callerInstructionIndex = frame.pc - 1;
+      if (callerInstructionIndex >= 0) {
+        const instructionItem = frame.instructions[callerInstructionIndex];
+        const label = instructionItem.labelDef;
+        pcToCheck = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+      }
+    }
+
+    const table = frame.exceptionTable;
+    if (table) {
+      for (const entry of table) {
+        if (pcToCheck >= entry.start_pc && pcToCheck < entry.end_pc) {
+          if (entry.catch_type === 'any' || entry.catch_type === exception.type) {
+            const targetIndex = frame.instructions.findIndex(inst => {
+              if (!inst.labelDef) return false;
+              const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));
+              return labelPc === entry.handler_pc;
+            });
+
+            if (targetIndex !== -1) {
+              frame.stack.clear();
+              frame.stack.push(exception);
+              frame.pc = targetIndex;
+              return;
+            }
+          }
+        }
+      }
+    }
+
+    this.callStack.pop();
+    this.handleException(exception, -1); // PC is -1 for subsequent frames
   }
 }
 
