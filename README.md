@@ -81,3 +81,50 @@ This script executes a `.class` file using a basic, custom-built JVM.
 
 ```bash
 node scripts/runJvm.js <classFilePath>
+
+
+## Supported Java Bytecode Instructions
+
+The JVM implementation currently supports a comprehensive set of Java bytecode instructions:
+
+### Integer Constants
+- `iconst_m1`, `iconst_0`, `iconst_1`, `iconst_2`, `iconst_3`, `iconst_4`, `iconst_5` - Load integer constants
+- `ldc` - Load constants from constant pool
+
+### Local Variable Operations  
+- `iload_0`, `iload_1`, `iload_2`, `iload_3` - Load integers from local variables
+- `istore_0`, `istore_1`, `istore_2`, `istore_3` - Store integers to local variables
+- `aload_0`, `aload_1` - Load object references from local variables
+- `astore_0`, `astore_1` - Store object references to local variables
+
+### Arithmetic Operations
+- `iadd` - Integer addition
+- `isub` - Integer subtraction  
+- `imul` - Integer multiplication
+- `idiv` - Integer division
+- `irem` - Integer remainder (modulo)
+
+### Stack Operations
+- `dup` - Duplicate top stack value
+- `pop` - Remove top stack value
+
+### Method Invocation
+- `invokestatic` - Invoke static methods
+- `invokevirtual` - Invoke virtual methods (including System.out.println)
+- `invokespecial` - Invoke constructors and private methods
+
+### Field Access
+- `getstatic` - Get static field values
+
+### Control Flow
+- `return` - Return from void method
+- `ireturn` - Return integer value from method
+
+### Examples
+
+The following Java programs are included as test cases:
+
+- **RuntimeArithmetic.java** - Demonstrates all arithmetic operations
+- **SmallDivisionTest.java** - Shows integer division and remainder
+- **ConstantsTest.java** - Tests all integer constant instructions
+- **Calculator.java** - Static method calls with parameters

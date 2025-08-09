@@ -7,7 +7,7 @@ class Frame {
     this.method = method;
     this.stack = new Stack();
     const code = method.attributes.find(attr => attr.type === 'code').code;
-    this.locals = new Array(parseInt(code.localsSize, 10));
+    this.locals = new Array(parseInt(code.localsSize, 10)).fill(undefined);
     this.instructions = code.codeItems;
     this.pc = 0;
   }
@@ -96,14 +96,57 @@ class JVM {
       case 'return':
         this.callStack.pop();
         break;
+      case 'bipush': {
+        const value = parseInt(arg, 10);
+        frame.stack.push(value);
+        break;
+      }
+      case 'istore': {
+        const index = parseInt(arg, 10);
+        const value = frame.stack.pop();
+        frame.locals[index] = value;
+        // console.log(`istore ${index}: stored value ${value}`);
+        break;
+      }
+      case 'iload': {
+        const index = parseInt(arg, 10);
+        const value = frame.locals[index];
+        frame.stack.push(value);
+        // console.log(`iload ${index}: loaded value ${value}`);
+        break;
+      }
+      case 'iconst_m1':
+        frame.stack.push(-1);
+        break;
+      case 'iconst_0':
+        frame.stack.push(0);
+        break;
+      case 'iconst_1':
+        frame.stack.push(1);
+        break;
       case 'iconst_2':
         frame.stack.push(2);
+        break;
+      case 'iconst_3':
+        frame.stack.push(3);
         break;
       case 'iconst_4':
         frame.stack.push(4);
         break;
+      case 'iconst_5':
+        frame.stack.push(5);
+        break;
+      case 'istore_0':
+        frame.locals[0] = frame.stack.pop();
+        break;
       case 'istore_1':
         frame.locals[1] = frame.stack.pop();
+        break;
+      case 'istore_2':
+        frame.locals[2] = frame.stack.pop();
+        break;
+      case 'istore_3':
+        frame.locals[3] = frame.stack.pop();
         break;
       case 'iload_0':
         frame.stack.push(frame.locals[0]);
@@ -111,10 +154,40 @@ class JVM {
       case 'iload_1':
         frame.stack.push(frame.locals[1]);
         break;
+      case 'iload_2':
+        frame.stack.push(frame.locals[2]);
+        break;
+      case 'iload_3':
+        frame.stack.push(frame.locals[3]);
+        break;
       case 'iadd': {
         const value2 = frame.stack.pop();
         const value1 = frame.stack.pop();
         frame.stack.push(value1 + value2);
+        break;
+      }
+      case 'isub': {
+        const value2 = frame.stack.pop();
+        const value1 = frame.stack.pop();
+        frame.stack.push(value1 - value2);
+        break;
+      }
+      case 'imul': {
+        const value2 = frame.stack.pop();
+        const value1 = frame.stack.pop();
+        frame.stack.push(value1 * value2);
+        break;
+      }
+      case 'idiv': {
+        const value2 = frame.stack.pop();
+        const value1 = frame.stack.pop();
+        frame.stack.push(Math.floor(value1 / value2));
+        break;
+      }
+      case 'irem': {
+        const value2 = frame.stack.pop();
+        const value1 = frame.stack.pop();
+        frame.stack.push(value1 % value2);
         break;
       }
       case 'ireturn': {
@@ -140,6 +213,37 @@ class JVM {
             newFrame.locals[i] = frame.stack.pop();
           }
           this.callStack.push(newFrame);
+        }
+        break;
+      }
+      case 'aload_0':
+        frame.stack.push(frame.locals[0]);
+        break;
+      case 'aload_1':
+        frame.stack.push(frame.locals[1]);
+        break;
+      case 'astore_0':
+        frame.locals[0] = frame.stack.pop();
+        break;
+      case 'astore_1':
+        frame.locals[1] = frame.stack.pop();
+        break;
+      case 'dup':
+        const topValue = frame.stack.peek();
+        frame.stack.push(topValue);
+        break;
+      case 'pop':
+        frame.stack.pop();
+        break;
+      case 'invokespecial': {
+        const [_, className, [methodName, descriptor]] = arg;
+        if (methodName === '<init>') {
+          // Constructor call - for now just pop the object reference
+          const { params } = parseDescriptor(descriptor);
+          for (let i = 0; i < params.length; i++) {
+            frame.stack.pop();
+          }
+          frame.stack.pop(); // pop object reference
         }
         break;
       }
