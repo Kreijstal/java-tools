@@ -45,6 +45,38 @@ To install the dependencies, run:
 npm install
 ```
 
+### Development Setup
+
+This project requires both Node.js and Java environments:
+- **Node.js** (v18.x or v20.x)
+- **Java JDK** (v11 or v17)
+
+For local development, you can use the provided Makefile:
+
+```bash
+make install  # Install dependencies
+make build    # Compile Java sources
+make test     # Run tests
+make clean    # Clean compiled files
+```
+
+Or use npm scripts directly:
+
+```bash
+npm run build:java  # Compile Java sources
+npm test           # Run test suite
+npm run clean      # Remove compiled files
+```
+
+## Continuous Integration
+
+This project includes GitHub Actions CI that automatically:
+- Tests against multiple Node.js (18.x, 20.x) and Java (11, 17) versions
+- Compiles Java sources and runs the complete test suite
+- Provides build artifacts for debugging
+
+See [CI.md](CI.md) for detailed CI configuration information.
+
 ## Utilities
 
 This project also includes several utility scripts for manipulating Java class files.
