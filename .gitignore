@@ -1,3 +1,24 @@
 node_modules/
 *.class
 package-lock.json
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Coverage reports
+coverage/
+
+# Temporary files
+.tmp/
+temp/
