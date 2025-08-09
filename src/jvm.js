@@ -104,11 +104,42 @@ class JVM {
             const result = obj + args[0];
             frame.stack.push(result);
             // console.log(`String.concat: "${obj}" + "${args[0]}" = "${result}"`);
+          } else if (methodName === 'toUpperCase') {
+            const result = obj.toUpperCase();
+            frame.stack.push(result);
+          } else if (methodName === 'toLowerCase') {
+            const result = obj.toLowerCase();
+            frame.stack.push(result);
+          } else if (methodName === 'length') {
+            const result = obj.length;
+            frame.stack.push(result);
           } else {
             console.error(`Unsupported String method: ${methodName}`);
+            // For unsupported methods, push a default return value to avoid stack underflow
+            const { returnType } = parseDescriptor(descriptor);
+            if (returnType === 'V') {
+              // void return type, don't push anything
+            } else if (returnType === 'Ljava/lang/String;') {
+              frame.stack.push(obj); // return the original string
+            } else {
+              frame.stack.push(null); // default return value
+            }
           }
-        } else if (obj[className] && obj[className][methodName]) {
+        } else if (className === 'java/io/PrintStream') {
+          if (methodName === 'println') {
+            // Handle PrintStream.println method
+            if (obj && obj['java/io/PrintStream'] && obj['java/io/PrintStream']['println']) {
+              obj['java/io/PrintStream']['println'](...args);
+            } else {
+              console.log(...args);
+            }
+          } else {
+            console.error(`Unsupported PrintStream method: ${methodName}`);
+          }
+        } else if (obj && obj[className] && obj[className][methodName]) {
           obj[className][methodName](...args);
+        } else {
+          console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
         }
         break;
       }
