@@ -58,7 +58,7 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     // Add GitHub Pages specific enhancements and real JVM integration
     const enhancements = `
     <!-- Include the real JVM debug bundle -->
-    <script src="./jvm-debug.js"></script>
+    <script src="/dist/jvm-debug.js"></script>
 
     <script>
         // Real JVM integration - override mock functions with real implementations
@@ -72,7 +72,7 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     jvmDebug = new window.JVMDebug.BrowserJVMDebug();
                     
                     try {
-                        const response = await fetch('data.zip');
+                        const response = await fetch('/dist/data.zip');
                         if (response.ok) {
                             const buffer = await response.arrayBuffer();
                             const dataPackage = { buffer };
@@ -123,6 +123,22 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                         <button onclick="loadSampleClass()">Load & Debug Sample</button>
                     \`;
                     controls.appendChild(samplesDiv);
+                    
+                    // Enable the Start Debugging button now that sample classes are available
+                    const debugBtn = document.getElementById('debugBtn');
+                    if (debugBtn) {
+                        debugBtn.disabled = false;
+                        log('Start Debugging button enabled - sample classes ready', 'info');
+                    }
+                    
+                    // Also update the state to indicate we have classes available
+                    if (typeof updateState === 'function') {
+                        updateState({
+                            loadedClass: true,
+                            className: 'VerySimple', // Default to first sample class
+                            status: 'ready'
+                        });
+                    }
                 } catch (error) {
                     log(\`Failed to populate sample classes: \${error.message}\`, 'error');
                 }
@@ -167,11 +183,39 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             // Override step functions with real JVM calls
             if (jvmDebug) {
                 // Store original functions if they exist
+                const originalStartDebugging = window.startDebugging;
                 const originalStepInto = window.stepInto;
                 const originalStepOver = window.stepOver;
                 const originalStepOut = window.stepOut;
                 const originalContinue = window.continue_;
                 const originalFinish = window.finish;
+                
+                // Override startDebugging to work with real JVM and sample classes
+                window.startDebugging = function() {
+                    try {
+                        // If no class is explicitly loaded, try to use the default sample class
+                        if (!currentState.loadedClass) {
+                            log('No class explicitly loaded, starting with default sample class: VerySimple', 'info');
+                            const result = jvmDebug.start('VerySimple');
+                            updateDebugDisplay();
+                            return;
+                        }
+                        
+                        // Use the original logic for explicitly loaded classes
+                        if (originalStartDebugging) {
+                            originalStartDebugging();
+                        } else {
+                            // Fallback: start with current state's class name
+                            const className = currentState.className || 'VerySimple';
+                            log(\`Starting debug session with \${className}...\`, 'info');
+                            const result = jvmDebug.start(className);
+                            updateDebugDisplay();
+                        }
+                    } catch (error) {
+                        log(\`Failed to start debugging: \${error.message}\`, 'error');
+                        if (originalStartDebugging) originalStartDebugging();
+                    }
+                };
                 
                 // Override with real JVM implementations
                 window.stepInto = function() {
