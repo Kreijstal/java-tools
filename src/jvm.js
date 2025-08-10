@@ -1,5 +1,5 @@
 const Stack = require('./stack');
-const { loadClassByPath } = require('./classLoader');
+const { loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures } = require('./convert_tree');
 
@@ -460,7 +460,7 @@ class JVM {
   }
 
   loadClass(classFilePath, options = {}) {
-    const classData = loadClassByPath(classFilePath, options);
+    const classData = loadClassByPathSync(classFilePath, options);
     if (classData) {
       this.classes[classData.classes[0].className] = classData;
     }
