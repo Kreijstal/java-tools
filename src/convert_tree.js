@@ -422,54 +422,67 @@ function convertJson(inputJson, constantPool) {
 }
 
 /**
+ * Formats a single instruction for display
+ * @param {Object|String} instr - The instruction to format
+ * @returns {String} Formatted instruction string
+ */
+function formatInstruction(instr) {
+  if (!instr) {
+    return "null";
+  }
+  if (typeof instr === "string") {
+    return instr;
+  } else if (instr.op === "tableswitch") {
+    // Prioritize tableswitch check
+    const labelsStr = instr.labels
+      .map((label) => `            ${label}`)
+      .join("\n");
+    return `${instr.op} ${instr.low}\n${labelsStr}\n            default : ${instr.defaultLbl}`; // Format tableswitch with labels and default label
+  } else if (instr.op === "iinc") {
+    // Handle iinc instruction with arguments
+    return `${instr.op} ${instr.varnum} ${instr.incr}`;
+  } else if (instr.op !== undefined && instr.arg !== undefined) {
+    const argStr = formatInstructionArg(instr.arg);
+    if (instr.op === "invokeinterface" && instr.count !== undefined) {
+      return `${instr.op} ${argStr} ${instr.count}`; // Include the count for invokeinterface
+    } else {
+      return `${instr.op} ${argStr}`;
+    }
+  } else {
+    return instr.op || "";
+  }
+}
+
+/**
+ * Formats instruction arguments for display
+ * @param {*} arg - The argument to format
+ * @returns {String} Formatted argument string
+ */
+function formatInstructionArg(arg) {
+  if (typeof arg === "string") {
+    return arg;
+  } else if (Array.isArray(arg)) {
+    // Recursively format each item and join with spaces
+    return arg.map(formatInstructionArg).join(" ");
+  } else if (typeof arg === "object") {
+    // For object arguments, check if it's a sourcefile attribute
+    if (arg.type === "sourcefile") {
+      return arg.value; // Return the value directly without further formatting
+    } else {
+      // For other object arguments, format their values
+      return Object.values(arg).map(formatInstructionArg).join(" ");
+    }
+  } else {
+    return String(arg);
+  }
+}
+
+/**
  * Converts a structured class representation into assembly-like textual format
  * @param {Object} cls - The class object with methods, fields, flags, and other class metadata
  * @returns {String} Assembly-like representation of the class suitable for debugging/analysis
  */
 function unparseDataStructures(cls) {
-  function formatInstruction(instr) {
-    if (typeof instr === "string") {
-      return instr;
-    } else if (instr.op === "tableswitch") {
-      // Prioritize tableswitch check
-      const labelsStr = instr.labels
-        .map((label) => `            ${label}`)
-        .join("\n");
-      return `${instr.op} ${instr.low}\n${labelsStr}\n            default : ${instr.defaultLbl}`; // Format tableswitch with labels and default label
-    } else if (instr.op === "iinc") {
-      // Handle iinc instruction with arguments
-      return `${instr.op} ${instr.varnum} ${instr.incr}`;
-    } else if (instr.op !== undefined && instr.arg !== undefined) {
-      const argStr = formatInstructionArg(instr.arg);
-      if (instr.op === "invokeinterface" && instr.count !== undefined) {
-        return `${instr.op} ${argStr} ${instr.count}`; // Include the count for invokeinterface
-      } else {
-        return `${instr.op} ${argStr}`;
-      }
-    } else {
-      return instr.op || "";
-    }
-  }
-
-  function formatInstructionArg(arg) {
-    if (typeof arg === "string") {
-      return arg;
-    } else if (Array.isArray(arg)) {
-      // Recursively format each item and join with spaces
-      return arg.map(formatInstructionArg).join(" ");
-    } else if (typeof arg === "object") {
-      // For object arguments, check if it's a sourcefile attribute
-      if (arg.type === "sourcefile") {
-        return arg.value; // Return the value directly without further formatting
-      } else {
-        // For other object arguments, format their values
-        return Object.values(arg).map(formatInstructionArg).join(" ");
-      }
-    } else {
-      return String(arg);
-    }
-  }
-
   function formatCodeAttribute(attr) {
     if (attr.type === "linenumbertable") {
       const lines = [
@@ -604,4 +617,4 @@ function unparseDataStructures(cls) {
     })(cls);
 }
 
-module.exports={unparseDataStructures,convertJson};
+module.exports={unparseDataStructures,convertJson,formatInstruction};

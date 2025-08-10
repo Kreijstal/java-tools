@@ -1,5 +1,5 @@
 const test = require('tape');
-const JVM = require('../src/jvm');
+const { JVM } = require('../src/jvm');
 
 test('JVM invokevirtual should support various Java methods', (t) => {
   const jvm = new JVM();
