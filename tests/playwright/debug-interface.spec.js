@@ -150,8 +150,8 @@ test.describe('JVM Debug Browser Interface', () => {
     const output = page.locator('#output');
     const outputText = await output.textContent();
     
-    // Should contain timestamps in bracket format
-    expect(outputText).toMatch(/\[\d{1,2}:\d{2}:\d{2}\]/);
+    // Should contain timestamps in bracket format (supporting both 12-hour and 24-hour format)
+    expect(outputText).toMatch(/\[\d{1,2}:\d{2}:\d{2}(\s?(AM|PM))?\]/);
     
     // Should contain initial load message
     expect(outputText).toContain('JVM Debug API Example loaded');
