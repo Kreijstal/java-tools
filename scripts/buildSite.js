@@ -362,12 +362,24 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             
             try {
                 log(\`Loading sample class: \${selectedClass}\`, 'info');
+                
+                // Set the loaded class state before starting debug session
+                updateState({ 
+                    loadedClass: { name: selectedClass },
+                    className: selectedClass
+                });
+                
                 const result = await jvmDebug.start(selectedClass);
                 log(\`Debug session started for \${selectedClass}\`, 'success');
                 log(\`Status: \${result.status}\`, 'info');
                 updateDebugDisplay();
             } catch (error) {
                 log(\`Failed to start debugging \${selectedClass}: \${error.message}\`, 'error');
+                // Reset loadedClass on failure
+                updateState({ 
+                    loadedClass: null,
+                    className: null
+                });
             }
         }
         
@@ -541,12 +553,27 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 log(\`Failed to clear breakpoints: \${error.message}\`, 'error');
             }
         }
-        
         function updateDebugDisplay() {
             if (!jvmDebug) return;
 
             try {
                 const state = jvmDebug.getCurrentState();
+                
+                // Update currentState to sync with the real JVM state using updateState
+                updateState({
+                    status: state.executionState,
+                    pc: state.pc,
+                    stack: state.stack || [],
+                    locals: state.locals || [],
+                    callDepth: state.callStackDepth || 0,
+                    method: state.method ? state.method.name : null,
+                    breakpoints: state.breakpoints || []
+                });
+                
+                // Mark as loaded when debugging is active if not already set
+                if (!currentState.loadedClass && state.executionState !== 'stopped') {
+                    updateState({ loadedClass: { name: 'active' } });
+                }
                 
                 // Update text-based state panels
                 const statusDiv = document.getElementById('executionState');
@@ -662,6 +689,9 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             } catch (error) {
                 log(\`Failed to update debug display: \${error.message}\`, 'error');
             }
+            
+            // Update button states to sync with the real JVM state
+            updateButtons();
         }
         
         // Initialize everything when page loads
