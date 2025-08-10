@@ -1,5 +1,10 @@
 # Java Classfile Parser
 
+[![CI](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
+[![Node.js](https://img.shields.io/badge/node.js-18.x%20%7C%2020.x-green.svg)](https://nodejs.org/)
+[![Java](https://img.shields.io/badge/java-11%20%7C%2017-orange.svg)](https://adoptopenjdk.net/)
+
 This project provides tools for parsing and analyzing Java `.class` files. It uses the `jvm_parser` library to create an Abstract Syntax Tree (AST) from bytecode, allowing for in-depth analysis of Java classes.
 
 ## New Features 🔥
@@ -56,7 +61,7 @@ This project is not directly related to the Krakatau decompiler. While both tool
 
 You can parse a `.class` file by using the `loadAndTraverse` function from `src/loadAndTraverse.js`. This function takes a class name and a classpath as arguments. It returns an object containing the Abstract Syntax Tree (AST) and a reference object.
 
-The `parseHelloClass.js` script provides an example of how to parse a class and traverse its AST to find class references.
+For advanced class analysis and workspace management, see the `KrakatauWorkspace` class in `src/KrakatauWorkspace.js` which provides methods for listing classes, methods, fields, and finding references.
 
 ## Installation
 

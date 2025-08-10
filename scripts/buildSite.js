@@ -19,15 +19,14 @@ if (!fs.existsSync(distDir)) {
     fs.mkdirSync(distDir, { recursive: true });
 }
 
-// Step 1: Build the browser bundle using webpack
-console.log('📦 Building browser bundle with Webpack...');
-try {
-    execSync('npx webpack --mode production', { stdio: 'inherit' });
-    console.log('  ✓ Bundle created successfully');
-} catch (error) {
-    console.error('❌ Webpack build failed:', error.message);
+// Step 1: Verify the browser bundle exists (should be built by npm run build:bundle)
+console.log('📦 Verifying browser bundle exists...');
+const bundlePath = path.join(distDir, 'jvm-debug.js');
+if (!fs.existsSync(bundlePath)) {
+    console.error('❌ Bundle not found! Run npm run build:bundle first');
     process.exit(1);
 }
+console.log('  ✓ Bundle found successfully');
 
 // Step 2: Copy and enhance the debug web interface
 console.log('📄 Creating enhanced debug interface...');
