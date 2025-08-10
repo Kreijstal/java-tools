@@ -137,7 +137,6 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     <script>
         // Real JVM Debug implementation using the actual JVM logic
         let jvmDebug = null;
-        let aceEditor = null;
         let lineToPcMap = {};
         
         // Add log function that works even if JVM isn't initialized
