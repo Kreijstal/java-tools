@@ -76,7 +76,7 @@ jobs:
         run: npx playwright install --with-deps chromium
         timeout-minutes: 10
       - name: Run Playwright tests
-        run: timeout 300 npm run test:playwright || true
+        run: timeout 300 npm run test:playwright
         timeout-minutes: 6
 
   build:
