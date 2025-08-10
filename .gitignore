@@ -24,3 +24,6 @@ coverage/
 temp/
 scripts/krakatau-disasm
 tools/krakatau/Krakatau
+
+# Build output
+dist/

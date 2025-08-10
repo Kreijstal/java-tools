@@ -5,8 +5,9 @@
   "scripts": {
     "test": "tape test/*.test.js",
     "build:java": "javac sources/*.java",
-    "build": "npm run build:java",
-    "clean": "find sources -name '*.class' -delete",
+    "generate": "npm run build:java && node scripts/generateData.js",
+    "build": "npm run generate && node scripts/buildSite.js",
+    "clean": "find sources -name '*.class' -delete && rm -rf dist",
     "pretest": "npm run build:java",
     "ci": "npm run build && npm test",
     "health-check": "node scripts/health-check.js"
