@@ -4,6 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>JVM Debug API Example</title>
+    <!-- Include Ace Editor from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.15.2/ace.js"></script>
     <style>
         body {
             font-family: 'Courier New', monospace;
@@ -14,11 +16,23 @@
             color: #d4d4d4;
         }
         
-        .container {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 20px;
+        .main-container { 
+            display: grid; 
+            grid-template-columns: 2fr 1fr; 
+            gap: 20px; 
+            margin-top: 20px;
+        }
+        
+        .debugger-panel { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 10px; 
+        }
+        
+        .state-panel-stack { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 20px; 
         }
         
         .panel {
@@ -44,6 +58,106 @@
             flex-wrap: wrap;
         }
         
+        .breakpoint-input {
+            width: 80px;
+            padding: 8px;
+            border: 1px solid #3e3e42;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 3px;
+            font-family: inherit;
+        }
+            grid-column: 1 / -1;
+        }
+        
+        #disassembly-editor { 
+            width: 100%; 
+            height: 60vh; 
+            border: 1px solid #3e3e42; 
+            border-radius: 5px; 
+        }
+        
+        .debug-controls { 
+            display: flex; 
+            gap: 8px; 
+            margin-bottom: 10px; 
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        
+        .debug-controls button { 
+            font-size: 1.2em; 
+            padding: 8px 12px; 
+            min-width: 40px;
+            background-color: #0e639c;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        
+        .debug-controls button:hover {
+            background-color: #1177bb;
+        }
+        
+        .debug-controls button:disabled {
+            background-color: #3e3e42;
+            cursor: not-allowed;
+        }
+        
+        .ace_gutter-cell.ace_breakpoint { 
+            background-color: #f44336 !important; 
+            border-radius: 50%; 
+        }
+        
+        .ace-editor-highlight { 
+            position: absolute; 
+            background: rgba(86, 156, 214, 0.3); 
+            z-index: 20; 
+        }
+        
+        .state-display {
+            background-color: #1e1e1e;
+            border: 1px solid #3e3e42;
+            padding: 10px;
+            border-radius: 3px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        
+        .output {
+            background-color: #1e1e1e;
+            border: 1px solid #3e3e42;
+            padding: 10px;
+            border-radius: 3px;
+            height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        
+        .status {
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 3px;
+            border-left: 4px solid #007acc;
+            background-color: #0f4a85;
+        }
+        
+        .error {
+            color: #f44747;
+            background-color: #5a1d1d;
+            border-left-color: #f44747;
+        }
+        
+        .success {
+            color: #4ec9b0;
+            background-color: #1e3a32;
+            border-left-color: #4ec9b0;
+        }
+        
         button {
             background-color: #0e639c;
             color: white;
@@ -62,59 +176,6 @@
         button:disabled {
             background-color: #3e3e42;
             cursor: not-allowed;
-        }
-        
-        .status {
-            padding: 10px;
-            margin-bottom: 10px;
-            border-radius: 3px;
-            border-left: 4px solid #007acc;
-            background-color: #0f4a85;
-        }
-        
-        .output {
-            background-color: #1e1e1e;
-            border: 1px solid #3e3e42;
-            padding: 10px;
-            border-radius: 3px;
-            height: 200px;
-            overflow-y: auto;
-            font-size: 12px;
-            white-space: pre-wrap;
-        }
-        
-        .state-display {
-            font-size: 12px;
-        }
-        
-        .state-display .key {
-            color: #9cdcfe;
-        }
-        
-        .state-display .value {
-            color: #ce9178;
-        }
-        
-        .breakpoint-input {
-            background-color: #3c3c3c;
-            border: 1px solid #3e3e42;
-            color: #d4d4d4;
-            padding: 5px;
-            border-radius: 3px;
-            width: 60px;
-            margin-right: 10px;
-        }
-        
-        .error {
-            color: #f44747;
-            background-color: #5a1d1d;
-            border-left-color: #f44747;
-        }
-        
-        .success {
-            color: #4ec9b0;
-            background-color: #1e3a32;
-            border-left-color: #4ec9b0;
         }
     </style>
 </head>
@@ -139,29 +200,51 @@
         <div class="button-group">
             <input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" min="0">
             <button onclick="setBreakpoint()">Set Breakpoint</button>
-            <button onclick="clearBreakpoints()">Clear All Breakpoints</button>
+            <button onclick="clearAllBreakpoints()">Clear All Breakpoints</button>
             <button onclick="serializeState()">Serialize State</button>
-            <button onclick="deserializeState()" id="deserializeBtn" disabled>Restore State</button>
-        </div>
-    </div>
-    
-    <div class="container">
-        <div class="panel">
-            <h3>Execution State</h3>
-            <div id="executionState" class="state-display">
-                <div><span class="key">Status:</span> <span class="value">Not started</span></div>
-                <div><span class="key">PC:</span> <span class="value">-</span></div>
-                <div><span class="key">Stack:</span> <span class="value">[]</span></div>
-                <div><span class="key">Locals:</span> <span class="value">[]</span></div>
-                <div><span class="key">Call Depth:</span> <span class="value">0</span></div>
-                <div><span class="key">Method:</span> <span class="value">-</span></div>
-                <div><span class="key">Breakpoints:</span> <span class="value">[]</span></div>
-            </div>
+            <button onclick="deserializeState()" id="deserializeBtn" disabled>Deserialize State</button>
         </div>
         
-        <div class="panel">
-            <h3>Output Console</h3>
-            <div id="output" class="output"></div>
+        <!-- IDE-style controls for enhanced UI -->
+        <div class="debug-controls">
+            <h4>IDE Controls</h4>
+            <button onclick="continue_()" title="Continue (F8)">▶️</button>
+            <button onclick="stepOver()" title="Step Over (F10)">↷</button>
+            <button onclick="stepInto()" title="Step Into (F11)">↪️</button>
+            <button onclick="stepOut()" title="Step Out (Shift+F11)">↩️</button>
+            <button onclick="finish()" title="Finish Method">⏩</button>
+            <button onclick="serializeState()" title="Serialize State">💾</button>
+            <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">📂</button>
+            <input type="file" id="stateFileInput" style="display: none;" accept=".json">
+        </div>
+    </div>
+
+    <!-- Main UI Layout with IDE-style interface -->
+    <div class="main-container">
+        <!-- Left Column: Debugger -->
+        <div class="debugger-panel panel">
+            <h3>Disassembly View</h3>
+            <div id="disassembly-editor"></div>
+        </div>
+
+        <!-- Right Column: State & Output -->
+        <div class="state-panel-stack">
+            <div class="panel">
+                <h3>Execution State</h3>
+                <div id="executionState" class="state-display">Not started</div>
+            </div>
+            <div class="panel">
+                <h3>Stack</h3>
+                <div id="stackDisplay" class="state-display">Empty</div>
+            </div>
+            <div class="panel">
+                <h3>Locals</h3>
+                <div id="localsDisplay" class="state-display">No locals</div>
+            </div>
+            <div class="panel">
+                <h3>Output Console</h3>
+                <div id="output" class="output"></div>
+            </div>
         </div>
     </div>
     
@@ -172,20 +255,26 @@
             
             <p><strong>Debug Commands:</strong></p>
             <ul>
-                <li><strong>Start Debugging:</strong> Loads VerySimple.class and begins debug session</li>
-                <li><strong>Step Into:</strong> Execute next instruction, entering method calls</li>
-                <li><strong>Step Over:</strong> Execute next instruction, skipping over method calls</li>
-                <li><strong>Step Out:</strong> Continue until current method returns</li>
-                <li><strong>Step Instruction:</strong> Execute exactly one bytecode instruction</li>
-                <li><strong>Continue:</strong> Run until next breakpoint or completion</li>
-                <li><strong>Finish Method:</strong> Run until current method completes</li>
+                <li><strong>▶️ Continue:</strong> Run until next breakpoint or completion</li>
+                <li><strong>↷ Step Over:</strong> Execute next instruction, skipping over method calls</li>
+                <li><strong>↪️ Step Into:</strong> Execute next instruction, entering method calls</li>
+                <li><strong>↩️ Step Out:</strong> Continue until current method returns</li>
+                <li><strong>⏩ Finish Method:</strong> Run until current method completes</li>
             </ul>
             
             <p><strong>State Management:</strong></p>
             <ul>
-                <li><strong>Serialize State:</strong> Capture complete JVM state for persistence</li>
-                <li><strong>Restore State:</strong> Reload previously serialized state</li>
-                <li><strong>Breakpoints:</strong> Set/clear breakpoints at specific program counter locations</li>
+                <li><strong>💾 Serialize State:</strong> Download complete JVM state as JSON file</li>
+                <li><strong>📂 Restore State:</strong> Upload and reload previously serialized state</li>
+                <li><strong>Breakpoints:</strong> Click in the disassembly gutter to toggle breakpoints</li>
+            </ul>
+            
+            <p><strong>Disassembly View:</strong></p>
+            <ul>
+                <li>Interactive code editor showing bytecode disassembly</li>
+                <li>Current instruction highlighted automatically</li>
+                <li>Click gutter (line numbers area) to set/remove breakpoints</li>
+                <li>Red dots indicate active breakpoints</li>
             </ul>
         </div>
     </div>
@@ -194,6 +283,7 @@
         // Simulated debug controller for frontend demo
         // In a real application, this would be API calls to your Node.js backend
         
+        let aceEditor = null;
         let currentState = {
             status: 'stopped',
             pc: null,
@@ -206,6 +296,28 @@
         
         let serializedState = null;
         let stepCount = 0;
+        
+        function initializeEditor() {
+            try {
+                aceEditor = ace.edit("disassembly-editor");
+                aceEditor.setTheme("ace/theme/monokai");
+                aceEditor.session.setMode("ace/mode/text");
+                aceEditor.setReadOnly(true);
+                aceEditor.renderer.setShowGutter(true);
+                aceEditor.renderer.setPadding(10);
+                aceEditor.setOptions({ 
+                    highlightActiveLine: false, 
+                    highlightGutterLine: false,
+                    fontSize: 12
+                });
+
+                aceEditor.setValue('Load a class to see disassembly...', -1);
+            } catch (e) {
+                // Fallback if Ace editor fails to load
+                document.getElementById('disassembly-editor').innerHTML = 
+                    '<textarea readonly style="width: 100%; height: 300px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #3e3e42;">Load a class to see disassembly...</textarea>';
+            }
+        }
         
         function log(message, type = 'info') {
             const output = document.getElementById('output');
@@ -234,6 +346,14 @@
                 <div><span class="key">Method:</span> <span class="value">${currentState.method || '-'}</span></div>
                 <div><span class="key">Breakpoints:</span> <span class="value">[${currentState.breakpoints.join(', ')}]</span></div>
             `;
+            
+            const stackDisplay = document.getElementById('stackDisplay');
+            stackDisplay.textContent = currentState.stack.length > 0 ? 
+                currentState.stack.join(', ') : 'Empty';
+                
+            const localsDisplay = document.getElementById('localsDisplay');
+            localsDisplay.textContent = currentState.locals.length > 0 ? 
+                currentState.locals.join(', ') : 'No locals';
             
             updateButtons();
         }
@@ -294,38 +414,49 @@
         }
         
         function continue_() {
+            if (currentState.status !== 'paused') {
+                log('Cannot continue - debugger not paused', 'error');
+                return;
+            }
+            
             log('Continuing execution...', 'info');
             updateStatus('Running...', 'info');
+            updateState({ status: 'running' });
             
             setTimeout(() => {
-                // Simulate hitting a breakpoint or completion
-                if (currentState.breakpoints.length > 0 && Math.random() > 0.5) {
-                    const bp = currentState.breakpoints[0];
+                if (currentState.breakpoints.length > 0) {
+                    // Simulate hitting a breakpoint
+                    const hitBreakpoint = currentState.breakpoints[0];
                     updateState({
                         status: 'paused',
-                        pc: bp
+                        pc: hitBreakpoint
                     });
-                    updateStatus(`Paused at breakpoint PC=${bp}`, 'success');
-                    log(`Hit breakpoint at PC=${bp}`, 'success');
+                    updateStatus(`Hit breakpoint at PC=${hitBreakpoint}`, 'success');
+                    log(`Execution paused at breakpoint PC=${hitBreakpoint}`, 'info');
                 } else {
+                    // Simulate completion
                     updateState({
                         status: 'completed',
                         pc: null,
                         callDepth: 0
                     });
                     updateStatus('Program execution completed', 'success');
-                    log('Program execution completed successfully', 'success');
+                    log('Program execution completed', 'success');
                 }
             }, 1000);
         }
         
         function executeStep(stepType) {
-            log(`Executing ${stepType}...`, 'info');
-            updateStatus(`Stepping...`, 'info');
+            if (currentState.status !== 'paused') {
+                log(`Cannot ${stepType.toLowerCase()} - debugger not paused`, 'error');
+                return;
+            }
+            
+            log(`Executing ${stepType.toLowerCase()}...`, 'info');
             stepCount++;
             
             setTimeout(() => {
-                if (stepCount >= 10) {
+                if (stepCount > 10) {
                     // Simulate completion
                     updateState({
                         status: 'completed',
@@ -374,7 +505,7 @@
             input.value = '';
         }
         
-        function clearBreakpoints() {
+        function clearAllBreakpoints() {
             updateState({ breakpoints: [] });
             log('All breakpoints cleared', 'success');
         }
@@ -417,9 +548,14 @@
                 method: 'main([Ljava/lang/String;)V'
             });
             
-            updateStatus('State restored from serialized data', 'success');
+            updateStatus('State restored', 'success');
             log('JVM state restored successfully', 'success');
         }
+        
+        // Initialize editor when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            initializeEditor();
+        });
         
         // Initialize
         updateState(currentState);

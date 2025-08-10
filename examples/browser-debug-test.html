@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JVM Debug Test</title>
+    <script src="../dist/jvm-debug.js"></script>
+</head>
+<body>
+    <div id="test-results"></div>
+    
+    <script>
+        // Simple test to verify the browser debugging functionality works
+        async function runBrowserDebugTest() {
+            const resultsDiv = document.getElementById('test-results');
+            let passed = 0;
+            let failed = 0;
+            
+            function log(message, isSuccess = true) {
+                const div = document.createElement('div');
+                div.style.color = isSuccess ? 'green' : 'red';
+                div.style.fontFamily = 'monospace';
+                div.textContent = `${isSuccess ? '✓' : '✗'} ${message}`;
+                resultsDiv.appendChild(div);
+                
+                if (isSuccess) passed++;
+                else failed++;
+            }
+            
+            try {
+                // Test 1: Create BrowserJVMDebug instance
+                const debug = new window.JVMDebug.BrowserJVMDebug();
+                log('BrowserJVMDebug instance created successfully');
+                
+                // Test 2: Check initial state
+                if (!debug.isInitialized()) {
+                    log('Initial state is correctly not initialized');
+                } else {
+                    log('Initial state should not be initialized', false);
+                }
+                
+                // Test 3: Try to create data package
+                const mockDataPackage = {
+                    classes: [
+                        {
+                            filename: 'MainApp.class',
+                            content: 'yv66vgAAADQAEQoAAwAOBwAPBwAQAQAGPGluaXQ+AQADKClWAQAEQ29kZQEAD0xpbmVOdW1iZXJUYWJsZQEABG1haW4BABYoW0xqYXZhL2xhbmcvU3RyaW5nOylWAQAKU291cmNlRmlsZQEADk1haW5BcHAuamF2YQwABAAFAQAHTWFpbkFwcAEAEGphdmEvbGFuZy9PYmplY3QAIQACAAMAAAAAAAgAAQAEAAUAAQAGAAAAHwABAAEAAAAFKrcAAbEAAAABAAAAAAgAAQAEAAUAAQAJAAAAGQABAAIAAAADsQAAAAEABwAAAAYAAQAAAAIAAQAKAAAAAgAL'
+                        }
+                    ]
+                };
+                
+                // Test 4: Initialize with data package
+                await debug.initialize({ dataPackage: mockDataPackage });
+                log('Initialized with mock data package');
+                
+                // Test 5: Check that it's now ready
+                if (debug.isInitialized()) {
+                    log('State is correctly initialized after setup');
+                } else {
+                    log('State should be initialized after setup', false);
+                }
+                
+                // Test 6: List files
+                const files = await debug.listFiles();
+                if (files.length > 0) {
+                    log(`Listed ${files.length} files from virtual filesystem`);
+                } else {
+                    log('Should have files in virtual filesystem', false);
+                }
+                
+                // Test 7: Try to start debugging (this should work now with async fix)
+                try {
+                    const result = await debug.start('MainApp.class');
+                    log('Successfully started debugging session');
+                    log(`Debug result status: ${result.status}`);
+                } catch (error) {
+                    if (error.message.includes('main method not found')) {
+                        log('Expected error for mock class without proper main method');
+                    } else {
+                        log(`Debugging start failed: ${error.message}`, false);
+                    }
+                }
+                
+            } catch (error) {
+                log(`Test failed with error: ${error.message}`, false);
+                console.error('Full error:', error);
+            }
+            
+            // Final results
+            const totalTests = passed + failed;
+            const summaryDiv = document.createElement('div');
+            summaryDiv.style.marginTop = '20px';
+            summaryDiv.style.fontWeight = 'bold';
+            summaryDiv.style.fontSize = '16px';
+            summaryDiv.style.color = failed === 0 ? 'green' : 'red';
+            summaryDiv.textContent = `Tests completed: ${passed}/${totalTests} passed`;
+            resultsDiv.appendChild(summaryDiv);
+            
+            // Set global result for testing
+            window.testResult = { passed, failed, total: totalTests };
+        }
+        
+        // Run tests when page loads
+        window.addEventListener('load', runBrowserDebugTest);
+    </script>
+</body>
+</html>

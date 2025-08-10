@@ -44,7 +44,7 @@ test('JVM Serialization', (t) => {
   t.end();
 });
 
-test('Debug Controller Basic Operations', (t) => {
+test('Debug Controller Basic Operations', async (t) => {
   const controller = new DebugController();
   
   // Test initial state
@@ -54,7 +54,7 @@ test('Debug Controller Basic Operations', (t) => {
 
   // Test loading a class
   try {
-    const result = controller.start('sources/VerySimple.class');
+    const result = await controller.start('sources/VerySimple.class');
     t.equal(result.status, 'started', 'Should start successfully');
     t.equal(controller.executionState, 'paused', 'Should be paused after start');
     t.equal(controller.isPaused(), true, 'Should report as paused');
@@ -79,12 +79,12 @@ test('Debug Controller Basic Operations', (t) => {
   t.end();
 });
 
-test('Debug Controller Serialization', (t) => {
+test('Debug Controller Serialization', async (t) => {
   const controller = new DebugController();
   
   try {
     // Start debugging
-    controller.start('sources/VerySimple.class');
+    await controller.start('sources/VerySimple.class');
     controller.setBreakpoint(3);
     controller.setBreakpoint(7);
 
@@ -113,12 +113,12 @@ test('Debug Controller Serialization', (t) => {
   t.end();
 });
 
-test('Debug Controller Step Operations', (t) => {
+test('Debug Controller Step Operations', async (t) => {
   const controller = new DebugController();
   
   try {
     // Start debugging
-    controller.start('sources/VerySimple.class');
+    await controller.start('sources/VerySimple.class');
     
     // Test step into
     const stepResult = controller.stepInto();
@@ -139,7 +139,7 @@ test('Debug Controller Step Operations', (t) => {
   t.end();
 });
 
-test('Debug API Error Handling', (t) => {
+test('Debug API Error Handling', async (t) => {
   const controller = new DebugController();
   
   // Test operations on non-paused debugger
@@ -159,7 +159,7 @@ test('Debug API Error Handling', (t) => {
 
   // Test loading invalid class
   try {
-    controller.start('nonexistent.class');
+    await controller.start('nonexistent.class');
     t.fail('Should throw error for nonexistent class');
   } catch (error) {
     t.ok(error.message.includes('Error loading class'), 'Should throw loading error');
