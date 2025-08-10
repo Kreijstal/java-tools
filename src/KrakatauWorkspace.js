@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { loadClassByPath } = require('./classLoader');
+const { loadClassByPathSync } = require('./classLoader');
 const { getReferenceObjFromClass } = require('./traverseAST');
 const { unparseDataStructures } = require('./convert_tree');
 
@@ -129,7 +129,7 @@ class KrakatauWorkspace {
 
     // Load all class files
     for (const classFile of classFiles) {
-      const ast = loadClassByPath(classFile, { silent: true });
+      const ast = loadClassByPathSync(classFile, { silent: true });
       if (ast) {
         const className = ast.classes[0].className;
         this.workspaceASTs[className] = ast;
@@ -858,7 +858,7 @@ class KrakatauWorkspace {
    * @param {string} filePath - The path to the .class file that has changed.
    */
   async reloadFile(filePath) {
-    const ast = loadClassByPath(filePath, { silent: true });
+    const ast = loadClassByPathSync(filePath, { silent: true });
     if (ast) {
       const className = ast.classes[0].className;
       this.workspaceASTs[className] = ast;

@@ -5,8 +5,10 @@
   "scripts": {
     "test": "tape test/*.test.js",
     "build:java": "javac sources/*.java",
-    "build": "npm run build:java",
-    "clean": "find sources -name '*.class' -delete",
+    "build:bundle": "webpack --mode production",
+    "generate": "npm run build:java && node scripts/generateData.js",
+    "build": "npm run generate && npm run build:bundle && node scripts/buildSite.js",
+    "clean": "find sources -name '*.class' -delete && rm -rf dist",
     "pretest": "npm run build:java",
     "ci": "npm run build && npm test",
     "health-check": "node scripts/health-check.js"
@@ -16,7 +18,20 @@
   "license": "AGPLv3",
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
+    "jszip": "^3.10.1",
     "jvm_parser": "^0.0.3",
     "tape": "^5.9.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.28.0",
+    "@babel/preset-env": "^7.28.0",
+    "babel-loader": "^10.0.0",
+    "buffer": "^6.0.3",
+    "path-browserify": "^1.0.1",
+    "process": "^0.11.10",
+    "stream-browserify": "^3.0.0",
+    "util": "^0.12.5",
+    "webpack": "^5.101.0",
+    "webpack-cli": "^6.0.1"
   }
 }

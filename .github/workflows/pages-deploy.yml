@@ -1,0 +1,105 @@
+name: Deploy JVM Debug Interface to Pages
+
+on:
+  push:
+    branches: ["master"]
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: write # Changed to write to allow creating releases
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate data
+        run: npm run generate
+
+      - name: Build site
+        run: npm run build
+
+      - name: Handle Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if release exists and delete it
+          if gh release view latest-data &>/dev/null; then
+            gh release delete latest-data --yes
+          fi
+          
+          # Create new release
+          gh release create latest-data dist/data.zip \
+            --title "Latest JVM Debug Data Release" \
+            --notes "$(cat << 'EOF'
+          # Latest JVM Debug Data Release  
+
+          This release contains compiled Java class files for the JVM Debug Interface.
+
+          ## Access Information
+
+          All assets from this release can be accessed from:
+          https://github.com/Kreijstal/java-tools/releases/download/latest-data/*
+
+          For example, the data.zip file is available at:
+          https://github.com/Kreijstal/java-tools/releases/download/latest-data/data.zip
+
+          ## Contents
+
+          - 25 compiled Java class files
+          - metadata.json with class descriptions
+          - Total size: ~13KB
+
+          ## Sample Classes Include
+
+          - **Hello**: Simple Hello World program
+          - **VerySimple**: Basic arithmetic (3-2=1)  
+          - **RuntimeArithmetic**: Comprehensive arithmetic operations
+          - **Calculator**: Static method calls with parameters
+          - **StringConcatMethod**: String concatenation examples
+          - **ConstantsTest**: Integer constant instructions
+          - **ExceptionTest**: Exception handling demonstration
+
+          Perfect for testing the Interactive JVM Debug Interface!
+          EOF
+          )" \
+            --latest
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
