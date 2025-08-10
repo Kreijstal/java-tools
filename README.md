@@ -61,7 +61,7 @@ This project is not directly related to the Krakatau decompiler. While both tool
 
 You can parse a `.class` file by using the `loadAndTraverse` function from `src/loadAndTraverse.js`. This function takes a class name and a classpath as arguments. It returns an object containing the Abstract Syntax Tree (AST) and a reference object.
 
-The `parseHelloClass.js` script provides an example of how to parse a class and traverse its AST to find class references.
+For advanced class analysis and workspace management, see the `KrakatauWorkspace` class in `src/KrakatauWorkspace.js` which provides methods for listing classes, methods, fields, and finding references.
 
 ## Installation
 
