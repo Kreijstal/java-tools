@@ -4,6 +4,9 @@
   "main": "index.js",
   "scripts": {
     "test": "tape test/*.test.js",
+    "test:playwright": "playwright test",
+    "test:all": "npm test && npm run test:playwright",
+    "serve": "node scripts/serve.js",
     "build:java": "javac sources/*.java",
     "build:bundle": "webpack --mode production",
     "generate": "npm run build:java && node scripts/generateData.js",
@@ -24,9 +27,11 @@
   "devDependencies": {
     "@babel/core": "^7.28.0",
     "@babel/preset-env": "^7.28.0",
+    "@playwright/test": "^1.45.0",
     "babel-loader": "^10.0.0",
     "buffer": "^6.0.3",
     "path-browserify": "^1.0.1",
+    "playwright": "^1.45.0",
     "process": "^0.11.10",
     "stream-browserify": "^3.0.0",
     "tape": "^5.9.0",

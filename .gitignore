@@ -27,3 +27,7 @@ tools/krakatau/Krakatau
 
 # Build output
 dist/
+
+# Playwright test artifacts  
+test-results/
+playwright-report/

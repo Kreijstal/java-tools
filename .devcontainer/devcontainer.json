@@ -13,5 +13,5 @@
       "version": "stable"
     }
   },
-  "postCreateCommand": "npm ci && bash scripts/install-krakatau.sh"
+  "postCreateCommand": "npm ci && bash scripts/install-krakatau.sh && npx playwright install-deps"
 }

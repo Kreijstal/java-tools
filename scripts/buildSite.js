@@ -58,18 +58,100 @@ console.log('📦 Real JVM debug logic is now available in the browser!');
 function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     // Add GitHub Pages specific enhancements and real JVM integration
     const enhancements = `
-    <!-- GitHub Pages Enhancements with Real JVM Integration -->
-    <meta name="description" content="Interactive JVM Debug Interface - Step-by-step Java bytecode execution with real-time visualization">
-    <meta name="keywords" content="JVM, Java, bytecode, debugger, visualization, interactive">
-    <meta name="author" content="java-tools">
+    <!-- Include Ace Editor from CDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.15.2/ace.js"></script>
     
     <!-- Include the real JVM debug bundle -->
     <script src="./jvm-debug.js"></script>
-    
+
+    <!-- Enhanced Styles for the new IDE layout -->
+    <style>
+        .main-container { 
+            display: grid; 
+            grid-template-columns: 2fr 1fr; 
+            gap: 20px; 
+            margin-top: 20px;
+        }
+        .debugger-panel { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 10px; 
+        }
+        .state-panel-stack { 
+            display: flex; 
+            flex-direction: column; 
+            gap: 20px; 
+        }
+        #disassembly-editor { 
+            width: 100%; 
+            height: 60vh; 
+            border: 1px solid #3e3e42; 
+            border-radius: 5px; 
+        }
+        .debug-controls { 
+            display: flex; 
+            gap: 8px; 
+            margin-bottom: 10px; 
+            flex-wrap: wrap;
+            align-items: center;
+        }
+        .debug-controls button { 
+            font-size: 1.2em; 
+            padding: 8px 12px; 
+            min-width: 40px;
+            background-color: #0e639c;
+            color: white;
+            border: none;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .debug-controls button:hover {
+            background-color: #1177bb;
+        }
+        .debug-controls button:disabled {
+            background-color: #3e3e42;
+            cursor: not-allowed;
+        }
+        .ace_gutter-cell.ace_breakpoint { 
+            background-color: #f44336 !important; 
+            border-radius: 50%; 
+        }
+        .ace-editor-highlight { 
+            position: absolute; 
+            background: rgba(86, 156, 214, 0.3); 
+            z-index: 20; 
+        }
+        .state-display {
+            background-color: #1e1e1e;
+            border: 1px solid #3e3e42;
+            padding: 10px;
+            border-radius: 3px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+    </style>
+
     <!-- Real JVM Debug Integration -->
     <script>
         // Real JVM Debug implementation using the actual JVM logic
         let jvmDebug = null;
+        let aceEditor = null;
+        let lineToPcMap = {};
+        
+        // Add log function that works even if JVM isn't initialized
+        function log(message, type = 'info') {
+            const output = document.getElementById('output');
+            if (output) {
+                const timestamp = new Date().toLocaleTimeString();
+                const className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
+                output.innerHTML += \`<div class="\${className}">[\${timestamp}] \${message}</div>\`;
+                output.scrollTop = output.scrollHeight;
+            } else {
+                console.log(\`[\${type.toUpperCase()}] \${message}\`);
+            }
+        }
         
         // Initialize the real JVM debug interface
         async function initializeRealJVM() {
@@ -100,6 +182,75 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 return false;
             }
         }
+
+        // Initialize Ace Editor
+        function initializeEditor() {
+            try {
+                if (typeof ace !== 'undefined') {
+                    aceEditor = ace.edit("disassembly-editor");
+                    aceEditor.setTheme("ace/theme/monokai");
+                    aceEditor.session.setMode("ace/mode/text");
+                    aceEditor.setReadOnly(true);
+                    aceEditor.renderer.setShowGutter(true);
+                    aceEditor.renderer.setPadding(10);
+                    aceEditor.setOptions({ 
+                        highlightActiveLine: false, 
+                        highlightGutterLine: false,
+                        fontSize: 12
+                    });
+
+                    // Gutter click handler for breakpoints
+                    aceEditor.on("guttermousedown", function(e) {
+                        const line = e.getDocumentPosition().row;
+                        const pc = lineToPcMap[line];
+                        
+                        if (pc === undefined) return;
+
+                        try {
+                            const breakpoints = jvmDebug.getBreakpoints();
+                            if (breakpoints.includes(pc)) {
+                                jvmDebug.removeBreakpoint(pc);
+                                aceEditor.session.clearBreakpoint(line);
+                                log(\`Breakpoint removed at PC \${pc}\`, 'info');
+                            } else {
+                                jvmDebug.setBreakpoint(pc);
+                                aceEditor.session.setBreakpoint(line, "ace_breakpoint");
+                                log(\`Breakpoint set at PC \${pc}\`, 'success');
+                            }
+                            updateDebugDisplay(); // Refresh state
+                        } catch (error) {
+                            log(\`Breakpoint operation failed: \${error.message}\`, 'error');
+                        }
+                    });
+
+                    aceEditor.setValue('Load a class to see disassembly...', -1);
+                    log('Ace Editor initialized successfully', 'success');
+                } else {
+                    // Fallback when Ace Editor is not available
+                    const editorElement = document.getElementById('disassembly-editor');
+                    if (editorElement) {
+                        editorElement.innerHTML = \`
+                            <div style="background: #1e1e1e; color: #d4d4d4; padding: 15px; font-family: monospace; height: 100%; overflow-y: auto; border: 1px solid #3e3e42; border-radius: 3px;">
+                                <div style="color: #f44747; margin-bottom: 10px;">⚠️ Code editor not available (CDN blocked)</div>
+                                <div id="disassembly-text" style="white-space: pre-wrap;">Load a class to see disassembly...</div>
+                            </div>
+                        \`;
+                    }
+                    log('Using fallback text editor (Ace Editor not available)', 'info');
+                }
+            } catch (error) {
+                log(\`Failed to initialize editor: \${error.message}\`, 'error');
+                // Create basic fallback
+                const editorElement = document.getElementById('disassembly-editor');
+                if (editorElement) {
+                    editorElement.innerHTML = \`
+                        <div style="background: #1e1e1e; color: #d4d4d4; padding: 15px; font-family: monospace; height: 100%; overflow-y: auto; border: 1px solid #3e3e42; border-radius: 3px;">
+                            <div id="disassembly-text" style="white-space: pre-wrap;">Editor initialization failed. Load a class to see disassembly...</div>
+                        </div>
+                    \`;
+                }
+            }
+        }
         
         // Enhanced file upload with real class loading
         function addRealFileUpload() {
@@ -109,6 +260,7 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 <h4>📁 Upload Custom Class File</h4>
                 <input type="file" id="classFileInput" accept=".class,.jar" multiple />
                 <button onclick="loadCustomFiles()">Load Files</button>
+                <input type="file" id="stateFileInput" style="display: none;" accept=".json">
                 <div id="uploadStatus" style="margin-top: 10px;"></div>
             \`;
             controls.appendChild(fileUploadDiv);
@@ -233,6 +385,89 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 log(\`Step out failed: \${error.message}\`, 'error');
             }
         }
+
+        function continue_() {
+            if (!jvmDebug) {
+                log('JVM not initialized', 'error');
+                return;
+            }
+            
+            try {
+                const result = jvmDebug.continue();
+                log(\`Continue: \${result.status}\`, 'info');
+                updateDebugDisplay();
+            } catch (error) {
+                log(\`Continue failed: \${error.message}\`, 'error');
+            }
+        }
+
+        function finish() {
+            if (!jvmDebug) {
+                log('JVM not initialized', 'error');
+                return;
+            }
+            
+            try {
+                const result = jvmDebug.finish();
+                log(\`Finish: \${result.status}\`, 'info');
+                updateDebugDisplay();
+            } catch (error) {
+                log(\`Finish failed: \${error.message}\`, 'error');
+            }
+        }
+
+        function serializeState() {
+            if (!jvmDebug) {
+                log('JVM not initialized', 'error');
+                return;
+            }
+            
+            try {
+                const state = jvmDebug.serialize();
+                const stateJson = JSON.stringify(state, null, 2);
+                const blob = new Blob([stateJson], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = \`jvm-state-\${new Date().toISOString().replace(/[:.]/g, '-')}.json\`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                
+                log(\`State serialized and downloaded (\${stateJson.length} bytes)\`, 'success');
+            } catch (error) {
+                log(\`State serialization failed: \${error.message}\`, 'error');
+            }
+        }
+
+        function deserializeState() {
+            document.getElementById('stateFileInput').click();
+        }
+
+        async function handleStateFile(event) {
+            const file = event.target.files[0];
+            if (!file) {
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = async (e) => {
+                try {
+                    const state = JSON.parse(e.target.result);
+                    if (!jvmDebug) {
+                        await initializeRealJVM();
+                    }
+                    jvmDebug.deserialize(state);
+                    log('State restored successfully from file.', 'success');
+                    updateDebugDisplay();
+                } catch (error) {
+                    log(\`Failed to restore state: \${error.message}\`, 'error');
+                }
+            };
+            reader.readAsText(file);
+        }
         
         function setBreakpoint() {
             const pcInput = document.getElementById('pcInput');
@@ -274,75 +509,123 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
         
         function updateDebugDisplay() {
             if (!jvmDebug) return;
-            
+
             try {
                 const state = jvmDebug.getCurrentState();
                 
-                // Update status display
-                const statusDiv = document.querySelector('.debug-status');
+                // Update text-based state panels
+                const statusDiv = document.getElementById('executionState');
                 if (statusDiv) {
                     statusDiv.innerHTML = \`
-                        <h4>🔍 Debug Status</h4>
-                        <p><strong>State:</strong> \${state.executionState}</p>
-                        <p><strong>PC:</strong> \${state.pc !== null ? state.pc : 'N/A'}</p>
-                        <p><strong>Method:</strong> \${state.method ? state.method.name : 'N/A'}</p>
-                        <p><strong>Call Depth:</strong> \${state.callStackDepth}</p>
-                        <p><strong>Breakpoints:</strong> [\${state.breakpoints.join(', ')}]</p>
+                        <strong>State:</strong> \${state.executionState}\\n
+                        <strong>PC:</strong> \${state.pc !== null ? state.pc : 'N/A'}\\n
+                        <strong>Method:</strong> \${state.method ? state.method.name : 'N/A'}\\n
+                        <strong>Call Depth:</strong> \${state.callStackDepth}\\n
+                        <strong>Breakpoints:</strong> [\${state.breakpoints.join(', ')}]
                     \`;
                 }
-                
-                // Update stack display
-                const stackDiv = document.querySelector('.stack-display');
+
+                const stackDiv = document.getElementById('stackDisplay');
                 if (stackDiv) {
                     const stackDisplay = state.stack.map((value, index) => 
                         \`\${index}: \${typeof value === 'string' ? '"\${value}"' : value}\`
                     ).join('\\n') || 'Empty';
-                    
-                    stackDiv.innerHTML = \`
-                        <h4>📚 Stack (\${state.stack.length} items)</h4>
-                        <pre>\${stackDisplay}</pre>
-                    \`;
+                    stackDiv.textContent = stackDisplay;
                 }
-                
-                // Update locals display
-                const localsDiv = document.querySelector('.locals-display');
+
+                const localsDiv = document.getElementById('localsDisplay');
                 if (localsDiv) {
                     const localsDisplay = state.locals.map((value, index) => 
                         \`local_\${index}: \${value !== undefined && value !== null ? 
                             (typeof value === 'string' ? '"\${value}"' : value) : 'undefined'}\`
                     ).join('\\n') || 'No locals';
-                    
-                    localsDiv.innerHTML = \`
-                        <h4>🔧 Local Variables (\${state.locals.length} slots)</h4>
-                        <pre>\${localsDisplay}</pre>
-                    \`;
+                    localsDiv.textContent = localsDisplay;
                 }
                 
+                // Update the Ace Editor with disassembly
+                if ((state.executionState === 'paused' || state.executionState === 'running')) {
+                    try {
+                        const view = jvmDebug.getDisassemblyView();
+                        if (view && view.formattedDisassembly) {
+                            if (aceEditor) {
+                                // Use Ace Editor if available
+                                aceEditor.setValue(view.formattedDisassembly, -1);
+                                
+                                // Clear previous highlights and breakpoints
+                                aceEditor.session.clearBreakpoints();
+                                const markers = aceEditor.session.getMarkers();
+                                for (const i in markers) {
+                                    if (markers[i].clazz === "ace-editor-highlight") {
+                                        aceEditor.session.removeMarker(markers[i].id);
+                                    }
+                                }
+
+                                // Rebuild line-to-pc map
+                                lineToPcMap = {};
+                                const lines = view.formattedDisassembly.split('\\n');
+                                lines.forEach((lineText, index) => {
+                                    // Look for PC markers like "L0:", "L3:", etc.
+                                    const match = lineText.match(/L(\\d+):/);
+                                    if (match) {
+                                        lineToPcMap[index] = parseInt(match[1]);
+                                    }
+                                });
+
+                                // Highlight current line if available
+                                if (view.currentLineNumber !== undefined && view.currentLineNumber >= 0) {
+                                    const currentLine = view.currentLineNumber;
+                                    const Range = ace.require("ace/range").Range;
+                                    aceEditor.session.addMarker(new Range(currentLine, 0, currentLine, 1), "ace-editor-highlight", "fullLine");
+                                    aceEditor.scrollToLine(currentLine, true, true);
+                                }
+                                
+                                // Redraw breakpoints
+                                const breakpoints = state.breakpoints || [];
+                                for (const [line, pc] of Object.entries(lineToPcMap)) {
+                                    if (breakpoints.includes(pc)) {
+                                        aceEditor.session.setBreakpoint(parseInt(line), "ace_breakpoint");
+                                    }
+                                }
+                            } else {
+                                // Fallback to simple text display
+                                const textElement = document.getElementById('disassembly-text');
+                                if (textElement) {
+                                    // Add highlighting for current line in fallback mode
+                                    let formattedText = view.formattedDisassembly;
+                                    if (view.currentLineNumber !== undefined) {
+                                        const lines = formattedText.split('\\n');
+                                        if (lines[view.currentLineNumber]) {
+                                            lines[view.currentLineNumber] = '>>> ' + lines[view.currentLineNumber] + ' <<<';
+                                        }
+                                        formattedText = lines.join('\\n');
+                                    }
+                                    textElement.textContent = formattedText;
+                                }
+                            }
+                        }
+                    } catch (disasmError) {
+                        console.warn('Failed to update disassembly:', disasmError);
+                        if (aceEditor) {
+                            aceEditor.setValue('Disassembly unavailable: ' + disasmError.message, -1);
+                        } else {
+                            const textElement = document.getElementById('disassembly-text');
+                            if (textElement) {
+                                textElement.textContent = 'Disassembly unavailable: ' + disasmError.message;
+                            }
+                        }
+                    }
+                } else {
+                    if (aceEditor) {
+                        aceEditor.setValue('Execution completed or not started.', -1);
+                    } else {
+                        const textElement = document.getElementById('disassembly-text');
+                        if (textElement) {
+                            textElement.textContent = 'Execution completed or not started.';
+                        }
+                    }
+                }
             } catch (error) {
                 log(\`Failed to update debug display: \${error.message}\`, 'error');
-            }
-        }
-        
-        // Add display panels for debug information
-        function addDebugDisplayPanels() {
-            const container = document.querySelector('.container');
-            if (container) {
-                const debugInfo = document.createElement('div');
-                debugInfo.innerHTML = \`
-                    <div class="panel debug-status">
-                        <h4>🔍 Debug Status</h4>
-                        <p>Not started</p>
-                    </div>
-                    <div class="panel stack-display">
-                        <h4>📚 Stack</h4>
-                        <pre>Empty</pre>
-                    </div>
-                    <div class="panel locals-display">
-                        <h4>🔧 Local Variables</h4>
-                        <pre>No locals</pre>
-                    </div>
-                \`;
-                container.appendChild(debugInfo);
             }
         }
         
@@ -350,10 +633,12 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
         document.addEventListener('DOMContentLoaded', async function() {
             log('Initializing Real JVM Debug Interface...', 'info');
             
+            initializeEditor(); // Initialize Ace Editor first
             const success = await initializeRealJVM();
             if (success) {
                 addRealFileUpload();
-                addDebugDisplayPanels();
+                // Set up file input event listener
+                document.getElementById('stateFileInput').addEventListener('change', handleStateFile, false);
                 log('Real JVM Debug Interface ready! 🚀', 'success');
             } else {
                 log('Failed to initialize JVM Debug Interface', 'error');
@@ -362,8 +647,59 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     </script>
     `;
     
+    // Now I need to replace the HTML layout with the new IDE-style layout
+    let newHtml = htmlContent;
+
+    // Replace the old container and controls structure with new layout
+    const oldLayout = /<div class="panel controls">.*?<\/div>\s*<div class="container">.*?<\/div>/s;
+    const newLayout = `
+    <div class="panel controls">
+        <h3>File Operations</h3>
+        <div id="status" class="status">Ready - No program loaded</div>
+    </div>
+
+    <!-- Main UI Layout with IDE-style interface -->
+    <div class="main-container">
+        <!-- Left Column: Debugger -->
+        <div class="debugger-panel panel">
+            <div class="debug-controls">
+                <button onclick="continue_()" title="Continue (F8)">▶️</button>
+                <button onclick="stepOver()" title="Step Over (F10)">↷</button>
+                <button onclick="stepInto()" title="Step Into (F11)">↪️</button>
+                <button onclick="stepOut()" title="Step Out (Shift+F11)">↩️</button>
+                <button onclick="finish()" title="Finish Method">⏩</button>
+                <button onclick="serializeState()" title="Serialize State">💾</button>
+                <button onclick="deserializeState()" title="Restore State">📂</button>
+            </div>
+            <div id="disassembly-editor"></div>
+        </div>
+
+        <!-- Right Column: State & Output -->
+        <div class="state-panel-stack">
+            <div class="panel">
+                <h3>Execution State</h3>
+                <div id="executionState" class="state-display">Not started</div>
+            </div>
+            <div class="panel">
+                <h3>Stack</h3>
+                <div id="stackDisplay" class="state-display">Empty</div>
+            </div>
+            <div class="panel">
+                <h3>Locals</h3>
+                <div id="localsDisplay" class="state-display">No locals</div>
+            </div>
+            <div class="panel">
+                <h3>Output Console</h3>
+                <div id="output" class="output"></div>
+            </div>
+        </div>
+    </div>
+    `;
+
+    newHtml = newHtml.replace(oldLayout, newLayout);
+    
     // Insert enhancements before the closing </head> tag
-    return htmlContent.replace('</head>', enhancements + '</head>');
+    return newHtml.replace('</head>', enhancements + '</head>');
 }
 
 function createSiteReadme() {

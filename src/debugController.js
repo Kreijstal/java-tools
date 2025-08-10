@@ -12,9 +12,9 @@ class DebugController {
    * @param {string} classFilePath - Path to the .class file
    * @param {object} options - Loading options
    */
-  loadClass(classFilePath, options = {}) {
+  async loadClass(classFilePath, options = {}) {
     try {
-      const classData = this.jvm.loadClass(classFilePath, options);
+      const classData = await this.jvm.loadClassAsync(classFilePath, options);
       if (!classData) {
         throw new Error(`Failed to load class from ${classFilePath}`);
       }
@@ -29,8 +29,8 @@ class DebugController {
    * @param {string} classFilePath - Path to the .class file
    * @param {object} options - Execution options
    */
-  start(classFilePath, options = {}) {
-    const classData = this.loadClass(classFilePath, options);
+  async start(classFilePath, options = {}) {
+    const classData = await this.loadClass(classFilePath, options);
     
     const mainMethod = this.jvm.findMainMethod(classData);
     if (!mainMethod) {
