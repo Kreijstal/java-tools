@@ -113,14 +113,14 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     
                     const samplesDiv = document.createElement('div');
                     samplesDiv.innerHTML = \`
-                        <h4>📚 Sample Class Files (\${classes.length} available)</h4>
+                        <h4>📚 Sample Classes (\${classes.length} available) - or upload your own .class/.jar files</h4>
                         <select id="sampleClassSelect">
                             <option value="">Select a sample class...</option>
                             \${classes.map(cls => 
                                 \`<option value="\${cls.filename}">\${cls.name} - \${cls.description}</option>\`
                             ).join('')}
                         </select>
-                        <button onclick="loadSampleClass()">Load & Debug Sample</button>
+                        <button onclick="loadSampleClass()">Load Sample</button>
                     \`;
                     controls.appendChild(samplesDiv);
                     
@@ -210,6 +210,11 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                             log(\`Starting debug session with \${className}...\`, 'info');
                             const result = jvmDebug.start(className);
                             updateDebugDisplay();
+                        }
+                        
+                        // Ensure buttons are updated after starting debugging
+                        if (typeof updateButtons === 'function') {
+                            updateButtons();
                         }
                     } catch (error) {
                         log(\`Failed to start debugging: \${error.message}\`, 'error');
@@ -399,6 +404,122 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 input.click();
             }
         }
+        
+        // Override the original updateButtons function to include stepInstructionBtn
+        const originalUpdateButtons = window.updateButtons;
+        window.updateButtons = function() {
+            if (jvmDebug) {
+                // Use the enhanced JVM state-based button updates
+                try {
+                    const state = jvmDebug.getState();
+                    const isPaused = state.executionState === 'paused';
+                    const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                    stepButtons.forEach(id => {
+                        const btn = document.getElementById(id);
+                        if (btn) btn.disabled = !isPaused;
+                    });
+                    
+                    // Handle debug button state
+                    const debugBtn = document.getElementById('debugBtn');
+                    if (debugBtn) {
+                        const hasLoadedClass = state.loadedClass || currentState.loadedClass;
+                        debugBtn.disabled = !hasLoadedClass || isPaused;
+                    }
+                } catch (error) {
+                    // Fallback to original logic
+                    if (originalUpdateButtons) {
+                        originalUpdateButtons();
+                        // Still need to handle stepInstructionBtn manually
+                        const stepInstructionBtn = document.getElementById('stepInstructionBtn');
+                        if (stepInstructionBtn && currentState) {
+                            stepInstructionBtn.disabled = currentState.status !== 'paused';
+                        }
+                    }
+                }
+            } else if (originalUpdateButtons) {
+                // Use original logic but add stepInstructionBtn support
+                originalUpdateButtons();
+                const stepInstructionBtn = document.getElementById('stepInstructionBtn');
+                if (stepInstructionBtn && currentState) {
+                    stepInstructionBtn.disabled = currentState.status !== 'paused';
+                }
+            }
+        };
+        
+        
+        // Enhanced loadClassFile function to handle both .class and .jar files
+        const originalLoadClassFile = window.loadClassFile;
+        window.loadClassFile = function() {
+            const fileInput = document.getElementById('classFileInput');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                log('Please select a file to upload', 'error');
+                return;
+            }
+            
+            if (!jvmDebug) {
+                log('JVM Debug not initialized', 'error');
+                return;
+            }
+            
+            const fileName = file.name;
+            const isJar = fileName.toLowerCase().endsWith('.jar');
+            const isClass = fileName.toLowerCase().endsWith('.class');
+            
+            if (!isJar && !isClass) {
+                log('Please select a .class or .jar file', 'error');
+                return;
+            }
+            
+            log(\`Loading \${isJar ? 'JAR' : 'class'} file: \${fileName}...\`, 'info');
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const buffer = new Uint8Array(e.target.result);
+                    
+                    if (isJar) {
+                        // Handle JAR file
+                        jvmDebug.loadJar(buffer, fileName);
+                        log(\`JAR file \${fileName} loaded successfully\`, 'success');
+                    } else {
+                        // Handle .class file
+                        const className = fileName.replace('.class', '');
+                        jvmDebug.loadClass(buffer, className);
+                        log(\`Class file \${className} loaded successfully\`, 'success');
+                        
+                        // Update state to reflect loaded class
+                        if (typeof updateState === 'function') {
+                            updateState({
+                                loadedClass: true,
+                                className: className,
+                                status: 'ready'
+                            });
+                        }
+                    }
+                    
+                    // Enable debug button
+                    const debugBtn = document.getElementById('debugBtn');
+                    if (debugBtn) {
+                        debugBtn.disabled = false;
+                        log('Start Debugging button enabled', 'info');
+                    }
+                    
+                } catch (error) {
+                    log(\`Failed to load \${fileName}: \${error.message}\`, 'error');
+                    if (originalLoadClassFile) {
+                        originalLoadClassFile();
+                    }
+                }
+            };
+            
+            reader.onerror = function() {
+                log(\`Failed to read file \${fileName}\`, 'error');
+            };
+            
+            reader.readAsArrayBuffer(file);
+        };
     </script>
     `;
     
@@ -406,13 +527,25 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     const debugControlsPattern = /(<button onclick="finish\(\)" id="finishBtn"[^>]*>⏩<\/button>)/;
     htmlContent = htmlContent.replace(debugControlsPattern, '$1\n            <button onclick="stepInstruction()" id="stepInstructionBtn" title="Step Instruction" disabled>📶</button>');
     
-    // Add the deserializeBtn ID to the restore state button
+    // Add the deserializeBtn ID to the restore state button and add text
     const restoreButtonPattern = /(<button onclick="document\.getElementById\('stateFileInput'\)\.click\(\)"[^>]*>📂<\/button>)/;
-    htmlContent = htmlContent.replace(restoreButtonPattern, '<button onclick="deserializeState()" id="deserializeBtn" title="Restore State">📂</button>');
+    htmlContent = htmlContent.replace(restoreButtonPattern, '<button onclick="deserializeState()" id="deserializeBtn" title="Restore State">📂 Restore State</button>');
+    
+    // Add ID and text to the serialize button for test compatibility
+    const serializeButtonPattern = /(<button onclick="serializeState\(\)" title="Serialize State">💾<\/button>)/;
+    htmlContent = htmlContent.replace(serializeButtonPattern, '<button onclick="serializeState()" id="serializeBtn" title="Serialize State">💾 Serialize State</button>');
     
     // Add the Clear button to the output console
     const outputConsolePattern = /(<h3>Output Console<\/h3>)/;
     htmlContent = htmlContent.replace(outputConsolePattern, '$1\n                <button onclick="clearOutput()" style="float: right; font-size: 10px; padding: 2px 6px;">Clear</button>');
+    
+    // Consolidate upload mechanisms - update file input to accept both .class and .jar files
+    const fileInputPattern = /(<input type="file" id="classFileInput" accept="\.class"[^>]*>)/;
+    htmlContent = htmlContent.replace(fileInputPattern, '<input type="file" id="classFileInput" accept=".class,.jar" style="margin-right: 10px;" title="Upload .class or .jar files">');
+    
+    // Update the load button text to reflect unified functionality
+    const loadButtonPattern = /(<button onclick="loadClassFile\(\)" id="loadBtn">)Load Class(<\/button>)/;
+    htmlContent = htmlContent.replace(loadButtonPattern, '$1Upload Custom File$2');
     
     // Insert enhancements before the closing </head> tag
     return htmlContent.replace('</head>', enhancements + '</head>');
