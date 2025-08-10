@@ -1,6 +1,7 @@
 const Stack = require('./stack');
 const { loadClassByPath } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
+const { formatInstruction } = require('./convert_tree');
 
 class Frame {
   constructor(method) {
@@ -745,7 +746,7 @@ class JVM {
     });
 
     const instruction = instructionItem ? instructionItem.instruction : null;
-    const instructionText = this.formatInstruction(instruction);
+    const instructionText = formatInstruction(instruction);
 
     return {
       line: lineNumber,
@@ -776,27 +777,7 @@ class JVM {
     return null;
   }
 
-  /**
-   * Format instruction for display
-   * @param {object|string} instruction - Instruction object or string
-   * @returns {string} Formatted instruction text
-   */
-  formatInstruction(instruction) {
-    if (typeof instruction === 'string') {
-      return instruction;
-    } else if (instruction && instruction.op) {
-      let result = instruction.op;
-      if (instruction.arg) {
-        if (Array.isArray(instruction.arg)) {
-          result += ' ' + instruction.arg.join(' ');
-        } else {
-          result += ' ' + instruction.arg;
-        }
-      }
-      return result;
-    }
-    return 'null';
-  }
+
 
   /**
    * Get disassembly view with current execution position highlighted
@@ -821,7 +802,7 @@ class JVM {
     const instructions = codeAttribute.code.codeItems.map((item, index) => {
       const label = item.labelDef;
       const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-      const instruction = this.formatInstruction(item.instruction);
+      const instruction = formatInstruction(item.instruction);
       const isCurrentInstruction = pc === currentPc;
       const sourceMapping = this.getSourceLineMapping(pc, method);
       
@@ -849,6 +830,3 @@ class JVM {
 }
 
 module.exports = { JVM, Frame };
-
-module.exports = JVM;
-module.exports.Frame = Frame;

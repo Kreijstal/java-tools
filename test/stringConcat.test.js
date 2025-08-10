@@ -1,5 +1,5 @@
 const test = require('tape');
-const JVM = require('../src/jvm');
+const { JVM } = require('../src/jvm');
 
 test('JVM should execute string concatenation examples', (t) => {
   const jvm = new JVM();

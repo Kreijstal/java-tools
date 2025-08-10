@@ -1,5 +1,4 @@
-const JVM = require('./jvm');
-const { Frame } = require('./jvm');
+const { JVM, Frame } = require('./jvm');
 
 class DebugController {
   constructor() {

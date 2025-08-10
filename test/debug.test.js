@@ -1,5 +1,5 @@
 const test = require('tape');
-const JVM = require('../src/jvm');
+const { JVM } = require('../src/jvm');
 const DebugController = require('../src/debugController');
 
 test('JVM Serialization', (t) => {
