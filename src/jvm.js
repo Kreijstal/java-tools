@@ -1,7 +1,7 @@
 const Stack = require('./stack');
 const { loadClassByPath } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
-const { formatInstruction } = require('./convert_tree');
+const { formatInstruction, unparseDataStructures } = require('./convert_tree');
 
 class Frame {
   constructor(method) {
@@ -785,46 +785,121 @@ class JVM {
    */
   getDisassemblyView() {
     if (this.callStack.isEmpty()) {
-      return { instructions: [], currentPc: null, sourceMapping: null };
+      return { 
+        formattedDisassembly: 'No active execution frame',
+        currentPc: null, 
+        sourceMapping: null,
+        classFile: null
+      };
     }
 
     const frame = this.callStack.peek();
     const method = frame.method;
+    
+    // Get current PC from the instruction
     const currentInstructionItem = frame.instructions[frame.pc < frame.instructions.length ? frame.pc : frame.pc - 1];
     const currentLabel = currentInstructionItem ? currentInstructionItem.labelDef : null;
     const currentPc = currentLabel ? parseInt(currentLabel.substring(1, currentLabel.length - 1)) : -1;
-
-    const codeAttribute = method.attributes.find(attr => attr.type === 'code');
-    if (!codeAttribute) {
-      return { instructions: [], currentPc: currentPc, sourceMapping: null };
+    
+    // Find the class data that contains this method
+    let classData = null;
+    let classFile = null;
+    for (const [className, data] of Object.entries(this.classes)) {
+      if (data && data.classes && data.classes[0]) {
+        const methods = data.classes[0].items.filter(item => item.type === 'method');
+        if (methods.some(item => item.method === method)) {
+          classData = data.classes[0];
+          classFile = className;
+          break;
+        }
+      }
     }
 
-    const instructions = codeAttribute.code.codeItems.map((item, index) => {
-      const label = item.labelDef;
-      const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-      const instruction = formatInstruction(item.instruction);
-      const isCurrentInstruction = pc === currentPc;
-      const sourceMapping = this.getSourceLineMapping(pc, method);
-      
-      return {
-        pc: pc,
-        instruction: instruction,
-        isCurrent: isCurrentInstruction,
-        sourceMapping: sourceMapping,
-        index: index
+    if (!classData) {
+      return { 
+        formattedDisassembly: 'Class data not found for current method',
+        currentPc: currentPc, 
+        sourceMapping: null,
+        classFile: null
       };
+    }
+
+    // Get complete disassembly using unparseDataStructures
+    const completeDisassembly = unparseDataStructures(classData);
+    
+    // Split into lines and add line numbers
+    const lines = completeDisassembly.split('\n');
+    
+    // Find which line contains the current PC label within the current method context
+    let currentPcLineIndex = -1;
+    const currentPcLabel = `L${currentPc}:`;
+    const currentMethodName = method.name;
+    const currentMethodDescriptor = method.descriptor;
+    
+    // Find the method section first
+    let inCurrentMethod = false;
+    let methodStartIndex = -1;
+    let methodEndIndex = -1;
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.includes(`.method`) && line.includes(currentMethodName) && line.includes(currentMethodDescriptor)) {
+        inCurrentMethod = true;
+        methodStartIndex = i;
+      } else if (inCurrentMethod && line.includes(`.end method`)) {
+        methodEndIndex = i;
+        break;
+      }
+    }
+    
+    // Now search for the PC label within this method
+    if (methodStartIndex !== -1 && methodEndIndex !== -1) {
+      for (let i = methodStartIndex; i <= methodEndIndex; i++) {
+        if (lines[i].includes(currentPcLabel)) {
+          currentPcLineIndex = i;
+          break;
+        }
+      }
+    }
+
+    // Format the disassembly with line numbers and current position marker
+    const numberedLines = lines.map((line, index) => {
+      const lineNumber = String(index + 1).padStart(4, ' ');
+      const marker = index === currentPcLineIndex ? '=>' : '  ';
+      return `${marker} ${lineNumber}  ${line}`;
     });
 
+    // Get source mapping for current PC
     const currentSourceMapping = this.getSourceLineMapping(currentPc, method);
+    
+    // Create header and footer
+    const sourceLineInfo = currentPcLineIndex !== -1 ? 
+      ` (at line ${currentPcLineIndex + 1})` : '';
+    
+    const header = [
+      '8. Disassembly View',
+      '================================================================================',
+      `File: ${classFile}`,
+      `Current PC: ${currentPc}${sourceLineInfo}`,
+      ''
+    ];
+    
+    const footer = [
+      '================================================================================'
+    ];
+
+    const formattedDisassembly = [
+      ...header,
+      ...numberedLines,
+      ...footer
+    ].join('\n');
 
     return {
-      instructions: instructions,
+      formattedDisassembly: formattedDisassembly,
       currentPc: currentPc,
       sourceMapping: currentSourceMapping,
-      method: {
-        name: method.name,
-        descriptor: method.descriptor
-      }
+      classFile: classFile,
+      currentLineNumber: currentPcLineIndex + 1
     };
   }
 }

@@ -96,17 +96,9 @@ async function demonstrateDebugAPI() {
     }
 
     // 8. Show disassembly view
-    console.log('\n8. Disassembly view with current execution position:');
+    console.log('\n');
     const disassembly = newController.getDisassemblyView();
-    console.log(`   Method: ${disassembly.method.name}${disassembly.method.descriptor}`);
-    console.log(`   Current PC: ${disassembly.currentPc}`);
-    console.log(`   Source mapping: line ${disassembly.sourceMapping.line} in ${disassembly.sourceMapping.sourceFile}`);
-    console.log('   Instructions:');
-    disassembly.instructions.forEach(instr => {
-      const marker = instr.isCurrent ? ' >' : '  ';
-      const lineInfo = instr.sourceMapping.line ? ` (line ${instr.sourceMapping.line})` : '';
-      console.log(`${marker} PC=${instr.pc}: ${instr.instruction}${lineInfo}`);
-    });
+    console.log(disassembly.formattedDisassembly);
 
   } catch (error) {
     console.error(`❌ Error during demonstration: ${error.message}`);
