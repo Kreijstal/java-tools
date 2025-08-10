@@ -20,8 +20,13 @@ function assembleClasses(root, baseOutputDir = '.') {
     const jContent = unparseDataStructures(cls);
     fs.writeFileSync(jFileName, jContent);
 
-    // Execute krak2 asm command with the specified output directory
-    execSync(`krak2 asm ${jFileName} --out ${classFileName}`);
+    // Find Krakatau binary relative to project root
+    const krak2Path = path.resolve(__dirname, '../tools/krakatau/Krakatau/target/release/krak2');
+    if (!fs.existsSync(krak2Path)) {
+      throw new Error(`Krakatau binary not found at ${krak2Path}`);
+    }
+    // Execute Krakatau asm command with the specified output directory
+    execSync(`"${krak2Path}" asm "${jFileName}" --out "${classFileName}"`);
   });
 }
 
