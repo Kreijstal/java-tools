@@ -7,7 +7,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
 
 console.log('🏗️  Building JVM Debug Interface site...');
 
@@ -19,7 +18,7 @@ if (!fs.existsSync(distDir)) {
     fs.mkdirSync(distDir, { recursive: true });
 }
 
-// Step 1: Verify the browser bundle exists (should be built by npm run build:bundle)
+// Step 1: Verify the browser bundle exists
 console.log('📦 Verifying browser bundle exists...');
 const bundlePath = path.join(distDir, 'jvm-debug.js');
 if (!fs.existsSync(bundlePath)) {
@@ -36,7 +35,7 @@ const indexPath = path.join(distDir, 'index.html');
 if (fs.existsSync(debugInterfacePath)) {
     let htmlContent = fs.readFileSync(debugInterfacePath, 'utf8');
     
-    // Update the HTML to use the real JVM bundle
+    // Enhance the HTML with real JVM integration
     htmlContent = enhanceDebugInterfaceWithRealJVM(htmlContent);
     
     fs.writeFileSync(indexPath, htmlContent);
@@ -58,535 +57,236 @@ console.log('📦 Real JVM debug logic is now available in the browser!');
 function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     // Add GitHub Pages specific enhancements and real JVM integration
     const enhancements = `
-    <!-- Include Ace Editor from CDN -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.15.2/ace.js"></script>
-    
     <!-- Include the real JVM debug bundle -->
     <script src="./jvm-debug.js"></script>
 
-    <!-- Enhanced Styles for the new IDE layout -->
-    <style>
-        .main-container { 
-            display: grid; 
-            grid-template-columns: 2fr 1fr; 
-            gap: 20px; 
-            margin-top: 20px;
-        }
-        .debugger-panel { 
-            display: flex; 
-            flex-direction: column; 
-            gap: 10px; 
-        }
-        .state-panel-stack { 
-            display: flex; 
-            flex-direction: column; 
-            gap: 20px; 
-        }
-        #disassembly-editor { 
-            width: 100%; 
-            height: 60vh; 
-            border: 1px solid #3e3e42; 
-            border-radius: 5px; 
-        }
-        .debug-controls { 
-            display: flex; 
-            gap: 8px; 
-            margin-bottom: 10px; 
-            flex-wrap: wrap;
-            align-items: center;
-        }
-        .debug-controls button { 
-            font-size: 1.2em; 
-            padding: 8px 12px; 
-            min-width: 40px;
-            background-color: #0e639c;
-            color: white;
-            border: none;
-            border-radius: 3px;
-            cursor: pointer;
-        }
-        .debug-controls button:hover {
-            background-color: #1177bb;
-        }
-        .debug-controls button:disabled {
-            background-color: #3e3e42;
-            cursor: not-allowed;
-        }
-        .ace_gutter-cell.ace_breakpoint { 
-            background-color: #f44336 !important; 
-            border-radius: 50%; 
-        }
-        .ace-editor-highlight { 
-            position: absolute; 
-            background: rgba(86, 156, 214, 0.3); 
-            z-index: 20; 
-        }
-        .state-display {
-            background-color: #1e1e1e;
-            border: 1px solid #3e3e42;
-            padding: 10px;
-            border-radius: 3px;
-            max-height: 200px;
-            overflow-y: auto;
-            font-size: 12px;
-            white-space: pre-wrap;
-        }
-    </style>
-
-    <!-- Real JVM Debug Integration -->
     <script>
-        // Real JVM Debug implementation using the actual JVM logic
+        // Real JVM integration - override mock functions with real implementations
         let jvmDebug = null;
-        let lineToPcMap = {};
         
-        // Add log function that works even if JVM isn't initialized
-        function log(message, type = 'info') {
-            const output = document.getElementById('output');
-            if (output) {
-                const timestamp = new Date().toLocaleTimeString();
-                const className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
-                output.innerHTML += \`<div class="\${className}">[\${timestamp}] \${message}</div>\`;
-                output.scrollTop = output.scrollHeight;
-            } else {
-                console.log(\`[\${type.toUpperCase()}] \${message}\`);
-            }
-        }
-        
-        // Initialize the real JVM debug interface
-        async function initializeRealJVM() {
+        // Initialize real JVM when page loads
+        document.addEventListener('DOMContentLoaded', async function() {
             try {
-                jvmDebug = new JVMDebug.BrowserJVMDebug();
-                
-                // Load data package if available
-                try {
-                    const response = await fetch('./data/metadata.json');
-                    if (response.ok) {
-                        const metadata = await response.json();
-                        
-                        // Load actual class files by fetching them from the data directory
-                        const dataPackage = { classes: [] };
-                        
-                        log('Loading class files from data directory...', 'info');
-                        for (const classInfo of metadata.classes) {
-                            try {
-                                const classResponse = await fetch(\`./data/\${classInfo.filename}\`);
-                                if (classResponse.ok) {
-                                    const arrayBuffer = await classResponse.arrayBuffer();
-                                    const content = new Uint8Array(arrayBuffer);
-                                    
-                                    // Convert to base64 for compatibility with loadDataPackage
-                                    let base64String = '';
-                                    const chunkSize = 8192;
-                                    for (let i = 0; i < content.length; i += chunkSize) {
-                                        const chunk = content.slice(i, i + chunkSize);
-                                        base64String += String.fromCharCode.apply(null, chunk);
-                                    }
-                                    
-                                    dataPackage.classes.push({
-                                        name: classInfo.name,
-                                        filename: classInfo.filename,
-                                        size: classInfo.size,
-                                        description: classInfo.description,
-                                        content: btoa(base64String)
-                                    });
-                                    log(\`Loaded \${classInfo.filename} (\${classInfo.size} bytes)\`, 'info');
-                                } else {
-                                    log(\`Failed to fetch \${classInfo.filename}: \${classResponse.status}\`, 'error');
-                                }
-                            } catch (fileError) {
-                                log(\`Error loading \${classInfo.filename}: \${fileError.message}\`, 'error');
-                            }
+                // Initialize the real JVM debug engine
+                if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
+                    jvmDebug = new window.JVMDebug.BrowserJVMDebug();
+                    
+                    try {
+                        const response = await fetch('data.zip');
+                        if (response.ok) {
+                            const buffer = await response.arrayBuffer();
+                            const dataPackage = { buffer };
+                            await jvmDebug.initialize({ dataPackage });
+                            log('Real JVM Debug initialized with sample classes', 'success');
+                            populateSampleClasses();
+                        } else {
+                            await jvmDebug.initialize();
+                            log('Real JVM Debug initialized (no data package)', 'info');
                         }
-                        
-                        await jvmDebug.initialize({ dataPackage });
-                        log(\`Initialized with \${dataPackage.classes.length} classes loaded\`, 'success');
-                        populateSampleClasses(dataPackage.classes);
-                    } else {
+                    } catch (err) {
                         await jvmDebug.initialize();
-                        log('JVM Debug initialized (no data package)', 'info');
+                        log('Real JVM Debug initialized without data package', 'info');
                     }
-                } catch (err) {
-                    await jvmDebug.initialize();
-                    log('JVM Debug initialized without data package', 'info');
-                }
-                
-                return true;
-            } catch (error) {
-                console.error('Failed to initialize JVM Debug:', error);
-                log(\`Failed to initialize JVM: \${error.message}\`, 'error');
-                return false;
-            }
-        }
-
-        // Initialize Ace Editor
-        function initializeEditor() {
-            try {
-                if (typeof ace !== 'undefined') {
-                    aceEditor = ace.edit("disassembly-editor");
-                    aceEditor.setTheme("ace/theme/monokai");
-                    aceEditor.session.setMode("ace/mode/text");
-                    aceEditor.setReadOnly(true);
-                    aceEditor.renderer.setShowGutter(true);
-                    aceEditor.renderer.setPadding(10);
-                    aceEditor.setOptions({ 
-                        highlightActiveLine: false, 
-                        highlightGutterLine: false,
-                        fontSize: 12
-                    });
-
-                    // Gutter click handler for breakpoints
-                    aceEditor.on("guttermousedown", function(e) {
-                        const line = e.getDocumentPosition().row;
-                        const pc = lineToPcMap[line];
-                        
-                        if (pc === undefined) return;
-
-                        try {
-                            const breakpoints = jvmDebug.getBreakpoints();
-                            if (breakpoints.includes(pc)) {
-                                jvmDebug.removeBreakpoint(pc);
-                                aceEditor.session.clearBreakpoint(line);
-                                log(\`Breakpoint removed at PC \${pc}\`, 'info');
-                            } else {
-                                jvmDebug.setBreakpoint(pc);
-                                aceEditor.session.setBreakpoint(line, "ace_breakpoint");
-                                log(\`Breakpoint set at PC \${pc}\`, 'success');
-                            }
-                            updateDebugDisplay(); // Refresh state
-                        } catch (error) {
-                            log(\`Breakpoint operation failed: \${error.message}\`, 'error');
-                        }
-                    });
-
-                    aceEditor.setValue('Load a class to see disassembly...', -1);
-                    log('Ace Editor initialized successfully', 'success');
+                    
+                    log('Real JVM Debug Interface ready! 🚀', 'success');
+                    
+                    // Enhance the existing functions with real JVM calls
+                    enhanceWithRealJVM();
                 } else {
-                    // Fallback when Ace Editor is not available
-                    const editorElement = document.getElementById('disassembly-editor');
-                    if (editorElement) {
-                        editorElement.innerHTML = \`
-                            <div style="background: #1e1e1e; color: #d4d4d4; padding: 15px; font-family: monospace; height: 100%; overflow-y: auto; border: 1px solid #3e3e42; border-radius: 3px;">
-                                <div style="color: #f44747; margin-bottom: 10px;">⚠️ Code editor not available (CDN blocked)</div>
-                                <div id="disassembly-text" style="white-space: pre-wrap;">Load a class to see disassembly...</div>
-                            </div>
-                        \`;
-                    }
-                    log('Using fallback text editor (Ace Editor not available)', 'info');
+                    log('JVM Debug bundle not available - using mock implementation', 'info');
                 }
             } catch (error) {
-                log(\`Failed to initialize editor: \${error.message}\`, 'error');
-                // Create basic fallback
-                const editorElement = document.getElementById('disassembly-editor');
-                if (editorElement) {
-                    editorElement.innerHTML = \`
-                        <div style="background: #1e1e1e; color: #d4d4d4; padding: 15px; font-family: monospace; height: 100%; overflow-y: auto; border: 1px solid #3e3e42; border-radius: 3px;">
-                            <div id="disassembly-text" style="white-space: pre-wrap;">Editor initialization failed. Load a class to see disassembly...</div>
-                        </div>
+                log(\`Failed to initialize real JVM: \${error.message}\`, 'error');
+            }
+        });
+        
+        function populateSampleClasses() {
+            // Add sample class loading functionality
+            const controls = document.querySelector('.controls');
+            if (controls && jvmDebug) {
+                try {
+                    const classes = [
+                        { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
+                        { filename: 'Hello.class', name: 'Hello', description: 'Hello World program' },
+                        { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' }
+                    ];
+                    
+                    const samplesDiv = document.createElement('div');
+                    samplesDiv.innerHTML = \`
+                        <h4>📚 Sample Class Files (\${classes.length} available)</h4>
+                        <select id="sampleClassSelect">
+                            <option value="">Select a sample class...</option>
+                            \${classes.map(cls => 
+                                \`<option value="\${cls.filename}">\${cls.name} - \${cls.description}</option>\`
+                            ).join('')}
+                        </select>
+                        <button onclick="loadSampleClass()">Load & Debug Sample</button>
                     \`;
+                    controls.appendChild(samplesDiv);
+                } catch (error) {
+                    log(\`Failed to populate sample classes: \${error.message}\`, 'error');
                 }
             }
         }
         
-        // Enhanced file upload with real class loading
-        function addRealFileUpload() {
-            const controls = document.querySelector('.controls');
-            const fileUploadDiv = document.createElement('div');
-            fileUploadDiv.innerHTML = \`
-                <h4>📁 Upload Custom Class File</h4>
-                <input type="file" id="classFileInput" accept=".class,.jar" multiple />
-                <button onclick="loadCustomFiles()">Load Files</button>
-                <input type="file" id="stateFileInput" style="display: none;" accept=".json">
-                <div id="uploadStatus" style="margin-top: 10px;"></div>
-            \`;
-            controls.appendChild(fileUploadDiv);
-        }
-        
-        async function loadCustomFiles() {
-            const fileInput = document.getElementById('classFileInput');
-            const files = fileInput.files;
-            
-            if (!files || files.length === 0) {
-                updateUploadStatus('Please select .class or .jar files', 'error');
-                return;
-            }
-            
-            try {
-                for (const file of files) {
-                    const result = await jvmDebug.loadFile(file);
-                    updateUploadStatus(\`Loaded \${result.fileName} (\${result.size} bytes)\`, 'success');
-                    log(\`File loaded: \${result.fileName}\`, 'success');
-                }
-                
-                // Refresh file list
-                const files = await jvmDebug.listFiles();
-                log(\`Total files available: \${files.length}\`, 'info');
-            } catch (error) {
-                updateUploadStatus(\`Failed to load files: \${error.message}\`, 'error');
-                log(\`File load error: \${error.message}\`, 'error');
-            }
-        }
-        
-        function updateUploadStatus(message, type) {
-            const status = document.getElementById('uploadStatus');
-            if (status) {
-                status.textContent = message;
-                status.className = type;
-            }
-        }
-        
-        // Sample classes integration
-        function populateSampleClasses(classes) {
-            const controls = document.querySelector('.controls');
-            const samplesDiv = document.createElement('div');
-            samplesDiv.innerHTML = \`
-                <h4>📚 Sample Class Files (\${classes.length} available)</h4>
-                <select id="sampleClassSelect">
-                    <option value="">Select a sample class...</option>
-                    \${classes.map(cls => 
-                        \`<option value="\${cls.filename}">\${cls.name} - \${cls.description}</option>\`
-                    ).join('')}
-                </select>
-                <button onclick="loadSampleClass()">Load & Debug</button>
-            \`;
-            controls.appendChild(samplesDiv);
-        }
-        
-        async function loadSampleClass() {
+        function loadSampleClass() {
             const select = document.getElementById('sampleClassSelect');
             const selectedClass = select.value;
             
-            if (!selectedClass) {
-                log('Please select a sample class', 'error');
+            if (!selectedClass || !jvmDebug) {
+                log('Please select a sample class and ensure JVM is initialized', 'error');
                 return;
             }
             
             try {
                 log(\`Loading sample class: \${selectedClass}\`, 'info');
                 
-                // Set the loaded class state before starting debug session
-                updateState({ 
-                    loadedClass: { name: selectedClass },
-                    className: selectedClass
-                });
-                
-                const result = await jvmDebug.start(selectedClass);
+                const result = jvmDebug.start(selectedClass.replace('.class', ''));
                 log(\`Debug session started for \${selectedClass}\`, 'success');
-                log(\`Status: \${result.status}\`, 'info');
                 updateDebugDisplay();
+                
+                // Update the current state to enable debug buttons
+                if (typeof updateState === 'function') {
+                    updateState({
+                        loadedClass: { name: selectedClass },
+                        className: selectedClass.replace('.class', ''),
+                        status: 'paused'
+                    });
+                }
+                
+                if (typeof updateStatus === 'function') {
+                    updateStatus('Debugger started - Real JVM session active', 'success');
+                }
+                
             } catch (error) {
                 log(\`Failed to start debugging \${selectedClass}: \${error.message}\`, 'error');
-                // Reset loadedClass on failure
-                updateState({ 
-                    loadedClass: null,
-                    className: null
-                });
             }
         }
         
-        // Real debug functionality
-        function startDebugging() {
-            log('Use "Load & Debug" button with sample classes or upload your own .class files', 'info');
-        }
-        
-        function stepInto() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.stepInto();
-                log(\`Step into: \${result.status}\`, 'info');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Step into failed: \${error.message}\`, 'error');
-            }
-        }
-        
-        function stepOver() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.stepOver();
-                log(\`Step over: \${result.status}\`, 'info');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Step over failed: \${error.message}\`, 'error');
-            }
-        }
-        
-        function stepOut() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.stepOut();
-                log(\`Step out: \${result.status}\`, 'info');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Step out failed: \${error.message}\`, 'error');
-            }
-        }
-
-        function continue_() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.continue();
-                log(\`Continue: \${result.status}\`, 'info');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Continue failed: \${error.message}\`, 'error');
-            }
-        }
-
-        function finish() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.finish();
-                log(\`Finish: \${result.status}\`, 'info');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Finish failed: \${error.message}\`, 'error');
-            }
-        }
-
-        function serializeState() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const state = jvmDebug.serialize();
-                const stateJson = JSON.stringify(state, null, 2);
-                const blob = new Blob([stateJson], { type: 'application/json' });
-                const url = URL.createObjectURL(blob);
+        function enhanceWithRealJVM() {
+            // Override step functions with real JVM calls
+            if (jvmDebug) {
+                // Store original functions if they exist
+                const originalStepInto = window.stepInto;
+                const originalStepOver = window.stepOver;
+                const originalStepOut = window.stepOut;
+                const originalContinue = window.continue_;
+                const originalFinish = window.finish;
                 
-                const a = document.createElement('a');
-                a.href = url;
-                a.download = \`jvm-state-\${new Date().toISOString().replace(/[:.]/g, '-')}.json\`;
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-                URL.revokeObjectURL(url);
-                
-                log(\`State serialized and downloaded (\${stateJson.length} bytes)\`, 'success');
-            } catch (error) {
-                log(\`State serialization failed: \${error.message}\`, 'error');
-            }
-        }
-
-        function deserializeState() {
-            document.getElementById('stateFileInput').click();
-        }
-
-        async function handleStateFile(event) {
-            const file = event.target.files[0];
-            if (!file) {
-                return;
-            }
-
-            const reader = new FileReader();
-            reader.onload = async (e) => {
-                try {
-                    const state = JSON.parse(e.target.result);
-                    if (!jvmDebug) {
-                        await initializeRealJVM();
+                // Override with real JVM implementations
+                window.stepInto = function() {
+                    try {
+                        const result = jvmDebug.stepInto();
+                        log('Step Into completed', 'info');
+                        updateDebugDisplay();
+                    } catch (error) {
+                        log(\`Step into failed: \${error.message}\`, 'error');
+                        if (originalStepInto) originalStepInto();
                     }
-                    jvmDebug.deserialize(state);
-                    log('State restored successfully from file.', 'success');
-                    updateDebugDisplay();
-                } catch (error) {
-                    log(\`Failed to restore state: \${error.message}\`, 'error');
+                };
+                
+                window.stepOver = function() {
+                    try {
+                        const result = jvmDebug.stepOver();
+                        log('Step Over completed', 'info');
+                        updateDebugDisplay();
+                    } catch (error) {
+                        log(\`Step over failed: \${error.message}\`, 'error');
+                        if (originalStepOver) originalStepOver();
+                    }
+                };
+                
+                window.stepOut = function() {
+                    try {
+                        const result = jvmDebug.stepOut();
+                        log('Step Out completed', 'info');
+                        updateDebugDisplay();
+                    } catch (error) {
+                        log(\`Step out failed: \${error.message}\`, 'error');
+                        if (originalStepOut) originalStepOut();
+                    }
+                };
+                
+                window.continue_ = function() {
+                    try {
+                        const result = jvmDebug.continue();
+                        log('Continue completed', 'info');
+                        updateDebugDisplay();
+                    } catch (error) {
+                        log(\`Continue failed: \${error.message}\`, 'error');
+                        if (originalContinue) originalContinue();
+                    }
+                };
+                
+                window.finish = function() {
+                    try {
+                        const result = jvmDebug.finish();
+                        log('Finish completed', 'info');
+                        updateDebugDisplay();
+                    } catch (error) {
+                        log(\`Finish failed: \${error.message}\`, 'error');
+                        if (originalFinish) originalFinish();
+                    }
+                };
+                
+                // Add stepInstruction function if it doesn't exist
+                if (!window.stepInstruction) {
+                    window.stepInstruction = function() {
+                        try {
+                            const result = jvmDebug.stepInstruction();
+                            log('Step Instruction completed', 'info');
+                            updateDebugDisplay();
+                        } catch (error) {
+                            log(\`Step instruction failed: \${error.message}\`, 'error');
+                        }
+                    };
                 }
-            };
-            reader.readAsText(file);
+                
+                // Override serialize/deserialize with real JVM state
+                const originalSerialize = window.serializeState;
+                window.serializeState = function() {
+                    try {
+                        const state = jvmDebug.serialize();
+                        const stateJson = JSON.stringify(state, null, 2);
+                        const blob = new Blob([stateJson], { type: 'application/json' });
+                        const url = URL.createObjectURL(blob);
+                        
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = \`jvm-state-\${new Date().toISOString().replace(/[:.]/g, '-')}.json\`;
+                        document.body.appendChild(a);
+                        a.click();
+                        document.body.removeChild(a);
+                        URL.revokeObjectURL(url);
+                        
+                        log('State serialized successfully', 'success');
+                    } catch (error) {
+                        log(\`State serialization failed: \${error.message}\`, 'error');
+                        if (originalSerialize) originalSerialize();
+                    }
+                };
+            }
         }
         
-        function setBreakpoint() {
-            const pcInput = document.getElementById('pcInput');
-            const pc = parseInt(pcInput.value);
-            
-            if (isNaN(pc)) {
-                log('Please enter a valid PC value', 'error');
-                return;
-            }
-            
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.setBreakpoint(pc);
-                log(\`Breakpoint set at PC \${pc}\`, 'success');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Failed to set breakpoint: \${error.message}\`, 'error');
-            }
-        }
-        
-        function clearBreakpoints() {
-            if (!jvmDebug) {
-                log('JVM not initialized', 'error');
-                return;
-            }
-            
-            try {
-                const result = jvmDebug.clearBreakpoints();
-                log('All breakpoints cleared', 'success');
-                updateDebugDisplay();
-            } catch (error) {
-                log(\`Failed to clear breakpoints: \${error.message}\`, 'error');
-            }
-        }
         function updateDebugDisplay() {
             if (!jvmDebug) return;
-
+            
             try {
                 const state = jvmDebug.getCurrentState();
                 
-                // Update currentState to sync with the real JVM state using updateState
-                updateState({
-                    status: state.executionState,
-                    pc: state.pc,
-                    stack: state.stack || [],
-                    locals: state.locals || [],
-                    callDepth: state.callStackDepth || 0,
-                    method: state.method ? state.method.name : null,
-                    breakpoints: state.breakpoints || []
-                });
-                
-                // Mark as loaded when debugging is active if not already set
-                if (!currentState.loadedClass && state.executionState !== 'stopped') {
-                    updateState({ loadedClass: { name: 'active' } });
-                }
-                
-                // Update text-based state panels
+                // Update execution state display
                 const statusDiv = document.getElementById('executionState');
                 if (statusDiv) {
                     statusDiv.innerHTML = \`
-                        <strong>State:</strong> \${state.executionState}\\n
-                        <strong>PC:</strong> \${state.pc !== null ? state.pc : 'N/A'}\\n
-                        <strong>Method:</strong> \${state.method ? state.method.name : 'N/A'}\\n
-                        <strong>Call Depth:</strong> \${state.callStackDepth}\\n
-                        <strong>Breakpoints:</strong> [\${state.breakpoints.join(', ')}]
+                        <div><span class="key">Status:</span> <span class="value">\${state.executionState}</span></div>
+                        <div><span class="key">PC:</span> <span class="value">\${state.pc !== null ? state.pc : 'N/A'}</span></div>
+                        <div><span class="key">Method:</span> <span class="value">\${state.method ? state.method.name : 'N/A'}</span></div>
+                        <div><span class="key">Call Depth:</span> <span class="value">\${state.callStackDepth}</span></div>
+                        <div><span class="key">Breakpoints:</span> <span class="value">[\${state.breakpoints.join(', ')}]</span></div>
                     \`;
                 }
-
+                
+                // Update stack display
                 const stackDiv = document.getElementById('stackDisplay');
                 if (stackDiv) {
                     const stackDisplay = state.stack.map((value, index) => 
@@ -594,7 +294,8 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     ).join('\\n') || 'Empty';
                     stackDiv.textContent = stackDisplay;
                 }
-
+                
+                // Update locals display
                 const localsDiv = document.getElementById('localsDisplay');
                 if (localsDiv) {
                     const localsDisplay = state.locals.map((value, index) => 
@@ -604,167 +305,73 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     localsDiv.textContent = localsDisplay;
                 }
                 
-                // Update the Ace Editor with disassembly
-                if ((state.executionState === 'paused' || state.executionState === 'running')) {
+                // Update disassembly view
+                if (state.executionState === 'paused' || state.executionState === 'running') {
                     try {
                         const view = jvmDebug.getDisassemblyView();
-                        if (view && view.formattedDisassembly) {
-                            if (aceEditor) {
-                                // Use Ace Editor if available
-                                aceEditor.setValue(view.formattedDisassembly, -1);
-                                
-                                // Clear previous highlights and breakpoints
-                                aceEditor.session.clearBreakpoints();
-                                const markers = aceEditor.session.getMarkers();
-                                for (const i in markers) {
-                                    if (markers[i].clazz === "ace-editor-highlight") {
-                                        aceEditor.session.removeMarker(markers[i].id);
-                                    }
-                                }
-
-                                // Rebuild line-to-pc map
-                                lineToPcMap = {};
-                                const lines = view.formattedDisassembly.split('\\n');
-                                lines.forEach((lineText, index) => {
-                                    // Look for PC markers like "L0:", "L3:", etc.
-                                    const match = lineText.match(/L(\\d+):/);
-                                    if (match) {
-                                        lineToPcMap[index] = parseInt(match[1]);
-                                    }
-                                });
-
-                                // Highlight current line if available
-                                if (view.currentLineNumber !== undefined && view.currentLineNumber >= 0) {
-                                    const currentLine = view.currentLineNumber;
-                                    const Range = ace.require("ace/range").Range;
-                                    aceEditor.session.addMarker(new Range(currentLine, 0, currentLine, 1), "ace-editor-highlight", "fullLine");
-                                    aceEditor.scrollToLine(currentLine, true, true);
-                                }
-                                
-                                // Redraw breakpoints
-                                const breakpoints = state.breakpoints || [];
-                                for (const [line, pc] of Object.entries(lineToPcMap)) {
-                                    if (breakpoints.includes(pc)) {
-                                        aceEditor.session.setBreakpoint(parseInt(line), "ace_breakpoint");
-                                    }
-                                }
-                            } else {
-                                // Fallback to simple text display
-                                const textElement = document.getElementById('disassembly-text');
-                                if (textElement) {
-                                    // Add highlighting for current line in fallback mode
-                                    let formattedText = view.formattedDisassembly;
-                                    if (view.currentLineNumber !== undefined) {
-                                        const lines = formattedText.split('\\n');
-                                        if (lines[view.currentLineNumber]) {
-                                            lines[view.currentLineNumber] = '>>> ' + lines[view.currentLineNumber] + ' <<<';
-                                        }
-                                        formattedText = lines.join('\\n');
-                                    }
-                                    textElement.textContent = formattedText;
-                                }
+                        if (view && view.formattedDisassembly && window.aceEditor) {
+                            aceEditor.setValue(view.formattedDisassembly, -1);
+                            
+                            // Highlight current line if available
+                            if (view.currentLineNumber !== undefined && view.currentLineNumber >= 0) {
+                                aceEditor.scrollToLine(view.currentLineNumber, true, true);
                             }
                         }
                     } catch (disasmError) {
-                        console.warn('Failed to update disassembly:', disasmError);
-                        if (aceEditor) {
-                            aceEditor.setValue('Disassembly unavailable: ' + disasmError.message, -1);
-                        } else {
-                            const textElement = document.getElementById('disassembly-text');
-                            if (textElement) {
-                                textElement.textContent = 'Disassembly unavailable: ' + disasmError.message;
-                            }
-                        }
-                    }
-                } else {
-                    if (aceEditor) {
-                        aceEditor.setValue('Execution completed or not started.', -1);
-                    } else {
-                        const textElement = document.getElementById('disassembly-text');
-                        if (textElement) {
-                            textElement.textContent = 'Execution completed or not started.';
-                        }
+                        log(\`Failed to update disassembly: \${disasmError.message}\`, 'error');
                     }
                 }
+                
+                // Update button states
+                if (typeof updateButtons === 'function') {
+                    const isPaused = state.executionState === 'paused';
+                    const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                    stepButtons.forEach(id => {
+                        const btn = document.getElementById(id);
+                        if (btn) btn.disabled = !isPaused;
+                    });
+                }
+                
             } catch (error) {
                 log(\`Failed to update debug display: \${error.message}\`, 'error');
             }
-            
-            // Update button states to sync with the real JVM state
-            updateButtons();
         }
         
-        // Initialize everything when page loads
-        document.addEventListener('DOMContentLoaded', async function() {
-            log('Initializing Real JVM Debug Interface...', 'info');
-            
-            initializeEditor(); // Initialize Ace Editor first
-            const success = await initializeRealJVM();
-            if (success) {
-                addRealFileUpload();
-                // Set up file input event listener
-                document.getElementById('stateFileInput').addEventListener('change', handleStateFile, false);
-                log('Real JVM Debug Interface ready! 🚀', 'success');
-            } else {
-                log('Failed to initialize JVM Debug Interface', 'error');
+        // Add missing clearOutput function 
+        function clearOutput() {
+            const output = document.getElementById('output');
+            if (output) {
+                output.innerHTML = '';
+                if (typeof log === 'function') {
+                    log('Output console cleared.', 'info');
+                }
             }
-        });
+        }
+        
+        // Enhanced deserializeState function
+        function deserializeState() {
+            const input = document.getElementById('stateFileInput');
+            if (input) {
+                input.click();
+            }
+        }
     </script>
     `;
     
-    // Now I need to replace the HTML layout with the new IDE-style layout
-    let newHtml = htmlContent;
-
-    // Replace the old container and controls structure with new layout
-    const oldLayout = /<div class="panel controls">.*?<\/div>\s*<div class="container">.*?<\/div>/s;
-    const newLayout = `
-    <div class="panel controls">
-        <h3>File Operations</h3>
-        <div id="status" class="status">Ready - No program loaded</div>
-    </div>
-
-    <!-- Main UI Layout with IDE-style interface -->
-    <div class="main-container">
-        <!-- Left Column: Debugger -->
-        <div class="debugger-panel panel">
-            <div class="debug-controls">
-                <button onclick="continue_()" title="Continue (F8)">▶️</button>
-                <button onclick="stepOver()" title="Step Over (F10)">↷</button>
-                <button onclick="stepInto()" title="Step Into (F11)">↪️</button>
-                <button onclick="stepOut()" title="Step Out (Shift+F11)">↩️</button>
-                <button onclick="finish()" title="Finish Method">⏩</button>
-                <button onclick="serializeState()" title="Serialize State">💾</button>
-                <button onclick="deserializeState()" title="Restore State">📂</button>
-            </div>
-            <div id="disassembly-editor"></div>
-        </div>
-
-        <!-- Right Column: State & Output -->
-        <div class="state-panel-stack">
-            <div class="panel">
-                <h3>Execution State</h3>
-                <div id="executionState" class="state-display">Not started</div>
-            </div>
-            <div class="panel">
-                <h3>Stack</h3>
-                <div id="stackDisplay" class="state-display">Empty</div>
-            </div>
-            <div class="panel">
-                <h3>Locals</h3>
-                <div id="localsDisplay" class="state-display">No locals</div>
-            </div>
-            <div class="panel">
-                <h3>Output Console</h3>
-                <div id="output" class="output"></div>
-            </div>
-        </div>
-    </div>
-    `;
-
-    newHtml = newHtml.replace(oldLayout, newLayout);
+    // Add the missing stepInstruction button to the debug controls
+    const debugControlsPattern = /(<button onclick="finish\(\)" id="finishBtn"[^>]*>⏩<\/button>)/;
+    htmlContent = htmlContent.replace(debugControlsPattern, '$1\n            <button onclick="stepInstruction()" id="stepInstructionBtn" title="Step Instruction" disabled>📶</button>');
+    
+    // Add the deserializeBtn ID to the restore state button
+    const restoreButtonPattern = /(<button onclick="document\.getElementById\('stateFileInput'\)\.click\(\)"[^>]*>📂<\/button>)/;
+    htmlContent = htmlContent.replace(restoreButtonPattern, '<button onclick="deserializeState()" id="deserializeBtn" title="Restore State">📂</button>');
+    
+    // Add the Clear button to the output console
+    const outputConsolePattern = /(<h3>Output Console<\/h3>)/;
+    htmlContent = htmlContent.replace(outputConsolePattern, '$1\n                <button onclick="clearOutput()" style="float: right; font-size: 10px; padding: 2px 6px;">Clear</button>');
     
     // Insert enhancements before the closing </head> tag
-    return newHtml.replace('</head>', enhancements + '</head>');
+    return htmlContent.replace('</head>', enhancements + '</head>');
 }
 
 function createSiteReadme() {

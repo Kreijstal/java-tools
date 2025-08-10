@@ -46,7 +46,7 @@ function serveFile(res, filePath) {
 }
 
 const server = http.createServer((req, res) => {
-  let urlPath = req.url === '/' ? '/examples/debug-web-interface.html' : req.url;
+  let urlPath = req.url === '/' ? '/dist/index.html' : req.url;
   
   // Remove query parameters
   urlPath = urlPath.split('?')[0];
