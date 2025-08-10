@@ -168,38 +168,58 @@ class KrakatauWorkspace {
   _buildBasicReferenceGraph() {
     this.referenceObj = {};
     
-    // For now, just create a basic structure to enable testing
-    // We'll implement the full traverseAST functionality later
+    // First, initialize the basic structure for all known classes
     Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
       if (!this.referenceObj[className]) {
         this.referenceObj[className] = { children: {}, referees: [] };
       }
-      
-      // Add a basic reference for the class definition
-      this.referenceObj[className].referees.push(`classes.0`);
-      
-      // Add references for methods and fields
-      ast.classes[0].items.forEach((item, itemIndex) => {
-        if (item.type === 'method') {
-          const methodName = item.method.name;
-          if (!this.referenceObj[className].children[methodName]) {
-            this.referenceObj[className].children[methodName] = {
-              descriptor: item.method.descriptor,
-              referees: []
-            };
-          }
-          this.referenceObj[className].children[methodName].referees.push(`classes.0.items.${itemIndex}.method`);
-        } else if (item.type === 'field') {
-          const fieldName = item.field.name;
-          if (!this.referenceObj[className].children[fieldName]) {
-            this.referenceObj[className].children[fieldName] = {
-              descriptor: item.field.descriptor,
-              referees: []
-            };
-          }
-          this.referenceObj[className].children[fieldName].referees.push(`classes.0.items.${itemIndex}.field`);
+    });
+    
+    // Build comprehensive reference graph using traverseAST functionality
+    // Process each class in the workspace to find all cross-references
+    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+      try {
+        // Use the full getReferenceObjFromClass functionality from traverseAST.js
+        // This will analyze method calls, field accesses, and other references
+        getReferenceObjFromClass(ast, 0, this.referenceObj, false);
+      } catch (error) {
+        console.warn(`Warning: Failed to process references for class ${className}:`, error.message);
+        // Fall back to basic structure for this class
+        this._addBasicReferencesForClass(className, ast);
+      }
+    });
+  }
+
+  _addBasicReferencesForClass(className, ast) {
+    // Fallback method that adds basic references when full traversal fails
+    if (!this.referenceObj[className]) {
+      this.referenceObj[className] = { children: {}, referees: [] };
+    }
+    
+    // Add a basic reference for the class definition
+    this.referenceObj[className].referees.push(`classes.0`);
+    
+    // Add references for methods and fields
+    ast.classes[0].items.forEach((item, itemIndex) => {
+      if (item.type === 'method') {
+        const methodName = item.method.name;
+        if (!this.referenceObj[className].children[methodName]) {
+          this.referenceObj[className].children[methodName] = {
+            descriptor: item.method.descriptor,
+            referees: []
+          };
         }
-      });
+        this.referenceObj[className].children[methodName].referees.push(`classes.0.items.${itemIndex}.method`);
+      } else if (item.type === 'field') {
+        const fieldName = item.field.name;
+        if (!this.referenceObj[className].children[fieldName]) {
+          this.referenceObj[className].children[fieldName] = {
+            descriptor: item.field.descriptor,
+            referees: []
+          };
+        }
+        this.referenceObj[className].children[fieldName].referees.push(`classes.0.items.${itemIndex}.field`);
+      }
     });
   }
 
