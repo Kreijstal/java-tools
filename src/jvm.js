@@ -97,8 +97,49 @@ class JVM {
           args.unshift(frame.stack.pop());
         }
         const obj = frame.stack.pop();
-        if (obj[className] && obj[className][methodName]) {
+        
+        // Handle built-in Java methods
+        if (className === 'java/lang/String') {
+          if (methodName === 'concat') {
+            const result = obj + args[0];
+            frame.stack.push(result);
+            // console.log(`String.concat: "${obj}" + "${args[0]}" = "${result}"`);
+          } else if (methodName === 'toUpperCase') {
+            const result = obj.toUpperCase();
+            frame.stack.push(result);
+          } else if (methodName === 'toLowerCase') {
+            const result = obj.toLowerCase();
+            frame.stack.push(result);
+          } else if (methodName === 'length') {
+            const result = obj.length;
+            frame.stack.push(result);
+          } else {
+            console.error(`Unsupported String method: ${methodName}`);
+            // For unsupported methods, push a default return value to avoid stack underflow
+            const { returnType } = parseDescriptor(descriptor);
+            if (returnType === 'V') {
+              // void return type, don't push anything
+            } else if (returnType === 'Ljava/lang/String;') {
+              frame.stack.push(obj); // return the original string
+            } else {
+              frame.stack.push(null); // default return value
+            }
+          }
+        } else if (className === 'java/io/PrintStream') {
+          if (methodName === 'println') {
+            // Handle PrintStream.println method
+            if (obj && obj['java/io/PrintStream'] && obj['java/io/PrintStream']['println']) {
+              obj['java/io/PrintStream']['println'](...args);
+            } else {
+              console.log(...args);
+            }
+          } else {
+            console.error(`Unsupported PrintStream method: ${methodName}`);
+          }
+        } else if (obj && obj[className] && obj[className][methodName]) {
           obj[className][methodName](...args);
+        } else {
+          console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
         }
         break;
       }
@@ -234,11 +275,23 @@ class JVM {
       case 'aload_1':
         frame.stack.push(frame.locals[1]);
         break;
+      case 'aload_2':
+        frame.stack.push(frame.locals[2]);
+        break;
+      case 'aload_3':
+        frame.stack.push(frame.locals[3]);
+        break;
       case 'astore_0':
         frame.locals[0] = frame.stack.pop();
         break;
       case 'astore_1':
         frame.locals[1] = frame.stack.pop();
+        break;
+      case 'astore_2':
+        frame.locals[2] = frame.stack.pop();
+        break;
+      case 'astore_3':
+        frame.locals[3] = frame.stack.pop();
         break;
       case 'dup':
         const topValue = frame.stack.peek();
@@ -276,6 +329,12 @@ class JVM {
         const index = parseInt(arg, 10);
         const ref = frame.stack.pop();
         frame.locals[index] = ref;
+        break;
+      }
+      case 'aload': {
+        const index = parseInt(arg, 10);
+        const ref = frame.locals[index];
+        frame.stack.push(ref);
         break;
       }
       case 'astore_1':

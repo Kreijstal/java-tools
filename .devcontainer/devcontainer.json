@@ -1,0 +1,17 @@
+// For Codespaces/devcontainer: install Node.js, Java, Rust, and Krakatau (krak2)
+{
+  "name": "Java Tools DevContainer",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-24.04",
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    },
+    "ghcr.io/devcontainers/features/java:1": {
+      "version": "17"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "stable"
+    }
+  },
+  "postCreateCommand": "npm ci && bash scripts/install-krakatau.sh"
+}

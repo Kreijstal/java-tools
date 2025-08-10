@@ -1,3 +1,9 @@
+/**
+ * Converts a parsed Java class AST to a structured format suitable for disassembly
+ * @param {Object} inputJson - The parsed Java class structure from jvm_parser
+ * @param {Array} constantPool - The constant pool entries from the class file
+ * @returns {Object} A structured representation of the class with methods, fields, and metadata
+ */
 function convertJson(inputJson, constantPool) {
   // Map accessFlags to flags based on context (class, method, or field)
   const accessFlagMap = {
@@ -278,6 +284,39 @@ function convertJson(inputJson, constantPool) {
             };
             break;
 
+          case "astore":
+          case "aload":
+          case "istore":
+          case "iload":
+          case "lstore":
+          case "lload":
+          case "fstore":
+          case "fload":
+          case "dstore":
+          case "dload":
+            // Instructions that take a local variable index
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: instr.operands.index.toString()
+            };
+            break;
+
+          case "bipush":
+            // Push byte value onto stack
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: instr.operands.byte.toString()
+            };
+            break;
+
+          case "sipush":
+            // Push short value onto stack
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: instr.operands.value.toString()
+            };
+            break;
+
           default:
             // For simple instructions without operands
             codeItem.instruction = instr.opcodeName;
@@ -382,6 +421,11 @@ function convertJson(inputJson, constantPool) {
   return outputJson;
 }
 
+/**
+ * Converts a structured class representation into assembly-like textual format
+ * @param {Object} cls - The class object with methods, fields, flags, and other class metadata
+ * @returns {String} Assembly-like representation of the class suitable for debugging/analysis
+ */
 function unparseDataStructures(cls) {
   function formatInstruction(instr) {
     if (typeof instr === "string") {
