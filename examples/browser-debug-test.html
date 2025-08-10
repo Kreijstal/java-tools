@@ -39,12 +39,12 @@
                     log('Initial state should not be initialized', false);
                 }
                 
-                // Test 3: Try to create data package
+                // Test 3: Try to create data package  
                 const mockDataPackage = {
                     classes: [
                         {
-                            filename: 'MainApp.class',
-                            content: 'yv66vgAAADQAEQoAAwAOBwAPBwAQAQAGPGluaXQ+AQADKClWAQAEQ29kZQEAD0xpbmVOdW1iZXJUYWJsZQEABG1haW4BABYoW0xqYXZhL2xhbmcvU3RyaW5nOylWAQAKU291cmNlRmlsZQEADk1haW5BcHAuamF2YQwABAAFAQAHTWFpbkFwcAEAEGphdmEvbGFuZy9PYmplY3QAIQACAAMAAAAAAAgAAQAEAAUAAQAGAAAAHwABAAEAAAAFKrcAAbEAAAABAAAAAAgAAQAEAAUAAQAJAAAAGQABAAIAAAADsQAAAAEABwAAAAYAAQAAAAIAAQAKAAAAAgAL'
+                            filename: 'VerySimple.class',
+                            content: 'yv66vgAAAD0AGwoAAgADBwAEDAAFAAYBABBqYXZhL2xhbmcvT2JqZWN0AQAGPGluaXQ+AQADKClWCQAIAAkHAAoMAAsADAEAEGphdmEvbGFuZy9TeXN0ZW0BAANvdXQBABVMamF2YS9pby9QcmludFN0cmVhbTsKAA4ADwcAEAwAEQASAQATamF2YS9pby9QcmludFN0cmVhbQEAB3ByaW50bG4BAAQoSSlWBwAUAQAKVmVyeVNpbXBsZQEABENvZGUBAA9MaW5lTnVtYmVyVGFibGUBAARtYWluAQAWKFtMamF2YS9sYW5nL1N0cmluZzspVgEAClNvdXJjZUZpbGUBAA9WZXJ5U2ltcGxlLmphdmEAIQATAAIAAAAAAAIAAQAFAAYAAQAVAAAAHQABAAEAAAAFKrcAAbEAAAABABYAAAAGAAEAAAABAAkAFwAYAAEAFQAAADgAAgAEAAAAEAY8BT0bHGQ+sgAHHbYADbEAAAABABYAAAAWAAUAAAADAAIABAAEAAUACAAGAA8ABwABABkAAAACABo='
                         }
                     ]
                 };
@@ -70,7 +70,7 @@
                 
                 // Test 7: Try to start debugging (this should work now with async fix)
                 try {
-                    const result = await debug.start('MainApp.class');
+                    const result = await debug.start('VerySimple.class');
                     log('Successfully started debugging session');
                     log(`Debug result status: ${result.status}`);
                 } catch (error) {
