@@ -161,10 +161,46 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 try {
                     const response = await fetch('./data/metadata.json');
                     if (response.ok) {
-                        const dataPackage = await response.json();
+                        const metadata = await response.json();
+                        
+                        // Load actual class files by fetching them from the data directory
+                        const dataPackage = { classes: [] };
+                        
+                        log('Loading class files from data directory...', 'info');
+                        for (const classInfo of metadata.classes) {
+                            try {
+                                const classResponse = await fetch(\`./data/\${classInfo.filename}\`);
+                                if (classResponse.ok) {
+                                    const arrayBuffer = await classResponse.arrayBuffer();
+                                    const content = new Uint8Array(arrayBuffer);
+                                    
+                                    // Convert to base64 for compatibility with loadDataPackage
+                                    let base64String = '';
+                                    const chunkSize = 8192;
+                                    for (let i = 0; i < content.length; i += chunkSize) {
+                                        const chunk = content.slice(i, i + chunkSize);
+                                        base64String += String.fromCharCode.apply(null, chunk);
+                                    }
+                                    
+                                    dataPackage.classes.push({
+                                        name: classInfo.name,
+                                        filename: classInfo.filename,
+                                        size: classInfo.size,
+                                        description: classInfo.description,
+                                        content: btoa(base64String)
+                                    });
+                                    log(\`Loaded \${classInfo.filename} (\${classInfo.size} bytes)\`, 'info');
+                                } else {
+                                    log(\`Failed to fetch \${classInfo.filename}: \${classResponse.status}\`, 'error');
+                                }
+                            } catch (fileError) {
+                                log(\`Error loading \${classInfo.filename}: \${fileError.message}\`, 'error');
+                            }
+                        }
+                        
                         await jvmDebug.initialize({ dataPackage });
-                        log(\`Initialized with \${dataPackage.classes?.length || 0} classes\`, 'success');
-                        populateSampleClasses(dataPackage.classes || []);
+                        log(\`Initialized with \${dataPackage.classes.length} classes loaded\`, 'success');
+                        populateSampleClasses(dataPackage.classes);
                     } else {
                         await jvmDebug.initialize();
                         log('JVM Debug initialized (no data package)', 'info');
