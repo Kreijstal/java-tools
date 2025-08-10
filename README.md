@@ -2,6 +2,27 @@
 
 This project provides tools for parsing and analyzing Java `.class` files. It uses the `jvm_parser` library to create an Abstract Syntax Tree (AST) from bytecode, allowing for in-depth analysis of Java classes.
 
+## New Features 🔥
+
+### JVM Debug API and State Serialization
+The project now includes comprehensive debugging and serialization capabilities:
+
+- **🔍 Debug API**: Step-by-step execution control (step into, over, out, instruction, finish)
+- **💾 State Serialization**: Pause and resume JVM execution across different Node.js runtimes
+- **🎯 Breakpoints**: Set/clear breakpoints at any program counter location
+- **📊 State Inspection**: Real-time access to stack, locals, call depth, and program counter
+- **🌐 Web Integration**: Ready for web application debugging interfaces
+
+```bash
+# Try the debug demo
+node scripts/debugDemo.js
+
+# See the web interface demo
+open examples/debug-web-interface.html
+```
+
+For detailed documentation, see [DEBUG_API.md](DEBUG_API.md).
+
 ## How to Use
 
 To parse a Java `.class` file, you can use the `runLoadAndTraverse.js` script. This script takes a class name and an optional classpath as arguments.

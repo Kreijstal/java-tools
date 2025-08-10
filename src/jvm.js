@@ -29,6 +29,12 @@ class JVM {
         }
       }
     };
+    // Debug state
+    this.debugMode = false;
+    this.breakpoints = new Set();
+    this.stepMode = null; // null, 'into', 'over', 'out', 'instruction', 'finish'
+    this.stepTargetDepth = null;
+    this.stepTargetFrame = null;
   }
 
   run(classFilePath, options = {}) {
@@ -61,6 +67,13 @@ class JVM {
       const label = instructionItem.labelDef;
       // The pc is the bytecode offset, which we get from the label `L<pc>:`
       const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+
+      // Check debug conditions before executing instruction
+      if (this.debugMode && this.shouldPause(currentPc, frame)) {
+        // Pause execution - return control to caller
+        return { paused: true, pc: currentPc, frame: frame };
+      }
+
       frame.pc++;
 
       try {
@@ -71,6 +84,60 @@ class JVM {
         this.handleException(e, currentPc);
       }
     }
+    
+    // Execution completed
+    return { paused: false, completed: true };
+  }
+
+  shouldPause(currentPc, frame) {
+    // Check breakpoints
+    if (this.breakpoints.has(currentPc)) {
+      this.stepMode = null; // Clear step mode when hitting breakpoint
+      return true;
+    }
+
+    // Check step conditions
+    if (this.stepMode) {
+      const currentDepth = this.callStack.size();
+      
+      switch (this.stepMode) {
+        case 'instruction':
+          // Pause at every instruction
+          this.stepMode = null;
+          return true;
+          
+        case 'into':
+          // Pause at next instruction (step into calls)
+          this.stepMode = null;
+          return true;
+          
+        case 'over':
+          // Pause when we're back at the same depth or shallower
+          if (currentDepth <= this.stepTargetDepth) {
+            this.stepMode = null;
+            return true;
+          }
+          break;
+          
+        case 'out':
+          // Pause when we've returned from current method
+          if (currentDepth < this.stepTargetDepth) {
+            this.stepMode = null;
+            return true;
+          }
+          break;
+          
+        case 'finish':
+          // Pause when the target frame finishes
+          if (this.stepTargetFrame && !this.callStack.items.includes(this.stepTargetFrame)) {
+            this.stepMode = null;
+            return true;
+          }
+          break;
+      }
+    }
+
+    return false;
   }
 
   executeInstruction(instruction, frame) {
@@ -432,6 +499,176 @@ class JVM {
     this.callStack.pop();
     this.handleException(exception, -1); // PC is -1 for subsequent frames
   }
+
+  // Serialization methods
+  serialize() {
+    const frames = [];
+    const callStackItems = [...this.callStack.items];
+    
+    for (const frame of callStackItems) {
+      frames.push({
+        method: {
+          name: frame.method.name,
+          descriptor: frame.method.descriptor,
+          accessFlags: frame.method.accessFlags,
+          attributes: frame.method.attributes
+        },
+        stack: [...frame.stack.items],
+        locals: [...frame.locals],
+        pc: frame.pc,
+        // Store instructions and exception table references
+        methodRef: {
+          className: this.findClassNameForMethod(frame.method),
+          methodName: frame.method.name,
+          methodDescriptor: frame.method.descriptor
+        }
+      });
+    }
+
+    return {
+      frames: frames,
+      classes: this.classes,
+      debugMode: this.debugMode,
+      breakpoints: Array.from(this.breakpoints),
+      stepMode: this.stepMode,
+      stepTargetDepth: this.stepTargetDepth,
+      stepTargetFrame: this.stepTargetFrame
+    };
+  }
+
+  deserialize(state) {
+    // Clear current state
+    this.callStack.clear();
+    this.classes = state.classes || {};
+    this.debugMode = state.debugMode || false;
+    this.breakpoints = new Set(state.breakpoints || []);
+    this.stepMode = state.stepMode || null;
+    this.stepTargetDepth = state.stepTargetDepth || null;
+    this.stepTargetFrame = state.stepTargetFrame || null;
+
+    // Reconstruct call stack
+    for (const frameData of state.frames || []) {
+      // Find the method in loaded classes
+      const method = this.findMethodByRef(frameData.methodRef);
+      if (!method) {
+        throw new Error(`Cannot find method ${frameData.methodRef.className}.${frameData.methodRef.methodName}${frameData.methodRef.methodDescriptor}`);
+      }
+
+      const frame = new Frame(method);
+      frame.stack.items = [...frameData.stack];
+      frame.locals = [...frameData.locals];
+      frame.pc = frameData.pc;
+      
+      this.callStack.push(frame);
+    }
+  }
+
+  findClassNameForMethod(method) {
+    // Helper method to find which class contains a given method
+    for (const [className, classData] of Object.entries(this.classes)) {
+      if (classData && classData.classes && classData.classes[0]) {
+        const methods = classData.classes[0].items.filter(item => item.type === 'method');
+        if (methods.some(item => item.method === method)) {
+          return className;
+        }
+      }
+    }
+    return null;
+  }
+
+  findMethodByRef(methodRef) {
+    // Find method by class name, method name, and descriptor
+    const classData = this.classes[methodRef.className];
+    if (!classData || !classData.classes || !classData.classes[0]) {
+      return null;
+    }
+
+    const methodItem = classData.classes[0].items.find(item => {
+      return item.type === 'method' &&
+             item.method.name === methodRef.methodName &&
+             item.method.descriptor === methodRef.methodDescriptor;
+    });
+    
+    return methodItem ? methodItem.method : null;
+  }
+
+  // Debug control methods
+  enableDebugMode() {
+    this.debugMode = true;
+  }
+
+  disableDebugMode() {
+    this.debugMode = false;
+    this.stepMode = null;
+  }
+
+  addBreakpoint(pc) {
+    this.breakpoints.add(pc);
+  }
+
+  removeBreakpoint(pc) {
+    this.breakpoints.delete(pc);
+  }
+
+  clearBreakpoints() {
+    this.breakpoints.clear();
+  }
+
+  stepInto() {
+    this.stepMode = 'into';
+    this.stepTargetDepth = this.callStack.size();
+  }
+
+  stepOver() {
+    this.stepMode = 'over';
+    this.stepTargetDepth = this.callStack.size();
+  }
+
+  stepOut() {
+    this.stepMode = 'out';
+    this.stepTargetDepth = this.callStack.size();
+  }
+
+  stepInstruction() {
+    this.stepMode = 'instruction';
+  }
+
+  finish() {
+    this.stepMode = 'finish';
+    this.stepTargetFrame = this.callStack.peek();
+  }
+
+  continue() {
+    this.stepMode = null;
+    this.stepTargetDepth = null;
+    this.stepTargetFrame = null;
+  }
+
+  getCurrentState() {
+    if (this.callStack.isEmpty()) {
+      return {
+        pc: null,
+        frame: null,
+        stack: [],
+        locals: [],
+        callStackDepth: 0
+      };
+    }
+
+    const frame = this.callStack.peek();
+    return {
+      pc: frame.pc,
+      frame: frame,
+      stack: [...frame.stack.items],
+      locals: [...frame.locals],
+      callStackDepth: this.callStack.size(),
+      method: {
+        name: frame.method.name,
+        descriptor: frame.method.descriptor
+      }
+    };
+  }
 }
 
 module.exports = JVM;
+module.exports.Frame = Frame;
