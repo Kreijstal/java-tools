@@ -704,6 +704,405 @@ class JVM {
   }
 
   /**
+   * Get a detailed backtrace showing all frames with arguments and local variables
+   * @returns {Array} Array of frame information with method details and variables
+   */
+  getBacktrace() {
+    if (this.callStack.isEmpty()) {
+      return [];
+    }
+
+    const frames = [];
+    const stackItems = this.callStack.items;
+    
+    for (let i = stackItems.length - 1; i >= 0; i--) {
+      const frame = stackItems[i];
+      const frameInfo = this._getFrameInfo(frame, i);
+      frames.push(frameInfo);
+    }
+    
+    return frames;
+  }
+
+  /**
+   * Get detailed information about a specific frame
+   * @param {Frame} frame - The frame to analyze
+   * @param {number} frameIndex - Index of the frame in the call stack
+   * @returns {object} Detailed frame information
+   */
+  _getFrameInfo(frame, frameIndex) {
+    // Get current PC for this frame
+    const currentInstructionItem = frame.instructions[frame.pc < frame.instructions.length ? frame.pc : frame.pc - 1];
+    const label = currentInstructionItem ? currentInstructionItem.labelDef : null;
+    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+    
+    // Parse method descriptor to understand arguments
+    const { params, returnType } = parseDescriptor(frame.method.descriptor);
+    
+    // Get method arguments from local variables
+    const methodArgs = this._extractMethodArguments(frame, params);
+    
+    // Get local variable information
+    const localVariables = this._getLocalVariableInfo(frame);
+    
+    // Get source line mapping
+    const sourceMapping = this.getSourceLineMapping(currentPc, frame.method);
+    
+    // Find class name for this method
+    const className = this.findClassNameForMethod(frame.method);
+    
+    // Get total stack size for isCurrentFrame check
+    const totalFrames = this.callStack.size();
+    
+    return {
+      frameIndex: frameIndex,
+      className: className || 'Unknown',
+      methodName: frame.method.name,
+      methodDescriptor: frame.method.descriptor,
+      pc: currentPc,
+      sourceLine: sourceMapping.line,
+      sourceFile: sourceMapping.sourceFile,
+      arguments: methodArgs,
+      localVariables: localVariables,
+      stack: [...frame.stack.items],
+      returnType: returnType,
+      isCurrentFrame: frameIndex === totalFrames - 1
+    };
+  }
+
+  /**
+   * Extract method arguments from local variables based on method descriptor
+   * @param {Frame} frame - The frame to analyze
+   * @param {Array} params - Parameter types from method descriptor
+   * @returns {Array} Method arguments with names and values
+   */
+  _extractMethodArguments(frame, params) {
+    const args = [];
+    let localIndex = 0;
+    
+    // Check if method is static by looking at method flags
+    const isStatic = frame.method.flags && frame.method.flags.includes('static');
+    
+    // For non-static methods, local 0 is 'this'
+    if (!isStatic) {
+      args.push({
+        name: 'this',
+        type: 'reference',
+        value: frame.locals[0],
+        localIndex: 0
+      });
+      localIndex = 1;
+    }
+    
+    // Extract parameters
+    for (let i = 0; i < params.length; i++) {
+      const paramType = params[i];
+      const value = frame.locals[localIndex];
+      
+      args.push({
+        name: `arg${i}`,
+        type: paramType,
+        value: value,
+        localIndex: localIndex
+      });
+      
+      // Long and double take up 2 local variable slots
+      if (paramType === 'long' || paramType === 'double') {
+        localIndex += 2;
+      } else {
+        localIndex += 1;
+      }
+    }
+    
+    return args;
+  }
+
+  /**
+   * Get information about all local variables in a frame
+   * @param {Frame} frame - The frame to analyze
+   * @returns {Array} Local variable information
+   */
+  _getLocalVariableInfo(frame) {
+    const variables = [];
+    
+    // Try to get variable names from LocalVariableTable if available
+    const localVarTable = this._getLocalVariableTable(frame.method);
+    
+    for (let i = 0; i < frame.locals.length; i++) {
+      const value = frame.locals[i];
+      let varInfo = {
+        index: i,
+        value: value,
+        type: this._inferType(value),
+        name: `local_${i}`
+      };
+      
+      // If we have debug info, use the actual variable name
+      if (localVarTable) {
+        const varEntry = localVarTable.find(entry => entry.index === i);
+        if (varEntry) {
+          varInfo.name = varEntry.name;
+          varInfo.type = varEntry.signature || varInfo.type;
+        }
+      }
+      
+      variables.push(varInfo);
+    }
+    
+    return variables;
+  }
+
+  /**
+   * Get LocalVariableTable from method attributes
+   * @param {object} method - Method object
+   * @returns {Array|null} Local variable table entries
+   */
+  _getLocalVariableTable(method) {
+    if (!method.attributes) return null;
+    
+    const codeAttribute = method.attributes.find(attr => attr.type === 'code');
+    if (!codeAttribute || !codeAttribute.code.attributes) return null;
+    
+    const localVarTable = codeAttribute.code.attributes.find(attr => attr.type === 'localvariabletable');
+    return localVarTable ? localVarTable.variables : null;
+  }
+
+  /**
+   * Infer the type of a value
+   * @param {*} value - The value to analyze
+   * @returns {string} Inferred type
+   */
+  _inferType(value) {
+    if (value === null || value === undefined) {
+      return 'null';
+    } else if (typeof value === 'number') {
+      return Number.isInteger(value) ? 'int' : 'double';
+    } else if (typeof value === 'string') {
+      return 'String';
+    } else if (typeof value === 'boolean') {
+      return 'boolean';
+    } else if (Array.isArray(value)) {
+      return 'array';
+    } else if (typeof value === 'object') {
+      return value.type || 'object';
+    } else {
+      return typeof value;
+    }
+  }
+
+  /**
+   * Inspect the current execution stack with detailed type information
+   * @returns {Array} Stack values with type and index information
+   */
+  inspectStack() {
+    if (this.callStack.isEmpty()) {
+      return [];
+    }
+    
+    const frame = this.callStack.peek();
+    const stackItems = frame.stack.items;
+    
+    return stackItems.map((value, index) => ({
+      index: index,
+      value: value,
+      type: this._inferType(value),
+      description: this._getValueDescription(value)
+    }));
+  }
+
+  /**
+   * Inspect local variables with detailed information
+   * @returns {Array} Local variables with names, types, and values
+   */
+  inspectLocals() {
+    if (this.callStack.isEmpty()) {
+      return [];
+    }
+    
+    const frame = this.callStack.peek();
+    return this._getLocalVariableInfo(frame);
+  }
+
+  /**
+   * Inspect a specific local variable by index
+   * @param {number} index - Local variable index
+   * @returns {object|null} Variable information or null if not found
+   */
+  inspectLocalVariable(index) {
+    if (this.callStack.isEmpty()) {
+      return null;
+    }
+    
+    const frame = this.callStack.peek();
+    if (index < 0 || index >= frame.locals.length) {
+      return null;
+    }
+    
+    const value = frame.locals[index];
+    const localVarTable = this._getLocalVariableTable(frame.method);
+    let name = `local_${index}`;
+    let signature = this._inferType(value);
+    
+    if (localVarTable) {
+      const varEntry = localVarTable.find(entry => entry.index === index);
+      if (varEntry) {
+        name = varEntry.name;
+        signature = varEntry.signature || signature;
+      }
+    }
+    
+    return {
+      index: index,
+      name: name,
+      value: value,
+      type: signature,
+      description: this._getValueDescription(value)
+    };
+  }
+
+  /**
+   * Inspect a specific stack value by index
+   * @param {number} index - Stack index (0 = bottom, -1 = top)
+   * @returns {object|null} Stack value information or null if not found
+   */
+  inspectStackValue(index) {
+    if (this.callStack.isEmpty()) {
+      return null;
+    }
+    
+    const frame = this.callStack.peek();
+    const stackItems = frame.stack.items;
+    
+    // Handle negative indices (from top)
+    const actualIndex = index < 0 ? stackItems.length + index : index;
+    
+    if (actualIndex < 0 || actualIndex >= stackItems.length) {
+      return null;
+    }
+    
+    const value = stackItems[actualIndex];
+    return {
+      index: actualIndex,
+      value: value,
+      type: this._inferType(value),
+      description: this._getValueDescription(value)
+    };
+  }
+
+  /**
+   * Inspect an object's fields if the value is an object reference
+   * @param {*} objRef - Object reference to inspect
+   * @returns {object|null} Object field information or null if not an object
+   */
+  inspectObject(objRef) {
+    if (!objRef || typeof objRef !== 'object' || Array.isArray(objRef)) {
+      return null;
+    }
+    
+    const result = {
+      type: objRef.type || 'object',
+      fields: [],
+      methods: []
+    };
+    
+    // Inspect object fields
+    if (objRef.fields) {
+      for (const [fieldName, fieldValue] of Object.entries(objRef.fields)) {
+        result.fields.push({
+          name: fieldName,
+          value: fieldValue,
+          type: this._inferType(fieldValue),
+          description: this._getValueDescription(fieldValue)
+        });
+      }
+    }
+    
+    // Add any other properties as fields
+    for (const [key, value] of Object.entries(objRef)) {
+      if (key !== 'type' && key !== 'fields') {
+        result.fields.push({
+          name: key,
+          value: value,
+          type: this._inferType(value),
+          description: this._getValueDescription(value)
+        });
+      }
+    }
+    
+    return result;
+  }
+
+  /**
+   * Find a variable by name in the current frame
+   * @param {string} name - Variable name to search for
+   * @returns {object|null} Variable information or null if not found
+   */
+  findVariableByName(name) {
+    if (this.callStack.isEmpty()) {
+      return null;
+    }
+    
+    const frame = this.callStack.peek();
+    const localVarTable = this._getLocalVariableTable(frame.method);
+    
+    if (!localVarTable) {
+      return null;
+    }
+    
+    const varEntry = localVarTable.find(entry => entry.name === name);
+    if (!varEntry) {
+      return null;
+    }
+    
+    return this.inspectLocalVariable(varEntry.index);
+  }
+
+  /**
+   * Get all available variable names in the current frame
+   * @returns {Array} List of variable names
+   */
+  getAvailableVariableNames() {
+    if (this.callStack.isEmpty()) {
+      return [];
+    }
+    
+    const frame = this.callStack.peek();
+    const localVarTable = this._getLocalVariableTable(frame.method);
+    
+    if (!localVarTable) {
+      // Return generic local variable names
+      return frame.locals.map((_, index) => `local_${index}`);
+    }
+    
+    return localVarTable.map(entry => entry.name);
+  }
+
+  /**
+   * Get a human-readable description of a value
+   * @param {*} value - The value to describe
+   * @returns {string} Human-readable description
+   */
+  _getValueDescription(value) {
+    if (value === null || value === undefined) {
+      return 'null';
+    } else if (typeof value === 'number') {
+      return `${value} (${Number.isInteger(value) ? 'integer' : 'floating-point'})`;
+    } else if (typeof value === 'string') {
+      return `"${value}" (String, length: ${value.length})`;
+    } else if (typeof value === 'boolean') {
+      return `${value} (boolean)`;
+    } else if (Array.isArray(value)) {
+      return `Array[${value.length}] (${value.map(v => this._inferType(v)).join(', ')})`;
+    } else if (typeof value === 'object') {
+      const type = value.type || 'Object';
+      const fieldCount = value.fields ? Object.keys(value.fields).length : Object.keys(value).length - 1;
+      return `${type} instance (${fieldCount} fields)`;
+    } else {
+      return `${value} (${typeof value})`;
+    }
+  }
+
+  /**
    * Get source line mapping for a given PC
    * @param {number} pc - Program counter value
    * @param {object} method - Method object containing line number table

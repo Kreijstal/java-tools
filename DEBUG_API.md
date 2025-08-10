@@ -1,6 +1,6 @@
 # JVM Debug API and Serialization
 
-This document describes the new JVM debugging and state serialization features added to the java-tools project.
+This document describes the comprehensive JVM debugging and state serialization features added to the java-tools project.
 
 ## Overview
 
@@ -8,7 +8,9 @@ The enhanced JVM implementation now supports:
 
 1. **Complete JVM state serialization/deserialization** - pause and resume execution across different Node.js runtime instances
 2. **Comprehensive debug API** - step-by-step execution control with breakpoints
-3. **JavaScript debug interface** - high-level API for debug operations
+3. **Backtrace and call stack inspection** - detailed view of method calls with arguments
+4. **Value inspection** - examine stack values, local variables, and object fields
+5. **JavaScript debug interface** - high-level API for debug operations
 
 ## Features
 
@@ -48,6 +50,57 @@ The debug API provides fine-grained control over JVM execution:
 #### Breakpoint Management
 - Set breakpoints at specific program counter locations
 - Remove individual breakpoints or clear all
+
+#### Backtrace and Call Stack Inspection
+
+The debugger now provides detailed call stack information with method arguments:
+
+```javascript
+const controller = new DebugController();
+controller.start('MyClass.class');
+
+// Get detailed backtrace with arguments and local variables
+const backtrace = controller.getBacktrace();
+backtrace.forEach(frame => {
+  console.log(`${frame.className}.${frame.methodName}`);
+  console.log(`  PC: ${frame.pc}, Line: ${frame.sourceLine}`);
+  
+  frame.arguments.forEach(arg => {
+    console.log(`  Arg ${arg.name} (${arg.type}): ${arg.value}`);
+  });
+});
+```
+
+#### Value Inspection
+
+Comprehensive value inspection capabilities for debugging:
+
+```javascript
+// Inspect execution stack
+const stackValues = controller.inspectStack();
+stackValues.forEach(item => {
+  console.log(`Stack[${item.index}]: ${item.description}`);
+});
+
+// Inspect local variables
+const locals = controller.inspectLocals();
+locals.forEach(local => {
+  console.log(`${local.name}: ${local.value} (${local.type})`);
+});
+
+// Inspect specific values
+const localVar = controller.inspectLocalVariable(1);
+const stackTop = controller.inspectStackValue(-1);
+
+// Get available variable names
+const variableNames = controller.getAvailableVariableNames();
+
+// Find variable by name (if debug info available)
+const variable = controller.findVariableByName('myVar');
+
+// Inspect object fields
+const objectInfo = controller.inspectObject(objReference);
+```
 - Automatic pause when breakpoints are hit
 
 #### State Inspection
@@ -84,6 +137,24 @@ console.log(`Status: ${continueResult.status}`); // "paused" or "completed"
 const state = controller.getCurrentState();
 console.log(`Stack: [${state.stack.join(', ')}]`);
 console.log(`Locals: [${state.locals.join(', ')}]`);
+
+// Enhanced debugging features
+const backtrace = controller.getBacktrace();
+console.log('Call Stack:');
+backtrace.forEach((frame, index) => {
+  console.log(`  Frame ${index}: ${frame.className}.${frame.methodName}`);
+  console.log(`    PC: ${frame.pc}, Line: ${frame.sourceLine}`);
+  frame.arguments.forEach(arg => {
+    console.log(`    ${arg.name}: ${arg.value} (${arg.type})`);
+  });
+});
+
+// Inspect stack and local variables
+const stackInspection = controller.inspectStack();
+const localsInspection = controller.inspectLocals();
+
+console.log('Stack Values:', stackInspection.map(s => s.description));
+console.log('Local Variables:', localsInspection.map(l => `${l.name}: ${l.value}`));
 ```
 
 ### State Serialization
@@ -147,6 +218,81 @@ app.post('/debug/serialize', (req, res) => {
 });
 ```
 
+### Enhanced Value Inspection
+
+```javascript
+// Detailed variable inspection example
+const controller = new DebugController();
+controller.start('sources/Calculator.class');
+
+// Execute a few steps to have data on stack and in locals
+controller.stepInto();
+controller.stepInto();
+
+// Get complete backtrace with method arguments
+const backtrace = controller.getBacktrace();
+console.log('=== CALL STACK BACKTRACE ===');
+backtrace.forEach((frame, index) => {
+  console.log(`Frame ${index}: ${frame.className}.${frame.methodName}${frame.methodDescriptor}`);
+  console.log(`  PC: ${frame.pc}, Source Line: ${frame.sourceLine || 'unknown'}`);
+  console.log(`  Return Type: ${frame.returnType}`);
+  
+  console.log('  Arguments:');
+  frame.arguments.forEach(arg => {
+    console.log(`    ${arg.name} (${arg.type}): ${arg.value !== undefined ? arg.value : 'undefined'}`);
+  });
+  
+  console.log('  Local Variables:');
+  frame.localVariables.forEach(local => {
+    console.log(`    [${local.index}] ${local.name} (${local.type}): ${local.value !== undefined ? local.value : 'undefined'}`);
+  });
+  
+  if (frame.stack.length > 0) {
+    console.log(`  Stack: [${frame.stack.join(', ')}]`);
+  }
+  console.log('');
+});
+
+// Inspect specific values
+console.log('=== VALUE INSPECTION ===');
+
+// Stack inspection
+const stackValues = controller.inspectStack();
+console.log('Stack Values:');
+stackValues.forEach(item => {
+  console.log(`  [${item.index}] ${item.description}`);
+});
+
+// Local variable inspection
+const locals = controller.inspectLocals();
+console.log('Local Variables:');
+locals.forEach(local => {
+  console.log(`  ${local.name} [${local.index}]: ${local.value !== undefined ? local.value : 'undefined'} (${local.type})`);
+});
+
+// Specific variable inspection
+const localVar1 = controller.inspectLocalVariable(1);
+if (localVar1) {
+  console.log(`Local variable 1: ${localVar1.description}`);
+}
+
+// Stack value inspection (negative index for top of stack)
+const topStackValue = controller.inspectStackValue(-1);
+if (topStackValue) {
+  console.log(`Top stack value: ${topStackValue.description}`);
+}
+
+// Available variable names
+const variableNames = controller.getAvailableVariableNames();
+console.log(`Available variables: ${variableNames.join(', ')}`);
+
+// Find variable by name (if debug info is available)
+const variable = controller.findVariableByName('myVar');
+if (variable) {
+  console.log(`Found variable 'myVar': ${variable.description}`);
+}
+```
+
 ## API Reference
 
 ### JVM Class Methods
@@ -175,6 +321,15 @@ app.post('/debug/serialize', (req, res) => {
 
 #### State Inspection
 - `getCurrentState()` → `Object` - Get current execution state
+- `getBacktrace()` → `Array` - Get detailed call stack with arguments
+- `inspectStack()` → `Array` - Inspect execution stack values
+- `inspectLocals()` → `Array` - Inspect local variables with type info
+- `inspectLocalVariable(index)` → `Object|null` - Inspect specific local variable
+- `inspectStackValue(index)` → `Object|null` - Inspect specific stack value
+- `inspectObject(objRef)` → `Object|null` - Inspect object fields
+- `findVariableByName(name)` → `Object|null` - Find variable by name
+- `getAvailableVariableNames()` → `Array` - Get all variable names
+- `getSourceLineMapping(pc, method)` → `Object` - Get source line for PC
 
 ### DebugController Class Methods
 
@@ -200,6 +355,18 @@ app.post('/debug/serialize', (req, res) => {
 - `serialize()` → `Object` - Serialize complete state
 - `deserialize(state)` → `{status, state}` - Restore from serialized state
 - `getCurrentState()` → `Object` - Get current execution state
+- `getDisassemblyView()` → `Object` - Get formatted disassembly with current position
+- `getCurrentSourceMapping()` → `Object` - Get source line mapping for current PC
+
+#### Enhanced Debugging
+- `getBacktrace()` → `Array` - Get detailed call stack with arguments and locals
+- `inspectStack()` → `Array` - Inspect execution stack values with type information
+- `inspectLocals()` → `Array` - Inspect local variables with names and types
+- `inspectLocalVariable(index)` → `Object|null` - Inspect specific local variable by index
+- `inspectStackValue(index)` → `Object|null` - Inspect specific stack value by index (supports negative indices)
+- `inspectObject(objRef)` → `Object|null` - Inspect object fields and properties
+- `findVariableByName(name)` → `Object|null` - Find variable by name (requires debug info)
+- `getAvailableVariableNames()` → `Array` - Get list of all available variable names
 
 #### Status Queries
 - `isPaused()` → `boolean` - Check if execution is paused

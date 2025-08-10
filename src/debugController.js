@@ -281,6 +281,74 @@ class DebugController {
     }
     return { line: null, sourceFile: null, instruction: null, pc: null };
   }
+
+  /**
+   * Get detailed backtrace showing all call stack frames with arguments
+   * @returns {Array} Array of frame information with method details and variables
+   */
+  getBacktrace() {
+    return this.jvm.getBacktrace();
+  }
+
+  /**
+   * Inspect the current execution stack
+   * @returns {Array} Stack values with type and index information
+   */
+  inspectStack() {
+    return this.jvm.inspectStack();
+  }
+
+  /**
+   * Inspect local variables in the current frame
+   * @returns {Array} Local variables with names, types, and values
+   */
+  inspectLocals() {
+    return this.jvm.inspectLocals();
+  }
+
+  /**
+   * Inspect a specific local variable by index
+   * @param {number} index - Local variable index
+   * @returns {object|null} Variable information or null if not found
+   */
+  inspectLocalVariable(index) {
+    return this.jvm.inspectLocalVariable(index);
+  }
+
+  /**
+   * Inspect a specific stack value by index
+   * @param {number} index - Stack index (0 = bottom, -1 = top)
+   * @returns {object|null} Stack value information or null if not found
+   */
+  inspectStackValue(index) {
+    return this.jvm.inspectStackValue(index);
+  }
+
+  /**
+   * Inspect an object's fields
+   * @param {*} objRef - Object reference to inspect
+   * @returns {object|null} Object field information or null if not an object
+   */
+  inspectObject(objRef) {
+    return this.jvm.inspectObject(objRef);
+  }
+
+  /**
+   * Find a variable by name in the current frame
+   * @param {string} name - Variable name to search for
+   * @returns {object|null} Variable information or null if not found
+   */
+  findVariableByName(name) {
+    return this.jvm.findVariableByName(name);
+  }
+
+  /**
+   * Get all available variable names in the current frame
+   * @returns {Array} List of variable names
+   */
+  getAvailableVariableNames() {
+    return this.jvm.getAvailableVariableNames();
+  }
 }
 
 module.exports = DebugController;

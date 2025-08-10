@@ -100,6 +100,71 @@ async function demonstrateDebugAPI() {
     const disassembly = newController.getDisassemblyView();
     console.log(disassembly.formattedDisassembly);
 
+    // 9. Show enhanced debugging features - backtrace and value inspection
+    console.log('\n9. Enhanced Debugging Features');
+    console.log('================================================================================');
+    
+    if (newController.isPaused()) {
+      // Show backtrace
+      console.log('\n--- Call Stack Backtrace ---');
+      const backtrace = newController.getBacktrace();
+      backtrace.forEach((frame, index) => {
+        console.log(`Frame ${index}: ${frame.className}.${frame.methodName}${frame.methodDescriptor}`);
+        console.log(`  PC: ${frame.pc}, Source Line: ${frame.sourceLine || 'unknown'}`);
+        console.log(`  Arguments:`);
+        frame.arguments.forEach(arg => {
+          console.log(`    ${arg.name} (${arg.type}): ${arg.value !== undefined ? arg.value : 'undefined'}`);
+        });
+        if (frame.stack.length > 0) {
+          console.log(`  Stack: [${frame.stack.join(', ')}]`);
+        }
+        console.log('');
+      });
+
+      // Show stack inspection
+      console.log('--- Stack Inspection ---');
+      const stackInspection = newController.inspectStack();
+      if (stackInspection.length > 0) {
+        stackInspection.forEach(item => {
+          console.log(`  [${item.index}] ${item.description}`);
+        });
+      } else {
+        console.log('  Stack is empty');
+      }
+      console.log('');
+
+      // Show local variables inspection
+      console.log('--- Local Variables Inspection ---');
+      const localsInspection = newController.inspectLocals();
+      localsInspection.forEach(local => {
+        console.log(`  ${local.name} (index ${local.index}, ${local.type}): ${local.value !== undefined ? local.value : 'undefined'}`);
+      });
+      console.log('');
+
+      // Show available variable names
+      console.log('--- Available Variable Names ---');
+      const variableNames = newController.getAvailableVariableNames();
+      console.log(`  Variables: ${variableNames.join(', ')}`);
+      console.log('');
+
+      // Test specific variable inspection
+      console.log('--- Specific Variable Inspection ---');
+      const localVar1 = newController.inspectLocalVariable(1);
+      if (localVar1) {
+        console.log(`  Local variable 1: ${localVar1.description}`);
+      }
+      
+      // Test stack value inspection
+      const topStackValue = newController.inspectStackValue(-1);
+      if (topStackValue) {
+        console.log(`  Top stack value: ${topStackValue.description}`);
+      } else {
+        console.log('  No values on stack');
+      }
+    } else {
+      console.log('Cannot inspect values - execution is not paused');
+    }
+
   } catch (error) {
     console.error(`❌ Error during demonstration: ${error.message}`);
     console.error(error.stack);
@@ -128,6 +193,16 @@ function printUsage() {
   console.log('  controller.serialize()                    # Serialize state');
   console.log('  controller.deserialize(state)             # Restore state');
   console.log('  controller.getCurrentState()              # Get execution state');
+  console.log('');
+  console.log('Enhanced debugging features:');
+  console.log('  controller.getBacktrace()                 # Get call stack with arguments');
+  console.log('  controller.inspectStack()                 # Inspect execution stack');
+  console.log('  controller.inspectLocals()                # Inspect local variables');
+  console.log('  controller.inspectLocalVariable(index)    # Inspect specific local variable');
+  console.log('  controller.inspectStackValue(index)       # Inspect specific stack value');
+  console.log('  controller.inspectObject(objRef)          # Inspect object fields');
+  console.log('  controller.findVariableByName(name)       # Find variable by name');
+  console.log('  controller.getAvailableVariableNames()    # Get all variable names');
 }
 
 // Main execution
