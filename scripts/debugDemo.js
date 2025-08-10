@@ -34,7 +34,9 @@ async function demonstrateDebugAPI() {
     let stepCount = 0;
     while (stepCount < 3 && controller.isPaused()) {
       const state = controller.getCurrentState();
+      const sourceMapping = controller.getCurrentSourceMapping();
       console.log(`   Step ${stepCount + 1}: PC=${state.pc}, Stack=[${state.stack.join(', ')}]`);
+      console.log(`      Source: line ${sourceMapping.line}, instruction: ${sourceMapping.instruction}`);
       
       const stepResult = controller.stepInto();
       stepCount++;
@@ -92,6 +94,19 @@ async function demonstrateDebugAPI() {
         console.log(`     Result: ${stepOutResult.status}`);
       }
     }
+
+    // 8. Show disassembly view
+    console.log('\n8. Disassembly view with current execution position:');
+    const disassembly = newController.getDisassemblyView();
+    console.log(`   Method: ${disassembly.method.name}${disassembly.method.descriptor}`);
+    console.log(`   Current PC: ${disassembly.currentPc}`);
+    console.log(`   Source mapping: line ${disassembly.sourceMapping.line} in ${disassembly.sourceMapping.sourceFile}`);
+    console.log('   Instructions:');
+    disassembly.instructions.forEach(instr => {
+      const marker = instr.isCurrent ? ' >' : '  ';
+      const lineInfo = instr.sourceMapping.line ? ` (line ${instr.sourceMapping.line})` : '';
+      console.log(`${marker} PC=${instr.pc}: ${instr.instruction}${lineInfo}`);
+    });
 
   } catch (error) {
     console.error(`❌ Error during demonstration: ${error.message}`);

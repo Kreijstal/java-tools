@@ -261,6 +261,27 @@ class DebugController {
   isCompleted() {
     return this.executionState === 'stopped';
   }
+
+  /**
+   * Get disassembly view with current execution position
+   * @returns {object} Disassembly view showing instructions and current position
+   */
+  getDisassemblyView() {
+    return this.jvm.getDisassemblyView();
+  }
+
+  /**
+   * Get source line mapping for current PC
+   * @returns {object} Source line information for current execution position
+   */
+  getCurrentSourceMapping() {
+    const state = this.getCurrentState();
+    if (state.pc !== null && this.jvm.callStack && !this.jvm.callStack.isEmpty()) {
+      const frame = this.jvm.callStack.peek();
+      return this.jvm.getSourceLineMapping(state.pc, frame.method);
+    }
+    return { line: null, sourceFile: null, instruction: null, pc: null };
+  }
 }
 
 module.exports = DebugController;

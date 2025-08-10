@@ -68,8 +68,12 @@ class JVM {
       // The pc is the bytecode offset, which we get from the label `L<pc>:`
       const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
 
-      // Check debug conditions before executing instruction
-      if (this.debugMode && this.shouldPause(currentPc, frame)) {
+      // For stepping modes, execute one instruction first, then check if we should pause
+      const shouldExecuteFirst = this.debugMode && this.stepMode && 
+        (this.stepMode === 'into' || this.stepMode === 'instruction');
+
+      // Check debug conditions before executing instruction (except for step modes that need to execute first)
+      if (this.debugMode && !shouldExecuteFirst && this.shouldPause(currentPc, frame)) {
         // Pause execution - return control to caller
         return { paused: true, pc: currentPc, frame: frame };
       }
@@ -82,6 +86,21 @@ class JVM {
         }
       } catch (e) {
         this.handleException(e, currentPc);
+      }
+
+      // After executing instruction, check if we should pause for step modes
+      if (this.debugMode && shouldExecuteFirst && this.shouldPauseAfterStep(currentPc, frame)) {
+        // Get the new current PC after execution
+        const nextFrame = this.callStack.peek();
+        if (nextFrame && nextFrame.pc < nextFrame.instructions.length) {
+          const nextInstructionItem = nextFrame.instructions[nextFrame.pc];
+          const nextLabel = nextInstructionItem.labelDef;
+          const nextPc = nextLabel ? parseInt(nextLabel.substring(1, nextLabel.length - 1)) : -1;
+          return { paused: true, pc: nextPc, frame: nextFrame };
+        } else {
+          // If we're at the end of the method, just return the current state
+          return { paused: true, pc: currentPc, frame: frame };
+        }
       }
     }
     
@@ -96,21 +115,11 @@ class JVM {
       return true;
     }
 
-    // Check step conditions
-    if (this.stepMode) {
+    // Check step conditions (except for 'into' and 'instruction' which are handled after execution)
+    if (this.stepMode && this.stepMode !== 'into' && this.stepMode !== 'instruction') {
       const currentDepth = this.callStack.size();
       
       switch (this.stepMode) {
-        case 'instruction':
-          // Pause at every instruction
-          this.stepMode = null;
-          return true;
-          
-        case 'into':
-          // Pause at next instruction (step into calls)
-          this.stepMode = null;
-          return true;
-          
         case 'over':
           // Pause when we're back at the same depth or shallower
           if (currentDepth <= this.stepTargetDepth) {
@@ -134,6 +143,25 @@ class JVM {
             return true;
           }
           break;
+      }
+    }
+
+    return false;
+  }
+
+  shouldPauseAfterStep(currentPc, frame) {
+    // This method handles step modes that need to execute first then pause
+    if (this.stepMode) {
+      switch (this.stepMode) {
+        case 'instruction':
+          // Pause after executing one instruction
+          this.stepMode = null;
+          return true;
+          
+        case 'into':
+          // Pause after executing one instruction (step into calls)
+          this.stepMode = null;
+          return true;
       }
     }
 
@@ -656,8 +684,13 @@ class JVM {
     }
 
     const frame = this.callStack.peek();
+    // Get the current PC from the current instruction's label
+    const currentInstructionItem = frame.instructions[frame.pc < frame.instructions.length ? frame.pc : frame.pc - 1];
+    const label = currentInstructionItem ? currentInstructionItem.labelDef : null;
+    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+
     return {
-      pc: frame.pc,
+      pc: currentPc,
       frame: frame,
       stack: [...frame.stack.items],
       locals: [...frame.locals],
@@ -668,7 +701,154 @@ class JVM {
       }
     };
   }
+
+  /**
+   * Get source line mapping for a given PC
+   * @param {number} pc - Program counter value
+   * @param {object} method - Method object containing line number table
+   * @returns {object} Source line information
+   */
+  getSourceLineMapping(pc, method) {
+    if (!method || !method.attributes) {
+      return { line: null, sourceFile: null, instruction: null };
+    }
+
+    const codeAttribute = method.attributes.find(attr => attr.type === 'code');
+    if (!codeAttribute || !codeAttribute.code.attributes) {
+      return { line: null, sourceFile: null, instruction: null };
+    }
+
+    const lineNumberTable = codeAttribute.code.attributes.find(attr => attr.type === 'linenumbertable');
+    if (!lineNumberTable || !lineNumberTable.lines) {
+      return { line: null, sourceFile: null, instruction: null };
+    }
+
+    // Find the appropriate line number for this PC
+    let lineNumber = null;
+    for (const lineEntry of lineNumberTable.lines) {
+      const linePc = parseInt(lineEntry.label.substring(1)); // Remove 'L' prefix
+      if (linePc <= pc) {
+        lineNumber = parseInt(lineEntry.lineNumber);
+      } else {
+        break;
+      }
+    }
+
+    // Get the instruction at this PC
+    const instructionItem = codeAttribute.code.codeItems.find(item => {
+      const label = item.labelDef;
+      if (label) {
+        const itemPc = parseInt(label.substring(1, label.length - 1));
+        return itemPc === pc;
+      }
+      return false;
+    });
+
+    const instruction = instructionItem ? instructionItem.instruction : null;
+    const instructionText = this.formatInstruction(instruction);
+
+    return {
+      line: lineNumber,
+      sourceFile: this.getSourceFileName(method),
+      instruction: instructionText,
+      pc: pc
+    };
+  }
+
+  /**
+   * Get source file name from method's class
+   * @param {object} method - Method object
+   * @returns {string} Source file name
+   */
+  getSourceFileName(method) {
+    // Try to get from the loaded class data
+    for (const className in this.classes) {
+      const classData = this.classes[className];
+      if (classData.classes && classData.classes[0] && classData.classes[0].items) {
+        const sourceFileAttr = classData.classes[0].items.find(item => 
+          item.type === 'attribute' && item.attribute.type === 'sourcefile'
+        );
+        if (sourceFileAttr) {
+          return sourceFileAttr.attribute.value.replace(/"/g, '');
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Format instruction for display
+   * @param {object|string} instruction - Instruction object or string
+   * @returns {string} Formatted instruction text
+   */
+  formatInstruction(instruction) {
+    if (typeof instruction === 'string') {
+      return instruction;
+    } else if (instruction && instruction.op) {
+      let result = instruction.op;
+      if (instruction.arg) {
+        if (Array.isArray(instruction.arg)) {
+          result += ' ' + instruction.arg.join(' ');
+        } else {
+          result += ' ' + instruction.arg;
+        }
+      }
+      return result;
+    }
+    return 'null';
+  }
+
+  /**
+   * Get disassembly view with current execution position highlighted
+   * @returns {object} Disassembly information
+   */
+  getDisassemblyView() {
+    if (this.callStack.isEmpty()) {
+      return { instructions: [], currentPc: null, sourceMapping: null };
+    }
+
+    const frame = this.callStack.peek();
+    const method = frame.method;
+    const currentInstructionItem = frame.instructions[frame.pc < frame.instructions.length ? frame.pc : frame.pc - 1];
+    const currentLabel = currentInstructionItem ? currentInstructionItem.labelDef : null;
+    const currentPc = currentLabel ? parseInt(currentLabel.substring(1, currentLabel.length - 1)) : -1;
+
+    const codeAttribute = method.attributes.find(attr => attr.type === 'code');
+    if (!codeAttribute) {
+      return { instructions: [], currentPc: currentPc, sourceMapping: null };
+    }
+
+    const instructions = codeAttribute.code.codeItems.map((item, index) => {
+      const label = item.labelDef;
+      const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+      const instruction = this.formatInstruction(item.instruction);
+      const isCurrentInstruction = pc === currentPc;
+      const sourceMapping = this.getSourceLineMapping(pc, method);
+      
+      return {
+        pc: pc,
+        instruction: instruction,
+        isCurrent: isCurrentInstruction,
+        sourceMapping: sourceMapping,
+        index: index
+      };
+    });
+
+    const currentSourceMapping = this.getSourceLineMapping(currentPc, method);
+
+    return {
+      instructions: instructions,
+      currentPc: currentPc,
+      sourceMapping: currentSourceMapping,
+      method: {
+        name: method.name,
+        descriptor: method.descriptor
+      }
+    };
+  }
 }
+
+module.exports = { JVM, Frame };
 
 module.exports = JVM;
 module.exports.Frame = Frame;
