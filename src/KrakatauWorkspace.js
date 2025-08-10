@@ -395,6 +395,185 @@ class KrakatauWorkspace {
   }
 
   /**
+   * Finds all direct dependencies (callees) for a given method.
+   * @param {SymbolIdentifier} methodIdentifier - An identifier for the method to analyze.
+   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for every method and field called by the target method.
+   */
+  findCallees(methodIdentifier) {
+    const callees = [];
+    const ast = this.workspaceASTs[methodIdentifier.className];
+    if (!ast) {
+      return callees;
+    }
+
+    // Find the method in the AST
+    const methodItem = ast.classes[0].items.find(item => 
+      item.type === 'method' && 
+      item.method.name === methodIdentifier.memberName &&
+      (methodIdentifier.descriptor ? item.method.descriptor === methodIdentifier.descriptor : true)
+    );
+
+    if (!methodItem) {
+      return callees;
+    }
+
+    // Look for code attribute
+    const codeAttribute = methodItem.method.attributes.find(attr => attr.type === 'code');
+    if (!codeAttribute) {
+      return callees;
+    }
+
+    // Traverse code items to find method and field references
+    codeAttribute.code.codeItems.forEach(codeItem => {
+      if (codeItem.instruction && codeItem.instruction.arg) {
+        const instruction = codeItem.instruction;
+        
+        // Check for method invocations
+        if (instruction.op && instruction.op.includes('invoke')) {
+          if (Array.isArray(instruction.arg) && instruction.arg.length >= 3) {
+            const targetClass = instruction.arg[1];
+            const [methodName, descriptor] = instruction.arg[2];
+            
+            const callee = new SymbolDefinition(
+              new SymbolIdentifier(targetClass, methodName, descriptor),
+              new SymbolLocation(targetClass, 'method_call'), // This would need to be more specific
+              'method',
+              [], // We don't have flags information from the call site
+              descriptor
+            );
+            callees.push(callee);
+          }
+        }
+        
+        // Check for field access
+        if (instruction.op && (instruction.op.includes('getfield') || instruction.op.includes('putfield') || 
+                              instruction.op.includes('getstatic') || instruction.op.includes('putstatic'))) {
+          if (Array.isArray(instruction.arg) && instruction.arg.length >= 3) {
+            const targetClass = instruction.arg[1];
+            const [fieldName, descriptor] = instruction.arg[2];
+            
+            const callee = new SymbolDefinition(
+              new SymbolIdentifier(targetClass, fieldName, descriptor),
+              new SymbolLocation(targetClass, 'field_access'),
+              'field',
+              [],
+              descriptor
+            );
+            callees.push(callee);
+          }
+        }
+      }
+    });
+
+    return callees;
+  }
+
+  /**
+   * Finds the inheritance hierarchy for a given class (supertypes).
+   * @param {string} className - The fully qualified name of the class.
+   * @returns {SymbolDefinition[]} An ordered array of SymbolDefinitions from the immediate superclass to java/lang/Object.
+   */
+  getSupertypeHierarchy(className) {
+    const hierarchy = [];
+    let currentClass = className;
+
+    while (currentClass) {
+      const ast = this.workspaceASTs[currentClass];
+      if (!ast) {
+        break;
+      }
+
+      const superClass = ast.classes[0].superClass;
+      if (!superClass || superClass === 'java/lang/Object') {
+        // Add java/lang/Object if it's not the starting class
+        if (currentClass !== className && superClass === 'java/lang/Object') {
+          hierarchy.push(new SymbolDefinition(
+            new SymbolIdentifier('java/lang/Object'),
+            new SymbolLocation('java/lang/Object', 'classes.0'),
+            'class',
+            ['public']
+          ));
+        }
+        break;
+      }
+
+      // Check if we have the superclass in our workspace
+      const superAst = this.workspaceASTs[superClass];
+      if (superAst) {
+        hierarchy.push(new SymbolDefinition(
+          new SymbolIdentifier(superClass),
+          new SymbolLocation(superClass, 'classes.0'),
+          'class',
+          superAst.classes[0].flags
+        ));
+      }
+
+      currentClass = superClass;
+    }
+
+    return hierarchy;
+  }
+
+  /**
+   * Finds all known subtypes for a given class or interface within the workspace.
+   * @param {string} className - The fully qualified name of the class or interface.
+   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for all classes that extend or implement the given type.
+   */
+  getSubtypeHierarchy(className) {
+    const subtypes = [];
+
+    Object.entries(this.workspaceASTs).forEach(([subClassName, ast]) => {
+      if (subClassName === className) {
+        return; // Skip self
+      }
+
+      const cls = ast.classes[0];
+      
+      // Check if this class extends the target class
+      if (cls.superClass === className) {
+        subtypes.push(new SymbolDefinition(
+          new SymbolIdentifier(subClassName),
+          new SymbolLocation(subClassName, 'classes.0'),
+          'class',
+          cls.flags
+        ));
+      }
+
+      // Check if this class implements the target interface
+      if (cls.interfaces && cls.interfaces.includes(className)) {
+        subtypes.push(new SymbolDefinition(
+          new SymbolIdentifier(subClassName),
+          new SymbolLocation(subClassName, 'classes.0'),
+          'class',
+          cls.flags
+        ));
+      }
+    });
+
+    return subtypes;
+  }
+
+  /**
+   * Builds a complete call graph for the entire workspace.
+   * @returns {Map<SymbolIdentifier, SymbolIdentifier[]>} A map where keys are method SymbolIdentifiers and values are arrays of callee SymbolIdentifiers.
+   */
+  getCallGraph() {
+    const callGraph = new Map();
+
+    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+      ast.classes[0].items.forEach(item => {
+        if (item.type === 'method') {
+          const methodId = new SymbolIdentifier(className, item.method.name, item.method.descriptor);
+          const callees = this.findCallees(methodId);
+          callGraph.set(methodId, callees.map(callee => callee.identifier));
+        }
+      });
+    });
+
+    return callGraph;
+  }
+
+  /**
    * Performs a fuzzy search for symbols across the entire workspace.
    * @param {string} query - The search string.
    * @returns {SymbolDefinition[]} An array of matching SymbolDefinitions.
@@ -438,6 +617,373 @@ class KrakatauWorkspace {
     });
 
     return results;
+  }
+
+  /**
+   * Calculates all necessary changes to rename a symbol across the entire workspace.
+   * @param {SymbolIdentifier} symbolIdentifier - The symbol to be renamed.
+   * @param {string} newName - The desired new name for the symbol.
+   * @returns {WorkspaceEdit} A WorkspaceEdit object detailing all the changes required.
+   */
+  prepareRename(symbolIdentifier, newName) {
+    const edit = new WorkspaceEdit();
+
+    // Find all references to the symbol
+    const references = this.findReferences(symbolIdentifier);
+
+    // Add operation to rename the definition
+    if (symbolIdentifier.memberName) {
+      // Renaming a method or field
+      const defLocation = this._findSymbolDefinitionLocation(symbolIdentifier);
+      if (defLocation) {
+        edit.addOperation(new RefactorOperation(
+          symbolIdentifier.className,
+          defLocation.astPath + '.name',
+          'rename',
+          newName
+        ));
+      }
+    } else {
+      // Renaming a class (not implemented in basic version)
+      throw new Error('Class renaming not yet implemented');
+    }
+
+    // Add operations for all references
+    references.forEach(ref => {
+      // This would need to analyze the specific AST path to determine what to update
+      // For now, we'll create a generic operation
+      edit.addOperation(new RefactorOperation(
+        ref.className,
+        ref.astPath,
+        'rename',
+        newName
+      ));
+    });
+
+    return edit;
+  }
+
+  /**
+   * Applies a set of refactoring operations to the in-memory ASTs of the workspace.
+   * @param {WorkspaceEdit} edit - The WorkspaceEdit plan to apply.
+   */
+  applyEdit(edit) {
+    edit.operations.forEach(operation => {
+      const ast = this.workspaceASTs[operation.className];
+      if (!ast) {
+        console.warn(`Class ${operation.className} not found for edit operation`);
+        return;
+      }
+
+      // Navigate to the AST node and apply the change
+      this._applyOperationToAST(ast, operation);
+    });
+
+    // Rebuild the reference graph after applying changes
+    this._buildBasicReferenceGraph();
+  }
+
+  /**
+   * Finds all symbols that are defined but never used within the workspace.
+   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for unused private methods and fields.
+   */
+  findUnusedSymbols() {
+    const unusedSymbols = [];
+
+    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+      ast.classes[0].items.forEach((item, itemIndex) => {
+        if (item.type === 'method' && item.method.flags.includes('private')) {
+          const methodId = new SymbolIdentifier(className, item.method.name, item.method.descriptor);
+          const references = this.findReferences(methodId);
+          
+          // If only one reference (the definition itself), it's unused
+          if (references.length <= 1) {
+            unusedSymbols.push(new SymbolDefinition(
+              methodId,
+              new SymbolLocation(className, `classes.0.items.${itemIndex}.method`),
+              'method',
+              item.method.flags,
+              item.method.descriptor
+            ));
+          }
+        } else if (item.type === 'field' && item.field.flags.includes('private')) {
+          const fieldId = new SymbolIdentifier(className, item.field.name, item.field.descriptor);
+          const references = this.findReferences(fieldId);
+          
+          // If only one reference (the definition itself), it's unused
+          if (references.length <= 1) {
+            unusedSymbols.push(new SymbolDefinition(
+              fieldId,
+              new SymbolLocation(className, `classes.0.items.${itemIndex}.field`),
+              'field',
+              item.field.flags,
+              item.field.descriptor
+            ));
+          }
+        }
+      });
+    });
+
+    return unusedSymbols;
+  }
+
+  /**
+   * Validates the entire workspace and reports potential issues.
+   * @returns {Diagnostic[]} An array of diagnostic objects, each detailing a problem.
+   */
+  validateWorkspace() {
+    const diagnostics = [];
+
+    // Check for missing class dependencies
+    Object.entries(this.referenceObj).forEach(([className, classRef]) => {
+      if (!this.workspaceASTs[className] && !className.startsWith('java/')) {
+        diagnostics.push(new Diagnostic(
+          new SymbolLocation(className, 'undefined'),
+          `Referenced class ${className} is not found in workspace`,
+          'warning'
+        ));
+      }
+    });
+
+    return diagnostics;
+  }
+
+  /**
+   * Reloads and re-analyzes a specific class file from disk.
+   * @param {string} filePath - The path to the .class file that has changed.
+   */
+  async reloadFile(filePath) {
+    const ast = loadClassByPath(filePath, { silent: true });
+    if (ast) {
+      const className = ast.classes[0].className;
+      this.workspaceASTs[className] = ast;
+      this.classFilePaths[className] = filePath;
+      
+      // Rebuild the reference graph
+      this._buildBasicReferenceGraph();
+    }
+  }
+
+  // Helper methods
+
+  /**
+   * Finds the AST location of a symbol definition
+   * @private
+   */
+  _findSymbolDefinitionLocation(symbolIdentifier) {
+    const ast = this.workspaceASTs[symbolIdentifier.className];
+    if (!ast) {
+      return null;
+    }
+
+    const itemIndex = ast.classes[0].items.findIndex(item => {
+      if (item.type === 'method') {
+        return item.method.name === symbolIdentifier.memberName &&
+               (symbolIdentifier.descriptor ? item.method.descriptor === symbolIdentifier.descriptor : true);
+      } else if (item.type === 'field') {
+        return item.field.name === symbolIdentifier.memberName &&
+               (symbolIdentifier.descriptor ? item.field.descriptor === symbolIdentifier.descriptor : true);
+      }
+      return false;
+    });
+
+    if (itemIndex >= 0) {
+      const item = ast.classes[0].items[itemIndex];
+      return new SymbolLocation(
+        symbolIdentifier.className,
+        `classes.0.items.${itemIndex}.${item.type}`
+      );
+    }
+
+    return null;
+  }
+
+  /**
+   * Calculates the changes needed to move a static method from one class to another.
+   * @param {SymbolIdentifier} methodIdentifier - The static method to move.
+   * @param {string} targetClassName - The destination class.
+   * @returns {WorkspaceEdit} A WorkspaceEdit detailing the removal from source, addition to target, and updates to all call sites.
+   */
+  prepareMoveStaticMethod(methodIdentifier, targetClassName) {
+    const edit = new WorkspaceEdit();
+    
+    // Check if method is static
+    const sourceAst = this.workspaceASTs[methodIdentifier.className];
+    if (!sourceAst) {
+      throw new Error(`Source class ${methodIdentifier.className} not found`);
+    }
+    
+    const methodItem = sourceAst.classes[0].items.find(item =>
+      item.type === 'method' && 
+      item.method.name === methodIdentifier.memberName &&
+      (methodIdentifier.descriptor ? item.method.descriptor === methodIdentifier.descriptor : true)
+    );
+    
+    if (!methodItem) {
+      throw new Error(`Method ${methodIdentifier.memberName} not found in ${methodIdentifier.className}`);
+    }
+    
+    if (!methodItem.method.flags.includes('static')) {
+      throw new Error(`Method ${methodIdentifier.memberName} is not static and cannot be moved`);
+    }
+    
+    // Check if target class exists
+    if (!this.workspaceASTs[targetClassName]) {
+      throw new Error(`Target class ${targetClassName} not found`);
+    }
+    
+    // For now, just return a placeholder edit - full implementation would involve:
+    // 1. Remove method from source class
+    // 2. Add method to target class  
+    // 3. Update all call sites to reference new location
+    edit.addOperation(new RefactorOperation(
+      methodIdentifier.className,
+      'method_removal',
+      'move',
+      targetClassName
+    ));
+    
+    return edit;
+  }
+
+  /**
+   * Calculates the changes to make a method static, if possible.
+   * @param {SymbolIdentifier} methodIdentifier - The instance method to make static.
+   * @returns {WorkspaceEdit} A WorkspaceEdit with the necessary changes.
+   */
+  prepareMakeMethodStatic(methodIdentifier) {
+    const edit = new WorkspaceEdit();
+    
+    const ast = this.workspaceASTs[methodIdentifier.className];
+    if (!ast) {
+      throw new Error(`Class ${methodIdentifier.className} not found`);
+    }
+    
+    const methodItem = ast.classes[0].items.find(item =>
+      item.type === 'method' && 
+      item.method.name === methodIdentifier.memberName &&
+      (methodIdentifier.descriptor ? item.method.descriptor === methodIdentifier.descriptor : true)
+    );
+    
+    if (!methodItem) {
+      throw new Error(`Method ${methodIdentifier.memberName} not found`);
+    }
+    
+    if (methodItem.method.flags.includes('static')) {
+      throw new Error(`Method ${methodIdentifier.memberName} is already static`);
+    }
+    
+    // Check if method uses 'this' (simplified check)
+    const codeAttribute = methodItem.method.attributes.find(attr => attr.type === 'code');
+    if (codeAttribute) {
+      const usesThis = codeAttribute.code.codeItems.some(codeItem => {
+        if (codeItem.instruction) {
+          const instr = codeItem.instruction;
+          // Look for aload_0 (loading 'this') or getfield/putfield instructions
+          return instr === 'aload_0' || 
+                 (instr.op && (instr.op === 'getfield' || instr.op === 'putfield'));
+        }
+        return false;
+      });
+      
+      if (usesThis) {
+        throw new Error(`Method ${methodIdentifier.memberName} uses 'this' and cannot be made static`);
+      }
+    }
+    
+    // Add static flag to method
+    edit.addOperation(new RefactorOperation(
+      methodIdentifier.className,
+      `method.${methodIdentifier.memberName}.flags`,
+      'add_flag',
+      'static'
+    ));
+    
+    return edit;
+  }
+
+  /**
+   * Retrieves the definition of a symbol at a specific AST location.
+   * This is the reverse of findReferences. Useful for "Go to Definition".
+   * @param {SymbolLocation} location - The AST location of a symbol reference.
+   * @returns {SymbolDefinition|null} The SymbolDefinition of the symbol being referenced, or null if unresolved.
+   */
+  getDefinitionAt(location) {
+    // This is a complex operation that would analyze the AST at the given path
+    // to determine what symbol is being referenced
+    
+    const ast = this.workspaceASTs[location.className];
+    if (!ast) {
+      return null;
+    }
+    
+    // For now, return null - full implementation would traverse the AST path
+    // and determine the referenced symbol based on the instruction type and operands
+    return null;
+  }
+
+  // Helper methods
+
+  /**
+   * Finds the AST location of a symbol definition
+   * @private
+   */
+  _findSymbolDefinitionLocation(symbolIdentifier) {
+    const ast = this.workspaceASTs[symbolIdentifier.className];
+    if (!ast) {
+      return null;
+    }
+
+    const itemIndex = ast.classes[0].items.findIndex(item => {
+      if (item.type === 'method') {
+        return item.method.name === symbolIdentifier.memberName &&
+               (symbolIdentifier.descriptor ? item.method.descriptor === symbolIdentifier.descriptor : true);
+      } else if (item.type === 'field') {
+        return item.field.name === symbolIdentifier.memberName &&
+               (symbolIdentifier.descriptor ? item.field.descriptor === symbolIdentifier.descriptor : true);
+      }
+      return false;
+    });
+
+    if (itemIndex >= 0) {
+      const item = ast.classes[0].items[itemIndex];
+      return new SymbolLocation(
+        symbolIdentifier.className,
+        `classes.0.items.${itemIndex}.${item.type}`
+      );
+    }
+
+    return null;
+  }
+
+  /**
+   * Applies a single refactor operation to an AST
+   * @private
+   */
+  _applyOperationToAST(ast, operation) {
+    // This is a simplified implementation
+    // In a real implementation, you'd need to parse the AST path and navigate to the correct node
+    const pathParts = operation.astPath.split('.');
+    let current = ast;
+
+    // Navigate to the parent of the target node
+    for (let i = 0; i < pathParts.length - 1; i++) {
+      const part = pathParts[i];
+      if (current && typeof current === 'object') {
+        current = current[part];
+      } else {
+        console.warn(`Could not navigate AST path: ${operation.astPath}`);
+        return;
+      }
+    }
+
+    // Apply the change to the final property
+    const finalProperty = pathParts[pathParts.length - 1];
+    if (current && typeof current === 'object' && finalProperty in current) {
+      if (operation.operationType === 'rename') {
+        current[finalProperty] = operation.newValue;
+      }
+    }
   }
 }
 
