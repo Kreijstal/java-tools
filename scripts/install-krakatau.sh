@@ -9,9 +9,14 @@ echo "Installing Krakatau (krak2)..."
 
 # Check if Rust and Cargo are available
 if ! command -v cargo &> /dev/null; then
-    echo "Error: Rust and Cargo are required but not installed."
-    echo "Please install Rust from https://rustup.rs/ and try again."
-    echo "Run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    echo "Rust toolchain not found. Installing via rustup (non-interactive)..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+fi
+
+if ! command -v cargo &> /dev/null; then
+    echo "Error: Failed to install Rust toolchain. Aborting Krakatau build." >&2
     exit 1
 fi
 
