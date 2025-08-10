@@ -179,9 +179,8 @@ class KrakatauWorkspace {
     // Process each class in the workspace to find all cross-references
     Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
       try {
-        // Use the full getReferenceObjFromClass functionality from traverseAST.js
-        // This will analyze method calls, field accesses, and other references
-        getReferenceObjFromClass(ast, 0, this.referenceObj, false);
+        // Use the modified getReferenceObjFromClass functionality that includes context
+        this._buildReferencesForClass(className, ast);
       } catch (error) {
         console.warn(`Warning: Failed to process references for class ${className}:`, error.message);
         // Fall back to basic structure for this class
@@ -197,7 +196,7 @@ class KrakatauWorkspace {
     }
     
     // Add a basic reference for the class definition
-    this.referenceObj[className].referees.push(`classes.0`);
+    this.referenceObj[className].referees.push({ className, astPath: `classes.0` });
     
     // Add references for methods and fields
     ast.classes[0].items.forEach((item, itemIndex) => {
@@ -209,7 +208,10 @@ class KrakatauWorkspace {
             referees: []
           };
         }
-        this.referenceObj[className].children[methodName].referees.push(`classes.0.items.${itemIndex}.method`);
+        this.referenceObj[className].children[methodName].referees.push({ 
+          className, 
+          astPath: `classes.0.items.${itemIndex}.method` 
+        });
       } else if (item.type === 'field') {
         const fieldName = item.field.name;
         if (!this.referenceObj[className].children[fieldName]) {
@@ -218,7 +220,80 @@ class KrakatauWorkspace {
             referees: []
           };
         }
-        this.referenceObj[className].children[fieldName].referees.push(`classes.0.items.${itemIndex}.field`);
+        this.referenceObj[className].children[fieldName].referees.push({ 
+          className, 
+          astPath: `classes.0.items.${itemIndex}.field` 
+        });
+      }
+    });
+  }
+
+  /**
+   * Builds references for a single class with proper context tracking
+   * @private
+   */
+  _buildReferencesForClass(className, ast) {
+    const cls = ast.classes[0];
+    const classIndex = 0; // Always 0 since each AST contains one class
+    
+    // Initialize reference object for this class
+    if (!this.referenceObj[cls.className]) {
+      this.referenceObj[cls.className] = { children: {}, referees: [] };
+    }
+    this.referenceObj[cls.className].referees.push({ 
+      className: cls.className, 
+      astPath: `classes.${classIndex}` 
+    });
+
+    cls.items.forEach((item, itemIndex) => {
+      if (item.type === 'method') {
+        const methodName = item.method.name;
+        const methodDescriptor = item.method.descriptor;
+
+        if (!this.referenceObj[cls.className].children[methodName]) {
+          this.referenceObj[cls.className].children[methodName] = {
+            descriptor: methodDescriptor,
+            referees: []
+          };
+        }
+        this.referenceObj[cls.className].children[methodName].referees.push({ 
+          className: cls.className, 
+          astPath: `classes.${classIndex}.items.${itemIndex}.method` 
+        });
+
+        item.method.attributes.forEach((attr, attrIndex) => {
+          if (attr.type === "code") {
+            attr.code.codeItems.forEach((codeItem, codeItemIndex) => {
+              if (codeItem.instruction && codeItem.instruction.arg) {
+                const arg = codeItem.instruction.arg;
+                if (Array.isArray(arg) && arg.length > 2 && Array.isArray(arg[2]) && arg[2].length >= 2) {
+                  const [fieldNameOrMethodName, descriptor] = arg[2];
+                  const parentClass = arg[1];
+
+                  if (!this.referenceObj[parentClass]) {
+                    this.referenceObj[parentClass] = { children: {}, referees: [] };
+                  }
+                  if (!this.referenceObj[parentClass].children[fieldNameOrMethodName]) {
+                    this.referenceObj[parentClass].children[fieldNameOrMethodName] = {
+                      descriptor: descriptor,
+                      referees: []
+                    };
+                  }
+                  
+                  // Double-check the structure exists before adding reference
+                  const targetRef = this.referenceObj[parentClass].children[fieldNameOrMethodName];
+                  if (targetRef && Array.isArray(targetRef.referees)) {
+                    // Store the reference with the className context (where the reference occurs)
+                    targetRef.referees.push({ 
+                      className: cls.className, // This is the class making the reference
+                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}` 
+                    });
+                  }
+                }
+              }
+            });
+          }
+        });
       }
     });
   }
@@ -373,14 +448,24 @@ class KrakatauWorkspace {
       // Looking for method or field references
       const memberRef = classRef.children[symbolIdentifier.memberName];
       if (memberRef) {
-        memberRef.referees.forEach(refereePath => {
-          references.push(new SymbolLocation(symbolIdentifier.className, refereePath));
+        memberRef.referees.forEach(referee => {
+          // Handle both old format (string) and new format (object with className)
+          if (typeof referee === 'string') {
+            references.push(new SymbolLocation(symbolIdentifier.className, referee));
+          } else {
+            references.push(new SymbolLocation(referee.className, referee.astPath));
+          }
         });
       }
     } else {
       // Looking for class references
-      classRef.referees.forEach(refereePath => {
-        references.push(new SymbolLocation(symbolIdentifier.className, refereePath));
+      classRef.referees.forEach(referee => {
+        // Handle both old format (string) and new format (object with className)
+        if (typeof referee === 'string') {
+          references.push(new SymbolLocation(symbolIdentifier.className, referee));
+        } else {
+          references.push(new SymbolLocation(referee.className, referee.astPath));
+        }
       });
     }
 
