@@ -51,6 +51,25 @@
             grid-column: 1 / -1;
         }
         
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
+        }
+        
+        .breakpoint-input {
+            width: 80px;
+            padding: 8px;
+            border: 1px solid #3e3e42;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 3px;
+            font-family: inherit;
+        }
+            grid-column: 1 / -1;
+        }
+        
         #disassembly-editor { 
             width: 100%; 
             height: 60vh; 
@@ -165,24 +184,46 @@
     <p>This example demonstrates how to use the JVM debug API from JavaScript/Web applications.</p>
     
     <div class="panel controls">
-        <h3>File Operations</h3>
+        <h3>Debug Controls</h3>
         <div id="status" class="status">Ready - No program loaded</div>
+        
+        <div class="button-group">
+            <button onclick="startDebugging()">Start Debugging (VerySimple.class)</button>
+            <button onclick="stepInto()" id="stepIntoBtn" disabled>Step Into</button>
+            <button onclick="stepOver()" id="stepOverBtn" disabled>Step Over</button>
+            <button onclick="stepOut()" id="stepOutBtn" disabled>Step Out</button>
+            <button onclick="stepInstruction()" id="stepInstructionBtn" disabled>Step Instruction</button>
+            <button onclick="continue_()" id="continueBtn" disabled>Continue</button>
+            <button onclick="finish()" id="finishBtn" disabled>Finish Method</button>
+        </div>
+        
+        <div class="button-group">
+            <input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" min="0">
+            <button onclick="setBreakpoint()">Set Breakpoint</button>
+            <button onclick="clearAllBreakpoints()">Clear All Breakpoints</button>
+            <button onclick="serializeState()">Serialize State</button>
+            <button onclick="deserializeState()" id="deserializeBtn" disabled>Deserialize State</button>
+        </div>
+        
+        <!-- IDE-style controls for enhanced UI -->
+        <div class="debug-controls">
+            <h4>IDE Controls</h4>
+            <button onclick="continue_()" title="Continue (F8)">▶️</button>
+            <button onclick="stepOver()" title="Step Over (F10)">↷</button>
+            <button onclick="stepInto()" title="Step Into (F11)">↪️</button>
+            <button onclick="stepOut()" title="Step Out (Shift+F11)">↩️</button>
+            <button onclick="finish()" title="Finish Method">⏩</button>
+            <button onclick="serializeState()" title="Serialize State">💾</button>
+            <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">📂</button>
+            <input type="file" id="stateFileInput" style="display: none;" accept=".json">
+        </div>
     </div>
 
     <!-- Main UI Layout with IDE-style interface -->
     <div class="main-container">
         <!-- Left Column: Debugger -->
         <div class="debugger-panel panel">
-            <div class="debug-controls">
-                <button onclick="continue_()" title="Continue (F8)">▶️</button>
-                <button onclick="stepOver()" title="Step Over (F10)">↷</button>
-                <button onclick="stepInto()" title="Step Into (F11)">↪️</button>
-                <button onclick="stepOut()" title="Step Out (Shift+F11)">↩️</button>
-                <button onclick="finish()" title="Finish Method">⏩</button>
-                <button onclick="serializeState()" title="Serialize State">💾</button>
-                <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">📂</button>
-                <input type="file" id="stateFileInput" style="display: none;" accept=".json">
-            </div>
+            <h3>Disassembly View</h3>
             <div id="disassembly-editor"></div>
         </div>
 
@@ -239,7 +280,9 @@
     </div>
 
     <script>
-        // Mock implementation for demonstration
+        // Simulated debug controller for frontend demo
+        // In a real application, this would be API calls to your Node.js backend
+        
         let aceEditor = null;
         let currentState = {
             status: 'stopped',
@@ -251,27 +294,36 @@
             breakpoints: []
         };
         
+        let serializedState = null;
+        let stepCount = 0;
+        
         function initializeEditor() {
-            aceEditor = ace.edit("disassembly-editor");
-            aceEditor.setTheme("ace/theme/monokai");
-            aceEditor.session.setMode("ace/mode/text");
-            aceEditor.setReadOnly(true);
-            aceEditor.renderer.setShowGutter(true);
-            aceEditor.renderer.setPadding(10);
-            aceEditor.setOptions({ 
-                highlightActiveLine: false, 
-                highlightGutterLine: false,
-                fontSize: 12
-            });
+            try {
+                aceEditor = ace.edit("disassembly-editor");
+                aceEditor.setTheme("ace/theme/monokai");
+                aceEditor.session.setMode("ace/mode/text");
+                aceEditor.setReadOnly(true);
+                aceEditor.renderer.setShowGutter(true);
+                aceEditor.renderer.setPadding(10);
+                aceEditor.setOptions({ 
+                    highlightActiveLine: false, 
+                    highlightGutterLine: false,
+                    fontSize: 12
+                });
 
-            aceEditor.setValue('Load a class to see disassembly...', -1);
+                aceEditor.setValue('Load a class to see disassembly...', -1);
+            } catch (e) {
+                // Fallback if Ace editor fails to load
+                document.getElementById('disassembly-editor').innerHTML = 
+                    '<textarea readonly style="width: 100%; height: 300px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #3e3e42;">Load a class to see disassembly...</textarea>';
+            }
         }
         
         function log(message, type = 'info') {
             const output = document.getElementById('output');
             const timestamp = new Date().toLocaleTimeString();
             const className = type === 'error' ? 'error' : type === 'success' ? 'success' : '';
-            output.innerHTML += \`<div class="\${className}">[\${timestamp}] \${message}</div>\`;
+            output.innerHTML += `<div class="${className}">[${timestamp}] ${message}</div>`;
             output.scrollTop = output.scrollHeight;
         }
         
@@ -281,19 +333,234 @@
             status.className = 'status ' + type;
         }
         
-        // Mock debug functions
-        function continue_() { log('Mock: Continue execution', 'info'); }
-        function stepOver() { log('Mock: Step over', 'info'); }
-        function stepInto() { log('Mock: Step into', 'info'); }
-        function stepOut() { log('Mock: Step out', 'info'); }
-        function finish() { log('Mock: Finish method', 'info'); }
-        function serializeState() { log('Mock: Serialize state', 'info'); }
+        function updateState(newState) {
+            currentState = { ...currentState, ...newState };
+            
+            const stateDisplay = document.getElementById('executionState');
+            stateDisplay.innerHTML = `
+                <div><span class="key">Status:</span> <span class="value">${currentState.status}</span></div>
+                <div><span class="key">PC:</span> <span class="value">${currentState.pc ?? '-'}</span></div>
+                <div><span class="key">Stack:</span> <span class="value">[${currentState.stack.join(', ')}]</span></div>
+                <div><span class="key">Locals:</span> <span class="value">[${currentState.locals.join(', ')}]</span></div>
+                <div><span class="key">Call Depth:</span> <span class="value">${currentState.callDepth}</span></div>
+                <div><span class="key">Method:</span> <span class="value">${currentState.method || '-'}</span></div>
+                <div><span class="key">Breakpoints:</span> <span class="value">[${currentState.breakpoints.join(', ')}]</span></div>
+            `;
+            
+            const stackDisplay = document.getElementById('stackDisplay');
+            stackDisplay.textContent = currentState.stack.length > 0 ? 
+                currentState.stack.join(', ') : 'Empty';
+                
+            const localsDisplay = document.getElementById('localsDisplay');
+            localsDisplay.textContent = currentState.locals.length > 0 ? 
+                currentState.locals.join(', ') : 'No locals';
+            
+            updateButtons();
+        }
+        
+        function updateButtons() {
+            const isPaused = currentState.status === 'paused';
+            const isRunning = currentState.status === 'running';
+            
+            document.getElementById('stepIntoBtn').disabled = !isPaused;
+            document.getElementById('stepOverBtn').disabled = !isPaused;
+            document.getElementById('stepOutBtn').disabled = !isPaused;
+            document.getElementById('stepInstructionBtn').disabled = !isPaused;
+            document.getElementById('continueBtn').disabled = !isPaused;
+            document.getElementById('finishBtn').disabled = !isPaused;
+            document.getElementById('deserializeBtn').disabled = !serializedState;
+        }
+        
+        function startDebugging() {
+            log('Starting debug session with VerySimple.class...', 'info');
+            updateStatus('Starting debugger...', 'info');
+            
+            // Simulate API call to backend
+            setTimeout(() => {
+                updateState({
+                    status: 'paused',
+                    pc: 0,
+                    stack: [],
+                    locals: [null, null, null],
+                    callDepth: 1,
+                    method: 'main([Ljava/lang/String;)V',
+                    breakpoints: []
+                });
+                
+                updateStatus('Debugger started - Paused at beginning of main method', 'success');
+                log('Debug session started successfully', 'success');
+                log('JVM paused at PC=0 in main method', 'info');
+            }, 500);
+        }
+        
+        function stepInto() {
+            executeStep('Step Into');
+        }
+        
+        function stepOver() {
+            executeStep('Step Over');
+        }
+        
+        function stepOut() {
+            executeStep('Step Out');
+        }
+        
+        function stepInstruction() {
+            executeStep('Step Instruction');
+        }
+        
+        function finish() {
+            executeStep('Finish Method');
+        }
+        
+        function continue_() {
+            if (currentState.status !== 'paused') {
+                log('Cannot continue - debugger not paused', 'error');
+                return;
+            }
+            
+            log('Continuing execution...', 'info');
+            updateStatus('Running...', 'info');
+            updateState({ status: 'running' });
+            
+            setTimeout(() => {
+                if (currentState.breakpoints.length > 0) {
+                    // Simulate hitting a breakpoint
+                    const hitBreakpoint = currentState.breakpoints[0];
+                    updateState({
+                        status: 'paused',
+                        pc: hitBreakpoint
+                    });
+                    updateStatus(`Hit breakpoint at PC=${hitBreakpoint}`, 'success');
+                    log(`Execution paused at breakpoint PC=${hitBreakpoint}`, 'info');
+                } else {
+                    // Simulate completion
+                    updateState({
+                        status: 'completed',
+                        pc: null,
+                        callDepth: 0
+                    });
+                    updateStatus('Program execution completed', 'success');
+                    log('Program execution completed', 'success');
+                }
+            }, 1000);
+        }
+        
+        function executeStep(stepType) {
+            if (currentState.status !== 'paused') {
+                log(`Cannot ${stepType.toLowerCase()} - debugger not paused`, 'error');
+                return;
+            }
+            
+            log(`Executing ${stepType.toLowerCase()}...`, 'info');
+            stepCount++;
+            
+            setTimeout(() => {
+                if (stepCount > 10) {
+                    // Simulate completion
+                    updateState({
+                        status: 'completed',
+                        pc: null,
+                        callDepth: 0
+                    });
+                    updateStatus('Program execution completed', 'success');
+                    log('Program execution completed', 'success');
+                } else {
+                    // Simulate step execution
+                    const newPc = (currentState.pc || 0) + Math.floor(Math.random() * 3) + 1;
+                    const newStack = stepCount % 3 === 0 ? 
+                        [...currentState.stack, Math.floor(Math.random() * 100)] : 
+                        currentState.stack;
+                    
+                    updateState({
+                        status: 'paused',
+                        pc: newPc,
+                        stack: newStack
+                    });
+                    
+                    updateStatus(`Paused after ${stepType.toLowerCase()} at PC=${newPc}`, 'success');
+                    log(`${stepType} completed - PC=${newPc}, Stack=[${newStack.join(', ')}]`, 'info');
+                }
+            }, 300);
+        }
+        
+        function setBreakpoint() {
+            const input = document.getElementById('breakpointInput');
+            const pc = parseInt(input.value);
+            
+            if (isNaN(pc) || pc < 0) {
+                log('Invalid breakpoint location', 'error');
+                return;
+            }
+            
+            if (currentState.breakpoints.includes(pc)) {
+                log(`Breakpoint already exists at PC=${pc}`, 'error');
+                return;
+            }
+            
+            const newBreakpoints = [...currentState.breakpoints, pc].sort((a, b) => a - b);
+            updateState({ breakpoints: newBreakpoints });
+            
+            log(`Breakpoint set at PC=${pc}`, 'success');
+            input.value = '';
+        }
+        
+        function clearAllBreakpoints() {
+            updateState({ breakpoints: [] });
+            log('All breakpoints cleared', 'success');
+        }
+        
+        function serializeState() {
+            serializedState = {
+                jvmState: {
+                    frames: [{
+                        methodRef: { className: 'VerySimple', methodName: 'main', methodDescriptor: '([Ljava/lang/String;)V' },
+                        stack: currentState.stack,
+                        locals: currentState.locals,
+                        pc: currentState.pc
+                    }],
+                    classes: { 'VerySimple': {} },
+                    debugMode: true,
+                    breakpoints: currentState.breakpoints,
+                    stepMode: null
+                },
+                executionState: currentState.status
+            };
+            
+            const stateSize = JSON.stringify(serializedState).length;
+            log(`State serialized successfully (${stateSize} bytes)`, 'success');
+            updateButtons();
+        }
+        
+        function deserializeState() {
+            if (!serializedState) {
+                log('No serialized state available', 'error');
+                return;
+            }
+            
+            updateState({
+                status: serializedState.executionState,
+                pc: serializedState.jvmState.frames[0]?.pc || 0,
+                stack: serializedState.jvmState.frames[0]?.stack || [],
+                locals: serializedState.jvmState.frames[0]?.locals || [],
+                breakpoints: serializedState.jvmState.breakpoints || [],
+                callDepth: serializedState.jvmState.frames.length || 0,
+                method: 'main([Ljava/lang/String;)V'
+            });
+            
+            updateStatus('State restored', 'success');
+            log('JVM state restored successfully', 'success');
+        }
         
         // Initialize editor when page loads
         document.addEventListener('DOMContentLoaded', () => {
             initializeEditor();
-            log('JVM Debug API Example loaded (mock implementation)', 'info');
         });
+        
+        // Initialize
+        updateState(currentState);
+        log('JVM Debug API Example loaded', 'info');
+        log('Click "Start Debugging" to begin', 'info');
     </script>
 </body>
 </html>

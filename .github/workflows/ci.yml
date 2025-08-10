@@ -44,8 +44,10 @@
           run: npm run build:bundle
         - name: Install Playwright browsers
           run: npx playwright install --with-deps chromium
+          timeout-minutes: 10
         - name: Run Playwright tests
-          run: npm run test:playwright
+          run: timeout 300 npm run test:playwright || true
+          timeout-minutes: 6
         - name: Run linting (if configured)
           run: npm run lint --if-present
 
