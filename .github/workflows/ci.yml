@@ -104,6 +104,8 @@
           run: npm ci
         - name: Compile Java sources
           run: npm run build:java
+        - name: Smoke test Krakatau wrapper
+          run: bash scripts/krakatau-disasm 2>&1 | head -n 5 || true
         - name: Compare our disassembly with Krakatau
           run: |
             node scripts/compare_with_javap.js
