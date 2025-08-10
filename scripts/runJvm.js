@@ -1,4 +1,4 @@
-const JVM = require('../src/jvm');
+const { JVM } = require('../src/jvm');
 
 function main() {
   const args = process.argv.slice(2);

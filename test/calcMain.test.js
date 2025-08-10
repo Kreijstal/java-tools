@@ -1,5 +1,5 @@
 const test = require('tape');
-const JVM = require('../src/jvm');
+const { JVM } = require('../src/jvm');
 const path = require('path');
 
 test('JVM should execute CalcMain.class and print "4"', function(t) {

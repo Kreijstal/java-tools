@@ -1,5 +1,5 @@
 const test = require('tape');
-const JVM = require('../src/jvm');
+const { JVM } = require('../src/jvm');
 const path = require('path');
 
 test('JVM should execute Hello.class and print "Hello, World!"', function(t) {
