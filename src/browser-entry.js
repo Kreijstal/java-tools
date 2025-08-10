@@ -86,7 +86,7 @@ class BrowserJVMDebug {
 
     try {
       // Use the real debug controller to start debugging
-      const result = this.debugController.start(classPath, options);
+      const result = await this.debugController.start(classPath, options);
       return result;
     } catch (error) {
       console.error('Failed to start debugging:', error);

@@ -1,5 +1,5 @@
 const Stack = require('./stack');
-const { loadClassByPathSync } = require('./classLoader');
+const { loadClassByPath, loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures } = require('./convert_tree');
 
@@ -39,7 +39,7 @@ class JVM {
   }
 
   run(classFilePath, options = {}) {
-    const classData = this.loadClass(classFilePath, options);
+    const classData = this.loadClassSync(classFilePath, options);
     if (!classData) {
       return;
     }
@@ -352,7 +352,7 @@ class JVM {
         let classData = this.classes[className];
         if (!classData) {
           const newClassPath = `sources/${className}.class`;
-          classData = this.loadClass(newClassPath, { silent: true });
+          classData = this.loadClassSync(newClassPath, { silent: true });
         }
         const method = this.findMethod(classData, methodName, descriptor);
         if (method) {
@@ -460,11 +460,60 @@ class JVM {
   }
 
   loadClass(classFilePath, options = {}) {
-    const classData = loadClassByPathSync(classFilePath, options);
-    if (classData) {
-      this.classes[classData.classes[0].className] = classData;
+    // For backwards compatibility, try sync first
+    try {
+      const classData = loadClassByPathSync(classFilePath, options);
+      if (classData) {
+        this.classes[classData.classes[0].className] = classData;
+      }
+      return classData;
+    } catch (error) {
+      if (error.message.includes('Synchronous file operations not supported')) {
+        // This is a browser environment - return a rejected promise or throw error
+        // telling the caller to use loadClassAsync instead
+        throw new Error('Use loadClassAsync() for browser environments');
+      }
+      // Re-throw other errors
+      throw error;
     }
-    return classData;
+  }
+
+  async loadClassAsync(classFilePath, options = {}) {
+    // Try async first, fall back to sync for backwards compatibility
+    try {
+      const classData = await loadClassByPath(classFilePath, options);
+      if (classData) {
+        this.classes[classData.classes[0].className] = classData;
+      }
+      return classData;
+    } catch (error) {
+      // If async fails and we have a sync provider, try sync method
+      try {
+        const classData = loadClassByPathSync(classFilePath, options);
+        if (classData) {
+          this.classes[classData.classes[0].className] = classData;
+        }
+        return classData;
+      } catch (syncError) {
+        // If both fail, throw the original async error
+        throw error;
+      }
+    }
+  }
+
+  loadClassSync(classFilePath, options = {}) {
+    try {
+      const classData = loadClassByPathSync(classFilePath, options);
+      if (classData) {
+        this.classes[classData.classes[0].className] = classData;
+      }
+      return classData;
+    } catch (error) {
+      // If sync fails, for browser environments, just return null 
+      // and let the caller handle the missing class
+      console.warn(`Could not load class ${classFilePath} synchronously:`, error.message);
+      return null;
+    }
   }
 
   findMainMethod(classData) {
