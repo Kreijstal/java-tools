@@ -29,7 +29,7 @@ if [ -d "$KRAKATAU_DIR/Krakatau" ]; then
     echo "Krakatau already exists in $KRAKATAU_DIR/Krakatau"
     echo "Updating to latest version..."
     cd "$KRAKATAU_DIR/Krakatau"
-    git pull origin krak2
+    git pull origin v2
 else
     echo "Cloning Krakatau repository..."
     cd "$KRAKATAU_DIR"
