@@ -1,0 +1,120 @@
+name: Deploy JVM Showcase to Pages
+
+on:
+  push:
+    branches: ["master", "main"]
+  workflow_dispatch:
+
+# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
+permissions:
+  contents: write # Changed to write to allow creating releases
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Generate data
+        run: npm run generate
+
+      - name: Build site
+        run: npm run build
+
+      - name: Handle Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if release exists and delete it
+          if gh release view latest-data &>/dev/null; then
+            gh release delete latest-data --yes
+          fi
+          
+          # Create zip with sample data if it doesn't exist
+          if [ ! -f data.zip ]; then
+            echo "Creating sample data archive..."
+            mkdir -p sample-data
+            cp -r sources/*.class sample-data/ 2>/dev/null || true
+            cp -r sources/*.java sample-data/ 2>/dev/null || true
+            cp README.md sample-data/ 2>/dev/null || true
+            cd sample-data && zip -r ../data.zip . && cd ..
+          fi
+          
+          # Create new release
+          gh release create latest-data data.zip \
+            --title "Latest JVM Showcase Data" \
+            --notes "$(cat << 'EOF'
+          # Latest JVM Showcase Data Release  
+
+          This release contains generated sample Java class files and sources for the JVM Showcase.
+
+          ## Access Information
+
+          All assets from this release can be accessed from:
+          https://github.com/Kreijstal/java-tools/releases/download/latest-data/*
+
+          For example, the data.zip file is available at:
+          https://github.com/Kreijstal/java-tools/releases/download/latest-data/data.zip
+
+          ## JVM Showcase Features
+
+          The deployed showcase includes:
+          - **Interactive JVM Execution**: Step through Java bytecode instruction by instruction
+          - **Real-time Stack Visualization**: Watch the JVM stack change with each operation
+          - **Local Variables Inspection**: Monitor local variable states during execution
+          - **Source Code Mapping**: View original Java source alongside bytecode execution
+          - **Sample Classes**: Pre-loaded examples including arithmetic operations, string handling, and more
+
+          ## Supported Instructions
+
+          Our JVM implementation supports:
+          - Integer constants (iconst_0 through iconst_5)
+          - Arithmetic operations (iadd, isub, imul, idiv, irem)
+          - Stack operations (dup, pop)
+          - Local variable operations (iload_*, istore_*, aload_*, astore_*)
+          - Method invocations (invokestatic, invokevirtual, invokespecial)
+          - Field access (getstatic)
+          - Control flow (return, ireturn)
+          - String operations via built-in Java methods
+
+          Visit the live showcase to explore these features interactively!
+          EOF
+          )" \
+            --latest
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './dist'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

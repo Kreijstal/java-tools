@@ -5,7 +5,9 @@
   "scripts": {
     "test": "tape test/*.test.js",
     "build:java": "javac sources/*.java",
-    "build": "npm run build:java",
+    "build": "npm run build:java && npm run build:web",
+    "build:web": "node scripts/buildWeb.js",
+    "generate": "node scripts/generateData.js",
     "clean": "find sources -name '*.class' -delete",
     "pretest": "npm run build:java",
     "ci": "npm run build && npm test",

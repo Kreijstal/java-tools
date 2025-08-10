@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Java Tools - JVM Showcase</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <header>
+        <nav class="navbar">
+            <div class="nav-brand">
+                <h1>🚀 Java Tools - JVM Showcase</h1>
+                <p>Interactive Java Bytecode Execution & Analysis</p>
+            </div>
+            <div class="nav-links">
+                <a href="https://github.com/Kreijstal/java-tools" target="_blank" class="github-link">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+                        <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+                    </svg>
+                    GitHub
+                </a>
+            </div>
+        </nav>
+    </header>
+
+    <main class="container">
+        <section class="intro-section">
+            <div class="feature-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">📁</div>
+                    <h3>Upload .class Files</h3>
+                    <p>Upload your own Java bytecode files or use our sample classes</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🔍</div>
+                    <h3>Source Code Viewer</h3>
+                    <p>View the original Java source code alongside bytecode execution</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">⚡</div>
+                    <h3>Step-by-Step Execution</h3>
+                    <p>Execute bytecode instruction by instruction with full visibility</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <h3>Live Stack & Variables</h3>
+                    <p>Watch the JVM stack and local variables change in real-time</p>
+                </div>
+            </div>
+        </section>
+
+        <section class="main-content">
+            <div class="control-panel">
+                <h2>Class Loader</h2>
+                <div class="upload-section">
+                    <div class="file-input-wrapper">
+                        <input type="file" id="classFileInput" accept=".class" />
+                        <label for="classFileInput" class="file-input-label">
+                            📎 Choose .class file
+                        </label>
+                    </div>
+                    <div class="sample-classes">
+                        <label for="sampleSelect">Or select a sample:</label>
+                        <select id="sampleSelect">
+                            <option value="">-- Choose a sample class --</option>
+                        </select>
+                    </div>
+                    <button id="loadClassBtn" class="btn btn-primary" disabled>Load Class</button>
+                </div>
+
+                <div class="execution-controls" style="display: none;">
+                    <h3>Execution Controls</h3>
+                    <div class="control-buttons">
+                        <button id="stepBtn" class="btn btn-step">▶️ Step</button>
+                        <button id="runBtn" class="btn btn-run">🚀 Run All</button>
+                        <button id="resetBtn" class="btn btn-reset">🔄 Reset</button>
+                    </div>
+                    <div class="execution-info">
+                        <span id="executionStatus">Ready to execute</span>
+                        <span id="stepCounter">Step: 0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="workspace">
+                <div class="code-panel">
+                    <div class="panel-header">
+                        <h3>Bytecode Instructions</h3>
+                        <div class="panel-tabs">
+                            <button class="tab-btn active" data-tab="bytecode">Bytecode</button>
+                            <button class="tab-btn" data-tab="source">Source</button>
+                        </div>
+                    </div>
+                    <div class="tab-content">
+                        <div id="bytecode-tab" class="tab-pane active">
+                            <div id="bytecodeDisplay" class="code-display">
+                                <div class="placeholder">Load a class to see bytecode instructions</div>
+                            </div>
+                        </div>
+                        <div id="source-tab" class="tab-pane">
+                            <div id="sourceDisplay" class="code-display">
+                                <div class="placeholder">Source code will appear here if available</div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="state-panel">
+                    <div class="state-section">
+                        <h3>JVM Stack</h3>
+                        <div id="stackDisplay" class="stack-display">
+                            <div class="stack-empty">Stack is empty</div>
+                        </div>
+                    </div>
+
+                    <div class="state-section">
+                        <h3>Local Variables</h3>
+                        <div id="localsDisplay" class="locals-display">
+                            <div class="locals-empty">No local variables</div>
+                        </div>
+                    </div>
+
+                    <div class="state-section">
+                        <h3>Output</h3>
+                        <div id="outputDisplay" class="output-display">
+                            <div class="output-empty">No output yet</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <div class="container">
+            <p>&copy; 2024 Java Tools Project. Licensed under AGPLv3.</p>
+            <p>Explore the power of Java bytecode analysis and JVM implementation.</p>
+        </div>
+    </footer>
+
+    <script src="app.js"></script>
+</body>
+</html>

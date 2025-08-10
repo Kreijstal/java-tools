@@ -1,0 +1,55 @@
+{
+  "classes": [
+    {
+      "name": "Hello",
+      "file": "Hello.class",
+      "hasSource": true,
+      "description": "Simple Hello World program"
+    },
+    {
+      "name": "VerySimple",
+      "file": "VerySimple.class", 
+      "hasSource": true,
+      "description": "Basic arithmetic (3-2=1)"
+    },
+    {
+      "name": "Calculator",
+      "file": "Calculator.class",
+      "hasSource": true,
+      "description": "Addition example (2+2=4)"
+    },
+    {
+      "name": "RuntimeArithmetic", 
+      "file": "RuntimeArithmetic.class",
+      "hasSource": true,
+      "description": "Multiple arithmetic operations"
+    },
+    {
+      "name": "ConstantsTest",
+      "file": "ConstantsTest.class",
+      "hasSource": true,
+      "description": "Tests all iconst instructions"
+    },
+    {
+      "name": "SmallDivisionTest",
+      "file": "SmallDivisionTest.class",
+      "hasSource": true,
+      "description": "Division and remainder operations"
+    }
+  ],
+  "features": [
+    "Step-by-step execution",
+    "Stack visualization", 
+    "Local variables inspection",
+    "Bytecode instruction display",
+    "Source code mapping"
+  ],
+  "instructions": [
+    "Upload a .class file using the file input",
+    "Or select from the sample classes provided",
+    "Click \"Load Class\" to parse the bytecode", 
+    "Use \"Step\" to execute one instruction at a time",
+    "Watch the stack and variables change in real-time"
+  ],
+  "timestamp": "2024-08-10T15:49:00Z"
+}
