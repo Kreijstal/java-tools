@@ -301,6 +301,22 @@ function convertJson(inputJson, constantPool) {
             };
             break;
 
+          case "bipush":
+            // Push byte value onto stack
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: instr.operands.byte.toString()
+            };
+            break;
+
+          case "sipush":
+            // Push short value onto stack
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: instr.operands.value.toString()
+            };
+            break;
+
           default:
             // For simple instructions without operands
             codeItem.instruction = instr.opcodeName;
