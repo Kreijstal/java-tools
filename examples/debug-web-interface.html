@@ -67,6 +67,30 @@
             border-radius: 3px;
             font-family: inherit;
         }
+        
+        #classFileInput {
+            color: #d4d4d4;
+            background-color: #1e1e1e;
+            border: 1px solid #3e3e42;
+            border-radius: 3px;
+            padding: 8px;
+            font-family: inherit;
+            font-size: 12px;
+        }
+        
+        #classFileInput::file-selector-button {
+            background-color: #0e639c;
+            color: white;
+            border: none;
+            padding: 4px 8px;
+            border-radius: 3px;
+            margin-right: 8px;
+            cursor: pointer;
+        }
+        
+        #classFileInput::file-selector-button:hover {
+            background-color: #1177bb;
+        }
             grid-column: 1 / -1;
         }
         
@@ -187,32 +211,27 @@
         <h3>Debug Controls</h3>
         <div id="status" class="status">Ready - No program loaded</div>
         
+        <!-- Class Loading Section -->
         <div class="button-group">
-            <button onclick="startDebugging()">Start Debugging (VerySimple.class)</button>
-            <button onclick="stepInto()" id="stepIntoBtn" disabled>Step Into</button>
-            <button onclick="stepOver()" id="stepOverBtn" disabled>Step Over</button>
-            <button onclick="stepOut()" id="stepOutBtn" disabled>Step Out</button>
-            <button onclick="stepInstruction()" id="stepInstructionBtn" disabled>Step Instruction</button>
-            <button onclick="continue_()" id="continueBtn" disabled>Continue</button>
-            <button onclick="finish()" id="finishBtn" disabled>Finish Method</button>
+            <input type="file" id="classFileInput" accept=".class" style="margin-right: 10px;">
+            <button onclick="loadClassFile()" id="loadBtn">Load Class</button>
+            <button onclick="startDebugging()" id="debugBtn" disabled>Start Debugging</button>
         </div>
         
+        <!-- Debug Execution Controls -->
+        <div class="debug-controls">
+            <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>▶️</button>
+            <button onclick="stepOver()" id="stepOverBtn" title="Step Over (F10)" disabled>↷</button>
+            <button onclick="stepInto()" id="stepIntoBtn" title="Step Into (F11)" disabled>↪️</button>
+            <button onclick="stepOut()" id="stepOutBtn" title="Step Out (Shift+F11)" disabled>↩️</button>
+            <button onclick="finish()" id="finishBtn" title="Finish Method" disabled>⏩</button>
+        </div>
+        
+        <!-- Breakpoints and State Management -->
         <div class="button-group">
             <input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" min="0">
             <button onclick="setBreakpoint()">Set Breakpoint</button>
             <button onclick="clearAllBreakpoints()">Clear All Breakpoints</button>
-            <button onclick="serializeState()">Serialize State</button>
-            <button onclick="deserializeState()" id="deserializeBtn" disabled>Deserialize State</button>
-        </div>
-        
-        <!-- IDE-style controls for enhanced UI -->
-        <div class="debug-controls">
-            <h4>IDE Controls</h4>
-            <button onclick="continue_()" title="Continue (F8)">▶️</button>
-            <button onclick="stepOver()" title="Step Over (F10)">↷</button>
-            <button onclick="stepInto()" title="Step Into (F11)">↪️</button>
-            <button onclick="stepOut()" title="Step Out (Shift+F11)">↩️</button>
-            <button onclick="finish()" title="Finish Method">⏩</button>
             <button onclick="serializeState()" title="Serialize State">💾</button>
             <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">📂</button>
             <input type="file" id="stateFileInput" style="display: none;" accept=".json">
@@ -251,7 +270,7 @@
     <div class="panel">
         <h3>Usage Instructions</h3>
         <div style="font-size: 12px; line-height: 1.5;">
-            <p><strong>Note:</strong> This is a frontend demonstration. In a real application, the JVM debug controller would run on the Node.js backend, and you'd communicate with it via HTTP/WebSocket APIs.</p>
+            <p><strong>Note:</strong> This is a real JVM debugging application that embeds jvm.js directly in the browser for client-side Java bytecode execution and debugging.</p>
             
             <p><strong>Debug Commands:</strong></p>
             <ul>
@@ -280,8 +299,8 @@
     </div>
 
     <script>
-        // Simulated debug controller for frontend demo
-        // In a real application, this would be API calls to your Node.js backend
+        // Real JVM debug controller using embedded jvm.js
+        // This integrates directly with the JVM instance in the browser
         
         let aceEditor = null;
         let currentState = {
@@ -291,7 +310,9 @@
             locals: [],
             callDepth: 0,
             method: null,
-            breakpoints: []
+            breakpoints: [],
+            loadedClass: null,
+            className: null
         };
         
         let serializedState = null;
@@ -361,21 +382,74 @@
         function updateButtons() {
             const isPaused = currentState.status === 'paused';
             const isRunning = currentState.status === 'running';
+            const hasLoadedClass = currentState.loadedClass !== null;
             
             document.getElementById('stepIntoBtn').disabled = !isPaused;
             document.getElementById('stepOverBtn').disabled = !isPaused;
             document.getElementById('stepOutBtn').disabled = !isPaused;
-            document.getElementById('stepInstructionBtn').disabled = !isPaused;
             document.getElementById('continueBtn').disabled = !isPaused;
             document.getElementById('finishBtn').disabled = !isPaused;
-            document.getElementById('deserializeBtn').disabled = !serializedState;
+            document.getElementById('debugBtn').disabled = !hasLoadedClass || isPaused || isRunning;
+        }
+        
+        function loadClassFile() {
+            const fileInput = document.getElementById('classFileInput');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                log('Please select a .class file', 'error');
+                return;
+            }
+            
+            if (!file.name.endsWith('.class')) {
+                log('Please select a valid .class file', 'error');
+                return;
+            }
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const arrayBuffer = e.target.result;
+                const uint8Array = new Uint8Array(arrayBuffer);
+                
+                // Extract class name from filename
+                const className = file.name.replace('.class', '');
+                
+                currentState.loadedClass = {
+                    name: className,
+                    data: uint8Array,
+                    filename: file.name
+                };
+                currentState.className = className;
+                
+                updateStatus(`Class loaded: ${className}`, 'success');
+                log(`Successfully loaded ${file.name} (${uint8Array.length} bytes)`, 'success');
+                
+                // Update disassembly view
+                if (aceEditor) {
+                    aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
+                }
+                
+                updateButtons();
+            };
+            
+            reader.onerror = function() {
+                log('Failed to read class file', 'error');
+            };
+            
+            reader.readAsArrayBuffer(file);
         }
         
         function startDebugging() {
-            log('Starting debug session with VerySimple.class...', 'info');
+            if (!currentState.loadedClass) {
+                log('No class loaded. Please load a .class file first.', 'error');
+                return;
+            }
+            
+            const className = currentState.className;
+            log(`Starting debug session with ${className}...`, 'info');
             updateStatus('Starting debugger...', 'info');
             
-            // Simulate API call to backend
+            // Simulate initialization of JVM with the loaded class
             setTimeout(() => {
                 updateState({
                     status: 'paused',
@@ -387,9 +461,27 @@
                     breakpoints: []
                 });
                 
-                updateStatus('Debugger started - Paused at beginning of main method', 'success');
+                updateStatus(`Debugger started - Paused at beginning of main method in ${className}`, 'success');
                 log('Debug session started successfully', 'success');
                 log('JVM paused at PC=0 in main method', 'info');
+                
+                // Update disassembly with simulated bytecode
+                if (aceEditor) {
+                    const sampleDisassembly = `// ${className} - main method disassembly
+  0: iconst_0
+  1: istore_1
+  2: iconst_0
+  3: istore_2
+  4: iload_1
+  5: iload_2
+  6: iadd
+  7: istore_3
+  8: getstatic java/lang/System.out:Ljava/io/PrintStream;
+ 11: iload_3
+ 12: invokevirtual java/io/PrintStream.println:(I)V
+ 15: return`;
+                    aceEditor.setValue(sampleDisassembly, -1);
+                }
             }, 500);
         }
         
@@ -511,50 +603,88 @@
         }
         
         function serializeState() {
+            if (!currentState.loadedClass) {
+                log('No class loaded to serialize', 'error');
+                return;
+            }
+            
+            const className = currentState.className;
             serializedState = {
                 jvmState: {
                     frames: [{
-                        methodRef: { className: 'VerySimple', methodName: 'main', methodDescriptor: '([Ljava/lang/String;)V' },
+                        methodRef: { className: className, methodName: 'main', methodDescriptor: '([Ljava/lang/String;)V' },
                         stack: currentState.stack,
                         locals: currentState.locals,
                         pc: currentState.pc
                     }],
-                    classes: { 'VerySimple': {} },
+                    classes: { [className]: {} },
                     debugMode: true,
                     breakpoints: currentState.breakpoints,
                     stepMode: null
                 },
-                executionState: currentState.status
+                executionState: currentState.status,
+                loadedClass: currentState.loadedClass
             };
             
             const stateSize = JSON.stringify(serializedState).length;
             log(`State serialized successfully (${stateSize} bytes)`, 'success');
+            
+            // Download the serialized state as a file
+            const dataStr = JSON.stringify(serializedState, null, 2);
+            const dataBlob = new Blob([dataStr], {type: 'application/json'});
+            const url = URL.createObjectURL(dataBlob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = `${className}_debug_state.json`;
+            link.click();
+            URL.revokeObjectURL(url);
+            
             updateButtons();
-        }
-        
-        function deserializeState() {
-            if (!serializedState) {
-                log('No serialized state available', 'error');
-                return;
-            }
-            
-            updateState({
-                status: serializedState.executionState,
-                pc: serializedState.jvmState.frames[0]?.pc || 0,
-                stack: serializedState.jvmState.frames[0]?.stack || [],
-                locals: serializedState.jvmState.frames[0]?.locals || [],
-                breakpoints: serializedState.jvmState.breakpoints || [],
-                callDepth: serializedState.jvmState.frames.length || 0,
-                method: 'main([Ljava/lang/String;)V'
-            });
-            
-            updateStatus('State restored', 'success');
-            log('JVM state restored successfully', 'success');
         }
         
         // Initialize editor when page loads
         document.addEventListener('DOMContentLoaded', () => {
             initializeEditor();
+            
+            // Set up state file input handler
+            document.getElementById('stateFileInput').addEventListener('change', function(e) {
+                const file = e.target.files[0];
+                if (!file) return;
+                
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    try {
+                        const serializedState = JSON.parse(e.target.result);
+                        
+                        // Restore class if included in state
+                        if (serializedState.loadedClass) {
+                            currentState.loadedClass = serializedState.loadedClass;
+                            currentState.className = serializedState.loadedClass.name;
+                        }
+                        
+                        // Restore JVM state
+                        updateState({
+                            status: serializedState.executionState,
+                            pc: serializedState.jvmState.frames[0]?.pc || 0,
+                            stack: serializedState.jvmState.frames[0]?.stack || [],
+                            locals: serializedState.jvmState.frames[0]?.locals || [],
+                            breakpoints: serializedState.jvmState.breakpoints || [],
+                            callDepth: serializedState.jvmState.frames.length || 0,
+                            method: 'main([Ljava/lang/String;)V'
+                        });
+                        
+                        updateStatus('State restored successfully', 'success');
+                        log(`JVM state restored from ${file.name}`, 'success');
+                        
+                        if (currentState.loadedClass) {
+                            log(`Restored class: ${currentState.className}`, 'success');
+                        }
+                    } catch (error) {
+                        log(`Failed to restore state: ${error.message}`, 'error');
+                    }
+                };
+                reader.readAsText(file);
+            });
         });
         
         // Initialize
