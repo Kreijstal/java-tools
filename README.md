@@ -2,7 +2,49 @@
 
 This project provides tools for parsing and analyzing Java `.class` files. It uses the `jvm_parser` library to create an Abstract Syntax Tree (AST) from bytecode, allowing for in-depth analysis of Java classes.
 
-## How to Use
+## JVM Showcase
+
+🚀 **[View the Live JVM Showcase](https://kreijstal.github.io/java-tools/)** - Interactive Java bytecode execution and analysis!
+
+This project now includes an interactive web-based showcase that demonstrates the JVM implementation with step-by-step execution visualization. The showcase is automatically deployed to GitHub Pages via CI/CD.
+
+### Features
+
+- **🔍 Interactive Bytecode Execution**: Execute Java bytecode instruction by instruction
+- **📊 Real-time Visualization**: Watch the JVM stack and local variables change in real-time
+- **📂 File Upload Support**: Upload your own .class files or use provided samples
+- **📖 Source Code Viewer**: View original Java source code alongside bytecode execution
+- **🎯 Step-by-Step Debugging**: Full visibility into each instruction execution
+- **📱 Responsive Design**: Works on desktop and mobile devices
+
+### Sample Classes
+
+The showcase includes several pre-loaded examples:
+- **Hello**: Simple "Hello, World!" program
+- **VerySimple**: Basic arithmetic (3-2=1)
+- **Calculator**: Addition example (2+2=4)
+- **RuntimeArithmetic**: Multiple arithmetic operations with variables
+- **ConstantsTest**: Demonstrates all integer constant instructions
+- **SmallDivisionTest**: Division and remainder operations
+
+### How to Use the Showcase
+
+1. Visit the [live showcase](https://kreijstal.github.io/java-tools/)
+2. Select a sample class or upload your own .class file
+3. Click "Load Class" to parse the bytecode
+4. Use "Step" to execute one instruction at a time
+5. Watch the stack, local variables, and output change in real-time
+6. Switch between "Bytecode" and "Source" tabs to see both views
+
+### Building the Showcase
+
+```bash
+npm run build        # Build both Java classes and web frontend
+npm run build:web    # Build only the web frontend
+npm run generate     # Generate sample data for releases
+```
+
+The built files will be in the `dist/` directory, ready for deployment.
 
 To parse a Java `.class` file, you can use the `runLoadAndTraverse.js` script. This script takes a class name and an optional classpath as arguments.
 
