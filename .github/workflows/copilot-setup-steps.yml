@@ -40,3 +40,8 @@ jobs:
 
       - name: Install Krakatau (krak2)
         run: bash scripts/install-krakatau.sh
+      
+      - name: Install Playwright and dependencies
+        run: |
+          npx playwright install-deps
+          npx playwright install chromium
