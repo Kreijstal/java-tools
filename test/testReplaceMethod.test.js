@@ -2,7 +2,7 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { replaceMethod } = require('../scripts/replaceMethod');
+const { KrakatauWorkspace, SymbolIdentifier } = require('../src/KrakatauWorkspace');
 
 // TODO: This test is currently disabled due to issues with the replaceMethod function
 // The function needs to be fixed to properly handle the test scenario
@@ -13,7 +13,7 @@ test('replaceMethod functionality', function(t) {
 
 // Original test code preserved for future fixing:
 /*
-function runTest() {
+async function runTest() {
   const tempDir = path.join(__dirname, 'tempTestDir');
 
   //please make sure tempDir is empty
@@ -33,10 +33,12 @@ function runTest() {
   });
   
 
-  // Perform the method renaming
-  console.log(`Calling replaceMethod with: className=TestMethods, classPath=${tempDir}, oldMethodName=publicMethod1, newMethodName=newMethodName`);
+  // Perform the method renaming using new KrakatauWorkspace API
+  console.log(`Calling applyRenameAndSave with: className=TestMethods, classPath=${tempDir}, oldMethodName=publicMethod1, newMethodName=newMethodName`);
 
-  replaceMethod("TestMethodsRunner",'TestMethods', path.join(__dirname, '..','sources'), 'publicMethod1', 'newMethodName',tempDir);
+  const workspace = await KrakatauWorkspace.create(path.join(__dirname, '..','sources'));
+  const symbolIdentifier = new SymbolIdentifier('TestMethods', 'publicMethod1');
+  workspace.applyRenameAndSave(symbolIdentifier, 'newMethodName', tempDir);
 
   // Verify the method has been renamed
   const classFilePath = path.join(tempDir, 'TestMethods.class');

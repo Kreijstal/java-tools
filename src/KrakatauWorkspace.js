@@ -3,6 +3,8 @@ const path = require('path');
 const { loadClassByPathSync } = require('./classLoader');
 const { getReferenceObjFromClass } = require('./traverseAST');
 const { unparseDataStructures } = require('./convert_tree');
+const { assembleClasses } = require('./assembleAndRun');
+const { renameMethod } = require('./renameMethod');
 
 /**
  * Represents a unique identifier for a symbol (class, method, field)
@@ -780,6 +782,36 @@ class KrakatauWorkspace {
 
     // Rebuild the reference graph after applying changes
     this._buildBasicReferenceGraph();
+  }
+
+  /**
+   * Applies a rename refactoring to a symbol and saves the modified class files.
+   * This is a high-level workflow that handles loading, modification, and reassembly.
+   * @param {SymbolIdentifier} symbolIdentifier - The symbol to rename.
+   * @param {string} newName - The new name for the symbol.
+   * @param {string} outputDir - The directory to save the modified .class files.
+   */
+  applyRenameAndSave(symbolIdentifier, newName, outputDir = '.') {
+    // Step 1: Use the internal rename logic
+    renameMethod(this.workspaceASTs, this.referenceObj, symbolIdentifier.className, symbolIdentifier.memberName, newName);
+
+    // Step 2: Identify which class files were actually modified
+    const modifiedClasses = new Set([symbolIdentifier.className]);
+    const refs = this.findReferences(symbolIdentifier);
+    refs.forEach(ref => modifiedClasses.add(ref.className));
+
+    // Step 3: Reassemble only the affected classes
+    const modifiedAsts = { classes: [] };
+    for (const className of modifiedClasses) {
+      if (this.workspaceASTs[className]) {
+        modifiedAsts.classes.push(this.workspaceASTs[className].classes[0]);
+      }
+    }
+    
+    // Assemble the modified classes
+    assembleClasses(modifiedAsts, outputDir);
+
+    console.log(`Successfully renamed ${symbolIdentifier.memberName} to ${newName} and saved ${modifiedClasses.size} affected files.`);
   }
 
   /**
