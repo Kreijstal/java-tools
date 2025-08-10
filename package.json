@@ -19,8 +19,7 @@
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
     "jszip": "^3.10.1",
-    "jvm_parser": "^0.0.3",
-    "tape": "^5.9.0"
+    "jvm_parser": "^0.0.3"
   },
   "devDependencies": {
     "@babel/core": "^7.28.0",
@@ -30,6 +29,7 @@
     "path-browserify": "^1.0.1",
     "process": "^0.11.10",
     "stream-browserify": "^3.0.0",
+    "tape": "^5.9.0",
     "util": "^0.12.5",
     "webpack": "^5.101.0",
     "webpack-cli": "^6.0.1"

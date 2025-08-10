@@ -366,31 +366,44 @@ class KrakatauWorkspace {
   }
 
   /**
-   * Lists all methods for a given class.
+   * Private helper method to list symbols of a specific type from a class.
+   * @private
    * @param {string} className - The fully qualified name of the class.
-   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for each method in the class.
+   * @param {string} itemType - The type of item to look for ('method' or 'field').
+   * @param {string} symbolKind - The kind of symbol for the SymbolDefinition.
+   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for each symbol of the specified type.
    */
-  listMethods(className) {
+  _listSymbols(className, itemType, symbolKind) {
     const ast = this.workspaceASTs[className];
     if (!ast) {
       return [];
     }
 
-    const methods = [];
+    const symbols = [];
     ast.classes[0].items.forEach((item, itemIndex) => {
-      if (item.type === 'method') {
-        const methodDef = new SymbolDefinition(
-          new SymbolIdentifier(className, item.method.name, item.method.descriptor),
-          new SymbolLocation(className, `classes.0.items.${itemIndex}.method`),
-          'method',
-          item.method.flags,
-          item.method.descriptor
+      if (item.type === itemType) {
+        const member = item[itemType]; // e.g., item.method or item.field
+        const symbol = new SymbolDefinition(
+          new SymbolIdentifier(className, member.name, member.descriptor),
+          new SymbolLocation(className, `classes.0.items.${itemIndex}.${itemType}`),
+          symbolKind,
+          member.flags,
+          member.descriptor
         );
-        methods.push(methodDef);
+        symbols.push(symbol);
       }
     });
+    
+    return symbols;
+  }
 
-    return methods;
+  /**
+   * Lists all methods for a given class.
+   * @param {string} className - The fully qualified name of the class.
+   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for each method in the class.
+   */
+  listMethods(className) {
+    return this._listSymbols(className, 'method', 'method');
   }
 
   /**
@@ -399,26 +412,7 @@ class KrakatauWorkspace {
    * @returns {SymbolDefinition[]} An array of SymbolDefinitions for each field in the class.
    */
   listFields(className) {
-    const ast = this.workspaceASTs[className];
-    if (!ast) {
-      return [];
-    }
-
-    const fields = [];
-    ast.classes[0].items.forEach((item, itemIndex) => {
-      if (item.type === 'field') {
-        const fieldDef = new SymbolDefinition(
-          new SymbolIdentifier(className, item.field.name, item.field.descriptor),
-          new SymbolLocation(className, `classes.0.items.${itemIndex}.field`),
-          'field',
-          item.field.flags,
-          item.field.descriptor
-        );
-        fields.push(fieldDef);
-      }
-    });
-
-    return fields;
+    return this._listSymbols(className, 'field', 'field');
   }
 
   /**
