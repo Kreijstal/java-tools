@@ -405,47 +405,6 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             }
         }
         
-        // Override the original updateButtons function to include stepInstructionBtn
-        const originalUpdateButtons = window.updateButtons;
-        window.updateButtons = function() {
-            if (jvmDebug) {
-                // Use the enhanced JVM state-based button updates
-                try {
-                    const state = jvmDebug.getState();
-                    const isPaused = state.executionState === 'paused';
-                    const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-                    stepButtons.forEach(id => {
-                        const btn = document.getElementById(id);
-                        if (btn) btn.disabled = !isPaused;
-                    });
-                    
-                    // Handle debug button state
-                    const debugBtn = document.getElementById('debugBtn');
-                    if (debugBtn) {
-                        const hasLoadedClass = state.loadedClass || currentState.loadedClass;
-                        debugBtn.disabled = !hasLoadedClass || isPaused;
-                    }
-                } catch (error) {
-                    // Fallback to original logic
-                    if (originalUpdateButtons) {
-                        originalUpdateButtons();
-                        // Still need to handle stepInstructionBtn manually
-                        const stepInstructionBtn = document.getElementById('stepInstructionBtn');
-                        if (stepInstructionBtn && currentState) {
-                            stepInstructionBtn.disabled = currentState.status !== 'paused';
-                        }
-                    }
-                }
-            } else if (originalUpdateButtons) {
-                // Use original logic but add stepInstructionBtn support
-                originalUpdateButtons();
-                const stepInstructionBtn = document.getElementById('stepInstructionBtn');
-                if (stepInstructionBtn && currentState) {
-                    stepInstructionBtn.disabled = currentState.status !== 'paused';
-                }
-            }
-        };
-        
         
         // Enhanced loadClassFile function to handle both .class and .jar files
         const originalLoadClassFile = window.loadClassFile;
@@ -538,6 +497,10 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
     // Add the Clear button to the output console
     const outputConsolePattern = /(<h3>Output Console<\/h3>)/;
     htmlContent = htmlContent.replace(outputConsolePattern, '$1\n                <button onclick="clearOutput()" style="float: right; font-size: 10px; padding: 2px 6px;">Clear</button>');
+    
+    // Add stepInstruction button to the original updateButtons function
+    const updateButtonsPattern = /(document\.getElementById\('finishBtn'\)\.disabled = !isPaused;)/;
+    htmlContent = htmlContent.replace(updateButtonsPattern, '$1\n            document.getElementById(\'stepInstructionBtn\').disabled = !isPaused;');
     
     // Consolidate upload mechanisms - update file input to accept both .class and .jar files
     const fileInputPattern = /(<input type="file" id="classFileInput" accept="\.class"[^>]*>)/;
