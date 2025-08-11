@@ -111,17 +111,55 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
         
         // Define updateButtons function for UI compatibility
         function updateButtons() {
-            const debugButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-            const isDebugging = currentState.status === 'paused' || currentState.status === 'running';
+            if (!jvmDebug) {
+                // If JVM not initialized, keep debug button enabled but step buttons disabled
+                const debugBtn = document.getElementById('debugBtn');
+                if (debugBtn) debugBtn.disabled = false;
+                
+                const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                stepButtons.forEach(id => {
+                    const btn = document.getElementById(id);
+                    if (btn) btn.disabled = true;
+                });
+                return;
+            }
             
-            debugButtons.forEach(btnId => {
-                const btn = document.getElementById(btnId);
-                if (btn) {
-                    btn.disabled = !isDebugging;
+            try {
+                const state = jvmDebug.getCurrentState();
+                const isPaused = state.executionState === 'paused';
+                const isRunning = state.executionState === 'running';
+                const hasLoadedClass = currentState.loadedClass !== null || state.method !== null;
+                
+                // Debug button should be enabled when we have a class and not currently debugging
+                const debugBtn = document.getElementById('debugBtn');
+                if (debugBtn) {
+                    debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
                 }
-            });
-            
-            log(\`Debug buttons \${isDebugging ? 'enabled' : 'disabled'}\`, 'debug');
+                
+                // Step buttons should be enabled only when paused
+                const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                stepButtons.forEach(id => {
+                    const btn = document.getElementById(id);
+                    if (btn) btn.disabled = !isPaused;
+                });
+                
+                log(\`Debug buttons \${isPaused ? 'enabled' : 'disabled'} (state: \${state.executionState})\`, 'debug');
+                
+            } catch (error) {
+                log(\`Error updating buttons: \${error.message}\`, 'error');
+                // Fallback to simple state check
+                const isDebugging = currentState.status === 'paused' || currentState.status === 'running';
+                const debugButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                
+                debugButtons.forEach(btnId => {
+                    const btn = document.getElementById(btnId);
+                    if (btn) {
+                        btn.disabled = !isDebugging;
+                    }
+                });
+                
+                log(\`Debug buttons \${isDebugging ? 'enabled' : 'disabled'} (fallback)\`, 'debug');
+            }
         }
         function updateState(updates) {
             Object.assign(currentState, updates);
@@ -151,7 +189,7 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                             // Initialize the debug environment
                             await jvmDebug.initialize();
                             log(\`Real JVM Debug initialized with \${extractedFiles.length} sample classes\`, 'success');
-                            populateSampleClasses();
+                            await populateSampleClasses();
                         } else {
                             log('Data package fetch failed, initializing without data', 'warning');
                             await jvmDebug.initialize();
@@ -178,16 +216,31 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             }
         });
         
-        function populateSampleClasses() {
+        async function populateSampleClasses() {
             // Add sample class loading functionality
             const controls = document.querySelector('.controls');
             if (controls && jvmDebug) {
                 try {
-                    const classes = [
-                        { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
-                        { filename: 'Hello.class', name: 'Hello', description: 'Hello World program' },
-                        { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' }
-                    ];
+                    // Get available classes from the JVM debug instance
+                    let availableClasses = [];
+                    try {
+                        availableClasses = jvmDebug ? await jvmDebug.listFiles() : [];
+                    } catch (error) {
+                        log('Could not retrieve class list, using default classes', 'info');
+                        availableClasses = [];
+                    }
+                    
+                    const classes = availableClasses.length > 0 ? 
+                        availableClasses.map(cls => ({
+                            filename: cls,
+                            name: cls.replace('.class', ''),
+                            description: getClassDescription(cls)
+                        })) :
+                        [
+                            { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
+                            { filename: 'Hello.class', name: 'Hello', description: 'Hello World program' },
+                            { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' }
+                        ];
                     
                     const samplesDiv = document.createElement('div');
                     samplesDiv.innerHTML = \`
@@ -211,9 +264,10 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     
                     // Also update the state to indicate we have classes available
                     if (typeof updateState === 'function') {
+                        const firstClass = classes.length > 0 ? classes[0] : null;
                         updateState({
                             loadedClass: true,
-                            className: 'VerySimple', // Default to first sample class
+                            className: firstClass ? firstClass.name : null,
                             status: 'ready'
                         });
                     }
@@ -223,7 +277,39 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             }
         }
         
-        function loadSampleClass() {
+        function getClassDescription(className) {
+            // Provide descriptions for known classes
+            const descriptions = {
+                'VerySimple.class': 'Basic arithmetic (3-2=1)',
+                'Hello.class': 'Hello World program',  
+                'Calculator.class': 'Calculator operations',
+                'Calc.class': 'Simple calculation demo',
+                'CalcMain.class': 'Main calculation entry point',
+                'RuntimeArithmetic.class': 'Runtime arithmetic operations',
+                'ArithmeticTest.class': 'Arithmetic operation tests',
+                'ConstantsTest.class': 'Constant loading tests',
+                'DivisionTest.class': 'Division operation tests',
+                'SmallDivisionTest.class': 'Small division tests',
+                'WorkingArithmetic.class': 'Working arithmetic examples',
+                'SimpleArithmetic.class': 'Simple arithmetic operations',
+                'StringConcat.class': 'String concatenation',
+                'SimpleStringConcat.class': 'Simple string concatenation',
+                'StringBuilderConcat.class': 'StringBuilder concatenation',
+                'StringConcatMethod.class': 'String concatenation methods',
+                'StringMethodsTest.class': 'String method tests',
+                'TestMethods.class': 'Method testing examples',
+                'TestMethodsRunner.class': 'Test method runner',
+                'ExceptionTest.class': 'Exception handling tests',
+                'InvokeVirtualTest.class': 'Virtual method invocation tests',
+                'MainApp.class': 'Main application entry point',
+                'SipushTest.class': 'Short integer push tests',
+                'Thing.class': 'Generic object example',
+                'ThingProducer.class': 'Object factory example'
+            };
+            return descriptions[className] || 'Java class file';
+        }
+        
+        async function loadSampleClass() {
             const select = document.getElementById('sampleClassSelect');
             const selectedClass = select.value;
             
@@ -236,7 +322,7 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 log(\`Loading sample class: \${selectedClass}\`, 'info');
                 
                 // selectedClass is already 'VerySimple.class', so pass it directly
-                const result = jvmDebug.start(selectedClass);
+                const result = await jvmDebug.start(selectedClass);
                 log(\`Debug session started for \${selectedClass}\`, 'success');
                 updateDebugDisplay();
                 
@@ -270,18 +356,42 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 const originalFinish = window.finish;
                 
                 // Override startDebugging to work with real JVM and sample classes
-                window.startDebugging = function() {
+                window.startDebugging = async function() {
                     try {
-                        // Always use VerySimple.class as the default for tests
-                        log('Starting debug session with default class: VerySimple.class', 'info');
-                        const result = jvmDebug.start('VerySimple.class');
+                        // Determine which class to start with
+                        let classToStart = null;
+                        
+                        // First, check if a sample class is selected
+                        const sampleSelect = document.getElementById('sampleClassSelect');
+                        if (sampleSelect && sampleSelect.value) {
+                            classToStart = sampleSelect.value;
+                        } else {
+                            // Use the first available class from loaded classes
+                            let availableClasses = [];
+                            try {
+                                availableClasses = await jvmDebug.listFiles();
+                            } catch (error) {
+                                log('Could not retrieve class list', 'error');
+                            }
+                            if (availableClasses.length > 0) {
+                                classToStart = availableClasses[0];
+                            }
+                        }
+                        
+                        if (!classToStart) {
+                            log('No class available to start debugging. Please load a class first.', 'error');
+                            return;
+                        }
+                        
+                        log(\`Starting debug session with class: \${classToStart}\`, 'info');
+                        const result = await jvmDebug.start(classToStart);
                         updateDebugDisplay();
                         
                         // Update the current state to enable debug buttons
                         if (typeof updateState === 'function') {
                             updateState({
-                                loadedClass: { name: 'VerySimple.class' },
-                                className: 'VerySimple',
+                                loadedClass: { name: classToStart },
+                                className: classToStart.replace('.class', ''),
                                 status: 'paused'
                             });
                         }
@@ -451,12 +561,7 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 
                 // Update button states
                 if (typeof updateButtons === 'function') {
-                    const isPaused = state.executionState === 'paused';
-                    const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-                    stepButtons.forEach(id => {
-                        const btn = document.getElementById(id);
-                        if (btn) btn.disabled = !isPaused;
-                    });
+                    updateButtons();
                 }
                 
             } catch (error) {
@@ -557,45 +662,6 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             
             reader.readAsArrayBuffer(file);
         };
-        
-        // Add missing updateButtons function for UI compatibility
-        function updateButtons() {
-            if (!jvmDebug) {
-                // If JVM not initialized, keep debug button enabled but step buttons disabled
-                const debugBtn = document.getElementById('debugBtn');
-                if (debugBtn) debugBtn.disabled = false;
-                
-                const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-                stepButtons.forEach(id => {
-                    const btn = document.getElementById(id);
-                    if (btn) btn.disabled = true;
-                });
-                return;
-            }
-            
-            try {
-                const state = jvmDebug.getCurrentState();
-                const isPaused = state.executionState === 'paused';
-                const isRunning = state.executionState === 'running';
-                const hasLoadedClass = currentState.loadedClass !== null || state.method !== null;
-                
-                // Debug button should be enabled when we have a class and not currently debugging
-                const debugBtn = document.getElementById('debugBtn');
-                if (debugBtn) {
-                    debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
-                }
-                
-                // Step buttons should be enabled only when paused
-                const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-                stepButtons.forEach(id => {
-                    const btn = document.getElementById(id);
-                    if (btn) btn.disabled = !isPaused;
-                });
-                
-            } catch (error) {
-                log(\`Error updating buttons: \${error.message}\`, 'error');
-            }
-        }
         
         // Add missing initializeEditor function for ACE editor setup
         let aceEditor = null;
