@@ -92,6 +92,17 @@ const server = http.createServer((req, res) => {
 
     if (stats.isFile()) {
       serveFile(res, filePath);
+    } else if (stats.isDirectory()) {
+      // Try to serve index.html from the directory
+      const indexPath = path.join(filePath, 'index.html');
+      fs.stat(indexPath, (indexErr, indexStats) => {
+        if (indexErr || !indexStats.isFile()) {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('File not found');
+          return;
+        }
+        serveFile(res, indexPath);
+      });
     } else {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('File not found');
