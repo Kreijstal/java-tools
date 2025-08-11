@@ -218,6 +218,23 @@
             <button onclick="startDebugging()" id="debugBtn" disabled>Start Debugging</button>
         </div>
         
+        <!-- Sample Class Loading Section -->
+        <div class="button-group">
+            <select id="sampleClassSelect" style="color: #d4d4d4; background-color: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; padding: 8px; font-family: inherit; font-size: 12px; margin-right: 10px;">
+                <option value="">Choose a sample class...</option>
+                <option value="Hello">Hello - Simple Hello World</option>
+                <option value="VerySimple">VerySimple - Basic class structure</option>
+                <option value="RuntimeArithmetic">RuntimeArithmetic - Math operations</option>
+                <option value="SimpleArithmetic">SimpleArithmetic - Simple calculations</option>
+                <option value="StringConcat">StringConcat - String operations</option>
+                <option value="CalcMain">CalcMain - Calculator main class</option>
+                <option value="ExceptionTest">ExceptionTest - Exception handling</option>
+                <option value="InvokeVirtualTest">InvokeVirtualTest - Method invocation</option>
+                <option value="MainApp">MainApp - Larger application example</option>
+            </select>
+            <button onclick="loadSampleClass()" id="loadSampleBtn">Load Sample</button>
+        </div>
+        
         <!-- Debug Execution Controls -->
         <div class="debug-controls">
             <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>▶️</button>
@@ -273,9 +290,19 @@
         <div style="font-size: 12px; line-height: 1.5; background-color: #2d2d30; padding: 10px; border-radius: 3px; margin-bottom: 10px;">
             <p><strong>Quick Start Options:</strong></p>
             <ul>
-                <li><strong>🚀 Built-in Samples:</strong> Visit <a href="/" style="color: #569cd6;">http://localhost:3000/</a> for 25 pre-loaded sample classes</li>
-                <li><strong>📂 Download from Repository:</strong> Get .class files from <a href="/sources/" style="color: #569cd6;">sources directory</a></li>
-                <li><strong>☕ Compile your own:</strong> <code style="background: #1e1e1e; padding: 2px 4px;">javac YourFile.java</code> creates YourFile.class</li>
+                <li><strong>🚀 Load Sample Class:</strong> Use the "Choose a sample class..." dropdown above to instantly load one of 25 pre-compiled sample classes</li>
+                <li><strong>📂 Browse Repository:</strong> Download individual .class files from <a href="/sources/" style="color: #569cd6;">sources directory</a></li>
+                <li><strong>☕ Compile your own:</strong> <code style="background: #1e1e1e; padding: 2px 4px;">javac YourFile.java</code> creates YourFile.class to upload</li>
+            </ul>
+            
+            <p><strong>Available Sample Classes Include:</strong></p>
+            <ul style="margin-left: 20px;">
+                <li><strong>Hello</strong> - Classic "Hello World" program</li>
+                <li><strong>RuntimeArithmetic</strong> - Demonstrates math operations</li>
+                <li><strong>StringConcat</strong> - String manipulation examples</li>
+                <li><strong>ExceptionTest</strong> - Exception handling demonstration</li>
+                <li><strong>MainApp</strong> - More complex application example</li>
+                <li>And 20+ more sample classes to explore!</li>
             </ul>
             
             <p><strong>Example Java Files to Compile:</strong></p>
@@ -297,7 +324,7 @@ public class SimpleCalc {<br/>
 &nbsp;&nbsp;&nbsp;&nbsp;}<br/>
 }
             </div>
-            <p style="font-style: italic;">💡 Tip: Compile with <code style="background: #1e1e1e; padding: 2px 4px;">javac Hello.java</code> then upload the generated Hello.class file</p>
+            <p style="font-style: italic;">💡 Tip: Use the sample class dropdown for instant access, or compile your own with <code style="background: #1e1e1e; padding: 2px 4px;">javac Hello.java</code> then upload the generated Hello.class file</p>
         </div>
     </div>
     
@@ -471,6 +498,56 @@ public class SimpleCalc {<br/>
             };
             
             reader.readAsArrayBuffer(file);
+        }
+        
+        function loadSampleClass() {
+            const selectElement = document.getElementById('sampleClassSelect');
+            const className = selectElement.value;
+            
+            if (!className) {
+                log('Please select a sample class', 'error');
+                return;
+            }
+            
+            const classUrl = `/dist/data/${className}.class`;
+            log(`Loading sample class: ${className}...`, 'info');
+            updateStatus(`Loading sample class: ${className}...`, 'info');
+            
+            // Fetch the class file from the server
+            fetch(classUrl)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`Failed to load class file: ${response.status} ${response.statusText}`);
+                    }
+                    return response.arrayBuffer();
+                })
+                .then(arrayBuffer => {
+                    const uint8Array = new Uint8Array(arrayBuffer);
+                    
+                    currentState.loadedClass = {
+                        name: className,
+                        data: uint8Array,
+                        filename: `${className}.class`
+                    };
+                    currentState.className = className;
+                    
+                    updateStatus(`Sample class loaded: ${className}`, 'success');
+                    log(`Successfully loaded ${className}.class (${uint8Array.length} bytes)`, 'success');
+                    
+                    // Update disassembly view
+                    if (aceEditor) {
+                        aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
+                    }
+                    
+                    updateButtons();
+                    
+                    // Clear the selection for next use
+                    selectElement.selectedIndex = 0;
+                })
+                .catch(error => {
+                    log(`Failed to load sample class: ${error.message}`, 'error');
+                    updateStatus('Failed to load sample class', 'error');
+                });
         }
         
         function startDebugging() {
