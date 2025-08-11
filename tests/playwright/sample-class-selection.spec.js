@@ -122,14 +122,14 @@ test.describe('Sample Class Selection UI', () => {
     await page.click('button:has-text("Load Sample")');
     await page.waitForTimeout(1000);
     
-    // Load third class
-    await page.selectOption('#sampleClassSelect', 'Calculator.class');
+    // Load third class (use a class with main method instead of Calculator)
+    await page.selectOption('#sampleClassSelect', 'RuntimeArithmetic.class');
     await page.click('button:has-text("Load Sample")');
     await page.waitForTimeout(1000);
     
     // Check that the latest class was loaded successfully
     const output = await page.locator('#output').textContent();
-    expect(output).toContain('Loading sample class: Calculator.class');
+    expect(output).toContain('Loading sample class: RuntimeArithmetic.class');
     
     // Verify debugging can start with the latest class
     await page.click('#debugBtn');

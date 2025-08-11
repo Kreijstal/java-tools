@@ -108,7 +108,7 @@ function getClassDescription(className) {
         'ArithmeticTest.class': 'Arithmetic operation tests',
         'Calc.class': 'Simple calculation demo',
         'CalcMain.class': 'Calculator main class',
-        'Calculator.class': 'Calculator operations',
+        'Calculator.class': 'Calculator operations (utility class - no main)',
         'ConstantsTest.class': 'Constant loading tests (iconst_0 through iconst_5)',
         'DivisionTest.class': 'Division operation tests',
         'ExceptionTest.class': 'Exception handling tests',
@@ -124,10 +124,10 @@ function getClassDescription(className) {
         'StringConcat.class': 'String concatenation',
         'StringConcatMethod.class': 'String concatenation methods',
         'StringMethodsTest.class': 'String method tests',
-        'TestMethods.class': 'Method testing examples',
+        'TestMethods.class': 'Method testing examples (utility class - no main)',
         'TestMethodsRunner.class': 'Test method runner',
-        'Thing.class': 'Generic object example',
-        'ThingProducer.class': 'Object factory example',
+        'Thing.class': 'Generic object example (utility class - no main)',
+        'ThingProducer.class': 'Object factory example (utility class - no main)',
         'VerySimple.class': 'Basic arithmetic (3-2=1)',
         'WorkingArithmetic.class': 'Working arithmetic examples'
     };
@@ -392,8 +392,9 @@ async function loadSampleClass() {
             window.aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
         }
         
-        // Clear the selection for next use
-        select.selectedIndex = 0;
+        // Keep the selection so startDebugging knows which class to use
+        // Don't clear the selection - this was causing the issue
+        log(`Class ${selectedClass} loaded and ready for debugging`, 'info');
         
     } catch (error) {
         log(`Failed to load sample class: ${error.message}`, 'error');
@@ -590,20 +591,28 @@ function enhanceWithRealJVM() {
             // Determine which class to start with
             let classToStart = null;
             
-            // First, check if a sample class is selected
-            const sampleSelect = document.getElementById('sampleClassSelect');
-            if (sampleSelect && sampleSelect.value) {
-                classToStart = sampleSelect.value;
+            // First priority: Use the currently loaded class from state
+            if (currentState.loadedClass && currentState.loadedClass.name) {
+                classToStart = currentState.loadedClass.name;
+                log(`Using loaded class from state: ${classToStart}`, 'debug');
             } else {
-                // Use the first available class from loaded classes
-                let availableClasses = [];
-                try {
-                    availableClasses = await jvmDebug.listFiles();
-                } catch (error) {
-                    log('Could not retrieve class list', 'error');
-                }
-                if (availableClasses.length > 0) {
-                    classToStart = availableClasses[0];
+                // Second priority: Check if a sample class is currently selected
+                const sampleSelect = document.getElementById('sampleClassSelect');
+                if (sampleSelect && sampleSelect.value) {
+                    classToStart = sampleSelect.value;
+                    log(`Using selected class from dropdown: ${classToStart}`, 'debug');
+                } else {
+                    // Last resort: Use the first available class from loaded classes
+                    let availableClasses = [];
+                    try {
+                        availableClasses = await jvmDebug.listFiles();
+                    } catch (error) {
+                        log('Could not retrieve class list', 'error');
+                    }
+                    if (availableClasses.length > 0) {
+                        classToStart = availableClasses[0];
+                        log(`Using first available class: ${classToStart}`, 'debug');
+                    }
                 }
             }
             
@@ -634,7 +643,54 @@ function enhanceWithRealJVM() {
                 updateButtons();
             }
         } catch (error) {
-            log(`Failed to start debugging: ${error.message}`, 'error');
+            // Handle classes without main method gracefully
+            if (error.message && error.message.includes('main method not found')) {
+                const className = classToStart ? classToStart.replace('.class', '') : 'unknown';
+                log(`Class ${className} doesn't have a main method and cannot be executed as a standalone program`, 'error');
+                updateStatus(`Cannot debug ${className}: No main method found`, 'error');
+                
+                // Try to find a class with a main method instead
+                let availableClasses = [];
+                try {
+                    availableClasses = await jvmDebug.listFiles();
+                    const classesWithMain = [
+                        'ArithmeticTest.class', 'Calc.class', 'CalcMain.class', 'ConstantsTest.class',
+                        'DivisionTest.class', 'ExceptionTest.class', 'Hello.class', 'InvokeVirtualTest.class',
+                        'MainApp.class', 'RuntimeArithmetic.class', 'SimpleArithmetic.class',
+                        'SimpleStringConcat.class', 'SipushTest.class', 'SmallDivisionTest.class',
+                        'StringBuilderConcat.class', 'StringConcat.class', 'StringConcatMethod.class',
+                        'StringMethodsTest.class', 'TestMethodsRunner.class', 'VerySimple.class',
+                        'WorkingArithmetic.class'
+                    ];
+                    
+                    const fallbackClass = availableClasses.find(cls => classesWithMain.includes(cls));
+                    if (fallbackClass) {
+                        log(`Falling back to ${fallbackClass} which has a main method`, 'info');
+                        const result = await jvmDebug.start(fallbackClass);
+                        updateDebugDisplay();
+                        
+                        if (typeof updateState === 'function') {
+                            updateState({
+                                loadedClass: { name: fallbackClass },
+                                className: fallbackClass.replace('.class', ''),
+                                status: 'paused'
+                            });
+                        }
+                        
+                        updateStatus(`Debugger started with ${fallbackClass.replace('.class', '')} - Real JVM session active`, 'success');
+                        
+                        if (typeof updateButtons === 'function') {
+                            updateButtons();
+                        }
+                        return;
+                    }
+                } catch (fallbackError) {
+                    log(`Fallback also failed: ${fallbackError.message}`, 'error');
+                }
+            } else {
+                log(`Failed to start debugging: ${error.message}`, 'error');
+            }
+            
             if (originalStartDebugging) originalStartDebugging();
         }
     };
