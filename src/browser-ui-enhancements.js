@@ -360,6 +360,32 @@ async function loadSampleClass() {
     }
 }
 
+// Helper function to update disassembly state info outside the editor
+function updateDisassemblyStateInfo(view) {
+    // Find or create disassembly info element
+    let infoElement = document.getElementById('disassembly-info');
+    if (!infoElement) {
+        // Create info element above the editor
+        const disassemblyPanel = document.querySelector('.debugger-panel');
+        if (disassemblyPanel) {
+            infoElement = document.createElement('div');
+            infoElement.id = 'disassembly-info';
+            infoElement.className = 'disassembly-info';
+            disassemblyPanel.insertBefore(infoElement, document.getElementById(DOM_IDS.DISASSEMBLY_EDITOR));
+        }
+    }
+    
+    if (infoElement && view.classFile && view.currentPc !== undefined) {
+        infoElement.innerHTML = `
+            <div class="disassembly-status">
+                <span class="info-label">File:</span> <span class="info-value">${view.classFile}</span>
+                <span class="info-separator">|</span>
+                <span class="info-label">PC:</span> <span class="info-value">${view.currentPc}</span>
+            </div>
+        `;
+    }
+}
+
 // Debug Display Updates
 function updateDebugDisplay() {
     if (!jvmDebug) return;
@@ -367,15 +393,15 @@ function updateDebugDisplay() {
     try {
         const state = jvmDebug.getCurrentState();
         
-        // Update execution state display
+        // Update execution state display with compact formatting
         const statusDiv = document.getElementById(DOM_IDS.EXECUTION_STATE);
         if (statusDiv) {
             statusDiv.innerHTML = `
-                <div><span class="key">Status:</span> <span class="value">${state.executionState}</span></div>
-                <div><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : 'N/A'}</span></div>
-                <div><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div>
-                <div><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div>
-                <div><span class="key">Breakpoints:</span> <span class="value">[${state.breakpoints.join(', ')}]</span></div>
+                <div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div>
+                <div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : 'N/A'}</span></div>
+                <div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div>
+                <div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div>
+                <div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${state.breakpoints.join(', ')}]</span></div>
             `;
         }
         
@@ -398,7 +424,7 @@ function updateDebugDisplay() {
             localsDiv.textContent = localsDisplay;
         }
         
-        // Update disassembly view
+        // Update disassembly view with clean content and external state display
         if (state.executionState === 'paused' || state.executionState === 'running') {
             try {
                 const view = jvmDebug.getDisassemblyView();
@@ -406,13 +432,65 @@ function updateDebugDisplay() {
                 
                 if (view && view.formattedDisassembly) {
                     if (window.aceEditor) {
-                        log('Updating ACE editor with disassembly content', 'debug');
-                        aceEditor.setValue(view.formattedDisassembly, -1);
+                        log('Updating ACE editor with clean disassembly content', 'debug');
                         
-                        // Highlight current line if available
-                        if (view.currentLineNumber !== undefined && view.currentLineNumber >= 0) {
-                            aceEditor.scrollToLine(view.currentLineNumber, true, true);
+                        // Extract clean disassembly without header/footer and line numbers
+                        const lines = view.formattedDisassembly.split('\n');
+                        let cleanLines = [];
+                        let currentExecutionLine = -1;
+                        
+                        // Skip header (8. Disassembly View, ===, File:, Current PC:, empty line)
+                        // And remove footer (===)
+                        let startIndex = 0;
+                        let endIndex = lines.length;
+                        
+                        // Find start (skip header)
+                        for (let i = 0; i < lines.length; i++) {
+                            if (lines[i].startsWith('8. Disassembly View')) {
+                                // Skip past header until we find content lines
+                                startIndex = i + 5; // Skip the 5 header lines
+                                break;
+                            }
                         }
+                        
+                        // Find end (remove footer)
+                        for (let i = lines.length - 1; i >= 0; i--) {
+                            if (lines[i].includes('================')) {
+                                endIndex = i;
+                                break;
+                            }
+                        }
+                        
+                        // Extract content lines and clean them
+                        for (let i = startIndex; i < endIndex; i++) {
+                            const line = lines[i];
+                            if (line.startsWith('=>')) {
+                                // Current execution line - remove marker and line number
+                                currentExecutionLine = cleanLines.length;
+                                cleanLines.push(line.substring(8)); // Remove "=>  123  "
+                            } else if (line.startsWith('  ')) {
+                                // Regular line - remove line number prefix
+                                cleanLines.push(line.substring(8)); // Remove "   123  "
+                            } else {
+                                // Line without prefix (shouldn't happen, but handle gracefully)
+                                cleanLines.push(line);
+                            }
+                        }
+                        
+                        // Set clean content
+                        const cleanContent = cleanLines.join('\n');
+                        aceEditor.setValue(cleanContent, -1);
+                        
+                        // Highlight current execution line using ACE's built-in highlighting
+                        aceEditor.session.clearBreakpoints();
+                        if (currentExecutionLine !== -1) {
+                            aceEditor.session.setBreakpoint(currentExecutionLine, 'ace_execution_line');
+                            aceEditor.scrollToLine(currentExecutionLine + 1, true, true);
+                        }
+                        
+                        // Update external disassembly state info in HTML
+                        updateDisassemblyStateInfo(view);
+                        
                     } else {
                         log('ACE editor not available, falling back to textarea', 'warning');
                         // Fallback to textarea if ACE editor failed
