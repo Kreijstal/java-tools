@@ -35,6 +35,14 @@ const indexPath = path.join(distDir, 'index.html');
 if (fs.existsSync(debugInterfacePath)) {
     let htmlContent = fs.readFileSync(debugInterfacePath, 'utf8');
     
+    // Remove the old, simulated script block to prevent conflicts
+    // Target the specific script block that contains the JVM simulation
+    htmlContent = htmlContent.replace(/\s*<script>\s*\/\/ Real JVM debug controller using embedded jvm\.js[\s\S]*?<\/script>/s, '');
+    
+    // Remove old breakpoint UI elements
+    htmlContent = htmlContent.replace(/\s*<input type="number" id="breakpointInput"[^>]*>\s*/g, '');
+    htmlContent = htmlContent.replace(/\s*<button onclick="setBreakpoint\(\)">Set Breakpoint<\/button>\s*/g, '');
+    
     // Enhance the HTML with real JVM integration
     htmlContent = enhanceDebugInterfaceWithRealJVM(htmlContent);
     
@@ -64,26 +72,76 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
         // Real JVM integration - override mock functions with real implementations
         let jvmDebug = null;
         
+        // Define currentState for UI compatibility
+        let currentState = {
+            status: 'stopped',
+            pc: null,
+            stack: [],
+            locals: [],
+            callDepth: 0,
+            method: null,
+            breakpoints: [],
+            loadedClass: null,
+            className: null
+        };
+        
+        // Define log function for UI compatibility
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString();
+            const output = document.getElementById('output');
+            if (output) {
+                const logEntry = document.createElement('div');
+                logEntry.className = \`log-entry \${type}\`;
+                logEntry.innerHTML = \`[\${timestamp}] \${message}\`;
+                output.appendChild(logEntry);
+                output.scrollTop = output.scrollHeight;
+            }
+            console.log(\`[\${type.toUpperCase()}] \${message}\`);
+        }
+        
+        // Define updateStatus function for UI compatibility
+        function updateStatus(message, type = 'info') {
+            const statusDiv = document.getElementById('status');
+            if (statusDiv) {
+                statusDiv.textContent = message;
+                statusDiv.className = \`status \${type}\`;
+            }
+            log(message, type);
+        }
+        
+        // Define updateState function for UI compatibility
+        function updateState(updates) {
+            Object.assign(currentState, updates);
+            log(\`State updated: \${JSON.stringify(updates)}\`, 'debug');
+        }
+        
         // Initialize real JVM when page loads
         document.addEventListener('DOMContentLoaded', async function() {
             try {
+                log('Starting JVM Debug initialization...', 'info');
+                
                 // Initialize the real JVM debug engine
                 if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
+                    log('JVM Debug bundle found, creating instance...', 'info');
                     jvmDebug = new window.JVMDebug.BrowserJVMDebug();
+                    log('JVM Debug instance created successfully', 'info');
                     
                     try {
                         const response = await fetch('/dist/data.zip');
                         if (response.ok) {
+                            log('Data package fetched successfully', 'info');
                             const buffer = await response.arrayBuffer();
                             const dataPackage = { buffer };
                             await jvmDebug.initialize({ dataPackage });
                             log('Real JVM Debug initialized with sample classes', 'success');
                             populateSampleClasses();
                         } else {
+                            log('Data package fetch failed, initializing without data', 'warning');
                             await jvmDebug.initialize();
                             log('Real JVM Debug initialized (no data package)', 'info');
                         }
                     } catch (err) {
+                        log(\`Data package error: \${err.message}\`, 'warning');
                         await jvmDebug.initialize();
                         log('Real JVM Debug initialized without data package', 'info');
                     }
@@ -92,6 +150,14 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     
                     // Enhance the existing functions with real JVM calls
                     enhanceWithRealJVM();
+                    
+                    // Ensure the Start Debugging button is enabled for basic debugging
+                    // even if sample classes didn't load properly
+                    const debugBtn = document.getElementById('debugBtn');
+                    if (debugBtn && debugBtn.disabled) {
+                        debugBtn.disabled = false;
+                        log('Start Debugging button enabled as fallback', 'info');
+                    }
                 } else {
                     log('JVM Debug bundle not available - using mock implementation', 'info');
                 }
@@ -193,12 +259,35 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 // Override startDebugging to work with real JVM and sample classes
                 window.startDebugging = function() {
                     try {
-                        // If no class is explicitly loaded, try to use the default sample class
+                        // If no class is explicitly loaded, try to auto-load a sample class first
                         if (!currentState.loadedClass) {
-                            log('No class explicitly loaded, starting with default sample class: VerySimple', 'info');
-                            const result = jvmDebug.start('VerySimple');
-                            updateDebugDisplay();
-                            return;
+                            log('No class explicitly loaded, auto-loading sample class: VerySimple', 'info');
+                            
+                            // First, try to select VerySimple in the sample dropdown if it exists
+                            const select = document.getElementById('sampleClassSelect');
+                            if (select) {
+                                const option = Array.from(select.options).find(opt => opt.value === 'VerySimple.class');
+                                if (option) {
+                                    select.value = 'VerySimple.class';
+                                    // Call loadSampleClass to properly load and start debugging
+                                    if (typeof loadSampleClass === 'function') {
+                                        loadSampleClass();
+                                        return;
+                                    }
+                                }
+                            }
+                            
+                            // Fallback: try direct start
+                            try {
+                                const result = jvmDebug.start('VerySimple');
+                                updateStatus('Debugger started', 'success');
+                                updateDebugDisplay();
+                                return;
+                            } catch (error) {
+                                log(\`Failed to start with VerySimple: \${error.message}\`, 'error');
+                                updateStatus('Debug session failed to start', 'error');
+                                return;
+                            }
                         }
                         
                         // Use the original logic for explicitly loaded classes
@@ -208,8 +297,14 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                             // Fallback: start with current state's class name
                             const className = currentState.className || 'VerySimple';
                             log(\`Starting debug session with \${className}...\`, 'info');
-                            const result = jvmDebug.start(className);
-                            updateDebugDisplay();
+                            try {
+                                const result = jvmDebug.start(className);
+                                updateStatus('Debugger started', 'success');
+                                updateDebugDisplay();
+                            } catch (error) {
+                                log(\`Failed to start with \${className}: \${error.message}\`, 'error');
+                                updateStatus('Debug session failed to start', 'error');
+                            }
                         }
                         
                         // Ensure buttons are updated after starting debugging
