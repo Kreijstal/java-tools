@@ -320,10 +320,19 @@ async function loadSampleClass() {
             debugBtn.disabled = false;
         }
         
-        // Update ACE editor to show that class is loaded
+        // Update ACE editor to show actual disassembled bytecode
         if (window.aceEditor) {
-            const className = selectedClass.replace('.class', '');
-            window.aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
+            try {
+                // Get actual disassembly immediately when class is loaded
+                const disassembly = jvmDebug.getClassDisassembly(classData);
+                window.aceEditor.setValue(disassembly, -1);
+                log(`Disassembly loaded for ${selectedClass}`, 'success');
+            } catch (error) {
+                // Fallback to placeholder if disassembly fails
+                const className = selectedClass.replace('.class', '');
+                window.aceEditor.setValue(`// Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start Debugging' to begin execution`, -1);
+                logError('Failed to disassemble class', error);
+            }
         }
         
         // Keep the selection so startDebugging knows which class to use

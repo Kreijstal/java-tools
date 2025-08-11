@@ -8,6 +8,7 @@ const { JVM, Frame } = require('./jvm');
 const DebugController = require('./debugController');
 const BrowserFileProvider = require('./BrowserFileProvider');
 const { setFileProvider } = require('./classLoader');
+const { getDisassembled } = require('jvm_parser');
 
 // Browser-compatible JVM Debug API
 class BrowserJVMDebug {
@@ -239,6 +240,19 @@ class BrowserJVMDebug {
    */
   getFileProvider() {
     return this.fileProvider;
+  }
+
+  /**
+   * Get disassembly of a class without starting debug session
+   * @param {Uint8Array} classData - The binary class file data
+   * @returns {string} - The disassembled bytecode
+   */
+  getClassDisassembly(classData) {
+    try {
+      return getDisassembled(classData);
+    } catch (error) {
+      return `// Error disassembling class: ${error.message}`;
+    }
   }
 
   /**
