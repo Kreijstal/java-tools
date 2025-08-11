@@ -19,61 +19,69 @@ function getValueByPath(obj, path) {
   return result;
 }
 
-function renameMethod(convertedAst, referenceObj, className, oldMethodName, newMethodName) {
+function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, newMethodName) {
   if (!referenceObj[className]) {
-    console.error(`Class ${className} not found in referenceObj`);
-    return;
-  }
-  
-  if (!referenceObj[className].children[oldMethodName]) {
-    console.error(`Method ${oldMethodName} not found in class ${className}`);
-    console.log(`Available methods: ${Object.keys(referenceObj[className].children).join(', ')}`);
-    return;
+    throw new Error(`Class ${className} not found in referenceObj`);
   }
 
-  // Rename the method in the convertedAst
- /* const classObj = convertedAst.classes.find(cls => cls.className === className);
-  if (classObj) {
-    const methodObj = classObj.items.find(item => item.type === "method" && item.method.name === oldMethodName);
-    if (methodObj) {
-      methodObj.method.name = newMethodName;
-    }
+  if (referenceObj[className].children[newMethodName]) {
+    throw new Error(`Method ${newMethodName} already exists in class ${className}`);
   }
-  */
+
+  // TODO: Handle inheritance. This implementation only renames direct references
+  // and does not account for polymorphism.
+
   const methodRef = referenceObj[className].children[oldMethodName];
   if (!methodRef) {
+    throw new Error(`Method ${oldMethodName} not found in class ${className}`);
+  }
+
+  if (!methodRef.referees) {
     console.error(`No referees found for method ${oldMethodName} in class ${className}`);
     return;
   }
-//console.log("These are our referees",  methodRef.referees)
-  methodRef.referees.forEach(refereePath => {
-    var v=getValueByPath(convertedAst,refereePath);
-//    console.log("path",refereePath,v)
-    if("descriptor" in v && "flags" in v){
-      //its a class
-      v.name=newMethodName;
 
-
-    }else if ("instruction" in v){
-      //its an instruction
-      //since we are changing a method it must be a instructon that summons method like invokevirtual or something like that
-//      assert(v.instruction.op) is an invoke instruction
-      v.instruction.arg[2][0]=newMethodName;
-
+  methodRef.referees.forEach(referee => {
+    const ast = workspaceAsts[referee.className];
+    if (!ast) {
+      console.warn(`AST for class ${referee.className} not found.`);
+      return;
     }
-    
+
+    const targetNode = getValueByPath(ast, referee.astPath);
+    if (!targetNode) {
+      console.warn(`Value not found at path ${referee.astPath} in class ${referee.className}`);
+      return;
+    }
+
+    // Case 1: Method definition
+    // The path points to a method object: { name, descriptor, flags, ... }
+    if (targetNode.name === oldMethodName && 'descriptor' in targetNode && 'flags' in targetNode) {
+        targetNode.name = newMethodName;
+    }
+    // Case 2: Method call (instruction)
+    // The path points to a codeItem object: { instruction, ... }
+    else if (targetNode.instruction) {
+      const instruction = targetNode.instruction;
+      if (instruction.op && instruction.op.startsWith('invoke') && instruction.arg && Array.isArray(instruction.arg)) {
+        const targetClass = instruction.arg[1];
+        if (Array.isArray(instruction.arg[2])) {
+            const [methodName, descriptor] = instruction.arg[2];
+            if (targetClass === className && methodName === oldMethodName) {
+              instruction.arg[2][0] = newMethodName;
+            }
+        }
+      }
+    }
   });
 
-  // Rename the method in the reference object
-  referenceObj[className].children[newMethodName] = methodRef;
-  delete referenceObj[className].children[oldMethodName];
+  // Update the reference object to reflect the new method name
+  if (referenceObj[className].children[oldMethodName]) {
+    referenceObj[className].children[newMethodName] = referenceObj[className].children[oldMethodName];
+    delete referenceObj[className].children[oldMethodName];
+  }
 
-
-  // Clear old referees
-  methodRef.referees = [];
-  // console.log(JSON.stringify(referenceObj, null, 1));
   console.log(`Renamed method ${oldMethodName} to ${newMethodName} in class ${className}`);
-
 }
 
 module.exports = { renameMethod };
