@@ -68,7 +68,7 @@ function ensureBuildDependencies() {
 }
 
 const server = http.createServer((req, res) => {
-  let urlPath = req.url === '/' ? '/dist/index.html' : req.url;
+  let urlPath = req.url;
   
   // Remove query parameters
   urlPath = urlPath.split('?')[0];
@@ -81,7 +81,18 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const filePath = path.join(PUBLIC_DIR, normalizedPath);
+  let filePath;
+  if (normalizedPath.startsWith('/examples/')) {
+    // Serve examples from the root directory
+    filePath = path.join(PUBLIC_DIR, normalizedPath);
+  } else {
+    // Serve everything else from dist directory (GitHub Pages behavior)
+    if (normalizedPath === '/') {
+      filePath = path.join(PUBLIC_DIR, 'dist', 'index.html');
+    } else {
+      filePath = path.join(PUBLIC_DIR, 'dist', normalizedPath);
+    }
+  }
   
   fs.stat(filePath, (err, stats) => {
     if (err) {
