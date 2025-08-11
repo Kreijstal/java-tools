@@ -162,6 +162,14 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Get list of breakpoints
+   * @returns {Array} - List of breakpoint PC locations
+   */
+  getBreakpoints() {
+    return this.debugController.getBreakpoints();
+  }
+
+  /**
    * Get current execution state
    * @returns {object} - Current state
    */
