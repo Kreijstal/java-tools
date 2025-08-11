@@ -118,30 +118,26 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
         // Initialize real JVM when page loads
         document.addEventListener('DOMContentLoaded', async function() {
             try {
+                log('JVM Debug API Example loaded', 'info');
                 log('Starting JVM Debug initialization...', 'info');
                 
                 // Initialize the real JVM debug engine
                 if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
-                    log('JVM Debug bundle found, creating instance...', 'info');
                     jvmDebug = new window.JVMDebug.BrowserJVMDebug();
-                    log('JVM Debug instance created successfully', 'info');
                     
                     try {
                         const response = await fetch('/dist/data.zip');
                         if (response.ok) {
-                            log('Data package fetched successfully', 'info');
                             const buffer = await response.arrayBuffer();
                             const dataPackage = { buffer };
                             await jvmDebug.initialize({ dataPackage });
                             log('Real JVM Debug initialized with sample classes', 'success');
                             populateSampleClasses();
                         } else {
-                            log('Data package fetch failed, initializing without data', 'warning');
                             await jvmDebug.initialize();
                             log('Real JVM Debug initialized (no data package)', 'info');
                         }
                     } catch (err) {
-                        log(\`Data package error: \${err.message}\`, 'warning');
                         await jvmDebug.initialize();
                         log('Real JVM Debug initialized without data package', 'info');
                     }
@@ -151,13 +147,8 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                     // Enhance the existing functions with real JVM calls
                     enhanceWithRealJVM();
                     
-                    // Ensure the Start Debugging button is enabled for basic debugging
-                    // even if sample classes didn't load properly
-                    const debugBtn = document.getElementById('debugBtn');
-                    if (debugBtn && debugBtn.disabled) {
-                        debugBtn.disabled = false;
-                        log('Start Debugging button enabled as fallback', 'info');
-                    }
+                    // Initialize ACE editor after JVM is ready
+                    setTimeout(initializeEditor, 100);
                 } else {
                     log('JVM Debug bundle not available - using mock implementation', 'info');
                 }
@@ -259,35 +250,12 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                 // Override startDebugging to work with real JVM and sample classes
                 window.startDebugging = function() {
                     try {
-                        // If no class is explicitly loaded, try to auto-load a sample class first
+                        // If no class is explicitly loaded, try to use the default sample class
                         if (!currentState.loadedClass) {
-                            log('No class explicitly loaded, auto-loading sample class: VerySimple', 'info');
-                            
-                            // First, try to select VerySimple in the sample dropdown if it exists
-                            const select = document.getElementById('sampleClassSelect');
-                            if (select) {
-                                const option = Array.from(select.options).find(opt => opt.value === 'VerySimple.class');
-                                if (option) {
-                                    select.value = 'VerySimple.class';
-                                    // Call loadSampleClass to properly load and start debugging
-                                    if (typeof loadSampleClass === 'function') {
-                                        loadSampleClass();
-                                        return;
-                                    }
-                                }
-                            }
-                            
-                            // Fallback: try direct start
-                            try {
-                                const result = jvmDebug.start('VerySimple');
-                                updateStatus('Debugger started', 'success');
-                                updateDebugDisplay();
-                                return;
-                            } catch (error) {
-                                log(\`Failed to start with VerySimple: \${error.message}\`, 'error');
-                                updateStatus('Debug session failed to start', 'error');
-                                return;
-                            }
+                            log('No class explicitly loaded, starting with default sample class: VerySimple', 'info');
+                            const result = jvmDebug.start('VerySimple');
+                            updateDebugDisplay();
+                            return;
                         }
                         
                         // Use the original logic for explicitly loaded classes
@@ -297,14 +265,8 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                             // Fallback: start with current state's class name
                             const className = currentState.className || 'VerySimple';
                             log(\`Starting debug session with \${className}...\`, 'info');
-                            try {
-                                const result = jvmDebug.start(className);
-                                updateStatus('Debugger started', 'success');
-                                updateDebugDisplay();
-                            } catch (error) {
-                                log(\`Failed to start with \${className}: \${error.message}\`, 'error');
-                                updateStatus('Debug session failed to start', 'error');
-                            }
+                            const result = jvmDebug.start(className);
+                            updateDebugDisplay();
                         }
                         
                         // Ensure buttons are updated after starting debugging
@@ -574,8 +536,161 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
             
             reader.readAsArrayBuffer(file);
         };
+        
+        // Add missing updateButtons function for UI compatibility
+        function updateButtons() {
+            if (!jvmDebug) {
+                // If JVM not initialized, keep debug button enabled but step buttons disabled
+                const debugBtn = document.getElementById('debugBtn');
+                if (debugBtn) debugBtn.disabled = false;
+                
+                const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                stepButtons.forEach(id => {
+                    const btn = document.getElementById(id);
+                    if (btn) btn.disabled = true;
+                });
+                return;
+            }
+            
+            try {
+                const state = jvmDebug.getCurrentState();
+                const isPaused = state.executionState === 'paused';
+                const isRunning = state.executionState === 'running';
+                const hasLoadedClass = currentState.loadedClass !== null || state.method !== null;
+                
+                // Debug button should be enabled when we have a class and not currently debugging
+                const debugBtn = document.getElementById('debugBtn');
+                if (debugBtn) {
+                    debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
+                }
+                
+                // Step buttons should be enabled only when paused
+                const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+                stepButtons.forEach(id => {
+                    const btn = document.getElementById(id);
+                    if (btn) btn.disabled = !isPaused;
+                });
+                
+            } catch (error) {
+                log(\`Error updating buttons: \${error.message}\`, 'error');
+            }
+        }
+        
+        // Add missing initializeEditor function for ACE editor setup
+        let aceEditor = null;
+        function initializeEditor() {
+            try {
+                aceEditor = ace.edit("disassembly-editor");
+                aceEditor.setTheme("ace/theme/monokai");
+                aceEditor.session.setMode("ace/mode/text");
+                aceEditor.setReadOnly(true);
+                aceEditor.renderer.setShowGutter(true);
+                aceEditor.renderer.setPadding(10);
+                aceEditor.setOptions({ 
+                    highlightActiveLine: false, 
+                    highlightGutterLine: false,
+                    fontSize: 12
+                });
+
+                aceEditor.setValue('Load a class to see disassembly...', -1);
+                
+                // Add gutter click handler for breakpoints
+                aceEditor.on("guttermousedown", function(e) {
+                    const target = e.domEvent.target;
+                    if (target.className.indexOf("ace_gutter-cell") == -1) return;
+                    if (!e.editor.isFocused()) return;
+                    if (e.clientX > 25 + target.getBoundingClientRect().left) return;
+
+                    const line = e.getDocumentPosition().row;
+                    if (jvmDebug && typeof jvmDebug.getDisassemblyView === 'function') {
+                        try {
+                            const view = jvmDebug.getDisassemblyView();
+                            if (view && view.lineToPcMap && view.lineToPcMap[line] !== undefined) {
+                                const pc = view.lineToPcMap[line];
+                                const breakpoints = jvmDebug.getBreakpoints();
+                                
+                                if (breakpoints.includes(pc)) {
+                                    jvmDebug.removeBreakpoint(pc);
+                                    aceEditor.session.clearBreakpoint(line);
+                                    log(\`Breakpoint removed at PC \${pc}\`, 'info');
+                                } else {
+                                    jvmDebug.setBreakpoint(pc);
+                                    aceEditor.session.setBreakpoint(line, "ace_breakpoint");
+                                    log(\`Breakpoint set at PC \${pc}\`, 'info');
+                                }
+                                updateDebugDisplay();
+                            }
+                        } catch (error) {
+                            log(\`Error toggling breakpoint: \${error.message}\`, 'error');
+                        }
+                    }
+                    e.stop();
+                });
+                
+            } catch (e) {
+                log(\`ACE editor failed to load: \${e.message}\`, 'warning');
+                // Fallback if Ace editor fails to load
+                const editorDiv = document.getElementById('disassembly-editor');
+                if (editorDiv) {
+                    editorDiv.innerHTML = 
+                        '<textarea readonly style="width: 100%; height: 300px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #3e3e42;">Load a class to see disassembly...</textarea>';
+                }
+            }
+        }
+        
+        // Add setBreakpoint function for test compatibility
+        function setBreakpoint() {
+            const input = document.getElementById('breakpointInput');
+            const pc = parseInt(input.value);
+            
+            if (!jvmDebug) {
+                log('JVM Debug not initialized', 'error');
+                return;
+            }
+            
+            if (isNaN(pc) || pc < 0) {
+                log('Please enter a valid program counter (PC) value', 'error');
+                return;
+            }
+            
+            try {
+                jvmDebug.setBreakpoint(pc);
+                log(\`Breakpoint set at PC \${pc}\`, 'success');
+                input.value = '';
+                updateDebugDisplay();
+            } catch (error) {
+                log(\`Failed to set breakpoint: \${error.message}\`, 'error');
+            }
+        }
+        
+        // Add clearAllBreakpoints function implementation
+        function clearAllBreakpoints() {
+            if (!jvmDebug) {
+                log('JVM Debug not initialized', 'error');
+                return;
+            }
+            
+            try {
+                jvmDebug.clearBreakpoints();
+                log('All breakpoints cleared', 'success');
+                
+                // Clear visual breakpoints from editor
+                if (aceEditor && aceEditor.session) {
+                    aceEditor.session.clearBreakpoints();
+                }
+                
+                updateDebugDisplay();
+            } catch (error) {
+                log(\`Failed to clear breakpoints: \${error.message}\`, 'error');
+            }
+        }
     </script>
     `;
+    
+    // Add breakpoint input UI for test compatibility (add after clear breakpoints button)
+    const clearBreakpointsPattern = /(<button onclick="clearAllBreakpoints\(\)">Clear All Breakpoints<\/button>)/;
+    htmlContent = htmlContent.replace(clearBreakpointsPattern, 
+        '<input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" title="Program Counter for breakpoint">\n            <button onclick="setBreakpoint()">Set Breakpoint</button>\n            $1');
     
     // Add the missing stepInstruction button to the debug controls
     const debugControlsPattern = /(<button onclick="finish\(\)" id="finishBtn"[^>]*>⏩<\/button>)/;
