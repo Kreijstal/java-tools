@@ -39,10 +39,10 @@ function removeOldSimulatedScript(htmlContent) {
  * Fix ACE editor CDN to use local copy
  */
 function fixAceEditorCDN(htmlContent) {
-    // Replace CDN link with local copy
+    // Replace CDN link with local copy and preload theme to prevent dynamic loading issues
     return htmlContent.replace(
         /<script src="https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/ace\/[^"]*\/ace\.js"><\/script>/,
-        '<script src="./lib/ace.js"></script>'
+        '<script src="./lib/ace.js"></script>\n    <script src="./lib/theme-monokai.js"></script>'
     );
 }
 

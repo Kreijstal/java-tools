@@ -8,6 +8,7 @@ const { JVM, Frame } = require('./jvm');
 const DebugController = require('./debugController');
 const BrowserFileProvider = require('./BrowserFileProvider');
 const { setFileProvider } = require('./classLoader');
+// const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
 // Browser-compatible JVM Debug API
 class BrowserJVMDebug {
@@ -239,6 +240,42 @@ class BrowserJVMDebug {
    */
   getFileProvider() {
     return this.fileProvider;
+  }
+
+  /**
+   * Set a callback function to capture println output for web UI
+   * @param {function} callback - Function to call with println output
+   */
+  setOutputCallback(callback) {
+    if (this.debugController && this.debugController.jvm) {
+      this.debugController.jvm.setOutputCallback(callback);
+    }
+  }
+
+  /**
+   * Get disassembly of a class without starting debug session
+   * @param {Uint8Array} classData - The binary class file data
+   * @returns {string} - The disassembled bytecode
+   */
+  getClassDisassembly(classData) {
+    try {
+      // Use the same krak2 format as debugging for consistency
+      const { getAST } = require('jvm_parser');
+      const { convertJson, unparseDataStructures } = require('./convert_tree');
+      
+      // Parse class data to AST
+      const ast = getAST(classData);
+      
+      // Convert AST to structured format
+      const convertedAst = convertJson(ast.ast, ast.constantPool);
+      
+      // Generate krak2 format disassembly
+      const disassembly = unparseDataStructures(convertedAst.classes[0]);
+      
+      return disassembly;
+    } catch (error) {
+      return `// Error disassembling class: ${error.message}`;
+    }
   }
 
   /**
