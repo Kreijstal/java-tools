@@ -77,7 +77,10 @@ function updateStatus(message, type = 'info') {
 
 function updateState(updates) {
     Object.assign(currentState, updates);
-    log(`State updated: ${JSON.stringify(updates)}`, 'debug');
+    // Reduced verbosity: Only log important state changes, not all debug updates
+    if (updates.status && (updates.status === 'paused' || updates.status === 'stopped' || updates.status === 'ready')) {
+        log(`State: ${updates.status}`, 'debug');
+    }
 }
 
 function updateButtons() {
@@ -115,7 +118,7 @@ function updateButtons() {
         if (btn) btn.disabled = !isPaused;
     });
     
-    log(`Debug buttons ${isPaused ? 'enabled' : 'disabled'} (state: ${state.executionState})`, 'debug');
+    log(`Debug buttons ${isPaused ? 'enabled' : 'disabled'}`, 'debug');
 }
 
 
@@ -408,19 +411,48 @@ function updateDebugDisplay() {
         // Update stack display
         const stackDiv = document.getElementById(DOM_IDS.STACK_DISPLAY);
         if (stackDiv) {
-            const stackDisplay = state.stack.map((value, index) => 
-                `${index}: ${typeof value === 'string' ? '"${value}"' : value}`
-            ).join('\n') || 'Empty';
+            const stackDisplay = state.stack.map((value, index) => {
+                let displayValue;
+                if (value === null || value === undefined) {
+                    displayValue = 'null';
+                } else if (typeof value === 'string') {
+                    displayValue = `"${value}"`;
+                } else if (typeof value === 'object') {
+                    // Handle objects properly instead of showing [object Object]
+                    try {
+                        displayValue = JSON.stringify(value);
+                    } catch (e) {
+                        displayValue = value.toString();
+                    }
+                } else {
+                    displayValue = value.toString();
+                }
+                return `${index}: ${displayValue}`;
+            }).join('\n') || 'Empty';
             stackDiv.textContent = stackDisplay;
         }
         
         // Update locals display
         const localsDiv = document.getElementById(DOM_IDS.LOCALS_DISPLAY);
         if (localsDiv) {
-            const localsDisplay = state.locals.map((value, index) => 
-                `local_${index}: ${value !== undefined && value !== null ? 
-                    (typeof value === 'string' ? '"${value}"' : value) : 'undefined'}`
-            ).join('\n') || 'No locals';
+            const localsDisplay = state.locals.map((value, index) => {
+                let displayValue;
+                if (value === null || value === undefined) {
+                    displayValue = 'undefined';
+                } else if (typeof value === 'string') {
+                    displayValue = `"${value}"`;
+                } else if (typeof value === 'object') {
+                    // Handle objects properly instead of showing [object Object]
+                    try {
+                        displayValue = JSON.stringify(value);
+                    } catch (e) {
+                        displayValue = value.toString();
+                    }
+                } else {
+                    displayValue = value.toString();
+                }
+                return `local_${index}: ${displayValue}`;
+            }).join('\n') || 'No locals';
             localsDiv.textContent = localsDisplay;
         }
         
@@ -428,11 +460,11 @@ function updateDebugDisplay() {
         if (state.executionState === 'paused' || state.executionState === 'running') {
             try {
                 const view = jvmDebug.getDisassemblyView();
-                log(`Got disassembly view: ${!!view}`, 'debug');
+                log(`Got disassembly view`, 'debug');
                 
                 if (view && view.formattedDisassembly) {
                     if (window.aceEditor) {
-                        log('Updating ACE editor with clean disassembly content', 'debug');
+                        log('Updating disassembly content', 'debug');
                         
                         // Extract clean disassembly without header/footer and line numbers
                         const lines = view.formattedDisassembly.split('\n');
@@ -521,7 +553,7 @@ function updateDebugDisplay() {
 // ACE Editor Initialization
 function initializeEditor() {
     try {
-        log('Initializing ACE editor...', 'debug');
+        log('ACE editor initialized', 'debug');
         
         // Ensure editor container exists and has proper height
         const editorContainer = document.getElementById(DOM_IDS.DISASSEMBLY_EDITOR);
@@ -632,19 +664,19 @@ function enhanceWithRealJVM() {
             // First priority: Use the currently loaded class from state
             if (currentState.loadedClass && currentState.loadedClass.name) {
                 classToStart = currentState.loadedClass.name;
-                log(`Using loaded class from state: ${classToStart}`, 'debug');
+                log(`Using loaded class: ${classToStart}`, 'debug');
             } else {
                 // Second priority: Check if a sample class is currently selected
                 const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
                 if (sampleSelect && sampleSelect.value) {
                     classToStart = sampleSelect.value;
-                    log(`Using selected class from dropdown: ${classToStart}`, 'debug');
+                    log(`Using selected class: ${classToStart}`, 'debug');
                 } else {
                     // Last resort: Use the first available class from loaded classes
                     const availableClasses = await jvmDebug.listFiles();
                     if (availableClasses.length > 0) {
                         classToStart = availableClasses[0];
-                        log(`Using first available class: ${classToStart}`, 'debug');
+                        log(`Using available class: ${classToStart}`, 'debug');
                     }
                 }
             }

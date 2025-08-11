@@ -259,6 +259,8 @@ class BrowserJVMDebug {
    */
   getClassDisassembly(classData) {
     try {
+      // For now, fall back to getDisassembled to ensure it works
+      // TODO: Later implement krak2 format consistency
       return getDisassembled(classData);
     } catch (error) {
       return `// Error disassembling class: ${error.message}`;
