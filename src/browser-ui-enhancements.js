@@ -102,37 +102,7 @@ function updateButtons() {
     }
 }
 
-// Class Descriptions
-function getClassDescription(className) {
-    const descriptions = {
-        'VerySimple.class': 'Basic arithmetic (3-2=1)',
-        'Hello.class': 'Hello World program',  
-        'Calculator.class': 'Calculator operations',
-        'Calc.class': 'Simple calculation demo',
-        'CalcMain.class': 'Main calculation entry point',
-        'RuntimeArithmetic.class': 'Runtime arithmetic operations',
-        'ArithmeticTest.class': 'Arithmetic operation tests',
-        'ConstantsTest.class': 'Constant loading tests',
-        'DivisionTest.class': 'Division operation tests',
-        'SmallDivisionTest.class': 'Small division tests',
-        'WorkingArithmetic.class': 'Working arithmetic examples',
-        'SimpleArithmetic.class': 'Simple arithmetic operations',
-        'StringConcat.class': 'String concatenation',
-        'SimpleStringConcat.class': 'Simple string concatenation',
-        'StringBuilderConcat.class': 'StringBuilder concatenation',
-        'StringConcatMethod.class': 'String concatenation methods',
-        'StringMethodsTest.class': 'String method tests',
-        'TestMethods.class': 'Method testing examples',
-        'TestMethodsRunner.class': 'Test method runner',
-        'ExceptionTest.class': 'Exception handling tests',
-        'InvokeVirtualTest.class': 'Virtual method invocation tests',
-        'MainApp.class': 'Main application entry point',
-        'SipushTest.class': 'Short integer push tests',
-        'Thing.class': 'Generic object example',
-        'ThingProducer.class': 'Object factory example'
-    };
-    return descriptions[className] || 'Java class file';
-}
+
 
 // JVM Integration Functions
 function setupStateFileInput() {
@@ -250,42 +220,29 @@ async function initializeJVM() {
 }
 
 async function populateSampleClasses() {
-    const controls = document.querySelector('.controls');
-    if (controls && jvmDebug) {
+    const sampleSelect = document.getElementById('sampleClassSelect');
+    if (sampleSelect && jvmDebug) {
         try {
             // Get available classes from the JVM debug instance
-            let availableClasses = [];
-            try {
-                availableClasses = jvmDebug ? await jvmDebug.listFiles() : [];
-            } catch (error) {
-                log('Could not retrieve class list, using default classes', 'info');
-                availableClasses = [];
+            const availableClasses = await jvmDebug.listFiles();
+            log(`Found ${availableClasses.length} classes in data.zip`, 'info');
+            
+            // Clear existing options except the first one
+            sampleSelect.innerHTML = '<option value="">Select a sample class...</option>';
+            
+            // Add all classes to the dropdown
+            availableClasses.forEach(cls => {
+                const option = document.createElement('option');
+                option.value = cls;
+                option.textContent = cls.replace('.class', '');
+                sampleSelect.appendChild(option);
+            });
+            
+            // Update the heading to show the count
+            const samplesHeading = document.querySelector('h4');
+            if (samplesHeading && samplesHeading.textContent.includes('Sample Classes')) {
+                samplesHeading.textContent = `📚 Sample Classes (${availableClasses.length} available) - or upload your own .class/.jar files`;
             }
-            
-            const classes = availableClasses.length > 0 ? 
-                availableClasses.map(cls => ({
-                    filename: cls,
-                    name: cls.replace('.class', ''),
-                    description: getClassDescription(cls)
-                })) :
-                [
-                    { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
-                    { filename: 'Hello.class', name: 'Hello', description: 'Hello World program' },
-                    { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' }
-                ];
-            
-            const samplesDiv = document.createElement('div');
-            samplesDiv.innerHTML = `
-                <h4>📚 Sample Classes (${classes.length} available) - or upload your own .class/.jar files</h4>
-                <select id="sampleClassSelect">
-                    <option value="">Select a sample class...</option>
-                    ${classes.map(cls => 
-                        `<option value="${cls.filename}">${cls.name} - ${cls.description}</option>`
-                    ).join('')}
-                </select>
-                <button onclick="loadSampleClass()">Load Sample</button>
-            `;
-            controls.appendChild(samplesDiv);
             
             // Enable the Start Debugging button now that sample classes are available
             const debugBtn = document.getElementById('debugBtn');
@@ -294,17 +251,9 @@ async function populateSampleClasses() {
                 log('Start Debugging button enabled - sample classes ready', 'info');
             }
             
-            // Also update the state to indicate we have classes available
-            if (typeof updateState === 'function') {
-                const firstClass = classes.length > 0 ? classes[0] : null;
-                updateState({
-                    loadedClass: true,
-                    className: firstClass ? firstClass.name : null,
-                    status: 'ready'
-                });
-            }
         } catch (error) {
             log(`Failed to populate sample classes: ${error.message}`, 'error');
+            throw error; // Don't hide the error with fallbacks
         }
     }
 }
@@ -314,38 +263,56 @@ async function loadSampleClass() {
     const select = document.getElementById('sampleClassSelect');
     const selectedClass = select.value;
     
-    if (!selectedClass || !jvmDebug) {
-        log('Please select a sample class and ensure JVM is initialized', 'error');
+    if (!selectedClass) {
+        log('Please select a sample class', 'error');
         return;
+    }
+    
+    if (!jvmDebug) {
+        throw new Error('JVM not initialized - cannot load class');
     }
     
     try {
         log(`Loading sample class: ${selectedClass}`, 'info');
         
-        const result = await jvmDebug.start(selectedClass);
-        log(`Debug session started for ${selectedClass}`, 'success');
-        updateDebugDisplay();
+        // Get the class data from the JVM's loaded files
+        const classData = await jvmDebug.fileProvider.readFile(selectedClass);
+        if (!classData) {
+            throw new Error(`Class file ${selectedClass} not found in loaded data`);
+        }
         
-        // Update the current state to enable debug buttons
+        log(`Successfully loaded ${selectedClass} (${classData.length} bytes)`, 'success');
+        updateStatus(`Sample class loaded: ${selectedClass.replace('.class', '')}`, 'success');
+        
+        // Update the current state to enable debug buttons (but don't start debugging yet)
         if (typeof updateState === 'function') {
             updateState({
-                loadedClass: { name: selectedClass },
+                loadedClass: { name: selectedClass, data: classData },
                 className: selectedClass.replace('.class', ''),
-                status: 'paused'
+                status: 'ready'  // Ready for debugging, not paused
             });
         }
         
-        if (typeof updateStatus === 'function') {
-            updateStatus('Debugger started - Real JVM session active', 'success');
+        // Enable debug button
+        const debugBtn = document.getElementById('debugBtn');
+        if (debugBtn) {
+            debugBtn.disabled = false;
         }
         
-        // Update debug display to show disassembly
-        if (typeof updateDebugDisplay === 'function') {
-            updateDebugDisplay();
+        // Update ACE editor to show that class is loaded
+        if (window.aceEditor) {
+            const className = selectedClass.replace('.class', '');
+            window.aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
         }
+        
+        // Keep the selection so startDebugging knows which class to use
+        // Don't clear the selection - this was causing the issue
+        log(`Class ${selectedClass} loaded and ready for debugging`, 'info');
         
     } catch (error) {
-        log(`Failed to start debugging ${selectedClass}: ${error.message}`, 'error');
+        log(`Failed to load sample class: ${error.message}`, 'error');
+        updateStatus('Failed to load sample class', 'error');
+        throw error; // Don't hide errors with fallbacks
     }
 }
 
@@ -538,20 +505,28 @@ function enhanceWithRealJVM() {
             // Determine which class to start with
             let classToStart = null;
             
-            // First, check if a sample class is selected
-            const sampleSelect = document.getElementById('sampleClassSelect');
-            if (sampleSelect && sampleSelect.value) {
-                classToStart = sampleSelect.value;
+            // First priority: Use the currently loaded class from state
+            if (currentState.loadedClass && currentState.loadedClass.name) {
+                classToStart = currentState.loadedClass.name;
+                log(`Using loaded class from state: ${classToStart}`, 'debug');
             } else {
-                // Use the first available class from loaded classes
-                let availableClasses = [];
-                try {
-                    availableClasses = await jvmDebug.listFiles();
-                } catch (error) {
-                    log('Could not retrieve class list', 'error');
-                }
-                if (availableClasses.length > 0) {
-                    classToStart = availableClasses[0];
+                // Second priority: Check if a sample class is currently selected
+                const sampleSelect = document.getElementById('sampleClassSelect');
+                if (sampleSelect && sampleSelect.value) {
+                    classToStart = sampleSelect.value;
+                    log(`Using selected class from dropdown: ${classToStart}`, 'debug');
+                } else {
+                    // Last resort: Use the first available class from loaded classes
+                    let availableClasses = [];
+                    try {
+                        availableClasses = await jvmDebug.listFiles();
+                    } catch (error) {
+                        log('Could not retrieve class list', 'error');
+                    }
+                    if (availableClasses.length > 0) {
+                        classToStart = availableClasses[0];
+                        log(`Using first available class: ${classToStart}`, 'debug');
+                    }
                 }
             }
             
@@ -582,8 +557,13 @@ function enhanceWithRealJVM() {
                 updateButtons();
             }
         } catch (error) {
-            log(`Failed to start debugging: ${error.message}`, 'error');
-            if (originalStartDebugging) originalStartDebugging();
+            // Handle classes without main method by throwing an error
+            if (error.message && error.message.includes('main method not found')) {
+                const className = classToStart ? classToStart.replace('.class', '') : 'unknown';
+                throw new Error(`Class ${className} doesn't have a main method and cannot be executed as a standalone program`);
+            } else {
+                throw error;
+            }
         }
     };
     
