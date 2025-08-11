@@ -129,9 +129,11 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                         const response = await fetch('/dist/data.zip');
                         if (response.ok) {
                             const buffer = await response.arrayBuffer();
-                            const dataPackage = { buffer };
-                            await jvmDebug.initialize({ dataPackage });
-                            log('Real JVM Debug initialized with sample classes', 'success');
+                            const uint8Array = new Uint8Array(buffer);
+                            
+                            // Load as JAR archive since data.zip is essentially a zip file
+                            const extractedFiles = await jvmDebug.fileProvider.loadJarArchive(uint8Array, 'data.zip');
+                            log(\`Real JVM Debug initialized with \${extractedFiles.length} sample classes\`, 'success');
                             populateSampleClasses();
                         } else {
                             await jvmDebug.initialize();
