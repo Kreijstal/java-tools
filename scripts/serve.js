@@ -46,7 +46,7 @@ function serveFile(res, filePath) {
 }
 
 const server = http.createServer((req, res) => {
-  let urlPath = req.url === '/' ? '/examples/debug-web-interface.html' : req.url;
+  let urlPath = req.url === '/' ? '/dist/index.html' : req.url;
   
   // Remove query parameters
   urlPath = urlPath.split('?')[0];
@@ -79,7 +79,8 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
-  console.log(`Debug interface available at http://localhost:${PORT}/examples/debug-web-interface.html`);
+  console.log(`Debug interface available at http://localhost:${PORT}/ (built version with sample classes)`);
+  console.log(`Raw template available at http://localhost:${PORT}/examples/debug-web-interface.html (no sample classes)`);
 });
 
 // Graceful shutdown

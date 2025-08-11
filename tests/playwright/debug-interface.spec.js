@@ -3,7 +3,7 @@ const { test, expect } = require('@playwright/test');
 test.describe('JVM Debug Browser Interface', () => {
   test.beforeEach(async ({ page }) => {
     // Navigate to the debug interface with timeout
-    await page.goto('/', { timeout: 10000 });
+    await page.goto('/dist/index.html', { timeout: 10000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 });
   });
 

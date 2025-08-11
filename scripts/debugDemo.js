@@ -16,7 +16,7 @@ async function demonstrateDebugAPI() {
   try {
     // 1. Start debugging a simple program
     console.log('1. Starting debug session with VerySimple.class...');
-    const startResult = controller.start('sources/VerySimple.class');
+    const startResult = await controller.start('sources/VerySimple.class');
     console.log(`   Status: ${startResult.status}`);
     console.log(`   Initial PC: ${startResult.state.pc}`);
     console.log('');
