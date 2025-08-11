@@ -118,7 +118,8 @@ function updateButtons() {
         if (btn) btn.disabled = !isPaused;
     });
     
-    log(`Debug buttons ${isPaused ? 'enabled' : 'disabled'}`, 'debug');
+    // Reduced verbosity: Only log button state changes in verbose mode
+    // log(`Debug buttons ${isPaused ? 'enabled' : 'disabled'}`, 'debug');
 }
 
 
@@ -396,16 +397,10 @@ function updateDebugDisplay() {
     try {
         const state = jvmDebug.getCurrentState();
         
-        // Update execution state display with compact formatting
+        // Update execution state display with compact formatting - reduced whitespace
         const statusDiv = document.getElementById(DOM_IDS.EXECUTION_STATE);
         if (statusDiv) {
-            statusDiv.innerHTML = `
-                <div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div>
-                <div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : 'N/A'}</span></div>
-                <div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div>
-                <div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div>
-                <div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${state.breakpoints.join(', ')}]</span></div>
-            `;
+            statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : ''}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div>`;
         }
         
         // Update stack display
@@ -460,11 +455,13 @@ function updateDebugDisplay() {
         if (state.executionState === 'paused' || state.executionState === 'running') {
             try {
                 const view = jvmDebug.getDisassemblyView();
-                log(`Got disassembly view`, 'debug');
+                // Reduced verbosity: Only log in verbose mode  
+                // log(`Got disassembly view`, 'debug');
                 
                 if (view && view.formattedDisassembly) {
                     if (window.aceEditor) {
-                        log('Updating disassembly content', 'debug');
+                        // Reduced verbosity: Only log in verbose mode
+                        // log('Updating disassembly content', 'debug');
                         
                         // Extract clean disassembly without header/footer and line numbers
                         const lines = view.formattedDisassembly.split('\n');
@@ -553,7 +550,8 @@ function updateDebugDisplay() {
 // ACE Editor Initialization
 function initializeEditor() {
     try {
-        log('ACE editor initialized', 'debug');
+        // Reduced verbosity: Only log ACE editor init in verbose mode
+        // log('ACE editor initialized', 'debug');
         
         // Ensure editor container exists and has proper height
         const editorContainer = document.getElementById(DOM_IDS.DISASSEMBLY_EDITOR);
@@ -594,14 +592,8 @@ function initializeEditor() {
         
         log('ACE editor initialized successfully', 'success');
         
-        // Add gutter click handler for breakpoints
-        aceEditor.on("guttermousedown", function(e) {
-            const target = e.domEvent.target;
-            if (target.className.indexOf("ace_gutter-cell") == -1) return;
-            if (!e.editor.isFocused()) return;
-            if (e.clientX > 25 + target.getBoundingClientRect().left) return;
-
-            const line = e.getDocumentPosition().row;
+        // Add gutter click handler for breakpoints (single click and double click support)
+        function toggleBreakpointAtLine(line) {
             if (jvmDebug && typeof jvmDebug.getDisassemblyView === 'function') {
                 try {
                     const view = jvmDebug.getDisassemblyView();
@@ -624,6 +616,28 @@ function initializeEditor() {
                     logError('Error toggling breakpoint', error);
                 }
             }
+        }
+
+        aceEditor.on("guttermousedown", function(e) {
+            const target = e.domEvent.target;
+            if (target.className.indexOf("ace_gutter-cell") == -1) return;
+            if (!e.editor.isFocused()) return;
+            if (e.clientX > 25 + target.getBoundingClientRect().left) return;
+
+            const line = e.getDocumentPosition().row;
+            toggleBreakpointAtLine(line);
+            e.stop();
+        });
+
+        // Also support double-click for breakpoint setting
+        aceEditor.on("gutterdblclick", function(e) {
+            const target = e.domEvent.target;
+            if (target.className.indexOf("ace_gutter-cell") == -1) return;
+            if (!e.editor.isFocused()) return;
+            if (e.clientX > 25 + target.getBoundingClientRect().left) return;
+
+            const line = e.getDocumentPosition().row;
+            toggleBreakpointAtLine(line);
             e.stop();
         });
         
@@ -646,7 +660,8 @@ function executeDebugOperation(operation, operationName, successMessage) {
     }
     
     const result = operation();
-    log(successMessage, 'info');
+    // Reduced verbosity: Only log step completion in verbose mode
+    // log(successMessage, 'info');
     updateDebugDisplay();
     return result;
 }
@@ -664,19 +679,22 @@ function enhanceWithRealJVM() {
             // First priority: Use the currently loaded class from state
             if (currentState.loadedClass && currentState.loadedClass.name) {
                 classToStart = currentState.loadedClass.name;
-                log(`Using loaded class: ${classToStart}`, 'debug');
+                // Reduced verbosity: Only log in verbose mode
+                // log(`Using loaded class: ${classToStart}`, 'debug');
             } else {
                 // Second priority: Check if a sample class is currently selected
                 const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
                 if (sampleSelect && sampleSelect.value) {
                     classToStart = sampleSelect.value;
-                    log(`Using selected class: ${classToStart}`, 'debug');
+                    // Reduced verbosity: Only log in verbose mode
+                    // log(`Using selected class: ${classToStart}`, 'debug');
                 } else {
                     // Last resort: Use the first available class from loaded classes
                     const availableClasses = await jvmDebug.listFiles();
                     if (availableClasses.length > 0) {
                         classToStart = availableClasses[0];
-                        log(`Using available class: ${classToStart}`, 'debug');
+                        // Reduced verbosity: Only log in verbose mode
+                        // log(`Using available class: ${classToStart}`, 'debug');
                     }
                 }
             }
@@ -730,7 +748,8 @@ function enhanceWithRealJVM() {
             throw new Error('JVM not initialized - cannot continue');
         }
         const result = jvmDebug.continue();
-        log('Continue completed', 'info');
+        // Reduced verbosity: Only log in verbose mode
+        // log('Continue completed', 'info');
         updateDebugDisplay();
         
         // Update status based on result
