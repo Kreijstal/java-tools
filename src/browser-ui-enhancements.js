@@ -5,6 +5,31 @@
  * Previously this was hardcoded as a massive string injection in buildSite.js.
  */
 
+// Constants for commonly used DOM element IDs
+const DOM_IDS = {
+    DEBUG_BTN: 'debugBtn',
+    SAMPLE_CLASS_SELECT: 'sampleClassSelect',
+    DISASSEMBLY_EDITOR: 'disassembly-editor',
+    STATE_FILE_INPUT: 'stateFileInput',
+    OUTPUT: 'output',
+    STATUS: 'status',
+    STACK_DISPLAY: 'stackDisplay',
+    LOCALS_DISPLAY: 'localsDisplay',
+    EXECUTION_STATE: 'executionState',
+    CLASS_FILE_INPUT: 'classFileInput',
+    BREAKPOINT_INPUT: 'breakpointInput'
+};
+
+// Constants for step button IDs
+const STEP_BUTTON_IDS = [
+    'stepIntoBtn', 
+    'stepOverBtn', 
+    'stepOutBtn', 
+    'stepInstructionBtn', 
+    'continueBtn', 
+    'finishBtn'
+];
+
 // Global state for UI compatibility
 let jvmDebug = null;
 let currentState = {
@@ -25,7 +50,7 @@ let aceEditor = null;
 // Utility Functions
 function log(message, type = 'info') {
     const timestamp = new Date().toLocaleTimeString();
-    const output = document.getElementById('output');
+    const output = document.getElementById(DOM_IDS.OUTPUT);
     if (output) {
         const logEntry = document.createElement('div');
         logEntry.className = `log-entry ${type}`;
@@ -36,8 +61,13 @@ function log(message, type = 'info') {
     console.log(`[${type.toUpperCase()}] ${message}`);
 }
 
+// Helper function to log errors consistently
+function logError(message, error) {
+    log(`${message}: ${error.message}`, 'error');
+}
+
 function updateStatus(message, type = 'info') {
-    const statusDiv = document.getElementById('status');
+    const statusDiv = document.getElementById(DOM_IDS.STATUS);
     if (statusDiv) {
         statusDiv.textContent = message;
         statusDiv.className = `status ${type}`;
@@ -53,11 +83,10 @@ function updateState(updates) {
 function updateButtons() {
     if (!jvmDebug) {
         // If JVM not initialized, keep debug button enabled but step buttons disabled
-        const debugBtn = document.getElementById('debugBtn');
+        const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
         if (debugBtn) debugBtn.disabled = false;
         
-        const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-        stepButtons.forEach(id => {
+        STEP_BUTTON_IDS.forEach(id => {
             const btn = document.getElementById(id);
             if (btn) btn.disabled = true;
         });
@@ -75,14 +104,13 @@ function updateButtons() {
     const hasLoadedClass = currentState.loadedClass !== null || state.method !== null;
     
     // Debug button should be enabled when we have a class and not currently debugging
-    const debugBtn = document.getElementById('debugBtn');
+    const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
     if (debugBtn) {
         debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
     }
     
     // Step buttons should be enabled only when paused
-    const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-    stepButtons.forEach(id => {
+    STEP_BUTTON_IDS.forEach(id => {
         const btn = document.getElementById(id);
         if (btn) btn.disabled = !isPaused;
     });
@@ -95,7 +123,7 @@ function updateButtons() {
 // JVM Integration Functions
 function setupStateFileInput() {
     // Set up state file input handler
-    const stateFileInput = document.getElementById('stateFileInput');
+    const stateFileInput = document.getElementById(DOM_IDS.STATE_FILE_INPUT);
     if (stateFileInput) {
         stateFileInput.addEventListener('change', function(e) {
             const file = e.target.files[0];
@@ -120,7 +148,7 @@ function setupStateFileInput() {
                         throw new Error('JVM not initialized - cannot restore state');
                     }
                 } catch (error) {
-                    log(`Failed to restore state: ${error.message}`, 'error');
+                    logError('Failed to restore state', error);
                     updateStatus('Failed to restore state', 'error');
                 }
             };
@@ -185,7 +213,7 @@ async function initializeJVM() {
         log('Click "Start Debugging" to begin', 'info');
         
     } catch (error) {
-        log(`Failed to initialize real JVM: ${error.message}`, 'error');
+        logError('Failed to initialize real JVM', error);
     }
 }
 
@@ -215,7 +243,7 @@ async function getDataZipUrl() {
 }
 
 async function populateSampleClasses() {
-    const sampleSelect = document.getElementById('sampleClassSelect');
+    const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
     if (sampleSelect && jvmDebug) {
         try {
             // Get available classes from the JVM debug instance
@@ -240,14 +268,14 @@ async function populateSampleClasses() {
             }
             
             // Enable the Start Debugging button now that sample classes are available
-            const debugBtn = document.getElementById('debugBtn');
+            const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
             if (debugBtn) {
                 debugBtn.disabled = false;
                 log('Start Debugging button enabled - sample classes ready', 'info');
             }
             
         } catch (error) {
-            log(`Failed to populate sample classes: ${error.message}`, 'error');
+            logError('Failed to populate sample classes', error);
             throw error; // Don't hide the error with fallbacks
         }
     }
@@ -255,7 +283,7 @@ async function populateSampleClasses() {
 
 // Sample Class Loading
 async function loadSampleClass() {
-    const select = document.getElementById('sampleClassSelect');
+    const select = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
     const selectedClass = select.value;
     
     if (!selectedClass) {
@@ -287,7 +315,7 @@ async function loadSampleClass() {
         });
         
         // Enable debug button
-        const debugBtn = document.getElementById('debugBtn');
+        const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
         if (debugBtn) {
             debugBtn.disabled = false;
         }
@@ -303,7 +331,7 @@ async function loadSampleClass() {
         log(`Class ${selectedClass} loaded and ready for debugging`, 'info');
         
     } catch (error) {
-        log(`Failed to load sample class: ${error.message}`, 'error');
+        logError('Failed to load sample class', error);
         updateStatus('Failed to load sample class', 'error');
         throw error; // Don't hide errors with fallbacks
     }
@@ -317,7 +345,7 @@ function updateDebugDisplay() {
         const state = jvmDebug.getCurrentState();
         
         // Update execution state display
-        const statusDiv = document.getElementById('executionState');
+        const statusDiv = document.getElementById(DOM_IDS.EXECUTION_STATE);
         if (statusDiv) {
             statusDiv.innerHTML = `
                 <div><span class="key">Status:</span> <span class="value">${state.executionState}</span></div>
@@ -329,7 +357,7 @@ function updateDebugDisplay() {
         }
         
         // Update stack display
-        const stackDiv = document.getElementById('stackDisplay');
+        const stackDiv = document.getElementById(DOM_IDS.STACK_DISPLAY);
         if (stackDiv) {
             const stackDisplay = state.stack.map((value, index) => 
                 `${index}: ${typeof value === 'string' ? '"${value}"' : value}`
@@ -338,7 +366,7 @@ function updateDebugDisplay() {
         }
         
         // Update locals display
-        const localsDiv = document.getElementById('localsDisplay');
+        const localsDiv = document.getElementById(DOM_IDS.LOCALS_DISPLAY);
         if (localsDiv) {
             const localsDisplay = state.locals.map((value, index) => 
                 `local_${index}: ${value !== undefined && value !== null ? 
@@ -365,7 +393,7 @@ function updateDebugDisplay() {
                     } else {
                         log('ACE editor not available, falling back to textarea', 'warning');
                         // Fallback to textarea if ACE editor failed
-                        const editorDiv = document.getElementById('disassembly-editor');
+                        const editorDiv = document.getElementById(DOM_IDS.DISASSEMBLY_EDITOR);
                         if (editorDiv) {
                             const textarea = editorDiv.querySelector('textarea');
                             if (textarea) {
@@ -385,7 +413,7 @@ function updateDebugDisplay() {
         updateButtons();
         
     } catch (error) {
-        log(`Failed to update debug display: ${error.message}`, 'error');
+        logError('Failed to update debug display', error);
     }
 }
 
@@ -395,7 +423,7 @@ function initializeEditor() {
         log('Initializing ACE editor...', 'debug');
         
         // Ensure editor container exists and has proper height
-        const editorContainer = document.getElementById('disassembly-editor');
+        const editorContainer = document.getElementById(DOM_IDS.DISASSEMBLY_EDITOR);
         if (!editorContainer) {
             throw new Error('Editor container not found');
         }
@@ -406,7 +434,7 @@ function initializeEditor() {
             editorContainer.style.minHeight = '300px';
         }
         
-        aceEditor = ace.edit("disassembly-editor");
+        aceEditor = ace.edit(DOM_IDS.DISASSEMBLY_EDITOR);
         
         // Configure ACE with safe defaults and error handling for theme
         try {
@@ -460,16 +488,16 @@ function initializeEditor() {
                         updateDebugDisplay();
                     }
                 } catch (error) {
-                    log(`Error toggling breakpoint: ${error.message}`, 'error');
+                    logError('Error toggling breakpoint', error);
                 }
             }
             e.stop();
         });
         
     } catch (e) {
-        log(`ACE editor failed to initialize: ${e.message}`, 'error');
+        logError('ACE editor failed to initialize', e);
         // Fallback if Ace editor fails to load
-        const editorDiv = document.getElementById('disassembly-editor');
+        const editorDiv = document.getElementById(DOM_IDS.DISASSEMBLY_EDITOR);
         if (editorDiv) {
             editorDiv.style.height = '300px';
             editorDiv.innerHTML = 
@@ -506,7 +534,7 @@ function enhanceWithRealJVM() {
                 log(`Using loaded class from state: ${classToStart}`, 'debug');
             } else {
                 // Second priority: Check if a sample class is currently selected
-                const sampleSelect = document.getElementById('sampleClassSelect');
+                const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
                 if (sampleSelect && sampleSelect.value) {
                     classToStart = sampleSelect.value;
                     log(`Using selected class from dropdown: ${classToStart}`, 'debug');
@@ -628,7 +656,7 @@ function enhanceWithRealJVM() {
 
 // File Loading
 function loadClassFile() {
-    const fileInput = document.getElementById('classFileInput');
+    const fileInput = document.getElementById(DOM_IDS.CLASS_FILE_INPUT);
     const file = fileInput.files[0];
     
     if (!file) {
@@ -676,14 +704,14 @@ function loadClassFile() {
             }
             
             // Enable debug button
-            const debugBtn = document.getElementById('debugBtn');
+            const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
             if (debugBtn) {
                 debugBtn.disabled = false;
                 log('Start Debugging button enabled', 'info');
             }
             
         } catch (error) {
-            log(`Failed to load ${fileName}: ${error.message}`, 'error');
+            logError(`Failed to load ${fileName}`, error);
         }
     };
     
@@ -696,7 +724,7 @@ function loadClassFile() {
 
 // Utility Functions for UI
 function clearOutput() {
-    const output = document.getElementById('output');
+    const output = document.getElementById(DOM_IDS.OUTPUT);
     if (output) {
         output.innerHTML = '';
         log('Output console cleared.', 'info');
@@ -714,14 +742,14 @@ function deserializeState() {
     }
     
     // Otherwise, trigger file input
-    const input = document.getElementById('stateFileInput');
+    const input = document.getElementById(DOM_IDS.STATE_FILE_INPUT);
     if (input) {
         input.click();
     }
 }
 
 function setBreakpoint() {
-    const input = document.getElementById('breakpointInput');
+    const input = document.getElementById(DOM_IDS.BREAKPOINT_INPUT);
     const pc = parseInt(input.value);
     
     if (!jvmDebug) {
@@ -740,7 +768,7 @@ function setBreakpoint() {
         input.value = '';
         updateDebugDisplay();
     } catch (error) {
-        log(`Failed to set breakpoint: ${error.message}`, 'error');
+        logError('Failed to set breakpoint', error);
     }
 }
 
@@ -761,7 +789,7 @@ function clearAllBreakpoints() {
         
         updateDebugDisplay();
     } catch (error) {
-        log(`Failed to clear breakpoints: ${error.message}`, 'error');
+        logError('Failed to clear breakpoints', error);
     }
 }
 
