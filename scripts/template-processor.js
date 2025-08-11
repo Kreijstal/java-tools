@@ -101,11 +101,7 @@ function addBrowserUIScript(htmlContent) {
  * Add breakpoint UI elements for test compatibility
  */
 function addBreakpointUI(htmlContent) {
-    // Add breakpoint input after clear breakpoints button
-    const clearBreakpointsPattern = /(<button onclick="clearAllBreakpoints\(\)">Clear All Breakpoints<\/button>)/;
-    htmlContent = htmlContent.replace(clearBreakpointsPattern, 
-        '<input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" title="Program Counter for breakpoint">\n            <button onclick="setBreakpoint()">Set Breakpoint</button>\n            $1');
-    
+    // Note: Breakpoint input already exists in template, no need to add
     return htmlContent;
 }
 
