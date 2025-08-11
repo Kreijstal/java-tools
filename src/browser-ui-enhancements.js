@@ -102,37 +102,7 @@ function updateButtons() {
     }
 }
 
-// Class Descriptions
-function getClassDescription(className) {
-    const descriptions = {
-        'ArithmeticTest.class': 'Arithmetic operation tests',
-        'Calc.class': 'Simple calculation demo',
-        'CalcMain.class': 'Calculator main class',
-        'Calculator.class': 'Calculator operations (utility class - no main)',
-        'ConstantsTest.class': 'Constant loading tests (iconst_0 through iconst_5)',
-        'DivisionTest.class': 'Division operation tests',
-        'ExceptionTest.class': 'Exception handling tests',
-        'Hello.class': 'Hello World program',  
-        'InvokeVirtualTest.class': 'Virtual method invocation tests',
-        'MainApp.class': 'Main application entry point',
-        'RuntimeArithmetic.class': 'Runtime arithmetic operations',
-        'SimpleArithmetic.class': 'Simple arithmetic operations',
-        'SimpleStringConcat.class': 'Simple string concatenation',
-        'SipushTest.class': 'Short integer push tests',
-        'SmallDivisionTest.class': 'Small division tests',
-        'StringBuilderConcat.class': 'StringBuilder concatenation',
-        'StringConcat.class': 'String concatenation',
-        'StringConcatMethod.class': 'String concatenation methods',
-        'StringMethodsTest.class': 'String method tests',
-        'TestMethods.class': 'Method testing examples (utility class - no main)',
-        'TestMethodsRunner.class': 'Test method runner',
-        'Thing.class': 'Generic object example (utility class - no main)',
-        'ThingProducer.class': 'Object factory example (utility class - no main)',
-        'VerySimple.class': 'Basic arithmetic (3-2=1)',
-        'WorkingArithmetic.class': 'Working arithmetic examples'
-    };
-    return descriptions[className] || 'Java class file';
-}
+
 
 // JVM Integration Functions
 function setupStateFileInput() {
@@ -254,63 +224,24 @@ async function populateSampleClasses() {
     if (sampleSelect && jvmDebug) {
         try {
             // Get available classes from the JVM debug instance
-            let availableClasses = [];
-            try {
-                availableClasses = jvmDebug ? await jvmDebug.listFiles() : [];
-            } catch (error) {
-                log('Could not retrieve class list, using default classes', 'info');
-                availableClasses = [];
-            }
-            
-            const classes = availableClasses.length > 0 ? 
-                availableClasses.map(cls => ({
-                    filename: cls,
-                    name: cls.replace('.class', ''),
-                    description: getClassDescription(cls)
-                })) :
-                [
-                    { filename: 'ArithmeticTest.class', name: 'ArithmeticTest', description: 'Arithmetic operation tests' },
-                    { filename: 'Calc.class', name: 'Calc', description: 'Simple calculation demo' },
-                    { filename: 'CalcMain.class', name: 'CalcMain', description: 'Calculator main class' },
-                    { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' },
-                    { filename: 'ConstantsTest.class', name: 'ConstantsTest', description: 'Constant loading tests (iconst_0 through iconst_5)' },
-                    { filename: 'DivisionTest.class', name: 'DivisionTest', description: 'Division operation tests' },
-                    { filename: 'ExceptionTest.class', name: 'ExceptionTest', description: 'Exception handling tests' },
-                    { filename: 'Hello.class', name: 'Hello', description: 'Hello World program' },
-                    { filename: 'InvokeVirtualTest.class', name: 'InvokeVirtualTest', description: 'Virtual method invocation tests' },
-                    { filename: 'MainApp.class', name: 'MainApp', description: 'Main application entry point' },
-                    { filename: 'RuntimeArithmetic.class', name: 'RuntimeArithmetic', description: 'Runtime arithmetic operations' },
-                    { filename: 'SimpleArithmetic.class', name: 'SimpleArithmetic', description: 'Simple arithmetic operations' },
-                    { filename: 'SimpleStringConcat.class', name: 'SimpleStringConcat', description: 'Simple string concatenation' },
-                    { filename: 'SipushTest.class', name: 'SipushTest', description: 'Short integer push tests' },
-                    { filename: 'SmallDivisionTest.class', name: 'SmallDivisionTest', description: 'Small division tests' },
-                    { filename: 'StringBuilderConcat.class', name: 'StringBuilderConcat', description: 'StringBuilder concatenation' },
-                    { filename: 'StringConcat.class', name: 'StringConcat', description: 'String concatenation' },
-                    { filename: 'StringConcatMethod.class', name: 'StringConcatMethod', description: 'String concatenation methods' },
-                    { filename: 'StringMethodsTest.class', name: 'StringMethodsTest', description: 'String method tests' },
-                    { filename: 'TestMethods.class', name: 'TestMethods', description: 'Method testing examples' },
-                    { filename: 'TestMethodsRunner.class', name: 'TestMethodsRunner', description: 'Test method runner' },
-                    { filename: 'Thing.class', name: 'Thing', description: 'Generic object example' },
-                    { filename: 'ThingProducer.class', name: 'ThingProducer', description: 'Object factory example' },
-                    { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
-                    { filename: 'WorkingArithmetic.class', name: 'WorkingArithmetic', description: 'Working arithmetic examples' }
-                ];
+            const availableClasses = await jvmDebug.listFiles();
+            log(`Found ${availableClasses.length} classes in data.zip`, 'info');
             
             // Clear existing options except the first one
             sampleSelect.innerHTML = '<option value="">Select a sample class...</option>';
             
             // Add all classes to the dropdown
-            classes.forEach(cls => {
+            availableClasses.forEach(cls => {
                 const option = document.createElement('option');
-                option.value = cls.filename;
-                option.textContent = `${cls.name} - ${cls.description}`;
+                option.value = cls;
+                option.textContent = cls.replace('.class', '');
                 sampleSelect.appendChild(option);
             });
             
             // Update the heading to show the count
             const samplesHeading = document.querySelector('h4');
             if (samplesHeading && samplesHeading.textContent.includes('Sample Classes')) {
-                samplesHeading.textContent = `📚 Sample Classes (${classes.length} available) - or upload your own .class/.jar files`;
+                samplesHeading.textContent = `📚 Sample Classes (${availableClasses.length} available) - or upload your own .class/.jar files`;
             }
             
             // Enable the Start Debugging button now that sample classes are available
@@ -320,17 +251,9 @@ async function populateSampleClasses() {
                 log('Start Debugging button enabled - sample classes ready', 'info');
             }
             
-            // Also update the state to indicate we have classes available
-            if (typeof updateState === 'function') {
-                const firstClass = classes.length > 0 ? classes[0] : null;
-                updateState({
-                    loadedClass: true,
-                    className: firstClass ? firstClass.name : null,
-                    status: 'ready'
-                });
-            }
         } catch (error) {
             log(`Failed to populate sample classes: ${error.message}`, 'error');
+            throw error; // Don't hide the error with fallbacks
         }
     }
 }
@@ -346,17 +269,7 @@ async function loadSampleClass() {
     }
     
     if (!jvmDebug) {
-        log('JVM not initialized - using fallback loading', 'warning');
-        // Fallback to mock loading for when JVM isn't available
-        currentState.loadedClass = {
-            name: selectedClass.replace('.class', ''),
-            filename: selectedClass
-        };
-        currentState.className = selectedClass.replace('.class', '');
-        updateStatus(`Sample class loaded: ${selectedClass.replace('.class', '')}`, 'success');
-        log(`Successfully loaded ${selectedClass}`, 'success');
-        updateButtons();
-        return;
+        throw new Error('JVM not initialized - cannot load class');
     }
     
     try {
@@ -399,6 +312,7 @@ async function loadSampleClass() {
     } catch (error) {
         log(`Failed to load sample class: ${error.message}`, 'error');
         updateStatus('Failed to load sample class', 'error');
+        throw error; // Don't hide errors with fallbacks
     }
 }
 
@@ -643,55 +557,13 @@ function enhanceWithRealJVM() {
                 updateButtons();
             }
         } catch (error) {
-            // Handle classes without main method gracefully
+            // Handle classes without main method by throwing an error
             if (error.message && error.message.includes('main method not found')) {
                 const className = classToStart ? classToStart.replace('.class', '') : 'unknown';
-                log(`Class ${className} doesn't have a main method and cannot be executed as a standalone program`, 'error');
-                updateStatus(`Cannot debug ${className}: No main method found`, 'error');
-                
-                // Try to find a class with a main method instead
-                let availableClasses = [];
-                try {
-                    availableClasses = await jvmDebug.listFiles();
-                    const classesWithMain = [
-                        'ArithmeticTest.class', 'Calc.class', 'CalcMain.class', 'ConstantsTest.class',
-                        'DivisionTest.class', 'ExceptionTest.class', 'Hello.class', 'InvokeVirtualTest.class',
-                        'MainApp.class', 'RuntimeArithmetic.class', 'SimpleArithmetic.class',
-                        'SimpleStringConcat.class', 'SipushTest.class', 'SmallDivisionTest.class',
-                        'StringBuilderConcat.class', 'StringConcat.class', 'StringConcatMethod.class',
-                        'StringMethodsTest.class', 'TestMethodsRunner.class', 'VerySimple.class',
-                        'WorkingArithmetic.class'
-                    ];
-                    
-                    const fallbackClass = availableClasses.find(cls => classesWithMain.includes(cls));
-                    if (fallbackClass) {
-                        log(`Falling back to ${fallbackClass} which has a main method`, 'info');
-                        const result = await jvmDebug.start(fallbackClass);
-                        updateDebugDisplay();
-                        
-                        if (typeof updateState === 'function') {
-                            updateState({
-                                loadedClass: { name: fallbackClass },
-                                className: fallbackClass.replace('.class', ''),
-                                status: 'paused'
-                            });
-                        }
-                        
-                        updateStatus(`Debugger started with ${fallbackClass.replace('.class', '')} - Real JVM session active`, 'success');
-                        
-                        if (typeof updateButtons === 'function') {
-                            updateButtons();
-                        }
-                        return;
-                    }
-                } catch (fallbackError) {
-                    log(`Fallback also failed: ${fallbackError.message}`, 'error');
-                }
+                throw new Error(`Class ${className} doesn't have a main method and cannot be executed as a standalone program`);
             } else {
-                log(`Failed to start debugging: ${error.message}`, 'error');
+                throw error;
             }
-            
-            if (originalStartDebugging) originalStartDebugging();
         }
     };
     
