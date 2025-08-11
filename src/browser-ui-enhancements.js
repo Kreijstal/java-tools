@@ -64,42 +64,30 @@ function updateButtons() {
         return;
     }
     
-    try {
-        const state = jvmDebug.getCurrentState();
-        const isPaused = state.executionState === 'paused';
-        const isRunning = state.executionState === 'running';
-        const hasLoadedClass = currentState.loadedClass !== null || state.method !== null;
-        
-        // Debug button should be enabled when we have a class and not currently debugging
-        const debugBtn = document.getElementById('debugBtn');
-        if (debugBtn) {
-            debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
-        }
-        
-        // Step buttons should be enabled only when paused
-        const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-        stepButtons.forEach(id => {
-            const btn = document.getElementById(id);
-            if (btn) btn.disabled = !isPaused;
-        });
-        
-        log(`Debug buttons ${isPaused ? 'enabled' : 'disabled'} (state: ${state.executionState})`, 'debug');
-        
-    } catch (error) {
-        log(`Error updating buttons: ${error.message}`, 'error');
-        // Fallback to simple state check
-        const isDebugging = currentState.status === 'paused' || currentState.status === 'running';
-        const debugButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
-        
-        debugButtons.forEach(btnId => {
-            const btn = document.getElementById(btnId);
-            if (btn) {
-                btn.disabled = !isDebugging;
-            }
-        });
-        
-        log(`Debug buttons ${isDebugging ? 'enabled' : 'disabled'} (fallback)`, 'debug');
+    if (!jvmDebug) {
+        log('JVM not initialized - cannot update button states', 'error');
+        return;
     }
+    
+    const state = jvmDebug.getCurrentState();
+    const isPaused = state.executionState === 'paused';
+    const isRunning = state.executionState === 'running';
+    const hasLoadedClass = currentState.loadedClass !== null || state.method !== null;
+    
+    // Debug button should be enabled when we have a class and not currently debugging
+    const debugBtn = document.getElementById('debugBtn');
+    if (debugBtn) {
+        debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
+    }
+    
+    // Step buttons should be enabled only when paused
+    const stepButtons = ['stepIntoBtn', 'stepOverBtn', 'stepOutBtn', 'stepInstructionBtn', 'continueBtn', 'finishBtn'];
+    stepButtons.forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.disabled = !isPaused;
+    });
+    
+    log(`Debug buttons ${isPaused ? 'enabled' : 'disabled'} (state: ${state.executionState})`, 'debug');
 }
 
 
@@ -118,37 +106,18 @@ function setupStateFileInput() {
                 try {
                     const serializedState = JSON.parse(e.target.result);
                     
-                    // Try to restore using the real JVM if available
-                    if (typeof jvmDebug !== 'undefined' && jvmDebug && typeof jvmDebug.deserialize === 'function') {
+                    // Try to restore using the real JVM
+                    if (jvmDebug && typeof jvmDebug.deserialize === 'function') {
                         jvmDebug.deserialize(serializedState);
-                        if (typeof updateDebugDisplay === 'function') {
-                            updateDebugDisplay();
+                        updateDebugDisplay();
+                        updateStatus('State restored successfully', 'success');
+                        log('JVM state restored successfully', 'success');
+                        
+                        if (serializedState.loadedClass) {
+                            log(`Restored class: ${serializedState.loadedClass.name}`, 'success');
                         }
                     } else {
-                        // Fallback restoration for when JVM isn't available
-                        // Restore class if included in state
-                        if (serializedState.loadedClass) {
-                            currentState.loadedClass = serializedState.loadedClass;
-                            currentState.className = serializedState.loadedClass.name;
-                        }
-                        
-                        // Restore JVM state
-                        updateState({
-                            status: serializedState.executionState || 'paused',
-                            pc: serializedState.jvmState?.frames?.[0]?.pc || 0,
-                            stack: serializedState.jvmState?.frames?.[0]?.stack || [],
-                            locals: serializedState.jvmState?.frames?.[0]?.locals || [],
-                            breakpoints: serializedState.jvmState?.breakpoints || [],
-                            callDepth: serializedState.jvmState?.frames?.length || 0,
-                            method: 'main([Ljava/lang/String;)V'
-                        });
-                    }
-                    
-                    updateStatus('State restored successfully', 'success');
-                    log('JVM state restored successfully', 'success');
-                    
-                    if (currentState.loadedClass) {
-                        log(`Restored class: ${currentState.className}`, 'success');
+                        throw new Error('JVM not initialized - cannot restore state');
                     }
                 } catch (error) {
                     log(`Failed to restore state: ${error.message}`, 'error');
@@ -175,27 +144,24 @@ async function initializeJVM() {
                 log(`Attempting to load data from: ${dataUrl}`, 'info');
                 
                 const response = await fetch(dataUrl);
-                if (response.ok) {
-                    const buffer = await response.arrayBuffer();
-                    const uint8Array = new Uint8Array(buffer);
-                    
-                    // Load as JAR archive since data.zip is essentially a zip file
-                    const extractedFiles = await jvmDebug.fileProvider.loadJarArchive(uint8Array, 'data.zip');
-                    log(`Data package loaded with ${extractedFiles.length} class files`, 'info');
-                    
-                    // Initialize the debug environment
-                    await jvmDebug.initialize();
-                    log(`Real JVM Debug initialized with ${extractedFiles.length} sample classes`, 'success');
-                    await populateSampleClasses();
-                } else {
-                    log(`Data package fetch failed (${response.status}), initializing without data`, 'warning');
-                    await jvmDebug.initialize();
-                    log('Real JVM Debug initialized (no data package)', 'info');
+                if (!response.ok) {
+                    throw new Error(`Data package fetch failed (${response.status}): ${response.statusText}`);
                 }
-            } catch (err) {
-                log(`Data package error: ${err.message}`, 'warning');
+                
+                const buffer = await response.arrayBuffer();
+                const uint8Array = new Uint8Array(buffer);
+                
+                // Load as JAR archive since data.zip is essentially a zip file
+                const extractedFiles = await jvmDebug.fileProvider.loadJarArchive(uint8Array, 'data.zip');
+                log(`Data package loaded with ${extractedFiles.length} class files`, 'info');
+                
+                // Initialize the debug environment
                 await jvmDebug.initialize();
-                log('Real JVM Debug initialized without data package', 'info');
+                log(`Real JVM Debug initialized with ${extractedFiles.length} sample classes`, 'success');
+                await populateSampleClasses();
+            } catch (err) {
+                log(`Failed to load data package: ${err.message}`, 'error');
+                throw new Error(`Cannot initialize JVM without data package: ${err.message}`);
             }
             
             log('Real JVM Debug Interface ready! 🚀', 'success');
@@ -314,13 +280,11 @@ async function loadSampleClass() {
         updateStatus(`Sample class loaded: ${selectedClass.replace('.class', '')}`, 'success');
         
         // Update the current state to enable debug buttons (but don't start debugging yet)
-        if (typeof updateState === 'function') {
-            updateState({
-                loadedClass: { name: selectedClass, data: classData },
-                className: selectedClass.replace('.class', ''),
-                status: 'ready'  // Ready for debugging, not paused
-            });
-        }
+        updateState({
+            loadedClass: { name: selectedClass, data: classData },
+            className: selectedClass.replace('.class', ''),
+            status: 'ready'  // Ready for debugging, not paused
+        });
         
         // Enable debug button
         const debugBtn = document.getElementById('debugBtn');
@@ -418,9 +382,7 @@ function updateDebugDisplay() {
         }
         
         // Update button states
-        if (typeof updateButtons === 'function') {
-            updateButtons();
-        }
+        updateButtons();
         
     } catch (error) {
         log(`Failed to update debug display: ${error.message}`, 'error');
@@ -516,17 +478,21 @@ function initializeEditor() {
     }
 }
 
+// Helper function to handle debug operations with consistent error handling and display updates
+function executeDebugOperation(operation, operationName, successMessage) {
+    if (!jvmDebug) {
+        throw new Error(`JVM not initialized - cannot ${operationName.toLowerCase()}`);
+    }
+    
+    const result = operation();
+    log(successMessage, 'info');
+    updateDebugDisplay();
+    return result;
+}
+
 // Enhanced debugging functions
 function enhanceWithRealJVM() {
     if (!jvmDebug) return;
-    
-    // Store original functions if they exist
-    const originalStartDebugging = window.startDebugging;
-    const originalStepInto = window.stepInto;
-    const originalStepOver = window.stepOver;
-    const originalStepOut = window.stepOut;
-    const originalContinue = window.continue_;
-    const originalFinish = window.finish;
     
     // Override startDebugging to work with real JVM and sample classes
     window.startDebugging = async function() {
@@ -546,12 +512,7 @@ function enhanceWithRealJVM() {
                     log(`Using selected class from dropdown: ${classToStart}`, 'debug');
                 } else {
                     // Last resort: Use the first available class from loaded classes
-                    let availableClasses = [];
-                    try {
-                        availableClasses = await jvmDebug.listFiles();
-                    } catch (error) {
-                        log('Could not retrieve class list', 'error');
-                    }
+                    const availableClasses = await jvmDebug.listFiles();
                     if (availableClasses.length > 0) {
                         classToStart = availableClasses[0];
                         log(`Using first available class: ${classToStart}`, 'debug');
@@ -569,22 +530,16 @@ function enhanceWithRealJVM() {
             updateDebugDisplay();
             
             // Update the current state to enable debug buttons
-            if (typeof updateState === 'function') {
-                updateState({
-                    loadedClass: { name: classToStart },
-                    className: classToStart.replace('.class', ''),
-                    status: 'paused'
-                });
-            }
+            updateState({
+                loadedClass: { name: classToStart },
+                className: classToStart.replace('.class', ''),
+                status: 'paused'
+            });
             
-            if (typeof updateStatus === 'function') {
-                updateStatus('Debugger started - Real JVM session active', 'success');
-            }
+            updateStatus('Debugger started - Real JVM session active', 'success');
             
             // Ensure buttons are updated after starting debugging
-            if (typeof updateButtons === 'function') {
-                updateButtons();
-            }
+            updateButtons();
         } catch (error) {
             // Handle classes without main method by throwing an error
             if (error.message && error.message.includes('main method not found')) {
@@ -598,115 +553,76 @@ function enhanceWithRealJVM() {
     
     // Override with real JVM implementations
     window.stepInto = function() {
-        try {
-            const result = jvmDebug.stepInto();
-            log('Step Into completed', 'info');
-            updateDebugDisplay();
-        } catch (error) {
-            log(`Step into failed: ${error.message}`, 'error');
-            if (originalStepInto) originalStepInto();
-        }
+        return executeDebugOperation(() => jvmDebug.stepInto(), 'step into', 'Step Into completed');
     };
     
     window.stepOver = function() {
-        try {
-            const result = jvmDebug.stepOver();
-            log('Step Over completed', 'info');
-            updateDebugDisplay();
-        } catch (error) {
-            log(`Step over failed: ${error.message}`, 'error');
-            if (originalStepOver) originalStepOver();
-        }
+        return executeDebugOperation(() => jvmDebug.stepOver(), 'step over', 'Step Over completed');
     };
     
     window.stepOut = function() {
-        try {
-            const result = jvmDebug.stepOut();
-            log('Step Out completed', 'info');
-            updateDebugDisplay();
-        } catch (error) {
-            log(`Step out failed: ${error.message}`, 'error');
-            if (originalStepOut) originalStepOut();
-        }
+        return executeDebugOperation(() => jvmDebug.stepOut(), 'step out', 'Step Out completed');
     };
     
     window.continue_ = function() {
-        try {
-            const result = jvmDebug.continue();
-            log('Continue completed', 'info');
-            updateDebugDisplay();
-            
-            // Update status based on result
-            const state = jvmDebug.getCurrentState();
-            if (state.executionState === 'completed') {
-                updateStatus('Program execution completed', 'success');
-            } else if (state.executionState === 'paused') {
-                // Check if we hit a breakpoint
-                const breakpoints = state.breakpoints || [];
-                if (breakpoints.length > 0 && breakpoints.includes(state.pc)) {
-                    updateStatus(`Hit breakpoint at PC=${state.pc}`, 'info');
-                } else {
-                    updateStatus('Execution paused', 'info');
-                }
-            } else {
-                updateStatus('Continue execution completed', 'info');
-            }
-        } catch (error) {
-            log(`Continue failed: ${error.message}`, 'error');
-            if (originalContinue) originalContinue();
+        if (!jvmDebug) {
+            throw new Error('JVM not initialized - cannot continue');
         }
+        const result = jvmDebug.continue();
+        log('Continue completed', 'info');
+        updateDebugDisplay();
+        
+        // Update status based on result
+        const state = jvmDebug.getCurrentState();
+        if (state.executionState === 'completed') {
+            updateStatus('Program execution completed', 'success');
+        } else if (state.executionState === 'paused') {
+            // Check if we hit a breakpoint
+            const breakpoints = state.breakpoints || [];
+            if (breakpoints.length > 0 && breakpoints.includes(state.pc)) {
+                updateStatus(`Hit breakpoint at PC=${state.pc}`, 'info');
+            } else {
+                updateStatus('Execution paused', 'info');
+            }
+        } else {
+            updateStatus('Continue execution completed', 'info');
+        }
+        return result;
     };
     
     window.finish = function() {
-        try {
-            const result = jvmDebug.finish();
-            log('Finish completed', 'info');
-            updateDebugDisplay();
-        } catch (error) {
-            log(`Finish failed: ${error.message}`, 'error');
-            if (originalFinish) originalFinish();
-        }
+        return executeDebugOperation(() => jvmDebug.finish(), 'finish', 'Finish completed');
     };
     
-    // Add stepInstruction function if it doesn't exist
-    if (!window.stepInstruction) {
-        window.stepInstruction = function() {
-            try {
-                const result = jvmDebug.stepInstruction();
-                log('Step Instruction completed', 'info');
-                updateDebugDisplay();
-            } catch (error) {
-                log(`Step instruction failed: ${error.message}`, 'error');
-            }
-        };
-    }
+    // Add stepInstruction function
+    window.stepInstruction = function() {
+        return executeDebugOperation(() => jvmDebug.stepInstruction(), 'step instruction', 'Step Instruction completed');
+    };
     
     // Override serialize/deserialize with real JVM state
-    const originalSerialize = window.serializeState;
     window.serializeState = function() {
-        try {
-            const state = jvmDebug.serialize();
-            const stateJson = JSON.stringify(state, null, 2);
-            
-            // Store in memory for testing
-            window._testSerializedState = state;
-            
-            const blob = new Blob([stateJson], { type: 'application/json' });
-            const url = URL.createObjectURL(blob);
-            
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `jvm-state-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
-            document.body.appendChild(a);
-            a.click();
-            document.body.removeChild(a);
-            URL.revokeObjectURL(url);
-            
-            log('State serialized successfully', 'success');
-        } catch (error) {
-            log(`State serialization failed: ${error.message}`, 'error');
-            if (originalSerialize) originalSerialize();
+        if (!jvmDebug) {
+            throw new Error('JVM not initialized - cannot serialize state');
         }
+        
+        const state = jvmDebug.serialize();
+        const stateJson = JSON.stringify(state, null, 2);
+        
+        // Store in memory for testing
+        window._testSerializedState = state;
+        
+        const blob = new Blob([stateJson], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `jvm-state-${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        
+        log('State serialized successfully', 'success');
     };
 }
 
@@ -752,13 +668,11 @@ function loadClassFile() {
                 log(`Class file ${className} loaded successfully`, 'success');
                 
                 // Update state to reflect loaded class
-                if (typeof updateState === 'function') {
-                    updateState({
-                        loadedClass: true,
-                        className: className,
-                        status: 'ready'
-                    });
-                }
+                updateState({
+                    loadedClass: true,
+                    className: className,
+                    status: 'ready'
+                });
             }
             
             // Enable debug button
@@ -785,26 +699,18 @@ function clearOutput() {
     const output = document.getElementById('output');
     if (output) {
         output.innerHTML = '';
-        if (typeof log === 'function') {
-            log('Output console cleared.', 'info');
-        }
+        log('Output console cleared.', 'info');
     }
 }
 
 function deserializeState() {
     // If we have a test state in memory, use it directly
-    if (window._testSerializedState && typeof jvmDebug !== 'undefined' && jvmDebug) {
-        try {
-            jvmDebug.deserialize(window._testSerializedState);
-            if (typeof updateDebugDisplay === 'function') {
-                updateDebugDisplay();
-            }
-            updateStatus('State restored successfully', 'success');
-            log('JVM state restored successfully', 'success');
-            return;
-        } catch (error) {
-            log(`Memory state restore failed: ${error.message}`, 'error');
-        }
+    if (window._testSerializedState && jvmDebug) {
+        jvmDebug.deserialize(window._testSerializedState);
+        updateDebugDisplay();
+        updateStatus('State restored successfully', 'success');
+        log('JVM state restored successfully', 'success');
+        return;
     }
     
     // Otherwise, trigger file input
