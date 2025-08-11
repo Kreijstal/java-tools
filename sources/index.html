@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sample .class Files - JVM Debug Interface</title>
+    <style>
+        body {
+            font-family: 'Courier New', monospace;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+        }
+        h1 { color: #569cd6; }
+        h2 { color: #4ec9b0; }
+        .file-list { 
+            display: grid; 
+            grid-template-columns: 1fr auto auto; 
+            gap: 10px; 
+            background: #252526; 
+            padding: 15px; 
+            border-radius: 5px; 
+        }
+        .file-item { display: contents; }
+        .file-name { 
+            font-weight: bold; 
+            color: #569cd6; 
+        }
+        .file-name a { 
+            color: #569cd6; 
+            text-decoration: none; 
+        }
+        .file-name a:hover { 
+            text-decoration: underline; 
+        }
+        .file-size { 
+            color: #9cdcfe; 
+            text-align: right; 
+        }
+        .file-type { 
+            color: #4ec9b0; 
+            text-align: center; 
+        }
+        .back-link { 
+            color: #569cd6; 
+            text-decoration: none; 
+            margin-bottom: 20px; 
+            display: inline-block; 
+        }
+        .back-link:hover { text-decoration: underline; }
+        .description { 
+            background: #2d2d30; 
+            padding: 10px; 
+            border-radius: 3px; 
+            margin-bottom: 20px; 
+        }
+    </style>
+</head>
+<body>
+    <a href="/examples/debug-web-interface.html" class="back-link">← Back to Debug Interface</a>
+    
+    <h1>📂 Sample .class Files for JVM Debugging</h1>
+    
+    <div class="description">
+        <p><strong>How to use:</strong> Right-click any .class file below and "Save Link As" to download, then upload it in the debug interface.</p>
+        <p><strong>Quick start:</strong> Try <a href="Hello.class" style="color: #569cd6;">Hello.class</a> or <a href="VerySimple.class" style="color: #569cd6;">VerySimple.class</a> for simple examples.</p>
+    </div>
+
+    <h2>Available .class Files</h2>
+    <div class="file-list">
+        <div class="file-item">
+            <div class="file-name"><a href="ArithmeticTest.class">ArithmeticTest.class</a></div>
+            <div class="file-size">503 bytes</div>
+            <div class="file-type">Arithmetic operations</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="Calc.class">Calc.class</a></div>
+            <div class="file-size">384 bytes</div>
+            <div class="file-type">Simple calculator</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="CalcMain.class">CalcMain.class</a></div>
+            <div class="file-size">436 bytes</div>
+            <div class="file-type">Calculator main</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="Calculator.class">Calculator.class</a></div>
+            <div class="file-size">250 bytes</div>
+            <div class="file-type">Calculator logic</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="ConstantsTest.class">ConstantsTest.class</a></div>
+            <div class="file-size">474 bytes</div>
+            <div class="file-type">Constant testing</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="DivisionTest.class">DivisionTest.class</a></div>
+            <div class="file-size">580 bytes</div>
+            <div class="file-type">Division operations</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="ExceptionTest.class">ExceptionTest.class</a></div>
+            <div class="file-size">610 bytes</div>
+            <div class="file-type">Exception handling</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="Hello.class">Hello.class</a></div>
+            <div class="file-size">417 bytes</div>
+            <div class="file-type">Hello World</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="InvokeVirtualTest.class">InvokeVirtualTest.class</a></div>
+            <div class="file-size">659 bytes</div>
+            <div class="file-type">Method invocation</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="MainApp.class">MainApp.class</a></div>
+            <div class="file-size">1053 bytes</div>
+            <div class="file-type">Main application</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="RuntimeArithmetic.class">RuntimeArithmetic.class</a></div>
+            <div class="file-size">630 bytes</div>
+            <div class="file-type">Runtime arithmetic</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="SimpleArithmetic.class">SimpleArithmetic.class</a></div>
+            <div class="file-size">464 bytes</div>
+            <div class="file-type">Simple arithmetic</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="SimpleStringConcat.class">SimpleStringConcat.class</a></div>
+            <div class="file-size">447 bytes</div>
+            <div class="file-type">String concatenation</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="SipushTest.class">SipushTest.class</a></div>
+            <div class="file-size">398 bytes</div>
+            <div class="file-type">Short integer push</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="SmallDivisionTest.class">SmallDivisionTest.class</a></div>
+            <div class="file-size">586 bytes</div>
+            <div class="file-type">Small division test</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="StringBuilderConcat.class">StringBuilderConcat.class</a></div>
+            <div class="file-size">653 bytes</div>
+            <div class="file-type">StringBuilder concat</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="StringConcat.class">StringConcat.class</a></div>
+            <div class="file-size">926 bytes</div>
+            <div class="file-type">String concatenation</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="StringConcatMethod.class">StringConcatMethod.class</a></div>
+            <div class="file-size">571 bytes</div>
+            <div class="file-type">String concat methods</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="StringMethodsTest.class">StringMethodsTest.class</a></div>
+            <div class="file-size">710 bytes</div>
+            <div class="file-type">String method tests</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="TestMethods.class">TestMethods.class</a></div>
+            <div class="file-size">683 bytes</div>
+            <div class="file-type">Method testing</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="TestMethodsRunner.class">TestMethodsRunner.class</a></div>
+            <div class="file-size">381 bytes</div>
+            <div class="file-type">Test runner</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="Thing.class">Thing.class</a></div>
+            <div class="file-size">343 bytes</div>
+            <div class="file-type">Generic object</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="ThingProducer.class">ThingProducer.class</a></div>
+            <div class="file-size">337 bytes</div>
+            <div class="file-type">Object factory</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="VerySimple.class">VerySimple.class</a></div>
+            <div class="file-size">410 bytes</div>
+            <div class="file-type">Very simple example</div>
+        </div>
+        <div class="file-item">
+            <div class="file-name"><a href="WorkingArithmetic.class">WorkingArithmetic.class</a></div>
+            <div class="file-size">445 bytes</div>
+            <div class="file-type">Working arithmetic</div>
+        </div>
+    </div>
+
+    <h2>📚 Source Code Available</h2>
+    <p>You can also view the corresponding .java source files in this directory for reference.</p>
+    
+    <div style="background: #2d2d30; padding: 10px; border-radius: 3px; margin-top: 20px;">
+        <p><strong>💡 Pro tip:</strong> For the best debugging experience with pre-loaded samples, visit <a href="/" style="color: #569cd6;">the main debug interface</a> which includes all 25 classes ready to use.</p>
+    </div>
+</body>
+</html>

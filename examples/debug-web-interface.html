@@ -269,6 +269,39 @@
     </div>
     
     <div class="panel">
+        <h3>📚 Getting Sample .class Files to Try</h3>
+        <div style="font-size: 12px; line-height: 1.5; background-color: #2d2d30; padding: 10px; border-radius: 3px; margin-bottom: 10px;">
+            <p><strong>Quick Start Options:</strong></p>
+            <ul>
+                <li><strong>🚀 Built-in Samples:</strong> Visit <a href="/" style="color: #569cd6;">http://localhost:3000/</a> for 25 pre-loaded sample classes</li>
+                <li><strong>📂 Download from Repository:</strong> Get .class files from <a href="/sources/" style="color: #569cd6;">sources directory</a></li>
+                <li><strong>☕ Compile your own:</strong> <code style="background: #1e1e1e; padding: 2px 4px;">javac YourFile.java</code> creates YourFile.class</li>
+            </ul>
+            
+            <p><strong>Example Java Files to Compile:</strong></p>
+            <div style="background: #1e1e1e; padding: 8px; border-radius: 3px; font-family: 'Courier New', monospace; margin: 5px 0;">
+// Hello.java<br/>
+public class Hello {<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;public static void main(String[] args) {<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;System.out.println("Hello, World!");<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;}<br/>
+}
+            </div>
+            <div style="background: #1e1e1e; padding: 8px; border-radius: 3px; font-family: 'Courier New', monospace; margin: 5px 0;">
+// SimpleCalc.java<br/>
+public class SimpleCalc {<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;public static void main(String[] args) {<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;int a = 5;<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;int b = 3;<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;System.out.println(a + b);<br/>
+&nbsp;&nbsp;&nbsp;&nbsp;}<br/>
+}
+            </div>
+            <p style="font-style: italic;">💡 Tip: Compile with <code style="background: #1e1e1e; padding: 2px 4px;">javac Hello.java</code> then upload the generated Hello.class file</p>
+        </div>
+    </div>
+    
+    <div class="panel">
         <h3>Usage Instructions</h3>
         <div style="font-size: 12px; line-height: 1.5;">
             <p><strong>Note:</strong> This is a real JVM debugging application that embeds jvm.js directly in the browser for client-side Java bytecode execution and debugging.</p>
