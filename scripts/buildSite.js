@@ -133,13 +133,19 @@ function enhanceDebugInterfaceWithRealJVM(htmlContent) {
                             
                             // Load as JAR archive since data.zip is essentially a zip file
                             const extractedFiles = await jvmDebug.fileProvider.loadJarArchive(uint8Array, 'data.zip');
+                            log(\`Data package loaded with \${extractedFiles.length} class files\`, 'info');
+                            
+                            // Initialize the debug environment
+                            await jvmDebug.initialize();
                             log(\`Real JVM Debug initialized with \${extractedFiles.length} sample classes\`, 'success');
                             populateSampleClasses();
                         } else {
+                            log('Data package fetch failed, initializing without data', 'warning');
                             await jvmDebug.initialize();
                             log('Real JVM Debug initialized (no data package)', 'info');
                         }
                     } catch (err) {
+                        log(\`Data package error: \${err.message}\`, 'warning');
                         await jvmDebug.initialize();
                         log('Real JVM Debug initialized without data package', 'info');
                     }
