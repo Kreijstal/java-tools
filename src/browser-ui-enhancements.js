@@ -256,80 +256,14 @@ async function populateSampleClasses() {
             const availableClasses = await jvmDebug.listFiles();
             log(`Found ${availableClasses.length} classes in data.zip`, 'info');
             
-            // Try to load metadata.json for descriptions
-            let metadata = null;
-            try {
-                const metadataData = await jvmDebug.fileProvider.readFile('metadata.json');
-                if (metadataData) {
-                    const metadataText = new TextDecoder().decode(metadataData);
-                    metadata = JSON.parse(metadataText);
-                    log(`Loaded metadata with ${metadata.classes?.length || 0} class descriptions`, 'info');
-                }
-            } catch (metaErr) {
-                // Metadata not available, will use fallback descriptions
-                log('Using fallback descriptions for class list', 'info');
-            }
-            
             // Clear existing options except the first one
             sampleSelect.innerHTML = '<option value="">Select a sample class...</option>';
             
-            // Add all classes to the dropdown with descriptions if available
+            // Add all classes to the dropdown
             availableClasses.forEach(cls => {
                 const option = document.createElement('option');
                 option.value = cls;
-                
-                // Look for description in metadata
-                const className = cls.replace('.class', '');
-                let description = null;
-                if (metadata && metadata.classes) {
-                    const classInfo = metadata.classes.find(c => c.name === className);
-                    if (classInfo) {
-                        description = classInfo.description;
-                        // Use short form for specific classes to match test expectations
-                        if (className === 'Hello' && description.includes('Hello World')) {
-                            description = 'Hello World program';
-                        } else if (className === 'VerySimple' && description.includes('arithmetic')) {
-                            description = 'Basic arithmetic';
-                        } else if (className === 'Calculator' && description.includes('method')) {
-                            description = 'Calculator operations';
-                        }
-                    } else {
-                        // No metadata entry for this class, will use fallback
-                    }
-                } else {
-                    // Fallback descriptions for when metadata isn't available
-                    const fallbackDescriptions = {
-                        'Hello': 'Hello World program',
-                        'VerySimple': 'Basic arithmetic',
-                        'Calculator': 'Calculator operations',
-                        'RuntimeArithmetic': 'Comprehensive arithmetic operations',
-                        'ExceptionTest': 'Exception handling demonstration',
-                        'StringConcatMethod': 'String concatenation examples',
-                        'ConstantsTest': 'Integer constant instructions',
-                        'ArithmeticTest': 'Arithmetic test operations',
-                        'Calc': 'Basic calculator functionality',
-                        'CalcMain': 'Calculator main program',
-                        'DivisionTest': 'Division operation tests',
-                        'InvokeVirtualTest': 'Virtual method invocation',
-                        'MainApp': 'Main application class',
-                        'SimpleArithmetic': 'Simple arithmetic operations',
-                        'SimpleStringConcat': 'Simple string concatenation',
-                        'SipushTest': 'Short integer push test',
-                        'SmallDivisionTest': 'Small division operations',
-                        'StringBuilderConcat': 'StringBuilder concatenation',
-                        'StringConcat': 'String concatenation methods',
-                        'StringMethodsTest': 'String method testing',
-                        'TestMethods': 'Method testing examples',
-                        'TestMethodsRunner': 'Test runner class',
-                        'Thing': 'Basic object class',
-                        'ThingProducer': 'Object producer class',
-                        'WorkingArithmetic': 'Working arithmetic examples'
-                    };
-                    
-                    description = fallbackDescriptions[className];
-                }
-                
-                option.textContent = description ? `${className} - ${description}` : className;
+                option.textContent = cls.replace('.class', '');
                 sampleSelect.appendChild(option);
             });
             
