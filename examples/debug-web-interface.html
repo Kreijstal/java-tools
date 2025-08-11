@@ -218,19 +218,11 @@
             <button onclick="startDebugging()" id="debugBtn" disabled>Start Debugging</button>
         </div>
         
-        <!-- Sample Class Loading Section -->
+        <!-- Sample Class Loading Section - populated dynamically -->
+        <h4>📚 Sample Classes - or upload your own .class/.jar files</h4>
         <div class="button-group">
             <select id="sampleClassSelect" style="color: #d4d4d4; background-color: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; padding: 8px; font-family: inherit; font-size: 12px; margin-right: 10px;">
-                <option value="">Choose a sample class...</option>
-                <option value="Hello">Hello - Simple Hello World</option>
-                <option value="VerySimple">VerySimple - Basic class structure</option>
-                <option value="RuntimeArithmetic">RuntimeArithmetic - Math operations</option>
-                <option value="SimpleArithmetic">SimpleArithmetic - Simple calculations</option>
-                <option value="StringConcat">StringConcat - String operations</option>
-                <option value="CalcMain">CalcMain - Calculator main class</option>
-                <option value="ExceptionTest">ExceptionTest - Exception handling</option>
-                <option value="InvokeVirtualTest">InvokeVirtualTest - Method invocation</option>
-                <option value="MainApp">MainApp - Larger application example</option>
+                <option value="">Loading sample classes...</option>
             </select>
             <button onclick="loadSampleClass()" id="loadSampleBtn">Load Sample</button>
         </div>
@@ -282,80 +274,6 @@
                 <h3>Output Console</h3>
                 <div id="output" class="output"></div>
             </div>
-        </div>
-    </div>
-    
-    <div class="panel">
-        <h3>📚 Getting Sample .class Files to Try</h3>
-        <div style="font-size: 12px; line-height: 1.5; background-color: #2d2d30; padding: 10px; border-radius: 3px; margin-bottom: 10px;">
-            <p><strong>Quick Start Options:</strong></p>
-            <ul>
-                <li><strong>🚀 Load Sample Class:</strong> Use the "Choose a sample class..." dropdown above to instantly load one of 25 pre-compiled sample classes</li>
-                <li><strong>📂 Browse Repository:</strong> Download individual .class files from <a href="/sources/" style="color: #569cd6;">sources directory</a></li>
-                <li><strong>☕ Compile your own:</strong> <code style="background: #1e1e1e; padding: 2px 4px;">javac YourFile.java</code> creates YourFile.class to upload</li>
-            </ul>
-            
-            <p><strong>Available Sample Classes Include:</strong></p>
-            <ul style="margin-left: 20px;">
-                <li><strong>Hello</strong> - Classic "Hello World" program</li>
-                <li><strong>RuntimeArithmetic</strong> - Demonstrates math operations</li>
-                <li><strong>StringConcat</strong> - String manipulation examples</li>
-                <li><strong>ExceptionTest</strong> - Exception handling demonstration</li>
-                <li><strong>MainApp</strong> - More complex application example</li>
-                <li>And 20+ more sample classes to explore!</li>
-            </ul>
-            
-            <p><strong>Example Java Files to Compile:</strong></p>
-            <div style="background: #1e1e1e; padding: 8px; border-radius: 3px; font-family: 'Courier New', monospace; margin: 5px 0;">
-// Hello.java<br/>
-public class Hello {<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;public static void main(String[] args) {<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;System.out.println("Hello, World!");<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;}<br/>
-}
-            </div>
-            <div style="background: #1e1e1e; padding: 8px; border-radius: 3px; font-family: 'Courier New', monospace; margin: 5px 0;">
-// SimpleCalc.java<br/>
-public class SimpleCalc {<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;public static void main(String[] args) {<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;int a = 5;<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;int b = 3;<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;System.out.println(a + b);<br/>
-&nbsp;&nbsp;&nbsp;&nbsp;}<br/>
-}
-            </div>
-            <p style="font-style: italic;">💡 Tip: Use the sample class dropdown for instant access, or compile your own with <code style="background: #1e1e1e; padding: 2px 4px;">javac Hello.java</code> then upload the generated Hello.class file</p>
-        </div>
-    </div>
-    
-    <div class="panel">
-        <h3>Usage Instructions</h3>
-        <div style="font-size: 12px; line-height: 1.5;">
-            <p><strong>Note:</strong> This is a real JVM debugging application that embeds jvm.js directly in the browser for client-side Java bytecode execution and debugging.</p>
-            
-            <p><strong>Debug Commands:</strong></p>
-            <ul>
-                <li><strong>▶️ Continue:</strong> Run until next breakpoint or completion</li>
-                <li><strong>↷ Step Over:</strong> Execute next instruction, skipping over method calls</li>
-                <li><strong>↪️ Step Into:</strong> Execute next instruction, entering method calls</li>
-                <li><strong>↩️ Step Out:</strong> Continue until current method returns</li>
-                <li><strong>⏩ Finish Method:</strong> Run until current method completes</li>
-            </ul>
-            
-            <p><strong>State Management:</strong></p>
-            <ul>
-                <li><strong>💾 Serialize State:</strong> Download complete JVM state as JSON file</li>
-                <li><strong>📂 Restore State:</strong> Upload and reload previously serialized state</li>
-                <li><strong>Breakpoints:</strong> Click in the disassembly gutter to toggle breakpoints</li>
-            </ul>
-            
-            <p><strong>Disassembly View:</strong></p>
-            <ul>
-                <li>Interactive code editor showing bytecode disassembly</li>
-                <li>Current instruction highlighted automatically</li>
-                <li>Click gutter (line numbers area) to set/remove breakpoints</li>
-                <li>Red dots indicate active breakpoints</li>
-            </ul>
         </div>
     </div>
 
