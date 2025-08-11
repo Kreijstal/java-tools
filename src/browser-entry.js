@@ -243,6 +243,16 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Set a callback function to capture println output for web UI
+   * @param {function} callback - Function to call with println output
+   */
+  setOutputCallback(callback) {
+    if (this.debugController && this.debugController.jvm) {
+      this.debugController.jvm.setOutputCallback(callback);
+    }
+  }
+
+  /**
    * Get disassembly of a class without starting debug session
    * @param {Uint8Array} classData - The binary class file data
    * @returns {string} - The disassembled bytecode

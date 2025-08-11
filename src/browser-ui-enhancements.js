@@ -166,6 +166,20 @@ async function initializeJVM() {
         if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
             jvmDebug = new window.JVMDebug.BrowserJVMDebug();
             
+            // Set up println output callback to redirect to web console
+            jvmDebug.setOutputCallback((output) => {
+                // Add println output to the web UI output console
+                const outputDiv = document.getElementById(DOM_IDS.OUTPUT);
+                if (outputDiv) {
+                    const timestamp = new Date().toLocaleTimeString();
+                    const logEntry = document.createElement('div');
+                    logEntry.textContent = `[${timestamp}] ${output}`;
+                    logEntry.style.color = '#4ec9b0'; // Different color for program output
+                    outputDiv.appendChild(logEntry);
+                    outputDiv.scrollTop = outputDiv.scrollHeight; // Auto-scroll to bottom
+                }
+            });
+            
             try {
                 // Detect environment and determine data.zip URL
                 const dataUrl = await getDataZipUrl();

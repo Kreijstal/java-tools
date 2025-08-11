@@ -19,12 +19,18 @@ class JVM {
   constructor() {
     this.callStack = new Stack();
     this.classes = {};
+    // Output callback for capturing println output in browser UI
+    this.outputCallback = null;
     this.jre = {
       'java/lang/System': {
         'out': {
           'java/io/PrintStream': {
             'println': (str) => {
               console.log(str);
+              // Also send to web UI if callback is set
+              if (this.outputCallback) {
+                this.outputCallback(str);
+              }
             }
           }
         }
@@ -36,6 +42,14 @@ class JVM {
     this.stepMode = null; // null, 'into', 'over', 'out', 'instruction', 'finish'
     this.stepTargetDepth = null;
     this.stepTargetFrame = null;
+  }
+
+  /**
+   * Set a callback function to capture println output for web UI
+   * @param {function} callback - Function to call with println output
+   */
+  setOutputCallback(callback) {
+    this.outputCallback = callback;
   }
 
   run(classFilePath, options = {}) {
