@@ -239,7 +239,7 @@ async function getDataZipUrl() {
     }
     
     // Default to local path for development and fallback
-    return '/dist/data.zip';
+    return './data.zip';
 }
 
 async function populateSampleClasses() {
