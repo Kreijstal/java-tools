@@ -158,11 +158,15 @@ test('Debug API Error Handling', async (t) => {
   }
 
   // Test loading invalid class
+  const originalConsoleError = console.error;
+  console.error = () => {}; // Suppress expected error message
   try {
     await controller.start('nonexistent.class');
     t.fail('Should throw error for nonexistent class');
   } catch (error) {
     t.ok(error.message.includes('Error loading class'), 'Should throw loading error');
+  } finally {
+    console.error = originalConsoleError; // Restore console.error
   }
 
   t.end();
