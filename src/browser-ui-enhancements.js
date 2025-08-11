@@ -135,6 +135,61 @@ function getClassDescription(className) {
 }
 
 // JVM Integration Functions
+function setupStateFileInput() {
+    // Set up state file input handler
+    const stateFileInput = document.getElementById('stateFileInput');
+    if (stateFileInput) {
+        stateFileInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const serializedState = JSON.parse(e.target.result);
+                    
+                    // Try to restore using the real JVM if available
+                    if (typeof jvmDebug !== 'undefined' && jvmDebug && typeof jvmDebug.deserialize === 'function') {
+                        jvmDebug.deserialize(serializedState);
+                        if (typeof updateDebugDisplay === 'function') {
+                            updateDebugDisplay();
+                        }
+                    } else {
+                        // Fallback restoration for when JVM isn't available
+                        // Restore class if included in state
+                        if (serializedState.loadedClass) {
+                            currentState.loadedClass = serializedState.loadedClass;
+                            currentState.className = serializedState.loadedClass.name;
+                        }
+                        
+                        // Restore JVM state
+                        updateState({
+                            status: serializedState.executionState || 'paused',
+                            pc: serializedState.jvmState?.frames?.[0]?.pc || 0,
+                            stack: serializedState.jvmState?.frames?.[0]?.stack || [],
+                            locals: serializedState.jvmState?.frames?.[0]?.locals || [],
+                            breakpoints: serializedState.jvmState?.breakpoints || [],
+                            callDepth: serializedState.jvmState?.frames?.length || 0,
+                            method: 'main([Ljava/lang/String;)V'
+                        });
+                    }
+                    
+                    updateStatus('State restored successfully', 'success');
+                    log('JVM state restored successfully', 'success');
+                    
+                    if (currentState.loadedClass) {
+                        log(`Restored class: ${currentState.className}`, 'success');
+                    }
+                } catch (error) {
+                    log(`Failed to restore state: ${error.message}`, 'error');
+                    updateStatus('Failed to restore state', 'error');
+                }
+            };
+            reader.readAsText(file);
+        });
+    }
+}
+
 async function initializeJVM() {
     try {
         log('JVM Debug API Example loaded', 'info');
@@ -178,7 +233,17 @@ async function initializeJVM() {
             setTimeout(initializeEditor, 100);
         } else {
             log('JVM Debug bundle not available - using mock implementation', 'info');
+            // Still initialize editor even without JVM
+            setTimeout(initializeEditor, 100);
         }
+        
+        // Set up state file input handler
+        setupStateFileInput();
+        
+        // Initialize state and welcome message
+        updateState(currentState);
+        log('Click "Start Debugging" to begin', 'info');
+        
     } catch (error) {
         log(`Failed to initialize real JVM: ${error.message}`, 'error');
     }
@@ -274,6 +339,11 @@ async function loadSampleClass() {
             updateStatus('Debugger started - Real JVM session active', 'success');
         }
         
+        // Update debug display to show disassembly
+        if (typeof updateDebugDisplay === 'function') {
+            updateDebugDisplay();
+        }
+        
     } catch (error) {
         log(`Failed to start debugging ${selectedClass}: ${error.message}`, 'error');
     }
@@ -321,13 +391,30 @@ function updateDebugDisplay() {
         if (state.executionState === 'paused' || state.executionState === 'running') {
             try {
                 const view = jvmDebug.getDisassemblyView();
-                if (view && view.formattedDisassembly && window.aceEditor) {
-                    aceEditor.setValue(view.formattedDisassembly, -1);
-                    
-                    // Highlight current line if available
-                    if (view.currentLineNumber !== undefined && view.currentLineNumber >= 0) {
-                        aceEditor.scrollToLine(view.currentLineNumber, true, true);
+                log(`Got disassembly view: ${!!view}`, 'debug');
+                
+                if (view && view.formattedDisassembly) {
+                    if (window.aceEditor) {
+                        log('Updating ACE editor with disassembly content', 'debug');
+                        aceEditor.setValue(view.formattedDisassembly, -1);
+                        
+                        // Highlight current line if available
+                        if (view.currentLineNumber !== undefined && view.currentLineNumber >= 0) {
+                            aceEditor.scrollToLine(view.currentLineNumber, true, true);
+                        }
+                    } else {
+                        log('ACE editor not available, falling back to textarea', 'warning');
+                        // Fallback to textarea if ACE editor failed
+                        const editorDiv = document.getElementById('disassembly-editor');
+                        if (editorDiv) {
+                            const textarea = editorDiv.querySelector('textarea');
+                            if (textarea) {
+                                textarea.value = view.formattedDisassembly;
+                            }
+                        }
                     }
+                } else {
+                    log('No disassembly content available', 'warning');
                 }
             } catch (disasmError) {
                 log(`Failed to update disassembly: ${disasmError.message}`, 'error');
@@ -347,8 +434,30 @@ function updateDebugDisplay() {
 // ACE Editor Initialization
 function initializeEditor() {
     try {
+        log('Initializing ACE editor...', 'debug');
+        
+        // Ensure editor container exists and has proper height
+        const editorContainer = document.getElementById('disassembly-editor');
+        if (!editorContainer) {
+            throw new Error('Editor container not found');
+        }
+        
+        // Set minimum height to ensure editor is visible
+        if (editorContainer.style.height === '' || editorContainer.offsetHeight === 0) {
+            editorContainer.style.height = '300px';
+            editorContainer.style.minHeight = '300px';
+        }
+        
         aceEditor = ace.edit("disassembly-editor");
-        aceEditor.setTheme("ace/theme/monokai");
+        
+        // Configure ACE with safe defaults and error handling for theme
+        try {
+            aceEditor.setTheme("ace/theme/monokai");
+        } catch (themeError) {
+            log(`Theme loading failed, using default: ${themeError.message}`, 'warning');
+            // Theme will fall back to default
+        }
+        
         aceEditor.session.setMode("ace/mode/text");
         aceEditor.setReadOnly(true);
         aceEditor.renderer.setShowGutter(true);
@@ -360,6 +469,11 @@ function initializeEditor() {
         });
 
         aceEditor.setValue('Load a class to see disassembly...', -1);
+        
+        // Make editor instance available globally
+        window.aceEditor = aceEditor;
+        
+        log('ACE editor initialized successfully', 'success');
         
         // Add gutter click handler for breakpoints
         aceEditor.on("guttermousedown", function(e) {
@@ -379,11 +493,11 @@ function initializeEditor() {
                         if (breakpoints.includes(pc)) {
                             jvmDebug.removeBreakpoint(pc);
                             aceEditor.session.clearBreakpoint(line);
-                            log(`Breakpoint removed at PC ${pc}`, 'info');
+                            log(`Breakpoint removed at PC=${pc}`, 'info');
                         } else {
                             jvmDebug.setBreakpoint(pc);
                             aceEditor.session.setBreakpoint(line, "ace_breakpoint");
-                            log(`Breakpoint set at PC ${pc}`, 'info');
+                            log(`Breakpoint set at PC=${pc}`, 'info');
                         }
                         updateDebugDisplay();
                     }
@@ -395,10 +509,11 @@ function initializeEditor() {
         });
         
     } catch (e) {
-        log(`ACE editor failed to load: ${e.message}`, 'warning');
+        log(`ACE editor failed to initialize: ${e.message}`, 'error');
         // Fallback if Ace editor fails to load
         const editorDiv = document.getElementById('disassembly-editor');
         if (editorDiv) {
+            editorDiv.style.height = '300px';
             editorDiv.innerHTML = 
                 '<textarea readonly style="width: 100%; height: 300px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #3e3e42;">Load a class to see disassembly...</textarea>';
         }
@@ -511,6 +626,22 @@ function enhanceWithRealJVM() {
             const result = jvmDebug.continue();
             log('Continue completed', 'info');
             updateDebugDisplay();
+            
+            // Update status based on result
+            const state = jvmDebug.getCurrentState();
+            if (state.executionState === 'completed') {
+                updateStatus('Program execution completed', 'success');
+            } else if (state.executionState === 'paused') {
+                // Check if we hit a breakpoint
+                const breakpoints = state.breakpoints || [];
+                if (breakpoints.length > 0 && breakpoints.includes(state.pc)) {
+                    updateStatus(`Hit breakpoint at PC=${state.pc}`, 'info');
+                } else {
+                    updateStatus('Execution paused', 'info');
+                }
+            } else {
+                updateStatus('Continue execution completed', 'info');
+            }
         } catch (error) {
             log(`Continue failed: ${error.message}`, 'error');
             if (originalContinue) originalContinue();
@@ -547,6 +678,10 @@ function enhanceWithRealJVM() {
         try {
             const state = jvmDebug.serialize();
             const stateJson = JSON.stringify(state, null, 2);
+            
+            // Store in memory for testing
+            window._testSerializedState = state;
+            
             const blob = new Blob([stateJson], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             
@@ -648,6 +783,22 @@ function clearOutput() {
 }
 
 function deserializeState() {
+    // If we have a test state in memory, use it directly
+    if (window._testSerializedState && typeof jvmDebug !== 'undefined' && jvmDebug) {
+        try {
+            jvmDebug.deserialize(window._testSerializedState);
+            if (typeof updateDebugDisplay === 'function') {
+                updateDebugDisplay();
+            }
+            updateStatus('State restored successfully', 'success');
+            log('JVM state restored successfully', 'success');
+            return;
+        } catch (error) {
+            log(`Memory state restore failed: ${error.message}`, 'error');
+        }
+    }
+    
+    // Otherwise, trigger file input
     const input = document.getElementById('stateFileInput');
     if (input) {
         input.click();
@@ -670,7 +821,7 @@ function setBreakpoint() {
     
     try {
         jvmDebug.setBreakpoint(pc);
-        log(`Breakpoint set at PC ${pc}`, 'success');
+        log(`Breakpoint set at PC=${pc}`, 'success');
         input.value = '';
         updateDebugDisplay();
     } catch (error) {
