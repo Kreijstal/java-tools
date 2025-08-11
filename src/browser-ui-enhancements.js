@@ -135,6 +135,61 @@ function getClassDescription(className) {
 }
 
 // JVM Integration Functions
+function setupStateFileInput() {
+    // Set up state file input handler
+    const stateFileInput = document.getElementById('stateFileInput');
+    if (stateFileInput) {
+        stateFileInput.addEventListener('change', function(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const serializedState = JSON.parse(e.target.result);
+                    
+                    // Try to restore using the real JVM if available
+                    if (typeof jvmDebug !== 'undefined' && jvmDebug && typeof jvmDebug.deserialize === 'function') {
+                        jvmDebug.deserialize(serializedState);
+                        if (typeof updateDebugDisplay === 'function') {
+                            updateDebugDisplay();
+                        }
+                    } else {
+                        // Fallback restoration for when JVM isn't available
+                        // Restore class if included in state
+                        if (serializedState.loadedClass) {
+                            currentState.loadedClass = serializedState.loadedClass;
+                            currentState.className = serializedState.loadedClass.name;
+                        }
+                        
+                        // Restore JVM state
+                        updateState({
+                            status: serializedState.executionState || 'paused',
+                            pc: serializedState.jvmState?.frames?.[0]?.pc || 0,
+                            stack: serializedState.jvmState?.frames?.[0]?.stack || [],
+                            locals: serializedState.jvmState?.frames?.[0]?.locals || [],
+                            breakpoints: serializedState.jvmState?.breakpoints || [],
+                            callDepth: serializedState.jvmState?.frames?.length || 0,
+                            method: 'main([Ljava/lang/String;)V'
+                        });
+                    }
+                    
+                    updateStatus('State restored successfully', 'success');
+                    log('JVM state restored successfully', 'success');
+                    
+                    if (currentState.loadedClass) {
+                        log(`Restored class: ${currentState.className}`, 'success');
+                    }
+                } catch (error) {
+                    log(`Failed to restore state: ${error.message}`, 'error');
+                    updateStatus('Failed to restore state', 'error');
+                }
+            };
+            reader.readAsText(file);
+        });
+    }
+}
+
 async function initializeJVM() {
     try {
         log('JVM Debug API Example loaded', 'info');
@@ -178,7 +233,17 @@ async function initializeJVM() {
             setTimeout(initializeEditor, 100);
         } else {
             log('JVM Debug bundle not available - using mock implementation', 'info');
+            // Still initialize editor even without JVM
+            setTimeout(initializeEditor, 100);
         }
+        
+        // Set up state file input handler
+        setupStateFileInput();
+        
+        // Initialize state and welcome message
+        updateState(currentState);
+        log('Click "Start Debugging" to begin', 'info');
+        
     } catch (error) {
         log(`Failed to initialize real JVM: ${error.message}`, 'error');
     }

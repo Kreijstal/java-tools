@@ -56,65 +56,7 @@ function addBrowserUIScript(htmlContent) {
     <!-- Include browser UI enhancements -->
     <script src="/dist/browser-ui-enhancements.js"></script>
     
-    <script>
-        // Initialize state file input handler when DOM is ready
-        document.addEventListener('DOMContentLoaded', function() {
-            // Set up state file input handler
-            document.getElementById('stateFileInput').addEventListener('change', function(e) {
-                const file = e.target.files[0];
-                if (!file) return;
-                
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    try {
-                        const serializedState = JSON.parse(e.target.result);
-                        
-                        // Try to restore using the real JVM if available
-                        if (typeof jvmDebug !== 'undefined' && jvmDebug && typeof jvmDebug.deserialize === 'function') {
-                            jvmDebug.deserialize(serializedState);
-                            if (typeof updateDebugDisplay === 'function') {
-                                updateDebugDisplay();
-                            }
-                        } else {
-                            // Fallback restoration for when JVM isn't available
-                            // Restore class if included in state
-                            if (serializedState.loadedClass) {
-                                currentState.loadedClass = serializedState.loadedClass;
-                                currentState.className = serializedState.loadedClass.name;
-                            }
-                            
-                            // Restore JVM state
-                            updateState({
-                                status: serializedState.executionState || 'paused',
-                                pc: serializedState.jvmState?.frames?.[0]?.pc || 0,
-                                stack: serializedState.jvmState?.frames?.[0]?.stack || [],
-                                locals: serializedState.jvmState?.frames?.[0]?.locals || [],
-                                breakpoints: serializedState.jvmState?.breakpoints || [],
-                                callDepth: serializedState.jvmState?.frames?.length || 0,
-                                method: 'main([Ljava/lang/String;)V'
-                            });
-                        }
-                        
-                        updateStatus('State restored successfully', 'success');
-                        log('JVM state restored successfully', 'success');
-                        
-                        if (currentState.loadedClass) {
-                            log(\`Restored class: \${currentState.className}\`, 'success');
-                        }
-                    } catch (error) {
-                        log(\`Failed to restore state: \${error.message}\`, 'error');
-                        updateStatus('Failed to restore state', 'error');
-                    }
-                };
-                reader.readAsText(file);
-            });
-            
-            // Initialize state and welcome message
-            updateState(currentState);
-            log('JVM Debug API Example loaded', 'info');
-            log('Click "Start Debugging" to begin', 'info');
-        });
-    </script>
+
     `;
     
     // Insert before closing </head> tag
