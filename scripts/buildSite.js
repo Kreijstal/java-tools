@@ -9,7 +9,6 @@
 
 const path = require('path');
 const fs = require('fs');
-const https = require('https');
 const { verifyBuildPrerequisites, ensureDirectory, readFile, writeFile, copyFile } = require('./build-utils');
 const { processDebugInterfaceTemplate, createSiteReadme } = require('./template-processor');
 
@@ -21,9 +20,9 @@ const libDir = path.join(distDir, 'lib');
 const examplesDir = path.join(process.cwd(), 'examples');
 const srcDir = path.join(process.cwd(), 'src');
 
-// Function to download ACE editor
-async function downloadAceEditor() {
-    const aceUrl = 'https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.2/ace.js';
+// Function to copy ACE editor from node_modules
+async function setupAceEditor() {
+    const aceSourcePath = path.join(process.cwd(), 'node_modules', 'ace-builds', 'src-min-noconflict', 'ace.js');
     const aceFilePath = path.join(libDir, 'ace.js');
     
     // Check if ACE editor already exists
@@ -32,34 +31,15 @@ async function downloadAceEditor() {
         return;
     }
     
-    console.log('  📥 Downloading ACE editor...');
+    console.log('  📦 Copying ACE editor from node_modules...');
     ensureDirectory(libDir);
     
-    return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(aceFilePath);
-        
-        https.get(aceUrl, (response) => {
-            if (response.statusCode !== 200) {
-                reject(new Error(`Failed to download ACE editor: ${response.statusCode}`));
-                return;
-            }
-            
-            response.pipe(file);
-            
-            file.on('finish', () => {
-                file.close();
-                console.log('  ✓ ACE editor downloaded successfully');
-                resolve();
-            });
-            
-            file.on('error', (err) => {
-                fs.unlink(aceFilePath, () => {}); // Delete the file async
-                reject(err);
-            });
-        }).on('error', (err) => {
-            reject(err);
-        });
-    });
+    if (!fs.existsSync(aceSourcePath)) {
+        throw new Error('ACE editor not found in node_modules. Please run: npm install ace-builds');
+    }
+    
+    copyFile(aceSourcePath, aceFilePath);
+    console.log('  ✓ ACE editor copied successfully');
 }
 
 // Main build function
@@ -68,9 +48,9 @@ async function buildSite() {
     ensureDirectory(distDir);
     verifyBuildPrerequisites(distDir);
 
-    // Step 2: Download ACE editor
+    // Step 2: Setup ACE editor from node_modules
     console.log('📦 Setting up ACE editor...');
-    await downloadAceEditor();
+    await setupAceEditor();
 
     // Step 3: Copy browser UI enhancement module to dist for inclusion
     console.log('📋 Copying browser UI enhancements...');

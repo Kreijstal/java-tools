@@ -4,6 +4,7 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { execSync } = require('child_process');
 
 const PORT = 3000;
 const PUBLIC_DIR = path.join(__dirname, '..');
@@ -45,6 +46,27 @@ function serveFile(res, filePath) {
   });
 }
 
+// Function to ensure build dependencies are met
+function ensureBuildDependencies() {
+  const distDir = path.join(PUBLIC_DIR, 'dist');
+  const indexPath = path.join(distDir, 'index.html');
+  
+  // Check if dist/index.html exists
+  if (!fs.existsSync(indexPath)) {
+    console.log('📦 Build artifacts not found. Running build process...');
+    try {
+      execSync('npm run build', { 
+        cwd: PUBLIC_DIR, 
+        stdio: 'inherit' 
+      });
+      console.log('✅ Build completed successfully');
+    } catch (error) {
+      console.error('❌ Build failed:', error.message);
+      process.exit(1);
+    }
+  }
+}
+
 const server = http.createServer((req, res) => {
   let urlPath = req.url === '/' ? '/dist/index.html' : req.url;
   
@@ -76,6 +98,9 @@ const server = http.createServer((req, res) => {
     }
   });
 });
+
+// Ensure build dependencies before starting server
+ensureBuildDependencies();
 
 server.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
