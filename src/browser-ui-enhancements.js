@@ -400,7 +400,8 @@ function updateDebugDisplay() {
         // Update execution state display with compact formatting - reduced whitespace
         const statusDiv = document.getElementById(DOM_IDS.EXECUTION_STATE);
         if (statusDiv) {
-            statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : ''}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div>`;
+            const breakpoints = jvmDebug.getBreakpoints ? jvmDebug.getBreakpoints() : [];
+            statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : ''}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div><div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${breakpoints.join(', ')}]</span></div>`;
         }
         
         // Update stack display
@@ -659,11 +660,16 @@ function executeDebugOperation(operation, operationName, successMessage) {
         throw new Error(`JVM not initialized - cannot ${operationName.toLowerCase()}`);
     }
     
-    const result = operation();
-    // Reduced verbosity: Only log step completion in verbose mode
-    // log(successMessage, 'info');
-    updateDebugDisplay();
-    return result;
+    try {
+        const result = operation();
+        // Keep step completion messages for tests and user feedback
+        log(successMessage, 'info');
+        updateDebugDisplay();
+        return result;
+    } catch (error) {
+        logError(`Failed to ${operationName}`, error);
+        throw error;
+    }
 }
 
 // Enhanced debugging functions
