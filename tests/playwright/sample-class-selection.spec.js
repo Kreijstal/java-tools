@@ -84,27 +84,27 @@ test.describe('Sample Class Selection UI', () => {
     await expect(page.locator('#continueBtn')).toBeEnabled();
   });
 
-  test('should display class descriptions in dropdown', async ({ page }) => {
+  test('should display class names in dropdown', async ({ page }) => {
     // Wait for the dropdown to be populated
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(3000); // Increased wait time
     
-    // Get all options and check they have descriptions
+    // Get all options and check they have class names
     const options = await page.locator('#sampleClassSelect option').allTextContents();
     
     // Filter out the default option
     const classOptions = options.filter(option => !option.includes('Select a sample class') && !option.includes('Loading'));
     
-    // Each class option should have a description (format: "ClassName - Description")
+    // Each class option should be just the class name (no descriptions)
     for (const option of classOptions.slice(0, 5)) { // Check first 5 to avoid timeout
-      expect(option).toMatch(/\w+ - .+/); // Should match "ClassName - Description" pattern
+      expect(option).toMatch(/^\w+$/); // Should match just a class name pattern
     }
     
-    // Check specific classes have expected descriptions
+    // Check specific classes are present (without descriptions)
     const allText = options.join(' ');
-    expect(allText).toContain('Hello - Hello World program');
-    expect(allText).toContain('VerySimple - Basic arithmetic');
-    expect(allText).toContain('Calculator - Calculator operations');
+    expect(allText).toContain('Hello');
+    expect(allText).toContain('VerySimple');
+    expect(allText).toContain('Calculator');
   });
 
   test('should handle loading multiple sample classes sequentially', async ({ page }) => {

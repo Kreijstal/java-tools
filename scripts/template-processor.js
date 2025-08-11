@@ -21,6 +21,7 @@ function processDebugInterfaceTemplate(htmlContent) {
     htmlContent = addBreakpointUI(htmlContent);
     htmlContent = updateFileInputs(htmlContent);
     htmlContent = addUIElementIds(htmlContent);
+    htmlContent = addDataZipDownloadSection(htmlContent);
     
     console.log('  ✓ Template processed successfully');
     return htmlContent;
@@ -103,6 +104,41 @@ function addUIElementIds(htmlContent) {
     htmlContent = htmlContent.replace(outputConsolePattern, '$1\n                <button onclick="clearOutput()" style="float: right; font-size: 10px; padding: 2px 6px;">Clear</button>');
     
     return htmlContent;
+}
+
+/**
+ * Add data.zip download section for GitHub Pages deployment
+ */
+function addDataZipDownloadSection(htmlContent) {
+    // Find the sample classes section and add download section before it
+    const sampleClassesPattern = /(<h4>📚 Sample Classes[^<]*<\/h4>)/;
+    const downloadSection = `
+        <!-- Data Package Download Section for GitHub Pages -->
+        <h3>📚 Getting Sample .class Files to Try</h3>
+        <p>Download the complete sample class files package to try different examples locally:</p>
+        <div class="button-group">
+            <a href="./data.zip" download="java-class-samples.zip" style="
+                display: inline-block; 
+                background-color: #0e639c; 
+                color: white; 
+                padding: 8px 16px; 
+                text-decoration: none; 
+                border-radius: 3px; 
+                font-family: inherit; 
+                font-size: 12px;
+                border: none;
+            ">📦 Download data.zip</a>
+            <span style="margin-left: 10px; color: #888; font-size: 11px;">
+                Contains 25 sample .class files (~13KB)
+            </span>
+        </div>
+        <p style="font-size: 11px; color: #888; margin-bottom: 20px;">
+            Or select from pre-loaded samples below:
+        </p>
+        
+        $1`;
+    
+    return htmlContent.replace(sampleClassesPattern, downloadSection);
 }
 
 /**
