@@ -218,19 +218,11 @@
             <button onclick="startDebugging()" id="debugBtn" disabled>Start Debugging</button>
         </div>
         
-        <!-- Sample Class Loading Section -->
+        <!-- Sample Class Loading Section - populated dynamically -->
+        <h4>📚 Sample Classes - or upload your own .class/.jar files</h4>
         <div class="button-group">
             <select id="sampleClassSelect" style="color: #d4d4d4; background-color: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; padding: 8px; font-family: inherit; font-size: 12px; margin-right: 10px;">
-                <option value="">Choose a sample class...</option>
-                <option value="Hello">Hello - Simple Hello World</option>
-                <option value="VerySimple">VerySimple - Basic class structure</option>
-                <option value="RuntimeArithmetic">RuntimeArithmetic - Math operations</option>
-                <option value="SimpleArithmetic">SimpleArithmetic - Simple calculations</option>
-                <option value="StringConcat">StringConcat - String operations</option>
-                <option value="CalcMain">CalcMain - Calculator main class</option>
-                <option value="ExceptionTest">ExceptionTest - Exception handling</option>
-                <option value="InvokeVirtualTest">InvokeVirtualTest - Method invocation</option>
-                <option value="MainApp">MainApp - Larger application example</option>
+                <option value="">Loading sample classes...</option>
             </select>
             <button onclick="loadSampleClass()" id="loadSampleBtn">Load Sample</button>
         </div>
@@ -290,7 +282,7 @@
         <div style="font-size: 12px; line-height: 1.5; background-color: #2d2d30; padding: 10px; border-radius: 3px; margin-bottom: 10px;">
             <p><strong>Quick Start Options:</strong></p>
             <ul>
-                <li><strong>🚀 Load Sample Class:</strong> Use the "Choose a sample class..." dropdown above to instantly load one of 25 pre-compiled sample classes</li>
+                <li><strong>🚀 Load Sample Class:</strong> Use the "Choose a sample class..." dropdown above to instantly load one of our pre-compiled sample classes</li>
                 <li><strong>📂 Browse Repository:</strong> Download individual .class files from <a href="/sources/" style="color: #569cd6;">sources directory</a></li>
                 <li><strong>☕ Compile your own:</strong> <code style="background: #1e1e1e; padding: 2px 4px;">javac YourFile.java</code> creates YourFile.class to upload</li>
             </ul>

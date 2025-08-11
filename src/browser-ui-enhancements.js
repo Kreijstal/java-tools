@@ -105,31 +105,31 @@ function updateButtons() {
 // Class Descriptions
 function getClassDescription(className) {
     const descriptions = {
-        'VerySimple.class': 'Basic arithmetic (3-2=1)',
-        'Hello.class': 'Hello World program',  
-        'Calculator.class': 'Calculator operations',
-        'Calc.class': 'Simple calculation demo',
-        'CalcMain.class': 'Main calculation entry point',
-        'RuntimeArithmetic.class': 'Runtime arithmetic operations',
         'ArithmeticTest.class': 'Arithmetic operation tests',
-        'ConstantsTest.class': 'Constant loading tests',
+        'Calc.class': 'Simple calculation demo',
+        'CalcMain.class': 'Calculator main class',
+        'Calculator.class': 'Calculator operations',
+        'ConstantsTest.class': 'Constant loading tests (iconst_0 through iconst_5)',
         'DivisionTest.class': 'Division operation tests',
-        'SmallDivisionTest.class': 'Small division tests',
-        'WorkingArithmetic.class': 'Working arithmetic examples',
+        'ExceptionTest.class': 'Exception handling tests',
+        'Hello.class': 'Hello World program',  
+        'InvokeVirtualTest.class': 'Virtual method invocation tests',
+        'MainApp.class': 'Main application entry point',
+        'RuntimeArithmetic.class': 'Runtime arithmetic operations',
         'SimpleArithmetic.class': 'Simple arithmetic operations',
-        'StringConcat.class': 'String concatenation',
         'SimpleStringConcat.class': 'Simple string concatenation',
+        'SipushTest.class': 'Short integer push tests',
+        'SmallDivisionTest.class': 'Small division tests',
         'StringBuilderConcat.class': 'StringBuilder concatenation',
+        'StringConcat.class': 'String concatenation',
         'StringConcatMethod.class': 'String concatenation methods',
         'StringMethodsTest.class': 'String method tests',
         'TestMethods.class': 'Method testing examples',
         'TestMethodsRunner.class': 'Test method runner',
-        'ExceptionTest.class': 'Exception handling tests',
-        'InvokeVirtualTest.class': 'Virtual method invocation tests',
-        'MainApp.class': 'Main application entry point',
-        'SipushTest.class': 'Short integer push tests',
         'Thing.class': 'Generic object example',
-        'ThingProducer.class': 'Object factory example'
+        'ThingProducer.class': 'Object factory example',
+        'VerySimple.class': 'Basic arithmetic (3-2=1)',
+        'WorkingArithmetic.class': 'Working arithmetic examples'
     };
     return descriptions[className] || 'Java class file';
 }
@@ -250,8 +250,8 @@ async function initializeJVM() {
 }
 
 async function populateSampleClasses() {
-    const controls = document.querySelector('.controls');
-    if (controls && jvmDebug) {
+    const sampleSelect = document.getElementById('sampleClassSelect');
+    if (sampleSelect && jvmDebug) {
         try {
             // Get available classes from the JVM debug instance
             let availableClasses = [];
@@ -269,23 +269,49 @@ async function populateSampleClasses() {
                     description: getClassDescription(cls)
                 })) :
                 [
-                    { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
+                    { filename: 'ArithmeticTest.class', name: 'ArithmeticTest', description: 'Arithmetic operation tests' },
+                    { filename: 'Calc.class', name: 'Calc', description: 'Simple calculation demo' },
+                    { filename: 'CalcMain.class', name: 'CalcMain', description: 'Calculator main class' },
+                    { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' },
+                    { filename: 'ConstantsTest.class', name: 'ConstantsTest', description: 'Constant loading tests (iconst_0 through iconst_5)' },
+                    { filename: 'DivisionTest.class', name: 'DivisionTest', description: 'Division operation tests' },
+                    { filename: 'ExceptionTest.class', name: 'ExceptionTest', description: 'Exception handling tests' },
                     { filename: 'Hello.class', name: 'Hello', description: 'Hello World program' },
-                    { filename: 'Calculator.class', name: 'Calculator', description: 'Calculator operations' }
+                    { filename: 'InvokeVirtualTest.class', name: 'InvokeVirtualTest', description: 'Virtual method invocation tests' },
+                    { filename: 'MainApp.class', name: 'MainApp', description: 'Main application entry point' },
+                    { filename: 'RuntimeArithmetic.class', name: 'RuntimeArithmetic', description: 'Runtime arithmetic operations' },
+                    { filename: 'SimpleArithmetic.class', name: 'SimpleArithmetic', description: 'Simple arithmetic operations' },
+                    { filename: 'SimpleStringConcat.class', name: 'SimpleStringConcat', description: 'Simple string concatenation' },
+                    { filename: 'SipushTest.class', name: 'SipushTest', description: 'Short integer push tests' },
+                    { filename: 'SmallDivisionTest.class', name: 'SmallDivisionTest', description: 'Small division tests' },
+                    { filename: 'StringBuilderConcat.class', name: 'StringBuilderConcat', description: 'StringBuilder concatenation' },
+                    { filename: 'StringConcat.class', name: 'StringConcat', description: 'String concatenation' },
+                    { filename: 'StringConcatMethod.class', name: 'StringConcatMethod', description: 'String concatenation methods' },
+                    { filename: 'StringMethodsTest.class', name: 'StringMethodsTest', description: 'String method tests' },
+                    { filename: 'TestMethods.class', name: 'TestMethods', description: 'Method testing examples' },
+                    { filename: 'TestMethodsRunner.class', name: 'TestMethodsRunner', description: 'Test method runner' },
+                    { filename: 'Thing.class', name: 'Thing', description: 'Generic object example' },
+                    { filename: 'ThingProducer.class', name: 'ThingProducer', description: 'Object factory example' },
+                    { filename: 'VerySimple.class', name: 'VerySimple', description: 'Basic arithmetic (3-2=1)' },
+                    { filename: 'WorkingArithmetic.class', name: 'WorkingArithmetic', description: 'Working arithmetic examples' }
                 ];
             
-            const samplesDiv = document.createElement('div');
-            samplesDiv.innerHTML = `
-                <h4>📚 Sample Classes (${classes.length} available) - or upload your own .class/.jar files</h4>
-                <select id="sampleClassSelect">
-                    <option value="">Select a sample class...</option>
-                    ${classes.map(cls => 
-                        `<option value="${cls.filename}">${cls.name} - ${cls.description}</option>`
-                    ).join('')}
-                </select>
-                <button onclick="loadSampleClass()">Load Sample</button>
-            `;
-            controls.appendChild(samplesDiv);
+            // Clear existing options except the first one
+            sampleSelect.innerHTML = '<option value="">Select a sample class...</option>';
+            
+            // Add all classes to the dropdown
+            classes.forEach(cls => {
+                const option = document.createElement('option');
+                option.value = cls.filename;
+                option.textContent = `${cls.name} - ${cls.description}`;
+                sampleSelect.appendChild(option);
+            });
+            
+            // Update the heading to show the count
+            const samplesHeading = document.querySelector('h4');
+            if (samplesHeading && samplesHeading.textContent.includes('Sample Classes')) {
+                samplesHeading.textContent = `📚 Sample Classes (${classes.length} available) - or upload your own .class/.jar files`;
+            }
             
             // Enable the Start Debugging button now that sample classes are available
             const debugBtn = document.getElementById('debugBtn');
@@ -314,38 +340,64 @@ async function loadSampleClass() {
     const select = document.getElementById('sampleClassSelect');
     const selectedClass = select.value;
     
-    if (!selectedClass || !jvmDebug) {
-        log('Please select a sample class and ensure JVM is initialized', 'error');
+    if (!selectedClass) {
+        log('Please select a sample class', 'error');
+        return;
+    }
+    
+    if (!jvmDebug) {
+        log('JVM not initialized - using fallback loading', 'warning');
+        // Fallback to mock loading for when JVM isn't available
+        currentState.loadedClass = {
+            name: selectedClass.replace('.class', ''),
+            filename: selectedClass
+        };
+        currentState.className = selectedClass.replace('.class', '');
+        updateStatus(`Sample class loaded: ${selectedClass.replace('.class', '')}`, 'success');
+        log(`Successfully loaded ${selectedClass}`, 'success');
+        updateButtons();
         return;
     }
     
     try {
         log(`Loading sample class: ${selectedClass}`, 'info');
         
-        const result = await jvmDebug.start(selectedClass);
-        log(`Debug session started for ${selectedClass}`, 'success');
-        updateDebugDisplay();
+        // Get the class data from the JVM's loaded files
+        const classData = await jvmDebug.fileProvider.readFile(selectedClass);
+        if (!classData) {
+            throw new Error(`Class file ${selectedClass} not found in loaded data`);
+        }
         
-        // Update the current state to enable debug buttons
+        log(`Successfully loaded ${selectedClass} (${classData.length} bytes)`, 'success');
+        updateStatus(`Sample class loaded: ${selectedClass.replace('.class', '')}`, 'success');
+        
+        // Update the current state to enable debug buttons (but don't start debugging yet)
         if (typeof updateState === 'function') {
             updateState({
-                loadedClass: { name: selectedClass },
+                loadedClass: { name: selectedClass, data: classData },
                 className: selectedClass.replace('.class', ''),
-                status: 'paused'
+                status: 'ready'  // Ready for debugging, not paused
             });
         }
         
-        if (typeof updateStatus === 'function') {
-            updateStatus('Debugger started - Real JVM session active', 'success');
+        // Enable debug button
+        const debugBtn = document.getElementById('debugBtn');
+        if (debugBtn) {
+            debugBtn.disabled = false;
         }
         
-        // Update debug display to show disassembly
-        if (typeof updateDebugDisplay === 'function') {
-            updateDebugDisplay();
+        // Update ACE editor to show that class is loaded
+        if (window.aceEditor) {
+            const className = selectedClass.replace('.class', '');
+            window.aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
         }
+        
+        // Clear the selection for next use
+        select.selectedIndex = 0;
         
     } catch (error) {
-        log(`Failed to start debugging ${selectedClass}: ${error.message}`, 'error');
+        log(`Failed to load sample class: ${error.message}`, 'error');
+        updateStatus('Failed to load sample class', 'error');
     }
 }
 
