@@ -68,7 +68,7 @@ function ensureBuildDependencies() {
 }
 
 const server = http.createServer((req, res) => {
-  let urlPath = req.url === '/' ? '/dist/index.html' : req.url;
+  let urlPath = req.url;
   
   // Remove query parameters
   urlPath = urlPath.split('?')[0];
@@ -81,10 +81,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  const filePath = path.join(PUBLIC_DIR, normalizedPath);
+  let filePath;
+  if (normalizedPath.startsWith('/examples/')) {
+    // Serve examples from the root directory for development access
+    filePath = path.join(PUBLIC_DIR, normalizedPath);
+  } else if (normalizedPath.startsWith('/dist/')) {
+    // Legacy compatibility: serve /dist/* requests from dist directory 
+    // This removes /dist/ prefix and serves from actual dist directory
+    const distRelativePath = normalizedPath.substring(5); // Remove '/dist'
+    if (distRelativePath === '' || distRelativePath === '/') {
+      filePath = path.join(PUBLIC_DIR, 'dist', 'index.html');
+    } else {
+      filePath = path.join(PUBLIC_DIR, 'dist', distRelativePath);
+    }
+  } else {
+    // Serve everything else from dist directory to match GitHub Pages exactly
+    if (normalizedPath === '/') {
+      filePath = path.join(PUBLIC_DIR, 'dist', 'index.html');
+    } else {
+      filePath = path.join(PUBLIC_DIR, 'dist', normalizedPath);
+    }
+  }
   
   fs.stat(filePath, (err, stats) => {
     if (err) {
+      // Log the error for debugging
+      console.log(`[ERROR] File not found: ${filePath} (requested: ${normalizedPath})`);
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('File not found');
       return;
@@ -97,6 +119,7 @@ const server = http.createServer((req, res) => {
       const indexPath = path.join(filePath, 'index.html');
       fs.stat(indexPath, (indexErr, indexStats) => {
         if (indexErr || !indexStats.isFile()) {
+          console.log(`[ERROR] Directory index not found: ${indexPath} (requested: ${normalizedPath})`);
           res.writeHead(404, { 'Content-Type': 'text/plain' });
           res.end('File not found');
           return;
@@ -104,6 +127,7 @@ const server = http.createServer((req, res) => {
         serveFile(res, indexPath);
       });
     } else {
+      console.log(`[ERROR] Not a file or directory: ${filePath} (requested: ${normalizedPath})`);
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('File not found');
     }

@@ -9,18 +9,19 @@
     <style>
         body {
             font-family: 'Courier New', monospace;
-            max-width: 1200px;
-            margin: 0 auto;
+            margin: 0;
             padding: 20px;
             background-color: #1e1e1e;
             color: #d4d4d4;
+            min-height: 100vh;
         }
         
         .main-container { 
             display: grid; 
-            grid-template-columns: 2fr 1fr; 
+            grid-template-columns: 3fr 2fr; 
             gap: 20px; 
             margin-top: 20px;
+            width: 100%;
         }
         
         .debugger-panel { 
@@ -134,10 +135,47 @@
             border-radius: 50%; 
         }
         
+        /* Execution line highlighting */
+        .ace_gutter-cell.ace_execution_line {
+            background-color: #569cd6 !important;
+            color: white !important;
+        }
+        
         .ace-editor-highlight { 
             position: absolute; 
             background: rgba(86, 156, 214, 0.3); 
             z-index: 20; 
+        }
+        
+        /* Disassembly state info styling */
+        .disassembly-info {
+            background-color: #252526;
+            border: 1px solid #3e3e42;
+            padding: 8px 12px;
+            margin-bottom: 10px;
+            border-radius: 3px;
+            font-size: 12px;
+            font-family: 'Courier New', monospace;
+        }
+        
+        .disassembly-status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .disassembly-info .info-label {
+            color: #569cd6;
+            font-weight: bold;
+        }
+        
+        .disassembly-info .info-value {
+            color: #d4d4d4;
+        }
+        
+        .disassembly-info .info-separator {
+            color: #6a9955;
+            margin: 0 4px;
         }
         
         .state-display {
@@ -151,6 +189,22 @@
             white-space: pre-wrap;
         }
         
+        /* Compact execution state styling */
+        .state-display .state-item {
+            margin: 2px 0;
+            line-height: 1.2;
+        }
+        
+        .state-display .key {
+            color: #569cd6;
+            font-weight: bold;
+            margin-right: 5px;
+        }
+        
+        .state-display .value {
+            color: #d4d4d4;
+        }
+        
         .output {
             background-color: #1e1e1e;
             border: 1px solid #3e3e42;
@@ -160,6 +214,7 @@
             overflow-y: auto;
             font-size: 12px;
             white-space: pre-wrap;
+            max-width: 400px;
         }
         
         .status {
