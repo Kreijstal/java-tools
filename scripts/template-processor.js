@@ -13,6 +13,9 @@ function processDebugInterfaceTemplate(htmlContent) {
     // Remove old simulated script block to prevent conflicts
     htmlContent = removeOldSimulatedScript(htmlContent);
     
+    // Fix ACE editor CDN to use local copy
+    htmlContent = fixAceEditorCDN(htmlContent);
+    
     // Add browser-specific enhancements
     htmlContent = addBrowserUIScript(htmlContent);
     htmlContent = addBreakpointUI(htmlContent);
@@ -29,6 +32,17 @@ function processDebugInterfaceTemplate(htmlContent) {
 function removeOldSimulatedScript(htmlContent) {
     // Target the specific script block that contains the JVM simulation
     return htmlContent.replace(/\s*<script>\s*\/\/ Real JVM debug controller using embedded jvm\.js[\s\S]*?<\/script>/s, '');
+}
+
+/**
+ * Fix ACE editor CDN to use local copy
+ */
+function fixAceEditorCDN(htmlContent) {
+    // Replace CDN link with local copy
+    return htmlContent.replace(
+        /<script src="https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/ace\/[^"]*\/ace\.js"><\/script>/,
+        '<script src="/dist/lib/ace.js"></script>'
+    );
 }
 
 /**
@@ -55,22 +69,31 @@ function addBrowserUIScript(htmlContent) {
                     try {
                         const serializedState = JSON.parse(e.target.result);
                         
-                        // Restore class if included in state
-                        if (serializedState.loadedClass) {
-                            currentState.loadedClass = serializedState.loadedClass;
-                            currentState.className = serializedState.loadedClass.name;
+                        // Try to restore using the real JVM if available
+                        if (typeof jvmDebug !== 'undefined' && jvmDebug && typeof jvmDebug.deserialize === 'function') {
+                            jvmDebug.deserialize(serializedState);
+                            if (typeof updateDebugDisplay === 'function') {
+                                updateDebugDisplay();
+                            }
+                        } else {
+                            // Fallback restoration for when JVM isn't available
+                            // Restore class if included in state
+                            if (serializedState.loadedClass) {
+                                currentState.loadedClass = serializedState.loadedClass;
+                                currentState.className = serializedState.loadedClass.name;
+                            }
+                            
+                            // Restore JVM state
+                            updateState({
+                                status: serializedState.executionState || 'paused',
+                                pc: serializedState.jvmState?.frames?.[0]?.pc || 0,
+                                stack: serializedState.jvmState?.frames?.[0]?.stack || [],
+                                locals: serializedState.jvmState?.frames?.[0]?.locals || [],
+                                breakpoints: serializedState.jvmState?.breakpoints || [],
+                                callDepth: serializedState.jvmState?.frames?.length || 0,
+                                method: 'main([Ljava/lang/String;)V'
+                            });
                         }
-                        
-                        // Restore JVM state
-                        updateState({
-                            status: serializedState.executionState,
-                            pc: serializedState.jvmState.frames[0]?.pc || 0,
-                            stack: serializedState.jvmState.frames[0]?.stack || [],
-                            locals: serializedState.jvmState.frames[0]?.locals || [],
-                            breakpoints: serializedState.jvmState.breakpoints || [],
-                            callDepth: serializedState.jvmState.frames.length || 0,
-                            method: 'main([Ljava/lang/String;)V'
-                        });
                         
                         updateStatus('State restored successfully', 'success');
                         log('JVM state restored successfully', 'success');
@@ -80,6 +103,7 @@ function addBrowserUIScript(htmlContent) {
                         }
                     } catch (error) {
                         log(\`Failed to restore state: \${error.message}\`, 'error');
+                        updateStatus('Failed to restore state', 'error');
                     }
                 };
                 reader.readAsText(file);

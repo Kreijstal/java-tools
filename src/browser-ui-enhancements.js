@@ -379,11 +379,11 @@ function initializeEditor() {
                         if (breakpoints.includes(pc)) {
                             jvmDebug.removeBreakpoint(pc);
                             aceEditor.session.clearBreakpoint(line);
-                            log(`Breakpoint removed at PC ${pc}`, 'info');
+                            log(`Breakpoint removed at PC=${pc}`, 'info');
                         } else {
                             jvmDebug.setBreakpoint(pc);
                             aceEditor.session.setBreakpoint(line, "ace_breakpoint");
-                            log(`Breakpoint set at PC ${pc}`, 'info');
+                            log(`Breakpoint set at PC=${pc}`, 'info');
                         }
                         updateDebugDisplay();
                     }
@@ -511,6 +511,22 @@ function enhanceWithRealJVM() {
             const result = jvmDebug.continue();
             log('Continue completed', 'info');
             updateDebugDisplay();
+            
+            // Update status based on result
+            const state = jvmDebug.getCurrentState();
+            if (state.executionState === 'completed') {
+                updateStatus('Program execution completed', 'success');
+            } else if (state.executionState === 'paused') {
+                // Check if we hit a breakpoint
+                const breakpoints = state.breakpoints || [];
+                if (breakpoints.length > 0 && breakpoints.includes(state.pc)) {
+                    updateStatus(`Hit breakpoint at PC=${state.pc}`, 'info');
+                } else {
+                    updateStatus('Execution paused', 'info');
+                }
+            } else {
+                updateStatus('Continue execution completed', 'info');
+            }
         } catch (error) {
             log(`Continue failed: ${error.message}`, 'error');
             if (originalContinue) originalContinue();
@@ -547,6 +563,10 @@ function enhanceWithRealJVM() {
         try {
             const state = jvmDebug.serialize();
             const stateJson = JSON.stringify(state, null, 2);
+            
+            // Store in memory for testing
+            window._testSerializedState = state;
+            
             const blob = new Blob([stateJson], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             
@@ -648,6 +668,22 @@ function clearOutput() {
 }
 
 function deserializeState() {
+    // If we have a test state in memory, use it directly
+    if (window._testSerializedState && typeof jvmDebug !== 'undefined' && jvmDebug) {
+        try {
+            jvmDebug.deserialize(window._testSerializedState);
+            if (typeof updateDebugDisplay === 'function') {
+                updateDebugDisplay();
+            }
+            updateStatus('State restored successfully', 'success');
+            log('JVM state restored successfully', 'success');
+            return;
+        } catch (error) {
+            log(`Memory state restore failed: ${error.message}`, 'error');
+        }
+    }
+    
+    // Otherwise, trigger file input
     const input = document.getElementById('stateFileInput');
     if (input) {
         input.click();
@@ -670,7 +706,7 @@ function setBreakpoint() {
     
     try {
         jvmDebug.setBreakpoint(pc);
-        log(`Breakpoint set at PC ${pc}`, 'success');
+        log(`Breakpoint set at PC=${pc}`, 'success');
         input.value = '';
         updateDebugDisplay();
     } catch (error) {
