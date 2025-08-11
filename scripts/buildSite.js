@@ -22,7 +22,7 @@ const srcDir = path.join(process.cwd(), 'src');
 
 // Function to copy ACE editor from node_modules
 async function setupAceEditor() {
-    const aceSourcePath = path.join(process.cwd(), 'node_modules', 'ace-builds', 'src-min-noconflict', 'ace.js');
+    const aceSourceDir = path.join(process.cwd(), 'node_modules', 'ace-builds', 'src-min-noconflict');
     const aceFilePath = path.join(libDir, 'ace.js');
     
     // Check if ACE editor already exists
@@ -31,15 +31,37 @@ async function setupAceEditor() {
         return;
     }
     
-    console.log('  📦 Copying ACE editor from node_modules...');
+    console.log('  📦 Copying ACE editor and dependencies from node_modules...');
     ensureDirectory(libDir);
     
-    if (!fs.existsSync(aceSourcePath)) {
+    if (!fs.existsSync(aceSourceDir)) {
         throw new Error('ACE editor not found in node_modules. Please run: npm install ace-builds');
     }
     
-    copyFile(aceSourcePath, aceFilePath);
-    console.log('  ✓ ACE editor copied successfully');
+    // Copy main ACE editor file
+    copyFile(path.join(aceSourceDir, 'ace.js'), aceFilePath);
+    
+    // Copy theme files that ACE editor dynamically loads
+    const themeFiles = ['theme-monokai.js', 'theme-github.js', 'theme-textmate.js'];
+    for (const themeFile of themeFiles) {
+        const themeSourcePath = path.join(aceSourceDir, themeFile);
+        const themeTargetPath = path.join(libDir, themeFile);
+        if (fs.existsSync(themeSourcePath)) {
+            copyFile(themeSourcePath, themeTargetPath);
+        }
+    }
+    
+    // Copy mode files that might be needed
+    const modeFiles = ['mode-text.js', 'mode-java.js'];
+    for (const modeFile of modeFiles) {
+        const modeSourcePath = path.join(aceSourceDir, modeFile);
+        const modeTargetPath = path.join(libDir, modeFile);
+        if (fs.existsSync(modeSourcePath)) {
+            copyFile(modeSourcePath, modeTargetPath);
+        }
+    }
+    
+    console.log('  ✓ ACE editor and dependencies copied successfully');
 }
 
 // Main build function
