@@ -42,7 +42,7 @@ function fixAceEditorCDN(htmlContent) {
     // Replace CDN link with local copy
     return htmlContent.replace(
         /<script src="https:\/\/cdnjs\.cloudflare\.com\/ajax\/libs\/ace\/[^"]*\/ace\.js"><\/script>/,
-        '<script src="/dist/lib/ace.js"></script>'
+        '<script src="./lib/ace.js"></script>'
     );
 }
 
@@ -52,10 +52,10 @@ function fixAceEditorCDN(htmlContent) {
 function addBrowserUIScript(htmlContent) {
     const scriptIncludes = `
     <!-- Include the real JVM debug bundle -->
-    <script src="/dist/jvm-debug.js"></script>
+    <script src="./jvm-debug.js"></script>
     
     <!-- Include browser UI enhancements -->
-    <script src="/dist/browser-ui-enhancements.js"></script>
+    <script src="./browser-ui-enhancements.js"></script>
     
 
     `;
