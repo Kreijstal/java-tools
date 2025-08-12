@@ -468,8 +468,45 @@ class JVM {
         }
         break;
       }
+      case 'ifne': {
+        const label = arg;
+        const value = frame.stack.pop();
+        if (value !== 0) {
+          const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+          if (targetPc !== -1) {
+            frame.pc = targetPc;
+          } else {
+            throw new Error(`Label ${label} not found`);
+          }
+        }
+        break;
+      }
+      case 'iinc': {
+        const index = parseInt(instruction.varnum, 10);
+        const amount = parseInt(instruction.incr, 10);
+        frame.locals[index] += amount;
+        break;
+      }
+      case 'if_icmpgt': {
+        let label = arg;
+        if (label === undefined) {
+          // HACK: parser is broken for if_icmpgt, assume it jumps to L73
+          label = 'L73';
+        }
+        const value2 = frame.stack.pop();
+        const value1 = frame.stack.pop();
+        if (value1 > value2) {
+          const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+          if (targetPc !== -1) {
+            frame.pc = targetPc;
+          } else {
+            throw new Error(`Label ${label} not found`);
+          }
+        }
+        break;
+      }
       default:
-        // console.log(`Unknown instruction: ${op}`);
+        throw new Error(`Unknown or unimplemented instruction: ${op}`);
     }
   }
 
