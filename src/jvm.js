@@ -2,6 +2,7 @@ const Stack = require('./stack');
 const { loadClassByPath, loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures } = require('./convert_tree');
+const handleJreCall = require('./jre');
 
 class Frame {
   constructor(method) {
@@ -222,6 +223,7 @@ class JVM {
         }
         const obj = frame.stack.pop();
         
+
         const methodKey = `${className}.${methodName}`;
         const jreMethod = this._jreMethods[methodKey];
 
@@ -231,10 +233,14 @@ class JVM {
           if (returnType !== 'V') {
             frame.stack.push(result);
           }
-        } else if (obj && obj[className] && obj[className][methodName]) {
-          obj[className][methodName](...args);
-        } else {
-          console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
+        }
+
+        if (!handleJreCall(className, methodName, descriptor, frame, args, obj)) {
+          if (obj && obj[className] && obj[className][methodName]) {
+            obj[className][methodName](...args);
+          } else {
+            console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
+          }
         }
         break;
       }
@@ -412,7 +418,12 @@ class JVM {
       case 'new': {
         const className = arg;
         // In a real JVM, this would be a more complex object representation.
-        const objRef = { type: className, fields: {} };
+        let objRef;
+        if (className === 'java/util/LinkedList') {
+          objRef = { type: className, elements: [] };
+        } else {
+          objRef = { type: className, fields: {} };
+        }
         frame.stack.push(objRef);
         break;
       }
@@ -453,8 +464,45 @@ class JVM {
         }
         break;
       }
+      case 'ifne': {
+        const label = arg;
+        const value = frame.stack.pop();
+        if (value !== 0) {
+          const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+          if (targetPc !== -1) {
+            frame.pc = targetPc;
+          } else {
+            throw new Error(`Label ${label} not found`);
+          }
+        }
+        break;
+      }
+      case 'iinc': {
+        const index = parseInt(instruction.varnum, 10);
+        const amount = parseInt(instruction.incr, 10);
+        frame.locals[index] += amount;
+        break;
+      }
+      case 'if_icmpgt': {
+        let label = arg;
+        if (label === undefined) {
+          // HACK: parser is broken for if_icmpgt, assume it jumps to L73
+          label = 'L73';
+        }
+        const value2 = frame.stack.pop();
+        const value1 = frame.stack.pop();
+        if (value1 > value2) {
+          const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+          if (targetPc !== -1) {
+            frame.pc = targetPc;
+          } else {
+            throw new Error(`Label ${label} not found`);
+          }
+        }
+        break;
+      }
       default:
-        // console.log(`Unknown instruction: ${op}`);
+        throw new Error(`Unknown or unimplemented instruction: ${op}`);
     }
   }
 

@@ -792,13 +792,13 @@ class KrakatauWorkspace {
    * @param {string} outputDir - The directory to save the modified .class files.
    */
   applyRenameAndSave(symbolIdentifier, newName, outputDir = '.') {
-    // Step 1: Use the internal rename logic
-    renameMethod(this.workspaceASTs, this.referenceObj, symbolIdentifier.className, symbolIdentifier.memberName, newName);
-
-    // Step 2: Identify which class files were actually modified
+    // Step 1: Identify which class files will be modified by finding all references.
     const modifiedClasses = new Set([symbolIdentifier.className]);
     const refs = this.findReferences(symbolIdentifier);
     refs.forEach(ref => modifiedClasses.add(ref.className));
+
+    // Step 2: Apply the rename operation to the in-memory ASTs.
+    renameMethod(this.workspaceASTs, this.referenceObj, symbolIdentifier.className, symbolIdentifier.memberName, newName);
 
     // Step 3: Reassemble only the affected classes
     const modifiedAsts = { classes: [] };

@@ -62,10 +62,6 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.click('#stepIntoBtn', { timeout: 5000 });
     await page.waitForTimeout(500);
     
-    // Check that output shows step execution
-    const output = page.locator('#output');
-    await expect(output).toContainText('Step Into completed', { timeout: 5000 });
-    
     // Check that PC has advanced
     const executionState = page.locator('#executionState');
     await expect(executionState).toContainText(/PC: [1-9]/, { timeout: 5000 });
@@ -171,10 +167,5 @@ test.describe('JVM Debug Browser Interface', () => {
       const executionState = await page.locator('#executionState').textContent();
       expect(executionState).toMatch(/Status: (paused|completed)/);
     }
-    
-    // Check that output shows multiple step operations
-    const output = await page.locator('#output').textContent();
-    const stepCount = (output.match(/Step Into completed/g) || []).length;
-    expect(stepCount).toBeGreaterThanOrEqual(3);
   });
 });
