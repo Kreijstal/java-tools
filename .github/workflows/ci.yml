@@ -103,6 +103,8 @@ jobs:
         run: bash scripts/install-krakatau.sh
       - name: Install dependencies
         run: npm ci
+      - name: Run Gemini CLI
+        uses: google-github-actions/run-gemini-cli@v0.1.10
       - name: Build project
         run: npm run build
       - name: Archive build artifacts
