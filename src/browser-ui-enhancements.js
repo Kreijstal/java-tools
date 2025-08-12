@@ -663,7 +663,9 @@ function executeDebugOperation(operation, operationName, successMessage) {
     try {
         const result = operation();
         // Keep step completion messages for tests and user feedback
-        log(successMessage, 'info');
+        if (successMessage) {
+            log(successMessage, 'info');
+        }
         updateDebugDisplay();
         return result;
     } catch (error) {
@@ -738,15 +740,15 @@ function enhanceWithRealJVM() {
     
     // Override with real JVM implementations
     window.stepInto = function() {
-        return executeDebugOperation(() => jvmDebug.stepInto(), 'step into', 'Step Into completed');
+        return executeDebugOperation(() => jvmDebug.stepInto(), 'step into');
     };
     
     window.stepOver = function() {
-        return executeDebugOperation(() => jvmDebug.stepOver(), 'step over', 'Step Over completed');
+        return executeDebugOperation(() => jvmDebug.stepOver(), 'step over');
     };
     
     window.stepOut = function() {
-        return executeDebugOperation(() => jvmDebug.stepOut(), 'step out', 'Step Out completed');
+        return executeDebugOperation(() => jvmDebug.stepOut(), 'step out');
     };
     
     window.continue_ = function() {
