@@ -63,11 +63,7 @@ module.exports = {
     }
   },
   if_icmpgt: (frame, instruction) => {
-    let label = instruction.arg;
-    if (label === undefined) {
-      // HACK: parser is broken for if_icmpgt, assume it jumps to L73
-      label = 'L73';
-    }
+    const label = instruction.arg;
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 > value2) {
