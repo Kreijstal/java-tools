@@ -76,7 +76,15 @@ class DebugController {
       this.executionState = 'stopped';
       return {
         status: 'completed',
-        state: this.getCurrentState()
+        state: {
+          executionState: 'stopped',
+          pc: null,
+          stack: [],
+          locals: [],
+          callStackDepth: 0,
+          method: null,
+          breakpoints: []
+        }
       };
     }
   }
