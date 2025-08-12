@@ -859,6 +859,40 @@ class KrakatauWorkspace {
   }
 
   /**
+   * Finds all method references that cannot be resolved to a definition in the workspace.
+   * @returns {SymbolIdentifier[]} An array of SymbolIdentifiers for each unresolved method.
+   */
+  findUnresolvedMethods() {
+    const unresolvedMethods = [];
+    for (const className in this.referenceObj) {
+      const classRef = this.referenceObj[className];
+      const ast = this.workspaceASTs[className];
+
+      for (const memberName in classRef.children) {
+        const memberRef = classRef.children[memberName];
+
+        // A method descriptor will always start with '('.
+        if (memberRef.descriptor && memberRef.descriptor.startsWith('(')) {
+          let isDefined = false;
+          if (ast) {
+            // Check if the method exists in the AST
+            isDefined = ast.classes[0].items.some(item =>
+              item.type === 'method' &&
+              item.method.name === memberName &&
+              item.method.descriptor === memberRef.descriptor
+            );
+          }
+
+          if (!isDefined) {
+            unresolvedMethods.push(new SymbolIdentifier(className, memberName, memberRef.descriptor));
+          }
+        }
+      }
+    }
+    return unresolvedMethods;
+  }
+
+  /**
    * Validates the entire workspace and reports potential issues.
    * @returns {Diagnostic[]} An array of diagnostic objects, each detailing a problem.
    */
