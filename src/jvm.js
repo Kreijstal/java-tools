@@ -2,7 +2,7 @@ const Stack = require('./stack');
 const { loadClassByPath, loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures } = require('./convert_tree');
-const handleJreCall = require('./jre');
+const jreMethods = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
 
@@ -24,6 +24,18 @@ class JVM {
               }
             }
           }
+        },
+        'in': {
+          'java/io/InputStream': {
+            input: 'foo\nbar\nbaz\n',
+            offset: 0,
+            read: function() {
+              if (this.offset < this.input.length) {
+                return this.input.charCodeAt(this.offset++);
+              }
+              return -1;
+            }
+          }
         }
       }
     };
@@ -39,14 +51,12 @@ class JVM {
       'java/lang/String.toUpperCase': (obj, args) => obj.toUpperCase(),
       'java/lang/String.toLowerCase': (obj, args) => obj.toLowerCase(),
       'java/lang/String.length': (obj, args) => obj.length,
-      'java/io/PrintStream.println': (obj, args) => {
-        if (obj && obj['java/io/PrintStream'] && obj['java/io/PrintStream']['println']) {
-          obj['java/io/PrintStream']['println'](...args);
-        } else {
-          console.log(...args);
-        }
-      }
+      ...jreMethods
     };
+  }
+
+  internString(str) {
+    return str;
   }
 
   /**
