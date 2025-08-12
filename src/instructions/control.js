@@ -37,6 +37,31 @@ module.exports = {
       }
     }
   },
+  if_icmpeq: (frame, instruction) => {
+    const label = instruction.arg;
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value1 === value2) {
+      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
+  ifnull: (frame, instruction) => {
+    const label = instruction.arg;
+    const value = frame.stack.pop();
+    if (value === null) {
+      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
   if_icmpgt: (frame, instruction) => {
     let label = instruction.arg;
     if (label === undefined) {
