@@ -17,7 +17,7 @@ test('JVM Serialization', (t) => {
   jvm.addBreakpoint(0);
   jvm.addBreakpoint(5);
   
-  const { Frame } = require('../src/jvm');
+  const Frame = require('../src/frame');
   const initialFrame = new Frame(mainMethod);
   jvm.callStack.push(initialFrame);
 
