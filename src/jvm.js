@@ -43,6 +43,20 @@ class JVM {
     this.stepMode = null; // null, 'into', 'over', 'out', 'instruction', 'finish'
     this.stepTargetDepth = null;
     this.stepTargetFrame = null;
+
+    this._jreMethods = {
+      'java/lang/String.concat': (obj, args) => obj + args[0],
+      'java/lang/String.toUpperCase': (obj, args) => obj.toUpperCase(),
+      'java/lang/String.toLowerCase': (obj, args) => obj.toLowerCase(),
+      'java/lang/String.length': (obj, args) => obj.length,
+      'java/io/PrintStream.println': (obj, args) => {
+        if (obj && obj['java/io/PrintStream'] && obj['java/io/PrintStream']['println']) {
+          obj['java/io/PrintStream']['println'](...args);
+        } else {
+          console.log(...args);
+        }
+      }
+    };
   }
 
   /**
@@ -209,13 +223,21 @@ class JVM {
         }
         const obj = frame.stack.pop();
         
-        if (!handleJreCall(className, methodName, descriptor, frame, args, obj)) {
-          if (obj && obj[className] && obj[className][methodName]) {
-            obj[className][methodName](...args);
-          } else {
+
+        const methodKey = `${className}.${methodName}`;
+        const jreMethod = this._jreMethods[methodKey];
+
+        if (jreMethod) {
+          const result = jreMethod(obj, args);
+          const { returnType } = parseDescriptor(descriptor);
+          if (returnType !== 'V') {
+            frame.stack.push(result);
+          }else {
             console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
           }
         }
+
+
         break;
       }
       case 'return':
