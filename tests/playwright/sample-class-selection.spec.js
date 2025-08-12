@@ -18,7 +18,8 @@ test.describe('Sample Class Selection UI', () => {
     const options = await page.locator('#sampleClassSelect option').allTextContents();
     
     // Should have at least 25 class options plus the default "Select a sample class..." option
-    expect(options.length).toBeGreaterThanOrEqual(25);
+    const classOptions = options.filter(option => !option.includes('Select a sample class') && !option.includes('Loading...'));
+    expect(classOptions.length).toBeGreaterThanOrEqual(25);
     
     // Check that some specific classes are present
     const optionText = options.join(' ');
@@ -35,7 +36,7 @@ test.describe('Sample Class Selection UI', () => {
     
     // Verify it shows the total number in the heading
     const heading = await page.locator('h4').filter({ hasText: 'Sample Classes' }).textContent();
-    expect(heading).toContain('25 available');
+    expect(heading).toContain(`${classOptions.length} available`);
   });
 
   test('should load a sample class successfully', async ({ page }) => {
