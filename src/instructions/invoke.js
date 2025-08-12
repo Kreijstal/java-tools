@@ -15,7 +15,7 @@ module.exports = {
     const jreMethod = jvm._jreMethods[methodKey];
 
     if (jreMethod) {
-      const result = jreMethod(obj, args);
+      const result = jreMethod(obj, args, jvm);
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== 'V') {
         frame.stack.push(result);
@@ -43,15 +43,19 @@ module.exports = {
   },
   invokespecial: (frame, instruction, jvm) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
+    const { params } = parseDescriptor(descriptor);
+    const args = [];
+    for (let i = 0; i < params.length; i++) {
+      args.unshift(frame.stack.pop());
+    }
+    const obj = frame.stack.pop();
+
     if (methodName === '<init>') {
-      // Constructor call - for now just pop the object reference
-      const { params } = parseDescriptor(descriptor);
-      for (let i = 0; i < params.length; i++) {
-        frame.stack.pop();
+      const methodKey = `${className}.${methodName}`;
+      const jreMethod = jvm._jreMethods[methodKey];
+      if (jreMethod) {
+        jreMethod(obj, args, jvm);
       }
-      frame.stack.pop(); // pop object reference
-      // In a real JVM, this would initialize the object.
-      // For now, we do nothing.
     }
   },
 };
