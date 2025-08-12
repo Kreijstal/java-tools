@@ -2,6 +2,7 @@ const Stack = require('./stack');
 const { loadClassByPath, loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures } = require('./convert_tree');
+const handleJreCall = require('./jre');
 
 class Frame {
   constructor(method) {
@@ -208,48 +209,12 @@ class JVM {
         }
         const obj = frame.stack.pop();
         
-        // Handle built-in Java methods
-        if (className === 'java/lang/String') {
-          if (methodName === 'concat') {
-            const result = obj + args[0];
-            frame.stack.push(result);
-            // console.log(`String.concat: "${obj}" + "${args[0]}" = "${result}"`);
-          } else if (methodName === 'toUpperCase') {
-            const result = obj.toUpperCase();
-            frame.stack.push(result);
-          } else if (methodName === 'toLowerCase') {
-            const result = obj.toLowerCase();
-            frame.stack.push(result);
-          } else if (methodName === 'length') {
-            const result = obj.length;
-            frame.stack.push(result);
+        if (!handleJreCall(className, methodName, descriptor, frame, args, obj)) {
+          if (obj && obj[className] && obj[className][methodName]) {
+            obj[className][methodName](...args);
           } else {
-            console.error(`Unsupported String method: ${methodName}`);
-            // For unsupported methods, push a default return value to avoid stack underflow
-            const { returnType } = parseDescriptor(descriptor);
-            if (returnType === 'V') {
-              // void return type, don't push anything
-            } else if (returnType === 'Ljava/lang/String;') {
-              frame.stack.push(obj); // return the original string
-            } else {
-              frame.stack.push(null); // default return value
-            }
+            console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
           }
-        } else if (className === 'java/io/PrintStream') {
-          if (methodName === 'println') {
-            // Handle PrintStream.println method
-            if (obj && obj['java/io/PrintStream'] && obj['java/io/PrintStream']['println']) {
-              obj['java/io/PrintStream']['println'](...args);
-            } else {
-              console.log(...args);
-            }
-          } else {
-            console.error(`Unsupported PrintStream method: ${methodName}`);
-          }
-        } else if (obj && obj[className] && obj[className][methodName]) {
-          obj[className][methodName](...args);
-        } else {
-          console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
         }
         break;
       }
@@ -427,7 +392,12 @@ class JVM {
       case 'new': {
         const className = arg;
         // In a real JVM, this would be a more complex object representation.
-        const objRef = { type: className, fields: {} };
+        let objRef;
+        if (className === 'java/util/LinkedList') {
+          objRef = { type: className, elements: [] };
+        } else {
+          objRef = { type: className, fields: {} };
+        }
         frame.stack.push(objRef);
         break;
       }
