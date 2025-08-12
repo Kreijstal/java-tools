@@ -246,6 +246,7 @@ function convertJson(inputJson, constantPool) {
           case "ifnonnull":
           case "ifne":
           case "if_icmpge":
+          case "if_icmpgt":
           case "ifnull":
             const targetPc = instr.pc + instr.operands.branchoffset;
             codeItem.instruction = {
