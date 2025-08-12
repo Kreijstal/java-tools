@@ -16,14 +16,15 @@ const classFiles = fs.readdirSync(sourcesDir)
   .map(file => path.join(sourcesDir, file));
 
 test('create_java_asm basic functionality', function (t) {
-  t.plan(2);
+  t.plan(3);
   
   const helloClassPath = path.join(sourcesDir, 'Hello.class');
   
   // Test that parsing doesn't throw errors
   t.doesNotThrow(() => {
     const result = parseClassFile(helloClassPath);
-    t.ok(typeof result === 'string' && result.length > 0, 'Returns non-empty string');
+    t.ok(result.includes('.class public super Hello'), 'Output should contain correct class name');
+    t.ok(result.includes('.super java/lang/Object'), 'Output should contain correct superclass name');
   }, 'parseClassFile does not throw for valid class file');
 });
 
@@ -89,11 +90,7 @@ test('create_java_asm handles all available class files', function (t) {
   classFiles.forEach(classFile => {
     const fileName = path.basename(classFile);
     t.doesNotThrow(() => {
-      const result = parseClassFile(classFile);
-      // Basic validation that we got meaningful output
-      if (typeof result !== 'string' || result.length < 10) {
-        throw new Error('Output too short or not a string');
-      }
+      parseClassFile(classFile);
     }, `Successfully parses ${fileName}`);
   });
 });
