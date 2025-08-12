@@ -4,24 +4,37 @@ const fs = require('fs');
 const path = require('path');
 const DebugController = require('../src/debugController');
 
-const STATE_FILE = path.join(__dirname, 'state.json');
-
 async function main() {
-  const args = process.argv.slice(2);
+  let args = process.argv.slice(2);
+
+  // Extract --state-file argument
+  let stateFile = path.join(__dirname, 'state.json'); // Default value
+  const stateFileIndex = args.indexOf('--state-file');
+  if (stateFileIndex > -1) {
+    if (args.length <= stateFileIndex + 1) {
+      console.error('Error: --state-file option requires a value.');
+      printUsage();
+      process.exit(1);
+    }
+    stateFile = args[stateFileIndex + 1];
+    // Remove the flag and its value from args array
+    args.splice(stateFileIndex, 2);
+  }
+
   const command = args[0];
   const classArg = args[1];
 
   if (command === 'start') {
     if (!classArg) {
       console.error('Error: Missing class name for "start" command.');
-      console.log('Usage: node scripts/cli.js start <ClassName>');
+      console.log('Usage: node scripts/jvm-debugger.js start <ClassName>');
       process.exit(1);
     }
-    await startCommand(classArg);
+    await startCommand(classArg, stateFile);
   } else if (command === 'step') {
-    await stepCommand();
+    await stepCommand(stateFile);
   } else if (command === 'inspect') {
-    await inspectCommand();
+    await inspectCommand(stateFile);
   } else {
     printUsage();
   }
@@ -29,21 +42,23 @@ async function main() {
 
 function printUsage() {
   console.log(`
-Usage: node scripts/cli.js <command> [options]
+Usage: node scripts/jvm-debugger.js <command> [options]
 
 Commands:
-  start <ClassName>   Initialize a debug session for a class.
-                      e.g., node scripts/cli.js start Hello
+  start <ClassName>     Initialize a debug session for a class.
+                        e.g., node scripts/jvm-debugger.js start Hello
 
-  step                Execute the next instruction from the saved state.
+  step                  Execute the next instruction from the saved state.
 
-  inspect             View the current JVM state (stack, locals, etc.).
+  inspect               View the current JVM state (stack, locals, etc.).
 
-  reset               Clear the saved state.
+Options:
+  --state-file <path>   Path to the state file.
+                        Defaults to 'scripts/state.json'.
   `);
 }
 
-async function startCommand(className) {
+async function startCommand(className, stateFile) {
   const controller = new DebugController();
   const classPath = path.join('sources', `${className}.class`);
 
@@ -55,9 +70,9 @@ async function startCommand(className) {
 
   console.log(`🚀 Initializing debugger for ${className}`);
   await controller.start(classPath);
-  saveState(controller);
+  saveState(controller, stateFile);
 
-  console.log('Debugger initialized. Ready to step.');
+  console.log(`Debugger initialized. State saved to ${stateFile}. Ready to step.`);
   const state = controller.getCurrentState();
   const sourceMapping = controller.getCurrentSourceMapping();
   console.log(
@@ -65,24 +80,24 @@ async function startCommand(className) {
   );
 }
 
-function saveState(controller) {
+function saveState(controller, stateFile) {
   const serializedState = controller.serialize();
-  fs.writeFileSync(STATE_FILE, JSON.stringify(serializedState, null, 2));
+  fs.writeFileSync(stateFile, JSON.stringify(serializedState, null, 2));
 }
 
-function loadState() {
-  if (!fs.existsSync(STATE_FILE)) {
+function loadState(stateFile) {
+  if (!fs.existsSync(stateFile)) {
     return null;
   }
-  const stateJson = fs.readFileSync(STATE_FILE, 'utf-8');
+  const stateJson = fs.readFileSync(stateFile, 'utf-8');
   if (!stateJson || stateJson.trim() === '{}') {
     return null;
   }
   return JSON.parse(stateJson);
 }
 
-async function stepCommand() {
-  const state = loadState();
+async function stepCommand(stateFile) {
+  const state = loadState(stateFile);
   if (!state || !state.jvmState) {
     console.error('Error: No saved state found or state is invalid. Start a new run.');
     process.exit(1);
@@ -94,7 +109,7 @@ async function stepCommand() {
   if (!controller.isPaused()) {
     console.log('✅ Execution has already completed.');
     // Clear the state file as it's for a completed run
-    fs.writeFileSync(STATE_FILE, JSON.stringify({}, null, 2));
+    fs.writeFileSync(stateFile, JSON.stringify({}, null, 2));
     return;
   }
 
@@ -108,16 +123,16 @@ async function stepCommand() {
 
   if (result.status === 'completed') {
     console.log('✅ Execution completed.');
-    fs.writeFileSync(STATE_FILE, JSON.stringify({}, null, 2));
+    fs.writeFileSync(stateFile, JSON.stringify({}, null, 2));
   } else {
-    saveState(controller);
+    saveState(controller, stateFile);
     const newState = controller.getCurrentState();
     console.log(`Stepped to PC: ${newState.pc}`);
   }
 }
 
-async function inspectCommand() {
-  const state = loadState();
+async function inspectCommand(stateFile) {
+  const state = loadState(stateFile);
   if (!state || !state.jvmState) {
     console.error('Error: No saved state found. Start a new run.');
     process.exit(1);
