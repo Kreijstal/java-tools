@@ -120,6 +120,11 @@ class JVM {
 
       // After executing instruction, check if we should pause for step modes
       if (this.debugMode && shouldExecuteFirst && this.shouldPauseAfterStep(currentPc, frame)) {
+        // After stepping, the stack might be empty if the program finished.
+        if (this.callStack.isEmpty()) {
+            return { paused: false, completed: true };
+        }
+
         // Get the new current PC after execution
         const nextFrame = this.callStack.peek();
         if (nextFrame && nextFrame.pc < nextFrame.instructions.length) {
