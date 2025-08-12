@@ -232,16 +232,12 @@ class JVM {
           const { returnType } = parseDescriptor(descriptor);
           if (returnType !== 'V') {
             frame.stack.push(result);
-          }
-        }
-
-        if (!handleJreCall(className, methodName, descriptor, frame, args, obj)) {
-          if (obj && obj[className] && obj[className][methodName]) {
-            obj[className][methodName](...args);
-          } else {
+          }else {
             console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
           }
         }
+
+
         break;
       }
       case 'return':
