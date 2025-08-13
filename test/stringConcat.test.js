@@ -7,10 +7,11 @@ test('JVM should execute string concatenation examples', async (t) => {
 
   const jvm = new JVM();
   let output = '';
-  const originalLog = console.log;
-  console.log = function(message) {
-    output += message;
-  };
+  jvm.registerJreMethods({
+    'java/io/PrintStream.println': (j, o, a) => {
+      output += a[0];
+    }
+  });
 
   await jvm.run(path.join(__dirname, '..', 'sources', 'SimpleStringConcat.class'), { silent: true });
   t.equal(output.trim(), 'Hello World', 'SimpleStringConcat should work');
@@ -18,6 +19,4 @@ test('JVM should execute string concatenation examples', async (t) => {
   output = '';
   await jvm.run(path.join(__dirname, '..', 'sources', 'StringConcatMethod.class'), { silent: true });
   t.equal(output.trim(), 'Hello World', 'StringConcatMethod should work');
-
-  console.log = originalLog;
 });

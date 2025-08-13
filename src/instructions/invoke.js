@@ -1,8 +1,9 @@
 const { parseDescriptor } = require('../typeParser');
 const Frame = require('../frame');
+const Stack = require('../stack');
 
 module.exports = {
-  invokevirtual: async (frame, instruction, jvm) => {
+  invokevirtual: async (frame, instruction, jvm, thread) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
     const { params } = parseDescriptor(descriptor);
     const args = [];
@@ -10,6 +11,28 @@ module.exports = {
       args.unshift(frame.stack.pop());
     }
     const obj = frame.stack.pop();
+
+    // Handle Thread.start()
+    if (methodName === 'start' && descriptor === '()V') {
+      const threadObject = obj;
+      const threadClassName = threadObject.type;
+
+      const runMethod = jvm.findMethodInHierarchy(threadClassName, 'run', '()V');
+      if (runMethod) {
+        const newThread = {
+          id: jvm.threads.length,
+          callStack: new Stack(),
+          status: 'runnable',
+        };
+        const newFrame = new Frame(runMethod);
+        newFrame.locals[0] = threadObject; // 'this'
+        newThread.callStack.push(newFrame);
+        jvm.threads.push(newThread);
+      } else {
+        console.error(`Could not find run() method on ${threadClassName}`);
+      }
+      return;
+    }
 
     const methodKey = `${className}.${methodName}`;
     const jreMethod = jvm._jreMethods[methodKey];
@@ -21,10 +44,21 @@ module.exports = {
         frame.stack.push(result);
       }
     } else {
-      console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
+      // This is for user-defined instance methods.
+      const method = jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
+      if (method) {
+        const newFrame = new Frame(method);
+        newFrame.locals[0] = obj; // 'this'
+        for (let i = 0; i < args.length; i++) {
+          newFrame.locals[i+1] = args[i];
+        }
+        thread.callStack.push(newFrame);
+      } else {
+        console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
+      }
     }
   },
-  invokestatic: async (frame, instruction, jvm) => {
+  invokestatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
 
     const methodKey = `${className}.${methodName}`;
@@ -56,10 +90,10 @@ module.exports = {
       for (let i = params.length - 1; i >= 0; i--) {
         newFrame.locals[i] = frame.stack.pop();
       }
-      jvm.callStack.push(newFrame);
+      thread.callStack.push(newFrame);
     }
   },
-  invokespecial: async (frame, instruction, jvm) => {
+  invokespecial: async (frame, instruction, jvm, thread) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
     const { params } = parseDescriptor(descriptor);
     const args = [];
@@ -73,6 +107,21 @@ module.exports = {
       const jreMethod = jvm._jreMethods[methodKey];
       if (jreMethod) {
         await jreMethod(jvm, obj, args);
+      } else {
+        // This is a constructor for a user-defined class.
+        // We need to find the constructor and invoke it.
+        const method = jvm.findMethodInHierarchy(className, methodName, descriptor);
+        if (method) {
+          const newFrame = new Frame(method);
+          newFrame.locals[0] = obj; // 'this'
+          for (let i = 0; i < args.length; i++) {
+            newFrame.locals[i+1] = args[i];
+          }
+          thread.callStack.push(newFrame);
+        } else {
+          // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
+          // For now, we do nothing, assuming the object is already created by 'new'.
+        }
       }
     }
   },

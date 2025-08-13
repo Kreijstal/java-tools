@@ -1,19 +1,19 @@
 module.exports = {
-  return: (frame, instruction, jvm) => {
-    jvm.callStack.pop();
+  return: (frame, instruction, jvm, thread) => {
+    thread.callStack.pop();
   },
-  ireturn: (frame, instruction, jvm) => {
+  ireturn: (frame, instruction, jvm, thread) => {
     const returnValue = frame.stack.pop();
-    jvm.callStack.pop();
-    if (!jvm.callStack.isEmpty()) {
-      jvm.callStack.peek().stack.push(returnValue);
+    thread.callStack.pop();
+    if (!thread.callStack.isEmpty()) {
+      thread.callStack.peek().stack.push(returnValue);
     }
   },
-  areturn: (frame, instruction, jvm) => {
+  areturn: (frame, instruction, jvm, thread) => {
     const returnValue = frame.stack.pop();
-    jvm.callStack.pop();
-    if (!jvm.callStack.isEmpty()) {
-      jvm.callStack.peek().stack.push(returnValue);
+    thread.callStack.pop();
+    if (!thread.callStack.isEmpty()) {
+      thread.callStack.peek().stack.push(returnValue);
     }
   },
   goto: (frame, instruction) => {

@@ -28,18 +28,18 @@
             }
             
             try {
-                // Test 1: Create BrowserJVMDebug instance
+                console.log('Starting test: Create BrowserJVMDebug instance');
                 const debug = new window.JVMDebug.BrowserJVMDebug();
                 log('BrowserJVMDebug instance created successfully');
                 
-                // Test 2: Check initial state
+                console.log('Starting test: Check initial state');
                 if (!debug.isInitialized()) {
                     log('Initial state is correctly not initialized');
                 } else {
                     log('Initial state should not be initialized', false);
                 }
                 
-                // Test 3: Try to create data package  
+                console.log('Starting test: Try to create data package');
                 const mockDataPackage = {
                     classes: [
                         {
@@ -49,36 +49,34 @@
                     ]
                 };
                 
-                // Test 4: Initialize with data package
+                console.log('Starting test: Initialize with data package');
                 await debug.initialize({ dataPackage: mockDataPackage });
                 log('Initialized with mock data package');
                 
-                // Test 5: Check that it's now ready
+                console.log('Starting test: Check that it\'s now ready');
                 if (debug.isInitialized()) {
                     log('State is correctly initialized after setup');
                 } else {
                     log('State should be initialized after setup', false);
                 }
                 
-                // Test 6: List files
+                console.log('Starting test: List files');
                 const files = await debug.listFiles();
                 if (files.length > 0) {
-                    log(`Listed ${files.length} files from virtual filesystem`);
+                    log(`Listed ${files.length} files from virtual filesystem: ${files.join(', ')}`);
                 } else {
                     log('Should have files in virtual filesystem', false);
                 }
                 
-                // Test 7: Try to start debugging (this should work now with async fix)
+                console.log('Starting test: Try to start debugging');
                 try {
                     const result = await debug.start('VerySimple.class');
                     log('Successfully started debugging session');
+                    console.log('Debug result:', result);
                     log(`Debug result status: ${result.status}`);
                 } catch (error) {
-                    if (error.message.includes('main method not found')) {
-                        log('Expected error for mock class without proper main method');
-                    } else {
-                        log(`Debugging start failed: ${error.message}`, false);
-                    }
+                    log(`Debugging start failed: ${error.message}`, false);
+                    console.error('Full error during debug start:', error);
                 }
                 
             } catch (error) {

@@ -5,358 +5,208 @@ class DebugController {
   constructor() {
     this.jvm = new JVM();
     this.executionState = 'stopped'; // stopped, running, paused
-    this.lastExecutionResult = null;
   }
 
-  /**
-   * Load and prepare a class for debugging
-   * @param {string} classFilePath - Path to the .class file
-   * @param {object} options - Loading options
-   */
-  async loadClass(classFilePath, options = {}) {
-    try {
-      const classData = await this.jvm.loadClassAsync(classFilePath, options);
-      if (!classData) {
-        throw new Error(`Failed to load class from ${classFilePath}`);
-      }
-      return classData;
-    } catch (error) {
-      throw new Error(`Error loading class: ${error.message}`);
-    }
-  }
-
-  /**
-   * Start debugging a program from the main method
-   * @param {string} classFilePath - Path to the .class file
-   * @param {object} options - Execution options
-   */
   async start(classFilePath, options = {}) {
-    const classData = await this.loadClass(classFilePath, options);
-    
-    const mainMethod = this.jvm.findMainMethod(classData);
-    if (!mainMethod) {
-      throw new Error('main method not found');
-    }
+    try {
+      // Start the JVM but in a paused state
+      this.jvm.debugManager.enable();
+      this.jvm.debugManager.pause();
+      await this.jvm.run(classFilePath, options);
+      this.executionState = 'paused';
 
-    // Enable debug mode and set up initial frame
-    this.jvm.enableDebugMode();
-    const initialFrame = new Frame(mainMethod);
-    
-    this.jvm.callStack.push(initialFrame);
-    this.executionState = 'paused';
-    
-    return {
-      status: 'started',
-      state: this.getCurrentState()
-    };
+      return {
+        status: 'started',
+        state: this.getCurrentState()
+      };
+    } catch (e) {
+      this.executionState = 'stopped';
+      throw new Error(`Error loading class: ${e.message}`);
+    }
   }
 
-  /**
-   * Continue execution until next breakpoint or completion
-   */
   async continue() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot continue: execution is not paused');
     }
-
-    this.jvm.continue();
     this.executionState = 'running';
-    
     const result = await this.jvm.execute();
-    this.lastExecutionResult = result;
-    
     if (result.paused) {
       this.executionState = 'paused';
-      return {
-        status: 'paused',
-        pc: result.pc,
-        state: this.getCurrentState()
-      };
     } else {
       this.executionState = 'stopped';
-      return {
-        status: 'completed',
-        state: {
-          executionState: 'stopped',
-          pc: null,
-          stack: [],
-          locals: [],
-          callStackDepth: 0,
-          method: null,
-          breakpoints: []
-        }
-      };
     }
+    return { status: this.executionState, state: this.getCurrentState() };
   }
 
-  /**
-   * Step into the next instruction (will enter method calls)
-   */
   async stepInto() {
-    if (this.executionState !== 'paused') {
-      throw new Error('Cannot step: execution is not paused');
-    }
-
-    this.jvm.stepInto();
-    return await this._executeStep();
+    return this.jvmStep();
   }
 
-  /**
-   * Step over the next instruction (will not enter method calls)
-   */
   async stepOver() {
-    if (this.executionState !== 'paused') {
-      throw new Error('Cannot step: execution is not paused');
-    }
-
-    this.jvm.stepOver();
-    return await this._executeStep();
+    return this.jvmStep();
   }
 
-  /**
-   * Step out of the current method
-   */
   async stepOut() {
-    if (this.executionState !== 'paused') {
-      throw new Error('Cannot step: execution is not paused');
-    }
-
-    this.jvm.stepOut();
-    return await this._executeStep();
+    return this.jvmStep();
   }
 
-  /**
-   * Execute a single instruction
-   */
   async stepInstruction() {
-    if (this.executionState !== 'paused') {
-      throw new Error('Cannot step: execution is not paused');
-    }
-
-    this.jvm.stepInstruction();
-    return await this._executeStep();
+    return this.jvmStep();
   }
 
-  /**
-   * Continue until the current method finishes
-   */
   async finish() {
+    return this.jvmStep();
+  }
+
+  async jvmStep() {
+    if (this.executionState !== 'paused') {
+      throw new Error('Cannot step: execution is not paused');
+    }
+    const result = await this.jvm.executeTick();
+    if (result.completed) {
+      this.executionState = 'stopped';
+    }
+    return { status: this.executionState, state: this.getCurrentState() };
+  }
+
+  async threadStep() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
 
-    this.jvm.finish();
-    return await this._executeStep();
-  }
+    const targetThreadId = this.jvm.debugManager.selectedThreadId;
 
-  async _executeStep() {
-    this.executionState = 'running';
-    const result = await this.jvm.execute();
-    this.lastExecutionResult = result;
-    
-    if (result.paused) {
-      this.executionState = 'paused';
-      return {
-        status: 'paused',
-        pc: result.pc,
-        state: this.getCurrentState()
-      };
-    } else {
-      this.executionState = 'stopped';
-      return {
-        status: 'completed',
-        state: this.getCurrentState()
-      };
+    // Step one tick first
+    let result = await this.jvm.executeTick();
+    if (result.completed) {
+        this.executionState = 'stopped';
+        return { status: this.executionState, state: this.getCurrentState() };
     }
+
+    // Keep ticking until the selected thread is the current one again
+    while (this.jvm.currentThreadIndex !== targetThreadId && !result.completed) {
+        result = await this.jvm.executeTick();
+        if (result.completed) {
+            break;
+        }
+    }
+    
+    if (result.completed) {
+        this.executionState = 'stopped';
+    }
+
+    return { status: this.executionState, state: this.getCurrentState() };
   }
 
-  /**
-   * Set a breakpoint at the specified program counter
-   * @param {number} pc - Program counter location
-   */
+  selectThread(threadId) {
+    this.jvm.debugManager.selectThread(threadId);
+    return { status: 'thread_selected', threadId: threadId };
+  }
+
+  getThreads() {
+    return this.jvm.threads.map(t => ({ id: t.id, status: t.status }));
+  }
+
   setBreakpoint(pc) {
-    this.jvm.addBreakpoint(pc);
+    this.jvm.debugManager.addBreakpoint(pc);
     return { status: 'breakpoint_set', pc: pc };
   }
 
-  /**
-   * Remove a breakpoint at the specified program counter
-   * @param {number} pc - Program counter location
-   */
   removeBreakpoint(pc) {
-    this.jvm.removeBreakpoint(pc);
+    this.jvm.debugManager.removeBreakpoint(pc);
     return { status: 'breakpoint_removed', pc: pc };
   }
 
-  /**
-   * Clear all breakpoints
-   */
   clearBreakpoints() {
-    this.jvm.clearBreakpoints();
+    this.jvm.debugManager.clearBreakpoints();
     return { status: 'breakpoints_cleared' };
   }
 
-  /**
-   * Get the current execution state
-   */
   getCurrentState() {
-    const jvmState = this.jvm.getCurrentState();
-    return {
-      executionState: this.executionState,
-      pc: jvmState.pc,
-      stack: jvmState.stack,
-      locals: jvmState.locals,
-      callStackDepth: jvmState.callStackDepth,
-      method: jvmState.method,
-      breakpoints: Array.from(this.jvm.breakpoints)
-    };
-  }
+    const thread = this.jvm.threads[this.jvm.currentThreadIndex];
+    if (!thread) {
+      return { executionState: this.executionState, pc: null, stack: [], locals: [], callStackDepth: 0, method: null, breakpoints: [] };
+    }
 
-  /**
-   * Serialize the complete JVM state for persistence
-   */
-  serialize() {
-    return {
-      jvmState: this.jvm.serialize(),
-      executionState: this.executionState,
-      lastExecutionResult: this.lastExecutionResult
-    };
-  }
+    const frame = thread.callStack.peek();
+    if (!frame) {
+      return { executionState: this.executionState, pc: null, stack: [], locals: [], callStackDepth: 0, method: null, breakpoints: [] };
+    }
 
-  /**
-   * Deserialize and restore JVM state
-   * @param {object} state - Serialized state
-   */
-  deserialize(state) {
-    this.jvm.deserialize(state.jvmState);
-    this.executionState = state.executionState || 'stopped';
-    this.lastExecutionResult = state.lastExecutionResult || null;
+    const instructionItem = frame.instructions[frame.pc];
+    const label = instructionItem ? instructionItem.labelDef : null;
+    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
     
     return {
-      status: 'restored',
-      state: this.getCurrentState()
+      executionState: this.executionState,
+      currentThreadId: this.jvm.currentThreadIndex,
+      pc: currentPc,
+      stack: frame.stack.items,
+      locals: frame.locals,
+      callStackDepth: thread.callStack.size(),
+      method: frame.method.name,
+      breakpoints: Array.from(this.jvm.debugManager.breakpoints)
     };
   }
 
-  /**
-   * Reset the debugger to initial state
-   */
   reset() {
     this.jvm = new JVM();
     this.executionState = 'stopped';
-    this.lastExecutionResult = null;
-    
     return { status: 'reset' };
   }
 
-  /**
-   * Get the list of all breakpoints
-   */
   getBreakpoints() {
-    return Array.from(this.jvm.breakpoints);
+    return Array.from(this.jvm.debugManager.breakpoints);
   }
 
-  /**
-   * Check if the debugger is currently paused
-   */
   isPaused() {
     return this.executionState === 'paused';
   }
 
-  /**
-   * Check if execution is completed
-   */
   isCompleted() {
     return this.executionState === 'stopped';
   }
 
-  /**
-   * Get disassembly view with current execution position
-   * @returns {object} Disassembly view showing instructions and current position
-   */
-  getDisassemblyView() {
-    return this.jvm.getDisassemblyView();
+  serialize() {
+    return {
+      jvmState: this.jvm.serialize(),
+      executionState: this.executionState,
+    };
   }
 
-  /**
-   * Get source line mapping for current PC
-   * @returns {object} Source line information for current execution position
-   */
-  getCurrentSourceMapping() {
-    const state = this.getCurrentState();
-    if (state.pc !== null && this.jvm.callStack && !this.jvm.callStack.isEmpty()) {
-      const frame = this.jvm.callStack.peek();
-      return this.jvm.getSourceLineMapping(state.pc, frame.method);
-    }
-    return { line: null, sourceFile: null, instruction: null, pc: null };
+  deserialize(state) {
+    this.jvm.deserialize(state.jvmState);
+    this.executionState = state.executionState || 'stopped';
+    return { status: 'restored' };
   }
 
-  /**
-   * Get detailed backtrace showing all call stack frames with arguments
-   * @returns {Array} Array of frame information with method details and variables
-   */
-  getBacktrace() {
-    return this.jvm.getBacktrace();
+  getBacktrace(threadId) {
+    return this.jvm.getBacktrace(threadId);
   }
 
-  /**
-   * Inspect the current execution stack
-   * @returns {Array} Stack values with type and index information
-   */
-  inspectStack() {
-    return this.jvm.inspectStack();
+  inspectStack(threadId) {
+    return this.jvm.inspectStack(threadId);
   }
 
-  /**
-   * Inspect local variables in the current frame
-   * @returns {Array} Local variables with names, types, and values
-   */
-  inspectLocals() {
-    return this.jvm.inspectLocals();
+  inspectLocals(threadId) {
+    return this.jvm.inspectLocals(threadId);
   }
 
-  /**
-   * Inspect a specific local variable by index
-   * @param {number} index - Local variable index
-   * @returns {object|null} Variable information or null if not found
-   */
-  inspectLocalVariable(index) {
-    return this.jvm.inspectLocalVariable(index);
+  inspectLocalVariable(index, threadId) {
+    return this.jvm.inspectLocalVariable(index, threadId);
   }
 
-  /**
-   * Inspect a specific stack value by index
-   * @param {number} index - Stack index (0 = bottom, -1 = top)
-   * @returns {object|null} Stack value information or null if not found
-   */
-  inspectStackValue(index) {
-    return this.jvm.inspectStackValue(index);
+  inspectStackValue(index, threadId) {
+    return this.jvm.inspectStackValue(index, threadId);
   }
 
-  /**
-   * Inspect an object's fields
-   * @param {*} objRef - Object reference to inspect
-   * @returns {object|null} Object field information or null if not an object
-   */
+  getAvailableVariableNames(threadId) {
+    return this.jvm.getAvailableVariableNames(threadId);
+  }
+
   inspectObject(objRef) {
     return this.jvm.inspectObject(objRef);
-  }
-
-  /**
-   * Find a variable by name in the current frame
-   * @param {string} name - Variable name to search for
-   * @returns {object|null} Variable information or null if not found
-   */
-  findVariableByName(name) {
-    return this.jvm.findVariableByName(name);
-  }
-
-  /**
-   * Get all available variable names in the current frame
-   * @returns {Array} List of variable names
-   */
-  getAvailableVariableNames() {
-    return this.jvm.getAvailableVariableNames();
   }
 }
 
