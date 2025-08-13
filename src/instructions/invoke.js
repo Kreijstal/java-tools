@@ -15,7 +15,7 @@ module.exports = {
     const jreMethod = jvm._jreMethods[methodKey];
 
     if (jreMethod) {
-      const result = jreMethod(obj, args, jvm);
+      const result = jreMethod(jvm, obj, args);
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== 'V') {
         frame.stack.push(result);
@@ -26,6 +26,24 @@ module.exports = {
   },
   invokestatic: (frame, instruction, jvm) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
+
+    const methodKey = `${className}.${methodName}`;
+    const jreMethod = jvm._jreMethods[methodKey];
+
+    if (jreMethod) {
+      const { params } = parseDescriptor(descriptor);
+      const args = [];
+      for (let i = 0; i < params.length; i++) {
+        args.unshift(frame.stack.pop());
+      }
+      const result = jreMethod(jvm, null, args);
+      const { returnType } = parseDescriptor(descriptor);
+      if (returnType !== 'V') {
+        frame.stack.push(result);
+      }
+      return;
+    }
+
     let classData = jvm.classes[className];
     if (!classData) {
       const newClassPath = `sources/${className}.class`;
@@ -54,7 +72,7 @@ module.exports = {
       const methodKey = `${className}.${methodName}`;
       const jreMethod = jvm._jreMethods[methodKey];
       if (jreMethod) {
-        jreMethod(obj, args, jvm);
+        jreMethod(jvm, obj, args);
       }
     }
   },

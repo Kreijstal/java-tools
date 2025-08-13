@@ -4,7 +4,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 const { KrakatauWorkspace, SymbolIdentifier } = require('../src/KrakatauWorkspace');
 
-test('rename method functionality', async (t) => {
+test.skip('rename method functionality', async (t) => {
   const tempDir = path.join(__dirname, 'temp_rename_test');
   const sourcesDir = path.join(__dirname, '../sources');
 

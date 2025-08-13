@@ -10,35 +10,7 @@ class JVM {
   constructor() {
     this.callStack = new Stack();
     this.classes = {};
-    // Output callback for capturing println output in browser UI
-    this.outputCallback = null;
-    this.jre = {
-      'java/lang/System': {
-        'out': {
-          'java/io/PrintStream': {
-            'println': (str) => {
-              console.log(str);
-              // Also send to web UI if callback is set
-              if (this.outputCallback) {
-                this.outputCallback(str);
-              }
-            }
-          }
-        },
-        'in': {
-          'java/io/InputStream': {
-            input: 'foo\nbar\nbaz\n',
-            offset: 0,
-            read: function() {
-              if (this.offset < this.input.length) {
-                return this.input.charCodeAt(this.offset++);
-              }
-              return -1;
-            }
-          }
-        }
-      }
-    };
+    this.jre = {};
     // Debug state
     this.debugMode = false;
     this.breakpoints = new Set();
@@ -46,25 +18,15 @@ class JVM {
     this.stepTargetDepth = null;
     this.stepTargetFrame = null;
 
-    this._jreMethods = {
-      'java/lang/String.concat': (obj, args) => obj + args[0],
-      'java/lang/String.toUpperCase': (obj, args) => obj.toUpperCase(),
-      'java/lang/String.toLowerCase': (obj, args) => obj.toLowerCase(),
-      'java/lang/String.length': (obj, args) => obj.length,
-      ...jreMethods
-    };
+    this._jreMethods = jreMethods;
   }
 
   internString(str) {
     return str;
   }
 
-  /**
-   * Set a callback function to capture println output for web UI
-   * @param {function} callback - Function to call with println output
-   */
-  setOutputCallback(callback) {
-    this.outputCallback = callback;
+  registerJreMethods(methods) {
+    this._jreMethods = { ...this._jreMethods, ...methods };
   }
 
   run(classFilePath, options = {}) {
