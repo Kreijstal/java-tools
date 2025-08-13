@@ -1,16 +1,16 @@
 module.exports = {
-  'java/io/BufferedReader.<init>': (obj, args) => {
+  'java/io/BufferedReader.<init>': (jvm, obj, args) => {
     obj.reader = args[0];
     return obj;
   },
-  'java/io/BufferedReader.readLine': (obj, args, jvm) => {
+  'java/io/BufferedReader.readLine': (jvm, obj, args) => {
     const reader = obj.reader;
     let line = '';
     let charCode;
 
     const readerRead = jvm._jreMethods['java/io/InputStreamReader.read'];
 
-    while ((charCode = readerRead(reader, [], jvm)) !== -1) {
+    while ((charCode = readerRead(jvm, reader, [])) !== -1) {
       const char = String.fromCharCode(charCode);
       if (char === '\n') {
         break;
@@ -25,5 +25,8 @@ module.exports = {
     }
 
     return jvm.internString(line);
+  },
+  'java/io/BufferedReader.close': (jvm, obj, args) => {
+    // no-op
   }
 };

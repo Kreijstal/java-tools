@@ -1,7 +1,7 @@
 const test = require('tape');
 const { JVM } = require('../src/jvm');
 
-test('JVM invokevirtual should support various Java methods', (t) => {
+test('JVM invokevirtual should support various Java methods', async (t) => {
   const jvm = new JVM();
   
   // Capture console output
@@ -13,7 +13,7 @@ test('JVM invokevirtual should support various Java methods', (t) => {
 
   // Test enhanced invokevirtual with string methods
   output = '';
-  jvm.run('sources/StringMethodsTest.class', { silent: true });
+  await jvm.run('sources/StringMethodsTest.class', { silent: true });
   const lines = output.trim().split('\n');
   t.equal(lines[0], 'Hello World', 'Basic string should print correctly');
   t.equal(lines[1], 'HELLO WORLD', 'String.toUpperCase should work');
@@ -23,7 +23,7 @@ test('JVM invokevirtual should support various Java methods', (t) => {
 
   // Test complex invokevirtual calls
   output = '';
-  jvm.run('sources/InvokeVirtualTest.class', { silent: true });
+  await jvm.run('sources/InvokeVirtualTest.class', { silent: true });
   const testLines = output.trim().split('\n');
   t.equal(testLines[0], 'Hello World', 'Complex string concatenation should work');
   t.equal(testLines[1], 'Test completed', 'Multiple println calls should work');

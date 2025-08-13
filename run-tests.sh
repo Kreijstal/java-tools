@@ -1,0 +1,9 @@
+#!/bin/bash
+for f in test/*.test.js; do
+  echo "Running test: $f"
+  tape "$f"
+  if [ $? -ne 0 ]; then
+    echo "Test failed: $f"
+    exit 1
+  fi
+done
