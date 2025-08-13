@@ -254,9 +254,9 @@ class BrowserJVMDebug {
    * Set a callback function to capture println output for web UI
    * @param {function} callback - Function to call with println output
    */
-  setOutputCallback(callback) {
+  registerJreMethods(methods) {
     if (this.debugController && this.debugController.jvm) {
-      this.debugController.jvm.setOutputCallback(callback);
+      this.debugController.jvm.registerJreMethods(methods);
     }
   }
 
