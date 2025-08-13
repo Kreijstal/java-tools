@@ -9,14 +9,13 @@ test('JVM should execute Calc.class and print "4"', async function(t) {
   const classFilePath = path.join(__dirname, '..', 'sources', 'Calc.class');
 
   let output = '';
-  const originalLog = console.log;
-  console.log = function(message) {
-    output += message;
-  };
+  jvm.registerJreMethods({
+    'java/io/PrintStream.println': (j, o, a) => {
+      output += a[0];
+    }
+  });
 
   await jvm.run(classFilePath, { silent: true });
-
-  console.log = originalLog;
 
   t.equal(output, '4', 'The JVM should correctly print "4"');
 });

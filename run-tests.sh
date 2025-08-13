@@ -1,4 +1,7 @@
 #!/bin/bash
+echo "Compiling Java sources..."
+javac sources/*.java
+
 for f in test/*.test.js; do
   echo "Running test: $f"
   tape "$f"

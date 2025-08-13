@@ -405,6 +405,23 @@ function updateDebugDisplay() {
             statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : ''}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div><div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${breakpoints.join(', ')}]</span></div>`;
         }
         
+        // Update thread dropdown
+        const threadSelect = document.getElementById('threadSelect');
+        if (threadSelect) {
+            const threads = jvmDebug.getThreads ? jvmDebug.getThreads() : [];
+            const selectedThreadId = jvmDebug.debugController.jvm.debugManager.selectedThreadId;
+            threadSelect.innerHTML = '';
+            threads.forEach(thread => {
+                const option = document.createElement('option');
+                option.value = thread.id;
+                option.textContent = `Thread ${thread.id} (${thread.status})`;
+                if (thread.id === selectedThreadId) {
+                    option.selected = true;
+                }
+                threadSelect.appendChild(option);
+            });
+        }
+
         // Update stack display
         const stackDiv = document.getElementById(DOM_IDS.STACK_DISPLAY);
         if (stackDiv) {
@@ -884,6 +901,15 @@ function loadClassFile() {
 }
 
 // Utility Functions for UI
+function selectThread() {
+    const select = document.getElementById('threadSelect');
+    const threadId = parseInt(select.value);
+    if (!isNaN(threadId) && jvmDebug) {
+        jvmDebug.selectThread(threadId);
+        updateDebugDisplay();
+    }
+}
+
 function clearOutput() {
     const output = document.getElementById(DOM_IDS.OUTPUT);
     if (output) {

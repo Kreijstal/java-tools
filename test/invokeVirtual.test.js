@@ -2,14 +2,16 @@ const test = require('tape');
 const { JVM } = require('../src/jvm');
 
 test('JVM invokevirtual should support various Java methods', async (t) => {
+  t.plan(7);
+
   const jvm = new JVM();
   
-  // Capture console output
-  const originalLog = console.log;
   let output = '';
-  console.log = (msg) => {
-    output += msg + '\n';
-  };
+  jvm.registerJreMethods({
+    'java/io/PrintStream.println': (j, o, a) => {
+      output += a[0] + '\n';
+    }
+  });
 
   // Test enhanced invokevirtual with string methods
   output = '';
@@ -27,9 +29,4 @@ test('JVM invokevirtual should support various Java methods', async (t) => {
   const testLines = output.trim().split('\n');
   t.equal(testLines[0], 'Hello World', 'Complex string concatenation should work');
   t.equal(testLines[1], 'Test completed', 'Multiple println calls should work');
-
-  // Restore console.log
-  console.log = originalLog;
-  
-  t.end();
 });

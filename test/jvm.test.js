@@ -9,14 +9,13 @@ test('JVM should execute Hello.class and print "Hello, World!"', async function(
   const classFilePath = path.join(__dirname, '..', 'sources', 'Hello.class');
 
   let output = '';
-  const originalLog = console.log;
-  console.log = function(message) {
-    output += message;
-  };
+  jvm.registerJreMethods({
+    'java/io/PrintStream.println': (j, o, a) => {
+      output += a[0];
+    }
+  });
 
   await jvm.run(classFilePath, { silent: true });
-
-  console.log = originalLog;
 
   t.equal(output, 'Hello, World!', 'The JVM should correctly print "Hello, World!"');
 });

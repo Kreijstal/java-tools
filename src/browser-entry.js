@@ -210,6 +210,14 @@ class BrowserJVMDebug {
     return this.debugController.getDisassemblyView();
   }
 
+  getThreads() {
+    return this.debugController.getThreads();
+  }
+
+  selectThread(threadId) {
+    return this.debugController.selectThread(threadId);
+  }
+
   /**
    * Get backtrace
    * @returns {Array} - Call stack frames
