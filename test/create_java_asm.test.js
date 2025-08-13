@@ -7,6 +7,8 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const util = require('util');
+const execPromise = util.promisify(exec);
 const { parseClassFile } = require('../src/create_java_asm');
 
 // Get all .class files in the sources directory
@@ -41,7 +43,7 @@ test('create_java_asm output format validation', function (t) {
   t.end();
 });
 
-test('create_java_asm vs javap comparison', function (t) {
+test('create_java_asm vs javap comparison', async function (t) {
   // Test a few key files to ensure our parser captures essential information
   const testFiles = ['Hello.class', 'SimpleStringConcat.class', 'VerySimple.class'].filter(file => 
     fs.existsSync(path.join(sourcesDir, file))
@@ -54,7 +56,7 @@ test('create_java_asm vs javap comparison', function (t) {
   
   t.plan(testFiles.length * 2);
   
-  testFiles.forEach(fileName => {
+  for (const fileName of testFiles) {
     const classPath = path.join(sourcesDir, fileName);
     
     // Test our parser
@@ -64,19 +66,18 @@ test('create_java_asm vs javap comparison', function (t) {
     }, `Our parser successfully parses ${fileName}`);
     
     // Test that javap can also parse it (as a sanity check)
-    exec(`javap -c "${classPath}"`, (error, javapOutput, stderr) => {
-      if (error) {
-        t.fail(`javap failed for ${fileName}: ${error.message}`);
-      } else {
-        // Basic structural comparison - both should identify the same class
-        const className = path.basename(fileName, '.class');
-        t.ok(
-          ourOutput.includes(className) && javapOutput.includes(className),
-          `Both parsers identify class ${className}`
-        );
-      }
-    });
-  });
+    try {
+      const { stdout: javapOutput } = await execPromise(`javap -c "${classPath}"`);
+      // Basic structural comparison - both should identify the same class
+      const className = path.basename(fileName, '.class');
+      t.ok(
+        ourOutput.includes(className) && javapOutput.includes(className),
+        `Both parsers identify class ${className}`
+      );
+    } catch (error) {
+      t.fail(`javap failed for ${fileName}: ${error.message}`);
+    }
+  }
 });
 
 test('create_java_asm handles all available class files', function (t) {

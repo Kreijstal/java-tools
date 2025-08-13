@@ -2,7 +2,7 @@ const test = require('tape');
 const { JVM } = require('../src/jvm');
 const path = require('path');
 
-test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', function(t) {
+test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', async function(t) {
   t.plan(1);
 
   const jvm = new JVM();
@@ -14,7 +14,7 @@ test('JVM should execute RuntimeArithmetic.class with all arithmetic operations'
     output += message + '\n';
   };
 
-  jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath, { silent: true });
 
   console.log = originalLog;
 
@@ -22,7 +22,7 @@ test('JVM should execute RuntimeArithmetic.class with all arithmetic operations'
   t.equal(output, expected, 'The JVM should correctly execute iadd, isub, and imul operations');
 });
 
-test('JVM should execute VerySimple.class with subtraction', function(t) {
+test('JVM should execute VerySimple.class with subtraction', async function(t) {
   t.plan(1);
 
   const jvm = new JVM();
@@ -34,14 +34,14 @@ test('JVM should execute VerySimple.class with subtraction', function(t) {
     output += message + '\n';
   };
 
-  jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath, { silent: true });
 
   console.log = originalLog;
 
   t.equal(output, '1\n', 'The JVM should correctly execute subtraction (3-2=1)');
 });
 
-test('JVM should execute SmallDivisionTest.class with division and remainder operations', function(t) {
+test('JVM should execute SmallDivisionTest.class with division and remainder operations', async function(t) {
   t.plan(1);
 
   const jvm = new JVM();
@@ -53,7 +53,7 @@ test('JVM should execute SmallDivisionTest.class with division and remainder ope
     output += message + '\n';
   };
 
-  jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath, { silent: true });
 
   console.log = originalLog;
 
@@ -61,7 +61,7 @@ test('JVM should execute SmallDivisionTest.class with division and remainder ope
   t.equal(output, expected, 'The JVM should correctly execute idiv and irem operations');
 });
 
-test('JVM should execute ConstantsTest.class with iconst instructions', function(t) {
+test('JVM should execute ConstantsTest.class with iconst instructions', async function(t) {
   t.plan(3);
 
   const jvm = new JVM();
@@ -73,7 +73,7 @@ test('JVM should execute ConstantsTest.class with iconst instructions', function
     output += message + '\n';
   };
 
-  jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath, { silent: true });
 
   console.log = originalLog;
 

@@ -8,8 +8,8 @@ test('Enhanced Debug Features - Backtrace with method arguments', async (t) => {
   
   try {
     await controller.start('sources/VerySimple.class');
-    controller.stepInto(); // Execute iconst_3
-    controller.stepInto(); // Execute istore_1
+    await controller.stepInto(); // Execute iconst_3
+    await controller.stepInto(); // Execute istore_1
     
     const backtrace = controller.getBacktrace();
     
@@ -36,7 +36,7 @@ test('Enhanced Debug Features - Stack inspection', async (t) => {
   
   try {
     await controller.start('sources/VerySimple.class');
-    controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
+    await controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
     
     const stackInspection = controller.inspectStack();
     
@@ -57,8 +57,8 @@ test('Enhanced Debug Features - Local variables inspection', async (t) => {
   
   try {
     await controller.start('sources/VerySimple.class');
-    controller.stepInto(); // Execute iconst_3
-    controller.stepInto(); // Execute istore_1 (stores 3 in local 1)
+    await controller.stepInto(); // Execute iconst_3
+    await controller.stepInto(); // Execute istore_1 (stores 3 in local 1)
     
     const localsInspection = controller.inspectLocals();
     
@@ -79,8 +79,8 @@ test('Enhanced Debug Features - Specific local variable inspection', async (t) =
   
   try {
     await controller.start('sources/VerySimple.class');
-    controller.stepInto(); // Execute iconst_3
-    controller.stepInto(); // Execute istore_1 (stores 3 in local 1)
+    await controller.stepInto(); // Execute iconst_3
+    await controller.stepInto(); // Execute istore_1 (stores 3 in local 1)
     
     const localVar = controller.inspectLocalVariable(1);
     
@@ -102,7 +102,7 @@ test('Enhanced Debug Features - Specific stack value inspection', async (t) => {
   
   try {
     await controller.start('sources/VerySimple.class');
-    controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
+    await controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
     
     const stackValue = controller.inspectStackValue(0);
     
@@ -123,7 +123,7 @@ test('Enhanced Debug Features - Negative stack indices', async (t) => {
   
   try {
     await controller.start('sources/VerySimple.class');
-    controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
+    await controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
     
     const topStackValue = controller.inspectStackValue(-1);
     

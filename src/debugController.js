@@ -54,7 +54,7 @@ class DebugController {
   /**
    * Continue execution until next breakpoint or completion
    */
-  continue() {
+  async continue() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot continue: execution is not paused');
     }
@@ -62,7 +62,7 @@ class DebugController {
     this.jvm.continue();
     this.executionState = 'running';
     
-    const result = this.jvm.execute();
+    const result = await this.jvm.execute();
     this.lastExecutionResult = result;
     
     if (result.paused) {
@@ -92,66 +92,66 @@ class DebugController {
   /**
    * Step into the next instruction (will enter method calls)
    */
-  stepInto() {
+  async stepInto() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
 
     this.jvm.stepInto();
-    return this._executeStep();
+    return await this._executeStep();
   }
 
   /**
    * Step over the next instruction (will not enter method calls)
    */
-  stepOver() {
+  async stepOver() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
 
     this.jvm.stepOver();
-    return this._executeStep();
+    return await this._executeStep();
   }
 
   /**
    * Step out of the current method
    */
-  stepOut() {
+  async stepOut() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
 
     this.jvm.stepOut();
-    return this._executeStep();
+    return await this._executeStep();
   }
 
   /**
    * Execute a single instruction
    */
-  stepInstruction() {
+  async stepInstruction() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
 
     this.jvm.stepInstruction();
-    return this._executeStep();
+    return await this._executeStep();
   }
 
   /**
    * Continue until the current method finishes
    */
-  finish() {
+  async finish() {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
 
     this.jvm.finish();
-    return this._executeStep();
+    return await this._executeStep();
   }
 
-  _executeStep() {
+  async _executeStep() {
     this.executionState = 'running';
-    const result = this.jvm.execute();
+    const result = await this.jvm.execute();
     this.lastExecutionResult = result;
     
     if (result.paused) {

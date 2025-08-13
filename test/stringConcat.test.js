@@ -1,28 +1,23 @@
 const test = require('tape');
 const { JVM } = require('../src/jvm');
+const path = require('path');
 
-test('JVM should execute string concatenation examples', (t) => {
+test('JVM should execute string concatenation examples', async (t) => {
+  t.plan(2);
+
   const jvm = new JVM();
-  
-  // Capture console output
-  const originalLog = console.log;
   let output = '';
-  console.log = (msg) => {
-    output += msg + '\n';
+  const originalLog = console.log;
+  console.log = function(message) {
+    output += message;
   };
 
-  // Test simple string concatenation (compile-time optimized)
-  output = '';
-  jvm.run('sources/SimpleStringConcat.class', { silent: true });
-  t.equal(output.trim(), 'Hello World', 'Simple string concatenation should work');
+  await jvm.run(path.join(__dirname, '..', 'sources', 'SimpleStringConcat.class'), { silent: true });
+  t.equal(output.trim(), 'Hello World', 'SimpleStringConcat should work');
 
-  // Test String.concat method calls
   output = '';
-  jvm.run('sources/StringConcatMethod.class', { silent: true });
-  t.equal(output.trim(), 'Hello World', 'String.concat method should work');
+  await jvm.run(path.join(__dirname, '..', 'sources', 'StringConcatMethod.class'), { silent: true });
+  t.equal(output.trim(), 'Hello World', 'StringConcatMethod should work');
 
-  // Restore console.log
   console.log = originalLog;
-  
-  t.end();
 });
