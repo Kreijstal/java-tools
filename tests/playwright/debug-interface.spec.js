@@ -111,13 +111,18 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should handle continue execution', async ({ page }) => {
+    // First load a sample class
+    await page.selectOption('#sampleClassSelect', 'VerySimple.class');
+    await page.click('#loadSampleBtn', { timeout: 5000 });
+    await expect(page.locator('#status')).toContainText('Sample class loaded', { timeout: 5000 });
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
     
     // Continue execution
     await page.click('#continueBtn', { timeout: 5000 });
-    await page.waitForTimeout(1200); // Slightly shorter timeout
+    await page.waitForTimeout(1200); // Wait for execution to complete
     
     // Check that execution either completes or hits a breakpoint
     const status = await page.locator('#status').textContent();

@@ -129,7 +129,14 @@ class DebugController {
       return { executionState: this.executionState, pc: null, stack: [], locals: [], callStackDepth: 0, method: null, breakpoints: [] };
     }
 
-    const frame = thread.callStack.peek();
+    let frame;
+    try {
+      frame = thread.callStack.peek();
+    } catch (error) {
+      // Stack is empty - execution completed
+      frame = null;
+    }
+    
     if (!frame) {
       return { executionState: this.executionState, pc: null, stack: [], locals: [], callStackDepth: 0, method: null, breakpoints: [] };
     }
@@ -145,7 +152,7 @@ class DebugController {
       stack: frame.stack.items,
       locals: frame.locals,
       callStackDepth: thread.callStack.size(),
-      method: frame.method.name,
+      method: { name: frame.method.name, descriptor: frame.method.descriptor },
       breakpoints: Array.from(this.jvm.debugManager.breakpoints)
     };
   }
