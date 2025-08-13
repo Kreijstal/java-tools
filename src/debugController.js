@@ -145,7 +145,7 @@ class DebugController {
       stack: frame.stack.items,
       locals: frame.locals,
       callStackDepth: thread.callStack.size(),
-      method: frame.method.name,
+      method: { name: frame.method.name, descriptor: frame.method.descriptor },
       breakpoints: Array.from(this.jvm.debugManager.breakpoints)
     };
   }
