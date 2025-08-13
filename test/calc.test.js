@@ -2,7 +2,7 @@ const test = require('tape');
 const { JVM } = require('../src/jvm');
 const path = require('path');
 
-test('JVM should execute Calc.class and print "4"', function(t) {
+test('JVM should execute Calc.class and print "4"', async function(t) {
   t.plan(1);
 
   const jvm = new JVM();
@@ -14,7 +14,7 @@ test('JVM should execute Calc.class and print "4"', function(t) {
     output += message;
   };
 
-  jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath, { silent: true });
 
   console.log = originalLog;
 

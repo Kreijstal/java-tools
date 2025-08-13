@@ -2,7 +2,7 @@ const { parseDescriptor } = require('../typeParser');
 const Frame = require('../frame');
 
 module.exports = {
-  invokevirtual: (frame, instruction, jvm) => {
+  invokevirtual: async (frame, instruction, jvm) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
     const { params } = parseDescriptor(descriptor);
     const args = [];
@@ -15,7 +15,7 @@ module.exports = {
     const jreMethod = jvm._jreMethods[methodKey];
 
     if (jreMethod) {
-      const result = jreMethod(jvm, obj, args);
+      const result = await jreMethod(jvm, obj, args);
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== 'V') {
         frame.stack.push(result);
@@ -24,7 +24,7 @@ module.exports = {
       console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
     }
   },
-  invokestatic: (frame, instruction, jvm) => {
+  invokestatic: async (frame, instruction, jvm) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
 
     const methodKey = `${className}.${methodName}`;
@@ -36,7 +36,7 @@ module.exports = {
       for (let i = 0; i < params.length; i++) {
         args.unshift(frame.stack.pop());
       }
-      const result = jreMethod(jvm, null, args);
+      const result = await jreMethod(jvm, null, args);
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== 'V') {
         frame.stack.push(result);
@@ -59,7 +59,7 @@ module.exports = {
       jvm.callStack.push(newFrame);
     }
   },
-  invokespecial: (frame, instruction, jvm) => {
+  invokespecial: async (frame, instruction, jvm) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
     const { params } = parseDescriptor(descriptor);
     const args = [];
@@ -72,7 +72,7 @@ module.exports = {
       const methodKey = `${className}.${methodName}`;
       const jreMethod = jvm._jreMethods[methodKey];
       if (jreMethod) {
-        jreMethod(jvm, obj, args);
+        await jreMethod(jvm, obj, args);
       }
     }
   },

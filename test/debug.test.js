@@ -2,11 +2,12 @@ const test = require('tape');
 const { JVM } = require('../src/jvm');
 const DebugController = require('../src/debugController');
 
-test('JVM Serialization', (t) => {
+test('JVM Serialization', async (t) => {
   const jvm = new JVM();
-  
+  t.plan(12);
+
   // Load a simple class for testing
-  const classData = jvm.loadClass('sources/VerySimple.class', { silent: true });
+  const classData = await jvm.loadClassAsync('sources/VerySimple.class', { silent: true });
   t.ok(classData, 'Should load VerySimple.class');
 
   const mainMethod = jvm.findMainMethod(classData);
@@ -40,8 +41,6 @@ test('JVM Serialization', (t) => {
   const restoredFrame = newJvm.callStack.peek();
   t.equal(restoredFrame.method.name, 'main', 'Restored frame should be main method');
   t.equal(restoredFrame.pc, 0, 'Restored frame should have correct PC');
-
-  t.end();
 });
 
 test('Debug Controller Basic Operations', async (t) => {
@@ -121,7 +120,7 @@ test('Debug Controller Step Operations', async (t) => {
     await controller.start('sources/VerySimple.class');
     
     // Test step into
-    const stepResult = controller.stepInto();
+    const stepResult = await controller.stepInto();
     t.ok(stepResult, 'Step into should return result');
     t.ok(['paused', 'completed'].includes(stepResult.status), 'Step should result in pause or completion');
 
@@ -141,17 +140,18 @@ test('Debug Controller Step Operations', async (t) => {
 
 test('Debug API Error Handling', async (t) => {
   const controller = new DebugController();
+  t.plan(3);
   
   // Test operations on non-paused debugger
   try {
-    controller.stepInto();
+    await controller.stepInto();
     t.fail('Should throw error when stepping on non-paused debugger');
   } catch (error) {
     t.ok(error.message.includes('execution is not paused'), 'Should throw appropriate error');
   }
 
   try {
-    controller.continue();
+    await controller.continue();
     t.fail('Should throw error when continuing non-paused debugger');
   } catch (error) {
     t.ok(error.message.includes('execution is not paused'), 'Should throw appropriate error');
@@ -168,6 +168,4 @@ test('Debug API Error Handling', async (t) => {
   } finally {
     console.error = originalConsoleError; // Restore console.error
   }
-
-  t.end();
 });

@@ -29,7 +29,7 @@ class JVM {
     this._jreMethods = { ...this._jreMethods, ...methods };
   }
 
-  run(classFilePath, options = {}) {
+  async run(classFilePath, options = {}) {
     const classData = this.loadClassSync(classFilePath, options);
     if (!classData) {
       return;
@@ -43,10 +43,10 @@ class JVM {
 
     const initialFrame = new Frame(mainMethod);
     this.callStack.push(initialFrame);
-    this.execute();
+    await this.execute();
   }
 
-  execute() {
+  async execute() {
     while (!this.callStack.isEmpty()) {
       const frame = this.callStack.peek();
       if (frame.pc >= frame.instructions.length) {
@@ -74,7 +74,7 @@ class JVM {
 
       try {
         if (instruction) {
-          this.executeInstruction(instruction, frame);
+          await this.executeInstruction(instruction, frame);
         }
       } catch (e) {
         this.handleException(e, currentPc);
@@ -165,8 +165,8 @@ class JVM {
     return false;
   }
 
-  executeInstruction(instruction, frame) {
-    dispatch(frame, instruction, this);
+  async executeInstruction(instruction, frame) {
+    await dispatch(frame, instruction, this);
   }
 
   loadClass(classFilePath, options = {}) {

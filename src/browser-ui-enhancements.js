@@ -656,13 +656,13 @@ function initializeEditor() {
 }
 
 // Helper function to handle debug operations with consistent error handling and display updates
-function executeDebugOperation(operation, operationName, successMessage) {
+async function executeDebugOperation(operation, operationName, successMessage) {
     if (!jvmDebug) {
         throw new Error(`JVM not initialized - cannot ${operationName.toLowerCase()}`);
     }
     
     try {
-        const result = operation();
+        const result = await operation();
         // Keep step completion messages for tests and user feedback
         if (successMessage) {
             log(successMessage, 'info');
@@ -740,23 +740,23 @@ function enhanceWithRealJVM() {
     };
     
     // Override with real JVM implementations
-    window.stepInto = function() {
-        return executeDebugOperation(() => jvmDebug.stepInto(), 'step into');
+    window.stepInto = async function() {
+        return await executeDebugOperation(() => jvmDebug.stepInto(), 'step into');
     };
     
-    window.stepOver = function() {
-        return executeDebugOperation(() => jvmDebug.stepOver(), 'step over');
+    window.stepOver = async function() {
+        return await executeDebugOperation(() => jvmDebug.stepOver(), 'step over');
     };
     
-    window.stepOut = function() {
-        return executeDebugOperation(() => jvmDebug.stepOut(), 'step out');
+    window.stepOut = async function() {
+        return await executeDebugOperation(() => jvmDebug.stepOut(), 'step out');
     };
     
-    window.continue_ = function() {
+    window.continue_ = async function() {
         if (!jvmDebug) {
             throw new Error('JVM not initialized - cannot continue');
         }
-        const result = jvmDebug.continue();
+        const result = await jvmDebug.continue();
         // Reduced verbosity: Only log in verbose mode
         // log('Continue completed', 'info');
         updateDebugDisplay();
@@ -779,13 +779,13 @@ function enhanceWithRealJVM() {
         return result;
     };
     
-    window.finish = function() {
-        return executeDebugOperation(() => jvmDebug.finish(), 'finish', 'Finish completed');
+    window.finish = async function() {
+        return await executeDebugOperation(() => jvmDebug.finish(), 'finish', 'Finish completed');
     };
     
     // Add stepInstruction function
-    window.stepInstruction = function() {
-        return executeDebugOperation(() => jvmDebug.stepInstruction(), 'step instruction', 'Step Instruction completed');
+    window.stepInstruction = async function() {
+        return await executeDebugOperation(() => jvmDebug.stepInstruction(), 'step instruction', 'Step Instruction completed');
     };
     
     // Override serialize/deserialize with real JVM state
