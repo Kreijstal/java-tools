@@ -27,7 +27,7 @@ class JVM {
   }
 
   async run(classFilePath, options = {}) {
-    const classData = this.loadClassSync(classFilePath, options);
+    const classData = await this.loadClassAsync(classFilePath, options);
     if (!classData) {
       throw new Error(`Class not found: ${classFilePath}`);
     }

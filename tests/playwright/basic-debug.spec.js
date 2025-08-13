@@ -25,6 +25,7 @@ test.describe('JVM Debug Browser Interface - Basic Tests', () => {
 
   test('should run browser debug functionality test', async ({ page }) => {
     // Navigate to our test page with timeout
+    page.on('console', msg => console.log(msg.text()));
     await page.goto('/examples/browser-debug-test.html', { timeout: 10000 });
     
     // Wait for tests to complete with shorter timeout
