@@ -12,7 +12,22 @@ module.exports = {
   },
   getstatic: (frame, instruction, jvm) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
-    const field = jvm.jre[className][fieldName];
-    frame.stack.push(field);
+
+    if (jvm.jre[className] && jvm.jre[className][fieldName]) {
+      const field = jvm.jre[className][fieldName];
+      frame.stack.push(field);
+      return;
+    }
+
+    if (className === 'java/lang/System' && fieldName === 'out') {
+      const printStream = {
+        type: 'java/io/PrintStream',
+        println: jvm._jreMethods['java/io/PrintStream.println']
+      };
+      frame.stack.push(printStream);
+      return;
+    }
+
+    console.error(`Unsupported getstatic: ${className}.${fieldName}`);
   },
 };

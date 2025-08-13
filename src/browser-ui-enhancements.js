@@ -170,18 +170,19 @@ async function initializeJVM() {
         if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
             jvmDebug = new window.JVMDebug.BrowserJVMDebug();
             
-            // Set up println output callback to redirect to web console
-            jvmDebug.setOutputCallback((output) => {
-                // Add println output to the web UI output console
+            // Register a custom println method to redirect output to the web console
+            jvmDebug.registerJreMethods({
+              'java/io/PrintStream.println': (jvm, obj, args) => {
                 const outputDiv = document.getElementById(DOM_IDS.OUTPUT);
                 if (outputDiv) {
                     const timestamp = new Date().toLocaleTimeString();
                     const logEntry = document.createElement('div');
-                    logEntry.textContent = `[${timestamp}] ${output}`;
+                    logEntry.textContent = `[${timestamp}] ${args[0]}`;
                     logEntry.style.color = '#4ec9b0'; // Different color for program output
                     outputDiv.appendChild(logEntry);
                     outputDiv.scrollTop = outputDiv.scrollHeight; // Auto-scroll to bottom
                 }
+              }
             });
             
             try {
