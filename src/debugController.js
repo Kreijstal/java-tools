@@ -215,6 +215,10 @@ class DebugController {
   inspectObject(objRef) {
     return this.jvm.inspectObject(objRef);
   }
+
+  getDisassemblyView() {
+    return this.jvm.getDisassemblyView();
+  }
 }
 
 module.exports = DebugController;

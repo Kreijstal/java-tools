@@ -483,7 +483,134 @@ class JVM {
   _getValueDescription(value) { return ''; }
   getSourceLineMapping(pc, method) { return {}; }
   getSourceFileName(method) { return null; }
-  getDisassemblyView() { return {}; }
+  getDisassemblyView() {
+    // Get current execution state
+    const thread = this.threads[this.currentThreadIndex];
+    if (!thread || thread.callStack.isEmpty()) {
+      return { 
+        formattedDisassembly: '',
+        lineToPcMap: {},
+        classFile: null,
+        currentPc: -1
+      };
+    }
+
+    const frame = thread.callStack.peek();
+    if (!frame) {
+      return { 
+        formattedDisassembly: '',
+        lineToPcMap: {},
+        classFile: null,
+        currentPc: -1
+      };
+    }
+
+    // Find the class that contains the current method
+    const className = this.findClassNameForMethod(frame.method);
+    if (!className) {
+      return { 
+        formattedDisassembly: '// Could not find class for current method',
+        lineToPcMap: {},
+        classFile: null,
+        currentPc: -1
+      };
+    }
+
+    const classData = this.classes[className];
+    if (!classData) {
+      return { 
+        formattedDisassembly: '// Class data not available',
+        lineToPcMap: {},
+        classFile: className,
+        currentPc: -1
+      };
+    }
+
+    try {
+      // Get current PC
+      let currentPc = -1;
+      if (frame.pc < frame.instructions.length) {
+        const instructionItem = frame.instructions[frame.pc];
+        const label = instructionItem ? instructionItem.labelDef : null;
+        currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+      }
+
+      // Generate disassembly using the same method as getClassDisassembly
+      const disassembly = unparseDataStructures(classData.classes[0]);
+      
+      // Format the disassembly with debug information
+      const formattedDisassembly = this._formatDisassemblyForDebugView(disassembly, currentPc, className);
+      
+      // Create line to PC mapping for breakpoint support
+      const lineToPcMap = this._createLineToPcMap(disassembly, currentPc);
+      
+      return {
+        formattedDisassembly: formattedDisassembly,
+        lineToPcMap: lineToPcMap,
+        classFile: `${className}.class`,
+        currentPc: currentPc
+      };
+    } catch (error) {
+      return { 
+        formattedDisassembly: `// Error generating disassembly: ${error.message}`,
+        lineToPcMap: {},
+        classFile: `${className}.class`,
+        currentPc: -1
+      };
+    }
+  }
+
+  _formatDisassemblyForDebugView(disassembly, currentPc, className) {
+    // Format disassembly with debug header and current execution indicator
+    const header = `8. Disassembly View
+=====================================
+File: ${className}.class
+Current PC: ${currentPc}
+
+`;
+    
+    const lines = disassembly.split('\n');
+    const formattedLines = [];
+    let lineNumber = 1;
+    
+    for (const line of lines) {
+      // Check if this line contains a PC marker that matches the current PC
+      const pcMatch = line.match(/L(\d+):/);
+      const linePc = pcMatch ? parseInt(pcMatch[1]) : -1;
+      
+      if (linePc === currentPc) {
+        // Mark current execution line with arrow
+        formattedLines.push(`=>  ${lineNumber.toString().padStart(3)}  ${line}`);
+      } else {
+        // Regular line with line number
+        formattedLines.push(`    ${lineNumber.toString().padStart(3)}  ${line}`);
+      }
+      lineNumber++;
+    }
+    
+    const footer = '\n=====================================';
+    
+    return header + formattedLines.join('\n') + footer;
+  }
+
+  _createLineToPcMap(disassembly, currentPc) {
+    // Create mapping from display line numbers to PC values for breakpoint support
+    const lineToPcMap = {};
+    const lines = disassembly.split('\n');
+    
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const pcMatch = line.match(/L(\d+):/);
+      if (pcMatch) {
+        const pc = parseInt(pcMatch[1]);
+        // The display line number will be i + 6 (accounting for header lines)
+        const displayLineNumber = i + 5; // 5 header lines before content starts
+        lineToPcMap[displayLineNumber] = pc;
+      }
+    }
+    
+    return lineToPcMap;
+  }
 }
 
 module.exports = { JVM };
