@@ -5,6 +5,7 @@ const { formatInstruction, unparseDataStructures } = require('./convert_tree');
 const jreMethods = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
+const DebugManager = require('./DebugManager');
 
 class JVM {
   constructor() {
@@ -12,12 +13,7 @@ class JVM {
     this.currentThreadIndex = 0;
     this.classes = {};
     this.jre = {};
-    // Debug state
-    this.debugMode = false;
-    this.breakpoints = new Set();
-    this.stepMode = null; // null, 'into', 'over', 'out', 'instruction', 'finish'
-    this.stepTargetDepth = null;
-    this.stepTargetFrame = null;
+    this.debugManager = new DebugManager();
 
     this._jreMethods = jreMethods;
   }
@@ -33,7 +29,7 @@ class JVM {
   async run(classFilePath, options = {}) {
     const classData = this.loadClassSync(classFilePath, options);
     if (!classData) {
-      return;
+      throw new Error(`Class not found: ${classFilePath}`);
     }
 
     const mainMethod = this.findMainMethod(classData);
@@ -51,69 +47,93 @@ class JVM {
     mainThread.callStack.push(initialFrame);
     this.threads.push(mainThread);
 
-    await this.execute();
+    if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
+        await this.execute();
+    }
   }
 
   async execute() {
-    // This is now the scheduler.
-    // It runs as long as there are runnable threads.
-    while (this.threads.filter(t => t.status === 'runnable').length > 0) {
-      if (this.threads.length === 0) {
-        break;
-      }
-      const thread = this.threads[this.currentThreadIndex];
+    this.debugManager.resume();
 
-      if (thread.status !== 'runnable') {
-        this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
-        await new Promise(resolve => setImmediate(resolve));
-        continue;
+    while (!this.debugManager.isPaused) {
+      const result = await this.executeTick();
+      if (result.completed) {
+        this.debugManager.pause();
+        return { completed: true, paused: false };
       }
 
-      const callStack = thread.callStack;
-
-      if (callStack.isEmpty()) {
-        thread.status = 'terminated';
-        if (this.threads.filter(t => t.status === 'runnable').length === 0) {
-          break;
-        }
-        this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
-        continue;
+      // Check for breakpoints
+      const currentThread = this.threads[this.currentThreadIndex];
+      if (currentThread && currentThread.status === 'runnable' && !currentThread.callStack.isEmpty()) {
+          const frame = currentThread.callStack.peek();
+          if (frame) {
+              // A thread's pc can be out of bounds if it just finished.
+              if (frame.pc < frame.instructions.length) {
+                const instructionItem = frame.instructions[frame.pc];
+                if (instructionItem) {
+                    const label = instructionItem.labelDef;
+                    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+                    if (this.debugManager.breakpoints.has(currentPc)) {
+                        this.debugManager.pause();
+                    }
+                }
+              }
+          }
       }
-
-      const frame = callStack.peek();
-      if (frame.pc >= frame.instructions.length) {
-        callStack.pop();
-        continue;
-      }
-
-      const instructionItem = frame.instructions[frame.pc];
-      const instruction = instructionItem.instruction;
-
-      // NOTE: Debugging features are temporarily disabled for threading implementation.
-
-      frame.pc++;
-
-      try {
-        if (instruction) {
-          await this.executeInstruction(instruction, frame, thread);
-        }
-      } catch (e) {
-        const label = instructionItem.labelDef;
-        const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-        this.handleException(e, currentPc, thread);
-      }
-
-      // Simple round-robin scheduler.
-      if (this.threads.length > 0) {
-        this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
-      }
-
-      // Yield to the event loop.
+      // Yield to the event loop to prevent blocking on long-running code without breakpoints
       await new Promise(resolve => setImmediate(resolve));
     }
-    
-    // Execution completed
-    return { paused: false, completed: true };
+
+    return { paused: true, completed: false };
+  }
+
+  async executeTick() {
+    if (this.threads.filter(t => t.status === 'runnable').length === 0) {
+      return { completed: true };
+    }
+
+    const thread = this.threads[this.currentThreadIndex];
+
+    if (!thread || thread.status !== 'runnable') {
+      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+      return { completed: false };
+    }
+
+    const callStack = thread.callStack;
+
+    if (callStack.isEmpty()) {
+      thread.status = 'terminated';
+      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+      return { completed: false };
+    }
+
+    const frame = callStack.peek();
+    if (frame.pc >= frame.instructions.length) {
+      callStack.pop();
+      return { completed: false };
+    }
+
+    const instructionItem = frame.instructions[frame.pc];
+    const instruction = instructionItem.instruction;
+
+    frame.pc++;
+
+    try {
+      if (instruction) {
+        await this.executeInstruction(instruction, frame, thread);
+      }
+    } catch (e) {
+      const label = instructionItem.labelDef;
+      const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+      this.handleException(e, currentPc, thread);
+    }
+
+    // Advance to next thread
+    if (this.threads.length > 0) {
+      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+    }
+
+    return { completed: false };
   }
 
   // TODO: Make debugger thread-aware
@@ -266,13 +286,16 @@ class JVM {
     this.handleException(exception, -1, thread); // PC is -1 for subsequent frames
   }
 
-  // NOTE: Serialization is disabled for threaded JVM
   serialize() {
-    return {};
+    return {
+      debugManager: this.debugManager.serialize(),
+    };
   }
 
   deserialize(state) {
-    // empty
+    if (state && state.debugManager) {
+      this.debugManager.deserialize(state.debugManager);
+    }
   }
 
   findClassNameForMethod(method) {
@@ -304,35 +327,159 @@ class JVM {
     return methodItem ? methodItem.method : null;
   }
 
-  // NOTE: Debugging and inspection methods are disabled for threaded JVM.
-  // A thread-aware implementation is required.
+  // Thread-aware debugging and inspection methods
 
-  // Debug control methods
-  enableDebugMode() {}
-  disableDebugMode() {}
-  addBreakpoint(pc) {}
-  removeBreakpoint(pc) {}
-  clearBreakpoints() {}
+  enableDebugMode() { this.debugManager.enable(); }
+  disableDebugMode() { this.debugManager.disable(); }
+  addBreakpoint(pc) { this.debugManager.addBreakpoint(pc); }
+  removeBreakpoint(pc) { this.debugManager.removeBreakpoint(pc); }
+  clearBreakpoints() { this.debugManager.clearBreakpoints(); }
+
+  getCurrentState() {
+    const thread = this.threads[this.currentThreadIndex];
+    if (!thread || thread.callStack.isEmpty()) return { callStackDepth: 0 };
+    const frame = thread.callStack.peek();
+    if (!frame) return { callStackDepth: thread.callStack.size() };
+
+    const instructionItem = frame.instructions[frame.pc];
+    const label = instructionItem ? instructionItem.labelDef : null;
+    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+
+    return {
+        pc: currentPc,
+        stack: frame.stack.items,
+        locals: frame.locals,
+        callStackDepth: thread.callStack.size(),
+        method: { name: frame.method.name, descriptor: frame.method.descriptor },
+    };
+  }
+
+  getBacktrace(threadId = this.debugManager.selectedThreadId) {
+    const thread = this.threads[threadId];
+    if (!thread) return [];
+    return thread.callStack.items.map((frame, i) => this._getFrameInfo(frame, i, thread.callStack.size()));
+  }
+
+  _getFrameInfo(frame, frameIndex, totalFrames) {
+    const className = this.findClassNameForMethod(frame.method);
+    const { params } = parseDescriptor(frame.method.descriptor);
+    const args = this._extractMethodArguments(frame, params);
+    return {
+        frameIndex: frameIndex,
+        className: className,
+        methodName: frame.method.name,
+        methodDescriptor: frame.method.descriptor,
+        isCurrentFrame: frameIndex === (totalFrames - 1),
+        arguments: args,
+    };
+  }
+
+  _extractMethodArguments(frame, params) {
+    const args = [];
+    let localIndex = 0;
+    const isStatic = frame.method.flags && frame.method.flags.includes('static');
+    if (!isStatic) {
+      args.push({ name: 'this', type: 'reference', value: frame.locals[0], localIndex: 0 });
+      localIndex = 1;
+    }
+    for (let i = 0; i < params.length; i++) {
+      const paramType = params[i];
+      args.push({ name: `arg${i}`, type: paramType, value: frame.locals[localIndex], localIndex: localIndex });
+      if (paramType === 'long' || paramType === 'double') {
+        localIndex += 2;
+      } else {
+        localIndex += 1;
+      }
+    }
+    return args;
+  }
+
+  inspectStack(threadId = this.debugManager.selectedThreadId) {
+    const thread = this.threads[threadId];
+    if (!thread || thread.callStack.isEmpty()) return [];
+    return thread.callStack.peek().stack.items.map((value, index) => ({
+        index, value, type: this._inferType(value)
+    }));
+  }
+
+  inspectLocals(threadId = this.debugManager.selectedThreadId) {
+    const thread = this.threads[threadId];
+    if (!thread || thread.callStack.isEmpty()) return [];
+    return this._getLocalVariableInfo(thread.callStack.peek());
+  }
+
+  _getLocalVariableInfo(frame) {
+    const variables = [];
+    const localVarTable = this._getLocalVariableTable(frame.method);
+    for (let i = 0; i < frame.locals.length; i++) {
+      const value = frame.locals[i];
+      let varInfo = {
+        index: i,
+        value: value,
+        type: this._inferType(value),
+        name: `local_${i}`
+      };
+      if (localVarTable) {
+        const varEntry = localVarTable.find(entry => entry.index === i);
+        if (varEntry) {
+          varInfo.name = varEntry.name;
+          varInfo.type = varEntry.signature || varInfo.type;
+        }
+      }
+      variables.push(varInfo);
+    }
+    return variables;
+  }
+
+  _getLocalVariableTable(method) {
+    if (!method.attributes) return null;
+    const codeAttribute = method.attributes.find(attr => attr.type === 'code');
+    if (!codeAttribute || !codeAttribute.code.attributes) return null;
+    const localVarTable = codeAttribute.code.attributes.find(attr => attr.type === 'localvariabletable');
+    return localVarTable ? localVarTable.variables : null;
+  }
+
+  _inferType(value) {
+    if (value === null || value === undefined) return 'null';
+    if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'double';
+    if (typeof value === 'string') return 'String';
+    if (typeof value === 'boolean') return 'boolean';
+    if (Array.isArray(value)) return 'array';
+    if (typeof value === 'object') return value.type || 'object';
+    return typeof value;
+  }
+
+  inspectLocalVariable(index, threadId = this.debugManager.selectedThreadId) {
+    const locals = this.inspectLocals(threadId);
+    return locals.find(l => l.index === index) || null;
+  }
+
+  inspectStackValue(index, threadId = this.debugManager.selectedThreadId) {
+    const stack = this.inspectStack(threadId);
+    if (index < 0) {
+        index = stack.length + index;
+    }
+    return stack.find(s => s.index === index) || null;
+  }
+
+  getAvailableVariableNames(threadId = this.debugManager.selectedThreadId) {
+      const locals = this.inspectLocals(threadId);
+      return locals.map(l => l.name);
+  }
+
+  inspectObject(objRef) {
+    if (!objRef || typeof objRef !== 'object') return null;
+    return { type: objRef.type, fields: objRef.fields || {} };
+  }
+
+  // Placeholders for now
   stepInto() {}
   stepOver() {}
   stepOut() {}
   stepInstruction() {}
   finish() {}
   continue() {}
-  getCurrentState() { return {}; }
-  getBacktrace() { return []; }
-  _getFrameInfo(frame, frameIndex) { return {}; }
-  _extractMethodArguments(frame, params) { return []; }
-  _getLocalVariableInfo(frame) { return []; }
-  _getLocalVariableTable(method) { return null; }
-  _inferType(value) { return 'unknown'; }
-  inspectStack() { return []; }
-  inspectLocals() { return []; }
-  inspectLocalVariable(index) { return null; }
-  inspectStackValue(index) { return null; }
-  inspectObject(objRef) { return null; }
   findVariableByName(name) { return null; }
-  getAvailableVariableNames() { return []; }
   _getValueDescription(value) { return ''; }
   getSourceLineMapping(pc, method) { return {}; }
   getSourceFileName(method) { return null; }
