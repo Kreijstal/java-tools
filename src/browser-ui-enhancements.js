@@ -780,7 +780,7 @@ function enhanceWithRealJVM() {
         
         // Update status based on result
         const state = jvmDebug.getCurrentState();
-        if (state.executionState === 'completed') {
+        if (state.executionState === 'stopped') {
             updateStatus('Program execution completed', 'success');
         } else if (state.executionState === 'paused') {
             // Check if we hit a breakpoint
