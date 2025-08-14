@@ -1,7 +1,22 @@
 module.exports = {
-  ldc: (frame, instruction) => {
-    const value = instruction.arg.replace(/"/g, '');
-    frame.stack.push(value);
+  ldc: async (frame, instruction, jvm) => {
+    if (Array.isArray(instruction.arg) && instruction.arg[0] === 'Class') {
+      const className = instruction.arg[1];
+      const classData = await jvm.loadClassByName(className);
+      if (classData) {
+        const classObj = {
+          type: 'java/lang/Class',
+          _classData: classData,
+        };
+        frame.stack.push(classObj);
+      } else {
+        // TODO: Throw ClassNotFoundException
+        frame.stack.push(null);
+      }
+    } else {
+      const value = instruction.arg.replace(/"/g, '');
+      frame.stack.push(value);
+    }
   },
   bipush: (frame, instruction) => {
     const value = parseInt(instruction.arg, 10);
@@ -27,5 +42,8 @@ module.exports = {
   },
   iconst_5: (frame) => {
     frame.stack.push(5);
+  },
+  aconst_null: (frame) => {
+    frame.stack.push(null);
   },
 };

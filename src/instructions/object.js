@@ -46,4 +46,38 @@ module.exports = {
 
     console.error(`Unsupported getstatic: ${className}.${fieldName}`);
   },
+  arraylength: (frame) => {
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      // TODO: Throw NullPointerException
+      return;
+    }
+    const length = arrayRef.length;
+    frame.stack.push(length);
+  },
+  aaload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      // TODO: Throw NullPointerException
+      return;
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  aastore: (frame) => {
+    const value = frame.stack.pop();
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      // TODO: Throw NullPointerException
+      return;
+    }
+    arrayRef[index] = value;
+  },
+  anewarray: (frame, instruction) => {
+    const count = frame.stack.pop();
+    const array = new Array(count).fill(null);
+    frame.stack.push(array);
+  },
 };

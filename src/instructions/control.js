@@ -79,4 +79,29 @@ module.exports = {
     const exception = frame.stack.pop();
     throw exception;
   },
+  if_icmpge: (frame, instruction) => {
+    const label = instruction.arg;
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value1 >= value2) {
+      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
+  ifeq: (frame, instruction) => {
+    const label = instruction.arg;
+    const value = frame.stack.pop();
+    if (value === 0) {
+      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
 };

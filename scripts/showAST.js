@@ -1,7 +1,7 @@
 const { loadClassByPath } = require('../src/classLoader');
 
-function showAST(classFilePath) {
-  const classData = loadClassByPath(classFilePath);
+async function showAST(classFilePath) {
+  const classData = await loadClassByPath(classFilePath);
   if (!classData) {
     console.error(`Failed to load class from file: ${classFilePath}`);
     process.exit(1);

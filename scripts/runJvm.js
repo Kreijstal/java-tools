@@ -26,7 +26,7 @@ function main() {
   }
 
   const classFilePath = path.join(cp, `${mainClass}.class`);
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: cp });
 
   let stdin = '';
   if (!process.stdin.isTTY) {

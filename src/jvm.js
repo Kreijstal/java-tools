@@ -8,14 +8,12 @@ const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
 
 class JVM {
-  constructor(options = {}) {
+  constructor() {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {};
     this.jre = {};
     this.debugManager = new DebugManager();
-    this.stdin = options.stdin || '';
-    this.stdin_cursor = 0;
 
     this._jreMethods = jreMethods;
   }
@@ -29,10 +27,6 @@ class JVM {
   }
 
   async run(classFilePath, options = {}) {
-    if (options.stdin) {
-      this.stdin = options.stdin;
-      this.stdin_cursor = 0;
-    }
     const classData = await this.loadClassAsync(classFilePath, options);
     if (!classData) {
       throw new Error(`Class not found: ${classFilePath}`);
