@@ -281,6 +281,7 @@ function convertJson(inputJson, constantPool) {
           case "new":
           case "checkcast":
           case "instanceof":
+          case "anewarray":
             const classInfo = resolveConstant(instr.operands.index);
             codeItem.instruction = {
               op: instr.opcodeName,
