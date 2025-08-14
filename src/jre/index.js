@@ -12,10 +12,12 @@ const handleHttpURLConnection = require('./java/net/HttpURLConnection');
 const handleStringBuilder = require('./java/lang/StringBuilder');
 const handleIllegalArgumentException = require('./java/lang/IllegalArgumentException');
 const handleThread = require('./java/lang/Thread');
+const handleNoSuchMethodException = require('./java/lang/NoSuchMethodException');
 
 const jreMethods = {
   ...handleStringBuilder,
   ...handleIllegalArgumentException,
+  ...handleNoSuchMethodException,
   ...handleThread,
   ...handleObject,
   ...handleSystem,

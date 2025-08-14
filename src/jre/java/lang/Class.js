@@ -90,8 +90,28 @@ module.exports = {
     const classData = classObj._classData;
     const methods = classData.classes[0].items.filter(item => item.type === 'method');
 
-    // TODO: handle parameter types
-    const method = methods.find(m => m.method.name === methodName);
+    const getDescriptor = (paramClass) => {
+      if (!paramClass) return '';
+      const paramClassName = paramClass._classData.classes[0].className;
+      // Basic type mapping, can be extended
+      switch (paramClassName) {
+        case 'int': return 'I';
+        case 'long': return 'J';
+        case 'double': return 'D';
+        case 'float': return 'F';
+        case 'char': return 'C';
+        case 'short': return 'S';
+        case 'byte': return 'B';
+        case 'boolean': return 'Z';
+        default: return `L${paramClassName};`;
+      }
+    };
+
+    const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;
+    const method = methods.find(m => {
+      const d = m.method.descriptor;
+      return m.method.name === methodName && d.substring(0, d.indexOf(')') + 1) === targetDescriptor;
+    });
 
     if (method) {
       return {
@@ -100,7 +120,10 @@ module.exports = {
         _declaringClass: classObj,
       };
     } else {
-      throw new Error(`NoSuchMethodException: ${methodName}`);
+      throw {
+        type: 'java/lang/NoSuchMethodException',
+        message: methodName,
+      };
     }
   },
 };
