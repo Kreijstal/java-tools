@@ -102,19 +102,41 @@ function analyzeOutputs(ourOutput, javapOutput, className) {
  * Main comparison function
  */
 async function compareWithJavap() {
-  const sourcesDir = path.join(__dirname, '../sources');
-  const classFiles = fs.readdirSync(sourcesDir)
-    .filter(file => file.endsWith('.class'))
-    .slice(0, 5); // Limit to first 5 files for detailed analysis (tune as needed)
+  // --- MODIFICATION START ---
+  // Get command-line arguments, excluding the first two (node executable and script path)
+  const args = process.argv.slice(2);
 
-  const includeJavap = process.argv.includes('--with-javap');
+  // Find the optional --with-javap flag
+  const includeJavap = args.includes('--with-javap');
+  
+  // The first argument that is not a flag is our classpath
+  const sourcesDir = args.find(arg => !arg.startsWith('--'));
+
+  // If no classpath is provided, print usage instructions and exit
+  if (!sourcesDir) {
+    console.error('Error: Please provide a path to the directory containing .class files.');
+    console.error('\nUsage: node scripts/compare_with_javap.js <classpath> [--with-javap]');
+    console.error('Example: node scripts/compare_with_javap.js ./sources');
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(sourcesDir)) {
+    console.error(`Error: Directory not found at '${sourcesDir}'`);
+    process.exit(1);
+  }
+  // --- MODIFICATION END ---
+
+  const classFiles = fs.readdirSync(sourcesDir)
+    .filter(file => file.endsWith('.class'));
+
   console.log(`=== Java Class Parser Comparison: ours vs krak2${includeJavap ? ' vs javap' : ''} ===\n`);
+  console.log(`🔍 Target directory: ${path.resolve(sourcesDir)}\n`);
 
   for (const fileName of classFiles) {
-    const classPath = path.join(sourcesDir, fileName);
+    const classPath = path.join(sourcesDir, fileName); // Use the provided directory
     const className = path.basename(fileName, '.class');
 
-    console.log(`\n--- Analyzing ${fileName} ---`);
+    console.log(`--- Analyzing ${fileName} ---`);
 
     try {
       // Get our parser output
@@ -215,7 +237,6 @@ async function compareWithJavap() {
       }
       
       const ourInvokes = (ourOutput.match(/invoke\w+/g) || []).length;
-      const javapInvokes = (javapOutput.match(/invoke\w+/g) || []).length;
       
       console.log(`${className}:`);
       console.log(`  Our parser found ${ourInvokes} method invocations`);
