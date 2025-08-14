@@ -86,8 +86,9 @@ function convertJson(inputJson, constantPool) {
       case 3: // Integer
         return { value: entry.info.bytes | 0, type: "Integer" };
       case 4: // Float
-        // In JS, all numbers are floats anyway, so this is fine
-        return { value: entry.info.bytes, type: "Float" };
+        const floatView = new DataView(new ArrayBuffer(4));
+        floatView.setUint32(0, entry.info.bytes, false);
+        return { value: floatView.getFloat32(0, false), type: "Float" };
       case 5: // Long
         let longValue = (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
         if (longValue >= (1n << 63n)) {
