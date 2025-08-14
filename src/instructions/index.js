@@ -19,6 +19,18 @@ const instructions = {
 };
 
 module.exports = async function dispatch(frame, instruction, jvm, thread) {
+  if (jvm.verbose) {
+    const threadId = thread ? thread.id : 'main';
+    let pc = -1;
+    if (frame.pc < frame.instructions.length) {
+      const instructionItem = frame.instructions[frame.pc - 1];
+      if (instructionItem) {
+        const label = instructionItem.labelDef;
+        pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+      }
+    }
+    console.log(`[thread:${threadId}, pc:${pc}]`, instruction);
+  }
   const op = typeof instruction === 'string' ? instruction : instruction.op;
 
   const func = instructions[op];

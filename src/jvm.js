@@ -15,6 +15,7 @@ class JVM {
     this.jre = {};
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || '.';
+    this.verbose = options.verbose || false;
 
     this._jreMethods = jreMethods;
   }

@@ -28,6 +28,10 @@ module.exports = {
         newFrame.locals[localIndex++] = args_for_invoke[i];
       }
 
+      thread.isAwaitingReflectiveCall = true;
+      thread.reflectiveCallResolver = (ret) => {
+        frame.stack.push(ret);
+      };
       thread.callStack.push(newFrame);
       return;
     }

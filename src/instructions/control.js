@@ -1,12 +1,19 @@
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
     thread.callStack.pop();
+    if (thread.isAwaitingReflectiveCall) {
+      thread.reflectiveCallResolver();
+      thread.isAwaitingReflectiveCall = false;
+    }
   },
   ireturn: (frame, instruction, jvm, thread) => {
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
     if (!thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(returnValue);
+    } else if (thread.isAwaitingReflectiveCall) {
+      thread.reflectiveCallResolver(returnValue);
+      thread.isAwaitingReflectiveCall = false;
     }
   },
   areturn: (frame, instruction, jvm, thread) => {
@@ -14,6 +21,9 @@ module.exports = {
     thread.callStack.pop();
     if (!thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(returnValue);
+    } else if (thread.isAwaitingReflectiveCall) {
+      thread.reflectiveCallResolver(returnValue);
+      thread.isAwaitingReflectiveCall = false;
     }
   },
   goto: (frame, instruction) => {
