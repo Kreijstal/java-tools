@@ -48,7 +48,7 @@ module.exports = {
           }
         });
 
-      const superClassName = classData.classes[0].superClass;
+      const superClassName = classData.classes[0].superClassName;
       if (superClassName) {
         const superClassData = jvm.classes[superClassName];
         if (superClassData) {

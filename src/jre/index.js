@@ -9,8 +9,10 @@ const handlePrintStream = require('./java/io/PrintStream');
 const handleURL = require('./java/net/URL');
 const handleURLConnection = require('./java/net/URLConnection');
 const handleHttpURLConnection = require('./java/net/HttpURLConnection');
+const handleStringBuilder = require('./java/lang/StringBuilder');
 
 const jreMethods = {
+  ...handleStringBuilder,
   ...handleObject,
   ...handleSystem,
   ...handleClass,

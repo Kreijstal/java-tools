@@ -62,9 +62,12 @@ module.exports = {
       const jreMethod = jvm._jreMethods[methodKey];
 
       if (jreMethod) {
-        const result = await jreMethod(jvm, obj, args);
+        let result = await jreMethod(jvm, obj, args);
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V') {
+          if (typeof result === 'boolean') {
+            result = result ? 1 : 0;
+          }
           frame.stack.push(result);
         }
       } else {

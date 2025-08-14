@@ -25,9 +25,6 @@ function getFileProvider() {
 }
 
 async function loadClass(className, classPath) {
-  console.log(`Attempt to load class ${className}`);
-
-
   const fileProvider = getFileProvider();
   
   // Split the class path by ';' to handle multiple paths
@@ -57,10 +54,6 @@ async function loadClass(className, classPath) {
 }
 
 async function loadClassByPath(classFilePath, options = {}) {
-  if (!options.silent) {
-    console.log(`Attempt to load class from file: ${classFilePath}`);
-  }
-
   const fileProvider = getFileProvider();
 
   if (!(await fileProvider.exists(classFilePath))) {
@@ -82,10 +75,6 @@ async function loadClassByPath(classFilePath, options = {}) {
 
 // Synchronous versions for backwards compatibility with existing Node.js code
 function loadClassByPathSync(classFilePath, options = {}) {
-  if (!options.silent) {
-    console.log(`Attempt to load class from file: ${classFilePath}`);
-  }
-
   const fileProvider = getFileProvider();
   
   // For Node.js FileProvider, use sync methods
