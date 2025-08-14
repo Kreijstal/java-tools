@@ -1,4 +1,6 @@
 const handleSystem = require('./java/lang/System');
+const handleClass = require('./java/lang/Class');
+const handleReflect = require('./java/lang/reflect');
 const handleInputStreamReader = require('./java/io/InputStreamReader');
 const handleBufferedReader = require('./java/io/BufferedReader');
 const handleBufferedInputStream = require('./java/io/BufferedInputStream');
@@ -9,6 +11,8 @@ const handleHttpURLConnection = require('./java/net/HttpURLConnection');
 
 const jreMethods = {
   ...handleSystem,
+  ...handleClass,
+  ...handleReflect,
   ...handleInputStreamReader,
   ...handleBufferedReader,
   ...handleBufferedInputStream,
@@ -20,6 +24,7 @@ const jreMethods = {
   'java/lang/String.toUpperCase': (jvm, str, args) => str.toUpperCase(),
   'java/lang/String.toLowerCase': (jvm, str, args) => str.toLowerCase(),
   'java/lang/String.length': (jvm, str, args) => str.length,
+  'java/lang/String.equals': (jvm, str, args) => str === args[0],
 };
 
 module.exports = jreMethods;
