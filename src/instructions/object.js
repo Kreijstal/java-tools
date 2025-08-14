@@ -143,4 +143,30 @@ module.exports = {
 
     frame.stack.push(0); // No match found in the hierarchy
   },
+
+  checkcast: (frame, instruction, jvm) => {
+    const targetClassName = instruction.arg;
+    const objRef = frame.stack.peek(); // Don't pop, just peek
+
+    if (objRef === null) {
+      return; // null can be cast to anything
+    }
+
+    let currentClassName = objRef.type;
+    while (currentClassName) {
+      if (currentClassName === targetClassName) {
+        return; // Cast is valid
+      }
+      const classData = jvm.classes[currentClassName];
+      if (!classData) {
+        // This should not happen if classes are loaded correctly
+        // TODO: Throw ClassCastException
+        return;
+      }
+      currentClassName = classData.classes[0].superClassName;
+    }
+
+    // If we get here, the cast is invalid
+    // TODO: Throw ClassCastException
+  },
 };
