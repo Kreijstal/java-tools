@@ -14,7 +14,6 @@ module.exports = {
     const obj = frame.stack.pop();
 
     if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
-      console.log('Inside invoke.js special case for Method.invoke');
       const methodObj = obj;
       const obj_for_invoke = args[0];
       const args_for_invoke = args[1];
@@ -32,7 +31,6 @@ module.exports = {
 
       thread.isAwaitingReflectiveCall = true;
       thread.reflectiveCallResolver = (ret) => {
-        console.log('Executing reflectiveCallResolver in invoke.js, ret:', ret);
         frame.stack.push(ret);
       };
       thread.callStack.push(newFrame);

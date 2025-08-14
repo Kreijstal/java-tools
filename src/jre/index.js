@@ -10,9 +10,13 @@ const handleURL = require('./java/net/URL');
 const handleURLConnection = require('./java/net/URLConnection');
 const handleHttpURLConnection = require('./java/net/HttpURLConnection');
 const handleStringBuilder = require('./java/lang/StringBuilder');
+const handleIllegalArgumentException = require('./java/lang/IllegalArgumentException');
+const handleThread = require('./java/lang/Thread');
 
 const jreMethods = {
   ...handleStringBuilder,
+  ...handleIllegalArgumentException,
+  ...handleThread,
   ...handleObject,
   ...handleSystem,
   ...handleClass,
