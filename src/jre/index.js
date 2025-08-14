@@ -1,3 +1,4 @@
+const handleObject = require('./java/lang/Object');
 const handleSystem = require('./java/lang/System');
 const handleClass = require('./java/lang/Class');
 const handleReflect = require('./java/lang/reflect');
@@ -10,6 +11,7 @@ const handleURLConnection = require('./java/net/URLConnection');
 const handleHttpURLConnection = require('./java/net/HttpURLConnection');
 
 const jreMethods = {
+  ...handleObject,
   ...handleSystem,
   ...handleClass,
   ...handleReflect,

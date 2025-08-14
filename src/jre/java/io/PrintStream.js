@@ -16,4 +16,7 @@ module.exports = {
   'java/io/PrintStream.println()V': (jvm, obj, args) => {
     console.log();
   },
+  'java/io/PrintStream.println(Z)V': (jvm, obj, args) => {
+    console.log(args[0] === 1 ? 'true' : 'false');
+  },
 };

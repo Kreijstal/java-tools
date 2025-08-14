@@ -27,11 +27,6 @@ function getFileProvider() {
 async function loadClass(className, classPath) {
   console.log(`Attempt to load class ${className}`);
 
-  // If the class name path starts with java, we ignore it for now
-  if (className.startsWith('java')) {
-    console.log(`Ignoring system class: ${className}`);
-    return null;
-  }
 
   const fileProvider = getFileProvider();
   

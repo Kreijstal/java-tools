@@ -123,31 +123,43 @@ module.exports = {
     const { params } = parseDescriptor(descriptor);
     const args = [];
     for (let i = 0; i < params.length; i++) {
-      args.unshift(frame.stack.pop());
+        args.unshift(frame.stack.pop());
     }
     const obj = frame.stack.pop();
 
-    if (methodName === '<init>') {
-      const methodKey = `${className}.${methodName}${descriptor}`;
-      const jreMethod = jvm._jreMethods[methodKey];
-      if (jreMethod) {
+    const methodKey = `${className}.${methodName}${descriptor}`;
+    const jreMethod = jvm._jreMethods[methodKey];
+
+    if (jreMethod) {
         await jreMethod(jvm, obj, args);
-      } else {
-        // This is a constructor for a user-defined class.
-        // We need to find the constructor and invoke it.
-        const method = jvm.findMethodInHierarchy(className, methodName, descriptor);
-        if (method) {
-          const newFrame = new Frame(method);
-          newFrame.locals[0] = obj; // 'this'
-          for (let i = 0; i < args.length; i++) {
-            newFrame.locals[i+1] = args[i];
-          }
-          thread.callStack.push(newFrame);
-        } else {
-          // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
-          // For now, we do nothing, assuming the object is already created by 'new'.
+        return;
+    }
+
+    // For user-defined methods (constructors, private methods, super calls)
+    const classData = jvm.classes[className];
+    if (!classData) {
+        // If class is not loaded, loading it.
+        const loadedClassData = await jvm.loadClassByName(className);
+        if (!loadedClassData) {
+          console.error(`Class not found for invokespecial: ${className}`);
+          return;
         }
-      }
+    }
+
+    const method = jvm.findMethod(jvm.classes[className], methodName, descriptor);
+    if (method) {
+        const newFrame = new Frame(method);
+        let localIndex = 0;
+        newFrame.locals[localIndex++] = obj; // 'this'
+        for (const arg of args) {
+            newFrame.locals[localIndex++] = arg;
+        }
+        thread.callStack.push(newFrame);
+    } else if (methodName === '<init>') {
+        // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
+        // For now, we do nothing, assuming the object is already created by 'new'.
+    } else {
+        console.error(`Unsupported invokespecial: ${className}.${methodName}${descriptor}`);
     }
   },
 };
