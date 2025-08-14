@@ -1,15 +1,48 @@
 module.exports = {
-  new: (frame, instruction) => {
+  new: async (frame, instruction, jvm) => {
     const className = instruction.arg;
-    // In a real JVM, this would be a more complex object representation.
-    let objRef;
-    if (className === 'java/util/LinkedList') {
-      objRef = { type: className, elements: [] };
-    } else {
-      objRef = { type: className, fields: {} };
+    await jvm.loadClassByName(className);
+
+    const fields = {};
+    let currentClassName = className;
+    while (currentClassName) {
+      const currentClassData = jvm.classes[currentClassName];
+      if (currentClassData) {
+        const classFields = currentClassData.classes[0].items.filter(item => item.type === 'field');
+        for (const field of classFields) {
+          // TODO: Use correct default values based on field descriptor
+          fields[`${currentClassName}.${field.field.name}`] = null;
+        }
+        const superClassName = currentClassData.classes[0].superClassName;
+        if (superClassName) {
+            await jvm.loadClassByName(superClassName);
+        }
+        currentClassName = superClassName;
+      } else {
+        currentClassName = null;
+      }
     }
+
+    const objRef = { type: className, fields, hashCode: jvm.nextHashCode++ };
     frame.stack.push(objRef);
   },
+
+  getfield: (frame, instruction, jvm) => {
+    const [_, className, [fieldName, descriptor]] = instruction.arg;
+    const objRef = frame.stack.pop();
+    // In a real implementation, we should check for NullPointerException here.
+    const value = objRef.fields[`${className}.${fieldName}`];
+    frame.stack.push(value);
+  },
+
+  putfield: (frame, instruction, jvm) => {
+    const [_, className, [fieldName, descriptor]] = instruction.arg;
+    const value = frame.stack.pop();
+    const objRef = frame.stack.pop();
+    // In a real implementation, we should check for NullPointerException here.
+    objRef.fields[`${className}.${fieldName}`] = value;
+  },
+
   getstatic: (frame, instruction, jvm) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
 
@@ -46,7 +79,7 @@ module.exports = {
 
     console.error(`Unsupported getstatic: ${className}.${fieldName}`);
   },
-  arraylength: (frame) => {
+  arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
       // TODO: Throw NullPointerException
@@ -55,7 +88,7 @@ module.exports = {
     const length = arrayRef.length;
     frame.stack.push(length);
   },
-  aaload: (frame) => {
+  aaload: (frame, instruction, jvm) => {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
@@ -65,7 +98,7 @@ module.exports = {
     const value = arrayRef[index];
     frame.stack.push(value);
   },
-  aastore: (frame) => {
+  aastore: (frame, instruction, jvm) => {
     const value = frame.stack.pop();
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
@@ -75,9 +108,65 @@ module.exports = {
     }
     arrayRef[index] = value;
   },
-  anewarray: (frame, instruction) => {
+  anewarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
     const array = new Array(count).fill(null);
     frame.stack.push(array);
+  },
+
+  instanceof: (frame, instruction, jvm) => {
+    const targetClassName = instruction.arg;
+    const objRef = frame.stack.pop();
+
+    if (objRef === null) {
+      frame.stack.push(0); // null is not an instance of anything
+      return;
+    }
+
+    let currentClassName = objRef.type;
+    while (currentClassName) {
+      if (currentClassName === targetClassName) {
+        frame.stack.push(1); // Found a match
+        return;
+      }
+
+      const classData = jvm.classes[currentClassName];
+      if (!classData) {
+        frame.stack.push(0); // Should not happen if classes are loaded correctly
+        return;
+      }
+
+      // TODO: Check interfaces as well
+
+      currentClassName = classData.classes[0].superClassName;
+    }
+
+    frame.stack.push(0); // No match found in the hierarchy
+  },
+
+  checkcast: (frame, instruction, jvm) => {
+    const targetClassName = instruction.arg;
+    const objRef = frame.stack.peek(); // Don't pop, just peek
+
+    if (objRef === null) {
+      return; // null can be cast to anything
+    }
+
+    let currentClassName = objRef.type;
+    while (currentClassName) {
+      if (currentClassName === targetClassName) {
+        return; // Cast is valid
+      }
+      const classData = jvm.classes[currentClassName];
+      if (!classData) {
+        // This should not happen if classes are loaded correctly
+        // TODO: Throw ClassCastException
+        return;
+      }
+      currentClassName = classData.classes[0].superClassName;
+    }
+
+    // If we get here, the cast is invalid
+    // TODO: Throw ClassCastException
   },
 };

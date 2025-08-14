@@ -15,6 +15,8 @@ class JVM {
     this.jre = {};
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || '.';
+    this.verbose = options.verbose || false;
+    this.nextHashCode = 1;
 
     this._jreMethods = jreMethods;
   }
@@ -113,7 +115,16 @@ class JVM {
 
     const frame = callStack.peek();
     if (frame.pc >= frame.instructions.length) {
-      callStack.pop();
+      const popped = callStack.pop();
+      if (thread.isAwaitingReflectiveCall) {
+          let ret = null;
+          if (!popped.stack.isEmpty()) {
+              ret = popped.stack.pop();
+          }
+          thread.reflectiveCallResolver(ret);
+          thread.isAwaitingReflectiveCall = false;
+          thread.reflectiveCallResolver = null;
+      }
       return { completed: false };
     }
 
@@ -199,6 +210,20 @@ class JVM {
     if (this.classes[classNameWithSlashes]) {
       return this.classes[classNameWithSlashes];
     }
+
+    if (classNameWithSlashes === 'java/lang/Object') {
+      const objectClassData = {
+        classes: [{
+          className: 'java/lang/Object',
+          superClassName: null,
+          items: [],
+          flags: ['public'],
+        }],
+      };
+      this.classes['java/lang/Object'] = objectClassData;
+      return objectClassData;
+    }
+
     const classNameWithDots = classNameWithSlashes.replace(/\//g, '.');
     const classData = await loadClass(classNameWithDots, this.classpath);
     if (classData) {

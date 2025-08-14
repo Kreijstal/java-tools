@@ -55,7 +55,7 @@ function convertJson(inputJson, constantPool) {
         ],
         flags: getFlags(inputJson.accessFlags, "class"),
         className: inputJson.className.replace(/\./g, "/"),
-        superClass: inputJson.superClassName
+        superClassName: inputJson.superClassName
           ? inputJson.superClassName.replace(/\./g, "/")
           : null,
         interfaces: [], // Assuming no interfaces, adjust if needed
@@ -248,6 +248,8 @@ function convertJson(inputJson, constantPool) {
           case "if_icmpge":
           case "if_icmpgt":
           case "ifnull":
+          case "ifeq":
+          case "ifeq":
             const targetPc = instr.pc + instr.operands.branchoffset;
             codeItem.instruction = {
               op: instr.opcodeName,
@@ -278,6 +280,8 @@ function convertJson(inputJson, constantPool) {
 
           case "new":
           case "checkcast":
+          case "instanceof":
+          case "anewarray":
             const classInfo = resolveConstant(instr.operands.index);
             codeItem.instruction = {
               op: instr.opcodeName,
@@ -520,7 +524,7 @@ function unparseDataStructures(cls) {
       }
 
       headerLines.push(`.class ${cls.flags.join(" ")} ${cls.className}`);
-      headerLines.push(`.super ${cls.superClass}`);
+      headerLines.push(`.super ${cls.superClassName}`);
 
       // Handle interfaces
       if (cls.interfaces && cls.interfaces.length > 0) {

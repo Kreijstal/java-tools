@@ -149,7 +149,7 @@ class KrakatauWorkspace {
    */
   _findClassFiles(dirPath, classFiles) {
     if (!fs.existsSync(dirPath)) {
-      return;
+      throw new Error(`Class path entry ${dirPath} does not exist`);
     }
 
     const stats = fs.statSync(dirPath);
@@ -180,14 +180,7 @@ class KrakatauWorkspace {
     // Build comprehensive reference graph using traverseAST functionality
     // Process each class in the workspace to find all cross-references
     Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
-      try {
-        // Use the modified getReferenceObjFromClass functionality that includes context
-        this._buildReferencesForClass(className, ast);
-      } catch (error) {
-        console.warn(`Warning: Failed to process references for class ${className}:`, error.message);
-        // Fall back to basic structure for this class
-        this._addBasicReferencesForClass(className, ast);
-      }
+      this._buildReferencesForClass(className, ast);
     });
   }
 
@@ -423,7 +416,11 @@ class KrakatauWorkspace {
    * @returns {object|null} The parsed AST object for the class, or null if not found.
    */
   getClassAST(className) {
-    return this.workspaceASTs[className] || null;
+    const ast = this.workspaceASTs[className];
+    if (!ast) {
+      throw new Error(`Class ${className} not found in workspace`);
+    }
+    return ast;
   }
 
   /**
@@ -487,11 +484,7 @@ class KrakatauWorkspace {
    * @returns {string} The string content for the .j file.
    */
   toKrakatauAssembly(className) {
-    const ast = this.workspaceASTs[className];
-    if (!ast) {
-      throw new Error(`Class ${className} not found in workspace`);
-    }
-
+    const ast = this.getClassAST(className);
     return unparseDataStructures(ast.classes[0]);
   }
 
@@ -770,11 +763,7 @@ class KrakatauWorkspace {
    */
   applyEdit(edit) {
     edit.operations.forEach(operation => {
-      const ast = this.workspaceASTs[operation.className];
-      if (!ast) {
-        console.warn(`Class ${operation.className} not found for edit operation`);
-        return;
-      }
+      const ast = this.getClassAST(operation.className);
 
       // Navigate to the AST node and apply the change
       this._applyOperationToAST(ast, operation);

@@ -10,12 +10,12 @@ test('JVM should execute CalcMain.class and print "4"', async function(t) {
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(I)V': (j, o, a) => {
       output += a[0];
     }
   });
 
-  await jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath, { silent: true, classpath: 'sources' });
 
   t.equal(output, '4', 'The JVM should correctly print "4"');
 });
