@@ -8,7 +8,7 @@ test('JVM invokevirtual should support various Java methods', async (t) => {
   
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(Ljava/lang/String;)V': (j, o, a) => {
       output += a[0] + '\n';
     }
   });

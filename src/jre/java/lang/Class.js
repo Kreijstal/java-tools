@@ -1,11 +1,11 @@
 module.exports = {
-  'java/lang/Class.getName': (jvm, classObj, args) => {
+  'java/lang/Class.getName()Ljava/lang/String;': (jvm, classObj, args) => {
     const classData = classObj._classData;
     const className = classData.classes[0].className.replace(/\//g, '.');
     return jvm.internString(className);
   },
 
-  'java/lang/Class.getSuperclass': async (jvm, classObj, args) => {
+  'java/lang/Class.getSuperclass()Ljava/lang/Class;': async (jvm, classObj, args) => {
     const classData = classObj._classData;
     const superClassName = classData.classes[0].superClass;
     if (!superClassName) {
@@ -21,12 +21,12 @@ module.exports = {
     };
   },
 
-  'java/lang/Class.isInterface': (jvm, classObj, args) => {
+  'java/lang/Class.isInterface()Z': (jvm, classObj, args) => {
     const classData = classObj._classData;
     return classData.classes[0].flags.includes('interface');
   },
 
-  'java/lang/Class.getMethods': (jvm, classObj, args) => {
+  'java/lang/Class.getMethods()[Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
     const allMethods = {};
 
     const getMethodsRecursive = (currentClassObj) => {
@@ -83,7 +83,7 @@ module.exports = {
     return Object.values(allMethods);
   },
 
-  'java/lang/Class.getMethod': (jvm, classObj, args) => {
+  'java/lang/Class.getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
     const methodName = args[0];
     const paramTypes = args[1]; // array of class objects
 

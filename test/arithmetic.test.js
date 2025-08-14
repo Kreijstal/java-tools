@@ -10,7 +10,7 @@ test('JVM should execute RuntimeArithmetic.class with all arithmetic operations'
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(I)V': (j, o, a) => {
       output += a[0] + '\n';
     }
   });
@@ -29,7 +29,7 @@ test('JVM should execute VerySimple.class with subtraction', async function(t) {
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(I)V': (j, o, a) => {
       output += a[0] + '\n';
     }
   });
@@ -47,7 +47,7 @@ test('JVM should execute SmallDivisionTest.class with division and remainder ope
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(I)V': (j, o, a) => {
       output += a[0] + '\n';
     }
   });
@@ -66,7 +66,7 @@ test('JVM should execute ConstantsTest.class with iconst instructions', async fu
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(I)V': (j, o, a) => {
       output += a[0] + '\n';
     }
   });

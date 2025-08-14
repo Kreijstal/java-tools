@@ -1,6 +1,7 @@
 const { parseDescriptor } = require('../typeParser');
 const Frame = require('../frame');
 const Stack = require('../stack');
+const path = require('path');
 
 module.exports = {
   invokevirtual: async (frame, instruction, jvm, thread) => {
@@ -58,7 +59,7 @@ module.exports = {
       return;
     }
 
-    const methodKey = `${className}.${methodName}`;
+    const methodKey = `${className}.${methodName}${descriptor}`;
     const jreMethod = jvm._jreMethods[methodKey];
 
     if (jreMethod) {
@@ -85,7 +86,7 @@ module.exports = {
   invokestatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [methodName, descriptor]] = instruction.arg;
 
-    const methodKey = `${className}.${methodName}`;
+    const methodKey = `${className}.${methodName}${descriptor}`;
     const jreMethod = jvm._jreMethods[methodKey];
 
     if (jreMethod) {
@@ -104,7 +105,7 @@ module.exports = {
 
     let classData = jvm.classes[className];
     if (!classData) {
-      const newClassPath = `sources/${className}.class`;
+      const newClassPath = path.join(jvm.classpath, `${className}.class`);
       classData = jvm.loadClassSync(newClassPath, { silent: true });
     }
     const method = jvm.findMethod(classData, methodName, descriptor);
@@ -127,7 +128,7 @@ module.exports = {
     const obj = frame.stack.pop();
 
     if (methodName === '<init>') {
-      const methodKey = `${className}.${methodName}`;
+      const methodKey = `${className}.${methodName}${descriptor}`;
       const jreMethod = jvm._jreMethods[methodKey];
       if (jreMethod) {
         await jreMethod(jvm, obj, args);
