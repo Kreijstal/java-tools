@@ -84,17 +84,28 @@ function convertJson(inputJson, constantPool) {
       case 1: // Utf8
         return { value: entry.info.bytes, type: "Utf8" };
       case 3: // Integer
-        return { value: entry.info.bytes, type: "Integer" };
+        return { value: entry.info.bytes | 0, type: "Integer" };
       case 4: // Float
-        return { value: entry.info.bytes, type: "Float" };
+        const floatView = new DataView(new ArrayBuffer(4));
+        floatView.setUint32(0, entry.info.bytes, false);
+        return { value: floatView.getFloat32(0, false), type: "Float" };
       case 5: // Long
+        let longValue = (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
+        if (longValue >= (1n << 63n)) {
+          longValue -= (1n << 64n);
+        }
         return {
-          value: entry.info.high_bytes * Math.pow(2, 32) + entry.info.low_bytes,
+          value: longValue,
           type: "Long"
         };
       case 6: // Double
+        const doubleHigh = BigInt(entry.info.high_bytes);
+        const doubleLow = BigInt(entry.info.low_bytes);
+        const doubleBits = (doubleHigh << 32n) | doubleLow;
+        const doubleView = new DataView(new ArrayBuffer(8));
+        doubleView.setBigUint64(0, doubleBits, false);
         return {
-          value: entry.info.high_bytes * Math.pow(2, 32) + entry.info.low_bytes,
+          value: doubleView.getFloat64(0, false),
           type: "Double"
         };
       case 7: // Class
@@ -232,13 +243,26 @@ function convertJson(inputJson, constantPool) {
             break;
 
           case "ldc":
+          case "ldc_w":
+          case "ldc2_w":
             const ldcConstant = resolveConstant(instr.operands.index);
+            let arg;
+            switch (ldcConstant.type) {
+              case "Class":
+                arg = ["Class", ldcConstant.value];
+                break;
+              case "String":
+                arg = JSON.stringify(ldcConstant.value);
+                break;
+              case "Long":
+                arg = ldcConstant.value.toString() + "L";
+                break;
+              default:
+                arg = ldcConstant.value;
+            }
             codeItem.instruction = {
-              op: "ldc",
-              arg:
-                ldcConstant.type === "Class"
-                  ? ["Class", ldcConstant.value]
-                  : JSON.stringify(ldcConstant.value)
+              op: instr.opcodeName,
+              arg: arg
             };
             break;
 
@@ -249,7 +273,16 @@ function convertJson(inputJson, constantPool) {
           case "if_icmpgt":
           case "ifnull":
           case "ifeq":
-          case "ifeq":
+          case "if_icmpeq":
+          case "if_icmpne":
+          case "if_icmplt":
+          case "if_icmple":
+          case "if_acmpeq":
+          case "if_acmpne":
+          case "iflt":
+          case "ifle":
+          case "ifgt":
+          case "ifge":
             const targetPc = instr.pc + instr.operands.branchoffset;
             codeItem.instruction = {
               op: instr.opcodeName,
@@ -286,6 +319,31 @@ function convertJson(inputJson, constantPool) {
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: classInfo.value.replace(/\./g, "/")
+            };
+            break;
+
+          case "newarray":
+            const atypeMap = {
+              4: "boolean",
+              5: "char",
+              6: "float",
+              7: "double",
+              8: "byte",
+              9: "short",
+              10: "int",
+              11: "long"
+            };
+            codeItem.instruction = {
+              op: "newarray",
+              arg: atypeMap[instr.operands.atype]
+            };
+            break;
+
+          case "multianewarray":
+            const mclassInfo = resolveConstant(instr.operands.index);
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: [mclassInfo.value.replace(/\./g, "/"), instr.operands.dimensions.toString()]
             };
             break;
 
