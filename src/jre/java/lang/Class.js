@@ -54,23 +54,18 @@ module.exports = {
         if (superClassData) {
           getMethodsRecursive({ type: 'java/lang/Class', _classData: superClassData });
         } else if (superClassName === 'java/lang/Object') {
-            const objectMethods = [
-                { name: 'equals', descriptor: '(Ljava/lang/Object;)Z' },
-                { name: 'toString', descriptor: '()Ljava/lang/String;' },
-                { name: 'hashCode', descriptor: '()I' },
-                { name: 'getClass', descriptor: '()Ljava/lang/Class;' },
-                { name: 'notify', descriptor: '()V' },
-                { name: 'notifyAll', descriptor: '()V' },
-                { name: 'wait', descriptor: '(J)V' },
-                { name: 'wait', descriptor: '(JI)V' },
-                { name: 'wait', descriptor: '()V' },
-            ];
-            objectMethods.forEach(method => {
-                const key = method.name + method.descriptor;
+            const objectMethods = require('./Object.js');
+            Object.keys(objectMethods).forEach(methodSignature => {
+                const lastDot = methodSignature.lastIndexOf('.');
+                const nameAndDescriptor = methodSignature.substring(lastDot + 1);
+                const openParen = nameAndDescriptor.indexOf('(');
+                const name = nameAndDescriptor.substring(0, openParen);
+                const descriptor = nameAndDescriptor.substring(openParen);
+                const key = name + descriptor;
                 if (!allMethods[key]) {
                     allMethods[key] = {
                         type: 'java/lang/reflect/Method',
-                        _methodData: { ...method, flags: ['public'], attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
+                        _methodData: { name, descriptor, flags: ['public'], attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
                         _declaringClass: { type: 'java/lang/Class', _classData: null /* object class data */ },
                     };
                 }

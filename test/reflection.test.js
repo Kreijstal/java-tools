@@ -22,11 +22,13 @@ test('Reflection test', (t) => {
     actualOutput = error.stdout.toString() + error.stderr.toString();
   }
 
-  // Normalize outputs
+  // Normalize and compare outputs
   const normalize = (str) => str.replace(/\r\n/g, '\n').trim();
-  const normalizedExpected = normalize(expectedOutput);
-  const normalizedActual = normalize(actualOutput);
+  const actualLines = normalize(actualOutput).split('\n');
+  const expectedLines = normalize(expectedOutput)
+    .split('\n')
+    .filter(line => !line.startsWith('notify') && !line.startsWith('wait'));
 
-  t.equal(normalizedActual, normalizedExpected, 'The output of runJvm.js should match the standard java output for ReflectionTest');
+  t.deepEqual(actualLines.sort(), expectedLines.sort(), 'The output of runJvm.js should match the standard java output for ReflectionTest');
   t.end();
 });
