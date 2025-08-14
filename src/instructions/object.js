@@ -28,6 +28,22 @@ module.exports = {
       return;
     }
 
+    if (className === 'java/lang/System' && fieldName === 'in') {
+      const inputStream = {
+        type: 'java/io/InputStream',
+        'java/io/InputStream': {
+          read: () => {
+            if (jvm.stdin_cursor >= jvm.stdin.length) {
+              return -1;
+            }
+            return jvm.stdin.charCodeAt(jvm.stdin_cursor++);
+          }
+        }
+      };
+      frame.stack.push(inputStream);
+      return;
+    }
+
     console.error(`Unsupported getstatic: ${className}.${fieldName}`);
   },
 };
