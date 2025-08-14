@@ -5,8 +5,7 @@ const path = require('path');
 test('JVM should execute CalcMain.class and print "4"', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
-  const classFilePath = path.join(__dirname, '..', 'sources', 'CalcMain.class');
+  const jvm = new JVM({ classpath: ['sources'] });
 
   let output = '';
   jvm.registerJreMethods({
@@ -15,7 +14,7 @@ test('JVM should execute CalcMain.class and print "4"', async function(t) {
     }
   });
 
-  await jvm.run(classFilePath, { silent: true });
+  await jvm.runByName('CalcMain', { silent: true });
 
   t.equal(output, '4', 'The JVM should correctly print "4"');
 });

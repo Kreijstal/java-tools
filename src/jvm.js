@@ -7,15 +7,70 @@ const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
 
+const { getFileProvider } = require('./classLoader');
+
 class JVM {
-  constructor() {
+  constructor(options = {}) {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {};
     this.jre = {};
     this.debugManager = new DebugManager();
+    this.classpath = options.classpath || [];
 
     this._jreMethods = jreMethods;
+  }
+
+  findClassFileSync(className) {
+    const fileProvider = getFileProvider();
+    const relativePath = `${className.replace(/\./g, '/')}.class`;
+
+    for (const cp of this.classpath) {
+      const classFilePath = fileProvider.joinPath(cp, relativePath);
+      if (fileProvider.existsSync(classFilePath)) {
+        return classFilePath;
+      }
+    }
+
+    return null;
+  }
+
+  async findClassFile(className) {
+    const fileProvider = getFileProvider();
+    const relativePath = `${className.replace(/\./g, '/')}.class`;
+
+    for (const cp of this.classpath) {
+      const classFilePath = fileProvider.joinPath(cp, relativePath);
+      if (await fileProvider.exists(classFilePath)) {
+        return classFilePath;
+      }
+    }
+
+    return null;
+  }
+
+  loadClassByNameSync(className, options={}) {
+      const path = this.findClassFileSync(className);
+      if (path) {
+          const classData = loadClassByPathSync(path, options);
+          if (classData) {
+              this.classes[classData.classes[0].className] = classData;
+          }
+          return classData;
+      }
+      return null;
+  }
+
+  async loadClassByName(className, options={}) {
+      const path = await this.findClassFile(className);
+      if (path) {
+          const classData = await loadClassByPath(path, options);
+          if (classData) {
+              this.classes[classData.classes[0].className] = classData;
+          }
+          return classData;
+      }
+      return null;
   }
 
   internString(str) {
@@ -50,6 +105,14 @@ class JVM {
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
         await this.execute();
     }
+  }
+
+  async runByName(className, options = {}) {
+    const classFilePath = await this.findClassFile(className);
+    if (!classFilePath) {
+      throw new Error(`Class not found: ${className}`);
+    }
+    return this.run(classFilePath, options);
   }
 
   async execute() {

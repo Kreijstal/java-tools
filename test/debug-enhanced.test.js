@@ -4,10 +4,10 @@ const Frame = require('../src/frame');
 const DebugController = require('../src/debugController');
 
 test('Enhanced Debug Features - Backtrace with method arguments', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     await controller.stepInto(); // Execute iconst_3
     await controller.stepInto(); // Execute istore_1
     
@@ -32,10 +32,10 @@ test('Enhanced Debug Features - Backtrace with method arguments', async (t) => {
 });
 
 test('Enhanced Debug Features - Stack inspection', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     await controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
     
     const stackInspection = controller.inspectStack();
@@ -53,10 +53,10 @@ test('Enhanced Debug Features - Stack inspection', async (t) => {
 });
 
 test('Enhanced Debug Features - Local variables inspection', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     await controller.stepInto(); // Execute iconst_3
     await controller.stepInto(); // Execute istore_1 (stores 3 in local 1)
     
@@ -75,10 +75,10 @@ test('Enhanced Debug Features - Local variables inspection', async (t) => {
 });
 
 test('Enhanced Debug Features - Specific local variable inspection', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     await controller.stepInto(); // Execute iconst_3
     await controller.stepInto(); // Execute istore_1 (stores 3 in local 1)
     
@@ -98,10 +98,10 @@ test('Enhanced Debug Features - Specific local variable inspection', async (t) =
 });
 
 test('Enhanced Debug Features - Specific stack value inspection', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     await controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
     
     const stackValue = controller.inspectStackValue(0);
@@ -119,10 +119,10 @@ test('Enhanced Debug Features - Specific stack value inspection', async (t) => {
 });
 
 test('Enhanced Debug Features - Negative stack indices', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     await controller.stepInto(); // Execute iconst_3 (pushes 3 to stack)
     
     const topStackValue = controller.inspectStackValue(-1);
@@ -140,10 +140,10 @@ test('Enhanced Debug Features - Negative stack indices', async (t) => {
 });
 
 test('Enhanced Debug Features - Invalid indices handling', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     
     const invalidLocal = controller.inspectLocalVariable(99);
     const invalidStack = controller.inspectStackValue(99);
@@ -159,10 +159,10 @@ test('Enhanced Debug Features - Invalid indices handling', async (t) => {
 });
 
 test('Enhanced Debug Features - Available variable names', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     
     const variableNames = controller.getAvailableVariableNames();
     

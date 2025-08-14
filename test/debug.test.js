@@ -18,7 +18,7 @@ test('JVM Serialization', async (t) => {
 });
 
 test('Debug Controller Basic Operations', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   // Test initial state
   t.equal(controller.executionState, 'stopped', 'Initial state should be stopped');
@@ -27,7 +27,7 @@ test('Debug Controller Basic Operations', async (t) => {
 
   // Test loading a class
   try {
-    const result = await controller.start('sources/VerySimple.class');
+    const result = await controller.start('VerySimple');
     t.equal(result.status, 'started', 'Should start successfully');
     t.equal(controller.executionState, 'paused', 'Should be paused after start');
     t.equal(controller.isPaused(), true, 'Should report as paused');
@@ -53,11 +53,11 @@ test('Debug Controller Basic Operations', async (t) => {
 });
 
 test('Debug Controller Serialization', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
     // Start debugging
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     controller.setBreakpoint(3);
     controller.setBreakpoint(7);
 
@@ -87,11 +87,11 @@ test('Debug Controller Serialization', async (t) => {
 });
 
 test('Debug Controller Step Operations', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: ['sources'] });
   
   try {
     // Start debugging
-    await controller.start('sources/VerySimple.class');
+    await controller.start('VerySimple');
     
     // Test step into
     const stepResult = await controller.stepInto();
@@ -135,7 +135,7 @@ test('Debug API Error Handling', async (t) => {
   const originalConsoleError = console.error;
   console.error = () => {}; // Suppress expected error message
   try {
-    await controller.start('nonexistent.class');
+    await controller.start('nonexistent');
     t.fail('Should throw error for nonexistent class');
   } catch (error) {
     t.ok(error.message.includes('Error loading class'), 'Should throw loading error');

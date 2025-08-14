@@ -25,8 +25,14 @@ function main() {
     process.exit(1);
   }
 
-  const classFilePath = path.join(cp, `${mainClass}.class`);
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: cp.split(':') });
+  const classFilePath = jvm.findClassFileSync(mainClass);
+
+  if (!classFilePath) {
+    console.error(`Error: Could not find or load main class ${mainClass}`);
+    process.exit(1);
+  }
+
   jvm.run(classFilePath);
 }
 

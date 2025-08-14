@@ -80,8 +80,7 @@ module.exports = {
 
     let classData = jvm.classes[className];
     if (!classData) {
-      const newClassPath = `sources/${className}.class`;
-      classData = jvm.loadClassSync(newClassPath, { silent: true });
+      classData = jvm.loadClassByNameSync(className, { silent: true });
     }
     const method = jvm.findMethod(classData, methodName, descriptor);
     if (method) {

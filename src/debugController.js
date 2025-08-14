@@ -2,17 +2,17 @@ const { JVM } = require('./jvm');
 const Frame = require('./frame');
 
 class DebugController {
-  constructor() {
-    this.jvm = new JVM();
+  constructor(options = {}) {
+    this.jvm = new JVM(options);
     this.executionState = 'stopped'; // stopped, running, paused
   }
 
-  async start(classFilePath, options = {}) {
+  async start(className, options = {}) {
     try {
       // Start the JVM but in a paused state
       this.jvm.debugManager.enable();
       this.jvm.debugManager.pause();
-      await this.jvm.run(classFilePath, options);
+      await this.jvm.runByName(className, options);
       this.executionState = 'paused';
 
       return {
