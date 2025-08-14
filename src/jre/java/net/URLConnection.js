@@ -13,7 +13,7 @@ async function _connect(obj) {
 
 module.exports = {
   _connect: _connect,
-  'java/net/URLConnection.getInputStream': async (jvm, obj, args) => {
+  'java/net/URLConnection.getInputStream()Ljava/io/InputStream;': async (jvm, obj, args) => {
     await _connect(obj);
     const text = obj.body;
     let index = 0;

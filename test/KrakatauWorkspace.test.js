@@ -149,16 +149,10 @@ test('KrakatauWorkspace refactoring', async function(t) {
     t.pass('Allowing partial implementation');
   }
 
-  // Test applyEdit with a simple edit
-  const simpleEdit = new WorkspaceEdit();
-  simpleEdit.addOperation(new RefactorOperation('TestMethods', 'test.path', 'rename', 'newName'));
-  
-  try {
-    workspace.applyEdit(simpleEdit);
-    t.pass('applyEdit should not throw');
-  } catch (error) {
-    t.pass('applyEdit might have issues with test path: ' + error.message);
-  }
+  // Test applyEdit with an invalid class
+  const invalidEdit = new WorkspaceEdit();
+  invalidEdit.addOperation(new RefactorOperation('NonExistentClass', 'test.path', 'rename', 'newName'));
+  t.throws(() => workspace.applyEdit(invalidEdit), /not found in workspace/, 'applyEdit should throw for non-existent class');
 
   // Test that workspace still works after edit attempt
   const classesAfterEdit = workspace.listClasses();
@@ -186,4 +180,21 @@ test('KrakatauWorkspace refactoring', async function(t) {
   const location = new SymbolLocation('TestMethods', 'classes.0.items.1');
   const definition = workspace.getDefinitionAt(location);
   t.equal(definition, null, 'getDefinitionAt should return null (not fully implemented)');
+});
+
+test('KrakatauWorkspace error handling', async function(t) {
+  t.plan(2);
+
+  // Test that create throws for an invalid path
+  try {
+    await KrakatauWorkspace.create('./non-existent-path');
+    t.fail('Should have thrown for invalid path');
+  } catch (error) {
+    t.pass('Should throw for invalid path');
+  }
+
+  // Test that getClassAST throws for a non-existent class
+  const sourcesPath = path.join(__dirname, '..', 'sources');
+  const workspace = await KrakatauWorkspace.create(sourcesPath);
+  t.throws(() => workspace.getClassAST('NonExistentClass'), /not found in workspace/, 'getClassAST should throw for non-existent class');
 });

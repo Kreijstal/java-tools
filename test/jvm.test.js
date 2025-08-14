@@ -10,7 +10,7 @@ test('JVM should execute Hello.class and print "Hello, World!"', async function(
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(Ljava/lang/String;)V': (j, o, a) => {
       output += a[0];
     }
   });

@@ -10,7 +10,7 @@ test('JVM should execute Calc.class and print "4"', async function(t) {
 
   let output = '';
   jvm.registerJreMethods({
-    'java/io/PrintStream.println': (j, o, a) => {
+    'java/io/PrintStream.println(I)V': (j, o, a) => {
       output += a[0];
     }
   });

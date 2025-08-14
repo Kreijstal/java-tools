@@ -1,32 +1,47 @@
 const Frame = require('../../../../frame');
 
 module.exports = {
-  'java/lang/reflect/Method.getName': (jvm, methodObj, args) => {
+  'java/lang/reflect/Method.getName()Ljava/lang/String;': (jvm, methodObj, args) => {
     const methodName = methodObj._methodData.name;
     return jvm.internString(methodName);
   },
 
-  'java/lang/reflect/Method.invoke': (jvm, methodObj, args) => {
+  'java/lang/reflect/Method.invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
+    console.log('Inside Method.js JRE handler for Method.invoke');
     const obj = args[0];
     const methodArgs = args[1];
-    const thread = jvm.threads[jvm.currentThreadIndex];
 
-    return new Promise((resolve, reject) => {
-      thread.isAwaitingReflectiveCall = true;
-      thread.reflectiveCallResolver = resolve;
+    const methodData = methodObj._methodData;
+    const { name, descriptor, flags } = methodData;
+    const isStatic = flags.includes('static');
 
-      const methodData = methodObj._methodData;
-      const newFrame = new Frame(methodData);
+    const className = methodObj._declaringClass._classData.classes[0].className;
+    const method = jvm.findMethodInHierarchy(className, name, descriptor);
 
+    if (method) {
+      const newFrame = new Frame(method);
       let localIndex = 0;
-      if (!methodData.flags.includes('static')) {
+      if (!isStatic) {
         newFrame.locals[localIndex++] = obj;
       }
-      for (let i = 0; i < methodArgs.length; i++) {
-        newFrame.locals[localIndex++] = methodArgs[i];
+      if (methodArgs) {
+        for (const arg of methodArgs) {
+          newFrame.locals[localIndex++] = arg;
+        }
       }
 
-      thread.callStack.push(newFrame);
-    });
+      const thread = jvm.threads[jvm.currentThreadIndex];
+
+      return new Promise((resolve) => {
+          thread.isAwaitingReflectiveCall = true;
+          thread.reflectiveCallResolver = (ret) => {
+              console.log('Executing reflectiveCallResolver in Method.js, ret:', ret);
+              resolve(ret);
+          };
+          thread.callStack.push(newFrame);
+      });
+    } else {
+      throw new Error(`Could not find method ${name}${descriptor} for reflective invocation.`);
+    }
   },
 };
