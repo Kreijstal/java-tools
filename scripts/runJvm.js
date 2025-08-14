@@ -26,8 +26,24 @@ function main() {
   }
 
   const classFilePath = path.join(cp, `${mainClass}.class`);
-  const jvm = new JVM();
-  jvm.run(classFilePath);
+  const jvm = new JVM({ classpath: cp });
+
+  let stdin = '';
+  if (!process.stdin.isTTY) {
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('readable', () => {
+      let chunk;
+      while ((chunk = process.stdin.read()) !== null) {
+        stdin += chunk;
+      }
+    });
+
+    process.stdin.on('end', () => {
+      jvm.run(classFilePath, { stdin: stdin });
+    });
+  } else {
+    jvm.run(classFilePath);
+  }
 }
 
 main();

@@ -12,6 +12,26 @@ module.exports = {
     }
     const obj = frame.stack.pop();
 
+    if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
+      const methodObj = obj;
+      const obj_for_invoke = args[0];
+      const args_for_invoke = args[1];
+
+      const methodData = methodObj._methodData;
+      const newFrame = new Frame(methodData);
+
+      let localIndex = 0;
+      if (!methodData.flags.includes('static')) {
+        newFrame.locals[localIndex++] = obj_for_invoke;
+      }
+      for (let i = 0; i < args_for_invoke.length; i++) {
+        newFrame.locals[localIndex++] = args_for_invoke[i];
+      }
+
+      thread.callStack.push(newFrame);
+      return;
+    }
+
     // Handle Thread.start()
     if (methodName === 'start' && descriptor === '()V') {
       const threadObject = obj;

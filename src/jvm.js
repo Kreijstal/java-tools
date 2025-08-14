@@ -1,5 +1,5 @@
 const Stack = require('./stack');
-const { loadClassByPath, loadClassByPathSync } = require('./classLoader');
+const { loadClass, loadClassByPath, loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures } = require('./convert_tree');
 const jreMethods = require('./jre');
@@ -8,12 +8,13 @@ const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
 
 class JVM {
-  constructor() {
+  constructor(options = {}) {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {};
     this.jre = {};
     this.debugManager = new DebugManager();
+    this.classpath = options.classpath || '.';
 
     this._jreMethods = jreMethods;
   }
@@ -27,6 +28,9 @@ class JVM {
   }
 
   async run(classFilePath, options = {}) {
+    if (options.classpath) {
+      this.classpath = options.classpath;
+    }
     const classData = await this.loadClassAsync(classFilePath, options);
     if (!classData) {
       throw new Error(`Class not found: ${classFilePath}`);
@@ -189,6 +193,18 @@ class JVM {
         throw error;
       }
     }
+  }
+
+  async loadClassByName(classNameWithSlashes) {
+    if (this.classes[classNameWithSlashes]) {
+      return this.classes[classNameWithSlashes];
+    }
+    const classNameWithDots = classNameWithSlashes.replace(/\//g, '.');
+    const classData = await loadClass(classNameWithDots, this.classpath);
+    if (classData) {
+      this.classes[classData.classes[0].className] = classData;
+    }
+    return classData;
   }
 
   loadClassSync(classFilePath, options = {}) {
