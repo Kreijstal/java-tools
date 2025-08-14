@@ -93,13 +93,17 @@ module.exports = {
     const label = instruction.arg;
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
+    console.log(`if_icmpge: comparing ${value1} >= ${value2}`);
     if (value1 >= value2) {
+      console.log('if_icmpge: jumping');
       const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
         throw new Error(`Label ${label} not found`);
       }
+    } else {
+      console.log('if_icmpge: not jumping');
     }
   },
   ifeq: (frame, instruction) => {

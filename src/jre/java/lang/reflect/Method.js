@@ -7,6 +7,7 @@ module.exports = {
   },
 
   'java/lang/reflect/Method.invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
+    console.log('Inside Method.js JRE handler for Method.invoke');
     const obj = args[0];
     const methodArgs = args[1];
 
@@ -34,6 +35,7 @@ module.exports = {
       return new Promise((resolve) => {
           thread.isAwaitingReflectiveCall = true;
           thread.reflectiveCallResolver = (ret) => {
+              console.log('Executing reflectiveCallResolver in Method.js, ret:', ret);
               resolve(ret);
           };
           thread.callStack.push(newFrame);
