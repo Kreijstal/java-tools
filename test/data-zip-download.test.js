@@ -4,7 +4,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 test('data.zip should be generated and contain all sample class files', function(t) {
-  t.plan(4);
+  t.plan(3);
 
   // First, ensure the build has been run
   const distDir = path.join(__dirname, '..', 'dist');
