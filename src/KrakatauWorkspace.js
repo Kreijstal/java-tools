@@ -855,19 +855,28 @@ class KrakatauWorkspace {
     const unresolvedMethods = [];
     for (const className in this.referenceObj) {
       const classRef = this.referenceObj[className];
-      const ast = this.workspaceASTs[className];
 
       for (const [memberName, memberRef] of classRef.children.entries()) {
         // A method descriptor will always start with '('.
         if (memberRef.descriptor && memberRef.descriptor.startsWith('(')) {
           let isDefined = false;
-          if (ast) {
-            // Check if the method exists in the AST
-            isDefined = ast.classes[0].items.some(item =>
-              item.type === 'method' &&
-              item.method.name === memberName &&
-              item.method.descriptor === memberRef.descriptor
-            );
+          let classToInspect = className;
+
+          while (classToInspect) {
+            const ast = this.workspaceASTs[classToInspect];
+            if (ast) {
+              isDefined = ast.classes[0].items.some(item =>
+                item.type === 'method' &&
+                item.method.name === memberName &&
+                item.method.descriptor === memberRef.descriptor
+              );
+              if (isDefined) {
+                break;
+              }
+              classToInspect = ast.classes[0].superClassName;
+            } else {
+              classToInspect = null;
+            }
           }
 
           if (!isDefined) {
