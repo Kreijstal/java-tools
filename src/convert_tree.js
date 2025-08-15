@@ -389,8 +389,26 @@ function convertJson(inputJson, constantPool) {
             break;
 
           default:
-            // For simple instructions without operands
-            codeItem.instruction = instr.opcodeName;
+            // Handle wide instructions (ending with "_w")
+            if (instr.opcodeName.endsWith("_w")) {
+              const baseInstruction = instr.opcodeName.slice(0, -2); // Remove "_w" suffix
+              if (baseInstruction === "iinc") {
+                // iinc_w has both index and const operands
+                codeItem.instruction = {
+                  op: "wide",
+                  arg: `${baseInstruction} ${instr.operands.index} ${instr.operands.const}`
+                };
+              } else {
+                // Other wide instructions only have index operand
+                codeItem.instruction = {
+                  op: "wide",
+                  arg: `${baseInstruction} ${instr.operands.index}`
+                };
+              }
+            } else {
+              // For simple instructions without operands
+              codeItem.instruction = instr.opcodeName;
+            }
             break;
         }
 
