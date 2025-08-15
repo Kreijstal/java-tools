@@ -22,6 +22,10 @@ module.exports = {
     const value = parseInt(instruction.arg, 10);
     frame.stack.push(value);
   },
+  sipush: (frame, instruction) => {
+    const value = parseInt(instruction.arg, 10);
+    frame.stack.push(value);
+  },
   iconst_m1: (frame) => {
     frame.stack.push(-1);
   },

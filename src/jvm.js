@@ -5,6 +5,7 @@ const { formatInstruction, unparseDataStructures } = require('./convert_tree');
 const jreMethods = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
+const opcodeNames = require('jvm_parser/opcodeNames');
 const DebugManager = require('./DebugManager');
 
 class JVM {
@@ -17,6 +18,7 @@ class JVM {
     this.classpath = options.classpath || '.';
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
+    this.opcodeNames = opcodeNames;
 
     this._jreMethods = jreMethods;
   }

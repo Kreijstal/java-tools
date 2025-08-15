@@ -1,4 +1,4 @@
-const { getAST } = require('jvm_parser'); 
+const { getAST, opcodeNames } = require('jvm_parser');
 const { convertJson } = require('./convert_tree');
 const NodeFileProvider = require('./NodeFileProvider');
 
@@ -43,7 +43,7 @@ async function loadClass(className, classPath) {
       const ast = getAST(classFileContent);
 
       // Convert the AST
-      const convertedAst = convertJson(ast.ast, ast.constantPool);
+      const convertedAst = convertJson(ast.ast, ast.constantPool, opcodeNames);
 
       return convertedAst;
     }
@@ -68,7 +68,7 @@ async function loadClassByPath(classFilePath, options = {}) {
   const ast = getAST(classFileContent);
 
   // Convert the AST
-  const convertedAst = convertJson(ast.ast, ast.constantPool);
+  const convertedAst = convertJson(ast.ast, ast.constantPool, opcodeNames);
 
   return convertedAst;
 }
@@ -91,7 +91,7 @@ function loadClassByPathSync(classFilePath, options = {}) {
     const ast = getAST(classFileContent);
 
     // Convert the AST
-    const convertedAst = convertJson(ast.ast, ast.constantPool);
+    const convertedAst = convertJson(ast.ast, ast.constantPool, opcodeNames);
 
     return convertedAst;
   } else {

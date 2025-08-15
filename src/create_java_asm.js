@@ -6,7 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getAST } = require('jvm_parser');
+const { getAST, opcodeNames } = require('jvm_parser');
 const { unparseDataStructures, convertJson } = require('./convert_tree');
 
 /**
@@ -22,7 +22,7 @@ function parseClassFile(classFilePath) {
   const ast = getAST(new Uint8Array(classFileContent));
   
   // Convert to structured format and then to assembly syntax
-  const convertedAst = convertJson(ast.ast, ast.constantPool);
+  const convertedAst = convertJson(ast.ast, ast.constantPool, opcodeNames);
   const asmSyntax = unparseDataStructures(convertedAst.classes[0]);
   
   return asmSyntax;

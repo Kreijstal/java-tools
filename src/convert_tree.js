@@ -4,7 +4,7 @@
  * @param {Array} constantPool - The constant pool entries from the class file
  * @returns {Object} A structured representation of the class with methods, fields, and metadata
  */
-function convertJson(inputJson, constantPool) {
+function convertJson(inputJson, constantPool, opcodeNames) {
   // Map accessFlags to flags based on context (class, method, or field)
   const accessFlagMap = {
     class: {
@@ -194,7 +194,15 @@ function convertJson(inputJson, constantPool) {
       labelMap[method.code.codeLength] = `L${method.code.codeLength}`;
 
       // Convert instructions
-      method.code.instructions.forEach((instr) => {
+      for (let i = 0; i < method.code.instructions.length; i++) {
+        const instr = method.code.instructions[i];
+
+        if (instr.opcodeName === 'wide') {
+          const modifiedOpcodeName = opcodeNames[instr.operands.modifiedOpcode];
+          instr.opcodeName = modifiedOpcodeName;
+          instr.operands.index = instr.operands.index;
+        }
+
         const codeItem = {};
         const labelDef = `L${instr.pc}:`;
         codeItem.labelDef = labelDef;
@@ -387,7 +395,7 @@ function convertJson(inputJson, constantPool) {
         }
 
         codeAttr.code.codeItems.push(codeItem);
-      });
+      }
 
       codeAttr.code.codeItems.push({
         labelDef: labelMap[method.code.codeLength] + ":",
@@ -495,6 +503,8 @@ function formatInstruction(instr) {
   }
   if (typeof instr === "string") {
     return instr;
+  } else if (instr.op === 'wide') {
+    return `wide ${instr.arg.op} ${instr.arg.arg}`;
   } else if (instr.op === "tableswitch") {
     // Prioritize tableswitch check
     const labelsStr = instr.labels
