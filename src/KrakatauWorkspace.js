@@ -173,7 +173,7 @@ class KrakatauWorkspace {
     // First, initialize the basic structure for all known classes
     Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
       if (!this.referenceObj[className]) {
-        this.referenceObj[className] = { children: {}, referees: [] };
+        this.referenceObj[className] = { children: new Map(), referees: [] };
       }
     });
     
@@ -187,7 +187,7 @@ class KrakatauWorkspace {
   _addBasicReferencesForClass(className, ast) {
     // Fallback method that adds basic references when full traversal fails
     if (!this.referenceObj[className]) {
-      this.referenceObj[className] = { children: {}, referees: [] };
+      this.referenceObj[className] = { children: new Map(), referees: [] };
     }
     
     // Add a basic reference for the class definition
@@ -197,25 +197,25 @@ class KrakatauWorkspace {
     ast.classes[0].items.forEach((item, itemIndex) => {
       if (item.type === 'method') {
         const methodName = item.method.name;
-        if (!this.referenceObj[className].children[methodName]) {
-          this.referenceObj[className].children[methodName] = {
+        if (!this.referenceObj[className].children.has(methodName)) {
+          this.referenceObj[className].children.set(methodName, {
             descriptor: item.method.descriptor,
             referees: []
-          };
+          });
         }
-        this.referenceObj[className].children[methodName].referees.push({ 
+        this.referenceObj[className].children.get(methodName).referees.push({
           className, 
           astPath: `classes.0.items.${itemIndex}.method` 
         });
       } else if (item.type === 'field') {
         const fieldName = item.field.name;
-        if (!this.referenceObj[className].children[fieldName]) {
-          this.referenceObj[className].children[fieldName] = {
+        if (!this.referenceObj[className].children.has(fieldName)) {
+          this.referenceObj[className].children.set(fieldName, {
             descriptor: item.field.descriptor,
             referees: []
-          };
+          });
         }
-        this.referenceObj[className].children[fieldName].referees.push({ 
+        this.referenceObj[className].children.get(fieldName).referees.push({
           className, 
           astPath: `classes.0.items.${itemIndex}.field` 
         });
@@ -233,7 +233,7 @@ class KrakatauWorkspace {
     
     // Initialize reference object for this class
     if (!this.referenceObj[cls.className]) {
-      this.referenceObj[cls.className] = { children: {}, referees: [] };
+      this.referenceObj[cls.className] = { children: new Map(), referees: [] };
     }
     this.referenceObj[cls.className].referees.push({ 
       className: cls.className, 
@@ -245,13 +245,13 @@ class KrakatauWorkspace {
         const methodName = item.method.name;
         const methodDescriptor = item.method.descriptor;
 
-        if (!this.referenceObj[cls.className].children[methodName]) {
-          this.referenceObj[cls.className].children[methodName] = {
+        if (!this.referenceObj[cls.className].children.has(methodName)) {
+          this.referenceObj[cls.className].children.set(methodName, {
             descriptor: methodDescriptor,
             referees: []
-          };
+          });
         }
-        this.referenceObj[cls.className].children[methodName].referees.push({ 
+        this.referenceObj[cls.className].children.get(methodName).referees.push({
           className: cls.className, 
           astPath: `classes.${classIndex}.items.${itemIndex}.method` 
         });
@@ -266,17 +266,17 @@ class KrakatauWorkspace {
                   const parentClass = arg[1];
 
                   if (!this.referenceObj[parentClass]) {
-                    this.referenceObj[parentClass] = { children: {}, referees: [] };
+                    this.referenceObj[parentClass] = { children: new Map(), referees: [] };
                   }
-                  if (!this.referenceObj[parentClass].children[fieldNameOrMethodName]) {
-                    this.referenceObj[parentClass].children[fieldNameOrMethodName] = {
+                  if (!this.referenceObj[parentClass].children.has(fieldNameOrMethodName)) {
+                    this.referenceObj[parentClass].children.set(fieldNameOrMethodName, {
                       descriptor: descriptor,
                       referees: []
-                    };
+                    });
                   }
                   
                   // Double-check the structure exists before adding reference
-                  const targetRef = this.referenceObj[parentClass].children[fieldNameOrMethodName];
+                  const targetRef = this.referenceObj[parentClass].children.get(fieldNameOrMethodName);
                   if (targetRef && Array.isArray(targetRef.referees)) {
                     // Store the reference with the className context (where the reference occurs)
                     targetRef.referees.push({ 
@@ -439,7 +439,7 @@ class KrakatauWorkspace {
 
     if (symbolIdentifier.memberName) {
       // Looking for method or field references
-      const memberRef = classRef.children[symbolIdentifier.memberName];
+      const memberRef = classRef.children.get(symbolIdentifier.memberName);
       if (memberRef) {
         memberRef.referees.forEach(referee => {
           // Handle both old format (string) and new format (object with className)
@@ -857,9 +857,7 @@ class KrakatauWorkspace {
       const classRef = this.referenceObj[className];
       const ast = this.workspaceASTs[className];
 
-      for (const memberName in classRef.children) {
-        const memberRef = classRef.children[memberName];
-
+      for (const [memberName, memberRef] of classRef.children.entries()) {
         // A method descriptor will always start with '('.
         if (memberRef.descriptor && memberRef.descriptor.startsWith('(')) {
           let isDefined = false;
