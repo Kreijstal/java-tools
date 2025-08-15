@@ -572,37 +572,32 @@ class KrakatauWorkspace {
     let currentClass = className;
 
     while (currentClass) {
-      const ast = this.workspaceASTs[currentClass];
-      if (!ast) {
-        break;
-      }
-
-      const superClass = ast.classes[0].superClass;
-      if (!superClass || superClass === 'java/lang/Object') {
-        // Add java/lang/Object if it's not the starting class
-        if (currentClass !== className && superClass === 'java/lang/Object') {
-          hierarchy.push(new SymbolDefinition(
-            new SymbolIdentifier('java/lang/Object'),
-            new SymbolLocation('java/lang/Object', 'classes.0'),
-            'class',
-            ['public']
-          ));
+        const ast = this.workspaceASTs[currentClass];
+        if (!ast) {
+            if (currentClass !== className) {
+                hierarchy.push(new SymbolDefinition(new SymbolIdentifier(currentClass), null, 'class', []));
+            }
+            break;
         }
-        break;
-      }
 
-      // Check if we have the superclass in our workspace
-      const superAst = this.workspaceASTs[superClass];
-      if (superAst) {
+        const superClass = ast.classes[0].superClassName;
+        if (!superClass) {
+            break;
+        }
+
+        const superAst = this.workspaceASTs[superClass];
         hierarchy.push(new SymbolDefinition(
-          new SymbolIdentifier(superClass),
-          new SymbolLocation(superClass, 'classes.0'),
-          'class',
-          superAst.classes[0].flags
+            new SymbolIdentifier(superClass),
+            superAst ? new SymbolLocation(superClass, 'classes.0') : null,
+            'class',
+            superAst ? superAst.classes[0].flags : []
         ));
-      }
 
-      currentClass = superClass;
+        if (!superAst) {
+            break;
+        }
+
+        currentClass = superClass;
     }
 
     return hierarchy;
