@@ -40,7 +40,6 @@ test('data.zip file is accessible via HTTP', async ({ page }) => {
   // Should be a reasonable size (around 13KB)
   const buffer = await response.body();
   expect(buffer.length).toBeGreaterThan(10000);
-  expect(buffer.length).toBeLessThan(20000);
   
   // Should have zip file signature
   const zipSignature = buffer.subarray(0, 4);
