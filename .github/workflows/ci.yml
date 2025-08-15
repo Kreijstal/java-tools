@@ -144,7 +144,7 @@ jobs:
         run: bash scripts/krakatau-disasm 2>&1 | head -n 5 || true
       - name: Compare our disassembly with Krakatau
         run: |
-          node scripts/compare_with_javap.js
+          node scripts/compare_with_javap.js sources
           if ls /tmp/parser_comparison/*_ours_vs_krak2.diff.txt 1> /dev/null 2>&1; then
             echo 'Disassembly mismatch(s) found:'
             cat /tmp/parser_comparison/*_ours_vs_krak2.diff.txt
