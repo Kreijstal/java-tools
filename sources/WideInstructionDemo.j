@@ -10,19 +10,17 @@
     .end code
 .end method
 
-.method public static main : ([Ljava/lang/String;)V
-    .code stack 0 locals 1
-        invokestatic Method WideInstructionDemo wideMethod ()V
-        return
-    .end code
-.end method
-
-.method public static wideMethod : ()V
-    .code stack 2 locals 257
+.method public static wideLdc : ()V
+    .code stack 1 locals 257
         sipush 256
         wide istore 256
         return
     .end code
 .end method
 
-.end class
+.method public static main : ([Ljava/lang/String;)V
+    .code stack 1 locals 1
+        invokestatic Method WideInstructionDemo wideLdc ()V
+        return
+    .end code
+.end method
