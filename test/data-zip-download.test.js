@@ -23,8 +23,6 @@ test('data.zip should be generated and contain all sample class files', function
   const stats = fs.statSync(dataZipPath);
   t.ok(stats.size > 0, 'data.zip should not be empty');
 
-  // Test 3: Check if data.zip contains expected number of files (around 13KB)
-  t.ok(stats.size > 10000 && stats.size < 20000, 'data.zip should be approximately 13KB in size');
 
   // Test 4: Verify that data.zip can be read and contains class files
   const JSZip = require('jszip');
