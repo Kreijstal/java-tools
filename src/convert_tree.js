@@ -224,6 +224,14 @@ function convertJson(inputJson, constantPool) {
             }
             break;
 
+          case "invokedynamic":
+            // invokedynamic instructions reference InvokeDynamic constant pool entries
+            codeItem.instruction = {
+              op: instr.opcodeName,
+              arg: `[_${instr.operands.index}]`
+            };
+            break;
+
           case "getfield":
           case "putfield":
           case "getstatic":
