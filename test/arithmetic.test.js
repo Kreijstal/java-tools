@@ -5,7 +5,7 @@ const path = require('path');
 test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'RuntimeArithmetic.class');
 
   let output = '';
@@ -24,7 +24,7 @@ test('JVM should execute RuntimeArithmetic.class with all arithmetic operations'
 test('JVM should execute VerySimple.class with subtraction', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'VerySimple.class');
 
   let output = '';
@@ -42,7 +42,7 @@ test('JVM should execute VerySimple.class with subtraction', async function(t) {
 test('JVM should execute SmallDivisionTest.class with division and remainder operations', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'SmallDivisionTest.class');
 
   let output = '';
@@ -61,7 +61,7 @@ test('JVM should execute SmallDivisionTest.class with division and remainder ope
 test('JVM should execute ConstantsTest.class with iconst instructions', async function(t) {
   t.plan(3);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'ConstantsTest.class');
 
   let output = '';

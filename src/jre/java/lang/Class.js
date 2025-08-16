@@ -51,9 +51,10 @@ module.exports = {
       const superClassName = classData.classes[0].superClassName;
       if (superClassName) {
         const superClassData = jvm.classes[superClassName];
-        if (superClassData) {
+        if (superClassData && superClassName !== 'java/lang/Object') {
           getMethodsRecursive({ type: 'java/lang/Class', _classData: superClassData });
-        } else if (superClassName === 'java/lang/Object') {
+        }
+        if (superClassName === 'java/lang/Object') {
             const objectMethods = require('./Object.js');
             Object.keys(objectMethods).forEach(methodSignature => {
                 const lastDot = methodSignature.lastIndexOf('.');

@@ -15,7 +15,7 @@ module.exports = {
     const { name, descriptor, flags } = methodData;
     const isStatic = flags.includes('static');
 
-    const className = methodObj._declaringClass._classData.classes[0].className;
+    const className = methodObj._declaringClass._classData.ast.classes[0].className;
     const method = jvm.findMethodInHierarchy(className, name, descriptor);
 
     if (method) {

@@ -100,7 +100,7 @@ class Diagnostic {
  */
 class KrakatauWorkspace {
   constructor() {
-    this.workspaceASTs = {}; // className -> AST
+    this.workspaceASTs = {}; // className -> { ast, constantPool }
     this.referenceObj = {}; // Master reference graph
     this.classFilePaths = {}; // className -> file path
   }
@@ -131,10 +131,22 @@ class KrakatauWorkspace {
 
     // Load all class files
     for (const classFile of classFiles) {
-      const ast = loadClassByPathSync(classFile, { silent: true });
-      if (ast) {
-        const className = ast.classes[0].className;
-        this.workspaceASTs[className] = ast;
+      // We need to get the raw parser output before it's converted
+      // but loadClassByPathSync does both. Let's get the raw content and parse it here.
+      const fs = require('fs');
+      const { getAST } = require('jvm_parser');
+      const { convertJson } = require('./convert_tree');
+
+      const classFileContent = fs.readFileSync(classFile);
+      const rawAst = getAST(classFileContent);
+      const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+
+      if (convertedAst) {
+        const className = convertedAst.classes[0].className;
+        this.workspaceASTs[className] = {
+          ast: convertedAst,
+          constantPool: rawAst.constantPool,
+        };
         this.classFilePaths[className] = classFile;
       }
     }
@@ -171,7 +183,7 @@ class KrakatauWorkspace {
     this.referenceObj = {};
     
     // First, initialize the basic structure for all known classes
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+    Object.keys(this.workspaceASTs).forEach(className => {
       if (!this.referenceObj[className]) {
         this.referenceObj[className] = { children: new Map(), referees: [] };
       }
@@ -179,8 +191,8 @@ class KrakatauWorkspace {
     
     // Build comprehensive reference graph using traverseAST functionality
     // Process each class in the workspace to find all cross-references
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
-      this._buildReferencesForClass(className, ast);
+    Object.entries(this.workspaceASTs).forEach(([className, workspaceEntry]) => {
+      this._buildReferencesForClass(className, workspaceEntry.ast);
     });
   }
 
@@ -300,7 +312,8 @@ class KrakatauWorkspace {
   getSymbolTree() {
     const rootChildren = [];
 
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+    Object.entries(this.workspaceASTs).forEach(([className, workspaceEntry]) => {
+      const ast = workspaceEntry.ast;
       const classSymbol = new SymbolDefinition(
         new SymbolIdentifier(className),
         new SymbolLocation(className, `classes.0`),
@@ -347,7 +360,8 @@ class KrakatauWorkspace {
   listClasses() {
     const classes = [];
 
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+    Object.entries(this.workspaceASTs).forEach(([className, workspaceEntry]) => {
+      const ast = workspaceEntry.ast;
       const classDef = new SymbolDefinition(
         new SymbolIdentifier(className),
         new SymbolLocation(className, `classes.0`),
@@ -369,10 +383,11 @@ class KrakatauWorkspace {
    * @returns {SymbolDefinition[]} An array of SymbolDefinitions for each symbol of the specified type.
    */
   _listSymbols(className, itemType, symbolKind) {
-    const ast = this.workspaceASTs[className];
-    if (!ast) {
+    const workspaceEntry = this.workspaceASTs[className];
+    if (!workspaceEntry) {
       return [];
     }
+    const ast = workspaceEntry.ast;
 
     const symbols = [];
     ast.classes[0].items.forEach((item, itemIndex) => {
@@ -416,11 +431,11 @@ class KrakatauWorkspace {
    * @returns {object|null} The parsed AST object for the class, or null if not found.
    */
   getClassAST(className) {
-    const ast = this.workspaceASTs[className];
-    if (!ast) {
+    const workspaceEntry = this.workspaceASTs[className];
+    if (!workspaceEntry) {
       throw new Error(`Class ${className} not found in workspace`);
     }
-    return ast;
+    return workspaceEntry.ast;
   }
 
   /**
@@ -484,8 +499,11 @@ class KrakatauWorkspace {
    * @returns {string} The string content for the .j file.
    */
   toKrakatauAssembly(className) {
-    const ast = this.getClassAST(className);
-    return unparseDataStructures(ast.classes[0]);
+    const workspaceEntry = this.workspaceASTs[className];
+    if (!workspaceEntry) {
+      throw new Error(`Class ${className} not found in workspace`);
+    }
+    return unparseDataStructures(workspaceEntry.ast.classes[0], workspaceEntry.constantPool);
   }
 
   /**
@@ -495,10 +513,11 @@ class KrakatauWorkspace {
    */
   findCallees(methodIdentifier) {
     const callees = [];
-    const ast = this.workspaceASTs[methodIdentifier.className];
-    if (!ast) {
+    const workspaceEntry = this.workspaceASTs[methodIdentifier.className];
+    if (!workspaceEntry) {
       return callees;
     }
+    const ast = workspaceEntry.ast;
 
     // Find the method in the AST
     const methodItem = ast.classes[0].items.find(item => 
@@ -572,20 +591,21 @@ class KrakatauWorkspace {
     let currentClass = className;
 
     while (currentClass) {
-        const ast = this.workspaceASTs[currentClass];
-        if (!ast) {
+        const workspaceEntry = this.workspaceASTs[currentClass];
+        if (!workspaceEntry) {
             if (currentClass !== className) {
                 hierarchy.push(new SymbolDefinition(new SymbolIdentifier(currentClass), null, 'class', []));
             }
             break;
         }
-
+        const ast = workspaceEntry.ast;
         const superClass = ast.classes[0].superClassName;
         if (!superClass) {
             break;
         }
 
-        const superAst = this.workspaceASTs[superClass];
+        const superWorkspaceEntry = this.workspaceASTs[superClass];
+        const superAst = superWorkspaceEntry ? superWorkspaceEntry.ast : null;
         hierarchy.push(new SymbolDefinition(
             new SymbolIdentifier(superClass),
             superAst ? new SymbolLocation(superClass, 'classes.0') : null,
@@ -611,12 +631,12 @@ class KrakatauWorkspace {
   getSubtypeHierarchy(className) {
     const subtypes = [];
 
-    Object.entries(this.workspaceASTs).forEach(([subClassName, ast]) => {
+    Object.entries(this.workspaceASTs).forEach(([subClassName, workspaceEntry]) => {
       if (subClassName === className) {
         return; // Skip self
       }
 
-      const cls = ast.classes[0];
+      const cls = workspaceEntry.ast.classes[0];
       
       // Check if this class extends the target class
       if (cls.superClass === className) {
@@ -649,8 +669,8 @@ class KrakatauWorkspace {
   getCallGraph() {
     const callGraph = new Map();
 
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
-      ast.classes[0].items.forEach(item => {
+    Object.entries(this.workspaceASTs).forEach(([className, workspaceEntry]) => {
+      workspaceEntry.ast.classes[0].items.forEach(item => {
         if (item.type === 'method') {
           const methodId = new SymbolIdentifier(className, item.method.name, item.method.descriptor);
           const callees = this.findCallees(methodId);
@@ -672,7 +692,8 @@ class KrakatauWorkspace {
     const lowerQuery = query.toLowerCase();
 
     // Search through all classes
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
+    Object.entries(this.workspaceASTs).forEach(([className, workspaceEntry]) => {
+      const ast = workspaceEntry.ast;
       // Check class name
       if (className.toLowerCase().includes(lowerQuery)) {
         results.push(new SymbolDefinition(
@@ -805,8 +826,8 @@ class KrakatauWorkspace {
   findUnusedSymbols() {
     const unusedSymbols = [];
 
-    Object.entries(this.workspaceASTs).forEach(([className, ast]) => {
-      ast.classes[0].items.forEach((item, itemIndex) => {
+    Object.entries(this.workspaceASTs).forEach(([className, workspaceEntry]) => {
+      workspaceEntry.ast.classes[0].items.forEach((item, itemIndex) => {
         if (item.type === 'method' && item.method.flags.includes('private')) {
           const methodId = new SymbolIdentifier(className, item.method.name, item.method.descriptor);
           const references = this.findReferences(methodId);
@@ -909,10 +930,21 @@ class KrakatauWorkspace {
    * @param {string} filePath - The path to the .class file that has changed.
    */
   async reloadFile(filePath) {
-    const ast = loadClassByPathSync(filePath, { silent: true });
-    if (ast) {
-      const className = ast.classes[0].className;
-      this.workspaceASTs[className] = ast;
+    // This needs to be updated to match the logic in _initialize
+    const fs = require('fs');
+    const { getAST } = require('jvm_parser');
+    const { convertJson } = require('./convert_tree');
+
+    const classFileContent = fs.readFileSync(filePath);
+    const rawAst = getAST(classFileContent);
+    const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+
+    if (convertedAst) {
+      const className = convertedAst.classes[0].className;
+      this.workspaceASTs[className] = {
+        ast: convertedAst,
+        constantPool: rawAst.constantPool,
+      };
       this.classFilePaths[className] = filePath;
       
       // Rebuild the reference graph

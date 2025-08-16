@@ -8,12 +8,12 @@ module.exports = {
     while (currentClassName) {
       const currentClassData = jvm.classes[currentClassName];
       if (currentClassData) {
-        const classFields = currentClassData.classes[0].items.filter(item => item.type === 'field');
+        const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
         for (const field of classFields) {
           // TODO: Use correct default values based on field descriptor
           fields[`${currentClassName}.${field.field.name}`] = null;
         }
-        const superClassName = currentClassData.classes[0].superClassName;
+        const superClassName = currentClassData.ast.classes[0].superClassName;
         if (superClassName) {
             await jvm.loadClassByName(superClassName);
         }
@@ -23,8 +23,44 @@ module.exports = {
       }
     }
 
-    const objRef = { type: className, fields, hashCode: jvm.nextHashCode++ };
+    const objRef = {
+      type: className,
+      fields,
+      hashCode: jvm.nextHashCode++,
+      lockOwner: null,
+      lockCount: 0,
+      waitSet: [],
+    };
     frame.stack.push(objRef);
+  },
+
+  monitorenter: (frame, instruction, jvm, thread) => {
+    const objRef = frame.stack.pop();
+    if (objRef.lockOwner === null) {
+      objRef.lockOwner = thread.id;
+      objRef.lockCount = 1;
+    } else if (objRef.lockOwner === thread.id) {
+      objRef.lockCount++;
+    } else {
+      thread.status = 'BLOCKED';
+      // ugly spin lock for now
+      setImmediate(() => {
+        thread.status = 'RUNNABLE';
+      });
+      frame.pc--; // retry instruction
+    }
+  },
+
+  monitorexit: (frame, instruction, jvm, thread) => {
+    const objRef = frame.stack.pop();
+    if (objRef.lockOwner === thread.id) {
+      objRef.lockCount--;
+      if (objRef.lockCount === 0) {
+        objRef.lockOwner = null;
+      }
+    } else {
+      // This should throw IllegalMonitorStateException
+    }
   },
 
   getfield: (frame, instruction, jvm) => {
@@ -138,7 +174,7 @@ module.exports = {
 
       // TODO: Check interfaces as well
 
-      currentClassName = classData.classes[0].superClassName;
+      currentClassName = classData.ast.classes[0].superClassName;
     }
 
     frame.stack.push(0); // No match found in the hierarchy
@@ -163,7 +199,7 @@ module.exports = {
         // TODO: Throw ClassCastException
         return;
       }
-      currentClassName = classData.classes[0].superClassName;
+      currentClassName = classData.ast.classes[0].superClassName;
     }
 
     // If we get here, the cast is invalid

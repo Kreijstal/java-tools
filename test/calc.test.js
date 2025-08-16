@@ -5,7 +5,7 @@ const path = require('path');
 test('JVM should execute Calc.class and print "4"', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'Calc.class');
 
   let output = '';
