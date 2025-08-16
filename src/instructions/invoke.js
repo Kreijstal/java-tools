@@ -239,15 +239,43 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 
   // For a lambda, the result of invokedynamic is a functional interface object (e.g., Runnable).
   // When its method is called (e.g., run()), the target method handle is invoked.
-  // We will simulate this by creating a simple object that represents the Runnable.
-  const runnable = {
-    type: 'java/lang/Runnable',
-    methodHandle: targetMethodHandle,
-    // A real implementation would have a dispatch table for interface methods.
-  };
+  if (bsm.method_ref.value.reference.className === 'java/lang/invoke/LambdaMetafactory') {
+    // We will simulate this by creating a simple object that represents the Runnable.
+    const runnable = {
+      type: 'java/lang/Runnable',
+      methodHandle: targetMethodHandle,
+      // A real implementation would have a dispatch table for interface methods.
+    };
 
-  // Push the resulting functional interface object onto the stack.
-  frame.stack.push(runnable);
+    // Push the resulting functional interface object onto the stack.
+    frame.stack.push(runnable);
+  } else if (bsm.method_ref.value.reference.className === 'java/lang/invoke/StringConcatFactory') {
+    // For string concatenation, we immediately invoke the target method handle.
+    const { params } = parseDescriptor(invokedType.descriptor);
+    const dynamicArgs = [];
+    for (let i = 0; i < params.length; i++) {
+      dynamicArgs.unshift(frame.stack.pop());
+    }
+
+    const concatInstruction = {
+      op: 'invokestatic',
+      arg: [
+        'Method',
+        targetMethodHandle.reference.className,
+        [
+          targetMethodHandle.reference.methodName,
+          targetMethodHandle.reference.methodDescriptor
+        ]
+      ]
+    };
+
+    // Push arguments for the concat helper
+    const recipe = targetMethodHandle.bound;
+    frame.stack.push(recipe);
+    frame.stack.push(dynamicArgs);
+
+    await invokestatic(frame, concatInstruction, jvm, thread);
+  }
 }
 
 async function invokeinterface(frame, instruction, jvm, thread) {

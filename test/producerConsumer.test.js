@@ -1,11 +1,19 @@
 const test = require('tape');
 const { JVM } = require('../src/jvm');
 
-test.skip('JVM should execute ProducerConsumer.class and demonstrate wait/notify', async (t) => {
+test('JVM should execute ProducerConsumer.class and demonstrate wait/notify', async (t) => {
+  t.plan(1);
   const jvm = new JVM({ classpath: 'sources' });
   const output = [];
 
-  // TODO: Capture output
+  jvm.registerJreMethods({
+    'java/io/PrintStream': {
+      'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+        output.push(args[0]);
+      },
+    },
+  });
+
   await jvm.run('sources/ProducerConsumer.class');
 
   t.deepEqual(output, [
@@ -20,5 +28,4 @@ test.skip('JVM should execute ProducerConsumer.class and demonstrate wait/notify
     'Producer produced-4',
     'Consumer consumed-4',
   ]);
-  t.end();
 });

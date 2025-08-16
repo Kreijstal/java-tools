@@ -216,6 +216,8 @@ class JVM {
       return { completed: true };
     }
 
+    console.error(`Tick. Current thread: ${this.currentThreadIndex}. Statuses: ${this.threads.map(t => `${t.id}:${t.status}`).join(', ')}`);
+
     let thread = this.threads[this.currentThreadIndex];
 
     // Find the next runnable thread

@@ -3,6 +3,13 @@ class MethodHandle {
     this.kind = kind; // e.g., 'invokeStatic', 'invokeVirtual'
     this.reference = reference; // { className, nameAndType: { name, descriptor } }
     this.type = 'java/lang/invoke/MethodHandle';
+    this.bound = null;
+  }
+
+  bindTo(value) {
+    const newHandle = new MethodHandle(this.kind, this.reference);
+    newHandle.bound = value;
+    return newHandle;
   }
 }
 

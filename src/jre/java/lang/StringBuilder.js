@@ -11,6 +11,11 @@ module.exports = {
       obj.value += str;
       return obj;
     },
+    'append(I)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      const int = args[0];
+      obj.value += int;
+      return obj;
+    },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.value);
     },
