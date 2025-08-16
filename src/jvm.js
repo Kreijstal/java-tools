@@ -581,7 +581,7 @@ class JVM {
     const lineToPcMap = {};
     const lines = disassembly.split('\n');
     
-    for (let i = 0; i < lines.length; i) {
+    for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const pcMatch = line.match(/L(\d+):/);
       if (pcMatch) {
