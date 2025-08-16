@@ -1,12 +1,14 @@
 const Frame = require('../../../../frame');
 
 module.exports = {
-  'java/lang/reflect/Method.getName()Ljava/lang/String;': (jvm, methodObj, args) => {
-    const methodName = methodObj._methodData.name;
-    return jvm.internString(methodName);
-  },
-
-  'java/lang/reflect/Method.invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
+  super: 'java/lang/reflect/AccessibleObject',
+  staticFields: {},
+  methods: {
+    'getName()Ljava/lang/String;': (jvm, methodObj, args) => {
+      const methodName = methodObj._methodData.name;
+      return jvm.internString(methodName);
+    },
+    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
     console.log('Inside Method.js JRE handler for Method.invoke');
     const obj = args[0];
     const methodArgs = args[1];
@@ -44,4 +46,5 @@ module.exports = {
       throw new Error(`Could not find method ${name}${descriptor} for reflective invocation.`);
     }
   },
+}
 };

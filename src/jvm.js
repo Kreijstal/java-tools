@@ -2,7 +2,7 @@ const Stack = require('./stack');
 const { loadClassByPath, loadClassByPathSync: loadConvertedClass } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures, convertJson } = require('./convert_tree');
-const jreMethods = require('./jre');
+const jreClasses = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
@@ -16,13 +16,12 @@ class JVM {
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
     this.invokedynamicCache = new Map();
-    this.jre = {};
+    this.jre = jreClasses;
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || '.';
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
 
-    this._jreMethods = jreMethods;
     this._preloadJreClasses();
   }
 
@@ -100,8 +99,38 @@ class JVM {
     return str;
   }
 
-  registerJreMethods(methods) {
-    this._jreMethods = { ...this._jreMethods, ...methods };
+  _setTestOutputCallback(callback) {
+    this.testOutputCallback = callback;
+  }
+
+  _jreFindMethod(className, methodName, descriptor) {
+    let currentClass = this.jre[className];
+    while (currentClass) {
+      const methodKey = `${methodName}${descriptor}`;
+      const method = currentClass.methods[methodKey];
+      if (method) {
+        return method;
+      }
+      currentClass = this.jre[currentClass.super];
+    }
+    return null;
+  }
+
+  _jreFindStaticField(className, fieldName, descriptor) {
+    let currentClass = this.jre[className];
+    while (currentClass) {
+      const fieldKey = `${fieldName}:${descriptor}`;
+      const field = currentClass.staticFields[fieldKey];
+      if (field) {
+        return field;
+      }
+      currentClass = this.jre[currentClass.super];
+    }
+    return null;
+  }
+
+  _jreGetNative(className, nativeName) {
+    return this.jre[className][nativeName];
   }
 
   async run(classFilePath, options = {}) {

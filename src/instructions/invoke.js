@@ -58,8 +58,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
     return;
   } else {
-    const methodKey = `${className}.${methodName}${descriptor}`;
-    const jreMethod = jvm._jreMethods[methodKey];
+    const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
 
     if (jreMethod) {
       let result = await jreMethod(jvm, obj, args, thread);
@@ -90,8 +89,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 async function invokestatic(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
 
-  const methodKey = `${className}.${methodName}${descriptor}`;
-  const jreMethod = jvm._jreMethods[methodKey];
+  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
 
   if (jreMethod) {
     const { params } = parseDescriptor(descriptor);
@@ -131,8 +129,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
-  const methodKey = `${className}.${methodName}${descriptor}`;
-  const jreMethod = jvm._jreMethods[methodKey];
+  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
 
   if (jreMethod) {
       await jreMethod(jvm, obj, args);
