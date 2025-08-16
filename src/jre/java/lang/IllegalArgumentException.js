@@ -1,6 +1,10 @@
 module.exports = {
-  'java/lang/IllegalArgumentException.<init>()V': (jvm, obj, args) => {
-    obj.hashCode = jvm.nextHashCode++;
-    delete obj.isUninitialized;
+  super: 'java/lang/RuntimeException',
+  staticFields: {},
+  methods: {
+    '<init>()V': (jvm, obj, args) => {
+      obj.hashCode = jvm.nextHashCode++;
+      delete obj.isUninitialized;
+    },
   },
 };

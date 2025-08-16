@@ -170,20 +170,8 @@ async function initializeJVM() {
         if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
             jvmDebug = new window.JVMDebug.BrowserJVMDebug();
             
-            // Register a custom println method to redirect output to the web console
-            jvmDebug.registerJreMethods({
-              'java/io/PrintStream.println': (jvm, obj, args) => {
-                const outputDiv = document.getElementById(DOM_IDS.OUTPUT);
-                if (outputDiv) {
-                    const timestamp = new Date().toLocaleTimeString();
-                    const logEntry = document.createElement('div');
-                    logEntry.textContent = `[${timestamp}] ${args[0]}`;
-                    logEntry.style.color = '#4ec9b0'; // Different color for program output
-                    outputDiv.appendChild(logEntry);
-                    outputDiv.scrollTop = outputDiv.scrollHeight; // Auto-scroll to bottom
-                }
-              }
-            });
+            // The JRE methods are now preloaded, so we don't need to register them here.
+            // The `println` implementation will be handled by the JRE itself.
             
             try {
                 // Detect environment and determine data.zip URL

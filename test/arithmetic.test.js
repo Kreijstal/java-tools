@@ -5,17 +5,10 @@ const path = require('path');
 test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'RuntimeArithmetic.class');
 
-  let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream.println(I)V': (j, o, a) => {
-      output += a[0] + '\n';
-    }
-  });
-
-  await jvm.run(classFilePath, { silent: true });
+  await jvm.run(classFilePath);
 
   const expected = '5\n2\n6\n';
   t.equal(output, expected, 'The JVM should correctly execute iadd, isub, and imul operations');
@@ -24,17 +17,12 @@ test('JVM should execute RuntimeArithmetic.class with all arithmetic operations'
 test('JVM should execute VerySimple.class with subtraction', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'VerySimple.class');
 
   let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream.println(I)V': (j, o, a) => {
-      output += a[0] + '\n';
-    }
-  });
-
-  await jvm.run(classFilePath, { silent: true });
+  // TODO: Find a new way to capture output for tests
+  await jvm.run(classFilePath);
 
   t.equal(output, '1\n', 'The JVM should correctly execute subtraction (3-2=1)');
 });
@@ -42,15 +30,10 @@ test('JVM should execute VerySimple.class with subtraction', async function(t) {
 test('JVM should execute SmallDivisionTest.class with division and remainder operations', async function(t) {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'SmallDivisionTest.class');
 
   let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream.println(I)V': (j, o, a) => {
-      output += a[0] + '\n';
-    }
-  });
 
   await jvm.run(classFilePath, { silent: true });
 
@@ -61,7 +44,7 @@ test('JVM should execute SmallDivisionTest.class with division and remainder ope
 test('JVM should execute ConstantsTest.class with iconst instructions', async function(t) {
   t.plan(3);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'ConstantsTest.class');
 
   let output = '';

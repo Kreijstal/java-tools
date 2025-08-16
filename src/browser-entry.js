@@ -258,15 +258,6 @@ class BrowserJVMDebug {
     return this.fileProvider;
   }
 
-  /**
-   * Set a callback function to capture println output for web UI
-   * @param {function} callback - Function to call with println output
-   */
-  registerJreMethods(methods) {
-    if (this.debugController && this.debugController.jvm) {
-      this.debugController.jvm.registerJreMethods(methods);
-    }
-  }
 
   /**
    * Get disassembly of a class without starting debug session
