@@ -27,6 +27,45 @@ class JVM {
   }
 
   _preloadJreClasses() {
+    const jreHierarchy = {
+      'java/lang/Object': null,
+      'java/lang/Throwable': 'java/lang/Object',
+      'java/lang/Exception': 'java/lang/Throwable',
+      'java/lang/RuntimeException': 'java/lang/Exception',
+      'java/lang/IllegalArgumentException': 'java/lang/RuntimeException',
+      'java/lang/ReflectiveOperationException': 'java/lang/Exception',
+      'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
+      'java/io/Reader': 'java/lang/Object',
+      'java/io/BufferedReader': 'java/io/Reader',
+      'java/io/InputStreamReader': 'java/io/Reader',
+      'java/io/InputStream': 'java/lang/Object',
+      'java/io/FilterInputStream': 'java/io/InputStream',
+      'java/io/BufferedInputStream': 'java/io/FilterInputStream',
+      'java/io/OutputStream': 'java/lang/Object',
+      'java/io/FilterOutputStream': 'java/io/OutputStream',
+      'java/io/PrintStream': 'java/io/FilterOutputStream',
+      'java/net/URLConnection': 'java/lang/Object',
+      'java/net/HttpURLConnection': 'java/net/URLConnection',
+    };
+
+    // Create stubs for all classes in the hierarchy
+    for (const className in jreHierarchy) {
+      const superClassName = jreHierarchy[className];
+      const classStub = {
+        ast: {
+          classes: [{
+            className: className,
+            superClassName: superClassName,
+            items: [],
+            flags: ['public']
+          }]
+        },
+        constantPool: []
+      };
+      this.classes[className] = classStub;
+    }
+
+    // Add other JRE classes that extend Object directly
     const jrePath = path.join(__dirname, 'jre');
     const walk = (dir, prefix) => {
       const files = fs.readdirSync(dir);
@@ -37,18 +76,20 @@ class JVM {
           walk(fullPath, `${prefix}${file}/`);
         } else if (file.endsWith('.js')) {
           const className = `${prefix}${file.slice(0, -3)}`;
-          const classStub = {
-            ast: {
-              classes: [{
-                className: className,
-                superClassName: className === 'java/lang/Object' ? null : 'java/lang/Object',
-                items: [],
-                flags: ['public']
-              }]
-            },
-            constantPool: []
-          };
-          this.classes[className] = classStub;
+          if (!this.classes[className]) {
+            const classStub = {
+              ast: {
+                classes: [{
+                  className: className,
+                  superClassName: 'java/lang/Object',
+                  items: [],
+                  flags: ['public']
+                }]
+              },
+              constantPool: []
+            };
+            this.classes[className] = classStub;
+          }
         }
       }
     };
