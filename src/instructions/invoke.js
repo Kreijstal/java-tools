@@ -165,4 +165,12 @@ module.exports = {
         console.error(`Unsupported invokespecial: ${className}.${methodName}${descriptor}`);
     }
   },
+  invokedynamic: async (frame, instruction, jvm, thread) => {
+    console.log("invokedynamic instruction recognized, but not yet implemented.");
+    // For now, we do nothing. In the future, this will involve bootstrap methods.
+    // To prevent the JVM from stalling, we need to handle stack changes.
+    // The invokedynamic instruction consumes arguments from the stack and pushes a result.
+    // Since we don't know the method signature yet, we can't do this accurately.
+    // This is a temporary measure to allow the JVM to continue for simple cases.
+  },
 };
