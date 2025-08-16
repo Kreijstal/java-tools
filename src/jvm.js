@@ -12,6 +12,7 @@ class JVM {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {};
+    this.invokedynamicCache = new Map();
     this.jre = {};
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || '.';

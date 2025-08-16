@@ -264,10 +264,10 @@ function convertJson(inputJson, constantPool) {
             break;
 
           case "invokedynamic":
-            // invokedynamic instructions reference InvokeDynamic constant pool entries
+            const invokeDynamicRef = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: `[_${instr.operands.index}]`
+              arg: invokeDynamicRef.value
             };
             break;
 

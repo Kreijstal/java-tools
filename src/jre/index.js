@@ -14,8 +14,10 @@ const handleIllegalArgumentException = require('./java/lang/IllegalArgumentExcep
 const handleThread = require('./java/lang/Thread');
 const handleNoSuchMethodException = require('./java/lang/NoSuchMethodException');
 const handleLinkedList = require('./java/util/LinkedList');
+const handleLambdaMetafactory = require('./java/lang/invoke/LambdaMetafactory.js');
 
 const jreMethods = {
+  ...handleLambdaMetafactory,
   ...handleLinkedList,
   ...handleStringBuilder,
   ...handleIllegalArgumentException,
