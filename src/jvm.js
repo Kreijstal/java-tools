@@ -1,17 +1,19 @@
 const Stack = require('./stack');
-const { loadClass, loadClassByPath, loadClassByPathSync } = require('./classLoader');
+const { loadClassByPath, loadClassByPathSync: loadConvertedClass } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
-const { formatInstruction, unparseDataStructures } = require('./convert_tree');
+const { formatInstruction, unparseDataStructures, convertJson } = require('./convert_tree');
 const jreMethods = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
+const fs = require('fs');
+const { getAST } = require('jvm_parser');
 
 class JVM {
   constructor(options = {}) {
     this.threads = [];
     this.currentThreadIndex = 0;
-    this.classes = {};
+    this.classes = {}; // className -> { ast, constantPool }
     this.invokedynamicCache = new Map();
     this.jre = {};
     this.debugManager = new DebugManager();
@@ -35,11 +37,11 @@ class JVM {
       this.classpath = options.classpath;
     }
     const classData = await this.loadClassAsync(classFilePath, options);
-    if (!classData) {
+    if (!classData || !classData.ast) {
       throw new Error(`Class not found: ${classFilePath}`);
     }
 
-    const mainMethod = this.findMainMethod(classData);
+    const mainMethod = this.findMainMethod(classData.ast);
     if (!mainMethod) {
       console.error('main method not found');
       return;
@@ -113,14 +115,11 @@ class JVM {
       thread = this.threads[this.currentThreadIndex];
       if (this.currentThreadIndex === initialThreadIndex) {
         // We've looped through all threads and none are runnable.
-        // If there are non-terminated threads, it's a deadlock.
         const nonTerminated = this.threads.filter(t => t.status !== 'terminated');
         if (nonTerminated.length > 0) {
-            // Deadlock or waiting for external event. For now, we just spin.
             await new Promise(resolve => setImmediate(resolve));
             return { completed: false };
         } else {
-            // All threads are terminated.
             return { completed: true };
         }
       }
@@ -164,7 +163,6 @@ class JVM {
       this.handleException(e, currentPc, thread);
     }
 
-    // Advance to next thread
     if (this.threads.length > 0) {
       this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
     }
@@ -172,7 +170,6 @@ class JVM {
     return { completed: false };
   }
 
-  // TODO: Make debugger thread-aware
   shouldPause(currentPc, frame) {
     return false;
   }
@@ -185,46 +182,19 @@ class JVM {
     await dispatch(frame, instruction, this, thread);
   }
 
-  loadClass(classFilePath, options = {}) {
-    // For backwards compatibility, try sync first
-    try {
-      const classData = loadClassByPathSync(classFilePath, options);
-      if (classData) {
-        this.classes[classData.classes[0].className] = classData;
-      }
-      return classData;
-    } catch (error) {
-      if (error.message.includes('Synchronous file operations not supported')) {
-        // This is a browser environment - return a rejected promise or throw error
-        // telling the caller to use loadClassAsync instead
-        throw new Error('Use loadClassAsync() for browser environments');
-      }
-      // Re-throw other errors
-      throw error;
-    }
+  loadClassByPathSync(classFilePath) {
+    const classFileContent = fs.readFileSync(classFilePath);
+    const rawAst = getAST(classFileContent);
+    const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+    return { ast: convertedAst, constantPool: rawAst.constantPool };
   }
 
   async loadClassAsync(classFilePath, options = {}) {
-    // Try async first, fall back to sync for backwards compatibility
-    try {
-      const classData = await loadClassByPath(classFilePath, options);
-      if (classData) {
-        this.classes[classData.classes[0].className] = classData;
-      }
-      return classData;
-    } catch (error) {
-      // If async fails and we have a sync provider, try sync method
-      try {
-        const classData = loadClassByPathSync(classFilePath, options);
-        if (classData) {
-          this.classes[classData.classes[0].className] = classData;
-        }
-        return classData;
-      } catch (syncError) {
-        // If both fail, throw the original async error
-        throw error;
-      }
+    const classData = this.loadClassByPathSync(classFilePath);
+    if (classData && classData.ast) {
+      this.classes[classData.ast.classes[0].className] = classData;
     }
+    return classData;
   }
 
   async loadClassByName(classNameWithSlashes) {
@@ -232,40 +202,12 @@ class JVM {
       return this.classes[classNameWithSlashes];
     }
 
-    if (classNameWithSlashes === 'java/lang/Object') {
-      const objectClassData = {
-        classes: [{
-          className: 'java/lang/Object',
-          superClassName: null,
-          items: [],
-          flags: ['public'],
-        }],
-      };
-      this.classes['java/lang/Object'] = objectClassData;
-      return objectClassData;
-    }
-
-    const classNameWithDots = classNameWithSlashes.replace(/\//g, '.');
-    const classData = await loadClass(classNameWithDots, this.classpath);
-    if (classData) {
-      this.classes[classData.classes[0].className] = classData;
+    const classFilePath = `sources/${classNameWithSlashes}.class`;
+    const classData = this.loadClassByPathSync(classFilePath);
+    if (classData && classData.ast) {
+        this.classes[classNameWithSlashes] = classData;
     }
     return classData;
-  }
-
-  loadClassSync(classFilePath, options = {}) {
-    try {
-      const classData = loadClassByPathSync(classFilePath, options);
-      if (classData) {
-        this.classes[classData.classes[0].className] = classData;
-      }
-      return classData;
-    } catch (error) {
-      // If sync fails, for browser environments, just return null 
-      // and let the caller handle the missing class
-      console.warn(`Could not load class ${classFilePath} synchronously:`, error.message);
-      return null;
-    }
   }
 
   findMainMethod(classData) {
@@ -313,7 +255,6 @@ class JVM {
 
     let pcToCheck = pc;
     if (pc === -1) {
-      // Unwinding from a called method. The pc is the one of the call site.
       const callerInstructionIndex = frame.pc - 1;
       if (callerInstructionIndex >= 0) {
         const instructionItem = frame.instructions[callerInstructionIndex];
@@ -345,7 +286,7 @@ class JVM {
     }
 
     callStack.pop();
-    this.handleException(exception, -1, thread); // PC is -1 for subsequent frames
+    this.handleException(exception, -1, thread);
   }
 
   serialize() {
@@ -361,10 +302,9 @@ class JVM {
   }
 
   findClassNameForMethod(method) {
-    // Helper method to find which class contains a given method
     for (const [className, classData] of Object.entries(this.classes)) {
-      if (classData && classData.classes && classData.classes[0]) {
-        const methods = classData.classes[0].items.filter(item => item.type === 'method');
+      if (classData && classData.ast && classData.ast.classes && classData.ast.classes[0]) {
+        const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
         if (methods.some(item => item.method === method)) {
           return className;
         }
@@ -374,13 +314,12 @@ class JVM {
   }
 
   findMethodByRef(methodRef) {
-    // Find method by class name, method name, and descriptor
     const classData = this.classes[methodRef.className];
-    if (!classData || !classData.classes || !classData.classes[0]) {
+    if (!classData || !classData.ast || !classData.ast.classes[0]) {
       return null;
     }
 
-    const methodItem = classData.classes[0].items.find(item => {
+    const methodItem = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
              item.method.name === methodRef.methodName &&
              item.method.descriptor === methodRef.methodDescriptor;
@@ -388,8 +327,6 @@ class JVM {
     
     return methodItem ? methodItem.method : null;
   }
-
-  // Thread-aware debugging and inspection methods
 
   enableDebugMode() { this.debugManager.enable(); }
   disableDebugMode() { this.debugManager.disable(); }
@@ -534,7 +471,6 @@ class JVM {
     return { type: objRef.type, fields: objRef.fields || {} };
   }
 
-  // Placeholders for now
   stepInto() {}
   stepOver() {}
   stepOut() {}
@@ -545,8 +481,8 @@ class JVM {
   _getValueDescription(value) { return ''; }
   getSourceLineMapping(pc, method) { return {}; }
   getSourceFileName(method) { return null; }
+
   getDisassemblyView() {
-    // Get current execution state
     const thread = this.threads[this.currentThreadIndex];
     if (!thread || thread.callStack.isEmpty()) {
       return { 
@@ -567,7 +503,6 @@ class JVM {
       };
     }
 
-    // Find the class that contains the current method
     const className = this.findClassNameForMethod(frame.method);
     if (!className) {
       return { 
@@ -578,8 +513,8 @@ class JVM {
       };
     }
 
-    const classData = this.classes[className];
-    if (!classData) {
+    const workspaceEntry = this.classes[className];
+    if (!workspaceEntry) {
       return { 
         formattedDisassembly: '// Class data not available',
         lineToPcMap: {},
@@ -589,7 +524,6 @@ class JVM {
     }
 
     try {
-      // Get current PC
       let currentPc = -1;
       if (frame.pc < frame.instructions.length) {
         const instructionItem = frame.instructions[frame.pc];
@@ -597,13 +531,10 @@ class JVM {
         currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       }
 
-      // Generate disassembly using the same method as getClassDisassembly
-      const disassembly = unparseDataStructures(classData.classes[0]);
+      const disassembly = unparseDataStructures(workspaceEntry.ast.classes[0], workspaceEntry.constantPool);
       
-      // Format the disassembly with debug information
       const formattedDisassembly = this._formatDisassemblyForDebugView(disassembly, currentPc, className);
       
-      // Create line to PC mapping for breakpoint support
       const lineToPcMap = this._createLineToPcMap(disassembly, currentPc);
       
       return {
@@ -623,28 +554,19 @@ class JVM {
   }
 
   _formatDisassemblyForDebugView(disassembly, currentPc, className) {
-    // Format disassembly with debug header and current execution indicator
-    const header = `8. Disassembly View
-=====================================
-File: ${className}.class
-Current PC: ${currentPc}
-
-`;
+    const header = `8. Disassembly View\n=====================================\nFile: ${className}.class\nCurrent PC: ${currentPc}\n\n`;
     
     const lines = disassembly.split('\n');
     const formattedLines = [];
     let lineNumber = 1;
     
     for (const line of lines) {
-      // Check if this line contains a PC marker that matches the current PC
       const pcMatch = line.match(/L(\d+):/);
       const linePc = pcMatch ? parseInt(pcMatch[1]) : -1;
       
       if (linePc === currentPc) {
-        // Mark current execution line with arrow
         formattedLines.push(`=>  ${lineNumber.toString().padStart(3)}  ${line}`);
       } else {
-        // Regular line with line number
         formattedLines.push(`    ${lineNumber.toString().padStart(3)}  ${line}`);
       }
       lineNumber++;
@@ -656,17 +578,15 @@ Current PC: ${currentPc}
   }
 
   _createLineToPcMap(disassembly, currentPc) {
-    // Create mapping from display line numbers to PC values for breakpoint support
     const lineToPcMap = {};
     const lines = disassembly.split('\n');
     
-    for (let i = 0; i < lines.length; i++) {
+    for (let i = 0; i < lines.length; i) {
       const line = lines[i];
       const pcMatch = line.match(/L(\d+):/);
       if (pcMatch) {
         const pc = parseInt(pcMatch[1]);
-        // The display line number will be i + 6 (accounting for header lines)
-        const displayLineNumber = i + 5; // 5 header lines before content starts
+        const displayLineNumber = i + 5;
         lineToPcMap[displayLineNumber] = pc;
       }
     }

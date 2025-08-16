@@ -107,12 +107,13 @@ async function invokestatic(frame, instruction, jvm, thread) {
     return;
   }
 
-  let classData = jvm.classes[className];
-  if (!classData) {
+  let workspaceEntry = jvm.classes[className];
+  if (!workspaceEntry) {
     const newClassPath = path.join(jvm.classpath, `${className}.class`);
-    classData = jvm.loadClassSync(newClassPath, { silent: true });
+    workspaceEntry = jvm.loadClassByPathSync(newClassPath);
+    jvm.classes[className] = workspaceEntry;
   }
-  const method = jvm.findMethod(classData, methodName, descriptor);
+  const method = jvm.findMethod(workspaceEntry.ast, methodName, descriptor);
   if (method) {
     const newFrame = new Frame(method);
     const { params } = parseDescriptor(descriptor);
@@ -141,17 +142,17 @@ async function invokespecial(frame, instruction, jvm, thread) {
   }
 
   // For user-defined methods (constructors, private methods, super calls)
-  const classData = jvm.classes[className];
-  if (!classData) {
+    let workspaceEntry = jvm.classes[className];
+    if (!workspaceEntry) {
       // If class is not loaded, loading it.
-      const loadedClassData = await jvm.loadClassByName(className);
-      if (!loadedClassData) {
+        workspaceEntry = await jvm.loadClassByName(className);
+        if (!workspaceEntry) {
         console.error(`Class not found for invokespecial: ${className}`);
         return;
       }
   }
 
-  const method = jvm.findMethod(jvm.classes[className], methodName, descriptor);
+    const method = jvm.findMethod(workspaceEntry.ast, methodName, descriptor);
   if (method) {
       const newFrame = new Frame(method);
       let localIndex = 0;
