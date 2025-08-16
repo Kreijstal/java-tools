@@ -270,7 +270,7 @@ async function invokedynamic(frame, instruction, jvm, thread) {
     };
 
     // Push arguments for the concat helper
-    const recipe = targetMethodHandle.bound;
+    const recipe = bsm.arguments[0].value;
     frame.stack.push(recipe);
     frame.stack.push(dynamicArgs);
 
