@@ -7,6 +7,7 @@ const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
 const fs = require('fs');
+const path = require('path');
 const { getAST } = require('jvm_parser');
 
 class JVM {
@@ -22,6 +23,36 @@ class JVM {
     this.nextHashCode = 1;
 
     this._jreMethods = jreMethods;
+    this._preloadJreClasses();
+  }
+
+  _preloadJreClasses() {
+    const jrePath = path.join(__dirname, 'jre');
+    const walk = (dir, prefix) => {
+      const files = fs.readdirSync(dir);
+      for (const file of files) {
+        const fullPath = path.join(dir, file);
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          walk(fullPath, `${prefix}${file}/`);
+        } else if (file.endsWith('.js')) {
+          const className = `${prefix}${file.slice(0, -3)}`;
+          const classStub = {
+            ast: {
+              classes: [{
+                className: className,
+                superClassName: className === 'java/lang/Object' ? null : 'java/lang/Object',
+                items: [],
+                flags: ['public']
+              }]
+            },
+            constantPool: []
+          };
+          this.classes[className] = classStub;
+        }
+      }
+    };
+    walk(jrePath, '');
   }
 
   internString(str) {
@@ -41,7 +72,7 @@ class JVM {
       throw new Error(`Class not found: ${classFilePath}`);
     }
 
-    const mainMethod = this.findMainMethod(classData.ast);
+    const mainMethod = this.findMainMethod(classData);
     if (!mainMethod) {
       console.error('main method not found');
       return;
@@ -202,7 +233,7 @@ class JVM {
       return this.classes[classNameWithSlashes];
     }
 
-    const classFilePath = `sources/${classNameWithSlashes}.class`;
+    const classFilePath = path.join(this.classpath, `${classNameWithSlashes}.class`);
     const classData = this.loadClassByPathSync(classFilePath);
     if (classData && classData.ast) {
         this.classes[classNameWithSlashes] = classData;
@@ -211,7 +242,7 @@ class JVM {
   }
 
   findMainMethod(classData) {
-    const mainMethod = classData.classes[0].items.find(item => {
+    const mainMethod = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
              item.method.name === 'main' &&
              item.method.descriptor === '([Ljava/lang/String;)V';
@@ -220,7 +251,7 @@ class JVM {
   }
 
   findMethod(classData, methodName, descriptor) {
-    const method = classData.classes[0].items.find(item => {
+    const method = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
              item.method.name === methodName &&
              item.method.descriptor === descriptor;
@@ -240,7 +271,7 @@ class JVM {
       } else {
         return null;
       }
-      currentClassName = classData.classes[0].superClassName;
+      currentClassName = classData.ast.classes[0].superClassName;
     }
     return null;
   }

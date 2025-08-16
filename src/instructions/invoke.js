@@ -109,11 +109,9 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
   let workspaceEntry = jvm.classes[className];
   if (!workspaceEntry) {
-    const newClassPath = path.join(jvm.classpath, `${className}.class`);
-    workspaceEntry = jvm.loadClassByPathSync(newClassPath);
-    jvm.classes[className] = workspaceEntry;
+    workspaceEntry = await jvm.loadClassByName(className);
   }
-  const method = jvm.findMethod(workspaceEntry.ast, methodName, descriptor);
+  const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
     const newFrame = new Frame(method);
     const { params } = parseDescriptor(descriptor);
@@ -152,7 +150,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
       }
   }
 
-    const method = jvm.findMethod(workspaceEntry.ast, methodName, descriptor);
+    const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
       const newFrame = new Frame(method);
       let localIndex = 0;
@@ -192,7 +190,7 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 
   // 2. Get the bootstrap method from the class's attribute
   const classData = jvm.classes[className];
-  const bsm = classData.classes[0].bootstrapMethods[bsmAttrIndex];
+  const bsm = classData.ast.classes[0].bootstrapMethods[bsmAttrIndex];
 
   // 3. Prepare arguments for the bootstrap method call
   const lookup = new Lookup();
