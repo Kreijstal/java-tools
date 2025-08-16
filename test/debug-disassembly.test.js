@@ -1,7 +1,8 @@
 const test = require('tape');
 const DebugController = require('../src/debugController');
+const { setFileProvider } = require('../src/classLoader');
 
-test('DebugController getDisassemblyView functionality', async (t) => {
+test('DebugController getDisassemblyView initial state', async (t) => {
     const debugController = new DebugController();
     
     // Test initial state (no class loaded)
@@ -11,6 +12,12 @@ test('DebugController getDisassemblyView functionality', async (t) => {
     t.deepEqual(initialView.lineToPcMap, {}, 'Initial lineToPcMap should be empty');
     t.equal(initialView.classFile, null, 'Initial classFile should be null');
     t.equal(initialView.currentPc, -1, 'Initial currentPc should be -1');
+    t.end();
+});
+
+test('DebugController getDisassemblyView with loaded class', async (t) => {
+    setFileProvider(null); // Reset global state before this test
+    const debugController = new DebugController();
     
     // Test with a loaded class
     try {
