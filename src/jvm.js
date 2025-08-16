@@ -98,11 +98,31 @@ class JVM {
       return { completed: true };
     }
 
-    const thread = this.threads[this.currentThreadIndex];
+    let thread = this.threads[this.currentThreadIndex];
 
-    if (!thread || thread.status !== 'runnable') {
+    // Find the next runnable thread
+    let initialThreadIndex = this.currentThreadIndex;
+    while (thread.status !== 'runnable') {
+      if (thread.status === 'SLEEPING' && Date.now() >= thread.sleepUntil) {
+        thread.status = 'runnable';
+        delete thread.sleepUntil;
+        break;
+      }
       this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
-      return { completed: false };
+      thread = this.threads[this.currentThreadIndex];
+      if (this.currentThreadIndex === initialThreadIndex) {
+        // We've looped through all threads and none are runnable.
+        // If there are non-terminated threads, it's a deadlock.
+        const nonTerminated = this.threads.filter(t => t.status !== 'terminated');
+        if (nonTerminated.length > 0) {
+            // Deadlock or waiting for external event. For now, we just spin.
+            await new Promise(resolve => setImmediate(resolve));
+            return { completed: false };
+        } else {
+            // All threads are terminated.
+            return { completed: true };
+        }
+      }
     }
 
     const callStack = thread.callStack;

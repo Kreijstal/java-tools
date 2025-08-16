@@ -13,8 +13,10 @@ const handleStringBuilder = require('./java/lang/StringBuilder');
 const handleIllegalArgumentException = require('./java/lang/IllegalArgumentException');
 const handleThread = require('./java/lang/Thread');
 const handleNoSuchMethodException = require('./java/lang/NoSuchMethodException');
+const handleLinkedList = require('./java/util/LinkedList');
 
 const jreMethods = {
+  ...handleLinkedList,
   ...handleStringBuilder,
   ...handleIllegalArgumentException,
   ...handleNoSuchMethodException,

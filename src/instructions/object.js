@@ -23,8 +23,44 @@ module.exports = {
       }
     }
 
-    const objRef = { type: className, fields, hashCode: jvm.nextHashCode++ };
+    const objRef = {
+      type: className,
+      fields,
+      hashCode: jvm.nextHashCode++,
+      lockOwner: null,
+      lockCount: 0,
+      waitSet: [],
+    };
     frame.stack.push(objRef);
+  },
+
+  monitorenter: (frame, instruction, jvm, thread) => {
+    const objRef = frame.stack.pop();
+    if (objRef.lockOwner === null) {
+      objRef.lockOwner = thread.id;
+      objRef.lockCount = 1;
+    } else if (objRef.lockOwner === thread.id) {
+      objRef.lockCount++;
+    } else {
+      thread.status = 'BLOCKED';
+      // ugly spin lock for now
+      setImmediate(() => {
+        thread.status = 'RUNNABLE';
+      });
+      frame.pc--; // retry instruction
+    }
+  },
+
+  monitorexit: (frame, instruction, jvm, thread) => {
+    const objRef = frame.stack.pop();
+    if (objRef.lockOwner === thread.id) {
+      objRef.lockCount--;
+      if (objRef.lockCount === 0) {
+        objRef.lockOwner = null;
+      }
+    } else {
+      // This should throw IllegalMonitorStateException
+    }
   },
 
   getfield: (frame, instruction, jvm) => {
