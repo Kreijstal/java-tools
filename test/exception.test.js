@@ -8,9 +8,16 @@ test('JVM should handle exceptions', async function(t) {
   const jvm = new JVM();
   const classFilePath = path.join(__dirname, '..', 'sources', 'ExceptionTest.class');
 
-  // TODO: Capture output
+  let output = '';
+  jvm.registerJreMethods({
+    'java/io/PrintStream': {
+      'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+        output += args[0];
+      },
+    },
+  });
+
   await jvm.run(classFilePath);
 
-  // t.equal(output, 'Caught exception', 'The JVM should correctly handle the exception');
-  t.pass('Test temporarily disabled until output capturing is fixed');
+  t.equal(output, 'Caught exception', 'The JVM should correctly handle the exception');
 });

@@ -247,9 +247,9 @@ class KrakatauWorkspace {
     if (!this.referenceObj[cls.className]) {
       this.referenceObj[cls.className] = { children: new Map(), referees: [] };
     }
-    this.referenceObj[cls.className].referees.push({ 
-      className: cls.className, 
-      astPath: `classes.${classIndex}` 
+        this.referenceObj[cls.className].referees.push({
+          className: cls.className,
+          astPath: `ast.classes.${classIndex}`
     });
 
     cls.items.forEach((item, itemIndex) => {
@@ -264,8 +264,8 @@ class KrakatauWorkspace {
           });
         }
         this.referenceObj[cls.className].children.get(methodName).referees.push({
-          className: cls.className, 
-          astPath: `classes.${classIndex}.items.${itemIndex}.method` 
+          className: cls.className,
+          astPath: `ast.classes.${classIndex}.items.${itemIndex}.method`
         });
 
         item.method.attributes.forEach((attr, attrIndex) => {
@@ -293,7 +293,7 @@ class KrakatauWorkspace {
                     // Store the reference with the className context (where the reference occurs)
                     targetRef.referees.push({ 
                       className: cls.className, // This is the class making the reference
-                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}` 
+                      astPath: `ast.classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
                     });
                   }
                 }

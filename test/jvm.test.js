@@ -8,9 +8,16 @@ test('JVM should execute Hello.class and print "Hello, World!"', async function(
   const jvm = new JVM();
   const classFilePath = path.join(__dirname, '..', 'sources', 'Hello.class');
 
-  // TODO: Capture output
+  let output = '';
+  jvm.registerJreMethods({
+    'java/io/PrintStream': {
+      'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+        output += args[0];
+      },
+    },
+  });
+
   await jvm.run(classFilePath);
 
-  // t.equal(output, 'Hello, World!', 'The JVM should correctly print "Hello, World!"');
-  t.pass('Test temporarily disabled');
+  t.equal(output, 'Hello, World!', 'The JVM should correctly print "Hello, World!"');
 });

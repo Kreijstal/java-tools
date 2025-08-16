@@ -8,9 +8,16 @@ test('JVM should execute CalcMain.class and print "4"', async function(t) {
   const jvm = new JVM({ classpath: 'sources' });
   const classFilePath = path.join(__dirname, '..', 'sources', 'CalcMain.class');
 
-  // TODO: Capture output
+  let output = '';
+  jvm.registerJreMethods({
+    'java/io/PrintStream': {
+      'println(I)V': (jvm, obj, args) => {
+        output += args[0];
+      },
+    },
+  });
+
   await jvm.run(classFilePath);
 
-  // t.equal(output, '4', 'The JVM should correctly print "4"');
-  t.pass('Test temporarily disabled until output capturing is fixed');
+  t.equal(output, '4', 'The JVM should correctly print "4"');
 });
