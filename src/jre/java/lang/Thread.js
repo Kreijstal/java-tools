@@ -3,8 +3,33 @@ module.exports = {
     obj.hashCode = jvm.nextHashCode++;
     delete obj.isUninitialized;
   },
+  'java/lang/Thread.<init>(Ljava/lang/Runnable;)V': (jvm, obj, args) => {
+    obj.hashCode = jvm.nextHashCode++;
+    obj.runnable = args[0];
+    delete obj.isUninitialized;
+  },
   'java/lang/Thread.start()V': (jvm, obj, args) => {
     // The logic for starting a new thread is handled in invokevirtual
     // instruction. This is just a placeholder.
+  },
+  'java/lang/Thread.join()V': (jvm, obj, args, thread) => {
+    const threadToJoin = obj.nativeThread;
+    if (!threadToJoin || threadToJoin.status === 'terminated') {
+      return;
+    }
+
+    thread.status = 'BLOCKED';
+
+    const interval = setInterval(() => {
+      if (threadToJoin.status === 'terminated') {
+        thread.status = 'RUNNABLE';
+        clearInterval(interval);
+      }
+    }, 100);
+  },
+  'java/lang/Thread.sleep(J)V': (jvm, obj, args, thread) => {
+    const time = args[0];
+    thread.status = 'SLEEPING';
+    thread.sleepUntil = Date.now() + time;
   },
 };

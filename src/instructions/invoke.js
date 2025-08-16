@@ -38,21 +38,23 @@ module.exports = {
     } else if (methodName === 'start' && descriptor === '()V') {
       // Handle Thread.start()
       const threadObject = obj;
-      const threadClassName = threadObject.type;
+      const target = threadObject.runnable || threadObject;
+      const targetClassName = target.type;
 
-      const runMethod = jvm.findMethodInHierarchy(threadClassName, 'run', '()V');
+      const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
       if (runMethod) {
         const newThread = {
           id: jvm.threads.length,
           callStack: new Stack(),
           status: 'runnable',
         };
+        threadObject.nativeThread = newThread;
         const newFrame = new Frame(runMethod);
-        newFrame.locals[0] = threadObject; // 'this'
+        newFrame.locals[0] = target; // 'this'
         newThread.callStack.push(newFrame);
         jvm.threads.push(newThread);
       } else {
-        console.error(`Could not find run() method on ${threadClassName}`);
+        console.error(`Could not find run() method on ${targetClassName}`);
       }
       return;
     } else {
@@ -60,7 +62,7 @@ module.exports = {
       const jreMethod = jvm._jreMethods[methodKey];
 
       if (jreMethod) {
-        let result = await jreMethod(jvm, obj, args);
+        let result = await jreMethod(jvm, obj, args, thread);
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V') {
           if (typeof result === 'boolean') {
@@ -70,7 +72,7 @@ module.exports = {
         }
       } else {
         // This is for user-defined instance methods.
-        const method = jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
+        const method = await jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
         if (method) {
           const newFrame = new Frame(method);
           newFrame.locals[0] = obj; // 'this'
@@ -96,7 +98,7 @@ module.exports = {
       for (let i = 0; i < params.length; i++) {
         args.unshift(frame.stack.pop());
       }
-      const result = await jreMethod(jvm, null, args);
+      const result = await jreMethod(jvm, null, args, thread);
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== 'V') {
         frame.stack.push(result);
