@@ -9,12 +9,11 @@ module.exports = {
       return jvm.internString(methodName);
     },
     'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
-    console.log('Inside Method.js JRE handler for Method.invoke');
+    const methodData = methodObj._methodData;
+    const { name, descriptor, flags } = methodData;
     const obj = args[0];
     const methodArgs = args[1];
 
-    const methodData = methodObj._methodData;
-    const { name, descriptor, flags } = methodData;
     const isStatic = flags.includes('static');
 
     const className = methodObj._declaringClass._classData.ast.classes[0].className;
@@ -37,7 +36,7 @@ module.exports = {
       return new Promise((resolve) => {
           thread.isAwaitingReflectiveCall = true;
           thread.reflectiveCallResolver = (ret) => {
-              console.log('Executing reflectiveCallResolver in Method.js, ret:', ret);
+              require('fs').appendFileSync('/tmp/debug.log', `Method ${name} returned: ${JSON.stringify(ret)}\n`);
               resolve(ret);
           };
           thread.callStack.push(newFrame);

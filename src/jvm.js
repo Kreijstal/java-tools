@@ -103,6 +103,20 @@ class JVM {
     this.testOutputCallback = callback;
   }
 
+  registerJreMethods(methods) {
+    for (const className in methods) {
+      if (!this.jre[className]) {
+        this.jre[className] = { methods: {} };
+      }
+      if (!this.jre[className].methods) {
+        this.jre[className].methods = {};
+      }
+      for (const methodSig in methods[className]) {
+        this.jre[className].methods[methodSig] = methods[className][methodSig];
+      }
+    }
+  }
+
   _jreFindMethod(className, methodName, descriptor) {
     let currentClass = this.jre[className];
     while (currentClass) {
