@@ -1,13 +1,13 @@
 module.exports = {
   'java/lang/Class.getName()Ljava/lang/String;': (jvm, classObj, args) => {
     const classData = classObj._classData;
-    const className = classData.classes[0].className.replace(/\//g, '.');
+    const className = classData.ast.classes[0].className.replace(/\//g, '.');
     return jvm.internString(className);
   },
 
   'java/lang/Class.getSuperclass()Ljava/lang/Class;': async (jvm, classObj, args) => {
     const classData = classObj._classData;
-    const superClassName = classData.classes[0].superClass;
+    const superClassName = classData.ast.classes[0].superClassName;
     if (!superClassName) {
       return null;
     }
@@ -23,7 +23,7 @@ module.exports = {
 
   'java/lang/Class.isInterface()Z': (jvm, classObj, args) => {
     const classData = classObj._classData;
-    return classData.classes[0].flags.includes('interface');
+    return classData.ast.classes[0].flags.includes('interface');
   },
 
   'java/lang/Class.getMethods()[Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
@@ -31,11 +31,11 @@ module.exports = {
 
     const getMethodsRecursive = (currentClassObj) => {
       const classData = currentClassObj._classData;
-      if (!classData) {
+      if (!classData || !classData.ast) {
         return;
       }
 
-      classData.classes[0].items
+      classData.ast.classes[0].items
         .filter(item => item.type === 'method' && item.method.flags.includes('public'))
         .forEach(methodItem => {
           const key = methodItem.method.name + methodItem.method.descriptor;
@@ -48,7 +48,7 @@ module.exports = {
           }
         });
 
-      const superClassName = classData.classes[0].superClassName;
+      const superClassName = classData.ast.classes[0].superClassName;
       if (superClassName) {
         const superClassData = jvm.classes[superClassName];
         if (superClassData && superClassName !== 'java/lang/Object') {
@@ -67,7 +67,7 @@ module.exports = {
                     allMethods[key] = {
                         type: 'java/lang/reflect/Method',
                         _methodData: { name, descriptor, flags: ['public'], attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
-                        _declaringClass: { type: 'java/lang/Class', _classData: null /* object class data */ },
+                        _declaringClass: { type: 'java/lang/Class', _classData: jvm.classes['java/lang/Object'] },
                     };
                 }
             });
@@ -84,11 +84,11 @@ module.exports = {
     const paramTypes = args[1]; // array of class objects
 
     const classData = classObj._classData;
-    const methods = classData.classes[0].items.filter(item => item.type === 'method');
+    const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
 
     const getDescriptor = (paramClass) => {
       if (!paramClass) return '';
-      const paramClassName = paramClass._classData.classes[0].className;
+      const paramClassName = paramClass._classData.ast.classes[0].className;
       // Basic type mapping, can be extended
       switch (paramClassName) {
         case 'int': return 'I';
