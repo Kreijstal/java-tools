@@ -30,36 +30,47 @@ module.exports = {
       lockOwner: null,
       lockCount: 0,
       waitSet: [],
+      monitorQueue: [],
     };
     frame.stack.push(objRef);
   },
 
   monitorenter: (frame, instruction, jvm, thread) => {
-    const objRef = frame.stack.pop();
+    const objRef = frame.stack.peek();
     if (objRef.lockOwner === null) {
       objRef.lockOwner = thread.id;
-      objRef.lockCount = 1;
+      objRef.lockCount = thread.savedLockCount || 1;
+      delete thread.savedLockCount;
+      frame.stack.pop(); // Pop only on success
     } else if (objRef.lockOwner === thread.id) {
       objRef.lockCount++;
+      frame.stack.pop(); // Pop only on success
     } else {
+      // Thread needs to wait for the lock
+      if (!objRef.monitorQueue.includes(thread)) {
+        objRef.monitorQueue.push(thread);
+      }
       thread.status = 'BLOCKED';
-      // ugly spin lock for now
-      setImmediate(() => {
-        thread.status = 'RUNNABLE';
-      });
       frame.pc--; // retry instruction
     }
   },
 
   monitorexit: (frame, instruction, jvm, thread) => {
     const objRef = frame.stack.pop();
-    if (objRef.lockOwner === thread.id) {
-      objRef.lockCount--;
-      if (objRef.lockCount === 0) {
-        objRef.lockOwner = null;
-      }
-    } else {
+    if (objRef.lockOwner !== thread.id) {
       // This should throw IllegalMonitorStateException
+      console.error("IllegalMonitorStateException: thread does not own the monitor");
+      return;
+    }
+
+    objRef.lockCount--;
+    if (objRef.lockCount === 0) {
+      objRef.lockOwner = null;
+      // Wake up a thread waiting to enter the monitor
+      const nextThread = objRef.monitorQueue.shift();
+      if (nextThread) {
+        nextThread.status = 'RUNNABLE';
+      }
     }
   },
 
