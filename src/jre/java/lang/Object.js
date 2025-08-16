@@ -22,4 +22,37 @@ module.exports = {
     const hashCode = obj.hashCode.toString(16);
     return jvm.internString(`${className}@${hashCode}`);
   },
+
+  'java/lang/Object.wait()V': (jvm, obj, args, thread) => {
+    if (obj.lockOwner !== thread.id) {
+      // This should throw IllegalMonitorStateException
+      return;
+    }
+    obj.waitSet.push(thread);
+    thread.status = 'WAITING';
+    obj.lockOwner = null;
+    obj.lockCount = 0;
+  },
+
+  'java/lang/Object.notify()V': (jvm, obj, args, thread) => {
+    if (obj.lockOwner !== thread.id) {
+      // This should throw IllegalMonitorStateException
+      return;
+    }
+    const waitingThread = obj.waitSet.shift();
+    if (waitingThread) {
+      waitingThread.status = 'RUNNABLE';
+    }
+  },
+
+  'java/lang/Object.notifyAll()V': (jvm, obj, args, thread) => {
+    if (obj.lockOwner !== thread.id) {
+      // This should throw IllegalMonitorStateException
+      return;
+    }
+    for (const waitingThread of obj.waitSet) {
+      waitingThread.status = 'RUNNABLE';
+    }
+    obj.waitSet = [];
+  },
 };
