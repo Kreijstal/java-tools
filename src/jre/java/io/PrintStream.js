@@ -3,7 +3,8 @@ module.exports = {
   staticFields: {},
   methods: {
     'println(Ljava/lang/String;)V': (jvm, obj, args) => {
-      const output = args[0] + '\n';
+      const stringObj = args[0];
+      const output = stringObj.value + '\n';
       if (jvm.testOutputCallback) {
         jvm.testOutputCallback(output);
       } else {

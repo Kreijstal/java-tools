@@ -96,7 +96,7 @@ class JVM {
   }
 
   internString(str) {
-    return str;
+    return { type: 'java/lang/String', value: str };
   }
 
   _setTestOutputCallback(callback) {
