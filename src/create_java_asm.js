@@ -23,7 +23,7 @@ function parseClassFile(classFilePath) {
   
   // Convert to structured format and then to assembly syntax
   const convertedAst = convertJson(ast.ast, ast.constantPool);
-  const asmSyntax = unparseDataStructures(convertedAst.classes[0]);
+  const asmSyntax = unparseDataStructures(convertedAst.classes[0], ast.constantPool);
   
   return asmSyntax;
 }
