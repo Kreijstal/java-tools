@@ -1,5 +1,5 @@
 const Stack = require('./stack');
-const { loadClassByPath, loadClassByPathSync: loadConvertedClass } = require('./classLoader');
+const { loadClassByPath, loadClassByPathSync: loadConvertedClass, getFileProvider } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures, convertJson } = require('./convert_tree');
 const jreClasses = require('./jre');
@@ -65,34 +65,76 @@ class JVM {
     }
 
     // Add other JRE classes that extend Object directly
-    const jrePath = path.join(__dirname, 'jre');
-    const walk = (dir, prefix) => {
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        const fullPath = path.join(dir, file);
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          walk(fullPath, `${prefix}${file}/`);
-        } else if (file.endsWith('.js')) {
-          const className = `${prefix}${file.slice(0, -3)}`;
-          if (!this.classes[className]) {
-            const classStub = {
-              ast: {
-                classes: [{
-                  className: className,
-                  superClassName: 'java/lang/Object',
-                  items: [],
-                  flags: ['public']
-                }]
-              },
-              constantPool: []
-            };
-            this.classes[className] = classStub;
-          }
+    // Use browser-compatible JRE class loading
+    this._loadJreClasses();
+  }
+
+  _loadJreClasses() {
+    // Check if we're in a browser or Node.js environment
+    const isBrowser = (typeof window !== 'undefined' && typeof fs === 'undefined') || 
+                     (typeof fs === 'object' && !fs.readdirSync);
+
+    if (isBrowser) {
+      // Browser environment - use hardcoded list of JRE classes
+      const jreClasses = [
+        'java/lang/Object',
+        'java/lang/String', 
+        'java/lang/StringBuilder',
+        'java/lang/Class',
+        'java/lang/NoSuchMethodException',
+        'java/lang/reflect/Method',
+        'java/net/URL',
+        'java/net/URLConnection', 
+        'java/net/HttpURLConnection'
+      ];
+
+      for (const className of jreClasses) {
+        if (!this.classes[className]) {
+          const classStub = {
+            ast: {
+              classes: [{
+                className: className,
+                superClassName: 'java/lang/Object',
+                items: [],
+                flags: ['public']
+              }]
+            },
+            constantPool: []
+          };
+          this.classes[className] = classStub;
         }
       }
-    };
-    walk(jrePath, '');
+    } else {
+      // Node.js environment - use filesystem walking
+      const jrePath = path.join(__dirname, 'jre');
+      const walk = (dir, prefix) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            walk(fullPath, `${prefix}${file}/`);
+          } else if (file.endsWith('.js')) {
+            const className = `${prefix}${file.slice(0, -3)}`;
+            if (!this.classes[className]) {
+              const classStub = {
+                ast: {
+                  classes: [{
+                    className: className,
+                    superClassName: 'java/lang/Object',
+                    items: [],
+                    flags: ['public']
+                  }]
+                },
+                constantPool: []
+              };
+              this.classes[className] = classStub;
+            }
+          }
+        }
+      };
+      walk(jrePath, '');
+    }
   }
 
   internString(str) {
@@ -300,10 +342,31 @@ class JVM {
   }
 
   loadClassByPathSync(classFilePath) {
-    const classFileContent = fs.readFileSync(classFilePath);
-    const rawAst = getAST(classFileContent);
-    const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
-    return { ast: convertedAst, constantPool: rawAst.constantPool };
+    const fileProvider = getFileProvider();
+    
+    // Check if we're in browser mode with BrowserFileProvider
+    if (fileProvider && fileProvider.existsSync && fileProvider.readFileSync) {
+      // Node.js mode with sync methods
+      const classFileContent = fileProvider.readFileSync(classFilePath);
+      const rawAst = getAST(classFileContent);
+      const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+      return { ast: convertedAst, constantPool: rawAst.constantPool };
+    } else if (fileProvider && fileProvider.virtualFS) {
+      // Browser mode with virtual file system
+      const classFileContent = fileProvider.virtualFS.get(classFilePath);
+      if (!classFileContent) {
+        throw new Error(`Class file not found in virtual file system: ${classFilePath}`);
+      }
+      const rawAst = getAST(classFileContent);
+      const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+      return { ast: convertedAst, constantPool: rawAst.constantPool };
+    } else {
+      // Fallback to filesystem (legacy Node.js mode)
+      const classFileContent = fs.readFileSync(classFilePath);
+      const rawAst = getAST(classFileContent);
+      const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+      return { ast: convertedAst, constantPool: rawAst.constantPool };
+    }
   }
 
   async loadClassAsync(classFilePath, options = {}) {
@@ -319,8 +382,21 @@ class JVM {
       return this.classes[classNameWithSlashes];
     }
 
-    const classFilePath = path.join(this.classpath, `${classNameWithSlashes}.class`);
-    const classData = this.loadClassByPathSync(classFilePath);
+    const fileProvider = getFileProvider();
+    let classData;
+    
+    if (fileProvider && fileProvider.virtualFS) {
+      // Browser mode - try to find class in virtual file system
+      const classFilePath = `${classNameWithSlashes}.class`;
+      if (fileProvider.virtualFS.has(classFilePath)) {
+        classData = this.loadClassByPathSync(classFilePath);
+      }
+    } else {
+      // Node.js mode
+      const classFilePath = path.join(this.classpath, `${classNameWithSlashes}.class`);
+      classData = this.loadClassByPathSync(classFilePath);
+    }
+    
     if (classData && classData.ast) {
         this.classes[classNameWithSlashes] = classData;
     }
