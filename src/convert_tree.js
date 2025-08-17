@@ -259,7 +259,8 @@ function convertJson(inputJson, constantPool) {
                   methodRef.value.nameAndType.name,
                   methodRef.value.nameAndType.descriptor
                 ]
-              ]
+              ],
+              cp_index: instr.operands.index
             };
             if (instr.opcodeName === "invokeinterface") {
               codeItem.instruction.count = instr.operands.count.toString();
@@ -270,7 +271,8 @@ function convertJson(inputJson, constantPool) {
             const invokeDynamicRef = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: invokeDynamicRef.value
+              arg: invokeDynamicRef.value,
+              cp_index: instr.operands.index
             };
             break;
 
@@ -570,7 +572,7 @@ function convertJson(inputJson, constantPool) {
  * @param {Object|String} instr - The instruction to format
  * @returns {String} Formatted instruction string
  */
-function formatInstruction(instr) {
+function formatInstruction(instr, withComments = false) {
   if (!instr) {
     return "null";
   }
@@ -585,6 +587,24 @@ function formatInstruction(instr) {
   } else if (instr.op === "iinc") {
     // Handle iinc instruction with arguments
     return `${instr.op} ${instr.varnum} ${instr.incr}`;
+  } else if (instr.op === "invokedynamic") {
+    if (withComments) {
+        const argStr = formatInstructionArg(instr.arg);
+        return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
+    }
+    return `${instr.op} [_${instr.cp_index}]`;
+  } else if (instr.op === "invokespecial" || instr.op === "invokevirtual" || instr.op === "invokestatic" || instr.op === "invokeinterface") {
+    const argStr = formatInstructionArg(instr.arg);
+    if (withComments) {
+      if (instr.op === "invokeinterface") {
+          return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
+      }
+      return `${instr.op} ${argStr} ; [_${instr.cp_index}]`;
+    }
+    if (instr.op === "invokeinterface") {
+        return `${instr.op} ${argStr} ${instr.count}`;
+    }
+    return `${instr.op} ${argStr}`;
   } else if (instr.op !== undefined && instr.arg !== undefined) {
     const argStr = formatInstructionArg(instr.arg);
     if (instr.op === "invokeinterface" && instr.count !== undefined) {
@@ -626,7 +646,8 @@ function formatInstructionArg(arg) {
  * @param {Object} cls - The class object with methods, fields, flags, and other class metadata
  * @returns {String} Assembly-like representation of the class suitable for debugging/analysis
  */
-function unparseDataStructures(cls, constantPool) {
+function unparseDataStructures(cls, constantPool, options = {}) {
+  const { withComments = false } = options;
   function formatCodeAttribute(attr) {
     if (attr.type === "linenumbertable") {
       const lines = [
@@ -707,7 +728,7 @@ function unparseDataStructures(cls, constantPool) {
                   if (line.length > 0) {
                     line += "    ";
                   }
-                  line += formatInstruction(ci.instruction);
+                  line += formatInstruction(ci.instruction, withComments);
                 }
                 if (ci.type === "catch") {
                   line = `    .catch ${ci.clsref} from ${ci.fromLbl} to ${ci.toLbl} using ${ci.usingLbl}`;

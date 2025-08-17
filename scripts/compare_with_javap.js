@@ -108,6 +108,7 @@ async function compareWithJavap() {
 
   // Find the optional --with-javap flag
   const includeJavap = args.includes('--with-javap');
+  const withComments = args.includes('--with-comments');
   
   // The first argument that is not a flag is our classpath
   const sourcesDir = args.find(arg => !arg.startsWith('--'));
@@ -142,7 +143,7 @@ async function compareWithJavap() {
       // Get our parser output
       let ourOutput;
       try {
-        ourOutput = parseClassFile(classPath);
+        ourOutput = parseClassFile(classPath, { withComments });
       } catch (e) {
         console.error(`Error in parseClassFile for ${fileName}:`, e);
         continue;
@@ -187,9 +188,9 @@ async function compareWithJavap() {
       const mismatches = [];
       const minLen = Math.min(ourLines.length, krak2Lines.length);
       for (let i = 0; i < minLen && mismatches.length < 10; i++) {
-        // Compare ignoring multiple spaces
-        const normOur = ourLines[i].replace(/\s+/g,' ').trim();
-        const normK = krak2Lines[i].replace(/\s+/g,' ').trim();
+        // Compare ignoring multiple spaces and comments
+        const normOur = ourLines[i].replace(/;.*/, '').replace(/\s+/g,' ').trim();
+        const normK = krak2Lines[i].replace(/;.*/, '').replace(/\s+/g,' ').trim();
         if (normOur !== normK) {
           mismatches.push({ index: i, ours: ourLines[i], krak2: krak2Lines[i] });
         }

@@ -14,7 +14,7 @@ const { unparseDataStructures, convertJson } = require('./convert_tree');
  * @param {string} classFilePath - Path to the .class file to parse
  * @returns {string} Assembly-like representation of the class
  */
-function parseClassFile(classFilePath) {
+function parseClassFile(classFilePath, options = {}) {
   // Read the binary content of the class file
   const classFileContent = fs.readFileSync(classFilePath);
   
@@ -23,7 +23,7 @@ function parseClassFile(classFilePath) {
   
   // Convert to structured format and then to assembly syntax
   const convertedAst = convertJson(ast.ast, ast.constantPool);
-  const asmSyntax = unparseDataStructures(convertedAst.classes[0], ast.constantPool);
+  const asmSyntax = unparseDataStructures(convertedAst.classes[0], ast.constantPool, options);
   
   return asmSyntax;
 }
