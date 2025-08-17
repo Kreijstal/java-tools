@@ -2,8 +2,8 @@ const { JVM } = require('./jvm');
 const Frame = require('./frame');
 
 class DebugController {
-  constructor() {
-    this.jvm = new JVM();
+  constructor(options = {}) {
+    this.jvm = new JVM(options);
     this.executionState = 'stopped'; // stopped, running, paused
   }
 

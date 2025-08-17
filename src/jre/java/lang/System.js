@@ -1,3 +1,13 @@
-// No methods to handle for now.
-// System.in and System.out are static fields, which are not handled by the current JRE mechanism.
-module.exports = {};
+module.exports = {
+  super: 'java/lang/Object',
+  staticFields: {
+    'out:Ljava/io/PrintStream;': {
+      type: 'java/io/PrintStream',
+      // This is a simplified representation of the PrintStream object.
+      // In a real implementation, this would be a more complex object
+      // that is properly initialized.
+      _isJreObject: true,
+    },
+  },
+  methods: {},
+};

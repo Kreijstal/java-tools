@@ -4,7 +4,116 @@
  * @param {Array} constantPool - The constant pool entries from the class file
  * @returns {Object} A structured representation of the class with methods, fields, and metadata
  */
+function resolveConstant(index, constantPool) {
+  const entry = constantPool[index];
+  if (!entry) return { value: null, type: "unknown" };
+  switch (entry.tag) {
+    case 1: // Utf8
+      return { value: entry.info.bytes, type: "Utf8" };
+    case 3: // Integer
+      return { value: entry.info.bytes | 0, type: "Integer" };
+    case 4: // Float
+      const floatView = new DataView(new ArrayBuffer(4));
+      floatView.setUint32(0, entry.info.bytes, false);
+      return { value: floatView.getFloat32(0, false), type: "Float" };
+    case 5: // Long
+      let longValue = (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
+      if (longValue >= (1n << 63n)) {
+        longValue -= (1n << 64n);
+      }
+      return {
+        value: longValue,
+        type: "Long"
+      };
+    case 6: // Double
+      const doubleHigh = BigInt(entry.info.high_bytes);
+      const doubleLow = BigInt(entry.info.low_bytes);
+      const doubleBits = (doubleHigh << 32n) | doubleLow;
+      const doubleView = new DataView(new ArrayBuffer(8));
+      doubleView.setBigUint64(0, doubleBits, false);
+      return {
+        value: doubleView.getFloat64(0, false),
+        type: "Double"
+      };
+    case 7: // Class
+      return {
+        value: resolveConstant(entry.info.name_index, constantPool).value,
+        type: "Class"
+      };
+    case 8: // String
+      return {
+        value: resolveConstant(entry.info.string_index, constantPool).value,
+        type: "String"
+      };
+    case 9: // Fieldref
+    case 10: // Methodref
+    case 11: // InterfaceMethodref
+      const className = resolveConstant(entry.info.class_index, constantPool).value;
+      const nameAndType = resolveConstant(
+        entry.info.name_and_type_index, constantPool
+      ).value;
+      return {
+        value: { className, nameAndType },
+        type:
+          entry.tag === 9
+            ? "Fieldref"
+            : entry.tag === 10
+            ? "Methodref"
+            : "InterfaceMethodref"
+      };
+    case 12: // NameAndType
+      const name = resolveConstant(entry.info.name_index, constantPool).value;
+      const descriptor = resolveConstant(entry.info.descriptor_index, constantPool).value;
+      return { value: { name, descriptor }, type: "NameAndType" };
+    case 15: // MethodHandle
+      const kindMap = {1: "getField", 2: "getStatic", 3: "putField", 4: "putStatic", 5: "invokeVirtual", 6: "invokeStatic", 7: "invokeSpecial", 8: "newInvokeSpecial", 9: "invokeInterface"};
+      const referenceKind = kindMap[entry.info.reference_kind];
+      const reference = resolveConstant(entry.info.reference_index, constantPool);
+      return { value: { kind: referenceKind, reference: reference.value }, type: "MethodHandle" };
+    case 16: // MethodType
+      const methodDescriptor = resolveConstant(entry.info.descriptor_index, constantPool).value;
+      return { value: methodDescriptor, type: "MethodType" };
+    case 18: // InvokeDynamic
+      const bootstrapMethodAttrIndex = entry.info.bootstrap_method_attr_index;
+      const nameAndTypeDynamic = resolveConstant(entry.info.name_and_type_index, constantPool).value;
+      return { value: { bootstrap_method_attr_index: bootstrapMethodAttrIndex, nameAndType: nameAndTypeDynamic}, type: "InvokeDynamic" };
+    default:
+      return { value: null, type: "unknown" };
+  }
+}
+
+function formatConst(entry, index, constantPool, cls) {
+  if (!entry) return "";
+  let line = `.const [_${index}] =`;
+
+  switch(entry.tag) {
+      case 18: // InvokeDynamic
+          if (!cls.bootstrapMethods) return "";
+          const bsmIndex = entry.info.bootstrap_method_attr_index;
+          const bsm = cls.bootstrapMethods[bsmIndex];
+          if (!bsm) return "";
+          const nameAndType = resolveConstant(entry.info.name_and_type_index, constantPool).value;
+
+          line += ` InvokeDynamic ${formatInstructionArg(bsm.method_ref.value.reference.nameAndType.name)} ${bsm.arguments.map(a => formatInstructionArg(a.value)).join(' ')} : ${nameAndType.name} ${nameAndType.descriptor}`;
+          break;
+      case 15: // MethodHandle
+          const methodHandle = resolveConstant(index, constantPool).value;
+          if (!methodHandle) return "";
+          const refConst = methodHandle.reference;
+          if (!refConst) return "";
+          line += ` MethodHandle ${methodHandle.kind} Method ${refConst.className.replace(/\./g, '/')} ${refConst.nameAndType.name} ${refConst.nameAndType.descriptor}`;
+          break;
+      default:
+          return "";
+  }
+  return line;
+}
+
+
 function convertJson(inputJson, constantPool) {
+  if (inputJson.classes) {
+    return inputJson;
+  }
   // Map accessFlags to flags based on context (class, method, or field)
   const accessFlagMap = {
     class: {
@@ -76,73 +185,6 @@ function convertJson(inputJson, constantPool) {
     return flags;
   }
 
-  // Helper function to resolve indices in the constant pool
-  function resolveConstant(index) {
-    const entry = constantPool[index];
-    if (!entry) return { value: null, type: "unknown" };
-    switch (entry.tag) {
-      case 1: // Utf8
-        return { value: entry.info.bytes, type: "Utf8" };
-      case 3: // Integer
-        return { value: entry.info.bytes | 0, type: "Integer" };
-      case 4: // Float
-        const floatView = new DataView(new ArrayBuffer(4));
-        floatView.setUint32(0, entry.info.bytes, false);
-        return { value: floatView.getFloat32(0, false), type: "Float" };
-      case 5: // Long
-        let longValue = (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
-        if (longValue >= (1n << 63n)) {
-          longValue -= (1n << 64n);
-        }
-        return {
-          value: longValue,
-          type: "Long"
-        };
-      case 6: // Double
-        const doubleHigh = BigInt(entry.info.high_bytes);
-        const doubleLow = BigInt(entry.info.low_bytes);
-        const doubleBits = (doubleHigh << 32n) | doubleLow;
-        const doubleView = new DataView(new ArrayBuffer(8));
-        doubleView.setBigUint64(0, doubleBits, false);
-        return {
-          value: doubleView.getFloat64(0, false),
-          type: "Double"
-        };
-      case 7: // Class
-        return {
-          value: resolveConstant(entry.info.name_index).value,
-          type: "Class"
-        };
-      case 8: // String
-        return {
-          value: resolveConstant(entry.info.string_index).value,
-          type: "String"
-        };
-      case 9: // Fieldref
-      case 10: // Methodref
-      case 11: // InterfaceMethodref
-        const className = resolveConstant(entry.info.class_index).value;
-        const nameAndType = resolveConstant(
-          entry.info.name_and_type_index
-        ).value;
-        return {
-          value: { className, nameAndType },
-          type:
-            entry.tag === 9
-              ? "Fieldref"
-              : entry.tag === 10
-              ? "Methodref"
-              : "InterfaceMethodref"
-        };
-      case 12: // NameAndType
-        const name = resolveConstant(entry.info.name_index).value;
-        const descriptor = resolveConstant(entry.info.descriptor_index).value;
-        return { value: { name, descriptor }, type: "NameAndType" };
-      default:
-        return { value: null, type: "unknown" };
-    }
-  }
-
   // Convert fields
   inputJson.fields.forEach((field) => {
     const fieldItem = {
@@ -205,7 +247,7 @@ function convertJson(inputJson, constantPool) {
           case "invokevirtual":
           case "invokestatic":
           case "invokeinterface":
-            const methodRef = resolveConstant(instr.operands.index);
+            const methodRef = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: [
@@ -225,10 +267,10 @@ function convertJson(inputJson, constantPool) {
             break;
 
           case "invokedynamic":
-            // invokedynamic instructions reference InvokeDynamic constant pool entries
+            const invokeDynamicRef = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: `[_${instr.operands.index}]`
+              arg: invokeDynamicRef.value
             };
             break;
 
@@ -236,7 +278,7 @@ function convertJson(inputJson, constantPool) {
           case "putfield":
           case "getstatic":
           case "putstatic":
-            const fieldRef = resolveConstant(instr.operands.index);
+            const fieldRef = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: [
@@ -253,7 +295,7 @@ function convertJson(inputJson, constantPool) {
           case "ldc":
           case "ldc_w":
           case "ldc2_w":
-            const ldcConstant = resolveConstant(instr.operands.index);
+            const ldcConstant = resolveConstant(instr.operands.index, constantPool);
             let arg;
             switch (ldcConstant.type) {
               case "Class":
@@ -323,7 +365,7 @@ function convertJson(inputJson, constantPool) {
           case "checkcast":
           case "instanceof":
           case "anewarray":
-            const classInfo = resolveConstant(instr.operands.index);
+            const classInfo = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: classInfo.value.replace(/\./g, "/")
@@ -348,7 +390,7 @@ function convertJson(inputJson, constantPool) {
             break;
 
           case "multianewarray":
-            const mclassInfo = resolveConstant(instr.operands.index);
+            const mclassInfo = resolveConstant(instr.operands.index, constantPool);
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: [mclassInfo.value.replace(/\./g, "/"), instr.operands.dimensions.toString()]
@@ -426,7 +468,7 @@ function convertJson(inputJson, constantPool) {
           const catchTypeIndex = ex.catch_type;
           const catchType = catchTypeIndex === 0
             ? "any"
-            : resolveConstant(catchTypeIndex).value.replace(/\./g, "/");
+            : resolveConstant(catchTypeIndex, constantPool).value.replace(/\./g, "/");
 
           return {
             start_pc: ex.start_pc,
@@ -441,7 +483,7 @@ function convertJson(inputJson, constantPool) {
       if (method.code.attributes) {
         method.code.attributes.forEach((attr) => {
           const attrName = resolveConstant(
-            attr.attribute_name_index.index
+            attr.attribute_name_index.index, constantPool
           ).value;
           if (attrName === "LineNumberTable") {
             const lineAttr = {
@@ -463,9 +505,9 @@ function convertJson(inputJson, constantPool) {
               vars: []
             };
             attr.info.local_variable_table.forEach((varInfo) => {
-              const varName = resolveConstant(varInfo.name_index).value;
+              const varName = resolveConstant(varInfo.name_index, constantPool).value;
               const varDescriptor = resolveConstant(
-                varInfo.descriptor_index
+                varInfo.descriptor_index, constantPool
               ).value;
               const varItem = {
                 index: varInfo.index.toString(),
@@ -506,6 +548,19 @@ function convertJson(inputJson, constantPool) {
       value: `"${inputJson.sourceFile}"`
     }
   });
+
+  const bootstrapMethodsAttr = inputJson.attributes.find(
+    (attr) => resolveConstant(attr.attribute_name_index.index, constantPool).value === "BootstrapMethods"
+  );
+
+  if (bootstrapMethodsAttr) {
+    outputJson.classes[0].bootstrapMethods = bootstrapMethodsAttr.info.bootstrap_methods.map((bsm) => {
+      return {
+        method_ref: resolveConstant(bsm.bootstrap_method_ref, constantPool),
+        arguments: bsm.bootstrap_arguments.map(argIndex => resolveConstant(argIndex, constantPool))
+      };
+    });
+  }
 
   return outputJson;
 }
@@ -571,7 +626,7 @@ function formatInstructionArg(arg) {
  * @param {Object} cls - The class object with methods, fields, flags, and other class metadata
  * @returns {String} Assembly-like representation of the class suitable for debugging/analysis
  */
-function unparseDataStructures(cls) {
+function unparseDataStructures(cls, constantPool) {
   function formatCodeAttribute(attr) {
     if (attr.type === "linenumbertable") {
       const lines = [
@@ -693,12 +748,15 @@ function unparseDataStructures(cls) {
         sourceFileLine = `.sourcefile ${sourceFileAttribute.attribute.value}`;
       }
 
+      const constLines = constantPool.map((entry, index) => formatConst(entry, index, constantPool, cls)).filter(Boolean).join('\n');
+
       // Combine all parts
       return [
         headerLines.filter(Boolean).join("\n"),
         fields,
         methods,
         sourceFileLine,
+        constLines,
         `.end class`
       ]
         .filter(Boolean)

@@ -140,7 +140,13 @@ async function compareWithJavap() {
 
     try {
       // Get our parser output
-      const ourOutput = parseClassFile(classPath);
+      let ourOutput;
+      try {
+        ourOutput = parseClassFile(classPath);
+      } catch (e) {
+        console.error(`Error in parseClassFile for ${fileName}:`, e);
+        continue;
+      }
 
       // Get krak2 output
       const krak2Output = await runKrak2(classPath);

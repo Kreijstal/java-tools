@@ -46,4 +46,12 @@ module.exports = {
   aconst_null: (frame) => {
     frame.stack.push(null);
   },
+  ldc2_w: (frame, instruction) => {
+    const value = instruction.arg;
+    if (typeof value === 'string' && value.endsWith('L')) {
+      frame.stack.push(BigInt(value.slice(0, -1)));
+    } else {
+      frame.stack.push(parseFloat(value));
+    }
+  },
 };

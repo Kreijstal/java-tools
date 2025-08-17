@@ -1,32 +1,154 @@
 const Stack = require('./stack');
-const { loadClass, loadClassByPath, loadClassByPathSync } = require('./classLoader');
+const { loadClassByPath, loadClassByPathSync: loadConvertedClass } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
-const { formatInstruction, unparseDataStructures } = require('./convert_tree');
-const jreMethods = require('./jre');
+const { formatInstruction, unparseDataStructures, convertJson } = require('./convert_tree');
+const jreClasses = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
+const fs = require('fs');
+const path = require('path');
+const { getAST } = require('jvm_parser');
 
 class JVM {
   constructor(options = {}) {
     this.threads = [];
     this.currentThreadIndex = 0;
-    this.classes = {};
-    this.jre = {};
+    this.classes = {}; // className -> { ast, constantPool }
+    this.invokedynamicCache = new Map();
+    this.jre = jreClasses;
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || '.';
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
 
-    this._jreMethods = jreMethods;
+    this._preloadJreClasses();
+  }
+
+  _preloadJreClasses() {
+    const jreHierarchy = {
+      'java/lang/Object': null,
+      'java/lang/Throwable': 'java/lang/Object',
+      'java/lang/Exception': 'java/lang/Throwable',
+      'java/lang/RuntimeException': 'java/lang/Exception',
+      'java/lang/IllegalArgumentException': 'java/lang/RuntimeException',
+      'java/lang/ReflectiveOperationException': 'java/lang/Exception',
+      'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
+      'java/io/Reader': 'java/lang/Object',
+      'java/io/BufferedReader': 'java/io/Reader',
+      'java/io/InputStreamReader': 'java/io/Reader',
+      'java/io/InputStream': 'java/lang/Object',
+      'java/io/FilterInputStream': 'java/io/InputStream',
+      'java/io/BufferedInputStream': 'java/io/FilterInputStream',
+      'java/io/OutputStream': 'java/lang/Object',
+      'java/io/FilterOutputStream': 'java/io/OutputStream',
+      'java/io/PrintStream': 'java/io/FilterOutputStream',
+      'java/net/URLConnection': 'java/lang/Object',
+      'java/net/HttpURLConnection': 'java/net/URLConnection',
+    };
+
+    // Create stubs for all classes in the hierarchy
+    for (const className in jreHierarchy) {
+      const superClassName = jreHierarchy[className];
+      const classStub = {
+        ast: {
+          classes: [{
+            className: className,
+            superClassName: superClassName,
+            items: [],
+            flags: ['public']
+          }]
+        },
+        constantPool: []
+      };
+      this.classes[className] = classStub;
+    }
+
+    // Add other JRE classes that extend Object directly - only in Node.js environment
+    if (typeof window === 'undefined' && fs && fs.readdirSync) {
+      const jrePath = path.join(__dirname, 'jre');
+      const walk = (dir, prefix) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            walk(fullPath, `${prefix}${file}/`);
+          } else if (file.endsWith('.js')) {
+            const className = `${prefix}${file.slice(0, -3)}`;
+            if (!this.classes[className]) {
+              const classStub = {
+                ast: {
+                  classes: [{
+                    className: className,
+                    superClassName: 'java/lang/Object',
+                    items: [],
+                    flags: ['public']
+                  }]
+                },
+                constantPool: []
+              };
+              this.classes[className] = classStub;
+            }
+          }
+        }
+      };
+      walk(jrePath, '');
+    }
+    // In browser environment, we'll rely on the basic hierarchy defined above
+    // and any additional JRE classes can be loaded dynamically as needed
   }
 
   internString(str) {
     return str;
   }
 
+  _setTestOutputCallback(callback) {
+    this.testOutputCallback = callback;
+  }
+
   registerJreMethods(methods) {
-    this._jreMethods = { ...this._jreMethods, ...methods };
+    for (const className in methods) {
+      if (!this.jre[className]) {
+        this.jre[className] = { methods: {} };
+      }
+      if (!this.jre[className].methods) {
+        this.jre[className].methods = {};
+      }
+      for (const methodSig in methods[className]) {
+        this.jre[className].methods[methodSig] = methods[className][methodSig];
+      }
+    }
+  }
+
+  _jreFindMethod(className, methodName, descriptor) {
+    let currentClass = this.jre[className];
+    while (currentClass) {
+      const methodKey = `${methodName}${descriptor}`;
+      const method = currentClass.methods[methodKey];
+      if (method) {
+        return method;
+      }
+      currentClass = this.jre[currentClass.super];
+    }
+    return null;
+  }
+
+  _jreFindStaticField(className, fieldName, descriptor) {
+    let currentClass = this.jre[className];
+    while (currentClass) {
+      const fieldKey = `${fieldName}:${descriptor}`;
+      const field = currentClass.staticFields[fieldKey];
+      if (field) {
+        return field;
+      }
+      currentClass = this.jre[currentClass.super];
+    }
+    return null;
+  }
+
+  _jreGetNative(className, nativeName) {
+    return this.jre[className][nativeName];
   }
 
   async run(classFilePath, options = {}) {
@@ -34,7 +156,7 @@ class JVM {
       this.classpath = options.classpath;
     }
     const classData = await this.loadClassAsync(classFilePath, options);
-    if (!classData) {
+    if (!classData || !classData.ast) {
       throw new Error(`Class not found: ${classFilePath}`);
     }
 
@@ -94,15 +216,49 @@ class JVM {
   }
 
   async executeTick() {
-    if (this.threads.filter(t => t.status === 'runnable').length === 0) {
+    // On each tick, check for threads that need to be woken up.
+    for (const t of this.threads) {
+      if (t.status === 'SLEEPING' && Date.now() >= t.sleepUntil) {
+        t.status = 'runnable';
+        delete t.sleepUntil;
+      }
+      if (t.status === 'JOINING' && t.joiningOn.status === 'terminated') {
+        t.status = 'runnable';
+        delete t.joiningOn;
+      }
+      if (t.status === 'BLOCKED' && t.blockingOn && !t.blockingOn.isLocked) {
+        t.status = 'runnable';
+        // The thread will attempt to acquire the lock again in monitorenter
+      }
+    }
+
+    if (this.threads.every(t => t.status === 'terminated')) {
       return { completed: true };
     }
 
-    const thread = this.threads[this.currentThreadIndex];
+    // console.error(`Tick. Current thread: ${this.currentThreadIndex}. Statuses: ${this.threads.map(t => `${t.id}:${t.status}`).join(', ')}`);
 
-    if (!thread || thread.status !== 'runnable') {
+    let thread = this.threads[this.currentThreadIndex];
+
+    // Find the next runnable thread
+    let initialThreadIndex = this.currentThreadIndex;
+    while (thread.status !== 'runnable') {
       this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
-      return { completed: false };
+      thread = this.threads[this.currentThreadIndex];
+      if (this.currentThreadIndex === initialThreadIndex) {
+        // We've looped through all threads and none are runnable.
+        // This could be a deadlock or all threads are waiting/blocked.
+        const nonTerminated = this.threads.filter(t => t.status !== 'terminated');
+        if (nonTerminated.length > 0) {
+            // Yield to allow time to pass for sleeping threads or external events.
+            await new Promise(resolve => setImmediate(resolve));
+            return { completed: false };
+//		continue;
+        } else {
+            // All threads are terminated.
+            return { completed: true };
+        }
+      }
     }
 
     const callStack = thread.callStack;
@@ -138,12 +294,13 @@ class JVM {
         await this.executeInstruction(instruction, frame, thread);
       }
     } catch (e) {
+	      console.error(`>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`);
+  console.error(e); // Log the raw error object to see its stack trace
       const label = instructionItem.labelDef;
       const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       this.handleException(e, currentPc, thread);
     }
 
-    // Advance to next thread
     if (this.threads.length > 0) {
       this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
     }
@@ -151,7 +308,6 @@ class JVM {
     return { completed: false };
   }
 
-  // TODO: Make debugger thread-aware
   shouldPause(currentPc, frame) {
     return false;
   }
@@ -164,23 +320,11 @@ class JVM {
     await dispatch(frame, instruction, this, thread);
   }
 
-  loadClass(classFilePath, options = {}) {
-    // For backwards compatibility, try sync first
-    try {
-      const classData = loadClassByPathSync(classFilePath, options);
-      if (classData) {
-        this.classes[classData.classes[0].className] = classData;
-      }
-      return classData;
-    } catch (error) {
-      if (error.message.includes('Synchronous file operations not supported')) {
-        // This is a browser environment - return a rejected promise or throw error
-        // telling the caller to use loadClassAsync instead
-        throw new Error('Use loadClassAsync() for browser environments');
-      }
-      // Re-throw other errors
-      throw error;
-    }
+  loadClassByPathSync(classFilePath) {
+    const classFileContent = fs.readFileSync(classFilePath);
+    const rawAst = getAST(classFileContent);
+    const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+    return { ast: convertedAst, constantPool: rawAst.constantPool };
   }
 
   async loadClassAsync(classFilePath, options = {}) {
@@ -188,15 +332,15 @@ class JVM {
     try {
       const classData = await loadClassByPath(classFilePath, options);
       if (classData) {
-        this.classes[classData.classes[0].className] = classData;
+        this.classes[classData.ast.classes[0].className] = classData;
       }
       return classData;
     } catch (error) {
       // If async fails and we have a sync provider, try sync method
       try {
-        const classData = loadClassByPathSync(classFilePath, options);
+        const classData = loadConvertedClass(classFilePath, options);
         if (classData) {
-          this.classes[classData.classes[0].className] = classData;
+          this.classes[classData.ast.classes[0].className] = classData;
         }
         return classData;
       } catch (syncError) {
@@ -211,44 +355,16 @@ class JVM {
       return this.classes[classNameWithSlashes];
     }
 
-    if (classNameWithSlashes === 'java/lang/Object') {
-      const objectClassData = {
-        classes: [{
-          className: 'java/lang/Object',
-          superClassName: null,
-          items: [],
-          flags: ['public'],
-        }],
-      };
-      this.classes['java/lang/Object'] = objectClassData;
-      return objectClassData;
-    }
-
-    const classNameWithDots = classNameWithSlashes.replace(/\//g, '.');
-    const classData = await loadClass(classNameWithDots, this.classpath);
-    if (classData) {
-      this.classes[classData.classes[0].className] = classData;
+    const classFilePath = path.join(this.classpath, `${classNameWithSlashes}.class`);
+    const classData = this.loadClassByPathSync(classFilePath);
+    if (classData && classData.ast) {
+        this.classes[classNameWithSlashes] = classData;
     }
     return classData;
   }
 
-  loadClassSync(classFilePath, options = {}) {
-    try {
-      const classData = loadClassByPathSync(classFilePath, options);
-      if (classData) {
-        this.classes[classData.classes[0].className] = classData;
-      }
-      return classData;
-    } catch (error) {
-      // If sync fails, for browser environments, just return null 
-      // and let the caller handle the missing class
-      console.warn(`Could not load class ${classFilePath} synchronously:`, error.message);
-      return null;
-    }
-  }
-
   findMainMethod(classData) {
-    const mainMethod = classData.classes[0].items.find(item => {
+    const mainMethod = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
              item.method.name === 'main' &&
              item.method.descriptor === '([Ljava/lang/String;)V';
@@ -257,7 +373,7 @@ class JVM {
   }
 
   findMethod(classData, methodName, descriptor) {
-    const method = classData.classes[0].items.find(item => {
+    const method = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
              item.method.name === methodName &&
              item.method.descriptor === descriptor;
@@ -277,7 +393,7 @@ class JVM {
       } else {
         return null;
       }
-      currentClassName = classData.classes[0].superClassName;
+      currentClassName = classData.ast.classes[0].superClassName;
     }
     return null;
   }
@@ -292,7 +408,6 @@ class JVM {
 
     let pcToCheck = pc;
     if (pc === -1) {
-      // Unwinding from a called method. The pc is the one of the call site.
       const callerInstructionIndex = frame.pc - 1;
       if (callerInstructionIndex >= 0) {
         const instructionItem = frame.instructions[callerInstructionIndex];
@@ -324,7 +439,7 @@ class JVM {
     }
 
     callStack.pop();
-    this.handleException(exception, -1, thread); // PC is -1 for subsequent frames
+    this.handleException(exception, -1, thread);
   }
 
   serialize() {
@@ -340,10 +455,9 @@ class JVM {
   }
 
   findClassNameForMethod(method) {
-    // Helper method to find which class contains a given method
     for (const [className, classData] of Object.entries(this.classes)) {
-      if (classData && classData.classes && classData.classes[0]) {
-        const methods = classData.classes[0].items.filter(item => item.type === 'method');
+      if (classData && classData.ast && classData.ast.classes && classData.ast.classes[0]) {
+        const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
         if (methods.some(item => item.method === method)) {
           return className;
         }
@@ -353,13 +467,12 @@ class JVM {
   }
 
   findMethodByRef(methodRef) {
-    // Find method by class name, method name, and descriptor
     const classData = this.classes[methodRef.className];
-    if (!classData || !classData.classes || !classData.classes[0]) {
+    if (!classData || !classData.ast || !classData.ast.classes[0]) {
       return null;
     }
 
-    const methodItem = classData.classes[0].items.find(item => {
+    const methodItem = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
              item.method.name === methodRef.methodName &&
              item.method.descriptor === methodRef.methodDescriptor;
@@ -367,8 +480,6 @@ class JVM {
     
     return methodItem ? methodItem.method : null;
   }
-
-  // Thread-aware debugging and inspection methods
 
   enableDebugMode() { this.debugManager.enable(); }
   disableDebugMode() { this.debugManager.disable(); }
@@ -513,7 +624,6 @@ class JVM {
     return { type: objRef.type, fields: objRef.fields || {} };
   }
 
-  // Placeholders for now
   stepInto() {}
   stepOver() {}
   stepOut() {}
@@ -524,8 +634,8 @@ class JVM {
   _getValueDescription(value) { return ''; }
   getSourceLineMapping(pc, method) { return {}; }
   getSourceFileName(method) { return null; }
+
   getDisassemblyView() {
-    // Get current execution state
     const thread = this.threads[this.currentThreadIndex];
     if (!thread || thread.callStack.isEmpty()) {
       return { 
@@ -546,7 +656,6 @@ class JVM {
       };
     }
 
-    // Find the class that contains the current method
     const className = this.findClassNameForMethod(frame.method);
     if (!className) {
       return { 
@@ -557,8 +666,8 @@ class JVM {
       };
     }
 
-    const classData = this.classes[className];
-    if (!classData) {
+    const workspaceEntry = this.classes[className];
+    if (!workspaceEntry) {
       return { 
         formattedDisassembly: '// Class data not available',
         lineToPcMap: {},
@@ -568,7 +677,6 @@ class JVM {
     }
 
     try {
-      // Get current PC
       let currentPc = -1;
       if (frame.pc < frame.instructions.length) {
         const instructionItem = frame.instructions[frame.pc];
@@ -576,13 +684,10 @@ class JVM {
         currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       }
 
-      // Generate disassembly using the same method as getClassDisassembly
-      const disassembly = unparseDataStructures(classData.classes[0]);
+      const disassembly = unparseDataStructures(workspaceEntry.ast.classes[0], workspaceEntry.constantPool);
       
-      // Format the disassembly with debug information
       const formattedDisassembly = this._formatDisassemblyForDebugView(disassembly, currentPc, className);
       
-      // Create line to PC mapping for breakpoint support
       const lineToPcMap = this._createLineToPcMap(disassembly, currentPc);
       
       return {
@@ -602,28 +707,19 @@ class JVM {
   }
 
   _formatDisassemblyForDebugView(disassembly, currentPc, className) {
-    // Format disassembly with debug header and current execution indicator
-    const header = `8. Disassembly View
-=====================================
-File: ${className}.class
-Current PC: ${currentPc}
-
-`;
+    const header = `8. Disassembly View\n=====================================\nFile: ${className}.class\nCurrent PC: ${currentPc}\n\n`;
     
     const lines = disassembly.split('\n');
     const formattedLines = [];
     let lineNumber = 1;
     
     for (const line of lines) {
-      // Check if this line contains a PC marker that matches the current PC
       const pcMatch = line.match(/L(\d+):/);
       const linePc = pcMatch ? parseInt(pcMatch[1]) : -1;
       
       if (linePc === currentPc) {
-        // Mark current execution line with arrow
         formattedLines.push(`=>  ${lineNumber.toString().padStart(3)}  ${line}`);
       } else {
-        // Regular line with line number
         formattedLines.push(`    ${lineNumber.toString().padStart(3)}  ${line}`);
       }
       lineNumber++;
@@ -635,7 +731,6 @@ Current PC: ${currentPc}
   }
 
   _createLineToPcMap(disassembly, currentPc) {
-    // Create mapping from display line numbers to PC values for breakpoint support
     const lineToPcMap = {};
     const lines = disassembly.split('\n');
     
@@ -644,8 +739,7 @@ Current PC: ${currentPc}
       const pcMatch = line.match(/L(\d+):/);
       if (pcMatch) {
         const pc = parseInt(pcMatch[1]);
-        // The display line number will be i + 6 (accounting for header lines)
-        const displayLineNumber = i + 5; // 5 header lines before content starts
+        const displayLineNumber = i + 5;
         lineToPcMap[displayLineNumber] = pc;
       }
     }
