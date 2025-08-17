@@ -35,31 +35,44 @@ module.exports = {
   },
 
   monitorenter: (frame, instruction, jvm, thread) => {
-    const objRef = frame.stack.pop();
+    const objRef = frame.stack.peek();
+    if (!objRef) {
+        throw new Error('NullPointerException in monitorenter');
+    }
+
     if (objRef.lockOwner === null) {
       objRef.lockOwner = thread.id;
       objRef.lockCount = 1;
+      frame.stack.pop();
     } else if (objRef.lockOwner === thread.id) {
       objRef.lockCount++;
+      frame.stack.pop();
     } else {
       thread.status = 'BLOCKED';
-      // ugly spin lock for now
-      setImmediate(() => {
-        thread.status = 'RUNNABLE';
-      });
-      frame.pc--; // retry instruction
+      thread.blockingOn = objRef;
+      frame.pc--;
     }
   },
 
   monitorexit: (frame, instruction, jvm, thread) => {
     const objRef = frame.stack.pop();
-    if (objRef.lockOwner === thread.id) {
-      objRef.lockCount--;
-      if (objRef.lockCount === 0) {
-        objRef.lockOwner = null;
+     if (!objRef) {
+        throw new Error('NullPointerException in monitorexit');
+    }
+    if (objRef.lockOwner !== thread.id) {
+        // This should throw IllegalMonitorStateException, but for now we'll log it.
+        console.error(`Thread ${thread.id} attempted to exit monitor on object ${objRef.hashCode} not owned by it.`);
+        return;
+    }
+
+    objRef.lockCount--;
+    if (objRef.lockCount === 0) {
+      objRef.lockOwner = null;
+      const blockedThread = jvm.threads.find(t => t.status === 'BLOCKED' && t.blockingOn === objRef);
+      if (blockedThread) {
+        blockedThread.status = 'RUNNABLE';
+        delete blockedThread.blockingOn;
       }
-    } else {
-      // This should throw IllegalMonitorStateException
     }
   },
 
