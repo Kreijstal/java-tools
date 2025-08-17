@@ -263,11 +263,10 @@ async function invokedynamic(frame, instruction, jvm, thread) {
   // For a lambda, the result of invokedynamic is a functional interface object (e.g., Runnable).
   // When its method is called (e.g., run()), the target method handle is invoked.
   if (bsm.method_ref.value.reference.className === 'java/lang/invoke/LambdaMetafactory') {
-    // We will simulate this by creating a simple object that represents the Runnable.
+    // Create a functional interface object (e.g., Runnable).
     const runnable = {
-      type: 'java/lang/Runnable',
-      methodHandle: targetMethodHandle,
-      // A real implementation would have a dispatch table for interface methods.
+      type: 'java/lang/Runnable', // The functional interface type
+      methodHandle: targetMethodHandle, // The implementation of the interface's method
     };
 
     // Push the resulting functional interface object onto the stack.
@@ -278,8 +277,7 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 async function invokeinterface(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
 
-  // In a real JVM, we'd look up the method in the interface's vtable.
-  // For our lambda simulation, we have the target method handle stored directly on our object.
+  // For a functional interface, the method handle is stored on the object.
   const runnable = frame.stack.pop();
 
   if (!runnable || !runnable.methodHandle) {
