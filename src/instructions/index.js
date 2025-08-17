@@ -34,8 +34,6 @@ module.exports = async function dispatch(frame, instruction, jvm, thread) {
     const threadStatus = jvm.threads.map((t, i) => `  Thread ${i}: ${t.status}`).join('\n');
 
     console.log(`[${threadStates}] [thread:${threadId}, pc:${pc}, stack:${stackSize}]`, instruction);
-    console.log(`Operand stack size: ${stackSize}`);
-    console.log(`Thread statuses:\n${threadStatus}`);
   }
   const op = typeof instruction === 'string' ? instruction : instruction.op;
 
