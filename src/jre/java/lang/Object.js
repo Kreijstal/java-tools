@@ -48,6 +48,12 @@ module.exports = {
       // The JVM scheduler will now be able to run another thread that might have been
       // BLOCKED on this object's monitor.
     },
+    'wait(J)V': (jvm, obj, args, thread) => {
+      // For now, this is a stub that does nothing.
+    },
+    'wait(JI)V': (jvm, obj, args, thread) => {
+      // For now, this is a stub that does nothing.
+    },
     'notify()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         // TODO: throw IllegalMonitorStateException
