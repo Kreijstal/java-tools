@@ -22,7 +22,8 @@
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
     "jszip": "^3.10.1",
-    "jvm_parser": "^0.0.9"
+    "jvm_parser": "^0.0.9",
+    "parsimmon": "^1.18.1"
   },
   "devDependencies": {
     "@babel/core": "^7.28.0",
