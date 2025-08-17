@@ -29,7 +29,12 @@ module.exports = async function dispatch(frame, instruction, jvm, thread) {
         pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       }
     }
-    console.log(`[thread:${threadId}, pc:${pc}]`, instruction);
+    const threadStates = jvm.threads.map(t => t.status.slice(0, 1).toUpperCase()).join('');
+    const stackSize = frame.stack.size();
+    const threadStatus = jvm.threads.map((t, i) => `  Thread ${i}: ${t.status}`).join('\n');
+
+    const className = jvm.findClassNameForMethod(frame.method);
+    console.log(`[${threadStates}] [thread:${threadId}, pc:${className}.${frame.method.name} ${pc}, stack:${stackSize}]`, instruction);
   }
   const op = typeof instruction === 'string' ? instruction : instruction.op;
 

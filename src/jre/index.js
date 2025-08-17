@@ -1,40 +1,24 @@
-const handleObject = require('./java/lang/Object');
-const handleSystem = require('./java/lang/System');
-const handleClass = require('./java/lang/Class');
-const handleReflect = require('./java/lang/reflect');
-const handleInputStreamReader = require('./java/io/InputStreamReader');
-const handleBufferedReader = require('./java/io/BufferedReader');
-const handleBufferedInputStream = require('./java/io/BufferedInputStream');
-const handlePrintStream = require('./java/io/PrintStream');
-const handleURL = require('./java/net/URL');
-const handleURLConnection = require('./java/net/URLConnection');
-const handleHttpURLConnection = require('./java/net/HttpURLConnection');
-const handleStringBuilder = require('./java/lang/StringBuilder');
-const handleIllegalArgumentException = require('./java/lang/IllegalArgumentException');
-const handleThread = require('./java/lang/Thread');
-const handleNoSuchMethodException = require('./java/lang/NoSuchMethodException');
-
-const jreMethods = {
-  ...handleStringBuilder,
-  ...handleIllegalArgumentException,
-  ...handleNoSuchMethodException,
-  ...handleThread,
-  ...handleObject,
-  ...handleSystem,
-  ...handleClass,
-  ...handleReflect,
-  ...handleInputStreamReader,
-  ...handleBufferedReader,
-  ...handleBufferedInputStream,
-  ...handlePrintStream,
-  ...handleURL,
-  ...handleURLConnection,
-  ...handleHttpURLConnection,
-  'java/lang/String.concat(Ljava/lang/String;)Ljava/lang/String;': (jvm, str, args) => str + args[0],
-  'java/lang/String.toUpperCase()Ljava/lang/String;': (jvm, str, args) => str.toUpperCase(),
-  'java/lang/String.toLowerCase()Ljava/lang/String;': (jvm, str, args) => str.toLowerCase(),
-  'java/lang/String.length()I': (jvm, str, args) => str.length,
-  'java/lang/String.equals(Ljava/lang/Object;)Z': (jvm, str, args) => str === args[0],
+const jreClasses = {
+  'java/lang/Object': require('./java/lang/Object'),
+  'java/lang/System': require('./java/lang/System'),
+  'java/lang/Class': require('./java/lang/Class'),
+  'java/lang/String': require('./java/lang/String'),
+  'java/lang/StringBuilder': require('./java/lang/StringBuilder'),
+  'java/lang/Thread': require('./java/lang/Thread'),
+  'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException'),
+  'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException'),
+  'java/lang/invoke/LambdaMetafactory': require('./java/lang/invoke/LambdaMetafactory'),
+  'java/lang/invoke/StringConcatFactory': require('./java/lang/invoke/StringConcatFactory'),
+  'java/lang/reflect/Method': require('./java/lang/reflect/Method'),
+  'java/lang/Integer': require('./java/lang/Integer'),
+  'java/io/InputStreamReader': require('./java/io/InputStreamReader'),
+  'java/io/BufferedReader': require('./java/io/BufferedReader'),
+  'java/io/BufferedInputStream': require('./java/io/BufferedInputStream'),
+  'java/io/PrintStream': require('./java/io/PrintStream'),
+  'java/net/URL': require('./java/net/URL'),
+  'java/net/URLConnection': require('./java/net/URLConnection'),
+  'java/net/HttpURLConnection': require('./java/net/HttpURLConnection'),
+  'java/util/LinkedList': require('./java/util/LinkedList'),
 };
 
-module.exports = jreMethods;
+module.exports = jreClasses;
