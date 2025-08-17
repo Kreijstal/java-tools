@@ -29,7 +29,9 @@ module.exports = async function dispatch(frame, instruction, jvm, thread) {
         pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       }
     }
-    console.log(`[thread:${threadId}, pc:${pc}]`, instruction);
+    const threadStates = jvm.threads.map(t => t.status === 'runnable' ? 'R' : 'B').join('');
+    const stackSize = thread.callStack.size();
+    console.log(`[${threadStates}] [thread:${threadId}, pc:${pc}, stack:${stackSize}]`, instruction);
   }
   const op = typeof instruction === 'string' ? instruction : instruction.op;
 
