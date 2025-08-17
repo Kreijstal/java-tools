@@ -1,6 +1,12 @@
 module.exports = {
-  super: 'java/lang/Object',
-  staticFields: {},
+  super: 'java/lang/Number',
+  staticFields: {
+    'TYPE:Ljava/lang/Class;': {
+      type: 'java/lang/Class',
+      isPrimitive: true,
+      name: 'int',
+    },
+  },
   methods: {
     'valueOf(I)Ljava/lang/Integer;': (jvm, _, args) => {
       return {

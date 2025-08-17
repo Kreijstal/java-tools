@@ -1,4 +1,5 @@
 const Frame = require('../../../../frame');
+const { parseDescriptor } = require('../../../../typeParser');
 
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
@@ -9,18 +10,31 @@ module.exports = {
       return jvm.internString(methodName);
     },
     'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
-    const methodData = methodObj._methodData;
-    const { name, descriptor, flags } = methodData;
-    const obj = args[0];
-    const methodArgs = args[1];
+      const methodData = methodObj._methodData;
+      const { name, descriptor, flags } = methodData;
+      const obj = args[0];
+      const methodArgs = args[1];
 
-    const isStatic = flags.includes('static');
+      const isStatic = flags.includes('static');
 
-    const className = methodObj._declaringClass._classData.ast.classes[0].className;
-    const method = jvm.findMethodInHierarchy(className, name, descriptor);
+      if (!isStatic && obj === null) {
+        throw {
+          type: 'java/lang/NullPointerException',
+          message: `Cannot invoke instance method ${name} on a null object`,
+        };
+      }
 
-    if (method) {
-      const newFrame = new Frame(method);
+      const { params } = parseDescriptor(descriptor);
+      const numArgs = methodArgs ? methodArgs.length : 0;
+
+      if (params.length !== numArgs) {
+        throw {
+          type: 'java/lang/IllegalArgumentException',
+          message: `argument type mismatch: expected ${params.length} but got ${numArgs}`,
+        };
+      }
+
+      const newFrame = new Frame(methodData);
       let localIndex = 0;
       if (!isStatic) {
         newFrame.locals[localIndex++] = obj;
@@ -34,16 +48,12 @@ module.exports = {
       const thread = jvm.threads[jvm.currentThreadIndex];
 
       return new Promise((resolve) => {
-          thread.isAwaitingReflectiveCall = true;
-          thread.reflectiveCallResolver = (ret) => {
-              require('fs').appendFileSync('/tmp/debug.log', `Method ${name} returned: ${JSON.stringify(ret)}\n`);
-              resolve(ret);
-          };
-          thread.callStack.push(newFrame);
+        thread.isAwaitingReflectiveCall = true;
+        thread.reflectiveCallResolver = (ret) => {
+          resolve(ret);
+        };
+        thread.callStack.push(newFrame);
       });
-    } else {
-      throw new Error(`Could not find method ${name}${descriptor} for reflective invocation.`);
-    }
-  },
-}
+    },
+  }
 };

@@ -11,9 +11,27 @@ module.exports = {
       obj.runnable = args[0];
       delete obj.isUninitialized;
     },
-    'start()V': (jvm, obj, args) => {
-      // The logic for starting a new thread is handled in invokevirtual
-      // instruction. This is just a placeholder.
+    'start()V': async (jvm, threadObject, args, currentThread) => {
+      const Stack = require('../../../stack');
+      const Frame = require('../../../frame');
+      const target = threadObject.runnable || threadObject;
+      const targetClassName = target.type;
+
+      const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
+      if (runMethod) {
+        const newThread = {
+          id: jvm.threads.length,
+          callStack: new Stack(),
+          status: 'runnable',
+        };
+        threadObject.nativeThread = newThread;
+        const newFrame = new Frame(runMethod);
+        newFrame.locals[0] = target; // 'this'
+        newThread.callStack.push(newFrame);
+        jvm.threads.push(newThread);
+      } else {
+        console.error(`Could not find run() method on ${targetClassName}`);
+      }
     },
     'join()V': (jvm, obj, args, thread) => {
       const threadToJoin = obj.nativeThread;

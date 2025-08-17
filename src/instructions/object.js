@@ -1,7 +1,17 @@
 module.exports = {
   new: async (frame, instruction, jvm) => {
     const className = instruction.arg;
-    await jvm.loadClassByName(className);
+    try {
+      await jvm.loadClassByName(className);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        throw {
+          type: 'java/lang/NoClassDefFoundError',
+          message: className,
+        };
+      }
+      throw e;
+    }
 
     const fields = {};
     let currentClassName = className;

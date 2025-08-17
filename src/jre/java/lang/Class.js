@@ -87,19 +87,21 @@ module.exports = {
 
       const getDescriptor = (paramClass) => {
         if (!paramClass) return '';
-        const paramClassName = paramClass._classData.ast.classes[0].className;
-        // Basic type mapping, can be extended
-        switch (paramClassName) {
-          case 'int': return 'I';
-          case 'long': return 'J';
-          case 'double': return 'D';
-          case 'float': return 'F';
-          case 'char': return 'C';
-          case 'short': return 'S';
-          case 'byte': return 'B';
-          case 'boolean': return 'Z';
-          default: return `L${paramClassName};`;
+        if (paramClass.isPrimitive) {
+          switch (paramClass.name) {
+            case 'int': return 'I';
+            case 'long': return 'J';
+            case 'double': return 'D';
+            case 'float': return 'F';
+            case 'char': return 'C';
+            case 'short': return 'S';
+            case 'byte': return 'B';
+            case 'boolean': return 'Z';
+            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+          }
         }
+        const paramClassName = paramClass._classData.ast.classes[0].className;
+        return `L${paramClassName};`;
       };
 
       const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;
