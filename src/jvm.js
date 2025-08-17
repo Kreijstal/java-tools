@@ -228,6 +228,11 @@ class JVM {
         delete thread.sleepUntil;
         break;
       }
+      if (thread.status === 'JOINING' && thread.joiningOn.status === 'terminated') {
+        thread.status = 'runnable';
+        delete thread.joiningOn;
+        break;
+      }
       this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
       thread = this.threads[this.currentThreadIndex];
       if (this.currentThreadIndex === initialThreadIndex) {

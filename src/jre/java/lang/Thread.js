@@ -21,14 +21,8 @@ module.exports = {
         return;
       }
 
-      thread.status = 'BLOCKED';
-
-      const interval = setInterval(() => {
-        if (threadToJoin.status === 'terminated') {
-          thread.status = 'RUNNABLE';
-          clearInterval(interval);
-        }
-      }, 100);
+      thread.status = 'JOINING';
+      thread.joiningOn = threadToJoin;
     },
     'sleep(J)V': (jvm, obj, args, thread) => {
       const time = args[0];

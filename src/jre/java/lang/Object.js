@@ -38,7 +38,11 @@ module.exports = {
 
       // When a thread calls wait(), it releases the lock. It is then the job
       // of the scheduler to run a thread that was BLOCKED on the monitor.
-      // The logic to wake up a blocked thread is correctly handled by monitorexit.
+      const blockedThread = jvm.threads.find(t => t.status === 'BLOCKED' && t.blockingOn === obj);
+      if (blockedThread) {
+        blockedThread.status = 'RUNNABLE';
+        delete blockedThread.blockingOn;
+      }
     },
     'notify()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
@@ -46,6 +50,17 @@ module.exports = {
         return;
       }
       if (obj.waitSet.length > 0) {
+        const notifiedThread = obj.waitSet.shift();
+        notifiedThread.status = 'BLOCKED';
+        notifiedThread.blockingOn = obj;
+      }
+    },
+    'notifyAll()V': (jvm, obj, args, thread) => {
+      if (obj.lockOwner !== thread.id) {
+        // TODO: throw IllegalMonitorStateException
+        return;
+      }
+      while (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
         notifiedThread.status = 'BLOCKED';
         notifiedThread.blockingOn = obj;

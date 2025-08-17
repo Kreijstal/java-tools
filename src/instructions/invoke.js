@@ -206,6 +206,29 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 
   const bsmArgs = [lookup, invokedName, invokedType, ...staticArgs];
 
+  if (bsm.method_ref.value.reference.className === 'java/lang/invoke/StringConcatFactory') {
+    const recipe = bsm.arguments[0].value;
+    const { params } = parseDescriptor(nameAndType.descriptor);
+    const dynamicArgs = [];
+    for (let i = 0; i < params.length; i++) {
+        dynamicArgs.unshift(frame.stack.pop());
+    }
+
+    let result = '';
+    let argIndex = 0;
+    for (let i = 0; i < recipe.length; i++) {
+        const char = recipe.charAt(i);
+        if (char === '\u0001') {
+            result += dynamicArgs[argIndex++];
+        } else {
+            result += char;
+        }
+    }
+    frame.stack.push(jvm.internString(result));
+    return;
+  }
+
+
   // The next step is to actually invoke the bsm.method_ref with these args.
   // We can reuse the invokestatic logic for this.
 
@@ -249,32 +272,6 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 
     // Push the resulting functional interface object onto the stack.
     frame.stack.push(runnable);
-  } else if (bsm.method_ref.value.reference.className === 'java/lang/invoke/StringConcatFactory') {
-    // For string concatenation, we immediately invoke the target method handle.
-    const { params } = parseDescriptor(invokedType.descriptor);
-    const dynamicArgs = [];
-    for (let i = 0; i < params.length; i++) {
-      dynamicArgs.unshift(frame.stack.pop());
-    }
-
-    const concatInstruction = {
-      op: 'invokestatic',
-      arg: [
-        'Method',
-        targetMethodHandle.reference.className,
-        [
-          targetMethodHandle.reference.methodName,
-          targetMethodHandle.reference.methodDescriptor
-        ]
-      ]
-    };
-
-    // Push arguments for the concat helper
-    const recipe = targetMethodHandle.bound;
-    frame.stack.push(recipe);
-    frame.stack.push(dynamicArgs);
-
-    await invokestatic(frame, concatInstruction, jvm, thread);
   }
 }
 

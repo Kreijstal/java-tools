@@ -38,7 +38,7 @@ class PC {
                     wait();
                 System.out.println("Producer produced-" + value);
                 list.add(value++);
-                notify();
+                notifyAll();
                 Thread.sleep(100);
             }
         }
@@ -53,7 +53,7 @@ class PC {
                 int val = list.removeFirst();
                 System.out.println("Consumer consumed-" + val);
                 i++;
-                notify();
+                notifyAll();
                 Thread.sleep(100);
             }
         }
