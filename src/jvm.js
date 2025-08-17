@@ -64,35 +64,39 @@ class JVM {
       this.classes[className] = classStub;
     }
 
-    // Add other JRE classes that extend Object directly
-    const jrePath = path.join(__dirname, 'jre');
-    const walk = (dir, prefix) => {
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        const fullPath = path.join(dir, file);
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          walk(fullPath, `${prefix}${file}/`);
-        } else if (file.endsWith('.js')) {
-          const className = `${prefix}${file.slice(0, -3)}`;
-          if (!this.classes[className]) {
-            const classStub = {
-              ast: {
-                classes: [{
-                  className: className,
-                  superClassName: 'java/lang/Object',
-                  items: [],
-                  flags: ['public']
-                }]
-              },
-              constantPool: []
-            };
-            this.classes[className] = classStub;
+    // Add other JRE classes that extend Object directly - only in Node.js environment
+    if (typeof window === 'undefined' && fs && fs.readdirSync) {
+      const jrePath = path.join(__dirname, 'jre');
+      const walk = (dir, prefix) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            walk(fullPath, `${prefix}${file}/`);
+          } else if (file.endsWith('.js')) {
+            const className = `${prefix}${file.slice(0, -3)}`;
+            if (!this.classes[className]) {
+              const classStub = {
+                ast: {
+                  classes: [{
+                    className: className,
+                    superClassName: 'java/lang/Object',
+                    items: [],
+                    flags: ['public']
+                  }]
+                },
+                constantPool: []
+              };
+              this.classes[className] = classStub;
+            }
           }
         }
-      }
-    };
-    walk(jrePath, '');
+      };
+      walk(jrePath, '');
+    }
+    // In browser environment, we'll rely on the basic hierarchy defined above
+    // and any additional JRE classes can be loaded dynamically as needed
   }
 
   internString(str) {
@@ -324,11 +328,26 @@ class JVM {
   }
 
   async loadClassAsync(classFilePath, options = {}) {
-    const classData = this.loadClassByPathSync(classFilePath);
-    if (classData && classData.ast) {
-      this.classes[classData.ast.classes[0].className] = classData;
+    // Try async first, fall back to sync for backwards compatibility
+    try {
+      const classData = await loadClassByPath(classFilePath, options);
+      if (classData) {
+        this.classes[classData.ast.classes[0].className] = classData;
+      }
+      return classData;
+    } catch (error) {
+      // If async fails and we have a sync provider, try sync method
+      try {
+        const classData = loadConvertedClass(classFilePath, options);
+        if (classData) {
+          this.classes[classData.ast.classes[0].className] = classData;
+        }
+        return classData;
+      } catch (syncError) {
+        // If both fail, throw the original async error
+        throw error;
+      }
     }
-    return classData;
   }
 
   async loadClassByName(classNameWithSlashes) {

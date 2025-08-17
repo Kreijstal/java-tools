@@ -70,7 +70,8 @@ async function loadClassByPath(classFilePath, options = {}) {
   // Convert the AST
   const convertedAst = convertJson(ast.ast, ast.constantPool);
 
-  return convertedAst;
+  // Return the same structure as the sync version
+  return { ast: convertedAst, constantPool: ast.constantPool };
 }
 
 // Synchronous versions for backwards compatibility with existing Node.js code

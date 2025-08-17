@@ -160,6 +160,14 @@ class KrakatauWorkspace {
    * @private
    */
   _findClassFiles(dirPath, classFiles) {
+    // Skip filesystem operations in browser environment
+    if (typeof window !== 'undefined') {
+      // In browser environment, this method should not be called
+      // as we work with virtual file system instead
+      console.warn('_findClassFiles called in browser environment - using virtual file system instead');
+      return;
+    }
+
     if (!fs.existsSync(dirPath)) {
       throw new Error(`Class path entry ${dirPath} does not exist`);
     }
