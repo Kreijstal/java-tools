@@ -248,6 +248,16 @@ function convertJson(inputJson, constantPool) {
           case "invokestatic":
           case "invokeinterface":
             const methodRef = resolveConstant(instr.operands.index, constantPool);
+            const jvm_arg = [
+              instr.opcodeName === "invokeinterface"
+                ? "InterfaceMethod"
+                : "Method",
+              methodRef.value.className.replace(/\./g, "/"),
+              [
+                methodRef.value.nameAndType.name,
+                methodRef.value.nameAndType.descriptor,
+              ],
+            ];
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: [
@@ -258,15 +268,21 @@ function convertJson(inputJson, constantPool) {
                 methodRef.value.nameAndType.name,
                 methodRef.value.nameAndType.descriptor,
               ],
+              jvm_arg: jvm_arg,
             };
             if (instr.opcodeName === "invokeinterface") {
               codeItem.instruction.count = instr.operands.count.toString();
             }
             break;
           case "invokedynamic":
+            const invokeDynamicRef = resolveConstant(
+              instr.operands.index,
+              constantPool
+            );
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: `[_${instr.operands.index}]`,
+              jvm_arg: invokeDynamicRef.value,
             };
             break;
 
