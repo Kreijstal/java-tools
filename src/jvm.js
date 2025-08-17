@@ -294,7 +294,7 @@ class JVM {
         await this.executeInstruction(instruction, frame, thread);
       }
     } catch (e) {
-if(this.verbose) 
+if(this.verbose) {
 	      console.error(`>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`);
   console.error(e); // Log the raw error object to see its stack trace
     }
