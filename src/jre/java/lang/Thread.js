@@ -27,7 +27,7 @@ module.exports = {
     'sleep(J)V': (jvm, obj, args, thread) => {
       const time = args[0];
       thread.status = 'SLEEPING';
-      thread.sleepUntil = Date.now() + time;
+      thread.sleepUntil = Date.now() + Number(time);
     },
   },
 };

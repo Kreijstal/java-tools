@@ -33,6 +33,7 @@ module.exports = {
       thread.status = 'WAITING';
 
       // Release lock
+      obj.isLocked = false;
       obj.lockOwner = null;
       obj.lockCount = 0;
 

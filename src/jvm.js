@@ -245,6 +245,7 @@ class JVM {
             // Yield to allow time to pass for sleeping threads or external events.
             await new Promise(resolve => setImmediate(resolve));
             return { completed: false };
+//		continue;
         } else {
             // All threads are terminated.
             return { completed: true };
@@ -285,6 +286,8 @@ class JVM {
         await this.executeInstruction(instruction, frame, thread);
       }
     } catch (e) {
+	      console.error(`>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`);
+  console.error(e); // Log the raw error object to see its stack trace
       const label = instructionItem.labelDef;
       const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       this.handleException(e, currentPc, thread);
