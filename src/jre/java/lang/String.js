@@ -17,5 +17,8 @@ module.exports = {
     'equals(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       return obj === args[0] ? 1 : 0;
     },
+    'substring(II)Ljava/lang/String;': (jvm, obj, args) => {
+        throw new Error('NotImplementedError: String.substring is not implemented.');
+    },
   },
 };

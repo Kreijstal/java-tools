@@ -9,5 +9,9 @@ module.exports = {
       _isJreObject: true,
     },
   },
-  methods: {},
+  methods: {
+    'getProperty(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      throw new Error('NotImplementedError: System.getProperty is not implemented.');
+    },
+  },
 };

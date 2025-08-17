@@ -80,7 +80,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
         }
         thread.callStack.push(newFrame);
       } else {
-        console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
+        throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
       }
     }
   }
@@ -160,7 +160,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
       // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
       // For now, we do nothing, assuming the object is already created by 'new'.
   } else {
-      console.error(`Unsupported invokespecial: ${className}.${methodName}${descriptor}`);
+      throw new Error(`Unsupported invokespecial: ${className}.${methodName}${descriptor}`);
   }
 }
 
@@ -281,6 +281,11 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   // In a real JVM, we'd look up the method in the interface's vtable.
   // For our lambda simulation, we have the target method handle stored directly on our object.
   const runnable = frame.stack.pop();
+
+  if (!runnable || !runnable.methodHandle) {
+    throw new Error('NotImplementedError: invokeinterface is only supported for lambdas.');
+  }
+
   const targetMethodHandle = runnable.methodHandle;
 
   // Now, invoke the target method. It's a static method in this case.
