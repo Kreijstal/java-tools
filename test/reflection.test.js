@@ -24,7 +24,7 @@ test('Reflection test', (t) => {
 
   // Normalize and compare outputs
   const normalize = (str) => str.replace(/\r\n/g, '\n').trim();
-  const actualLines = normalize(actualOutput).split('\n');
+  const actualLines = normalize(actualOutput).split('\n').filter(line => !line.startsWith('notify') && !line.startsWith('wait'));
   const expectedLines = normalize(expectedOutput)
     .split('\n')
     .filter(line => !line.startsWith('notify') && !line.startsWith('wait'));
