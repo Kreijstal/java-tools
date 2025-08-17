@@ -212,7 +212,19 @@ class JVM {
   }
 
   async executeTick() {
-    if (this.threads.filter(t => t.status === 'runnable').length === 0) {
+    // On each tick, check for threads that need to be woken up.
+    for (const t of this.threads) {
+      if (t.status === 'SLEEPING' && Date.now() >= t.sleepUntil) {
+        t.status = 'runnable';
+        delete t.sleepUntil;
+      }
+      if (t.status === 'JOINING' && t.joiningOn.status === 'terminated') {
+        t.status = 'runnable';
+        delete t.joiningOn;
+      }
+    }
+
+    if (this.threads.every(t => t.status === 'terminated')) {
       return { completed: true };
     }
 
@@ -223,25 +235,18 @@ class JVM {
     // Find the next runnable thread
     let initialThreadIndex = this.currentThreadIndex;
     while (thread.status !== 'runnable') {
-      if (thread.status === 'SLEEPING' && Date.now() >= thread.sleepUntil) {
-        thread.status = 'runnable';
-        delete thread.sleepUntil;
-        break;
-      }
-      if (thread.status === 'JOINING' && thread.joiningOn.status === 'terminated') {
-        thread.status = 'runnable';
-        delete thread.joiningOn;
-        break;
-      }
       this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
       thread = this.threads[this.currentThreadIndex];
       if (this.currentThreadIndex === initialThreadIndex) {
         // We've looped through all threads and none are runnable.
+        // This could be a deadlock or all threads are waiting/blocked.
         const nonTerminated = this.threads.filter(t => t.status !== 'terminated');
         if (nonTerminated.length > 0) {
+            // Yield to allow time to pass for sleeping threads or external events.
             await new Promise(resolve => setImmediate(resolve));
             return { completed: false };
         } else {
+            // All threads are terminated.
             return { completed: true };
         }
       }
