@@ -294,8 +294,10 @@ class JVM {
         await this.executeInstruction(instruction, frame, thread);
       }
     } catch (e) {
+if(this.verbose) 
 	      console.error(`>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`);
   console.error(e); // Log the raw error object to see its stack trace
+    }
       const label = instructionItem.labelDef;
       const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       this.handleException(e, currentPc, thread);
