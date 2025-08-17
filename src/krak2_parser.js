@@ -1248,8 +1248,8 @@ const Lang = P.createLanguage({
 
     // source_file Parser
     source_file: (r) =>
-      P.seq(r.NL.atMost(1), r.class_def.many())
-        .map(([, classes]) => ({ classes }))
+      r.ws.then(r.class_def.many()).skip(r.ws)
+        .map((classes) => ({ classes }))
         .desc("source_file"),
 
     // class_def Parser
@@ -1269,8 +1269,8 @@ const Lang = P.createLanguage({
         P.string(".super").skip(r.ws),
         r.clsref.skip(r.NL),
         r.interface.many(),
-        r.clsitem.many(),
-        P.string(".end").skip(r.ws).skip(P.string("class")).skip(r.NL),
+        r.clsitem.sepBy(r.NL.many()),
+        P.string(".end").skip(r.ws).skip(P.string("class")).skip(r.NL.atMost(1)),
         (
           versionOpt,
           _,
