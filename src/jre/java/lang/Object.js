@@ -36,12 +36,9 @@ module.exports = {
       obj.lockOwner = null;
       obj.lockCount = 0;
 
-      // Wake up a thread that is blocked on this object
-      const blockedThread = jvm.threads.find(t => t.status === 'BLOCKED' && t.blockingOn === obj);
-      if (blockedThread) {
-        blockedThread.status = 'RUNNABLE';
-        delete blockedThread.blockingOn;
-      }
+      // When a thread calls wait(), it releases the lock. It is then the job
+      // of the scheduler to run a thread that was BLOCKED on the monitor.
+      // The logic to wake up a blocked thread is correctly handled by monitorexit.
     },
     'notify()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
