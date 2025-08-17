@@ -1,5 +1,5 @@
 const Stack = require('./stack');
-const { loadClassByPath, loadClassByPathSync: loadConvertedClass } = require('./classLoader');
+const { loadClassByPath, loadClassByPathSync } = require('./classLoader');
 const { parseDescriptor } = require('./typeParser');
 const { formatInstruction, unparseDataStructures, convertJson } = require('./convert_tree');
 const jreClasses = require('./jre');
@@ -65,34 +65,36 @@ class JVM {
     }
 
     // Add other JRE classes that extend Object directly
-    const jrePath = path.join(__dirname, 'jre');
-    const walk = (dir, prefix) => {
-      const files = fs.readdirSync(dir);
-      for (const file of files) {
-        const fullPath = path.join(dir, file);
-        const stat = fs.statSync(fullPath);
-        if (stat.isDirectory()) {
-          walk(fullPath, `${prefix}${file}/`);
-        } else if (file.endsWith('.js')) {
-          const className = `${prefix}${file.slice(0, -3)}`;
-          if (!this.classes[className]) {
-            const classStub = {
-              ast: {
-                classes: [{
-                  className: className,
-                  superClassName: 'java/lang/Object',
-                  items: [],
-                  flags: ['public']
-                }]
-              },
-              constantPool: []
-            };
-            this.classes[className] = classStub;
+    if (fs.readdirSync) {
+      const jrePath = path.join(__dirname, 'jre');
+      const walk = (dir, prefix) => {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+          const fullPath = path.join(dir, file);
+          const stat = fs.statSync(fullPath);
+          if (stat.isDirectory()) {
+            walk(fullPath, `${prefix}${file}/`);
+          } else if (file.endsWith('.js')) {
+            const className = `${prefix}${file.slice(0, -3)}`;
+            if (!this.classes[className]) {
+              const classStub = {
+                ast: {
+                  classes: [{
+                    className: className,
+                    superClassName: 'java/lang/Object',
+                    items: [],
+                    flags: ['public']
+                  }]
+                },
+                constantPool: []
+              };
+              this.classes[className] = classStub;
+            }
           }
         }
-      }
-    };
-    walk(jrePath, '');
+      };
+      walk(jrePath, '');
+    }
   }
 
   internString(str) {
@@ -290,8 +292,10 @@ class JVM {
         await this.executeInstruction(instruction, frame, thread);
       }
     } catch (e) {
-	      console.error(`>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`);
-  console.error(e); // Log the raw error object to see its stack trace
+	      if (this.verbose) {
+	        console.error(`>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`);
+          console.error(e); // Log the raw error object to see its stack trace
+        }
       const label = instructionItem.labelDef;
       const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
       this.handleException(e, currentPc, thread);
@@ -317,14 +321,11 @@ class JVM {
   }
 
   loadClassByPathSync(classFilePath) {
-    const classFileContent = fs.readFileSync(classFilePath);
-    const rawAst = getAST(classFileContent);
-    const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
-    return { ast: convertedAst, constantPool: rawAst.constantPool };
+    return loadClassByPathSync(classFilePath);
   }
 
   async loadClassAsync(classFilePath, options = {}) {
-    const classData = this.loadClassByPathSync(classFilePath);
+    const classData = await loadClassByPath(classFilePath, options);
     if (classData && classData.ast) {
       this.classes[classData.ast.classes[0].className] = classData;
     }
