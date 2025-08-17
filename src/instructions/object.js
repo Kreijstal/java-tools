@@ -71,11 +71,6 @@ module.exports = {
     if (objRef.lockCount === 0) {
       objRef.isLocked = false;
       objRef.lockOwner = null;
-      const blockedThread = jvm.threads.find(t => t.status === 'BLOCKED' && t.blockingOn === objRef);
-      if (blockedThread) {
-        blockedThread.status = 'RUNNABLE';
-        delete blockedThread.blockingOn;
-      }
     }
   },
 

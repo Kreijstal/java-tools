@@ -24,26 +24,29 @@ module.exports = {
     },
     'wait()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // TODO: throw IllegalMonitorStateException
+        // In a real implementation, this would throw IllegalMonitorStateException.
+        console.error(`Thread ${thread.id} attempted to wait on a monitor it does not own.`);
         return;
       }
 
-      // Add to wait set
+      // 1. Add the current thread to the object's wait set.
       obj.waitSet.push(thread);
+
+      // 2. Change the thread's status to WAITING.
       thread.status = 'WAITING';
 
-      // Release lock
+      // 3. Atomically release the lock.
+      // We must also remember how many times the lock was held recursively.
+      const lockCount = obj.lockCount;
       obj.isLocked = false;
       obj.lockOwner = null;
       obj.lockCount = 0;
 
-      // When a thread calls wait(), it releases the lock. A thread that was
-      // BLOCKED on the monitor should be woken up.
-      const blockedThread = jvm.threads.find(t => t.status === 'BLOCKED' && t.blockingOn === obj);
-      if (blockedThread) {
-        blockedThread.status = 'RUNNABLE';
-        delete blockedThread.blockingOn;
-      }
+      // Store the lock count so it can be restored when the thread wakes up.
+      thread.waitLockCount = lockCount;
+
+      // The JVM scheduler will now be able to run another thread that might have been
+      // BLOCKED on this object's monitor.
     },
     'notify()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {

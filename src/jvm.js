@@ -222,6 +222,10 @@ class JVM {
         t.status = 'runnable';
         delete t.joiningOn;
       }
+      if (t.status === 'BLOCKED' && t.blockingOn && !t.blockingOn.isLocked) {
+        t.status = 'runnable';
+        // The thread will attempt to acquire the lock again in monitorenter
+      }
     }
 
     if (this.threads.every(t => t.status === 'terminated')) {
