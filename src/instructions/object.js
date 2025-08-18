@@ -57,6 +57,36 @@ module.exports = {
       lockCount: 0,
       waitSet: [],
     };
+    
+    // Add JavaScript toString method that calls Java toString
+    objRef.toString = function() {
+      try {
+        // Try to find toString method in the class hierarchy
+        let currentType = this.type;
+        let toStringMethod = null;
+        
+        // First check if it's a JRE class
+        toStringMethod = jvm._jreFindMethod(currentType, 'toString', '()Ljava/lang/String;');
+        
+        // If not found, check parent classes
+        if (!toStringMethod) {
+          const classData = jvm.classes[currentType];
+          if (classData && classData.ast && classData.ast.classes[0].superClassName) {
+            const superClassName = classData.ast.classes[0].superClassName;
+            toStringMethod = jvm._jreFindMethod(superClassName, 'toString', '()Ljava/lang/String;');
+          }
+        }
+        
+        if (toStringMethod) {
+          const result = toStringMethod(jvm, this, []);
+          return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
+        }
+        return this.type.split('/').pop();
+      } catch (e) {
+        return this.type.split('/').pop();
+      }
+    };
+    
     frame.stack.push(objRef);
   },
 
@@ -221,7 +251,15 @@ module.exports = {
   },
   anewarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
+    const elementType = instruction.arg;
     const array = new Array(count).fill(null);
+    
+    // Set array type for proper runtime behavior
+    array.type = `[L${elementType};`;
+    array.elementType = elementType;
+    array.length = count;
+    array.hashCode = jvm.nextHashCode++;
+    
     frame.stack.push(array);
   },
 
