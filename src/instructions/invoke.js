@@ -14,55 +14,31 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
-  if (methodName === 'start' && descriptor === '()V') {
-    // Handle Thread.start()
-    const threadObject = obj;
-    const target = threadObject.runnable || threadObject;
-    const targetClassName = target.type;
+  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
 
-    const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
-    if (runMethod) {
-      const newThread = {
-        id: jvm.threads.length,
-        callStack: new Stack(),
-        status: 'runnable',
-      };
-      threadObject.nativeThread = newThread;
-      const newFrame = new Frame(runMethod);
-      newFrame.locals[0] = target; // 'this'
-      newThread.callStack.push(newFrame);
-      jvm.threads.push(newThread);
-    } else {
-      console.error(`Could not find run() method on ${targetClassName}`);
+  if (jreMethod) {
+    const result = jreMethod(jvm, obj, args, thread);
+    if (result !== ASYNC_METHOD_SENTINEL) {
+      const { returnType } = parseDescriptor(descriptor);
+      if (returnType !== 'V' && result !== undefined) {
+        if (typeof result === 'boolean') {
+          result = result ? 1 : 0;
+        }
+        frame.stack.push(result);
+      }
     }
-    return;
   } else {
-    const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
-
-    if (jreMethod) {
-      const result = jreMethod(jvm, obj, args, thread);
-      if (result !== ASYNC_METHOD_SENTINEL) {
-        const { returnType } = parseDescriptor(descriptor);
-        if (returnType !== 'V' && result !== undefined) {
-          if (typeof result === 'boolean') {
-            result = result ? 1 : 0;
-          }
-          frame.stack.push(result);
-        }
+    // This is for user-defined instance methods.
+    const method = jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
+    if (method) {
+      const newFrame = new Frame(method);
+      newFrame.locals[0] = obj; // 'this'
+      for (let i = 0; i < args.length; i++) {
+        newFrame.locals[i+1] = args[i];
       }
+      thread.callStack.push(newFrame);
     } else {
-      // This is for user-defined instance methods.
-      const method = jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
-      if (method) {
-        const newFrame = new Frame(method);
-        newFrame.locals[0] = obj; // 'this'
-        for (let i = 0; i < args.length; i++) {
-          newFrame.locals[i+1] = args[i];
-        }
-        thread.callStack.push(newFrame);
-      } else {
-        throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
-      }
+      throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
     }
   }
 }

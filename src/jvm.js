@@ -394,7 +394,16 @@ if(this.verbose) {
               return method;
           }
       } else {
-        return null;
+        // Class might not be loaded, try to load it.
+        const loadedClassData = this.loadClassByName(currentClassName);
+        if (loadedClassData) {
+          const method = this.findMethod(loadedClassData, methodName, descriptor);
+          if (method) {
+            return method;
+          }
+        } else {
+          return null;
+        }
       }
       currentClassName = classData.ast.classes[0].superClassName;
     }

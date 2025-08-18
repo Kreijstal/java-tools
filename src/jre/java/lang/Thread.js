@@ -1,3 +1,5 @@
+const { ASYNC_METHOD_SENTINEL } = require('../../../constants');
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -17,7 +19,7 @@ module.exports = {
       const target = threadObject.runnable || threadObject;
       const targetClassName = target.type;
 
-      const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
+      const runMethod = jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
       if (runMethod) {
         const newThread = {
           id: jvm.threads.length,
@@ -32,6 +34,7 @@ module.exports = {
       } else {
         console.error(`Could not find run() method on ${targetClassName}`);
       }
+      return ASYNC_METHOD_SENTINEL;
     },
     'join()V': (jvm, obj, args, thread) => {
       const threadToJoin = obj.nativeThread;
