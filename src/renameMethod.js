@@ -34,6 +34,18 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
 
   // TODO: Handle inheritance. This implementation only renames direct references
   // and does not account for polymorphism.
+  // Basic inheritance support: check if method calls on superclasses should also be renamed
+  function shouldRenameMethodCall(callTargetClass, callMethodName, renameTargetClass, renameMethodName) {
+    // Direct match
+    if (callTargetClass === renameTargetClass && callMethodName === renameMethodName) {
+      return true;
+    }
+    
+    // For now, we could add basic superclass checking here, but it requires
+    // access to the workspace hierarchy which isn't available in this context.
+    // A full implementation would need the workspace reference to check inheritance.
+    return false;
+  }
 
   const methodRef = isMap ? children.get(oldMethodName) : children[oldMethodName];
   if (!methodRef) {
@@ -71,7 +83,7 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
         const targetClass = instruction.arg[1];
         if (Array.isArray(instruction.arg[2])) {
             const [methodName, descriptor] = instruction.arg[2];
-            if (targetClass === className && methodName === oldMethodName) {
+            if (shouldRenameMethodCall(targetClass, methodName, className, oldMethodName)) {
               instruction.arg[2][0] = newMethodName;
             }
         }

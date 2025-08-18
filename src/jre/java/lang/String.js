@@ -18,7 +18,10 @@ module.exports = {
       return obj === args[0] ? 1 : 0;
     },
     'substring(II)Ljava/lang/String;': (jvm, obj, args) => {
-        throw new Error('NotImplementedError: String.substring is not implemented.');
+        const startIndex = args[0];
+        const endIndex = args[1];
+        const result = obj.substring(startIndex, endIndex);
+        return jvm.internString(result);
     },
   },
 };

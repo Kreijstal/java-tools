@@ -60,7 +60,10 @@ module.exports = {
       }
     },
     'print(Ljava/lang/String;)V': (jvm, obj, args) => {
-      throw new Error('NotImplementedError: PrintStream.print is not implemented.');
+      const message = args[0];
+      if (message !== null) {
+        process.stdout.write(message);
+      }
     },
   },
 };
