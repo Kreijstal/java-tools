@@ -19,7 +19,8 @@ function getValueByPath(obj, path) {
   return result;
 }
 
-function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, newMethodName) {
+function renameMethod(workspace, className, oldMethodName, newMethodName) {
+  const { workspaceASTs, referenceObj } = workspace;
   if (!referenceObj[className]) {
     throw new Error(`Class ${className} not found in referenceObj`);
   }
@@ -41,9 +42,16 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
       return true;
     }
     
-    // For now, we could add basic superclass checking here, but it requires
-    // access to the workspace hierarchy which isn't available in this context.
-    // A full implementation would need the workspace reference to check inheritance.
+    const hierarchy = workspace.getSupertypeHierarchy(callTargetClass);
+    if (hierarchy.some(supertype => supertype.identifier.className === renameTargetClass)) {
+        // This is a potential candidate for renaming, but we need to check
+        // if the method is overridden in the subclass. For simplicity, we'll
+        // rename for now, but a more robust solution would check for overrides.
+        if (callMethodName === renameMethodName) {
+            return true;
+        }
+    }
+
     return false;
   }
 
@@ -58,7 +66,7 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
   }
 
   methodRef.referees.forEach(referee => {
-    const ast = workspaceAsts[referee.className];
+    const ast = workspaceASTs[referee.className].ast;
     if (!ast) {
       console.warn(`AST for class ${referee.className} not found.`);
       return;

@@ -257,7 +257,7 @@ class KrakatauWorkspace {
     }
         this.referenceObj[cls.className].referees.push({
           className: cls.className,
-          astPath: `ast.classes.${classIndex}`
+          astPath: `classes.${classIndex}`
     });
 
     cls.items.forEach((item, itemIndex) => {
@@ -273,7 +273,7 @@ class KrakatauWorkspace {
         }
         this.referenceObj[cls.className].children.get(methodName).referees.push({
           className: cls.className,
-          astPath: `ast.classes.${classIndex}.items.${itemIndex}.method`
+          astPath: `classes.${classIndex}.items.${itemIndex}.method`
         });
 
         item.method.attributes.forEach((attr, attrIndex) => {
@@ -301,7 +301,7 @@ class KrakatauWorkspace {
                     // Store the reference with the className context (where the reference occurs)
                     targetRef.referees.push({ 
                       className: cls.className, // This is the class making the reference
-                      astPath: `ast.classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
+                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
                     });
                   }
                 }
@@ -811,7 +811,7 @@ class KrakatauWorkspace {
     refs.forEach(ref => modifiedClasses.add(ref.className));
 
     // Step 2: Apply the rename operation to the in-memory ASTs.
-    renameMethod(this.workspaceASTs, this.referenceObj, symbolIdentifier.className, symbolIdentifier.memberName, newName);
+    renameMethod(this, symbolIdentifier.className, symbolIdentifier.memberName, newName);
 
     // Step 3: Reassemble only the affected classes
     const modifiedAsts = { classes: [], constantPools: [] };
