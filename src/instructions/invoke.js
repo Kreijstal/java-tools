@@ -14,33 +14,46 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
-  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
-
-  if (jreMethod) {
-    const result = jreMethod(jvm, obj, args, thread);
-    if (result !== ASYNC_METHOD_SENTINEL) {
-      const { returnType } = parseDescriptor(descriptor);
-      if (returnType !== 'V' && result !== undefined) {
-        if (typeof result === 'boolean') {
-          result = result ? 1 : 0;
+  let currentClassName = obj.type;
+  while (currentClassName) {
+    const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
+    if (jreMethod) {
+      const result = jreMethod(jvm, obj, args, thread);
+      if (result !== ASYNC_METHOD_SENTINEL) {
+        const { returnType } = parseDescriptor(descriptor);
+        if (returnType !== 'V' && result !== undefined) {
+          if (typeof result === 'boolean') {
+            result = result ? 1 : 0;
+          }
+          frame.stack.push(result);
         }
-        frame.stack.push(result);
       }
+      return;
     }
-  } else {
-    // This is for user-defined instance methods.
-    const method = jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
-    if (method) {
-      const newFrame = new Frame(method);
-      newFrame.locals[0] = obj; // 'this'
-      for (let i = 0; i < args.length; i++) {
-        newFrame.locals[i+1] = args[i];
+
+    let classData = jvm.classes[currentClassName];
+    if (!classData) {
+      classData = await jvm.loadClassByName(currentClassName);
+    }
+
+    if (classData) {
+      const method = jvm.findMethod(classData, methodName, descriptor);
+      if (method) {
+        const newFrame = new Frame(method);
+        newFrame.locals[0] = obj; // 'this'
+        for (let i = 0; i < args.length; i++) {
+          newFrame.locals[i+1] = args[i];
+        }
+        thread.callStack.push(newFrame);
+        return;
       }
-      thread.callStack.push(newFrame);
+      currentClassName = classData.ast.classes[0].superClassName;
     } else {
-      throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
+      currentClassName = null;
     }
   }
+
+  throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
 }
 
 async function invokestatic(frame, instruction, jvm, thread) {

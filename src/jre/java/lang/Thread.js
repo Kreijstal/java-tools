@@ -19,7 +19,7 @@ module.exports = {
       const target = threadObject.runnable || threadObject;
       const targetClassName = target.type;
 
-      const runMethod = jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
+      const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
       if (runMethod) {
         const newThread = {
           id: jvm.threads.length,

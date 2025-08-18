@@ -9,7 +9,6 @@ const DebugManager = require('./DebugManager');
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
-const { ASYNC_METHOD_SENTINEL } = require('./constants');
 
 class JVM {
   constructor(options = {}) {
@@ -353,13 +352,13 @@ if(this.verbose) {
     }
   }
 
-  loadClassByName(classNameWithSlashes) {
+  async loadClassByName(classNameWithSlashes) {
     if (this.classes[classNameWithSlashes]) {
       return this.classes[classNameWithSlashes];
     }
 
     const classFilePath = path.join(this.classpath, `${classNameWithSlashes}.class`);
-    const classData = this.loadClassByPathSync(classFilePath);
+    const classData = await this.loadClassAsync(classFilePath);
     if (classData && classData.ast) {
         this.classes[classNameWithSlashes] = classData;
     }
@@ -384,27 +383,22 @@ if(this.verbose) {
     return method ? method.method : null;
   }
 
-  findMethodInHierarchy(className, methodName, descriptor) {
+  async findMethodInHierarchy(className, methodName, descriptor) {
     let currentClassName = className;
     while (currentClassName) {
-      const classData = this.classes[currentClassName];
-      if (classData) {
-          const method = this.findMethod(classData, methodName, descriptor);
-          if (method) {
-              return method;
-          }
-      } else {
-        // Class might not be loaded, try to load it.
-        const loadedClassData = this.loadClassByName(currentClassName);
-        if (loadedClassData) {
-          const method = this.findMethod(loadedClassData, methodName, descriptor);
-          if (method) {
-            return method;
-          }
-        } else {
+      let classData = this.classes[currentClassName];
+      if (!classData) {
+        classData = await this.loadClassByName(currentClassName);
+        if (!classData) {
           return null;
         }
       }
+
+      const method = this.findMethod(classData, methodName, descriptor);
+      if (method) {
+          return method;
+      }
+
       currentClassName = classData.ast.classes[0].superClassName;
     }
     return null;
