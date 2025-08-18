@@ -171,7 +171,10 @@ module.exports = {
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to get length of null array'
+      };
     }
     const length = arrayRef.length;
     frame.stack.push(length);
@@ -180,7 +183,10 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to access null array'
+      };
     }
     const value = arrayRef[index];
     frame.stack.push(value);
@@ -189,7 +195,10 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to access null array'
+      };
     }
     const value = arrayRef[index];
     frame.stack.push(value);
@@ -199,7 +208,10 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to store to null array'
+      };
     }
     arrayRef[index] = value;
   },
@@ -208,7 +220,10 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to store to null array'
+      };
     }
     arrayRef[index] = value;
   },
