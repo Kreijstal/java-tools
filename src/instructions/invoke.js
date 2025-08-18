@@ -67,6 +67,12 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 async function invokestatic(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
 
+  const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
+  if (wasFramePushed) {
+    frame.pc--;
+    return;
+  }
+
   const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
 
   if (jreMethod) {
