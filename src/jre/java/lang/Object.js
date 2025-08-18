@@ -22,6 +22,22 @@ module.exports = {
       const hashCode = obj.hashCode.toString(16);
       return jvm.internString(`${className}@${hashCode}`);
     },
+    'clone()Ljava/lang/Object;': (jvm, obj, args) => {
+      // Handle array cloning
+      if (obj.type && obj.type.startsWith('[')) {
+        const cloned = [...obj]; // Shallow copy of array elements
+        cloned.type = obj.type;
+        cloned.elementType = obj.elementType;
+        cloned.length = obj.length;
+        cloned.hashCode = jvm.nextHashCode++;
+        return cloned;
+      }
+      
+      // Basic clone implementation - shallow copy
+      const cloned = Object.assign({}, obj);
+      cloned.hashCode = jvm.nextHashCode++;
+      return cloned;
+    },
     'wait()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         // In a real implementation, this would throw IllegalMonitorStateException.

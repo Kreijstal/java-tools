@@ -15,5 +15,15 @@ module.exports = {
     'removeFirst()Ljava/lang/Object;': (jvm, obj, args) => {
       return obj.list.shift();
     },
+    'get(I)Ljava/lang/Object;': (jvm, obj, args) => {
+      const index = args[0];
+      if (index < 0 || index >= obj.list.length) {
+        throw {
+          type: 'java/lang/IndexOutOfBoundsException',
+          message: `Index: ${index}, Size: ${obj.list.length}`
+        };
+      }
+      return obj.list[index];
+    },
   },
 };

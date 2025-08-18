@@ -142,10 +142,19 @@ class JVM {
     let currentClass = this.jre[className];
     while (currentClass) {
       const methodKey = `${methodName}${descriptor}`;
-      const method = currentClass.methods[methodKey];
+      
+      // Check instance methods
+      const method = currentClass.methods && currentClass.methods[methodKey];
       if (method) {
         return method;
       }
+      
+      // Check static methods
+      const staticMethod = currentClass.staticMethods && currentClass.staticMethods[methodKey];
+      if (staticMethod) {
+        return staticMethod;
+      }
+      
       currentClass = this.jre[currentClass.super];
     }
     return null;
