@@ -7,6 +7,12 @@ module.exports = {
       const className = classData.ast.classes[0].className.replace(/\//g, '.');
       return jvm.internString(className);
     },
+    'getSimpleName()Ljava/lang/String;': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      const fullName = classData.ast.classes[0].className;
+      const simpleName = fullName.split('/').pop().split('$').pop();
+      return jvm.internString(simpleName);
+    },
     'getSuperclass()Ljava/lang/Class;': async (jvm, classObj, args) => {
       const classData = classObj._classData;
       const superClassName = classData.ast.classes[0].superClassName;

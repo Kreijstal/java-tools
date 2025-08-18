@@ -4,8 +4,13 @@ const jreClasses = {
   'java/lang/Class': require('./java/lang/Class'),
   'java/lang/String': require('./java/lang/String'),
   'java/lang/StringBuilder': require('./java/lang/StringBuilder'),
+  'java/lang/Enum': require('./java/lang/Enum'),
   'java/lang/Runnable': require('./java/lang/Runnable'),
   'java/lang/Thread': require('./java/lang/Thread'),
+  'java/lang/Throwable': require('./java/lang/Throwable'),
+  'java/lang/Exception': require('./java/lang/Exception'),
+  'java/lang/RuntimeException': require('./java/lang/RuntimeException'),
+  'java/lang/ArithmeticException': require('./java/lang/ArithmeticException'),
   'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException'),
   'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException'),
   'java/lang/invoke/LambdaMetafactory': require('./java/lang/invoke/LambdaMetafactory'),
@@ -25,6 +30,7 @@ const jreClasses = {
   'java/net/URLConnection': require('./java/net/URLConnection'),
   'java/net/HttpURLConnection': require('./java/net/HttpURLConnection'),
   'java/util/LinkedList': require('./java/util/LinkedList'),
+  'java/util/Objects': require('./java/util/Objects'),
 };
 
 module.exports = jreClasses;

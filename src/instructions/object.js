@@ -221,7 +221,15 @@ module.exports = {
   },
   anewarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
+    const elementType = instruction.arg;
     const array = new Array(count).fill(null);
+    
+    // Set array type for proper runtime behavior
+    array.type = `[L${elementType};`;
+    array.elementType = elementType;
+    array.length = count;
+    array.hashCode = jvm.nextHashCode++;
+    
     frame.stack.push(array);
   },
 

@@ -23,6 +23,25 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
 
   let currentClassName = obj.type;
+  
+  // Handle arrays - they inherit from Object
+  if (currentClassName && currentClassName.startsWith('[')) {
+    const jreMethod = jvm._jreFindMethod('java/lang/Object', methodName, descriptor);
+    if (jreMethod) {
+      const result = jreMethod(jvm, obj, args, thread);
+      if (result !== ASYNC_METHOD_SENTINEL) {
+        const { returnType } = parseDescriptor(descriptor);
+        if (returnType !== 'V' && result !== undefined) {
+          if (typeof result === 'boolean') {
+            result = result ? 1 : 0;
+          }
+          frame.stack.push(result);
+        }
+      }
+      return;
+    }
+  }
+  
   while (currentClassName) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
@@ -260,30 +279,84 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 
 async function invokeinterface(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
+  const { params } = parseDescriptor(descriptor);
+  const args = [];
+  for (let i = 0; i < params.length; i++) {
+    args.unshift(frame.stack.pop());
+  }
+  const obj = frame.stack.pop();
 
-  // For a functional interface, the method handle is stored on the object.
-  const runnable = frame.stack.pop();
-
-  if (!runnable || !runnable.methodHandle) {
-    throw new Error('NotImplementedError: invokeinterface is only supported for lambdas.');
+  // Check for null object reference
+  if (obj === null) {
+    throw {
+      type: 'java/lang/NullPointerException',
+      message: 'Attempted to invoke interface method on null object reference'
+    };
   }
 
-  const targetMethodHandle = runnable.methodHandle;
+  // For a functional interface with method handle (lambdas)
+  if (obj.methodHandle) {
+    const targetMethodHandle = obj.methodHandle;
 
-  // Now, invoke the target method. It's a static method in this case.
-  const lambdaInstruction = {
-    op: 'invokestatic',
-    arg: [
-      'Method',
-      targetMethodHandle.reference.className,
-      [
-        targetMethodHandle.reference.nameAndType.name,
-        targetMethodHandle.reference.nameAndType.descriptor
+    // Now, invoke the target method. It's a static method in this case.
+    const lambdaInstruction = {
+      op: 'invokestatic',
+      arg: [
+        'Method',
+        targetMethodHandle.reference.className,
+        [
+          targetMethodHandle.reference.nameAndType.name,
+          targetMethodHandle.reference.nameAndType.descriptor
+        ]
       ]
-    ]
-  };
+    };
 
-  await invokestatic(frame, lambdaInstruction, jvm, thread);
+    await invokestatic(frame, lambdaInstruction, jvm, thread);
+    return;
+  }
+
+  // For regular interface implementations, treat like invokevirtual
+  // First check JRE methods
+  let currentClassName = obj.type;
+  while (currentClassName) {
+    const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
+    if (jreMethod) {
+      const result = jreMethod(jvm, obj, args, thread);
+      if (result !== ASYNC_METHOD_SENTINEL) {
+        const { returnType } = parseDescriptor(descriptor);
+        if (returnType !== 'V' && result !== undefined) {
+          if (typeof result === 'boolean') {
+            result = result ? 1 : 0;
+          }
+          frame.stack.push(result);
+        }
+      }
+      return;
+    }
+
+    let classData = jvm.classes[currentClassName];
+    if (!classData) {
+      classData = await jvm.loadClassByName(currentClassName);
+    }
+
+    if (classData) {
+      const method = jvm.findMethod(classData, methodName, descriptor);
+      if (method) {
+        const newFrame = new Frame(method);
+        newFrame.locals[0] = obj; // 'this'
+        for (let i = 0; i < args.length; i++) {
+          newFrame.locals[i+1] = args[i];
+        }
+        thread.callStack.push(newFrame);
+        return;
+      }
+      currentClassName = classData.ast.classes[0].superClassName;
+    } else {
+      currentClassName = null;
+    }
+  }
+
+  throw new Error(`Unsupported invokeinterface: ${obj.type}.${methodName}${descriptor}`);
 }
 
 const invokeHandlers = {
