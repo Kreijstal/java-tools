@@ -117,15 +117,8 @@ module.exports = {
     objRef.fields[`${className}.${fieldName}`] = value;
   },
 
-  getstatic: async (frame, instruction, jvm) => {
+  getstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
-
-    // First try JRE classes
-    const jreField = jvm._jreFindStaticField(className, fieldName, descriptor);
-    if (jreField !== null) {
-      frame.stack.push(jreField);
-      return;
-    }
 
     const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) {
@@ -147,42 +140,24 @@ module.exports = {
 
   
 
-    putstatic: async (frame, instruction, jvm) => {
+  putstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const value = frame.stack.pop();
 
-    // Try user-defined classes
-    const classData = await jvm.loadClassByName(className);
-    if (classData) {
-      // Initialize static fields if not already done
-      if (!classData.staticFields) {
-        await jvm._initializeStaticFields(classData);
-      }
-      
+    const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) {
+      frame.pc--; // Re-run this instruction after <clinit> is done.
+      return;
+    }
+
+    const classData = jvm.classes[className];
+    if (classData && classData.staticFields) {
       const fieldKey = `${fieldName}:${descriptor}`;
-      classData.staticFields[fieldKey] = value;
+      classData.staticFields.set(fieldKey, value);
       return;
     }
 
     throw new Error(`Unsupported putstatic: ${className}.${fieldName}`);
-  },
-    // Then try user-defined classes
-    const classData = await jvm.loadClassByName(className);
-    if (classData) {
-      // Initialize static fields if not already done
-      if (!classData.staticFields) {
-        await jvm._initializeStaticFields(classData);
-      }
-      
-      const fieldKey = `${fieldName}:${descriptor}`;
-      const value = classData.staticFields[fieldKey];
-      if (value !== undefined) {
-        frame.stack.push(value);
-        return;
-      }
-    }
-
-    throw new Error(`Unsupported getstatic: ${className}.${fieldName}`);
   },
 
   arraylength: (frame, instruction, jvm) => {
