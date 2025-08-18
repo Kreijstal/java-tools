@@ -33,6 +33,7 @@ class JVM {
       'java/lang/Exception': 'java/lang/Throwable',
       'java/lang/RuntimeException': 'java/lang/Exception',
       'java/lang/IllegalArgumentException': 'java/lang/RuntimeException',
+      'java/lang/Runnable': 'java/lang/Object',
       'java/lang/ReflectiveOperationException': 'java/lang/Exception',
       'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
       'java/io/Reader': 'java/lang/Object',

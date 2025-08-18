@@ -167,7 +167,9 @@ function convertJson(inputJson, constantPool) {
         superClassName: inputJson.superClassName
           ? inputJson.superClassName.replace(/\./g, "/")
           : null,
-        interfaces: [], // Assuming no interfaces, adjust if needed
+        interfaces: inputJson.interfaces
+          ? inputJson.interfaces.map(iface => iface.replace(/\./g, "/"))
+          : [],
         items: []
       }
     ]
