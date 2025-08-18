@@ -16,6 +16,7 @@ class JVM {
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
     this.invokedynamicCache = new Map();
+    this.pendingAsyncOperations = 0;
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || '.';
@@ -122,15 +123,19 @@ class JVM {
   }
 
   _jreFindMethod(className, methodName, descriptor) {
+    console.error(`JREFIND: Searching for ${className}.${methodName}${descriptor}`);
     let currentClass = this.jre[className];
     while (currentClass) {
+      console.error(`JREFIND: Checking class ${JSON.stringify(Object.keys(currentClass))}`);
       const methodKey = `${methodName}${descriptor}`;
       const method = currentClass.methods[methodKey];
       if (method) {
+        console.error(`JREFIND: Found method.`);
         return method;
       }
       currentClass = this.jre[currentClass.super];
     }
+    console.error(`JREFIND: Method not found.`);
     return null;
   }
 
@@ -232,7 +237,7 @@ class JVM {
       }
     }
 
-    if (this.threads.every(t => t.status === 'terminated')) {
+    if (this.threads.every(t => t.status === 'terminated') && this.pendingAsyncOperations === 0) {
       return { completed: true };
     }
 

@@ -47,9 +47,11 @@ module.exports = {
 
       const thread = jvm.threads[jvm.currentThreadIndex];
 
+      jvm.pendingAsyncOperations++;
       return new Promise((resolve) => {
         thread.isAwaitingReflectiveCall = true;
         thread.reflectiveCallResolver = (ret) => {
+          jvm.pendingAsyncOperations--;
           resolve(ret);
         };
         thread.callStack.push(newFrame);

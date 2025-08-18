@@ -13,6 +13,11 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
+  // TODO: This is a special case for Method.invoke. Ideally, this should be handled
+  // by the generic JRE method dispatch. However, removing this special case causes
+  // the JVM to exit prematurely without an error, even when the native method is
+  // found correctly. This points to a subtle bug in the async execution of the
+  // JVM main loop that needs further investigation.
   if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
     const methodObj = obj;
     const obj_for_invoke = args[0];
