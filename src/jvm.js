@@ -100,7 +100,10 @@ class JVM {
   }
 
   internString(str) {
-    return str;
+    // Create a string object with proper type property for invokevirtual
+    const stringObj = new String(str);
+    stringObj.type = 'java/lang/String';
+    return stringObj;
   }
 
   _setTestOutputCallback(callback) {

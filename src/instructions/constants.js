@@ -17,7 +17,7 @@ module.exports = {
       }
     } else {
       const value = instruction.arg.replace(/"/g, '');
-      frame.stack.push(value);
+      frame.stack.push(jvm.internString(value));
     }
   },
   bipush: (frame, instruction) => {
