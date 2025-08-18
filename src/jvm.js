@@ -116,6 +116,7 @@ class JVM {
     return stringObj;
   }
 
+
   _setTestOutputCallback(callback) {
     this.testOutputCallback = callback;
   }
