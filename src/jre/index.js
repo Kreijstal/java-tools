@@ -12,6 +12,8 @@ const jreClasses = {
   'java/lang/invoke/StringConcatFactory': require('./java/lang/invoke/StringConcatFactory'),
   'java/lang/reflect/Method': require('./java/lang/reflect/Method'),
   'java/lang/Integer': require('./java/lang/Integer'),
+  'java/lang/Appendable': require('./java/lang/Appendable'),
+  'java/io/OutputStream': require('./java/io/OutputStream'),
   'java/io/InputStreamReader': require('./java/io/InputStreamReader'),
   'java/io/BufferedReader': require('./java/io/BufferedReader'),
   'java/io/BufferedInputStream': require('./java/io/BufferedInputStream'),
