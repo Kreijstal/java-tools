@@ -2,7 +2,8 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { KrakatauWorkspace, SymbolIdentifier } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require("../src/KrakatauWorkspace");
+const { SymbolIdentifier } = require("../src/symbols");
 
 // Test re-enabled after fixing KrakatauWorkspace.applyRenameAndSave
 test('replaceMethod functionality', async function(t) {
