@@ -4,7 +4,7 @@ const { unparseDataStructures } = require('./convert_tree');
 const path = require('path');
  
 function assembleClasses(root, baseOutputDir = '.') {
-  root.classes.forEach(cls => {
+  root.classes.forEach((cls, index) => {
     const fullClassName = cls.className.replace(/\//g, '.');
     const packagePath = fullClassName.substring(0, fullClassName.lastIndexOf('.'));
     const simpleClassName = fullClassName.substring(fullClassName.lastIndexOf('.') + 1);
@@ -16,8 +16,9 @@ function assembleClasses(root, baseOutputDir = '.') {
     // Ensure the package directory exists
     fs.mkdirSync(packageDir, { recursive: true });
 
-    // Unparse the class to a .j file
-    const jContent = unparseDataStructures(cls);
+    // Unparse the class to a .j file, using the corresponding constant pool
+    const constantPool = root.constantPools && root.constantPools[index] ? root.constantPools[index] : null;
+    const jContent = unparseDataStructures(cls, constantPool);
     fs.writeFileSync(jFileName, jContent);
 
     // Find Krakatau binary relative to project root

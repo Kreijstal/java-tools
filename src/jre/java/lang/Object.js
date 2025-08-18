@@ -49,15 +49,48 @@ module.exports = {
       // BLOCKED on this object's monitor.
     },
     'wait(J)V': (jvm, obj, args, thread) => {
-      // For now, this is a stub that does nothing.
+      // Implementation for wait with timeout (milliseconds)
+      const timeout = args[0]; // BigInt or number
+      
+      if (obj.lockOwner !== thread.id) {
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
+      }
+      
+      // For simplicity, treat timed wait same as regular wait in this mock implementation
+      // In a real JVM, this would involve timers and timeout handling
+      const waitMethod = obj.methods ? obj.methods['wait()V'] : module.exports.methods['wait()V'];
+      if (waitMethod) {
+        waitMethod(jvm, obj, [], thread);
+      }
     },
     'wait(JI)V': (jvm, obj, args, thread) => {
-      // For now, this is a stub that does nothing.
+      // Implementation for wait with timeout (milliseconds) and nanos  
+      const timeout = args[0]; // BigInt or number - milliseconds
+      const nanos = args[1]; // int - nanoseconds
+      
+      if (obj.lockOwner !== thread.id) {
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
+      }
+      
+      // For simplicity, treat timed wait same as regular wait in this mock implementation
+      // In a real JVM, this would involve precise timing with milliseconds + nanoseconds
+      const waitMethod = obj.methods ? obj.methods['wait()V'] : module.exports.methods['wait()V'];
+      if (waitMethod) {
+        waitMethod(jvm, obj, [], thread);
+      }
     },
     'notify()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // TODO: throw IllegalMonitorStateException
-        return;
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
       }
       if (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
@@ -67,8 +100,10 @@ module.exports = {
     },
     'notifyAll()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // TODO: throw IllegalMonitorStateException
-        return;
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
       }
       while (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();

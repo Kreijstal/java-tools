@@ -20,8 +20,25 @@ module.exports = {
       if (currentClassData) {
         const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
         for (const field of classFields) {
-          // TODO: Use correct default values based on field descriptor
-          fields[`${currentClassName}.${field.field.name}`] = null;
+          // Use correct default values based on field descriptor
+          const descriptor = field.field.descriptor;
+          let defaultValue = null; // Default for object references
+          
+          // Set primitive defaults based on descriptor
+          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S') {
+            defaultValue = 0; // int, byte, short
+          } else if (descriptor === 'J') {
+            defaultValue = BigInt(0); // long
+          } else if (descriptor === 'F' || descriptor === 'D') {
+            defaultValue = 0.0; // float, double
+          } else if (descriptor === 'Z') {
+            defaultValue = 0; // boolean (false)
+          } else if (descriptor === 'C') {
+            defaultValue = 0; // char ('\0')
+          }
+          // Object references (L...;) and arrays ([...) default to null
+          
+          fields[`${currentClassName}.${field.field.name}`] = defaultValue;
         }
         const superClassName = currentClassData.ast.classes[0].superClassName;
         if (superClassName) {
