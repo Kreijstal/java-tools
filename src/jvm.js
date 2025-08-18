@@ -15,6 +15,7 @@ class JVM {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
+    this.classInitializationState = new Map();
     this.invokedynamicCache = new Map();
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
@@ -59,7 +60,8 @@ class JVM {
             flags: ['public']
           }]
         },
-        constantPool: []
+        constantPool: [],
+        staticFields: new Map(),
       };
       this.classes[className] = classStub;
     }
@@ -86,7 +88,8 @@ class JVM {
                     flags: ['public']
                   }]
                 },
-                constantPool: []
+                constantPool: [],
+                staticFields: new Map(),
               };
               this.classes[className] = classStub;
             }
@@ -148,18 +151,6 @@ class JVM {
     return null;
   }
 
-  _jreFindStaticField(className, fieldName, descriptor) {
-    let currentClass = this.jre[className];
-    while (currentClass) {
-      const fieldKey = `${fieldName}:${descriptor}`;
-      const field = currentClass.staticFields[fieldKey];
-      if (field) {
-        return field;
-      }
-      currentClass = this.jre[currentClass.super];
-    }
-    return null;
-  }
 
   _jreGetNative(className, nativeName) {
     return this.jre[className][nativeName];
@@ -185,9 +176,10 @@ class JVM {
       callStack: new Stack(),
       status: 'runnable',
     };
-    const initialFrame = new Frame(mainMethod);
-    mainThread.callStack.push(initialFrame);
     this.threads.push(mainThread);
+
+    const mainFrame = new Frame(mainMethod);
+    mainThread.callStack.push(mainFrame);
 
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
         await this.execute();
@@ -348,6 +340,7 @@ if(this.verbose) {
     try {
       const classData = await loadClassByPath(classFilePath, options);
       if (classData) {
+        classData.staticFields = new Map();
         this.classes[classData.ast.classes[0].className] = classData;
       }
       return classData;
@@ -356,6 +349,7 @@ if(this.verbose) {
       try {
         const classData = loadConvertedClass(classFilePath, options);
         if (classData) {
+          classData.staticFields = new Map();
           this.classes[classData.ast.classes[0].className] = classData;
         }
         return classData;
@@ -379,6 +373,51 @@ if(this.verbose) {
     return classData;
   }
 
+  async initializeClassIfNeeded(className, thread) {
+    if (!className || this.classInitializationState.get(className) === 'INITIALIZED') {
+      return false;
+    }
+
+    if (this.classInitializationState.get(className) === 'INITIALIZING') {
+      // In a real multi-threaded JVM, the current thread would wait.
+      return false;
+    }
+
+    this.classInitializationState.set(className, 'INITIALIZING');
+
+    const classData = await this.loadClassByName(className);
+    if (classData) {
+      const superClassName = classData.ast.classes[0].superClassName;
+      if (superClassName) {
+        const wasSuperPushed = await this.initializeClassIfNeeded(superClassName, thread);
+        if (wasSuperPushed) {
+          return true;
+        }
+      }
+
+      // Check for and execute native initializer
+      const nativeClinit = this._jreFindMethod(className, '<clinit>', '()V');
+      if (nativeClinit) {
+        nativeClinit(this, null, [], thread);
+      }
+
+      // Check for and execute bytecode initializer
+      const staticInitializer = this.findStaticInitializer(classData);
+      if (staticInitializer) {
+        const clinitFrame = new Frame(staticInitializer);
+        thread.callStack.push(clinitFrame);
+        // We pushed a bytecode initializer, so the calling instruction needs to be re-run.
+        // We set the state to initialized here to prevent re-entry, but the <clinit>
+        // code itself will run before any other instruction on this thread.
+        this.classInitializationState.set(className, 'INITIALIZED');
+        return true;
+      }
+    }
+
+    this.classInitializationState.set(className, 'INITIALIZED');
+    return false;
+  }
+
   findMainMethod(classData) {
     const mainMethod = classData.ast.classes[0].items.find(item => {
       return item.type === 'method' &&
@@ -386,6 +425,15 @@ if(this.verbose) {
              item.method.descriptor === '([Ljava/lang/String;)V';
     });
     return mainMethod ? mainMethod.method : null;
+  }
+
+  findStaticInitializer(classData) {
+    const clinitMethod = classData.ast.classes[0].items.find(item => {
+      return item.type === 'method' &&
+             item.method.name === '<clinit>' &&
+             item.method.descriptor === '()V';
+    });
+    return clinitMethod ? clinitMethod.method : null;
   }
 
   findMethod(classData, methodName, descriptor) {

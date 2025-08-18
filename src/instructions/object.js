@@ -1,6 +1,13 @@
 module.exports = {
-  new: (frame, instruction, jvm) => {
+  new: async (frame, instruction, jvm, thread) => {
     const className = instruction.arg;
+
+    const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) {
+      frame.pc--;
+      return;
+    }
+
     try {
       jvm.loadClassByName(className);
     } catch (e) {
@@ -20,24 +27,15 @@ module.exports = {
       if (currentClassData) {
         const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
         for (const field of classFields) {
-          // Use correct default values based on field descriptor
           const descriptor = field.field.descriptor;
-          let defaultValue = null; // Default for object references
-          
-          // Set primitive defaults based on descriptor
-          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S') {
-            defaultValue = 0; // int, byte, short
+          let defaultValue = null;
+          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S' || descriptor === 'Z' || descriptor === 'C') {
+            defaultValue = 0;
           } else if (descriptor === 'J') {
-            defaultValue = BigInt(0); // long
+            defaultValue = BigInt(0);
           } else if (descriptor === 'F' || descriptor === 'D') {
-            defaultValue = 0.0; // float, double
-          } else if (descriptor === 'Z') {
-            defaultValue = 0; // boolean (false)
-          } else if (descriptor === 'C') {
-            defaultValue = 0; // char ('\0')
+            defaultValue = 0.0;
           }
-          // Object references (L...;) and arrays ([...) default to null
-          
           fields[`${currentClassName}.${field.field.name}`] = defaultValue;
         }
         const superClassName = currentClassData.ast.classes[0].superClassName;
@@ -119,16 +117,46 @@ module.exports = {
     objRef.fields[`${className}.${fieldName}`] = value;
   },
 
-  getstatic: (frame, instruction, jvm) => {
+  getstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
 
-    const field = jvm._jreFindStaticField(className, fieldName, descriptor);
-    if (field) {
-      frame.stack.push(field);
+    const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) {
+      frame.pc--; // Re-run this instruction after <clinit> is done.
+      return;
+    }
+
+    const classData = jvm.classes[className];
+    if (classData && classData.staticFields) {
+      const fieldKey = `${fieldName}:${descriptor}`;
+      if (classData.staticFields.has(fieldKey)) {
+        frame.stack.push(classData.staticFields.get(fieldKey));
+        return;
+      }
+    }
+
+    throw new Error(`Unresolved static field: ${className}.${fieldName}`);
+  },
+
+  putstatic: async (frame, instruction, jvm, thread) => {
+    const [_, className, [fieldName, descriptor]] = instruction.arg;
+
+    const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) {
+      frame.pc--; // Re-run this instruction after <clinit> is done.
+      return;
+    }
+
+    const value = frame.stack.pop();
+    const classData = jvm.classes[className];
+    if (classData && classData.staticFields) {
+      const fieldKey = `${fieldName}:${descriptor}`;
+      classData.staticFields.set(fieldKey, value);
     } else {
-      throw new Error(`Unsupported getstatic: ${className}.${fieldName}`);
+      throw new Error(`Could not find class data for ${className} to putstatic`);
     }
   },
+
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
