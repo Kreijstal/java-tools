@@ -180,14 +180,22 @@ class JVM {
       return;
     }
 
+    const staticInitializer = this.findStaticInitializer(classData);
+
     const mainThread = {
       id: 0,
       callStack: new Stack(),
       status: 'runnable',
     };
-    const initialFrame = new Frame(mainMethod);
-    mainThread.callStack.push(initialFrame);
     this.threads.push(mainThread);
+
+    const mainFrame = new Frame(mainMethod);
+    mainThread.callStack.push(mainFrame);
+
+    if (staticInitializer) {
+      const clinitFrame = new Frame(staticInitializer);
+      mainThread.callStack.push(clinitFrame);
+    }
 
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
         await this.execute();
@@ -386,6 +394,15 @@ if(this.verbose) {
              item.method.descriptor === '([Ljava/lang/String;)V';
     });
     return mainMethod ? mainMethod.method : null;
+  }
+
+  findStaticInitializer(classData) {
+    const clinitMethod = classData.ast.classes[0].items.find(item => {
+      return item.type === 'method' &&
+             item.method.name === '<clinit>' &&
+             item.method.descriptor === '()V';
+    });
+    return clinitMethod ? clinitMethod.method : null;
   }
 
   findMethod(classData, methodName, descriptor) {
