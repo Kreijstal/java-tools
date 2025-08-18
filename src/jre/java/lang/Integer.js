@@ -8,6 +8,14 @@ module.exports = {
     },
   },
   methods: {
+    '<init>(I)V': (jvm, obj, args) => {
+      obj.value = args[0];
+      
+      // Add JavaScript toString method for proper string concatenation
+      obj.toString = function() {
+        return this.value.toString();
+      };
+    },
     'valueOf(I)Ljava/lang/Integer;': (jvm, _, args) => {
       const integerObj = {
         type: 'java/lang/Integer',
