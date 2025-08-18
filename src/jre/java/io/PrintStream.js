@@ -11,6 +11,36 @@ module.exports = {
       }
     },
 
+    'println(D)V': (jvm, obj, args) => {
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
+      }
+    },
+
+    'println(F)V': (jvm, obj, args) => {
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
+      }
+    },
+
+    'println(J)V': (jvm, obj, args) => {
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
+      }
+    },
+
     'write(I)V': (jvm, obj, args) => {
       // Delegate to the superclass (FilterOutputStream)
       const superClass = jvm.jre[obj.type].super;

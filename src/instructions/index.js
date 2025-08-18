@@ -6,6 +6,7 @@ const math = require('./math');
 const control = require('./control');
 const invoke = require('./invoke');
 const object = require('./object');
+const conversions = require('./conversions');
 
 const instructions = {
   ...constants,
@@ -16,6 +17,7 @@ const instructions = {
   ...control,
   ...invoke,
   ...object,
+  ...conversions,
 };
 
 module.exports = async function dispatch(frame, instruction, jvm, thread) {
