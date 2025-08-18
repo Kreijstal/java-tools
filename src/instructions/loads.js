@@ -33,4 +33,67 @@ module.exports = {
   aload_3: (frame) => {
     frame.stack.push(frame.locals[3]);
   },
+  iaload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  laload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  faload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  daload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  baload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  caload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  saload: (frame) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw new Error('NullPointerException');
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
 };

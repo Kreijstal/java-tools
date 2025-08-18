@@ -268,6 +268,28 @@ module.exports = {
     frame.stack.push(0); // No match found in the hierarchy
   },
 
+  multianewarray: (frame, instruction, jvm) => {
+    const [className, dimensions] = instruction.arg;
+    const counts = [];
+    for (let i = 0; i < dimensions; i++) {
+      counts.unshift(frame.stack.pop());
+    }
+
+    const createMultiArray = (dims) => {
+      const count = dims.shift();
+      const arr = new Array(count).fill(null);
+      if (dims.length > 0) {
+        for (let i = 0; i < count; i++) {
+          arr[i] = createMultiArray([...dims]);
+        }
+      }
+      return arr;
+    };
+
+    const newArray = createMultiArray(counts);
+    frame.stack.push(newArray);
+  },
+
   checkcast: (frame, instruction, jvm) => {
     const targetClassName = instruction.arg;
     const objRef = frame.stack.peek(); // Don't pop, just peek
