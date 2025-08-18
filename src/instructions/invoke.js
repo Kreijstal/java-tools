@@ -14,6 +14,14 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
+  // Check for null object reference
+  if (obj === null) {
+    throw {
+      type: 'java/lang/NullPointerException',
+      message: 'Attempted to invoke virtual method on null object reference'
+    };
+  }
+
   let currentClassName = obj.type;
   while (currentClassName) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
