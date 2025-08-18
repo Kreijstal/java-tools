@@ -2,9 +2,10 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { KrakatauWorkspace, SymbolIdentifier } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { SymbolIdentifier } = require('../src/symbols');
 
-test.skip('rename method functionality', async (t) => {
+test('rename method functionality', async (t) => {
   const tempDir = path.join(__dirname, 'temp_rename_test');
   const sourcesDir = path.join(__dirname, '../sources');
 
@@ -26,17 +27,26 @@ test.skip('rename method functionality', async (t) => {
     const symbolIdentifier = new SymbolIdentifier('TestMethods', 'publicMethod1');
     await workspace.applyRenameAndSave(symbolIdentifier, 'renamedPublicMethod', tempDir);
 
-    // 4. Verify the rename
-    const classFilePath = path.join(tempDir, 'TestMethods.class');
-    const classDetails = execSync(`javap -public ${classFilePath}`).toString();
-    t.ok(classDetails.includes('renamedPublicMethod'), 'TestMethods.class should contain renamedPublicMethod');
-    t.notOk(classDetails.includes('publicMethod1'), 'TestMethods.class should not contain publicMethod1');
+    // 4. Verify the rename using KrakatauWorkspace
+    const verificationWorkspace = await KrakatauWorkspace.create(tempDir);
 
-    // Also verify that the runner was updated
-    const runnerClassFilePath = path.join(tempDir, 'TestMethodsRunner.class');
-    const runnerDetails = execSync(`javap -c ${runnerClassFilePath}`).toString();
-    t.ok(runnerDetails.includes('invokevirtual'), 'TestMethodsRunner should have an invokevirtual instruction');
-    t.ok(runnerDetails.includes('// Method TestMethods.renamedPublicMethod:()V'), 'TestMethodsRunner should call renamedPublicMethod');
+    // Verify TestMethods.class
+    const testMethodsAst = verificationWorkspace.getClassAST('TestMethods');
+    const methods = testMethodsAst.classes[0].items.filter(item => item.type === 'method');
+    const renamedMethod = methods.find(m => m.method.name === 'renamedPublicMethod');
+    const oldMethod = methods.find(m => m.method.name === 'publicMethod1');
+    t.ok(renamedMethod, 'TestMethods.class should contain renamedPublicMethod');
+    t.notOk(oldMethod, 'TestMethods.class should not contain publicMethod1');
+
+    // Verify TestMethodsRunner.class
+    const runnerAst = verificationWorkspace.getClassAST('TestMethodsRunner');
+    const mainMethod = runnerAst.classes[0].items.find(item => item.method.name === 'main');
+    const code = mainMethod.method.attributes.find(attr => attr.type === 'code').code;
+    const invokeVirtualInstructions = code.codeItems.filter(item => item.instruction && item.instruction.op === 'invokevirtual');
+    t.ok(invokeVirtualInstructions.length > 0, 'TestMethodsRunner should have at least one invokevirtual instruction');
+
+    const renamedCall = invokeVirtualInstructions.find(instr => instr.instruction.arg[2][0] === 'renamedPublicMethod');
+    t.ok(renamedCall, 'TestMethodsRunner should call renamedPublicMethod');
 
 
     // 5. Run the modified code and check the output

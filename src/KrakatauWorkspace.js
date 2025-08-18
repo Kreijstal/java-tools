@@ -6,94 +6,15 @@ const { unparseDataStructures } = require('./convert_tree');
 const { assembleClasses } = require('./assembleAndRun');
 const { renameMethod } = require('./renameMethod');
 
-/**
- * Represents a unique identifier for a symbol (class, method, field)
- */
-class SymbolIdentifier {
-  constructor(className, memberName = null, descriptor = null) {
-    this.className = className;
-    this.memberName = memberName;
-    this.descriptor = descriptor;
-  }
-
-  toString() {
-    if (this.memberName) {
-      return `${this.className}.${this.memberName}${this.descriptor ? `(${this.descriptor})` : ''}`;
-    }
-    return this.className;
-  }
-}
-
-/**
- * Represents a location in the AST where a symbol is defined or referenced
- */
-class SymbolLocation {
-  constructor(className, astPath, line = null, column = null) {
-    this.className = className;
-    this.astPath = astPath;
-    this.line = line;
-    this.column = column;
-  }
-}
-
-/**
- * Represents the definition of a symbol with its properties
- */
-class SymbolDefinition {
-  constructor(identifier, location, kind, flags = [], descriptor = null) {
-    this.identifier = identifier;
-    this.location = location;
-    this.kind = kind; // 'class', 'method', 'field', 'interface'
-    this.flags = flags; // ['public', 'static', etc.]
-    this.descriptor = descriptor;
-  }
-}
-
-/**
- * Hierarchical tree structure for organizing symbols
- */
-class SymbolTree {
-  constructor(symbol, children = []) {
-    this.symbol = symbol;
-    this.children = children;
-  }
-}
-
-/**
- * Represents a single refactoring operation
- */
-class RefactorOperation {
-  constructor(className, astPath, operationType, newValue) {
-    this.className = className;
-    this.astPath = astPath;
-    this.operationType = operationType; // 'rename', 'move', 'delete', etc.
-    this.newValue = newValue;
-  }
-}
-
-/**
- * Represents a collection of refactoring operations
- */
-class WorkspaceEdit {
-  constructor(operations = []) {
-    this.operations = operations;
-  }
-
-  addOperation(operation) {
-    this.operations.push(operation);
-  }
-}
-
-/**
- * Represents a diagnostic issue found in the workspace
- */
-class Diagnostic {
-  constructor(location, message, severity = 'error') {
-    this.location = location;
-    this.message = message;
-    this.severity = severity; // 'error', 'warning', 'info'
-  }
-}
+const {
+  SymbolIdentifier,
+  SymbolLocation,
+  SymbolDefinition,
+  SymbolTree,
+  WorkspaceEdit,
+  RefactorOperation,
+  Diagnostic
+} = require('./symbols');
 
 /**
  * Main workspace class for Java bytecode analysis and refactoring
@@ -257,7 +178,7 @@ class KrakatauWorkspace {
     }
         this.referenceObj[cls.className].referees.push({
           className: cls.className,
-          astPath: `ast.classes.${classIndex}`
+          astPath: `classes.${classIndex}`
     });
 
     cls.items.forEach((item, itemIndex) => {
@@ -273,7 +194,7 @@ class KrakatauWorkspace {
         }
         this.referenceObj[cls.className].children.get(methodName).referees.push({
           className: cls.className,
-          astPath: `ast.classes.${classIndex}.items.${itemIndex}.method`
+          astPath: `classes.${classIndex}.items.${itemIndex}.method`
         });
 
         item.method.attributes.forEach((attr, attrIndex) => {
@@ -301,7 +222,7 @@ class KrakatauWorkspace {
                     // Store the reference with the className context (where the reference occurs)
                     targetRef.referees.push({ 
                       className: cls.className, // This is the class making the reference
-                      astPath: `ast.classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
+                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
                     });
                   }
                 }
@@ -452,40 +373,69 @@ class KrakatauWorkspace {
    * @returns {SymbolLocation[]} An array of SymbolLocations where the symbol is used.
    */
   findReferences(symbolIdentifier) {
-    const references = [];
+    const allReferences = [];
+    const classesToSearch = new Set([symbolIdentifier.className]);
+
+    // Add superclasses
+    const supertypes = this.getSupertypeHierarchy(symbolIdentifier.className);
+    supertypes.forEach(s => classesToSearch.add(s.identifier.className));
+
+    // Add subclasses (recursively)
+    const allSubtypes = this.getAllSubtypes(symbolIdentifier.className);
+    allSubtypes.forEach(s => classesToSearch.add(s.identifier.className));
     
-    // Look up the symbol in the reference object
-    const classRef = this.referenceObj[symbolIdentifier.className];
-    if (!classRef) {
-      return references;
-    }
+    const processedRefs = new Set();
 
-    if (symbolIdentifier.memberName) {
-      // Looking for method or field references
-      const memberRef = classRef.children.get(symbolIdentifier.memberName);
-      if (memberRef) {
-        memberRef.referees.forEach(referee => {
-          // Handle both old format (string) and new format (object with className)
-          if (typeof referee === 'string') {
-            references.push(new SymbolLocation(symbolIdentifier.className, referee));
-          } else {
-            references.push(new SymbolLocation(referee.className, referee.astPath));
-          }
-        });
-      }
-    } else {
-      // Looking for class references
-      classRef.referees.forEach(referee => {
-        // Handle both old format (string) and new format (object with className)
-        if (typeof referee === 'string') {
-          references.push(new SymbolLocation(symbolIdentifier.className, referee));
-        } else {
-          references.push(new SymbolLocation(referee.className, referee.astPath));
+    for (const className of classesToSearch) {
+        const classRef = this.referenceObj[className];
+        if (!classRef) {
+            continue;
         }
-      });
+
+        if (symbolIdentifier.memberName) {
+            // Looking for method or field references
+            const memberRef = classRef.children.get(symbolIdentifier.memberName);
+            if (memberRef) {
+                memberRef.referees.forEach(referee => {
+                    const refKey = `${referee.className}:${referee.astPath}`;
+                    if (!processedRefs.has(refKey)) {
+                        allReferences.push(new SymbolLocation(referee.className, referee.astPath));
+                        processedRefs.add(refKey);
+                    }
+                });
+            }
+        } else {
+            // Looking for class references
+            classRef.referees.forEach(referee => {
+                const refKey = `${referee.className}:${referee.astPath}`;
+                if (!processedRefs.has(refKey)) {
+                    allReferences.push(new SymbolLocation(referee.className, referee.astPath));
+                    processedRefs.add(refKey);
+                }
+            });
+        }
     }
 
-    return references;
+    // The above logic finds references TO the members of the hierarchy.
+    // We also need to include the definitions of the methods in the hierarchy as "references" to themselves,
+    // so that renameMethod can find and rename them.
+    for (const className of classesToSearch) {
+        const workspaceEntry = this.workspaceASTs[className];
+        if (workspaceEntry) {
+            const ast = workspaceEntry.ast;
+            ast.classes[0].items.forEach((item, itemIndex) => {
+                if (item.type === 'method' && item.method.name === symbolIdentifier.memberName) {
+                    const refKey = `${className}:classes.0.items.${itemIndex}.method`;
+                     if (!processedRefs.has(refKey)) {
+                        allReferences.push(new SymbolLocation(className, `classes.0.items.${itemIndex}.method`));
+                        processedRefs.add(refKey);
+                    }
+                }
+            });
+        }
+    }
+
+    return allReferences;
   }
 
   /**
@@ -647,7 +597,7 @@ class KrakatauWorkspace {
       const cls = workspaceEntry.ast.classes[0];
       
       // Check if this class extends the target class
-      if (cls.superClass === className) {
+      if (cls.superClassName === className) {
         subtypes.push(new SymbolDefinition(
           new SymbolIdentifier(subClassName),
           new SymbolLocation(subClassName, 'classes.0'),
@@ -668,6 +618,34 @@ class KrakatauWorkspace {
     });
 
     return subtypes;
+  }
+
+  /**
+   * Finds all known subtypes for a given class or interface within the workspace, recursively.
+   * @param {string} className - The fully qualified name of the class or interface.
+   * @returns {SymbolDefinition[]} An array of SymbolDefinitions for all classes that extend or implement the given type.
+   */
+  getAllSubtypes(className) {
+    const allSubtypes = [];
+    const subtypesToProcess = [className];
+    const processed = new Set();
+
+    while (subtypesToProcess.length > 0) {
+        const currentClass = subtypesToProcess.shift();
+        if (processed.has(currentClass)) {
+            continue;
+        }
+        processed.add(currentClass);
+
+        const directSubtypes = this.getSubtypeHierarchy(currentClass);
+        for (const subtype of directSubtypes) {
+            if (!allSubtypes.some(s => s.identifier.className === subtype.identifier.className)) {
+                allSubtypes.push(subtype);
+            }
+            subtypesToProcess.push(subtype.identifier.className);
+        }
+    }
+    return allSubtypes;
   }
 
   /**
@@ -811,7 +789,7 @@ class KrakatauWorkspace {
     refs.forEach(ref => modifiedClasses.add(ref.className));
 
     // Step 2: Apply the rename operation to the in-memory ASTs.
-    renameMethod(this.workspaceASTs, this.referenceObj, symbolIdentifier.className, symbolIdentifier.memberName, newName);
+    renameMethod(this, symbolIdentifier.className, symbolIdentifier.memberName, newName);
 
     // Step 3: Reassemble only the affected classes
     const modifiedAsts = { classes: [], constantPools: [] };
@@ -968,10 +946,11 @@ class KrakatauWorkspace {
    * @private
    */
   _findSymbolDefinitionLocation(symbolIdentifier) {
-    const ast = this.workspaceASTs[symbolIdentifier.className];
-    if (!ast) {
+    const workspaceEntry = this.workspaceASTs[symbolIdentifier.className];
+    if (!workspaceEntry) {
       return null;
     }
+    const ast = workspaceEntry.ast;
 
     const itemIndex = ast.classes[0].items.findIndex(item => {
       if (item.type === 'method') {
@@ -1005,10 +984,11 @@ class KrakatauWorkspace {
     const edit = new WorkspaceEdit();
     
     // Check if method is static
-    const sourceAst = this.workspaceASTs[methodIdentifier.className];
-    if (!sourceAst) {
+    const workspaceEntry = this.workspaceASTs[methodIdentifier.className];
+    if (!workspaceEntry) {
       throw new Error(`Source class ${methodIdentifier.className} not found`);
     }
+    const sourceAst = workspaceEntry.ast;
     
     const methodItem = sourceAst.classes[0].items.find(item =>
       item.type === 'method' && 
@@ -1051,10 +1031,11 @@ class KrakatauWorkspace {
   prepareMakeMethodStatic(methodIdentifier) {
     const edit = new WorkspaceEdit();
     
-    const ast = this.workspaceASTs[methodIdentifier.className];
-    if (!ast) {
+    const workspaceEntry = this.workspaceASTs[methodIdentifier.className];
+    if (!workspaceEntry) {
       throw new Error(`Class ${methodIdentifier.className} not found`);
     }
+    const ast = workspaceEntry.ast;
     
     const methodItem = ast.classes[0].items.find(item =>
       item.type === 'method' && 
@@ -1109,10 +1090,11 @@ class KrakatauWorkspace {
     // This is a complex operation that would analyze the AST at the given path
     // to determine what symbol is being referenced
     
-    const ast = this.workspaceASTs[location.className];
-    if (!ast) {
+    const workspaceEntry = this.workspaceASTs[location.className];
+    if (!workspaceEntry) {
       return null;
     }
+    const ast = workspaceEntry.ast;
     
     // For now, return null - full implementation would traverse the AST path
     // and determine the referenced symbol based on the instruction type and operands
@@ -1186,11 +1168,4 @@ class KrakatauWorkspace {
 
 module.exports = {
   KrakatauWorkspace,
-  SymbolIdentifier,
-  SymbolLocation,
-  SymbolDefinition,
-  SymbolTree,
-  WorkspaceEdit,
-  RefactorOperation,
-  Diagnostic
 };
