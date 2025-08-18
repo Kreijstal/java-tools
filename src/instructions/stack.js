@@ -6,4 +6,8 @@ module.exports = {
   pop: (frame) => {
     frame.stack.pop();
   },
+  pop2: (frame) => {
+    frame.stack.pop();
+    frame.stack.pop();
+  },
 };
