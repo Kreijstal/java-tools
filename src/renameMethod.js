@@ -24,14 +24,30 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
     throw new Error(`Class ${className} not found in referenceObj`);
   }
 
-  if (referenceObj[className].children[newMethodName]) {
+  // Handle both Map and plain object structures
+  const children = referenceObj[className].children;
+  const isMap = children instanceof Map;
+  
+  if (isMap ? children.has(newMethodName) : children[newMethodName]) {
     throw new Error(`Method ${newMethodName} already exists in class ${className}`);
   }
 
   // TODO: Handle inheritance. This implementation only renames direct references
   // and does not account for polymorphism.
+  // Basic inheritance support: check if method calls on superclasses should also be renamed
+  function shouldRenameMethodCall(callTargetClass, callMethodName, renameTargetClass, renameMethodName) {
+    // Direct match
+    if (callTargetClass === renameTargetClass && callMethodName === renameMethodName) {
+      return true;
+    }
+    
+    // For now, we could add basic superclass checking here, but it requires
+    // access to the workspace hierarchy which isn't available in this context.
+    // A full implementation would need the workspace reference to check inheritance.
+    return false;
+  }
 
-  const methodRef = referenceObj[className].children[oldMethodName];
+  const methodRef = isMap ? children.get(oldMethodName) : children[oldMethodName];
   if (!methodRef) {
     throw new Error(`Method ${oldMethodName} not found in class ${className}`);
   }
@@ -67,7 +83,7 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
         const targetClass = instruction.arg[1];
         if (Array.isArray(instruction.arg[2])) {
             const [methodName, descriptor] = instruction.arg[2];
-            if (targetClass === className && methodName === oldMethodName) {
+            if (shouldRenameMethodCall(targetClass, methodName, className, oldMethodName)) {
               instruction.arg[2][0] = newMethodName;
             }
         }
@@ -76,9 +92,17 @@ function renameMethod(workspaceAsts, referenceObj, className, oldMethodName, new
   });
 
   // Update the reference object to reflect the new method name
-  if (referenceObj[className].children[oldMethodName]) {
-    referenceObj[className].children[newMethodName] = referenceObj[className].children[oldMethodName];
-    delete referenceObj[className].children[oldMethodName];
+  if (isMap) {
+    if (children.has(oldMethodName)) {
+      const methodData = children.get(oldMethodName);
+      children.set(newMethodName, methodData);
+      children.delete(oldMethodName);
+    }
+  } else {
+    if (children[oldMethodName]) {
+      children[newMethodName] = children[oldMethodName];
+      delete children[oldMethodName];
+    }
   }
 
   console.log(`Renamed method ${oldMethodName} to ${newMethodName} in class ${className}`);

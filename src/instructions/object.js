@@ -1,7 +1,17 @@
 module.exports = {
-  new: async (frame, instruction, jvm) => {
+  new: (frame, instruction, jvm) => {
     const className = instruction.arg;
-    await jvm.loadClassByName(className);
+    try {
+      jvm.loadClassByName(className);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        throw {
+          type: 'java/lang/NoClassDefFoundError',
+          message: className,
+        };
+      }
+      throw e;
+    }
 
     const fields = {};
     let currentClassName = className;
@@ -10,12 +20,29 @@ module.exports = {
       if (currentClassData) {
         const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
         for (const field of classFields) {
-          // TODO: Use correct default values based on field descriptor
-          fields[`${currentClassName}.${field.field.name}`] = null;
+          // Use correct default values based on field descriptor
+          const descriptor = field.field.descriptor;
+          let defaultValue = null; // Default for object references
+          
+          // Set primitive defaults based on descriptor
+          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S') {
+            defaultValue = 0; // int, byte, short
+          } else if (descriptor === 'J') {
+            defaultValue = BigInt(0); // long
+          } else if (descriptor === 'F' || descriptor === 'D') {
+            defaultValue = 0.0; // float, double
+          } else if (descriptor === 'Z') {
+            defaultValue = 0; // boolean (false)
+          } else if (descriptor === 'C') {
+            defaultValue = 0; // char ('\0')
+          }
+          // Object references (L...;) and arrays ([...) default to null
+          
+          fields[`${currentClassName}.${field.field.name}`] = defaultValue;
         }
         const superClassName = currentClassData.ast.classes[0].superClassName;
         if (superClassName) {
-            await jvm.loadClassByName(superClassName);
+            jvm.loadClassByName(superClassName);
         }
         currentClassName = superClassName;
       } else {
@@ -62,9 +89,7 @@ module.exports = {
         throw new Error('NullPointerException in monitorexit');
     }
     if (objRef.lockOwner !== thread.id) {
-        // This should throw IllegalMonitorStateException, but for now we'll log it.
-        console.error(`Thread ${thread.id} attempted to exit monitor on object ${objRef.hashCode} not owned by it.`);
-        return;
+        throw new Error('IllegalMonitorStateException');
     }
 
     objRef.lockCount--;
@@ -77,7 +102,9 @@ module.exports = {
   getfield: (frame, instruction, jvm) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const objRef = frame.stack.pop();
-    // In a real implementation, we should check for NullPointerException here.
+    if (objRef === null) {
+      throw new Error('NullPointerException');
+    }
     const value = objRef.fields[`${className}.${fieldName}`];
     frame.stack.push(value);
   },
@@ -86,7 +113,9 @@ module.exports = {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const value = frame.stack.pop();
     const objRef = frame.stack.pop();
-    // In a real implementation, we should check for NullPointerException here.
+    if (objRef === null) {
+      throw new Error('NullPointerException');
+    }
     objRef.fields[`${className}.${fieldName}`] = value;
   },
 
@@ -97,14 +126,13 @@ module.exports = {
     if (field) {
       frame.stack.push(field);
     } else {
-      console.error(`Unsupported getstatic: ${className}.${fieldName}`);
+      throw new Error(`Unsupported getstatic: ${className}.${fieldName}`);
     }
   },
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      // TODO: Throw NullPointerException
-      return;
+      throw new Error('NullPointerException');
     }
     const length = arrayRef.length;
     frame.stack.push(length);
@@ -113,8 +141,7 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      // TODO: Throw NullPointerException
-      return;
+      throw new Error('NullPointerException');
     }
     const value = arrayRef[index];
     frame.stack.push(value);
@@ -124,8 +151,7 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      // TODO: Throw NullPointerException
-      return;
+      throw new Error('NullPointerException');
     }
     arrayRef[index] = value;
   },
@@ -157,8 +183,21 @@ module.exports = {
         return;
       }
 
-      // TODO: Check interfaces as well
-
+      const interfaces = classData.ast.classes[0].interfaces;
+      if (interfaces && interfaces.length > 0) {
+        const interfaceQueue = [...interfaces];
+        while (interfaceQueue.length > 0) {
+          const interfaceName = interfaceQueue.shift();
+          if (interfaceName === targetClassName) {
+            frame.stack.push(1);
+            return;
+          }
+          const interfaceData = jvm.classes[interfaceName];
+          if (interfaceData && interfaceData.ast.classes[0].interfaces) {
+            interfaceQueue.push(...interfaceData.ast.classes[0].interfaces);
+          }
+        }
+      }
       currentClassName = classData.ast.classes[0].superClassName;
     }
 
@@ -181,13 +220,28 @@ module.exports = {
       const classData = jvm.classes[currentClassName];
       if (!classData) {
         // This should not happen if classes are loaded correctly
-        // TODO: Throw ClassCastException
-        return;
+        throw new Error('ClassCastException');
       }
+
+      const interfaces = classData.ast.classes[0].interfaces;
+      if (interfaces && interfaces.length > 0) {
+        const interfaceQueue = [...interfaces];
+        while (interfaceQueue.length > 0) {
+          const interfaceName = interfaceQueue.shift();
+          if (interfaceName === targetClassName) {
+            return; // Cast is valid
+          }
+          const interfaceData = jvm.classes[interfaceName];
+          if (interfaceData && interfaceData.ast.classes[0].interfaces) {
+            interfaceQueue.push(...interfaceData.ast.classes[0].interfaces);
+          }
+        }
+      }
+
       currentClassName = classData.ast.classes[0].superClassName;
     }
 
     // If we get here, the cast is invalid
-    // TODO: Throw ClassCastException
+    throw new Error('ClassCastException');
   },
 };

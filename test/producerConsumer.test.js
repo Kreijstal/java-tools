@@ -29,7 +29,7 @@ test('JVM should execute ProducerConsumer.class, demonstrate wait/notify, and no
     jvm.registerJreMethods({
       'java/io/PrintStream': {
         'println(Ljava/lang/String;)V': (jvm, obj, args) => {
-          output.push(args[0]);
+          output.push(String(args[0]));
         },
       },
     });
