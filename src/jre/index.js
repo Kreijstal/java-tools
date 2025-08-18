@@ -16,6 +16,7 @@ const jreClasses = {
   'java/io/OutputStream': require('./java/io/OutputStream'),
   'java/io/FilterOutputStream': require('./java/io/FilterOutputStream'),
   'java/io/NullOutputStream': require('./java/io/NullOutputStream'),
+  'java/io/ConsoleOutputStream': require('./java/io/ConsoleOutputStream'),
   'java/io/PrintStream': require('./java/io/PrintStream'),
   'java/io/InputStreamReader': require('./java/io/InputStreamReader'),
   'java/io/BufferedReader': require('./java/io/BufferedReader'),

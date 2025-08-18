@@ -12,10 +12,11 @@ module.exports = {
     },
 
     'write(I)V': (jvm, obj, args) => {
-      const byte = args[0];
-      const char = String.fromCharCode(byte);
-      if (jvm.testOutputCallback) {
-        jvm.testOutputCallback(char);
+      // Delegate to the superclass (FilterOutputStream)
+      const superClass = jvm.jre[obj.type].super;
+      const superWrite = jvm._jreFindMethod(superClass, 'write', '(I)V');
+      if (superWrite) {
+        superWrite(jvm, obj, args);
       }
     },
 

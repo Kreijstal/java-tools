@@ -3,11 +3,9 @@ module.exports = {
   staticFields: {
     'out:Ljava/io/PrintStream;': {
       type: 'java/io/PrintStream',
-      fields: {
-        'java/io/FilterOutputStream.out': {
-          type: 'java/io/NullOutputStream',
-          fields: {}
-        }
+      out: {
+        type: 'java/io/ConsoleOutputStream',
+        fields: {}
       }
     },
   },
