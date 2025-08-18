@@ -56,8 +56,10 @@ module.exports = {
     },
     'notify()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // TODO: throw IllegalMonitorStateException
-        return;
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
       }
       if (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
@@ -67,8 +69,10 @@ module.exports = {
     },
     'notifyAll()V': (jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // TODO: throw IllegalMonitorStateException
-        return;
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
       }
       while (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
