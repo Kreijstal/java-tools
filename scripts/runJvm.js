@@ -28,7 +28,10 @@ function main() {
     process.exit(1);
   }
 
-  const classFilePath = path.join(cp, `${mainClass}.class`);
+  let classFilePath = mainClass;
+  if (!mainClass.endsWith('.class')) {
+    classFilePath = path.join(cp, `${mainClass}.class`);
+  }
   const jvm = new JVM({ classpath: cp, verbose: verbose });
 
   let stdin = '';

@@ -9,7 +9,7 @@ module.exports = {
       const methodName = methodObj._methodData.name;
       return jvm.internString(methodName);
     },
-    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
+    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': (jvm, methodObj, args) => {
       const methodData = methodObj._methodData;
       const { name, descriptor, flags } = methodData;
       const obj = args[0];
@@ -46,16 +46,13 @@ module.exports = {
       }
 
       const thread = jvm.threads[jvm.currentThreadIndex];
+      const callingFrame = thread.callStack.peek();
 
-      jvm.pendingAsyncOperations++;
-      return new Promise((resolve) => {
-        thread.isAwaitingReflectiveCall = true;
-        thread.reflectiveCallResolver = (ret) => {
-          jvm.pendingAsyncOperations--;
-          resolve(ret);
-        };
-        thread.callStack.push(newFrame);
-      });
+      thread.isAwaitingReflectiveCall = true;
+      thread.reflectiveCallResolver = (ret) => {
+        callingFrame.stack.push(ret);
+      };
+      thread.callStack.push(newFrame);
     },
   }
 };

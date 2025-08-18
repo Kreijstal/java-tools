@@ -13,34 +13,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
-  // TODO: This is a special case for Method.invoke. Ideally, this should be handled
-  // by the generic JRE method dispatch. However, removing this special case causes
-  // the JVM to exit prematurely without an error, even when the native method is
-  // found correctly. This points to a subtle bug in the async execution of the
-  // JVM main loop that needs further investigation.
-  if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
-    const methodObj = obj;
-    const obj_for_invoke = args[0];
-    const args_for_invoke = args[1];
-
-    const methodData = methodObj._methodData;
-    const newFrame = new Frame(methodData);
-
-    let localIndex = 0;
-    if (!methodData.flags.includes('static')) {
-      newFrame.locals[localIndex++] = obj_for_invoke;
-    }
-    for (let i = 0; i < args_for_invoke.length; i++) {
-      newFrame.locals[localIndex++] = args_for_invoke[i];
-    }
-
-    thread.isAwaitingReflectiveCall = true;
-    thread.reflectiveCallResolver = (ret) => {
-      frame.stack.push(ret);
-    };
-    thread.callStack.push(newFrame);
-    return;
-  } else if (methodName === 'start' && descriptor === '()V') {
+  if (methodName === 'start' && descriptor === '()V') {
     // Handle Thread.start()
     const threadObject = obj;
     const target = threadObject.runnable || threadObject;
@@ -66,9 +39,11 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
 
     if (jreMethod) {
-      let result = await jreMethod(jvm, obj, args, thread);
+      const result = jreMethod(jvm, obj, args, thread);
       const { returnType } = parseDescriptor(descriptor);
-      if (returnType !== 'V') {
+      if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
+        // The reflective call resolver will push the result.
+      } else if (returnType !== 'V' && result !== undefined) {
         if (typeof result === 'boolean') {
           result = result ? 1 : 0;
         }
