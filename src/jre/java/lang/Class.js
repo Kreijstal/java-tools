@@ -68,15 +68,31 @@ module.exports = {
 
       // Manually add java.lang.Object methods if they haven't been added by a subclass
       const objectMethods = require('./Object.js');
+      
+      // Define access modifiers for Object methods
+      const objectMethodAccessModifiers = {
+        'getClass': ['public', 'final', 'native'],
+        'hashCode': ['public', 'native'],
+        'equals': ['public'],
+        'toString': ['public'],
+        'clone': ['protected', 'native'],
+        'wait': ['public', 'final', 'native'],
+        'notify': ['public', 'final', 'native'],
+        'notifyAll': ['public', 'final', 'native'],
+      };
+      
       Object.keys(objectMethods.methods).forEach(methodSignature => {
           const openParen = methodSignature.indexOf('(');
           const name = methodSignature.substring(0, openParen);
           const descriptor = methodSignature.substring(openParen);
           const key = name + descriptor;
-          if (!allMethods[key]) {
+          
+          // Only add public methods to getMethods() result
+          const flags = objectMethodAccessModifiers[name] || ['public'];
+          if (flags.includes('public') && !allMethods[key]) {
               allMethods[key] = {
                   type: 'java/lang/reflect/Method',
-                  _methodData: { name, descriptor, flags: ['public'], attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
+                  _methodData: { name, descriptor, flags, attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
                   _declaringClass: { type: 'java/lang/Class', _classData: jvm.classes['java/lang/Object'] },
               };
           }

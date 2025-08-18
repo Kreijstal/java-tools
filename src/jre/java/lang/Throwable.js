@@ -27,7 +27,7 @@ module.exports = {
       const message = obj.message;
       const className = obj.type.replace(/\//g, '.');
       if (message) {
-        return jvm.internString(`${className}: ${message}`);
+        return jvm.internString(`${className}: ${message.value}`);
       } else {
         return jvm.internString(className);
       }
@@ -36,7 +36,7 @@ module.exports = {
       const className = obj.type.replace(/\//g, '.');
       const message = obj.message;
       if (message) {
-        console.error(`${className}: ${message}`);
+        console.error(`${className}: ${message.value}`);
       } else {
         console.error(className);
       }

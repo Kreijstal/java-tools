@@ -13,7 +13,7 @@ module.exports = {
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
       const message = obj.message || jvm.internString('/ by zero');
-      return jvm.internString(`java.lang.ArithmeticException: ${message}`);
+      return jvm.internString(`java.lang.ArithmeticException: ${message.value}`);
     },
   },
 };

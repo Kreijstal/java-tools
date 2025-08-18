@@ -79,7 +79,7 @@ module.exports = {
         
         if (toStringMethod) {
           const result = toStringMethod(jvm, this, []);
-          return result || this.type.split('/').pop();
+          return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
         }
         return this.type.split('/').pop();
       } catch (e) {

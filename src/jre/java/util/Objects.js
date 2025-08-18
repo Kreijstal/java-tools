@@ -24,12 +24,12 @@ module.exports = {
     },
     'hash([Ljava/lang/Object;)I': (jvm, obj, args) => {
       const values = args[0];
-      if (!values || !values.elements) {
+      if (!values) {
         return 0;
       }
       
       let result = 1;
-      for (const element of values.elements) {
+      for (const element of values) {
         let elementHash = 0;
         if (element !== null) {
           const hashCodeMethod = jvm._jreFindMethod(element.type, 'hashCode', '()I');
