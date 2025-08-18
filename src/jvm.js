@@ -116,6 +116,13 @@ class JVM {
     return stringObj;
   }
 
+  newObject(className) {
+    return {
+      type: className,
+      fields: {}
+    };
+  }
+
   _setTestOutputCallback(callback) {
     this.testOutputCallback = callback;
   }
