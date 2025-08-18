@@ -138,8 +138,11 @@ module.exports = {
     throw new Error(`Unresolved static field: ${className}.${fieldName}`);
   },
 
+  
+
   putstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
+    const value = frame.stack.pop();
 
     const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) {
@@ -147,20 +150,23 @@ module.exports = {
       return;
     }
 
-    const value = frame.stack.pop();
     const classData = jvm.classes[className];
     if (classData && classData.staticFields) {
       const fieldKey = `${fieldName}:${descriptor}`;
       classData.staticFields.set(fieldKey, value);
-    } else {
-      throw new Error(`Could not find class data for ${className} to putstatic`);
+      return;
     }
+
+    throw new Error(`Unsupported putstatic: ${className}.${fieldName}`);
   },
 
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to get length of null array'
+      };
     }
     const length = arrayRef.length;
     frame.stack.push(length);
@@ -169,7 +175,22 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to access null array'
+      };
+    }
+    const value = arrayRef[index];
+    frame.stack.push(value);
+  },
+  iaload: (frame, instruction, jvm) => {
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to access null array'
+      };
     }
     const value = arrayRef[index];
     frame.stack.push(value);
@@ -179,7 +200,22 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to store to null array'
+      };
+    }
+    arrayRef[index] = value;
+  },
+  iastore: (frame, instruction, jvm) => {
+    const value = frame.stack.pop();
+    const index = frame.stack.pop();
+    const arrayRef = frame.stack.pop();
+    if (arrayRef === null) {
+      throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Attempted to store to null array'
+      };
     }
     arrayRef[index] = value;
   },
@@ -293,5 +329,43 @@ module.exports = {
 
     // If we get here, the cast is invalid
     throw new Error('ClassCastException');
+  },
+
+  newarray: (frame, instruction, jvm) => {
+    const count = frame.stack.pop();
+    const atype = instruction.arg;
+    
+    if (count < 0) {
+      throw new Error('NegativeArraySizeException');
+    }
+    
+    // Create array based on type name
+    let array;
+    switch (atype) {
+      case 'boolean':
+      case 'byte':
+      case 'short':
+      case 'int':
+        array = new Array(count).fill(0);
+        break;
+      case 'long':
+        array = new Array(count).fill(BigInt(0));
+        break;
+      case 'float':
+      case 'double':
+        array = new Array(count).fill(0.0);
+        break;
+      case 'char':
+        array = new Array(count).fill(0); // char as int
+        break;
+      default:
+        throw new Error(`Unsupported array type: ${atype}`);
+    }
+    
+    // Set array type for proper runtime behavior
+    array.type = 'array';
+    array.elementType = atype;
+    
+    frame.stack.push(array);
   },
 };
