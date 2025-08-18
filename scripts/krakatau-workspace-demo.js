@@ -7,7 +7,8 @@
  * for Java bytecode analysis and refactoring.
  */
 
-const { KrakatauWorkspace, SymbolIdentifier } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { SymbolIdentifier } = require('../src/symbols');
 const path = require('path');
 
 async function runDemo() {
