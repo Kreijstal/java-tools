@@ -3,6 +3,7 @@ const Frame = require('../frame');
 const Stack = require('../stack');
 const path = require('path');
 const { MethodHandle, MethodType, Lookup } = require('../jre/java/lang/invoke');
+const { ASYNC_METHOD_SENTINEL } = require('../constants');
 
 async function invokevirtual(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
@@ -40,18 +41,18 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
     if (jreMethod) {
       const result = jreMethod(jvm, obj, args, thread);
-      const { returnType } = parseDescriptor(descriptor);
-      if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
-        // The reflective call resolver will push the result.
-      } else if (returnType !== 'V' && result !== undefined) {
-        if (typeof result === 'boolean') {
-          result = result ? 1 : 0;
+      if (result !== ASYNC_METHOD_SENTINEL) {
+        const { returnType } = parseDescriptor(descriptor);
+        if (returnType !== 'V' && result !== undefined) {
+          if (typeof result === 'boolean') {
+            result = result ? 1 : 0;
+          }
+          frame.stack.push(result);
         }
-        frame.stack.push(result);
       }
     } else {
       // This is for user-defined instance methods.
-      const method = await jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
+      const method = jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
       if (method) {
         const newFrame = new Frame(method);
         newFrame.locals[0] = obj; // 'this'
@@ -77,9 +78,9 @@ async function invokestatic(frame, instruction, jvm, thread) {
     for (let i = 0; i < params.length; i++) {
       args.unshift(frame.stack.pop());
     }
-    const result = await jreMethod(jvm, null, args, thread);
+    const result = jreMethod(jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
-    if (returnType !== 'V') {
+    if (returnType !== 'V' && result !== undefined) {
       frame.stack.push(result);
     }
     return;
@@ -87,7 +88,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
   let workspaceEntry = jvm.classes[className];
   if (!workspaceEntry) {
-    workspaceEntry = await jvm.loadClassByName(className);
+    workspaceEntry = jvm.loadClassByName(className);
   }
   const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
@@ -120,7 +121,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
     let workspaceEntry = jvm.classes[className];
     if (!workspaceEntry) {
       // If class is not loaded, loading it.
-        workspaceEntry = await jvm.loadClassByName(className);
+        workspaceEntry = jvm.loadClassByName(className);
         if (!workspaceEntry) {
         console.error(`Class not found for invokespecial: ${className}`);
         return;

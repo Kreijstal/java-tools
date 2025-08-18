@@ -1,8 +1,8 @@
 module.exports = {
-  new: async (frame, instruction, jvm) => {
+  new: (frame, instruction, jvm) => {
     const className = instruction.arg;
     try {
-      await jvm.loadClassByName(className);
+      jvm.loadClassByName(className);
     } catch (e) {
       if (e.code === 'ENOENT') {
         throw {
@@ -25,7 +25,7 @@ module.exports = {
         }
         const superClassName = currentClassData.ast.classes[0].superClassName;
         if (superClassName) {
-            await jvm.loadClassByName(superClassName);
+            jvm.loadClassByName(superClassName);
         }
         currentClassName = superClassName;
       } else {

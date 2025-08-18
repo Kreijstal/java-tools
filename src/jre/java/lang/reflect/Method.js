@@ -1,5 +1,6 @@
 const Frame = require('../../../../frame');
 const { parseDescriptor } = require('../../../../typeParser');
+const { ASYNC_METHOD_SENTINEL } = require('../../../../constants');
 
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
@@ -9,7 +10,7 @@ module.exports = {
       const methodName = methodObj._methodData.name;
       return jvm.internString(methodName);
     },
-    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': (jvm, methodObj, args) => {
+    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
       const methodData = methodObj._methodData;
       const { name, descriptor, flags } = methodData;
       const obj = args[0];
@@ -49,10 +50,13 @@ module.exports = {
       const callingFrame = thread.callStack.peek();
 
       thread.isAwaitingReflectiveCall = true;
-      thread.reflectiveCallResolver = (ret) => {
-        callingFrame.stack.push(ret);
+      thread.reflectiveCallResolver = async (ret) => {
+        const finalRet = await ret;
+        callingFrame.stack.push(finalRet);
       };
       thread.callStack.push(newFrame);
+
+      return ASYNC_METHOD_SENTINEL;
     },
   }
 };

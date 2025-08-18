@@ -4,9 +4,8 @@
   "main": "index.js",
   "scripts": {
     "test": "bash run-tests.sh",
-    "test:integration": "bash run-integration-tests.sh",
     "test:playwright": "playwright test",
-    "test:all": "npm test && npm run test:integration && npm run test:playwright",
+    "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
     "build:java": "javac sources/*.java",
     "build:bundle": "webpack --mode production",

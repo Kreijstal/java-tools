@@ -1,8 +1,8 @@
 module.exports = {
-  ldc: async (frame, instruction, jvm) => {
+  ldc: (frame, instruction, jvm) => {
     if (Array.isArray(instruction.arg) && instruction.arg[0] === 'Class') {
       const className = instruction.arg[1];
-      const classData = await jvm.loadClassByName(className);
+      const classData = jvm.loadClassByName(className);
       if (classData) {
         const classObj = {
           type: 'java/lang/Class',

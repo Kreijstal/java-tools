@@ -9,6 +9,7 @@ const DebugManager = require('./DebugManager');
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
+const { ASYNC_METHOD_SENTINEL } = require('./constants');
 
 class JVM {
   constructor(options = {}) {
@@ -277,7 +278,7 @@ class JVM {
           if (!popped.stack.isEmpty()) {
               ret = popped.stack.pop();
           }
-          thread.reflectiveCallResolver(ret);
+          await thread.reflectiveCallResolver(ret);
           thread.isAwaitingReflectiveCall = false;
           thread.reflectiveCallResolver = null;
       }
@@ -352,7 +353,7 @@ if(this.verbose) {
     }
   }
 
-  async loadClassByName(classNameWithSlashes) {
+  loadClassByName(classNameWithSlashes) {
     if (this.classes[classNameWithSlashes]) {
       return this.classes[classNameWithSlashes];
     }

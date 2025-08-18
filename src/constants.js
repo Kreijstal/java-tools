@@ -1,0 +1,5 @@
+const ASYNC_METHOD_SENTINEL = Symbol('ASYNC_METHOD_SENTINEL');
+
+module.exports = {
+  ASYNC_METHOD_SENTINEL,
+};
