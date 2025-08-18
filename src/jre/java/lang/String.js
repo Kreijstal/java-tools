@@ -3,13 +3,13 @@ module.exports = {
   staticFields: {},
   methods: {
     'concat(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
-      return obj + args[0];
+      return jvm.internString(obj + args[0]);
     },
     'toUpperCase()Ljava/lang/String;': (jvm, obj, args) => {
-      return obj.toUpperCase();
+      return jvm.internString(obj.toUpperCase());
     },
     'toLowerCase()Ljava/lang/String;': (jvm, obj, args) => {
-      return obj.toLowerCase();
+      return jvm.internString(obj.toLowerCase());
     },
     'length()I': (jvm, obj, args) => {
       return obj.length;

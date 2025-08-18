@@ -77,7 +77,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
   let workspaceEntry = jvm.classes[className];
   if (!workspaceEntry) {
-    workspaceEntry = jvm.loadClassByName(className);
+    workspaceEntry = await jvm.loadClassByName(className);
   }
   const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
@@ -110,7 +110,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
     let workspaceEntry = jvm.classes[className];
     if (!workspaceEntry) {
       // If class is not loaded, loading it.
-        workspaceEntry = jvm.loadClassByName(className);
+        workspaceEntry = await jvm.loadClassByName(className);
         if (!workspaceEntry) {
         console.error(`Class not found for invokespecial: ${className}`);
         return;

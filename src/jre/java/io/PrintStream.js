@@ -3,7 +3,7 @@ module.exports = {
   staticFields: {},
   methods: {
     'println(Ljava/lang/String;)V': (jvm, obj, args) => {
-      const output = args[0] + '\n';
+      const output = String(args[0]) + '\n';
       if (jvm.testOutputCallback) {
         jvm.testOutputCallback(output);
       } else {
@@ -37,7 +37,7 @@ module.exports = {
         }
         return;
       }
-      const output = val + '\n';
+      const output = String(val) + '\n';
       if (jvm.testOutputCallback) {
         jvm.testOutputCallback(output);
       } else {
@@ -62,7 +62,7 @@ module.exports = {
     'print(Ljava/lang/String;)V': (jvm, obj, args) => {
       const message = args[0];
       if (message !== null) {
-        process.stdout.write(message);
+        process.stdout.write(String(message));
       }
     },
   },

@@ -1,8 +1,8 @@
 module.exports = {
-  ldc: (frame, instruction, jvm) => {
+  ldc: async (frame, instruction, jvm) => {
     if (Array.isArray(instruction.arg) && instruction.arg[0] === 'Class') {
       const className = instruction.arg[1];
-      const classData = jvm.loadClassByName(className);
+      const classData = await jvm.loadClassByName(className);
       if (classData) {
         const classObj = {
           type: 'java/lang/Class',
@@ -17,7 +17,7 @@ module.exports = {
       }
     } else {
       const value = instruction.arg.replace(/"/g, '');
-      frame.stack.push(value);
+      frame.stack.push(jvm.internString(value));
     }
   },
   bipush: (frame, instruction) => {
