@@ -39,7 +39,11 @@ module.exports = {
       return obj.ordinal || 0;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      return obj.name || jvm.internString('UNKNOWN');
+      // obj.name is a Java String object, we need to extract the actual string value
+      const nameStr = obj.name && typeof obj.name === 'object' && obj.name.value 
+        ? obj.name.value 
+        : (obj.name || 'UNKNOWN');
+      return jvm.internString(nameStr);
     },
     'equals(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const other = args[0];

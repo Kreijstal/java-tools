@@ -222,7 +222,16 @@ async function invokedynamic(frame, instruction, jvm, thread) {
     for (let i = 0; i < recipe.length; i++) {
         const char = recipe.charAt(i);
         if (char === '\u0001') {
-            result += dynamicArgs[argIndex++];
+            const arg = dynamicArgs[argIndex++];
+            // Convert Java objects to strings properly
+            if (arg && typeof arg === 'object' && arg.toString) {
+                result += arg.toString();
+            } else if (arg && typeof arg === 'object' && arg.value !== undefined) {
+                // Java String object
+                result += arg.value;
+            } else {
+                result += String(arg);
+            }
         } else {
             result += char;
         }
