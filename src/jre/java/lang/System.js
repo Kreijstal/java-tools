@@ -3,10 +3,10 @@ module.exports = {
   staticFields: {
     'out:Ljava/io/PrintStream;': {
       type: 'java/io/PrintStream',
-      // This is a simplified representation of the PrintStream object.
-      // In a real implementation, this would be a more complex object
-      // that is properly initialized.
-      _isJreObject: true,
+      out: {
+        type: 'java/io/ConsoleOutputStream',
+        fields: {}
+      }
     },
   },
   methods: {
