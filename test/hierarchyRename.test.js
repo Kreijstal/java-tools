@@ -34,14 +34,19 @@ test('rename method down hierarchy', async (t) => {
     const symbolIdentifier = new SymbolIdentifier('HierarchyA', 'methodToRename');
     await workspace.applyRenameAndSave(symbolIdentifier, 'renamedMethod', tempDir);
 
-    const detailsA = execSync(`javap -public ${path.join(tempDir, 'HierarchyA.class')}`).toString();
-    t.ok(detailsA.includes('renamedMethod'), 'HierarchyA.class should contain renamedMethod');
+    const verificationWorkspace = await KrakatauWorkspace.create(tempDir);
 
-    const detailsB = execSync(`javap -public ${path.join(tempDir, 'HierarchyB.class')}`).toString();
-    t.ok(detailsB.includes('renamedMethod'), 'HierarchyB.class should contain renamedMethod');
+    const astA = verificationWorkspace.getClassAST('HierarchyA');
+    t.ok(astA.classes[0].items.some(item => item.type === 'method' && item.method.name === 'renamedMethod'), 'HierarchyA.class should contain renamedMethod');
 
-    const detailsC = execSync(`javap -c ${path.join(tempDir, 'HierarchyC.class')}`).toString();
-    t.equal((detailsC.match(/renamedMethod/g) || []).length, 2, 'HierarchyC.class should have two calls to renamedMethod');
+    const astB = verificationWorkspace.getClassAST('HierarchyB');
+    t.ok(astB.classes[0].items.some(item => item.type === 'method' && item.method.name === 'renamedMethod'), 'HierarchyB.class should contain renamedMethod');
+
+    const astC = verificationWorkspace.getClassAST('HierarchyC');
+    const mainMethodC = astC.classes[0].items.find(item => item.method.name === 'main');
+    const codeC = mainMethodC.method.attributes.find(attr => attr.type === 'code').code;
+    const calls = codeC.codeItems.filter(item => item.instruction && item.instruction.op === 'invokevirtual' && item.instruction.arg[2][0] === 'renamedMethod');
+    t.equal(calls.length, 2, 'HierarchyC.class should have two calls to renamedMethod');
 
     const output = execSync(`java -cp ${tempDir} HierarchyC`).toString().trim();
     t.equal(output, "A\nB", 'Output of HierarchyC should be correct');
@@ -63,14 +68,19 @@ test('rename method up hierarchy', async (t) => {
     const symbolIdentifier = new SymbolIdentifier('HierarchyB', 'methodToRename');
     await workspace.applyRenameAndSave(symbolIdentifier, 'renamedMethod', tempDir);
 
-    const detailsA = execSync(`javap -public ${path.join(tempDir, 'HierarchyA.class')}`).toString();
-    t.ok(detailsA.includes('renamedMethod'), 'HierarchyA.class should contain renamedMethod');
+    const verificationWorkspace = await KrakatauWorkspace.create(tempDir);
 
-    const detailsB = execSync(`javap -public ${path.join(tempDir, 'HierarchyB.class')}`).toString();
-    t.ok(detailsB.includes('renamedMethod'), 'HierarchyB.class should contain renamedMethod');
+    const astA = verificationWorkspace.getClassAST('HierarchyA');
+    t.ok(astA.classes[0].items.some(item => item.type === 'method' && item.method.name === 'renamedMethod'), 'HierarchyA.class should contain renamedMethod');
 
-    const detailsC = execSync(`javap -c ${path.join(tempDir, 'HierarchyC.class')}`).toString();
-    t.equal((detailsC.match(/renamedMethod/g) || []).length, 2, 'HierarchyC.class should have two calls to renamedMethod');
+    const astB = verificationWorkspace.getClassAST('HierarchyB');
+    t.ok(astB.classes[0].items.some(item => item.type === 'method' && item.method.name === 'renamedMethod'), 'HierarchyB.class should contain renamedMethod');
+
+    const astC = verificationWorkspace.getClassAST('HierarchyC');
+    const mainMethodC = astC.classes[0].items.find(item => item.method.name === 'main');
+    const codeC = mainMethodC.method.attributes.find(attr => attr.type === 'code').code;
+    const calls = codeC.codeItems.filter(item => item.instruction && item.instruction.op === 'invokevirtual' && item.instruction.arg[2][0] === 'renamedMethod');
+    t.equal(calls.length, 2, 'HierarchyC.class should have two calls to renamedMethod');
 
     const output = execSync(`java -cp ${tempDir} HierarchyC`).toString().trim();
     t.equal(output, "A\nB", 'Output of HierarchyC should be correct');
