@@ -10,12 +10,14 @@ module.exports = {
         };
         frame.stack.push(classObj);
       } else {
-        // TODO: Throw ClassNotFoundException
-        frame.stack.push(null);
+        throw {
+          type: 'java/lang/ClassNotFoundException',
+          message: `Class not found: ${className}`,
+        };
       }
     } else {
       const value = instruction.arg.replace(/"/g, '');
-      frame.stack.push(value);
+      frame.stack.push(jvm.internString(value));
     }
   },
   bipush: (frame, instruction) => {

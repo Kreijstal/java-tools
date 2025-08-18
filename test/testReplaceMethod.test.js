@@ -4,64 +4,57 @@ const path = require('path');
 const { execSync } = require('child_process');
 const { KrakatauWorkspace, SymbolIdentifier } = require('../src/KrakatauWorkspace');
 
-// TODO: This test is currently disabled due to issues with the replaceMethod function
-// The function needs to be fixed to properly handle the test scenario
-test('replaceMethod functionality', function(t) {
-  t.skip('replaceMethod test temporarily disabled - needs fix for broken functionality');
-  t.end();
-});
-
-// Original test code preserved for future fixing:
-/*
-async function runTest() {
+// Test re-enabled after fixing KrakatauWorkspace.applyRenameAndSave
+test('replaceMethod functionality', async function(t) {
   const tempDir = path.join(__dirname, 'tempTestDir');
 
-  //please make sure tempDir is empty
-  if (!fs.existsSync(tempDir)) {
-    fs.mkdirSync(tempDir);
+  // Clean up and create temp directory
+  if (fs.existsSync(tempDir)) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
   }
+  fs.mkdirSync(tempDir);
 
-  
-  // Copy original class files to temp directory
-  // Actually we should only copy sources/TestMethods.class and sources/TestMethodsRunner.class
-  const sourceDir = path.join(__dirname, '../sources');
-  fs.readdirSync(sourceDir).forEach(file => {
-    
-    const srcFile = path.join(sourceDir, file);
-    const destFile = path.join(tempDir, file);
-    fs.copyFileSync(srcFile, destFile);
-  });
-  
-
-  // Perform the method renaming using new KrakatauWorkspace API
-  console.log(`Calling applyRenameAndSave with: className=TestMethods, classPath=${tempDir}, oldMethodName=publicMethod1, newMethodName=newMethodName`);
-
-  const workspace = await KrakatauWorkspace.create(path.join(__dirname, '..','sources'));
-  const symbolIdentifier = new SymbolIdentifier('TestMethods', 'publicMethod1');
-  workspace.applyRenameAndSave(symbolIdentifier, 'newMethodName', tempDir);
-
-  // Verify the method has been renamed
-  const classFilePath = path.join(tempDir, 'TestMethods.class');
-  const classDetails = execSync(`node scripts/listClassDetails.js ${classFilePath}`).toString();
-  if (!classDetails.includes('newMethodName')) {
-    console.error('Method renaming failed.');
-    console.log(classDetails)
-    process.exit(1);
-  }
-
-  // Change directory to temp directory
-  process.chdir(tempDir);
-
-  // Run the Java class
   try {
-    const output = execSync(`java -cp . TestMethodsRunner`).toString();
-    console.log('Java program output:', output);
+    // Copy original class files to temp directory
+    const sourceDir = path.join(__dirname, '../sources');
+    ['TestMethods.class', 'TestMethodsRunner.class'].forEach(file => {
+      const srcFile = path.join(sourceDir, file);
+      const destFile = path.join(tempDir, file);
+      fs.copyFileSync(srcFile, destFile);
+    });
+
+    // Perform the method renaming using KrakatauWorkspace API
+    console.log(`Calling applyRenameAndSave with: className=TestMethods, oldMethodName=publicMethod1, newMethodName=newMethodName`);
+
+    const workspace = await KrakatauWorkspace.create(path.join(__dirname, '..','sources'));
+    const symbolIdentifier = new SymbolIdentifier('TestMethods', 'publicMethod1');
+    workspace.applyRenameAndSave(symbolIdentifier, 'newMethodName', tempDir);
+
+    // Verify the method has been renamed
+    const classFilePath = path.join(tempDir, 'TestMethods.class');
+    const classDetails = execSync(`javap -public ${classFilePath}`).toString();
+    t.ok(classDetails.includes('newMethodName'), 'TestMethods.class should contain newMethodName');
+    t.notOk(classDetails.includes('publicMethod1'), 'TestMethods.class should not contain publicMethod1');
+
+    // Run the Java class to verify it still works
+    const originalDir = process.cwd();
+    process.chdir(tempDir);
+    try {
+      const output = execSync(`java -cp . TestMethodsRunner`).toString();
+      console.log('Java program output:', output);
+      t.ok(output.includes('Public Method 1'), 'Program should still print "Public Method 1"');
+    } finally {
+      process.chdir(originalDir);
+    }
+
+    t.end();
   } catch (error) {
-    console.error('Error running Java program:', error);
-    process.exit(1);
+    t.fail(`Test failed: ${error.message}`);
+    t.end();
   } finally {
-    // Change back to the original directory
-    process.chdir(__dirname);
+    // Clean up
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
   }
-}
-*/
+});

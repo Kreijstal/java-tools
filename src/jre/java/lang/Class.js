@@ -35,6 +35,7 @@ module.exports = {
           return;
         }
 
+        // Add methods from the current class
         classData.ast.classes[0].items
           .filter(item => item.type === 'method' && item.method.flags.includes('public'))
           .forEach(methodItem => {
@@ -51,29 +52,30 @@ module.exports = {
         const superClassName = classData.ast.classes[0].superClassName;
         if (superClassName) {
           const superClassData = jvm.classes[superClassName];
-          if (superClassData && superClassName !== 'java/lang/Object') {
+          if (superClassData) {
             getMethodsRecursive({ type: 'java/lang/Class', _classData: superClassData });
-          }
-          if (superClassName === 'java/lang/Object') {
-              const objectMethods = require('./Object.js');
-              Object.keys(objectMethods.methods).forEach(methodSignature => {
-                  const openParen = methodSignature.indexOf('(');
-                  const name = methodSignature.substring(0, openParen);
-                  const descriptor = methodSignature.substring(openParen);
-                  const key = name + descriptor;
-                  if (!allMethods[key]) {
-                      allMethods[key] = {
-                          type: 'java/lang/reflect/Method',
-                          _methodData: { name, descriptor, flags: ['public'], attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
-                          _declaringClass: { type: 'java/lang/Class', _classData: jvm.classes['java/lang/Object'] },
-                      };
-                  }
-              });
           }
         }
       };
 
       getMethodsRecursive(classObj);
+
+      // Manually add java.lang.Object methods if they haven't been added by a subclass
+      const objectMethods = require('./Object.js');
+      Object.keys(objectMethods.methods).forEach(methodSignature => {
+          const openParen = methodSignature.indexOf('(');
+          const name = methodSignature.substring(0, openParen);
+          const descriptor = methodSignature.substring(openParen);
+          const key = name + descriptor;
+          if (!allMethods[key]) {
+              allMethods[key] = {
+                  type: 'java/lang/reflect/Method',
+                  _methodData: { name, descriptor, flags: ['public'], attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
+                  _declaringClass: { type: 'java/lang/Class', _classData: jvm.classes['java/lang/Object'] },
+              };
+          }
+      });
+
       return Object.values(allMethods);
     },
     'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
@@ -85,19 +87,21 @@ module.exports = {
 
       const getDescriptor = (paramClass) => {
         if (!paramClass) return '';
-        const paramClassName = paramClass._classData.ast.classes[0].className;
-        // Basic type mapping, can be extended
-        switch (paramClassName) {
-          case 'int': return 'I';
-          case 'long': return 'J';
-          case 'double': return 'D';
-          case 'float': return 'F';
-          case 'char': return 'C';
-          case 'short': return 'S';
-          case 'byte': return 'B';
-          case 'boolean': return 'Z';
-          default: return `L${paramClassName};`;
+        if (paramClass.isPrimitive) {
+          switch (paramClass.name) {
+            case 'int': return 'I';
+            case 'long': return 'J';
+            case 'double': return 'D';
+            case 'float': return 'F';
+            case 'char': return 'C';
+            case 'short': return 'S';
+            case 'byte': return 'B';
+            case 'boolean': return 'Z';
+            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+          }
         }
+        const paramClassName = paramClass._classData.ast.classes[0].className;
+        return `L${paramClassName};`;
       };
 
       const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;

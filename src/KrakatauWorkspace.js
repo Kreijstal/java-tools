@@ -814,10 +814,11 @@ class KrakatauWorkspace {
     renameMethod(this.workspaceASTs, this.referenceObj, symbolIdentifier.className, symbolIdentifier.memberName, newName);
 
     // Step 3: Reassemble only the affected classes
-    const modifiedAsts = { classes: [] };
+    const modifiedAsts = { classes: [], constantPools: [] };
     for (const className of modifiedClasses) {
       if (this.workspaceASTs[className]) {
-        modifiedAsts.classes.push(this.workspaceASTs[className].classes[0]);
+        modifiedAsts.classes.push(this.workspaceASTs[className].ast.classes[0]);
+        modifiedAsts.constantPools.push(this.workspaceASTs[className].constantPool);
       }
     }
     

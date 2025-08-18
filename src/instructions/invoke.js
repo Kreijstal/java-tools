@@ -3,6 +3,7 @@ const Frame = require('../frame');
 const Stack = require('../stack');
 const path = require('path');
 const { MethodHandle, MethodType, Lookup } = require('../jre/java/lang/invoke');
+const { ASYNC_METHOD_SENTINEL } = require('../constants');
 
 async function invokevirtual(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
@@ -13,65 +14,30 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
-  if (className === 'java/lang/reflect/Method' && methodName === 'invoke') {
-    const methodObj = obj;
-    const obj_for_invoke = args[0];
-    const args_for_invoke = args[1];
-
-    const methodData = methodObj._methodData;
-    const newFrame = new Frame(methodData);
-
-    let localIndex = 0;
-    if (!methodData.flags.includes('static')) {
-      newFrame.locals[localIndex++] = obj_for_invoke;
-    }
-    for (let i = 0; i < args_for_invoke.length; i++) {
-      newFrame.locals[localIndex++] = args_for_invoke[i];
-    }
-
-    thread.isAwaitingReflectiveCall = true;
-    thread.reflectiveCallResolver = (ret) => {
-      frame.stack.push(ret);
-    };
-    thread.callStack.push(newFrame);
-    return;
-  } else if (methodName === 'start' && descriptor === '()V') {
-    // Handle Thread.start()
-    const threadObject = obj;
-    const target = threadObject.runnable || threadObject;
-    const targetClassName = target.type;
-
-    const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
-    if (runMethod) {
-      const newThread = {
-        id: jvm.threads.length,
-        callStack: new Stack(),
-        status: 'runnable',
-      };
-      threadObject.nativeThread = newThread;
-      const newFrame = new Frame(runMethod);
-      newFrame.locals[0] = target; // 'this'
-      newThread.callStack.push(newFrame);
-      jvm.threads.push(newThread);
-    } else {
-      console.error(`Could not find run() method on ${targetClassName}`);
-    }
-    return;
-  } else {
-    const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
-
+  let currentClassName = obj.type;
+  while (currentClassName) {
+    const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
-      let result = await jreMethod(jvm, obj, args, thread);
-      const { returnType } = parseDescriptor(descriptor);
-      if (returnType !== 'V') {
-        if (typeof result === 'boolean') {
-          result = result ? 1 : 0;
+      const result = jreMethod(jvm, obj, args, thread);
+      if (result !== ASYNC_METHOD_SENTINEL) {
+        const { returnType } = parseDescriptor(descriptor);
+        if (returnType !== 'V' && result !== undefined) {
+          if (typeof result === 'boolean') {
+            result = result ? 1 : 0;
+          }
+          frame.stack.push(result);
         }
-        frame.stack.push(result);
       }
-    } else {
-      // This is for user-defined instance methods.
-      const method = await jvm.findMethodInHierarchy(obj.type, methodName, descriptor);
+      return;
+    }
+
+    let classData = jvm.classes[currentClassName];
+    if (!classData) {
+      classData = await jvm.loadClassByName(currentClassName);
+    }
+
+    if (classData) {
+      const method = jvm.findMethod(classData, methodName, descriptor);
       if (method) {
         const newFrame = new Frame(method);
         newFrame.locals[0] = obj; // 'this'
@@ -79,11 +45,15 @@ async function invokevirtual(frame, instruction, jvm, thread) {
           newFrame.locals[i+1] = args[i];
         }
         thread.callStack.push(newFrame);
-      } else {
-        console.error(`Unsupported invokevirtual: ${className}.${methodName}${descriptor}`);
+        return;
       }
+      currentClassName = classData.ast.classes[0].superClassName;
+    } else {
+      currentClassName = null;
     }
   }
+
+  throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
 }
 
 async function invokestatic(frame, instruction, jvm, thread) {
@@ -97,9 +67,9 @@ async function invokestatic(frame, instruction, jvm, thread) {
     for (let i = 0; i < params.length; i++) {
       args.unshift(frame.stack.pop());
     }
-    const result = await jreMethod(jvm, null, args, thread);
+    const result = jreMethod(jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
-    if (returnType !== 'V') {
+    if (returnType !== 'V' && result !== undefined) {
       frame.stack.push(result);
     }
     return;
@@ -160,7 +130,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
       // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
       // For now, we do nothing, assuming the object is already created by 'new'.
   } else {
-      console.error(`Unsupported invokespecial: ${className}.${methodName}${descriptor}`);
+      throw new Error(`Unsupported invokespecial: ${className}.${methodName}${descriptor}`);
   }
 }
 
@@ -263,11 +233,10 @@ async function invokedynamic(frame, instruction, jvm, thread) {
   // For a lambda, the result of invokedynamic is a functional interface object (e.g., Runnable).
   // When its method is called (e.g., run()), the target method handle is invoked.
   if (bsm.method_ref.value.reference.className === 'java/lang/invoke/LambdaMetafactory') {
-    // We will simulate this by creating a simple object that represents the Runnable.
+    // Create a functional interface object (e.g., Runnable).
     const runnable = {
-      type: 'java/lang/Runnable',
-      methodHandle: targetMethodHandle,
-      // A real implementation would have a dispatch table for interface methods.
+      type: 'java/lang/Runnable', // The functional interface type
+      methodHandle: targetMethodHandle, // The implementation of the interface's method
     };
 
     // Push the resulting functional interface object onto the stack.
@@ -278,9 +247,13 @@ async function invokedynamic(frame, instruction, jvm, thread) {
 async function invokeinterface(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
 
-  // In a real JVM, we'd look up the method in the interface's vtable.
-  // For our lambda simulation, we have the target method handle stored directly on our object.
+  // For a functional interface, the method handle is stored on the object.
   const runnable = frame.stack.pop();
+
+  if (!runnable || !runnable.methodHandle) {
+    throw new Error('NotImplementedError: invokeinterface is only supported for lambdas.');
+  }
+
   const targetMethodHandle = runnable.methodHandle;
 
   // Now, invoke the target method. It's a static method in this case.

@@ -4,6 +4,7 @@ const jreClasses = {
   'java/lang/Class': require('./java/lang/Class'),
   'java/lang/String': require('./java/lang/String'),
   'java/lang/StringBuilder': require('./java/lang/StringBuilder'),
+  'java/lang/Runnable': require('./java/lang/Runnable'),
   'java/lang/Thread': require('./java/lang/Thread'),
   'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException'),
   'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException'),

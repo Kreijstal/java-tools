@@ -100,7 +100,20 @@ class JVM {
   }
 
   internString(str) {
-    return str;
+    // Proper string interning - reuse the same object for the same string value
+    if (!this.stringPool) {
+      this.stringPool = new Map();
+    }
+    
+    if (this.stringPool.has(str)) {
+      return this.stringPool.get(str);
+    }
+    
+    // Create a string object with proper type property for invokevirtual
+    const stringObj = new String(str);
+    stringObj.type = 'java/lang/String';
+    this.stringPool.set(str, stringObj);
+    return stringObj;
   }
 
   _setTestOutputCallback(callback) {
@@ -277,7 +290,7 @@ class JVM {
           if (!popped.stack.isEmpty()) {
               ret = popped.stack.pop();
           }
-          thread.reflectiveCallResolver(ret);
+          await thread.reflectiveCallResolver(ret);
           thread.isAwaitingReflectiveCall = false;
           thread.reflectiveCallResolver = null;
       }
@@ -358,7 +371,7 @@ if(this.verbose) {
     }
 
     const classFilePath = path.join(this.classpath, `${classNameWithSlashes}.class`);
-    const classData = this.loadClassByPathSync(classFilePath);
+    const classData = await this.loadClassAsync(classFilePath);
     if (classData && classData.ast) {
         this.classes[classNameWithSlashes] = classData;
     }
@@ -383,18 +396,22 @@ if(this.verbose) {
     return method ? method.method : null;
   }
 
-  findMethodInHierarchy(className, methodName, descriptor) {
+  async findMethodInHierarchy(className, methodName, descriptor) {
     let currentClassName = className;
     while (currentClassName) {
-      const classData = this.classes[currentClassName];
-      if (classData) {
-          const method = this.findMethod(classData, methodName, descriptor);
-          if (method) {
-              return method;
-          }
-      } else {
-        return null;
+      let classData = this.classes[currentClassName];
+      if (!classData) {
+        classData = await this.loadClassByName(currentClassName);
+        if (!classData) {
+          return null;
+        }
       }
+
+      const method = this.findMethod(classData, methodName, descriptor);
+      if (method) {
+          return method;
+      }
+
       currentClassName = classData.ast.classes[0].superClassName;
     }
     return null;
