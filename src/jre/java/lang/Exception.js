@@ -15,7 +15,7 @@ module.exports = {
       const message = obj.message;
       const className = obj.type.replace(/\//g, '.');
       if (message) {
-        return jvm.internString(`${className}: ${message}`);
+        return jvm.internString(`${className}: ${message.value}`);
       } else {
         return jvm.internString(className);
       }
