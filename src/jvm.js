@@ -100,9 +100,19 @@ class JVM {
   }
 
   internString(str) {
+    // Proper string interning - reuse the same object for the same string value
+    if (!this.stringPool) {
+      this.stringPool = new Map();
+    }
+    
+    if (this.stringPool.has(str)) {
+      return this.stringPool.get(str);
+    }
+    
     // Create a string object with proper type property for invokevirtual
     const stringObj = new String(str);
     stringObj.type = 'java/lang/String';
+    this.stringPool.set(str, stringObj);
     return stringObj;
   }
 
