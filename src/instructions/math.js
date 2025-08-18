@@ -32,4 +32,34 @@ module.exports = {
     const amount = parseInt(instruction.incr, 10);
     frame.locals[index] += amount;
   },
+  ishl: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 << value2);
+  },
+  ishr: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 >> value2);
+  },
+  iushr: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 >>> value2);
+  },
+  iand: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 & value2);
+  },
+  ior: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 | value2);
+  },
+  ixor: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 ^ value2);
+  },
 };
