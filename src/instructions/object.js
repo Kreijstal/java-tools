@@ -119,16 +119,55 @@ module.exports = {
     objRef.fields[`${className}.${fieldName}`] = value;
   },
 
-  getstatic: (frame, instruction, jvm) => {
+  getstatic: async (frame, instruction, jvm) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
 
-    const field = jvm._jreFindStaticField(className, fieldName, descriptor);
-    if (field) {
-      frame.stack.push(field);
-    } else {
-      throw new Error(`Unsupported getstatic: ${className}.${fieldName}`);
+    // First try JRE classes
+    const jreField = jvm._jreFindStaticField(className, fieldName, descriptor);
+    if (jreField !== null) {
+      frame.stack.push(jreField);
+      return;
     }
+
+    // Then try user-defined classes
+    const classData = await jvm.loadClassByName(className);
+    if (classData) {
+      // Initialize static fields if not already done
+      if (!classData.staticFields) {
+        await jvm._initializeStaticFields(classData);
+      }
+      
+      const fieldKey = `${fieldName}:${descriptor}`;
+      const value = classData.staticFields[fieldKey];
+      if (value !== undefined) {
+        frame.stack.push(value);
+        return;
+      }
+    }
+
+    throw new Error(`Unsupported getstatic: ${className}.${fieldName}`);
   },
+
+  putstatic: async (frame, instruction, jvm) => {
+    const [_, className, [fieldName, descriptor]] = instruction.arg;
+    const value = frame.stack.pop();
+
+    // Try user-defined classes
+    const classData = await jvm.loadClassByName(className);
+    if (classData) {
+      // Initialize static fields if not already done
+      if (!classData.staticFields) {
+        await jvm._initializeStaticFields(classData);
+      }
+      
+      const fieldKey = `${fieldName}:${descriptor}`;
+      classData.staticFields[fieldKey] = value;
+      return;
+    }
+
+    throw new Error(`Unsupported putstatic: ${className}.${fieldName}`);
+  },
+
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {

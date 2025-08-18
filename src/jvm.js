@@ -161,6 +161,59 @@ class JVM {
     return null;
   }
 
+  async _initializeStaticFields(classData) {
+    if (classData.staticFields) {
+      return; // Already initialized
+    }
+
+    classData.staticFields = {};
+    
+    // Initialize static fields with default values
+    const fields = classData.ast.classes[0].items.filter(item => 
+      item.type === 'field' && item.field.flags && item.field.flags.includes('static')
+    );
+    
+    for (const fieldItem of fields) {
+      const field = fieldItem.field;
+      const fieldKey = `${field.name}:${field.descriptor}`;
+      
+      // Set default value based on descriptor
+      let defaultValue = null;
+      if (field.descriptor === 'I' || field.descriptor === 'B' || field.descriptor === 'S') {
+        defaultValue = 0; // int, byte, short
+      } else if (field.descriptor === 'J') {
+        defaultValue = BigInt(0); // long
+      } else if (field.descriptor === 'F' || field.descriptor === 'D') {
+        defaultValue = 0.0; // float, double
+      } else if (field.descriptor === 'Z') {
+        defaultValue = 0; // boolean (false)
+      } else if (field.descriptor === 'C') {
+        defaultValue = 0; // char ('\0')
+      }
+      // Object references default to null
+      
+      classData.staticFields[fieldKey] = defaultValue;
+    }
+    
+    // Execute static initializer (<clinit>) if it exists
+    const staticInitializer = classData.ast.classes[0].items.find(item => 
+      item.type === 'method' && item.method.name === '<clinit>'
+    );
+    
+    if (staticInitializer) {
+      // Execute the static initializer
+      const thread = this.threads[this.currentThreadIndex];
+      const frame = new Frame(staticInitializer.method, []);
+      thread.callStack.push(frame);
+      
+      // Execute until the static initializer completes
+      while (!thread.callStack.isEmpty() && thread.callStack.peek().method === staticInitializer.method) {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+    }
+  }
+
   _jreGetNative(className, nativeName) {
     return this.jre[className][nativeName];
   }
