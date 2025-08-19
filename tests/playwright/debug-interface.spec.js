@@ -61,6 +61,12 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should step through execution', async ({ page }) => {
+    // Monitor console messages for debugging
+    const consoleMessages = [];
+    page.on('console', (msg) => {
+      consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
+    });
+
     // Use Hello.class as requested - System class should be properly overridden for browser
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
@@ -81,6 +87,10 @@ test.describe('JVM Debug Browser Interface', () => {
     
     // Log execution state after stepping
     console.log('After step execution state:', await page.locator('#executionState').textContent());
+    
+    // Log recent console messages for debugging
+    console.log('Recent browser console messages:');
+    consoleMessages.slice(-10).forEach(msg => console.log('  ' + msg));
     
     // Check that PC has advanced (be more flexible about the PC value)
     const executionState = page.locator('#executionState');
