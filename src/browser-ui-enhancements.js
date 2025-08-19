@@ -830,7 +830,7 @@ async function loadSampleClass() {
             } catch (error) {
                 // Fallback to placeholder if disassembly fails
                 const className = selectedClass.replace('.class', '');
-                window.aceEditor.setValue(`// Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start Debugging' to begin execution`, -1);
+                window.aceEditor.setValue(`// BROWSER-UI ERROR - Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start Debugging' to begin execution`, -1);
                 logError('Failed to disassemble class', error);
             }
         }
