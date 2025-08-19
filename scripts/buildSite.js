@@ -64,6 +64,32 @@ async function setupAceEditor() {
     console.log('  ✓ ACE editor and dependencies copied successfully');
 }
 
+// Function to copy XTerm.js from node_modules
+async function setupXtermLibrary() {
+    const xtermCSS = path.join(process.cwd(), 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
+    const xtermCSSTarget = path.join(libDir, 'xterm.css');
+    
+    // Check if XTerm CSS already exists
+    if (fs.existsSync(xtermCSSTarget)) {
+        console.log('  ✓ XTerm.js CSS already exists');
+        return;
+    }
+    
+    console.log('  📦 Copying XTerm.js CSS from node_modules...');
+    
+    if (!fs.existsSync(xtermCSS)) {
+        console.log('  ⚠️  XTerm.js not found in node_modules - skipping (XTerm features will be disabled)');
+        return;
+    }
+    
+    // Copy XTerm CSS
+    copyFile(xtermCSS, xtermCSSTarget);
+    console.log('  ✓ XTerm.js CSS copied successfully');
+    
+    // Note: We don't copy JS files here because they'll be bundled by webpack
+    // or loaded dynamically via import() in the browser
+}
+
 // Main build function
 async function buildSite() {
     // Step 1: Setup and verification
@@ -73,6 +99,10 @@ async function buildSite() {
     // Step 2: Setup ACE editor from node_modules
     console.log('📦 Setting up ACE editor...');
     await setupAceEditor();
+    
+    // Step 2.5: Setup XTerm.js from node_modules
+    console.log('📦 Setting up XTerm.js...');
+    await setupXtermLibrary();
 
     // Step 3: Copy browser UI enhancement module to dist for inclusion
     console.log('📋 Copying browser UI enhancements...');

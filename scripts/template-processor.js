@@ -18,6 +18,7 @@ function processDebugInterfaceTemplate(htmlContent) {
     
     // Add browser-specific enhancements
     htmlContent = addBrowserUIScript(htmlContent);
+    htmlContent = addXtermSupport(htmlContent);
     htmlContent = addBreakpointUI(htmlContent);
     htmlContent = updateFileInputs(htmlContent);
     htmlContent = addUIElementIds(htmlContent);
@@ -139,6 +140,41 @@ function addDataZipDownloadSection(htmlContent) {
         $1`;
     
     return htmlContent.replace(sampleClassesPattern, downloadSection);
+}
+
+/**
+ * Add XTerm.js support for enhanced terminal I/O
+ */
+function addXtermSupport(htmlContent) {
+    // Add XTerm CSS import to head
+    const headPattern = /(<\/head>)/;
+    const xtermIncludes = `    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+$1`;
+    htmlContent = htmlContent.replace(headPattern, xtermIncludes);
+    
+    // Add toggle button after the "Clear" button in Output Console section
+    const clearButtonPattern = /(<button onclick="clearOutput\(\)" style="float: right; font-size: 10px; padding: 2px 6px;">Clear<\/button>)/;
+    const toggleButton = `$1
+                <button onclick="toggleOutputMode()" id="toggle-output-btn" style="float: right; margin-right: 10px; font-size: 10px; padding: 2px 6px;">Use XTerm Output</button>`;
+    htmlContent = htmlContent.replace(clearButtonPattern, toggleButton);
+    
+    // Initialize XTerm when page loads by adding to the DOMContentLoaded event
+    const domContentLoadedPattern = /(document\.addEventListener\('DOMContentLoaded', \(\) => \{[^}]*initializeEditor\(\);)/;
+    const xtermInit = `$1
+            
+            // Initialize XTerm support (optional)
+            initializeXterm().then(success => {
+                if (success) {
+                    log('XTerm.js available - toggle output mode to use terminal I/O with ANSI support', 'info');
+                }
+            }).catch(err => {
+                log('XTerm.js not available - using DOM output only', 'info');
+            });`;
+    htmlContent = htmlContent.replace(domContentLoadedPattern, xtermInit);
+    
+    return htmlContent;
 }
 
 /**
