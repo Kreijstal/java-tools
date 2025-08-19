@@ -23,5 +23,14 @@ module.exports = {
         const result = obj.substring(startIndex, endIndex);
         return jvm.internString(result);
     },
+    'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
+      return {
+        type: 'java/lang/Class',
+        className: 'java.lang.String',
+        getSimpleName: function() {
+          return jvm.internString('String');
+        }
+      };
+    },
   },
 };

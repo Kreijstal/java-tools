@@ -8,10 +8,20 @@ module.exports = {
       return jvm.internString(className);
     },
     'getSimpleName()Ljava/lang/String;': (jvm, classObj, args) => {
+      // Handle primitive wrapper classes and other objects that may not have _classData
+      if (classObj.className) {
+        return jvm.internString(classObj.className.split('.').pop());
+      }
+      
       const classData = classObj._classData;
-      const fullName = classData.ast.classes[0].className;
-      const simpleName = fullName.split('/').pop().split('$').pop();
-      return jvm.internString(simpleName);
+      if (classData && classData.ast && classData.ast.classes[0]) {
+        const fullName = classData.ast.classes[0].className;
+        const simpleName = fullName.split('/').pop().split('$').pop();
+        return jvm.internString(simpleName);
+      }
+      
+      // Fallback if we can't determine the class name
+      return jvm.internString('Unknown');
     },
     'getSuperclass()Ljava/lang/Class;': async (jvm, classObj, args) => {
       const classData = classObj._classData;
@@ -144,6 +154,15 @@ module.exports = {
           message: methodName,
         };
       }
+    },
+    'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, classObj, args) => {
+      // For now, return false since we don't have full annotation support
+      // In a complete implementation, this would check the annotations on the class
+      return false;
+    },
+    'getAnnotation(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;': (jvm, classObj, args) => {
+      // Return null since we don't have annotation support yet
+      return null;
     },
   }
 };

@@ -11,6 +11,8 @@ const jreClasses = {
   'java/lang/Exception': require('./java/lang/Exception'),
   'java/lang/RuntimeException': require('./java/lang/RuntimeException'),
   'java/lang/ArithmeticException': require('./java/lang/ArithmeticException'),
+  'java/lang/ArrayIndexOutOfBoundsException': require('./java/lang/ArrayIndexOutOfBoundsException'),
+  'java/lang/NullPointerException': require('./java/lang/NullPointerException'),
   'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException'),
   'java/lang/IllegalStateException': require('./java/lang/IllegalStateException'),
   'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException'),

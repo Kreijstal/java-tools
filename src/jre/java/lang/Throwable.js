@@ -6,16 +6,19 @@ module.exports = {
       obj.message = null;
       obj.cause = null;
       obj.stackTrace = [];
+      obj.suppressedExceptions = [];
     },
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
       obj.message = args[0];
       obj.cause = null;
       obj.stackTrace = [];
+      obj.suppressedExceptions = [];
     },
     '<init>(Ljava/lang/String;Ljava/lang/Throwable;)V': (jvm, obj, args) => {
       obj.message = args[0];
       obj.cause = args[1];
       obj.stackTrace = [];
+      obj.suppressedExceptions = [];
     },
     'getMessage()Ljava/lang/String;': (jvm, obj, args) => {
       return obj.message;
@@ -42,6 +45,36 @@ module.exports = {
       }
       // In a real implementation, this would print the full stack trace
       console.error('\tat <native method>');
+    },
+    'addSuppressed(Ljava/lang/Throwable;)V': (jvm, obj, args) => {
+      const suppressedException = args[0];
+      if (!obj.suppressedExceptions) {
+        obj.suppressedExceptions = [];
+      }
+      obj.suppressedExceptions.push(suppressedException);
+    },
+    'getSuppressed()[Ljava/lang/Throwable;': (jvm, obj, args) => {
+      const suppressedArray = obj.suppressedExceptions || [];
+      // Create a Java array of Throwable
+      const javaArray = {
+        type: '[Ljava/lang/Throwable;',
+        length: suppressedArray.length,
+        elements: suppressedArray
+      };
+      return javaArray;
+    },
+    'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
+      // Extract class name from the object's type
+      const className = obj.type.replace(/\//g, '.');
+      const shortName = className.split('.').pop();
+      
+      return {
+        type: 'java/lang/Class',
+        className: className,
+        getSimpleName: function() {
+          return jvm.internString(shortName);
+        }
+      };
     },
   },
 };

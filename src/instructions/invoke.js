@@ -5,6 +5,40 @@ const path = require('path');
 const { MethodHandle, MethodType, Lookup } = require('../jre/java/lang/invoke');
 const { ASYNC_METHOD_SENTINEL } = require('../constants');
 
+// Helper function to auto-box primitives when needed
+function autoboxPrimitive(jvm, value) {
+  if (typeof value === 'number') {
+    if (Number.isInteger(value)) {
+      // Integer autoboxing
+      return {
+        type: 'java/lang/Integer',
+        value: value,
+        toString: function() { return this.value.toString(); }
+      };
+    } else {
+      // Double autoboxing
+      return {
+        type: 'java/lang/Double',
+        value: value,
+        toString: function() { return this.value.toString(); }
+      };
+    }
+  }
+  if (typeof value === 'boolean') {
+    // Boolean autoboxing
+    return {
+      type: 'java/lang/Boolean',
+      value: value,
+      toString: function() { return this.value ? 'true' : 'false'; }
+    };
+  }
+  if (typeof value === 'string') {
+    // String is already an object in our JVM implementation
+    return value;
+  }
+  return value;
+}
+
 async function invokevirtual(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
   const { params } = parseDescriptor(descriptor);
@@ -14,21 +48,27 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
+  // Auto-box primitive if needed (when a primitive is being used as an object)
+  let boxedObj = obj;
+  if (typeof obj === 'number' || typeof obj === 'boolean') {
+    boxedObj = autoboxPrimitive(jvm, obj);
+  }
+
   // Check for null object reference
-  if (obj === null) {
+  if (boxedObj === null) {
     throw {
       type: 'java/lang/NullPointerException',
       message: 'Attempted to invoke virtual method on null object reference'
     };
   }
 
-  let currentClassName = obj.type;
+  let currentClassName = boxedObj.type;
   
   // Handle arrays - they inherit from Object
   if (currentClassName && currentClassName.startsWith('[')) {
     const jreMethod = jvm._jreFindMethod('java/lang/Object', methodName, descriptor);
     if (jreMethod) {
-      const result = jreMethod(jvm, obj, args, thread);
+      const result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {
@@ -45,7 +85,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   while (currentClassName) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
-      const result = jreMethod(jvm, obj, args, thread);
+      const result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {
@@ -80,7 +120,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
   }
 
-  throw new Error(`Unsupported invokevirtual: ${obj.type}.${methodName}${descriptor}`);
+  throw new Error(`Unsupported invokevirtual: ${boxedObj?.type || typeof boxedObj}.${methodName}${descriptor}`);
 }
 
 async function invokestatic(frame, instruction, jvm, thread) {
@@ -330,7 +370,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   while (currentClassName) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
-      const result = jreMethod(jvm, obj, args, thread);
+      const result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {
