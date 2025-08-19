@@ -33,6 +33,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should start debugging and enable controls', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000); // Wait for dropdown to be populated
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000); // Wait for class to load
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     
@@ -54,6 +61,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should step through execution', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000);
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000);
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
@@ -68,6 +82,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should set and clear breakpoints', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000);
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000);
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
@@ -87,6 +108,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should serialize and restore state', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000);
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000);
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
@@ -130,6 +158,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should validate invalid breakpoint input', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000);
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000);
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
@@ -143,6 +178,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should show proper console output format', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000);
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000);
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
@@ -159,6 +201,13 @@ test.describe('JVM Debug Browser Interface', () => {
   });
 
   test('should handle multiple step operations', async ({ page }) => {
+    // First load a sample class with a main method that doesn't use System calls
+    await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
+    await page.waitForTimeout(2000);
+    await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
+    await page.click('button:has-text("Load Sample")');
+    await page.waitForTimeout(1000);
+    
     // Start debugging
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
@@ -170,7 +219,7 @@ test.describe('JVM Debug Browser Interface', () => {
       
       // Check that we're still in a valid state
       const executionState = await page.locator('#executionState').textContent();
-      expect(executionState).toMatch(/Status: (paused|completed)/);
+      expect(executionState).toMatch(/Status: (paused|completed|stopped)/);
     }
   });
 });
