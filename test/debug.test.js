@@ -53,7 +53,7 @@ test('Debug Controller Basic Operations', async (t) => {
 });
 
 test('Debug Controller Serialization', async (t) => {
-  const controller = new DebugController();
+  const controller = new DebugController({ classpath: 'sources' });
   
   try {
     // Start debugging
@@ -68,8 +68,8 @@ test('Debug Controller Serialization', async (t) => {
     t.equal(serializedState.executionState, 'paused', 'Should preserve execution state');
 
     // Create new debugger and restore state
-    const newController = new DebugController();
-    const restoreResult = newController.deserialize(serializedState);
+    const newController = new DebugController({ classpath: 'sources' });
+    const restoreResult = await newController.deserialize(serializedState);
     
     t.equal(restoreResult.status, 'restored', 'Should restore successfully');
     t.equal(newController.executionState, 'paused', 'Should restore execution state');
