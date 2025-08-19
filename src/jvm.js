@@ -227,6 +227,9 @@ class JVM {
       
       currentClass = this.jre[currentClass.super];
     }
+    if (this.verbose) {
+      console.warn(`Method not found: ${className}.${methodName}${descriptor}`);
+    }
     return null;
   }
 
