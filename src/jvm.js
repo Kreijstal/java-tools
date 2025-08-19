@@ -584,7 +584,8 @@ if(this.verbose) {
             });
 
             if (targetIndex !== -1) {
-              thread.pendingException = exception;
+              frame.stack.clear();
+              frame.stack.push(exception);
               frame.pc = targetIndex;
               return;
             }
