@@ -1,4 +1,4 @@
-const { getAST, getClassFileStruct } = require('jvm_parser'); 
+const { getAST } = require('jvm_parser'); 
 const { convertJson } = require('./convert_tree');
 const NodeFileProvider = require('./NodeFileProvider');
 
@@ -25,10 +25,10 @@ function getFileProvider() {
 }
 
 /**
- * Parse annotation data from class file structure
+ * Parse annotation data from AST with jvm-parser 0.0.11
  */
-function parseAnnotations(classFileStruct) {
-  const constantPool = classFileStruct.constant_pool?.entries || classFileStruct.constant_pool;
+function parseAnnotationsFromAst(ast) {
+  const constantPool = ast.constantPool;
   
   const result = {
     classAnnotations: [],
@@ -36,42 +36,86 @@ function parseAnnotations(classFileStruct) {
     methodAnnotations: {}
   };
   
-  // Parse field annotations
-  if (classFileStruct.fields) {
-    classFileStruct.fields.forEach((field, fieldIndex) => {
-      // Get field name from constant pool
-      const fieldName = constantPool[13]?.info?.bytes || `field_${fieldIndex}`;
+  // Helper function to resolve string from constant pool
+  function resolveString(index) {
+    if (!index) return undefined;
+    
+    // For annotation element names, the index points directly to the UTF-8 entry
+    // So we need to use 0-based indexing (no -1 adjustment)
+    const entry = constantPool[index];
+    if (!entry) return undefined;
+    
+    // Handle UTF8 entries directly
+    if (entry.tag === 1) {
+      return entry.info.bytes;
+    }
+    
+    // Handle NameAndType entries that point to UTF8
+    if (entry.tag === 12) {
+      const nameEntry = constantPool[entry.info.name_index];
+      return nameEntry?.info?.bytes;
+    }
+    
+    return undefined;
+  }
+  
+  // Helper function to resolve annotation element values
+  function resolveAnnotationValue(tag, valueIndex) {
+    // For annotation values, use 0-based indexing as well
+    const entry = constantPool[valueIndex];
+    if (!entry) return undefined;
+    
+    if (tag === 115) { // 's' - String
+      return entry.tag === 1 ? entry.info.bytes : undefined;
+    } else if (tag === 73) { // 'I' - Integer
+      return entry.tag === 3 ? entry.info.bytes : undefined;
+    }
+    
+    return entry.info;
+  }
+  
+  // Helper function specifically for annotation type resolution
+  function resolveAnnotationType(index) {
+    // There seems to be an off-by-one issue with annotation type_index in jvm-parser
+    // Try both the given index and index+1
+    let entry = constantPool[index - 1];
+    if (entry && entry.tag === 1 && entry.info?.bytes?.startsWith('L') && entry.info?.bytes?.endsWith(';')) {
+      return entry.info.bytes.replace(/^L|;$/g, '');
+    }
+    
+    // Try the next index
+    entry = constantPool[index];
+    if (entry && entry.tag === 1 && entry.info?.bytes?.startsWith('L') && entry.info?.bytes?.endsWith(';')) {
+      return entry.info.bytes.replace(/^L|;$/g, '');
+    }
+    
+    return resolveString(index);
+  }
+  
+  // Parse field annotations from the new AST structure
+  if (ast.ast.fields) {
+    ast.ast.fields.forEach(field => {
+      const fieldName = field.name;
       
       if (field.attributes) {
-        field.attributes.forEach((attr, attrIndex) => {
+        field.attributes.forEach(attr => {
           const attrName = attr.attribute_name_index?.name?.info?.bytes;
-          if (attrName === 'RuntimeVisibleAnnotations') {
+          if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
             result.fieldAnnotations[fieldName] = attr.info.annotations.map(annotation => {
-              const typeName = constantPool[annotation.type_index - 1]?.info?.bytes;
+              const typeName = resolveAnnotationType(annotation.type_index);
               const elements = {};
               
               if (annotation.element_value_pairs) {
                 annotation.element_value_pairs.forEach(pair => {
-                  const elementName = constantPool[pair.element_name_index - 1]?.info?.bytes;
-                  let elementValue;
+                  const elementName = resolveString(pair.element_name_index);
                   
                   // Parse element value based on tag
                   const tag = pair.value.tag;
-                  if (tag === 115) { // 's' - String
-                    elementValue = {
-                      tag: 's',
-                      stringValue: constantPool[pair.value.value.const_value_index - 1]?.info?.bytes
-                    };
-                  } else if (tag === 73) { // 'I' - Integer
-                    elementValue = {
-                      tag: 'I', 
-                      intValue: constantPool[pair.value.value.const_value_index - 1]?.info?.bytes
-                    };
-                  } else {
-                    elementValue = { tag: tag, value: null };
-                  }
+                  const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
                   
-                  elements[elementName] = elementValue;
+                  if (elementName && elementValue !== undefined) {
+                    elements[elementName] = elementValue;
+                  }
                 });
               }
               
@@ -86,22 +130,57 @@ function parseAnnotations(classFileStruct) {
     });
   }
   
-  // Skip parsing methods for now to avoid recursion issue
-  // TODO: Implement method annotation parsing
+  // Parse method annotations from the new AST structure
+  if (ast.ast.methods) {
+    ast.ast.methods.forEach(method => {
+      const methodName = method.name;
+      
+      if (method.attributes) {
+        method.attributes.forEach(attr => {
+          const attrName = attr.attribute_name_index?.name?.info?.bytes;
+          if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+            result.methodAnnotations[methodName] = attr.info.annotations.map(annotation => {
+              const typeName = resolveAnnotationType(annotation.type_index);
+              const elements = {};
+              
+              if (annotation.element_value_pairs) {
+                annotation.element_value_pairs.forEach(pair => {
+                  const elementName = resolveString(pair.element_name_index);
+                  
+                  const tag = pair.value.tag;
+                  const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+                  
+                  if (elementName && elementValue !== undefined) {
+                    elements[elementName] = elementValue;
+                  }
+                });
+              }
+              
+              return {
+                type: typeName,
+                elements: elements
+              };
+            });
+          }
+        });
+      }
+    });
+  }
   
   return result;
 }
 
 /**
- * Enhance AST with annotation data
+ * Enhance convertedAst with annotation data
  */
-function enhanceAstWithAnnotations(ast, annotations) {
+function enhanceAstWithAnnotations(convertedAst, annotations) {
   // Add class-level annotations
-  ast.annotations = annotations.classAnnotations;
+  convertedAst.annotations = annotations.classAnnotations;
   
-  // Add field annotations
-  if (ast.classes && ast.classes[0] && ast.classes[0].items) {
-    ast.classes[0].items.forEach(item => {
+  // Add field annotations - handle both old and new AST structures
+  if (convertedAst.classes && convertedAst.classes[0] && convertedAst.classes[0].items) {
+    // Old structure: classes[0].items[]
+    convertedAst.classes[0].items.forEach(item => {
       if (item.type === 'field' && item.field) {
         const fieldName = item.field.name;
         if (annotations.fieldAnnotations[fieldName]) {
@@ -111,9 +190,10 @@ function enhanceAstWithAnnotations(ast, annotations) {
     });
   }
   
-  // Add method annotations
-  if (ast.classes && ast.classes[0] && ast.classes[0].items) {
-    ast.classes[0].items.forEach(item => {
+  // Add method annotations - handle both old and new AST structures
+  if (convertedAst.classes && convertedAst.classes[0] && convertedAst.classes[0].items) {
+    // Old structure: classes[0].items[]
+    convertedAst.classes[0].items.forEach(item => {
       if (item.type === 'method' && item.method) {
         const methodName = item.method.name;
         if (annotations.methodAnnotations[methodName]) {
@@ -142,9 +222,8 @@ async function loadClass(className, classPath) {
       // Generate the AST
       const ast = getAST(classFileContent);
       
-      // Get class file structure for annotation parsing
-      const classFileStruct = getClassFileStruct(classFileContent);
-      const annotations = parseAnnotations(classFileStruct);
+      // Parse annotations from the new AST structure
+      const annotations = parseAnnotationsFromAst(ast);
 
       // Convert the AST
       const convertedAst = convertJson(ast.ast, ast.constantPool);
@@ -174,9 +253,8 @@ async function loadClassByPath(classFilePath, options = {}) {
   // Generate the AST
   const ast = getAST(classFileContent);
   
-  // Get class file structure for annotation parsing
-  const classFileStruct = getClassFileStruct(classFileContent);
-  const annotations = parseAnnotations(classFileStruct);
+  // Parse annotations from the new AST structure
+  const annotations = parseAnnotationsFromAst(ast);
 
   // Convert the AST
   const convertedAst = convertJson(ast.ast, ast.constantPool);
@@ -205,9 +283,8 @@ function loadClassByPathSync(classFilePath, options = {}) {
     // Generate the AST
     const ast = getAST(classFileContent);
     
-    // Get class file structure for annotation parsing
-    const classFileStruct = getClassFileStruct(classFileContent);
-    const annotations = parseAnnotations(classFileStruct);
+    // Parse annotations from the new AST structure
+    const annotations = parseAnnotationsFromAst(ast);
 
     // Convert the AST
     const convertedAst = convertJson(ast.ast, ast.constantPool);

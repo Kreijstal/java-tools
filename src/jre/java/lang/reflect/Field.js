@@ -140,8 +140,6 @@ module.exports = {
       const annotationClass = args[0];
       const annotations = fieldObj._annotations || [];
       
-      console.log('Field.isAnnotationPresent called, annotations:', annotations);
-      
       // Check if annotation of the specified type is present
       return annotations.some(ann => {
         const annotationType = ann.type;

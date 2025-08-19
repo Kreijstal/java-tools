@@ -156,6 +156,66 @@ module.exports = {
         };
       }
     },
+    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
+      const methodNameObj = args[0];
+      const paramTypes = args[1]; // array of class objects
+
+      // Extract the actual string value from JVM string object
+      let methodName;
+      if (typeof methodNameObj === 'string') {
+        methodName = methodNameObj;
+      } else if (methodNameObj && methodNameObj.value) {
+        methodName = methodNameObj.value;
+      } else if (methodNameObj && typeof methodNameObj.toString === 'function') {
+        methodName = methodNameObj.toString();
+      } else {
+        methodName = String(methodNameObj);
+      }
+
+      const classData = classObj._classData;
+      const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
+
+      const getDescriptor = (paramClass) => {
+        if (!paramClass) return '';
+        if (paramClass.isPrimitive) {
+          switch (paramClass.name) {
+            case 'int': return 'I';
+            case 'long': return 'J';
+            case 'double': return 'D';
+            case 'float': return 'F';
+            case 'char': return 'C';
+            case 'short': return 'S';
+            case 'byte': return 'B';
+            case 'boolean': return 'Z';
+            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+          }
+        }
+        const paramClassName = paramClass._classData.ast.classes[0].className;
+        return `L${paramClassName};`;
+      };
+
+      const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;
+      
+      const method = methods.find(m => {
+        const d = m.method.descriptor;
+        const methodDescriptor = d.substring(0, d.indexOf(')') + 1);
+        return m.method.name === methodName && methodDescriptor === targetDescriptor;
+      });
+
+      if (method) {
+        return {
+          type: 'java/lang/reflect/Method',
+          _methodData: method.method,
+          _declaringClass: classObj,
+          _annotations: method.method.annotations || [],
+        };
+      } else {
+        throw {
+          type: 'java/lang/NoSuchMethodException',
+          message: methodName,
+        };
+      }
+    },
     'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       const fieldNameObj = args[0];
       

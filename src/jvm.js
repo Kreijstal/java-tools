@@ -1001,16 +1001,19 @@ if(this.verbose) {
         const elementValue = annotation.elements[elementName];
         
         // Create interface method for the annotation element
-        // For CustomAnnotation: value() and number()
+        // Handle both old format (with .stringValue/.intValue) and new format (direct values)
         if (elementName === 'value') {
           proxy['value()Ljava/lang/String;'] = () => {
-            return this.internString(elementValue.stringValue || '');
+            const value = elementValue.stringValue || elementValue;
+            return this.internString(value || '');
           };
         } else if (elementName === 'number') {
           proxy['number()I'] = () => {
-            return elementValue.intValue || 0;
+            const value = elementValue.intValue || elementValue;
+            return value || 0;
           };
         }
+        // TODO: Add support for other element types as needed
       });
     }
     

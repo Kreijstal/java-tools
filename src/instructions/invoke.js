@@ -366,6 +366,20 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   // For regular interface implementations, treat like invokevirtual
+  
+  // Special handling for annotation proxy objects
+  if (obj._annotationData) {
+    const methodKey = methodName + descriptor;
+    if (typeof obj[methodKey] === 'function') {
+      const result = obj[methodKey]();
+      const { returnType } = parseDescriptor(descriptor);
+      if (returnType !== 'V' && result !== undefined) {
+        frame.stack.push(result);
+      }
+      return;
+    }
+  }
+  
   // First check JRE methods
   let currentClassName = obj.type;
   while (currentClassName) {
