@@ -158,8 +158,6 @@ module.exports = {
     },
     'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       const fieldNameObj = args[0];
-      console.log('Raw fieldName object:', fieldNameObj);
-      console.log('fieldNameObj keys:', Object.keys(fieldNameObj));
       
       // Extract the actual string value from JVM string object
       let fieldName;
@@ -174,17 +172,11 @@ module.exports = {
       }
       
       const classData = classObj._classData;
-      console.log('Looking for field:', fieldName);
       
       // Find the field in the class
       const field = classData.ast.classes[0].items.find(item => 
         item.type === 'field' && item.field.name === fieldName
       );
-      
-      console.log('Field found:', !!field);
-      if (field) {
-        console.log('Field annotations:', field.field.annotations);
-      }
       
       if (field) {
         return {
