@@ -987,6 +987,67 @@ if(this.verbose) {
     
     return lineToPcMap;
   }
+
+  createAnnotationProxy(annotation) {
+    // Create a proxy object that implements the annotation interface
+    const proxy = {
+      type: annotation.type,
+      _annotationData: annotation,
+    };
+    
+    // Add methods for each annotation element
+    if (annotation.elements) {
+      Object.keys(annotation.elements).forEach(elementName => {
+        const elementValue = annotation.elements[elementName];
+        
+        // Create interface method for the annotation element
+        // For CustomAnnotation: value() and number()
+        if (elementName === 'value') {
+          proxy['value()Ljava/lang/String;'] = () => {
+            return this.internString(elementValue.stringValue || '');
+          };
+        } else if (elementName === 'number') {
+          proxy['number()I'] = () => {
+            return elementValue.intValue || 0;
+          };
+        }
+      });
+    }
+    
+    return proxy;
+  }
+
+  _parseAnnotationValue(elementValue) {
+    if (!elementValue) return null;
+    
+    // Handle different annotation value types
+    switch (elementValue.tag) {
+      case 's': // String
+        return this.internString(elementValue.stringValue || '');
+      case 'I': // Integer
+        return elementValue.intValue || 0;
+      case 'Z': // Boolean
+        return elementValue.booleanValue || false;
+      case 'J': // Long
+        return elementValue.longValue || 0;
+      case 'F': // Float
+        return elementValue.floatValue || 0.0;
+      case 'D': // Double
+        return elementValue.doubleValue || 0.0;
+      case 'c': // Class
+        // TODO: Implement class literal support
+        return null;
+      case 'e': // Enum
+        // TODO: Implement enum support
+        return null;
+      case '@': // Annotation
+        return this.createAnnotationProxy(elementValue.annotationValue);
+      case '[': // Array
+        return elementValue.arrayValue?.map(val => this._parseAnnotationValue(val)) || [];
+      default:
+        return null;
+    }
+  }
 }
 
 module.exports = { JVM };

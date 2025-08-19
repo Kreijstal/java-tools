@@ -147,6 +147,7 @@ module.exports = {
           type: 'java/lang/reflect/Method',
           _methodData: method.method,
           _declaringClass: classObj,
+          _annotations: method.method.annotations || [],
         };
       } else {
         throw {
@@ -155,13 +156,94 @@ module.exports = {
         };
       }
     },
+    'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
+      const fieldNameObj = args[0];
+      console.log('Raw fieldName object:', fieldNameObj);
+      console.log('fieldNameObj keys:', Object.keys(fieldNameObj));
+      
+      // Extract the actual string value from JVM string object
+      let fieldName;
+      if (typeof fieldNameObj === 'string') {
+        fieldName = fieldNameObj;
+      } else if (fieldNameObj && fieldNameObj.value) {
+        fieldName = fieldNameObj.value;
+      } else if (fieldNameObj && typeof fieldNameObj.toString === 'function') {
+        fieldName = fieldNameObj.toString();
+      } else {
+        fieldName = String(fieldNameObj);
+      }
+      
+      const classData = classObj._classData;
+      console.log('Looking for field:', fieldName);
+      
+      // Find the field in the class
+      const field = classData.ast.classes[0].items.find(item => 
+        item.type === 'field' && item.field.name === fieldName
+      );
+      
+      console.log('Field found:', !!field);
+      if (field) {
+        console.log('Field annotations:', field.field.annotations);
+      }
+      
+      if (field) {
+        return {
+          type: 'java/lang/reflect/Field',
+          _fieldData: field.field,
+          _declaringClass: classObj,
+          _annotations: field.field.annotations || [],
+        };
+      } else {
+        throw {
+          type: 'java/lang/NoSuchFieldException',
+          message: fieldName,
+        };
+      }
+    },
+    'getDeclaredFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      const fields = classData.ast.classes[0].items.filter(item => item.type === 'field');
+      
+      return fields.map(fieldItem => ({
+        type: 'java/lang/reflect/Field',
+        _fieldData: fieldItem.field,
+        _declaringClass: classObj,
+        _annotations: fieldItem.field.annotations || [],
+      }));
+    },
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, classObj, args) => {
-      // For now, return false since we don't have full annotation support
-      // In a complete implementation, this would check the annotations on the class
-      return false;
+      const annotationClass = args[0];
+      const classData = classObj._classData;
+      const annotations = classData.annotations || [];
+      
+      // Check if annotation of the specified type is present
+      return annotations.some(ann => {
+        const annotationType = ann.type;
+        const annotationClassName = annotationClass._classData ? 
+          annotationClass._classData.ast.classes[0].className : 
+          annotationClass.className;
+        return annotationType === annotationClassName;
+      });
     },
     'getAnnotation(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;': (jvm, classObj, args) => {
-      // Return null since we don't have annotation support yet
+      const annotationClass = args[0];
+      const classData = classObj._classData;
+      const annotations = classData.annotations || [];
+      
+      // Find annotation of the specified type
+      const annotation = annotations.find(ann => {
+        const annotationType = ann.type;
+        const annotationClassName = annotationClass._classData ? 
+          annotationClass._classData.ast.classes[0].className : 
+          annotationClass.className;
+        return annotationType === annotationClassName;
+      });
+      
+      if (annotation) {
+        // Create annotation proxy object
+        return jvm.createAnnotationProxy(annotation);
+      }
+      
       return null;
     },
   }

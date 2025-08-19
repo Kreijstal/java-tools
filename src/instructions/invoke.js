@@ -69,7 +69,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   if (currentClassName && currentClassName.startsWith('[')) {
     const jreMethod = jvm._jreFindMethod('java/lang/Object', methodName, descriptor);
     if (jreMethod) {
-      const result = jreMethod(jvm, boxedObj, args, thread);
+      let result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {
@@ -86,7 +86,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   while (currentClassName) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
-      const result = jreMethod(jvm, boxedObj, args, thread);
+      let result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {
@@ -141,7 +141,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
     for (let i = 0; i < params.length; i++) {
       args.unshift(frame.stack.pop());
     }
-    const result = jreMethod(jvm, null, args, thread);
+    let result = jreMethod(jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
     if (returnType !== 'V' && result !== undefined) {
       frame.stack.push(result);
@@ -371,7 +371,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   while (currentClassName) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
-      const result = jreMethod(jvm, boxedObj, args, thread);
+      let result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {

@@ -1,4 +1,4 @@
-const { getAST } = require('jvm_parser'); 
+const { getAST, getClassFileStruct } = require('jvm_parser'); 
 const { convertJson } = require('./convert_tree');
 const NodeFileProvider = require('./NodeFileProvider');
 
@@ -24,6 +24,142 @@ function getFileProvider() {
   return globalFileProvider;
 }
 
+/**
+ * Parse annotation data from class file structure
+ */
+function parseAnnotations(classFileStruct) {
+  const constantPool = classFileStruct.constant_pool;
+  
+  // Helper function to resolve constant pool entries
+  function resolveConstant(index) {
+    if (index === 0 || !constantPool[index - 1]) return null;
+    const entry = constantPool[index - 1];
+    
+    switch (entry.tag) {
+      case 1: // Utf8
+        return entry.info.bytes;
+      case 3: // Integer
+        return entry.info.bytes;
+      case 8: // String ref
+        return resolveConstant(entry.info.string_index);
+      default:
+        return null;
+    }
+  }
+  
+  // Parse annotation structure
+  function parseAnnotation(annotation) {
+    const typeName = resolveConstant(annotation.type_index);
+    const elements = {};
+    
+    if (annotation.element_value_pairs) {
+      annotation.element_value_pairs.forEach(pair => {
+        const elementName = resolveConstant(pair.element_name_index);
+        const elementValue = parseElementValue(pair.value);
+        elements[elementName] = elementValue;
+      });
+    }
+    
+    return {
+      type: typeName,
+      elements: elements
+    };
+  }
+  
+  // Parse element value based on tag
+  function parseElementValue(elementValue) {
+    const tag = elementValue.tag;
+    
+    switch (tag) {
+      case 115: // 's' - String
+        return {
+          tag: 's',
+          stringValue: resolveConstant(elementValue.value.const_value_index)
+        };
+      case 73: // 'I' - Integer
+        return {
+          tag: 'I', 
+          intValue: resolveConstant(elementValue.value.const_value_index)
+        };
+      case 90: // 'Z' - Boolean
+        return {
+          tag: 'Z',
+          booleanValue: resolveConstant(elementValue.value.const_value_index) !== 0
+        };
+      default:
+        return { tag: tag, value: null };
+    }
+  }
+  
+  const result = {
+    classAnnotations: [],
+    fieldAnnotations: {},
+    methodAnnotations: {}
+  };
+  
+  // Parse field annotations
+  if (classFileStruct.fields) {
+    classFileStruct.fields.forEach((field, fieldIndex) => {
+      if (field.attributes) {
+        field.attributes.forEach(attr => {
+          if (attr.attribute_name_index?.name?.info?.bytes === 'RuntimeVisibleAnnotations') {
+            const fieldName = resolveConstant(field.name_index);
+            result.fieldAnnotations[fieldName] = attr.info.annotations.map(parseAnnotation);
+          }
+        });
+      }
+    });
+  }
+  
+  // Parse method annotations  
+  if (classFileStruct.methods) {
+    classFileStruct.methods.forEach((method, methodIndex) => {
+      if (method.attributes) {
+        method.attributes.forEach(attr => {
+          if (attr.attribute_name_index?.name?.info?.bytes === 'RuntimeVisibleAnnotations') {
+            const methodName = resolveConstant(method.name_index);
+            result.methodAnnotations[methodName] = attr.info.annotations.map(parseAnnotation);
+          }
+        });
+      }
+    });
+  }
+  
+  return result;
+}
+
+/**
+ * Enhance AST with annotation data
+ */
+function enhanceAstWithAnnotations(ast, annotations) {
+  // Add class-level annotations
+  ast.annotations = annotations.classAnnotations;
+  
+  // Add field annotations
+  if (ast.classes && ast.classes[0] && ast.classes[0].items) {
+    ast.classes[0].items.forEach(item => {
+      if (item.type === 'field' && item.field) {
+        const fieldName = item.field.name;
+        if (annotations.fieldAnnotations[fieldName]) {
+          item.field.annotations = annotations.fieldAnnotations[fieldName];
+        }
+      }
+    });
+  }
+  
+  // Add method annotations
+  if (ast.classes && ast.classes[0] && ast.classes[0].items) {
+    ast.classes[0].items.forEach(item => {
+      if (item.type === 'method' && item.method) {
+        const methodName = item.method.name;
+        if (annotations.methodAnnotations[methodName]) {
+          item.method.annotations = annotations.methodAnnotations[methodName];
+        }
+      }
+    });
+  }
+}
+
 async function loadClass(className, classPath) {
   const fileProvider = getFileProvider();
   
@@ -41,9 +177,16 @@ async function loadClass(className, classPath) {
 
       // Generate the AST
       const ast = getAST(classFileContent);
+      
+      // Get class file structure for annotation parsing
+      const classFileStruct = getClassFileStruct(classFileContent);
+      const annotations = parseAnnotations(classFileStruct);
 
       // Convert the AST
       const convertedAst = convertJson(ast.ast, ast.constantPool);
+      
+      // Add annotation data to the converted AST
+      enhanceAstWithAnnotations(convertedAst, annotations);
 
       return convertedAst;
     }
@@ -66,9 +209,16 @@ async function loadClassByPath(classFilePath, options = {}) {
 
   // Generate the AST
   const ast = getAST(classFileContent);
+  
+  // Get class file structure for annotation parsing
+  const classFileStruct = getClassFileStruct(classFileContent);
+  const annotations = parseAnnotations(classFileStruct);
 
   // Convert the AST
   const convertedAst = convertJson(ast.ast, ast.constantPool);
+  
+  // Add annotation data to the converted AST
+  enhanceAstWithAnnotations(convertedAst, annotations);
 
   // Return the same structure as the sync version
   return { ast: convertedAst, constantPool: ast.constantPool };
@@ -90,9 +240,16 @@ function loadClassByPathSync(classFilePath, options = {}) {
 
     // Generate the AST
     const ast = getAST(classFileContent);
+    
+    // Get class file structure for annotation parsing
+    const classFileStruct = getClassFileStruct(classFileContent);
+    const annotations = parseAnnotations(classFileStruct);
 
     // Convert the AST
     const convertedAst = convertJson(ast.ast, ast.constantPool);
+    
+    // Add annotation data to the converted AST
+    enhanceAstWithAnnotations(convertedAst, annotations);
 
     return convertedAst;
   } else {
