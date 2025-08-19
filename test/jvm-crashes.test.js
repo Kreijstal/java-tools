@@ -68,6 +68,11 @@ const FIXED_CRASH_TESTS = [
     name: 'TryCatchFinallyTestFixed',
     description: 'Complex try-catch-finally constructs - now fixed (infinite loop bug resolved)',
     expectedPattern: /Exception from finally|Exception from catch|Returned value: 2|Inner catch: Inner exception|Exception from try-finally/
+  },
+  {
+    name: 'DoubleComparisonTest',
+    description: 'Double comparison operations using dcmpl instruction - now fixed',
+    expectedPattern: /d1 > d2: true|NaN == NaN: false|Test completed successfully/
   }
 ];
 
@@ -112,7 +117,11 @@ async function runJvmTest(testName, timeout = 2000) {
 
     try {
       const jvm = new JVM();
-      const classFilePath = path.join(__dirname, '..', 'sources', `${testName}.class`);
+      const sourcesPath = path.join(__dirname, '..', 'sources');
+      const classFilePath = path.join(sourcesPath, `${testName}.class`);
+      
+      // Set the classpath so that inner classes can be found
+      jvm.classpath = sourcesPath;
       
       let output = '';
       let error = '';
@@ -179,7 +188,8 @@ async function runJvmTest(testName, timeout = 2000) {
 function runRealJava(testName, timeout = 10000) {
   try {
     const sourcesPath = path.join(__dirname, '..', 'sources');
-    const output = execSync(`timeout ${timeout/1000}s java -cp ${sourcesPath} ${testName}`, 
+    // Properly quote the testName to handle $ characters
+    const output = execSync(`timeout ${timeout/1000}s java -cp ${sourcesPath} "${testName}"`, 
       { encoding: 'utf8', timeout });
     return { output, error: '', success: true };
   } catch (e) {

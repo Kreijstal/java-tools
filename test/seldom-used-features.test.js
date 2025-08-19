@@ -53,7 +53,8 @@ const SELDOM_USED_FEATURE_TESTS = [
 function runRealJava(testName, timeout = 10000) {
   try {
     const sourcesPath = path.join(__dirname, '..', 'sources');
-    const output = execSync(`timeout ${timeout/1000}s java -cp ${sourcesPath} ${testName}`, 
+    // Properly quote the testName to handle $ characters
+    const output = execSync(`timeout ${timeout/1000}s java -cp ${sourcesPath} "${testName}"`, 
       { encoding: 'utf8', timeout });
     return { output, error: '', success: true };
   } catch (e) {

@@ -163,4 +163,70 @@ module.exports = {
     const value1 = frame.stack.pop();
     frame.stack.push(value1 / value2);
   },
+  // Comparison instructions
+  dcmpl: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (isNaN(value1) || isNaN(value2)) {
+      frame.stack.push(-1); // NaN bias towards -1
+    } else if (value1 < value2) {
+      frame.stack.push(-1);
+    } else if (value1 > value2) {
+      frame.stack.push(1);
+    } else {
+      frame.stack.push(0);
+    }
+  },
+  dcmpg: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (isNaN(value1) || isNaN(value2)) {
+      frame.stack.push(1); // NaN bias towards 1
+    } else if (value1 < value2) {
+      frame.stack.push(-1);
+    } else if (value1 > value2) {
+      frame.stack.push(1);
+    } else {
+      frame.stack.push(0);
+    }
+  },
+  fcmpl: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (isNaN(value1) || isNaN(value2)) {
+      frame.stack.push(-1); // NaN bias towards -1
+    } else if (value1 < value2) {
+      frame.stack.push(-1);
+    } else if (value1 > value2) {
+      frame.stack.push(1);
+    } else {
+      frame.stack.push(0);
+    }
+  },
+  fcmpg: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (isNaN(value1) || isNaN(value2)) {
+      frame.stack.push(1); // NaN bias towards 1
+    } else if (value1 < value2) {
+      frame.stack.push(-1);
+    } else if (value1 > value2) {
+      frame.stack.push(1);
+    } else {
+      frame.stack.push(0);
+    }
+  },
+  lcmp: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    const long1 = BigInt(value1);
+    const long2 = BigInt(value2);
+    if (long1 < long2) {
+      frame.stack.push(-1);
+    } else if (long1 > long2) {
+      frame.stack.push(1);
+    } else {
+      frame.stack.push(0);
+    }
+  },
 };
