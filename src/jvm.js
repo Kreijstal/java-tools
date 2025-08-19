@@ -238,6 +238,7 @@ class JVM {
       id: 0,
       callStack: new Stack(),
       status: 'runnable',
+      pendingException: null,
     };
     this.threads.push(mainThread);
 
@@ -529,6 +530,30 @@ if(this.verbose) {
     return null;
   }
 
+  isInstanceOf(className, target) {
+    if (!className) return false;
+    if (className === target) return true;
+
+    const classData = this.classes[className];
+    if (!classData) return false;
+
+    // Check superclass
+    if (this.isInstanceOf(classData.ast.classes[0].superClassName, target)) {
+      return true;
+    }
+
+    // Check interfaces
+    const interfaces = classData.ast.classes[0].interfaces;
+    if (interfaces) {
+      for (const iface of interfaces) {
+        if (this.isInstanceOf(iface, target)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   handleException(exception, pc, thread) {
     const callStack = thread.callStack;
     if (callStack.isEmpty()) {
@@ -551,7 +576,19 @@ if(this.verbose) {
     if (table) {
       for (const entry of table) {
         if (pcToCheck >= entry.start_pc && pcToCheck < entry.end_pc) {
-          if (entry.catch_type === 'any' || entry.catch_type === exception.type) {
+          if (entry.catch_type === 'any') {
+            const targetIndex = frame.instructions.findIndex(inst => {
+              if (!inst.labelDef) return false;
+              const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));
+              return labelPc === entry.handler_pc;
+            });
+
+            if (targetIndex !== -1) {
+              thread.pendingException = exception;
+              frame.pc = targetIndex;
+              return;
+            }
+          } else if (this.isInstanceOf(exception.type, entry.catch_type)) {
             const targetIndex = frame.instructions.findIndex(inst => {
               if (!inst.labelDef) return false;
               const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));

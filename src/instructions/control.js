@@ -195,4 +195,27 @@ module.exports = {
       throw new Error(`Label ${targetLabel} not found`);
     }
   },
+  jsr: (frame, instruction) => {
+    const label = instruction.arg;
+    const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+    if (targetPc !== -1) {
+      frame.stack.push(frame.pc);
+      frame.pc = targetPc;
+    } else {
+      throw new Error(`Label ${label} not found`);
+    }
+  },
+  ret: (frame, instruction, jvm, thread) => {
+    const index = parseInt(instruction.arg);
+    const returnAddress = frame.locals[index];
+    if (typeof returnAddress !== 'number') {
+        throw new Error('Return address is not a number');
+    }
+    frame.pc = returnAddress;
+    if (thread.pendingException) {
+      const e = thread.pendingException;
+      delete thread.pendingException;
+      throw e;
+    }
+  },
 };
