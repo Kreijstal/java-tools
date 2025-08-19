@@ -50,3 +50,54 @@ test('JVM should execute FinallyTest.class and print correct output', async func
 
   t.equal(output, expectedOutput, 'The JVM should correctly handle finally blocks');
 });
+
+test('JVM should execute TryCatchFinallyTest.class and print correct output', async function(t) {
+  t.plan(1);
+
+  const jvm = new JVM();
+  const classFilePath = path.join(__dirname, '..', 'sources', 'TryCatchFinallyTest.class');
+
+  let output = '';
+  jvm.registerJreMethods({
+    'java/io/PrintStream': {
+      'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+        output += args[0] + '\\n';
+      },
+       'println(I)V': (jvm, obj, args) => {
+        output += args[0] + '\\n';
+      }
+    },
+  });
+
+  await jvm.run(classFilePath);
+
+  const expectedOutput = '--- Test: Exception in finally ---\\n' +
+    'Outer try\\n' +
+    'Inner finally, throwing new exception\\n' +
+    'Caught: Exception from finally\\n' +
+    '\\n' +
+    '--- Test: Exception in catch ---\\n' +
+    'Outer try\\n' +
+    'Outer catch, throwing new exception\\n' +
+    'Caught: Exception from catch\\n' +
+    '\\n' +
+    '--- Test: Return in finally ---\\n' +
+    'In try\\n' +
+    'In finally\\n' +
+    'Returned value: 2\\n' +
+    '\\n' +
+    '--- Test: Nested try-catch-finally ---\\n' +
+    'Outer try\\n' +
+    'Inner try\\n' +
+    'Inner catch: Inner exception\\n' +
+    'Inner finally\\n' +
+    'Outer try after inner\\n' +
+    'Outer finally\\n' +
+    '\\n' +
+    '--- Test: Try-finally without catch ---\\n' +
+    'Inner try\\n' +
+    'Inner finally\\n' +
+    'Caught: Exception from try-finally\\n';
+
+  t.equal(output.trim(), expectedOutput.trim(), 'The JVM should correctly handle all try-catch-finally edge cases');
+});
