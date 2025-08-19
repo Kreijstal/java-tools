@@ -47,6 +47,11 @@ let currentState = {
 // ACE Editor instance
 let aceEditor = null;
 
+// XTerm instances and configuration
+let xtermTerminal = null;
+let xtermFitAddon = null;
+let useXtermOutput = false;
+
 /**
  * Set up browser-specific System class override using the generic JVM override system
  * This function overrides ONLY the System class's static initializer (<clinit>) to provide 
@@ -167,6 +172,373 @@ function setupBrowserSystemOverride() {
     
     log('Browser System constructor (<clinit>) override installed using generic JVM override system!', 'success');
     log('System.out.println will now work in browser with DOM output', 'success');
+}
+
+/**
+ * Initialize xterm.js terminal for enhanced I/O with ANSI support
+ */
+async function initializeXterm() {
+    try {
+        // Try to dynamically import xterm modules - they might not be available
+        let Terminal, FitAddon;
+        
+        try {
+            // Try importing from global scope (if bundled)
+            if (typeof window.Terminal !== 'undefined') {
+                Terminal = window.Terminal;
+                FitAddon = window.FitAddon;
+            } else {
+                // Try dynamic import (might fail if not bundled)
+                const xtermModule = await import('@xterm/xterm');
+                const fitModule = await import('@xterm/addon-fit');
+                Terminal = xtermModule.Terminal;
+                FitAddon = fitModule.FitAddon;
+            }
+        } catch (importError) {
+            log('XTerm.js modules not available - dynamic import failed', 'info');
+            return false;
+        }
+        
+        if (!Terminal || !FitAddon) {
+            log('XTerm.js classes not available', 'info');
+            return false;
+        }
+        
+        // Create terminal instance
+        xtermTerminal = new Terminal({
+            cursorBlink: true,
+            fontFamily: 'Monaco, Menlo, "Ubuntu Mono", monospace',
+            fontSize: 12,
+            theme: {
+                background: '#1e1e1e',
+                foreground: '#d4d4d4',
+                cursor: '#ffffff',
+                selection: '#264f78',
+                black: '#000000',
+                red: '#f44747',
+                green: '#68d391',
+                yellow: '#ffcc02',
+                blue: '#569cd6',
+                magenta: '#bc89bd',
+                cyan: '#4ec9b0',
+                white: '#d4d4d4',
+                brightBlack: '#666666',
+                brightRed: '#f44747',
+                brightGreen: '#68d391',
+                brightYellow: '#ffcc02',
+                brightBlue: '#569cd6',
+                brightMagenta: '#bc89bd',
+                brightCyan: '#4ec9b0',
+                brightWhite: '#ffffff'
+            },
+            allowTransparency: true
+        });
+
+        // Add fit addon for responsive sizing
+        xtermFitAddon = new FitAddon();
+        xtermTerminal.loadAddon(xtermFitAddon);
+
+        // Find or create xterm container
+        let xtermContainer = document.getElementById('xterm-container');
+        if (!xtermContainer) {
+            // Create xterm container
+            xtermContainer = document.createElement('div');
+            xtermContainer.id = 'xterm-container';
+            xtermContainer.style.cssText = `
+                width: 100%;
+                height: 200px;
+                background: #1e1e1e;
+                border: 1px solid #3e3e42;
+                border-radius: 3px;
+                display: none;
+            `;
+            
+            // Insert after the regular output div
+            const output = document.getElementById(DOM_IDS.OUTPUT);
+            if (output && output.parentNode) {
+                output.parentNode.insertBefore(xtermContainer, output.nextSibling);
+            }
+        }
+
+        // Open terminal in container
+        xtermTerminal.open(xtermContainer);
+        
+        // Fit terminal to container
+        setTimeout(() => {
+            if (xtermFitAddon) {
+                xtermFitAddon.fit();
+            }
+        }, 100);
+
+        // Set up input handling for stdin
+        setupXtermInput();
+        
+        log('XTerm.js terminal initialized successfully', 'success');
+        return true;
+        
+    } catch (error) {
+        logError('Failed to initialize XTerm.js terminal', error);
+        return false;
+    }
+}
+
+/**
+ * Set up xterm input handling for Java System.in
+ */
+function setupXtermInput() {
+    if (!xtermTerminal) return;
+    
+    let inputBuffer = '';
+    let inputResolvers = [];
+    
+    // Handle terminal input
+    xtermTerminal.onData((data) => {
+        // Handle special keys
+        if (data === '\r') {
+            // Enter key - send line to Java input
+            xtermTerminal.write('\r\n');
+            inputBuffer += '\n';
+            
+            // If Java is waiting for input, resolve the promise
+            if (inputResolvers.length > 0) {
+                const resolver = inputResolvers.shift();
+                resolver(inputBuffer);
+                inputBuffer = '';
+            }
+            
+        } else if (data === '\u0008') {
+            // Backspace
+            if (inputBuffer.length > 0) {
+                inputBuffer = inputBuffer.slice(0, -1);
+                xtermTerminal.write('\b \b');
+            }
+        } else if (data === '\u0003') {
+            // Ctrl+C - interrupt
+            xtermTerminal.write('^C\r\n');
+            inputBuffer = '';
+            // Could trigger Java interrupt here
+        } else {
+            // Regular character
+            inputBuffer += data;
+            xtermTerminal.write(data);
+        }
+    });
+    
+    // Make input available to Java System.in
+    window.xtermInputBuffer = inputBuffer;
+    window.xtermInputResolvers = inputResolvers;
+    window.xtermGetInput = () => {
+        return new Promise((resolve) => {
+            if (inputBuffer.length > 0) {
+                const data = inputBuffer;
+                inputBuffer = '';
+                resolve(data);
+            } else {
+                inputResolvers.push(resolve);
+            }
+        });
+    };
+}
+
+/**
+ * Create xterm-based output writer with ANSI support
+ */
+function createXtermWriter(type = 'stdout') {
+    return (char) => {
+        if (xtermTerminal && useXtermOutput) {
+            // Write directly to xterm, which handles ANSI escape codes
+            xtermTerminal.write(char);
+            
+            // Also log to console for debugging
+            if (typeof console !== 'undefined' && console.log && char === '\n') {
+                console.log(`[JVM System.${type === 'stderr' ? 'err' : 'out'}] XTerm output`);
+            }
+        }
+    };
+}
+
+/**
+ * Toggle between DOM output and XTerm output
+ */
+function toggleOutputMode() {
+    const regularOutput = document.getElementById(DOM_IDS.OUTPUT);
+    const xtermContainer = document.getElementById('xterm-container');
+    const toggleBtn = document.getElementById('toggle-output-btn');
+    
+    if (!xtermContainer) {
+        log('XTerm not initialized. Initializing...', 'info');
+        initializeXterm().then(success => {
+            if (success) {
+                toggleOutputMode(); // Retry after initialization
+            }
+        });
+        return;
+    }
+    
+    useXtermOutput = !useXtermOutput;
+    
+    if (useXtermOutput) {
+        // Switch to XTerm
+        regularOutput.style.display = 'none';
+        xtermContainer.style.display = 'block';
+        if (toggleBtn) toggleBtn.textContent = 'Use DOM Output';
+        
+        // Fit terminal when shown
+        setTimeout(() => {
+            if (xtermFitAddon) {
+                xtermFitAddon.fit();
+            }
+        }, 100);
+        
+        log('Switched to XTerm output mode (supports ANSI colors & stdin)', 'success');
+        
+        // Re-setup system override to use xterm writers
+        setupBrowserSystemOverrideWithXterm();
+        
+    } else {
+        // Switch to DOM
+        regularOutput.style.display = 'block';
+        xtermContainer.style.display = 'none';
+        if (toggleBtn) toggleBtn.textContent = 'Use XTerm Output';
+        
+        log('Switched to DOM output mode', 'info');
+        
+        // Re-setup system override to use DOM writers
+        setupBrowserSystemOverride();
+    }
+}
+
+/**
+ * Set up browser-specific System class override with XTerm writers
+ */
+function setupBrowserSystemOverrideWithXterm() {
+    if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
+        log('Cannot setup browser System override - JVM not available', 'error');
+        return;
+    }
+
+    const jvm = jvmDebug.debugController.jvm;
+    
+    // Create XTerm writers that support ANSI codes
+    const outWriter = createXtermWriter('stdout');
+    const errWriter = createXtermWriter('stderr');
+
+    // Use the same override system but with xterm writers
+    jvm.registerJreOverrides({
+        'java/lang/System': {
+            methods: {
+                '<clinit>()V': (jvm, _, args, thread) => {
+                    const systemClass = jvm.classes['java/lang/System'];
+
+                    // 1. Create ConsoleOutputStream for out
+                    const cosOut = { type: 'java/io/ConsoleOutputStream', fields: {} };
+                    const cosInit = jvm._jreFindMethod('java/io/ConsoleOutputStream', '<init>', '(Ljava/lang/Object;)V');
+                    if (cosInit) {
+                        cosInit(jvm, cosOut, [outWriter]);
+                    }
+
+                    // 2. Create PrintStream for out
+                    const out = { type: 'java/io/PrintStream', fields: {} };
+                    const psInit = jvm._jreFindMethod('java/io/PrintStream', '<init>', '(Ljava/io/OutputStream;)V');
+                    if (psInit) {
+                        psInit(jvm, out, [cosOut]);
+                    }
+                    systemClass.staticFields.set('out:Ljava/io/PrintStream;', out);
+
+                    // 3. Create ConsoleOutputStream for err
+                    const cosErr = { type: 'java/io/ConsoleOutputStream', fields: {} };
+                    if (cosInit) {
+                        cosInit(jvm, cosErr, [errWriter]);
+                    }
+
+                    // 4. Create PrintStream for err
+                    const err = { type: 'java/io/PrintStream', fields: {} };
+                    if (psInit) {
+                        psInit(jvm, err, [cosErr]);
+                    }
+                    systemClass.staticFields.set('err:Ljava/io/PrintStream;', err);
+
+                    // 5. Create enhanced InputStream for in with XTerm support
+                    const inStream = { 
+                        type: 'java/io/InputStream', 
+                        fields: {},
+                        xtermInputEnabled: true
+                    };
+                    systemClass.staticFields.set('in:Ljava/io/InputStream;', inStream);
+                }
+            }
+        }
+    });
+    
+    // Override println to work with XTerm
+    jvm.registerJreMethods({
+        'java/io/PrintStream': {
+            'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+                const str = (typeof args[0] === 'string') ? args[0] : args[0]?.value || String(args[0]);
+                
+                // Use XTerm writer for output with ANSI support
+                for (let i = 0; i < str.length; i++) {
+                    outWriter(str.charAt(i));
+                }
+                outWriter('\n');
+                
+                if (typeof console !== 'undefined') {
+                    console.log('[Browser XTerm System.out.println]:', str);
+                }
+            }
+        }
+    });
+    
+    log('Browser System override with XTerm support installed!', 'success');
+    log('System.out supports ANSI colors and System.in works with terminal input', 'success');
+}
+
+/**
+ * Set up XTerm integration - add toggle button and initialize if available
+ */
+async function setupXtermIntegration() {
+    try {
+        // Add toggle button to the UI dynamically
+        addXtermToggleButton();
+        
+        // Try to initialize XTerm
+        const success = await initializeXterm();
+        if (success) {
+            log('XTerm.js available - toggle output mode to use terminal I/O with ANSI support', 'info');
+        } else {
+            // Hide the button if XTerm failed to initialize
+            const toggleBtn = document.getElementById('toggle-output-btn');
+            if (toggleBtn) {
+                toggleBtn.style.display = 'none';
+            }
+            log('XTerm.js not available - using DOM output only', 'info');
+        }
+    } catch (error) {
+        logError('XTerm integration setup failed', error);
+    }
+}
+
+/**
+ * Dynamically add the XTerm toggle button to the UI
+ */
+function addXtermToggleButton() {
+    // Find the Clear button in the Output Console section
+    const clearBtn = document.querySelector('button[onclick="clearOutput()"]');
+    if (clearBtn) {
+        // Create the toggle button
+        const toggleBtn = document.createElement('button');
+        toggleBtn.id = 'toggle-output-btn';
+        toggleBtn.onclick = toggleOutputMode;
+        toggleBtn.textContent = 'Use XTerm Output';
+        toggleBtn.style.cssText = 'float: right; margin-right: 10px; font-size: 10px; padding: 2px 6px; background-color: #0e639c; color: white; border: none; border-radius: 3px; cursor: pointer;';
+        
+        // Insert the toggle button before the Clear button
+        clearBtn.parentNode.insertBefore(toggleBtn, clearBtn);
+        
+        log('XTerm toggle button added to UI', 'info');
+    } else {
+        log('Could not find Clear button to add XTerm toggle', 'warning');
+    }
 }
 
 // Utility Functions
@@ -315,6 +687,9 @@ async function initializeJVM() {
                 
                 // Set up browser-specific System class override
                 setupBrowserSystemOverride();
+                
+                // Set up XTerm integration
+                await setupXtermIntegration();
                 
                 log(`Real JVM Debug initialized with ${extractedFiles.length} sample classes`, 'success');
                 await populateSampleClasses();
@@ -1105,6 +1480,9 @@ window.deserializeState = deserializeState;
 window.setBreakpoint = setBreakpoint;
 window.clearAllBreakpoints = clearAllBreakpoints;
 window.initializeEditor = initializeEditor;
+window.toggleOutputMode = toggleOutputMode;
+window.initializeXterm = initializeXterm;
+window.setupXtermIntegration = setupXtermIntegration;
 
 // Initialize when DOM is ready
 document.addEventListener('DOMContentLoaded', initializeJVM);
