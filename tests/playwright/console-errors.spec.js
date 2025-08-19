@@ -2,11 +2,13 @@ const { test, expect } = require('@playwright/test');
 
 test.describe('Console Error Detection', () => {
   test('should not have console errors during Hello class step-by-step execution', async ({ page }) => {
-    const consoleMessages = [];
+    const consoleErrors = [];
     
-    // Capture all console messages
+    // Capture console errors only
     page.on('console', (msg) => {
-      consoleMessages.push(`[${msg.type()}] ${msg.text()}`);
+      if (msg.type() === 'error') {
+        consoleErrors.push(msg.text());
+      }
     });
 
     // Load the debug interface
@@ -26,8 +28,8 @@ test.describe('Console Error Detection', () => {
     await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
     
-    // Clear console messages collected during initialization
-    consoleMessages.length = 0;
+    // Clear console errors collected during initialization
+    consoleErrors.length = 0;
     
     // Step through execution - this should trigger the System.out access
     await page.click('#stepIntoBtn', { timeout: 5000 });
@@ -41,23 +43,10 @@ test.describe('Console Error Detection', () => {
     await page.click('#stepIntoBtn', { timeout: 5000 });
     await page.waitForTimeout(500);
     
-    // Log all console messages for debugging
-    if (consoleMessages.length > 0) {
-      console.log('All console messages during steps:');
-      consoleMessages.forEach(msg => console.log(`  - ${msg}`));
-    }
-    
-    // Check if the browser override was called
-    const browserOverrideMessages = consoleMessages.filter(msg => 
-      msg.includes('BROWSER OVERRIDE')
-    );
-    
-    console.log(`Browser override messages: ${browserOverrideMessages.length}`);
-    browserOverrideMessages.forEach(msg => console.log(`  ${msg}`));
-    
-    // Assert no console errors related to the specific issues mentioned
-    const systemClassErrors = consoleMessages.filter(msg => 
-      msg.includes('Unresolved static field: java/lang/System.out')
+    // Assert no console errors related to System class static field access
+    const systemClassErrors = consoleErrors.filter(error => 
+      error.includes('Unresolved static field: java/lang/System.out') ||
+      error.includes('Class file not found: java/lang/System.class')
     );
     
     expect(systemClassErrors).toHaveLength(0);
