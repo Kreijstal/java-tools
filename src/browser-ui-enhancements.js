@@ -27,7 +27,8 @@ const STEP_BUTTON_IDS = [
     'stepOutBtn', 
     'stepInstructionBtn', 
     'continueBtn', 
-    'finishBtn'
+    'finishBtn',
+    'rewindBtn'
 ];
 
 // Global state for UI compatibility
@@ -235,18 +236,29 @@ async function initializeXterm() {
                 background: #1e1e1e;
                 border: 1px solid #3e3e42;
                 border-radius: 3px;
-                display: none;
+                display: block;
+                margin-top: 10px;
             `;
             
-            // Insert after the disassembly editor div (below Disassembly View)
-            const disassemblyEditor = document.getElementById('disassembly-editor');
-            if (disassemblyEditor && disassemblyEditor.parentNode) {
-                disassemblyEditor.parentNode.insertBefore(xtermContainer, disassemblyEditor.nextSibling);
+            // Add a title for the XTerm container
+            const xtermTitle = document.createElement('h3');
+            xtermTitle.textContent = 'Java Program Output (XTerm)';
+            xtermTitle.style.cssText = 'margin-top: 10px; margin-bottom: 5px; color: #569cd6; font-size: 14px;';
+            
+            // Insert after the Output Console section
+            const outputSection = document.getElementById(DOM_IDS.OUTPUT)?.parentNode;
+            if (outputSection && outputSection.parentNode) {
+                outputSection.parentNode.insertBefore(xtermTitle, outputSection.nextSibling);
+                outputSection.parentNode.insertBefore(xtermContainer, xtermTitle.nextSibling);
             } else {
-                // Fallback: Insert after the regular output div if disassembly editor not found
-                const output = document.getElementById(DOM_IDS.OUTPUT);
-                if (output && output.parentNode) {
-                    output.parentNode.insertBefore(xtermContainer, output.nextSibling);
+                // Fallback: append to the state panel stack
+                const statePanelStack = document.querySelector('.state-panel-stack');
+                if (statePanelStack) {
+                    const newPanel = document.createElement('div');
+                    newPanel.className = 'panel';
+                    newPanel.appendChild(xtermTitle);
+                    newPanel.appendChild(xtermContainer);
+                    statePanelStack.appendChild(newPanel);
                 }
             }
         }
@@ -264,7 +276,11 @@ async function initializeXterm() {
         // Set up input handling for stdin
         setupXtermInput();
         
-        log('XTerm.js terminal initialized successfully', 'success');
+        // Always enable XTerm output mode since we show both
+        useXtermOutput = true;
+        setupBrowserSystemOverrideWithXterm();
+        
+        log('XTerm.js terminal initialized successfully for Java output', 'success');
         return true;
         
     } catch (error) {
@@ -348,56 +364,7 @@ function createXtermWriter(type = 'stdout') {
     };
 }
 
-/**
- * Toggle between DOM output and XTerm output
- */
-function toggleOutputMode() {
-    const regularOutput = document.getElementById(DOM_IDS.OUTPUT);
-    const xtermContainer = document.getElementById('xterm-container');
-    const toggleBtn = document.getElementById('toggle-output-btn');
-    
-    if (!xtermContainer) {
-        log('XTerm not initialized. Initializing...', 'info');
-        initializeXterm().then(success => {
-            if (success) {
-                toggleOutputMode(); // Retry after initialization
-            }
-        });
-        return;
-    }
-    
-    useXtermOutput = !useXtermOutput;
-    
-    if (useXtermOutput) {
-        // Switch to XTerm
-        regularOutput.style.display = 'none';
-        xtermContainer.style.display = 'block';
-        if (toggleBtn) toggleBtn.textContent = 'Use DOM Output';
-        
-        // Fit terminal when shown
-        setTimeout(() => {
-            if (xtermFitAddon) {
-                xtermFitAddon.fit();
-            }
-        }, 100);
-        
-        log('Switched to XTerm output mode (supports ANSI colors & stdin)', 'success');
-        
-        // Re-setup system override to use xterm writers
-        setupBrowserSystemOverrideWithXterm();
-        
-    } else {
-        // Switch to DOM
-        regularOutput.style.display = 'block';
-        xtermContainer.style.display = 'none';
-        if (toggleBtn) toggleBtn.textContent = 'Use XTerm Output';
-        
-        log('Switched to DOM output mode', 'info');
-        
-        // Re-setup system override to use DOM writers
-        setupBrowserSystemOverride();
-    }
-}
+// XTerm toggle functionality removed - both XTerm and DOM output are now always visible
 
 /**
  * Set up browser-specific System class override with XTerm writers
@@ -485,54 +452,23 @@ function setupBrowserSystemOverrideWithXterm() {
 }
 
 /**
- * Set up XTerm integration - add toggle button and initialize if available
+ * Set up XTerm integration - initialize XTerm for Java output alongside DOM logging
  */
 async function setupXtermIntegration() {
     try {
-        // Add toggle button to the UI dynamically
-        addXtermToggleButton();
-        
         // Try to initialize XTerm
         const success = await initializeXterm();
         if (success) {
-            log('XTerm.js available - toggle output mode to use terminal I/O with ANSI support', 'info');
+            log('XTerm.js initialized for Java program output - DOM logging available for general messages', 'info');
         } else {
-            // Keep the button visible but disabled to show the feature exists
-            const toggleBtn = document.getElementById('toggle-output-btn');
-            if (toggleBtn) {
-                toggleBtn.disabled = true;
-                toggleBtn.title = 'XTerm.js not available - feature disabled';
-                toggleBtn.style.opacity = '0.5';
-            }
-            log('XTerm.js not available - using DOM output only', 'info');
+            log('XTerm.js not available - using DOM output for both Java and logging', 'info');
         }
     } catch (error) {
         logError('XTerm integration setup failed', error);
     }
 }
 
-/**
- * Dynamically add the XTerm toggle button to the UI
- */
-function addXtermToggleButton() {
-    // Find the Clear button in the Output Console section
-    const clearBtn = document.querySelector('button[onclick="clearOutput()"]');
-    if (clearBtn) {
-        // Create the toggle button
-        const toggleBtn = document.createElement('button');
-        toggleBtn.id = 'toggle-output-btn';
-        toggleBtn.onclick = toggleOutputMode;
-        toggleBtn.textContent = 'Use XTerm Output';
-        toggleBtn.style.cssText = 'float: right; margin-right: 10px; font-size: 10px; padding: 2px 6px; background-color: #0e639c; color: white; border: none; border-radius: 3px; cursor: pointer;';
-        
-        // Insert the toggle button before the Clear button
-        clearBtn.parentNode.insertBefore(toggleBtn, clearBtn);
-        
-        log('XTerm toggle button added to UI', 'info');
-    } else {
-        log('Could not find Clear button to add XTerm toggle', 'warning');
-    }
-}
+// XTerm toggle button functionality removed - both outputs are always available
 
 // Utility Functions
 function log(message, type = 'info') {
@@ -1286,6 +1222,11 @@ function enhanceWithRealJVM() {
         return await executeDebugOperation(() => jvmDebug.stepInstruction(), 'step instruction', 'Step Instruction completed');
     };
     
+    // Add rewind function - expose existing rewind functionality from DebugController
+    window.rewind = async function() {
+        return await executeDebugOperation(() => jvmDebug.rewind(), 'rewind', 'Rewind completed');
+    };
+    
     // Override serialize/deserialize with real JVM state
     window.serializeState = function() {
         if (!jvmDebug) {
@@ -1473,7 +1414,7 @@ window.deserializeState = deserializeState;
 window.setBreakpoint = setBreakpoint;
 window.clearAllBreakpoints = clearAllBreakpoints;
 window.initializeEditor = initializeEditor;
-window.toggleOutputMode = toggleOutputMode;
+// toggleOutputMode function removed - both XTerm and DOM output are now always available
 window.initializeXterm = initializeXterm;
 window.setupXtermIntegration = setupXtermIntegration;
 

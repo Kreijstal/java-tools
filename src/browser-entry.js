@@ -17,8 +17,8 @@ class BrowserJVMDebug {
     this.fileProvider = new BrowserFileProvider();
     setFileProvider(this.fileProvider);
     
-    // Create the real debug controller
-    this.debugController = new DebugController();
+    // Create the real debug controller with rewind history enabled
+    this.debugController = new DebugController({ rewindHistorySize: 50 });
     this.isReady = false;
   }
 
@@ -133,6 +133,15 @@ class BrowserJVMDebug {
    */
   stepInstruction() {
     return this.debugController.stepInstruction();
+  }
+
+  /**
+   * Rewind execution by one or more steps
+   * @param {number} steps - Number of steps to rewind (default: 1)
+   * @returns {object} - Rewind result
+   */
+  rewind(steps = 1) {
+    return this.debugController.rewind(steps);
   }
 
   /**
