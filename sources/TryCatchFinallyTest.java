@@ -48,10 +48,14 @@ public class TryCatchFinallyTest {
     public static int testReturnInFinally() {
         try {
             System.out.println("In try");
-            return 0; // This will be superseded
+            throw new RuntimeException("Exception in try");
+            return 0;
+        } catch (Exception e) {
+            System.out.println("In catch");
+            return 1; // This return is superseded by the finally block's return
         } finally {
             System.out.println("In finally");
-            return 2;
+            return 2; // This return will be the one that is executed
         }
     }
 
@@ -86,4 +90,6 @@ public class TryCatchFinallyTest {
             System.out.println("Caught: " + e.getMessage());
         }
     }
+
 }
+

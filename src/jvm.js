@@ -555,6 +555,9 @@ if(this.verbose) {
   }
 
   handleException(exception, pc, thread) {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     const callStack = thread.callStack;
     if (callStack.isEmpty()) {
       console.error('Unhandled exception:', exception);

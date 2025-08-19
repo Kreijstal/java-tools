@@ -1,5 +1,8 @@
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     thread.callStack.pop();
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(null);
@@ -7,6 +10,9 @@ module.exports = {
     }
   },
   ireturn: (frame, instruction, jvm, thread) => {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
     if (thread.isAwaitingReflectiveCall) {
@@ -17,6 +23,9 @@ module.exports = {
     }
   },
   areturn: (frame, instruction, jvm, thread) => {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
     if (thread.isAwaitingReflectiveCall) {
