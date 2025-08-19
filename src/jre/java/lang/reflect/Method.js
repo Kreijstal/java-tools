@@ -58,5 +58,38 @@ module.exports = {
 
       return ASYNC_METHOD_SENTINEL;
     },
+    'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, methodObj, args) => {
+      const annotationClass = args[0];
+      const annotations = methodObj._annotations || [];
+      
+      // Check if annotation of the specified type is present
+      return annotations.some(ann => {
+        const annotationType = ann.type;
+        const annotationClassName = annotationClass._classData ? 
+          annotationClass._classData.ast.classes[0].className : 
+          annotationClass.className;
+        return annotationType === annotationClassName;
+      });
+    },
+    'getAnnotation(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;': (jvm, methodObj, args) => {
+      const annotationClass = args[0];
+      const annotations = methodObj._annotations || [];
+      
+      // Find annotation of the specified type
+      const annotation = annotations.find(ann => {
+        const annotationType = ann.type;
+        const annotationClassName = annotationClass._classData ? 
+          annotationClass._classData.ast.classes[0].className : 
+          annotationClass.className;
+        return annotationType === annotationClassName;
+      });
+      
+      if (annotation) {
+        // Create annotation proxy object
+        return jvm.createAnnotationProxy(annotation);
+      }
+      
+      return null;
+    },
   }
 };
