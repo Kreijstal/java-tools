@@ -78,32 +78,31 @@ const FIXED_CRASH_TESTS = [
     name: 'ConversionTest',
     description: 'l2i conversion - should work',
     expectedPattern: /10/
+  },
+  {
+    name: 'StackOverflowTest',
+    description: 'Should throw StackOverflowError',
+    expectedPattern: /Caught StackOverflowError/
+  },
+  {
+    name: 'TryCatchTest',
+    description: 'Should correctly handle try-catch-finally',
+    expectedPattern: /Caught arithmetic exception.*Finally block executed/s
+  },
+  {
+    name: 'EnumTest',
+    description: 'Should support enums',
+    expectedPattern: /Color: RED.*It's red!.*Caught expected exception/s
+  },
+  {
+    name: 'InnerClassTest',
+    description: 'Should support inner classes',
+    expectedPattern: /Inner field.*Nested field.*Local variable.*Anonymous inner class running/s
   }
 ];
 
 // Test programs that may still have issues
-const PARTIAL_TESTS = [
-  {
-    name: 'TryCatchTest',
-    description: 'Partial failure on exception methods',
-    allowFailure: true
-  },
-  {
-    name: 'EnumTest',
-    description: 'May still have issues with enum constants',
-    allowFailure: true
-  },
-  {
-    name: 'StackOverflowTest',
-    description: 'May still crash on getstatic before stack overflow',
-    allowFailure: true
-  },
-  {
-    name: 'InnerClassTest',
-    description: 'Missing JRE dependencies',
-    allowFailure: true
-  }
-];
+const PARTIAL_TESTS = [];
 
 // Helper function to run JVM test
 async function runJvmTest(testName, timeout = 2000) {

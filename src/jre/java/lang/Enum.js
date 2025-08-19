@@ -31,6 +31,13 @@ module.exports = {
       // Constructor for enum: name and ordinal
       obj.name = args[0];
       obj.ordinal = args[1];
+      // Override the native toString method for easier string concatenation
+      obj.toString = () => {
+        if (obj.name && typeof obj.name === 'object' && obj.name.value) {
+          return obj.name.value;
+        }
+        return obj.name || 'UNKNOWN';
+      };
     },
     'name()Ljava/lang/String;': (jvm, obj, args) => {
       return obj.name || jvm.internString('UNKNOWN');
@@ -39,11 +46,8 @@ module.exports = {
       return obj.ordinal || 0;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      // obj.name is a Java String object, we need to extract the actual string value
-      const nameStr = obj.name && typeof obj.name === 'object' && obj.name.value 
-        ? obj.name.value 
-        : (obj.name || 'UNKNOWN');
-      return jvm.internString(nameStr);
+      // This is the Java toString() method, which should return a Java String object
+      return obj.name || jvm.internString('UNKNOWN');
     },
     'equals(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const other = args[0];
