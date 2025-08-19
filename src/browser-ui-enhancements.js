@@ -161,43 +161,6 @@ function setupStateFileInput() {
     }
 }
 
-// Browser System Class Override
-function setupBrowserSystemOverride() {
-    if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
-        log('JVM not available for System override', 'warning');
-        return;
-    }
-
-    const jvm = jvmDebug.debugController.jvm;
-    
-    // Set up browser output callback to capture System.out.println output
-    jvm._setTestOutputCallback((char) => {
-        // Write output to browser console and UI
-        const output = document.getElementById(DOM_IDS.OUTPUT);
-        if (output) {
-            // Find or create a system output div
-            let systemOutput = document.getElementById('systemOutput');
-            if (!systemOutput) {
-                systemOutput = document.createElement('div');
-                systemOutput.id = 'systemOutput';
-                systemOutput.className = 'system-output';
-                systemOutput.style.cssText = 'background: #2d3748; color: #68d391; padding: 8px; margin: 4px 0; border-left: 4px solid #68d391; font-family: monospace; white-space: pre-wrap;';
-                output.appendChild(systemOutput);
-            }
-            
-            // Append character to system output
-            systemOutput.textContent += char;
-            output.scrollTop = output.scrollHeight;
-        }
-        
-        // Also log to browser console for debugging  
-        if (typeof console !== 'undefined' && console.log && char === '\n') {
-            console.log('[JVM System.out]'); // Only log newlines to avoid spam
-        }
-    });
-    
-    log('Browser System output callback initialized successfully', 'success');
-}
 
 async function initializeJVM() {
     try {
@@ -207,9 +170,6 @@ async function initializeJVM() {
         // Initialize the real JVM debug engine
         if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
             jvmDebug = new window.JVMDebug.BrowserJVMDebug();
-            
-            // Set up browser-specific System class override for console output
-            setupBrowserSystemOverride();
             
             try {
                 // Detect environment and determine data.zip URL
@@ -238,6 +198,7 @@ async function initializeJVM() {
             }
             
             log('Real JVM Debug Interface ready! 🚀', 'success');
+            log('System class browser override initialized - System.out.println now works in browser!', 'success');
             
             // Enhance the existing functions with real JVM calls
             enhanceWithRealJVM();

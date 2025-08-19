@@ -8,10 +8,6 @@ module.exports = {
     'write(I)V': (jvm, obj, args) => {
       const byte = args[0];
       const char = String.fromCharCode(byte);
-      if (jvm.testOutputCallback) {
-        jvm.testOutputCallback(char);
-        return;
-      }
       if (obj.writer) {
         obj.writer(char);
       }

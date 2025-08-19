@@ -123,9 +123,6 @@ class JVM {
   }
 
 
-  _setTestOutputCallback(callback) {
-    this.testOutputCallback = callback;
-  }
 
   registerJreMethods(methods) {
     for (const className in methods) {
