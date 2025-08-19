@@ -67,27 +67,34 @@ async function setupAceEditor() {
 // Function to copy XTerm.js from node_modules
 async function setupXtermLibrary() {
     const xtermCSS = path.join(process.cwd(), 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
+    const xtermJS = path.join(process.cwd(), 'node_modules', '@xterm', 'xterm', 'lib', 'xterm.js');
+    const fitAddonJS = path.join(process.cwd(), 'node_modules', '@xterm', 'addon-fit', 'lib', 'addon-fit.js');
+    
     const xtermCSSTarget = path.join(libDir, 'xterm.css');
+    const xtermJSTarget = path.join(libDir, 'xterm.js');
+    const fitAddonJSTarget = path.join(libDir, 'addon-fit.js');
     
-    // Check if XTerm CSS already exists
-    if (fs.existsSync(xtermCSSTarget)) {
-        console.log('  ✓ XTerm.js CSS already exists');
+    // Check if XTerm files already exist
+    if (fs.existsSync(xtermCSSTarget) && fs.existsSync(xtermJSTarget) && fs.existsSync(fitAddonJSTarget)) {
+        console.log('  ✓ XTerm.js files already exist');
         return;
     }
     
-    console.log('  📦 Copying XTerm.js CSS from node_modules...');
+    console.log('  📦 Copying XTerm.js and FitAddon from node_modules...');
     
-    if (!fs.existsSync(xtermCSS)) {
-        console.log('  ⚠️  XTerm.js not found in node_modules - skipping (XTerm features will be disabled)');
+    if (!fs.existsSync(xtermCSS) || !fs.existsSync(xtermJS) || !fs.existsSync(fitAddonJS)) {
+        console.log('  ⚠️  XTerm.js or FitAddon not found in node_modules - skipping (XTerm features will be disabled)');
         return;
     }
     
-    // Copy XTerm CSS
+    // Copy XTerm files
     copyFile(xtermCSS, xtermCSSTarget);
-    console.log('  ✓ XTerm.js CSS copied successfully');
-    
-    // Note: We don't copy JS files here because they'll be bundled by webpack
-    // or loaded dynamically via import() in the browser
+    copyFile(xtermJS, xtermJSTarget);
+    copyFile(fitAddonJS, fitAddonJSTarget);
+    console.log('  ✓ Copied: xterm.css');
+    console.log('  ✓ Copied: xterm.js');
+    console.log('  ✓ Copied: addon-fit.js');
+    console.log('  ✓ XTerm.js and FitAddon copied successfully');
 }
 
 // Main build function

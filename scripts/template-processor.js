@@ -146,11 +146,11 @@ function addDataZipDownloadSection(htmlContent) {
  * Add XTerm.js support for enhanced terminal I/O
  */
 function addXtermSupport(htmlContent) {
-    // Add XTerm CSS import to head
+    // Add XTerm CSS and JS imports using local files instead of CDN
     const headPattern = /(<\/head>)/;
-    const xtermIncludes = `    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    const xtermIncludes = `    <link rel="stylesheet" href="./lib/xterm.css">
+    <script src="./lib/xterm.js"></script>
+    <script src="./lib/addon-fit.js"></script>
 $1`;
     htmlContent = htmlContent.replace(headPattern, xtermIncludes);
     
