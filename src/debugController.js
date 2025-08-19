@@ -5,6 +5,14 @@ class DebugController {
   constructor(options = {}) {
     this.jvm = new JVM(options);
     this.executionState = 'stopped'; // stopped, running, paused
+    // Store last known state for display purposes when execution completes
+    this.lastKnownState = {
+      pc: null,
+      method: null,
+      stack: [],
+      locals: [],
+      callStackDepth: 0
+    };
   }
 
   async start(classFilePath, options = {}) {
@@ -126,7 +134,15 @@ class DebugController {
   getCurrentState() {
     const thread = this.jvm.threads[this.jvm.currentThreadIndex];
     if (!thread) {
-      return { executionState: this.executionState, pc: null, stack: [], locals: [], callStackDepth: 0, method: null, breakpoints: [] };
+      return { 
+        executionState: this.executionState, 
+        pc: this.lastKnownState.pc, 
+        stack: [], 
+        locals: [], 
+        callStackDepth: 0, 
+        method: this.lastKnownState.method, 
+        breakpoints: [] 
+      };
     }
 
     let frame;
@@ -138,12 +154,30 @@ class DebugController {
     }
     
     if (!frame) {
-      return { executionState: this.executionState, pc: null, stack: [], locals: [], callStackDepth: 0, method: null, breakpoints: [] };
+      // Return last known state when execution is complete but with current execution state
+      return { 
+        executionState: this.executionState, 
+        pc: this.lastKnownState.pc, 
+        stack: [], 
+        locals: [], 
+        callStackDepth: 0, 
+        method: this.lastKnownState.method, 
+        breakpoints: Array.from(this.jvm.debugManager.breakpoints) 
+      };
     }
 
     const instructionItem = frame.instructions[frame.pc];
     const label = instructionItem ? instructionItem.labelDef : null;
     const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+    
+    // Update last known state for future use
+    this.lastKnownState = {
+      pc: currentPc,
+      method: { name: frame.method.name, descriptor: frame.method.descriptor },
+      stack: frame.stack.items,
+      locals: frame.locals,
+      callStackDepth: thread.callStack.size()
+    };
     
     return {
       executionState: this.executionState,

@@ -1,5 +1,8 @@
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     thread.callStack.pop();
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(null);
@@ -7,6 +10,9 @@ module.exports = {
     }
   },
   ireturn: (frame, instruction, jvm, thread) => {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
     if (thread.isAwaitingReflectiveCall) {
@@ -17,6 +23,9 @@ module.exports = {
     }
   },
   areturn: (frame, instruction, jvm, thread) => {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
     if (thread.isAwaitingReflectiveCall) {
@@ -193,6 +202,29 @@ module.exports = {
       frame.pc = targetPc;
     } else {
       throw new Error(`Label ${targetLabel} not found`);
+    }
+  },
+  jsr: (frame, instruction) => {
+    const label = instruction.arg;
+    const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+    if (targetPc !== -1) {
+      frame.stack.push(frame.pc);
+      frame.pc = targetPc;
+    } else {
+      throw new Error(`Label ${label} not found`);
+    }
+  },
+  ret: (frame, instruction, jvm, thread) => {
+    const index = parseInt(instruction.arg);
+    const returnAddress = frame.locals[index];
+    if (typeof returnAddress !== 'number') {
+        throw new Error('Return address is not a number');
+    }
+    frame.pc = returnAddress;
+    if (thread.pendingException) {
+      const e = thread.pendingException;
+      delete thread.pendingException;
+      throw e;
     }
   },
 };

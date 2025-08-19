@@ -16,7 +16,8 @@ function runKrak2(classPath) {
     // Krakatau will output a .j file with the same name as the class
     const classBase = path.basename(classPath, '.class');
     const jFile = path.join(outDir, `${classBase}.j`);
-    exec(`"${krak2Path}" dis --out "${outDir}" "${classPath}"`, (error, stdout, stderr) => {
+    // Use execFile to avoid shell interpretation of special characters like $
+    execFile(krak2Path, ['dis', '--out', outDir, classPath], (error, stdout, stderr) => {
       if (error) {
         reject(error);
       } else {
@@ -40,7 +41,7 @@ function runKrak2(classPath) {
 
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { exec, execFile } = require('child_process');
 const { parseClassFile } = require('../src/create_java_asm');
 
 /**

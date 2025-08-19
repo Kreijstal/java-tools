@@ -16,8 +16,12 @@ module.exports = {
         };
       }
     } else {
-      const value = instruction.arg.replace(/"/g, '');
-      frame.stack.push(jvm.internString(value));
+      const constant = instruction.arg;
+      if (typeof constant === 'string' || constant instanceof String) {
+        frame.stack.push(jvm.internString(constant.replace(/"/g, '')));
+      } else {
+        frame.stack.push(constant);
+      }
     }
   },
   bipush: (frame, instruction) => {

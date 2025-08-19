@@ -268,42 +268,39 @@ module.exports = {
     const objRef = frame.stack.pop();
 
     if (objRef === null) {
-      frame.stack.push(0); // null is not an instance of anything
+      frame.stack.push(0);
       return;
     }
 
-    let currentClassName = objRef.type;
-    while (currentClassName) {
-      if (currentClassName === targetClassName) {
-        frame.stack.push(1); // Found a match
-        return;
+    const isInstanceOf = (className, target) => {
+      if (!className) return false;
+      if (className === target) return true;
+
+      const classData = jvm.classes[className];
+      if (!classData) return false;
+
+      // Check superclass
+      if (isInstanceOf(classData.ast.classes[0].superClassName, target)) {
+        return true;
       }
 
-      const classData = jvm.classes[currentClassName];
-      if (!classData) {
-        frame.stack.push(0); // Should not happen if classes are loaded correctly
-        return;
-      }
-
+      // Check interfaces
       const interfaces = classData.ast.classes[0].interfaces;
-      if (interfaces && interfaces.length > 0) {
-        const interfaceQueue = [...interfaces];
-        while (interfaceQueue.length > 0) {
-          const interfaceName = interfaceQueue.shift();
-          if (interfaceName === targetClassName) {
-            frame.stack.push(1);
-            return;
-          }
-          const interfaceData = jvm.classes[interfaceName];
-          if (interfaceData && interfaceData.ast.classes[0].interfaces) {
-            interfaceQueue.push(...interfaceData.ast.classes[0].interfaces);
+      if (interfaces) {
+        for (const iface of interfaces) {
+          if (isInstanceOf(iface, target)) {
+            return true;
           }
         }
       }
-      currentClassName = classData.ast.classes[0].superClassName;
-    }
+      return false;
+    };
 
-    frame.stack.push(0); // No match found in the hierarchy
+    if (isInstanceOf(objRef.type, targetClassName)) {
+      frame.stack.push(1);
+    } else {
+      frame.stack.push(0);
+    }
   },
 
   multianewarray: (frame, instruction, jvm) => {
@@ -366,7 +363,7 @@ module.exports = {
     }
 
     // If we get here, the cast is invalid
-    throw new Error('ClassCastException');
+    throw { type: 'java/lang/ClassCastException', message: `${objRef.type} cannot be cast to ${targetClassName}` };
   },
 
   newarray: (frame, instruction, jvm) => {

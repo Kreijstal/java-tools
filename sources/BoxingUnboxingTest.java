@@ -13,7 +13,7 @@ public class BoxingUnboxingTest {
         // Test with method calls
         System.out.println("=== Method Call Boxing ===");
         testIntegerMethod(100); // autoboxing
-        testIntMethod(new Integer(200)); // unboxing
+        testIntMethod(Integer.valueOf(200)); // unboxing
         
         // Test arithmetic with boxed types
         System.out.println("=== Arithmetic with Boxed Types ===");

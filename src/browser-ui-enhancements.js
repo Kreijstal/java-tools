@@ -47,6 +47,128 @@ let currentState = {
 // ACE Editor instance
 let aceEditor = null;
 
+/**
+ * Set up browser-specific System class override using the generic JVM override system
+ * This function overrides ONLY the System class's static initializer (<clinit>) to provide 
+ * DOM-based output in the browser while preserving Node.js functionality in the core System.js
+ */
+function setupBrowserSystemOverride() {
+    if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
+        log('Cannot setup browser System override - JVM not available', 'error');
+        return;
+    }
+
+    const jvm = jvmDebug.debugController.jvm;
+    
+    // Create browser writers that output to DOM elements
+    function createBrowserWriter(type = 'stdout') {
+        return (char) => {
+            // Browser environment - output to browser UI
+            if (typeof document !== 'undefined') {
+                const output = document.getElementById('output');
+                if (output) {
+                    // Find or create system output div
+                    let systemOutput = document.getElementById('systemOutput');
+                    if (!systemOutput) {
+                        systemOutput = document.createElement('div');
+                        systemOutput.id = 'systemOutput';
+                        systemOutput.className = 'system-output';
+                        const style = type === 'stderr' ? 
+                            'background: #2d3748; color: #f56565; padding: 8px; margin: 4px 0; border-left: 4px solid #f56565; font-family: monospace; white-space: pre-wrap;' :
+                            'background: #2d3748; color: #68d391; padding: 8px; margin: 4px 0; border-left: 4px solid #68d391; font-family: monospace; white-space: pre-wrap;';
+                        systemOutput.style.cssText = style;
+                        output.appendChild(systemOutput);
+                    }
+                    
+                    // Append character to system output
+                    systemOutput.textContent += char;
+                    output.scrollTop = output.scrollHeight;
+                }
+                
+                // Also log to browser console for debugging
+                if (typeof console !== 'undefined' && console.log && char === '\n') {
+                    console.log(`[JVM System.${type === 'stderr' ? 'err' : 'out'}]`);
+                }
+            }
+        };
+    }
+
+    // Use the new generic override system to override ONLY the <clinit> constructor
+    // This approach is cleaner and more surgical than replacing the entire class
+    jvm.registerJreOverrides({
+        'java/lang/System': {
+            methods: {
+                // Override only the static constructor to provide browser-specific System.out/err
+                '<clinit>()V': (jvm, _, args, thread) => {
+                    const systemClass = jvm.classes['java/lang/System'];
+
+                    const outWriter = createBrowserWriter('stdout');
+                    const errWriter = createBrowserWriter('stderr');
+
+                    // 1. Create ConsoleOutputStream for out
+                    const cosOut = { type: 'java/io/ConsoleOutputStream', fields: {} };
+                    const cosInit = jvm._jreFindMethod('java/io/ConsoleOutputStream', '<init>', '(Ljava/lang/Object;)V');
+                    if (cosInit) {
+                        cosInit(jvm, cosOut, [outWriter]);
+                    }
+
+                    // 2. Create PrintStream for out
+                    const out = { type: 'java/io/PrintStream', fields: {} };
+                    const psInit = jvm._jreFindMethod('java/io/PrintStream', '<init>', '(Ljava/io/OutputStream;)V');
+                    if (psInit) {
+                        psInit(jvm, out, [cosOut]);
+                    }
+                    systemClass.staticFields.set('out:Ljava/io/PrintStream;', out);
+
+                    // 3. Create ConsoleOutputStream for err
+                    const cosErr = { type: 'java/io/ConsoleOutputStream', fields: {} };
+                    if (cosInit) {
+                        cosInit(jvm, cosErr, [errWriter]);
+                    }
+
+                    // 4. Create PrintStream for err
+                    const err = { type: 'java/io/PrintStream', fields: {} };
+                    if (psInit) {
+                        psInit(jvm, err, [cosErr]);
+                    }
+                    systemClass.staticFields.set('err:Ljava/io/PrintStream;', err);
+
+                    // 5. Create a dummy InputStream for in
+                    const inStream = { type: 'java/io/InputStream', fields: {} };
+                    systemClass.staticFields.set('in:Ljava/io/InputStream;', inStream);
+                }
+                // Note: We don't override getProperty, exit, or other methods - they remain as-is from System.js
+            }
+        }
+    });
+    
+    // ALSO use the older registerJreMethods for println to make sure it works in both paths
+    // This ensures browser output works regardless of which override method is used
+    jvm.registerJreMethods({
+        'java/io/PrintStream': {
+            'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+                // Extract the actual string value from the JVM string object
+                const str = (typeof args[0] === 'string') ? args[0] : args[0]?.value || String(args[0]);
+                
+                // Use the browser writer system for DOM output
+                const outWriter = createBrowserWriter('stdout');
+                for (let i = 0; i < str.length; i++) {
+                    outWriter(str.charAt(i));
+                }
+                outWriter('\n'); // Add newline for println
+                
+                // Also log to console for debugging
+                if (typeof console !== 'undefined') {
+                    console.log('[Browser System.out.println]:', str);
+                }
+            }
+        }
+    });
+    
+    log('Browser System constructor (<clinit>) override installed using generic JVM override system!', 'success');
+    log('System.out.println will now work in browser with DOM output', 'success');
+}
+
 // Utility Functions
 function log(message, type = 'info') {
     const timestamp = new Date().toLocaleTimeString();
@@ -161,6 +283,7 @@ function setupStateFileInput() {
     }
 }
 
+
 async function initializeJVM() {
     try {
         log('JVM Debug API Example loaded', 'info');
@@ -169,9 +292,6 @@ async function initializeJVM() {
         // Initialize the real JVM debug engine
         if (typeof window.JVMDebug !== 'undefined' && window.JVMDebug.BrowserJVMDebug) {
             jvmDebug = new window.JVMDebug.BrowserJVMDebug();
-            
-            // The JRE methods are now preloaded, so we don't need to register them here.
-            // The `println` implementation will be handled by the JRE itself.
             
             try {
                 // Detect environment and determine data.zip URL
@@ -192,6 +312,10 @@ async function initializeJVM() {
                 
                 // Initialize the debug environment
                 await jvmDebug.initialize();
+                
+                // Set up browser-specific System class override
+                setupBrowserSystemOverride();
+                
                 log(`Real JVM Debug initialized with ${extractedFiles.length} sample classes`, 'success');
                 await populateSampleClasses();
             } catch (err) {
@@ -200,6 +324,7 @@ async function initializeJVM() {
             }
             
             log('Real JVM Debug Interface ready! 🚀', 'success');
+            log('System class browser override initialized - System.out.println now works in browser!', 'success');
             
             // Enhance the existing functions with real JVM calls
             enhanceWithRealJVM();
@@ -390,7 +515,7 @@ function updateDebugDisplay() {
         const statusDiv = document.getElementById(DOM_IDS.EXECUTION_STATE);
         if (statusDiv) {
             const breakpoints = jvmDebug.getBreakpoints ? jvmDebug.getBreakpoints() : [];
-            statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null ? state.pc : ''}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + '([Ljava/lang/String;)V' : 'N/A'}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div><div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${breakpoints.join(', ')}]</span></div>`;
+            statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null && state.pc !== undefined ? state.pc : ''}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + state.method.descriptor : 'N/A'}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div><div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${breakpoints.join(', ')}]</span></div>`;
         }
         
         // Update thread dropdown
