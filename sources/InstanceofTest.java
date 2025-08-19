@@ -3,7 +3,7 @@ public class InstanceofTest {
         System.out.println("=== instanceof Test ===");
         
         Object obj1 = "Hello";
-        Object obj2 = new Integer(42);
+        Object obj2 = Integer.valueOf(42);
         Object obj3 = new int[]{1, 2, 3};
         
         // Test basic instanceof
