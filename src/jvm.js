@@ -29,6 +29,7 @@ class JVM {
   _preloadJreClasses() {
     const jreHierarchy = {
       'java/lang/Object': null,
+      'java/lang/System': 'java/lang/Object',
       'java/lang/Throwable': 'java/lang/Object',
       'java/lang/Exception': 'java/lang/Throwable',
       'java/lang/RuntimeException': 'java/lang/Exception',
@@ -47,6 +48,7 @@ class JVM {
       'java/io/OutputStream': 'java/lang/Object',
       'java/io/FilterOutputStream': 'java/io/OutputStream',
       'java/io/PrintStream': 'java/io/FilterOutputStream',
+      'java/io/ConsoleOutputStream': 'java/io/OutputStream',
       'java/net/URLConnection': 'java/lang/Object',
       'java/net/HttpURLConnection': 'java/net/URLConnection',
     };
@@ -537,7 +539,22 @@ if(this.verbose) {
 
     this.classInitializationState.set(className, 'INITIALIZING');
 
-    const classData = await this.loadClassByName(className);
+    // For JRE classes, we should already have them preloaded in this.classes
+    let classData = this.classes[className];
+    if (!classData) {
+      // Only try to load from file system if not a JRE class
+      if (!this.jre[className]) {
+        classData = await this.loadClassByName(className);
+      } else {
+        // JRE class should have been preloaded, something went wrong
+        if (this.verbose) {
+          console.warn(`JRE class ${className} not found in preloaded classes`);
+        }
+        this.classInitializationState.set(className, 'INITIALIZED');
+        return false;
+      }
+    }
+    
     if (classData) {
       const superClassName = classData.ast.classes[0].superClassName;
       if (superClassName) {
