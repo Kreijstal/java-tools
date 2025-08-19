@@ -148,8 +148,11 @@ function addDataZipDownloadSection(htmlContent) {
 function addXtermSupport(htmlContent) {
     // Add XTerm CSS import to head
     const headPattern = /(<\/head>)/;
-    const xtermCSS = '    <link rel="stylesheet" href="./lib/xterm.css">\n$1';
-    htmlContent = htmlContent.replace(headPattern, xtermCSS);
+    const xtermIncludes = `    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+$1`;
+    htmlContent = htmlContent.replace(headPattern, xtermIncludes);
     
     // Add toggle button after the "Clear" button in Output Console section
     const clearButtonPattern = /(<button onclick="clearOutput\(\)" style="float: right; font-size: 10px; padding: 2px 6px;">Clear<\/button>)/;

@@ -179,28 +179,12 @@ function setupBrowserSystemOverride() {
  */
 async function initializeXterm() {
     try {
-        // Try to dynamically import xterm modules - they might not be available
-        let Terminal, FitAddon;
-        
-        try {
-            // Try importing from global scope (if bundled)
-            if (typeof window.Terminal !== 'undefined') {
-                Terminal = window.Terminal;
-                FitAddon = window.FitAddon;
-            } else {
-                // Try dynamic import (might fail if not bundled)
-                const xtermModule = await import('@xterm/xterm');
-                const fitModule = await import('@xterm/addon-fit');
-                Terminal = xtermModule.Terminal;
-                FitAddon = fitModule.FitAddon;
-            }
-        } catch (importError) {
-            log('XTerm.js modules not available - dynamic import failed', 'info');
-            return false;
-        }
+        // Use XTerm from CDN (available as global objects)
+        const Terminal = window.Terminal;
+        const FitAddon = window.FitAddon;
         
         if (!Terminal || !FitAddon) {
-            log('XTerm.js classes not available', 'info');
+            log('XTerm.js not loaded from CDN - classes not available', 'info');
             return false;
         }
         
@@ -506,10 +490,12 @@ async function setupXtermIntegration() {
         if (success) {
             log('XTerm.js available - toggle output mode to use terminal I/O with ANSI support', 'info');
         } else {
-            // Hide the button if XTerm failed to initialize
+            // Keep the button visible but disabled to show the feature exists
             const toggleBtn = document.getElementById('toggle-output-btn');
             if (toggleBtn) {
-                toggleBtn.style.display = 'none';
+                toggleBtn.disabled = true;
+                toggleBtn.title = 'XTerm.js not available - feature disabled';
+                toggleBtn.style.opacity = '0.5';
             }
             log('XTerm.js not available - using DOM output only', 'info');
         }
