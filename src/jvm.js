@@ -535,6 +535,10 @@ if(this.verbose) {
       return false;
     }
 
+    if (this.verbose) {
+      console.log(`Initializing class: ${className}`);
+    }
+
     this.classInitializationState.set(className, 'INITIALIZING');
 
     const classData = await this.loadClassByName(className);
@@ -551,6 +555,10 @@ if(this.verbose) {
       if (!classData.staticFields) {
         classData.staticFields = new Map();
         
+        if (this.verbose) {
+          console.log(`Initializing staticFields for ${className}`);
+        }
+
         // Initialize static fields with default values
         const fields = classData.ast.classes[0].items.filter(item => 
           item.type === 'field' && item.field.flags && item.field.flags.includes('static')
@@ -576,13 +584,25 @@ if(this.verbose) {
           // Object references default to null
           
           classData.staticFields.set(fieldKey, defaultValue);
+
+          if (this.verbose) {
+            console.log(`Initialized static field ${fieldKey} with default value`);
+          }
         }
       }
 
       // Check for and execute native initializer
       const nativeClinit = this._jreFindMethod(className, '<clinit>', '()V');
       if (nativeClinit) {
+        if (this.verbose) {
+          console.log(`Executing native <clinit> for ${className}`);
+        }
         nativeClinit(this, null, [], thread);
+
+        // Log static fields after native <clinit>
+        if (this.verbose && classData.staticFields) {
+          console.log(`Static fields after <clinit> for ${className}:`, Array.from(classData.staticFields.keys()));
+        }
       }
 
       // Check for and execute bytecode initializer
