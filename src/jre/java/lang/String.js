@@ -1,6 +1,21 @@
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
+  staticMethods: {
+    'valueOf(Ljava/lang/Object;)Ljava/lang/String;': (jvm, obj, args) => {
+      const value = args[0];
+      if (value === null) {
+        return jvm.internString('null');
+      }
+      if (typeof value === 'string') {
+        return value; // Already a string
+      }
+      if (value && typeof value.toString === 'function') {
+        return jvm.internString(value.toString());
+      }
+      return jvm.internString(String(value));
+    },
+  },
   methods: {
     'concat(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj + args[0]);

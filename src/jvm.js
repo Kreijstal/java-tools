@@ -318,9 +318,10 @@ class JVM {
     
     if (wasFramePushed) {
       // If a <clinit> frame was pushed, we need to execute it to completion first
-      while (!mainThread.callStack.isEmpty() && 
-             mainThread.callStack.peek().method && 
-             mainThread.callStack.peek().method.name === '<clinit>') {
+      // Wait until all frames related to class initialization complete
+      // This includes the <clinit> frame and any methods it calls
+      const originalStackSize = mainThread.callStack.size();
+      while (mainThread.callStack.size() >= originalStackSize) {
         const result = await this.executeTick();
         if (result.completed) break;
       }
