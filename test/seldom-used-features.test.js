@@ -32,8 +32,8 @@ const SELDOM_USED_FEATURE_TESTS = [
   {
     name: 'VarargsGenericTest',
     description: 'Varargs with generic types',
-    expectedDifferences: ['Missing ifle instruction'],
-    allowFailure: true
+    expectedDifferences: [],
+    allowFailure: false  // Fixed! ifle instruction implemented
   },
   {
     name: 'StaticInitializationTest',

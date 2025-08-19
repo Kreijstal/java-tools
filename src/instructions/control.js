@@ -123,6 +123,18 @@ module.exports = {
       }
     }
   },
+  ifgt: (frame, instruction) => {
+    const label = instruction.arg;
+    const value = frame.stack.pop();
+    if (value > 0) {
+      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
   ifeq: (frame, instruction) => {
     const label = instruction.arg;
     const value = frame.stack.pop();

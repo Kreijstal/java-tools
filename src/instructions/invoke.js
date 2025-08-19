@@ -28,8 +28,9 @@ function autoboxPrimitive(jvm, value) {
     // Boolean autoboxing
     return {
       type: 'java/lang/Boolean',
-      value: value,
-      toString: function() { return this.value ? 'true' : 'false'; }
+      value: value ? 1 : 0, // Store as integer for JVM compatibility
+      booleanValue: value,   // Store original boolean value
+      toString: function() { return value ? 'true' : 'false'; }
     };
   }
   if (typeof value === 'string') {
