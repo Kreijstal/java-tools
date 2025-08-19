@@ -6,6 +6,7 @@ const jreClasses = require('./jre');
 const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
+const JNI = require('./jni');
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
@@ -22,6 +23,12 @@ class JVM {
     this.classpath = options.classpath || '.';
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
+    
+    // Initialize JNI system
+    this.jni = new JNI(this);
+    if (options.verbose) {
+      this.jni.setVerbose(true);
+    }
 
     this._preloadJreClasses();
   }
@@ -211,6 +218,13 @@ class JVM {
   }
 
   _jreFindMethod(className, methodName, descriptor) {
+    // First check JNI registry for registered native methods
+    const nativeMethod = this.jni.findNativeMethod(className, methodName, descriptor);
+    if (nativeMethod) {
+      return nativeMethod;
+    }
+
+    // Continue with original JRE method lookup
     let currentClass = this.jre[className];
     while (currentClass) {
       const methodKey = `${methodName}${descriptor}`;
@@ -290,7 +304,70 @@ class JVM {
   }
 
   _jreGetNative(className, nativeName) {
+    // First check JNI registry for native methods
+    const nativeMethod = this.jni.findNativeMethod(className, nativeName, '');
+    if (nativeMethod) {
+      return nativeMethod;
+    }
+    
+    // Fallback to legacy JRE lookup for backward compatibility
     return this.jre[className][nativeName];
+  }
+
+  /**
+   * Register a native method implementation
+   * @param {string} className - Java class name
+   * @param {string} methodName - Method name
+   * @param {string} descriptor - Method descriptor
+   * @param {function} implementation - Native implementation function
+   * @param {object} options - Additional options
+   */
+  registerNativeMethod(className, methodName, descriptor, implementation, options = {}) {
+    return this.jni.registerNativeMethod(className, methodName, descriptor, implementation, options);
+  }
+
+  /**
+   * Load a native library
+   * @param {string} libraryName - Name of the library
+   * @param {string|object} libraryPath - Path to JS module or library object
+   * @param {object} options - Loading options
+   */
+  loadNativeLibrary(libraryName, libraryPath, options = {}) {
+    return this.jni.loadLibrary(libraryName, libraryPath, options);
+  }
+
+  /**
+   * Check if a method is registered as native
+   * @param {string} className - Java class name
+   * @param {string} methodName - Method name
+   * @param {string} descriptor - Method descriptor
+   * @returns {boolean}
+   */
+  hasNativeMethod(className, methodName, descriptor) {
+    return this.jni.hasNativeMethod(className, methodName, descriptor);
+  }
+
+  /**
+   * Get all registered native methods for debugging/introspection
+   * @param {string} className - Optional class name filter
+   * @returns {Array} - Array of native method descriptors
+   */
+  getNativeMethods(className = null) {
+    if (className) {
+      return this.jni.getClassNativeMethods(className);
+    } else {
+      // Return all native methods
+      const allMethods = [];
+      for (const [key, _] of this.jni.nativeRegistry) {
+        const parts = key.split(':');
+        allMethods.push({
+          className: parts[0],
+          methodName: parts[1],
+          descriptor: parts[2]
+        });
+      }
+      return allMethods;
+    }
   }
 
   async run(classFilePath, options = {}) {
