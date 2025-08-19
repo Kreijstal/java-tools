@@ -163,6 +163,17 @@ module.exports = {
         frame.stack.push(classData.staticFields.get(fieldKey));
         return;
       }
+
+      // Debug: Log available static fields
+      if (jvm.verbose) {
+        console.log(`Static fields available for ${className}:`, Array.from(classData.staticFields.keys()));
+      }
+    } else {
+      if (jvm.verbose) {
+        console.log(`No classData or staticFields found for ${className}`);
+        console.log(`classData exists:`, !!classData);
+        console.log(`staticFields exists:`, !!(classData && classData.staticFields));
+      }
     }
 
     throw new Error(`Unresolved static field: ${className}.${fieldName}`);
