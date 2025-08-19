@@ -12,6 +12,7 @@ const jreClasses = {
   'java/lang/RuntimeException': require('./java/lang/RuntimeException'),
   'java/lang/ArithmeticException': require('./java/lang/ArithmeticException'),
   'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException'),
+  'java/lang/IllegalStateException': require('./java/lang/IllegalStateException'),
   'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException'),
   'java/lang/invoke/LambdaMetafactory': require('./java/lang/invoke/LambdaMetafactory'),
   'java/lang/invoke/StringConcatFactory': require('./java/lang/invoke/StringConcatFactory'),

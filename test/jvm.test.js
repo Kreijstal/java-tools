@@ -96,6 +96,7 @@ test('JVM should execute TryCatchFinallyTest.class and print correct output', as
     '\\n' +
     '--- Test: Return in finally ---\\n' +
     'In try\\n' +
+    'In catch\\n' +
     'In finally\\n' +
     'Returned value: 2\\n' +
     '\\n' +
