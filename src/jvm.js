@@ -849,13 +849,53 @@ if(this.verbose) {
   }
 
   serialize() {
-    return {
+    const serialized = {
+      threads: this.threads.map(thread => ({
+        id: thread.id,
+        status: thread.status,
+        callStack: thread.callStack.items.map(frame => ({
+          pc: frame.pc,
+          locals: frame.locals,
+          stack: frame.stack.items,
+          method: {
+            name: frame.method.name,
+            descriptor: frame.method.descriptor,
+            className: this.findClassNameForMethod(frame.method)
+          }
+        }))
+      })),
+      currentThreadIndex: this.currentThreadIndex,
+      classInitializationState: [...this.classInitializationState],
+      nextHashCode: this.nextHashCode,
       debugManager: this.debugManager.serialize(),
     };
+    return JSON.parse(JSON.stringify(serialized));
   }
 
-  deserialize(state) {
-    if (state && state.debugManager) {
+  async deserialize(state) {
+    this.threads = await Promise.all(state.threads.map(async threadState => {
+      const thread = {
+        id: threadState.id,
+        status: threadState.status,
+        callStack: new Stack(),
+      };
+      for (const frameState of threadState.callStack) {
+        const method = await this.findMethodInHierarchy(frameState.method.className, frameState.method.name, frameState.method.descriptor);
+        if (!method) {
+          throw new Error(`Could not find method ${frameState.method.className}.${frameState.method.name}${frameState.method.descriptor} during deserialization.`);
+        }
+        const frame = new Frame(method);
+        frame.pc = frameState.pc;
+        frame.locals = frameState.locals;
+        frame.stack.items = frameState.stack;
+        thread.callStack.push(frame);
+      }
+      return thread;
+    }));
+    this.currentThreadIndex = state.currentThreadIndex;
+    this.classInitializationState = new Map(state.classInitializationState);
+    this.nextHashCode = state.nextHashCode;
+    if (state.debugManager) {
       this.debugManager.deserialize(state.debugManager);
     }
   }

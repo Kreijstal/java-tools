@@ -3,8 +3,13 @@ const Frame = require('./frame');
 
 class DebugController {
   constructor(options = {}) {
+    this.options = {
+      rewindHistorySize: 0,
+      ...options,
+    };
     this.jvm = new JVM(options);
     this.executionState = 'stopped'; // stopped, running, paused
+    this.history = [];
     // Store last known state for display purposes when execution completes
     this.lastKnownState = {
       pc: null,
@@ -71,6 +76,14 @@ class DebugController {
     if (this.executionState !== 'paused') {
       throw new Error('Cannot step: execution is not paused');
     }
+
+    if (this.options.rewindHistorySize > 0) {
+      this.history.push(this.serialize());
+      if (this.history.length > this.options.rewindHistorySize) {
+        this.history.shift();
+      }
+    }
+
     const result = await this.jvm.executeTick();
     if (result.completed) {
       this.executionState = 'stopped';
@@ -216,8 +229,8 @@ class DebugController {
     };
   }
 
-  deserialize(state) {
-    this.jvm.deserialize(state.jvmState);
+  async deserialize(state) {
+    await this.jvm.deserialize(state.jvmState);
     this.executionState = state.executionState || 'stopped';
     return { status: 'restored' };
   }
@@ -252,6 +265,23 @@ class DebugController {
 
   getDisassemblyView() {
     return this.jvm.getDisassemblyView();
+  }
+
+  async rewind(steps = 1) {
+    if (steps > this.history.length) {
+      throw new Error('Cannot rewind: not enough history');
+    }
+
+    let stateToRestore = null;
+    for (let i = 0; i < steps; i++) {
+      stateToRestore = this.history.pop();
+    }
+
+    if (stateToRestore) {
+      await this.deserialize(stateToRestore);
+    }
+
+    return { status: 'rewound', state: this.getCurrentState() };
   }
 }
 
