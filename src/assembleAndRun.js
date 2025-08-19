@@ -1,5 +1,5 @@
 const fs = require('fs');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const { unparseDataStructures } = require('./convert_tree');
 const path = require('path');
  
@@ -27,7 +27,8 @@ function assembleClasses(root, baseOutputDir = '.') {
       throw new Error(`Krakatau binary not found at ${krak2Path}`);
     }
     // Execute Krakatau asm command with the specified output directory
-    execSync(`"${krak2Path}" asm "${jFileName}" --out "${classFileName}"`);
+    // Use execFileSync to avoid shell interpretation of special characters like $
+    execFileSync(krak2Path, ['asm', jFileName, '--out', classFileName]);
   });
 }
 
