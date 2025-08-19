@@ -123,9 +123,6 @@ class JVM {
   }
 
 
-  _setTestOutputCallback(callback) {
-    this.testOutputCallback = callback;
-  }
 
   registerJreMethods(methods) {
     for (const className in methods) {
@@ -137,6 +134,76 @@ class JVM {
       }
       for (const methodSig in methods[className]) {
         this.jre[className].methods[methodSig] = methods[className][methodSig];
+      }
+    }
+  }
+
+  /**
+   * Comprehensive JVM override system that can override:
+   * - Methods (instance and static)
+   * - Private methods  
+   * - Constructors (<init> and <clinit>)
+   * - Properties/Fields (static and instance)
+   * - Entire classes
+   * - And other JRE components
+   */
+  registerJreOverrides(overrides) {
+    for (const className in overrides) {
+      const classOverrides = overrides[className];
+      
+      // Initialize class entry if it doesn't exist
+      if (!this.jre[className]) {
+        this.jre[className] = {};
+      }
+
+      // Handle complete class replacement
+      if (classOverrides.__replaceClass) {
+        this.jre[className] = { ...classOverrides.__replaceClass };
+        continue;
+      }
+
+      // Handle method overrides (instance, static, private, constructors)
+      if (classOverrides.methods) {
+        if (!this.jre[className].methods) {
+          this.jre[className].methods = {};
+        }
+        Object.assign(this.jre[className].methods, classOverrides.methods);
+      }
+
+      // Handle static field overrides
+      if (classOverrides.staticFields) {
+        if (!this.jre[className].staticFields) {
+          this.jre[className].staticFields = new Map();
+        }
+        for (const [fieldName, fieldValue] of Object.entries(classOverrides.staticFields)) {
+          this.jre[className].staticFields.set(fieldName, fieldValue);
+        }
+      }
+
+      // Handle instance field overrides (field initializers)
+      if (classOverrides.instanceFields) {
+        if (!this.jre[className].instanceFields) {
+          this.jre[className].instanceFields = {};
+        }
+        Object.assign(this.jre[className].instanceFields, classOverrides.instanceFields);
+      }
+
+      // Handle superclass override
+      if (classOverrides.super) {
+        this.jre[className].super = classOverrides.super;
+      }
+
+      // Handle interface implementations
+      if (classOverrides.interfaces) {
+        if (!this.jre[className].interfaces) {
+          this.jre[className].interfaces = [];
+        }
+        this.jre[className].interfaces.push(...classOverrides.interfaces);
+      }
+
+      // Handle native properties/constants
+      if (classOverrides.natives) {
+        Object.assign(this.jre[className], classOverrides.natives);
       }
     }
   }
