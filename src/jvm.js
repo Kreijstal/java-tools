@@ -784,6 +784,9 @@ if(this.verbose) {
       };
       for (const frameState of threadState.callStack) {
         const method = await this.findMethodInHierarchy(frameState.method.className, frameState.method.name, frameState.method.descriptor);
+        if (!method) {
+          throw new Error(`Could not find method ${frameState.method.className}.${frameState.method.name}${frameState.method.descriptor} during deserialization.`);
+        }
         const frame = new Frame(method);
         frame.pc = frameState.pc;
         frame.locals = frameState.locals;
