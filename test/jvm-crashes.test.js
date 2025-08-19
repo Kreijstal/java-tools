@@ -73,6 +73,11 @@ const FIXED_CRASH_TESTS = [
     name: 'DoubleComparisonTest',
     description: 'Double comparison operations using dcmpl instruction - now fixed',
     expectedPattern: /d1 > d2: true|NaN == NaN: false|Test completed successfully/
+  },
+  {
+    name: 'ConversionTest',
+    description: 'l2i conversion - should work',
+    expectedPattern: /10/
   }
 ];
 

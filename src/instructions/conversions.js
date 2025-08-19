@@ -11,4 +11,9 @@ module.exports = {
     // In JavaScript, int, float, and double are all numbers.
     // No conversion is needed.
   },
+
+  l2i: (frame) => {
+    const value = frame.stack.pop();
+    frame.stack.push(Number(value) | 0);
+  },
 };
