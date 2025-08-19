@@ -48,9 +48,9 @@ let currentState = {
 let aceEditor = null;
 
 /**
- * Set up browser-specific System class override for System.out and System.err
- * This function overrides the System class's static initializer to provide 
- * DOM-based output in the browser while preserving Node.js functionality
+ * Set up browser-specific System class override using the generic JVM override system
+ * This function overrides ONLY the System class's static initializer (<clinit>) to provide 
+ * DOM-based output in the browser while preserving Node.js functionality in the core System.js
  */
 function setupBrowserSystemOverride() {
     if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
@@ -93,75 +93,80 @@ function setupBrowserSystemOverride() {
         };
     }
 
-    // Override the System class's <clinit> method specifically for the browser
-    const browserSystemOverride = {
-        super: 'java/lang/Object',
-        methods: {
-            '<clinit>()V': (jvm, _, args, thread) => {
-                const systemClass = jvm.classes['java/lang/System'];
+    // Use the new generic override system to override ONLY the <clinit> constructor
+    // This approach is cleaner and more surgical than replacing the entire class
+    jvm.registerJreOverrides({
+        'java/lang/System': {
+            methods: {
+                // Override only the static constructor to provide browser-specific System.out/err
+                '<clinit>()V': (jvm, _, args, thread) => {
+                    const systemClass = jvm.classes['java/lang/System'];
 
-                const outWriter = createBrowserWriter('stdout');
-                const errWriter = createBrowserWriter('stderr');
+                    const outWriter = createBrowserWriter('stdout');
+                    const errWriter = createBrowserWriter('stderr');
 
-                // 1. Create ConsoleOutputStream for out
-                const cosOut = { type: 'java/io/ConsoleOutputStream', fields: {} };
-                const cosInit = jvm._jreFindMethod('java/io/ConsoleOutputStream', '<init>', '(Ljava/lang/Object;)V');
-                if (cosInit) {
-                    cosInit(jvm, cosOut, [outWriter]);
+                    // 1. Create ConsoleOutputStream for out
+                    const cosOut = { type: 'java/io/ConsoleOutputStream', fields: {} };
+                    const cosInit = jvm._jreFindMethod('java/io/ConsoleOutputStream', '<init>', '(Ljava/lang/Object;)V');
+                    if (cosInit) {
+                        cosInit(jvm, cosOut, [outWriter]);
+                    }
+
+                    // 2. Create PrintStream for out
+                    const out = { type: 'java/io/PrintStream', fields: {} };
+                    const psInit = jvm._jreFindMethod('java/io/PrintStream', '<init>', '(Ljava/io/OutputStream;)V');
+                    if (psInit) {
+                        psInit(jvm, out, [cosOut]);
+                    }
+                    systemClass.staticFields.set('out:Ljava/io/PrintStream;', out);
+
+                    // 3. Create ConsoleOutputStream for err
+                    const cosErr = { type: 'java/io/ConsoleOutputStream', fields: {} };
+                    if (cosInit) {
+                        cosInit(jvm, cosErr, [errWriter]);
+                    }
+
+                    // 4. Create PrintStream for err
+                    const err = { type: 'java/io/PrintStream', fields: {} };
+                    if (psInit) {
+                        psInit(jvm, err, [cosErr]);
+                    }
+                    systemClass.staticFields.set('err:Ljava/io/PrintStream;', err);
+
+                    // 5. Create a dummy InputStream for in
+                    const inStream = { type: 'java/io/InputStream', fields: {} };
+                    systemClass.staticFields.set('in:Ljava/io/InputStream;', inStream);
                 }
-
-                // 2. Create PrintStream for out
-                const out = { type: 'java/io/PrintStream', fields: {} };
-                const psInit = jvm._jreFindMethod('java/io/PrintStream', '<init>', '(Ljava/io/OutputStream;)V');
-                if (psInit) {
-                    psInit(jvm, out, [cosOut]);
-                }
-                systemClass.staticFields.set('out:Ljava/io/PrintStream;', out);
-
-                // 3. Create ConsoleOutputStream for err
-                const cosErr = { type: 'java/io/ConsoleOutputStream', fields: {} };
-                if (cosInit) {
-                    cosInit(jvm, cosErr, [errWriter]);
-                }
-
-                // 4. Create PrintStream for err
-                const err = { type: 'java/io/PrintStream', fields: {} };
-                if (psInit) {
-                    psInit(jvm, err, [cosErr]);
-                }
-                systemClass.staticFields.set('err:Ljava/io/PrintStream;', err);
-
-                // 5. Create a dummy InputStream for in
-                const inStream = { type: 'java/io/InputStream', fields: {} };
-                systemClass.staticFields.set('in:Ljava/io/InputStream;', inStream);
-            },
-
-            'getProperty(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
-                const propertyName = args[0];
-                const systemProperties = {
-                    'java.version': '1.8.0',
-                    'java.vendor': 'JVM Tools Mock',
-                    'os.name': 'Linux',
-                    'user.dir': '/tmp',
-                    'file.separator': '/',
-                    'path.separator': ':',
-                    'line.separator': '\n'
-                };
-                
-                const value = systemProperties[propertyName] || null;
-                return value ? jvm.internString(value) : null;
-            },
-
-            'exit(I)V': (jvm, obj, args) => {
-                // For now, this is a no-op in the test environment
-            },
-        },
-    };
-
-    // Override the System class in the JRE
-    jvm.jre['java/lang/System'] = browserSystemOverride;
+                // Note: We don't override getProperty, exit, or other methods - they remain as-is from System.js
+            }
+        }
+    });
     
-    log('Browser System class override installed - System.out.println will now work in browser!', 'success');
+    // ALSO use the older registerJreMethods for println to make sure it works in both paths
+    // This ensures browser output works regardless of which override method is used
+    jvm.registerJreMethods({
+        'java/io/PrintStream': {
+            'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+                // Extract the actual string value from the JVM string object
+                const str = (typeof args[0] === 'string') ? args[0] : args[0]?.value || String(args[0]);
+                
+                // Use the browser writer system for DOM output
+                const outWriter = createBrowserWriter('stdout');
+                for (let i = 0; i < str.length; i++) {
+                    outWriter(str.charAt(i));
+                }
+                outWriter('\n'); // Add newline for println
+                
+                // Also log to console for debugging
+                if (typeof console !== 'undefined') {
+                    console.log('[Browser System.out.println]:', str);
+                }
+            }
+        }
+    });
+    
+    log('Browser System constructor (<clinit>) override installed using generic JVM override system!', 'success');
+    log('System.out.println will now work in browser with DOM output', 'success');
 }
 
 // Utility Functions
