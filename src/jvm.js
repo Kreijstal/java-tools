@@ -311,6 +311,21 @@ class JVM {
     };
     this.threads.push(mainThread);
 
+    // Initialize the main class before running main method
+    // This ensures static blocks execute before main method starts
+    const className = classData.ast.classes[0].className;
+    const wasFramePushed = await this.initializeClassIfNeeded(className, mainThread);
+    
+    if (wasFramePushed) {
+      // If a <clinit> frame was pushed, we need to execute it to completion first
+      while (!mainThread.callStack.isEmpty() && 
+             mainThread.callStack.peek().method && 
+             mainThread.callStack.peek().method.name === '<clinit>') {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+    }
+    
     const mainFrame = new Frame(mainMethod);
     mainThread.callStack.push(mainFrame);
 
@@ -525,6 +540,38 @@ if(this.verbose) {
         const wasSuperPushed = await this.initializeClassIfNeeded(superClassName, thread);
         if (wasSuperPushed) {
           return true;
+        }
+      }
+
+      // Initialize static fields with default values first
+      if (!classData.staticFields) {
+        classData.staticFields = new Map();
+        
+        // Initialize static fields with default values
+        const fields = classData.ast.classes[0].items.filter(item => 
+          item.type === 'field' && item.field.flags && item.field.flags.includes('static')
+        );
+        
+        for (const fieldItem of fields) {
+          const field = fieldItem.field;
+          const fieldKey = `${field.name}:${field.descriptor}`;
+          
+          // Set default value based on descriptor
+          let defaultValue = null;
+          if (field.descriptor === 'I' || field.descriptor === 'B' || field.descriptor === 'S') {
+            defaultValue = 0; // int, byte, short
+          } else if (field.descriptor === 'J') {
+            defaultValue = BigInt(0); // long
+          } else if (field.descriptor === 'F' || field.descriptor === 'D') {
+            defaultValue = 0.0; // float, double
+          } else if (field.descriptor === 'Z') {
+            defaultValue = 0; // boolean (false)
+          } else if (field.descriptor === 'C') {
+            defaultValue = 0; // char ('\0')
+          }
+          // Object references default to null
+          
+          classData.staticFields.set(fieldKey, defaultValue);
         }
       }
 

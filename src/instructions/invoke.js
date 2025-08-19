@@ -28,7 +28,7 @@ function autoboxPrimitive(jvm, value) {
     // Boolean autoboxing
     return {
       type: 'java/lang/Boolean',
-      value: value ? 1 : 0, // Store as integer for JVM compatibility
+      value: value, // Store the boolean value directly
       booleanValue: value,   // Store original boolean value
       toString: function() { return value ? 'true' : 'false'; }
     };
@@ -141,6 +141,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
     for (let i = 0; i < params.length; i++) {
       args.unshift(frame.stack.pop());
     }
+    
     let result = jreMethod(jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
     if (returnType !== 'V' && result !== undefined) {
