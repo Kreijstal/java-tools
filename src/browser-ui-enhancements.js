@@ -179,12 +179,13 @@ function setupBrowserSystemOverride() {
  */
 async function initializeXterm() {
     try {
-        // Use XTerm from CDN (available as global objects)
+        // Use XTerm from local files (available as global objects)
         const Terminal = window.Terminal;
-        const FitAddon = window.FitAddon;
+        // FitAddon is exported as an object with FitAddon property due to UMD module structure
+        const FitAddon = window.FitAddon?.FitAddon || window.FitAddon;
         
         if (!Terminal || !FitAddon) {
-            log('XTerm.js not loaded from CDN - classes not available', 'info');
+            log('XTerm.js not loaded - classes not available', 'info');
             return false;
         }
         
@@ -237,10 +238,16 @@ async function initializeXterm() {
                 display: none;
             `;
             
-            // Insert after the regular output div
-            const output = document.getElementById(DOM_IDS.OUTPUT);
-            if (output && output.parentNode) {
-                output.parentNode.insertBefore(xtermContainer, output.nextSibling);
+            // Insert after the disassembly editor div (below Disassembly View)
+            const disassemblyEditor = document.getElementById('disassembly-editor');
+            if (disassemblyEditor && disassemblyEditor.parentNode) {
+                disassemblyEditor.parentNode.insertBefore(xtermContainer, disassemblyEditor.nextSibling);
+            } else {
+                // Fallback: Insert after the regular output div if disassembly editor not found
+                const output = document.getElementById(DOM_IDS.OUTPUT);
+                if (output && output.parentNode) {
+                    output.parentNode.insertBefore(xtermContainer, output.nextSibling);
+                }
             }
         }
 
@@ -823,7 +830,7 @@ async function loadSampleClass() {
             } catch (error) {
                 // Fallback to placeholder if disassembly fails
                 const className = selectedClass.replace('.class', '');
-                window.aceEditor.setValue(`// Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start Debugging' to begin execution`, -1);
+                window.aceEditor.setValue(`// BROWSER-UI ERROR - Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start Debugging' to begin execution`, -1);
                 logError('Failed to disassemble class', error);
             }
         }

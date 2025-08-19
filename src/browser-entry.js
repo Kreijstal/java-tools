@@ -276,12 +276,20 @@ class BrowserJVMDebug {
       // Convert AST to structured format
       const convertedAst = convertJson(ast.ast, ast.constantPool);
       
+      // Check if conversion was successful and classes exist
+      if (!convertedAst || !convertedAst.classes || !convertedAst.classes[0]) {
+        return '// Error: Unable to parse class structure\n// The class file may be corrupted or use unsupported features';
+      }
+      
+      // Ensure constantPool exists for unparseDataStructures
+      const constantPool = convertedAst.constantPool || ast.constantPool || [];
+      
       // Generate krak2 format disassembly
-      const disassembly = unparseDataStructures(convertedAst.classes[0]);
+      const disassembly = unparseDataStructures(convertedAst.classes[0], constantPool);
       
       return disassembly;
     } catch (error) {
-      return `// Error disassembling class: ${error.message}`;
+      return `// DEFINITELY-BROWSER-ENTRY-ERROR - Error disassembling class: ${error.message}\n// This may occur when the class file uses advanced features not yet fully supported\n// Try starting the debugger to see more detailed disassembly`;
     }
   }
 
