@@ -17,23 +17,65 @@ module.exports = {
       const Stack = require('../../../stack');
       const Frame = require('../../../frame');
       const target = threadObject.runnable || threadObject;
-      const targetClassName = target.type;
 
-      const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
-      if (runMethod) {
-        const newThread = {
-          id: jvm.threads.length,
-          callStack: new Stack(),
-          status: 'runnable',
+      const newThread = {
+        id: jvm.threads.length,
+        callStack: new Stack(),
+        status: 'runnable',
+      };
+      threadObject.nativeThread = newThread;
+      
+      // Handle lambda Runnables (created by invokedynamic)
+      if (target.methodHandle) {
+        // This is a lambda - create invokestatic instruction to call the lambda method
+        const lambdaInstruction = {
+          op: 'invokestatic',
+          arg: [
+            'Method',
+            target.methodHandle.reference.className,
+            [
+              target.methodHandle.reference.nameAndType.name,
+              target.methodHandle.reference.nameAndType.descriptor
+            ]
+          ]
         };
-        threadObject.nativeThread = newThread;
-        const newFrame = new Frame(runMethod);
-        newFrame.locals[0] = target; // 'this'
-        newThread.callStack.push(newFrame);
-        jvm.threads.push(newThread);
+        
+        // Create a frame for the lambda method call
+        const lambdaMethod = await jvm.findMethodInHierarchy(
+          target.methodHandle.reference.className,
+          target.methodHandle.reference.nameAndType.name,
+          target.methodHandle.reference.nameAndType.descriptor
+        );
+        
+        if (lambdaMethod) {
+          const newFrame = new Frame(lambdaMethod);
+          // Lambda methods are static, so no 'this' parameter needed
+          newThread.callStack.push(newFrame);
+          jvm.threads.push(newThread);
+        } else {
+          console.error(`Could not find lambda method: ${target.methodHandle.reference.className}.${target.methodHandle.reference.nameAndType.name}`);
+        }
       } else {
-        console.error(`Could not find run() method on ${targetClassName}`);
+        // Handle regular Runnable implementations or Thread subclasses
+        const targetClassName = target.type;
+        const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
+        if (runMethod) {
+          const newFrame = new Frame(runMethod);
+          newFrame.locals[0] = target; // 'this'
+          newThread.callStack.push(newFrame);
+          jvm.threads.push(newThread);
+        } else {
+          // If no run method found and no runnable, it's Thread's default run (no-op)
+          if (!threadObject.runnable) {
+            // Thread's default run() method does nothing - terminate immediately
+            newThread.status = 'terminated';
+            jvm.threads.push(newThread);
+          } else {
+            console.error(`Could not find run() method on ${targetClassName}`);
+          }
+        }
       }
+      
       return ASYNC_METHOD_SENTINEL;
     },
     'join()V': (jvm, obj, args, thread) => {
