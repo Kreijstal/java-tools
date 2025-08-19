@@ -314,6 +314,22 @@ class JVM {
     };
     this.threads.push(mainThread);
 
+    // Initialize the main class before running main method
+    // This ensures static blocks execute before main method starts
+    const className = classData.ast.classes[0].className;
+    const wasFramePushed = await this.initializeClassIfNeeded(className, mainThread);
+    
+    if (wasFramePushed) {
+      // If a <clinit> frame was pushed, we need to execute it to completion first
+      // Wait until all frames related to class initialization complete
+      // This includes the <clinit> frame and any methods it calls
+      const originalStackSize = mainThread.callStack.size();
+      while (mainThread.callStack.size() >= originalStackSize) {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+    }
+    
     const mainFrame = new Frame(mainMethod);
     mainThread.callStack.push(mainFrame);
 
@@ -528,6 +544,38 @@ if(this.verbose) {
         const wasSuperPushed = await this.initializeClassIfNeeded(superClassName, thread);
         if (wasSuperPushed) {
           return true;
+        }
+      }
+
+      // Initialize static fields with default values first
+      if (!classData.staticFields) {
+        classData.staticFields = new Map();
+        
+        // Initialize static fields with default values
+        const fields = classData.ast.classes[0].items.filter(item => 
+          item.type === 'field' && item.field.flags && item.field.flags.includes('static')
+        );
+        
+        for (const fieldItem of fields) {
+          const field = fieldItem.field;
+          const fieldKey = `${field.name}:${field.descriptor}`;
+          
+          // Set default value based on descriptor
+          let defaultValue = null;
+          if (field.descriptor === 'I' || field.descriptor === 'B' || field.descriptor === 'S') {
+            defaultValue = 0; // int, byte, short
+          } else if (field.descriptor === 'J') {
+            defaultValue = BigInt(0); // long
+          } else if (field.descriptor === 'F' || field.descriptor === 'D') {
+            defaultValue = 0.0; // float, double
+          } else if (field.descriptor === 'Z') {
+            defaultValue = 0; // boolean (false)
+          } else if (field.descriptor === 'C') {
+            defaultValue = 0; // char ('\0')
+          }
+          // Object references default to null
+          
+          classData.staticFields.set(fieldKey, defaultValue);
         }
       }
 
@@ -989,6 +1037,70 @@ if(this.verbose) {
     }
     
     return lineToPcMap;
+  }
+
+  createAnnotationProxy(annotation) {
+    // Create a proxy object that implements the annotation interface
+    const proxy = {
+      type: annotation.type,
+      _annotationData: annotation,
+    };
+    
+    // Add methods for each annotation element
+    if (annotation.elements) {
+      Object.keys(annotation.elements).forEach(elementName => {
+        const elementValue = annotation.elements[elementName];
+        
+        // Create interface method for the annotation element
+        // Handle both old format (with .stringValue/.intValue) and new format (direct values)
+        if (elementName === 'value') {
+          proxy['value()Ljava/lang/String;'] = () => {
+            const value = elementValue.stringValue || elementValue;
+            return this.internString(value || '');
+          };
+        } else if (elementName === 'number') {
+          proxy['number()I'] = () => {
+            const value = elementValue.intValue || elementValue;
+            return value || 0;
+          };
+        }
+        // TODO: Add support for other element types as needed
+      });
+    }
+    
+    return proxy;
+  }
+
+  _parseAnnotationValue(elementValue) {
+    if (!elementValue) return null;
+    
+    // Handle different annotation value types
+    switch (elementValue.tag) {
+      case 's': // String
+        return this.internString(elementValue.stringValue || '');
+      case 'I': // Integer
+        return elementValue.intValue || 0;
+      case 'Z': // Boolean
+        return elementValue.booleanValue || false;
+      case 'J': // Long
+        return elementValue.longValue || 0;
+      case 'F': // Float
+        return elementValue.floatValue || 0.0;
+      case 'D': // Double
+        return elementValue.doubleValue || 0.0;
+      case 'c': // Class
+        // TODO: Implement class literal support
+        return null;
+      case 'e': // Enum
+        // TODO: Implement enum support
+        return null;
+      case '@': // Annotation
+        return this.createAnnotationProxy(elementValue.annotationValue);
+      case '[': // Array
+        return elementValue.arrayValue?.map(val => this._parseAnnotationValue(val)) || [];
+      default:
+        return null;
+    }
   }
 }
 

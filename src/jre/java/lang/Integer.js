@@ -41,5 +41,14 @@ module.exports = {
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.value.toString());
     },
+    'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
+      return {
+        type: 'java/lang/Class',
+        className: 'java.lang.Integer',
+        getSimpleName: function() {
+          return jvm.internString('Integer');
+        }
+      };
+    },
   },
 };
