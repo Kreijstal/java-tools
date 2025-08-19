@@ -32,4 +32,135 @@ module.exports = {
     const amount = parseInt(instruction.incr, 10);
     frame.locals[index] += amount;
   },
+  ishl: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 << value2);
+  },
+  ishr: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 >> value2);
+  },
+  iushr: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 >>> value2);
+  },
+  iand: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 & value2);
+  },
+  ior: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 | value2);
+  },
+  ixor: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 ^ value2);
+  },
+  ladd: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) + BigInt(value2));
+  },
+  lsub: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) - BigInt(value2));
+  },
+  lmul: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) * BigInt(value2));
+  },
+  ldiv: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value2 === 0) {
+      throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+    }
+    frame.stack.push(BigInt(value1) / BigInt(value2));
+  },
+  lshl: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) << BigInt(value2));
+  },
+  lshr: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) >> BigInt(value2));
+  },
+  lushr: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    const shift = BigInt(value2);
+    if (value1 >= 0) {
+      frame.stack.push(BigInt(value1) >> shift);
+      return;
+    }
+    // For negative BigInts, we simulate the unsigned shift.
+    const sixtyFour = BigInt(64);
+    const result = (BigInt(value1) >> shift) + ((BigInt(1) << sixtyFour) >> shift);
+    frame.stack.push(result);
+  },
+  land: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) & BigInt(value2));
+  },
+  lor: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) | BigInt(value2));
+  },
+  lxor: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(BigInt(value1) ^ BigInt(value2));
+  },
+  fadd: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 + value2);
+  },
+  fsub: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 - value2);
+  },
+  fmul: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 * value2);
+  },
+  fdiv: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 / value2);
+  },
+  dadd: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 + value2);
+  },
+  dsub: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 - value2);
+  },
+  dmul: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 * value2);
+  },
+  ddiv: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 / value2);
+  },
 };

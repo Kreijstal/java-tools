@@ -63,6 +63,11 @@ const FIXED_CRASH_TESTS = [
     name: 'NullPointerTest',
     description: 'Previously caused JVM crash instead of proper NPE - now fixed',
     expectedPattern: /NullPointerException|caught|exception/i
+  },
+  {
+    name: 'TryCatchFinallyTestFixed',
+    description: 'Complex try-catch-finally constructs - now fixed (infinite loop bug resolved)',
+    expectedPattern: /Exception from finally|Exception from catch|Returned value: 2|Inner catch: Inner exception|Exception from try-finally/
   }
 ];
 

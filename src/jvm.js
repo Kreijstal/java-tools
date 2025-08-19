@@ -32,7 +32,10 @@ class JVM {
       'java/lang/Throwable': 'java/lang/Object',
       'java/lang/Exception': 'java/lang/Throwable',
       'java/lang/RuntimeException': 'java/lang/Exception',
+      'java/lang/ArithmeticException': 'java/lang/RuntimeException',
       'java/lang/IllegalArgumentException': 'java/lang/RuntimeException',
+      'java/lang/IllegalStateException': 'java/lang/RuntimeException',
+      'java/lang/Runnable': 'java/lang/Object',
       'java/lang/ReflectiveOperationException': 'java/lang/Exception',
       'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
       'java/io/Reader': 'java/lang/Object',
@@ -120,9 +123,6 @@ class JVM {
   }
 
 
-  _setTestOutputCallback(callback) {
-    this.testOutputCallback = callback;
-  }
 
   registerJreMethods(methods) {
     for (const className in methods) {
@@ -134,6 +134,76 @@ class JVM {
       }
       for (const methodSig in methods[className]) {
         this.jre[className].methods[methodSig] = methods[className][methodSig];
+      }
+    }
+  }
+
+  /**
+   * Comprehensive JVM override system that can override:
+   * - Methods (instance and static)
+   * - Private methods  
+   * - Constructors (<init> and <clinit>)
+   * - Properties/Fields (static and instance)
+   * - Entire classes
+   * - And other JRE components
+   */
+  registerJreOverrides(overrides) {
+    for (const className in overrides) {
+      const classOverrides = overrides[className];
+      
+      // Initialize class entry if it doesn't exist
+      if (!this.jre[className]) {
+        this.jre[className] = {};
+      }
+
+      // Handle complete class replacement
+      if (classOverrides.__replaceClass) {
+        this.jre[className] = { ...classOverrides.__replaceClass };
+        continue;
+      }
+
+      // Handle method overrides (instance, static, private, constructors)
+      if (classOverrides.methods) {
+        if (!this.jre[className].methods) {
+          this.jre[className].methods = {};
+        }
+        Object.assign(this.jre[className].methods, classOverrides.methods);
+      }
+
+      // Handle static field overrides
+      if (classOverrides.staticFields) {
+        if (!this.jre[className].staticFields) {
+          this.jre[className].staticFields = new Map();
+        }
+        for (const [fieldName, fieldValue] of Object.entries(classOverrides.staticFields)) {
+          this.jre[className].staticFields.set(fieldName, fieldValue);
+        }
+      }
+
+      // Handle instance field overrides (field initializers)
+      if (classOverrides.instanceFields) {
+        if (!this.jre[className].instanceFields) {
+          this.jre[className].instanceFields = {};
+        }
+        Object.assign(this.jre[className].instanceFields, classOverrides.instanceFields);
+      }
+
+      // Handle superclass override
+      if (classOverrides.super) {
+        this.jre[className].super = classOverrides.super;
+      }
+
+      // Handle interface implementations
+      if (classOverrides.interfaces) {
+        if (!this.jre[className].interfaces) {
+          this.jre[className].interfaces = [];
+        }
+        this.jre[className].interfaces.push(...classOverrides.interfaces);
+      }
+
+      // Handle native properties/constants
+      if (classOverrides.natives) {
+        Object.assign(this.jre[className], classOverrides.natives);
       }
     }
   }
@@ -237,6 +307,7 @@ class JVM {
       id: 0,
       callStack: new Stack(),
       status: 'runnable',
+      pendingException: null,
     };
     this.threads.push(mainThread);
 
@@ -528,7 +599,34 @@ if(this.verbose) {
     return null;
   }
 
+  isInstanceOf(className, target) {
+    if (!className) return false;
+    if (className === target) return true;
+
+    const classData = this.classes[className];
+    if (!classData) return false;
+
+    // Check superclass
+    if (this.isInstanceOf(classData.ast.classes[0].superClassName, target)) {
+      return true;
+    }
+
+    // Check interfaces
+    const interfaces = classData.ast.classes[0].interfaces;
+    if (interfaces) {
+      for (const iface of interfaces) {
+        if (this.isInstanceOf(iface, target)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
   handleException(exception, pc, thread) {
+    if (thread.pendingException) {
+      delete thread.pendingException;
+    }
     const callStack = thread.callStack;
     if (callStack.isEmpty()) {
       console.error('Unhandled exception:', exception);
@@ -550,7 +648,20 @@ if(this.verbose) {
     if (table) {
       for (const entry of table) {
         if (pcToCheck >= entry.start_pc && pcToCheck < entry.end_pc) {
-          if (entry.catch_type === 'any' || entry.catch_type === exception.type) {
+          if (entry.catch_type === 'any') {
+            const targetIndex = frame.instructions.findIndex(inst => {
+              if (!inst.labelDef) return false;
+              const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));
+              return labelPc === entry.handler_pc;
+            });
+
+            if (targetIndex !== -1) {
+              frame.stack.clear();
+              frame.stack.push(exception);
+              frame.pc = targetIndex;
+              return;
+            }
+          } else if (this.isInstanceOf(exception.type, entry.catch_type)) {
             const targetIndex = frame.instructions.findIndex(inst => {
               if (!inst.labelDef) return false;
               const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));
