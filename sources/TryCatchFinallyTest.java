@@ -49,7 +49,7 @@ public class TryCatchFinallyTest {
         try {
             System.out.println("In try");
             throw new RuntimeException("Exception in try");
-            return 0;
+           // return 0;
         } catch (Exception e) {
             System.out.println("In catch");
             return 1; // This return is superseded by the finally block's return
