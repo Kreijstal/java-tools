@@ -8,13 +8,6 @@ module.exports = {
       const methodName = args[1]; // String
       const methodType = args[2]; // MethodType object
       
-      if (jvm.verbose) {
-        console.log('findVirtual called with:');
-        console.log('  targetClass:', targetClass);
-        console.log('  methodName:', methodName);
-        console.log('  methodType:', methodType);
-      }
-      
       // Extract class name from Class object
       let className = 'java/lang/String'; // Default assumption
       if (targetClass._classData && targetClass._classData.ast && targetClass._classData.ast.classes[0]) {
@@ -23,10 +16,6 @@ module.exports = {
         className = targetClass._className;
       } else if (targetClass.className) {
         className = targetClass.className;
-      }
-      
-      if (jvm.verbose) {
-        console.log('  extracted className:', className);
       }
       
       // Build method descriptor from MethodType

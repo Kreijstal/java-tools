@@ -31,6 +31,7 @@ const jreClasses = {
   'java/lang/Double': require('./java/lang/Double'),
   'java/lang/Long': require('./java/lang/Long'),
   'java/lang/Number': require('./java/lang/Number'),
+  'java/lang/Void': require('./java/lang/Void'),
   'java/lang/Appendable': require('./java/lang/Appendable'),
   'java/io/OutputStream': require('./java/io/OutputStream'),
   'java/io/FilterOutputStream': require('./java/io/FilterOutputStream'),
