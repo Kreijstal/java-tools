@@ -68,7 +68,7 @@ module.exports = {
         }
 
         classData.ast.classes[0].items
-          .filter(item => item.type === 'method' && item.method.flags.includes('public'))
+          .filter(item => item.type === 'method' && item.method.flags.includes('public') && item.method.name !== '<init>')
           .forEach(methodItem => {
             const key = methodItem.method.name + methodItem.method.descriptor;
             if (!allMethods[key]) {
@@ -129,7 +129,7 @@ module.exports = {
           const key = name + descriptor;
           
           const flags = objectMethodAccessModifiers[name] || ['public'];
-          if (flags.includes('public') && !allMethods[key]) {
+          if (flags.includes('public') && !allMethods[key] && name !== '<init>') {
               allMethods[key] = {
                   type: 'java/lang/reflect/Method',
                   _methodData: { name, descriptor, flags, attributes: [] },
