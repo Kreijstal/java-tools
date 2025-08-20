@@ -53,6 +53,31 @@ module.exports = {
   iconst_5: (frame) => {
     frame.stack.push(5);
   },
+  
+  lconst_0: (frame) => {
+    frame.stack.push(BigInt(0));
+  },
+  lconst_1: (frame) => {
+    frame.stack.push(BigInt(1));
+  },
+  
+  fconst_0: (frame) => {
+    frame.stack.push(0.0);
+  },
+  fconst_1: (frame) => {
+    frame.stack.push(1.0);
+  },
+  fconst_2: (frame) => {
+    frame.stack.push(2.0);
+  },
+  
+  dconst_0: (frame) => {
+    frame.stack.push(0.0);
+  },
+  dconst_1: (frame) => {
+    frame.stack.push(1.0);
+  },
+  
   aconst_null: (frame) => {
     frame.stack.push(null);
   },

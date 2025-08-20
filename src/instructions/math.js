@@ -62,6 +62,10 @@ module.exports = {
     const value1 = frame.stack.pop();
     frame.stack.push(value1 ^ value2);
   },
+  ineg: (frame) => {
+    const value = frame.stack.pop();
+    frame.stack.push(-value);
+  },
   ladd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
@@ -84,6 +88,14 @@ module.exports = {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
     frame.stack.push(BigInt(value1) / BigInt(value2));
+  },
+  lrem: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value2 === 0) {
+      throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+    }
+    frame.stack.push(BigInt(value1) % BigInt(value2));
   },
   lshl: (frame) => {
     const value2 = frame.stack.pop();
@@ -123,6 +135,10 @@ module.exports = {
     const value1 = frame.stack.pop();
     frame.stack.push(BigInt(value1) ^ BigInt(value2));
   },
+  lneg: (frame) => {
+    const value = frame.stack.pop();
+    frame.stack.push(-BigInt(value));
+  },
   fadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
@@ -143,6 +159,15 @@ module.exports = {
     const value1 = frame.stack.pop();
     frame.stack.push(value1 / value2);
   },
+  frem: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 % value2);
+  },
+  fneg: (frame) => {
+    const value = frame.stack.pop();
+    frame.stack.push(-value);
+  },
   dadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
@@ -162,6 +187,15 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     frame.stack.push(value1 / value2);
+  },
+  drem: (frame) => {
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    frame.stack.push(value1 % value2);
+  },
+  dneg: (frame) => {
+    const value = frame.stack.pop();
+    frame.stack.push(-value);
   },
   // Comparison instructions
   dcmpl: (frame) => {
