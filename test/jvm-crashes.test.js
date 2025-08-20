@@ -78,6 +78,20 @@ const FIXED_CRASH_TESTS = [
     name: 'ConversionTest',
     description: 'l2i conversion - should work',
     expectedPattern: /10/
+  }
+];
+
+// Test programs that may still have issues
+const PARTIAL_TESTS = [
+  {
+    name: 'TryCatchTest',
+    description: 'Partial failure on exception methods',
+    allowFailure: false
+  },
+  {
+    name: 'ConversionTest',
+    description: 'l2i conversion - should work',
+    expectedPattern: /10/
   },
   {
     name: 'StackOverflowTest',
