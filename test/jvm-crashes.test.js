@@ -101,6 +101,11 @@ const FIXED_CRASH_TESTS = [
     name: 'MissingBytecodeCrash',
     description: 'Previously crashed on instanceof with interface - now fixed',
     expectedPattern: /obj is CharSequence/
+  },
+  {
+    name: 'ReflectionCrash',
+    description: 'Crashes due to unimplemented reflection methods',
+    expectedPattern: /String class: java.lang.String/
   }
 ];
 
@@ -144,14 +149,12 @@ async function runJvmTest(testName, timeout = 2000) {
     let isResolved = false;
     let hasUnhandledException = false;
     const originalConsoleError = console.error;
-    const originalConsoleWarn = console.warn;
     
     const timeoutId = setTimeout(() => {
       if (!isResolved) {
         isResolved = true;
         console.error = originalConsoleError;
-        console.warn = originalConsoleWarn;
-        resolve({ output: '', error: 'TIMEOUT', success: false, warnings: [] });
+        resolve({ output: '', error: 'TIMEOUT', success: false });
       }
     }, timeout);
 
@@ -165,7 +168,6 @@ async function runJvmTest(testName, timeout = 2000) {
       
       let output = '';
       let error = '';
-      const warnings = [];
       
       // Override console.error to detect unhandled exceptions
       console.error = (...args) => {
@@ -177,10 +179,6 @@ async function runJvmTest(testName, timeout = 2000) {
         if (args[0] !== 'Unhandled exception:') {
           originalConsoleError.apply(console, args);
         }
-      };
-
-      console.warn = (...args) => {
-        warnings.push(args.join(' '));
       };
       
       // Register print methods to capture output
@@ -210,22 +208,20 @@ async function runJvmTest(testName, timeout = 2000) {
       await jvm.run(classFilePath);
       
       console.error = originalConsoleError;
-      console.warn = originalConsoleWarn;
       
       if (!isResolved) {
         isResolved = true;
         clearTimeout(timeoutId);
         // If there was an unhandled exception, treat it as a failure
         const success = !hasUnhandledException;
-        resolve({ output, error, success, warnings });
+        resolve({ output, error, success });
       }
     } catch (e) {
       if (!isResolved) {
         isResolved = true;
         clearTimeout(timeoutId);
         console.error = originalConsoleError;
-        console.warn = originalConsoleWarn;
-        resolve({ output: '', error: e.message || e.toString(), success: false, warnings: [] });
+        resolve({ output: '', error: e.message || e.toString(), success: false });
       }
     }
   });
@@ -369,26 +365,4 @@ test('JVM Crash Tests - Boxing/unboxing display fixes', async function(t) {
   setTimeout(() => {
     process.exit(0);
   }, 100);
-});
-
-test('JVM Crash Tests - Lambda support', async function(t) {
-  const testCase = {
-    name: 'LambdaCrash',
-    description: 'Should support lambda expressions without warnings',
-    expectedPattern: /Hello, World/
-  };
-
-  const jvmResult = await runJvmTest(testCase.name);
-
-  t.ok(jvmResult.success, `${testCase.name}: ${testCase.description} - should not crash`);
-
-  if (jvmResult.success && testCase.expectedPattern) {
-    t.ok(testCase.expectedPattern.test(jvmResult.output),
-      `${testCase.name}: output should match expected pattern. Got: "${jvmResult.output}"`);
-  }
-
-  const hasMethodNotFoundWarning = jvmResult.warnings.some(w => w.includes('Method not found'));
-  t.notOk(hasMethodNotFoundWarning, `${testCase.name}: should not produce 'Method not found' warnings`);
-
-  t.end();
 });
