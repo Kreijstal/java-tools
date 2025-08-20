@@ -898,11 +898,15 @@ class JVM {
       classInitializationState: [...this.classInitializationState],
       nextHashCode: this.nextHashCode,
       debugManager: this.debugManager.serialize(),
+      classpath: this.classpath,
     };
     return JSON.parse(JSON.stringify(serialized));
   }
 
   async deserialize(state) {
+    if (state.classpath) {
+      this.classpath = state.classpath;
+    }
     this.threads = await Promise.all(state.threads.map(async threadState => {
       const thread = {
         id: threadState.id,
