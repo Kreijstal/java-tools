@@ -30,6 +30,13 @@ module.exports = {
       // Constructor for enum: name and ordinal
       obj.name = args[0];
       obj.ordinal = args[1];
+      // Override the native toString method for easier string concatenation
+      obj.toString = () => {
+        if (obj.name && typeof obj.name === 'object' && obj.name.value) {
+          return obj.name.value;
+        }
+        return obj.name || 'UNKNOWN';
+      };
     },
     'name()Ljava/lang/String;': (jvm, obj, args) => {
       return obj.name || jvm.internString('UNKNOWN');
@@ -38,6 +45,7 @@ module.exports = {
       return obj.ordinal || 0;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
+
       // The 'name' property is set in the constructor. It should be a primitive string.
       return jvm.internString(obj.name || 'UNKNOWN');
     },

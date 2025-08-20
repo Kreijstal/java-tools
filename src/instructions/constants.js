@@ -60,6 +60,9 @@ module.exports = {
     const value = instruction.arg;
     if (typeof value === 'string' && value.endsWith('L')) {
       frame.stack.push(BigInt(value.slice(0, -1)));
+    } else if (typeof value === 'object' && value !== null) {
+      // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Double"})
+      frame.stack.push(value.value);
     } else {
       frame.stack.push(parseFloat(value));
     }

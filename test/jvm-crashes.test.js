@@ -95,17 +95,32 @@ const PARTIAL_TESTS = [
   {
     name: 'TryCatchTest',
     description: 'Partial failure on exception methods',
-    allowFailure: true
+    allowFailure: false
+  },
+  {
+    name: 'ConversionTest',
+    description: 'l2i conversion - should work',
+    expectedPattern: /10/
   },
   {
     name: 'StackOverflowTest',
-    description: 'May still crash on getstatic before stack overflow',
-    allowFailure: true
+    description: 'Should throw StackOverflowError',
+    expectedPattern: /Caught StackOverflowError/
+  },
+  {
+    name: 'TryCatchTest',
+    description: 'Should correctly handle try-catch-finally',
+    expectedPattern: /Caught arithmetic exception.*Finally block executed/s
+  },
+  {
+    name: 'EnumTest',
+    description: 'Should support enums',
+    expectedPattern: /Color: RED.*It's red!.*Caught expected exception/s
   },
   {
     name: 'InnerClassTest',
-    description: 'Missing JRE dependencies',
-    allowFailure: true
+    description: 'Should support inner classes',
+    expectedPattern: /Inner field.*Nested field.*Local variable.*Anonymous inner class running/s
   }
 ];
 

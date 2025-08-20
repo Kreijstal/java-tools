@@ -4,6 +4,57 @@
  * @param {Array} constantPool - The constant pool entries from the class file
  * @returns {Object} A structured representation of the class with methods, fields, and metadata
  */
+/**
+ * Formats a string constant to match Krakatau's output format
+ * @param {String} str - The string to format
+ * @returns {String} Formatted string with Krakatau-compatible escape sequences
+ */
+function formatStringConstant(str) {
+  return JSON.stringify(str)
+    .replace(/\\u([0-9a-f]{4})/gi, (match, hex) => `\\u${hex.toUpperCase()}`)
+    .replace(/\\n/g, '\\u000A');
+}
+
+/**
+ * Formats a double constant to match Krakatau's output format
+ * @param {Number} value - The double value to format
+ * @returns {String} Formatted double with Krakatau-compatible notation
+ */
+function formatDoubleConstant(value) {
+  // Handle special values to match Krakatau format
+  if (isNaN(value)) {
+    return '+NaN';
+  }
+  if (value === Infinity) {
+    return '+Infinity';
+  }
+  if (value === -Infinity) {
+    return '-Infinity';
+  }
+  // Always use exponential notation for doubles to match Krakatau
+  return value.toExponential().replace(/e\+?/, 'e');
+}
+
+/**
+ * Formats a float constant to match Krakatau's output format
+ * @param {Number} value - The float value to format
+ * @returns {String} Formatted float with Krakatau-compatible notation
+ */
+function formatFloatConstant(value) {
+  // Handle special values to match Krakatau format
+  if (isNaN(value)) {
+    return '+NaN';
+  }
+  if (value === Infinity) {
+    return '+Infinity';
+  }
+  if (value === -Infinity) {
+    return '-Infinity';
+  }
+  // Always use exponential notation with 'f' suffix for floats to match Krakatau
+  return value.toExponential().replace(/e\+?/, 'e') + 'f';
+}
+
 function resolveConstant(index, constantPool) {
   const entry = constantPool[index];
   if (!entry) return { value: null, type: "unknown" };
@@ -311,6 +362,12 @@ function convertJson(inputJson, constantPool) {
               case "Long":
                 arg = ldcConstant.value.toString() + "L";
                 break;
+              case "Float":
+                arg = { value: ldcConstant.value, type: "Float" };
+                break;
+              case "Double": 
+                arg = { value: ldcConstant.value, type: "Double" };
+                break;
               default:
                 arg = ldcConstant.value;
             }
@@ -570,6 +627,57 @@ function convertJson(inputJson, constantPool) {
 }
 
 /**
+ * Formats a single instruction for Krakatau-compatible disassembly output
+ * @param {Object|String} instr - The instruction to format
+ * @param {Boolean} withComments - Whether to include comments
+ * @returns {String} Krakatau-compatible formatted instruction string
+ */
+function formatInstructionKrakatau(instr, withComments = false) {
+  if (!instr) {
+    return "null";
+  }
+  if (typeof instr === "string") {
+    return instr;
+  } else if (instr.op === "tableswitch") {
+    // Prioritize tableswitch check
+    const labelsStr = instr.labels
+      .map((label) => `            ${label}`)
+      .join("\n");
+    return `${instr.op} ${instr.low}\n${labelsStr}\n            default : ${instr.defaultLbl}`; // Format tableswitch with labels and default label
+  } else if (instr.op === "iinc") {
+    // Handle iinc instruction with arguments
+    return `${instr.op} ${instr.varnum} ${instr.incr}`;
+  } else if (instr.op === "invokedynamic") {
+    if (withComments) {
+        const argStr = formatInstructionArgKrakatau(instr.arg);
+        return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
+    }
+    return `${instr.op} [_${instr.cp_index}]`;
+  } else if (instr.op === "invokespecial" || instr.op === "invokevirtual" || instr.op === "invokestatic" || instr.op === "invokeinterface") {
+    const argStr = formatInstructionArgKrakatau(instr.arg);
+    if (withComments) {
+      if (instr.op === "invokeinterface") {
+          return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
+      }
+      return `${instr.op} ${argStr} ; [_${instr.cp_index}]`;
+    }
+    if (instr.op === "invokeinterface") {
+        return `${instr.op} ${argStr} ${instr.count}`;
+    }
+    return `${instr.op} ${argStr}`;
+  } else if (instr.op !== undefined && instr.arg !== undefined) {
+    const argStr = formatInstructionArgKrakatau(instr.arg);
+    if (instr.op === "invokeinterface" && instr.count !== undefined) {
+      return `${instr.op} ${argStr} ${instr.count}`; // Include the count for invokeinterface
+    } else {
+      return `${instr.op} ${argStr}`;
+    }
+  } else {
+    return instr.op || "";
+  }
+}
+
+/**
  * Formats a single instruction for display
  * @param {Object|String} instr - The instruction to format
  * @returns {String} Formatted instruction string
@@ -638,6 +746,83 @@ function formatInstructionArg(arg) {
       // For other object arguments, format their values
       return Object.values(arg).map(formatInstructionArg).join(" ");
     }
+  } else {
+    return String(arg);
+  }
+}
+
+/**
+ * Formats instruction arguments for Krakatau-compatible disassembly output
+ * @param {*} arg - The argument to format
+ * @returns {String} Krakatau-compatible formatted argument string
+ */
+function formatInstructionArgKrakatau(arg) {
+  if (typeof arg === "string") {
+    // Apply Krakatau-compatible formatting for string constants
+    if (arg.startsWith('"') && arg.endsWith('"')) {
+      try {
+        return formatStringConstant(JSON.parse(arg));
+      } catch (e) {
+        return arg; // If parsing fails, return as-is
+      }
+    }
+    return arg;
+  } else if (Array.isArray(arg)) {
+    // Recursively format each item and join with spaces
+    return arg.map(formatInstructionArgKrakatau).join(" ");
+  } else if (typeof arg === "object") {
+    // For object arguments, check if it's a typed float/double first
+    if (arg.type === "Float") {
+      // Apply special formatting for Float to match Krakatau
+      const value = arg.value;
+      if (Number.isNaN(value)) {
+        return '+NaN';
+      }
+      if (value === Infinity) {
+        return '+Infinity';
+      }
+      if (value === -Infinity) {
+        return '-Infinity';
+      }
+      // For floats, use exponential notation with 'f' suffix to match Krakatau
+      return value.toExponential().replace(/e\+?/, 'e') + 'f';
+    } else if (arg.type === "Double") {
+      // Apply special formatting for Double to match Krakatau
+      const value = arg.value;
+      if (Number.isNaN(value)) {
+        return '+NaN';
+      }
+      if (value === Infinity) {
+        return '+Infinity';
+      }
+      if (value === -Infinity) {
+        return '-Infinity';
+      }
+      // For doubles, use exponential notation to match Krakatau
+      return value.toExponential().replace(/e\+?/, 'e');
+    } else if (arg.type === "sourcefile") {
+      return arg.value; // Return the value directly without further formatting
+    } else {
+      // For other object arguments, format their values
+      return Object.values(arg).map(formatInstructionArgKrakatau).join(" ");
+    }
+  } else if (typeof arg === "number") {
+    // Apply special formatting for floating point numbers to match Krakatau
+    if (Number.isNaN(arg)) {
+      return '+NaN';
+    }
+    if (arg === Infinity) {
+      return '+Infinity';
+    }
+    if (arg === -Infinity) {
+      return '-Infinity';
+    }
+    // For floating point numbers, use exponential notation to match Krakatau
+    const str = arg.toString();
+    if (str.includes('.') && !str.includes('e')) {
+      return arg.toExponential().replace(/e\+?/, 'e');
+    }
+    return String(arg);
   } else {
     return String(arg);
   }
@@ -730,7 +915,7 @@ function unparseDataStructures(cls, constantPool, options = {}) {
                   if (line.length > 0) {
                     line += "    ";
                   }
-                  line += formatInstruction(ci.instruction, withComments);
+                  line += formatInstructionKrakatau(ci.instruction, withComments);
                 }
                 if (ci.type === "catch") {
                   line = `    .catch ${ci.clsref} from ${ci.fromLbl} to ${ci.toLbl} using ${ci.usingLbl}`;
