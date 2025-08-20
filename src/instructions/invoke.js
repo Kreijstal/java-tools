@@ -87,6 +87,15 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
+      if (thread.status === 'BLOCKED') {
+        // If the thread was blocked (e.g. by a lock), push the arguments back on the stack
+        // so they are available when the instruction is re-executed.
+        frame.stack.push(obj);
+        for (const arg of args) {
+          frame.stack.push(arg);
+        }
+        return;
+      }
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== 'V' && result !== undefined) {
