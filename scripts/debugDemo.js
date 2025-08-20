@@ -11,7 +11,7 @@ async function demonstrateDebugAPI() {
   console.log('🔍 JVM Debug API Demonstration\n');
 
   // Create a debug controller
-  const controller = new DebugController();
+  const controller = new DebugController({ rewindHistorySize: 5 });
   
   try {
     // 1. Start debugging a simple program
@@ -34,11 +34,11 @@ async function demonstrateDebugAPI() {
     let stepCount = 0;
     while (stepCount < 3 && controller.isPaused()) {
       const state = controller.getCurrentState();
-      const sourceMapping = controller.getCurrentSourceMapping();
+      const sourceMapping = controller.jvm.getSourceLineMapping(state.pc, state.method);
       console.log(`   Step ${stepCount + 1}: PC=${state.pc}, Stack=[${state.stack.join(', ')}]`);
-      console.log(`      Source: line ${sourceMapping.line}, instruction: ${sourceMapping.instruction}`);
+      console.log(`      Source: line ${sourceMapping ? sourceMapping.line : 'unknown'}, instruction: ${sourceMapping ? sourceMapping.instruction : 'unknown'}`);
       
-      const stepResult = controller.stepInto();
+      const stepResult = await controller.stepInto();
       stepCount++;
       
       if (stepResult.status === 'completed') {
@@ -48,18 +48,36 @@ async function demonstrateDebugAPI() {
     }
     console.log('');
 
+    // 3.5. Demonstrate rewind
+    console.log('3.5. Demonstrating rewind...');
+    if (controller.isPaused()) {
+      const stateBeforeStep = controller.getCurrentState();
+      console.log(`   PC before step: ${stateBeforeStep.pc}`);
+
+      console.log('   Stepping forward...');
+      await controller.stepInto();
+      const stateAfterStep = controller.getCurrentState();
+      console.log(`   PC after step: ${stateAfterStep.pc}`);
+
+      console.log('   Rewinding...');
+      await controller.rewind();
+      const stateAfterRewind = controller.getCurrentState();
+      console.log(`   PC after rewind: ${stateAfterRewind.pc}`);
+    }
+    console.log('');
+
     // 4. Demonstrate serialization
     console.log('4. Serializing JVM state...');
     const serializedState = controller.serialize();
     console.log(`   Serialized state size: ${JSON.stringify(serializedState).length} bytes`);
     console.log(`   Execution state: ${serializedState.executionState}`);
-    console.log(`   Breakpoints: ${serializedState.jvmState.breakpoints.length}`);
+    console.log(`   Breakpoints: ${serializedState.jvmState.debugManager.breakpoints.length}`);
     console.log('');
 
     // 5. Create new controller and restore state
     console.log('5. Creating new controller and restoring state...');
     const newController = new DebugController();
-    const restoreResult = newController.deserialize(serializedState);
+    const restoreResult = await newController.deserialize(serializedState);
     console.log(`   Restore status: ${restoreResult.status}`);
     console.log(`   Restored breakpoints: ${newController.getBreakpoints().join(', ')}`);
     console.log(`   Execution state: ${newController.executionState}`);
