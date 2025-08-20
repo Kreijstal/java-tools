@@ -92,6 +92,11 @@ const FIXED_CRASH_TESTS = [
     name: 'InnerClassTest',
     description: 'Previously failed to call Objects.requireNonNull - now fixed',
     expectedPattern: /Anonymous inner class running/
+  },
+  {
+    name: 'MissingBytecodeCrash',
+    description: 'Previously crashed on instanceof with interface - now fixed',
+    expectedPattern: /obj is CharSequence/
   }
 ];
 
