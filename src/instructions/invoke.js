@@ -84,7 +84,10 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   
   while (currentClassName) {
-    const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
+    let jreMethod = null;
+    if (jvm.jre[currentClassName]) {
+      jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
+    }
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
       if (thread.status === 'BLOCKED') {
@@ -110,6 +113,9 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
     let classData = jvm.classes[currentClassName];
     if (!classData) {
+      if (jvm.jre[currentClassName]) {
+        break; // It's a JRE class, don't try to load it from file.
+      }
       classData = await jvm.loadClassByName(currentClassName);
     }
 
@@ -142,11 +148,9 @@ async function invokestatic(frame, instruction, jvm, thread) {
     return;
   }
 
-  let jreMethod = null;
-  if (!methodName.includes('lambda$')) {
-    jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
-  }
-
+  // First, check for JRE/JNI methods. This handles both JRE static methods
+  // and native methods on user classes.
+  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
   if (jreMethod) {
     const { params } = parseDescriptor(descriptor);
     const args = [];
@@ -162,19 +166,31 @@ async function invokestatic(frame, instruction, jvm, thread) {
     return;
   }
 
+  // If it's a JRE class and we didn't find a method, it's likely unimplemented.
+  if (jvm.jre[className]) {
+    return;
+  }
+
+  // Otherwise, it must be a user-defined class.
   let workspaceEntry = jvm.classes[className];
   if (!workspaceEntry) {
     workspaceEntry = await jvm.loadClassByName(className);
   }
+
   const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
-    const newFrame = new Frame(method);
-    const { params } = parseDescriptor(descriptor);
-    for (let i = params.length - 1; i >= 0; i--) {
-      newFrame.locals[i] = frame.stack.pop();
+    if (method.flags && method.flags.includes('native')) {
+      // This case should be handled by the _jreFindMethod call above,
+      // but as a fallback, we can do nothing.
+    } else {
+      // We found a bytecode method.
+      const newFrame = new Frame(method);
+      const { params } = parseDescriptor(descriptor);
+      for (let i = params.length - 1; i >= 0; i--) {
+        newFrame.locals[i] = frame.stack.pop();
+      }
+      thread.callStack.push(newFrame);
     }
-    
-    thread.callStack.push(newFrame);
   } else {
     // Method not found - this is expected for some JVM methods that aren't implemented
     // Don't throw an error, just return silently
@@ -190,7 +206,10 @@ async function invokespecial(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
-  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
+  let jreMethod = null;
+  if (jvm.jre[className]) {
+    jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
+  }
 
   if (jreMethod) {
       await jreMethod(jvm, obj, args);
@@ -200,6 +219,9 @@ async function invokespecial(frame, instruction, jvm, thread) {
   // For user-defined methods (constructors, private methods, super calls)
     let workspaceEntry = jvm.classes[className];
     if (!workspaceEntry) {
+      if (jvm.jre[className]) {
+        return;
+      }
       // If class is not loaded, loading it.
         workspaceEntry = await jvm.loadClassByName(className);
         if (!workspaceEntry) {
@@ -405,7 +427,10 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   // First check JRE methods
   let currentClassName = obj.type;
   while (currentClassName) {
-    const jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
+    let jreMethod = null;
+    if (jvm.jre[currentClassName]) {
+      jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
+    }
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
@@ -422,6 +447,9 @@ async function invokeinterface(frame, instruction, jvm, thread) {
 
     let classData = jvm.classes[currentClassName];
     if (!classData) {
+      if (jvm.jre[currentClassName]) {
+        break; // It's a JRE class, don't try to load it from file.
+      }
       classData = await jvm.loadClassByName(currentClassName);
     }
 

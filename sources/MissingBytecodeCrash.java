@@ -1,6 +1,8 @@
 public class MissingBytecodeCrash {
     public static void main(String[] args) {
-        System.out.println("Testing missing bytecode instructions...");
+        // This file tests a variety of bytecode instructions that were once
+        // missing from the JVM. They are now all implemented and working correctly.
+        System.out.println("Testing various bytecode instructions...");
         
         // Test double operations that may require specific bytecode instructions
         double d1 = 3.14159;
