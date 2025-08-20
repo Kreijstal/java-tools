@@ -407,6 +407,7 @@ class JVM {
 
     const mainThread = {
       id: 0,
+  name: 'main',
       callStack: new Stack(),
       status: 'runnable',
       pendingException: null,

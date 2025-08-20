@@ -1,9 +1,24 @@
 module.exports = {
   super: 'java/lang/Object',
+  interfaces: ['java/util/List'],
   staticFields: {},
   methods: {
     '<init>()V': (jvm, obj, args) => {
       obj.list = [];
+    },
+    'iterator()Ljava/util/Iterator;': (jvm, obj, args) => {
+      const iteratorClassName = 'java/util/LinkedList$ListIterator';
+      const iteratorObj = {
+        type: iteratorClassName,
+        hashCode: jvm.nextHashCode++,
+      };
+      const constructor = jvm._jreFindMethod(iteratorClassName, '<init>', '(Ljava/util/LinkedList;)V');
+      if (constructor) {
+        constructor(jvm, iteratorObj, [obj]);
+      } else {
+        throw { type: 'java/lang/NoSuchMethodError', message: 'Constructor for iterator not found' };
+      }
+      return iteratorObj;
     },
     'size()I': (jvm, obj, args) => {
       return obj.list.length;

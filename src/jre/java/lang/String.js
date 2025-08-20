@@ -39,6 +39,14 @@ module.exports = {
         const result = obj.substring(startIndex, endIndex);
         return jvm.internString(result);
     },
+    'compareTo(Ljava/lang/String;)I': (jvm, obj, args) => {
+      const otherString = args[0];
+      return obj.localeCompare(otherString);
+    },
+    'compareTo(Ljava/lang/Object;)I': (jvm, obj, args) => {
+      const otherString = args[0];
+      return obj.localeCompare(otherString);
+    },
     'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
       return {
         type: 'java/lang/Class',
