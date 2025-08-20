@@ -68,6 +68,7 @@ module.exports = {
         
         if (lambdaMethod) {
           const newFrame = new Frame(lambdaMethod);
+          newFrame.className = target.methodHandle.reference.className; // Add className to the frame
           // Lambda methods are static, so no 'this' parameter needed
           newThread.callStack.push(newFrame);
           jvm.threads.push(newThread);
@@ -80,6 +81,7 @@ module.exports = {
         const runMethod = await jvm.findMethodInHierarchy(targetClassName, 'run', '()V');
         if (runMethod) {
           const newFrame = new Frame(runMethod);
+          newFrame.className = targetClassName; // Add className to the frame
           newFrame.locals[0] = target; // 'this'
           newThread.callStack.push(newFrame);
           jvm.threads.push(newThread);

@@ -43,13 +43,13 @@ function formatDoubleConstant(value) {
 function formatFloatConstant(value) {
   // Handle special values to match Krakatau format
   if (isNaN(value)) {
-    return '+NaN';
+    return '+NaNf';
   }
   if (value === Infinity) {
-    return '+Infinity';
+    return '+Infinityf';
   }
   if (value === -Infinity) {
-    return '-Infinity';
+    return '-Infinityf';
   }
   // Always use exponential notation with 'f' suffix for floats to match Krakatau
   return value.toExponential().replace(/e\+?/, 'e') + 'f';
@@ -796,16 +796,31 @@ function formatInstructionArgKrakatau(arg) {
       // Apply special formatting for Float to match Krakatau
       const value = arg.value;
       if (Number.isNaN(value)) {
-        return '+NaN';
+        return '+NaNf';
       }
       if (value === Infinity) {
-        return '+Infinity';
+        return '+Infinityf';
       }
       if (value === -Infinity) {
-        return '-Infinity';
+        return '-Infinityf';
       }
       // For floats, use exponential notation with 'f' suffix to match Krakatau
-      return value.toExponential().replace(/e\+?/, 'e') + 'f';
+      // Check if this is a simple value that can be represented more compactly
+      const expStr = value.toExponential().replace(/e\+?/, 'e');
+      
+      // Check if the value matches a simple decimal (like 3.14)
+      // by checking if rounding to 2-6 decimal places gives us the same float value
+      for (let decimals = 2; decimals <= 6; decimals++) {
+        const rounded = parseFloat(value.toFixed(decimals));
+        if (Math.abs(rounded - value) < 1e-6) { // Increased tolerance for float precision
+          const roundedExp = rounded.toExponential().replace(/e\+?/, 'e');
+          if (roundedExp.length < expStr.length) {
+            return roundedExp + 'f';
+          }
+        }
+      }
+      
+      return expStr + 'f';
     } else if (arg.type === "Double") {
       // Apply special formatting for Double to match Krakatau
       const value = arg.value;
