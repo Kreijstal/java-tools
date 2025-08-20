@@ -201,6 +201,12 @@ test('Specific Missing JVM Features', function(t) {
   t.comment('- ArrayIndexOutOfBoundsException needs proper JRE class');
   t.comment('- NullPointerException needs proper JRE class');
   
+  t.comment('Recently implemented JVM instructions:');
+  t.comment('- Type conversion instructions: l2f, l2d, f2i, f2l, f2d, d2i, d2l, d2f, i2b, i2c, i2s');
+  t.comment('- Constant instructions: fconst_0, fconst_1, fconst_2, dconst_0, dconst_1, lconst_0, lconst_1');
+  t.comment('- Arithmetic instructions: lrem, frem, drem, ineg, lneg, fneg, dneg');
+  t.comment('- Proper handling of NaN/Infinity in float/double conversions');
+  
   t.ok(true, 'Documented missing features for implementation');
   t.end();
 });

@@ -104,7 +104,7 @@ const FIXED_CRASH_TESTS = [
   },
   {
     name: 'ReflectionCrash',
-    description: 'Crashes due to unimplemented reflection methods',
+    description: 'Previously crashed due to unimplemented reflection methods - now fixed',
     expectedPattern: /String class: java.lang.String/
   },
   {
@@ -116,6 +116,21 @@ const FIXED_CRASH_TESTS = [
     name: 'NewLambdaCrash',
     description: 'Should support simple lambda expressions without warnings',
     expectedPattern: /Hello from lambda!/
+  },
+  {
+    name: 'PotentialCrash3',
+    description: 'Previously crashed on missing conversion instructions - now fixed',
+    expectedPattern: /Type conversion test completed.*lcmp works.*Caught: Test exception.*Checkcast works.*instanceof works/s
+  },
+  {
+    name: 'MathInstructions', 
+    description: 'Previously crashed on missing arithmetic instructions - now fixed',
+    expectedPattern: /Long arithmetic.*Float arithmetic.*Double arithmetic.*Integer bitwise.*Long bitwise.*Shift instructions/s
+  },
+  {
+    name: 'ComparisonInstructions',
+    description: 'Tests comparison instructions for long/float/double types',
+    expectedPattern: /100 < 200.*100 == 100.*1.5 != NaN.*1.5 < 2.5 \(double\).*1.5 != NaN \(double\)/s
   }
 ];
 
