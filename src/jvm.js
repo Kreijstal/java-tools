@@ -23,6 +23,7 @@ class JVM {
     this.classpath = options.classpath || '.';
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
+    this.maxStackDepth = options.maxStackDepth || 1024;
     
     // Initialize JNI system
     this.jni = new JNI(this);
@@ -43,6 +44,7 @@ class JVM {
       'java/lang/ArithmeticException': 'java/lang/RuntimeException',
       'java/lang/IllegalArgumentException': 'java/lang/RuntimeException',
       'java/lang/IllegalStateException': 'java/lang/RuntimeException',
+      'java/lang/Enum': 'java/lang/Object',
       'java/lang/Runnable': 'java/lang/Object',
       'java/lang/ReflectiveOperationException': 'java/lang/Exception',
       'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
@@ -501,6 +503,15 @@ class JVM {
     }
 
     const callStack = thread.callStack;
+
+    if (callStack.size() > this.maxStackDepth) {
+      const error = {
+        type: 'java/lang/StackOverflowError',
+        message: 'Stack overflow',
+      };
+      this.handleException(error, -1, thread);
+      return { completed: false };
+    }
 
     if (callStack.isEmpty()) {
       thread.status = 'terminated';

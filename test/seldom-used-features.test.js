@@ -78,8 +78,9 @@ async function runJvmTest(testName, timeout = 5000) {
     }, timeout);
 
     try {
-      const jvm = new JVM();
-      const classFilePath = path.join(__dirname, '..', 'sources', `${testName}.class`);
+      const sourcesPath = path.join(__dirname, '..', 'sources');
+      const jvm = new JVM({ classpath: sourcesPath });
+      const classFilePath = path.join(sourcesPath, `${testName}.class`);
       
       let output = '';
       let error = '';
