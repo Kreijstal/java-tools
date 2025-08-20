@@ -274,32 +274,62 @@ module.exports = {
     frame.stack.push(array);
   },
 
-  instanceof: (frame, instruction, jvm) => {
+  instanceof: async (frame, instruction, jvm, thread) => {
     const targetClassName = instruction.arg;
-    const objRef = frame.stack.pop();
 
+    // Ensure the target class is initialized before checking
+    const wasFramePushed = await jvm.initializeClassIfNeeded(targetClassName, thread);
+    if (wasFramePushed) {
+      frame.pc--; // Re-run this instruction
+      return;
+    }
+
+    const objRef = frame.stack.pop();
     if (objRef === null) {
       frame.stack.push(0);
       return;
     }
 
-    const isInstanceOf = (className, target) => {
-      if (!className) return false;
-      if (className === target) return true;
+    const isInstanceOf = async (className, target) => {
+      if (!className) {
+        return false;
+      }
+      if (className === target) {
+        return true;
+      }
 
       const classData = jvm.classes[className];
-      if (!classData) return false;
+      if (!classData) {
+        // This should not happen if classes are initialized correctly
+        return false;
+      }
 
       // Check superclass
-      if (isInstanceOf(classData.ast.classes[0].superClassName, target)) {
-        return true;
+      const superClassName = classData.ast.classes[0].superClassName;
+      if (superClassName) {
+        const wasSuperInitialized = await jvm.initializeClassIfNeeded(superClassName, thread);
+        if (wasSuperInitialized) {
+            // If we had to initialize a superclass, we need to restart the check
+            // to ensure the whole chain is loaded before we continue.
+            // By decrementing PC, we re-run the instanceof instruction from the top.
+            frame.pc--;
+            return 'RETRY'; // Special value to indicate a retry is needed.
+        }
+        if (await isInstanceOf(superClassName, target)) {
+          return true;
+        }
       }
 
       // Check interfaces
       const interfaces = classData.ast.classes[0].interfaces;
       if (interfaces) {
         for (const iface of interfaces) {
-          if (isInstanceOf(iface, target)) {
+          const wasInterfaceInitialized = await jvm.initializeClassIfNeeded(iface, thread);
+          if (wasInterfaceInitialized) {
+              frame.pc--;
+              return 'RETRY';
+          }
+          if (await isInstanceOf(iface, target)) {
             return true;
           }
         }
@@ -307,7 +337,15 @@ module.exports = {
       return false;
     };
 
-    if (isInstanceOf(objRef.type, targetClassName)) {
+    const result = await isInstanceOf(objRef.type, targetClassName);
+
+    if (result === 'RETRY') {
+        // A class was initialized during the check.
+        // The PC has been rewound, so we just return to let the instruction re-run.
+        return;
+    }
+
+    if (result) {
       frame.stack.push(1);
     } else {
       frame.stack.push(0);

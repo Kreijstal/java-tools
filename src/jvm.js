@@ -46,6 +46,7 @@ class JVM {
       'java/lang/IllegalStateException': 'java/lang/RuntimeException',
       'java/lang/Enum': 'java/lang/Object',
       'java/lang/Runnable': 'java/lang/Object',
+      'java/lang/CharSequence': 'java/lang/Object',
       'java/lang/ReflectiveOperationException': 'java/lang/Exception',
       'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
       'java/io/Reader': 'java/lang/Object',
@@ -94,13 +95,15 @@ class JVM {
           } else if (file.endsWith('.js')) {
             const className = `${prefix}${file.slice(0, -3)}`;
             if (!this.classes[className]) {
+              const jreDef = require(fullPath);
               const classStub = {
                 ast: {
                   classes: [{
                     className: className,
-                    superClassName: 'java/lang/Object',
+                    superClassName: jreDef.super || 'java/lang/Object',
+                    interfaces: jreDef.interfaces || [],
                     items: [],
-                    flags: ['public']
+                    flags: jreDef.super ? ['public'] : ['public', 'interface']
                   }]
                 },
                 constantPool: [],
