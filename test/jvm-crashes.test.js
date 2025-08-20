@@ -87,6 +87,11 @@ const FIXED_CRASH_TESTS = [
     name: 'AdvancedArrayCrash',
     description: 'Previously crashed on System.arraycopy - now fixed',
     expectedPattern: /Arraycopy result: dst\[3] = 2/
+  },
+  {
+    name: 'InnerClassTest',
+    description: 'Previously failed to call Objects.requireNonNull - now fixed',
+    expectedPattern: /Anonymous inner class running/
   }
 ];
 
