@@ -142,7 +142,10 @@ async function invokestatic(frame, instruction, jvm, thread) {
     return;
   }
 
-  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
+  let jreMethod = null;
+  if (!methodName.includes('lambda$')) {
+    jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
+  }
 
   if (jreMethod) {
     const { params } = parseDescriptor(descriptor);
