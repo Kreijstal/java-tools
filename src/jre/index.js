@@ -40,6 +40,7 @@ const jreClasses = {
   'java/net/HttpURLConnection': require('./java/net/HttpURLConnection'),
   'java/util/LinkedList': require('./java/util/LinkedList'),
   'java/util/Objects': require('./java/util/Objects'),
+  'java/util/concurrent/locks/ReentrantLock': require('./java/util/concurrent/locks/ReentrantLock'),
 };
 
 module.exports = jreClasses;
