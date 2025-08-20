@@ -106,6 +106,11 @@ const FIXED_CRASH_TESTS = [
     name: 'ReflectionCrash',
     description: 'Crashes due to unimplemented reflection methods',
     expectedPattern: /String class: java.lang.String/
+  },
+  {
+    name: 'MethodReferenceCrash',
+    description: 'Crashes on method reference to StringBuilder.reverse - should be fixed',
+    expectedPattern: /olleH/
   }
 ];
 
