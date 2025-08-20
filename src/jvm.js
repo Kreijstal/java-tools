@@ -256,8 +256,8 @@ class JVM {
       
       currentClass = this.jre[currentClass.super];
     }
-    if (this.verbose && methodName !== '<clinit>') {
-      console.warn(`Method not found: ${className}.${methodName}${descriptor}`);
+    if (this.verbose && methodName !== '<clinit>' && this.jre[className]) {
+      console.warn(`Method not found in JRE: ${className}.${methodName}${descriptor}`);
     }
     return null;
   }

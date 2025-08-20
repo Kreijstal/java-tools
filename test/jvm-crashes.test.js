@@ -111,6 +111,11 @@ const FIXED_CRASH_TESTS = [
     name: 'MethodReferenceCrash',
     description: 'Crashes on method reference to StringBuilder.reverse - should be fixed',
     expectedPattern: /olleH/
+},
+  {
+    name: 'NewLambdaCrash',
+    description: 'Should support simple lambda expressions without warnings',
+    expectedPattern: /Hello from lambda!/
   }
 ];
 
