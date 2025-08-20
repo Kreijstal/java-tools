@@ -658,6 +658,12 @@ function formatInstructionKrakatau(instr, withComments = false) {
       .map((label) => `            ${label}`)
       .join("\n");
     return `${instr.op} ${instr.low}\n${labelsStr}\n            default : ${instr.defaultLbl}`; // Format tableswitch with labels and default label
+  } else if (instr.op === "lookupswitch") {
+    // Format lookupswitch to match Krakatau output
+    const pairsStr = instr.arg.pairs
+      .map(([value, label]) => `            ${value} : ${label}`)
+      .join("\n");
+    return `${instr.op}\n${pairsStr}\n            default : ${instr.arg.defaultLabel}`;
   } else if (instr.op === "iinc") {
     // Handle iinc instruction with arguments
     return `${instr.op} ${instr.varnum} ${instr.incr}`;

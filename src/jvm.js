@@ -107,8 +107,7 @@ class JVM {
                 ast: {
                   classes: [{
                     className: className,
-                    superClassName: jreDef.super || 'java/lang/Object',
-                    interfaces: jreDef.interfaces || [],
+                    superClassName: (jreClassDef && jreClassDef.super) || 'java/lang/Object',
                     items: [],
                     flags: ['public'],
                     interfaces: interfaces
