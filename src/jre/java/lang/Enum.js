@@ -13,7 +13,7 @@ module.exports = {
       if (classData && classData.staticFields) {
         // The name of an enum constant is stored in the 'name' property of the enum object itself.
         for (const value of classData.staticFields.values()) {
-          if (value && value.type === enumClassName && value.name === nameStr) {
+          if (value && value.type === enumClassName && value.name.toString() === nameStr) {
             return value;
           }
         }

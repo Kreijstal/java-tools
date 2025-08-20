@@ -19,6 +19,11 @@ public class EnumSwitchTest {
         // Test default case
         color = Color.YELLOW;
         System.out.println("Testing YELLOW: " + testColor(color));
+
+        System.out.println("---");
+        System.out.println("Testing Enum.valueOf()...");
+        Color red = Enum.valueOf(Color.class, "RED");
+        System.out.println("Enum.valueOf(Color.class, RED) = " + red);
     }
     
     public static String testColor(Color color) {
