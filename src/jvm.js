@@ -237,6 +237,11 @@ class JVM {
       return nativeMethod;
     }
 
+    // It's not a JNI method. Only proceed if it's a JRE class.
+    if (!this.jre[className]) {
+      return null;
+    }
+
     // Continue with original JRE method lookup
     let currentClass = this.jre[className];
     while (currentClass) {

@@ -171,6 +171,7 @@ The JVM implementation currently supports a comprehensive set of Java bytecode i
 - `invokestatic` - Invoke static methods
 - `invokevirtual` - Invoke virtual methods (including System.out.println and String.concat)
 - `invokespecial` - Invoke constructors and private methods
+- `invokedynamic` - Support for lambda expressions and modern string concatenation
 
 ### Field Access
 - `getstatic` - Get static field values
@@ -211,4 +212,4 @@ public class StringConcatMethod {
 }
 ```
 
-**Note**: Modern Java (9+) uses `invokedynamic` instructions for the `+` operator on variables, which this JVM does not currently support. Use explicit `String.concat()` calls for variable concatenation.
+**Note on `invokedynamic`**: This JVM now supports the `invokedynamic` instruction, which is used by modern Java (9+) for string concatenation and by Java 8+ for lambda expressions. Both of these features are now supported.
