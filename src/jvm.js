@@ -375,6 +375,8 @@ class JVM {
   async run(classFilePath, options = {}) {
     if (options.classpath) {
       this.classpath = options.classpath;
+    } else if (classFilePath.includes(path.sep)) {
+      this.classpath = path.dirname(classFilePath);
     }
     const classData = await this.loadClassAsync(classFilePath, options);
     if (!classData || !classData.ast) {

@@ -80,6 +80,10 @@ const FIXED_CRASH_TESTS = [
     expectedPattern: /10/
   },
   {
+    name: 'EnumTest',
+    description: 'Previously had issues with enum constants - now fixed',
+    expectedPattern: /Red value: 255/
+},{
     name: 'AdvancedArrayCrash',
     description: 'Previously crashed on System.arraycopy - now fixed',
     expectedPattern: /Arraycopy result: dst\[3] = 2/

@@ -5,24 +5,23 @@ module.exports = {
     'valueOf(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;': (jvm, obj, args) => {
       const clazz = args[0];
       const name = args[1];
-      
-      // Get the enum class name from the Class object
-      const enumClassName = clazz._classData ? clazz._classData.name : 'UnknownEnum';
-      
-      // Look for the enum constant in the class's static fields
+      const nameStr = name.toString();
+
+      const enumClassName = clazz._classData ? clazz._classData.ast.classes[0].className : 'UnknownEnum';
+
       const classData = jvm.classes[enumClassName];
       if (classData && classData.staticFields) {
-        for (const [fieldKey, value] of classData.staticFields) {
-          if (fieldKey.startsWith(name + ':') && value && value.name === name) {
+        // The name of an enum constant is stored in the 'name' property of the enum object itself.
+        for (const value of classData.staticFields.values()) {
+          if (value && value.type === enumClassName && value.name === nameStr) {
             return value;
           }
         }
       }
-      
-      // If not found, throw IllegalArgumentException
+
       throw {
         type: 'java/lang/IllegalArgumentException',
-        message: `No enum constant ${enumClassName}.${name}`
+        message: `No enum constant ${enumClassName}.${nameStr}`
       };
     },
   },
@@ -46,8 +45,9 @@ module.exports = {
       return obj.ordinal || 0;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      // This is the Java toString() method, which should return a Java String object
-      return obj.name || jvm.internString('UNKNOWN');
+
+      // The 'name' property is set in the constructor. It should be a primitive string.
+      return jvm.internString(obj.name || 'UNKNOWN');
     },
     'equals(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const other = args[0];
