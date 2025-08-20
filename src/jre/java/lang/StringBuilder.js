@@ -8,7 +8,10 @@ module.exports = {
     },
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
       const str = args[0];
-      obj.value = str;
+      if (str === null) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      obj.value = String(str);
       delete obj.isUninitialized;
     },
     'append(Ljava/lang/String;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
