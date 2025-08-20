@@ -28,7 +28,8 @@ module.exports = {
       return jvm.internString(obj.value);
     },
     'reverse()Ljava/lang/StringBuilder;': (jvm, obj, args) => {
-      obj.value = obj.value.split('').reverse().join('');
+      // Unicode-aware reversal using Array.from to handle surrogate pairs and combining marks
+      obj.value = Array.from(obj.value).reverse().join('');
       return obj;
     },
   },
