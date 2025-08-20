@@ -266,7 +266,7 @@ module.exports = {
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, classObj, args) => {
       const annotationClass = args[0];
       const classData = classObj._classData;
-      const annotations = classData.annotations || [];
+      const annotations = (classData.ast && classData.ast.annotations) ? classData.ast.annotations : [];
       
       // Check if annotation of the specified type is present
       return annotations.some(ann => {
@@ -280,7 +280,7 @@ module.exports = {
     'getAnnotation(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;': (jvm, classObj, args) => {
       const annotationClass = args[0];
       const classData = classObj._classData;
-      const annotations = classData.annotations || [];
+      const annotations = (classData.ast && classData.ast.annotations) ? classData.ast.annotations : [];
       
       // Find annotation of the specified type
       const annotation = annotations.find(ann => {

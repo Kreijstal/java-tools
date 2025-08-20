@@ -471,9 +471,8 @@ class JVM {
         t.status = 'runnable';
         delete t.joiningOn;
       }
-      if (t.status === 'BLOCKED' && t.blockingOn && !t.blockingOn.isLocked) {
+      if (t.status === 'BLOCKED' && t.blockingOn && !t.blockingOn.isLocked && !t.blockingOn._isReentrantLock) {
         t.status = 'runnable';
-        // The thread will attempt to acquire the lock again in monitorenter
       }
     }
 
@@ -833,7 +832,7 @@ class JVM {
         if (pcToCheck >= entry.start_pc && pcToCheck < entry.end_pc) {
           if (entry.catch_type === 'any') {
             const targetIndex = frame.instructions.findIndex(inst => {
-              if (!inst.labelDef) return false;
+              if (!inst || !inst.labelDef) return false;
               const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));
               return labelPc === entry.handler_pc;
             });
@@ -846,7 +845,7 @@ class JVM {
             }
           } else if (this.isInstanceOf(exception.type, entry.catch_type)) {
             const targetIndex = frame.instructions.findIndex(inst => {
-              if (!inst.labelDef) return false;
+              if (!inst || !inst.labelDef) return false;
               const labelPc = parseInt(inst.labelDef.substring(1, inst.labelDef.length - 1));
               return labelPc === entry.handler_pc;
             });
@@ -1212,31 +1211,51 @@ class JVM {
   }
 
   createAnnotationProxy(annotation) {
-    // Create a proxy object that implements the annotation interface
+    const jvm = this;
     const proxy = {
       type: annotation.type,
       _annotationData: annotation,
+      'annotationType()Ljava/lang/Class;': () => {
+        return {
+          type: 'java/lang/Class',
+          _classData: jvm.classes[annotation.type],
+          className: annotation.type.replace(/\//g, '.'),
+        };
+      },
+      'toString()Ljava/lang/String;': () => {
+        let elementsStr = '';
+        if (annotation.elements) {
+          elementsStr = Object.entries(annotation.elements).map(([key, value]) => {
+            let valueStr = value;
+            if (typeof value === 'string') {
+              valueStr = `\"${value}\"`;
+            }
+            return `${key}=${valueStr}`;
+          }).join(', ');
+        }
+        return jvm.internString(`@${annotation.type.replace(/\//g, '.')}(${elementsStr})`);
+      }
     };
     
-    // Add methods for each annotation element
     if (annotation.elements) {
       Object.keys(annotation.elements).forEach(elementName => {
         const elementValue = annotation.elements[elementName];
-        
-        // Create interface method for the annotation element
-        // Handle both old format (with .stringValue/.intValue) and new format (direct values)
-        if (elementName === 'value') {
-          proxy['value()Ljava/lang/String;'] = () => {
-            const value = elementValue.stringValue || elementValue;
-            return this.internString(value || '');
-          };
-        } else if (elementName === 'number') {
-          proxy['number()I'] = () => {
-            const value = elementValue.intValue || elementValue;
-            return value || 0;
-          };
+        let methodSignature;
+        let methodImplementation;
+
+        if (typeof elementValue === 'string') {
+          methodSignature = `${elementName}()Ljava/lang/String;`;
+          methodImplementation = () => jvm.internString(String(elementValue));
+        } else if (typeof elementValue === 'number') {
+          methodSignature = `${elementName}()I`;
+          methodImplementation = () => elementValue;
+        } else {
+          // Default/fallback for other types
+          methodSignature = `${elementName}()Ljava/lang/Object;`;
+          methodImplementation = () => elementValue;
         }
-        // TODO: Add support for other element types as needed
+
+        proxy[methodSignature] = methodImplementation;
       });
     }
     
@@ -1273,6 +1292,58 @@ class JVM {
       default:
         return null;
     }
+  }
+
+  createAnnotationProxy(annotation) {
+    const jvm = this;
+    const proxy = {
+      type: annotation.type,
+      _annotationData: annotation,
+      'annotationType()Ljava/lang/Class;': () => {
+        return {
+          type: 'java/lang/Class',
+          _classData: jvm.classes[annotation.type],
+          className: annotation.type.replace(/\//g, '.'),
+        };
+      },
+      'toString()Ljava/lang/String;': () => {
+        let elementsStr = '';
+        if (annotation.elements) {
+          elementsStr = Object.entries(annotation.elements).map(([key, value]) => {
+            let valueStr = value;
+            if (typeof value === 'string') {
+              valueStr = `\"${value}\"`;
+            }
+            return `${key}=${valueStr}`;
+          }).join(', ');
+        }
+        return jvm.internString(`@${annotation.type.replace(/\//g, '.')}(${elementsStr})`);
+      }
+    };
+
+    if (annotation.elements) {
+      Object.keys(annotation.elements).forEach(elementName => {
+        const elementValue = annotation.elements[elementName];
+        let methodSignature;
+        let methodImplementation;
+
+        if (typeof elementValue === 'string') {
+          methodSignature = `${elementName}()Ljava/lang/String;`;
+          methodImplementation = () => jvm.internString(String(elementValue));
+        } else if (typeof elementValue === 'number') {
+          methodSignature = `${elementName}()I`;
+          methodImplementation = () => elementValue;
+        } else {
+          // Default/fallback for other types
+          methodSignature = `${elementName}()Ljava/lang/Object;`;
+          methodImplementation = () => elementValue;
+        }
+
+        proxy[methodSignature] = methodImplementation;
+      });
+    }
+
+    return proxy;
   }
 }
 
