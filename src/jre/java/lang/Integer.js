@@ -8,6 +8,12 @@ module.exports = {
     },
   },
   staticMethods: {
+    'toBinaryString(I)Ljava/lang/String;': (jvm, obj, args) => {
+      const intValue = args[0];
+      // Use unsigned right shift to get the 32-bit two's complement representation
+      const binaryString = (intValue >>> 0).toString(2);
+      return jvm.internString(binaryString);
+    },
     'valueOf(I)Ljava/lang/Integer;': (jvm, obj, args) => {
       const integerObj = {
         type: 'java/lang/Integer',
