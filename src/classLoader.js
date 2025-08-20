@@ -92,6 +92,70 @@ function parseAnnotationsFromAst(ast) {
     return resolveString(index);
   }
   
+  // Parse class-level annotations from the new AST structure
+  if (ast.ast.attributes) {
+    ast.ast.attributes.forEach(attr => {
+      const attrName = attr.attribute_name_index?.name?.info?.bytes;
+      if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+        result.classAnnotations = attr.info.annotations.map(annotation => {
+          const typeName = resolveAnnotationType(annotation.type_index);
+          const elements = {};
+
+          if (annotation.element_value_pairs) {
+            annotation.element_value_pairs.forEach(pair => {
+              const elementName = resolveString(pair.element_name_index);
+
+              // Parse element value based on tag
+              const tag = pair.value.tag;
+              const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+
+              if (elementName && elementValue !== undefined) {
+                elements[elementName] = elementValue;
+              }
+            });
+          }
+
+          return {
+            type: typeName,
+            elements: elements
+          };
+        });
+      }
+    });
+  }
+
+  // Parse class-level annotations from the new AST structure
+  if (ast.ast.attributes) {
+    ast.ast.attributes.forEach(attr => {
+      const attrName = attr.attribute_name_index?.name?.info?.bytes;
+      if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+        result.classAnnotations = attr.info.annotations.map(annotation => {
+          const typeName = resolveAnnotationType(annotation.type_index);
+          const elements = {};
+
+          if (annotation.element_value_pairs) {
+            annotation.element_value_pairs.forEach(pair => {
+              const elementName = resolveString(pair.element_name_index);
+
+              // Parse element value based on tag
+              const tag = pair.value.tag;
+              const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+
+              if (elementName && elementValue !== undefined) {
+                elements[elementName] = elementValue;
+              }
+            });
+          }
+
+          return {
+            type: typeName,
+            elements: elements
+          };
+        });
+      }
+    });
+  }
+
   // Parse field annotations from the new AST structure
   if (ast.ast.fields) {
     ast.ast.fields.forEach(field => {
