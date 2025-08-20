@@ -4,15 +4,33 @@ module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/lang/Runnable'],
   staticFields: {},
+  staticMethods: {
+    'currentThread()Ljava/lang/Thread;': (jvm, obj, args) => {
+      const internalThread = jvm.threads[jvm.currentThreadIndex];
+      // This is a hack. In a real JVM, we would have a reference to the
+      // java.lang.Thread object for each thread.
+      const threadObj = {
+        type: 'java/lang/Thread',
+        name: internalThread.name || 'Unknown',
+        hashCode: jvm.nextHashCode++
+      };
+      return threadObj;
+    }
+  },
   methods: {
     '<init>()V': (jvm, obj, args) => {
       obj.hashCode = jvm.nextHashCode++;
+      obj.name = 'Thread-' + obj.hashCode;
       delete obj.isUninitialized;
     },
     '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args) => {
       obj.hashCode = jvm.nextHashCode++;
+      obj.name = 'Thread-' + obj.hashCode;
       obj.runnable = args[0];
       delete obj.isUninitialized;
+    },
+    'getName()Ljava/lang/String;': (jvm, obj, args) => {
+      return jvm.internString(obj.name);
     },
     'start()V': async (jvm, threadObject, args, currentThread) => {
       const Stack = require('../../../stack');
