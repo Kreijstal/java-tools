@@ -414,6 +414,20 @@ function convertJson(inputJson, constantPool) {
             };
             break;
 
+          case "lookupswitch":
+            const lookupDefaultPc = instr.pc + instr.operands.default;
+            const lookupPairs = instr.operands.matchOffsetPairs.map(
+              (pair) => [pair.match, labelMap[instr.pc + pair.offset]]
+            );
+            codeItem.instruction = {
+              op: "lookupswitch",
+              arg: {
+                defaultLabel: labelMap[lookupDefaultPc],
+                pairs: lookupPairs
+              }
+            };
+            break;
+
           case "iinc":
             codeItem.instruction = {
               op: "iinc",
