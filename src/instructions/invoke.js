@@ -90,6 +90,12 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
+      
+      // Check if the result is a Promise and await it
+      if (result && typeof result.then === 'function') {
+        result = await result;
+      }
+      
       if (thread.status === 'BLOCKED') {
         // If the thread was blocked (e.g. by a lock), push the arguments back on the stack
         // so they are available when the instruction is re-executed.

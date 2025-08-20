@@ -116,6 +116,14 @@ class JVM {
                 constantPool: [],
                 staticFields: new Map(),
               };
+              
+              // Initialize static fields from JRE definition during preloading
+              if (jreClassDef && jreClassDef.staticFields) {
+                for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
+                  classStub.staticFields.set(fieldKey, fieldValue);
+                }
+              }
+              
               this.classes[className] = classStub;
             }
           }
@@ -683,34 +691,59 @@ class JVM {
           console.log(`Initializing staticFields for ${className}`);
         }
 
-        // Initialize static fields with default values
-        const fields = classData.ast.classes[0].items.filter(item => 
-          item.type === 'field' && item.field.flags && item.field.flags.includes('static')
-        );
-        
-        for (const fieldItem of fields) {
-          const field = fieldItem.field;
-          const fieldKey = `${field.name}:${field.descriptor}`;
+        // Initialize static fields from bytecode AST
+        if (classData.ast && classData.ast.classes[0]) {
+          const fields = classData.ast.classes[0].items.filter(item => 
+            item.type === 'field' && item.field.flags && item.field.flags.includes('static')
+          );
           
-          // Set default value based on descriptor
-          let defaultValue = null;
-          if (field.descriptor === 'I' || field.descriptor === 'B' || field.descriptor === 'S') {
-            defaultValue = 0; // int, byte, short
-          } else if (field.descriptor === 'J') {
-            defaultValue = BigInt(0); // long
-          } else if (field.descriptor === 'F' || field.descriptor === 'D') {
-            defaultValue = 0.0; // float, double
-          } else if (field.descriptor === 'Z') {
-            defaultValue = 0; // boolean (false)
-          } else if (field.descriptor === 'C') {
-            defaultValue = 0; // char ('\0')
-          }
-          // Object references default to null
-          
-          classData.staticFields.set(fieldKey, defaultValue);
+          for (const fieldItem of fields) {
+            const field = fieldItem.field;
+            const fieldKey = `${field.name}:${field.descriptor}`;
+            
+            // Set default value based on descriptor
+            let defaultValue = null;
+            if (field.descriptor === 'I' || field.descriptor === 'B' || field.descriptor === 'S') {
+              defaultValue = 0; // int, byte, short
+            } else if (field.descriptor === 'J') {
+              defaultValue = BigInt(0); // long
+            } else if (field.descriptor === 'F' || field.descriptor === 'D') {
+              defaultValue = 0.0; // float, double
+            } else if (field.descriptor === 'Z') {
+              defaultValue = 0; // boolean (false)
+            } else if (field.descriptor === 'C') {
+              defaultValue = 0; // char ('\0')
+            }
+            // Object references default to null
+            
+            classData.staticFields.set(fieldKey, defaultValue);
 
+            if (this.verbose) {
+              console.log(`Initialized static field ${fieldKey} with default value`);
+            }
+          }
+        }
+        
+        // Initialize static fields from JRE definitions
+        const jreClass = this.jre[className];
+        if (jreClass && jreClass.staticFields) {
           if (this.verbose) {
-            console.log(`Initialized static field ${fieldKey} with default value`);
+            console.log(`Found JRE class ${className} with staticFields:`, Object.keys(jreClass.staticFields));
+          }
+          for (const [fieldKey, fieldValue] of Object.entries(jreClass.staticFields)) {
+            classData.staticFields.set(fieldKey, fieldValue);
+            
+            if (this.verbose) {
+              console.log(`Initialized JRE static field ${fieldKey}:`, fieldValue);
+            }
+          }
+        } else {
+          if (this.verbose) {
+            console.log(`No JRE class found for ${className}, or no staticFields defined`);
+            console.log(`JRE class exists: ${!!jreClass}`);
+            if (jreClass) {
+              console.log(`JRE class keys:`, Object.keys(jreClass));
+            }
           }
         }
       }
