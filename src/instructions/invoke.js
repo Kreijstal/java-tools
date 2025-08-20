@@ -154,7 +154,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
       args.unshift(frame.stack.pop());
     }
     
-    let result = jreMethod(jvm, null, args, thread);
+    let result = await jreMethod(jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
     if (returnType !== 'V' && result !== undefined) {
       frame.stack.push(result);

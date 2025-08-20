@@ -2,13 +2,30 @@ module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
   methods: {
+    'forName(Ljava/lang/String;)Ljava/lang/Class;': async (jvm, classObj, args) => {
+      const classNameWithDots = args[0];
+      const classNameWithSlashes = classNameWithDots.replace(/\./g, '/');
+      const classData = await jvm.loadClassByName(classNameWithSlashes);
+      if (!classData) {
+        throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
+      }
+      return { type: 'java/lang/Class', _classData: classData };
+    },
+    'getFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
+      return [];
+    },
     'getName()Ljava/lang/String;': (jvm, classObj, args) => {
       const classData = classObj._classData;
+      if (!classData || !classData.ast) {
+        if (classObj.type) {
+            return jvm.internString(classObj.type.replace(/\//g, '.'));
+        }
+        return jvm.internString("Unknown");
+      }
       const className = classData.ast.classes[0].className.replace(/\//g, '.');
       return jvm.internString(className);
     },
     'getSimpleName()Ljava/lang/String;': (jvm, classObj, args) => {
-      // Handle primitive wrapper classes and other objects that may not have _classData
       if (classObj.className) {
         return jvm.internString(classObj.className.split('.').pop());
       }
@@ -20,7 +37,6 @@ module.exports = {
         return jvm.internString(simpleName);
       }
       
-      // Fallback if we can't determine the class name
       return jvm.internString('Unknown');
     },
     'getSuperclass()Ljava/lang/Class;': async (jvm, classObj, args) => {
@@ -51,7 +67,6 @@ module.exports = {
           return;
         }
 
-        // Add methods from the current class
         classData.ast.classes[0].items
           .filter(item => item.type === 'method' && item.method.flags.includes('public'))
           .forEach(methodItem => {
@@ -76,10 +91,26 @@ module.exports = {
 
       getMethodsRecursive(classObj);
 
-      // Manually add java.lang.Object methods if they haven't been added by a subclass
+      // Special case for String, which is a native-implemented class
+      if (classObj._classData.ast.classes[0].className === 'java/lang/String') {
+        const stringMethods = require('./String.js');
+        Object.keys(stringMethods.methods).forEach(methodSignature => {
+          const openParen = methodSignature.indexOf('(');
+          const name = methodSignature.substring(0, openParen);
+          const descriptor = methodSignature.substring(openParen);
+          const key = name + descriptor;
+          if (!allMethods[key]) {
+            allMethods[key] = {
+              type: 'java/lang/reflect/Method',
+              _methodData: { name, descriptor, flags: ['public'] },
+              _declaringClass: classObj,
+            };
+          }
+        });
+      }
+
       const objectMethods = require('./Object.js');
       
-      // Define access modifiers for Object methods
       const objectMethodAccessModifiers = {
         'getClass': ['public', 'final', 'native'],
         'hashCode': ['public', 'native'],
@@ -97,12 +128,11 @@ module.exports = {
           const descriptor = methodSignature.substring(openParen);
           const key = name + descriptor;
           
-          // Only add public methods to getMethods() result
           const flags = objectMethodAccessModifiers[name] || ['public'];
           if (flags.includes('public') && !allMethods[key]) {
               allMethods[key] = {
                   type: 'java/lang/reflect/Method',
-                  _methodData: { name, descriptor, flags, attributes: [{ type: 'code', code: { localsSize: 1, codeItems: [] } }] },
+                  _methodData: { name, descriptor, flags, attributes: [] },
                   _declaringClass: { type: 'java/lang/Class', _classData: jvm.classes['java/lang/Object'] },
               };
           }
@@ -112,7 +142,7 @@ module.exports = {
     },
     'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
       const methodName = args[0];
-      const paramTypes = args[1]; // array of class objects
+      const paramTypes = args[1];
 
       const classData = classObj._classData;
       const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
@@ -158,9 +188,8 @@ module.exports = {
     },
     'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
       const methodNameObj = args[0];
-      const paramTypes = args[1]; // array of class objects
+      const paramTypes = args[1];
 
-      // Extract the actual string value from JVM string object
       let methodName;
       if (typeof methodNameObj === 'string') {
         methodName = methodNameObj;
@@ -219,7 +248,6 @@ module.exports = {
     'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       const fieldNameObj = args[0];
       
-      // Extract the actual string value from JVM string object
       let fieldName;
       if (typeof fieldNameObj === 'string') {
         fieldName = fieldNameObj;
@@ -233,7 +261,6 @@ module.exports = {
       
       const classData = classObj._classData;
       
-      // Find the field in the class
       const field = classData.ast.classes[0].items.find(item => 
         item.type === 'field' && item.field.name === fieldName
       );
@@ -268,7 +295,6 @@ module.exports = {
       const classData = classObj._classData;
       const annotations = classData.annotations || [];
       
-      // Check if annotation of the specified type is present
       return annotations.some(ann => {
         const annotationType = ann.type;
         const annotationClassName = annotationClass._classData ? 
@@ -282,7 +308,6 @@ module.exports = {
       const classData = classObj._classData;
       const annotations = classData.annotations || [];
       
-      // Find annotation of the specified type
       const annotation = annotations.find(ann => {
         const annotationType = ann.type;
         const annotationClassName = annotationClass._classData ? 
@@ -292,7 +317,6 @@ module.exports = {
       });
       
       if (annotation) {
-        // Create annotation proxy object
         return jvm.createAnnotationProxy(annotation);
       }
       
