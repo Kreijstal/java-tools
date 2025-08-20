@@ -101,6 +101,11 @@ const FIXED_CRASH_TESTS = [
     name: 'MissingBytecodeCrash',
     description: 'Previously crashed on instanceof with interface - now fixed',
     expectedPattern: /obj is CharSequence/
+  },
+  {
+    name: 'ReflectionCrash',
+    description: 'Crashes due to unimplemented reflection methods',
+    expectedPattern: /String class: java.lang.String/
   }
 ];
 
