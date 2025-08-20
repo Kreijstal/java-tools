@@ -14,7 +14,13 @@ module.exports = {
       const methodData = methodObj._methodData;
       const { name, descriptor, flags } = methodData;
       const obj = args[0];
-      const methodArgs = args[1];
+      const methodArgs = args[1] ? args[1] : [];
+
+      const jreMethod = jvm._jreFindMethod(obj.type, name, descriptor);
+      if (jreMethod) {
+        const result = jreMethod(jvm, obj, methodArgs, jvm.threads[jvm.currentThreadIndex]);
+        return result;
+      }
 
       const isStatic = flags.includes('static');
 

@@ -422,6 +422,18 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   // For regular interface implementations, treat like invokevirtual
+  const jreClass = jvm.jre[boxedObj.type];
+  if (jreClass && jreClass.methods && jreClass.methods[methodName + descriptor]) {
+    const result = jreClass.methods[methodName + descriptor](jvm, boxedObj, args, thread);
+    const { returnType } = parseDescriptor(descriptor);
+    if (returnType !== 'V' && result !== undefined) {
+      if (typeof result === 'boolean') {
+        result = result ? 1 : 0;
+      }
+      frame.stack.push(result);
+    }
+    return;
+  }
   
   // Special handling for annotation proxy objects
   if (boxedObj._annotationData) {

@@ -102,13 +102,27 @@ class JVM {
 
               const jreClassDef = this.jre[className];
               const interfaces = (jreClassDef && jreClassDef.interfaces) ? jreClassDef.interfaces : [];
+              const methods = (jreClassDef && jreClassDef.methods) ? Object.keys(jreClassDef.methods).map(methodSig => {
+                const openParen = methodSig.indexOf('(');
+                const name = methodSig.substring(0, openParen);
+                const descriptor = methodSig.substring(openParen);
+                return {
+                  type: 'method',
+                  method: {
+                    name: name,
+                    descriptor: descriptor,
+                    flags: ['public'], // Assume public for JRE methods
+                    attributes: []
+                  }
+                };
+              }) : [];
 
               const classStub = {
                 ast: {
                   classes: [{
                     className: className,
                     superClassName: (jreClassDef && jreClassDef.super) || 'java/lang/Object',
-                    items: [],
+                    items: methods,
                     flags: ['public'],
                     interfaces: interfaces
                   }]
