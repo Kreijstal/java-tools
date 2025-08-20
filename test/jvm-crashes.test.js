@@ -78,6 +78,11 @@ const FIXED_CRASH_TESTS = [
     name: 'ConversionTest',
     description: 'l2i conversion - should work',
     expectedPattern: /10/
+  },
+  {
+    name: 'AdvancedArrayCrash',
+    description: 'Previously crashed on System.arraycopy - now fixed',
+    expectedPattern: /Arraycopy result: dst\[3] = 2/
   }
 ];
 
