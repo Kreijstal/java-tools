@@ -356,13 +356,13 @@ async function invokedynamic(frame, instruction, jvm, thread) {
   // When its method is called (e.g., run()), the target method handle is invoked.
   if (bsm.method_ref.value.reference.className === 'java/lang/invoke/LambdaMetafactory') {
     // Create a functional interface object (e.g., Runnable).
-    const runnable = {
-      type: 'java/lang/Runnable', // The functional interface type
+    const functionalInterface = {
+      type: invokedType.returnType, // The functional interface type
       methodHandle: targetMethodHandle, // The implementation of the interface's method
     };
 
     // Push the resulting functional interface object onto the stack.
-    frame.stack.push(runnable);
+    frame.stack.push(functionalInterface);
   }
 }
 

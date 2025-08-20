@@ -106,6 +106,11 @@ const FIXED_CRASH_TESTS = [
     name: 'ReflectionCrash',
     description: 'Crashes due to unimplemented reflection methods',
     expectedPattern: /String class: java.lang.String/
+  },
+  {
+    name: 'NewLambdaCrash',
+    description: 'Should support simple lambda expressions without warnings',
+    expectedPattern: /Hello from lambda!/
   }
 ];
 
