@@ -375,8 +375,14 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
+  // Auto-box primitive if needed
+  let boxedObj = obj;
+  if (typeof obj === 'number' || typeof obj === 'boolean') {
+    boxedObj = autoboxPrimitive(jvm, obj);
+  }
+
   // Check for null object reference
-  if (obj === null) {
+  if (boxedObj === null) {
     throw {
       type: 'java/lang/NullPointerException',
       message: 'Attempted to invoke interface method on null object reference'
@@ -384,13 +390,13 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   // For a functional interface with method handle (lambdas)
-  if (obj.methodHandle) {
+  if (boxedObj.methodHandle) {
     // It's a lambda. Push the args back for invokestatic.
     for (const arg of args) {
         frame.stack.push(arg);
     }
 
-    const targetMethodHandle = obj.methodHandle;
+    const targetMethodHandle = boxedObj.methodHandle;
 
     // Now, invoke the target method. It's a static method in this case.
     const lambdaInstruction = {
@@ -412,10 +418,10 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   // For regular interface implementations, treat like invokevirtual
   
   // Special handling for annotation proxy objects
-  if (obj._annotationData) {
+  if (boxedObj._annotationData) {
     const methodKey = methodName + descriptor;
-    if (typeof obj[methodKey] === 'function') {
-      const result = obj[methodKey]();
+    if (typeof boxedObj[methodKey] === 'function') {
+      const result = boxedObj[methodKey]();
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== 'V' && result !== undefined) {
         frame.stack.push(result);
@@ -425,7 +431,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
   
   // First check JRE methods
-  let currentClassName = obj.type;
+  let currentClassName = boxedObj.type;
   while (currentClassName) {
     let jreMethod = null;
     if (jvm.jre[currentClassName]) {
@@ -457,7 +463,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
       const method = jvm.findMethod(classData, methodName, descriptor);
       if (method) {
         const newFrame = new Frame(method);
-        newFrame.locals[0] = obj; // 'this'
+        newFrame.locals[0] = boxedObj; // 'this'
         for (let i = 0; i < args.length; i++) {
           newFrame.locals[i+1] = args[i];
         }
@@ -470,7 +476,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     }
   }
 
-  throw new Error(`Unsupported invokeinterface: ${obj.type}.${methodName}${descriptor}`);
+  throw new Error(`Unsupported invokeinterface: ${boxedObj.type}.${methodName}${descriptor}`);
 }
 
 const invokeHandlers = {
