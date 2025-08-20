@@ -1,96 +1,71 @@
+const invokeHandlers = require('/app/src/instructions/invoke');
+const objectHandlers = require('/app/src/instructions/object');
+
+async function invokeWithArguments(jvm, handle, methodArgs) {
+  const thread = jvm.threads[jvm.currentThreadIndex];
+  const frame = thread.callStack.peek();
+  const instruction = {
+    op: handle.kind,
+    arg: [
+      handle.kind.endsWith('Field') ? 'Field' : 'Method',
+      handle.reference.className,
+      [handle.reference.nameAndType.name, handle.reference.nameAndType.descriptor],
+    ],
+  };
+
+  switch (handle.kind) {
+    case 'invokeVirtual':
+    case 'invokeSpecial':
+      frame.stack.push(methodArgs[0]);
+      for (let i = 1; i < methodArgs.length; i++) {
+        frame.stack.push(methodArgs[i]);
+      }
+      if (handle.kind === 'invokeVirtual') {
+        await invokeHandlers.invokevirtual(frame, instruction, jvm, thread);
+      } else {
+        await invokeHandlers.invokespecial(frame, instruction, jvm, thread);
+      }
+      if (handle.methodType.rtype !== 'V') {
+        return frame.stack.pop();
+      }
+      return null;
+    case 'invokeStatic':
+      for (const arg of methodArgs) {
+        frame.stack.push(arg);
+      }
+      await invokeHandlers.invokestatic(frame, instruction, jvm, thread);
+      if (handle.methodType.rtype !== 'V') {
+        return frame.stack.pop();
+      }
+      return null;
+    case 'getField':
+      frame.stack.push(methodArgs[0]);
+      await objectHandlers['getfield'](frame, instruction, jvm);
+      return frame.stack.pop();
+    case 'putField':
+      frame.stack.push(methodArgs[0]);
+      frame.stack.push(methodArgs[1]);
+      await objectHandlers['putfield'](frame, instruction, jvm);
+      return null;
+    default:
+      throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+  }
+}
+
 module.exports = {
   super: 'java/lang/Object',
-  staticFields: {},
-  staticMethods: {},
   methods: {
-    'invoke([Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, handle, args) => {
-      // Handle.invoke(...args) should dispatch to the target method
-      if (!handle.targetMethod) {
-        // Dispatch to the actual implementation
-        return await module.exports.methods['invoke(Ljava/lang/String;II)Ljava/lang/String;'](jvm, handle, args[0]);
-      }
-      
-      const methodArgs = args[0]; // Varargs are passed as array
-      
-      try {
-        if (handle.kind === 'invokeVirtual') {
-          // For virtual methods, first argument is the receiver object
-          const receiver = methodArgs[0];
-          const methodArguments = methodArgs.slice(1);
-          
-          // Find the method in JRE first
-          const jreMethod = jvm._jreFindMethod(handle.targetClass, handle.targetMethodName, handle.targetDescriptor);
-          if (jreMethod) {
-            return await jreMethod(jvm, receiver, methodArguments);
-          }
-          
-          // If not in JRE, look in loaded classes
-          const classData = jvm.classes[handle.targetClass];
-          if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
-          }
-          
-          const method = jvm.findMethod(classData, handle.targetMethodName, handle.targetDescriptor);
-          if (!method) {
-            throw new Error(`Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`);
-          }
-          
-          // Call the method using JVM's method invocation
-          const result = await jvm.callMethod(method, [receiver, ...methodArguments]);
-          return result;
-        }
-        
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
-        
-      } catch (error) {
-        if (jvm.verbose) {
-          console.error('MethodHandle.invoke error:', error);
-        }
-        throw error;
-      }
+    'invoke(Ljava/lang/String;)V': async (jvm, handle, args) => {
+      return await invokeWithArguments(jvm, handle, args);
     },
-    'invoke(Ljava/lang/String;II)Ljava/lang/String;': async (jvm, handle, args) => {
-      // Direct signature for String methods with 2 int parameters
-      const receiver = args[0];
-      const arg1 = args[1];
-      const arg2 = args[2];
-      
-      if (jvm.verbose) {
-        console.log(`MethodHandle.invoke: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor} with args:`, [receiver, arg1, arg2]);
-      }
-      
-      try {
-        if (handle.kind === 'invokeVirtual') {
-          // Find the method in JRE first
-          const jreMethod = jvm._jreFindMethod(handle.targetClass, handle.targetMethodName, handle.targetDescriptor);
-          if (jreMethod) {
-            return await jreMethod(jvm, receiver, [arg1, arg2]);
-          }
-          
-          // If not in JRE, look in loaded classes  
-          const classData = jvm.classes[handle.targetClass];
-          if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
-          }
-          
-          const method = jvm.findMethod(classData, handle.targetMethodName, handle.targetDescriptor);
-          if (!method) {
-            throw new Error(`Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`);
-          }
-          
-          // Call the method using JVM's method invocation
-          const result = await jvm.callMethod(method, [receiver, arg1, arg2]);
-          return result;
-        }
-        
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
-        
-      } catch (error) {
-        if (jvm.verbose) {
-          console.error('MethodHandle.invoke error:', error);
-        }
-        throw error;
-      }
-    }
-  }
+    'invoke(LMethodHandlesTest;I)Ljava/lang/String;': async (jvm, handle, args) => {
+      return await invokeWithArguments(jvm, handle, args);
+    },
+    'invoke(LMethodHandlesTest;I)V': async (jvm, handle, args) => {
+      return await invokeWithArguments(jvm, handle, args);
+    },
+    'invoke(LMethodHandlesTest;)I': async (jvm, handle, args) => {
+      return await invokeWithArguments(jvm, handle, args);
+    },
+  },
 };

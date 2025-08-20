@@ -148,6 +148,7 @@ class JVM {
     // Create a string object with proper type property for invokevirtual
     const stringObj = new String(str);
     stringObj.type = 'java/lang/String';
+    stringObj.value = str;
     this.stringPool.set(str, stringObj);
     return stringObj;
   }

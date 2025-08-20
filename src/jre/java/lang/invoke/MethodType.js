@@ -1,48 +1,28 @@
+const { MethodType } = require('./index');
+
+const { classToDescriptor } = require('/app/src/jre/utils');
+
 module.exports = {
   super: 'java/lang/Object',
-  staticFields: {},
   staticMethods: {
     'methodType(Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;': (jvm, obj, args) => {
-      const returnType = args[0];
-      const paramTypes = args[1];
-      
-      // Create MethodType object
-      const methodType = {
-        type: 'java/lang/invoke/MethodType',
-        returnType: returnType,
-        parameterTypes: paramTypes || []
-      };
-      
-      return methodType;
+      const rtype = args[0];
+      const ptypes = args[1] ? args[1].array : [];
+      const rtypeDesc = classToDescriptor(rtype);
+      const ptypeDescs = ptypes.map(ptype => classToDescriptor(ptype));
+      return new MethodType(ptypeDescs, rtypeDesc);
     },
-    'methodType(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/invoke/MethodType;': (jvm, obj, args) => {
-      const returnType = args[0];
-      const paramType1 = args[1];
-      const paramType2 = args[2];
-      
-      // Create MethodType object
-      const methodType = {
-        type: 'java/lang/invoke/MethodType',
-        returnType: returnType,
-        parameterTypes: [paramType1, paramType2]
-      };
-      
-      return methodType;
+    'methodType(Ljava/lang/Class;Ljava/lang/Class;)Ljava/lang/invoke/MethodType;': (jvm, obj, args) => {
+      const rtype = args[0];
+      const ptype0 = args[1];
+      const rtypeDesc = classToDescriptor(rtype);
+      const ptypeDesc0 = classToDescriptor(ptype0);
+      return new MethodType([ptypeDesc0], rtypeDesc);
     },
-    'methodType(Ljava/lang/Class;Ljava/lang/Class;[Ljava/lang/Class;)Ljava/lang/invoke/MethodType;': (jvm, obj, args) => {
-      const returnType = args[0];
-      const firstParamType = args[1];
-      const additionalParamTypes = args[2] || [];
-      
-      // Create MethodType object
-      const methodType = {
-        type: 'java/lang/invoke/MethodType',
-        returnType: returnType,
-        parameterTypes: [firstParamType, ...additionalParamTypes]
-      };
-      
-      return methodType;
+    'methodType(Ljava/lang/Class;)Ljava/lang/invoke/MethodType;': (jvm, obj, args) => {
+      const rtype = args[0];
+      const rtypeDesc = classToDescriptor(rtype);
+      return new MethodType([], rtypeDesc);
     }
-  },
-  methods: {}
+  }
 };
