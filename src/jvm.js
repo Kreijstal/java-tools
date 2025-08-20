@@ -66,13 +66,17 @@ class JVM {
     // Create stubs for all classes in the hierarchy
     for (const className in jreHierarchy) {
       const superClassName = jreHierarchy[className];
+      const jreClassDef = this.jre[className];
+      const interfaces = (jreClassDef && jreClassDef.interfaces) ? jreClassDef.interfaces : [];
+
       const classStub = {
         ast: {
           classes: [{
             className: className,
             superClassName: superClassName,
             items: [],
-            flags: ['public']
+            flags: ['public'],
+            interfaces: interfaces
           }]
         },
         constantPool: [],
@@ -94,13 +98,17 @@ class JVM {
           } else if (file.endsWith('.js')) {
             const className = `${prefix}${file.slice(0, -3)}`;
             if (!this.classes[className]) {
+              const jreClassDef = this.jre[className];
+              const interfaces = (jreClassDef && jreClassDef.interfaces) ? jreClassDef.interfaces : [];
+
               const classStub = {
                 ast: {
                   classes: [{
                     className: className,
                     superClassName: 'java/lang/Object',
                     items: [],
-                    flags: ['public']
+                    flags: ['public'],
+                    interfaces: interfaces
                   }]
                 },
                 constantPool: [],

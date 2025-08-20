@@ -1,6 +1,6 @@
 module.exports = {
   super: 'java/io/FilterOutputStream',
-  interfaces: ['java/lang/Appendable'],
+  interfaces: ['java/lang/Appendable', 'java/io/Closeable'],
   methods: {
     '<init>(Ljava/io/OutputStream;)V': (jvm, obj, args) => {
       const out = args[0];
