@@ -2,6 +2,9 @@ module.exports = {
   super: null,
   staticFields: {},
   methods: {
+    '<init>()V': (jvm, obj, args) => {
+      // Object constructor does nothing
+    },
     'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
       const className = obj.type;
       const classData = jvm.classes[className];
