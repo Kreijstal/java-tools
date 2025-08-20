@@ -124,9 +124,6 @@ const PARTIAL_TESTS = [
   }
 ];
 
-// Test programs that may still have issues
-const PARTIAL_TESTS = [];
-
 // Helper function to run JVM test
 async function runJvmTest(testName, timeout = 2000) {
   return new Promise(async (resolve) => {
