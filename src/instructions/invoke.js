@@ -270,11 +270,11 @@ async function invokedynamic(frame, instruction, jvm, thread) {
         if (char === '\u0001') {
             const arg = dynamicArgs[argIndex++];
             // Convert Java objects to strings properly
-            if (arg && typeof arg === 'object' && arg.toString) {
-                result += arg.toString();
-            } else if (arg && typeof arg === 'object' && arg.value !== undefined) {
+            if (arg && typeof arg === 'object' && arg.value !== undefined) {
                 // Java String object
                 result += arg.value;
+            } else if (arg && typeof arg === 'object' && arg.toString) {
+                result += arg.toString();
             } else {
                 result += String(arg);
             }
@@ -351,6 +351,11 @@ async function invokeinterface(frame, instruction, jvm, thread) {
 
   // For a functional interface with method handle (lambdas)
   if (obj.methodHandle) {
+    // It's a lambda. Push the args back for invokestatic.
+    for (const arg of args) {
+        frame.stack.push(arg);
+    }
+
     const targetMethodHandle = obj.methodHandle;
 
     // Now, invoke the target method. It's a static method in this case.
