@@ -60,6 +60,7 @@ class JVM {
       'java/io/ConsoleOutputStream': 'java/io/OutputStream',
       'java/net/URLConnection': 'java/lang/Object',
       'java/net/HttpURLConnection': 'java/net/URLConnection',
+      'java/util/function/Function': 'java/lang/Object',
     };
 
     // Create stubs for all classes in the hierarchy
