@@ -1,7 +1,6 @@
 module.exports = {
   super: 'java/lang/Object',
-  staticFields: {},
-  methods: {
+  staticMethods: {
     'equals(Ljava/lang/Object;Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const a = args[0];
       const b = args[1];
