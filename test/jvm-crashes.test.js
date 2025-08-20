@@ -78,6 +78,11 @@ const FIXED_CRASH_TESTS = [
     name: 'ConversionTest',
     description: 'l2i conversion - should work',
     expectedPattern: /10/
+  },
+  {
+    name: 'EnumTest',
+    description: 'Previously had issues with enum constants - now fixed',
+    expectedPattern: /Red value: 255/
   }
 ];
 
@@ -86,11 +91,6 @@ const PARTIAL_TESTS = [
   {
     name: 'TryCatchTest',
     description: 'Partial failure on exception methods',
-    allowFailure: true
-  },
-  {
-    name: 'EnumTest',
-    description: 'May still have issues with enum constants',
     allowFailure: true
   },
   {
