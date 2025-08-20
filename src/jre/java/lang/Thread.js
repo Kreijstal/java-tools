@@ -2,6 +2,7 @@ const { ASYNC_METHOD_SENTINEL } = require('../../../constants');
 
 module.exports = {
   super: 'java/lang/Object',
+  interfaces: ['java/lang/Runnable'],
   staticFields: {},
   methods: {
     '<init>()V': (jvm, obj, args) => {

@@ -1,6 +1,6 @@
 module.exports = {
   super: 'java/lang/Object',
-  interfaces: ['java/lang/CharSequence'],
+  interfaces: ['java/lang/CharSequence', 'java/io/Serializable', 'java/lang/Comparable'],
   staticFields: {},
   staticMethods: {
     'valueOf(Ljava/lang/Object;)Ljava/lang/String;': (jvm, obj, args) => {
