@@ -1,4 +1,4 @@
-const { _aload } = require('./utils');
+const { _aload } = require("./utils");
 
 module.exports = {
   iload: (frame, instruction) => {

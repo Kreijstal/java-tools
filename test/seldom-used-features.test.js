@@ -150,29 +150,29 @@ Static method called, counter = 35`,
     shouldFail: false,
     expectedOutput: `=== Jagged Array Test ===
 Basic jagged array:
-Row 0: 1 2 3 4
-Row 1: 5 6
-Row 2: 7 8 9
+Row 0: 1 2 3 4\x20
+Row 1: 5 6\x20
+Row 2: 7 8 9\x20
 Jagged array with direct initialization:
-Row 0: 10 20 30
-Row 1: 40 50
-Row 2: 60 70 80 90 100
+Row 0: 10 20 30\x20
+Row 1: 40 50\x20
+Row 2: 60 70 80 90 100\x20
 3D jagged array:
 Level 0:
-Row 0: 1 2
-Row 1: 3 4 5
+Row 0: 1 2\x20
+Row 1: 3 4 5\x20
 Level 1:
-Row 0: 6
-Row 1: 7 8 9
-Row 2: 10 11
+Row 0: 6\x20
+Row 1: 7 8 9\x20
+Row 2: 10 11\x20
 Array with null subarrays:
-Row 0: hello world
+Row 0: hello world\x20
 Row 1: null
-Row 2: java test
+Row 2: java test\x20
 Dynamic jagged array:
-Row 0: 10
-Row 1: 20 21
-Row 2: 30 31 32
+Row 0: 10\x20
+Row 1: 20 21\x20
+Row 2: 30 31 32\x20
 Row 3: 40 41 42 43`,
   },
 ];
@@ -182,10 +182,6 @@ test("Seldom-used Java Features", async function (t) {
     const options = {
       shouldFail: testCase.shouldFail,
     };
-    // Enable verbose mode for MethodHandlesTest to debug method resolution
-    if (testCase.name === "MethodHandlesTest") {
-      options.verbose = true;
-    }
     await runTest(testCase.name, testCase.expectedOutput, t, options);
   }
   t.end();

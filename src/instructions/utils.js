@@ -4,19 +4,19 @@ function _aload(frame) {
 
   if (arrayRef === null) {
     throw {
-      type: 'java/lang/NullPointerException',
-      message: '',
+      type: "java/lang/NullPointerException",
+      message: "",
     };
   }
 
   if (index < 0 || index >= arrayRef.length) {
     throw {
-      type: 'java/lang/ArrayIndexOutOfBoundsException',
+      type: "java/lang/ArrayIndexOutOfBoundsException",
       message: `Index ${index} out of bounds for length ${arrayRef.length}`,
     };
   }
 
-  const value = arrayRef[index];
+  const value = arrayRef.elements ? arrayRef.elements[index] : arrayRef[index];
   frame.stack.push(value);
 }
 
@@ -27,14 +27,14 @@ function _astore(frame) {
 
   if (arrayRef === null) {
     throw {
-      type: 'java/lang/NullPointerException',
-      message: '',
+      type: "java/lang/NullPointerException",
+      message: "",
     };
   }
 
   if (index < 0 || index >= arrayRef.length) {
     throw {
-      type: 'java/lang/ArrayIndexOutOfBoundsException',
+      type: "java/lang/ArrayIndexOutOfBoundsException",
       message: `Index ${index} out of bounds for length ${arrayRef.length}`,
     };
   }

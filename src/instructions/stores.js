@@ -1,4 +1,4 @@
-const { _astore } = require('./utils');
+const { _astore } = require("./utils");
 
 module.exports = {
   istore: (frame, instruction) => {
@@ -21,6 +21,7 @@ module.exports = {
   astore: (frame, instruction) => {
     const index = parseInt(instruction.arg, 10);
     const ref = frame.stack.pop();
+
     frame.locals[index] = ref;
   },
   astore_0: (frame) => {
