@@ -20,9 +20,8 @@ module.exports = {
       if (typeof constant === 'string' || constant instanceof String) {
         frame.stack.push(jvm.internString(constant));
       } else if (typeof constant === 'object' && constant !== null && constant.value !== undefined) {
-        // Handle typed constants from convert_tree.js (e.g., {value: 3.5, type: "Float"})
-        // Preserve the type information for proper formatting during string concatenation
-        frame.stack.push(constant);
+        // Extract the primitive value from typed constants - primitives should not be boxed
+        frame.stack.push(constant.value);
       } else {
         frame.stack.push(constant);
       }
@@ -89,10 +88,9 @@ module.exports = {
     const value = instruction.arg;
     if (typeof value === 'string' && value.endsWith('L')) {
       frame.stack.push(BigInt(value.slice(0, -1)));
-    } else if (typeof value === 'object' && value !== null) {
-      // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Double"})
-      // Preserve the type information for proper formatting during string concatenation
-      frame.stack.push(value);
+    } else if (typeof value === 'object' && value !== null && value.value !== undefined) {
+      // Extract the primitive value from typed constants - primitives should not be boxed
+      frame.stack.push(value.value);
     } else {
       frame.stack.push(parseFloat(value));
     }

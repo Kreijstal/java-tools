@@ -1,14 +1,9 @@
-// Helper function to extract numeric value from typed or primitive values
+// Helper function to extract numeric value from any source
 function extractNumericValue(value) {
   if (typeof value === 'object' && value !== null && typeof value.value === 'number') {
     return value.value;
   }
   return value;
-}
-
-// Helper function to create a typed result for float operations
-function createTypedResult(value, type) {
-  return { value: value, type: type };
 }
 
 module.exports = {
@@ -156,71 +151,71 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) + extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Float'));
+    frame.stack.push(result);
   },
   fsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) - extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Float'));
+    frame.stack.push(result);
   },
   fmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) * extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Float'));
+    frame.stack.push(result);
   },
   fdiv: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) / extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Float'));
+    frame.stack.push(result);
   },
   frem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) % extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Float'));
+    frame.stack.push(result);
   },
   fneg: (frame) => {
     const value = frame.stack.pop();
     const result = -extractNumericValue(value);
-    frame.stack.push(createTypedResult(result, 'Float'));
+    frame.stack.push(result);
   },
   dadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) + extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Double'));
+    frame.stack.push(result);
   },
   dsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) - extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Double'));
+    frame.stack.push(result);
   },
   dmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) * extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Double'));
+    frame.stack.push(result);
   },
   ddiv: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) / extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Double'));
+    frame.stack.push(result);
   },
   drem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     const result = extractNumericValue(value1) % extractNumericValue(value2);
-    frame.stack.push(createTypedResult(result, 'Double'));
+    frame.stack.push(result);
   },
   dneg: (frame) => {
     const value = frame.stack.pop();
     const result = -extractNumericValue(value);
-    frame.stack.push(createTypedResult(result, 'Double'));
+    frame.stack.push(result);
   },
   // Comparison instructions
   dcmpl: (frame) => {

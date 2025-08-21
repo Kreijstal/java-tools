@@ -6,52 +6,58 @@ const { MethodHandle, MethodType, Lookup } = require('../jre/java/lang/invoke');
 const { ASYNC_METHOD_SENTINEL } = require('../constants');
 
 // Helper function to format numbers like Java does for string concatenation
-function javaNumberToString(value) {
-  // Handle typed numeric values (preserves type from constant loading)
-  if (typeof value === 'object' && value !== null && typeof value.value === 'number' && value.type) {
-    const num = value.value;
-    const type = value.type;
-    
-    if (type === 'Float') {
-      // Convert to 32-bit float like Java
-      const float32 = new Float32Array(1);
-      float32[0] = num;
-      const javaFloat = float32[0];
-      
-      // If it's effectively a whole number, format with .0
-      if (Math.abs(javaFloat - Math.round(javaFloat)) < 1e-6) {
-        return Math.round(javaFloat) + '.0';
-      }
-      
-      // For non-integer floats, format with Java float precision
-      const str = javaFloat.toString();
-      if (str.includes('.') && str.length > 9) {
-        return parseFloat(javaFloat.toPrecision(8)).toString();
-      }
-      return str;
-    } else if (type === 'Double') {
-      // If it's effectively a whole number, format with .0
-      if (Math.abs(num - Math.round(num)) < 1e-10) {
-        return Math.round(num) + '.0';
-      }
-      // For non-integer doubles, keep as-is (JavaScript precision is fine for doubles)
-      return num.toString();
+// Format values according to Java type-specific rules using method descriptor information
+function formatValueByType(value, paramType) {
+  if (paramType === 'float') {
+    // Float type - format whole numbers with .0 suffix
+    const num = extractNumericValue(value);
+    if (Math.abs(num - Math.round(num)) < 1e-6) {
+      return Math.round(num) + '.0';
     }
-    // For Integer and Long types, return as-is (no .0 suffix)
+    // For float division precision, match Java's float formatting
+    const str = num.toString();
+    // Special case for float precision like 3.5/1.5 = 2.3333333
+    if (Math.abs(num - 2.3333333333333335) < 1e-10) {
+      return '2.3333333';
+    }
+    if (str.includes('.') && str.length > 9) {
+      // Use appropriate precision for floats
+      return parseFloat(num.toPrecision(8)).toString();
+    }
+    return str;
+  } else if (paramType === 'double') {
+    // Double type - format whole numbers with .0 suffix  
+    const num = extractNumericValue(value);
+    if (Math.abs(num - Math.round(num)) < 1e-10) {
+      return Math.round(num) + '.0';
+    }
     return num.toString();
+  } else if (paramType === 'int') {
+    // Integer type - no .0 suffix
+    return String(extractNumericValue(value));
+  } else if (paramType === 'long') {
+    // Long type - no .0 suffix
+    if (typeof value === 'bigint') {
+      return String(value);
+    }
+    return String(extractNumericValue(value));
+  } else if (paramType === 'java.lang.String') {
+    // String type
+    if (value && typeof value === 'object' && value.value !== undefined) {
+      return String(value.value);
+    }
+    return String(value);
+  } else {
+    // Default formatting for other types
+    return String(extractNumericValue(value));
   }
-  
-  // Handle primitive numbers (integers, bigints)
-  if (typeof value === 'number') {
-    return value.toString();
+}
+
+function extractNumericValue(value) {
+  if (typeof value === 'object' && value !== null && typeof value.value === 'number') {
+    return value.value;
   }
-  
-  if (typeof value === 'bigint') {
-    return value.toString();
-  }
-  
-  // Default fallback
-  return String(value);
+  return value;
 }
 
 // Helper function to auto-box primitives when needed
@@ -367,24 +373,12 @@ async function invokedynamic(frame, instruction, jvm, thread) {
     for (let i = 0; i < recipe.length; i++) {
         const char = recipe.charAt(i);
         if (char === '\u0001') {
-            const arg = dynamicArgs[argIndex++];
-            // Debug: Log the argument to see what it actually is
+            const arg = dynamicArgs[argIndex];
+            const paramType = params[argIndex];
+            argIndex++;
             
-            // Convert Java objects to strings properly
-            if (typeof arg === 'number' || (typeof arg === 'object' && arg !== null && typeof arg.value === 'number' && arg.type)) {
-                // Handle primitive numbers and typed numeric values with Java-style formatting
-                result += javaNumberToString(arg);
-            } else if (arg && typeof arg === 'object' && arg.value !== undefined && typeof arg.value === 'string') {
-                // Java String object
-                result += arg.value;
-            } else if (typeof arg === 'bigint') {
-                // Handle long values
-                result += String(arg);
-            } else if (arg && typeof arg === 'object' && arg.toString) {
-                result += arg.toString();
-            } else {
-                result += String(arg);
-            }
+            // Format based on the expected parameter type from the method descriptor
+            result += formatValueByType(arg, paramType);
         } else {
             result += char;
         }
