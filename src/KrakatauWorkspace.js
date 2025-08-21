@@ -5,6 +5,7 @@ const { getReferenceObjFromClass } = require('./traverseAST');
 const { unparseDataStructures } = require('./convert_tree');
 const { assembleClasses } = require('./assembleAndRun');
 const { renameMethod } = require('./renameMethod');
+const { renameField } = require('./renameField');
 
 const {
   SymbolIdentifier,
@@ -376,17 +377,20 @@ class KrakatauWorkspace {
     const allReferences = [];
     const classesToSearch = new Set([symbolIdentifier.className]);
 
-    // Add superclasses
+    // Go up the hierarchy
     const supertypes = this.getSupertypeHierarchy(symbolIdentifier.className);
     supertypes.forEach(s => classesToSearch.add(s.identifier.className));
 
-    // Add subclasses (recursively)
-    const allSubtypes = this.getAllSubtypes(symbolIdentifier.className);
-    allSubtypes.forEach(s => classesToSearch.add(s.identifier.className));
-    
+    // For each class in the hierarchy (original + supertypes), find all subtypes
+    const hierarchyAndSubtypes = new Set(classesToSearch);
+    for (const c of classesToSearch) {
+        const subtypes = this.getAllSubtypes(c);
+        subtypes.forEach(s => hierarchyAndSubtypes.add(s.identifier.className));
+    }
+
     const processedRefs = new Set();
 
-    for (const className of classesToSearch) {
+    for (const className of hierarchyAndSubtypes) { // Use the expanded set of classes
         const classRef = this.referenceObj[className];
         if (!classRef) {
             continue;
@@ -417,9 +421,9 @@ class KrakatauWorkspace {
     }
 
     // The above logic finds references TO the members of the hierarchy.
-    // We also need to include the definitions of the methods in the hierarchy as "references" to themselves,
-    // so that renameMethod can find and rename them.
-    for (const className of classesToSearch) {
+    // We also need to include the definitions of the members in the hierarchy as "references" to themselves,
+    // so that rename can find and rename them.
+    for (const className of hierarchyAndSubtypes) { // Use the expanded set of classes
         const workspaceEntry = this.workspaceASTs[className];
         if (workspaceEntry) {
             const ast = workspaceEntry.ast;
@@ -428,6 +432,12 @@ class KrakatauWorkspace {
                     const refKey = `${className}:classes.0.items.${itemIndex}.method`;
                      if (!processedRefs.has(refKey)) {
                         allReferences.push(new SymbolLocation(className, `classes.0.items.${itemIndex}.method`));
+                        processedRefs.add(refKey);
+                    }
+                } else if (item.type === 'field' && item.field.name === symbolIdentifier.memberName) {
+                    const refKey = `${className}:classes.0.items.${itemIndex}.field`;
+                     if (!processedRefs.has(refKey)) {
+                        allReferences.push(new SymbolLocation(className, `classes.0.items.${itemIndex}.field`));
                         processedRefs.add(refKey);
                     }
                 }
@@ -800,6 +810,30 @@ class KrakatauWorkspace {
       }
     }
     
+    // Assemble the modified classes
+    assembleClasses(modifiedAsts, outputDir);
+
+    console.log(`Successfully renamed ${symbolIdentifier.memberName} to ${newName} and saved ${modifiedClasses.size} affected files.`);
+  }
+
+  applyFieldRenameAndSave(symbolIdentifier, newName, outputDir = '.') {
+    // Step 1: Identify which class files will be modified by finding all references.
+    const modifiedClasses = new Set([symbolIdentifier.className]);
+    const refs = this.findReferences(symbolIdentifier);
+    refs.forEach(ref => modifiedClasses.add(ref.className));
+
+    // Step 2: Apply the rename operation to the in-memory ASTs.
+    renameField(this, symbolIdentifier.className, symbolIdentifier.memberName, newName);
+
+    // Step 3: Reassemble only the affected classes
+    const modifiedAsts = { classes: [], constantPools: [] };
+    for (const className of modifiedClasses) {
+      if (this.workspaceASTs[className]) {
+        modifiedAsts.classes.push(this.workspaceASTs[className].ast.classes[0]);
+        modifiedAsts.constantPools.push(this.workspaceASTs[className].constantPool);
+      }
+    }
+
     // Assemble the modified classes
     assembleClasses(modifiedAsts, outputDir);
 

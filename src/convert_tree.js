@@ -923,7 +923,7 @@ function unparseDataStructures(cls, constantPool, options = {}) {
         .filter((item) => item.type === "field")
         .map((item) => {
           const field = item.field;
-          return `.field ${field.name} ${field.descriptor};`;
+          return `.field ${field.name} ${field.descriptor}`;
         })
         .join("\n\n");
 
