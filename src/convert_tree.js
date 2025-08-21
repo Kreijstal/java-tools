@@ -360,7 +360,7 @@ function convertJson(inputJson, constantPool) {
                 arg = ldcConstant.value;
                 break;
               case "Long":
-                arg = ldcConstant.value.toString() + "L";
+                arg = ldcConstant.value;
                 break;
               case "Float":
                 arg = { value: ldcConstant.value, type: "Float" };
@@ -777,14 +777,22 @@ function formatInstructionArg(arg) {
  * @returns {String} Krakatau-compatible formatted argument string
  */
 function formatInstructionArgKrakatau(arg, opcode) {
+  if (Array.isArray(arg)) {
+    if ((opcode === 'ldc' || opcode === 'ldc_w') && arg[0] === 'Class') {
+      return arg.join(' ');
+    }
+    return arg.map(item => formatInstructionArgKrakatau(item, opcode)).join(" ");
+  }
+
+  if (typeof arg === 'bigint') {
+    return arg.toString() + 'L';
+  }
+
   if (typeof arg === "string") {
-    if (opcode === 'ldc' || opcode === 'ldc_w' || opcode === 'ldc2_w') {
+    if (opcode === 'ldc' || opcode === 'ldc_w') {
       return formatStringConstant(arg);
     }
     return arg;
-  } else if (Array.isArray(arg)) {
-    // Recursively format each item and join with spaces
-    return arg.map(item => formatInstructionArgKrakatau(item, opcode)).join(" ");
   } else if (typeof arg === "object") {
     // For object arguments, check if it's a typed float/double first
     if (arg.type === "Float") {
