@@ -5,61 +5,6 @@ const path = require('path');
 const { MethodHandle, MethodType, Lookup } = require('../jre/java/lang/invoke');
 const { ASYNC_METHOD_SENTINEL } = require('../constants');
 
-// Helper function to format numbers like Java does for string concatenation
-// Format values according to Java type-specific rules using method descriptor information
-function formatValueByType(value, paramType) {
-  if (paramType === 'float') {
-    // Float type - format whole numbers with .0 suffix
-    const num = extractNumericValue(value);
-    if (Math.abs(num - Math.round(num)) < 1e-6) {
-      return Math.round(num) + '.0';
-    }
-    // For float division precision, match Java's float formatting
-    const str = num.toString();
-    // Special case for float precision like 3.5/1.5 = 2.3333333
-    if (Math.abs(num - 2.3333333333333335) < 1e-10) {
-      return '2.3333333';
-    }
-    if (str.includes('.') && str.length > 9) {
-      // Use appropriate precision for floats
-      return parseFloat(num.toPrecision(8)).toString();
-    }
-    return str;
-  } else if (paramType === 'double') {
-    // Double type - format whole numbers with .0 suffix  
-    const num = extractNumericValue(value);
-    if (Math.abs(num - Math.round(num)) < 1e-10) {
-      return Math.round(num) + '.0';
-    }
-    return num.toString();
-  } else if (paramType === 'int') {
-    // Integer type - no .0 suffix
-    return String(extractNumericValue(value));
-  } else if (paramType === 'long') {
-    // Long type - no .0 suffix
-    if (typeof value === 'bigint') {
-      return String(value);
-    }
-    return String(extractNumericValue(value));
-  } else if (paramType === 'java.lang.String') {
-    // String type
-    if (value && typeof value === 'object' && value.value !== undefined) {
-      return String(value.value);
-    }
-    return String(value);
-  } else {
-    // Default formatting for other types
-    return String(extractNumericValue(value));
-  }
-}
-
-function extractNumericValue(value) {
-  if (typeof value === 'object' && value !== null && typeof value.value === 'number') {
-    return value.value;
-  }
-  return value;
-}
-
 // Helper function to auto-box primitives when needed
 function autoboxPrimitive(jvm, value) {
   if (typeof value === 'number') {
@@ -368,22 +313,18 @@ async function invokedynamic(frame, instruction, jvm, thread) {
         dynamicArgs.unshift(frame.stack.pop());
     }
 
-    let result = '';
-    let argIndex = 0;
-    for (let i = 0; i < recipe.length; i++) {
-        const char = recipe.charAt(i);
-        if (char === '\u0001') {
-            const arg = dynamicArgs[argIndex];
-            const paramType = params[argIndex];
-            argIndex++;
-            
-            // Format based on the expected parameter type from the method descriptor
-            result += formatValueByType(arg, paramType);
-        } else {
-            result += char;
-        }
-    }
-    frame.stack.push(jvm.internString(result));
+    // Create a MethodType object with parameter type information for StringConcatFactory
+    const methodType = {
+      parameterTypes: params,
+      returnType: 'java.lang.String'
+    };
+
+    // Call StringConcatFactory directly with type information
+    const stringConcatFactory = jvm.jre['java/lang/invoke/StringConcatFactory'];
+    const concatMethod = stringConcatFactory.methods['concat(Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/String;'];
+    
+    const result = concatMethod(jvm, null, [recipe, methodType, dynamicArgs]);
+    frame.stack.push(result);
     return;
   }
 
