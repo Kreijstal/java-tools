@@ -1,24 +1,31 @@
 module.exports = {
   ldc: async (frame, instruction, jvm) => {
-    if (Array.isArray(instruction.arg) && instruction.arg[0] === 'Class') {
+    if (Array.isArray(instruction.arg) && instruction.arg[0] === "Class") {
       const className = instruction.arg[1];
       const classData = await jvm.loadClassByName(className);
       if (classData) {
         const classObj = {
-          type: 'java/lang/Class',
+          type: "java/lang/Class",
           _classData: classData,
         };
         frame.stack.push(classObj);
       } else {
         throw {
-          type: 'java/lang/ClassNotFoundException',
+          type: "java/lang/ClassNotFoundException",
           message: `Class not found: ${className}`,
         };
       }
     } else {
       const constant = instruction.arg;
-      if (typeof constant === 'string' || constant instanceof String) {
+      if (typeof constant === "string" || constant instanceof String) {
         frame.stack.push(jvm.internString(constant));
+      } else if (
+        typeof constant === "object" &&
+        constant !== null &&
+        constant.hasOwnProperty("value")
+      ) {
+        // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Float"})
+        frame.stack.push(constant.value);
       } else {
         frame.stack.push(constant);
       }
@@ -53,14 +60,14 @@ module.exports = {
   iconst_5: (frame) => {
     frame.stack.push(5);
   },
-  
+
   lconst_0: (frame) => {
     frame.stack.push(BigInt(0));
   },
   lconst_1: (frame) => {
     frame.stack.push(BigInt(1));
   },
-  
+
   fconst_0: (frame) => {
     frame.stack.push(0.0);
   },
@@ -70,22 +77,22 @@ module.exports = {
   fconst_2: (frame) => {
     frame.stack.push(2.0);
   },
-  
+
   dconst_0: (frame) => {
     frame.stack.push(0.0);
   },
   dconst_1: (frame) => {
     frame.stack.push(1.0);
   },
-  
+
   aconst_null: (frame) => {
     frame.stack.push(null);
   },
   ldc2_w: (frame, instruction) => {
     const value = instruction.arg;
-    if (typeof value === 'string' && value.endsWith('L')) {
+    if (typeof value === "string" && value.endsWith("L")) {
       frame.stack.push(BigInt(value.slice(0, -1)));
-    } else if (typeof value === 'object' && value !== null) {
+    } else if (typeof value === "object" && value !== null) {
       // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Double"})
       frame.stack.push(value.value);
     } else {
