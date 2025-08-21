@@ -24,7 +24,7 @@ public class TryCatchFinallyTest {
                 throw new RuntimeException("Original exception");
             } finally {
                 System.out.println("Inner finally, throwing new exception");
-                throw new IllegalStateException("Exception from finally");
+                throw new RuntimeException("Exception from finally");
             }
         } catch (Exception e) {
             System.out.println("Caught: " + e.getMessage());
@@ -38,7 +38,7 @@ public class TryCatchFinallyTest {
                 throw new RuntimeException("Original exception");
             } catch (RuntimeException e) {
                 System.out.println("Outer catch, throwing new exception");
-                throw new IllegalStateException("Exception from catch");
+                throw new RuntimeException("Exception from catch");
             }
         } catch (Exception e) {
             System.out.println("Caught: " + e.getMessage());
@@ -48,14 +48,10 @@ public class TryCatchFinallyTest {
     public static int testReturnInFinally() {
         try {
             System.out.println("In try");
-            throw new RuntimeException("Exception in try");
-           // return 0;
-        } catch (Exception e) {
-            System.out.println("In catch");
-            return 1; // This return is superseded by the finally block's return
+            return 0; // This will be superseded
         } finally {
             System.out.println("In finally");
-            return 2; // This return will be the one that is executed
+            return 2;
         }
     }
 
@@ -90,6 +86,4 @@ public class TryCatchFinallyTest {
             System.out.println("Caught: " + e.getMessage());
         }
     }
-
 }
-

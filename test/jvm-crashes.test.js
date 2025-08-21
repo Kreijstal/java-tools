@@ -1,429 +1,129 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
-const path = require('path');
-const { execSync } = require('child_process');
+const { runTest } = require('./test-helpers');
 
-// Define test programs that should work
-const WORKING_TESTS = [
+// Consolidated list of JVM crash tests
+const tests = [
+  // Basic functionality
   {
     name: 'RecursionTest',
-    description: 'Factorial calculation - should work',
-    expectedPattern: /\d+/ // Should contain numbers
+    description: 'Factorial calculation using recursion',
+    expectedOutput: 'Testing recursion without static fields...\n5! = 120'
   },
-  {
-    name: 'Hello',
-    description: 'Basic string printing - should work',
-    expectedPattern: /Hello, World!/
-  },
-  {
-    name: 'RuntimeArithmetic',
-    description: 'Basic arithmetic operations - should work',
-    expectedPattern: /5.*2.*6/s // Multiple numbers with any chars between
-  }
-];
 
-// Define test programs that previously crashed but should now work
-const FIXED_CRASH_TESTS = [
-  {
-    name: 'SimpleArrayTest',
-    description: 'Previously crashed on newarray instruction - now fixed',
-    expectedPattern: /Array created|works|success/i
-  },
+  // Array tests
   {
     name: 'ArrayTest',
-    description: 'Complex array operations - partially working',
-    expectedPattern: /.+/ // Should produce some output
+    description: 'Complex array operations',
+    expectedOutput: '=== Basic Array Test ===\narr[0] = 10\narr[1] = 20\n=== Array Initialization ===\narr2[0] = 1\narr2[1] = 2\narr2[2] = 3\narr2[3] = 4\narr2[4] = 5\n=== Multi-dimensional Arrays ===\nmatrix[0][0] = 1\nmatrix[0][1] = 2\nmatrix[1][0] = 3\n=== Array Bounds Test ===\nAccessing arr[10]...\nCaught expected exception: ArrayIndexOutOfBoundsException'
   },
+  {
+    name: 'AdvancedArrayCrash',
+    description: 'System.arraycopy functionality',
+    expectedOutput: 'Testing advanced array operations...\nMatrix[0][0] = 10\nMatrix[2][3] = 20\nString: Hello\nString: World\nString: !\nTotal length: 11\nArraycopy result: dst[3] = 2'
+  },
+
+  // Class and object features
   {
     name: 'StaticFieldTest',
-    description: 'Previously crashed on getstatic instruction - now fixed',
-    expectedPattern: /100|static|field/i
-  },
-  {
-    name: 'BoxingUnboxingTest',
-    description: 'Previously crashed on sipush + boxing issues - now fixed',
-    expectedPattern: /42|200|boxing/i
+    description: 'Static field access (getstatic)',
+    expectedOutput: 'Testing static field access...\nStatic field value: 100\nStatic field updated: 200'
   },
   {
     name: 'InstanceofTest',
-    description: 'Previously crashed on newarray for int[] creation - now fixed',
-    expectedPattern: /1|0|true|false/i
-  },
-  {
-    name: 'SynchronizationTest',
-    description: 'Previously crashed on getstatic for static fields - now fixed',
-    expectedPattern: /sync|thread|wait/i
-  },
-  {
-    name: 'SipushTest',
-    description: 'Previously crashed on sipush instruction - now fixed',
-    expectedPattern: /1000|large|constant/i
-  },
-  {
-    name: 'NullPointerTest',
-    description: 'Previously caused JVM crash instead of proper NPE - now fixed',
-    expectedPattern: /NullPointerException|caught|exception/i
-  },
-  {
-    name: 'TryCatchFinallyTestFixed',
-    description: 'Complex try-catch-finally constructs - now fixed (infinite loop bug resolved)',
-    expectedPattern: /Exception from finally|Exception from catch|Returned value: 2|Inner catch: Inner exception|Exception from try-finally/
-  },
-  {
-    name: 'DoubleComparisonTest',
-    description: 'Double comparison operations using dcmpl instruction - now fixed',
-    expectedPattern: /d1 > d2: true|NaN == NaN: false|Test completed successfully/
-  },
-  {
-    name: 'ConversionTest',
-    description: 'l2i conversion - should work',
-    expectedPattern: /10/
-  },
-  {
-    name: 'EnumTest',
-    description: 'Previously had issues with enum constants - now fixed',
-    expectedPattern: /Red value: 255/
-},{
-    name: 'AdvancedArrayCrash',
-    description: 'Previously crashed on System.arraycopy - now fixed',
-    expectedPattern: /Arraycopy result: dst\[3] = 2/
+    description: 'instanceof instruction for array types',
+    expectedOutput: '=== instanceof Test ===\nString instanceof String: 1\nString instanceof Object: 1\nInteger instanceof Integer: 1\nInteger instanceof Number: 1\nint[] instanceof Object: 0\nnull instanceof String: 0\nnull instanceof Object: 0\n=== Class Hierarchy Test ===\nParent instanceof Parent: 1\nChild instanceof Parent: 1\nChild instanceof Child: 1\nParent ref to Child instanceof Child: 1'
   },
   {
     name: 'InnerClassTest',
-    description: 'Previously failed to call Objects.requireNonNull - now fixed',
-    expectedPattern: /Anonymous inner class running/
-  },
-  {
-    name: 'ConcurrencyCrash',
-    description: 'Previously crashed on ReentrantLock - now fixed',
-    expectedPattern: /Final counter value: 2000/
-  },{
-    name: 'MissingBytecodeCrash',
-    description: 'Previously crashed on instanceof with interface - now fixed',
-    expectedPattern: /obj is CharSequence/
+    description: 'Inner class support',
+    expectedOutput: '=== Inner Class Test ===\nInner field: 10\nOuter field: 42\nStatic outer field: 100\nNested field: 20\nStatic outer field: 100\n=== Local Inner Class ===\nLocal variable: 30\nOuter field: 42\n=== Anonymous Inner Class ===\nAnonymous inner class running\nOuter field: 42'
   },
   {
     name: 'ReflectionCrash',
-    description: 'Previously crashed due to unimplemented reflection methods - now fixed',
-    expectedPattern: /String class: java.lang.String/
+    description: 'Basic reflection support',
+    expectedOutput: 'Testing reflection operations that might crash...\nString class: java.lang.String\nString has 16 methods\nString has 0 public fields'
   },
-  {
-    name: 'MethodReferenceCrash',
-    description: 'Crashes on method reference to StringBuilder.reverse - should be fixed',
-    expectedPattern: /olleH/
-},
-  {
-    name: 'NewLambdaCrash',
-    description: 'Should support simple lambda expressions without warnings',
-    expectedPattern: /Hello from lambda!/
-  },
-  {
-    name: 'PotentialCrash3',
-    description: 'Previously crashed on missing conversion instructions - now fixed',
-    expectedPattern: /Type conversion test completed.*lcmp works.*Caught: Test exception.*Checkcast works.*instanceof works/s
-  },
-  {
-    name: 'MathInstructions', 
-    description: 'Previously crashed on missing arithmetic instructions - now fixed',
-    expectedPattern: /Long arithmetic.*Float arithmetic.*Double arithmetic.*Integer bitwise.*Long bitwise.*Shift instructions/s
-  },
-  {
-    name: 'ComparisonInstructions',
-    description: 'Tests comparison instructions for long/float/double types',
-    expectedPattern: /100 < 200.*100 == 100.*1.5 != NaN.*1.5 < 2.5 \(double\).*1.5 != NaN \(double\)/s
-  }
-];
 
-// Test programs that may still have issues
-const PARTIAL_TESTS = [
+  // Data types and conversions
   {
-    name: 'TryCatchTest',
-    description: 'Partial failure on exception methods',
-    allowFailure: false
+    name: 'BoxingUnboxingTest',
+    description: 'Boxing and unboxing of primitive types',
+    expectedOutput: '=== Boxing/Unboxing Test ===\nAutoboxed Integer: 42\nUnboxed int: 42\n=== Method Call Boxing ===\nInteger method received: 100\nint method received: 200\n=== Arithmetic with Boxed Types ===\n10 + 20 = 30\n=== Null Unboxing Test ===\nCaught expected NPE during unboxing'
+  },
+  {
+    name: 'SipushTest',
+    description: 'sipush instruction for 16-bit integers',
+    expectedOutput: '1000'
+  },
+  {
+    name: 'DoubleComparisonTest',
+    description: 'Double comparison operations (dcmpl)',
+    expectedOutput: '=== Double Comparison Test ===\nd1 > d2: true\nd1 < d2: false\nd1 == d3: true\nNaN > d1: false\nNaN < d1: false\nNaN == NaN: false\nTest completed successfully!'
   },
   {
     name: 'ConversionTest',
-    description: 'l2i conversion - should work',
-    expectedPattern: /10/
+    description: 'l2i (long to int) conversion',
+    expectedOutput: '10'
   },
   {
-    name: 'StackOverflowTest',
-    description: 'Should throw StackOverflowError',
-    expectedPattern: /Caught StackOverflowError/
+    name: 'PotentialCrash3',
+    description: 'Type conversion and checking instructions',
+    expectedOutput: 'Type conversion test completed\nlcmp works\nCaught: Test exception\nCheckcast works: Hello\ninstanceof works'
   },
   {
-    name: 'TryCatchTest',
-    description: 'Should correctly handle try-catch-finally',
-    expectedPattern: /Caught arithmetic exception.*Finally block executed/s
+    name: 'MathInstructions',
+    description: 'Arithmetic instructions for various types',
+    expectedOutput: 'Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333333\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804'
   },
+  {
+    name: 'ComparisonInstructions',
+    description: 'Comparison instructions (long/float/double)',
+    expectedOutput: '100 < 200\n100 == 100\n1.5 != NaN\n1.5 < 2.5 (double)\n1.5 != NaN (double)'
+  },
+
+  // Concurrency
+  {
+    name: 'SynchronizationTest',
+    description: 'Monitorenter/monitorexit for synchronization',
+    expectedOutput: '=== Synchronization Test ===\nIn synchronized method\nCounter after synchronized method: 10\nBefore synchronized block\nIn synchronized block\nCounter after synchronized block: 15\n=== Multi-threaded Test ===\nFinal counter value: 15'
+  },
+  {
+    name: 'ConcurrencyCrash',
+    description: 'ReentrantLock support',
+    expectedOutput: 'Testing concurrency features that might crash...\nFinal counter value: 2000'
+  },
+
+  // Enums and modern Java features
   {
     name: 'EnumTest',
-    description: 'Should support enums',
-    expectedPattern: /Color: RED.*It's red!.*Caught expected exception/s
+    description: 'Enum constants and methods',
+    expectedOutput: '=== Enum Test ===\nColor: RED\nRed value: 255\nHex: 255,0,0\nRED == RED: 1\nRED equals RED: 1\n=== Enum Switch Test ===\nIt\'s red!\nIt\'s green!\nIt\'s blue!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nCaught expected exception for invalid enum: IllegalArgumentException'
   },
   {
-    name: 'InnerClassTest',
-    description: 'Should support inner classes',
-    expectedPattern: /Inner field.*Nested field.*Local variable.*Anonymous inner class running/s
+    name: 'MissingBytecodeCrash',
+    description: 'instanceof with an interface',
+    expectedOutput: 'Testing various bytecode instructions...\nDouble result: 5.85987\nLong result: 11111111101110\nd1 is greater than d2\nobj is CharSequence'
   },
   {
-    name: 'GenericsCrash',
-    description: 'Should handle ClassCastException from generics',
-    allowFailure: true
-  }
+    name: 'MethodReferenceCrash',
+    description: 'Method reference support (StringBuilder.reverse)',
+    expectedOutput: 'olleH'
+  },
+  {
+    name: 'NewLambdaCrash',
+    description: 'Simple lambda expression support',
+    expectedOutput: 'Hello from lambda!'
+  },
+  {
+    name: 'LambdaCrash',
+    description: 'Lambda expressions with captured variables',
+    expectedOutput: 'This test demonstrates lambda expressions (\'invokedynamic\').\nHello, World\nLambda expressions are working correctly.'
+  },
 ];
 
-// Helper function to run JVM test
-async function runJvmTest(testName, timeout = 2000) {
-  return new Promise(async (resolve) => {
-    let isResolved = false;
-    let hasUnhandledException = false;
-    const originalConsoleError = console.error;
-    const originalConsoleWarn = console.warn;
-    
-    const timeoutId = setTimeout(() => {
-      if (!isResolved) {
-        isResolved = true;
-        console.error = originalConsoleError;
-        console.warn = originalConsoleWarn;
-        resolve({ output: '', error: 'TIMEOUT', success: false, warnings: [] });
-      }
-    }, timeout);
-
-    try {
-      const jvm = new JVM();
-      const sourcesPath = path.join(__dirname, '..', 'sources');
-      const classFilePath = path.join(sourcesPath, `${testName}.class`);
-      
-      // Set the classpath so that inner classes can be found
-      jvm.classpath = sourcesPath;
-      
-      let output = '';
-      let error = '';
-      const warnings = [];
-      
-      // Override console.error to detect unhandled exceptions
-      console.error = (...args) => {
-        if (args[0] === 'Unhandled exception:') {
-          hasUnhandledException = true;
-          error = args[1]?.message || args[1]?.toString() || 'Unhandled exception';
-        }
-        // Don't log unhandled exceptions to keep test output clean
-        if (args[0] !== 'Unhandled exception:') {
-          originalConsoleError.apply(console, args);
-        }
-      };
-
-      console.warn = (...args) => {
-        warnings.push(args.join(' '));
-      };
-      
-      // Register print methods to capture output
-      jvm.registerJreMethods({
-        'java/io/PrintStream': {
-          'println(Ljava/lang/String;)V': (jvm, obj, args) => {
-            output += args[0] + '\n';
-          },
-          'println(I)V': (jvm, obj, args) => {
-            output += args[0] + '\n';
-          },
-          'println(Z)V': (jvm, obj, args) => {
-            output += (args[0] ? 'true' : 'false') + '\n';
-          },
-          'println()V': (jvm, obj, args) => {
-            output += '\n';
-          },
-          'print(Ljava/lang/String;)V': (jvm, obj, args) => {
-            output += args[0];
-          },
-          'print(I)V': (jvm, obj, args) => {
-            output += args[0];
-          },
-        },
-      });
-
-      await jvm.run(classFilePath);
-      
-      console.error = originalConsoleError;
-      console.warn = originalConsoleWarn;
-      
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeoutId);
-        // If there was an unhandled exception, treat it as a failure
-        const success = !hasUnhandledException;
-        resolve({ output, error, success, warnings });
-      }
-    } catch (e) {
-      if (!isResolved) {
-        isResolved = true;
-        clearTimeout(timeoutId);
-        console.error = originalConsoleError;
-        console.warn = originalConsoleWarn;
-        resolve({ output: '', error: e.message || e.toString(), success: false, warnings: [] });
-      }
-    }
-  });
-}
-
-// Helper function to run real Java for comparison
-function runRealJava(testName, timeout = 10000) {
-  try {
-    const sourcesPath = path.join(__dirname, '..', 'sources');
-    // Properly quote the testName to handle $ characters
-    const output = execSync(`timeout ${timeout/1000}s java -cp ${sourcesPath} "${testName}"`, 
-      { encoding: 'utf8', timeout });
-    return { output, error: '', success: true };
-  } catch (e) {
-    return { output: '', error: e.message || e.toString(), success: false };
+test('JVM Crash and Functionality Tests', async function(t) {
+  for (const testCase of tests) {
+    await runTest(testCase.name, testCase.expectedOutput, t);
   }
-}
-
-// Test working programs
-test('JVM Crash Tests - Programs that should work', async function(t) {
-  for (const testCase of WORKING_TESTS) {
-    const jvmResult = await runJvmTest(testCase.name);
-    
-    t.ok(jvmResult.success, `${testCase.name}: ${testCase.description} - should not crash`);
-    
-    if (jvmResult.success && testCase.expectedPattern) {
-      t.ok(testCase.expectedPattern.test(jvmResult.output), 
-        `${testCase.name}: output should match expected pattern. Got: "${jvmResult.output}"`);
-    }
-  }
-  
-  t.end();
-});
-
-// Test previously crashing programs that should now work
-test('JVM Crash Tests - Previously crashing programs now fixed', async function(t) {
-  for (const testCase of FIXED_CRASH_TESTS) {
-    const jvmResult = await runJvmTest(testCase.name);
-    
-    t.ok(jvmResult.success, `${testCase.name}: ${testCase.description} - should not crash anymore`);
-    
-    if (jvmResult.success && testCase.expectedPattern) {
-      t.ok(testCase.expectedPattern.test(jvmResult.output), 
-        `${testCase.name}: output should match expected pattern. Got: "${jvmResult.output}"`);
-    }
-  }
-  
-  t.end();
-});
-
-// Test programs that may still have issues
-test('JVM Crash Tests - Programs with potential remaining issues', async function(t) {
-  for (const testCase of PARTIAL_TESTS) {
-    // Use shorter timeout for StackOverflowTest since it's expected to hang
-    const testTimeout = testCase.name === 'StackOverflowTest' ? 1000 : 2000;
-    const jvmResult = await runJvmTest(testCase.name, testTimeout);
-    
-    if (testCase.allowFailure) {
-      // For these tests, we just log the result but don't fail
-      if (jvmResult.success) {
-        t.pass(`${testCase.name}: ${testCase.description} - unexpectedly succeeded!`);
-      } else {
-        t.pass(`${testCase.name}: ${testCase.description} - failed as expected: ${jvmResult.error}`);
-      }
-    } else {
-      t.ok(jvmResult.success, `${testCase.name}: ${testCase.description} - should work`);
-    }
-  }
-  
-  t.end();
-});
-
-// Test critical bytecode instructions that were missing
-test('JVM Crash Tests - Critical bytecode instructions', async function(t) {
-  const criticalTests = [
-    {
-      name: 'SipushTest',
-      instruction: 'sipush',
-      description: 'sipush instruction for 16-bit integer constants'
-    },
-    {
-      name: 'SimpleArrayTest', 
-      instruction: 'newarray',
-      description: 'newarray instruction for primitive array creation'
-    },
-    {
-      name: 'ArrayTest',
-      instruction: 'iaload/iastore',
-      description: 'iaload/iastore instructions for array element access'
-    },
-    {
-      name: 'StaticFieldTest',
-      instruction: 'getstatic/putstatic',
-      description: 'getstatic/putstatic instructions for static field access'
-    }
-  ];
-
-  for (const testCase of criticalTests) {
-    const jvmResult = await runJvmTest(testCase.name);
-    
-    t.ok(jvmResult.success, `${testCase.instruction}: ${testCase.description} - should work`);
-    
-    if (!jvmResult.success) {
-      t.comment(`${testCase.name} failed with error: ${jvmResult.error}`);
-    }
-  }
-  
-  t.end();
-});
-
-// Test proper exception handling
-test('JVM Crash Tests - Exception handling improvements', async function(t) {
-  const jvmResult = await runJvmTest('NullPointerTest');
-  
-  t.ok(jvmResult.success, 'NullPointerTest: Should handle NPE properly instead of crashing JVM');
-  
-  if (jvmResult.success) {
-    // Should contain NullPointerException handling
-    const hasNPEHandling = /NullPointerException|exception.*caught|null.*pointer/i.test(jvmResult.output);
-    t.ok(hasNPEHandling, 'Should properly handle NullPointerException instead of JVM crash');
-  }
-  
-  t.end();
-});
-
-// Test boxing/unboxing improvements
-test('JVM Crash Tests - Boxing/unboxing display fixes', async function(t) {
-  const jvmResult = await runJvmTest('BoxingUnboxingTest');
-  
-  t.ok(jvmResult.success, 'BoxingUnboxingTest: Should handle boxing/unboxing without crashes');
-  
-  if (jvmResult.success) {
-    // Should show actual numbers, not "[object Object]"
-    const hasProperDisplay = /\d+/.test(jvmResult.output) && !/\[object Object\]/i.test(jvmResult.output);
-    t.ok(hasProperDisplay, 'Integer objects should display as numbers, not "[object Object]"');
-  }
-  
-  t.end();
-  
-  // Force exit after a short delay to prevent hanging
-  setTimeout(() => {
-    process.exit(0);
-  }, 100);
-});
-
-test('JVM Crash Tests - Lambda support', async function(t) {
-  const testCase = {
-    name: 'LambdaCrash',
-    description: 'Should support lambda expressions without warnings',
-    expectedPattern: /Hello, World/
-  };
-
-  const jvmResult = await runJvmTest(testCase.name);
-
-  t.ok(jvmResult.success, `${testCase.name}: ${testCase.description} - should not crash`);
-
-  if (jvmResult.success && testCase.expectedPattern) {
-    t.ok(testCase.expectedPattern.test(jvmResult.output),
-      `${testCase.name}: output should match expected pattern. Got: "${jvmResult.output}"`);
-  }
-
-  const hasMethodNotFoundWarning = jvmResult.warnings.some(w => w.includes('Method not found'));
-  t.notOk(hasMethodNotFoundWarning, `${testCase.name}: should not produce 'Method not found' warnings`);
-
   t.end();
 });

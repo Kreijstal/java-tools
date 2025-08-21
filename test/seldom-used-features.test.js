@@ -1,212 +1,181 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
-const path = require('path');
-const { execSync } = require('child_process');
+const { runTest } = require('./test-helpers');
 
-// Test cases for seldom-used Java features
 const SELDOM_USED_FEATURE_TESTS = [
   {
     name: 'MethodHandlesTest',
-    description: 'MethodHandles and MethodType - advanced reflection',
-    expectedDifferences: ['Missing MethodHandles JRE implementation'],
-    allowFailure: true
+    description: 'MethodHandles and MethodType - should pass',
+    shouldFail: false,
+    // TODO: This test is expected to fail until MethodHandles are implemented in the JVM.
+    expectedOutput: `=== Method Handles Test ===
+Invoking static method via MethodHandle:
+Static method called: Hello from MethodHandle!
+Invoking instance method via MethodHandle:
+Result: Instance method called with: 42
+Field access via MethodHandle:
+Field value: 100`
   },
   {
     name: 'AnnotationReflectionTest',
-    description: 'Annotation processing with reflection',
-    expectedDifferences: ['Missing annotation reflection methods'],
-    allowFailure: true
+    description: 'Annotation processing with reflection - should pass',
+    shouldFail: false,
+    // TODO: This test is expected to fail until annotation reflection is fully implemented.
+    expectedOutput: `=== Annotation Reflection Test ===
+Class annotations:
+No class annotation found
+Field annotations:
+Field annotation: field, 10
+Method annotations:
+Method annotation: method, 99
+Method result: Processed`
   },
   {
     name: 'TryWithResourcesTest',
-    description: 'Try-with-resources and suppressed exceptions',
-    expectedDifferences: ['Missing addSuppressed method'],
-    allowFailure: true
+    description: 'Try-with-resources and suppressed exceptions - should pass',
+    shouldFail: false,
+    // TODO: This test is expected to fail until try-with-resources is fully implemented.
+    expectedOutput: `=== Try-With-Resources Test ===
+Single resource:
+Created resource: Resource1
+Working with resource: Resource1
+Work completed successfully
+Closing resource: Resource1
+Multiple resources:
+Created resource: Resource1
+Created resource: Resource2
+Multiple resources work completed
+Closing resource: Resource2
+Closing resource: Resource1
+Exception handling:
+Created resource: FailingResource
+Working with resource: FailingResource
+Closing resource: FailingResource
+Caught exception: Exception in try block
+Suppressed exceptions: 1
+  - Failed to close FailingResource`
   },
   {
     name: 'MultiCatchTest',
-    description: 'Multi-catch exception handling',
-    expectedDifferences: ['Missing ArrayIndexOutOfBoundsException handling', 'Missing getClass method'],
-    allowFailure: true
+    description: 'Multi-catch exception handling - should pass',
+    shouldFail: false,
+    expectedOutput: `=== Multi-Catch Exception Test ===
+Test case 1:
+Caught multi-catch exception: ArithmeticException
+Message: / by zero
+Finally block executed for test case 1
+
+Test case 2:
+Caught multi-catch exception: ArrayIndexOutOfBoundsException
+Message: Index 10 out of bounds for length 3
+Finally block executed for test case 2
+
+Test case 3:
+Caught multi-catch exception: NullPointerException
+Message: Cannot invoke "String.length()" because "<local4>" is null
+Finally block executed for test case 3
+
+Test case 4:
+Normal execution - no exception
+Finally block executed for test case 4`
   },
   {
     name: 'VarargsGenericTest',
-    description: 'Varargs with generic types',
-    expectedDifferences: [],
-    allowFailure: false  // Fixed! ifle instruction implemented
+    description: 'Varargs with generic types - should pass',
+    shouldFail: false,
+    expectedOutput: `=== Varargs with Generics Test ===
+Simple varargs:
+Received 3 items:
+  - apple
+  - banana
+  - cherry
+Generic varargs:
+Generic items (type: String):
+  - first
+  - second
+  - third
+Generic items (type: Integer):
+  - 1
+  - 2
+  - 3
+  - 4
+  - 5
+Varargs with arrays:
+Received 2 items:
+  - orange
+  - grape
+Safe varargs:
+Safe varargs method with 3 items:
+  - safe1
+  - safe2
+  - safe3
+Mixed generic types:
+Processing 4 mixed items:
+  - Process (type: String)
+  - 42 (type: Integer)
+  - true (type: Boolean)
+  - 3.14 (type: Double)`
   },
   {
     name: 'StaticInitializationTest',
-    description: 'Static initialization block ordering',
-    expectedDifferences: ['Static initialization order may differ'],
-    allowFailure: false  // This one works!
+    description: 'Static initialization block ordering - should pass',
+    shouldFail: false,
+    expectedOutput: `Static block 1 executed
+Initializing CONSTANT2
+Static block 2 executed
+=== Static Initialization Order Test ===
+CONSTANT1: First constant
+Counter after static blocks: 35
+Dynamic value: Initialized in static block 1 and modified in static block 2
+CONSTANT2: Second constant (counter was 15)
+Creating first instance...
+Instance initialization block executed
+Constructor executed
+Instance field: Instance field: First constant (modified in instance block) (modified in constructor)
+Creating second instance...
+Instance initialization block executed
+Constructor executed
+Instance field: Instance field: First constant (modified in instance block) (modified in constructor)
+Calling static method...
+Static method called, counter = 35`
   },
   {
     name: 'JaggedArrayTest',
-    description: 'Jagged (non-rectangular) multi-dimensional arrays',
-    expectedDifferences: [],
-    allowFailure: false  // This one works!
+    description: 'Jagged (non-rectangular) multi-dimensional arrays - should pass',
+    shouldFail: false,
+    expectedOutput: `=== Jagged Array Test ===
+Basic jagged array:
+Row 0: 1 2 3 4
+Row 1: 5 6
+Row 2: 7 8 9
+Jagged array with direct initialization:
+Row 0: 10 20 30
+Row 1: 40 50
+Row 2: 60 70 80 90 100
+3D jagged array:
+Level 0:
+Row 0: 1 2
+Row 1: 3 4 5
+Level 1:
+Row 0: 6
+Row 1: 7 8 9
+Row 2: 10 11
+Array with null subarrays:
+Row 0: hello world
+Row 1: null
+Row 2: java test
+Dynamic jagged array:
+Row 0: 10
+Row 1: 20 21
+Row 2: 30 31 32
+Row 3: 40 41 42 43`
   }
 ];
 
-// Helper function to run real Java for comparison
-function runRealJava(testName, timeout = 10000) {
-  try {
-    const sourcesPath = path.join(__dirname, '..', 'sources');
-    // Properly quote the testName to handle $ characters
-    const output = execSync(`timeout ${timeout/1000}s java -cp ${sourcesPath} "${testName}"`, 
-      { encoding: 'utf8', timeout });
-    return { output, error: '', success: true };
-  } catch (e) {
-    return { output: '', error: e.message || e.toString(), success: false };
-  }
-}
-
-// Helper function to run JVM test
-async function runJvmTest(testName, timeout = 5000) {
-  return new Promise(async (resolve) => {
-    let isResolved = false;
-    let hasUnhandledException = false;
-    const originalConsoleError = console.error;
-    
-    const timeoutId = setTimeout(() => {
-      if (!isResolved) {
-        isResolved = true;
-        console.error = originalConsoleError;
-        resolve({ output: '', error: 'TIMEOUT', success: false });
-      }
-    }, timeout);
-
-    try {
-      const sourcesPath = path.join(__dirname, '..', 'sources');
-      const jvm = new JVM({ classpath: sourcesPath });
-      const classFilePath = path.join(sourcesPath, `${testName}.class`);
-      
-      let output = '';
-      let error = '';
-      
-      // Override console.error to detect unhandled exceptions
-      console.error = (...args) => {
-        if (args[0] === 'Unhandled exception:') {
-          hasUnhandledException = true;
-          error = args[1]?.message || args[1]?.toString() || 'Unhandled exception';
-        }
-        // Don't log unhandled exceptions to keep test output clean
-        if (args[0] !== 'Unhandled exception:') {
-          originalConsoleError.apply(console, args);
-        }
-      };
-      
-      // Register print methods to capture output
-      jvm.registerJreMethods({
-        'java/io/PrintStream': {
-          'println(Ljava/lang/String;)V': (jvm, obj, args) => {
-            output += args[0] + '\n';
-          },
-          'println(I)V': (jvm, obj, args) => {
-            output += args[0] + '\n';
-          },
-          'println(Z)V': (jvm, obj, args) => {
-            output += (args[0] ? 'true' : 'false') + '\n';
-          },
-          'println()V': (jvm, obj, args) => {
-            output += '\n';
-          },
-          'print(Ljava/lang/String;)V': (jvm, obj, args) => {
-            output += args[0];
-          },
-          'print(I)V': (jvm, obj, args) => {
-            output += args[0];
-          },
-          'print(Z)V': (jvm, obj, args) => {
-            output += (args[0] ? 'true' : 'false');
-          }
-        }
-      });
-
-      await jvm.run(classFilePath);
-      
-      clearTimeout(timeoutId);
-      if (!isResolved) {
-        isResolved = true;
-        console.error = originalConsoleError;
-        resolve({ 
-          output: output.trim(), 
-          error: hasUnhandledException ? error : '', 
-          success: !hasUnhandledException 
-        });
-      }
-      
-    } catch (e) {
-      clearTimeout(timeoutId);
-      if (!isResolved) {
-        isResolved = true;
-        console.error = originalConsoleError;
-        resolve({ output: '', error: e.message || e.toString(), success: false });
-      }
-    }
-  });
-}
-
-// Test seldom-used Java features
-test('Seldom-used Java Features - Comparison between jvm.js and real Java', async function(t) {
+test('Seldom-used Java Features', async function(t) {
   for (const testCase of SELDOM_USED_FEATURE_TESTS) {
-    console.log(`\n=== Testing ${testCase.name} ===`);
-    
-    // Run with real Java
-    const javaResult = runRealJava(testCase.name);
-    console.log('Real Java output:', javaResult.output.substring(0, 200) + (javaResult.output.length > 200 ? '...' : ''));
-    
-    // Run with jvm.js
-    const jvmResult = await runJvmTest(testCase.name);
-    console.log('jvm.js output:', jvmResult.output.substring(0, 200) + (jvmResult.output.length > 200 ? '...' : ''));
-    
-    if (jvmResult.error) {
-      console.log('jvm.js error:', jvmResult.error);
-    }
-    
-    if (testCase.allowFailure) {
-      // For tests that are expected to fail, just document the difference
-      t.comment(`${testCase.name}: Expected differences found - ${testCase.expectedDifferences.join(', ')}`);
-      t.ok(true, `${testCase.name}: Documented expected failure`);
-    } else {
-      // For tests that should work, compare outputs
-      t.ok(jvmResult.success, `${testCase.name}: jvm.js should not crash`);
-      if (javaResult.success && jvmResult.success) {
-        // Normalize outputs for comparison (remove trailing whitespace differences)
-        const normalizeOutput = (output) => output.replace(/\s+$/g, '').replace(/\r\n/g, '\n');
-        const javaOutput = normalizeOutput(javaResult.output);
-        const jvmOutput = normalizeOutput(jvmResult.output);
-        
-        t.equal(jvmOutput, javaOutput, `${testCase.name}: Outputs should match`);
-      }
-    }
+    await runTest(testCase.name, testCase.expectedOutput, t, {
+      shouldFail: testCase.shouldFail
+    });
   }
-  
-  t.end();
-});
-
-// Test individual issues we identified
-test('Specific Missing JVM Features', function(t) {
-  t.comment('Missing JRE method implementations identified:');
-  t.comment('- java.lang.invoke.MethodHandles (complete package missing)');
-  t.comment('- java.lang.Class.isAnnotationPresent(Class)');
-  t.comment('- java.lang.Class.getAnnotation(Class)'); 
-  t.comment('- java.lang.RuntimeException.addSuppressed(Throwable)');
-  t.comment('- java.lang.Exception.getSuppressed()');
-  t.comment('- java.lang.Throwable.getClass()');
-  
-  t.comment('Missing JVM instructions identified:');
-  t.comment('- ifle (if less than or equal)');
-  t.comment('- ArrayIndexOutOfBoundsException needs proper JRE class');
-  t.comment('- NullPointerException needs proper JRE class');
-  
-  t.comment('Recently implemented JVM instructions:');
-  t.comment('- Type conversion instructions: l2f, l2d, f2i, f2l, f2d, d2i, d2l, d2f, i2b, i2c, i2s');
-  t.comment('- Constant instructions: fconst_0, fconst_1, fconst_2, dconst_0, dconst_1, lconst_0, lconst_1');
-  t.comment('- Arithmetic instructions: lrem, frem, drem, ineg, lneg, fneg, dneg');
-  t.comment('- Proper handling of NaN/Infinity in float/double conversions');
-  
-  t.ok(true, 'Documented missing features for implementation');
   t.end();
 });
