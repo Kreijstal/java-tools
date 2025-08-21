@@ -1,4 +1,4 @@
-.version 65 0
+.version 61 0
 .class public super ClassRenamingTestRunner
 .super java/lang/Object
 .method public <init> : ()V
