@@ -1,3 +1,16 @@
+// Helper function to extract numeric value from typed or primitive values
+function extractNumericValue(value) {
+  if (typeof value === 'object' && value !== null && typeof value.value === 'number') {
+    return value.value;
+  }
+  return value;
+}
+
+// Helper function to create a typed result for float operations
+function createTypedResult(value, type) {
+  return { value: value, type: type };
+}
+
 module.exports = {
   iadd: (frame) => {
     const value2 = frame.stack.pop();
@@ -142,70 +155,84 @@ module.exports = {
   fadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 + value2);
+    const result = extractNumericValue(value1) + extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Float'));
   },
   fsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 - value2);
+    const result = extractNumericValue(value1) - extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Float'));
   },
   fmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 * value2);
+    const result = extractNumericValue(value1) * extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Float'));
   },
   fdiv: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 / value2);
+    const result = extractNumericValue(value1) / extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Float'));
   },
   frem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 % value2);
+    const result = extractNumericValue(value1) % extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Float'));
   },
   fneg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(-value);
+    const result = -extractNumericValue(value);
+    frame.stack.push(createTypedResult(result, 'Float'));
   },
   dadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 + value2);
+    const result = extractNumericValue(value1) + extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Double'));
   },
   dsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 - value2);
+    const result = extractNumericValue(value1) - extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Double'));
   },
   dmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 * value2);
+    const result = extractNumericValue(value1) * extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Double'));
   },
   ddiv: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 / value2);
+    const result = extractNumericValue(value1) / extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Double'));
   },
   drem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 % value2);
+    const result = extractNumericValue(value1) % extractNumericValue(value2);
+    frame.stack.push(createTypedResult(result, 'Double'));
   },
   dneg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(-value);
+    const result = -extractNumericValue(value);
+    frame.stack.push(createTypedResult(result, 'Double'));
   },
   // Comparison instructions
   dcmpl: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    if (isNaN(value1) || isNaN(value2)) {
+    const num1 = extractNumericValue(value1);
+    const num2 = extractNumericValue(value2);
+    if (isNaN(num1) || isNaN(num2)) {
       frame.stack.push(-1); // NaN bias towards -1
-    } else if (value1 < value2) {
+    } else if (num1 < num2) {
       frame.stack.push(-1);
-    } else if (value1 > value2) {
+    } else if (num1 > num2) {
       frame.stack.push(1);
     } else {
       frame.stack.push(0);
@@ -214,11 +241,13 @@ module.exports = {
   dcmpg: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    if (isNaN(value1) || isNaN(value2)) {
+    const num1 = extractNumericValue(value1);
+    const num2 = extractNumericValue(value2);
+    if (isNaN(num1) || isNaN(num2)) {
       frame.stack.push(1); // NaN bias towards 1
-    } else if (value1 < value2) {
+    } else if (num1 < num2) {
       frame.stack.push(-1);
-    } else if (value1 > value2) {
+    } else if (num1 > num2) {
       frame.stack.push(1);
     } else {
       frame.stack.push(0);
@@ -227,11 +256,13 @@ module.exports = {
   fcmpl: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    if (isNaN(value1) || isNaN(value2)) {
+    const num1 = extractNumericValue(value1);
+    const num2 = extractNumericValue(value2);
+    if (isNaN(num1) || isNaN(num2)) {
       frame.stack.push(-1); // NaN bias towards -1
-    } else if (value1 < value2) {
+    } else if (num1 < num2) {
       frame.stack.push(-1);
-    } else if (value1 > value2) {
+    } else if (num1 > num2) {
       frame.stack.push(1);
     } else {
       frame.stack.push(0);
@@ -240,11 +271,13 @@ module.exports = {
   fcmpg: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    if (isNaN(value1) || isNaN(value2)) {
+    const num1 = extractNumericValue(value1);
+    const num2 = extractNumericValue(value2);
+    if (isNaN(num1) || isNaN(num2)) {
       frame.stack.push(1); // NaN bias towards 1
-    } else if (value1 < value2) {
+    } else if (num1 < num2) {
       frame.stack.push(-1);
-    } else if (value1 > value2) {
+    } else if (num1 > num2) {
       frame.stack.push(1);
     } else {
       frame.stack.push(0);

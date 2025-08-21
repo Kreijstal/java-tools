@@ -21,7 +21,8 @@ module.exports = {
         frame.stack.push(jvm.internString(constant));
       } else if (typeof constant === 'object' && constant !== null && constant.value !== undefined) {
         // Handle typed constants from convert_tree.js (e.g., {value: 3.5, type: "Float"})
-        frame.stack.push(constant.value);
+        // Preserve the type information for proper formatting during string concatenation
+        frame.stack.push(constant);
       } else {
         frame.stack.push(constant);
       }
@@ -90,7 +91,8 @@ module.exports = {
       frame.stack.push(BigInt(value.slice(0, -1)));
     } else if (typeof value === 'object' && value !== null) {
       // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Double"})
-      frame.stack.push(value.value);
+      // Preserve the type information for proper formatting during string concatenation
+      frame.stack.push(value);
     } else {
       frame.stack.push(parseFloat(value));
     }

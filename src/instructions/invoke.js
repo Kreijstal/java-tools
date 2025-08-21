@@ -6,52 +6,52 @@ const { MethodHandle, MethodType, Lookup } = require('../jre/java/lang/invoke');
 const { ASYNC_METHOD_SENTINEL } = require('../constants');
 
 // Helper function to format numbers like Java does for string concatenation
-function javaNumberToString(num, recipe = '') {
-  if (typeof num !== 'number') return String(num);
-  
-  // Use recipe to determine context
-  const isFloatContext = recipe.includes('3.5') || recipe.includes('1.5') || recipe.includes('Float arithmetic');
-  const isDoubleContext = recipe.includes('10.5') || recipe.includes('2.5') || recipe.includes('Double arithmetic');
-  const isLongContext = recipe.includes('100') || recipe.includes('50') || recipe.includes('Long arithmetic');
-  
-  // For integer context (long operations, bitwise, shifts), format as integers
-  if (isLongContext || recipe.includes('Integer bitwise') || recipe.includes('Long bitwise') || 
-      recipe.includes('Shift instructions')) {
+function javaNumberToString(value) {
+  // Handle typed numeric values (preserves type from constant loading)
+  if (typeof value === 'object' && value !== null && typeof value.value === 'number' && value.type) {
+    const num = value.value;
+    const type = value.type;
+    
+    if (type === 'Float') {
+      // Convert to 32-bit float like Java
+      const float32 = new Float32Array(1);
+      float32[0] = num;
+      const javaFloat = float32[0];
+      
+      // If it's effectively a whole number, format with .0
+      if (Math.abs(javaFloat - Math.round(javaFloat)) < 1e-6) {
+        return Math.round(javaFloat) + '.0';
+      }
+      
+      // For non-integer floats, format with Java float precision
+      const str = javaFloat.toString();
+      if (str.includes('.') && str.length > 9) {
+        return parseFloat(javaFloat.toPrecision(8)).toString();
+      }
+      return str;
+    } else if (type === 'Double') {
+      // If it's effectively a whole number, format with .0
+      if (Math.abs(num - Math.round(num)) < 1e-10) {
+        return Math.round(num) + '.0';
+      }
+      // For non-integer doubles, keep as-is (JavaScript precision is fine for doubles)
+      return num.toString();
+    }
+    // For Integer and Long types, return as-is (no .0 suffix)
     return num.toString();
   }
   
-  // For float context
-  if (isFloatContext) {
-    // Convert to 32-bit float like Java
-    const float32 = new Float32Array(1);
-    float32[0] = num;
-    const javaFloat = float32[0];
-    
-    // If it's effectively a whole number, format with .0
-    if (Math.abs(javaFloat - Math.round(javaFloat)) < 1e-6) {
-      return Math.round(javaFloat) + '.0';
-    }
-    
-    // For non-integer floats, format with Java float precision
-    const str = javaFloat.toString();
-    if (str.includes('.') && str.length > 9) {
-      return parseFloat(javaFloat.toPrecision(8)).toString();
-    }
-    return str;
+  // Handle primitive numbers (integers, bigints)
+  if (typeof value === 'number') {
+    return value.toString();
   }
   
-  // For double context
-  if (isDoubleContext) {
-    // If it's effectively a whole number, format with .0
-    if (Math.abs(num - Math.round(num)) < 1e-10) {
-      return Math.round(num) + '.0';
-    }
-    // For non-integer doubles, keep as-is (JavaScript precision is fine for doubles)
-    return num.toString();
+  if (typeof value === 'bigint') {
+    return value.toString();
   }
   
-  // Default: if it's a whole number, don't add .0 (integer context)
-  return num.toString();
+  // Default fallback
+  return String(value);
 }
 
 // Helper function to auto-box primitives when needed
@@ -369,18 +369,14 @@ async function invokedynamic(frame, instruction, jvm, thread) {
         if (char === '\u0001') {
             const arg = dynamicArgs[argIndex++];
             // Debug: Log the argument to see what it actually is
-            if (jvm.verbose) {
-              console.log(`String concat arg ${argIndex-1}:`, arg, 'type:', typeof arg, 'constructor:', arg?.constructor?.name);
-            }
             
             // Convert Java objects to strings properly
-            if (arg && typeof arg === 'object' && arg.value !== undefined) {
+            if (typeof arg === 'number' || (typeof arg === 'object' && arg !== null && typeof arg.value === 'number' && arg.type)) {
+                // Handle primitive numbers and typed numeric values with Java-style formatting
+                result += javaNumberToString(arg);
+            } else if (arg && typeof arg === 'object' && arg.value !== undefined && typeof arg.value === 'string') {
                 // Java String object
                 result += arg.value;
-            } else if (typeof arg === 'number') {
-                // Handle primitive numbers with Java-style formatting
-                // Use the recipe to determine the context (float vs double vs int operations)
-                result += javaNumberToString(arg, recipe);
             } else if (typeof arg === 'bigint') {
                 // Handle long values
                 result += String(arg);
