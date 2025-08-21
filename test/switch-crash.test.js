@@ -13,6 +13,9 @@ async function runJvmTest(testName) {
             'println(I)V': (jvm, obj, args) => {
                 output += args[0] + '\n';
             },
+            'println(Ljava/lang/String;)V': (jvm, obj, args) => {
+                output += args[0] + '\n';
+            },
         },
     });
     await jvm.run(classFilePath);
@@ -21,6 +24,7 @@ async function runJvmTest(testName) {
 
 test('JVM Crash Tests - SwitchCrash', async function (t) {
     const output = await runJvmTest('SwitchCrash');
-    t.equal(output, '2\n4\n', 'SwitchCrash test should produce the correct output');
+    const expectedOutput = 'Testing tableswitch:\nCase 0\nCase 1\nCase 2\nDefault case\n\\nTesting lookupswitch:\nCase 10\n2\n4\nCase 100\n2\n4\nCase 1000\n2\n4\nDefault case\n2\n4\n';
+    t.equal(output, expectedOutput, 'SwitchCrash test should produce the correct output');
     t.end();
 });
