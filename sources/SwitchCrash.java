@@ -47,9 +47,9 @@ public class SwitchCrash {
 
         // "FB" and "Ea" have the same hash code, but are not equal.
         // This will test the `equals` method after the `lookupswitch`.
-        String value = "Ea";
+        String stringValue = "Ea";
         int result = -1;
-        switch (value) {
+        switch (stringValue) {
             case "FB":
                 result = 1;
                 break;
@@ -67,9 +67,9 @@ public class SwitchCrash {
 
         // Test with a value that is not in the switch, but has the same hash code as one of the cases.
         // "G!" also has the same hash code as "FB" and "Ea".
-        value = "G!";
+        stringValue = "G!";
         result = -1;
-        switch (value) {
+        switch (stringValue) {
             case "FB":
                 result = 1;
                 break;
