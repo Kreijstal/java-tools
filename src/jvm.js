@@ -441,7 +441,7 @@ class JVM {
     const mainThread = {
       id: 0,
   name: 'main',
-      callStack: new Stack(),
+      callStack: new Stack(this.maxStackDepth),
       status: 'runnable',
       pendingException: null,
     };
@@ -559,6 +559,7 @@ class JVM {
 
     const callStack = thread.callStack;
 
+
     if (callStack.size() > this.maxStackDepth) {
       const error = {
         type: 'java/lang/StackOverflowError',
@@ -595,6 +596,12 @@ class JVM {
     frame.pc++;
 
     try {
+      if (callStack.size() > this.maxStackDepth) {
+        throw {
+          type: 'java/lang/StackOverflowError',
+          message: 'Stack overflow',
+        };
+      }
       if (instruction) {
         await this.executeInstruction(instruction, frame, thread);
       }

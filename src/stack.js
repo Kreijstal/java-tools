@@ -1,10 +1,17 @@
 class Stack {
-  constructor() {
+  constructor(maxDepth = 1024) {
     this.items = [];
+    this.maxDepth = maxDepth;
   }
 
   // Push an item onto the stack
   push(item) {
+    if (this.items.length >= this.maxDepth) {
+      throw {
+        type: 'java/lang/StackOverflowError',
+        message: 'Stack overflow',
+      };
+    }
     this.items.push(item);
   }
 
