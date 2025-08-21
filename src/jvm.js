@@ -37,11 +37,11 @@ class JVM {
       this.jni.setVerbose(true);
     }
 
-    // Initialize method resolver with proper separation of concerns
+    // Method resolver is available for future architectural improvements
     this.methodResolver = new MethodResolver(this);
-    this.methodResolver.addResolver(new NativeMethodResolver(this));  // Check native methods first
-    this.methodResolver.addResolver(new JREMethodResolver(this));     // Then JRE methods  
-    this.methodResolver.addResolver(new UserClassMethodResolver(this)); // Finally user classes
+    this.methodResolver.addResolver(new NativeMethodResolver(this));  
+    this.methodResolver.addResolver(new JREMethodResolver(this));     
+    this.methodResolver.addResolver(new UserClassMethodResolver(this));
 
     if (options.jreOverrides) {
       this.registerJreOverrides(options.jreOverrides);
@@ -309,6 +309,79 @@ class JVM {
       console.warn(`Method not found in JRE: ${className}.${methodName}${descriptor}`);
     }
     return null;
+  }
+
+  // Delegate method for better architecture - replaces direct JRE access
+  findMethodByResolver(className, methodName, descriptor, obj, invokeType) {
+    // First try JNI methods
+    const nativeMethod = this.jni.findNativeMethod(className, methodName, descriptor);
+    if (nativeMethod) {
+      return nativeMethod;
+    }
+
+    // Then try JRE methods
+    if (this.jre[className]) {
+      let currentClass = this.jre[className];
+      while (currentClass) {
+        const methodKey = `${methodName}${descriptor}`;
+        
+        // Check instance methods
+        const method = currentClass.methods && currentClass.methods[methodKey];
+        if (method) {
+          return method;
+        }
+        
+        // Check static methods
+        const staticMethod = currentClass.staticMethods && currentClass.staticMethods[methodKey];
+        if (staticMethod) {
+          return staticMethod;
+        }
+        
+        currentClass = this.jre[currentClass.super];
+      }
+      
+      if (this.verbose && methodName !== '<clinit>') {
+        console.warn(`JRE method not found: ${className}.${methodName}${descriptor}`);
+      }
+      return null;
+    }
+
+    // Finally try user classes (but don't load new classes here for simplicity)
+    const workspaceEntry = this.classes[className];
+    if (workspaceEntry) {
+      const method = this.findMethod(workspaceEntry, methodName, descriptor);
+      if (method) {
+        // Return a wrapper that executes the bytecode method
+        return async (jvm, thisObj, args, thread) => {
+          const frame = new Frame(method, args);
+          frame.className = className;
+          
+          if (thisObj) {
+            frame.locals[0] = thisObj;
+          }
+
+          thread = thread || jvm.threads[jvm.currentThreadIndex];
+          thread.callStack.push(frame);
+        };
+      }
+    }
+
+    return null;
+  }
+
+  // Check if a class is handled by any resolver (replaces direct jvm.jre[className] checks)
+  hasClassInResolver(className) {
+    // Check JRE first
+    if (this.jre[className]) {
+      return true;
+    }
+    
+    // Check user classes
+    if (this.classes[className]) {
+      return true;
+    }
+    
+    return false;
   }
 
 

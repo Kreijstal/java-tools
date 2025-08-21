@@ -130,10 +130,12 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   // Handle arrays - they inherit from Object
   if (currentClassName && currentClassName.startsWith("[")) {
-    const jreMethod = jvm._jreFindMethod(
+    const jreMethod = jvm.findMethodByResolver(
       "java/lang/Object",
       methodName,
       descriptor,
+      boxedObj,
+      'virtual'
     );
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
@@ -152,9 +154,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   while (currentClassName) {
     let jreMethod = null;
-    if (jvm.jre[currentClassName]) {
-      jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
-    }
+    jreMethod = jvm.findMethodByResolver(currentClassName, methodName, descriptor, boxedObj, 'virtual');
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
 
@@ -226,7 +226,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
   // First, check for JRE/JNI methods. This handles both JRE static methods
   // and native methods on user classes.
-  const jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
+  const jreMethod = jvm.findMethodByResolver(className, methodName, descriptor, null, 'static');
   if (jreMethod) {
     const { params } = parseDescriptor(descriptor);
     const args = [];
@@ -284,9 +284,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
   const obj = frame.stack.pop();
 
   let jreMethod = null;
-  if (jvm.jre[className]) {
-    jreMethod = jvm._jreFindMethod(className, methodName, descriptor);
-  }
+  jreMethod = jvm.findMethodByResolver(className, methodName, descriptor, obj, 'special');
 
   if (jreMethod) {
     await jreMethod(jvm, obj, args);
@@ -504,13 +502,9 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   // For regular interface implementations, treat like invokevirtual
-  const jreClass = jvm.jre[boxedObj.type];
-  if (
-    jreClass &&
-    jreClass.methods &&
-    jreClass.methods[methodName + descriptor]
-  ) {
-    const result = jreClass.methods[methodName + descriptor](
+  const jreMethod = jvm.findMethodByResolver(boxedObj.type, methodName, descriptor, boxedObj, 'interface');
+  if (jreMethod) {
+    const result = jreMethod(
       jvm,
       boxedObj,
       args,
@@ -543,9 +537,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   let currentClassName = boxedObj.type;
   while (currentClassName) {
     let jreMethod = null;
-    if (jvm.jre[currentClassName]) {
-      jreMethod = jvm._jreFindMethod(currentClassName, methodName, descriptor);
-    }
+    jreMethod = jvm.findMethodByResolver(currentClassName, methodName, descriptor, boxedObj, 'virtual');
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
