@@ -1,85 +1,26 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
-const path = require('path');
+const { runTest } = require('./test-helpers');
 
-test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', async function(t) {
+test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', t => {
   t.plan(1);
-
-  const jvm = new JVM({ classpath: 'sources' });
-  const classFilePath = path.join(__dirname, '..', 'sources', 'RuntimeArithmetic.class');
-
-  let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream': {
-      'println(I)V': (jvm, obj, args, thread) => {
-        output += args[0] + '\n';
-      }
-    }
-  });
-
-  await jvm.run(classFilePath);
-
-  const expected = '5\n2\n6\n';
-  t.equal(output, expected, 'The JVM should correctly execute iadd, isub, and imul operations');
+  const expected = '5\n2\n6';
+  runTest('RuntimeArithmetic', expected, t);
 });
 
-test('JVM should execute VerySimple.class with subtraction', async function(t) {
+test('JVM should execute VerySimple.class with subtraction', t => {
   t.plan(1);
-
-  const jvm = new JVM({ classpath: 'sources' });
-  const classFilePath = path.join(__dirname, '..', 'sources', 'VerySimple.class');
-
-  let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream': {
-      'println(I)V': (jvm, obj, args, thread) => {
-        output += args[0] + '\n';
-      }
-    }
-  });
-  await jvm.run(classFilePath);
-
-  t.equal(output, '1\n', 'The JVM should correctly execute subtraction (3-2=1)');
+  runTest('VerySimple', '1', t);
 });
 
-test('JVM should execute SmallDivisionTest.class with division and remainder operations', async function(t) {
+test('JVM should execute SmallDivisionTest.class with division and remainder operations', t => {
   t.plan(1);
-
-  const jvm = new JVM({ classpath: 'sources' });
-  const classFilePath = path.join(__dirname, '..', 'sources', 'SmallDivisionTest.class');
-
-  let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream': {
-      'println(I)V': (jvm, obj, args, thread) => {
-        output += args[0] + '\n';
-      }
-    }
-  });
-
-  await jvm.run(classFilePath, { silent: true });
-
-  const expected = '2\n1\n2\n0\n';
-  t.equal(output, expected, 'The JVM should correctly execute idiv and irem operations');
+  const expected = '2\n1\n2\n0';
+  runTest('SmallDivisionTest', expected, t, { silent: true });
 });
 
-test('JVM should execute ConstantsTest.class with iconst instructions', async function(t) {
+test('JVM should execute ConstantsTest.class with iconst instructions', async t => {
   t.plan(3);
-
-  const jvm = new JVM({ classpath: 'sources' });
-  const classFilePath = path.join(__dirname, '..', 'sources', 'ConstantsTest.class');
-
-  let output = '';
-  jvm.registerJreMethods({
-    'java/io/PrintStream': {
-      'println(I)V': (jvm, obj, args, thread) => {
-        output += args[0] + '\n';
-      }
-    }
-  });
-
-  await jvm.run(classFilePath, { silent: true });
-
+  const { output } = await runTest('ConstantsTest', undefined, undefined, { silent: true });
   const lines = output.trim().split('\n');
   t.equal(lines[0], '0', 'iconst_0 should work correctly');
   t.equal(lines[1], '1', 'iconst_1 should work correctly');
