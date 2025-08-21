@@ -120,9 +120,74 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   // Check for null object reference
   if (boxedObj === null) {
+    // Try to find which local variable contains the null reference
+    let nullVariableInfo = "";
+    try {
+      const localVarTable = jvm._getLocalVariableTable(frame.method);
+      if (localVarTable) {
+        const currentPc = frame.pc - 1; // Current instruction index
+        const instructionItem = frame.instructions[currentPc];
+        const label = instructionItem?.labelDef;
+        const instructionPc = label
+          ? parseInt(label.substring(1, label.length - 1))
+          : -1;
+
+        if (jvm.verbose) {
+          console.log(
+            `DEBUG: NullPointerException at PC ${instructionPc}, frame.pc=${frame.pc}`,
+          );
+          console.log(`DEBUG: Local variable table:`, localVarTable);
+          console.log(`DEBUG: Frame locals:`, frame.locals);
+        }
+
+        if (instructionPc !== -1) {
+          // Find local variables active at this PC
+          const activeVariables = localVarTable.filter(
+            (entry) =>
+              instructionPc >= entry.start_pc && instructionPc < entry.end_pc,
+          );
+
+          if (jvm.verbose) {
+            console.log(
+              `DEBUG: Active variables at PC ${instructionPc}:`,
+              activeVariables,
+            );
+          }
+
+          // Check which local variables contain null values
+          const nullVariables = activeVariables.filter(
+            (entry) => frame.locals[entry.index] === null,
+          );
+
+          if (nullVariables.length > 0) {
+            const varInfo = nullVariables[0];
+            nullVariableInfo = ` because "${varInfo.name}" is null`;
+          } else {
+            // If no null local variable found, use slot-based information
+            for (let i = 0; i < frame.locals.length; i++) {
+              if (frame.locals[i] === null) {
+                nullVariableInfo = ` because "<local${i}>" is null`;
+                break;
+              }
+            }
+          }
+        }
+      }
+    } catch (e) {
+      // If anything fails, fall back to generic message
+      if (jvm.verbose) {
+        console.log(`DEBUG: Error in null variable detection:`, e);
+      }
+      nullVariableInfo = " because the object reference is null";
+    }
+
+    if (!nullVariableInfo) {
+      nullVariableInfo = " because the object reference is null";
+    }
+
     throw {
       type: "java/lang/NullPointerException",
-      message: `Cannot invoke "${className.substring(className.lastIndexOf("/") + 1)}.${methodName}()" because the object reference is null`,
+      message: `Cannot invoke "${className.substring(className.lastIndexOf("/") + 1)}.${methodName}()"${nullVariableInfo}`,
     };
   }
 
@@ -473,7 +538,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   if (boxedObj === null) {
     throw {
       type: "java/lang/NullPointerException",
-      message: "Attempted to invoke interface method on null object reference",
+      message: `Cannot invoke interface method "${methodName}()" because the object reference is null`,
     };
   }
 
