@@ -49,6 +49,13 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
   const obj = frame.stack.pop();
 
+  if (obj === undefined) {
+    throw {
+        type: 'java/lang/NullPointerException',
+        message: 'Stack is empty when calling virtual method'
+    };
+  }
+
   // Auto-box primitive if needed (when a primitive is being used as an object)
   let boxedObj = obj;
   if (typeof obj === 'number' || typeof obj === 'boolean') {

@@ -475,33 +475,38 @@ class JVM {
   async execute() {
     this.debugManager.resume();
 
-    while (!this.debugManager.isPaused) {
-      const result = await this.executeTick();
-      if (result.completed) {
-        this.debugManager.pause();
-        return { completed: true, paused: false };
-      }
+    try {
+      while (!this.debugManager.isPaused) {
+        const result = await this.executeTick();
+        if (result.completed) {
+          this.debugManager.pause();
+          return { completed: true, paused: false };
+        }
 
-      // Check for breakpoints
-      const currentThread = this.threads[this.currentThreadIndex];
-      if (currentThread && currentThread.status === 'runnable' && !currentThread.callStack.isEmpty()) {
-          const frame = currentThread.callStack.peek();
-          if (frame) {
-              // A thread's pc can be out of bounds if it just finished.
-              if (frame.pc < frame.instructions.length) {
-                const instructionItem = frame.instructions[frame.pc];
-                if (instructionItem) {
-                    const label = instructionItem.labelDef;
-                    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-                    if (this.debugManager.breakpoints.has(currentPc)) {
-                        this.debugManager.pause();
-                    }
+        // Check for breakpoints
+        const currentThread = this.threads[this.currentThreadIndex];
+        if (currentThread && currentThread.status === 'runnable' && !currentThread.callStack.isEmpty()) {
+            const frame = currentThread.callStack.peek();
+            if (frame) {
+                // A thread's pc can be out of bounds if it just finished.
+                if (frame.pc < frame.instructions.length) {
+                  const instructionItem = frame.instructions[frame.pc];
+                  if (instructionItem) {
+                      const label = instructionItem.labelDef;
+                      const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+                      if (this.debugManager.breakpoints.has(currentPc)) {
+                          this.debugManager.pause();
+                      }
+                  }
                 }
-              }
-          }
+            }
+        }
+        // Yield to the event loop to prevent blocking on long-running code without breakpoints
+        await new Promise(resolve => setImmediate(resolve));
       }
-      // Yield to the event loop to prevent blocking on long-running code without breakpoints
-      await new Promise(resolve => setImmediate(resolve));
+    } catch (e) {
+      this.debugManager.pause();
+      throw e;
     }
 
     return { paused: true, completed: false };
@@ -885,7 +890,7 @@ class JVM {
     const callStack = thread.callStack;
     if (callStack.isEmpty()) {
       console.error('Unhandled exception:', exception);
-      return;
+      throw exception;
     }
     const frame = callStack.peek();
 

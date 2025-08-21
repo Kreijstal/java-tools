@@ -2,18 +2,18 @@ const test = require('tape');
 const { runTest } = require('./test-helpers');
 
 test('JVM should execute RuntimeArithmetic.class with all arithmetic operations', t => {
-  t.plan(1);
+  t.plan(2);
   const expected = '5\n2\n6';
   runTest('RuntimeArithmetic', expected, t);
 });
 
 test('JVM should execute VerySimple.class with subtraction', t => {
-  t.plan(1);
+  t.plan(2);
   runTest('VerySimple', '1', t);
 });
 
 test('JVM should execute SmallDivisionTest.class with division and remainder operations', t => {
-  t.plan(1);
+  t.plan(2);
   const expected = '2\n1\n2\n0';
   runTest('SmallDivisionTest', expected, t, { silent: true });
 });
