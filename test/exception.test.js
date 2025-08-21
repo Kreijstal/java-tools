@@ -64,8 +64,8 @@ test('Exception Tests', async function(t) {
 
   t.test('JVM should handle StackOverflowError', async t => {
     // TODO: The JVM should throw a StackOverflowError, but it currently does not.
-    // This test is set to expect success to make the test suite pass.
+    // This test is set to expect failure to highlight the bug.
     t.plan(1);
-    await runTest('StackOverflowTest', undefined, t, { shouldFail: false });
+    await runTest('StackOverflowTest', undefined, t, { shouldFail: true });
   });
 });

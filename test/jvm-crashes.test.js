@@ -14,7 +14,7 @@ const tests = [
   {
     name: 'ArrayTest',
     description: 'Complex array operations',
-    expectedOutput: '=== Basic Array Test ===\narr[0] = 10\narr[1] = 20\n=== Array Initialization ===\narr2[0] = 1\narr2[1] = 2\narr2[2] = 3\narr2[3] = 4\narr2[4] = 5\n=== Multi-dimensional Arrays ===\nmatrix[0][0] = 1\nmatrix[0][1] = 2\nmatrix[1][0] = 3\n=== Array Bounds Test ===\nAccessing arr[10]...\nundefined'
+    expectedOutput: '=== Basic Array Test ===\narr[0] = 10\narr[1] = 20\n=== Array Initialization ===\narr2[0] = 1\narr2[1] = 2\narr2[2] = 3\narr2[3] = 4\narr2[4] = 5\n=== Multi-dimensional Arrays ===\nmatrix[0][0] = 1\nmatrix[0][1] = 2\nmatrix[1][0] = 3\n=== Array Bounds Test ===\nAccessing arr[10]...\nCaught expected exception: ArrayIndexOutOfBoundsException'
   },
   {
     name: 'AdvancedArrayCrash',
@@ -73,7 +73,7 @@ const tests = [
   {
     name: 'MathInstructions',
     description: 'Arithmetic instructions for various types',
-    expectedOutput: 'Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = [object Object][object Object]\n3.5 - 1.5 = NaN\n3.5 * 1.5 = NaN\n3.5 / 1.5 = NaN\n3.5 % 1.5 = NaN\nDouble arithmetic:\n10.5 + 2.5 = 13\n10.5 - 2.5 = 8\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804'
+    expectedOutput: 'Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333333\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804'
   },
   {
     name: 'ComparisonInstructions',

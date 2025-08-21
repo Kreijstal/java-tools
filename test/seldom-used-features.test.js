@@ -4,21 +4,55 @@ const { runTest } = require('./test-helpers');
 const SELDOM_USED_FEATURE_TESTS = [
   {
     name: 'MethodHandlesTest',
-    description: 'MethodHandles and MethodType - should fail gracefully',
-    shouldFail: true,
-    expectedError: 'Unsupported invokevirtual: java/lang/invoke/MethodHandles$Lookup.findStatic(Ljava/lang/Class;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;'
+    description: 'MethodHandles and MethodType - should pass',
+    shouldFail: false,
+    // TODO: This test is expected to fail until MethodHandles are implemented in the JVM.
+    expectedOutput: `=== Method Handles Test ===
+Invoking static method via MethodHandle:
+Static method called: Hello from MethodHandle!
+Invoking instance method via MethodHandle:
+Result: Instance method called with: 42
+Field access via MethodHandle:
+Field value: 100`
   },
   {
     name: 'AnnotationReflectionTest',
-    description: 'Annotation processing with reflection - should fail gracefully',
-    shouldFail: true,
-    expectedError: 'Stack underflow'
+    description: 'Annotation processing with reflection - should pass',
+    shouldFail: false,
+    // TODO: This test is expected to fail until annotation reflection is fully implemented.
+    expectedOutput: `=== Annotation Reflection Test ===
+Class annotations:
+No class annotation found
+Field annotations:
+Field annotation: field, 10
+Method annotations:
+Method annotation: method, 99
+Method result: Processed`
   },
   {
     name: 'TryWithResourcesTest',
-    description: 'Try-with-resources and suppressed exceptions - should fail gracefully',
-    shouldFail: true,
-    expectedError: 'Cannot read properties of undefined (reading \'type\')'
+    description: 'Try-with-resources and suppressed exceptions - should pass',
+    shouldFail: false,
+    // TODO: This test is expected to fail until try-with-resources is fully implemented.
+    expectedOutput: `=== Try-With-Resources Test ===
+Single resource:
+Created resource: Resource1
+Working with resource: Resource1
+Work completed successfully
+Closing resource: Resource1
+Multiple resources:
+Created resource: Resource1
+Created resource: Resource2
+Multiple resources work completed
+Closing resource: Resource2
+Closing resource: Resource1
+Exception handling:
+Created resource: FailingResource
+Working with resource: FailingResource
+Closing resource: FailingResource
+Caught exception: Exception in try block
+Suppressed exceptions: 1
+  - Failed to close FailingResource`
   },
   {
     name: 'MultiCatchTest',
@@ -31,11 +65,13 @@ Message: / by zero
 Finally block executed for test case 1
 
 Test case 2:
+Caught multi-catch exception: ArrayIndexOutOfBoundsException
+Message: Index 10 out of bounds for length 3
 Finally block executed for test case 2
 
 Test case 3:
 Caught multi-catch exception: NullPointerException
-Message: Attempted to invoke virtual method on null object reference
+Message: Cannot invoke "String.length()" because "<local4>" is null
 Finally block executed for test case 3
 
 Test case 4:
@@ -138,8 +174,7 @@ Row 3: 40 41 42 43`
 test('Seldom-used Java Features', async function(t) {
   for (const testCase of SELDOM_USED_FEATURE_TESTS) {
     await runTest(testCase.name, testCase.expectedOutput, t, {
-      shouldFail: testCase.shouldFail,
-      expectedError: testCase.expectedError
+      shouldFail: testCase.shouldFail
     });
   }
   t.end();
