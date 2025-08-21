@@ -21,6 +21,7 @@
   "license": "AGPLv3",
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
+    "decimal.js": "^10.4.3",
     "jszip": "^3.10.1",
     "jvm_parser": "^0.0.12",
     "parsimmon": "^1.18.1"
