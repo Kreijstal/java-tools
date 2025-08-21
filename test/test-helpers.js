@@ -3,7 +3,7 @@ const { JVM } = require('../src/jvm');
 
 async function runTest(className, expectedOutput, t, options = {}) {
   let output = '';
-  const { nativeMethods, shouldFail, ...jvmOptions } = options;
+  const { nativeMethods, shouldFail, expectedError, ...jvmOptions } = options;
   let success = true;
   let error = null;
 
@@ -73,6 +73,9 @@ async function runTest(className, expectedOutput, t, options = {}) {
   if (t) {
     if (shouldFail) {
       t.notOk(success, `${className} should fail as expected.`);
+      if (expectedError) {
+        t.equal(error.message, expectedError, `${className} should fail with the correct error message.`);
+      }
     } else {
       t.ok(success, `${className} should run without errors.`);
       if (expectedOutput !== undefined) {
