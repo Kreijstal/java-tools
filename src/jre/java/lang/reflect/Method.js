@@ -14,7 +14,13 @@ module.exports = {
       const methodData = methodObj._methodData;
       const { name, descriptor, flags } = methodData;
       const obj = args[0];
-      const methodArgs = args[1] ? args[1] : [];
+      const methodArgs = args[1];
+
+      if (obj === null && !flags.includes('static')) {
+        throw {
+          type: 'java/lang/NullPointerException'
+        };
+      }
 
       const isStatic = flags.includes('static');
 
@@ -23,27 +29,6 @@ module.exports = {
           type: 'java/lang/NullPointerException',
           message: `Cannot invoke instance method ${name} on a null object`,
         };
-      }
-
-      // For JRE method lookup, use the declaring class for static methods, otherwise use obj.type
-      let classNameForLookup;
-      if (isStatic) {
-        // Use the declaring class for static methods
-        const declaringClass = methodObj._declaringClass;
-        if (declaringClass && declaringClass._classData && declaringClass._classData.ast) {
-          classNameForLookup = declaringClass._classData.ast.classes[0].className;
-        }
-      } else {
-        // Use the object's type for instance methods
-        classNameForLookup = obj.type;
-      }
-
-      if (classNameForLookup) {
-        const jreMethod = jvm._jreFindMethod(classNameForLookup, name, descriptor);
-        if (jreMethod) {
-          const result = jreMethod(jvm, obj, methodArgs, jvm.threads[jvm.currentThreadIndex]);
-          return result;
-        }
       }
 
       const { params } = parseDescriptor(descriptor);
@@ -57,9 +42,6 @@ module.exports = {
       }
 
       const newFrame = new Frame(methodData);
-      if (methodData.className) {
-        newFrame.className = methodData.className; // Add className if available
-      }
       let localIndex = 0;
       if (!isStatic) {
         newFrame.locals[localIndex++] = obj;

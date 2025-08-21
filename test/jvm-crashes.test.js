@@ -165,11 +165,6 @@ const PARTIAL_TESTS = [
     name: 'InnerClassTest',
     description: 'Should support inner classes',
     expectedPattern: /Inner field.*Nested field.*Local variable.*Anonymous inner class running/s
-  },
-  {
-    name: 'GenericsCrash',
-    description: 'Should handle ClassCastException from generics',
-    allowFailure: true
   }
 ];
 

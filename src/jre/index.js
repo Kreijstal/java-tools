@@ -15,7 +15,6 @@ const jreClasses = {
   'java/lang/NullPointerException': require('./java/lang/NullPointerException'),
   'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException'),
   'java/lang/IllegalStateException': require('./java/lang/IllegalStateException'),
-  'java/lang/ReflectiveOperationException': require('./java/lang/ReflectiveOperationException'),
   'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException'),
   'java/lang/invoke/LambdaMetafactory': require('./java/lang/invoke/LambdaMetafactory'),
   'java/lang/invoke/StringConcatFactory': require('./java/lang/invoke/StringConcatFactory'),
@@ -48,11 +47,6 @@ const jreClasses = {
   'java/util/LinkedList': require('./java/util/LinkedList'),
   'java/util/Objects': require('./java/util/Objects'),
   'java/util/concurrent/locks/ReentrantLock': require('./java/util/concurrent/locks/ReentrantLock'),
-  'java/lang/Iterable': require('./java/lang/Iterable'),
-  'java/util/Collection': require('./java/util/Collection'),
-  'java/util/List': require('./java/util/List'),
-  'java/util/ArrayList': require('./java/util/ArrayList'),
-  'java/util/Iterator': require('./java/util/Iterator'),
 };
 
 module.exports = jreClasses;

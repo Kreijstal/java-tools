@@ -56,12 +56,5 @@ module.exports = {
         }
       };
     },
-    'hashCode()I': (jvm, obj, args) => {
-      let hash = 0;
-      for (let i = 0; i < obj.length; i++) {
-        hash = (31 * hash + obj.charCodeAt(i)) | 0;
-      }
-      return hash;
-    },
   },
 };

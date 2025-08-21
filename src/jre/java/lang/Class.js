@@ -140,9 +140,12 @@ module.exports = {
 
       return Object.values(allMethods);
     },
-    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': async (jvm, classObj, args) => {
-      const methodName = String(args[0]);
+    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
+      const methodName = args[0];
       const paramTypes = args[1];
+
+      const classData = classObj._classData;
+      const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
 
       const getDescriptor = (paramClass) => {
         if (!paramClass) return '';
@@ -162,38 +165,26 @@ module.exports = {
         const paramClassName = paramClass._classData.ast.classes[0].className;
         return `L${paramClassName};`;
       };
+
       const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;
+      const method = methods.find(m => {
+        const d = m.method.descriptor;
+        return m.method.name === methodName && d.substring(0, d.indexOf(')') + 1) === targetDescriptor;
+      });
 
-      let currentClass = classObj._classData;
-      while (currentClass) {
-        const methods = currentClass.ast.classes[0].items.filter(item => item.type === 'method');
-        const method = methods.find(m => {
-            const d = m.method.descriptor;
-            const sub = d.substring(0, d.indexOf(')') + 1);
-            return m.method.name === methodName && sub === targetDescriptor && m.method.flags.includes('public');
-        });
-
-        if (method) {
-            return {
-            type: 'java/lang/reflect/Method',
-            _methodData: method.method,
-            _declaringClass: { type: 'java/lang/Class', _classData: currentClass },
-            _annotations: method.method.annotations || [],
-            };
-        }
-
-        const superClassName = currentClass.ast.classes[0].superClassName;
-        if (superClassName) {
-            currentClass = await jvm.loadClassByName(superClassName);
-        } else {
-            currentClass = null;
-        }
+      if (method) {
+        return {
+          type: 'java/lang/reflect/Method',
+          _methodData: method.method,
+          _declaringClass: classObj,
+          _annotations: method.method.annotations || [],
+        };
+      } else {
+        throw {
+          type: 'java/lang/NoSuchMethodException',
+          message: methodName,
+        };
       }
-
-      throw {
-        type: 'java/lang/NoSuchMethodException',
-        message: methodName,
-      };
     },
     'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
       const methodNameObj = args[0];

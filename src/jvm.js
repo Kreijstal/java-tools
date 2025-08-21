@@ -102,27 +102,13 @@ class JVM {
 
               const jreClassDef = this.jre[className];
               const interfaces = (jreClassDef && jreClassDef.interfaces) ? jreClassDef.interfaces : [];
-              const methods = (jreClassDef && jreClassDef.methods) ? Object.keys(jreClassDef.methods).map(methodSig => {
-                const openParen = methodSig.indexOf('(');
-                const name = methodSig.substring(0, openParen);
-                const descriptor = methodSig.substring(openParen);
-                return {
-                  type: 'method',
-                  method: {
-                    name: name,
-                    descriptor: descriptor,
-                    flags: ['public'], // Assume public for JRE methods
-                    attributes: []
-                  }
-                };
-              }) : [];
 
               const classStub = {
                 ast: {
                   classes: [{
                     className: className,
                     superClassName: (jreClassDef && jreClassDef.super) || 'java/lang/Object',
-                    items: methods,
+                    items: [],
                     flags: ['public'],
                     interfaces: interfaces
                   }]
@@ -333,7 +319,6 @@ class JVM {
       // Execute the static initializer
       const thread = this.threads[this.currentThreadIndex];
       const frame = new Frame(staticInitializer.method, []);
-      frame.className = className; // Add className to the frame
       thread.callStack.push(frame);
       
       // Execute until the static initializer completes
@@ -454,7 +439,6 @@ class JVM {
     }
     
     const mainFrame = new Frame(mainMethod);
-    mainFrame.className = className; // Add className to the frame
     mainThread.callStack.push(mainFrame);
 
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
@@ -782,7 +766,6 @@ class JVM {
       const staticInitializer = this.findStaticInitializer(classData);
       if (staticInitializer) {
         const clinitFrame = new Frame(staticInitializer);
-        clinitFrame.className = className; // Add className to the frame
         thread.callStack.push(clinitFrame);
         // We pushed a bytecode initializer, so the calling instruction needs to be re-run.
         // We set the state to initialized here to prevent re-entry, but the <clinit>
@@ -969,7 +952,6 @@ class JVM {
           throw new Error(`Could not find method ${frameState.method.className}.${frameState.method.name}${frameState.method.descriptor} during deserialization.`);
         }
         const frame = new Frame(method);
-        frame.className = frameState.method.className; // Add className to the frame
         frame.pc = frameState.pc;
         frame.locals = frameState.locals;
         frame.stack.items = frameState.stack;
@@ -1163,86 +1145,7 @@ class JVM {
   continue() {}
   findVariableByName(name) { return null; }
   _getValueDescription(value) { return ''; }
-  getSourceLineMapping(pc, method) { 
-    if (!method || !method.name) return {};
-    
-    // Find the current method's class data
-    const thread = this.threads[this.currentThreadIndex];
-    if (!thread || thread.callStack.isEmpty()) return {};
-    
-    const frame = thread.callStack.peek();
-    if (!frame || frame.method.name !== method.name) return {};
-    
-    // Get the class name from the current execution context
-    const className = frame.className;
-    const classData = this.classes[className];
-    if (!classData || !classData.ast) return {};
-    
-    // Find the method in the class
-    const methodItem = classData.ast.classes[0].items.find(item => 
-      item.type === 'method' && 
-      item.method.name === method.name && 
-      item.method.descriptor === method.descriptor
-    );
-    
-    if (!methodItem || !methodItem.method.attributes) return {};
-    
-    // Find the code attribute
-    const codeAttr = methodItem.method.attributes.find(attr => attr.type === 'code');
-    if (!codeAttr || !codeAttr.code.attributes) return {};
-    
-    // Find the line number table
-    const lineTable = codeAttr.code.attributes.find(attr => attr.type === 'linenumbertable');
-    if (!lineTable || !lineTable.lines) return {};
-    
-    // Create a mapping from PC to line number
-    const pcToLineMap = {};
-    lineTable.lines.forEach(line => {
-      const pcValue = parseInt(line.label.substring(1)); // Remove 'L' prefix
-      pcToLineMap[pcValue] = parseInt(line.lineNumber);
-    });
-    
-    // Find the line number for the given PC
-    // If exact PC match isn't found, find the most recent line before this PC
-    let lineNumber = null;
-    let instructionLabel = null;
-    
-    if (pcToLineMap[pc] !== undefined) {
-      lineNumber = pcToLineMap[pc];
-      instructionLabel = `L${pc}`;
-    } else {
-      // Find the closest PC that is less than or equal to the current PC
-      let closestPc = -1;
-      for (const [pcStr, lineNum] of Object.entries(pcToLineMap)) {
-        const pcVal = parseInt(pcStr);
-        if (pcVal <= pc && pcVal > closestPc) {
-          closestPc = pcVal;
-          lineNumber = lineNum;
-          instructionLabel = `L${pcVal}`;
-        }
-      }
-    }
-    
-    if (lineNumber === null) return {};
-    
-    // Find the instruction at this PC
-    let instruction = null;
-    if (frame.instructions && frame.instructions[frame.pc]) {
-      const instructionItem = frame.instructions[frame.pc];
-      if (instructionItem.instruction) {
-        instruction = typeof instructionItem.instruction === 'string' 
-          ? instructionItem.instruction 
-          : (instructionItem.instruction.op || 'unknown');
-      }
-    }
-    
-    return {
-      line: lineNumber,
-      instruction: instruction || 'unknown',
-      pc: pc,
-      label: instructionLabel
-    };
-  }
+  getSourceLineMapping(pc, method) { return {}; }
   getSourceFileName(method) { return null; }
 
   getDisassemblyView() {
