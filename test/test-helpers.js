@@ -1,6 +1,31 @@
 const path = require("path");
 const { JVM } = require("../src/jvm");
 
+// Custom InputStream implementation that reads from provided input data
+class TestInputStream {
+  constructor(inputData = "") {
+    this.inputData = inputData;
+    this.inputIndex = 0;
+  }
+
+  read() {
+    if (this.inputIndex >= this.inputData.length) {
+      return -1; // End of stream
+    }
+    return this.inputData.charCodeAt(this.inputIndex++);
+  }
+}
+
+// Proper InputStream object that can be used by InputStreamReader
+function createTestInputStream(inputData = "") {
+  const testInputStream = new TestInputStream(inputData);
+  return {
+    type: "java/io/InputStream",
+    fields: {},
+    read: () => testInputStream.read(),
+  };
+}
+
 async function runTest(className, expectedOutput, t, options = {}) {
   let output = "";
   const { nativeMethods, shouldFail, expectedError, ...jvmOptions } = options;
@@ -72,8 +97,9 @@ async function runTest(className, expectedOutput, t, options = {}) {
               }
               systemClass.staticFields.set("err:Ljava/io/PrintStream;", err);
 
-              // Create a dummy InputStream for in
-              const inStream = { type: "java/io/InputStream", fields: {} };
+              // Create a proper InputStream for in that supports input data
+              const inputData = jvmOptions.inputData || "";
+              const inStream = createTestInputStream(inputData);
               systemClass.staticFields.set(
                 "in:Ljava/io/InputStream;",
                 inStream,

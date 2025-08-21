@@ -37,3 +37,4 @@ scripts/state.json
 
 jvm-debug.js.map
 jvm-debug.js
+test/temp*
