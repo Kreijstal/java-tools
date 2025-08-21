@@ -7,6 +7,12 @@ const dispatch = require('./instructions');
 const Frame = require('./frame');
 const DebugManager = require('./DebugManager');
 const JNI = require('./jni');
+const { 
+  MethodResolver, 
+  JREMethodResolver, 
+  NativeMethodResolver, 
+  UserClassMethodResolver 
+} = require('./MethodResolver');
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
@@ -30,6 +36,12 @@ class JVM {
     if (options.verbose) {
       this.jni.setVerbose(true);
     }
+
+    // Initialize method resolver with proper separation of concerns
+    this.methodResolver = new MethodResolver(this);
+    this.methodResolver.addResolver(new NativeMethodResolver(this));  // Check native methods first
+    this.methodResolver.addResolver(new JREMethodResolver(this));     // Then JRE methods  
+    this.methodResolver.addResolver(new UserClassMethodResolver(this)); // Finally user classes
 
     if (options.jreOverrides) {
       this.registerJreOverrides(options.jreOverrides);
