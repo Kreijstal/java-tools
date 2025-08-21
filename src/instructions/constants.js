@@ -18,7 +18,7 @@ module.exports = {
     } else {
       const constant = instruction.arg;
       if (typeof constant === 'string' || constant instanceof String) {
-        frame.stack.push(jvm.internString(constant.replace(/"/g, '')));
+        frame.stack.push(jvm.internString(constant));
       } else {
         frame.stack.push(constant);
       }

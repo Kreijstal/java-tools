@@ -31,6 +31,10 @@ class JVM {
       this.jni.setVerbose(true);
     }
 
+    if (options.jreOverrides) {
+      this.registerJreOverrides(options.jreOverrides);
+    }
+
     this._preloadJreClasses();
   }
 
