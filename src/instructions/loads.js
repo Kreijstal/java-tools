@@ -88,7 +88,7 @@ module.exports = {
     const index = frame.stack.pop();
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
-      throw new Error('NullPointerException');
+      throw { type: 'java/lang/NullPointerException', message: 'Cannot load from a null array reference.' };
     }
     if (index < 0 || index >= arrayRef.length) {
       throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
