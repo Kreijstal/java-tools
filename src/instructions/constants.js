@@ -19,6 +19,9 @@ module.exports = {
       const constant = instruction.arg;
       if (typeof constant === 'string' || constant instanceof String) {
         frame.stack.push(jvm.internString(constant));
+      } else if (typeof constant === 'object' && constant !== null && constant.value !== undefined) {
+        // Handle typed constants from convert_tree.js (e.g., {value: 3.5, type: "Float"})
+        frame.stack.push(constant.value);
       } else {
         frame.stack.push(constant);
       }

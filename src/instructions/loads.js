@@ -90,6 +90,9 @@ module.exports = {
     if (arrayRef === null) {
       throw new Error('NullPointerException');
     }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    }
     const value = arrayRef[index];
     frame.stack.push(value);
   },
@@ -98,6 +101,9 @@ module.exports = {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
       throw new Error('NullPointerException');
+    }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
     }
     const value = arrayRef[index];
     frame.stack.push(value);
@@ -108,6 +114,9 @@ module.exports = {
     if (arrayRef === null) {
       throw new Error('NullPointerException');
     }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    }
     const value = arrayRef[index];
     frame.stack.push(value);
   },
@@ -116,6 +125,9 @@ module.exports = {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
       throw new Error('NullPointerException');
+    }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
     }
     const value = arrayRef[index];
     frame.stack.push(value);
@@ -126,6 +138,9 @@ module.exports = {
     if (arrayRef === null) {
       throw new Error('NullPointerException');
     }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    }
     const value = arrayRef[index];
     frame.stack.push(value);
   },
@@ -135,6 +150,9 @@ module.exports = {
     if (arrayRef === null) {
       throw new Error('NullPointerException');
     }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    }
     const value = arrayRef[index];
     frame.stack.push(value);
   },
@@ -143,6 +161,9 @@ module.exports = {
     const arrayRef = frame.stack.pop();
     if (arrayRef === null) {
       throw new Error('NullPointerException');
+    }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
     }
     const value = arrayRef[index];
     frame.stack.push(value);

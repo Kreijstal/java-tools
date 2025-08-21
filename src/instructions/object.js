@@ -221,6 +221,9 @@ module.exports = {
         message: 'Attempted to access null array'
       };
     }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    }
     const value = arrayRef[index];
     frame.stack.push(value);
   },
@@ -232,6 +235,9 @@ module.exports = {
         type: 'java/lang/NullPointerException',
         message: 'Attempted to access null array'
       };
+    }
+    if (index < 0 || index >= arrayRef.length) {
+      throw { type: 'java/lang/ArrayIndexOutOfBoundsException', message: `Index ${index} out of bounds for length ${arrayRef.length}` };
     }
     const value = arrayRef[index];
     frame.stack.push(value);
