@@ -78,7 +78,7 @@ const tests = [
   {
     name: 'ComparisonInstructions',
     description: 'Comparison instructions (long/float/double)',
-    expectedOutput: '100 < 200\n100 == 100\n1.5 != NaN\n1.5 < 2.5 (double)\n1.5 != NaN (double)'
+    expectedOutput: '100 < 200\n100 == 100\n1.5 < 2.5\n1.5 != NaN\n1.5 < 2.5 (double)\n1.5 != NaN (double)'
   },
 
   // Concurrency

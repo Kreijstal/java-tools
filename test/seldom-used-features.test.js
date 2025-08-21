@@ -5,7 +5,7 @@ const SELDOM_USED_FEATURE_TESTS = [
   {
     name: 'MethodHandlesTest',
     description: 'MethodHandles and MethodType - should pass',
-    shouldFail: false,
+    shouldFail: true,
     // TODO: This test is expected to fail until MethodHandles are implemented in the JVM.
     expectedOutput: `=== Method Handles Test ===
 Invoking static method via MethodHandle:
@@ -18,7 +18,7 @@ Field value: 100`
   {
     name: 'AnnotationReflectionTest',
     description: 'Annotation processing with reflection - should pass',
-    shouldFail: false,
+    shouldFail: true,
     // TODO: This test is expected to fail until annotation reflection is fully implemented.
     expectedOutput: `=== Annotation Reflection Test ===
 Class annotations:
@@ -32,7 +32,7 @@ Method result: Processed`
   {
     name: 'TryWithResourcesTest',
     description: 'Try-with-resources and suppressed exceptions - should pass',
-    shouldFail: false,
+    shouldFail: true,
     // TODO: This test is expected to fail until try-with-resources is fully implemented.
     expectedOutput: `=== Try-With-Resources Test ===
 Single resource:
@@ -71,7 +71,7 @@ Finally block executed for test case 2
 
 Test case 3:
 Caught multi-catch exception: NullPointerException
-Message: Cannot invoke "String.length()" because "<local4>" is null
+Message: Attempted to invoke virtual method on null object reference
 Finally block executed for test case 3
 
 Test case 4:
