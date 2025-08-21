@@ -6,6 +6,7 @@ const { unparseDataStructures } = require('./convert_tree');
 const { assembleClasses } = require('./assembleAndRun');
 const { renameMethod } = require('./renameMethod');
 const { renameField } = require('./renameField');
+const { renameClass } = require('./renameClass');
 
 const {
   SymbolIdentifier,
@@ -202,14 +203,39 @@ class KrakatauWorkspace {
           if (attr.type === "code") {
             attr.code.codeItems.forEach((codeItem, codeItemIndex) => {
               if (codeItem.instruction && codeItem.instruction.arg) {
-                const arg = codeItem.instruction.arg;
-                if (Array.isArray(arg) && arg.length > 2 && Array.isArray(arg[2]) && arg[2].length >= 2) {
-                  const [fieldNameOrMethodName, descriptor] = arg[2];
-                  const parentClass = arg[1];
+                const instruction = codeItem.instruction;
+                const op = instruction.op;
+                const arg = instruction.arg;
 
+                if (op === 'new' || op === 'instanceof' || op === 'checkcast' || op === 'anewarray') {
+                    const referencedClass = arg;
+                    if (!this.referenceObj[referencedClass]) {
+                        this.referenceObj[referencedClass] = { children: new Map(), referees: [] };
+                    }
+                    this.referenceObj[referencedClass].referees.push({
+                        className: cls.className,
+                        astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
+                    });
+                } else if (op === 'multianewarray') {
+                    const referencedClass = arg[0];
+                    if (!this.referenceObj[referencedClass]) {
+                        this.referenceObj[referencedClass] = { children: new Map(), referees: [] };
+                    }
+                    this.referenceObj[referencedClass].referees.push({
+                        className: cls.className,
+                        astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
+                    });
+                } else if (Array.isArray(arg) && arg.length > 2 && Array.isArray(arg[2]) && arg[2].length >= 2) {
+                  const parentClass = arg[1];
                   if (!this.referenceObj[parentClass]) {
-                    this.referenceObj[parentClass] = { children: new Map(), referees: [] };
+                      this.referenceObj[parentClass] = { children: new Map(), referees: [] };
                   }
+                  this.referenceObj[parentClass].referees.push({
+                      className: cls.className,
+                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
+                  });
+
+                  const [fieldNameOrMethodName, descriptor] = arg[2];
                   if (!this.referenceObj[parentClass].children.has(fieldNameOrMethodName)) {
                     this.referenceObj[parentClass].children.set(fieldNameOrMethodName, {
                       descriptor: descriptor,
@@ -217,12 +243,10 @@ class KrakatauWorkspace {
                     });
                   }
                   
-                  // Double-check the structure exists before adding reference
                   const targetRef = this.referenceObj[parentClass].children.get(fieldNameOrMethodName);
                   if (targetRef && Array.isArray(targetRef.referees)) {
-                    // Store the reference with the className context (where the reference occurs)
                     targetRef.referees.push({ 
-                      className: cls.className, // This is the class making the reference
+                      className: cls.className,
                       astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
                     });
                   }
@@ -694,7 +718,7 @@ class KrakatauWorkspace {
       if (className.toLowerCase().includes(lowerQuery)) {
         results.push(new SymbolDefinition(
           new SymbolIdentifier(className),
-          new SymbolLocation(className, 'classes.0'),
+          new SymbolLocation(className, `classes.0`),
           'class',
           ast.classes[0].flags
         ));
@@ -838,6 +862,49 @@ class KrakatauWorkspace {
     assembleClasses(modifiedAsts, outputDir);
 
     console.log(`Successfully renamed ${symbolIdentifier.memberName} to ${newName} and saved ${modifiedClasses.size} affected files.`);
+  }
+
+  applyClassRenameAndSave(oldClassName, newClassName, outputDir = '.') {
+    // Step 1: Identify which class files will be modified by finding all references.
+    const modifiedClasses = new Set([oldClassName]);
+    const classRefs = this.findReferences(new SymbolIdentifier(oldClassName));
+    classRefs.forEach(ref => modifiedClasses.add(ref.className));
+    const constructorRefs = this.findReferences(new SymbolIdentifier(oldClassName, '<init>'));
+    constructorRefs.forEach(ref => modifiedClasses.add(ref.className));
+
+    // Step 2: Apply the rename operation to the in-memory ASTs.
+    renameClass(this, oldClassName, newClassName);
+
+    // Step 3: Reassemble the modified classes
+    const modifiedAsts = { classes: [], constantPools: [] };
+    for (const className of modifiedClasses) {
+      const astData = this.workspaceASTs[className] || this.workspaceASTs[newClassName];
+      if (astData) {
+        modifiedAsts.classes.push(astData.ast.classes[0]);
+        modifiedAsts.constantPools.push(astData.constantPool);
+      }
+    }
+    assembleClasses(modifiedAsts, outputDir);
+
+    // Step 4: Update workspace data structures and filesystem
+    const oldFilePath = this.classFilePaths[oldClassName];
+    if (oldFilePath && fs.existsSync(oldFilePath)) {
+        fs.unlinkSync(oldFilePath); // Delete the old class file
+    }
+
+    if (this.workspaceASTs[oldClassName]) {
+        this.workspaceASTs[newClassName] = this.workspaceASTs[oldClassName];
+        delete this.workspaceASTs[oldClassName];
+    }
+    if (this.classFilePaths[oldClassName]) {
+        const newFilePath = this.classFilePaths[oldClassName].replace(oldClassName + '.class', newClassName + '.class');
+        this.classFilePaths[newClassName] = newFilePath;
+        delete this.classFilePaths[oldClassName];
+    }
+
+    this._buildBasicReferenceGraph();
+
+    console.log(`Successfully renamed class ${oldClassName} to ${newClassName} and saved ${modifiedClasses.size} affected files.`);
   }
 
   /**
