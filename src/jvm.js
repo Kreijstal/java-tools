@@ -49,6 +49,7 @@ class JVM {
       'java/lang/CharSequence': 'java/lang/Object',
       'java/lang/ReflectiveOperationException': 'java/lang/Exception',
       'java/lang/NoSuchMethodException': 'java/lang/ReflectiveOperationException',
+      'java/io/IOException': 'java/lang/Exception',
       'java/io/Reader': 'java/lang/Object',
       'java/io/BufferedReader': 'java/io/Reader',
       'java/io/InputStreamReader': 'java/io/Reader',
@@ -61,6 +62,11 @@ class JVM {
       'java/io/ConsoleOutputStream': 'java/io/OutputStream',
       'java/net/URLConnection': 'java/lang/Object',
       'java/net/HttpURLConnection': 'java/net/URLConnection',
+      'java/net/URI': 'java/lang/Object',
+      'java/net/http/HttpClient': 'java/lang/Object',
+      'java/net/http/HttpRequest': 'java/lang/Object',
+      'java/net/http/HttpResponse': 'java/lang/Object',
+      'java/time/Duration': 'java/lang/Object',
       'java/util/function/Function': 'java/lang/Object',
     };
 
