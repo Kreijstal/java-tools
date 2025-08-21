@@ -42,6 +42,9 @@ module.exports = {
       }
 
       const newFrame = new Frame(methodData);
+      if (methodData.className) {
+        newFrame.className = methodData.className; // Add className if available
+      }
       let localIndex = 0;
       if (!isStatic) {
         newFrame.locals[localIndex++] = obj;

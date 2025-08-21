@@ -129,6 +129,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
       const method = jvm.findMethod(classData, methodName, descriptor);
       if (method) {
         const newFrame = new Frame(method);
+        newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = obj; // 'this'
         for (let i = 0; i < args.length; i++) {
           newFrame.locals[i+1] = args[i];
@@ -191,6 +192,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
     } else {
       // We found a bytecode method.
       const newFrame = new Frame(method);
+      newFrame.className = className; // Add className to the frame
       const { params } = parseDescriptor(descriptor);
       for (let i = params.length - 1; i >= 0; i--) {
         newFrame.locals[i] = frame.stack.pop();
@@ -239,6 +241,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
     const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
       const newFrame = new Frame(method);
+      newFrame.className = className; // Add className to the frame
       let localIndex = 0;
       newFrame.locals[localIndex++] = obj; // 'this'
       for (const arg of args) {
@@ -481,6 +484,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
       const method = jvm.findMethod(classData, methodName, descriptor);
       if (method) {
         const newFrame = new Frame(method);
+        newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = boxedObj; // 'this'
         for (let i = 0; i < args.length; i++) {
           newFrame.locals[i+1] = args[i];
