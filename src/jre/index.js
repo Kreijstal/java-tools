@@ -53,6 +53,7 @@ const jreClasses = {
   'java/util/List': require('./java/util/List'),
   'java/util/ArrayList': require('./java/util/ArrayList'),
   'java/util/Iterator': require('./java/util/Iterator'),
+  'java/math/BigDecimal': require('./java/math/BigDecimal'),
 };
 
 module.exports = jreClasses;
