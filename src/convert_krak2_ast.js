@@ -1,7 +1,17 @@
 function convertCodeItem(item) {
   if (!item) return null;
-  // The structure is already the same, so just pass through.
-  // We will need to handle instructions with args later.
+
+  if (item.instruction && (item.instruction.op === 'ldc' || item.instruction.op === 'ldc_w' || item.instruction.op === 'ldc2_w')) {
+    if (typeof item.instruction.arg === 'string' && item.instruction.arg.startsWith('"') && item.instruction.arg.endsWith('"')) {
+      try {
+        // Use JSON.parse to handle escapes correctly
+        item.instruction.arg = JSON.parse(item.instruction.arg);
+      } catch (e) {
+        // If parsing fails, leave it as is.
+      }
+    }
+  }
+
   return item;
 }
 
