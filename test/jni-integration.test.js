@@ -1,66 +1,50 @@
 const test = require('tape');
+const { runTest } = require('./test-helpers');
 const { JVM } = require('../src/jvm');
-const path = require('path');
 
 test('JNI Integration with Java Bytecode Execution', async (t) => {
-  const jvm = new JVM({ verbose: false });
-  
-  // Register the native methods that NativeTest.java expects
-  jvm.registerNativeMethod('NativeTest', 'nativeAdd', '(II)I', (jniEnv, thisObj, args) => {
-    return args[0] + args[1];
-  });
-  
-  jvm.registerNativeMethod('NativeTest', 'nativeGreeting', '(Ljava/lang/String;)Ljava/lang/String;', 
-    (jniEnv, thisObj, args) => {
-      const name = args[0].toString();
-      return jniEnv.internString(`Hello, ${name}!`);
-    }
-  );
-  
-  jvm.registerNativeMethod('NativeTest', 'nativeIsPrime', '(I)Z', (jniEnv, thisObj, args) => {
-    const n = args[0];
-    if (n <= 1) return false;
-    if (n <= 3) return true;
-    if (n % 2 === 0 || n % 3 === 0) return false;
-    
-    for (let i = 5; i * i <= n; i += 6) {
-      if (n % i === 0 || n % (i + 2) === 0) {
-        return false;
+  const nativeMethods = {
+    'NativeTest': [
+      {
+        name: 'nativeAdd',
+        descriptor: '(II)I',
+        impl: (jniEnv, thisObj, args) => args[0] + args[1]
+      },
+      {
+        name: 'nativeGreeting',
+        descriptor: '(Ljava/lang/String;)Ljava/lang/String;',
+        impl: (jniEnv, thisObj, args) => {
+          const name = args[0].toString();
+          return jniEnv.internString(`Hello, ${name}!`);
+        }
+      },
+      {
+        name: 'nativeIsPrime',
+        descriptor: '(I)Z',
+        impl: (jniEnv, thisObj, args) => {
+          const n = args[0];
+          if (n <= 1) return false;
+          if (n <= 3) return true;
+          if (n % 2 === 0 || n % 3 === 0) return false;
+          for (let i = 5; i * i <= n; i += 6) {
+            if (n % i === 0 || n % (i + 2) === 0) return false;
+          }
+          return true;
+        }
       }
-    }
-    return true;
-  });
-
-  // Capture process.stdout output since that's what System.out uses
-  let output = '';
-  const originalWrite = process.stdout.write;
-  process.stdout.write = (chunk) => {
-    output += chunk.toString();
-    return true;
+    ]
   };
 
-  try {
-    // Execute the Java class
-    const classPath = path.join(__dirname, '..', 'sources', 'NativeTest.class');
-    await jvm.run(classPath);
-    
-    // Restore stdout
-    process.stdout.write = originalWrite;
-    
-    // Verify the output contains expected results
-    t.ok(output.includes('=== Native Method Test ==='), 'Should print test header');
-    t.ok(output.includes('nativeAdd(5, 3) = 8'), 'Native addition should work correctly');
-    t.ok(output.includes('nativeGreeting("World") = Hello, World!'), 'Native string method should work');
-    t.ok(output.includes('nativeIsPrime(17) = true'), 'Native prime check should work');
-    t.ok(output.includes('=== Test Complete ==='), 'Should print test completion');
-    
-    console.log('=== JNI Integration Test Output ===');
-    console.log(output);
-    
-  } catch (error) {
-    process.stdout.write = originalWrite;
-    t.fail(`Execution failed: ${error.message}`);
-  }
+  const { output } = await runTest('NativeTest', undefined, undefined, { nativeMethods });
+
+  t.ok(output.includes('=== Native Method Test ==='), 'Should print test header');
+  t.ok(output.includes('nativeAdd(5, 3) = 8'), 'Native addition should work correctly');
+  t.ok(output.includes('nativeGreeting("World") = Hello, World!'), 'Native string method should work');
+  t.ok(output.includes('nativeIsPrime(17) = true'), 'Native prime check should work');
+  t.ok(output.includes('=== Test Complete ==='), 'Should print test completion');
+
+  console.log('=== JNI Integration Test Output ===');
+  console.log(output);
 
   t.end();
 });

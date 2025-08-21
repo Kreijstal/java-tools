@@ -357,7 +357,7 @@ function convertJson(inputJson, constantPool) {
                 arg = ["Class", ldcConstant.value];
                 break;
               case "String":
-                arg = JSON.stringify(ldcConstant.value);
+                arg = ldcConstant.value;
                 break;
               case "Long":
                 arg = ldcConstant.value.toString() + "L";
@@ -669,12 +669,12 @@ function formatInstructionKrakatau(instr, withComments = false) {
     return `${instr.op} ${instr.varnum} ${instr.incr}`;
   } else if (instr.op === "invokedynamic") {
     if (withComments) {
-        const argStr = formatInstructionArgKrakatau(instr.arg);
+        const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
         return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
     }
     return `${instr.op} [_${instr.cp_index}]`;
   } else if (instr.op === "invokespecial" || instr.op === "invokevirtual" || instr.op === "invokestatic" || instr.op === "invokeinterface") {
-    const argStr = formatInstructionArgKrakatau(instr.arg);
+    const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
     if (withComments) {
       if (instr.op === "invokeinterface") {
           return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
@@ -686,7 +686,7 @@ function formatInstructionKrakatau(instr, withComments = false) {
     }
     return `${instr.op} ${argStr}`;
   } else if (instr.op !== undefined && instr.arg !== undefined) {
-    const argStr = formatInstructionArgKrakatau(instr.arg);
+    const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
     if (instr.op === "invokeinterface" && instr.count !== undefined) {
       return `${instr.op} ${argStr} ${instr.count}`; // Include the count for invokeinterface
     } else {
@@ -776,20 +776,15 @@ function formatInstructionArg(arg) {
  * @param {*} arg - The argument to format
  * @returns {String} Krakatau-compatible formatted argument string
  */
-function formatInstructionArgKrakatau(arg) {
+function formatInstructionArgKrakatau(arg, opcode) {
   if (typeof arg === "string") {
-    // Apply Krakatau-compatible formatting for string constants
-    if (arg.startsWith('"') && arg.endsWith('"')) {
-      try {
-        return formatStringConstant(JSON.parse(arg));
-      } catch (e) {
-        return arg; // If parsing fails, return as-is
-      }
+    if (opcode === 'ldc' || opcode === 'ldc_w' || opcode === 'ldc2_w') {
+      return formatStringConstant(arg);
     }
     return arg;
   } else if (Array.isArray(arg)) {
     // Recursively format each item and join with spaces
-    return arg.map(formatInstructionArgKrakatau).join(" ");
+    return arg.map(item => formatInstructionArgKrakatau(item, opcode)).join(" ");
   } else if (typeof arg === "object") {
     // For object arguments, check if it's a typed float/double first
     if (arg.type === "Float") {
