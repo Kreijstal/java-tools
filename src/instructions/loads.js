@@ -107,4 +107,7 @@ module.exports = {
   saload: (frame) => {
     _aload(frame);
   },
+  aaload: (frame) => {
+    _aload(frame);
+  },
 };
