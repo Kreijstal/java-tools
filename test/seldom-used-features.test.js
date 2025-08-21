@@ -1,10 +1,10 @@
-const test = require('tape');
-const { runTest } = require('./test-helpers');
+const test = require("tape");
+const { runTest } = require("./test-helpers");
 
 const SELDOM_USED_FEATURE_TESTS = [
   {
-    name: 'MethodHandlesTest',
-    description: 'MethodHandles and MethodType - should pass',
+    name: "MethodHandlesTest",
+    description: "MethodHandles and MethodType - should pass",
     shouldFail: false,
     // TODO: This test is expected to fail until MethodHandles are implemented in the JVM.
     expectedOutput: `=== Method Handles Test ===
@@ -13,11 +13,11 @@ Static method called: Hello from MethodHandle!
 Invoking instance method via MethodHandle:
 Result: Instance method called with: 42
 Field access via MethodHandle:
-Field value: 100`
+Field value: 100`,
   },
   {
-    name: 'AnnotationReflectionTest',
-    description: 'Annotation processing with reflection - should pass',
+    name: "AnnotationReflectionTest",
+    description: "Annotation processing with reflection - should pass",
     shouldFail: false,
     // TODO: This test is expected to fail until annotation reflection is fully implemented.
     expectedOutput: `=== Annotation Reflection Test ===
@@ -27,11 +27,14 @@ Field annotations:
 Field annotation: field, 10
 Method annotations:
 Method annotation: method, 99
-Method result: Processed`
+Method result: Processed: test
+Field modifiers:
+Is private: true
+Is static: false`,
   },
   {
-    name: 'TryWithResourcesTest',
-    description: 'Try-with-resources and suppressed exceptions - should pass',
+    name: "TryWithResourcesTest",
+    description: "Try-with-resources and suppressed exceptions - should pass",
     shouldFail: false,
     // TODO: This test is expected to fail until try-with-resources is fully implemented.
     expectedOutput: `=== Try-With-Resources Test ===
@@ -43,6 +46,8 @@ Closing resource: Resource1
 Multiple resources:
 Created resource: Resource1
 Created resource: Resource2
+Working with resource: Resource1
+Working with resource: Resource2
 Multiple resources work completed
 Closing resource: Resource2
 Closing resource: Resource1
@@ -50,13 +55,13 @@ Exception handling:
 Created resource: FailingResource
 Working with resource: FailingResource
 Closing resource: FailingResource
-Caught exception: Exception in try block
+Caught exception: Work failed for FailingResource
 Suppressed exceptions: 1
-  - Failed to close FailingResource`
+  - Failed to close FailingResource`,
   },
   {
-    name: 'MultiCatchTest',
-    description: 'Multi-catch exception handling - should pass',
+    name: "MultiCatchTest",
+    description: "Multi-catch exception handling - should pass",
     shouldFail: false,
     expectedOutput: `=== Multi-Catch Exception Test ===
 Test case 1:
@@ -76,11 +81,11 @@ Finally block executed for test case 3
 
 Test case 4:
 Normal execution - no exception
-Finally block executed for test case 4`
+Finally block executed for test case 4`,
   },
   {
-    name: 'VarargsGenericTest',
-    description: 'Varargs with generic types - should pass',
+    name: "VarargsGenericTest",
+    description: "Varargs with generic types - should pass",
     shouldFail: false,
     expectedOutput: `=== Varargs with Generics Test ===
 Simple varargs:
@@ -113,11 +118,11 @@ Processing 4 mixed items:
   - Process (type: String)
   - 42 (type: Integer)
   - true (type: Boolean)
-  - 3.14 (type: Double)`
+  - 3.14 (type: Double)`,
   },
   {
-    name: 'StaticInitializationTest',
-    description: 'Static initialization block ordering - should pass',
+    name: "StaticInitializationTest",
+    description: "Static initialization block ordering - should pass",
     shouldFail: false,
     expectedOutput: `Static block 1 executed
 Initializing CONSTANT2
@@ -136,11 +141,12 @@ Instance initialization block executed
 Constructor executed
 Instance field: Instance field: First constant (modified in instance block) (modified in constructor)
 Calling static method...
-Static method called, counter = 35`
+Static method called, counter = 35`,
   },
   {
-    name: 'JaggedArrayTest',
-    description: 'Jagged (non-rectangular) multi-dimensional arrays - should pass',
+    name: "JaggedArrayTest",
+    description:
+      "Jagged (non-rectangular) multi-dimensional arrays - should pass",
     shouldFail: false,
     expectedOutput: `=== Jagged Array Test ===
 Basic jagged array:
@@ -167,15 +173,20 @@ Dynamic jagged array:
 Row 0: 10
 Row 1: 20 21
 Row 2: 30 31 32
-Row 3: 40 41 42 43`
-  }
+Row 3: 40 41 42 43`,
+  },
 ];
 
-test('Seldom-used Java Features', async function(t) {
+test("Seldom-used Java Features", async function (t) {
   for (const testCase of SELDOM_USED_FEATURE_TESTS) {
-    await runTest(testCase.name, testCase.expectedOutput, t, {
-      shouldFail: testCase.shouldFail
-    });
+    const options = {
+      shouldFail: testCase.shouldFail,
+    };
+    // Enable verbose mode for MethodHandlesTest to debug method resolution
+    if (testCase.name === "MethodHandlesTest") {
+      options.verbose = true;
+    }
+    await runTest(testCase.name, testCase.expectedOutput, t, options);
   }
   t.end();
 });

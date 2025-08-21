@@ -9,6 +9,12 @@ module.exports = {
         const methodName = args[1]; // String
         const methodType = args[2]; // MethodType object
 
+        if (jvm.verbose) {
+          console.log(`findStatic called with methodType:`, methodType);
+          console.log(`methodType.parameterTypes:`, methodType.parameterTypes);
+          console.log(`methodType.returnType:`, methodType.returnType);
+        }
+
         // Extract class name from Class object
         let className = "java/lang/String"; // Default assumption
         if (
@@ -103,6 +109,7 @@ module.exports = {
           console.log(
             `Created MethodHandle for ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
           );
+          console.log(`MethodType was:`, methodType);
         }
 
         return handle;
