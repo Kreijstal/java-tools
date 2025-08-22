@@ -790,13 +790,8 @@ class JVM {
     const descriptor = arrayClassName.substring(1);
     
     // Handle primitive types
-<<<<<<< HEAD
-    if (primitiveTypeDescriptors[descriptor]) {
-      return primitiveTypeDescriptors[descriptor];
-=======
     if (arrayPrimitiveTypeDescriptors[descriptor]) {
       return arrayPrimitiveTypeDescriptors[descriptor];
->>>>>>> origin/master
     }
     
     // Handle object types (L<classname>;)
@@ -845,25 +840,6 @@ class JVM {
     }
 
     // Handle primitive types
-<<<<<<< HEAD
-    const primitiveTypes = {
-      'int': 'int',
-      'long': 'long',
-      'double': 'double',
-      'float': 'float',
-      'char': 'char',
-      'short': 'short',
-      'byte': 'byte',
-      'boolean': 'boolean',
-      'void': 'void'
-    };
-    
-    if (primitiveTypes[classNameWithSlashes]) {
-      const classObj = {
-        type: "java/lang/Class",
-        isPrimitive: true,
-        name: primitiveTypes[classNameWithSlashes],
-=======
     const primitiveTypeNames = new Set(Object.values(primitiveTypeDescriptors));
     
     if (primitiveTypeNames.has(classNameWithSlashes)) {
@@ -871,7 +847,6 @@ class JVM {
         type: "java/lang/Class",
         isPrimitive: true,
         name: classNameWithSlashes,
->>>>>>> origin/master
       };
       this.classObjectCache.set(classNameWithSlashes, classObj);
       return classObj;
@@ -886,11 +861,6 @@ class JVM {
     const classObj = {
       type: "java/lang/Class",
       _classData: classData,
-<<<<<<< HEAD
-      name: classNameWithSlashes.replace(/\//g, "."),
-      className: classNameWithSlashes.replace(/\//g, "."),
-=======
->>>>>>> origin/master
     };
     this.classObjectCache.set(classNameWithSlashes, classObj);
     return classObj;
