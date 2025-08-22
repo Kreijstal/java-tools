@@ -40,7 +40,8 @@ module.exports = {
           result += char;
         }
       }
-      return jvm.internString(result);
+      // Per the Java spec, runtime concatenation should produce a new String object.
+      return jvm.newString(result);
     }
   },
 };

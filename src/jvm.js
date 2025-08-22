@@ -62,6 +62,7 @@ class JVM {
       "java/lang/ReflectiveOperationException": "java/lang/Exception",
       "java/lang/NoSuchMethodException":
         "java/lang/ReflectiveOperationException",
+      "java/lang/reflect/Array": "java/lang/Object",
       "java/io/IOException": "java/lang/Exception",
       "java/io/Reader": "java/lang/Object",
       "java/io/BufferedReader": "java/io/Reader",
@@ -196,6 +197,14 @@ class JVM {
     const stringObj = new String(str);
     stringObj.type = "java/lang/String";
     this.stringPool.set(str, stringObj);
+    return stringObj;
+  }
+
+  newString(str) {
+    // Creates a new Java String object, without adding it to the string pool.
+    // This is for methods that are required to return a new String instance.
+    const stringObj = new String(str);
+    stringObj.type = "java/lang/String";
     return stringObj;
   }
 

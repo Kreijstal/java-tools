@@ -16,7 +16,8 @@ module.exports = {
     },
     'toString(I)Ljava/lang/String;': (jvm, obj, args) => {
       const intValue = args[0];
-      return jvm.internString(intValue.toString());
+      // Per spec, this should be a new string, not an interned one.
+      return jvm.newString(intValue.toString());
     },
     'valueOf(I)Ljava/lang/Integer;': (jvm, obj, args) => {
       const integerObj = {
@@ -49,7 +50,8 @@ module.exports = {
       return obj.value;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      return jvm.internString(obj.value.toString());
+      // Per spec, this should be a new string, not an interned one.
+      return jvm.newString(obj.value.toString());
     },
     'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
       return {
