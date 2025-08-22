@@ -1,3 +1,5 @@
+const { _aload } = require("./utils");
+
 module.exports = {
   iload: (frame, instruction) => {
     const index = parseInt(instruction.arg, 10);
@@ -85,66 +87,27 @@ module.exports = {
     frame.stack.push(frame.locals[3]);
   },
   iaload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
   },
   laload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
   },
   faload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
   },
   daload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
   },
   baload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
   },
   caload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
   },
   saload: (frame) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
+    _aload(frame);
+  },
+  aaload: (frame) => {
+    _aload(frame);
   },
 };
