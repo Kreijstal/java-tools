@@ -1,6 +1,7 @@
-const { primitiveTypeDescriptors } = require("./constants");
+const { primitiveTypeDescriptors } = require('./constants');
 
 function parseDescriptor(descriptor) {
+  const types = primitiveTypeDescriptors;
   function parseType(descriptor, index) {
     let arrayDepth = 0;
     while (descriptor[index] === '[') {
@@ -15,7 +16,7 @@ function parseDescriptor(descriptor) {
       return { type: className + '[]'.repeat(arrayDepth), index };
     }
 
-    const type = primitiveTypeDescriptors[descriptor[index]];
+    const type = types[descriptor[index]];
     index++;
     return { type: type + '[]'.repeat(arrayDepth), index };
   }

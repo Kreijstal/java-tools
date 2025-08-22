@@ -110,22 +110,16 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   // Check for null object reference
   if (boxedObj === null) {
-    const instructionItem = frame.instructions[frame.pc - 1];
-    const label = instructionItem.labelDef;
-    const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-
-    const exception = {
+    throw {
       type: "java/lang/NullPointerException",
       message: null,
       context: {
         frame: frame,
-        pc: pc,
+        pc: frame.instructions[frame.pc - 1].pc,
         className: className,
         methodName: methodName,
       },
     };
-    jvm.handleException(exception, -1, thread);
-    return;
   }
 
   let currentClassName = boxedObj.type;
@@ -212,11 +206,9 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
   }
 
-  const exception = {
-    type: "java/lang/NoSuchMethodError",
-    message: `${boxedObj?.type || typeof boxedObj}.${methodName}${descriptor}`,
-  };
-  jvm.handleException(exception, -1, thread);
+  throw new Error(
+    `Unsupported invokevirtual: ${boxedObj?.type || typeof boxedObj}.${methodName}${descriptor}`,
+  );
 }
 
 async function invokestatic(frame, instruction, jvm, thread) {
@@ -328,11 +320,9 @@ async function invokespecial(frame, instruction, jvm, thread) {
     // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
     // For now, we do nothing, assuming the object is already created by 'new'.
   } else {
-    const exception = {
-      type: "java/lang/NoSuchMethodError",
-      message: `${className}.${methodName}${descriptor}`,
-    };
-    jvm.handleException(exception, -1, thread);
+    throw new Error(
+      `Unsupported invokespecial: ${className}.${methodName}${descriptor}`,
+    );
   }
 }
 
@@ -481,22 +471,10 @@ async function invokeinterface(frame, instruction, jvm, thread) {
 
   // Check for null object reference
   if (boxedObj === null) {
-    const instructionItem = frame.instructions[frame.pc - 1];
-    const label = instructionItem.labelDef;
-    const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-
-    const exception = {
+    throw {
       type: "java/lang/NullPointerException",
       message: "Attempted to invoke interface method on null object reference",
-      context: {
-        frame: frame,
-        pc: pc,
-        className: className,
-        methodName: methodName,
-      },
     };
-    jvm.handleException(exception, -1, thread);
-    return;
   }
 
   // For a functional interface with method handle (lambdas)
@@ -608,11 +586,9 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     }
   }
 
-  const exception = {
-    type: "java/lang/NoSuchMethodError",
-    message: `${boxedObj.type}.${methodName}${descriptor}`,
-  };
-  jvm.handleException(exception, -1, thread);
+  throw new Error(
+    `Unsupported invokeinterface: ${boxedObj.type}.${methodName}${descriptor}`,
+  );
 }
 
 const invokeHandlers = {

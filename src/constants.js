@@ -1,4 +1,4 @@
-const ASYNC_METHOD_SENTINEL = Symbol("ASYNC_METHOD_SENTINEL");
+const ASYNC_METHOD_SENTINEL = Symbol('ASYNC_METHOD_SENTINEL');
 
 const primitiveTypeDescriptors = {
   B: "byte",
@@ -9,18 +9,14 @@ const primitiveTypeDescriptors = {
   J: "long",
   S: "short",
   Z: "boolean",
-  V: "void",
+  V: "void"
 };
 
-const primitiveTypeNameToDescriptor = Object.fromEntries(
-  Object.entries(primitiveTypeDescriptors).map(([descriptor, name]) => [
-    name,
-    descriptor,
-  ]),
-);
+const arrayPrimitiveTypeDescriptors = { ...primitiveTypeDescriptors };
+delete arrayPrimitiveTypeDescriptors.V;
 
 module.exports = {
   ASYNC_METHOD_SENTINEL,
   primitiveTypeDescriptors,
-  primitiveTypeNameToDescriptor,
+  arrayPrimitiveTypeDescriptors,
 };

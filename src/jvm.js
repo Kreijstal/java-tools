@@ -4,7 +4,7 @@ const {
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
 const { parseDescriptor } = require("./typeParser");
-const { primitiveTypeDescriptors } = require("./constants");
+const { primitiveTypeDescriptors, arrayPrimitiveTypeDescriptors } = require("./constants");
 const {
   formatInstruction,
   unparseDataStructures,
@@ -790,8 +790,8 @@ class JVM {
     const descriptor = arrayClassName.substring(1);
     
     // Handle primitive types
-    if (primitiveTypeDescriptors[descriptor]) {
-      return primitiveTypeDescriptors[descriptor];
+    if (arrayPrimitiveTypeDescriptors[descriptor]) {
+      return arrayPrimitiveTypeDescriptors[descriptor];
     }
     
     // Handle object types (L<classname>;)
@@ -840,23 +840,13 @@ class JVM {
     }
 
     // Handle primitive types
-    const primitiveTypes = {
-      'int': 'int',
-      'long': 'long',
-      'double': 'double',
-      'float': 'float',
-      'char': 'char',
-      'short': 'short',
-      'byte': 'byte',
-      'boolean': 'boolean',
-      'void': 'void'
-    };
+    const primitiveTypeNames = new Set(Object.values(primitiveTypeDescriptors));
     
-    if (primitiveTypes[classNameWithSlashes]) {
+    if (primitiveTypeNames.has(classNameWithSlashes)) {
       const classObj = {
         type: "java/lang/Class",
         isPrimitive: true,
-        name: primitiveTypes[classNameWithSlashes],
+        name: classNameWithSlashes,
       };
       this.classObjectCache.set(classNameWithSlashes, classObj);
       return classObj;
@@ -871,8 +861,6 @@ class JVM {
     const classObj = {
       type: "java/lang/Class",
       _classData: classData,
-      name: classNameWithSlashes.replace(/\//g, "."),
-      className: classNameWithSlashes.replace(/\//g, "."),
     };
     this.classObjectCache.set(classNameWithSlashes, classObj);
     return classObj;
