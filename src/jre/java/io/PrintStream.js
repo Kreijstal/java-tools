@@ -12,31 +12,32 @@ module.exports = {
     },
 
     'println(D)V': (jvm, obj, args) => {
-      const stringClass = jvm.jre['java/lang/String'];
-      const str = stringClass.staticMethods['valueOf(D)Ljava/lang/String;'](jvm, null, args);
-      const printlnStr = jvm._jreFindMethod(obj.type, 'println', '(Ljava/lang/String;)V');
-      if (printlnStr) {
-        printlnStr(jvm, obj, [str]);
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
       }
     },
 
     'println(F)V': (jvm, obj, args) => {
-      const stringClass = jvm.jre['java/lang/String'];
-      // Floats are widened to doubles in this implementation for valueOf
-      const str = stringClass.staticMethods['valueOf(D)Ljava/lang/String;'](jvm, null, args);
-      const printlnStr = jvm._jreFindMethod(obj.type, 'println', '(Ljava/lang/String;)V');
-      if (printlnStr) {
-        printlnStr(jvm, obj, [str]);
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
       }
     },
 
     'println(J)V': (jvm, obj, args) => {
-      const stringClass = jvm.jre['java/lang/String'];
-      // Longs are handled by the generic Object valueOf for now, which is fine.
-      const str = stringClass.staticMethods['valueOf(Ljava/lang/Object;)Ljava/lang/String;'](jvm, null, args);
-      const printlnStr = jvm._jreFindMethod(obj.type, 'println', '(Ljava/lang/String;)V');
-      if (printlnStr) {
-        printlnStr(jvm, obj, [str]);
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
       }
     },
 
@@ -61,11 +62,12 @@ module.exports = {
     },
 
     'println(I)V': (jvm, obj, args) => {
-      const stringClass = jvm.jre['java/lang/String'];
-      const str = stringClass.staticMethods['valueOf(I)Ljava/lang/String;'](jvm, null, args);
-      const printlnStr = jvm._jreFindMethod(obj.type, 'println', '(Ljava/lang/String;)V');
-      if (printlnStr) {
-        printlnStr(jvm, obj, [str]);
+      const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
       }
     },
 

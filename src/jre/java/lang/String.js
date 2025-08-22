@@ -20,16 +20,6 @@ module.exports = {
       }
       return jvm.internString(String(value));
     },
-    "valueOf(D)Ljava/lang/String;": (jvm, obj, args) => {
-      // Defer to Double.toString for proper formatting
-      const doubleClass = jvm.getStatic('java/lang/Double');
-      return doubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, args);
-    },
-    "valueOf(I)Ljava/lang/String;": (jvm, obj, args) => {
-      // Defer to Integer.toString for proper formatting
-      const integerClass = jvm.getStatic('java/lang/Integer');
-      return integerClass.staticMethods['toString(I)Ljava/lang/String;'](jvm, null, args);
-    },
   },
   methods: {
     "<init>()V": (jvm, obj, args) => {
