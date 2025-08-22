@@ -14,6 +14,10 @@ module.exports = {
       const binaryString = (intValue >>> 0).toString(2);
       return jvm.internString(binaryString);
     },
+    'toString(I)Ljava/lang/String;': (jvm, obj, args) => {
+      const intValue = args[0];
+      return jvm.internString(intValue.toString());
+    },
     'valueOf(I)Ljava/lang/Integer;': (jvm, obj, args) => {
       const integerObj = {
         type: 'java/lang/Integer',

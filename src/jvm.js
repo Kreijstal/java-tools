@@ -749,9 +749,72 @@ class JVM {
     }
   }
 
+  createArrayClass(arrayClassName) {
+    // Create a synthetic array class
+    const arrayClass = {
+      className: arrayClassName,
+      isArray: true,
+      componentType: this.getArrayComponentType(arrayClassName),
+      ast: {
+        classes: [{
+          className: arrayClassName,
+          superClass: 'java/lang/Object',
+          interfaces: [],
+          items: [],
+          flags: ['public', 'final', 'abstract']
+        }]
+      }
+    };
+    
+    // Store it in the classes registry
+    this.classes[arrayClassName] = arrayClass;
+    return arrayClass;
+  }
+
+  getArrayComponentType(arrayClassName) {
+    if (!arrayClassName.startsWith('[')) {
+      return null;
+    }
+    
+    const descriptor = arrayClassName.substring(1);
+    
+    // Handle primitive types
+    const primitiveMap = {
+      'B': 'byte',
+      'C': 'char', 
+      'D': 'double',
+      'F': 'float',
+      'I': 'int',
+      'J': 'long',
+      'S': 'short',
+      'Z': 'boolean'
+    };
+    
+    if (primitiveMap[descriptor]) {
+      return primitiveMap[descriptor];
+    }
+    
+    // Handle object types (L<classname>;)
+    if (descriptor.startsWith('L') && descriptor.endsWith(';')) {
+      return descriptor.substring(1, descriptor.length - 1);
+    }
+    
+    // Handle nested arrays
+    if (descriptor.startsWith('[')) {
+      return descriptor;
+    }
+    
+    return null;
+  }
+
   async loadClassByName(classNameWithSlashes) {
     if (this.classes[classNameWithSlashes]) {
       return this.classes[classNameWithSlashes];
+    }
+
+    // Handle array classes (e.g., [I, [[Ljava/lang/String;, etc.)
+    if (classNameWithSlashes.startsWith('[')) {
+      return this.createArrayClass(classNameWithSlashes);
     }
 
     const classFilePath = path.join(
