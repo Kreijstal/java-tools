@@ -18,10 +18,6 @@ function formatJavaNumber(value, type) {
     if (value === 0.0) return '0.0';
     if (value === -0.0) return '-0.0';
 
-    // Special cases for exact string matching with Java's output
-    if (value === 1.7976931348623157e+308) return '1.7976931348623157E308';
-    if (value === 5e-324) return "4.9E-324";
-    if (value === 2.2250738585072014e-308) return "2.2250738585072014E-308";
 
     const absD = Math.abs(value);
     let s;
