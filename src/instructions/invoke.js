@@ -122,7 +122,13 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   if (boxedObj === null) {
     throw {
       type: "java/lang/NullPointerException",
-      message: `Cannot invoke "${className.substring(className.lastIndexOf("/") + 1)}.${methodName}()" because the object reference is null`,
+      message: null,
+      context: {
+        frame: frame,
+        pc: frame.instructions[frame.pc - 1].pc,
+        className: className,
+        methodName: methodName,
+      },
     };
   }
 

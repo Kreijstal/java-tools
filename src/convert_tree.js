@@ -332,6 +332,7 @@ function convertJson(inputJson, constantPool) {
         const codeItem = {};
         const labelDef = `L${instr.pc}:`;
         codeItem.labelDef = labelDef;
+        codeItem.pc = instr.pc;
 
         // Handle different opcodes
         switch (instr.opcodeName) {
