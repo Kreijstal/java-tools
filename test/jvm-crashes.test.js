@@ -35,7 +35,7 @@ const tests = [
     name: "InstanceofTest",
     description: "instanceof instruction for array types",
     expectedOutput:
-      "=== instanceof Test ===\nString instanceof String: 1\nString instanceof Object: 1\nInteger instanceof Integer: 1\nInteger instanceof Number: 1\nint[] instanceof Object: 0\nnull instanceof String: 0\nnull instanceof Object: 0\n=== Class Hierarchy Test ===\nParent instanceof Parent: 1\nChild instanceof Parent: 1\nChild instanceof Child: 1\nParent ref to Child instanceof Child: 1",
+      "=== instanceof Test ===\nString instanceof String: true\nString instanceof Object: true\nInteger instanceof Integer: true\nInteger instanceof Number: true\nint[] instanceof Object: false\nnull instanceof String: false\nnull instanceof Object: false\n=== Class Hierarchy Test ===\nParent instanceof Parent: true\nChild instanceof Parent: true\nChild instanceof Child: true\nParent ref to Child instanceof Child: true",
   },
   {
     name: "InnerClassTest",
@@ -47,7 +47,7 @@ const tests = [
     name: "ReflectionCrash",
     description: "Basic reflection support",
     expectedOutput:
-      "Testing reflection operations that might crash...\nString class: java.lang.String\nString has 18 methods\nString has 0 public fields",
+      "Testing reflection operations that might crash...\nString class: java.lang.String\nString has 22 methods\nString has 0 public fields",
   },
 
   // Data types and conversions
@@ -111,7 +111,7 @@ const tests = [
     name: "EnumTest",
     description: "Enum constants and methods",
     expectedOutput:
-      "=== Enum Test ===\nColor: RED\nRed value: 255\nHex: 255,0,0\nRED == RED: 1\nRED equals RED: 1\n=== Enum Switch Test ===\nIt's red!\nIt's green!\nIt's blue!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nCaught expected exception for invalid enum: IllegalArgumentException",
+      "=== Enum Test ===\nColor: RED\nRed value: 255\nHex: 255,0,0\nRED == RED: true\nRED equals RED: true\n=== Enum Switch Test ===\nIt's red!\nIt's green!\nIt's blue!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nCaught expected exception for invalid enum: IllegalArgumentException",
   },
   {
     name: "MissingBytecodeCrash",

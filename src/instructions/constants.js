@@ -2,19 +2,8 @@ module.exports = {
   ldc: async (frame, instruction, jvm) => {
     if (Array.isArray(instruction.arg) && instruction.arg[0] === "Class") {
       const className = instruction.arg[1];
-      const classData = await jvm.loadClassByName(className);
-      if (classData) {
-        const classObj = {
-          type: "java/lang/Class",
-          _classData: classData,
-        };
-        frame.stack.push(classObj);
-      } else {
-        throw {
-          type: "java/lang/ClassNotFoundException",
-          message: `Class not found: ${className}`,
-        };
-      }
+      const classObj = await jvm.getClassObject(className);
+      frame.stack.push(classObj);
     } else {
       const constant = instruction.arg;
       if (typeof constant === "string" || constant instanceof String) {

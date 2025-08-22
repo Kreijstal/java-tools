@@ -1,20 +1,22 @@
 module.exports = {
   super: 'java/lang/Object',
-  staticFields: {},
-  methods: {
+  staticMethods: {
     'forName(Ljava/lang/String;)Ljava/lang/Class;': async (jvm, classObj, args) => {
       const classNameWithDots = args[0];
       const classNameWithSlashes = classNameWithDots.replace(/\./g, '/');
-      const classData = await jvm.loadClassByName(classNameWithSlashes);
-      if (!classData) {
-        throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
-      }
-      return { type: 'java/lang/Class', _classData: classData };
+      return await jvm.getClassObject(classNameWithSlashes);
     },
+  },
+  methods: {
     'getFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       return [];
     },
     'getName()Ljava/lang/String;': (jvm, classObj, args) => {
+      // Handle primitive class objects
+      if (classObj.isPrimitive && classObj.name) {
+        return jvm.internString(classObj.name);
+      }
+      
       const classData = classObj._classData;
       if (!classData || !classData.ast) {
         if (classObj.type) {
@@ -57,6 +59,15 @@ module.exports = {
     'isInterface()Z': (jvm, classObj, args) => {
       const classData = classObj._classData;
       return classData.ast.classes[0].flags.includes('interface');
+    },
+    'isPrimitive()Z': (jvm, classObj, args) => {
+      // Check if this is a primitive type class
+      return classObj.isPrimitive ? 1 : 0;
+    },
+    'isArray()Z': (jvm, classObj, args) => {
+      // Check if this is an array class
+      const classData = classObj._classData;
+      return classData && classData.isArray ? 1 : 0;
     },
     'getMethods()[Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
       const allMethods = {};
