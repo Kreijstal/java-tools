@@ -41,5 +41,11 @@ module.exports = {
       Buffer: ['buffer', 'Buffer'],
     }),
   ],
+  externals: {
+    'os': 'commonjs os',
+    'v8': 'commonjs v8',
+    'process': 'commonjs process',
+    'fs': 'commonjs fs',
+  },
   devtool: 'source-map'
 };
