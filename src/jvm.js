@@ -1441,7 +1441,7 @@ class JVM {
     const localVarTable = codeAttribute.code.attributes.find(
       (attr) => attr.type === "localvariabletable",
     );
-    return localVarTable ? localVarTable.variables : null;
+    return localVarTable ? localVarTable.vars : null;
   }
 
   _inferType(value) {

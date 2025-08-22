@@ -21,8 +21,8 @@ Echo program exited.
 test('simple echo program - empty input', async (t) => {
   const inputData = '\n\nquit\n';
   const expectedOutput = `Echo program started. Type 'quit' to exit.
-Echo:
-Echo:
+Echo: 
+Echo: 
 Echo program exited.
 `;
 
