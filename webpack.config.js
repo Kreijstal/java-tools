@@ -32,7 +32,9 @@ module.exports = {
       "util": require.resolve("util/"),
       "stream": require.resolve("stream-browserify"),
       "buffer": require.resolve("buffer/"),
-      "process": require.resolve("process/browser")
+      "process": require.resolve("process/browser"),
+      "os": false, // Make os return false instead of trying to load it
+      "v8": false, // Make v8 return false instead of trying to load it
     }
   },
   plugins: [
@@ -42,10 +44,8 @@ module.exports = {
     }),
   ],
   externals: {
-    'os': 'commonjs os',
-    'v8': 'commonjs v8',
-    'process': 'commonjs process',
-    'fs': 'commonjs fs',
+    // Remove externals since we want everything bundled for browser use
+    // The fallbacks above will handle Node.js modules
   },
   devtool: 'source-map'
 };
