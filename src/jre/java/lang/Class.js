@@ -4,11 +4,7 @@ module.exports = {
     'forName(Ljava/lang/String;)Ljava/lang/Class;': async (jvm, classObj, args) => {
       const classNameWithDots = args[0];
       const classNameWithSlashes = classNameWithDots.replace(/\./g, '/');
-      const classData = await jvm.loadClassByName(classNameWithSlashes);
-      if (!classData) {
-        throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
-      }
-      return { type: 'java/lang/Class', _classData: classData };
+      return await jvm.getClassObject(classNameWithSlashes);
     },
   },
   methods: {
@@ -16,6 +12,11 @@ module.exports = {
       return [];
     },
     'getName()Ljava/lang/String;': (jvm, classObj, args) => {
+      // Handle primitive class objects
+      if (classObj.isPrimitive && classObj.name) {
+        return jvm.internString(classObj.name);
+      }
+      
       const classData = classObj._classData;
       if (!classData || !classData.ast) {
         if (classObj.type) {

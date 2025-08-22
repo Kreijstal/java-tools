@@ -7,6 +7,11 @@ const { ASYNC_METHOD_SENTINEL } = require("../constants");
 
 // Helper function to format numbers according to Java's rules
 function formatJavaNumber(value, type) {
+  // Handle boolean type specifically
+  if (type === "boolean" || type === "Z") {
+    return value === 1 ? "true" : "false";
+  }
+  
   if (typeof value === "number") {
     // For float values, always show decimal point even for whole numbers
     if (type === "float") {
@@ -20,34 +25,26 @@ function formatJavaNumber(value, type) {
     if (type === "double") {
       if (Number.isInteger(value)) {
         const result = value + ".0";
-
         return result;
       }
       const str = value.toString();
-      // If it's in scientific notation, convert to fixed point
+      // Convert lowercase 'e' to uppercase 'E' for Java compatibility
       if (str.includes("e")) {
-        const result = value.toFixed(15).replace(/\.?0+$/, "");
-
-        return result;
+        return str.replace("e", "E");
       }
-
       return str;
     }
     // For integers, return as string without decimal
     if (Number.isInteger(value)) {
       const result = value.toString();
-
       return result;
     }
     // For other floating-point numbers
     const str = value.toString();
-    // If it's in scientific notation, convert to fixed point
+    // Convert lowercase 'e' to uppercase 'E' for Java compatibility
     if (str.includes("e")) {
-      const result = value.toFixed(15).replace(/\.?0+$/, "");
-
-      return result;
+      return str.replace("e", "E");
     }
-
     return str;
   }
   const result = String(value);

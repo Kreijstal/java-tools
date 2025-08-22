@@ -25,6 +25,7 @@ class JVM {
     this.classes = {}; // className -> { ast, constantPool }
     this.classInitializationState = new Map();
     this.invokedynamicCache = new Map();
+    this.classObjectCache = new Map(); // className -> Class object (for maintaining identity)
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || ".";
@@ -828,6 +829,54 @@ class JVM {
     return classData;
   }
 
+  /**
+   * Get or create a Class object for the given class name, maintaining object identity
+   * @param {string} classNameWithSlashes - Class name with slashes (e.g., "java/lang/String")
+   * @returns {Promise<Object>} The Class object
+   */
+  async getClassObject(classNameWithSlashes) {
+    // Check cache first
+    if (this.classObjectCache.has(classNameWithSlashes)) {
+      return this.classObjectCache.get(classNameWithSlashes);
+    }
+
+    // Handle primitive types
+    const primitiveTypes = {
+      'int': 'int',
+      'long': 'long', 
+      'double': 'double',
+      'float': 'float',
+      'char': 'char',
+      'short': 'short',
+      'byte': 'byte',
+      'boolean': 'boolean',
+      'void': 'void'
+    };
+    
+    if (primitiveTypes[classNameWithSlashes]) {
+      const classObj = {
+        type: "java/lang/Class",
+        isPrimitive: true,
+        name: primitiveTypes[classNameWithSlashes],
+      };
+      this.classObjectCache.set(classNameWithSlashes, classObj);
+      return classObj;
+    }
+
+    // Load class data for regular classes
+    const classData = await this.loadClassByName(classNameWithSlashes);
+    if (!classData) {
+      throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
+    }
+
+    const classObj = {
+      type: "java/lang/Class",
+      _classData: classData,
+    };
+    this.classObjectCache.set(classNameWithSlashes, classObj);
+    return classObj;
+  }
+
   async initializeClassIfNeeded(className, thread) {
     if (
       !className ||
@@ -937,7 +986,20 @@ class JVM {
           for (const [fieldKey, fieldValue] of Object.entries(
             jreClass.staticFields,
           )) {
-            classData.staticFields.set(fieldKey, fieldValue);
+            // Handle Class-type static fields to ensure object identity
+            if (fieldValue && fieldValue.type === 'java/lang/Class') {
+              let processedFieldValue;
+              if (fieldValue.isPrimitive && fieldValue.name) {
+                // This is a primitive class like Integer.TYPE or Void.TYPE
+                processedFieldValue = await this.getClassObject(fieldValue.name);
+              } else {
+                // Regular class, use as is for now (could be enhanced later)
+                processedFieldValue = fieldValue;
+              }
+              classData.staticFields.set(fieldKey, processedFieldValue);
+            } else {
+              classData.staticFields.set(fieldKey, fieldValue);
+            }
 
             if (this.verbose) {
               console.log(
