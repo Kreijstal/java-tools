@@ -25,6 +25,7 @@ class JVM {
     this.classes = {}; // className -> { ast, constantPool }
     this.classInitializationState = new Map();
     this.invokedynamicCache = new Map();
+    this.classObjectCache = new Map(); // className -> Class object (for maintaining identity)
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
     this.classpath = options.classpath || ".";
@@ -61,6 +62,7 @@ class JVM {
       "java/lang/ReflectiveOperationException": "java/lang/Exception",
       "java/lang/NoSuchMethodException":
         "java/lang/ReflectiveOperationException",
+      "java/lang/reflect/Array": "java/lang/Object",
       "java/io/IOException": "java/lang/Exception",
       "java/io/Reader": "java/lang/Object",
       "java/io/BufferedReader": "java/io/Reader",
@@ -195,6 +197,14 @@ class JVM {
     const stringObj = new String(str);
     stringObj.type = "java/lang/String";
     this.stringPool.set(str, stringObj);
+    return stringObj;
+  }
+
+  newString(str) {
+    // Creates a new Java String object, without adding it to the string pool.
+    // This is for methods that are required to return a new String instance.
+    const stringObj = new String(str);
+    stringObj.type = "java/lang/String";
     return stringObj;
   }
 
@@ -749,9 +759,72 @@ class JVM {
     }
   }
 
+  createArrayClass(arrayClassName) {
+    // Create a synthetic array class
+    const arrayClass = {
+      className: arrayClassName,
+      isArray: true,
+      componentType: this.getArrayComponentType(arrayClassName),
+      ast: {
+        classes: [{
+          className: arrayClassName,
+          superClass: 'java/lang/Object',
+          interfaces: [],
+          items: [],
+          flags: ['public', 'final', 'abstract']
+        }]
+      }
+    };
+    
+    // Store it in the classes registry
+    this.classes[arrayClassName] = arrayClass;
+    return arrayClass;
+  }
+
+  getArrayComponentType(arrayClassName) {
+    if (!arrayClassName.startsWith('[')) {
+      return null;
+    }
+    
+    const descriptor = arrayClassName.substring(1);
+    
+    // Handle primitive types
+    const primitiveMap = {
+      'B': 'byte',
+      'C': 'char', 
+      'D': 'double',
+      'F': 'float',
+      'I': 'int',
+      'J': 'long',
+      'S': 'short',
+      'Z': 'boolean'
+    };
+    
+    if (primitiveMap[descriptor]) {
+      return primitiveMap[descriptor];
+    }
+    
+    // Handle object types (L<classname>;)
+    if (descriptor.startsWith('L') && descriptor.endsWith(';')) {
+      return descriptor.substring(1, descriptor.length - 1);
+    }
+    
+    // Handle nested arrays
+    if (descriptor.startsWith('[')) {
+      return descriptor;
+    }
+    
+    return null;
+  }
+
   async loadClassByName(classNameWithSlashes) {
     if (this.classes[classNameWithSlashes]) {
       return this.classes[classNameWithSlashes];
+    }
+
+    // Handle array classes (e.g., [I, [[Ljava/lang/String;, etc.)
+    if (classNameWithSlashes.startsWith('[')) {
+      return this.createArrayClass(classNameWithSlashes);
     }
 
     const classFilePath = path.join(
@@ -763,6 +836,54 @@ class JVM {
       this.classes[classNameWithSlashes] = classData;
     }
     return classData;
+  }
+
+  /**
+   * Get or create a Class object for the given class name, maintaining object identity
+   * @param {string} classNameWithSlashes - Class name with slashes (e.g., "java/lang/String")
+   * @returns {Promise<Object>} The Class object
+   */
+  async getClassObject(classNameWithSlashes) {
+    // Check cache first
+    if (this.classObjectCache.has(classNameWithSlashes)) {
+      return this.classObjectCache.get(classNameWithSlashes);
+    }
+
+    // Handle primitive types
+    const primitiveTypes = {
+      'int': 'int',
+      'long': 'long', 
+      'double': 'double',
+      'float': 'float',
+      'char': 'char',
+      'short': 'short',
+      'byte': 'byte',
+      'boolean': 'boolean',
+      'void': 'void'
+    };
+    
+    if (primitiveTypes[classNameWithSlashes]) {
+      const classObj = {
+        type: "java/lang/Class",
+        isPrimitive: true,
+        name: primitiveTypes[classNameWithSlashes],
+      };
+      this.classObjectCache.set(classNameWithSlashes, classObj);
+      return classObj;
+    }
+
+    // Load class data for regular classes
+    const classData = await this.loadClassByName(classNameWithSlashes);
+    if (!classData) {
+      throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
+    }
+
+    const classObj = {
+      type: "java/lang/Class",
+      _classData: classData,
+    };
+    this.classObjectCache.set(classNameWithSlashes, classObj);
+    return classObj;
   }
 
   async initializeClassIfNeeded(className, thread) {
@@ -874,7 +995,20 @@ class JVM {
           for (const [fieldKey, fieldValue] of Object.entries(
             jreClass.staticFields,
           )) {
-            classData.staticFields.set(fieldKey, fieldValue);
+            // Handle Class-type static fields to ensure object identity
+            if (fieldValue && fieldValue.type === 'java/lang/Class') {
+              let processedFieldValue;
+              if (fieldValue.isPrimitive && fieldValue.name) {
+                // This is a primitive class like Integer.TYPE or Void.TYPE
+                processedFieldValue = await this.getClassObject(fieldValue.name);
+              } else {
+                // Regular class, use as is for now (could be enhanced later)
+                processedFieldValue = fieldValue;
+              }
+              classData.staticFields.set(fieldKey, processedFieldValue);
+            } else {
+              classData.staticFields.set(fieldKey, fieldValue);
+            }
 
             if (this.verbose) {
               console.log(

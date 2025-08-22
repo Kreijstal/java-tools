@@ -22,6 +22,30 @@ module.exports = {
     },
   },
   methods: {
+    "<init>()V": (jvm, obj, args) => {
+      // Default constructor - creates empty string
+      // The obj should already be a String object, just ensure it has the right value
+      if (typeof obj !== 'string') {
+        obj.value = "";
+        obj.toString = function() { return this.value; };
+      }
+    },
+    "<init>(Ljava/lang/String;)V": (jvm, obj, args) => {
+      // String constructor with another string
+      const sourceString = args[0];
+      if (typeof obj !== 'string') {
+        obj.value = sourceString ? sourceString.toString() : "";
+        obj.toString = function() { return this.value; };
+      }
+    },
+    "<init>([C)V": (jvm, obj, args) => {
+      // String constructor with char array
+      const charArray = args[0];
+      if (typeof obj !== 'string') {
+        obj.value = charArray ? String.fromCharCode.apply(null, charArray) : "";
+        obj.toString = function() { return this.value; };
+      }
+    },
     "concat(Ljava/lang/String;)Ljava/lang/String;": (jvm, obj, args) => {
       return jvm.internString(obj + args[0]);
     },
@@ -45,7 +69,21 @@ module.exports = {
       return obj.charCodeAt(index);
     },
     "equals(Ljava/lang/Object;)Z": (jvm, obj, args) => {
-      return obj === args[0] ? 1 : 0;
+      const other = args[0];
+      if (other === null) return 0;
+      if (other === obj) return 1; // Same reference
+      
+      // Check if the other object is a String
+      if (typeof other === 'string') {
+        return obj.toString() === other ? 1 : 0;
+      }
+      
+      // If it's a String object, compare the string values
+      if (other.type === 'java/lang/String' || other instanceof String) {
+        return obj.toString() === other.toString() ? 1 : 0;
+      }
+      
+      return 0;
     },
     "substring(II)Ljava/lang/String;": (jvm, obj, args) => {
       const startIndex = args[0];
@@ -117,6 +155,10 @@ module.exports = {
       array.hashCode = jvm.nextHashCode++;
 
       return array;
+    },
+    "intern()Ljava/lang/String;": (jvm, obj, args) => {
+      // Return the interned version of this string
+      return jvm.internString(obj.toString());
     },
   },
 };

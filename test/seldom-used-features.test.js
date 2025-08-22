@@ -175,6 +175,126 @@ Row 1: 20 21\x20
 Row 2: 30 31 32\x20
 Row 3: 40 41 42 43`,
   },
+  {
+    name: "NestedClassPrivateAccessTest",
+    description: "Nested class access to private members - should pass",
+    shouldFail: false,
+    expectedOutput: `=== Nested Class Private Access Test ===
+Testing static nested class:
+Static nested accessing static private field: 42
+Static nested calling static private method: Private static: test
+Static nested accessing instance private field: 99
+Static nested calling instance private method: Private instance: 123
+
+Testing inner class:
+Inner class accessing static private field: 42
+Inner class accessing instance private field: 99
+Inner class calling static private method: Private static: inner
+Inner class calling instance private method: Private instance: 456`,
+  },
+  {
+    name: "ClassLiteralTest", 
+    description: "Class literals and Class.forName - should match standard Java",
+    shouldFail: false,
+    expectedOutput: `=== Class Literal Test ===
+int.class: int
+String.class: java.lang.String
+int[].class: [I
+int[][].class: [[I
+int.class == Integer.TYPE: true
+Integer.class: java.lang.Integer
+void.class: void
+Void.TYPE: void
+void.class == Void.TYPE: true
+Class.forName("java.lang.String"): java.lang.String
+forName == String.class: true
+Class.forName("[I"): [I
+forName array == int[].class: true
+String.class.getSuperclass(): java.lang.Object
+int.class.isPrimitive(): true
+String.class.isPrimitive(): false
+int[].class.isArray(): true
+String.class.isArray(): false`,
+  },
+  {
+    name: "HexFloatLiteralsTest",
+    description: "Hexadecimal float literals - should match standard Java",
+    shouldFail: false,
+    expectedOutput: `=== Hexadecimal Float Literals Test ===
+0x1.0p0 = 1.0
+0x1.8p0 = 1.5
+0x1.0p1 = 2.0
+0x1.0p-1 = 0.5
+Hex Pi approximation: 3.141592653589793
+Hex E approximation: 2.718281828459045
+Math.PI: 3.141592653589793
+Math.E: 2.718281828459045
+Hex float: 1.0
+Max value (hex): 1.7976931348623157E308
+Double.MAX_VALUE: 1.7976931348623157E308
+Min normal (hex): 2.2250738585072014E-308
+Double.MIN_NORMAL: 2.2250738585072014E-308
+Min subnormal (hex): 4.9E-324
+Double.MIN_VALUE: 4.9E-324
+Positive infinity: Infinity
+Is positive infinite: true
+Negative infinity: -Infinity
+Is negative infinite: true
+NaN: NaN
+Is NaN: true`,
+  },
+  {
+    name: "ReflectiveArrayTest",
+    description: "Reflective array creation - currently fails due to missing reflection support",
+    shouldFail: true,
+    expectedOutput: `=== Reflective Array Creation Test ===
+Created int array, length: 5
+Element 0: 42
+Element 1: 99
+Element 2: -1
+Multi-dimensional array [2][3]:
+Hello World ! 
+Java Array Test 
+Double array:
+  [0] = 3.14
+  [1] = 2.71
+  [2] = 1.41
+Int array class: [I
+Is array: true
+Component type: int
+Multi array class: [[Ljava.lang.String;
+Multi array component type: [Ljava.lang.String;
+Zero-length array length: 0
+Jagged array created with different row sizes:
+  Row 0 length: 2
+  Row 1 length: 4
+  Row 2 length: 1`,
+  },
+  {
+    name: "StringInternTest",
+    description: "String interning - should match standard Java",
+    shouldFail: false,
+    expectedOutput: `=== String Intern Test ===
+Literal strings s1 == s2: true
+s1 == new String("hello"): false
+s1.equals(s3): true
+s1 == s3.intern(): true
+"hel" + "lo" == "he" + "llo": true
+concat1 == s1: true
+Runtime concat1 == runtime concat2: false
+Runtime concat1 == literal: false
+Runtime concat1.intern() == literal: true
+StringBuilder result == literal: false
+StringBuilder result.intern() == literal: true
+Number literal "123" == Integer.toString(123): false
+Number literal == new String("123"): false
+Integer.toString(123).intern() == "123": true
+Empty literal "" == new String("").intern(): true
+null.intern() threw NullPointerException: NullPointerException
+Two unique strings == : false
+unique1.intern() == unique2.intern(): true
+unique1.intern() == unique1: false`,
+  },
 ];
 
 test("Seldom-used Java Features", async function (t) {

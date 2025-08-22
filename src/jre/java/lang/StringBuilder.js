@@ -25,7 +25,9 @@ module.exports = {
       return obj;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      return jvm.internString(obj.value);
+      const strObj = new String(obj.value);
+      strObj.type = 'java/lang/String';
+      return strObj;
     },
     'reverse()Ljava/lang/StringBuilder;': (jvm, obj, args) => {
       // Unicode-aware reversal using Array.from to handle surrogate pairs and combining marks
