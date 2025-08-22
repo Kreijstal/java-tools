@@ -155,6 +155,27 @@ function setupBrowserSystemOverride() {
         // Note: We don't override getProperty, exit, or other methods - they remain as-is from System.js
       },
     },
+    "java/lang/Runtime": {
+      methods: {
+        // Browser-compatible Runtime method overrides with reasonable fallbacks
+        "availableProcessors()I": (jvm, _, args) => {
+          // Browser fallback: return a reasonable default of 4 cores
+          return 4;
+        },
+        "freeMemory()J": (jvm, _, args) => {
+          // Browser fallback: return a reasonable estimate (64MB free)
+          return 64 * 1024 * 1024; // 64MB
+        },
+        "totalMemory()J": (jvm, _, args) => {
+          // Browser fallback: return a reasonable estimate (128MB total)
+          return 128 * 1024 * 1024; // 128MB
+        },
+        "maxMemory()J": (jvm, _, args) => {
+          // Browser fallback: return a reasonable estimate (2GB max)
+          return 2 * 1024 * 1024 * 1024; // 2GB
+        },
+      },
+    },
   });
 
   // ALSO use the older registerJreMethods for println to make sure it works in both paths
@@ -460,6 +481,27 @@ function setupBrowserSystemOverrideWithXterm() {
             xtermInputEnabled: true,
           };
           systemClass.staticFields.set("in:Ljava/io/InputStream;", inStream);
+        },
+      },
+    },
+    "java/lang/Runtime": {
+      methods: {
+        // Browser-compatible Runtime method overrides with reasonable fallbacks
+        "availableProcessors()I": (jvm, _, args) => {
+          // Browser fallback: return a reasonable default of 4 cores
+          return 4;
+        },
+        "freeMemory()J": (jvm, _, args) => {
+          // Browser fallback: return a reasonable estimate (64MB free)
+          return 64 * 1024 * 1024; // 64MB
+        },
+        "totalMemory()J": (jvm, _, args) => {
+          // Browser fallback: return a reasonable estimate (128MB total)
+          return 128 * 1024 * 1024; // 128MB
+        },
+        "maxMemory()J": (jvm, _, args) => {
+          // Browser fallback: return a reasonable estimate (2GB max)
+          return 2 * 1024 * 1024 * 1024; // 2GB
         },
       },
     },
