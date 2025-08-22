@@ -29,12 +29,19 @@ module.exports = {
       for (let i = 0; i < recipe.length; i++) {
         const char = recipe.charAt(i);
         if (char === '\u0001') {
-          result += dynamicArgs[argIndex++];
+          const arg = dynamicArgs[argIndex++];
+          // Convert boolean values (1/0) to "true"/"false" strings
+          if (arg === 1 || arg === 0) {
+            result += (arg === 1 ? 'true' : 'false');
+          } else {
+            result += arg;
+          }
         } else {
           result += char;
         }
       }
-      return jvm.internString(result);
+      // Per the Java spec, runtime concatenation should produce a new String object.
+      return jvm.newString(result);
     }
   },
 };
