@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/lang/Number',
   staticFields: {
     'TYPE:Ljava/lang/Class;': {
       type: 'java/lang/Class',

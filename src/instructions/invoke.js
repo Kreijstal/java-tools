@@ -110,16 +110,14 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   // Check for null object reference
   if (boxedObj === null) {
-    throw {
+    const exception = {
       type: "java/lang/NullPointerException",
-      message: null,
-      context: {
-        frame: frame,
-        pc: frame.instructions[frame.pc - 1].pc,
-        className: className,
-        methodName: methodName,
-      },
+      message: `Attempted to call method ${className}.${methodName}${descriptor} on a null object reference.`,
     };
+    // The pc needs to be the pc of the instruction that caused the exception.
+    const pc = frame.pc - 1;
+    jvm.handleException(exception, pc, thread);
+    return;
   }
 
   let currentClassName = boxedObj.type;

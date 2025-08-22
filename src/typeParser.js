@@ -1,7 +1,15 @@
-const { primitiveTypeDescriptors } = require('./constants');
-
 function parseDescriptor(descriptor) {
-  const types = primitiveTypeDescriptors;
+  const types = {
+    B: "byte",
+    C: "char",
+    D: "double",
+    F: "float",
+    I: "int",
+    J: "long",
+    S: "short",
+    Z: "boolean",
+    V: "void"
+  };
 
   function parseType(descriptor, index) {
     let arrayDepth = 0;

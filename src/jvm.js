@@ -4,7 +4,6 @@ const {
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
 const { parseDescriptor } = require("./typeParser");
-const { primitiveTypeDescriptors, arrayPrimitiveTypeDescriptors } = require("./constants");
 const {
   formatInstruction,
   unparseDataStructures,
@@ -790,8 +789,19 @@ class JVM {
     const descriptor = arrayClassName.substring(1);
     
     // Handle primitive types
-    if (arrayPrimitiveTypeDescriptors[descriptor]) {
-      return arrayPrimitiveTypeDescriptors[descriptor];
+    const primitiveMap = {
+      'B': 'byte',
+      'C': 'char',
+      'D': 'double',
+      'F': 'float',
+      'I': 'int',
+      'J': 'long',
+      'S': 'short',
+      'Z': 'boolean'
+    };
+
+    if (primitiveMap[descriptor]) {
+      return primitiveMap[descriptor];
     }
     
     // Handle object types (L<classname>;)
@@ -840,13 +850,23 @@ class JVM {
     }
 
     // Handle primitive types
-    const primitiveTypeNames = new Set(Object.values(primitiveTypeDescriptors));
+    const primitiveTypes = {
+      'int': 'int',
+      'long': 'long',
+      'double': 'double',
+      'float': 'float',
+      'char': 'char',
+      'short': 'short',
+      'byte': 'byte',
+      'boolean': 'boolean',
+      'void': 'void'
+    };
     
-    if (primitiveTypeNames.has(classNameWithSlashes)) {
+    if (primitiveTypes[classNameWithSlashes]) {
       const classObj = {
         type: "java/lang/Class",
         isPrimitive: true,
-        name: classNameWithSlashes,
+        name: primitiveTypes[classNameWithSlashes],
       };
       this.classObjectCache.set(classNameWithSlashes, classObj);
       return classObj;
@@ -1253,6 +1273,7 @@ class JVM {
   }
 
   handleException(exception, pc, thread) {
+    console.log(`handleException: exception=${exception.type}, pc=${pc}, thread=${thread.id}`);
     if (thread.pendingException) {
       delete thread.pendingException;
     }
