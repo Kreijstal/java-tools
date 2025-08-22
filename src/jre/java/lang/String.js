@@ -34,6 +34,16 @@ module.exports = {
     "length()I": (jvm, obj, args) => {
       return obj.length;
     },
+    "charAt(I)C": (jvm, obj, args) => {
+      const index = args[0];
+      if (index < 0 || index >= obj.length) {
+        throw {
+          type: 'java/lang/StringIndexOutOfBoundsException',
+          message: `String index out of range: ${index}`,
+        };
+      }
+      return obj.charCodeAt(index);
+    },
     "equals(Ljava/lang/Object;)Z": (jvm, obj, args) => {
       return obj === args[0] ? 1 : 0;
     },
