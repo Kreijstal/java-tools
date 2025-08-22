@@ -63,9 +63,12 @@ test('Exception Tests', async function(t) {
   });
 
   t.test('JVM should handle StackOverflowError', async t => {
-    // TODO: The JVM should throw a StackOverflowError, but it currently does not.
-    // This test is set to expect failure to highlight the bug.
-    t.plan(1);
-    await runTest('StackOverflowTest', undefined, t, { shouldFail: true });
+    t.plan(2);
+    const expectedOutput = '=== Stack Overflow Test ===\n' +
+      'Starting infinite recursion...\n' +
+      'Recursion depth: 1000\n' +
+      'Caught StackOverflowError at depth: 1023\n' +
+      'Test completed';
+    await runTest('StackOverflowTest', expectedOutput, t);
   });
 });

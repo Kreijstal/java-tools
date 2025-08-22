@@ -6,6 +6,8 @@ const jreClasses = {
   'java/lang/StringBuilder': require('./java/lang/StringBuilder'),
   'java/lang/Enum': require('./java/lang/Enum'),
   'java/lang/Runnable': require('./java/lang/Runnable'),
+  'java/lang/IndexOutOfBoundsException': require('./java/lang/IndexOutOfBoundsException'),
+  'java/lang/StringIndexOutOfBoundsException': require('./java/lang/StringIndexOutOfBoundsException'),
   'java/lang/Thread': require('./java/lang/Thread'),
   'java/lang/Throwable': require('./java/lang/Throwable'),
   'java/lang/Exception': require('./java/lang/Exception'),

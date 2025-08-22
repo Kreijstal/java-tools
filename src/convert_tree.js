@@ -12,7 +12,7 @@
 function formatStringConstant(str) {
   return JSON.stringify(str)
     .replace(/\\u([0-9a-f]{4})/gi, (match, hex) => `\\u${hex.toUpperCase()}`)
-    .replace(/\\n/g, '\\u000A');
+    .replace(/\\n/g, "\\u000A");
 }
 
 /**
@@ -23,16 +23,16 @@ function formatStringConstant(str) {
 function formatDoubleConstant(value) {
   // Handle special values to match Krakatau format
   if (isNaN(value)) {
-    return '+NaN';
+    return "+NaN";
   }
   if (value === Infinity) {
-    return '+Infinity';
+    return "+Infinity";
   }
   if (value === -Infinity) {
-    return '-Infinity';
+    return "-Infinity";
   }
   // Always use exponential notation for doubles to match Krakatau
-  return value.toExponential().replace(/e\+?/, 'e');
+  return value.toExponential().replace(/e\+?/, "e");
 }
 
 /**
@@ -43,16 +43,16 @@ function formatDoubleConstant(value) {
 function formatFloatConstant(value) {
   // Handle special values to match Krakatau format
   if (isNaN(value)) {
-    return '+NaNf';
+    return "+NaNf";
   }
   if (value === Infinity) {
-    return '+Infinityf';
+    return "+Infinityf";
   }
   if (value === -Infinity) {
-    return '-Infinityf';
+    return "-Infinityf";
   }
   // Always use exponential notation with 'f' suffix for floats to match Krakatau
-  return value.toExponential().replace(/e\+?/, 'e') + 'f';
+  return value.toExponential().replace(/e\+?/, "e") + "f";
 }
 
 function resolveConstant(index, constantPool) {
@@ -68,13 +68,14 @@ function resolveConstant(index, constantPool) {
       floatView.setUint32(0, entry.info.bytes, false);
       return { value: floatView.getFloat32(0, false), type: "Float" };
     case 5: // Long
-      let longValue = (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
-      if (longValue >= (1n << 63n)) {
-        longValue -= (1n << 64n);
+      let longValue =
+        (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
+      if (longValue >= 1n << 63n) {
+        longValue -= 1n << 64n;
       }
       return {
         value: longValue,
-        type: "Long"
+        type: "Long",
       };
     case 6: // Double
       const doubleHigh = BigInt(entry.info.high_bytes);
@@ -84,24 +85,28 @@ function resolveConstant(index, constantPool) {
       doubleView.setBigUint64(0, doubleBits, false);
       return {
         value: doubleView.getFloat64(0, false),
-        type: "Double"
+        type: "Double",
       };
     case 7: // Class
       return {
         value: resolveConstant(entry.info.name_index, constantPool).value,
-        type: "Class"
+        type: "Class",
       };
     case 8: // String
       return {
         value: resolveConstant(entry.info.string_index, constantPool).value,
-        type: "String"
+        type: "String",
       };
     case 9: // Fieldref
     case 10: // Methodref
     case 11: // InterfaceMethodref
-      const className = resolveConstant(entry.info.class_index, constantPool).value;
+      const className = resolveConstant(
+        entry.info.class_index,
+        constantPool,
+      ).value;
       const nameAndType = resolveConstant(
-        entry.info.name_and_type_index, constantPool
+        entry.info.name_and_type_index,
+        constantPool,
       ).value;
       return {
         value: { className, nameAndType },
@@ -109,25 +114,56 @@ function resolveConstant(index, constantPool) {
           entry.tag === 9
             ? "Fieldref"
             : entry.tag === 10
-            ? "Methodref"
-            : "InterfaceMethodref"
+              ? "Methodref"
+              : "InterfaceMethodref",
       };
     case 12: // NameAndType
       const name = resolveConstant(entry.info.name_index, constantPool).value;
-      const descriptor = resolveConstant(entry.info.descriptor_index, constantPool).value;
+      const descriptor = resolveConstant(
+        entry.info.descriptor_index,
+        constantPool,
+      ).value;
       return { value: { name, descriptor }, type: "NameAndType" };
     case 15: // MethodHandle
-      const kindMap = {1: "getField", 2: "getStatic", 3: "putField", 4: "putStatic", 5: "invokeVirtual", 6: "invokeStatic", 7: "invokeSpecial", 8: "newInvokeSpecial", 9: "invokeInterface"};
+      const kindMap = {
+        1: "getField",
+        2: "getStatic",
+        3: "putField",
+        4: "putStatic",
+        5: "invokeVirtual",
+        6: "invokeStatic",
+        7: "invokeSpecial",
+        8: "newInvokeSpecial",
+        9: "invokeInterface",
+      };
       const referenceKind = kindMap[entry.info.reference_kind];
-      const reference = resolveConstant(entry.info.reference_index, constantPool);
-      return { value: { kind: referenceKind, reference: reference.value }, type: "MethodHandle" };
+      const reference = resolveConstant(
+        entry.info.reference_index,
+        constantPool,
+      );
+      return {
+        value: { kind: referenceKind, reference: reference.value },
+        type: "MethodHandle",
+      };
     case 16: // MethodType
-      const methodDescriptor = resolveConstant(entry.info.descriptor_index, constantPool).value;
+      const methodDescriptor = resolveConstant(
+        entry.info.descriptor_index,
+        constantPool,
+      ).value;
       return { value: methodDescriptor, type: "MethodType" };
     case 18: // InvokeDynamic
       const bootstrapMethodAttrIndex = entry.info.bootstrap_method_attr_index;
-      const nameAndTypeDynamic = resolveConstant(entry.info.name_and_type_index, constantPool).value;
-      return { value: { bootstrap_method_attr_index: bootstrapMethodAttrIndex, nameAndType: nameAndTypeDynamic}, type: "InvokeDynamic" };
+      const nameAndTypeDynamic = resolveConstant(
+        entry.info.name_and_type_index,
+        constantPool,
+      ).value;
+      return {
+        value: {
+          bootstrap_method_attr_index: bootstrapMethodAttrIndex,
+          nameAndType: nameAndTypeDynamic,
+        },
+        type: "InvokeDynamic",
+      };
     default:
       return { value: null, type: "unknown" };
   }
@@ -137,29 +173,31 @@ function formatConst(entry, index, constantPool, cls) {
   if (!entry) return "";
   let line = `.const [_${index}] =`;
 
-  switch(entry.tag) {
-      case 18: // InvokeDynamic
-          if (!cls.bootstrapMethods) return "";
-          const bsmIndex = entry.info.bootstrap_method_attr_index;
-          const bsm = cls.bootstrapMethods[bsmIndex];
-          if (!bsm) return "";
-          const nameAndType = resolveConstant(entry.info.name_and_type_index, constantPool).value;
+  switch (entry.tag) {
+    case 18: // InvokeDynamic
+      if (!cls.bootstrapMethods) return "";
+      const bsmIndex = entry.info.bootstrap_method_attr_index;
+      const bsm = cls.bootstrapMethods[bsmIndex];
+      if (!bsm) return "";
+      const nameAndType = resolveConstant(
+        entry.info.name_and_type_index,
+        constantPool,
+      ).value;
 
-          line += ` InvokeDynamic ${formatInstructionArg(bsm.method_ref.value.reference.nameAndType.name)} ${bsm.arguments.map(a => formatInstructionArg(a.value)).join(' ')} : ${nameAndType.name} ${nameAndType.descriptor}`;
-          break;
-      case 15: // MethodHandle
-          const methodHandle = resolveConstant(index, constantPool).value;
-          if (!methodHandle) return "";
-          const refConst = methodHandle.reference;
-          if (!refConst) return "";
-          line += ` MethodHandle ${methodHandle.kind} Method ${refConst.className.replace(/\./g, '/')} ${refConst.nameAndType.name} ${refConst.nameAndType.descriptor}`;
-          break;
-      default:
-          return "";
+      line += ` InvokeDynamic ${formatInstructionArg(bsm.method_ref.value.reference.nameAndType.name)} ${bsm.arguments.map((a) => formatInstructionArg(a.value)).join(" ")} : ${nameAndType.name} ${nameAndType.descriptor}`;
+      break;
+    case 15: // MethodHandle
+      const methodHandle = resolveConstant(index, constantPool).value;
+      if (!methodHandle) return "";
+      const refConst = methodHandle.reference;
+      if (!refConst) return "";
+      line += ` MethodHandle ${methodHandle.kind} Method ${refConst.className.replace(/\./g, "/")} ${refConst.nameAndType.name} ${refConst.nameAndType.descriptor}`;
+      break;
+    default:
+      return "";
   }
   return line;
 }
-
 
 function convertJson(inputJson, constantPool) {
   if (inputJson.classes) {
@@ -175,7 +213,7 @@ function convertJson(inputJson, constantPool) {
       1024: "abstract",
       4096: "enum",
       8192: "module",
-      16384: "synthetic"
+      16384: "synthetic",
     },
     method: {
       1: "public",
@@ -189,7 +227,7 @@ function convertJson(inputJson, constantPool) {
       256: "native",
       1024: "abstract",
       2048: "strictfp",
-      4096: "synthetic"
+      4096: "synthetic",
     },
     field: {
       1: "public",
@@ -200,8 +238,8 @@ function convertJson(inputJson, constantPool) {
       64: "volatile",
       128: "transient",
       4096: "enum",
-      8192: "synthetic"
-    }
+      8192: "synthetic",
+    },
   };
 
   const outputJson = {
@@ -210,8 +248,8 @@ function convertJson(inputJson, constantPool) {
         version: [
           {
             major: inputJson.major_version.toString(),
-            minor: inputJson.minor_version.toString()
-          }
+            minor: inputJson.minor_version.toString(),
+          },
         ],
         flags: getFlags(inputJson.accessFlags, "class"),
         className: inputJson.className.replace(/\./g, "/"),
@@ -219,17 +257,17 @@ function convertJson(inputJson, constantPool) {
           ? inputJson.superClassName.replace(/\./g, "/")
           : null,
         interfaces: inputJson.interfaces
-          ? inputJson.interfaces.map(iface => iface.replace(/\./g, "/"))
+          ? inputJson.interfaces.map((iface) => iface.replace(/\./g, "/"))
           : [],
-        items: []
-      }
-    ]
+        items: [],
+      },
+    ],
   };
 
   function getFlags(accessFlags, context) {
     const flags = [];
     for (const [flagValue, flagName] of Object.entries(
-      accessFlagMap[context]
+      accessFlagMap[context],
     )) {
       if (accessFlags & flagValue) {
         flags.push(flagName);
@@ -244,11 +282,12 @@ function convertJson(inputJson, constantPool) {
       type: "field",
       field: {
         flags: getFlags(field.accessFlags, "field"),
+        accessFlags: field.accessFlags,
         name: field.name,
         descriptor: field.descriptor,
         value: null, // Assuming no value, adjust if needed
-        attrs: null // Assuming no attrs, adjust if needed
-      }
+        attrs: null, // Assuming no attrs, adjust if needed
+      },
     };
     outputJson.classes[0].items.push(fieldItem);
   });
@@ -261,8 +300,8 @@ function convertJson(inputJson, constantPool) {
         flags: getFlags(method.accessFlags, "method"),
         name: method.name,
         descriptor: method.descriptor,
-        attributes: []
-      }
+        attributes: [],
+      },
     };
 
     // Convert code attribute if exists
@@ -275,8 +314,8 @@ function convertJson(inputJson, constantPool) {
           localsSize: method.code.maxLocals.toString(),
           codeItems: [],
           exceptionTable: [],
-          attributes: []
-        }
+          attributes: [],
+        },
       };
 
       // Build a map for labels to program counters
@@ -293,6 +332,7 @@ function convertJson(inputJson, constantPool) {
         const codeItem = {};
         const labelDef = `L${instr.pc}:`;
         codeItem.labelDef = labelDef;
+        codeItem.pc = instr.pc;
 
         // Handle different opcodes
         switch (instr.opcodeName) {
@@ -300,7 +340,10 @@ function convertJson(inputJson, constantPool) {
           case "invokevirtual":
           case "invokestatic":
           case "invokeinterface":
-            const methodRef = resolveConstant(instr.operands.index, constantPool);
+            const methodRef = resolveConstant(
+              instr.operands.index,
+              constantPool,
+            );
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: [
@@ -310,10 +353,10 @@ function convertJson(inputJson, constantPool) {
                 methodRef.value.className.replace(/\./g, "/"),
                 [
                   methodRef.value.nameAndType.name,
-                  methodRef.value.nameAndType.descriptor
-                ]
+                  methodRef.value.nameAndType.descriptor,
+                ],
               ],
-              cp_index: instr.operands.index
+              cp_index: instr.operands.index,
             };
             if (instr.opcodeName === "invokeinterface") {
               codeItem.instruction.count = instr.operands.count.toString();
@@ -321,11 +364,14 @@ function convertJson(inputJson, constantPool) {
             break;
 
           case "invokedynamic":
-            const invokeDynamicRef = resolveConstant(instr.operands.index, constantPool);
+            const invokeDynamicRef = resolveConstant(
+              instr.operands.index,
+              constantPool,
+            );
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: invokeDynamicRef.value,
-              cp_index: instr.operands.index
+              cp_index: instr.operands.index,
             };
             break;
 
@@ -333,7 +379,10 @@ function convertJson(inputJson, constantPool) {
           case "putfield":
           case "getstatic":
           case "putstatic":
-            const fieldRef = resolveConstant(instr.operands.index, constantPool);
+            const fieldRef = resolveConstant(
+              instr.operands.index,
+              constantPool,
+            );
             codeItem.instruction = {
               op: instr.opcodeName,
               arg: [
@@ -341,16 +390,19 @@ function convertJson(inputJson, constantPool) {
                 fieldRef.value.className.replace(/\./g, "/"),
                 [
                   fieldRef.value.nameAndType.name,
-                  fieldRef.value.nameAndType.descriptor
-                ]
-              ]
+                  fieldRef.value.nameAndType.descriptor,
+                ],
+              ],
             };
             break;
 
           case "ldc":
           case "ldc_w":
           case "ldc2_w":
-            const ldcConstant = resolveConstant(instr.operands.index, constantPool);
+            const ldcConstant = resolveConstant(
+              instr.operands.index,
+              constantPool,
+            );
             let arg;
             switch (ldcConstant.type) {
               case "Class":
@@ -365,7 +417,7 @@ function convertJson(inputJson, constantPool) {
               case "Float":
                 arg = { value: ldcConstant.value, type: "Float" };
                 break;
-              case "Double": 
+              case "Double":
                 arg = { value: ldcConstant.value, type: "Double" };
                 break;
               default:
@@ -373,7 +425,7 @@ function convertJson(inputJson, constantPool) {
             }
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: arg
+              arg: arg,
             };
             break;
 
@@ -397,34 +449,35 @@ function convertJson(inputJson, constantPool) {
             const targetPc = instr.pc + instr.operands.branchoffset;
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: labelMap[targetPc]
+              arg: labelMap[targetPc],
             };
             break;
 
           case "tableswitch":
             const defaultPc = instr.pc + instr.operands.default;
             const jumpOffsets = instr.operands.jumpOffsets.map(
-              (offset) => labelMap[instr.pc + offset]
+              (offset) => labelMap[instr.pc + offset],
             );
             codeItem.instruction = {
               op: "tableswitch",
               low: instr.operands.low.toString(),
               labels: jumpOffsets,
-              defaultLbl: "L" + instr.operands.default
+              defaultLbl: "L" + instr.operands.default,
             };
             break;
 
           case "lookupswitch":
             const lookupDefaultPc = instr.pc + instr.operands.default;
-            const lookupPairs = instr.operands.matchOffsetPairs.map(
-              (pair) => [pair.match, labelMap[instr.pc + pair.offset]]
-            );
+            const lookupPairs = instr.operands.matchOffsetPairs.map((pair) => [
+              pair.match,
+              labelMap[instr.pc + pair.offset],
+            ]);
             codeItem.instruction = {
               op: "lookupswitch",
               arg: {
                 defaultLabel: labelMap[lookupDefaultPc],
-                pairs: lookupPairs
-              }
+                pairs: lookupPairs,
+              },
             };
             break;
 
@@ -432,7 +485,7 @@ function convertJson(inputJson, constantPool) {
             codeItem.instruction = {
               op: "iinc",
               varnum: instr.operands.index.toString(),
-              incr: instr.operands.const.toString()
+              incr: instr.operands.const.toString(),
             };
             break;
 
@@ -440,10 +493,13 @@ function convertJson(inputJson, constantPool) {
           case "checkcast":
           case "instanceof":
           case "anewarray":
-            const classInfo = resolveConstant(instr.operands.index, constantPool);
+            const classInfo = resolveConstant(
+              instr.operands.index,
+              constantPool,
+            );
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: classInfo.value.replace(/\./g, "/")
+              arg: classInfo.value.replace(/\./g, "/"),
             };
             break;
 
@@ -456,19 +512,25 @@ function convertJson(inputJson, constantPool) {
               8: "byte",
               9: "short",
               10: "int",
-              11: "long"
+              11: "long",
             };
             codeItem.instruction = {
               op: "newarray",
-              arg: atypeMap[instr.operands.atype]
+              arg: atypeMap[instr.operands.atype],
             };
             break;
 
           case "multianewarray":
-            const mclassInfo = resolveConstant(instr.operands.index, constantPool);
+            const mclassInfo = resolveConstant(
+              instr.operands.index,
+              constantPool,
+            );
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: [mclassInfo.value.replace(/\./g, "/"), instr.operands.dimensions.toString()]
+              arg: [
+                mclassInfo.value.replace(/\./g, "/"),
+                instr.operands.dimensions.toString(),
+              ],
             };
             break;
 
@@ -485,7 +547,7 @@ function convertJson(inputJson, constantPool) {
             // Instructions that take a local variable index
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: instr.operands.index.toString()
+              arg: instr.operands.index.toString(),
             };
             break;
 
@@ -493,7 +555,7 @@ function convertJson(inputJson, constantPool) {
             // Push byte value onto stack
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: instr.operands.byte.toString()
+              arg: instr.operands.byte.toString(),
             };
             break;
 
@@ -501,7 +563,7 @@ function convertJson(inputJson, constantPool) {
             // Push short value onto stack
             codeItem.instruction = {
               op: instr.opcodeName,
-              arg: instr.operands.value.toString()
+              arg: instr.operands.value.toString(),
             };
             break;
 
@@ -513,13 +575,13 @@ function convertJson(inputJson, constantPool) {
                 // iinc_w has both index and const operands
                 codeItem.instruction = {
                   op: "wide",
-                  arg: `${baseInstruction} ${instr.operands.index} ${instr.operands.const}`
+                  arg: `${baseInstruction} ${instr.operands.index} ${instr.operands.const}`,
                 };
               } else {
                 // Other wide instructions only have index operand
                 codeItem.instruction = {
                   op: "wide",
-                  arg: `${baseInstruction} ${instr.operands.index}`
+                  arg: `${baseInstruction} ${instr.operands.index}`,
                 };
               }
             } else {
@@ -534,16 +596,20 @@ function convertJson(inputJson, constantPool) {
 
       codeAttr.code.codeItems.push({
         labelDef: labelMap[method.code.codeLength] + ":",
-        instruction: null
+        instruction: null,
       });
 
       // Handle exception table entries
       if (method.code.exceptionTable && method.code.exceptionTable.length > 0) {
         codeAttr.code.exceptionTable = method.code.exceptionTable.map((ex) => {
           const catchTypeIndex = ex.catch_type;
-          const catchType = catchTypeIndex === 0
-            ? "any"
-            : resolveConstant(catchTypeIndex, constantPool).value.replace(/\./g, "/");
+          const catchType =
+            catchTypeIndex === 0
+              ? "any"
+              : resolveConstant(catchTypeIndex, constantPool).value.replace(
+                  /\./g,
+                  "/",
+                );
 
           return {
             start_pc: ex.start_pc,
@@ -558,38 +624,43 @@ function convertJson(inputJson, constantPool) {
       if (method.code.attributes) {
         method.code.attributes.forEach((attr) => {
           const attrName = resolveConstant(
-            attr.attribute_name_index.index, constantPool
+            attr.attribute_name_index.index,
+            constantPool,
           ).value;
           if (attrName === "LineNumberTable") {
             const lineAttr = {
               type: "linenumbertable",
-              lines: []
+              lines: [],
             };
             attr.info.line_number_table.forEach((line) => {
               const label = labelMap[line.start_pc];
               const lineNumber = line.line_number.toString();
               lineAttr.lines.push({
                 label,
-                lineNumber
+                lineNumber,
               });
             });
             codeAttr.code.attributes.push(lineAttr);
           } else if (attrName === "LocalVariableTable") {
             const varAttr = {
               type: "localvariabletable",
-              vars: []
+              vars: [],
             };
             attr.info.local_variable_table.forEach((varInfo) => {
-              const varName = resolveConstant(varInfo.name_index, constantPool).value;
+              const varName = resolveConstant(
+                varInfo.name_index,
+                constantPool,
+              ).value;
               const varDescriptor = resolveConstant(
-                varInfo.descriptor_index, constantPool
+                varInfo.descriptor_index,
+                constantPool,
               ).value;
               const varItem = {
                 index: varInfo.index.toString(),
                 name: varName,
                 descriptor: varDescriptor,
                 startLbl: labelMap[varInfo.start_pc],
-                endLbl: labelMap[varInfo.start_pc + varInfo.length]
+                endLbl: labelMap[varInfo.start_pc + varInfo.length],
               };
               varAttr.vars.push(varItem);
             });
@@ -606,8 +677,8 @@ function convertJson(inputJson, constantPool) {
       const exAttr = {
         type: "exceptions",
         exceptions: method.exceptions.map((exceptionName) =>
-          exceptionName.replace(/\./g, "/")
-        )
+          exceptionName.replace(/\./g, "/"),
+        ),
       };
       methodItem.method.attributes.push(exAttr);
     }
@@ -620,21 +691,26 @@ function convertJson(inputJson, constantPool) {
     type: "attribute",
     attribute: {
       type: "sourcefile",
-      value: `"${inputJson.sourceFile}"`
-    }
+      value: `"${inputJson.sourceFile}"`,
+    },
   });
 
   const bootstrapMethodsAttr = inputJson.attributes.find(
-    (attr) => resolveConstant(attr.attribute_name_index.index, constantPool).value === "BootstrapMethods"
+    (attr) =>
+      resolveConstant(attr.attribute_name_index.index, constantPool).value ===
+      "BootstrapMethods",
   );
 
   if (bootstrapMethodsAttr) {
-    outputJson.classes[0].bootstrapMethods = bootstrapMethodsAttr.info.bootstrap_methods.map((bsm) => {
-      return {
-        method_ref: resolveConstant(bsm.bootstrap_method_ref, constantPool),
-        arguments: bsm.bootstrap_arguments.map(argIndex => resolveConstant(argIndex, constantPool))
-      };
-    });
+    outputJson.classes[0].bootstrapMethods =
+      bootstrapMethodsAttr.info.bootstrap_methods.map((bsm) => {
+        return {
+          method_ref: resolveConstant(bsm.bootstrap_method_ref, constantPool),
+          arguments: bsm.bootstrap_arguments.map((argIndex) =>
+            resolveConstant(argIndex, constantPool),
+          ),
+        };
+      });
   }
 
   return outputJson;
@@ -669,20 +745,25 @@ function formatInstructionKrakatau(instr, withComments = false) {
     return `${instr.op} ${instr.varnum} ${instr.incr}`;
   } else if (instr.op === "invokedynamic") {
     if (withComments) {
-        const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
-        return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
+      const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
+      return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
     }
     return `${instr.op} [_${instr.cp_index}]`;
-  } else if (instr.op === "invokespecial" || instr.op === "invokevirtual" || instr.op === "invokestatic" || instr.op === "invokeinterface") {
+  } else if (
+    instr.op === "invokespecial" ||
+    instr.op === "invokevirtual" ||
+    instr.op === "invokestatic" ||
+    instr.op === "invokeinterface"
+  ) {
     const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
     if (withComments) {
       if (instr.op === "invokeinterface") {
-          return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
+        return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
       }
       return `${instr.op} ${argStr} ; [_${instr.cp_index}]`;
     }
     if (instr.op === "invokeinterface") {
-        return `${instr.op} ${argStr} ${instr.count}`;
+      return `${instr.op} ${argStr} ${instr.count}`;
     }
     return `${instr.op} ${argStr}`;
   } else if (instr.op !== undefined && instr.arg !== undefined) {
@@ -719,20 +800,25 @@ function formatInstruction(instr, withComments = false) {
     return `${instr.op} ${instr.varnum} ${instr.incr}`;
   } else if (instr.op === "invokedynamic") {
     if (withComments) {
-        const argStr = formatInstructionArg(instr.arg);
-        return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
+      const argStr = formatInstructionArg(instr.arg);
+      return `${instr.op} [_${instr.cp_index}] ; ${argStr}`;
     }
     return `${instr.op} [_${instr.cp_index}]`;
-  } else if (instr.op === "invokespecial" || instr.op === "invokevirtual" || instr.op === "invokestatic" || instr.op === "invokeinterface") {
+  } else if (
+    instr.op === "invokespecial" ||
+    instr.op === "invokevirtual" ||
+    instr.op === "invokestatic" ||
+    instr.op === "invokeinterface"
+  ) {
     const argStr = formatInstructionArg(instr.arg);
     if (withComments) {
       if (instr.op === "invokeinterface") {
-          return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
+        return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
       }
       return `${instr.op} ${argStr} ; [_${instr.cp_index}]`;
     }
     if (instr.op === "invokeinterface") {
-        return `${instr.op} ${argStr} ${instr.count}`;
+      return `${instr.op} ${argStr} ${instr.count}`;
     }
     return `${instr.op} ${argStr}`;
   } else if (instr.op !== undefined && instr.arg !== undefined) {
@@ -778,18 +864,20 @@ function formatInstructionArg(arg) {
  */
 function formatInstructionArgKrakatau(arg, opcode) {
   if (Array.isArray(arg)) {
-    if ((opcode === 'ldc' || opcode === 'ldc_w') && arg[0] === 'Class') {
-      return arg.join(' ');
+    if ((opcode === "ldc" || opcode === "ldc_w") && arg[0] === "Class") {
+      return arg.join(" ");
     }
-    return arg.map(item => formatInstructionArgKrakatau(item, opcode)).join(" ");
+    return arg
+      .map((item) => formatInstructionArgKrakatau(item, opcode))
+      .join(" ");
   }
 
-  if (typeof arg === 'bigint') {
-    return arg.toString() + 'L';
+  if (typeof arg === "bigint") {
+    return arg.toString() + "L";
   }
 
   if (typeof arg === "string") {
-    if (opcode === 'ldc' || opcode === 'ldc_w') {
+    if (opcode === "ldc" || opcode === "ldc_w") {
       return formatStringConstant(arg);
     }
     return arg;
@@ -799,45 +887,46 @@ function formatInstructionArgKrakatau(arg, opcode) {
       // Apply special formatting for Float to match Krakatau
       const value = arg.value;
       if (Number.isNaN(value)) {
-        return '+NaNf';
+        return "+NaNf";
       }
       if (value === Infinity) {
-        return '+Infinityf';
+        return "+Infinityf";
       }
       if (value === -Infinity) {
-        return '-Infinityf';
+        return "-Infinityf";
       }
       // For floats, use exponential notation with 'f' suffix to match Krakatau
       // Check if this is a simple value that can be represented more compactly
-      const expStr = value.toExponential().replace(/e\+?/, 'e');
-      
+      const expStr = value.toExponential().replace(/e\+?/, "e");
+
       // Check if the value matches a simple decimal (like 3.14)
       // by checking if rounding to 2-6 decimal places gives us the same float value
       for (let decimals = 2; decimals <= 6; decimals++) {
         const rounded = parseFloat(value.toFixed(decimals));
-        if (Math.abs(rounded - value) < 1e-6) { // Increased tolerance for float precision
-          const roundedExp = rounded.toExponential().replace(/e\+?/, 'e');
+        if (Math.abs(rounded - value) < 1e-6) {
+          // Increased tolerance for float precision
+          const roundedExp = rounded.toExponential().replace(/e\+?/, "e");
           if (roundedExp.length < expStr.length) {
-            return roundedExp + 'f';
+            return roundedExp + "f";
           }
         }
       }
-      
-      return expStr + 'f';
+
+      return expStr + "f";
     } else if (arg.type === "Double") {
       // Apply special formatting for Double to match Krakatau
       const value = arg.value;
       if (Number.isNaN(value)) {
-        return '+NaN';
+        return "+NaN";
       }
       if (value === Infinity) {
-        return '+Infinity';
+        return "+Infinity";
       }
       if (value === -Infinity) {
-        return '-Infinity';
+        return "-Infinity";
       }
       // For doubles, use exponential notation to match Krakatau
-      return value.toExponential().replace(/e\+?/, 'e');
+      return value.toExponential().replace(/e\+?/, "e");
     } else if (arg.type === "sourcefile") {
       return arg.value; // Return the value directly without further formatting
     } else {
@@ -847,18 +936,18 @@ function formatInstructionArgKrakatau(arg, opcode) {
   } else if (typeof arg === "number") {
     // Apply special formatting for floating point numbers to match Krakatau
     if (Number.isNaN(arg)) {
-      return '+NaN';
+      return "+NaN";
     }
     if (arg === Infinity) {
-      return '+Infinity';
+      return "+Infinity";
     }
     if (arg === -Infinity) {
-      return '-Infinity';
+      return "-Infinity";
     }
     // For floating point numbers, use exponential notation to match Krakatau
     const str = arg.toString();
-    if (str.includes('.') && !str.includes('e')) {
-      return arg.toExponential().replace(/e\+?/, 'e');
+    if (str.includes(".") && !str.includes("e")) {
+      return arg.toExponential().replace(/e\+?/, "e");
     }
     return String(arg);
   } else {
@@ -878,9 +967,9 @@ function unparseDataStructures(cls, constantPool, options = {}) {
       const lines = [
         `        .linenumbertable`,
         ...attr.lines.map(
-          (line) => `            ${line.label} ${line.lineNumber}`
+          (line) => `            ${line.label} ${line.lineNumber}`,
         ),
-        `        .end linenumbertable`
+        `        .end linenumbertable`,
       ];
       return lines.join("\n");
     } else if (attr.type === "localvariabletable") {
@@ -888,9 +977,9 @@ function unparseDataStructures(cls, constantPool, options = {}) {
         `        .localvariabletable`,
         ...attr.vars.map(
           (v) =>
-            `            ${v.index} is ${v.name} ${v.descriptor} from ${v.startLbl} to ${v.endLbl}`
+            `            ${v.index} is ${v.name} ${v.descriptor} from ${v.startLbl} to ${v.endLbl}`,
         ),
-        `        .end localvariabletable`
+        `        .end localvariabletable`,
       ];
       return vars.join("\n");
     }
@@ -899,115 +988,118 @@ function unparseDataStructures(cls, constantPool, options = {}) {
   }
 
   return ((cls) => {
-      // Include the .version directive if present
-      const headerLines = [];
+    // Include the .version directive if present
+    const headerLines = [];
 
-      if (cls.version && cls.version.length > 0) {
-        headerLines.push(
-          `.version ${cls.version[0].major} ${cls.version[0].minor}`
-        );
-      }
-
-      headerLines.push(`.class ${cls.flags.join(" ")} ${cls.className}`);
-      headerLines.push(`.super ${cls.superClassName}`);
-
-      // Handle interfaces
-      if (cls.interfaces && cls.interfaces.length > 0) {
-        headerLines.push(
-          cls.interfaces.map((iface) => `.implements ${iface}`).join("\n")
-        );
-      }
-
-      // Fields
-      const fields = cls.items
-        .filter((item) => item.type === "field")
-        .map((item) => {
-          const field = item.field;
-          return `.field ${field.name} ${field.descriptor}`;
-        })
-        .join("\n\n");
-
-      // Methods
-      const methods = cls.items
-        .filter((item) => item.type === "method")
-        .map((item) => {
-          const method = item.method;
-          const methodHeader = `.method ${method.flags.join(" ")} ${
-            method.name
-          } : ${method.descriptor}`;
-
-          // Code attribute
-          const codeAttribute = method.attributes.find(
-            (attr) => attr.type === "code"
-          );
-          let codeSection = "";
-          if (codeAttribute && codeAttribute.code) {
-            const codeLines = [
-              `    .code stack ${codeAttribute.code.stackSize} locals ${codeAttribute.code.localsSize}`,
-              ...codeAttribute.code.codeItems.flatMap((ci) => {
-                let line = "";
-                if (ci.labelDef) {
-                  line += `${ci.labelDef}`;
-                }
-                if (ci.instruction) {
-                  if (line.length > 0) {
-                    line += "    ";
-                  }
-                  line += formatInstructionKrakatau(ci.instruction, withComments);
-                }
-                if (ci.type === "catch") {
-                  line = `    .catch ${ci.clsref} from ${ci.fromLbl} to ${ci.toLbl} using ${ci.usingLbl}`;
-                }
-                return line ? [line] : [];
-              }),
-              ...codeAttribute.code.attributes.map((attr) =>
-                formatCodeAttribute(attr)
-              ),
-              `    .end code`
-            ];
-            codeSection = codeLines.join("\n");
-          }
-
-          // Exceptions
-          const exceptionsAttribute = method.attributes.find(
-            (attr) => attr.type === "exceptions"
-          );
-          let exceptionsSection = "";
-          if (exceptionsAttribute) {
-            exceptionsSection = `    .exceptions ${exceptionsAttribute.exceptions.join(
-              " "
-            )}`;
-          }
-
-          return [methodHeader, codeSection, exceptionsSection, `.end method`]
-            .filter(Boolean)
-            .join("\n");
-        })
-        .join("\n\n");
-
-      // Source file
-      const sourceFileAttribute = cls.items.find(
-        (item) => item.attribute && item.attribute.type === "sourcefile"
+    if (cls.version && cls.version.length > 0) {
+      headerLines.push(
+        `.version ${cls.version[0].major} ${cls.version[0].minor}`,
       );
-      let sourceFileLine = "";
-      if (sourceFileAttribute) {
-        sourceFileLine = `.sourcefile ${sourceFileAttribute.attribute.value}`;
-      }
+    }
 
-      const constLines = constantPool.map((entry, index) => formatConst(entry, index, constantPool, cls)).filter(Boolean).join('\n');
+    headerLines.push(`.class ${cls.flags.join(" ")} ${cls.className}`);
+    headerLines.push(`.super ${cls.superClassName}`);
 
-      // Combine all parts
-      return [
-        headerLines.filter(Boolean).join("\n"),
-        fields,
-        methods,
-        sourceFileLine,
-        constLines,
-        `.end class`
-      ]
-        .filter(Boolean)
-        .join("\n");
-    })(cls);
+    // Handle interfaces
+    if (cls.interfaces && cls.interfaces.length > 0) {
+      headerLines.push(
+        cls.interfaces.map((iface) => `.implements ${iface}`).join("\n"),
+      );
+    }
+
+    // Fields
+    const fields = cls.items
+      .filter((item) => item.type === "field")
+      .map((item) => {
+        const field = item.field;
+        return `.field ${field.name} ${field.descriptor}`;
+      })
+      .join("\n\n");
+
+    // Methods
+    const methods = cls.items
+      .filter((item) => item.type === "method")
+      .map((item) => {
+        const method = item.method;
+        const methodHeader = `.method ${method.flags.join(" ")} ${
+          method.name
+        } : ${method.descriptor}`;
+
+        // Code attribute
+        const codeAttribute = method.attributes.find(
+          (attr) => attr.type === "code",
+        );
+        let codeSection = "";
+        if (codeAttribute && codeAttribute.code) {
+          const codeLines = [
+            `    .code stack ${codeAttribute.code.stackSize} locals ${codeAttribute.code.localsSize}`,
+            ...codeAttribute.code.codeItems.flatMap((ci) => {
+              let line = "";
+              if (ci.labelDef) {
+                line += `${ci.labelDef}`;
+              }
+              if (ci.instruction) {
+                if (line.length > 0) {
+                  line += "    ";
+                }
+                line += formatInstructionKrakatau(ci.instruction, withComments);
+              }
+              if (ci.type === "catch") {
+                line = `    .catch ${ci.clsref} from ${ci.fromLbl} to ${ci.toLbl} using ${ci.usingLbl}`;
+              }
+              return line ? [line] : [];
+            }),
+            ...codeAttribute.code.attributes.map((attr) =>
+              formatCodeAttribute(attr),
+            ),
+            `    .end code`,
+          ];
+          codeSection = codeLines.join("\n");
+        }
+
+        // Exceptions
+        const exceptionsAttribute = method.attributes.find(
+          (attr) => attr.type === "exceptions",
+        );
+        let exceptionsSection = "";
+        if (exceptionsAttribute) {
+          exceptionsSection = `    .exceptions ${exceptionsAttribute.exceptions.join(
+            " ",
+          )}`;
+        }
+
+        return [methodHeader, codeSection, exceptionsSection, `.end method`]
+          .filter(Boolean)
+          .join("\n");
+      })
+      .join("\n\n");
+
+    // Source file
+    const sourceFileAttribute = cls.items.find(
+      (item) => item.attribute && item.attribute.type === "sourcefile",
+    );
+    let sourceFileLine = "";
+    if (sourceFileAttribute) {
+      sourceFileLine = `.sourcefile ${sourceFileAttribute.attribute.value}`;
+    }
+
+    const constLines = constantPool
+      .map((entry, index) => formatConst(entry, index, constantPool, cls))
+      .filter(Boolean)
+      .join("\n");
+
+    // Combine all parts
+    return [
+      headerLines.filter(Boolean).join("\n"),
+      fields,
+      methods,
+      sourceFileLine,
+      constLines,
+      `.end class`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  })(cls);
 }
 
-module.exports={unparseDataStructures,convertJson,formatInstruction};
+module.exports = { unparseDataStructures, convertJson, formatInstruction };

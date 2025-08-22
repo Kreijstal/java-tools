@@ -1,3 +1,5 @@
+const { _astore } = require("./utils");
+
 module.exports = {
   istore: (frame, instruction) => {
     const index = parseInt(instruction.arg, 10);
@@ -19,6 +21,7 @@ module.exports = {
   astore: (frame, instruction) => {
     const index = parseInt(instruction.arg, 10);
     const ref = frame.stack.pop();
+
     frame.locals[index] = ref;
   },
   astore_0: (frame) => {
@@ -85,66 +88,27 @@ module.exports = {
     frame.locals[3] = frame.stack.pop();
   },
   iastore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
   },
   lastore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
   },
   fastore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
   },
   dastore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
   },
   bastore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
   },
   castore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
   },
   sastore: (frame) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw new Error('NullPointerException');
-    }
-    arrayRef[index] = value;
+    _astore(frame);
+  },
+  aastore: (frame) => {
+    _astore(frame);
   },
 };

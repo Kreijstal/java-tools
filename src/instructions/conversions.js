@@ -52,8 +52,8 @@ module.exports = {
     }
   },
   f2d: (frame) => {
-    // In JavaScript, float and double are both numbers.
-    // No conversion is needed.
+    const value = frame.stack.pop();
+    frame.stack.push(value);
   },
 
   d2i: (frame) => {

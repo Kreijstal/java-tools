@@ -212,54 +212,6 @@ module.exports = {
     const length = arrayRef.length;
     frame.stack.push(length);
   },
-  aaload: (frame, instruction, jvm) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw {
-        type: 'java/lang/NullPointerException',
-        message: 'Attempted to access null array'
-      };
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
-  },
-  iaload: (frame, instruction, jvm) => {
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw {
-        type: 'java/lang/NullPointerException',
-        message: 'Attempted to access null array'
-      };
-    }
-    const value = arrayRef[index];
-    frame.stack.push(value);
-  },
-  aastore: (frame, instruction, jvm) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw {
-        type: 'java/lang/NullPointerException',
-        message: 'Attempted to store to null array'
-      };
-    }
-    arrayRef[index] = value;
-  },
-  iastore: (frame, instruction, jvm) => {
-    const value = frame.stack.pop();
-    const index = frame.stack.pop();
-    const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
-      throw {
-        type: 'java/lang/NullPointerException',
-        message: 'Attempted to store to null array'
-      };
-    }
-    arrayRef[index] = value;
-  },
   anewarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
     const elementType = instruction.arg;

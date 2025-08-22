@@ -1,8 +1,33 @@
-const path = require('path');
-const { JVM } = require('../src/jvm');
+const path = require("path");
+const { JVM } = require("../src/jvm");
+
+// Custom InputStream implementation that reads from provided input data
+class TestInputStream {
+  constructor(inputData = "") {
+    this.inputData = inputData;
+    this.inputIndex = 0;
+  }
+
+  read() {
+    if (this.inputIndex >= this.inputData.length) {
+      return -1; // End of stream
+    }
+    return this.inputData.charCodeAt(this.inputIndex++);
+  }
+}
+
+// Proper InputStream object that can be used by InputStreamReader
+function createTestInputStream(inputData = "") {
+  const testInputStream = new TestInputStream(inputData);
+  return {
+    type: "java/io/InputStream",
+    fields: {},
+    read: () => testInputStream.read(),
+  };
+}
 
 async function runTest(className, expectedOutput, t, options = {}) {
-  let output = '';
+  let output = "";
   const { nativeMethods, shouldFail, expectedError, ...jvmOptions } = options;
   let success = true;
   let error = null;
@@ -11,59 +36,99 @@ async function runTest(className, expectedOutput, t, options = {}) {
     const jvm = new JVM({
       ...jvmOptions,
       jreOverrides: {
-        'testing/MockPrintStream': {
-          super: 'java/io/PrintStream',
+        "testing/MockOutputStream": {
+          super: "java/io/OutputStream",
           methods: {
-            'println(Ljava/lang/String;)V': (jvm, obj, args) => { output += args[0] + '\n'; },
-            'println(I)V': (jvm, obj, args) => { output += args[0] + '\n'; },
-            'println(C)V': (jvm, obj, args) => { output += String.fromCharCode(args[0]) + '\n'; },
-            'println(J)V': (jvm, obj, args) => { output += args[0] + '\n'; },
-            'println(F)V': (jvm, obj, args) => { output += args[0] + '\n'; },
-            'println(D)V': (jvm, obj, args) => { output += args[0] + '\n'; },
-            'println()V': (jvm, obj, args) => { output += '\n'; },
-            'print(Ljava/lang/String;)V': (jvm, obj, args) => { output += args[0]; },
-            'print(I)V': (jvm, obj, args) => { output += args[0]; },
-            'print(C)V': (jvm, obj, args) => { output += String.fromCharCode(args[0]); },
-          }
+            "write(I)V": (jvm, obj, args) => {
+              output += String.fromCharCode(args[0]);
+            },
+          },
         },
-        'java/lang/System': {
+        "java/lang/System": {
           methods: {
-            '<clinit>()V': (jvm, _, args, thread) => {
-              const systemClass = jvm.classes['java/lang/System'];
+            "<clinit>()V": (jvm, _, args, thread) => {
+              const systemClass = jvm.classes["java/lang/System"];
 
-              const mockOut = { type: 'testing/MockPrintStream', fields: {} };
-              systemClass.staticFields.set('out:Ljava/io/PrintStream;', mockOut);
+              // Create MockOutputStream for out
+              const mockOut = { type: "testing/MockOutputStream", fields: {} };
+              const mockOutInit = jvm._jreFindMethod(
+                "testing/MockOutputStream",
+                "<init>",
+                "()V",
+              );
+              if (mockOutInit) {
+                mockOutInit(jvm, mockOut, []);
+              }
 
-              const cosErr = { type: 'java/io/ConsoleOutputStream', fields: {} };
-              const cosInit = jvm._jreFindMethod('java/io/ConsoleOutputStream', '<init>', '(Ljava/lang/Object;)V');
+              // Create PrintStream that uses MockOutputStream
+              const out = { type: "java/io/PrintStream", fields: {} };
+              const psInit = jvm._jreFindMethod(
+                "java/io/PrintStream",
+                "<init>",
+                "(Ljava/io/OutputStream;)V",
+              );
+              if (psInit) {
+                psInit(jvm, out, [mockOut]);
+              }
+              systemClass.staticFields.set("out:Ljava/io/PrintStream;", out);
+
+              // Create ConsoleOutputStream for err (using console.error)
+              const cosErr = {
+                type: "java/io/ConsoleOutputStream",
+                fields: {},
+              };
+              const cosInit = jvm._jreFindMethod(
+                "java/io/ConsoleOutputStream",
+                "<init>",
+                "(Ljava/lang/Object;)V",
+              );
               if (cosInit) {
-                const writer = () => {};
+                const writer = (char) => {
+                  if (typeof process !== "undefined")
+                    process.stderr.write(char);
+                };
                 cosInit(jvm, cosErr, [writer]);
               }
-              const err = { type: 'java/io/PrintStream', fields: {} };
-              const psInit = jvm._jreFindMethod('java/io/PrintStream', '<init>', '(Ljava/io/OutputStream;)V');
+
+              // Create PrintStream for err
+              const err = { type: "java/io/PrintStream", fields: {} };
               if (psInit) {
                 psInit(jvm, err, [cosErr]);
               }
-              systemClass.staticFields.set('err:Ljava/io/PrintStream;', err);
+              systemClass.staticFields.set("err:Ljava/io/PrintStream;", err);
 
-              const inStream = { type: 'java/io/InputStream', fields: {} };
-              systemClass.staticFields.set('in:Ljava/io/InputStream;', inStream);
-            }
-          }
-        }
-      }
+              // Create a proper InputStream for in that supports input data
+              const inputData = jvmOptions.inputData || "";
+              const inStream = createTestInputStream(inputData);
+              systemClass.staticFields.set(
+                "in:Ljava/io/InputStream;",
+                inStream,
+              );
+            },
+          },
+        },
+      },
     });
 
     if (nativeMethods) {
       for (const className in nativeMethods) {
         for (const method of nativeMethods[className]) {
-          jvm.registerNativeMethod(className, method.name, method.descriptor, method.impl);
+          jvm.registerNativeMethod(
+            className,
+            method.name,
+            method.descriptor,
+            method.impl,
+          );
         }
       }
     }
 
-    const classFilePath = path.join(__dirname, '..', 'sources', `${className}.class`);
+    const classFilePath = path.join(
+      __dirname,
+      "..",
+      "sources",
+      `${className}.class`,
+    );
     await jvm.run(classFilePath);
   } catch (e) {
     success = false;
@@ -74,12 +139,20 @@ async function runTest(className, expectedOutput, t, options = {}) {
     if (shouldFail) {
       t.notOk(success, `${className} should fail as expected.`);
       if (expectedError) {
-        t.equal(error.message, expectedError, `${className} should fail with the correct error message.`);
+        t.equal(
+          error.message,
+          expectedError,
+          `${className} should fail with the correct error message.`,
+        );
       }
     } else {
       t.ok(success, `${className} should run without errors.`);
       if (expectedOutput !== undefined) {
-        t.equal(output.trim(), expectedOutput.trim(), `Output for ${className} should be correct`);
+        t.equal(
+          output.trim(),
+          expectedOutput.trim(),
+          `Output for ${className} should be correct`,
+        );
       }
     }
   }

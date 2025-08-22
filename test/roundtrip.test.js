@@ -39,7 +39,7 @@ classNames.forEach(className => {
       function stripCpIndex(obj) {
         if (obj && typeof obj === 'object') {
           for (const key in obj) {
-            if (key === 'cp_index') {
+            if (key === 'cp_index' || key === 'pc') {
               delete obj[key];
             } else {
               stripCpIndex(obj[key]);
