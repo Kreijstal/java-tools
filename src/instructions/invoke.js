@@ -110,13 +110,21 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   // Check for null object reference
   if (boxedObj === null) {
+    const instructionItem = frame.instructions[frame.pc - 1];
+    const label = instructionItem.labelDef;
+    const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+
     const exception = {
       type: "java/lang/NullPointerException",
-      message: `Attempted to call method ${className}.${methodName}${descriptor} on a null object reference.`,
+      message: null,
+      context: {
+        frame: frame,
+        pc: pc,
+        className: className,
+        methodName: methodName,
+      },
     };
-    // The pc needs to be the pc of the instruction that caused the exception.
-    const pc = frame.pc - 1;
-    jvm.handleException(exception, pc, thread);
+    jvm.handleException(exception, -1, thread);
     return;
   }
 
@@ -204,9 +212,11 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
   }
 
-  throw new Error(
-    `Unsupported invokevirtual: ${boxedObj?.type || typeof boxedObj}.${methodName}${descriptor}`,
-  );
+  const exception = {
+    type: "java/lang/NoSuchMethodError",
+    message: `${boxedObj?.type || typeof boxedObj}.${methodName}${descriptor}`,
+  };
+  jvm.handleException(exception, -1, thread);
 }
 
 async function invokestatic(frame, instruction, jvm, thread) {
@@ -318,9 +328,11 @@ async function invokespecial(frame, instruction, jvm, thread) {
     // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
     // For now, we do nothing, assuming the object is already created by 'new'.
   } else {
-    throw new Error(
-      `Unsupported invokespecial: ${className}.${methodName}${descriptor}`,
-    );
+    const exception = {
+      type: "java/lang/NoSuchMethodError",
+      message: `${className}.${methodName}${descriptor}`,
+    };
+    jvm.handleException(exception, -1, thread);
   }
 }
 
@@ -469,10 +481,22 @@ async function invokeinterface(frame, instruction, jvm, thread) {
 
   // Check for null object reference
   if (boxedObj === null) {
-    throw {
+    const instructionItem = frame.instructions[frame.pc - 1];
+    const label = instructionItem.labelDef;
+    const pc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+
+    const exception = {
       type: "java/lang/NullPointerException",
       message: "Attempted to invoke interface method on null object reference",
+      context: {
+        frame: frame,
+        pc: pc,
+        className: className,
+        methodName: methodName,
+      },
     };
+    jvm.handleException(exception, -1, thread);
+    return;
   }
 
   // For a functional interface with method handle (lambdas)
@@ -584,9 +608,11 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     }
   }
 
-  throw new Error(
-    `Unsupported invokeinterface: ${boxedObj.type}.${methodName}${descriptor}`,
-  );
+  const exception = {
+    type: "java/lang/NoSuchMethodError",
+    message: `${boxedObj.type}.${methodName}${descriptor}`,
+  };
+  jvm.handleException(exception, -1, thread);
 }
 
 const invokeHandlers = {

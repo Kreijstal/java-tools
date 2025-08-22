@@ -4,6 +4,7 @@ const {
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
 const { parseDescriptor } = require("./typeParser");
+const { primitiveTypeDescriptors } = require("./constants");
 const {
   formatInstruction,
   unparseDataStructures,
@@ -789,19 +790,8 @@ class JVM {
     const descriptor = arrayClassName.substring(1);
     
     // Handle primitive types
-    const primitiveMap = {
-      'B': 'byte',
-      'C': 'char',
-      'D': 'double',
-      'F': 'float',
-      'I': 'int',
-      'J': 'long',
-      'S': 'short',
-      'Z': 'boolean'
-    };
-
-    if (primitiveMap[descriptor]) {
-      return primitiveMap[descriptor];
+    if (primitiveTypeDescriptors[descriptor]) {
+      return primitiveTypeDescriptors[descriptor];
     }
     
     // Handle object types (L<classname>;)
@@ -881,6 +871,8 @@ class JVM {
     const classObj = {
       type: "java/lang/Class",
       _classData: classData,
+      name: classNameWithSlashes.replace(/\//g, "."),
+      className: classNameWithSlashes.replace(/\//g, "."),
     };
     this.classObjectCache.set(classNameWithSlashes, classObj);
     return classObj;
@@ -1273,7 +1265,6 @@ class JVM {
   }
 
   handleException(exception, pc, thread) {
-    console.log(`handleException: exception=${exception.type}, pc=${pc}, thread=${thread.id}`);
     if (thread.pendingException) {
       delete thread.pendingException;
     }

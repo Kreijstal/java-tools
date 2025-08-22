@@ -1,16 +1,6 @@
-function parseDescriptor(descriptor) {
-  const types = {
-    B: "byte",
-    C: "char",
-    D: "double",
-    F: "float",
-    I: "int",
-    J: "long",
-    S: "short",
-    Z: "boolean",
-    V: "void"
-  };
+const { primitiveTypeDescriptors } = require("./constants");
 
+function parseDescriptor(descriptor) {
   function parseType(descriptor, index) {
     let arrayDepth = 0;
     while (descriptor[index] === '[') {
@@ -25,7 +15,7 @@ function parseDescriptor(descriptor) {
       return { type: className + '[]'.repeat(arrayDepth), index };
     }
 
-    const type = types[descriptor[index]];
+    const type = primitiveTypeDescriptors[descriptor[index]];
     index++;
     return { type: type + '[]'.repeat(arrayDepth), index };
   }

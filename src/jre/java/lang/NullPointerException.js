@@ -23,7 +23,12 @@ module.exports = {
           className.lastIndexOf("/") + 1,
         )}.${methodName}()" because the object reference is null`;
 
-        const currentInstructionIndex = frame.instructions.findIndex(item => item.pc === pc);
+        const getPcFromItem = (item) => {
+          if (!item || !item.labelDef) return -1;
+          return parseInt(item.labelDef.substring(1, item.labelDef.length - 1));
+        };
+
+        const currentInstructionIndex = frame.instructions.findIndex(item => getPcFromItem(item) === pc);
 
         if (currentInstructionIndex > 0) {
           const prevInstruction = frame.instructions[currentInstructionIndex - 1].instruction;
