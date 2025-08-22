@@ -6,8 +6,18 @@ module.exports = {
       const componentType = args[0];
       const length = args[1];
       const array = new Array(length).fill(null);
-      array.type = `[${componentType.className.replace(/\./g, '/')}`;
-      array.elementType = componentType.className;
+      let componentDescriptor;
+      let elementTypeName;
+      if (componentType.isPrimitive) {
+        const primitiveMap = { 'boolean': 'Z', 'byte': 'B', 'char': 'C', 'short': 'S', 'int': 'I', 'long': 'J', 'float': 'F', 'double': 'D' };
+        componentDescriptor = primitiveMap[componentType.name];
+        elementTypeName = componentType.name;
+      } else {
+        elementTypeName = componentType._classData.ast.classes[0].className;
+        componentDescriptor = `L${elementTypeName};`;
+      }
+      array.type = `[${componentDescriptor}`;
+      array.elementType = elementTypeName;
       return array;
     },
     'getLength(Ljava/lang/Object;)I': (jvm, _, args) => {
