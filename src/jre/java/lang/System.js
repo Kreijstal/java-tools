@@ -1,15 +1,5 @@
 'use strict';
-
-// Browser-compatible process module loading
-let process;
-try {
-  if (typeof require !== 'undefined') {
-    process = require('process');
-  }
-} catch (e) {
-  // Browser environment - process not available
-  process = null;
-}
+const process = require('process');
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
