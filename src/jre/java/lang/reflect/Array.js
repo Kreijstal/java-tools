@@ -1,5 +1,3 @@
-const { primitiveTypeNameToDescriptor } = require("../../../constants");
-
 module.exports = {
   name: 'java/lang/reflect/Array',
   super: 'java/lang/Object',
@@ -7,27 +5,9 @@ module.exports = {
     'newInstance(Ljava/lang/Class;I)Ljava/lang/Object;': (jvm, _, args) => {
       const componentType = args[0];
       const length = args[1];
-
-      let typeDescriptor;
-      const componentName = componentType.name || componentType.className;
-
-      if (componentType.isPrimitive) {
-        typeDescriptor = primitiveTypeNameToDescriptor[componentName];
-      } else {
-        typeDescriptor = `L${componentName.replace(/\./g, '/')};`;
-      }
-
-      const array = new Array(length);
-
-      if (componentType.isPrimitive) {
-          const defaultValue = (typeDescriptor === 'J') ? BigInt(0) : 0;
-          array.fill(defaultValue);
-      } else {
-          array.fill(null);
-      }
-
-      array.type = `[${typeDescriptor}`;
-      array.elementType = componentName;
+      const array = new Array(length).fill(null);
+      array.type = `[${componentType.className.replace(/\./g, '/')}`;
+      array.elementType = componentType.className;
       return array;
     },
     'getLength(Ljava/lang/Object;)I': (jvm, _, args) => {
