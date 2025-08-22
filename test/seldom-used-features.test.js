@@ -194,31 +194,31 @@ Inner class calling instance private method: Private instance: 456`,
   },
   {
     name: "ClassLiteralTest", 
-    description: "Class literals and Class.forName - now working",
+    description: "Class literals and Class.forName - should match standard Java",
     shouldFail: false,
     expectedOutput: `=== Class Literal Test ===
-int.class: java.lang.Class
+int.class: int
 String.class: java.lang.String
 int[].class: [I
 int[][].class: [[I
-int.class == Integer.TYPE: 1
+int.class == Integer.TYPE: true
 Integer.class: java.lang.Integer
-void.class: java.lang.Class
-Void.TYPE: java.lang.Class
-void.class == Void.TYPE: 1
+void.class: void
+Void.TYPE: void
+void.class == Void.TYPE: true
 Class.forName("java.lang.String"): java.lang.String
-forName == String.class: 0
+forName == String.class: true
 Class.forName("[I"): [I
-forName array == int[].class: 0
+forName array == int[].class: true
 String.class.getSuperclass(): java.lang.Object
-int.class.isPrimitive(): 1
-String.class.isPrimitive(): 0
-int[].class.isArray(): 1
-String.class.isArray(): 0`,
+int.class.isPrimitive(): true
+String.class.isPrimitive(): false
+int[].class.isArray(): true
+String.class.isArray(): false`,
   },
   {
     name: "HexFloatLiteralsTest",
-    description: "Hexadecimal float literals - mostly working, small values still have issues",
+    description: "Hexadecimal float literals - should match standard Java",
     shouldFail: false,
     expectedOutput: `=== Hexadecimal Float Literals Test ===
 0x1.0p0 = 1.0
@@ -230,18 +230,18 @@ Hex E approximation: 2.718281828459045
 Math.PI: 3.141592653589793
 Math.E: 2.718281828459045
 Hex float: 1.0
-Max value (hex): 1.7976931348623157e+308.0
+Max value (hex): 1.7976931348623157E308
 Double.MAX_VALUE: 1.7976931348623157E308
-Min normal (hex): 0
+Min normal (hex): 2.2250738585072014E-308
 Double.MIN_NORMAL: 2.2250738585072014E-308
-Min subnormal (hex): 0
+Min subnormal (hex): 4.9E-324
 Double.MIN_VALUE: 4.9E-324
 Positive infinity: Infinity
-Is positive infinite: 1
+Is positive infinite: true
 Negative infinity: -Infinity
-Is negative infinite: 1
+Is negative infinite: true
 NaN: NaN
-Is NaN: 1`,
+Is NaN: true`,
   },
   {
     name: "ReflectiveArrayTest",
@@ -272,28 +272,28 @@ Jagged array created with different row sizes:
   },
   {
     name: "StringInternTest",
-    description: "String interning - now working correctly",
+    description: "String interning - should match standard Java",
     shouldFail: false,
     expectedOutput: `=== String Intern Test ===
-Literal strings s1 == s2: 1
-s1 == new String("hello"): 0
-s1.equals(s3): 1
-s1 == s3.intern(): 1
-"hel" + "lo" == "he" + "llo": 1
-concat1 == s1: 1
-Runtime concat1 == runtime concat2: 1
-Runtime concat1 == literal: 1
-Runtime concat1.intern() == literal: 1
-StringBuilder result == literal: 1
-StringBuilder result.intern() == literal: 1
-Number literal "123" == Integer.toString(123): 1
-Number literal == new String("123"): 0
-Integer.toString(123).intern() == "123": 1
-Empty literal "" == new String("").intern(): 1
+Literal strings s1 == s2: true
+s1 == new String("hello"): false
+s1.equals(s3): true
+s1 == s3.intern(): true
+"hel" + "lo" == "he" + "llo": true
+concat1 == s1: true
+Runtime concat1 == runtime concat2: false
+Runtime concat1 == literal: false
+Runtime concat1.intern() == literal: true
+StringBuilder result == literal: false
+StringBuilder result.intern() == literal: true
+Number literal "123" == Integer.toString(123): false
+Number literal == new String("123"): false
+Integer.toString(123).intern() == "123": true
+Empty literal "" == new String("").intern(): true
 null.intern() threw NullPointerException: NullPointerException
-Two unique strings == : 0
-unique1.intern() == unique2.intern(): 1
-unique1.intern() == unique1: 0`,
+Two unique strings == : false
+unique1.intern() == unique2.intern(): true
+unique1.intern() == unique1: false`,
   },
 ];
 
