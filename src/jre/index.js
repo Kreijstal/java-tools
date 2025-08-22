@@ -4,6 +4,8 @@ const jreClasses = {
   'java/lang/Class': require('./java/lang/Class'),
   'java/lang/String': require('./java/lang/String'),
   'java/lang/StringBuilder': require('./java/lang/StringBuilder'),
+  'java/lang/Runtime': require('./java/lang/Runtime'),
+  'java/lang/Process': require('./java/lang/Process'),
   'java/lang/Enum': require('./java/lang/Enum'),
   'java/lang/Runnable': require('./java/lang/Runnable'),
   'java/lang/IndexOutOfBoundsException': require('./java/lang/IndexOutOfBoundsException'),
