@@ -151,22 +151,20 @@ async function runTest(className, expectedOutput, t, options = {}) {
       `${className}.class`,
     );
 
-    // Use AbortController for efficient timeout handling
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => {
-      controller.abort();
-    }, timeout);
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`Test timeout after ${timeout}ms`));
+      }, timeout);
+    });
 
     try {
-      await jvm.run(classFilePath);
-      // Test completed successfully, clear the timeout
+      await Promise.race([
+        jvm.run(classFilePath),
+        timeoutPromise,
+      ]);
+    } finally {
       clearTimeout(timeoutId);
-    } catch (e) {
-      clearTimeout(timeoutId);
-      if (controller.signal.aborted) {
-        throw new Error(`Test timeout after ${timeout}ms`);
-      }
-      throw e;
     }
   } catch (e) {
     success = false;
