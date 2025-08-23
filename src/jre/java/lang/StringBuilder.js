@@ -34,5 +34,48 @@ module.exports = {
       obj.value = Array.from(obj.value).reverse().join('');
       return obj;
     },
+    'length()I': (jvm, obj, args) => {
+      return obj.value.length;
+    },
+    'charAt(I)C': (jvm, obj, args) => {
+      const index = args[0];
+      if (index < 0 || index >= obj.value.length) {
+        throw {
+          type: 'java/lang/StringIndexOutOfBoundsException',
+          message: `String index out of range: ${index}`,
+        };
+      }
+      return obj.value.charCodeAt(index);
+    },
+    'setCharAt(IC)V': (jvm, obj, args) => {
+      const index = args[0];
+      const ch = args[1];
+      if (index < 0 || index >= obj.value.length) {
+        throw {
+          type: 'java/lang/StringIndexOutOfBoundsException',
+          message: `String index out of range: ${index}`,
+        };
+      }
+      // Convert the string to an array, replace the character, and join back
+      const chars = Array.from(obj.value);
+      chars[index] = String.fromCharCode(ch);
+      obj.value = chars.join('');
+    },
+    'setLength(I)V': (jvm, obj, args) => {
+      const newLength = args[0];
+      if (newLength < 0) {
+        throw {
+          type: 'java/lang/StringIndexOutOfBoundsException',
+          message: `String index out of range: ${newLength}`,
+        };
+      }
+      if (newLength > obj.value.length) {
+        // Pad with null characters (char 0)
+        obj.value += '\0'.repeat(newLength - obj.value.length);
+      } else {
+        // Truncate the string
+        obj.value = obj.value.substring(0, newLength);
+      }
+    },
   },
 };

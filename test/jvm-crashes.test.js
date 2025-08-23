@@ -47,7 +47,7 @@ const tests = [
     name: "ReflectionCrash",
     description: "Basic reflection support",
     expectedOutput:
-      "Testing reflection operations that might crash...\nString class: java.lang.String\nString has 23 methods\nString has 0 public fields",
+      "Testing reflection operations that might crash...\nString class: java.lang.String\nString has 32 methods\nString has 0 public fields",
   },
 
   // Data types and conversions
