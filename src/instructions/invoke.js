@@ -180,6 +180,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
       return;
     }
 
+
     let classData = jvm.classes[currentClassName];
     if (!classData) {
       if (jvm.jre[currentClassName]) {
