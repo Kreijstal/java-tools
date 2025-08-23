@@ -3,7 +3,6 @@
 // This file is .gitignored and regenerated during builds for browser compatibility
 
 const jreClasses = {
-  '[I': require('./[I.js'),
   'java/io/BufferedInputStream': require('./java/io/BufferedInputStream.js'),
   'java/io/BufferedReader': require('./java/io/BufferedReader.js'),
   'java/io/ByteArrayInputStream': require('./java/io/ByteArrayInputStream.js'),
