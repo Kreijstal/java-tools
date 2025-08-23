@@ -18,6 +18,7 @@ const JNI = require("./jni");
 const fs = require("fs");
 const path = require("path");
 const { getAST } = require("jvm_parser");
+const { JreBootstrap } = require("./jre-bootstrap");
 
 class JVM {
   constructor(options = {}) {
@@ -34,6 +35,12 @@ class JVM {
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
 
+    // Make fs and path available for JreBootstrap (only in Node.js environment)
+    if (typeof window === "undefined") {
+      this.fs = fs;
+      this.path = path;
+    }
+
     // Initialize JNI system
     this.jni = new JNI(this);
     if (options.verbose) {
@@ -44,144 +51,8 @@ class JVM {
       this.registerJreOverrides(options.jreOverrides);
     }
 
-    this._preloadJreClasses();
-  }
-
-  _preloadJreClasses() {
-    const jreHierarchy = {
-      "java/lang/Object": null,
-      "java/lang/System": "java/lang/Object",
-      "java/lang/Throwable": "java/lang/Object",
-      "java/lang/Exception": "java/lang/Throwable",
-      "java/lang/RuntimeException": "java/lang/Exception",
-      "java/lang/ArithmeticException": "java/lang/RuntimeException",
-      "java/lang/IllegalArgumentException": "java/lang/RuntimeException",
-      "java/lang/IllegalStateException": "java/lang/RuntimeException",
-      "java/lang/Enum": "java/lang/Object",
-      "java/lang/Runnable": "java/lang/Object",
-      "java/lang/CharSequence": "java/lang/Object",
-      "java/lang/ReflectiveOperationException": "java/lang/Exception",
-      "java/lang/NoSuchMethodException":
-        "java/lang/ReflectiveOperationException",
-      "java/lang/reflect/Array": "java/lang/Object",
-      "java/io/IOException": "java/lang/Exception",
-      "java/io/Reader": "java/lang/Object",
-      "java/io/BufferedReader": "java/io/Reader",
-      "java/io/InputStreamReader": "java/io/Reader",
-      "java/io/InputStream": "java/lang/Object",
-      "java/io/FilterInputStream": "java/io/InputStream",
-      "java/io/BufferedInputStream": "java/io/FilterInputStream",
-      "java/io/OutputStream": "java/lang/Object",
-      "java/io/FilterOutputStream": "java/io/OutputStream",
-      "java/io/PrintStream": "java/io/FilterOutputStream",
-      "java/io/ConsoleOutputStream": "java/io/OutputStream",
-      "java/net/URLConnection": "java/lang/Object",
-      "java/net/HttpURLConnection": "java/net/URLConnection",
-      "java/net/URI": "java/lang/Object",
-      "java/net/http/HttpClient": "java/lang/Object",
-      "java/net/http/HttpRequest": "java/lang/Object",
-      "java/net/http/HttpResponse": "java/lang/Object",
-      "java/time/Duration": "java/lang/Object",
-      "java/util/function/Function": "java/lang/Object",
-    };
-
-    // Create stubs for all classes in the hierarchy
-    for (const className in jreHierarchy) {
-      const superClassName = jreHierarchy[className];
-      const jreClassDef = this.jre[className];
-      const interfaces =
-        jreClassDef && jreClassDef.interfaces ? jreClassDef.interfaces : [];
-
-      const classStub = {
-        ast: {
-          classes: [
-            {
-              className: className,
-              superClassName: superClassName,
-              items: [],
-              flags: ["public"],
-              interfaces: interfaces,
-            },
-          ],
-        },
-        constantPool: [],
-        staticFields: new Map(),
-      };
-      this.classes[className] = classStub;
-    }
-
-    // Add other JRE classes that extend Object directly - only in Node.js environment
-    if (typeof window === "undefined" && fs && fs.readdirSync) {
-      const jrePath = path.join(__dirname, "jre");
-      const walk = (dir, prefix) => {
-        const files = fs.readdirSync(dir);
-        for (const file of files) {
-          const fullPath = path.join(dir, file);
-          const stat = fs.statSync(fullPath);
-          if (stat.isDirectory()) {
-            walk(fullPath, `${prefix}${file}/`);
-          } else if (file.endsWith(".js")) {
-            const className = `${prefix}${file.slice(0, -3)}`;
-            if (!this.classes[className]) {
-              const jreClassDef = this.jre[className];
-              const interfaces =
-                jreClassDef && jreClassDef.interfaces
-                  ? jreClassDef.interfaces
-                  : [];
-              const methods =
-                jreClassDef && jreClassDef.methods
-                  ? Object.keys(jreClassDef.methods).map((methodSig) => {
-                      const openParen = methodSig.indexOf("(");
-                      const name = methodSig.substring(0, openParen);
-                      const descriptor = methodSig.substring(openParen);
-                      return {
-                        type: "method",
-                        method: {
-                          name: name,
-                          descriptor: descriptor,
-                          flags: ["public"], // Assume public for JRE methods
-                          attributes: [],
-                        },
-                      };
-                    })
-                  : [];
-
-              const classStub = {
-                ast: {
-                  classes: [
-                    {
-                      className: className,
-                      superClassName:
-                        (jreClassDef && jreClassDef.super) ||
-                        "java/lang/Object",
-                      items: methods,
-                      flags: ["public"],
-                      interfaces: interfaces,
-                    },
-                  ],
-                },
-                constantPool: [],
-                staticFields: new Map(),
-              };
-
-              // Initialize static fields from JRE definition during preloading
-              if (jreClassDef && jreClassDef.staticFields) {
-                for (const [fieldKey, fieldValue] of Object.entries(
-                  jreClassDef.staticFields,
-                )) {
-                  classStub.staticFields.set(fieldKey, fieldValue);
-                }
-              }
-
-              this.classes[className] = classStub;
-            }
-          }
-        }
-      };
-      walk(jrePath, "");
-    }
-    // In browser environment, we'll rely on the basic hierarchy defined above
-    // and any additional JRE classes can be loaded dynamically as needed
+    // Use JreBootstrap to preload all JRE classes
+    JreBootstrap.preloadAllJreClasses(this);
   }
 
   internString(str) {
