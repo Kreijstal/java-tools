@@ -46,6 +46,29 @@ module.exports = {
       // In a real implementation, this would print the full stack trace
       console.error('\tat <native method>');
     },
+    'printStackTrace(Ljava/io/PrintWriter;)V': (jvm, obj, args) => {
+      const printWriter = args[0];
+      const className = obj.type.replace(/\//g, '.');
+      const message = obj.message;
+      
+      // Create the error message
+      let errorMsg;
+      if (message) {
+        errorMsg = `${className}: ${message.value}`;
+      } else {
+        errorMsg = className;
+      }
+      
+      // Write to PrintWriter - simplified implementation
+      if (printWriter && printWriter.println) {
+        printWriter.println(errorMsg);
+        printWriter.println('\tat <native method>');
+      } else {
+        // Fallback to console if PrintWriter doesn't have expected methods
+        console.error(errorMsg);
+        console.error('\tat <native method>');
+      }
+    },
     'addSuppressed(Ljava/lang/Throwable;)V': (jvm, obj, args) => {
       const suppressedException = args[0];
       if (!obj.suppressedExceptions) {

@@ -21,6 +21,31 @@ module.exports = {
       
       return booleanObj;
     },
+    'valueOf(Ljava/lang/String;)Ljava/lang/Boolean;': (jvm, obj, args) => {
+      const str = args[0];
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      const boolValue = stringValue ? stringValue.toLowerCase() === 'true' : false;
+      
+      const booleanObj = {
+        type: 'java/lang/Boolean',
+        value: boolValue,
+      };
+      
+      booleanObj.toString = function() {
+        return this.value ? 'true' : 'false';
+      };
+      
+      return booleanObj;
+    },
+    'parseBoolean(Ljava/lang/String;)Z': (jvm, obj, args) => {
+      const str = args[0];
+      if (!str) return false;
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      if (!stringValue) return false;
+      return stringValue.toLowerCase() === 'true';
+    },
   },
   methods: {
     '<init>(Z)V': (jvm, obj, args) => {
