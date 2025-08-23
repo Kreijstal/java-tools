@@ -1,34 +1,38 @@
-// JRE Class: java/io/InputStreamReader
 module.exports = {
-  super: 'java/io/Reader',
-  methods: {
-    '<init>(Ljava/io/InputStream;)V': function(jvm, obj, args) {
-      const inputStream = args[0];
-      obj.stream = inputStream;
-      return obj;
+  'java/io/InputStreamReader': {
+    '<init>(Ljava/io/InputStream;)V': (thread, locals) => {
+      const self = locals[0];
+      const inputStream = locals[1];
+      self['java/io/InputStreamReader/stream'] = inputStream;
+      thread.return();
     },
-    'read()I': function(jvm, obj, args) {
-      const stream = obj.stream;
+    'read()I': (thread, locals) => {
+      const self = locals[0];
+      const stream = self['java/io/InputStreamReader/stream'];
+      
       if (!stream) {
-        return -1;
+        thread.return(-1);
+        return;
       }
       
       // Call the InputStream's read method
       if (stream.read && typeof stream.read === 'function') {
         // For TestInputStream objects created in test-helpers
-        return stream.read();
+        const result = stream.read();
+        thread.return(result);
+        return;
       }
       
       // Try to find the read method via JRE method lookup
+      const jvm = thread.jvm;
       const readMethod = jvm._jreFindMethod(stream.type || 'java/io/InputStream', 'read', '()I');
       if (readMethod) {
-        return readMethod(jvm, stream, []);
+        const result = readMethod(jvm, stream, []);
+        thread.return(result);
+        return;
       }
       
-      return -1;
+      thread.return(-1);
     },
-    'close()V': function(jvm, obj, args) {
-      // Default implementation - do nothing
-    }
-  }
+  },
 };
