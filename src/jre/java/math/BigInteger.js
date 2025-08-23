@@ -5,7 +5,12 @@ module.exports = {
   methods: {
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
       const str = args[0];
-      const stringValue = typeof str === 'string' ? str : (str ? str.value : '0');
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      if (!stringValue) {
+        obj.value = BigInt(0);
+        return;
+      }
       try {
         obj.value = BigInt(stringValue);
       } catch (error) {

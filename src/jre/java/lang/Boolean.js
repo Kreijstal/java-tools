@@ -23,8 +23,9 @@ module.exports = {
     },
     'valueOf(Ljava/lang/String;)Ljava/lang/Boolean;': (jvm, obj, args) => {
       const str = args[0];
-      const stringValue = typeof str === 'string' ? str : (str ? str.value : 'false');
-      const boolValue = stringValue.toLowerCase() === 'true';
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      const boolValue = stringValue ? stringValue.toLowerCase() === 'true' : false;
       
       const booleanObj = {
         type: 'java/lang/Boolean',
@@ -39,7 +40,10 @@ module.exports = {
     },
     'parseBoolean(Ljava/lang/String;)Z': (jvm, obj, args) => {
       const str = args[0];
-      const stringValue = typeof str === 'string' ? str : (str ? str.value : 'false');
+      if (!str) return false;
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      if (!stringValue) return false;
       return stringValue.toLowerCase() === 'true';
     },
   },

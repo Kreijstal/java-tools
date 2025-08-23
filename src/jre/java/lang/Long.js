@@ -10,7 +10,9 @@ module.exports = {
   staticMethods: {
     'parseLong(Ljava/lang/String;)J': (jvm, obj, args) => {
       const str = args[0];
-      const stringValue = typeof str === 'string' ? str : (str ? str.value : '0');
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      if (!stringValue) return BigInt(0);
       try {
         const result = BigInt(stringValue);
         return result;

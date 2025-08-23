@@ -21,7 +21,10 @@ module.exports = {
     },
     'parseInt(Ljava/lang/String;)I': (jvm, obj, args) => {
       const str = args[0];
-      const stringValue = typeof str === 'string' ? str : (str ? str.value : '0');
+      if (!str) return 0;
+      // Handle both string objects and primitive strings
+      const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
+      if (!stringValue) return 0;
       const result = parseInt(stringValue, 10);
       if (isNaN(result)) {
         // In real Java this would throw NumberFormatException
