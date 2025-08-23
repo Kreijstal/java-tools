@@ -245,16 +245,16 @@ Is NaN: true`,
   },
   {
     name: "ReflectiveArrayTest",
-    description: "Reflective array creation - currently fails due to missing reflection support",
-    shouldFail: true,
+    description: "Reflective array creation - should pass with reflection support",
+    shouldFail: false,
     expectedOutput: `=== Reflective Array Creation Test ===
 Created int array, length: 5
 Element 0: 42
 Element 1: 99
 Element 2: -1
 Multi-dimensional array [2][3]:
-Hello World ! 
-Java Array Test 
+Hello World !\x20
+Java Array Test\x20
 Double array:
   [0] = 3.14
   [1] = 2.71
