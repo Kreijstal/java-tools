@@ -967,8 +967,9 @@ class KrakatauWorkspace {
           let classToInspect = className;
 
           while (classToInspect) {
-            const ast = this.workspaceASTs[classToInspect];
-            if (ast) {
+            const workspaceEntry = this.workspaceASTs[classToInspect];
+            if (workspaceEntry) {
+              const ast = workspaceEntry.ast;
               isDefined = ast.classes[0].items.some(item =>
                 item.type === 'method' &&
                 item.method.name === memberName &&
