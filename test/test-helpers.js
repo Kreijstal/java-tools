@@ -203,6 +203,11 @@ async function runTest(className, expectedOutput, t, options = {}) {
   const endTime = Date.now();
   const executionTime = endTime - startTime;
 
+  // Log tests that take longer than 50ms for performance analysis, if enabled
+  if (process.env.PERF_LOG && executionTime > 50) {
+    console.log(`[PERF] ${className}: ${executionTime}ms`);
+  }
+
   // Log tests that take longer than 50ms for performance analysis
   if (executionTime > 50) {
     console.log(`[PERF] ${className}: ${executionTime}ms`);
