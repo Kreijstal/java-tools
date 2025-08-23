@@ -10,37 +10,24 @@ class JreBootstrap {
    * Preload essential JRE classes that are required for basic JVM operation
    * @param {JVM} jvm - The JVM instance to load classes into
    */
-  static preloadEssentialClasses(jvm) {
-    const essentialClasses = [
-      'java/lang/Object',
-      'java/lang/System',
-      'java/lang/String',
-      'java/lang/Class',
-      'java/io/PrintStream',
-      'java/io/ConsoleOutputStream',
-      'java/lang/Throwable',
-      'java/lang/Exception',
-      'java/lang/RuntimeException'
-    ];
-
-    for (const className of essentialClasses) {
-      if (jvm.jre[className] && !jvm.classes[className]) {
-        this.createRuntimeClass(jvm, className, jvm.jre[className]);
-      }
-    }
-  }
 
   /**
-   * Load all JRE classes from the hierarchy and filesystem (extracted from JVM._preloadJreClasses)
+   * Load all JRE classes from the hierarchy and filesystem, including essential classes
+   * (previously handled by preloadEssentialClasses)
    * @param {JVM} jvm - The JVM instance to load classes into
    */
   static preloadAllJreClasses(jvm) {
     const jreHierarchy = {
+      // Essential classes - now loaded as part of normal process
       "java/lang/Object": null,
       "java/lang/System": "java/lang/Object",
+      "java/lang/String": "java/lang/Object",
+      "java/lang/Class": "java/lang/Object",
       "java/lang/Throwable": "java/lang/Object",
       "java/lang/Exception": "java/lang/Throwable",
       "java/lang/RuntimeException": "java/lang/Exception",
+
+      // Other JRE classes
       "java/lang/ArithmeticException": "java/lang/RuntimeException",
       "java/lang/IllegalArgumentException": "java/lang/RuntimeException",
       "java/lang/IllegalStateException": "java/lang/RuntimeException",
@@ -162,10 +149,6 @@ class JreBootstrap {
 
               jvm.classes[className] = classStub;
 
-              // Special handling for MethodHandle - set up invoke methods
-              if (className === 'java/lang/invoke/MethodHandle') {
-                this.setupMethodHandleInvoke(jvm, className);
-              }
             }
           }
         }
@@ -175,9 +158,6 @@ class JreBootstrap {
     // In browser environment, we'll rely on the basic hierarchy defined above
     // and any additional JRE classes can be loaded dynamically as needed
 
-    // Set up special method interfaces that need JVM dispatch
-    this.setupMethodHandleInvoke(jvm);
-
     // Set up reflection Array methods
     this.setupArrayReflection(jvm);
 
@@ -185,202 +165,6 @@ class JreBootstrap {
     this.setupClassReflection(jvm);
   }
 
-  /**
-   * Set up MethodHandle.invoke method resolution behavior
-   * @param {JVM} jvm - The JVM instance
-   * @param {string} className - Name of the class to create
-   */
-  static setupMethodHandleInvoke(jvm, className) {
-    if (className === 'java/lang/invoke/MethodHandle') {
-      // Set up the generic invoke method that will be dispatched by JVM
-      const invokeMethod = {
-        type: "method",
-        method: {
-          name: "invoke",
-          descriptor: "([Ljava/lang/Object;)Ljava/lang/Object;",
-          flags: ["public"],
-          attributes: [],
-        },
-      };
-
-      // Add to the class if it exists
-      const classData = jvm.classes[className];
-      if (classData && classData.ast && classData.ast.classes[0]) {
-        if (!classData.ast.classes[0].items) {
-          classData.ast.classes[0].items = [];
-        }
-        // Check if invoke method already exists
-        const existingInvoke = classData.ast.classes[0].items.find(
-          item => item.type === "method" && item.method.name === "invoke"
-        );
-        if (!existingInvoke) {
-          classData.ast.classes[0].items.push(invokeMethod);
-        }
-      }
-
-      // Also add the generic method to the JRE definition so it can be found
-      if (!jvm.jre[className]) {
-        jvm.jre[className] = {};
-      }
-      if (!jvm.jre[className].methods) {
-        jvm.jre[className].methods = {};
-      }
-
-      // MethodHandle.invoke signatures - truly universal implementation
-      // This single signature can handle ANY method handle invocation dynamically
-      const invokeSignatures = [
-        "([Ljava/lang/Object;)Ljava/lang/Object;" // Universal varargs signature - can handle any parameters
-      ];
-
-      invokeSignatures.forEach(sig => {
-        const methodKey = `invoke${sig}`;
-        jvm.jre[className].methods[methodKey] = function(jvm, thisObj, args, thread) {
-          // Universal MethodHandle.invoke implementation that works with any signature
-
-          if (thisObj && thisObj.kind) {
-            // Use the MethodHandle's kind to determine the operation type
-            switch (thisObj.kind) {
-              case 'invokeStatic':
-                return handleStaticMethod(jvm, thisObj, args);
-
-              case 'invokeVirtual':
-              case 'invokeSpecial':
-                return handleInstanceMethod(jvm, thisObj, args);
-
-              case 'getField':
-                return handleFieldGet(jvm, thisObj, args);
-
-              case 'putField':
-                return handleFieldSet(jvm, thisObj, args);
-
-              case 'invokeInterface':
-                return handleInterfaceMethod(jvm, thisObj, args);
-
-              default:
-                // Fallback for unknown kinds
-                return handleUnknownMethod(jvm, thisObj, args);
-            }
-          } else {
-            // Fallback for MethodHandles without kind information
-            return handleLegacyMethod(jvm, thisObj, args);
-          }
-        };
-      });
-
-      // Helper functions for different method handle types
-      function handleStaticMethod(jvm, methodHandle, args) {
-        // Static method call - typically has a message string
-        if (args && args.length > 0 && typeof args[0] === 'string') {
-          const message = args[0];
-          const outputText = `Static method called: ${message}`;
-
-          // Output via System.out.println
-          const printlnMethod = jvm._jreFindMethod('java/io/PrintStream', 'println', '(Ljava/lang/String;)V');
-          if (printlnMethod) {
-            const systemClass = jvm.classes['java/lang/System'];
-            if (systemClass && systemClass.staticFields) {
-              const out = systemClass.staticFields.get('out:Ljava/io/PrintStream;');
-              if (out) {
-                printlnMethod(jvm, out, [jvm.internString(outputText)]);
-                return;
-              }
-            }
-          }
-
-          // Fallback to test framework output
-          if (typeof jvm._outputCallback === 'function') {
-            jvm._outputCallback(outputText + '\n');
-          }
-        }
-        return;
-      }
-
-      function handleInstanceMethod(jvm, methodHandle, args) {
-        // Instance method call - typically has an instance and parameters
-        if (args && args.length >= 2) {
-          const instance = args[0];
-          const value = args[1]; // Usually an int parameter
-          return jvm.internString(`Instance method called with: ${value}`);
-        }
-        return jvm.internString("Instance method called");
-      }
-
-      function handleFieldGet(jvm, methodHandle, args) {
-        // Field getter - return field value from instance
-        if (args && args.length > 0) {
-          const instance = args[0];
-          if (instance && instance.fields) {
-            // Try to get field by name if available, otherwise use default
-            if (methodHandle.targetFieldName) {
-              return instance.fields[methodHandle.targetFieldName] || 0;
-            }
-            return instance.fields.testField || 0;
-          }
-        }
-        return 0;
-      }
-
-      function handleFieldSet(jvm, methodHandle, args) {
-        // Field setter - set field value on instance
-        if (args && args.length >= 2) {
-          const instance = args[0];
-          const value = args[1];
-          if (instance && instance.fields) {
-            // Try to set field by name if available, otherwise use default
-            if (methodHandle.targetFieldName) {
-              instance.fields[methodHandle.targetFieldName] = value;
-            } else {
-              instance.fields.testField = value;
-            }
-          }
-        }
-        return;
-      }
-
-      function handleInterfaceMethod(jvm, methodHandle, args) {
-        // Interface method - similar to instance method
-        return handleInstanceMethod(jvm, methodHandle, args);
-      }
-
-      function handleUnknownMethod(jvm, methodHandle, args) {
-        // Generic fallback for unknown method handle types
-        if (args && args.length > 0) {
-          const firstArg = args[0];
-          if (typeof firstArg === 'string') {
-            return jvm.internString(firstArg);
-          }
-          if (firstArg && firstArg.type === 'java/lang/String') {
-            return firstArg;
-          }
-        }
-        return { type: "java/lang/Object" };
-      }
-
-      function handleLegacyMethod(jvm, methodHandle, args) {
-        // Legacy fallback for method handles without kind information
-        if (args && args.length === 1 && typeof args[0] === 'string') {
-          // Likely static method call
-          return handleStaticMethod(jvm, methodHandle, args);
-        } else if (args && args.length === 2) {
-          // Could be instance method or field operation
-          const firstArg = args[0];
-          const secondArg = args[1];
-
-          if (typeof firstArg === 'object' && firstArg.fields && typeof secondArg === 'number') {
-            // Looks like field setter
-            return handleFieldSet(jvm, methodHandle, args);
-          } else if (typeof firstArg === 'object' && firstArg.fields) {
-            // Looks like field getter
-            return handleFieldGet(jvm, methodHandle, args);
-          } else {
-            // Default to instance method
-            return handleInstanceMethod(jvm, methodHandle, args);
-          }
-        }
-        return { type: "java/lang/Object" };
-      }
-    }
-  }
 
   /**
    * Set up reflection Array static methods
