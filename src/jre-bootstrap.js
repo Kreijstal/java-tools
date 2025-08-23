@@ -3,7 +3,13 @@
  *
  * This module handles the loading and initialization of JRE (Java Runtime Environment) classes
  * into the JVM's runtime class registry. This separates JRE concerns from core JVM functionality.
+ *
+ * Uses the generated JRE index for real implementations when available, falling back to
+ * the original comprehensive class loading approach for compatibility.
  */
+
+// Import the generated JRE index for real class implementations
+const jreClasses = require('./jre/index');
 
 class JreBootstrap {
   /**
@@ -17,47 +23,89 @@ class JreBootstrap {
    * @param {JVM} jvm - The JVM instance to load classes into
    */
   static preloadAllJreClasses(jvm) {
-    const jreHierarchy = {
-      // Essential classes - now loaded as part of normal process
+    // Load real implementations from generated JRE index first
+    // Sort classes to ensure superclasses are loaded before subclasses
+    const classNames = Object.keys(jreClasses);
+    const sortedClassNames = classNames.sort((a, b) => {
+      const aDepth = a.split('/').length;
+      const bDepth = b.split('/').length;
+      return aDepth - bDepth; // Load less nested classes first
+    });
+
+    for (const className of sortedClassNames) {
+      const jreClassDef = jreClasses[className];
+      this.createRuntimeClass(jvm, className, jreClassDef);
+    }
+
+    // Set static fields in JRE registry after all classes are loaded
+    // This ensures getstatic can find them in the JRE registry
+    for (const className of sortedClassNames) {
+      const jreClassDef = jreClasses[className];
+      if (jreClassDef && jreClassDef.staticFields) {
+        if (!jvm.jre[className]) {
+          jvm.jre[className] = {};
+        }
+        if (!jvm.jre[className].staticFields) {
+          jvm.jre[className].staticFields = {};
+        }
+
+        for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
+          const normalizedFieldKey = fieldKey.replace(/'/g, '');
+          jvm.jre[className].staticFields[normalizedFieldKey] = fieldValue;
+        }
+      }
+    }
+
+    // Generate hierarchy dynamically from the generated JRE index with essential fallbacks
+    const jreHierarchy = {};
+
+    // First, add all classes from the generated index with their proper superclasses
+    for (const className in jreClasses) {
+      const classDef = jreClasses[className];
+      jreHierarchy[className] = classDef.super || "java/lang/Object";
+    }
+
+    // Essential base classes that must be available (some may not be in index)
+    const essentialBaseClasses = {
       "java/lang/Object": null,
-      "java/lang/System": "java/lang/Object",
-      "java/lang/String": "java/lang/Object",
-      "java/lang/Class": "java/lang/Object",
       "java/lang/Throwable": "java/lang/Object",
       "java/lang/Exception": "java/lang/Throwable",
-      "java/lang/RuntimeException": "java/lang/Exception",
-
-      // Other JRE classes
-      "java/lang/ArithmeticException": "java/lang/RuntimeException",
-      "java/lang/IllegalArgumentException": "java/lang/RuntimeException",
-      "java/lang/IllegalStateException": "java/lang/RuntimeException",
-      "java/lang/Enum": "java/lang/Object",
-      "java/lang/Runnable": "java/lang/Object",
-      "java/lang/CharSequence": "java/lang/Object",
-      "java/lang/ReflectiveOperationException": "java/lang/Exception",
-      "java/lang/NoSuchMethodException":
-        "java/lang/ReflectiveOperationException",
-      "java/io/IOException": "java/lang/Exception",
-      "java/io/Reader": "java/lang/Object",
-      "java/io/BufferedReader": "java/io/Reader",
-      "java/io/InputStreamReader": "java/io/Reader",
-      "java/io/InputStream": "java/lang/Object",
-      "java/io/FilterInputStream": "java/io/InputStream",
-      "java/io/BufferedInputStream": "java/io/FilterInputStream",
-      "java/io/OutputStream": "java/lang/Object",
-      "java/io/FilterOutputStream": "java/io/OutputStream",
-      "java/io/PrintStream": "java/io/FilterOutputStream",
-      "java/io/ConsoleOutputStream": "java/io/OutputStream",
-      "java/net/URLConnection": "java/lang/Object",
-      "java/net/HttpURLConnection": "java/net/URLConnection",
-      "java/net/URI": "java/lang/Object",
-      "java/net/http/HttpClient": "java/lang/Object",
-      "java/net/http/HttpRequest": "java/lang/Object",
-      "java/net/http/HttpResponse": "java/lang/Object",
-      "java/time/Duration": "java/lang/Object",
-      "java/util/function/Function": "java/lang/Object",
-      "java/lang/reflect/Array": "java/lang/Object",
+      "java/lang/RuntimeException": "java/lang/Exception"
     };
+
+    // Add essential base classes
+    Object.assign(jreHierarchy, essentialBaseClasses);
+
+    // Additional essential classes that are referenced but may not be in the index
+    // Note: Primitive type wrapper classes (Void, Integer, etc.) are already in the generated index
+    const additionalEssentialClasses = {
+      "java/lang/reflect/Array": "java/lang/Object",
+      "java/lang/CharSequence": "java/lang/Object",
+      "java/util/function/Function": "java/lang/Object",
+      "java/lang/Iterable": "java/lang/Object",
+      "java/util/Collection": "java/lang/Iterable",
+      "java/util/List": "java/util/Collection",
+      "java/util/Iterator": "java/lang/Object",
+      "java/lang/Appendable": "java/lang/Object",
+      "java/io/FilterInputStream": "java/io/InputStream",
+      "java/io/NullOutputStream": "java/io/OutputStream",
+      "java/lang/StringBuilder": "java/lang/Object",
+      "java/lang/Runtime": "java/lang/Object",
+      "java/lang/Process": "java/lang/Object",
+      "java/lang/Thread": "java/lang/Object",
+      "java/lang/IndexOutOfBoundsException": "java/lang/RuntimeException",
+      "java/lang/StringIndexOutOfBoundsException": "java/lang/IndexOutOfBoundsException",
+      "java/lang/ArrayIndexOutOfBoundsException": "java/lang/IndexOutOfBoundsException",
+      "java/lang/NullPointerException": "java/lang/RuntimeException",
+      "java/lang/NumberFormatException": "java/lang/IllegalArgumentException"
+    };
+
+    // Add additional essential classes only if not already in the index
+    for (const className in additionalEssentialClasses) {
+      if (!jreHierarchy[className]) {
+        jreHierarchy[className] = additionalEssentialClasses[className];
+      }
+    }
 
     // Create stubs for all classes in the hierarchy
     for (const className in jreHierarchy) {
@@ -739,10 +787,14 @@ class JreBootstrap {
       if (jvm.verbose) {
         console.log(`Initializing static fields for ${className} from JRE definition`);
       }
+
       for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
-        classStub.staticFields.set(fieldKey, fieldValue);
+        // Convert field key from 'name:descriptor' format to 'name:descriptor' format
+        const normalizedFieldKey = fieldKey.replace(/'/g, '');
+        classStub.staticFields.set(normalizedFieldKey, fieldValue);
+
         if (jvm.verbose) {
-          console.log(`  Set static field ${fieldKey}:`, fieldValue);
+          console.log(`  Set static field ${normalizedFieldKey}:`, fieldValue);
         }
       }
     }

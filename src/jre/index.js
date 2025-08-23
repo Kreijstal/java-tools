@@ -38,6 +38,8 @@ const jreClasses = {
   'java/lang/Number': require('./java/lang/Number'),
   'java/lang/Void': require('./java/lang/Void'),
   'java/lang/Appendable': require('./java/lang/Appendable'),
+  'java/io/Reader': require('./java/io/Reader'),
+  'java/io/InputStream': require('./java/io/InputStream'),
   'java/io/OutputStream': require('./java/io/OutputStream'),
   'java/io/FilterOutputStream': require('./java/io/FilterOutputStream'),
   'java/io/NullOutputStream': require('./java/io/NullOutputStream'),
