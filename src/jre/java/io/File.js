@@ -89,9 +89,9 @@ module.exports = {
     'length()J': (jvm, obj, args) => {
       try {
         const stats = fs.statSync(obj.path);
-        return stats.size;
+        return BigInt(stats.size);
       } catch (e) {
-        return 0;
+        return BigInt(0);
       }
     },
     

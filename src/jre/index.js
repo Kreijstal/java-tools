@@ -84,6 +84,9 @@ const jreClasses = {
   'java/net/URI': require('./java/net/URI.js'),
   'java/net/URL': require('./java/net/URL.js'),
   'java/net/URLConnection': require('./java/net/URLConnection.js'),
+  'java/nio/ByteBuffer': require('./java/nio/ByteBuffer.js'),
+  'java/nio/charset/Charset': require('./java/nio/charset/Charset.js'),
+  'java/security/SecureRandom': require('./java/security/SecureRandom.js'),
   'java/time/Duration': require('./java/time/Duration.js'),
   'java/util/AbstractCollection': require('./java/util/AbstractCollection.js'),
   'java/util/AbstractSet': require('./java/util/AbstractSet.js'),
@@ -100,7 +103,10 @@ const jreClasses = {
   'java/util/LinkedList$ListIterator': require('./java/util/LinkedList$ListIterator.js'),
   'java/util/List': require('./java/util/List.js'),
   'java/util/NoSuchElementException': require('./java/util/NoSuchElementException.js'),
-  'java/util/Objects': require('./java/util/Objects.js')
+  'java/util/Objects': require('./java/util/Objects.js'),
+  'java/util/Random': require('./java/util/Random.js'),
+  'java/util/zip/CRC32': require('./java/util/zip/CRC32.js'),
+  'java/util/zip/Inflater': require('./java/util/zip/Inflater.js')
 };
 
 module.exports = jreClasses;
