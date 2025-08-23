@@ -55,6 +55,10 @@ module.exports = {
     "toLowerCase()Ljava/lang/String;": (jvm, obj, args) => {
       return jvm.internString(obj.toLowerCase());
     },
+    "repeat(I)Ljava/lang/String;": (jvm, obj, args) => {
+      const count = args[0];
+      return jvm.internString(obj.repeat(count));
+    },
     "length()I": (jvm, obj, args) => {
       return obj.length;
     },
