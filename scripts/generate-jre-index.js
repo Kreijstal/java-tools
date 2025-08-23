@@ -37,9 +37,7 @@ function generateJreIndex() {
         const relativePath = `./${prefix}${file}`;
 
         // Skip if this looks like an index file (contains 'index')
-        if (!className.includes('index')) {
-          jreClasses[className] = relativePath;
-        }
+jreClasses[className] = relativePath;
       }
     }
   }
