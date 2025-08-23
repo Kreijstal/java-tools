@@ -65,15 +65,10 @@ class JreBootstrap {
       jreHierarchy[className] = classDef.super || "java/lang/Object";
     }
 
-    // Essential base classes that must be available as fallbacks
-    // These ensure the hierarchy is complete even if some JRE class files don't define proper super properties
-    // Object must remain as the ultimate root class safeguard
-    const essentialBaseClasses = {
-      "java/lang/Object": null
-    };
-
-    // Add essential base classes to ensure hierarchy completeness
-    Object.assign(jreHierarchy, essentialBaseClasses);
+    // Essential root class that must be available as fallback
+    // Object is the foundation that 48+ classes reference as their default superclass
+    // This ensures the hierarchy has a solid root before any other classes are processed
+    jreHierarchy["java/lang/Object"] = null;
 
     // Create stubs for all classes in the hierarchy
     for (const className in jreHierarchy) {

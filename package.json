@@ -13,7 +13,7 @@
     "generate": "npm run build:java && node scripts/generateData.js",
     "build": "npm run generate && npm run build:bundle && node scripts/buildSite.js",
     "clean": "find sources -name '*.class' -delete && rm -rf dist",
-    "pretest": "npm run build:java",
+    "pretest": "node scripts/generate-jre-index.js &&npm run build:java",
     "ci": "npm run build && npm test",
     "health-check": "node scripts/health-check.js"
   },
