@@ -140,6 +140,20 @@ module.exports = {
       return obj;
     },
 
+    'printf(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;': (jvm, obj, args) => {
+      const { format } = require('../util/Formatter');
+      const formatString = args[0];
+      const formatArgs = args[1];
+      const result = format(formatString, formatArgs);
+
+      const printMethod = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      if (printMethod) {
+        printMethod(jvm, obj, [jvm.internString(result)]);
+      }
+
+      return obj;
+    },
+
     'append(Ljava/lang/CharSequence;)Ljava/lang/Appendable;': (jvm, obj, args) => {
       const csq = args[0];
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');

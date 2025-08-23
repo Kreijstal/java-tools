@@ -75,6 +75,8 @@ const jreClasses = {
   'java/util/ArrayList': require('./java/util/ArrayList.js'),
   'java/util/Collection': require('./java/util/Collection.js'),
   'java/util/concurrent/locks/ReentrantLock': require('./java/util/concurrent/locks/ReentrantLock.js'),
+  'java/util/Date': require('./java/util/Date.js'),
+  'java/util/Formatter': require('./java/util/Formatter.js'),
   'java/util/function/Function': require('./java/util/function/Function.js'),
   'java/util/HashSet': require('./java/util/HashSet.js'),
   'java/util/Iterator': require('./java/util/Iterator.js'),
