@@ -3,6 +3,7 @@
 // This file is .gitignored and regenerated during builds for browser compatibility
 
 const jreClasses = {
+  '[I': require('./[I.js'),
   'java/io/BufferedInputStream': require('./java/io/BufferedInputStream.js'),
   'java/io/BufferedReader': require('./java/io/BufferedReader.js'),
   'java/io/ConsoleOutputStream': require('./java/io/ConsoleOutputStream.js'),
@@ -24,6 +25,7 @@ const jreClasses = {
   'java/lang/Class': require('./java/lang/Class.js'),
   'java/lang/Double': require('./java/lang/Double.js'),
   'java/lang/Enum': require('./java/lang/Enum.js'),
+  'java/lang/Error': require('./java/lang/Error.js'),
   'java/lang/Exception': require('./java/lang/Exception.js'),
   'java/lang/Float': require('./java/lang/Float.js'),
   'java/lang/IllegalArgumentException': require('./java/lang/IllegalArgumentException.js'),
@@ -38,6 +40,7 @@ const jreClasses = {
   'java/lang/invoke/StringConcatFactory': require('./java/lang/invoke/StringConcatFactory.js'),
   'java/lang/Iterable': require('./java/lang/Iterable.js'),
   'java/lang/Long': require('./java/lang/Long.js'),
+  'java/lang/Math': require('./java/lang/Math.js'),
   'java/lang/NoSuchMethodException': require('./java/lang/NoSuchMethodException.js'),
   'java/lang/NullPointerException': require('./java/lang/NullPointerException.js'),
   'java/lang/Number': require('./java/lang/Number.js'),
@@ -53,6 +56,7 @@ const jreClasses = {
   'java/lang/Runnable': require('./java/lang/Runnable.js'),
   'java/lang/Runtime': require('./java/lang/Runtime.js'),
   'java/lang/RuntimeException': require('./java/lang/RuntimeException.js'),
+  'java/lang/SecurityException': require('./java/lang/SecurityException.js'),
   'java/lang/Short': require('./java/lang/Short.js'),
   'java/lang/String': require('./java/lang/String.js'),
   'java/lang/StringBuilder': require('./java/lang/StringBuilder.js'),
@@ -62,6 +66,7 @@ const jreClasses = {
   'java/lang/Throwable': require('./java/lang/Throwable.js'),
   'java/lang/Void': require('./java/lang/Void.js'),
   'java/math/BigDecimal': require('./java/math/BigDecimal.js'),
+  'java/math/BigInteger': require('./java/math/BigInteger.js'),
   'java/net/http/HttpClient': require('./java/net/http/HttpClient.js'),
   'java/net/http/HttpRequest': require('./java/net/http/HttpRequest.js'),
   'java/net/http/HttpResponse': require('./java/net/http/HttpResponse.js'),

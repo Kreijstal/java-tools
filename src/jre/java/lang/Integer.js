@@ -19,6 +19,21 @@ module.exports = {
       // Per spec, this should be a new string, not an interned one.
       return jvm.newString(intValue.toString());
     },
+    'parseInt(Ljava/lang/String;)I': (jvm, obj, args) => {
+      const str = args[0];
+      const stringValue = typeof str === 'string' ? str : (str ? str.value : '0');
+      const result = parseInt(stringValue, 10);
+      if (isNaN(result)) {
+        // In real Java this would throw NumberFormatException
+        return 0;
+      }
+      return result;
+    },
+    'toHexString(I)Ljava/lang/String;': (jvm, obj, args) => {
+      const intValue = args[0];
+      const hexString = (intValue >>> 0).toString(16);
+      return jvm.newString(hexString);
+    },
     'valueOf(I)Ljava/lang/Integer;': (jvm, obj, args) => {
       const integerObj = {
         type: 'java/lang/Integer',
