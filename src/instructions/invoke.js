@@ -231,6 +231,8 @@ async function invokestatic(frame, instruction, jvm, thread) {
     }
 
     let result = await jreMethod(jvm, null, args, thread);
+    // Yield to the event loop to prevent race conditions with synchronous native methods
+    await new Promise(resolve => setImmediate(resolve));
     const { returnType } = parseDescriptor(descriptor);
     if (returnType !== "V" && result !== undefined) {
       if (typeof result === "boolean") {
