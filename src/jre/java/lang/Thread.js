@@ -21,13 +21,23 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       obj.hashCode = jvm.nextHashCode++;
       obj.name = 'Thread-' + obj.hashCode;
+      obj.daemon = false;
+      obj.priority = 5;
       delete obj.isUninitialized;
     },
     '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args) => {
       obj.hashCode = jvm.nextHashCode++;
       obj.name = 'Thread-' + obj.hashCode;
       obj.runnable = args[0];
+      obj.daemon = false;
+      obj.priority = 5;
       delete obj.isUninitialized;
+    },
+    'setDaemon(Z)V': (jvm, obj, args) => {
+      obj.daemon = args[0];
+    },
+    'setPriority(I)V': (jvm, obj, args) => {
+      obj.priority = args[0];
     },
     'getName()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.name);
