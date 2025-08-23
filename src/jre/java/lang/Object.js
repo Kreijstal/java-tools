@@ -7,6 +7,32 @@ module.exports = {
     },
     'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
       const className = obj.type;
+
+      // Special handling for arrays
+      if (className && className.startsWith('[')) {
+        // Check if array class is already registered (e.g., from createMultiDimensionalArray)
+        if (jvm.classes[className] && jvm.classes[className].type === 'java/lang/Class') {
+          return jvm.classes[className];
+        }
+
+        // Create new array class if not already registered
+        const classData = {
+          isArray: true,
+          arrayType: className,
+          componentType: className.slice(1), // Remove leading '['
+          className: className
+        };
+
+        // Register the new class
+        jvm.classes[className] = classData;
+
+        return {
+          type: 'java/lang/Class',
+          _classData: classData
+        };
+      }
+
+      // For regular objects, use existing logic
       const classData = jvm.classes[className];
       return {
         type: 'java/lang/Class',

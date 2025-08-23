@@ -16,14 +16,15 @@ module.exports = {
       if (classObj.isPrimitive && classObj.name) {
         return jvm.internString(classObj.name);
       }
-      
+
       const classData = classObj._classData;
       if (!classData || !classData.ast) {
         if (classObj.type) {
-            return jvm.internString(classObj.type.replace(/\//g, '.'));
+          return jvm.internString(classObj.type.replace(/\//g, '.'));
         }
-        return jvm.internString("Unknown");
+        return jvm.internString("java.lang.Class");
       }
+
       const className = classData.ast.classes[0].className.replace(/\//g, '.');
       return jvm.internString(className);
     },

@@ -203,20 +203,6 @@ class JVM {
         return staticMethod;
       }
 
-      // Special handling for MethodHandle.invoke - fall back to generic varargs method
-      // when no exact signature match is found
-      if (
-        className === "java/lang/invoke/MethodHandle" &&
-        methodName === "invoke"
-      ) {
-        const genericMethodKey =
-          "invoke([Ljava/lang/Object;)Ljava/lang/Object;";
-        const genericMethod =
-          currentClass.methods && currentClass.methods[genericMethodKey];
-        if (genericMethod) {
-          return genericMethod;
-        }
-      }
 
       // Check superclass
       currentClass = currentClass.super ? this.jre[currentClass.super] : null;
@@ -712,7 +698,7 @@ class JVM {
 
     // Handle primitive types
     const primitiveTypeNames = new Set(Object.values(primitiveTypeDescriptors));
-    
+
     if (primitiveTypeNames.has(classNameWithSlashes)) {
       const classObj = {
         type: "java/lang/Class",
@@ -728,6 +714,7 @@ class JVM {
     if (!classData) {
       throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
     }
+
 
     const classObj = {
       type: "java/lang/Class",
