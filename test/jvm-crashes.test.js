@@ -98,12 +98,14 @@ const tests = [
     description: "Monitorenter/monitorexit for synchronization",
     expectedOutput:
       "=== Synchronization Test ===\nIn synchronized method\nCounter after synchronized method: 10\nBefore synchronized block\nIn synchronized block\nCounter after synchronized block: 15\n=== Multi-threaded Test ===\nFinal counter value: 15",
+    timeout: 1000, // 1 second timeout for threading tests
   },
   {
     name: "ConcurrencyCrash",
     description: "ReentrantLock support",
     expectedOutput:
       "Testing concurrency features that might crash...\nFinal counter value: 2000",
+    timeout: 2000, // 2 second timeout for threading tests
   },
 
   // Enums and modern Java features
@@ -139,7 +141,12 @@ const tests = [
 
 test("JVM Crash and Functionality Tests", async function (t) {
   for (const testCase of tests) {
-    await runTest(testCase.name, testCase.expectedOutput, t);
+    // Use timeout from test case if specified, otherwise use default
+    const options = {};
+    if (testCase.timeout) {
+      options.timeout = testCase.timeout;
+    }
+    await runTest(testCase.name, testCase.expectedOutput, t, options);
   }
   t.end();
 });

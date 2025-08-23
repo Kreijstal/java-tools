@@ -46,7 +46,7 @@ function createTestInputStream(inputData = "") {
 
 async function runTest(className, expectedOutput, t, options = {}) {
   let output = "";
-  const { nativeMethods, shouldFail, expectedError, ...jvmOptions } = options;
+  const { nativeMethods, shouldFail, expectedError, timeout = 30000, ...jvmOptions } = options;
   let success = true;
   let error = null;
 
@@ -147,7 +147,24 @@ async function runTest(className, expectedOutput, t, options = {}) {
       "sources",
       `${className}.class`,
     );
-    await jvm.run(classFilePath);
+
+    // Use AbortController for efficient timeout handling
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, timeout);
+
+    try {
+      await jvm.run(classFilePath);
+      // Test completed successfully, clear the timeout
+      clearTimeout(timeoutId);
+    } catch (e) {
+      clearTimeout(timeoutId);
+      if (controller.signal.aborted) {
+        throw new Error(`Test timeout after ${timeout}ms`);
+      }
+      throw e;
+    }
   } catch (e) {
     success = false;
     error = e;
