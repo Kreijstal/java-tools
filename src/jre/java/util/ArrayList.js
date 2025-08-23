@@ -21,6 +21,17 @@ module.exports = {
         array: obj.array,
         index: 0,
       };
+    },
+    'addAll(Ljava/util/Collection;)Z': function(jvm, obj, args) {
+      const collection = args[0];
+      if (collection.array) {
+        obj.array.push(...collection.array);
+        return 1;
+      }
+      return 0;
+    },
+    'toArray()[Ljava/lang/Object;': function(jvm, obj, args) {
+      return obj.array;
     }
   }
 };
