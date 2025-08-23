@@ -156,24 +156,46 @@ module.exports = {
       return;
     }
 
+    const fieldKey = `${fieldName}:${descriptor}`;
+
+    // First, try to get the field from the class registry (regular classes)
     const classData = jvm.classes[className];
-    if (classData && classData.staticFields) {
-      const fieldKey = `${fieldName}:${descriptor}`;
-      if (classData.staticFields.has(fieldKey)) {
-        frame.stack.push(classData.staticFields.get(fieldKey));
+    if (classData && classData.staticFields && classData.staticFields.has(fieldKey)) {
+      frame.stack.push(classData.staticFields.get(fieldKey));
+      return;
+    }
+
+    // If not found in class registry, try the JRE registry (for JRE classes)
+    if (jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields) {
+      const jreStaticFields = jvm.jre[className].staticFields;
+      if (jreStaticFields[fieldKey]) {
+        frame.stack.push(jreStaticFields[fieldKey]);
         return;
       }
 
-      // Debug: Log available static fields
-      if (jvm.verbose) {
-        console.log(`Static fields available for ${className}:`, Array.from(classData.staticFields.keys()));
+      // Try alternative field key formats for JRE registry
+      const alternativeKeys = [
+        `'${fieldName}:${descriptor}'`,
+        `${fieldName}:${descriptor}'`,
+        `'${fieldName}:${descriptor}`,
+        fieldName,
+        `'${fieldName}'`
+      ];
+
+      for (const altKey of alternativeKeys) {
+        if (jreStaticFields[altKey]) {
+          frame.stack.push(jreStaticFields[altKey]);
+          return;
+        }
       }
-    } else {
-      if (jvm.verbose) {
-        console.log(`No classData or staticFields found for ${className}`);
-        console.log(`classData exists:`, !!classData);
-        console.log(`staticFields exists:`, !!(classData && classData.staticFields));
-      }
+    }
+
+    // Debug logging for troubleshooting (only in verbose mode)
+    if (jvm.verbose) {
+      console.log(`Static field lookup failed for ${className}.${fieldName}`);
+      console.log(`Looking for field key: "${fieldKey}"`);
+      console.log(`Class registry static fields:`, classData && classData.staticFields ? Array.from(classData.staticFields.keys()) : 'none');
+      console.log(`JRE registry static fields:`, jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields ? Object.keys(jvm.jre[className].staticFields) : 'none');
     }
 
     throw new Error(`Unresolved static field: ${className}.${fieldName}`);

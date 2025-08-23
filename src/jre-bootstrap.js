@@ -3,74 +3,72 @@
  *
  * This module handles the loading and initialization of JRE (Java Runtime Environment) classes
  * into the JVM's runtime class registry. This separates JRE concerns from core JVM functionality.
+ *
+ * Uses the generated JRE index for real implementations when available, falling back to
+ * the original comprehensive class loading approach for compatibility.
  */
+
+// Import the generated JRE index for real class implementations
+const jreClasses = require('./jre/index');
 
 class JreBootstrap {
   /**
    * Preload essential JRE classes that are required for basic JVM operation
    * @param {JVM} jvm - The JVM instance to load classes into
    */
-  static preloadEssentialClasses(jvm) {
-    const essentialClasses = [
-      'java/lang/Object',
-      'java/lang/System',
-      'java/lang/String',
-      'java/lang/Class',
-      'java/io/PrintStream',
-      'java/io/ConsoleOutputStream',
-      'java/lang/Throwable',
-      'java/lang/Exception',
-      'java/lang/RuntimeException'
-    ];
-
-    for (const className of essentialClasses) {
-      if (jvm.jre[className] && !jvm.classes[className]) {
-        this.createRuntimeClass(jvm, className, jvm.jre[className]);
-      }
-    }
-  }
 
   /**
-   * Load all JRE classes from the hierarchy and filesystem (extracted from JVM._preloadJreClasses)
+   * Load all JRE classes from the hierarchy and filesystem, including essential classes
+   * (previously handled by preloadEssentialClasses)
    * @param {JVM} jvm - The JVM instance to load classes into
    */
   static preloadAllJreClasses(jvm) {
-    const jreHierarchy = {
-      "java/lang/Object": null,
-      "java/lang/System": "java/lang/Object",
-      "java/lang/Throwable": "java/lang/Object",
-      "java/lang/Exception": "java/lang/Throwable",
-      "java/lang/RuntimeException": "java/lang/Exception",
-      "java/lang/ArithmeticException": "java/lang/RuntimeException",
-      "java/lang/IllegalArgumentException": "java/lang/RuntimeException",
-      "java/lang/IllegalStateException": "java/lang/RuntimeException",
-      "java/lang/Enum": "java/lang/Object",
-      "java/lang/Runnable": "java/lang/Object",
-      "java/lang/CharSequence": "java/lang/Object",
-      "java/lang/ReflectiveOperationException": "java/lang/Exception",
-      "java/lang/NoSuchMethodException":
-        "java/lang/ReflectiveOperationException",
-      "java/io/IOException": "java/lang/Exception",
-      "java/io/Reader": "java/lang/Object",
-      "java/io/BufferedReader": "java/io/Reader",
-      "java/io/InputStreamReader": "java/io/Reader",
-      "java/io/InputStream": "java/lang/Object",
-      "java/io/FilterInputStream": "java/io/InputStream",
-      "java/io/BufferedInputStream": "java/io/FilterInputStream",
-      "java/io/OutputStream": "java/lang/Object",
-      "java/io/FilterOutputStream": "java/io/OutputStream",
-      "java/io/PrintStream": "java/io/FilterOutputStream",
-      "java/io/ConsoleOutputStream": "java/io/OutputStream",
-      "java/net/URLConnection": "java/lang/Object",
-      "java/net/HttpURLConnection": "java/net/URLConnection",
-      "java/net/URI": "java/lang/Object",
-      "java/net/http/HttpClient": "java/lang/Object",
-      "java/net/http/HttpRequest": "java/lang/Object",
-      "java/net/http/HttpResponse": "java/lang/Object",
-      "java/time/Duration": "java/lang/Object",
-      "java/util/function/Function": "java/lang/Object",
-      "java/lang/reflect/Array": "java/lang/Object",
-    };
+    // Load real implementations from generated JRE index first
+    // Sort classes to ensure superclasses are loaded before subclasses
+    const classNames = Object.keys(jreClasses);
+    const sortedClassNames = classNames.sort((a, b) => {
+      const aDepth = a.split('/').length;
+      const bDepth = b.split('/').length;
+      return aDepth - bDepth; // Load less nested classes first
+    });
+
+    for (const className of sortedClassNames) {
+      const jreClassDef = jreClasses[className];
+      this.createRuntimeClass(jvm, className, jreClassDef);
+    }
+
+    // Set static fields in JRE registry after all classes are loaded
+    // This ensures getstatic can find them in the JRE registry
+    for (const className of sortedClassNames) {
+      const jreClassDef = jreClasses[className];
+      if (jreClassDef && jreClassDef.staticFields) {
+        if (!jvm.jre[className]) {
+          jvm.jre[className] = {};
+        }
+        if (!jvm.jre[className].staticFields) {
+          jvm.jre[className].staticFields = {};
+        }
+
+        for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
+          const normalizedFieldKey = fieldKey.replace(/'/g, '');
+          jvm.jre[className].staticFields[normalizedFieldKey] = fieldValue;
+        }
+      }
+    }
+
+    // Generate hierarchy dynamically from the generated JRE index
+    const jreHierarchy = {};
+
+    // Add all classes from the generated index with their proper superclasses
+    for (const className in jreClasses) {
+      const classDef = jreClasses[className];
+      jreHierarchy[className] = classDef.super || "java/lang/Object";
+    }
+
+    // Essential root class that must be available as fallback
+    // Object is the foundation that 48+ classes reference as their default superclass
+    // This ensures the hierarchy has a solid root before any other classes are processed
+    jreHierarchy["java/lang/Object"] = null;
 
     // Create stubs for all classes in the hierarchy
     for (const className in jreHierarchy) {
@@ -162,10 +160,6 @@ class JreBootstrap {
 
               jvm.classes[className] = classStub;
 
-              // Special handling for MethodHandle - set up invoke methods
-              if (className === 'java/lang/invoke/MethodHandle') {
-                this.setupMethodHandleInvoke(jvm, className);
-              }
             }
           }
         }
@@ -175,9 +169,6 @@ class JreBootstrap {
     // In browser environment, we'll rely on the basic hierarchy defined above
     // and any additional JRE classes can be loaded dynamically as needed
 
-    // Set up special method interfaces that need JVM dispatch
-    this.setupMethodHandleInvoke(jvm);
-
     // Set up reflection Array methods
     this.setupArrayReflection(jvm);
 
@@ -185,136 +176,6 @@ class JreBootstrap {
     this.setupClassReflection(jvm);
   }
 
-  /**
-   * Set up MethodHandle.invoke method resolution behavior
-   * @param {JVM} jvm - The JVM instance
-   * @param {string} className - Name of the class to create
-   */
-  static setupMethodHandleInvoke(jvm, className) {
-    if (className === 'java/lang/invoke/MethodHandle') {
-      // Set up the generic invoke method that will be dispatched by JVM
-      const invokeMethod = {
-        type: "method",
-        method: {
-          name: "invoke",
-          descriptor: "([Ljava/lang/Object;)Ljava/lang/Object;",
-          flags: ["public"],
-          attributes: [],
-        },
-      };
-
-      // Add to the class if it exists
-      const classData = jvm.classes[className];
-      if (classData && classData.ast && classData.ast.classes[0]) {
-        if (!classData.ast.classes[0].items) {
-          classData.ast.classes[0].items = [];
-        }
-        // Check if invoke method already exists
-        const existingInvoke = classData.ast.classes[0].items.find(
-          item => item.type === "method" && item.method.name === "invoke"
-        );
-        if (!existingInvoke) {
-          classData.ast.classes[0].items.push(invokeMethod);
-        }
-      }
-
-      // Also add the generic method to the JRE definition so it can be found
-      if (!jvm.jre[className]) {
-        jvm.jre[className] = {};
-      }
-      if (!jvm.jre[className].methods) {
-        jvm.jre[className].methods = {};
-      }
-
-      // Add multiple invoke method signatures to handle different call patterns
-      const invokeSignatures = [
-        "()Ljava/lang/Object;",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        "(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        "([Ljava/lang/Object;)Ljava/lang/Object;",
-        // Add specific signatures that tests expect
-        "(LMethodHandlesTest;I)Ljava/lang/String;",
-        "(Ljava/lang/String;)V",
-        "(LMethodHandlesTest;I)V",
-        "(LMethodHandlesTest;)I",
-        "(LMethodHandlesTest;Ljava/lang/String;)V",
-        // Add more specific test signatures
-        "(LMethodHandlesTest;I)Ljava/lang/String;",
-        "(LMethodHandlesTest;I)V"
-      ];
-
-      invokeSignatures.forEach(sig => {
-        const methodKey = `invoke${sig}`;
-        jvm.jre[className].methods[methodKey] = function(jvm, thisObj, args, thread) {
-          // MethodHandle.invoke implementation based on signature
-          if (sig === "(Ljava/lang/String;)V") {
-            // Static method call: mh.invoke("Hello from MethodHandle!")
-            // This should actually call MethodHandlesTest.staticMethod(message)
-            const message = args[0];
-
-            // For this test case, we know it's calling MethodHandlesTest.staticMethod
-            // Since the class isn't in jvm.classes, we need to simulate the call
-            const outputText = `Static method called: ${message}`;
-
-            // Simply call System.out.println through the JRE system
-            // This should work because the test framework has set up System.out to capture output
-            const printlnMethod = jvm._jreFindMethod('java/io/PrintStream', 'println', '(Ljava/lang/String;)V');
-            if (printlnMethod) {
-              const systemClass = jvm.classes['java/lang/System'];
-              if (systemClass && systemClass.staticFields) {
-                const out = systemClass.staticFields.get('out:Ljava/io/PrintStream;');
-                if (out) {
-                  printlnMethod(jvm, out, [jvm.internString(outputText)]);
-                  return;
-                }
-              }
-            }
-
-            // Fallback: use the test framework's output mechanism
-            if (typeof jvm._outputCallback === 'function') {
-              jvm._outputCallback(outputText + '\n');
-            }
-            return;
-          } else if (sig === "(LMethodHandlesTest;I)Ljava/lang/String;") {
-            // Instance method call: instanceMh.invoke(instance, 42)
-            // This should call instanceMethod(42) and return a formatted string
-            const value = args[1]; // Second argument is the int value
-            return jvm.internString(`Instance method called with: ${value}`);
-          } else if (sig === "(LMethodHandlesTest;I)V") {
-            // Field setter: setterMh.invoke(instance, 100)
-            // This should set the field value
-            const instance = args[0];
-            const value = args[1];
-            if (instance && instance.fields) {
-              instance.fields.testField = value;
-            }
-            return;
-          } else if (sig === "(LMethodHandlesTest;)I") {
-            // Field getter: getterMh.invoke(instance)
-            // This should return the field value
-            const instance = args[0];
-            if (instance && instance.fields) {
-              return instance.fields.testField || 0;
-            }
-            return 0;
-          } else {
-            // Generic fallback for other signatures
-            if (args && args.length > 0) {
-              const firstArg = args[0];
-              if (typeof firstArg === 'string') {
-                return jvm.internString(firstArg);
-              }
-              if (firstArg && firstArg.type === 'java/lang/String') {
-                return firstArg;
-              }
-            }
-            return { type: "java/lang/Object" };
-          }
-        };
-      });
-    }
-  }
 
   /**
    * Set up reflection Array static methods
@@ -889,10 +750,14 @@ class JreBootstrap {
       if (jvm.verbose) {
         console.log(`Initializing static fields for ${className} from JRE definition`);
       }
+
       for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
-        classStub.staticFields.set(fieldKey, fieldValue);
+        // Convert field key from 'name:descriptor' format to 'name:descriptor' format
+        const normalizedFieldKey = fieldKey.replace(/'/g, '');
+        classStub.staticFields.set(normalizedFieldKey, fieldValue);
+
         if (jvm.verbose) {
-          console.log(`  Set static field ${fieldKey}:`, fieldValue);
+          console.log(`  Set static field ${normalizedFieldKey}:`, fieldValue);
         }
       }
     }

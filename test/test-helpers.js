@@ -46,9 +46,12 @@ function createTestInputStream(inputData = "") {
 
 async function runTest(className, expectedOutput, t, options = {}) {
   let output = "";
-  const { nativeMethods, shouldFail, expectedError, ...jvmOptions } = options;
+  const { nativeMethods, shouldFail, expectedError, timeout = 1000, ...jvmOptions } = options;
   let success = true;
   let error = null;
+
+  // Track execution time for performance analysis
+  const startTime = Date.now();
 
   try {
     const jvm = new JVM({
@@ -147,7 +150,22 @@ async function runTest(className, expectedOutput, t, options = {}) {
       "sources",
       `${className}.class`,
     );
-    await jvm.run(classFilePath);
+
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+      timeoutId = setTimeout(() => {
+        reject(new Error(`Test timeout after ${timeout}ms`));
+      }, timeout);
+    });
+
+    try {
+      await Promise.race([
+        jvm.run(classFilePath),
+        timeoutPromise,
+      ]);
+    } finally {
+      clearTimeout(timeoutId);
+    }
   } catch (e) {
     success = false;
     error = e;
@@ -179,7 +197,22 @@ async function runTest(className, expectedOutput, t, options = {}) {
     }
   }
 
-  return { output, success, error };
+  // Log execution time for performance monitoring
+  const endTime = Date.now();
+  const executionTime = endTime - startTime;
+
+  // Log tests that take longer than 50ms for performance analysis, if enabled
+  if (process.env.PERF_LOG && executionTime > 50) {
+    console.log(`[PERF] ${className}: ${executionTime}ms`);
+  }
+
+  // Log tests that take longer than 50ms for performance analysis
+  if (executionTime > 50) {
+    console.log(`[PERF] ${className}: ${executionTime}ms`);
+  }
+
+  return { output, success, error, executionTime };
 }
 
-module.exports = { runTest, normalizeFloatingPointNumbers };
+
+module.exports = { runTest,  normalizeFloatingPointNumbers };

@@ -1,4 +1,5 @@
 module.exports = {
+  super: null,
   name: 'java/lang/Appendable',
   isInterface: true,
   methods: {

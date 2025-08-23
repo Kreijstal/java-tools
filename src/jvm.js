@@ -208,8 +208,21 @@ class JVM {
       currentClass = currentClass.super ? this.jre[currentClass.super] : null;
     }
 
+    // If no exact match found and this is a MethodHandle.invoke method,
+    // try the universal varargs signature that can handle any parameters
+    if (className === 'java/lang/invoke/MethodHandle' && methodName === 'invoke') {
+      const methodHandleClass = this.jre['java/lang/invoke/MethodHandle'];
+      if (methodHandleClass && methodHandleClass.methods) {
+        const universalMethod = methodHandleClass.methods['invoke([Ljava/lang/Object;)Ljava/lang/Object;'];
+        if (universalMethod) {
+          return universalMethod;
+        }
+      }
+    }
+
     return null;
   }
+
 
   async _initializeStaticFields(classData) {
     if (classData.staticFields) {

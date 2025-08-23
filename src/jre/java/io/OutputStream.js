@@ -1,4 +1,5 @@
 module.exports = {
+  super: 'java/lang/Object',
   name: 'java/io/OutputStream',
   isAbstract: true,
   methods: {
