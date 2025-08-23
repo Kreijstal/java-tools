@@ -56,16 +56,17 @@ class JreBootstrap {
       }
     }
 
-    // Generate hierarchy dynamically from the generated JRE index with essential fallbacks
+    // Generate hierarchy dynamically from the generated JRE index
     const jreHierarchy = {};
 
-    // First, add all classes from the generated index with their proper superclasses
+    // Add all classes from the generated index with their proper superclasses
     for (const className in jreClasses) {
       const classDef = jreClasses[className];
       jreHierarchy[className] = classDef.super || "java/lang/Object";
     }
 
-    // Essential base classes that must be available (some may not be in index)
+    // Essential base classes that must be available as fallbacks
+    // These are included in the generated index but kept here as safeguards
     const essentialBaseClasses = {
       "java/lang/Object": null,
       "java/lang/Throwable": "java/lang/Object",
@@ -73,39 +74,11 @@ class JreBootstrap {
       "java/lang/RuntimeException": "java/lang/Exception"
     };
 
-    // Add essential base classes
+    // Add essential base classes (these are already in the generated index but kept as fallbacks)
     Object.assign(jreHierarchy, essentialBaseClasses);
 
-    // Additional essential classes that are referenced but may not be in the index
-    // Note: Primitive type wrapper classes (Void, Integer, etc.) are already in the generated index
-    const additionalEssentialClasses = {
-      "java/lang/reflect/Array": "java/lang/Object",
-      "java/lang/CharSequence": "java/lang/Object",
-      "java/util/function/Function": "java/lang/Object",
-      "java/lang/Iterable": "java/lang/Object",
-      "java/util/Collection": "java/lang/Iterable",
-      "java/util/List": "java/util/Collection",
-      "java/util/Iterator": "java/lang/Object",
-      "java/lang/Appendable": "java/lang/Object",
-      "java/io/FilterInputStream": "java/io/InputStream",
-      "java/io/NullOutputStream": "java/io/OutputStream",
-      "java/lang/StringBuilder": "java/lang/Object",
-      "java/lang/Runtime": "java/lang/Object",
-      "java/lang/Process": "java/lang/Object",
-      "java/lang/Thread": "java/lang/Object",
-      "java/lang/IndexOutOfBoundsException": "java/lang/RuntimeException",
-      "java/lang/StringIndexOutOfBoundsException": "java/lang/IndexOutOfBoundsException",
-      "java/lang/ArrayIndexOutOfBoundsException": "java/lang/IndexOutOfBoundsException",
-      "java/lang/NullPointerException": "java/lang/RuntimeException",
-      "java/lang/NumberFormatException": "java/lang/IllegalArgumentException"
-    };
-
-    // Add additional essential classes only if not already in the index
-    for (const className in additionalEssentialClasses) {
-      if (!jreHierarchy[className]) {
-        jreHierarchy[className] = additionalEssentialClasses[className];
-      }
-    }
+    // All essential classes are now properly included in the generated JRE index
+    // No manual class definitions needed since all classes exist as .js files
 
     // Create stubs for all classes in the hierarchy
     for (const className in jreHierarchy) {
