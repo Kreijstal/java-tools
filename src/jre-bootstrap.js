@@ -67,12 +67,9 @@ class JreBootstrap {
 
     // Essential base classes that must be available as fallbacks
     // These ensure the hierarchy is complete even if some JRE class files don't define proper super properties
-    // Keeping as temporary safeguard while fixing remaining classes
+    // Object must remain as the ultimate root class safeguard
     const essentialBaseClasses = {
-      "java/lang/Object": null,
-      "java/lang/Throwable": "java/lang/Object",
-      "java/lang/Exception": "java/lang/Throwable",
-      "java/lang/RuntimeException": "java/lang/Exception"
+      "java/lang/Object": null
     };
 
     // Add essential base classes to ensure hierarchy completeness
