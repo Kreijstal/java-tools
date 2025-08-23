@@ -46,7 +46,7 @@ function createTestInputStream(inputData = "") {
 
 async function runTest(className, expectedOutput, t, options = {}) {
   let output = "";
-  const { nativeMethods, shouldFail, expectedError, timeout = 30000, ...jvmOptions } = options;
+  const { nativeMethods, shouldFail, expectedError, timeout = 1000, ...jvmOptions } = options;
   let success = true;
   let error = null;
 
@@ -199,4 +199,10 @@ async function runTest(className, expectedOutput, t, options = {}) {
   return { output, success, error };
 }
 
-module.exports = { runTest, normalizeFloatingPointNumbers };
+async function runSlowTest(className, expectedOutput, t, options = {}) {
+  // Create a test that takes longer than 1 second
+  const slowOptions = { ...options, timeout: 2000 }; // Override to 2 seconds for this specific test
+  return runTest(className, expectedOutput, t, slowOptions);
+}
+
+module.exports = { runTest, runSlowTest, normalizeFloatingPointNumbers };
