@@ -66,7 +66,8 @@ class JreBootstrap {
     }
 
     // Essential base classes that must be available as fallbacks
-    // These are included in the generated index but kept here as safeguards
+    // These ensure the hierarchy is complete even if some JRE class files don't define proper super properties
+    // Keeping as temporary safeguard while fixing remaining classes
     const essentialBaseClasses = {
       "java/lang/Object": null,
       "java/lang/Throwable": "java/lang/Object",
@@ -74,11 +75,8 @@ class JreBootstrap {
       "java/lang/RuntimeException": "java/lang/Exception"
     };
 
-    // Add essential base classes (these are already in the generated index but kept as fallbacks)
+    // Add essential base classes to ensure hierarchy completeness
     Object.assign(jreHierarchy, essentialBaseClasses);
-
-    // All essential classes are now properly included in the generated JRE index
-    // No manual class definitions needed since all classes exist as .js files
 
     // Create stubs for all classes in the hierarchy
     for (const className in jreHierarchy) {

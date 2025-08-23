@@ -1,4 +1,5 @@
 module.exports = {
+  super: 'java/lang/Object',
   methods: {
     '<init>()V': (jvm, obj, args) => {
       obj._isReentrantLock = true; // Marker property
