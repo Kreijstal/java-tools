@@ -6,11 +6,12 @@ run_test() {
   echo "Running test: $test_file"
 
   # Special handling for tests that need longer timeouts
-  if [[ "$test_file" == *data-zip-download* ]]; then
-    timeout 60 ./node_modules/.bin/tape "$test_file"
-  else
-    timeout 5 ./node_modules/.bin/tape "$test_file"
-  fi
+  local timeout_val=5
+  case "$test_file" in
+    *data-zip-download*) timeout_val=60;;
+    # Add other special cases here
+  esac
+  timeout "$timeout_val" ./node_modules/.bin/tape "$test_file"
 
   if [ $? -ne 0 ]; then
     echo "Test failed: $test_file"
