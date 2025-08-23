@@ -343,5 +343,19 @@ module.exports = {
       
       return null;
     },
+    'newInstance()Ljava/lang/Object;': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      const className = classData.ast.classes[0].className;
+      const newObj = jvm.newObject(className);
+      const constructor = jvm.findMethod(className, '<init>()V');
+      if (constructor) {
+        jvm.runMethod(constructor, [newObj]);
+      }
+      return newObj;
+    },
+    'getClassLoader()Ljava/lang/ClassLoader;': (jvm, classObj, args) => {
+      // Return null to indicate the bootstrap class loader
+      return null;
+    }
   }
 };

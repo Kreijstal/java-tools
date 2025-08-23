@@ -90,6 +90,7 @@ const jreClasses = {
   'java/util/Formatter': require('./java/util/Formatter.js'),
   'java/util/function/Function': require('./java/util/function/Function.js'),
   'java/util/HashSet': require('./java/util/HashSet.js'),
+  'java/util/Hashtable': require('./java/util/Hashtable.js'),
   'java/util/Iterator': require('./java/util/Iterator.js'),
   'java/util/LinkedList': require('./java/util/LinkedList.js'),
   'java/util/LinkedList$ListIterator': require('./java/util/LinkedList$ListIterator.js'),

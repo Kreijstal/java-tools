@@ -169,5 +169,50 @@ module.exports = {
       
       return null;
     },
+    'getInt(Ljava/lang/Object;)I': (jvm, fieldObj, args) => {
+      const obj = args[0];
+      const fieldData = fieldObj._fieldData;
+      const fieldName = fieldData.name;
+
+      if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
+        const declaringClass = fieldObj._declaringClass;
+        const classData = declaringClass._classData;
+        if (classData.staticFields && classData.staticFields.has(fieldName)) {
+          return classData.staticFields.get(fieldName);
+        }
+        return 0;
+      } else {
+        if (obj === null) {
+          throw {
+            type: 'java/lang/NullPointerException',
+            message: `Cannot get field ${fieldName} from null object`,
+          };
+        }
+        return obj[fieldName];
+      }
+    },
+    'setInt(Ljava/lang/Object;I)V': (jvm, fieldObj, args) => {
+      const obj = args[0];
+      const value = args[1];
+      const fieldData = fieldObj._fieldData;
+      const fieldName = fieldData.name;
+
+      if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
+        const declaringClass = fieldObj._declaringClass;
+        const classData = declaringClass._classData;
+        if (!classData.staticFields) {
+          classData.staticFields = new Map();
+        }
+        classData.staticFields.set(fieldName, value);
+      } else {
+        if (obj === null) {
+          throw {
+            type: 'java/lang/NullPointerException',
+            message: `Cannot set field ${fieldName} on null object`,
+          };
+        }
+        obj[fieldName] = value;
+      }
+    }
   }
 };
