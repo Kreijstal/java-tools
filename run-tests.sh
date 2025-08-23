@@ -4,7 +4,14 @@
 run_test() {
   local test_file="$1"
   echo "Running test: $test_file"
-  timeout 60 ./node_modules/.bin/tape "$test_file"
+
+  # Special handling for tests that need longer timeouts
+  if [[ "$test_file" == *data-zip-download* ]]; then
+    timeout 60 ./node_modules/.bin/tape "$test_file"
+  else
+    timeout 5 ./node_modules/.bin/tape "$test_file"
+  fi
+
   if [ $? -ne 0 ]; then
     echo "Test failed: $test_file"
     exit 1
