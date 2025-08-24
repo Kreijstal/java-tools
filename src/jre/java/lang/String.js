@@ -241,6 +241,20 @@ module.exports = {
       
       return byteArray;
     },
+    "getBytes()[B": (jvm, obj, args) => {
+      // Default getBytes() method - uses UTF-8 encoding
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(obj.toString());
+      
+      // Create a Java byte array
+      const byteArray = Array.from(bytes);
+      byteArray.type = "[B";
+      byteArray.elementType = "byte";
+      byteArray.length = bytes.length;
+      byteArray.hashCode = jvm.nextHashCode++;
+      
+      return byteArray;
+    },
     "getBytes(Ljava/lang/String;)[B": (jvm, obj, args) => {
       const charsetName = args[0];
       // For simplicity, we'll use UTF-8 encoding regardless of charset name
