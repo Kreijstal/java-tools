@@ -60,6 +60,18 @@ module.exports = {
     'available()I': (jvm, obj, args) => {
       return obj.count - obj.pos;
     },
+
+    'mark(I)V': (jvm, obj, args) => {
+      obj.mark = obj.pos;
+    },
+
+    'reset()V': (jvm, obj, args) => {
+      obj.pos = obj.mark;
+    },
+
+    'markSupported()Z': (jvm, obj, args) => {
+      return 1; // true
+    },
     
     'close()V': (jvm, obj, args) => {
       // No-op for ByteArrayInputStream
