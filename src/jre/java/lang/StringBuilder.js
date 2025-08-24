@@ -24,6 +24,11 @@ module.exports = {
       obj.value += int;
       return obj;
     },
+    'append(C)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      const charCode = args[0];
+      obj.value += String.fromCharCode(charCode);
+      return obj;
+    },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
       const strObj = new String(obj.value);
       strObj.type = 'java/lang/String';

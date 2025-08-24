@@ -51,8 +51,8 @@ module.exports = {
     },
 
     'println(Ljava/lang/String;)V': (jvm, obj, args) => {
-      const str = args[0];
-      const toPrint = (str === null ? "null" : String(str)) + '\n';
+      const strObj = args[0];
+      const toPrint = (strObj === null ? "null" : String(strObj)) + '\n';
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
       if (writeByteMethod) {
         for (let i = 0; i < toPrint.length; i++) {
@@ -130,6 +130,50 @@ module.exports = {
         }
       }
     },
+
+    'print(I)V': (jvm, obj, args) => {
+      const str = String(args[0]);
+      const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      printString(jvm, obj, [jvm.newString(str)]);
+    },
+
+    'print(J)V': (jvm, obj, args) => {
+      const str = String(args[0]);
+      const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      printString(jvm, obj, [jvm.newString(str)]);
+    },
+
+    'print(F)V': (jvm, obj, args) => {
+      const str = String(args[0]);
+      const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      printString(jvm, obj, [jvm.newString(str)]);
+    },
+
+    'print(D)V': (jvm, obj, args) => {
+      const str = String(args[0]);
+      const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      printString(jvm, obj, [jvm.newString(str)]);
+    },
+
+    'print(Z)V': (jvm, obj, args) => {
+      const str = args[0] ? 'true' : 'false';
+      const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      printString(jvm, obj, [jvm.newString(str)]);
+    },
+
+    'print(C)V': (jvm, obj, args) => {
+      const str = String.fromCharCode(args[0]);
+      const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+      printString(jvm, obj, [jvm.newString(str)]);
+    },
+
+    'print(Ljava/lang/Object;)V': (jvm, obj, args) => {
+        const val = args[0];
+        const str = (val === null) ? "null" : val.toString();
+        const printString = jvm._jreFindMethod(obj.type, 'print', '(Ljava/lang/String;)V');
+        printString(jvm, obj, [jvm.newString(str)]);
+    },
+
 
     'append(C)Ljava/lang/Appendable;': (jvm, obj, args) => {
       const charCode = args[0];

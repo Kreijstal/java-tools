@@ -1,45 +1,53 @@
 const zlib = require('zlib');
 
 module.exports = {
-  'java/util/zip/Inflater': {
-    '<init>(Z)V': (thread, locals) => {
-      const self = locals[0];
-      const nowrap = locals[1];
-      self['java/util/zip/Inflater/inflater'] = zlib.createInflateRaw({
-        windowBits: nowrap ? 0 : 15,
-      });
-      self['java/util/zip/Inflater/buffer'] = null;
-      thread.return();
+  super: 'java/lang/Object',
+  interfaces: [],
+  methods: {
+    '<init>()V': (jvm, obj, args) => {
+      obj.input = null;
+      obj.finished = false;
+      obj.nowrap = false;
     },
-    'setInput([BII)V': (thread, locals) => {
-      const self = locals[0];
-      const b = locals[1].array;
-      const off = locals[2];
-      const len = locals[3];
-      self['java/util/zip/Inflater/buffer'] = b.slice(off, off + len);
-      thread.return();
+    '<init>(Z)V': (jvm, obj, args) => {
+      obj.input = null;
+      obj.finished = false;
+      obj.nowrap = args[0];
     },
-    'inflate([B)I': (thread, locals) => {
-      const self = locals[0];
-      const b = locals[1].array;
-      const inflater = self['java/util/zip/Inflater/inflater'];
-      const buffer = self['java/util/zip/Inflater/buffer'];
-      if (buffer) {
-        inflater.write(buffer);
+    'setInput([BII)V': (jvm, obj, args) => {
+      const b = args[0];
+      const off = args[1];
+      const len = args[2];
+      obj.input = Buffer.from(b.slice(off, off + len));
+    },
+    'inflate([B)I': (jvm, obj, args) => {
+      if (!obj.input) {
+        obj.finished = true;
+        return 0;
       }
-      const result = inflater.read();
-      if (result) {
-        result.copy(b);
-        thread.pushStack(result.length);
-      } else {
-        thread.pushStack(0);
+      const output = obj.nowrap
+        ? zlib.inflateRawSync(obj.input)
+        : zlib.inflateSync(obj.input);
+
+      const target = args[0];
+      for (let i = 0; i < output.length; i++) {
+        target[i] = output[i];
       }
+      obj.finished = true;
+      return output.length;
     },
-    'reset()V': (thread, locals) => {
-      const self = locals[0];
-      self['java/util/zip/Inflater/inflater'].reset();
-      self['java/util/zip/Inflater/buffer'] = null;
-      thread.return();
+    'finished()Z': (jvm, obj, args) => {
+      return obj.finished ? 1 : 0;
+    },
+    'needsInput()Z': (jvm, obj, args) => {
+      return (obj.input === null) ? 1 : 0;
+    },
+    'end()V': (jvm, obj, args) => {
+      // no-op
+    },
+    'reset()V': (jvm, obj, args) => {
+      obj.input = null;
+      obj.finished = false;
     },
   },
 };

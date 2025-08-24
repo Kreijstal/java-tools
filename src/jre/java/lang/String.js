@@ -51,6 +51,16 @@ module.exports = {
         obj.toString = function() { return this.value; };
       }
     },
+    "<init>([BLjava/lang/String;)V": (jvm, obj, args) => {
+      const bytes = args[0];
+      const charsetName = String(args[1]);
+      const decoder = new TextDecoder(charsetName);
+      const decodedString = decoder.decode(Buffer.from(bytes));
+      if (typeof obj !== 'string') {
+        obj.value = decodedString;
+        obj.toString = function() { return this.value; };
+      }
+    },
     "concat(Ljava/lang/String;)Ljava/lang/String;": (jvm, obj, args) => {
       return jvm.internString(obj + args[0]);
     },
@@ -224,6 +234,20 @@ module.exports = {
       const thisRegion = obj.substring(toffset, toffset + len);
       const otherRegion = other.toString().substring(ooffset, ooffset + len);
       return thisRegion === otherRegion ? 1 : 0;
+    },
+    "getBytes()[B": (jvm, obj, args) => {
+      // Assume UTF-8 as the default charset
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(obj.toString());
+
+      // Create a Java byte array
+      const byteArray = Array.from(bytes);
+      byteArray.type = "[B";
+      byteArray.elementType = "byte";
+      byteArray.length = bytes.length;
+      byteArray.hashCode = jvm.nextHashCode++;
+
+      return byteArray;
     },
     "getBytes(Ljava/nio/charset/Charset;)[B": (jvm, obj, args) => {
       const charset = args[0];

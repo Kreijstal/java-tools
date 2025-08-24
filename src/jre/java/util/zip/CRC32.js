@@ -1,32 +1,47 @@
-const crc32 = require('crc-32');
+const table = (function () {
+  let c;
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    c = n;
+    for (let k = 0; k < 8; k++) {
+      c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+    }
+    table[n] = c;
+  }
+  return table;
+})();
 
 module.exports = {
-  'java/util/zip/CRC32': {
-    '<init>()V': (thread, locals) => {
-      const self = locals[0];
-      self['java/util/zip/CRC32/crc'] = 0;
-      thread.return();
+  super: 'java/lang/Object',
+  interfaces: ['java/util/zip/Checksum'],
+  methods: {
+    '<init>()V': (jvm, obj, args) => {
+      obj.crc = -1;
     },
-    'reset()V': (thread, locals) => {
-      const self = locals[0];
-      self['java/util/zip/CRC32/crc'] = 0;
-      thread.return();
+
+    'reset()V': (jvm, obj, args) => {
+      obj.crc = -1;
     },
-    'update([BII)V': (thread, locals) => {
-      const self = locals[0];
-      const b = locals[1].array;
-      const off = locals[2];
-      const len = locals[3];
-      const slicedB = b.slice(off, off + len);
-      let crc = self['java/util/zip/CRC32/crc'];
-      crc = crc32.buf(slicedB, crc);
-      self['java/util/zip/CRC32/crc'] = crc;
-      thread.return();
+
+    'update(I)V': (jvm, obj, args) => {
+      const b = args[0];
+      obj.crc = (obj.crc >>> 8) ^ table[(obj.crc ^ (b & 0xFF)) & 0xFF];
     },
-    'getValue()J': (thread, locals) => {
-      const self = locals[0];
-      const crc = self['java/util/zip/CRC32/crc'];
-      thread.pushStackLong(BigInt(crc >>> 0));
+
+    'update([BII)V': (jvm, obj, args) => {
+      const b = args[0];
+      const off = args[1];
+      const len = args[2];
+
+      let crc = obj.crc;
+      for (let i = off; i < off + len; i++) {
+        crc = (crc >>> 8) ^ table[(crc ^ (b[i] & 0xFF)) & 0xFF];
+      }
+      obj.crc = crc;
+    },
+
+    'getValue()J': (jvm, obj, args) => {
+      return BigInt((obj.crc ^ -1) >>> 0);
     },
   },
 };

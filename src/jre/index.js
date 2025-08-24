@@ -5,6 +5,7 @@
 const jreClasses = {
   'java/io/BufferedInputStream': require('./java/io/BufferedInputStream.js'),
   'java/io/BufferedReader': require('./java/io/BufferedReader.js'),
+  'java/io/ByteArrayOutputStream': require('./java/io/ByteArrayOutputStream.js'),
   'java/io/ByteArrayInputStream': require('./java/io/ByteArrayInputStream.js'),
   'java/io/ConsoleOutputStream': require('./java/io/ConsoleOutputStream.js'),
   'java/io/DataInputStream': require('./java/io/DataInputStream.js'),
@@ -106,6 +107,7 @@ const jreClasses = {
   'java/util/Objects': require('./java/util/Objects.js'),
   'java/util/Random': require('./java/util/Random.js'),
   'java/util/zip/CRC32': require('./java/util/zip/CRC32.js'),
+  'java/util/zip/Deflater': require('./java/util/zip/Deflater.js'),
   'java/util/zip/Inflater': require('./java/util/zip/Inflater.js')
 };
 

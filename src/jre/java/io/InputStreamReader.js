@@ -1,38 +1,111 @@
+const { TextDecoder } = require('util');
+
 module.exports = {
-  'java/io/InputStreamReader': {
-    '<init>(Ljava/io/InputStream;)V': (thread, locals) => {
-      const self = locals[0];
-      const inputStream = locals[1];
-      self['java/io/InputStreamReader/stream'] = inputStream;
-      thread.return();
+  super: 'java/io/Reader',
+  interfaces: [],
+  methods: {
+    '<init>(Ljava/io/InputStream;)V': (jvm, obj, args) => {
+      const inStream = args[0];
+      obj.in = inStream;
+      obj.charsetName = 'UTF-8'; // Default charset
+      obj.decoder = new TextDecoder(obj.charsetName, { stream: true });
+      obj.byteBuffer = [];
     },
-    'read()I': (thread, locals) => {
-      const self = locals[0];
-      const stream = self['java/io/InputStreamReader/stream'];
+
+    '<init>(Ljava/io/InputStream;Ljava/lang/String;)V': (jvm, obj, args) => {
+      const inStream = args[0];
+      const charsetName = String(args[1]); // Convert Java string to JS string
+      obj.in = inStream;
+      obj.charsetName = charsetName;
+      try {
+        obj.decoder = new TextDecoder(obj.charsetName, { stream: true });
+      } catch (e) {
+        throw new jvm.java.io.UnsupportedEncodingException(charsetName);
+      }
+      obj.byteBuffer = [];
+    },
+
+    'read()I': (jvm, obj, args) => {
+      let decoded = obj.decoder.decode(Buffer.from(obj.byteBuffer), { stream: true });
       
-      if (!stream) {
-        thread.return(-1);
-        return;
+      while (decoded.length === 0) {
+        const b = jvm._jreFindMethod(obj.in.type, 'read', '()I')(jvm, obj.in, []);
+        if (b === -1) {
+          // End of stream, decode any remaining bytes
+          const finalDecoded = obj.decoder.decode(Buffer.from(obj.byteBuffer));
+          if (finalDecoded.length > 0) {
+            obj.byteBuffer = Array.from(Buffer.from(finalDecoded.substring(1)));
+            return finalDecoded.charCodeAt(0);
+          }
+          return -1;
+        }
+        obj.byteBuffer.push(b);
+        decoded = obj.decoder.decode(Buffer.from(obj.byteBuffer), { stream: true });
+      }
+
+      const charCode = decoded.charCodeAt(0);
+      const remainingBytes = Buffer.from(decoded.substring(1), 'utf16le');
+      obj.byteBuffer = Array.from(remainingBytes);
+      
+      return charCode;
+    },
+
+    'read([CII)I': (jvm, obj, args) => {
+      const cbuf = args[0];
+      const off = args[1];
+      const len = args[2];
+
+      if (len === 0) {
+        return 0;
+      }
+
+      let charsRead = 0;
+      const ch = jvm._jreFindMethod(obj.type, 'read', '()I')(jvm, obj, []);
+      if (ch === -1) {
+        return -1;
+      }
+      cbuf[off] = ch;
+      charsRead = 1;
+
+      if (!jvm._jreFindMethod(obj.type, 'ready', '()Z')(jvm, obj, [])) {
+        return charsRead;
+      }
+
+      while (charsRead < len) {
+        if (!jvm._jreFindMethod(obj.type, 'ready', '()Z')(jvm, obj, [])) {
+            break;
+        }
+        const nextChar = jvm._jreFindMethod(obj.type, 'read', '()I')(jvm, obj, []);
+        if (nextChar === -1) {
+            break;
+        }
+        cbuf[off + charsRead] = nextChar;
+        charsRead++;
       }
       
-      // Call the InputStream's read method
-      if (stream.read && typeof stream.read === 'function') {
-        // For TestInputStream objects created in test-helpers
-        const result = stream.read();
-        thread.return(result);
-        return;
+      return charsRead;
+    },
+
+    'getEncoding()Ljava/lang/String;': (jvm, obj, args) => {
+      return jvm.newString(obj.charsetName);
+    },
+
+    'ready()Z': (jvm, obj, args) => {
+      if (obj.byteBuffer.length > 0) {
+        return true;
       }
-      
-      // Try to find the read method via JRE method lookup
-      const jvm = thread.jvm;
-      const readMethod = jvm._jreFindMethod(stream.type || 'java/io/InputStream', 'read', '()I');
-      if (readMethod) {
-        const result = readMethod(jvm, stream, []);
-        thread.return(result);
-        return;
+      const availableMethod = jvm._jreFindMethod(obj.in.type, 'available', '()I');
+      if (availableMethod) {
+        return availableMethod(jvm, obj.in, []) > 0;
       }
-      
-      thread.return(-1);
+      return false;
+    },
+
+    'close()V': (jvm, obj, args) => {
+      const closeMethod = jvm._jreFindMethod(obj.in.type, 'close', '()V');
+      if (closeMethod) {
+        closeMethod(jvm, obj.in, []);
+      }
     },
   },
 };
