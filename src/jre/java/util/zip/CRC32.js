@@ -1,22 +1,18 @@
 const crc32 = require('crc-32');
 
 module.exports = {
-  'java/util/zip/CRC32': {
-    '<init>()V': (thread, locals) => {
-      const self = locals[0];
-      self['java/util/zip/CRC32/crc'] = 0;
-      thread.return();
+  super: "java/lang/Object",
+  methods: {
+    '<init>()V': (jvm, obj, args) => {
+      obj['java/util/zip/CRC32/crc'] = 0;
     },
-    'reset()V': (thread, locals) => {
-      const self = locals[0];
-      self['java/util/zip/CRC32/crc'] = 0;
-      thread.return();
+    'reset()V': (jvm, obj, args) => {
+      obj['java/util/zip/CRC32/crc'] = 0;
     },
-    'update([BII)V': (thread, locals) => {
-      const self = locals[0];
-      const b = locals[1];
-      const off = locals[2];
-      const len = locals[3];
+    'update([BII)V': (jvm, obj, args) => {
+      const b = args[0];
+      const off = args[1];
+      const len = args[2];
       
       // Handle both array formats - direct arrays and arrays with array property
       let byteArray;
@@ -29,14 +25,12 @@ module.exports = {
       }
       
       const slicedB = byteArray.slice(off, off + len);
-      let crc = self['java/util/zip/CRC32/crc'];
+      let crc = obj['java/util/zip/CRC32/crc'];
       crc = crc32.buf(slicedB, crc);
-      self['java/util/zip/CRC32/crc'] = crc;
-      thread.return();
+      obj['java/util/zip/CRC32/crc'] = crc;
     },
-    'getValue()J': (thread, locals) => {
-      const self = locals[0];
-      const crc = self['java/util/zip/CRC32/crc'];
+    'getValue()J': (jvm, obj, args) => {
+      const crc = obj['java/util/zip/CRC32/crc'];
       // Return the CRC value as a BigInt for proper long handling
       return BigInt(crc >>> 0);
     },

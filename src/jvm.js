@@ -203,34 +203,6 @@ class JVM {
         return staticMethod;
       }
 
-      // Check for old format (where methods are stored directly under className)
-      if (currentClass[className] && currentClass[className][methodKey]) {
-        const oldFormatMethod = currentClass[className][methodKey];
-        // Wrap old format method to match new format calling convention
-        return (jvm, obj, args) => {
-          // Create thread-like object for old format methods
-          let returnValue = undefined;
-          const threadLike = {
-            jvm: jvm,
-            return: (value) => {
-              returnValue = value; // Capture the return value
-            }
-          };
-          
-          // Create locals array for old format: [obj, ...args]
-          const locals = [obj, ...args];
-          
-          const methodResult = oldFormatMethod(threadLike, locals);
-          
-          // If the method directly returned a value, use that instead
-          if (methodResult !== undefined) {
-            return methodResult;
-          }
-          
-          return returnValue; // Return the captured value
-        };
-      }
-
       // Check superclass
       currentClass = currentClass.super ? this.jre[currentClass.super] : null;
     }
