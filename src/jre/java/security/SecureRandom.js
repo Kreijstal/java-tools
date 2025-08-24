@@ -1,13 +1,14 @@
 const crypto = require('crypto');
 
 module.exports = {
-  'java/security/SecureRandom': {
-    '<init>()V': (thread, locals) => {
-      thread.return();
+  super: "java/util/Random",
+  methods: {
+    '<init>()V': (jvm, obj, args) => {
+      // Initialize SecureRandom - no need to do anything special
     },
-    'nextInt()I': (thread, locals) => {
+    'nextInt()I': (jvm, obj, args) => {
       const buffer = crypto.randomBytes(4);
-      thread.pushStack(buffer.readInt32BE(0));
+      return buffer.readInt32BE(0);
     },
   },
 };
