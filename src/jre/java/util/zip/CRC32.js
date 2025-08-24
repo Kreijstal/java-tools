@@ -14,10 +14,21 @@ module.exports = {
     },
     'update([BII)V': (thread, locals) => {
       const self = locals[0];
-      const b = locals[1].array;
+      const b = locals[1];
       const off = locals[2];
       const len = locals[3];
-      const slicedB = b.slice(off, off + len);
+      
+      // Handle both array formats - direct arrays and arrays with array property
+      let byteArray;
+      if (b && b.array) {
+        byteArray = b.array;
+      } else if (Array.isArray(b)) {
+        byteArray = b;
+      } else {
+        throw new Error('Invalid byte array format');
+      }
+      
+      const slicedB = byteArray.slice(off, off + len);
       let crc = self['java/util/zip/CRC32/crc'];
       crc = crc32.buf(slicedB, crc);
       self['java/util/zip/CRC32/crc'] = crc;
@@ -26,7 +37,8 @@ module.exports = {
     'getValue()J': (thread, locals) => {
       const self = locals[0];
       const crc = self['java/util/zip/CRC32/crc'];
-      thread.pushStackLong(BigInt(crc >>> 0));
+      // Return the CRC value as a BigInt for proper long handling
+      return BigInt(crc >>> 0);
     },
   },
 };
