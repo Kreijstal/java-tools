@@ -9,7 +9,7 @@
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
     "build:java": "javac sources/*.java",
-    "build:bundle": "webpack --mode production",
+    "build:bundle": "node scripts/generate-jre-index && webpack --mode production",
     "generate": "npm run build:java && node scripts/generateData.js",
     "build": "npm run generate && npm run build:bundle && node scripts/buildSite.js",
     "clean": "find sources -name '*.class' -delete && rm -rf dist",
