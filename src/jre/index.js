@@ -73,6 +73,7 @@ const jreClasses = {
   'java/util/AbstractCollection': require('./java/util/AbstractCollection.js'),
   'java/util/AbstractSet': require('./java/util/AbstractSet.js'),
   'java/util/ArrayList': require('./java/util/ArrayList.js'),
+  'java/util/Calendar': require('./java/util/Calendar.js'),
   'java/util/Collection': require('./java/util/Collection.js'),
   'java/util/concurrent/locks/ReentrantLock': require('./java/util/concurrent/locks/ReentrantLock.js'),
   'java/util/Date': require('./java/util/Date.js'),
@@ -84,7 +85,8 @@ const jreClasses = {
   'java/util/LinkedList$ListIterator': require('./java/util/LinkedList$ListIterator.js'),
   'java/util/List': require('./java/util/List.js'),
   'java/util/NoSuchElementException': require('./java/util/NoSuchElementException.js'),
-  'java/util/Objects': require('./java/util/Objects.js')
+  'java/util/Objects': require('./java/util/Objects.js'),
+  'java/util/TimeZone': require('./java/util/TimeZone.js')
 };
 
 module.exports = jreClasses;
