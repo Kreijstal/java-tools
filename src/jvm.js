@@ -220,7 +220,13 @@ class JVM {
           // Create locals array for old format: [obj, ...args]
           const locals = [obj, ...args];
           
-          oldFormatMethod(threadLike, locals);
+          const methodResult = oldFormatMethod(threadLike, locals);
+          
+          // If the method directly returned a value, use that instead
+          if (methodResult !== undefined) {
+            return methodResult;
+          }
+          
           return returnValue; // Return the captured value
         };
       }
