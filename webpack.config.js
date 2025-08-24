@@ -35,6 +35,8 @@ module.exports = {
       "process": require.resolve("process/browser"),
       "os": false, // Make os return false instead of trying to load it
       "v8": false, // Make v8 return false instead of trying to load it
+      "crypto": false,
+      "zlib": false,
     }
   },
   plugins: [

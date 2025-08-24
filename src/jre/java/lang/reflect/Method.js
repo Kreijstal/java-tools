@@ -2,6 +2,18 @@ const Frame = require('../../../../frame');
 const { parseDescriptor } = require('../../../../typeParser');
 const { ASYNC_METHOD_SENTINEL } = require('../../../../constants');
 
+const MODIFIERS = {
+  PUBLIC: 0x00000001,
+  PRIVATE: 0x00000002,
+  PROTECTED: 0x00000004,
+  STATIC: 0x00000008,
+  FINAL: 0x00000010,
+  SYNCHRONIZED: 0x00000020,
+  NATIVE: 0x00000100,
+  ABSTRACT: 0x00000400,
+  STRICT: 0x00000800,
+};
+
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
@@ -9,6 +21,23 @@ module.exports = {
     'getName()Ljava/lang/String;': (jvm, methodObj, args) => {
       const methodName = methodObj._methodData.name;
       return jvm.internString(methodName);
+    },
+    'getModifiers()I': (jvm, methodObj, args) => {
+      const flags = methodObj._methodData.flags;
+      let modifiers = 0;
+      if (flags.includes('public')) modifiers |= MODIFIERS.PUBLIC;
+      if (flags.includes('protected')) modifiers |= MODIFIERS.PROTECTED;
+      if (flags.includes('private')) modifiers |= MODIFIERS.PRIVATE;
+      if (flags.includes('static')) modifiers |= MODIFIERS.STATIC;
+      if (flags.includes('final')) modifiers |= MODIFIERS.FINAL;
+      if (flags.includes('synchronized')) modifiers |= MODIFIERS.SYNCHRONIZED;
+      if (flags.includes('native')) modifiers |= MODIFIERS.NATIVE;
+      if (flags.includes('abstract')) modifiers |= MODIFIERS.ABSTRACT;
+      if (flags.includes('strict')) modifiers |= MODIFIERS.STRICT;
+      return modifiers;
+    },
+    'setAccessible(Z)V': (jvm, methodObj, args) => {
+      methodObj.accessible = args[0];
     },
     'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
       const methodData = methodObj._methodData;

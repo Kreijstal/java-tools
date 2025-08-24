@@ -20,6 +20,11 @@ module.exports = {
       }
       return jvm.internString(String(value));
     },
+    "valueOf(C)Ljava/lang/String;": (jvm, obj, args) => {
+      const charCode = args[0];
+      const charStr = String.fromCharCode(charCode);
+      return jvm.internString(charStr);
+    },
   },
   methods: {
     "<init>()V": (jvm, obj, args) => {
@@ -163,6 +168,94 @@ module.exports = {
     "intern()Ljava/lang/String;": (jvm, obj, args) => {
       // Return the interned version of this string
       return jvm.internString(obj.toString());
+    },
+    "indexOf(I)I": (jvm, obj, args) => {
+      const ch = args[0];
+      const char = String.fromCharCode(ch);
+      return obj.indexOf(char);
+    },
+    "lastIndexOf(I)I": (jvm, obj, args) => {
+      const ch = args[0];
+      const char = String.fromCharCode(ch);
+      return obj.lastIndexOf(char);
+    },
+    "trim()Ljava/lang/String;": (jvm, obj, args) => {
+      return jvm.internString(obj.trim());
+    },
+    "startsWith(Ljava/lang/String;)Z": (jvm, obj, args) => {
+      const prefix = args[0];
+      if (prefix === null) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      return obj.startsWith(prefix.toString()) ? 1 : 0;
+    },
+    "endsWith(Ljava/lang/String;)Z": (jvm, obj, args) => {
+      const suffix = args[0];
+      if (suffix === null) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      return obj.endsWith(suffix.toString()) ? 1 : 0;
+    },
+    "replace(CC)Ljava/lang/String;": (jvm, obj, args) => {
+      const oldChar = String.fromCharCode(args[0]);
+      const newChar = String.fromCharCode(args[1]);
+      // Replace all occurrences of oldChar with newChar
+      const result = obj.split(oldChar).join(newChar);
+      return jvm.internString(result);
+    },
+    "regionMatches(ILjava/lang/String;II)Z": (jvm, obj, args) => {
+      const toffset = args[0];
+      const other = args[1];
+      const ooffset = args[2];
+      const len = args[3];
+      
+      if (other === null) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      
+      // Check bounds
+      if (toffset < 0 || ooffset < 0 || 
+          toffset + len > obj.length || 
+          ooffset + len > other.length) {
+        return 0;
+      }
+      
+      // Compare the regions
+      const thisRegion = obj.substring(toffset, toffset + len);
+      const otherRegion = other.toString().substring(ooffset, ooffset + len);
+      return thisRegion === otherRegion ? 1 : 0;
+    },
+    "getBytes(Ljava/nio/charset/Charset;)[B": (jvm, obj, args) => {
+      const charset = args[0];
+      // For simplicity, we'll use UTF-8 encoding regardless of charset
+      // In a full implementation, we'd need to handle different charsets
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(obj.toString());
+      
+      // Create a Java byte array
+      const byteArray = Array.from(bytes);
+      byteArray.type = "[B";
+      byteArray.elementType = "byte";
+      byteArray.length = bytes.length;
+      byteArray.hashCode = jvm.nextHashCode++;
+      
+      return byteArray;
+    },
+    "getBytes(Ljava/lang/String;)[B": (jvm, obj, args) => {
+      const charsetName = args[0];
+      // For simplicity, we'll use UTF-8 encoding regardless of charset name
+      // In a full implementation, we'd need to handle different charsets
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(obj.toString());
+      
+      // Create a Java byte array
+      const byteArray = Array.from(bytes);
+      byteArray.type = "[B";
+      byteArray.elementType = "byte";
+      byteArray.length = bytes.length;
+      byteArray.hashCode = jvm.nextHashCode++;
+      
+      return byteArray;
     },
   },
 };

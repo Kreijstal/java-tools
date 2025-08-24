@@ -7,7 +7,7 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       obj._date = new Date();
     },
-    'getYear()I': (jvm, obj, args) => {
+ 'getYear()I': (jvm, obj, args) => {
       return obj._date.getFullYear() - 1900;
     },
   },
