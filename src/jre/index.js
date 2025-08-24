@@ -84,6 +84,8 @@ const jreClasses = {
   'java/net/URI': require('./java/net/URI.js'),
   'java/net/URL': require('./java/net/URL.js'),
   'java/net/URLConnection': require('./java/net/URLConnection.js'),
+  'java/nio/BufferOverflowException': require('./java/nio/BufferOverflowException.js'),
+  'java/nio/BufferUnderflowException': require('./java/nio/BufferUnderflowException.js'),
   'java/nio/ByteBuffer': require('./java/nio/ByteBuffer.js'),
   'java/nio/charset/Charset': require('./java/nio/charset/Charset.js'),
   'java/security/SecureRandom': require('./java/security/SecureRandom.js'),
