@@ -11,6 +11,16 @@ module.exports = {
       }
     },
 
+    'print(I)V': (jvm, obj, args) => {
+      const output = String(args[0]);
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
+      }
+    },
+
     'println(D)V': (jvm, obj, args) => {
       const output = String(args[0]) + '\n';
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');

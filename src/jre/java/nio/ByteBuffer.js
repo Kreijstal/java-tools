@@ -19,7 +19,10 @@ module.exports = {
     'capacity()I': (jvm, obj, args) => {
       return obj['java/nio/Buffer/capacity'];
     },
-    'position(I)Ljava/nio/Buffer;': (jvm, obj, args) => {
+    'position()I': (jvm, obj, args) => {
+      return obj['java/nio/Buffer/position'];
+    },
+    'position(I)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
       const newPosition = args[0];
       if (newPosition > obj['java/nio/Buffer/limit'] || newPosition < 0) {
         throw { type: 'java/lang/IllegalArgumentException', message: 'New position is out of bounds' };
@@ -31,13 +34,24 @@ module.exports = {
       const dest = args[0];
       const buffer = obj['java/nio/ByteBuffer/buffer'];
       let position = obj['java/nio/Buffer/position'];
-      const length = dest.array.length;
+
+      let destArray;
+      if (dest && dest.array) {
+        destArray = dest.array;
+      } else if (Array.isArray(dest)) {
+        destArray = dest;
+      } else {
+        throw new Error('Invalid byte array format for get');
+      }
+      const length = destArray.length;
 
       if (obj['java/nio/Buffer/limit'] - position < length) {
         throw { type: 'java/nio/BufferUnderflowException' };
       }
 
-      buffer.copy(dest.array, 0, position, position + length);
+      for (let i = 0; i < length; i++) {
+        destArray[i] = buffer[position + i];
+      }
       obj['java/nio/Buffer/position'] = position + length;
       return obj;
     },
@@ -45,14 +59,24 @@ module.exports = {
       const src = args[0];
       const buffer = obj['java/nio/ByteBuffer/buffer'];
       let position = obj['java/nio/Buffer/position'];
-      const length = src.array.length;
+
+      let srcArray;
+      if (src && src.array) {
+        srcArray = src.array;
+      } else if (Array.isArray(src)) {
+        srcArray = src;
+      } else {
+        throw new Error('Invalid byte array format for put');
+      }
+      const length = srcArray.length;
 
       if (obj['java/nio/Buffer/limit'] - position < length) {
         throw { type: 'java/nio/BufferOverflowException' };
       }
 
-      // Assuming src.array is a Buffer or similar object with a copy method
-      src.array.copy(buffer, position, 0, length);
+      for (let i = 0; i < length; i++) {
+        buffer[position + i] = srcArray[i];
+      }
       obj['java/nio/Buffer/position'] = position + length;
       return obj;
     },

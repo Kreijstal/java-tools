@@ -51,6 +51,34 @@ module.exports = {
         obj.toString = function() { return this.value; };
       }
     },
+    '<init>([BII)V': (jvm, obj, args) => {
+      const bytes = args[0];
+      const offset = args[1];
+      const length = args[2];
+
+      let byteArray;
+      if (bytes && bytes.array) {
+        byteArray = bytes.array;
+      } else if (Array.isArray(bytes)) {
+        byteArray = bytes;
+      } else {
+        throw new Error('Invalid byte array format for String constructor');
+      }
+
+      const relevantBytes = byteArray.slice(offset, offset + length);
+
+      // In a real implementation, we would use a CharsetDecoder.
+      // For now, assume default platform encoding (which is what this does).
+      let str = '';
+      for (let i = 0; i < relevantBytes.length; i++) {
+        str += String.fromCharCode(relevantBytes[i]);
+      }
+
+      if (typeof obj !== 'string') {
+        obj.value = str;
+        obj.toString = function() { return this.value; };
+      }
+    },
     "concat(Ljava/lang/String;)Ljava/lang/String;": (jvm, obj, args) => {
       return jvm.internString(obj + args[0]);
     },

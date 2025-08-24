@@ -110,6 +110,7 @@ const jreClasses = {
   'java/util/Random': require('./java/util/Random.js'),
   'java/util/TimeZone': require('./java/util/TimeZone.js'),
   'java/util/zip/CRC32': require('./java/util/zip/CRC32.js'),
+  'java/util/zip/DataFormatException': require('./java/util/zip/DataFormatException.js'),
   'java/util/zip/Inflater': require('./java/util/zip/Inflater.js')
 };
 
