@@ -1358,6 +1358,21 @@ class KrakatauWorkspace {
     }
     return unresolved;
   }
+
+  listUtf8Strings() {
+    const utf8Strings = new Set();
+    for (const className in this.workspaceASTs) {
+      const { constantPool } = this.workspaceASTs[className];
+      if (constantPool) {
+        for (const entry of constantPool) {
+          if (entry && entry.tag === 1) {
+            utf8Strings.add(entry.info.bytes);
+          }
+        }
+      }
+    }
+    return Array.from(utf8Strings);
+  }
 }
 
 module.exports = {
