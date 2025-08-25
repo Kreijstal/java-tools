@@ -88,6 +88,13 @@ class JVM {
     return stringObj;
   }
 
+  newByteArray(buffer) {
+    return {
+      type: '[B',
+      array: new Int8Array(buffer)
+    };
+  }
+
   registerJreMethods(methods) {
     for (const className in methods) {
       if (!this.jre[className]) {

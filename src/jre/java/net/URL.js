@@ -1,3 +1,5 @@
+const fetch = require('node-fetch');
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -44,13 +46,26 @@ module.exports = {
       return jvm.internString(file);
     },
 
-    'openStream()Ljava/io/InputStream;': (jvm, obj, args) => {
-      // This is a shorthand for openConnection().getInputStream().
-      // The existing openConnection is a stub, so this will also be a stub.
-      // Returning a placeholder InputStream object.
+    'openStream()Ljava/io/InputStream;': async (jvm, obj, args) => {
+      const urlString = String(obj.url);
+      const response = await fetch(urlString);
+      const body = response.body;
+
       const inputStream = {
         type: 'java/io/InputStream',
+        stream: body,
+        _buffer: [],
+        _ended: false,
       };
+
+      body.on('data', (chunk) => {
+        inputStream._buffer.push(chunk);
+      });
+
+      body.on('end', () => {
+        inputStream._ended = true;
+      });
+
       return inputStream;
     },
   }
