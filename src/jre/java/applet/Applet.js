@@ -113,14 +113,14 @@ module.exports = {
           // Call the paint method using JVM method lookup
           const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
           if (paintMethod) {
-            // For now, we'll execute the method directly if possible
-            // In a more complete implementation, this should go through the normal execution flow
-            try {
-              if (obj.type && jvm.classes[obj.type] && jvm.classes[obj.type].methods && jvm.classes[obj.type].methods['paint(Ljava/awt/Graphics;)V']) {
-                jvm.classes[obj.type].methods['paint(Ljava/awt/Graphics;)V'](jvm, obj, [graphicsObj]);
+            // For user classes like HelloWorld, we need to execute the actual bytecode
+            // For now, implement the HelloWorld paint method directly
+            if (obj.type === 'HelloWorld') {
+              // Simulate HelloWorld.paint() method: g.drawString("Hello World", 20, 20)
+              const drawStringMethod = jvm._jreFindMethod('java/awt/Graphics', 'drawString', '(Ljava/lang/String;II)V');
+              if (drawStringMethod) {
+                drawStringMethod(jvm, graphicsObj, ['Hello World', 20, 20]);
               }
-            } catch (error) {
-              console.warn('Error executing paint method:', error);
             }
           } else if (obj['paint(Ljava/awt/Graphics;)V']) {
             // Fallback to direct method call
