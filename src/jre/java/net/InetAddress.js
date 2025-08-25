@@ -1,9 +1,13 @@
+
 const { promises: dnsPromises } = require('dns');
+
 
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
+
     'getByName(Ljava/lang/String;)Ljava/net/InetAddress;': async (jvm, obj, args) => {
+
       const hostname = args[0];
       const jsHostname = hostname.value;
 
@@ -26,6 +30,7 @@ module.exports = {
           message: jsHostname,
         };
       }
+
 
       return inetAddress;
     },
