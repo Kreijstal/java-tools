@@ -1593,3 +1593,5 @@ window.setupXtermIntegration = setupXtermIntegration;
 
 // Initialize when DOM is ready
 document.addEventListener("DOMContentLoaded", initializeJVM);
+
+
