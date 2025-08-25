@@ -54,6 +54,59 @@ let xtermFitAddon = null;
 let useXtermOutput = false;
 
 /**
+ * Set up AWT integration for browser environment
+ * This detects when AWT/Applet classes are used and automatically creates canvases
+ */
+function setupAWTIntegration() {
+  // Check if awt.js framework is available
+  if (typeof window !== 'undefined' && window.awtFramework) {
+    console.log('AWT framework detected, setting up browser integration');
+    
+    // Override applet initialization to hook into DOM
+    const originalAppletInit = window.awtFramework.setupAppletIntegration;
+    if (originalAppletInit) {
+      window.awtFramework.setupAppletIntegration = function(...args) {
+        console.log('Applet integration triggered');
+        return originalAppletInit.apply(this, args);
+      };
+    }
+  }
+  
+  // Monitor for AWT canvas creation and ensure they're visible
+  const observer = new MutationObserver((mutations) => {
+    mutations.forEach((mutation) => {
+      mutation.addedNodes.forEach((node) => {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          // Check if this is an AWT container
+          if (node.id === 'awt-container') {
+            console.log('AWT container added to DOM:', node);
+            // Ensure proper styling
+            if (!node.style.display || node.style.display === 'none') {
+              node.style.display = 'block';
+            }
+          }
+          // Check for canvas elements
+          if (node.tagName === 'CANVAS' && node.parentElement?.id === 'awt-container') {
+            console.log('AWT canvas detected:', node);
+            // Ensure canvas is visible and properly sized
+            if (!node.width) node.width = 800;
+            if (!node.height) node.height = 600;
+          }
+        }
+      });
+    });
+  });
+  
+  // Start observing DOM changes
+  if (typeof document !== 'undefined') {
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
+  }
+}
+
+/**
  * Set up browser-specific System class override using the generic JVM override system
  * This function overrides ONLY the System class's static initializer (<clinit>) to provide
  * DOM-based output in the browser while preserving Node.js functionality in the core System.js
@@ -718,6 +771,9 @@ async function initializeJVM() {
 
         // Set up XTerm integration
         await setupXtermIntegration();
+        
+        // Set up AWT integration for browser-based canvas rendering
+        setupAWTIntegration();
 
         log(
           `Real JVM Debug initialized with ${extractedFiles.length} sample classes`,
