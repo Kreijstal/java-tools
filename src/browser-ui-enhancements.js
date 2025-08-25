@@ -518,10 +518,8 @@ function setupBrowserSystemOverrideWithXterm() {
         // Use XTerm writer for output with ANSI support
         outWriter(char);
 
-        // Also call the original writer if it exists
-        if (obj.writer && typeof obj.writer === "function") {
-          obj.writer(char);
-        }
+        // Note: Don't call obj.writer again as it would cause duplicate output
+        // since outWriter is already the same writer that was set during initialization
       },
     },
   });
