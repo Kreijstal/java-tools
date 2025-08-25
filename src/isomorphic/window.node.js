@@ -1,107 +1,144 @@
 /**
  * Node.js window implementation for isomorphic JavaScript.
- * This module provides a mock window object for Node.js environments that don't have DOM support.
- * It creates a minimal window-like object that includes document and essential browser APIs for testing.
+ * This module uses JSDOM to create a complete DOM environment in Node.js.
+ * It provides a realistic browser-like environment for server-side rendering and testing.
  */
 
-// Create a minimal mock window object for CLI/Node.js environments
-const mockWindow = {
-    // Mock document for basic compatibility
-    document: {
-        createElement: (tagName) => {
-            // Return a mock element with essential Canvas functionality
-            if (tagName === 'canvas') {
-                return {
-                    width: 800,
-                    height: 600,
-                    style: {},
-                    getContext: (type) => {
-                        if (type === '2d') {
-                            // Return a mock Canvas 2D context for CLI testing
-                            return {
-                                canvas: { width: 800, height: 600 },
-                                fillStyle: '#000000',
-                                strokeStyle: '#000000',
-                                font: '10px sans-serif',
-                                fillRect: () => {},
-                                strokeRect: () => {},
-                                fillText: () => {},
-                                drawImage: () => {},
-                                clearRect: () => {},
-                                beginPath: () => {},
-                                closePath: () => {},
-                                moveTo: () => {},
-                                lineTo: () => {},
-                                stroke: () => {},
-                                fill: () => {}
-                            };
-                        }
-                        return null;
-                    },
-                    addEventListener: () => {},
-                    removeEventListener: () => {},
-                    getBoundingClientRect: () => ({ left: 0, top: 0, right: 800, bottom: 600 })
+const { JSDOM } = require('jsdom');
+
+// Create a new JSDOM instance with a basic HTML document
+const dom = new JSDOM(`<!DOCTYPE html><html><head></head><body></body></html>`, {
+    // Configure JSDOM to simulate a browser environment
+    url: "http://localhost/",
+    referrer: "http://localhost/",
+    contentType: "text/html",
+    includeNodeLocations: true,
+    storageQuota: 10000000,
+    
+    // Configure window features
+    features: {
+        FetchExternalResources: false,
+        ProcessExternalResources: false,
+        SkipExternalResources: false
+    },
+    
+    // Add Canvas support through a mock implementation
+    beforeParse(window) {
+        // Add Canvas 2D context support for AWT graphics operations
+        const originalCreateElement = window.document.createElement.bind(window.document);
+        window.document.createElement = function(tagName) {
+            const element = originalCreateElement(tagName);
+            
+            if (tagName.toLowerCase() === 'canvas') {
+                // Enhance canvas elements with proper 2D context mock
+                element.getContext = function(type) {
+                    if (type === '2d') {
+                        return {
+                            canvas: element,
+                            fillStyle: '#000000',
+                            strokeStyle: '#000000',
+                            font: '10px sans-serif',
+                            lineWidth: 1,
+                            
+                            // Drawing operations that record actions for testing
+                            fillRect: function(x, y, width, height) {
+                                this._recordOperation('fillRect', x, y, width, height);
+                            },
+                            strokeRect: function(x, y, width, height) {
+                                this._recordOperation('strokeRect', x, y, width, height);
+                            },
+                            fillText: function(text, x, y, maxWidth) {
+                                this._recordOperation('fillText', text, x, y, maxWidth);
+                            },
+                            strokeText: function(text, x, y, maxWidth) {
+                                this._recordOperation('strokeText', text, x, y, maxWidth);
+                            },
+                            drawImage: function(image, sx, sy, sw, sh, dx, dy, dw, dh) {
+                                const args = Array.from(arguments);
+                                this._recordOperation('drawImage', ...args);
+                            },
+                            clearRect: function(x, y, width, height) {
+                                this._recordOperation('clearRect', x, y, width, height);
+                            },
+                            
+                            // Path operations
+                            beginPath: function() {
+                                this._recordOperation('beginPath');
+                            },
+                            closePath: function() {
+                                this._recordOperation('closePath');
+                            },
+                            moveTo: function(x, y) {
+                                this._recordOperation('moveTo', x, y);
+                            },
+                            lineTo: function(x, y) {
+                                this._recordOperation('lineTo', x, y);
+                            },
+                            arc: function(x, y, radius, startAngle, endAngle, counterclockwise) {
+                                this._recordOperation('arc', x, y, radius, startAngle, endAngle, counterclockwise);
+                            },
+                            stroke: function() {
+                                this._recordOperation('stroke');
+                            },
+                            fill: function() {
+                                this._recordOperation('fill');
+                            },
+                            
+                            // Transformation operations
+                            save: function() {
+                                this._recordOperation('save');
+                            },
+                            restore: function() {
+                                this._recordOperation('restore');
+                            },
+                            translate: function(x, y) {
+                                this._recordOperation('translate', x, y);
+                            },
+                            rotate: function(angle) {
+                                this._recordOperation('rotate', angle);
+                            },
+                            scale: function(x, y) {
+                                this._recordOperation('scale', x, y);
+                            },
+                            
+                            // Operation recording for testing
+                            _operations: [],
+                            _recordOperation: function(operation, ...args) {
+                                this._operations.push({
+                                    operation: operation,
+                                    args: args,
+                                    timestamp: Date.now()
+                                });
+                            },
+                            
+                            // Get recorded operations for testing
+                            getOperations: function() {
+                                return this._operations.map(op => 
+                                    op.args.length > 0 ? 
+                                    `${op.operation}(${op.args.join(', ')})` : 
+                                    `${op.operation}()`
+                                );
+                            },
+                            
+                            // Clear recorded operations
+                            clearOperations: function() {
+                                this._operations = [];
+                            }
+                        };
+                    }
+                    return null;
                 };
+                
+                // Set default canvas dimensions
+                element.width = 800;
+                element.height = 600;
             }
             
-            // Generic mock element
-            return {
-                tagName: tagName.toUpperCase(),
-                style: {},
-                classList: {
-                    add: () => {},
-                    remove: () => {},
-                    contains: () => false
-                },
-                appendChild: () => {},
-                removeChild: () => {},
-                addEventListener: () => {},
-                removeEventListener: () => {},
-                setAttribute: () => {},
-                getAttribute: () => null
-            };
-        },
-        
-        // Mock body for appendChild operations
-        body: {
-            appendChild: () => {},
-            removeChild: () => {}
-        },
-        
-        // Mock query selectors
-        querySelector: () => null,
-        querySelectorAll: () => [],
-        getElementById: () => null
-    },
-    
-    // Mock console (use Node.js console)
-    console: console,
-    
-    // Mock setTimeout/setInterval
-    setTimeout: global.setTimeout,
-    setInterval: global.setInterval,
-    clearTimeout: global.clearTimeout,
-    clearInterval: global.clearInterval,
-    
-    // Mock location
-    location: {
-        href: 'http://localhost/',
-        protocol: 'http:',
-        host: 'localhost',
-        pathname: '/',
-        search: '',
-        hash: ''
-    },
-    
-    // Mock navigator
-    navigator: {
-        userAgent: 'Node.js AWT Mock',
-        platform: process.platform
-    },
-    
-    // Essential for AWT framework compatibility
-    addEventListener: () => {},
-    removeEventListener: () => {}
-};
+            return element;
+        };
+    }
+});
 
-module.exports = mockWindow;
+// Export the window object from our JSDOM instance
+// This provides a complete DOM environment including document, navigator, location, etc.
+module.exports = dom.window;
