@@ -1,4 +1,27 @@
 public class EnumTest {
+    enum Color {
+        RED(255, 0, 0),
+        GREEN(0, 255, 0),
+        BLUE(0, 0, 255),
+        YELLOW(255, 255, 0);
+
+        private final int r, g, b;
+
+        Color(int r, int g, int b) {
+            this.r = r;
+            this.g = g;
+            this.b = b;
+        }
+
+        public int getRed() { return r; }
+        public int getGreen() { return g; }
+        public int getBlue() { return b; }
+
+        public String getHex() {
+            return String.format("#%02x%02x%02x", r, g, b);
+        }
+    }
+
     public static void main(String[] args) {
         System.out.println("=== Enum Test ===");
         
@@ -25,7 +48,10 @@ public class EnumTest {
             Color blue = Color.valueOf("BLUE");
             System.out.println("valueOf(BLUE): " + blue);
             
-            Color invalid = Color.valueOf("YELLOW"); // Should throw exception
+            Color yellow = Color.valueOf("YELLOW");
+            System.out.println("valueOf(YELLOW): " + yellow);
+
+            Color invalid = Color.valueOf("PURPLE"); // Should throw exception
         } catch (IllegalArgumentException e) {
             System.out.println("Caught expected exception for invalid enum: " + e.getClass().getSimpleName());
         }
@@ -41,6 +67,9 @@ public class EnumTest {
                 break;
             case BLUE:
                 System.out.println("It's blue!");
+                break;
+            case YELLOW:
+                System.out.println("It's yellow!");
                 break;
             default:
                 System.out.println("Unknown color");

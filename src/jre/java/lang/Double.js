@@ -55,10 +55,10 @@ module.exports = {
         return jvm.internString("-Infinity");
       }
       if (d === 0.0) {
-        return jvm.newString('0.0');
+        return jvm.internString('0.0');
       }
       if (d === -0.0) {
-        return jvm.newString('-0.0');
+        return jvm.internString('-0.0');
       }
 
       const absD = Math.abs(d);
@@ -66,14 +66,22 @@ module.exports = {
 
       if (absD >= 1e-3 && absD < 1e7) {
         s = String(d);
-        if (!s.includes('.') && !s.includes('e')) {
+        if (s.indexOf('.') === -1) {
             s += '.0';
         }
       } else {
-        s = d.toExponential().replace('e+', 'E').replace('e', 'E');
+        s = d.toExponential().toUpperCase().replace(/E\+/, 'E');
+        let [mantissa, exponent] = s.split('E');
+        if (mantissa.includes('.')) {
+          mantissa = mantissa.replace(/0+$/, '');
+          if (mantissa.endsWith('.')) {
+            mantissa = mantissa.slice(0, -1);
+          }
+        }
+        s = mantissa + 'E' + exponent;
       }
 
-      return jvm.newString(s);
+      return jvm.internString(s);
     },
   },
   methods: {
