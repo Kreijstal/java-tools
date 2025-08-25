@@ -1,3 +1,5 @@
+const fetch = require('../../../fetch-polyfill');
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},

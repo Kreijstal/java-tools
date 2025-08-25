@@ -1,4 +1,4 @@
-const fetch = require('node-fetch');
+const fetch = require('../../../fetch-polyfill');
 
 module.exports = {
   super: 'java/lang/Object',
