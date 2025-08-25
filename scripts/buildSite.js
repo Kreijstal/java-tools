@@ -117,6 +117,13 @@ async function buildSite() {
     const browserUITarget = path.join(distDir, 'browser-ui-enhancements.js');
     copyFile(browserUISource, browserUITarget);
 
+    // Step 3.5: Copy AWT framework to dist for browser usage
+    console.log('🎨 Copying AWT framework...');
+    const awtSource = path.join(srcDir, 'awt.js');
+    const awtTarget = path.join(distDir, 'awt.js');
+    copyFile(awtSource, awtTarget);
+
+
     // Step 4: Process and enhance the debug web interface
     console.log('📄 Processing debug interface template...');
     const debugInterfacePath = path.join(examplesDir, 'debug-web-interface.html');
