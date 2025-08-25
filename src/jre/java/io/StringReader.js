@@ -4,7 +4,7 @@ module.exports = {
   methods: {
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
       const str = args[0];
-      obj.str = str && str.value ? str.value : "";
+      obj.str = str ? String(str) : "";
       obj.next = 0;
       obj.mark = 0;
     },

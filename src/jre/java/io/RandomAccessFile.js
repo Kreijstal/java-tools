@@ -5,27 +5,27 @@ module.exports = {
   interfaces: ['java/io/DataInput', 'java/io/DataOutput'],
   staticFields: {},
   methods: {
-    '<init>(Ljava/io/File;Ljava/lang/String;)V': (jvm, obj, args) => {
+    '<init>(Ljava/io/File;Ljava/lang/String;)V': async (jvm, obj, args) => {
       const file = args[0];
       const mode = args[1];
       
       const filePath = file && file.path ? file.path : '';
-      const modeStr = mode && mode.value ? mode.value : 'r';
+      const modeStr = mode ? String(mode) : 'r';
       
       obj.path = filePath;
       obj.mode = modeStr;
       obj.position = 0;
-      obj.fd = null;
+      obj.fileHandle = null;
       
       try {
-        const flags = modeStr.includes('w') ? 'r+' : 'r';
-        obj.fd = fs.openSync(filePath, flags);
+        const flags = modeStr.includes('w') ? 'w+' : 'r';
+        obj.fileHandle = await jvm.fs.promises.open(filePath, flags);
       } catch (e) {
         jvm.throwException('java/io/IOException', `Cannot open file: ${filePath}`);
       }
     },
     
-    '<init>(Ljava/lang/String;Ljava/lang/String;)V': (jvm, obj, args) => {
+    '<init>(Ljava/lang/String;Ljava/lang/String;)V': async (jvm, obj, args) => {
       const fileName = args[0];
       const mode = args[1];
       
@@ -35,25 +35,25 @@ module.exports = {
       obj.path = filePath;
       obj.mode = modeStr;
       obj.position = 0;
-      obj.fd = null;
+      obj.fileHandle = null;
       
       try {
         const flags = modeStr.includes('w') ? 'r+' : 'r';
-        obj.fd = fs.openSync(filePath, flags);
+        obj.fileHandle = await jvm.fs.promises.open(filePath, flags);
       } catch (e) {
         jvm.throwException('java/io/IOException', `Cannot open file: ${filePath}`);
       }
     },
     
-    'read()I': (jvm, obj, args) => {
-      if (!obj.fd) {
+    'read()I': async (jvm, obj, args) => {
+      if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
         return -1;
       }
       
       try {
         const buffer = Buffer.alloc(1);
-        const bytesRead = fs.readSync(obj.fd, buffer, 0, 1, obj.position);
+        const { bytesRead } = await obj.fileHandle.read(buffer, 0, 1, obj.position);
         if (bytesRead === 0) {
           return -1;
         }
@@ -64,12 +64,12 @@ module.exports = {
       }
     },
     
-    'read([BII)I': (jvm, obj, args) => {
+    'read([BII)I': async (jvm, obj, args) => {
       const b = args[0];
       const off = args[1];
       const len = args[2];
       
-      if (!obj.fd) {
+      if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
         return -1;
       }
@@ -90,7 +90,7 @@ module.exports = {
       
       try {
         const buffer = Buffer.alloc(len);
-        const bytesRead = fs.readSync(obj.fd, buffer, 0, len, obj.position);
+        const { bytesRead } = await obj.fileHandle.read(buffer, 0, len, obj.position);
         
         for (let i = 0; i < bytesRead; i++) {
           b[off + i] = buffer[i];
@@ -103,17 +103,16 @@ module.exports = {
       }
     },
     
-    'write(I)V': (jvm, obj, args) => {
+    'write(I)V': async (jvm, obj, args) => {
       const b = args[0];
-      
-      if (!obj.fd) {
+      if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
         return;
       }
       
       try {
         const buffer = Buffer.from([b & 0xFF]);
-        fs.writeSync(obj.fd, buffer, 0, 1, obj.position);
+        await obj.fileHandle.write(buffer, 0, 1, obj.position);
         obj.position += 1;
       } catch (e) {
         jvm.throwException('java/io/IOException', 'Write failed');
@@ -126,31 +125,31 @@ module.exports = {
         jvm.throwException('java/io/IOException', 'Negative seek position');
         return;
       }
-      obj.position = pos;
+      obj.position = Number(pos);
     },
     
-    'length()J': (jvm, obj, args) => {
-      if (!obj.fd) {
+    'length()J': async (jvm, obj, args) => {
+      if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
         return 0;
       }
       
       try {
-        const stats = fs.fstatSync(obj.fd);
+        const stats = await obj.fileHandle.stat();
         return stats.size;
       } catch (e) {
         return 0;
       }
     },
     
-    'close()V': (jvm, obj, args) => {
-      if (obj.fd !== null) {
+    'close()V': async (jvm, obj, args) => {
+      if (obj.fileHandle !== null) {
         try {
-          fs.closeSync(obj.fd);
+          await obj.fileHandle.close();
         } catch (e) {
           // Ignore close errors
         }
-        obj.fd = null;
+        obj.fileHandle = null;
       }
     }
   }
