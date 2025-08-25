@@ -8,21 +8,26 @@ module.exports = {
     },
     "readLine()Ljava/lang/String;": (jvm, obj, args) => {
       const reader = obj.reader;
+      if (!reader) {
+        jvm.throwException('java/io/IOException', 'Stream closed');
+        return;
+      }
+
+      const readMethod = jvm._jreFindMethod(reader.type, 'read', '()I');
+      if (!readMethod) {
+        jvm.throwException('java/io/IOException', 'Read method not found on reader');
+        return;
+      }
+
       let line = "";
       let charCode;
 
-      const readerRead = jvm._jreFindMethod(
-        "java/io/InputStreamReader",
-        "read",
-        "()I",
-      );
-
-      while ((charCode = readerRead(jvm, reader, [])) !== -1) {
+      while ((charCode = readMethod(jvm, reader, [])) !== -1) {
         const char = String.fromCharCode(charCode);
-        if (char === "\n") {
+        if (char === '\n') {
           break;
         }
-        if (char !== "\r") {
+        if (char !== '\r') {
           line += char;
         }
       }
@@ -34,7 +39,14 @@ module.exports = {
       return jvm.internString(line);
     },
     "close()V": (jvm, obj, args) => {
-      // no-op
+      const reader = obj.reader;
+      if (reader) {
+        const closeMethod = jvm._jreFindMethod(reader.type, 'close', '()V');
+        if (closeMethod) {
+          closeMethod(jvm, reader, []);
+        }
+        obj.reader = null;
+      }
     },
   },
 };

@@ -46,11 +46,12 @@ module.exports = {
     
     'print(Ljava/lang/String;)V': (jvm, obj, args) => {
       const str = args[0];
-      if (str && str.value) {
-        for (let i = 0; i < str.value.length; i++) {
+      if (str) {
+        const s = String(str);
+        for (let i = 0; i < s.length; i++) {
           const writeMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
           if (writeMethod) {
-            writeMethod(jvm, obj, [str.value.charCodeAt(i)]);
+            writeMethod(jvm, obj, [s.charCodeAt(i)]);
           }
         }
       }
