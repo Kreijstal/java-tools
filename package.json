@@ -26,6 +26,7 @@
     "decimal.js": "^10.4.3",
     "jszip": "^3.10.1",
     "jvm_parser": "^0.0.12",
+    "node-fetch": "^2.7.0",
     "parsimmon": "^1.18.1",
     "url": "^0.11.4"
   },
