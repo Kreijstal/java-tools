@@ -22,7 +22,8 @@ module.exports = {
     },
 
     'println(D)V': (jvm, obj, args) => {
-      const output = String(args[0]) + '\n';
+      const doubleClass = jvm.classes['java/lang/Double'];
+      const output = doubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, args) + '\n';
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
       if (writeByteMethod) {
         for (let i = 0; i < output.length; i++) {
@@ -32,7 +33,8 @@ module.exports = {
     },
 
     'println(F)V': (jvm, obj, args) => {
-      const output = String(args[0]) + '\n';
+      const floatClass = jvm.classes['java/lang/Float'];
+      const output = floatClass.staticMethods['toString(F)Ljava/lang/String;'](jvm, null, args) + '\n';
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
       if (writeByteMethod) {
         for (let i = 0; i < output.length; i++) {
