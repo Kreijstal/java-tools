@@ -15,13 +15,7 @@ const tests = [
     name: "ArrayTest",
     description: "Complex array operations",
     expectedOutput:
-      "=== Basic Array Test ===\narr[0] = 10\narr[1] = 20\n=== Array Initialization ===\narr2[0] = 1\narr2[1] = 2\narr2[2] = 3\narr2[3] = 4\narr2[4] = 5\n=== Multi-dimensional Arrays ===\nmatrix[0][0] = 1\nmatrix[0][1] = 2\nmatrix[1][0] = 3\n=== Array Bounds Test ===\nAccessing arr[10]...\nCaught expected exception: ArrayIndexOutOfBoundsException",
-  },
-  {
-    name: "AdvancedArrayCrash",
-    description: "System.arraycopy functionality",
-    expectedOutput:
-      "Testing advanced array operations...\nMatrix[0][0] = 10\nMatrix[2][3] = 20\nString: Hello\nString: World\nString: !\nTotal length: 11\nArraycopy result: dst[3] = 2",
+      "=== Basic Array Test ===\narr[0] = 10\narr[1] = 20\n\n=== Array Initialization ===\narr2[0] = 1\narr2[1] = 2\narr2[2] = 3\narr2[3] = 4\narr2[4] = 5\n\n=== Multi-dimensional Arrays ===\nmatrix[0][0] = 1\nmatrix[0][1] = 2\nmatrix[1][0] = 3\n\n=== Array Bounds Test ===\nAccessing arr[10]...\nCaught expected exception: ArrayIndexOutOfBoundsException\n\n=== Advanced Array Operations ===\nMatrix2[0][0] = 10\nMatrix2[2][3] = 20\nEnhanced for loop:\nString: Hello\nString: World\nString: !\nTotal length of strings: 11\nArraycopy result: dst[3] = 2\n\n=== Array Creator Test ===\nArray created successfully.\nA constant string",
   },
 
   // Class and object features

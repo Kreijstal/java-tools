@@ -37,24 +37,8 @@ class JreBootstrap {
       this.createRuntimeClass(jvm, className, jreClassDef);
     }
 
-    // Set static fields in JRE registry after all classes are loaded
-    // This ensures getstatic can find them in the JRE registry
-    for (const className of sortedClassNames) {
-      const jreClassDef = jreClasses[className];
-      if (jreClassDef && jreClassDef.staticFields) {
-        if (!jvm.jre[className]) {
-          jvm.jre[className] = {};
-        }
-        if (!jvm.jre[className].staticFields) {
-          jvm.jre[className].staticFields = {};
-        }
-
-        for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
-          const normalizedFieldKey = fieldKey.replace(/'/g, '');
-          jvm.jre[className].staticFields[normalizedFieldKey] = fieldValue;
-        }
-      }
-    }
+    // This space is intentionally left blank.
+    // The logic has been moved into createRuntimeClass.
 
     // Generate hierarchy dynamically from the generated JRE index
     const jreHierarchy = {};
@@ -91,6 +75,8 @@ class JreBootstrap {
         },
         constantPool: [],
         staticFields: new Map(),
+      methods: jreClassDef.methods || {},
+      staticMethods: jreClassDef.staticMethods || {},
       };
       jvm.classes[className] = classStub;
     }
@@ -743,6 +729,8 @@ class JreBootstrap {
       },
       constantPool: [],
       staticFields: new Map(),
+      methods: jreClassDef.methods || {},
+      staticMethods: jreClassDef.staticMethods || {},
     };
 
     // Initialize static fields from JRE definition
