@@ -15,7 +15,7 @@ module.exports = {
   methods: {
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
       const pathname = args[0];
-      obj.path = pathname && pathname.value ? pathname.value : '';
+      obj.path = pathname ? String(pathname) : '';
     },
     
     '<init>(Ljava/lang/String;Ljava/lang/String;)V': (jvm, obj, args) => {

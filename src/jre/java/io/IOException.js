@@ -14,8 +14,8 @@ module.exports = {
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
       const message = obj.message;
       const className = obj.type.replace(/\//g, '.');
-      if (message && message.value) {
-        return jvm.internString(`${className}: ${message.value}`);
+      if (message) {
+        return jvm.internString(`${className}: ${String(message)}`);
       } else {
         return jvm.internString(className);
       }

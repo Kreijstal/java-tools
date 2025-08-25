@@ -12,11 +12,15 @@ Available: 0
 Testing StringWriter:
 StringWriter content: Hello
 Testing StringReader:
+Read char: 84
+Read char: 101
+Read char: 115
+Read char: 116
 Testing File:
 File exists: false
-File path: 
+File path: test.txt
 Testing IOException:
-Caught: java.io.IOException
+Caught: java.io.IOException: Test exception
 === Test Complete ===`;
 
   await runTest('IOTest', expectedOutput, t);

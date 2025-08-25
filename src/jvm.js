@@ -55,6 +55,14 @@ class JVM {
     JreBootstrap.preloadAllJreClasses(this);
   }
 
+  throwException(exceptionClass, message) {
+    const exception = { type: exceptionClass };
+    if (message) {
+      exception.message = this.internString(message);
+    }
+    throw exception;
+  }
+
   internString(str) {
     // Proper string interning - reuse the same object for the same string value
     if (!this.stringPool) {
