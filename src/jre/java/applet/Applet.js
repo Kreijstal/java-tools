@@ -110,8 +110,20 @@ module.exports = {
           const graphicsObj = { type: 'java/awt/Graphics' };
           graphicsObj._awtGraphics = graphics;
           
-          // Call the paint method
-          if (obj['paint(Ljava/awt/Graphics;)V']) {
+          // Call the paint method using JVM method lookup
+          const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
+          if (paintMethod) {
+            // For now, we'll execute the method directly if possible
+            // In a more complete implementation, this should go through the normal execution flow
+            try {
+              if (obj.type && jvm.classes[obj.type] && jvm.classes[obj.type].methods && jvm.classes[obj.type].methods['paint(Ljava/awt/Graphics;)V']) {
+                jvm.classes[obj.type].methods['paint(Ljava/awt/Graphics;)V'](jvm, obj, [graphicsObj]);
+              }
+            } catch (error) {
+              console.warn('Error executing paint method:', error);
+            }
+          } else if (obj['paint(Ljava/awt/Graphics;)V']) {
+            // Fallback to direct method call
             obj['paint(Ljava/awt/Graphics;)V'](jvm, obj, [graphicsObj]);
           }
         }
