@@ -192,6 +192,13 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     if (classData) {
       const method = jvm.findMethod(classData, methodName, descriptor);
       if (method) {
+        // Validate that the method is not static for invokevirtual
+        if (method.flags && method.flags.includes("static")) {
+          throw new Error(
+            `IncompatibleClassChangeError: invokevirtual called on static method ${currentClassName}.${methodName}${descriptor}`
+          );
+        }
+
         const newFrame = new Frame(method);
         newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = obj; // 'this'
@@ -255,6 +262,13 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
   const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
   if (method) {
+    // Validate that the method is actually static for invokestatic
+    if (!method.flags || !method.flags.includes("static")) {
+      throw new Error(
+        `IncompatibleClassChangeError: invokestatic called on non-static method ${className}.${methodName}${descriptor}`
+      );
+    }
+
     if (method.flags && method.flags.includes("native")) {
       // This case should be handled by the _jreFindMethod call above,
       // but as a fallback, we can do nothing.
@@ -572,6 +586,13 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     if (classData) {
       const method = jvm.findMethod(classData, methodName, descriptor);
       if (method) {
+        // Validate that the method is not static for invokeinterface
+        if (method.flags && method.flags.includes("static")) {
+          throw new Error(
+            `IncompatibleClassChangeError: invokeinterface called on static method ${currentClassName}.${methodName}${descriptor}`
+          );
+        }
+
         const newFrame = new Frame(method);
         newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = boxedObj; // 'this'
