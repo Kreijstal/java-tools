@@ -393,7 +393,9 @@ class JVM {
     }
 
     const mainMethod = this.findMainMethod(classData);
-    if (!mainMethod) {
+    const isApplet = this.isAppletClass(classData);
+    
+    if (!mainMethod && !isApplet) {
       console.error("main method not found");
       return;
     }
@@ -407,7 +409,7 @@ class JVM {
     };
     this.threads.push(mainThread);
 
-    // Initialize the main class before running main method
+    // Initialize the main class before running main method or creating applet
     // This ensures static blocks execute before main method starts
     const className = classData.ast.classes[0].className;
     const wasFramePushed = await this.initializeClassIfNeeded(
@@ -426,12 +428,77 @@ class JVM {
       }
     }
 
-    const mainFrame = new Frame(mainMethod);
-    mainFrame.className = className; // Add className to the frame
-    mainThread.callStack.push(mainFrame);
+    if (isApplet) {
+      // Handle applet execution
+      await this.runApplet(className, mainThread);
+    } else {
+      // Handle regular class with main method
+      const mainFrame = new Frame(mainMethod);
+      mainFrame.className = className; // Add className to the frame
+      mainThread.callStack.push(mainFrame);
+    }
 
     if (!this.debugManager.debugMode || !this.debugManager.isPaused) {
       await this.execute();
+    }
+  }
+
+  async runApplet(className, mainThread) {
+    // Create applet instance
+    const appletObj = { type: className };
+    
+    // Find and call constructor
+    const constructorMethod = this.findMethod({ ast: this.classes[className].ast }, '<init>', '()V');
+    if (constructorMethod) {
+      const constructorFrame = new Frame(constructorMethod);
+      constructorFrame.className = className;
+      constructorFrame.locals[0] = appletObj;
+      mainThread.callStack.push(constructorFrame);
+      
+      // Execute constructor to completion
+      const originalStackSize = mainThread.callStack.size();
+      while (mainThread.callStack.size() >= originalStackSize) {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+    }
+
+    // Call init() method if it exists
+    const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
+    if (initMethod) {
+      const initFrame = new Frame(initMethod);
+      initFrame.className = className;
+      initFrame.locals[0] = appletObj;
+      mainThread.callStack.push(initFrame);
+      
+      // Execute init to completion
+      const originalStackSize = mainThread.callStack.size();
+      while (mainThread.callStack.size() >= originalStackSize) {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+    }
+
+    // Call start() method if it exists
+    const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
+    if (startMethod) {
+      const startFrame = new Frame(startMethod);
+      startFrame.className = className;
+      startFrame.locals[0] = appletObj;
+      mainThread.callStack.push(startFrame);
+      
+      // Execute start to completion
+      const originalStackSize = mainThread.callStack.size();
+      while (mainThread.callStack.size() >= originalStackSize) {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+    }
+
+    // Call repaint() to trigger paint method
+    const repaintMethod = this.jre['java/applet/Applet'].methods['repaint()V'];
+    if (repaintMethod) {
+      await repaintMethod(this, appletObj, []);
     }
   }
 
@@ -939,6 +1006,24 @@ class JVM {
       );
     });
     return mainMethod ? mainMethod.method : null;
+  }
+
+  isAppletClass(classData) {
+    // Check if this class extends java/applet/Applet
+    let currentClassName = classData.ast.classes[0].className;
+    let currentClassData = classData;
+    
+    while (currentClassData) {
+      const superClassName = currentClassData.ast.classes[0].superClassName;
+      if (superClassName === 'java/applet/Applet') {
+        return true;
+      }
+      if (!superClassName || superClassName === 'java/lang/Object') {
+        return false;
+      }
+      currentClassData = this.classes[superClassName];
+    }
+    return false;
   }
 
   findStaticInitializer(classData) {

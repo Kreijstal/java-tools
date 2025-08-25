@@ -110,8 +110,34 @@ module.exports = {
           const graphicsObj = { type: 'java/awt/Graphics' };
           graphicsObj._awtGraphics = graphics;
           
-          // Call the paint method
-          if (obj['paint(Ljava/awt/Graphics;)V']) {
+          // Call the paint method using JVM method lookup
+          const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
+          if (paintMethod) {
+            // Execute the actual paint method bytecode
+            const Frame = require('../../../frame');
+            const paintFrame = new Frame(paintMethod);
+            paintFrame.className = obj.type;
+            paintFrame.locals[0] = obj; // 'this' parameter
+            paintFrame.locals[1] = graphicsObj; // Graphics parameter
+            
+            // Get current thread to execute the paint method
+            const currentThread = jvm.threads[jvm.currentThreadIndex];
+            if (currentThread) {
+              currentThread.callStack.push(paintFrame);
+              
+              // Execute the paint method synchronously
+              const originalStackSize = currentThread.callStack.size();
+              let maxIterations = 1000; // Safety limit
+              let iterations = 0;
+              
+              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
+                const result = jvm.executeTick();
+                iterations++;
+                if (result && result.completed) break;
+              }
+            }
+          } else if (obj['paint(Ljava/awt/Graphics;)V']) {
+            // Fallback to direct method call
             obj['paint(Ljava/awt/Graphics;)V'](jvm, obj, [graphicsObj]);
           }
         }

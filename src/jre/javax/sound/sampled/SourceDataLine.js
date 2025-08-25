@@ -1,4 +1,26 @@
-const Speaker = require('speaker');
+let Speaker;
+try {
+  Speaker = require('speaker');
+} catch (err) {
+  // Fallback for environments where speaker package is not available
+  console.warn('Speaker package not available, audio output disabled');
+  Speaker = class MockSpeaker {
+    constructor(options) {
+      this.options = options;
+    }
+    write(data) {
+      // Mock write - do nothing
+    }
+    end() {
+      // Mock end - do nothing
+    }
+    once(event, callback) {
+      if (event === 'drain') {
+        setTimeout(callback, 0);
+      }
+    }
+  };
+}
 
 module.exports = {
   super: 'javax/sound/sampled/DataLine',
