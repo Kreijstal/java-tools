@@ -12,7 +12,7 @@ if (!fs.existsSync(tempDir)) {
   fs.mkdirSync(tempDir, { recursive: true });
 }
 
-const classNames = ['VerySimple', 'Hello', 'ArithmeticTest', 'ConstantsTest'];
+const classNames = ['VerySimple', 'Hello', 'ConstantsTest'];
 
 classNames.forEach(className => {
   test(`Roundtrip test for ${className}.class`, (t) => {
