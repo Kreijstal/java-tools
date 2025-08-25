@@ -28,6 +28,7 @@
     "jvm_parser": "^0.0.12",
     "node-fetch": "^3.0.0",
     "parsimmon": "^1.18.1",
+    "speaker": "^0.5.5",
     "url": "^0.11.4"
   },
   "devDependencies": {
