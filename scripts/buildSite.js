@@ -123,11 +123,6 @@ async function buildSite() {
     const awtTarget = path.join(distDir, 'awt.js');
     copyFile(awtSource, awtTarget);
 
-    // Step 3.6: Copy AWT browser integration
-    console.log('🎨 Copying AWT browser integration...');
-    const awtIntegrationSource = path.join(srcDir, 'awt-browser-integration.js');
-    const awtIntegrationTarget = path.join(distDir, 'awt-browser-integration.js');
-    copyFile(awtIntegrationSource, awtIntegrationTarget);
 
     // Step 4: Process and enhance the debug web interface
     console.log('📄 Processing debug interface template...');
