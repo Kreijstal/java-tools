@@ -1593,3 +1593,12 @@ window.setupXtermIntegration = setupXtermIntegration;
 
 // Initialize when DOM is ready
 document.addEventListener("DOMContentLoaded", initializeJVM);
+
+// Load AWT browser integration if available
+if (typeof document !== 'undefined') {
+  const awtScript = document.createElement('script');
+  awtScript.src = './awt-browser-integration.js';
+  awtScript.onload = () => console.log('🎨 AWT browser integration loaded');
+  awtScript.onerror = () => console.log('ℹ️  AWT browser integration not available');
+  document.head.appendChild(awtScript);
+}

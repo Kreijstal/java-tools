@@ -58,7 +58,9 @@ function addBrowserUIScript(htmlContent) {
     <!-- Include browser UI enhancements -->
     <script src="./browser-ui-enhancements.js"></script>
     
-
+    <!-- Include AWT framework for browser-based AWT support -->
+    <script src="./awt.js"></script>
+    
     `;
     
     // Insert before closing </head> tag
