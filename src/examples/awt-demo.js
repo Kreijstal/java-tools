@@ -87,11 +87,6 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports = AwtDemo;
 }
 
-// For browser environment, expose as global
-if (typeof window !== 'undefined') {
-    window.AwtDemo = AwtDemo;
-}
-
 // Example usage for CLI testing
 if (require.main === module) {
     console.log('=== AWT Demo CLI Test ===');

@@ -145,36 +145,8 @@ class AwtFocusListener {
 }
 
 
-// Remove ES6 export statements that cause issues in browser context
-// Export classes to global scope for browser use
-if (typeof window !== 'undefined') {
-    // Browser environment - assign classes to window object
-    window.AwtEvent = AwtEvent;
-    window.AwtMouseEvent = AwtMouseEvent;
-    window.AwtKeyEvent = AwtKeyEvent;
-    window.AwtMouseWheelEvent = AwtMouseWheelEvent;
-    window.AwtFocusEvent = AwtFocusEvent;
-    window.AwtActionEvent = AwtActionEvent;
-    window.Component = Component;
-    window.Container = Container;
-    window.Canvas = Canvas;
-    window.Window = Window;
-    window.Frame = Frame;
-    window.AwtToolkit = AwtToolkit;
-    window.MediaTracker = MediaTracker;
-    window.AwtClipboard = AwtClipboard;
-    window.AwtTransferable = AwtTransferable;
-    window.AwtEventQueue = AwtEventQueue;
-    window.AwtCursor = AwtCursor;
-    window.AwtImage = AwtImage;
-    window.CanvasImage = CanvasImage;
-    window.IGraphics = IGraphics;
-    window.CanvasGraphics = CanvasGraphics;
-    window.MockGraphics = MockGraphics;
-    window.MockImage = MockImage;
-    
-    console.log('🎨 AWT classes loaded into global scope');
-}
+// Note: Window namespace pollution removed. AWT classes are now available 
+// only through CommonJS exports to avoid polluting the global namespace.
 
 // --- Event Classes ---
 
@@ -937,12 +909,6 @@ const awtModules = {
 
 // Handle different module systems
 if (typeof module !== 'undefined' && module.exports) {
-    // CommonJS
+    // CommonJS - this is the primary export mechanism
     module.exports = awtModules;
-} 
-
-// Browser environment - assign classes to window object for global access
-if (typeof window !== 'undefined') {
-    Object.assign(window, awtModules);
-    console.log('🎨 AWT classes loaded into global scope');
 }
