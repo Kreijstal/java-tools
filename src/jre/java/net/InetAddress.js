@@ -1,9 +1,13 @@
-const dns = require('dns');
+
+const { promises: dnsPromises } = require('dns');
+
 
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
-    'getByName(Ljava/lang/String;)Ljava/net/InetAddress;': (jvm, obj, args) => {
+
+    'getByName(Ljava/lang/String;)Ljava/net/InetAddress;': async (jvm, obj, args) => {
+
       const hostname = args[0];
       const jsHostname = hostname.value;
 
@@ -13,13 +17,20 @@ module.exports = {
         address: null,
       };
 
-      // Using a hardcoded IP address because dns.lookupSync causes
-      // unrecoverable errors in this execution environment.
-      const dummyIp = [93, 184, 216, 34]; // Real IP for example.com
-      const byteArray = Array.from(dummyIp);
-      byteArray.type = '[B';
-      byteArray.elementType = 'byte';
-      inetAddress.address = byteArray;
+      try {
+        const lookupResult = await dnsPromises.lookup(jsHostname, { family: 4 });
+        const ipBytes = lookupResult.address.split('.').map(s => parseInt(s, 10));
+        const byteArray = Array.from(ipBytes);
+        byteArray.type = '[B';
+        byteArray.elementType = 'byte';
+        inetAddress.address = byteArray;
+      } catch (e) {
+        throw {
+          type: 'java/net/UnknownHostException',
+          message: jsHostname,
+        };
+      }
+
 
       return inetAddress;
     },
