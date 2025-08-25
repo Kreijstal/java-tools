@@ -1,4 +1,55 @@
 // JRE Class: java/util/Scanner
+
+// Helper function to read the next token (word separated by whitespace)
+function nextToken(jvm, obj) {
+  const source = obj['java/util/Scanner/source'];
+  if (!source) {
+    return null;
+  }
+  
+  let token = '';
+  let charCode;
+  let foundNonWhitespace = false;
+  
+  // Skip leading whitespace and read until next whitespace
+  while (true) {
+    if (source.read && typeof source.read === 'function') {
+      // For TestInputStream objects created in test-helpers
+      charCode = source.read();
+    } else {
+      // Try to find the read method via JRE method lookup
+      const readMethod = jvm._jreFindMethod(source.type || 'java/io/InputStream', 'read', '()I');
+      if (readMethod) {
+        charCode = readMethod(jvm, source, []);
+      } else {
+        charCode = -1;
+      }
+    }
+    
+    if (charCode === -1) {
+      // End of stream
+      obj['java/util/Scanner/hasNext'] = false;
+      break;
+    }
+    
+    const char = String.fromCharCode(charCode);
+    
+    // Check if it's whitespace
+    if (/\s/.test(char)) {
+      if (foundNonWhitespace) {
+        // We've found our token, stop here
+        break;
+      }
+      // Still in leading whitespace, continue
+    } else {
+      foundNonWhitespace = true;
+      token += char;
+    }
+  }
+  
+  return token || null;
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -68,9 +119,8 @@ module.exports = {
         return;
       }
       
-      // Read the next token (skip whitespace) - call the helper method directly
-      const nextTokenMethod = module.exports.methods['java/util/Scanner/nextToken'];
-      const token = nextTokenMethod(jvm, obj);
+      // Read the next token (skip whitespace) - call the helper function directly
+      const token = nextToken(jvm, obj);
       if (!token) {
         jvm.throwException('java/util/NoSuchElementException', 'No int found');
         return;
@@ -91,8 +141,7 @@ module.exports = {
         return;
       }
       
-      const nextTokenMethod = module.exports.methods['java/util/Scanner/nextToken'];
-      const token = nextTokenMethod(jvm, obj);
+      const token = nextToken(jvm, obj);
       if (!token) {
         jvm.throwException('java/util/NoSuchElementException', 'No token found');
         return;
@@ -136,56 +185,6 @@ module.exports = {
           closeMethod(jvm, source, []);
         }
       }
-    },
-    
-    // Helper method to read the next token (word separated by whitespace)
-    'java/util/Scanner/nextToken': (jvm, obj) => {
-      const source = obj['java/util/Scanner/source'];
-      if (!source) {
-        return null;
-      }
-      
-      let token = '';
-      let charCode;
-      let foundNonWhitespace = false;
-      
-      // Skip leading whitespace and read until next whitespace
-      while (true) {
-        if (source.read && typeof source.read === 'function') {
-          // For TestInputStream objects created in test-helpers
-          charCode = source.read();
-        } else {
-          // Try to find the read method via JRE method lookup
-          const readMethod = jvm._jreFindMethod(source.type || 'java/io/InputStream', 'read', '()I');
-          if (readMethod) {
-            charCode = readMethod(jvm, source, []);
-          } else {
-            charCode = -1;
-          }
-        }
-        
-        if (charCode === -1) {
-          // End of stream
-          obj['java/util/Scanner/hasNext'] = false;
-          break;
-        }
-        
-        const char = String.fromCharCode(charCode);
-        
-        // Check if it's whitespace
-        if (/\s/.test(char)) {
-          if (foundNonWhitespace) {
-            // We've found our token, stop here
-            break;
-          }
-          // Still in leading whitespace, continue
-        } else {
-          foundNonWhitespace = true;
-          token += char;
-        }
-      }
-      
-      return token || null;
     }
   }
 };
