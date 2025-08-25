@@ -197,10 +197,7 @@ function setupBrowserSystemOverride() {
         const browserWriter = createBrowserWriter(writerType);
         browserWriter(char);
 
-        // Also call the original writer if it exists
-        if (obj.writer && typeof obj.writer === "function") {
-          obj.writer(char);
-        }
+
       },
     },
   });
