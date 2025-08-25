@@ -40,6 +40,22 @@ module.exports = {
       "dns": false,
       "net": false,
       "url": require.resolve("url/"),
+      // Handle node-fetch v3 and Node.js native modules
+      "node-fetch": false, // Use browser fetch instead
+      "node:util": require.resolve("util/"),
+      "node:zlib": false,
+      "node:stream": require.resolve("stream-browserify"),
+      "node:http": false,
+      "node:https": false,
+      "node:url": require.resolve("url/"),
+      "node:fs": false,
+      "node:path": require.resolve("path-browserify"),
+      "node:buffer": require.resolve("buffer/"),
+      "node:process": require.resolve("process/browser"),
+      // Additional node-fetch dependencies
+      "fetch-blob": false,
+      "formdata-polyfill": false,
+      "web-streams-polyfill": false,
     }
   },
   plugins: [
