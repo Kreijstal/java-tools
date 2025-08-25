@@ -8,6 +8,7 @@ const { JVM, Frame } = require('./jvm');
 const DebugController = require('./debugController');
 const BrowserFileProvider = require('./BrowserFileProvider');
 const { setFileProvider } = require('./classLoader');
+const awtFramework = require('./awt');
 // const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
 // Browser-compatible JVM Debug API
@@ -317,7 +318,8 @@ module.exports = {
   JVM,
   Frame,
   DebugController,
-  BrowserFileProvider
+  BrowserFileProvider,
+  awtFramework
 };
 
 // Also make available as global for direct script inclusion
@@ -329,4 +331,5 @@ if (typeof window !== 'undefined') {
     DebugController,
     BrowserFileProvider
   };
+  window.awtFramework = awtFramework;
 }
