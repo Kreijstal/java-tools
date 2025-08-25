@@ -245,9 +245,10 @@ class KrakatauWorkspace {
                   
                   const targetRef = this.referenceObj[parentClass].children.get(fieldNameOrMethodName);
                   if (targetRef && Array.isArray(targetRef.referees)) {
-                    targetRef.referees.push({ 
+                    targetRef.referees.push({
                       className: cls.className,
-                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`
+                      astPath: `classes.${classIndex}.items.${itemIndex}.method.attributes.${attrIndex}.code.codeItems.${codeItemIndex}`,
+                      op: op,
                     });
                   }
                 }
@@ -951,47 +952,67 @@ class KrakatauWorkspace {
     return unusedSymbols;
   }
 
-  /**
-   * Finds all method references that cannot be resolved to a definition in the workspace.
-   * @returns {SymbolIdentifier[]} An array of SymbolIdentifiers for each unresolved method.
-   */
   findUnresolvedMethods() {
-    const unresolvedMethods = [];
+    return this.findUnresolvedMembers('method');
+  }
+
+  findUnresolvedFields() {
+    return this.findUnresolvedMembers('field');
+  }
+
+  /**
+   * Finds all method or field references that cannot be resolved to a definition in the workspace.
+   * @private
+   * @param {string} memberType - The type of member to look for ('method' or 'field').
+   * @returns {SymbolIdentifier[]} An array of SymbolIdentifiers for each unresolved member.
+   */
+  findUnresolvedMembers(memberType) {
+    const unresolvedMembers = [];
     for (const className in this.referenceObj) {
       const classRef = this.referenceObj[className];
 
       for (const [memberName, memberRef] of classRef.children.entries()) {
-        // A method descriptor will always start with '('.
-        if (memberRef.descriptor && memberRef.descriptor.startsWith('(')) {
-          let isDefined = false;
-          let classToInspect = className;
+        const isMethod = memberRef.descriptor && memberRef.descriptor.startsWith('(');
+        if ((memberType === 'method' && !isMethod) || (memberType === 'field' && isMethod)) {
+          continue;
+        }
 
-          while (classToInspect) {
-            const workspaceEntry = this.workspaceASTs[classToInspect];
-            if (workspaceEntry) {
-              const ast = workspaceEntry.ast;
-              isDefined = ast.classes[0].items.some(item =>
-                item.type === 'method' &&
-                item.method.name === memberName &&
-                item.method.descriptor === memberRef.descriptor
-              );
-              if (isDefined) {
-                break;
-              }
-              classToInspect = ast.classes[0].superClassName;
-            } else {
-              classToInspect = null;
+        let isDefined = false;
+        let classToInspect = className;
+        let memberDef = null;
+
+        while (classToInspect) {
+          const workspaceEntry = this.workspaceASTs[classToInspect];
+          if (workspaceEntry) {
+            const ast = workspaceEntry.ast;
+            memberDef = ast.classes[0].items.find(item =>
+              item.type === memberType &&
+              item[memberType].name === memberName &&
+              item[memberType].descriptor === memberRef.descriptor
+            );
+
+            if (memberDef) {
+              isDefined = true;
+              break;
             }
+            classToInspect = ast.classes[0].superClassName;
+          } else {
+            classToInspect = null;
           }
+        }
 
-          if (!isDefined) {
-            unresolvedMethods.push(new SymbolIdentifier(className, memberName, memberRef.descriptor));
+        if (!isDefined) {
+          const symbol = new SymbolIdentifier(className, memberName, memberRef.descriptor);
+          if (memberType === 'method') {
+            symbol.isStatic = memberRef.referees.some(r => r.op === 'invokestatic');
           }
+          unresolvedMembers.push(symbol);
         }
       }
     }
-    return unresolvedMethods;
+    return unresolvedMembers;
   }
+
 
   /**
    * Validates the entire workspace and reports potential issues.
