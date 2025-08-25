@@ -647,20 +647,47 @@
                     updateStatus('Program execution completed', 'success');
                     log('Program execution completed', 'success');
                 } else {
-                    // Simulate step execution
-                    const newPc = (currentState.pc || 0) + Math.floor(Math.random() * 3) + 1;
-                    const newStack = stepCount % 3 === 0 ? 
-                        [...currentState.stack, Math.floor(Math.random() * 100)] : 
-                        currentState.stack;
+                    // Simulate proper step execution following HelloWorld bytecode sequence
+                    // Instruction sequence: L0(0) → L3(3) → L5(5) → L8(8) → end
+                    const instructionSequence = [0, 3, 5, 8];
+                    const currentPcIndex = instructionSequence.indexOf(currentState.pc);
                     
-                    updateState({
-                        status: 'paused',
-                        pc: newPc,
-                        stack: newStack
-                    });
-                    
-                    updateStatus(`Paused after ${stepType.toLowerCase()} at PC=${newPc}`, 'success');
-                    log(`${stepType} completed - PC=${newPc}, Stack=[${newStack.join(', ')}]`, 'info');
+                    if (currentPcIndex === -1 || currentPcIndex >= instructionSequence.length - 1) {
+                        // End of program or invalid state
+                        updateState({
+                            status: 'completed', 
+                            pc: null,
+                            callDepth: 0
+                        });
+                        updateStatus('Program execution completed', 'success');
+                        log('Program execution completed', 'success');
+                    } else {
+                        // Move to next instruction in sequence
+                        const newPc = instructionSequence[currentPcIndex + 1];
+                        let newStack = [...currentState.stack];
+                        
+                        // Simulate proper stack changes for HelloWorld program
+                        if (newPc === 3) {
+                            // L3: getstatic - puts System.out on stack
+                            newStack.push('System.out');
+                        } else if (newPc === 5) {
+                            // L5: ldc - puts "Hello, World!" on stack  
+                            newStack.push('"Hello, World!"');
+                        } else if (newPc === 8) {
+                            // L8: invokevirtual - consumes both stack items and prints
+                            newStack = [];
+                            log('📄 Program Output: Hello, World!', 'success');
+                        }
+                        
+                        updateState({
+                            status: 'paused',
+                            pc: newPc, 
+                            stack: newStack
+                        });
+                        
+                        updateStatus(`Paused after ${stepType.toLowerCase()} at PC=${newPc}`, 'success');
+                        log(`${stepType} completed - PC=${newPc}, Stack=[${newStack.join(', ')}]`, 'info');
+                    }
                 }
             }, 300);
         }
