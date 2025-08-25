@@ -13,7 +13,8 @@ module.exports = {
         address: null,
       };
 
-      // dns.lookupSync is causing a stack underflow. Using a hardcoded value to test the rest of the flow.
+      // Using a hardcoded IP address because dns.lookupSync causes
+      // unrecoverable errors in this execution environment.
       const dummyIp = [93, 184, 216, 34]; // Real IP for example.com
       const byteArray = Array.from(dummyIp);
       byteArray.type = '[B';

@@ -1,90 +1,57 @@
-const { URL } = require('url');
-
 module.exports = {
-  '<init>(Ljava/lang/String;)V': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const urlString = locals[1];
-    const jsUrlString = jvm.interned_string_to_string(urlString);
+  super: 'java/lang/Object',
+  staticFields: {},
+  methods: {
+    '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
+      obj.url = args[0];
+      return obj;
+    },
+    'openConnection()Ljava/net/URLConnection;': (jvm, obj, args) => {
+      const urlConnection = { type: 'java/net/HttpURLConnection', url: obj.url };
+      return urlConnection;
+    },
+    'getProtocol()Ljava/lang/String;': (jvm, obj, args) => {
+      const urlString = obj.url.value; // Assuming .value holds the JS string
+      const protocol = new URL(urlString).protocol.replace(':', '');
+      return jvm.internString(protocol);
+    },
 
-    try {
-      const parsed = new URL(jsUrlString);
-      thisUrl.set_field('java/net/URL', 'urlString', 'Ljava/lang/String;', urlString);
-      thisUrl.set_field('java/net/URL', 'protocol', 'Ljava/lang/String;', jvm.intern_string(parsed.protocol.replace(':', '')));
-      thisUrl.set_field('java/net/URL', 'host', 'Ljava/lang/String;', jvm.intern_string(parsed.hostname));
-      thisUrl.set_field('java/net/URL', 'port', 'I', parsed.port ? parseInt(parsed.port) : -1);
-      const file = parsed.pathname + parsed.search;
-      thisUrl.set_field('java/net/URL', 'file', 'Ljava/lang/String;', jvm.intern_string(file));
-    } catch (e) {
-      // In a real implementation, we should throw MalformedURLException.
-      // For now, we'll leave fields uninitialized, which will likely cause NullPointerException later.
-    }
-  },
+    '<init>(Ljava/net/URL;Ljava/lang/String;)V': (jvm, obj, args) => {
+      const context = args[0];
+      const spec = args[1];
+      const contextString = context.url.value;
+      const specString = spec.value;
 
-  '<init>(Ljava/net/URL;Ljava/lang/String;)V': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const context = locals[1];
-    const spec = locals[2];
+      const newUrl = new URL(specString, contextString);
+      obj.url = jvm.internString(newUrl.href);
+      return obj;
+    },
 
-    const contextString = jvm.interned_string_to_string(context.get_field('java/net/URL', 'urlString', 'Ljava/lang/String;'));
-    const specString = jvm.interned_string_to_string(spec);
+    'toString()Ljava/lang/String;': (jvm, obj, args) => {
+      return obj.url;
+    },
 
-    try {
-      const parsed = new URL(specString, contextString);
-      const fullUrlString = jvm.intern_string(parsed.href);
-      thisUrl.set_field('java/net/URL', 'urlString', 'Ljava/lang/String;', fullUrlString);
-      thisUrl.set_field('java/net/URL', 'protocol', 'Ljava/lang/String;', jvm.intern_string(parsed.protocol.replace(':', '')));
-      thisUrl.set_field('java/net/URL', 'host', 'Ljava/lang/String;', jvm.intern_string(parsed.hostname));
-      thisUrl.set_field('java/net/URL', 'port', 'I', parsed.port ? parseInt(parsed.port) : -1);
-      const file = parsed.pathname + parsed.search;
-      thisUrl.set_field('java/net/URL', 'file', 'Ljava/lang/String;', jvm.intern_string(file));
-    } catch (e) {
-      // MalformedURLException
-    }
-  },
+    'getHost()Ljava/lang/String;': (jvm, obj, args) => {
+      const urlString = obj.url.value;
+      const host = new URL(urlString).hostname;
+      return jvm.internString(host);
+    },
 
-  'toString()Ljava/lang/String;': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const urlString = thisUrl.get_field('java/net/URL', 'urlString', 'Ljava/lang/String;');
-    jvm.push_stack(urlString);
-  },
+    'getFile()Ljava/lang/String;': (jvm, obj, args) => {
+      const urlString = obj.url.value;
+      const url = new URL(urlString);
+      const file = url.pathname + url.search;
+      return jvm.internString(file);
+    },
 
-  'getHost()Ljava/lang/String;': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const host = thisUrl.get_field('java/net/URL', 'host', 'Ljava/lang/String;');
-    jvm.push_stack(host);
-  },
-
-  'getFile()Ljava/lang/String;': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const file = thisUrl.get_field('java/net/URL', 'file', 'Ljava/lang/String;');
-    jvm.push_stack(file);
-  },
-
-  'getProtocol()Ljava/lang/String;': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const protocol = thisUrl.get_field('java/net/URL', 'protocol', 'Ljava/lang/String;');
-    jvm.push_stack(protocol);
-  },
-
-  'openConnection()Ljava/net/URLConnection;': (jvm, frame, locals) => {
-    const thisUrl = locals[0];
-    const protocol = jvm.interned_string_to_string(thisUrl.get_field('java/net/URL', 'protocol', 'Ljava/lang/String;'));
-
-    let connection;
-    if (protocol === 'http' || protocol === 'https') {
-      connection = jvm.new_class('java/net/HttpURLConnection');
-    } else {
-      // Other protocols would have different connection types.
-      connection = jvm.new_class('java/net/URLConnection');
-    }
-    connection.set_field('java/net/URLConnection', 'url', 'Ljava/net/URL;', thisUrl);
-    jvm.push_stack(connection);
-  },
-
-  'openStream()Ljava/io/InputStream;': (jvm, frame, locals) => {
-    // This is a shorthand for openConnection().getInputStream().
-    // Since we don't have a full implementation of URLConnection,
-    // and specifically getInputStream(), we return null.
-    jvm.push_stack(null);
-  },
+    'openStream()Ljava/io/InputStream;': (jvm, obj, args) => {
+      // This is a shorthand for openConnection().getInputStream().
+      // The existing openConnection is a stub, so this will also be a stub.
+      // Returning a placeholder InputStream object.
+      const inputStream = {
+        type: 'java/io/InputStream',
+      };
+      return inputStream;
+    },
+  }
 };
