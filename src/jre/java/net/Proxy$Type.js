@@ -1,6 +1,8 @@
 module.exports = {
-  // This is a placeholder for the Proxy.Type enum.
-  // A full implementation would require static fields for the enum constants (DIRECT, HTTP, SOCKS)
-  // and a private constructor, which is beyond the current scope.
-  // This empty definition allows the type to be recognized by the JVM.
+  super: 'java/lang/Enum',
+  // In a real implementation, this would have static fields for the enum constants
+  // (DIRECT, HTTP, SOCKS) and methods like values() and valueOf().
+  // For now, this is enough to make it a valid class for the JRE indexer.
+  staticFields: {},
+  methods: {}
 };

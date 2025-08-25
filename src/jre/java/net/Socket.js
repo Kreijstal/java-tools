@@ -5,90 +5,91 @@ const Sockets = new Map();
 let nextSocketId = 0;
 
 module.exports = {
-  '<init>(Ljava/net/InetAddress;I)V': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    const address = locals[1];
-    const port = locals[2];
+  super: 'java/lang/Object',
+  methods: {
+    // Constructor
+    '<init>(Ljava/net/InetAddress;I)V': (jvm, obj, args) => {
+      const address = args[0]; // This is an InetAddress object from our JRE
+      const port = args[1];
 
-    const host = jvm.interned_string_to_string(address.get_field('java/net/InetAddress', 'hostName', 'Ljava/lang/String;'));
+      const host = address.hostName.value; // Get JS string from the Java String object
 
-    const nativeSocket = new net.Socket();
-    const socketId = nextSocketId++;
-    Sockets.set(socketId, nativeSocket);
+      const nativeSocket = new net.Socket();
+      const socketId = nextSocketId++;
+      Sockets.set(socketId, nativeSocket);
 
-    thisSocket.set_field('java/net/Socket', 'socketId', 'I', socketId);
+      obj.socketId = socketId;
+      obj.isClosed = false;
 
-    // Node's connect is async. We can't block, so we fire and forget.
-    // Any errors would need to be handled via events, which the JRE doesn't seem to support well.
-    nativeSocket.connect(port, host, () => {
-      // Connected.
-    });
+      // Node's connect is async. We fire and forget for now.
+      nativeSocket.connect(port, host, () => {
+        // Connected.
+      });
 
-    thisSocket.set_field('java/net/Socket', 'isClosed', 'Z', false);
-  },
+      // Prevent unhandled errors from crashing the process.
+      nativeSocket.on('error', (err) => {
+        // In a full implementation, this error should be stored and
+        // thrown as a Java exception on the next socket operation.
+        // For now, we just log it and prevent a crash.
+        console.error(`Socket error for ${host}:${port}:`, err.message);
+      });
+    },
 
-  'connect(Ljava/net/SocketAddress;)V': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    const endpoint = locals[1]; // This is an InetSocketAddress
+    'connect(Ljava/net/SocketAddress;)V': (jvm, obj, args) => {
+      const endpoint = args[0]; // This is an InetSocketAddress object
+      const host = endpoint.hostname.value;
+      const port = endpoint.port;
 
-    const host = jvm.interned_string_to_string(endpoint.get_field('java/net/InetSocketAddress', 'hostname', 'Ljava/lang/String;'));
-    const port = endpoint.get_field('java/net/InetSocketAddress', 'port', 'I');
+      const nativeSocket = Sockets.get(obj.socketId);
+      if (nativeSocket) {
+        nativeSocket.connect(port, host, () => {
+          // Connected.
+        });
+      }
+    },
 
-    const socketId = thisSocket.get_field('java/net/Socket', 'socketId', 'I');
-    const nativeSocket = Sockets.get(socketId);
+    'setSoTimeout(I)V': (jvm, obj, args) => {
+      const timeout = args[0];
+      const nativeSocket = Sockets.get(obj.socketId);
+      if (nativeSocket) {
+        nativeSocket.setTimeout(timeout);
+      }
+    },
 
-    nativeSocket.connect(port, host, () => {
-      // Connected.
-    });
-  },
+    'setTcpNoDelay(Z)V': (jvm, obj, args) => {
+      const on = args[0]; // 1 for true, 0 for false
+      const nativeSocket = Sockets.get(obj.socketId);
+      if (nativeSocket) {
+        nativeSocket.setNoDelay(on === 1);
+      }
+    },
 
-  'setSoTimeout(I)V': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    const timeout = locals[1];
-    const socketId = thisSocket.get_field('java/net/Socket', 'socketId', 'I');
-    const nativeSocket = Sockets.get(socketId);
-    nativeSocket.setTimeout(timeout);
-  },
+    'close()V': (jvm, obj, args) => {
+      if (obj.isClosed) {
+          return;
+      }
+      const nativeSocket = Sockets.get(obj.socketId);
+      if (nativeSocket) {
+          nativeSocket.destroy();
+          Sockets.delete(obj.socketId);
+      }
+      obj.isClosed = true;
+    },
 
-  'setTcpNoDelay(Z)V': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    const on = locals[1];
-    const socketId = thisSocket.get_field('java/net/Socket', 'socketId', 'I');
-    const nativeSocket = Sockets.get(socketId);
-    nativeSocket.setNoDelay(on);
-  },
+    'getOutputStream()Ljava/io/OutputStream;': (jvm, obj, args) => {
+      const outputStream = {
+        type: 'java/io/OutputStream',
+        socketId: obj.socketId,
+      };
+      return outputStream;
+    },
 
-  'close()V': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    if (thisSocket.get_field('java/net/Socket', 'isClosed', 'Z')) {
-        return;
+    'getInputStream()Ljava/io/InputStream;': (jvm, obj, args) => {
+      const inputStream = {
+        type: 'java/io/InputStream',
+        socketId: obj.socketId,
+      };
+      return inputStream;
     }
-    const socketId = thisSocket.get_field('java/net/Socket', 'socketId', 'I');
-    const nativeSocket = Sockets.get(socketId);
-    if (nativeSocket) {
-        nativeSocket.destroy();
-        Sockets.delete(socketId);
-    }
-    thisSocket.set_field('java/net/Socket', 'isClosed', 'Z', true);
-  },
-
-  'getOutputStream()Ljava/io/OutputStream;': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    const outputStream = jvm.new_class('java/io/OutputStream');
-    const socketId = thisSocket.get_field('java/net/Socket', 'socketId', 'I');
-    // We need to associate the stream with the socket.
-    // We assume the OutputStream class has a field for this.
-    outputStream.set_field('java/io/OutputStream', 'socketId', 'I', socketId);
-    jvm.push_stack(outputStream);
-  },
-
-  'getInputStream()Ljava/io/InputStream;': (jvm, frame, locals) => {
-    const thisSocket = locals[0];
-    const inputStream = jvm.new_class('java/io/InputStream');
-    const socketId = thisSocket.get_field('java/net/Socket', 'socketId', 'I');
-    // We need to associate the stream with the socket.
-    // We assume the InputStream class has a field for this.
-    inputStream.set_field('java/io/InputStream', 'socketId', 'I', socketId);
-    jvm.push_stack(inputStream);
   }
 };
