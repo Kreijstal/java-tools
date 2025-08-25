@@ -37,6 +37,9 @@ module.exports = {
       "v8": false, // Make v8 return false instead of trying to load it
       "crypto": false,
       "zlib": false,
+      "dns": false,
+      "net": false,
+      "url": require.resolve("url/"),
     }
   },
   plugins: [
