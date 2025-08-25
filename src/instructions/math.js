@@ -142,31 +142,31 @@ module.exports = {
   fadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(Math.fround(value1 + value2));
+    frame.stack.push(value1 + value2);
   },
   fsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(Math.fround(value1 - value2));
+    frame.stack.push(value1 - value2);
   },
   fmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(Math.fround(value1 * value2));
+    frame.stack.push(value1 * value2);
   },
   fdiv: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(Math.fround(value1 / value2));
+    frame.stack.push(value1 / value2);
   },
   frem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(Math.fround(value1 % value2));
+    frame.stack.push(value1 % value2);
   },
   fneg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(Math.fround(-value));
+    frame.stack.push(-value);
   },
   dadd: (frame) => {
     const value2 = frame.stack.pop();
