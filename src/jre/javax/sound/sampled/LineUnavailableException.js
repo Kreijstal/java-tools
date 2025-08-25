@@ -3,14 +3,14 @@ module.exports = {
   methods: {
     '<init>()V': (jvm, obj, args) => {
       const exception = obj;
-      const exceptionClass = jvm.findClass('java/lang/Exception');
-      jvm.runMethod(exceptionClass, '<init>()V', [exception]);
+      const exceptionClassDef = jvm.jre['java/lang/Exception'];
+      exceptionClassDef.methods['<init>()V'](jvm, obj, [exception]);
     },
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
       const [msg] = args;
       const exception = obj;
-      const exceptionClass = jvm.findClass('java/lang/Exception');
-      jvm.runMethod(exceptionClass, '<init>(Ljava/lang/String;)V', [exception, msg]);
+      const exceptionClassDef = jvm.jre['java/lang/Exception'];
+      exceptionClassDef.methods['<init>(Ljava/lang/String;)V'](jvm, obj, [exception, msg]);
     },
   },
 };
