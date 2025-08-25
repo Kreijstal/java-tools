@@ -1287,6 +1287,77 @@ class KrakatauWorkspace {
       }
     }
   }
+
+  getAllMethods() {
+    const allMethods = [];
+    for (const className in this.workspaceASTs) {
+      const ast = this.workspaceASTs[className].ast;
+      const classDef = ast.classes[0];
+      for (const item of classDef.items) {
+        if (item.type === 'method') {
+          allMethods.push({
+            class: classDef,
+            name: item.method.name,
+            descriptor: item.method.descriptor,
+            ...item.method,
+          });
+        }
+      }
+    }
+    return allMethods;
+  }
+
+  getCalledMethods(method) {
+    const calledMethods = [];
+    const codeAttribute = method.attributes.find(attr => attr.type === 'code');
+    if (codeAttribute) {
+      for (const codeItem of codeAttribute.code.codeItems) {
+        if (codeItem.instruction && codeItem.instruction.op && codeItem.instruction.op.startsWith('invoke')) {
+          const arg = codeItem.instruction.arg;
+          if (Array.isArray(arg) && arg.length > 2) {
+            const [_, className, [methodName, descriptor]] = arg;
+            calledMethods.push({ className, methodName, descriptor });
+          }
+        }
+      }
+    }
+    return calledMethods;
+  }
+
+  getUnresolvedCalls(calledMethods) {
+    const unresolved = [];
+    for (const called of calledMethods) {
+        const fullMethodName = `${called.className}.${called.methodName}${called.descriptor}`;
+        let isDefined = false;
+        let classToInspect = called.className;
+
+        while (classToInspect) {
+            const workspaceEntry = this.workspaceASTs[classToInspect];
+            if (workspaceEntry) {
+                const ast = workspaceEntry.ast;
+                const memberDef = ast.classes[0].items.find(item =>
+                    item.type === 'method' &&
+                    item.method.name === called.methodName &&
+                    item.method.descriptor === called.descriptor
+                );
+
+                if (memberDef) {
+                    isDefined = true;
+                    break;
+                }
+                classToInspect = ast.classes[0].superClassName;
+            } else {
+                // Class not in workspace, so we can't resolve it further up the hierarchy
+                classToInspect = null;
+            }
+        }
+
+        if (!isDefined) {
+            unresolved.push(fullMethodName);
+        }
+    }
+    return unresolved;
+  }
 }
 
 module.exports = {
