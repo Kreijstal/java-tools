@@ -6,6 +6,10 @@ module.exports = {
       isPrimitive: true,
       name: 'boolean',
     },
+    'TRUE:Ljava/lang/Boolean;': {
+      type: 'java/lang/Boolean',
+      value: true,
+    },
   },
   staticMethods: {
     'valueOf(Z)Ljava/lang/Boolean;': (jvm, obj, args) => {
