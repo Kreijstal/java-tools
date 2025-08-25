@@ -113,13 +113,27 @@ module.exports = {
           // Call the paint method using JVM method lookup
           const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
           if (paintMethod) {
-            // For user classes like HelloWorld, we need to execute the actual bytecode
-            // For now, implement the HelloWorld paint method directly
-            if (obj.type === 'HelloWorld') {
-              // Simulate HelloWorld.paint() method: g.drawString("Hello World", 20, 20)
-              const drawStringMethod = jvm._jreFindMethod('java/awt/Graphics', 'drawString', '(Ljava/lang/String;II)V');
-              if (drawStringMethod) {
-                drawStringMethod(jvm, graphicsObj, ['Hello World', 20, 20]);
+            // Execute the actual paint method bytecode
+            const Frame = require('../../../frame');
+            const paintFrame = new Frame(paintMethod);
+            paintFrame.className = obj.type;
+            paintFrame.locals[0] = obj; // 'this' parameter
+            paintFrame.locals[1] = graphicsObj; // Graphics parameter
+            
+            // Get current thread to execute the paint method
+            const currentThread = jvm.threads[jvm.currentThreadIndex];
+            if (currentThread) {
+              currentThread.callStack.push(paintFrame);
+              
+              // Execute the paint method synchronously
+              const originalStackSize = currentThread.callStack.size();
+              let maxIterations = 1000; // Safety limit
+              let iterations = 0;
+              
+              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
+                const result = jvm.executeTick();
+                iterations++;
+                if (result && result.completed) break;
               }
             }
           } else if (obj['paint(Ljava/awt/Graphics;)V']) {
