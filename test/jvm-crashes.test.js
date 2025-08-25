@@ -107,7 +107,7 @@ const tests = [
     name: "EnumTest",
     description: "Enum constants and methods",
     expectedOutput:
-      "=== Enum Test ===\nColor: RED\nRed value: 255\nHex: 255,0,0\nRED == RED: true\nRED equals RED: true\n=== Enum Switch Test ===\nIt's red!\nIt's green!\nIt's blue!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nCaught expected exception for invalid enum: IllegalArgumentException",
+      "=== Enum Test ===\nColor: RED\nRed value: 255\nHex: 255,0,0\nRED == RED: true\nRED equals RED: true\n=== Enum Switch Test ===\nIt's red!\nIt's green!\nIt's blue!\nIt's yellow!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nvalueOf(YELLOW): YELLOW\nCaught expected exception for invalid enum: IllegalArgumentException",
   },
   {
     name: "MissingBytecodeCrash",
