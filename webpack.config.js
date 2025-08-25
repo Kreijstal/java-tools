@@ -25,6 +25,10 @@ module.exports = {
     ]
   },
   resolve: {
+    alias: {
+      // Isomorphic window module - use browser implementation for webpack builds
+      'window': path.resolve(__dirname, 'src/isomorphic/window.browser.js')
+    },
     fallback: {
       // Provide browser-compatible alternatives for Node.js modules
       "fs": false,
