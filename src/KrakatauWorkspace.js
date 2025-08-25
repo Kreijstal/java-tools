@@ -1359,7 +1359,6 @@ class KrakatauWorkspace {
     return unresolved;
   }
 
-
   listUtf8Strings() {
     const utf8Strings = new Set();
     for (const className in this.workspaceASTs) {
@@ -1374,7 +1373,6 @@ class KrakatauWorkspace {
     }
     return Array.from(utf8Strings);
   }
-
 }
 
 module.exports = {
