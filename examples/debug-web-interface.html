@@ -6,6 +6,15 @@
     <title>JVM Debug API Example</title>
     <!-- Include Ace Editor from CDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.2/ace.js"></script>
+    
+    <!-- Include the real JVM debug bundle -->
+    <script src="../dist/jvm-debug.js"></script>
+    
+    <!-- Include browser UI enhancements -->
+    <script src="../dist/browser-ui-enhancements.js"></script>
+    
+    <!-- Include AWT framework for browser-based AWT support -->
+    <script src="../dist/awt.js"></script>
     <style>
         body {
             font-family: 'Courier New', monospace;
@@ -338,8 +347,9 @@
     </div>
 
     <script>
-        // Real JVM debug controller using embedded jvm.js
-        // This integrates directly with the JVM instance in the browser
+        // Real JVM debug controller integration
+        // The real debug functions (stepInstruction, stepInto, stepOver, etc.) are now provided by browser-ui-enhancements.js
+        // This file was converted from using mock debug functionality to real JVM debug controller integration
         
         let aceEditor = null;
         let currentState = {
@@ -355,7 +365,7 @@
         };
         
         let serializedState = null;
-        let stepCount = 0;
+        // stepCount removed - was part of mock implementation
         
         function initializeEditor() {
             try {
@@ -528,169 +538,39 @@
                 });
         }
         
+        // Mock startDebugging - should throw error as specified in problem statement
         function startDebugging() {
-            if (!currentState.loadedClass) {
-                log('No class loaded. Please load a .class file first.', 'error');
-                return;
-            }
-            
-            const className = currentState.className;
-            log(`Starting debug session with ${className}...`, 'info');
-            updateStatus('Starting debugger...', 'info');
-            
-            // Simulate initialization of JVM with the loaded class
-            setTimeout(() => {
-                updateState({
-                    status: 'paused',
-                    pc: 0,
-                    stack: [],
-                    locals: [null, null, null],
-                    callDepth: 1,
-                    method: 'main([Ljava/lang/String;)V',
-                    breakpoints: []
-                });
-                
-                updateStatus(`Debugger started - Paused at beginning of main method in ${className}`, 'success');
-                log('Debug session started successfully', 'success');
-                log('JVM paused at PC=0 in main method', 'info');
-                
-                // Update disassembly with simulated bytecode
-                if (aceEditor) {
-                    const sampleDisassembly = `// ${className} - main method disassembly
-  0: iconst_0
-  1: istore_1
-  2: iconst_0
-  3: istore_2
-  4: iload_1
-  5: iload_2
-  6: iadd
-  7: istore_3
-  8: getstatic java/lang/System.out:Ljava/io/PrintStream;
- 11: iload_3
- 12: invokevirtual java/io/PrintStream.println:(I)V
- 15: return`;
-                    aceEditor.setValue(sampleDisassembly, -1);
-                }
-            }, 500);
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
+        // Mock step functions - should throw errors as specified in problem statement
         function stepInto() {
-            executeStep('Step Into');
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
         function stepOver() {
-            executeStep('Step Over');
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
         function stepOut() {
-            executeStep('Step Out');
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
         function stepInstruction() {
-            executeStep('Step Instruction');
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
         function finish() {
-            executeStep('Finish Method');
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
+        // Mock continue function - should throw error as specified in problem statement  
         function continue_() {
-            if (currentState.status !== 'paused') {
-                log('Cannot continue - debugger not paused', 'error');
-                return;
-            }
-            
-            log('Continuing execution...', 'info');
-            updateStatus('Running...', 'info');
-            updateState({ status: 'running' });
-            
-            setTimeout(() => {
-                if (currentState.breakpoints.length > 0) {
-                    // Simulate hitting a breakpoint
-                    const hitBreakpoint = currentState.breakpoints[0];
-                    updateState({
-                        status: 'paused',
-                        pc: hitBreakpoint
-                    });
-                    updateStatus(`Hit breakpoint at PC=${hitBreakpoint}`, 'success');
-                    log(`Execution paused at breakpoint PC=${hitBreakpoint}`, 'info');
-                } else {
-                    // Simulate completion
-                    updateState({
-                        status: 'completed',
-                        pc: null,
-                        callDepth: 0
-                    });
-                    updateStatus('Program execution completed', 'success');
-                    log('Program execution completed', 'success');
-                }
-            }, 1000);
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         
-        function executeStep(stepType) {
-            if (currentState.status !== 'paused') {
-                log(`Cannot ${stepType.toLowerCase()} - debugger not paused`, 'error');
-                return;
-            }
-            
-            log(`Executing ${stepType.toLowerCase()}...`, 'info');
-            stepCount++;
-            
-            setTimeout(() => {
-                if (stepCount > 10) {
-                    // Simulate completion
-                    updateState({
-                        status: 'completed',
-                        pc: null,
-                        callDepth: 0
-                    });
-                    updateStatus('Program execution completed', 'success');
-                    log('Program execution completed', 'success');
-                } else {
-                    // Simulate proper step execution following HelloWorld bytecode sequence
-                    // Instruction sequence: L0(0) → L3(3) → L5(5) → L8(8) → end
-                    const instructionSequence = [0, 3, 5, 8];
-                    const currentPcIndex = instructionSequence.indexOf(currentState.pc);
-                    
-                    if (currentPcIndex === -1 || currentPcIndex >= instructionSequence.length - 1) {
-                        // End of program or invalid state
-                        updateState({
-                            status: 'completed', 
-                            pc: null,
-                            callDepth: 0
-                        });
-                        updateStatus('Program execution completed', 'success');
-                        log('Program execution completed', 'success');
-                    } else {
-                        // Move to next instruction in sequence
-                        const newPc = instructionSequence[currentPcIndex + 1];
-                        let newStack = [...currentState.stack];
-                        
-                        // Simulate proper stack changes for HelloWorld program
-                        if (newPc === 3) {
-                            // L3: getstatic - puts System.out on stack
-                            newStack.push('System.out');
-                        } else if (newPc === 5) {
-                            // L5: ldc - puts "Hello, World!" on stack  
-                            newStack.push('"Hello, World!"');
-                        } else if (newPc === 8) {
-                            // L8: invokevirtual - consumes both stack items and prints
-                            newStack = [];
-                            log('📄 Program Output: Hello, World!', 'success');
-                        }
-                        
-                        updateState({
-                            status: 'paused',
-                            pc: newPc, 
-                            stack: newStack
-                        });
-                        
-                        updateStatus(`Paused after ${stepType.toLowerCase()} at PC=${newPc}`, 'success');
-                        log(`${stepType} completed - PC=${newPc}, Stack=[${newStack.join(', ')}]`, 'info');
-                    }
-                }
-            }, 300);
-        }
+        // Mock executeStep function removed - was causing issues with real debug controller
+        // The real debug controller integration is provided by browser-ui-enhancements.js
         
         function setBreakpoint() {
             const input = document.getElementById('breakpointInput');
