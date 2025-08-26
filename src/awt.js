@@ -702,7 +702,11 @@ class CanvasGraphics {
     /** @private @type {CanvasRenderingContext2D} */ ctx;
     
     /** @param {CanvasRenderingContext2D} ctx */
-    constructor(ctx) { this.ctx = ctx; }
+    constructor(ctx) {
+        this.ctx = ctx;
+        // Set a default font for the canvas
+        this.ctx.font = '12px sans-serif';
+    }
 
     /** @override @param {AwtColor} color */
     setColor(color) {
