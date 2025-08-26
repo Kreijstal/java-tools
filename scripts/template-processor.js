@@ -51,6 +51,9 @@ function fixAceEditorCDN(htmlContent) {
  * Add the browser UI enhancement script
  */
 function addBrowserUIScript(htmlContent) {
+    // First, remove any existing incorrect script tags with ../dist/ paths
+    htmlContent = removeIncorrectScriptPaths(htmlContent);
+    
     const scriptIncludes = `
     <!-- Include the real JVM debug bundle -->
     <script src="./jvm-debug.js"></script>
@@ -65,6 +68,22 @@ function addBrowserUIScript(htmlContent) {
     
     // Insert before closing </head> tag
     return htmlContent.replace('</head>', scriptIncludes + '</head>');
+}
+
+/**
+ * Remove script tags with incorrect ../dist/ paths
+ */
+function removeIncorrectScriptPaths(htmlContent) {
+    // Remove the jvm-debug.js script with incorrect path
+    htmlContent = htmlContent.replace(/\s*<!-- Include the real JVM debug bundle -->\s*<script src="\.\.\/dist\/jvm-debug\.js"><\/script>\s*/, '');
+    
+    // Remove the browser-ui-enhancements.js script with incorrect path  
+    htmlContent = htmlContent.replace(/\s*<!-- Include browser UI enhancements -->\s*<script src="\.\.\/dist\/browser-ui-enhancements\.js"><\/script>\s*/, '');
+    
+    // Remove the awt.js script with incorrect path
+    htmlContent = htmlContent.replace(/\s*<!-- Include AWT framework for browser-based AWT support -->\s*<script src="\.\.\/dist\/awt\.js"><\/script>\s*/, '');
+    
+    return htmlContent;
 }
 
 /**
