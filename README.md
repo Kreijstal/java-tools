@@ -1,215 +1,312 @@
-# Java Classfile Parser
+# JVM Tools - Advanced Java Bytecode Analysis & Execution
 
 [![CI](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![Node.js](https://img.shields.io/badge/node.js-18.x%20%7C%2020.x-green.svg)](https://nodejs.org/)
 [![Java](https://img.shields.io/badge/java-11%20%7C%2017-orange.svg)](https://adoptopenjdk.net/)
 
-This project provides tools for parsing and analyzing Java `.class` files. It uses the `jvm_parser` library to create an Abstract Syntax Tree (AST) from bytecode, allowing for in-depth analysis of Java classes.
+A comprehensive toolkit for Java bytecode analysis, manipulation, and execution. This project provides advanced tools for working with Java `.class` files, including a custom JVM implementation, web-based debugging interface, and extensive bytecode analysis capabilities.
 
-## New Features 🔥
+## 🌟 Key Features
 
-### JVM Debug API and State Serialization
-The project now includes comprehensive debugging and serialization capabilities:
+### 🔍 Advanced Bytecode Analysis
+- **Class File Parsing**: Complete Java class file format support using `jvm_parser`
+- **AST Generation**: Convert bytecode to structured Abstract Syntax Trees
+- **Method Analysis**: Deep inspection of methods, fields, and class hierarchies
+- **Bytecode Manipulation**: Modify and reassemble Java bytecode
 
-- **🔍 Debug API**: Step-by-step execution control (step into, over, out, instruction, finish)
-- **💾 State Serialization**: Pause and resume JVM execution across different Node.js runtimes
-- **🎯 Breakpoints**: Set/clear breakpoints at any program counter location
-- **📊 State Inspection**: Real-time access to stack, locals, call depth, and program counter
-- **🌐 Web Integration**: Ready for web application debugging interfaces
+### 🚀 Custom JVM Implementation
+- **Full Instruction Set**: Comprehensive Java bytecode instruction support
+- **Runtime Execution**: Execute Java classes directly in Node.js
+- **Multi-threading**: Java threading model implementation
+- **Memory Management**: Stack, heap, and garbage collection
 
-```bash
-# Try the debug demo
-node scripts/debugDemo.js
+### 🐛 Web-Based Debugging
+- **Visual Debugger**: Step-by-step execution with web interface
+- **Real-Time Inspection**: Examine JVM state, stack, and local variables
+- **Breakpoint Management**: Set and manage execution breakpoints
+- **State Serialization**: Save and restore JVM execution state
 
-# See the web interface demo
-open examples/debug-web-interface.html
-```
+### 🎨 Browser Integration
+- **AWT Support**: Run Java GUI applications in browsers
+- **Web Assembly**: Java bytecode execution in web environments
+- **Cross-Platform**: Same code runs in Node.js and browsers
 
-For detailed documentation, see [DEBUG_API.md](DEBUG_API.md).
+### 🛠️ Development Tools
+- **Krakatau Integration**: Advanced bytecode assembler/disassembler
+- **Class Manipulation**: Load, modify, and generate class files
+- **Native Methods**: JNI (Java Native Interface) support
+- **Build System**: Complete webpack-based build pipeline
 
-## How to Use
+## 📋 Use Cases
 
-To parse a Java `.class` file, you can use the `runLoadAndTraverse.js` script. This script takes a class name and an optional classpath as arguments.
+### Development & Analysis
+- **Java Learning**: Study JVM internals and bytecode execution
+- **Reverse Engineering**: Analyze and understand Java applications
+- **Code Analysis**: Build static analysis tools for Java bytecode
+- **Security Research**: Examine compiled Java applications
 
-**Usage:**
-```bash
-node scripts/runLoadAndTraverse.js <className> [classPath]
-```
+### Web Deployment
+- **Legacy Migration**: Run Java applications in modern browsers
+- **Cross-Platform Apps**: Deploy Java applications without JVM installation
+- **Educational Tools**: Teach Java programming with browser execution
 
-The `className` is the name of the class to parse (e.g., `Hello`), and `classPath` is the directory where the `.class` file is located (e.g., `sources`). If `classPath` is not provided, it defaults to the current directory.
+### Tool Development
+- **Custom JVMs**: Build specialized Java runtime environments
+- **Bytecode Tools**: Create advanced Java development utilities
+- **Testing Frameworks**: Develop Java testing and debugging tools
 
-**Example:**
+## 🚀 Quick Start
 
-First, compile the Java source file:
-```bash
-javac sources/Hello.java
-```
-
-Then, run the script:
-```bash
-node scripts/runLoadAndTraverse.js Hello sources
-```
-
-This will parse the `Hello.class` file from the `sources` directory and print information about the loaded classes.
-
-## How it is related to Krakatau
-
-This project is not directly related to the Krakatau decompiler. While both tools work with Java bytecode, they serve different purposes. Krakatau is a decompiler and disassembler that attempts to reconstruct Java source code from bytecode. This project, on the other hand, provides a library for parsing `.class` files into an AST, which can then be used for various analysis tasks.
-
-## How to Parse a Class
-
-You can parse a `.class` file by using the `loadAndTraverse` function from `src/loadAndTraverse.js`. This function takes a class name and a classpath as arguments. It returns an object containing the Abstract Syntax Tree (AST) and a reference object.
-
-For advanced class analysis and workspace management, see the `KrakatauWorkspace` class in `src/KrakatauWorkspace.js` which provides methods for listing classes, methods, fields, and finding references.
-
-## Installation
-
-To install the dependencies, run:
+### Installation
 
 ```bash
 npm install
 ```
 
-### Development Setup
+### Basic Usage
 
-This project requires both Node.js and Java environments:
-- **Node.js** (v18.x or v20.x)
-- **Java JDK** (v11 or v17)
-
-For local development, you can use the provided Makefile:
+#### Parse and Analyze a Java Class
 
 ```bash
-make install  # Install dependencies
-make build    # Compile Java sources
-make test     # Run tests
-make clean    # Clean compiled files
+# Compile a Java source file
+javac sources/Hello.java
+
+# Parse and analyze the class file
+node scripts/runLoadAndTraverse.js Hello sources
 ```
 
-Or use npm scripts directly:
+#### Execute Java Bytecode
 
 ```bash
-npm run build:java  # Compile Java sources
-npm test           # Run test suite
-npm run clean      # Remove compiled files
+# Run a Java class with the custom JVM
+node scripts/runJvm.js sources/Hello.class
 ```
 
-## Continuous Integration
-
-This project includes GitHub Actions CI that automatically:
-- Tests against multiple Node.js (18.x, 20.x) and Java (11, 17) versions
-- Compiles Java sources and runs the complete test suite
-- Provides build artifacts for debugging
-
-See [CI.md](CI.md) for detailed CI configuration information.
-
-## Utilities
-
-This project also includes several utility scripts for manipulating Java class files.
-
-### `renameMethod.js`
-
-This script allows you to rename a method within a class. It takes the class name, the old method name, and the new method name as arguments. The script will update all references to the old method name to the new one.
-
-### `replaceMethod.js`
-
-This script replaces a method in a class with another method. It effectively renames a method, but is designed to be used in a way that it replaces a method implementation with another.
-
-**Usage:**
+#### Web-Based Debugging
 
 ```bash
-node src/replaceMethod.js <mainClass> <className> <classPath> <oldMethodName> <newMethodName> <targetPath>
+# Start the development server
+npm run serve
 ```
 
-### `showAST.js`
+Then open http://localhost:3000 to access the debugging interface.
 
-This script prints the complete Abstract Syntax Tree (AST) of a given `.class` file.
+## 🏗️ Architecture
 
-**Usage:**
+### Core Components
+
+```
+src/
+├── jvm.js                 # Main JVM implementation and execution engine
+├── frame.js              # Stack frame management and local variables
+├── classLoader.js        # Dynamic class loading and resolution
+├── debugController.js    # Debugging functionality and controls
+├── browser-entry.js      # Browser-specific entry point and API
+├── instructions/         # Complete bytecode instruction set
+├── jre/                  # Java Runtime Environment implementation
+├── awt.js               # Browser AWT (Abstract Window Toolkit)
+└── convert_tree.js      # AST conversion and bytecode manipulation
+```
+
+### Key Features
+
+#### JVM Runtime
+- **Complete Bytecode Support**: All major JVM instructions implemented
+- **Multi-threading**: Java thread model with synchronization
+- **Exception Handling**: Full Java exception system
+- **Memory Model**: Stack and heap management
+
+#### Class Loading System
+- **Dynamic Resolution**: Load classes at runtime
+- **Verification**: Bytecode format validation
+- **Linking**: Class preparation and initialization
+
+#### Web Integration
+- **Browser JVM**: Execute Java in web browsers
+- **Visual Debugging**: Step-through interface
+- **State Management**: Serialize and restore execution state
+
+## 📚 Usage Examples
+
+### 1. Basic Class Analysis
+
+```javascript
+const { loadClassByPath } = require('./src/classLoader');
+
+// Load and parse a class file
+const classData = await loadClassByPath('MyClass.class');
+console.log('Class name:', classData.ast.classes[0].className);
+console.log('Methods:', classData.ast.classes[0].items.filter(item => item.type === 'method'));
+```
+
+### 2. JVM Execution
+
+```javascript
+const { JVM } = require('./src/jvm');
+
+const jvm = new JVM({
+    verbose: true,
+    classpath: 'sources'
+});
+
+// Execute a Java class
+await jvm.run('Hello.class');
+```
+
+### 3. Web-Based Debugging
+
+```javascript
+// In browser environment
+const { BrowserJVMDebug } = window.JVMDebug;
+
+const debugger = new BrowserJVMDebug();
+
+// Initialize with data package
+await debugger.initialize({
+    dataUrl: '/dist/data.zip'
+});
+
+// Start debugging session
+await debugger.start('com.example.MyClass');
+
+// Control execution
+debugger.setBreakpoint(10);
+debugger.stepInto();
+debugger.continue();
+```
+
+### 4. Bytecode Manipulation
+
+```javascript
+const { getAST, convertJson } = require('./src/convert_tree');
+const { unparseDataStructures } = require('./src/convert_tree');
+
+// Parse class file
+const classData = fs.readFileSync('MyClass.class');
+const ast = getAST(classData);
+const converted = convertJson(ast.ast, ast.constantPool);
+
+// Modify the AST as needed
+// ... modify converted.classes[0] ...
+
+// Generate new bytecode
+const newBytecode = unparseDataStructures(converted.classes[0], converted.constantPool);
+```
+
+## 🔧 Configuration
+
+### JVM Options
+
+```javascript
+const jvm = new JVM({
+    verbose: true,           // Enable detailed logging
+    maxStackDepth: 1024,     // Maximum call stack depth
+    classpath: 'lib',        // Default classpath
+    debugMode: true,         // Enable debugging features
+    enableAWT: true         // Enable AWT graphics support
+});
+```
+
+### Build System
 
 ```bash
-node scripts/showAST.js <classFilePath>
+# Install dependencies
+npm install
+
+# Build Java sources
+npm run build:java
+
+# Build web bundle
+npm run build
+
+# Run tests
+npm test
+
+# Start development server
+npm run serve
 ```
 
-### `runJvm.js`
+## 🌐 Web Interface
 
-This script executes a `.class` file using a basic, custom-built JVM.
+### Visual Debugger Features
+- **Disassembly View**: Syntax-highlighted bytecode with current instruction indicator
+- **Execution Controls**: Step into, over, out, continue, and rewind
+- **State Inspection**: Real-time display of stack, locals, and JVM state
+- **Breakpoint Management**: Set breakpoints by clicking in the disassembly view
 
-**Usage:**
+### Sample Applications
+- **Built-in Examples**: Pre-compiled Java test cases
+- **File Upload**: Load your own .class and .jar files
+- **Class Browser**: Navigate methods and fields
+
+### AWT Graphics
+- **Canvas Rendering**: Java GUI components in HTML5 Canvas
+- **Event Translation**: Browser events converted to AWT events
+- **Layout Support**: Proper component layout and rendering
+
+## 🧪 Testing
+
+Run the comprehensive test suite:
 
 ```bash
-node scripts/runJvm.js <classFilePath>
+# Run all tests
+npm test
 
+# Run specific test categories
+npm run test:arithmetic
+npm run test:awt
 
-## Supported Java Bytecode Instructions
-
-The JVM implementation currently supports a comprehensive set of Java bytecode instructions:
-
-### Integer Constants
-- `iconst_m1`, `iconst_0`, `iconst_1`, `iconst_2`, `iconst_3`, `iconst_4`, `iconst_5` - Load integer constants
-- `ldc` - Load constants from constant pool
-
-### Local Variable Operations  
-- `iload_0`, `iload_1`, `iload_2`, `iload_3` - Load integers from local variables
-- `istore_0`, `istore_1`, `istore_2`, `istore_3` - Store integers to local variables
-- `aload_0`, `aload_1`, `aload_2`, `aload_3` - Load object references from local variables
-- `astore_0`, `astore_1`, `astore_2`, `astore_3` - Store object references to local variables
-- `aload`, `astore` - Load/store object references from/to any local variable index
-
-### Arithmetic Operations
-- `iadd` - Integer addition
-- `isub` - Integer subtraction  
-- `imul` - Integer multiplication
-- `idiv` - Integer division
-- `irem` - Integer remainder (modulo)
-
-### Stack Operations
-- `dup` - Duplicate top stack value
-- `pop` - Remove top stack value
-
-### Method Invocation
-- `invokestatic` - Invoke static methods
-- `invokevirtual` - Invoke virtual methods (including System.out.println and String.concat)
-- `invokespecial` - Invoke constructors and private methods
-- `invokedynamic` - Support for lambda expressions and modern string concatenation
-
-### Field Access
-- `getstatic` - Get static field values
-
-### Control Flow
-- `return` - Return from void method
-- `ireturn` - Return integer value from method
-
-### Examples
-
-The following Java programs are included as test cases:
-
-- **RuntimeArithmetic.java** - Demonstrates all arithmetic operations
-- **SmallDivisionTest.java** - Shows integer division and remainder
-- **ConstantsTest.java** - Tests all integer constant instructions
-- **Calculator.java** - Static method calls with parameters
-- **SimpleStringConcat.java** - Simple string concatenation (compile-time optimized)
-- **StringConcatMethod.java** - String concatenation using String.concat() method calls
-
-### String Concatenation Support
-
-The JVM supports string concatenation through multiple approaches:
-
-1. **Compile-time optimized concatenation**: When string literals are concatenated directly (e.g., `"Hello" + " " + "World"`), the Java compiler optimizes this into a single string constant.
-
-2. **String.concat() method calls**: For runtime string concatenation, the JVM supports calling the `String.concat()` method on string objects.
-
-**Example usage:**
-```java
-public class StringConcatMethod {
-    public static void main(String[] args) {
-        String hello = "Hello";
-        String space = " ";
-        String world = "World";
-        String result = hello.concat(space).concat(world);
-        System.out.println(result); // Prints: Hello World
-    }
-}
+# Run browser tests
+npm run test:playwright
 ```
 
-**Note on `invokedynamic`**: This JVM now supports the `invokedynamic` instruction, which is used by modern Java (9+) for string concatenation and by Java 8+ for lambda expressions. Both of these features are now supported.
+## 📁 Project Structure
+
+```
+├── src/                    # Core implementation
+│   ├── jvm.js             # Main JVM engine
+│   ├── classLoader.js     # Class loading system
+│   ├── instructions/      # Bytecode instructions
+│   ├── jre/               # Java Runtime Environment
+│   └── awt.js             # Browser graphics
+├── sources/               # Java source files and examples
+├── test/                  # Test files and test runners
+├── scripts/               # Build and utility scripts
+├── examples/              # Web interface examples
+├── tools/                 # External tools (Krakatau)
+└── dist/                  # Built distribution files
+```
+
+## 🔗 Krakatau Integration
+
+This project integrates with [Krakatau](https://github.com/Storyyeller/Krakatau), an advanced Java bytecode assembler/disassembler:
+
+- **Disassembly**: Convert .class files to Krakatau assembly format
+- **Assembly**: Generate .class files from Krakatau assembly
+- **Manipulation**: Modify bytecode using assembly representation
+- **Analysis**: Advanced bytecode analysis capabilities
+
+## 🤝 Contributing
+
+We welcome contributions! Areas for improvement:
+
+- Additional bytecode instruction implementations
+- Enhanced JRE class library coverage
+- Improved web interface features
+- Performance optimizations
+- Documentation enhancements
+
+## 📄 License
+
+This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE) for details.
+
+## 🙏 Acknowledgments
+
+- **jvm_parser**: Java class file parsing library
+- **Krakatau**: Advanced bytecode manipulation tools
+- **Java Community**: Inspiration from various JVM implementations
+
+---
+
+**JVM Tools** - Advanced Java bytecode analysis and execution for modern development.
