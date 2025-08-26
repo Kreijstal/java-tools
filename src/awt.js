@@ -459,27 +459,18 @@ class Canvas extends Component {
     
     /** @returns {IGraphics} */
     getGraphics() {
-        console.log(`🖼️  Canvas.getGraphics() called`);
-        console.log(`📋 Environment check: typeof document = ${typeof document}`);
-        console.log(`🔍 canvasElement exists: ${!!this.canvasElement}`);
-
         if (!this.graphics && this.canvasElement) {
             const ctx = this.canvasElement.getContext('2d');
             if (ctx) {
-                console.log(`✅ Creating CanvasGraphics with real canvas context`);
                 this.graphics = new CanvasGraphics(ctx);
-            } else {
-                console.log(`❌ Failed to get 2D context from canvas`);
             }
         }
 
         // For CLI environments, create a mock graphics context
         if (!this.graphics) {
-            console.log(`🎭 Creating MockGraphics (no canvas or CLI environment)`);
             this.graphics = this.createMockGraphics();
         }
 
-        console.log(`🎨 Final graphics type: ${this.graphics.constructor.name}`);
         return this.graphics;
     }
     
@@ -738,16 +729,8 @@ class CanvasGraphics {
 
     /** @override @param {string} str @param {number} x @param {number} y */
     drawString(str, x, y) {
-        console.log(`🎨 CanvasGraphics.drawString called: "${str}" at (${x}, ${y})`);
-        console.log(`📋 Canvas context:`, this.ctx);
-        console.log(`📏 Canvas dimensions:`, this.ctx.canvas ? `${this.ctx.canvas.width}x${this.ctx.canvas.height}` : 'No canvas');
-
         if (this.ctx && this.ctx.fillText) {
-            console.log(`✅ Calling ctx.fillText("${str}", ${x}, ${y})`);
             this.ctx.fillText(str, x, y);
-            console.log(`✅ Canvas fillText completed`);
-        } else {
-            console.log(`❌ No canvas context or fillText method available`);
         }
     }
 
