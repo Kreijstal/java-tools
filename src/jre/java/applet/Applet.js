@@ -78,17 +78,8 @@ module.exports = {
     },
     
     'getGraphics()Ljava/awt/Graphics;': (jvm, obj, args) => {
-      // Return a Graphics object that wraps our AWT graphics context
-      const awtGraphics = obj._awtComponent ? obj._awtComponent.getGraphics() : null;
-      
-      if (awtGraphics) {
-        // Create Java Graphics object using proper pattern
-        const graphicsObj = { type: 'java/awt/Graphics' };
-        graphicsObj._awtGraphics = awtGraphics;
-        return graphicsObj;
-      }
-      
-      return null;
+      // Return a Graphics object using JVM's createGraphicsObject method
+      return jvm.createGraphicsObject(obj);
     },
     
     'repaint()V': (jvm, obj, args) => {
@@ -106,9 +97,8 @@ module.exports = {
             }
           }
           
-          // Create Java Graphics object and call paint
-          const graphicsObj = { type: 'java/awt/Graphics' };
-          graphicsObj._awtGraphics = graphics;
+          // Create Java Graphics object using JVM's createGraphicsObject method
+          const graphicsObj = jvm.createGraphicsObject(obj);
           
           // Call the paint method using JVM method lookup
           const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
@@ -119,6 +109,11 @@ module.exports = {
             paintFrame.className = obj.type;
             paintFrame.locals[0] = obj; // 'this' parameter
             paintFrame.locals[1] = graphicsObj; // Graphics parameter
+
+            console.log('🎨 Applet.repaint() - Graphics object created:', {
+              hasAwtGraphics: !!graphicsObj._awtGraphics,
+              graphicsType: graphicsObj.type
+            });
             
             // Get current thread to execute the paint method
             const currentThread = jvm.threads[jvm.currentThreadIndex];

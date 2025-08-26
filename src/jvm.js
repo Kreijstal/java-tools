@@ -606,7 +606,12 @@ class JVM {
     }
 
     // Create the Java Graphics object with proper connection
-    const graphicsObj = { type: 'java/awt/Graphics' };
+    const graphicsObj = {
+      type: 'java/awt/Graphics',
+      _awtGraphics: awtGraphics,
+      _debug_created: true,
+      _creation_timestamp: Date.now()
+    };
 
     if (awtGraphics) {
       // Connect to real canvas graphics context
@@ -617,6 +622,14 @@ class JVM {
       graphicsObj.isMock = true;
       console.log('🎭 Graphics object is mock (no real canvas)');
     }
+
+    console.log('🎨 Final Graphics object structure:', {
+      type: graphicsObj.type,
+      hasAwtGraphics: !!graphicsObj._awtGraphics,
+      isMock: graphicsObj.isMock,
+      debugCreated: graphicsObj._debug_created,
+      creationTimestamp: graphicsObj._creation_timestamp
+    });
 
     return graphicsObj;
   }
