@@ -722,6 +722,13 @@ function convertJson(inputJson, constantPool) {
  * @param {Boolean} withComments - Whether to include comments
  * @returns {String} Krakatau-compatible formatted instruction string
  */
+const KRAKATAU_KEYWORDS = new Set([
+  "abstract", "annotation", "bridge", "enum", "final", "interface",
+  "mandated", "module", "native", "open", "static", "static_phase",
+  "strict", "strictfp", "super", "synchronized", "synthetic", "transient",
+  "transitive", "varargs", "volatile"
+]);
+
 function formatInstructionKrakatau(instr, withComments = false) {
   if (!instr) {
     return "null";
@@ -755,7 +762,15 @@ function formatInstructionKrakatau(instr, withComments = false) {
     instr.op === "invokestatic" ||
     instr.op === "invokeinterface"
   ) {
-    const argStr = formatInstructionArgKrakatau(instr.arg, instr.op);
+    const type = formatInstructionArgKrakatau(instr.arg[0], instr.op);
+    const className = formatInstructionArgKrakatau(instr.arg[1], instr.op);
+    let methodName = instr.arg[2][0];
+    if (instr.op === "invokeinterface" && KRAKATAU_KEYWORDS.has(methodName)) {
+      methodName = `"${methodName}"`;
+    }
+    const descriptor = instr.arg[2][1];
+    const argStr = `${type} ${className} ${methodName} ${descriptor}`;
+
     if (withComments) {
       if (instr.op === "invokeinterface") {
         return `${instr.op} ${argStr} ${instr.count} ; [_${instr.cp_index}]`;
