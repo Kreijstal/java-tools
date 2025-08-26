@@ -731,12 +731,28 @@ async function initializeJVM() {
     log("JVM Debug API Example loaded", "info");
     log("Starting JVM Debug initialization...", "info");
 
+    // Check if JVMDebug is available
+    log(`Checking JVMDebug availability: ${typeof window.JVMDebug}`, "info");
+    if (typeof window.JVMDebug !== "undefined") {
+      log(`JVMDebug.BrowserJVMDebug available: ${!!window.JVMDebug.BrowserJVMDebug}`, "info");
+    } else {
+      log("window.JVMDebug is undefined", "error");
+      return; // Exit early if JVMDebug is not available
+    }
+
     // Initialize the real JVM debug engine
     if (
       typeof window.JVMDebug !== "undefined" &&
       window.JVMDebug.BrowserJVMDebug
     ) {
-      jvmDebug = new window.JVMDebug.BrowserJVMDebug();
+      log("Creating BrowserJVMDebug instance...", "info");
+      try {
+        jvmDebug = new window.JVMDebug.BrowserJVMDebug();
+        log("BrowserJVMDebug instance created successfully", "success");
+      } catch (instanceError) {
+        log(`Failed to create BrowserJVMDebug instance: ${instanceError.message}`, "error");
+        return; // Exit early if instance creation fails
+      }
 
       try {
         // Detect environment and determine data.zip URL
@@ -752,6 +768,7 @@ async function initializeJVM() {
 
         const buffer = await response.arrayBuffer();
         const uint8Array = new Uint8Array(buffer);
+        log(`Data package fetched, size: ${uint8Array.length} bytes`, "info");
 
         // Load as JAR archive since data.zip is essentially a zip file
         const extractedFiles = await jvmDebug.fileProvider.loadJarArchive(
@@ -765,13 +782,14 @@ async function initializeJVM() {
 
         // Initialize the debug environment
         await jvmDebug.initialize();
+        log("JVM debug environment initialized", "success");
 
         // Set up browser-specific System class override
         setupBrowserSystemOverride();
 
         // Set up XTerm integration
         await setupXtermIntegration();
-        
+
         // Set up AWT integration for browser-based canvas rendering
         setupAWTIntegration();
 
@@ -782,9 +800,8 @@ async function initializeJVM() {
         await populateSampleClasses();
       } catch (err) {
         log(`Failed to load data package: ${err.message}`, "error");
-        throw new Error(
-          `Cannot initialize JVM without data package: ${err.message}`,
-        );
+        log("JVM initialization failed - mock functions will remain active", "error");
+        return; // Exit early but don't throw - let mock functions remain
       }
 
       log("Real JVM Debug Interface ready! 🚀", "success");
@@ -794,12 +811,14 @@ async function initializeJVM() {
       );
 
       // Enhance the existing functions with real JVM calls
+      log("Calling enhanceWithRealJVM() to override mock functions...", "info");
       enhanceWithRealJVM();
+      log("Mock functions should now be overridden with real implementations", "success");
 
       // Initialize ACE editor after JVM is ready
       setTimeout(initializeEditor, 100);
     } else {
-      log("JVM Debug bundle not available - using mock implementation", "info");
+      log("JVM Debug bundle not available - using mock implementation", "error");
       // Still initialize editor even without JVM
       setTimeout(initializeEditor, 100);
     }
@@ -812,6 +831,7 @@ async function initializeJVM() {
     log('Click "Start Debugging" to begin', "info");
   } catch (error) {
     logError("Failed to initialize real JVM", error);
+    log("JVM initialization failed completely - mock functions will remain active", "error");
   }
 }
 
@@ -1320,7 +1340,14 @@ async function executeDebugOperation(operation, operationName, successMessage) {
 
 // Enhanced debugging functions
 function enhanceWithRealJVM() {
-  if (!jvmDebug) return;
+  log("enhanceWithRealJVM() called", "info");
+
+  if (!jvmDebug) {
+    log("jvmDebug is not available - cannot override functions", "error");
+    return;
+  }
+
+  log("jvmDebug is available - proceeding with function overrides", "info");
 
   // Override startDebugging to work with real JVM and sample classes
   window.startDebugging = async function () {

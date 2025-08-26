@@ -9,13 +9,13 @@
  */
 function processDebugInterfaceTemplate(htmlContent) {
     console.log('📄 Processing debug interface template...');
-    
+
     // Remove old simulated script block to prevent conflicts
     htmlContent = removeOldSimulatedScript(htmlContent);
-    
+
     // Fix ACE editor CDN to use local copy
     htmlContent = fixAceEditorCDN(htmlContent);
-    
+
     // Add browser-specific enhancements
     htmlContent = addBrowserUIScript(htmlContent);
     htmlContent = addXtermSupport(htmlContent);
@@ -23,7 +23,7 @@ function processDebugInterfaceTemplate(htmlContent) {
     htmlContent = updateFileInputs(htmlContent);
     htmlContent = addUIElementIds(htmlContent);
     htmlContent = addDataZipDownloadSection(htmlContent);
-    
+
     console.log('  ✓ Template processed successfully');
     return htmlContent;
 }
@@ -35,6 +35,7 @@ function removeOldSimulatedScript(htmlContent) {
     // Target the specific script block that contains the JVM simulation
     return htmlContent.replace(/\s*<script>\s*\/\/ Real JVM debug controller using embedded jvm\.js[\s\S]*?<\/script>/s, '');
 }
+
 
 /**
  * Fix ACE editor CDN to use local copy
@@ -188,82 +189,8 @@ $1`;
     return htmlContent;
 }
 
-/**
- * Create README content for the GitHub Pages site
- */
-function createSiteReadme() {
-    return `# Interactive JVM Debug Interface
 
-**🚀 Now featuring REAL JVM bytecode execution!**
-
-This is a live demonstration of the Java Tools project's comprehensive JVM debugging capabilities, now running actual JVM logic in the browser.
-
-## 🔍 Real Features
-
-- **Real JVM Execution**: Uses the actual JVM implementation, not a simulation
-- **Step-by-Step Debugging**: Execute Java bytecode instruction by instruction with full visibility
-- **Real-Time State Inspection**: Watch the actual JVM stack, local variables, and program counter
-- **File Upload Support**: Upload and debug custom .class files or JAR archives
-- **Breakpoint Management**: Set breakpoints at any program counter location
-- **State Serialization**: Pause and resume actual JVM execution across sessions
-- **Cross-Platform**: Same JVM logic that runs in Node.js, now in your browser
-
-## 🛠️ How It Works
-
-This interface uses:
-- **Webpack bundling** to make Node.js JVM code browser-compatible
-- **FileProvider abstraction** for platform-agnostic file operations  
-- **Real JVM classes**: \`JVM\`, \`DebugController\`, and all core logic
-- **JSZip integration** for JAR file support in the browser
-
-## 🚀 Usage
-
-1. Wait for "Real JVM Debug Interface ready! 🚀" message
-2. Select a sample class from the dropdown and click "Load & Debug"
-3. Use step controls to execute bytecode instructions one by one
-4. Upload your own .class or .jar files for custom debugging
-5. Set breakpoints and inspect real JVM state
-
-## 📚 Sample Classes
-
-The interface includes pre-loaded sample classes demonstrating JVM features:
-
-- **Hello**: Simple Hello World program
-- **VerySimple**: Basic arithmetic (3-2=1)  
-- **RuntimeArithmetic**: Comprehensive arithmetic operations
-- **Calculator**: Static method calls with parameters
-- **StringConcatMethod**: String concatenation examples
-- **ConstantsTest**: Integer constant instructions
-
-## 🔧 Technical Architecture
-
-### Isomorphic Design
-- Core JVM logic works in both Node.js and browser
-- FileProvider pattern abstracts file system operations
-- Webpack creates browser-compatible bundle
-
-### Real vs Mock
-- ❌ Previous version: Separate mock implementation 
-- ✅ Current version: Real JVM logic bundled for browser
-
-### Browser Compatibility
-- Real bytecode parsing and execution
-- Actual debug state serialization
-- True-to-life JVM behavior
-
-## 📖 More Information
-
-- [GitHub Repository](https://github.com/Kreijstal/java-tools)
-- [Debug API Documentation](https://github.com/Kreijstal/java-tools/blob/master/DEBUG_API.md)
-- [Project README](https://github.com/Kreijstal/java-tools/blob/master/README.md)
-
----
-
-**Built with real JVM implementation - same code that powers the Node.js version!**
-`;
-}
 
 module.exports = {
-    processDebugInterfaceTemplate,
-    createSiteReadme
+    processDebugInterfaceTemplate
 };
