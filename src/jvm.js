@@ -444,8 +444,8 @@ class JVM {
   }
 
   async runApplet(className, mainThread) {
-    // Create applet instance
-    const appletObj = { type: className };
+    // Create applet instance with proper field initialization
+    const appletObj = await this.createAppletInstance(className);
     
     // In debug mode, set up applet for step-by-step debugging
     if (this.debugManager.debugMode && this.debugManager.isPaused) {
@@ -454,6 +454,93 @@ class JVM {
 
     // Non-debug mode: execute all methods to completion (original behavior)
     return this.executeAppletLifecycle(className, mainThread, appletObj);
+  }
+
+  async createAppletInstance(className) {
+    // Ensure class is loaded
+    await this.initializeClassIfNeeded(className, this.threads[0]);
+    
+    try {
+      this.loadClassByName(className);
+    } catch (e) {
+      if (e.code === 'ENOENT') {
+        throw {
+          type: 'java/lang/NoClassDefFoundError',
+          message: className,
+        };
+      }
+      throw e;
+    }
+
+    // Initialize fields properly like the 'new' instruction does
+    const fields = {};
+    let currentClassName = className;
+    while (currentClassName) {
+      const currentClassData = this.classes[currentClassName];
+      if (currentClassData) {
+        const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
+        for (const field of classFields) {
+          const descriptor = field.field.descriptor;
+          let defaultValue = null;
+          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S' || descriptor === 'Z' || descriptor === 'C') {
+            defaultValue = 0;
+          } else if (descriptor === 'J') {
+            defaultValue = BigInt(0);
+          } else if (descriptor === 'F' || descriptor === 'D') {
+            defaultValue = 0.0;
+          }
+          fields[`${currentClassName}.${field.field.name}`] = defaultValue;
+        }
+        const superClassName = currentClassData.ast.classes[0].superClassName;
+        if (superClassName) {
+          this.loadClassByName(superClassName);
+        }
+        currentClassName = superClassName;
+      } else {
+        currentClassName = null;
+      }
+    }
+
+    const objRef = {
+      type: className,
+      fields,
+      hashCode: this.nextHashCode++,
+      isLocked: false,
+      lockOwner: null,
+      lockCount: 0,
+      waitSet: [],
+    };
+    
+    // Add JavaScript toString method that calls Java toString
+    objRef.toString = function() {
+      try {
+        // Try to find toString method in the class hierarchy
+        let currentType = this.type;
+        let toStringMethod = null;
+        
+        // First check if it's a JRE class
+        toStringMethod = this._jreFindMethod(currentType, 'toString', '()Ljava/lang/String;');
+        
+        // If not found, check parent classes
+        if (!toStringMethod) {
+          const classData = this.classes[currentType];
+          if (classData && classData.ast && classData.ast.classes[0].superClassName) {
+            const superClassName = classData.ast.classes[0].superClassName;
+            toStringMethod = this._jreFindMethod(superClassName, 'toString', '()Ljava/lang/String;');
+          }
+        }
+        
+        if (toStringMethod) {
+          const result = toStringMethod(this, this, []);
+          return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
+        }
+        return this.type.split('/').pop();
+      } catch (e) {
+        return this.type.split('/').pop();
+      }
+    };
+    
+    return objRef;
   }
 
   setupAppletDebugMode(className, mainThread, appletObj) {
