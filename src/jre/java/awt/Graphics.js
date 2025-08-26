@@ -9,8 +9,16 @@ module.exports = {
     'drawString(Ljava/lang/String;II)V': (jvm, obj, args) => {
       // Get the native graphics context from the object
       const graphicsContext = obj._awtGraphics;
+      console.log(`🎨 Graphics.drawString called with: text="${args[0]}", x=${args[1]}, y=${args[2]}`);
+      console.log(`📋 Graphics context available: ${!!graphicsContext}`);
+      console.log(`🔧 drawString method available: ${!!(graphicsContext && graphicsContext.drawString)}`);
+
       if (graphicsContext && graphicsContext.drawString) {
+        console.log(`✅ Executing native drawString implementation`);
         graphicsContext.drawString(args[0], args[1], args[2]);
+        console.log(`✅ drawString execution completed`);
+      } else {
+        console.log(`❌ No graphics context or drawString method available`);
       }
     },
     
