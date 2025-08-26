@@ -3,7 +3,23 @@ module.exports = {
     if (thread.pendingException) {
       delete thread.pendingException;
     }
+    
+    // Handle applet method completion before popping frame
+    const popped = frame; // The frame that will be popped
+    const shouldHandleAppletTransition = jvm.debugManager.debugMode && 
+                                       thread.appletState && 
+                                       thread.appletState.phase !== 'completed' &&
+                                       (popped.isAppletMethod || 
+                                        (popped.className === thread.appletState.className) ||
+                                        (popped.className === 'java/applet/Applet'));
+    
     thread.callStack.pop();
+    
+    // Set up next applet method for debugging if needed
+    if (shouldHandleAppletTransition) {
+      jvm.setupNextAppletMethod(thread);
+    }
+    
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(null);
       thread.isAwaitingReflectiveCall = false;
@@ -14,7 +30,23 @@ module.exports = {
       delete thread.pendingException;
     }
     const returnValue = frame.stack.pop();
+    
+    // Handle applet method completion before popping frame
+    const popped = frame; // The frame that will be popped
+    const shouldHandleAppletTransition = jvm.debugManager.debugMode && 
+                                       thread.appletState && 
+                                       thread.appletState.phase !== 'completed' &&
+                                       (popped.isAppletMethod || 
+                                        (popped.className === thread.appletState.className) ||
+                                        (popped.className === 'java/applet/Applet'));
+    
     thread.callStack.pop();
+    
+    // Set up next applet method for debugging if needed
+    if (shouldHandleAppletTransition) {
+      jvm.setupNextAppletMethod(thread);
+    }
+    
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(returnValue);
       thread.isAwaitingReflectiveCall = false;
@@ -27,7 +59,23 @@ module.exports = {
       delete thread.pendingException;
     }
     const returnValue = frame.stack.pop();
+    
+    // Handle applet method completion before popping frame
+    const popped = frame; // The frame that will be popped
+    const shouldHandleAppletTransition = jvm.debugManager.debugMode && 
+                                       thread.appletState && 
+                                       thread.appletState.phase !== 'completed' &&
+                                       (popped.isAppletMethod || 
+                                        (popped.className === thread.appletState.className) ||
+                                        (popped.className === 'java/applet/Applet'));
+    
     thread.callStack.pop();
+    
+    // Set up next applet method for debugging if needed
+    if (shouldHandleAppletTransition) {
+      jvm.setupNextAppletMethod(thread);
+    }
+    
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(returnValue);
       thread.isAwaitingReflectiveCall = false;
