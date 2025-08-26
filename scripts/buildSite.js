@@ -10,7 +10,7 @@
 const path = require('path');
 const fs = require('fs');
 const { verifyBuildPrerequisites, ensureDirectory, readFile, writeFile, copyFile } = require('./build-utils');
-const { processDebugInterfaceTemplate, createSiteReadme } = require('./template-processor');
+const { processDebugInterfaceTemplate } = require('./template-processor');
 
 console.log('🏗️  Building JVM Debug Interface site...');
 
@@ -133,11 +133,6 @@ async function buildSite() {
     const enhancedHtml = processDebugInterfaceTemplate(htmlContent);
     writeFile(indexPath, enhancedHtml);
 
-    // Step 5: Create README for the GitHub Pages site
-    console.log('📝 Creating site README...');
-    const readmePath = path.join(distDir, 'README.md');
-    const readmeContent = createSiteReadme();
-    writeFile(readmePath, readmeContent);
 
     console.log('✅ Site build complete!');
     console.log('🌐 Ready for deployment to GitHub Pages');
