@@ -12,6 +12,19 @@ module.exports = {
       console.log(`🎨 Graphics.drawString called with: text="${args[0]}", x=${args[1]}, y=${args[2]}`);
       console.log(`📋 Graphics context available: ${!!graphicsContext}`);
       console.log(`🔧 drawString method available: ${!!(graphicsContext && graphicsContext.drawString)}`);
+      console.log(`🔍 Graphics object:`, {
+        type: obj.type,
+        hasAwtGraphics: !!obj._awtGraphics,
+        isMock: obj.isMock,
+        debugCreated: obj._debug_created,
+        creationTimestamp: obj._creation_timestamp,
+        allKeys: Object.keys(obj)
+      });
+
+      // Debug: Check if this is the right object type
+      if (obj.type !== 'java/awt/Graphics') {
+        console.log(`❌ Wrong object type! Expected java/awt/Graphics, got ${obj.type}`);
+      }
 
       if (graphicsContext && graphicsContext.drawString) {
         console.log(`✅ Executing native drawString implementation`);
@@ -19,6 +32,7 @@ module.exports = {
         console.log(`✅ drawString execution completed`);
       } else {
         console.log(`❌ No graphics context or drawString method available`);
+        // No fallback - rely on proper Graphics object creation
       }
     },
     
