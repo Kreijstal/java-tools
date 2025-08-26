@@ -561,28 +561,17 @@ class JVM {
     let canvas = null;
     let awtGraphics = null;
 
-    console.log('🔍 createGraphicsObject called with:', {
-      hasAppletObj: !!appletObj,
-      hasCanvasElement: !!(appletObj && appletObj._canvasElement),
-      hasAwtComponent: !!(appletObj && appletObj._awtComponent),
-      hasDocument: typeof document !== 'undefined'
-    });
-
     if (appletObj && typeof document !== 'undefined') {
       // First, try to get the canvas from the applet object's canvas element
       if (appletObj._canvasElement) {
         canvas = appletObj._canvasElement;
-        console.log('✅ Found canvas via _canvasElement');
       } else if (appletObj._awtComponent && appletObj._awtComponent.canvasElement) {
         canvas = appletObj._awtComponent.canvasElement;
-        console.log('✅ Found canvas via _awtComponent.canvasElement');
       } else {
         // Look for AWT container and find canvas within it
         const awtContainer = document.getElementById('awt-container');
-        console.log('🔍 Looking for awt-container:', !!awtContainer);
         if (awtContainer) {
           canvas = awtContainer.querySelector('canvas');
-          console.log('🔍 Found canvas in awt-container:', !!canvas);
         }
       }
 
@@ -590,46 +579,30 @@ class JVM {
       if (canvas) {
         try {
           const ctx = canvas.getContext('2d');
-          console.log('🎨 Got 2D context:', !!ctx);
           if (ctx) {
             // Import the AWT framework to create CanvasGraphics
             const awtFramework = require('./awt.js');
             awtGraphics = new awtFramework.CanvasGraphics(ctx);
-            console.log('✅ Created CanvasGraphics successfully');
           }
         } catch (error) {
-          console.warn('❌ Failed to create CanvasGraphics:', error.message);
+          // Silently handle canvas graphics creation failure
         }
-      } else {
-        console.log('❌ No canvas element found');
       }
     }
 
     // Create the Java Graphics object with proper connection
     const graphicsObj = {
       type: 'java/awt/Graphics',
-      _awtGraphics: awtGraphics,
-      _debug_created: true,
-      _creation_timestamp: Date.now()
+      _awtGraphics: awtGraphics
     };
 
     if (awtGraphics) {
       // Connect to real canvas graphics context
       graphicsObj._awtGraphics = awtGraphics;
-      console.log('🎯 Graphics object connected to real canvas');
     } else {
       // Fallback to mock graphics for environments without DOM
       graphicsObj.isMock = true;
-      console.log('🎭 Graphics object is mock (no real canvas)');
     }
-
-    console.log('🎨 Final Graphics object structure:', {
-      type: graphicsObj.type,
-      hasAwtGraphics: !!graphicsObj._awtGraphics,
-      isMock: graphicsObj.isMock,
-      debugCreated: graphicsObj._debug_created,
-      creationTimestamp: graphicsObj._creation_timestamp
-    });
 
     return graphicsObj;
   }
@@ -681,11 +654,6 @@ class JVM {
         paintFrame.locals[0] = appletObj;
         // Create proper Graphics object connected to DOM canvas
         const graphicsObj = this.createGraphicsObject(appletObj);
-        console.log('🎨 JVM paint method - created Graphics object:', {
-          hasAwtGraphics: !!graphicsObj._awtGraphics,
-          isMock: graphicsObj.isMock,
-          type: graphicsObj.type
-        });
         paintFrame.locals[1] = graphicsObj;
         mainThread.callStack.push(paintFrame);
         return;
