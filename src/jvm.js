@@ -447,113 +447,86 @@ class JVM {
     // Create applet instance
     const appletObj = { type: className };
     
-    // Store applet lifecycle state for debugging
-    if (!mainThread.appletState) {
-      mainThread.appletState = {
-        instance: appletObj,
-        phase: 'constructor', // constructor -> init -> start -> repaint -> completed
-        className: className
-      };
-    }
-
-    // If debugging is enabled and paused, only set up the first method and let user step through
+    // In debug mode, set up applet for step-by-step debugging
     if (this.debugManager.debugMode && this.debugManager.isPaused) {
-      return this.setupNextAppletMethod(mainThread);
+      return this.setupAppletDebugMode(className, mainThread, appletObj);
     }
 
     // Non-debug mode: execute all methods to completion (original behavior)
-    await this.executeAppletLifecycle(className, mainThread, appletObj);
+    return this.executeAppletLifecycle(className, mainThread, appletObj);
+  }
+
+  setupAppletDebugMode(className, mainThread, appletObj) {
+    // Store minimal applet info for method sequencing
+    mainThread.appletInfo = {
+      instance: appletObj,
+      className: className,
+      nextMethods: ['<init>', 'init', 'start', 'paint']
+    };
+
+    // Start with constructor - this will be debugged step-by-step
+    this.setupNextAppletMethod(mainThread);
   }
 
   setupNextAppletMethod(mainThread) {
-    const appletState = mainThread.appletState;
-    const className = appletState.className;
-    const appletObj = appletState.instance;
-
-    switch (appletState.phase) {
-      case 'constructor':
-        const constructorMethod = this.findMethod({ ast: this.classes[className].ast }, '<init>', '()V');
-        if (constructorMethod) {
-          const constructorFrame = new Frame(constructorMethod);
-          constructorFrame.className = className;
-          constructorFrame.locals[0] = appletObj;
-          mainThread.callStack.push(constructorFrame);
-          appletState.phase = 'init';
-          return;
-        }
-        // Fall through to next phase if constructor not found
-        appletState.phase = 'init';
-
-      case 'init':
-        const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
-        if (initMethod) {
-          const initFrame = new Frame(initMethod);
-          initFrame.className = className;
-          initFrame.locals[0] = appletObj;
-          mainThread.callStack.push(initFrame);
-          appletState.phase = 'start';
-          return;
-        }
-        // Fall through to next phase if init not found
-        console.log(`No init method found for ${className}, skipping to start`);
-        appletState.phase = 'start';
-
-      case 'start':
-        const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
-        if (startMethod) {
-          const startFrame = new Frame(startMethod);
-          startFrame.className = className;
-          startFrame.locals[0] = appletObj;
-          mainThread.callStack.push(startFrame);
-          appletState.phase = 'repaint';
-          return;
-        }
-        // Fall through to next phase if start not found
-        console.log(`No start method found for ${className}, skipping to repaint`);
-        appletState.phase = 'repaint';
-
-      case 'repaint':
-        // For repaint, we need to call the JRE method directly since it's not a bytecode method
-        const repaintMethod = this.jre['java/applet/Applet'].methods['repaint()V'];
-        if (repaintMethod) {
-          // Create a synthetic frame to represent the repaint call for debugging
-          const syntheticFrame = new Frame({
-            name: 'repaint',
-            descriptor: '()V',
-            attributes: [
-              {
-                type: 'code',
-                code: {
-                  localsSize: '1',
-                  codeItems: [
-                    { instruction: null, labelDef: 'L0:' }, // Synthetic instruction for debugging visibility
-                  ],
-                  exceptionTable: []
-                }
-              }
-            ]
-          });
-          syntheticFrame.className = 'java/applet/Applet';
-          syntheticFrame.locals[0] = appletObj;
-          syntheticFrame.isAppletMethod = true; // Mark this as special applet method
-          mainThread.callStack.push(syntheticFrame);
-          appletState.phase = 'completed';
-          return;
-        }
-        // Fall through to completion if repaint not found
-        console.log(`No repaint method found, completing applet lifecycle`);
-        appletState.phase = 'completed';
-
-      case 'completed':
-        // All applet lifecycle methods have been set up
-        console.log(`Applet lifecycle completed for ${className}`);
-        break;
+    const appletInfo = mainThread.appletInfo;
+    if (!appletInfo || appletInfo.nextMethods.length === 0) {
+      // No more methods to set up
+      delete mainThread.appletInfo;
+      return;
     }
+
+    const methodName = appletInfo.nextMethods.shift();
+    const className = appletInfo.className;
+    const appletObj = appletInfo.instance;
+
+    if (methodName === '<init>') {
+      const constructorMethod = this.findMethod({ ast: this.classes[className].ast }, '<init>', '()V');
+      if (constructorMethod) {
+        const constructorFrame = new Frame(constructorMethod);
+        constructorFrame.className = className;
+        constructorFrame.locals[0] = appletObj;
+        mainThread.callStack.push(constructorFrame);
+        return;
+      }
+    } else if (methodName === 'init') {
+      const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
+      if (initMethod) {
+        const initFrame = new Frame(initMethod);
+        initFrame.className = className;
+        initFrame.locals[0] = appletObj;
+        mainThread.callStack.push(initFrame);
+        return;
+      }
+    } else if (methodName === 'start') {
+      const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
+      if (startMethod) {
+        const startFrame = new Frame(startMethod);
+        startFrame.className = className;
+        startFrame.locals[0] = appletObj;
+        mainThread.callStack.push(startFrame);
+        return;
+      }
+    } else if (methodName === 'paint') {
+      const paintMethod = this.findMethod({ ast: this.classes[className].ast }, 'paint', '(Ljava/awt/Graphics;)V');
+      if (paintMethod) {
+        const paintFrame = new Frame(paintMethod);
+        paintFrame.className = className;
+        paintFrame.locals[0] = appletObj;
+        // Mock Graphics object for paint method
+        paintFrame.locals[1] = { type: 'java/awt/Graphics', isMock: true };
+        mainThread.callStack.push(paintFrame);
+        return;
+      }
+    }
+
+    // If method not found, try next method recursively
+    this.setupNextAppletMethod(mainThread);
   }
 
   async executeAppletLifecycle(className, mainThread, appletObj) {
-    // Original non-debug behavior: execute all methods to completion
-
+    // Original behavior: execute all methods to completion
+    
     // Find and call constructor
     const constructorMethod = this.findMethod({ ast: this.classes[className].ast }, '<init>', '()V');
     if (constructorMethod) {
@@ -727,26 +700,8 @@ class JVM {
     }
 
     const frame = callStack.peek();
-    
     if (frame.pc >= frame.instructions.length) {
       const popped = callStack.pop();
-      
-      // Handle applet method completion in debug mode
-      if (this.debugManager.debugMode && thread.appletState && thread.appletState.phase !== 'completed') {
-        // If this was an applet method, check if we need to set up the next lifecycle method
-        if (popped.isAppletMethod || 
-            (popped.className === thread.appletState.className) ||
-            (popped.className === 'java/applet/Applet' && thread.appletState.phase === 'completed')) {
-          
-          // Set up the next applet method for debugging
-          this.setupNextAppletMethod(thread);
-          
-          // If we set up a new method, continue execution
-          if (!callStack.isEmpty()) {
-            return { completed: false };
-          }
-        }
-      }
       
       if (thread.isAwaitingReflectiveCall) {
         let ret = null;
@@ -767,16 +722,22 @@ class JVM {
 
     try {
       if (instruction) {
-        await this.executeInstruction(instruction, frame, thread);
-      } else if (frame.isAppletMethod && frame.className === 'java/applet/Applet') {
-        // Handle synthetic repaint method execution
-        const appletObj = frame.locals[0];
-        const repaintMethod = this.jre['java/applet/Applet'].methods['repaint()V'];
-        if (repaintMethod) {
-          await repaintMethod(this, appletObj, []);
+        // Check if this is a return instruction that will complete an applet method in debug mode
+        const isReturnInstruction = instruction === 'return' || 
+          (instruction.op && (instruction.op === 'ireturn' || instruction.op === 'areturn'));
+        const shouldSetupNextAppletMethod = isReturnInstruction && 
+          this.debugManager.debugMode && 
+          thread.appletInfo && 
+          thread.appletInfo.nextMethods.length > 0;
+
+        if (shouldSetupNextAppletMethod) {
+          // Execute the return instruction first
+          await this.executeInstruction(instruction, frame, thread);
+          // Then set up the next applet method
+          this.setupNextAppletMethod(thread);
+        } else {
+          await this.executeInstruction(instruction, frame, thread);
         }
-        // Force frame completion by setting pc to end
-        frame.pc = frame.instructions.length;
       }
     } catch (e) {
       const isJavaException =
