@@ -1482,6 +1482,9 @@ function enhanceWithRealJVM() {
 
     log("State serialized successfully", "success");
   };
+
+  // Export jvmDebug to window for testing and external access
+  window.jvmDebug = jvmDebug;
 }
 
 // File Loading
