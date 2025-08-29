@@ -2,7 +2,7 @@ const test = require('tape');
 const DebugController = require('../src/debugController');
 
 test('DebugController getDisassemblyView functionality', async (t) => {
-    const debugController = new DebugController();
+    const debugController = new DebugController({ classpath: 'sources' });
     
     // Test initial state (no class loaded)
     const initialView = debugController.getDisassemblyView();
@@ -14,7 +14,7 @@ test('DebugController getDisassemblyView functionality', async (t) => {
     
     // Test with a loaded class
     try {
-        await debugController.start('sources/VerySimple.class');
+        await debugController.start('VerySimple');
         
         const view = debugController.getDisassemblyView();
         t.ok(view, 'getDisassemblyView should return an object after starting debug session');

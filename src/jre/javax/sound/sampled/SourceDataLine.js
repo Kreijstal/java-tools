@@ -3,7 +3,7 @@ try {
   Speaker = require("speaker");
 } catch (err) {
   // Fallback for environments where speaker package is not available
-  console.warn("Speaker package not available, audio output disabled");
+  // console.warn("Speaker package not available, audio output disabled");
   Speaker = class MockSpeaker {
     constructor(options) {
       this.options = options;

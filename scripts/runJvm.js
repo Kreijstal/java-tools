@@ -10,7 +10,7 @@ function main() {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '-cp' || args[i] === '-classpath') {
       if (i + 1 < args.length) {
-        cp = args[i + 1];
+        cp = args[i + 1].split(path.delimiter);
         i++;
       } else {
         console.error('Error: classpath not specified');
@@ -28,7 +28,6 @@ function main() {
     process.exit(1);
   }
 
-  const classFilePath = path.join(cp, `${mainClass}.class`);
   const jvm = new JVM({ classpath: cp, verbose: verbose });
 
   let stdin = '';
@@ -42,10 +41,10 @@ function main() {
     });
 
     process.stdin.on('end', () => {
-      jvm.run(classFilePath, { stdin: stdin });
+      jvm.run(mainClass, { stdin: stdin });
     });
   } else {
-    jvm.run(classFilePath);
+    jvm.run(mainClass);
   }
 }
 

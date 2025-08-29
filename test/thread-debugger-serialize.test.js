@@ -4,8 +4,8 @@ const DebugController = require('../src/debugController');
 test('Thread debugging with serialization', async t => {
   t.plan(1);
 
-  let controller = new DebugController({ classpath: 'sources' });
-  await controller.start('sources/ProducerConsumer.class');
+  let controller = new DebugController({ classpath: ['sources'] });
+  await controller.start('ProducerConsumer');
 
   for (let i = 0; i < 1000; i++) {
     if (controller.isCompleted()) {
@@ -13,7 +13,7 @@ test('Thread debugging with serialization', async t => {
     }
     await controller.stepInstruction();
     const state = controller.serialize();
-    const newController = new DebugController({ classpath: 'sources' });
+    const newController = new DebugController({ classpath: ['sources'] });
     await newController.deserialize(state);
     controller = newController;
   }

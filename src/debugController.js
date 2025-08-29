@@ -7,7 +7,7 @@ class DebugController {
       rewindHistorySize: 0,
       ...options,
     };
-    this.jvm = new JVM(options);
+    this.jvm = new JVM(this.options);
     this.executionState = 'stopped'; // stopped, running, paused
     this.history = [];
     // Store last known state for display purposes when execution completes

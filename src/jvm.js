@@ -30,7 +30,11 @@ class JVM {
     this.classObjectCache = new Map(); // className -> Class object (for maintaining identity)
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
-    this.classpath = options.classpath || ".";
+    this.classpath = options.classpath
+      ? Array.isArray(options.classpath)
+        ? options.classpath
+        : [options.classpath]
+      : ["."];
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
@@ -381,15 +385,14 @@ class JVM {
     }
   }
 
-  async run(classFilePath, options = {}) {
+  async run(mainClassName, options = {}) {
     if (options.classpath) {
-      this.classpath = options.classpath;
-    } else if (classFilePath.includes(path.sep)) {
-      this.classpath = path.dirname(classFilePath);
+      this.classpath = Array.isArray(options.classpath) ? options.classpath : [options.classpath];
     }
-    const classData = await this.loadClassAsync(classFilePath, options);
+
+    const classData = await this.loadClassByName(mainClassName);
     if (!classData || !classData.ast) {
-      throw new Error(`Class not found: ${classFilePath}`);
+      throw new Error(`Class not found: ${mainClassName}`);
     }
 
     const mainMethod = this.findMainMethod(classData);
@@ -994,7 +997,8 @@ class JVM {
     return null;
   }
 
-  async loadClassByName(classNameWithSlashes) {
+  async loadClassByName(className) {
+    const classNameWithSlashes = className.replace(/\./g, '/');
     if (this.classes[classNameWithSlashes]) {
       return this.classes[classNameWithSlashes];
     }
@@ -1004,15 +1008,22 @@ class JVM {
       return this.createArrayClass(classNameWithSlashes);
     }
 
-    const classFilePath = path.join(
-      this.classpath,
-      `${classNameWithSlashes}.class`,
-    );
-    const classData = await this.loadClassAsync(classFilePath);
-    if (classData && classData.ast) {
-      this.classes[classNameWithSlashes] = classData;
+    for (const cp of this.classpath) {
+      const classFilePath = path.join(cp, `${classNameWithSlashes}.class`);
+      try {
+        const classData = await this.loadClassAsync(classFilePath);
+        if (classData && classData.ast) {
+          this.classes[classNameWithSlashes] = classData;
+          return classData;
+        }
+      } catch (error) {
+        if (error.code !== 'ENOENT') {
+          throw error;
+        }
+      }
     }
-    return classData;
+
+    return null;
   }
 
   /**
