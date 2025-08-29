@@ -4,7 +4,7 @@ const { JVM } = require('../src/jvm');
 test('JVM invokevirtual should support StringMethodsTest', async (t) => {
   t.plan(5);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: ['sources'] });
   
   let output = '';
   jvm.registerJreMethods({
@@ -15,7 +15,7 @@ test('JVM invokevirtual should support StringMethodsTest', async (t) => {
     },
   });
 
-  await jvm.run('sources/StringMethodsTest.class');
+  await jvm.run('StringMethodsTest');
   const lines = output.trim().split('\n');
   t.equal(lines[0], 'Hello World', 'Initial string should be correct');
   t.equal(lines[1], 'HELLO WORLD', 'toUpperCase should work');
@@ -27,7 +27,7 @@ test('JVM invokevirtual should support StringMethodsTest', async (t) => {
 test('JVM invokevirtual should support InvokeVirtualTest', async (t) => {
   t.plan(2);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: ['sources'] });
 
   let output = '';
   jvm.registerJreMethods({
@@ -38,7 +38,7 @@ test('JVM invokevirtual should support InvokeVirtualTest', async (t) => {
     },
   });
 
-  await jvm.run('sources/InvokeVirtualTest.class');
+  await jvm.run('InvokeVirtualTest');
   const testLines = output.trim().split('\n');
   t.equal(testLines[0], 'Hello World', 'Should print from Thing.print');
   t.equal(testLines[1], 'Test completed', 'Should print from main');

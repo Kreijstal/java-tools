@@ -5,7 +5,7 @@ const path = require('path');
 test('JVM should execute SimpleStringConcat', async (t) => {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: ['sources'] });
 
   let output = '';
   jvm.registerJreMethods({
@@ -16,14 +16,14 @@ test('JVM should execute SimpleStringConcat', async (t) => {
     },
   });
 
-  await jvm.run(path.join(__dirname, '..', 'sources', 'SimpleStringConcat.class'));
+  await jvm.run('SimpleStringConcat');
   t.equal(output.trim(), 'Hello World', 'SimpleStringConcat should work');
 });
 
 test('JVM should execute StringConcatMethod', async (t) => {
   t.plan(1);
 
-  const jvm = new JVM();
+  const jvm = new JVM({ classpath: ['sources'] });
 
   let output = '';
   jvm.registerJreMethods({
@@ -34,6 +34,6 @@ test('JVM should execute StringConcatMethod', async (t) => {
     },
   });
 
-  await jvm.run(path.join(__dirname, '..', 'sources', 'StringConcatMethod.class'));
+  await jvm.run('StringConcatMethod');
   t.equal(output.trim(), 'Hello World', 'StringConcatMethod should work');
 });
