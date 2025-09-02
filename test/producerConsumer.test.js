@@ -24,7 +24,7 @@ test('JVM should execute ProducerConsumer.class, demonstrate wait/notify, and no
   };
 
   const runTest = async () => {
-    const jvm = new JVM({ classpath: 'sources' });
+    const jvm = new JVM({ classpath: ['sources'] });
     const output = [];
     jvm.registerJreMethods({
       'java/io/PrintStream': {
@@ -35,7 +35,7 @@ test('JVM should execute ProducerConsumer.class, demonstrate wait/notify, and no
     });
 
     const startTime = Date.now();
-    await jvm.run('sources/ProducerConsumer.class');
+    await jvm.run('ProducerConsumer');
     const endTime = Date.now();
     const executionTime = endTime - startTime;
     return { executionTime, output };

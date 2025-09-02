@@ -55,6 +55,7 @@ async function runTest(className, expectedOutput, t, options = {}) {
 
   try {
     const jvm = new JVM({
+      classpath: 'sources',
       ...jvmOptions,
       jreOverrides: {
         "testing/MockOutputStream": {
@@ -144,13 +145,6 @@ async function runTest(className, expectedOutput, t, options = {}) {
       }
     }
 
-    const classFilePath = path.join(
-      __dirname,
-      "..",
-      "sources",
-      `${className}.class`,
-    );
-
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => {
@@ -160,7 +154,7 @@ async function runTest(className, expectedOutput, t, options = {}) {
 
     try {
       await Promise.race([
-        jvm.run(classFilePath),
+        jvm.run(className),
         timeoutPromise,
       ]);
     } finally {
