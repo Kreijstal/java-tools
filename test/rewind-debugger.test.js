@@ -4,8 +4,8 @@ const DebugController = require('../src/debugController');
 test('Debugger rewind', async t => {
   t.plan(4);
 
-  const controller = new DebugController({ rewindHistorySize: 10, classpath: 'sources' });
-  await controller.start('sources/SimpleArithmetic.class');
+  const controller = new DebugController({ rewindHistorySize: 10, classpath: ['sources'] });
+  await controller.start('SimpleArithmetic');
 
   // Step a few instructions
   await controller.stepInstruction();

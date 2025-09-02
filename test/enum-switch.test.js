@@ -15,10 +15,8 @@ tape('JVM should handle enum switch statements', async (t) => {
     }
   });
 
-  const classFilePath = path.join('sources', 'EnumSwitchCrash.class');
-  
   try {
-    await jvm.run(classFilePath);
+    await jvm.run('EnumSwitchCrash');
     t.equal(output.trim(), 'It is red', 'EnumSwitchCrash should print "It is red"');
   } catch (e) {
     t.fail(`EnumSwitchCrash should not crash: ${e.message}`);
@@ -26,10 +24,9 @@ tape('JVM should handle enum switch statements', async (t) => {
   
   // Test comprehensive enum switch
   output = '';
-  const testClassFilePath = path.join('sources', 'EnumSwitchTest.class');
   
   try {
-    await jvm.run(testClassFilePath);
+    await jvm.run('EnumSwitchTest');
     const lines = output.trim().split('\n');
     t.equal(lines[0], 'Testing RED: It is red', 'RED case should work');
     t.equal(lines[1], 'Testing GREEN: It is green', 'GREEN case should work');

@@ -5,8 +5,8 @@ const DebugController = require('../src/debugController');
 test('Thread-Aware Debugger - jvmStep', async (t) => {
   t.plan(6);
 
-  const controller = new DebugController();
-  await controller.start('sources/Main.class');
+  const controller = new DebugController({ classpath: ['sources'] });
+  await controller.start('Main');
 
   t.equal(controller.executionState, 'paused', 'Debugger should start in a paused state');
 
@@ -35,8 +35,8 @@ test('Thread-Aware Debugger - jvmStep', async (t) => {
 test('Thread-Aware Debugger - threadStep', async (t) => {
     t.plan(3);
 
-    const controller = new DebugController();
-    await controller.start('sources/Main.class');
+    const controller = new DebugController({ classpath: ['sources'] });
+    await controller.start('Main');
 
     // Step until after the new thread is created
     for (let i = 0; i < 20; i++) {
