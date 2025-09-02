@@ -1388,14 +1388,16 @@ function enhanceWithRealJVM() {
         return;
       }
 
-      log(`Starting debug session with class: ${classToStart}`, "info");
-      const result = await jvmDebug.start(classToStart);
+      // Strip .class extension if present since DebugController expects class name only
+      const className = classToStart.endsWith('.class') ? classToStart.replace('.class', '') : classToStart;
+      log(`Starting debug session with class: ${className}`, "info");
+      const result = await jvmDebug.start(className);
       updateDebugDisplay();
 
       // Update the current state to enable debug buttons
       updateState({
-        loadedClass: { name: classToStart },
-        className: classToStart.replace(".class", ""),
+        loadedClass: { name: className },
+        className: className,
         status: "paused",
       });
 
@@ -1407,7 +1409,7 @@ function enhanceWithRealJVM() {
       // Handle classes without main method by throwing an error
       if (error.message && error.message.includes("main method not found")) {
         const className = classToStart
-          ? classToStart.replace(".class", "")
+          ? (classToStart.endsWith('.class') ? classToStart.replace('.class', '') : classToStart)
           : "unknown";
         throw new Error(
           `Class ${className} doesn't have a main method and cannot be executed as a standalone program`,
