@@ -18,8 +18,8 @@ class BrowserJVMDebug {
     this.fileProvider = new BrowserFileProvider();
     setFileProvider(this.fileProvider);
     
-    // Create the real debug controller with rewind history enabled
-    this.debugController = new DebugController({ rewindHistorySize: 50 });
+    // Create the real debug controller with rewind history enabled and classpath set to root
+    this.debugController = new DebugController({ rewindHistorySize: 50, classpath: ['.'] });
     this.isReady = false;
   }
 
@@ -77,7 +77,7 @@ class BrowserJVMDebug {
 
   /**
    * Start debugging a class
-   * @param {string} classPath - Path to the class file (virtual path)
+   * @param {string} classPath - Path to the class file (virtual path) or class name
    * @param {object} options - Debug options
    * @returns {Promise<object>} - Debug session start result
    */
@@ -87,8 +87,11 @@ class BrowserJVMDebug {
     }
 
     try {
+      // Strip .class extension if present since DebugController expects class name only
+      const className = classPath.endsWith('.class') ? classPath.replace('.class', '') : classPath;
+      
       // Use the real debug controller to start debugging
-      const result = await this.debugController.start(classPath, options);
+      const result = await this.debugController.start(className, options);
       return result;
     } catch (error) {
       console.error('Failed to start debugging:', error);
