@@ -264,7 +264,20 @@ class DebugController {
   }
 
   getDisassemblyView() {
-    return this.jvm.getDisassemblyView();
+    try {
+      return this.jvm.getDisassemblyView();
+    } catch (error) {
+      /* HARDENED: Handle case where no class is loaded */
+      if (error.code === 'NO_THREAD') {
+        return {
+          formattedDisassembly: "",
+          lineToPcMap: {},
+          classFile: null,
+          currentPc: -1,
+        };
+      }
+      throw error;
+    }
   }
 
   async rewind(steps = 1) {
