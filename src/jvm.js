@@ -399,8 +399,8 @@ class JVM {
     const isApplet = this.isAppletClass(classData);
     
     if (!mainMethod && !isApplet) {
-      console.error("main method not found");
-      return;
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error("main method not found");
     }
 
     const mainThread = {
@@ -462,18 +462,10 @@ class JVM {
   async createAppletInstance(className) {
     // Ensure class is loaded
     await this.initializeClassIfNeeded(className, this.threads[0]);
-    
-    try {
-      this.loadClassByName(className);
-    } catch (e) {
-      if (e.code === 'ENOENT') {
-        throw {
-          type: 'java/lang/NoClassDefFoundError',
-          message: className,
-        };
-      }
-      throw e;
-    }
+    /* HARDENED: Rethrow with more context */
+    await this.loadClassByName(className).catch(err => {
+      throw new Error(`createAppletInstance failed: could not load class ${className}`, { cause: err });
+    });
 
     // Initialize fields properly like the 'new' instruction does
     const fields = {};
@@ -516,31 +508,27 @@ class JVM {
     
     // Add JavaScript toString method that calls Java toString
     objRef.toString = function() {
-      try {
-        // Try to find toString method in the class hierarchy
-        let currentType = this.type;
-        let toStringMethod = null;
-        
-        // First check if it's a JRE class
-        toStringMethod = this._jreFindMethod(currentType, 'toString', '()Ljava/lang/String;');
-        
-        // If not found, check parent classes
-        if (!toStringMethod) {
-          const classData = this.classes[currentType];
-          if (classData && classData.ast && classData.ast.classes[0].superClassName) {
-            const superClassName = classData.ast.classes[0].superClassName;
-            toStringMethod = this._jreFindMethod(superClassName, 'toString', '()Ljava/lang/String;');
-          }
+      // Try to find toString method in the class hierarchy
+      let currentType = this.type;
+      let toStringMethod = null;
+
+      // First check if it's a JRE class
+      toStringMethod = this._jreFindMethod(currentType, 'toString', '()Ljava/lang/String;');
+
+      // If not found, check parent classes
+      if (!toStringMethod) {
+        const classData = this.classes[currentType];
+        if (classData && classData.ast && classData.ast.classes[0].superClassName) {
+          const superClassName = classData.ast.classes[0].superClassName;
+          toStringMethod = this._jreFindMethod(superClassName, 'toString', '()Ljava/lang/String;');
         }
-        
-        if (toStringMethod) {
-          const result = toStringMethod(this, this, []);
-          return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
-        }
-        return this.type.split('/').pop();
-      } catch (e) {
-        return this.type.split('/').pop();
       }
+
+      if (toStringMethod) {
+        const result = toStringMethod(this, this, []);
+        return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
+      }
+      return this.type.split('/').pop();
     };
     
     return objRef;
@@ -580,15 +568,11 @@ class JVM {
 
       // If we found a canvas, create a proper graphics context
       if (canvas) {
-        try {
-          const ctx = canvas.getContext('2d');
-          if (ctx) {
-            // Import the AWT framework to create CanvasGraphics
-            const awtFramework = require('./awt.js');
-            awtGraphics = new awtFramework.CanvasGraphics(ctx);
-          }
-        } catch (error) {
-          // Silently handle canvas graphics creation failure
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          // Import the AWT framework to create CanvasGraphics
+          const awtFramework = require('./awt.js');
+          awtGraphics = new awtFramework.CanvasGraphics(ctx);
         }
       }
     }
@@ -1809,17 +1793,37 @@ class JVM {
     return { type: objRef.type, fields: objRef.fields || {} };
   }
 
-  stepInto() {}
-  stepOver() {}
-  stepOut() {}
-  stepInstruction() {}
-  finish() {}
-  continue() {}
+  stepInto() {
+    /* HARDENED: Implemented stub */
+    throw new Error("stepInto is not implemented");
+  }
+  stepOver() {
+    /* HARDENED: Implemented stub */
+    throw new Error("stepOver is not implemented");
+  }
+  stepOut() {
+    /* HARDENED: Implemented stub */
+    throw new Error("stepOut is not implemented");
+  }
+  stepInstruction() {
+    /* HARDENED: Implemented stub */
+    throw new Error("stepInstruction is not implemented");
+  }
+  finish() {
+    /* HARDENED: Implemented stub */
+    throw new Error("finish is not implemented");
+  }
+  continue() {
+    /* HARDENED: Implemented stub */
+    throw new Error("continue is not implemented");
+  }
   findVariableByName(name) {
-    return null;
+    /* HARDENED: Implemented stub */
+    throw new Error("findVariableByName is not implemented");
   }
   _getValueDescription(value) {
-    return "";
+    /* HARDENED: Implemented stub */
+    throw new Error("_getValueDescription is not implemented");
   }
   getSourceLineMapping(pc, method) {
     if (!method || !method.name) return {};
@@ -1908,48 +1912,34 @@ class JVM {
     };
   }
   getSourceFileName(method) {
-    return null;
+    /* HARDENED: Implemented stub */
+    throw new Error("getSourceFileName is not implemented");
   }
 
   getDisassemblyView() {
     const thread = this.threads[this.currentThreadIndex];
     if (!thread || thread.callStack.isEmpty()) {
-      return {
-        formattedDisassembly: "",
-        lineToPcMap: {},
-        classFile: null,
-        currentPc: -1,
-      };
+      const error = new Error("No thread or call stack");
+      error.code = 'NO_THREAD';
+      throw error;
     }
 
     const frame = thread.callStack.peek();
     if (!frame) {
-      return {
-        formattedDisassembly: "",
-        lineToPcMap: {},
-        classFile: null,
-        currentPc: -1,
-      };
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error("getDisassemblyView failed: no current frame");
     }
 
     const className = this.findClassNameForMethod(frame.method);
     if (!className) {
-      return {
-        formattedDisassembly: "// Could not find class for current method",
-        lineToPcMap: {},
-        classFile: null,
-        currentPc: -1,
-      };
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error("getDisassemblyView failed: could not find class for current method");
     }
 
     const workspaceEntry = this.classes[className];
     if (!workspaceEntry) {
-      return {
-        formattedDisassembly: "// Class data not available",
-        lineToPcMap: {},
-        classFile: className,
-        currentPc: -1,
-      };
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error(`getDisassemblyView failed: class data not available for ${className}`);
     }
 
     try {
@@ -2091,38 +2081,41 @@ class JVM {
   }
 
   _parseAnnotationValue(elementValue) {
-    if (!elementValue) return null;
+    if (!elementValue) {
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error("_parseAnnotationValue requires an elementValue");
+    }
 
     // Handle different annotation value types
     switch (elementValue.tag) {
       case "s": // String
-        return this.internString(elementValue.stringValue || "");
+        return this.internString(elementValue.stringValue);
       case "I": // Integer
-        return elementValue.intValue || 0;
+        return elementValue.intValue;
       case "Z": // Boolean
-        return elementValue.booleanValue || false;
+        return elementValue.booleanValue;
       case "J": // Long
-        return elementValue.longValue || 0;
+        return elementValue.longValue;
       case "F": // Float
-        return elementValue.floatValue || 0.0;
+        return elementValue.floatValue;
       case "D": // Double
-        return elementValue.doubleValue || 0.0;
+        return elementValue.doubleValue;
       case "c": // Class
         // TODO: Implement class literal support
-        return null;
+        throw new Error("_parseAnnotationValue: class literal support is not implemented");
       case "e": // Enum
         // TODO: Implement enum support
-        return null;
+        throw new Error("_parseAnnotationValue: enum support is not implemented");
       case "@": // Annotation
         return this.createAnnotationProxy(elementValue.annotationValue);
       case "[": // Array
         return (
-          elementValue.arrayValue?.map((val) =>
+          elementValue.arrayValue.map((val) =>
             this._parseAnnotationValue(val),
-          ) || []
+          )
         );
       default:
-        return null;
+        throw new Error(`_parseAnnotationValue: unhandled tag ${elementValue.tag}`);
     }
   }
 
