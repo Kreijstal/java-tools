@@ -300,4 +300,55 @@ module.exports = {
       throw e;
     }
   },
+    dreturn: (frame, instruction, jvm, thread) => {
+      if (thread.pendingException) {
+        delete thread.pendingException;
+      }
+      const returnValue = frame.stack.pop();
+      thread.callStack.pop();
+      if (thread.isAwaitingReflectiveCall) {
+        thread.reflectiveCallResolver(returnValue);
+        thread.isAwaitingReflectiveCall = false;
+      } else if (!thread.callStack.isEmpty()) {
+        thread.callStack.peek().stack.push(returnValue);
+      }
+    },
+    freturn: (frame, instruction, jvm, thread) => {
+      if (thread.pendingException) {
+        delete thread.pendingException;
+      }
+      const returnValue = frame.stack.pop();
+      thread.callStack.pop();
+      if (thread.isAwaitingReflectiveCall) {
+        thread.reflectiveCallResolver(returnValue);
+        thread.isAwaitingReflectiveCall = false;
+      } else if (!thread.callStack.isEmpty()) {
+        thread.callStack.peek().stack.push(returnValue);
+      }
+    },
+    lreturn: (frame, instruction, jvm, thread) => {
+      if (thread.pendingException) {
+        delete thread.pendingException;
+      }
+      const returnValue = frame.stack.pop();
+      thread.callStack.pop();
+      if (thread.isAwaitingReflectiveCall) {
+        thread.reflectiveCallResolver(returnValue);
+        thread.isAwaitingReflectiveCall = false;
+      } else if (!thread.callStack.isEmpty()) {
+        thread.callStack.peek().stack.push(returnValue);
+      }
+    },
+    goto_w: (frame, instruction) => {
+      const offset = parseInt(instruction.arg, 10); // 32-bit signed offset
+      frame.pc += offset;
+    },
+    jsr_w: (frame, instruction) => {
+      const offset = parseInt(instruction.arg, 10); // 32-bit signed offset
+      frame.stack.push(frame.pc);
+      frame.pc += offset;
+    },
+    nop: (frame) => {
+      // No operation
+    },
 };
