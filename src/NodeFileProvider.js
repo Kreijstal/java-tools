@@ -17,7 +17,11 @@ class NodeFileProvider extends FileProvider {
       await fs.access(filePath);
       return true;
     } catch (error) {
-      return false;
+      /* HARDENED: Distinguish between "not found" and other errors */
+      if (error.code === 'ENOENT') {
+        return false;
+      }
+      throw new Error(`NodeFileProvider.exists failed for path: ${filePath}`, { cause: error });
     }
   }
 

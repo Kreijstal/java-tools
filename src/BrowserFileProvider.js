@@ -44,7 +44,8 @@ class BrowserFileProvider extends FileProvider {
     try {
       const response = await fetch(url);
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        /* HARDENED: More specific error */
+        throw new Error(`Failed to fetch ${url}: ${response.status} ${response.statusText}`);
       }
       const arrayBuffer = await response.arrayBuffer();
       const content = new Uint8Array(arrayBuffer);
@@ -81,7 +82,7 @@ class BrowserFileProvider extends FileProvider {
           resolve(virtualPath);
         }
       };
-      reader.onerror = () => reject(new Error('Failed to read file'));
+      reader.onerror = (event) => reject(new Error(`Failed to read file ${file.name}: ${event.target.error}`));
       reader.readAsArrayBuffer(file);
     });
   }
@@ -154,7 +155,8 @@ class BrowserFileProvider extends FileProvider {
   async listFiles(dirPath = '') {
     const files = [];
     for (const path of this.virtualFS.keys()) {
-      if (!dirPath || path.startsWith(dirPath)) {
+      /* HARDENED: Removed defensive check */
+      if (path.startsWith(dirPath)) {
         files.push(path);
       }
     }
@@ -184,7 +186,11 @@ class BrowserFileProvider extends FileProvider {
    */
   getFileSize(filePath) {
     const content = this.virtualFS.get(filePath);
-    return content ? content.length : -1;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    if (content === undefined) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    return content.length;
   }
 
   /**

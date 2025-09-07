@@ -54,7 +54,10 @@ class DebugManager {
   }
 
   deserialize(state) {
-    if (!state) return;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    if (!state) {
+      throw new Error('DebugManager.deserialize requires a state object');
+    }
     this.debugMode = state.debugMode;
     this.steppingMode = state.steppingMode;
     this.selectedThreadId = state.selectedThreadId;

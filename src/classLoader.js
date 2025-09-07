@@ -10,6 +10,10 @@ let globalFileProvider = null;
  * @param {FileProvider} provider - FileProvider implementation
  */
 function setFileProvider(provider) {
+  /* HARDENED: Added check for provider */
+  if (!provider) {
+    throw new Error('setFileProvider requires a provider object');
+  }
   globalFileProvider = provider;
 }
 
@@ -38,12 +42,18 @@ function parseAnnotationsFromAst(ast) {
   
   // Helper function to resolve string from constant pool
   function resolveString(index) {
-    if (!index) return undefined;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    if (!index) {
+      throw new Error('resolveString requires an index');
+    }
     
     // For annotation element names, the index points directly to the UTF-8 entry
     // So we need to use 0-based indexing (no -1 adjustment)
     const entry = constantPool[index];
-    if (!entry) return undefined;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    if (!entry) {
+      throw new Error(`resolveString failed: constant pool entry not found at index ${index}`);
+    }
     
     // Handle UTF8 entries directly
     if (entry.tag === 1) {
@@ -53,22 +63,35 @@ function parseAnnotationsFromAst(ast) {
     // Handle NameAndType entries that point to UTF8
     if (entry.tag === 12) {
       const nameEntry = constantPool[entry.info.name_index];
-      return nameEntry?.info?.bytes;
+      /* HARDENED: Replaced defensive optional chaining with direct access */
+      return nameEntry.info.bytes;
     }
     
-    return undefined;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    throw new Error(`resolveString failed: unhandled constant pool entry type ${entry.tag}`);
   }
   
   // Helper function to resolve annotation element values
   function resolveAnnotationValue(tag, valueIndex) {
     // For annotation values, use 0-based indexing as well
     const entry = constantPool[valueIndex];
-    if (!entry) return undefined;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    if (!entry) {
+      throw new Error(`resolveAnnotationValue failed: constant pool entry not found at index ${valueIndex}`);
+    }
     
     if (tag === 115) { // 's' - String
-      return entry.tag === 1 ? entry.info.bytes : undefined;
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      if (entry.tag !== 1) {
+        throw new Error(`resolveAnnotationValue failed: expected string at index ${valueIndex}, but found tag ${entry.tag}`);
+      }
+      return entry.info.bytes;
     } else if (tag === 73) { // 'I' - Integer
-      return entry.tag === 3 ? entry.info.bytes : undefined;
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      if (entry.tag !== 3) {
+        throw new Error(`resolveAnnotationValue failed: expected integer at index ${valueIndex}, but found tag ${entry.tag}`);
+      }
+      return entry.info.bytes;
     }
     
     return entry.info;
@@ -79,13 +102,15 @@ function parseAnnotationsFromAst(ast) {
     // There seems to be an off-by-one issue with annotation type_index in jvm-parser
     // Try both the given index and index+1
     let entry = constantPool[index - 1];
-    if (entry && entry.tag === 1 && entry.info?.bytes?.startsWith('L') && entry.info?.bytes?.endsWith(';')) {
+    /* HARDENED: Replaced defensive optional chaining with direct access */
+    if (entry && entry.tag === 1 && entry.info.bytes.startsWith('L') && entry.info.bytes.endsWith(';')) {
       return entry.info.bytes.replace(/^L|;$/g, '');
     }
     
     // Try the next index
     entry = constantPool[index];
-    if (entry && entry.tag === 1 && entry.info?.bytes?.startsWith('L') && entry.info?.bytes?.endsWith(';')) {
+    /* HARDENED: Replaced defensive optional chaining with direct access */
+    if (entry && entry.tag === 1 && entry.info.bytes.startsWith('L') && entry.info.bytes.endsWith(';')) {
       return entry.info.bytes.replace(/^L|;$/g, '');
     }
     
@@ -95,8 +120,9 @@ function parseAnnotationsFromAst(ast) {
   // Parse class-level annotations from the new AST structure
   if (ast.ast.attributes) {
     ast.ast.attributes.forEach(attr => {
-      const attrName = attr.attribute_name_index?.name?.info?.bytes;
-      if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+      /* HARDENED: Replaced defensive optional chaining with direct access */
+      const attrName = attr.attribute_name_index.name.info.bytes;
+      if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
         result.classAnnotations = attr.info.annotations.map(annotation => {
           const typeName = resolveAnnotationType(annotation.type_index);
           const elements = {};
@@ -107,7 +133,16 @@ function parseAnnotationsFromAst(ast) {
 
               // Parse element value based on tag
               const tag = pair.value.tag;
-              const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+              let elementValue;
+              if (tag === 101) { // 'e' - Enum
+                elementValue = {
+                  type: 'enum',
+                  typeName: resolveString(pair.value.value.type_name_index),
+                  constName: resolveString(pair.value.value.const_name_index),
+                };
+              } else {
+                elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+              }
 
               if (elementName && elementValue !== undefined) {
                 elements[elementName] = elementValue;
@@ -127,8 +162,9 @@ function parseAnnotationsFromAst(ast) {
   // Parse class-level annotations from the new AST structure
   if (ast.ast.attributes) {
     ast.ast.attributes.forEach(attr => {
-      const attrName = attr.attribute_name_index?.name?.info?.bytes;
-      if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+      /* HARDENED: Replaced defensive optional chaining with direct access */
+      const attrName = attr.attribute_name_index.name.info.bytes;
+      if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
         result.classAnnotations = attr.info.annotations.map(annotation => {
           const typeName = resolveAnnotationType(annotation.type_index);
           const elements = {};
@@ -139,7 +175,16 @@ function parseAnnotationsFromAst(ast) {
 
               // Parse element value based on tag
               const tag = pair.value.tag;
-              const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+              let elementValue;
+              if (tag === 101) { // 'e' - Enum
+                elementValue = {
+                  type: 'enum',
+                  typeName: resolveString(pair.value.value.type_name_index),
+                  constName: resolveString(pair.value.value.const_name_index),
+                };
+              } else {
+                elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+              }
 
               if (elementName && elementValue !== undefined) {
                 elements[elementName] = elementValue;
@@ -163,8 +208,9 @@ function parseAnnotationsFromAst(ast) {
       
       if (field.attributes) {
         field.attributes.forEach(attr => {
-          const attrName = attr.attribute_name_index?.name?.info?.bytes;
-          if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+          /* HARDENED: Replaced defensive optional chaining with direct access */
+          const attrName = attr.attribute_name_index.name.info.bytes;
+          if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
             result.fieldAnnotations[fieldName] = attr.info.annotations.map(annotation => {
               const typeName = resolveAnnotationType(annotation.type_index);
               const elements = {};
@@ -175,7 +221,16 @@ function parseAnnotationsFromAst(ast) {
                   
                   // Parse element value based on tag
                   const tag = pair.value.tag;
-                  const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+                  let elementValue;
+                  if (tag === 101) { // 'e' - Enum
+                    elementValue = {
+                      type: 'enum',
+                      typeName: resolveString(pair.value.value.type_name_index),
+                      constName: resolveString(pair.value.value.const_name_index),
+                    };
+                  } else {
+                    elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+                  }
                   
                   if (elementName && elementValue !== undefined) {
                     elements[elementName] = elementValue;
@@ -201,8 +256,9 @@ function parseAnnotationsFromAst(ast) {
       
       if (method.attributes) {
         method.attributes.forEach(attr => {
-          const attrName = attr.attribute_name_index?.name?.info?.bytes;
-          if (attrName === 'RuntimeVisibleAnnotations' && attr.info?.annotations) {
+          /* HARDENED: Replaced defensive optional chaining with direct access */
+          const attrName = attr.attribute_name_index.name.info.bytes;
+          if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
             result.methodAnnotations[methodName] = attr.info.annotations.map(annotation => {
               const typeName = resolveAnnotationType(annotation.type_index);
               const elements = {};
@@ -212,7 +268,16 @@ function parseAnnotationsFromAst(ast) {
                   const elementName = resolveString(pair.element_name_index);
                   
                   const tag = pair.value.tag;
-                  const elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+                  let elementValue;
+                  if (tag === 101) { // 'e' - Enum
+                    elementValue = {
+                      type: 'enum',
+                      typeName: resolveString(pair.value.value.type_name_index),
+                      constName: resolveString(pair.value.value.const_name_index),
+                    };
+                  } else {
+                    elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
+                  }
                   
                   if (elementName && elementValue !== undefined) {
                     elements[elementName] = elementValue;
@@ -242,30 +307,28 @@ function enhanceAstWithAnnotations(convertedAst, annotations) {
   convertedAst.annotations = annotations.classAnnotations;
   
   // Add field annotations - handle both old and new AST structures
-  if (convertedAst.classes && convertedAst.classes[0] && convertedAst.classes[0].items) {
-    // Old structure: classes[0].items[]
-    convertedAst.classes[0].items.forEach(item => {
-      if (item.type === 'field' && item.field) {
-        const fieldName = item.field.name;
-        if (annotations.fieldAnnotations[fieldName]) {
-          item.field.annotations = annotations.fieldAnnotations[fieldName];
-        }
+  /* HARDENED: Removed defensive check */
+  // Old structure: classes[0].items[]
+  convertedAst.classes[0].items.forEach(item => {
+    if (item.type === 'field' && item.field) {
+      const fieldName = item.field.name;
+      if (annotations.fieldAnnotations[fieldName]) {
+        item.field.annotations = annotations.fieldAnnotations[fieldName];
       }
-    });
-  }
+    }
+  });
   
   // Add method annotations - handle both old and new AST structures
-  if (convertedAst.classes && convertedAst.classes[0] && convertedAst.classes[0].items) {
-    // Old structure: classes[0].items[]
-    convertedAst.classes[0].items.forEach(item => {
-      if (item.type === 'method' && item.method) {
-        const methodName = item.method.name;
-        if (annotations.methodAnnotations[methodName]) {
-          item.method.annotations = annotations.methodAnnotations[methodName];
-        }
+  /* HARDENED: Removed defensive check */
+  // Old structure: classes[0].items[]
+  convertedAst.classes[0].items.forEach(item => {
+    if (item.type === 'method' && item.method) {
+      const methodName = item.method.name;
+      if (annotations.methodAnnotations[methodName]) {
+        item.method.annotations = annotations.methodAnnotations[methodName];
       }
-    });
-  }
+    }
+  });
 }
 
 async function loadClass(className, classPath) {
@@ -299,16 +362,16 @@ async function loadClass(className, classPath) {
     }
   }
 
-  console.error(`Class file not found for class: ${className}`);
-  return null;
+  /* HARDENED: Replaced quiet failure with an explicit error */
+  throw new Error(`Class file not found for class: ${className}`);
 }
 
 async function loadClassByPath(classFilePath, options = {}) {
   const fileProvider = getFileProvider();
 
   if (!(await fileProvider.exists(classFilePath))) {
-    console.error(`Class file not found: ${classFilePath}`);
-    return null;
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    throw new Error(`Class file not found: ${classFilePath}`);
   }
 
   // Read the class file content
@@ -335,10 +398,11 @@ function loadClassByPathSync(classFilePath, options = {}) {
   const fileProvider = getFileProvider();
   
   // For Node.js FileProvider, use sync methods
+  /* HARDENED: Removed defensive check */
   if (fileProvider.existsSync && fileProvider.readFileSync) {
     if (!fileProvider.existsSync(classFilePath)) {
-      console.error(`Class file not found: ${classFilePath}`);
-      return null;
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error(`Class file not found: ${classFilePath}`);
     }
 
     // Read the class file content
