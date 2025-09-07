@@ -20,4 +20,56 @@ module.exports = {
     frame.stack.pop();
     frame.stack.pop();
   },
+    swap: (frame) => {
+      const value2 = frame.stack.pop();
+      const value1 = frame.stack.pop();
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+    },
+    dup_x1: (frame) => {
+      const value1 = frame.stack.pop(); // top
+      const value2 = frame.stack.pop(); // second
+      frame.stack.push(value1);
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+    },
+    dup_x2: (frame) => {
+      const value1 = frame.stack.pop(); // top
+      const value2 = frame.stack.pop(); // second
+      const value3 = frame.stack.pop(); // third
+      frame.stack.push(value1);
+      frame.stack.push(value3);
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+    },
+    dup2: (frame) => {
+      const value1 = frame.stack.pop(); // top
+      const value2 = frame.stack.pop(); // second
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+    },
+    dup2_x1: (frame) => {
+      const value1 = frame.stack.pop(); // top
+      const value2 = frame.stack.pop(); // second
+      const value3 = frame.stack.pop(); // third
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+      frame.stack.push(value3);
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+    },
+    dup2_x2: (frame) => {
+      const value1 = frame.stack.pop(); // top
+      const value2 = frame.stack.pop(); // second
+      const value3 = frame.stack.pop(); // third
+      const value4 = frame.stack.pop(); // fourth
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+      frame.stack.push(value4);
+      frame.stack.push(value3);
+      frame.stack.push(value2);
+      frame.stack.push(value1);
+    },
 };
