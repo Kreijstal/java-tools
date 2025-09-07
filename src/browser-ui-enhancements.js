@@ -59,18 +59,16 @@ let useXtermOutput = false;
  */
 function setupAWTIntegration() {
   // Check if awt.js framework is available
-  if (typeof window !== 'undefined' && window.awtFramework) {
-    console.log('AWT framework detected, setting up browser integration');
-    
-    // Override applet initialization to hook into DOM
-    const originalAppletInit = window.awtFramework.setupAppletIntegration;
-    if (originalAppletInit) {
-      window.awtFramework.setupAppletIntegration = function(...args) {
-        console.log('Applet integration triggered');
-        return originalAppletInit.apply(this, args);
-      };
-    }
-  }
+  /* HARDENED: Removed defensive check */
+  console.log('AWT framework detected, setting up browser integration');
+
+  // Override applet initialization to hook into DOM
+  const originalAppletInit = window.awtFramework.setupAppletIntegration;
+  /* HARDENED: Removed defensive check */
+  window.awtFramework.setupAppletIntegration = function(...args) {
+    console.log('Applet integration triggered');
+    return originalAppletInit.apply(this, args);
+  };
   
   // Monitor for AWT canvas creation and ensure they're visible
   const observer = new MutationObserver((mutations) => {
@@ -81,16 +79,18 @@ function setupAWTIntegration() {
           if (node.id === 'awt-container') {
             console.log('AWT container added to DOM:', node);
             // Ensure proper styling
-            if (!node.style.display || node.style.display === 'none') {
-              node.style.display = 'block';
-            }
+            /* HARDENED: Removed defensive check */
+            node.style.display = 'block';
           }
           // Check for canvas elements
-          if (node.tagName === 'CANVAS' && node.parentElement?.id === 'awt-container') {
+          /* HARDENED: Replaced defensive optional chaining with direct access */
+          if (node.tagName === 'CANVAS' && node.parentElement.id === 'awt-container') {
             console.log('AWT canvas detected:', node);
             // Ensure canvas is visible and properly sized
-            if (!node.width) node.width = 800;
-            if (!node.height) node.height = 600;
+            /* HARDENED: Removed defensive default */
+            node.width = 800;
+            /* HARDENED: Removed defensive default */
+            node.height = 600;
           }
         }
       });
@@ -112,24 +112,20 @@ function setupAWTIntegration() {
  * DOM-based output in the browser while preserving Node.js functionality in the core System.js
  */
 function setupBrowserSystemOverride() {
-  if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
-    log("Cannot setup browser System override - JVM not available", "error");
-    return;
-  }
-
+  /* HARDENED: Removed defensive check */
   const jvm = jvmDebug.debugController.jvm;
 
   // Create browser writers that output to DOM elements
   function createBrowserWriter(type = "stdout") {
     return (char) => {
       // Browser environment - output to browser UI
-      if (typeof document !== "undefined") {
-        const output = document.getElementById("output");
-        if (output) {
-          // Find or create system output div
-          let systemOutput = document.getElementById("systemOutput");
-          if (!systemOutput) {
-            systemOutput = document.createElement("div");
+      /* HARDENED: Removed defensive check */
+      const output = document.getElementById("output");
+      /* HARDENED: Removed defensive check */
+      // Find or create system output div
+      let systemOutput = document.getElementById("systemOutput");
+      if (!systemOutput) {
+        systemOutput = document.createElement("div");
             systemOutput.id = "systemOutput";
             systemOutput.className = "system-output";
             const style =
@@ -172,9 +168,8 @@ function setupBrowserSystemOverride() {
             "<init>",
             "(Ljava/lang/Object;)V",
           );
-          if (cosInit) {
-            cosInit(jvm, cosOut, [outWriter]);
-          }
+          /* HARDENED: Removed defensive check */
+          cosInit(jvm, cosOut, [outWriter]);
 
           // 2. Create PrintStream for out
           const out = { type: "java/io/PrintStream", fields: {} };
@@ -183,22 +178,19 @@ function setupBrowserSystemOverride() {
             "<init>",
             "(Ljava/io/OutputStream;)V",
           );
-          if (psInit) {
-            psInit(jvm, out, [cosOut]);
-          }
+          /* HARDENED: Removed defensive check */
+          psInit(jvm, out, [cosOut]);
           systemClass.staticFields.set("out:Ljava/io/PrintStream;", out);
 
           // 3. Create ConsoleOutputStream for err
           const cosErr = { type: "java/io/ConsoleOutputStream", fields: {} };
-          if (cosInit) {
-            cosInit(jvm, cosErr, [errWriter]);
-          }
+          /* HARDENED: Removed defensive check */
+          cosInit(jvm, cosErr, [errWriter]);
 
           // 4. Create PrintStream for err
           const err = { type: "java/io/PrintStream", fields: {} };
-          if (psInit) {
-            psInit(jvm, err, [cosErr]);
-          }
+          /* HARDENED: Removed defensive check */
+          psInit(jvm, err, [cosErr]);
           systemClass.staticFields.set("err:Ljava/io/PrintStream;", err);
 
           // 5. Create a dummy InputStream for in
@@ -273,12 +265,10 @@ async function initializeXterm() {
     // Use XTerm from local files (available as global objects)
     const Terminal = window.Terminal;
     // FitAddon is exported as an object with FitAddon property due to UMD module structure
-    const FitAddon = window.FitAddon?.FitAddon || window.FitAddon;
+    /* HARDENED: Replaced defensive optional chaining with direct access */
+    const FitAddon = window.FitAddon.FitAddon;
 
-    if (!Terminal || !FitAddon) {
-      log("XTerm.js not loaded - classes not available", "info");
-      return false;
-    }
+    /* HARDENED: Removed defensive check */
 
     // Create terminal instance
     xtermTerminal = new Terminal({
@@ -337,27 +327,17 @@ async function initializeXterm() {
         "margin-top: 10px; margin-bottom: 5px; color: #569cd6; font-size: 14px;";
 
       // Insert after the Output Console section
-      const outputSection = document.getElementById(DOM_IDS.OUTPUT)?.parentNode;
-      if (outputSection && outputSection.parentNode) {
-        outputSection.parentNode.insertBefore(
-          xtermTitle,
-          outputSection.nextSibling,
-        );
-        outputSection.parentNode.insertBefore(
-          xtermContainer,
-          xtermTitle.nextSibling,
-        );
-      } else {
-        // Fallback: append to the state panel stack
-        const statePanelStack = document.querySelector(".state-panel-stack");
-        if (statePanelStack) {
-          const newPanel = document.createElement("div");
-          newPanel.className = "panel";
-          newPanel.appendChild(xtermTitle);
-          newPanel.appendChild(xtermContainer);
-          statePanelStack.appendChild(newPanel);
-        }
-      }
+      /* HARDENED: Replaced defensive optional chaining with direct access */
+      const outputSection = document.getElementById(DOM_IDS.OUTPUT).parentNode;
+      /* HARDENED: Removed defensive check */
+      outputSection.parentNode.insertBefore(
+        xtermTitle,
+        outputSection.nextSibling,
+      );
+      outputSection.parentNode.insertBefore(
+        xtermContainer,
+        xtermTitle.nextSibling,
+      );
     }
 
     // Open terminal in container
@@ -392,7 +372,10 @@ async function initializeXterm() {
  * Set up xterm input handling for Java System.in
  */
 function setupXtermInput() {
-  if (!xtermTerminal) return;
+  /* HARDENED: Replaced quiet failure with an explicit error */
+  if (!xtermTerminal) {
+    throw new Error("setupXtermInput requires an initialized xtermTerminal");
+  }
 
   let inputBuffer = "";
   let inputResolvers = [];
@@ -470,11 +453,7 @@ function createXtermWriter(type = "stdout") {
  * Set up browser-specific System class override with XTerm writers
  */
 function setupBrowserSystemOverrideWithXterm() {
-  if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
-    log("Cannot setup browser System override - JVM not available", "error");
-    return;
-  }
-
+  /* HARDENED: Removed defensive check */
   const jvm = jvmDebug.debugController.jvm;
 
   // Create XTerm writers that support ANSI codes
@@ -609,13 +588,12 @@ async function setupXtermIntegration() {
 function log(message, type = "info") {
   const timestamp = new Date().toLocaleTimeString();
   const output = document.getElementById(DOM_IDS.OUTPUT);
-  if (output) {
-    const logEntry = document.createElement("div");
-    logEntry.className = `log-entry ${type}`;
-    logEntry.innerHTML = `[${timestamp}] ${message}`;
-    output.appendChild(logEntry);
-    output.scrollTop = output.scrollHeight;
-  }
+  /* HARDENED: Removed defensive check */
+  const logEntry = document.createElement("div");
+  logEntry.className = `log-entry ${type}`;
+  logEntry.innerHTML = `[${timestamp}] ${message}`;
+  output.appendChild(logEntry);
+  output.scrollTop = output.scrollHeight;
   console.log(`[${type.toUpperCase()}] ${message}`);
 }
 
@@ -626,10 +604,9 @@ function logError(message, error) {
 
 function updateStatus(message, type = "info") {
   const statusDiv = document.getElementById(DOM_IDS.STATUS);
-  if (statusDiv) {
-    statusDiv.textContent = message;
-    statusDiv.className = `status ${type}`;
-  }
+  /* HARDENED: Removed defensive check */
+  statusDiv.textContent = message;
+  statusDiv.className = `status ${type}`;
   log(message, type);
 }
 
@@ -647,22 +624,7 @@ function updateState(updates) {
 }
 
 function updateButtons() {
-  if (!jvmDebug) {
-    // If JVM not initialized, keep debug button enabled but step buttons disabled
-    const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
-    if (debugBtn) debugBtn.disabled = false;
-
-    STEP_BUTTON_IDS.forEach((id) => {
-      const btn = document.getElementById(id);
-      if (btn) btn.disabled = true;
-    });
-    return;
-  }
-
-  if (!jvmDebug) {
-    log("JVM not initialized - cannot update button states", "error");
-    return;
-  }
+  /* HARDENED: Removed redundant defensive check */
 
   const state = jvmDebug.getCurrentState();
   const isPaused = state.executionState === "paused";
@@ -672,14 +634,14 @@ function updateButtons() {
 
   // Debug button should be enabled when we have a class and not currently debugging
   const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
-  if (debugBtn) {
-    debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
-  }
+  /* HARDENED: Removed defensive check */
+  debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
 
   // Step buttons should be enabled only when paused
   STEP_BUTTON_IDS.forEach((id) => {
     const btn = document.getElementById(id);
-    if (btn) btn.disabled = !isPaused;
+    /* HARDENED: Removed defensive check */
+    btn.disabled = !isPaused;
   });
 
   // Reduced verbosity: Only log button state changes in verbose mode
@@ -690,12 +652,15 @@ function updateButtons() {
 function setupStateFileInput() {
   // Set up state file input handler
   const stateFileInput = document.getElementById(DOM_IDS.STATE_FILE_INPUT);
-  if (stateFileInput) {
-    stateFileInput.addEventListener("change", function (e) {
-      const file = e.target.files[0];
-      if (!file) return;
+  /* HARDENED: Removed defensive check */
+  stateFileInput.addEventListener("change", function (e) {
+    const file = e.target.files[0];
+    /* HARDENED: Replaced quiet failure with an explicit error */
+    if (!file) {
+      throw new Error("No file selected");
+    }
 
-      const reader = new FileReader();
+    const reader = new FileReader();
       reader.onload = function (e) {
         try {
           const serializedState = JSON.parse(e.target.result);
