@@ -126,25 +126,23 @@ function setupBrowserSystemOverride() {
       let systemOutput = document.getElementById("systemOutput");
       if (!systemOutput) {
         systemOutput = document.createElement("div");
-            systemOutput.id = "systemOutput";
-            systemOutput.className = "system-output";
-            const style =
-              type === "stderr"
-                ? "background: #2d3748; color: #f56565; padding: 8px; margin: 4px 0; border-left: 4px solid #f56565; font-family: monospace; white-space: pre-wrap;"
-                : "background: #2d3748; color: #68d391; padding: 8px; margin: 4px 0; border-left: 4px solid #68d391; font-family: monospace; white-space: pre-wrap;";
-            systemOutput.style.cssText = style;
-            output.appendChild(systemOutput);
-          }
+        systemOutput.id = "systemOutput";
+        systemOutput.className = "system-output";
+        const style =
+          type === "stderr"
+            ? "background: #2d3748; color: #f56565; padding: 8px; margin: 4px 0; border-left: 4px solid #f56565; font-family: monospace; white-space: pre-wrap;"
+            : "background: #2d3748; color: #68d391; padding: 8px; margin: 4px 0; border-left: 4px solid #68d391; font-family: monospace; white-space: pre-wrap;";
+        systemOutput.style.cssText = style;
+        output.appendChild(systemOutput);
+      }
 
-          // Append character to system output
-          systemOutput.textContent += char;
-          output.scrollTop = output.scrollHeight;
-        }
+      // Append character to system output
+      systemOutput.textContent += char;
+      output.scrollTop = output.scrollHeight;
 
-        // Also log to browser console for debugging
-        if (typeof console !== "undefined" && console.log && char === "\n") {
-          console.log(`[JVM System.${type === "stderr" ? "err" : "out"}]`);
-        }
+      // Also log to browser console for debugging
+      if (typeof console !== "undefined" && console.log && char === "\n") {
+        console.log(`[JVM System.${type === "stderr" ? "err" : "out"}]`);
       }
     };
   }
@@ -661,34 +659,33 @@ function setupStateFileInput() {
     }
 
     const reader = new FileReader();
-      reader.onload = function (e) {
-        try {
-          const serializedState = JSON.parse(e.target.result);
+    reader.onload = function (e) {
+      try {
+        const serializedState = JSON.parse(e.target.result);
 
-          // Try to restore using the real JVM
-          if (jvmDebug && typeof jvmDebug.deserialize === "function") {
-            jvmDebug.deserialize(serializedState);
-            updateDebugDisplay();
-            updateStatus("State restored successfully", "success");
-            log("JVM state restored successfully", "success");
+        // Try to restore using the real JVM
+        if (jvmDebug && typeof jvmDebug.deserialize === "function") {
+          jvmDebug.deserialize(serializedState);
+          updateDebugDisplay();
+          updateStatus("State restored successfully", "success");
+          log("JVM state restored successfully", "success");
 
-            if (serializedState.loadedClass) {
-              log(
-                `Restored class: ${serializedState.loadedClass.name}`,
-                "success",
-              );
-            }
-          } else {
-            throw new Error("JVM not initialized - cannot restore state");
+          if (serializedState.loadedClass) {
+            log(
+              `Restored class: ${serializedState.loadedClass.name}`,
+              "success",
+            );
           }
-        } catch (error) {
-          logError("Failed to restore state", error);
-          updateStatus("Failed to restore state", "error");
+        } else {
+          throw new Error("JVM not initialized - cannot restore state");
         }
-      };
-      reader.readAsText(file);
-    });
-  }
+      } catch (error) {
+        logError("Failed to restore state", error);
+        updateStatus("Failed to restore state", "error");
+      }
+    };
+    reader.readAsText(file);
+  });
 }
 
 async function initializeJVM() {
