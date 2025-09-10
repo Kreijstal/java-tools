@@ -390,6 +390,10 @@ class JVM {
       this.classpath = Array.isArray(options.classpath) ? options.classpath : [options.classpath];
     }
 
+    // Clear existing threads when starting a new program execution
+    this.threads = [];
+    this.currentThreadIndex = 0;
+
     const classData = await this.loadClassByName(mainClassName);
     if (!classData || !classData.ast) {
       throw new Error(`Class not found: ${mainClassName}`);
