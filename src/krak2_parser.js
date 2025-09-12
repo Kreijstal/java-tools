@@ -319,7 +319,8 @@ const Lang = P.createLanguage({
       P.alt(
         P.regexp(/[+-]Infinity/),
         P.regexp(/[+-]NaN(?:<0x[0-9a-fA-F]{16}>)?/),
-        P.regexp(/[+-]?\d*\.?\d+(?:[eE][+-]?\d+)?/),
+        P.regexp(/[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?/),
+        P.regexp(/[+-]?\d+[eE][+-]?\d+/),
         P.regexp(/[+-]?0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?(?:p[+-]?\d+)/)
       ).desc("DOUBLE_LITERAL"),
     LONG_LITERAL: () =>

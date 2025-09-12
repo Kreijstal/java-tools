@@ -12,31 +12,25 @@ function convertCodeItem(item) {
           // Leave as string if parsing fails
         }
       } else if (argStr.endsWith('f')) {
-        try {
-          const value = parseFloat(argStr);
+        const floatVal = parseFloat(argStr);
+        if (!isNaN(floatVal)) {
           item.instruction.arg = {
-            value: value,
+            value: floatVal,
             type: 'Float'
           };
-        } catch (e) {
-          // Leave as string if parsing fails
         }
       } else if (argStr.includes('e') || argStr.includes('E') || argStr.includes('.')) {
-        try {
-          const value = parseFloat(argStr);
+        const doubleVal = parseFloat(argStr);
+        if (!isNaN(doubleVal)) {
           item.instruction.arg = {
-            value: value,
+            value: doubleVal,
             type: 'Double'
           };
-        } catch (e) {
-          // Leave as string if parsing fails
         }
       } else {
-        try {
-          // Try to parse as integer for cases like "10"
-          item.instruction.arg = parseInt(argStr, 10);
-        } catch (e) {
-          // Leave as string if parsing fails
+        const numVal = Number(argStr);
+        if (Number.isInteger(numVal)) {
+          item.instruction.arg = numVal;
         }
       }
     }
