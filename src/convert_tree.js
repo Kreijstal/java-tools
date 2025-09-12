@@ -184,7 +184,20 @@ function formatConst(entry, index, constantPool, cls) {
         constantPool,
       ).value;
 
-      line += ` InvokeDynamic ${formatInstructionArg(bsm.method_ref.value.reference.nameAndType.name)} ${bsm.arguments.map((a) => formatInstructionArg(a.value)).join(" ")} : ${nameAndType.name} ${nameAndType.descriptor}`;
+      // Format the bootstrap method handle
+      const bsmMethodHandle = bsm.method_ref.value;
+      const bsmRefConst = bsmMethodHandle.reference;
+      const methodHandlePart = `${bsmMethodHandle.kind} Method ${bsmRefConst.className.replace(/\./g, "/")} ${bsmRefConst.nameAndType.name} ${bsmRefConst.nameAndType.descriptor}`;
+      
+      // Format the arguments with proper type prefixes
+      const formattedArgs = bsm.arguments.map((a) => {
+        if (typeof a.value === "string") {
+          return `String ${formatInstructionArg(a.value)}`;
+        }
+        return formatInstructionArg(a.value);
+      }).join(" ");
+
+      line += ` InvokeDynamic ${methodHandlePart} ${formattedArgs} : ${nameAndType.name} ${nameAndType.descriptor}`;
       break;
     case 15: // MethodHandle
       const methodHandle = resolveConstant(index, constantPool).value;
@@ -855,6 +868,11 @@ function formatInstruction(instr, withComments = false) {
  */
 function formatInstructionArg(arg) {
   if (typeof arg === "string") {
+    // Check if the string contains special characters that would break Krakatau assembly syntax
+    // In particular, colons (:) are used as separators in InvokeDynamic constant definitions
+    if (arg.includes(':') || arg.includes(' ') || arg.includes('\t') || arg.includes('\n') || arg.includes('\r') || arg.includes('"') || arg.includes('\\')) {
+      return formatStringConstant(arg);
+    }
     return arg;
   } else if (Array.isArray(arg)) {
     // Recursively format each item and join with spaces
