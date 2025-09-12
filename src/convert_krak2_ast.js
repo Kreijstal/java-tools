@@ -2,12 +2,36 @@ function convertCodeItem(item) {
   if (!item) return null;
 
   if (item.instruction && (item.instruction.op === 'ldc' || item.instruction.op === 'ldc_w' || item.instruction.op === 'ldc2_w')) {
-    if (typeof item.instruction.arg === 'string' && item.instruction.arg.startsWith('"') && item.instruction.arg.endsWith('"')) {
-      try {
-        // Use JSON.parse to handle escapes correctly
-        item.instruction.arg = JSON.parse(item.instruction.arg);
-      } catch (e) {
-        // If parsing fails, leave it as is.
+    const argStr = item.instruction.arg;
+    if (typeof argStr === 'string') {
+      // Check for string literals
+      if (argStr.startsWith('"') && argStr.endsWith('"')) {
+        try {
+          item.instruction.arg = JSON.parse(argStr);
+        } catch (e) {
+          // Leave as string if parsing fails
+        }
+      } else if (argStr.endsWith('f')) {
+        try {
+          item.instruction.arg = parseFloat(argStr);
+          item.instruction.type = 'Float';
+        } catch (e) {
+          // Leave as string if parsing fails
+        }
+      } else if (argStr.includes('e') || argStr.includes('E') || argStr.includes('.')) {
+        try {
+          item.instruction.arg = parseFloat(argStr);
+          item.instruction.type = 'Double';
+        } catch (e) {
+          // Leave as string if parsing fails
+        }
+      } else {
+        try {
+          // Try to parse as integer for cases like "10"
+          item.instruction.arg = parseInt(argStr, 10);
+        } catch (e) {
+          // Leave as string if parsing fails
+        }
       }
     }
   }
