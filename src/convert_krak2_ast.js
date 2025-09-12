@@ -2,12 +2,36 @@ function convertCodeItem(item) {
   if (!item) return null;
 
   if (item.instruction && (item.instruction.op === 'ldc' || item.instruction.op === 'ldc_w' || item.instruction.op === 'ldc2_w')) {
-    if (typeof item.instruction.arg === 'string' && item.instruction.arg.startsWith('"') && item.instruction.arg.endsWith('"')) {
-      try {
-        // Use JSON.parse to handle escapes correctly
-        item.instruction.arg = JSON.parse(item.instruction.arg);
-      } catch (e) {
-        // If parsing fails, leave it as is.
+    const argStr = item.instruction.arg;
+    if (typeof argStr === 'string') {
+      // Check for string literals
+      if (argStr.startsWith('"') && argStr.endsWith('"')) {
+        try {
+          item.instruction.arg = JSON.parse(argStr);
+        } catch (e) {
+          // Leave as string if parsing fails
+        }
+      } else if (argStr.endsWith('f')) {
+        const floatVal = parseFloat(argStr);
+        if (!isNaN(floatVal)) {
+          item.instruction.arg = {
+            value: floatVal,
+            type: 'Float'
+          };
+        }
+      } else if (argStr.includes('e') || argStr.includes('E') || argStr.includes('.')) {
+        const doubleVal = parseFloat(argStr);
+        if (!isNaN(doubleVal)) {
+          item.instruction.arg = {
+            value: doubleVal,
+            type: 'Double'
+          };
+        }
+      } else {
+        const numVal = Number(argStr);
+        if (Number.isInteger(numVal)) {
+          item.instruction.arg = numVal;
+        }
       }
     }
   }
