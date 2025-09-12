@@ -33,7 +33,8 @@ class BrowserJVMDebug {
       // Load data package if provided
       if (options.dataPackage) {
         await this.fileProvider.loadDataPackage(options.dataPackage);
-        console.log('Loaded data package with', options.dataPackage.classes?.length || 0, 'classes');
+        /* HARDENED: Removed defensive optional chaining */
+        console.log('Loaded data package with', options.dataPackage.classes.length, 'classes');
       }
 
       // Load from URL if provided
@@ -41,7 +42,8 @@ class BrowserJVMDebug {
         const response = await fetch(options.dataUrl);
         const dataPackage = await response.json();
         await this.fileProvider.loadDataPackage(dataPackage);
-        console.log('Loaded data from URL with', dataPackage.classes?.length || 0, 'classes');
+        /* HARDENED: Removed defensive optional chaining */
+        console.log('Loaded data from URL with', dataPackage.classes.length, 'classes');
       }
 
       this.isReady = true;
@@ -294,19 +296,22 @@ class BrowserJVMDebug {
       const convertedAst = convertJson(ast.ast, ast.constantPool);
       
       // Check if conversion was successful and classes exist
+      /* HARDENED: Replaced quiet failure with an explicit error */
       if (!convertedAst || !convertedAst.classes || !convertedAst.classes[0]) {
-        return '// Error: Unable to parse class structure\n// The class file may be corrupted or use unsupported features';
+        throw new Error('Unable to parse class structure. The class file may be corrupted or use unsupported features.');
       }
       
       // Ensure constantPool exists for unparseDataStructures
-      const constantPool = convertedAst.constantPool || ast.constantPool || [];
+      /* HARDENED: Removed defensive default */
+      const constantPool = ast.constantPool;
       
       // Generate krak2 format disassembly
       const disassembly = unparseDataStructures(convertedAst.classes[0], constantPool);
       
       return disassembly;
     } catch (error) {
-      return `// DEFINITELY-BROWSER-ENTRY-ERROR - Error disassembling class: ${error.message}\n// This may occur when the class file uses advanced features not yet fully supported\n// Try starting the debugger to see more detailed disassembly`;
+      /* HARDENED: Replaced quiet failure with an explicit error */
+      throw new Error(`Error disassembling class: ${error.message}`, { cause: error });
     }
   }
 
