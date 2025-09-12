@@ -451,10 +451,10 @@ const Lang = P.createLanguage({
         r.u8Instruction,
         r.i8Instruction,
         r.clsrefInstruction,
+        r.newarrayInstruction,
         r.lblInstruction,
         r.refOrTaggedConstInstruction,
         r.ldcInstruction,
-        r.newarrayInstruction,
         r.i16Instruction,
         r.lookupswitchInstruction,
         r.tableswitchInstruction,
@@ -557,7 +557,7 @@ const Lang = P.createLanguage({
     newarrayInstruction: (r) =>
       P.seqMap(
         P.string("newarray").skip(r.ws),
-        P.alt(...newarrayTypes.map(P.string)),
+        r.WORD,
         (op, arg) => ({ op, arg })
       ).desc("newarray Instruction"),
 

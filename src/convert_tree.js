@@ -184,7 +184,23 @@ function formatConst(entry, index, constantPool, cls) {
         constantPool,
       ).value;
 
-      line += ` InvokeDynamic ${formatInstructionArg(bsm.method_ref.value.reference.nameAndType.name)} ${bsm.arguments.map((a) => formatInstructionArg(a.value)).join(" ")} : ${nameAndType.name} ${nameAndType.descriptor}`;
+      const bsmHandle = `MethodHandle ${bsm.method_ref.value.kind} Method ${bsm.method_ref.value.reference.className.replace(/\./g, "/")} ${bsm.method_ref.value.reference.nameAndType.name} ${bsm.method_ref.value.reference.nameAndType.descriptor}`;
+      const bsmArgs = bsm.arguments.map(arg => {
+        if (arg.type === 'String') {
+          return `String ${formatStringConstant(arg.value)}`;
+        }
+        if (arg.type === 'MethodHandle') {
+          const mh = arg.value;
+          const ref = mh.reference;
+          return `MethodHandle ${mh.kind} Method ${ref.className.replace(/\./g, "/")} ${ref.nameAndType.name} ${ref.nameAndType.descriptor}`;
+        }
+        if (arg.type === 'MethodType') {
+            return `MethodType ${arg.value}`;
+        }
+        return formatInstructionArgKrakatau(arg.value);
+      }).join(' ');
+
+      line += ` InvokeDynamic ${bsmHandle} ${bsmArgs} : ${nameAndType.name} ${nameAndType.descriptor}`;
       break;
     case 15: // MethodHandle
       const methodHandle = resolveConstant(index, constantPool).value;
