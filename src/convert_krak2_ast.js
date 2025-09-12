@@ -13,15 +13,21 @@ function convertCodeItem(item) {
         }
       } else if (argStr.endsWith('f')) {
         try {
-          item.instruction.arg = parseFloat(argStr);
-          item.instruction.type = 'Float';
+          const value = parseFloat(argStr);
+          item.instruction.arg = {
+            value: value,
+            type: 'Float'
+          };
         } catch (e) {
           // Leave as string if parsing fails
         }
       } else if (argStr.includes('e') || argStr.includes('E') || argStr.includes('.')) {
         try {
-          item.instruction.arg = parseFloat(argStr);
-          item.instruction.type = 'Double';
+          const value = parseFloat(argStr);
+          item.instruction.arg = {
+            value: value,
+            type: 'Double'
+          };
         } catch (e) {
           // Leave as string if parsing fails
         }
