@@ -393,6 +393,7 @@ const Lang = P.createLanguage({
         P.seq(P.string("Class").skip(r.ws), r.utfref),
         P.seq(P.string("String").skip(r.ws), r.utfref),
         P.seq(P.string("MethodType").skip(r.ws), r.utfref),
+        P.seq(P.string("MethodHandle").skip(r.ws), r.mhnotref),  // Move before Method to avoid conflicts
         P.seq(P.string("Module").skip(r.ws), r.utfref),
         P.seq(P.string("Package").skip(r.ws), r.utfref),
         P.seq(P.string("Field").skip(r.ws), r.clsref.skip(r.ws), r.natref),
@@ -407,7 +408,6 @@ const Lang = P.createLanguage({
           r.utfref.skip(r.ws),
           r.utfref
         ),
-        P.seq(P.string("MethodHandle").skip(r.ws), r.mhnotref),
         P.seq(P.string("Dynamic").skip(r.ws), r.bsref.skip(r.ws), r.natref),
         P.seq(
           P.string("InvokeDynamic").skip(r.ws),
@@ -450,17 +450,17 @@ const Lang = P.createLanguage({
         r.noArgInstruction,
         r.u8Instruction,
         r.i8Instruction,
+        r.newarrayInstruction,  // Move before clsrefInstruction to avoid "new" vs "newarray" conflict
+        r.multianewarrayInstruction,  // Move before clsrefInstruction to avoid conflicts
         r.clsrefInstruction,
         r.lblInstruction,
         r.refOrTaggedConstInstruction,
         r.ldcInstruction,
-        r.newarrayInstruction,
         r.i16Instruction,
         r.lookupswitchInstruction,
         r.tableswitchInstruction,
         r.wideInstruction,
-        r.iincInstruction,
-        r.multianewarrayInstruction
+        r.iincInstruction
       ).desc("instruction"),
 
     // No-argument instructions
