@@ -89,6 +89,10 @@ class BrowserJVMDebug {
     }
 
     try {
+      // Reset the debug controller to clear any previous session state
+      // This ensures thread arrays and other state are properly reset
+      this.debugController.reset();
+      
       // Strip .class extension if present since DebugController expects class name only
       const className = classPath.endsWith('.class') ? classPath.replace('.class', '') : classPath;
       

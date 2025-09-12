@@ -272,7 +272,7 @@ function createUnsignedParser(bits) {
     "putstatic"
   ];
 
-  const ldcInstructions = ["ldc", "ldc_w", "ldc2_w"];
+  const ldcInstructions = ["ldc2_w", "ldc_w", "ldc"];
 
   const newarrayTypes = [
     "boolean",
@@ -319,8 +319,8 @@ const Lang = P.createLanguage({
       P.alt(
         P.regexp(/[+-]Infinity/),
         P.regexp(/[+-]NaN(?:<0x[0-9a-fA-F]{16}>)?/),
-        P.regexp(/[+-]?\d+\.\d+(?:e[+-]?\d+)?/),
-        P.regexp(/[+-]?\d+(?:e[+-]?\d+)/),
+        P.regexp(/[+-]?(?:\d+\.\d*|\.\d+)(?:[eE][+-]?\d+)?/),
+        P.regexp(/[+-]?\d+[eE][+-]?\d+/),
         P.regexp(/[+-]?0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?(?:p[+-]?\d+)/)
       ).desc("DOUBLE_LITERAL"),
     LONG_LITERAL: () =>
@@ -329,8 +329,8 @@ const Lang = P.createLanguage({
       P.alt(
         P.regexp(/[+-]Infinityf/),
         P.regexp(/[+-]NaN(?:<0x[0-9a-fA-F]{8}>)?f/),
-        P.regexp(/[+-]?\d+\.\d+(?:e[+-]?\d+)?f/),
-        P.regexp(/[+-]?\d+(?:e[+-]?\d+)f/),
+        P.regexp(/[+-]?\d*\.?\d+[eE][+-]?\d+f/),
+        P.regexp(/[+-]?\d*\.?\d+f/),
         P.regexp(/[+-]?0x[0-9a-fA-F]+(?:\.[0-9a-fA-F]+)?(?:p[+-]?\d+)f/)
       ).desc("FLOAT_LITERAL"),
     STRING_LITERAL: () =>
@@ -437,13 +437,13 @@ const Lang = P.createLanguage({
 
     ldc_rhs: (r) =>
       P.alt(
-        r.INT_LITERAL,
         r.FLOAT_LITERAL,
-        r.LONG_LITERAL,
         r.DOUBLE_LITERAL,
+        r.LONG_LITERAL,
         r.STRING_LITERAL,
         r.REF,
-        r.tagged_const
+        r.tagged_const,
+        r.INT_LITERAL
       ).desc("ldc_rhs"),
     instruction: (r) =>
       P.alt(
@@ -545,10 +545,11 @@ const Lang = P.createLanguage({
     ldcInstruction: (r) =>
       P.alt(
         ...ldcInstructions.map((instr) =>
-          P.seqMap(P.string(instr).skip(r.ws), r.ldc_rhs, (op, arg) => ({
-            op,
-            arg
-          }))
+          P.seqMap(
+            P.string(instr).skip(r.ws),
+            r.ldc_rhs.skip(r.ws),
+            (op, arg) => ({ op, arg })
+          )
         )
       ).desc("ldc Instruction"),
 
@@ -718,15 +719,28 @@ const Lang = P.createLanguage({
         )
       ).desc("code_directive"),
 
+    // Line label parser
+    line_label: () =>
+      P.regexp(/L\d+:/).desc("line_label"),
+    
     // code_item Parser
     code_item: (r) =>
       P.alt(
+        // Label definition with optional instruction
         P.seqMap(
           r.LABEL_DEF.skip(r.ws),
           r.instruction.atMost(1),
           (labelDef, instr) => ({ labelDef, instruction: instr[0] || null })
         ),
+        // Line label with instruction
+        P.seqMap(
+          r.line_label.skip(r.ws),
+          r.instruction,
+          (lineLabel, instr) => ({ lineLabel, instruction: instr })
+        ),
+        // Instruction without label
         r.instruction,
+        // Code directive
         r.code_directive
       ).desc("code_item"),
 
@@ -738,7 +752,7 @@ const Lang = P.createLanguage({
         r.u16.skip(r.ws),
         P.string("locals").skip(r.ws),
         r.u16.skip(r.NL),
-        r.code_item.skip(r.NL).many(),
+        r.code_item.skip(r.NL).atLeast(1),
         r.attribute.skip(r.NL).many(),
         P.string(".end").skip(r.ws).skip(P.string("code")),
         (

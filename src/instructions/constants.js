@@ -88,4 +88,27 @@ module.exports = {
       frame.stack.push(parseFloat(value));
     }
   },
+    ldc_w: async (frame, instruction, jvm) => {
+      const index = parseInt(instruction.arg, 10); // 16-bit constant pool index
+      const constantPool = frame.method.constantPool;
+      if (!constantPool || index >= constantPool.length || index < 1) {
+        throw new Error(`Invalid constant pool index for ldc_w: ${index}`);
+      }
+      const constant = constantPool[index];
+      if (Array.isArray(constant) && constant[0] === "Class") {
+        const className = constant[1];
+        const classObj = await jvm.getClassObject(className);
+        frame.stack.push(classObj);
+      } else if (typeof constant === "string" || constant instanceof String) {
+        frame.stack.push(jvm.internString(constant));
+      } else if (
+        typeof constant === "object" &&
+        constant !== null &&
+        constant.hasOwnProperty("value")
+      ) {
+        frame.stack.push(constant.value);
+      } else {
+        frame.stack.push(constant);
+      }
+    },
 };
