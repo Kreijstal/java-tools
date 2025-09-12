@@ -272,7 +272,7 @@ function createUnsignedParser(bits) {
     "putstatic"
   ];
 
-  const ldcInstructions = ["ldc", "ldc_w", "ldc2_w"];
+  const ldcInstructions = ["ldc2_w", "ldc_w", "ldc"];
 
   const newarrayTypes = [
     "boolean",
