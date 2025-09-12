@@ -198,10 +198,13 @@ function convertKrak2AstToClassAst(krak2Ast) {
       invokeDynamicRefs.reverse();
     }
     
+    // Build a map for quick lookups
+    const itemsByRef = new Map(classDef.items.map(item => [item.ref, item]));
+
     // Build the invokeDynamicMap with correct indices after reversal
     const invokeDynamicMap = {};
     for (let i = 0; i < invokeDynamicRefs.length; i++) {
-      const item = classDef.items.find(item => item.ref === invokeDynamicRefs[i]);
+      const item = itemsByRef.get(invokeDynamicRefs[i]);
       if (item) {
         // Extract final method ref from constValue for nameAndType
         const [, , finalMethodRef] = item.constValue;
