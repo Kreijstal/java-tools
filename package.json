@@ -21,6 +21,9 @@
   "author": "kreijstal",
   "license": "AGPLv3",
   "description": "Java bytecode analysis and JVM implementation tools",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "crc-32": "^1.2.2",
     "decimal.js": "^10.4.3",
