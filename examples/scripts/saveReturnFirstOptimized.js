@@ -12,6 +12,22 @@ const { inlinePureMethods } = require('../../src/inlinePureMethods');
 const JASMIN_DIR = path.join(__dirname, '..', 'sources', 'jasmin');
 const JAVA_DIR = path.join(__dirname, '..', 'sources', 'java');
 
+/**
+ * Validates that a file path is within a specified base directory.
+ * @param {string} filePath - The path to validate.
+ * @param {string} baseDir - The directory the path should be within.
+ * @returns {string} The resolved, validated path.
+ * @throws {Error} If path traversal is detected.
+ */
+function validatePath(filePath, baseDir) {
+  const resolvedPath = path.resolve(filePath);
+  const resolvedBase = path.resolve(baseDir);
+  if (!resolvedPath.startsWith(resolvedBase)) {
+    throw new Error(`Path traversal attempt detected: ${filePath} is outside of ${baseDir}`);
+  }
+  return resolvedPath;
+}
+
 function ensureKrak2Path() {
   const krak2Path = path.resolve(
     __dirname,
@@ -25,7 +41,7 @@ function ensureKrak2Path() {
 
 function assembleReturnFirst(tempDir, krak2Path) {
   const jasminSource = path.join(JASMIN_DIR, 'ReturnFirst.j');
-  const classOutput = path.join(tempDir, 'ReturnFirst.class');
+  const classOutput = validatePath(path.join(tempDir, 'ReturnFirst.class'), tempDir);
   execFileSync(krak2Path, ['asm', jasminSource, '--out', classOutput]);
   return classOutput;
 }
@@ -45,7 +61,7 @@ function compileReturnFirstTest(tempDir) {
     }
     throw error;
   }
-  return path.join(tempDir, 'ReturnFirstTest.class');
+  return validatePath(path.join(tempDir, 'ReturnFirstTest.class'), tempDir);
 }
 
 function convertClassFromFile(classFilePath) {
@@ -68,7 +84,8 @@ function sanitizeAssembly(assembly) {
     .join('\n');
 }
 
-function writeAssembly(classItem, constantPool, outputPath) {
+function writeAssembly(classItem, constantPool, outputPath, baseDir) {
+  const validatedPath = validatePath(outputPath, baseDir);
   if (!classItem) {
     throw new Error('Cannot emit assembly for a missing class definition.');
   }
@@ -78,11 +95,11 @@ function writeAssembly(classItem, constantPool, outputPath) {
   const disassembly = unparseDataStructures(classItem, constantPool);
   const sanitized = sanitizeAssembly(disassembly);
   fs.writeFileSync(
-    outputPath,
+    validatedPath,
     sanitized.endsWith('\n') ? sanitized : `${sanitized}\n`,
   );
   console.log(
-    `Optimized assembly written to ${path.relative(process.cwd(), outputPath)}`,
+    `Optimized assembly written to ${path.relative(process.cwd(), validatedPath)}`,
   );
 }
 
@@ -117,12 +134,14 @@ function main() {
     returnFirst.classItem,
     returnFirst.constantPool,
     path.join(outputDir, 'ReturnFirst.deadcode.j'),
+    outputDir,
   );
 
   writeAssembly(
     returnFirstTest.classItem,
     returnFirstTest.constantPool,
     path.join(outputDir, 'ReturnFirstTest.optimized.j'),
+    outputDir,
   );
 }
 
