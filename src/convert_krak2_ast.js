@@ -96,12 +96,20 @@ function buildWideArg(body) {
     parts.push(String(body.index));
   }
 
+  if (body.varnum != null) {
+    parts.push(String(body.varnum));
+  }
+
   if (body.arg != null) {
     parts.push(String(body.arg));
   }
 
   if (body.const != null) {
     parts.push(String(body.const));
+  }
+
+  if (body.incr != null) {
+    parts.push(String(body.incr));
   }
 
   if (body.value != null) {
@@ -368,10 +376,7 @@ function parseStringLiteral(raw) {
     try {
       return JSON.parse(raw);
     } catch (e) {
-      const inner = raw.slice(1, -1);
-      return inner.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) =>
-        String.fromCharCode(parseInt(hex, 16))
-      );
+      return raw;
     }
   }
 
