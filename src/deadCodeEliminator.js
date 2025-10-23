@@ -392,6 +392,9 @@ function computeMaxStack(entries, keepSet) {
     }
     height -= entry.meta.popSlots;
     if (height < 0) {
+      console.error(
+        `Stack underflow detected at entry index ${entry.index} (popSlots: ${entry.meta.popSlots}).`
+      );
       return null;
     }
     height += entry.meta.pushSlots;

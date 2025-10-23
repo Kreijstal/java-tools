@@ -1,23 +1,17 @@
 const { getStackEffect, normalizeInstruction } = require('./deadCodeEliminator')._internals;
-/**
- * Performs a topological sort of the basic blocks in a CFG.
- * This is necessary to flatten the graph back into a linear sequence of
- * instructions while respecting control flow.
- *
 
 /**
+ * Performs a topological sort of the basic blocks in a CFG.
  * @param {import('./cfg').CFG} cfg - The Control Flow Graph to sort.
  * @returns {Array<import('./cfg').BasicBlock>} A sorted array of basic blocks.
  */
 function topologicalSort(cfg) {
   const sorted = [];
   const visited = new Set();
-  const recursionStack = new Set(); // For detecting cycles
+  const recursionStack = new Set();
 
   function visit(blockId) {
     if (recursionStack.has(blockId)) {
-      // This indicates a cycle, which shouldn't happen in reducible CFGs from Java bytecode,
-      // but it's good practice to handle it. For our purposes, we can ignore it.
       return;
     }
     if (visited.has(blockId)) {
@@ -35,7 +29,6 @@ function topologicalSort(cfg) {
     }
 
     recursionStack.delete(blockId);
-    // Post-order traversal addition
     if (block) {
       sorted.unshift(block);
     }
@@ -55,6 +48,7 @@ function recalculateMaxStack(instructions) {
   let currentStack = 0;
 
   for (const item of instructions) {
+    if (!item.instruction) continue;
     const normalized = normalizeInstruction(item.instruction);
     if (!normalized || !normalized.op) continue;
 
@@ -62,7 +56,7 @@ function recalculateMaxStack(instructions) {
     if (!effect) continue;
 
     currentStack -= effect.popSlots;
-    if (currentStack < 0) currentStack = 0; // Should not happen in valid code
+    if (currentStack < 0) currentStack = 0;
     currentStack += effect.pushSlots;
 
     if (currentStack > maxStack) {
@@ -74,28 +68,38 @@ function recalculateMaxStack(instructions) {
 }
 
 /**
- * Reconstructs a method's instruction list (codeItems) from an optimized CFG.
- *
- * @param {import('./cfg').CFG} optimizedCfg - The optimized Control Flow Graph.
+ * Reconstructs a method's instruction list (codeItems) from a CFG.
+ * @param {import('./cfg').CFG} cfg - The Control Flow Graph.
  * @param {object} originalMethodAst - The original method AST, used as a template.
  * @returns {object} A new method AST with the updated instruction list.
  */
-function reconstructAstFromCfg(optimizedCfg, originalMethodAst) {
-  const sortedBlocks = topologicalSort(optimizedCfg);
+function reconstructAstFromCfg(cfg, originalMethodAst) {
+  const sortedBlocks = topologicalSort(cfg);
 
   const newCodeItems = [];
   for (const block of sortedBlocks) {
     newCodeItems.push(...block.instructions);
   }
 
-  // Deep clone the original method AST to avoid mutating it.
+  // Append any label-only items from the end of the original method
+  const originalCodeItems = originalMethodAst.attributes.find(a => a.type === 'code').code.codeItems;
+  for (let i = originalCodeItems.length - 1; i >= 0; i--) {
+    const item = originalCodeItems[i];
+    if (!item.instruction && item.labelDef) {
+      if (!newCodeItems.find(ci => ci.labelDef === item.labelDef)) {
+        newCodeItems.push(item);
+      }
+    } else {
+      break;
+    }
+  }
+
   const newMethodAst = JSON.parse(JSON.stringify(originalMethodAst));
 
   const codeAttr = newMethodAst.attributes.find(attr => attr.type === 'code');
   if (codeAttr) {
     codeAttr.code.codeItems = newCodeItems;
     codeAttr.code.stackSize = String(recalculateMaxStack(newCodeItems));
-    // Note: maxLocals is not recalculated as this optimization does not affect it.
   }
 
   return newMethodAst;

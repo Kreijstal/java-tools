@@ -49,6 +49,7 @@ function findLeaders(instructions) {
 
   for (let i = 0; i < instructions.length; i++) {
     const instr = instructions[i];
+    if (!instr.instruction) continue;
     const op = typeof instr.instruction === 'string' ? instr.instruction : instr.instruction?.op;
     if (!op) continue;
 
@@ -85,13 +86,12 @@ function convertAstToCfg(method) {
     return null;
   }
 
-  const instructions = codeAttr.code.codeItems.filter(item => item.instruction);
+  const instructions = codeAttr.code.codeItems;
   if (instructions.length === 0) {
     return null;
   }
 
   const leaders = findLeaders(instructions);
-  const pcToInstructionIndex = new Map(instructions.map((instr, i) => [instr.pc, i]));
 
   const entryBlock = new BasicBlock('block_0');
   const cfg = new CFG(entryBlock.id);
@@ -105,11 +105,14 @@ function convertAstToCfg(method) {
         const newBlock = new BasicBlock(`block_${instr.pc}`);
         cfg.addBlock(newBlock);
 
-        // Add fall-through edge from previous block if it wasn't a jump
         const prevInstr = instructions[i - 1];
-        const prevOp = typeof prevInstr.instruction === 'string' ? prevInstr.instruction : prevInstr.instruction?.op;
-        if (!BLOCK_END_OPCODES.has(prevOp)) {
-            cfg.addEdge(currentBlock.id, newBlock.id);
+        if (prevInstr.instruction) {
+            const prevOp = typeof prevInstr.instruction === 'string' ? prevInstr.instruction : prevInstr.instruction?.op;
+            if (!BLOCK_END_OPCODES.has(prevOp)) {
+                cfg.addEdge(currentBlock.id, newBlock.id);
+            }
+        } else {
+             cfg.addEdge(currentBlock.id, newBlock.id);
         }
         currentBlock = newBlock;
     }
@@ -120,6 +123,8 @@ function convertAstToCfg(method) {
   for (const block of cfg.blocks.values()) {
     if (block.instructions.length === 0) continue;
     const lastInstr = block.instructions[block.instructions.length - 1];
+    if (!lastInstr.instruction) continue;
+
     const op = typeof lastInstr.instruction === 'string' ? lastInstr.instruction : lastInstr.instruction?.op;
 
     if (BLOCK_END_OPCODES.has(op) || CONDITIONAL_JUMP_OPCODES.has(op)) {
