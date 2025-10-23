@@ -225,7 +225,7 @@ function getLoadDetails(entry) {
   if (!entry || !entry.normalized) {
     return null;
   }
-  const op = entry.normalized.op;
+  const {op} = entry.normalized;
   if (!op) {
     return null;
   }
@@ -274,7 +274,7 @@ function gatherMethods(ast) {
     if (!cls || !Array.isArray(cls.items)) {
       continue;
     }
-    const className = cls.className;
+    const {className} = cls;
     if (!className) {
       continue;
     }
@@ -282,7 +282,7 @@ function gatherMethods(ast) {
       if (!item || item.type !== 'method' || !item.method) {
         continue;
       }
-      const method = item.method;
+      const {method} = item;
       const signature = buildMethodSignature(className, method.name, method.descriptor);
       const codeAttr = (method.attributes || []).find((attr) => attr.type === 'code');
       methods.set(signature, {
@@ -303,13 +303,13 @@ function analyzeMethodReturn(methodInfo) {
     return null;
   }
 
-  const method = methodInfo.method;
+  const {method} = methodInfo;
   const isStatic = Array.isArray(method.flags) && method.flags.includes('static');
   if (!isStatic) {
     return null;
   }
 
-  const codeAttr = methodInfo.codeAttr;
+  const {codeAttr} = methodInfo;
   if (!codeAttr || !codeAttr.code) {
     return null;
   }

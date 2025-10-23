@@ -293,7 +293,7 @@ function getStackEffect(op, instruction = null) {
     if (!instruction || !instruction.arg || !instruction.arg.nameAndType) {
       return null;
     }
-    const descriptor = instruction.arg.nameAndType.descriptor;
+    const {descriptor} = instruction.arg.nameAndType;
     const layout = parseMethodDescriptor(descriptor);
     if (!layout) {
       return null;
@@ -414,13 +414,13 @@ function eliminateDeadCode(ast) {
     if (!cls || !Array.isArray(cls.items)) {
       continue;
     }
-    const className = cls.className;
+    const {className} = cls;
 
     for (const item of cls.items) {
       if (!item || item.type !== "method" || !item.method) {
         continue;
       }
-      const method = item.method;
+      const {method} = item;
       const signature = buildMethodSignature(className, method);
       const codeAttr = (method.attributes || []).find((attr) => attr.type === "code");
       if (!codeAttr || !codeAttr.code || !Array.isArray(codeAttr.code.codeItems)) {

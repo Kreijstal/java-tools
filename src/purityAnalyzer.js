@@ -276,7 +276,7 @@ function analyzePurity(ast) {
   const pending = new Map();
 
   for (const cls of classes) {
-    const className = cls.className;
+    const {className} = cls;
     if (!className || !Array.isArray(cls.items)) {
       continue;
     }
@@ -286,7 +286,7 @@ function analyzePurity(ast) {
         continue;
       }
 
-      const method = item.method;
+      const {method} = item;
       const signature = buildMethodSignature(
         className,
         method.name,
