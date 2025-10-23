@@ -56,7 +56,7 @@ function recalculateMaxStack(instructions) {
     if (!effect) continue;
 
     currentStack -= effect.popSlots;
-    if (currentStack < 0) currentStack = 0;
+    if (currentStack < 0) throw new Error('Stack underflow detected during stack recalculation.');
     currentStack += effect.pushSlots;
 
     if (currentStack > maxStack) {
