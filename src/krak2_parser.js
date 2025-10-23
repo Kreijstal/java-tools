@@ -64,6 +64,10 @@ function createUnsignedParser(bits) {
     "invokeInterface"
   ];
 
+  function sortByLengthDesc(tokens) {
+    return [...tokens].sort((a, b) => b.length - a.length);
+  }
+
   const noArgInstructions = [
     "iload_0",
     "iload_1",
@@ -285,6 +289,9 @@ function createUnsignedParser(bits) {
     "long"
   ];
 
+  const sortedNoArgInstructions = sortByLengthDesc(noArgInstructions);
+  const sortedLblInstructions = sortByLengthDesc(lblInstructions);
+
 const Lang = P.createLanguage({
     // Whitespace and Comments
     whitespace: () => P.regexp(/[ \t]+/).desc("whitespace"),
@@ -353,7 +360,14 @@ const Lang = P.createLanguage({
     i32: (r) => createSignedParser(32)(r),
     i64: (r) => createSignedParser(64)(r),
 
-    flags: (r) => P.alt(...flagTokens.map(P.string)).sepBy(P.whitespace),
+    flags: (r) =>
+      P.alt(...flagTokens.map(token =>
+        P.seqMap(
+          P.string(token),
+          P.lookahead(P.alt(P.whitespace, P.string(":"), P.string("\n"), P.eof)),
+          (value) => value
+        )
+      )).sepBy(P.whitespace),
     lbl: (r) =>
       r.WORD.chain((word) => {
         if (word.startsWith("L") && word[0] === "L") {
@@ -417,7 +431,7 @@ const Lang = P.createLanguage({
       ).desc("tagged_const"),
 
     bs_args: (r) =>
-      P.seq(r.ref_or_tagged_const.many().skip(r.ws), P.string(":")).desc(
+      P.seq(r.ref_or_tagged_const.skip(r.ws).many(), P.string(":")).desc(
         "bs_args"
       ),
 
@@ -465,7 +479,7 @@ const Lang = P.createLanguage({
 
     // No-argument instructions
     noArgInstruction: () =>
-      P.alt(...noArgInstructions.map(P.string)).desc("No-Argument Instruction"),
+      P.alt(...sortedNoArgInstructions.map(P.string)).desc("No-Argument Instruction"),
 
     // u8 argument instructions
     u8Instruction: (r) =>
@@ -514,7 +528,7 @@ const Lang = P.createLanguage({
     // lbl instructions
     lblInstruction: (r) =>
       P.alt(
-        ...lblInstructions.map((instr) =>
+        ...sortedLblInstructions.map((instr) =>
           P.seqMap(P.string(instr).skip(r.ws), r.lbl, (op, arg) => ({
             op,
             arg
@@ -801,7 +815,7 @@ const Lang = P.createLanguage({
         ),
         P.seqMap(
           P.string(".exceptions").skip(r.ws),
-          r.clsref.many(),
+          r.clsref.skip(r.ws).atLeast(1),
           (_, exceptions) => ({ type: "exceptions", exceptions })
         ),
         P.seqMap(
