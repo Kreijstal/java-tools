@@ -129,10 +129,22 @@ function convertAstToCfg(method) {
 
     if (BLOCK_END_OPCODES.has(op) || CONDITIONAL_JUMP_OPCODES.has(op)) {
       if (lastInstr.instruction.arg) {
-        const targetLabel = lastInstr.instruction.arg;
-        const targetPc = instructions.find(inst => inst.labelDef === `${targetLabel}:`)?.pc;
-        if (targetPc !== undefined) {
-          cfg.addEdge(block.id, `block_${targetPc}`);
+        // Handle tableswitch/lookupswitch with multiple targets
+        if (op === 'tableswitch' || op === 'lookupswitch') {
+          const targetLabels = Array.isArray(lastInstr.instruction.arg) ? lastInstr.instruction.arg : [];
+          for (const targetLabel of targetLabels) {
+            const targetPc = instructions.find(inst => inst.labelDef === `${targetLabel}:`)?.pc;
+            if (targetPc !== undefined) {
+              cfg.addEdge(block.id, `block_${targetPc}`);
+            }
+          }
+        } else {
+          // Single target jump
+          const targetLabel = lastInstr.instruction.arg;
+          const targetPc = instructions.find(inst => inst.labelDef === `${targetLabel}:`)?.pc;
+          if (targetPc !== undefined) {
+            cfg.addEdge(block.id, `block_${targetPc}`);
+          }
         }
       }
     }
