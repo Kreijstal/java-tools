@@ -9,16 +9,6 @@ const { convertJson, unparseDataStructures } = require('../../src/convert_tree')
 const { eliminateDeadCode } = require('../../src/deadCodeEliminator');
 const { inlinePureMethods } = require('../../src/inlinePureMethods');
 
-const JASMIN_DIR = path.join(__dirname, '..', 'sources', 'jasmin');
-const JAVA_DIR = path.join(__dirname, '..', 'sources', 'java');
-
-/**
- * Validates that a file path is within a specified base directory.
- * @param {string} filePath - The path to validate.
- * @param {string} baseDir - The directory the path should be within.
- * @returns {string} The resolved, validated path.
- * @throws {Error} If path traversal is detected.
- */
 function validatePath(filePath, baseDir) {
   const resolvedPath = path.resolve(filePath);
   const resolvedBase = path.resolve(baseDir);
@@ -27,6 +17,9 @@ function validatePath(filePath, baseDir) {
   }
   return resolvedPath;
 }
+
+const JASMIN_DIR = path.join(__dirname, '..', 'sources', 'jasmin');
+const JAVA_DIR = path.join(__dirname, '..', 'sources', 'java');
 
 function ensureKrak2Path() {
   const krak2Path = path.resolve(

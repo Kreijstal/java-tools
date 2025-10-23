@@ -24,10 +24,7 @@ const INVOKE_OPS = new Set([
 
 /**
  * Analyzes the purity of a method based on its Control Flow Graph.
- * A method is considered pure if it has no side effects, such as writing to
- * fields or arrays, performing I/O, or calling other impure methods.
- *
- * This is a simplified analysis and does not yet handle inter-procedural analysis.
+ * A method is considered pure if it has no side effects.
  *
  * @param {import('./cfg').CFG} cfg - The Control Flow Graph of the method.
  * @returns {{isPure: boolean, reason: string | null}} An object indicating if
@@ -43,6 +40,7 @@ function analyzePurityCfg(cfg) {
     const block = cfg.blocks.get(blockId);
 
     for (const instr of block.instructions) {
+      if (!instr.instruction) continue;
       const op = typeof instr.instruction === 'string' ? instr.instruction : instr.instruction?.op;
       if (!op) continue;
 
@@ -50,8 +48,6 @@ function analyzePurityCfg(cfg) {
         return { isPure: false, reason: `contains impure opcode ${op} (${IMPURE_OPCODE_REASONS[op]})` };
       }
 
-      // For this simplified analysis, we consider all method calls as potentially impure.
-      // A more advanced analysis would look up the purity of the callee.
       if (INVOKE_OPS.has(op)) {
          return { isPure: false, reason: `calls another method (${op}), which is potentially impure` };
       }
