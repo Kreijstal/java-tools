@@ -390,7 +390,7 @@ function inlineInvocation(callerInfo, code, items, index, candidate) {
     localsSize = 0;
   }
   const tempIndex = localsSize;
-  code.localsSize = localsSize + width;
+  code.localsSize = String(localsSize + width);
 
   replacements.push(createInstructionItem(storeOp, tempIndex));
 
