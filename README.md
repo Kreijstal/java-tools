@@ -194,6 +194,8 @@ const converted = convertJson(ast.ast, ast.constantPool);
 const newBytecode = unparseDataStructures(converted.classes[0], converted.constantPool);
 ```
 
+See `docs/dead_code_elimination.md` for a detailed walkthrough of assembling `.j` sources, parsing the resulting `.class`, running the stack-based dead-code eliminator, and emitting updated assembly.
+
 ## 🔧 Configuration
 
 ### JVM Options
