@@ -1,7 +1,7 @@
 const test = require('tape');
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const { getAST } = require('jvm_parser');
 const { convertJson, unparseDataStructures } = require('../src/convert_tree');
 const { parseKrak2Assembly } = require('../src/parse_krak2.js');
@@ -12,7 +12,12 @@ if (!fs.existsSync(tempDir)) {
   fs.mkdirSync(tempDir, { recursive: true });
 }
 
-const classNames = ['VerySimple', 'Hello', 'ConstantsTest', 'ArithmeticTest', 'ReflectiveArrayTest'];
+const sourcesDir = path.join(__dirname, '../sources');
+const classNames = fs
+  .readdirSync(sourcesDir)
+  .filter((fileName) => fileName.endsWith('.class'))
+  .map((fileName) => fileName.slice(0, -'.class'.length))
+  .sort((a, b) => a.localeCompare(b));
 
 classNames.forEach(className => {
   test(`Roundtrip test for ${className}.class`, (t) => {
@@ -31,10 +36,26 @@ classNames.forEach(className => {
 
       // Path A: .j -> .class -> classAST (golden)
       const krak2Path = path.resolve(__dirname, '../tools/krakatau/Krakatau/target/release/krak2');
-      execSync(`"${krak2Path}" asm "${jFilePath}" --out "${tempClassFilePath}"`);
+      execFileSync(krak2Path, ['asm', jFilePath, '--out', tempClassFilePath]);
       const goldenClassFileContent = fs.readFileSync(tempClassFilePath);
       const goldenAst = getAST(new Uint8Array(goldenClassFileContent));
       const goldenClassAst = convertJson(goldenAst.ast, goldenAst.constantPool);
+
+      function deepClone(value) {
+        if (value === null || typeof value !== 'object') {
+          return value;
+        }
+
+        if (Array.isArray(value)) {
+          return value.map(deepClone);
+        }
+
+        const clone = {};
+        for (const key of Object.keys(value)) {
+          clone[key] = deepClone(value[key]);
+        }
+        return clone;
+      }
 
       function stripCpIndex(obj) {
         if (obj && typeof obj === 'object') {
@@ -49,7 +70,7 @@ classNames.forEach(className => {
         return obj;
       }
 
-      const strippedGoldenAst = stripCpIndex(JSON.parse(JSON.stringify(goldenClassAst)));
+      const strippedGoldenAst = stripCpIndex(deepClone(goldenClassAst));
       t.pass('Golden classAST generated and stripped successfully');
 
       // Path B: .j -> krak2AST -> classAST (new)

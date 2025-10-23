@@ -1,3 +1,5 @@
+const { decodeAccessFlags } = require("./access_flags");
+
 /**
  * Converts a parsed Java class AST to a structured format suitable for disassembly
  * @param {Object} inputJson - The parsed Java class structure from jvm_parser
@@ -9,6 +11,7 @@
  * @param {String} str - The string to format
  * @returns {String} Formatted string with Krakatau-compatible escape sequences
  */
+
 function formatStringConstant(str) {
   return JSON.stringify(str)
     .replace(/\\u([0-9a-f]{4})/gi, (match, hex) => `\\u${hex.toUpperCase()}`)
@@ -169,12 +172,56 @@ function resolveConstant(index, constantPool) {
   }
 }
 
+function methodHandleEquals(a, b) {
+  if (!a || !b) {
+    return false;
+  }
+
+  const aRef = a.reference;
+  const bRef = b.reference;
+  if (!aRef || !bRef) {
+    return false;
+  }
+
+  const aNt = aRef.nameAndType;
+  const bNt = bRef.nameAndType;
+  return (
+    a.kind === b.kind &&
+    aRef.className === bRef.className &&
+    aNt &&
+    bNt &&
+    aNt.name === bNt.name &&
+    aNt.descriptor === bNt.descriptor
+  );
+}
+
+function findMethodHandleIndex(constantPool, handleValue) {
+  if (!handleValue) {
+    return null;
+  }
+
+  for (let i = 0; i < constantPool.length; i++) {
+    const entry = constantPool[i];
+    if (entry && entry.tag === 15) {
+      const resolved = resolveConstant(i, constantPool);
+      if (
+        resolved.type === "MethodHandle" &&
+        methodHandleEquals(resolved.value, handleValue)
+      ) {
+        return i;
+      }
+    }
+  }
+
+  return null;
+}
+
 function formatConst(entry, index, constantPool, cls) {
   if (!entry) return "";
   let line = `.const [_${index}] =`;
 
   switch (entry.tag) {
-    case 18: // InvokeDynamic
+    case 18: { // InvokeDynamic
       if (!cls.bootstrapMethods) return "";
       const bsmIndex = entry.info.bootstrap_method_attr_index;
       const bsm = cls.bootstrapMethods[bsmIndex];
@@ -184,21 +231,47 @@ function formatConst(entry, index, constantPool, cls) {
         constantPool,
       ).value;
 
-      // Format the bootstrap method handle
       const bsmMethodHandle = bsm.method_ref.value;
       const bsmRefConst = bsmMethodHandle.reference;
       const methodHandlePart = `${bsmMethodHandle.kind} Method ${bsmRefConst.className.replace(/\./g, "/")} ${bsmRefConst.nameAndType.name} ${bsmRefConst.nameAndType.descriptor}`;
-      
-      // Format the arguments with proper type prefixes
-      const formattedArgs = bsm.arguments.map((a) => {
-        if (typeof a.value === "string") {
-          return `String ${formatInstructionArg(a.value)}`;
-        }
-        return formatInstructionArg(a.value);
-      }).join(" ");
 
-      line += ` InvokeDynamic ${methodHandlePart} ${formattedArgs} : ${nameAndType.name} ${nameAndType.descriptor}`;
+      const formattedArgs = bsm.arguments
+        .map((a) => {
+          switch (a.type) {
+            case "MethodType":
+              return `MethodType ${formatInstructionArg(a.value)}`;
+            case "MethodHandle":
+              if (a.value) {
+                const handleIndex = findMethodHandleIndex(
+                  constantPool,
+                  a.value
+                );
+                if (handleIndex !== null) {
+                  return `[_${handleIndex}]`;
+                }
+                if (a.value.reference) {
+                  const ref = a.value.reference;
+                  return `MethodHandle ${a.value.kind} Method ${ref.className.replace(/\./g, "/")} ${ref.nameAndType.name} ${ref.nameAndType.descriptor}`;
+                }
+              }
+              return formatInstructionArg(a.value);
+            case "String":
+              return `String ${formatStringConstant(a.value)}`;
+            case "Class":
+              return `Class ${a.value.replace(/\./g, "/")}`;
+            default:
+              return formatInstructionArg(a.value);
+          }
+        })
+        .filter(Boolean)
+        .join(" ");
+
+      line +=
+        ` InvokeDynamic ${methodHandlePart}` +
+        (formattedArgs ? ` ${formattedArgs}` : "") +
+        ` : ${nameAndType.name} ${nameAndType.descriptor}`;
       break;
+    }
     case 15: // MethodHandle
       const methodHandle = resolveConstant(index, constantPool).value;
       if (!methodHandle) return "";
@@ -216,44 +289,6 @@ function convertJson(inputJson, constantPool) {
   if (inputJson.classes) {
     return inputJson;
   }
-  // Map accessFlags to flags based on context (class, method, or field)
-  const accessFlagMap = {
-    class: {
-      1: "public",
-      16: "final",
-      32: "super",
-      512: "interface",
-      1024: "abstract",
-      4096: "enum",
-      8192: "module",
-      16384: "synthetic",
-    },
-    method: {
-      1: "public",
-      2: "private",
-      4: "protected",
-      8: "static",
-      16: "final",
-      32: "synchronized",
-      64: "bridge",
-      128: "varargs",
-      256: "native",
-      1024: "abstract",
-      2048: "strictfp",
-      4096: "synthetic",
-    },
-    field: {
-      1: "public",
-      2: "private",
-      4: "protected",
-      8: "static",
-      16: "final",
-      64: "volatile",
-      128: "transient",
-      4096: "enum",
-      8192: "synthetic",
-    },
-  };
 
   const outputJson = {
     classes: [
@@ -278,15 +313,7 @@ function convertJson(inputJson, constantPool) {
   };
 
   function getFlags(accessFlags, context) {
-    const flags = [];
-    for (const [flagValue, flagName] of Object.entries(
-      accessFlagMap[context],
-    )) {
-      if (accessFlags & flagValue) {
-        flags.push(flagName);
-      }
-    }
-    return flags;
+    return decodeAccessFlags(accessFlags, context);
   }
 
   // Convert fields
@@ -311,6 +338,7 @@ function convertJson(inputJson, constantPool) {
       type: "method",
       method: {
         flags: getFlags(method.accessFlags, "method"),
+        accessFlags: method.accessFlags,
         name: method.name,
         descriptor: method.descriptor,
         attributes: [],
