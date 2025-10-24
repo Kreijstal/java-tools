@@ -115,3 +115,31 @@ test('runOptimizationPasses orchestrates the inline/fold/DCE pipeline', (t) => {
     t.ok(dcePasses.some((pass) => pass.changed), 'at least one DCE pass should report changes');
   });
 });
+
+test('runOptimizationPasses respects the passes filter', (t) => {
+  t.plan(4);
+
+  const emptyProgram = { classes: [] };
+
+  const foldOnly = runOptimizationPasses(emptyProgram, { passes: ['constantFoldCfg'] });
+  t.deepEqual(
+    foldOnly.passes.map((pass) => pass.name),
+    ['constantFoldCfg', 'constantFoldCfg'],
+    'only constant fold passes should run when requested',
+  );
+  t.ok(
+    foldOnly.passes.every((pass) => pass.iteration === 2 || pass.iteration === 5),
+    'constant fold passes should retain their iteration numbers',
+  );
+
+  const inlineOnly = runOptimizationPasses({ classes: [] }, { passes: ['inlinePureMethods'] });
+  t.deepEqual(
+    inlineOnly.passes.map((pass) => pass.name),
+    ['inlinePureMethods', 'inlinePureMethods'],
+    'requesting only inlining should omit CFG passes',
+  );
+  t.ok(
+    inlineOnly.passes.every((pass) => pass.iteration === 1 || pass.iteration === 4),
+    'inlining-only pipeline should contain both inline iterations',
+  );
+});

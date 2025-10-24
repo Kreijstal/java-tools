@@ -66,6 +66,165 @@ function markBlockUnsupported(block, reason) {
   }
 }
 
+function pushProducedValue(instr, stack, width) {
+  const producedValue = { producer: instr, width };
+  instr.produced.push(producedValue);
+  stack.push(createValueEntry(width, [producedValue]));
+}
+
+function handleStackManipulation(instr, effect, consumed, stack) {
+  const [v1, v2, v3, v4] = consumed;
+
+  switch (effect.special) {
+    case 'dup': {
+      if (!v1 || v1.width !== 1 || consumed.length !== 1) {
+        return false;
+      }
+      stack.push(v1);
+      pushProducedValue(instr, stack, v1.width);
+      return true;
+    }
+    case 'dup_x1': {
+      if (!v1 || !v2 || v1.width !== 1 || v2.width !== 1 || consumed.length !== 2) {
+        return false;
+      }
+      pushProducedValue(instr, stack, 1);
+      stack.push(v2);
+      stack.push(v1);
+      return true;
+    }
+    case 'dup_x2': {
+      if (consumed.length === 3 && v1 && v2 && v3 && v1.width === 1 && v2.width === 1 && v3.width === 1) {
+        pushProducedValue(instr, stack, 1);
+        stack.push(v3);
+        stack.push(v2);
+        stack.push(v1);
+        return true;
+      }
+      if (consumed.length === 2 && v1 && v2 && v1.width === 1 && v2.width === 2) {
+        pushProducedValue(instr, stack, 1);
+        stack.push(v2);
+        stack.push(v1);
+        return true;
+      }
+      return false;
+    }
+    case 'dup2': {
+      if (consumed.length === 1 && v1 && v1.width === 2) {
+        stack.push(v1);
+        pushProducedValue(instr, stack, 2);
+        return true;
+      }
+      if (
+        consumed.length === 2 &&
+        v1 &&
+        v2 &&
+        v1.width === 1 &&
+        v2.width === 1
+      ) {
+        stack.push(v2);
+        stack.push(v1);
+        pushProducedValue(instr, stack, v2.width);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      return false;
+    }
+    case 'dup2_x1': {
+      if (
+        consumed.length === 3 &&
+        v1 && v2 && v3 &&
+        v1.width === 1 &&
+        v2.width === 1 &&
+        v3.width === 1
+      ) {
+        stack.push(v2);
+        stack.push(v1);
+        stack.push(v3);
+        pushProducedValue(instr, stack, v2.width);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      if (consumed.length === 2 && v1 && v2 && v1.width === 2 && v2.width === 1) {
+        stack.push(v1);
+        stack.push(v2);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      return false;
+    }
+    case 'dup2_x2': {
+      if (
+        consumed.length === 4 &&
+        v1 &&
+        v2 &&
+        v3 &&
+        v4 &&
+        v1.width === 1 &&
+        v2.width === 1 &&
+        v3.width === 1 &&
+        v4.width === 1
+      ) {
+        stack.push(v2);
+        stack.push(v1);
+        stack.push(v4);
+        stack.push(v3);
+        pushProducedValue(instr, stack, v2.width);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      if (
+        consumed.length === 3 &&
+        v1 &&
+        v2 &&
+        v3 &&
+        v1.width === 2 &&
+        v2.width === 1 &&
+        v3.width === 1
+      ) {
+        stack.push(v1);
+        stack.push(v3);
+        stack.push(v2);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      if (
+        consumed.length === 3 &&
+        v1 &&
+        v2 &&
+        v3 &&
+        v1.width === 1 &&
+        v2.width === 1 &&
+        v3.width === 2
+      ) {
+        stack.push(v2);
+        stack.push(v1);
+        stack.push(v3);
+        pushProducedValue(instr, stack, v2.width);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      if (consumed.length === 2 && v1 && v2 && v1.width === 2 && v2.width === 2) {
+        stack.push(v1);
+        stack.push(v2);
+        pushProducedValue(instr, stack, v1.width);
+        return true;
+      }
+      return false;
+    }
+    case 'swap': {
+      if (!v1 || !v2 || v1.width !== 1 || v2.width !== 1 || consumed.length !== 2) {
+        return false;
+      }
+      stack.push(v1);
+      stack.push(v2);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 function buildDefUseChains(cfg) {
   const blockStates = new Map();
   const failedBlocks = new Set();
@@ -156,18 +315,13 @@ function buildDefUseChains(cfg) {
 
       instr.consumes = consumed;
 
-      if (effect.special === 'dup') {
-        if (consumed.length !== 1) {
+      if (effect.special) {
+        const handled = handleStackManipulation(instr, effect, consumed, stack);
+        if (!handled) {
           instr.unsupported = true;
-          instr.error = 'Unsupported dup form';
+          instr.error = `Unsupported stack manipulation for ${effect.special}`;
           blockFailed = true;
-          continue;
         }
-        const [top] = consumed;
-        stack.push(top);
-        const producedValue = { producer: instr, width: top.width };
-        instr.produced.push(producedValue);
-        stack.push(createValueEntry(top.width, [producedValue]));
         continue;
       }
 
