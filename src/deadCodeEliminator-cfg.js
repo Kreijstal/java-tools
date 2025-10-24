@@ -63,12 +63,11 @@ function eliminateDeadCodeCfg(cfg) {
     for (const instr of block.instructions) {
       if (!instr.instruction) continue;
       const op = typeof instr.instruction === 'string' ? instr.instruction : instr.instruction?.op;
-      if (op && ESSENTIAL_OPCODES.has(op)) {
-        if (!liveSet.has(instr)) {
-          liveSet.add(instr);
-          worklist.push(instr);
-        }
+      if (op && ESSENTIAL_OPCODES.has(op) && !liveSet.has(instr)) {
+            liveSet.add(instr);
+            worklist.push(instr);
       }
+
     }
   }
 
