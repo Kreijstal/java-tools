@@ -1,8 +1,5 @@
 const { CFG, BasicBlock } = require('./cfg');
 
-/**
- * A set of opcodes that unconditionally end a basic block.
- */
 const BLOCK_END_OPCODES = new Set([
   'ret',
   'return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn',
@@ -12,9 +9,6 @@ const BLOCK_END_OPCODES = new Set([
   'lookupswitch',
 ]);
 
-/**
- * A set of opcodes that conditionally end a basic block.
- */
 const CONDITIONAL_JUMP_OPCODES = new Set([
   'ifeq', 'ifne', 'iflt', 'ifge', 'ifgt', 'ifle',
   'if_icmpeq', 'if_icmpne', 'if_icmplt', 'if_icmpge', 'if_icmpgt', 'if_icmple',
@@ -23,129 +17,264 @@ const CONDITIONAL_JUMP_OPCODES = new Set([
   'jsr',
 ]);
 
-/**
- * Identifies the leaders of basic blocks in a list of instructions.
- * A leader is the first instruction of a basic block.
- * @param {Array<object>} instructions - The codeItems from a method's AST.
- * @returns {Set<number>} A set of the program counters (pc) of leader instructions.
- */
-function findLeaders(instructions) {
-  const leaders = new Set();
-  if (instructions.length === 0) {
-    return leaders;
+function normalizeLabelName(label) {
+  if (typeof label !== 'string') {
+    return null;
+  }
+  return label.endsWith(':') ? label.slice(0, -1) : label;
+}
+
+function getOpcode(instruction) {
+  if (!instruction) {
+    return null;
+  }
+  if (typeof instruction === 'string') {
+    return instruction;
+  }
+  return instruction.op || null;
+}
+
+function getJumpTargets(opcode, instruction) {
+  if (!opcode || !instruction) {
+    return [];
   }
 
-  // The first instruction is always a leader.
-  leaders.add(instructions[0].pc);
+  if (opcode === 'tableswitch') {
+    const targets = [];
+    if (Array.isArray(instruction.labels)) {
+      targets.push(...instruction.labels);
+    }
+    if (instruction.defaultLbl) {
+      targets.push(instruction.defaultLbl);
+    }
+    return targets;
+  }
 
-  // Helper to find the pc for a given label.
+  if (opcode === 'lookupswitch') {
+    const targets = [];
+    const { arg } = instruction;
+    if (arg) {
+      if (Array.isArray(arg.pairs)) {
+        for (const pair of arg.pairs) {
+          if (Array.isArray(pair) && pair[1]) {
+            targets.push(pair[1]);
+          }
+        }
+      }
+      if (arg.defaultLabel) {
+        targets.push(arg.defaultLabel);
+      }
+    }
+    return targets;
+  }
+
+  if (typeof instruction.arg === 'string') {
+    return [instruction.arg];
+  }
+
+  return [];
+}
+
+function findLastInstruction(block) {
+  for (let i = block.instructions.length - 1; i >= 0; i -= 1) {
+    const candidate = block.instructions[i];
+    if (candidate && candidate.instruction) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function findLeaders(instructions, exceptionTable = []) {
+  const leaders = new Set();
   const labelToPc = new Map();
+  const pcToInstruction = new Map();
+
   for (const instruction of instructions) {
     if (instruction.labelDef) {
-      const label = instruction.labelDef.replace(':', '');
-      labelToPc.set(label, instruction.pc);
+      const labelName = normalizeLabelName(instruction.labelDef);
+      if (labelName !== null && instruction.pc !== undefined) {
+        labelToPc.set(labelName, instruction.pc);
+      }
+    }
+    if (instruction.pc !== undefined) {
+      pcToInstruction.set(instruction.pc, instruction);
     }
   }
 
-  for (let i = 0; i < instructions.length; i++) {
-    const instr = instructions[i];
-    if (!instr.instruction) continue;
-    const op = typeof instr.instruction === 'string' ? instr.instruction : instr.instruction?.op;
-    if (!op) continue;
+  if (instructions.length > 0 && instructions[0].pc !== undefined) {
+    leaders.add(instructions[0].pc);
+  }
 
-    const isUnconditionalJump = BLOCK_END_OPCODES.has(op);
-    const isConditionalJump = CONDITIONAL_JUMP_OPCODES.has(op);
+  const addLeaderByLabel = (label) => {
+    const labelName = normalizeLabelName(label);
+    if (!labelName) {
+      return;
+    }
+    const targetPc = labelToPc.get(labelName);
+    if (targetPc !== undefined) {
+      leaders.add(targetPc);
+    }
+  };
+
+  for (let i = 0; i < instructions.length; i += 1) {
+    const item = instructions[i];
+    if (!item || !item.instruction) {
+      continue;
+    }
+    const opcode = getOpcode(item.instruction);
+    if (!opcode) {
+      continue;
+    }
+
+    const isUnconditionalJump = BLOCK_END_OPCODES.has(opcode);
+    const isConditionalJump = CONDITIONAL_JUMP_OPCODES.has(opcode);
 
     if (isUnconditionalJump || isConditionalJump) {
-      // The instruction *after* a jump is a leader.
-      if (i + 1 < instructions.length) {
+      if (i + 1 < instructions.length && instructions[i + 1].pc !== undefined) {
         leaders.add(instructions[i + 1].pc);
       }
 
-      // The target of a jump is a leader.
-      if (instr.instruction.arg) {
-        const targetLabel = instr.instruction.arg;
-        if (labelToPc.has(targetLabel)) {
-          leaders.add(labelToPc.get(targetLabel));
+      const targets = getJumpTargets(opcode, item.instruction);
+      for (const target of targets) {
+        addLeaderByLabel(target);
+      }
+    }
+  }
+
+  for (const entry of exceptionTable) {
+    if (!entry || typeof entry.handler_pc !== 'number') {
+      continue;
+    }
+    const handlerInstruction = pcToInstruction.get(entry.handler_pc);
+    if (handlerInstruction && handlerInstruction.pc !== undefined) {
+      leaders.add(handlerInstruction.pc);
+    }
+  }
+
+  return { leaders, labelToPc, pcToInstruction };
+}
+
+function convertAstToCfg(method) {
+  const codeAttr = method.attributes.find((attr) => attr.type === 'code');
+  if (!codeAttr || !codeAttr.code) {
+    return null;
+  }
+
+  const { code } = codeAttr;
+  const instructions = Array.isArray(code.codeItems) ? code.codeItems : [];
+  const exceptionTable = Array.isArray(code.exceptionTable) ? code.exceptionTable : [];
+
+  const entryBlock = new BasicBlock('block_0');
+  const cfg = new CFG(entryBlock.id);
+  cfg.handlerBlocks = new Set();
+  cfg.exceptionSuccessors = new Map();
+  cfg.addBlock(entryBlock);
+
+  if (instructions.length === 0) {
+    return cfg;
+  }
+
+  const { leaders, labelToPc, pcToInstruction } = findLeaders(instructions, exceptionTable);
+
+  let currentBlock = entryBlock;
+  const pcToBlockId = new Map();
+
+  for (let i = 0; i < instructions.length; i += 1) {
+    const instr = instructions[i];
+    if (i === 0) {
+      // entry block already created
+    } else if (instr.pc !== undefined && leaders.has(instr.pc)) {
+      const previousBlock = currentBlock;
+      const newBlock = new BasicBlock(`block_${instr.pc}`);
+      cfg.addBlock(newBlock);
+      currentBlock = newBlock;
+
+      const prevInstruction = instructions[i - 1];
+      const prevOpcode = prevInstruction && getOpcode(prevInstruction.instruction);
+      if (!prevInstruction || !prevInstruction.instruction || !BLOCK_END_OPCODES.has(prevOpcode)) {
+        cfg.addEdge(previousBlock.id, newBlock.id);
+      }
+    }
+
+    currentBlock.addInstruction(instr);
+
+    if (instr.pc !== undefined) {
+      pcToBlockId.set(instr.pc, currentBlock.id);
+    }
+  }
+
+  const resolveLabelToBlock = (label) => {
+    const labelName = normalizeLabelName(label);
+    if (!labelName) {
+      return null;
+    }
+    const targetPc = labelToPc.get(labelName);
+    if (targetPc === undefined) {
+      return null;
+    }
+    return pcToBlockId.get(targetPc) || null;
+  };
+
+  for (const block of cfg.blocks.values()) {
+    const lastInstruction = findLastInstruction(block);
+    if (!lastInstruction || !lastInstruction.instruction) {
+      continue;
+    }
+
+    const opcode = getOpcode(lastInstruction.instruction);
+    if (!opcode) {
+      continue;
+    }
+
+    if (BLOCK_END_OPCODES.has(opcode) || CONDITIONAL_JUMP_OPCODES.has(opcode)) {
+      const targets = getJumpTargets(opcode, lastInstruction.instruction);
+      for (const target of targets) {
+        const blockId = resolveLabelToBlock(target);
+        if (blockId) {
+          cfg.addEdge(block.id, blockId);
         }
       }
     }
   }
-  return leaders;
-}
 
+  for (const entry of exceptionTable) {
+    if (!entry || typeof entry.start_pc !== 'number' || typeof entry.end_pc !== 'number') {
+      continue;
+    }
+    const handlerInstruction = pcToInstruction.get(entry.handler_pc);
+    if (!handlerInstruction || handlerInstruction.pc === undefined) {
+      continue;
+    }
+    const handlerBlockId = pcToBlockId.get(handlerInstruction.pc);
+    if (!handlerBlockId) {
+      continue;
+    }
+    cfg.handlerBlocks.add(handlerBlockId);
 
-/**
- * Converts a method's AST into a Control Flow Graph.
- * @param {object} method - A method object from the class AST.
- * @returns {CFG} The resulting Control Flow Graph.
- */
-function convertAstToCfg(method) {
-  const codeAttr = method.attributes.find(attr => attr.type === 'code');
-  if (!codeAttr || !codeAttr.code || !codeAttr.code.codeItems) {
-    return null;
-  }
+    for (const block of cfg.blocks.values()) {
+      if (block.instructions.length === 0) {
+        continue;
+      }
+      const blockStart = block.instructions[0].pc;
+      const blockEndInstruction = findLastInstruction(block);
+      const blockEnd = blockEndInstruction ? blockEndInstruction.pc : blockStart;
 
-  const instructions = codeAttr.code.codeItems;
-  if (instructions.length === 0) {
-    return null;
-  }
-
-  const leaders = findLeaders(instructions);
-
-  const entryBlock = new BasicBlock('block_0');
-  const cfg = new CFG(entryBlock.id);
-  cfg.addBlock(entryBlock);
-
-  let currentBlock = entryBlock;
-
-  for (let i = 0; i < instructions.length; i++) {
-    const instr = instructions[i];
-    if (i > 0 && leaders.has(instr.pc)) {
-        const newBlock = new BasicBlock(`block_${instr.pc}`);
-        cfg.addBlock(newBlock);
-
-        const prevInstr = instructions[i - 1];
-        if (prevInstr.instruction) {
-            const prevOp = typeof prevInstr.instruction === 'string' ? prevInstr.instruction : prevInstr.instruction?.op;
-            if (!BLOCK_END_OPCODES.has(prevOp)) {
-                cfg.addEdge(currentBlock.id, newBlock.id);
-            }
-        } else {
-             cfg.addEdge(currentBlock.id, newBlock.id);
+      if (
+        blockStart !== undefined &&
+        blockEnd !== undefined &&
+        blockEnd >= entry.start_pc &&
+        blockStart < entry.end_pc
+      ) {
+        cfg.addEdge(block.id, handlerBlockId);
+        let targets = cfg.exceptionSuccessors.get(block.id);
+        if (!targets) {
+          targets = new Set();
+          cfg.exceptionSuccessors.set(block.id, targets);
         }
-        currentBlock = newBlock;
+        targets.add(handlerBlockId);
+      }
     }
-    currentBlock.addInstruction(instr);
-  }
-
-  // Create jump edges
-  for (const block of cfg.blocks.values()) {
-    if (block.instructions.length === 0) continue;
-    const lastInstr = block.instructions[block.instructions.length - 1];
-    if (!lastInstr.instruction) continue;
-
-    const op = typeof lastInstr.instruction === 'string' ? lastInstr.instruction : lastInstr.instruction?.op;
-
-    if ((BLOCK_END_OPCODES.has(op) || CONDITIONAL_JUMP_OPCODES.has(op)) && lastInstr.instruction.arg) {
-          if (op === 'tableswitch' || op === 'lookupswitch') {
-            const targetLabels = Array.isArray(lastInstr.instruction.arg) ? lastInstr.instruction.arg : [];
-            for (const targetLabel of targetLabels) {
-              const targetPc = instructions.find(inst => inst.labelDef === `${targetLabel}:`)?.pc;
-              if (targetPc !== undefined) {
-                cfg.addEdge(block.id, `block_${targetPc}`);
-              }
-            }
-          } else {
-            // Single target jump
-            const targetLabel = lastInstr.instruction.arg;
-            const targetPc = instructions.find(inst => inst.labelDef === `${targetLabel}:`)?.pc;
-            if (targetPc !== undefined) {
-              cfg.addEdge(block.id, `block_${targetPc}`);
-            }
-          }
-    }
-
   }
 
   return cfg;
