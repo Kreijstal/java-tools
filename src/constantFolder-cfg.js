@@ -220,7 +220,7 @@ function createIntConstantInstruction(value) {
   if (value >= -32768 && value <= 32767) {
     return { op: 'sipush', arg: String(value) };
   }
-  return null;
+  return { op: 'ldc', arg: value };
 }
 
 function createLongConstantInstruction(value) {
