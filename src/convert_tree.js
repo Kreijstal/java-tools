@@ -652,11 +652,18 @@ function convertJson(inputJson, constantPool) {
                   "/",
                 );
 
+          const startLbl = labelMap[ex.start_pc] ?? `L${ex.start_pc}`;
+          const endLbl = labelMap[ex.end_pc] ?? `L${ex.end_pc}`;
+          const handlerLbl = labelMap[ex.handler_pc] ?? `L${ex.handler_pc}`;
+
           return {
             start_pc: ex.start_pc,
             end_pc: ex.end_pc,
             handler_pc: ex.handler_pc,
             catch_type: catchType,
+            startLbl,
+            endLbl,
+            handlerLbl,
           };
         });
       }
@@ -1092,6 +1099,15 @@ function unparseDataStructures(cls, constantPool, options = {}) {
         );
         let codeSection = "";
         if (codeAttribute && codeAttribute.code) {
+          const exceptionLines = (codeAttribute.code.exceptionTable || []).map((ex) => {
+            const catchRef = ex.catch_type === 'any' ? 'any' : ex.catch_type;
+            const fromLbl = ex.fromLbl || ex.startLbl || (typeof ex.start_pc === 'number' ? `L${ex.start_pc}` : ex.start_pc);
+            const toLbl = ex.toLbl || ex.endLbl || (typeof ex.end_pc === 'number' ? `L${ex.end_pc}` : ex.end_pc);
+            const handlerLbl =
+              ex.usingLbl || ex.handlerLbl || (typeof ex.handler_pc === 'number' ? `L${ex.handler_pc}` : ex.handler_pc);
+            return `    .catch ${catchRef} from ${fromLbl} to ${toLbl} using ${handlerLbl}`;
+          });
+
           const codeLines = [
             `    .code stack ${codeAttribute.code.stackSize} locals ${codeAttribute.code.localsSize}`,
             ...codeAttribute.code.codeItems.flatMap((ci) => {
@@ -1110,6 +1126,7 @@ function unparseDataStructures(cls, constantPool, options = {}) {
               }
               return line ? [line] : [];
             }),
+            ...exceptionLines,
             ...codeAttribute.code.attributes.map((attr) =>
               formatCodeAttribute(attr),
             ),

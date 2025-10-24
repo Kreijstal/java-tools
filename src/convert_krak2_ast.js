@@ -2,6 +2,13 @@ const { computeAccessFlags } = require('./access_flags');
 
 const referenceKinds = new Set(['Method', 'InterfaceMethod', 'Field']);
 
+function ensureArray(value) {
+  if (value == null) {
+    return [];
+  }
+  return Array.isArray(value) ? value : [value];
+}
+
 function parseSpecialFloatingLiteral(raw) {
   if (typeof raw !== 'string') {
     return null;
@@ -259,14 +266,43 @@ function convertAttribute(attribute, invokeDynamicMap) {
 
   if (attribute.type === 'code') {
     const code = attribute.code;
+    const exceptionTable = [];
+    const convertedItems = [];
+    ensureArray(code.codeItems).forEach((item) => {
+      if (item && item.type === 'catch') {
+        exceptionTable.push({
+          startLbl: item.fromLbl ?? item.fromLabel ?? item.from,
+          endLbl: item.toLbl ?? item.toLabel ?? item.to,
+          handlerLbl: item.usingLbl ?? item.handlerLabel ?? item.handler,
+          catchType: item.clsref === 'any' ? 'any' : item.clsref,
+        });
+        return;
+      }
+      const converted = convertCodeItem(item, invokeDynamicMap);
+      if (converted) {
+        convertedItems.push(converted);
+      }
+    });
+
+    if (Array.isArray(code.exception_table)) {
+      code.exception_table.forEach((entry) => {
+        exceptionTable.push({
+          startLbl: entry.fromLbl ?? entry.startLbl ?? entry.start,
+          endLbl: entry.toLbl ?? entry.endLbl ?? entry.end,
+          handlerLbl: entry.usingLbl ?? entry.handlerLbl ?? entry.handler,
+          catchType: entry.clsref ?? entry.catchType ?? entry.catch_type ?? 'any',
+        });
+      });
+    }
+
     return {
       type: 'code',
       code: {
         long: code.long,
         stackSize: code.stackSize,
         localsSize: code.localsSize,
-        codeItems: code.codeItems.map(item => convertCodeItem(item, invokeDynamicMap)).filter(Boolean),
-        exceptionTable: [], // Add empty exception table
+        codeItems: convertedItems,
+        exceptionTable,
         attributes: code.attributes.map(attr => convertAttribute(attr, invokeDynamicMap)).filter(Boolean)
       }
     };
