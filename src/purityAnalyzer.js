@@ -42,7 +42,6 @@ const PURE_SAFE_OPS = new Set([
   "jsr_w",
   "ret",
   "getfield",
-  "getstatic",
   "wide",
 ]);
 
@@ -188,6 +187,7 @@ const IMPURE_OPCODE_REASONS = {
   bastore: "array write",
   castore: "array write",
   sastore: "array write",
+  getstatic: "static field read",
 };
 
 const INVOKE_OPS = new Set([
