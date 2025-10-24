@@ -29,11 +29,20 @@ function buildDefUseChains(cfg) {
 
       const consumed = [];
       let remaining = effect.popSlots;
+      let stackUnderflow = false;
       while (remaining > 0) {
         const producer = stack.pop();
-        if (!producer) break;
+        if (!producer) {
+          stackUnderflow = true;
+          break;
+        }
         consumed.push(producer);
         remaining -= producer.width;
+      }
+      if (stackUnderflow) {
+        instr.unsupported = true;
+        instr.error = "Stack underflow during def-use chain construction";
+        continue;
       }
       instr.consumes = consumed;
 
