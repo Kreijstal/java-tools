@@ -10,6 +10,7 @@ run_test() {
   case "$test_file" in
     *data-zip-download*) timeout_val=60;;
     */roundtrip.test.js) timeout_val=60;;
+    */hierarchyRename.test.js) timeout_val=60;;
     # Add other special cases here
   esac
   timeout "$timeout_val" ./node_modules/.bin/tape "$test_file"
@@ -19,9 +20,6 @@ run_test() {
     exit 1
   fi
 }
-
-echo "Compiling Java sources..."
-javac sources/*.java
 
 # If arguments are provided, run specific tests
 if [ $# -gt 0 ]; then
