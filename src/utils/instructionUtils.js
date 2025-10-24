@@ -193,6 +193,30 @@ function getStackEffect(op, instruction = null) {
     return { popSlots: 1, pushSlots: 2, special: 'dup' };
   }
 
+  if (op === 'dup_x1') {
+    return { popSlots: 2, pushSlots: 3, special: 'dup_x1' };
+  }
+
+  if (op === 'dup_x2') {
+    return { popSlots: 3, pushSlots: 4, special: 'dup_x2' };
+  }
+
+  if (op === 'dup2') {
+    return { popSlots: 2, pushSlots: 4, special: 'dup2' };
+  }
+
+  if (op === 'dup2_x1') {
+    return { popSlots: 3, pushSlots: 5, special: 'dup2_x1' };
+  }
+
+  if (op === 'dup2_x2') {
+    return { popSlots: 4, pushSlots: 6, special: 'dup2_x2' };
+  }
+
+  if (op === 'swap') {
+    return { popSlots: 2, pushSlots: 2, special: 'swap' };
+  }
+
   if (CONST_SPECIAL.has(op)) {
     return { popSlots: 0, pushSlots: getConstWidth(op) };
   }

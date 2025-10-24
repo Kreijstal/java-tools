@@ -10,9 +10,11 @@ const { reconstructAstFromCfg } = require('../src/cfg-to-ast');
 const { constantFoldCfg } = require('../src/constantFolder-cfg');
 const { eliminateDeadCodeCfg } = require('../src/deadCodeEliminator-cfg');
 const { inlinePureMethods } = require('../src/inlinePureMethods');
+const { runOptimizationPasses } = require('../src/passManager');
 const { ensureKrak2Path } = require('../src/utils/krakatau');
 
 const JASMIN_DIR = path.join(__dirname, '..', 'examples', 'sources', 'jasmin');
+const JAVA_DIR = path.join(__dirname, '..', 'examples', 'sources', 'java');
 
 function withTempDir(prefix, fn) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -196,6 +198,61 @@ test('constant folding evaluates long, float, and double arithmetic', (t) => {
 
     t.deepEqual(doubleOps, ['ldc2_w', 'dreturn'], 'double method should reduce to a single constant and return');
     t.notOk(doubleOps.includes('dadd'), 'double addition should be removed');
+  });
+});
+
+test('constant folding respects configured instruction limits', (t) => {
+  t.plan(2);
+  const krak2Path = ensureKrak2Path();
+
+  withTempDir('cf-limit-', (tempDir) => {
+    const classPath = assembleJasminFile(tempDir, krak2Path, 'Arithmetic.j');
+    const { classItem } = convertClassFromFile(classPath);
+    const method = findMethod(classItem, (m) => m.name === 'test');
+
+    const cfg = convertAstToCfg(method);
+    const result = constantFoldCfg(cfg, { limits: { maxInstructions: 0 } });
+
+    t.notOk(result.changed, 'constant folder should not change code when the limit is exceeded');
+    t.equal(result.limited, 'instructionLimit', 'limit metadata should report the instruction limit');
+  });
+});
+
+test('pure invocation folding obeys evaluation limits for recursive callees', (t) => {
+  t.plan(4);
+  const krak2Path = ensureKrak2Path();
+  const javacBinary = process.env.JAVAC || 'javac';
+
+  withTempDir('cf-eval-', (tempDir) => {
+    const fibClassPath = assembleJasminFile(tempDir, krak2Path, 'Fib.j');
+    const ackClassPath = assembleJasminFile(tempDir, krak2Path, 'Ackermann.j');
+
+    const javaSource = path.join(JAVA_DIR, 'OptimizerTimeoutTest.java');
+    execFileSync(javacBinary, ['-d', tempDir, '-cp', tempDir, javaSource]);
+
+    const optimizerClassPath = path.join(tempDir, 'OptimizerTimeoutTest.class');
+
+    const fibClass = convertClassFromFile(fibClassPath);
+    const ackClass = convertClassFromFile(ackClassPath);
+    const optimizerClass = convertClassFromFile(optimizerClassPath);
+
+    const program = {
+      classes: [optimizerClass.classItem, fibClass.classItem, ackClass.classItem],
+    };
+
+    runOptimizationPasses(program);
+
+    const optimized = program.classes.find((cls) => cls.className === 'OptimizerTimeoutTest');
+    const fibMethod = findMethod(optimized, (m) => m.name === 'fib');
+    const ackMethod = findMethod(optimized, (m) => m.name === 'ack');
+
+    const fibOps = listInstructionOps(fibMethod);
+    const ackOps = listInstructionOps(ackMethod);
+
+    t.ok(fibOps.includes('ldc2_w'), 'fib helper should fold into a long constant');
+    t.notOk(fibOps.includes('invokestatic'), 'fib helper should not invoke Fib.test after folding');
+    t.ok(ackOps.includes('invokestatic'), 'ack helper should retain the Ackermann invocation when evaluation exceeds limits');
+    t.notOk(ackOps.includes('ldc2_w'), 'ack helper should not reduce to a folded constant');
   });
 });
 

@@ -3,21 +3,33 @@ const { reconstructAstFromCfg } = require('./cfg-to-ast');
 const { constantFoldCfg } = require('./constantFolder-cfg');
 const { eliminateDeadCodeCfg } = require('./deadCodeEliminator-cfg');
 const { inlinePureMethods } = require('./inlinePureMethods');
+const { createStaticInvokeEvaluator } = require('./utils/staticInvokeEvaluator');
 
 function formatMethodSignature(className, method) {
   return `${className}.${method.name}${method.descriptor}`;
 }
 
-function runCfgPasses(program) {
+function runCfgPasses(program, options = {}) {
   const foldChanged = [];
+  const foldLimitHits = [];
   const dceChanged = [];
 
   if (!program || !Array.isArray(program.classes)) {
     return {
-      fold: { changed: false, methods: foldChanged },
+      fold: { changed: false, methods: foldChanged, limitHits: foldLimitHits },
       dce: { changed: false, methods: dceChanged },
     };
   }
+
+  const foldOptions = {};
+  if (options && typeof options.evaluateStaticInvoke === 'function') {
+    foldOptions.evaluateStaticInvoke = options.evaluateStaticInvoke;
+  }
+  if (options && options.limits) {
+    foldOptions.limits = options.limits;
+  }
+  const skipConstantFold = Boolean(options && options.skipConstantFold);
+  const skipDeadCode = Boolean(options && options.skipDeadCode);
 
   for (const cls of program.classes) {
     if (!cls || !Array.isArray(cls.items)) {
@@ -36,13 +48,26 @@ function runCfgPasses(program) {
       }
 
       const cfg = convertAstToCfg(method);
-      const foldResult = constantFoldCfg(cfg);
-      if (foldResult.changed) {
-        foldChanged.push(formatMethodSignature(className, method));
+      let foldResult = { changed: false, optimizedCfg: cfg };
+      if (!skipConstantFold) {
+        foldResult = constantFoldCfg(cfg, foldOptions);
+        if (foldResult.changed) {
+          foldChanged.push(formatMethodSignature(className, method));
+        }
+        if (foldResult.limited) {
+          foldLimitHits.push({
+            method: formatMethodSignature(className, method),
+            reason: foldResult.limited,
+          });
+        }
       }
-      const dceResult = eliminateDeadCodeCfg(cfg);
-      if (dceResult.changed) {
-        dceChanged.push(formatMethodSignature(className, method));
+
+      let dceResult = { changed: false, optimizedCfg: cfg };
+      if (!skipDeadCode) {
+        dceResult = eliminateDeadCodeCfg(cfg);
+        if (dceResult.changed) {
+          dceChanged.push(formatMethodSignature(className, method));
+        }
       }
       if (foldResult.changed || dceResult.changed) {
         const finalCfg = dceResult.optimizedCfg || cfg;
@@ -52,57 +77,96 @@ function runCfgPasses(program) {
   }
 
   return {
-    fold: { changed: foldChanged.length > 0, methods: foldChanged },
+    fold: { changed: foldChanged.length > 0, methods: foldChanged, limitHits: foldLimitHits },
     dce: { changed: dceChanged.length > 0, methods: dceChanged },
   };
 }
 
-function runOptimizationPasses(program) {
+function runOptimizationPasses(program, options = {}) {
   const passes = [];
 
-  const firstInline = inlinePureMethods(program);
-  passes.push({
-    name: 'inlinePureMethods',
-    iteration: 1,
-    changed: firstInline.changed || false,
-    summary: firstInline.summary || null,
-  });
+  const requestedPasses = Array.isArray(options.passes) && options.passes.length > 0
+    ? new Set(options.passes)
+    : null;
+  const includePass = (name) => !requestedPasses || requestedPasses.has(name);
 
-  const firstCfg = runCfgPasses(program);
-  passes.push({
-    name: 'constantFoldCfg',
-    iteration: 2,
-    changed: firstCfg.fold.changed,
-    methods: firstCfg.fold.methods,
-  });
-  passes.push({
-    name: 'eliminateDeadCodeCfg',
-    iteration: 3,
-    changed: firstCfg.dce.changed,
-    methods: firstCfg.dce.methods,
-  });
+  const inlineEnabled = includePass('inlinePureMethods');
+  const foldEnabled = includePass('constantFoldCfg');
+  const dceEnabled = includePass('eliminateDeadCodeCfg');
 
-  const secondInline = inlinePureMethods(program);
-  passes.push({
-    name: 'inlinePureMethods',
-    iteration: 4,
-    changed: secondInline.changed || false,
-    summary: secondInline.summary || null,
-  });
+  if (inlineEnabled) {
+    const firstInline = inlinePureMethods(program);
+    passes.push({
+      name: 'inlinePureMethods',
+      iteration: 1,
+      changed: firstInline.changed || false,
+      summary: firstInline.summary || null,
+    });
+  }
 
-  const secondCfg = runCfgPasses(program);
-  passes.push({
-    name: 'constantFoldCfg',
-    iteration: 5,
-    changed: secondCfg.fold.changed,
-    methods: secondCfg.fold.methods,
-  });
-  passes.push({
-    name: 'eliminateDeadCodeCfg',
-    iteration: 6,
-    changed: secondCfg.dce.changed,
-    methods: secondCfg.dce.methods,
-  });
+  if (foldEnabled || dceEnabled) {
+    const firstEvaluator = foldEnabled ? createStaticInvokeEvaluator(program, options) : null;
+    const firstCfg = runCfgPasses(program, {
+      evaluateStaticInvoke: foldEnabled ? firstEvaluator : null,
+      limits: options.limits,
+      skipConstantFold: !foldEnabled,
+      skipDeadCode: !dceEnabled,
+    });
+    if (foldEnabled) {
+      passes.push({
+        name: 'constantFoldCfg',
+        iteration: 2,
+        changed: firstCfg.fold.changed,
+        methods: firstCfg.fold.methods,
+        limitHits: firstCfg.fold.limitHits,
+      });
+    }
+    if (dceEnabled) {
+      passes.push({
+        name: 'eliminateDeadCodeCfg',
+        iteration: 3,
+        changed: firstCfg.dce.changed,
+        methods: firstCfg.dce.methods,
+      });
+    }
+  }
+
+  if (inlineEnabled) {
+    const secondInline = inlinePureMethods(program);
+    passes.push({
+      name: 'inlinePureMethods',
+      iteration: 4,
+      changed: secondInline.changed || false,
+      summary: secondInline.summary || null,
+    });
+  }
+
+  if (foldEnabled || dceEnabled) {
+    const secondEvaluator = foldEnabled ? createStaticInvokeEvaluator(program, options) : null;
+    const secondCfg = runCfgPasses(program, {
+      evaluateStaticInvoke: foldEnabled ? secondEvaluator : null,
+      limits: options.limits,
+      skipConstantFold: !foldEnabled,
+      skipDeadCode: !dceEnabled,
+    });
+    if (foldEnabled) {
+      passes.push({
+        name: 'constantFoldCfg',
+        iteration: 5,
+        changed: secondCfg.fold.changed,
+        methods: secondCfg.fold.methods,
+        limitHits: secondCfg.fold.limitHits,
+      });
+    }
+    if (dceEnabled) {
+      passes.push({
+        name: 'eliminateDeadCodeCfg',
+        iteration: 6,
+        changed: secondCfg.dce.changed,
+        methods: secondCfg.dce.methods,
+      });
+    }
+  }
 
   const changed = passes.some((pass) => pass.changed);
   return { changed, passes };
