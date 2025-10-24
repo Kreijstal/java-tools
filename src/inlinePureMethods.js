@@ -1,8 +1,7 @@
 const { analyzePurity, _internals: purityInternals } = require('./purityAnalyzer');
-const { _internals: eliminatorInternals } = require('./deadCodeEliminator');
+const { normalizeInstruction, getStackEffect } = require('./utils/instructionUtils');
 
 const { buildMethodSignature } = purityInternals;
-const { normalizeInstruction, getStackEffect } = eliminatorInternals;
 
 const RETURN_PREFIX = new Map([
   ['ireturn', 'i'],
@@ -385,12 +384,12 @@ function inlineInvocation(callerInfo, code, items, index, candidate) {
     return null;
   }
 
-  let localsSize = Number(code.localsSize);
-  if (!Number.isFinite(localsSize)) {
-    localsSize = 0;
+  const localsSizeValue = Number(code.localsSize);
+  if (!Number.isInteger(localsSizeValue) || localsSizeValue < 0) {
+    return null;
   }
-  const tempIndex = localsSize;
-  code.localsSize = String(localsSize + width);
+  const tempIndex = localsSizeValue;
+  code.localsSize = String(localsSizeValue + width);
 
   replacements.push(createInstructionItem(storeOp, tempIndex));
 

@@ -9,19 +9,10 @@ const { convertAstToCfg } = require('../src/ast-to-cfg');
 const { reconstructAstFromCfg } = require('../src/cfg-to-ast');
 const { eliminateDeadCodeCfg } = require('../src/deadCodeEliminator-cfg');
 const { analyzePurityCfg } = require('../src/purityAnalyzer-cfg');
+const { ensureKrak2Path } = require('../src/utils/krakatau');
 
 const JASMIN_DIR = path.join(__dirname, '..', 'examples', 'sources', 'jasmin');
-
-function ensureKrak2Path() {
-  const krak2Path = path.resolve(
-    __dirname,
-    '..', 'tools', 'krakatau', 'Krakatau', 'target', 'release', 'krak2',
-  );
-  if (!fs.existsSync(krak2Path)) {
-    throw new Error(`Krakatau binary not found at ${krak2Path}`);
-  }
-  return krak2Path;
-}
+const JAVA_DIR = path.join(__dirname, '..', 'examples', 'sources', 'java');
 
 function assembleJasminFile(tempDir, krak2Path, jasminFile) {
   const jasminSource = path.join(JASMIN_DIR, jasminFile);
@@ -35,104 +26,138 @@ function convertClassFromFile(classFilePath) {
   const classBytes = fs.readFileSync(classFilePath);
   const parsed = getAST(new Uint8Array(classBytes));
   const converted = convertJson(parsed.ast, parsed.constantPool);
-  const classItem = converted.classes && converted.classes[0];
+  const [classItem] = converted.classes || [];
   if (!classItem) {
     throw new Error(`Failed to convert ${classFilePath} into a class AST.`);
   }
   return { classItem, constantPool: parsed.constantPool };
 }
 
-test('AST -> CFG -> AST roundtrip is non-destructive', (t) => {
-  t.plan(1);
+function findMethod(classItem, predicate) {
+  const { items = [] } = classItem;
+  const methodItem = items.find((item) => item.type === 'method' && predicate(item.method));
+  if (!methodItem) {
+    throw new Error('Requested method was not found in class.');
+  }
+  return methodItem.method;
+}
 
-  const krak2Path = ensureKrak2Path();
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'roundtrip-test-'));
+function getCodeFromMethod(method) {
+  const codeAttr = (method.attributes || []).find(({ type }) => type === 'code');
+  if (!codeAttr) {
+    throw new Error(`Method ${method.name} has no code attribute.`);
+  }
+  return codeAttr.code;
+}
 
+function roundTripMethod(method) {
+  const cfg = convertAstToCfg(method);
+  return reconstructAstFromCfg(cfg, method);
+}
+
+function assertRoundTripEquality(t, method, message) {
+  const roundTripped = roundTripMethod(method);
+  const originalCode = getCodeFromMethod(method);
+  const roundTrippedCode = getCodeFromMethod(roundTripped);
+  const { codeItems: originalItems } = originalCode;
+  const { codeItems: roundTripItems } = roundTrippedCode;
+  t.equal(JSON.stringify(roundTripItems), JSON.stringify(originalItems), message);
+}
+
+function withTempDir(prefix, fn) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   try {
-    const classPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
-    const { classItem: originalAst } = convertClassFromFile(classPath);
-    const originalMethod = originalAst.items.find(item => item.type === 'method').method;
-
-    const cfg = convertAstToCfg(originalMethod);
-    const roundtrippedMethod = reconstructAstFromCfg(cfg, originalMethod);
-
-    // We only care about the codeItems for this test.
-    const originalCode = originalMethod.attributes.find(a => a.type === 'code').code;
-    const roundtrippedCode = roundtrippedMethod.attributes.find(a => a.type === 'code').code;
-
-    // Normalize for comparison
-    const originalCodeItems = JSON.stringify(originalCode.codeItems);
-    const roundtrippedCodeItems = JSON.stringify(roundtrippedCode.codeItems);
-
-    t.equal(roundtrippedCodeItems, originalCodeItems, 'Round-tripped codeItems should be identical');
-
-  } catch (error) {
-    t.fail(error.toString());
+    fn(tempDir);
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
-    t.end();
   }
+}
+
+test('AST -> CFG -> AST roundtrip is non-destructive', (t) => {
+  t.plan(1);
+  const krak2Path = ensureKrak2Path();
+
+  withTempDir('roundtrip-', (tempDir) => {
+    const classPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
+    const { classItem } = convertClassFromFile(classPath);
+    const method = findMethod(classItem, () => true);
+    assertRoundTripEquality(t, method, 'Round-tripped codeItems should be identical');
+  });
+});
+
+test('Roundtrip covers empty bodies, exception handlers, and switch control flow', (t) => {
+  const krak2Path = ensureKrak2Path();
+
+  const fixtures = [
+    { file: 'EmptyBody.j', method: (m) => m.name === 'doNothing', label: 'empty body' },
+    { file: 'TryCatchFlow.j', method: (m) => m.name === 'withException', label: 'exception handler' },
+    { file: 'SwitchFlow.j', method: (m) => m.name === 'dispatch', label: 'tableswitch control flow' },
+    { file: 'SwitchFlow.j', method: (m) => m.name === 'lookup', label: 'lookupswitch control flow' },
+  ];
+
+  t.plan(fixtures.length);
+
+  fixtures.forEach(({ file, method: predicate, label }) => {
+    withTempDir(`roundtrip-${label}-`, (tempDir) => {
+      const classPath = assembleJasminFile(tempDir, krak2Path, file);
+      const { classItem } = convertClassFromFile(classPath);
+      const method = findMethod(classItem, predicate);
+      assertRoundTripEquality(t, method, `Roundtrip should preserve ${label} methods`);
+    });
+  });
 });
 
 test('CFG-based purity analysis', (t) => {
   t.plan(4);
-
   const krak2Path = ensureKrak2Path();
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'purity-test-'));
 
-  try {
-    // Test case 1: A pure method
-    const pureClassPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
-    const { classItem: pureClass } = convertClassFromFile(pureClassPath);
-    const pureMethod = pureClass.items.find(item => item.type === 'method').method;
+  withTempDir('purity-', (tempDir) => {
+    const classPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
+    const { classItem } = convertClassFromFile(classPath);
+    const pureMethod = findMethod(classItem, (m) => m.name === 'useAndReturnFirst');
     const pureCfg = convertAstToCfg(pureMethod);
-    const { isPure: isPureResult, reason: pureReason } = analyzePurityCfg(pureCfg);
-    t.ok(isPureResult, 'useAndReturnFirst should be identified as pure');
-    t.equal(pureReason, null, 'There should be no reason for impurity for useAndReturnFirst');
+    const signature = `${classItem.className}.${pureMethod.name}${pureMethod.descriptor}`;
+    const { isPure, reason } = analyzePurityCfg(pureCfg, {
+      knownPureCallees: new Set([signature]),
+      methodSignature: signature,
+    });
+    t.ok(isPure, 'useAndReturnFirst should be identified as pure');
+    t.equal(reason, null, 'There should be no impurity reason for useAndReturnFirst');
 
-    // Test case 2: An impure method
-    const impureClassPath = assembleJasminFile(tempDir, krak2Path, 'SideEffects.j');
-    const { classItem: impureClass } = convertClassFromFile(impureClassPath);
-    const impureMethod = impureClass.items.find(item => item.type === 'method').method;
+    const sideEffectPath = assembleJasminFile(tempDir, krak2Path, 'SideEffects.j');
+    const { classItem: impureClass } = convertClassFromFile(sideEffectPath);
+    const impureMethod = findMethod(impureClass, (m) => m.name === 'test');
     const impureCfg = convertAstToCfg(impureMethod);
-    const { isPure: isImpureResult, reason: impureReason } = analyzePurityCfg(impureCfg);
-    t.notOk(isImpureResult, 'SideEffects.test should be identified as impure');
+    const { isPure: impureResult, reason: impureReason } = analyzePurityCfg(impureCfg);
+    t.notOk(impureResult, 'SideEffects.test should be identified as impure');
     t.ok(impureReason.includes('putstatic'), 'Impurity reason should mention putstatic');
-
-  } catch (error) {
-    t.fail(error.toString());
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    t.end();
-  }
+  });
 });
 
 test('Optimized code is executable', (t) => {
   t.plan(1);
-
   const krak2Path = ensureKrak2Path();
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'optimized-executable-test-'));
 
-  try {
+  withTempDir('optimized-', (tempDir) => {
     const classPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
     const { classItem, constantPool } = convertClassFromFile(classPath);
-    const originalMethod = classItem.items.find(item => item.type === 'method').method;
+    const method = findMethod(classItem, (m) => m.name === 'useAndReturnFirst');
 
-    const cfg = convertAstToCfg(originalMethod);
+    const cfg = convertAstToCfg(method);
     const { optimizedCfg } = eliminateDeadCodeCfg(cfg);
-    const optimizedMethod = reconstructAstFromCfg(optimizedCfg, originalMethod);
+    const optimizedMethod = reconstructAstFromCfg(optimizedCfg, method);
 
-    const methodIndex = classItem.items.findIndex(item => item.type === 'method');
-    classItem.items[methodIndex].method = optimizedMethod;
+    const { items } = classItem;
+    const methodIndex = items.findIndex((item) => item.type === 'method' && item.method.name === method.name);
+    items[methodIndex].method = optimizedMethod;
 
-    const newJasmin = unparseDataStructures(classItem, constantPool);
+    const jasminSource = unparseDataStructures(classItem, constantPool);
     const newJasminPath = path.join(tempDir, 'ReturnFirst.opt.j');
-    fs.writeFileSync(newJasminPath, newJasmin);
+    fs.writeFileSync(newJasminPath, jasminSource);
 
     const newClassPath = path.join(tempDir, 'ReturnFirst.opt.class');
     execFileSync(krak2Path, ['asm', newJasminPath, '--out', newClassPath]);
 
-    const JAVA_DIR = path.join(__dirname, '..', 'examples', 'sources', 'java');
     const javaSource = path.join(JAVA_DIR, 'ReturnFirstTest.java');
     const javacBinary = process.env.JAVAC || 'javac';
     execFileSync(javacBinary, ['-d', tempDir, '-cp', tempDir, javaSource]);
@@ -141,70 +166,51 @@ test('Optimized code is executable', (t) => {
     execFileSync(javaBinary, ['-cp', tempDir, 'ReturnFirstTest']);
 
     t.pass('Optimized code assembled and executed successfully');
-
-  } catch (error) {
-    t.fail(error.toString());
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    t.end();
-  }
+  });
 });
 
 test('CFG-based dead code elimination removes dead code', (t) => {
   t.plan(2);
-
   const krak2Path = ensureKrak2Path();
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dce-test-'));
 
-  try {
+  withTempDir('dce-', (tempDir) => {
     const classPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
     const { classItem } = convertClassFromFile(classPath);
-    const method = classItem.items.find(item => item.type === 'method').method;
+    const method = findMethod(classItem, (m) => m.name === 'useAndReturnFirst');
 
     const cfg = convertAstToCfg(method);
     const { changed, optimizedCfg } = eliminateDeadCodeCfg(cfg);
 
     t.ok(changed, 'Should report changes for dead code');
 
-    const instructionCount = optimizedCfg.blocks.get('block_0').instructions.filter(i => i.instruction).length;
-    t.equal(instructionCount, 2, 'Should remove dead instructions');
-
-  } catch (error) {
-    t.fail(error.toString());
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    t.end();
-  }
+    const entryBlock = optimizedCfg.blocks.get('block_0');
+    const remaining = entryBlock.instructions.filter((instruction) => instruction.instruction);
+    t.equal(remaining.length, 2, 'Should remove dead instructions');
+  });
 });
 
 test('Round-tripped code is executable', (t) => {
   t.plan(1);
-
   const krak2Path = ensureKrak2Path();
-  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'executable-test-'));
 
-  try {
+  withTempDir('roundtrip-exec-', (tempDir) => {
     const classPath = assembleJasminFile(tempDir, krak2Path, 'ReturnFirst.j');
     const { classItem, constantPool } = convertClassFromFile(classPath);
-    const originalMethod = classItem.items.find(item => item.type === 'method').method;
+    const method = findMethod(classItem, (m) => m.name === 'useAndReturnFirst');
 
-    const cfg = convertAstToCfg(originalMethod);
-    const roundtrippedMethod = reconstructAstFromCfg(cfg, originalMethod);
+    const roundTrippedMethod = roundTripMethod(method);
 
-    // Replace the method in the class AST
-    const methodIndex = classItem.items.findIndex(item => item.type === 'method');
-    classItem.items[methodIndex].method = roundtrippedMethod;
+    const { items } = classItem;
+    const methodIndex = items.findIndex((item) => item.type === 'method' && item.method.name === method.name);
+    items[methodIndex].method = roundTrippedMethod;
 
-    const newJasmin = unparseDataStructures(classItem, constantPool);
-    const newJasminPath = path.join(tempDir, 'ReturnFirst.rt.j');
-    fs.writeFileSync(newJasminPath, newJasmin);
+    const jasminSource = unparseDataStructures(classItem, constantPool);
+    const jasminPath = path.join(tempDir, 'ReturnFirst.rt.j');
+    fs.writeFileSync(jasminPath, jasminSource);
 
-    // Assemble the new Jasmin file
-    const newClassPath = path.join(tempDir, 'ReturnFirst.rt.class');
-    execFileSync(krak2Path, ['asm', newJasminPath, '--out', newClassPath]);
+    const classOutput = path.join(tempDir, 'ReturnFirst.rt.class');
+    execFileSync(krak2Path, ['asm', jasminPath, '--out', classOutput]);
 
-    // To execute, we need the test class as well
-    const JAVA_DIR = path.join(__dirname, '..', 'examples', 'sources', 'java');
     const javaSource = path.join(JAVA_DIR, 'ReturnFirstTest.java');
     const javacBinary = process.env.JAVAC || 'javac';
     execFileSync(javacBinary, ['-d', tempDir, '-cp', tempDir, javaSource]);
@@ -213,11 +219,5 @@ test('Round-tripped code is executable', (t) => {
     execFileSync(javaBinary, ['-cp', tempDir, 'ReturnFirstTest']);
 
     t.pass('Round-tripped code assembled and executed successfully');
-
-  } catch (error) {
-    t.fail(error.toString());
-  } finally {
-    fs.rmSync(tempDir, { recursive: true, force: true });
-    t.end();
-  }
+  });
 });

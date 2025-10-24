@@ -6,8 +6,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { getAST } = require('jvm_parser');
 const { convertJson, unparseDataStructures } = require('../../src/convert_tree');
-const { eliminateDeadCode } = require('../../src/deadCodeEliminator');
-const { inlinePureMethods } = require('../../src/inlinePureMethods');
+const { runOptimizationPasses } = require('../../src/passManager');
+const { ensureKrak2Path } = require('../../src/utils/krakatau');
 
 function validatePath(filePath, baseDir) {
   const resolvedPath = path.resolve(filePath);
@@ -20,17 +20,6 @@ function validatePath(filePath, baseDir) {
 
 const JASMIN_DIR = path.join(__dirname, '..', 'sources', 'jasmin');
 const JAVA_DIR = path.join(__dirname, '..', 'sources', 'java');
-
-function ensureKrak2Path() {
-  const krak2Path = path.resolve(
-    __dirname,
-    '../../tools/krakatau/Krakatau/target/release/krak2',
-  );
-  if (!fs.existsSync(krak2Path)) {
-    throw new Error(`Krakatau binary not found at ${krak2Path}`);
-  }
-  return krak2Path;
-}
 
 function assembleReturnFirst(tempDir, krak2Path) {
   const jasminSource = path.join(JASMIN_DIR, 'ReturnFirst.j');
@@ -110,13 +99,15 @@ function main() {
     classes: [returnFirst.classItem, returnFirstTest.classItem],
   };
 
-  const { changed: inlined } = inlinePureMethods(program);
-  if (!inlined) {
+  const { passes } = runOptimizationPasses(program);
+
+  const firstInline = passes.find((pass) => pass.name === 'inlinePureMethods' && pass.iteration === 1);
+  if (!firstInline || !firstInline.changed) {
     console.warn('Inlining reported no changes for the ReturnFirst demo.');
   }
 
-  const { changed: eliminated } = eliminateDeadCode(program);
-  if (!eliminated) {
+  const firstDce = passes.find((pass) => pass.name === 'eliminateDeadCodeCfg' && pass.iteration === 3);
+  if (!firstDce || !firstDce.changed) {
     console.warn('Dead-code elimination reported no changes after inlining.');
   }
 
