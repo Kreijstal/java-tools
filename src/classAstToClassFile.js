@@ -1952,7 +1952,7 @@ function writeConstantPool(writer, entries) {
       case 5: { // Long
         const value = entry.value;
         const buffer = Buffer.allocUnsafe(8);
-        buffer.writeBigInt64BE(BigInt(value));
+        buffer.writeBigInt64BE(value);
         writer.writeBytes(buffer);
         break;
       }
