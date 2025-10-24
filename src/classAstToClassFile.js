@@ -150,7 +150,7 @@ function parseStringLiteral(raw) {
     try {
       return JSON.parse(trimmed);
     } catch (e) {
-      return trimmed.slice(1, -1);
+      throw new Error(`Failed to parse string literal '${raw}': ${e.message}`);
     }
   }
   return raw;
