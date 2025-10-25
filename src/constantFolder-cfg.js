@@ -1,4 +1,5 @@
-const { getStackEffect, normalizeInstruction } = require('./utils/instructionUtils');
+const { getStackEffect, normalizeInstruction, parseLocalOperation } = require('./utils/instructionUtils');
+const { applyStackManipulation } = require('./utils/stackManipulation');
 
 const INT_BINARY_OPS = new Set([
   'iadd',
@@ -73,6 +74,12 @@ const FLOAT_VIEW = new DataView(new ArrayBuffer(4));
 
 const LONG_MASK = (1n << 64n) - 1n;
 const LONG_SIGN = 1n << 63n;
+const INT_MIN = -0x80000000;
+const INT_MAX = 0x7fffffff;
+const LONG_MIN = -(1n << 63n);
+const LONG_MAX = (1n << 63n) - 1n;
+const LONG_MIN_NUMBER = Number(LONG_MIN);
+const LONG_MAX_NUMBER = Number(LONG_MAX);
 
 const DEFAULT_LIMITS = {
   maxIterations: 20000,
@@ -174,6 +181,39 @@ function normalizeLong(value) {
   return result;
 }
 
+function convertFloatingToInt(value) {
+  if (Number.isNaN(value)) {
+    return 0;
+  }
+  if (!Number.isFinite(value)) {
+    return value > 0 ? INT_MAX : INT_MIN;
+  }
+  if (value >= INT_MAX) {
+    return INT_MAX;
+  }
+  if (value <= INT_MIN) {
+    return INT_MIN;
+  }
+  return toInt32(Math.trunc(value));
+}
+
+function convertFloatingToLong(value) {
+  if (Number.isNaN(value)) {
+    return 0n;
+  }
+  if (!Number.isFinite(value)) {
+    return value > 0 ? LONG_MAX : LONG_MIN;
+  }
+  if (value >= LONG_MAX_NUMBER) {
+    return LONG_MAX;
+  }
+  if (value <= LONG_MIN_NUMBER) {
+    return LONG_MIN;
+  }
+  const truncated = Math.trunc(value);
+  return BigInt(truncated);
+}
+
 function createUnknown(width = 1) {
   return { kind: 'unknown', width, removable: false };
 }
@@ -222,232 +262,24 @@ function cloneForDuplicate(value) {
 }
 
 function handleStackManipulation(effect, consumed, stack) {
-  const [v1, v2, v3, v4] = consumed;
-
-  switch (effect.special) {
-    case 'dup': {
-      if (!v1 || v1.width !== 1 || consumed.length !== 1) {
-        return false;
-      }
-      markNotRemovable(v1);
-      const duplicate = cloneForDuplicate(v1);
-      if (!duplicate) {
-        return false;
-      }
-      stack.push(v1);
-      stack.push(duplicate);
+  return applyStackManipulation(effect, consumed, stack, {
+    prepareValue: (value) => {
+      markNotRemovable(value);
       return true;
-    }
-    case 'dup_x1': {
-      if (!v1 || !v2 || v1.width !== 1 || v2.width !== 1 || consumed.length !== 2) {
-        return false;
-      }
-      markNotRemovable(v1);
-      markNotRemovable(v2);
-      const duplicate = cloneForDuplicate(v1);
+    },
+    pushOriginal: (value) => {
+      stack.push(value);
+      return true;
+    },
+    pushDuplicate: (value) => {
+      const duplicate = cloneForDuplicate(value);
       if (!duplicate) {
         return false;
       }
       stack.push(duplicate);
-      stack.push(v2);
-      stack.push(v1);
       return true;
-    }
-    case 'dup_x2': {
-      if (consumed.length === 3 && v1 && v2 && v3 && v1.width === 1 && v2.width === 1 && v3.width === 1) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        markNotRemovable(v3);
-        const duplicate = cloneForDuplicate(v1);
-        if (!duplicate) {
-          return false;
-        }
-        stack.push(duplicate);
-        stack.push(v3);
-        stack.push(v2);
-        stack.push(v1);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 1 && v2.width === 2) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        const duplicate = cloneForDuplicate(v1);
-        if (!duplicate) {
-          return false;
-        }
-        stack.push(duplicate);
-        stack.push(v2);
-        stack.push(v1);
-        return true;
-      }
-      return false;
-    }
-    case 'dup2': {
-      if (consumed.length === 1 && v1 && v1.width === 2) {
-        markNotRemovable(v1);
-        const duplicate = cloneForDuplicate(v1);
-        if (!duplicate) {
-          return false;
-        }
-        stack.push(v1);
-        stack.push(duplicate);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 1 && v2.width === 1) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        const dupV2 = cloneForDuplicate(v2);
-        const dupV1 = cloneForDuplicate(v1);
-        if (!dupV2 || !dupV1) {
-          return false;
-        }
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(dupV2);
-        stack.push(dupV1);
-        return true;
-      }
-      return false;
-    }
-    case 'dup2_x1': {
-      if (
-        consumed.length === 3 &&
-        v1 && v2 && v3 &&
-        v1.width === 1 &&
-        v2.width === 1 &&
-        v3.width === 1
-      ) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        markNotRemovable(v3);
-        const dupV2 = cloneForDuplicate(v2);
-        const dupV1 = cloneForDuplicate(v1);
-        if (!dupV2 || !dupV1) {
-          return false;
-        }
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(v3);
-        stack.push(dupV2);
-        stack.push(dupV1);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 2 && v2.width === 1) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        const duplicate = cloneForDuplicate(v1);
-        if (!duplicate) {
-          return false;
-        }
-        stack.push(v1);
-        stack.push(v2);
-        stack.push(duplicate);
-        return true;
-      }
-      return false;
-    }
-    case 'dup2_x2': {
-      if (
-        consumed.length === 4 &&
-        v1 &&
-        v2 &&
-        v3 &&
-        v4 &&
-        v1.width === 1 &&
-        v2.width === 1 &&
-        v3.width === 1 &&
-        v4.width === 1
-      ) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        markNotRemovable(v3);
-        markNotRemovable(v4);
-        const dupV2 = cloneForDuplicate(v2);
-        const dupV1 = cloneForDuplicate(v1);
-        if (!dupV2 || !dupV1) {
-          return false;
-        }
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(v4);
-        stack.push(v3);
-        stack.push(dupV2);
-        stack.push(dupV1);
-        return true;
-      }
-      if (
-        consumed.length === 3 &&
-        v1 &&
-        v2 &&
-        v3 &&
-        v1.width === 2 &&
-        v2.width === 1 &&
-        v3.width === 1
-      ) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        markNotRemovable(v3);
-        const duplicate = cloneForDuplicate(v1);
-        if (!duplicate) {
-          return false;
-        }
-        stack.push(v1);
-        stack.push(v3);
-        stack.push(v2);
-        stack.push(duplicate);
-        return true;
-      }
-      if (
-        consumed.length === 3 &&
-        v1 &&
-        v2 &&
-        v3 &&
-        v1.width === 1 &&
-        v2.width === 1 &&
-        v3.width === 2
-      ) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        markNotRemovable(v3);
-        const dupV2 = cloneForDuplicate(v2);
-        const dupV1 = cloneForDuplicate(v1);
-        if (!dupV2 || !dupV1) {
-          return false;
-        }
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(v3);
-        stack.push(dupV2);
-        stack.push(dupV1);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 2 && v2.width === 2) {
-        markNotRemovable(v1);
-        markNotRemovable(v2);
-        const duplicate = cloneForDuplicate(v1);
-        if (!duplicate) {
-          return false;
-        }
-        stack.push(v1);
-        stack.push(v2);
-        stack.push(duplicate);
-        return true;
-      }
-      return false;
-    }
-    case 'swap': {
-      if (!v1 || !v2 || v1.width !== 1 || v2.width !== 1 || consumed.length !== 2) {
-        return false;
-      }
-      markNotRemovable(v1);
-      markNotRemovable(v2);
-      stack.push(v1);
-      stack.push(v2);
-      return true;
-    }
-    default:
-      return false;
-  }
+    },
+  });
 }
 
 function parseIntArg(arg) {
@@ -1245,6 +1077,32 @@ function simulateBlock(block, entryStack, entryLocals, blockId, context, options
             produced = [createConstantValue(context, 'double', result, 2, blockId, item, true)];
           }
         }
+      } else if (normalized.op === 'f2i' || normalized.op === 'd2i') {
+        const source = consumed[0];
+        const expectedType = normalized.op === 'f2i' ? 'float' : 'double';
+        if (source && source.kind === 'constant' && source.type === expectedType) {
+          const numeric = expectedType === 'float' ? toFloat32(source.value) : source.value;
+          const converted = convertFloatingToInt(numeric);
+          const replacement = createIntConstantInstruction(converted);
+          const removable = Boolean(replacement) && canRemoveValue(source, blockId);
+          if (replacement && removable) {
+            fold = { replacement, consumed: [...consumed], value: converted };
+            produced = [createConstantValue(context, 'int', converted, 1, blockId, item, true)];
+          }
+        }
+      } else if (normalized.op === 'f2l' || normalized.op === 'd2l') {
+        const source = consumed[0];
+        const expectedType = normalized.op === 'f2l' ? 'float' : 'double';
+        if (source && source.kind === 'constant' && source.type === expectedType) {
+          const numeric = expectedType === 'float' ? toFloat32(source.value) : source.value;
+          const converted = convertFloatingToLong(numeric);
+          const replacement = createLongConstantInstruction(converted);
+          const removable = Boolean(replacement) && canRemoveValue(source, blockId);
+          if (replacement && removable) {
+            fold = { replacement, consumed: [...consumed], value: converted };
+            produced = [createConstantValue(context, 'long', converted, 2, blockId, item, true)];
+          }
+        }
       } else if (normalized.op === 'lcmp') {
         const right = consumed[0];
         const left = consumed[1];
@@ -1369,28 +1227,6 @@ function simulateBlock(block, entryStack, entryLocals, blockId, context, options
   }
 
   return { exitStack: stack, exitLocals: locals, instructions, failed: false };
-}
-
-function parseLocalOperation(normalized, original) {
-  if (!normalized || !normalized.op) {
-    return null;
-  }
-  const { op } = normalized;
-  if (op.includes('_')) {
-    const [base, suffix] = op.split('_');
-    const index = Number.parseInt(suffix, 10);
-    if (!Number.isInteger(index)) {
-      return null;
-    }
-    return { base, index };
-  }
-  if (original && typeof original === 'object' && original.arg !== undefined) {
-    const index = Number.parseInt(original.arg, 10);
-    if (Number.isInteger(index)) {
-      return { base: op, index };
-    }
-  }
-  return null;
 }
 
 function constantFoldCfg(cfg, options = {}) {

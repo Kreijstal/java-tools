@@ -404,7 +404,30 @@ function getStackEffect(op, instruction = null) {
   return null;
 }
 
+function parseLocalOperation(normalized, original) {
+  if (!normalized || !normalized.op) {
+    return null;
+  }
+  const { op } = normalized;
+  if (op.includes('_')) {
+    const [base, suffix] = op.split('_');
+    const index = Number.parseInt(suffix, 10);
+    if (!Number.isInteger(index)) {
+      return null;
+    }
+    return { base, index };
+  }
+  if (original && typeof original === 'object' && original.arg !== undefined) {
+    const index = Number.parseInt(original.arg, 10);
+    if (Number.isInteger(index)) {
+      return { base: op, index };
+    }
+  }
+  return null;
+}
+
 module.exports = {
   getStackEffect,
   normalizeInstruction,
+  parseLocalOperation,
 };

@@ -3,6 +3,8 @@
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
+const yargs = require('yargs/yargs');
+const { hideBin } = require('yargs/helpers');
 const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../src/convert_tree');
@@ -79,9 +81,14 @@ function parsePassList(value) {
   if (!value) {
     return [];
   }
+  const raw = Array.isArray(value) ? value : [value];
+  const tokens = raw
+    .flatMap((entry) => String(entry).split(','))
+    .map((token) => token.trim())
+    .filter((token) => token.length > 0);
   const seen = new Set();
   const result = [];
-  for (const token of value.split(',')) {
+  for (const token of tokens) {
     const resolved = resolvePassName(token);
     if (resolved && !seen.has(resolved)) {
       seen.add(resolved);
@@ -92,104 +99,111 @@ function parsePassList(value) {
 }
 
 function parseArgs(argv) {
-  const options = {
-    inputs: [],
-    classpath: [],
-    output: null,
-    limits: {},
-    passes: [],
-    help: false,
-    listPasses: false,
+  const parser = yargs(hideBin(argv))
+    .option('input', {
+      alias: ['i', 'inputs'],
+      type: 'string',
+      array: true,
+      description: 'Add a .class file or directory containing classes to optimize.',
+    })
+    .option('classpath', {
+      alias: ['c', 'class-path'],
+      type: 'string',
+      array: true,
+      description: 'Additional directories or JARs containing dependency classes.',
+    })
+    .option('output', {
+      alias: 'o',
+      type: 'string',
+      description: 'Directory where optimized classes will be written.',
+    })
+    .option('passes', {
+      type: 'string',
+      array: true,
+      description: 'Comma-separated list of passes to run (default: all).',
+    })
+    .option('max-instructions', {
+      alias: ['maxInstructions', 'max_instructions'],
+      type: 'string',
+      description: 'Override the constant-folding instruction limit.',
+      coerce: (value) => {
+        const values = Array.isArray(value) ? value : [value];
+        const lastValue = values[values.length - 1];
+        return parseNumericOption(lastValue, '--max-instructions');
+      },
+    })
+    .option('max-iterations', {
+      alias: ['maxIterations', 'max_iterations'],
+      type: 'string',
+      description: 'Override the constant-folding iteration limit.',
+      coerce: (value) => {
+        const values = Array.isArray(value) ? value : [value];
+        const lastValue = values[values.length - 1];
+        return parseNumericOption(lastValue, '--max-iterations');
+      },
+    })
+    .option('max-tracked-values', {
+      alias: ['maxTrackedValues', 'max_tracked_values'],
+      type: 'string',
+      description: 'Override the constant-folding tracked value limit.',
+      coerce: (value) => {
+        const values = Array.isArray(value) ? value : [value];
+        const lastValue = values[values.length - 1];
+        return parseNumericOption(lastValue, '--max-tracked-values');
+      },
+    })
+    .option('list-passes', {
+      type: 'boolean',
+      description: 'List available passes and exit.',
+    })
+    .option('help', {
+      alias: 'h',
+      type: 'boolean',
+      description: 'Show this help message.',
+    })
+    .strict()
+    .fail((msg, error) => {
+      throw error || new Error(msg);
+    });
+
+  const parsed = parser.parse();
+  const normalize = (value) => {
+    if (value === undefined || value === null) {
+      return [];
+    }
+    return Array.isArray(value) ? value : [value];
   };
 
-  const args = argv.slice(2);
-  for (let i = 0; i < args.length; i += 1) {
-    let arg = args[i];
-    if (arg === '--help' || arg === '-h') {
-      options.help = true;
-      continue;
-    }
-    if (arg === '--list-passes') {
-      options.listPasses = true;
-      continue;
-    }
+  const positionalInputs = (parsed._ || [])
+    .map((entry) => String(entry))
+    .filter((entry) => entry.length > 0);
 
-    let value = null;
-    if (arg.startsWith('--')) {
-      const eqIndex = arg.indexOf('=');
-      if (eqIndex !== -1) {
-        value = arg.slice(eqIndex + 1);
-        arg = arg.slice(0, eqIndex);
-      } else {
-        i += 1;
-        if (i >= args.length) {
-          throw new Error(`Flag ${arg} expects a value.`);
-        }
-        value = args[i];
-      }
-    } else if (arg.startsWith('-')) {
-      switch (arg) {
-        case '-i':
-        case '-c':
-        case '-o':
-          i += 1;
-          if (i >= args.length) {
-            throw new Error(`Flag ${arg} expects a value.`);
-          }
-          value = args[i];
-          break;
-        default:
-          throw new Error(`Unknown flag ${arg}.`);
-      }
-    }
+  const inputs = [...normalize(parsed.input), ...positionalInputs].filter(Boolean);
+  const classpath = normalize(parsed.classpath)
+    .flatMap((entry) => splitClasspath(entry))
+    .filter(Boolean);
+  const passes = parsePassList(parsed.passes);
 
-    switch (arg) {
-      case '--input':
-      case '--inputs':
-      case '-i':
-        options.inputs.push(value);
-        break;
-      case '--classpath':
-      case '--class-path':
-      case '-c':
-        options.classpath.push(...splitClasspath(value));
-        break;
-      case '--output':
-      case '-o':
-        options.output = value;
-        break;
-      case '--passes':
-        options.passes = parsePassList(value);
-        break;
-      case '--max-instructions':
-      case '--maxInstructions':
-      case '--max_instructions':
-        options.limits.maxInstructions = parseNumericOption(value, arg);
-        break;
-      case '--max-iterations':
-      case '--maxIterations':
-      case '--max_iterations':
-        options.limits.maxIterations = parseNumericOption(value, arg);
-        break;
-      case '--max-tracked-values':
-      case '--maxTrackedValues':
-      case '--max_tracked_values':
-        options.limits.maxTrackedValues = parseNumericOption(value, arg);
-        break;
-      default:
-        if (arg.startsWith('--')) {
-          throw new Error(`Unknown flag ${arg}.`);
-        }
-        // Positional arguments fall back to inputs
-        options.inputs.push(arg);
-        break;
-    }
+  const limits = {};
+  if (parsed.maxInstructions !== undefined) {
+    limits.maxInstructions = parsed.maxInstructions;
+  }
+  if (parsed.maxIterations !== undefined) {
+    limits.maxIterations = parsed.maxIterations;
+  }
+  if (parsed.maxTrackedValues !== undefined) {
+    limits.maxTrackedValues = parsed.maxTrackedValues;
   }
 
-  options.inputs = options.inputs.filter((entry) => Boolean(entry));
-  options.classpath = options.classpath.filter((entry) => Boolean(entry));
-
-  return options;
+  return {
+    inputs,
+    classpath,
+    output: parsed.output || null,
+    limits,
+    passes,
+    help: Boolean(parsed.help),
+    listPasses: Boolean(parsed.listPasses),
+  };
 }
 
 function ensureDirectory(dirPath) {
