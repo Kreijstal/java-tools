@@ -84,7 +84,7 @@ function parsePassList(value) {
   const raw = Array.isArray(value) ? value : [value];
   const tokens = [];
   for (const entry of raw) {
-    if (entry === undefined || entry === null) {
+    if (entry == null) {
       continue;
     }
     if (typeof entry !== 'string') {
