@@ -238,6 +238,7 @@ function convertAstToCfg(method) {
     }
   }
 
+  const handlerEntries = [];
   for (const entry of exceptionTable) {
     if (!entry || typeof entry.start_pc !== 'number' || typeof entry.end_pc !== 'number') {
       continue;
@@ -251,28 +252,43 @@ function convertAstToCfg(method) {
       continue;
     }
     cfg.handlerBlocks.add(handlerBlockId);
+    handlerEntries.push({
+      start: entry.start_pc,
+      end: entry.end_pc,
+      handlerBlockId,
+    });
+  }
 
-    for (const block of cfg.blocks.values()) {
-      if (block.instructions.length === 0) {
-        continue;
-      }
-      const blockStart = block.instructions[0].pc;
-      const blockEndInstruction = findLastInstruction(block);
-      const blockEnd = blockEndInstruction ? blockEndInstruction.pc : blockStart;
+  const blockRanges = [];
+  for (const block of cfg.blocks.values()) {
+    if (!block || block.instructions.length === 0) {
+      continue;
+    }
+    const blockStart = block.instructions[0].pc;
+    const blockEndInstruction = findLastInstruction(block);
+    const blockEnd = blockEndInstruction ? blockEndInstruction.pc : blockStart;
+    blockRanges.push({ block, start: blockStart, end: blockEnd });
+  }
 
+  for (const { block, start, end } of blockRanges) {
+    if (!block || start === undefined || end === undefined) {
+      continue;
+    }
+    for (const handler of handlerEntries) {
       if (
-        blockStart !== undefined &&
-        blockEnd !== undefined &&
-        blockEnd >= entry.start_pc &&
-        blockStart < entry.end_pc
+        handler &&
+        handler.start !== undefined &&
+        handler.end !== undefined &&
+        end >= handler.start &&
+        start < handler.end
       ) {
-        cfg.addEdge(block.id, handlerBlockId);
+        cfg.addEdge(block.id, handler.handlerBlockId);
         let targets = cfg.exceptionSuccessors.get(block.id);
         if (!targets) {
           targets = new Set();
           cfg.exceptionSuccessors.set(block.id, targets);
         }
-        targets.add(handlerBlockId);
+        targets.add(handler.handlerBlockId);
       }
     }
   }
