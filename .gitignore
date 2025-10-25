@@ -41,3 +41,5 @@ jvm-debug.js
 test/temp*
 jvm-debug.js.LICENSE.txt
 src/jre/index.js
+# Example output artifacts
+examples/output/
