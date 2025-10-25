@@ -1,5 +1,5 @@
 const { analyzePurity, _internals: purityInternals } = require('../purityAnalyzer');
-const { normalizeInstruction } = require('./instructionUtils');
+const { normalizeInstruction, parseLocalOperation } = require('./instructionUtils');
 
 const { buildMethodSignature } = purityInternals;
 
@@ -384,30 +384,6 @@ function popLong(stack) {
   return value.value;
 }
 
-function getLocalIndex(op, original) {
-  if (!op) {
-    return null;
-  }
-
-  if (op.includes('_')) {
-    const [base, suffix] = op.split('_');
-    const index = Number.parseInt(suffix, 10);
-    if (!Number.isInteger(index)) {
-      return null;
-    }
-    return { base, index };
-  }
-
-  if (original && typeof original === 'object' && original.arg !== undefined) {
-    const index = Number.parseInt(original.arg, 10);
-    if (Number.isInteger(index)) {
-      return { base: op, index };
-    }
-  }
-
-  return null;
-}
-
 function loadLocal(frame, descriptor, state) {
   if (!descriptor) {
     return false;
@@ -588,7 +564,7 @@ function runFrame(methodInfo, frame, state, methods, purity, callStack) {
       case 'iload_2':
       case 'iload_3':
       case 'iload': {
-        const descriptor = getLocalIndex(op, original);
+        const descriptor = parseLocalOperation({ op }, original);
         if (!descriptor || !loadLocal(frame, descriptor, state)) {
           return { status: 'unsupported' };
         }
@@ -600,7 +576,7 @@ function runFrame(methodInfo, frame, state, methods, purity, callStack) {
       case 'istore_2':
       case 'istore_3':
       case 'istore': {
-        const descriptor = getLocalIndex(op, original);
+        const descriptor = parseLocalOperation({ op }, original);
         if (!descriptor || !storeLocal(frame, descriptor, state)) {
           return { status: 'unsupported' };
         }
@@ -612,7 +588,7 @@ function runFrame(methodInfo, frame, state, methods, purity, callStack) {
       case 'lload_2':
       case 'lload_3':
       case 'lload': {
-        const descriptor = getLocalIndex(op, original);
+        const descriptor = parseLocalOperation({ op }, original);
         if (!descriptor || !loadLocal(frame, descriptor, state)) {
           return { status: 'unsupported' };
         }
@@ -624,7 +600,7 @@ function runFrame(methodInfo, frame, state, methods, purity, callStack) {
       case 'lstore_2':
       case 'lstore_3':
       case 'lstore': {
-        const descriptor = getLocalIndex(op, original);
+        const descriptor = parseLocalOperation({ op }, original);
         if (!descriptor || !storeLocal(frame, descriptor, state)) {
           return { status: 'unsupported' };
         }
