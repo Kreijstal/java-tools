@@ -279,16 +279,18 @@ function convertAstToCfg(method) {
         handler &&
         handler.start !== undefined &&
         handler.end !== undefined &&
+        handler.handlerBlockId &&
         end >= handler.start &&
         start < handler.end
       ) {
-        cfg.addEdge(block.id, handler.handlerBlockId);
+        const handlerBlockId = handler.handlerBlockId;
+        cfg.addEdge(block.id, handlerBlockId);
         let targets = cfg.exceptionSuccessors.get(block.id);
         if (!targets) {
           targets = new Set();
           cfg.exceptionSuccessors.set(block.id, targets);
         }
-        targets.add(handler.handlerBlockId);
+        targets.add(handlerBlockId);
       }
     }
   }

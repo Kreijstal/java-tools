@@ -82,10 +82,21 @@ function parsePassList(value) {
     return [];
   }
   const raw = Array.isArray(value) ? value : [value];
-  const tokens = raw
-    .flatMap((entry) => String(entry).split(','))
-    .map((token) => token.trim())
-    .filter((token) => token.length > 0);
+  const tokens = [];
+  for (const entry of raw) {
+    if (entry === undefined || entry === null) {
+      continue;
+    }
+    if (typeof entry !== 'string') {
+      throw new Error('Pass list entries must be strings.');
+    }
+    for (const token of entry.split(',')) {
+      const trimmed = token.trim();
+      if (trimmed.length > 0) {
+        tokens.push(trimmed);
+      }
+    }
+  }
   const seen = new Set();
   const result = [];
   for (const token of tokens) {
@@ -128,7 +139,11 @@ function parseArgs(argv) {
       description: 'Override the constant-folding instruction limit.',
       coerce: (value) => {
         const values = Array.isArray(value) ? value : [value];
-        const lastValue = values[values.length - 1];
+        const filtered = values.filter((entry) => entry !== undefined && entry !== null);
+        if (filtered.length === 0) {
+          return undefined;
+        }
+        const lastValue = filtered[filtered.length - 1];
         return parseNumericOption(lastValue, '--max-instructions');
       },
     })
@@ -138,7 +153,11 @@ function parseArgs(argv) {
       description: 'Override the constant-folding iteration limit.',
       coerce: (value) => {
         const values = Array.isArray(value) ? value : [value];
-        const lastValue = values[values.length - 1];
+        const filtered = values.filter((entry) => entry !== undefined && entry !== null);
+        if (filtered.length === 0) {
+          return undefined;
+        }
+        const lastValue = filtered[filtered.length - 1];
         return parseNumericOption(lastValue, '--max-iterations');
       },
     })
@@ -148,7 +167,11 @@ function parseArgs(argv) {
       description: 'Override the constant-folding tracked value limit.',
       coerce: (value) => {
         const values = Array.isArray(value) ? value : [value];
-        const lastValue = values[values.length - 1];
+        const filtered = values.filter((entry) => entry !== undefined && entry !== null);
+        if (filtered.length === 0) {
+          return undefined;
+        }
+        const lastValue = filtered[filtered.length - 1];
         return parseNumericOption(lastValue, '--max-tracked-values');
       },
     })
