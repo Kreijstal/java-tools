@@ -153,7 +153,7 @@ function parseArgs(argv) {
       description: 'Override the constant-folding iteration limit.',
       coerce: (value) => {
         const values = Array.isArray(value) ? value : [value];
-        const filtered = values.filter((entry) => entry !== undefined && entry !== null);
+        const filtered = values.filter((entry) => entry != null);
         if (filtered.length === 0) {
           return undefined;
         }
