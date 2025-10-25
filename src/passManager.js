@@ -62,15 +62,16 @@ function runCfgPasses(program, options = {}) {
         }
       }
 
-      let dceResult = { changed: false, optimizedCfg: cfg };
+      const foldedCfg = foldResult.optimizedCfg || cfg;
+      let dceResult = { changed: false, optimizedCfg: foldedCfg };
       if (!skipDeadCode) {
-        dceResult = eliminateDeadCodeCfg(cfg);
+        dceResult = eliminateDeadCodeCfg(foldedCfg);
         if (dceResult.changed) {
           dceChanged.push(formatMethodSignature(className, method));
         }
       }
       if (foldResult.changed || dceResult.changed) {
-        const finalCfg = dceResult.optimizedCfg || cfg;
+        const finalCfg = dceResult.optimizedCfg || foldedCfg;
         item.method = reconstructAstFromCfg(finalCfg, method);
       }
     }

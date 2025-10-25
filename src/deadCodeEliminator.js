@@ -1,4 +1,5 @@
 const { getStackEffect, normalizeInstruction } = require('./utils/instructionUtils');
+const { applyStackManipulation } = require('./utils/stackManipulation');
 
 function buildMethodSignature(className, method) {
   return `${className}.${method.name}${method.descriptor}`;
@@ -11,150 +12,16 @@ function pushProducedValue(entry, stack, width) {
 }
 
 function handleStackManipulation(entry, effect, consumed, stack) {
-  const [v1, v2, v3, v4] = consumed;
-
-  switch (effect.special) {
-    case 'dup': {
-      if (!v1 || v1.width !== 1 || consumed.length !== 1) {
-        return false;
-      }
-      stack.push(v1);
-      pushProducedValue(entry, stack, v1.width);
+  return applyStackManipulation(effect, consumed, stack, {
+    pushOriginal: (value) => {
+      stack.push(value);
       return true;
-    }
-    case 'dup_x1': {
-      if (!v1 || !v2 || v1.width !== 1 || v2.width !== 1 || consumed.length !== 2) {
-        return false;
-      }
-      pushProducedValue(entry, stack, 1);
-      stack.push(v2);
-      stack.push(v1);
+    },
+    pushDuplicate: (value) => {
+      pushProducedValue(entry, stack, value.width);
       return true;
-    }
-    case 'dup_x2': {
-      if (consumed.length === 3 && v1 && v2 && v3 && v1.width === 1 && v2.width === 1 && v3.width === 1) {
-        pushProducedValue(entry, stack, 1);
-        stack.push(v3);
-        stack.push(v2);
-        stack.push(v1);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 1 && v2.width === 2) {
-        pushProducedValue(entry, stack, 1);
-        stack.push(v2);
-        stack.push(v1);
-        return true;
-      }
-      return false;
-    }
-    case 'dup2': {
-      if (consumed.length === 1 && v1 && v1.width === 2) {
-        stack.push(v1);
-        pushProducedValue(entry, stack, 2);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 1 && v2.width === 1) {
-        stack.push(v2);
-        stack.push(v1);
-        pushProducedValue(entry, stack, v2.width);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      return false;
-    }
-    case 'dup2_x1': {
-      if (
-        consumed.length === 3 &&
-        v1 && v2 && v3 &&
-        v1.width === 1 &&
-        v2.width === 1 &&
-        v3.width === 1
-      ) {
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(v3);
-        pushProducedValue(entry, stack, v2.width);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 2 && v2.width === 1) {
-        stack.push(v1);
-        stack.push(v2);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      return false;
-    }
-    case 'dup2_x2': {
-      if (
-        consumed.length === 4 &&
-        v1 &&
-        v2 &&
-        v3 &&
-        v4 &&
-        v1.width === 1 &&
-        v2.width === 1 &&
-        v3.width === 1 &&
-        v4.width === 1
-      ) {
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(v4);
-        stack.push(v3);
-        pushProducedValue(entry, stack, v2.width);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      if (
-        consumed.length === 3 &&
-        v1 &&
-        v2 &&
-        v3 &&
-        v1.width === 2 &&
-        v2.width === 1 &&
-        v3.width === 1
-      ) {
-        stack.push(v1);
-        stack.push(v3);
-        stack.push(v2);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      if (
-        consumed.length === 3 &&
-        v1 &&
-        v2 &&
-        v3 &&
-        v1.width === 1 &&
-        v2.width === 1 &&
-        v3.width === 2
-      ) {
-        stack.push(v2);
-        stack.push(v1);
-        stack.push(v3);
-        pushProducedValue(entry, stack, v2.width);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      if (consumed.length === 2 && v1 && v2 && v1.width === 2 && v2.width === 2) {
-        stack.push(v1);
-        stack.push(v2);
-        pushProducedValue(entry, stack, v1.width);
-        return true;
-      }
-      return false;
-    }
-    case 'swap': {
-      if (!v1 || !v2 || v1.width !== 1 || v2.width !== 1 || consumed.length !== 2) {
-        return false;
-      }
-      stack.push(v1);
-      stack.push(v2);
-      return true;
-    }
-    default:
-      return false;
-  }
+    },
+  });
 }
 
 function computeMaxStack(entries, keepSet) {
