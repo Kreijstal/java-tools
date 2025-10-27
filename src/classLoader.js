@@ -71,6 +71,16 @@ function parseAnnotationsFromAst(ast) {
     throw new Error(`resolveString failed: unhandled constant pool entry type ${entry.tag}`);
   }
   
+  function descriptorToInternalName(descriptor) {
+    if (typeof descriptor !== 'string') {
+      return null;
+    }
+    if (descriptor.startsWith('L') && descriptor.endsWith(';')) {
+      return descriptor.slice(1, -1);
+    }
+    return descriptor;
+  }
+
   // Helper function to resolve annotation element values
   function resolveAnnotationValue(tag, valueIndex) {
     // For annotation values, use 0-based indexing as well
@@ -79,22 +89,56 @@ function parseAnnotationsFromAst(ast) {
     if (!entry) {
       throw new Error(`resolveAnnotationValue failed: constant pool entry not found at index ${valueIndex}`);
     }
-    
+
     if (tag === 115) { // 's' - String
       /* HARDENED: Replaced quiet failure with an explicit error */
       if (entry.tag !== 1) {
         throw new Error(`resolveAnnotationValue failed: expected string at index ${valueIndex}, but found tag ${entry.tag}`);
       }
       return entry.info.bytes;
-    } else if (tag === 73) { // 'I' - Integer
-      /* HARDENED: Replaced quiet failure with an explicit error */
-      if (entry.tag !== 3) {
-        throw new Error(`resolveAnnotationValue failed: expected integer at index ${valueIndex}, but found tag ${entry.tag}`);
-      }
+    }
+
+    if (tag === 73 || tag === 74 || tag === 68 || tag === 70) {
+      // 'I' (int), 'J' (long), 'D' (double), 'F' (float) share the same structure
       return entry.info.bytes;
     }
-    
+
+    if (tag === 90 || tag === 66 || tag === 67 || tag === 83) {
+      // 'Z' (boolean), 'B' (byte), 'C' (char), 'S' (short)
+      return entry.info.bytes;
+    }
+
     return entry.info;
+  }
+
+  function parseAnnotationElementValue(tag, value) {
+    const tagChar = typeof tag === 'number' ? String.fromCharCode(tag) : tag;
+
+    switch (tagChar) {
+      case 'e': { // Enum constant
+        const rawDescriptor = resolveString(value.type_name_index);
+        return {
+          type: 'enum',
+          descriptor: rawDescriptor,
+          className: descriptorToInternalName(rawDescriptor),
+          constName: resolveString(value.const_name_index),
+        };
+      }
+      case 'c': { // Class literal
+        const rawDescriptor = resolveString(value.class_info_index);
+        return {
+          type: 'class',
+          descriptor: rawDescriptor,
+          className: descriptorToInternalName(rawDescriptor),
+        };
+      }
+      default: {
+        if (value && value.const_value_index !== undefined) {
+          return resolveAnnotationValue(tag, value.const_value_index);
+        }
+        return null;
+      }
+    }
   }
   
   // Helper function specifically for annotation type resolution
@@ -133,18 +177,9 @@ function parseAnnotationsFromAst(ast) {
 
               // Parse element value based on tag
               const tag = pair.value.tag;
-              let elementValue;
-              if (tag === 101) { // 'e' - Enum
-                elementValue = {
-                  type: 'enum',
-                  typeName: resolveString(pair.value.value.type_name_index),
-                  constName: resolveString(pair.value.value.const_name_index),
-                };
-              } else {
-                elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-              }
+              const elementValue = parseAnnotationElementValue(tag, pair.value.value);
 
-              if (elementName && elementValue !== undefined) {
+              if (elementName && elementValue !== undefined && elementValue !== null) {
                 elements[elementName] = elementValue;
               }
             });
@@ -175,18 +210,9 @@ function parseAnnotationsFromAst(ast) {
 
               // Parse element value based on tag
               const tag = pair.value.tag;
-              let elementValue;
-              if (tag === 101) { // 'e' - Enum
-                elementValue = {
-                  type: 'enum',
-                  typeName: resolveString(pair.value.value.type_name_index),
-                  constName: resolveString(pair.value.value.const_name_index),
-                };
-              } else {
-                elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-              }
+              const elementValue = parseAnnotationElementValue(tag, pair.value.value);
 
-              if (elementName && elementValue !== undefined) {
+              if (elementName && elementValue !== undefined && elementValue !== null) {
                 elements[elementName] = elementValue;
               }
             });
@@ -221,18 +247,9 @@ function parseAnnotationsFromAst(ast) {
                   
                   // Parse element value based on tag
                   const tag = pair.value.tag;
-                  let elementValue;
-                  if (tag === 101) { // 'e' - Enum
-                    elementValue = {
-                      type: 'enum',
-                      typeName: resolveString(pair.value.value.type_name_index),
-                      constName: resolveString(pair.value.value.const_name_index),
-                    };
-                  } else {
-                    elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-                  }
+                  const elementValue = parseAnnotationElementValue(tag, pair.value.value);
                   
-                  if (elementName && elementValue !== undefined) {
+                  if (elementName && elementValue !== undefined && elementValue !== null) {
                     elements[elementName] = elementValue;
                   }
                 });
@@ -268,18 +285,9 @@ function parseAnnotationsFromAst(ast) {
                   const elementName = resolveString(pair.element_name_index);
                   
                   const tag = pair.value.tag;
-                  let elementValue;
-                  if (tag === 101) { // 'e' - Enum
-                    elementValue = {
-                      type: 'enum',
-                      typeName: resolveString(pair.value.value.type_name_index),
-                      constName: resolveString(pair.value.value.const_name_index),
-                    };
-                  } else {
-                    elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-                  }
+                  const elementValue = parseAnnotationElementValue(tag, pair.value.value);
                   
-                  if (elementName && elementValue !== undefined) {
+                  if (elementName && elementValue !== undefined && elementValue !== null) {
                     elements[elementName] = elementValue;
                   }
                 });

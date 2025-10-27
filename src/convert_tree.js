@@ -329,6 +329,25 @@ function convertJson(inputJson, constantPool) {
         attrs: null, // Assuming no attrs, adjust if needed
       },
     };
+
+    if (Array.isArray(field.attributes) && field.attributes.length > 0) {
+      for (const attribute of field.attributes) {
+        const attributeName =
+          attribute &&
+          attribute.attribute_name_index &&
+          attribute.attribute_name_index.name &&
+          attribute.attribute_name_index.name.info
+            ? attribute.attribute_name_index.name.info.bytes
+            : null;
+
+        if (attributeName === "ConstantValue") {
+          const constantIndex = attribute.info.constantvalue_index;
+          const resolved = resolveConstant(constantIndex, constantPool);
+          fieldItem.field.value = resolved.value;
+        }
+      }
+    }
+
     outputJson.classes[0].items.push(fieldItem);
   });
 

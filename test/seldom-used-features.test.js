@@ -33,6 +33,15 @@ Is private: true
 Is static: false`,
   },
   {
+    name: "AnnotationClassLiteralTest",
+    description:
+      "Annotations with class literals and enum values should be accessible at runtime",
+    shouldFail: false,
+    expectedOutput: `=== Annotation Class Literal Test ===
+Type: java.lang.String
+Level: HIGH`,
+  },
+  {
     name: "TryWithResourcesTest",
     description: "Try-with-resources and suppressed exceptions - should pass",
     shouldFail: false,
@@ -142,6 +151,14 @@ Constructor executed
 Instance field: Instance field: First constant (modified in instance block) (modified in constructor)
 Calling static method...
 Static method called, counter = 35`,
+  },
+  {
+    name: "WideInstructionDemo",
+    description: "Wide instruction prefix with high local indexes - should pass",
+    shouldFail: false,
+    expectedOutput: `Starting wide instruction demo...
+Sum: 32896
+Wide instruction demo finished.`,
   },
   {
     name: "JaggedArrayTest",
@@ -269,6 +286,15 @@ Jagged array created with different row sizes:
   Row 0 length: 2
   Row 1 length: 4
   Row 2 length: 1`,
+  },
+  {
+    name: "DebugInfoSample",
+    description: "Reflection over static fields via Class.getField - should pass",
+    shouldFail: false,
+    expectedOutput: `ANSWER=42
+GREETING=hi
+REFL_ANSWER=42
+REFL_GREETING=hi`,
   },
   {
     name: "StringInternTest",

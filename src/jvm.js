@@ -4,7 +4,11 @@ const {
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
 const { parseDescriptor } = require("./typeParser");
-const { primitiveTypeDescriptors, arrayPrimitiveTypeDescriptors } = require("./constants");
+const {
+  ASYNC_METHOD_SENTINEL,
+  primitiveTypeDescriptors,
+  arrayPrimitiveTypeDescriptors,
+} = require("./constants");
 const {
   formatInstruction,
   unparseDataStructures,
@@ -1101,26 +1105,29 @@ class JVM {
       }
 
       // Initialize static fields with default values first
-      if (!classData.staticFields) {
+      if (!classData.staticFields || !(classData.staticFields instanceof Map)) {
         classData.staticFields = new Map();
 
         if (this.verbose) {
           console.log(`Initializing staticFields for ${className}`);
         }
+      }
 
-        // Initialize static fields from bytecode AST
-        if (classData.ast && classData.ast.classes[0]) {
-          const fields = classData.ast.classes[0].items.filter(
-            (item) =>
-              item.type === "field" &&
-              item.field.flags &&
-              item.field.flags.includes("static"),
-          );
+      // Initialize static fields from bytecode AST
+      if (classData.ast && classData.ast.classes[0]) {
+        const fields = classData.ast.classes[0].items.filter(
+          (item) =>
+            item.type === "field" &&
+            item.field &&
+            item.field.flags &&
+            item.field.flags.includes("static"),
+        );
 
-          for (const fieldItem of fields) {
-            const field = fieldItem.field;
-            const fieldKey = `${field.name}:${field.descriptor}`;
+        for (const fieldItem of fields) {
+          const field = fieldItem.field;
+          const fieldKey = `${field.name}:${field.descriptor}`;
 
+          if (!classData.staticFields.has(fieldKey)) {
             // Set default value based on descriptor
             let defaultValue = null;
             if (
@@ -1148,52 +1155,62 @@ class JVM {
               );
             }
           }
+
+          if (field.value !== undefined && field.value !== null) {
+            let constantValue = field.value;
+
+            if (field.descriptor === "Ljava/lang/String;") {
+              constantValue = this.internString(String(constantValue));
+            } else if (field.descriptor === "J" && typeof constantValue !== "bigint") {
+              constantValue = BigInt(constantValue);
+            }
+
+            classData.staticFields.set(fieldKey, constantValue);
+          }
         }
+      }
 
-        // Initialize static fields from JRE definitions
-        const jreClass = this.jre[className];
-        if (jreClass && jreClass.staticFields) {
-          if (this.verbose) {
-            console.log(
-              `Found JRE class ${className} with staticFields:`,
-              Object.keys(jreClass.staticFields),
-            );
-          }
-          for (const [fieldKey, fieldValue] of Object.entries(
-            jreClass.staticFields,
-          )) {
-            // Handle Class-type static fields to ensure object identity
-            if (fieldValue && fieldValue.type === 'java/lang/Class') {
-              let processedFieldValue;
-              if (fieldValue.isPrimitive && fieldValue.name) {
-                // This is a primitive class like Integer.TYPE or Void.TYPE
-                processedFieldValue = await this.getClassObject(fieldValue.name);
-              } else {
-                // Regular class, use as is for now (could be enhanced later)
-                processedFieldValue = fieldValue;
-              }
-              classData.staticFields.set(fieldKey, processedFieldValue);
+      // Initialize static fields from JRE definitions
+      const jreClass = this.jre[className];
+      if (jreClass && jreClass.staticFields) {
+        if (this.verbose) {
+          console.log(
+            `Found JRE class ${className} with staticFields:`,
+            Object.keys(jreClass.staticFields),
+          );
+        }
+        for (const [fieldKey, fieldValue] of Object.entries(
+          jreClass.staticFields,
+        )) {
+          // Handle Class-type static fields to ensure object identity
+          if (fieldValue && fieldValue.type === 'java/lang/Class') {
+            let processedFieldValue;
+            if (fieldValue.isPrimitive && fieldValue.name) {
+              // This is a primitive class like Integer.TYPE or Void.TYPE
+              processedFieldValue = await this.getClassObject(fieldValue.name);
             } else {
-              classData.staticFields.set(fieldKey, fieldValue);
+              // Regular class, use as is for now (could be enhanced later)
+              processedFieldValue = fieldValue;
             }
-
-            if (this.verbose) {
-              console.log(
-                `Initialized JRE static field ${fieldKey}:`,
-                fieldValue,
-              );
-            }
+            classData.staticFields.set(fieldKey, processedFieldValue);
+          } else {
+            classData.staticFields.set(fieldKey, fieldValue);
           }
-        } else {
+
           if (this.verbose) {
             console.log(
-              `No JRE class found for ${className}, or no staticFields defined`,
+              `Initialized JRE static field ${fieldKey}:`,
+              fieldValue,
             );
-            console.log(`JRE class exists: ${!!jreClass}`);
-            if (jreClass) {
-              console.log(`JRE class keys:`, Object.keys(jreClass));
-            }
           }
+        }
+      } else if (this.verbose) {
+        console.log(
+          `No JRE class found for ${className}, or no staticFields defined`,
+        );
+        console.log(`JRE class exists: ${!!jreClass}`);
+        if (jreClass) {
+          console.log(`JRE class keys:`, Object.keys(jreClass));
         }
       }
 
@@ -2028,62 +2045,6 @@ class JVM {
     return lineToPcMap;
   }
 
-  createAnnotationProxy(annotation) {
-    const jvm = this;
-    const proxy = {
-      type: annotation.type,
-      _annotationData: annotation,
-      "annotationType()Ljava/lang/Class;": () => {
-        return {
-          type: "java/lang/Class",
-          _classData: jvm.classes[annotation.type],
-          className: annotation.type.replace(/\//g, "."),
-        };
-      },
-      "toString()Ljava/lang/String;": () => {
-        let elementsStr = "";
-        if (annotation.elements) {
-          elementsStr = Object.entries(annotation.elements)
-            .map(([key, value]) => {
-              let valueStr = value;
-              if (typeof value === "string") {
-                valueStr = `\"${value}\"`;
-              }
-              return `${key}=${valueStr}`;
-            })
-            .join(", ");
-        }
-        return jvm.internString(
-          `@${annotation.type.replace(/\//g, ".")}(${elementsStr})`,
-        );
-      },
-    };
-
-    if (annotation.elements) {
-      Object.keys(annotation.elements).forEach((elementName) => {
-        const elementValue = annotation.elements[elementName];
-        let methodSignature;
-        let methodImplementation;
-
-        if (typeof elementValue === "string") {
-          methodSignature = `${elementName}()Ljava/lang/String;`;
-          methodImplementation = () => jvm.internString(String(elementValue));
-        } else if (typeof elementValue === "number") {
-          methodSignature = `${elementName}()I`;
-          methodImplementation = () => elementValue;
-        } else {
-          // Default/fallback for other types
-          methodSignature = `${elementName}()Ljava/lang/Object;`;
-          methodImplementation = () => elementValue;
-        }
-
-        proxy[methodSignature] = methodImplementation;
-      });
-    }
-
-    return proxy;
-  }
-
   _parseAnnotationValue(elementValue) {
     if (!elementValue) {
       /* HARDENED: Replaced quiet failure with an explicit error */
@@ -2104,12 +2065,25 @@ class JVM {
         return elementValue.floatValue;
       case "D": // Double
         return elementValue.doubleValue;
-      case "c": // Class
-        // TODO: Implement class literal support
-        throw new Error("_parseAnnotationValue: class literal support is not implemented");
-      case "e": // Enum
-        // TODO: Implement enum support
-        throw new Error("_parseAnnotationValue: enum support is not implemented");
+      case "c": { // Class
+        const descriptor = elementValue.classDescriptor || elementValue.descriptor;
+        const internalName = elementValue.className || (descriptor ? descriptor.replace(/^L|;$/g, "") : undefined);
+        return {
+          type: "class",
+          className: internalName,
+          descriptor,
+        };
+      }
+      case "e": { // Enum
+        const descriptor = elementValue.enumDescriptor || elementValue.descriptor;
+        const internalName = elementValue.enumClassName || (descriptor ? descriptor.replace(/^L|;$/g, "") : undefined);
+        return {
+          type: "enum",
+          className: internalName,
+          descriptor,
+          constName: elementValue.enumConstName || elementValue.constName,
+        };
+      }
       case "@": // Annotation
         return this.createAnnotationProxy(elementValue.annotationValue);
       case "[": // Array
@@ -2119,12 +2093,105 @@ class JVM {
           )
         );
       default:
-        throw new Error(`_parseAnnotationValue: unhandled tag ${elementValue.tag}`);
+        return elementValue;
     }
   }
 
   createAnnotationProxy(annotation) {
     const jvm = this;
+
+    const formatAnnotationValueForToString = (value) => {
+      if (Array.isArray(value)) {
+        return `[${value.map((item) => formatAnnotationValueForToString(item)).join(", ")}]`;
+      }
+
+      if (value && typeof value === "object") {
+        if (value.type === "class") {
+          const className = (value.className || value.descriptor || "java/lang/Object").replace(/\//g, ".");
+          return `${className}.class`;
+        }
+
+        if (value.type === "enum") {
+          const enumName = (value.className || value.descriptor || "").replace(/\//g, ".").replace(/^L|;$/g, "");
+          return `${enumName}.${value.constName}`;
+        }
+      }
+
+      if (typeof value === "string") {
+        return `\"${value}\"`;
+      }
+
+      return String(value);
+    };
+
+    const resolveAnnotationElement = async (rawValue, thread) => {
+      if (Array.isArray(rawValue)) {
+        const resolved = [];
+        for (const item of rawValue) {
+          const value = await resolveAnnotationElement(item, thread);
+          if (value === ASYNC_METHOD_SENTINEL) {
+            return ASYNC_METHOD_SENTINEL;
+          }
+          resolved.push(value);
+        }
+        return resolved;
+      }
+
+      if (rawValue && typeof rawValue === "object") {
+        if (rawValue.type === "class") {
+          const targetClass = rawValue.className || (rawValue.descriptor ? rawValue.descriptor.replace(/^L|;$/g, "") : null);
+          if (!targetClass) {
+            return null;
+          }
+          return jvm.getClassObject(targetClass);
+        }
+
+        if (rawValue.type === "enum") {
+          const enumClassName = rawValue.className || (rawValue.descriptor ? rawValue.descriptor.replace(/^L|;$/g, "") : null);
+          if (!enumClassName) {
+            throw new Error("Enum annotation value is missing class information");
+          }
+
+          await jvm.loadClassByName(enumClassName);
+
+          if (thread) {
+            const wasFramePushed = await jvm.initializeClassIfNeeded(enumClassName, thread);
+            if (wasFramePushed) {
+              return ASYNC_METHOD_SENTINEL;
+            }
+          }
+
+          const descriptor = rawValue.descriptor || `L${enumClassName};`;
+          const fieldKey = `${rawValue.constName}:${descriptor}`;
+          const classData = jvm.classes[enumClassName];
+          if (classData && classData.staticFields && classData.staticFields.has(fieldKey)) {
+            return classData.staticFields.get(fieldKey);
+          }
+
+          const jreClass = jvm.jre[enumClassName];
+          if (jreClass && jreClass.staticFields && jreClass.staticFields[fieldKey]) {
+            return jreClass.staticFields[fieldKey];
+          }
+
+          throw new Error(`Enum constant not found: ${enumClassName}.${rawValue.constName}`);
+        }
+      }
+
+      if (typeof rawValue === "string") {
+        return jvm.internString(String(rawValue));
+      }
+
+      if (typeof rawValue === "number") {
+        return rawValue;
+      }
+
+      if (typeof rawValue === "boolean") {
+        return rawValue ? 1 : 0;
+      }
+
+      return rawValue;
+    };
+
     const proxy = {
       type: annotation.type,
       _annotationData: annotation,
@@ -2139,13 +2206,7 @@ class JVM {
         let elementsStr = "";
         if (annotation.elements) {
           elementsStr = Object.entries(annotation.elements)
-            .map(([key, value]) => {
-              let valueStr = value;
-              if (typeof value === "string") {
-                valueStr = `\"${value}\"`;
-              }
-              return `${key}=${valueStr}`;
-            })
+            .map(([key, value]) => `${key}=${formatAnnotationValueForToString(value)}`)
             .join(", ");
         }
         return jvm.internString(
@@ -2160,16 +2221,32 @@ class JVM {
         let methodSignature;
         let methodImplementation;
 
-        if (typeof elementValue === "string") {
+        if (elementValue && typeof elementValue === "object" && elementValue.type === "class") {
+          methodSignature = `${elementName}()Ljava/lang/Class;`;
+          methodImplementation = async (thread) =>
+            resolveAnnotationElement(elementValue, thread);
+        } else if (elementValue && typeof elementValue === "object" && elementValue.type === "enum") {
+          const descriptor = elementValue.descriptor || `L${elementValue.className};`;
+          methodSignature = `${elementName}()${descriptor}`;
+          methodImplementation = async (thread) =>
+            resolveAnnotationElement(elementValue, thread);
+        } else if (typeof elementValue === "string") {
           methodSignature = `${elementName}()Ljava/lang/String;`;
           methodImplementation = () => jvm.internString(String(elementValue));
         } else if (typeof elementValue === "number") {
           methodSignature = `${elementName}()I`;
           methodImplementation = () => elementValue;
+        } else if (typeof elementValue === "boolean") {
+          methodSignature = `${elementName}()Z`;
+          methodImplementation = () => (elementValue ? 1 : 0);
+        } else if (Array.isArray(elementValue)) {
+          methodSignature = `${elementName}()[Ljava/lang/Object;`;
+          methodImplementation = async (thread) =>
+            resolveAnnotationElement(elementValue, thread);
         } else {
-          // Default/fallback for other types
           methodSignature = `${elementName}()Ljava/lang/Object;`;
-          methodImplementation = () => elementValue;
+          methodImplementation = async (thread) =>
+            resolveAnnotationElement(elementValue, thread);
         }
 
         proxy[methodSignature] = methodImplementation;

@@ -96,8 +96,17 @@ module.exports = {
         // Static field - get from class static fields
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (classData.staticFields && classData.staticFields.has(fieldName)) {
-          return classData.staticFields.get(fieldName);
+        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
+
+        if (classData.staticFields instanceof Map) {
+          if (classData.staticFields.has(fieldKey)) {
+            return classData.staticFields.get(fieldKey);
+          }
+        } else if (
+          classData.staticFields &&
+          Object.prototype.hasOwnProperty.call(classData.staticFields, fieldKey)
+        ) {
+          return classData.staticFields[fieldKey];
         }
         return null;
       } else {
@@ -121,10 +130,11 @@ module.exports = {
         // Static field - set in class static fields
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (!classData.staticFields) {
+        if (!(classData.staticFields instanceof Map)) {
           classData.staticFields = new Map();
         }
-        classData.staticFields.set(fieldName, value);
+        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
+        classData.staticFields.set(fieldKey, value);
       } else {
         // Instance field
         if (obj === null) {
@@ -177,8 +187,17 @@ module.exports = {
       if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (classData.staticFields && classData.staticFields.has(fieldName)) {
-          return classData.staticFields.get(fieldName);
+        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
+
+        if (classData.staticFields instanceof Map) {
+          if (classData.staticFields.has(fieldKey)) {
+            return classData.staticFields.get(fieldKey);
+          }
+        } else if (
+          classData.staticFields &&
+          Object.prototype.hasOwnProperty.call(classData.staticFields, fieldKey)
+        ) {
+          return classData.staticFields[fieldKey];
         }
         return 0;
       } else {
@@ -200,10 +219,11 @@ module.exports = {
       if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (!classData.staticFields) {
+        if (!(classData.staticFields instanceof Map)) {
           classData.staticFields = new Map();
         }
-        classData.staticFields.set(fieldName, value);
+        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
+        classData.staticFields.set(fieldKey, value);
       } else {
         if (obj === null) {
           throw {
