@@ -321,6 +321,13 @@ Two unique strings == : false
 unique1.intern() == unique2.intern(): true
 unique1.intern() == unique1: false`,
   },
+  {
+    name: "SwingCanvasSmoke",
+    description: "Basic Swing components rendered via canvas should execute",
+    shouldFail: false,
+    expectedOutput: `EDT label: Updated\nEDT button: Clicked\nFrame title: Swing Canvas\nPanel size: 2\nLabel text: Updated\nButton text: Clicked`,
+  },
+
 ];
 
 test("Seldom-used Java Features", async function (t) {
