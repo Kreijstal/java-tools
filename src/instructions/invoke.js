@@ -545,7 +545,13 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   if (boxedObj._annotationData) {
     const methodKey = methodName + descriptor;
     if (typeof boxedObj[methodKey] === "function") {
-      let result = boxedObj[methodKey](thread);
+      let result;
+      try {
+        result = boxedObj[methodKey](thread);
+      } catch (error) {
+        console.error("Exception during annotation proxy method invocation:", error);
+        throw error;
+      }
 
       if (result && typeof result.then === "function") {
         result = await result;

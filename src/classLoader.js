@@ -71,14 +71,25 @@ function parseAnnotationsFromAst(ast) {
     throw new Error(`resolveString failed: unhandled constant pool entry type ${entry.tag}`);
   }
   
-  function descriptorToInternalName(descriptor) {
+  function classDescriptorToInternalName(descriptor) {
     if (typeof descriptor !== 'string') {
       return null;
     }
     if (descriptor.startsWith('L') && descriptor.endsWith(';')) {
       return descriptor.slice(1, -1);
     }
-    return descriptor;
+    const primitiveMap = {
+      Z: 'boolean',
+      B: 'byte',
+      C: 'char',
+      S: 'short',
+      I: 'int',
+      J: 'long',
+      F: 'float',
+      D: 'double',
+      V: 'void',
+    };
+    return primitiveMap[descriptor] || descriptor;
   }
 
   // Helper function to resolve annotation element values
@@ -120,7 +131,7 @@ function parseAnnotationsFromAst(ast) {
         return {
           type: 'enum',
           descriptor: rawDescriptor,
-          className: descriptorToInternalName(rawDescriptor),
+          className: classDescriptorToInternalName(rawDescriptor),
           constName: resolveString(value.const_name_index),
         };
       }
@@ -129,7 +140,7 @@ function parseAnnotationsFromAst(ast) {
         return {
           type: 'class',
           descriptor: rawDescriptor,
-          className: descriptorToInternalName(rawDescriptor),
+          className: classDescriptorToInternalName(rawDescriptor),
         };
       }
       default: {

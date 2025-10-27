@@ -1156,6 +1156,7 @@ class JVM {
             }
           }
 
+          // A ConstantValue attribute was present in the class file; seed the field without executing <clinit>.
           if (field.value !== undefined && field.value !== null) {
             let constantValue = field.value;
 
@@ -2124,6 +2125,34 @@ class JVM {
       return String(value);
     };
 
+    const primitiveDescriptorMap = {
+      Z: "boolean",
+      B: "byte",
+      C: "char",
+      S: "short",
+      I: "int",
+      J: "long",
+      F: "float",
+      D: "double",
+      V: "void",
+    };
+
+    const normalizeAnnotationClassName = (input) => {
+      if (!input || typeof input !== "string") {
+        return null;
+      }
+
+      if (primitiveDescriptorMap[input]) {
+        return primitiveDescriptorMap[input];
+      }
+
+      if (input.startsWith("L") && input.endsWith(";")) {
+        return input.slice(1, -1);
+      }
+
+      return input;
+    };
+
     const resolveAnnotationElement = async (rawValue, thread) => {
       if (Array.isArray(rawValue)) {
         const resolved = [];
@@ -2139,7 +2168,12 @@ class JVM {
 
       if (rawValue && typeof rawValue === "object") {
         if (rawValue.type === "class") {
-          const targetClass = rawValue.className || (rawValue.descriptor ? rawValue.descriptor.replace(/^L|;$/g, "") : null);
+          const descriptor =
+            typeof rawValue.descriptor === "string" ? rawValue.descriptor : null;
+          let targetClass = normalizeAnnotationClassName(rawValue.className);
+          if (!targetClass) {
+            targetClass = normalizeAnnotationClassName(descriptor);
+          }
           if (!targetClass) {
             return null;
           }
@@ -2147,9 +2181,11 @@ class JVM {
         }
 
         if (rawValue.type === "enum") {
-          const enumClassName = rawValue.className || (rawValue.descriptor ? rawValue.descriptor.replace(/^L|;$/g, "") : null);
+          const enumClassName =
+            rawValue.className ||
+            (rawValue.descriptor ? rawValue.descriptor.replace(/^L|;$/g, "") : null);
           if (!enumClassName) {
-            throw new Error("Enum annotation value is missing class information");
+            return ASYNC_METHOD_SENTINEL;
           }
 
           await jvm.loadClassByName(enumClassName);
@@ -2173,7 +2209,7 @@ class JVM {
             return jreClass.staticFields[fieldKey];
           }
 
-          throw new Error(`Enum constant not found: ${enumClassName}.${rawValue.constName}`);
+          throw new Error(`Enum constant not found: ${enumClassName}.${rawValue.constName} with fieldKey ${fieldKey}`);
         }
       }
 
@@ -2244,6 +2280,7 @@ class JVM {
           methodImplementation = async (thread) =>
             resolveAnnotationElement(elementValue, thread);
         } else {
+          // Nested annotations and complex values defer to resolveAnnotationElement so they can be resolved lazily on demand.
           methodSignature = `${elementName}()Ljava/lang/Object;`;
           methodImplementation = async (thread) =>
             resolveAnnotationElement(elementValue, thread);

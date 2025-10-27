@@ -31,6 +31,10 @@ const STEP_BUTTON_IDS = [
   "rewindBtn",
 ];
 
+const SWING_CONTAINER_ID = "swing-container";
+const AWT_CONTAINER_ID = "awt-container";
+let swingDomIntegrationRegistered = false;
+
 // Global state for UI compatibility
 let jvmDebug = null;
 let currentState = {
@@ -104,6 +108,153 @@ function setupAWTIntegration() {
       subtree: true
     });
   }
+}
+
+function ensureDomContainer(containerId, titleText, options = {}) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  let container = document.getElementById(containerId);
+  if (!container) {
+    container = document.createElement("div");
+    container.id = containerId;
+    container.style.cssText =
+      options.styles || "margin: 10px 0; padding: 10px; border: 1px solid #ddd; background: #f4f4f4;";
+
+    if (titleText) {
+      const title = document.createElement("h3");
+      title.textContent = titleText;
+      title.style.cssText = options.titleStyles || "margin: 0 0 10px; font-family: sans-serif; color: #333;";
+      container.appendChild(title);
+    }
+
+    if (options.insertAfterOutput) {
+      const outputElement = document.getElementById(DOM_IDS.OUTPUT);
+      const outputWrapper = outputElement ? outputElement.parentNode : null;
+      if (outputWrapper && outputWrapper.parentNode) {
+        outputWrapper.parentNode.insertBefore(container, outputWrapper.nextSibling);
+      } else if (document.body) {
+        document.body.appendChild(container);
+      }
+    } else if (document.body) {
+      document.body.appendChild(container);
+    }
+  }
+
+  return container;
+}
+
+function attachCanvasToContainer(obj, containerId, titleText, options = {}) {
+  if (typeof document === "undefined") {
+    return null;
+  }
+
+  const container = ensureDomContainer(containerId, titleText, options);
+  if (!container) {
+    return null;
+  }
+
+  let canvas = obj._canvasElement;
+  if (!canvas) {
+    canvas = document.createElement("canvas");
+    canvas.width = obj._width || options.defaultWidth || 800;
+    canvas.height = obj._height || options.defaultHeight || 600;
+    canvas.style.cssText =
+      options.canvasStyles || "border: 1px solid #888; background: white; display: block;";
+  }
+
+  if (!container.contains(canvas)) {
+    container.appendChild(canvas);
+  }
+
+  canvas.style.display = "block";
+
+  obj._canvasElement = canvas;
+  if (obj._awtComponent && typeof obj._awtComponent.setCanvasElement === "function") {
+    obj._awtComponent.setCanvasElement(canvas);
+  }
+
+  if (obj._awtComponent && typeof obj._awtComponent.setSize === "function") {
+    obj._awtComponent.setSize(canvas.width, canvas.height);
+  }
+
+  return canvas;
+}
+
+function setupSwingDomIntegration() {
+  if (swingDomIntegrationRegistered) {
+    return;
+  }
+
+  if (!jvmDebug || !jvmDebug.debugController || !jvmDebug.debugController.jvm) {
+    return;
+  }
+
+  if (typeof document === "undefined") {
+    return;
+  }
+
+  const jvm = jvmDebug.debugController.jvm;
+  const frameBase = require('./jre/java/awt/Frame.js');
+  const componentBase = require('./jre/java/awt/Component.js');
+  const appletBase = require('./jre/java/applet/Applet.js');
+
+  jvm.registerJreOverrides({
+    'java/awt/Frame': {
+      methods: {
+        'setVisible(Z)V': (jvmInstance, obj, args) => {
+          const isVisible = !!args[0];
+          if (isVisible) {
+            attachCanvasToContainer(obj, SWING_CONTAINER_ID, 'Swing Canvas Output', {
+              styles: 'margin: 10px 0; padding: 10px; border: 1px solid #ddd; background: #f4f4f4;',
+              canvasStyles: 'border: 1px solid #888; background: white; display: block;',
+            });
+          }
+
+          frameBase.methods['setVisible(Z)V'](jvmInstance, obj, args);
+
+          if (!isVisible && obj._canvasElement) {
+            obj._canvasElement.style.display = 'none';
+          }
+        },
+        'setSize(II)V': (jvmInstance, obj, args) => {
+          frameBase.methods['setSize(II)V'](jvmInstance, obj, args);
+          if (obj._canvasElement) {
+            obj._canvasElement.width = obj._width;
+            obj._canvasElement.height = obj._height;
+          }
+        },
+      },
+    },
+    'java/applet/Applet': {
+      methods: {
+        '<init>()V': (jvmInstance, obj, args) => {
+          appletBase.methods['<init>()V'](jvmInstance, obj, args);
+          attachCanvasToContainer(obj, AWT_CONTAINER_ID, 'Java AWT/Applet Output', {
+            styles: 'margin: 10px 0; padding: 10px; border: 1px solid #ddd; background: #f9f9f9;',
+            titleStyles: 'margin: 0 0 10px 0; color: #333;',
+            insertAfterOutput: true,
+            canvasStyles: 'border: 1px solid #ccc; background: white; display: block;',
+            defaultWidth: obj._width || 800,
+            defaultHeight: obj._height || 600,
+          });
+        },
+        'setSize(II)V': (jvmInstance, obj, args) => {
+          componentBase.methods['setSize(II)V'](jvmInstance, obj, args);
+          if (obj._awtComponent && typeof obj._awtComponent.setSize === 'function') {
+            obj._awtComponent.setSize(obj._width, obj._height);
+          }
+          if (obj._canvasElement) {
+            obj._canvasElement.width = obj._width;
+            obj._canvasElement.height = obj._height;
+          }
+        },
+      },
+    },
+  });
+
+  swingDomIntegrationRegistered = true;
 }
 
 /**
@@ -754,6 +905,9 @@ async function initializeJVM() {
 
         // Set up AWT integration for browser-based canvas rendering
         setupAWTIntegration();
+
+        // Wire Swing/Applet DOM overlays now that the JVM is available
+        setupSwingDomIntegration();
 
         log(
           `Real JVM Debug initialized with ${extractedFiles.length} sample classes`,
