@@ -1,42 +1,5 @@
 const awtFramework = require('../../../awt.js');
 
-function ensureCanvasElement(frameObj) {
-  if (typeof document === 'undefined') {
-    return;
-  }
-
-  if (frameObj._canvasElement) {
-    return;
-  }
-
-  const canvas = document.createElement('canvas');
-  canvas.width = frameObj._width || 800;
-  canvas.height = frameObj._height || 600;
-  canvas.style.border = '1px solid #888';
-  canvas.style.background = 'white';
-
-  let container = document.getElementById('swing-container');
-  if (!container) {
-    container = document.createElement('div');
-    container.id = 'swing-container';
-    container.style.cssText = 'margin: 10px 0; padding: 10px; border: 1px solid #ddd; background: #f4f4f4;';
-
-    const title = document.createElement('h3');
-    title.textContent = 'Swing Canvas Output';
-    title.style.cssText = 'margin: 0 0 10px; font-family: sans-serif; color: #333;';
-    container.appendChild(title);
-
-    if (typeof document !== 'undefined' && document.body) {
-      document.body.appendChild(container);
-    }
-  }
-
-  container.appendChild(canvas);
-
-  frameObj._canvasElement = canvas;
-  frameObj._awtComponent.setCanvasElement(canvas);
-}
-
 module.exports = {
   super: 'java/awt/Container',
   methods: {
@@ -49,6 +12,7 @@ module.exports = {
       obj._awtComponent = new awtFramework.Canvas();
       obj._awtComponent.setSize(obj._width, obj._height);
       obj._backgroundColor = { r: 240, g: 240, b: 240 };
+      obj._canvasElement = null;
     },
 
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
@@ -72,17 +36,12 @@ module.exports = {
       if (obj._awtComponent) {
         obj._awtComponent.setSize(obj._width, obj._height);
       }
-      if (obj._canvasElement) {
-        obj._canvasElement.width = obj._width;
-        obj._canvasElement.height = obj._height;
-      }
     },
 
     'setVisible(Z)V': (jvm, obj, args) => {
       obj._visible = !!args[0];
-      if (obj._visible) {
-        ensureCanvasElement(obj);
-        obj.repaint && obj.repaint();
+      if (obj._visible && typeof obj.repaint === 'function') {
+        obj.repaint();
       }
     },
 

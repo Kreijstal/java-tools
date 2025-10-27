@@ -41,3 +41,4 @@ jvm-debug.js
 test/temp*
 jvm-debug.js.LICENSE.txt
 src/jre/index.js
+examples/data.zip
