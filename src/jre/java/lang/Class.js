@@ -11,6 +11,104 @@ module.exports = {
     'getFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       return [];
     },
+    'getField(Ljava/lang/String;)Ljava/lang/reflect/Field;': async (jvm, classObj, args) => {
+      const fieldNameObj = args[0];
+
+      let fieldName;
+      if (typeof fieldNameObj === 'string') {
+        fieldName = fieldNameObj;
+      } else if (fieldNameObj && fieldNameObj.value) {
+        fieldName = fieldNameObj.value;
+      } else if (fieldNameObj && typeof fieldNameObj.toString === 'function') {
+        fieldName = fieldNameObj.toString();
+      } else {
+        fieldName = String(fieldNameObj);
+      }
+
+      const visited = new Set();
+      const queue = [];
+
+      const enqueueClassData = (classData) => {
+        if (
+          !classData ||
+          !classData.ast ||
+          !classData.ast.classes ||
+          !classData.ast.classes[0]
+        ) {
+          return;
+        }
+
+        const className = classData.ast.classes[0].className;
+        if (!visited.has(className)) {
+          queue.push({ classData, className });
+        }
+      };
+
+      enqueueClassData(classObj._classData);
+
+      while (queue.length > 0) {
+        const { classData, className } = queue.shift();
+        if (visited.has(className)) {
+          continue;
+        }
+        visited.add(className);
+
+        const classItems = (classData.ast.classes[0] && classData.ast.classes[0].items) || [];
+        const fieldItem = classItems.find(
+          (item) =>
+            item.type === 'field' &&
+            item.field &&
+            item.field.name === fieldName &&
+            item.field.flags &&
+            item.field.flags.includes('public')
+        );
+
+        if (fieldItem) {
+          const declaringClassObj =
+            classObj._classData &&
+            classObj._classData.ast &&
+            classObj._classData.ast.classes &&
+            classObj._classData.ast.classes[0] &&
+            classObj._classData.ast.classes[0].className === className
+              ? classObj
+              : await jvm.getClassObject(className);
+
+          return {
+            type: 'java/lang/reflect/Field',
+            _fieldData: fieldItem.field,
+            _declaringClass: declaringClassObj,
+            _annotations: fieldItem.field.annotations || [],
+          };
+        }
+
+        const { superClassName, interfaces = [] } = classData.ast.classes[0];
+
+        if (superClassName) {
+          try {
+            const superClassData = await jvm.loadClassByName(superClassName);
+            enqueueClassData(superClassData);
+          } catch (e) {
+            // Ignore classes that cannot be loaded
+          }
+        }
+
+        if (interfaces.length) {
+          for (const ifaceName of interfaces) {
+            try {
+              const interfaceData = await jvm.loadClassByName(ifaceName);
+              enqueueClassData(interfaceData);
+            } catch (e) {
+              // Ignore interfaces that cannot be loaded
+            }
+          }
+        }
+      }
+
+      throw {
+        type: 'java/lang/NoSuchFieldException',
+        message: fieldName,
+      };
+    },
     'getName()Ljava/lang/String;': (jvm, classObj, args) => {
       // Handle primitive class objects
       if (classObj.isPrimitive && classObj.name) {

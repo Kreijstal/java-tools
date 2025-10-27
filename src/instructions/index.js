@@ -20,6 +20,55 @@ const instructions = {
   ...conversions,
 };
 
+function expandWideInstruction(instruction) {
+  if (!instruction || typeof instruction.arg !== 'string') {
+    throw new Error('Invalid wide instruction format');
+  }
+
+  const parts = instruction.arg.trim().split(/\s+/);
+  if (parts.length < 2) {
+    throw new Error(`Invalid wide instruction operands: ${instruction.arg}`);
+  }
+
+  const [baseOp, ...operands] = parts;
+
+  switch (baseOp) {
+    case 'iinc': {
+      if (operands.length !== 2) {
+        throw new Error(`Invalid wide iinc operands: ${instruction.arg}`);
+      }
+      const [index, amount] = operands;
+      return {
+        op: baseOp,
+        varnum: index,
+        incr: amount,
+      };
+    }
+    case 'iload':
+    case 'lload':
+    case 'fload':
+    case 'dload':
+    case 'aload':
+    case 'istore':
+    case 'lstore':
+    case 'fstore':
+    case 'dstore':
+    case 'astore':
+    case 'ret': {
+      if (operands.length !== 1) {
+        throw new Error(`Invalid wide ${baseOp} operands: ${instruction.arg}`);
+      }
+      const [index] = operands;
+      return {
+        op: baseOp,
+        arg: index,
+      };
+    }
+    default:
+      throw new Error(`Unsupported wide instruction target: ${baseOp}`);
+  }
+}
+
 module.exports = async function dispatch(frame, instruction, jvm, thread) {
   if (jvm.verbose) {
     const threadId = thread ? thread.id : 'main';
@@ -38,11 +87,17 @@ module.exports = async function dispatch(frame, instruction, jvm, thread) {
     const className = jvm.findClassNameForMethod(frame.method);
     console.log(`[${threadStates}] [thread:${threadId}, pc:${className}.${frame.method.name} ${pc}, stack:${stackSize}]`, instruction);
   }
-  const op = typeof instruction === 'string' ? instruction : instruction.op;
+  let currentInstruction = instruction;
+  let op = typeof currentInstruction === 'string' ? currentInstruction : currentInstruction.op;
+
+  if (op === 'wide') {
+    currentInstruction = expandWideInstruction(currentInstruction);
+    op = currentInstruction.op;
+  }
 
   const func = instructions[op];
   if (func) {
-    await func(frame, instruction, jvm, thread);
+    await func(frame, currentInstruction, jvm, thread);
   } else {
     throw new Error(`Unknown or unimplemented instruction: ${op}`);
   }
