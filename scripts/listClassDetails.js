@@ -1,8 +1,8 @@
 const { loadClassByPath } = require('../src/classLoader');
 const { parseDescriptor } = require('../src/typeParser');
 
-function listClassDetails(classFilePath) {
-  const classData = loadClassByPath(classFilePath);
+async function listClassDetails(classFilePath) {
+  const classData = await loadClassByPath(classFilePath);
   // console.log('Loaded class data:', JSON.stringify(classData, null, 2));
   if (!classData) {
     console.error(`Failed to load class from file: ${classFilePath}`);
@@ -40,7 +40,7 @@ function listClassDetails(classFilePath) {
   console.log(JSON.stringify(classDetails, null, 2));
 }
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   if (args.length !== 1) {
     console.error('Usage: node listClassDetails.js <classFilePath>');
@@ -48,7 +48,7 @@ function main() {
   }
 
   const classFilePath = args[0];
-  listClassDetails(classFilePath);
+  await listClassDetails(classFilePath);
 }
 
 main();
