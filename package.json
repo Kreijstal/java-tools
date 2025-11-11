@@ -23,15 +23,18 @@
   "license": "AGPLv3",
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.21.1",
     "crc-32": "^1.2.2",
     "decimal.js": "^10.4.3",
+    "diff": "^8.0.2",
     "jszip": "^3.10.1",
     "jvm_parser": "^0.0.12",
     "node-fetch": "^3.0.0",
     "parsimmon": "^1.18.1",
     "puppeteer": "^24.17.0",
     "url": "^0.11.4",
-    "yargs": "^17.7.2"
+    "yargs": "^17.7.2",
+    "diff": "^5.2.0"
   },
   "optionalDependencies": {
     "speaker": "^0.5.5"
@@ -44,6 +47,7 @@
     "@xterm/xterm": "^5.5.0",
     "ace-builds": "^1.43.2",
     "babel-loader": "^10.0.0",
+    "blessed": "^0.1.81",
     "buffer": "^6.0.3",
     "jsdom": "^26.1.0",
     "path-browserify": "^1.0.1",
