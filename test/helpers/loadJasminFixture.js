@@ -11,7 +11,7 @@ function loadJasminFixture(baseName) {
   );
   const assembly = fs.readFileSync(jasminPath, 'utf8');
   const krak2Ast = parseKrak2Assembly(assembly);
-  return convertKrak2AstToClassAst(krak2Ast);
+  return convertKrak2AstToClassAst(krak2Ast, { sourceText: assembly });
 }
 
 module.exports = { loadJasminFixture };

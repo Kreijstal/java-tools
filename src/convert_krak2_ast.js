@@ -484,7 +484,169 @@ function convertConstToBootstrapMethod(constItem, methodHandleMap) {
   return null;
 }
 
-function convertKrak2AstToClassAst(krak2Ast) {
+function extractMethodKeyFromDirective(line) {
+  const rest = line.replace(/^\.method\s+/, '');
+  const colonIndex = rest.lastIndexOf(':');
+  if (colonIndex === -1) {
+    return null;
+  }
+  const descriptor = rest.slice(colonIndex + 1).trim();
+  const beforeColon = rest.slice(0, colonIndex).trim();
+  if (!descriptor || !beforeColon) {
+    return null;
+  }
+  const tokens = beforeColon.split(/\s+/);
+  const methodName = tokens[tokens.length - 1];
+  if (!methodName) {
+    return null;
+  }
+  return `${methodName}:${descriptor}`;
+}
+
+function buildMethodLineMap(sourceText) {
+  const lineInfos = sourceText.split(/\r?\n/).map((text, index) => ({ text, index }));
+  const map = new Map();
+  let currentKey = null;
+  let inCode = false;
+
+  lineInfos.forEach(({ text, index }) => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (trimmed.startsWith('.method')) {
+      currentKey = extractMethodKeyFromDirective(trimmed);
+      if (currentKey && !map.has(currentKey)) {
+        map.set(currentKey, []);
+      }
+      inCode = false;
+      return;
+    }
+    if (!currentKey) {
+      return;
+    }
+    if (trimmed.startsWith('.end method')) {
+      currentKey = null;
+      inCode = false;
+      return;
+    }
+    if (trimmed.startsWith('.code')) {
+      inCode = true;
+      return;
+    }
+    if (trimmed.startsWith('.end code')) {
+      inCode = false;
+      return;
+    }
+    if (!inCode) {
+      return;
+    }
+    const bucket = map.get(currentKey);
+    if (bucket) {
+      bucket.push({ lineNumber: index, text });
+    }
+  });
+
+  return map;
+}
+
+function annotateCodeItemsWithSource(method, methodLines) {
+  if (!Array.isArray(methodLines) || methodLines.length === 0) {
+    return;
+  }
+  const codeAttribute = (method.attributes || []).find((attr) => attr.type === 'code');
+  if (!codeAttribute || !codeAttribute.code || !Array.isArray(codeAttribute.code.codeItems)) {
+    return;
+  }
+
+  const codeItems = codeAttribute.code.codeItems;
+  const assigned = new WeakSet();
+  const nextInstruction = () => {
+    for (let i = 0; i < codeItems.length; i += 1) {
+      const candidate = codeItems[i];
+      if (
+        candidate &&
+        candidate.instruction &&
+        !assigned.has(candidate) &&
+        candidate.type !== 'catch'
+      ) {
+        assigned.add(candidate);
+        return candidate;
+      }
+    }
+    return null;
+  };
+
+  const nextCatch = () => {
+    for (let i = 0; i < codeItems.length; i += 1) {
+      const candidate = codeItems[i];
+      if (candidate && candidate.type === 'catch' && !assigned.has(candidate)) {
+        assigned.add(candidate);
+        return candidate;
+      }
+    }
+    return null;
+  };
+
+  methodLines.forEach(({ lineNumber, text }) => {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (trimmed.startsWith('.catch')) {
+      const catchItem = nextCatch();
+      if (catchItem) {
+        catchItem.loc = {
+          line: lineNumber,
+          column: Math.max(0, text.indexOf('.catch')),
+        };
+      }
+      return;
+    }
+    if (trimmed.startsWith('.')) {
+      return;
+    }
+    let instructionText = trimmed;
+    let column = Math.max(0, text.indexOf(trimmed));
+    const colonIndex = trimmed.indexOf(':');
+    if (colonIndex !== -1) {
+      const afterColon = trimmed.slice(colonIndex + 1).trim();
+      if (!afterColon) {
+        return;
+      }
+      instructionText = afterColon;
+      const idx = text.indexOf(afterColon);
+      column = idx === -1 ? column : idx;
+    }
+    if (!instructionText) {
+      return;
+    }
+    const instructionItem = nextInstruction();
+    if (instructionItem) {
+      instructionItem.loc = {
+        line: lineNumber,
+        column,
+      };
+    }
+  });
+}
+
+function annotateClassesWithSource(convertedClasses, sourceText) {
+  const methodLineMap = buildMethodLineMap(sourceText);
+  convertedClasses.forEach((cls) => {
+    cls.items.forEach((item) => {
+      if (item.type !== 'method' || !item.method) {
+        return;
+      }
+      const key = `${item.method.name}:${item.method.descriptor}`;
+      const methodLines = methodLineMap.get(key);
+      annotateCodeItemsWithSource(item.method, methodLines);
+    });
+  });
+}
+
+function convertKrak2AstToClassAst(krak2Ast, options = {}) {
+  const { sourceText } = typeof options === 'string' ? { sourceText: options } : options;
   if (!krak2Ast || !krak2Ast.classes) {
     return { classes: [] };
   }
@@ -599,6 +761,10 @@ function convertKrak2AstToClassAst(krak2Ast) {
     
     return result;
   });
+
+  if (sourceText) {
+    annotateClassesWithSource(convertedClasses, sourceText);
+  }
 
   return {
     classes: convertedClasses

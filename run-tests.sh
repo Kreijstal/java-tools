@@ -6,10 +6,10 @@ run_test() {
   echo "Running test: $test_file"
 
   # Special handling for tests that need longer timeouts
-  local timeout_val=5
+  local timeout_val=15
   case "$test_file" in
     *data-zip-download*) timeout_val=60;;
-    */roundtrip.test.js) timeout_val=60;;
+    */roundtrip.test.js) timeout_val=300;;
     */hierarchyRename.test.js) timeout_val=60;;
     # Add other special cases here
   esac

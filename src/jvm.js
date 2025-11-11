@@ -92,6 +92,18 @@ class JVM {
     return stringObj;
   }
 
+  createStringArray(strings = []) {
+    const array = new Array(strings.length);
+    for (let i = 0; i < strings.length; i++) {
+      array[i] = this.internString(strings[i]);
+    }
+    array.type = "[Ljava/lang/String;";
+    array.elementType = "java/lang/String";
+    array.length = strings.length;
+    array.hashCode = this.nextHashCode++;
+    return array;
+  }
+
   newByteArray(buffer) {
     return {
       type: '[B',
@@ -442,6 +454,11 @@ class JVM {
       // Handle regular class with main method
       const mainFrame = new Frame(mainMethod);
       mainFrame.className = className; // Add className to the frame
+      const mainArgs =
+        Array.isArray(options.args) && options.args.length
+          ? options.args
+          : [];
+      mainFrame.locals[0] = this.createStringArray(mainArgs);
       mainThread.callStack.push(mainFrame);
     }
 

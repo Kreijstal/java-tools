@@ -3,8 +3,8 @@
   "version": "0.0.1",
   "main": "index.js",
   "scripts": {
-    "test": "bash run-tests.sh",
-    "test:specific": "bash run-tests.sh",
+    "test": "node scripts/run-tests.js",
+    "test:specific": "node scripts/run-tests.js",
     "test:playwright": "playwright test",
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
@@ -15,7 +15,8 @@
     "clean": "find sources -name '*.class' -delete && rm -rf dist",
     "pretest": "node scripts/generate-jre-index.js &&npm run build:java",
     "ci": "npm run build && npm test",
-    "health-check": "node scripts/health-check.js"
+    "health-check": "node scripts/health-check.js",
+    "lint:jasmin": "node scripts/jvm-cli.js lint"
   },
   "keywords": [],
   "author": "kreijstal",

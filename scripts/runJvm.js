@@ -6,6 +6,7 @@ function main() {
   let cp = '.';
   let mainClass = '';
   let verbose = false;
+  const mainArgs = [];
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '-cp' || args[i] === '-classpath') {
@@ -19,7 +20,11 @@ function main() {
     } else if (args[i] === '--verbose') {
       verbose = true;
     } else {
-      mainClass = args[i];
+      if (!mainClass) {
+        mainClass = args[i];
+      } else {
+        mainArgs.push(args[i]);
+      }
     }
   }
 
@@ -41,10 +46,10 @@ function main() {
     });
 
     process.stdin.on('end', () => {
-      jvm.run(mainClass, { stdin: stdin });
+      jvm.run(mainClass, { args: mainArgs, stdin: stdin });
     });
   } else {
-    jvm.run(mainClass);
+    jvm.run(mainClass, { args: mainArgs });
   }
 }
 

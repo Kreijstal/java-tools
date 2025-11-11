@@ -15,7 +15,7 @@ function buildClassAstFromFile(classFilePath) {
   const convertedOriginalAst = convertJson(originalAst.ast, originalAst.constantPool);
   const jContent = unparseDataStructures(convertedOriginalAst.classes[0], originalAst.constantPool);
   const krak2Ast = parseKrak2Assembly(jContent);
-  return convertKrak2AstToClassAst(krak2Ast);
+  return convertKrak2AstToClassAst(krak2Ast, { sourceText: jContent });
 }
 
 test('assembler preserves exception tables for try/catch blocks', (t) => {

@@ -96,7 +96,7 @@ function reconstructAstFromCfg(cfg, originalMethodAst) {
   const sanitizeInstructionData = (items) =>
     JSON.parse(
       JSON.stringify(items, (key, value) => {
-        if (key === 'consumes' || key === 'produced' || key === 'consumers' || key === 'effect') {
+        if (key === 'consumes' || key === 'produced' || key === 'consumers' || key === 'effect' || key === 'loc') {
           return undefined;
         }
         if (key === 'producer') {
@@ -139,7 +139,7 @@ function reconstructAstFromCfg(cfg, originalMethodAst) {
 
   const newMethodAst = JSON.parse(
     JSON.stringify(originalMethodAst, (key, value) => {
-      if (key === 'consumes' || key === 'produced' || key === 'consumers' || key === 'effect') {
+      if (key === 'consumes' || key === 'produced' || key === 'consumers' || key === 'effect' || key === 'loc') {
         return undefined;
       }
       if (key === 'producer') {
