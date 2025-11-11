@@ -1,6 +1,166 @@
 const { getStackEffect, normalizeInstruction } = require('./utils/instructionUtils');
 const { applyStackManipulation } = require('./utils/stackManipulation');
 
+function pruneUnreachableBlocks(cfg) {
+  if (!cfg || !cfg.entryBlockId) {
+    return false;
+  }
+
+  const reachable = new Set();
+  const worklist = [cfg.entryBlockId];
+
+  while (worklist.length > 0) {
+    const blockId = worklist.pop();
+    if (reachable.has(blockId)) {
+      continue;
+    }
+    const block = cfg.blocks.get(blockId);
+    if (!block) {
+      continue;
+    }
+    reachable.add(blockId);
+    for (const successorId of block.successors) {
+      if (!reachable.has(successorId)) {
+        worklist.push(successorId);
+      }
+    }
+  }
+
+  const unreachable = [];
+  for (const id of cfg.blocks.keys()) {
+    if (!reachable.has(id)) {
+      unreachable.push(id);
+    }
+  }
+
+  if (unreachable.length === 0) {
+    return false;
+  }
+
+  for (const block of cfg.blocks.values()) {
+    block.successors = block.successors.filter((succ) => reachable.has(succ));
+    block.predecessors = block.predecessors.filter((pred) => reachable.has(pred));
+  }
+
+  for (const id of unreachable) {
+    cfg.blocks.delete(id);
+  }
+
+  if (cfg.handlerBlocks instanceof Set) {
+    for (const id of unreachable) {
+      cfg.handlerBlocks.delete(id);
+    }
+  }
+
+  if (cfg.exceptionSuccessors instanceof Map) {
+    for (const [blockId, targets] of cfg.exceptionSuccessors.entries()) {
+      if (!reachable.has(blockId)) {
+        cfg.exceptionSuccessors.delete(blockId);
+        continue;
+      }
+      for (const id of unreachable) {
+        targets.delete(id);
+      }
+      if (targets.size === 0) {
+        cfg.exceptionSuccessors.delete(blockId);
+      }
+    }
+  }
+
+  return true;
+}
+
+function getOpcodeFromInstruction(instruction) {
+  if (!instruction) {
+    return null;
+  }
+  if (typeof instruction === 'string') {
+    return instruction;
+  }
+  if (typeof instruction === 'object' && instruction.op) {
+    return instruction.op;
+  }
+  return null;
+}
+
+function findLastInstructionIndex(block) {
+  if (!block || !Array.isArray(block.instructions)) {
+    return -1;
+  }
+  for (let i = block.instructions.length - 1; i >= 0; i -= 1) {
+    const entry = block.instructions[i];
+    if (entry && entry.instruction) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function getBlockStart(block, entryId) {
+  if (!block) {
+    return Number.POSITIVE_INFINITY;
+  }
+  if (block.id === entryId) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  for (const entry of block.instructions) {
+    if (entry && typeof entry.pc === 'number') {
+      return entry.pc;
+    }
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+function simplifyTrivialGotos(cfg) {
+  if (!cfg || cfg.blocks.size === 0) {
+    return false;
+  }
+
+  const orderedBlocks = Array.from(cfg.blocks.values()).sort(
+    (a, b) => getBlockStart(a, cfg.entryBlockId) - getBlockStart(b, cfg.entryBlockId),
+  );
+  const blockOrder = new Map();
+  orderedBlocks.forEach((block, index) => {
+    blockOrder.set(block.id, index);
+  });
+
+  const exceptionSuccessors =
+    cfg.exceptionSuccessors instanceof Map ? cfg.exceptionSuccessors : new Map();
+
+  let changed = false;
+
+  for (const block of orderedBlocks) {
+    const lastIndex = findLastInstructionIndex(block);
+    if (lastIndex === -1) {
+      continue;
+    }
+    const entry = block.instructions[lastIndex];
+    const opcode = getOpcodeFromInstruction(entry.instruction);
+    if (opcode !== 'goto') {
+      continue;
+    }
+
+    const exceptionTargets = exceptionSuccessors.get(block.id);
+    const normalSuccessors = block.successors.filter(
+      (succ) => !exceptionTargets || !exceptionTargets.has(succ),
+    );
+    if (normalSuccessors.length !== 1) {
+      continue;
+    }
+
+    const targetId = normalSuccessors[0];
+    const nextBlock = orderedBlocks[blockOrder.get(block.id) + 1];
+    if (!nextBlock || nextBlock.id !== targetId) {
+      continue;
+    }
+
+    block.instructions.splice(lastIndex, 1);
+    changed = true;
+  }
+
+  return changed;
+}
+
 const ESSENTIAL_OPCODES = new Set([
   'invokevirtual', 'invokespecial', 'invokestatic', 'invokeinterface', 'invokedynamic',
   'putfield', 'putstatic', 'getstatic',
@@ -235,6 +395,7 @@ function buildDefUseChains(cfg) {
 }
 
 function eliminateDeadCodeCfg(cfg) {
+  const removedBlocks = pruneUnreachableBlocks(cfg);
   buildDefUseChains(cfg);
 
   const liveSet = new Set();
@@ -290,7 +451,9 @@ function eliminateDeadCodeCfg(cfg) {
     }
   }
 
-  return { changed, optimizedCfg: cfg };
+  const simplifiedGoto = simplifyTrivialGotos(cfg);
+
+  return { changed: changed || removedBlocks || simplifiedGoto, optimizedCfg: cfg };
 }
 
 module.exports = {

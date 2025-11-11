@@ -1,5 +1,13 @@
 const P = require('parsimmon');
 
+if (typeof P.Parser.prototype.many1 !== 'function') {
+  P.Parser.prototype.many1 = function () {
+    return this.chain((first) =>
+      this.many().map((rest) => [first, ...rest]),
+    );
+  };
+}
+
 function createUnsignedParser(bits) {
     const max = (1n << BigInt(bits)) - 1n; // Maximum value for unsigned integer
     return (r) =>

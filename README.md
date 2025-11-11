@@ -196,6 +196,47 @@ const newBytecode = unparseDataStructures(converted.classes[0], converted.consta
 
 See `docs/dead_code_elimination.md` for a detailed walkthrough of assembling `.j` sources, parsing the resulting `.class`, running the stack-based dead-code eliminator, and emitting updated assembly.
 
+### Jasmin Lint & Fix CLI
+
+Use the unified JVM CLI to surface the same dead-code diagnostics and jump-handler fixes that power the LSP workflow:
+
+```bash
+# Show diagnostics for a Jasmin file
+node scripts/jvm-cli.js lint examples/sources/jasmin/MisplacedCatch.j
+
+# Apply the recommended fix in place
+node scripts/jvm-cli.js lint --fix examples/sources/jasmin/MisplacedCatch.j
+
+# Or write the fix to a separate file
+node scripts/jvm-cli.js lint --fix --out /tmp/MisplacedCatch.fixed.j examples/sources/jasmin/MisplacedCatch.j
+
+# npm shortcut
+npm run lint:jasmin -- --fix examples/sources/jasmin/MisplacedCatch.j
+```
+
+When `--fix` is supplied, the tool rewrites the target file (or the path provided via `--out`) with the optimized handler layout.
+
+### Unified JVM CLI
+
+The helper `scripts/jvm-cli.js` centralizes common JVM/Jasmin workflows:
+
+```bash
+# Assemble/disassemble
+node scripts/jvm-cli.js assemble examples/sources/jasmin/MisplacedCatch.j
+node scripts/jvm-cli.js disassemble build/classes/Hello.class --out /tmp/Hello.j
+
+# Rename classes or methods in-place (works for .j and .class)
+node scripts/jvm-cli.js rename-class examples/sources/jasmin/MisplacedCatch.j \
+    --from MisplacedCatch --to MCatch -n   # dry-run; prints diff
+node scripts/jvm-cli.js rename-method build/classes/Hello.class \
+    --class Hello --from greet --to greetSafe --descriptor '()V'
+
+# Dead-code optimization (alias for `lint --fix`)
+node scripts/jvm-cli.js optimize examples/sources/jasmin/MisplacedCatch.j --out /tmp/MisplacedCatch.opt.j
+```
+
+Use `node scripts/jvm-cli.js --help` to see the complete list of subcommands and flags. All mutating operations accept `-n/--dry-run` to preview the unified diff without touching the input file.
+
 ## 🔧 Configuration
 
 ### JVM Options

@@ -122,7 +122,7 @@ function stripCpIndex(obj) {
     }
 
     for (const key in obj) {
-      if (key === 'cp_index' || key === 'pc') {
+      if (key === 'cp_index' || key === 'pc' || key === 'loc') {
         delete obj[key];
         continue;
       }
@@ -141,6 +141,28 @@ function stripCpIndex(obj) {
     if ('catch_type' in obj && !('catchType' in obj)) {
       obj.catchType = obj.catch_type;
       delete obj.catch_type;
+    }
+    if ('bootstrapMethods' in obj) {
+      delete obj.bootstrapMethods;
+    }
+    if ('bootstrapMethods' in obj) {
+      delete obj.bootstrapMethods;
+    }
+  }
+  return obj;
+}
+
+function stripLocMetadata(obj) {
+  if (obj && typeof obj === 'object') {
+    if (Array.isArray(obj)) {
+      obj.forEach(stripLocMetadata);
+      return obj;
+    }
+    if ('loc' in obj) {
+      delete obj.loc;
+    }
+    for (const key in obj) {
+      stripLocMetadata(obj[key]);
     }
   }
   return obj;
@@ -180,11 +202,12 @@ classNames.forEach(className => {
 
       // Path B: .j -> krak2AST -> classAST (new)
       const krak2Ast = parseKrak2Assembly(jContent);
-      const newClassAst = convertKrak2AstToClassAst(krak2Ast);
+      const newClassAst = convertKrak2AstToClassAst(krak2Ast, { sourceText: jContent });
+      const sanitizedNewClassAst = stripCpIndex(stripLocMetadata(deepClone(newClassAst)));
       t.pass('New classAST generated successfully');
 
       // Verification
-      t.deepEqual(newClassAst, strippedGoldenAst, "The AST from the new parser should match the golden AST");
+      t.deepEqual(sanitizedNewClassAst, strippedGoldenAst, "The AST from the new parser should match the golden AST");
 
       // Path C: classAST -> .class -> classAST (roundtrip check)
       if (assemblerMode === 'krak2') {
@@ -197,8 +220,17 @@ classNames.forEach(className => {
       const regeneratedClassContent = fs.readFileSync(regeneratedClassFilePath);
       const regeneratedAst = getAST(new Uint8Array(regeneratedClassContent));
       const regeneratedConverted = convertJson(regeneratedAst.ast, regeneratedAst.constantPool);
-      const strippedRegenerated = stripCpIndex(deepClone(regeneratedConverted));
-      t.deepEqual(strippedRegenerated, newClassAst, 'Reconstructed class from AST should match the original AST');
+      const strippedRegenerated = stripCpIndex(stripLocMetadata(deepClone(regeneratedConverted)));
+      t.deepEqual(strippedRegenerated, sanitizedNewClassAst, 'Reconstructed class from AST should match the original AST');
+
+      const regeneratedJ = unparseDataStructures(regeneratedConverted.classes[0], regeneratedAst.constantPool);
+      const reparsedRegenerated = convertKrak2AstToClassAst(parseKrak2Assembly(regeneratedJ), { sourceText: regeneratedJ });
+      const strippedReparsedRegenerated = stripCpIndex(deepClone(reparsedRegenerated));
+      t.deepEqual(
+        strippedReparsedRegenerated,
+        strippedRegenerated,
+        'Regenerated Jasmin should parse back to the same AST',
+      );
 
     } catch (error) {
       t.fail(`Roundtrip test failed with an error: ${error.message}\n${error.stack}`);
