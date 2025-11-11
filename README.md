@@ -237,6 +237,8 @@ node scripts/jvm-cli.js optimize examples/sources/jasmin/MisplacedCatch.j --out 
 
 Use `node scripts/jvm-cli.js --help` to see the complete list of subcommands and flags. All mutating operations accept `-n/--dry-run` to preview the unified diff without touching the input file.
 
+See `docs/tooling.md` for a deeper tour of the CLI, the workspace TUI, the MCP server’s JSON-RPC surface, and how these building blocks roll up into the planned LSP.
+
 ## 🔧 Configuration
 
 ### JVM Options

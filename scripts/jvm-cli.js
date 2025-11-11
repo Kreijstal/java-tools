@@ -9,10 +9,10 @@ const { getAST } = require('jvm_parser');
 const { convertJson, unparseDataStructures } = require('../src/convert_tree');
 const { parseKrak2Assembly } = require('../src/parse_krak2');
 const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
-const { convertAstToCfg } = require('../src/ast-to-cfg');
-const { eliminateDeadCodeCfg } = require('../src/deadCodeEliminator-cfg');
-const { reconstructAstFromCfg } = require('../src/cfg-to-ast');
 const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
+const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { runDeadCodePass } = require('../src/deadCodePass');
+const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
 
 const HELP_TEXT = `
 Usage: node scripts/jvm-cli.js <command> [options]
@@ -24,10 +24,16 @@ Commands:
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
   rename-class <file> --from Old --to New [options] Rename a class within the file
   rename-method <file> --class C --from old --to new [--descriptor desc] [options]
+  workspace list-methods <Class> [--classpath dir]
+  workspace list-fields <Class> [--classpath dir]
+  workspace list-constants <Class> [--classpath dir]
+  workspace describe-class <Class> [--classpath dir]
+  workspace find-references --class C [--member m] [--descriptor desc] [--classpath dir]
 
 Options (where supported):
   --out <file>     Write results to the given path (defaults to in-place)
   -n, --dry-run    Do not write changes; print unified diff instead
+  --classpath <dir>  (workspace commands) root containing .class files (default: sources/)
   --help           Show this message
 
 Examples:
@@ -224,39 +230,6 @@ function showDiff(beforeText, afterText) {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }
 
-function applyDeadCode(astRoot) {
-  const diagnostics = [];
-  let changed = false;
-
-  for (const classItem of astRoot.classes || []) {
-    const className = classItem.className || 'UnknownClass';
-    for (const item of classItem.items || []) {
-      if (!item || item.type !== 'method' || !item.method) {
-        continue;
-      }
-      const cfg = convertAstToCfg(item.method);
-      if (!cfg) {
-        continue;
-      }
-      const result = eliminateDeadCodeCfg(cfg);
-      if (!result.changed) {
-        continue;
-      }
-      const optimizedMethod = reconstructAstFromCfg(result.optimizedCfg, item.method);
-      item.method = optimizedMethod;
-      diagnostics.push({
-        className,
-        methodName: optimizedMethod.name,
-        descriptor: optimizedMethod.descriptor,
-        message: 'Dead handler/jump detected; handler body can be simplified.',
-      });
-      changed = true;
-    }
-  }
-
-  return { diagnostics, changed };
-}
-
 function lintOrOptimizeCommand(args, { applyFix }) {
   let outPath = null;
   let dryRun = false;
@@ -285,7 +258,7 @@ function lintOrOptimizeCommand(args, { applyFix }) {
   ensureFileExists(inputPath);
   const artifact = loadArtifact(inputPath);
   try {
-    const { diagnostics, changed } = applyDeadCode(artifact.astRoot);
+    const { diagnostics, changed } = runDeadCodePass(artifact.astRoot);
     if (diagnostics.length === 0) {
       console.log('No issues detected.');
     } else {
@@ -310,144 +283,6 @@ function lintOrOptimizeCommand(args, { applyFix }) {
   } finally {
     artifact.cleanup();
   }
-}
-
-function escapeRegex(str) {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function replaceDescriptor(descriptor, oldClass, newClass) {
-  if (!descriptor || typeof descriptor !== 'string') {
-    return descriptor;
-  }
-  const pattern = new RegExp(`L${escapeRegex(oldClass)};`, 'g');
-  return descriptor.replace(pattern, `L${newClass};`);
-}
-
-function renameClassAst(astRoot, fromClass, toClass) {
-  let changed = false;
-  for (const classItem of astRoot.classes || []) {
-    if (classItem.className === fromClass) {
-      classItem.className = toClass;
-      changed = true;
-    }
-    if (classItem.superClassName === fromClass) {
-      classItem.superClassName = toClass;
-      changed = true;
-    }
-    if (Array.isArray(classItem.interfaces)) {
-      classItem.interfaces = classItem.interfaces.map((iface) =>
-        iface === fromClass ? toClass : iface,
-      );
-    }
-    for (const item of classItem.items || []) {
-      if (item.type === 'field' && item.field) {
-        const newDesc = replaceDescriptor(item.field.descriptor, fromClass, toClass);
-        if (newDesc !== item.field.descriptor) {
-          item.field.descriptor = newDesc;
-          changed = true;
-        }
-      } else if (item.type === 'method' && item.method) {
-        const method = item.method;
-        const newDesc = replaceDescriptor(method.descriptor, fromClass, toClass);
-        if (newDesc !== method.descriptor) {
-          method.descriptor = newDesc;
-          changed = true;
-        }
-        for (const attr of method.attributes || []) {
-          if (attr.type !== 'code' || !attr.code) continue;
-          for (const codeItem of attr.code.codeItems || []) {
-            if (!codeItem || !codeItem.instruction) continue;
-            const instr = codeItem.instruction;
-            const op = instr.op;
-            if (!op) continue;
-            if (
-              ['new', 'checkcast', 'instanceof', 'anewarray'].includes(op) &&
-              instr.arg === fromClass
-            ) {
-              instr.arg = toClass;
-              changed = true;
-            } else if (op.startsWith('invoke') || op.startsWith('get') || op.startsWith('put')) {
-              changed = updateMemberInstruction(instr, fromClass, toClass) || changed;
-            }
-          }
-        }
-      } else if (item.attribute && item.attribute.type === 'sourcefile') {
-        const expected = `"${fromClass}.java"`;
-        if (item.attribute.value === expected) {
-          item.attribute.value = `"${toClass}.java"`;
-          changed = true;
-        }
-      }
-    }
-  }
-  return changed;
-}
-
-function updateMemberInstruction(instr, fromClass, toClass) {
-  if (!instr || !instr.arg) return false;
-  const arg = instr.arg;
-  if (Array.isArray(arg) && arg.length >= 2) {
-    let modified = false;
-    if (arg[1] === fromClass) {
-      arg[1] = toClass;
-      modified = true;
-    }
-    if (Array.isArray(arg[2]) && arg[2].length >= 2 && typeof arg[2][1] === 'string') {
-      const newDesc = replaceDescriptor(arg[2][1], fromClass, toClass);
-      if (newDesc !== arg[2][1]) {
-        arg[2][1] = newDesc;
-        modified = true;
-      }
-    }
-    return modified;
-  }
-  return false;
-}
-
-function renameMethodAst(astRoot, className, oldName, newName, descriptor) {
-  let changed = false;
-  for (const classItem of astRoot.classes || []) {
-    if (classItem.className !== className) {
-      continue;
-    }
-    for (const item of classItem.items || []) {
-      if (item.type === 'method' && item.method) {
-        const method = item.method;
-        if (
-          method.name === oldName &&
-          (!descriptor || descriptor === method.descriptor)
-        ) {
-          method.name = newName;
-          changed = true;
-        }
-        for (const attr of method.attributes || []) {
-          if (attr.type !== 'code' || !attr.code) {
-            continue;
-          }
-          for (const codeItem of attr.code.codeItems || []) {
-            if (!codeItem || !codeItem.instruction) continue;
-            const instr = codeItem.instruction;
-            if (!instr.op || !instr.op.startsWith('invoke')) continue;
-            const arg = instr.arg;
-            if (Array.isArray(arg) && arg.length >= 3) {
-              const owner = arg[1];
-              if (owner !== className) continue;
-              const nameAndType = arg[2];
-              if (!Array.isArray(nameAndType)) continue;
-              const name = nameAndType[0];
-              const desc = nameAndType[1];
-              if (name === oldName && (!descriptor || descriptor === desc)) {
-                nameAndType[0] = newName;
-                changed = true;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  return changed;
 }
 
 function renameClassCommand(args) {
@@ -562,6 +397,149 @@ function renameMethodCommand(args) {
   }
 }
 
+function parseWorkspaceOptions(args) {
+  let classpath = ['sources'];
+  const rest = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--classpath' || arg === '-cp') {
+      if (i + 1 >= args.length) throw new Error('--classpath requires a value');
+      classpath = args[++i].split(path.delimiter);
+    } else {
+      rest.push(arg);
+    }
+  }
+  return { classpath, rest };
+}
+
+async function loadWorkspace(classpath) {
+  return await KrakatauWorkspace.create(classpath);
+}
+
+async function workspaceCommand(args) {
+  if (args.length === 0 || args[0] === '--help' || args[0] === '-h') {
+    printHelp();
+    return;
+  }
+  const subcommand = args[0];
+  const { classpath, rest } = parseWorkspaceOptions(args.slice(1));
+  const workspace = await loadWorkspace(classpath);
+
+  switch (subcommand) {
+    case 'list-methods':
+      workspaceListMethods(workspace, rest);
+      break;
+    case 'list-fields':
+      workspaceListFields(workspace, rest);
+      break;
+    case 'list-constants':
+      workspaceListConstants(workspace, rest);
+      break;
+    case 'describe-class':
+      workspaceDescribeClass(workspace, rest);
+      break;
+    case 'find-references':
+      workspaceFindReferences(workspace, rest);
+      break;
+    default:
+      throw new Error(`Unknown workspace command: ${subcommand}`);
+  }
+}
+
+function workspaceListMethods(workspace, args) {
+  if (args.length !== 1) {
+    throw new Error('workspace list-methods requires <ClassName>');
+  }
+  const className = args[0];
+  const methods = workspace.listMethods(className);
+  if (!methods.length) {
+    console.log(`No methods found in ${className}`);
+    return;
+  }
+  methods.forEach((method) => {
+    const flags = method.flags ? method.flags.join(' ') : '';
+    console.log(`${className}.${method.identifier.memberName}${method.descriptor} ${flags}`);
+  });
+}
+
+function workspaceListFields(workspace, args) {
+  if (args.length !== 1) {
+    throw new Error('workspace list-fields requires <ClassName>');
+  }
+  const className = args[0];
+  const fields = workspace.listFields(className);
+  if (!fields.length) {
+    console.log(`No fields found in ${className}`);
+    return;
+  }
+  fields.forEach((field) => {
+    const flags = field.flags ? field.flags.join(' ') : '';
+    console.log(`${className}.${field.identifier.memberName} : ${field.descriptor} ${flags}`);
+  });
+}
+
+function workspaceListConstants(workspace, args) {
+  if (args.length !== 1) {
+    throw new Error('workspace list-constants requires <ClassName>');
+  }
+  const className = args[0];
+  const workspaceEntry = workspace.workspaceASTs[className];
+  if (!workspaceEntry || !workspaceEntry.constantPool) {
+    console.log(`Class ${className} not loaded in workspace`);
+    return;
+  }
+  workspaceEntry.constantPool.forEach((entry, index) => {
+    if (!entry) return;
+    console.log(`#${index}: ${JSON.stringify(entry)}`);
+  });
+}
+
+function workspaceDescribeClass(workspace, args) {
+  if (args.length !== 1) {
+    throw new Error('workspace describe-class requires <ClassName>');
+  }
+  const className = args[0];
+  const ast = workspace.getClassAST(className);
+  const cls = ast.classes[0];
+  console.log(`Class: ${cls.className}`);
+  console.log(`Flags: ${(cls.flags || []).join(' ')}`);
+  console.log(`Super: ${cls.superClassName}`);
+  console.log(`Interfaces: ${(cls.interfaces || []).join(', ') || '(none)'}`);
+}
+
+function workspaceFindReferences(workspace, args) {
+  let className = null;
+  let memberName = null;
+  let descriptor = null;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--class') {
+      className = args[++i];
+    } else if (arg === '--member') {
+      memberName = args[++i];
+    } else if (arg === '--descriptor' || arg === '-d') {
+      descriptor = args[++i];
+    } else {
+      throw new Error(`Unknown option for find-references: ${arg}`);
+    }
+  }
+  if (!className) {
+    throw new Error('find-references requires --class');
+  }
+  const identifier = new (require('../src/symbols').SymbolIdentifier)(
+    className,
+    memberName,
+    descriptor,
+  );
+  const refs = workspace.findReferences(identifier);
+  if (!refs.length) {
+    console.log('No references found.');
+    return;
+  }
+  refs.forEach((ref) => {
+    console.log(`${ref.className} :: ${ref.astPath}`);
+  });
+}
 function main(argv) {
   try {
     const { command, args } = parseCommand(argv);
@@ -586,6 +564,9 @@ function main(argv) {
         break;
       case 'rename-method':
         renameMethodCommand(args);
+        break;
+      case 'workspace':
+        workspaceCommand(args);
         break;
       default:
         throw new Error(`Unknown command: ${command}`);
