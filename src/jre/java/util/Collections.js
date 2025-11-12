@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   methods: {},
   staticMethods: {
@@ -108,7 +110,7 @@ module.exports = {
         }
       }
     },
-    'max(Ljava/util/Collection;)Ljava/lang/Object;': (jvm, obj, args) => {
+    'max(Ljava/util/Collection;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const collection = args[0];
       if (!collection || !collection.items || collection.items.length === 0) {
         throw {
@@ -124,8 +126,8 @@ module.exports = {
         }
       }
       return max;
-    },
-    'min(Ljava/util/Collection;)Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/util/NoSuchElementException']),
+    'min(Ljava/util/Collection;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const collection = args[0];
       if (!collection || !collection.items || collection.items.length === 0) {
         throw {
@@ -141,7 +143,7 @@ module.exports = {
         }
       }
       return min;
-    }
+    }, ['java/util/NoSuchElementException'])
   },
   staticFields: {
     EMPTY_LIST: {

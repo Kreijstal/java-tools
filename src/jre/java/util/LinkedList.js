@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/util/List'],
@@ -6,7 +8,7 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       obj.list = [];
     },
-    'iterator()Ljava/util/Iterator;': (jvm, obj, args) => {
+    'iterator()Ljava/util/Iterator;': withThrows((jvm, obj, args) => {
       const iteratorClassName = 'java/util/LinkedList$ListIterator';
       const iteratorObj = {
         type: iteratorClassName,
@@ -19,7 +21,7 @@ module.exports = {
         throw { type: 'java/lang/NoSuchMethodError', message: 'Constructor for iterator not found' };
       }
       return iteratorObj;
-    },
+    }, ['java/lang/NoSuchMethodError']),
     'size()I': (jvm, obj, args) => {
       return obj.list.length;
     },
@@ -30,7 +32,7 @@ module.exports = {
     'removeFirst()Ljava/lang/Object;': (jvm, obj, args) => {
       return obj.list.shift();
     },
-    'get(I)Ljava/lang/Object;': (jvm, obj, args) => {
+    'get(I)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const index = args[0];
       if (index < 0 || index >= obj.list.length) {
         throw {
@@ -39,6 +41,6 @@ module.exports = {
         };
       }
       return obj.list[index];
-    },
+    }, ['java/lang/IndexOutOfBoundsException']),
   },
 };

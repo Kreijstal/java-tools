@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -6,14 +8,14 @@ module.exports = {
       obj.value = '';
       delete obj.isUninitialized;
     },
-    '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
+    '<init>(Ljava/lang/String;)V': withThrows((jvm, obj, args) => {
       const str = args[0];
       if (str === null) {
         throw { type: 'java/lang/NullPointerException' };
       }
       obj.value = String(str);
       delete obj.isUninitialized;
-    },
+    }, ['java/lang/NullPointerException']),
     'append(Ljava/lang/String;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
       const str = args[0];
       obj.value += str;
@@ -37,7 +39,7 @@ module.exports = {
     'length()I': (jvm, obj, args) => {
       return obj.value.length;
     },
-    'charAt(I)C': (jvm, obj, args) => {
+    'charAt(I)C': withThrows((jvm, obj, args) => {
       const index = args[0];
       if (index < 0 || index >= obj.value.length) {
         throw {
@@ -46,8 +48,8 @@ module.exports = {
         };
       }
       return obj.value.charCodeAt(index);
-    },
-    'setCharAt(IC)V': (jvm, obj, args) => {
+    }, ['java/lang/StringIndexOutOfBoundsException']),
+    'setCharAt(IC)V': withThrows((jvm, obj, args) => {
       const index = args[0];
       const ch = args[1];
       if (index < 0 || index >= obj.value.length) {
@@ -60,8 +62,8 @@ module.exports = {
       const chars = Array.from(obj.value);
       chars[index] = String.fromCharCode(ch);
       obj.value = chars.join('');
-    },
-    'setLength(I)V': (jvm, obj, args) => {
+    }, ['java/lang/StringIndexOutOfBoundsException']),
+    'setLength(I)V': withThrows((jvm, obj, args) => {
       const newLength = args[0];
       if (newLength < 0) {
         throw {
@@ -76,6 +78,6 @@ module.exports = {
         // Truncate the string
         obj.value = obj.value.substring(0, newLength);
       }
-    },
+    }, ['java/lang/StringIndexOutOfBoundsException']),
   },
 };

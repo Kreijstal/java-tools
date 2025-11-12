@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/io/Writer',
   staticFields: {},
@@ -15,7 +17,7 @@ module.exports = {
       obj.buffer.push(c & 0xFFFF); // Mask to 16-bit for char
     },
     
-    'write([CII)V': (jvm, obj, args) => {
+    'write([CII)V': withThrows((jvm, obj, args) => {
       const cbuf = args[0];
       const off = args[1];
       const len = args[2];
@@ -32,7 +34,7 @@ module.exports = {
       for (let i = 0; i < len; i++) {
         obj.buffer.push(cbuf[off + i]);
       }
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/IndexOutOfBoundsException']),
     
     'write(Ljava/lang/String;)V': (jvm, obj, args) => {
       const str = args[0];

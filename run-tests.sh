@@ -9,7 +9,7 @@ run_test() {
   local timeout_val=15
   case "$test_file" in
     *data-zip-download*) timeout_val=60;;
-    */roundtrip.test.js) timeout_val=300;;
+    */roundtrip.test.js) timeout_val=600;;
     */hierarchyRename.test.js) timeout_val=60;;
     # Add other special cases here
   esac

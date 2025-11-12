@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/io/Reader',
   staticFields: {},
@@ -16,7 +18,7 @@ module.exports = {
       return obj.str.charCodeAt(obj.next++);
     },
     
-    'read([CII)I': (jvm, obj, args) => {
+    'read([CII)I': withThrows((jvm, obj, args) => {
       const cbuf = args[0];
       const off = args[1];
       const len = args[2];
@@ -43,7 +45,7 @@ module.exports = {
       }
       obj.next += n;
       return n;
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/IndexOutOfBoundsException']),
     
     'close()V': (jvm, obj, args) => {
       obj.str = null;

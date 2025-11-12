@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: "java/io/Reader",
   staticFields: {},
@@ -6,7 +8,7 @@ module.exports = {
       obj.reader = args[0];
       return obj;
     },
-    "readLine()Ljava/lang/String;": (jvm, obj, args) => {
+    "readLine()Ljava/lang/String;": withThrows((jvm, obj, args) => {
       const reader = obj.reader;
       if (!reader) {
         jvm.throwException('java/io/IOException', 'Stream closed');
@@ -37,7 +39,7 @@ module.exports = {
       }
 
       return jvm.internString(line);
-    },
+    }, ['java/io/IOException']),
     "close()V": (jvm, obj, args) => {
       const reader = obj.reader;
       if (reader) {

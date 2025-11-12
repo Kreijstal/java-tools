@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/io/FilterInputStream',
   interfaces: ['java/io/DataInput'],
@@ -32,7 +34,7 @@ module.exports = {
       return -1;
     },
     
-    'readBoolean()Z': (jvm, obj, args) => {
+    'readBoolean()Z': withThrows((jvm, obj, args) => {
       const readMethod = jvm._jreFindMethod(obj.type, 'read', '()I');
       if (readMethod) {
         const ch = readMethod(jvm, obj, []);
@@ -43,9 +45,9 @@ module.exports = {
         return ch !== 0;
       }
       return false;
-    },
+    }, ['java/io/EOFException']),
     
-    'readByte()B': (jvm, obj, args) => {
+    'readByte()B': withThrows((jvm, obj, args) => {
       const readMethod = jvm._jreFindMethod(obj.type, 'read', '()I');
       if (readMethod) {
         const ch = readMethod(jvm, obj, []);
@@ -56,9 +58,9 @@ module.exports = {
         return (ch << 24) >> 24; // Convert to signed byte
       }
       return 0;
-    },
+    }, ['java/io/EOFException']),
     
-    'readInt()I': (jvm, obj, args) => {
+    'readInt()I': withThrows((jvm, obj, args) => {
       const readMethod = jvm._jreFindMethod(obj.type, 'read', '()I');
       if (readMethod) {
         let ch1 = readMethod(jvm, obj, []);
@@ -74,7 +76,7 @@ module.exports = {
         return ((ch1 << 24) + (ch2 << 16) + (ch3 << 8) + (ch4 << 0));
       }
       return 0;
-    },
+    }, ['java/io/EOFException']),
     
     'close()V': (jvm, obj, args) => {
       if (obj.in) {

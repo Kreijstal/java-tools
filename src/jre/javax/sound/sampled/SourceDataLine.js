@@ -1,19 +1,39 @@
+const disableNativeAudio =
+  process.env.JVM_DISABLE_AUDIO === '1' ||
+  process.env.JVM_DISABLE_AUDIO === 'true';
+const { withThrows } = require('../../../helpers');
+
 let Speaker;
-try {
-  Speaker = require("speaker");
-} catch (err) {
-  // Fallback for environments where speaker package is not available
-  // console.warn("Speaker package not available, audio output disabled");
+if (!disableNativeAudio) {
+  try {
+    Speaker = require("speaker");
+  } catch (err) {
+    // Fallback for environments where speaker package is not available
+    // console.warn("Speaker package not available, audio output disabled");
+    Speaker = class MockSpeaker {
+      constructor(options) {
+        this.options = options;
+      }
+      write(data) {
+        // Mock write - do nothing
+      }
+      end() {
+        // Mock end - do nothing
+      }
+      once(event, callback) {
+        if (event === "drain") {
+          setTimeout(callback, 0);
+        }
+      }
+    };
+  }
+} else {
   Speaker = class MockSpeaker {
     constructor(options) {
       this.options = options;
     }
-    write(data) {
-      // Mock write - do nothing
-    }
-    end() {
-      // Mock end - do nothing
-    }
+    write(data) {}
+    end() {}
     once(event, callback) {
       if (event === "drain") {
         setTimeout(callback, 0);
@@ -25,7 +45,7 @@ try {
 module.exports = {
   super: "javax/sound/sampled/DataLine",
   methods: {
-    "open(Ljavax/sound/sampled/AudioFormat;)V": (jvm, obj, args) => {
+    "open(Ljavax/sound/sampled/AudioFormat;)V": withThrows((jvm, obj, args) => {
       const [format] = args;
       const formatFields = format.fields["javax/sound/sampled/AudioFormat"];
 
@@ -47,13 +67,13 @@ module.exports = {
           message: "Failed to open audio device: " + error.message,
         };
       }
-    },
+    }, ["javax/sound/sampled/LineUnavailableException"]),
     "open(Ljavax/sound/sampled/AudioFormat;I)V": (jvm, obj, args) => {
       // bufferSize is ignored for now
       const self = jvm.jre["javax/sound/sampled/SourceDataLine"];
       self.methods["open(Ljavax/sound/sampled/AudioFormat;)V"](jvm, obj, args);
     },
-    "write([BII)I": (jvm, obj, args) => {
+    "write([BII)I": withThrows((jvm, obj, args) => {
       const [buffer, offset, len] = args;
 
       if (!obj.speaker || !obj.isOpen) {
@@ -74,7 +94,7 @@ module.exports = {
           message: "Audio write failed: " + error.message,
         };
       }
-    },
+    }, ["java/lang/IllegalStateException", "java/io/IOException"]),
     "available()I": (jvm, obj, args) => {
       // Return a reasonable buffer size estimate
       return 4096;

@@ -6,6 +6,7 @@
 
 - `assemble`/`disassemble` convert between Jasmin and bytecode without depending on Krakatau’s Java tools.
 - `lint`/`optimize` run the dead-handler eliminator; `--fix` rewrites the file, `-n/--dry-run` shows a unified diff.
+- `format` reassembles/disassembles `.j` sources to enforce a canonical layout (same defaults used by the forthcoming LSP formatter).
 - `rename-class`/`rename-method` patch both definitions and call sites; they understand descriptors and emit diffs.
 - `workspace` subcommands query any classpath (default `sources`) for methods, fields, constants, class descriptors, and reference graph lookups.
 
@@ -45,3 +46,5 @@ The in-process harness in `src/lsp/inProcessHarness.js` lets us spin up an LSP-c
 4. **Auto-fix Suggestions** — dead-code optimizations can surface as auto-fixable diagnostics both in the CLI (`-n` diffs) and in editors; future passes (constant folding, verifier hints) can follow the same shape.
 
 Because all heavy lifting lives in plain JS modules (parser, CFG builder, optimizer, renamers), the LSP server can share code with the CLI/MCP server without bundlers. The same primitives also power CLI-based workflows, ensuring feature parity between headless pipelines (CI, MCP clients) and editor integrations.
+
+For client authors and protocol implementers, see `docs/lsp.md` for the detailed request/response breakdown, sample payloads, and configuration knobs exposed during the LSP handshake.

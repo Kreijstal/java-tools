@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { withThrows } = require('../../helpers');
 
 module.exports = {
   super: "java/util/Random",
@@ -9,22 +10,21 @@ module.exports = {
     'setSeed(J)V': (jvm, obj, args) => {
       // SecureRandom is automatically seeded from system entropy.
     },
-    'setSeed([B)V': (jvm, obj, args) => {
+    'setSeed([B)V': withThrows((jvm, obj, args) => {
       // SecureRandom is automatically seeded from system entropy.
-    },
+    }, ['java/lang/UnsupportedOperationException']),
     'nextInt()I': (jvm, obj, args) => {
       const buffer = crypto.randomBytes(4);
       return buffer.readInt32BE(0);
     },
-    'nextInt(I)I': (jvm, obj, args) => {
+    'nextInt(I)I': withThrows((jvm, obj, args) => {
         const bound = args[0];
         if (bound <= 0) {
-            jvm.throwNew("java/lang/IllegalArgumentException", "bound must be positive");
-            return;
+            throw { type: 'java/lang/IllegalArgumentException', message: 'bound must be positive' };
         }
         return crypto.randomInt(bound);
-    },
-    'nextBytes([B)V': (jvm, obj, args) => {
+    }, ['java/lang/IllegalArgumentException']),
+    'nextBytes([B)V': withThrows((jvm, obj, args) => {
       const byteArray = args[0];
       let bytes;
       if (byteArray && byteArray.array) {
@@ -32,14 +32,13 @@ module.exports = {
       } else if (Array.isArray(byteArray)) {
         bytes = byteArray;
       } else {
-        // Should probably throw an exception that the JVM can handle.
-        throw new Error('Invalid byte array format');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };
       }
       const randomBytes = crypto.randomBytes(bytes.length);
       for (let i = 0; i < bytes.length; i++) {
         bytes[i] = randomBytes.readInt8(i);
       }
-    },
+    }, ['java/lang/IllegalArgumentException']),
     'nextLong()J': (jvm, obj, args) => {
       const buffer = crypto.randomBytes(8);
       return buffer.readBigInt64BE(0);

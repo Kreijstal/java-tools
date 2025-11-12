@@ -87,6 +87,22 @@ function cloneLocalVariableEntries(attribute) {
   }));
 }
 
+function execOrRecordSkip({ t, cleanupPaths, skipState }, command, args, options = {}) {
+  if (skipState.shouldSkip) {
+    return null;
+  }
+  try {
+    return execFileSync(command, args, options);
+  } catch (error) {
+    if (error.code === 'EPERM' || error.errno === 'EPERM') {
+      skipState.shouldSkip = true;
+      skipState.reason = `Skipping attribute preservation: unable to execute '${command}' (${error.message})`;
+      return null;
+    }
+    throw error;
+  }
+}
+
 test('assembler preserves constant values and debug tables', (t) => {
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'class-ast-attrs-'));
   const compileDir = fs.mkdtempSync(path.join(os.tmpdir(), 'class-ast-attrs-src-'));
@@ -95,9 +111,13 @@ test('assembler preserves constant values and debug tables', (t) => {
   const javaFilePath = path.join(__dirname, `../sources/${className}.java`);
   const compiledClassPath = path.join(compileDir, `${className}.class`);
   const outputClassPath = path.join(outputDir, `${className}.class`);
+  const skipState = { shouldSkip: false, reason: null };
 
   try {
-    execFileSync('javac', ['-g', '-d', compileDir, javaFilePath], { stdio: 'inherit' });
+    const javacResult = execOrRecordSkip({ t, cleanupPaths, skipState }, 'javac', ['-g', '-d', compileDir, javaFilePath], { stdio: 'inherit' });
+    if (skipState.shouldSkip) {
+      return;
+    }
 
     const classAstRoot = buildClassAstFromFile(compiledClassPath);
     const classDef = classAstRoot.classes[0];
@@ -213,17 +233,26 @@ test('assembler preserves constant values and debug tables', (t) => {
 
     writeClassAstToClassFile(classAstRoot, outputClassPath);
 
-    const runtimeOutput = execFileSync('java', ['-cp', outputDir, className], { encoding: 'utf8' });
+    const runtimeOutput = execOrRecordSkip({ t, cleanupPaths, skipState }, 'java', ['-cp', outputDir, className], { encoding: 'utf8' });
+    if (skipState.shouldSkip) {
+      return;
+    }
     t.ok(runtimeOutput.includes('ANSWER=42'), 'main output should include inlined answer constant');
     t.ok(runtimeOutput.includes('GREETING=hi'), 'main output should include inlined greeting constant');
     t.ok(runtimeOutput.includes('REFL_ANSWER=42'), 'reflection should observe int constant value');
     t.ok(runtimeOutput.includes('REFL_GREETING=hi'), 'reflection should observe string constant value');
 
-    const javapDebug = execFileSync('javap', ['-classpath', outputDir, '-l', className], { encoding: 'utf8' });
+    const javapDebug = execOrRecordSkip({ t, cleanupPaths, skipState }, 'javap', ['-classpath', outputDir, '-l', className], { encoding: 'utf8' });
+    if (skipState.shouldSkip) {
+      return;
+    }
     t.ok(javapDebug.includes('LocalVariableTable:'), 'javap -l should list LocalVariableTable');
     t.ok(javapDebug.includes('doubled'), 'LocalVariableTable should retain variable names');
 
-    const javapVerbose = execFileSync('javap', ['-classpath', outputDir, '-v', className], { encoding: 'utf8' });
+    const javapVerbose = execOrRecordSkip({ t, cleanupPaths, skipState }, 'javap', ['-classpath', outputDir, '-v', className], { encoding: 'utf8' });
+    if (skipState.shouldSkip) {
+      return;
+    }
     t.ok(javapVerbose.includes('ConstantValue: int 42'), 'ConstantValue attribute for int field should be present');
     t.ok(javapVerbose.includes('ConstantValue: String hi'), 'ConstantValue attribute for string field should be present');
     t.ok(javapVerbose.includes('LocalVariableTypeTable:'), 'LocalVariableTypeTable attribute should be present');
@@ -239,6 +268,9 @@ test('assembler preserves constant values and debug tables', (t) => {
     cleanupPaths.forEach((dir) => {
       fs.rmSync(dir, { recursive: true, force: true });
     });
+    if (skipState.shouldSkip) {
+      t.skip(skipState.reason);
+    }
     t.end();
   }
 });

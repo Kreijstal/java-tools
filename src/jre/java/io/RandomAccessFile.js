@@ -1,11 +1,12 @@
 const fs = require('fs');
+const { withThrows } = require('../../helpers');
 
 module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/io/DataInput', 'java/io/DataOutput'],
   staticFields: {},
   methods: {
-    '<init>(Ljava/io/File;Ljava/lang/String;)V': async (jvm, obj, args) => {
+    '<init>(Ljava/io/File;Ljava/lang/String;)V': withThrows(async (jvm, obj, args) => {
       const file = args[0];
       const mode = args[1];
       
@@ -23,9 +24,9 @@ module.exports = {
       } catch (e) {
         jvm.throwException('java/io/IOException', `Cannot open file: ${filePath}`);
       }
-    },
+    }, ['java/io/IOException']),
     
-    '<init>(Ljava/lang/String;Ljava/lang/String;)V': async (jvm, obj, args) => {
+    '<init>(Ljava/lang/String;Ljava/lang/String;)V': withThrows(async (jvm, obj, args) => {
       const fileName = args[0];
       const mode = args[1];
       
@@ -43,9 +44,9 @@ module.exports = {
       } catch (e) {
         jvm.throwException('java/io/IOException', `Cannot open file: ${filePath}`);
       }
-    },
+    }, ['java/io/IOException']),
     
-    'read()I': async (jvm, obj, args) => {
+    'read()I': withThrows(async (jvm, obj, args) => {
       if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
         return -1;
@@ -62,9 +63,9 @@ module.exports = {
       } catch (e) {
         return -1;
       }
-    },
+    }, ['java/io/IOException']),
     
-    'read([BII)I': async (jvm, obj, args) => {
+    'read([BII)I': withThrows(async (jvm, obj, args) => {
       const b = args[0];
       const off = args[1];
       const len = args[2];
@@ -101,9 +102,9 @@ module.exports = {
       } catch (e) {
         return -1;
       }
-    },
+    }, ['java/io/IOException', 'java/lang/NullPointerException', 'java/lang/IndexOutOfBoundsException']),
     
-    'write(I)V': async (jvm, obj, args) => {
+    'write(I)V': withThrows(async (jvm, obj, args) => {
       const b = args[0];
       if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
@@ -117,18 +118,18 @@ module.exports = {
       } catch (e) {
         jvm.throwException('java/io/IOException', 'Write failed');
       }
-    },
+    }, ['java/io/IOException']),
     
-    'seek(J)V': (jvm, obj, args) => {
+    'seek(J)V': withThrows((jvm, obj, args) => {
       const pos = args[0];
       if (pos < 0) {
         jvm.throwException('java/io/IOException', 'Negative seek position');
         return;
       }
       obj.position = Number(pos);
-    },
+    }, ['java/io/IOException']),
     
-    'length()J': async (jvm, obj, args) => {
+    'length()J': withThrows(async (jvm, obj, args) => {
       if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
         return 0;
@@ -140,7 +141,7 @@ module.exports = {
       } catch (e) {
         return 0;
       }
-    },
+    }, ['java/io/IOException']),
     
     'close()V': async (jvm, obj, args) => {
       if (obj.fileHandle !== null) {

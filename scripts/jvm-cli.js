@@ -13,15 +13,28 @@ const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
 const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
 const { runDeadCodePass } = require('../src/deadCodePass');
 const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
+const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
+const { relocateTrivialHandlers } = require('../src/handlerRelocator');
+const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
+const { collectExceptionMetadata } = require('../src/exceptionMetadata');
+const { collectMethodCallers } = require('../src/callGraphMetadata');
+const { collectFieldReferences } = require('../src/fieldReferenceMetadata');
+const { computeMethodEffects } = require('../src/methodEffectsAnalyzer');
 
 const HELP_TEXT = `
 Usage: node scripts/jvm-cli.js <command> [options]
 
 Commands:
   assemble <file.j> [--out file.class]              Assemble Jasmin to .class
-  disassemble <file.class> [--out file.j]           Disassemble .class to Jasmin
+  disassemble <file.class> [--out file.j] [--stdout] [--xref-classpath paths] Disassemble .class to Jasmin
   lint <file.{j|class}> [--fix] [--out file]        Detect dead-code handler tricks; optionally apply fix
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
+  throws <file.{j|class}> [--json]                  Report declared & implicit exceptions per method
+  callers <file.{j|class}> [--json] [--class C --method M --descriptor desc]
+                                                  List callers for methods defined in the file
+  fieldrefs <file.{j|class}> [--json] [--class C --field F --descriptor desc]
+                                                  List references for fields defined in the file
+  format <file.j> [--out file.j] [-n]               Reformat Jasmin source via canonical assembler/disassembler
   rename-class <file> --from Old --to New [options] Rename a class within the file
   rename-method <file> --class C --from old --to new [--descriptor desc] [options]
   workspace list-methods <Class> [--classpath dir]
@@ -33,7 +46,7 @@ Commands:
 Options (where supported):
   --out <file>     Write results to the given path (defaults to in-place)
   -n, --dry-run    Do not write changes; print unified diff instead
-  --classpath <dir>  (workspace commands) root containing .class files (default: sources/)
+  --classpath <paths>  (lint/optimize/workspace) classpath roots (platform delimiter, default: sources/)
   --help           Show this message
 
 Examples:
@@ -41,6 +54,7 @@ Examples:
   node scripts/jvm-cli.js lint examples/sources/jasmin/MisplacedCatch.j --fix
   node scripts/jvm-cli.js rename-method examples/sources/jasmin/MisplacedCatch.j \\
       --class MisplacedCatch --from funnel --to funnelSafe
+  node scripts/jvm-cli.js format examples/sources/jasmin/MisplacedCatch.j
 `;
 
 function printHelp() {
@@ -106,14 +120,21 @@ function assembleCommand(args) {
   console.log(`Assembled ${inputPath} -> ${outPath}`);
 }
 
-function disassembleCommand(args) {
+async function disassembleCommand(args) {
   let outPath = null;
+  let toStdout = false;
+  let xrefClasspathRaw = null;
   const positional = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--out' || arg === '-o') {
       if (i + 1 >= args.length) throw new Error('--out requires a value');
       outPath = args[++i];
+    } else if (arg === '--stdout') {
+      toStdout = true;
+    } else if (arg === '--xref-classpath') {
+      if (i + 1 >= args.length) throw new Error('--xref-classpath requires a value');
+      xrefClasspathRaw = args[++i];
     } else if (arg === '--help' || arg === '-h') {
       printHelp();
       return;
@@ -128,16 +149,64 @@ function disassembleCommand(args) {
 
   const inputPath = positional[0];
   ensureFileExists(inputPath);
-  if (!outPath) {
+  if (!outPath && !toStdout) {
     outPath = defaultOutPath(inputPath, '.j');
   }
 
   const classBytes = fs.readFileSync(inputPath);
   const parsed = getAST(new Uint8Array(classBytes));
   const converted = convertJson(parsed.ast, parsed.constantPool);
-  const jasmin = generateJasminText(converted, parsed.constantPool);
-  fs.writeFileSync(outPath, jasmin, 'utf8');
-  console.log(`Disassembled ${inputPath} -> ${outPath}`);
+  let xrefClasspath = splitClasspath(xrefClasspathRaw);
+  if (!xrefClasspath) {
+    const defaultSources = path.join(process.cwd(), 'sources');
+    if (fs.existsSync(defaultSources)) {
+      xrefClasspath = [defaultSources];
+    }
+  }
+  let crossReferenceOptions = null;
+  if (xrefClasspath && xrefClasspath.length > 0) {
+    try {
+      const workspace = await KrakatauWorkspace.create(xrefClasspath);
+      const artifactClasses = converted.classes || [];
+      const artifactClassNames = new Set(artifactClasses.map((cls) => cls.className));
+      let analysisClasses = artifactClasses;
+      if (workspace && workspace.workspaceASTs) {
+        analysisClasses = artifactClasses.slice();
+        Object.values(workspace.workspaceASTs).forEach((entry) => {
+          if (!entry || !entry.ast || !entry.ast.classes || !entry.ast.classes.length) return;
+          const cls = entry.ast.classes[0];
+          if (artifactClassNames.has(cls.className)) {
+            return;
+          }
+          analysisClasses.push(cls);
+        });
+      }
+      const analysisAst =
+        analysisClasses === artifactClasses ? converted : { classes: analysisClasses };
+      const methodEntries = collectMethodCallers(analysisAst);
+      const fieldEntries = collectFieldReferences(analysisAst);
+      const crossReferenceIndex = buildCrossReferenceIndex(
+        methodEntries,
+        fieldEntries,
+        artifactClassNames,
+      );
+      if (crossReferenceIndex && crossReferenceIndex.size > 0) {
+        crossReferenceOptions = { crossReferenceIndex };
+      }
+    } catch (err) {
+      console.warn(`Warning: failed to build cross references (${err.message})`);
+    }
+  }
+  const jasmin = generateJasminText(converted, parsed.constantPool, crossReferenceOptions || {});
+  if (toStdout || outPath === '-') {
+    process.stdout.write(jasmin);
+    if (!jasmin.endsWith('\n')) {
+      process.stdout.write('\n');
+    }
+  } else {
+    fs.writeFileSync(outPath, jasmin, 'utf8');
+    console.log(`Disassembled ${inputPath} -> ${outPath}`);
+  }
 }
 
 function loadArtifact(inputPath) {
@@ -186,13 +255,122 @@ function loadArtifact(inputPath) {
   };
 }
 
-function generateJasminText(astRoot, constantPool) {
+function generateJasminText(astRoot, constantPool, options = {}) {
   if (!astRoot || !astRoot.classes) {
     return '';
   }
+  const { crossReferenceIndex = null, withComments = false } = options;
   return astRoot.classes
-    .map((cls) => unparseDataStructures(cls, constantPool))
+    .map((cls) => {
+      const crossReferences =
+        crossReferenceIndex && crossReferenceIndex.get(cls.className);
+      return unparseDataStructures(cls, constantPool, {
+        withComments,
+        crossReferences,
+      });
+    })
     .join('\n');
+}
+
+function splitClasspath(value) {
+  if (!value || typeof value !== 'string') {
+    return null;
+  }
+  const entries = value.split(path.delimiter).filter(Boolean);
+  return entries.length ? entries : null;
+}
+
+function resolveInputPath(inputPath, classpathEntries) {
+  if (fs.existsSync(inputPath)) {
+    return inputPath;
+  }
+  if (classpathEntries && classpathEntries.length) {
+    for (const base of classpathEntries) {
+      const candidate = path.join(base, inputPath);
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return inputPath;
+}
+
+function mergeWithWorkspaceClasses(astRoot, workspace) {
+  const artifactClasses = (astRoot && astRoot.classes) || [];
+  const merged = artifactClasses.slice();
+  const classNames = new Set(artifactClasses.map((cls) => cls.className));
+  Object.values(workspace.workspaceASTs || {}).forEach((entry) => {
+    if (!entry || !entry.ast || !entry.ast.classes || !entry.ast.classes.length) {
+      return;
+    }
+    entry.ast.classes.forEach((cls) => {
+      if (!classNames.has(cls.className)) {
+        merged.push(cls);
+      }
+    });
+  });
+  return { classes: merged };
+}
+
+function compareMethodRefs(a, b) {
+  if (a.className !== b.className) {
+    return a.className.localeCompare(b.className);
+  }
+  if (a.methodName !== b.methodName) {
+    return a.methodName.localeCompare(b.methodName);
+  }
+  return (a.descriptor || '').localeCompare(b.descriptor || '');
+}
+
+function compareFieldRefs(a, b) {
+  if (a.className !== b.className) {
+    return a.className.localeCompare(b.className);
+  }
+  if (a.methodName !== b.methodName) {
+    return a.methodName.localeCompare(b.methodName);
+  }
+  if ((a.descriptor || '') !== (b.descriptor || '')) {
+    return (a.descriptor || '').localeCompare(b.descriptor || '');
+  }
+  return (a.op || '').localeCompare(b.op || '');
+}
+
+function ensureCrossReferenceBucket(index, className) {
+  let bucket = index.get(className);
+  if (!bucket) {
+    bucket = { methods: Object.create(null), fields: Object.create(null) };
+    index.set(className, bucket);
+  }
+  return bucket;
+}
+
+function buildCrossReferenceIndex(methodEntries, fieldEntries, classFilter) {
+  const index = new Map();
+  methodEntries.forEach((entry) => {
+    if (classFilter && !classFilter.has(entry.className)) {
+      return;
+    }
+    const bucket = ensureCrossReferenceBucket(index, entry.className);
+    const key = `${entry.methodName}${entry.descriptor}`;
+    const callers = Array.isArray(entry.callers) ? entry.callers.slice() : [];
+    callers.sort(compareMethodRefs);
+    if (callers.length) {
+      bucket.methods[key] = callers;
+    }
+  });
+  fieldEntries.forEach((entry) => {
+    if (classFilter && !classFilter.has(entry.className)) {
+      return;
+    }
+    const bucket = ensureCrossReferenceBucket(index, entry.className);
+    const key = `${entry.fieldName}:${entry.descriptor}`;
+    const refs = Array.isArray(entry.references) ? entry.references.slice() : [];
+    refs.sort(compareFieldRefs);
+    if (refs.length) {
+      bucket.fields[key] = refs;
+    }
+  });
+  return index;
 }
 
 function writeArtifact(artifact, outputPath) {
@@ -230,10 +408,11 @@ function showDiff(beforeText, afterText) {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 }
 
-function lintOrOptimizeCommand(args, { applyFix }) {
+async function lintOrOptimizeCommand(args, { applyFix }) {
   let outPath = null;
   let dryRun = false;
   let fix = applyFix;
+  let classpathRaw = null;
   const positional = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -244,6 +423,9 @@ function lintOrOptimizeCommand(args, { applyFix }) {
       fix = true;
     } else if (arg === '-n' || arg === '--dry-run') {
       dryRun = true;
+    } else if (arg === '--classpath' || arg === '-cp') {
+      if (i + 1 >= args.length) throw new Error('--classpath requires a value');
+      classpathRaw = args[++i];
     } else if (arg === '--help' || arg === '-h') {
       printHelp();
       return;
@@ -254,20 +436,61 @@ function lintOrOptimizeCommand(args, { applyFix }) {
   if (positional.length !== 1) {
     throw new Error(`${applyFix ? 'optimize' : 'lint'} requires exactly one input file`);
   }
-  const inputPath = positional[0];
+  let classpathEntries = splitClasspath(classpathRaw);
+  if (!classpathEntries) {
+    const defaultSources = path.join(process.cwd(), 'sources');
+    if (fs.existsSync(defaultSources)) {
+      classpathEntries = [defaultSources];
+    }
+  }
+  const inputPath = resolveInputPath(positional[0], classpathEntries);
   ensureFileExists(inputPath);
   const artifact = loadArtifact(inputPath);
   try {
-    const { diagnostics, changed } = runDeadCodePass(artifact.astRoot);
-    if (diagnostics.length === 0) {
+    let methodEffects = null;
+    if (classpathEntries && classpathEntries.length) {
+      try {
+        const workspace = await KrakatauWorkspace.create(classpathEntries);
+        const mergedAst = mergeWithWorkspaceClasses(artifact.astRoot, workspace);
+        methodEffects = computeMethodEffects(mergedAst);
+      } catch (err) {
+        console.warn(`Warning: failed to load workspace (${err.message}); falling back to file-only analysis.`);
+      }
+    }
+    if (!methodEffects) {
+      methodEffects = computeMethodEffects(artifact.astRoot);
+    }
+    const inlineResult = inlineSinglePredecessorBlocks(artifact.astRoot);
+    const inlineDiagnostics = inlineResult.merges.map((merge) => ({
+      className: merge.className,
+      methodName: merge.methodName,
+      descriptor: merge.descriptor,
+      message: `Inlined unique-target block ${merge.label} into its predecessor.`,
+    }));
+    const relocation = relocateTrivialHandlers(artifact.astRoot);
+    const relocationDiagnostics = relocation.relocations.map((reloc) => ({
+      className: reloc.className,
+      methodName: reloc.methodName,
+      descriptor: reloc.descriptor,
+      message: `Relocated trivial handler ${reloc.handlerLabel} to the method epilogue.`,
+    }));
+    const { diagnostics: deadCodeDiagnostics, changed: dceChanged } = runDeadCodePass(
+      artifact.astRoot,
+      { methodEffects },
+    );
+    const allDiagnostics = inlineDiagnostics
+      .concat(relocationDiagnostics)
+      .concat(deadCodeDiagnostics);
+    if (allDiagnostics.length === 0) {
       console.log('No issues detected.');
     } else {
-      diagnostics.forEach((diag, index) => {
+      allDiagnostics.forEach((diag, index) => {
         console.log(
           `${index + 1}) ${diag.className}.${diag.methodName}${diag.descriptor} - ${diag.message}`,
         );
       });
     }
+    const changed = inlineResult.changed || relocation.changed || dceChanged;
     if (!fix || !changed) {
       if (fix && !changed) {
         console.log('No fixes applied.');
@@ -283,6 +506,291 @@ function lintOrOptimizeCommand(args, { applyFix }) {
   } finally {
     artifact.cleanup();
   }
+}
+
+function throwsMetadataCommand(args) {
+  let outputFormat = 'text';
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--json') {
+      outputFormat = 'json';
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('throws requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const metadata = collectExceptionMetadata(artifact.astRoot);
+    if (outputFormat === 'json') {
+      process.stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
+      return;
+    }
+    if (!metadata.length) {
+      console.log('No methods found.');
+      return;
+    }
+    metadata.forEach((entry) => {
+      console.log(`${entry.className}.${entry.methodName}${entry.descriptor}`);
+      const declaredText = entry.declared.length ? entry.declared.join(', ') : '(none)';
+      const implicitText = entry.implicit.length ? entry.implicit.join(', ') : '(none)';
+      console.log(`  declared: ${declaredText}`);
+      console.log(`  implicit: ${implicitText}`);
+    });
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+async function callersMetadataCommand(args) {
+  let outputFormat = 'text';
+  let filterClass = null;
+  let filterMethod = null;
+  let filterDescriptor = null;
+  let classpath = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--json') {
+      outputFormat = 'json';
+    } else if (arg === '--class') {
+      if (i + 1 >= args.length) throw new Error('--class requires a value');
+      filterClass = args[++i];
+    } else if (arg === '--method') {
+      if (i + 1 >= args.length) throw new Error('--method requires a value');
+      filterMethod = args[++i];
+    } else if (arg === '--descriptor' || arg === '-d') {
+      if (i + 1 >= args.length) throw new Error('--descriptor requires a value');
+      filterDescriptor = args[++i];
+    } else if (arg === '--classpath' || arg === '-cp') {
+      if (i + 1 >= args.length) throw new Error('--classpath requires a value');
+      classpath = args[++i].split(path.delimiter);
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('callers requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const artifactClasses = artifact.astRoot.classes || [];
+    const artifactClassNames = new Set(artifactClasses.map((cls) => cls.className));
+    let analysisClasses = artifactClasses;
+    if (classpath && classpath.length) {
+      analysisClasses = artifactClasses.slice();
+      const workspace = await KrakatauWorkspace.create(classpath);
+      Object.values(workspace.workspaceASTs || {}).forEach((entry) => {
+        if (!entry || !entry.ast || !entry.ast.classes || !entry.ast.classes.length) return;
+        const cls = entry.ast.classes[0];
+        if (artifactClassNames.has(cls.className)) {
+          return;
+        }
+        analysisClasses.push(cls);
+      });
+    }
+    const analysisAst =
+      analysisClasses === artifactClasses
+        ? artifact.astRoot
+        : { classes: analysisClasses };
+    let metadata = collectMethodCallers(analysisAst);
+    metadata = metadata.filter((entry) => artifactClassNames.has(entry.className));
+    metadata = metadata.filter((entry) => {
+      if (filterClass && entry.className !== filterClass) {
+        return false;
+      }
+      if (filterMethod && entry.methodName !== filterMethod) {
+        return false;
+      }
+      if (filterDescriptor && entry.descriptor !== filterDescriptor) {
+        return false;
+      }
+      return true;
+    });
+    if (outputFormat === 'json') {
+      process.stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
+      return;
+    }
+    if (!metadata.length) {
+      console.log('No matching methods.');
+      return;
+    }
+    metadata.forEach((entry) => {
+      console.log(`${entry.className}.${entry.methodName}${entry.descriptor}`);
+      if (!entry.callers.length) {
+        console.log('  callers: (none)');
+        return;
+      }
+      console.log('  callers:');
+      entry.callers.forEach((caller) => {
+        console.log(
+          `    ${caller.className}.${caller.methodName}${caller.descriptor}`,
+        );
+      });
+    });
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+async function fieldRefsCommand(args) {
+  let outputFormat = 'text';
+  let filterClass = null;
+  let filterField = null;
+  let filterDescriptor = null;
+  let classpath = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--json') {
+      outputFormat = 'json';
+    } else if (arg === '--class') {
+      if (i + 1 >= args.length) throw new Error('--class requires a value');
+      filterClass = args[++i];
+    } else if (arg === '--field') {
+      if (i + 1 >= args.length) throw new Error('--field requires a value');
+      filterField = args[++i];
+    } else if (arg === '--descriptor' || arg === '-d') {
+      if (i + 1 >= args.length) throw new Error('--descriptor requires a value');
+      filterDescriptor = args[++i];
+    } else if (arg === '--classpath' || arg === '-cp') {
+      if (i + 1 >= args.length) throw new Error('--classpath requires a value');
+      classpath = args[++i].split(path.delimiter);
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('fieldrefs requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const artifactClasses = artifact.astRoot.classes || [];
+    const artifactClassNames = new Set(artifactClasses.map((cls) => cls.className));
+    let analysisClasses = artifactClasses;
+    if (classpath && classpath.length) {
+      analysisClasses = artifactClasses.slice();
+      const workspace = await KrakatauWorkspace.create(classpath);
+      Object.values(workspace.workspaceASTs || {}).forEach((entry) => {
+        if (!entry || !entry.ast || !entry.ast.classes || !entry.ast.classes.length) return;
+        const cls = entry.ast.classes[0];
+        if (artifactClassNames.has(cls.className)) {
+          return;
+        }
+        analysisClasses.push(cls);
+      });
+    }
+    const analysisAst =
+      analysisClasses === artifactClasses
+        ? artifact.astRoot
+        : { classes: analysisClasses };
+    let metadata = collectFieldReferences(analysisAst);
+    metadata = metadata.filter((entry) => artifactClassNames.has(entry.className));
+    metadata = metadata.filter((entry) => {
+      if (filterClass && entry.className !== filterClass) {
+        return false;
+      }
+      if (filterField && entry.fieldName !== filterField) {
+        return false;
+      }
+      if (filterDescriptor && entry.descriptor !== filterDescriptor) {
+        return false;
+      }
+      return true;
+    });
+    if (outputFormat === 'json') {
+      process.stdout.write(`${JSON.stringify(metadata, null, 2)}\n`);
+      return;
+    }
+    if (!metadata.length) {
+      console.log('No matching fields.');
+      return;
+    }
+    metadata.forEach((entry) => {
+      console.log(`${entry.className}.${entry.fieldName} : ${entry.descriptor}`);
+      if (!entry.references.length) {
+        console.log('  references: (none)');
+        return;
+      }
+      console.log('  references:');
+      entry.references.forEach((ref) => {
+        console.log(
+          `    ${ref.op} by ${ref.className}.${ref.methodName}${ref.descriptor}`,
+        );
+      });
+    });
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function formatCommand(args) {
+  let outPath = null;
+  let dryRun = false;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '-n' || arg === '--dry-run') {
+      dryRun = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('format requires exactly one input .j file');
+  }
+  const inputPath = positional[0];
+  if (path.extname(inputPath).toLowerCase() !== '.j') {
+    throw new Error('format currently supports only .j files');
+  }
+  if (outPath && path.extname(outPath).toLowerCase() !== '.j') {
+    throw new Error('format output must have a .j extension');
+  }
+  ensureFileExists(inputPath);
+  const originalText = fs.readFileSync(inputPath, 'utf8');
+  let formatted;
+  try {
+    formatted = formatJasminSource(originalText);
+  } catch (err) {
+    throw new Error(`Failed to format ${inputPath}: ${err.message}`);
+  }
+  const originalNormalized = normalizeNewlines(originalText);
+  const formattedNormalized = normalizeNewlines(formatted);
+  if (formattedNormalized === originalNormalized) {
+    console.log('Already formatted.');
+    return;
+  }
+  if (dryRun) {
+    showDiff(originalText, formatted);
+    return;
+  }
+  const targetPath = outPath || inputPath;
+  fs.writeFileSync(targetPath, formatted, 'utf8');
+  console.log(`Formatted ${inputPath} -> ${targetPath}`);
 }
 
 function renameClassCommand(args) {
@@ -540,7 +1048,7 @@ function workspaceFindReferences(workspace, args) {
     console.log(`${ref.className} :: ${ref.astPath}`);
   });
 }
-function main(argv) {
+async function main(argv) {
   try {
     const { command, args } = parseCommand(argv);
     switch (command) {
@@ -551,13 +1059,25 @@ function main(argv) {
         assembleCommand(args);
         break;
       case 'disassemble':
-        disassembleCommand(args);
+        await disassembleCommand(args);
         break;
       case 'lint':
-        lintOrOptimizeCommand(args, { applyFix: false });
+        await lintOrOptimizeCommand(args, { applyFix: false });
         break;
       case 'optimize':
-        lintOrOptimizeCommand(args, { applyFix: true });
+        await lintOrOptimizeCommand(args, { applyFix: true });
+        break;
+      case 'format':
+        formatCommand(args);
+        break;
+      case 'throws':
+        throwsMetadataCommand(args);
+        break;
+      case 'callers':
+        await callersMetadataCommand(args);
+        break;
+      case 'fieldrefs':
+        await fieldRefsCommand(args);
         break;
       case 'rename-class':
         renameClassCommand(args);
@@ -566,7 +1086,7 @@ function main(argv) {
         renameMethodCommand(args);
         break;
       case 'workspace':
-        workspaceCommand(args);
+        await workspaceCommand(args);
         break;
       default:
         throw new Error(`Unknown command: ${command}`);
@@ -581,7 +1101,13 @@ function main(argv) {
 }
 
 if (require.main === module) {
-  main(process.argv.slice(2));
+  main(process.argv.slice(2)).catch((err) => {
+    console.error(`Error: ${err.message}`);
+    process.exitCode = 1;
+    if (process.env.DEBUG_CLI) {
+      console.error(err.stack);
+    }
+  });
 }
 
 module.exports = { main };

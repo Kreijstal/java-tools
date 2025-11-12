@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   isInterface: true,
   super: null,
@@ -6,13 +8,13 @@ module.exports = {
     'hasNext()Z': (jvm, iter, args) => {
       return iter.index < iter.array.length ? 1 : 0;
     },
-    'next()Ljava/lang/Object;': (jvm, iter, args) => {
+    'next()Ljava/lang/Object;': withThrows((jvm, iter, args) => {
       if (iter.index >= iter.array.length) {
         throw {
           type: 'java/util/NoSuchElementException'
         };
       }
       return iter.array[iter.index++];
-    }
+    }, ['java/util/NoSuchElementException'])
   }
 };

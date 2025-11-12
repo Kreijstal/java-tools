@@ -1,6 +1,7 @@
 const Frame = require('../../../../frame');
 const { parseDescriptor } = require('../../../../typeParser');
 const { ASYNC_METHOD_SENTINEL } = require('../../../../constants');
+const { withThrows } = require('../../../helpers');
 
 const MODIFIERS = {
   PUBLIC: 0x00000001,
@@ -39,7 +40,7 @@ module.exports = {
     'setAccessible(Z)V': (jvm, methodObj, args) => {
       methodObj.accessible = args[0];
     },
-    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
+    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': withThrows(async (jvm, methodObj, args) => {
       const methodData = methodObj._methodData;
       const { name, descriptor, flags } = methodData;
       const obj = args[0];
@@ -110,7 +111,7 @@ module.exports = {
       thread.callStack.push(newFrame);
 
       return ASYNC_METHOD_SENTINEL;
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/IllegalArgumentException']),
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, methodObj, args) => {
       const annotationClass = args[0];
       const annotations = methodObj._annotations || [];

@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: null,
   staticFields: {},
@@ -51,7 +53,7 @@ module.exports = {
       const hashCode = obj.hashCode.toString(16);
       return jvm.internString(`${className}@${hashCode}`);
     },
-    'clone()Ljava/lang/Object;': (jvm, obj, args) => {
+    'clone()Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       // Handle array cloning
       if (obj.type && obj.type.startsWith('[')) {
         const cloned = [...obj]; // Shallow copy of array elements
@@ -66,12 +68,13 @@ module.exports = {
       const cloned = Object.assign({}, obj);
       cloned.hashCode = jvm.nextHashCode++;
       return cloned;
-    },
-    'wait()V': (jvm, obj, args, thread) => {
+    }, ['java/lang/CloneNotSupportedException']),
+    'wait()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // In a real implementation, this would throw IllegalMonitorStateException.
-        console.error(`Thread ${thread.id} attempted to wait on a monitor it does not own.`);
-        return;
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
       }
 
       // 1. Add the current thread to the object's wait set.
@@ -92,8 +95,8 @@ module.exports = {
 
       // The JVM scheduler will now be able to run another thread that might have been
       // BLOCKED on this object's monitor.
-    },
-    'wait(J)V': (jvm, obj, args, thread) => {
+    }, ['java/lang/IllegalMonitorStateException']),
+    'wait(J)V': withThrows((jvm, obj, args, thread) => {
       // Implementation for wait with timeout (milliseconds)
       const timeout = args[0]; // BigInt or number
       
@@ -110,8 +113,8 @@ module.exports = {
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
       }
-    },
-    'wait(JI)V': (jvm, obj, args, thread) => {
+    }, ['java/lang/IllegalMonitorStateException']),
+    'wait(JI)V': withThrows((jvm, obj, args, thread) => {
       // Implementation for wait with timeout (milliseconds) and nanos  
       const timeout = args[0]; // BigInt or number - milliseconds
       const nanos = args[1]; // int - nanoseconds
@@ -129,8 +132,8 @@ module.exports = {
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
       }
-    },
-    'notify()V': (jvm, obj, args, thread) => {
+    }, ['java/lang/IllegalMonitorStateException']),
+    'notify()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         throw {
           type: 'java/lang/IllegalMonitorStateException',
@@ -142,8 +145,8 @@ module.exports = {
         notifiedThread.status = 'BLOCKED';
         notifiedThread.blockingOn = obj;
       }
-    },
-    'notifyAll()V': (jvm, obj, args, thread) => {
+    }, ['java/lang/IllegalMonitorStateException']),
+    'notifyAll()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         throw {
           type: 'java/lang/IllegalMonitorStateException',
@@ -155,6 +158,6 @@ module.exports = {
         notifiedThread.status = 'BLOCKED';
         notifiedThread.blockingOn = obj;
       }
-    },
+    }, ['java/lang/IllegalMonitorStateException']),
   },
 };

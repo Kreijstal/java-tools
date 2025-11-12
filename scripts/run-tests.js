@@ -3,6 +3,10 @@
 const { spawn } = require("child_process");
 const readline = require("readline");
 
+if (!process.env.JVM_DISABLE_AUDIO) {
+  process.env.JVM_DISABLE_AUDIO = "1";
+}
+
 const RUNNER_CMD = ["bash", ["run-tests.sh"]];
 
 function runPlain() {

@@ -1,3 +1,5 @@
+const { withThrows } = require('../../../helpers');
+
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
@@ -6,7 +8,7 @@ module.exports = {
       const fieldName = fieldObj._fieldData.name;
       return jvm.internString(fieldName);
     },
-    'getType()Ljava/lang/Class;': async (jvm, fieldObj, args) => {
+    'getType()Ljava/lang/Class;': withThrows(async (jvm, fieldObj, args) => {
       const descriptor = fieldObj._fieldData.descriptor;
       
       // Parse the field descriptor to get the type
@@ -81,13 +83,13 @@ module.exports = {
         };
       }
       
-      throw new Error(`Unsupported field descriptor: ${descriptor}`);
-    },
+      throw { type: 'java/lang/IllegalArgumentException', message: `Unsupported field descriptor: ${descriptor}` };
+    }, ['java/lang/ClassNotFoundException', 'java/lang/IllegalArgumentException']),
     'getModifiers()I': (jvm, fieldObj, args) => {
       const accessFlags = fieldObj._fieldData.accessFlags;
       return accessFlags;
     },
-    'get(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, fieldObj, args) => {
+    'get(Ljava/lang/Object;)Ljava/lang/Object;': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const fieldData = fieldObj._fieldData;
       const fieldName = fieldData.name;
@@ -110,8 +112,8 @@ module.exports = {
         }
         return obj[fieldName];
       }
-    },
-    'set(Ljava/lang/Object;Ljava/lang/Object;)V': (jvm, fieldObj, args) => {
+    }, ['java/lang/NullPointerException']),
+    'set(Ljava/lang/Object;Ljava/lang/Object;)V': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const value = args[1];
       const fieldData = fieldObj._fieldData;
@@ -135,7 +137,7 @@ module.exports = {
         }
         obj[fieldName] = value;
       }
-    },
+    }, ['java/lang/NullPointerException']),
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, fieldObj, args) => {
       const annotationClass = args[0];
       const annotations = fieldObj._annotations || [];
@@ -169,7 +171,7 @@ module.exports = {
       
       return null;
     },
-    'getInt(Ljava/lang/Object;)I': (jvm, fieldObj, args) => {
+    'getInt(Ljava/lang/Object;)I': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const fieldData = fieldObj._fieldData;
       const fieldName = fieldData.name;
@@ -190,8 +192,8 @@ module.exports = {
         }
         return obj[fieldName];
       }
-    },
-    'setInt(Ljava/lang/Object;I)V': (jvm, fieldObj, args) => {
+    }, ['java/lang/NullPointerException']),
+    'setInt(Ljava/lang/Object;I)V': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const value = args[1];
       const fieldData = fieldObj._fieldData;
@@ -213,6 +215,6 @@ module.exports = {
         }
         obj[fieldName] = value;
       }
-    }
+    }, ['java/lang/NullPointerException'])
   }
 };

@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: "java/lang/Object",
   methods: {
@@ -27,11 +29,11 @@ module.exports = {
       // Convert to 32-bit signed integer
       return result | 0;
     },
-    'nextInt(I)I': (jvm, obj, args) => {
+    'nextInt(I)I': withThrows((jvm, obj, args) => {
       const bound = args[0];
       
       if (bound <= 0) {
-        throw new Error('bound must be positive');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'bound must be positive' };
       }
       
       // Use the nextInt() method and apply modulo bound
@@ -52,7 +54,7 @@ module.exports = {
         let val = signedResult >>> 1; // Use only 31 bits to ensure positive
         return val % bound;
       }
-    },
+    }, ['java/lang/IllegalArgumentException']),
     'nextLong()J': (jvm, obj, args) => {
       let seed = obj['java/util/Random/seed'];
       
@@ -103,7 +105,7 @@ module.exports = {
       // Combine for 53 bits of precision
       return (high27 * (1 << 26) + low26) / (1 << 53);
     },
-    'nextBytes([B)V': (jvm, obj, args) => {
+    'nextBytes([B)V': withThrows((jvm, obj, args) => {
       const byteArray = args[0];
       
       // Handle both array formats
@@ -113,7 +115,7 @@ module.exports = {
       } else if (Array.isArray(byteArray)) {
         bytes = byteArray;
       } else {
-        throw new Error('Invalid byte array format');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };
       }
       
       let seed = obj['java/util/Random/seed'];
@@ -128,7 +130,7 @@ module.exports = {
       }
       
       obj['java/util/Random/seed'] = seed;
-    },
+    }, ['java/lang/IllegalArgumentException']),
     'nextGaussian()D': (jvm, obj, args) => {
       // Check if we have a cached Gaussian value
       if (obj['java/util/Random/haveNextNextGaussian']) {

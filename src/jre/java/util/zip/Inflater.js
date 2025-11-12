@@ -1,4 +1,5 @@
 const zlib = require('zlib');
+const { withThrows } = require('../../../helpers');
 
 module.exports = {
   super: "java/lang/Object",
@@ -12,7 +13,7 @@ module.exports = {
       obj['java/util/zip/Inflater/nowrap'] = nowrap;
       obj['java/util/zip/Inflater/buffer'] = null;
     },
-    'setInput([BII)V': (jvm, obj, args) => {
+    'setInput([BII)V': withThrows((jvm, obj, args) => {
       const b = args[0];
       const off = args[1];
       const len = args[2];
@@ -23,12 +24,12 @@ module.exports = {
       } else if (Array.isArray(b)) {
         byteArray = b;
       } else {
-        throw new Error('Invalid byte array format');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };
       }
 
       obj['java/util/zip/Inflater/buffer'] = Buffer.from(byteArray.slice(off, off + len));
-    },
-    'inflate([B)I': (jvm, obj, args) => {
+    }, ['java/lang/IllegalArgumentException']),
+    'inflate([B)I': withThrows((jvm, obj, args) => {
       const dest = args[0];
       let destArray;
       if (dest && dest.array) {
@@ -36,7 +37,7 @@ module.exports = {
       } else if (Array.isArray(dest)) {
         destArray = dest;
       } else {
-        throw new Error('Invalid byte array format for inflate');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for inflate' };
       }
 
       const buffer = obj['java/util/zip/Inflater/buffer'];
@@ -66,7 +67,7 @@ module.exports = {
       } else {
         return 0;
       }
-    },
+    }, ['java/lang/IllegalArgumentException', 'java/util/zip/DataFormatException']),
     'reset()V': (jvm, obj, args) => {
       obj['java/util/zip/Inflater/buffer'] = null;
     },
