@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 // JRE Class: java/util/Scanner
 
 // Helper function to read the next token (word separated by whitespace)
@@ -62,7 +64,7 @@ module.exports = {
       obj['java/util/Scanner/hasNext'] = true;
     },
     
-    'nextLine()Ljava/lang/String;': (jvm, obj, args) => {
+    'nextLine()Ljava/lang/String;': withThrows((jvm, obj, args) => {
       if (obj['java/util/Scanner/closed']) {
         jvm.throwException('java/lang/IllegalStateException', 'Scanner closed');
         return;
@@ -111,9 +113,9 @@ module.exports = {
       }
       
       return jvm.internString(line);
-    },
+    }, ['java/lang/IllegalStateException', 'java/util/NoSuchElementException']),
     
-    'nextInt()I': (jvm, obj, args) => {
+    'nextInt()I': withThrows((jvm, obj, args) => {
       if (obj['java/util/Scanner/closed']) {
         jvm.throwException('java/lang/IllegalStateException', 'Scanner closed');
         return;
@@ -133,9 +135,13 @@ module.exports = {
       }
       
       return intValue;
-    },
+    }, [
+      'java/lang/IllegalStateException',
+      'java/util/NoSuchElementException',
+      'java/util/InputMismatchException',
+    ]),
     
-    'next()Ljava/lang/String;': (jvm, obj, args) => {
+    'next()Ljava/lang/String;': withThrows((jvm, obj, args) => {
       if (obj['java/util/Scanner/closed']) {
         jvm.throwException('java/lang/IllegalStateException', 'Scanner closed');
         return;
@@ -148,7 +154,7 @@ module.exports = {
       }
       
       return jvm.internString(token);
-    },
+    }, ['java/lang/IllegalStateException', 'java/util/NoSuchElementException']),
     
     'hasNext()Z': (jvm, obj, args) => {
       if (obj['java/util/Scanner/closed']) {

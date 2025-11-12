@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 // JRE Class: java/io/Writer
 module.exports = {
   super: 'java/lang/Object',
@@ -6,7 +8,7 @@ module.exports = {
     'write(I)V': function(jvm, obj, args, thread) {
       // Default implementation - abstract method
     },
-    'write([C)V': function(jvm, obj, args, thread) {
+    'write([C)V': withThrows(function(jvm, obj, args, thread) {
       const cbuf = args[0];
       if (cbuf === null) {
         jvm.throwException('java/lang/NullPointerException');
@@ -16,8 +18,8 @@ module.exports = {
       if (writeMethod) {
         writeMethod(jvm, obj, [cbuf, 0, cbuf.length]);
       }
-    },
-    'write([CII)V': function(jvm, obj, args, thread) {
+    }, ['java/lang/NullPointerException']),
+    'write([CII)V': withThrows(function(jvm, obj, args, thread) {
       const cbuf = args[0];
       const off = args[1];
       const len = args[2];
@@ -37,7 +39,7 @@ module.exports = {
           writeCharMethod(jvm, obj, [cbuf[off + i]]);
         }
       }
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/IndexOutOfBoundsException']),
     'flush()V': function(jvm, obj, args, thread) {
       // Default implementation - do nothing
     },

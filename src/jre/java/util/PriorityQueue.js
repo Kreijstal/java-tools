@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: {
     type: 'java/util/AbstractQueue'
@@ -64,7 +66,7 @@ module.exports = {
       return {
         type: 'java/util/Iterator',
         hasNext: () => index < obj.size,
-        next: () => {
+        next: withThrows(() => {
           if (index >= obj.size) {
             throw {
               type: 'java/util/NoSuchElementException',
@@ -72,7 +74,7 @@ module.exports = {
             };
           }
           return obj.heap[index++];
-        }
+        }, ['java/util/NoSuchElementException'])
       };
     },
     // Helper methods

@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
@@ -68,7 +70,7 @@ module.exports = {
       
       return jvm.internString(o.toString());
     },
-    'requireNonNull(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+    'requireNonNull(Ljava/lang/Object;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const o = args[0];
       if (o === null) {
         throw {
@@ -77,8 +79,8 @@ module.exports = {
         };
       }
       return o;
-    },
-    'requireNonNull(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/lang/NullPointerException']),
+    'requireNonNull(Ljava/lang/Object;Ljava/lang/String;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const o = args[0];
       const message = args[1];
       if (o === null) {
@@ -88,6 +90,6 @@ module.exports = {
         };
       }
       return o;
-    },
+    }, ['java/lang/NullPointerException']),
   },
 };

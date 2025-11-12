@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: {
     type: 'java/lang/Object'
@@ -13,7 +15,7 @@ module.exports = {
       obj.packages = new Map();
       obj.classes = new Map();
     },
-    'loadClass(Ljava/lang/String;)Ljava/lang/Class;': (jvm, obj, args, thread) => {
+    'loadClass(Ljava/lang/String;)Ljava/lang/Class;': withThrows((jvm, obj, args, thread) => {
       const name = args[0];
 
       // Check if the class is already loaded
@@ -49,7 +51,7 @@ module.exports = {
         type: 'java/lang/ClassNotFoundException',
         message: name
       };
-    },
+    }, ['java/lang/ClassNotFoundException']),
     'loadClass(Ljava/lang/String;Z)Ljava/lang/Class;': (jvm, obj, args, thread) => {
       const name = args[0];
       const resolve = args[1];
@@ -65,14 +67,14 @@ module.exports = {
 
       return loadedClass;
     },
-    'findClass(Ljava/lang/String;)Ljava/lang/Class;': (jvm, obj, args, thread) => {
+    'findClass(Ljava/lang/String;)Ljava/lang/Class;': withThrows((jvm, obj, args, thread) => {
       // Default implementation throws ClassNotFoundException
       // Subclasses should override this method
       throw {
         type: 'java/lang/ClassNotFoundException',
         message: args[0]
       };
-    },
+    }, ['java/lang/ClassNotFoundException']),
     'defineClass(Ljava/lang/String;[BII)Ljava/lang/Class;': (jvm, obj, args, thread) => {
       const name = args[0];
       const b = args[1];

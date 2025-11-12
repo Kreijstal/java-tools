@@ -1,3 +1,5 @@
+const { withThrows } = require('../../../helpers');
+
 module.exports = {
   super: {
     type: 'java/lang/Enum'
@@ -27,7 +29,7 @@ module.exports = {
         module.exports.staticFields.RUNTIME
       ];
     },
-    'valueOf(Ljava/lang/String;)Ljava/lang/annotation/RetentionPolicy;': (jvm, obj, args) => {
+    'valueOf(Ljava/lang/String;)Ljava/lang/annotation/RetentionPolicy;': withThrows((jvm, obj, args) => {
       const name = args[0];
       switch (name) {
         case 'SOURCE': return module.exports.staticFields.SOURCE;
@@ -39,7 +41,7 @@ module.exports = {
             message: `No enum constant java.lang.annotation.RetentionPolicy.${name}`
           };
       }
-    }
+    }, ['java/lang/IllegalArgumentException'])
   },
   methods: {
     'name()Ljava/lang/String;': (jvm, obj, args) => {

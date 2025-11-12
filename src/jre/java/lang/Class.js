@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
@@ -152,7 +154,7 @@ module.exports = {
 
       return Object.values(allMethods);
     },
-    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': async (jvm, classObj, args) => {
+    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': withThrows(async (jvm, classObj, args) => {
       const methodName = String(args[0]);
       const paramTypes = args[1];
 
@@ -168,7 +170,11 @@ module.exports = {
             case 'short': return 'S';
             case 'byte': return 'B';
             case 'boolean': return 'Z';
-            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+            default:
+              throw {
+                type: 'java/lang/IllegalArgumentException',
+                message: `Unknown primitive type: ${paramClass.name}`,
+              };
           }
         }
         const paramClassName = paramClass._classData.ast.classes[0].className;
@@ -206,8 +212,8 @@ module.exports = {
         type: 'java/lang/NoSuchMethodException',
         message: methodName,
       };
-    },
-    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
+    }, ['java/lang/NoSuchMethodException', 'java/lang/IllegalArgumentException']),
+    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': withThrows((jvm, classObj, args) => {
       const methodNameObj = args[0];
       const paramTypes = args[1];
 
@@ -237,7 +243,11 @@ module.exports = {
             case 'short': return 'S';
             case 'byte': return 'B';
             case 'boolean': return 'Z';
-            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+            default:
+              throw {
+                type: 'java/lang/IllegalArgumentException',
+                message: `Unknown primitive type: ${paramClass.name}`,
+              };
           }
         }
         const paramClassName = paramClass._classData.ast.classes[0].className;
@@ -265,8 +275,8 @@ module.exports = {
           message: methodName,
         };
       }
-    },
-    'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
+    }, ['java/lang/NoSuchMethodException', 'java/lang/IllegalArgumentException']),
+    'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': withThrows((jvm, classObj, args) => {
       const fieldNameObj = args[0];
       
       let fieldName;
@@ -299,7 +309,7 @@ module.exports = {
           message: fieldName,
         };
       }
-    },
+    }, ['java/lang/NoSuchFieldException']),
     'getDeclaredFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       const classData = classObj._classData;
       const fields = classData.ast.classes[0].items.filter(item => item.type === 'field');

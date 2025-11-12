@@ -233,6 +233,9 @@ node scripts/jvm-cli.js rename-method build/classes/Hello.class \
 
 # Dead-code optimization (alias for `lint --fix`)
 node scripts/jvm-cli.js optimize examples/sources/jasmin/MisplacedCatch.j --out /tmp/MisplacedCatch.opt.j
+
+# Canonical Jasmin formatting
+node scripts/jvm-cli.js format examples/sources/jasmin/MisplacedCatch.j -n   # preview diff only
 ```
 
 Use `node scripts/jvm-cli.js --help` to see the complete list of subcommands and flags. All mutating operations accept `-n/--dry-run` to preview the unified diff without touching the input file.

@@ -13,6 +13,11 @@ const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
 const { SymbolIdentifier } = require('../src/symbols');
 const { runDeadCodePass } = require('../src/deadCodePass');
 const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
+const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
+const { relocateTrivialHandlers } = require('../src/handlerRelocator');
+const { computeMethodEffects } = require('../src/methodEffectsAnalyzer');
+const { collectMethodCallers } = require('../src/callGraphMetadata');
+const { collectFieldReferences } = require('../src/fieldReferenceMetadata');
 
 const jsonrpc = {
   success(id, result) {
@@ -101,6 +106,40 @@ function normalizeClasspath(value) {
   throw new Error('classpath must be a string or array');
 }
 
+function buildWorkspaceAst(workspace) {
+  const classes = [];
+  Object.values(workspace.workspaceASTs || {}).forEach((entry) => {
+    if (!entry || !entry.ast || !Array.isArray(entry.ast.classes)) {
+      return;
+    }
+    entry.ast.classes.forEach((cls) => classes.push(cls));
+  });
+  return { classes };
+}
+
+function compareMethodRefs(a, b) {
+  if (a.className !== b.className) {
+    return a.className.localeCompare(b.className);
+  }
+  if (a.methodName !== b.methodName) {
+    return a.methodName.localeCompare(b.methodName);
+  }
+  return (a.descriptor || '').localeCompare(b.descriptor || '');
+}
+
+function compareFieldRefs(a, b) {
+  if (a.className !== b.className) {
+    return a.className.localeCompare(b.className);
+  }
+  if (a.methodName !== b.methodName) {
+    return a.methodName.localeCompare(b.methodName);
+  }
+  if ((a.descriptor || '') !== (b.descriptor || '')) {
+    return (a.descriptor || '').localeCompare(b.descriptor || '');
+  }
+  return (a.op || '').localeCompare(b.op || '');
+}
+
 function buildClassTree(workspace) {
   const root = {};
   Object.keys(workspace.workspaceASTs).forEach((className) => {
@@ -145,20 +184,42 @@ async function handleRequest(message) {
       }
       case 'lintDeadCode': {
         const artifact = loadArtifact(params.file);
-        const { diagnostics, changed } = runDeadCodePass(artifact.astRoot);
+        const inlineResult = inlineSinglePredecessorBlocks(artifact.astRoot);
+        const inlineDiagnostics = inlineResult.merges.map((merge) => ({
+          className: merge.className,
+          methodName: merge.methodName,
+          descriptor: merge.descriptor,
+          message: `Inlined unique-target block ${merge.label} into its predecessor.`,
+        }));
+        const relocation = relocateTrivialHandlers(artifact.astRoot);
+        const relocationDiagnostics = relocation.relocations.map((reloc) => ({
+          className: reloc.className,
+          methodName: reloc.methodName,
+          descriptor: reloc.descriptor,
+          message: `Relocated trivial handler ${reloc.handlerLabel} to the method epilogue.`,
+        }));
+        const methodEffects = computeMethodEffects(artifact.astRoot);
+        const { diagnostics: deadCodeDiagnostics, changed: dceChanged } = runDeadCodePass(
+          artifact.astRoot,
+          { methodEffects },
+        );
+        const allDiagnostics = inlineDiagnostics
+          .concat(relocationDiagnostics)
+          .concat(deadCodeDiagnostics);
+        const changed = inlineResult.changed || relocation.changed || dceChanged;
         if (params.fix && changed) {
           const outPath = params.out || params.file;
           artifact.write(outPath);
           const after = generateJasmin(artifact.astRoot, artifact.constantPool);
           const diff = createTwoFilesPatch(params.file, params.file, artifact.baseline, after, '', '');
-          return jsonrpc.success(id, { changed, outPath, diff, diagnostics });
+          return jsonrpc.success(id, { changed, outPath, diff, diagnostics: allDiagnostics });
         }
         if (changed) {
           const after = generateJasmin(artifact.astRoot, artifact.constantPool);
           const diff = createTwoFilesPatch(params.file, params.file, artifact.baseline, after, '', '');
-          return jsonrpc.success(id, { changed, diff, diagnostics });
+          return jsonrpc.success(id, { changed, diff, diagnostics: allDiagnostics });
         }
-        return jsonrpc.success(id, { changed: false, diagnostics });
+        return jsonrpc.success(id, { changed: false, diagnostics: allDiagnostics });
       }
       case 'renameClass': {
         if (!params.file) throw new Error('file required');
@@ -247,6 +308,58 @@ async function handleRequest(message) {
         const workspace = await getWorkspace(classpath);
         const tree = buildClassTree(workspace);
         return jsonrpc.success(id, { tree });
+      }
+      case 'workspace.methodCallers': {
+        if (!params.className) throw new Error('className required');
+        const classpath = normalizeClasspath(params.classpath);
+        const workspace = await getWorkspace(classpath);
+        const astRoot = buildWorkspaceAst(workspace);
+        const methods = collectMethodCallers(astRoot)
+          .filter((entry) => {
+            if (entry.className !== params.className) {
+              return false;
+            }
+            if (params.methodName && entry.methodName !== params.methodName) {
+              return false;
+            }
+            if (params.descriptor && entry.descriptor !== params.descriptor) {
+              return false;
+            }
+            return true;
+          })
+          .map((entry) => ({
+            className: entry.className,
+            methodName: entry.methodName,
+            descriptor: entry.descriptor,
+            callers: (entry.callers || []).slice().sort(compareMethodRefs),
+          }));
+        return jsonrpc.success(id, { methods });
+      }
+      case 'workspace.fieldReferences': {
+        if (!params.className) throw new Error('className required');
+        const classpath = normalizeClasspath(params.classpath);
+        const workspace = await getWorkspace(classpath);
+        const astRoot = buildWorkspaceAst(workspace);
+        const fields = collectFieldReferences(astRoot)
+          .filter((entry) => {
+            if (entry.className !== params.className) {
+              return false;
+            }
+            if (params.fieldName && entry.fieldName !== params.fieldName) {
+              return false;
+            }
+            if (params.descriptor && entry.descriptor !== params.descriptor) {
+              return false;
+            }
+            return true;
+          })
+          .map((entry) => ({
+            className: entry.className,
+            fieldName: entry.fieldName,
+            descriptor: entry.descriptor,
+            references: (entry.references || []).slice().sort(compareFieldRefs),
+          }));
+        return jsonrpc.success(id, { fields });
       }
       case 'workspace.describeClass': {
         if (!params.className) throw new Error('className required');

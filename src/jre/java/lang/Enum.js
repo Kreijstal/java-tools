@@ -1,8 +1,10 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
   staticMethods: {
-    'valueOf(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;': (jvm, obj, args) => {
+    'valueOf(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;': withThrows((jvm, obj, args) => {
       const clazz = args[0];
       const name = args[1];
       const nameStr = name.toString();
@@ -23,7 +25,7 @@ module.exports = {
         type: 'java/lang/IllegalArgumentException',
         message: `No enum constant ${enumClassName}.${nameStr}`
       };
-    },
+    }, ['java/lang/IllegalArgumentException']),
   },
   methods: {
     '<init>(Ljava/lang/String;I)V': (jvm, obj, args) => {

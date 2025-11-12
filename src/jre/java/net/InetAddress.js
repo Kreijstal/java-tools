@@ -1,12 +1,13 @@
 
 const { promises: dnsPromises } = require('dns');
+const { withThrows } = require('../../helpers');
 
 
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
 
-    'getByName(Ljava/lang/String;)Ljava/net/InetAddress;': async (jvm, obj, args) => {
+    'getByName(Ljava/lang/String;)Ljava/net/InetAddress;': withThrows(async (jvm, obj, args) => {
 
       const hostname = args[0];
       const jsHostname = hostname.value;
@@ -33,7 +34,7 @@ module.exports = {
 
 
       return inetAddress;
-    },
+    }, ['java/net/UnknownHostException']),
   },
   methods: {
     'getHostName()Ljava/lang/String;': (jvm, obj, args) => {

@@ -1,6 +1,8 @@
 const { getStackEffect, normalizeInstruction } = require('./utils/instructionUtils');
 const { applyStackManipulation } = require('./utils/stackManipulation');
 
+const INVOKE_OPS = new Set(['invokevirtual', 'invokespecial', 'invokestatic', 'invokeinterface']);
+
 function pruneUnreachableBlocks(cfg) {
   if (!cfg || !cfg.entryBlockId) {
     return false;
@@ -288,6 +290,11 @@ function buildDefUseChains(cfg) {
 
       instr.consumes = [];
       instr.produced = [];
+      if (instr.consumers && typeof instr.consumers.clear === 'function') {
+        instr.consumers.clear();
+      } else {
+        instr.consumers = new Set();
+      }
       delete instr.unsupported;
       delete instr.error;
 
@@ -394,16 +401,26 @@ function buildDefUseChains(cfg) {
   }
 }
 
-function eliminateDeadCodeCfg(cfg) {
+function eliminateDeadCodeCfg(cfg, options = {}) {
   const removedBlocks = pruneUnreachableBlocks(cfg);
   buildDefUseChains(cfg);
+  linkConsumers(cfg);
 
   const liveSet = new Set();
   const worklist = [];
 
+  const handlerBlocks = cfg.handlerBlocks instanceof Set ? cfg.handlerBlocks : new Set();
+
   for (const block of cfg.blocks.values()) {
+    const isHandlerBlock = handlerBlocks.has(block.id);
     for (const instr of block.instructions) {
       if (!instr || !instr.instruction) {
+        continue;
+      }
+      if (isHandlerBlock) {
+        liveSet.add(instr);
+        worklist.push(instr);
+        enqueueConsumers(instr, liveSet, worklist);
         continue;
       }
       if (instr.unsupported) {
@@ -411,9 +428,17 @@ function eliminateDeadCodeCfg(cfg) {
         continue;
       }
       const op = typeof instr.instruction === 'string' ? instr.instruction : instr.instruction?.op;
-      if (op && ESSENTIAL_OPCODES.has(op) && !liveSet.has(instr)) {
+      const isInvoke = op && INVOKE_OPS.has(op);
+      const invokeSignature = isInvoke ? getInvocationSignature(instr.instruction) : null;
+      const pureInvoke =
+        isInvoke &&
+        typeof options.isInvocationPure === 'function' &&
+        invokeSignature &&
+        options.isInvocationPure(invokeSignature);
+      if (op && ESSENTIAL_OPCODES.has(op) && !pureInvoke && !liveSet.has(instr)) {
         liveSet.add(instr);
         worklist.push(instr);
+        enqueueConsumers(instr, liveSet, worklist);
       }
     }
   }
@@ -454,6 +479,59 @@ function eliminateDeadCodeCfg(cfg) {
   const simplifiedGoto = simplifyTrivialGotos(cfg);
 
   return { changed: changed || removedBlocks || simplifiedGoto, optimizedCfg: cfg };
+}
+
+function linkConsumers(cfg) {
+  for (const block of cfg.blocks.values()) {
+    for (const instr of block.instructions) {
+      if (!instr || !Array.isArray(instr.consumes)) {
+        continue;
+      }
+      for (const consumed of instr.consumes) {
+        if (!consumed || !consumed.sources) {
+          continue;
+        }
+        for (const producedValue of consumed.sources) {
+          const producer = producedValue && producedValue.producer;
+          if (producer && producer.consumers instanceof Set) {
+            producer.consumers.add(instr);
+          }
+        }
+      }
+    }
+  }
+}
+
+function enqueueConsumers(instr, liveSet, worklist) {
+  if (!instr || !(instr.consumers instanceof Set)) {
+    return;
+  }
+  instr.consumers.forEach((consumer) => {
+    if (consumer && !liveSet.has(consumer)) {
+      liveSet.add(consumer);
+      worklist.push(consumer);
+    }
+  });
+}
+
+function getInvocationSignature(instruction) {
+  if (!instruction || typeof instruction !== 'object') {
+    return null;
+  }
+  const arg = instruction.arg;
+  if (!Array.isArray(arg) || arg.length < 3) {
+    return null;
+  }
+  const owner = arg[1];
+  const nameDesc = arg[2];
+  if (!owner || !Array.isArray(nameDesc) || nameDesc.length < 2) {
+    return null;
+  }
+  const [name, descriptor] = nameDesc;
+  if (!name || !descriptor) {
+    return null;
+  }
+  return `${owner}.${name}${descriptor}`;
 }
 
 module.exports = {

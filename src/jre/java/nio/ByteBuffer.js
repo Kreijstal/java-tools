@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: "java/lang/Object",
   staticMethods: {
@@ -22,15 +24,15 @@ module.exports = {
     'position()I': (jvm, obj, args) => {
       return obj['java/nio/Buffer/position'];
     },
-    'position(I)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
+    'position(I)Ljava/nio/ByteBuffer;': withThrows((jvm, obj, args) => {
       const newPosition = args[0];
       if (newPosition > obj['java/nio/Buffer/limit'] || newPosition < 0) {
         throw { type: 'java/lang/IllegalArgumentException', message: 'New position is out of bounds' };
       }
       obj['java/nio/Buffer/position'] = newPosition;
       return obj;
-    },
-    'get([B)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
+    }, ['java/lang/IllegalArgumentException']),
+    'get([B)Ljava/nio/ByteBuffer;': withThrows((jvm, obj, args) => {
       const dest = args[0];
       const buffer = obj['java/nio/ByteBuffer/buffer'];
       let position = obj['java/nio/Buffer/position'];
@@ -41,7 +43,7 @@ module.exports = {
       } else if (Array.isArray(dest)) {
         destArray = dest;
       } else {
-        throw new Error('Invalid byte array format for get');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for get' };
       }
       const length = destArray.length;
 
@@ -54,8 +56,8 @@ module.exports = {
       }
       obj['java/nio/Buffer/position'] = position + length;
       return obj;
-    },
-    'put([B)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
+    }, ['java/lang/IllegalArgumentException', 'java/nio/BufferUnderflowException']),
+    'put([B)Ljava/nio/ByteBuffer;': withThrows((jvm, obj, args) => {
       const src = args[0];
       const buffer = obj['java/nio/ByteBuffer/buffer'];
       let position = obj['java/nio/Buffer/position'];
@@ -66,7 +68,7 @@ module.exports = {
       } else if (Array.isArray(src)) {
         srcArray = src;
       } else {
-        throw new Error('Invalid byte array format for put');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for put' };
       }
       const length = srcArray.length;
 
@@ -79,6 +81,6 @@ module.exports = {
       }
       obj['java/nio/Buffer/position'] = position + length;
       return obj;
-    },
+    }, ['java/lang/IllegalArgumentException', 'java/nio/BufferOverflowException']),
   },
 };

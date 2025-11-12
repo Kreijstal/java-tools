@@ -1,10 +1,11 @@
 'use strict';
 const process = require('process');
+const { withThrows } = require('../../helpers');
 module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
   staticMethods: {
-    'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': (jvm, _, args) => {
+    'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': withThrows((jvm, _, args) => {
       const [src, srcPos, dest, destPos, length] = args;
       if (src === null || dest === null) {
         throw {
@@ -26,7 +27,7 @@ module.exports = {
           dest[destPos + i] = src[srcPos + i];
         }
       }
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/ArrayIndexOutOfBoundsException']),
     'getProperty(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
       const key = jvm.stringify(args[0]);
       const value = module.exports.staticFields.get('props').get(key);

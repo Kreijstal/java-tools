@@ -1028,8 +1028,19 @@ function formatInstructionArgKrakatau(arg, opcode) {
  * @param {Object} cls - The class object with methods, fields, flags, and other class metadata
  * @returns {String} Assembly-like representation of the class suitable for debugging/analysis
  */
+function formatMethodRef(ref) {
+  return `${ref.className}.${ref.methodName}${ref.descriptor}`;
+}
+
+function formatFieldRef(ref) {
+  return `${ref.op} by ${ref.className}.${ref.methodName}${ref.descriptor}`;
+}
+
 function unparseDataStructures(cls, constantPool, options = {}) {
-  const { withComments = false } = options;
+  const { withComments = false, crossReferences = null } = options;
+  const classMethodRefs = crossReferences && crossReferences.methods;
+  const classFieldRefs = crossReferences && crossReferences.fields;
+
   function formatCodeAttribute(attr) {
     if (attr.type === "linenumbertable") {
       const lines = [
@@ -1080,7 +1091,16 @@ function unparseDataStructures(cls, constantPool, options = {}) {
       .filter((item) => item.type === "field")
       .map((item) => {
         const field = item.field;
-        return `.field ${field.name} ${field.descriptor}`;
+        const lines = [`.field ${field.name} ${field.descriptor}`];
+        const key = `${field.name}:${field.descriptor}`;
+        const refs = classFieldRefs && classFieldRefs[key];
+        if (refs && refs.length) {
+          lines.push(`; references:`);
+          refs.forEach((ref) => {
+            lines.push(`;   ${formatFieldRef(ref)}`);
+          });
+        }
+        return lines.join("\n");
       })
       .join("\n\n");
 
@@ -1089,9 +1109,20 @@ function unparseDataStructures(cls, constantPool, options = {}) {
       .filter((item) => item.type === "method")
       .map((item) => {
         const method = item.method;
-        const methodHeader = `.method ${method.flags.join(" ")} ${
-          method.name
-        } : ${method.descriptor}`;
+        const methodHeaderLines = [
+          `.method ${method.flags.join(" ")} ${method.name} : ${
+            method.descriptor
+          }`,
+        ];
+        const methodKey = `${method.name}${method.descriptor}`;
+        const callers = classMethodRefs && classMethodRefs[methodKey];
+        if (callers && callers.length) {
+          methodHeaderLines.push(`; callers:`);
+          callers.forEach((caller) => {
+            methodHeaderLines.push(`;   ${formatMethodRef(caller)}`);
+          });
+        }
+        const methodHeader = methodHeaderLines.join("\n");
 
         // Code attribute
         const codeAttribute = method.attributes.find(
