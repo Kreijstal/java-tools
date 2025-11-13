@@ -11,7 +11,7 @@ const { convertJson } = require('../src/convert_tree');
 const { runOptimizationPasses } = require('../src/passManager');
 const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
 
-const AVAILABLE_PASSES = ['inlinePureMethods', 'constantFoldCfg', 'eliminateDeadCodeCfg'];
+const AVAILABLE_PASSES = ['inlinePureMethods', 'constantFoldCfg', 'evaluateCounterLoops', 'eliminateDeadCodeCfg'];
 const PASS_ALIASES = new Map([
   ['inlinepuremethods', 'inlinePureMethods'],
   ['inline', 'inlinePureMethods'],
@@ -19,6 +19,8 @@ const PASS_ALIASES = new Map([
   ['constantfoldcfg', 'constantFoldCfg'],
   ['constantfold', 'constantFoldCfg'],
   ['fold', 'constantFoldCfg'],
+  ['evaluateloops', 'evaluateCounterLoops'],
+  ['loopfold', 'evaluateCounterLoops'],
   ['eliminatedeadcodecfg', 'eliminateDeadCodeCfg'],
   ['deadcode', 'eliminateDeadCodeCfg'],
   ['dce', 'eliminateDeadCodeCfg'],

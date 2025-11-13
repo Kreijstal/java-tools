@@ -31,9 +31,48 @@ function extractInvokeTarget(instruction) {
   };
 }
 
+function isHarmlessStackOp(op) {
+  if (!op) return false;
+  if (op === 'nop') return true;
+  if (/^(?:[ailfd]?load(?:_\d)?|[ailfd]?store(?:_\d)?|aload(?:_\d)?|astore(?:_\d)?)$/.test(op)) {
+    return true;
+  }
+  if (/^(?:iconst_m1|iconst_[0-5]|lconst_[01]|fconst_[0-2]|dconst_[01])$/.test(op)) {
+    return true;
+  }
+  if (/^(?:bipush|sipush|ldc(?:2?_w)?)$/.test(op)) {
+    return true;
+  }
+  if (/^(?:dup(?:2)?(?:_x[12])?|dup2_x[12]|dup_x[12]|pop2?|swap)$/.test(op)) {
+    return true;
+  }
+  if (/^(?:aconst_null|iinc)$/.test(op)) {
+    return true;
+  }
+  return false;
+}
+
 function computeMethodEffects(astRoot) {
   const classes = (astRoot && astRoot.classes) || [];
   const methodInfos = new Map();
+
+  function recordImpureReason(info, reason) {
+    if (!info.impureReasons) {
+      info.impureReasons = new Set();
+    }
+    info.impureReasons.add(reason);
+  }
+
+  function describeFieldArg(arg) {
+    if (Array.isArray(arg) && arg.length >= 3) {
+      const owner = arg[1];
+      const nameDesc = arg[2];
+      if (Array.isArray(nameDesc) && nameDesc.length >= 1) {
+        return `${owner}.${nameDesc[0]}${nameDesc[1] || ''}`;
+      }
+    }
+    return JSON.stringify(arg);
+  }
 
   // First pass: register methods with declared exceptions
   classes.forEach((cls) => {
@@ -54,6 +93,7 @@ function computeMethodEffects(astRoot) {
         throwsUnknown: false,
         hasSideEffects: false,
         pureCandidate: !method.flags || !(method.flags.includes('abstract') || method.flags.includes('native')),
+        impureReasons: new Set(),
       };
       methodInfos.set(key, info);
     });
@@ -89,12 +129,27 @@ function computeMethodEffects(astRoot) {
           if (!methodInfos.has(calleeKey)) {
             info.throwsUnknown = true;
             info.hasSideEffects = true;
+            recordImpureReason(
+              info,
+              `calls unresolved method ${callee.className}.${callee.methodName}${callee.descriptor}`,
+            );
           }
         }
         if (!isInvokeInstruction(item.instruction) && !potential) {
           const op = typeof item.instruction === 'string' ? item.instruction : item.instruction.op;
-          if (op && !/^(nop|return|ireturn|lreturn|freturn|dreturn|areturn)$/.test(op)) {
-            info.hasSideEffects = true;
+          if (op) {
+            let reason = null;
+            if (op === 'putstatic' || op === 'putfield') {
+              reason = `writes field ${describeFieldArg(item.instruction.arg)}`;
+            } else if (op === 'getstatic') {
+              reason = `reads static field ${describeFieldArg(item.instruction.arg)}`;
+            } else if (!isHarmlessStackOp(op) && !/^return|[ildfa]return$/.test(op)) {
+              reason = `executes effectful opcode ${op}`;
+            }
+            if (reason) {
+              info.hasSideEffects = true;
+              recordImpureReason(info, reason);
+            }
           }
         }
       });
@@ -118,6 +173,7 @@ function computeMethodEffects(astRoot) {
       hasSideEffects: info.hasSideEffects,
       callees: info.callees,
       pureUnknown: canBecomePure,
+      impureReasons: new Set(info.impureReasons || []),
     });
   });
 
@@ -132,6 +188,13 @@ function computeMethodEffects(astRoot) {
           if (!callee || callee.throwsUnknown) {
             if (!effect.throwsUnknown) {
               effect.throwsUnknown = true;
+              if (!callee) {
+                effect.impureReasons.add(`calls unresolved method ${calleeKey}`);
+              } else {
+                effect.impureReasons.add(
+                  `calls ${callee.className}.${callee.methodName}${callee.descriptor}, which may throw`,
+                );
+              }
               changed = true;
             }
             return;
@@ -144,12 +207,22 @@ function computeMethodEffects(astRoot) {
           });
         });
       }
+
       if (!effect.pure && effect.pureUnknown) {
         let calleeImpure = false;
         effect.callees.forEach((calleeKey) => {
           const callee = effects.get(calleeKey);
           if (!callee || !callee.pure) {
             calleeImpure = true;
+            if (callee && callee.impureReasons && callee.impureReasons.size) {
+              callee.impureReasons.forEach((reason) => {
+                effect.impureReasons.add(
+                  `calls ${callee.className}.${callee.methodName}${callee.descriptor}: ${reason}`,
+                );
+              });
+            } else {
+              effect.impureReasons.add(`calls non-pure method ${calleeKey}`);
+            }
           }
         });
         if (!effect.hasSideEffects && !effect.throwsUnknown && !calleeImpure) {

@@ -14,12 +14,13 @@ const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
 const { runDeadCodePass } = require('../src/deadCodePass');
 const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
 const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
+const { inlinePureMethods } = require('../src/inlinePureMethods');
 const { relocateTrivialHandlers } = require('../src/handlerRelocator');
 const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
 const { collectExceptionMetadata } = require('../src/exceptionMetadata');
 const { collectMethodCallers } = require('../src/callGraphMetadata');
 const { collectFieldReferences } = require('../src/fieldReferenceMetadata');
-const { computeMethodEffects } = require('../src/methodEffectsAnalyzer');
+const { computeMethodEffects, makeMethodKey } = require('../src/methodEffectsAnalyzer');
 
 const HELP_TEXT = `
 Usage: node scripts/jvm-cli.js <command> [options]
@@ -27,7 +28,8 @@ Usage: node scripts/jvm-cli.js <command> [options]
 Commands:
   assemble <file.j> [--out file.class]              Assemble Jasmin to .class
   disassemble <file.class> [--out file.j] [--stdout] [--xref-classpath paths] Disassemble .class to Jasmin
-  lint <file.{j|class}> [--fix] [--out file]        Detect dead-code handler tricks; optionally apply fix
+  purity <file.{j|class}> [--json] [--classpath paths] Report purity & reasons per method
+  lint <file.{j|class}> [--fix] [--out file] [--xref-comments] [--stdout] Detect dead-code handler tricks; optionally apply fix
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
   throws <file.{j|class}> [--json]                  Report declared & implicit exceptions per method
   callers <file.{j|class}> [--json] [--class C --method M --descriptor desc]
@@ -47,6 +49,8 @@ Options (where supported):
   --out <file>     Write results to the given path (defaults to in-place)
   -n, --dry-run    Do not write changes; print unified diff instead
   --classpath <paths>  (lint/optimize/workspace) classpath roots (platform delimiter, default: sources/)
+  --xref-comments (lint/optimize) annotate emitted Jasmin with caller/reference comments when fixing
+  --stdout (lint/optimize) write the optimized Jasmin to stdout instead of editing files (implies --fix, incompatible with -n)
   --help           Show this message
 
 Examples:
@@ -259,7 +263,7 @@ function generateJasminText(astRoot, constantPool, options = {}) {
   if (!astRoot || !astRoot.classes) {
     return '';
   }
-  const { crossReferenceIndex = null, withComments = false } = options;
+  const { crossReferenceIndex = null, withComments = false, methodAnnotations = null } = options;
   return astRoot.classes
     .map((cls) => {
       const crossReferences =
@@ -267,6 +271,7 @@ function generateJasminText(astRoot, constantPool, options = {}) {
       return unparseDataStructures(cls, constantPool, {
         withComments,
         crossReferences,
+        methodAnnotations,
       });
     })
     .join('\n');
@@ -310,6 +315,124 @@ function mergeWithWorkspaceClasses(astRoot, workspace) {
     });
   });
   return { classes: merged };
+}
+
+function createCrossReferenceOptions(astRoot, workspace) {
+  const artifactClasses = (astRoot && astRoot.classes) || [];
+  const artifactClassNames = new Set(artifactClasses.map((cls) => cls.className));
+  let analysisAst = astRoot;
+  if (workspace) {
+    analysisAst = mergeWithWorkspaceClasses(astRoot, workspace);
+  }
+  const methodEntries = collectMethodCallers(analysisAst);
+  const fieldEntries = collectFieldReferences(analysisAst);
+  const crossReferenceIndex = buildCrossReferenceIndex(
+    methodEntries,
+    fieldEntries,
+    artifactClassNames,
+  );
+  const options = { withComments: true };
+  if (crossReferenceIndex && crossReferenceIndex.size > 0) {
+    options.crossReferenceIndex = crossReferenceIndex;
+  }
+  return options;
+}
+
+function ensureMethodAnnotationBucket(index, className) {
+  let bucket = index.get(className);
+  if (!bucket) {
+    bucket = new Map();
+    index.set(className, bucket);
+  }
+  return bucket;
+}
+
+function buildMethodAnnotations(methodEffects, exceptionMetadata) {
+  const index = new Map();
+  if (methodEffects && typeof methodEffects.forEach === 'function') {
+    methodEffects.forEach((effect) => {
+      if (!effect || !effect.className) return;
+      const bucket = ensureMethodAnnotationBucket(index, effect.className);
+      const key = `${effect.methodName}${effect.descriptor}`;
+      let entry = bucket.get(key);
+      if (!entry) {
+        entry = { methodName: effect.methodName, descriptor: effect.descriptor };
+        bucket.set(key, entry);
+      }
+      entry.purity = {
+        pure: !!effect.pure,
+        impureReasons: effect.impureReasons ? Array.from(effect.impureReasons) : [],
+      };
+    });
+  }
+  if (Array.isArray(exceptionMetadata)) {
+    exceptionMetadata.forEach((meta) => {
+      if (!meta || !meta.className) return;
+      const bucket = ensureMethodAnnotationBucket(index, meta.className);
+      const key = `${meta.methodName}${meta.descriptor}`;
+      let entry = bucket.get(key);
+      if (!entry) {
+        entry = { methodName: meta.methodName, descriptor: meta.descriptor };
+        bucket.set(key, entry);
+      }
+      entry.exceptions = {
+        declared: Array.isArray(meta.declared) ? meta.declared.slice() : [],
+        implicit: Array.isArray(meta.implicit) ? meta.implicit.slice() : [],
+      };
+    });
+  }
+  return index.size ? index : null;
+}
+
+function parseMethodSignatureString(signature) {
+  if (typeof signature !== 'string') {
+    return null;
+  }
+  const dot = signature.lastIndexOf('.');
+  if (dot === -1) {
+    return null;
+  }
+  const className = signature.slice(0, dot);
+  const remainder = signature.slice(dot + 1);
+  const paren = remainder.indexOf('(');
+  if (paren === -1) {
+    return null;
+  }
+  return {
+    className,
+    methodName: remainder.slice(0, paren),
+    descriptor: remainder.slice(paren),
+  };
+}
+
+function summarizeInlinePureDiagnostics(summary) {
+  if (!summary) {
+    return [];
+  }
+  const diagnostics = [];
+  Object.entries(summary).forEach(([signature, entries]) => {
+    const parsed = parseMethodSignatureString(signature);
+    if (!parsed) {
+      return;
+    }
+    entries.forEach((entry) => {
+      const argDescription =
+        typeof entry.argIndex === 'number'
+          ? `argument ${entry.argIndex + 1}`
+          : 'an argument';
+      const tempDescription =
+        entry && entry.tempLocalIndex !== undefined
+          ? `temporary local #${entry.tempLocalIndex}`
+          : 'a temporary local';
+      diagnostics.push({
+        className: parsed.className,
+        methodName: parsed.methodName,
+        descriptor: parsed.descriptor,
+        message: `Inlined pure call to ${entry.callee} (returns ${argDescription}) using ${tempDescription}.`,
+      });
+    });
+  });
+  return diagnostics;
 }
 
 function compareMethodRefs(a, b) {
@@ -373,11 +496,11 @@ function buildCrossReferenceIndex(methodEntries, fieldEntries, classFilter) {
   return index;
 }
 
-function writeArtifact(artifact, outputPath) {
+function writeArtifact(artifact, outputPath, options = {}) {
   const targetPath = outputPath || artifact.inputPath;
   const ext = path.extname(targetPath).toLowerCase();
   if (ext === '.j') {
-    const text = generateJasminText(artifact.astRoot, artifact.constantPool);
+    const text = generateJasminText(artifact.astRoot, artifact.constantPool, options);
     fs.writeFileSync(targetPath, text, 'utf8');
   } else {
     writeClassAstToClassFile(artifact.astRoot, targetPath);
@@ -413,6 +536,8 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
   let dryRun = false;
   let fix = applyFix;
   let classpathRaw = null;
+  let annotateXrefs = false;
+  let toStdout = false;
   const positional = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -426,6 +551,10 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
     } else if (arg === '--classpath' || arg === '-cp') {
       if (i + 1 >= args.length) throw new Error('--classpath requires a value');
       classpathRaw = args[++i];
+    } else if (arg === '--xref-comments') {
+      annotateXrefs = true;
+    } else if (arg === '--stdout') {
+      toStdout = true;
     } else if (arg === '--help' || arg === '-h') {
       printHelp();
       return;
@@ -435,6 +564,12 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
   }
   if (positional.length !== 1) {
     throw new Error(`${applyFix ? 'optimize' : 'lint'} requires exactly one input file`);
+  }
+  if (toStdout && !fix) {
+    throw new Error('--stdout requires --fix');
+  }
+  if (toStdout && dryRun) {
+    throw new Error('--stdout cannot be combined with --dry-run');
   }
   let classpathEntries = splitClasspath(classpathRaw);
   if (!classpathEntries) {
@@ -447,19 +582,28 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
   ensureFileExists(inputPath);
   const artifact = loadArtifact(inputPath);
   try {
-    let methodEffects = null;
+    let workspace = null;
+    let analysisAst = artifact.astRoot;
     if (classpathEntries && classpathEntries.length) {
       try {
-        const workspace = await KrakatauWorkspace.create(classpathEntries);
-        const mergedAst = mergeWithWorkspaceClasses(artifact.astRoot, workspace);
-        methodEffects = computeMethodEffects(mergedAst);
+        workspace = await KrakatauWorkspace.create(classpathEntries);
+        analysisAst = mergeWithWorkspaceClasses(artifact.astRoot, workspace);
       } catch (err) {
         console.warn(`Warning: failed to load workspace (${err.message}); falling back to file-only analysis.`);
       }
     }
-    if (!methodEffects) {
-      methodEffects = computeMethodEffects(artifact.astRoot);
+    let methodEffects = null;
+    try {
+      methodEffects = computeMethodEffects(analysisAst);
+    } catch (err) {
+      if (analysisAst !== artifact.astRoot) {
+        console.warn(`Warning: failed to analyze workspace (${err.message}); retrying with file-only classes.`);
+      }
+      analysisAst = artifact.astRoot;
+      methodEffects = computeMethodEffects(analysisAst);
     }
+    const pureInlineResult = inlinePureMethods(artifact.astRoot, { analysisAst });
+    const pureInlineDiagnostics = summarizeInlinePureDiagnostics(pureInlineResult.summary);
     const inlineResult = inlineSinglePredecessorBlocks(artifact.astRoot);
     const inlineDiagnostics = inlineResult.merges.map((merge) => ({
       className: merge.className,
@@ -478,31 +622,77 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
       artifact.astRoot,
       { methodEffects },
     );
-    const allDiagnostics = inlineDiagnostics
+    const allDiagnostics = pureInlineDiagnostics
+      .concat(inlineDiagnostics)
       .concat(relocationDiagnostics)
       .concat(deadCodeDiagnostics);
-    if (allDiagnostics.length === 0) {
-      console.log('No issues detected.');
-    } else {
-      allDiagnostics.forEach((diag, index) => {
-        console.log(
-          `${index + 1}) ${diag.className}.${diag.methodName}${diag.descriptor} - ${diag.message}`,
-        );
-      });
-    }
-    const changed = inlineResult.changed || relocation.changed || dceChanged;
-    if (!fix || !changed) {
-      if (fix && !changed) {
-        console.log('No fixes applied.');
+    if (!toStdout) {
+      if (allDiagnostics.length === 0) {
+        console.log('No issues detected.');
+      } else {
+        allDiagnostics.forEach((diag, index) => {
+          console.log(
+            `${index + 1}) ${diag.className}.${diag.methodName}${diag.descriptor} - ${diag.message}`,
+          );
+        });
       }
+    }
+    const changed = pureInlineResult.changed || inlineResult.changed || relocation.changed || dceChanged;
+    if (!fix) {
       return;
     }
-    const newText = generateJasminText(artifact.astRoot, artifact.constantPool);
+    if (!changed) {
+      if (toStdout) {
+        const currentText = generateJasminText(artifact.astRoot, artifact.constantPool);
+        process.stdout.write(currentText);
+        if (!currentText.endsWith('\n')) {
+          process.stdout.write('\n');
+        }
+        return;
+      }
+      console.log('No fixes applied.');
+      return;
+    }
+    let crossReferenceOptions = null;
+    let methodAnnotations = null;
+    let exceptionMetadata = null;
+    if (annotateXrefs) {
+      try {
+        exceptionMetadata = collectExceptionMetadata(artifact.astRoot);
+      } catch (err) {
+        console.warn(`Warning: failed to collect exception metadata (${err.message})`);
+      }
+      methodAnnotations = buildMethodAnnotations(methodEffects, exceptionMetadata);
+      try {
+        crossReferenceOptions = createCrossReferenceOptions(artifact.astRoot, workspace);
+      } catch (err) {
+        console.warn(`Warning: failed to compute cross references (${err.message})`);
+        crossReferenceOptions = { withComments: true };
+      }
+      if (!crossReferenceOptions) {
+        crossReferenceOptions = { withComments: true };
+      }
+      if (methodAnnotations) {
+        crossReferenceOptions.methodAnnotations = methodAnnotations;
+      }
+    }
+    const newText = generateJasminText(
+      artifact.astRoot,
+      artifact.constantPool,
+      crossReferenceOptions || {},
+    );
     if (dryRun) {
       showDiff(artifact.baselineJasmin, newText);
       return;
     }
-    writeArtifact(artifact, outPath);
+    if (toStdout) {
+      process.stdout.write(newText);
+      if (!newText.endsWith('\n')) {
+        process.stdout.write('\n');
+      }
+      return;
+    }
+    writeArtifact(artifact, outPath, crossReferenceOptions || {});
   } finally {
     artifact.cleanup();
   }
@@ -736,6 +926,86 @@ async function fieldRefsCommand(args) {
           `    ${ref.op} by ${ref.className}.${ref.methodName}${ref.descriptor}`,
         );
       });
+    });
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+async function purityMetadataCommand(args) {
+  let outputFormat = 'text';
+  let classpathRaw = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--json') {
+      outputFormat = 'json';
+    } else if (arg === '--classpath' || arg === '-cp') {
+      if (i + 1 >= args.length) throw new Error('--classpath requires a value');
+      classpathRaw = args[++i];
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('purity requires exactly one input file');
+  }
+  let classpathEntries = splitClasspath(classpathRaw);
+  if (!classpathEntries) {
+    const defaultSources = path.join(process.cwd(), 'sources');
+    if (fs.existsSync(defaultSources)) {
+      classpathEntries = [defaultSources];
+    }
+  }
+  const inputPath = resolveInputPath(positional[0], classpathEntries);
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    let analysisAst = artifact.astRoot;
+    if (classpathEntries && classpathEntries.length) {
+      try {
+        const workspace = await KrakatauWorkspace.create(classpathEntries);
+        analysisAst = mergeWithWorkspaceClasses(artifact.astRoot, workspace);
+      } catch (err) {
+        console.warn(`Warning: failed to load workspace (${err.message}); analyzing file only.`);
+      }
+    }
+    const methodEffects = computeMethodEffects(analysisAst);
+    const results = [];
+    for (const classItem of artifact.astRoot.classes || []) {
+      const className = classItem.className || 'UnknownClass';
+      for (const item of classItem.items || []) {
+        if (!item || item.type !== 'method' || !item.method) continue;
+        const key = makeMethodKey(className, item.method.name, item.method.descriptor);
+        const effect = methodEffects.get(key);
+        const summary = {
+          className,
+          methodName: item.method.name,
+          descriptor: item.method.descriptor,
+          pure: !!(effect && effect.pure),
+          reasons: Array.from((effect && effect.impureReasons) || []),
+        };
+        results.push(summary);
+      }
+    }
+    if (outputFormat === 'json') {
+      process.stdout.write(`${JSON.stringify(results, null, 2)}\n`);
+      return;
+    }
+    if (!results.length) {
+      console.log('No methods found.');
+      return;
+    }
+    results.forEach((entry) => {
+      console.log(`${entry.className}.${entry.methodName}${entry.descriptor}`);
+      console.log(`  pure: ${entry.pure ? 'yes' : 'no'}`);
+      if (!entry.pure && entry.reasons.length) {
+        console.log('  reasons:');
+        entry.reasons.forEach((reason) => console.log(`    - ${reason}`));
+      }
     });
   } finally {
     artifact.cleanup();
@@ -1072,6 +1342,9 @@ async function main(argv) {
         break;
       case 'throws':
         throwsMetadataCommand(args);
+        break;
+      case 'purity':
+        await purityMetadataCommand(args);
         break;
       case 'callers':
         await callersMetadataCommand(args);

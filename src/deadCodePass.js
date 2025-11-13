@@ -6,6 +6,7 @@ const { reconstructAstFromCfg } = require('./cfg-to-ast');
 const { analyzePurity } = require('./purityAnalyzer');
 const { collectExceptionMetadata } = require('./exceptionMetadata');
 const { makeMethodKey, extractInvokeTarget } = require('./methodEffectsAnalyzer');
+const { removeDummyStackOps } = require('./removeDummyStackOps');
 
 function runDeadCodePass(astRoot, { collectDiagnostics = true, methodEffects = null } = {}) {
   const diagnostics = [];
@@ -26,6 +27,7 @@ function runDeadCodePass(astRoot, { collectDiagnostics = true, methodEffects = n
       if (!cfg) {
         continue;
       }
+      cfg.context = { className, methodName: methodNode.name, descriptor: methodNode.descriptor };
       const result = eliminateDeadCodeCfg(cfg, {
         isInvocationPure: (signature) => {
           if (!purityInfo) return false;
@@ -36,7 +38,13 @@ function runDeadCodePass(astRoot, { collectDiagnostics = true, methodEffects = n
       if (!result.changed) {
         continue;
       }
-      const optimizedMethod = reconstructAstFromCfg(result.optimizedCfg, methodNode);
+      let optimizedMethod;
+      try {
+        optimizedMethod = reconstructAstFromCfg(result.optimizedCfg, methodNode);
+      } catch (err) {
+        err.message = `While optimizing ${className}.${methodNode.name}${methodNode.descriptor}: ${err.message}`;
+        throw err;
+      }
       item.method = optimizedMethod;
       methodNode = optimizedMethod;
       methodLookup.set(makeMethodKey(className, methodNode.name, methodNode.descriptor), methodNode);
@@ -122,6 +130,21 @@ function runDeadCodePass(astRoot, { collectDiagnostics = true, methodEffects = n
           }
         }
       }
+    }
+  }
+
+  const dummyRemoval = removeDummyStackOps(astRoot);
+  if (dummyRemoval.changed) {
+    changed = true;
+    if (collectDiagnostics) {
+      dummyRemoval.methods.forEach((method) => {
+        diagnostics.push({
+          className: method.className,
+          methodName: method.methodName,
+          descriptor: method.descriptor,
+          message: `Removed ${method.removedPairs} redundant push/pop pair(s).`,
+        });
+      });
     }
   }
 

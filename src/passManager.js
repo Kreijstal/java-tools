@@ -4,6 +4,8 @@ const { constantFoldCfg } = require('./constantFolder-cfg');
 const { eliminateDeadCodeCfg } = require('./deadCodeEliminator-cfg');
 const { inlinePureMethods } = require('./inlinePureMethods');
 const { createStaticInvokeEvaluator } = require('./utils/staticInvokeEvaluator');
+const { evaluateCounterLoops } = require('./evaluateCounterLoops');
+const { removeDummyStackOps } = require('./removeDummyStackOps');
 
 function formatMethodSignature(className, method) {
   return `${className}.${method.name}${method.descriptor}`;
@@ -85,6 +87,14 @@ function runCfgPasses(program, options = {}) {
 
 function runOptimizationPasses(program, options = {}) {
   const passes = [];
+  const pushPass = (name, info = {}) => {
+    passes.push({
+      name,
+      iteration: passes.length + 1,
+      changed: Boolean(info.changed),
+      ...info,
+    });
+  };
 
   const requestedPasses = Array.isArray(options.passes) && options.passes.length > 0
     ? new Set(options.passes)
@@ -93,16 +103,13 @@ function runOptimizationPasses(program, options = {}) {
 
   const inlineEnabled = includePass('inlinePureMethods');
   const foldEnabled = includePass('constantFoldCfg');
+  const loopEvalEnabled = includePass('evaluateCounterLoops');
   const dceEnabled = includePass('eliminateDeadCodeCfg');
+  const dummyEnabled = includePass('removeDummyStackOps');
 
   if (inlineEnabled) {
     const firstInline = inlinePureMethods(program);
-    passes.push({
-      name: 'inlinePureMethods',
-      iteration: 1,
-      changed: firstInline.changed || false,
-      summary: firstInline.summary || null,
-    });
+    pushPass('inlinePureMethods', { changed: firstInline.changed, summary: firstInline.summary || null });
   }
 
   if (foldEnabled || dceEnabled) {
@@ -114,18 +121,18 @@ function runOptimizationPasses(program, options = {}) {
       skipDeadCode: !dceEnabled,
     });
     if (foldEnabled) {
-      passes.push({
-        name: 'constantFoldCfg',
-        iteration: 2,
+      pushPass('constantFoldCfg', {
         changed: firstCfg.fold.changed,
         methods: firstCfg.fold.methods,
         limitHits: firstCfg.fold.limitHits,
       });
     }
+    if (loopEvalEnabled) {
+      const loopResult = evaluateCounterLoops(program);
+      pushPass('evaluateCounterLoops', { changed: loopResult.changed, loops: loopResult.loops });
+    }
     if (dceEnabled) {
-      passes.push({
-        name: 'eliminateDeadCodeCfg',
-        iteration: 3,
+      pushPass('eliminateDeadCodeCfg', {
         changed: firstCfg.dce.changed,
         methods: firstCfg.dce.methods,
       });
@@ -134,12 +141,7 @@ function runOptimizationPasses(program, options = {}) {
 
   if (inlineEnabled) {
     const secondInline = inlinePureMethods(program);
-    passes.push({
-      name: 'inlinePureMethods',
-      iteration: 4,
-      changed: secondInline.changed || false,
-      summary: secondInline.summary || null,
-    });
+    pushPass('inlinePureMethods', { changed: secondInline.changed, summary: secondInline.summary || null });
   }
 
   if (foldEnabled || dceEnabled) {
@@ -151,22 +153,27 @@ function runOptimizationPasses(program, options = {}) {
       skipDeadCode: !dceEnabled,
     });
     if (foldEnabled) {
-      passes.push({
-        name: 'constantFoldCfg',
-        iteration: 5,
+      pushPass('constantFoldCfg', {
         changed: secondCfg.fold.changed,
         methods: secondCfg.fold.methods,
         limitHits: secondCfg.fold.limitHits,
       });
     }
+    if (loopEvalEnabled) {
+      const loopResult = evaluateCounterLoops(program);
+      pushPass('evaluateCounterLoops', { changed: loopResult.changed, loops: loopResult.loops });
+    }
     if (dceEnabled) {
-      passes.push({
-        name: 'eliminateDeadCodeCfg',
-        iteration: 6,
+      pushPass('eliminateDeadCodeCfg', {
         changed: secondCfg.dce.changed,
         methods: secondCfg.dce.methods,
       });
     }
+  }
+
+  if (dummyEnabled) {
+    const dummy = removeDummyStackOps(program);
+    pushPass('removeDummyStackOps', { changed: dummy.changed, methods: dummy.methods });
   }
 
   const changed = passes.some((pass) => pass.changed);

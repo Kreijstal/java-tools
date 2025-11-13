@@ -56,6 +56,28 @@ const BRANCH_OPS = new Set([
 
 const CONTROL_FLOW_OPS = new Set(['goto', 'tableswitch', 'lookupswitch', 'jsr', 'ret']);
 
+const ARRAY_LOAD_OPS = new Map([
+  ['iaload', { popSlots: 2, pushSlots: 1 }],
+  ['laload', { popSlots: 2, pushSlots: 2 }],
+  ['faload', { popSlots: 2, pushSlots: 1 }],
+  ['daload', { popSlots: 2, pushSlots: 2 }],
+  ['aaload', { popSlots: 2, pushSlots: 1 }],
+  ['baload', { popSlots: 2, pushSlots: 1 }],
+  ['caload', { popSlots: 2, pushSlots: 1 }],
+  ['saload', { popSlots: 2, pushSlots: 1 }],
+]);
+
+const ARRAY_STORE_OPS = new Map([
+  ['iastore', { popSlots: 3, pushSlots: 0 }],
+  ['lastore', { popSlots: 4, pushSlots: 0 }],
+  ['fastore', { popSlots: 3, pushSlots: 0 }],
+  ['dastore', { popSlots: 4, pushSlots: 0 }],
+  ['aastore', { popSlots: 3, pushSlots: 0 }],
+  ['bastore', { popSlots: 3, pushSlots: 0 }],
+  ['castore', { popSlots: 3, pushSlots: 0 }],
+  ['sastore', { popSlots: 3, pushSlots: 0 }],
+]);
+
 function parseTypeDescriptor(descriptor, startIndex = 0) {
   if (!descriptor || startIndex >= descriptor.length) {
     return null;
@@ -215,6 +237,15 @@ function getStackEffect(op, instruction = null) {
 
   if (op === 'swap') {
     return { popSlots: 2, pushSlots: 2, special: 'swap' };
+  }
+
+  if (ARRAY_LOAD_OPS.has(op)) {
+    return ARRAY_LOAD_OPS.get(op);
+  }
+
+  if (ARRAY_STORE_OPS.has(op)) {
+    const effect = ARRAY_STORE_OPS.get(op);
+    return { ...effect, essential: true };
   }
 
   if (CONST_SPECIAL.has(op)) {

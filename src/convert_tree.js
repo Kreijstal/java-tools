@@ -1037,9 +1037,10 @@ function formatFieldRef(ref) {
 }
 
 function unparseDataStructures(cls, constantPool, options = {}) {
-  const { withComments = false, crossReferences = null } = options;
+  const { withComments = false, crossReferences = null, methodAnnotations = null } = options;
   const classMethodRefs = crossReferences && crossReferences.methods;
   const classFieldRefs = crossReferences && crossReferences.fields;
+  const classMethodAnnotations = methodAnnotations && methodAnnotations.get(cls.className);
 
   function formatCodeAttribute(attr) {
     if (attr.type === "linenumbertable") {
@@ -1121,6 +1122,33 @@ function unparseDataStructures(cls, constantPool, options = {}) {
           callers.forEach((caller) => {
             methodHeaderLines.push(`;   ${formatMethodRef(caller)}`);
           });
+        }
+        const annotationEntry =
+          classMethodAnnotations && classMethodAnnotations.get(methodKey);
+        if (withComments && annotationEntry && annotationEntry.purity) {
+          const { pure, impureReasons = [] } = annotationEntry.purity;
+          if (pure) {
+            methodHeaderLines.push(`; purity: pure`);
+          } else if (impureReasons.length) {
+            methodHeaderLines.push(`; purity: impure`);
+            const maxReasons = 3;
+            impureReasons.slice(0, maxReasons).forEach((reason) => {
+              methodHeaderLines.push(`;   reason: ${reason}`);
+            });
+            if (impureReasons.length > maxReasons) {
+              methodHeaderLines.push(`;   ... ${impureReasons.length - maxReasons} more reason(s)`);
+            }
+          } else {
+            methodHeaderLines.push(`; purity: unknown`);
+          }
+        }
+        if (withComments && annotationEntry && annotationEntry.exceptions) {
+          const declared = annotationEntry.exceptions.declared || [];
+          const implicit = annotationEntry.exceptions.implicit || [];
+          const declaredText = declared.length ? declared.join(', ') : '(none)';
+          const implicitText = implicit.length ? implicit.join(', ') : '(none)';
+          methodHeaderLines.push(`; throws declared: ${declaredText}`);
+          methodHeaderLines.push(`; throws implicit: ${implicitText}`);
         }
         const methodHeader = methodHeaderLines.join("\n");
 
