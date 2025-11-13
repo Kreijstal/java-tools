@@ -62,3 +62,34 @@ test('inlinePureMethods inlines pure argument-returning statics', (t) => {
 
   t.end();
 });
+
+test('inlinePureMethods can analyze external workspace classes', (t) => {
+  const callee = loadJasminFixture('ReturnFirst');
+  const caller = loadJasminFixture('ReturnFirstCaller');
+
+  const target = {
+    classes: caller.classes.map((cls) => JSON.parse(JSON.stringify(cls))),
+  };
+  const analysisAst = {
+    classes: target.classes.concat(callee.classes),
+  };
+
+  const { changed } = inlinePureMethods(target, { analysisAst });
+  t.ok(changed, 'should inline even when target AST lacks the callee definition');
+
+  const callerClass = target.classes.find((cls) => cls.className === 'ReturnFirstCaller');
+  const methodItem = callerClass.items.find(
+    (item) => item.type === 'method' && item.method.name === 'call',
+  );
+  const instructions = methodItem.method.attributes
+    .find((attr) => attr.type === 'code')
+    .code.codeItems
+    .map((ci) => ci.instruction)
+    .filter(Boolean);
+
+  t.notOk(
+    instructions.some((insn) => insn === 'invokestatic' || (insn.op && insn.op === 'invokestatic')),
+    'invokestatic should disappear after inlining via analysisAst',
+  );
+  t.end();
+});

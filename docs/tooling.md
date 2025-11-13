@@ -5,7 +5,7 @@
 `scripts/jvm-cli.js` centralizes assembly, disassembly, linting/optimization, and structural refactors for both `.j` and `.class` files. Highlights:
 
 - `assemble`/`disassemble` convert between Jasmin and bytecode without depending on Krakatau’s Java tools.
-- `lint`/`optimize` run the dead-handler eliminator; `--fix` rewrites the file, `-n/--dry-run` shows a unified diff.
+- `lint`/`optimize` run the dead-handler eliminator; `--fix` rewrites the file, `-n/--dry-run` shows a unified diff, `--stdout` prints the optimized Jasmin without touching disk, and `--xref-comments` injects caller/field-reference comments plus purity/throws summaries (requires a `--classpath` so the workspace can be indexed).
 - `format` reassembles/disassembles `.j` sources to enforce a canonical layout (same defaults used by the forthcoming LSP formatter).
 - `rename-class`/`rename-method` patch both definitions and call sites; they understand descriptors and emit diffs.
 - `workspace` subcommands query any classpath (default `sources`) for methods, fields, constants, class descriptors, and reference graph lookups.

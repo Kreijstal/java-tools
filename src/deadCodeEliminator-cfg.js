@@ -128,6 +128,7 @@ function simplifyTrivialGotos(cfg) {
 
   const exceptionSuccessors =
     cfg.exceptionSuccessors instanceof Map ? cfg.exceptionSuccessors : new Map();
+  const handlerBlocks = cfg.handlerBlocks instanceof Set ? cfg.handlerBlocks : new Set();
 
   let changed = false;
 
@@ -143,9 +144,11 @@ function simplifyTrivialGotos(cfg) {
     }
 
     const exceptionTargets = exceptionSuccessors.get(block.id);
-    const normalSuccessors = block.successors.filter(
-      (succ) => !exceptionTargets || !exceptionTargets.has(succ),
-    );
+    const normalSuccessors = block.successors.filter((succ) => {
+      const isException = exceptionTargets && exceptionTargets.has(succ);
+      const isHandler = handlerBlocks.has(succ);
+      return !isException && !isHandler;
+    });
     if (normalSuccessors.length !== 1) {
       continue;
     }
@@ -248,18 +251,80 @@ function handleStackManipulation(instr, effect, consumed, stack) {
   });
 }
 
+function cloneLocalsMap(locals) {
+  if (!locals) {
+    return new Map();
+  }
+  const cloned = new Map();
+  locals.forEach((value, key) => {
+    cloned.set(key, new Set(value));
+  });
+  return cloned;
+}
+
+function getLocalIndexFromOpcode(op, arg, kind) {
+  if (!op) return null;
+  const suffixPattern =
+    kind === 'store'
+      ? /^(?:[ailfd]?store|astore)_(\d+)$/
+      : /^(?:[ailfd]?load|aload)_(\d+)$/;
+  const baseOps =
+    kind === 'store'
+      ? new Set(['istore', 'lstore', 'fstore', 'dstore', 'astore'])
+      : new Set(['iload', 'lload', 'fload', 'dload', 'aload']);
+  const match = op.match(suffixPattern);
+  if (match) {
+    return Number(match[1]);
+  }
+  if (baseOps.has(op)) {
+    if (typeof arg === 'number') return arg;
+    if (typeof arg === 'string' && arg.length) return Number(arg);
+  }
+  return null;
+}
+
+function getLocalStoreIndex(normalized) {
+  if (!normalized || !normalized.op) return null;
+  if (normalized.op === 'iinc') {
+    const varnum = normalized.varnum ?? normalized.index ?? normalized.arg;
+    if (typeof varnum === 'number') return varnum;
+    if (typeof varnum === 'string' && varnum.length) return Number(varnum);
+    return null;
+  }
+  return getLocalIndexFromOpcode(normalized.op, normalized.arg, 'store');
+}
+
+function getLocalLoadIndex(normalized) {
+  return getLocalIndexFromOpcode(normalized.op, normalized.arg, 'load');
+}
+
+function createLocalConsumeEntry(producer) {
+  const pseudoValue = { producer };
+  return { width: 0, sources: new Set([pseudoValue]) };
+}
+
+const DEBUG_DCE = process.env.DCE_DEBUG === '1';
+const DEBUG_DCE_METHOD = process.env.DCE_DEBUG_METHOD || null;
+
 function buildDefUseChains(cfg) {
+  const debugKey =
+    cfg && cfg.context
+      ? `${cfg.context.className || 'Unknown'}.${cfg.context.methodName || '?'}${cfg.context.descriptor || ''}`
+      : null;
+  const debugEnabled = DEBUG_DCE && (!DEBUG_DCE_METHOD || DEBUG_DCE_METHOD === debugKey);
+  const iterationCounts = debugEnabled ? new Map() : null;
   const blockStates = new Map();
   const failedBlocks = new Set();
   const worklist = [cfg.entryBlockId];
+  let totalIterations = 0;
 
-  blockStates.set(cfg.entryBlockId, { inStack: [] });
+  blockStates.set(cfg.entryBlockId, { inStack: [], locals: new Map() });
 
   const handlerBlocks = cfg.handlerBlocks instanceof Set ? cfg.handlerBlocks : new Set();
   const exceptionSuccessors = cfg.exceptionSuccessors instanceof Map ? cfg.exceptionSuccessors : new Map();
   for (const handlerId of handlerBlocks) {
     if (!blockStates.has(handlerId)) {
-      blockStates.set(handlerId, { inStack: [createValueEntry(1)] });
+      blockStates.set(handlerId, { inStack: [createValueEntry(1)], locals: new Map() });
     }
     if (handlerId !== cfg.entryBlockId) {
       worklist.push(handlerId);
@@ -268,6 +333,21 @@ function buildDefUseChains(cfg) {
 
   while (worklist.length > 0) {
     const blockId = worklist.pop();
+    totalIterations += 1;
+    if (debugEnabled) {
+      const currentCount = (iterationCounts.get(blockId) || 0) + 1;
+      iterationCounts.set(blockId, currentCount);
+      if (currentCount === 1 || currentCount % 100 === 0) {
+        console.error(
+          `[DCE] visiting ${debugKey} block=${blockId} (#${currentCount}, total ${totalIterations})`,
+        );
+      }
+      if (currentCount > 10000) {
+        throw new Error(
+          `Def-use analysis appears stuck in ${debugKey} (block ${blockId} exceeded 10000 visits)`,
+        );
+      }
+    }
     if (failedBlocks.has(blockId)) {
       continue;
     }
@@ -279,7 +359,9 @@ function buildDefUseChains(cfg) {
 
     const state = blockStates.get(blockId);
     const entryStack = state && state.inStack ? cloneStack(state.inStack) : [];
+    const entryLocals = state && state.locals ? cloneLocalsMap(state.locals) : new Map();
     const stack = entryStack;
+    const locals = entryLocals;
 
     let blockFailed = false;
 
@@ -358,6 +440,37 @@ function buildDefUseChains(cfg) {
         instr.produced.push(producedValue);
         stack.push(createValueEntry(effect.pushSlots, [producedValue]));
       }
+
+      const loadIndex = getLocalLoadIndex(normalized);
+      if (loadIndex !== null) {
+        const producers = locals.get(loadIndex);
+        if (producers) {
+          producers.forEach((producer) => {
+            if (producer && producer.consumers instanceof Set) {
+              producer.consumers.add(instr);
+            }
+            if (producer) {
+              instr.consumes.push(createLocalConsumeEntry(producer));
+            }
+          });
+        }
+      }
+
+      const storeIndex = getLocalStoreIndex(normalized);
+      if (storeIndex !== null) {
+        const previousSet = locals.get(storeIndex);
+        if (normalized.op === 'iinc' && previousSet) {
+          previousSet.forEach((producer) => {
+            if (producer && producer.consumers instanceof Set) {
+              producer.consumers.add(instr);
+            }
+            if (producer) {
+              instr.consumes.push(createLocalConsumeEntry(producer));
+            }
+          });
+        }
+        locals.set(storeIndex, new Set([instr]));
+      }
     }
 
     if (blockFailed) {
@@ -367,6 +480,7 @@ function buildDefUseChains(cfg) {
     }
 
     const exitStack = stack;
+    const exitLocals = locals;
     for (const successorId of block.successors) {
       const successorBlock = cfg.blocks.get(successorId);
       if (!successorBlock || failedBlocks.has(successorId)) {
@@ -374,10 +488,14 @@ function buildDefUseChains(cfg) {
       }
 
       const exceptionTargets = exceptionSuccessors.get(block.id);
-      const isExceptionEdge = exceptionTargets && exceptionTargets.has(successorId);
+      const isExceptionEdge =
+        (exceptionTargets && exceptionTargets.has(successorId)) || handlerBlocks.has(successorId);
       if (isExceptionEdge) {
         if (!blockStates.has(successorId)) {
-          blockStates.set(successorId, { inStack: [createValueEntry(1)] });
+          blockStates.set(successorId, {
+            inStack: [createValueEntry(1)],
+            locals: cloneLocalsMap(exitLocals),
+          });
           worklist.push(successorId);
         }
         continue;
@@ -385,26 +503,85 @@ function buildDefUseChains(cfg) {
 
       const successorState = blockStates.get(successorId);
       const existingStack = successorState ? successorState.inStack : null;
-      const merged = mergeStacks(existingStack, exitStack);
+      const mergedStack = mergeStacks(existingStack, exitStack);
 
-      if (merged.incompatible) {
+      if (mergedStack.incompatible) {
         failedBlocks.add(successorId);
         markBlockUnsupported(successorBlock, 'Incompatible stack shapes at block entry');
         continue;
       }
 
-      if (merged.changed || !successorState) {
-        blockStates.set(successorId, { inStack: merged.stack });
+      const existingLocals = successorState ? successorState.locals : null;
+      let localsChanged = false;
+      let mergedLocals;
+      if (!existingLocals) {
+        mergedLocals = cloneLocalsMap(exitLocals);
+        localsChanged = true;
+      } else {
+        mergedLocals = cloneLocalsMap(existingLocals);
+        exitLocals.forEach((value, key) => {
+          let target = mergedLocals.get(key);
+          if (!target) {
+            mergedLocals.set(key, new Set(value));
+            localsChanged = true;
+            return;
+          }
+          const sizeBefore = target.size;
+          value.forEach((producer) => target.add(producer));
+          if (target.size !== sizeBefore) {
+            localsChanged = true;
+          }
+        });
+      }
+
+      if (mergedStack.changed || localsChanged || !successorState) {
+        blockStates.set(successorId, { inStack: mergedStack.stack, locals: mergedLocals });
         worklist.push(successorId);
       }
     }
   }
 }
 
+function blockNeedsForcedLiveness(block) {
+  if (!block || !Array.isArray(block.instructions)) {
+    return false;
+  }
+  for (const instr of block.instructions) {
+    if (!instr || !instr.instruction) {
+      continue;
+    }
+    const normalized = normalizeInstruction(instr.instruction);
+    if (!normalized || !normalized.op) {
+      continue;
+    }
+    const effect = getStackEffect(normalized.op, normalized);
+    if (!effect || effect.popSlots <= 0) {
+      continue;
+    }
+    if (!Array.isArray(instr.consumes) || instr.consumes.length === 0) {
+      return true;
+    }
+    const hasSources = instr.consumes.every(
+      (entry) => entry && entry.sources instanceof Set && entry.sources.size > 0,
+    );
+    if (!hasSources) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function eliminateDeadCodeCfg(cfg, options = {}) {
   const removedBlocks = pruneUnreachableBlocks(cfg);
   buildDefUseChains(cfg);
   linkConsumers(cfg);
+
+  const forceLiveBlocks = new Set();
+  for (const block of cfg.blocks.values()) {
+    if (blockNeedsForcedLiveness(block)) {
+      forceLiveBlocks.add(block);
+    }
+  }
 
   const liveSet = new Set();
   const worklist = [];
@@ -435,10 +612,28 @@ function eliminateDeadCodeCfg(cfg, options = {}) {
         typeof options.isInvocationPure === 'function' &&
         invokeSignature &&
         options.isInvocationPure(invokeSignature);
-      if (op && ESSENTIAL_OPCODES.has(op) && !pureInvoke && !liveSet.has(instr)) {
+      if (op && ESSENTIAL_OPCODES.has(op) && !pureInvoke) {
+        if (!liveSet.has(instr)) {
+          liveSet.add(instr);
+          worklist.push(instr);
+          enqueueConsumers(instr, liveSet, worklist);
+        }
+        continue;
+      }
+    }
+  }
+
+  if (forceLiveBlocks.size > 0) {
+    for (const block of forceLiveBlocks) {
+      if (!block || !Array.isArray(block.instructions)) {
+        continue;
+      }
+      for (const instr of block.instructions) {
+        if (!instr || !instr.instruction || liveSet.has(instr)) {
+          continue;
+        }
         liveSet.add(instr);
         worklist.push(instr);
-        enqueueConsumers(instr, liveSet, worklist);
       }
     }
   }
@@ -457,6 +652,7 @@ function eliminateDeadCodeCfg(cfg, options = {}) {
         if (producer && !liveSet.has(producer)) {
           liveSet.add(producer);
           worklist.push(producer);
+          enqueueConsumers(producer, liveSet, worklist);
         }
       }
     }
@@ -469,7 +665,9 @@ function eliminateDeadCodeCfg(cfg, options = {}) {
       if (!instr || !instr.instruction) {
         return true;
       }
-      return liveSet.has(instr);
+      const live = liveSet.has(instr);
+      instr.__live = live;
+      return live;
     });
     if (block.instructions.length < originalCount) {
       changed = true;

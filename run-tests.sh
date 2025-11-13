@@ -5,15 +5,19 @@ run_test() {
   local test_file="$1"
   echo "Running test: $test_file"
 
-  # Special handling for tests that need longer timeouts
-  local timeout_val=15
+  local timeout_cmd=(timeout 15)
   case "$test_file" in
-    *data-zip-download*) timeout_val=60;;
-    */roundtrip.test.js) timeout_val=600;;
-    */hierarchyRename.test.js) timeout_val=60;;
+    *data-zip-download*) timeout_cmd=(timeout 60);;
+    */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
+    */roundtrip.test.js) timeout_cmd=();; # roundtrip enforces per-case timeouts internally
     # Add other special cases here
   esac
-  timeout "$timeout_val" ./node_modules/.bin/tape "$test_file"
+
+  if [ ${#timeout_cmd[@]} -eq 0 ]; then
+    ./node_modules/.bin/tape "$test_file"
+  else
+    "${timeout_cmd[@]}" ./node_modules/.bin/tape "$test_file"
+  fi
 
   if [ $? -ne 0 ]; then
     echo "Test failed: $test_file"

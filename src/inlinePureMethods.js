@@ -418,21 +418,32 @@ function inlineInvocation(callerInfo, code, items, index, candidate) {
   return { tempIndex, adjustment: replacements.length - 1 };
 }
 
-function inlinePureMethods(ast) {
+function inlinePureMethods(ast, options = {}) {
   const summary = {};
   if (!ast || !Array.isArray(ast.classes)) {
     return { changed: false, summary };
   }
 
-  const methods = gatherMethods(ast);
-  if (methods.size === 0) {
+  const analysisAst =
+    options && options.analysisAst && Array.isArray(options.analysisAst.classes)
+      ? options.analysisAst
+      : ast;
+
+  const targetMethods = gatherMethods(ast);
+  if (targetMethods.size === 0) {
     return { changed: false, summary };
   }
 
-  const purity = analyzePurity(ast);
+  const analysisMethods =
+    analysisAst === ast ? targetMethods : gatherMethods(analysisAst);
+  if (analysisMethods.size === 0) {
+    return { changed: false, summary };
+  }
+
+  const purity = analyzePurity(analysisAst);
   const inlineable = new Map();
 
-  for (const [signature, info] of methods) {
+  for (const [signature, info] of analysisMethods) {
     const purityInfo = purity && purity[signature];
     if (!purityInfo || purityInfo.pure !== true) {
       continue;
@@ -449,7 +460,7 @@ function inlinePureMethods(ast) {
 
   let changed = false;
 
-  for (const [signature, info] of methods) {
+  for (const [signature, info] of targetMethods) {
     const codeAttr = info.codeAttr;
     if (!codeAttr || !codeAttr.code || !Array.isArray(codeAttr.code.codeItems)) {
       continue;

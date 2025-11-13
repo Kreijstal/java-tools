@@ -69,7 +69,7 @@ function listInstructionOps(method) {
 }
 
 test('runOptimizationPasses orchestrates the inline/fold/DCE pipeline', (t) => {
-  t.plan(6);
+  t.plan(7);
   const krak2Path = ensureKrak2Path();
 
   withTempDir('pm-', (tempDir) => {
@@ -84,18 +84,21 @@ test('runOptimizationPasses orchestrates the inline/fold/DCE pipeline', (t) => {
     const { changed, passes } = runOptimizationPasses(program);
 
     t.ok(changed, 'optimization pipeline should report changes');
-    t.deepEqual(
-      passes.map((pass) => pass.name),
-      [
-        'inlinePureMethods',
-        'constantFoldCfg',
-        'eliminateDeadCodeCfg',
-        'inlinePureMethods',
-        'constantFoldCfg',
-        'eliminateDeadCodeCfg',
-      ],
-      'passes should run in the expected order',
-    );
+  t.deepEqual(
+    passes.map((pass) => pass.name),
+    [
+      'inlinePureMethods',
+      'constantFoldCfg',
+      'evaluateCounterLoops',
+      'eliminateDeadCodeCfg',
+      'inlinePureMethods',
+      'constantFoldCfg',
+      'evaluateCounterLoops',
+      'eliminateDeadCodeCfg',
+      'removeDummyStackOps',
+    ],
+    'passes should run in the expected order',
+  );
 
     const callerClass = program.classes.find((cls) => cls.className === 'Caller');
     const method = findMethod(callerClass, (m) => m.name === 'test');
@@ -111,6 +114,8 @@ test('runOptimizationPasses orchestrates the inline/fold/DCE pipeline', (t) => {
     const inlinePasses = passes.filter((pass) => pass.name === 'inlinePureMethods');
     t.ok(inlinePasses.some((pass) => pass.changed), 'at least one inlining pass should report changes');
 
+    const loopPasses = passes.filter((pass) => pass.name === 'evaluateCounterLoops');
+    t.ok(loopPasses.length >= 2, 'loop evaluation pass should run twice');
     const dcePasses = passes.filter((pass) => pass.name === 'eliminateDeadCodeCfg');
     t.ok(dcePasses.some((pass) => pass.changed), 'at least one DCE pass should report changes');
   });
@@ -128,8 +133,8 @@ test('runOptimizationPasses respects the passes filter', (t) => {
     'only constant fold passes should run when requested',
   );
   t.ok(
-    foldOnly.passes.every((pass) => pass.iteration === 2 || pass.iteration === 5),
-    'constant fold passes should retain their iteration numbers',
+    foldOnly.passes.every((pass, index) => pass.iteration === index + 1),
+    'constant fold passes should retain sequential iteration numbers',
   );
 
   const inlineOnly = runOptimizationPasses({ classes: [] }, { passes: ['inlinePureMethods'] });
@@ -139,7 +144,7 @@ test('runOptimizationPasses respects the passes filter', (t) => {
     'requesting only inlining should omit CFG passes',
   );
   t.ok(
-    inlineOnly.passes.every((pass) => pass.iteration === 1 || pass.iteration === 4),
+    inlineOnly.passes.every((pass, index) => pass.iteration === index + 1),
     'inlining-only pipeline should contain both inline iterations',
   );
 });

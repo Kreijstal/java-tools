@@ -110,3 +110,43 @@ test('computeMethodEffects marks unknown callees as throwing', (t) => {
   t.ok(effects.get(callerKey).throwsUnknown, 'unknown callee should mark throwsUnknown');
   t.end();
 });
+
+test('computeMethodEffects treats ldc-only methods as pure', (t) => {
+  const ast = {
+    classes: [
+      {
+        className: 'ConstHolder',
+        items: [
+          {
+            type: 'method',
+            method: {
+              name: 'literal',
+              descriptor: '()Ljava/lang/String;',
+              flags: ['public', 'static'],
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    stackSize: '1',
+                    localsSize: '0',
+                    codeItems: [
+                      { pc: 0, labelDef: 'L0:', instruction: { op: 'ldc', arg: '"hello"' } },
+                      { pc: 1, labelDef: 'L1:', instruction: 'areturn' },
+                    ],
+                    exceptionTable: [],
+                    attributes: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const effects = computeMethodEffects(ast);
+  const key = makeMethodKey('ConstHolder', 'literal', '()Ljava/lang/String;');
+  t.ok(effects.get(key).pure, 'ldc-only method should be pure');
+  t.equal(effects.get(key).impureReasons.size, 0, 'no impurity reasons should be recorded');
+  t.end();
+});

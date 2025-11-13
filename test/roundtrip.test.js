@@ -169,6 +169,8 @@ function stripLocMetadata(obj) {
 }
 
 // Tests from master branch (roundtrip tests for all classes in sources/)
+const PER_TEST_TIMEOUT_MS = Number.parseInt(process.env.ROUNDTRIP_CASE_TIMEOUT_MS || '120000', 10);
+
 const classNames = fs
   .readdirSync(sourcesDir)
   .filter((fileName) => fileName.endsWith('.class'))
@@ -181,6 +183,16 @@ classNames.forEach(className => {
     const jFilePath = path.join(tempDir, `${className}.j`);
     const tempClassFilePath = path.join(tempDir, `${className}.class`);
     const regeneratedClassFilePath = path.join(tempDir, `${className}.regenerated.class`);
+
+    let timeoutFired = false;
+    const timeoutHandle = setTimeout(() => {
+      timeoutFired = true;
+      t.fail(
+        `Roundtrip for ${className}.class exceeded ${PER_TEST_TIMEOUT_MS}ms timeout; ` +
+        'set ROUNDTRIP_CASE_TIMEOUT_MS to adjust.',
+      );
+      t.end();
+    }, PER_TEST_TIMEOUT_MS);
 
     try {
       // 1. Generate .j file from original .class file
@@ -235,11 +247,14 @@ classNames.forEach(className => {
     } catch (error) {
       t.fail(`Roundtrip test failed with an error: ${error.message}\n${error.stack}`);
     } finally {
+      clearTimeout(timeoutHandle);
       // Cleanup temporary files
       if (fs.existsSync(jFilePath)) fs.unlinkSync(jFilePath);
       if (fs.existsSync(tempClassFilePath)) fs.unlinkSync(tempClassFilePath);
       if (fs.existsSync(regeneratedClassFilePath)) fs.unlinkSync(regeneratedClassFilePath);
-      t.end();
+      if (!timeoutFired) {
+        t.end();
+      }
     }
   });
 });

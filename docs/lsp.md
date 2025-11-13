@@ -1,13 +1,14 @@
 # LSP Integration Guide
 
-This document explains how the JVM tools expose Language Server Protocol (LSP) features and how an editor or external client can integrate with them. The server follows the standard [Language Server Protocol](https://microsoft.github.io/language-server-protocol/specification) over JSON-RPC 2.0 and reuses the same analysis passes exposed via the CLI/MCP server (dead-code diagnostics, structural refactors, workspace queries).
+This document explains how the JVM tools expose Language Server Protocol (LSP) features and how an editor or external client can integrate with them. The server follows the standard [Language Server Protocol](https://microsoft.github.io/language-server-protocol/specification) over JSON-RPC 2.0, reuses the same analysis/assembly stack as the CLI + MCP tools (dead-code diagnostics, refactors, workspace queries), and ships as a plain Node.js script with no bundling required.
 
-The canonical implementation lives in the repository’s forthcoming `scripts/lsp-server.js` entry point and shares code with the in-process harness (`src/lsp/inProcessHarness.js`) that our unit tests use. This guide focuses on the protocol surface so client authors can start wiring up their editors even before we ship polished binaries.
+The canonical implementation lives in `scripts/lsp-server.js` and shares code with the in-process harness (`src/lsp/inProcessHarness.js`) that our unit tests use. This guide covers the transport, protocol surface, and roadmap so client authors can wire up editors confidently.
 
 ## Transport & Lifecycle
 
-- **Transport:** stdio with `Content-Length` headers, identical to every other LSP server.
-- **Initialization:** send the standard `initialize` request followed by `initialized`. Include any configuration data under `initializationOptions` (see below).
+- **Entry point:** `node scripts/lsp-server.js`
+- **Transport:** stdio with `Content-Length` headers (standard LSP framing).
+- **Initialization:** send the standard `initialize` request followed by `initialized`. Include configuration under `initializationOptions` if needed (see below).
 - **Shutdown:** use `shutdown` and `exit`.
 
 Example initialization request:
@@ -39,43 +40,45 @@ Example initialization request:
 
 Initialization options:
 
-| Option           | Type             | Description |
-| ---------------- | ---------------- | ----------- |
-| `classpath`      | `string[]`       | Roots to scan for `.class` files (defaults to `["sources"]`). Mirrors `--classpath` in the CLI/MCP server. |
-| `jvmCliPath`     | `string`         | Absolute/relative path to `scripts/jvm-cli.js`; used when shelling out for heavyweight transformations. |
-| `mcpServerPath`  | `string` _(opt)_ | Path to `scripts/mcp-server.js` if the client wants the LSP to delegate certain operations to the MCP JSON-RPC server. |
-| `diagnostics.fixOnSave` | `boolean` _(opt)_ | Enable auto-fix when `textDocument/willSaveWaitUntil` is supported; defaults to `false`. |
+| Option | Type | Description |
+| --- | --- | --- |
+| `classpath` | `string[]` | Roots to scan for `.class`/`.j` lookups (defaults to `["sources"]`). Mirrors `--classpath` for the CLI/MCP server. |
+| `jvmCliPath` | `string` | Path to `scripts/jvm-cli.js`; used when shelling out for heavyweight transforms. |
+| `mcpServerPath` | `string` _(opt)_ | Path to `scripts/mcp-server.js` if the client wants the LSP to delegate operations to the MCP JSON-RPC server. |
+| `diagnostics.fixOnSave` | `boolean` _(opt)_ | Planned toggle to auto-apply available fixes during `textDocument/willSaveWaitUntil`. |
 
-The server replies with capabilities roughly equivalent to:
+## Capabilities
+
+### Currently implemented
 
 ```json
 {
-  "capabilities": {
-    "textDocumentSync": 2,
-    "codeActionProvider": { "resolveProvider": false },
-    "renameProvider": { "prepareProvider": true },
-    "documentFormattingProvider": true,
-    "documentSymbolProvider": true,
-    "workspaceSymbolProvider": true,
-    "referencesProvider": true,
-    "executeCommandProvider": {
-      "commands": [
-        "jvm.applyDeadCodeFix",
-        "jvm.renameClass",
-        "jvm.renameMethod",
-        "jvm.disassembleSelection",
-        "jvm.assembleBuffer"
-      ]
-    }
-  }
+  "textDocumentSync": 1,
+  "documentFormattingProvider": true,
+  "definitionProvider": true,
+  "completionProvider": { "triggerCharacters": [" ", "\t", ":"] }
 }
 ```
 
+### Planned (already supported by CLI/MCP)
+
+| LSP Feature | Backing Tooling | Notes |
+| --- | --- | --- |
+| `textDocument/publishDiagnostics` | `jvm-cli lint`, MCP `lintDeadCode` | Diagnostics already include fix diffs; wiring to the LSP is next. |
+| `textDocument/codeAction` | MCP `lintDeadCode` | Quick fixes will invoke the same diff-producing command. |
+| `textDocument/references` | `workspace.methodCallers` / `workspace.fieldReferences` | Cross references already exist in the workspace metadata. |
+| `textDocument/rename` | `renameClass` / `renameMethod` | CLI-tested transforms will provide WorkspaceEdits. |
+| `documentSymbol`, `workspaceSymbol` | `KrakatauWorkspace` symbol APIs | Ready to expose. |
+
 ## Text Document Flow
 
-1. **Open:** send `textDocument/didOpen` with the full `.j` or `.class` contents. For `.class` files, the server disassembles on the fly (using the same logic as `scripts/jvm-cli.js disassemble`).
-2. **Incremental updates:** use `textDocument/didChange` with full-document sync (the server advertises `TextDocumentSyncKind.Full`).
-3. **Diagnostics:** after each change, the server runs `runDeadCodePass` on the in-memory AST. Diagnostics look like:
+1. **Open:** send `textDocument/didOpen` with the full `.j` contents. (`.class` buffers will be handled once diagnostics land; for now open the disassembled `.j` files generated by `jvm-cli disassemble --xref`.)
+2. **Change:** send `textDocument/didChange` with full-document sync (the server advertises `TextDocumentSyncKind.Full`).
+3. **Close:** send `textDocument/didClose` to release cached buffers and symbol indices.
+
+## Diagnostics (roadmap)
+
+The dead-code passes that power `jvm-cli lint` are already packaged as reusable modules, so LSP diagnostics will surface the same findings. Each diagnostic carries a structured diff and the command needed to apply it:
 
 ```json
 {
@@ -88,81 +91,104 @@ The server replies with capabilities roughly equivalent to:
       "message": "Dead handler/jump detected; handler body can be simplified.",
       "data": {
         "fixCommand": "jvm.applyDeadCodeFix",
-        "diff": "@@ ... (unified diff omitted for brevity)"
+        "diff": "@@ ... (unified diff)"
       }
     }
   ]
 }
 ```
 
-Clients can surface the diff to users or execute the referenced command to auto-fix.
+Until diagnostics are wired into the LSP, the CLI (`node scripts/jvm-cli.js lint --fix -n`) and MCP server provide the same analysis/fix data.
 
-## Formatting
+## Formatting (`textDocument/formatting`)
 
-The server advertises `textDocument/formatting` (full-document only). When requested, it reassembles the buffer using the same pipeline as `node scripts/jvm-cli.js format`:
+Formatting reuses the exact pipeline as `node scripts/jvm-cli.js format`:
 
-1. Parse the `.j` text via the Krakatau-compatible parser.
-2. Assemble it to bytecode to ensure verifier-correct ordering.
-3. Disassemble back to Jasmin using `unparseDataStructures`, which enforces canonical indentation, label spacing, and attribute layout.
+1. Parse the `.j` buffer via the Krakatau-compatible parser.
+2. Assemble and disassemble to normalize stack/local metadata and verify correctness.
+3. Emit canonical Jasmin with `unparseDataStructures`.
 
-Requests follow the standard shape:
+Indentation preferences from the client are ignored so every tool (CLI, MCP, LSP) produces the same layout (tabs for directives, 4-space instruction columns). Inline `;` comments and standalone comment lines survive the round-trip, so format-on-save is safe even for heavily annotated files.
 
-```json
-{
-  "textDocument": { "uri": "file:///MisplacedCatch.j" },
-  "options": { "tabSize": 4, "insertSpaces": true }
-}
-```
+## Go To Definition (`textDocument/definition`)
 
-Formatting currently ignores client-specific indentation settings; instead it produces the canonical layout (tabs for directives, 4-space instruction columns) so that CLI, MCP, and LSP workflows stay consistent. Existing `;` comments and blank comment-only lines are preserved by tracking their positions relative to the normalized code.
+The server currently resolves three symbol types:
 
-## Code Actions & Commands
+1. **Method invocations** – recognizes `invokevirtual`, `invokestatic`, `invokeinterface`, and `invokespecial`, matches on `class + name + descriptor`, and searches open documents before lazily loading `.j` siblings relative to the current file or `rootUri`. Plain-text signatures such as `ba.a(ILuf;)V` are also matched anywhere in the document (comments included).
+   - Plain-text signatures such as `ba.a(ILuf;)V` are also matched anywhere in the document (comments, data sections, attributes). If the cursor is inside the `Class.method(desc)` token, go-to-definition resolves it just like a real `invoke*` instruction.
+2. **Labels** – every label declared within the current `.method … .end method` block is indexed (no requirement that labels start with `L`). References like `goto start` or `ifne loop1` jump to their definitions even if they have obfuscated names.
+3. **Class declarations** – `.class public super Foo` lines are parsed so the last identifier (`Foo`) is indexed regardless of how many modifiers precede it.
 
-- **`textDocument/codeAction`:** When invoked for a diagnostic with `code === "dead-handler"`, the server returns a `CodeAction` that references `command: "jvm.applyDeadCodeFix"` alongside the file URI and current buffer version. Clients may invoke the command immediately or present it as a quick fix.
-- **`workspace/executeCommand`:** Available commands mirror the MCP server:
-  - `jvm.applyDeadCodeFix` → Applies dead-code eliminator; returns workspace edits derived from the diff.
-  - `jvm.renameClass` → Renames class references inside the current file; expects `{ uri, from, to }`.
-  - `jvm.renameMethod` → Renames a method and its call sites in the current file; expects `{ uri, className, from, to, descriptor? }`.
-  - `jvm.disassembleSelection` / `jvm.assembleBuffer` are utility commands for clients that want to show raw bytecode/Jasmin snippets.
+If a match is found, the server returns a standard `Location` array; otherwise it returns `null` per the LSP spec.
 
-Internally the server delegates to the same helpers used by the CLI (`runDeadCodePass`, `renameClassAst`, `renameMethodAst`) to keep behavior consistent.
+## Code Actions & Commands (roadmap)
 
-## Navigation Features
+Once diagnostics are hooked up, these commands will be surfaced via `workspace/executeCommand` and linked to code actions:
+
+| Command | Purpose |
+| --- | --- |
+| `jvm.applyDeadCodeFix` | Apply the diff produced by `runDeadCodePass`. |
+| `jvm.renameClass` | Rename a class and update references. |
+| `jvm.renameMethod` | Rename a method (with descriptor-aware matching) and its call sites. |
+| `jvm.disassembleSelection` | Utility command to show bytecode for a highlighted region. |
+| `jvm.assembleBuffer` | Assemble an edited Jasmin buffer back into bytecode. |
+
+Because these commands are already part of the MCP server, the LSP simply needs to forward the same JSON payloads.
+
+## Navigation & Metadata Roadmap
 
 | LSP Request | Backing Implementation | Notes |
-| ----------- | --------------------- | ----- |
-| `textDocument/documentSymbol` | `KrakatauWorkspace.listMethods/fields` | Returns both method and field symbols grouped by class. |
-| `workspace/symbol` | `workspace.listClasses` + symbol search | Allows cross-project symbol search by class/method name. |
-| `textDocument/references` | `KrakatauWorkspace.findReferences` | Requires classpath indexing; results include class+AST path. |
-| `textDocument/rename` | Combination of workspace rename + file-level transforms | For cross-file renames the server updates every affected URI and emits WorkspaceEdits. |
+| --- | --- | --- |
+| `textDocument/documentSymbol` | `KrakatauWorkspace.listMethods/fields` | Returns method + field symbols grouped by class. |
+| `workspace/symbol` | Workspace class index | Enables cross-project symbol search. |
+| `textDocument/references` | `workspace.methodCallers` / `workspace.fieldReferences` | Provides cross references for methods/fields using the classpath-aware workspace. |
+| `textDocument/rename` | Rename transforms + purity/throws metadata | Ensures only semantically safe renames are suggested. |
 
-Clients that only care about `.j` buffers can choose to implement a minimal subset (diagnostics + quick fixes) by watching for diagnostics with `data.diff`.
+## Completion (`textDocument/completion`)
+
+Two completion modes are available today:
+
+1. **Opcode mnemonics**
+   - Triggered automatically after whitespace or immediately following a label colon (`L0:`).
+   - Partial mnemonics (e.g., `ico`) filter down to matching opcodes such as `iconst_0`, `iconst_1`, etc.
+   - Completions are suppressed inside comments or when the cursor sits in the middle of an operand, so the server only suggests mnemonics where they make sense.
+   - Suggestions come directly from the opcode tables used by the assembler/runtime, so every JVM instruction is represented.
+
+2. **Method/Field references**
+   - Triggered in three contexts: `Class.member` signatures (even inside comments), `invoke* Method Foo bar ...` operands, and field operands for `getstatic/putstatic/getfield/putfield`.
+   - The server merges method metadata from open `.j` documents and any classpath roots specified via `initializationOptions.classpath` (e.g., your workspace + our embedded JRE stubs). That means method names from compiled dependencies show up even if their `.j` sources aren’t open.
+   - Field lookups follow the same rules, so `getstatic Field Foo c…` will suggest `counter` (with its descriptor) as soon as a workspace file defines it.
+   - Returned items include the descriptor in the `detail` field so editors can display the full signature while inserting only the symbol name.
+
+3. **String constants**
+   - Typing `ldc "He` (or `ldc_w`/`ldc2_w`) surfaces constant-pool strings harvested from the open buffers and any classpath roots. Handy for navigating obfuscated string tables without retyping the entire literal.
 
 ## Working with `.class` Files
 
-When a `.class` document is opened, the server disassembles it to Jasmin internally and tracks a virtual buffer. Diagnostics and code actions refer to the synthesized `.j` text. On save/apply-edits, the server re-assembles the modified AST back into bytecode using `writeClassAstToClassFile`. Clients do not need to handle the conversion themselves.
+The long-term plan is to allow `.class` buffers directly:
+
+1. Disassemble the opened bytecode using the same logic as `jvm-cli disassemble --xref`.
+2. Run diagnostics/formatting on the synthesized Jasmin.
+3. Reassemble modifications back into `.class` files before saving.
+
+Until then, pair the LSP with CLI workflows that keep `.j` files synchronized with their `.class` counterparts.
 
 ## Testing & Harness
 
-Use `src/lsp/inProcessHarness.js` to exercise the protocol surface without setting up a full LSP transport. The harness lets you:
+`src/lsp/inProcessHarness.js` spins up the LSP server inside the current process so tests (or client prototypes) can issue requests without sockets or subprocesses. Useful references:
 
-```javascript
-const { createInProcessLspHarness } = require('../src/lsp/inProcessHarness');
-const harness = createInProcessLspHarness({ createServer });
-await harness.initialize();
-await harness.notify('textDocument/didOpen', { /* ... */ });
-const diagnostics = harness.getNotifications();
-```
+- `test/lspHarness.test.js` – exercises initialization, open/change flows, and synthetic diagnostics.
+- `test/lspFormatting.test.js` – verifies formatting preserves comments and spacing.
 
-Our `test/lspHarness.test.js` file shows how diagnostics, code actions, and command executions are expected to behave.
+The harness exposes helpers for `initialize`, `shutdown`, arbitrary requests, and capturing notifications (diagnostics, logs, etc.).
 
 ## Summary Checklist for Client Authors
 
-1. Spawn the server (`node scripts/lsp-server.js`) with the project root as the working directory.
-2. Send a standard `initialize` request with `classpath` under `initializationOptions` if you need non-default lookups.
-3. Use full-document synchronization (`didOpen` + `didChange` with the entire text).
-4. Surface diagnostics tagged with `dead-handler` and present the provided quick fix (`jvm.applyDeadCodeFix`).
-5. Wire `textDocument/rename`, `documentSymbol`, `workspace/symbol`, and `textDocument/references` if your editor supports them.
-6. (Optional) expose the custom commands directly via command palettes to let users run refactors or disassemble buffers on demand.
+1. Launch `node scripts/lsp-server.js` from the repo root.
+2. Send `initialize` with `rootUri` (and `classpath` if you need cross-file lookups outside `sources/`).
+3. Use full-document `textDocument/didOpen` + `didChange` notifications.
+4. Wire `textDocument/formatting` to your editor’s “format document”.
+5. Wire `textDocument/definition` so users can jump to methods, labels, and `.class` declarations.
+6. Watch for upcoming diagnostics/code-action support; the request/response shapes documented above will remain stable once enabled.
 
-Following these conventions ensures that your client experiences the same behavior as the CLI, MCP server, and automated tests, with zero editor-specific logic baked into the tools themselves.
+Following this checklist keeps editor integrations consistent with the CLI, MCP server, and automated tests, while providing a clear path to richer features as they land.

@@ -210,6 +210,14 @@ node scripts/jvm-cli.js lint --fix examples/sources/jasmin/MisplacedCatch.j
 # Or write the fix to a separate file
 node scripts/jvm-cli.js lint --fix --out /tmp/MisplacedCatch.fixed.j examples/sources/jasmin/MisplacedCatch.j
 
+# Need cross-reference breadcrumbs plus purity/exception summaries in the resulting Jasmin? Add
+# `--xref-comments` and point the command at a classpath so it can index the surrounding workspace:
+node scripts/jvm-cli.js lint --fix --classpath sources --xref-comments examples/sources/jasmin/MisplacedCatch.j
+
+# Need the optimized Jasmin on stdout without touching the file? Pair `--fix` with `--stdout`
+# (and optionally `--classpath` / `--xref-comments`):
+node scripts/jvm-cli.js lint --fix --stdout examples/sources/jasmin/MisplacedCatch.j
+
 # npm shortcut
 npm run lint:jasmin -- --fix examples/sources/jasmin/MisplacedCatch.j
 ```

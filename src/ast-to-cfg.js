@@ -117,6 +117,16 @@ function findLeaders(instructions, exceptionTable = []) {
     }
   };
 
+  const addFallthroughLeader = (startIndex) => {
+    for (let cursor = startIndex; cursor < instructions.length; cursor += 1) {
+      const candidate = instructions[cursor];
+      if (candidate && candidate.pc !== undefined) {
+        leaders.add(candidate.pc);
+        break;
+      }
+    }
+  };
+
   for (let i = 0; i < instructions.length; i += 1) {
     const item = instructions[i];
     if (!item || !item.instruction) {
@@ -131,9 +141,7 @@ function findLeaders(instructions, exceptionTable = []) {
     const isConditionalJump = CONDITIONAL_JUMP_OPCODES.has(opcode);
 
     if (isUnconditionalJump || isConditionalJump) {
-      if (i + 1 < instructions.length && instructions[i + 1].pc !== undefined) {
-        leaders.add(instructions[i + 1].pc);
-      }
+      addFallthroughLeader(i + 1);
 
       const targets = getJumpTargets(opcode, item.instruction);
       for (const target of targets) {
@@ -216,24 +224,35 @@ function convertAstToCfg(method) {
     return pcToBlockId.get(targetPc) || null;
   };
 
+  const addJumpEdges = (fromBlock, instruction) => {
+    const targets = getJumpTargets(getOpcode(instruction), instruction);
+    for (const target of targets) {
+      const blockId = resolveLabelToBlock(target);
+      if (blockId) {
+        cfg.addEdge(fromBlock.id, blockId);
+      }
+    }
+  };
+
   for (const block of cfg.blocks.values()) {
-    const lastInstruction = findLastInstruction(block);
-    if (!lastInstruction || !lastInstruction.instruction) {
+    if (!block || !Array.isArray(block.instructions)) {
       continue;
     }
-
-    const opcode = getOpcode(lastInstruction.instruction);
-    if (!opcode) {
-      continue;
-    }
-
-    if (BLOCK_END_OPCODES.has(opcode) || CONDITIONAL_JUMP_OPCODES.has(opcode)) {
-      const targets = getJumpTargets(opcode, lastInstruction.instruction);
-      for (const target of targets) {
-        const blockId = resolveLabelToBlock(target);
-        if (blockId) {
-          cfg.addEdge(block.id, blockId);
-        }
+    for (const entry of block.instructions) {
+      if (!entry || !entry.instruction) {
+        continue;
+      }
+      const opcode = getOpcode(entry.instruction);
+      if (!opcode) {
+        continue;
+      }
+      if (CONDITIONAL_JUMP_OPCODES.has(opcode)) {
+        addJumpEdges(block, entry.instruction);
+        continue;
+      }
+      if (BLOCK_END_OPCODES.has(opcode)) {
+        addJumpEdges(block, entry.instruction);
+        break;
       }
     }
   }
