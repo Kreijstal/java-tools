@@ -9,7 +9,7 @@ test('Test stepping functionality shows the issue', async ({ page }) => {
 
   console.log('=== Loading Hello.class ===');
   await page.selectOption('#sampleClassSelect', 'Hello.class');
-  await page.click('#loadSampleBtn');
+  await page.click('#loadBtn');
   await page.waitForTimeout(2000);
 
   console.log('=== Starting debugging ===');

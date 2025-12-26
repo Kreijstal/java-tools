@@ -8,7 +8,7 @@ test('debug sequential loading issue', async ({ page }) => {
 
   console.log('=== Loading Calculator.class ===');
   await page.selectOption('#sampleClassSelect', 'Calculator.class');
-  await page.click('#loadSampleBtn');
+  await page.click('#loadBtn');
   await page.waitForTimeout(2000);
 
   const output = await page.locator('#output').textContent();
