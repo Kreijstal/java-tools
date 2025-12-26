@@ -8,6 +8,7 @@
 // Constants for commonly used DOM element IDs
 const DOM_IDS = {
   DEBUG_BTN: "debugBtn",
+  RUN_BTN: "runBtn",
   SAMPLE_CLASS_SELECT: "sampleClassSelect",
   DISASSEMBLY_EDITOR: "disassembly-editor",
   STATE_FILE_INPUT: "stateFileInput",
@@ -15,6 +16,7 @@ const DOM_IDS = {
   STATUS: "status",
   STACK_DISPLAY: "stackDisplay",
   LOCALS_DISPLAY: "localsDisplay",
+  CALLSTACK_DISPLAY: "callStackDisplay",
   EXECUTION_STATE: "executionState",
   CLASS_FILE_INPUT: "classFileInput",
   BREAKPOINT_INPUT: "breakpointInput",
@@ -52,6 +54,8 @@ let aceEditor = null;
 let xtermTerminal = null;
 let xtermFitAddon = null;
 let useXtermOutput = false;
+let methodBrowserData = [];
+let selectedMethodElement = null;
 
 /**
  * Set up AWT integration for browser environment
@@ -149,7 +153,7 @@ function setupBrowserSystemOverride() {
 
   // Use the new generic override system to override ONLY the <clinit> constructor
   // This approach is cleaner and more surgical than replacing the entire class
-  jvm.registerJreOverrides({
+  const overrides = {
     "java/lang/System": {
       methods: {
         // Override only the static constructor to provide browser-specific System.out/err
@@ -198,6 +202,21 @@ function setupBrowserSystemOverride() {
         // Note: We don't override getProperty, exit, or other methods - they remain as-is from System.js
       },
     },
+    "java/io/ConsoleOutputStream": {
+      methods: {
+        "write(I)V": (jvm, obj, args) => {
+          const byte = args[0];
+          const char = String.fromCharCode(byte);
+          if (obj.writer) {
+            obj.writer(char);
+            return;
+          }
+
+          const browserWriter = createBrowserWriter("stdout");
+          browserWriter(char);
+        },
+      },
+    },
     "java/lang/Runtime": {
       methods: {
         // Browser-compatible Runtime method overrides with reasonable fallbacks
@@ -219,31 +238,15 @@ function setupBrowserSystemOverride() {
         },
       },
     },
-  });
-
-  // ALSO use the older registerJreMethods for println to make sure it works in both paths
-  // This ensures browser output works regardless of which override method is used
-  // Override ConsoleOutputStream write method to capture all output at the stream level
-  jvm.registerJreMethods({
-    "java/io/ConsoleOutputStream": {
-      "write(I)V": (jvm, obj, args) => {
-        const byte = args[0];
-        const char = String.fromCharCode(byte);
-
-        // Use the appropriate browser writer based on which stream this is
-        let writerType = "stdout";
-        // Try to determine if this is stderr by checking if the writer function matches stderr behavior
-        if (obj.writer && obj.writer.toString().includes("stderr")) {
-          writerType = "stderr";
-        }
-
-        const browserWriter = createBrowserWriter(writerType);
-        browserWriter(char);
-
-
-      },
-    },
-  });
+  };
+  jvm.registerJreOverrides(overrides);
+  jvmDebug.debugController.options.jreOverrides = overrides;
+  if (jvm.classes["java/lang/System"] && overrides["java/lang/System"]) {
+    const clinit = overrides["java/lang/System"].methods["<clinit>()V"];
+    if (clinit) {
+      clinit(jvm, null, [], null);
+    }
+  }
 
   log(
     "Browser System constructor (<clinit>) override installed using generic JVM override system!",
@@ -260,13 +263,19 @@ function setupBrowserSystemOverride() {
  */
 async function initializeXterm() {
   try {
+    if (xtermTerminal) {
+      return true;
+    }
+
     // Use XTerm from local files (available as global objects)
     const Terminal = window.Terminal;
     // FitAddon is exported as an object with FitAddon property due to UMD module structure
     /* HARDENED: Replaced defensive optional chaining with direct access */
     const FitAddon = window.FitAddon.FitAddon;
 
-    /* HARDENED: Removed defensive check */
+    if (!Terminal || !FitAddon) {
+      return false;
+    }
 
     // Create terminal instance
     xtermTerminal = new Terminal({
@@ -337,6 +346,10 @@ async function initializeXterm() {
         xtermTitle.nextSibling,
       );
     }
+    if (xtermContainer.dataset.xtermInitialized === "true") {
+      return true;
+    }
+    xtermContainer.dataset.xtermInitialized = "true";
 
     // Open terminal in container
     xtermTerminal.open(xtermContainer);
@@ -430,10 +443,24 @@ function setupXtermInput() {
  * Create xterm-based output writer with ANSI support
  */
 function createXtermWriter(type = "stdout") {
+  let prevWasCR = false;
   return (char) => {
     if (xtermTerminal && useXtermOutput) {
-      // Write directly to xterm, which handles ANSI escape codes
-      xtermTerminal.write(char);
+      // Normalize newlines to CRLF so cursor resets to column 0
+      if (char === "\n") {
+        if (prevWasCR) {
+          xtermTerminal.write("\n");
+        } else {
+          xtermTerminal.write("\r\n");
+        }
+        prevWasCR = false;
+      } else if (char === "\r") {
+        xtermTerminal.write("\r");
+        prevWasCR = true;
+      } else {
+        xtermTerminal.write(char);
+        prevWasCR = false;
+      }
 
       // Also log to console for debugging
       if (typeof console !== "undefined" && console.log && char === "\n") {
@@ -459,7 +486,7 @@ function setupBrowserSystemOverrideWithXterm() {
   const errWriter = createXtermWriter("stderr");
 
   // Use the same override system but with xterm writers
-  jvm.registerJreOverrides({
+  const overrides = {
     "java/lang/System": {
       methods: {
         "<clinit>()V": (jvm, _, args, thread) => {
@@ -511,6 +538,19 @@ function setupBrowserSystemOverrideWithXterm() {
         },
       },
     },
+    "java/io/ConsoleOutputStream": {
+      methods: {
+        "write(I)V": (jvm, obj, args) => {
+          const byte = args[0];
+          const char = String.fromCharCode(byte);
+          if (obj.writer) {
+            obj.writer(char);
+            return;
+          }
+          outWriter(char);
+        },
+      },
+    },
     "java/lang/Runtime": {
       methods: {
         // Browser-compatible Runtime method overrides with reasonable fallbacks
@@ -532,23 +572,15 @@ function setupBrowserSystemOverrideWithXterm() {
         },
       },
     },
-  });
-
-  // Override println to work with XTerm
-  // Override ConsoleOutputStream write method for XTerm output
-  jvm.registerJreMethods({
-    "java/io/ConsoleOutputStream": {
-      "write(I)V": (jvm, obj, args) => {
-        const byte = args[0];
-        const char = String.fromCharCode(byte);
-
-        // Use XTerm writer for output with ANSI support
-        outWriter(char);
-
-       
-      },
-    },
-  });
+  };
+  jvm.registerJreOverrides(overrides);
+  jvmDebug.debugController.options.jreOverrides = overrides;
+  if (jvm.classes["java/lang/System"] && overrides["java/lang/System"]) {
+    const clinit = overrides["java/lang/System"].methods["<clinit>()V"];
+    if (clinit) {
+      clinit(jvm, null, [], null);
+    }
+  }
 
   log("Browser System override with XTerm support installed!", "success");
   log(
@@ -569,14 +601,16 @@ async function setupXtermIntegration() {
         "XTerm.js initialized for Java program output - DOM logging available for general messages",
         "info",
       );
-    } else {
-      log(
-        "XTerm.js not available - using DOM output for both Java and logging",
-        "info",
-      );
+      return true;
     }
+    log(
+      "XTerm.js not available - using DOM output for both Java and logging",
+      "info",
+    );
+    return false;
   } catch (error) {
     logError("XTerm integration setup failed", error);
+    return false;
   }
 }
 
@@ -608,6 +642,19 @@ function updateStatus(message, type = "info") {
   log(message, type);
 }
 
+function setDebugControlsVisible(isVisible) {
+  const debugRow = document.querySelector(".debug-row");
+  if (!debugRow) {
+    return;
+  }
+
+  if (isVisible) {
+    debugRow.classList.remove("is-hidden");
+  } else {
+    debugRow.classList.add("is-hidden");
+  }
+}
+
 function updateState(updates) {
   Object.assign(currentState, updates);
   // Reduced verbosity: Only log important state changes, not all debug updates
@@ -627,13 +674,23 @@ function updateButtons() {
   const state = jvmDebug.getCurrentState();
   const isPaused = state.executionState === "paused";
   const isRunning = state.executionState === "running";
+  const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
+  const hasSampleSelection = !!(sampleSelect && sampleSelect.value);
+  const hasSamplesLoaded = !!(sampleSelect && sampleSelect.options.length > 1);
   const hasLoadedClass =
-    currentState.loadedClass !== null || state.method !== null;
+    currentState.loadedClass !== null ||
+    state.method !== null ||
+    hasSampleSelection ||
+    hasSamplesLoaded;
 
   // Debug button should be enabled when we have a class and not currently debugging
   const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
   /* HARDENED: Removed defensive check */
   debugBtn.disabled = !hasLoadedClass || isPaused || isRunning;
+
+  const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
+  /* HARDENED: Removed defensive check */
+  runBtn.disabled = !hasLoadedClass || isPaused || isRunning;
 
   // Step buttons should be enabled only when paused
   STEP_BUTTON_IDS.forEach((id) => {
@@ -746,11 +803,12 @@ async function initializeJVM() {
         await jvmDebug.initialize();
         log("JVM debug environment initialized", "success");
 
-        // Set up browser-specific System class override
-        setupBrowserSystemOverride();
-
-        // Set up XTerm integration
-        await setupXtermIntegration();
+        // Set up XTerm integration first (prefer XTerm for Java output)
+        const xtermReady = await setupXtermIntegration();
+        if (!xtermReady) {
+          // Fall back to DOM-based System.out/err if XTerm isn't available
+          setupBrowserSystemOverride();
+        }
 
         // Set up AWT integration for browser-based canvas rendering
         setupAWTIntegration();
@@ -760,6 +818,7 @@ async function initializeJVM() {
           "success",
         );
         await populateSampleClasses();
+        await initializeMethodBrowser();
       } catch (err) {
         log(`Failed to load data package: ${err.message}`, "error");
         log("JVM initialization failed - mock functions will remain active", "error");
@@ -790,7 +849,7 @@ async function initializeJVM() {
 
     // Initialize state and welcome message
     updateState(currentState);
-    log('Click "Start Debugging" to begin', "info");
+    log('Click "Start & Break" to debug, or Run to execute', "info");
   } catch (error) {
     logError("Failed to initialize real JVM", error);
     log("JVM initialization failed completely - mock functions will remain active", "error");
@@ -852,19 +911,282 @@ async function populateSampleClasses() {
         samplesHeading &&
         samplesHeading.textContent.includes("Sample Classes")
       ) {
-        samplesHeading.textContent = `📚 Sample Classes (${availableClasses.length} available) - or upload your own .class/.jar files`;
+        samplesHeading.textContent = `📚 Sample Classes`;
       }
 
-      // Enable the Start Debugging button now that sample classes are available
+      // Enable the Start & Break button now that sample classes are available
       const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
       if (debugBtn) {
         debugBtn.disabled = false;
-        log("Start Debugging button enabled - sample classes ready", "info");
+        log("Start & Break button enabled - sample classes ready", "info");
+      }
+
+      const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
+      if (runBtn) {
+        runBtn.disabled = false;
       }
     } catch (error) {
       logError("Failed to populate sample classes", error);
       throw error; // Don't hide the error with fallbacks
     }
+  }
+}
+
+function parseDescriptorType(descriptor, startIndex) {
+  let index = startIndex;
+  let arrayDepth = 0;
+
+  while (descriptor[index] === "[") {
+    arrayDepth += 1;
+    index += 1;
+  }
+
+  const typeChar = descriptor[index];
+  let typeName;
+
+  switch (typeChar) {
+    case "B":
+      typeName = "byte";
+      index += 1;
+      break;
+    case "C":
+      typeName = "char";
+      index += 1;
+      break;
+    case "D":
+      typeName = "double";
+      index += 1;
+      break;
+    case "F":
+      typeName = "float";
+      index += 1;
+      break;
+    case "I":
+      typeName = "int";
+      index += 1;
+      break;
+    case "J":
+      typeName = "long";
+      index += 1;
+      break;
+    case "S":
+      typeName = "short";
+      index += 1;
+      break;
+    case "Z":
+      typeName = "boolean";
+      index += 1;
+      break;
+    case "V":
+      typeName = "void";
+      index += 1;
+      break;
+    case "L": {
+      const endIndex = descriptor.indexOf(";", index);
+      const rawName = descriptor.slice(index + 1, endIndex);
+      typeName = rawName.replace(/\//g, ".");
+      index = endIndex + 1;
+      break;
+    }
+    default:
+      typeName = "unknown";
+      index += 1;
+      break;
+  }
+
+  for (let i = 0; i < arrayDepth; i += 1) {
+    typeName += "[]";
+  }
+
+  return { typeName, nextIndex: index };
+}
+
+function formatMethodSignature(methodName, descriptor, className) {
+  if (!descriptor || descriptor[0] !== "(") {
+    return methodName;
+  }
+
+  let index = 1;
+  const args = [];
+  while (descriptor[index] !== ")" && index < descriptor.length) {
+    const parsed = parseDescriptorType(descriptor, index);
+    args.push(parsed.typeName);
+    index = parsed.nextIndex;
+  }
+
+  const displayName =
+    methodName === "<init>"
+      ? (className || "constructor").split(".").pop()
+      : methodName;
+
+  return `${displayName}(${args.join(", ")})`;
+}
+
+function getVisibilityClass(accessFlags) {
+  if (accessFlags & 0x0001) {
+    return "vis-public";
+  }
+  if (accessFlags & 0x0002) {
+    return "vis-private";
+  }
+  if (accessFlags & 0x0004) {
+    return "vis-protected";
+  }
+  return "vis-default";
+}
+
+async function buildMethodBrowserData() {
+  methodBrowserData = [];
+  if (!jvmDebug) {
+    return;
+  }
+
+  const files = await jvmDebug.listFiles();
+  const classFiles = files.filter((file) => file.endsWith(".class"));
+
+  for (const file of classFiles) {
+    try {
+      const className = file.replace(/\.class$/, "").replace(/\//g, ".");
+      const methods = await jvmDebug.getClassMethods(file);
+
+      const constructors = methods.filter((method) => method.name === "<init>");
+      const regularMethods = methods.filter(
+        (method) => method.name !== "<init>" && method.name !== "<clinit>",
+      );
+      const staticInit = methods.filter((method) => method.name === "<clinit>");
+
+      methodBrowserData.push({
+        className,
+        constructors,
+        methods: regularMethods,
+        staticInit,
+      });
+    } catch (error) {
+      console.error(`Method browser failed to parse ${file}`, error);
+    }
+  }
+}
+
+function renderMethodBrowser(filterQuery = "") {
+  const tree = document.getElementById("method-tree");
+  if (!tree) {
+    return;
+  }
+
+  const query = filterQuery.trim().toLowerCase();
+  tree.innerHTML = "";
+
+  const createMethodItem = (method, className) => {
+    const item = document.createElement("li");
+    item.className = "method-item";
+    const signature = formatMethodSignature(method.name, method.descriptor, className);
+    item.dataset.method = signature.toLowerCase();
+    item.dataset.className = className.toLowerCase();
+
+    const dot = document.createElement("span");
+    dot.className = `vis-dot ${getVisibilityClass(method.accessFlags)}`;
+
+    const label = document.createElement("span");
+    label.textContent = signature;
+
+    item.appendChild(dot);
+    item.appendChild(label);
+
+    item.addEventListener("click", () => {
+      if (selectedMethodElement) {
+        selectedMethodElement.classList.remove("selected");
+      }
+      item.classList.add("selected");
+      selectedMethodElement = item;
+      window.selectedMethodSignature = signature;
+      window.selectedMethodClass = className;
+    });
+
+    return item;
+  };
+
+  methodBrowserData.forEach((entry) => {
+    const classMatches = entry.className.toLowerCase().includes(query);
+    const classDetails = document.createElement("details");
+    classDetails.className = "method-class";
+    classDetails.open = query.length === 0;
+
+    const summary = document.createElement("summary");
+    summary.textContent = entry.className;
+    classDetails.appendChild(summary);
+
+    const categorySections = [
+      { title: "Constructors", items: entry.constructors },
+      { title: "Methods", items: entry.methods },
+    ];
+
+    if (entry.staticInit.length > 0) {
+      categorySections.push({ title: "Static Init", items: entry.staticInit });
+    }
+
+    let totalVisible = 0;
+
+    categorySections.forEach((section) => {
+      if (!section.items.length) {
+        return;
+      }
+      const category = document.createElement("div");
+      category.className = "method-category";
+
+      const list = document.createElement("ul");
+      list.className = "method-list";
+      let labelAttached = false;
+
+      section.items.forEach((method) => {
+        const item = createMethodItem(method, entry.className);
+        const methodMatches = item.dataset.method.includes(query);
+        const showItem = query.length === 0 || classMatches || methodMatches;
+        item.style.display = showItem ? "flex" : "none";
+        if (showItem) {
+          totalVisible += 1;
+          if (!labelAttached) {
+            const label = document.createElement("span");
+            label.className = "method-category-label";
+            label.textContent = section.title;
+            item.appendChild(label);
+            labelAttached = true;
+          }
+        }
+        list.appendChild(item);
+      });
+
+      category.style.display = list.querySelector('[style*="flex"]') ? "block" : "none";
+      category.appendChild(list);
+      classDetails.appendChild(category);
+    });
+
+    if (query.length > 0 && totalVisible === 0 && !classMatches) {
+      return;
+    }
+
+    tree.appendChild(classDetails);
+  });
+
+  if (!methodBrowserData.length) {
+    tree.textContent = "No classes available.";
+  }
+}
+
+async function initializeMethodBrowser() {
+  const tree = document.getElementById("method-tree");
+  if (!tree || !jvmDebug) {
+    return;
+  }
+
+  tree.textContent = "Loading classes...";
+  await buildMethodBrowserData();
+  renderMethodBrowser();
+
+  const search = document.getElementById("method-search");
+  if (search) {
+    search.addEventListener("input", (event) => {
+      renderMethodBrowser(event.target.value);
+    });
   }
 }
 
@@ -912,6 +1234,11 @@ async function loadSampleClass() {
     if (debugBtn) {
       debugBtn.disabled = false;
     }
+    const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
+    if (runBtn) {
+      runBtn.disabled = false;
+    }
+    setDebugControlsVisible(false);
 
     // Update ACE editor to show actual disassembled bytecode
     if (window.aceEditor) {
@@ -924,7 +1251,7 @@ async function loadSampleClass() {
         // Fallback to placeholder if disassembly fails
         const className = selectedClass.replace(".class", "");
         window.aceEditor.setValue(
-          `// BROWSER-UI ERROR - Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start Debugging' to begin execution`,
+          `// BROWSER-UI ERROR - Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start & Break' to debug, or Run to execute`,
           -1,
         );
         logError("Failed to disassemble class", error);
@@ -970,6 +1297,180 @@ function updateDisassemblyStateInfo(view) {
   }
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function getTypeInfo(value) {
+  if (value === null) {
+    return { label: "NULL", detail: "null" };
+  }
+  if (value === undefined) {
+    return { label: "UNDEF", detail: "undefined" };
+  }
+  if (typeof value === "bigint") {
+    return { label: "LONG", detail: "long" };
+  }
+  if (typeof value === "number") {
+    return {
+      label: Number.isInteger(value) ? "INT" : "DOUBLE",
+      detail: "number",
+    };
+  }
+  if (typeof value === "boolean") {
+    return { label: "BOOL", detail: "boolean" };
+  }
+  if (typeof value === "string") {
+    return { label: "REF", detail: "java/lang/String" };
+  }
+  if (typeof value === "object") {
+    if (value.type) {
+      return { label: "REF", detail: value.type };
+    }
+    if (Array.isArray(value)) {
+      return { label: "REF", detail: "array" };
+    }
+    return { label: "REF", detail: "object" };
+  }
+  return {
+    label: String(typeof value).toUpperCase(),
+    detail: String(typeof value),
+  };
+}
+
+function formatValue(value) {
+  if (value === null) {
+    return "null";
+  }
+  if (value === undefined) {
+    return "undefined";
+  }
+  if (typeof value === "string") {
+    return `"${value}"`;
+  }
+  if (typeof value === "bigint") {
+    return `${value}n`;
+  }
+  if (typeof value === "object") {
+    if (value instanceof String) {
+      return `"${String(value)}"`;
+    }
+    if (value.array && typeof value.array.length === "number") {
+      const preview = Array.from(value.array).slice(0, 8).join(", ");
+      const suffix = value.array.length > 8 ? ", …" : "";
+      return `Array(${value.array.length}) [${preview}${suffix}]`;
+    }
+    if (value.type) {
+      return value.type;
+    }
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return value.toString();
+    }
+  }
+  return String(value);
+}
+
+function renderStackTable(values) {
+  if (!values || values.length === 0) {
+    return "Empty";
+  }
+
+  const rows = values
+    .map((value, index) => {
+      const typeInfo = getTypeInfo(value);
+      const valueText = formatValue(value);
+      const valueTitle = `${typeInfo.detail} | ${valueText}`;
+      return `<tr>
+        <td>${index}</td>
+        <td title="${escapeHtml(typeInfo.detail)}">${escapeHtml(
+        typeInfo.label,
+      )}</td>
+        <td class="value" title="${escapeHtml(valueTitle)}">${escapeHtml(
+        valueText,
+      )}</td>
+      </tr>`;
+    })
+    .join("");
+
+  return `<table class="state-table">
+    <thead>
+      <tr><th>#</th><th>Type</th><th>Value</th></tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderLocalsTable(values, names) {
+  if (!values || values.length === 0) {
+    return "No locals";
+  }
+  const rows = values
+    .map((value, index) => {
+      const typeInfo = getTypeInfo(value);
+      const name = names && names[index] ? names[index] : `local${index}`;
+      const valueText = formatValue(value);
+      const valueTitle = `${typeInfo.detail} | ${valueText}`;
+      return `<tr>
+        <td>${index}</td>
+        <td>${escapeHtml(name)}</td>
+        <td title="${escapeHtml(typeInfo.detail)}">${escapeHtml(
+        typeInfo.label,
+      )}</td>
+        <td class="value" title="${escapeHtml(valueTitle)}">${escapeHtml(
+        valueText,
+      )}</td>
+      </tr>`;
+    })
+    .join("");
+
+  return `<table class="state-table">
+    <thead>
+      <tr><th>Slot</th><th>Name</th><th>Type</th><th>Value</th></tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+function renderCallStackTable(frames) {
+  if (!frames || frames.length === 0) {
+    return "No frames";
+  }
+  const rows = frames
+    .map((frame) => {
+      const className = frame.className || "UnknownClass";
+      const methodName = frame.methodName || "unknown";
+      const descriptor = frame.methodDescriptor || "()V";
+      const label = `${className}.${methodName}${descriptor}`;
+      const rowClass = frame.isCurrentFrame ? "call-stack-current" : "";
+      const args =
+        frame.arguments && frame.arguments.length > 0
+          ? `Args: ${frame.arguments.map(formatValue).join(", ")}`
+          : "Args: none";
+      const tooltip = `${label}\n${args}`;
+      return `<tr class="${rowClass}">
+        <td>#${frame.frameIndex}</td>
+        <td class="value" title="${escapeHtml(tooltip)}">${escapeHtml(
+        label,
+      )}</td>
+      </tr>`;
+    })
+    .join("");
+
+  return `<table class="state-table call-stack-frame">
+    <thead>
+      <tr><th>Frame</th><th>Method</th></tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
 // Debug Display Updates
 function updateDebugDisplay() {
   if (!jvmDebug) return;
@@ -1007,55 +1508,23 @@ function updateDebugDisplay() {
     // Update stack display
     const stackDiv = document.getElementById(DOM_IDS.STACK_DISPLAY);
     if (stackDiv) {
-      const stackDisplay =
-        state.stack
-          .map((value, index) => {
-            let displayValue;
-            if (value === null || value === undefined) {
-              displayValue = "null";
-            } else if (typeof value === "string") {
-              displayValue = `"${value}"`;
-            } else if (typeof value === "object") {
-              // Handle objects properly instead of showing [object Object]
-              try {
-                displayValue = JSON.stringify(value);
-              } catch (e) {
-                displayValue = value.toString();
-              }
-            } else {
-              displayValue = value.toString();
-            }
-            return `${index}: ${displayValue}`;
-          })
-          .join("\n") || "Empty";
-      stackDiv.textContent = stackDisplay;
+      stackDiv.innerHTML = renderStackTable(state.stack);
     }
 
     // Update locals display
     const localsDiv = document.getElementById(DOM_IDS.LOCALS_DISPLAY);
     if (localsDiv) {
-      const localsDisplay =
-        state.locals
-          .map((value, index) => {
-            let displayValue;
-            if (value === null || value === undefined) {
-              displayValue = "undefined";
-            } else if (typeof value === "string") {
-              displayValue = `"${value}"`;
-            } else if (typeof value === "object") {
-              // Handle objects properly instead of showing [object Object]
-              try {
-                displayValue = JSON.stringify(value);
-              } catch (e) {
-                displayValue = value.toString();
-              }
-            } else {
-              displayValue = value.toString();
-            }
-            return `local_${index}: ${displayValue}`;
-          })
-          .join("\n") || "No locals";
-      localsDiv.textContent = localsDisplay;
+      const names =
+        jvmDebug.getAvailableVariableNames &&
+        jvmDebug.getAvailableVariableNames();
+      localsDiv.innerHTML = renderLocalsTable(state.locals, names);
+    }
+
+    // Update call stack display
+    const callStackDiv = document.getElementById(DOM_IDS.CALLSTACK_DISPLAY);
+    if (callStackDiv && jvmDebug.getBacktrace) {
+      const frames = jvmDebug.getBacktrace();
+      callStackDiv.innerHTML = renderCallStackTable(frames);
     }
 
     // Update disassembly view with clean content and external state display
@@ -1069,7 +1538,8 @@ function updateDebugDisplay() {
         // log(`Got disassembly view`, 'debug');
 
         if (view && view.formattedDisassembly) {
-          if (window.aceEditor) {
+          const editor = window.aceEditor || aceEditor;
+          if (editor) {
             // Reduced verbosity: Only log in verbose mode
             // log('Updating disassembly content', 'debug');
 
@@ -1118,16 +1588,16 @@ function updateDebugDisplay() {
 
             // Set clean content
             const cleanContent = cleanLines.join("\n");
-            aceEditor.setValue(cleanContent, -1);
+            editor.setValue(cleanContent, -1);
 
             // Highlight current execution line using ACE's built-in highlighting
-            aceEditor.session.clearBreakpoints();
+            editor.session.clearBreakpoints();
             if (currentExecutionLine !== -1) {
-              aceEditor.session.setBreakpoint(
+              editor.session.setBreakpoint(
                 currentExecutionLine,
                 "ace_execution_line",
               );
-              aceEditor.scrollToLine(currentExecutionLine + 1, true, true);
+              editor.scrollToLine(currentExecutionLine + 1, true, true);
             }
 
             // Update external disassembly state info in HTML
@@ -1175,14 +1645,10 @@ function initializeEditor() {
       throw new Error("Editor container not found");
     }
 
-    // Set minimum height to ensure editor is visible
-    if (
-      editorContainer.style.height === "" ||
-      editorContainer.offsetHeight === 0
-    ) {
-      editorContainer.style.height = "300px";
-      editorContainer.style.minHeight = "300px";
-    }
+    // Let the editor flex to fill available panel height
+    editorContainer.style.flex = "1 1 auto";
+    editorContainer.style.minHeight = "0";
+    editorContainer.style.height = "100%";
 
     aceEditor = ace.edit(DOM_IDS.DISASSEMBLY_EDITOR);
 
@@ -1211,6 +1677,9 @@ function initializeEditor() {
 
     // Make editor instance available globally
     window.aceEditor = aceEditor;
+
+    // Ensure ACE matches the container size after layout
+    requestAnimationFrame(() => aceEditor.resize(true));
 
     log("ACE editor initialized successfully", "success");
 
@@ -1311,36 +1780,32 @@ function enhanceWithRealJVM() {
 
   log("jvmDebug is available - proceeding with function overrides", "info");
 
+  async function resolveClassToStart() {
+    // First priority: Use the currently loaded class from state
+    if (currentState.loadedClass && currentState.loadedClass.name) {
+      return currentState.loadedClass.name;
+    }
+
+    // Second priority: Check if a sample class is currently selected
+    const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
+    if (sampleSelect && sampleSelect.value) {
+      return sampleSelect.value;
+    }
+
+    // Last resort: Use the first available class from loaded classes
+    const availableClasses = await jvmDebug.listFiles();
+    if (availableClasses.length > 0) {
+      return availableClasses[0];
+    }
+
+    return null;
+  }
+
   // Override startDebugging to work with real JVM and sample classes
   window.startDebugging = async function () {
     try {
       // Determine which class to start with
-      let classToStart = null;
-
-      // First priority: Use the currently loaded class from state
-      if (currentState.loadedClass && currentState.loadedClass.name) {
-        classToStart = currentState.loadedClass.name;
-        // Reduced verbosity: Only log in verbose mode
-        // log(`Using loaded class: ${classToStart}`, 'debug');
-      } else {
-        // Second priority: Check if a sample class is currently selected
-        const sampleSelect = document.getElementById(
-          DOM_IDS.SAMPLE_CLASS_SELECT,
-        );
-        if (sampleSelect && sampleSelect.value) {
-          classToStart = sampleSelect.value;
-          // Reduced verbosity: Only log in verbose mode
-          // log(`Using selected class: ${classToStart}`, 'debug');
-        } else {
-          // Last resort: Use the first available class from loaded classes
-          const availableClasses = await jvmDebug.listFiles();
-          if (availableClasses.length > 0) {
-            classToStart = availableClasses[0];
-            // Reduced verbosity: Only log in verbose mode
-            // log(`Using available class: ${classToStart}`, 'debug');
-          }
-        }
-      }
+      const classToStart = await resolveClassToStart();
 
       if (!classToStart) {
         log(
@@ -1353,6 +1818,7 @@ function enhanceWithRealJVM() {
       // Strip .class extension if present since DebugController expects class name only
       const className = classToStart.endsWith('.class') ? classToStart.replace('.class', '') : classToStart;
       log(`Starting debug session with class: ${className}`, "info");
+      setDebugControlsVisible(true);
       const result = await jvmDebug.start(className);
       updateDebugDisplay();
 
@@ -1378,6 +1844,37 @@ function enhanceWithRealJVM() {
         );
       } else {
         throw error;
+      }
+    }
+  };
+
+  window.runProgram = async function () {
+    const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
+    try {
+      const classToRun = await resolveClassToStart();
+      if (!classToRun) {
+        log("No class available to run. Please load a class first.", "error");
+        return;
+      }
+
+      const className = classToRun.endsWith(".class")
+        ? classToRun.replace(".class", "")
+        : classToRun;
+
+      if (runBtn) {
+        runBtn.disabled = true;
+      }
+
+      setDebugControlsVisible(false);
+      updateStatus(`Running ${className}...`, "info");
+      await jvmDebug.run(className);
+      updateStatus(`Program ${className} completed`, "success");
+    } catch (error) {
+      logError("Run failed", error);
+      updateStatus("Program failed to run", "error");
+    } finally {
+      if (runBtn) {
+        runBtn.disabled = false;
       }
     }
   };
@@ -1476,6 +1973,12 @@ function enhanceWithRealJVM() {
 
   // Export jvmDebug to window for testing and external access
   window.jvmDebug = jvmDebug;
+
+  // Override any mock helpers defined in the HTML template
+  window.updateButtons = window.__realUpdateButtons || updateButtons;
+  window.updateState = window.__realUpdateState || updateState;
+  window.loadSampleClass = window.__realLoadSampleClass || loadSampleClass;
+  window.loadClassFile = window.__realLoadClassFile || loadClassFile;
 }
 
 // File Loading
@@ -1531,8 +2034,13 @@ function loadClassFile() {
       const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
       if (debugBtn) {
         debugBtn.disabled = false;
-        log("Start Debugging button enabled", "info");
+        log("Start & Break button enabled", "info");
       }
+      const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
+      if (runBtn) {
+        runBtn.disabled = false;
+      }
+      setDebugControlsVisible(false);
     } catch (error) {
       logError(`Failed to load ${fileName}`, error);
     }
@@ -1629,6 +2137,10 @@ function clearAllBreakpoints() {
 window.log = log;
 window.updateStatus = updateStatus;
 window.updateState = updateState;
+window.__realUpdateButtons = updateButtons;
+window.__realUpdateState = updateState;
+window.__realLoadSampleClass = loadSampleClass;
+window.__realLoadClassFile = loadClassFile;
 window.updateButtons = updateButtons;
 window.loadSampleClass = loadSampleClass;
 window.loadClassFile = loadClassFile;
@@ -1643,5 +2155,3 @@ window.setupXtermIntegration = setupXtermIntegration;
 
 // Initialize when DOM is ready
 document.addEventListener("DOMContentLoaded", initializeJVM);
-
-

@@ -28,33 +28,77 @@
         .main-container { 
             display: grid; 
             grid-template-columns: 3fr 2fr; 
-            gap: 20px; 
-            margin-top: 20px;
+            gap: 14px; 
+            margin-top: 14px;
             width: 100%;
         }
         
         .debugger-panel { 
             display: flex; 
             flex-direction: column; 
-            gap: 10px; 
+            gap: 12px; 
+            min-height: 0;
         }
         
         .state-panel-stack { 
             display: flex; 
             flex-direction: column; 
-            gap: 20px; 
+            gap: 14px; 
         }
         
         .panel {
             background-color: #252526;
             border: 1px solid #3e3e42;
-            padding: 15px;
+            padding: 12px;
             border-radius: 5px;
         }
         
         .panel h3 {
             margin-top: 0;
             color: #569cd6;
+        }
+
+        .panel h4 {
+            margin: 6px 0 8px;
+            font-size: 13px;
+            color: #9cdcfe;
+        }
+
+        .state-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+        }
+
+        .state-table th,
+        .state-table td {
+            padding: 6px 8px;
+            border-bottom: 1px solid #333;
+            text-align: left;
+            vertical-align: top;
+            white-space: nowrap;
+        }
+
+        .state-table th {
+            color: #9cdcfe;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            font-size: 10px;
+        }
+
+        .state-table td.value {
+            white-space: pre-wrap;
+            word-break: break-word;
+            width: 100%;
+        }
+
+        .call-stack-frame {
+            table-layout: fixed;
+        }
+
+        .call-stack-current {
+            background: rgba(86, 156, 214, 0.15);
         }
         
         .controls {
@@ -63,14 +107,38 @@
         
         .button-group {
             display: flex;
-            gap: 10px;
-            margin-bottom: 10px;
+            gap: 8px;
+            margin-bottom: 8px;
             flex-wrap: wrap;
+        }
+
+        .source-row {
+            flex-wrap: nowrap;
+            align-items: center;
+        }
+
+        .source-toggle {
+            display: inline-flex;
+            gap: 10px;
+            align-items: center;
+            font-size: 12px;
+            margin: 0 10px 0 0;
+        }
+
+        .source-toggle label {
+            display: inline-flex;
+            gap: 6px;
+            align-items: center;
+            cursor: pointer;
+        }
+
+        .is-hidden {
+            display: none !important;
         }
         
         .breakpoint-input {
             width: 80px;
-            padding: 8px;
+            padding: 6px;
             border: 1px solid #3e3e42;
             background-color: #1e1e1e;
             color: #d4d4d4;
@@ -83,7 +151,7 @@
             background-color: #1e1e1e;
             border: 1px solid #3e3e42;
             border-radius: 3px;
-            padding: 8px;
+            padding: 6px;
             font-family: inherit;
             font-size: 12px;
         }
@@ -101,28 +169,40 @@
         #classFileInput::file-selector-button:hover {
             background-color: #1177bb;
         }
-            grid-column: 1 / -1;
-        }
         
         #disassembly-editor { 
             width: 100%; 
-            height: 60vh; 
+            height: 300px;
+            flex: 1 1 auto;
+            min-height: 220px;
             border: 1px solid #3e3e42; 
             border-radius: 5px; 
         }
         
-        .debug-controls { 
-            display: flex; 
-            gap: 8px; 
-            margin-bottom: 10px; 
-            flex-wrap: wrap;
+        .debug-row {
+            display: flex;
+            gap: 12px;
             align-items: center;
+            flex-wrap: nowrap;
+            margin-bottom: 6px;
+        }
+
+        .debug-row .button-group {
+            margin-bottom: 0;
+        }
+
+        .debug-controls { 
+            display: inline-flex; 
+            gap: 6px; 
+            flex-wrap: nowrap;
+            align-items: center;
+            width: fit-content;
         }
         
         .debug-controls button { 
-            font-size: 1.2em; 
-            padding: 8px 12px; 
-            min-width: 40px;
+            font-size: 1.05em; 
+            padding: 6px 10px; 
+            min-width: 36px;
             background-color: #0e639c;
             color: white;
             border: none;
@@ -137,6 +217,46 @@
         .debug-controls button:disabled {
             background-color: #3e3e42;
             cursor: not-allowed;
+        }
+
+        .sample-download {
+            float: right;
+            width: fit-content;
+            margin: 0 0 8px 12px;
+            padding: 6px 8px;
+            border: 1px solid #3e3e42;
+            border-radius: 4px;
+            background: #1f1f1f;
+            max-width: 240px;
+        }
+
+        .sample-download summary {
+            cursor: pointer;
+            color: #9cdcfe;
+            font-size: 12px;
+            list-style: none;
+        }
+
+        .sample-download summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .sample-download .download-note {
+            color: #888;
+            font-size: 11px;
+            margin: 6px 0 0;
+        }
+
+        .breakpoint-controls {
+            display: inline-flex;
+            align-items: center;
+            flex-wrap: nowrap;
+        }
+
+        .controls::after {
+            content: "";
+            display: block;
+            clear: both;
         }
         
         .ace_gutter-cell.ace_breakpoint { 
@@ -225,6 +345,119 @@
             white-space: pre-wrap;
             max-width: 400px;
         }
+
+        .method-browser {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            min-height: 160px;
+        }
+
+        .disassembly-panel {
+            display: flex;
+            flex-direction: column;
+            min-height: 260px;
+        }
+
+        .method-search {
+            width: 100%;
+            padding: 6px 8px;
+            border: 1px solid #3e3e42;
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            border-radius: 3px;
+            font-family: inherit;
+            font-size: 12px;
+        }
+
+        .method-tree {
+            border: 1px solid #3e3e42;
+            border-radius: 3px;
+            background: #1e1e1e;
+            padding: 8px;
+            max-height: 340px;
+            overflow: auto;
+            font-size: 12px;
+        }
+
+        .method-class {
+            margin-bottom: 8px;
+        }
+
+        .method-class > summary {
+            cursor: pointer;
+            color: #9cdcfe;
+            font-weight: 600;
+            list-style: none;
+        }
+
+        .method-class > summary::-webkit-details-marker {
+            display: none;
+        }
+
+        .method-category {
+            margin: 6px 0 4px 14px;
+            position: relative;
+            padding-left: 86px;
+        }
+
+        .method-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+
+        .method-item {
+            position: relative;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 6px;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+
+        .method-category-label {
+            position: absolute;
+            left: -86px;
+            top: 0;
+            width: 80px;
+            color: #6a9955;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+
+        .method-item:hover {
+            background: #2a2a2a;
+        }
+
+        .method-item.selected {
+            background: #094771;
+        }
+
+        .vis-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            flex: 0 0 auto;
+        }
+
+        .vis-public {
+            background: #3fb950;
+        }
+
+        .vis-private {
+            background: #f85149;
+        }
+
+        .vis-protected {
+            background: #d29922;
+        }
+
+        .vis-default {
+            background: #8b949e;
+        }
         
         .status {
             padding: 10px;
@@ -275,35 +508,36 @@
         <h3>Debug Controls</h3>
         <div id="status" class="status">Ready - No program loaded</div>
         
-        <!-- Class Loading Section -->
-        <div class="button-group">
-            <input type="file" id="classFileInput" accept=".class" style="margin-right: 10px;">
-            <button onclick="loadClassFile()" id="loadBtn">Load Class</button>
-            <button onclick="startDebugging()" id="debugBtn" disabled>Start Debugging</button>
-        </div>
-        
-        <!-- Sample Class Loading Section - populated dynamically -->
-        <h4>📚 Sample Classes - or upload your own .class/.jar files</h4>
-        <div class="button-group">
-            <select id="sampleClassSelect" style="color: #d4d4d4; background-color: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; padding: 8px; font-family: inherit; font-size: 12px; margin-right: 10px;">
+        <!-- Class Source -->
+        <h4>📚 Sample Classes</h4>
+        <div class="button-group source-row">
+            <div class="source-toggle">
+                <label><input type="radio" name="classSource" value="sample" checked onclick="setClassSource('sample')"> Sample</label>
+                <label><input type="radio" name="classSource" value="file" onclick="setClassSource('file')"> File</label>
+            </div>
+            <select id="sampleClassSelect" style="color: #d4d4d4; background-color: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; padding: 6px; font-family: inherit; font-size: 12px; margin-right: 10px;">
                 <option value="">Loading sample classes...</option>
             </select>
-            <button onclick="loadSampleClass()" id="loadSampleBtn">Load Sample</button>
+            <input type="file" id="classFileInput" accept=".class,.jar" class="is-hidden" style="margin-right: 10px;" title="Upload .class or .jar files">
+            <button onclick="loadSelectedClass()" id="loadBtn">Load</button>
+            <button onclick="runProgram()" id="runBtn" disabled title="Run without debugging">▶ Run</button>
+            <button onclick="startDebugging()" id="debugBtn" disabled>Start &amp; Break</button>
         </div>
         
         <!-- Debug Execution Controls -->
-        <div class="debug-controls">
-            <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>▶️</button>
-            <button onclick="stepOver()" id="stepOverBtn" title="Step Over (F10)" disabled>↷</button>
-            <button onclick="stepInto()" id="stepIntoBtn" title="Step Into (F11)" disabled>↪️</button>
-            <button onclick="stepOut()" id="stepOutBtn" title="Step Out (Shift+F11)" disabled>↩️</button>
-            <button onclick="finish()" id="finishBtn" title="Finish Method" disabled>⏩</button>
-            <button onclick="stepInstruction()" id="stepInstructionBtn" title="Step Instruction" disabled>📶</button>
-            <button onclick="rewind()" id="rewindBtn" title="Rewind (Undo Last Step)" disabled>⏪</button>
-        </div>
-        
-        <!-- Breakpoints and State Management -->
-        <div class="button-group">
+        <div class="debug-row is-hidden">
+            <div class="debug-controls">
+                <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>▶️</button>
+                <button onclick="stepOver()" id="stepOverBtn" title="Step Over (F10)" disabled>↷</button>
+                <button onclick="stepInto()" id="stepIntoBtn" title="Step Into (F11)" disabled>↪️</button>
+                <button onclick="stepOut()" id="stepOutBtn" title="Step Out (Shift+F11)" disabled>↩️</button>
+                <button onclick="finish()" id="finishBtn" title="Finish Method" disabled>⏩</button>
+                <button onclick="stepInstruction()" id="stepInstructionBtn" title="Step Instruction" disabled>↯</button>
+                <button onclick="rewind()" id="rewindBtn" title="Rewind (Undo Last Step)" disabled>⏪</button>
+            </div>
+
+            <!-- Breakpoints and State Management -->
+            <div class="button-group breakpoint-controls">
             <input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" min="0">
             <button onclick="setBreakpoint()">Set Breakpoint</button>
             <button onclick="clearAllBreakpoints()">Clear All Breakpoints</button>
@@ -311,14 +545,22 @@
             <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">📂</button>
             <input type="file" id="stateFileInput" style="display: none;" accept=".json">
         </div>
+        </div>
     </div>
 
     <!-- Main UI Layout with IDE-style interface -->
     <div class="main-container">
         <!-- Left Column: Debugger -->
-        <div class="debugger-panel panel">
-            <h3>Disassembly View</h3>
-            <div id="disassembly-editor"></div>
+        <div class="debugger-panel">
+            <div class="panel method-browser">
+                <h3>Method Browser</h3>
+                <input type="text" id="method-search" class="method-search" placeholder="Search classes or methods">
+                <div id="method-tree" class="method-tree">Loading classes...</div>
+            </div>
+            <div class="panel disassembly-panel">
+                <h3>Disassembly View</h3>
+                <div id="disassembly-editor"></div>
+            </div>
         </div>
 
         <!-- Right Column: State & Output -->
@@ -340,6 +582,10 @@
                 <div id="localsDisplay" class="state-display">No locals</div>
             </div>
             <div class="panel">
+                <h3>Call Stack</h3>
+                <div id="callStackDisplay" class="state-display">No frames</div>
+            </div>
+            <div class="panel">
                 <h3>Output Console</h3>
                 <div id="output" class="output"></div>
             </div>
@@ -350,9 +596,7 @@
         // Real JVM debug controller integration
         // The real debug functions (stepInstruction, stepInto, stepOver, etc.) are now provided by browser-ui-enhancements.js
         // This file was converted from using mock debug functionality to real JVM debug controller integration
-        
-        let aceEditor = null;
-        let currentState = {
+        let uiState = {
             status: 'stopped',
             pc: null,
             stack: [],
@@ -368,20 +612,26 @@
         // stepCount removed - was part of mock implementation
         
         function initializeEditor() {
+            if (window.aceEditor) {
+                return;
+            }
             try {
-                aceEditor = ace.edit("disassembly-editor");
-                aceEditor.setTheme("ace/theme/monokai");
-                aceEditor.session.setMode("ace/mode/text");
-                aceEditor.setReadOnly(true);
-                aceEditor.renderer.setShowGutter(true);
-                aceEditor.renderer.setPadding(10);
-                aceEditor.setOptions({ 
+                if (!window.ace) {
+                    throw new Error('Ace editor not loaded');
+                }
+                window.aceEditor = ace.edit("disassembly-editor");
+                window.aceEditor.setTheme("ace/theme/monokai");
+                window.aceEditor.session.setMode("ace/mode/text");
+                window.aceEditor.setReadOnly(true);
+                window.aceEditor.renderer.setShowGutter(true);
+                window.aceEditor.renderer.setPadding(10);
+                window.aceEditor.setOptions({ 
                     highlightActiveLine: false, 
                     highlightGutterLine: false,
                     fontSize: 12
                 });
 
-                aceEditor.setValue('Load a class to see disassembly...', -1);
+                window.aceEditor.setValue('Load a class to see disassembly...', -1);
             } catch (e) {
                 // Fallback if Ace editor fails to load
                 document.getElementById('disassembly-editor').innerHTML = 
@@ -404,34 +654,71 @@
         }
         
         function updateState(newState) {
-            currentState = { ...currentState, ...newState };
+            uiState = { ...uiState, ...newState };
             
             const stateDisplay = document.getElementById('executionState');
-            stateDisplay.innerHTML = `
-                <div><span class="key">Status:</span> <span class="value">${currentState.status}</span></div>
-                <div><span class="key">PC:</span> <span class="value">${currentState.pc ?? '-'}</span></div>
-                <div><span class="key">Stack:</span> <span class="value">[${currentState.stack.join(', ')}]</span></div>
-                <div><span class="key">Locals:</span> <span class="value">[${currentState.locals.join(', ')}]</span></div>
-                <div><span class="key">Call Depth:</span> <span class="value">${currentState.callDepth}</span></div>
-                <div><span class="key">Method:</span> <span class="value">${currentState.method || '-'}</span></div>
-                <div><span class="key">Breakpoints:</span> <span class="value">[${currentState.breakpoints.join(', ')}]</span></div>
-            `;
+            stateDisplay.innerHTML = [
+                `<div><span class="key">Status:</span> <span class="value">${uiState.status}</span></div>`,
+                `<div><span class="key">PC:</span> <span class="value">${uiState.pc ?? '-'}</span></div>`,
+                `<div><span class="key">Stack:</span> <span class="value">[${uiState.stack.join(', ')}]</span></div>`,
+                `<div><span class="key">Locals:</span> <span class="value">[${uiState.locals.join(', ')}]</span></div>`,
+                `<div><span class="key">Call Depth:</span> <span class="value">${uiState.callDepth}</span></div>`,
+                `<div><span class="key">Method:</span> <span class="value">${uiState.method || '-'}</span></div>`,
+                `<div><span class="key">Breakpoints:</span> <span class="value">[${uiState.breakpoints.join(', ')}]</span></div>`
+            ].join('');
             
             const stackDisplay = document.getElementById('stackDisplay');
-            stackDisplay.textContent = currentState.stack.length > 0 ? 
-                currentState.stack.join(', ') : 'Empty';
+            if (uiState.stack.length > 0) {
+                stackDisplay.innerHTML = `
+                    <table class="state-table">
+                        <thead>
+                            <tr><th>#</th><th>Type</th><th>Value</th></tr>
+                        </thead>
+                        <tbody>
+                            ${uiState.stack.map((value, index) => `
+                                <tr>
+                                    <td>${index}</td>
+                                    <td>${typeof value}</td>
+                                    <td class="value">${value}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } else {
+                stackDisplay.textContent = 'Empty';
+            }
                 
             const localsDisplay = document.getElementById('localsDisplay');
-            localsDisplay.textContent = currentState.locals.length > 0 ? 
-                currentState.locals.join(', ') : 'No locals';
+            if (uiState.locals.length > 0) {
+                localsDisplay.innerHTML = `
+                    <table class="state-table">
+                        <thead>
+                            <tr><th>Slot</th><th>Name</th><th>Type</th><th>Value</th></tr>
+                        </thead>
+                        <tbody>
+                            ${uiState.locals.map((value, index) => `
+                                <tr>
+                                    <td>${index}</td>
+                                    <td>local${index}</td>
+                                    <td>${typeof value}</td>
+                                    <td class="value">${value}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } else {
+                localsDisplay.textContent = 'No locals';
+            }
             
             updateButtons();
         }
         
         function updateButtons() {
-            const isPaused = currentState.status === 'paused';
-            const isRunning = currentState.status === 'running';
-            const hasLoadedClass = currentState.loadedClass !== null;
+            const isPaused = uiState.status === 'paused';
+            const isRunning = uiState.status === 'running';
+            const hasLoadedClass = uiState.loadedClass !== null;
             
             document.getElementById('stepIntoBtn').disabled = !isPaused;
             document.getElementById('stepOverBtn').disabled = !isPaused;
@@ -439,6 +726,28 @@
             document.getElementById('continueBtn').disabled = !isPaused;
             document.getElementById('finishBtn').disabled = !isPaused;
             document.getElementById('debugBtn').disabled = !hasLoadedClass || isPaused || isRunning;
+        }
+
+        function setClassSource(source) {
+            const fileInput = document.getElementById('classFileInput');
+            const sampleSelect = document.getElementById('sampleClassSelect');
+
+            if (source === 'file') {
+                fileInput.classList.remove('is-hidden');
+                sampleSelect.classList.add('is-hidden');
+            } else {
+                sampleSelect.classList.remove('is-hidden');
+                fileInput.classList.add('is-hidden');
+            }
+        }
+
+        function loadSelectedClass() {
+            const source = document.querySelector('input[name="classSource"]:checked')?.value || 'sample';
+            if (source === 'file') {
+                loadClassFile();
+            } else {
+                loadSampleClass();
+            }
         }
         
         function loadClassFile() {
@@ -463,19 +772,19 @@
                 // Extract class name from filename
                 const className = file.name.replace('.class', '');
                 
-                currentState.loadedClass = {
+                uiState.loadedClass = {
                     name: className,
                     data: uint8Array,
                     filename: file.name
                 };
-                currentState.className = className;
+                uiState.className = className;
                 
                 updateStatus(`Class loaded: ${className}`, 'success');
                 log(`Successfully loaded ${file.name} (${uint8Array.length} bytes)`, 'success');
                 
                 // Update disassembly view
-                if (aceEditor) {
-                    aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
+                if (window.aceEditor) {
+                    window.aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start & Break' to debug, or Run to execute`, -1);
                 }
                 
                 updateButtons();
@@ -512,19 +821,19 @@
                 .then(arrayBuffer => {
                     const uint8Array = new Uint8Array(arrayBuffer);
                     
-                    currentState.loadedClass = {
+                    uiState.loadedClass = {
                         name: className,
                         data: uint8Array,
                         filename: `${className}.class`
                     };
-                    currentState.className = className;
+                    uiState.className = className;
                     
                     updateStatus(`Sample class loaded: ${className}`, 'success');
                     log(`Successfully loaded ${className}.class (${uint8Array.length} bytes)`, 'success');
                     
                     // Update disassembly view
-                    if (aceEditor) {
-                        aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start Debugging' to begin execution`, -1);
+                    if (window.aceEditor) {
+                        window.aceEditor.setValue(`// Bytecode for ${className}\n// Click 'Start & Break' to debug, or Run to execute`, -1);
                     }
                     
                     updateButtons();
@@ -581,12 +890,12 @@
                 return;
             }
             
-            if (currentState.breakpoints.includes(pc)) {
+            if (uiState.breakpoints.includes(pc)) {
                 log(`Breakpoint already exists at PC=${pc}`, 'error');
                 return;
             }
             
-            const newBreakpoints = [...currentState.breakpoints, pc].sort((a, b) => a - b);
+            const newBreakpoints = [...uiState.breakpoints, pc].sort((a, b) => a - b);
             updateState({ breakpoints: newBreakpoints });
             
             log(`Breakpoint set at PC=${pc}`, 'success');
@@ -599,27 +908,27 @@
         }
         
         function serializeState() {
-            if (!currentState.loadedClass) {
+            if (!uiState.loadedClass) {
                 log('No class loaded to serialize', 'error');
                 return;
             }
             
-            const className = currentState.className;
+            const className = uiState.className;
             serializedState = {
                 jvmState: {
                     frames: [{
                         methodRef: { className: className, methodName: 'main', methodDescriptor: '([Ljava/lang/String;)V' },
-                        stack: currentState.stack,
-                        locals: currentState.locals,
-                        pc: currentState.pc
+                        stack: uiState.stack,
+                        locals: uiState.locals,
+                        pc: uiState.pc
                     }],
                     classes: { [className]: {} },
                     debugMode: true,
-                    breakpoints: currentState.breakpoints,
+                    breakpoints: uiState.breakpoints,
                     stepMode: null
                 },
-                executionState: currentState.status,
-                loadedClass: currentState.loadedClass
+                executionState: uiState.status,
+                loadedClass: uiState.loadedClass
             };
             
             const stateSize = JSON.stringify(serializedState).length;
@@ -654,8 +963,8 @@
                         
                         // Restore class if included in state
                         if (serializedState.loadedClass) {
-                            currentState.loadedClass = serializedState.loadedClass;
-                            currentState.className = serializedState.loadedClass.name;
+                            uiState.loadedClass = serializedState.loadedClass;
+                            uiState.className = serializedState.loadedClass.name;
                         }
                         
                         // Restore JVM state
@@ -672,8 +981,8 @@
                         updateStatus('State restored successfully', 'success');
                         log(`JVM state restored from ${file.name}`, 'success');
                         
-                        if (currentState.loadedClass) {
-                            log(`Restored class: ${currentState.className}`, 'success');
+                        if (uiState.loadedClass) {
+                            log(`Restored class: ${uiState.className}`, 'success');
                         }
                     } catch (error) {
                         log(`Failed to restore state: ${error.message}`, 'error');
@@ -683,10 +992,19 @@
             });
         });
         
+        const sourceInputs = document.querySelectorAll('input[name="classSource"]');
+        sourceInputs.forEach((input) => {
+            input.addEventListener('change', (event) => {
+                setClassSource(event.target.value);
+            });
+        });
+        const selectedSource = document.querySelector('input[name="classSource"]:checked')?.value || 'sample';
+        setClassSource(selectedSource);
+
         // Initialize
-        updateState(currentState);
+        updateState(uiState);
         log('JVM Debug API Example loaded', 'info');
-        log('Click "Start Debugging" to begin', 'info');
+        log('Click "Start & Break" to debug, or Run to execute', 'info');
     </script>
 </body>
 </html>
