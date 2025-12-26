@@ -1822,6 +1822,10 @@ function enhanceWithRealJVM() {
       // Strip .class extension if present since DebugController expects class name only
       const className = classToStart.endsWith('.class') ? classToStart.replace('.class', '') : classToStart;
       log(`Starting debug session with class: ${className}`, "info");
+
+      // Clean up any previous applet DOM elements before starting new session
+      cleanupAppletDOM();
+
       setDebugControlsVisible(true);
       const result = await jvmDebug.start(className);
       updateDebugDisplay();
@@ -1868,6 +1872,9 @@ function enhanceWithRealJVM() {
       if (runBtn) {
         runBtn.disabled = true;
       }
+
+      // Clean up any previous applet DOM elements before running new program
+      cleanupAppletDOM();
 
       setDebugControlsVisible(false);
       updateStatus(`Running ${className}...`, "info");
@@ -2058,6 +2065,28 @@ function clearOutput() {
   if (output) {
     output.innerHTML = "";
     log("Output console cleared.", "info");
+  }
+}
+
+/**
+ * Clean up applet DOM elements from previous sessions.
+ * This removes old canvas elements and applet roots to prevent
+ * multiple applets from running simultaneously.
+ */
+function cleanupAppletDOM() {
+  // Remove all applet root divs (each applet creates one)
+  const awtContainer = document.getElementById("awt-container");
+  if (awtContainer) {
+    // Remove all children (applet roots, canvases, etc.)
+    while (awtContainer.firstChild) {
+      awtContainer.removeChild(awtContainer.firstChild);
+    }
+  }
+
+  // Also clear the systemOutput div if it exists (applet console output)
+  const systemOutput = document.getElementById("systemOutput");
+  if (systemOutput) {
+    systemOutput.innerHTML = "";
   }
 }
 
