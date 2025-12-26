@@ -106,6 +106,34 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Run a class without debugging (execute to completion).
+   * @param {string} classPath - Path to the class file (virtual path) or class name
+   * @param {object} options - Run options
+   * @returns {Promise<object>} - Run result
+   */
+  async run(classPath, options = {}) {
+    if (!this.isReady) {
+      throw new Error('JVM Debug not initialized. Call initialize() first.');
+    }
+
+    try {
+      this.debugController.reset();
+      const className = classPath.endsWith('.class')
+        ? classPath.replace('.class', '')
+        : classPath;
+
+      this.debugController.executionState = 'running';
+      await this.debugController.jvm.run(className, options);
+      this.debugController.executionState = 'stopped';
+      return { status: 'completed' };
+    } catch (error) {
+      this.debugController.executionState = 'stopped';
+      console.error('Failed to run class:', error);
+      throw new Error(`Run failed: ${error.message}`);
+    }
+  }
+
+  /**
    * Continue execution
    * @returns {object} - Execution result
    */
@@ -262,6 +290,14 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Get available variable names for locals
+   * @returns {Array} - Local variable names
+   */
+  getAvailableVariableNames() {
+    return this.debugController.getAvailableVariableNames();
+  }
+
+  /**
    * List available files in virtual file system
    * @returns {Promise<Array>} - File list
    */
@@ -313,6 +349,34 @@ class BrowserJVMDebug {
       /* HARDENED: Replaced quiet failure with an explicit error */
       throw new Error(`Error disassembling class: ${error.message}`, { cause: error });
     }
+  }
+
+  /**
+   * Get method metadata for a class file in the virtual file system.
+   * @param {string} classPath - Virtual file path or class name
+   * @returns {Promise<Array>} - Array of method metadata
+   */
+  async getClassMethods(classPath) {
+    const normalizedPath = classPath.endsWith(".class")
+      ? classPath
+      : `${classPath}.class`;
+    const classData = await this.fileProvider.readFile(normalizedPath);
+    const { getAST } = require("jvm_parser");
+    const { convertJson } = require("./convert_tree");
+
+    const ast = getAST(classData);
+    const converted = convertJson(ast.ast, ast.constantPool);
+    const items =
+      (converted.classes && converted.classes[0] && converted.classes[0].items) ||
+      [];
+
+    return items
+      .filter((item) => item.type === "method")
+      .map((item) => ({
+        name: item.method.name,
+        descriptor: item.method.descriptor,
+        accessFlags: item.method.accessFlags || 0,
+      }));
   }
 
   /**

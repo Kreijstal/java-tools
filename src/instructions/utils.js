@@ -2,10 +2,10 @@ function _aload(frame) {
   const index = frame.stack.pop();
   const arrayRef = frame.stack.pop();
 
-  if (arrayRef === null) {
+  if (arrayRef === null || arrayRef === undefined) {
     throw {
       type: "java/lang/NullPointerException",
-      message: "",
+      message: `Attempted to load from null array in ${frame.method.name}`,
     };
   }
 
@@ -25,10 +25,10 @@ function _astore(frame) {
   const index = frame.stack.pop();
   const arrayRef = frame.stack.pop();
 
-  if (arrayRef === null) {
+  if (arrayRef === null || arrayRef === undefined) {
     throw {
       type: "java/lang/NullPointerException",
-      message: "",
+      message: `Attempted to store into null array in ${frame.method.name}`,
     };
   }
 

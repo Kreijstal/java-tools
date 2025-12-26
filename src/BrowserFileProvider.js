@@ -18,7 +18,17 @@ class BrowserFileProvider extends FileProvider {
    * @returns {Promise<boolean>} - True if file exists
    */
   async exists(filePath) {
-    return this.virtualFS.has(filePath);
+    const normalized = this.normalizePath(filePath);
+    if (this.virtualFS.has(normalized)) {
+      return true;
+    }
+    if (normalized.startsWith('./')) {
+      return this.virtualFS.has(normalized.slice(2));
+    }
+    if (normalized.startsWith('/')) {
+      return this.virtualFS.has(normalized.slice(1));
+    }
+    return false;
   }
 
   /**
@@ -27,7 +37,14 @@ class BrowserFileProvider extends FileProvider {
    * @returns {Promise<Uint8Array>} - File content as bytes
    */
   async readFile(filePath) {
-    const content = this.virtualFS.get(filePath);
+    const normalized = this.normalizePath(filePath);
+    let content = this.virtualFS.get(normalized);
+    if (!content && normalized.startsWith('./')) {
+      content = this.virtualFS.get(normalized.slice(2));
+    }
+    if (!content && normalized.startsWith('/')) {
+      content = this.virtualFS.get(normalized.slice(1));
+    }
     if (!content) {
       throw new Error(`File not found: ${filePath}`);
     }

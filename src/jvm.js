@@ -678,6 +678,7 @@ class JVM {
     // Find and call constructor
     const constructorMethod = this.findMethod({ ast: this.classes[className].ast }, '<init>', '()V');
     if (constructorMethod) {
+      mainThread.status = "runnable";
       const constructorFrame = new Frame(constructorMethod);
       constructorFrame.className = className;
       constructorFrame.locals[0] = appletObj;
@@ -694,6 +695,7 @@ class JVM {
     // Call init() method if it exists
     const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
     if (initMethod) {
+      mainThread.status = "runnable";
       const initFrame = new Frame(initMethod);
       initFrame.className = className;
       initFrame.locals[0] = appletObj;
@@ -710,6 +712,7 @@ class JVM {
     // Call start() method if it exists
     const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
     if (startMethod) {
+      mainThread.status = "runnable";
       const startFrame = new Frame(startMethod);
       startFrame.className = className;
       startFrame.locals[0] = appletObj;
@@ -726,6 +729,7 @@ class JVM {
     // Call repaint() to trigger paint method
     const repaintMethod = this.jre['java/applet/Applet'].methods['repaint()V'];
     if (repaintMethod) {
+      mainThread.status = "runnable";
       await repaintMethod(this, appletObj, []);
     }
   }

@@ -100,13 +100,20 @@ function addBreakpointUI(htmlContent) {
  */
 function updateFileInputs(htmlContent) {
     // Update file input to accept both .class and .jar files
-    const fileInputPattern = /(<input type="file" id="classFileInput" accept="\.class"[^>]*>)/;
-    htmlContent = htmlContent.replace(fileInputPattern, '<input type="file" id="classFileInput" accept=".class,.jar" style="margin-right: 10px;" title="Upload .class or .jar files">');
-    
-    // Update the load button text to reflect unified functionality
-    const loadButtonPattern = /(<button onclick="loadClassFile\(\)" id="loadBtn">)Load Class(<\/button>)/;
-    htmlContent = htmlContent.replace(loadButtonPattern, '$1Upload Custom File$2');
-    
+    const fileInputPattern = /<input type="file" id="classFileInput"([^>]*)>/;
+    htmlContent = htmlContent.replace(fileInputPattern, (match, attrs) => {
+        let updatedAttrs = attrs;
+        if (/accept=/.test(updatedAttrs)) {
+            updatedAttrs = updatedAttrs.replace(/accept="[^"]*"/, 'accept=".class,.jar"');
+        } else {
+            updatedAttrs += ' accept=".class,.jar"';
+        }
+        if (!/title=/.test(updatedAttrs)) {
+            updatedAttrs += ' title="Upload .class or .jar files"';
+        }
+        return `<input type="file" id="classFileInput"${updatedAttrs}>`;
+    });
+
     return htmlContent;
 }
 
@@ -137,27 +144,23 @@ function addDataZipDownloadSection(htmlContent) {
     const sampleClassesPattern = /(<h4>📚 Sample Classes[^<]*<\/h4>)/;
     const downloadSection = `
         <!-- Data Package Download Section for GitHub Pages -->
-        <h3>📚 Getting Sample .class Files to Try</h3>
-        <p>Download the complete sample class files package to try different examples locally:</p>
-        <div class="button-group">
-            <a href="./data.zip" download="java-class-samples.zip" style="
-                display: inline-block; 
-                background-color: #0e639c; 
-                color: white; 
-                padding: 8px 16px; 
-                text-decoration: none; 
-                border-radius: 3px; 
-                font-family: inherit; 
-                font-size: 12px;
-                border: none;
-            ">📦 Download data.zip</a>
-            <span style="margin-left: 10px; color: #888; font-size: 11px;">
-                Contains 25 sample .class files (~13KB)
-            </span>
-        </div>
-        <p style="font-size: 11px; color: #888; margin-bottom: 20px;">
-            Or select from pre-loaded samples below:
-        </p>
+        <details class="sample-download">
+            <summary>📦 Download bundle</summary>
+            <div class="button-group" style="margin-top: 8px;">
+                <a href="./data.zip" download="java-class-samples.zip" style="
+                    display: inline-block; 
+                    background-color: #0e639c; 
+                    color: white; 
+                    padding: 6px 12px; 
+                    text-decoration: none; 
+                    border-radius: 3px; 
+                    font-family: inherit; 
+                    font-size: 12px;
+                    border: none;
+                ">Download data.zip</a>
+            </div>
+            <div class="download-note">Includes the same sample classes used in the browser list.</div>
+        </details>
         
         $1`;
     

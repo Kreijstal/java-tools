@@ -19,7 +19,8 @@ function recalculateMaxStack(cfg) {
   const entryHeights = new Map();
   const worklist = [];
   const visitCounts = new Map();
-  const MAX_VISITS = 100000;
+  const blockCount = cfg && cfg.blocks && typeof cfg.blocks.size === 'number' ? cfg.blocks.size : 0;
+  const MAX_VISITS = Math.max(100000, blockCount * 50);
 
   entryHeights.set(cfg.entryBlockId, 0);
   worklist.push(cfg.entryBlockId);
@@ -86,7 +87,8 @@ function recalculateMaxStack(cfg) {
       const isExceptionEdge =
         (exceptionTargets && exceptionTargets.has(successorId)) || handlerBlocks.has(successorId);
       const successorHeight = isExceptionEdge ? 1 : currentStack;
-      if (!entryHeights.has(successorId) || entryHeights.get(successorId) !== successorHeight) {
+      const previousHeight = entryHeights.get(successorId);
+      if (previousHeight == null || successorHeight > previousHeight) {
         if (debugEnabled) {
           console.error(
             `[stack] ${contextLabel || '?'} ${blockId} -> ${successorId} height ${successorHeight}`,
@@ -152,7 +154,12 @@ function reconstructAstFromCfg(cfg, originalMethodAst) {
   }
 
   // Append any label-only items from the end of the original method
-  const originalCodeItems = originalMethodAst.attributes.find(a => a.type === 'code').code.codeItems;
+  const originalCodeAttr = (originalMethodAst.attributes || []).find((attr) => attr.type === 'code');
+  const originalStackSize =
+    originalCodeAttr && originalCodeAttr.code && originalCodeAttr.code.stackSize != null
+      ? String(originalCodeAttr.code.stackSize)
+      : null;
+  const originalCodeItems = originalCodeAttr && originalCodeAttr.code ? originalCodeAttr.code.codeItems : [];
   for (let i = originalCodeItems.length - 1; i >= 0; i--) {
     const item = originalCodeItems[i];
     if (!item.instruction && item.labelDef) {
@@ -181,10 +188,22 @@ function reconstructAstFromCfg(cfg, originalMethodAst) {
     }),
   );
 
-  const codeAttr = newMethodAst.attributes.find(attr => attr.type === 'code');
+  const codeAttr = newMethodAst.attributes.find((attr) => attr.type === 'code');
   if (codeAttr) {
     codeAttr.code.codeItems = newCodeItems;
-    codeAttr.code.stackSize = String(recalculateMaxStack(cfg));
+    try {
+      codeAttr.code.stackSize = String(recalculateMaxStack(cfg));
+    } catch (error) {
+      const contextLabel = cfg && cfg.context
+        ? `${cfg.context.className || 'Unknown'}.${cfg.context.methodName || '?'}${cfg.context.descriptor || ''}`
+        : 'unknown';
+      console.warn(
+        `[stack] Falling back to existing stack size for ${contextLabel}: ${error.message}`,
+      );
+      if (originalStackSize != null) {
+        codeAttr.code.stackSize = originalStackSize;
+      }
+    }
   }
 
   return newMethodAst;
