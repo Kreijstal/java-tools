@@ -39,6 +39,13 @@ module.exports = {
       }
     },
 
+    'drawLine(IIII)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      if (graphicsContext && graphicsContext.drawLine) {
+        graphicsContext.drawLine(args[0], args[1], args[2], args[3]);
+      }
+    },
+
     'fillOval(IIII)V': (jvm, obj, args) => {
       const graphicsContext = obj._awtGraphics;
       if (graphicsContext && graphicsContext.fillOval) {
@@ -61,6 +68,38 @@ module.exports = {
           graphicsContext.setFont(fontObj.value);
         }
       }
+    },
+
+    'fillPolygon([I[II)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      const xs = args[0];
+      const ys = args[1];
+      const xVals = xs && xs.array ? Array.from(xs.array) : xs;
+      const yVals = ys && ys.array ? Array.from(ys.array) : ys;
+      if (graphicsContext && graphicsContext.fillPolygon && xVals && yVals) {
+        graphicsContext.fillPolygon(xVals, yVals);
+      }
+    },
+
+    'drawPolygon([I[II)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      const xs = args[0];
+      const ys = args[1];
+      const xVals = xs && xs.array ? Array.from(xs.array) : xs;
+      const yVals = ys && ys.array ? Array.from(ys.array) : ys;
+      if (graphicsContext && graphicsContext.drawPolygon && xVals && yVals) {
+        graphicsContext.drawPolygon(xVals, yVals);
+      }
+    },
+
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      const imageObj = args[0];
+      if (!graphicsContext || !graphicsContext.drawImage || !imageObj) {
+        return 0;
+      }
+      const awtImage = imageObj._awtImage ? imageObj._awtImage : imageObj;
+      return graphicsContext.drawImage(awtImage, args[1], args[2]) ? 1 : 0;
     },
     
     'dispose()V': (jvm, obj, args) => {

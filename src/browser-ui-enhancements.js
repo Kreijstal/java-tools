@@ -2007,30 +2007,21 @@ function loadClassFile() {
 
   log(`Loading ${isJar ? "JAR" : "class"} file: ${fileName}...`, "info");
 
-  const reader = new FileReader();
-  reader.onload = function (e) {
-    try {
-      const buffer = new Uint8Array(e.target.result);
-
+  jvmDebug
+    .loadFile(file)
+    .then(() => {
       if (isJar) {
-        // Handle JAR file
-        jvmDebug.loadJar(buffer, fileName);
         log(`JAR file ${fileName} loaded successfully`, "success");
       } else {
-        // Handle .class file
         const className = fileName.replace(".class", "");
-        jvmDebug.loadClass(buffer, className);
         log(`Class file ${className} loaded successfully`, "success");
-
-        // Update state to reflect loaded class
         updateState({
-          loadedClass: true,
+          loadedClass: { name: className },
           className: className,
           status: "ready",
         });
       }
 
-      // Enable debug button
       const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
       if (debugBtn) {
         debugBtn.disabled = false;
@@ -2041,16 +2032,11 @@ function loadClassFile() {
         runBtn.disabled = false;
       }
       setDebugControlsVisible(false);
-    } catch (error) {
+    })
+    .catch((error) => {
       logError(`Failed to load ${fileName}`, error);
-    }
-  };
-
-  reader.onerror = function () {
-    log(`Failed to read file ${fileName}`, "error");
-  };
-
-  reader.readAsArrayBuffer(file);
+      updateStatus(`Failed to load ${fileName}`, "error");
+    });
 }
 
 // Utility Functions for UI

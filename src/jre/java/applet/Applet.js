@@ -44,8 +44,27 @@ module.exports = {
             document.body.appendChild(awtContainer);
           }
         }
-        
-        awtContainer.appendChild(canvas);
+
+        let appletRoot = awtContainer.querySelector('.awt-applet-root');
+        if (!appletRoot) {
+          appletRoot = document.createElement('div');
+          appletRoot.className = 'awt-applet-root';
+          appletRoot.style.position = 'relative';
+          appletRoot.style.boxSizing = 'border-box';
+          awtContainer.appendChild(appletRoot);
+        }
+
+        obj._awtElement = appletRoot;
+        if (obj._width) {
+          appletRoot.style.minWidth = `${obj._width}px`;
+        }
+        if (obj._height) {
+          appletRoot.style.minHeight = `${obj._height}px`;
+        }
+        if (!appletRoot.contains(canvas)) {
+          appletRoot.appendChild(canvas);
+        }
+        canvas.style.display = 'block';
 
         if (!obj._clickListenerAttached) {
           obj._clickListenerAttached = true;
@@ -161,17 +180,21 @@ module.exports = {
             // Get current thread to execute the paint method
             const currentThread = jvm.threads[jvm.currentThreadIndex];
             if (currentThread) {
+              currentThread.status = 'runnable';
               currentThread.callStack.push(paintFrame);
               
               // Execute the paint method synchronously
               const originalStackSize = currentThread.callStack.size();
-              let maxIterations = 1000; // Safety limit
+              const maxIterations = 200000; // Allow heavier paint loops to complete
               let iterations = 0;
               
               while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
                 const result = await jvm.executeTick();
                 iterations++;
                 if (result && result.completed) break;
+              }
+              if (iterations >= maxIterations) {
+                console.warn('Applet.paint exceeded iteration limit');
               }
             }
           } else if (obj['paint(Ljava/awt/Graphics;)V']) {
