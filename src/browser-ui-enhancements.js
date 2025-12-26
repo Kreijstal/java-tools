@@ -349,10 +349,12 @@ async function initializeXterm() {
     if (xtermContainer.dataset.xtermInitialized === "true") {
       return true;
     }
-    xtermContainer.dataset.xtermInitialized = "true";
 
     // Open terminal in container
     xtermTerminal.open(xtermContainer);
+
+    // Mark as initialized only after open() succeeds
+    xtermContainer.dataset.xtermInitialized = "true";
 
     // Fit terminal to container
     setTimeout(() => {
@@ -1136,6 +1138,7 @@ function renderMethodBrowser(filterQuery = "") {
       const list = document.createElement("ul");
       list.className = "method-list";
       let labelAttached = false;
+      let hasVisibleItem = false;
 
       section.items.forEach((method) => {
         const item = createMethodItem(method, entry.className);
@@ -1143,6 +1146,7 @@ function renderMethodBrowser(filterQuery = "") {
         const showItem = query.length === 0 || classMatches || methodMatches;
         item.style.display = showItem ? "flex" : "none";
         if (showItem) {
+          hasVisibleItem = true;
           totalVisible += 1;
           if (!labelAttached) {
             const label = document.createElement("span");
@@ -1155,7 +1159,7 @@ function renderMethodBrowser(filterQuery = "") {
         list.appendChild(item);
       });
 
-      category.style.display = list.querySelector('[style*="flex"]') ? "block" : "none";
+      category.style.display = hasVisibleItem ? "block" : "none";
       category.appendChild(list);
       classDetails.appendChild(category);
     });
