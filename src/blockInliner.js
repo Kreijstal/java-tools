@@ -73,7 +73,20 @@ function inlineInMethod(method) {
     if (blockHasStackMapFrame(block)) continue;
 
     const removed = items.splice(targetIdx, block.length);
-    items.splice(i, 1, ...removed);
+    const replacements = removed.slice();
+    const predecessorItem = entry;
+    if (predecessorItem) {
+      const firstReplacement = ensureReplacementAnchor(replacements, predecessorItem.labelDef);
+      if (firstReplacement) {
+        if (predecessorItem.pc !== undefined) {
+          firstReplacement.pc = predecessorItem.pc;
+        }
+        if (predecessorItem.stackMapFrame && !firstReplacement.stackMapFrame) {
+          firstReplacement.stackMapFrame = predecessorItem.stackMapFrame;
+        }
+      }
+    }
+    items.splice(i, 1, ...replacements);
     labels.push(target);
     changed = true;
     labelIndex = buildLabelIndex(items);
@@ -237,6 +250,27 @@ function findNextLabel(codeItems, startIdx) {
     }
   }
   return null;
+}
+
+function ensureReplacementAnchor(replacements, labelDef) {
+  if (!replacements.length) {
+    if (!labelDef) {
+      return null;
+    }
+    const anchor = { labelDef };
+    replacements.push(anchor);
+    return anchor;
+  }
+  if (!labelDef) {
+    return replacements[0];
+  }
+  const anchorIndex = replacements.findIndex((entry) => entry && entry.instruction);
+  if (anchorIndex === -1) {
+    replacements[0].labelDef = labelDef;
+    return replacements[0];
+  }
+  replacements[anchorIndex].labelDef = labelDef;
+  return replacements[anchorIndex];
 }
 
 module.exports = { inlineSinglePredecessorBlocks };

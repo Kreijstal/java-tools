@@ -26,7 +26,7 @@ test.describe('Debug Initialization Issues', () => {
       });
 
       // Navigate to the page
-      await page.goto('http://localhost:3000/');
+      await page.goto('/dist/index.html');
 
       // Wait for page to load
       await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });

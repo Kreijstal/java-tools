@@ -1,6 +1,10 @@
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
+    'RED:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 255, g: 0, b: 0, a: 255 },
+    },
     'black:Ljava/awt/Color;': {
       type: 'java/awt/Color',
       value: { r: 0, g: 0, b: 0, a: 255 },

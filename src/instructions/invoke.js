@@ -5,6 +5,18 @@ const path = require("path");
 const { MethodHandle, MethodType, Lookup } = require("../jre/java/lang/invoke");
 const { ASYNC_METHOD_SENTINEL } = require("../constants");
 
+function assignArgsToLocals(locals, args, params, startIndex) {
+  let localIndex = startIndex;
+  for (let i = 0; i < params.length; i++) {
+    locals[localIndex] = args[i];
+    if (params[i] === "long" || params[i] === "double") {
+      localIndex += 2;
+    } else {
+      localIndex += 1;
+    }
+  }
+}
+
 // Helper function to format numbers according to Java's rules
 function formatJavaNumber(value, type) {
   if (type === "boolean" || type === "Z") {
@@ -202,9 +214,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
         const newFrame = new Frame(method);
         newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = obj; // 'this'
-        for (let i = 0; i < args.length; i++) {
-          newFrame.locals[i + 1] = args[i];
-        }
+        assignArgsToLocals(newFrame.locals, args, params, 1);
         thread.callStack.push(newFrame);
         return;
       }
@@ -277,9 +287,11 @@ async function invokestatic(frame, instruction, jvm, thread) {
       const newFrame = new Frame(method);
       newFrame.className = className; // Add className to the frame
       const { params } = parseDescriptor(descriptor);
-      for (let i = params.length - 1; i >= 0; i--) {
-        newFrame.locals[i] = frame.stack.pop();
+      const args = [];
+      for (let i = 0; i < params.length; i++) {
+        args.unshift(frame.stack.pop());
       }
+      assignArgsToLocals(newFrame.locals, args, params, 0);
       thread.callStack.push(newFrame);
     }
   } else {
@@ -325,11 +337,8 @@ async function invokespecial(frame, instruction, jvm, thread) {
   if (method) {
     const newFrame = new Frame(method);
     newFrame.className = className; // Add className to the frame
-    let localIndex = 0;
-    newFrame.locals[localIndex++] = obj; // 'this'
-    for (const arg of args) {
-      newFrame.locals[localIndex++] = arg;
-    }
+    newFrame.locals[0] = obj; // 'this'
+    assignArgsToLocals(newFrame.locals, args, params, 1);
     thread.callStack.push(newFrame);
   } else if (methodName === "<init>") {
     // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
@@ -596,9 +605,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
         const newFrame = new Frame(method);
         newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = boxedObj; // 'this'
-        for (let i = 0; i < args.length; i++) {
-          newFrame.locals[i + 1] = args[i];
-        }
+        assignArgsToLocals(newFrame.locals, args, params, 1);
         thread.callStack.push(newFrame);
         return;
       }

@@ -2,15 +2,21 @@ const { test, expect } = require('@playwright/test');
 
 test('download data.zip from debug interface', async ({ page }) => {
   // Navigate to the debug interface
-  await page.goto('http://localhost:3000');
+  await page.goto('/dist/index.html');
 
   // Wait for the page to load
   await page.waitForLoadState('networkidle');
 
-  // Check that the download link is present
+  // The download link is inside a collapsible details element
+  // First expand it by clicking the summary
+  const downloadSection = page.locator('details.sample-download');
+  await expect(downloadSection).toBeVisible();
+  await downloadSection.locator('summary').click();
+
+  // Now check that the download link is visible
   const downloadLink = page.locator('a[href="./data.zip"]');
   await expect(downloadLink).toBeVisible();
-  await expect(downloadLink).toContainText('Download data.zip');
+  await expect(downloadLink).toContainText('data.zip');
 
   // Test the download link href attribute
   const href = await downloadLink.getAttribute('href');
@@ -19,20 +25,11 @@ test('download data.zip from debug interface', async ({ page }) => {
   // Test that the download attribute is set correctly
   const downloadAttr = await downloadLink.getAttribute('download');
   expect(downloadAttr).toBe('java-class-samples.zip');
-
-  // Verify the download link is in the correct section
-  const sampleSection = page.locator('h3:has-text("📚 Getting Sample .class Files to Try")');
-  await expect(sampleSection).toBeVisible();
-  
-  // The download link should be near the sample section
-  const sampleContainer = sampleSection.locator('..'); // Parent element
-  const downloadInSection = sampleContainer.locator('a[href="./data.zip"]');
-  await expect(downloadInSection).toBeVisible();
 });
 
 test('data.zip file is accessible via HTTP', async ({ page }) => {
   // Test that the data.zip file can be accessed directly
-  const response = await page.request.get('http://localhost:3000/dist/data.zip');
+  const response = await page.request.get('/dist/data.zip');
   
   // Should return 200 OK
   expect(response.status()).toBe(200);
