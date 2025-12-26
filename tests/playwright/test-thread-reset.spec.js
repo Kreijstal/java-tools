@@ -15,7 +15,7 @@ test.describe('Thread Reset Issue Test', () => {
     // Select Hello.class
     console.log('\n=== First Run: Load and run Hello to completion ===');
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(2000);
 
     // Start debugging
@@ -49,7 +49,7 @@ test.describe('Thread Reset Issue Test', () => {
     // Second run: Debug Hello again
     console.log('\n=== Second Run: Load and debug Hello again ===');
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(2000);
 
     // Start debugging again

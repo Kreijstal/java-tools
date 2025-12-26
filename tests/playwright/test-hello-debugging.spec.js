@@ -25,7 +25,7 @@ test.describe('Hello Class Debugging Test', () => {
     
     // Click Load button
     console.log('Clicking Load button...');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(2000);
 
     // Check console output

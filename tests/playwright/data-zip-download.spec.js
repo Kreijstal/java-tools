@@ -7,7 +7,13 @@ test('download data.zip from debug interface', async ({ page }) => {
   // Wait for the page to load
   await page.waitForLoadState('networkidle');
 
-  // Check that the download link is present
+  // The download link is inside a collapsible details element
+  // First expand it by clicking the summary
+  const downloadSection = page.locator('details.sample-download');
+  await expect(downloadSection).toBeVisible();
+  await downloadSection.locator('summary').click();
+
+  // Now check that the download link is visible
   const downloadLink = page.locator('a[href="./data.zip"]');
   await expect(downloadLink).toBeVisible();
   await expect(downloadLink).toContainText('data.zip');
@@ -19,15 +25,6 @@ test('download data.zip from debug interface', async ({ page }) => {
   // Test that the download attribute is set correctly
   const downloadAttr = await downloadLink.getAttribute('download');
   expect(downloadAttr).toBe('java-class-samples.zip');
-
-  // Verify the download link is in the correct section
-  const sampleSection = page.locator('h3:has-text("📚 Getting Sample .class Files to Try")');
-  await expect(sampleSection).toBeVisible();
-  
-  // The download link should be near the sample section
-  const sampleContainer = sampleSection.locator('..'); // Parent element
-  const downloadInSection = sampleContainer.locator('a[href="./data.zip"]');
-  await expect(downloadInSection).toBeVisible();
 });
 
 test('data.zip file is accessible via HTTP', async ({ page }) => {

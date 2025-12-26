@@ -21,7 +21,7 @@ test.describe('Console Error Detection', () => {
     
     // Load Hello.class which contains System.out.println
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging

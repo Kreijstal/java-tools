@@ -37,7 +37,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000); // Wait for dropdown to be populated
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000); // Wait for class to load
 
     // Start debugging
@@ -71,7 +71,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -105,7 +105,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -131,7 +131,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -154,7 +154,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'VerySimple.class');
-    await page.click('#loadSampleBtn', { timeout: 5000 });
+    await page.click('#loadBtn', { timeout: 5000 });
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -175,7 +175,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -195,7 +195,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -218,7 +218,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'TestMethodsRunner.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
@@ -241,7 +241,7 @@ test.describe('JVM Debug Browser Interface', () => {
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     await page.waitForTimeout(2000);
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('#loadSampleBtn');
+    await page.click('#loadBtn');
     await page.waitForTimeout(1000);
 
     // Start debugging
