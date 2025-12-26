@@ -724,6 +724,14 @@ class CanvasGraphics {
 
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     drawRect(x, y, width, height) { this.ctx.strokeRect(x, y, width, height); }
+
+    /** @param {number} x1 @param {number} y1 @param {number} x2 @param {number} y2 */
+    drawLine(x1, y1, x2, y2) {
+        this.ctx.beginPath();
+        this.ctx.moveTo(x1, y1);
+        this.ctx.lineTo(x2, y2);
+        this.ctx.stroke();
+    }
     
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     fillOval(x, y, width, height) {
@@ -762,11 +770,40 @@ class CanvasGraphics {
 
     /** @override @param {AwtImage} image @param {number} x @param {number} y */
     drawImage(image, x, y) {
+        if (!image) return false;
         if (image instanceof CanvasImage) {
             this.ctx.drawImage(image.getCanvasElement(), x, y);
             return true;
         }
+        if (typeof image.getCanvasElement === 'function') {
+            this.ctx.drawImage(image.getCanvasElement(), x, y);
+            return true;
+        }
         return false;
+    }
+
+    /** @param {number[]} xs @param {number[]} ys */
+    fillPolygon(xs, ys) {
+        if (!xs.length || xs.length !== ys.length) return;
+        this.ctx.beginPath();
+        this.ctx.moveTo(xs[0], ys[0]);
+        for (let i = 1; i < xs.length; i++) {
+            this.ctx.lineTo(xs[i], ys[i]);
+        }
+        this.ctx.closePath();
+        this.ctx.fill();
+    }
+
+    /** @param {number[]} xs @param {number[]} ys */
+    drawPolygon(xs, ys) {
+        if (!xs.length || xs.length !== ys.length) return;
+        this.ctx.beginPath();
+        this.ctx.moveTo(xs[0], ys[0]);
+        for (let i = 1; i < xs.length; i++) {
+            this.ctx.lineTo(xs[i], ys[i]);
+        }
+        this.ctx.closePath();
+        this.ctx.stroke();
     }
 
     /** @override @returns {AwtRectangle} */

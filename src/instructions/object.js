@@ -225,10 +225,10 @@ module.exports = {
 
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
+    if (arrayRef === null || arrayRef === undefined) {
       throw {
         type: 'java/lang/NullPointerException',
-        message: 'Attempted to get length of null array'
+        message: `Attempted to get length of null array in ${frame.method.name}`
       };
     }
     const length = arrayRef.length;
@@ -333,12 +333,36 @@ module.exports = {
       counts.unshift(frame.stack.pop());
     }
 
+    const baseType = className.replace(/^\[+/, '');
+    const leafDefault = (() => {
+      if (baseType.startsWith('L')) return null;
+      switch (baseType) {
+        case 'Z':
+        case 'B':
+        case 'S':
+        case 'I':
+        case 'C':
+          return 0;
+        case 'J':
+          return BigInt(0);
+        case 'F':
+        case 'D':
+          return 0.0;
+        default:
+          return null;
+      }
+    })();
+
     const createMultiArray = (dims) => {
-      const count = dims.shift();
-      const arr = new Array(count).fill(null);
-      if (dims.length > 0) {
+      const count = dims[0];
+      const remaining = dims.slice(1);
+      let arr;
+      if (remaining.length === 0) {
+        arr = new Array(count).fill(leafDefault);
+      } else {
+        arr = new Array(count).fill(null);
         for (let i = 0; i < count; i++) {
-          arr[i] = createMultiArray([...dims]);
+          arr[i] = createMultiArray(remaining);
         }
       }
       return arr;

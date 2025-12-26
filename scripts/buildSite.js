@@ -25,8 +25,16 @@ async function setupAceEditor() {
     const aceSourceDir = path.join(process.cwd(), 'node_modules', 'ace-builds', 'src-min-noconflict');
     const aceFilePath = path.join(libDir, 'ace.js');
     
-    // Check if ACE editor already exists
-    if (fs.existsSync(aceFilePath)) {
+    const themeFiles = ['theme-monokai.js', 'theme-github.js', 'theme-textmate.js'];
+    const modeFiles = ['mode-text.js', 'mode-java.js'];
+    const themeTargets = themeFiles.map((themeFile) => path.join(libDir, themeFile));
+    const modeTargets = modeFiles.map((modeFile) => path.join(libDir, modeFile));
+    const allAceAssetsExist =
+        fs.existsSync(aceFilePath) &&
+        themeTargets.every((target) => fs.existsSync(target)) &&
+        modeTargets.every((target) => fs.existsSync(target));
+
+    if (allAceAssetsExist) {
         console.log('  ✓ ACE editor already exists');
         return;
     }
@@ -38,25 +46,25 @@ async function setupAceEditor() {
         throw new Error('ACE editor not found in node_modules. Please run: npm install ace-builds');
     }
     
-    // Copy main ACE editor file
-    copyFile(path.join(aceSourceDir, 'ace.js'), aceFilePath);
-    
+    // Copy main ACE editor file if needed
+    if (!fs.existsSync(aceFilePath)) {
+        copyFile(path.join(aceSourceDir, 'ace.js'), aceFilePath);
+    }
+
     // Copy theme files that ACE editor dynamically loads
-    const themeFiles = ['theme-monokai.js', 'theme-github.js', 'theme-textmate.js'];
     for (const themeFile of themeFiles) {
         const themeSourcePath = path.join(aceSourceDir, themeFile);
         const themeTargetPath = path.join(libDir, themeFile);
-        if (fs.existsSync(themeSourcePath)) {
+        if (!fs.existsSync(themeTargetPath) && fs.existsSync(themeSourcePath)) {
             copyFile(themeSourcePath, themeTargetPath);
         }
     }
-    
+
     // Copy mode files that might be needed
-    const modeFiles = ['mode-text.js', 'mode-java.js'];
     for (const modeFile of modeFiles) {
         const modeSourcePath = path.join(aceSourceDir, modeFile);
         const modeTargetPath = path.join(libDir, modeFile);
-        if (fs.existsSync(modeSourcePath)) {
+        if (!fs.existsSync(modeTargetPath) && fs.existsSync(modeSourcePath)) {
             copyFile(modeSourcePath, modeTargetPath);
         }
     }
