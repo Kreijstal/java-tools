@@ -422,7 +422,7 @@ function getStackEffect(op, instruction = null) {
     }
   }
 
-  const convMatch = op.match(/^([ilfd])2([ilfd])/);
+  const convMatch = op.match(/^([ilfd])2([ilfdbcs])/);
   if (convMatch) {
     const [, from, to] = convMatch;
     return { popSlots: getTypeWidth(from), pushSlots: getTypeWidth(to) };
