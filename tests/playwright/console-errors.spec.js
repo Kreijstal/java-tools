@@ -21,11 +21,11 @@ test.describe('Console Error Detection', () => {
     
     // Load Hello.class which contains System.out.println
     await page.selectOption('#sampleClassSelect', 'Hello.class');
-    await page.click('button:has-text("Load Sample")');
+    await page.click('#loadSampleBtn');
     await page.waitForTimeout(1000);
-    
+
     // Start debugging
-    await page.click('button:has-text("Start Debugging")', { timeout: 5000 });
+    await page.click('#debugBtn', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Debugger started', { timeout: 5000 });
     
     // Clear console errors collected during initialization

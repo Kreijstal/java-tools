@@ -23,9 +23,9 @@ test.describe('Hello Class Debugging Test', () => {
     console.log('\n=== Selecting Hello.class ===');
     await page.selectOption('#sampleClassSelect', 'Hello.class');
     
-    // Click Load Sample button
-    console.log('Clicking Load Sample button...');
-    await page.click('button:has-text("Load Sample")');
+    // Click Load button
+    console.log('Clicking Load button...');
+    await page.click('#loadSampleBtn');
     await page.waitForTimeout(2000);
 
     // Check console output

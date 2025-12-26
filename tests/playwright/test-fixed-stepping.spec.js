@@ -12,7 +12,7 @@ test('Fixed stepping functionality - real JVM implementation sequential steps', 
   // Load a sample class using the real interface
   console.log('=== Loading Hello.class ===');
   await page.selectOption('#sampleClassSelect', 'Hello.class');
-  await page.click('button:has-text("Load Sample")');
+  await page.click('#loadBtn');
   await page.waitForTimeout(2000);
 
   console.log('=== Starting debugging ===');
