@@ -8,6 +8,8 @@ module.exports = {
       // Initialize applet as a Panel
       obj._awtComponent = new awtFramework.Canvas();
       obj._awtComponent.setSize(800, 600); // Default applet size
+      obj._width = 800;
+      obj._height = 600;
       
       // Create and attach canvas to DOM if in browser environment
       if (typeof document !== 'undefined') {
@@ -44,6 +46,47 @@ module.exports = {
         }
         
         awtContainer.appendChild(canvas);
+
+        if (!obj._clickListenerAttached) {
+          obj._clickListenerAttached = true;
+          canvas.addEventListener('click', async (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const clickX = Math.floor(event.clientX - rect.left);
+            const clickY = Math.floor(event.clientY - rect.top);
+
+            const method = jvm.findMethod(jvm.classes[obj.type], 'handleClick', '(II)V');
+            if (!method) {
+              return;
+            }
+
+            const Frame = require('../../../frame');
+            const clickFrame = new Frame(method);
+            clickFrame.className = obj.type;
+            clickFrame.locals[0] = obj;
+            clickFrame.locals[1] = clickX;
+            clickFrame.locals[2] = clickY;
+
+            const currentThread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+            if (currentThread) {
+              currentThread.callStack.push(clickFrame);
+              const threadIndex = jvm.threads.indexOf(currentThread);
+              if (threadIndex >= 0) {
+                jvm.currentThreadIndex = threadIndex;
+              }
+              currentThread.status = 'runnable';
+
+              const originalStackSize = currentThread.callStack.size();
+              let maxIterations = 1000;
+              let iterations = 0;
+
+              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
+                const result = await jvm.executeTick();
+                iterations++;
+                if (result && result.completed) break;
+              }
+            }
+          });
+        }
         
         console.log('AWT Canvas created and attached to DOM', canvas);
       }
@@ -82,7 +125,7 @@ module.exports = {
       return jvm.createGraphicsObject(obj);
     },
     
-    'repaint()V': (jvm, obj, args) => {
+    'repaint()V': async (jvm, obj, args) => {
       // Trigger a repaint
       if (obj._awtComponent) {
         const graphics = obj._awtComponent.getGraphics();
@@ -126,7 +169,7 @@ module.exports = {
               let iterations = 0;
               
               while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
-                const result = jvm.executeTick();
+                const result = await jvm.executeTick();
                 iterations++;
                 if (result && result.completed) break;
               }

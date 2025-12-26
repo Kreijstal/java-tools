@@ -205,7 +205,7 @@ class DebugController {
   }
 
   reset() {
-    this.jvm = new JVM();
+    this.jvm = new JVM(this.options);
     this.executionState = 'stopped';
     return { status: 'reset' };
   }

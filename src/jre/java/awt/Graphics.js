@@ -18,11 +18,10 @@ module.exports = {
     
     'setColor(Ljava/awt/Color;)V': (jvm, obj, args) => {
       const colorObj = args[0];
-      if (colorObj && colorObj.value) {
-        const graphicsContext = obj._awtGraphics;
-        if (graphicsContext && graphicsContext.setColor) {
-          graphicsContext.setColor(colorObj.value);
-        }
+      const graphicsContext = obj._awtGraphics;
+      if (graphicsContext && graphicsContext.setColor && colorObj) {
+        const colorValue = (colorObj.value !== undefined) ? colorObj.value : colorObj;
+        graphicsContext.setColor(colorValue);
       }
     },
     
@@ -37,6 +36,20 @@ module.exports = {
       const graphicsContext = obj._awtGraphics;
       if (graphicsContext && graphicsContext.drawRect) {
         graphicsContext.drawRect(args[0], args[1], args[2], args[3]);
+      }
+    },
+
+    'fillOval(IIII)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      if (graphicsContext && graphicsContext.fillOval) {
+        graphicsContext.fillOval(args[0], args[1], args[2], args[3]);
+      }
+    },
+
+    'drawOval(IIII)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      if (graphicsContext && graphicsContext.drawOval) {
+        graphicsContext.drawOval(args[0], args[1], args[2], args[3]);
       }
     },
     

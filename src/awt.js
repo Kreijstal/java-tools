@@ -78,6 +78,10 @@ class IGraphics {
     fillRect(x, y, width, height) {}
     /** @param {number} x @param {number} y @param {number} width @param {number} height */
     drawRect(x, y, width, height) {}
+    /** @param {number} x @param {number} y @param {number} width @param {number} height */
+    fillOval(x, y, width, height) {}
+    /** @param {number} x @param {number} y @param {number} width @param {number} height */
+    drawOval(x, y, width, height) {}
     /** @param {AwtFont} font */
     setFont(font) {}
     /** @param {string} str @param {number} x @param {number} y */
@@ -720,6 +724,28 @@ class CanvasGraphics {
 
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     drawRect(x, y, width, height) { this.ctx.strokeRect(x, y, width, height); }
+    
+    /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
+    fillOval(x, y, width, height) {
+        const rx = Math.max(0, width / 2);
+        const ry = Math.max(0, height / 2);
+        const cx = x + rx;
+        const cy = y + ry;
+        this.ctx.beginPath();
+        this.ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        this.ctx.fill();
+    }
+    
+    /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
+    drawOval(x, y, width, height) {
+        const rx = Math.max(0, width / 2);
+        const ry = Math.max(0, height / 2);
+        const cx = x + rx;
+        const cy = y + ry;
+        this.ctx.beginPath();
+        this.ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        this.ctx.stroke();
+    }
 
     /** @override @param {AwtFont} font */
     setFont(font) {
@@ -816,6 +842,16 @@ class MockGraphics {
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     drawRect(x, y, width, height) { 
         this.operations.push(`drawRect(${x}, ${y}, ${width}, ${height})`);
+    }
+    
+    /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
+    fillOval(x, y, width, height) { 
+        this.operations.push(`fillOval(${x}, ${y}, ${width}, ${height})`);
+    }
+    
+    /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
+    drawOval(x, y, width, height) { 
+        this.operations.push(`drawOval(${x}, ${y}, ${width}, ${height})`);
     }
 
     /** @override @param {AwtFont} font */
