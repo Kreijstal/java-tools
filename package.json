@@ -49,7 +49,7 @@
     "babel-loader": "^10.0.0",
     "blessed": "^0.1.81",
     "buffer": "^6.0.3",
-    "jsdom": "^26.1.0",
+    "jsdom": "^28.0.0",
     "path-browserify": "^1.0.1",
     "playwright": "^1.45.0",
     "process": "^0.11.10",
