@@ -41,7 +41,7 @@ public final class JoinBlockSplitter {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: JoinBlockSplitter <input.class> <output.class> [--min-incoming N] [--max-insns N] [--leave-one-original] [--cleanup-jumps] [--split-diamonds] [--split-latches] [--merge-duplicate-blocks] [--merge-duplicate-suffixes] [--merge-duplicate-suffix-ranges] [--merge-duplicate-max N] [--merge-dispatches] [--merge-preheaders] [--split-init-preheaders] [--orient-null-dispatches] [--fold-entry-stores] [--fold-single-assignment-locals] [--verbose]");
+            System.err.println("Usage: JoinBlockSplitter <input.class> <output.class> [--min-incoming N] [--max-insns N] [--leave-one-original] [--cleanup-jumps] [--split-diamonds] [--split-latches] [--split-fallthrough-joins] [--merge-duplicate-blocks] [--merge-duplicate-suffixes] [--merge-duplicate-suffix-ranges] [--merge-duplicate-max N] [--merge-dispatches] [--merge-preheaders] [--split-init-preheaders] [--orient-null-dispatches] [--fold-entry-stores] [--fold-single-assignment-locals] [--verbose]");
             System.err.println("       [--assume-static owner.name:desc=value]");
             System.exit(2);
         }
@@ -54,6 +54,7 @@ public final class JoinBlockSplitter {
         boolean cleanupJumps = false;
         boolean splitDiamonds = false;
         boolean splitLatches = false;
+        boolean splitFallthroughJoins = false;
         boolean mergeDuplicateBlocks = false;
         boolean mergeDuplicateSuffixes = false;
         boolean mergeDuplicateSuffixRanges = false;
@@ -80,6 +81,8 @@ public final class JoinBlockSplitter {
                 splitDiamonds = true;
             } else if ("--split-latches".equals(args[i])) {
                 splitLatches = true;
+            } else if ("--split-fallthrough-joins".equals(args[i])) {
+                splitFallthroughJoins = true;
             } else if ("--merge-duplicate-blocks".equals(args[i])) {
                 mergeDuplicateBlocks = true;
             } else if ("--merge-duplicate-suffixes".equals(args[i])) {
@@ -116,6 +119,7 @@ public final class JoinBlockSplitter {
         int cleanupCount = 0;
         int diamondCount = 0;
         int latchCount = 0;
+        int fallthroughJoinCount = 0;
         int mergedBlocks = 0;
         int mergedDispatches = 0;
         int mergedPreheaders = 0;
@@ -192,6 +196,10 @@ public final class JoinBlockSplitter {
                 latchCount += splitSharedGotoLatches(method, 64);
                 cleanupCount += cleanupJumps(method);
             }
+            if (splitFallthroughJoins) {
+                fallthroughJoinCount += splitFallthroughJoins(classNode.name, method, maxInsns);
+                cleanupCount += cleanupJumps(method);
+            }
             if (cleanupJumps) {
                 deadRemoved += removeUnreachableCode(method);
             }
@@ -215,6 +223,9 @@ public final class JoinBlockSplitter {
         }
         if (splitLatches) {
             System.out.println("split latches: " + latchCount);
+        }
+        if (splitFallthroughJoins) {
+            System.out.println("split fallthrough joins: " + fallthroughJoinCount);
         }
         if (mergeDuplicateBlocks || mergeDuplicateSuffixes) {
             System.out.println("merged duplicate blocks: " + mergedBlocks);
@@ -938,6 +949,113 @@ public final class JoinBlockSplitter {
             }
         }
         return splits;
+    }
+
+    private static int splitFallthroughJoins(String owner, MethodNode method, int maxInsns) {
+        if (method.instructions == null || method.instructions.size() == 0) {
+            return 0;
+        }
+
+        Frame<BasicValue>[] frames;
+        try {
+            frames = new Analyzer<>(new BasicInterpreter()).analyze(owner, method);
+        } catch (Exception ignored) {
+            return 0;
+        }
+
+        Map<AbstractInsnNode, Integer> indexes = instructionIndexes(method.instructions);
+        Set<LabelNode> handlers = new HashSet<>(handlerLabels(method));
+        int splits = 0;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (!(insn instanceof JumpInsnNode)) {
+                continue;
+            }
+            JumpInsnNode jump = (JumpInsnNode) insn;
+            if (inverseConditionalOpcode(jump.getOpcode()) < 0) {
+                continue;
+            }
+            LabelNode target = jump.label;
+            if (handlers.contains(target) || !hasFallthroughPredecessor(target)) {
+                continue;
+            }
+
+            AbstractInsnNode jumpReal = firstRealInstruction(jump);
+            AbstractInsnNode targetReal = firstRealInstruction(target);
+            Integer jumpIndex = indexes.get(jumpReal);
+            Integer targetIndex = indexes.get(targetReal);
+            if (jumpIndex == null || targetIndex == null || targetIndex <= jumpIndex) {
+                continue;
+            }
+            if (targetIndex < 0 || targetIndex >= frames.length) {
+                continue;
+            }
+            Frame<BasicValue> frame = frames[targetIndex];
+            if (frame == null || frame.getStackSize() != 0) {
+                continue;
+            }
+
+            LabelNode end = nextLabelAfter(target);
+            if (end == null) {
+                continue;
+            }
+            Block block = cloneableFallthroughJoinBlock(method.instructions, target, end, maxInsns);
+            if (block == null) {
+                continue;
+            }
+
+            InsnList clone = cloneBlock(method, block);
+            LabelNode clonedEntry = (LabelNode) clone.getFirst();
+            if (block.fallthroughLabel == end) {
+                method.instructions.insertBefore(end, new JumpInsnNode(Opcodes.GOTO, end));
+            }
+            method.instructions.insertBefore(end, clone);
+            jump.label = clonedEntry;
+            splits += 1;
+        }
+        return splits;
+    }
+
+    private static Block cloneableFallthroughJoinBlock(
+            InsnList instructions,
+            LabelNode start,
+            LabelNode end,
+            int maxInsns
+    ) {
+        List<AbstractInsnNode> body = new ArrayList<>();
+        int realCount = 0;
+        AbstractInsnNode lastReal = null;
+        for (AbstractInsnNode insn = start; insn != null && insn != end; insn = insn.getNext()) {
+            if (insn instanceof FrameNode || insn instanceof LineNumberNode) {
+                continue;
+            }
+            if (insn instanceof TableSwitchInsnNode || insn instanceof LookupSwitchInsnNode) {
+                return null;
+            }
+            body.add(insn);
+            if (!(insn instanceof LabelNode)) {
+                realCount += 1;
+                lastReal = insn;
+            }
+            if (realCount > maxInsns) {
+                return null;
+            }
+            if (insn instanceof JumpInsnNode && insn.getOpcode() == Opcodes.JSR) {
+                return null;
+            }
+            if (isTerminal(insn.getOpcode())) {
+                break;
+            }
+        }
+        if (body.isEmpty() || realCount == 0) {
+            return null;
+        }
+        LabelNode fallthrough = end;
+        if (lastReal instanceof JumpInsnNode && lastReal.getOpcode() == Opcodes.GOTO) {
+            fallthrough = null;
+        } else if (lastReal != null && isTerminal(lastReal.getOpcode())) {
+            fallthrough = null;
+        }
+        return new Block(body, fallthrough);
     }
 
     private static int mergeDuplicateGotoBlocks(MethodNode method, int maxInsns) {
@@ -1960,6 +2078,24 @@ public final class JoinBlockSplitter {
                 continue;
             }
             return insn;
+        }
+        return null;
+    }
+
+    private static boolean hasFallthroughPredecessor(LabelNode label) {
+        AbstractInsnNode previous = previousRealInstruction(label);
+        if (previous == null || isTerminal(previous.getOpcode())) {
+            return false;
+        }
+        return !(previous instanceof JumpInsnNode)
+                || (previous.getOpcode() != Opcodes.GOTO && previous.getOpcode() != Opcodes.JSR);
+    }
+
+    private static LabelNode nextLabelAfter(LabelNode label) {
+        for (AbstractInsnNode insn = label.getNext(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof LabelNode) {
+                return (LabelNode) insn;
+            }
         }
         return null;
     }
