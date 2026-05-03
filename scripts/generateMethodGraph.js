@@ -7,38 +7,36 @@ async function generateGraph(classPath, outputFile) {
     console.log(`Initializing workspace for path: ${classPath}`);
     const workspace = await KrakatauWorkspace.create(classPath);
     const allMethods = workspace.getAllMethods();
+    const methodIds = new Set(allMethods.map(method =>
+      `${method.class.className}.${method.name}${method.descriptor}`
+    ));
 
     const graph = {};
-    const allCalledMethods = new Set();
+    const allCalledInternalMethods = new Set();
 
     for (const method of allMethods) {
       const methodName = `${method.class.className}.${method.name}${method.descriptor}`;
       graph[methodName] = {
         calls: [],
+        internalCalls: [],
+        externalCalls: [],
       };
 
       const calledMethods = workspace.getCalledMethods(method);
       for (const called of calledMethods) {
         const calledMethodName = `${called.className}.${called.methodName}${called.descriptor}`;
         graph[methodName].calls.push(calledMethodName);
-        allCalledMethods.add(calledMethodName);
-      }
-    }
-
-    const rootMethods = Object.keys(graph).filter(methodName => !allCalledMethods.has(methodName));
-    const leafMethods = [];
-
-    for (const methodName in graph) {
-      const methodNode = graph[methodName];
-      if (methodNode.calls.length === 0) {
-        leafMethods.push(methodName);
-      } else {
-        const unresolvedCalls = workspace.getUnresolvedCalls(graph[methodName].calls);
-        if (unresolvedCalls.length === methodNode.calls.length) {
-          leafMethods.push(methodName);
+        if (methodIds.has(calledMethodName)) {
+          graph[methodName].internalCalls.push(calledMethodName);
+          allCalledInternalMethods.add(calledMethodName);
+        } else {
+          graph[methodName].externalCalls.push(calledMethodName);
         }
       }
     }
+
+    const rootMethods = Object.keys(graph).filter(methodName => !allCalledInternalMethods.has(methodName));
+    const leafMethods = Object.keys(graph).filter(methodName => graph[methodName].internalCalls.length === 0);
 
     const output = {
       graph,

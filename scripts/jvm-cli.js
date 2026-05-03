@@ -16,6 +16,7 @@ const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
 const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
 const { inlinePureMethods } = require('../src/inlinePureMethods');
 const { relocateTrivialHandlers } = require('../src/handlerRelocator');
+const { removeTrivialRethrowHandlers } = require('../src/removeTrivialRethrowHandlers');
 const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
 const { collectExceptionMetadata } = require('../src/exceptionMetadata');
 const { collectMethodCallers } = require('../src/callGraphMetadata');
@@ -31,6 +32,7 @@ Commands:
   purity <file.{j|class}> [--json] [--classpath paths] Report purity & reasons per method
   lint <file.{j|class}> [--fix] [--out file] [--xref-comments] [--stdout] Detect dead-code handler tricks; optionally apply fix
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
+  strip-rethrow-handlers <file.{j|class}> [--out file] Remove trivial rethrow handler traps only
   throws <file.{j|class}> [--json]                  Report declared & implicit exceptions per method
   callers <file.{j|class}> [--json] [--class C --method M --descriptor desc]
                                                   List callers for methods defined in the file
@@ -508,6 +510,45 @@ function writeArtifact(artifact, outputPath, options = {}) {
   console.log(`Wrote ${targetPath}`);
 }
 
+function stripRethrowHandlersCommand(args) {
+  let outPath = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('strip-rethrow-handlers requires exactly one input file');
+  }
+
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = removeTrivialRethrowHandlers(artifact.astRoot);
+    if (!result.changed) {
+      console.log('No trivial rethrow handlers found.');
+      return;
+    }
+    result.removals.forEach((removal, index) => {
+      console.log(
+        `${index + 1}) ${removal.className}.${removal.methodName}${removal.descriptor} - Removed trivial rethrow handler ${removal.handlerLabel}.`,
+      );
+    });
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
 function showDiff(beforeText, afterText) {
   if (beforeText === afterText) {
     console.log('No changes.');
@@ -611,6 +652,13 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
       descriptor: merge.descriptor,
       message: `Inlined unique-target block ${merge.label} into its predecessor.`,
     }));
+    const rethrowRemoval = removeTrivialRethrowHandlers(artifact.astRoot);
+    const rethrowRemovalDiagnostics = rethrowRemoval.removals.map((removal) => ({
+      className: removal.className,
+      methodName: removal.methodName,
+      descriptor: removal.descriptor,
+      message: `Removed trivial rethrow exception handler ${removal.handlerLabel} from the exception table.`,
+    }));
     const relocation = relocateTrivialHandlers(artifact.astRoot);
     const relocationDiagnostics = relocation.relocations.map((reloc) => ({
       className: reloc.className,
@@ -624,6 +672,7 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
     );
     const allDiagnostics = pureInlineDiagnostics
       .concat(inlineDiagnostics)
+      .concat(rethrowRemovalDiagnostics)
       .concat(relocationDiagnostics)
       .concat(deadCodeDiagnostics);
     if (!toStdout) {
@@ -637,7 +686,8 @@ async function lintOrOptimizeCommand(args, { applyFix }) {
         });
       }
     }
-    const changed = pureInlineResult.changed || inlineResult.changed || relocation.changed || dceChanged;
+    const changed = pureInlineResult.changed || inlineResult.changed || rethrowRemoval.changed
+      || relocation.changed || dceChanged;
     if (!fix) {
       return;
     }
@@ -1336,6 +1386,9 @@ async function main(argv) {
         break;
       case 'optimize':
         await lintOrOptimizeCommand(args, { applyFix: true });
+        break;
+      case 'strip-rethrow-handlers':
+        stripRethrowHandlersCommand(args);
         break;
       case 'format':
         formatCommand(args);
