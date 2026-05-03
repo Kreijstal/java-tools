@@ -41,7 +41,7 @@ public final class JoinBlockSplitter {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: JoinBlockSplitter <input.class> <output.class> [--min-incoming N] [--max-insns N] [--leave-one-original] [--cleanup-jumps] [--split-diamonds] [--split-latches] [--merge-duplicate-blocks] [--merge-dispatches] [--merge-preheaders] [--split-init-preheaders] [--orient-null-dispatches] [--fold-entry-stores] [--fold-single-assignment-locals] [--verbose]");
+            System.err.println("Usage: JoinBlockSplitter <input.class> <output.class> [--min-incoming N] [--max-insns N] [--leave-one-original] [--cleanup-jumps] [--split-diamonds] [--split-latches] [--merge-duplicate-blocks] [--merge-duplicate-suffixes] [--merge-duplicate-suffix-ranges] [--merge-duplicate-max N] [--merge-dispatches] [--merge-preheaders] [--split-init-preheaders] [--orient-null-dispatches] [--fold-entry-stores] [--fold-single-assignment-locals] [--verbose]");
             System.err.println("       [--assume-static owner.name:desc=value]");
             System.exit(2);
         }
@@ -55,6 +55,9 @@ public final class JoinBlockSplitter {
         boolean splitDiamonds = false;
         boolean splitLatches = false;
         boolean mergeDuplicateBlocks = false;
+        boolean mergeDuplicateSuffixes = false;
+        boolean mergeDuplicateSuffixRanges = false;
+        int mergeDuplicateMax = 32;
         boolean mergeDispatches = false;
         boolean mergePreheaders = false;
         boolean splitInitPreheaders = false;
@@ -79,6 +82,12 @@ public final class JoinBlockSplitter {
                 splitLatches = true;
             } else if ("--merge-duplicate-blocks".equals(args[i])) {
                 mergeDuplicateBlocks = true;
+            } else if ("--merge-duplicate-suffixes".equals(args[i])) {
+                mergeDuplicateSuffixes = true;
+            } else if ("--merge-duplicate-suffix-ranges".equals(args[i])) {
+                mergeDuplicateSuffixRanges = true;
+            } else if ("--merge-duplicate-max".equals(args[i])) {
+                mergeDuplicateMax = Integer.parseInt(args[++i]);
             } else if ("--merge-dispatches".equals(args[i])) {
                 mergeDispatches = true;
             } else if ("--merge-preheaders".equals(args[i])) {
@@ -137,7 +146,7 @@ public final class JoinBlockSplitter {
                 deadRemoved += removeUnreachableCode(method);
             }
             if (mergeDuplicateBlocks) {
-                mergedBlocks += mergeDuplicateGotoBlocks(method, 32);
+                mergedBlocks += mergeDuplicateGotoBlocks(method, mergeDuplicateMax);
                 deadRemoved += removeUnreachableCode(method);
             }
             if (cleanupJumps && !mergeDispatches) {
@@ -160,6 +169,11 @@ public final class JoinBlockSplitter {
             }
             if (orientNullDispatches) {
                 orientedDispatches += orientNullDispatches(method);
+                deadRemoved += removeUnreachableCode(method);
+                cleanupCount += cleanupJumps(method);
+            }
+            if (mergeDuplicateSuffixes) {
+                mergedBlocks += mergeDuplicateGotoSuffixes(method, mergeDuplicateMax, mergeDuplicateSuffixRanges);
                 deadRemoved += removeUnreachableCode(method);
                 cleanupCount += cleanupJumps(method);
             }
@@ -202,7 +216,7 @@ public final class JoinBlockSplitter {
         if (splitLatches) {
             System.out.println("split latches: " + latchCount);
         }
-        if (mergeDuplicateBlocks) {
+        if (mergeDuplicateBlocks || mergeDuplicateSuffixes) {
             System.out.println("merged duplicate blocks: " + mergedBlocks);
         }
         if (mergeDispatches) {
@@ -998,6 +1012,59 @@ public final class JoinBlockSplitter {
         return changes;
     }
 
+    private static int mergeDuplicateGotoSuffixes(MethodNode method, int maxInsns, boolean replaceRanges) {
+        if (method.instructions == null || method.instructions.size() == 0) {
+            return 0;
+        }
+
+        Map<AbstractInsnNode, Integer> indexes = instructionIndexes(method.instructions);
+        Map<String, AbstractInsnNode> canonicalBySignature = new HashMap<>();
+        Map<LabelNode, AbstractInsnNode> replacements = new IdentityHashMap<>();
+        List<SuffixReplacement> rangeReplacements = new ArrayList<>();
+
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof FrameNode || insn instanceof LineNumberNode || insn instanceof LabelNode) {
+                continue;
+            }
+            String signature = gotoSuffixSignature(insn, indexes, maxInsns);
+            if (signature == null) {
+                continue;
+            }
+            AbstractInsnNode canonical = canonicalBySignature.get(signature);
+            if (canonical == null) {
+                canonicalBySignature.put(signature, insn);
+                continue;
+            }
+            LabelNode duplicateLabel = labelImmediatelyBefore(insn);
+            if (duplicateLabel != null && canonical != insn) {
+                replacements.put(duplicateLabel, canonical);
+            } else if (replaceRanges && canonical != insn) {
+                AbstractInsnNode endExclusive = gotoSuffixEndExclusive(insn, maxInsns);
+                if (endExclusive != null && !containsReferencedLabel(method, insn, endExclusive)) {
+                    rangeReplacements.add(new SuffixReplacement(insn, endExclusive, canonical));
+                }
+            }
+        }
+
+        if (replacements.isEmpty() && rangeReplacements.isEmpty()) {
+            return 0;
+        }
+
+        int changes = 0;
+        for (SuffixReplacement replacement : rangeReplacements) {
+            LabelNode target = ensureLabelBefore(method.instructions, replacement.target);
+            replaceRangeWithGoto(method.instructions, replacement.start, replacement.endExclusive, target);
+            changes += 1;
+        }
+
+        Map<LabelNode, LabelNode> replacementLabels = new IdentityHashMap<>();
+        for (Map.Entry<LabelNode, AbstractInsnNode> entry : replacements.entrySet()) {
+            replacementLabels.put(entry.getKey(), ensureLabelBefore(method.instructions, entry.getValue()));
+        }
+        changes += replaceJumpTargets(method, replacementLabels);
+        return changes;
+    }
+
     private static int mergeEquivalentDispatches(MethodNode method) {
         if (method.instructions == null || method.instructions.size() == 0) {
             return 0;
@@ -1296,6 +1363,15 @@ public final class JoinBlockSplitter {
             LabelNode target
     ) {
         AbstractInsnNode first = firstRealInstruction(start);
+        replaceRangeWithGoto(instructions, first, endExclusive, target);
+    }
+
+    private static void replaceRangeWithGoto(
+            InsnList instructions,
+            AbstractInsnNode first,
+            AbstractInsnNode endExclusive,
+            LabelNode target
+    ) {
         if (first == null) {
             return;
         }
@@ -1377,6 +1453,174 @@ public final class JoinBlockSplitter {
             }
         }
         return null;
+    }
+
+    private static String gotoSuffixSignature(
+            AbstractInsnNode start,
+            Map<AbstractInsnNode, Integer> indexes,
+            int maxInsns
+    ) {
+        StringBuilder signature = new StringBuilder();
+        int realCount = 0;
+        boolean sawConditional = false;
+        for (AbstractInsnNode insn = start; insn != null; insn = insn.getNext()) {
+            if (insn instanceof FrameNode || insn instanceof LineNumberNode || insn instanceof LabelNode) {
+                continue;
+            }
+            if (insn instanceof TableSwitchInsnNode || insn instanceof LookupSwitchInsnNode) {
+                return null;
+            }
+            realCount += 1;
+            if (realCount > maxInsns) {
+                return null;
+            }
+            appendInstructionSignature(signature, insn, indexes);
+            if (insn instanceof JumpInsnNode) {
+                int opcode = insn.getOpcode();
+                if (opcode == Opcodes.GOTO) {
+                    return sawConditional && realCount >= 2 ? signature.toString() : null;
+                }
+                if (opcode == Opcodes.JSR) {
+                    return null;
+                }
+                sawConditional = true;
+            }
+            if (isTerminal(insn.getOpcode())) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static AbstractInsnNode gotoSuffixEndExclusive(AbstractInsnNode start, int maxInsns) {
+        int realCount = 0;
+        boolean sawConditional = false;
+        for (AbstractInsnNode insn = start; insn != null; insn = insn.getNext()) {
+            if (insn instanceof FrameNode || insn instanceof LineNumberNode || insn instanceof LabelNode) {
+                continue;
+            }
+            if (insn instanceof TableSwitchInsnNode || insn instanceof LookupSwitchInsnNode) {
+                return null;
+            }
+            realCount += 1;
+            if (realCount > maxInsns) {
+                return null;
+            }
+            if (insn instanceof JumpInsnNode) {
+                int opcode = insn.getOpcode();
+                if (opcode == Opcodes.GOTO) {
+                    return sawConditional && realCount >= 2 ? insn.getNext() : null;
+                }
+                if (opcode == Opcodes.JSR) {
+                    return null;
+                }
+                sawConditional = true;
+            }
+            if (isTerminal(insn.getOpcode())) {
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private static boolean containsReferencedLabel(MethodNode method, AbstractInsnNode start, AbstractInsnNode endExclusive) {
+        Set<LabelNode> labels = new HashSet<>();
+        for (AbstractInsnNode insn = start; insn != null && insn != endExclusive; insn = insn.getNext()) {
+            if (insn instanceof LabelNode) {
+                labels.add((LabelNode) insn);
+            }
+        }
+        if (labels.isEmpty()) {
+            return false;
+        }
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn == start) {
+                insn = previousBefore(endExclusive);
+                if (insn == null) {
+                    break;
+                }
+                continue;
+            }
+            if (insn instanceof JumpInsnNode && labels.contains(((JumpInsnNode) insn).label)) {
+                return true;
+            }
+            if (insn instanceof TableSwitchInsnNode) {
+                TableSwitchInsnNode sw = (TableSwitchInsnNode) insn;
+                if (labels.contains(sw.dflt)) {
+                    return true;
+                }
+                for (LabelNode label : sw.labels) {
+                    if (labels.contains(label)) {
+                        return true;
+                    }
+                }
+            } else if (insn instanceof LookupSwitchInsnNode) {
+                LookupSwitchInsnNode sw = (LookupSwitchInsnNode) insn;
+                if (labels.contains(sw.dflt)) {
+                    return true;
+                }
+                for (LabelNode label : sw.labels) {
+                    if (labels.contains(label)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        if (method.tryCatchBlocks != null) {
+            for (TryCatchBlockNode block : method.tryCatchBlocks) {
+                if (labels.contains(block.start) || labels.contains(block.end) || labels.contains(block.handler)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static AbstractInsnNode previousBefore(AbstractInsnNode insn) {
+        return insn == null ? null : insn.getPrevious();
+    }
+
+    private static int replaceJumpTargets(MethodNode method, Map<LabelNode, LabelNode> replacements) {
+        int changes = 0;
+        for (AbstractInsnNode insn = method.instructions.getFirst(); insn != null; insn = insn.getNext()) {
+            if (insn instanceof JumpInsnNode) {
+                JumpInsnNode jump = (JumpInsnNode) insn;
+                LabelNode replacement = replacements.get(jump.label);
+                if (replacement != null) {
+                    jump.label = replacement;
+                    changes += 1;
+                }
+            } else if (insn instanceof TableSwitchInsnNode) {
+                TableSwitchInsnNode sw = (TableSwitchInsnNode) insn;
+                LabelNode replacement = replacements.get(sw.dflt);
+                if (replacement != null) {
+                    sw.dflt = replacement;
+                    changes += 1;
+                }
+                for (int i = 0; i < sw.labels.size(); i++) {
+                    replacement = replacements.get(sw.labels.get(i));
+                    if (replacement != null) {
+                        sw.labels.set(i, replacement);
+                        changes += 1;
+                    }
+                }
+            } else if (insn instanceof LookupSwitchInsnNode) {
+                LookupSwitchInsnNode sw = (LookupSwitchInsnNode) insn;
+                LabelNode replacement = replacements.get(sw.dflt);
+                if (replacement != null) {
+                    sw.dflt = replacement;
+                    changes += 1;
+                }
+                for (int i = 0; i < sw.labels.size(); i++) {
+                    replacement = replacements.get(sw.labels.get(i));
+                    if (replacement != null) {
+                        sw.labels.set(i, replacement);
+                        changes += 1;
+                    }
+                }
+            }
+        }
+        return changes;
     }
 
     private static void appendInstructionSignature(
@@ -1730,6 +1974,17 @@ public final class JoinBlockSplitter {
         return label;
     }
 
+    private static LabelNode labelImmediatelyBefore(AbstractInsnNode insn) {
+        AbstractInsnNode previous = insn.getPrevious();
+        while (previous instanceof FrameNode || previous instanceof LineNumberNode) {
+            previous = previous.getPrevious();
+        }
+        if (previous instanceof LabelNode) {
+            return (LabelNode) previous;
+        }
+        return null;
+    }
+
     private static boolean isTerminal(int opcode) {
         return opcode == Opcodes.ATHROW
                 || opcode == Opcodes.RET
@@ -1787,6 +2042,18 @@ public final class JoinBlockSplitter {
 
         private LoopPreheader(String key) {
             this.key = key;
+        }
+    }
+
+    private static final class SuffixReplacement {
+        private final AbstractInsnNode start;
+        private final AbstractInsnNode endExclusive;
+        private final AbstractInsnNode target;
+
+        private SuffixReplacement(AbstractInsnNode start, AbstractInsnNode endExclusive, AbstractInsnNode target) {
+            this.start = start;
+            this.endExclusive = endExclusive;
+            this.target = target;
         }
     }
 
