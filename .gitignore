@@ -26,6 +26,7 @@ scripts/krakatau-disasm
 tools/krakatau/Krakatau
 
 # Build output
+build/
 dist/
 
 # Playwright test artifacts
