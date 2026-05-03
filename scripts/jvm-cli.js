@@ -17,6 +17,7 @@ const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
 const { inlinePureMethods } = require('../src/inlinePureMethods');
 const { relocateTrivialHandlers } = require('../src/handlerRelocator');
 const { removeTrivialRethrowHandlers } = require('../src/removeTrivialRethrowHandlers');
+const { runPeepholeClean } = require('../src/peepholeClean');
 const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
 const { collectExceptionMetadata } = require('../src/exceptionMetadata');
 const { collectMethodCallers } = require('../src/callGraphMetadata');
@@ -32,7 +33,8 @@ Commands:
   purity <file.{j|class}> [--json] [--classpath paths] Report purity & reasons per method
   lint <file.{j|class}> [--fix] [--out file] [--xref-comments] [--stdout] Detect dead-code handler tricks; optionally apply fix
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
-  strip-rethrow-handlers <file.{j|class}> [--out file] Remove trivial rethrow handler traps only
+  strip-rethrow-handlers <file.{j|class}> [--out file] [--keep-handler-code] Remove trivial rethrow handler traps only
+  peephole-clean <file.{j|class}> [--out file] [--remove-handler-code] Run CFR-oriented peephole cleanup
   throws <file.{j|class}> [--json]                  Report declared & implicit exceptions per method
   callers <file.{j|class}> [--json] [--class C --method M --descriptor desc]
                                                   List callers for methods defined in the file
@@ -512,12 +514,15 @@ function writeArtifact(artifact, outputPath, options = {}) {
 
 function stripRethrowHandlersCommand(args) {
   let outPath = null;
+  let keepHandlerCode = false;
   const positional = [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (arg === '--out' || arg === '-o') {
       if (i + 1 >= args.length) throw new Error('--out requires a value');
       outPath = args[++i];
+    } else if (arg === '--keep-handler-code') {
+      keepHandlerCode = true;
     } else if (arg === '--help' || arg === '-h') {
       printHelp();
       return;
@@ -533,7 +538,9 @@ function stripRethrowHandlersCommand(args) {
   ensureFileExists(inputPath);
   const artifact = loadArtifact(inputPath);
   try {
-    const result = removeTrivialRethrowHandlers(artifact.astRoot);
+    const result = removeTrivialRethrowHandlers(artifact.astRoot, {
+      removeHandlerCode: !keepHandlerCode,
+    });
     if (!result.changed) {
       console.log('No trivial rethrow handlers found.');
       return;
@@ -543,6 +550,53 @@ function stripRethrowHandlersCommand(args) {
         `${index + 1}) ${removal.className}.${removal.methodName}${removal.descriptor} - Removed trivial rethrow handler ${removal.handlerLabel}.`,
       );
     });
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function peepholeCleanCommand(args) {
+  let outPath = null;
+  let removeHandlerCode = false;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--remove-handler-code') {
+      removeHandlerCode = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('peephole-clean requires exactly one input file');
+  }
+
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runPeepholeClean(artifact.astRoot, {
+      removeHandlerCode,
+    });
+    if (!result.changed) {
+      console.log('No peephole changes found.');
+      if (outPath) {
+        writeArtifact(artifact, outPath);
+      }
+      return;
+    }
+    console.log(`Peephole changes: ${result.changes}`);
+    console.log(`  rethrow handlers: ${result.details.rethrowHandlers}`);
+    console.log(`  nops: ${result.details.nops}`);
+    console.log(`  fallthrough gotos: ${result.details.fallthroughGotos}`);
+    console.log(`  unused labels: ${result.details.unusedLabels}`);
     writeArtifact(artifact, outPath);
   } finally {
     artifact.cleanup();
@@ -1389,6 +1443,9 @@ async function main(argv) {
         break;
       case 'strip-rethrow-handlers':
         stripRethrowHandlersCommand(args);
+        break;
+      case 'peephole-clean':
+        peepholeCleanCommand(args);
         break;
       case 'format':
         formatCommand(args);

@@ -73,3 +73,19 @@ test('removeTrivialRethrowHandlers preserves handlers with normal branch referen
   t.equal(code.exceptionTable.length, 1, 'exception table entry remains');
   t.end();
 });
+
+test('removeTrivialRethrowHandlers can keep handler code as a CFR-friendly sentinel', (t) => {
+  const ast = createTrapAst();
+  const removal = removeTrivialRethrowHandlers(ast, { removeHandlerCode: false });
+  t.ok(removal.changed, 'trap handler should be removed from exception table');
+
+  const code = ast.classes[0].items[0].method.attributes[0].code;
+  t.equal(code.exceptionTable.length, 0, 'exception table is now empty');
+
+  const ops = code.codeItems
+    .map((item) => item.instruction)
+    .filter(Boolean)
+    .map((instruction) => (typeof instruction === 'string' ? instruction : instruction.op));
+  t.deepEqual(ops, ['goto', 'athrow', 'return'], 'handler athrow remains in the instruction stream');
+  t.end();
+});

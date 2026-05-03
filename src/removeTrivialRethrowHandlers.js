@@ -1,6 +1,6 @@
 'use strict';
 
-function removeTrivialRethrowHandlers(astRoot) {
+function removeTrivialRethrowHandlers(astRoot, options = {}) {
   let changed = false;
   const removals = [];
 
@@ -11,7 +11,7 @@ function removeTrivialRethrowHandlers(astRoot) {
         continue;
       }
       const method = item.method;
-      const result = removeFromMethod(method);
+      const result = removeFromMethod(method, options);
       if (result.changed) {
         changed = true;
         result.removals.forEach((removal) => {
@@ -29,7 +29,7 @@ function removeTrivialRethrowHandlers(astRoot) {
   return { changed, removals };
 }
 
-function removeFromMethod(method) {
+function removeFromMethod(method, options = {}) {
   const codeAttr = (method.attributes || []).find((attr) => attr && attr.type === 'code');
   if (!codeAttr || !codeAttr.code || !Array.isArray(codeAttr.code.codeItems)) {
     return { changed: false, removals: [] };
@@ -83,8 +83,10 @@ function removeFromMethod(method) {
   }
 
   code.exceptionTable = filtered;
-  removeDeadAthrowInstructions(code.codeItems, removableBlocks);
-  const removedGotos = removeFallthroughGotos(code.codeItems);
+  if (options.removeHandlerCode !== false) {
+    removeDeadAthrowInstructions(code.codeItems, removableBlocks);
+  }
+  const removedGotos = options.removeHandlerCode === false ? 0 : removeFallthroughGotos(code.codeItems);
   return { changed: filtered.length !== exceptionTable.length || removedGotos > 0, removals };
 }
 
