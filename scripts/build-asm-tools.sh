@@ -23,7 +23,8 @@ fi
 mkdir -p build/asm-tools
 javac -cp "$ASM_JAR:$ASM_TREE_JAR:$ASM_ANALYSIS_JAR" \
   -d build/asm-tools \
-  tools/asm/JoinBlockSplitter.java
+  tools/asm/JoinBlockSplitter.java \
+  tools/asm/ReplaceMethodBody.java
 
 cat > build/asm-tools/run-join-block-splitter <<EOF
 #!/usr/bin/env bash
@@ -32,4 +33,11 @@ exec java -cp "$(pwd)/build/asm-tools:$ASM_JAR:$ASM_TREE_JAR:$ASM_ANALYSIS_JAR" 
 EOF
 chmod +x build/asm-tools/run-join-block-splitter
 
-echo "Built build/asm-tools/run-join-block-splitter"
+cat > build/asm-tools/run-replace-method-body <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec java -cp "$(pwd)/build/asm-tools:$ASM_JAR:$ASM_TREE_JAR:$ASM_ANALYSIS_JAR" ReplaceMethodBody "\$@"
+EOF
+chmod +x build/asm-tools/run-replace-method-body
+
+echo "Built build/asm-tools/run-join-block-splitter and build/asm-tools/run-replace-method-body"
