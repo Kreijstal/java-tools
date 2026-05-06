@@ -35,9 +35,12 @@ const BLOCK_END_OPCODES = new Set([
 function runMultiEntryLoopNormalizer(astRoot, options = {}) {
   const minIncoming = Math.max(2, options.minIncoming || 2);
   const maxCloneInsns = Math.max(1, options.maxCloneInsns || 64);
+  const maxJoinCloneInsns = Math.max(1, options.maxJoinCloneInsns || 4);
+  const joinSplit = options.joinSplit !== false;
   const verbose = !!options.verbose;
 
   let totalSplits = 0;
+  let totalJoinSplits = 0;
   let totalMerges = 0;
 
   for (const classItem of (astRoot.classes || [])) {
@@ -49,12 +52,15 @@ function runMultiEntryLoopNormalizer(astRoot, options = {}) {
       if (!Array.isArray(codeItems) || codeItems.length === 0) continue;
 
       const exceptionTable = Array.isArray(codeAttr.code.exceptionTable) ? codeAttr.code.exceptionTable : [];
-      const splits = normalizeMethod(codeItems, exceptionTable, {
-        minIncoming, maxCloneInsns, verbose,
+      const result = normalizeMethod(codeItems, exceptionTable, {
+        minIncoming, maxCloneInsns, maxJoinCloneInsns, joinSplit, verbose,
         owner: classItem.className, name: item.method.name, desc: item.method.descriptor,
       });
+      const splits = result.splits;
+      const joinSplits = result.joinSplits;
       totalSplits += splits;
-      if (splits > 0) {
+      totalJoinSplits += joinSplits;
+      if (splits > 0 || joinSplits > 0) {
         const merged = mergeAdjacentDuplicateBlocks(codeItems, exceptionTable);
         totalMerges += merged;
         // collapseLoopHeaderDuplicates is intentionally not invoked: the
@@ -67,7 +73,12 @@ function runMultiEntryLoopNormalizer(astRoot, options = {}) {
     }
   }
 
-  return { changed: totalSplits > 0, splits: totalSplits, merges: totalMerges };
+  return {
+    changed: totalSplits > 0 || totalJoinSplits > 0,
+    splits: totalSplits,
+    joinSplits: totalJoinSplits,
+    merges: totalMerges,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -75,12 +86,13 @@ function runMultiEntryLoopNormalizer(astRoot, options = {}) {
 // ---------------------------------------------------------------------------
 
 function normalizeMethod(codeItems, exceptionTable, opts) {
-  const { minIncoming, maxCloneInsns, verbose, owner, name, desc } = opts;
+  const { minIncoming, maxCloneInsns, maxJoinCloneInsns, joinSplit, verbose, owner, name, desc } = opts;
 
   // Snapshot the incoming-jump map. We must collect candidates before mutating
   // anything, then walk them; each split shifts indexes so we re-resolve as needed.
   const incoming = collectIncomingJumps(codeItems);
   const handlerLabels = collectHandlerLabels(exceptionTable);
+  const exceptionRangeLabels = collectExceptionRangeLabels(exceptionTable);
 
   const candidates = [];
   for (const [label, jumps] of incoming) {
@@ -88,7 +100,16 @@ function normalizeMethod(codeItems, exceptionTable, opts) {
     if (handlerLabels.has(label)) continue;
     candidates.push({ label, jumps });
   }
-  if (candidates.length === 0) return 0;
+  if (candidates.length === 0) {
+    if (joinSplit) {
+      const joinSplits = splitForwardOnlyJoins(codeItems, exceptionTable, {
+        minIncoming, maxJoinCloneInsns, verbose, owner, name, desc,
+        handlerLabels, exceptionRangeLabels,
+      });
+      return { splits: 0, joinSplits };
+    }
+    return { splits: 0, joinSplits: 0 };
+  }
 
   let splits = 0;
   for (const cand of candidates) {
@@ -180,7 +201,207 @@ function normalizeMethod(codeItems, exceptionTable, opts) {
       }
     }
   }
-  return splits;
+
+  let joinSplits = 0;
+  if (joinSplit) {
+    joinSplits = splitForwardOnlyJoins(codeItems, exceptionTable, {
+      minIncoming, maxJoinCloneInsns, verbose, owner, name, desc,
+      handlerLabels, exceptionRangeLabels,
+    });
+  }
+
+  return { splits, joinSplits };
+}
+
+// ---------------------------------------------------------------------------
+// Forward-only join splitting (tail duplication of fallthrough joins).
+// Inspired by JoinBlockSplitter.splitFallthroughJoins in asm-tools/.
+//
+// Targets the dominant marker pattern: a CONDITIONAL forward jump whose
+// target label ALSO has a fallthrough predecessor (i.e., the prior
+// instruction in source order is not a terminator/goto and just falls
+// through into this label). That's the canonical CFG diamond. We clone the
+// target's body, place the clone elsewhere, and redirect just THAT
+// conditional jump to its own private clone — the fallthrough path is
+// unaffected. Net effect: the join at the target label is broken.
+//
+// Critically, this is NOT "tail-duplicate all forward predecessors": that
+// approach pushes joins one level downstream and explodes marker counts.
+// Cloning per-conditional-jump for fallthrough-joined targets is much
+// narrower and matches what CFR can productively re-structure.
+// ---------------------------------------------------------------------------
+
+function splitForwardOnlyJoins(codeItems, exceptionTable, opts) {
+  const {
+    maxJoinCloneInsns, verbose, owner, name, desc,
+    handlerLabels, exceptionRangeLabels,
+  } = opts;
+
+  // Snapshot conditional jumps before mutation.
+  const condJumps = [];
+  for (let i = 0; i < codeItems.length; i++) {
+    const item = codeItems[i];
+    if (!item || !item.instruction) continue;
+    const op = getOp(item.instruction);
+    if (!CONDITIONAL_JUMPS.has(op)) continue;
+    if (typeof item.instruction.arg !== 'string') continue;
+    condJumps.push({ item, op });
+  }
+
+  // Process each target label at most once: the first conditional jump
+  // wins. Splitting the same target multiple times creates a fan of
+  // duplicated bodies that CFR can't structure.
+  const splitTargets = new Set();
+
+  let joinSplits = 0;
+  for (const cj of condJumps) {
+    // Re-resolve indices each time; prior splices may have shifted things.
+    const jumpIdx = codeItems.indexOf(cj.item);
+    if (jumpIdx < 0) continue;
+    const target = trimLabel(cj.item.instruction.arg);
+    if (handlerLabels.has(target)) continue;
+    if (exceptionRangeLabels.has(target)) continue;
+    if (target.startsWith('_meln_')) continue;
+    if (splitTargets.has(target)) continue;
+
+    const targetIdx = findLabelIndex(codeItems, target);
+    if (targetIdx <= jumpIdx) continue; // not forward
+
+    // Require the target to have ≥2 forward predecessors total — either a
+    // fallthrough plus this conditional, or this conditional plus another
+    // forward jump.  Pure single-predecessor labels aren't joins.
+    const hasFt = hasFallthroughPredecessor(codeItems, targetIdx);
+    const allJumps = collectJumpsToLabel(codeItems, target);
+    let forwardJumpCount = 0;
+    let hasBack = false;
+    for (const j of allJumps) {
+      if (j.idx >= targetIdx) { hasBack = true; break; }
+      forwardJumpCount++;
+    }
+    if (hasBack) continue;
+    const totalPreds = forwardJumpCount + (hasFt ? 1 : 0);
+    if (totalPreds < 2) continue;
+
+    // Extract a cloneable body. The existing extractor refuses conditionals
+    // and switches in the body and respects the cap.
+    const block = extractCloneableBlock(codeItems, targetIdx, maxJoinCloneInsns);
+    if (!block) continue;
+    const realInsns = block.body.filter((it) => it && it.instruction);
+    if (realInsns.length === 0) continue;
+    if (realInsns.length > maxJoinCloneInsns) continue;
+
+    // Body must end in a true terminator (goto/return/throw). Cloning
+    // fallthrough-ended bodies tends to inflate CFR markers because the
+    // duplicated trailing block creates new join structure CFR can't
+    // recover. Empirically dekobloko regresses on every class with
+    // ifle/ifne/etc. cloning of fallthrough bodies; only terminator
+    // bodies are safe across the corpus.  Pass --max-join-insns 4
+    // (or any value) plus, in code, drop this filter for the
+    // CfrBadLabelLoop reduced testcase if you want to enable it.
+    if (block.fallthroughLabel) continue;
+
+
+
+    // Build clone, redirect just this conditional jump's target.
+    const cloneInfo = cloneBlock(codeItems, block);
+    // Insert at the target's "end" — the next labelDef after the target's
+    // body. The clone (when its body falls through) already terminates with
+    // a `goto fallthroughLabel`, so it's self-contained.  However, the
+    // instruction immediately before the insertion point may itself fall
+    // through into the clone.  Guard against that: if the prior real
+    // instruction at insertAt is NOT a terminator / unconditional jump,
+    // insert a guard `goto endLabel` before the clone so prior code skips
+    // past the clone to its natural target.
+    const endLabel = block.fallthroughLabel;
+    let insertAt;
+    if (endLabel) {
+      insertAt = findLabelIndex(codeItems, endLabel);
+    }
+    if (insertAt == null || insertAt < 0) {
+      insertAt = codeItems.length;
+    }
+    if (priorFallsThrough(codeItems, insertAt) && endLabel) {
+      codeItems.splice(insertAt, 0, { instruction: { op: 'goto', arg: endLabel } });
+      insertAt += 1;
+    }
+    codeItems.splice(insertAt, 0, ...cloneInfo.items);
+    retargetJump(cj.item.instruction, target, cloneInfo.entryLabel);
+    splitTargets.add(target);
+    joinSplits += 1;
+    if (verbose) {
+      const lastOp = (() => {
+        for (let i = block.body.length - 1; i >= 0; i--) {
+          const it = block.body[i];
+          if (it && it.instruction) return getOp(it.instruction);
+        }
+        return '?';
+      })();
+      console.log(`  [join-split] ${owner}.${name}${desc}: ${cj.op} forward edge cloned out of fallthrough join (label=${target} bodyInsns=${realInsns.length} lastOp=${lastOp})`);
+    }
+  }
+
+  return joinSplits;
+}
+
+/**
+ * Returns true iff the instruction immediately preceding `idx` (skipping
+ * labels/aux items) is a non-terminator that would fall through into idx.
+ * Used to decide whether a guard `goto` must be inserted before a clone
+ * spliced at idx so prior code doesn't fall into the clone's body.
+ */
+function priorFallsThrough(codeItems, idx) {
+  for (let i = idx - 1; i >= 0; i--) {
+    const item = codeItems[i];
+    if (!item) continue;
+    if (item.instruction) {
+      const op = getOp(item.instruction);
+      if (op === 'goto' || op === 'jsr') return false;
+      if (TERMINAL_OPCODES.has(op)) return false;
+      // Switches always end a block; control transfers via cases/default.
+      if (op === 'tableswitch' || op === 'lookupswitch') return false;
+      return true;
+    }
+    // labelDef or aux: keep scanning backwards.
+  }
+  return false;
+}
+
+/**
+ * Returns true iff the closest preceding real instruction (before the
+ * labelDef at `targetIdx`) is a non-terminator that would naturally fall
+ * through into this label.  Anchors the "fallthrough join" predicate.
+ */
+function hasFallthroughPredecessor(codeItems, targetIdx) {
+  for (let i = targetIdx - 1; i >= 0; i--) {
+    const item = codeItems[i];
+    if (!item) continue;
+    if (item.instruction) {
+      const op = getOp(item.instruction);
+      if (op === 'goto' || op === 'jsr') return false;
+      if (TERMINAL_OPCODES.has(op)) return false;
+      if (op === 'tableswitch' || op === 'lookupswitch') return false;
+      return true;
+    }
+    // labelDef or aux item: keep scanning backwards.
+  }
+  return false;
+}
+
+/**
+ * Collect every label name referenced by the exception table, including
+ * start/end range markers (in addition to handler entries which are
+ * already protected separately). Splitting these would change the scope of
+ * try-blocks and is unsafe.
+ */
+function collectExceptionRangeLabels(exceptionTable) {
+  const set = new Set();
+  for (const entry of exceptionTable || []) {
+    for (const key of ['startLbl', 'startLabel', 'start', 'endLbl', 'endLabel', 'end']) {
+      const v = entry[key];
+      if (typeof v === 'string') set.add(trimLabel(v));
+    }
+  }
+  return set;
 }
 
 // ---------------------------------------------------------------------------
