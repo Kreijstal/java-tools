@@ -18,6 +18,11 @@ const { inlinePureMethods } = require('../src/inlinePureMethods');
 const { relocateTrivialHandlers } = require('../src/handlerRelocator');
 const { removeTrivialRethrowHandlers } = require('../src/removeTrivialRethrowHandlers');
 const { runPeepholeClean } = require('../src/peepholeClean');
+const { runConditionInverter } = require('../src/conditionInverter');
+const { runMultiEntryLoopNormalizer } = require('../src/multiEntryLoopNormalizer');
+const { runCoalesceLoopLoad } = require('../src/coalesceLoopLoad');
+const { runDeadStaticBoolFlag } = require('../src/deadStaticBoolFlag');
+const { runInlineSharedExitGoto } = require('../src/inlineSharedExitGoto');
 const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
 const { collectExceptionMetadata } = require('../src/exceptionMetadata');
 const { collectMethodCallers } = require('../src/callGraphMetadata');
@@ -35,6 +40,10 @@ Commands:
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
   strip-rethrow-handlers <file.{j|class}> [--out file] [--keep-handler-code] Remove trivial rethrow handler traps only
   peephole-clean <file.{j|class}> [--out file] [--remove-handler-code] Run CFR-oriented peephole cleanup
+  condition-invert <file.{j|class}> [--out file] [--max-distance N]  Invert conditional gotos for CFR friendliness
+  multi-entry-normalize <file.{j|class}> [--out file] [--min-incoming N] [--max-clone-insns N] [--verbose]  Clone multi-entry loop headers (CFR-friendly)
+  coalesce-loop-load <file.{j|class}> [--out file] [--verbose]                             Fold "load X; goto T2; T1: load X; T2: <use>" into "goto T1"
+  dead-flag-eliminate <file.{j|class}> [--out file] [--flags Cls.f,Cls.g] [--verbose]      Remove dead conditionals on always-false static boolean flags
   throws <file.{j|class}> [--json]                  Report declared & implicit exceptions per method
   callers <file.{j|class}> [--json] [--class C --method M --descriptor desc]
                                                   List callers for methods defined in the file
@@ -597,6 +606,198 @@ function peepholeCleanCommand(args) {
     console.log(`  nops: ${result.details.nops}`);
     console.log(`  fallthrough gotos: ${result.details.fallthroughGotos}`);
     console.log(`  unused labels: ${result.details.unusedLabels}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function multiEntryNormalizeCommand(args) {
+  let outPath = null;
+  let minIncoming = 2;
+  let maxCloneInsns = 64;
+  let maxJoinCloneInsns = 4;
+  let joinSplit = true;
+  let verbose = false;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--min-incoming') {
+      if (i + 1 >= args.length) throw new Error('--min-incoming requires a value');
+      minIncoming = parseInt(args[++i], 10);
+    } else if (arg === '--max-clone-insns') {
+      if (i + 1 >= args.length) throw new Error('--max-clone-insns requires a value');
+      maxCloneInsns = parseInt(args[++i], 10);
+    } else if (arg === '--max-join-insns') {
+      if (i + 1 >= args.length) throw new Error('--max-join-insns requires a value');
+      maxJoinCloneInsns = parseInt(args[++i], 10);
+    } else if (arg === '--no-join-split') {
+      joinSplit = false;
+    } else if (arg === '--verbose') {
+      verbose = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('multi-entry-normalize requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runMultiEntryLoopNormalizer(artifact.astRoot, {
+      minIncoming, maxCloneInsns, maxJoinCloneInsns, joinSplit, verbose,
+    });
+    console.log(`MultiEntryLoopNormalizer: splits=${result.splits} joinSplits=${result.joinSplits || 0} merges=${result.merges}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function deadFlagEliminateCommand(args) {
+  let outPath = null;
+  let verbose = false;
+  let flags = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--flags') {
+      if (i + 1 >= args.length) throw new Error('--flags requires a value');
+      flags = args[++i];
+    } else if (arg === '--verbose') {
+      verbose = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('dead-flag-eliminate requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runDeadStaticBoolFlag(artifact.astRoot, { verbose, flags });
+    console.log(`DeadStaticBoolFlag: eliminated=${result.eliminated} methods=${result.methodsAffected}/${result.totalMethods}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function coalesceLoopLoadCommand(args) {
+  let outPath = null;
+  let verbose = false;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--verbose') {
+      verbose = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('coalesce-loop-load requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runCoalesceLoopLoad(artifact.astRoot, { verbose });
+    console.log(`CoalesceLoopLoad: fired=${result.fired}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function inlineSharedExitGotoCommand(args) {
+  let outPath = null;
+  let verbose = false;
+  let maxBodyInsns = 20;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--max-body-insns') {
+      if (i + 1 >= args.length) throw new Error('--max-body-insns requires a value');
+      maxBodyInsns = parseInt(args[++i], 10);
+    } else if (arg === '--verbose') {
+      verbose = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('inline-shared-exit-goto requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runInlineSharedExitGoto(artifact.astRoot, { verbose, maxBodyInsns });
+    console.log(`InlineSharedExitGoto: fired=${result.fired}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function conditionInvertCommand(args) {
+  let outPath = null;
+  let maxDistance = 300;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--max-distance') {
+      if (i + 1 >= args.length) throw new Error('--max-distance requires a value');
+      maxDistance = parseInt(args[++i], 10);
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('condition-invert requires exactly one input file');
+  }
+
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runConditionInverter(artifact.astRoot, { maxDistance });
+    console.log(`ConditionInverter: fixed=${result.fixed}`);
     writeArtifact(artifact, outPath);
   } finally {
     artifact.cleanup();
@@ -1446,6 +1647,21 @@ async function main(argv) {
         break;
       case 'peephole-clean':
         peepholeCleanCommand(args);
+        break;
+      case 'condition-invert':
+        conditionInvertCommand(args);
+        break;
+      case 'multi-entry-normalize':
+        multiEntryNormalizeCommand(args);
+        break;
+      case 'coalesce-loop-load':
+        coalesceLoopLoadCommand(args);
+        break;
+      case 'dead-flag-eliminate':
+        deadFlagEliminateCommand(args);
+        break;
+      case 'inline-shared-exit-goto':
+        inlineSharedExitGotoCommand(args);
         break;
       case 'format':
         formatCommand(args);

@@ -357,6 +357,65 @@ We welcome contributions! Areas for improvement:
 
 This project is licensed under the GNU Affero General Public License v3.0 (AGPL-3.0). See [LICENSE](LICENSE) for details.
 
+## 🧬 Bytecode Deobfuscation Pipeline
+
+`scripts/jvm-cli.js` exposes a series of bytecode-rewriting passes designed to
+turn obfuscated `.class` files into shapes that decompilers (CFR, Vineflower,
+…) can structure cleanly.
+
+### Available passes
+
+| CLI subcommand | What it does |
+|---|---|
+| `peephole-clean` | Removes nops, single-use fall-through gotos, unreferenced labels. Run it twice — once before structural passes (cleans up obfuscator noise) and once after (collapses anything the structural passes leave behind). |
+| `strip-rethrow-handlers --keep-handler-code` | Drops trivial catch-and-rethrow exception-table entries while retaining bare `athrow` sentinels in the instruction stream. Removing both made CFR worse; the Diobfuscator-style "table-only" strip is the right move. |
+| `multi-entry-normalize` | Clones loop-header blocks for each forward edge so loops have a single semantic entry. Includes a forward-only join splitter for fallthrough-joined CFG diamonds. |
+| `coalesce-loop-load` | Folds `LOAD X; goto T2; T1: LOAD X; T2: <use X>` into `goto T1`, eliminating the duplicate prefix that multi-entry normalization tends to leave. Handles local loads, `getstatic`, constants, and `aload_0` (gated on no `astore_0` in the method). |
+| `dead-flag-eliminate` | Removes dead conditionals on caller-supplied always-false static boolean flags. Pass `--flags Cls.f,Other.g`. |
+| `inline-shared-exit-goto` | Tail-duplicates a shared exit/merge target's body at the goto-site reached as the fallthrough of a conditional jump. Targets the exact CFG shape javac produces inline but the obfuscator collapsed into a shared `goto EXIT`. See `src/inlineSharedExitGoto.js` for the gates (≥4 forward predecessors, body ≥5 and ≤50 insns ending in goto/return, an "inner predecessor" inside the conditional's then-target body, etc.). |
+
+### Recommended pipeline
+
+```bash
+node scripts/jvm-cli.js peephole-clean foo.class --out foo.class
+node scripts/jvm-cli.js strip-rethrow-handlers foo.class --keep-handler-code --out foo.class
+node scripts/jvm-cli.js multi-entry-normalize foo.class --out foo.class
+node scripts/jvm-cli.js coalesce-loop-load foo.class --out foo.class
+node scripts/jvm-cli.js dead-flag-eliminate foo.class --flags Cls.f,Other.g --out foo.class
+node scripts/jvm-cli.js inline-shared-exit-goto foo.class --max-body-insns 50 --out foo.class
+node scripts/jvm-cli.js peephole-clean foo.class --out foo.class
+```
+
+**Important: round-trip the bytecode between passes.** Each CLI invocation
+parses the `.class`, applies the pass, and serializes back to bytecode. The
+serialize/parse round-trip normalizes stack-map frames, label aliases, and
+constant-pool ordering — and several passes assume that normalized state. The
+`scripts/bulk-pipeline.js` helper demonstrates the correct in-process
+round-trip flow for batch use.
+
+### Discovered transform: `inline-shared-exit-goto`
+
+The new pass came from a javac-roundtrip experiment. Hand-writing Java that
+matches the obfuscated semantics for `td.c(Lvl;)V` (including the unusual
+"var10==0 → method exit, not loop continue" branch) and letting javac compile
+it produces bytecode that CFR decompiles cleanly. Diffing that against the
+obfuscated bytecode revealed the difference: javac inlines the method-exit
+prologue at certain conditional-fallthrough sites; the obfuscator collapsed
+those inlines into a shared `goto EXIT` chain. Reproducing javac's inline
+shape (tail-duplicating the exit prologue at the right predecessor) drove
+`td` from 2 markers to 0 and `lk` from 3 to 0.
+
+### Bulk pipeline runner
+
+For batch deobfuscation:
+
+```bash
+# scripts/bulk-pipeline.js IN_DIR OUT_DIR [--skip-inline]
+node scripts/bulk-pipeline.js classes-original/ output/
+```
+
+Single Node.js process; round-trips between every pass.
+
 ## 🙏 Acknowledgments
 
 - **jvm_parser**: Java class file parsing library
