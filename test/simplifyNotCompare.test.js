@@ -39,6 +39,24 @@ test('simplifyCodeItems rewrites k > ~x into x > ~k', (t) => {
   t.end();
 });
 
+test('simplifyCodeItems rewrites k != ~x into x != ~k', (t) => {
+  const codeItems = [
+    { instruction: { op: 'bipush', arg: '-61' } },
+    { instruction: { op: 'iload', arg: '9' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems), 1, 'rewrites one equality comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'iload', arg: '9' } },
+    { instruction: { op: 'bipush', arg: '60' } },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
 test('simplifyCodeItems preserves labelled interior instructions', (t) => {
   const codeItems = [
     { instruction: { op: 'goto', arg: 'Lmid' } },
