@@ -8,7 +8,7 @@
 // exactly).
 const fs = require('fs');
 const path = require('path');
-const JT = '/home/kreijstal/git/java-tools';
+const JT = path.resolve(__dirname, '..');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require(JT + '/src/convert_tree');
 const { writeClassAstToClassFile } = require(JT + '/src/classAstToClassFile');
@@ -19,6 +19,9 @@ const { runMultiEntryLoopNormalizer } = require(JT + '/src/multiEntryLoopNormali
 const { runCoalesceLoopLoad } = require(JT + '/src/coalesceLoopLoad');
 const { runDeadStaticBoolFlag } = require(JT + '/src/deadStaticBoolFlag');
 const { runInlineSharedExitGoto } = require(JT + '/src/inlineSharedExitGoto');
+const { runInlineSharedReturn } = require(JT + '/src/inlineSharedReturn');
+const { runCkClipFlag } = require(JT + '/src/ckClipFlag');
+const { runQkExceptionSplit } = require(JT + '/src/qkExceptionSplit');
 
 const inDir = process.argv[2];
 const outDir = process.argv[3];
@@ -45,6 +48,9 @@ const passes = [
   { name: 'coalesce', fn: (a) => runCoalesceLoopLoad(a) },
   { name: 'dead-flag', fn: (a) => runDeadStaticBoolFlag(a) },
   ...(skipInline ? [] : [{ name: 'inline-exit', fn: (a) => runInlineSharedExitGoto(a, { maxBodyInsns: 50 }) }]),
+  { name: 'inline-return', fn: (a) => runInlineSharedReturn(a, { oncePerMethod: false }) },
+  { name: 'ck-clip-flag', fn: (a) => runCkClipFlag(a) },
+  { name: 'qk-exception-split', fn: (a) => runQkExceptionSplit(a) },
   { name: 'peephole2', fn: (a) => runPeepholeClean(a) },
 ];
 
