@@ -5,6 +5,8 @@ const LEFT_OPS = {
   if_icmpge: 'if_icmple',
   if_icmplt: 'if_icmpgt',
   if_icmple: 'if_icmpge',
+  if_icmpeq: 'if_icmpeq',
+  if_icmpne: 'if_icmpne',
 };
 
 const RIGHT_OPS = {
@@ -12,6 +14,8 @@ const RIGHT_OPS = {
   if_icmpge: 'if_icmpge',
   if_icmplt: 'if_icmplt',
   if_icmple: 'if_icmple',
+  if_icmpeq: 'if_icmpeq',
+  if_icmpne: 'if_icmpne',
 };
 
 function runSimplifyNotCompare(astRoot, options = {}) {
