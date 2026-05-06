@@ -120,3 +120,45 @@ test('runSimplifyNotCompare can restrict rewrites to char-derived locals', (t) =
   t.ok(codeItems.some((item) => item.instruction && item.instruction.op === 'iload' && item.instruction.arg === '7'), 'non-char local comparison remains');
   t.end();
 });
+
+test('runSimplifyNotCompare rewrites static char field comparisons', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'bipush', arg: '-94' } },
+                      { instruction: { op: 'getstatic', arg: ['Field', 'el', ['G', 'C']] } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites the static char comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'getstatic', arg: ['Field', 'el', ['G', 'C']] } },
+    { instruction: { op: 'bipush', arg: '93' } },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ]);
+  t.end();
+});

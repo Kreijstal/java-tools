@@ -55,15 +55,14 @@ function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems),
 }
 
 function matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals) {
-  const load = codeItems[i];
+  const value = codeItems[i];
   const bound = pushValue(codeItems[i + 3]);
   const branch = codeItems[i + 4];
   const branchOp = op(branch);
-  if (!isIntLoad(load) || op(codeItems[i + 1]) !== 'iconst_m1' || op(codeItems[i + 2]) !== 'ixor') return null;
-  if (allowedLocals && !allowedLocals.has(localIndex(load))) return null;
+  if (!isAllowedIntValue(value, allowedLocals) || op(codeItems[i + 1]) !== 'iconst_m1' || op(codeItems[i + 2]) !== 'ixor') return null;
   if (bound == null || !LEFT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 1, i + 4, usedLabels)) return null;
   return [
-    normalizeLoad(load),
+    normalizeValue(value),
     { instruction: pushInstruction(~bound) },
     { instruction: { op: LEFT_OPS[branchOp], arg: arg(branch) } },
   ];
@@ -71,14 +70,13 @@ function matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals) {
 
 function matchRightNotCompare(codeItems, i, usedLabels, allowedLocals) {
   const bound = pushValue(codeItems[i]);
-  const load = codeItems[i + 1];
+  const value = codeItems[i + 1];
   const branch = codeItems[i + 4];
   const branchOp = op(branch);
-  if (bound == null || !isIntLoad(load) || op(codeItems[i + 2]) !== 'iconst_m1' || op(codeItems[i + 3]) !== 'ixor') return null;
-  if (allowedLocals && !allowedLocals.has(localIndex(load))) return null;
+  if (bound == null || !isAllowedIntValue(value, allowedLocals) || op(codeItems[i + 2]) !== 'iconst_m1' || op(codeItems[i + 3]) !== 'ixor') return null;
   if (!RIGHT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 2, i + 4, usedLabels)) return null;
   return [
-    normalizeLoad(load, codeItems[i]),
+    normalizeValue(value, codeItems[i]),
     { instruction: pushInstruction(~bound) },
     { instruction: { op: RIGHT_OPS[branchOp], arg: arg(branch) } },
   ];
@@ -94,11 +92,30 @@ function plainRemovedItems(codeItems, start, end, usedLabels) {
   return true;
 }
 
-function normalizeLoad(item, labelSource = item) {
+function normalizeValue(item, labelSource = item) {
   const out = {};
   if (labelSource && labelSource.labelDef) out.labelDef = labelSource.labelDef;
-  out.instruction = { op: 'iload', arg: localIndex(item) };
+  out.instruction = isIntLoad(item) ? { op: 'iload', arg: localIndex(item) } : cloneInstruction(item.instruction);
   return out;
+}
+
+function isAllowedIntValue(item, allowedLocals) {
+  if (isCharProducer(item)) return true;
+  return isIntLoad(item) && (!allowedLocals || allowedLocals.has(localIndex(item)));
+}
+
+function isCharProducer(item) {
+  const itemOp = op(item);
+  const itemArg = arg(item);
+  if (itemOp === 'caload') return true;
+  if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(itemArg) === 'C') return true;
+  if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsChar(itemArg)) return true;
+  return false;
+}
+
+function cloneInstruction(instruction) {
+  if (!instruction || typeof instruction === 'string') return instruction;
+  return { ...instruction };
 }
 
 function isIntLoad(item) {
@@ -176,6 +193,14 @@ function methodReturnsChar(itemArg) {
     Array.isArray(itemArg[2]) &&
     typeof itemArg[2][1] === 'string' &&
     itemArg[2][1].endsWith(')C');
+}
+
+function fieldDescriptor(itemArg) {
+  return Array.isArray(itemArg) &&
+    itemArg[0] === 'Field' &&
+    Array.isArray(itemArg[2])
+    ? itemArg[2][1]
+    : null;
 }
 
 function isIntStore(item) {
