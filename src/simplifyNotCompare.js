@@ -60,11 +60,11 @@ function matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals) {
   const branch = codeItems[i + 4];
   const branchOp = op(branch);
   if (!isAllowedIntValue(value, allowedLocals) || op(codeItems[i + 1]) !== 'iconst_m1' || op(codeItems[i + 2]) !== 'ixor') return null;
-  if (bound == null || !LEFT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 1, i + 4, usedLabels)) return null;
+  if (bound == null || !LEFT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 1, i + 2, usedLabels)) return null;
   return [
     normalizeValue(value),
-    { instruction: pushInstruction(~bound) },
-    { instruction: { op: LEFT_OPS[branchOp], arg: arg(branch) } },
+    itemWithInstruction(codeItems[i + 3], pushInstruction(~bound)),
+    itemWithInstruction(branch, { op: LEFT_OPS[branchOp], arg: arg(branch) }),
   ];
 }
 
@@ -74,11 +74,11 @@ function matchRightNotCompare(codeItems, i, usedLabels, allowedLocals) {
   const branch = codeItems[i + 4];
   const branchOp = op(branch);
   if (bound == null || !isAllowedIntValue(value, allowedLocals) || op(codeItems[i + 2]) !== 'iconst_m1' || op(codeItems[i + 3]) !== 'ixor') return null;
-  if (!RIGHT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 2, i + 4, usedLabels)) return null;
+  if (!RIGHT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 2, i + 3, usedLabels)) return null;
   return [
     normalizeValue(value, codeItems[i]),
     { instruction: pushInstruction(~bound) },
-    { instruction: { op: RIGHT_OPS[branchOp], arg: arg(branch) } },
+    itemWithInstruction(branch, { op: RIGHT_OPS[branchOp], arg: arg(branch) }),
   ];
 }
 
@@ -96,6 +96,13 @@ function normalizeValue(item, labelSource = item) {
   const out = {};
   if (labelSource && labelSource.labelDef) out.labelDef = labelSource.labelDef;
   out.instruction = isIntLoad(item) ? { op: 'iload', arg: localIndex(item) } : cloneInstruction(item.instruction);
+  return out;
+}
+
+function itemWithInstruction(labelSource, instruction) {
+  const out = {};
+  if (labelSource && labelSource.labelDef) out.labelDef = labelSource.labelDef;
+  out.instruction = instruction;
   return out;
 }
 
@@ -178,7 +185,7 @@ function collectCharLocals(codeItems, method = null) {
     const item = codeItems[i];
     const next = codeItems[i + 1];
     const itemOp = op(item);
-    if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface') && methodReturnsChar(arg(item)) && isIntStore(next)) {
+    if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsChar(arg(item)) && isIntStore(next)) {
       locals.add(storeLocalIndex(next));
     }
     if (itemOp === 'caload' && isIntStore(next)) {
@@ -250,4 +257,4 @@ function trimLabel(label) {
   return typeof label === 'string' ? label.replace(/:$/, '') : label;
 }
 
-module.exports = { runSimplifyNotCompare, simplifyCodeItems };
+module.exports = { runSimplifyNotCompare, simplifyCodeItems, collectCharLocals };

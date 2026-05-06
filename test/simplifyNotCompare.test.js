@@ -206,3 +206,63 @@ test('runSimplifyNotCompare rewrites char parameter comparisons', (t) => {
   ]);
   t.end();
 });
+
+test('runSimplifyNotCompare tracks static char-return helpers into locals', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '()V',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'sipush', arg: '228' } },
+                      { instruction: { op: 'iload', arg: '7' } },
+                      { instruction: { op: 'invokestatic', arg: ['Method', 'un', ['a', '(IC)C']] } },
+                      { instruction: { op: 'istore', arg: '8' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'iload', arg: '8' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+
+  t.equal(result.rewrites, 1, 'rewrites comparison on static helper char local');
+  t.end();
+});
+
+test('simplifyCodeItems preserves branch labels on rewritten comparisons', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: 'iconst_m1' },
+    { labelDef: 'L1:', instruction: { op: 'iload', arg: '8' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { labelDef: 'Lbranch:', instruction: { op: 'if_icmpeq', arg: 'L2' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(['Lbranch'])), 1, 'rewrites the comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '8' } },
+    { instruction: 'iconst_0' },
+    { labelDef: 'Lbranch:', instruction: { op: 'if_icmpeq', arg: 'L2' } },
+  ]);
+  t.end();
+});
