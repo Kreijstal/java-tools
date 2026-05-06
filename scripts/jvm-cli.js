@@ -17,6 +17,7 @@ const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
 const { inlinePureMethods } = require('../src/inlinePureMethods');
 const { relocateTrivialHandlers } = require('../src/handlerRelocator');
 const { removeTrivialRethrowHandlers } = require('../src/removeTrivialRethrowHandlers');
+const { runRemoveShadowedExceptionHandlers } = require('../src/removeShadowedExceptionHandlers');
 const { runPeepholeClean } = require('../src/peepholeClean');
 const { runConditionInverter } = require('../src/conditionInverter');
 const { runMultiEntryLoopNormalizer } = require('../src/multiEntryLoopNormalizer');
@@ -39,6 +40,7 @@ Commands:
   lint <file.{j|class}> [--fix] [--out file] [--xref-comments] [--stdout] Detect dead-code handler tricks; optionally apply fix
   optimize <file.{j|class}> [--out file]            Apply dead-code optimization (alias for lint --fix)
   strip-rethrow-handlers <file.{j|class}> [--out file] [--keep-handler-code] Remove trivial rethrow handler traps only
+  remove-shadowed-exception-handlers <file.{j|class}> [--out file] Remove exception handlers shadowed by earlier identical ranges
   peephole-clean <file.{j|class}> [--out file] [--remove-handler-code] Run CFR-oriented peephole cleanup
   condition-invert <file.{j|class}> [--out file] [--max-distance N]  Invert conditional gotos for CFR friendliness
   multi-entry-normalize <file.{j|class}> [--out file] [--min-incoming N] [--max-clone-insns N] [--verbose]  Clone multi-entry loop headers (CFR-friendly)
@@ -557,6 +559,45 @@ function stripRethrowHandlersCommand(args) {
     result.removals.forEach((removal, index) => {
       console.log(
         `${index + 1}) ${removal.className}.${removal.methodName}${removal.descriptor} - Removed trivial rethrow handler ${removal.handlerLabel}.`,
+      );
+    });
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function removeShadowedExceptionHandlersCommand(args) {
+  let outPath = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('remove-shadowed-exception-handlers requires exactly one input file');
+  }
+
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runRemoveShadowedExceptionHandlers(artifact.astRoot);
+    if (!result.changed) {
+      console.log('No shadowed exception handlers found.');
+      return;
+    }
+    result.removals.forEach((removal, index) => {
+      console.log(
+        `${index + 1}) ${removal.className}.${removal.methodName}${removal.descriptor} - Removed shadowed handler ${removal.handlerLabel} for ${removal.startLabel}->${removal.endLabel}.`,
       );
     });
     writeArtifact(artifact, outPath);
@@ -1644,6 +1685,9 @@ async function main(argv) {
         break;
       case 'strip-rethrow-handlers':
         stripRethrowHandlersCommand(args);
+        break;
+      case 'remove-shadowed-exception-handlers':
+        removeShadowedExceptionHandlersCommand(args);
         break;
       case 'peephole-clean':
         peepholeCleanCommand(args);
