@@ -41,7 +41,11 @@ function removeShadowedEntries(exceptionTable) {
     }
 
     const previous = seen.get(key);
-    if (previous) {
+    if (
+      previous &&
+      hasNestedWrapper(exceptionTable, previous.entry, entry) &&
+      handlerHasOnlyCoveredRanges(exceptionTable, previous.entry, entry)
+    ) {
       removals.push({
         index: i,
         shadowedByIndex: previous.index,
@@ -68,6 +72,59 @@ function removeShadowedEntries(exceptionTable) {
     exceptionTable.splice(0, exceptionTable.length, ...kept);
   }
   return removals;
+}
+
+function hasNestedWrapper(exceptionTable, firstHandlerEntry, laterHandlerEntry) {
+  const firstHandler = handlerLabel(firstHandlerEntry);
+  const laterHandler = handlerLabel(laterHandlerEntry);
+  if (firstHandler == null || laterHandler == null || firstHandler === laterHandler) return false;
+  const type = catchType(laterHandlerEntry);
+  return exceptionTable.some((entry) => (
+    startLabel(entry) === firstHandler &&
+    handlerLabel(entry) === laterHandler &&
+    catchType(entry) === type
+  ));
+}
+
+function handlerHasOnlyCoveredRanges(exceptionTable, firstHandlerEntry, laterHandlerEntry) {
+  const laterHandler = handlerLabel(laterHandlerEntry);
+  const type = catchType(laterHandlerEntry);
+  for (const entry of exceptionTable) {
+    if (handlerLabel(entry) !== laterHandler || catchType(entry) !== type) continue;
+    if (isDuplicateOfEarlierHandler(exceptionTable, entry)) continue;
+    if (isWrapperForEarlierHandler(exceptionTable, entry, laterHandler, type)) continue;
+    return false;
+  }
+  return true;
+}
+
+function isDuplicateOfEarlierHandler(exceptionTable, entry) {
+  const start = startLabel(entry);
+  const end = endLabel(entry);
+  const type = catchType(entry);
+  const handler = handlerLabel(entry);
+  for (const candidate of exceptionTable) {
+    if (candidate === entry) return false;
+    if (
+      startLabel(candidate) === start &&
+      endLabel(candidate) === end &&
+      catchType(candidate) === type &&
+      handlerLabel(candidate) !== handler
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isWrapperForEarlierHandler(exceptionTable, entry, laterHandler, type) {
+  const start = startLabel(entry);
+  if (handlerLabel(entry) !== laterHandler || catchType(entry) !== type) return false;
+  return exceptionTable.some((candidate) => (
+    candidate !== entry &&
+    handlerLabel(candidate) === start &&
+    catchType(candidate) === type
+  ));
 }
 
 function shadowKey(entry) {
