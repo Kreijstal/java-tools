@@ -24,6 +24,7 @@ const { runMultiEntryLoopNormalizer } = require('../src/multiEntryLoopNormalizer
 const { runCoalesceLoopLoad } = require('../src/coalesceLoopLoad');
 const { runDeadStaticBoolFlag } = require('../src/deadStaticBoolFlag');
 const { runInlineSharedExitGoto } = require('../src/inlineSharedExitGoto');
+const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
 const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
 const { collectExceptionMetadata } = require('../src/exceptionMetadata');
 const { collectMethodCallers } = require('../src/callGraphMetadata');
@@ -46,6 +47,7 @@ Commands:
   multi-entry-normalize <file.{j|class}> [--out file] [--min-incoming N] [--max-clone-insns N] [--verbose]  Clone multi-entry loop headers (CFR-friendly)
   coalesce-loop-load <file.{j|class}> [--out file] [--verbose]                             Fold "load X; goto T2; T1: load X; T2: <use>" into "goto T1"
   dead-flag-eliminate <file.{j|class}> [--out file] [--flags Cls.f,Cls.g] [--verbose]      Remove dead conditionals on always-false static boolean flags
+  simplify-not-compare <file.{j|class}> [--out file] Simplify comparisons against bitwise-not locals
   throws <file.{j|class}> [--json]                  Report declared & implicit exceptions per method
   callers <file.{j|class}> [--json] [--class C --method M --descriptor desc]
                                                   List callers for methods defined in the file
@@ -767,6 +769,36 @@ function coalesceLoopLoadCommand(args) {
   try {
     const result = runCoalesceLoopLoad(artifact.astRoot, { verbose });
     console.log(`CoalesceLoopLoad: fired=${result.fired}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function simplifyNotCompareCommand(args) {
+  let outPath = null;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('simplify-not-compare requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const result = runSimplifyNotCompare(artifact.astRoot);
+    console.log(`SimplifyNotCompare: rewrites=${result.rewrites}`);
     writeArtifact(artifact, outPath);
   } finally {
     artifact.cleanup();
@@ -1703,6 +1735,9 @@ async function main(argv) {
         break;
       case 'dead-flag-eliminate':
         deadFlagEliminateCommand(args);
+        break;
+      case 'simplify-not-compare':
+        simplifyNotCompareCommand(args);
         break;
       case 'inline-shared-exit-goto':
         inlineSharedExitGotoCommand(args);
