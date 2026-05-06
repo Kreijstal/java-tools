@@ -162,3 +162,47 @@ test('runSimplifyNotCompare rewrites static char field comparisons', (t) => {
   ]);
   t.end();
 });
+
+test('runSimplifyNotCompare rewrites char parameter comparisons', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '(IC)Z',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'iload', arg: '1' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'sipush', arg: '-161' } },
+                      { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites the char parameter comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'iload', arg: '1' } },
+    { instruction: { op: 'sipush', arg: '160' } },
+    { instruction: { op: 'if_icmplt', arg: 'L1' } },
+  ]);
+  t.end();
+});

@@ -26,7 +26,7 @@ function runSimplifyNotCompare(astRoot, options = {}) {
       for (const attr of item.method.attributes || []) {
         const codeItems = attr && attr.type === 'code' && attr.code && attr.code.codeItems;
         if (!Array.isArray(codeItems)) continue;
-        const allowedLocals = options.charLocalsOnly ? collectCharLocals(codeItems) : null;
+        const allowedLocals = options.charLocalsOnly ? collectCharLocals(codeItems, item.method) : null;
         rewrites += simplifyCodeItems(codeItems, collectUsedLabels(codeItems, attr.code.exceptionTable), allowedLocals);
       }
     }
@@ -171,8 +171,9 @@ function collectUsedLabels(codeItems = [], exceptionTable = []) {
   return used;
 }
 
-function collectCharLocals(codeItems) {
+function collectCharLocals(codeItems, method = null) {
   const locals = new Set();
+  for (const local of charParameterLocals(method)) locals.add(local);
   for (let i = 0; i < codeItems.length - 1; i += 1) {
     const item = codeItems[i];
     const next = codeItems[i + 1];
@@ -185,6 +186,38 @@ function collectCharLocals(codeItems) {
     }
   }
   return locals;
+}
+
+function charParameterLocals(method) {
+  const out = [];
+  if (!method || typeof method.descriptor !== 'string') return out;
+  let local = method.flags && method.flags.includes('static') ? 0 : 1;
+  const params = parseParameterDescriptors(method.descriptor);
+  for (const desc of params) {
+    if (desc === 'C') out.push(String(local));
+    local += (desc === 'J' || desc === 'D') ? 2 : 1;
+  }
+  return out;
+}
+
+function parseParameterDescriptors(descriptor) {
+  const close = descriptor.indexOf(')');
+  if (!descriptor.startsWith('(') || close < 0) return [];
+  const params = [];
+  for (let i = 1; i < close;) {
+    let start = i;
+    while (descriptor[i] === '[') i += 1;
+    if (descriptor[i] === 'L') {
+      const semi = descriptor.indexOf(';', i);
+      if (semi < 0 || semi > close) return params;
+      params.push(descriptor.slice(start, semi + 1));
+      i = semi + 1;
+    } else {
+      params.push(descriptor.slice(start, i + 1));
+      i += 1;
+    }
+  }
+  return params;
 }
 
 function methodReturnsChar(itemArg) {
