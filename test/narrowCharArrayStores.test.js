@@ -83,6 +83,28 @@ test('narrowCodeItems inserts char narrowing for char-derived local castore', (t
   t.end();
 });
 
+test('narrowCodeItems inserts char narrowing for constant castore', (t) => {
+  const codeItems = [
+    { instruction: { op: 'aload', arg: '3' } },
+    { instruction: { op: 'iload', arg: '4' } },
+    { instruction: { op: 'bipush', arg: '95' } },
+    { instruction: 'castore' },
+  ];
+
+  t.equal(narrowCodeItems(codeItems), 1, 'rewrites one constant char array store');
+  t.deepEqual(
+    codeItems.map((item) => item.instruction),
+    [
+      { op: 'aload', arg: '3' },
+      { op: 'iload', arg: '4' },
+      { op: 'bipush', arg: '95' },
+      'i2c',
+      'castore',
+    ],
+  );
+  t.end();
+});
+
 test('runNarrowCharArrayStores rewrites method code items', (t) => {
   const ast = {
     classes: [

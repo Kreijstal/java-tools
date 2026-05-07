@@ -18,6 +18,12 @@ function runNarrowCharArrayStores(astRoot) {
 function narrowCodeItems(codeItems, charLocals = collectCharLocals(codeItems)) {
   let rewrites = 0;
   for (let i = 0; i < codeItems.length; i += 1) {
+    if (i <= codeItems.length - 2 && pushValue(codeItems[i]) != null && op(codeItems[i + 1]) === 'castore') {
+      codeItems.splice(i + 1, 0, { instruction: 'i2c' });
+      rewrites += 1;
+      i += 1;
+      continue;
+    }
     if (i <= codeItems.length - 2 && charLocals.has(intLoadLocal(codeItems[i])) && op(codeItems[i + 1]) === 'castore') {
       codeItems.splice(i + 1, 0, { instruction: 'i2c' });
       rewrites += 1;
@@ -71,6 +77,14 @@ function intStoreLocal(item) {
   const itemOp = op(item);
   if (itemOp === 'istore') return String(arg(item));
   if (/^istore_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
+  return null;
+}
+
+function pushValue(item) {
+  const itemOp = op(item);
+  if (itemOp === 'iconst_m1') return -1;
+  if (/^iconst_[0-5]$/.test(itemOp || '')) return Number(itemOp.slice(-1));
+  if (itemOp === 'bipush' || itemOp === 'sipush') return Number(arg(item));
   return null;
 }
 
