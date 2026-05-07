@@ -31,20 +31,34 @@ function narrowCodeItems(codeItems, method = null) {
 
 function collectByteArrayLocals(codeItems, method = null) {
   const locals = new Set(byteArrayParameterLocals(method));
+  const arrayLocals = new Set(byteArrayArrayParameterLocals(method));
   for (let i = 0; i < codeItems.length - 1; i += 1) {
     if (isByteArrayProducer(codeItems[i]) && objectStoreLocal(codeItems[i + 1]) != null) {
       locals.add(objectStoreLocal(codeItems[i + 1]));
     }
+    if (isByteArrayArrayProducer(codeItems[i]) && objectStoreLocal(codeItems[i + 1]) != null) {
+      arrayLocals.add(objectStoreLocal(codeItems[i + 1]));
+    }
   }
-  return locals;
+  return { byteArrays: locals, byteArrayArrays: arrayLocals };
 }
 
-function hasKnownByteArrayProducer(codeItems, valueIndex, byteArrayLocals) {
+function hasKnownByteArrayProducer(codeItems, valueIndex, knownLocals) {
   for (let i = Math.max(0, valueIndex - 6); i < valueIndex; i += 1) {
     const item = codeItems[i];
     const local = objectLoadLocal(item);
-    if (local != null && byteArrayLocals.has(local)) return true;
+    if (local != null && knownLocals.byteArrays.has(local)) return true;
+    if (op(item) === 'aaload' && isKnownByteArrayArrayLoad(codeItems, i, knownLocals.byteArrayArrays)) return true;
     if (isByteArrayProducer(item)) return true;
+  }
+  return false;
+}
+
+function isKnownByteArrayArrayLoad(codeItems, i, byteArrayArrayLocals) {
+  for (let j = Math.max(0, i - 3); j < i; j += 1) {
+    const local = objectLoadLocal(codeItems[j]);
+    if (local != null && byteArrayArrayLocals.has(local)) return true;
+    if (isByteArrayArrayProducer(codeItems[j])) return true;
   }
   return false;
 }
@@ -55,6 +69,15 @@ function isByteArrayProducer(item) {
   if (itemOp === 'newarray' && itemArg === 'byte') return true;
   if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(itemArg) === '[B') return true;
   if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsByteArray(itemArg)) return true;
+  return false;
+}
+
+function isByteArrayArrayProducer(item) {
+  const itemOp = op(item);
+  const itemArg = arg(item);
+  if (itemOp === 'anewarray' && itemArg === '[B') return true;
+  if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(itemArg) === '[[B') return true;
+  if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsByteArrayArray(itemArg)) return true;
   return false;
 }
 
@@ -96,12 +119,20 @@ function pushValue(item) {
 }
 
 function byteArrayParameterLocals(method) {
+  return parameterLocals(method, '[B');
+}
+
+function byteArrayArrayParameterLocals(method) {
+  return parameterLocals(method, '[[B');
+}
+
+function parameterLocals(method, descriptor) {
   const out = [];
   if (!method || typeof method.descriptor !== 'string') return out;
   let local = method.flags && method.flags.includes('static') ? 0 : 1;
   const params = parseParameterDescriptors(method.descriptor);
   for (const desc of params) {
-    if (desc === '[B') out.push(String(local));
+    if (desc === descriptor) out.push(String(local));
     local += (desc === 'J' || desc === 'D') ? 2 : 1;
   }
   return out;
@@ -142,6 +173,13 @@ function methodReturnsByteArray(itemArg) {
     (itemArg[0] === 'Method' || itemArg[0] === 'InterfaceMethod') &&
     Array.isArray(itemArg[2]) &&
     itemArg[2][1] === '()[B';
+}
+
+function methodReturnsByteArrayArray(itemArg) {
+  return Array.isArray(itemArg) &&
+    (itemArg[0] === 'Method' || itemArg[0] === 'InterfaceMethod') &&
+    Array.isArray(itemArg[2]) &&
+    itemArg[2][1] === '()[[B';
 }
 
 function fieldDescriptor(itemArg) {
