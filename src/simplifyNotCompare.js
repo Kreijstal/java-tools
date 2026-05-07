@@ -36,7 +36,22 @@ function runSimplifyNotCompare(astRoot, options = {}) {
 
 function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems), allowedLocals = null) {
   let rewrites = 0;
-  for (let i = 0; i <= codeItems.length - 5; i += 1) {
+  for (let i = 0; i <= codeItems.length - 3; i += 1) {
+    const wideRight = matchWideRightNotCompare(codeItems, i, usedLabels, allowedLocals);
+    if (wideRight) {
+      codeItems.splice(i, wideRight.width, ...wideRight.items);
+      rewrites += 1;
+      i -= 1;
+      continue;
+    }
+    const impossibleNegative = matchImpossibleNegativeCharCompare(codeItems, i, usedLabels, allowedLocals);
+    if (impossibleNegative) {
+      codeItems.splice(i, impossibleNegative.width, ...impossibleNegative.items);
+      rewrites += 1;
+      i -= 1;
+      continue;
+    }
+    if (i > codeItems.length - 5) continue;
     const left = matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals);
     if (left) {
       codeItems.splice(i, 5, ...left);
@@ -52,6 +67,88 @@ function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems),
     }
   }
   return rewrites;
+}
+
+function matchWideRightNotCompare(codeItems, i, usedLabels, allowedLocals) {
+  const bound = pushValue(codeItems[i]);
+  if (bound == null) return null;
+  for (let valueEnd = i + 1; valueEnd <= Math.min(i + 4, codeItems.length - 4); valueEnd += 1) {
+    const value = codeItems[valueEnd];
+    const branch = codeItems[valueEnd + 3];
+    const branchOp = op(branch);
+    if (!isCharProducer(value) || !isAllowedIntValue(value, allowedLocals)) continue;
+    if (op(codeItems[valueEnd + 1]) !== 'iconst_m1' || op(codeItems[valueEnd + 2]) !== 'ixor') continue;
+    if (!RIGHT_OPS[branchOp]) continue;
+    const valueItems = codeItems.slice(i + 1, valueEnd + 1);
+    if (!isSimpleStringCharAtValueItems(valueItems)) continue;
+    if (!plainMovableItems(valueItems, usedLabels)) continue;
+    if (!plainRemovedItems(codeItems, valueEnd + 1, valueEnd + 2, usedLabels)) continue;
+    const movedValueItems = valueItems.map((item, offset) => offset === 0 ? copyItem(item, codeItems[i]) : copyItem(item));
+    return {
+      width: valueEnd - i + 4,
+      items: [
+        ...movedValueItems,
+        { instruction: pushInstruction(~bound) },
+        itemWithInstruction(branch, { op: RIGHT_OPS[branchOp], arg: arg(branch) }),
+      ],
+    };
+  }
+  return null;
+}
+
+function isSimpleStringCharAtValueItems(items) {
+  if (items.length < 2) return false;
+  if (!isStringCharAt(items[items.length - 1])) return false;
+  if (!isPlainIntProducer(items[items.length - 2])) return false;
+  return isObjectProducerChain(items.slice(0, -2));
+}
+
+function matchImpossibleNegativeCharCompare(codeItems, i, usedLabels, allowedLocals) {
+  const direct = matchImpossibleNegativeCharCompareValueFirst(codeItems, i, usedLabels, allowedLocals);
+  if (direct) return direct;
+  return matchImpossibleNegativeCharCompareConstantFirst(codeItems, i, usedLabels, allowedLocals);
+}
+
+function matchImpossibleNegativeCharCompareValueFirst(codeItems, i, usedLabels, allowedLocals) {
+  const value = codeItems[i];
+  const constant = pushValue(codeItems[i + 1]);
+  const branch = codeItems[i + 2];
+  if (!isAllowedIntValue(value, allowedLocals) || constant !== -1) return null;
+  if (!plainRemovedItems(codeItems, i + 1, i + 1, usedLabels)) return null;
+  return impossibleNegativeRewrite(value, branch, 3);
+}
+
+function matchImpossibleNegativeCharCompareConstantFirst(codeItems, i, usedLabels, allowedLocals) {
+  const constant = pushValue(codeItems[i]);
+  const value = codeItems[i + 1];
+  const branch = codeItems[i + 2];
+  if (constant !== -1 || !isAllowedIntValue(value, allowedLocals)) return null;
+  if (!plainRemovedItems(codeItems, i, i, usedLabels)) return null;
+  return impossibleNegativeRewrite(value, branch, 3);
+}
+
+function impossibleNegativeRewrite(value, branch, width) {
+  const branchOp = op(branch);
+  const target = arg(branch);
+  if (branchOp !== 'if_icmpne' && branchOp !== 'if_icmpeq') return null;
+  const valueItems = isCharProducer(value) ? [normalizeValue(value), { instruction: 'pop' }] : [];
+  const branchReplacementLabel = valueItems.length === 0 ? value : branch;
+  if (branchOp === 'if_icmpne') {
+    return {
+      width,
+      items: [
+        ...valueItems,
+        itemWithInstruction(branchReplacementLabel, { op: 'goto', arg: target }),
+      ],
+    };
+  }
+  return {
+    width,
+    items: [
+      ...valueItems,
+      itemWithInstruction(branchReplacementLabel, 'nop'),
+    ],
+  };
 }
 
 function matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals) {
@@ -82,6 +179,15 @@ function matchRightNotCompare(codeItems, i, usedLabels, allowedLocals) {
   ];
 }
 
+function plainMovableItems(items, usedLabels) {
+  for (const item of items) {
+    if (!item) return false;
+    if (item.labelDef && usedLabels.has(trimLabel(item.labelDef))) return false;
+    if (item.stackMapFrame || item.lineNumber) return false;
+  }
+  return true;
+}
+
 function plainRemovedItems(codeItems, start, end, usedLabels) {
   for (let i = start; i <= end; i += 1) {
     const item = codeItems[i];
@@ -90,6 +196,13 @@ function plainRemovedItems(codeItems, start, end, usedLabels) {
     if (item.stackMapFrame || item.lineNumber) return false;
   }
   return true;
+}
+
+function copyItem(item, labelSource = item) {
+  const out = {};
+  if (labelSource && labelSource.labelDef) out.labelDef = labelSource.labelDef;
+  out.instruction = cloneInstruction(item.instruction);
+  return out;
 }
 
 function normalizeValue(item, labelSource = item) {
@@ -118,6 +231,31 @@ function isCharProducer(item) {
   if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(itemArg) === 'C') return true;
   if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsChar(itemArg)) return true;
   return false;
+}
+
+function isPlainIntProducer(item) {
+  return pushValue(item) != null || isIntLoad(item);
+}
+
+function isObjectProducerChain(items) {
+  if (!items.length) return false;
+  const firstOp = op(items[0]);
+  if (firstOp !== 'aload' && !/^aload_[0-3]$/.test(firstOp || '') && firstOp !== 'getstatic') return false;
+  for (let i = 1; i < items.length; i += 1) {
+    if (op(items[i]) !== 'getfield') return false;
+  }
+  return true;
+}
+
+function isStringCharAt(item) {
+  const itemArg = arg(item);
+  return op(item) === 'invokevirtual' &&
+    Array.isArray(itemArg) &&
+    itemArg[0] === 'Method' &&
+    itemArg[1] === 'java/lang/String' &&
+    Array.isArray(itemArg[2]) &&
+    itemArg[2][0] === 'charAt' &&
+    itemArg[2][1] === '(I)C';
 }
 
 function cloneInstruction(instruction) {
@@ -186,6 +324,9 @@ function collectCharLocals(codeItems, method = null) {
     const next = codeItems[i + 1];
     const itemOp = op(item);
     if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsChar(arg(item)) && isIntStore(next)) {
+      locals.add(storeLocalIndex(next));
+    }
+    if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(arg(item)) === 'C' && isIntStore(next)) {
       locals.add(storeLocalIndex(next));
     }
     if (itemOp === 'caload' && isIntStore(next)) {
