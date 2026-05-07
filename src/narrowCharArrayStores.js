@@ -8,16 +8,23 @@ function runNarrowCharArrayStores(astRoot) {
       for (const attr of item.method.attributes || []) {
         const codeItems = attr && attr.type === 'code' && attr.code && attr.code.codeItems;
         if (!Array.isArray(codeItems)) continue;
-        rewrites += narrowCodeItems(codeItems);
+        rewrites += narrowCodeItems(codeItems, collectCharLocals(codeItems));
       }
     }
   }
   return { changed: rewrites > 0, rewrites };
 }
 
-function narrowCodeItems(codeItems) {
+function narrowCodeItems(codeItems, charLocals = collectCharLocals(codeItems)) {
   let rewrites = 0;
-  for (let i = 0; i <= codeItems.length - 7; i += 1) {
+  for (let i = 0; i < codeItems.length; i += 1) {
+    if (i <= codeItems.length - 2 && charLocals.has(intLoadLocal(codeItems[i])) && op(codeItems[i + 1]) === 'castore') {
+      codeItems.splice(i + 1, 0, { instruction: 'i2c' });
+      rewrites += 1;
+      i += 1;
+      continue;
+    }
+    if (i > codeItems.length - 7) continue;
     const local = intLoadLocal(codeItems[i]);
     if (local == null) continue;
     if (intLoadLocal(codeItems[i + 1]) !== local) continue;
@@ -32,6 +39,25 @@ function narrowCodeItems(codeItems) {
     i += 6;
   }
   return rewrites;
+}
+
+function collectCharLocals(codeItems) {
+  const locals = new Set();
+  for (let i = 0; i < codeItems.length - 1; i += 1) {
+    if (isCharProducer(codeItems[i]) && intStoreLocal(codeItems[i + 1]) != null) {
+      locals.add(intStoreLocal(codeItems[i + 1]));
+    }
+  }
+  return locals;
+}
+
+function isCharProducer(item) {
+  const itemOp = op(item);
+  const itemArg = arg(item);
+  if (itemOp === 'caload') return true;
+  if ((itemOp === 'getstatic' || itemOp === 'getfield') && fieldDescriptor(itemArg) === 'C') return true;
+  if ((itemOp === 'invokevirtual' || itemOp === 'invokeinterface' || itemOp === 'invokestatic') && methodReturnsChar(itemArg)) return true;
+  return false;
 }
 
 function intLoadLocal(item) {
@@ -58,4 +84,20 @@ function arg(item) {
   return insn && typeof insn === 'object' ? insn.arg : null;
 }
 
-module.exports = { runNarrowCharArrayStores, narrowCodeItems };
+function methodReturnsChar(itemArg) {
+  return Array.isArray(itemArg) &&
+    (itemArg[0] === 'Method' || itemArg[0] === 'InterfaceMethod') &&
+    Array.isArray(itemArg[2]) &&
+    typeof itemArg[2][1] === 'string' &&
+    itemArg[2][1].endsWith(')C');
+}
+
+function fieldDescriptor(itemArg) {
+  return Array.isArray(itemArg) &&
+    itemArg[0] === 'Field' &&
+    Array.isArray(itemArg[2])
+    ? itemArg[2][1]
+    : null;
+}
+
+module.exports = { runNarrowCharArrayStores, narrowCodeItems, collectCharLocals };
