@@ -249,6 +249,103 @@ test('runSimplifyNotCompare tracks static char-return helpers into locals', (t) 
   t.end();
 });
 
+test('runSimplifyNotCompare tracks char fields into locals', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '()V',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'getstatic', arg: ['Field', 'el', ['G', 'C']] } },
+                      { instruction: { op: 'istore', arg: '5' } },
+                      { instruction: { op: 'iload', arg: '5' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'if_icmpge', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+
+  t.equal(result.rewrites, 1, 'rewrites comparison on char field local');
+  t.end();
+});
+
+test('simplifyCodeItems rewrites wide k != ~charAt comparisons', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'bipush', arg: '-92' } },
+    { instruction: { op: 'getstatic', arg: ['Field', 'vh', ['vh_h', 'Lhb;']] } },
+    { instruction: { op: 'getfield', arg: ['Field', 'hb', ['Y', 'Ljava/lang/String;']] } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/String', ['charAt', '(I)C']] } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set()), 1, 'rewrites one wide negative char comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'vh', ['vh_h', 'Lhb;']] } },
+    { instruction: { op: 'getfield', arg: ['Field', 'hb', ['Y', 'Ljava/lang/String;']] } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/String', ['charAt', '(I)C']] } },
+    { instruction: { op: 'bipush', arg: '91' } },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems does not treat charAt index arithmetic as compare bound', (t) => {
+  const codeItems = [
+    { instruction: { op: 'bipush', arg: '-33' } },
+    { instruction: 'aload_0' },
+    { instruction: { op: 'getfield', arg: ['Field', 'rk', ['E', 'Ljava/lang/String;']] } },
+    { instruction: { op: 'iload', arg: '3' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'iadd' },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/String', ['charAt', '(I)C']] } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set()), 0, 'leaves consumed index arithmetic alone');
+  t.equal(codeItems.length, 10, 'items are unchanged');
+  t.end();
+});
+
+test('simplifyCodeItems rewrites impossible char local == -1 comparisons', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '5' } },
+    { instruction: 'iconst_m1' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set(['5'])), 1, 'rewrites one impossible negative char local comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: 'nop' },
+  ]);
+  t.end();
+});
+
 test('simplifyCodeItems preserves branch labels on rewritten comparisons', (t) => {
   const codeItems = [
     { labelDef: 'L0:', instruction: 'iconst_m1' },
