@@ -61,6 +61,24 @@ test('narrowCodeItems avoids unknown bastore arrays', (t) => {
   t.end();
 });
 
+test('narrowCodeItems recognizes byte array rows from byte array arrays', (t) => {
+  const codeItems = [
+    { instruction: { op: 'sipush', arg: '256' } },
+    { instruction: { op: 'anewarray', arg: '[B' } },
+    { instruction: { op: 'astore', arg: '5' } },
+    { instruction: { op: 'aload', arg: '5' } },
+    { instruction: { op: 'iload', arg: '6' } },
+    { instruction: 'aaload' },
+    { instruction: { op: 'iload', arg: '8' } },
+    { instruction: { op: 'iload', arg: '7' } },
+    { instruction: 'bastore' },
+  ];
+
+  t.equal(narrowCodeItems(codeItems, { flags: ['static'], descriptor: '()V' }), 1, 'rewrites one byte array row store');
+  t.equal(codeItems[8].instruction, 'i2b');
+  t.end();
+});
+
 test('runNarrowByteArrayStores rewrites method code items', (t) => {
   const ast = {
     classes: [
