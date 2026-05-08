@@ -9,6 +9,7 @@ function runPeepholeClean(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     fallthroughGotos: 0,
+    unreachableInstructions: 0,
     unusedLabels: 0,
   };
 
@@ -21,13 +22,20 @@ function runPeepholeClean(astRoot, options = {}) {
   }
 
   for (let i = 0; i < 4; i += 1) {
-    const round = cleanOneRound(astRoot);
+    const round = cleanOneRound(astRoot, {
+      removeUnreachableCode: options.removeHandlerCode !== false,
+    });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
     details.fallthroughGotos += round.fallthroughGotos;
+    details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.threadedBranches + round.fallthroughGotos + round.unusedLabels;
-    if (round.nops + round.threadedBranches + round.fallthroughGotos + round.unusedLabels === 0) {
+    changes += round.nops + round.threadedBranches + round.fallthroughGotos +
+      round.unreachableInstructions + round.unusedLabels;
+    if (
+      round.nops + round.threadedBranches + round.fallthroughGotos +
+      round.unreachableInstructions + round.unusedLabels === 0
+    ) {
       break;
     }
   }
@@ -35,12 +43,21 @@ function runPeepholeClean(astRoot, options = {}) {
   return { changed: changes > 0, changes, details };
 }
 
-function cleanOneRound(astRoot) {
-  const details = { nops: 0, threadedBranches: 0, fallthroughGotos: 0, unusedLabels: 0 };
+function cleanOneRound(astRoot, options = {}) {
+  const details = {
+    nops: 0,
+    threadedBranches: 0,
+    fallthroughGotos: 0,
+    unreachableInstructions: 0,
+    unusedLabels: 0,
+  };
   forEachCode(astRoot, (code) => {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
     details.fallthroughGotos += removeSingleUseFallthroughGotos(code);
+    if (options.removeUnreachableCode !== false) {
+      details.unreachableInstructions += removeUnreachableAfterTerminal(code);
+    }
     details.unusedLabels += removeUnusedLabels(code);
   });
   return details;
@@ -111,6 +128,63 @@ function removeSingleUseFallthroughGotos(code) {
     }
   }
   return removed;
+}
+
+function removeUnreachableAfterTerminal(code) {
+  const codeItems = code.codeItems;
+  const used = collectControlFlowLabels(code);
+  const labelIndex = buildLabelIndex(codeItems);
+  let removed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || !isTerminalOpcode(getOpcode(item.instruction))) continue;
+    const dead = collectTrailingDeadBackedge(codeItems, used, labelIndex, i + 1, i);
+    if (!dead) continue;
+    for (let j = dead.end; j >= dead.start; j -= 1) {
+      if (codeItems[j] && codeItems[j].instruction) removed += 1;
+      codeItems.splice(j, 1);
+    }
+  }
+
+  return removed;
+}
+
+function collectTrailingDeadBackedge(codeItems, usedLabels, labelIndex, start, terminalIndex) {
+  let gotoCount = 0;
+  let end = start - 1;
+
+  for (let i = start; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item) continue;
+    if (item.labelDef && usedLabels.has(trimLabel(item.labelDef))) return null;
+    if (!item.instruction) {
+      end = i;
+      continue;
+    }
+    const opcode = getOpcode(item.instruction);
+    if (opcode !== 'goto' && opcode !== 'goto_w') return null;
+    const target = trimLabel(getInstructionArg(item.instruction));
+    const targetIndex = labelIndex.get(target);
+    if (targetIndex == null || targetIndex >= terminalIndex) return null;
+    gotoCount += 1;
+    end = i;
+  }
+
+  return gotoCount === 1 ? { start, end } : null;
+}
+
+function collectControlFlowLabels(code) {
+  const used = new Set();
+  for (const entry of code.exceptionTable || []) {
+    addLabel(used, entry.startLbl || entry.startLabel || entry.start);
+    addLabel(used, entry.endLbl || entry.endLabel || entry.end);
+    addLabel(used, entry.handlerLbl || entry.handlerLabel || entry.handler || entry.usingLbl);
+  }
+  for (const item of code.codeItems || []) {
+    collectInstructionLabels(item && item.instruction, used);
+  }
+  return used;
 }
 
 function removeUnusedLabels(code) {
@@ -297,6 +371,7 @@ module.exports = {
   runPeepholeClean,
   removeNops,
   threadBranchesThroughGoto,
+  removeUnreachableAfterTerminal,
   removeSingleUseFallthroughGotos,
   removeUnusedLabels,
 };

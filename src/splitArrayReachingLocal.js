@@ -29,9 +29,13 @@ function splitCode(code) {
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
-  let candidates = collectCandidates(code, cfg, analysis);
+  let candidates = mergeCandidates(
+    collectCandidates(code, cfg, analysis),
+    collectPrimitiveArrayLocalCandidates(code, analysis),
+  );
   if (candidates.length > 2) {
-    candidates = candidates.filter((candidate) => isSimpleIntArrayCandidate(code, analysis, candidate));
+    candidates = candidates.filter((candidate) =>
+      candidate.primitiveArray || isSimpleIntArrayCandidate(code, analysis, candidate));
     if (candidates.length > 8) return 0;
   }
   let rewrites = 0;
@@ -47,12 +51,36 @@ function splitCode(code) {
   for (const candidate of candidates.sort((a, b) => b.storeIndex - a.storeIndex)) {
     const storeIndex = items.indexOf(candidate.storeItem);
     if (storeIndex < 0) continue;
-    items.splice(storeIndex, 0, { instruction: 'dup' }, { instruction: storeRef(candidate.fresh) });
-    code.stackSize = String(Math.max(Number(code.stackSize || 0), 2));
+    if (candidate.primitiveArray) {
+      candidate.storeItem.instruction = storeRef(candidate.fresh);
+    } else {
+      items.splice(storeIndex, 0, { instruction: 'dup' }, { instruction: storeRef(candidate.fresh) });
+      code.stackSize = String(Math.max(Number(code.stackSize || 0), 2));
+    }
     rewrites += 1;
   }
 
   return rewrites;
+}
+
+function mergeCandidates(...groups) {
+  const byKey = new Map();
+  for (const group of groups) {
+    for (const candidate of group) {
+      const key = `${candidate.storeIndex}:${candidate.local}`;
+      let existing = byKey.get(key);
+      if (!existing) {
+        existing = { ...candidate, loadItems: [] };
+        byKey.set(key, existing);
+      }
+      if (candidate.arrayUse) existing.arrayUse = true;
+      if (candidate.primitiveArray && !existing.arrayUse) existing.primitiveArray = true;
+      for (const item of candidate.loadItems || []) {
+        if (!existing.loadItems.includes(item)) existing.loadItems.push(item);
+      }
+    }
+  }
+  return [...byKey.values()].filter((candidate) => candidate.loadItems.length > 0);
 }
 
 function collectCandidates(code, cfg, analysis) {
@@ -72,7 +100,41 @@ function collectCandidates(code, cfg, analysis) {
     const key = String(defId);
     let candidate = byStore.get(key);
     if (!candidate) {
-      candidate = { storeIndex: def.index, storeItem: items[def.index], local, loadItems: [] };
+      candidate = { storeIndex: def.index, storeItem: items[def.index], local, loadItems: [], arrayUse: true };
+      byStore.set(key, candidate);
+    }
+    candidate.loadItems.push(items[i]);
+  }
+  return [...byStore.values()].filter((candidate) => candidate.loadItems.length > 0);
+}
+
+function collectPrimitiveArrayLocalCandidates(code, analysis) {
+  const byStore = new Map();
+  const items = code.codeItems;
+  if (items.length > 2000) return [];
+  for (let i = 0; i < items.length; i += 1) {
+    const local = aloadLocal(items[i]);
+    if (local == null) continue;
+    const reaching = analysis.before[i] && analysis.before[i].get(local);
+    if (!reaching || reaching.size !== 1) continue;
+    const [defId] = reaching;
+    if (typeof defId !== 'number') continue;
+    const def = analysis.defs.get(defId);
+    if (!def || def.local !== local) continue;
+    if (isHandlerStore(code.exceptionTable, items[def.index])) continue;
+    if (!hasConflictingStore(items, def.index, local)) continue;
+    if (hasPrimitiveLocalWrite(items, local)) continue;
+    if (!reachesPrimitiveArrayValue(code, analysis, def.index, new Set())) continue;
+    const key = String(defId);
+    let candidate = byStore.get(key);
+    if (!candidate) {
+      candidate = {
+        storeIndex: def.index,
+        storeItem: items[def.index],
+        local,
+        loadItems: [],
+        primitiveArray: true,
+      };
       byStore.set(key, candidate);
     }
     candidate.loadItems.push(items[i]);
@@ -102,6 +164,60 @@ function reachesIntArrayValue(code, analysis, storeIndex, seen) {
   const [defId] = reaching;
   const def = analysis.defs.get(defId);
   return !!def && reachesIntArrayValue(code, analysis, def.index, seen);
+}
+
+function reachesPrimitiveArrayValue(code, analysis, storeIndex, seen) {
+  const prev = previousInstructionIndex(code.codeItems, storeIndex);
+  if (prev < 0) return false;
+  const prevOp = op(code.codeItems[prev]);
+  if (prevOp === 'newarray' && isPrimitiveArrayElement(arg(code.codeItems[prev]))) return true;
+  const desc = producerDescriptor(code.codeItems[prev]);
+  if (isPrimitiveArrayDescriptor(desc)) return true;
+  const sourceLocal = aloadLocal(code.codeItems[prev]);
+  if (sourceLocal == null) return false;
+  const key = `${storeIndex}:${sourceLocal}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+  const reaching = analysis.before[storeIndex] && analysis.before[storeIndex].get(sourceLocal);
+  if (!reaching || reaching.size !== 1) return false;
+  const [defId] = reaching;
+  const def = analysis.defs.get(defId);
+  return !!def && reachesPrimitiveArrayValue(code, analysis, def.index, seen);
+}
+
+function isPrimitiveArrayElement(value) {
+  return value === 'boolean' || value === 'byte' || value === 'char' || value === 'short' ||
+    value === 'int' || value === 'long' || value === 'float' || value === 'double';
+}
+
+function isPrimitiveArrayDescriptor(desc) {
+  return typeof desc === 'string' && /^\[+[ZBCSIJFD]$/.test(desc);
+}
+
+function hasPrimitiveLocalWrite(items, local) {
+  for (const item of items) {
+    if (primitiveStoreLocal(item) === String(local)) return true;
+    if (iincLocal(item) === String(local)) return true;
+  }
+  return false;
+}
+
+function primitiveStoreLocal(item) {
+  const itemOp = op(item);
+  if (itemOp === 'istore' || itemOp === 'lstore' || itemOp === 'fstore' || itemOp === 'dstore') {
+    return String(arg(item));
+  }
+  const match = /^(?:i|l|f|d)store_([0-3])$/.exec(itemOp || '');
+  return match ? match[1] : null;
+}
+
+function iincLocal(item) {
+  if (op(item) !== 'iinc') return null;
+  const value = arg(item);
+  if (Array.isArray(value)) return String(value[0]);
+  if (value && typeof value === 'object' && value.local != null) return String(value.local);
+  if (typeof value === 'string') return value.split(/\s+/)[0];
+  return null;
 }
 
 function producerDescriptor(item) {

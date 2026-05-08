@@ -131,6 +131,40 @@ test('peephole clean does not thread labels reached by fallthrough', (t) => {
   t.end();
 });
 
+test('peephole clean removes unreachable code after terminal instructions', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iconst_0' },
+    { instruction: 'ireturn' },
+    { labelDef: 'Ldead:', instruction: { op: 'goto', arg: 'L0' } },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.unreachableInstructions, 1);
+  t.deepEqual(
+    code(ast).codeItems.map((item) => item.instruction).filter(Boolean),
+    ['iconst_0', 'ireturn'],
+  );
+  t.end();
+});
+
+test('peephole clean keeps reachable labelled code after terminal instructions', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'Llive' } },
+    { instruction: 'return' },
+    { labelDef: 'Llive:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.unreachableInstructions, 0);
+  t.deepEqual(
+    code(ast).codeItems.map((item) => item.instruction).filter(Boolean),
+    ['iload_1', { op: 'ifeq', arg: 'Llive' }, 'return', 'return'],
+  );
+  t.end();
+});
+
 test('peephole clean keeps handler athrow sentinels by default', (t) => {
   const ast = astWith(
     [
