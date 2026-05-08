@@ -120,3 +120,55 @@ test('splits simple int array aliases when a large method has many candidates', 
   t.ok(loads.includes('9'));
   t.end();
 });
+
+test('moves primitive array store to fresh local for non-array direct uses', (t) => {
+  const code = {
+    localsSize: '4',
+    stackSize: '1',
+    codeItems: [
+      { labelDef: 'L0:', instruction: 'aload_0' },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: 'iconst_4' },
+      { instruction: { op: 'newarray', arg: 'byte' } },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: { op: 'aload', arg: '3' } },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'x', ['use', '([B)V']] } },
+      { instruction: 'aload_0' },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code), 1);
+  t.equal(code.localsSize, '5');
+  t.equal(code.stackSize, '1');
+  t.deepEqual(code.codeItems[4].instruction, { op: 'astore', arg: '4' });
+  t.deepEqual(code.codeItems[5].instruction, { op: 'aload', arg: '4' });
+  t.deepEqual(code.codeItems[8].instruction, { op: 'astore', arg: '3' });
+  t.end();
+});
+
+test('does not move primitive array stores from locals also written as primitives', (t) => {
+  const code = {
+    localsSize: '4',
+    stackSize: '1',
+    codeItems: [
+      { labelDef: 'L0:', instruction: 'iconst_0' },
+      { instruction: { op: 'istore', arg: '3' } },
+      { instruction: 'iconst_4' },
+      { instruction: { op: 'newarray', arg: 'byte' } },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: { op: 'aload', arg: '3' } },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'x', ['use', '([B)V']] } },
+      { instruction: 'aload_0' },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code), 0);
+  t.equal(code.localsSize, '4');
+  t.end();
+});

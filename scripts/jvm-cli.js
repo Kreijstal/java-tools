@@ -649,6 +649,7 @@ function peepholeCleanCommand(args) {
     console.log(`  nops: ${result.details.nops}`);
     console.log(`  threaded branches: ${result.details.threadedBranches}`);
     console.log(`  fallthrough gotos: ${result.details.fallthroughGotos}`);
+    console.log(`  unreachable instructions: ${result.details.unreachableInstructions}`);
     console.log(`  unused labels: ${result.details.unusedLabels}`);
     writeArtifact(artifact, outPath);
   } finally {
