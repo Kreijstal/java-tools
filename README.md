@@ -367,7 +367,7 @@ turn obfuscated `.class` files into shapes that decompilers (CFR, Vineflower,
 
 | CLI subcommand | What it does |
 |---|---|
-| `peephole-clean` | Removes nops, single-use fall-through gotos, unreferenced labels. Run it twice — once before structural passes (cleans up obfuscator noise) and once after (collapses anything the structural passes leave behind). |
+| `peephole-clean` | Removes nops, safe conditional-branch goto bridges, single-use fall-through gotos, unreferenced labels. Run it twice — once before structural passes (cleans up obfuscator noise) and once after (collapses anything the structural passes leave behind). |
 | `strip-rethrow-handlers --keep-handler-code` | Drops trivial catch-and-rethrow exception-table entries while retaining bare `athrow` sentinels in the instruction stream. Removing both made CFR worse; the Diobfuscator-style "table-only" strip is the right move. |
 | `multi-entry-normalize` | Clones loop-header blocks for each forward edge so loops have a single semantic entry. Includes a forward-only join splitter for fallthrough-joined CFG diamonds. |
 | `coalesce-loop-load` | Folds `LOAD X; goto T2; T1: LOAD X; T2: <use X>` into `goto T1`, eliminating the duplicate prefix that multi-entry normalization tends to leave. Handles local loads, `getstatic`, constants, and `aload_0` (gated on no `astore_0` in the method). |

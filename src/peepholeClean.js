@@ -7,6 +7,7 @@ function runPeepholeClean(astRoot, options = {}) {
   const details = {
     rethrowHandlers: 0,
     nops: 0,
+    threadedBranches: 0,
     fallthroughGotos: 0,
     unusedLabels: 0,
   };
@@ -22,10 +23,11 @@ function runPeepholeClean(astRoot, options = {}) {
   for (let i = 0; i < 4; i += 1) {
     const round = cleanOneRound(astRoot);
     details.nops += round.nops;
+    details.threadedBranches += round.threadedBranches;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.fallthroughGotos + round.unusedLabels;
-    if (round.nops + round.fallthroughGotos + round.unusedLabels === 0) {
+    changes += round.nops + round.threadedBranches + round.fallthroughGotos + round.unusedLabels;
+    if (round.nops + round.threadedBranches + round.fallthroughGotos + round.unusedLabels === 0) {
       break;
     }
   }
@@ -34,9 +36,10 @@ function runPeepholeClean(astRoot, options = {}) {
 }
 
 function cleanOneRound(astRoot) {
-  const details = { nops: 0, fallthroughGotos: 0, unusedLabels: 0 };
+  const details = { nops: 0, threadedBranches: 0, fallthroughGotos: 0, unusedLabels: 0 };
   forEachCode(astRoot, (code) => {
     details.nops += removeNops(code.codeItems);
+    details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
     details.fallthroughGotos += removeSingleUseFallthroughGotos(code);
     details.unusedLabels += removeUnusedLabels(code);
   });
@@ -68,6 +71,25 @@ function removeNops(codeItems) {
     }
   }
   return removed;
+}
+
+function threadBranchesThroughGoto(codeItems) {
+  let changed = 0;
+  const labelIndex = buildLabelIndex(codeItems);
+  for (const item of codeItems) {
+    if (!item || !item.instruction || !isConditionalBranch(getOpcode(item.instruction))) continue;
+    const target = trimLabel(getInstructionArg(item.instruction));
+    if (!target) continue;
+    if (countInstructionLabelReferences(codeItems, target) !== 1) continue;
+    if (hasFallthroughPredecessor(codeItems, labelIndex, target)) continue;
+    const bridge = firstInstructionAtLabel(codeItems, labelIndex, target);
+    if (!bridge || getOpcode(bridge.instruction) !== 'goto') continue;
+    const nextTarget = trimLabel(getInstructionArg(bridge.instruction));
+    if (!nextTarget || nextTarget === target) continue;
+    item.instruction = setInstructionArg(item.instruction, nextTarget);
+    changed += 1;
+  }
+  return changed;
 }
 
 function removeSingleUseFallthroughGotos(code) {
@@ -127,6 +149,48 @@ function collectUsedLabels(code) {
     collectInstructionLabels(item && item.instruction, used);
   }
   return used;
+}
+
+function buildLabelIndex(codeItems) {
+  const out = new Map();
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (item && item.labelDef) out.set(trimLabel(item.labelDef), i);
+  }
+  return out;
+}
+
+function firstInstructionAtLabel(codeItems, labelIndex, label) {
+  const start = labelIndex.get(trimLabel(label));
+  if (start == null) return null;
+  for (let i = start; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (i !== start && item && item.labelDef) return null;
+    if (item && item.instruction) return item;
+  }
+  return null;
+}
+
+function hasFallthroughPredecessor(codeItems, labelIndex, label) {
+  const targetIndex = labelIndex.get(trimLabel(label));
+  if (targetIndex == null) return false;
+  for (let i = targetIndex - 1; i >= 0; i -= 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction) continue;
+    return !isTerminalOpcode(getOpcode(item.instruction));
+  }
+  return false;
+}
+
+function isConditionalBranch(opcode) {
+  return /^if/.test(opcode || '');
+}
+
+function isTerminalOpcode(opcode) {
+  return opcode === 'goto' || opcode === 'goto_w' ||
+    opcode === 'return' || opcode === 'ireturn' || opcode === 'lreturn' ||
+    opcode === 'freturn' || opcode === 'dreturn' || opcode === 'areturn' ||
+    opcode === 'athrow' || opcode === 'tableswitch' || opcode === 'lookupswitch';
 }
 
 function countInstructionLabelReferences(codeItems, label) {
@@ -207,6 +271,11 @@ function getInstructionArg(instruction) {
   return instruction && typeof instruction === 'object' ? instruction.arg : null;
 }
 
+function setInstructionArg(instruction, arg) {
+  if (!instruction || typeof instruction !== 'object') return instruction;
+  return { ...instruction, arg };
+}
+
 function addLabel(set, label) {
   if (typeof label === 'string') {
     set.add(trimLabel(label));
@@ -227,6 +296,7 @@ function trimLabel(label) {
 module.exports = {
   runPeepholeClean,
   removeNops,
+  threadBranchesThroughGoto,
   removeSingleUseFallthroughGotos,
   removeUnusedLabels,
 };
