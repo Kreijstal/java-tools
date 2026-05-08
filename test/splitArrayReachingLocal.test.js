@@ -75,3 +75,48 @@ test('does not split handler exception stores', (t) => {
   t.equal(code.localsSize, '2');
   t.end();
 });
+
+test('splits simple int array aliases when a large method has many candidates', (t) => {
+  const code = {
+    localsSize: '6',
+    stackSize: '1',
+    codeItems: [
+      { labelDef: 'L0:', instruction: { op: 'invokestatic', arg: ['Method', 'b', ['h', '(I)[I']] } },
+      { instruction: 'astore_3' },
+      { instruction: 'aload_3' },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: { op: 'getstatic', arg: ['Field', 'o', ['o_g', '[I']] } },
+      { instruction: { op: 'astore', arg: '5' } },
+      { instruction: { op: 'aload', arg: '4' } },
+      { instruction: 'iload_1' },
+      { instruction: { op: 'aload', arg: '5' } },
+      { instruction: 'iload_1' },
+      { instruction: 'iaload' },
+      { instruction: 'iastore' },
+      { instruction: { op: 'getstatic', arg: ['Field', 'j', ['j_d', '[I']] } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: 'aload_3' },
+      { instruction: { op: 'astore', arg: '5' } },
+      { instruction: { op: 'aload', arg: '4' } },
+      { instruction: 'iload_1' },
+      { instruction: { op: 'aload', arg: '5' } },
+      { instruction: 'iload_1' },
+      { instruction: 'iaload' },
+      { instruction: 'iastore' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code), 4);
+  t.equal(code.localsSize, '10');
+  t.equal(code.stackSize, '2');
+  const loads = code.codeItems
+    .map((item) => item.instruction)
+    .filter((instruction) => instruction && typeof instruction === 'object' && instruction.op === 'aload')
+    .map((instruction) => instruction.arg);
+  t.ok(loads.includes('6'));
+  t.ok(loads.includes('7'));
+  t.ok(loads.includes('8'));
+  t.ok(loads.includes('9'));
+  t.end();
+});

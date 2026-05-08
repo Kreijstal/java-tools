@@ -85,15 +85,18 @@ test('skips large cast ranges', (t) => {
   t.end();
 });
 
-test('skips ranges that contain a backward branch before the store', (t) => {
+test('splits only pre-backedge loads when range loops through producer', (t) => {
   const code = {
     localsSize: '3',
+    stackSize: '1',
     codeItems: [
-      { labelDef: 'Loop:', instruction: 'aload_2' },
-      { instruction: { op: 'ifnull', arg: 'Done' } },
-      { instruction: { op: 'invokevirtual', arg: ['Method', 'vj', ['d', '(Z)Lbh;']] } },
+      { labelDef: 'Loop:', instruction: { op: 'invokevirtual', arg: ['Method', 'vj', ['d', '(Z)Lbh;']] } },
       { instruction: { op: 'checkcast', arg: 've' } },
       { instruction: 'astore_2' },
+      { instruction: 'aload_2' },
+      { instruction: { op: 'ifnull', arg: 'Done' } },
+      { instruction: 'aload_2' },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'fm', ['a', '(Lve;)V']] } },
       { instruction: { op: 'goto', arg: 'Loop' } },
       { labelDef: 'Done:', instruction: 'aload_2' },
       { instruction: { op: 'invokestatic', arg: ['Method', 'fm', ['a', '(BLbh;Lbh;)V']] } },
@@ -101,8 +104,13 @@ test('skips ranges that contain a backward branch before the store', (t) => {
     ],
   };
 
-  t.equal(rewriteCode(code), 0);
-  t.equal(code.localsSize, '3');
-  t.equal(code.codeItems[6].instruction, 'aload_2');
+  t.equal(rewriteCode(code), 1);
+  t.equal(code.localsSize, '4');
+  t.equal(code.stackSize, '2');
+  t.equal(code.codeItems[2].instruction, 'dup');
+  t.equal(code.codeItems[3].instruction, 'astore_3');
+  t.equal(code.codeItems[5].instruction, 'aload_3');
+  t.equal(code.codeItems[7].instruction, 'aload_3');
+  t.equal(code.codeItems[10].instruction, 'aload_2');
   t.end();
 });
