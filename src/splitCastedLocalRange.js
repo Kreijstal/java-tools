@@ -29,9 +29,9 @@ function rewriteCode(code) {
     const nextStore = findNextStore(items, i + 1, local);
     if (nextStore < 0) continue;
     if (nextStore - i > 32) continue;
-    const loads = collectLoads(items, i + 1, nextStore, local);
+    const splitEnd = firstBackwardBranchIntoRange(items, labels, i + 1, nextStore, i);
+    const loads = collectLoads(items, i + 1, splitEnd < 0 ? nextStore : splitEnd, local);
     if (!loads.length) continue;
-    if (hasBackwardBranchIntoRange(items, labels, i + 1, nextStore, i)) continue;
     candidates.push({ storeIndex: i, storeItem: items[i], local, loads: loads.map((idx) => items[idx]) });
   }
 
@@ -61,14 +61,14 @@ function buildLabelIndex(items) {
   return labels;
 }
 
-function hasBackwardBranchIntoRange(items, labels, start, end, storeIndex) {
+function firstBackwardBranchIntoRange(items, labels, start, end, storeIndex) {
   for (let i = start; i < end; i += 1) {
     const target = branchTarget(items[i]);
     if (!target) continue;
     const targetIndex = labels.get(target.replace(/:$/, ''));
-    if (targetIndex != null && targetIndex < storeIndex) return true;
+    if (targetIndex != null && targetIndex < storeIndex) return i;
   }
-  return false;
+  return -1;
 }
 
 function branchTarget(item) {

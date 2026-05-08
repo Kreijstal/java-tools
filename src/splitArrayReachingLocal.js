@@ -29,8 +29,11 @@ function splitCode(code) {
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
-  const candidates = collectCandidates(code, cfg, analysis);
-  if (candidates.length > 2) return 0;
+  let candidates = collectCandidates(code, cfg, analysis);
+  if (candidates.length > 2) {
+    candidates = candidates.filter((candidate) => isSimpleIntArrayCandidate(code, analysis, candidate));
+    if (candidates.length > 8) return 0;
+  }
   let rewrites = 0;
 
   for (const candidate of candidates) {
@@ -75,6 +78,45 @@ function collectCandidates(code, cfg, analysis) {
     candidate.loadItems.push(items[i]);
   }
   return [...byStore.values()].filter((candidate) => candidate.loadItems.length > 0);
+}
+
+function isSimpleIntArrayCandidate(code, analysis, candidate) {
+  if (!candidate.loadItems.every((item) => isIntArrayUse(code.codeItems, code.codeItems.indexOf(item)))) return false;
+  return reachesIntArrayValue(code, analysis, candidate.storeIndex, new Set());
+}
+
+function reachesIntArrayValue(code, analysis, storeIndex, seen) {
+  const prev = previousInstructionIndex(code.codeItems, storeIndex);
+  if (prev < 0) return false;
+  const prevOp = op(code.codeItems[prev]);
+  if (prevOp === 'newarray' && arg(code.codeItems[prev]) === 'int') return true;
+  const desc = producerDescriptor(code.codeItems[prev]);
+  if (desc === '[I') return true;
+  const sourceLocal = aloadLocal(code.codeItems[prev]);
+  if (sourceLocal == null) return false;
+  const key = `${storeIndex}:${sourceLocal}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+  const reaching = analysis.before[storeIndex] && analysis.before[storeIndex].get(sourceLocal);
+  if (!reaching || reaching.size !== 1) return false;
+  const [defId] = reaching;
+  const def = analysis.defs.get(defId);
+  return !!def && reachesIntArrayValue(code, analysis, def.index, seen);
+}
+
+function producerDescriptor(item) {
+  const insn = item && item.instruction;
+  if (!insn || typeof insn !== 'object') return null;
+  if (insn.op === 'getstatic' || insn.op === 'getfield') {
+    const ref = insn.arg;
+    return Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
+  }
+  if (/^invoke/.test(insn.op || '')) {
+    const ref = insn.arg;
+    const desc = Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
+    return typeof desc === 'string' ? desc.slice(desc.lastIndexOf(')') + 1) : null;
+  }
+  return null;
 }
 
 function reachingDefinitions(code, cfg) {
@@ -229,6 +271,16 @@ function isArrayUse(items, index) {
   return false;
 }
 
+function isIntArrayUse(items, index) {
+  for (let i = index + 1; i < Math.min(items.length, index + 8); i += 1) {
+    const itemOp = op(items[i]);
+    if (itemOp === 'iaload' || itemOp === 'iastore') return true;
+    if (ARRAY_LOADS.has(itemOp) || ARRAY_STORES.has(itemOp) || itemOp === 'arraylength') return false;
+    if (isBranch(itemOp) || RETURN_OPS.has(itemOp) || itemOp === 'athrow') break;
+  }
+  return false;
+}
+
 function hasConflictingStore(items, selfIndex, local) {
   for (let i = 0; i < items.length; i += 1) {
     if (i === selfIndex) continue;
@@ -244,6 +296,13 @@ function isHandlerStore(exceptionTable, item) {
 
 function findLastInstructionIndex(items, start, end) {
   for (let i = end; i >= start; i -= 1) {
+    if (items[i] && items[i].instruction) return i;
+  }
+  return -1;
+}
+
+function previousInstructionIndex(items, index) {
+  for (let i = index - 1; i >= 0; i -= 1) {
     if (items[i] && items[i].instruction) return i;
   }
   return -1;
