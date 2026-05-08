@@ -69,6 +69,68 @@ test('peephole clean removes single-use goto to following label', (t) => {
   t.end();
 });
 
+test('peephole clean threads conditional branches through goto bridges', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: 'return' },
+    { labelDef: 'L1:', instruction: { op: 'goto', arg: 'L2' } },
+    { labelDef: 'L2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.threadedBranches, 1);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L2' });
+  t.end();
+});
+
+test('peephole clean does not thread through labelled non-bridge blocks', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: 'return' },
+    { labelDef: 'L1:' },
+    { labelDef: 'Lmid:', instruction: { op: 'goto', arg: 'L2' } },
+    { labelDef: 'L2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.threadedBranches, 0);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L1' });
+  t.end();
+});
+
+test('peephole clean does not thread shared goto bridges', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: { op: 'goto', arg: 'L1' } },
+    { labelDef: 'L1:', instruction: { op: 'goto', arg: 'L2' } },
+    { labelDef: 'L2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.threadedBranches, 0);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L1' });
+  t.end();
+});
+
+test('peephole clean does not thread labels reached by fallthrough', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: 'iconst_0' },
+    { labelDef: 'L1:', instruction: { op: 'goto', arg: 'L2' } },
+    { labelDef: 'L2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.threadedBranches, 0);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L1' });
+  t.end();
+});
+
 test('peephole clean keeps handler athrow sentinels by default', (t) => {
   const ast = astWith(
     [

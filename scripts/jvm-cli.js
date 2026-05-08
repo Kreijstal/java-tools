@@ -647,6 +647,7 @@ function peepholeCleanCommand(args) {
     console.log(`Peephole changes: ${result.changes}`);
     console.log(`  rethrow handlers: ${result.details.rethrowHandlers}`);
     console.log(`  nops: ${result.details.nops}`);
+    console.log(`  threaded branches: ${result.details.threadedBranches}`);
     console.log(`  fallthrough gotos: ${result.details.fallthroughGotos}`);
     console.log(`  unused labels: ${result.details.unusedLabels}`);
     writeArtifact(artifact, outPath);
