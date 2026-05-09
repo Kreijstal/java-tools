@@ -44,7 +44,7 @@ function collectByteArrayLocals(codeItems, method = null) {
 }
 
 function hasKnownByteArrayProducer(codeItems, valueIndex, knownLocals) {
-  for (let i = Math.max(0, valueIndex - 6); i < valueIndex; i += 1) {
+  for (let i = Math.max(0, valueIndex - 24); i < valueIndex; i += 1) {
     const item = codeItems[i];
     const local = objectLoadLocal(item);
     if (local != null && knownLocals.byteArrays.has(local)) return true;

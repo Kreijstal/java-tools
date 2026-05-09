@@ -79,6 +79,28 @@ test('narrowCodeItems recognizes byte array rows from byte array arrays', (t) =>
   t.end();
 });
 
+test('narrowCodeItems recognizes byte array local through complex index expression', (t) => {
+  const codeItems = [
+    { instruction: { op: 'newarray', arg: 'byte' } },
+    { instruction: { op: 'astore', arg: '8' } },
+    { instruction: { op: 'aload', arg: '8' } },
+    { instruction: { op: 'iload', arg: '12' } },
+    { instruction: { op: 'iload', arg: '7' } },
+    { instruction: { op: 'getfield', arg: ['Field', 'pi', ['lc_b', 'I']] } },
+    { instruction: 'iconst_3' },
+    { instruction: 'imul' },
+    { instruction: 'iadd' },
+    { instruction: 'iconst_2' },
+    { instruction: 'iadd' },
+    { instruction: { op: 'iload', arg: '11' } },
+    { instruction: 'bastore' },
+  ];
+
+  t.equal(narrowCodeItems(codeItems, { flags: ['static'], descriptor: '()V' }), 1);
+  t.equal(codeItems[12].instruction, 'i2b');
+  t.end();
+});
+
 test('runNarrowByteArrayStores rewrites method code items', (t) => {
   const ast = {
     classes: [
