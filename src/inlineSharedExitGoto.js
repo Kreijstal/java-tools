@@ -346,11 +346,21 @@ function cloneBodyItems(body, owner, name) {
       out.push({ labelDef: `${renameMap.get(orig)}:` });
     }
     if (it.instruction) {
-      const cloned = JSON.parse(JSON.stringify(it));
+      const cloned = cloneValue(it);
       delete cloned.labelDef;
       remapInstructionLabels(cloned.instruction, renameMap);
       out.push(cloned);
     }
+  }
+  return out;
+}
+
+function cloneValue(value) {
+  if (value == null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(cloneValue);
+  const out = {};
+  for (const [key, child] of Object.entries(value)) {
+    out[key] = cloneValue(child);
   }
   return out;
 }

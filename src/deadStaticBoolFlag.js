@@ -1,11 +1,12 @@
 'use strict';
 
 /**
- * deadStaticBoolFlag — eliminate a static always-false boolean guard pattern.
+ * deadStaticBoolFlag — eliminate a static always-zero guard pattern.
  *
  * The obfuscator inserts a static boolean field (default value: false) that is
- * loaded into a local at method entry and consulted throughout to gate dead
- * branches. Concretely, the entry pattern is:
+ * loaded into a local and consulted throughout to gate dead branches. Some
+ * old clients use the same shape with an int zero flag; that case is opt-in
+ * via allowIntFlags. Concretely, the entry pattern is:
  *
  *     L0: getstatic Field FOO X Z
  *     L3: istore N
@@ -116,6 +117,10 @@ function fieldRefOf(arg) {
   return { cls, name: inner[0], desc: inner[1] };
 }
 
+function fieldKey(ref) {
+  return `${ref.cls}.${ref.name}`;
+}
+
 function trimLabel(label) {
   if (typeof label !== 'string') return label;
   return label.endsWith(':') ? label.slice(0, -1) : label;
@@ -148,7 +153,7 @@ function isLocalRewritten(codeItems, local, allowedSites) {
   return false;
 }
 
-function findEntryStoreSites(codeItems, alwaysFalseFields) {
+function findEntryStoreSites(codeItems, alwaysFalseFields, opts = {}) {
   // Returns { sites: Set of istore-codeItem-indices to exclude from
   // rewritten-checks, bindingDetails: [{ getstaticIdx, istoreIdx, local }] }.
   const sites = new Set();
@@ -159,7 +164,7 @@ function findEntryStoreSites(codeItems, alwaysFalseFields) {
     const op = getOp(item.instruction);
     if (op !== 'getstatic') continue;
     const ref = fieldRefOf(getArg(item.instruction));
-    if (!ref || ref.desc !== 'Z') continue;
+    if (!ref || (ref.desc !== 'Z' && !(opts.allowIntFlags && ref.desc === 'I'))) continue;
     if (!alwaysFalseFields.has(`${ref.cls}.${ref.name}`)) continue;
     // Find next real instruction (a labelDef-only item is OK between them).
     let j = i + 1;
@@ -183,7 +188,7 @@ function findEntryStoreSites(codeItems, alwaysFalseFields) {
 function eliminateInMethod(code, opts) {
   const codeItems = code.codeItems;
   if (!Array.isArray(codeItems) || codeItems.length === 0) return 0;
-  const { sites, bindingDetails } = findEntryStoreSites(codeItems, opts.alwaysFalseFields);
+  const { sites, bindingDetails } = findEntryStoreSites(codeItems, opts.alwaysFalseFields, opts);
   if (bindingDetails.length === 0) return 0;
   // Determine which locals are "clean" (never re-stored).
   const cleanLocals = new Set();
@@ -266,6 +271,7 @@ function eliminateInMethod(code, opts) {
 function runDeadStaticBoolFlag(astRoot, options = {}) {
   const alwaysFalseFields = parseFieldList(options.flags);
   const verbose = !!options.verbose;
+  const allowIntFlags = !!options.allowIntFlags;
   let totalEliminated = 0;
   let totalMethods = 0;
   let methodsAffected = 0;
@@ -278,6 +284,7 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
         totalMethods += 1;
         const eliminated = eliminateInMethod(attr.code, {
           alwaysFalseFields,
+          allowIntFlags,
           verbose,
           owner: classItem.className,
           name: item.method.name,
@@ -299,7 +306,230 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
   };
 }
 
+function discoverDeadStaticFlags(astRoot, options = {}) {
+  const allowIntFlags = !!options.allowIntFlags;
+  const candidates = collectZeroStaticFields(astRoot, { allowIntFlags });
+  const writesByField = collectStaticWrites(astRoot, candidates);
+  const deps = new Map();
+  const rejected = new Set();
+
+  for (const key of candidates.keys()) deps.set(key, new Set());
+
+  for (const [key, writes] of writesByField) {
+    for (const write of writes) {
+      const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
+      if (!guard) {
+        rejected.add(key);
+        continue;
+      }
+      deps.get(key).add(guard);
+    }
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [key, keyDeps] of deps) {
+      if (rejected.has(key)) continue;
+      for (const dep of keyDeps) {
+        if (!deps.has(dep) || rejected.has(dep)) {
+          rejected.add(key);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+
+  const consumerFields = collectSentinelConsumerFields(astRoot, candidates);
+  const fields = [...candidates.keys()]
+    .filter((key) => !rejected.has(key) && consumerFields.has(key))
+    .sort();
+  return { fields, rejected: [...rejected].sort(), dependencies: deps };
+}
+
+function collectZeroStaticFields(astRoot, opts) {
+  const out = new Map();
+  for (const cls of astRoot.classes || []) {
+    for (const item of cls.items || []) {
+      if (!item || item.type !== 'field' || !item.field) continue;
+      const field = item.field;
+      if (!field.flags || !field.flags.includes('static')) continue;
+      if (field.descriptor !== 'Z' && !(opts.allowIntFlags && field.descriptor === 'I')) continue;
+      if (!isDefaultZeroValue(field.value)) continue;
+      out.set(`${cls.className}.${field.name}`, {
+        cls: cls.className,
+        name: field.name,
+        desc: field.descriptor,
+      });
+    }
+  }
+  return out;
+}
+
+function isDefaultZeroValue(value) {
+  if (value == null) return true;
+  if (value === false || value === 0 || value === '0') return true;
+  if (typeof value === 'object' && (value.value === false || value.value === 0 || value.value === '0')) return true;
+  return false;
+}
+
+function collectStaticWrites(astRoot, candidates) {
+  const writes = new Map();
+  for (const key of candidates.keys()) writes.set(key, []);
+  for (const cls of astRoot.classes || []) {
+    for (const item of cls.items || []) {
+      if (!item || item.type !== 'method' || !item.method) continue;
+      for (const attr of item.method.attributes || []) {
+        const code = attr && attr.type === 'code' && attr.code;
+        const codeItems = code && code.codeItems;
+        if (!Array.isArray(codeItems)) continue;
+        for (let i = 0; i < codeItems.length; i += 1) {
+          const insn = codeItems[i] && codeItems[i].instruction;
+          if (getOp(insn) !== 'putstatic') continue;
+          const ref = fieldRefOf(getArg(insn));
+          if (!ref) continue;
+          const key = fieldKey(ref);
+          if (!candidates.has(key)) continue;
+          writes.get(key).push({
+            codeItems,
+            index: i,
+            owner: cls.className,
+            method: item.method.name,
+            desc: item.method.descriptor,
+          });
+        }
+      }
+    }
+  }
+  return writes;
+}
+
+function collectSentinelConsumerFields(astRoot, candidates) {
+  const out = new Set();
+  for (const cls of astRoot.classes || []) {
+    for (const item of cls.items || []) {
+      if (!item || item.type !== 'method' || !item.method) continue;
+      for (const attr of item.method.attributes || []) {
+        const code = attr && attr.type === 'code' && attr.code;
+        const codeItems = code && code.codeItems;
+        if (!Array.isArray(codeItems)) continue;
+        for (const key of findConsumedFieldsInMethod(codeItems, candidates)) {
+          out.add(key);
+        }
+      }
+    }
+  }
+  return out;
+}
+
+function findConsumedFieldsInMethod(codeItems, candidates) {
+  const out = new Set();
+  for (const key of candidates.keys()) {
+    const { bindingDetails } = findEntryStoreSites(codeItems, new Set([key]), { allowIntFlags: true });
+    for (const binding of bindingDetails) {
+      if (hasFlatIloadBranchConsumer(codeItems, binding.local)) out.add(key);
+    }
+  }
+  return out;
+}
+
+function hasFlatIloadBranchConsumer(codeItems, local) {
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction) continue;
+    const op = getOp(item.instruction);
+    if (!ILOAD_OPS.has(op)) continue;
+    if (localOf(op, getArg(item.instruction)) !== local) continue;
+    let j = i + 1;
+    while (j < codeItems.length && codeItems[j] && !codeItems[j].instruction && !codeItems[j].labelDef) j += 1;
+    if (j >= codeItems.length) continue;
+    if (codeItems[j] && codeItems[j].labelDef && !codeItems[j].instruction) continue;
+    const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
+    if (nextOp === 'ifeq' || nextOp === 'ifne') return true;
+  }
+  return false;
+}
+
+function findNonZeroGuard(codeItems, writeIdx, candidates) {
+  const labels = collectLabelIndices(codeItems);
+  for (let i = writeIdx - 1; i >= 0; i -= 1) {
+    const item = codeItems[i];
+    const insn = item && item.instruction;
+    if (!insn) continue;
+    if (getOp(insn) !== 'ifeq') continue;
+    const target = trimLabel(getArg(insn));
+    const targetIdx = labels.get(target);
+    if (targetIdx == null || targetIdx <= writeIdx) continue;
+    const source = findPreviousStackSource(codeItems, i, candidates);
+    if (source) return source;
+  }
+  return null;
+}
+
+function findPreviousStackSource(codeItems, ifIdx, candidates) {
+  const prev = previousInstruction(codeItems, ifIdx);
+  if (!prev) return null;
+  const insn = prev.item.instruction;
+  if (getOp(insn) === 'getstatic') {
+    const ref = fieldRefOf(getArg(insn));
+    if (ref && candidates.has(fieldKey(ref))) return fieldKey(ref);
+    return null;
+  }
+  if (!ILOAD_OPS.has(getOp(insn))) return null;
+  const local = localOf(getOp(insn), getArg(insn));
+  if (local == null) return null;
+  return localFieldBindingAt(codeItems, local, prev.index, candidates);
+}
+
+function localFieldBindingAt(codeItems, local, useIdx, candidates) {
+  for (let i = useIdx - 1; i >= 0; i -= 1) {
+    const item = codeItems[i];
+    const insn = item && item.instruction;
+    if (!insn) continue;
+    const op = getOp(insn);
+    if (op === 'iinc' && localOfIinc(getArg(insn)) === local) return null;
+    if (!ISTORE_OPS.has(op)) continue;
+    const storedLocal = localOf(op, getArg(insn));
+    if (storedLocal !== local) continue;
+    const prev = previousInstruction(codeItems, i);
+    if (!prev || getOp(prev.item.instruction) !== 'getstatic') return null;
+    const ref = fieldRefOf(getArg(prev.item.instruction));
+    if (ref && candidates.has(fieldKey(ref))) return fieldKey(ref);
+    return null;
+  }
+  return null;
+}
+
+function localOfIinc(arg) {
+  if (arg && typeof arg === 'object' && typeof arg.local === 'number') return arg.local;
+  if (typeof arg === 'string') {
+    const m = /^(\d+)\b/.exec(arg);
+    if (m) return parseInt(m[1], 10);
+  }
+  if (typeof arg === 'number') return arg;
+  return null;
+}
+
+function previousInstruction(codeItems, idx) {
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    const item = codeItems[i];
+    if (item && item.instruction) return { item, index: i };
+  }
+  return null;
+}
+
+function collectLabelIndices(codeItems) {
+  const labels = new Map();
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const label = codeItems[i] && codeItems[i].labelDef;
+    if (label) labels.set(trimLabel(label), i);
+  }
+  return labels;
+}
+
 module.exports = {
   runDeadStaticBoolFlag,
+  discoverDeadStaticFlags,
   DEFAULT_ALWAYS_FALSE_FIELDS,
 };

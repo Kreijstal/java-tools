@@ -66,6 +66,7 @@ function ensureLabel(items, index, prefix) {
 }
 
 function mergeAdjacentConstReturns(code) {
+  if ((code.exceptionTable || []).length > 0) return 0;
   const items = code.codeItems;
   let rewrites = 0;
   for (let i = 0; i < items.length; i += 1) {
