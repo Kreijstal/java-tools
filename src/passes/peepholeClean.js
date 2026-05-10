@@ -13,12 +13,14 @@ function runPeepholeClean(astRoot, options = {}) {
     unusedLabels: 0,
   };
 
-  const rethrow = removeTrivialRethrowHandlers(astRoot, {
-    removeHandlerCode: options.removeHandlerCode !== false,
-  });
-  if (rethrow.changed) {
-    details.rethrowHandlers = rethrow.removals.length;
-    changes += rethrow.removals.length;
+  if (options.removeRethrowHandlers !== false) {
+    const rethrow = removeTrivialRethrowHandlers(astRoot, {
+      removeHandlerCode: options.removeHandlerCode !== false,
+    });
+    if (rethrow.changed) {
+      details.rethrowHandlers = rethrow.removals.length;
+      changes += rethrow.removals.length;
+    }
   }
 
   for (let i = 0; i < 4; i += 1) {
