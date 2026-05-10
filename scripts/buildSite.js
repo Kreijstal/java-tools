@@ -121,13 +121,13 @@ async function buildSite() {
 
     // Step 3: Copy browser UI enhancement module to dist for inclusion
     console.log('📋 Copying browser UI enhancements...');
-    const browserUISource = path.join(srcDir, 'browser-ui-enhancements.js');
+    const browserUISource = path.join(srcDir, 'platform', 'browser-ui-enhancements.js');
     const browserUITarget = path.join(distDir, 'browser-ui-enhancements.js');
     copyFile(browserUISource, browserUITarget);
 
     // Step 3.5: Copy AWT framework to dist for browser usage
     console.log('🎨 Copying AWT framework...');
-    const awtSource = path.join(srcDir, 'awt.js');
+    const awtSource = path.join(srcDir, 'platform', 'awt.js');
     const awtTarget = path.join(distDir, 'awt.js');
     copyFile(awtSource, awtTarget);
 
