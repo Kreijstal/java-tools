@@ -21,6 +21,16 @@ const { getAST } = require("jvm_parser");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 
+function yieldToEventLoop() {
+  return new Promise((resolve) => {
+    if (typeof setImmediate === "function") {
+      setImmediate(resolve);
+    } else {
+      setTimeout(resolve, 0);
+    }
+  });
+}
+
 class JVM {
   constructor(options = {}) {
     this.threads = [];
@@ -772,7 +782,7 @@ class JVM {
           }
         }
         // Yield to the event loop to prevent blocking on long-running code without breakpoints
-        await new Promise((resolve) => setImmediate(resolve));
+        await yieldToEventLoop();
       }
     } catch (e) {
       this.debugManager.pause();
@@ -825,7 +835,7 @@ class JVM {
         );
         if (nonTerminated.length > 0) {
           // Yield to allow time to pass for sleeping threads or external events.
-          await new Promise((resolve) => setImmediate(resolve));
+          await yieldToEventLoop();
           return { completed: false };
           //		continue;
         } else {
