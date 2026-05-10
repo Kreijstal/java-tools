@@ -1,5 +1,21 @@
 const { ASYNC_METHOD_SENTINEL } = require('../../../core/constants');
 
+function stringValue(value, fallback) {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  return value.valueOf ? String(value.valueOf()) : String(value);
+}
+
+function initializeThread(jvm, obj, { runnable = null, name = null } = {}) {
+  obj.hashCode = jvm.nextHashCode++;
+  obj.name = name || `Thread-${obj.hashCode}`;
+  obj.runnable = runnable;
+  obj.daemon = false;
+  obj.priority = 5;
+  delete obj.isUninitialized;
+}
+
 module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/lang/Runnable'],
@@ -19,19 +35,19 @@ module.exports = {
   },
   methods: {
     '<init>()V': (jvm, obj, args) => {
-      obj.hashCode = jvm.nextHashCode++;
-      obj.name = 'Thread-' + obj.hashCode;
-      obj.daemon = false;
-      obj.priority = 5;
-      delete obj.isUninitialized;
+      initializeThread(jvm, obj);
     },
     '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args) => {
-      obj.hashCode = jvm.nextHashCode++;
-      obj.name = 'Thread-' + obj.hashCode;
-      obj.runnable = args[0];
-      obj.daemon = false;
-      obj.priority = 5;
-      delete obj.isUninitialized;
+      initializeThread(jvm, obj, { runnable: args[0] });
+    },
+    '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
+      initializeThread(jvm, obj, { name: stringValue(args[0], null) });
+    },
+    '<init>(Ljava/lang/Runnable;Ljava/lang/String;)V': (jvm, obj, args) => {
+      initializeThread(jvm, obj, {
+        runnable: args[0],
+        name: stringValue(args[1], null),
+      });
     },
     'setDaemon(Z)V': (jvm, obj, args) => {
       obj.daemon = args[0];
@@ -122,6 +138,13 @@ module.exports = {
       const time = args[0];
       thread.status = 'SLEEPING';
       thread.sleepUntil = Date.now() + Number(time);
+    },
+    'interrupt()V': (jvm, obj, args) => {
+      obj.interrupted = true;
+      if (obj.nativeThread && obj.nativeThread.status === 'SLEEPING') {
+        obj.nativeThread.status = 'runnable';
+        delete obj.nativeThread.sleepUntil;
+      }
     },
   },
 };

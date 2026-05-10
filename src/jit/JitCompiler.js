@@ -291,6 +291,10 @@ class JitCompiler {
           const value = await this.invoke(op, frame, instruction, thread, invokePc);
           if (value && value.deopt) return value;
           if (value !== RETURN_VOID) stack.push(value);
+          if (thread.status !== "runnable") {
+            this.materialize(frame, locals, stack, pc);
+            return { deopt: true, reason: `thread yielded in ${frame.className || ""}.${frame.method.name}` };
+          }
           break;
         }
         case "goto": pc = this.target(frame, instruction.arg); break;
