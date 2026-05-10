@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { analyzeJavap } = require('../src/exceptionTrapAnalyzer');
+const { analyzeJavap } = require('../src/analysis/exceptionTrapAnalyzer');
 
 test('exception trap analyzer detects skipped athrow handler traps', (t) => {
   const javap = `

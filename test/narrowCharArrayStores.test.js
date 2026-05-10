@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { narrowCodeItems, runNarrowCharArrayStores } = require('../src/narrowCharArrayStores');
+const { narrowCodeItems, runNarrowCharArrayStores } = require('../src/passes/narrowCharArrayStores');
 
 test('narrowCodeItems inserts char narrowing before castore when incrementing same local', (t) => {
   const codeItems = [

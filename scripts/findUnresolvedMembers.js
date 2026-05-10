@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
 
 async function findUnresolved(classPath) {
   try {

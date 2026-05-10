@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { runPeepholeClean } = require('../src/peepholeClean');
+const { runPeepholeClean } = require('../src/passes/peepholeClean');
 
 function astWith(codeItems, exceptionTable = []) {
   return {

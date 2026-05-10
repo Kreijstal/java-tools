@@ -19,7 +19,7 @@
  *
  * Uses CFG analysis to detect the pattern structurally.
  */
-const { BasicBlock } = require('./cfg');
+const { BasicBlock } = require('../cfg/cfg');
 
 /**
  * @param {import('./cfg').CFG} cfg

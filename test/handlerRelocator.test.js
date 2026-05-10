@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { relocateTrivialHandlers } = require('../src/handlerRelocator');
+const { relocateTrivialHandlers } = require('../src/passes/handlerRelocator');
 
 function createTestAst() {
   return {

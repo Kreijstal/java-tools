@@ -1,5 +1,5 @@
 // Requires AWT framework
-const awtFramework = require('../../../awt.js');
+const awtFramework = require('../../../platform/awt.js');
 
 module.exports = {
   super: 'java/awt/Panel',
@@ -78,7 +78,7 @@ module.exports = {
               return;
             }
 
-            const Frame = require('../../../frame');
+            const Frame = require('../../../core/frame');
             const clickFrame = new Frame(method);
             clickFrame.className = obj.type;
             clickFrame.locals[0] = obj;
@@ -166,7 +166,7 @@ module.exports = {
           const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
           if (paintMethod) {
             // Execute the actual paint method bytecode
-            const Frame = require('../../../frame');
+            const Frame = require('../../../core/frame');
             const paintFrame = new Frame(paintMethod);
             paintFrame.className = obj.type;
             paintFrame.locals[0] = obj; // 'this' parameter

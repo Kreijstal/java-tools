@@ -1,5 +1,5 @@
 const test = require('tape');
-const { eliminateDeadCode } = require('../src/deadCodeEliminator');
+const { eliminateDeadCode } = require('../src/passes/deadCodeEliminator');
 const { loadJasminFixture } = require('./helpers/loadJasminFixture');
 
 test('dead code eliminator removes unused stack computations', (t) => {

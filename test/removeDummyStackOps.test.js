@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { removeDummyStackOps } = require('../src/removeDummyStackOps');
+const { removeDummyStackOps } = require('../src/passes/removeDummyStackOps');
 
 function buildProgram(instructions) {
   return {

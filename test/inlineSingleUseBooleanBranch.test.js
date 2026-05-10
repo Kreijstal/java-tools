@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/inlineSingleUseBooleanBranch');
+const { rewriteCode } = require('../src/passes/inlineSingleUseBooleanBranch');
 
 test('removes single-use boolean store feeding branch', (t) => {
   const code = {

@@ -1,5 +1,5 @@
 const test = require('tape');
-const { inlinePureMethods } = require('../src/inlinePureMethods');
+const { inlinePureMethods } = require('../src/passes/inlinePureMethods');
 const { loadJasminFixture } = require('./helpers/loadJasminFixture');
 
 test('inlinePureMethods inlines pure argument-returning statics', (t) => {

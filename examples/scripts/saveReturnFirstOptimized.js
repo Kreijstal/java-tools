@@ -5,8 +5,8 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getAST } = require('jvm_parser');
-const { convertJson, unparseDataStructures } = require('../../src/convert_tree');
-const { runOptimizationPasses } = require('../../src/passManager');
+const { convertJson, unparseDataStructures } = require('../../src/parsing/convert_tree');
+const { runOptimizationPasses } = require('../../src/passes/passManager');
 const { ensureKrak2Path } = require('../../src/utils/krakatau');
 
 function validatePath(filePath, baseDir) {

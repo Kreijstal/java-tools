@@ -1,5 +1,5 @@
 const test = require('tape');
-const DebugController = require('../src/debugController');
+const DebugController = require('../src/debug/debugController');
 
 test('Thread debugging with serialization', async t => {
   t.plan(1);

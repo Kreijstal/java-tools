@@ -1,6 +1,6 @@
 'use strict';
 
-const { normalizeInstruction } = require('./utils/instructionUtils');
+const { normalizeInstruction } = require('../utils/instructionUtils');
 
 const MAX_LOOP_ITERATIONS = 100000;
 

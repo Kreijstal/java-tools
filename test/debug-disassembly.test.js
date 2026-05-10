@@ -1,5 +1,5 @@
 const test = require('tape');
-const DebugController = require('../src/debugController');
+const DebugController = require('../src/debug/debugController');
 
 test('DebugController getDisassemblyView functionality', async (t) => {
     const debugController = new DebugController({ classpath: 'sources' });

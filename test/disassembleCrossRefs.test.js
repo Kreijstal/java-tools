@@ -5,9 +5,9 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const test = require('tape');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
-const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
+const { writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
 
 function withTempDir(prefix, fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));

@@ -1,4 +1,4 @@
-const { ASYNC_METHOD_SENTINEL } = require('../../../constants');
+const { ASYNC_METHOD_SENTINEL } = require('../../../core/constants');
 
 module.exports = {
   super: 'java/lang/Object',
@@ -43,8 +43,8 @@ module.exports = {
       return jvm.internString(obj.name);
     },
     'start()V': async (jvm, threadObject, args, currentThread) => {
-      const Stack = require('../../../stack');
-      const Frame = require('../../../frame');
+      const Stack = require('../../../core/stack');
+      const Frame = require('../../../core/frame');
       const target = threadObject.runnable || threadObject;
 
       const newThread = {

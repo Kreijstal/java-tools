@@ -22,7 +22,7 @@
  * (avoiding CFG round-trip which preserves original block ordering).
  */
 
-const { convertAstToCfg } = require('./ast-to-cfg');
+const { convertAstToCfg } = require('../cfg/ast-to-cfg');
 
 const CONDITIONAL_JUMPS = new Set([
   'ifeq', 'ifne', 'iflt', 'ifge', 'ifgt', 'ifle',

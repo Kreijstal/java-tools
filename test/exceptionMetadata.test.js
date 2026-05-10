@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const test = require('tape');
-const { collectExceptionMetadata } = require('../src/exceptionMetadata');
+const { collectExceptionMetadata } = require('../src/analysis/exceptionMetadata');
 
 function withTempDir(prefix, fn) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));

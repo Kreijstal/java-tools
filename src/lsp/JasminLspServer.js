@@ -3,9 +3,9 @@
 const fs = require('fs');
 const path = require('path');
 const { fileURLToPath, pathToFileURL } = require('url');
-const { formatJasminSource, normalizeNewlines } = require('../jasminFormatter');
+const { formatJasminSource, normalizeNewlines } = require('../parsing/jasminFormatter');
 const { OPCODE_NAMES } = require('./opcodeList');
-const { KrakatauWorkspace } = require('../KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../workspace/KrakatauWorkspace');
 
 const LABEL_CHAR_REGEX = /[A-Za-z0-9_.$]/;
 const METHOD_SIGNATURE_REGEX =

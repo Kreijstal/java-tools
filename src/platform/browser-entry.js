@@ -4,10 +4,11 @@
  */
 
 // Import the real JVM and debug controller classes
-const { JVM, Frame } = require('./jvm');
-const DebugController = require('./debugController');
-const BrowserFileProvider = require('./BrowserFileProvider');
-const { setFileProvider } = require('./classLoader');
+const { JVM } = require('../core/jvm');
+const Frame = require('../core/frame');
+const DebugController = require('../debug/debugController');
+const BrowserFileProvider = require('../io/BrowserFileProvider');
+const { setFileProvider } = require('../core/classLoader');
 const awtFramework = require('./awt');
 // const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
@@ -323,7 +324,7 @@ class BrowserJVMDebug {
     try {
       // Use the same krak2 format as debugging for consistency
       const { getAST } = require('jvm_parser');
-      const { convertJson, unparseDataStructures } = require('./convert_tree');
+      const { convertJson, unparseDataStructures } = require('../parsing/convert_tree');
       
       // Parse class data to AST
       const ast = getAST(classData);
@@ -362,7 +363,7 @@ class BrowserJVMDebug {
       : `${classPath}.class`;
     const classData = await this.fileProvider.readFile(normalizedPath);
     const { getAST } = require("jvm_parser");
-    const { convertJson } = require("./convert_tree");
+    const { convertJson } = require("../parsing/convert_tree");
 
     const ast = getAST(classData);
     const converted = convertJson(ast.ast, ast.constantPool);

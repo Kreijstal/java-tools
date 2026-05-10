@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { runConstructorPreSuperCleanup } = require('../src/constructorPreSuperCleanup');
+const { runConstructorPreSuperCleanup } = require('../src/passes/constructorPreSuperCleanup');
 
 function astWith(codeItems, exceptionTable = []) {
   return {

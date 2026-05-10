@@ -1,4 +1,4 @@
-const { primitiveTypeDescriptors } = require('./constants');
+const { primitiveTypeDescriptors } = require('../core/constants');
 
 function parseDescriptor(descriptor) {
   const types = primitiveTypeDescriptors;

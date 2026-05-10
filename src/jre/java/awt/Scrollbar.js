@@ -4,7 +4,7 @@ const dispatchAdjustmentEvent = async (jvm, source, listener) => {
   if (!method) return;
 
   const eventObj = { type: 'java/awt/event/AdjustmentEvent', source: source, value: source._value };
-  const Frame = require('../../../frame');
+  const Frame = require('../../../core/frame');
   const eventFrame = new Frame(method);
   eventFrame.className = listener.type;
   eventFrame.locals[0] = listener;

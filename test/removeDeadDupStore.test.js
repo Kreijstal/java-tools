@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/removeDeadDupStore');
+const { rewriteCode } = require('../src/passes/removeDeadDupStore');
 
 test('removes dead second store from dup store pair', (t) => {
   const code = {

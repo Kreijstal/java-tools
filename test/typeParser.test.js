@@ -1,5 +1,5 @@
 const test = require('tape');
-const { parseDescriptor, descriptorToString } = require('../src/typeParser');
+const { parseDescriptor, descriptorToString } = require('../src/parsing/typeParser');
 
 test('parseDescriptor should correctly parse method descriptors', (t) => {
   t.plan(3);

@@ -1,9 +1,9 @@
-const { parseDescriptor } = require("../typeParser");
-const Frame = require("../frame");
-const Stack = require("../stack");
+const { parseDescriptor } = require("../parsing/typeParser");
+const Frame = require("../core/frame");
+const Stack = require("../core/stack");
 const path = require("path");
 const { MethodHandle, MethodType, Lookup } = require("../jre/java/lang/invoke");
-const { ASYNC_METHOD_SENTINEL } = require("../constants");
+const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 
 function assignArgsToLocals(locals, args, params, startIndex) {
   let localIndex = startIndex;

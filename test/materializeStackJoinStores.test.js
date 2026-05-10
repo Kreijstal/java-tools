@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { rewriteCode } = require('../src/materializeStackJoinStores');
+const { rewriteCode } = require('../src/passes/materializeStackJoinStores');
 
 test('materializes reference stack values on goto edges into a labelled join store', () => {
   const code = {

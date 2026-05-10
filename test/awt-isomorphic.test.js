@@ -27,7 +27,7 @@ test('Isomorphic window pattern - Node.js environment', (t) => {
 
 test('AWT with isomorphic window - integration test', (t) => {
     // Test that AWT could potentially use the isomorphic window pattern
-    const awt = require('../src/awt');
+    const awt = require('../src/platform/awt');
     const windowModule = require('../src/isomorphic/window.node.js');
     const { Canvas } = awt;
     

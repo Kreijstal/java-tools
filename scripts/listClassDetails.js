@@ -1,5 +1,5 @@
-const { loadClassByPath } = require('../src/classLoader');
-const { parseDescriptor } = require('../src/typeParser');
+const { loadClassByPath } = require('../src/core/classLoader');
+const { parseDescriptor } = require('../src/parsing/typeParser');
 
 function listClassDetails(classFilePath) {
   const classData = loadClassByPath(classFilePath);

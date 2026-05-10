@@ -5,10 +5,10 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { getAST } = require('jvm_parser');
-const { convertJson, unparseDataStructures } = require('../src/convert_tree');
-const { convertAstToCfg } = require('../src/ast-to-cfg');
-const { reconstructAstFromCfg } = require('../src/cfg-to-ast');
-const { eliminateDeadCodeCfg } = require('../src/deadCodeEliminator-cfg');
+const { convertJson, unparseDataStructures } = require('../src/parsing/convert_tree');
+const { convertAstToCfg } = require('../src/cfg/ast-to-cfg');
+const { reconstructAstFromCfg } = require('../src/cfg/cfg-to-ast');
+const { eliminateDeadCodeCfg } = require('../src/passes/deadCodeEliminator-cfg');
 const { ensureKrak2Path } = require('../src/utils/krakatau');
 
 function printUsage() {

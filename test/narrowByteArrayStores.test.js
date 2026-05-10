@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { narrowCodeItems, runNarrowByteArrayStores } = require('../src/narrowByteArrayStores');
+const { narrowCodeItems, runNarrowByteArrayStores } = require('../src/passes/narrowByteArrayStores');
 
 test('narrowCodeItems inserts byte narrowing before non-boolean constant bastore', (t) => {
   const codeItems = [

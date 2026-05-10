@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/materializeTypedNullArgs');
+const { rewriteCode } = require('../src/passes/materializeTypedNullArgs');
 
 test('materializes typed null invoke argument into fresh local', (t) => {
   const code = {

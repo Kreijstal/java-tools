@@ -31,7 +31,7 @@ function parseClassFile(classFilePath, options = {}) {
 // Default behavior: parse Hello.class if run directly
 if (require.main === module) {
   // Path to the compiled Hello.class file
-  const classFilePath = path.join(__dirname, '../sources/Hello.class');
+  const classFilePath = path.join(__dirname, '../../sources/Hello.class');
   
   try {
     const asmSyntax = parseClassFile(classFilePath);

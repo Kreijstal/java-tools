@@ -1,4 +1,4 @@
-const { getStackEffect, normalizeInstruction } = require('./utils/instructionUtils');
+const { getStackEffect, normalizeInstruction } = require('../utils/instructionUtils');
 
 /**
  * Recalculates the maximum stack height for a list of instructions.

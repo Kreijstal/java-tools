@@ -1,4 +1,4 @@
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
 
 async function main() {
     const classPath = process.argv[2];

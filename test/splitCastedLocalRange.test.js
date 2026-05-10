@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/splitCastedLocalRange');
+const { rewriteCode } = require('../src/passes/splitCastedLocalRange');
 
 test('splits casted local range into a fresh local', (t) => {
   const code = {

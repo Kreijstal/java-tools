@@ -1,4 +1,4 @@
-const { analyzePurity, _internals: purityInternals } = require('../purityAnalyzer');
+const { analyzePurity, _internals: purityInternals } = require('../analysis/purityAnalyzer');
 const { normalizeInstruction, parseLocalOperation } = require('./instructionUtils');
 
 const { buildMethodSignature } = purityInternals;

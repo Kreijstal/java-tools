@@ -4,9 +4,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const test = require('tape');
 const { getAST } = require('jvm_parser');
-const { convertJson } = require('../src/convert_tree');
+const { convertJson } = require('../src/parsing/convert_tree');
 const { ensureKrak2Path } = require('../src/utils/krakatau');
-const { runOptimizationPasses } = require('../src/passManager');
+const { runOptimizationPasses } = require('../src/passes/passManager');
 
 const JASMIN_DIR = path.join(__dirname, '..', 'examples', 'sources', 'jasmin');
 

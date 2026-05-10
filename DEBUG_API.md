@@ -113,7 +113,7 @@ const objectInfo = controller.inspectObject(objReference);
 ### Basic Debug Controller
 
 ```javascript
-const DebugController = require('./src/debugController');
+const DebugController = require('./src/debug/debugController');
 
 const controller = new DebugController();
 

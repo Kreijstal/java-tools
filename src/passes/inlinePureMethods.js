@@ -1,5 +1,5 @@
-const { analyzePurity, _internals: purityInternals } = require('./purityAnalyzer');
-const { normalizeInstruction, getStackEffect } = require('./utils/instructionUtils');
+const { analyzePurity, _internals: purityInternals } = require('../analysis/purityAnalyzer');
+const { normalizeInstruction, getStackEffect } = require('../utils/instructionUtils');
 
 const { buildMethodSignature } = purityInternals;
 

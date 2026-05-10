@@ -1,10 +1,10 @@
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
-const { convertJson } = require('./convert_tree');
+const { convertJson } = require('../parsing/convert_tree');
 const { getReferenceObjFromClass } = require('./traverseAST');
 const { assembleClasses, runClass } = require('./assembleAndRun');
-const { loadClass } = require('./classLoader');
+const { loadClass } = require('../core/classLoader');
 const { renameMethod } = require('./renameMethod');
 
 function loadAndTraverse(className, classPath) {

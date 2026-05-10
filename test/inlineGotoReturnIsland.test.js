@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { inlineMethod } = require('../src/inlineGotoReturnIsland');
+const { inlineMethod } = require('../src/passes/inlineGotoReturnIsland');
 
 test('inlines isolated protected return island reached by one goto', (t) => {
   const code = {

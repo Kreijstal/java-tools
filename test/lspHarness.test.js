@@ -1,8 +1,8 @@
 const test = require('tape');
 const { createInProcessLspHarness } = require('../src/lsp/inProcessHarness');
-const { convertAstToCfg } = require('../src/ast-to-cfg');
-const { eliminateDeadCodeCfg } = require('../src/deadCodeEliminator-cfg');
-const { reconstructAstFromCfg } = require('../src/cfg-to-ast');
+const { convertAstToCfg } = require('../src/cfg/ast-to-cfg');
+const { eliminateDeadCodeCfg } = require('../src/passes/deadCodeEliminator-cfg');
+const { reconstructAstFromCfg } = require('../src/cfg/cfg-to-ast');
 const MISPLACED_CATCH_SOURCE = `
 .version 55 0
 .class public super Misplaced

@@ -20,7 +20,7 @@ The JNI system provides a way to register and execute native methods while maint
 ### Creating a JVM with JNI Support
 
 ```javascript
-const { JVM } = require('./src/jvm');
+const { JVM } = require('./src/core/jvm');
 
 // JNI is automatically initialized
 const jvm = new JVM({ verbose: true });

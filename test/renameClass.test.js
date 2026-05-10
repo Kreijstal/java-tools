@@ -2,8 +2,8 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { SymbolIdentifier } = require('../src/symbols');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { SymbolIdentifier } = require('../src/workspace/symbols');
 
 function teardown(testDir) {
   // if (fs.existsSync(testDir)) {

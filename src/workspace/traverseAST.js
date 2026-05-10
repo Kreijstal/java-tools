@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
-const { convertJson } = require('./convert_tree');
-const { parseDescriptor } = require('./typeParser');
+const { convertJson } = require('../parsing/convert_tree');
+const { parseDescriptor } = require('../parsing/typeParser');
 //const { Reference } = require('./referenceInterface');
 
 // Path to the compiled Hello.class file

@@ -2,8 +2,8 @@
 'use strict';
 
 const fs = require('fs');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { analyzeRenameSafety } = require('../src/renameSafetyAnalyzer');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { analyzeRenameSafety } = require('../src/analysis/renameSafetyAnalyzer');
 
 async function main() {
   const args = process.argv.slice(2);

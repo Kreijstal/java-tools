@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { splitCode } = require('../src/splitPrimitiveIntBranchLocal');
+const { splitCode } = require('../src/passes/splitPrimitiveIntBranchLocal');
 
 test('splits int local range used as array index loop after sibling branch store', (t) => {
   const code = {

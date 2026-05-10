@@ -1,7 +1,7 @@
 const test = require('tape');
 const path = require('path');
 const fs = require('fs');
-const BrowserFileProvider = require('../src/BrowserFileProvider');
+const BrowserFileProvider = require('../src/io/BrowserFileProvider');
 
 test('BrowserFileProvider should load class files with content', async (t) => {
     const provider = new BrowserFileProvider();

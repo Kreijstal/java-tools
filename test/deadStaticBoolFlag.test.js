@@ -3,9 +3,9 @@
 const test = require('tape');
 const fs = require('fs');
 const path = require('path');
-const { runDeadStaticBoolFlag, discoverDeadStaticFlags } = require('../src/deadStaticBoolFlag');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
+const { runDeadStaticBoolFlag, discoverDeadStaticFlags } = require('../src/passes/deadStaticBoolFlag');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
 
 function astWith(codeItems, exceptionTable = []) {
   return {

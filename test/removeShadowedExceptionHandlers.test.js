@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { runRemoveShadowedExceptionHandlers } = require('../src/removeShadowedExceptionHandlers');
+const { runRemoveShadowedExceptionHandlers } = require('../src/passes/removeShadowedExceptionHandlers');
 
 function createAst() {
   return {

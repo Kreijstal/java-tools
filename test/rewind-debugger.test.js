@@ -1,5 +1,5 @@
 const test = require('tape');
-const DebugController = require('../src/debugController');
+const DebugController = require('../src/debug/debugController');
 
 test('Debugger rewind', async t => {
   t.plan(4);

@@ -1,5 +1,5 @@
 const path = require('path');
-const { JVM } = require('../src/jvm');
+const { JVM } = require('../src/core/jvm');
 
 function main() {
   const args = process.argv.slice(2);

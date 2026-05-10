@@ -1,8 +1,8 @@
 'use strict';
 
 const test = require('tape');
-const { runDeadCodePass } = require('../src/deadCodePass');
-const { computeMethodEffects } = require('../src/methodEffectsAnalyzer');
+const { runDeadCodePass } = require('../src/passes/deadCodePass');
+const { computeMethodEffects } = require('../src/analysis/methodEffectsAnalyzer');
 
 function createSyntheticMisplacedAst() {
   return {

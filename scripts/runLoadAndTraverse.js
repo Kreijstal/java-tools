@@ -1,4 +1,4 @@
-const { loadAndTraverse } = require('../src/loadAndTraverse');
+const { loadAndTraverse } = require('../src/workspace/loadAndTraverse');
 
 function main() {
   const args = process.argv.slice(2);
