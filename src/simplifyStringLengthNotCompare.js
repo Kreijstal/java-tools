@@ -18,6 +18,7 @@ function runSimplifyStringLengthNotCompare(astRoot) {
 function rewriteCode(code) {
   const items = code.codeItems;
   const used = collectUsedLabels(code);
+  const protectedRanges = collectProtectedRanges(code);
   let rewrites = 0;
   for (let i = 0; i < items.length; i += 1) {
     if (op(items[i]) !== 'iconst_m1') continue;
@@ -27,6 +28,7 @@ function rewriteCode(code) {
       const branch = items[lenIndex + 3];
       const branchOp = op(branch);
       if (branchOp !== 'if_icmpeq' && branchOp !== 'if_icmpne') continue;
+      if (overlapsProtectedRange(i, lenIndex + 3, protectedRanges)) continue;
       if (!canMoveValueItems(items, i + 1, lenIndex, used)) continue;
       if (!canRemoveItems(items, i, i, used) || !canRemoveItems(items, lenIndex + 1, lenIndex + 2, used)) continue;
       const moved = items.slice(i + 1, lenIndex + 1).map((item, offset) =>
@@ -44,6 +46,30 @@ function rewriteCode(code) {
     }
   }
   return rewrites;
+}
+
+function collectProtectedRanges(code) {
+  const items = code.codeItems || [];
+  const labels = new Map();
+  for (let i = 0; i < items.length; i += 1) {
+    const label = trimLabel(items[i] && items[i].labelDef);
+    if (label) labels.set(label, i);
+  }
+  const ranges = [];
+  for (const entry of code.exceptionTable || []) {
+    const start = labels.get(trimLabel(entry.startLbl || entry.startLabel));
+    const end = labels.get(trimLabel(entry.endLbl || entry.endLabel));
+    if (start == null || end == null || start >= end) continue;
+    ranges.push({ start, end });
+  }
+  return ranges;
+}
+
+function overlapsProtectedRange(start, end, ranges) {
+  for (const range of ranges) {
+    if (start < range.end && end >= range.start) return true;
+  }
+  return false;
 }
 
 function isStringLength(item) {

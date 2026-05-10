@@ -673,7 +673,8 @@ function cloneBlock(codeItems, block) {
 }
 
 function deepCloneItem(item) {
-  return JSON.parse(JSON.stringify(item));
+  return JSON.parse(JSON.stringify(item, (_key, value) =>
+    typeof value === 'bigint' ? value.toString() : value));
 }
 
 function remapInstructionLabels(instruction, renameMap) {

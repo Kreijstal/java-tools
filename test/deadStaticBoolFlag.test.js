@@ -3,7 +3,7 @@
 const test = require('tape');
 const fs = require('fs');
 const path = require('path');
-const { runDeadStaticBoolFlag } = require('../src/deadStaticBoolFlag');
+const { runDeadStaticBoolFlag, discoverDeadStaticFlags } = require('../src/deadStaticBoolFlag');
 const { parseKrak2Assembly } = require('../src/parse_krak2');
 const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
 
@@ -29,6 +29,33 @@ function astWith(codeItems, exceptionTable = []) {
         ],
       },
     ],
+  };
+}
+
+function astWithClasses(classes) {
+  return { classes };
+}
+
+function staticField(name, descriptor) {
+  return {
+    type: 'field',
+    field: {
+      flags: ['public', 'static'],
+      name,
+      descriptor,
+      value: null,
+    },
+  };
+}
+
+function methodWith(name, codeItems) {
+  return {
+    type: 'method',
+    method: {
+      name,
+      descriptor: '()V',
+      attributes: [{ type: 'code', code: { codeItems, exceptionTable: [], attributes: [] } }],
+    },
   };
 }
 
@@ -156,5 +183,83 @@ test('dead-flag: ignores non-Z descriptor', (t) => {
   ]);
   const r = runDeadStaticBoolFlag(ast, { flags: 'jn.u' });
   t.equal(r.eliminated, 0, 'int descriptor I, not Z, must skip');
+  t.end();
+});
+
+test('dead-flag discovery: finds zero int field with no writes', (t) => {
+  const ast = astWithClasses([
+    {
+      className: 'Chess',
+      items: [
+        staticField('G', 'I'),
+        methodWith('f', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'Chess', ['G', 'I']] } },
+          { instruction: 'istore_1' },
+          { instruction: 'iload_1' },
+          { instruction: { op: 'ifne', arg: 'Lret' } },
+          { instruction: 'return' },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+  ]);
+  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.ok(r.fields.includes('Chess.G'));
+  t.end();
+});
+
+test('dead-flag discovery: finds mutually gated zero sentinel cycle', (t) => {
+  const ast = astWithClasses([
+    {
+      className: 'Main',
+      items: [
+        staticField('J', 'I'),
+        methodWith('writeJ', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'Flags', ['L', 'Z']] } },
+          { instruction: { op: 'ifeq', arg: 'Lret' } },
+          { instruction: 'iconst_1' },
+          { instruction: { op: 'putstatic', arg: ['Field', 'Main', ['J', 'I']] } },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+    {
+      className: 'Flags',
+      items: [
+        staticField('L', 'Z'),
+        methodWith('writeL', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'Main', ['J', 'I']] } },
+          { instruction: 'istore_2' },
+          { instruction: 'iload_2' },
+          { instruction: { op: 'ifeq', arg: 'Lret' } },
+          { instruction: 'iconst_1' },
+          { instruction: { op: 'putstatic', arg: ['Field', 'Flags', ['L', 'Z']] } },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+  ]);
+  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.ok(r.fields.includes('Main.J'));
+  t.notOk(r.fields.includes('Flags.L'), 'dependency-only guard is not returned without a consumer');
+  t.end();
+});
+
+test('dead-flag discovery: rejects unguarded write', (t) => {
+  const ast = astWithClasses([
+    {
+      className: 'Main',
+      items: [
+        staticField('J', 'I'),
+        methodWith('writeJ', [
+          { instruction: 'iconst_1' },
+          { instruction: { op: 'putstatic', arg: ['Field', 'Main', ['J', 'I']] } },
+          { instruction: 'return' },
+        ]),
+      ],
+    },
+  ]);
+  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.notOk(r.fields.includes('Main.J'));
   t.end();
 });
