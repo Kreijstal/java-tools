@@ -218,6 +218,25 @@ function parseBigInt(value) {
   throw new Error(`Unable to parse BigInt value from ${value}`);
 }
 
+function encodeModifiedUtf8(value) {
+  const bytes = [];
+  const text = value === null || value === undefined ? '' : String(value);
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code >= 0x0001 && code <= 0x007f) {
+      bytes.push(code);
+    } else if (code <= 0x07ff) {
+      bytes.push(0xc0 | ((code >> 6) & 0x1f));
+      bytes.push(0x80 | (code & 0x3f));
+    } else {
+      bytes.push(0xe0 | ((code >> 12) & 0x0f));
+      bytes.push(0x80 | ((code >> 6) & 0x3f));
+      bytes.push(0x80 | (code & 0x3f));
+    }
+  }
+  return Buffer.from(bytes);
+}
+
 function ensureArray(value) {
   if (!value) {
     return [];
@@ -308,9 +327,10 @@ class ByteWriter {
 }
 
 class ConstantPoolBuilder {
-  constructor() {
+  constructor(options = {}) {
     this.entries = [null];
     this.utf8Map = new Map();
+    this.rawUtf8BytesByValue = normalizeRawUtf8Map(options.rawUtf8BytesByValue);
     this.classMap = new Map();
     this.stringMap = new Map();
     this.integerMap = new Map();
@@ -340,6 +360,10 @@ class ConstantPoolBuilder {
       tag: 1,
       value: stringValue,
     };
+    const rawBytes = this.rawUtf8BytesByValue.get(stringValue);
+    if (rawBytes) {
+      entry.rawBytes = rawBytes;
+    }
     const index = this._pushEntry(entry);
     this.utf8Map.set(stringValue, index);
     return index;
@@ -576,6 +600,18 @@ class ConstantPoolBuilder {
   getEntries() {
     return this.entries;
   }
+}
+
+function normalizeRawUtf8Map(input) {
+  const out = new Map();
+  if (!input) return out;
+  const entries = input instanceof Map ? input.entries() : Object.entries(input);
+  for (const [key, value] of entries) {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (!raw) continue;
+    out.set(key, Buffer.isBuffer(raw) ? Buffer.from(raw) : Buffer.from(raw));
+  }
+  return out;
 }
 function primeConstantPoolFromClass(cls, builder) {
   ensureArray(cls.items).forEach((item) => {
@@ -1073,7 +1109,7 @@ function buildExceptionTableEntries(code, labelOffsets, builder) {
     }
 
     let catchTypeIndex = 0;
-    const catchType = entry.catchType ?? entry.type;
+    const catchType = entry.catchType ?? entry.catch_type ?? entry.type;
     if (catchType && catchType !== 'any' && catchType !== 0) {
       if (typeof catchType === 'object') {
         if (catchType.type === 'Class') {
@@ -1937,7 +1973,7 @@ function writeConstantPool(writer, entries) {
     writer.writeUint8(entry.tag);
     switch (entry.tag) {
       case 1: { // Utf8
-        const bytes = Buffer.from(entry.value, 'utf8');
+        const bytes = entry.rawBytes ? Buffer.from(entry.rawBytes) : encodeModifiedUtf8(entry.value);
         writer.writeUint16(bytes.length);
         writer.writeBytes(bytes);
         break;
@@ -2019,8 +2055,8 @@ function writeMethodInfo(writer, method) {
   });
 }
 
-function assembleClass(cls) {
-  const builder = new ConstantPoolBuilder();
+function assembleClass(cls, options = {}) {
+  const builder = new ConstantPoolBuilder(options);
   primeConstantPoolFromClass(cls, builder);
   const bootstrapMethods = buildBootstrapMethods(cls.bootstrapMethods || [], builder);
 
@@ -2094,7 +2130,7 @@ function writeClassAstToClassFile(classAstInput, outputClassPath, options = {}) 
 
   let buffer;
   try {
-    buffer = assembleClass(cls);
+    buffer = assembleClass(cls, options);
   } catch (err) {
     const wrapped = new Error(`Failed to assemble class ${cls.className || '<anonymous>'}: ${err.message}`);
     wrapped.cause = err;
@@ -2136,6 +2172,7 @@ function writeClassAstRootToDirectory(root, outputDir, options = {}) {
 }
 
 module.exports = {
+  encodeModifiedUtf8,
   writeClassAstToClassFile,
   writeClassAstRootToDirectory,
 };

@@ -173,9 +173,20 @@ function matchRightNotCompare(codeItems, i, usedLabels, allowedLocals) {
   if (bound == null || !isAllowedIntValue(value, allowedLocals) || op(codeItems[i + 2]) !== 'iconst_m1' || op(codeItems[i + 3]) !== 'ixor') return null;
   if (!RIGHT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 2, i + 3, usedLabels)) return null;
   return [
-    normalizeValue(value, codeItems[i]),
+    ...withLeadingLabel(normalizeValue(value, codeItems[i]), value, usedLabels),
     { instruction: pushInstruction(~bound) },
     itemWithInstruction(branch, { op: RIGHT_OPS[branchOp], arg: arg(branch) }),
+  ];
+}
+
+function withLeadingLabel(item, originalItem, usedLabels) {
+  const originalLabel = originalItem && originalItem.labelDef && trimLabel(originalItem.labelDef);
+  if (!item || !originalLabel || item.labelDef === originalItem.labelDef || !usedLabels.has(originalLabel)) {
+    return [item];
+  }
+  return [
+    { labelDef: originalItem.labelDef },
+    item,
   ];
 }
 

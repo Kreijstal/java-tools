@@ -12,7 +12,7 @@ const { analyzePurityCfg } = require('../src/analysis/purityAnalyzer-cfg');
 const { ensureKrak2Path } = require('../src/utils/krakatau');
 const { parseKrak2Assembly } = require('../src/parsing/parse_krak2.js');
 const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast.js');
-const { writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
+const { encodeModifiedUtf8, writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
 
 const JASMIN_DIR = path.join(__dirname, '..', 'examples', 'sources', 'jasmin');
 const JAVA_DIR = path.join(__dirname, '..', 'examples', 'sources', 'java');
@@ -36,6 +36,15 @@ const krakatauPath = path.resolve(
   __dirname,
   '../tools/krakatau/Krakatau/target/release/krak2'
 );
+
+test('class writer encodes JVM modified UTF-8 code units', (t) => {
+  t.deepEqual(
+    [...encodeModifiedUtf8('\u0000\ud800')],
+    [0xc0, 0x80, 0xed, 0xa0, 0x80],
+    'NUL and unpaired surrogate are preserved as modified UTF-8 bytes'
+  );
+  t.end();
+});
 
 // Helper functions from feat-cfg-analysis
 function assembleJasminFile(tempDir, krak2Path, jasminFile) {

@@ -152,9 +152,10 @@ function inlineOneMethod(codeItems, exceptionTable, opts) {
     // Build the inlined replacement: clone body with renamed internal
     // labels (so we don't collide with the originals).
     const cloneItems = cloneBodyItems(body, opts.owner, opts.name);
+    const replacementItems = preserveSiteLabel(site.item, cloneItems, protectedLabels);
 
     // Replace the original goto with the inlined body in-place.
-    codeItems.splice(gotoIdx, 1, ...cloneItems);
+    codeItems.splice(gotoIdx, 1, ...replacementItems);
     fired += 1;
     if (oncePerMethod) {
       if (opts.verbose) {
@@ -167,7 +168,7 @@ function inlineOneMethod(codeItems, exceptionTable, opts) {
         })();
         console.log(
           `  [inline-exit] ${opts.owner}.${opts.name}${opts.desc}: ` +
-          `goto ${gotoArg} (→${finalLabel}) inlined as ${cloneItems.length}-item body ` +
+          `goto ${gotoArg} (→${finalLabel}) inlined as ${replacementItems.length}-item body ` +
           `(target had ${preds.totalForward} fwd preds, lastOp=${lastOp})`
         );
       }
@@ -191,6 +192,15 @@ function inlineOneMethod(codeItems, exceptionTable, opts) {
   }
 
   return fired;
+}
+
+function preserveSiteLabel(siteItem, replacementItems, protectedLabels) {
+  const label = siteItem && siteItem.labelDef && trimLabel(siteItem.labelDef);
+  if (!label || !protectedLabels.has(label)) return replacementItems;
+  return [
+    { labelDef: siteItem.labelDef },
+    ...replacementItems,
+  ];
 }
 
 // ---------------------------------------------------------------------------

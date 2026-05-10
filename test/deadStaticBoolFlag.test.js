@@ -263,3 +263,48 @@ test('dead-flag discovery: rejects unguarded write', (t) => {
   t.notOk(r.fields.includes('Main.J'));
   t.end();
 });
+
+test('dead-flag discovery: rejects self-dependent toggle writes', (t) => {
+  const ast = astWithClasses([
+    {
+      className: 'client',
+      items: [
+        staticField('A', 'Z'),
+        methodWith('consume', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+          { instruction: 'istore_1' },
+          { instruction: 'iload_1' },
+          { instruction: { op: 'ifne', arg: 'Lret' } },
+          { instruction: 'return' },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+    {
+      className: 'hn',
+      items: [staticField('j', 'Z')],
+    },
+    {
+      className: 'Writer',
+      items: [
+        methodWith('toggleA', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+          { instruction: 'istore_1' },
+          { instruction: { op: 'getstatic', arg: ['Field', 'hn', ['j', 'Z']] } },
+          { instruction: { op: 'ifeq', arg: 'Lret' } },
+          { instruction: 'iload_1' },
+          { instruction: { op: 'ifeq', arg: 'Ltrue' } },
+          { instruction: 'iconst_0' },
+          { instruction: { op: 'goto', arg: 'Lstore' } },
+          { labelDef: 'Ltrue:', instruction: 'iconst_1' },
+          { labelDef: 'Lstore:', instruction: { op: 'putstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+  ]);
+  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.notOk(r.fields.includes('client.A'));
+  t.ok(r.rejected.includes('client.A'));
+  t.end();
+});
