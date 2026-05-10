@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-const DebugController = require('../src/debugController');
+const DebugController = require('../src/debug/debugController');
 
 /**
  * Example usage of the JVM Debug API

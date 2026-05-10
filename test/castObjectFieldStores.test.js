@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { castCodeItems, checkcastTarget, runCastObjectFieldStores } = require('../src/castObjectFieldStores');
+const { castCodeItems, checkcastTarget, runCastObjectFieldStores } = require('../src/passes/castObjectFieldStores');
 
 test('checkcastTarget returns class names for reference descriptors', (t) => {
   t.equal(checkcastTarget('Ljava/lang/String;'), 'java/lang/String');

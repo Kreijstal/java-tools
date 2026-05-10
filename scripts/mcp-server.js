@@ -4,20 +4,20 @@
 const fs = require('fs');
 const path = require('path');
 const { createTwoFilesPatch } = require('diff');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
-const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
-const { convertJson, unparseDataStructures } = require('../src/convert_tree');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
+const { writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
+const { convertJson, unparseDataStructures } = require('../src/parsing/convert_tree');
 const { getAST } = require('jvm_parser');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { SymbolIdentifier } = require('../src/symbols');
-const { runDeadCodePass } = require('../src/deadCodePass');
-const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
-const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
-const { relocateTrivialHandlers } = require('../src/handlerRelocator');
-const { computeMethodEffects } = require('../src/methodEffectsAnalyzer');
-const { collectMethodCallers } = require('../src/callGraphMetadata');
-const { collectFieldReferences } = require('../src/fieldReferenceMetadata');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { SymbolIdentifier } = require('../src/workspace/symbols');
+const { runDeadCodePass } = require('../src/passes/deadCodePass');
+const { renameClassAst, renameMethodAst } = require('../src/passes/astTransforms');
+const { inlineSinglePredecessorBlocks } = require('../src/passes/blockInliner');
+const { relocateTrivialHandlers } = require('../src/passes/handlerRelocator');
+const { computeMethodEffects } = require('../src/analysis/methodEffectsAnalyzer');
+const { collectMethodCallers } = require('../src/analysis/callGraphMetadata');
+const { collectFieldReferences } = require('../src/analysis/fieldReferenceMetadata');
 
 const jsonrpc = {
   success(id, result) {

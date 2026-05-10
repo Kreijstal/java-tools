@@ -1,9 +1,9 @@
-const { convertAstToCfg } = require('./ast-to-cfg');
-const { reconstructAstFromCfg } = require('./cfg-to-ast');
+const { convertAstToCfg } = require('../cfg/ast-to-cfg');
+const { reconstructAstFromCfg } = require('../cfg/cfg-to-ast');
 const { constantFoldCfg } = require('./constantFolder-cfg');
 const { eliminateDeadCodeCfg } = require('./deadCodeEliminator-cfg');
 const { inlinePureMethods } = require('./inlinePureMethods');
-const { createStaticInvokeEvaluator } = require('./utils/staticInvokeEvaluator');
+const { createStaticInvokeEvaluator } = require('../utils/staticInvokeEvaluator');
 const { evaluateCounterLoops } = require('./evaluateCounterLoops');
 const { removeDummyStackOps } = require('./removeDummyStackOps');
 

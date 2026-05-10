@@ -3,22 +3,23 @@ const {
   loadClassByPath,
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
-const { parseDescriptor } = require("./typeParser");
+const { parseDescriptor } = require("../parsing/typeParser");
 const { primitiveTypeDescriptors, arrayPrimitiveTypeDescriptors } = require("./constants");
 const {
   formatInstruction,
   unparseDataStructures,
   convertJson,
-} = require("./convert_tree");
-const jreClasses = require("./jre");
-const dispatch = require("./instructions");
+} = require("../parsing/convert_tree");
+const jreClasses = require("../jre");
+const dispatch = require("../instructions");
 const Frame = require("./frame");
-const DebugManager = require("./DebugManager");
+const DebugManager = require("../debug/DebugManager");
 const JNI = require("./jni");
 const fs = require("fs");
 const path = require("path");
 const { getAST } = require("jvm_parser");
 const { JreBootstrap } = require("./jre-bootstrap");
+const JitCompiler = require("../jit/JitCompiler");
 
 class JVM {
   constructor(options = {}) {
@@ -38,6 +39,7 @@ class JVM {
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
+    this.jit = new JitCompiler(this, options.jit || {});
 
     // Make fs and path available for JreBootstrap (only in Node.js environment)
     if (typeof window === "undefined") {
@@ -592,7 +594,7 @@ class JVM {
         const ctx = canvas.getContext('2d');
         if (ctx) {
           // Import the AWT framework to create CanvasGraphics
-          const awtFramework = require('./awt.js');
+          const awtFramework = require('../platform/awt.js');
           awtGraphics = new awtFramework.CanvasGraphics(ctx);
         }
       }
@@ -863,6 +865,15 @@ class JVM {
         await thread.reflectiveCallResolver(ret);
         thread.isAwaitingReflectiveCall = false;
         thread.reflectiveCallResolver = null;
+      }
+      return { completed: false };
+    }
+
+    const jitResult = await this.jit.tryRunFrame(frame, thread);
+    if (jitResult.handled) {
+      if (this.threads.length > 0) {
+        this.currentThreadIndex =
+          (this.currentThreadIndex + 1) % this.threads.length;
       }
       return { completed: false };
     }

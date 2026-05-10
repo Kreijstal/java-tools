@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
 
 function main() {
   const args = process.argv.slice(2);

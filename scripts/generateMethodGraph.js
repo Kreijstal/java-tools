@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
 const fs = require('fs');
 
 async function generateGraph(classPath, outputFile) {

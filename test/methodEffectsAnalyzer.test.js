@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { computeMethodEffects, makeMethodKey } = require('../src/methodEffectsAnalyzer');
+const { computeMethodEffects, makeMethodKey } = require('../src/analysis/methodEffectsAnalyzer');
 
 test('computeMethodEffects propagates throws across calls', (t) => {
   const ast = {

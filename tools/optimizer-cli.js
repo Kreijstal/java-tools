@@ -7,9 +7,9 @@ const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
-const { convertJson } = require('../src/convert_tree');
-const { runOptimizationPasses } = require('../src/passManager');
-const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
+const { convertJson } = require('../src/parsing/convert_tree');
+const { runOptimizationPasses } = require('../src/passes/passManager');
+const { writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
 
 const AVAILABLE_PASSES = ['inlinePureMethods', 'constantFoldCfg', 'evaluateCounterLoops', 'eliminateDeadCodeCfg'];
 const PASS_ALIASES = new Map([

@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { splitCode } = require('../src/splitReferenceArrayReachingLocal');
+const { splitCode } = require('../src/passes/splitReferenceArrayReachingLocal');
 
 test('moves reference array store to fresh local before primitive array reuse', (t) => {
   const code = {

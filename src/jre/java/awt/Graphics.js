@@ -1,5 +1,5 @@
 // Requires AWT framework
-const awtFramework = require('../../../awt.js');
+const awtFramework = require('../../../platform/awt.js');
 
 module.exports = {
   super: 'java/lang/Object',

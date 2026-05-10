@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/castObjectLocalStoreFromUses');
+const { rewriteCode } = require('../src/passes/castObjectLocalStoreFromUses');
 
 test('casts object local store based on later field reads', (t) => {
   const code = {

@@ -1,6 +1,6 @@
 const fs = require('fs');
 const { execSync, execFileSync } = require('child_process');
-const { unparseDataStructures } = require('./convert_tree');
+const { unparseDataStructures } = require('../parsing/convert_tree');
 const path = require('path');
  
 function assembleClasses(root, baseOutputDir = '.') {
@@ -22,7 +22,7 @@ function assembleClasses(root, baseOutputDir = '.') {
     fs.writeFileSync(jFileName, jContent);
 
     // Find Krakatau binary relative to project root
-    const krak2Path = path.resolve(__dirname, '../tools/krakatau/Krakatau/target/release/krak2');
+    const krak2Path = path.resolve(__dirname, '../../tools/krakatau/Krakatau/target/release/krak2');
     if (!fs.existsSync(krak2Path)) {
       throw new Error(`Krakatau binary not found at ${krak2Path}`);
     }

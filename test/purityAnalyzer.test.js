@@ -2,8 +2,8 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { getAST } = require('jvm_parser');
-const { convertJson } = require('../src/convert_tree');
-const { analyzePurity } = require('../src/purityAnalyzer');
+const { convertJson } = require('../src/parsing/convert_tree');
+const { analyzePurity } = require('../src/analysis/purityAnalyzer');
 
 function loadConvertedClass(classFileName) {
   const classFilePath = path.join(__dirname, '../sources', classFileName);

@@ -1,8 +1,8 @@
 const test = require('tape');
-const { convertAstToCfg } = require('../src/ast-to-cfg');
-const { constantFoldCfg } = require('../src/constantFolder-cfg');
-const { eliminateDeadCodeCfg } = require('../src/deadCodeEliminator-cfg');
-const { reconstructAstFromCfg } = require('../src/cfg-to-ast');
+const { convertAstToCfg } = require('../src/cfg/ast-to-cfg');
+const { constantFoldCfg } = require('../src/passes/constantFolder-cfg');
+const { eliminateDeadCodeCfg } = require('../src/passes/deadCodeEliminator-cfg');
+const { reconstructAstFromCfg } = require('../src/cfg/cfg-to-ast');
 
 function createStackManipulationProgram() {
   return {

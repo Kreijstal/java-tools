@@ -3,7 +3,7 @@
 
 const blessed = require('blessed');
 const path = require('path');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
 
 async function loadWorkspace(classpath) {
   return await KrakatauWorkspace.create(classpath);

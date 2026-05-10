@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/primitiveArrayCopyLoops');
+const { rewriteCode } = require('../src/passes/primitiveArrayCopyLoops');
 
 test('rewrites simple int array field copy loop', (t) => {
   const code = {

@@ -1,5 +1,5 @@
 // java.awt.Component - Base class for all AWT components
-const awtFramework = require('../../../awt.js');
+const awtFramework = require('../../../platform/awt.js');
 
 module.exports = {
   super: 'java/lang/Object',

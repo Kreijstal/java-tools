@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { simplifyCodeItems } = require('../src/simplifyNotCompare');
+const { simplifyCodeItems } = require('../src/passes/simplifyNotCompare');
 
 test('simplifyCodeItems rewrites ~x > k into x < ~k', (t) => {
   const codeItems = [
@@ -110,7 +110,7 @@ test('runSimplifyNotCompare can restrict rewrites to char-derived locals', (t) =
       },
     ],
   };
-  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
   const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
   const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
 
@@ -150,7 +150,7 @@ test('runSimplifyNotCompare rewrites static char field comparisons', (t) => {
       },
     ],
   };
-  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
   const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
   const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
 
@@ -194,7 +194,7 @@ test('runSimplifyNotCompare rewrites char parameter comparisons', (t) => {
       },
     ],
   };
-  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
   const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
   const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
 
@@ -242,7 +242,7 @@ test('runSimplifyNotCompare tracks static char-return helpers into locals', (t) 
       },
     ],
   };
-  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
   const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
 
   t.equal(result.rewrites, 1, 'rewrites comparison on static helper char local');
@@ -282,7 +282,7 @@ test('runSimplifyNotCompare tracks char fields into locals', (t) => {
       },
     ],
   };
-  const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
   const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
 
   t.equal(result.rewrites, 1, 'rewrites comparison on char field local');

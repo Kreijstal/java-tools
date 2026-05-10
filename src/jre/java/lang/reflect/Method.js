@@ -1,6 +1,6 @@
-const Frame = require('../../../../frame');
-const { parseDescriptor } = require('../../../../typeParser');
-const { ASYNC_METHOD_SENTINEL } = require('../../../../constants');
+const Frame = require('../../../../core/frame');
+const { parseDescriptor } = require('../../../../parsing/typeParser');
+const { ASYNC_METHOD_SENTINEL } = require('../../../../core/constants');
 const { withThrows } = require('../../../helpers');
 
 const MODIFIERS = {

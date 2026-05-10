@@ -9,7 +9,7 @@
  */
 
 // Import the generated JRE index for real class implementations
-const jreClasses = require('./jre/index');
+const jreClasses = require('../jre/index');
 
 class JreBootstrap {
   /**
@@ -83,7 +83,7 @@ class JreBootstrap {
 
     // Add other JRE classes that extend Object directly - only in Node.js environment
     if (typeof window === "undefined" && jvm.fs && jvm.path) {
-      const jrePath = jvm.path.join(__dirname, "jre");
+      const jrePath = jvm.path.join(__dirname, "..", "jre");
       const walk = (dir, prefix) => {
         const files = jvm.fs.readdirSync(dir);
         for (const file of files) {

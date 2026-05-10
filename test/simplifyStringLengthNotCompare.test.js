@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { rewriteCode } = require('../src/simplifyStringLengthNotCompare');
+const { rewriteCode } = require('../src/passes/simplifyStringLengthNotCompare');
 
 test('simplifies -1 == ~string.length() into length == 0', () => {
   const code = {

@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { collectLinearExplicitCastRanges, splitCode } = require('../src/splitConcreteObjectReachingLocal');
+const { collectLinearExplicitCastRanges, splitCode } = require('../src/passes/splitConcreteObjectReachingLocal');
 
 test('moves concrete object store to fresh local', (t) => {
   const code = {

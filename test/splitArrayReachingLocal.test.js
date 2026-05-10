@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { splitCode } = require('../src/splitArrayReachingLocal');
+const { splitCode } = require('../src/passes/splitArrayReachingLocal');
 
 test('duplicates array reaching definition into fresh local', (t) => {
   const code = {

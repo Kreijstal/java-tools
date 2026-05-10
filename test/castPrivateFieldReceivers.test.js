@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/castPrivateFieldReceivers');
+const { rewriteCode } = require('../src/passes/castPrivateFieldReceivers');
 
 test('casts receiver for private putfield with simple value', (t) => {
   const code = {

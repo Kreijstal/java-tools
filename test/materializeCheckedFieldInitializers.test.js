@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { rewriteCode } = require('../src/materializeCheckedFieldInitializers');
+const { rewriteCode } = require('../src/passes/materializeCheckedFieldInitializers');
 
 test('materializes constructor field object allocation through a temporary local', () => {
   const field = ['Field', 'il', ['il_a', 'Ljava/awt/Robot;']];

@@ -1,6 +1,6 @@
 const tape = require('tape');
 const path = require('path');
-const { JVM } = require('../src/jvm');
+const { JVM } = require('../src/core/jvm');
 
 tape('JVM should handle enum switch statements', async (t) => {
   const jvm = new JVM({ classpath: 'sources' });

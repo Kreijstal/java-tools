@@ -132,7 +132,7 @@ src/
 ### 1. Basic Class Analysis
 
 ```javascript
-const { loadClassByPath } = require('./src/classLoader');
+const { loadClassByPath } = require('./src/core/classLoader');
 
 // Load and parse a class file
 const classData = await loadClassByPath('MyClass.class');
@@ -143,7 +143,7 @@ console.log('Methods:', classData.ast.classes[0].items.filter(item => item.type 
 ### 2. JVM Execution
 
 ```javascript
-const { JVM } = require('./src/jvm');
+const { JVM } = require('./src/core/jvm');
 
 const jvm = new JVM({
     verbose: true,
@@ -179,8 +179,8 @@ debugger.continue();
 ### 4. Bytecode Manipulation
 
 ```javascript
-const { getAST, convertJson } = require('./src/convert_tree');
-const { unparseDataStructures } = require('./src/convert_tree');
+const { getAST, convertJson } = require('./src/parsing/convert_tree');
+const { unparseDataStructures } = require('./src/parsing/convert_tree');
 
 // Parse class file
 const classData = fs.readFileSync('MyClass.class');

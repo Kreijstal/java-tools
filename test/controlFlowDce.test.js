@@ -8,7 +8,7 @@ const {
   mergeAdjacentConstReturns,
   shareConstReturnGotos,
   removeUnreferencedAfterTerminals,
-} = require('../src/controlFlowDce');
+} = require('../src/passes/controlFlowDce');
 
 test('removes unreferenced instructions after terminal opcodes', () => {
   const code = {

@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
+const { inlineSinglePredecessorBlocks } = require('../src/passes/blockInliner');
 
 function createAst() {
   return {

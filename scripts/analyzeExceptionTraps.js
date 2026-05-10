@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { analyzeClass } = require('../src/exceptionTrapAnalyzer');
+const { analyzeClass } = require('../src/analysis/exceptionTrapAnalyzer');
 
 function usage() {
   console.error('Usage: node scripts/analyzeExceptionTraps.js <classes-dir-or-jar-or-class> [out.json] [--class Name] [--progress]');

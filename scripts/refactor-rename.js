@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { SymbolIdentifier } = require('../src/symbols');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { SymbolIdentifier } = require('../src/workspace/symbols');
 
 async function main() {
   const args = process.argv.slice(2);

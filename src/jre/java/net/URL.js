@@ -1,4 +1,4 @@
-const fetch = require('../../../fetch-polyfill');
+const fetch = require('../../../io/fetch-polyfill');
 
 module.exports = {
   super: 'java/lang/Object',

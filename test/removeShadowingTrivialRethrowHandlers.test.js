@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { removeFromCode, isPureRethrowBlock } = require('../src/removeShadowingTrivialRethrowHandlers');
+const { removeFromCode, isPureRethrowBlock } = require('../src/passes/removeShadowingTrivialRethrowHandlers');
 
 test('isPureRethrowBlock accepts astore aload athrow', (t) => {
   t.equal(isPureRethrowBlock([

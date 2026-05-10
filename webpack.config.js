@@ -2,7 +2,7 @@ const path = require('path');
 
 module.exports = {
   mode: 'production',
-  entry: './src/browser-entry.js',
+  entry: './src/platform/browser-entry.js',
   output: {
     filename: 'jvm-debug.js',
     path: path.resolve(__dirname, 'dist'),

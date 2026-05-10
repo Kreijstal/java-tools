@@ -2,8 +2,8 @@ const test = require('tape');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { SymbolIdentifier } = require('../src/symbols');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { SymbolIdentifier } = require('../src/workspace/symbols');
 
 test('rename method functionality', async (t) => {
   const tempDir = path.join(__dirname, 'temp_rename_test');

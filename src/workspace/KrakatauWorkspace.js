@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
-const { loadClassByPathSync } = require('./classLoader');
+const { loadClassByPathSync } = require('../core/classLoader');
 const { getReferenceObjFromClass } = require('./traverseAST');
-const { unparseDataStructures } = require('./convert_tree');
+const { unparseDataStructures } = require('../parsing/convert_tree');
 const { assembleClasses } = require('./assembleAndRun');
 const { renameMethod } = require('./renameMethod');
 const { renameField } = require('./renameField');
@@ -58,7 +58,7 @@ class KrakatauWorkspace {
       // but loadClassByPathSync does both. Let's get the raw content and parse it here.
       const fs = require('fs');
       const { getAST } = require('jvm_parser');
-      const { convertJson } = require('./convert_tree');
+      const { convertJson } = require('../parsing/convert_tree');
 
       const classFileContent = fs.readFileSync(classFile);
       const rawAst = getAST(classFileContent);
@@ -1043,7 +1043,7 @@ class KrakatauWorkspace {
     // This needs to be updated to match the logic in _initialize
     const fs = require('fs');
     const { getAST } = require('jvm_parser');
-    const { convertJson } = require('./convert_tree');
+    const { convertJson } = require('../parsing/convert_tree');
 
     const classFileContent = fs.readFileSync(filePath);
     const rawAst = getAST(classFileContent);

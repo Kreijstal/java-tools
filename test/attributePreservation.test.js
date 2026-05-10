@@ -4,10 +4,10 @@ const path = require('path');
 const os = require('os');
 const { execFileSync } = require('child_process');
 const { getAST } = require('jvm_parser');
-const { convertJson, unparseDataStructures } = require('../src/convert_tree');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
-const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
+const { convertJson, unparseDataStructures } = require('../src/parsing/convert_tree');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
+const { writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
 
 function buildClassAstFromFile(classFilePath) {
   const classFileContent = fs.readFileSync(classFilePath);

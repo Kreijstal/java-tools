@@ -1,6 +1,6 @@
 'use strict';
 
-const { normalizeInstruction } = require('./utils/instructionUtils');
+const { normalizeInstruction } = require('../utils/instructionUtils');
 
 const SAFE_CONST_PREFIXES = ['iconst_', 'lconst_', 'fconst_', 'dconst_'];
 const SAFE_LOAD_PREFIXES = ['iload', 'lload', 'fload', 'dload', 'aload'];

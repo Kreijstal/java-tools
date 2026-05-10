@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { removeTrivialRethrowHandlers } = require('../src/removeTrivialRethrowHandlers');
+const { removeTrivialRethrowHandlers } = require('../src/passes/removeTrivialRethrowHandlers');
 
 function createTrapAst() {
   return {

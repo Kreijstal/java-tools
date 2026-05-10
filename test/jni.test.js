@@ -1,5 +1,5 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
+const { JVM } = require('../src/core/jvm');
 
 test('JNI Native Method Registration and Execution', (t) => {
   const jvm = new JVM({ verbose: false });

@@ -9,7 +9,7 @@ const path = require('path');
 const { exec } = require('child_process');
 const util = require('util');
 const execPromise = util.promisify(exec);
-const { parseClassFile } = require('../src/create_java_asm');
+const { parseClassFile } = require('../src/parsing/create_java_asm');
 
 // Get all .class files in the sources directory
 const sourcesDir = path.join(__dirname, '../sources');

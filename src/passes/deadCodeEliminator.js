@@ -1,5 +1,5 @@
-const { getStackEffect, normalizeInstruction } = require('./utils/instructionUtils');
-const { applyStackManipulation } = require('./utils/stackManipulation');
+const { getStackEffect, normalizeInstruction } = require('../utils/instructionUtils');
+const { applyStackManipulation } = require('../utils/stackManipulation');
 
 function buildMethodSignature(className, method) {
   return `${className}.${method.name}${method.descriptor}`;

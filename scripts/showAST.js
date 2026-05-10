@@ -1,4 +1,4 @@
-const { loadClassByPath } = require('../src/classLoader');
+const { loadClassByPath } = require('../src/core/classLoader');
 
 async function showAST(classFilePath) {
   const classData = await loadClassByPath(classFilePath);

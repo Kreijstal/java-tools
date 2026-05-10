@@ -1,5 +1,5 @@
 const test = require('tape');
-const { Lang } = require('../src/krak2_parser.js');
+const { Lang } = require('../src/parsing/krak2_parser.js');
 const P = require('parsimmon');
 
 test("Parser tests", (t) => {

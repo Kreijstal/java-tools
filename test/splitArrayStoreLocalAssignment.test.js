@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { rewriteCode } = require('../src/splitArrayStoreLocalAssignment');
+const { rewriteCode } = require('../src/passes/splitArrayStoreLocalAssignment');
 
 test('moves local assignment before array store', (t) => {
   const code = {

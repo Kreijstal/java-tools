@@ -1,5 +1,5 @@
 const test = require('tape');
-const awt = require('../src/awt');
+const awt = require('../src/platform/awt');
 const { Canvas, Frame, Component, AwtMouseEvent, AwtKeyEvent } = awt;
 
 test('AWT framework - CLI compatibility with mocks', (t) => {

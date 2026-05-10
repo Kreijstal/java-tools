@@ -6,30 +6,30 @@ const os = require('os');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 const { getAST } = require('jvm_parser');
-const { convertJson, unparseDataStructures } = require('../src/convert_tree');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
-const { writeClassAstToClassFile } = require('../src/classAstToClassFile');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { runDeadCodePass } = require('../src/deadCodePass');
-const { renameClassAst, renameMethodAst } = require('../src/astTransforms');
-const { inlineSinglePredecessorBlocks } = require('../src/blockInliner');
-const { inlinePureMethods } = require('../src/inlinePureMethods');
-const { relocateTrivialHandlers } = require('../src/handlerRelocator');
-const { removeTrivialRethrowHandlers } = require('../src/removeTrivialRethrowHandlers');
-const { runRemoveShadowedExceptionHandlers } = require('../src/removeShadowedExceptionHandlers');
-const { runPeepholeClean } = require('../src/peepholeClean');
-const { runConditionInverter } = require('../src/conditionInverter');
-const { runMultiEntryLoopNormalizer } = require('../src/multiEntryLoopNormalizer');
-const { runCoalesceLoopLoad } = require('../src/coalesceLoopLoad');
-const { runDeadStaticBoolFlag } = require('../src/deadStaticBoolFlag');
-const { runInlineSharedExitGoto } = require('../src/inlineSharedExitGoto');
-const { runSimplifyNotCompare } = require('../src/simplifyNotCompare');
-const { formatJasminSource, normalizeNewlines } = require('../src/jasminFormatter');
-const { collectExceptionMetadata } = require('../src/exceptionMetadata');
-const { collectMethodCallers } = require('../src/callGraphMetadata');
-const { collectFieldReferences } = require('../src/fieldReferenceMetadata');
-const { computeMethodEffects, makeMethodKey } = require('../src/methodEffectsAnalyzer');
+const { convertJson, unparseDataStructures } = require('../src/parsing/convert_tree');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
+const { writeClassAstToClassFile } = require('../src/parsing/classAstToClassFile');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { runDeadCodePass } = require('../src/passes/deadCodePass');
+const { renameClassAst, renameMethodAst } = require('../src/passes/astTransforms');
+const { inlineSinglePredecessorBlocks } = require('../src/passes/blockInliner');
+const { inlinePureMethods } = require('../src/passes/inlinePureMethods');
+const { relocateTrivialHandlers } = require('../src/passes/handlerRelocator');
+const { removeTrivialRethrowHandlers } = require('../src/passes/removeTrivialRethrowHandlers');
+const { runRemoveShadowedExceptionHandlers } = require('../src/passes/removeShadowedExceptionHandlers');
+const { runPeepholeClean } = require('../src/passes/peepholeClean');
+const { runConditionInverter } = require('../src/passes/conditionInverter');
+const { runMultiEntryLoopNormalizer } = require('../src/passes/multiEntryLoopNormalizer');
+const { runCoalesceLoopLoad } = require('../src/passes/coalesceLoopLoad');
+const { runDeadStaticBoolFlag } = require('../src/passes/deadStaticBoolFlag');
+const { runInlineSharedExitGoto } = require('../src/passes/inlineSharedExitGoto');
+const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+const { formatJasminSource, normalizeNewlines } = require('../src/parsing/jasminFormatter');
+const { collectExceptionMetadata } = require('../src/analysis/exceptionMetadata');
+const { collectMethodCallers } = require('../src/analysis/callGraphMetadata');
+const { collectFieldReferences } = require('../src/analysis/fieldReferenceMetadata');
+const { computeMethodEffects, makeMethodKey } = require('../src/analysis/methodEffectsAnalyzer');
 
 const HELP_TEXT = `
 Usage: node scripts/jvm-cli.js <command> [options]
@@ -1684,7 +1684,7 @@ function workspaceFindReferences(workspace, args) {
   if (!className) {
     throw new Error('find-references requires --class');
   }
-  const identifier = new (require('../src/symbols').SymbolIdentifier)(
+  const identifier = new (require('../src/workspace/symbols').SymbolIdentifier)(
     className,
     memberName,
     descriptor,

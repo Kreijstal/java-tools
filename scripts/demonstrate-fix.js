@@ -5,9 +5,9 @@
  * This reproduces the original error scenario and shows it now works
  */
 
-const BrowserFileProvider = require('../src/BrowserFileProvider');
-const DebugController = require('../src/debugController');
-const { setFileProvider } = require('../src/classLoader');
+const BrowserFileProvider = require('../src/io/BrowserFileProvider');
+const DebugController = require('../src/debug/debugController');
+const { setFileProvider } = require('../src/core/classLoader');
 
 async function demonstrateFix() {
     console.log('🔬 Demonstrating Browser Debugging Fix');

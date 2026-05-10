@@ -3,9 +3,9 @@
 const test = require('tape');
 const fs = require('fs');
 const path = require('path');
-const { runCoalesceLoopLoad } = require('../src/coalesceLoopLoad');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
+const { runCoalesceLoopLoad } = require('../src/passes/coalesceLoopLoad');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
 
 function astWith(codeItems, exceptionTable = []) {
   return {

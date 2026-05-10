@@ -1,6 +1,6 @@
 const { getAST } = require('jvm_parser'); 
-const { convertJson } = require('./convert_tree');
-const NodeFileProvider = require('./NodeFileProvider');
+const { convertJson } = require('../parsing/convert_tree');
+const NodeFileProvider = require('../io/NodeFileProvider');
 
 // Global FileProvider instance - can be overridden for different environments
 let globalFileProvider = null;

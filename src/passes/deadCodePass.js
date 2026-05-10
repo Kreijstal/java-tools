@@ -1,11 +1,11 @@
 'use strict';
 
-const { convertAstToCfg } = require('./ast-to-cfg');
+const { convertAstToCfg } = require('../cfg/ast-to-cfg');
 const { eliminateDeadCodeCfg } = require('./deadCodeEliminator-cfg');
-const { reconstructAstFromCfg } = require('./cfg-to-ast');
-const { analyzePurity } = require('./purityAnalyzer');
-const { collectExceptionMetadata } = require('./exceptionMetadata');
-const { makeMethodKey, extractInvokeTarget } = require('./methodEffectsAnalyzer');
+const { reconstructAstFromCfg } = require('../cfg/cfg-to-ast');
+const { analyzePurity } = require('../analysis/purityAnalyzer');
+const { collectExceptionMetadata } = require('../analysis/exceptionMetadata');
+const { makeMethodKey, extractInvokeTarget } = require('../analysis/methodEffectsAnalyzer');
 const { removeDummyStackOps } = require('./removeDummyStackOps');
 
 function runDeadCodePass(astRoot, { collectDiagnostics = true, methodEffects = null } = {}) {

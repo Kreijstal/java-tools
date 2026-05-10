@@ -1,5 +1,5 @@
-const Frame = require("../../../../frame");
-const { ASYNC_METHOD_SENTINEL } = require("../../../../constants");
+const Frame = require("../../../../core/frame");
+const { ASYNC_METHOD_SENTINEL } = require("../../../../core/constants");
 const { withThrows } = require('../../../helpers');
 
 module.exports = {

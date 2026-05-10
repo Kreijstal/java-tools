@@ -1,9 +1,9 @@
 'use strict';
 
 const test = require('tape');
-const { parseKrak2Assembly } = require('../src/parse_krak2');
-const { convertKrak2AstToClassAst } = require('../src/convert_krak2_ast');
-const { evaluateCounterLoops } = require('../src/evaluateCounterLoops');
+const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
+const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
+const { evaluateCounterLoops } = require('../src/passes/evaluateCounterLoops');
 const { normalizeInstruction } = require('../src/utils/instructionUtils');
 
 function buildAstFromJasmin(source) {

@@ -1,5 +1,5 @@
-const { getStackEffect, normalizeInstruction, parseLocalOperation } = require('./utils/instructionUtils');
-const { applyStackManipulation } = require('./utils/stackManipulation');
+const { getStackEffect, normalizeInstruction, parseLocalOperation } = require('../utils/instructionUtils');
+const { applyStackManipulation } = require('../utils/stackManipulation');
 
 const INT_BINARY_OPS = new Set([
   'iadd',

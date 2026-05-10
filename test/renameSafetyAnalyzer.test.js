@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { analyzeRenameSafety } = require('../src/renameSafetyAnalyzer');
+const { analyzeRenameSafety } = require('../src/analysis/renameSafetyAnalyzer');
 
 function workspaceFromClass(cls) {
   return {
