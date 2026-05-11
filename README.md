@@ -83,6 +83,14 @@ node scripts/runLoadAndTraverse.js Hello sources
 node scripts/runJvm.js sources/Hello.class
 ```
 
+```bash
+# Run an executable jar using META-INF/MANIFEST.MF Main-Class
+node scripts/runJar.js app.jar
+
+# Run an applet-style jar by naming the entry class
+node scripts/runJar.js --class VecDemo vector.jar
+```
+
 #### Web-Based Debugging
 
 ```bash
