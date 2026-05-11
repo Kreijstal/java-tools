@@ -418,7 +418,7 @@ module.exports = {
     frame.stack.push(newArray);
   },
 
-  checkcast: (frame, instruction, jvm) => {
+  checkcast: async (frame, instruction, jvm) => {
     const targetClassName = instruction.arg;
     const objRef = frame.stack.peek(); // Don't pop, just peek
 
@@ -491,8 +491,11 @@ module.exports = {
     }
     
     // Set array type for proper runtime behavior
-    array.type = 'array';
+    const descriptors = { boolean: '[Z', byte: '[B', char: '[C', short: '[S', int: '[I', long: '[J', float: '[F', double: '[D' };
+    array.type = descriptors[atype] || 'array';
     array.elementType = atype;
+    array.length = count;
+    array.hashCode = jvm.nextHashCode++;
     
     frame.stack.push(array);
   },

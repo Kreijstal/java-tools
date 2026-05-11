@@ -76,6 +76,17 @@ module.exports = {
       }
       obj.suppressedExceptions.push(suppressedException);
     },
+    'getStackTrace()[Ljava/lang/StackTraceElement;': (jvm, obj) => {
+      const array = obj.stackTrace || [];
+      array.type = '[Ljava/lang/StackTraceElement;';
+      array.elementType = 'java/lang/StackTraceElement';
+      array.length = array.length;
+      return array;
+    },
+    'fillInStackTrace()Ljava/lang/Throwable;': (jvm, obj) => {
+      if (!obj.stackTrace) obj.stackTrace = [];
+      return obj;
+    },
     'getSuppressed()[Ljava/lang/Throwable;': (jvm, obj, args) => {
       const suppressedArray = obj.suppressedExceptions || [];
       // Create a Java array of Throwable

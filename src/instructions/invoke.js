@@ -9,6 +9,15 @@ function runtimeClassName(obj) {
   return obj && (obj._className || obj.type);
 }
 
+function isJavaPlatformClass(className) {
+  return typeof className === "string" && (
+    className.startsWith("java/") ||
+    className.startsWith("javax/") ||
+    className.startsWith("sun/") ||
+    className.startsWith("com/sun/")
+  );
+}
+
 function assignArgsToLocals(locals, args, params, startIndex) {
   let localIndex = startIndex;
   for (let i = 0; i < params.length; i++) {
@@ -201,11 +210,20 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
 
     let classData = jvm.classes[currentClassName];
+    if (classData && classData.isJreStub && !isJavaPlatformClass(currentClassName)) {
+      const loadedClassData = await jvm.loadClassByName(currentClassName);
+      if (loadedClassData && !loadedClassData.isJreStub) {
+        classData = loadedClassData;
+      }
+    }
     if (!classData) {
-      if (jvm.jre[currentClassName]) {
-        break; // It's a JRE class, don't try to load it from file.
+      if (jvm.jre[currentClassName] && isJavaPlatformClass(currentClassName)) {
+        break; // Platform JRE shims are runtime-only.
       }
       classData = await jvm.loadClassByName(currentClassName);
+      if (!classData && jvm.jre[currentClassName]) {
+        break;
+      }
     }
 
     if (classData) {
@@ -340,28 +358,82 @@ async function invokespecial(frame, instruction, jvm, thread) {
   }
 
   if (jreMethod) {
-    await jreMethod(jvm, obj, args);
+    let result = await jreMethod(jvm, obj, args, thread);
+    if (result !== ASYNC_METHOD_SENTINEL) {
+      const { returnType } = parseDescriptor(descriptor);
+      if (returnType !== "V" && result !== undefined) {
+        if (typeof result === "boolean") {
+          result = result ? 1 : 0;
+        }
+        frame.stack.push(result);
+      }
+    }
     return;
   }
 
   // For user-defined methods (constructors, private methods, super calls)
   let workspaceEntry = jvm.classes[className];
+  if (workspaceEntry && workspaceEntry.isJreStub && !isJavaPlatformClass(className)) {
+    const loadedClassData = await jvm.loadClassByName(className);
+    if (loadedClassData && !loadedClassData.isJreStub) {
+      workspaceEntry = loadedClassData;
+    }
+  }
   if (!workspaceEntry) {
-    if (jvm.jre[className]) {
+    if (jvm.jre[className] && isJavaPlatformClass(className)) {
       return;
     }
     // If class is not loaded, loading it.
     workspaceEntry = await jvm.loadClassByName(className);
     if (!workspaceEntry) {
+      if (jvm.jre[className]) {
+        return;
+      }
       console.error(`Class not found for invokespecial: ${className}`);
       return;
     }
   }
 
-  const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
+  let resolvedClassName = className;
+  let resolvedClassData = workspaceEntry;
+  let method = null;
+
+  while (resolvedClassData) {
+    method = jvm.findMethod(resolvedClassData, methodName, descriptor);
+    if (method) {
+      resolvedClassName = resolvedClassData.ast.classes[0].className;
+      break;
+    }
+
+    if (methodName === "<init>") {
+      break;
+    }
+
+    const superClassName = resolvedClassData.ast.classes[0].superClassName;
+    if (!superClassName) {
+      break;
+    }
+    if (jvm.jre[superClassName] && isJavaPlatformClass(superClassName)) {
+      break;
+    }
+    resolvedClassData = jvm.classes[superClassName];
+    if (resolvedClassData && resolvedClassData.isJreStub && !isJavaPlatformClass(superClassName)) {
+      const loadedClassData = await jvm.loadClassByName(superClassName);
+      if (loadedClassData && !loadedClassData.isJreStub) {
+        resolvedClassData = loadedClassData;
+      }
+    }
+    if (!resolvedClassData) {
+      resolvedClassData = await jvm.loadClassByName(superClassName);
+    }
+    if (!resolvedClassData && jvm.jre[superClassName]) {
+      break;
+    }
+  }
+
   if (method) {
     const newFrame = new Frame(method);
-    newFrame.className = className; // Add className to the frame
+    newFrame.className = resolvedClassName; // Add className to the frame
     newFrame.locals[0] = obj; // 'this'
     assignArgsToLocals(newFrame.locals, args, params, 1);
     thread.callStack.push(newFrame);
@@ -611,11 +683,20 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     }
 
     let classData = jvm.classes[currentClassName];
+    if (classData && classData.isJreStub && !isJavaPlatformClass(currentClassName)) {
+      const loadedClassData = await jvm.loadClassByName(currentClassName);
+      if (loadedClassData && !loadedClassData.isJreStub) {
+        classData = loadedClassData;
+      }
+    }
     if (!classData) {
-      if (jvm.jre[currentClassName]) {
-        break; // It's a JRE class, don't try to load it from file.
+      if (jvm.jre[currentClassName] && isJavaPlatformClass(currentClassName)) {
+        break; // Platform JRE shims are runtime-only.
       }
       classData = await jvm.loadClassByName(currentClassName);
+      if (!classData && jvm.jre[currentClassName]) {
+        break;
+      }
     }
 
     if (classData) {

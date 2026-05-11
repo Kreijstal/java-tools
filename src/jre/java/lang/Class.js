@@ -1,3 +1,18 @@
+
+function classNameFor(classObj) {
+  if (!classObj) return null;
+  if (classObj.isPrimitive) return classObj.name || null;
+  if (classObj._classData && classObj._classData.ast && classObj._classData.ast.classes[0]) {
+    return classObj._classData.ast.classes[0].className;
+  }
+  if (classObj.className) return String(classObj.className).replace(/\./g, '/');
+  if (classObj.type && classObj.type !== 'java/lang/Class') return String(classObj.type).replace(/\./g, '/');
+  return null;
+}
+
+function runtimeClassName(obj) {
+  return obj && (obj._className || obj.type);
+}
 const { withThrows } = require('../../helpers');
 
 module.exports = {
@@ -67,10 +82,55 @@ module.exports = {
       // Check if this is a primitive type class
       return classObj.isPrimitive ? 1 : 0;
     },
+    'isInstance(Ljava/lang/Object;)Z': async (jvm, classObj, args) => {
+      const obj = args[0];
+      if (obj === null || obj === undefined || classObj.isPrimitive) return 0;
+      const target = classNameFor(classObj);
+      return await jvm.isInstanceOfAsync(runtimeClassName(obj), target) ? 1 : 0;
+    },
+    'isAssignableFrom(Ljava/lang/Class;)Z': async (jvm, classObj, args) => {
+      if (!args[0] || classObj.isPrimitive || args[0].isPrimitive) {
+        return classObj === args[0] ? 1 : 0;
+      }
+      const target = classNameFor(classObj);
+      const source = classNameFor(args[0]);
+      return await jvm.isInstanceOfAsync(source, target) ? 1 : 0;
+    },
     'isArray()Z': (jvm, classObj, args) => {
       // Check if this is an array class
       const classData = classObj._classData;
       return classData && classData.isArray ? 1 : 0;
+    },
+    'isEnum()Z': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes[0]) return 0;
+      let current = classData.ast.classes[0].superClassName;
+      while (current) {
+        if (current === 'java/lang/Enum') return 1;
+        const currentData = jvm.classes[current];
+        current = currentData && currentData.ast && currentData.ast.classes[0]
+          ? currentData.ast.classes[0].superClassName
+          : null;
+      }
+      return 0;
+    },
+    'getEnumConstants()[Ljava/lang/Object;': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes[0]) return null;
+      const className = classData.ast.classes[0].className;
+      const values = [];
+      if (classData.staticFields) {
+        for (const [fieldKey, value] of classData.staticFields.entries()) {
+          if (!value || (value.type !== className && value._className !== className)) continue;
+          if (String(fieldKey).includes('$VALUES')) continue;
+          values.push(value);
+        }
+      }
+      if (values.length === 0) return null;
+      values.type = `[L${className};`;
+      values.elementType = className;
+      values.hashCode = jvm.nextHashCode++;
+      return values;
     },
     'getMethods()[Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
       const allMethods = {};
@@ -370,6 +430,20 @@ module.exports = {
         jvm.runMethod(constructor, [newObj]);
       }
       return newObj;
+    },
+    'getResource(Ljava/lang/String;)Ljava/net/URL;': (jvm, classObj, args) => {
+      const name = String(args[0]);
+      const classData = classObj._classData;
+      const className = classData && classData.ast && classData.ast.classes[0]
+        ? classData.ast.classes[0].className
+        : 'java/lang/Object';
+      const base = className.includes('/') ? className.substring(0, className.lastIndexOf('/') + 1) : '';
+      const resource = name.startsWith('/') ? name.substring(1) : base + name;
+      return {
+        type: 'java/net/URL',
+        url: jvm.internString(`file:/${resource}`),
+        hashCode: jvm.nextHashCode++,
+      };
     },
     'getClassLoader()Ljava/lang/ClassLoader;': (jvm, classObj, args) => {
       // Return null to indicate the bootstrap class loader

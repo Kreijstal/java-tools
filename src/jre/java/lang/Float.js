@@ -8,6 +8,24 @@ module.exports = {
     },
   },
   staticMethods: {
+    'intBitsToFloat(I)F': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(4);
+      const view = new DataView(buffer);
+      view.setInt32(0, args[0], false);
+      return view.getFloat32(0, false);
+    },
+    'floatToIntBits(F)I': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(4);
+      const view = new DataView(buffer);
+      view.setFloat32(0, args[0], false);
+      return view.getInt32(0, false);
+    },
+    'floatToRawIntBits(F)I': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(4);
+      const view = new DataView(buffer);
+      view.setFloat32(0, args[0], false);
+      return view.getInt32(0, false);
+    },
     'valueOf(F)Ljava/lang/Float;': (jvm, obj, args) => {
       const floatObj = {
         type: 'java/lang/Float',

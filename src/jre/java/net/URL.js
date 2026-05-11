@@ -1,4 +1,10 @@
 const fetch = require('../../../io/fetch-polyfill');
+function javaString(value) {
+  if (value === null || value === undefined) return '';
+  if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
+  return String(value);
+}
+
 
 module.exports = {
   super: 'java/lang/Object',
@@ -13,7 +19,7 @@ module.exports = {
       return urlConnection;
     },
     'getProtocol()Ljava/lang/String;': (jvm, obj, args) => {
-      const urlString = obj.url.value; // Assuming .value holds the JS string
+      const urlString = javaString(obj.url);
       const protocol = new URL(urlString).protocol.replace(':', '');
       return jvm.internString(protocol);
     },
@@ -21,8 +27,8 @@ module.exports = {
     '<init>(Ljava/net/URL;Ljava/lang/String;)V': (jvm, obj, args) => {
       const context = args[0];
       const spec = args[1];
-      const contextString = context.url.value;
-      const specString = spec.value;
+      const contextString = javaString(context.url);
+      const specString = javaString(spec);
 
       const newUrl = new URL(specString, contextString);
       obj.url = jvm.internString(newUrl.href);
@@ -34,13 +40,13 @@ module.exports = {
     },
 
     'getHost()Ljava/lang/String;': (jvm, obj, args) => {
-      const urlString = obj.url.value;
+      const urlString = javaString(obj.url);
       const host = new URL(urlString).hostname;
       return jvm.internString(host);
     },
 
     'getFile()Ljava/lang/String;': (jvm, obj, args) => {
-      const urlString = obj.url.value;
+      const urlString = javaString(obj.url);
       const url = new URL(urlString);
       const file = url.pathname + url.search;
       return jvm.internString(file);

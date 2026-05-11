@@ -2,6 +2,7 @@ module.exports = {
   super: {
     type: 'java/lang/Object'
   },
+  interfaces: ['java/util/Map'],
   methods: {
     '<init>()V': (jvm, obj, args) => {
       obj.entries = new Map();
