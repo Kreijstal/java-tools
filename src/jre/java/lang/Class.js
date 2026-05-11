@@ -116,6 +116,9 @@ module.exports = {
         Object.keys(stringMethods.methods).forEach(methodSignature => {
           const openParen = methodSignature.indexOf('(');
           const name = methodSignature.substring(0, openParen);
+          if (name === '<init>') {
+            return;
+          }
           const descriptor = methodSignature.substring(openParen);
           const key = name + descriptor;
           if (!allMethods[key]) {

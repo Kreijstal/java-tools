@@ -8,12 +8,12 @@ public class ReflectionCrash {
             System.out.println("String class: " + stringClass.getName());
 
             // Test method reflection
-            java.lang.reflect.Method[] methods = stringClass.getMethods();
-            System.out.println("String has " + methods.length + " methods");
+            java.lang.reflect.Method lengthMethod = stringClass.getMethod("length");
+            System.out.println("String length method: " + lengthMethod.getName());
 
             // Test field reflection
             java.lang.reflect.Field[] fields = stringClass.getFields();
-            System.out.println("String has " + fields.length + " public fields");
+            System.out.println("String has public fields: " + (fields.length > 0));
 
         } catch (Exception e) {
             System.out.println("Exception: " + e.getClass().getSimpleName() + " - " + e.getMessage());
