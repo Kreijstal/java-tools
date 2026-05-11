@@ -1,8 +1,13 @@
 'use strict';
 
-const { buildCfg, reachingDefinitions } = require('./splitArrayReachingLocal');
+const {
+  buildCfg,
+  computeDominators,
+  instructionDominates,
+  reachingDefinitions,
+} = require('./splitArrayReachingLocal');
 
-function runSplitConcreteObjectReachingLocal(astRoot) {
+function runSplitConcreteObjectReachingLocal(astRoot, options = {}) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
     for (const item of cls.items || []) {
@@ -10,21 +15,24 @@ function runSplitConcreteObjectReachingLocal(astRoot) {
       for (const attr of item.method.attributes || []) {
         const code = attr && attr.type === 'code' && attr.code;
         if (!code || !Array.isArray(code.codeItems)) continue;
-        rewrites += splitCode(code);
+        rewrites += splitCode(code, options);
       }
     }
   }
   return { changed: rewrites > 0, rewrites };
 }
 
-function splitCode(code) {
+function splitCode(code, options = {}) {
   const items = code.codeItems;
   if (items.length > 10000) return 0;
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
+  const requireDominance = !!options.requireDominance;
+  const preserveOriginalLocals = !!options.preserveOriginalLocals;
+  const dominators = requireDominance ? computeDominators(cfg) : null;
   let candidates = mergeCandidates(
-    collectCandidates(code, analysis),
+    collectCandidates(code, cfg, analysis, dominators),
     collectLinearExplicitCastRanges(code),
     collectCastedLoopRanges(code),
   );
@@ -63,11 +71,51 @@ function splitCode(code) {
     for (const storeItem of storeItems) {
       const idx = items.indexOf(storeItem);
       if (idx < 0) continue;
+      const preserveOriginal = preserveOriginalLocals && (
+        isBranchTarget(code, storeItem) ||
+        hasUnrewrittenLoadBeforeNextStore(items, idx, candidate.local, candidate.loadItems)
+      );
       storeItem.instruction = storeRef(candidate.fresh);
+      if (preserveOriginal) {
+        items.splice(idx + 1, 0, { instruction: loadRef(candidate.fresh) }, { instruction: storeRef(candidate.local) });
+      }
       rewrites += 1;
     }
   }
   return rewrites;
+}
+
+function isBranchTarget(code, item) {
+  const label = trimLabel(item && item.labelDef);
+  if (!label) return false;
+  for (const candidate of collectReferencedLabels(code)) {
+    if (candidate === label) return true;
+  }
+  return false;
+}
+
+function collectReferencedLabels(code) {
+  const out = new Set();
+  for (const item of code.codeItems || []) {
+    for (const target of branchTargets(item)) {
+      const label = trimLabel(target);
+      if (label) out.add(label);
+    }
+  }
+  for (const entry of code.exceptionTable || []) {
+    for (const value of [entry.startLbl, entry.endLbl, entry.handlerLbl]) {
+      const label = trimLabel(value);
+      if (label) out.add(label);
+    }
+  }
+  return out;
+}
+
+function hasUnrewrittenLoadBeforeNextStore(items, storeIndex, local, rewrittenLoads) {
+  for (let i = storeIndex + 1; i < items.length; i += 1) {
+    if (aloadLocal(items[i]) === local && !rewrittenLoads.includes(items[i])) return true;
+  }
+  return false;
 }
 
 function collectCastedLoopRanges(code) {
@@ -349,7 +397,7 @@ function mergeCandidates(...groups) {
   return [...byKey.values()].filter((candidate) => candidate.loadItems.length > 0);
 }
 
-function collectCandidates(code, analysis) {
+function collectCandidates(code, cfg, analysis, dominators) {
   const byStore = new Map();
   const items = code.codeItems;
   for (let i = 0; i < items.length; i += 1) {
@@ -361,6 +409,7 @@ function collectCandidates(code, analysis) {
     if (typeof defId !== 'number') continue;
     const def = analysis.defs.get(defId);
     if (!def || def.local !== local) continue;
+    if (dominators && !instructionDominates(cfg, dominators, def.index, i)) continue;
     if (isHandlerStore(code.exceptionTable, items[def.index])) continue;
     const explicitCast = hasExplicitCastProducer(items, def.index);
     const primitiveLocalWrite = hasPrimitiveLocalWrite(items, local);
