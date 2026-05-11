@@ -149,6 +149,9 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     );
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
+      if (result && typeof result.then === "function") {
+        result = await result;
+      }
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== "V" && result !== undefined) {

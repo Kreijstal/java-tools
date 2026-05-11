@@ -11,6 +11,9 @@ function stringValue(obj) {
     return String(obj.valueOf ? obj.valueOf() : obj);
   }
   if (obj && typeof obj === 'object') {
+    if (obj.type === 'java/lang/Boolean') {
+      return obj.value ? 'true' : 'false';
+    }
     if (Object.prototype.hasOwnProperty.call(obj, 'value')) {
       return String(obj.value);
     }
