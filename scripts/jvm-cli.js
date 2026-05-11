@@ -651,6 +651,12 @@ function peepholeCleanCommand(args) {
     if (result.details.conditionalForwardLoopEntryClones) {
       console.log(`  conditional forward loop entry clones: ${result.details.conditionalForwardLoopEntryClones}`);
     }
+    if (result.details.conditionalForwardTailClones) {
+      console.log(`  conditional forward tail clones: ${result.details.conditionalForwardTailClones}`);
+    }
+    if (result.details.sharedFallthroughBlockClones) {
+      console.log(`  shared fallthrough block clones: ${result.details.sharedFallthroughBlockClones}`);
+    }
     console.log(`  fallthrough gotos: ${result.details.fallthroughGotos}`);
     console.log(`  unreachable instructions: ${result.details.unreachableInstructions}`);
     console.log(`  unused labels: ${result.details.unusedLabels}`);
