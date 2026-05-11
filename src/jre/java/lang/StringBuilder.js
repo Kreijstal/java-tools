@@ -11,6 +11,9 @@ function valueAsString(value) {
     return String(value.valueOf ? value.valueOf() : value);
   }
   if (value && typeof value === 'object') {
+    if (value.type === 'java/lang/Boolean') {
+      return value.value ? 'true' : 'false';
+    }
     if (Object.prototype.hasOwnProperty.call(value, 'value')) {
       return String(value.value);
     }
@@ -68,6 +71,14 @@ module.exports = {
     },
     'append(J)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
       obj.value += args[0].toString();
+      return obj;
+    },
+    'append(F)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += args[0];
+      return obj;
+    },
+    'append(D)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += args[0];
       return obj;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
