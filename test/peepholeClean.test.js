@@ -194,3 +194,74 @@ test('peephole clean keeps handler athrow sentinels by default', (t) => {
   );
   t.end();
 });
+
+test('peephole clean clones stack-neutral shared forward loop entry', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'iflt', arg: 'Lneg' } },
+    { instruction: { op: 'goto', arg: 'Lloop' } },
+    { labelDef: 'Lneg:', instruction: 'iinc 1 1' },
+    { instruction: { op: 'goto', arg: 'Lloop' } },
+    { labelDef: 'Lloop:', instruction: 'iload_1' },
+    { labelDef: 'Lcond:', instruction: { op: 'ifge', arg: 'Lend' } },
+    { instruction: 'iinc 1 1' },
+    { instruction: { op: 'goto', arg: 'Lcond' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.forwardLoopEntryClones, 1);
+  t.notDeepEqual(code(ast).codeItems[2].instruction, { op: 'goto', arg: 'Lloop' });
+  t.end();
+});
+
+test('peephole clean coalesces duplicate loop tail updates', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lend' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifeq', arg: 'Lbody' } },
+    { instruction: 'iload_3' },
+    { instruction: 'iconst_1' },
+    { instruction: 'ishl' },
+    { instruction: 'istore_3' },
+    { instruction: 'iinc 1 1' },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lbody:', instruction: 'iinc 4 1' },
+    { labelDef: 'Ltail:', instruction: 'iload_3' },
+    { instruction: 'iconst_1' },
+    { instruction: 'ishl' },
+    { instruction: 'istore_3' },
+    { instruction: 'iinc 1 1' },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.duplicateLoopTails, 1);
+  t.ok(code(ast).codeItems.some((item) => item && item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Ltail'));
+  t.end();
+});
+
+test('peephole clean does not clone shared loop entry when branch block has live stack', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iconst_1' },
+    { instruction: 'iload_1' },
+    { instruction: { op: 'iflt', arg: 'Lneg' } },
+    { instruction: { op: 'goto', arg: 'Lloop' } },
+    { labelDef: 'Lneg:', instruction: 'pop' },
+    { instruction: { op: 'goto', arg: 'Lloop' } },
+    { labelDef: 'Lloop:', instruction: 'iload_1' },
+    { labelDef: 'Lcond:', instruction: { op: 'ifge', arg: 'Lend' } },
+    { instruction: 'iinc 1 1' },
+    { instruction: { op: 'goto', arg: 'Lcond' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.forwardLoopEntryClones, 0);
+  t.deepEqual(code(ast).codeItems[3].instruction, { op: 'goto', arg: 'Lloop' });
+  t.end();
+});
