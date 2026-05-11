@@ -260,6 +260,51 @@ test('peephole clean does not clone conditional loop entry without skip arm', (t
   t.end();
 });
 
+test('peephole clean clones conditional forward tail and shared assignment blocks', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Ltail' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifeq', arg: 'Ltail' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'iflt', arg: 'Ltail' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifgt', arg: 'Ltail' } },
+    { instruction: { op: 'iinc', varnum: '2', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lnext' } },
+    { labelDef: 'Ltail:', instruction: { op: 'goto', arg: 'Ls0' } },
+    { labelDef: 'Ls0:', instruction: { op: 'goto', arg: 'Ls1' } },
+    { labelDef: 'Ls1:', instruction: { op: 'goto', arg: 'Ls2' } },
+    { labelDef: 'Ls2:', instruction: { op: 'goto', arg: 'Ls3' } },
+    { labelDef: 'Ls3:', instruction: { op: 'goto', arg: 'Ls4' } },
+    { labelDef: 'Ls4:', instruction: { op: 'goto', arg: 'Ls5' } },
+    { labelDef: 'Ls5:', instruction: { op: 'goto', arg: 'Ls6' } },
+    { labelDef: 'Ls6:', instruction: { op: 'goto', arg: 'Ls7' } },
+    { labelDef: 'Ls7:', instruction: 'iload_2' },
+    { instruction: { op: 'ifne', arg: 'Lassign' } },
+    { instruction: { op: 'iinc', varnum: '2', incr: '1' } },
+    { instruction: 'aload_0' },
+    { instruction: 'iload_3' },
+    { instruction: 'iconst_0' },
+    { instruction: 'iastore' },
+    { instruction: { op: 'goto', arg: 'Lassign' } },
+    { labelDef: 'Lassign:', instruction: 'aload_0' },
+    { instruction: 'iload_3' },
+    { instruction: 'iconst_0' },
+    { instruction: 'iastore' },
+    { labelDef: 'Lnext:', instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.conditionalForwardTailClones, 1);
+  t.ok(result.details.sharedFallthroughBlockClones >= 2);
+  t.notEqual(code(ast).codeItems[1].instruction.arg, 'Ltail');
+  t.end();
+});
+
 test('peephole clean coalesces duplicate loop tail updates', (t) => {
   const ast = astWith([
     { labelDef: 'Lhead:', instruction: 'iload_1' },
