@@ -189,7 +189,6 @@ function eliminateInMethod(code, opts) {
   const codeItems = code.codeItems;
   if (!Array.isArray(codeItems) || codeItems.length === 0) return 0;
   const { sites, bindingDetails } = findEntryStoreSites(codeItems, opts.alwaysFalseFields, opts);
-  if (bindingDetails.length === 0) return 0;
   // Determine which locals are "clean" (never re-stored).
   const cleanLocals = new Set();
   for (const b of bindingDetails) {
@@ -197,15 +196,37 @@ function eliminateInMethod(code, opts) {
       cleanLocals.add(b.local);
     }
   }
-  if (cleanLocals.size === 0) return 0;
 
   // Walk and rewrite. We collect rewrites first (avoid reindexing during scan)
   // and apply in descending order.
   const rewrites = []; // { iloadIdx, ifIdx, ifKind, target, ifLabelDef }
+  const directRewrites = []; // { loadIdx, ifIdx, ifKind, target }
   for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     if (!item || !item.instruction) continue;
     const op = getOp(item.instruction);
+    if (op === 'getstatic') {
+      const ref = fieldRefOf(getArg(item.instruction));
+      if (ref && opts.alwaysFalseFields.has(fieldKey(ref))) {
+        let j = i + 1;
+        let labelBetween = false;
+        while (j < codeItems.length) {
+          const nx = codeItems[j];
+          if (!nx) { j += 1; continue; }
+          if (nx.instruction) break;
+          if (nx.labelDef) labelBetween = true;
+          j += 1;
+        }
+        if (j < codeItems.length && !labelBetween) {
+          const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
+          const target = getArg(codeItems[j] && codeItems[j].instruction);
+          if ((nextOp === 'ifeq' || nextOp === 'ifne') && typeof target === 'string') {
+            directRewrites.push({ loadIdx: i, ifIdx: j, ifKind: nextOp, target });
+          }
+        }
+      }
+      continue;
+    }
     if (!ILOAD_OPS.has(op)) continue;
     const local = localOf(op, getArg(item.instruction));
     if (local === null || !cleanLocals.has(local)) continue;
@@ -229,7 +250,7 @@ function eliminateInMethod(code, opts) {
     rewrites.push({ iloadIdx: i, ifIdx: j, ifKind: nop, target });
   }
 
-  if (rewrites.length === 0) return 0;
+  if (rewrites.length === 0 && directRewrites.length === 0) return 0;
 
   // Apply rewrites. We keep labelDefs intact: if the iload codeItem has a
   // labelDef, we delete only the instruction (not the labelDef). Same for
@@ -251,6 +272,18 @@ function eliminateInMethod(code, opts) {
       ifItem.instruction = { op: 'goto', arg: r.target };
     }
   }
+  for (const r of directRewrites) {
+    const loadItem = codeItems[r.loadIdx];
+    const ifItem = codeItems[r.ifIdx];
+    delete loadItem.instruction;
+    delete loadItem.pc;
+    if (r.ifKind === 'ifne') {
+      delete ifItem.instruction;
+      delete ifItem.pc;
+    } else {
+      ifItem.instruction = { op: 'goto', arg: r.target };
+    }
+  }
 
   // Now both items may be empty (no instruction, no labelDef, no stackMapFrame).
   // Splice empties from the back.
@@ -263,9 +296,9 @@ function eliminateInMethod(code, opts) {
   }
 
   if (opts.verbose) {
-    console.log(`  [dead-flag] ${opts.owner}.${opts.name}${opts.desc}: eliminated ${rewrites.length} dead conditional(s) from ${cleanLocals.size} clean local(s)`);
+    console.log(`  [dead-flag] ${opts.owner}.${opts.name}${opts.desc}: eliminated ${rewrites.length + directRewrites.length} dead conditional(s) from ${cleanLocals.size} clean local(s)`);
   }
-  return rewrites.length;
+  return rewrites.length + directRewrites.length;
 }
 
 function runDeadStaticBoolFlag(astRoot, options = {}) {
@@ -317,10 +350,6 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   for (const [key, writes] of writesByField) {
     for (const write of writes) {
-      if (writeDependsOnSameField(write.codeItems, write.index, key, candidates)) {
-        rejected.add(key);
-        continue;
-      }
       const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
       if (!guard) {
         rejected.add(key);
@@ -492,8 +521,25 @@ function findConsumedFieldsInMethod(codeItems, candidates) {
     for (const binding of bindingDetails) {
       if (hasFlatIloadBranchConsumer(codeItems, binding.local)) out.add(key);
     }
+    if (hasDirectStaticBranchConsumer(codeItems, key)) out.add(key);
   }
   return out;
+}
+
+function hasDirectStaticBranchConsumer(codeItems, key) {
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || getOp(item.instruction) !== 'getstatic') continue;
+    const ref = fieldRefOf(getArg(item.instruction));
+    if (!ref || fieldKey(ref) !== key) continue;
+    let j = i + 1;
+    while (j < codeItems.length && codeItems[j] && !codeItems[j].instruction && !codeItems[j].labelDef) j += 1;
+    if (j >= codeItems.length) continue;
+    if (codeItems[j] && codeItems[j].labelDef && !codeItems[j].instruction) continue;
+    const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
+    if (nextOp === 'ifeq' || nextOp === 'ifne') return true;
+  }
+  return false;
 }
 
 function hasFlatIloadBranchConsumer(codeItems, local) {

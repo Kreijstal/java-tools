@@ -33,7 +33,7 @@ function splitCode(code) {
   for (const candidate of candidates.sort((a, b) => b.storeIndex - a.storeIndex)) {
     items.splice(candidate.storeIndex + 1, 0,
       { instruction: loadInt(candidate.fresh) },
-      { instruction: storeInt(candidate.fresh) });
+      { instruction: storeInt(candidate.local) });
   }
   return candidates.length;
 }
@@ -55,6 +55,7 @@ function collectCandidates(code) {
     if (target == null || target <= i) continue;
     const nextWrite = nextIntWrite(items, i + 1, local);
     if (nextWrite >= 0 && nextWrite <= backGoto) continue;
+    if (hasBypassIntoRange(items, labels, i, backGoto)) continue;
 
     const loadItems = [];
     const iincItems = [];
@@ -72,6 +73,39 @@ function collectCandidates(code) {
     out.push({ storeIndex: i, storeItem: items[i], local, loadItems, iincItems, backGoto });
   }
   return out;
+}
+
+function hasBypassIntoRange(items, labels, storeIndex, endIndex) {
+  for (let i = 0; i < storeIndex; i += 1) {
+    for (const label of branchTargetLabels(items[i])) {
+      const target = labels.get(trimLabel(label));
+      if (target != null && target > storeIndex && target <= endIndex) return true;
+    }
+  }
+  return false;
+}
+
+function branchTargetLabels(item) {
+  const itemOp = op(item);
+  if (!/^(?:if|goto|jsr|lookupswitch|tableswitch)/.test(itemOp || '')) return [];
+  const labels = [];
+  collectLabels(arg(item), labels);
+  return labels;
+}
+
+function collectLabels(value, out) {
+  if (typeof value === 'string') {
+    out.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectLabels(item, out);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  for (const key of ['label', 'target', 'default', 'defaultLabel', 'labels', 'targets']) {
+    if (value[key] != null) collectLabels(value[key], out);
+  }
 }
 
 function isArrayIndexUse(items, loadIndex) {
