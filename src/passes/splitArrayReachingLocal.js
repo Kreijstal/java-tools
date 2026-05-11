@@ -9,7 +9,7 @@ const CONDITIONAL_OPS = new Set([
   'if_acmpeq', 'if_acmpne', 'ifnull', 'ifnonnull',
 ]);
 
-function runSplitArrayReachingLocal(astRoot) {
+function runSplitArrayReachingLocal(astRoot, options = {}) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
     for (const item of cls.items || []) {
@@ -17,21 +17,24 @@ function runSplitArrayReachingLocal(astRoot) {
       for (const attr of item.method.attributes || []) {
         const code = attr && attr.type === 'code' && attr.code;
         if (!code || !Array.isArray(code.codeItems)) continue;
-        rewrites += splitCode(code);
+        rewrites += splitCode(code, options);
       }
     }
   }
   return { changed: rewrites > 0, rewrites };
 }
 
-function splitCode(code) {
+function splitCode(code, options = {}) {
   const items = code.codeItems;
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
+  const requireDominance = !!options.requireDominance;
+  const preserveOriginalLocals = !!options.preserveOriginalLocals;
+  const dominators = requireDominance ? computeDominators(cfg) : null;
   let candidates = mergeCandidates(
-    collectCandidates(code, cfg, analysis),
-    collectPrimitiveArrayLocalCandidates(code, analysis),
+    collectCandidates(code, cfg, analysis, dominators),
+    collectPrimitiveArrayLocalCandidates(code, cfg, analysis, dominators),
   );
   if (candidates.length > 2) {
     candidates = candidates.filter((candidate) =>
@@ -51,7 +54,14 @@ function splitCode(code) {
   for (const candidate of candidates.sort((a, b) => b.storeIndex - a.storeIndex)) {
     const storeIndex = items.indexOf(candidate.storeItem);
     if (storeIndex < 0) continue;
-    if (candidate.primitiveArray) {
+    const preserveOriginal = preserveOriginalLocals && (
+      isBranchTarget(code, candidate.storeItem) ||
+      hasUnrewrittenLoadBeforeNextStore(items, storeIndex, candidate.local, candidate.loadItems)
+    );
+    if (preserveOriginal) {
+      candidate.storeItem.instruction = storeRef(candidate.fresh);
+      items.splice(storeIndex + 1, 0, { instruction: loadRef(candidate.fresh) }, { instruction: storeRef(candidate.local) });
+    } else if (candidate.primitiveArray) {
       candidate.storeItem.instruction = storeRef(candidate.fresh);
     } else {
       items.splice(storeIndex, 0, { instruction: 'dup' }, { instruction: storeRef(candidate.fresh) });
@@ -61,6 +71,39 @@ function splitCode(code) {
   }
 
   return rewrites;
+}
+
+function isBranchTarget(code, item) {
+  const label = trimLabel(item && item.labelDef);
+  if (!label) return false;
+  for (const candidate of collectReferencedLabels(code)) {
+    if (candidate === label) return true;
+  }
+  return false;
+}
+
+function collectReferencedLabels(code) {
+  const out = new Set();
+  for (const item of code.codeItems || []) {
+    for (const target of branchTargets(item)) {
+      const label = trimLabel(target);
+      if (label) out.add(label);
+    }
+  }
+  for (const entry of code.exceptionTable || []) {
+    for (const value of [entry.startLbl, entry.endLbl, entry.handlerLbl]) {
+      const label = trimLabel(value);
+      if (label) out.add(label);
+    }
+  }
+  return out;
+}
+
+function hasUnrewrittenLoadBeforeNextStore(items, storeIndex, local, rewrittenLoads) {
+  for (let i = storeIndex + 1; i < items.length; i += 1) {
+    if (aloadLocal(items[i]) === local && !rewrittenLoads.includes(items[i])) return true;
+  }
+  return false;
 }
 
 function mergeCandidates(...groups) {
@@ -83,7 +126,7 @@ function mergeCandidates(...groups) {
   return [...byKey.values()].filter((candidate) => candidate.loadItems.length > 0);
 }
 
-function collectCandidates(code, cfg, analysis) {
+function collectCandidates(code, cfg, analysis, dominators) {
   const byStore = new Map();
   const items = code.codeItems;
   for (let i = 0; i < items.length; i += 1) {
@@ -95,6 +138,7 @@ function collectCandidates(code, cfg, analysis) {
     if (typeof defId !== 'number') continue;
     const def = analysis.defs.get(defId);
     if (!def || def.local !== local) continue;
+    if (dominators && !instructionDominates(cfg, dominators, def.index, i)) continue;
     if (isHandlerStore(code.exceptionTable, items[def.index])) continue;
     if (!hasConflictingStore(items, def.index, local)) continue;
     const key = String(defId);
@@ -108,7 +152,7 @@ function collectCandidates(code, cfg, analysis) {
   return [...byStore.values()].filter((candidate) => candidate.loadItems.length > 0);
 }
 
-function collectPrimitiveArrayLocalCandidates(code, analysis) {
+function collectPrimitiveArrayLocalCandidates(code, cfg, analysis, dominators) {
   const byStore = new Map();
   const items = code.codeItems;
   if (items.length > 2000) return [];
@@ -121,6 +165,7 @@ function collectPrimitiveArrayLocalCandidates(code, analysis) {
     if (typeof defId !== 'number') continue;
     const def = analysis.defs.get(defId);
     if (!def || def.local !== local) continue;
+    if (dominators && !instructionDominates(cfg, dominators, def.index, i)) continue;
     if (isHandlerStore(code.exceptionTable, items[def.index])) continue;
     if (!hasConflictingStore(items, def.index, local)) continue;
     if (hasPrimitiveLocalWrite(items, local)) continue;
@@ -377,6 +422,56 @@ function buildCfg(code) {
   return { blocks, byId, indexToBlock };
 }
 
+function computeDominators(cfg) {
+  const allIds = new Set(cfg.blocks.map((block) => block.id));
+  const dom = new Map();
+  for (const block of cfg.blocks) {
+    dom.set(block.id, block.predecessors.length ? new Set(allIds) : new Set([block.id]));
+  }
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const block of cfg.blocks) {
+      if (!block.predecessors.length) continue;
+      let next = null;
+      for (const pred of block.predecessors) {
+        const predDom = dom.get(pred) || new Set();
+        if (next == null) {
+          next = new Set(predDom);
+        } else {
+          for (const id of [...next]) {
+            if (!predDom.has(id)) next.delete(id);
+          }
+        }
+      }
+      if (next == null) next = new Set();
+      next.add(block.id);
+      const old = dom.get(block.id);
+      if (!setEqual(old, next)) {
+        dom.set(block.id, next);
+        changed = true;
+      }
+    }
+  }
+  return dom;
+}
+
+function instructionDominates(cfg, dominators, defIndex, useIndex) {
+  if (defIndex > useIndex) return false;
+  const defBlock = cfg.indexToBlock.get(defIndex);
+  const useBlock = cfg.indexToBlock.get(useIndex);
+  if (!defBlock || !useBlock) return false;
+  if (defBlock === useBlock) return defIndex <= useIndex;
+  return !!(dominators.get(useBlock) || new Set()).has(defBlock);
+}
+
+function setEqual(left, right) {
+  if (!left || !right || left.size !== right.size) return false;
+  for (const value of left) if (!right.has(value)) return false;
+  return true;
+}
+
 function isArrayUse(items, index) {
   if (op(items[index + 1]) === 'arraylength') return true;
   for (let i = index + 1; i < Math.min(items.length, index + 8); i += 1) {
@@ -543,5 +638,7 @@ module.exports = {
   runSplitArrayReachingLocal,
   splitCode,
   buildCfg,
+  computeDominators,
+  instructionDominates,
   reachingDefinitions,
 };

@@ -350,10 +350,6 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   for (const [key, writes] of writesByField) {
     for (const write of writes) {
-      if (writeDependsOnSameField(write.codeItems, write.index, key, candidates)) {
-        rejected.add(key);
-        continue;
-      }
       const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
       if (!guard) {
         rejected.add(key);
@@ -525,8 +521,25 @@ function findConsumedFieldsInMethod(codeItems, candidates) {
     for (const binding of bindingDetails) {
       if (hasFlatIloadBranchConsumer(codeItems, binding.local)) out.add(key);
     }
+    if (hasDirectStaticBranchConsumer(codeItems, key)) out.add(key);
   }
   return out;
+}
+
+function hasDirectStaticBranchConsumer(codeItems, key) {
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || getOp(item.instruction) !== 'getstatic') continue;
+    const ref = fieldRefOf(getArg(item.instruction));
+    if (!ref || fieldKey(ref) !== key) continue;
+    let j = i + 1;
+    while (j < codeItems.length && codeItems[j] && !codeItems[j].instruction && !codeItems[j].labelDef) j += 1;
+    if (j >= codeItems.length) continue;
+    if (codeItems[j] && codeItems[j].labelDef && !codeItems[j].instruction) continue;
+    const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
+    if (nextOp === 'ifeq' || nextOp === 'ifne') return true;
+  }
+  return false;
 }
 
 function hasFlatIloadBranchConsumer(codeItems, local) {
