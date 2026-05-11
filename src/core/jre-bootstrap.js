@@ -60,6 +60,7 @@ class JreBootstrap {
       const jreClassDef = jvm.jre[className];
       const interfaces =
         jreClassDef && jreClassDef.interfaces ? jreClassDef.interfaces : [];
+      const classItems = this.createClassItems(jreClassDef);
 
       const classStub = {
         ast: {
@@ -67,7 +68,7 @@ class JreBootstrap {
             {
               className: className,
               superClassName: superClassName,
-              items: [],
+              items: classItems,
               flags: ["public"],
               interfaces: interfaces,
             },
@@ -78,6 +79,11 @@ class JreBootstrap {
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},
       };
+      if (jreClassDef && jreClassDef.staticFields) {
+        for (const [fieldKey, fieldValue] of Object.entries(jreClassDef.staticFields)) {
+          classStub.staticFields.set(fieldKey.replace(/'/g, ''), fieldValue);
+        }
+      }
       jvm.classes[className] = classStub;
     }
 
@@ -677,51 +683,15 @@ class JreBootstrap {
     const interfaces = jreClassDef && jreClassDef.interfaces ? jreClassDef.interfaces : [];
 
     // Create method items from JRE class definition (similar to original _preloadJreClasses)
-    const methods = [];
-    if (jreClassDef) {
-      // Add regular methods
-      if (jreClassDef.methods) {
-        for (const methodSig in jreClassDef.methods) {
-          const openParen = methodSig.indexOf("(");
-          const name = methodSig.substring(0, openParen);
-          const descriptor = methodSig.substring(openParen);
-          methods.push({
-            type: "method",
-            method: {
-              name: name,
-              descriptor: descriptor,
-              flags: ["public"], // Assume public for JRE methods
-              attributes: [],
-            },
-          });
-        }
-      }
-      // Add static methods
-      if (jreClassDef.staticMethods) {
-        for (const methodSig in jreClassDef.staticMethods) {
-          const openParen = methodSig.indexOf("(");
-          const name = methodSig.substring(0, openParen);
-          const descriptor = methodSig.substring(openParen);
-          methods.push({
-            type: "method",
-            method: {
-              name: name,
-              descriptor: descriptor,
-              flags: ["public", "static"], // Mark as static
-              attributes: [],
-            },
-          });
-        }
-      }
-    }
+    const classItems = this.createClassItems(jreClassDef);
 
     const classStub = {
       ast: {
         classes: [
-          {
-            className: className,
-            superClassName: jreClassDef && jreClassDef.super ? jreClassDef.super : "java/lang/Object",
-            items: methods,
+            {
+              className: className,
+              superClassName: jreClassDef && jreClassDef.super ? jreClassDef.super : "java/lang/Object",
+              items: classItems,
             flags: ["public"],
             interfaces: interfaces,
           },
@@ -751,6 +721,62 @@ class JreBootstrap {
     }
 
     jvm.classes[className] = classStub;
+  }
+
+  static createClassItems(jreClassDef) {
+    const classItems = [];
+    if (jreClassDef) {
+      // Add fields
+      if (jreClassDef.fields) {
+        for (const fieldSig in jreClassDef.fields) {
+          const colon = fieldSig.indexOf(":");
+          if (colon === -1) continue;
+          classItems.push({
+            type: "field",
+            field: {
+              name: fieldSig.substring(0, colon),
+              descriptor: fieldSig.substring(colon + 1),
+              flags: ["public"],
+            },
+          });
+        }
+      }
+      // Add regular methods
+      if (jreClassDef.methods) {
+        for (const methodSig in jreClassDef.methods) {
+          const openParen = methodSig.indexOf("(");
+          const name = methodSig.substring(0, openParen);
+          const descriptor = methodSig.substring(openParen);
+          classItems.push({
+            type: "method",
+            method: {
+              name: name,
+              descriptor: descriptor,
+              flags: ["public"], // Assume public for JRE methods
+              attributes: [],
+            },
+          });
+        }
+      }
+      // Add static methods
+      if (jreClassDef.staticMethods) {
+        for (const methodSig in jreClassDef.staticMethods) {
+          const openParen = methodSig.indexOf("(");
+          const name = methodSig.substring(0, openParen);
+          const descriptor = methodSig.substring(openParen);
+          classItems.push({
+            type: "method",
+            method: {
+              name: name,
+              descriptor: descriptor,
+              flags: ["public", "static"], // Mark as static
+              attributes: [],
+            },
+          });
+        }
+      }
+    }
+    return classItems;
   }
 }
 

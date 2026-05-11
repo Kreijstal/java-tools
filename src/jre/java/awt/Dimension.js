@@ -8,10 +8,16 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       obj.width = 0;
       obj.height = 0;
+      obj.fields = obj.fields || {};
+      obj.fields['java/awt/Dimension.width'] = 0;
+      obj.fields['java/awt/Dimension.height'] = 0;
     },
     '<init>(II)V': (jvm, obj, args) => {
       obj.width = args[0];
       obj.height = args[1];
+      obj.fields = obj.fields || {};
+      obj.fields['java/awt/Dimension.width'] = obj.width;
+      obj.fields['java/awt/Dimension.height'] = obj.height;
     },
   },
 };

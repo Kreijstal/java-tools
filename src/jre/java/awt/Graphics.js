@@ -101,6 +101,10 @@ module.exports = {
       const awtImage = imageObj._awtImage ? imageObj._awtImage : imageObj;
       return graphicsContext.drawImage(awtImage, args[1], args[2]) ? 1 : 0;
     },
+
+    'getFontMetrics()Ljava/awt/FontMetrics;': (jvm, obj, args) => {
+      return { type: 'java/awt/FontMetrics', _awtGraphics: obj._awtGraphics || null };
+    },
     
     'dispose()V': (jvm, obj, args) => {
       const graphicsContext = obj._awtGraphics;

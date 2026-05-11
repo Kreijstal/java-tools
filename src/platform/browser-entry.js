@@ -11,6 +11,7 @@ const BrowserFileProvider = require('../io/BrowserFileProvider');
 const { setFileProvider } = require('../core/classLoader');
 const awtFramework = require('./awt');
 const audioPlatform = require('./audio');
+const legacyPlatform = require('./legacy');
 // const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
 // Browser-compatible JVM Debug API
@@ -406,7 +407,8 @@ module.exports = {
   DebugController,
   BrowserFileProvider,
   awtFramework,
-  audioPlatform
+  audioPlatform,
+  legacyPlatform
 };
 
 // Also make available as global for direct script inclusion
@@ -417,7 +419,8 @@ if (typeof window !== 'undefined') {
     Frame,
     DebugController,
     BrowserFileProvider,
-    audioPlatform
+    audioPlatform,
+    legacyPlatform
   };
   window.awtFramework = awtFramework;
 }

@@ -137,6 +137,12 @@ async function buildSite() {
     const webAudioTarget = path.join(distDir, 'web-audio.js');
     copyFile(webAudioSource, webAudioTarget);
 
+    // Step 3.7: Copy browser legacy API backend to dist for browser injection
+    console.log('Copying browser legacy API backend...');
+    const webLegacySource = path.join(srcDir, 'platform', 'web-legacy.js');
+    const webLegacyTarget = path.join(distDir, 'web-legacy.js');
+    copyFile(webLegacySource, webLegacyTarget);
+
     // Step 4: Process and enhance the debug web interface
     console.log('📄 Processing debug interface template...');
     const debugInterfacePath = path.join(examplesDir, 'debug-web-interface.html');
