@@ -9,6 +9,8 @@ function runPeepholeClean(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     protectedLoadBridges: 0,
+    duplicateLoopTails: 0,
+    forwardLoopEntryClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -32,15 +34,19 @@ function runPeepholeClean(astRoot, options = {}) {
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
     details.protectedLoadBridges += round.protectedLoadBridges;
+    details.duplicateLoopTails += round.duplicateLoopTails;
+    details.forwardLoopEntryClones += round.forwardLoopEntryClones;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.invertedFallthroughGotos +
-      round.fallthroughGotos + round.unreachableInstructions + round.unusedLabels;
+    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.duplicateLoopTails +
+      round.forwardLoopEntryClones + round.invertedFallthroughGotos + round.fallthroughGotos +
+      round.unreachableInstructions + round.unusedLabels;
     if (
-      round.nops + round.threadedBranches + round.protectedLoadBridges + round.invertedFallthroughGotos +
-      round.fallthroughGotos + round.unreachableInstructions + round.unusedLabels === 0
+      round.nops + round.threadedBranches + round.protectedLoadBridges + round.duplicateLoopTails +
+      round.forwardLoopEntryClones + round.invertedFallthroughGotos + round.fallthroughGotos +
+      round.unreachableInstructions + round.unusedLabels === 0
     ) {
       break;
     }
@@ -54,6 +60,8 @@ function cleanOneRound(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     protectedLoadBridges: 0,
+    duplicateLoopTails: 0,
+    forwardLoopEntryClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -63,6 +71,8 @@ function cleanOneRound(astRoot, options = {}) {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
     details.protectedLoadBridges += coalesceProtectedLoadBridges(code);
+    details.duplicateLoopTails += coalesceDuplicateLoopTails(code);
+    details.forwardLoopEntryClones += cloneForwardLoopEntryGotos(code);
     if (method && method.name === '<init>') {
       details.invertedFallthroughGotos += invertConditionalOverGoto(code);
       details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
@@ -156,6 +166,118 @@ function coalesceProtectedLoadBridges(code) {
   }
 
   return changed;
+}
+
+function cloneForwardLoopEntryGotos(code) {
+  const codeItems = code.codeItems;
+  const labelIndex = buildLabelIndex(codeItems);
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || getOpcode(item.instruction) !== 'goto') continue;
+    const prevIdx = previousInstructionIndex(codeItems, i - 1);
+    if (prevIdx == null) continue;
+    const prev = codeItems[prevIdx] && codeItems[prevIdx].instruction;
+    if (!isConditionalBranch(getOpcode(prev))) continue;
+
+    const target = trimLabel(getInstructionArg(item.instruction));
+    const targetIdx = labelIndex.get(target);
+    if (targetIdx == null || targetIdx <= i) continue;
+    if (isLabelProtected(code, target)) continue;
+
+    const alternate = trimLabel(getInstructionArg(prev));
+    const alternateIdx = labelIndex.get(alternate);
+    if (alternateIdx == null || alternateIdx <= i || alternateIdx >= targetIdx) continue;
+    if (countInstructionLabelReferences(codeItems, target) !== 2) continue;
+    if (hasFallthroughPredecessor(codeItems, labelIndex, target)) continue;
+    if (!isStackNeutralConditionalGotoBlock(codeItems, prevIdx, i)) continue;
+
+    const range = findForwardLoopRange(codeItems, labelIndex, targetIdx);
+    if (!range) continue;
+    const realInsns = countInstructions(codeItems, range.start, range.end);
+    if (realInsns === 0 || realInsns > 140) continue;
+
+    const clone = cloneRange(codeItems.slice(range.start, range.end), `L${90000 + changed * 1000}`);
+    if (clone.length === 0) continue;
+    codeItems.splice(i, 1, ...clone);
+    changed += 1;
+    break;
+  }
+
+  return changed;
+}
+
+function coalesceDuplicateLoopTails(code) {
+  const codeItems = code.codeItems;
+  let changed = 0;
+
+  for (let gotoIdx = 0; gotoIdx < codeItems.length; gotoIdx += 1) {
+    const item = codeItems[gotoIdx];
+    if (!item || !item.instruction || getOpcode(item.instruction) !== 'goto') continue;
+    const loopHead = trimLabel(getInstructionArg(item.instruction));
+    const labelIndex = buildLabelIndex(codeItems);
+    const loopHeadIdx = labelIndex.get(loopHead);
+    if (loopHeadIdx == null || loopHeadIdx >= gotoIdx) continue;
+    const candidates = duplicateTailSuffixCandidates(codeItems, gotoIdx);
+    for (const candidate of candidates) {
+      const tail = findDuplicateTail(code, codeItems, labelIndex, gotoIdx + 1, loopHead, candidate.instructions);
+      if (!tail) continue;
+      const labelDef = codeItems[candidate.start] && codeItems[candidate.start].labelDef;
+      const replacement = labelDef
+        ? { labelDef, instruction: { op: 'goto', arg: tail.label } }
+        : { instruction: { op: 'goto', arg: tail.label } };
+      codeItems.splice(candidate.start, gotoIdx - candidate.start + 1, replacement);
+      changed += 1;
+      return changed;
+    }
+  }
+
+  return changed;
+}
+
+function duplicateTailSuffixCandidates(codeItems, gotoIdx) {
+  const candidates = [];
+  let start = previousInstructionIndex(codeItems, gotoIdx - 1);
+  for (let count = 1; start != null && count <= 12; count += 1) {
+    if (codeItems[start] && codeItems[start].labelDef) break;
+    const prev = previousInstructionIndex(codeItems, start - 1);
+    if (prev != null && isConditionalBranch(getOpcode(codeItems[prev] && codeItems[prev].instruction))) {
+      const instructions = instructionSlice(codeItems, start, gotoIdx);
+      if (instructions.some((instruction) => opcodeMnemonic(instruction) === 'iinc')) {
+        candidates.push({ start, instructions });
+      }
+    }
+    start = prev;
+  }
+  return candidates;
+}
+
+function findDuplicateTail(code, codeItems, labelIndex, startSearch, loopHead, blockInstructions) {
+  for (let i = startSearch; i < codeItems.length; i += 1) {
+    const label = trimLabel(codeItems[i] && codeItems[i].labelDef);
+    if (!label || isLabelProtected(code, label)) continue;
+    const gotoIdx = instructionIndexAfterSequence(codeItems, i, blockInstructions);
+    if (gotoIdx == null) continue;
+    const tailGoto = codeItems[gotoIdx] && codeItems[gotoIdx].instruction;
+    if (getOpcode(tailGoto) !== 'goto') continue;
+    if (trimLabel(getInstructionArg(tailGoto)) !== loopHead) continue;
+    if (labelIndex.get(label) !== i) continue;
+    return { label, gotoIdx };
+  }
+  return null;
+}
+
+function instructionIndexAfterSequence(codeItems, startIdx, instructions) {
+  let itemIdx = startIdx;
+  for (const expected of instructions) {
+    itemIdx = nextInstructionIndex(codeItems, itemIdx);
+    if (itemIdx == null) return null;
+    const actual = codeItems[itemIdx] && codeItems[itemIdx].instruction;
+    if (!sameInstruction(actual, expected)) return null;
+    itemIdx += 1;
+  }
+  return nextInstructionIndex(codeItems, itemIdx);
 }
 
 function removeSingleUseFallthroughGotos(code) {
@@ -358,6 +480,118 @@ function hasFallthroughPredecessor(codeItems, labelIndex, label) {
   return false;
 }
 
+function findForwardLoopRange(codeItems, labelIndex, startIdx) {
+  for (let i = startIdx + 1; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction) continue;
+    const labels = [];
+    collectInstructionLabels(item.instruction, {
+      add(label) {
+        labels.push(trimLabel(label));
+      },
+    });
+    for (const label of labels) {
+      const targetIdx = labelIndex.get(label);
+      if (targetIdx == null || targetIdx < startIdx || targetIdx >= i) continue;
+      const endIdx = nextLabelIndex(codeItems, i + 1);
+      if (endIdx == null || endIdx <= i) return null;
+      return { start: startIdx, end: endIdx };
+    }
+  }
+  return null;
+}
+
+function isStackNeutralConditionalGotoBlock(codeItems, conditionalIdx, gotoIdx) {
+  const start = previousLabelOrStart(codeItems, conditionalIdx);
+  let depth = 0;
+  for (let i = start; i <= conditionalIdx; i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    if (!instruction) continue;
+    const delta = stackDelta(instruction);
+    if (delta == null) return false;
+    depth += delta;
+    if (depth < 0) return false;
+  }
+  if (depth !== 0) return false;
+  return nextInstructionIndex(codeItems, conditionalIdx + 1) === gotoIdx;
+}
+
+function cloneRange(items, prefix) {
+  const labels = [];
+  for (const item of items) {
+    const label = trimLabel(item && item.labelDef);
+    if (label) labels.push(label);
+  }
+  if (labels.length === 0) return [];
+  const labelMap = new Map(labels.map((label, index) => [label, `${prefix}_${index}`]));
+  return items.map((item) => cloneItemWithLabels(item, labelMap));
+}
+
+function cloneItemWithLabels(item, labelMap) {
+  const out = {};
+  const label = trimLabel(item && item.labelDef);
+  if (label) out.labelDef = `${labelMap.get(label)}:`;
+  if (item && item.instruction) out.instruction = rewriteInstructionLabels(item.instruction, labelMap);
+  if (item && item.stackMapFrame) out.stackMapFrame = cloneValue(item.stackMapFrame);
+  if (item && item.lineNumber) out.lineNumber = cloneValue(item.lineNumber);
+  return out;
+}
+
+function rewriteInstructionLabels(instruction, labelMap) {
+  const out = cloneValue(instruction);
+  rewriteLabelsInValue(out, labelMap);
+  return out;
+}
+
+function rewriteLabelsInValue(value, labelMap) {
+  if (!value || typeof value !== 'object') return;
+  if (typeof value.arg === 'string') {
+    const label = trimLabel(value.arg);
+    if (labelMap.has(label)) value.arg = labelMap.get(label);
+  } else if (Array.isArray(value.arg)) {
+    value.arg = value.arg.map((entry) => rewriteLabelValue(entry, labelMap));
+  } else if (value.arg && typeof value.arg === 'object') {
+    value.arg = rewriteLabelValue(value.arg, labelMap);
+  }
+}
+
+function rewriteLabelValue(value, labelMap) {
+  if (typeof value === 'string') {
+    const label = trimLabel(value);
+    return labelMap.has(label) ? labelMap.get(label) : value;
+  }
+  if (Array.isArray(value)) return value.map((entry) => rewriteLabelValue(entry, labelMap));
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) out[key] = rewriteLabelValue(entry, labelMap);
+    return out;
+  }
+  return value;
+}
+
+function countInstructions(codeItems, startIdx, endIdx) {
+  let count = 0;
+  for (let i = startIdx; i < endIdx; i += 1) {
+    if (codeItems[i] && codeItems[i].instruction) count += 1;
+  }
+  return count;
+}
+
+function instructionSlice(codeItems, startIdx, endIdx) {
+  const instructions = [];
+  for (let i = startIdx; i < endIdx; i += 1) {
+    if (codeItems[i] && codeItems[i].instruction) instructions.push(cloneValue(codeItems[i].instruction));
+  }
+  return instructions;
+}
+
+function hasInternalLabel(codeItems, startIdx, endIdx) {
+  for (let i = startIdx; i < endIdx; i += 1) {
+    if (codeItems[i] && codeItems[i].labelDef) return true;
+  }
+  return false;
+}
+
 function hasInstructionBetween(codeItems, startIndex, endIndex) {
   for (let i = startIndex; i < endIndex; i += 1) {
     if (codeItems[i] && codeItems[i].instruction) return true;
@@ -490,6 +724,27 @@ function nextInstructionIndex(codeItems, startIndex) {
   return null;
 }
 
+function previousInstructionIndex(codeItems, startIndex) {
+  for (let i = startIndex; i >= 0; i -= 1) {
+    if (codeItems[i] && codeItems[i].instruction) return i;
+  }
+  return null;
+}
+
+function previousLabelOrStart(codeItems, startIndex) {
+  for (let i = startIndex; i >= 0; i -= 1) {
+    if (codeItems[i] && codeItems[i].labelDef) return i;
+  }
+  return 0;
+}
+
+function nextLabelIndex(codeItems, startIndex) {
+  for (let i = startIndex; i < codeItems.length; i += 1) {
+    if (codeItems[i] && codeItems[i].labelDef) return i;
+  }
+  return null;
+}
+
 function getInstructionArg(instruction) {
   return instruction && typeof instruction === 'object' ? instruction.arg : null;
 }
@@ -511,9 +766,46 @@ function getOpcode(instruction) {
   return instruction.op || null;
 }
 
+function opcodeMnemonic(instruction) {
+  const op = getOpcode(instruction);
+  return typeof op === 'string' ? op.split(/\s+/, 1)[0] : op;
+}
+
 function trimLabel(label) {
   if (typeof label !== 'string') return label;
   return label.endsWith(':') ? label.slice(0, -1) : label;
+}
+
+function cloneValue(value) {
+  if (value == null || typeof value !== 'object') return value;
+  if (typeof value === 'bigint') return value;
+  if (Array.isArray(value)) return value.map(cloneValue);
+  const out = {};
+  for (const [key, entry] of Object.entries(value)) out[key] = cloneValue(entry);
+  return out;
+}
+
+function stackDelta(instruction) {
+  const op = getOpcode(instruction);
+  if (!op) return null;
+  if (isConditionalBranch(op)) return -conditionalPopCount(op);
+  if (/^[afild]load(?:_\d+)?$/.test(op) || op === 'aload_0' || op === 'aload_1' || op === 'aload_2' || op === 'aload_3') return op[0] === 'd' || op[0] === 'l' ? 2 : 1;
+  if (/^[afild]store(?:_\d+)?$/.test(op) || op === 'astore_0' || op === 'astore_1' || op === 'astore_2' || op === 'astore_3') return op[0] === 'd' || op[0] === 'l' ? -2 : -1;
+  if (op.startsWith('iconst_') || op === 'bipush' || op === 'sipush' || op === 'ldc' || op === 'ldc_w' || op === 'aconst_null') return 1;
+  if (op === 'ldc2_w' || op === 'lconst_0' || op === 'lconst_1' || op === 'dconst_0' || op === 'dconst_1') return 2;
+  if (op === 'fconst_0' || op === 'fconst_1' || op === 'fconst_2') return 1;
+  if (op === 'dup') return 1;
+  if (op === 'pop') return -1;
+  if (op === 'pop2') return -2;
+  if (op === 'iinc' || op === 'nop' || op === 'goto') return 0;
+  return null;
+}
+
+function conditionalPopCount(op) {
+  if (op === 'ifnull' || op === 'ifnonnull') return 1;
+  if (/^if(?:eq|ne|lt|ge|gt|le)$/.test(op)) return 1;
+  if (/^if_[ai]cmp(?:eq|ne|lt|ge|gt|le)$/.test(op)) return 2;
+  return 1;
 }
 
 const INVERSE_CONDITIONALS = {
@@ -540,6 +832,8 @@ module.exports = {
   removeNops,
   threadBranchesThroughGoto,
   coalesceProtectedLoadBridges,
+  coalesceDuplicateLoopTails,
+  cloneForwardLoopEntryGotos,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
   removeUnreachableUntilUsedLabel,
