@@ -245,6 +245,25 @@ test('peephole clean coalesces duplicate loop tail updates', (t) => {
   t.end();
 });
 
+test('peephole clean coalesces loop producer bridge', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'bipush 6' },
+    { instruction: { op: 'goto', arg: 'Lcond' } },
+    { labelDef: 'Lbody:', instruction: 'iinc 1 1' },
+    { labelDef: 'Lbound:', instruction: 'bipush 6' },
+    { labelDef: 'Lcond:', instruction: 'iload_1' },
+    { instruction: { op: 'if_icmple', arg: 'Lend' } },
+    { instruction: { op: 'goto', arg: 'Lbound' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.loopProducerBridges, 1);
+  t.deepEqual(code(ast).codeItems[0].instruction, { op: 'goto', arg: 'Lbound' });
+  t.end();
+});
+
 test('peephole clean does not clone shared loop entry when branch block has live stack', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iconst_1' },
