@@ -10,58 +10,6 @@ function arrayForCollection(obj) {
 }
 
 
-function classNameOf(obj) {
-  return obj && (obj._className || obj.type);
-}
-
-function fieldValue(obj, name) {
-  if (!obj) return undefined;
-  if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
-  if (!obj.fields) return undefined;
-  for (const key of Object.keys(obj.fields)) {
-    if (key.endsWith(`.${name}`) || key === name) return obj.fields[key];
-  }
-  return undefined;
-}
-
-function instrIndexRelative(indexObj) {
-  const tempList = fieldValue(indexObj, 'tempList');
-  if (!tempList) return 0;
-  const rels = fieldValue(tempList, 'rels');
-  const array = arrayForCollection(rels);
-  if (!array) return 0;
-  const idx = Array.from(array).indexOf(indexObj);
-  return idx < 0 ? 0 : idx;
-}
-
-function instrIndexKey(indexObj) {
-  return [Number(fieldValue(indexObj, 'index') || 0), instrIndexRelative(indexObj)];
-}
-
-function compareInstrIndex(a, b) {
-  const ka = instrIndexKey(a);
-  const kb = instrIndexKey(b);
-  if (ka[0] !== kb[0]) return ka[0] - kb[0];
-  return ka[1] - kb[1];
-}
-
-function compareOp03ByIndex(a, b, asc) {
-  const result = compareInstrIndex(fieldValue(a, 'index'), fieldValue(b, 'index'));
-  return asc ? result : -result;
-}
-
-function comparatorFor(comparator) {
-  const comparatorClass = classNameOf(comparator);
-  if (comparatorClass === 'org/benf/cfr/reader/bytecode/analysis/opgraph/op3rewriters/CompareByIndex') {
-    const asc = fieldValue(comparator, 'asc') !== 0;
-    return (a, b) => compareOp03ByIndex(a, b, asc);
-  }
-  if (comparatorClass === 'org/benf/cfr/reader/entities/exceptions/ExceptionAggregator$CompareExceptionTablesByRange') {
-    return (a, b) => naturalCompare(a, b);
-  }
-  return null;
-}
-
 function comparableKey(value) {
   if (value === null || value === undefined) return value;
   if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'string') return value;
@@ -232,7 +180,10 @@ module.exports = {
       const comparator = args[1];
       const array = arrayForCollection(list);
       if (!array || typeof array.sort !== 'function') return;
-      const compare = comparatorFor(comparator);
+      let compare = null;
+      if (comparator && comparator.methods && comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I']) {
+        compare = (a, b) => comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I'](jvm, comparator, [a, b]);
+      }
       if (compare) {
         array.sort(compare);
       } else {

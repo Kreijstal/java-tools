@@ -15,17 +15,6 @@ function classNameOf(obj) {
   return obj && (obj._className || obj.type);
 }
 
-function fieldValue(obj, fieldName) {
-  if (!obj) return undefined;
-  if (obj.fields) {
-    const cls = classNameOf(obj);
-    if (cls && Object.prototype.hasOwnProperty.call(obj.fields, `${cls}.${fieldName}`)) return obj.fields[`${cls}.${fieldName}`];
-    const key = Object.keys(obj.fields).find(k => k.endsWith(`.${fieldName}`));
-    if (key) return obj.fields[key];
-  }
-  return obj[fieldName];
-}
-
 function bitSetEquals(a, b) {
   const ab = a && a.bits instanceof Set ? a.bits : null;
   const bb = b && b.bits instanceof Set ? b.bits : null;
@@ -51,15 +40,6 @@ function javaEquals(a, b) {
   if (at !== bt) return false;
 
   if (at === 'java/util/BitSet') return bitSetEquals(a, b);
-  if (at === 'org/benf/cfr/reader/bytecode/analysis/parse/utils/SSAIdent') {
-    return javaEquals(fieldValue(a, 'val'), fieldValue(b, 'val'));
-  }
-  if (at === 'org/benf/cfr/reader/bytecode/analysis/variables/Slot') {
-    return fieldValue(a, 'idx') === fieldValue(b, 'idx');
-  }
-  if (at === 'org/benf/cfr/reader/bytecode/analysis/parse/utils/Pair') {
-    return javaEquals(fieldValue(a, 'x'), fieldValue(b, 'x')) && javaEquals(fieldValue(a, 'y'), fieldValue(b, 'y'));
-  }
 
   return false;
 }
