@@ -2,7 +2,7 @@
 
 const TERMINALS = new Set(['return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow']);
 
-function runControlFlowDce(astRoot) {
+function runControlFlowDce(astRoot, options = {}) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
     for (const item of cls.items || []) {
@@ -10,10 +10,10 @@ function runControlFlowDce(astRoot) {
       for (const attr of item.method.attributes || []) {
         const code = attr && attr.type === 'code' && attr.code;
         if (!code || !Array.isArray(code.codeItems)) continue;
-        rewrites += mergeAdjacentConstReturns(code);
+        rewrites += mergeAdjacentConstReturns(code, options);
         rewrites += collapseGotoChains(code);
         rewrites += inlineGotoConstReturns(code);
-        rewrites += mergeAdjacentConstReturns(code);
+        rewrites += mergeAdjacentConstReturns(code, options);
         rewrites += shareConstReturnGotos(code);
         rewrites += removeUnreferencedAfterTerminals(code);
       }
@@ -65,7 +65,7 @@ function ensureLabel(items, index, prefix) {
   return label;
 }
 
-function mergeAdjacentConstReturns(code) {
+function mergeAdjacentConstReturns(code, options = {}) {
   if ((code.exceptionTable || []).length > 0) return 0;
   const items = code.codeItems;
   let rewrites = 0;
@@ -79,10 +79,19 @@ function mergeAdjacentConstReturns(code) {
     const firstLabel = trimLabel(items[i].labelDef);
     const secondLabel = trimLabel(items[secondConst].labelDef);
     if (!firstLabel || !secondLabel || isExceptionLabel(code.exceptionTable || [], secondLabel)) continue;
+    if (options.requireIsolatedMergeTarget && hasFallthroughInto(items, i)) continue;
     retargetLabel(code, secondLabel, firstLabel);
     rewrites += 1;
   }
   return rewrites;
+}
+
+function hasFallthroughInto(items, index) {
+  const prev = previousInstructionIndex(items, index);
+  if (prev < 0) return false;
+  const prevOp = op(items[prev]);
+  return prevOp !== 'goto' && prevOp !== 'goto_w' && !TERMINALS.has(prevOp) &&
+    prevOp !== 'tableswitch' && prevOp !== 'lookupswitch';
 }
 
 function retargetLabel(code, from, to) {
@@ -237,6 +246,13 @@ function buildLabelIndex(items) {
 
 function nextInstructionIndex(items, index) {
   for (let i = index + 1; i < items.length; i += 1) {
+    if (items[i] && items[i].instruction) return i;
+  }
+  return -1;
+}
+
+function previousInstructionIndex(items, index) {
+  for (let i = index - 1; i >= 0; i -= 1) {
     if (items[i] && items[i].instruction) return i;
   }
   return -1;
