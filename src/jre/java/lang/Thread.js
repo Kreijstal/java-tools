@@ -23,14 +23,15 @@ module.exports = {
   staticMethods: {
     'currentThread()Ljava/lang/Thread;': (jvm, obj, args) => {
       const internalThread = jvm.threads[jvm.currentThreadIndex];
-      // This is a hack. In a real JVM, we would have a reference to the
-      // java.lang.Thread object for each thread.
-      const threadObj = {
-        type: 'java/lang/Thread',
-        name: internalThread.name || 'Unknown',
-        hashCode: jvm.nextHashCode++
-      };
-      return threadObj;
+      if (!internalThread.javaThread) {
+        internalThread.javaThread = {
+          type: 'java/lang/Thread',
+          name: internalThread.name || 'Unknown',
+          nativeThread: internalThread,
+          hashCode: jvm.nextHashCode++,
+        };
+      }
+      return internalThread.javaThread;
     }
   },
   methods: {
@@ -67,6 +68,7 @@ module.exports = {
         id: jvm.threads.length,
         callStack: new Stack(),
         status: 'runnable',
+        javaThread: threadObject,
       };
       threadObject.nativeThread = newThread;
       
