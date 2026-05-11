@@ -108,6 +108,34 @@ const addComponent = (obj, component) => {
   return component;
 };
 
+function makeDimension(width, height) {
+  return {
+    type: 'java/awt/Dimension',
+    width,
+    height,
+    fields: {
+      'java/awt/Dimension.width': width,
+      'java/awt/Dimension.height': height,
+    },
+  };
+}
+
+function makeInsets(top, left, bottom, right) {
+  return {
+    type: 'java/awt/Insets',
+    top,
+    left,
+    bottom,
+    right,
+    fields: {
+      'java/awt/Insets.top': top,
+      'java/awt/Insets.left': left,
+      'java/awt/Insets.bottom': bottom,
+      'java/awt/Insets.right': right,
+    },
+  };
+}
+
 module.exports = {
   super: 'java/awt/Component',
   methods: {
@@ -116,6 +144,22 @@ module.exports = {
       obj._components = [];
       obj._visible = true;
       obj._layout = null;
+    },
+
+    'getSize()Ljava/awt/Dimension;': (jvm, obj, args) => {
+      return makeDimension(obj._width || 0, obj._height || 0);
+    },
+
+    'getInsets()Ljava/awt/Insets;': (jvm, obj, args) => {
+      return makeInsets(0, 0, 0, 0);
+    },
+
+    'size()Ljava/awt/Dimension;': (jvm, obj, args) => {
+      return makeDimension(obj._width || 0, obj._height || 0);
+    },
+
+    'insets()Ljava/awt/Insets;': (jvm, obj, args) => {
+      return makeInsets(0, 0, 0, 0);
     },
     
     'add(Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) => {

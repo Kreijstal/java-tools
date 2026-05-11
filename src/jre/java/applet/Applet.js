@@ -143,6 +143,16 @@ module.exports = {
       // Return a Graphics object using JVM's createGraphicsObject method
       return jvm.createGraphicsObject(obj);
     },
+
+    'getAppletContext()Ljava/applet/AppletContext;': (jvm, obj, args) => {
+      return obj._appletContext || { type: 'java/applet/AppletContext' };
+    },
+
+    'getParameter(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const params = obj._parameters || {};
+      const value = params[String(args[0] || '')];
+      return value == null ? null : jvm.internString(String(value));
+    },
     
     'repaint()V': async (jvm, obj, args) => {
       // Trigger a repaint

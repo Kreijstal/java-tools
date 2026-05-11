@@ -67,6 +67,9 @@ function addBrowserUIScript(htmlContent) {
 
     <!-- Include WebAudio backend for browser-based javax.sound support -->
     <script src="./web-audio.js"></script>
+
+    <!-- Include browser backend for legacy compatibility APIs -->
+    <script src="./web-legacy.js"></script>
     
     `;
     
@@ -89,6 +92,9 @@ function removeIncorrectScriptPaths(htmlContent) {
 
     // Remove the web-audio.js script with incorrect path
     htmlContent = htmlContent.replace(/\s*<!-- Include WebAudio backend for browser-based javax\.sound support -->\s*<script src="\.\.\/dist\/web-audio\.js"><\/script>\s*/, '');
+
+    // Remove the web-legacy.js script with incorrect path
+    htmlContent = htmlContent.replace(/\s*<!-- Include browser backend for legacy compatibility APIs -->\s*<script src="\.\.\/dist\/web-legacy\.js"><\/script>\s*/, '');
     
     return htmlContent;
 }
