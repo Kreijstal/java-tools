@@ -20,14 +20,14 @@ function collectionToArray(collection) {
 }
 
 function classNameOf(obj) { return obj && (obj._className || obj.type); }
-function bitSetEquals(a, b) {
-  const ab = a && a.bits instanceof Set ? a.bits : null;
-  const bb = b && b.bits instanceof Set ? b.bits : null;
-  if (!ab || !bb || ab.size !== bb.size) return false;
-  for (const v of ab) if (!bb.has(v)) return false;
-  return true;
+function classEquals(jvm, className, a, b) {
+  const equals = jvm && jvm.jre && jvm.jre[className] &&
+    jvm.jre[className].methods &&
+    jvm.jre[className].methods['equals(Ljava/lang/Object;)Z'];
+  return equals ? equals(jvm, a, [b]) !== 0 : null;
 }
-function javaEquals(a, b) {
+
+function javaEquals(jvm, a, b) {
   if (a === b) return true;
   if (a === null || a === undefined || b === null || b === undefined) return false;
   const av = Object.prototype.hasOwnProperty.call(a, 'value') ? a.value : undefined;
@@ -36,10 +36,11 @@ function javaEquals(a, b) {
   if ((a.type === 'java/lang/String' || a instanceof String) && (b.type === 'java/lang/String' || b instanceof String)) return String(a) === String(b);
   const at = classNameOf(a), bt = classNameOf(b);
   if (at !== bt) return false;
-  if (at === 'java/util/BitSet') return bitSetEquals(a, b);
+  const classResult = classEquals(jvm, at, a, b);
+  if (classResult !== null) return classResult;
   return false;
 }
-function findIndexJava(array, target) { return array.findIndex(value => javaEquals(value, target)); }
+function findIndexJava(jvm, array, target) { return array.findIndex(value => javaEquals(jvm, value, target)); }
 
 function iteratorFor(jvm, array) {
   return {
@@ -117,7 +118,7 @@ module.exports = {
     },
     'remove(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const a = backingArray(obj);
-      const i = findIndexJava(a, args[0]);
+      const i = findIndexJava(jvm, a, args[0]);
       if (i < 0) return 0;
       a.splice(i, 1);
       obj.size = a.length;
@@ -128,7 +129,7 @@ module.exports = {
       const remove = collectionToArray(args[0]);
       const before = a.length;
       for (let i = a.length - 1; i >= 0; i--) {
-        if (remove.some(value => javaEquals(value, a[i]))) a.splice(i, 1);
+        if (remove.some(value => javaEquals(jvm, value, a[i]))) a.splice(i, 1);
       }
       obj.size = a.length;
       return a.length !== before ? 1 : 0;
@@ -138,7 +139,7 @@ module.exports = {
       const retain = collectionToArray(args[0]);
       const before = a.length;
       for (let i = a.length - 1; i >= 0; i--) {
-        if (!retain.some(value => javaEquals(value, a[i]))) a.splice(i, 1);
+        if (!retain.some(value => javaEquals(jvm, value, a[i]))) a.splice(i, 1);
       }
       obj.size = a.length;
       return a.length !== before ? 1 : 0;
@@ -146,15 +147,15 @@ module.exports = {
     'clear()V': (jvm, obj) => { const a = backingArray(obj); a.length = 0; obj.size = 0; },
     'size()I': (jvm, obj) => backingArray(obj).length,
     'isEmpty()Z': (jvm, obj) => backingArray(obj).length === 0 ? 1 : 0,
-    'contains(Ljava/lang/Object;)Z': (jvm, obj, args) => findIndexJava(backingArray(obj), args[0]) >= 0 ? 1 : 0,
+    'contains(Ljava/lang/Object;)Z': (jvm, obj, args) => findIndexJava(jvm, backingArray(obj), args[0]) >= 0 ? 1 : 0,
     'containsAll(Ljava/util/Collection;)Z': (jvm, obj, args) => {
       const a = backingArray(obj);
-      return collectionToArray(args[0]).every(v => findIndexJava(a, v) >= 0) ? 1 : 0;
+      return collectionToArray(args[0]).every(v => findIndexJava(jvm, a, v) >= 0) ? 1 : 0;
     },
-    'indexOf(Ljava/lang/Object;)I': (jvm, obj, args) => findIndexJava(backingArray(obj), args[0]),
+    'indexOf(Ljava/lang/Object;)I': (jvm, obj, args) => findIndexJava(jvm, backingArray(obj), args[0]),
     'lastIndexOf(Ljava/lang/Object;)I': (jvm, obj, args) => {
       const a = backingArray(obj);
-      for (let i = a.length - 1; i >= 0; i--) if (javaEquals(a[i], args[0])) return i;
+      for (let i = a.length - 1; i >= 0; i--) if (javaEquals(jvm, a[i], args[0])) return i;
       return -1;
     },
     'iterator()Ljava/util/Iterator;': (jvm, obj) => iteratorFor(jvm, backingArray(obj)),
@@ -188,7 +189,7 @@ module.exports = {
       const other = collectionToArray(args[0]);
       const a = backingArray(obj);
       if (a.length !== other.length) return 0;
-      for (let i = 0; i < a.length; i++) if (!javaEquals(a[i], other[i])) return 0;
+      for (let i = 0; i < a.length; i++) if (!javaEquals(jvm, a[i], other[i])) return 0;
       return 1;
     },
   },

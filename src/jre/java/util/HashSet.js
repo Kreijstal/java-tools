@@ -15,15 +15,14 @@ function classNameOf(obj) {
   return obj && (obj._className || obj.type);
 }
 
-function bitSetEquals(a, b) {
-  const ab = a && a.bits instanceof Set ? a.bits : null;
-  const bb = b && b.bits instanceof Set ? b.bits : null;
-  if (!ab || !bb || ab.size !== bb.size) return false;
-  for (const v of ab) if (!bb.has(v)) return false;
-  return true;
+function classEquals(jvm, className, a, b) {
+  const equals = jvm && jvm.jre && jvm.jre[className] &&
+    jvm.jre[className].methods &&
+    jvm.jre[className].methods['equals(Ljava/lang/Object;)Z'];
+  return equals ? equals(jvm, a, [b]) !== 0 : null;
 }
 
-function javaEquals(a, b) {
+function javaEquals(jvm, a, b) {
   if (a === b) return true;
   if (a === null || a === undefined || b === null || b === undefined) return false;
 
@@ -39,13 +38,14 @@ function javaEquals(a, b) {
   const bt = classNameOf(b);
   if (at !== bt) return false;
 
-  if (at === 'java/util/BitSet') return bitSetEquals(a, b);
+  const classResult = classEquals(jvm, at, a, b);
+  if (classResult !== null) return classResult;
 
   return false;
 }
 
-function includesValue(values, target) {
-  return values.some(value => javaEquals(value, target));
+function includesValue(jvm, values, target) {
+  return values.some(value => javaEquals(jvm, value, target));
 }
 
 function collectionValues(collection) {
@@ -68,7 +68,7 @@ module.exports = {
     '<init>(IF)V': (jvm, obj) => { obj.set = new Set(); obj.items = obj.set; },
     'add(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const set = ensureSet(obj);
-      for (const value of set) if (javaEquals(value, args[0])) return 0;
+      for (const value of set) if (javaEquals(jvm, value, args[0])) return 0;
       set.add(args[0]);
       return 1;
     },
@@ -76,7 +76,7 @@ module.exports = {
       const set = ensureSet(obj);
       let changed = 0;
       for (const value of collectionValues(args[0])) {
-        if (!Array.from(set).some(existing => javaEquals(existing, value))) {
+        if (!Array.from(set).some(existing => javaEquals(jvm, existing, value))) {
           set.add(value);
           changed = 1;
         }
@@ -86,17 +86,17 @@ module.exports = {
     'contains(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const set = ensureSet(obj);
       if (set.has(args[0])) return 1;
-      return Array.from(set).some(value => javaEquals(value, args[0])) ? 1 : 0;
+      return Array.from(set).some(value => javaEquals(jvm, value, args[0])) ? 1 : 0;
     },
     'containsAll(Ljava/util/Collection;)Z': (jvm, obj, args) => {
       const values = Array.from(ensureSet(obj));
-      return collectionValues(args[0]).every(value => includesValue(values, value)) ? 1 : 0;
+      return collectionValues(args[0]).every(value => includesValue(jvm, values, value)) ? 1 : 0;
     },
     'remove(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const set = ensureSet(obj);
       if (set.delete(args[0])) return 1;
       for (const value of Array.from(set)) {
-        if (javaEquals(value, args[0])) { set.delete(value); return 1; }
+        if (javaEquals(jvm, value, args[0])) { set.delete(value); return 1; }
       }
       return 0;
     },
@@ -105,7 +105,7 @@ module.exports = {
       const remove = collectionValues(args[0]);
       let changed = 0;
       for (const value of Array.from(set)) {
-        if (includesValue(remove, value)) { set.delete(value); changed = 1; }
+        if (includesValue(jvm, remove, value)) { set.delete(value); changed = 1; }
       }
       return changed;
     },
@@ -114,7 +114,7 @@ module.exports = {
       const retain = collectionValues(args[0]);
       let changed = 0;
       for (const value of Array.from(set)) {
-        if (!includesValue(retain, value)) { set.delete(value); changed = 1; }
+        if (!includesValue(jvm, retain, value)) { set.delete(value); changed = 1; }
       }
       return changed;
     },
@@ -138,7 +138,7 @@ module.exports = {
       const set = ensureSet(obj);
       const other = collectionValues(args[0]);
       if (set.size !== other.length) return 0;
-      for (const item of set) if (!other.some(value => javaEquals(item, value))) return 0;
+      for (const item of set) if (!other.some(value => javaEquals(jvm, item, value))) return 0;
       return 1;
     },
   },

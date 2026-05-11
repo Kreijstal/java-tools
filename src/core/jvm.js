@@ -1616,7 +1616,7 @@ class JVM {
     }
 
     let classData = this.classes[className];
-    if (!classData && !(className.startsWith && className.startsWith('java/'))) {
+    if (!classData && !this.jre[className]) {
       try {
         classData = await this.loadClassByName(className);
       } catch (e) {
