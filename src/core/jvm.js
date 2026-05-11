@@ -22,15 +22,6 @@ const JSZip = require("jszip");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 
-function isJavaPlatformClassName(className) {
-  return typeof className === "string" && (
-    className.startsWith("java/") ||
-    className.startsWith("javax/") ||
-    className.startsWith("sun/") ||
-    className.startsWith("com/sun/")
-  );
-}
-
 function yieldToEventLoop() {
   return new Promise((resolve) => {
     if (typeof setImmediate === "function") {
@@ -1109,7 +1100,8 @@ class JVM {
   async loadClassByName(className) {
     const classNameWithSlashes = className.replace(/\./g, '/');
     const existingClass = this.classes[classNameWithSlashes];
-    if (existingClass && (!existingClass.isJreStub || isJavaPlatformClassName(classNameWithSlashes))) {
+    const isKnownJreClass = !!this.jre[classNameWithSlashes];
+    if (existingClass && (!existingClass.isJreStub || isKnownJreClass)) {
       return existingClass;
     }
 
@@ -1586,14 +1578,6 @@ class JVM {
         className === target;
     }
 
-    const extraInterfaces = {
-      'org/benf/cfr/reader/entities/Method': [
-        'org/benf/cfr/reader/util/KnowsRawSize',
-        'org/benf/cfr/reader/util/TypeUsageCollectable',
-      ],
-    };
-    if (extraInterfaces[className] && extraInterfaces[className].includes(target)) return true;
-
     const classData = this.classes[className];
     if (classData && classData.ast && classData.ast.classes && classData.ast.classes[0]) {
       const cls = classData.ast.classes[0];
@@ -1630,14 +1614,6 @@ class JVM {
         target === 'java/io/Serializable' ||
         className === target;
     }
-
-    const extraInterfaces = {
-      'org/benf/cfr/reader/entities/Method': [
-        'org/benf/cfr/reader/util/KnowsRawSize',
-        'org/benf/cfr/reader/util/TypeUsageCollectable',
-      ],
-    };
-    if (extraInterfaces[className] && extraInterfaces[className].includes(target)) return true;
 
     let classData = this.classes[className];
     if (!classData && !(className.startsWith && className.startsWith('java/'))) {
