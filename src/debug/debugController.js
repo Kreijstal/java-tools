@@ -191,9 +191,7 @@ class DebugController {
       };
     }
 
-    const instructionItem = frame.instructions[frame.pc];
-    const label = instructionItem ? instructionItem.labelDef : null;
-    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+    const currentPc = this.jvm._resolveFramePc(frame);
     
     // Update last known state for future use
     this.lastKnownState = {

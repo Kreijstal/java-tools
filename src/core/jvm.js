@@ -82,6 +82,13 @@ class JVM {
   }
 
   internString(str) {
+    if (str && str.type === "java/lang/String") {
+      return str;
+    }
+    if (str && typeof str === "object" && Object.prototype.hasOwnProperty.call(str, "value")) {
+      str = str.value;
+    }
+    str = String(str);
     // Proper string interning - reuse the same object for the same string value
     if (!this.stringPool) {
       this.stringPool = new Map();
@@ -1369,10 +1376,14 @@ class JVM {
 
   findStaticInitializer(classData) {
     const clinitMethod = classData.ast.classes[0].items.find((item) => {
+      const codeAttr = item.method && item.method.attributes &&
+        item.method.attributes.find((attr) => attr.type === "code" && attr.code);
       return (
         item.type === "method" &&
         item.method.name === "<clinit>" &&
-        item.method.descriptor === "()V"
+        item.method.descriptor === "()V" &&
+        codeAttr &&
+        Array.isArray(codeAttr.code.codeItems)
       );
     });
     return clinitMethod ? clinitMethod.method : null;
@@ -1766,11 +1777,7 @@ class JVM {
     const frame = thread.callStack.peek();
     if (!frame) return { callStackDepth: thread.callStack.size() };
 
-    const instructionItem = frame.instructions[frame.pc];
-    const label = instructionItem ? instructionItem.labelDef : null;
-    const currentPc = label
-      ? parseInt(label.substring(1, label.length - 1))
-      : -1;
+    const currentPc = this._resolveFramePc(frame);
 
     return {
       pc: currentPc,
@@ -1779,6 +1786,23 @@ class JVM {
       callStackDepth: thread.callStack.size(),
       method: { name: frame.method.name, descriptor: frame.method.descriptor },
     };
+  }
+
+  _resolveFramePc(frame) {
+    if (!frame || !Array.isArray(frame.instructions) || frame.instructions.length === 0) {
+      return null;
+    }
+    const index = Math.min(Math.max(frame.pc, 0), frame.instructions.length - 1);
+    const instructionItem = frame.instructions[index];
+    if (instructionItem && typeof instructionItem.pc === "number" && instructionItem.pc >= 0) {
+      return instructionItem.pc;
+    }
+    const label = instructionItem ? instructionItem.labelDef : null;
+    if (typeof label === "string") {
+      const match = /^L(\d+):?$/.exec(label);
+      if (match) return Number.parseInt(match[1], 10);
+    }
+    return index;
   }
 
   getBacktrace(threadId = this.debugManager.selectedThreadId) {
@@ -2069,12 +2093,7 @@ class JVM {
     }
 
     try {
-      let currentPc = -1;
-      if (frame.pc < frame.instructions.length) {
-        const instructionItem = frame.instructions[frame.pc];
-        const label = instructionItem ? instructionItem.labelDef : null;
-        currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
-      }
+      const currentPc = this._resolveFramePc(frame);
 
       const disassembly = unparseDataStructures(
         workspaceEntry.ast.classes[0],

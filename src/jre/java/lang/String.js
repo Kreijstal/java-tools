@@ -4,8 +4,23 @@ function stringValue(obj) {
   if (obj === null || obj === undefined) {
     return '';
   }
-  if (obj && obj.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(obj, 'value')) {
-    return String(obj.value);
+  if (obj && obj.type === 'java/lang/String') {
+    if (Object.prototype.hasOwnProperty.call(obj, 'value')) {
+      return String(obj.value);
+    }
+    return String(obj.valueOf ? obj.valueOf() : obj);
+  }
+  if (obj && typeof obj === 'object') {
+    if (Object.prototype.hasOwnProperty.call(obj, 'value')) {
+      return String(obj.value);
+    }
+    if (obj.name) {
+      return stringValue(obj.name);
+    }
+    const type = obj._className || obj.type;
+    if (type) {
+      return type.replace(/\//g, '.') + '@' + String(obj.hashCode || 0).toString(16);
+    }
   }
   return String(obj);
 }
