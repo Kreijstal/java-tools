@@ -119,6 +119,19 @@ module.exports = {
       }
     }
   },
+  if_icmple: (frame, instruction) => {
+    const label = instruction.arg;
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value1 <= value2) {
+      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
   if_icmpgt: (frame, instruction) => {
     const label = instruction.arg;
     const value2 = frame.stack.pop();

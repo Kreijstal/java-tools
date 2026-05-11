@@ -1,0 +1,20 @@
+module.exports = {
+  super: 'java/lang/Number',
+  methods: {
+    '<init>()V': (jvm, obj) => { obj.value = 0; },
+    '<init>(I)V': (jvm, obj, args) => { obj.value = args[0] | 0; },
+    'get()I': (jvm, obj) => obj.value | 0,
+    'set(I)V': (jvm, obj, args) => { obj.value = args[0] | 0; },
+    'incrementAndGet()I': (jvm, obj) => { obj.value = (obj.value | 0) + 1; return obj.value; },
+    'getAndIncrement()I': (jvm, obj) => { const old = obj.value | 0; obj.value = old + 1; return old; },
+    'decrementAndGet()I': (jvm, obj) => { obj.value = (obj.value | 0) - 1; return obj.value; },
+    'getAndDecrement()I': (jvm, obj) => { const old = obj.value | 0; obj.value = old - 1; return old; },
+    'addAndGet(I)I': (jvm, obj, args) => { obj.value = (obj.value | 0) + (args[0] | 0); return obj.value; },
+    'getAndAdd(I)I': (jvm, obj, args) => { const old = obj.value | 0; obj.value = old + (args[0] | 0); return old; },
+    'intValue()I': (jvm, obj) => obj.value | 0,
+    'longValue()J': (jvm, obj) => BigInt(obj.value | 0),
+    'floatValue()F': (jvm, obj) => obj.value | 0,
+    'doubleValue()D': (jvm, obj) => obj.value | 0,
+    'toString()Ljava/lang/String;': (jvm, obj) => jvm.internString(String(obj.value | 0)),
+  },
+};

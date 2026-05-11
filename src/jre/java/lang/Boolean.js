@@ -10,8 +10,15 @@ module.exports = {
       type: 'java/lang/Boolean',
       value: true,
     },
+    'FALSE:Ljava/lang/Boolean;': {
+      type: 'java/lang/Boolean',
+      value: false,
+    },
   },
   staticMethods: {
+    'toString(Z)Ljava/lang/String;': (jvm, obj, args) => {
+      return jvm.internString(args[0] ? 'true' : 'false');
+    },
     'valueOf(Z)Ljava/lang/Boolean;': (jvm, obj, args) => {
       const booleanObj = {
         type: 'java/lang/Boolean',

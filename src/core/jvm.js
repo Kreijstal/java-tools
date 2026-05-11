@@ -22,6 +22,15 @@ const JSZip = require("jszip");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 
+function isJavaPlatformClassName(className) {
+  return typeof className === "string" && (
+    className.startsWith("java/") ||
+    className.startsWith("javax/") ||
+    className.startsWith("sun/") ||
+    className.startsWith("com/sun/")
+  );
+}
+
 function yieldToEventLoop() {
   return new Promise((resolve) => {
     if (typeof setImmediate === "function") {
@@ -51,6 +60,8 @@ class JVM {
     this.verbose = options.verbose || false;
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
+    this.yieldInterval = options.yieldInterval || 4096;
+    this._ticksSinceYield = 0;
     this.jit = new JitCompiler(this, options.jit || {});
 
     // Make fs and path available for JreBootstrap (only in Node.js environment)
@@ -237,7 +248,10 @@ class JVM {
       return null;
     }
 
-    // Continue with original JRE method lookup
+    // Continue with original JRE method lookup.  Several existing JRE
+    // shims use either `super: "java/lang/Object"` or
+    // `super: { type: "java/lang/Object" }`; normalize both forms so
+    // method lookup works consistently through the JRE hierarchy.
     let currentClass = this.jre[className];
     while (currentClass) {
       const methodKey = `${methodName}${descriptor}`;
@@ -256,7 +270,11 @@ class JVM {
       }
 
       // Check superclass
-      currentClass = currentClass.super ? this.jre[currentClass.super] : null;
+      let superName = currentClass.super;
+      if (superName && typeof superName === "object") {
+        superName = superName.type || null;
+      }
+      currentClass = superName ? this.jre[superName] : null;
     }
 
     // If no exact match found and this is a MethodHandle.invoke method,
@@ -792,8 +810,13 @@ class JVM {
             }
           }
         }
-        // Yield to the event loop to prevent blocking on long-running code without breakpoints
-        await yieldToEventLoop();
+        // Yield periodically rather than after every bytecode. CFR executes enough
+        // bytecode that yielding per instruction dominates runtime.
+        this._ticksSinceYield += 1;
+        if (this._ticksSinceYield >= this.yieldInterval) {
+          this._ticksSinceYield = 0;
+          await yieldToEventLoop();
+        }
       }
     } catch (e) {
       this.debugManager.pause();
@@ -1085,8 +1108,9 @@ class JVM {
 
   async loadClassByName(className) {
     const classNameWithSlashes = className.replace(/\./g, '/');
-    if (this.classes[classNameWithSlashes]) {
-      return this.classes[classNameWithSlashes];
+    const existingClass = this.classes[classNameWithSlashes];
+    if (existingClass && (!existingClass.isJreStub || isJavaPlatformClassName(classNameWithSlashes))) {
+      return existingClass;
     }
 
     // Handle array classes (e.g., [I, [[Ljava/lang/String;, etc.)
@@ -1553,24 +1577,93 @@ class JVM {
   isInstanceOf(className, target) {
     if (!className) return false;
     if (className === target) return true;
+    if (target === "java/lang/Object" && className !== null) return true;
+
+    if (className.startsWith && className.startsWith('[')) {
+      return target === 'java/lang/Object' ||
+        target === 'java/lang/Cloneable' ||
+        target === 'java/io/Serializable' ||
+        className === target;
+    }
+
+    const extraInterfaces = {
+      'org/benf/cfr/reader/entities/Method': [
+        'org/benf/cfr/reader/util/KnowsRawSize',
+        'org/benf/cfr/reader/util/TypeUsageCollectable',
+      ],
+    };
+    if (extraInterfaces[className] && extraInterfaces[className].includes(target)) return true;
 
     const classData = this.classes[className];
-    if (!classData) return false;
-
-    // Check superclass
-    if (this.isInstanceOf(classData.ast.classes[0].superClassName, target)) {
-      return true;
+    if (classData && classData.ast && classData.ast.classes && classData.ast.classes[0]) {
+      const cls = classData.ast.classes[0];
+      if (this.isInstanceOf(cls.superClassName, target)) return true;
+      for (const iface of cls.interfaces || []) if (this.isInstanceOf(iface, target)) return true;
+      return false;
     }
 
-    // Check interfaces
-    const interfaces = classData.ast.classes[0].interfaces;
-    if (interfaces) {
-      for (const iface of interfaces) {
-        if (this.isInstanceOf(iface, target)) {
-          return true;
-        }
+    const jreClass = this.jre[className];
+    if (jreClass) {
+      const superName = typeof jreClass.super === "string"
+        ? jreClass.super
+        : (jreClass.super && jreClass.super.type) || null;
+      if (this.isInstanceOf(superName, target)) return true;
+      for (const iface of jreClass.interfaces || []) if (this.isInstanceOf(iface, target)) return true;
+      return false;
+    }
+
+    return false;
+  }
+
+  async isInstanceOfAsync(className, target, seen = new Set()) {
+    if (!className) return false;
+    if (className === target) return true;
+    if (target === "java/lang/Object" && className !== null) return true;
+
+    const visitKey = `${className}->${target}`;
+    if (seen.has(visitKey)) return false;
+    seen.add(visitKey);
+
+    if (className.startsWith && className.startsWith('[')) {
+      return target === 'java/lang/Object' ||
+        target === 'java/lang/Cloneable' ||
+        target === 'java/io/Serializable' ||
+        className === target;
+    }
+
+    const extraInterfaces = {
+      'org/benf/cfr/reader/entities/Method': [
+        'org/benf/cfr/reader/util/KnowsRawSize',
+        'org/benf/cfr/reader/util/TypeUsageCollectable',
+      ],
+    };
+    if (extraInterfaces[className] && extraInterfaces[className].includes(target)) return true;
+
+    let classData = this.classes[className];
+    if (!classData && !(className.startsWith && className.startsWith('java/'))) {
+      try {
+        classData = await this.loadClassByName(className);
+      } catch (e) {
+        classData = null;
       }
     }
+    if (classData && classData.ast && classData.ast.classes && classData.ast.classes[0]) {
+      const cls = classData.ast.classes[0];
+      if (await this.isInstanceOfAsync(cls.superClassName, target, seen)) return true;
+      for (const iface of cls.interfaces || []) if (await this.isInstanceOfAsync(iface, target, seen)) return true;
+      return false;
+    }
+
+    const jreClass = this.jre[className];
+    if (jreClass) {
+      const superName = typeof jreClass.super === "string"
+        ? jreClass.super
+        : (jreClass.super && jreClass.super.type) || null;
+      if (await this.isInstanceOfAsync(superName, target, seen)) return true;
+      for (const iface of jreClass.interfaces || []) if (await this.isInstanceOfAsync(iface, target, seen)) return true;
+      return false;
+    }
+
     return false;
   }
 

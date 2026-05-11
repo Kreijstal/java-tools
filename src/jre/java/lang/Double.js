@@ -14,6 +14,24 @@ module.exports = {
     "NaN:D": Number.NaN,
   },
   staticMethods: {
+    'longBitsToDouble(J)D': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setBigInt64(0, BigInt(args[0]), false);
+      return view.getFloat64(0, false);
+    },
+    'doubleToLongBits(D)J': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setFloat64(0, args[0], false);
+      return view.getBigInt64(0, false);
+    },
+    'doubleToRawLongBits(D)J': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setFloat64(0, args[0], false);
+      return view.getBigInt64(0, false);
+    },
     "parseDouble(Ljava/lang/String;)D": (jvm, obj, args) => {
       const str = args[0];
       return parseFloat(str);

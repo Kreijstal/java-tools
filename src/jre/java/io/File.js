@@ -5,12 +5,10 @@ module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/io/Serializable'],
   staticFields: {
-    'separator:Ljava/lang/String;': {
-      get: (jvm) => jvm.internString(path.sep)
-    },
-    'pathSeparator:Ljava/lang/String;': {
-      get: (jvm) => jvm.internString(path.delimiter)
-    }
+    'separator:Ljava/lang/String;': path.sep,
+    'pathSeparator:Ljava/lang/String;': path.delimiter,
+    'separatorChar:C': path.sep.charCodeAt(0),
+    'pathSeparatorChar:C': path.delimiter.charCodeAt(0),
   },
   methods: {
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {

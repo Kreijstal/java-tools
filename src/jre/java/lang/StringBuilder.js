@@ -4,6 +4,15 @@ function valueAsString(value) {
   if (value === null || value === undefined) {
     return 'null';
   }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint" || typeof value === "symbol") {
+    return String(value);
+  }
+  if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) {
+    return String(value.value);
+  }
   if (value && value.type === 'java/lang/String') {
     if (Object.prototype.hasOwnProperty.call(value, 'value')) {
       return String(value.value);
@@ -23,6 +32,27 @@ function valueAsString(value) {
     const type = value._className || value.type;
     if (type) {
       return type.replace(/\//g, '.') + '@' + String(value.hashCode || 0).toString(16);
+    }
+  }
+  if (value && typeof value.toString === "function") {
+    try {
+      const toStringValue = value.toString();
+      if (typeof toStringValue === "string") {
+        return toStringValue;
+      }
+      if (typeof toStringValue === "number" || typeof toStringValue === "boolean" || typeof toStringValue === "bigint" || typeof toStringValue === "symbol") {
+        return String(toStringValue);
+      }
+      if (toStringValue && typeof toStringValue === "object") {
+        if (toStringValue.type === "java/lang/String" && Object.prototype.hasOwnProperty.call(toStringValue, "value")) {
+          return String(toStringValue.value);
+        }
+        if (toStringValue.type === "java/lang/String") {
+          return String(toStringValue);
+        }
+      }
+    } catch (_) {
+      // fall back below
     }
   }
   return String(value);

@@ -37,6 +37,12 @@ module.exports = {
       const hexString = (intValue >>> 0).toString(16);
       return jvm.newString(hexString);
     },
+    'signum(I)I': (jvm, obj, args) => args[0] > 0 ? 1 : (args[0] < 0 ? -1 : 0),
+    'compare(II)I': (jvm, obj, args) => args[0] < args[1] ? -1 : (args[0] > args[1] ? 1 : 0),
+    'compareUnsigned(II)I': (jvm, obj, args) => (args[0] >>> 0) < (args[1] >>> 0) ? -1 : ((args[0] >>> 0) > (args[1] >>> 0) ? 1 : 0),
+    'bitCount(I)I': (jvm, obj, args) => { let v = args[0] >>> 0, c = 0; while (v) { v &= v - 1; c++; } return c; },
+    'highestOneBit(I)I': (jvm, obj, args) => { let v = args[0] | 0; if (v === 0) return 0; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; return v - (v >>> 1); },
+    'lowestOneBit(I)I': (jvm, obj, args) => args[0] & -args[0],
     'valueOf(I)Ljava/lang/Integer;': (jvm, obj, args) => {
       const integerObj = {
         type: 'java/lang/Integer',
@@ -67,6 +73,13 @@ module.exports = {
     'intValue()I': (jvm, obj, args) => {
       return obj.value;
     },
+    'longValue()J': (jvm, obj, args) => obj.value,
+    'floatValue()F': (jvm, obj, args) => obj.value,
+    'doubleValue()D': (jvm, obj, args) => obj.value,
+    'byteValue()B': (jvm, obj, args) => obj.value & 0xff,
+    'shortValue()S': (jvm, obj, args) => obj.value & 0xffff,
+    'equals(Ljava/lang/Object;)Z': (jvm, obj, args) => args[0] && args[0].type === 'java/lang/Integer' && args[0].value === obj.value ? 1 : 0,
+    'hashCode()I': (jvm, obj, args) => obj.value | 0,
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
       // Per spec, this should be a new string, not an interned one.
       return jvm.newString(obj.value.toString());

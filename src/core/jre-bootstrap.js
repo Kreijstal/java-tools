@@ -89,6 +89,7 @@ class JreBootstrap {
         },
         constantPool: [],
         staticFields: new Map(),
+        isJreStub: true,
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},
       };
@@ -152,6 +153,7 @@ class JreBootstrap {
                 },
                 constantPool: [],
                 staticFields: new Map(),
+                isJreStub: true,
               };
 
               // Initialize static fields from JRE definition during preloading
@@ -712,6 +714,7 @@ class JreBootstrap {
       },
       constantPool: [],
       staticFields: new Map(),
+      isJreStub: true,
       methods: jreClassDef.methods || {},
       staticMethods: jreClassDef.staticMethods || {},
     };

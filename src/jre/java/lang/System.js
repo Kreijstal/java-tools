@@ -1,6 +1,13 @@
 'use strict';
 const process = require('process');
+const path = require('path');
 const { withThrows } = require('../../helpers');
+function javaString(value) {
+  if (value === null || value === undefined) return '';
+  if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
+  return String(value);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
@@ -29,13 +36,19 @@ module.exports = {
       }
     }, ['java/lang/NullPointerException', 'java/lang/ArrayIndexOutOfBoundsException']),
     'getProperty(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
-      const key = jvm.stringify(args[0]);
+      const key = javaString(args[0]);
       const value = module.exports.staticFields.get('props').get(key);
       return value ? jvm.internString(value) : null;
     },
+    'getProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const key = javaString(args[0]);
+      const defaultValue = args[1];
+      const value = module.exports.staticFields.get('props').get(key);
+      return value !== undefined ? jvm.internString(value) : defaultValue;
+    },
     'setProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
-      const key = jvm.stringify(args[0]);
-      const value = jvm.stringify(args[1]);
+      const key = javaString(args[0]);
+      const value = javaString(args[1]);
       const props = module.exports.staticFields.get('props');
       const old = props.get(key);
       props.set(key, value);
@@ -103,9 +116,10 @@ module.exports = {
       props.set('java.version', '1.8.0');
       props.set('java.vendor', 'JVM Tools Mock');
       props.set('os.name', 'Linux');
-      props.set('user.dir', '/tmp');
-      props.set('file.separator', '/');
-      props.set('path.separator', ':');
+      props.set('user.dir', process.cwd ? process.cwd() : '/tmp');
+      props.set('java.class.path', Array.isArray(jvm.classpath) ? jvm.classpath.join(path.delimiter) : String(jvm.classpath || '.'));
+      props.set('file.separator', path.sep);
+      props.set('path.separator', path.delimiter);
       props.set('line.separator', '\n');
       module.exports.staticFields.set('props', props);
     }
