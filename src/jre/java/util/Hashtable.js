@@ -10,7 +10,7 @@ module.exports = {
       const value = args[1];
       const old = obj.map.get(key);
       obj.map.set(key, value);
-      return old;
+      return old === undefined ? null : old;
     },
     'containsKey(Ljava/lang/Object;)Z': function(jvm, obj, args) {
       const key = args[0];

@@ -648,6 +648,9 @@ function peepholeCleanCommand(args) {
     console.log(`  rethrow handlers: ${result.details.rethrowHandlers}`);
     console.log(`  nops: ${result.details.nops}`);
     console.log(`  threaded branches: ${result.details.threadedBranches}`);
+    if (result.details.conditionalForwardLoopEntryClones) {
+      console.log(`  conditional forward loop entry clones: ${result.details.conditionalForwardLoopEntryClones}`);
+    }
     console.log(`  fallthrough gotos: ${result.details.fallthroughGotos}`);
     console.log(`  unreachable instructions: ${result.details.unreachableInstructions}`);
     console.log(`  unused labels: ${result.details.unusedLabels}`);

@@ -18,6 +18,7 @@ const JNI = require("./jni");
 const fs = require("fs");
 const path = require("path");
 const { getAST } = require("jvm_parser");
+const JSZip = require("jszip");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 
@@ -39,6 +40,7 @@ class JVM {
     this.classInitializationState = new Map();
     this.invokedynamicCache = new Map();
     this.classObjectCache = new Map(); // className -> Class object (for maintaining identity)
+    this.jarCache = new Map(); // jarPath -> JSZip instance
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
     this.classpath = options.classpath
@@ -443,20 +445,20 @@ class JVM {
     // Initialize the main class before running main method or creating applet
     // This ensures static blocks execute before main method starts
     const className = classData.ast.classes[0].className;
-    const wasFramePushed = await this.initializeClassIfNeeded(
+    let wasFramePushed = await this.initializeClassIfNeeded(
       className,
       mainThread,
     );
 
-    if (wasFramePushed) {
-      // If a <clinit> frame was pushed, we need to execute it to completion first
-      // Wait until all frames related to class initialization complete
-      // This includes the <clinit> frame and any methods it calls
+    while (wasFramePushed) {
+      // If a <clinit> frame was pushed, execute it to completion, then retry
+      // initialization. A superclass initializer may have been pushed first.
       const originalStackSize = mainThread.callStack.size();
       while (mainThread.callStack.size() >= originalStackSize) {
         const result = await this.executeTick();
         if (result.completed) break;
       }
+      wasFramePushed = await this.initializeClassIfNeeded(className, mainThread);
     }
 
     if (isApplet) {
@@ -531,6 +533,7 @@ class JVM {
 
     const objRef = {
       type: className,
+      _className: className,
       fields,
       hashCode: this.nextHashCode++,
       isLocked: false,
@@ -540,28 +543,29 @@ class JVM {
     };
     
     // Add JavaScript toString method that calls Java toString
+    const jvm = this;
     objRef.toString = function() {
       // Try to find toString method in the class hierarchy
-      let currentType = this.type;
+      const currentType = this._className || this.type;
       let toStringMethod = null;
 
       // First check if it's a JRE class
-      toStringMethod = this._jreFindMethod(currentType, 'toString', '()Ljava/lang/String;');
+      toStringMethod = jvm._jreFindMethod(currentType, 'toString', '()Ljava/lang/String;');
 
       // If not found, check parent classes
       if (!toStringMethod) {
-        const classData = this.classes[currentType];
+        const classData = jvm.classes[currentType];
         if (classData && classData.ast && classData.ast.classes[0].superClassName) {
           const superClassName = classData.ast.classes[0].superClassName;
-          toStringMethod = this._jreFindMethod(superClassName, 'toString', '()Ljava/lang/String;');
+          toStringMethod = jvm._jreFindMethod(superClassName, 'toString', '()Ljava/lang/String;');
         }
       }
 
       if (toStringMethod) {
-        const result = toStringMethod(this, this, []);
-        return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
+        const result = toStringMethod(jvm, this, []);
+        return (result && result.value !== undefined) ? result.value : currentType.split('/').pop();
       }
-      return this.type.split('/').pop();
+      return currentType.split('/').pop();
     };
     
     return objRef;
@@ -997,6 +1001,34 @@ class JVM {
     }
   }
 
+  async loadClassFromJar(jarPath, classNameWithSlashes) {
+    const resolvedJarPath = path.resolve(jarPath);
+    let zip = this.jarCache.get(resolvedJarPath);
+
+    if (!zip) {
+      const jarBytes = await fs.promises.readFile(resolvedJarPath);
+      zip = await JSZip.loadAsync(jarBytes);
+      this.jarCache.set(resolvedJarPath, zip);
+    }
+
+    const entry = zip.file(`${classNameWithSlashes}.class`);
+    if (!entry) {
+      return null;
+    }
+
+    const classFileContent = Buffer.from(await entry.async('uint8array'));
+    const rawAst = getAST(classFileContent);
+    const convertedAst = convertJson(rawAst.ast, rawAst.constantPool);
+    const classData = {
+      ast: convertedAst,
+      constantPool: rawAst.constantPool,
+      staticFields: new Map(),
+    };
+
+    this.classes[classData.ast.classes[0].className] = classData;
+    return classData;
+  }
+
   createArrayClass(arrayClassName) {
     // Create a synthetic array class
     const arrayClass = {
@@ -1056,6 +1088,17 @@ class JVM {
     }
 
     for (const cp of this.classpath) {
+      const lowerCp = String(cp).toLowerCase();
+
+      if (lowerCp.endsWith('.jar') || lowerCp.endsWith('.zip')) {
+        const classData = await this.loadClassFromJar(cp, classNameWithSlashes);
+        if (classData && classData.ast) {
+          this.classes[classNameWithSlashes] = classData;
+          return classData;
+        }
+        continue;
+      }
+
       const classFilePath = path.join(cp, `${classNameWithSlashes}.class`);
       try {
         const classData = await this.loadClassAsync(classFilePath);
@@ -1155,13 +1198,17 @@ class JVM {
           thread,
         );
         if (wasSuperPushed) {
+          this.classInitializationState.delete(className);
           return true;
         }
       }
 
       // Initialize static fields with default values first
-      if (!classData.staticFields) {
-        classData.staticFields = new Map();
+      if (!classData.staticFields || !classData.staticFieldsInitialized) {
+        if (!classData.staticFields) {
+          classData.staticFields = new Map();
+        }
+        classData.staticFieldsInitialized = true;
 
         if (this.verbose) {
           console.log(`Initializing staticFields for ${className}`);
@@ -1869,7 +1916,7 @@ class JVM {
 
   inspectObject(objRef) {
     if (!objRef || typeof objRef !== "object") return null;
-    return { type: objRef.type, fields: objRef.fields || {} };
+    return { type: objRef._className || objRef.type, fields: objRef.fields || {} };
   }
 
   stepInto() {

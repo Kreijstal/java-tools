@@ -1,3 +1,24 @@
+function runtimeClassName(objRef) {
+  return objRef && (objRef._className || objRef.type);
+}
+
+function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
+  let currentClassName = className;
+  while (currentClassName) {
+    const fieldKey = `${currentClassName}.${fieldName}`;
+    if (Object.prototype.hasOwnProperty.call(objRef.fields, fieldKey)) {
+      return fieldKey;
+    }
+
+    const classData = jvm.classes[currentClassName];
+    currentClassName = classData && classData.ast && classData.ast.classes[0]
+      ? classData.ast.classes[0].superClassName
+      : null;
+  }
+
+  return Object.keys(objRef.fields).find((fieldKey) => fieldKey.endsWith(`.${fieldName}`));
+}
+
 module.exports = {
   new: async (frame, instruction, jvm, thread) => {
     const className = instruction.arg;
@@ -50,6 +71,7 @@ module.exports = {
 
     const objRef = {
       type: className,
+      _className: className,
       fields,
       hashCode: jvm.nextHashCode++,
       isLocked: false,
@@ -60,9 +82,9 @@ module.exports = {
     
     // Add JavaScript toString method that calls Java toString
     objRef.toString = function() {
+      const currentType = runtimeClassName(this);
       try {
         // Try to find toString method in the class hierarchy
-        let currentType = this.type;
         let toStringMethod = null;
         
         // First check if it's a JRE class
@@ -79,11 +101,11 @@ module.exports = {
         
         if (toStringMethod) {
           const result = toStringMethod(jvm, this, []);
-          return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
+          return (result && result.value !== undefined) ? result.value : currentType.split('/').pop();
         }
-        return this.type.split('/').pop();
+        return currentType.split('/').pop();
       } catch (e) {
-        return this.type.split('/').pop();
+        return currentType.split('/').pop();
       }
     };
     
@@ -133,7 +155,8 @@ module.exports = {
     if (objRef === null) {
       throw new Error('NullPointerException');
     }
-    const value = objRef.fields[`${className}.${fieldName}`];
+    const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName);
+    const value = fieldKey ? objRef.fields[fieldKey] : undefined;
     frame.stack.push(value);
   },
 
@@ -144,7 +167,8 @@ module.exports = {
     if (objRef === null) {
       throw new Error('NullPointerException');
     }
-    objRef.fields[`${className}.${fieldName}`] = value;
+    const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
+    objRef.fields[fieldKey] = value;
   },
 
   getstatic: async (frame, instruction, jvm, thread) => {
@@ -158,11 +182,19 @@ module.exports = {
 
     const fieldKey = `${fieldName}:${descriptor}`;
 
-    // First, try to get the field from the class registry (regular classes)
-    const classData = jvm.classes[className];
-    if (classData && classData.staticFields && classData.staticFields.has(fieldKey)) {
-      frame.stack.push(classData.staticFields.get(fieldKey));
-      return;
+    // First, try to get the field from the class registry (regular classes),
+    // using JVM field resolution through the superclass chain.
+    let currentClassName = className;
+    while (currentClassName) {
+      const currentClassData = jvm.classes[currentClassName];
+      if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldKey)) {
+        frame.stack.push(currentClassData.staticFields.get(fieldKey));
+        return;
+      }
+
+      currentClassName = currentClassData && currentClassData.ast && currentClassData.ast.classes[0]
+        ? currentClassData.ast.classes[0].superClassName
+        : null;
     }
 
     // If not found in class registry, try the JRE registry (for JRE classes)
@@ -192,6 +224,7 @@ module.exports = {
 
     // Debug logging for troubleshooting (only in verbose mode)
     if (jvm.verbose) {
+      const classData = jvm.classes[className];
       console.log(`Static field lookup failed for ${className}.${fieldName}`);
       console.log(`Looking for field key: "${fieldKey}"`);
       console.log(`Class registry static fields:`, classData && classData.staticFields ? Array.from(classData.staticFields.keys()) : 'none');
@@ -213,9 +246,22 @@ module.exports = {
       return;
     }
 
+    const fieldKey = `${fieldName}:${descriptor}`;
+    let currentClassName = className;
+    while (currentClassName) {
+      const currentClassData = jvm.classes[currentClassName];
+      if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldKey)) {
+        currentClassData.staticFields.set(fieldKey, value);
+        return;
+      }
+
+      currentClassName = currentClassData && currentClassData.ast && currentClassData.ast.classes[0]
+        ? currentClassData.ast.classes[0].superClassName
+        : null;
+    }
+
     const classData = jvm.classes[className];
     if (classData && classData.staticFields) {
-      const fieldKey = `${fieldName}:${descriptor}`;
       classData.staticFields.set(fieldKey, value);
       return;
     }
@@ -311,7 +357,7 @@ module.exports = {
       return false;
     };
 
-    const result = await isInstanceOf(objRef.type, targetClassName);
+    const result = await isInstanceOf(runtimeClassName(objRef), targetClassName);
 
     if (result === 'RETRY') {
         // A class was initialized during the check.
@@ -380,7 +426,7 @@ module.exports = {
       return; // null can be cast to anything
     }
 
-    let currentClassName = objRef.type;
+    let currentClassName = runtimeClassName(objRef);
     while (currentClassName) {
       if (currentClassName === targetClassName) {
         return; // Cast is valid
@@ -410,7 +456,7 @@ module.exports = {
     }
 
     // If we get here, the cast is invalid
-    throw { type: 'java/lang/ClassCastException', message: `${objRef.type} cannot be cast to ${targetClassName}` };
+    throw { type: 'java/lang/ClassCastException', message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}` };
   },
 
   newarray: (frame, instruction, jvm) => {

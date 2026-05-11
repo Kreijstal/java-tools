@@ -216,6 +216,50 @@ test('peephole clean clones stack-neutral shared forward loop entry', (t) => {
   t.end();
 });
 
+test('peephole clean clones conditional forward entry into loop with skip arm', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lloop' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifge', arg: 'Lclamp' } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lafter' } },
+    { labelDef: 'Lclamp:', instruction: { op: 'iinc', varnum: '1', incr: '2' } },
+    { labelDef: 'Lloop:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lafter' } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lloop' } },
+    { labelDef: 'Lafter:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.conditionalForwardLoopEntryClones, 1);
+  const branch = code(ast).codeItems[1].instruction;
+  t.equal(branch.op, 'ifge');
+  t.notEqual(branch.arg, 'Lloop', 'conditional entry retargeted to clone');
+  t.ok(code(ast).codeItems.some((item) => item && item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lloop'), 'guard preserves original fallthrough target');
+  t.end();
+});
+
+test('peephole clean does not clone conditional loop entry without skip arm', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lloop' } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '2' } },
+    { labelDef: 'Lloop:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lafter' } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lloop' } },
+    { labelDef: 'Lafter:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.conditionalForwardLoopEntryClones, 0);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifge', arg: 'Lloop' });
+  t.end();
+});
+
 test('peephole clean coalesces duplicate loop tail updates', (t) => {
   const ast = astWith([
     { labelDef: 'Lhead:', instruction: 'iload_1' },

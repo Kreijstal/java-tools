@@ -5,6 +5,10 @@ const path = require("path");
 const { MethodHandle, MethodType, Lookup } = require("../jre/java/lang/invoke");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 
+function runtimeClassName(obj) {
+  return obj && (obj._className || obj.type);
+}
+
 function assignArgsToLocals(locals, args, params, startIndex) {
   let localIndex = startIndex;
   for (let i = 0; i < params.length; i++) {
@@ -134,7 +138,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     };
   }
 
-  let currentClassName = boxedObj.type;
+  let currentClassName = runtimeClassName(boxedObj);
 
   // Handle arrays - they inherit from Object
   if (currentClassName && currentClassName.startsWith("[")) {
@@ -225,7 +229,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
 
   throw new Error(
-    `Unsupported invokevirtual: ${boxedObj?.type || typeof boxedObj}.${methodName}${descriptor}`,
+    `Unsupported invokevirtual: ${runtimeClassName(boxedObj) || typeof boxedObj}.${methodName}${descriptor}`,
   );
 }
 
@@ -270,12 +274,30 @@ async function invokestatic(frame, instruction, jvm, thread) {
     workspaceEntry = await jvm.loadClassByName(className);
   }
 
-  const method = jvm.findMethod(workspaceEntry, methodName, descriptor);
+  let resolvedClassName = className;
+  let resolvedClassData = workspaceEntry;
+  let method = null;
+
+  while (resolvedClassData) {
+    method = jvm.findMethod(resolvedClassData, methodName, descriptor);
+    if (method) {
+      resolvedClassName = resolvedClassData.ast.classes[0].className;
+      break;
+    }
+
+    const superClassName = resolvedClassData.ast.classes[0].superClassName;
+    if (!superClassName) {
+      break;
+    }
+
+    resolvedClassData = jvm.classes[superClassName] || await jvm.loadClassByName(superClassName);
+  }
+
   if (method) {
     // Validate that the method is actually static for invokestatic
     if (!method.flags || !method.flags.includes("static")) {
       throw new Error(
-        `IncompatibleClassChangeError: invokestatic called on non-static method ${className}.${methodName}${descriptor}`
+        `IncompatibleClassChangeError: invokestatic called on non-static method ${resolvedClassName}.${methodName}${descriptor}`
       );
     }
 
@@ -285,7 +307,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
     } else {
       // We found a bytecode method.
       const newFrame = new Frame(method);
-      newFrame.className = className; // Add className to the frame
+      newFrame.className = resolvedClassName; // Add className to the frame
       const { params } = parseDescriptor(descriptor);
       const args = [];
       for (let i = 0; i < params.length; i++) {
@@ -528,7 +550,8 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   // For regular interface implementations, treat like invokevirtual
-  const jreClass = jvm.jre[boxedObj.type];
+  const receiverClassName = runtimeClassName(boxedObj);
+  const jreClass = jvm.jre[receiverClassName];
   if (
     jreClass &&
     jreClass.methods &&
@@ -564,7 +587,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   // First check JRE methods
-  let currentClassName = boxedObj.type;
+  let currentClassName = receiverClassName;
   while (currentClassName) {
     let jreMethod = null;
     if (jvm.jre[currentClassName]) {
@@ -616,7 +639,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   }
 
   throw new Error(
-    `Unsupported invokeinterface: ${boxedObj.type}.${methodName}${descriptor}`,
+    `Unsupported invokeinterface: ${runtimeClassName(boxedObj)}.${methodName}${descriptor}`,
   );
 }
 
