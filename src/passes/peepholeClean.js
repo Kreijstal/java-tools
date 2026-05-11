@@ -9,6 +9,7 @@ function runPeepholeClean(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     protectedLoadBridges: 0,
+    loopProducerBridges: 0,
     duplicateLoopTails: 0,
     forwardLoopEntryClones: 0,
     invertedFallthroughGotos: 0,
@@ -34,18 +35,19 @@ function runPeepholeClean(astRoot, options = {}) {
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
     details.protectedLoadBridges += round.protectedLoadBridges;
+    details.loopProducerBridges += round.loopProducerBridges;
     details.duplicateLoopTails += round.duplicateLoopTails;
     details.forwardLoopEntryClones += round.forwardLoopEntryClones;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.duplicateLoopTails +
-      round.forwardLoopEntryClones + round.invertedFallthroughGotos + round.fallthroughGotos +
+    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.loopProducerBridges +
+      round.duplicateLoopTails + round.forwardLoopEntryClones + round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
     if (
-      round.nops + round.threadedBranches + round.protectedLoadBridges + round.duplicateLoopTails +
-      round.forwardLoopEntryClones + round.invertedFallthroughGotos + round.fallthroughGotos +
+      round.nops + round.threadedBranches + round.protectedLoadBridges + round.loopProducerBridges +
+      round.duplicateLoopTails + round.forwardLoopEntryClones + round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels === 0
     ) {
       break;
@@ -60,6 +62,7 @@ function cleanOneRound(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     protectedLoadBridges: 0,
+    loopProducerBridges: 0,
     duplicateLoopTails: 0,
     forwardLoopEntryClones: 0,
     invertedFallthroughGotos: 0,
@@ -71,6 +74,7 @@ function cleanOneRound(astRoot, options = {}) {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
     details.protectedLoadBridges += coalesceProtectedLoadBridges(code);
+    details.loopProducerBridges += coalesceLoopProducerBridges(code);
     details.duplicateLoopTails += coalesceDuplicateLoopTails(code);
     details.forwardLoopEntryClones += cloneForwardLoopEntryGotos(code);
     if (method && method.name === '<init>') {
@@ -203,6 +207,41 @@ function cloneForwardLoopEntryGotos(code) {
     codeItems.splice(i, 1, ...clone);
     changed += 1;
     break;
+  }
+
+  return changed;
+}
+
+function coalesceLoopProducerBridges(code) {
+  const codeItems = code.codeItems;
+  const labelIndex = buildLabelIndex(codeItems);
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || !isSimpleProducerInstruction(item.instruction)) continue;
+    const gotoIdx = nextInstructionIndex(codeItems, i + 1);
+    if (gotoIdx == null) continue;
+    const gotoInsn = codeItems[gotoIdx] && codeItems[gotoIdx].instruction;
+    if (getOpcode(gotoInsn) !== 'goto') continue;
+    if (hasInstructionBetween(codeItems, i + 1, gotoIdx)) continue;
+
+    const target = trimLabel(getInstructionArg(gotoInsn));
+    const targetIdx = labelIndex.get(target);
+    if (targetIdx == null || targetIdx <= gotoIdx) continue;
+
+    const producerIdx = previousInstructionIndex(codeItems, targetIdx - 1);
+    if (producerIdx == null || producerIdx <= gotoIdx) continue;
+    const producer = codeItems[producerIdx];
+    const producerLabel = trimLabel(producer && producer.labelDef);
+    if (!producerLabel || isLabelProtected(code, producerLabel)) continue;
+    if (!sameInstruction(item.instruction, producer.instruction)) continue;
+    if (nextInstructionIndex(codeItems, producerIdx + 1) !== targetIdx) continue;
+    if (!hasBackwardGotoToLabel(codeItems, labelIndex, producerLabel, targetIdx + 1)) continue;
+
+    item.instruction = { op: 'goto', arg: producerLabel };
+    removeInstructionOnly(codeItems, gotoIdx);
+    changed += 1;
   }
 
   return changed;
@@ -480,6 +519,17 @@ function hasFallthroughPredecessor(codeItems, labelIndex, label) {
   return false;
 }
 
+function hasBackwardGotoToLabel(codeItems, labelIndex, label, startIdx) {
+  const targetIdx = labelIndex.get(label);
+  if (targetIdx == null) return false;
+  for (let i = startIdx; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || getOpcode(item.instruction) !== 'goto') continue;
+    if (trimLabel(getInstructionArg(item.instruction)) === label && i > targetIdx) return true;
+  }
+  return false;
+}
+
 function findForwardLoopRange(codeItems, labelIndex, startIdx) {
   for (let i = startIdx + 1; i < codeItems.length; i += 1) {
     const item = codeItems[i];
@@ -612,6 +662,13 @@ function isSimpleLoadInstruction(instruction) {
     /^fload_\d$/.test(opcode || '') ||
     /^lload_\d$/.test(opcode || '') ||
     /^dload_\d$/.test(opcode || '');
+}
+
+function isSimpleProducerInstruction(instruction) {
+  const opcode = getOpcode(instruction);
+  if (typeof opcode !== 'string') return false;
+  if (isSimpleLoadInstruction(instruction)) return true;
+  return /^(aconst_null|iconst_m1|iconst_\d+|fconst_\d+|dconst_[01]|lconst_[01]|bipush|sipush|ldc|ldc_w|ldc2_w)(?:\s|$)/.test(opcode);
 }
 
 function sameInstruction(a, b) {
@@ -832,6 +889,7 @@ module.exports = {
   removeNops,
   threadBranchesThroughGoto,
   coalesceProtectedLoadBridges,
+  coalesceLoopProducerBridges,
   coalesceDuplicateLoopTails,
   cloneForwardLoopEntryGotos,
   invertConditionalOverGoto,
