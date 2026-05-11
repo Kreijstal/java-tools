@@ -131,6 +131,11 @@ async function buildSite() {
     const awtTarget = path.join(distDir, 'awt.js');
     copyFile(awtSource, awtTarget);
 
+    // Step 3.6: Copy browser audio backend to dist for browser injection
+    console.log('🔊 Copying WebAudio backend...');
+    const webAudioSource = path.join(srcDir, 'platform', 'web-audio.js');
+    const webAudioTarget = path.join(distDir, 'web-audio.js');
+    copyFile(webAudioSource, webAudioTarget);
 
     // Step 4: Process and enhance the debug web interface
     console.log('📄 Processing debug interface template...');

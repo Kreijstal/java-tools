@@ -16,6 +16,9 @@
     
     <!-- Include AWT framework for browser-based AWT support -->
     <script src="../dist/awt.js"></script>
+
+    <!-- Include WebAudio backend for browser-based javax.sound support -->
+    <script src="../dist/web-audio.js"></script>
     <style>
         body {
             font-family: 'Courier New', monospace;
@@ -529,6 +532,7 @@
         <div class="debug-row is-hidden">
             <div class="debug-controls">
                 <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>▶️</button>
+                <button onclick="pauseExecution()" id="pauseBtn" title="Pause" disabled>⏸</button>
                 <button onclick="stepOver()" id="stepOverBtn" title="Step Over (F10)" disabled>↷</button>
                 <button onclick="stepInto()" id="stepIntoBtn" title="Step Into (F11)" disabled>↪️</button>
                 <button onclick="stepOut()" id="stepOutBtn" title="Step Out (Shift+F11)" disabled>↩️</button>
@@ -725,6 +729,8 @@
             document.getElementById('stepOverBtn').disabled = !isPaused;
             document.getElementById('stepOutBtn').disabled = !isPaused;
             document.getElementById('continueBtn').disabled = !isPaused;
+            const pauseBtn = document.getElementById('pauseBtn');
+            if (pauseBtn) pauseBtn.disabled = !isRunning;
             document.getElementById('finishBtn').disabled = !isPaused;
             document.getElementById('debugBtn').disabled = !hasLoadedClass || isPaused || isRunning;
         }
@@ -876,6 +882,10 @@
         
         // Mock continue function - should throw error as specified in problem statement  
         function continue_() {
+            throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
+        }
+
+        function pauseExecution() {
             throw new Error('Mock debug functionality removed - this should not be used. Use the real debug controller integration instead.');
         }
         

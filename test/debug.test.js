@@ -112,9 +112,30 @@ test('Debug Controller Step Operations', async (t) => {
   t.end();
 });
 
+test('Debug Controller Pause Operation', async (t) => {
+  const controller = new DebugController({ classpath: 'sources' });
+
+  try {
+    await controller.start('VerySimple');
+    controller.executionState = 'running';
+    controller.jvm.debugManager.resume();
+
+    const result = controller.pause();
+
+    t.equal(result.status, 'paused', 'Pause should return paused status');
+    t.equal(controller.executionState, 'paused', 'Controller should be paused');
+    t.equal(controller.jvm.debugManager.isPaused, true, 'JVM debug manager should be paused');
+    t.equal(controller.jvm.debugManager.runMode, 'paused', 'Run mode should be paused');
+  } catch (error) {
+    t.fail(`Debug pause test failed: ${error.message}`);
+  }
+
+  t.end();
+});
+
 test('Debug API Error Handling', async (t) => {
   const controller = new DebugController({ classpath: 'sources' });
-  t.plan(3);
+  t.plan(4);
   
   // Test operations on non-paused debugger
   try {
@@ -129,6 +150,13 @@ test('Debug API Error Handling', async (t) => {
     t.fail('Should throw error when continuing non-paused debugger');
   } catch (error) {
     t.ok(error.message.includes('execution is not paused'), 'Should throw appropriate error');
+  }
+
+  try {
+    controller.pause();
+    t.fail('Should throw error when pausing non-running debugger');
+  } catch (error) {
+    t.ok(error.message.includes('execution is not running'), 'Should throw appropriate error');
   }
 
   // Test loading invalid class
