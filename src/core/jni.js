@@ -203,11 +203,15 @@ class JNI {
     this.registerNativeMethod('java/lang/Thread', 'currentThread', '()Ljava/lang/Thread;',
       (jniEnv) => {
         const currentThread = jniEnv.jvm.threads[jniEnv.jvm.currentThreadIndex];
-        return {
-          type: 'java/lang/Thread',
-          nativeThread: currentThread,
-          id: currentThread.id
-        };
+        if (!currentThread.javaThread) {
+          currentThread.javaThread = {
+            type: 'java/lang/Thread',
+            nativeThread: currentThread,
+            id: currentThread.id,
+            hashCode: jniEnv.jvm.nextHashCode++,
+          };
+        }
+        return currentThread.javaThread;
       });
 
     if (this.verbose) {
