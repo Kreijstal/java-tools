@@ -9,15 +9,6 @@ function runtimeClassName(obj) {
   return obj && (obj._className || obj.type);
 }
 
-function isJavaPlatformClass(className) {
-  return typeof className === "string" && (
-    className.startsWith("java/") ||
-    className.startsWith("javax/") ||
-    className.startsWith("sun/") ||
-    className.startsWith("com/sun/")
-  );
-}
-
 function assignArgsToLocals(locals, args, params, startIndex) {
   let localIndex = startIndex;
   for (let i = 0; i < params.length; i++) {
@@ -210,14 +201,15 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
 
     let classData = jvm.classes[currentClassName];
-    if (classData && classData.isJreStub && !isJavaPlatformClass(currentClassName)) {
+    const isKnownJreClass = !!jvm.jre[currentClassName];
+    if (classData && classData.isJreStub && !isKnownJreClass) {
       const loadedClassData = await jvm.loadClassByName(currentClassName);
       if (loadedClassData && !loadedClassData.isJreStub) {
         classData = loadedClassData;
       }
     }
     if (!classData) {
-      if (jvm.jre[currentClassName] && isJavaPlatformClass(currentClassName)) {
+      if (isKnownJreClass) {
         break; // Platform JRE shims are runtime-only.
       }
       classData = await jvm.loadClassByName(currentClassName);
@@ -373,14 +365,15 @@ async function invokespecial(frame, instruction, jvm, thread) {
 
   // For user-defined methods (constructors, private methods, super calls)
   let workspaceEntry = jvm.classes[className];
-  if (workspaceEntry && workspaceEntry.isJreStub && !isJavaPlatformClass(className)) {
+  const isKnownJreClass = !!jvm.jre[className];
+  if (workspaceEntry && workspaceEntry.isJreStub && !isKnownJreClass) {
     const loadedClassData = await jvm.loadClassByName(className);
     if (loadedClassData && !loadedClassData.isJreStub) {
       workspaceEntry = loadedClassData;
     }
   }
   if (!workspaceEntry) {
-    if (jvm.jre[className] && isJavaPlatformClass(className)) {
+    if (isKnownJreClass) {
       return;
     }
     // If class is not loaded, loading it.
@@ -413,11 +406,12 @@ async function invokespecial(frame, instruction, jvm, thread) {
     if (!superClassName) {
       break;
     }
-    if (jvm.jre[superClassName] && isJavaPlatformClass(superClassName)) {
+    const isKnownJreSuperClass = !!jvm.jre[superClassName];
+    if (isKnownJreSuperClass) {
       break;
     }
     resolvedClassData = jvm.classes[superClassName];
-    if (resolvedClassData && resolvedClassData.isJreStub && !isJavaPlatformClass(superClassName)) {
+    if (resolvedClassData && resolvedClassData.isJreStub && !isKnownJreSuperClass) {
       const loadedClassData = await jvm.loadClassByName(superClassName);
       if (loadedClassData && !loadedClassData.isJreStub) {
         resolvedClassData = loadedClassData;
@@ -683,14 +677,15 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     }
 
     let classData = jvm.classes[currentClassName];
-    if (classData && classData.isJreStub && !isJavaPlatformClass(currentClassName)) {
+    const isKnownJreClass = !!jvm.jre[currentClassName];
+    if (classData && classData.isJreStub && !isKnownJreClass) {
       const loadedClassData = await jvm.loadClassByName(currentClassName);
       if (loadedClassData && !loadedClassData.isJreStub) {
         classData = loadedClassData;
       }
     }
     if (!classData) {
-      if (jvm.jre[currentClassName] && isJavaPlatformClass(currentClassName)) {
+      if (isKnownJreClass) {
         break; // Platform JRE shims are runtime-only.
       }
       classData = await jvm.loadClassByName(currentClassName);
