@@ -350,6 +350,10 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   for (const [key, writes] of writesByField) {
     for (const write of writes) {
+      if (writeDependsOnSameField(write.codeItems, write.index, key, candidates)) {
+        rejected.add(key);
+        continue;
+      }
       const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
       if (!guard) {
         rejected.add(key);
@@ -390,7 +394,7 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   const consumerFields = collectSentinelConsumerFields(astRoot, candidates);
   const fields = [...candidates.keys()]
-    .filter((key) => !rejected.has(key) && consumerFields.has(key))
+    .filter((key) => !rejected.has(key) && (candidates.get(key).desc === 'I' || consumerFields.has(key)))
     .sort();
   return { fields, rejected: [...rejected].sort(), dependencies: deps };
 }
@@ -519,14 +523,14 @@ function findConsumedFieldsInMethod(codeItems, candidates) {
   for (const key of candidates.keys()) {
     const { bindingDetails } = findEntryStoreSites(codeItems, new Set([key]), { allowIntFlags: true });
     for (const binding of bindingDetails) {
-      if (hasFlatIloadBranchConsumer(codeItems, binding.local)) out.add(key);
+      if (hasFlatIloadBranchConsumer(codeItems, binding.local, candidates)) out.add(key);
     }
-    if (hasDirectStaticBranchConsumer(codeItems, key)) out.add(key);
+    if (hasDirectStaticBranchConsumer(codeItems, key, candidates)) out.add(key);
   }
   return out;
 }
 
-function hasDirectStaticBranchConsumer(codeItems, key) {
+function hasDirectStaticBranchConsumer(codeItems, key, candidates) {
   for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     if (!item || !item.instruction || getOp(item.instruction) !== 'getstatic') continue;
@@ -537,12 +541,12 @@ function hasDirectStaticBranchConsumer(codeItems, key) {
     if (j >= codeItems.length) continue;
     if (codeItems[j] && codeItems[j].labelDef && !codeItems[j].instruction) continue;
     const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
-    if (nextOp === 'ifeq' || nextOp === 'ifne') return true;
+    if ((nextOp === 'ifeq' || nextOp === 'ifne') && !guardsCandidateWrite(codeItems, j, candidates)) return true;
   }
   return false;
 }
 
-function hasFlatIloadBranchConsumer(codeItems, local) {
+function hasFlatIloadBranchConsumer(codeItems, local, candidates) {
   for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     if (!item || !item.instruction) continue;
@@ -554,7 +558,24 @@ function hasFlatIloadBranchConsumer(codeItems, local) {
     if (j >= codeItems.length) continue;
     if (codeItems[j] && codeItems[j].labelDef && !codeItems[j].instruction) continue;
     const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
-    if (nextOp === 'ifeq' || nextOp === 'ifne') return true;
+    if ((nextOp === 'ifeq' || nextOp === 'ifne') && !guardsCandidateWrite(codeItems, j, candidates)) return true;
+  }
+  return false;
+}
+
+function guardsCandidateWrite(codeItems, ifIdx, candidates) {
+  const insn = codeItems[ifIdx] && codeItems[ifIdx].instruction;
+  const target = trimLabel(getArg(insn));
+  if (!target) return false;
+  const targetIdx = collectLabelIndices(codeItems).get(target);
+  if (targetIdx == null) return false;
+  const start = Math.min(ifIdx, targetIdx) + 1;
+  const end = Math.max(ifIdx, targetIdx);
+  for (let i = start; i < end; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || getOp(item.instruction) !== 'putstatic') continue;
+    const ref = fieldRefOf(getArg(item.instruction));
+    if (ref && candidates.has(fieldKey(ref))) return true;
   }
   return false;
 }
