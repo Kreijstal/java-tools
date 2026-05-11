@@ -48,7 +48,7 @@ test('splits int local range used as array index loop after sibling branch store
   t.equal(code.locals, '7');
   t.deepEqual(code.codeItems[8].instruction, { op: 'istore', arg: '6' });
   t.deepEqual(code.codeItems[9].instruction, { op: 'iload', arg: '6' });
-  t.deepEqual(code.codeItems[10].instruction, { op: 'istore', arg: '6' });
+  t.equal(code.codeItems[10].instruction, 'istore_3');
   t.deepEqual(code.codeItems[13].instruction, { op: 'iload', arg: '6' });
   t.deepEqual(code.codeItems[16].instruction, { op: 'iload', arg: '6' });
   t.deepEqual(code.codeItems[24].instruction, { op: 'iload', arg: '6' });
