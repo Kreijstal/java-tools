@@ -8,6 +8,7 @@ function runPeepholeClean(astRoot, options = {}) {
     rethrowHandlers: 0,
     nops: 0,
     threadedBranches: 0,
+    invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
     unusedLabels: 0,
@@ -29,13 +30,14 @@ function runPeepholeClean(astRoot, options = {}) {
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
+    details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.threadedBranches + round.fallthroughGotos +
+    changes += round.nops + round.threadedBranches + round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
     if (
-      round.nops + round.threadedBranches + round.fallthroughGotos +
+      round.nops + round.threadedBranches + round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels === 0
     ) {
       break;
@@ -49,13 +51,18 @@ function cleanOneRound(astRoot, options = {}) {
   const details = {
     nops: 0,
     threadedBranches: 0,
+    invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
     unusedLabels: 0,
   };
-  forEachCode(astRoot, (code) => {
+  forEachCode(astRoot, (code, method) => {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
+    if (method && method.name === '<init>') {
+      details.invertedFallthroughGotos += invertConditionalOverGoto(code);
+      details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
+    }
     details.fallthroughGotos += removeSingleUseFallthroughGotos(code);
     if (options.removeUnreachableCode !== false) {
       details.unreachableInstructions += removeUnreachableAfterTerminal(code);
@@ -132,6 +139,29 @@ function removeSingleUseFallthroughGotos(code) {
   return removed;
 }
 
+function invertConditionalOverGoto(code) {
+  let changed = 0;
+  const codeItems = code.codeItems;
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = getOpcode(item && item.instruction);
+    const inverse = INVERSE_CONDITIONALS[opcode];
+    if (!inverse) continue;
+    const bodyLabel = trimLabel(getInstructionArg(item.instruction));
+    if (!bodyLabel) continue;
+    const gotoIndex = nextInstructionIndex(codeItems, i + 1);
+    if (gotoIndex == null || getOpcode(codeItems[gotoIndex] && codeItems[gotoIndex].instruction) !== 'goto') continue;
+    const exitLabel = trimLabel(getInstructionArg(codeItems[gotoIndex].instruction));
+    if (!exitLabel || exitLabel === bodyLabel) continue;
+    if (findNextLabel(codeItems, gotoIndex + 1) !== bodyLabel) continue;
+    if (isLabelProtected(code, bodyLabel) || isLabelProtected(code, exitLabel)) continue;
+    item.instruction = { op: inverse, arg: exitLabel };
+    removeInstructionOnly(codeItems, gotoIndex);
+    changed += 1;
+  }
+  return changed;
+}
+
 function removeUnreachableAfterTerminal(code) {
   const codeItems = code.codeItems;
   const used = collectControlFlowLabels(code);
@@ -149,6 +179,28 @@ function removeUnreachableAfterTerminal(code) {
     }
   }
 
+  return removed;
+}
+
+function removeUnreachableUntilUsedLabel(code) {
+  const codeItems = code.codeItems;
+  const used = collectControlFlowLabels(code);
+  let removed = 0;
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || !isTerminalOpcode(getOpcode(item.instruction))) continue;
+    let end = i;
+    for (let j = i + 1; j < codeItems.length; j += 1) {
+      const next = codeItems[j];
+      if (next && next.labelDef && used.has(trimLabel(next.labelDef))) break;
+      end = j;
+    }
+    if (end <= i) continue;
+    for (let j = end; j > i; j -= 1) {
+      if (codeItems[j] && codeItems[j].instruction) removed += 1;
+      codeItems.splice(j, 1);
+    }
+  }
   return removed;
 }
 
@@ -343,6 +395,13 @@ function findNextLabel(codeItems, startIndex) {
   return null;
 }
 
+function nextInstructionIndex(codeItems, startIndex) {
+  for (let i = startIndex; i < codeItems.length; i += 1) {
+    if (codeItems[i] && codeItems[i].instruction) return i;
+  }
+  return null;
+}
+
 function getInstructionArg(instruction) {
   return instruction && typeof instruction === 'object' ? instruction.arg : null;
 }
@@ -369,11 +428,32 @@ function trimLabel(label) {
   return label.endsWith(':') ? label.slice(0, -1) : label;
 }
 
+const INVERSE_CONDITIONALS = {
+  ifeq: 'ifne',
+  ifne: 'ifeq',
+  iflt: 'ifge',
+  ifge: 'iflt',
+  ifgt: 'ifle',
+  ifle: 'ifgt',
+  if_icmpeq: 'if_icmpne',
+  if_icmpne: 'if_icmpeq',
+  if_icmplt: 'if_icmpge',
+  if_icmpge: 'if_icmplt',
+  if_icmpgt: 'if_icmple',
+  if_icmple: 'if_icmpgt',
+  if_acmpeq: 'if_acmpne',
+  if_acmpne: 'if_acmpeq',
+  ifnull: 'ifnonnull',
+  ifnonnull: 'ifnull',
+};
+
 module.exports = {
   runPeepholeClean,
   removeNops,
   threadBranchesThroughGoto,
+  invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
+  removeUnreachableUntilUsedLabel,
   removeSingleUseFallthroughGotos,
   removeUnusedLabels,
 };

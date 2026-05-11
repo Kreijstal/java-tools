@@ -29,9 +29,11 @@ function rewriteCode(code) {
       const branchOp = op(branch);
       if (branchOp !== 'if_icmpeq' && branchOp !== 'if_icmpne') continue;
       if (overlapsProtectedRange(i, lenIndex + 3, protectedRanges)) continue;
+      const valueItems = items.slice(i + 1, lenIndex + 1);
+      if (!isStringLengthReceiverChain(valueItems)) continue;
       if (!canMoveValueItems(items, i + 1, lenIndex, used)) continue;
       if (!canRemoveItems(items, i, i, used) || !canRemoveItems(items, lenIndex + 1, lenIndex + 2, used)) continue;
-      const moved = items.slice(i + 1, lenIndex + 1).map((item, offset) =>
+      const moved = valueItems.map((item, offset) =>
         cloneItem(item, offset === 0 ? items[i] : item));
       items.splice(
         i,
@@ -46,6 +48,16 @@ function rewriteCode(code) {
     }
   }
   return rewrites;
+}
+
+function isStringLengthReceiverChain(items) {
+  if (items.length < 2 || !isStringLength(items[items.length - 1])) return false;
+  const firstOp = op(items[0]);
+  if (firstOp !== 'aload' && !/^aload_[0-3]$/.test(firstOp || '') && firstOp !== 'getstatic') return false;
+  for (let i = 1; i < items.length - 1; i += 1) {
+    if (op(items[i]) !== 'getfield') return false;
+  }
+  return true;
 }
 
 function collectProtectedRanges(code) {
