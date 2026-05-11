@@ -14,6 +14,13 @@ class JitCompiler {
     this.deoptedMethods = new WeakSet();
     this.invocationCounts = new WeakMap();
     this.warmupThreshold = options.warmupThreshold ?? 2;
+    this.codegenEnabled = options.codegen !== false;
+    this.codegenCache = new WeakMap();
+    this.codegenSupportCache = new WeakMap();
+    this.codegenUnavailable = false;
+    this.codegenCompileErrors = new WeakMap();
+    this.generatedRunCount = 0;
+    this.runnerRunCount = 0;
   }
 
   canRun(frame) {
@@ -26,7 +33,11 @@ class JitCompiler {
     if (this.deoptedMethods.has(frame.method)) {
       return false;
     }
-    if (this.jvm.debugManager.debugMode) {
+    const debug = this.jvm.debugManager;
+    if (debug.debugMode && debug.runMode !== "continuing") {
+      return false;
+    }
+    if (debug.isClassJitDeopted(this.getFrameClassName(frame))) {
       return false;
     }
     const count = (this.invocationCounts.get(frame.method) || 0) + 1;
@@ -44,7 +55,10 @@ class JitCompiler {
 
     this.runningFrames.add(frame);
     try {
-      const result = await this.runFrame(frame, thread);
+      const generated = this.getGeneratedFunction(frame.method);
+      const result = generated
+        ? await this.runGeneratedFrame(generated, frame, thread)
+        : await this.runFrame(frame, thread);
       if (result && result.deopt) {
         this.lastDeoptReason = result.reason;
         this.deoptedMethods.add(frame.method);
@@ -57,6 +71,28 @@ class JitCompiler {
     } finally {
       this.runningFrames.delete(frame);
     }
+  }
+
+  getGeneratedFunction(method) {
+    if (!this.codegenEnabled || this.codegenUnavailable || !this.isCodegenSupported(method)) {
+      return null;
+    }
+    if (this.codegenCache.has(method)) {
+      return this.codegenCache.get(method);
+    }
+    try {
+      const generated = this.compileMethod(method);
+      this.codegenCache.set(method, generated);
+      return generated;
+    } catch (err) {
+      this.codegenCompileErrors.set(method, err);
+      return null;
+    }
+  }
+
+  async runGeneratedFrame(generated, frame, thread) {
+    this.generatedRunCount += 1;
+    return generated(frame, thread, this);
   }
 
   isSupported(method) {
@@ -116,6 +152,55 @@ class JitCompiler {
     return supported;
   }
 
+  isCodegenSupported(method) {
+    if (this.codegenSupportCache.has(method)) {
+      return this.codegenSupportCache.get(method);
+    }
+
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code) {
+      this.codegenSupportCache.set(method, false);
+      return false;
+    }
+
+    const codeItems = code.code.codeItems;
+    const supportedOps = new Set([
+      "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
+      "areturn", "astore", "astore_0", "astore_1", "astore_2", "astore_3",
+      "aaload", "aastore", "arraylength", "bastore", "baload",
+      "bipush", "d2i", "dadd", "daload", "dastore", "dcmpg", "dcmpl",
+      "dconst_0", "dconst_1", "ddiv", "dload", "dload_0", "dload_1",
+      "dload_2", "dload_3", "dmul", "dneg", "dreturn", "dstore",
+      "dstore_0", "dstore_1", "dstore_2", "dstore_3", "dsub", "dup",
+      "goto", "i2d", "iadd", "iaload", "iastore", "idiv",
+      "iconst_0", "iconst_1", "iconst_2", "iconst_3", "iconst_4", "iconst_5",
+      "ifeq", "ifge", "ifgt", "if_icmpeq", "if_icmpge", "if_icmpgt",
+      "if_icmplt", "if_icmpne", "ifle", "iflt", "ifne", "ifnonnull",
+      "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
+      "imul", "iinc", "istore", "istore_0", "istore_1", "istore_2",
+      "istore_3", "isub", "ldc", "ldc2_w", "newarray", "pop", "return",
+      "sipush",
+    ]);
+
+    const hasNumericHotPath = codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op && (
+        op.startsWith("d")
+        || op === "i2d"
+        || op === "idiv"
+        || op === "imul"
+        || (op === "newarray" && item.instruction.arg === "double")
+      );
+    });
+    const supported = hasNumericHotPath && codeItems.every((item) => {
+      const op = getOp(item && item.instruction);
+      return !op || supportedOps.has(op);
+    });
+
+    this.codegenSupportCache.set(method, supported);
+    return supported;
+  }
+
   isSimpleConstructor(method, codeItems) {
     if (method.name !== "<init>") {
       return false;
@@ -160,13 +245,27 @@ class JitCompiler {
     frame.pc = pc;
   }
 
+  getFrameClassName(frame) {
+    if (!frame) {
+      return null;
+    }
+    return frame.className || (
+      typeof this.jvm.findClassNameForMethod === "function"
+        ? this.jvm.findClassNameForMethod(frame.method)
+        : null
+    );
+  }
+
   shouldDeopt(frame, pc) {
     if (this.safePoints !== "bytecode") {
       return false;
     }
     const debug = this.jvm.debugManager;
-    if (debug.debugMode) {
+    if (debug.debugMode && debug.runMode !== "continuing") {
       return true;
+    }
+    if (debug.hasLocatedBreakpoints() && !debug.isClassJitDeopted(this.getFrameClassName(frame))) {
+      return false;
     }
     if (debug.breakpoints.size === 0) {
       return false;
@@ -187,7 +286,171 @@ class JitCompiler {
     return index;
   }
 
+  compileMethod(method) {
+    const AsyncFunction = getAsyncFunctionConstructor();
+    if (!AsyncFunction) {
+      this.codegenUnavailable = true;
+      return null;
+    }
+
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const codeItems = code.code.codeItems;
+    this.compileLabelMap = buildLabelMap(codeItems);
+    const body = [
+      '"use strict";',
+      "const locals = frame.locals;",
+      "const stack = frame.stack.items;",
+      "let pc = frame.pc;",
+      `while (pc < ${codeItems.length}) {`,
+      "if (helpers.shouldDeopt(frame, pc)) { helpers.materialize(frame, locals, stack, pc); return { deopt: true }; }",
+      "switch (pc) {",
+    ];
+
+    try {
+      codeItems.forEach((item, index) => {
+        body.push(`case ${index}:`);
+        const instruction = item.instruction;
+        if (!instruction) {
+          body.push(`pc = ${index + 1}; break;`);
+          return;
+        }
+        body.push(`helpers.materialize(frame, locals, stack, ${index});`);
+        body.push(this.emitInstruction(instruction, index));
+      });
+    } finally {
+      this.compileLabelMap = null;
+    }
+
+    body.push("default: helpers.materialize(frame, locals, stack, pc); return { deopt: true, reason: 'invalid generated pc ' + pc };");
+    body.push("}");
+    body.push("}");
+    body.push("helpers.materialize(frame, locals, stack, pc);");
+    body.push("thread.callStack.pop();");
+    body.push("return { returned: true, value: helpers.returnVoid() };");
+
+    try {
+      return new AsyncFunction("frame", "thread", "helpers", body.join("\n"));
+    } catch (err) {
+      if (err && err.name === "EvalError") {
+        this.codegenUnavailable = true;
+      }
+      throw err;
+    }
+  }
+
+  emitInstruction(instruction, index) {
+    const op = getOp(instruction);
+    const next = index + 1;
+    const goNext = `pc = ${next}; break;`;
+    const target = (label) => this.targetInstructionIndex(instruction, label);
+    const localIndex = (fallback) => Number(instruction.arg ?? fallback);
+
+    switch (op) {
+      case "aconst_null": return `stack.push(null); ${goNext}`;
+      case "aload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
+      case "aload_0": return `stack.push(locals[0]); ${goNext}`;
+      case "aload_1": return `stack.push(locals[1]); ${goNext}`;
+      case "aload_2": return `stack.push(locals[2]); ${goNext}`;
+      case "aload_3": return `stack.push(locals[3]); ${goNext}`;
+      case "iload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
+      case "iload_0": return `stack.push(locals[0]); ${goNext}`;
+      case "iload_1": return `stack.push(locals[1]); ${goNext}`;
+      case "iload_2": return `stack.push(locals[2]); ${goNext}`;
+      case "iload_3": return `stack.push(locals[3]); ${goNext}`;
+      case "dload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
+      case "dload_0": return `stack.push(locals[0]); ${goNext}`;
+      case "dload_1": return `stack.push(locals[1]); ${goNext}`;
+      case "dload_2": return `stack.push(locals[2]); ${goNext}`;
+      case "dload_3": return `stack.push(locals[3]); ${goNext}`;
+      case "astore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
+      case "astore_0": return `locals[0] = stack.pop(); ${goNext}`;
+      case "astore_1": return `locals[1] = stack.pop(); ${goNext}`;
+      case "astore_2": return `locals[2] = stack.pop(); ${goNext}`;
+      case "astore_3": return `locals[3] = stack.pop(); ${goNext}`;
+      case "istore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
+      case "istore_0": return `locals[0] = stack.pop(); ${goNext}`;
+      case "istore_1": return `locals[1] = stack.pop(); ${goNext}`;
+      case "istore_2": return `locals[2] = stack.pop(); ${goNext}`;
+      case "istore_3": return `locals[3] = stack.pop(); ${goNext}`;
+      case "dstore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
+      case "dstore_0": return `locals[0] = stack.pop(); ${goNext}`;
+      case "dstore_1": return `locals[1] = stack.pop(); ${goNext}`;
+      case "dstore_2": return `locals[2] = stack.pop(); ${goNext}`;
+      case "dstore_3": return `locals[3] = stack.pop(); ${goNext}`;
+      case "iconst_0": return `stack.push(0); ${goNext}`;
+      case "iconst_1": return `stack.push(1); ${goNext}`;
+      case "iconst_2": return `stack.push(2); ${goNext}`;
+      case "iconst_3": return `stack.push(3); ${goNext}`;
+      case "iconst_4": return `stack.push(4); ${goNext}`;
+      case "iconst_5": return `stack.push(5); ${goNext}`;
+      case "dconst_0": return `stack.push(0.0); ${goNext}`;
+      case "dconst_1": return `stack.push(1.0); ${goNext}`;
+      case "bipush":
+      case "sipush": return `stack.push(${Number(instruction.arg)}); ${goNext}`;
+      case "ldc":
+      case "ldc2_w": return `stack.push(helpers.constantValue(${JSON.stringify(instruction.arg)})); ${goNext}`;
+      case "dup": return `stack.push(stack[stack.length - 1]); ${goNext}`;
+      case "pop": return `stack.pop(); ${goNext}`;
+      case "iadd": return `stack.push(stack.pop() + stack.pop()); ${goNext}`;
+      case "isub": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a - b); } ${goNext}`;
+      case "imul": return `stack.push(stack.pop() * stack.pop()); ${goNext}`;
+      case "idiv": return `{ const b = stack.pop(); const a = stack.pop(); if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push(Math.floor(a / b)); } ${goNext}`;
+      case "dadd": return `stack.push(stack.pop() + stack.pop()); ${goNext}`;
+      case "dsub": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a - b); } ${goNext}`;
+      case "dmul": return `stack.push(stack.pop() * stack.pop()); ${goNext}`;
+      case "ddiv": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a / b); } ${goNext}`;
+      case "dneg": return `stack.push(-stack.pop()); ${goNext}`;
+      case "i2d": return goNext;
+      case "d2i": return `stack.push(Math.trunc(stack.pop()) | 0); ${goNext}`;
+      case "iinc": return `locals[${Number(instruction.varnum)}] += ${Number(instruction.incr)}; ${goNext}`;
+      case "dcmpg": return `stack.push(helpers.compareDouble(stack.pop(), stack.pop(), 1)); ${goNext}`;
+      case "dcmpl": return `stack.push(helpers.compareDouble(stack.pop(), stack.pop(), -1)); ${goNext}`;
+      case "newarray": return `stack.push(helpers.newPrimitiveArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
+      case "arraylength": return `stack.push(helpers.arrayLength(stack.pop(), frame)); ${goNext}`;
+      case "aaload":
+      case "iaload":
+      case "daload":
+      case "baload": return `stack.push(helpers.arrayLoad(stack.pop(), stack.pop(), frame)); ${goNext}`;
+      case "aastore":
+      case "iastore":
+      case "dastore":
+      case "bastore": return `helpers.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); ${goNext}`;
+      case "goto": return `pc = ${target(instruction.arg)}; break;`;
+      case "ifeq": return `if (stack.pop() === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifne": return `if (stack.pop() !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "iflt": return `if (stack.pop() < 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifge": return `if (stack.pop() >= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifgt": return `if (stack.pop() > 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifle": return `if (stack.pop() <= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifnull": return `if (stack.pop() === null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifnonnull": return `if (stack.pop() !== null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "if_icmpeq": return `{ const b = stack.pop(); const a = stack.pop(); if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpne": return `{ const b = stack.pop(); const a = stack.pop(); if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmplt": return `{ const b = stack.pop(); const a = stack.pop(); if (a < b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpge": return `{ const b = stack.pop(); const a = stack.pop(); if (a >= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpgt": return `{ const b = stack.pop(); const a = stack.pop(); if (a > b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "return":
+        return `helpers.materialize(frame, locals, stack, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
+      case "areturn":
+      case "ireturn":
+      case "dreturn":
+        return `{ const ret = stack.pop(); helpers.materialize(frame, locals, stack, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
+      default:
+        return `helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
+    }
+  }
+
+  targetInstructionIndex(instruction, label) {
+    const labels = this.compileLabelMap;
+    const index = labels && labels.get(label);
+    if (index === undefined) {
+      throw new Error(`Label ${label} not found`);
+    }
+    return index;
+  }
+
   async runFrame(frame, thread) {
+    this.runnerRunCount += 1;
     const locals = frame.locals;
     const stack = frame.stack.items;
     const instructions = frame.instructions;
@@ -207,6 +470,7 @@ class JitCompiler {
       }
 
       const op = typeof instruction === "string" ? instruction : instruction.op;
+      this.materialize(frame, locals, stack, pc - 1);
       switch (op) {
         case "aconst_null": stack.push(null); break;
         case "aload": stack.push(locals[Number(instruction.arg)]); break;
@@ -334,6 +598,14 @@ class JitCompiler {
     this.materialize(frame, locals, stack, pc);
     thread.callStack.pop();
     return { returned: true, value: RETURN_VOID };
+  }
+
+  returnVoid() {
+    return RETURN_VOID;
+  }
+
+  compareDouble(value2, value1, nanValue) {
+    return compareDouble(value2, value1, nanValue);
   }
 
   constantValue(arg) {
@@ -581,6 +853,30 @@ function primitiveArrayType(type) {
     case "long": return "[J";
     case "int":
     default: return "[I";
+  }
+}
+
+function getOp(instruction) {
+  if (!instruction) return null;
+  return typeof instruction === "string" ? instruction : instruction.op;
+}
+
+function buildLabelMap(codeItems) {
+  const labels = new Map();
+  codeItems.forEach((item, index) => {
+    if (item && item.labelDef) {
+      const label = item.labelDef.endsWith(":") ? item.labelDef.slice(0, -1) : item.labelDef;
+      labels.set(label, index);
+    }
+  });
+  return labels;
+}
+
+function getAsyncFunctionConstructor() {
+  try {
+    return Object.getPrototypeOf(async function generatedProbe() {}).constructor;
+  } catch (_) {
+    return null;
   }
 }
 

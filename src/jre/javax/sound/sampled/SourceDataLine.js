@@ -1,45 +1,26 @@
-const disableNativeAudio =
-  process.env.JVM_DISABLE_AUDIO === '1' ||
-  process.env.JVM_DISABLE_AUDIO === 'true';
+const { createAudioOutput } = require('../../../../platform/audio');
 const { withThrows } = require('../../../helpers');
 
-let Speaker;
-if (!disableNativeAudio) {
-  try {
-    Speaker = require("speaker");
-  } catch (err) {
-    // Fallback for environments where speaker package is not available
-    // console.warn("Speaker package not available, audio output disabled");
-    Speaker = class MockSpeaker {
-      constructor(options) {
-        this.options = options;
-      }
-      write(data) {
-        // Mock write - do nothing
-      }
-      end() {
-        // Mock end - do nothing
-      }
-      once(event, callback) {
-        if (event === "drain") {
-          setTimeout(callback, 0);
-        }
-      }
-    };
-  }
-} else {
-  Speaker = class MockSpeaker {
-    constructor(options) {
-      this.options = options;
-    }
-    write(data) {}
-    end() {}
-    once(event, callback) {
-      if (event === "drain") {
-        setTimeout(callback, 0);
-      }
-    }
+function getFormatFields(format) {
+  return format.fields["javax/sound/sampled/AudioFormat"];
+}
+
+function toOutputOptions(formatFields) {
+  return {
+    channels: formatFields.channels || 1,
+    bitDepth: formatFields.sampleSizeInBits || 16,
+    sampleRate: formatFields.sampleRate || 44100,
+    signed: formatFields.signed !== undefined ? formatFields.signed : true,
+    bigEndian: formatFields.bigEndian !== undefined ? formatFields.bigEndian : false,
   };
+}
+
+function toAudioBytes(buffer, offset, len) {
+  const slice = buffer.slice(offset, offset + len);
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(slice);
+  }
+  return new Uint8Array(slice);
 }
 
 module.exports = {
@@ -47,18 +28,10 @@ module.exports = {
   methods: {
     "open(Ljavax/sound/sampled/AudioFormat;)V": withThrows((jvm, obj, args) => {
       const [format] = args;
-      const formatFields = format.fields["javax/sound/sampled/AudioFormat"];
+      const formatFields = getFormatFields(format);
 
       try {
-        const speaker = new Speaker({
-          channels: formatFields.channels || 1,
-          bitDepth: formatFields.sampleSizeInBits || 16,
-          sampleRate: formatFields.sampleRate || 44100,
-          signed:
-            formatFields.signed !== undefined ? formatFields.signed : true,
-        });
-
-        obj.speaker = speaker;
+        obj.audioOutput = createAudioOutput(toOutputOptions(formatFields));
         obj.isOpen = true;
       } catch (error) {
         console.error("Failed to open audio device:", error.message);
@@ -76,7 +49,7 @@ module.exports = {
     "write([BII)I": withThrows((jvm, obj, args) => {
       const [buffer, offset, len] = args;
 
-      if (!obj.speaker || !obj.isOpen) {
+      if (!obj.audioOutput || !obj.isOpen) {
         throw {
           type: "java/lang/IllegalStateException",
           message: "Line is not open",
@@ -84,8 +57,7 @@ module.exports = {
       }
 
       try {
-        const data = Buffer.from(buffer.slice(offset, offset + len));
-        obj.speaker.write(data);
+        obj.audioOutput.write(toAudioBytes(buffer, offset, len));
         return len;
       } catch (error) {
         console.error("Audio write error:", error.message);
@@ -100,33 +72,32 @@ module.exports = {
       return 4096;
     },
     "flush()V": (jvm, obj, args) => {
-      // Not implemented for speaker - data is sent immediately
+      // Data is sent immediately by the current audio outputs.
     },
     "start()V": (jvm, obj, args) => {
-      // Speaker starts automatically on first write
+      // Audio outputs start automatically on first write.
       obj.isStarted = true;
     },
     "stop()V": (jvm, obj, args) => {
-      // Not implemented - speaker continues until closed
       obj.isStarted = false;
     },
     "drain()V": async (jvm, obj, args) => {
-      if (!obj.speaker) {
+      if (!obj.audioOutput) {
         return;
       }
 
       await new Promise((resolve) => {
-        obj.speaker.once("drain", resolve);
+        obj.audioOutput.once("drain", resolve);
       });
     },
     "close()V": (jvm, obj, args) => {
-      if (obj.speaker) {
+      if (obj.audioOutput) {
         try {
-          obj.speaker.end();
+          obj.audioOutput.end();
         } catch (error) {
-          console.error("Error closing speaker:", error.message);
+          console.error("Error closing audio output:", error.message);
         }
-        obj.speaker = null;
+        obj.audioOutput = null;
       }
       obj.isOpen = false;
       obj.isStarted = false;

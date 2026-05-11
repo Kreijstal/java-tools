@@ -43,12 +43,22 @@ class DebugController {
       throw new Error('Cannot continue: execution is not paused');
     }
     this.executionState = 'running';
+    this.jvm.debugManager.setRunMode('continuing');
     const result = await this.jvm.execute();
     if (result.paused) {
       this.executionState = 'paused';
     } else {
       this.executionState = 'stopped';
     }
+    return { status: this.executionState, state: this.getCurrentState() };
+  }
+
+  pause() {
+    if (this.executionState !== 'running') {
+      throw new Error('Cannot pause: execution is not running');
+    }
+    this.jvm.debugManager.pause();
+    this.executionState = 'paused';
     return { status: this.executionState, state: this.getCurrentState() };
   }
 
@@ -84,7 +94,9 @@ class DebugController {
       }
     }
 
+    this.jvm.debugManager.setRunMode('stepping');
     const result = await this.jvm.executeTick();
+    this.jvm.debugManager.setRunMode('paused');
     if (result.completed) {
       this.executionState = 'stopped';
     }
@@ -130,12 +142,12 @@ class DebugController {
   }
 
   setBreakpoint(pc) {
-    this.jvm.debugManager.addBreakpoint(pc);
+    this.jvm.addBreakpoint(pc);
     return { status: 'breakpoint_set', pc: pc };
   }
 
   removeBreakpoint(pc) {
-    this.jvm.debugManager.removeBreakpoint(pc);
+    this.jvm.removeBreakpoint(pc);
     return { status: 'breakpoint_removed', pc: pc };
   }
 

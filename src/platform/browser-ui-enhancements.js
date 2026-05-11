@@ -12,6 +12,7 @@ const DOM_IDS = {
   SAMPLE_CLASS_SELECT: "sampleClassSelect",
   DISASSEMBLY_EDITOR: "disassembly-editor",
   STATE_FILE_INPUT: "stateFileInput",
+  PAUSE_BTN: "pauseBtn",
   OUTPUT: "output",
   STATUS: "status",
   STACK_DISPLAY: "stackDisplay",
@@ -693,6 +694,11 @@ function updateButtons() {
   const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
   /* HARDENED: Removed defensive check */
   runBtn.disabled = !hasLoadedClass || isPaused || isRunning;
+
+  const pauseBtn = document.getElementById(DOM_IDS.PAUSE_BTN);
+  if (pauseBtn) {
+    pauseBtn.disabled = !isRunning;
+  }
 
   // Step buttons should be enabled only when paused
   STEP_BUTTON_IDS.forEach((id) => {
@@ -1907,7 +1913,10 @@ function enhanceWithRealJVM() {
     if (!jvmDebug) {
       throw new Error("JVM not initialized - cannot continue");
     }
-    const result = await jvmDebug.continue();
+    updateState({ status: "running" });
+    const continuePromise = jvmDebug.continue();
+    updateButtons();
+    const result = await continuePromise;
     // Reduced verbosity: Only log in verbose mode
     // log('Continue completed', 'info');
     updateDebugDisplay();
@@ -1928,6 +1937,23 @@ function enhanceWithRealJVM() {
       updateStatus("Continue execution completed", "info");
     }
     return result;
+  };
+
+  window.pauseExecution = function () {
+    if (!jvmDebug) {
+      throw new Error("JVM not initialized - cannot pause");
+    }
+    try {
+      const result = jvmDebug.pause();
+      updateState({ status: "paused" });
+      updateDebugDisplay();
+      updateButtons();
+      updateStatus("Execution paused", "info");
+      return result;
+    } catch (error) {
+      logError("Failed to pause execution", error);
+      throw error;
+    }
   };
 
   window.finish = async function () {

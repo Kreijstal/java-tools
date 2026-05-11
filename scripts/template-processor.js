@@ -64,6 +64,9 @@ function addBrowserUIScript(htmlContent) {
     
     <!-- Include AWT framework for browser-based AWT support -->
     <script src="./awt.js"></script>
+
+    <!-- Include WebAudio backend for browser-based javax.sound support -->
+    <script src="./web-audio.js"></script>
     
     `;
     
@@ -83,6 +86,9 @@ function removeIncorrectScriptPaths(htmlContent) {
     
     // Remove the awt.js script with incorrect path
     htmlContent = htmlContent.replace(/\s*<!-- Include AWT framework for browser-based AWT support -->\s*<script src="\.\.\/dist\/awt\.js"><\/script>\s*/, '');
+
+    // Remove the web-audio.js script with incorrect path
+    htmlContent = htmlContent.replace(/\s*<!-- Include WebAudio backend for browser-based javax\.sound support -->\s*<script src="\.\.\/dist\/web-audio\.js"><\/script>\s*/, '');
     
     return htmlContent;
 }

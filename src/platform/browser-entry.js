@@ -10,6 +10,7 @@ const DebugController = require('../debug/debugController');
 const BrowserFileProvider = require('../io/BrowserFileProvider');
 const { setFileProvider } = require('../core/classLoader');
 const awtFramework = require('./awt');
+const audioPlatform = require('./audio');
 // const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
 // Browser-compatible JVM Debug API
@@ -140,6 +141,14 @@ class BrowserJVMDebug {
    */
   continue() {
     return this.debugController.continue();
+  }
+
+  /**
+   * Pause execution
+   * @returns {object} - Pause result
+   */
+  pause() {
+    return this.debugController.pause();
   }
 
   /**
@@ -396,7 +405,8 @@ module.exports = {
   Frame,
   DebugController,
   BrowserFileProvider,
-  awtFramework
+  awtFramework,
+  audioPlatform
 };
 
 // Also make available as global for direct script inclusion
@@ -406,7 +416,8 @@ if (typeof window !== 'undefined') {
     JVM,
     Frame,
     DebugController,
-    BrowserFileProvider
+    BrowserFileProvider,
+    audioPlatform
   };
   window.awtFramework = awtFramework;
 }

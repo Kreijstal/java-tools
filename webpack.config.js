@@ -56,6 +56,7 @@ module.exports = {
       "node:path": require.resolve("path-browserify"),
       "node:buffer": require.resolve("buffer/"),
       "node:process": require.resolve("process/browser"),
+      "speaker": false,
       // Additional node-fetch dependencies
       "fetch-blob": false,
       "formdata-polyfill": false,

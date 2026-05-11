@@ -879,8 +879,25 @@ class JVM {
       return { completed: false };
     }
 
-    const jitResult = await this.jit.tryRunFrame(frame, thread);
-    if (jitResult.handled) {
+    try {
+      const jitResult = await this.jit.tryRunFrame(frame, thread);
+      if (jitResult.handled) {
+        if (this.threads.length > 0) {
+          this.currentThreadIndex =
+            (this.currentThreadIndex + 1) % this.threads.length;
+        }
+        return { completed: false };
+      }
+    } catch (e) {
+      const currentFrame = thread.callStack.peek();
+      const currentInstructionItem = currentFrame && currentFrame.instructions
+        ? currentFrame.instructions[currentFrame.pc]
+        : null;
+      const label = currentInstructionItem && currentInstructionItem.labelDef;
+      const currentPc = label
+        ? parseInt(label.substring(1, label.length - 1))
+        : -1;
+      this.handleException(e, currentPc, thread);
       if (this.threads.length > 0) {
         this.currentThreadIndex =
           (this.currentThreadIndex + 1) % this.threads.length;
@@ -1671,13 +1688,29 @@ class JVM {
     this.debugManager.disable();
   }
   addBreakpoint(pc) {
-    this.debugManager.addBreakpoint(pc);
+    this.debugManager.addBreakpoint(pc, this.getCurrentBreakpointLocation());
   }
   removeBreakpoint(pc) {
-    this.debugManager.removeBreakpoint(pc);
+    this.debugManager.removeBreakpoint(pc, this.getCurrentBreakpointLocation());
   }
   clearBreakpoints() {
     this.debugManager.clearBreakpoints();
+  }
+
+  getCurrentBreakpointLocation() {
+    const thread = this.threads[this.currentThreadIndex];
+    if (!thread || thread.callStack.isEmpty()) {
+      return null;
+    }
+    const frame = thread.callStack.peek();
+    if (!frame || !frame.method) {
+      return null;
+    }
+    return {
+      className: frame.className || this.findClassNameForMethod(frame.method),
+      methodName: frame.method.name,
+      descriptor: frame.method.descriptor,
+    };
   }
 
   getCurrentState() {
