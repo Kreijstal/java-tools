@@ -81,8 +81,13 @@ module.exports = {
           return;
         }
 
+        const currentClassName = classData.ast.classes[0].className;
         classData.ast.classes[0].items
-          .filter(item => item.type === 'method' && item.method.flags.includes('public') && item.method.name !== '<init>')
+          .filter(item =>
+            item.type === 'method' &&
+            item.method.flags.includes('public') &&
+            item.method.name !== '<init>' &&
+            !(currentClassName === 'java/lang/Object' && item.method.name === 'clone'))
           .forEach(methodItem => {
             const key = methodItem.method.name + methodItem.method.descriptor;
             if (!allMethods[key]) {

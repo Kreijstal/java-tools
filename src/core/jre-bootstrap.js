@@ -11,6 +11,19 @@
 // Import the generated JRE index for real class implementations
 const jreClasses = require('../jre/index');
 
+function normalizeSuperClassName(superClassName) {
+  if (!superClassName) {
+    return null;
+  }
+  if (typeof superClassName === 'string') {
+    return superClassName;
+  }
+  if (typeof superClassName === 'object' && superClassName.type) {
+    return superClassName.type;
+  }
+  return String(superClassName);
+}
+
 class JreBootstrap {
   /**
    * Preload essential JRE classes that are required for basic JVM operation
@@ -46,7 +59,7 @@ class JreBootstrap {
     // Add all classes from the generated index with their proper superclasses
     for (const className in jreClasses) {
       const classDef = jreClasses[className];
-      jreHierarchy[className] = classDef.super || "java/lang/Object";
+      jreHierarchy[className] = normalizeSuperClassName(classDef.super) || "java/lang/Object";
     }
 
     // Essential root class that must be available as fallback
@@ -129,7 +142,7 @@ class JreBootstrap {
                     {
                       className: className,
                       superClassName:
-                        (jreClassDef && jreClassDef.super) ||
+                        normalizeSuperClassName(jreClassDef && jreClassDef.super) ||
                         "java/lang/Object",
                       items: methods,
                       flags: ["public"],

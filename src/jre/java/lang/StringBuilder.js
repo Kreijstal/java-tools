@@ -1,5 +1,15 @@
 const { withThrows } = require('../../helpers');
 
+function valueAsString(value) {
+  if (value === null || value === undefined) {
+    return 'null';
+  }
+  if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) {
+    return String(value.value);
+  }
+  return String(value);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -13,17 +23,36 @@ module.exports = {
       if (str === null) {
         throw { type: 'java/lang/NullPointerException' };
       }
-      obj.value = String(str);
+      obj.value = valueAsString(str);
       delete obj.isUninitialized;
     }, ['java/lang/NullPointerException']),
     'append(Ljava/lang/String;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
-      const str = args[0];
-      obj.value += str;
+      obj.value += valueAsString(args[0]);
+      return obj;
+    },
+    'append(Ljava/lang/Object;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += valueAsString(args[0]);
+      return obj;
+    },
+    'append(Ljava/lang/CharSequence;II)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      const value = valueAsString(args[0]);
+      obj.value += value.substring(args[1], args[2]);
+      return obj;
+    },
+    'append(C)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += String.fromCharCode(args[0]);
+      return obj;
+    },
+    'append(Z)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += args[0] ? 'true' : 'false';
       return obj;
     },
     'append(I)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
-      const int = args[0];
-      obj.value += int;
+      obj.value += args[0];
+      return obj;
+    },
+    'append(J)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += args[0].toString();
       return obj;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {

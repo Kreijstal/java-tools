@@ -7,39 +7,8 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       // Object constructor does nothing
     },
-    'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
-      const className = obj.type;
-
-      // Special handling for arrays
-      if (className && className.startsWith('[')) {
-        // Check if array class is already registered (e.g., from createMultiDimensionalArray)
-        if (jvm.classes[className] && jvm.classes[className].type === 'java/lang/Class') {
-          return jvm.classes[className];
-        }
-
-        // Create new array class if not already registered
-        const classData = {
-          isArray: true,
-          arrayType: className,
-          componentType: className.slice(1), // Remove leading '['
-          className: className
-        };
-
-        // Register the new class
-        jvm.classes[className] = classData;
-
-        return {
-          type: 'java/lang/Class',
-          _classData: classData
-        };
-      }
-
-      // For regular objects, use existing logic
-      const classData = jvm.classes[className];
-      return {
-        type: 'java/lang/Class',
-        _classData: classData,
-      };
+    'getClass()Ljava/lang/Class;': async (jvm, obj, args) => {
+      return await jvm.getClassObject(obj._className || obj.type);
     },
     'hashCode()I': (jvm, obj, args) => {
       return obj.hashCode;
@@ -49,7 +18,10 @@ module.exports = {
       return obj === other ? 1 : 0;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      const className = obj.type.replace(/\//g, '.');
+      const className = (obj._className || obj.type).replace(/\//g, '.');
+      if (obj.hashCode === undefined) {
+        obj.hashCode = jvm.nextHashCode++;
+      }
       const hashCode = obj.hashCode.toString(16);
       return jvm.internString(`${className}@${hashCode}`);
     },

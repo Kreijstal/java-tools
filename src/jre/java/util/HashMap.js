@@ -23,11 +23,12 @@ module.exports = {
       const value = args[1];
       const oldValue = obj.map.get(key);
       obj.map.set(key, value);
-      return oldValue;
+      return oldValue === undefined ? null : oldValue;
     },
     'get(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
       const key = args[0];
-      return obj.map.get(key);
+      const value = obj.map.get(key);
+      return value === undefined ? null : value;
     },
     'containsKey(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const key = args[0];
@@ -46,7 +47,7 @@ module.exports = {
       const key = args[0];
       const oldValue = obj.map.get(key);
       obj.map.delete(key);
-      return oldValue;
+      return oldValue === undefined ? null : oldValue;
     },
     'clear()V': (jvm, obj, args) => {
       obj.map.clear();
