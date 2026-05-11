@@ -8,6 +8,7 @@ function runPeepholeClean(astRoot, options = {}) {
     rethrowHandlers: 0,
     nops: 0,
     threadedBranches: 0,
+    protectedLoadBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -30,15 +31,16 @@ function runPeepholeClean(astRoot, options = {}) {
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
+    details.protectedLoadBridges += round.protectedLoadBridges;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.threadedBranches + round.invertedFallthroughGotos + round.fallthroughGotos +
-      round.unreachableInstructions + round.unusedLabels;
+    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.invertedFallthroughGotos +
+      round.fallthroughGotos + round.unreachableInstructions + round.unusedLabels;
     if (
-      round.nops + round.threadedBranches + round.invertedFallthroughGotos + round.fallthroughGotos +
-      round.unreachableInstructions + round.unusedLabels === 0
+      round.nops + round.threadedBranches + round.protectedLoadBridges + round.invertedFallthroughGotos +
+      round.fallthroughGotos + round.unreachableInstructions + round.unusedLabels === 0
     ) {
       break;
     }
@@ -51,6 +53,7 @@ function cleanOneRound(astRoot, options = {}) {
   const details = {
     nops: 0,
     threadedBranches: 0,
+    protectedLoadBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -59,6 +62,7 @@ function cleanOneRound(astRoot, options = {}) {
   forEachCode(astRoot, (code, method) => {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
+    details.protectedLoadBridges += coalesceProtectedLoadBridges(code);
     if (method && method.name === '<init>') {
       details.invertedFallthroughGotos += invertConditionalOverGoto(code);
       details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
@@ -115,6 +119,42 @@ function threadBranchesThroughGoto(codeItems) {
     item.instruction = setInstructionArg(item.instruction, nextTarget);
     changed += 1;
   }
+  return changed;
+}
+
+function coalesceProtectedLoadBridges(code) {
+  const codeItems = code.codeItems;
+  const labelIndex = buildLabelIndex(codeItems);
+  const protectedStarts = collectProtectedStarts(code);
+  let changed = 0;
+
+  for (const startLabel of protectedStarts) {
+    const startIndex = labelIndex.get(startLabel);
+    if (startIndex == null) continue;
+    const protectedLoadIndex = nextInstructionIndex(codeItems, startIndex);
+    if (protectedLoadIndex == null) continue;
+    const protectedLoad = codeItems[protectedLoadIndex] && codeItems[protectedLoadIndex].instruction;
+    if (!isSimpleLoadInstruction(protectedLoad)) continue;
+    const joinIndex = nextInstructionIndex(codeItems, protectedLoadIndex + 1);
+    if (joinIndex == null) continue;
+
+    for (let i = 0; i < protectedLoadIndex; i += 1) {
+      const item = codeItems[i];
+      if (!item || !item.instruction || !sameInstruction(item.instruction, protectedLoad)) continue;
+      if (item.labelDef && isLabelProtected(code, item.labelDef)) continue;
+      const gotoIndex = nextInstructionIndex(codeItems, i + 1);
+      if (gotoIndex == null) continue;
+      if (getOpcode(codeItems[gotoIndex] && codeItems[gotoIndex].instruction) !== 'goto') continue;
+      const target = trimLabel(getInstructionArg(codeItems[gotoIndex].instruction));
+      if (!target || labelIndex.get(target) !== joinIndex) continue;
+      if (hasInstructionBetween(codeItems, i + 1, gotoIndex)) continue;
+
+      item.instruction = { op: 'goto', arg: startLabel };
+      removeInstructionOnly(codeItems, gotoIndex);
+      changed += 1;
+    }
+  }
+
   return changed;
 }
 
@@ -241,6 +281,14 @@ function collectControlFlowLabels(code) {
   return used;
 }
 
+function collectProtectedStarts(code) {
+  const starts = new Set();
+  for (const entry of code.exceptionTable || []) {
+    addLabel(starts, entry.startLbl || entry.startLabel || entry.start);
+  }
+  return starts;
+}
+
 function removeUnusedLabels(code) {
   const used = collectUsedLabels(code);
   let removed = 0;
@@ -310,8 +358,48 @@ function hasFallthroughPredecessor(codeItems, labelIndex, label) {
   return false;
 }
 
+function hasInstructionBetween(codeItems, startIndex, endIndex) {
+  for (let i = startIndex; i < endIndex; i += 1) {
+    if (codeItems[i] && codeItems[i].instruction) return true;
+  }
+  return false;
+}
+
 function isConditionalBranch(opcode) {
   return /^if/.test(opcode || '');
+}
+
+function isSimpleLoadInstruction(instruction) {
+  const opcode = getOpcode(instruction);
+  return opcode === 'aload' || opcode === 'iload' || opcode === 'fload' ||
+    opcode === 'lload' || opcode === 'dload' ||
+    /^aload_\d$/.test(opcode || '') ||
+    /^iload_\d$/.test(opcode || '') ||
+    /^fload_\d$/.test(opcode || '') ||
+    /^lload_\d$/.test(opcode || '') ||
+    /^dload_\d$/.test(opcode || '');
+}
+
+function sameInstruction(a, b) {
+  if (getOpcode(a) !== getOpcode(b)) return false;
+  return sameValue(getInstructionArg(a), getInstructionArg(b));
+}
+
+function sameValue(a, b) {
+  if (typeof a === 'bigint' || typeof b === 'bigint') {
+    return typeof a === typeof b && a === b;
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((entry, index) => sameValue(entry, b[index]));
+  }
+  if (a && b && typeof a === 'object' && typeof b === 'object') {
+    const aKeys = Object.keys(a);
+    const bKeys = Object.keys(b);
+    if (aKeys.length !== bKeys.length) return false;
+    return aKeys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && sameValue(a[key], b[key]));
+  }
+  return a === b;
 }
 
 function isTerminalOpcode(opcode) {
@@ -451,6 +539,7 @@ module.exports = {
   runPeepholeClean,
   removeNops,
   threadBranchesThroughGoto,
+  coalesceProtectedLoadBridges,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
   removeUnreachableUntilUsedLabel,
