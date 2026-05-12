@@ -12,9 +12,9 @@ function runControlFlowDce(astRoot, options = {}) {
         if (!code || !Array.isArray(code.codeItems)) continue;
         rewrites += mergeAdjacentConstReturns(code, options);
         rewrites += collapseGotoChains(code);
-        rewrites += inlineGotoConstReturns(code);
+        rewrites += inlineGotoConstReturns(code, options);
         rewrites += mergeAdjacentConstReturns(code, options);
-        rewrites += shareConstReturnGotos(code);
+        rewrites += shareConstReturnGotos(code, options);
         rewrites += removeUnreferencedAfterTerminals(code);
       }
     }
@@ -22,12 +22,13 @@ function runControlFlowDce(astRoot, options = {}) {
   return { changed: rewrites > 0, rewrites };
 }
 
-function shareConstReturnGotos(code) {
+function shareConstReturnGotos(code, options = {}) {
   const items = code.codeItems;
   const labels = buildLabelIndex(items);
   let rewrites = 0;
   for (let i = 0; i < items.length; i += 1) {
     if (op(items[i]) !== 'goto') continue;
+    if (options.guardStackGotos && hasLikelyLiveStackBeforeGoto(items, i)) continue;
     const targetIndex = labels.get(trimLabel(arg(items[i])));
     if (targetIndex == null) continue;
     const targetConst = nextInstructionIndex(items, targetIndex - 1);
@@ -137,12 +138,14 @@ function collapseGotoChains(code) {
   return rewrites;
 }
 
-function inlineGotoConstReturns(code) {
+function inlineGotoConstReturns(code, options = {}) {
   const items = code.codeItems;
   const labels = buildLabelIndex(items);
   let rewrites = 0;
-  for (const item of items) {
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
     if (op(item) !== 'goto') continue;
+    if (options.guardStackGotos && hasLikelyLiveStackBeforeGoto(items, i)) continue;
     const target = trimLabel(arg(item));
     const targetIndex = labels.get(target);
     if (targetIndex == null) continue;
@@ -151,10 +154,25 @@ function inlineGotoConstReturns(code) {
     if (first < 0 || second < 0) continue;
     if (!isConstOp(op(items[first])) || !isReturnOp(op(items[second]))) continue;
     item.instruction = cloneInstruction(items[first].instruction);
-    items.splice(items.indexOf(item) + 1, 0, { instruction: cloneInstruction(items[second].instruction) });
+    items.splice(i + 1, 0, { instruction: cloneInstruction(items[second].instruction) });
     rewrites += 1;
+    i += 1;
   }
   return rewrites;
+}
+
+function hasLikelyLiveStackBeforeGoto(items, index) {
+  const prev = previousInstructionIndex(items, index);
+  if (prev < 0) return false;
+  const prevOp = op(items[prev]);
+  return isConstOp(prevOp) ||
+    /^iload_[0-3]$/.test(prevOp || '') ||
+    prevOp === 'iload' ||
+    /^aload_[0-3]$/.test(prevOp || '') ||
+    prevOp === 'aload' ||
+    prevOp === 'getstatic' ||
+    prevOp === 'getfield' ||
+    /^invoke/.test(prevOp || '');
 }
 
 function isConstOp(itemOp) {

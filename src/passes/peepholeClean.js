@@ -37,6 +37,7 @@ function runPeepholeClean(astRoot, options = {}) {
   for (let i = 0; i < 4; i += 1) {
     const round = cleanOneRound(astRoot, {
       removeUnreachableCode: options.removeHandlerCode !== false,
+      cloneForwardTails: options.cloneForwardTails === true,
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -94,8 +95,10 @@ function cleanOneRound(astRoot, options = {}) {
     details.duplicateLoopTails += coalesceDuplicateLoopTails(code);
     details.forwardLoopEntryClones += cloneForwardLoopEntryGotos(code);
     details.conditionalForwardLoopEntryClones += cloneConditionalForwardLoopEntry(code);
-    details.conditionalForwardTailClones += cloneConditionalForwardTailEntry(code);
-    details.sharedFallthroughBlockClones += cloneSharedFallthroughBlocks(code);
+    if (options.cloneForwardTails) {
+      details.conditionalForwardTailClones += cloneConditionalForwardTailEntry(code);
+      details.sharedFallthroughBlockClones += cloneSharedFallthroughBlocks(code);
+    }
     if (method && method.name === '<init>') {
       details.invertedFallthroughGotos += invertConditionalOverGoto(code);
       details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
@@ -268,7 +271,7 @@ function cloneConditionalForwardLoopEntry(code) {
     const cloneEntry = trimLabel(clone[0] && clone[0].labelDef);
     if (!cloneEntry) continue;
 
-    const guard = { instruction: { op: 'goto', arg: target }, peepholeGuard: true };
+    const guard = { instruction: { op: 'goto', arg: target } };
     codeItems.splice(targetIdx, 0, guard, ...clone);
     item.instruction = setInstructionArg(item.instruction, cloneEntry);
     changed += 1;

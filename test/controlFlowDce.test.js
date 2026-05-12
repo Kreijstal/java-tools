@@ -88,6 +88,22 @@ test('inlines gotos to constant return blocks', () => {
   assert.equal(code.codeItems[1].instruction, 'ireturn');
 });
 
+test('can guard const-return goto inline when the goto has a live stack value', () => {
+  const code = {
+    codeItems: [
+      { labelDef: 'L0:', instruction: 'iload_1' },
+      { instruction: { op: 'goto', arg: 'L2' } },
+      { labelDef: 'L1:', instruction: 'iconst_1' },
+      { labelDef: 'L2:', instruction: 'iconst_0' },
+      { labelDef: 'L3:', instruction: 'ireturn' },
+    ],
+    exceptionTable: [],
+  };
+
+  assert.equal(inlineGotoConstReturns(code, { guardStackGotos: true }), 0);
+  assert.deepEqual(code.codeItems[1].instruction, { op: 'goto', arg: 'L2' });
+});
+
 test('retargets duplicate adjacent constant return blocks', () => {
   const code = {
     codeItems: [
@@ -121,4 +137,22 @@ test('shares ireturn for goto to nearby constant return block', () => {
   assert.equal(code.codeItems[1].instruction, 'iconst_0');
   assert.deepEqual(code.codeItems[2].instruction, { op: 'goto', arg: 'Lshared_return' });
   assert.equal(code.codeItems[4].labelDef, 'Lshared_return:');
+});
+
+test('can guard shared const-return goto rewrite when the goto has a live stack value', () => {
+  const code = {
+    codeItems: [
+      { labelDef: 'L0:', instruction: { op: 'ifnull', arg: 'Ltrue' } },
+      { labelDef: 'L1:', instruction: 'iload_1' },
+      { instruction: { op: 'goto', arg: 'Lfalse' } },
+      { labelDef: 'Ltrue:', instruction: 'iconst_1' },
+      { instruction: 'ireturn' },
+      { labelDef: 'Lfalse:', instruction: 'iconst_0' },
+      { instruction: 'ireturn' },
+    ],
+    exceptionTable: [],
+  };
+
+  assert.equal(shareConstReturnGotos(code, { guardStackGotos: true }), 0);
+  assert.deepEqual(code.codeItems[2].instruction, { op: 'goto', arg: 'Lfalse' });
 });
