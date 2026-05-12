@@ -350,10 +350,6 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   for (const [key, writes] of writesByField) {
     for (const write of writes) {
-      if (writeDependsOnSameField(write.codeItems, write.index, key, candidates)) {
-        rejected.add(key);
-        continue;
-      }
       const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
       if (!guard) {
         rejected.add(key);
@@ -397,50 +393,6 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
     .filter((key) => !rejected.has(key) && (candidates.get(key).desc === 'I' || consumerFields.has(key)))
     .sort();
   return { fields, rejected: [...rejected].sort(), dependencies: deps };
-}
-
-function writeDependsOnSameField(codeItems, writeIdx, key, candidates) {
-  const direct = previousInstruction(codeItems, writeIdx);
-  if (direct && getOp(direct.item.instruction) === 'getstatic') {
-    const ref = fieldRefOf(getArg(direct.item.instruction));
-    if (ref && fieldKey(ref) === key) return true;
-  }
-
-  const locals = new Set();
-  for (let i = 0; i < writeIdx; i += 1) {
-    const insn = codeItems[i] && codeItems[i].instruction;
-    if (getOp(insn) !== 'getstatic') continue;
-    const ref = fieldRefOf(getArg(insn));
-    if (!ref || fieldKey(ref) !== key) continue;
-    let j = i + 1;
-    while (j < writeIdx) {
-      const next = codeItems[j];
-      if (next && next.instruction) break;
-      j += 1;
-    }
-    if (j >= writeIdx) continue;
-    const store = codeItems[j] && codeItems[j].instruction;
-    const storeOp = getOp(store);
-    if (!ISTORE_OPS.has(storeOp)) continue;
-    const local = localOf(storeOp, getArg(store));
-    if (local == null) continue;
-    locals.add(local);
-  }
-
-  if (locals.size === 0) return false;
-  for (let i = 0; i < writeIdx; i += 1) {
-    const insn = codeItems[i] && codeItems[i].instruction;
-    const op = getOp(insn);
-    if (!ILOAD_OPS.has(op)) continue;
-    const local = localOf(op, getArg(insn));
-    if (!locals.has(local)) continue;
-    const next = nextInstruction(codeItems, i);
-    if (!next) continue;
-    const nextOp = getOp(next.item.instruction);
-    if (nextOp === 'ifeq' || nextOp === 'ifne') return true;
-  }
-
-  return false;
 }
 
 function collectZeroStaticFields(astRoot, opts) {
