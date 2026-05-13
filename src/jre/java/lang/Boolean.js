@@ -1,3 +1,9 @@
+const BOOLEAN_TRUE = { type: 'java/lang/Boolean', value: true };
+const BOOLEAN_FALSE = { type: 'java/lang/Boolean', value: false };
+
+BOOLEAN_TRUE.toString = function() { return 'true'; };
+BOOLEAN_FALSE.toString = function() { return 'false'; };
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
@@ -6,31 +12,15 @@ module.exports = {
       isPrimitive: true,
       name: 'boolean',
     },
-    'TRUE:Ljava/lang/Boolean;': {
-      type: 'java/lang/Boolean',
-      value: true,
-    },
-    'FALSE:Ljava/lang/Boolean;': {
-      type: 'java/lang/Boolean',
-      value: false,
-    },
+    'TRUE:Ljava/lang/Boolean;': BOOLEAN_TRUE,
+    'FALSE:Ljava/lang/Boolean;': BOOLEAN_FALSE,
   },
   staticMethods: {
     'toString(Z)Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(args[0] ? 'true' : 'false');
     },
     'valueOf(Z)Ljava/lang/Boolean;': (jvm, obj, args) => {
-      const booleanObj = {
-        type: 'java/lang/Boolean',
-        value: args[0],
-      };
-      
-      // Add JavaScript toString method for proper string concatenation
-      booleanObj.toString = function() {
-        return this.value ? 'true' : 'false';
-      };
-      
-      return booleanObj;
+      return args[0] ? BOOLEAN_TRUE : BOOLEAN_FALSE;
     },
     'valueOf(Ljava/lang/String;)Ljava/lang/Boolean;': (jvm, obj, args) => {
       const str = args[0];
@@ -38,16 +28,7 @@ module.exports = {
       const stringValue = (typeof str === 'string') ? str : (str && str.value ? str.value : str);
       const boolValue = stringValue ? stringValue.toLowerCase() === 'true' : false;
       
-      const booleanObj = {
-        type: 'java/lang/Boolean',
-        value: boolValue,
-      };
-      
-      booleanObj.toString = function() {
-        return this.value ? 'true' : 'false';
-      };
-      
-      return booleanObj;
+      return boolValue ? BOOLEAN_TRUE : BOOLEAN_FALSE;
     },
     'parseBoolean(Ljava/lang/String;)Z': (jvm, obj, args) => {
       const str = args[0];

@@ -218,6 +218,31 @@ function parseBigInt(value) {
   throw new Error(`Unable to parse BigInt value from ${value}`);
 }
 
+function normalizeCodeItemInstruction(item) {
+  if (item == null) {
+    return null;
+  }
+  if (typeof item === 'string') {
+    return item;
+  }
+  if (typeof item === 'object') {
+    if (item.instruction !== undefined) {
+      return item.instruction;
+    }
+    if (item.op) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function normalizeCodeItemLabel(item) {
+  if (item && typeof item === 'object' && !Array.isArray(item)) {
+    return extractLabel(item.labelDef);
+  }
+  return null;
+}
+
 function encodeModifiedUtf8(value) {
   const bytes = [];
   const text = value === null || value === undefined ? '' : String(value);
@@ -623,7 +648,7 @@ function primeConstantPoolFromClass(cls, builder) {
         return;
       }
       ensureArray(attribute.code.codeItems).forEach((codeItem) => {
-        const instruction = codeItem ? codeItem.instruction : null;
+        const instruction = normalizeCodeItemInstruction(codeItem);
         if (!instruction || typeof instruction !== 'object') {
           return;
         }
@@ -1715,11 +1740,11 @@ function encodeInstructions(codeItems, builder, bootstrapMethodCount) {
   let offset = 0;
 
   ensureArray(codeItems).forEach((item) => {
-    const label = item ? extractLabel(item.labelDef) : null;
+    const label = normalizeCodeItemLabel(item);
     if (label) {
       labelOffsets.set(label, offset);
     }
-    const instruction = item ? item.instruction : null;
+    const instruction = normalizeCodeItemInstruction(item);
     if (instruction === null || instruction === undefined) {
       return;
     }

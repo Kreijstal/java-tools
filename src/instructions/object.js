@@ -296,80 +296,12 @@ module.exports = {
 
   instanceof: async (frame, instruction, jvm, thread) => {
     const targetClassName = instruction.arg;
-
-    // Ensure the target class is initialized before checking
-    const wasFramePushed = await jvm.initializeClassIfNeeded(targetClassName, thread);
-    if (wasFramePushed) {
-      frame.pc--; // Re-run this instruction
-      return;
-    }
-
     const objRef = frame.stack.pop();
-    if (objRef === null) {
+    if (objRef === null || objRef === undefined) {
       frame.stack.push(0);
       return;
     }
-
-    const isInstanceOf = async (className, target) => {
-      if (!className) {
-        return false;
-      }
-      if (className === target) {
-        return true;
-      }
-
-      const classData = jvm.classes[className];
-      if (!classData) {
-        // This should not happen if classes are initialized correctly
-        return false;
-      }
-
-      // Check superclass
-      const superClassName = classData.ast.classes[0].superClassName;
-      if (superClassName) {
-        const wasSuperInitialized = await jvm.initializeClassIfNeeded(superClassName, thread);
-        if (wasSuperInitialized) {
-            // If we had to initialize a superclass, we need to restart the check
-            // to ensure the whole chain is loaded before we continue.
-            // By decrementing PC, we re-run the instanceof instruction from the top.
-            frame.pc--;
-            return 'RETRY'; // Special value to indicate a retry is needed.
-        }
-        if (await isInstanceOf(superClassName, target)) {
-          return true;
-        }
-      }
-
-      // Check interfaces
-      const interfaces = classData.ast.classes[0].interfaces;
-      if (interfaces) {
-        for (const iface of interfaces) {
-          const wasInterfaceInitialized = await jvm.initializeClassIfNeeded(iface, thread);
-          if (wasInterfaceInitialized) {
-              frame.pc--;
-              return 'RETRY';
-          }
-          if (await isInstanceOf(iface, target)) {
-            return true;
-          }
-        }
-      }
-      return false;
-    };
-
-    const result = await isInstanceOf(runtimeClassName(objRef), targetClassName);
-
-    if (result === 'RETRY') {
-        // A class was initialized during the check.
-        // The PC has been rewound, so we just return to let the instruction re-run.
-        return;
-    }
-
-    if (result) {
-      frame.stack.push(1);
-    } else {
-      frame.stack.push(0);
-    }
+    frame.stack.push(await jvm.isInstanceOfAsync(runtimeClassName(objRef), targetClassName) ? 1 : 0);
   },
 
   multianewarray: (frame, instruction, jvm) => {
@@ -420,43 +352,20 @@ module.exports = {
 
   checkcast: async (frame, instruction, jvm) => {
     const targetClassName = instruction.arg;
-    const objRef = frame.stack.peek(); // Don't pop, just peek
+    const objRef = frame.stack.peek();
 
     if (objRef === null) {
-      return; // null can be cast to anything
+      return;
     }
 
-    let currentClassName = runtimeClassName(objRef);
-    while (currentClassName) {
-      if (currentClassName === targetClassName) {
-        return; // Cast is valid
-      }
-      const classData = jvm.classes[currentClassName];
-      if (!classData) {
-        // This should not happen if classes are loaded correctly
-        throw new Error('ClassCastException');
-      }
-
-      const interfaces = classData.ast.classes[0].interfaces;
-      if (interfaces && interfaces.length > 0) {
-        const interfaceQueue = [...interfaces];
-        while (interfaceQueue.length > 0) {
-          const interfaceName = interfaceQueue.shift();
-          if (interfaceName === targetClassName) {
-            return; // Cast is valid
-          }
-          const interfaceData = jvm.classes[interfaceName];
-          if (interfaceData && interfaceData.ast.classes[0].interfaces) {
-            interfaceQueue.push(...interfaceData.ast.classes[0].interfaces);
-          }
-        }
-      }
-
-      currentClassName = classData.ast.classes[0].superClassName;
+    if (await jvm.isInstanceOfAsync(runtimeClassName(objRef), targetClassName)) {
+      return;
     }
 
-    // If we get here, the cast is invalid
-    throw { type: 'java/lang/ClassCastException', message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}` };
+    throw {
+      type: 'java/lang/ClassCastException',
+      message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}`,
+    };
   },
 
   newarray: (frame, instruction, jvm) => {

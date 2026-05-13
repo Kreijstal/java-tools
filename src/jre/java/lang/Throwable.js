@@ -1,3 +1,23 @@
+function javaString(value) {
+  if (value === null || value === undefined) return null;
+  if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) return value;
+  if (value && Object.prototype.hasOwnProperty.call(value, 'value')) return value;
+  return null;
+}
+
+function throwableMessage(jvm, throwable) {
+  if (!throwable) return null;
+  if (throwable.message) return throwable.message;
+  const className = String(throwable.type || throwable.constructor && throwable.constructor.name || 'java/lang/Throwable').replace(/\//g, '.');
+  return jvm.internString(className);
+}
+
+function messageValue(message) {
+  if (message === null || message === undefined) return '';
+  if (message && Object.prototype.hasOwnProperty.call(message, 'value')) return String(message.value);
+  return String(message);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -30,7 +50,7 @@ module.exports = {
       const message = obj.message;
       const className = obj.type.replace(/\//g, '.');
       if (message) {
-        return jvm.internString(`${className}: ${message.value}`);
+        return jvm.internString(`${className}: ${messageValue(message)}`);
       } else {
         return jvm.internString(className);
       }
@@ -39,7 +59,7 @@ module.exports = {
       const className = obj.type.replace(/\//g, '.');
       const message = obj.message;
       if (message) {
-        console.error(`${className}: ${message.value}`);
+        console.error(`${className}: ${messageValue(message)}`);
       } else {
         console.error(className);
       }
@@ -54,7 +74,7 @@ module.exports = {
       // Create the error message
       let errorMsg;
       if (message) {
-        errorMsg = `${className}: ${message.value}`;
+        errorMsg = `${className}: ${messageValue(message)}`;
       } else {
         errorMsg = className;
       }

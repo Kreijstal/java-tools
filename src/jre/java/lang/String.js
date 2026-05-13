@@ -1,5 +1,20 @@
 const { withThrows } = require('../../helpers');
 
+
+function fieldStringValue(obj, fieldName) {
+  if (!obj || !obj.fields) return null;
+  const keys = Object.keys(obj.fields).filter((key) => key.endsWith(`.${fieldName}`));
+  keys.sort((a, b) => (a.startsWith('java/lang/Enum.') ? 1 : 0) - (b.startsWith('java/lang/Enum.') ? 1 : 0));
+  for (const key of keys) {
+    const value = obj.fields[key];
+    if (value === null || value === undefined) continue;
+    if (typeof value === 'string') return value;
+    if (value && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
+    if (value && value.type === 'java/lang/String') return String(value.valueOf ? value.valueOf() : value);
+  }
+  return null;
+}
+
 function stringValue(obj) {
   if (obj === null || obj === undefined) {
     return '';
@@ -25,6 +40,10 @@ function stringValue(obj) {
     }
     if (Object.prototype.hasOwnProperty.call(obj, 'value')) {
       return String(obj.value);
+    }
+    const fieldName = fieldStringValue(obj, 'name');
+    if (fieldName !== null) {
+      return fieldName;
     }
     if (obj.name) {
       return stringValue(obj.name);
@@ -190,6 +209,9 @@ module.exports = {
     "length()I": (jvm, obj, args) => {
       return stringValue(obj).length;
     },
+    "isEmpty()Z": (jvm, obj, args) => {
+      return stringValue(obj).length === 0 ? 1 : 0;
+    },
     "charAt(I)C": withThrows((jvm, obj, args) => {
       const value = stringValue(obj);
       const index = args[0];
@@ -200,6 +222,25 @@ module.exports = {
         };
       }
       return value.charCodeAt(index);
+    }, ['java/lang/StringIndexOutOfBoundsException']),
+    "toCharArray()[C": (jvm, obj) => {
+      const chars = Array.from(stringValue(obj), (ch) => ch.charCodeAt(0));
+      chars.type = "[C";
+      chars.elementType = "char";
+      return chars;
+    },
+    "getChars(II[CI)V": withThrows((jvm, obj, args) => {
+      const value = stringValue(obj);
+      const srcBegin = args[0];
+      const srcEnd = args[1];
+      const dst = args[2];
+      const dstBegin = args[3];
+      if (srcBegin < 0 || srcEnd > value.length || srcBegin > srcEnd || dstBegin < 0 || dstBegin + (srcEnd - srcBegin) > dst.length) {
+        throw { type: 'java/lang/StringIndexOutOfBoundsException' };
+      }
+      for (let i = srcBegin; i < srcEnd; i += 1) {
+        dst[dstBegin + i - srcBegin] = value.charCodeAt(i);
+      }
     }, ['java/lang/StringIndexOutOfBoundsException']),
     "equals(Ljava/lang/Object;)Z": (jvm, obj, args) => {
       const other = args[0];
@@ -217,6 +258,11 @@ module.exports = {
       }
 
       return 0;
+    },
+    "substring(I)Ljava/lang/String;": (jvm, obj, args) => {
+      const startIndex = args[0];
+      const result = stringValue(obj).substring(startIndex);
+      return jvm.internString(result);
     },
     "substring(II)Ljava/lang/String;": (jvm, obj, args) => {
       const startIndex = args[0];
@@ -307,6 +353,13 @@ module.exports = {
     "trim()Ljava/lang/String;": (jvm, obj, args) => {
       return jvm.internString(stringValue(obj).trim());
     },
+    "contains(Ljava/lang/CharSequence;)Z": withThrows((jvm, obj, args) => {
+      const needle = args[0];
+      if (needle === null) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      return stringValue(obj).includes(stringValue(needle)) ? 1 : 0;
+    }, ['java/lang/NullPointerException']),
     "startsWith(Ljava/lang/String;)Z": withThrows((jvm, obj, args) => {
       const prefix = args[0];
       if (prefix === null) {
@@ -328,6 +381,14 @@ module.exports = {
       const result = stringValue(obj).split(oldChar).join(newChar);
       return jvm.internString(result);
     },
+    "replace(Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;": withThrows((jvm, obj, args) => {
+      if (args[0] === null || args[1] === null) {
+        throw { type: 'java/lang/NullPointerException' };
+      }
+      const target = stringValue(args[0]);
+      const replacement = stringValue(args[1]);
+      return jvm.internString(stringValue(obj).split(target).join(replacement));
+    }, ['java/lang/NullPointerException']),
     "regionMatches(ILjava/lang/String;II)Z": withThrows((jvm, obj, args) => {
       const toffset = args[0];
       const other = args[1];

@@ -316,6 +316,28 @@ function convertJson(inputJson, constantPool) {
     return decodeAccessFlags(accessFlags, context);
   }
 
+  function attributeName(attribute) {
+    return attribute &&
+      attribute.attribute_name_index &&
+      attribute.attribute_name_index.name &&
+      attribute.attribute_name_index.name.info
+      ? attribute.attribute_name_index.name.info.bytes
+      : null;
+  }
+
+  function fieldConstantValue(field) {
+    const constantValueAttribute = (field.attributes || [])
+      .find((attribute) => attributeName(attribute) === "ConstantValue");
+    if (!constantValueAttribute || !constantValueAttribute.info) {
+      return null;
+    }
+    const constantIndex = constantValueAttribute.info.constantvalue_index;
+    if (!constantIndex) {
+      return null;
+    }
+    return resolveConstant(constantIndex, constantPool).value;
+  }
+
   // Convert fields
   inputJson.fields.forEach((field) => {
     const fieldItem = {
@@ -325,8 +347,8 @@ function convertJson(inputJson, constantPool) {
         accessFlags: field.accessFlags,
         name: field.name,
         descriptor: field.descriptor,
-        value: null, // Assuming no value, adjust if needed
-        attrs: null, // Assuming no attrs, adjust if needed
+        value: fieldConstantValue(field),
+        attrs: null,
       },
     };
     outputJson.classes[0].items.push(fieldItem);
@@ -1092,7 +1114,8 @@ function unparseDataStructures(cls, constantPool, options = {}) {
       .filter((item) => item.type === "field")
       .map((item) => {
         const field = item.field;
-        const lines = [`.field ${field.name} ${field.descriptor}`];
+        const flagText = field.flags && field.flags.length ? `${field.flags.join(" ")} ` : "";
+        const lines = [`.field ${flagText}${field.name} ${field.descriptor}`];
         const key = `${field.name}:${field.descriptor}`;
         const refs = classFieldRefs && classFieldRefs[key];
         if (refs && refs.length) {

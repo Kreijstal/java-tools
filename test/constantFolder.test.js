@@ -11,7 +11,7 @@ const { constantFoldCfg } = require('../src/passes/constantFolder-cfg');
 const { eliminateDeadCodeCfg } = require('../src/passes/deadCodeEliminator-cfg');
 const { inlinePureMethods } = require('../src/passes/inlinePureMethods');
 const { runOptimizationPasses } = require('../src/passes/passManager');
-const { ensureKrak2Path } = require('../src/utils/krakatau');
+const { assembleJasminFixture } = require('../src/utils/jasminAssembly');
 
 const JASMIN_DIR = path.join(__dirname, '..', 'examples', 'sources', 'jasmin');
 const JAVA_DIR = path.join(__dirname, '..', 'examples', 'sources', 'java');
@@ -25,12 +25,8 @@ function withTempDir(prefix, fn) {
   }
 }
 
-function assembleJasminFile(tempDir, krak2Path, jasminFile) {
-  const jasminSource = path.join(JASMIN_DIR, jasminFile);
-  const className = path.basename(jasminFile, '.j');
-  const classOutput = path.join(tempDir, `${className}.class`);
-  execFileSync(krak2Path, ['asm', jasminSource, '--out', classOutput]);
-  return classOutput;
+function assembleJasminFile(tempDir, jasminFile) {
+  return assembleJasminFixture(JASMIN_DIR, tempDir, jasminFile);
 }
 
 function convertClassFromFile(classFilePath) {
@@ -76,10 +72,8 @@ function listInstructionOps(method) {
 
 test('constant folding collapses constant branches and unlocks DCE', (t) => {
   t.plan(4);
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('cf-branch-', (tempDir) => {
-    const classPath = assembleJasminFile(tempDir, krak2Path, 'ConstantBranch.j');
+    const classPath = assembleJasminFile(tempDir, 'ConstantBranch.j');
     const { classItem } = convertClassFromFile(classPath);
     const method = findMethod(classItem, (m) => m.name === 'test');
 
@@ -100,10 +94,8 @@ test('constant folding collapses constant branches and unlocks DCE', (t) => {
 
 test('constant folding reduces arithmetic chains to single pushes', (t) => {
   t.plan(3);
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('cf-arith-', (tempDir) => {
-    const classPath = assembleJasminFile(tempDir, krak2Path, 'Arithmetic.j');
+    const classPath = assembleJasminFile(tempDir, 'Arithmetic.j');
     const { classItem } = convertClassFromFile(classPath);
     const method = findMethod(classItem, (m) => m.name === 'test');
 
@@ -123,11 +115,9 @@ test('constant folding reduces arithmetic chains to single pushes', (t) => {
 
 test('inlining + constant folding collapses pure calls into literals', (t) => {
   t.plan(5);
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('cf-inline-', (tempDir) => {
-    const callerClassPath = assembleJasminFile(tempDir, krak2Path, 'Caller.j');
-    const pureMathClassPath = assembleJasminFile(tempDir, krak2Path, 'PureMath.j');
+    const callerClassPath = assembleJasminFile(tempDir, 'Caller.j');
+    const pureMathClassPath = assembleJasminFile(tempDir, 'PureMath.j');
 
     const caller = convertClassFromFile(callerClassPath);
     const pureMath = convertClassFromFile(pureMathClassPath);
@@ -164,10 +154,8 @@ test('inlining + constant folding collapses pure calls into literals', (t) => {
 
 test('constant folding evaluates long, float, and double arithmetic', (t) => {
   t.plan(9);
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('cf-wide-', (tempDir) => {
-    const classPath = assembleJasminFile(tempDir, krak2Path, 'NumericWide.j');
+    const classPath = assembleJasminFile(tempDir, 'NumericWide.j');
     const { classItem } = convertClassFromFile(classPath);
 
     const sumAll = findMethod(classItem, (m) => m.name === 'sumAll');
@@ -203,10 +191,8 @@ test('constant folding evaluates long, float, and double arithmetic', (t) => {
 
 test('constant folding respects configured instruction limits', (t) => {
   t.plan(2);
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('cf-limit-', (tempDir) => {
-    const classPath = assembleJasminFile(tempDir, krak2Path, 'Arithmetic.j');
+    const classPath = assembleJasminFile(tempDir, 'Arithmetic.j');
     const { classItem } = convertClassFromFile(classPath);
     const method = findMethod(classItem, (m) => m.name === 'test');
 
@@ -220,12 +206,11 @@ test('constant folding respects configured instruction limits', (t) => {
 
 test('pure invocation folding obeys evaluation limits for recursive callees', (t) => {
   t.plan(4);
-  const krak2Path = ensureKrak2Path();
   const javacBinary = process.env.JAVAC || 'javac';
 
   withTempDir('cf-eval-', (tempDir) => {
-    const fibClassPath = assembleJasminFile(tempDir, krak2Path, 'Fib.j');
-    const ackClassPath = assembleJasminFile(tempDir, krak2Path, 'Ackermann.j');
+    const fibClassPath = assembleJasminFile(tempDir, 'Fib.j');
+    const ackClassPath = assembleJasminFile(tempDir, 'Ackermann.j');
 
     const javaSource = path.join(JAVA_DIR, 'OptimizerTimeoutTest.java');
     execFileSync(javacBinary, ['-d', tempDir, '-cp', tempDir, javaSource]);
@@ -258,10 +243,8 @@ test('pure invocation folding obeys evaluation limits for recursive callees', (t
 
 test('constant propagation through locals enables folding and branch removal', (t) => {
   t.plan(6);
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('cf-locals-', (tempDir) => {
-    const classPath = assembleJasminFile(tempDir, krak2Path, 'LocalPropagation.j');
+    const classPath = assembleJasminFile(tempDir, 'LocalPropagation.j');
     const { classItem } = convertClassFromFile(classPath);
 
     const sumMethod = findMethod(classItem, (m) => m.name === 'sum');

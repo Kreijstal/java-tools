@@ -3,13 +3,12 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execFileSync } = require('child_process');
 const { getAST } = require('jvm_parser');
 const { convertJson, unparseDataStructures } = require('../src/parsing/convert_tree');
 const { convertAstToCfg } = require('../src/cfg/ast-to-cfg');
 const { reconstructAstFromCfg } = require('../src/cfg/cfg-to-ast');
 const { eliminateDeadCodeCfg } = require('../src/passes/deadCodeEliminator-cfg');
-const { ensureKrak2Path } = require('../src/utils/krakatau');
+const { assembleJasminFile } = require('../src/utils/jasminAssembly');
 
 function printUsage() {
   console.error('Usage: node scripts/optimize-j.js <input.j> [output.j]');
@@ -61,12 +60,9 @@ function main() {
 
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opt-j-'));
   const tempClassFile = path.join(tempDir, 'input.class');
-  const krak2Path = ensureKrak2Path();
 
   try {
-    execFileSync(krak2Path, ['asm', inputPath, '--out', tempClassFile], {
-      stdio: 'inherit',
-    });
+    assembleJasminFile(inputPath, tempClassFile);
     const classBytes = fs.readFileSync(tempClassFile);
     const parsed = getAST(new Uint8Array(classBytes));
     const converted = convertJson(parsed.ast, parsed.constantPool);

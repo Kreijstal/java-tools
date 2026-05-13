@@ -54,6 +54,9 @@ function formatJavaNumber(value, type) {
     // For float, use 7 decimal places like Java typically does
     return value.toFixed(7).replace(/\.?0+$/, "");
   }
+  if (type === 'char' || type === 'C') {
+    return String.fromCharCode(value);
+  }
   if (type === 'int' || type === 'I' || type === 'short' || type === 'S' || type === 'byte' || type === 'B') {
     return String(value);
   }
