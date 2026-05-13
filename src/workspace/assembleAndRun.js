@@ -1,6 +1,7 @@
 const fs = require('fs');
-const { execSync, execFileSync } = require('child_process');
+const { execSync } = require('child_process');
 const { unparseDataStructures } = require('../parsing/convert_tree');
+const { writeClassAstToClassFile } = require('../parsing/classAstToClassFile');
 const path = require('path');
  
 function assembleClasses(root, baseOutputDir = '.') {
@@ -21,14 +22,8 @@ function assembleClasses(root, baseOutputDir = '.') {
     const jContent = unparseDataStructures(cls, constantPool);
     fs.writeFileSync(jFileName, jContent);
 
-    // Find Krakatau binary relative to project root
-    const krak2Path = path.resolve(__dirname, '../../tools/krakatau/Krakatau/target/release/krak2');
-    if (!fs.existsSync(krak2Path)) {
-      throw new Error(`Krakatau binary not found at ${krak2Path}`);
-    }
-    // Execute Krakatau asm command with the specified output directory
-    // Use execFileSync to avoid shell interpretation of special characters like $
-    execFileSync(krak2Path, ['asm', jFileName, '--out', classFileName]);
+    // Assemble using the repository's JavaScript class writer.
+    writeClassAstToClassFile(cls, classFileName);
   });
 }
 

@@ -11,6 +11,95 @@ function ensureSet(obj) {
 
 
 
+
+function javaString(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string') return value;
+  if (value && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
+  return String(value);
+}
+
+function fieldValue(obj, name) {
+  if (!obj) return undefined;
+  if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
+  if (obj.fields) {
+    const exact = Object.keys(obj.fields).find((key) => key.endsWith(`.${name}`));
+    if (exact) return obj.fields[exact];
+  }
+  return undefined;
+}
+
+function bitSetKey(obj) {
+  const bits = obj && obj.bits instanceof Set ? Array.from(obj.bits) : [];
+  bits.sort((a, b) => a - b);
+  return bits.join(',');
+}
+
+function canonicalKey(key) {
+  if (key === null || key === undefined) return 'null';
+  if (typeof key === 'number') return `number:${key}`;
+  if (typeof key === 'bigint') return `bigint:${key.toString()}`;
+  if (typeof key === 'boolean') return `boolean:${key ? 1 : 0}`;
+  if (typeof key === 'string') return `string:${key}`;
+  const type = classNameOf(key);
+  if (type === 'java/lang/String' || key instanceof String) return `java/lang/String:${String(key.value !== undefined ? key.value : key)}`;
+  switch (type) {
+    case 'org/benf/cfr/reader/bytecode/analysis/parse/utils/Pair':
+      return `${type}:${canonicalKey(fieldValue(key, 'x'))}:${canonicalKey(fieldValue(key, 'y'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/variables/Slot':
+      return `${type}:${String(fieldValue(key, 'idx'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/variables/Ident':
+      return `${type}:${String(fieldValue(key, 'stackpos'))}:${String(fieldValue(key, 'idx'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/parse/utils/SSAIdent':
+      return `${type}:${canonicalKey(fieldValue(key, 'val'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/variables/NamedVariableDefault':
+      return `${type}:${javaString(fieldValue(key, 'name'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/variables/NamedVariableFromHint':
+      return `${type}:${javaString(fieldValue(key, 'name'))}:${String(fieldValue(key, 'slot'))}:${String(fieldValue(key, 'idx'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/parse/lvalue/LocalVariable':
+      return `${type}:${canonicalKey(fieldValue(key, 'name'))}:${String(fieldValue(key, 'idx'))}:${canonicalKey(fieldValue(key, 'ident'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/parse/lvalue/SentinelLocalClassLValue':
+      return `${type}:${canonicalKey(fieldValue(key, 'localClassType'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/types/JavaRefTypeInstance':
+      return `${type}:${javaString(fieldValue(key, 'className'))}`;
+    case 'org/benf/cfr/reader/bytecode/analysis/types/RawJavaType':
+      return `${type}:${javaString(fieldValue(key, 'name'))}`;
+    case 'java/util/BitSet':
+      return `${type}:${bitSetKey(key)}`;
+    default:
+      break;
+  }
+  if (type && type.endsWith('$SentinelNV')) {
+    return `${type}:${canonicalKey(fieldValue(key, 'typeInstance'))}`;
+  }
+  if (Object.prototype.hasOwnProperty.call(key, 'value')) {
+    switch (type) {
+      case 'java/lang/Integer':
+      case 'java/lang/Long':
+      case 'java/lang/Short':
+      case 'java/lang/Byte':
+      case 'java/lang/Character':
+      case 'java/lang/Boolean':
+      case 'java/lang/Float':
+      case 'java/lang/Double':
+        return `${type}:${String(key.value)}`;
+      default:
+        break;
+    }
+  }
+  if (!Object.prototype.hasOwnProperty.call(key, '__hashSetIdentity')) {
+    Object.defineProperty(key, '__hashSetIdentity', {
+      value: HashSetIdentity.next++,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return `object:${key.__hashSetIdentity}`;
+}
+
+const HashSetIdentity = { next: 1 };
+
 function classNameOf(obj) {
   return obj && (obj._className || obj.type);
 }
@@ -25,6 +114,8 @@ function classEquals(jvm, className, a, b) {
 function javaEquals(jvm, a, b) {
   if (a === b) return true;
   if (a === null || a === undefined || b === null || b === undefined) return false;
+
+  if (canonicalKey(a) === canonicalKey(b)) return true;
 
   const av = a && Object.prototype.hasOwnProperty.call(a, 'value') ? a.value : undefined;
   const bv = b && Object.prototype.hasOwnProperty.call(b, 'value') ? b.value : undefined;

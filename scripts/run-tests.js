@@ -7,7 +7,8 @@ if (!process.env.JVM_DISABLE_AUDIO) {
   process.env.JVM_DISABLE_AUDIO = "1";
 }
 
-const RUNNER_CMD = ["bash", ["run-tests.sh"]];
+const runnerArgs = process.argv.slice(2);
+const RUNNER_CMD = ["bash", ["run-tests.sh", ...runnerArgs]];
 
 function runPlain() {
   return new Promise((resolve, reject) => {
@@ -35,11 +36,17 @@ function runWithSummary() {
     const rl = readline.createInterface({ input: runner.stdout });
     let total = 0;
     let failed = 0;
+    let skippedFiles = 0;
     const failures = [];
     let collecting = null;
 
     rl.on("line", (line) => {
       if (line.startsWith("Running test:")) {
+        process.stdout.write(`\n${line}\n`);
+        return;
+      }
+      if (line.startsWith("Skipping test:")) {
+        skippedFiles += 1;
         process.stdout.write(`\n${line}\n`);
         return;
       }
@@ -86,7 +93,8 @@ function runWithSummary() {
           process.stdout.write("\n");
         });
       } else {
-        process.stdout.write(`\n${total} tests passed\n`);
+        const skippedSuffix = skippedFiles ? `, ${skippedFiles} test file(s) skipped` : '';
+        process.stdout.write(`\n${total} tests passed${skippedSuffix}\n`);
       }
 
       if (signal) {

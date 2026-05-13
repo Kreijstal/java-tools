@@ -114,11 +114,7 @@ module.exports = {
     "doubleValue()D": (jvm, obj, args) => {
       return obj.value;
     },
-    "toString()Ljava/lang/String;": (jvm, obj, args) => {
-      // Defer to the static toString method for consistent formatting.
-      const doubleClass = jvm.getStatic('java/lang/Double');
-      return doubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, [obj.value]);
-    },
+    "toString()Ljava/lang/String;": (jvm, obj, args) => module.exports.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, [obj.value]),
     "getClass()Ljava/lang/Class;": (jvm, obj, args) => {
       return {
         type: "java/lang/Class",

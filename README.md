@@ -33,7 +33,7 @@ A comprehensive toolkit for Java bytecode analysis, manipulation, and execution.
 - **Cross-Platform**: Same code runs in Node.js and browsers
 
 ### 🛠️ Development Tools
-- **Krakatau Integration**: Advanced bytecode assembler/disassembler
+- **Native Assembly/Disassembly**: JavaScript Jasmin parser, class-file writer, and class disassembler
 - **Class Manipulation**: Load, modify, and generate class files
 - **Native Methods**: JNI (Java Native Interface) support
 - **Build System**: Complete webpack-based build pipeline
@@ -75,6 +75,15 @@ javac sources/Hello.java
 # Parse and analyze the class file
 node scripts/runLoadAndTraverse.js Hello sources
 ```
+
+#### Run the native JavaScript CFR-style decompiler
+
+```bash
+npm run cfr -- sources/VerySimple.class
+npm run cfr -- --outputdir /tmp/decompiled sources/VerySimple.class
+```
+
+`npm run cfr` uses `src/decompiler/cfr.js`, so it does not require `CFR.jar` or a Java process. The CFR fixture tests under `test/fixtures/cfr` assemble bytecode with the repo-native Jasmin assembler and compare the JavaScript decompiler against ported CFR expected-output bodies.
 
 #### Execute Java Bytecode
 
@@ -317,9 +326,16 @@ Run the comprehensive test suite:
 # Run all tests
 npm test
 
-# Run specific test categories
-npm run test:arithmetic
-npm run test:awt
+# Skip test files by substring or glob
+npm test -- --skip roundtrip
+JVM_TEST_SKIP=roundtrip npm test
+
+# Continue through later test files after a failure
+npm test -- --continue-on-failure
+
+# Run specific test files/categories
+npm test -- arithmetic
+npm run test:cfr  # integration plus ported CFR fixture coverage
 
 # Run browser tests
 npm run test:playwright
@@ -338,18 +354,18 @@ npm run test:playwright
 ├── test/                  # Test files and test runners
 ├── scripts/               # Build and utility scripts
 ├── examples/              # Web interface examples
-├── tools/                 # External tools (Krakatau)
+├── tools/                 # Optional external bytecode tools
 └── dist/                  # Built distribution files
 ```
 
-## 🔗 Krakatau Integration
+## 🔗 JVM Assembly and Disassembly
 
-This project integrates with [Krakatau](https://github.com/Storyyeller/Krakatau), an advanced Java bytecode assembler/disassembler:
+The repository has native JavaScript bytecode tooling:
 
-- **Disassembly**: Convert .class files to Krakatau assembly format
-- **Assembly**: Generate .class files from Krakatau assembly
-- **Manipulation**: Modify bytecode using assembly representation
-- **Analysis**: Advanced bytecode analysis capabilities
+- **Disassembly**: `node scripts/jvm-cli.js disassemble Foo.class --stdout`
+- **Assembly**: `node scripts/jvm-cli.js assemble Foo.j --out Foo.class`
+- **Manipulation**: Modify class ASTs and write `.class` files with `src/parsing/classAstToClassFile.js`
+- **Decompilation**: `npm run cfr -- Foo.class` uses the JavaScript CFR-style decompiler
 
 ## 🤝 Contributing
 
@@ -427,7 +443,7 @@ Single Node.js process; round-trips between every pass.
 ## 🙏 Acknowledgments
 
 - **jvm_parser**: Java class file parsing library
-- **Krakatau**: Advanced bytecode manipulation tools
+- **Jasmin/Krakatau-style syntax**: Inspiration for the assembly representation
 - **Java Community**: Inspiration from various JVM implementations
 
 ---

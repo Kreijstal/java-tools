@@ -5,7 +5,7 @@ const { execFileSync } = require('child_process');
 const test = require('tape');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../src/parsing/convert_tree');
-const { ensureKrak2Path } = require('../src/utils/krakatau');
+const { assembleJasminFixture } = require('../src/utils/jasminAssembly');
 
 const JASMIN_DIR = path.join(__dirname, '..', 'examples', 'sources', 'jasmin');
 
@@ -18,12 +18,8 @@ function withTempDir(prefix, fn) {
   }
 }
 
-function assembleJasminFile(tempDir, krak2Path, jasminFile) {
-  const jasminSource = path.join(JASMIN_DIR, jasminFile);
-  const className = path.basename(jasminFile, '.j');
-  const classOutput = path.join(tempDir, `${className}.class`);
-  execFileSync(krak2Path, ['asm', jasminSource, '--out', classOutput]);
-  return classOutput;
+function assembleJasminFile(tempDir, jasminFile) {
+  return assembleJasminFixture(JASMIN_DIR, tempDir, jasminFile);
 }
 
 function convertClassFromFile(classFilePath) {
@@ -54,11 +50,9 @@ function getMethodInstructions(classItem, methodName) {
 test('optimizer CLI folds caller test class and emits optimized output', (t) => {
   t.plan(4);
   const cliPath = path.join(__dirname, '..', 'tools', 'optimizer-cli.js');
-  const krak2Path = ensureKrak2Path();
-
   withTempDir('optimizer-cli-', (tempDir) => {
-    const callerClassPath = assembleJasminFile(tempDir, krak2Path, 'Caller.j');
-    const pureMathClassPath = assembleJasminFile(tempDir, krak2Path, 'PureMath.j');
+    const callerClassPath = assembleJasminFile(tempDir, 'Caller.j');
+    const pureMathClassPath = assembleJasminFile(tempDir, 'PureMath.j');
     const outputDir = path.join(tempDir, 'optimized');
 
     const stdout = execFileSync('node', [

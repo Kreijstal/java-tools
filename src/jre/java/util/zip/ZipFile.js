@@ -30,10 +30,19 @@ function makeEntry(jvm, name, zipObject) {
 
 async function openZip(jvm, obj, zipPath) {
   const resolved = path.resolve(zipPath);
-  const data = await fs.promises.readFile(resolved);
-  obj.path = resolved;
-  obj.zip = await JSZip.loadAsync(data);
-  obj.closed = false;
+  try {
+    const stats = await fs.promises.stat(resolved);
+    if (!stats.isFile()) {
+      jvm.throwException('java/io/IOException', `${resolved} is not a file`);
+    }
+    const data = await fs.promises.readFile(resolved);
+    obj.path = resolved;
+    obj.zip = await JSZip.loadAsync(data);
+    obj.closed = false;
+  } catch (error) {
+    if (error && error.type) throw error;
+    jvm.throwException('java/io/IOException', error && error.message ? error.message : String(error));
+  }
 }
 
 module.exports = {

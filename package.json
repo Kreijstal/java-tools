@@ -17,7 +17,11 @@
     "pretest": "node scripts/generate-jre-index.js &&npm run build:java",
     "ci": "npm run build && npm test",
     "health-check": "node scripts/health-check.js",
-    "lint:jasmin": "node scripts/jvm-cli.js lint"
+    "lint:jasmin": "node scripts/jvm-cli.js lint",
+    "cfr": "node scripts/runCfr.js",
+    "compile:java": "node scripts/compileJava.js",
+    "test:cfr": "node node_modules/tape/bin/tape test/cfrIntegration.test.js test/cfrFixtures.test.js test/cfrStructuredFeatures.test.js test/cfrAdditionalFeatures.test.js",
+    "test:java-frontend": "node node_modules/tape/bin/tape test/javaFrontendAst.test.js test/javaFrontendPassManager.test.js test/javaFrontendCfg.test.js test/javaFrontendCfgJoinStubs.test.js test/javaFrontendExpectedPassStubs.test.js test/javaFrontendHelloWorldCompile.test.js"
   },
   "keywords": [],
   "author": "kreijstal",
@@ -27,15 +31,14 @@
     "@modelcontextprotocol/sdk": "^1.21.1",
     "crc-32": "^1.2.2",
     "decimal.js": "^10.4.3",
-    "diff": "^8.0.2",
+    "diff": "^8.0.0",
     "jszip": "^3.10.1",
     "jvm_parser": "^0.0.12",
     "node-fetch": "^3.0.0",
     "parsimmon": "^1.18.1",
     "puppeteer": "^24.17.0",
     "url": "^0.11.4",
-    "yargs": "^17.7.2",
-    "diff": "^8.0.0"
+    "yargs": "^17.7.2"
   },
   "optionalDependencies": {
     "speaker": "^0.5.5"

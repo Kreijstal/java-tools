@@ -1,6 +1,24 @@
 const fs = require('fs');
 const path = require('path');
 
+
+function makeFile(filePath) {
+  return { type: 'java/io/File', path: filePath };
+}
+
+function makeFileArray(files) {
+  files.type = '[Ljava/io/File;';
+  files.elementType = 'java/io/File';
+  return files;
+}
+
+function stringValue(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
+  return String(value);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/io/Serializable'],
@@ -12,16 +30,15 @@ module.exports = {
   },
   methods: {
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
-      const pathname = args[0];
-      obj.path = pathname ? String(pathname) : '';
+      obj.path = stringValue(args[0]);
     },
     
     '<init>(Ljava/lang/String;Ljava/lang/String;)V': (jvm, obj, args) => {
       const parent = args[0];
       const child = args[1];
       
-      const parentPath = parent && parent.value ? parent.value : '';
-      const childPath = child && child.value ? child.value : '';
+      const parentPath = stringValue(parent);
+      const childPath = stringValue(child);
       
       if (parentPath) {
         obj.path = path.join(parentPath, childPath);
@@ -35,7 +52,7 @@ module.exports = {
       const child = args[1];
       
       const parentPath = parent && parent.path ? parent.path : '';
-      const childPath = child && child.value ? child.value : '';
+      const childPath = stringValue(child);
       
       if (parentPath) {
         obj.path = path.join(parentPath, childPath);
@@ -108,6 +125,53 @@ module.exports = {
         return true;
       } catch (e) {
         return false;
+      }
+    },
+
+    'mkdirs()Z': (jvm, obj, args) => {
+      try {
+        fs.mkdirSync(obj.path, { recursive: true });
+        return true;
+      } catch (e) {
+        return false;
+      }
+    },
+
+    'canRead()Z': (jvm, obj, args) => {
+      try {
+        fs.accessSync(obj.path, fs.constants.R_OK);
+        return 1;
+      } catch (e) {
+        return 0;
+      }
+    },
+
+    'getParent()Ljava/lang/String;': (jvm, obj, args) => {
+      const parent = path.dirname(obj.path);
+      return parent && parent !== obj.path ? jvm.internString(parent) : null;
+    },
+
+    'getParentFile()Ljava/io/File;': (jvm, obj, args) => {
+      const parent = path.dirname(obj.path);
+      return parent && parent !== obj.path ? makeFile(parent) : null;
+    },
+
+    'list()[Ljava/lang/String;': (jvm, obj, args) => {
+      try {
+        const entries = fs.readdirSync(obj.path).map((entry) => jvm.internString(entry));
+        entries.type = '[Ljava/lang/String;';
+        entries.elementType = 'java/lang/String';
+        return entries;
+      } catch (e) {
+        return null;
+      }
+    },
+
+    'listFiles()[Ljava/io/File;': (jvm, obj, args) => {
+      try {
+        return makeFileArray(fs.readdirSync(obj.path).map((entry) => makeFile(path.join(obj.path, entry))));
+      } catch (e) {
+        return null;
       }
     },
     

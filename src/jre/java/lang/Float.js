@@ -38,6 +38,16 @@ module.exports = {
 
       return floatObj;
     },
+    'isInfinite(F)Z': (jvm, obj, args) => {
+      const value = args[0];
+      return !isFinite(value) && !isNaN(value) ? 1 : 0;
+    },
+    'isNaN(F)Z': (jvm, obj, args) => {
+      return isNaN(args[0]) ? 1 : 0;
+    },
+    'isFinite(F)Z': (jvm, obj, args) => {
+      return isFinite(args[0]) ? 1 : 0;
+    },
     'toString(F)Ljava/lang/String;': (jvm, obj, args) => {
       const f = args[0];
       if (isNaN(f)) {
