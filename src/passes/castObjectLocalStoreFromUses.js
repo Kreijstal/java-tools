@@ -105,8 +105,28 @@ function impliedDescriptorAtUse(items, loadIndex) {
     const ref = arg(items[useIndex]);
     return Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
   }
+  if (itemOp === 'aastore') return impliedDescriptorFromArrayStoreValue(items, loadIndex);
   if (itemOp === 'ifnull' || itemOp === 'ifnonnull' || itemOp === 'if_acmpeq' || itemOp === 'if_acmpne') {
     return null;
+  }
+  return null;
+}
+
+function impliedDescriptorFromArrayStoreValue(items, loadIndex) {
+  const indexProducer = previousInstructionIndex(items, loadIndex);
+  if (indexProducer < 0) return null;
+  const arrayProducer = previousInstructionIndex(items, indexProducer);
+  if (arrayProducer < 0) return null;
+  const desc = arrayDescriptorAt(items[arrayProducer]);
+  if (typeof desc !== 'string' || !desc.startsWith('[L')) return null;
+  return desc.slice(1);
+}
+
+function arrayDescriptorAt(item) {
+  const itemOp = op(item);
+  if (itemOp === 'getfield' || itemOp === 'getstatic') {
+    const ref = arg(item);
+    return Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
   }
   return null;
 }
@@ -130,6 +150,13 @@ function previousOp(items, index) {
     if (items[i] && items[i].instruction) return op(items[i]);
   }
   return null;
+}
+
+function previousInstructionIndex(items, index) {
+  for (let i = index - 1; i >= 0; i -= 1) {
+    if (items[i] && items[i].instruction) return i;
+  }
+  return -1;
 }
 
 function nextInstructionIndex(items, index) {

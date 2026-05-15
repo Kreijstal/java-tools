@@ -344,3 +344,47 @@ test('dead-flag discovery: rejects writes guarded by the same field', (t) => {
   t.ok(r.rejected.includes('client.A'));
   t.end();
 });
+
+test('dead-flag discovery: accepts terminal self-increment int sentinel when enabled', (t) => {
+  const ast = astWithClasses([
+    {
+      className: 'client',
+      items: [
+        staticField('G', 'I'),
+        methodWith('consume', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'client', ['G', 'I']] } },
+          { instruction: 'istore_1' },
+          { instruction: 'iload_1' },
+          { instruction: { op: 'ifne', arg: 'Lret' } },
+          { instruction: 'return' },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+    {
+      className: 'Writer',
+      items: [
+        methodWith('bumpAtTail', [
+          { instruction: { op: 'getstatic', arg: ['Field', 'client', ['G', 'I']] } },
+          { instruction: 'istore_3' },
+          { instruction: { op: 'getstatic', arg: ['Field', 'wi', ['g', 'Z']] } },
+          { instruction: { op: 'ifeq', arg: 'Lret' } },
+          { instruction: { op: 'iinc', varnum: '3', incr: '1' } },
+          { instruction: 'iload_3' },
+          { instruction: { op: 'putstatic', arg: ['Field', 'client', ['G', 'I']] } },
+          { instruction: { op: 'goto', arg: 'Lret' } },
+          { labelDef: 'Ldead:', instruction: 'athrow' },
+          { labelDef: 'Lret:', instruction: 'return' },
+        ]),
+      ],
+    },
+  ]);
+  const disabled = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.notOk(disabled.fields.includes('client.G'));
+  const enabled = discoverDeadStaticFlags(ast, {
+    allowIntFlags: true,
+    allowTerminalSelfIncrementFlags: true,
+  });
+  t.ok(enabled.fields.includes('client.G'));
+  t.end();
+});
