@@ -341,6 +341,7 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
 
 function discoverDeadStaticFlags(astRoot, options = {}) {
   const allowIntFlags = !!options.allowIntFlags;
+  const allowTerminalSelfIncrementFlags = !!options.allowTerminalSelfIncrementFlags;
   const candidates = collectZeroStaticFields(astRoot, { allowIntFlags });
   const writesByField = collectStaticWrites(astRoot, candidates);
   const deps = new Map();
@@ -350,6 +351,9 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   for (const [key, writes] of writesByField) {
     for (const write of writes) {
+      if (allowTerminalSelfIncrementFlags && isTerminalSelfIncrementWrite(write, key, candidates)) {
+        continue;
+      }
       const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
       if (!guard) {
         rejected.add(key);
@@ -393,6 +397,53 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
     .filter((key) => !rejected.has(key) && (candidates.get(key).desc === 'I' || consumerFields.has(key)))
     .sort();
   return { fields, rejected: [...rejected].sort(), dependencies: deps };
+}
+
+function isTerminalSelfIncrementWrite(write, key, candidates) {
+  const candidate = candidates.get(key);
+  if (!candidate || candidate.desc !== 'I') return false;
+  const putInsn = write.codeItems[write.index] && write.codeItems[write.index].instruction;
+  if (getOp(putInsn) !== 'putstatic') return false;
+  const load = previousInstruction(write.codeItems, write.index);
+  if (!load || !ILOAD_OPS.has(getOp(load.item.instruction))) return false;
+  const local = localOf(getOp(load.item.instruction), getArg(load.item.instruction));
+  if (local == null) return false;
+  const inc = previousInstruction(write.codeItems, load.index);
+  if (!inc || getOp(inc.item.instruction) !== 'iinc' || localOfIinc(inc.item.instruction) !== local) return false;
+  if (!isLocalLoadedFromField(write.codeItems, key, local, inc.index)) return false;
+  return hasOnlyTerminalFlowAfter(write.codeItems, write.index);
+}
+
+function isLocalLoadedFromField(codeItems, key, local, beforeIdx) {
+  for (let i = 0; i < beforeIdx; i += 1) {
+    const item = codeItems[i];
+    const insn = item && item.instruction;
+    if (!insn || getOp(insn) !== 'getstatic') continue;
+    const ref = fieldRefOf(getArg(insn));
+    if (!ref || fieldKey(ref) !== key) continue;
+    const next = nextInstruction(codeItems, i);
+    if (!next || !ISTORE_OPS.has(getOp(next.item.instruction))) continue;
+    if (localOf(getOp(next.item.instruction), getArg(next.item.instruction)) === local) return true;
+  }
+  return false;
+}
+
+function hasOnlyTerminalFlowAfter(codeItems, index) {
+  const labels = collectLabelIndices(codeItems);
+  for (let i = index + 1; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const insn = item && item.instruction;
+    if (!insn) continue;
+    const op = getOp(insn);
+    if (op === 'return' || op === 'athrow') continue;
+    if (op === 'goto') {
+      const target = labels.get(trimLabel(getArg(insn)));
+      if (target == null || target <= index) return false;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 function collectZeroStaticFields(astRoot, opts) {
@@ -569,7 +620,7 @@ function localFieldBindingAt(codeItems, local, useIdx, candidates) {
     const insn = item && item.instruction;
     if (!insn) continue;
     const op = getOp(insn);
-    if (op === 'iinc' && localOfIinc(getArg(insn)) === local) return null;
+    if (op === 'iinc' && localOfIinc(insn) === local) return null;
     if (!ISTORE_OPS.has(op)) continue;
     const storedLocal = localOf(op, getArg(insn));
     if (storedLocal !== local) continue;
@@ -582,8 +633,14 @@ function localFieldBindingAt(codeItems, local, useIdx, candidates) {
   return null;
 }
 
-function localOfIinc(arg) {
+function localOfIinc(instruction) {
+  const arg = getArg(instruction);
   if (arg && typeof arg === 'object' && typeof arg.local === 'number') return arg.local;
+  if (typeof instruction.varnum === 'number') return instruction.varnum;
+  if (typeof instruction.varnum === 'string') {
+    const n = parseInt(instruction.varnum, 10);
+    if (Number.isFinite(n)) return n;
+  }
   if (typeof arg === 'string') {
     const m = /^(\d+)\b/.exec(arg);
     if (m) return parseInt(m[1], 10);
