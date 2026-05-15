@@ -29,7 +29,7 @@ const tests = [
     name: "InstanceofTest",
     description: "instanceof instruction for array types",
     expectedOutput:
-      "=== instanceof Test ===\nString instanceof String: true\nString instanceof Object: true\nInteger instanceof Integer: true\nInteger instanceof Number: true\nint[] instanceof Object: false\nnull instanceof String: false\nnull instanceof Object: false\n=== Class Hierarchy Test ===\nParent instanceof Parent: true\nChild instanceof Parent: true\nChild instanceof Child: true\nParent ref to Child instanceof Child: true",
+      "=== instanceof Test ===\nString instanceof String: true\nString instanceof Object: true\nInteger instanceof Integer: true\nInteger instanceof Number: true\nint[] instanceof Object: true\nnull instanceof String: false\nnull instanceof Object: false\n=== Class Hierarchy Test ===\nParent instanceof Parent: true\nChild instanceof Parent: true\nChild instanceof Child: true\nParent ref to Child instanceof Child: true",
   },
   {
     name: "InnerClassTest",
