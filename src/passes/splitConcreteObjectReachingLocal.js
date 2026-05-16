@@ -34,6 +34,7 @@ function splitCode(code, options = {}) {
   let candidates = mergeCandidates(
     collectCandidates(code, cfg, analysis, dominators),
     collectLinearExplicitCastRanges(code),
+    collectSingleCastedRangesBeforeReferenceReuse(code, analysis),
     collectCastedLoopRanges(code),
     collectCastedCursorRanges(code, cfg, analysis, dominators),
   );
@@ -179,6 +180,85 @@ function collectCastedLoopRanges(code) {
       explicitCast: true,
       primitiveLocalWrite: false,
       loadItems,
+    });
+  }
+  return out;
+}
+
+function collectSingleCastedRangesBeforeReferenceReuse(code, analysis) {
+  const items = code.codeItems;
+  if (items.length > 10000) return [];
+  const out = [];
+  for (let i = 1; i < items.length; i += 1) {
+    const local = astoreLocal(items[i]);
+    if (local == null || op(items[i - 1]) !== 'checkcast') continue;
+    if (isHandlerStore(code.exceptionTable, items[i])) continue;
+    const desc = referenceDescriptorFromClassName(arg(items[i - 1]));
+    if (!isConcreteObjectDescriptor(desc) || desc.startsWith('[L')) continue;
+    const storeItems = [items[i]];
+
+    const loadItems = [];
+    let typedUses = 0;
+    let ok = true;
+    let scanStart = i + 1;
+    let nextStore = -1;
+    for (;;) {
+      nextStore = nextStoreIndex(items, scanStart, local);
+      if (nextStore < 0) {
+        ok = false;
+        break;
+      }
+      for (let j = scanStart; j < nextStore; j += 1) {
+        if (aloadLocal(items[j]) !== local) continue;
+        const useIndex = nextInstructionIndex(items, j);
+        if (useIndex < 0) {
+          ok = false;
+          break;
+        }
+        if (isNullCompare(items[useIndex])) {
+          loadItems.push(items[j]);
+          continue;
+        }
+        if (astoreLocal(items[useIndex]) != null) {
+          typedUses += 1;
+          loadItems.push(items[j]);
+          continue;
+        }
+        if (isMatchingFieldRead(items[useIndex], desc) ||
+            isMatchingFieldReceiverWrite(items, j, desc) ||
+            methodArgumentDescriptorAtUse(items, j) === desc) {
+          typedUses += 1;
+          loadItems.push(items[j]);
+          continue;
+        }
+        ok = false;
+        break;
+      }
+      if (!ok) break;
+      const nextDesc = concreteObjectProducerDescriptor(items, nextStore, analysis) ||
+        producerDescriptor(items, previousInstructionIndex(items, nextStore));
+      if (nextDesc === desc && previousCastedStore(items, nextStore + 1, local, desc) === nextStore) {
+        storeItems.push(items[nextStore]);
+        scanStart = nextStore + 1;
+        continue;
+      }
+      break;
+    }
+    if (!ok) continue;
+    const nextDesc = concreteObjectProducerDescriptor(items, nextStore, analysis) ||
+      producerDescriptor(items, previousInstructionIndex(items, nextStore));
+    if (nextDesc === desc || !isReferenceDescriptor(nextDesc)) continue;
+    if (!ok || typedUses === 0 || loadItems.length === 0) continue;
+    out.push({
+      storeIndex: i,
+      storeItem: items[i],
+      storeItems,
+      local,
+      desc,
+      explicitCast: true,
+      primitiveLocalWrite: false,
+      loadItems,
+      noPreserveOriginal: true,
     });
   }
   return out;
@@ -567,6 +647,27 @@ function concreteObjectProducerDescriptor(items, storeIndex, analysis, seen = ne
     if (duplicatedIndex >= 0) {
       const duplicatedDesc = producerDescriptor(items, duplicatedIndex);
       if (isConcreteObjectDescriptor(duplicatedDesc)) return duplicatedDesc;
+      const duplicatedLocal = aloadLocal(items[duplicatedIndex]);
+      if (duplicatedLocal != null && analysis) {
+        const reaching = analysis.before[duplicatedIndex] && analysis.before[duplicatedIndex].get(duplicatedLocal);
+        if (reaching && reaching.size === 1) {
+          const [defId] = reaching;
+          const def = analysis.defs.get(defId);
+          if (def) {
+            const desc = concreteObjectProducerDescriptor(items, def.index, analysis, seen);
+            if (isConcreteObjectDescriptor(desc)) return desc;
+          }
+        }
+      }
+      if (duplicatedLocal != null) {
+        for (let j = duplicatedIndex - 1; j >= 0; j -= 1) {
+          if (primitiveStoreLocal(items[j]) === duplicatedLocal || iincLocal(items[j]) === duplicatedLocal) break;
+          if (astoreLocal(items[j]) !== duplicatedLocal) continue;
+          const desc = concreteObjectProducerDescriptor(items, j, analysis, seen);
+          if (isConcreteObjectDescriptor(desc)) return desc;
+          break;
+        }
+      }
     }
   }
   if (astoreLocal(items[prev]) != null) {
@@ -628,6 +729,10 @@ function isConcreteObjectDescriptor(desc) {
   if (typeof desc !== 'string' || !/^(?:L|\[L)[^;]+;$/.test(desc)) return false;
   return desc !== 'Ljava/lang/Object;' && desc !== 'Ljava/lang/Throwable;' &&
     desc !== 'Ljava/lang/Exception;' && desc !== '[Ljava/lang/Object;';
+}
+
+function isReferenceDescriptor(desc) {
+  return typeof desc === 'string' && (desc.startsWith('L') || desc.startsWith('['));
 }
 
 function isConcreteClassName(target) {
