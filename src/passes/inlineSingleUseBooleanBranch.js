@@ -23,7 +23,6 @@ function rewriteCode(code) {
   const labelIndexes = labelIndexMap(items);
   let rewrites = 0;
   rewrites += rewriteLoopCarriedBooleanTemps(code, referenced, labelIndexes);
-  rewrites += intizeBooleanFieldStores(code, referenced);
   for (let i = 0; i + 2 < items.length; i += 1) {
     if (!isBooleanProducingCall(items[i - 1])) continue;
     const local = istoreLocal(items[i]);
@@ -42,14 +41,15 @@ function rewriteCode(code) {
     items.splice(i, 2);
     rewrites += 1;
   }
+  rewrites += intizeBooleanStores(code, referenced);
   return rewrites;
 }
 
-function intizeBooleanFieldStores(code, referenced) {
+function intizeBooleanStores(code, referenced) {
   const items = code.codeItems;
   let rewrites = 0;
   for (let i = 0; i + 1 < items.length; i += 1) {
-    if (!isBooleanFieldRead(items[i])) continue;
+    if (!isBooleanProducer(items[i])) continue;
     const local = istoreLocal(items[i + 1]);
     if (local == null) continue;
     if (isReferencedLabel(items[i + 1], referenced)) continue;

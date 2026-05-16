@@ -153,6 +153,40 @@ test('intizes boolean field stores into mixed int locals', (t) => {
   t.end();
 });
 
+test('intizes boolean call stores into mixed int locals', (t) => {
+  const code = {
+    codeItems: [
+      { instruction: 'iconst_0' },
+      { instruction: { op: 'istore', arg: '5' } },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'ml', ['k', '(B)Z']] } },
+      { instruction: { op: 'istore', arg: '5' } },
+      { instruction: { op: 'iload', arg: '5' } },
+      { instruction: { op: 'ifne', arg: 'Done' } },
+      { instruction: { op: 'iload', arg: '5' } },
+      { instruction: { op: 'ifne', arg: 'Done' } },
+      { labelDef: 'Done:', instruction: 'return' },
+    ],
+  };
+
+  t.equal(rewriteCode(code), 1);
+  t.deepEqual(code.codeItems.map((item) => item.instruction), [
+    'iconst_0',
+    { op: 'istore', arg: '5' },
+    { op: 'invokevirtual', arg: ['Method', 'ml', ['k', '(B)Z']] },
+    { op: 'ifeq', arg: 'L_bool_false' },
+    'iconst_1',
+    { op: 'goto', arg: 'L_bool_store' },
+    'iconst_0',
+    { op: 'istore', arg: '5' },
+    { op: 'iload', arg: '5' },
+    { op: 'ifne', arg: 'Done' },
+    { op: 'iload', arg: '5' },
+    { op: 'ifne', arg: 'Done' },
+    'return',
+  ]);
+  t.end();
+});
+
 test('keeps boolean field stores for pure boolean locals', (t) => {
   const code = {
     codeItems: [

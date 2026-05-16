@@ -319,3 +319,28 @@ test('splits loop-carried casted cursor before primitive local reuse', (t) => {
   t.deepEqual(code.codeItems[15].instruction, { op: 'istore', arg: '4' });
   t.end();
 });
+
+test('splits casted object before same local is reused as reference array', (t) => {
+  const code = {
+    locals: '3',
+    codeItems: [
+      { instruction: { op: 'invokestatic', arg: ['Method', 'List', ['first', '()Lksa;']] } },
+      { instruction: { op: 'checkcast', arg: 'tj' } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: { op: 'aload', arg: '1' } },
+      { instruction: { op: 'bipush', arg: '1' } },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'tj', ['e', '(I)I']] } },
+      { instruction: 'pop' },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'World', ['all', '()[Lsg;']] } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code), 1);
+  t.equal(code.codeItems[2].instruction, 'astore_3');
+  t.equal(code.codeItems[3].instruction, 'aload_3');
+  t.deepEqual(code.codeItems[8].instruction, { op: 'astore', arg: '1' });
+  t.end();
+});
