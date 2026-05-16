@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { runSplitTypedReusedLocals } = require('../src/passes/splitTypedReusedLocals');
+const { runSplitTypedReusedLocals, splitCode } = require('../src/passes/splitTypedReusedLocals');
 
 function astWith(codeItems) {
   return {
@@ -213,6 +213,38 @@ test('split-typed-reused-locals: infers invoke argument type through later stack
   t.end();
 });
 
+test('split-typed-reused-locals: infers invokevirtual receiver type through later stack pushes', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'aload', arg: '0' } },
+    { instruction: { op: 'checkcast', arg: 'sg' } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: { op: 'bipush', arg: '-106' } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'sg', ['g', '(B)I']] } },
+    { instruction: 'pop' },
+    { instruction: 'aconst_null' },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: 'return' },
+  ]);
+
+  const result = runSplitTypedReusedLocals(ast, { preserveOriginalLocals: true });
+
+  t.equal(result.rewrites, 1);
+  t.deepEqual(opsAndArgs(ast), [
+    'aload 0',
+    'checkcast sg',
+    'astore_2',
+    'aload_2',
+    'bipush -106',
+    'invokevirtual Method,sg,g,(B)I',
+    'pop',
+    'aconst_null',
+    'astore 1',
+    'return',
+  ]);
+  t.end();
+});
+
 test('split-typed-reused-locals: infers value type from typed object array store', (t) => {
   const ast = astWith([
     { instruction: { op: 'new', arg: 'wfb' } },
@@ -419,6 +451,65 @@ test('split-typed-reused-locals: keeps primitive-array candidates when object ca
   t.equal(result.rewrites, 2);
   t.ok(opsAndArgs(ast).includes('anewarray [I'), 'keeps primitive array allocation');
   t.ok(opsAndArgs(ast).includes('iaload'), 'keeps primitive array use');
+  t.end();
+});
+
+test('split-typed-reused-locals: keeps concrete reference-array candidates when object candidates exceed cap', (t) => {
+  const code = {
+    localsSize: '10',
+    codeItems: [
+      { instruction: { op: 'getfield', arg: ['Field', 'owner', ['objects', 'Ljava/lang/Object;']] } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: { op: 'aload', arg: '1' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'foo', ['foo_i', 'I']] } },
+      { instruction: 'pop' },
+      { instruction: { op: 'getfield', arg: ['Field', 'owner', ['sgs', '[Lsg;']] } },
+      { instruction: { op: 'astore', arg: '2' } },
+      { instruction: { op: 'aload', arg: '2' } },
+      { instruction: 'arraylength' },
+      { instruction: 'pop' },
+      { instruction: { op: 'aload', arg: '2' } },
+      { instruction: 'iconst_0' },
+      { instruction: 'aaload' },
+      { instruction: 'pop' },
+      { instruction: { op: 'getfield', arg: ['Field', 'owner', ['other', 'Ljava/lang/Object;']] } },
+      { instruction: { op: 'astore', arg: '2' } },
+    ],
+    exceptionTable: [],
+  };
+
+  const rewrites = splitCode(code, { maxCandidates: 1 });
+  t.equal(rewrites, 1);
+  t.deepEqual(code.codeItems[6].instruction, { op: 'astore', arg: '10' });
+  t.deepEqual(code.codeItems[7].instruction, { op: 'aload', arg: '10' });
+  t.end();
+});
+
+test('split-typed-reused-locals: detects reference array loads with local indexes before primitive slot reuse', (t) => {
+  const code = {
+    localsSize: '4',
+    codeItems: [
+      { instruction: { op: 'getfield', arg: ['Field', 'owner', ['sgs', '[Lsg;']] } },
+      { instruction: { op: 'astore', arg: '2' } },
+      { instruction: { op: 'aload', arg: '2' } },
+      { instruction: { op: 'iload', arg: '3' } },
+      { instruction: 'aaload' },
+      { instruction: 'pop' },
+      { instruction: 'iconst_0' },
+      { instruction: { op: 'istore', arg: '2' } },
+      { instruction: 'aconst_null' },
+      { instruction: { op: 'astore', arg: '2' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  const rewrites = splitCode(code, { preserveOriginalLocals: true });
+
+  t.equal(rewrites, 1);
+  t.deepEqual(code.codeItems[1].instruction, { op: 'astore', arg: '4' });
+  t.deepEqual(code.codeItems[2].instruction, { op: 'aload', arg: '4' });
+  t.deepEqual(code.codeItems[7].instruction, { op: 'istore', arg: '2' });
   t.end();
 });
 

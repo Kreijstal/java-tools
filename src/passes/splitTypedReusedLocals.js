@@ -41,7 +41,8 @@ function splitCodeOnce(code, options = {}) {
   let candidates = collectCandidates(code, analysis, options);
   const maxCandidates = options.maxCandidates || 64;
   if (candidates.length > maxCandidates) {
-    candidates = candidates.filter(isPrimitiveArrayCandidate);
+    candidates = candidates.filter((candidate) =>
+      isPrimitiveArrayCandidate(candidate) || isConcreteReferenceArrayCandidate(candidate));
     if (candidates.length === 0 || candidates.length > maxCandidates) return 0;
   }
 
@@ -102,10 +103,14 @@ function collectCandidates(code, analysis, options) {
     candidate.loads.push(items[i]);
   }
 
-  return [...byDef.values()].filter((candidate) => {
+  return [...byDef.values()].map((candidate) => ({
+    ...candidate,
+    loads: candidate.loads.filter((load) =>
+      !hasPrimitiveLocalWriteBetween(items, candidate.storeIndex, items.indexOf(load), candidate.local)),
+  })).filter((candidate) => {
     if (candidate.loads.length === 0) return false;
     if (!hasOtherReferenceStore(items, candidate.storeIndex, candidate.local) && !isPrimitiveArrayDescriptor(candidate.produced)) return false;
-    if (hasPrimitiveLocalWriteInRange(items, candidate.storeIndex, candidate.local)) return false;
+    if (hasPrimitiveLocalWriteBeforeLastCandidateLoad(items, candidate.storeIndex, candidate.local, candidate.loads)) return false;
     if (options.requireAllLoadsTyped && !allLoadsTypedForDef(items, analysis, candidate)) return false;
     return true;
   });
@@ -156,6 +161,8 @@ function expectedTypeFromInvokeUse(items, loadIndex, invokeIndex) {
   const desc = Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
   const args = argumentDescriptors(desc);
   if (!args) return null;
+  const owner = Array.isArray(ref) && typeof ref[1] === 'string' ? ref[1] : null;
+  const hasReceiver = !/^invokestatic/.test(op(items[invokeIndex]) || '');
 
   const marker = { marker: true };
   const stack = [marker];
@@ -166,6 +173,10 @@ function expectedTypeFromInvokeUse(items, loadIndex, invokeIndex) {
 
   for (let argIndex = args.length - 1, stackIndex = stack.length - 1; argIndex >= 0 && stackIndex >= 0; argIndex -= 1, stackIndex -= 1) {
     if (stack[stackIndex] === marker) return args[argIndex];
+  }
+  const receiverIndex = stack.length - args.length - 1;
+  if (hasReceiver && receiverIndex >= 0 && stack[receiverIndex] === marker && owner) {
+    return `L${owner};`;
   }
   return null;
 }
@@ -262,8 +273,23 @@ function hasOtherReferenceStore(items, selfIndex, local) {
   return false;
 }
 
-function hasPrimitiveLocalWriteInRange(items, storeIndex, local) {
+function hasPrimitiveLocalWriteBeforeLastCandidateLoad(items, storeIndex, local, loads) {
+  let lastLoadIndex = -1;
+  for (const load of loads || []) {
+    lastLoadIndex = Math.max(lastLoadIndex, items.indexOf(load));
+  }
+  if (lastLoadIndex <= storeIndex) return false;
   for (let i = storeIndex + 1; i < items.length; i += 1) {
+    if (astoreLocal(items[i]) === local) return false;
+    if (i >= lastLoadIndex) return false;
+    if (primitiveStoreLocal(items[i]) === local || iincLocal(items[i]) === local) return true;
+  }
+  return false;
+}
+
+function hasPrimitiveLocalWriteBetween(items, storeIndex, loadIndex, local) {
+  if (loadIndex <= storeIndex) return false;
+  for (let i = storeIndex + 1; i < loadIndex; i += 1) {
     if (astoreLocal(items[i]) === local) return false;
     if (primitiveStoreLocal(items[i]) === local || iincLocal(items[i]) === local) return true;
   }
@@ -273,6 +299,7 @@ function hasPrimitiveLocalWriteInRange(items, storeIndex, local) {
 function hasUnrewrittenLoadBeforeNextStore(items, storeIndex, local, rewrittenLoads) {
   for (let i = storeIndex + 1; i < items.length; i += 1) {
     if (astoreLocal(items[i]) === local) return false;
+    if (primitiveStoreLocal(items[i]) === local || iincLocal(items[i]) === local) return false;
     if (aloadLocal(items[i]) === local && !rewrittenLoads.includes(items[i])) return true;
   }
   return false;
@@ -306,7 +333,8 @@ function isSimpleStackProducer(item) {
   const itemOp = op(item);
   return itemOp === 'dup' || itemOp === 'dup_x1' || itemOp === 'dup_x2' ||
     itemOp === 'swap' || itemOp === 'iconst_0' || itemOp === 'iconst_1' ||
-    itemOp === 'bipush' || itemOp === 'sipush' || itemOp === 'ldc';
+    itemOp === 'bipush' || itemOp === 'sipush' || itemOp === 'ldc' ||
+    /^(?:i|f|d|l)load(?:_[0-3])?$/.test(itemOp || '');
 }
 
 function simulateStackEffect(item, stack) {
@@ -435,6 +463,15 @@ function isPrimitiveArrayDescriptor(desc) {
 
 function isPrimitiveArrayCandidate(candidate) {
   return isPrimitiveArrayDescriptor(candidate.produced) || isPrimitiveArrayDescriptor(candidate.expected);
+}
+
+function isConcreteReferenceArrayCandidate(candidate) {
+  return isConcreteReferenceArrayDescriptor(candidate.produced) ||
+    isConcreteReferenceArrayDescriptor(candidate.expected);
+}
+
+function isConcreteReferenceArrayDescriptor(desc) {
+  return typeof desc === 'string' && /^\[+L[^;]+;$/.test(desc) && desc !== '[Ljava/lang/Object;';
 }
 
 function arrayElementDescriptor(desc) {
