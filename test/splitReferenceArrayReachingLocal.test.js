@@ -97,3 +97,60 @@ test('widens copied reference array to later consumer type', (t) => {
   t.deepEqual(code.codeItems[8].instruction, { op: 'checkcast', arg: 'lc' });
   t.end();
 });
+
+test('splits concrete array view before widened local is narrowed again', (t) => {
+  const code = {
+    localsSize: '4',
+    stackSize: '2',
+    codeItems: [
+      { instruction: { op: 'aload', arg: '0' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'Owner', ['sgs', '[Lsg;']] } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: { op: 'aload', arg: '1' } },
+      { instruction: { op: 'astore', arg: '2' } },
+      { instruction: { op: 'aload', arg: '2' } },
+      { instruction: { op: 'checkcast', arg: '[Lsg;' } },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: { op: 'aload', arg: '0' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'Owner', ['tvs', '[Ltv;']] } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code), 1);
+  t.equal(code.localsSize, '5');
+  t.deepEqual(code.codeItems[2].instruction, { op: 'astore', arg: '4' });
+  t.deepEqual(code.codeItems[3].instruction, { op: 'aload', arg: '4' });
+  t.deepEqual(code.codeItems[10].instruction, { op: 'astore', arg: '1' });
+  t.end();
+});
+
+test('rewrites narrowed array alias copy back to live concrete source', (t) => {
+  const code = {
+    localsSize: '5',
+    stackSize: '2',
+    codeItems: [
+      { instruction: { op: 'aload', arg: '0' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'Owner', ['sgs', '[Lsg;']] } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: { op: 'aload', arg: '1' } },
+      { instruction: { op: 'astore', arg: '2' } },
+      { instruction: { op: 'aload', arg: '1' } },
+      { instruction: 'arraylength' },
+      { instruction: 'pop' },
+      { instruction: { op: 'aload', arg: '2' } },
+      { instruction: { op: 'astore', arg: '3' } },
+      { instruction: { op: 'aload', arg: '3' } },
+      { instruction: { op: 'checkcast', arg: '[Lsg;' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code), 1);
+  t.equal(code.codeItems[8].instruction, 'aload_1');
+  t.end();
+});

@@ -25,9 +25,11 @@ function splitCode(code) {
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
+  let rewrites = rewriteConcreteArrayAliasCopies(code, analysis);
   const candidates = mergeCandidates(
     collectCandidates(code, analysis),
     collectLinearPrimitiveReuseCandidates(code),
+    collectConcreteArrayViewCandidates(code, analysis),
   );
   if (candidates.length > 8) return 0;
 
@@ -56,7 +58,6 @@ function splitCode(code) {
     items.splice(insertion.index, 0, { instruction: { op: 'checkcast', arg: insertion.element } });
   }
 
-  let rewrites = 0;
   for (const candidate of candidates.sort((a, b) => b.storeIndex - a.storeIndex)) {
     const idx = items.indexOf(candidate.storeItem);
     if (idx < 0) continue;
@@ -64,6 +65,63 @@ function splitCode(code) {
     rewrites += 1;
   }
   return rewrites;
+}
+
+function rewriteConcreteArrayAliasCopies(code, analysis) {
+  const items = code.codeItems;
+  let rewrites = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    const aliasLocal = aloadLocal(items[i]);
+    if (aliasLocal == null) continue;
+    const useIndex = nextInstructionIndex(items, i);
+    const copiedLocal = useIndex >= 0 ? astoreLocal(items[useIndex]) : null;
+    if (copiedLocal == null) continue;
+    const aliasDef = singleReachingDef(analysis, i, aliasLocal);
+    if (!aliasDef) continue;
+    const sourceIndex = previousInstructionIndex(items, aliasDef.index);
+    if (sourceIndex < 0) continue;
+    const sourceLocal = aloadLocal(items[sourceIndex]);
+    if (sourceLocal == null || sourceLocal === aliasLocal) continue;
+    const sourceDefAtAlias = singleReachingDef(analysis, sourceIndex, sourceLocal);
+    const sourceDefAtUse = singleReachingDef(analysis, i, sourceLocal);
+    if (!sourceDefAtAlias || !sourceDefAtUse || sourceDefAtAlias.id !== sourceDefAtUse.id) continue;
+    const sourceDesc = referenceArrayProducerDescriptor(items, sourceDefAtAlias.index, analysis);
+    if (!isConcreteReferenceArrayDescriptor(sourceDesc)) continue;
+    const copiedUseDesc = firstConcreteArrayUseDescriptor(items, useIndex + 1, copiedLocal);
+    if (copiedUseDesc !== sourceDesc && !hasOnlyArrayOperationsUntilWrite(items, useIndex + 1, copiedLocal)) continue;
+    items[i].instruction = loadRef(sourceLocal);
+    rewrites += 1;
+  }
+  return rewrites;
+}
+
+function hasOnlyArrayOperationsUntilWrite(items, start, local) {
+  let arrayUses = 0;
+  for (let i = start; i < items.length; i += 1) {
+    if (astoreLocal(items[i]) === local || primitiveStoreLocal(items[i]) === local || iincLocal(items[i]) === local) return arrayUses > 0;
+    if (aloadLocal(items[i]) !== local) continue;
+    if (!hasArrayOperationWithin(items, i)) return false;
+    arrayUses += 1;
+  }
+  return arrayUses > 0;
+}
+
+function hasArrayOperationWithin(items, loadIndex) {
+  for (let i = nextInstructionIndex(items, loadIndex), seen = 0;
+    i >= 0 && seen < 5;
+    i = nextInstructionIndex(items, i), seen += 1) {
+    if (ARRAY_OPS.has(op(items[i]))) return true;
+    if (!isSimpleStackProducer(items[i])) return false;
+  }
+  return false;
+}
+
+function singleReachingDef(analysis, index, local) {
+  const reaching = analysis.before[index] && analysis.before[index].get(local);
+  if (!reaching || reaching.size !== 1) return null;
+  const [defId] = reaching;
+  if (typeof defId !== 'number') return null;
+  return analysis.defs.get(defId) || null;
 }
 
 function mergeCandidates(...groups) {
@@ -140,6 +198,80 @@ function collectLinearPrimitiveReuseCandidates(code) {
     }
   }
   return out;
+}
+
+function collectConcreteArrayViewCandidates(code, analysis) {
+  const byStore = new Map();
+  const items = code.codeItems;
+  for (let i = 0; i < items.length; i += 1) {
+    const local = aloadLocal(items[i]);
+    if (local == null) continue;
+    const expected = concreteArrayExpectedDescriptor(items, i);
+    if (!expected) continue;
+    const reaching = analysis.before[i] && analysis.before[i].get(local);
+    if (!reaching || reaching.size !== 1) continue;
+    const [defId] = reaching;
+    if (typeof defId !== 'number') continue;
+    const def = analysis.defs.get(defId);
+    if (!def || def.local !== local) continue;
+    if (isHandlerStore(code.exceptionTable, items[def.index])) continue;
+    const produced = referenceArrayProducerDescriptor(items, def.index, analysis);
+    if (produced !== expected) continue;
+    if (!hasArrayViewStore(items, def.index, local, expected, analysis)) continue;
+    const key = String(defId);
+    let candidate = byStore.get(key);
+    if (!candidate) {
+      candidate = { storeIndex: def.index, storeItem: items[def.index], local, desc: expected, loadItems: [] };
+      byStore.set(key, candidate);
+    }
+    candidate.loadItems.push(items[i]);
+  }
+  return [...byStore.values()].filter((candidate) =>
+    candidate.loadItems.length > 0 && hasOnlyConcreteArrayViewUses(items, candidate));
+}
+
+function concreteArrayExpectedDescriptor(items, loadIndex) {
+  const useIndex = nextInstructionIndex(items, loadIndex);
+  if (useIndex < 0) return null;
+  const copiedLocal = astoreLocal(items[useIndex]);
+  if (copiedLocal == null) return null;
+  return firstConcreteArrayUseDescriptor(items, useIndex + 1, copiedLocal);
+}
+
+function firstConcreteArrayUseDescriptor(items, start, local) {
+  for (let i = start; i < items.length; i += 1) {
+    if (astoreLocal(items[i]) === local) return null;
+    if (aloadLocal(items[i]) !== local) continue;
+    const desc = concreteCheckcastDescriptorAfterLoad(items, i) || typedConsumerDescriptorWithin(items, i);
+    if (isConcreteReferenceArrayDescriptor(desc)) return desc;
+  }
+  return null;
+}
+
+function concreteCheckcastDescriptorAfterLoad(items, loadIndex) {
+  const useIndex = nextInstructionIndex(items, loadIndex);
+  if (useIndex < 0 || op(items[useIndex]) !== 'checkcast') return null;
+  const desc = referenceDescriptorFromClassName(arg(items[useIndex]));
+  return isConcreteReferenceArrayDescriptor(desc) ? desc : null;
+}
+
+function hasArrayViewStore(items, selfIndex, local, expected, analysis) {
+  for (let i = 0; i < items.length; i += 1) {
+    if (i === selfIndex || astoreLocal(items[i]) !== local) continue;
+    const desc = referenceArrayProducerDescriptor(items, i, analysis);
+    if (desc && desc !== expected) return true;
+  }
+  return false;
+}
+
+function hasOnlyConcreteArrayViewUses(items, candidate) {
+  for (const loadItem of candidate.loadItems) {
+    const loadIndex = items.indexOf(loadItem);
+    const useIndex = nextInstructionIndex(items, loadIndex);
+    if (useIndex < 0) return false;
+    if (astoreLocal(items[useIndex]) == null) return false;
+  }
+  return true;
 }
 
 function widenedArrayDescriptorForCopiedUse(items, candidate) {
@@ -247,6 +379,12 @@ function producerDescriptor(item) {
     return typeof desc === 'string' ? desc.slice(desc.lastIndexOf(')') + 1) : null;
   }
   return null;
+}
+
+function referenceDescriptorFromClassName(value) {
+  if (typeof value !== 'string') return null;
+  if (value.startsWith('[')) return value;
+  return `[L${value};`;
 }
 
 function hasOnlyReferenceArrayUses(items, candidate) {
