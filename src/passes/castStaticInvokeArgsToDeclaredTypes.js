@@ -61,9 +61,9 @@ function staticArgumentCastInsertions(items, invokeIndex, stack) {
   const start = stack.length - params.length;
   for (let p = 0; p < params.length; p += 1) {
     const expected = params[p];
-    if (!isUsefulReferenceCast(expected)) continue;
+    if (expected !== 'Ljava/lang/CharSequence;') continue;
     const value = stack[start + p];
-    if (!value || !isUsefulReferenceCast(value.desc) || value.desc === expected) continue;
+    if (!value || value.desc !== 'Ljava/lang/String;') continue;
     if (hasExistingCastAfter(items, value.index, invokeIndex, expected)) continue;
     if (!canInsertAfterProducer(items, value.index, invokeIndex)) continue;
     out.push({ index: nextInstructionIndex(items, value.index), desc: expected });

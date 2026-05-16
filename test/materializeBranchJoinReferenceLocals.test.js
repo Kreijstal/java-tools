@@ -22,3 +22,23 @@ test('copies branch reference local into join local before shared use', () => {
   assert.deepEqual(code.codeItems[5].instruction, { op: 'astore', arg: '6' });
   assert.deepEqual(code.codeItems[6].instruction, { op: 'goto', arg: 'Ljoin' });
 });
+
+test('skips join local later reused as primitive', () => {
+  const code = {
+    codeItems: [
+      { instruction: 'aload_0' },
+      { instruction: { op: 'ifnull', arg: 'Lelse' } },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'Bytes', ['make', '()[B']] } },
+      { instruction: { op: 'astore', arg: '5' } },
+      { instruction: { op: 'goto', arg: 'Ljoin' } },
+      { labelDef: 'Lelse:', instruction: { op: 'invokestatic', arg: ['Method', 'Bytes', ['make', '()[B']] } },
+      { instruction: { op: 'astore', arg: '6' } },
+      { labelDef: 'Ljoin:', instruction: { op: 'aload', arg: '6' } },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'Use', ['bytes', '([B)V']] } },
+      { instruction: 'iconst_1' },
+      { instruction: { op: 'istore', arg: '6' } },
+    ],
+  };
+
+  assert.equal(materializeCode(code), 0);
+});
