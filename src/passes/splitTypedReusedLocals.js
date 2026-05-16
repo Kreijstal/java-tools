@@ -21,14 +21,29 @@ function runSplitTypedReusedLocals(astRoot, options = {}) {
 }
 
 function splitCode(code, options = {}) {
+  const maxIterations = options.maxIterations || 1;
+  let total = 0;
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    const rewrites = splitCodeOnce(code, options);
+    if (rewrites === 0) break;
+    total += rewrites;
+  }
+  return total;
+}
+
+function splitCodeOnce(code, options = {}) {
   const items = code.codeItems;
   if (items.length < (options.minMethodItems || 0)) return 0;
   if (items.length > (options.maxMethodItems || 10000)) return 0;
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
-  const candidates = collectCandidates(code, analysis, options);
-  if (candidates.length > (options.maxCandidates || 64)) return 0;
+  let candidates = collectCandidates(code, analysis, options);
+  const maxCandidates = options.maxCandidates || 64;
+  if (candidates.length > maxCandidates) {
+    candidates = candidates.filter(isPrimitiveArrayCandidate);
+    if (candidates.length === 0 || candidates.length > maxCandidates) return 0;
+  }
 
   for (const candidate of candidates) {
     candidate.fresh = allocateLocal(code);
@@ -160,7 +175,8 @@ function producedTypeForStore(items, storeIndex, analysis, seen = new Set()) {
   if (prev < 0) return null;
   const prevOp = op(items[prev]);
   if (prevOp === 'newarray') return primitiveArrayDescriptor(arg(items[prev]));
-  if (prevOp === 'anewarray') return `[L${arg(items[prev])};`;
+  if (prevOp === 'anewarray') return arrayDescriptorFromAnewarray(arg(items[prev]));
+  if (prevOp === 'multianewarray') return arrayDescriptorFromMultianewarray(arg(items[prev]));
   if (prevOp === 'checkcast') return referenceDescriptorFromClassName(arg(items[prev]));
   if (prevOp === 'getfield' || prevOp === 'getstatic') {
     const ref = arg(items[prev]);
@@ -199,7 +215,8 @@ function arrayLoadProducedType(items, loadIndex, analysis, seen) {
 function producedTypeForInstruction(items, index, analysis, seen) {
   const itemOp = op(items[index]);
   if (itemOp === 'newarray') return primitiveArrayDescriptor(arg(items[index]));
-  if (itemOp === 'anewarray') return `[L${arg(items[index])};`;
+  if (itemOp === 'anewarray') return arrayDescriptorFromAnewarray(arg(items[index]));
+  if (itemOp === 'multianewarray') return arrayDescriptorFromMultianewarray(arg(items[index]));
   if (itemOp === 'checkcast') return referenceDescriptorFromClassName(arg(items[index]));
   if (itemOp === 'getfield' || itemOp === 'getstatic') {
     const ref = arg(items[index]);
@@ -413,12 +430,26 @@ function primitiveArrayDescriptor(value) {
 }
 
 function isPrimitiveArrayDescriptor(desc) {
-  return typeof desc === 'string' && /^\[[ZBCSIJFD]$/.test(desc);
+  return typeof desc === 'string' && /^\[+[ZBCSIJFD]$/.test(desc);
+}
+
+function isPrimitiveArrayCandidate(candidate) {
+  return isPrimitiveArrayDescriptor(candidate.produced) || isPrimitiveArrayDescriptor(candidate.expected);
 }
 
 function arrayElementDescriptor(desc) {
   if (typeof desc !== 'string' || !desc.startsWith('[')) return null;
   return desc.slice(1);
+}
+
+function arrayDescriptorFromAnewarray(value) {
+  if (typeof value !== 'string') return null;
+  return value.startsWith('[') ? `[${value}` : `[L${value};`;
+}
+
+function arrayDescriptorFromMultianewarray(value) {
+  const desc = Array.isArray(value) ? value[0] : value;
+  return typeof desc === 'string' ? desc : null;
 }
 
 function referenceDescriptorFromClassName(value) {

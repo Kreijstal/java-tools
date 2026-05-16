@@ -328,3 +328,125 @@ test('split-typed-reused-locals: splits single-store primitive arrays', (t) => {
   ]);
   t.end();
 });
+
+test('split-typed-reused-locals: infers primitive-array descriptors from reference array opcodes', (t) => {
+  const ast = astWith([
+    { instruction: 'iconst_2' },
+    { instruction: { op: 'anewarray', arg: '[I' } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'aaload' },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'iaload' },
+    { instruction: 'pop' },
+    { instruction: 'iconst_3' },
+    { instruction: 'iconst_4' },
+    { instruction: { op: 'multianewarray', arg: ['[[I', '2'] } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: 'iconst_1' },
+    { instruction: 'aaload' },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'iastore' },
+    { instruction: 'return' },
+  ]);
+
+  const result = runSplitTypedReusedLocals(ast, { preserveOriginalLocals: true });
+
+  t.equal(result.rewrites, 4);
+  t.deepEqual(opsAndArgs(ast), [
+    'iconst_2',
+    'anewarray [I',
+    'astore_2',
+    'aload_2',
+    'iconst_0',
+    'aaload',
+    'astore_3',
+    'aload_3',
+    'iconst_0',
+    'iaload',
+    'pop',
+    'iconst_3',
+    'iconst_4',
+    'multianewarray [[I,2',
+    'astore 4',
+    'aload 4',
+    'iconst_1',
+    'aaload',
+    'astore 5',
+    'aload 5',
+    'iconst_0',
+    'iastore',
+    'return',
+  ]);
+  t.end();
+});
+
+test('split-typed-reused-locals: keeps primitive-array candidates when object candidates exceed cap', (t) => {
+  const items = [];
+  for (let i = 0; i < 3; i += 1) {
+    items.push(
+      { instruction: { op: 'aload', arg: '0' } },
+      { instruction: { op: 'astore', arg: '1' } },
+      { instruction: { op: 'aload', arg: '1' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'Demo', ['value', 'I']] } },
+      { instruction: 'pop' },
+    );
+  }
+  items.push(
+    { instruction: 'iconst_2' },
+    { instruction: { op: 'anewarray', arg: '[I' } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'aaload' },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'iaload' },
+    { instruction: 'pop' },
+    { instruction: 'return' },
+  );
+  const ast = astWith(items);
+
+  const result = runSplitTypedReusedLocals(ast, { preserveOriginalLocals: true, maxCandidates: 2 });
+
+  t.equal(result.rewrites, 2);
+  t.ok(opsAndArgs(ast).includes('anewarray [I'), 'keeps primitive array allocation');
+  t.ok(opsAndArgs(ast).includes('iaload'), 'keeps primitive array use');
+  t.end();
+});
+
+test('split-typed-reused-locals: can iterate when aliases expose later array splits', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'aload', arg: '0' } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'grb', ['a', '(BII)[[I']] } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: { op: 'astore', arg: '2' } },
+    { instruction: { op: 'aload', arg: '2' } },
+    { instruction: 'iconst_2' },
+    { instruction: 'aaload' },
+    { instruction: { op: 'astore', arg: '3' } },
+    { instruction: { op: 'aload', arg: '3' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'iaload' },
+    { instruction: 'pop' },
+    { instruction: { op: 'aload', arg: '0' } },
+    { instruction: { op: 'astore', arg: '3' } },
+    { instruction: 'return' },
+  ]);
+  ast.classes[0].items[0].method.attributes[0].code.localsSize = '4';
+
+  const result = runSplitTypedReusedLocals(ast, { preserveOriginalLocals: true, maxIterations: 2 });
+
+  t.equal(result.rewrites, 2);
+  t.ok(opsAndArgs(ast).includes('astore 5'), 'splits the int-array alias into a fresh local');
+  t.ok(opsAndArgs(ast).includes('aload 5'), 'rewrites the typed int-array load');
+  t.end();
+});
