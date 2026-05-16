@@ -27,10 +27,12 @@ function materializeCode(code, options = {}) {
     if (!joinUse) continue;
     const elseStore = findReferenceStoreToLocal(items, i + 1, join, joinUse.local);
     if (!elseStore) continue;
+    if (joinUse.desc !== elseStore.desc) continue;
     const sourceStore = findPriorReferenceStore(items, i - 1, Math.max(0, i - 80), elseStore.desc, joinUse.local);
     if (!sourceStore) continue;
     if (localWrittenBetween(items, sourceStore.index + 1, i, sourceStore.local)) continue;
     if (localWrittenBetween(items, sourceStore.index + 1, i, joinUse.local)) continue;
+    if (primitiveWrittenAfter(items, join, joinUse.local)) continue;
     insertions.push({ index: i, sourceLocal: sourceStore.local, targetLocal: joinUse.local });
   }
   if (insertions.length === 0 || insertions.length > maxInsertions) return 0;
@@ -48,12 +50,69 @@ function materializeCode(code, options = {}) {
 function firstReferenceLoadBeforeWrite(items, start, maxSeen) {
   for (let i = start, seen = 0; i < items.length && seen < maxSeen; i += 1, seen += 1) {
     const loaded = aloadLocal(items[i]);
-    if (loaded != null) return { index: i, local: loaded };
+    if (loaded != null) {
+      const desc = referenceUseDescriptor(items, i);
+      return desc ? { index: i, local: loaded, desc } : null;
+    }
     if (astoreLocal(items[i]) != null || primitiveStoreLocal(items[i]) != null) return null;
     const itemOp = op(items[i]);
     if (itemOp && /^(?:if|goto|return|athrow)/.test(itemOp)) return null;
   }
   return null;
+}
+
+function referenceUseDescriptor(items, loadIndex) {
+  const stack = [{ desc: null, isTarget: true }];
+  for (let i = nextInstructionIndex(items, loadIndex), seen = 0;
+    i >= 0 && seen < 8;
+    i = nextInstructionIndex(items, i), seen += 1) {
+    const itemOp = op(items[i]);
+    if (/^invoke/.test(itemOp || '')) {
+      const ref = arg(items[i]);
+      const desc = Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
+      const params = parameterDescriptors(desc);
+      if (!params) return null;
+      const receiver = itemOp === 'invokestatic' ? 0 : 1;
+      const consumed = stack.slice(Math.max(0, stack.length - params.length - receiver));
+      for (let p = 0; p < params.length; p += 1) {
+        const value = consumed[consumed.length - params.length + p];
+        if (value && value.isTarget && isReferenceDescriptor(params[p])) return params[p];
+      }
+      return null;
+    }
+    const simple = simpleStackEffect(stack, items[i]);
+    if (!simple) return null;
+  }
+  return null;
+}
+
+function simpleStackEffect(stack, item) {
+  const itemOp = op(item);
+  if (aloadLocal(item) != null || /^(?:i|l|f|d)load(?:_[0-3])?$/.test(itemOp || '') ||
+      /^(?:aconst_null|iconst_m1|iconst_[0-5]|lconst_[0-1]|fconst_[0-2]|dconst_[0-1]|bipush|sipush|ldc|ldc_w|ldc2_w)$/.test(itemOp || '') ||
+      itemOp === 'getstatic') {
+    stack.push({ desc: null, isTarget: false });
+    return true;
+  }
+  if (itemOp === 'getfield') {
+    if (!stack.length) return false;
+    stack.pop();
+    stack.push({ desc: fieldDescriptor(arg(item)), isTarget: false });
+    return true;
+  }
+  if (itemOp === 'checkcast') {
+    if (!stack.length) return false;
+    stack[stack.length - 1].desc = referenceDescriptorFromClassName(arg(item));
+    return true;
+  }
+  if (/^(?:i|l|f|d)(?:add|sub|mul|div|rem|and|or|xor|shl|shr|ushr)$/.test(itemOp || '')) {
+    if (stack.length < 2) return false;
+    stack.pop();
+    stack.pop();
+    stack.push({ desc: null, isTarget: false });
+    return true;
+  }
+  return false;
 }
 
 function findReferenceStoreToLocal(items, start, end, local) {
@@ -108,6 +167,33 @@ function localWrittenBetween(items, start, end, local) {
   return false;
 }
 
+function primitiveWrittenAfter(items, start, local) {
+  for (let i = start; i < items.length; i += 1) {
+    if (primitiveStoreLocal(items[i]) === local || iincLocal(items[i]) === local) return true;
+  }
+  return false;
+}
+
+function parameterDescriptors(desc) {
+  if (typeof desc !== 'string' || desc[0] !== '(') return null;
+  const out = [];
+  for (let i = 1; i < desc.length && desc[i] !== ')';) {
+    const start = i;
+    while (desc[i] === '[') i += 1;
+    if (desc[i] === 'L') {
+      const end = desc.indexOf(';', i);
+      if (end < 0) return null;
+      out.push(desc.slice(start, end + 1));
+      i = end + 1;
+    } else {
+      if (!desc[i]) return null;
+      out.push(desc.slice(start, i + 1));
+      i += 1;
+    }
+  }
+  return out;
+}
+
 function returnDescriptor(desc) {
   if (typeof desc !== 'string') return null;
   const idx = desc.lastIndexOf(')');
@@ -124,6 +210,10 @@ function referenceDescriptorFromClassName(value) {
   return `L${value};`;
 }
 
+function fieldDescriptor(ref) {
+  return Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][1] : null;
+}
+
 function findLabel(items, label) {
   const target = trimLabel(label);
   if (!target) return -1;
@@ -135,6 +225,13 @@ function findLabel(items, label) {
 
 function previousInstructionIndex(items, index) {
   for (let i = index - 1; i >= 0; i -= 1) {
+    if (items[i] && items[i].instruction) return i;
+  }
+  return -1;
+}
+
+function nextInstructionIndex(items, index) {
+  for (let i = index + 1; i < items.length; i += 1) {
     if (items[i] && items[i].instruction) return i;
   }
   return -1;
