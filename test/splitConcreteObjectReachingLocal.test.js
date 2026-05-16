@@ -284,3 +284,38 @@ test('splits explicit cast range through copied local used as typed method argum
   t.deepEqual(code.codeItems[10].instruction, { op: 'astore', arg: '5' });
   t.end();
 });
+
+test('splits loop-carried casted cursor before primitive local reuse', (t) => {
+  const code = {
+    locals: '8',
+    codeItems: [
+      { instruction: 'aload_0' },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'List', ['first', '()LBase;']] } },
+      { instruction: { op: 'checkcast', arg: 'Item' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { labelDef: 'LTOP:', instruction: { op: 'aload', arg: '4' } },
+      { instruction: { op: 'ifnull', arg: 'LDONE' } },
+      { instruction: { op: 'aload', arg: '4' } },
+      { instruction: 'aload_1' },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'Item', ['draw', '(LCanvas;)V']] } },
+      { instruction: 'aload_0' },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'List', ['next', '()LBase;']] } },
+      { instruction: { op: 'checkcast', arg: 'Item' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: { op: 'goto', arg: 'LTOP' } },
+      { labelDef: 'LDONE:', instruction: 'iconst_0' },
+      { instruction: { op: 'istore', arg: '4' } },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(splitCode(code, { requireDominance: true, preserveOriginalLocals: true }), 2);
+  t.equal(code.locals, '9');
+  t.deepEqual(code.codeItems[3].instruction, { op: 'astore', arg: '8' });
+  t.deepEqual(code.codeItems[4].instruction, { op: 'aload', arg: '8' });
+  t.deepEqual(code.codeItems[6].instruction, { op: 'aload', arg: '8' });
+  t.deepEqual(code.codeItems[12].instruction, { op: 'astore', arg: '8' });
+  t.deepEqual(code.codeItems[15].instruction, { op: 'istore', arg: '4' });
+  t.end();
+});

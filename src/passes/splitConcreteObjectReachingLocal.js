@@ -35,6 +35,7 @@ function splitCode(code, options = {}) {
     collectCandidates(code, cfg, analysis, dominators),
     collectLinearExplicitCastRanges(code),
     collectCastedLoopRanges(code),
+    collectCastedCursorRanges(code, cfg, analysis, dominators),
   );
   if (candidates.length > 8) {
     candidates = candidates.filter((candidate) =>
@@ -71,7 +72,7 @@ function splitCode(code, options = {}) {
     for (const storeItem of storeItems) {
       const idx = items.indexOf(storeItem);
       if (idx < 0) continue;
-      const preserveOriginal = preserveOriginalLocals && (
+      const preserveOriginal = !candidate.noPreserveOriginal && preserveOriginalLocals && (
         isBranchTarget(code, storeItem) ||
         hasUnrewrittenLoadBeforeNextStore(items, idx, candidate.local, candidate.loadItems)
       );
@@ -181,6 +182,122 @@ function collectCastedLoopRanges(code) {
     });
   }
   return out;
+}
+
+function collectCastedCursorRanges(code, cfg, analysis, dominators) {
+  const items = code.codeItems;
+  if (items.length > 2000) return [];
+  const out = [];
+  const writesByLocal = collectLocalWrites(items);
+  for (let i = 1; i < items.length; i += 1) {
+    const local = astoreLocal(items[i]);
+    if (local == null || op(items[i - 1]) !== 'checkcast') continue;
+    if (isHandlerStore(code.exceptionTable, items[i])) continue;
+    const desc = referenceDescriptorFromClassName(arg(items[i - 1]));
+    if (!isConcreteObjectDescriptor(desc) || desc.startsWith('[L')) continue;
+    const localWrites = writesByLocal.get(local) || [];
+    if (!localWrites.some((idx) => idx > i && isIncompatibleLocalWrite(items, idx, desc))) continue;
+    const updateStore = nextSameCastedStore(items, localWrites, i + 1, desc);
+    if (updateStore < 0) continue;
+    const nextWrite = nextLocalWriteFrom(items, localWrites, updateStore + 1);
+    if (nextWrite < 0 || !isIncompatibleLocalWrite(items, nextWrite, desc)) continue;
+
+    const loadItems = [];
+    let typedUses = 0;
+    let ok = true;
+    for (let j = i + 1; j < nextWrite; j += 1) {
+      if (j !== updateStore && astoreLocal(items[j]) === local) {
+        ok = false;
+        break;
+      }
+      if (aloadLocal(items[j]) !== local) continue;
+      const reaching = analysis.before[j] && analysis.before[j].get(local);
+      if (!reaching || reaching.size === 0) {
+        ok = false;
+        break;
+      }
+      const defs = [...reaching].map((defId) => analysis.defs.get(defId));
+      if (!defs.every((def) => def && (def.index === i || def.index === updateStore))) {
+        ok = false;
+        break;
+      }
+      if (dominators && !defs.some((def) => instructionDominates(cfg, dominators, def.index, j))) {
+        ok = false;
+        break;
+      }
+      const useIndex = nextInstructionIndex(items, j);
+      if (useIndex < 0) {
+        ok = false;
+        break;
+      }
+      if (isNullCompare(items[useIndex])) {
+        loadItems.push(items[j]);
+        continue;
+      }
+      if (isMatchingFieldRead(items[useIndex], desc) ||
+          isMatchingFieldReceiverWrite(items, j, desc) ||
+          methodArgumentDescriptorAtUse(items, j) === desc) {
+        typedUses += 1;
+        loadItems.push(items[j]);
+        continue;
+      }
+      ok = false;
+      break;
+    }
+    if (!ok || typedUses === 0 || loadItems.length === 0) continue;
+    out.push({
+      storeIndex: i,
+      storeItem: items[i],
+      storeItems: [items[i], items[updateStore]],
+      local,
+      desc,
+      explicitCast: true,
+      primitiveLocalWrite: primitiveStoreLocal(items[nextWrite]) === local || iincLocal(items[nextWrite]) === local,
+      loadItems,
+      noPreserveOriginal: true,
+    });
+  }
+  return out;
+}
+
+function collectLocalWrites(items) {
+  const out = new Map();
+  for (let i = 0; i < items.length; i += 1) {
+    const local = astoreLocal(items[i]) || primitiveStoreLocal(items[i]) || iincLocal(items[i]);
+    if (local == null) continue;
+    if (!out.has(local)) out.set(local, []);
+    out.get(local).push(i);
+  }
+  return out;
+}
+
+function nextSameCastedStore(items, localWrites, start, desc) {
+  for (const i of localWrites) {
+    if (i < start) continue;
+    if (astoreLocal(items[i]) == null) return -1;
+    const prev = previousInstructionIndex(items, i);
+    if (prev >= 0 && op(items[prev]) === 'checkcast' &&
+        referenceDescriptorFromClassName(arg(items[prev])) === desc) {
+      return i;
+    }
+    return -1;
+  }
+  return -1;
+}
+
+function nextLocalWriteFrom(items, localWrites, start) {
+  for (const i of localWrites) {
+    if (i >= start) return i;
+  }
+  return -1;
+}
+
+function isIncompatibleLocalWrite(items, index, desc) {
+  const localWrite = astoreLocal(items[index]);
+  if (primitiveStoreLocal(items[index]) != null || iincLocal(items[index]) != null) return true;
+  if (localWrite == null) return false;
+  const produced = concreteObjectProducerDescriptor(items, index, null);
+  return produced !== desc;
 }
 
 function countReferenceStores(items, local) {
