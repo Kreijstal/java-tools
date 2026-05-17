@@ -113,6 +113,55 @@ test('peephole clean can clone shared fallthrough join for goto path', (t) => {
   t.end();
 });
 
+test('peephole clean can clone conditional shared join for one predecessor', (t) => {
+  const ast = astWith([
+    { instruction: 'aload_1' },
+    { instruction: 'ifnull Ljoin' },
+    { instruction: 'iconst_0' },
+    { instruction: 'istore_2' },
+    { instruction: { op: 'ifeq', arg: 'Ljoin' } },
+    { instruction: 'iconst_1' },
+    { instruction: 'istore_3' },
+    { instruction: { op: 'goto', arg: 'Lnext' } },
+    { labelDef: 'Ljoin:', instruction: 'iconst_m1' },
+    { instruction: 'istore_3' },
+    { labelDef: 'Lnext:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneConditionalSharedJoins: true });
+  t.ok(result.changed);
+  t.equal(result.details.conditionalSharedJoinClones, 1);
+  t.notEqual(code(ast).codeItems[1].instruction, 'ifnull Ljoin');
+  t.ok(code(ast).codeItems.some((item) => item.labelDef && /^Lcsj/.test(item.labelDef)));
+  t.ok(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lnext'));
+  t.end();
+});
+
+test('peephole clean can clone conditional shared loop tail for one predecessor', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'aload_1' },
+    { instruction: 'ifnull Ltail' },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifeq', arg: 'Ltail' } },
+    { instruction: 'iconst_1' },
+    { instruction: 'istore_3' },
+    { instruction: { op: 'goto', arg: 'Lnext' } },
+    { labelDef: 'Ltail:', instruction: 'iconst_m1' },
+    { instruction: 'istore_3' },
+    ...Array.from({ length: 100 }, () => ({ instruction: 'iinc 2 1' })),
+    { instruction: 'iinc 2 1' },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lnext:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneConditionalSharedLoopTails: true });
+  t.ok(result.changed);
+  t.equal(result.details.conditionalSharedLoopTailClones, 1);
+  t.notEqual(code(ast).codeItems[1].instruction, 'ifnull Ltail');
+  t.ok(code(ast).codeItems.some((item) => item.labelDef && /^Lctl/.test(item.labelDef)));
+  t.end();
+});
+
 test('peephole clean keeps class initializer conditional-goto shape', (t) => {
   const ast = astWith([
     { instruction: 'iload_1' },

@@ -19,6 +19,8 @@ function runPeepholeClean(astRoot, options = {}) {
     conditionalForwardTailClones: 0,
     sharedFallthroughBlockClones: 0,
     sharedFallthroughJoinClones: 0,
+    conditionalSharedJoinClones: 0,
+    conditionalSharedLoopTailClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -43,6 +45,10 @@ function runPeepholeClean(astRoot, options = {}) {
       invertConditionalsOverGotoClasses: new Set(options.invertConditionalsOverGotoClasses || []),
       cloneSharedFallthroughJoins: options.cloneSharedFallthroughJoins === true,
       cloneSharedFallthroughJoinClasses: new Set(options.cloneSharedFallthroughJoinClasses || []),
+      cloneConditionalSharedJoins: options.cloneConditionalSharedJoins === true,
+      cloneConditionalSharedJoinClasses: new Set(options.cloneConditionalSharedJoinClasses || []),
+      cloneConditionalSharedLoopTails: options.cloneConditionalSharedLoopTails === true,
+      cloneConditionalSharedLoopTailClasses: new Set(options.cloneConditionalSharedLoopTailClasses || []),
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -54,6 +60,8 @@ function runPeepholeClean(astRoot, options = {}) {
     details.conditionalForwardTailClones += round.conditionalForwardTailClones;
     details.sharedFallthroughBlockClones += round.sharedFallthroughBlockClones;
     details.sharedFallthroughJoinClones += round.sharedFallthroughJoinClones;
+    details.conditionalSharedJoinClones += round.conditionalSharedJoinClones;
+    details.conditionalSharedLoopTailClones += round.conditionalSharedLoopTailClones;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
@@ -62,6 +70,8 @@ function runPeepholeClean(astRoot, options = {}) {
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
+      round.conditionalSharedJoinClones +
+      round.conditionalSharedLoopTailClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
     if (
@@ -69,6 +79,8 @@ function runPeepholeClean(astRoot, options = {}) {
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
+      round.conditionalSharedJoinClones +
+      round.conditionalSharedLoopTailClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels === 0
     ) {
@@ -91,6 +103,8 @@ function cleanOneRound(astRoot, options = {}) {
     conditionalForwardTailClones: 0,
     sharedFallthroughBlockClones: 0,
     sharedFallthroughJoinClones: 0,
+    conditionalSharedJoinClones: 0,
+    conditionalSharedLoopTailClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -112,6 +126,16 @@ function cleanOneRound(astRoot, options = {}) {
       options.cloneSharedFallthroughJoinClasses.has(classItem && classItem.className);
     if (options.cloneSharedFallthroughJoins && joinCloneClassAllowed) {
       details.sharedFallthroughJoinClones += cloneSharedFallthroughJoinGotos(code);
+    }
+    const conditionalJoinCloneClassAllowed = options.cloneConditionalSharedJoinClasses.size === 0 ||
+      options.cloneConditionalSharedJoinClasses.has(classItem && classItem.className);
+    if (options.cloneConditionalSharedJoins && conditionalJoinCloneClassAllowed) {
+      details.conditionalSharedJoinClones += cloneConditionalSharedJoinBranches(code);
+    }
+    const conditionalLoopTailCloneClassAllowed = options.cloneConditionalSharedLoopTailClasses.size === 0 ||
+      options.cloneConditionalSharedLoopTailClasses.has(classItem && classItem.className);
+    if (options.cloneConditionalSharedLoopTails && conditionalLoopTailCloneClassAllowed) {
+      details.conditionalSharedLoopTailClones += cloneConditionalSharedLoopTails(code);
     }
     const classAllowed = options.invertConditionalsOverGotoClasses.size === 0 ||
       options.invertConditionalsOverGotoClasses.has(classItem && classItem.className);
@@ -441,6 +465,89 @@ function cloneSharedFallthroughJoinGotos(code) {
       replacement.push({ instruction: { op: 'goto', arg: fallthroughLabel } });
     }
     codeItems.splice(i, 1, ...replacement);
+    splitTargets.add(target);
+    changed += 1;
+    break;
+  }
+
+  return changed;
+}
+
+function cloneConditionalSharedJoinBranches(code) {
+  const codeItems = code.codeItems;
+  const splitTargets = getPeepholeSet(code, 'peepholeSplitConditionalSharedJoins');
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    if (!isConditionalBranch(opcode)) continue;
+    const target = trimLabel(getBranchArg(item.instruction));
+    if (!target || splitTargets.has(target)) continue;
+
+    const labelIndex = buildLabelIndex(codeItems);
+    const startIdx = labelIndex.get(target);
+    if (startIdx == null || startIdx <= i) continue;
+    if (isLabelProtected(code, target) || hasPreservationGuard(codeItems, startIdx, target)) continue;
+    if (countInstructionLabelReferences(codeItems, target) < 2) continue;
+
+    const endIdx = nextLabelIndex(codeItems, startIdx + 1);
+    if (endIdx == null || endIdx <= startIdx) continue;
+    const fallthroughLabel = trimLabel(codeItems[endIdx] && codeItems[endIdx].labelDef);
+    if (!fallthroughLabel || isLabelProtected(code, fallthroughLabel)) continue;
+    const realInsns = countInstructions(codeItems, startIdx, endIdx);
+    if (realInsns === 0 || realInsns > 12) continue;
+    if (hasInternalControlFlowBeforeEnd(codeItems, startIdx, endIdx)) continue;
+
+    const clone = cloneRange(codeItems.slice(startIdx, endIdx), nextClonePrefix('Lcsj'));
+    const cloneEntry = trimLabel(clone[0] && clone[0].labelDef);
+    if (!cloneEntry) continue;
+    const last = clone[clone.length - 1];
+    const lastOp = opcodeMnemonic(last && last.instruction);
+    if (!isTerminalOpcode(lastOp)) {
+      clone.push({ instruction: { op: 'goto', arg: fallthroughLabel } });
+    }
+
+    codeItems.splice(startIdx, 0, { instruction: { op: 'goto', arg: target }, peepholeGuard: true }, ...clone);
+    item.instruction = setBranchArg(item.instruction, cloneEntry);
+    splitTargets.add(target);
+    changed += 1;
+    break;
+  }
+
+  return changed;
+}
+
+function cloneConditionalSharedLoopTails(code) {
+  const codeItems = code.codeItems;
+  const splitTargets = getPeepholeSet(code, 'peepholeSplitConditionalSharedLoopTails');
+  if (splitTargets.size > 0) return 0;
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    if (!isConditionalBranch(opcode)) continue;
+    const target = trimLabel(getBranchArg(item.instruction));
+    if (!target || splitTargets.has(target)) continue;
+
+    const labelIndex = buildLabelIndex(codeItems);
+    const startIdx = labelIndex.get(target);
+    if (startIdx == null || startIdx <= i) continue;
+    if (isLabelProtected(code, target) || hasPreservationGuard(codeItems, startIdx, target)) continue;
+    if (countInstructionLabelReferences(codeItems, target) < 2) continue;
+
+    const range = findLoopTailRangeEndingAtBackedge(codeItems, labelIndex, startIdx);
+    if (!range) continue;
+    const realInsns = countInstructions(codeItems, range.start, range.end);
+    if (realInsns < 100 || realInsns > 320) continue;
+
+    const clone = cloneRange(codeItems.slice(range.start, range.end), nextClonePrefix('Lctl'));
+    const cloneEntry = trimLabel(clone[0] && clone[0].labelDef);
+    if (!cloneEntry) continue;
+
+    codeItems.splice(startIdx, 0, { instruction: { op: 'goto', arg: target }, peepholeGuard: true }, ...clone);
+    item.instruction = setBranchArg(item.instruction, cloneEntry);
     splitTargets.add(target);
     changed += 1;
     break;
@@ -807,6 +914,21 @@ function findForwardTailRange(codeItems, labelIndex, startIdx) {
   return null;
 }
 
+function findLoopTailRangeEndingAtBackedge(codeItems, labelIndex, startIdx) {
+  const maxScan = Math.min(codeItems.length, startIdx + 420);
+  for (let i = startIdx + 1; i < maxScan; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    if (opcode !== 'goto' && opcode !== 'goto_w') continue;
+    const target = trimLabel(getBranchArg(item.instruction));
+    const targetIdx = labelIndex.get(target);
+    if (targetIdx == null || targetIdx >= startIdx) continue;
+    const end = nextLabelIndex(codeItems, i + 1) || nextInstructionIndex(codeItems, i + 1) || i + 1;
+    return end > startIdx ? { start: startIdx, end } : null;
+  }
+  return null;
+}
+
 function hasSharedForwardTargetInside(codeItems, startIdx, endIdx) {
   const labelIndex = buildLabelIndex(codeItems);
   for (let i = startIdx; i < endIdx; i += 1) {
@@ -919,6 +1041,12 @@ function cloneItemWithLabels(item, labelMap) {
 }
 
 function rewriteInstructionLabels(instruction, labelMap) {
+  if (typeof instruction === 'string') {
+    const arg = getBranchArg(instruction);
+    if (arg == null) return instruction;
+    const label = trimLabel(arg);
+    return labelMap.has(label) ? setBranchArg(instruction, labelMap.get(label)) : instruction;
+  }
   const out = cloneValue(instruction);
   rewriteLabelsInValue(out, labelMap);
   return out;
@@ -976,6 +1104,20 @@ function hasInternalLabel(codeItems, startIdx, endIdx) {
 function hasInstructionBetween(codeItems, startIndex, endIndex) {
   for (let i = startIndex; i < endIndex; i += 1) {
     if (codeItems[i] && codeItems[i].instruction) return true;
+  }
+  return false;
+}
+
+function hasInternalControlFlowBeforeEnd(codeItems, startIdx, endIdx) {
+  const lastIdx = previousInstructionIndex(codeItems, endIdx - 1);
+  for (let i = startIdx; i < endIdx; i += 1) {
+    if (i === lastIdx) continue;
+    const opcode = opcodeMnemonic(codeItems[i] && codeItems[i].instruction);
+    if (!opcode) continue;
+    if (isConditionalBranch(opcode) || opcode === 'goto' || opcode === 'goto_w' ||
+      opcode === 'tableswitch' || opcode === 'lookupswitch') {
+      return true;
+    }
   }
   return false;
 }
@@ -1050,12 +1192,22 @@ function countInstructionLabelReferences(codeItems, label) {
   let count = 0;
   for (const item of codeItems || []) {
     if (!item || !item.instruction) continue;
+    const branchArg = getBranchArg(item.instruction);
+    if (branchArg != null) {
+      count += trimLabel(branchArg) === trimLabel(label) ? 1 : 0;
+      continue;
+    }
     count += countLabelInValue(item.instruction.arg, label);
   }
   return count;
 }
 
 function collectInstructionLabels(instruction, used) {
+  const branchArg = getBranchArg(instruction);
+  if (branchArg != null) {
+    addLabel(used, branchArg);
+    return;
+  }
   if (!instruction || typeof instruction !== 'object') return;
   collectLabelsFromValue(instruction.arg, used);
 }
@@ -1152,9 +1304,27 @@ function getInstructionArg(instruction) {
   return instruction && typeof instruction === 'object' ? instruction.arg : null;
 }
 
+function getBranchArg(instruction) {
+  const arg = getInstructionArg(instruction);
+  if (arg != null) return arg;
+  if (typeof instruction !== 'string') return null;
+  const parts = instruction.trim().split(/\s+/);
+  if (parts.length !== 2) return null;
+  if (!isConditionalBranch(parts[0]) && parts[0] !== 'goto' && parts[0] !== 'goto_w') return null;
+  return parts[1];
+}
+
 function setInstructionArg(instruction, arg) {
   if (!instruction || typeof instruction !== 'object') return instruction;
   return { ...instruction, arg };
+}
+
+function setBranchArg(instruction, arg) {
+  if (instruction && typeof instruction === 'object') return setInstructionArg(instruction, arg);
+  if (typeof instruction !== 'string') return instruction;
+  const parts = instruction.trim().split(/\s+/);
+  if (parts.length !== 2) return instruction;
+  return `${parts[0]} ${arg}`;
 }
 
 function addLabel(set, label) {
@@ -1242,6 +1412,8 @@ module.exports = {
   cloneConditionalForwardTailEntry,
   cloneSharedFallthroughBlocks,
   cloneSharedFallthroughJoinGotos,
+  cloneConditionalSharedJoinBranches,
+  cloneConditionalSharedLoopTails,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
   removeUnreachableUntilUsedLabel,
