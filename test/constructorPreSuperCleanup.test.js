@@ -86,3 +86,85 @@ test('deletes unused int snapshot before super', (t) => {
   t.equal(runConstructorPreSuperCleanup(ast).deletedSnapshots, 1);
   t.end();
 });
+
+test('inlines adjacent reference temp before this constructor delegation', (t) => {
+  const ast = {
+    classes: [{
+      className: 'Child',
+      superClassName: 'Parent',
+      items: [{
+        type: 'method',
+        method: {
+          name: '<init>',
+          descriptor: '(Ljava/lang/String;)V',
+          attributes: [{
+            type: 'code',
+            code: {
+              codeItems: [
+                { instruction: 'aload_0' },
+                { instruction: 'aload_1' },
+                { instruction: { op: 'checkcast', arg: 'java/lang/CharSequence' } },
+                { instruction: { op: 'astore', arg: '8' } },
+                { instruction: { op: 'aload', arg: '8' } },
+                { instruction: 'iconst_1' },
+                { instruction: { op: 'invokestatic', arg: ['Method', 'qua', ['a', '(Ljava/lang/CharSequence;Z)J']] } },
+                { instruction: { op: 'invokespecial', arg: ['Method', 'Child', ['<init>', '(J)V']] } },
+                { instruction: 'return' },
+              ],
+              exceptionTable: [],
+            },
+          }],
+        },
+      }],
+    }],
+  };
+
+  const result = runConstructorPreSuperCleanup(ast);
+  const items = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+  t.equal(result.inlinedTemps, 1);
+  t.deepEqual(items.map((item) => item.instruction), [
+    'aload_0',
+    'aload_1',
+    { op: 'checkcast', arg: 'java/lang/CharSequence' },
+    'iconst_1',
+    { op: 'invokestatic', arg: ['Method', 'qua', ['a', '(Ljava/lang/CharSequence;Z)J']] },
+    { op: 'invokespecial', arg: ['Method', 'Child', ['<init>', '(J)V']] },
+    'return',
+  ]);
+  t.end();
+});
+
+test('keeps labelled reference temp before constructor delegation', (t) => {
+  const ast = {
+    classes: [{
+      className: 'Child',
+      superClassName: 'Parent',
+      items: [{
+        type: 'method',
+        method: {
+          name: '<init>',
+          descriptor: '(Ljava/lang/String;)V',
+          attributes: [{
+            type: 'code',
+            code: {
+              codeItems: [
+                { instruction: 'aload_0' },
+                { instruction: 'aload_1' },
+                { labelDef: 'Lstore:', instruction: { op: 'astore', arg: '8' } },
+                { instruction: { op: 'goto', arg: 'Lstore' } },
+                { instruction: { op: 'aload', arg: '8' } },
+                { instruction: { op: 'invokespecial', arg: ['Method', 'Child', ['<init>', '(Ljava/lang/String;)V']] } },
+                { instruction: 'return' },
+              ],
+              exceptionTable: [],
+            },
+          }],
+        },
+      }],
+    }],
+  };
+
+  const result = runConstructorPreSuperCleanup(ast);
+  t.equal(result.inlinedTemps, 0);
+  t.end();
+});

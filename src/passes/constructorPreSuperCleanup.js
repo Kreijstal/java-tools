@@ -3,6 +3,7 @@
 function runConstructorPreSuperCleanup(astRoot, options = {}) {
   let methods = 0;
   let deletedSnapshots = 0;
+  let inlinedTemps = 0;
   for (const cls of astRoot.classes || []) {
     for (const item of cls.items || []) {
       if (!item || item.type !== 'method' || !item.method) continue;
@@ -11,34 +12,60 @@ function runConstructorPreSuperCleanup(astRoot, options = {}) {
       const code = codeOf(method);
       if (!code) continue;
       const result = cleanConstructor(code, cls, options);
-      if (result.deletedSnapshots > 0) {
+      if (result.deletedSnapshots > 0 || result.inlinedTemps > 0) {
         methods += 1;
         deletedSnapshots += result.deletedSnapshots;
+        inlinedTemps += result.inlinedTemps || 0;
       }
     }
   }
-  return { changed: deletedSnapshots > 0, methods, deletedSnapshots };
+  return { changed: deletedSnapshots > 0 || inlinedTemps > 0, methods, deletedSnapshots, inlinedTemps };
 }
 
 function cleanConstructor(code, cls, options = {}) {
   const codeItems = code.codeItems || [];
   const superIndex = findFirstConstructorCall(codeItems, cls);
-  if (superIndex == null) return { deletedSnapshots: 0 };
-  if (constructorCallInsidePreexistingTry(code, codeItems, superIndex)) return { deletedSnapshots: 0 };
+  if (superIndex == null) return { deletedSnapshots: 0, inlinedTemps: 0 };
+  if (constructorCallInsidePreexistingTry(code, codeItems, superIndex)) return { deletedSnapshots: 0, inlinedTemps: 0 };
+
+  const temp = matchAdjacentReferenceTempBeforeSelfConstructor(code, cls, codeItems, superIndex);
+  if (temp) {
+    removeInstructionOnly(codeItems, temp.loadIndex);
+    removeInstructionOnly(codeItems, temp.storeIndex);
+    return { deletedSnapshots: 0, inlinedTemps: 1 };
+  }
 
   const firstInstruction = nextInstructionIndex(codeItems, 0);
-  if (firstInstruction == null) return { deletedSnapshots: 0 };
+  if (firstInstruction == null) return { deletedSnapshots: 0, inlinedTemps: 0 };
   const snapshot = matchSnapshotAt(codeItems, firstInstruction);
-  if (!snapshot) return { deletedSnapshots: 0 };
-  if (snapshot.storeIndex >= superIndex) return { deletedSnapshots: 0 };
-  if (hasControlFlowBefore(codeItems, superIndex)) return { deletedSnapshots: 0 };
-  if (labelTargeted(code, codeItems, snapshot.storeIndex)) return { deletedSnapshots: 0 };
-  if (localUsedAfter(codeItems, snapshot.local, superIndex)) return { deletedSnapshots: 0 };
-  if (options.deleteUnusedSnapshots === false) return { deletedSnapshots: 0 };
+  if (!snapshot) return { deletedSnapshots: 0, inlinedTemps: 0 };
+  if (snapshot.storeIndex >= superIndex) return { deletedSnapshots: 0, inlinedTemps: 0 };
+  if (hasControlFlowBefore(codeItems, superIndex)) return { deletedSnapshots: 0, inlinedTemps: 0 };
+  if (labelTargeted(code, codeItems, snapshot.storeIndex)) return { deletedSnapshots: 0, inlinedTemps: 0 };
+  if (localUsedAfter(codeItems, snapshot.local, superIndex)) return { deletedSnapshots: 0, inlinedTemps: 0 };
+  if (options.deleteUnusedSnapshots === false) return { deletedSnapshots: 0, inlinedTemps: 0 };
 
   removeInstructionOnly(codeItems, snapshot.storeIndex);
   removeInstructionOnly(codeItems, snapshot.getIndex);
-  return { deletedSnapshots: 1 };
+  return { deletedSnapshots: 1, inlinedTemps: 0 };
+}
+
+function matchAdjacentReferenceTempBeforeSelfConstructor(code, cls, codeItems, constructorIndex) {
+  const ctorArg = arg(codeItems[constructorIndex]);
+  if (!Array.isArray(ctorArg) || ctorArg[1] !== cls.className) return null;
+  if (hasControlFlowBefore(codeItems, constructorIndex)) return null;
+  for (let storeIndex = 0; storeIndex < constructorIndex; storeIndex += 1) {
+    const local = refStoreLocal(codeItems[storeIndex]);
+    if (local == null) continue;
+    const loadIndex = nextInstructionIndex(codeItems, storeIndex + 1);
+    if (loadIndex == null || loadIndex >= constructorIndex) continue;
+    if (refLoadLocal(codeItems[loadIndex]) !== local) continue;
+    if (labelTargeted(code, codeItems, storeIndex) || labelTargeted(code, codeItems, loadIndex)) continue;
+    if (refLocalUsedBetween(codeItems, local, loadIndex + 1, constructorIndex)) continue;
+    if (refLocalUsedAfter(codeItems, local, constructorIndex)) continue;
+    return { storeIndex, loadIndex, local };
+  }
+  return null;
 }
 
 function matchSnapshotAt(codeItems, getIndex) {
@@ -138,6 +165,20 @@ function localUsedAfter(codeItems, local, startIndex) {
   return false;
 }
 
+function refLocalUsedBetween(codeItems, local, startIndex, endIndex) {
+  for (let i = startIndex; i < endIndex; i += 1) {
+    if (refLoadLocal(codeItems[i]) === local || refStoreLocal(codeItems[i]) === local) return true;
+  }
+  return false;
+}
+
+function refLocalUsedAfter(codeItems, local, startIndex) {
+  for (let i = startIndex + 1; i < codeItems.length; i += 1) {
+    if (refLoadLocal(codeItems[i]) === local || refStoreLocal(codeItems[i]) === local) return true;
+  }
+  return false;
+}
+
 function nextInstructionIndex(codeItems, start) {
   for (let i = start; i < codeItems.length; i += 1) {
     if (codeItems[i] && codeItems[i].instruction) return i;
@@ -172,6 +213,20 @@ function intStoreLocal(item) {
   const itemOp = op(item);
   if (itemOp === 'istore') return String(arg(item));
   if (/^istore_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
+  return null;
+}
+
+function refLoadLocal(item) {
+  const itemOp = op(item);
+  if (itemOp === 'aload') return String(arg(item));
+  if (/^aload_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
+  return null;
+}
+
+function refStoreLocal(item) {
+  const itemOp = op(item);
+  if (itemOp === 'astore') return String(arg(item));
+  if (/^astore_[0-3]$/.test(itemOp || '')) return itemOp.slice(-1);
   return null;
 }
 
