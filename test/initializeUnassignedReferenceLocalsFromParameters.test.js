@@ -80,3 +80,47 @@ test('places constructor reference initializers after super call', () => {
     { op: 'astore', arg: '5' },
   ]);
 });
+
+test('initializes low-slot reference local when first typed store does not dominate field use', () => {
+  const method = { descriptor: '()V', flags: [] };
+  const code = {
+    localsSize: 5,
+    codeItems: [
+      { instruction: 'aload_0' },
+      { instruction: { op: 'getfield', arg: ['Field', 'x', ['children', 'Lij;']] } },
+      { instruction: { op: 'ifnull', arg: 'Join' } },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'x', ['next', '()Lksa;']] } },
+      { instruction: { op: 'checkcast', arg: 'llb' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { labelDef: 'Join:', instruction: { op: 'aload', arg: '4' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'llb', ['W', 'Z']] } },
+      { instruction: 'pop' },
+      { instruction: 'return' },
+    ],
+  };
+
+  assert.equal(initializeCode(code, method, { minNullInitLocal: 16 }), 1);
+  assert.deepEqual(code.codeItems.slice(0, 2).map((item) => item.instruction), [
+    'aconst_null',
+    { op: 'astore', arg: '4' },
+  ]);
+});
+
+test('does not initialize low-slot reference local when first store dominates field use', () => {
+  const method = { descriptor: '()V', flags: [] };
+  const code = {
+    localsSize: 5,
+    codeItems: [
+      { instruction: { op: 'invokestatic', arg: ['Method', 'x', ['next', '()Lksa;']] } },
+      { instruction: { op: 'checkcast', arg: 'llb' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: { op: 'aload', arg: '4' } },
+      { instruction: { op: 'getfield', arg: ['Field', 'llb', ['W', 'Z']] } },
+      { instruction: 'pop' },
+      { instruction: 'return' },
+    ],
+  };
+
+  assert.equal(initializeCode(code, method, { minNullInitLocal: 16 }), 0);
+  assert.equal(code.codeItems.length, 7);
+});

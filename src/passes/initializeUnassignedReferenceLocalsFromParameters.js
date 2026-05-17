@@ -1,5 +1,11 @@
 'use strict';
 
+const {
+  buildCfg,
+  computeDominators,
+  instructionDominates,
+} = require('./splitArrayReachingLocal');
+
 function runInitializeUnassignedReferenceLocalsFromParameters(astRoot, options = {}) {
   let rewrites = 0;
   for (const cls of astRoot.classes || []) {
@@ -19,6 +25,15 @@ function initializeCode(code, method = {}, options = {}) {
   const items = code.codeItems;
   const params = referenceParameterLocals(method);
   const initializerIndex = method.name === '<init>' ? constructorInitializerEndIndex(items) : 0;
+  let cfg = null;
+  let dominators = null;
+  const dominance = () => {
+    if (!cfg) {
+      cfg = buildCfg(code);
+      dominators = computeDominators(cfg);
+    }
+    return { cfg, dominators };
+  };
 
   const firstAccess = new Map();
   const hasStore = new Set();
@@ -45,13 +60,16 @@ function initializeCode(code, method = {}, options = {}) {
   }
   for (const [local, access] of firstAccess) {
     if (paramLocals.has(local) || access.kind !== 'store' || !hasLaterLoad(items, access.index, local)) continue;
-    if (Number(local) < (options.minNullInitLocal || 16)) continue;
     if (access.index <= initializerIndex) continue;
     const producerIndex = previousInstructionIndex(items, access.index);
     if (op(items[producerIndex]) !== 'checkcast') continue;
     const desc = producerDescriptor(items, producerIndex);
     if (!isObjectDescriptor(desc) || desc === 'Ljava/lang/Throwable;' ||
         desc === 'Ljava/lang/Exception;' || desc === 'Ljava/lang/Object;') continue;
+    if (Number(local) < (options.minNullInitLocal || 16)) {
+      const dom = dominance();
+      if (!hasLaterMatchingLoadNotDominatedByStore(items, dom.cfg, dom.dominators, access.index, local, desc)) continue;
+    }
     initializers.push({ local, source: null });
   }
 
@@ -86,6 +104,16 @@ function hasLaterLoad(items, startIndex, local) {
   return false;
 }
 
+function hasLaterMatchingLoadNotDominatedByStore(items, cfg, dominators, storeIndex, local, desc) {
+  for (let i = storeIndex + 1; i < items.length; i += 1) {
+    if (aloadLocal(items[i]) !== local) continue;
+    if (instructionDominates(cfg, dominators, storeIndex, i)) continue;
+    const expected = consumedReferenceDescriptor(items, i);
+    if (expected === desc) return true;
+  }
+  return false;
+}
+
 function producerDescriptor(items, index) {
   if (index < 0) return null;
   const itemOp = op(items[index]);
@@ -101,6 +129,7 @@ function consumedReferenceDescriptor(items, loadIndex) {
   const next = nextInstructionIndex(items, loadIndex);
   if (next < 0) return null;
   const itemOp = op(items[next]);
+  if (itemOp === 'getfield') return fieldOwnerDescriptor(arg(items[next]));
   if (/^invoke/.test(itemOp || '')) {
     const params = parameterDescriptors(methodDescriptor(arg(items[next])));
     return params && params.length > 0 ? params[params.length - 1] : null;
@@ -108,6 +137,10 @@ function consumedReferenceDescriptor(items, loadIndex) {
   if (itemOp === 'checkcast') return referenceDescriptorFromClassName(arg(items[next]));
   if (itemOp === 'areturn') return null;
   return null;
+}
+
+function fieldOwnerDescriptor(ref) {
+  return Array.isArray(ref) && typeof ref[1] === 'string' ? referenceDescriptorFromClassName(ref[1]) : null;
 }
 
 function referenceParameterLocals(method) {
