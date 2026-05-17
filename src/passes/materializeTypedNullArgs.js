@@ -84,7 +84,7 @@ function parameterDescriptors(descriptor) {
 
 function referenceDescriptorFromClassName(target) {
   if (typeof target === 'string' && /^[^[]/.test(target)) return `L${target};`;
-  if (typeof target === 'string' && /^\[L[^;]+;$/.test(target)) return target;
+  if (typeof target === 'string' && /^\[+(?:[ZBCSIJFD]|L[^;]+;)$/.test(target)) return target;
   return null;
 }
 

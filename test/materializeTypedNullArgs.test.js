@@ -45,3 +45,26 @@ test('keeps checkcast null when following invoke does not consume that type', (t
   t.equal(code.codeItems.length, 3);
   t.end();
 });
+
+test('materializes primitive array typed null invoke argument', (t) => {
+  const code = {
+    locals: '1',
+    codeItems: [
+      { instruction: 'iconst_1' },
+      { instruction: 'aconst_null' },
+      { instruction: { op: 'checkcast', arg: '[I' } },
+      { instruction: { op: 'invokestatic', arg: ['Method', 'Demo', ['a', '(I[I)V']] } },
+    ],
+  };
+
+  t.equal(rewriteCode(code), 1);
+  t.deepEqual(code.codeItems.map((item) => item.instruction), [
+    'iconst_1',
+    'aconst_null',
+    { op: 'checkcast', arg: '[I' },
+    'dup',
+    'astore_1',
+    { op: 'invokestatic', arg: ['Method', 'Demo', ['a', '(I[I)V']] },
+  ]);
+  t.end();
+});
