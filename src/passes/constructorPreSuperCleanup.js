@@ -45,7 +45,7 @@ function matchSnapshotAt(codeItems, getIndex) {
   const getItem = codeItems[getIndex];
   if (op(getItem) !== 'getstatic') return null;
   const getArg = arg(getItem);
-  if (!Array.isArray(getArg) || getArg[0] !== 'Field' || !Array.isArray(getArg[2]) || getArg[2][1] !== 'Z') {
+  if (!Array.isArray(getArg) || getArg[0] !== 'Field' || !Array.isArray(getArg[2]) || !['Z', 'I'].includes(getArg[2][1])) {
     return null;
   }
   const storeIndex = nextInstructionIndex(codeItems, getIndex + 1);
