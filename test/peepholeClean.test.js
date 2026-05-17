@@ -87,6 +87,32 @@ test('peephole clean inverts conditional over goto in ordinary methods', (t) => 
   t.end();
 });
 
+test('peephole clean can clone shared fallthrough join for goto path', (t) => {
+  const ast = astWith([
+    { instruction: 'aload_1' },
+    { instruction: { op: 'ifnonnull', arg: 'Ljoin' } },
+    { instruction: 'aload_2' },
+    { instruction: { op: 'ifnull', arg: 'Lnext' } },
+    { instruction: 'aload_0' },
+    { instruction: 'aload_2' },
+    { instruction: 'putfield Field Example f Ljava/lang/Object;' },
+    { instruction: { op: 'goto', arg: 'Ljoin' } },
+    { labelDef: 'Ljoin:', instruction: 'iload_3' },
+    { instruction: { op: 'ifne', arg: 'Lnext' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'istore_3' },
+    { labelDef: 'Lnext:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneSharedFallthroughJoins: true });
+  t.ok(result.changed);
+  t.equal(result.details.sharedFallthroughJoinClones, 1);
+  t.equal(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Ljoin'), false);
+  t.ok(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lnext'));
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifnonnull', arg: 'Ljoin' });
+  t.end();
+});
+
 test('peephole clean keeps class initializer conditional-goto shape', (t) => {
   const ast = astWith([
     { instruction: 'iload_1' },

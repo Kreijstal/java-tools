@@ -18,6 +18,7 @@ function runPeepholeClean(astRoot, options = {}) {
     conditionalForwardLoopEntryClones: 0,
     conditionalForwardTailClones: 0,
     sharedFallthroughBlockClones: 0,
+    sharedFallthroughJoinClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -40,6 +41,8 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneForwardTails: options.cloneForwardTails === true,
       invertConditionalsOverGoto: options.invertConditionalsOverGoto === true,
       invertConditionalsOverGotoClasses: new Set(options.invertConditionalsOverGotoClasses || []),
+      cloneSharedFallthroughJoins: options.cloneSharedFallthroughJoins === true,
+      cloneSharedFallthroughJoinClasses: new Set(options.cloneSharedFallthroughJoinClasses || []),
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -50,6 +53,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.conditionalForwardLoopEntryClones += round.conditionalForwardLoopEntryClones;
     details.conditionalForwardTailClones += round.conditionalForwardTailClones;
     details.sharedFallthroughBlockClones += round.sharedFallthroughBlockClones;
+    details.sharedFallthroughJoinClones += round.sharedFallthroughJoinClones;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
@@ -57,12 +61,14 @@ function runPeepholeClean(astRoot, options = {}) {
     changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.loopProducerBridges +
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
+      round.sharedFallthroughJoinClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
     if (
       round.nops + round.threadedBranches + round.protectedLoadBridges + round.loopProducerBridges +
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
+      round.sharedFallthroughJoinClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels === 0
     ) {
@@ -84,6 +90,7 @@ function cleanOneRound(astRoot, options = {}) {
     conditionalForwardLoopEntryClones: 0,
     conditionalForwardTailClones: 0,
     sharedFallthroughBlockClones: 0,
+    sharedFallthroughJoinClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -100,6 +107,11 @@ function cleanOneRound(astRoot, options = {}) {
     if (options.cloneForwardTails) {
       details.conditionalForwardTailClones += cloneConditionalForwardTailEntry(code);
       details.sharedFallthroughBlockClones += cloneSharedFallthroughBlocks(code);
+    }
+    const joinCloneClassAllowed = options.cloneSharedFallthroughJoinClasses.size === 0 ||
+      options.cloneSharedFallthroughJoinClasses.has(classItem && classItem.className);
+    if (options.cloneSharedFallthroughJoins && joinCloneClassAllowed) {
+      details.sharedFallthroughJoinClones += cloneSharedFallthroughJoinGotos(code);
     }
     const classAllowed = options.invertConditionalsOverGotoClasses.size === 0 ||
       options.invertConditionalsOverGotoClasses.has(classItem && classItem.className);
@@ -377,6 +389,60 @@ function cloneSharedFallthroughBlocks(code) {
     codeItems.splice(startIdx, 0, ...insert);
     splitTargets.add(label);
     changed += refs.length;
+    break;
+  }
+
+  return changed;
+}
+
+function cloneSharedFallthroughJoinGotos(code) {
+  const codeItems = code.codeItems;
+  const splitTargets = getPeepholeSet(code, 'peepholeSplitSharedFallthroughJoins');
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (!item || !item.instruction || getOpcode(item.instruction) !== 'goto') continue;
+    const labelIndex = buildLabelIndex(codeItems);
+    const target = trimLabel(getInstructionArg(item.instruction));
+    const startIdx = labelIndex.get(target);
+    if (!target || startIdx == null || startIdx <= i) continue;
+    if (splitTargets.has(target) || isLabelProtected(code, target)) continue;
+    if (findNextLabel(codeItems, i + 1) !== target) continue;
+    if (countInstructionLabelReferences(codeItems, target) < 2) continue;
+
+    const endIdx = nextLabelIndex(codeItems, startIdx + 1);
+    if (endIdx == null || endIdx <= startIdx) continue;
+    const fallthroughLabel = trimLabel(codeItems[endIdx] && codeItems[endIdx].labelDef);
+    if (!fallthroughLabel || isLabelProtected(code, fallthroughLabel)) continue;
+    const realInsns = countInstructions(codeItems, startIdx, endIdx);
+    if (realInsns === 0 || realInsns > 80) continue;
+
+    const summary = analyzeRegion(code, startIdx, endIdx, { allowControlFlow: true, allowSideEffects: true });
+    if (!summary.supported) continue;
+    if (summary.touchesProtectedLabel || summary.overlapsExceptionRange) continue;
+    if (summary.hasTerminator || summary.stack.delta !== 0 || summary.stack.underflowsEntry) continue;
+    if (summary.inboundBranches.some((b) => b.target !== target)) continue;
+    if (summary.outboundBranches.some((b) => b.target !== fallthroughLabel)) continue;
+
+    const clone = cloneRange(codeItems.slice(startIdx, endIdx), nextClonePrefix('L99'));
+    if (clone.length === 0) continue;
+    const replacement = [];
+    if (item.labelDef || item.stackMapFrame) {
+      const labelOnly = {};
+      if (item.labelDef) labelOnly.labelDef = item.labelDef;
+      if (item.stackMapFrame) labelOnly.stackMapFrame = cloneValue(item.stackMapFrame);
+      replacement.push(labelOnly);
+    }
+    replacement.push(...clone);
+    const last = replacement[replacement.length - 1];
+    const lastOp = getOpcode(last && last.instruction);
+    if (!isTerminalOpcode(lastOp)) {
+      replacement.push({ instruction: { op: 'goto', arg: fallthroughLabel } });
+    }
+    codeItems.splice(i, 1, ...replacement);
+    splitTargets.add(target);
+    changed += 1;
     break;
   }
 
@@ -1175,6 +1241,7 @@ module.exports = {
   cloneConditionalForwardLoopEntry,
   cloneConditionalForwardTailEntry,
   cloneSharedFallthroughBlocks,
+  cloneSharedFallthroughJoinGotos,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
   removeUnreachableUntilUsedLabel,
