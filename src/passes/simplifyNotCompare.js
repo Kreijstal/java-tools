@@ -289,6 +289,10 @@ function pushValue(item) {
   if (itemOp === 'iconst_m1') return -1;
   if (/^iconst_[0-5]$/.test(itemOp || '')) return Number(itemOp.slice(-1));
   if (itemOp === 'bipush' || itemOp === 'sipush') return Number(arg(item));
+  if (itemOp === 'ldc') {
+    const value = arg(item);
+    return Number.isInteger(value) ? value : null;
+  }
   return null;
 }
 
@@ -296,7 +300,8 @@ function pushInstruction(value) {
   if (value === -1) return 'iconst_m1';
   if (value >= 0 && value <= 5) return `iconst_${value}`;
   if (value >= -128 && value <= 127) return { op: 'bipush', arg: String(value) };
-  return { op: 'sipush', arg: String(value) };
+  if (value >= -32768 && value <= 32767) return { op: 'sipush', arg: String(value) };
+  return { op: 'ldc', arg: value };
 }
 
 function op(item) {

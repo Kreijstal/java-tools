@@ -57,6 +57,24 @@ test('simplifyCodeItems rewrites k != ~x into x != ~k', (t) => {
   t.end();
 });
 
+test('simplifyCodeItems rewrites ldc k == ~char local into char local == ~k', (t) => {
+  const codeItems = [
+    { instruction: { op: 'ldc', arg: -65536 } },
+    { instruction: { op: 'iload', arg: '2' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set(['2'])), 1, 'rewrites one ldc equality comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'iload', arg: '2' } },
+    { instruction: { op: 'ldc', arg: 65535 } },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
 test('simplifyCodeItems preserves labelled interior instructions', (t) => {
   const codeItems = [
     { instruction: { op: 'goto', arg: 'Lmid' } },
