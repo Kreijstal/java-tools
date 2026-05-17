@@ -38,6 +38,8 @@ function runPeepholeClean(astRoot, options = {}) {
     const round = cleanOneRound(astRoot, {
       removeUnreachableCode: options.removeHandlerCode !== false,
       cloneForwardTails: options.cloneForwardTails === true,
+      invertConditionalsOverGoto: options.invertConditionalsOverGoto === true,
+      invertConditionalsOverGotoClasses: new Set(options.invertConditionalsOverGotoClasses || []),
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -87,7 +89,7 @@ function cleanOneRound(astRoot, options = {}) {
     unreachableInstructions: 0,
     unusedLabels: 0,
   };
-  forEachCode(astRoot, (code, method) => {
+  forEachCode(astRoot, (code, method, classItem) => {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
     details.protectedLoadBridges += coalesceProtectedLoadBridges(code);
@@ -99,8 +101,13 @@ function cleanOneRound(astRoot, options = {}) {
       details.conditionalForwardTailClones += cloneConditionalForwardTailEntry(code);
       details.sharedFallthroughBlockClones += cloneSharedFallthroughBlocks(code);
     }
-    if (method && method.name === '<init>') {
+    const classAllowed = options.invertConditionalsOverGotoClasses.size === 0 ||
+      options.invertConditionalsOverGotoClasses.has(classItem && classItem.className);
+    if ((method && method.name === '<init>') ||
+      (options.invertConditionalsOverGoto && classAllowed && (!method || method.name !== '<clinit>'))) {
       details.invertedFallthroughGotos += invertConditionalOverGoto(code);
+    }
+    if (method && method.name === '<init>') {
       details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
     }
     details.fallthroughGotos += removeSingleUseFallthroughGotos(code);

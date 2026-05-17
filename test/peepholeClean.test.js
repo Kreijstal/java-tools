@@ -69,6 +69,42 @@ test('peephole clean removes single-use goto to following label', (t) => {
   t.end();
 });
 
+test('peephole clean inverts conditional over goto in ordinary methods', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'iflt', arg: 'Lbody' } },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'Lbody:', instruction: 'iconst_0' },
+    { instruction: 'pop' },
+    { labelDef: 'Lexit:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { invertConditionalsOverGoto: true });
+  t.ok(result.changed);
+  t.equal(result.details.invertedFallthroughGotos, 1);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifge', arg: 'Lexit' });
+  t.equal(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lexit'), false);
+  t.end();
+});
+
+test('peephole clean keeps class initializer conditional-goto shape', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'iflt', arg: 'Lbody' } },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'Lbody:', instruction: 'iconst_0' },
+    { instruction: 'pop' },
+    { labelDef: 'Lexit:', instruction: 'return' },
+  ]);
+  ast.classes[0].items[0].method.name = '<clinit>';
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.invertedFallthroughGotos, 0);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'iflt', arg: 'Lbody' });
+  t.deepEqual(code(ast).codeItems[2].instruction, { op: 'goto', arg: 'Lexit' });
+  t.end();
+});
+
 test('peephole clean threads conditional branches through goto bridges', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iload_1' },
