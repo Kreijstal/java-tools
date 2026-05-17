@@ -75,7 +75,7 @@ test('skips used snapshot local', (t) => {
   t.end();
 });
 
-test('skips non-boolean field snapshot', (t) => {
+test('deletes unused int snapshot before super', (t) => {
   const ast = astWith([
     { instruction: { op: 'getstatic', arg: ['Field', 'client', ['N', 'I']] } },
     { instruction: { op: 'istore', arg: '10' } },
@@ -83,6 +83,6 @@ test('skips non-boolean field snapshot', (t) => {
     { instruction: { op: 'invokespecial', arg: ['Method', 'Parent', ['<init>', '()V']] } },
   ]);
 
-  t.equal(runConstructorPreSuperCleanup(ast).deletedSnapshots, 0);
+  t.equal(runConstructorPreSuperCleanup(ast).deletedSnapshots, 1);
   t.end();
 });
