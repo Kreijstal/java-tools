@@ -81,6 +81,32 @@ test('places constructor reference initializers after super call', () => {
   ]);
 });
 
+test('places constructor reference initializers after real super call when arguments allocate objects', () => {
+  const method = { name: '<init>', descriptor: '(J)V', flags: [] };
+  const cls = { className: 'Child', superClassName: 'Parent' };
+  const code = {
+    codeItems: [
+      { instruction: 'aload_0' },
+      { instruction: 'new java/lang/Long' },
+      { instruction: 'dup' },
+      { instruction: 'lload_1' },
+      { instruction: { op: 'invokespecial', arg: ['Method', 'java/lang/Long', ['<init>', '(J)V']] } },
+      { instruction: { op: 'invokespecial', arg: ['Method', 'Parent', ['<init>', '(Ljava/lang/Object;)V']] } },
+      { instruction: { op: 'checkcast', arg: 'opa' } },
+      { instruction: { op: 'astore', arg: '5' } },
+      { instruction: { op: 'aload', arg: '5' } },
+      { instruction: { op: 'ifnull', arg: 'Done' } },
+      { labelDef: 'Done:', instruction: 'return' },
+    ],
+  };
+
+  assert.equal(initializeCode(code, method, { minNullInitLocal: 5 }, cls), 1);
+  assert.deepEqual(code.codeItems.slice(6, 8).map((item) => item.instruction), [
+    'aconst_null',
+    { op: 'astore', arg: '5' },
+  ]);
+});
+
 test('initializes low-slot reference local when first typed store does not dominate field use', () => {
   const method = { descriptor: '()V', flags: [] };
   const code = {
