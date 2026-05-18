@@ -14,17 +14,17 @@ function runInitializeUnassignedReferenceLocalsFromParameters(astRoot, options =
       for (const attr of item.method.attributes || []) {
         const code = attr && attr.type === 'code' && attr.code;
         if (!code || !Array.isArray(code.codeItems)) continue;
-        rewrites += initializeCode(code, item.method, options);
+        rewrites += initializeCode(code, item.method, options, cls);
       }
     }
   }
   return { changed: rewrites > 0, rewrites };
 }
 
-function initializeCode(code, method = {}, options = {}) {
+function initializeCode(code, method = {}, options = {}, cls = null) {
   const items = code.codeItems;
   const params = referenceParameterLocals(method);
-  const initializerIndex = method.name === '<init>' ? constructorInitializerEndIndex(items) : 0;
+  const initializerIndex = method.name === '<init>' ? constructorInitializerEndIndex(items, cls) : 0;
   let cfg = null;
   let dominators = null;
   const dominance = () => {
@@ -87,12 +87,14 @@ function initializeCode(code, method = {}, options = {}) {
   return initializers.length;
 }
 
-function constructorInitializerEndIndex(items) {
+function constructorInitializerEndIndex(items, cls = null) {
   for (let i = 0; i < items.length; i += 1) {
     if (op(items[i]) !== 'invokespecial') continue;
     const ref = arg(items[i]);
     const name = Array.isArray(ref) && Array.isArray(ref[2]) ? ref[2][0] : null;
-    if (name === '<init>') return i + 1;
+    if (name !== '<init>') continue;
+    if (cls && ref[1] !== cls.className && ref[1] !== cls.superClassName) continue;
+    return i + 1;
   }
   return 0;
 }
