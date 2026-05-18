@@ -129,7 +129,8 @@ function expectedTypeForLoad(items, index) {
     if (itemOp === 'caload' || itemOp === 'castore') return '[C';
     if (itemOp === 'saload' || itemOp === 'sastore') return '[S';
     if (itemOp === 'aastore') return expectedTypeFromArrayStoreValue(items, index) || '[Ljava/lang/Object;';
-    if (itemOp === 'aaload' || itemOp === 'arraylength') return '[Ljava/lang/Object;';
+    if (itemOp === 'aaload') return expectedTypeFromCopiedAaloadElement(items, index) || '[Ljava/lang/Object;';
+    if (itemOp === 'arraylength') return '[Ljava/lang/Object;';
     if (itemOp === 'getfield') {
       const ref = arg(items[i]);
       return Array.isArray(ref) ? `L${ref[1]};` : null;
@@ -147,6 +148,43 @@ function expectedTypeFromArrayStoreValue(items, loadIndex) {
   if (arrayProducer < 0) return null;
   const desc = producedTypeForInstruction(items, arrayProducer, null, new Set());
   return arrayElementDescriptor(desc);
+}
+
+function expectedTypeFromCopiedAaloadElement(items, loadIndex) {
+  const indexProducer = nextInstructionIndex(items, loadIndex);
+  if (indexProducer < 0 || !isSimpleStackProducer(items[indexProducer])) return null;
+  const aaloadIndex = nextInstructionIndex(items, indexProducer);
+  if (aaloadIndex < 0 || op(items[aaloadIndex]) !== 'aaload') return null;
+  const storeIndex = nextInstructionIndex(items, aaloadIndex);
+  const copiedLocal = storeIndex >= 0 ? astoreLocal(items[storeIndex]) : null;
+  if (copiedLocal == null) return null;
+  const element = firstPrimitiveArrayUseDescriptor(items, storeIndex + 1, copiedLocal);
+  return element ? `[${element}` : null;
+}
+
+function firstPrimitiveArrayUseDescriptor(items, start, local) {
+  for (let i = start; i < items.length; i += 1) {
+    if (astoreLocal(items[i]) === local || primitiveStoreLocal(items[i]) === local || iincLocal(items[i]) === local) return null;
+    if (aloadLocal(items[i]) !== local) continue;
+    const desc = primitiveArrayUseDescriptor(items, i);
+    if (desc) return desc;
+  }
+  return null;
+}
+
+function primitiveArrayUseDescriptor(items, loadIndex) {
+  for (let i = nextInstructionIndex(items, loadIndex), seen = 0; i >= 0 && seen < 5; i = nextInstructionIndex(items, i), seen += 1) {
+    const itemOp = op(items[i]);
+    if (itemOp === 'iaload' || itemOp === 'iastore') return '[I';
+    if (itemOp === 'faload' || itemOp === 'fastore') return '[F';
+    if (itemOp === 'daload' || itemOp === 'dastore') return '[D';
+    if (itemOp === 'laload' || itemOp === 'lastore') return '[J';
+    if (itemOp === 'baload' || itemOp === 'bastore') return '[B';
+    if (itemOp === 'caload' || itemOp === 'castore') return '[C';
+    if (itemOp === 'saload' || itemOp === 'sastore') return '[S';
+    if (!isSimpleStackProducer(items[i])) return null;
+  }
+  return null;
 }
 
 function expectedTypeFromNextInvoke(items, loadIndex) {
@@ -332,7 +370,7 @@ function isHandlerStore(exceptionTable, item) {
 function isSimpleStackProducer(item) {
   const itemOp = op(item);
   return itemOp === 'dup' || itemOp === 'dup_x1' || itemOp === 'dup_x2' ||
-    itemOp === 'swap' || itemOp === 'iconst_0' || itemOp === 'iconst_1' ||
+    itemOp === 'swap' || /^(?:iconst_m1|iconst_[0-5])$/.test(itemOp || '') ||
     itemOp === 'bipush' || itemOp === 'sipush' || itemOp === 'ldc' ||
     /^(?:i|f|d|l)load(?:_[0-3])?$/.test(itemOp || '');
 }

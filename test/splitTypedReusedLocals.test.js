@@ -536,8 +536,8 @@ test('split-typed-reused-locals: can iterate when aliases expose later array spl
 
   const result = runSplitTypedReusedLocals(ast, { preserveOriginalLocals: true, maxIterations: 2 });
 
-  t.equal(result.rewrites, 2);
-  t.ok(opsAndArgs(ast).includes('astore 5'), 'splits the int-array alias into a fresh local');
-  t.ok(opsAndArgs(ast).includes('aload 5'), 'rewrites the typed int-array load');
+  t.equal(result.rewrites, 4);
+  t.ok(opsAndArgs(ast).includes('astore 7'), 'splits the int-array alias into a fresh local');
+  t.ok(opsAndArgs(ast).includes('aload 7'), 'rewrites the typed int-array load');
   t.end();
 });
