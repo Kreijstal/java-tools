@@ -146,7 +146,7 @@ function cleanOneRound(astRoot, options = {}) {
     if (method && method.name === '<init>') {
       details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
     }
-    details.fallthroughGotos += removeSingleUseFallthroughGotos(code);
+    details.fallthroughGotos += removeSingleUseFallthroughGotos(code, { allowMultiUse: method && method.name === '<init>' });
     if (options.removeUnreachableCode !== false) {
       details.unreachableInstructions += removeUnreachableAfterTerminal(code);
     }
@@ -663,7 +663,7 @@ function instructionIndexAfterSequence(codeItems, startIdx, instructions) {
   return nextInstructionIndex(codeItems, itemIdx);
 }
 
-function removeSingleUseFallthroughGotos(code) {
+function removeSingleUseFallthroughGotos(code, options = {}) {
   let removed = 0;
   const codeItems = code.codeItems;
   for (let i = 0; i < codeItems.length; i += 1) {
@@ -674,7 +674,7 @@ function removeSingleUseFallthroughGotos(code) {
     const nextLabel = findNextLabel(codeItems, i + 1);
     if (target !== nextLabel) continue;
     if (isLabelProtected(code, target)) continue;
-    if (countInstructionLabelReferences(codeItems, target) !== 1) continue;
+    if (!options.allowMultiUse && countInstructionLabelReferences(codeItems, target) !== 1) continue;
     removeInstructionOnly(codeItems, i);
     removed += 1;
     if (!codeItems[i] || !codeItems[i].instruction) {

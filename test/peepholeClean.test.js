@@ -69,6 +69,43 @@ test('peephole clean removes single-use goto to following label', (t) => {
   t.end();
 });
 
+test('peephole clean removes multi-use goto to following label', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'pop' },
+    { instruction: { op: 'goto', arg: 'L1' } },
+    { labelDef: 'L1:', instruction: 'return' },
+  ]);
+  ast.classes[0].items[0].method.name = '<init>';
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.fallthroughGotos, 1);
+  t.deepEqual(
+    code(ast).codeItems.map((item) => item.instruction).filter(Boolean),
+    ['iload_1', { op: 'ifeq', arg: 'L1' }, 'iconst_0', 'pop', 'return'],
+  );
+  t.end();
+});
+
+test('peephole clean keeps multi-use goto to following label outside constructors', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'pop' },
+    { instruction: { op: 'goto', arg: 'L1' } },
+    { labelDef: 'L1:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.fallthroughGotos, 0);
+  t.ok(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto'));
+  t.end();
+});
+
 test('peephole clean inverts conditional over goto in ordinary methods', (t) => {
   const ast = astWith([
     { instruction: 'iload_1' },
