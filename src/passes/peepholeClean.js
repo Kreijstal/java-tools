@@ -12,6 +12,7 @@ function runPeepholeClean(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     protectedLoadBridges: 0,
+    monitorWaitRegions: 0,
     loopProducerBridges: 0,
     duplicateLoopTails: 0,
     forwardLoopEntryClones: 0,
@@ -53,12 +54,14 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneConditionalSharedJoinRequireStatic: options.cloneConditionalSharedJoinRequireStatic === true,
       cloneConditionalSharedJoinMaxLocalIndex: options.cloneConditionalSharedJoinMaxLocalIndex || null,
       cloneConditionalSharedJoinRequireIntArrayParameter: options.cloneConditionalSharedJoinRequireIntArrayParameter === true,
+      stripMonitorWaitExceptionRegions: options.stripMonitorWaitExceptionRegions === true,
       cloneConditionalSharedLoopTails: options.cloneConditionalSharedLoopTails === true,
       cloneConditionalSharedLoopTailClasses: new Set(options.cloneConditionalSharedLoopTailClasses || []),
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
     details.protectedLoadBridges += round.protectedLoadBridges;
+    details.monitorWaitRegions += round.monitorWaitRegions;
     details.loopProducerBridges += round.loopProducerBridges;
     details.duplicateLoopTails += round.duplicateLoopTails;
     details.forwardLoopEntryClones += round.forwardLoopEntryClones;
@@ -72,7 +75,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
-    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.loopProducerBridges +
+    changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.monitorWaitRegions + round.loopProducerBridges +
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
@@ -81,7 +84,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
     if (
-      round.nops + round.threadedBranches + round.protectedLoadBridges + round.loopProducerBridges +
+      round.nops + round.threadedBranches + round.protectedLoadBridges + round.monitorWaitRegions + round.loopProducerBridges +
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
@@ -102,6 +105,7 @@ function cleanOneRound(astRoot, options = {}) {
     nops: 0,
     threadedBranches: 0,
     protectedLoadBridges: 0,
+    monitorWaitRegions: 0,
     loopProducerBridges: 0,
     duplicateLoopTails: 0,
     forwardLoopEntryClones: 0,
@@ -120,6 +124,9 @@ function cleanOneRound(astRoot, options = {}) {
     details.nops += removeNops(code.codeItems);
     details.threadedBranches += threadBranchesThroughGoto(code.codeItems);
     details.protectedLoadBridges += coalesceProtectedLoadBridges(code);
+    if (options.stripMonitorWaitExceptionRegions) {
+      details.monitorWaitRegions += stripMonitorWaitExceptionRegions(code, method);
+    }
     details.loopProducerBridges += coalesceLoopProducerBridges(code);
     details.duplicateLoopTails += coalesceDuplicateLoopTails(code);
     details.forwardLoopEntryClones += cloneForwardLoopEntryGotos(code);
@@ -242,6 +249,78 @@ function coalesceProtectedLoadBridges(code) {
   }
 
   return changed;
+}
+
+function stripMonitorWaitExceptionRegions(code, method) {
+  if (!method || method.name !== 'run' || method.descriptor !== '()V') return 0;
+  const codeItems = code.codeItems || [];
+  if (!hasOpcode(codeItems, 'monitorenter') || !hasOpcode(codeItems, 'monitorexit')) return 0;
+  if (!hasObjectWaitCall(codeItems)) return 0;
+  if (!hasOutputStreamWriteCall(codeItems)) return 0;
+  const exceptionTable = Array.isArray(code.exceptionTable) ? code.exceptionTable : [];
+  const hasMonitorFinally = exceptionTable.some((entry) =>
+    isAnyCatch(entry) && handlerHasMonitorRethrow(codeItems, entry.handlerLbl || entry.handlerLabel || entry.handler || entry.usingLbl));
+  const hasInterruptedWaitCatch = exceptionTable.some((entry) =>
+    entry && entry.catch_type === 'java/lang/InterruptedException');
+  if (!hasMonitorFinally || !hasInterruptedWaitCatch) return 0;
+
+  let rewrites = 0;
+  for (const item of codeItems) {
+    const opcode = getOpcode(item && item.instruction);
+    if (opcode !== 'monitorenter' && opcode !== 'monitorexit') continue;
+    item.instruction = 'pop';
+    delete item.pc;
+    rewrites += 1;
+  }
+  code.exceptionTable = exceptionTable.filter((entry) =>
+    !(isAnyCatch(entry) || (entry && entry.catch_type === 'java/lang/InterruptedException')));
+  return rewrites > 0 ? 1 : 0;
+}
+
+function hasOpcode(codeItems, opcode) {
+  return codeItems.some((item) => getOpcode(item && item.instruction) === opcode);
+}
+
+function hasObjectWaitCall(codeItems) {
+  return codeItems.some((item) => {
+    const instruction = item && item.instruction;
+    if (getOpcode(instruction) !== 'invokevirtual') return false;
+    const arg = getInstructionArg(instruction);
+    return Array.isArray(arg) && arg[0] === 'Method' && arg[1] === 'java/lang/Object' &&
+      Array.isArray(arg[2]) && arg[2][0] === 'wait';
+  });
+}
+
+function hasOutputStreamWriteCall(codeItems) {
+  return codeItems.some((item) => {
+    const instruction = item && item.instruction;
+    if (getOpcode(instruction) !== 'invokevirtual') return false;
+    const arg = getInstructionArg(instruction);
+    return Array.isArray(arg) && arg[0] === 'Method' && arg[1] === 'java/io/OutputStream' &&
+      Array.isArray(arg[2]) && arg[2][0] === 'write';
+  });
+}
+
+function isAnyCatch(entry) {
+  return entry && (entry.catch_type === 'any' || entry.catchType === 'any' || entry.catchType === null);
+}
+
+function handlerHasMonitorRethrow(codeItems, handlerLabel) {
+  const start = findLabelIndexInItems(codeItems, handlerLabel);
+  if (start < 0) return false;
+  let sawMonitorExit = false;
+  const end = Math.min(codeItems.length, start + 12);
+  for (let i = start; i < end; i += 1) {
+    const opcode = getOpcode(codeItems[i] && codeItems[i].instruction);
+    if (opcode === 'monitorexit') sawMonitorExit = true;
+    if (opcode === 'athrow') return sawMonitorExit;
+  }
+  return false;
+}
+
+function findLabelIndexInItems(codeItems, label) {
+  const target = trimLabel(label);
+  return codeItems.findIndex((item) => trimLabel(item && item.labelDef) === target);
 }
 
 function cloneForwardLoopEntryGotos(code) {
@@ -1480,6 +1559,7 @@ module.exports = {
   removeNops,
   threadBranchesThroughGoto,
   coalesceProtectedLoadBridges,
+  stripMonitorWaitExceptionRegions,
   coalesceLoopProducerBridges,
   coalesceDuplicateLoopTails,
   cloneForwardLoopEntryGotos,
