@@ -47,6 +47,12 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneSharedFallthroughJoinClasses: new Set(options.cloneSharedFallthroughJoinClasses || []),
       cloneConditionalSharedJoins: options.cloneConditionalSharedJoins === true,
       cloneConditionalSharedJoinClasses: new Set(options.cloneConditionalSharedJoinClasses || []),
+      cloneConditionalSharedJoinMinMethodInsns: options.cloneConditionalSharedJoinMinMethodInsns || 0,
+      cloneConditionalSharedJoinMinArrayStores: options.cloneConditionalSharedJoinMinArrayStores || 0,
+      cloneConditionalSharedJoinRequireNoExceptions: options.cloneConditionalSharedJoinRequireNoExceptions === true,
+      cloneConditionalSharedJoinRequireStatic: options.cloneConditionalSharedJoinRequireStatic === true,
+      cloneConditionalSharedJoinMaxLocalIndex: options.cloneConditionalSharedJoinMaxLocalIndex || null,
+      cloneConditionalSharedJoinRequireIntArrayParameter: options.cloneConditionalSharedJoinRequireIntArrayParameter === true,
       cloneConditionalSharedLoopTails: options.cloneConditionalSharedLoopTails === true,
       cloneConditionalSharedLoopTailClasses: new Set(options.cloneConditionalSharedLoopTailClasses || []),
     });
@@ -129,7 +135,8 @@ function cleanOneRound(astRoot, options = {}) {
     }
     const conditionalJoinCloneClassAllowed = options.cloneConditionalSharedJoinClasses.size === 0 ||
       options.cloneConditionalSharedJoinClasses.has(classItem && classItem.className);
-    if (options.cloneConditionalSharedJoins && conditionalJoinCloneClassAllowed) {
+    if (options.cloneConditionalSharedJoins && conditionalJoinCloneClassAllowed &&
+      methodMatchesConditionalSharedJoinGate(code, method, options)) {
       details.conditionalSharedJoinClones += cloneConditionalSharedJoinBranches(code);
     }
     const conditionalLoopTailCloneClassAllowed = options.cloneConditionalSharedLoopTailClasses.size === 0 ||
@@ -989,6 +996,74 @@ function countArrayStoreOpcodes(codeItems, startIdx, endIdx) {
     else counts.other += 1;
   }
   return counts;
+}
+
+function methodMatchesConditionalSharedJoinGate(code, method, options) {
+  if (options.cloneConditionalSharedJoinRequireStatic && !methodHasAccess(method, 'static')) {
+    return false;
+  }
+  if (options.cloneConditionalSharedJoinRequireIntArrayParameter &&
+    !(method && typeof method.descriptor === 'string' && method.descriptor.startsWith('(') && method.descriptor.includes('[I'))) {
+    return false;
+  }
+  if (options.cloneConditionalSharedJoinRequireNoExceptions &&
+    Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) {
+    return false;
+  }
+  const codeItems = code.codeItems || [];
+  const minInsns = Number(options.cloneConditionalSharedJoinMinMethodInsns || 0);
+  if (minInsns > 0 && countInstructions(codeItems, 0, codeItems.length) < minInsns) return false;
+  const minArrayStores = Number(options.cloneConditionalSharedJoinMinArrayStores || 0);
+  if (minArrayStores > 0 && countArrayStoreOpcodes(codeItems, 0, codeItems.length).total < minArrayStores) {
+    return false;
+  }
+  const maxLocalIndex = options.cloneConditionalSharedJoinMaxLocalIndex == null
+    ? null
+    : Number(options.cloneConditionalSharedJoinMaxLocalIndex);
+  if (maxLocalIndex != null && maxLocalIndex >= 0 && highestReferencedLocalIndex(codeItems) > maxLocalIndex) {
+    return false;
+  }
+  return true;
+}
+
+function highestReferencedLocalIndex(codeItems) {
+  let max = -1;
+  for (const item of codeItems || []) {
+    const index = referencedLocalIndex(item && item.instruction);
+    if (index != null && index > max) max = index;
+  }
+  return max;
+}
+
+function referencedLocalIndex(instruction) {
+  const op = opcodeMnemonic(instruction);
+  if (!op) return null;
+  const short = /^(?:[aidfl]load|[aidfl]store|ret)_(\d+)$/.exec(op);
+  if (short) return Number(short[1]);
+  if (!/^(?:[aidfl]load|[aidfl]store|ret|iinc)$/.test(op)) return null;
+  const arg = getInstructionArg(instruction);
+  if (typeof arg === 'number') return arg;
+  if (typeof arg === 'bigint') return Number(arg);
+  if (Array.isArray(arg) && arg.length > 0 && Number.isFinite(Number(arg[0]))) return Number(arg[0]);
+  if (arg && typeof arg === 'object') {
+    for (const key of ['index', 'local', 'var']) {
+      if (Number.isFinite(Number(arg[key]))) return Number(arg[key]);
+    }
+  }
+  if (typeof instruction === 'string') {
+    const parts = instruction.trim().split(/\s+/);
+    if (parts.length > 1 && Number.isFinite(Number(parts[1]))) return Number(parts[1]);
+  }
+  return null;
+}
+
+function methodHasAccess(method, flag) {
+  const access = method && method.access;
+  if (Array.isArray(access)) return access.includes(flag) || access.includes(`ACC_${flag.toUpperCase()}`);
+  if (typeof access === 'string') return access.split(/\s+/).includes(flag) || access.split(/\s+/).includes(`ACC_${flag.toUpperCase()}`);
+  if (method && Array.isArray(method.accessFlags)) return method.accessFlags.includes(flag) || method.accessFlags.includes(`ACC_${flag.toUpperCase()}`);
+  if (method && Array.isArray(method.flags)) return method.flags.includes(flag) || method.flags.includes(`ACC_${flag.toUpperCase()}`);
+  return false;
 }
 
 function hasPreservationGuard(codeItems, labelIdx, label) {

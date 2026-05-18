@@ -45,6 +45,12 @@ function splitCodeOnce(code, options = {}) {
       isPrimitiveArrayCandidate(candidate) || isConcreteReferenceArrayCandidate(candidate));
     if (candidates.length === 0 || candidates.length > maxCandidates) return 0;
   }
+  const maxFreshLocalIndex = options.maxFreshLocalIndex == null ? 255 : Number(options.maxFreshLocalIndex);
+  const currentLocalCount = Number(code.locals || code.localsSize || 0);
+  if (Number.isFinite(maxFreshLocalIndex) && Number.isFinite(currentLocalCount) &&
+    currentLocalCount + candidates.length - 1 > maxFreshLocalIndex) {
+    return 0;
+  }
 
   for (const candidate of candidates) {
     candidate.fresh = allocateLocal(code);
