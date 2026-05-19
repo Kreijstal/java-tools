@@ -29,6 +29,7 @@ function runPeepholeClean(astRoot, options = {}) {
     conditionalFallthroughGotoBridges: 0,
     stackConditionalTargetClones: 0,
     forwardTerminalGotoTailClones: 0,
+    conditionalTerminalTailClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     deadGotoIslands: 0,
@@ -82,6 +83,9 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneForwardTerminalGotoTails: options.cloneForwardTerminalGotoTails === true,
       cloneForwardTerminalGotoTailMaxInsns: options.cloneForwardTerminalGotoTailMaxInsns || 0,
       cloneForwardTerminalGotoTailMaxClones: options.cloneForwardTerminalGotoTailMaxClones || 1,
+      cloneConditionalTerminalTails: options.cloneConditionalTerminalTails === true,
+      cloneConditionalTerminalTailMaxInsns: options.cloneConditionalTerminalTailMaxInsns || 0,
+      cloneConditionalTerminalTailMaxClones: options.cloneConditionalTerminalTailMaxClones || 1,
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -103,6 +107,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.conditionalFallthroughGotoBridges += round.conditionalFallthroughGotoBridges;
     details.stackConditionalTargetClones += round.stackConditionalTargetClones;
     details.forwardTerminalGotoTailClones += round.forwardTerminalGotoTailClones;
+    details.conditionalTerminalTailClones += round.conditionalTerminalTailClones;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.deadGotoIslands += round.deadGotoIslands;
@@ -120,6 +125,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalFallthroughGotoBridges +
       round.stackConditionalTargetClones +
       round.forwardTerminalGotoTailClones +
+      round.conditionalTerminalTailClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.deadGotoIslands +
       round.unreachableInstructions + round.unusedLabels;
@@ -136,6 +142,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalFallthroughGotoBridges +
       round.stackConditionalTargetClones +
       round.forwardTerminalGotoTailClones +
+      round.conditionalTerminalTailClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.deadGotoIslands +
       round.unreachableInstructions + round.unusedLabels === 0
@@ -169,6 +176,7 @@ function cleanOneRound(astRoot, options = {}) {
     conditionalFallthroughGotoBridges: 0,
     stackConditionalTargetClones: 0,
     forwardTerminalGotoTailClones: 0,
+    conditionalTerminalTailClones: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     deadGotoIslands: 0,
@@ -236,6 +244,12 @@ function cleanOneRound(astRoot, options = {}) {
       details.forwardTerminalGotoTailClones += cloneForwardTerminalGotoTails(code, {
         maxInsns: options.cloneForwardTerminalGotoTailMaxInsns,
         maxClones: options.cloneForwardTerminalGotoTailMaxClones,
+      });
+    }
+    if (options.cloneConditionalTerminalTails) {
+      details.conditionalTerminalTailClones += cloneConditionalTerminalTails(code, {
+        maxInsns: options.cloneConditionalTerminalTailMaxInsns,
+        maxClones: options.cloneConditionalTerminalTailMaxClones,
       });
     }
     const classAllowed = options.invertConditionalsOverGotoClasses.size === 0 ||
@@ -1085,7 +1099,7 @@ function cloneForwardTerminalGotoTails(code, options = {}) {
   const maxClones = Math.max(1, Number(options.maxClones || 1));
   const candidates = [];
 
-  for (let i = 0; i < codeItems.length; i += 1) {
+  for (let i = codeItems.length - 1; i >= 0; i -= 1) {
     const item = codeItems[i];
     const opcode = opcodeMnemonic(item && item.instruction);
     if (opcode !== 'goto' && opcode !== 'goto_w') continue;
@@ -1111,12 +1125,77 @@ function cloneForwardTerminalGotoTails(code, options = {}) {
     if (clone.length === 0) continue;
     if (item.labelDef) clone.unshift({ labelDef: item.labelDef });
     candidates.push({ index: i, clone });
+    if (candidates.length >= maxClones) break;
   }
 
-  const selected = candidates.slice(-maxClones);
+  const selected = candidates;
+  for (const candidate of selected) {
+    codeItems.splice(candidate.index, 1, ...candidate.clone);
+  }
+
+  return selected.length;
+}
+
+function cloneConditionalTerminalTails(code, options = {}) {
+  const codeItems = code.codeItems;
+  const labelIndex = buildLabelIndex(codeItems);
+  const maxInsns = Number(options.maxInsns || 0);
+  const maxClones = Math.max(1, Number(options.maxClones || 1));
+  const candidates = [];
+  const tailCache = new Map();
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    const inverse = INVERSE_CONDITIONALS[opcode];
+    if (!inverse) continue;
+
+    const target = trimLabel(getInstructionArg(item.instruction));
+    const targetIdx = labelIndex.get(target);
+    if (targetIdx == null || targetIdx <= i || isLabelProtected(code, target)) continue;
+    if (countInstructionLabelReferences(codeItems, target) < 2) continue;
+
+    const fallthroughIdx = nextInstructionIndex(codeItems, i + 1);
+    if (fallthroughIdx == null || fallthroughIdx >= targetIdx) continue;
+    if (!rangeContainsTerminal(codeItems, fallthroughIdx, targetIdx)) continue;
+
+    let tail = tailCache.get(targetIdx);
+    if (!tail) {
+      const tailEnd = codeItems.length;
+      const insns = countInstructionsUpTo(codeItems, targetIdx, tailEnd, maxInsns > 0 ? maxInsns + 1 : 0);
+      if (insns === 0 || (maxInsns > 0 && insns > maxInsns)) {
+        tail = { ok: false };
+      } else {
+        tail = {
+          ok: true,
+          end: tailEnd,
+          summary: analyzeRegion(code, targetIdx, tailEnd, { allowControlFlow: true, allowSideEffects: true }),
+        };
+      }
+      tailCache.set(targetIdx, tail);
+    }
+    if (!tail.ok) continue;
+    const summary = tail.summary;
+    if (!summary.supported) continue;
+    if (summary.touchesProtectedLabel || summary.overlapsExceptionRange) continue;
+    if (summary.outboundBranches.length > 0) continue;
+    if (summary.stack.underflowsEntry) continue;
+    if (!summary.hasTerminator) continue;
+
+    const clone = cloneRange(codeItems.slice(targetIdx, tail.end), nextClonePrefix('Lct'));
+    if (clone.length === 0) continue;
+    const fallthroughLabel = ensureLabelAtInstruction(codeItems, fallthroughIdx, nextClonePrefix('Lctf'));
+    if (!fallthroughLabel) continue;
+    candidates.push({ index: i, inverse, fallthroughLabel, clone });
+    if (candidates.length >= maxClones) break;
+  }
+
+  const selected = candidates;
   for (let i = selected.length - 1; i >= 0; i -= 1) {
     const candidate = selected[i];
-    codeItems.splice(candidate.index, 1, ...candidate.clone);
+    const item = codeItems[candidate.index];
+    item.instruction = setOpcode(setBranchArg(item.instruction, candidate.fallthroughLabel), candidate.inverse);
+    codeItems.splice(candidate.index + 1, 0, ...candidate.clone);
   }
 
   return selected.length;
@@ -1667,6 +1746,25 @@ function countInstructions(codeItems, startIdx, endIdx) {
     if (codeItems[i] && codeItems[i].instruction) count += 1;
   }
   return count;
+}
+
+function countInstructionsUpTo(codeItems, startIdx, endIdx, limit) {
+  let count = 0;
+  for (let i = startIdx; i < endIdx; i += 1) {
+    if (codeItems[i] && codeItems[i].instruction) {
+      count += 1;
+      if (limit > 0 && count > limit) return count;
+    }
+  }
+  return count;
+}
+
+function rangeContainsTerminal(codeItems, startIdx, endIdx) {
+  for (let i = startIdx; i < endIdx; i += 1) {
+    const opcode = opcodeMnemonic(codeItems[i] && codeItems[i].instruction);
+    if (isTerminalOpcode(opcode)) return true;
+  }
+  return false;
 }
 
 function findSmallTerminalForwardBlock(codeItems, startIdx, maxInsns) {
@@ -2357,6 +2455,7 @@ module.exports = {
   removeConditionalFallthroughGotoBridges,
   cloneStackConditionalTargets,
   cloneForwardTerminalGotoTails,
+  cloneConditionalTerminalTails,
   removeDeadGotoIslandsAfterTerminals,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,

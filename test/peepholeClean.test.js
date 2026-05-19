@@ -723,6 +723,28 @@ test('peephole clean clones shared forward terminal goto tail', (t) => {
   t.end();
 });
 
+test('peephole clean clones shared forward conditional terminal tail', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'Ltail' } },
+    { instruction: 'iinc 2 1' },
+    { instruction: { op: 'ifne', arg: 'Ltail' } },
+    { instruction: 'return' },
+    { labelDef: 'Ltail:', instruction: 'iload_2' },
+    { instruction: { op: 'ifne', arg: 'Lret' } },
+    { instruction: 'return' },
+    { labelDef: 'Lret:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    cloneConditionalTerminalTails: true,
+    cloneConditionalTerminalTailMaxInsns: 20,
+  });
+  t.equal(result.details.conditionalTerminalTailClones, 1);
+  t.ok(code(ast).codeItems.some((item) => /^Lctf\d+_0:$/.test(item.labelDef || '')));
+  t.end();
+});
+
 test('peephole clean materializes dup-store compare locals', (t) => {
   const ast = astWith([
     { instruction: 'iload_1' },
