@@ -174,6 +174,42 @@ test('peephole clean can clone conditional shared join for one predecessor', (t)
   t.end();
 });
 
+test('peephole clean can materialize nullable shared join guards', (t) => {
+  const ast = astWith([
+    { instruction: 'aload 11' },
+    { instruction: { op: 'ifnonnull', arg: 'Ljoin' } },
+    { instruction: 'invokestatic Method Loader load ()Ljava/lang/Object;' },
+    { instruction: 'astore 11' },
+    { instruction: 'aconst_null' },
+    { instruction: 'aload 11' },
+    { instruction: { op: 'if_acmpne', arg: 'Lnonnull' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'istore 6' },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'Lnonnull:', instruction: 'aload_0' },
+    { instruction: 'aload 11' },
+    { instruction: 'putfield Field Example f Ljava/lang/Object;' },
+    { instruction: { op: 'goto', arg: 'Ljoin' } },
+    { labelDef: 'Ljoin:', instruction: 'aload 11' },
+    { instruction: 'invokevirtual Method Obj use ()Z' },
+    { instruction: { op: 'ifne', arg: 'Lexit' } },
+    { instruction: 'iconst_0' },
+    { instruction: 'istore 6' },
+    { labelDef: 'Lexit:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { materializeNullableSharedJoinGuards: true });
+  const items = code(ast).codeItems;
+  const joinIdx = items.findIndex((item) => item.labelDef === 'Ljoin:');
+
+  t.ok(result.changed);
+  t.equal(result.details.nullableSharedJoinGuards, 1);
+  t.deepEqual(items[joinIdx].instruction, { op: 'aload', arg: '11' });
+  t.deepEqual(items[joinIdx + 1].instruction, { op: 'ifnull', arg: 'Lexit' });
+  t.deepEqual(items[9].instruction, { op: 'goto', arg: 'Ljoin' });
+  t.end();
+});
+
 test('peephole clean can clone conditional shared loop tail for one predecessor', (t) => {
   const ast = astWith([
     { labelDef: 'Lhead:', instruction: 'aload_1' },
