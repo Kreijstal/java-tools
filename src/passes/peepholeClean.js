@@ -74,6 +74,7 @@ function runPeepholeClean(astRoot, options = {}) {
       removeConditionalFallthroughGotoBridges: options.removeConditionalFallthroughGotoBridges === true,
       materializeDupStoreCompareBranches: options.materializeDupStoreCompareBranches === true,
       removeDeadGotoIslands: options.removeDeadGotoIslands === true,
+      coalesceProtectedLoopProducerBridges: options.coalesceProtectedLoopProducerBridges === true,
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -170,7 +171,9 @@ function cleanOneRound(astRoot, options = {}) {
       methodMatchesConditionalSharedJoinGate(code, method, options)) {
       details.dupStoreCompareBranches += normalizeDupStoreCompareBranches(code);
     }
-    details.loopProducerBridges += coalesceLoopProducerBridges(code);
+    details.loopProducerBridges += coalesceLoopProducerBridges(code, {
+      allowProtectedProducer: options.coalesceProtectedLoopProducerBridges,
+    });
     details.duplicateLoopTails += coalesceDuplicateLoopTails(code);
     details.forwardLoopEntryClones += cloneForwardLoopEntryGotos(code);
     details.conditionalForwardLoopEntryClones += cloneConditionalForwardLoopEntry(code);
@@ -836,9 +839,10 @@ function materializeNullableSharedJoinGuards(code) {
   return changed;
 }
 
-function coalesceLoopProducerBridges(code) {
+function coalesceLoopProducerBridges(code, options = {}) {
   const codeItems = code.codeItems;
   const labelIndex = buildLabelIndex(codeItems);
+  const allowProtectedProducer = options.allowProtectedProducer === true;
   let changed = 0;
 
   for (let i = 0; i < codeItems.length; i += 1) {
@@ -858,7 +862,8 @@ function coalesceLoopProducerBridges(code) {
     if (producerIdx == null || producerIdx <= gotoIdx) continue;
     const producer = codeItems[producerIdx];
     const producerLabel = trimLabel(producer && producer.labelDef);
-    if (!producerLabel || isLabelProtected(code, producerLabel)) continue;
+    if (!producerLabel) continue;
+    if (!allowProtectedProducer && isLabelProtected(code, producerLabel)) continue;
     if (!sameInstruction(item.instruction, producer.instruction)) continue;
     if (nextInstructionIndex(codeItems, producerIdx + 1) !== targetIdx) continue;
     if (!hasBackwardGotoToLabel(codeItems, labelIndex, producerLabel, targetIdx + 1)) continue;
