@@ -22,6 +22,7 @@ function runPeepholeClean(astRoot, options = {}) {
     sharedFallthroughJoinClones: 0,
     conditionalSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
+    conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -57,6 +58,7 @@ function runPeepholeClean(astRoot, options = {}) {
       stripMonitorWaitExceptionRegions: options.stripMonitorWaitExceptionRegions === true,
       cloneConditionalSharedLoopTails: options.cloneConditionalSharedLoopTails === true,
       cloneConditionalSharedLoopTailClasses: new Set(options.cloneConditionalSharedLoopTailClasses || []),
+      removeConditionalFallthroughGotoBridges: options.removeConditionalFallthroughGotoBridges === true,
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -71,6 +73,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.sharedFallthroughJoinClones += round.sharedFallthroughJoinClones;
     details.conditionalSharedJoinClones += round.conditionalSharedJoinClones;
     details.conditionalSharedLoopTailClones += round.conditionalSharedLoopTailClones;
+    details.conditionalFallthroughGotoBridges += round.conditionalFallthroughGotoBridges;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
     details.unreachableInstructions += round.unreachableInstructions;
@@ -81,6 +84,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.sharedFallthroughJoinClones +
       round.conditionalSharedJoinClones +
       round.conditionalSharedLoopTailClones +
+      round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
     if (
@@ -90,6 +94,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.sharedFallthroughJoinClones +
       round.conditionalSharedJoinClones +
       round.conditionalSharedLoopTailClones +
+      round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels === 0
     ) {
@@ -115,6 +120,7 @@ function cleanOneRound(astRoot, options = {}) {
     sharedFallthroughJoinClones: 0,
     conditionalSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
+    conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
     unreachableInstructions: 0,
@@ -150,6 +156,10 @@ function cleanOneRound(astRoot, options = {}) {
       options.cloneConditionalSharedLoopTailClasses.has(classItem && classItem.className);
     if (options.cloneConditionalSharedLoopTails && conditionalLoopTailCloneClassAllowed) {
       details.conditionalSharedLoopTailClones += cloneConditionalSharedLoopTails(code);
+    }
+    if (options.removeConditionalFallthroughGotoBridges &&
+      methodMatchesConditionalSharedJoinGate(code, method, options)) {
+      details.conditionalFallthroughGotoBridges += removeConditionalFallthroughGotoBridges(code);
     }
     const classAllowed = options.invertConditionalsOverGotoClasses.size === 0 ||
       options.invertConditionalsOverGotoClasses.has(classItem && classItem.className);
@@ -770,6 +780,45 @@ function removeSingleUseFallthroughGotos(code, options = {}) {
   return removed;
 }
 
+function removeConditionalFallthroughGotoBridges(code) {
+  const codeItems = code.codeItems;
+  const labelIndex = buildLabelIndex(codeItems);
+  const refCounts = collectInstructionLabelReferenceCounts(codeItems);
+  let removed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    if (!isConditionalBranch(opcode)) continue;
+
+    const bridgeLabel = trimLabel(getBranchArg(item.instruction));
+    if (!bridgeLabel || isLabelProtected(code, bridgeLabel)) continue;
+
+    const bridgeIdx = labelIndex.get(bridgeLabel);
+    if (bridgeIdx == null || bridgeIdx <= i) continue;
+
+    const bridgeInsnIdx = nextInstructionIndex(codeItems, bridgeIdx);
+    if (bridgeInsnIdx == null) continue;
+    const bridgeInsn = codeItems[bridgeInsnIdx] && codeItems[bridgeInsnIdx].instruction;
+    if (opcodeMnemonic(bridgeInsn) !== 'goto') continue;
+    if (previousLabelOrStart(codeItems, bridgeInsnIdx) !== bridgeIdx) continue;
+
+    const joinLabel = trimLabel(getBranchArg(bridgeInsn));
+    if (!joinLabel || joinLabel === bridgeLabel || isLabelProtected(code, joinLabel)) continue;
+    if (findNextLabel(codeItems, bridgeInsnIdx + 1) !== joinLabel) continue;
+
+    item.instruction = setBranchArg(item.instruction, joinLabel);
+    refCounts.set(bridgeLabel, (refCounts.get(bridgeLabel) || 0) - 1);
+    refCounts.set(joinLabel, (refCounts.get(joinLabel) || 0) + 1);
+    if ((refCounts.get(bridgeLabel) || 0) === 0) {
+      removeInstructionOnly(codeItems, bridgeInsnIdx);
+    }
+    removed += 1;
+  }
+
+  return removed;
+}
+
 function invertConditionalOverGoto(code) {
   let changed = 0;
   const codeItems = code.codeItems;
@@ -1366,6 +1415,20 @@ function collectInstructionLabels(instruction, used) {
   collectLabelsFromValue(instruction.arg, used);
 }
 
+function collectInstructionLabelReferenceCounts(codeItems) {
+  const out = new Map();
+  for (const item of codeItems || []) {
+    if (!item || !item.instruction) continue;
+    collectInstructionLabels(item.instruction, {
+      add(label) {
+        const trimmed = trimLabel(label);
+        out.set(trimmed, (out.get(trimmed) || 0) + 1);
+      },
+    });
+  }
+  return out;
+}
+
 function collectLabelsFromValue(value, used) {
   if (!value) return;
   if (typeof value === 'string') {
@@ -1569,6 +1632,7 @@ module.exports = {
   cloneSharedFallthroughJoinGotos,
   cloneConditionalSharedJoinBranches,
   cloneConditionalSharedLoopTails,
+  removeConditionalFallthroughGotoBridges,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
   removeUnreachableUntilUsedLabel,
