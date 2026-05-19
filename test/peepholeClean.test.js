@@ -636,6 +636,31 @@ test('peephole clean coalesces loop producer bridge', (t) => {
   t.end();
 });
 
+test('peephole clean gates protected loop producer bridge', (t) => {
+  const items = [
+    { labelDef: 'L0:', instruction: 'iconst_0' },
+    { instruction: { op: 'goto', arg: 'Lcond' } },
+    { labelDef: 'Lbody:', instruction: 'iinc 1 1' },
+    { labelDef: 'Lbound:', instruction: 'iconst_0' },
+    { labelDef: 'Lcond:', instruction: 'iload_1' },
+    { instruction: { op: 'if_icmpgt', arg: 'Lend' } },
+    { instruction: { op: 'goto', arg: 'Lbound' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ];
+  const exceptionTable = [{ startLbl: 'Lbound', endLbl: 'Lend', handlerLbl: 'Lend', catchType: 'java/lang/Throwable' }];
+
+  const defaultAst = astWith(items.map((item) => ({ ...item })), exceptionTable);
+  const defaultResult = runPeepholeClean(defaultAst);
+  t.equal(defaultResult.details.loopProducerBridges, 0);
+  t.equal(code(defaultAst).codeItems[0].instruction, 'iconst_0');
+
+  const safeAst = astWith(items.map((item) => ({ ...item })), exceptionTable);
+  const safeResult = runPeepholeClean(safeAst, { coalesceProtectedLoopProducerBridges: true });
+  t.equal(safeResult.details.loopProducerBridges, 1);
+  t.deepEqual(code(safeAst).codeItems[0].instruction, { op: 'goto', arg: 'Lbound' });
+  t.end();
+});
+
 test('peephole clean materializes dup-store compare locals', (t) => {
   const ast = astWith([
     { instruction: 'iload_1' },
