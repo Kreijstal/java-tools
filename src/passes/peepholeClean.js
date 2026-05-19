@@ -22,6 +22,7 @@ function runPeepholeClean(astRoot, options = {}) {
     sharedFallthroughBlockClones: 0,
     sharedFallthroughJoinClones: 0,
     conditionalSharedJoinClones: 0,
+    longCompareSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
     conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
@@ -49,6 +50,7 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneSharedFallthroughJoins: options.cloneSharedFallthroughJoins === true,
       cloneSharedFallthroughJoinClasses: new Set(options.cloneSharedFallthroughJoinClasses || []),
       cloneConditionalSharedJoins: options.cloneConditionalSharedJoins === true,
+      cloneLongCompareSharedJoins: options.cloneLongCompareSharedJoins === true,
       cloneConditionalSharedJoinClasses: new Set(options.cloneConditionalSharedJoinClasses || []),
       cloneConditionalSharedJoinMinMethodInsns: options.cloneConditionalSharedJoinMinMethodInsns || 0,
       cloneConditionalSharedJoinMinArrayStores: options.cloneConditionalSharedJoinMinArrayStores || 0,
@@ -75,6 +77,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.sharedFallthroughBlockClones += round.sharedFallthroughBlockClones;
     details.sharedFallthroughJoinClones += round.sharedFallthroughJoinClones;
     details.conditionalSharedJoinClones += round.conditionalSharedJoinClones;
+    details.longCompareSharedJoinClones += round.longCompareSharedJoinClones;
     details.conditionalSharedLoopTailClones += round.conditionalSharedLoopTailClones;
     details.conditionalFallthroughGotoBridges += round.conditionalFallthroughGotoBridges;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
@@ -86,6 +89,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
       round.conditionalSharedJoinClones +
+      round.longCompareSharedJoinClones +
       round.conditionalSharedLoopTailClones +
       round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
@@ -96,6 +100,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
       round.conditionalSharedJoinClones +
+      round.longCompareSharedJoinClones +
       round.conditionalSharedLoopTailClones +
       round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
@@ -123,6 +128,7 @@ function cleanOneRound(astRoot, options = {}) {
     sharedFallthroughBlockClones: 0,
     sharedFallthroughJoinClones: 0,
     conditionalSharedJoinClones: 0,
+    longCompareSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
     conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
@@ -159,6 +165,11 @@ function cleanOneRound(astRoot, options = {}) {
     if (options.cloneConditionalSharedJoins && conditionalJoinCloneClassAllowed &&
       methodMatchesConditionalSharedJoinGate(code, method, options)) {
       details.conditionalSharedJoinClones += cloneConditionalSharedJoinBranches(code);
+    }
+    if (options.cloneLongCompareSharedJoins && methodMatchesLongCompareSharedJoinGate(code, options)) {
+      details.longCompareSharedJoinClones += cloneConditionalSharedJoinBranches(code, {
+        requireLongCompareBranch: true,
+      });
     }
     const conditionalLoopTailCloneClassAllowed = options.cloneConditionalSharedLoopTailClasses.size === 0 ||
       options.cloneConditionalSharedLoopTailClasses.has(classItem && classItem.className);
@@ -612,7 +623,7 @@ function cloneSharedFallthroughJoinGotos(code) {
   return changed;
 }
 
-function cloneConditionalSharedJoinBranches(code) {
+function cloneConditionalSharedJoinBranches(code, options = {}) {
   const codeItems = code.codeItems;
   const splitTargets = getPeepholeSet(code, 'peepholeSplitConditionalSharedJoins');
   let changed = 0;
@@ -621,6 +632,10 @@ function cloneConditionalSharedJoinBranches(code) {
     const item = codeItems[i];
     const opcode = opcodeMnemonic(item && item.instruction);
     if (!isConditionalBranch(opcode)) continue;
+    if (options.requireLongCompareBranch) {
+      const prevIdx = previousInstructionIndex(codeItems, i - 1);
+      if (prevIdx == null || opcodeMnemonic(codeItems[prevIdx] && codeItems[prevIdx].instruction) !== 'lcmp') continue;
+    }
     const target = trimLabel(getBranchArg(item.instruction));
     if (!target || splitTargets.has(target)) continue;
 
@@ -636,6 +651,7 @@ function cloneConditionalSharedJoinBranches(code) {
     if (!fallthroughLabel || isLabelProtected(code, fallthroughLabel)) continue;
     const realInsns = countInstructions(codeItems, startIdx, endIdx);
     if (realInsns === 0 || realInsns > 12) continue;
+    if (options.requireLongCompareBranch && realInsns < 4) continue;
     if (hasInternalControlFlowBeforeEnd(codeItems, startIdx, endIdx)) continue;
 
     const clone = cloneRange(codeItems.slice(startIdx, endIdx), nextClonePrefix('Lcsj'));
@@ -1188,6 +1204,23 @@ function methodMatchesConditionalSharedJoinGate(code, method, options) {
   if (minArrayStores > 0 && countArrayStoreOpcodes(codeItems, 0, codeItems.length).total < minArrayStores) {
     return false;
   }
+  const maxLocalIndex = options.cloneConditionalSharedJoinMaxLocalIndex == null
+    ? null
+    : Number(options.cloneConditionalSharedJoinMaxLocalIndex);
+  if (maxLocalIndex != null && maxLocalIndex >= 0 && highestReferencedLocalIndex(codeItems) > maxLocalIndex) {
+    return false;
+  }
+  return true;
+}
+
+function methodMatchesLongCompareSharedJoinGate(code, options) {
+  if (options.cloneConditionalSharedJoinRequireNoExceptions &&
+    Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) {
+    return false;
+  }
+  const codeItems = code.codeItems || [];
+  const minInsns = Number(options.cloneConditionalSharedJoinMinMethodInsns || 0);
+  if (minInsns > 0 && countInstructions(codeItems, 0, codeItems.length) < minInsns) return false;
   const maxLocalIndex = options.cloneConditionalSharedJoinMaxLocalIndex == null
     ? null
     : Number(options.cloneConditionalSharedJoinMaxLocalIndex);
