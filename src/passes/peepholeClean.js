@@ -24,6 +24,7 @@ function runPeepholeClean(astRoot, options = {}) {
     conditionalSharedJoinClones: 0,
     longCompareSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
+    nullableSharedJoinGuards: 0,
     conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
@@ -58,9 +59,13 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneConditionalSharedJoinRequireStatic: options.cloneConditionalSharedJoinRequireStatic === true,
       cloneConditionalSharedJoinMaxLocalIndex: options.cloneConditionalSharedJoinMaxLocalIndex || null,
       cloneConditionalSharedJoinRequireIntArrayParameter: options.cloneConditionalSharedJoinRequireIntArrayParameter === true,
+      nullableSharedJoinGuardMinMethodInsns: options.nullableSharedJoinGuardMinMethodInsns || 0,
+      nullableSharedJoinGuardRequireNoExceptions: options.nullableSharedJoinGuardRequireNoExceptions === true,
+      nullableSharedJoinGuardMaxLocalIndex: options.nullableSharedJoinGuardMaxLocalIndex || null,
       stripMonitorWaitExceptionRegions: options.stripMonitorWaitExceptionRegions === true,
       cloneConditionalSharedLoopTails: options.cloneConditionalSharedLoopTails === true,
       cloneConditionalSharedLoopTailClasses: new Set(options.cloneConditionalSharedLoopTailClasses || []),
+      materializeNullableSharedJoinGuards: options.materializeNullableSharedJoinGuards === true,
       removeConditionalFallthroughGotoBridges: options.removeConditionalFallthroughGotoBridges === true,
       materializeDupStoreCompareBranches: options.materializeDupStoreCompareBranches === true,
     });
@@ -79,6 +84,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.conditionalSharedJoinClones += round.conditionalSharedJoinClones;
     details.longCompareSharedJoinClones += round.longCompareSharedJoinClones;
     details.conditionalSharedLoopTailClones += round.conditionalSharedLoopTailClones;
+    details.nullableSharedJoinGuards += round.nullableSharedJoinGuards;
     details.conditionalFallthroughGotoBridges += round.conditionalFallthroughGotoBridges;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
@@ -91,6 +97,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalSharedJoinClones +
       round.longCompareSharedJoinClones +
       round.conditionalSharedLoopTailClones +
+      round.nullableSharedJoinGuards +
       round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels;
@@ -102,6 +109,7 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalSharedJoinClones +
       round.longCompareSharedJoinClones +
       round.conditionalSharedLoopTailClones +
+      round.nullableSharedJoinGuards +
       round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.unreachableInstructions + round.unusedLabels === 0
@@ -130,6 +138,7 @@ function cleanOneRound(astRoot, options = {}) {
     conditionalSharedJoinClones: 0,
     longCompareSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
+    nullableSharedJoinGuards: 0,
     conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
@@ -175,6 +184,10 @@ function cleanOneRound(astRoot, options = {}) {
       options.cloneConditionalSharedLoopTailClasses.has(classItem && classItem.className);
     if (options.cloneConditionalSharedLoopTails && conditionalLoopTailCloneClassAllowed) {
       details.conditionalSharedLoopTailClones += cloneConditionalSharedLoopTails(code);
+    }
+    if (options.materializeNullableSharedJoinGuards &&
+      methodMatchesNullableSharedJoinGuardGate(code, options)) {
+      details.nullableSharedJoinGuards += materializeNullableSharedJoinGuards(code);
     }
     if (options.removeConditionalFallthroughGotoBridges &&
       methodMatchesConditionalSharedJoinGate(code, method, options)) {
@@ -711,6 +724,50 @@ function cloneConditionalSharedLoopTails(code) {
   return changed;
 }
 
+function materializeNullableSharedJoinGuards(code) {
+  const codeItems = code.codeItems;
+  const guardedTargets = getPeepholeSet(code, 'peepholeNullableSharedJoinGuards');
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    if (!isNonNullConditional(opcode)) continue;
+
+    const local = referenceLoadLocalBeforeBranch(codeItems, i);
+    if (local == null) continue;
+
+    const target = trimLabel(getBranchArg(item.instruction));
+    if (!target || guardedTargets.has(target)) continue;
+    const labelIndex = buildLabelIndex(codeItems);
+    const targetIdx = labelIndex.get(target);
+    if (targetIdx == null || targetIdx <= i) continue;
+    if (isLabelProtected(code, target) || hasPreservationGuard(codeItems, targetIdx, target)) continue;
+    if (countInstructionLabelReferences(codeItems, target) < 2) continue;
+    const targetInsnIdx = firstInstructionIndexAtOrAfter(codeItems, targetIdx);
+    if (targetInsnIdx == null) continue;
+    if (hasLabelBetween(codeItems, targetIdx + 1, targetInsnIdx + 1)) continue;
+    if (!isAloadLocal(codeItems[targetInsnIdx] && codeItems[targetInsnIdx].instruction, local)) continue;
+
+    const skip = findNullableJoinSkipGoto(codeItems, i + 1, targetIdx, local);
+    if (!skip) continue;
+    const exitLabel = skip.exitLabel;
+    const exitIdx = labelIndex.get(exitLabel);
+    if (exitIdx == null || exitIdx <= targetInsnIdx || isLabelProtected(code, exitLabel)) continue;
+    if (countInstructions(codeItems, targetInsnIdx, exitIdx) > 14) continue;
+    if (hasBranchToLabelBetween(codeItems, targetInsnIdx, exitIdx, target)) continue;
+    if (!hasReferenceStoreBetween(codeItems, i + 1, skip.gotoIdx, local)) continue;
+
+    codeItems[skip.gotoIdx].instruction = setBranchArg(codeItems[skip.gotoIdx].instruction, target);
+    insertNullGuardAtLabel(codeItems, targetIdx, local, exitLabel);
+    guardedTargets.add(target);
+    changed += 1;
+    break;
+  }
+
+  return changed;
+}
+
 function coalesceLoopProducerBridges(code) {
   const codeItems = code.codeItems;
   const labelIndex = buildLabelIndex(codeItems);
@@ -1230,6 +1287,23 @@ function methodMatchesLongCompareSharedJoinGate(code, options) {
   return true;
 }
 
+function methodMatchesNullableSharedJoinGuardGate(code, options) {
+  if (options.nullableSharedJoinGuardRequireNoExceptions &&
+    Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) {
+    return false;
+  }
+  const codeItems = code.codeItems || [];
+  const minInsns = Number(options.nullableSharedJoinGuardMinMethodInsns || 0);
+  if (minInsns > 0 && countInstructions(codeItems, 0, codeItems.length) < minInsns) return false;
+  const maxLocalIndex = options.nullableSharedJoinGuardMaxLocalIndex == null
+    ? null
+    : Number(options.nullableSharedJoinGuardMaxLocalIndex);
+  if (maxLocalIndex != null && maxLocalIndex >= 0 && highestReferencedLocalIndex(codeItems) > maxLocalIndex) {
+    return false;
+  }
+  return true;
+}
+
 function highestReferencedLocalIndex(codeItems) {
   let max = -1;
   for (const item of codeItems || []) {
@@ -1380,11 +1454,19 @@ function hasInternalLabel(codeItems, startIdx, endIdx) {
   return false;
 }
 
+function hasLabelBetween(codeItems, startIdx, endIdx) {
+  return hasInternalLabel(codeItems, startIdx, endIdx);
+}
+
 function hasInstructionBetween(codeItems, startIndex, endIndex) {
   for (let i = startIndex; i < endIndex; i += 1) {
     if (codeItems[i] && codeItems[i].instruction) return true;
   }
   return false;
+}
+
+function firstInstructionIndexAtOrAfter(codeItems, startIndex) {
+  return nextInstructionIndex(codeItems, startIndex);
 }
 
 function hasInternalControlFlowBeforeEnd(codeItems, startIdx, endIdx) {
@@ -1416,8 +1498,131 @@ function hasBranchToLabelBetween(codeItems, startIndex, endIndex, label) {
   return false;
 }
 
+function findNullableJoinSkipGoto(codeItems, startIndex, endIndex, local) {
+  const labelIndex = buildLabelIndex(codeItems);
+  for (let i = startIndex; i < endIndex; i += 1) {
+    const opcode = opcodeMnemonic(codeItems[i] && codeItems[i].instruction);
+    if (!isNonNullConditional(opcode)) continue;
+    if (referenceLoadLocalBeforeBranch(codeItems, i) !== local) continue;
+
+    const nonNullLabel = trimLabel(getBranchArg(codeItems[i].instruction));
+    const nonNullIdx = labelIndex.get(nonNullLabel);
+    if (nonNullIdx == null || nonNullIdx <= i || nonNullIdx > endIndex) continue;
+    const skip = firstForwardGotoBetween(codeItems, labelIndex, i + 1, nonNullIdx, endIndex);
+    if (skip) return skip;
+  }
+  return null;
+}
+
+function firstForwardGotoBetween(codeItems, labelIndex, startIndex, endIndex, minTargetIndex) {
+  for (let i = startIndex; i < endIndex; i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    if (opcodeMnemonic(instruction) !== 'goto') continue;
+    const exitLabel = trimLabel(getBranchArg(instruction));
+    const exitIdx = labelIndex.get(exitLabel);
+    if (exitIdx != null && exitIdx > minTargetIndex) return { gotoIdx: i, exitLabel };
+  }
+  return null;
+}
+
+function hasReferenceStoreBetween(codeItems, startIndex, endIndex, local) {
+  for (let i = startIndex; i < endIndex; i += 1) {
+    if (isAstoreLocal(codeItems[i] && codeItems[i].instruction, local)) return true;
+  }
+  return false;
+}
+
+function insertNullGuardAtLabel(codeItems, targetIdx, local, exitLabel) {
+  const original = codeItems[targetIdx];
+  if (original && original.labelDef && !original.instruction) {
+    codeItems.splice(
+      targetIdx + 1,
+      0,
+      { instruction: { op: 'aload', arg: String(local) } },
+      { instruction: { op: 'ifnull', arg: exitLabel } },
+    );
+    return;
+  }
+  const labelDef = original && original.labelDef;
+  const stackMapFrame = original && original.stackMapFrame;
+  if (original) {
+    delete original.labelDef;
+    delete original.stackMapFrame;
+  }
+  const guardEntry = { labelDef, instruction: { op: 'aload', arg: String(local) } };
+  if (stackMapFrame) guardEntry.stackMapFrame = stackMapFrame;
+  codeItems.splice(
+    targetIdx,
+    0,
+    guardEntry,
+    { instruction: { op: 'ifnull', arg: exitLabel } },
+  );
+}
+
+function referenceLoadLocalBeforeBranch(codeItems, branchIdx) {
+  const opcode = opcodeMnemonic(codeItems[branchIdx] && codeItems[branchIdx].instruction);
+  if (opcode === 'ifnonnull') {
+    const loadIdx = previousInstructionIndex(codeItems, branchIdx - 1);
+    if (loadIdx == null) return null;
+    return aloadLocalIndex(codeItems[loadIdx] && codeItems[loadIdx].instruction);
+  }
+  if (opcode !== 'if_acmpne') return null;
+  const rightIdx = previousInstructionIndex(codeItems, branchIdx - 1);
+  const leftIdx = rightIdx == null ? null : previousInstructionIndex(codeItems, rightIdx - 1);
+  if (rightIdx == null || leftIdx == null) return null;
+  const rightLocal = aloadLocalIndex(codeItems[rightIdx] && codeItems[rightIdx].instruction);
+  const leftLocal = aloadLocalIndex(codeItems[leftIdx] && codeItems[leftIdx].instruction);
+  if (opcodeMnemonic(codeItems[leftIdx] && codeItems[leftIdx].instruction) === 'aconst_null' && rightLocal != null) {
+    return rightLocal;
+  }
+  if (opcodeMnemonic(codeItems[rightIdx] && codeItems[rightIdx].instruction) === 'aconst_null' && leftLocal != null) {
+    return leftLocal;
+  }
+  return null;
+}
+
+function isNonNullConditional(opcode) {
+  return opcode === 'ifnonnull' || opcode === 'if_acmpne';
+}
+
 function isConditionalBranch(opcode) {
   return /^if/.test(opcode || '');
+}
+
+function isAloadLocal(instruction, local) {
+  return aloadLocalIndex(instruction) === local;
+}
+
+function isAstoreLocal(instruction, local) {
+  return astoreLocalIndex(instruction) === local;
+}
+
+function aloadLocalIndex(instruction) {
+  const opcode = opcodeMnemonic(instruction);
+  const short = /^aload_(\d)$/.exec(opcode || '');
+  if (short) return Number(short[1]);
+  if (opcode !== 'aload') return null;
+  const arg = localInstructionArg(instruction);
+  if (arg != null && arg !== '' && Number.isFinite(Number(arg))) return Number(arg);
+  if (typeof instruction === 'string') {
+    const parts = instruction.trim().split(/\s+/);
+    if (parts.length === 2 && Number.isFinite(Number(parts[1]))) return Number(parts[1]);
+  }
+  return null;
+}
+
+function astoreLocalIndex(instruction) {
+  const opcode = opcodeMnemonic(instruction);
+  const short = /^astore_(\d)$/.exec(opcode || '');
+  if (short) return Number(short[1]);
+  if (opcode !== 'astore') return null;
+  const arg = localInstructionArg(instruction);
+  if (arg != null && arg !== '' && Number.isFinite(Number(arg))) return Number(arg);
+  if (typeof instruction === 'string') {
+    const parts = instruction.trim().split(/\s+/);
+    if (parts.length === 2 && Number.isFinite(Number(parts[1]))) return Number(parts[1]);
+  }
+  return null;
 }
 
 function isSimpleLoadInstruction(instruction) {
