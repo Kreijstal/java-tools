@@ -105,6 +105,24 @@ test('dead-flag: rewrites iload N; ifeq TGT to goto TGT', (t) => {
   t.end();
 });
 
+test('dead-flag: can preserve branch shape with a constant false load', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+    { labelDef: 'L3:', instruction: { op: 'istore', arg: '5' } },
+    { labelDef: 'L6:', instruction: { op: 'iload', arg: '5' } },
+    { labelDef: 'L7:', instruction: { op: 'ifeq', arg: 'L99' } },
+    { labelDef: 'L8:', instruction: 'return' },
+    { labelDef: 'L99:', instruction: 'return' },
+  ]);
+  const r = runDeadStaticBoolFlag(ast, { flags: 'client.A', preserveBranchShape: true });
+  t.equal(r.eliminated, 1);
+  const items = code(ast).codeItems.filter((it) => it && it.instruction);
+  const ops = items.map((it) => (typeof it.instruction === 'string' ? it.instruction : it.instruction.op));
+  t.deepEqual(ops, ['getstatic', 'istore', 'iconst_0', 'ifeq', 'return', 'return']);
+  t.equal(items[3].instruction.arg, 'L99');
+  t.end();
+});
+
 test('dead-flag: refuses if local N is rewritten elsewhere', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'jn', ['u', 'Z']] } },

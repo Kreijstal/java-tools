@@ -1,7 +1,7 @@
 'use strict';
 
 const test = require('tape');
-const { runPeepholeClean } = require('../src/passes/peepholeClean');
+const { runPeepholeClean, normalizeDupStoreCompareBranches } = require('../src/passes/peepholeClean');
 
 function astWith(codeItems, exceptionTable = []) {
   return {
@@ -542,6 +542,49 @@ test('peephole clean coalesces loop producer bridge', (t) => {
   t.ok(result.changed);
   t.equal(result.details.loopProducerBridges, 1);
   t.deepEqual(code(ast).codeItems[0].instruction, { op: 'goto', arg: 'Lbound' });
+  t.end();
+});
+
+test('peephole clean materializes dup-store compare locals', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: 'ineg' },
+    { instruction: 'dup' },
+    { instruction: 'istore 4' },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'if_icmplt', arg: 'Lneg' } },
+    { instruction: 'return' },
+    { labelDef: 'Lneg:', instruction: 'return' },
+  ]);
+
+  const result = normalizeDupStoreCompareBranches(code(ast));
+  t.equal(result, 1);
+  t.deepEqual(code(ast).codeItems.slice(2, 5).map((item) => item.instruction), [
+    'istore 4',
+    { op: 'iinc', varnum: '4', incr: '0' },
+    { op: 'iload', arg: '4' },
+  ]);
+  t.end();
+});
+
+test('peephole clean materializes dup-store compare locals with args arrays', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: 'dup' },
+    { instruction: { op: 'istore', args: ['47'] } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'if_icmpge', arg: 'Lge' } },
+    { instruction: 'return' },
+    { labelDef: 'Lge:', instruction: 'return' },
+  ]);
+
+  const result = normalizeDupStoreCompareBranches(code(ast));
+  t.equal(result, 1);
+  t.deepEqual(code(ast).codeItems.slice(1, 4).map((item) => item.instruction), [
+    { op: 'istore', args: ['47'] },
+    { op: 'iinc', varnum: '47', incr: '0' },
+    { op: 'iload', arg: '47' },
+  ]);
   t.end();
 });
 
