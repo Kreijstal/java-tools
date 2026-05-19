@@ -387,6 +387,24 @@ test('peephole clean removes unreachable code after terminal instructions', (t) 
   t.end();
 });
 
+test('peephole clean removes unreachable labelled code before used label when enabled', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'goto', arg: 'Lend' } },
+    { labelDef: 'Ldead:', instruction: 'iconst_0' },
+    { instruction: 'istore_1' },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { removeUnreachableUntilUsedLabels: true });
+  t.ok(result.changed);
+  t.equal(result.details.unreachableInstructions, 2);
+  t.deepEqual(
+    code(ast).codeItems.map((item) => item.instruction).filter(Boolean),
+    ['return'],
+  );
+  t.end();
+});
+
 test('peephole clean keeps reachable labelled code after terminal instructions', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iload_1' },
@@ -658,6 +676,50 @@ test('peephole clean gates protected loop producer bridge', (t) => {
   const safeResult = runPeepholeClean(safeAst, { coalesceProtectedLoopProducerBridges: true });
   t.equal(safeResult.details.loopProducerBridges, 1);
   t.deepEqual(code(safeAst).codeItems[0].instruction, { op: 'goto', arg: 'Lbound' });
+  t.end();
+});
+
+test('peephole clean clones stack-consuming conditional targets', (t) => {
+  const ast = astWith([
+    { instruction: 'iconst_0' },
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifne', arg: 'Lcmp' } },
+    { instruction: { op: 'if_icmpne', arg: 'Lbreak' } },
+    { instruction: 'return' },
+    { labelDef: 'Lcmp:', instruction: { op: 'if_icmple', arg: 'Lbreak' } },
+    { instruction: 'iinc 1 1' },
+    { instruction: 'return' },
+    { labelDef: 'Lbreak:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneStackConditionalTargets: true });
+  t.equal(result.details.stackConditionalTargetClones, 1);
+  const instructions = code(ast).codeItems.map((item) => item.instruction).filter(Boolean);
+  t.equal(instructions[2].op, 'ifeq');
+  t.ok(/^Lscf\d+_0$/.test(instructions[2].arg));
+  t.deepEqual(instructions[3], { op: 'if_icmple', arg: 'Lbreak' });
+  t.equal(instructions[4].op, 'goto');
+  t.ok(/^Lsct\d+_0$/.test(instructions[4].arg));
+  t.end();
+});
+
+test('peephole clean clones shared forward terminal goto tail', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'ifeq', arg: 'Ltail' } },
+    { instruction: { op: 'goto', arg: 'Ltail' } },
+    { labelDef: 'Ltail:', instruction: 'iconst_0' },
+    { instruction: { op: 'ifeq', arg: 'Lret' } },
+    { instruction: 'iconst_1' },
+    { instruction: 'istore_1' },
+    { labelDef: 'Lret:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    cloneForwardTerminalGotoTails: true,
+    cloneForwardTerminalGotoTailMaxInsns: 20,
+  });
+  t.equal(result.details.forwardTerminalGotoTailClones, 1);
+  t.notEqual(code(ast).codeItems[1].instruction.op, 'goto');
   t.end();
 });
 
