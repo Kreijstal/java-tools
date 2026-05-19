@@ -26,15 +26,40 @@ function runSimplifyNotCompare(astRoot, options = {}) {
       for (const attr of item.method.attributes || []) {
         const codeItems = attr && attr.type === 'code' && attr.code && attr.code.codeItems;
         if (!Array.isArray(codeItems)) continue;
-        const allowedLocals = options.charLocalsOnly ? collectCharLocals(codeItems, item.method) : null;
-        rewrites += simplifyCodeItems(codeItems, collectUsedLabels(codeItems, attr.code.exceptionTable), allowedLocals);
+        const charLocals = options.charLocalsOnly ? collectCharLocals(codeItems, item.method) : null;
+        const widenIntCompares = options.generalIntNotCompare &&
+          methodMatchesGeneralIntNotCompareGate(attr.code, item.method, options);
+        const compareLocals = widenIntCompares ? null : charLocals;
+        rewrites += simplifyCodeItems(codeItems, collectUsedLabels(codeItems, attr.code.exceptionTable), compareLocals, charLocals);
       }
     }
   }
   return { changed: rewrites > 0, rewrites };
 }
 
-function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems), allowedLocals = null) {
+function methodMatchesGeneralIntNotCompareGate(code, method, options) {
+  if (options.generalIntNotCompareRequireStatic && !methodHasAccess(method, 'static')) return false;
+  if (options.generalIntNotCompareRequireIntArrayParameter &&
+    !(method && typeof method.descriptor === 'string' && method.descriptor.startsWith('(') && method.descriptor.includes('[I'))) {
+    return false;
+  }
+  if (options.generalIntNotCompareRequireNoExceptions &&
+    Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) {
+    return false;
+  }
+  const codeItems = code.codeItems || [];
+  const minInsns = Number(options.generalIntNotCompareMinMethodInsns || 0);
+  if (minInsns > 0 && countInstructions(codeItems) < minInsns) return false;
+  const maxLocalIndex = options.generalIntNotCompareMaxLocalIndex == null
+    ? null
+    : Number(options.generalIntNotCompareMaxLocalIndex);
+  if (maxLocalIndex != null && maxLocalIndex >= 0 && highestReferencedLocalIndex(codeItems) > maxLocalIndex) {
+    return false;
+  }
+  return true;
+}
+
+function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems), allowedLocals = null, nonNegativeLocals = allowedLocals) {
   let rewrites = 0;
   for (let i = 0; i <= codeItems.length - 3; i += 1) {
     const wideRight = matchWideRightNotCompare(codeItems, i, usedLabels, allowedLocals);
@@ -44,7 +69,7 @@ function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems),
       i -= 1;
       continue;
     }
-    const impossibleNegative = matchImpossibleNegativeCharCompare(codeItems, i, usedLabels, allowedLocals);
+    const impossibleNegative = matchImpossibleNegativeCharCompare(codeItems, i, usedLabels, nonNegativeLocals);
     if (impossibleNegative) {
       codeItems.splice(i, impossibleNegative.width, ...impossibleNegative.items);
       rewrites += 1;
@@ -52,6 +77,13 @@ function simplifyCodeItems(codeItems, usedLabels = collectUsedLabels(codeItems),
       continue;
     }
     if (i > codeItems.length - 5) continue;
+    const dupStore = matchDupStoreLeftNotCompare(codeItems, i, usedLabels);
+    if (dupStore) {
+      codeItems.splice(i, 6, ...dupStore);
+      rewrites += 1;
+      i -= 1;
+      continue;
+    }
     const left = matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals);
     if (left) {
       codeItems.splice(i, 5, ...left);
@@ -151,6 +183,22 @@ function impossibleNegativeRewrite(value, branch, width) {
   };
 }
 
+function matchDupStoreLeftNotCompare(codeItems, i, usedLabels) {
+  if (i > codeItems.length - 6) return null;
+  const bound = pushValue(codeItems[i + 4]);
+  const branch = codeItems[i + 5];
+  const branchOp = op(branch);
+  if (op(codeItems[i]) !== 'dup' || !isIntStore(codeItems[i + 1])) return null;
+  if (op(codeItems[i + 2]) !== 'iconst_m1' || op(codeItems[i + 3]) !== 'ixor') return null;
+  if (bound == null || !LEFT_OPS[branchOp] || !plainRemovedItems(codeItems, i + 2, i + 3, usedLabels)) return null;
+  return [
+    copyItem(codeItems[i]),
+    copyItem(codeItems[i + 1]),
+    itemWithInstruction(codeItems[i + 4], pushInstruction(~bound)),
+    itemWithInstruction(branch, { op: LEFT_OPS[branchOp], arg: arg(branch) }),
+  ];
+}
+
 function matchLeftNotCompare(codeItems, i, usedLabels, allowedLocals) {
   const value = codeItems[i];
   const bound = pushValue(codeItems[i + 3]);
@@ -232,6 +280,7 @@ function itemWithInstruction(labelSource, instruction) {
 
 function isAllowedIntValue(item, allowedLocals) {
   if (isCharProducer(item)) return true;
+  if (!allowedLocals && isPureIntProducer(item)) return true;
   return isIntLoad(item) && (!allowedLocals || allowedLocals.has(localIndex(item)));
 }
 
@@ -246,6 +295,17 @@ function isCharProducer(item) {
 
 function isPlainIntProducer(item) {
   return pushValue(item) != null || isIntLoad(item);
+}
+
+function isPureIntProducer(item) {
+  if (isIntLoad(item)) return true;
+  const itemOp = op(item);
+  return itemOp === 'getstatic' && isIntLikeDescriptor(fieldDescriptor(arg(item)));
+}
+
+function isIntLikeDescriptor(descriptor) {
+  return descriptor === 'I' || descriptor === 'Z' || descriptor === 'B' ||
+    descriptor === 'S' || descriptor === 'C';
 }
 
 function isObjectProducerChain(items) {
@@ -408,6 +468,38 @@ function storeLocalIndex(item) {
   const itemOp = op(item);
   if (itemOp === 'istore') return String(arg(item));
   return itemOp.slice(-1);
+}
+
+function countInstructions(codeItems) {
+  return (codeItems || []).reduce((count, item) => count + (item && item.instruction ? 1 : 0), 0);
+}
+
+function highestReferencedLocalIndex(codeItems) {
+  let max = -1;
+  for (const item of codeItems || []) {
+    const index = referencedLocalIndex(item);
+    if (index != null && index > max) max = index;
+  }
+  return max;
+}
+
+function referencedLocalIndex(item) {
+  const itemOp = op(item);
+  if (!itemOp) return null;
+  const short = /^(?:[aidfl]load|[aidfl]store|ret)_(\d+)$/.exec(itemOp);
+  if (short) return Number(short[1]);
+  if (!/^(?:[aidfl]load|[aidfl]store|ret|iinc)$/.test(itemOp)) return null;
+  const value = arg(item);
+  return Number.isFinite(Number(value)) ? Number(value) : null;
+}
+
+function methodHasAccess(method, flag) {
+  const access = method && method.access;
+  if (Array.isArray(access)) return access.includes(flag) || access.includes(`ACC_${flag.toUpperCase()}`);
+  if (typeof access === 'string') return access.split(/\s+/).includes(flag) || access.split(/\s+/).includes(`ACC_${flag.toUpperCase()}`);
+  if (method && Array.isArray(method.accessFlags)) return method.accessFlags.includes(flag) || method.accessFlags.includes(`ACC_${flag.toUpperCase()}`);
+  if (method && Array.isArray(method.flags)) return method.flags.includes(flag) || method.flags.includes(`ACC_${flag.toUpperCase()}`);
+  return false;
 }
 
 function trimLabel(label) {
