@@ -90,6 +90,15 @@ function getArg(instruction) {
   return instruction.arg;
 }
 
+function getLocalArg(instruction) {
+  if (!instruction || typeof instruction !== 'object') return null;
+  if (instruction.arg != null) return instruction.arg;
+  if (instruction.index != null) return instruction.index;
+  if (instruction.varnum != null) return instruction.varnum;
+  if (Array.isArray(instruction.args)) return instruction.args[0];
+  return null;
+}
+
 function localOf(op, arg) {
   // Map opcode + arg to a numeric local index (or null if not a local-indexed
   // load/store). Both numbered (istore_2) and generic (istore N) forms supported.
@@ -99,6 +108,10 @@ function localOf(op, arg) {
     return Number.isFinite(n) ? n : null;
   }
   if (typeof arg === 'number') return arg;
+  if (Array.isArray(arg)) {
+    const n = parseInt(arg[0], 10);
+    return Number.isFinite(n) ? n : null;
+  }
   if (typeof arg === 'string') {
     const n = parseInt(arg, 10);
     return Number.isFinite(n) ? n : null;
@@ -136,7 +149,7 @@ function isLocalRewritten(codeItems, local, allowedSites) {
     const op = getOp(item.instruction);
     if (op === 'iinc') {
       // iinc operand: { local, increment } or arg "n by k"
-      const arg = getArg(item.instruction);
+      const arg = getLocalArg(item.instruction);
       let l = null;
       if (arg && typeof arg === 'object' && typeof arg.local === 'number') l = arg.local;
       else if (typeof arg === 'string') {
@@ -147,7 +160,7 @@ function isLocalRewritten(codeItems, local, allowedSites) {
       continue;
     }
     if (!STORE_OPS.has(op)) continue;
-    const l = localOf(op, getArg(item.instruction));
+    const l = localOf(op, getLocalArg(item.instruction));
     if (l === local) return true;
   }
   return false;
@@ -177,7 +190,7 @@ function findEntryStoreSites(codeItems, alwaysFalseFields, opts = {}) {
     const next = codeItems[j];
     const nextOp = getOp(next.instruction);
     if (!ISTORE_OPS.has(nextOp)) continue;
-    const local = localOf(nextOp, getArg(next.instruction));
+    const local = localOf(nextOp, getLocalArg(next.instruction));
     if (local === null) continue;
     sites.add(j);
     bindingDetails.push({ getstaticIdx: i, istoreIdx: j, local });
@@ -228,7 +241,7 @@ function eliminateInMethod(code, opts) {
       continue;
     }
     if (!ILOAD_OPS.has(op)) continue;
-    const local = localOf(op, getArg(item.instruction));
+    const local = localOf(op, getLocalArg(item.instruction));
     if (local === null || !cleanLocals.has(local)) continue;
     // Find next instruction; must be ifne/ifeq with no labelDef between.
     let j = i + 1;
@@ -255,11 +268,18 @@ function eliminateInMethod(code, opts) {
   // Apply rewrites. We keep labelDefs intact: if the iload codeItem has a
   // labelDef, we delete only the instruction (not the labelDef). Same for
   // the if codeItem. For ifeq we replace its instruction with `goto TGT`.
+  // In preserveBranchShape mode, keep the conditional edge and materialize the
+  // known false flag as iconst_0. This is useful for CFR, which often handles
+  // a conditional loop break better than the equivalent unconditional goto.
   // Iterate in DESCENDING index order so earlier indexes remain valid; but
   // since we never splice (we only mutate fields), the order doesn't matter.
   for (const r of rewrites) {
     const iloadItem = codeItems[r.iloadIdx];
     const ifItem = codeItems[r.ifIdx];
+    if (opts.preserveBranchShape) {
+      iloadItem.instruction = 'iconst_0';
+      continue;
+    }
     // Delete the iload instruction.
     delete iloadItem.instruction;
     delete iloadItem.pc;
@@ -275,6 +295,10 @@ function eliminateInMethod(code, opts) {
   for (const r of directRewrites) {
     const loadItem = codeItems[r.loadIdx];
     const ifItem = codeItems[r.ifIdx];
+    if (opts.preserveBranchShape) {
+      loadItem.instruction = 'iconst_0';
+      continue;
+    }
     delete loadItem.instruction;
     delete loadItem.pc;
     if (r.ifKind === 'ifne') {
@@ -301,10 +325,69 @@ function eliminateInMethod(code, opts) {
   return rewrites.length + directRewrites.length;
 }
 
+function methodMatchesPreserveBranchShapeGate(code, method, options = {}) {
+  if (!options.preserveBranchShape) return false;
+  if (options.preserveBranchShapeRequireStatic && !methodHasAccess(method, 'static')) return false;
+  if (options.preserveBranchShapeRequireIntArrayParameter &&
+    !(method && typeof method.descriptor === 'string' && method.descriptor.startsWith('(') && method.descriptor.includes('[I'))) {
+    return false;
+  }
+  if (options.preserveBranchShapeRequireNoExceptions &&
+    Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) {
+    return false;
+  }
+  const codeItems = code.codeItems || [];
+  const minInsns = Number(options.preserveBranchShapeMinMethodInsns || 0);
+  if (minInsns > 0 && countInstructions(codeItems) < minInsns) return false;
+  const maxLocalIndex = options.preserveBranchShapeMaxLocalIndex == null
+    ? null
+    : Number(options.preserveBranchShapeMaxLocalIndex);
+  if (maxLocalIndex != null && maxLocalIndex >= 0 && highestReferencedLocalIndex(codeItems) > maxLocalIndex) {
+    return false;
+  }
+  return true;
+}
+
+function countInstructions(codeItems) {
+  let count = 0;
+  for (const item of codeItems || []) {
+    if (item && item.instruction) count += 1;
+  }
+  return count;
+}
+
+function highestReferencedLocalIndex(codeItems) {
+  let max = -1;
+  for (const item of codeItems || []) {
+    const index = referencedLocalIndex(item && item.instruction);
+    if (index != null && index > max) max = index;
+  }
+  return max;
+}
+
+function referencedLocalIndex(instruction) {
+  const op = getOp(instruction);
+  if (!op) return null;
+  const short = /^(?:[aidfl]load|[aidfl]store|ret)_(\d+)$/.exec(op);
+  if (short) return Number(short[1]);
+  if (!/^(?:[aidfl]load|[aidfl]store|ret|iinc)$/.test(op)) return null;
+  return localOf(op, getLocalArg(instruction));
+}
+
+function methodHasAccess(method, flag) {
+  const access = method && method.access;
+  if (Array.isArray(access)) return access.includes(flag) || access.includes(`ACC_${flag.toUpperCase()}`);
+  if (typeof access === 'string') return access.split(/\s+/).includes(flag) || access.split(/\s+/).includes(`ACC_${flag.toUpperCase()}`);
+  if (method && Array.isArray(method.accessFlags)) return method.accessFlags.includes(flag) || method.accessFlags.includes(`ACC_${flag.toUpperCase()}`);
+  if (method && Array.isArray(method.flags)) return method.flags.includes(flag) || method.flags.includes(`ACC_${flag.toUpperCase()}`);
+  return false;
+}
+
 function runDeadStaticBoolFlag(astRoot, options = {}) {
   const alwaysFalseFields = parseFieldList(options.flags);
   const verbose = !!options.verbose;
   const allowIntFlags = !!options.allowIntFlags;
+  const preserveBranchShape = !!options.preserveBranchShape;
   let totalEliminated = 0;
   let totalMethods = 0;
   let methodsAffected = 0;
@@ -315,9 +398,12 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
       for (const attr of item.method.attributes || []) {
         if (!attr || attr.type !== 'code' || !attr.code) continue;
         totalMethods += 1;
+        const preserveBranchShapeForMethod = preserveBranchShape &&
+          methodMatchesPreserveBranchShapeGate(attr.code, item.method, options);
         const eliminated = eliminateInMethod(attr.code, {
           alwaysFalseFields,
           allowIntFlags,
+          preserveBranchShape: preserveBranchShapeForMethod,
           verbose,
           owner: classItem.className,
           name: item.method.name,
