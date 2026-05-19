@@ -588,6 +588,32 @@ test('peephole clean materializes dup-store compare locals with args arrays', (t
   t.end();
 });
 
+test('peephole clean can clone lcmp conditional shared joins', (t) => {
+  const ast = astWith([
+    { instruction: 'lload_1' },
+    { instruction: 'lload_3' },
+    { instruction: 'lcmp' },
+    { instruction: { op: 'ifge', arg: 'Join' } },
+    { instruction: 'aload_0' },
+    { instruction: { op: 'goto', arg: 'Exit' } },
+    { instruction: { op: 'goto', arg: 'Join' } },
+    { labelDef: 'Join:', instruction: 'aload_1' },
+    { instruction: 'iconst_1' },
+    { instruction: 'iadd' },
+    { instruction: { op: 'istore', arg: '5' } },
+    { labelDef: 'Exit:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneLongCompareSharedJoins: true });
+  t.ok(result.changed);
+  t.equal(result.details.longCompareSharedJoinClones, 1);
+  const branch = code(ast).codeItems.find((item) => item && item.instruction && item.instruction.op === 'ifge');
+  t.ok(branch.instruction.arg !== 'Join');
+  const clone = code(ast).codeItems.find((item) => item && item.labelDef === `${branch.instruction.arg}:`);
+  t.ok(clone, 'branch points at cloned join');
+  t.end();
+});
+
 test('peephole clean does not clone shared loop entry when branch block has live stack', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iconst_1' },
