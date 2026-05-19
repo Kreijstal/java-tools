@@ -21,6 +21,7 @@ function runPeepholeClean(astRoot, options = {}) {
     conditionalForwardTailClones: 0,
     sharedFallthroughBlockClones: 0,
     sharedFallthroughJoinClones: 0,
+    smallTerminalSharedBlockClones: 0,
     conditionalSharedJoinClones: 0,
     longCompareSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
@@ -28,6 +29,7 @@ function runPeepholeClean(astRoot, options = {}) {
     conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
+    deadGotoIslands: 0,
     unreachableInstructions: 0,
     unusedLabels: 0,
   };
@@ -50,6 +52,9 @@ function runPeepholeClean(astRoot, options = {}) {
       invertConditionalsOverGotoClasses: new Set(options.invertConditionalsOverGotoClasses || []),
       cloneSharedFallthroughJoins: options.cloneSharedFallthroughJoins === true,
       cloneSharedFallthroughJoinClasses: new Set(options.cloneSharedFallthroughJoinClasses || []),
+      cloneSmallTerminalSharedForwardBlocks: options.cloneSmallTerminalSharedForwardBlocks === true,
+      cloneSmallTerminalSharedForwardBlockMinMethodInsns: options.cloneSmallTerminalSharedForwardBlockMinMethodInsns || 0,
+      cloneSmallTerminalSharedForwardBlockMaxLocalIndex: options.cloneSmallTerminalSharedForwardBlockMaxLocalIndex || null,
       cloneConditionalSharedJoins: options.cloneConditionalSharedJoins === true,
       cloneLongCompareSharedJoins: options.cloneLongCompareSharedJoins === true,
       cloneConditionalSharedJoinClasses: new Set(options.cloneConditionalSharedJoinClasses || []),
@@ -68,6 +73,7 @@ function runPeepholeClean(astRoot, options = {}) {
       materializeNullableSharedJoinGuards: options.materializeNullableSharedJoinGuards === true,
       removeConditionalFallthroughGotoBridges: options.removeConditionalFallthroughGotoBridges === true,
       materializeDupStoreCompareBranches: options.materializeDupStoreCompareBranches === true,
+      removeDeadGotoIslands: options.removeDeadGotoIslands === true,
     });
     details.nops += round.nops;
     details.threadedBranches += round.threadedBranches;
@@ -81,6 +87,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.conditionalForwardTailClones += round.conditionalForwardTailClones;
     details.sharedFallthroughBlockClones += round.sharedFallthroughBlockClones;
     details.sharedFallthroughJoinClones += round.sharedFallthroughJoinClones;
+    details.smallTerminalSharedBlockClones += round.smallTerminalSharedBlockClones;
     details.conditionalSharedJoinClones += round.conditionalSharedJoinClones;
     details.longCompareSharedJoinClones += round.longCompareSharedJoinClones;
     details.conditionalSharedLoopTailClones += round.conditionalSharedLoopTailClones;
@@ -88,30 +95,35 @@ function runPeepholeClean(astRoot, options = {}) {
     details.conditionalFallthroughGotoBridges += round.conditionalFallthroughGotoBridges;
     details.invertedFallthroughGotos += round.invertedFallthroughGotos;
     details.fallthroughGotos += round.fallthroughGotos;
+    details.deadGotoIslands += round.deadGotoIslands;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
     changes += round.nops + round.threadedBranches + round.protectedLoadBridges + round.monitorWaitRegions + round.dupStoreCompareBranches + round.loopProducerBridges +
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
+      round.smallTerminalSharedBlockClones +
       round.conditionalSharedJoinClones +
       round.longCompareSharedJoinClones +
       round.conditionalSharedLoopTailClones +
       round.nullableSharedJoinGuards +
       round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
+      round.deadGotoIslands +
       round.unreachableInstructions + round.unusedLabels;
     if (
       round.nops + round.threadedBranches + round.protectedLoadBridges + round.monitorWaitRegions + round.dupStoreCompareBranches + round.loopProducerBridges +
       round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
+      round.smallTerminalSharedBlockClones +
       round.conditionalSharedJoinClones +
       round.longCompareSharedJoinClones +
       round.conditionalSharedLoopTailClones +
       round.nullableSharedJoinGuards +
       round.conditionalFallthroughGotoBridges +
       round.invertedFallthroughGotos + round.fallthroughGotos +
+      round.deadGotoIslands +
       round.unreachableInstructions + round.unusedLabels === 0
     ) {
       break;
@@ -135,6 +147,7 @@ function cleanOneRound(astRoot, options = {}) {
     conditionalForwardTailClones: 0,
     sharedFallthroughBlockClones: 0,
     sharedFallthroughJoinClones: 0,
+    smallTerminalSharedBlockClones: 0,
     conditionalSharedJoinClones: 0,
     longCompareSharedJoinClones: 0,
     conditionalSharedLoopTailClones: 0,
@@ -142,6 +155,7 @@ function cleanOneRound(astRoot, options = {}) {
     conditionalFallthroughGotoBridges: 0,
     invertedFallthroughGotos: 0,
     fallthroughGotos: 0,
+    deadGotoIslands: 0,
     unreachableInstructions: 0,
     unusedLabels: 0,
   };
@@ -168,6 +182,10 @@ function cleanOneRound(astRoot, options = {}) {
       options.cloneSharedFallthroughJoinClasses.has(classItem && classItem.className);
     if (options.cloneSharedFallthroughJoins && joinCloneClassAllowed) {
       details.sharedFallthroughJoinClones += cloneSharedFallthroughJoinGotos(code);
+    }
+    if (options.cloneSmallTerminalSharedForwardBlocks &&
+      methodMatchesSmallTerminalSharedForwardBlockGate(code, options)) {
+      details.smallTerminalSharedBlockClones += cloneSmallTerminalSharedForwardBlocks(code);
     }
     const conditionalJoinCloneClassAllowed = options.cloneConditionalSharedJoinClasses.size === 0 ||
       options.cloneConditionalSharedJoinClasses.has(classItem && classItem.className);
@@ -198,6 +216,9 @@ function cleanOneRound(astRoot, options = {}) {
     if ((method && method.name === '<init>') ||
       (options.invertConditionalsOverGoto && classAllowed && (!method || method.name !== '<clinit>'))) {
       details.invertedFallthroughGotos += invertConditionalOverGoto(code);
+    }
+    if (options.removeDeadGotoIslands) {
+      details.deadGotoIslands += removeDeadGotoIslandsAfterTerminals(code);
     }
     if (method && method.name === '<init>') {
       details.unreachableInstructions += removeUnreachableUntilUsedLabel(code);
@@ -636,6 +657,53 @@ function cloneSharedFallthroughJoinGotos(code) {
   return changed;
 }
 
+function cloneSmallTerminalSharedForwardBlocks(code) {
+  const codeItems = code.codeItems;
+  const splitTargets = getPeepholeSet(code, 'peepholeSplitSmallTerminalSharedBlocks');
+  let changed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    const opcode = opcodeMnemonic(item && item.instruction);
+    if (!isConditionalBranch(opcode) && opcode !== 'goto') continue;
+
+    const labelIndex = buildLabelIndex(codeItems);
+    const target = trimLabel(getBranchArg(item.instruction));
+    const startIdx = labelIndex.get(target);
+    if (!target || startIdx == null || startIdx <= i) continue;
+    if (splitTargets.has(target) || isLabelProtected(code, target)) continue;
+    if (hasPreservationGuard(codeItems, startIdx, target)) continue;
+    const refs = collectBranchRefsToLabel(codeItems, target);
+    if (refs.length < 2 || refs.some((ref) => ref.idx >= startIdx)) continue;
+
+    const range = findSmallTerminalForwardBlock(codeItems, startIdx, 12);
+    if (!range) continue;
+    if (regionTouchesProtectedLabel(code, range.start, range.end)) continue;
+    const stack = smallTerminalBlockStackSummary(codeItems, range.start, range.end);
+    if (!stack || stack.delta !== 0 || stack.underflowsEntry) continue;
+    if (!stack.hasObservableSideEffects && !(stack.hasLocalMutation && terminalBranchesBackward(codeItems, labelIndex, range))) {
+      continue;
+    }
+    if (hasBranchToLabelBetween(codeItems, range.start, range.end - 1, target)) continue;
+
+    const insert = [{ instruction: { op: 'goto', arg: target }, peepholeGuard: true }];
+    for (const ref of refs) {
+      const clone = cloneRange(codeItems.slice(range.start, range.end), nextClonePrefix('Lst'));
+      const cloneEntry = trimLabel(clone[0] && clone[0].labelDef);
+      if (!cloneEntry) continue;
+      insert.push(...clone);
+      ref.item.instruction = setBranchArg(ref.item.instruction, cloneEntry);
+    }
+    if (insert.length <= 1) continue;
+    codeItems.splice(startIdx, 0, ...insert);
+    splitTargets.add(target);
+    changed += refs.length;
+    break;
+  }
+
+  return changed;
+}
+
 function cloneConditionalSharedJoinBranches(code, options = {}) {
   const codeItems = code.codeItems;
   const splitTargets = getPeepholeSet(code, 'peepholeSplitConditionalSharedJoins');
@@ -930,6 +998,32 @@ function removeConditionalFallthroughGotoBridges(code) {
       removeInstructionOnly(codeItems, bridgeInsnIdx);
     }
     removed += 1;
+  }
+
+  return removed;
+}
+
+function removeDeadGotoIslandsAfterTerminals(code) {
+  const codeItems = code.codeItems;
+  const refCounts = collectInstructionLabelReferenceCounts(codeItems);
+  let removed = 0;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    if (!isTerminalOpcode(opcodeMnemonic(instruction))) continue;
+
+    let j = nextInstructionIndex(codeItems, i + 1);
+    while (j != null) {
+      const label = trimLabel(codeItems[j] && codeItems[j].labelDef);
+      if (label && ((refCounts.get(label) || 0) > 0 || isLabelProtected(code, label))) break;
+      const op = opcodeMnemonic(codeItems[j] && codeItems[j].instruction);
+      if (op !== 'goto' && op !== 'goto_w') break;
+      const target = trimLabel(getBranchArg(codeItems[j].instruction));
+      if (target) refCounts.set(target, Math.max(0, (refCounts.get(target) || 0) - 1));
+      removeInstructionOnly(codeItems, j);
+      removed += 1;
+      j = nextInstructionIndex(codeItems, j + 1);
+    }
   }
 
   return removed;
@@ -1304,6 +1398,19 @@ function methodMatchesNullableSharedJoinGuardGate(code, options) {
   return true;
 }
 
+function methodMatchesSmallTerminalSharedForwardBlockGate(code, options) {
+  const codeItems = code.codeItems || [];
+  const minInsns = Number(options.cloneSmallTerminalSharedForwardBlockMinMethodInsns || 0);
+  if (minInsns > 0 && countInstructions(codeItems, 0, codeItems.length) < minInsns) return false;
+  const maxLocalIndex = options.cloneSmallTerminalSharedForwardBlockMaxLocalIndex == null
+    ? null
+    : Number(options.cloneSmallTerminalSharedForwardBlockMaxLocalIndex);
+  if (maxLocalIndex != null && maxLocalIndex >= 0 && highestReferencedLocalIndex(codeItems) > maxLocalIndex) {
+    return false;
+  }
+  return true;
+}
+
 function highestReferencedLocalIndex(codeItems) {
   let max = -1;
   for (const item of codeItems || []) {
@@ -1437,6 +1544,151 @@ function countInstructions(codeItems, startIdx, endIdx) {
     if (codeItems[i] && codeItems[i].instruction) count += 1;
   }
   return count;
+}
+
+function findSmallTerminalForwardBlock(codeItems, startIdx, maxInsns) {
+  const firstInsn = nextInstructionIndex(codeItems, startIdx);
+  if (firstInsn == null) return null;
+  let count = 0;
+  for (let i = firstInsn; i < codeItems.length; i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    if (!instruction) continue;
+    count += 1;
+    if (count > maxInsns) return null;
+    const opcode = opcodeMnemonic(instruction);
+    if (isTerminalOpcode(opcode)) return { start: startIdx, end: i + 1, terminalIdx: i };
+    if (isConditionalBranch(opcode) || opcode === 'tableswitch' || opcode === 'lookupswitch') return null;
+  }
+  return null;
+}
+
+function smallTerminalBlockStackSummary(codeItems, startIdx, endIdx) {
+  let depth = 0;
+  let hasObservableSideEffects = false;
+  let hasLocalMutation = false;
+  for (let i = startIdx; i < endIdx; i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    if (!instruction) continue;
+    const delta = extendedStackDelta(instruction);
+    if (delta == null) return null;
+    depth += delta;
+    if (depth < 0) return { delta: depth, underflowsEntry: true, hasObservableSideEffects, hasLocalMutation };
+    if (instructionHasObservableSideEffect(instruction)) hasObservableSideEffects = true;
+    if (instructionMutatesLocal(instruction)) hasLocalMutation = true;
+  }
+  return { delta: depth, underflowsEntry: false, hasObservableSideEffects, hasLocalMutation };
+}
+
+function terminalBranchesBackward(codeItems, labelIndex, range) {
+  const terminal = codeItems[range.terminalIdx] && codeItems[range.terminalIdx].instruction;
+  const opcode = opcodeMnemonic(terminal);
+  if (opcode !== 'goto' && opcode !== 'goto_w') return false;
+  const target = trimLabel(getBranchArg(terminal));
+  const targetIdx = labelIndex.get(target);
+  return targetIdx != null && targetIdx < range.start;
+}
+
+function extendedStackDelta(instruction) {
+  const basic = stackDelta(instruction);
+  if (basic != null) return basic;
+  const opcode = opcodeMnemonic(instruction);
+  const text = instructionText(instruction);
+  if (opcode === 'putfield') {
+    const desc = trailingFieldDescriptor(text);
+    if (!desc) return null;
+    return -(1 + descriptorSlotSize(desc));
+  }
+  if (opcode === 'putstatic') {
+    const desc = trailingFieldDescriptor(text);
+    if (!desc) return null;
+    return -descriptorSlotSize(desc);
+  }
+  if (opcode === 'getfield') {
+    const desc = trailingFieldDescriptor(text);
+    if (!desc) return null;
+    return -1 + descriptorSlotSize(desc);
+  }
+  if (opcode === 'getstatic') {
+    const desc = trailingFieldDescriptor(text);
+    if (!desc) return null;
+    return descriptorSlotSize(desc);
+  }
+  if (opcode === 'checkcast' || opcode === 'instanceof') return 0;
+  if (/^invoke/.test(opcode || '')) {
+    const desc = methodDescriptorFromText(text);
+    if (!desc) return null;
+    const receiver = opcode === 'invokestatic' ? 0 : 1;
+    return -receiver - methodArgSlots(desc) + methodReturnSlots(desc);
+  }
+  return null;
+}
+
+function instructionHasObservableSideEffect(instruction) {
+  const opcode = opcodeMnemonic(instruction);
+  return opcode === 'putfield' || opcode === 'putstatic' ||
+    opcode === 'aastore' || opcode === 'iastore' || opcode === 'bastore' ||
+    opcode === 'sastore' || opcode === 'castore' || opcode === 'lastore' ||
+    opcode === 'fastore' || opcode === 'dastore' ||
+    /^invoke/.test(opcode || '');
+}
+
+function instructionMutatesLocal(instruction) {
+  const opcode = opcodeMnemonic(instruction);
+  return opcode === 'iinc' || /^(?:[aidfl]store)(?:_\d+)?$/.test(opcode || '');
+}
+
+function instructionText(instruction) {
+  if (typeof instruction === 'string') return instruction;
+  if (!instruction || typeof instruction !== 'object') return '';
+  const arg = instruction.arg == null ? '' : String(instruction.arg);
+  return `${instruction.op || ''}${arg ? ` ${arg}` : ''}`;
+}
+
+function trailingFieldDescriptor(text) {
+  const parts = String(text || '').trim().split(/\s+/);
+  return parts.length > 0 ? parts[parts.length - 1] : null;
+}
+
+function methodDescriptorFromText(text) {
+  const match = /\(([^)]*)\)(\S+)/.exec(String(text || ''));
+  return match ? `(${match[1]})${match[2]}` : null;
+}
+
+function methodArgSlots(descriptor) {
+  const end = descriptor.indexOf(')');
+  if (!descriptor.startsWith('(') || end < 0) return 0;
+  return descriptorSlots(descriptor.slice(1, end));
+}
+
+function methodReturnSlots(descriptor) {
+  const end = descriptor.indexOf(')');
+  if (end < 0) return 0;
+  const ret = descriptor.slice(end + 1);
+  return ret === 'V' ? 0 : descriptorSlotSize(ret);
+}
+
+function descriptorSlots(desc) {
+  let slots = 0;
+  for (let i = 0; i < desc.length; i += 1) {
+    let ch = desc[i];
+    while (ch === '[') {
+      i += 1;
+      ch = desc[i];
+    }
+    if (ch === 'L') {
+      const end = desc.indexOf(';', i);
+      if (end < 0) return slots;
+      i = end;
+      slots += 1;
+    } else {
+      slots += ch === 'J' || ch === 'D' ? 2 : 1;
+    }
+  }
+  return slots;
+}
+
+function descriptorSlotSize(desc) {
+  return desc && (desc[0] === 'J' || desc[0] === 'D') ? 2 : 1;
 }
 
 function instructionSlice(codeItems, startIdx, endIdx) {
@@ -1786,6 +2038,15 @@ function isLabelProtected(code, label) {
   return false;
 }
 
+function regionTouchesProtectedLabel(code, startIdx, endIdx) {
+  const codeItems = code.codeItems || [];
+  for (let i = startIdx; i < endIdx; i += 1) {
+    const label = trimLabel(codeItems[i] && codeItems[i].labelDef);
+    if (label && isLabelProtected(code, label)) return true;
+  }
+  return false;
+}
+
 function removeInstructionOnly(codeItems, index) {
   const item = codeItems[index];
   if (!item) return;
@@ -1948,9 +2209,11 @@ module.exports = {
   cloneConditionalForwardTailEntry,
   cloneSharedFallthroughBlocks,
   cloneSharedFallthroughJoinGotos,
+  cloneSmallTerminalSharedForwardBlocks,
   cloneConditionalSharedJoinBranches,
   cloneConditionalSharedLoopTails,
   removeConditionalFallthroughGotoBridges,
+  removeDeadGotoIslandsAfterTerminals,
   invertConditionalOverGoto,
   removeUnreachableAfterTerminal,
   removeUnreachableUntilUsedLabel,

@@ -42,7 +42,7 @@ test('peephole clean removes nops and unused labels', (t) => {
     { labelDef: 'L1:', instruction: 'return' },
   ]);
 
-  const result = runPeepholeClean(ast);
+  const result = runPeepholeClean(ast, { removeDeadGotoIslands: true });
   t.ok(result.changed);
   t.equal(result.details.nops, 1);
   t.equal(result.details.unusedLabels, 2);
@@ -59,7 +59,7 @@ test('peephole clean removes single-use goto to following label', (t) => {
     { labelDef: 'L1:', instruction: 'return' },
   ]);
 
-  const result = runPeepholeClean(ast);
+  const result = runPeepholeClean(ast, { removeDeadGotoIslands: true });
   t.ok(result.changed);
   t.equal(result.details.fallthroughGotos, 1);
   t.deepEqual(
@@ -210,6 +210,61 @@ test('peephole clean can materialize nullable shared join guards', (t) => {
   t.end();
 });
 
+test('peephole clean can clone small terminal shared forward blocks', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'Lbody' } },
+    { instruction: { op: 'goto', arg: 'Ljoin' } },
+    { labelDef: 'Lbody:', instruction: 'aload_0' },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'putfield', arg: 'Field Example f I' } },
+    { instruction: { op: 'goto', arg: 'Ljoin' } },
+    { labelDef: 'Ljoin:', instruction: 'aload_0' },
+    { instruction: 'iconst_2' },
+    { instruction: { op: 'putfield', arg: 'Field Example f I' } },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'Lexit:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneSmallTerminalSharedForwardBlocks: true });
+  const items = code(ast).codeItems;
+
+  t.ok(result.changed);
+  t.equal(result.details.smallTerminalSharedBlockClones, 2);
+  t.equal(items.some((item, index) =>
+    index < 7 && item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Ljoin'), false);
+  t.equal(items.filter((item) => item.instruction && item.instruction.op === 'putfield').length, 4);
+  t.end();
+});
+
+test('peephole clean removes dead goto islands after terminals', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'Lused' } },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'Ldead1:', instruction: { op: 'goto', arg: 'LdeadBody' } },
+    { labelDef: 'Ldead2:', instruction: { op: 'goto', arg: 'LdeadBody2' } },
+    { labelDef: 'Lused:', instruction: 'iconst_0' },
+    { instruction: 'pop' },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'LdeadBody:', instruction: 'iconst_1' },
+    { instruction: 'pop' },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'LdeadBody2:', instruction: 'iconst_2' },
+    { instruction: 'pop' },
+    { instruction: { op: 'goto', arg: 'Lexit' } },
+    { labelDef: 'Lexit:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { removeDeadGotoIslands: true });
+
+  t.ok(result.changed);
+  t.equal(result.details.deadGotoIslands, 2);
+  t.equal(code(ast).codeItems.some((item) => item.instruction && item.instruction.arg === 'LdeadBody'), false);
+  t.equal(code(ast).codeItems.some((item) => item.instruction && item.instruction.arg === 'LdeadBody2'), false);
+  t.end();
+});
+
 test('peephole clean can clone conditional shared loop tail for one predecessor', (t) => {
   const ast = astWith([
     { labelDef: 'Lhead:', instruction: 'aload_1' },
@@ -324,7 +379,7 @@ test('peephole clean removes unreachable code after terminal instructions', (t) 
 
   const result = runPeepholeClean(ast);
   t.ok(result.changed);
-  t.equal(result.details.unreachableInstructions, 1);
+  t.equal(result.details.unreachableInstructions + result.details.deadGotoIslands, 1);
   t.deepEqual(
     code(ast).codeItems.map((item) => item.instruction).filter(Boolean),
     ['iconst_0', 'ireturn'],
