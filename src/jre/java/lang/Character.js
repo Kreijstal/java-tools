@@ -7,8 +7,18 @@ module.exports = {
       name: 'char',
     },
   },
-  methods: {},
+  methods: {
+    "charValue()C": (jvm, obj) => obj.value,
+    "toString()Ljava/lang/String;": (jvm, obj) => jvm.newString(String.fromCharCode(obj.value)),
+  },
   staticMethods: {
+    "valueOf(C)Ljava/lang/Character;": (jvm, obj, args) => ({
+      type: 'java/lang/Character',
+      value: args[0],
+      toString() {
+        return String.fromCharCode(this.value);
+      },
+    }),
     "toUpperCase(C)C": (jvm, obj, args) => {
       const ch = args[0];
       const charStr = String.fromCharCode(ch);
