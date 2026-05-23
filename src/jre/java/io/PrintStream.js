@@ -1,3 +1,12 @@
+function writeString(jvm, obj, output) {
+  const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+  if (writeByteMethod) {
+    for (let i = 0; i < output.length; i++) {
+      writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+    }
+  }
+}
+
 module.exports = {
   super: 'java/io/FilterOutputStream',
   interfaces: ['java/lang/Appendable', 'java/io/Closeable'],
@@ -12,13 +21,34 @@ module.exports = {
     },
 
     'print(I)V': (jvm, obj, args) => {
-      const output = String(args[0]);
-      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
-      if (writeByteMethod) {
-        for (let i = 0; i < output.length; i++) {
-          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
-        }
-      }
+      writeString(jvm, obj, String(args[0]));
+    },
+
+    'print(J)V': (jvm, obj, args) => {
+      writeString(jvm, obj, String(args[0]));
+    },
+
+    'print(F)V': (jvm, obj, args) => {
+      const floatClass = jvm.classes['java/lang/Float'];
+      writeString(jvm, obj, floatClass.staticMethods['toString(F)Ljava/lang/String;'](jvm, null, args));
+    },
+
+    'print(D)V': (jvm, obj, args) => {
+      const doubleClass = jvm.classes['java/lang/Double'];
+      writeString(jvm, obj, doubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, args));
+    },
+
+    'print(C)V': (jvm, obj, args) => {
+      writeString(jvm, obj, String.fromCharCode(args[0]));
+    },
+
+    'print(Z)V': (jvm, obj, args) => {
+      writeString(jvm, obj, args[0] === 1 ? 'true' : 'false');
+    },
+
+    'print(Ljava/lang/Object;)V': (jvm, obj, args) => {
+      const val = args[0];
+      writeString(jvm, obj, val === null ? 'null' : val.toString());
     },
 
     'println(D)V': (jvm, obj, args) => {
@@ -75,6 +105,16 @@ module.exports = {
 
     'println(I)V': (jvm, obj, args) => {
       const output = String(args[0]) + '\n';
+      const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
+      if (writeByteMethod) {
+        for (let i = 0; i < output.length; i++) {
+          writeByteMethod(jvm, obj, [output.charCodeAt(i)]);
+        }
+      }
+    },
+
+    'println(C)V': (jvm, obj, args) => {
+      const output = String.fromCharCode(args[0]) + '\n';
       const writeByteMethod = jvm._jreFindMethod(obj.type, 'write', '(I)V');
       if (writeByteMethod) {
         for (let i = 0; i < output.length; i++) {

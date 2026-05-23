@@ -1,5 +1,9 @@
 const test = require('tape');
 const { JVM } = require('../src/core/jvm');
+const frontend = require('../src/java-frontend');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 
 function setupPrintCapture(jvm) {
   let out = '';
@@ -13,9 +17,20 @@ function setupPrintCapture(jvm) {
   return () => out;
 }
 
+function compileArgsLengthTest(t) {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-main-args-'));
+  t.teardown(() => fs.rmSync(outputDir, { recursive: true, force: true }));
+  frontend.compileJavaFile(path.resolve(__dirname, '../sources/ArgsLengthTest.java'), {
+    outputDir,
+    sourceFileName: 'ArgsLengthTest.java',
+  });
+  return outputDir;
+}
+
 test('JVM provides an empty args array by default', async (t) => {
   t.plan(1);
-  const jvm = new JVM({ classpath: ['sources'] });
+  const classpath = compileArgsLengthTest(t);
+  const jvm = new JVM({ classpath });
   const getOutput = setupPrintCapture(jvm);
 
   await jvm.run('ArgsLengthTest');
@@ -24,7 +39,8 @@ test('JVM provides an empty args array by default', async (t) => {
 
 test('JVM forwards provided CLI arguments to main', async (t) => {
   t.plan(1);
-  const jvm = new JVM({ classpath: ['sources'] });
+  const classpath = compileArgsLengthTest(t);
+  const jvm = new JVM({ classpath });
   const getOutput = setupPrintCapture(jvm);
 
   await jvm.run('ArgsLengthTest', { args: ['alpha', 'beta', 'gamma'] });

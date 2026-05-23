@@ -9,6 +9,8 @@ module.exports = {
   ...require('./semantic'),
   ...require('./frontend'),
   ...require('./compiler'),
+  ...require('./javaIr'),
+  ...require('./jvmBytecodeIr'),
   ...require('./annotations'),
   ...require('./traversal'),
   ...require('./passManager'),

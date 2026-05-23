@@ -576,6 +576,11 @@ function formatInstruction(instruction, index) {
 
 function fieldLines(field) {
   const lines = [];
+  if (field.name && field.descriptor) {
+    const access = jasminAccess(field.access || []);
+    lines.push(`.field ${access}${field.name} ${field.descriptor}`);
+    return lines;
+  }
   for (const declarator of field.declarators || []) {
     const access = jasminAccess(field.access || []);
     let descriptor = field.descriptor;
@@ -594,11 +599,13 @@ function methodLines(method) {
   const lines = [];
   const access = jasminAccess(method.access || []);
   lines.push(`.method ${access}${method.name} : ${method.descriptor}`);
-  lines.push(`    .code stack ${Math.max(0, method.maxStack || 0)} locals ${Math.max(0, method.maxLocals || 0)}`);
-  (method.instructions || []).forEach((instruction, index) => {
-    lines.push(formatInstruction(instruction, index));
-  });
-  lines.push('    .end code');
+  if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
+    lines.push(`    .code stack ${Math.max(0, method.maxStack || 0)} locals ${Math.max(0, method.maxLocals || 0)}`);
+    (method.instructions || []).forEach((instruction, index) => {
+      lines.push(formatInstruction(instruction, index));
+    });
+    lines.push('    .end code');
+  }
   lines.push('.end method');
   return lines;
 }
@@ -685,7 +692,15 @@ function writeClassFilesFromModel(classFileModel, outputDir, options = {}) {
 }
 
 function compileJavaAst(document, options = {}) {
-  const bytecodeIr = buildBytecodeIr(document, { ...options, tolerant: Boolean(options.tolerant) });
+  const { lowerAstToJavaIr } = require('./javaIr');
+  const { javaIrToJvmBytecodeIr } = require('./jvmBytecodeIr');
+  const javaIr = lowerAstToJavaIr(document, options);
+  const bytecodeIr = javaIrToJvmBytecodeIr(javaIr, options);
+  if (bytecodeIr.status !== 'complete' && !options.tolerant) {
+    const firstUnsupported = bytecodeIr.unsupported && bytecodeIr.unsupported[0];
+    const reason = firstUnsupported && firstUnsupported.reason ? firstUnsupported.reason : 'unsupported Java IR';
+    throw new UnsupportedJavaSyntaxError(`minimal compiler does not support ${reason}`, { phase: 'compile' });
+  }
   const classFileModel = buildClassFileModelFromIr(bytecodeIr, options);
   const classes = classFileModel.classes.map((classModel) => ({
     internalName: classModel.internalName,
@@ -710,6 +725,7 @@ function compileJavaAst(document, options = {}) {
     astSchema: document.schema,
     astVersion: document.version,
     sourceLevel: document.sourceLevel || null,
+    javaIr,
     bytecodeIr,
     classFileModel,
     classes,

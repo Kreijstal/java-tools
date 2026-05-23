@@ -15,6 +15,8 @@ const {
   createEmitClassFileModelPass,
   createValidateClassFileModelPass,
 } = require('./compiler');
+const { createLowerAstToJavaIrPass } = require('./javaIr');
+const { createEmitJvmBytecodeIrPass } = require('./jvmBytecodeIr');
 
 const FRONTEND_PASS_STUBS_SCHEMA_ID = 'java-tools.java-frontend.expected-passes';
 const FRONTEND_PASS_STUBS_SCHEMA_VERSION = 1;
@@ -501,10 +503,11 @@ const FRONTEND_EXPECTED_PASS_DEFINITIONS = freezeDefinitions([
     name: 'frontend.lowerAstToIr',
     phase: 'lowering',
     category: 'lowering',
-    status: PASS_STATUS.STUB,
+    status: PASS_STATUS.SCAFFOLD,
     description: 'Lower AST/semantic model into a backend-neutral Java IR.',
     dependsOn: ['frontend.lowerSyntheticBridges'],
     produces: ['javaFrontendLowering'],
+    factory: 'lowerAstToIr',
   },
   {
     name: 'frontend.validateLoweredIr',
@@ -967,8 +970,12 @@ function createConcretePass(definition, options = {}) {
       return createJoinJavaBytecodeCfgPass(passOptions);
     case 'validateCfgJoin':
       return createValidateCfgJoinPass(passOptions);
+    case 'lowerAstToIr':
+      return createLowerAstToJavaIrPass(passOptions);
     case 'emitBytecodeIr':
-      return createEmitBytecodeIrPass(passOptions);
+      return passOptions.fromJavaIr === true
+        ? createEmitJvmBytecodeIrPass(passOptions)
+        : createEmitBytecodeIrPass(passOptions);
     case 'emitClassFileModel':
       return createEmitClassFileModelPass(passOptions);
     case 'validateClassFileModel':
