@@ -17,6 +17,8 @@ module.exports = {
       isPrimitive: true,
       name: 'short',
     },
+    'MAX_VALUE:S': 32767,
+    'MIN_VALUE:S': -32768,
   },
   staticMethods: {
     'valueOf(S)Ljava/lang/Short;': (jvm, obj, args) => boxed(jvm, args[0]),

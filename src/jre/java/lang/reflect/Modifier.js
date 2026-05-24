@@ -15,7 +15,7 @@ module.exports = {
     ABSTRACT: 0x00000400,    // 1024
     STRICT: 0x00000800,      // 2048
   },
-  methods: {
+  staticMethods: {
     'isPublic(I)Z': (jvm, classObj, args) => {
       const mod = args[0];
       return (mod & 0x00000001) !== 0;
@@ -85,3 +85,5 @@ module.exports = {
     },
   }
 };
+
+module.exports.methods = module.exports.staticMethods;

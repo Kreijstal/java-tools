@@ -55,6 +55,8 @@ const ATTRIBUTE_NAMES = {
   BootstrapMethods: 'BootstrapMethods',
   ConstantValue: 'ConstantValue',
   Signature: 'Signature',
+  RuntimeVisibleAnnotations: 'RuntimeVisibleAnnotations',
+  RuntimeInvisibleAnnotations: 'RuntimeInvisibleAnnotations',
   Deprecated: 'Deprecated',
   Synthetic: 'Synthetic',
 };
@@ -935,6 +937,62 @@ function buildConstantValueAttribute(rawValue, descriptor, builder) {
   };
 }
 
+function annotationTypeDescriptor(typeName) {
+  const normalized = parseStringLiteral(typeName || '');
+  if (normalized.startsWith('L') && normalized.endsWith(';')) return normalized;
+  return `L${normalizeClassName(normalized)};`;
+}
+
+function writeAnnotationElementValue(writer, elementValue, builder) {
+  const value = elementValue && typeof elementValue === 'object' && Object.prototype.hasOwnProperty.call(elementValue, 'value')
+    ? elementValue.value
+    : elementValue;
+  const type = elementValue && typeof elementValue === 'object' ? elementValue.type : typeof value;
+  if (type === 'int' || type === 'byte' || type === 'short' || type === 'char') {
+    writer.writeUint8('I'.charCodeAt(0));
+    writer.writeUint16(builder.addInteger(parseInteger(value, 0)));
+    return;
+  }
+  if (type === 'boolean') {
+    writer.writeUint8('Z'.charCodeAt(0));
+    writer.writeUint16(builder.addInteger(value === true || value === 'true' || value === '1' ? 1 : 0));
+    return;
+  }
+  if (type === 'enum') {
+    writer.writeUint8('e'.charCodeAt(0));
+    writer.writeUint16(builder.addUtf8(annotationTypeDescriptor(elementValue.typeName)));
+    writer.writeUint16(builder.addUtf8(parseStringLiteral(elementValue.constName || '')));
+    return;
+  }
+  writer.writeUint8('s'.charCodeAt(0));
+  writer.writeUint16(builder.addUtf8(parseStringLiteral(value || '')));
+}
+
+function buildRuntimeAnnotationsAttribute(attribute, builder) {
+  const annotations = attribute.attr && Array.isArray(attribute.attr.annotations)
+    ? attribute.attr.annotations
+    : ensureArray(attribute.annotations);
+  const bodyWriter = new ByteWriter();
+  bodyWriter.writeUint16(annotations.length);
+  annotations.forEach((annotation) => {
+    bodyWriter.writeUint16(builder.addUtf8(annotationTypeDescriptor(annotation.typeName || annotation.type)));
+    const elements = Array.isArray(annotation.elements)
+      ? annotation.elements
+      : Object.entries(annotation.elements || {}).map(([name, value]) => ({ name, value }));
+    bodyWriter.writeUint16(elements.length);
+    elements.forEach((element) => {
+      bodyWriter.writeUint16(builder.addUtf8(parseStringLiteral(element.name || 'value')));
+      writeAnnotationElementValue(bodyWriter, element.value, builder);
+    });
+  });
+  return {
+    nameIndex: builder.addUtf8(attribute.visibility === 'invisible'
+      ? ATTRIBUTE_NAMES.RuntimeInvisibleAnnotations
+      : ATTRIBUTE_NAMES.RuntimeVisibleAnnotations),
+    info: bodyWriter.toBuffer(),
+  };
+}
+
 function buildFieldAttributes(field, builder) {
   const attributes = [];
   const descriptor = field.descriptor || '';
@@ -980,6 +1038,12 @@ function buildFieldAttributes(field, builder) {
         });
         break;
       }
+      case 'runtime':
+        if (attribute.attr && attribute.attr.type === 'annotations') {
+          attributes.push(buildRuntimeAnnotationsAttribute(attribute, builder));
+          break;
+        }
+        throw new Error(`Unsupported field runtime attribute type: ${attribute.attr && attribute.attr.type}`);
       case 'deprecated':
         attributes.push({
           nameIndex: builder.addUtf8(ATTRIBUTE_NAMES.Deprecated),
@@ -1941,6 +2005,16 @@ function buildMethodInfo(method, builder, bootstrapMethods) {
       attributes.push(buildCodeAttribute(attribute.code || {}, builder, bootstrapMethods));
     } else if (attribute.type === 'exceptions') {
       attributes.push(buildExceptionsAttribute(attribute, builder));
+    } else if (attribute.type === 'runtime' && attribute.attr && attribute.attr.type === 'annotations') {
+      attributes.push(buildRuntimeAnnotationsAttribute(attribute, builder));
+    } else if (attribute.type === 'signature') {
+      const signature = parseStringLiteral(attribute.sig || attribute.value || '');
+      const bodyWriter = new ByteWriter();
+      bodyWriter.writeUint16(builder.addUtf8(signature));
+      attributes.push({
+        nameIndex: builder.addUtf8(ATTRIBUTE_NAMES.Signature),
+        info: bodyWriter.toBuffer(),
+      });
     }
   });
 
@@ -1965,6 +2039,16 @@ function buildClassAttributes(rawAttributes, builder, bootstrapMethods) {
       bodyWriter.writeUint16(sourceFileIndex);
       attributes.push({
         nameIndex: builder.addUtf8(ATTRIBUTE_NAMES.SourceFile),
+        info: bodyWriter.toBuffer(),
+      });
+    } else if (attribute.type === 'runtime' && attribute.attr && attribute.attr.type === 'annotations') {
+      attributes.push(buildRuntimeAnnotationsAttribute(attribute, builder));
+    } else if (attribute.type === 'signature') {
+      const signature = parseStringLiteral(attribute.sig || attribute.value || '');
+      const bodyWriter = new ByteWriter();
+      bodyWriter.writeUint16(builder.addUtf8(signature));
+      attributes.push({
+        nameIndex: builder.addUtf8(ATTRIBUTE_NAMES.Signature),
         info: bodyWriter.toBuffer(),
       });
     }

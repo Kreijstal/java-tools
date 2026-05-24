@@ -28,8 +28,17 @@ const PRIMITIVE_DESCRIPTORS = Object.freeze({
 });
 
 const JAVA_LANG_TYPES = new Set([
-  'Boolean', 'Byte', 'Character', 'Class', 'Double', 'Float', 'Integer', 'Long',
-  'Math', 'Object', 'Short', 'String', 'StringBuilder', 'System', 'Thread', 'Throwable', 'Void',
+  'ArithmeticException', 'ArrayIndexOutOfBoundsException', 'Boolean', 'Byte',
+  'Character', 'Class', 'ClassCastException', 'Double', 'Exception', 'Float',
+  'IllegalArgumentException', 'Integer', 'InterruptedException', 'Long', 'NegativeArraySizeException',
+  'NullPointerException', 'RuntimeException', 'StackOverflowError', 'Throwable',
+  'Comparable', 'Iterable', 'Math', 'Object', 'Runnable', 'Short', 'String', 'StringBuilder',
+  'System', 'Thread', 'Void',
+]);
+
+const JAVA_UTIL_TYPES = new Set([
+  'ArrayList', 'Collection', 'Collections', 'Deque', 'HashMap', 'HashSet',
+  'Iterator', 'LinkedList', 'List', 'ListIterator', 'Map', 'Random', 'Set',
 ]);
 
 const ACCESS_MODIFIERS = new Set([
@@ -103,7 +112,10 @@ function internalNameFromClassName(className, packageName = '') {
   return `${String(packageName).replace(/\./g, '/')}/${normalizedClass}`;
 }
 
-function classTypeInternalName(type) {
+function classTypeInternalName(type, context = {}) {
+  if (type && type.kind === 'ParameterizedType') {
+    return classTypeInternalName(type.baseType, context);
+  }
   if (!type || type.kind !== 'ClassType') {
     throw new JavaFrontendError('Expected a ClassType node for class descriptor conversion', {
       phase: 'compile',
@@ -116,10 +128,36 @@ function classTypeInternalName(type) {
   if (JAVA_LANG_TYPES.has(type.name)) {
     return `java/lang/${type.name}`;
   }
+  if (type.name === 'Function') {
+    return 'java/util/function/Function';
+  }
+  if (['Array', 'Field', 'Method', 'Modifier'].includes(type.name)) {
+    return `java/lang/reflect/${type.name}`;
+  }
+  if (type.name === 'ReentrantLock') {
+    return 'java/util/concurrent/locks/ReentrantLock';
+  }
+  if (JAVA_UTIL_TYPES.has(type.name)) {
+    return `java/util/${type.name}`;
+  }
+  if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
+    return context.classBySimpleName.get(type.name);
+  }
   return String(type.name).replace(/\./g, '/');
 }
 
-function typeDescriptor(type) {
+function typeVariableErasure(type, context = {}) {
+  const map = context.typeParameters;
+  if (map && typeof map.get === 'function' && map.has(type.name)) {
+    return map.get(type.name);
+  }
+  if (Array.isArray(type.bounds) && type.bounds.length > 0) {
+    return typeDescriptor(type.bounds[0], context);
+  }
+  return 'Ljava/lang/Object;';
+}
+
+function typeDescriptor(type, context = {}) {
   if (!type || typeof type.kind !== 'string') {
     throw new JavaFrontendError('Cannot derive a JVM descriptor for a missing type node', { phase: 'compile' });
   }
@@ -134,16 +172,19 @@ function typeDescriptor(type) {
     return descriptor;
   }
   if (type.kind === 'ArrayType') {
-    return '['.repeat(type.dimensions || 1) + typeDescriptor(type.componentType);
+    return '['.repeat(type.dimensions || 1) + typeDescriptor(type.componentType, context);
   }
   if (type.kind === 'ClassType') {
-    return `L${classTypeInternalName(type)};`;
+    if (context.typeParameters && context.typeParameters.has(type.name)) {
+      return context.typeParameters.get(type.name);
+    }
+    return `L${classTypeInternalName(type, context)};`;
   }
   if (type.kind === 'ParameterizedType') {
-    return typeDescriptor(type.baseType);
+    return typeDescriptor(type.baseType, context);
   }
   if (type.kind === 'TypeVariable') {
-    return 'Ljava/lang/Object;';
+    return typeVariableErasure(type, context);
   }
   throw new JavaFrontendError(`Unsupported type node for JVM descriptor: ${type.kind}`, {
     phase: 'compile',
@@ -151,13 +192,85 @@ function typeDescriptor(type) {
   });
 }
 
-function methodDescriptor(method) {
+function buildTypeParameterErasureMap(typeParameters = [], parent = null) {
+  const map = new Map(parent ? Array.from(parent.entries()) : []);
+  for (const parameter of typeParameters || []) {
+    const context = { typeParameters: map };
+    const descriptor = parameter.bounds && parameter.bounds.length
+      ? typeDescriptor(parameter.bounds[0], context)
+      : 'Ljava/lang/Object;';
+    map.set(parameter.name, descriptor);
+  }
+  return map;
+}
+
+function methodTypeContext(method, parent = null) {
+  const parentTypeParameters = parent && parent.typeParameters ? parent.typeParameters : parent;
+  return {
+    ...(parent && parent.typeParameters ? parent : {}),
+    typeParameters: buildTypeParameterErasureMap(method.typeParameters || [], parentTypeParameters),
+  };
+}
+
+function typeSignature(type, context = {}) {
+  if (!type || typeof type.kind !== 'string') return null;
+  if (type.kind === 'VoidType') return 'V';
+  if (type.kind === 'PrimitiveType') return PRIMITIVE_DESCRIPTORS[type.name] || null;
+  if (type.kind === 'ArrayType') {
+    const component = typeSignature(type.componentType, context);
+    return component ? `${'['.repeat(type.dimensions || 1)}${component}` : null;
+  }
+  if (type.kind === 'ClassType') {
+    if (context.typeParameters && context.typeParameters.has(type.name)) return `T${type.name};`;
+    return `L${classTypeInternalName(type, context)};`;
+  }
+  if (type.kind === 'TypeVariable') return `T${type.name};`;
+  if (type.kind === 'ParameterizedType') {
+    const base = type.baseType;
+    if (!base || base.kind !== 'ClassType') return typeSignature(base, context);
+    const owner = classTypeInternalName(base, context);
+    const args = (type.typeArguments || []).map((arg) => typeArgumentSignature(arg, context)).join('');
+    return `L${owner}<${args}>;`;
+  }
+  if (type.kind === 'WildcardType') {
+    return typeArgumentSignature(type, context);
+  }
+  return null;
+}
+
+function typeArgumentSignature(type, context = {}) {
+  if (!type || type.kind === 'WildcardType' && !type.boundKind) return '*';
+  if (type.kind === 'WildcardType') {
+    const bound = typeSignature(type.boundType, context) || 'Ljava/lang/Object;';
+    return type.boundKind === 'super' ? `-${bound}` : `+${bound}`;
+  }
+  return typeSignature(type, context) || '*';
+}
+
+function typeParameterSignature(parameter, context = {}) {
+  const bounds = parameter.bounds && parameter.bounds.length ? parameter.bounds : [ast.classType('Object')];
+  return `${parameter.name}:${bounds.map((bound) => typeSignature(bound, context) || 'Ljava/lang/Object;').join(':')}`;
+}
+
+function methodGenericSignature(method, parent = null) {
+  const context = methodTypeContext(method, parent);
+  const typeParams = (method.typeParameters || []).map((parameter) => typeParameterSignature(parameter, context)).join('');
+  const params = (method.parameters || []).map((parameter) => typeSignature(parameter.parameterType, context)).join('');
+  const ret = method.kind === 'ConstructorDeclaration'
+    ? 'V'
+    : typeSignature(method.returnType || ast.voidType(), context);
+  const prefix = typeParams ? `<${typeParams}>` : '';
+  return `${prefix}(${params})${ret}`;
+}
+
+function methodDescriptor(method, parentTypeParameters = null) {
+  const context = methodTypeContext(method, parentTypeParameters);
   const parameterDescriptors = (method.parameters || [])
-    .map((parameter) => typeDescriptor(parameter.parameterType))
+    .map((parameter) => typeDescriptor(parameter.parameterType, context))
     .join('');
   const returnDescriptor = method.kind === 'ConstructorDeclaration'
     ? 'V'
-    : typeDescriptor(method.returnType || ast.voidType());
+    : typeDescriptor(method.returnType || ast.voidType(), context);
   return `(${parameterDescriptors})${returnDescriptor}`;
 }
 
@@ -165,9 +278,10 @@ function slotWidthFromDescriptor(descriptor) {
   return descriptor === 'J' || descriptor === 'D' ? 2 : 1;
 }
 
-function localSlotCountForMethod(method) {
+function localSlotCountForMethod(method, parentTypeParameters = null) {
+  const context = methodTypeContext(method, parentTypeParameters);
   const parameterSlots = (method.parameters || [])
-    .map((parameter) => slotWidthFromDescriptor(typeDescriptor(parameter.parameterType)))
+    .map((parameter) => slotWidthFromDescriptor(typeDescriptor(parameter.parameterType, context)))
     .reduce((sum, width) => sum + width, 0);
   return parameterSlots + (hasModifier(method, 'static') ? 0 : 1);
 }
@@ -178,6 +292,59 @@ function jasminAccess(flags) {
 
 function escapeJasminStringLiteral(value) {
   return JSON.stringify(value === undefined || value === null ? '' : String(value));
+}
+
+function annotationElementType(value) {
+  if (value && typeof value === 'object' && value.type === 'enum') return `enum ${value.typeName}`;
+  if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'double';
+  if (typeof value === 'boolean') return 'boolean';
+  return 'string';
+}
+
+function annotationElementValue(value) {
+  if (value && typeof value === 'object' && value.type === 'enum') return value.constName;
+  if (typeof value === 'string') return escapeJasminStringLiteral(value);
+  if (typeof value === 'boolean') return value ? '1' : '0';
+  return String(value);
+}
+
+function annotationAttributeLines(attribute) {
+  if (!attribute || attribute.type !== 'RuntimeVisibleAnnotations' || !Array.isArray(attribute.annotations) || attribute.annotations.length === 0) {
+    return [];
+  }
+  const lines = ['.runtime visible annotations'];
+  for (const annotation of attribute.annotations) {
+    lines.push(`L${annotation.type};`);
+    for (const [name, value] of Object.entries(annotation.elements || {})) {
+      lines.push(`${name} = ${annotationElementType(value)} ${annotationElementValue(value)}`);
+    }
+    lines.push('.endannotation');
+  }
+  lines.push('.end annotations');
+  return lines;
+}
+
+function attributeLines(attributes = []) {
+  const lines = [];
+  for (const attribute of attributes || []) {
+    if (attribute.type === 'RuntimeVisibleAnnotations') {
+      lines.push(...annotationAttributeLines(attribute));
+    } else if (attribute.type === 'Signature' && attribute.value) {
+      lines.push(`.signature ${escapeJasminStringLiteral(attribute.value)}`);
+    } else if (attribute.type === 'SourceFile' && attribute.value) {
+      lines.push(`.sourcefile ${escapeJasminStringLiteral(attribute.value)}`);
+    }
+  }
+  return lines;
+}
+
+function memberAttributesFromMeta(meta = {}) {
+  const attributes = [];
+  if (meta && meta.signature) attributes.push({ type: 'Signature', value: meta.signature });
+  if (meta && Array.isArray(meta.annotations) && meta.annotations.length) {
+    attributes.push({ type: 'RuntimeVisibleAnnotations', annotations: meta.annotations });
+  }
+  return attributes;
 }
 
 function literalValueFromExpression(expression) {
@@ -405,7 +572,7 @@ function compileStatement(statement, classIr, methodIr, options = {}) {
 }
 
 function compileMethodDeclaration(method, classIr, options = {}) {
-  const descriptor = methodDescriptor(method);
+  const descriptor = methodDescriptor(method, classIr._typeParameters || null);
   const returnDescriptor = descriptor.slice(descriptor.indexOf(')') + 1);
   const methodIr = {
     kind: method.kind === 'ConstructorDeclaration' ? 'Constructor' : 'Method',
@@ -413,7 +580,7 @@ function compileMethodDeclaration(method, classIr, options = {}) {
     descriptor,
     access: normalizeAccessFlags(method.modifiers, []),
     maxStack: 0,
-    maxLocals: localSlotCountForMethod(method),
+    maxLocals: localSlotCountForMethod(method, classIr._typeParameters || null),
     returnDescriptor,
     instructions: [],
     sourceNodeKind: method.kind,
@@ -478,7 +645,7 @@ function compileFieldDeclaration(field, options = {}) {
   return {
     kind: 'Field',
     access: normalizeAccessFlags(field.modifiers, []),
-    descriptor: typeDescriptor(field.fieldType),
+    descriptor: typeDescriptor(field.fieldType, { typeParameters: options.typeParameters || null }),
     declarators,
   };
 }
@@ -489,7 +656,8 @@ function compileClassDeclaration(classNode, document, options = {}) {
   }
   const packageName = packageNameForDocument(document);
   const internalName = internalNameFromClassName(classNode.name, packageName);
-  const superName = classNode.extendsType && classNode.extendsType.kind === 'ClassType'
+  const typeParameters = buildTypeParameterErasureMap(classNode.typeParameters || []);
+  const superName = classNode.extendsType && (classNode.extendsType.kind === 'ClassType' || classNode.extendsType.kind === 'ParameterizedType')
     ? classTypeInternalName(classNode.extendsType)
     : 'java/lang/Object';
   const classIr = {
@@ -504,11 +672,16 @@ function compileClassDeclaration(classNode, document, options = {}) {
     fields: [],
     methods: [],
   };
+  Object.defineProperty(classIr, '_typeParameters', {
+    value: typeParameters,
+    enumerable: false,
+    configurable: true,
+  });
 
   let hasConstructor = false;
   for (const member of classNode.body || []) {
     if (member.kind === 'FieldDeclaration') {
-      classIr.fields.push(compileFieldDeclaration(member, options));
+      classIr.fields.push(compileFieldDeclaration(member, { ...options, typeParameters }));
     } else if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
       if (member.kind === 'ConstructorDeclaration') {
         hasConstructor = true;
@@ -563,7 +736,9 @@ function buildBytecodeIr(document, options = {}) {
 }
 
 function formatInstruction(instruction, index) {
-  const operands = (instruction.operands || []).join(' ');
+  const operands = instruction.opcode === 'invokeinterface' && instruction.count !== undefined
+    ? (instruction.operands || []).concat([instruction.count]).join(' ')
+    : (instruction.operands || []).join(' ');
   const body = operands ? `${instruction.opcode} ${operands}` : instruction.opcode;
   if (instruction.label) {
     return `${instruction.label}:     ${body}`;
@@ -578,7 +753,14 @@ function fieldLines(field) {
   const lines = [];
   if (field.name && field.descriptor) {
     const access = jasminAccess(field.access || []);
-    lines.push(`.field ${access}${field.name} ${field.descriptor}`);
+    const attrs = attributeLines((field.attributes && field.attributes.length) ? field.attributes : memberAttributesFromMeta(field.meta));
+    if (attrs.length) {
+      lines.push(`.field ${access}${field.name} ${field.descriptor}.fieldattributes`);
+      lines.push(...attrs);
+      lines.push('.end fieldattributes');
+    } else {
+      lines.push(`.field ${access}${field.name} ${field.descriptor}`);
+    }
     return lines;
   }
   for (const declarator of field.declarators || []) {
@@ -599,11 +781,17 @@ function methodLines(method) {
   const lines = [];
   const access = jasminAccess(method.access || []);
   lines.push(`.method ${access}${method.name} : ${method.descriptor}`);
+  const attrs = attributeLines((method.attributes || []).filter((attribute) => attribute.type !== 'Signature'));
+  lines.push(...attrs);
   if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
     lines.push(`    .code stack ${Math.max(0, method.maxStack || 0)} locals ${Math.max(0, method.maxLocals || 0)}`);
     (method.instructions || []).forEach((instruction, index) => {
       lines.push(formatInstruction(instruction, index));
     });
+    for (const entry of method.exceptionTable || []) {
+      const catchType = entry.catchType || entry.catch_type || 'any';
+      lines.push(`    .catch ${catchType} from ${entry.startLabel} to ${entry.endLabel} using ${entry.handlerLabel}`);
+    }
     lines.push('    .end code');
   }
   lines.push('.end method');
@@ -617,6 +805,10 @@ function jasminFromClassIr(classIr) {
   lines.push(`.super ${classIr.superName || 'java/lang/Object'}`);
   for (const iface of classIr.interfaces || []) {
     lines.push(`.implements ${iface}`);
+  }
+  const classAttrLines = attributeLines((classIr.attributes || []).filter((attribute) => attribute.type !== 'SourceFile' && attribute.type !== 'Signature'));
+  if (classAttrLines.length) {
+    lines.push(...classAttrLines);
   }
   lines.push('');
   for (const field of classIr.fields || []) {
@@ -636,6 +828,14 @@ function jasminFromClassIr(classIr) {
   return lines.join('\n');
 }
 
+function classAttributesFromIr(classIr) {
+  const attributes = Array.isArray(classIr.attributes) ? classIr.attributes.map((attribute) => ({ ...attribute })) : [];
+  if (classIr.sourceFile && !attributes.some((attribute) => attribute.type === 'SourceFile')) {
+    attributes.push({ type: 'SourceFile', value: classIr.sourceFile });
+  }
+  return attributes;
+}
+
 function buildClassFileModelFromIr(bytecodeIr, options = {}) {
   const classes = (bytecodeIr.classes || []).map((classIr) => ({
     kind: 'ClassFileModel',
@@ -644,10 +844,14 @@ function buildClassFileModelFromIr(bytecodeIr, options = {}) {
     sourceFile: classIr.sourceFile || null,
     superName: classIr.superName || 'java/lang/Object',
     access: (classIr.access || []).slice(),
+    attributes: classAttributesFromIr(classIr),
     fields: (classIr.fields || []).map((field) => ({
       access: (field.access || []).slice(),
       descriptor: field.descriptor,
       declarators: (field.declarators || []).map((declarator) => ({ ...declarator })),
+      name: field.name,
+      initializer: field.initializer || null,
+      attributes: memberAttributesFromMeta(field.meta),
     })),
     methods: (classIr.methods || []).map((method) => ({
       name: method.name,
@@ -656,6 +860,7 @@ function buildClassFileModelFromIr(bytecodeIr, options = {}) {
       maxStack: method.maxStack || 0,
       maxLocals: method.maxLocals || 0,
       instructionCount: (method.instructions || []).length,
+      attributes: Array.isArray(method.attributes) ? method.attributes.map((attribute) => ({ ...attribute })) : [],
     })),
     jasmin: jasminFromClassIr(classIr),
   }));
@@ -831,6 +1036,9 @@ module.exports = {
   CLASSFILE_MODEL_SCHEMA_ID,
   CLASSFILE_MODEL_SCHEMA_VERSION,
   typeDescriptor,
+  typeSignature,
+  methodGenericSignature,
+  buildTypeParameterErasureMap,
   methodDescriptor,
   buildBytecodeIr,
   buildClassFileModelFromIr,

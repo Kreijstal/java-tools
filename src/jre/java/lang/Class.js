@@ -19,7 +19,7 @@ module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
     'forName(Ljava/lang/String;)Ljava/lang/Class;': async (jvm, classObj, args) => {
-      const classNameWithDots = args[0];
+      const classNameWithDots = args[0] && args[0].value !== undefined ? args[0].value : String(args[0]);
       const classNameWithSlashes = classNameWithDots.replace(/\./g, '/');
       return await jvm.getClassObject(classNameWithSlashes);
     },
@@ -451,3 +451,17 @@ module.exports = {
     }
   }
 };
+
+const classJre = module.exports;
+
+classJre.methods['getMethod(Ljava/lang/String;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], []], thread)
+);
+
+classJre.methods['getDeclaredMethod(Ljava/lang/String;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], []], thread)
+);
+
+classJre.methods['getDeclaredMethod(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], [args[1]]], thread)
+);

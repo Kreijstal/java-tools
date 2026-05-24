@@ -143,6 +143,18 @@ async function invokevirtual(frame, instruction, jvm, thread) {
 
   let currentClassName = runtimeClassName(boxedObj);
 
+  if (boxedObj._annotationData) {
+    const methodKey = methodName + descriptor;
+    if (typeof boxedObj[methodKey] === "function") {
+      const result = boxedObj[methodKey]();
+      const { returnType } = parseDescriptor(descriptor);
+      if (returnType !== "V" && result !== undefined) {
+        frame.stack.push(result);
+      }
+      return;
+    }
+  }
+
   // Handle arrays - they inherit from Object
   if (currentClassName && currentClassName.startsWith("[")) {
     const jreMethod = jvm._jreFindMethod(

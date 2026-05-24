@@ -102,10 +102,15 @@ function decodeSimpleLiteral(kind, raw) {
   return raw;
 }
 
+function translateUnicodeEscapes(source) {
+  return source.replace(/\\u+([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(Number.parseInt(hex, 16)));
+}
+
 function tokenizeJava(source) {
   if (typeof source !== 'string') {
     throw new TypeError('Java source must be a string');
   }
+  source = translateUnicodeEscapes(source);
 
   const tokens = [];
   const diagnostics = [];
@@ -304,5 +309,6 @@ function tokenizeJava(source) {
 module.exports = {
   JavaTokenStream,
   tokenizeJava,
+  translateUnicodeEscapes,
   JAVA_KEYWORDS,
 };

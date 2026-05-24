@@ -1,7 +1,7 @@
 'use strict';
 
 const ast = require('./ast');
-const { tokenizeJava } = require('./lexer');
+const { tokenizeJava, translateUnicodeEscapes } = require('./lexer');
 const { NotImplementedJavaFrontendError } = require('./errors');
 
 const MODIFIERS = new Set([
@@ -66,6 +66,20 @@ function isIdentifierOrKeyword(token, text) {
   return Boolean(token) && token.text === text;
 }
 
+function angleCloseCount(text) {
+  if (text === '>') return 1;
+  if (text === '>>') return 2;
+  if (text === '>>>') return 3;
+  return 0;
+}
+
+function adjustAngleDepth(depth, token) {
+  if (!token) return depth;
+  if (token.text === '<') return depth + 1;
+  const closeCount = angleCloseCount(token.text);
+  return closeCount ? Math.max(0, depth - closeCount) : depth;
+}
+
 function isTypeDeclarationStart(token, nextToken) {
   if (!token) {
     return false;
@@ -94,8 +108,7 @@ function splitTopLevel(tokens, separatorText) {
     else if (token.text === ']') bracketDepth = Math.max(0, bracketDepth - 1);
     else if (token.text === '{') braceDepth += 1;
     else if (token.text === '}') braceDepth = Math.max(0, braceDepth - 1);
-    else if (token.text === '<') angleDepth += 1;
-    else if (token.text === '>') angleDepth = Math.max(0, angleDepth - 1);
+    else angleDepth = adjustAngleDepth(angleDepth, token);
 
     if (token.text === separatorText && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0 && angleDepth === 0) {
       parts.push(current);
@@ -124,8 +137,7 @@ function findTopLevelToken(tokens, text) {
     else if (token.text === ']') bracketDepth = Math.max(0, bracketDepth - 1);
     else if (token.text === '{') braceDepth += 1;
     else if (token.text === '}') braceDepth = Math.max(0, braceDepth - 1);
-    else if (token.text === '<') angleDepth += 1;
-    else if (token.text === '>') angleDepth = Math.max(0, angleDepth - 1);
+    else angleDepth = adjustAngleDepth(angleDepth, token);
   }
   return -1;
 }
@@ -135,8 +147,8 @@ function findMatchingInTokens(tokens, openIndex, openText = '(', closeText = ')'
   for (let i = openIndex; i < tokens.length; i += 1) {
     if (tokens[i].text === openText) {
       depth += 1;
-    } else if (tokens[i].text === closeText) {
-      depth -= 1;
+    } else if (tokens[i].text === closeText || (closeText === '>' && angleCloseCount(tokens[i].text) > 0)) {
+      depth -= closeText === '>' ? angleCloseCount(tokens[i].text) : 1;
       if (depth === 0) {
         return i;
       }
@@ -162,9 +174,9 @@ function trimTokens(tokens) {
 
 class ParserImpl {
   constructor(source, options = {}) {
-    this.source = source;
+    this.source = translateUnicodeEscapes(source);
     this.options = options;
-    const lexed = tokenizeJava(source, options);
+    const lexed = tokenizeJava(this.source, options);
     this.tokens = lexed.tokens;
     this.diagnostics = lexed.diagnostics.slice();
     this.index = 0;
@@ -709,13 +721,12 @@ class ParserImpl {
     let bracketDepth = 0;
     for (let i = 0; i < tokens.length; i += 1) {
       const token = tokens[i];
-      if (token.text === '<') angleDepth += 1;
-      else if (token.text === '>') angleDepth = Math.max(0, angleDepth - 1);
-      else if (token.text === '[') bracketDepth += 1;
+      if (token.text === '[') bracketDepth += 1;
       else if (token.text === ']') bracketDepth = Math.max(0, bracketDepth - 1);
       else if (token.text === '(' && angleDepth === 0 && bracketDepth === 0 && i > 0 && (isNameToken(tokens[i - 1]) || tokens[i - 1].text === 'this')) {
         return i;
       }
+      angleDepth = adjustAngleDepth(angleDepth, token);
     }
     return -1;
   }
@@ -910,8 +921,11 @@ class ParserImpl {
       });
     }
     const parts = splitTopLevel(headerTokens, ';');
+    const initializer = parts[0] && parts[0].length
+      ? this.tryParseLocalVariableStatement(parts[0]) || this.unsupportedExpression(parts[0])
+      : null;
     return ast.createNode('ForStatement', {
-      initializer: parts[0] && parts[0].length ? this.unsupportedExpression(parts[0]) : null,
+      initializer,
       condition: parts[1] && parts[1].length ? this.unsupportedExpression(parts[1]) : null,
       update: parts[2] && parts[2].length ? this.unsupportedExpression(parts[2]) : null,
       body,
@@ -962,7 +976,13 @@ class ParserImpl {
   parseTryStatement() {
     this.expect('try');
     const resources = this.peek() && this.peek().text === '('
-      ? this.unsupportedExpression(this.consumeBalancedEnclosed('(', ')'))
+      ? splitTopLevel(this.consumeBalancedEnclosed('(', ')'), ';')
+        .filter((part) => part.length > 0)
+        .map((part) => ast.createNode('UnsupportedExpression', {
+          text: this.textOf(part),
+          tokens: part.map(compactToken),
+          range: tokenRange(part),
+        }))
       : null;
     const block = this.parseBlock();
     const catches = [];
@@ -1130,8 +1150,14 @@ class ParserImpl {
       if (token.text === openText) {
         depth += 1;
         tokens.push(token);
-      } else if (token.text === closeText) {
-        depth -= 1;
+      } else if (token.text === closeText || (closeText === '>' && angleCloseCount(token.text) > 0)) {
+        const closeCount = closeText === '>' ? angleCloseCount(token.text) : 1;
+        if (closeText === '>' && closeCount > 1) {
+          for (let i = 1; i < Math.min(closeCount, depth); i += 1) {
+            tokens.push({ ...token, text: '>' });
+          }
+        }
+        depth -= closeCount;
         if (depth > 0) {
           tokens.push(token);
         }
@@ -1159,8 +1185,7 @@ class ParserImpl {
       else if (token.text === ']') bracketDepth = Math.max(0, bracketDepth - 1);
       else if (token.text === '{') braceDepth += 1;
       else if (token.text === '}') braceDepth = Math.max(0, braceDepth - 1);
-      else if (token.text === '<') angleDepth += 1;
-      else if (token.text === '>') angleDepth = Math.max(0, angleDepth - 1);
+      else angleDepth = adjustAngleDepth(angleDepth, token);
       tokens.push(this.consume());
     }
     return tokens;
@@ -1211,8 +1236,7 @@ class ParserImpl {
         else if (token.text === ')') parenDepth = Math.max(0, parenDepth - 1);
         else if (token.text === '[') bracketDepth += 1;
         else if (token.text === ']') bracketDepth = Math.max(0, bracketDepth - 1);
-        else if (token.text === '<') angleDepth += 1;
-        else if (token.text === '>') angleDepth = Math.max(0, angleDepth - 1);
+        else angleDepth = adjustAngleDepth(angleDepth, token);
         i += 1;
       }
       const types = splitTopLevel(headerTokens.slice(start, i), ',')
@@ -1325,8 +1349,9 @@ class ParserImpl {
 
     const genericIndex = findTopLevelToken(tokens, '<');
     if (genericIndex !== -1) {
-      const closeIndex = findMatchingInTokens(tokens, genericIndex, '<', '>');
-      if (closeIndex !== -1) {
+      let closeIndex = findMatchingInTokens(tokens, genericIndex, '<', '>');
+      if (closeIndex === -1) closeIndex = tokens.length;
+      if (closeIndex > genericIndex) {
         const baseType = this.typeFromTokens(tokens.slice(0, genericIndex));
         const typeArguments = splitTopLevel(tokens.slice(genericIndex + 1, closeIndex), ',')
           .filter((part) => part.length > 0)
