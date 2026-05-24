@@ -6,6 +6,8 @@ module.exports = {
       isPrimitive: true,
       name: 'char',
     },
+    'MAX_VALUE:C': 65535,
+    'MIN_VALUE:C': 0,
   },
   methods: {
     "charValue()C": (jvm, obj) => obj.value,

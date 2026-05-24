@@ -147,3 +147,17 @@ module.exports = {
     },
   }
 };
+
+const methodJre = module.exports;
+
+methodJre.methods['invoke(Ljava/lang/Object;)Ljava/lang/Object;'] = (jvm, methodObj, args, thread) => (
+  methodJre.methods['invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;'](jvm, methodObj, [args[0], []], thread)
+);
+
+methodJre.methods['invoke(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;'] = (jvm, methodObj, args, thread) => (
+  methodJre.methods['invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;'](jvm, methodObj, [args[0], [args[1]]], thread)
+);
+
+methodJre.methods['invoke(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;'] = (jvm, methodObj, args, thread) => (
+  methodJre.methods['invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;'](jvm, methodObj, [args[0], [args[1], args[2]]], thread)
+);

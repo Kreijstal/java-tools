@@ -17,6 +17,8 @@ module.exports = {
       isPrimitive: true,
       name: 'byte',
     },
+    'MAX_VALUE:B': 127,
+    'MIN_VALUE:B': -128,
   },
   staticMethods: {
     'valueOf(B)Ljava/lang/Byte;': (jvm, obj, args) => boxed(jvm, args[0]),

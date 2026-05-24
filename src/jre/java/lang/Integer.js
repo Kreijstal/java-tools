@@ -6,6 +6,8 @@ module.exports = {
       isPrimitive: true,
       name: 'int',
     },
+    'MAX_VALUE:I': 2147483647,
+    'MIN_VALUE:I': -2147483648,
   },
   staticMethods: {
     'toBinaryString(I)Ljava/lang/String;': (jvm, obj, args) => {

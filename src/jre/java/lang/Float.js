@@ -6,6 +6,12 @@ module.exports = {
       isPrimitive: true,
       name: 'float',
     },
+    'MAX_VALUE:F': 3.4028234663852886e38,
+    'MIN_NORMAL:F': 1.1754943508222875e-38,
+    'MIN_VALUE:F': 1.401298464324817e-45,
+    'POSITIVE_INFINITY:F': Number.POSITIVE_INFINITY,
+    'NEGATIVE_INFINITY:F': Number.NEGATIVE_INFINITY,
+    'NaN:F': Number.NaN,
   },
   staticMethods: {
     'intBitsToFloat(I)F': (jvm, obj, args) => {

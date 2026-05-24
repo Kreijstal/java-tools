@@ -6,6 +6,8 @@ module.exports = {
       isPrimitive: true,
       name: 'long',
     },
+    'MAX_VALUE:J': BigInt('9223372036854775807'),
+    'MIN_VALUE:J': BigInt('-9223372036854775808'),
   },
   staticMethods: {
     'parseLong(Ljava/lang/String;)J': (jvm, obj, args) => {
