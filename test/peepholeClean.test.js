@@ -473,6 +473,37 @@ test('peephole clean clones stack-neutral shared forward loop entry', (t) => {
   t.end();
 });
 
+test('peephole clean coalesces duplicate labeled loop increment tails', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lend' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifeq', arg: 'LtailA' } },
+    { instruction: 'iload_3' },
+    { instruction: { op: 'ifeq', arg: 'LtailB' } },
+    { instruction: 'goto LtailC' },
+    { labelDef: 'LtailA:', instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'LtailB:', instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'LtailC:', instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.duplicateLoopIncrementTails, 2);
+  const refs = code(ast).codeItems
+    .map((item) => item && item.instruction)
+    .filter((insn) => insn && /^if|goto/.test(typeof insn === 'string' ? insn : insn.op))
+    .map((insn) => (typeof insn === 'string' ? insn.split(/\s+/)[1] : insn.arg));
+  t.equal(refs.filter((label) => label === 'LtailA').length, 3);
+  t.equal(refs.includes('LtailB'), false);
+  t.equal(refs.includes('LtailC'), false);
+  t.end();
+});
+
 test('peephole clean clones conditional forward entry into loop with skip arm', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iload_1' },
