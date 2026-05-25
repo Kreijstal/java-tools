@@ -47,6 +47,7 @@ function runPeepholeClean(astRoot, options = {}) {
     deadGotoIslands: 0,
     unreachableInstructions: 0,
     unusedLabels: 0,
+    restoredPcTargetLabels: 0,
   };
 
   if (options.removeRethrowHandlers !== false) {
@@ -101,6 +102,7 @@ function runPeepholeClean(astRoot, options = {}) {
       removeUnreachableUntilUsedLabels: options.removeUnreachableUntilUsedLabels === true,
       cloneForwardTerminalGotoTails: options.cloneForwardTerminalGotoTails === true,
       cloneForwardTerminalGotoTailMaxInsns: options.cloneForwardTerminalGotoTailMaxInsns || 0,
+      cloneForwardTerminalGotoTailMaxMethodInsns: options.cloneForwardTerminalGotoTailMaxMethodInsns || 0,
       cloneForwardTerminalGotoTailMaxClones: options.cloneForwardTerminalGotoTailMaxClones || 1,
       cloneSharedSideEffectJoins: options.cloneSharedSideEffectJoins === true,
       cloneSharedSideEffectJoinMaxInsns: options.cloneSharedSideEffectJoinMaxInsns || 32,
@@ -115,6 +117,7 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneLoopValueContinuationMaxClones: options.cloneLoopValueContinuationMaxClones || 4,
       cloneConditionalTerminalTails: options.cloneConditionalTerminalTails === true,
       cloneConditionalTerminalTailMaxInsns: options.cloneConditionalTerminalTailMaxInsns || 0,
+      cloneConditionalTerminalTailMaxMethodInsns: options.cloneConditionalTerminalTailMaxMethodInsns || 0,
       cloneConditionalTerminalTailMaxClones: options.cloneConditionalTerminalTailMaxClones || 1,
       coalesceDuplicateLoopBackedgeTails: options.coalesceDuplicateLoopBackedgeTails === true,
       cloneSharedLoopIncrementTails: options.cloneSharedLoopIncrementTails === true,
@@ -159,6 +162,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.deadGotoIslands += round.deadGotoIslands;
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
+    details.restoredPcTargetLabels += round.restoredPcTargetLabels;
     const roundChanges = round.nops + round.threadedBranches + round.threadedMultiUseGotoBridges + round.protectedLoadBridges + round.monitorWaitRegions + round.nullCompareBranches + round.dupStoreCompareBranches + round.loopProducerBridges +
       round.duplicateLoopTails + round.duplicateLoopIncrementTails + round.duplicateLoopBackedgeTails +
       round.sharedLoopIncrementTailClones +
@@ -180,7 +184,8 @@ function runPeepholeClean(astRoot, options = {}) {
       round.conditionalTerminalTailClones +
       round.invertedFallthroughGotos + round.fallthroughGotos +
       round.deadGotoIslands +
-      round.unreachableInstructions + round.unusedLabels;
+      round.unreachableInstructions + round.unusedLabels +
+      round.restoredPcTargetLabels;
     changes += roundChanges;
     if (roundChanges === 0) {
       break;
@@ -238,6 +243,7 @@ function cleanOneRound(astRoot, options = {}) {
     deadGotoIslands: 0,
     unreachableInstructions: 0,
     unusedLabels: 0,
+    restoredPcTargetLabels: 0,
   };
   forEachCode(astRoot, (code, method, classItem) => {
     const passFacts = () => createPeepholePassFacts(code);
@@ -331,6 +337,7 @@ function cleanOneRound(astRoot, options = {}) {
       const start = Date.now();
       details.forwardTerminalGotoTailClones += cloneForwardTerminalGotoTails(code, {
         maxInsns: options.cloneForwardTerminalGotoTailMaxInsns,
+        maxMethodInsns: options.cloneForwardTerminalGotoTailMaxMethodInsns,
         maxClones: options.cloneForwardTerminalGotoTailMaxClones,
       });
       tracePeepholeTime(classItem, method, 'cloneForwardTerminalGotoTails', start);
@@ -362,6 +369,7 @@ function cleanOneRound(astRoot, options = {}) {
       const start = Date.now();
       details.conditionalTerminalTailClones += cloneConditionalTerminalTails(code, {
         maxInsns: options.cloneConditionalTerminalTailMaxInsns,
+        maxMethodInsns: options.cloneConditionalTerminalTailMaxMethodInsns,
         maxClones: options.cloneConditionalTerminalTailMaxClones,
       });
       tracePeepholeTime(classItem, method, 'cloneConditionalTerminalTails', start);
@@ -383,6 +391,7 @@ function cleanOneRound(astRoot, options = {}) {
       details.unreachableInstructions += tracePeepholeStep(classItem, method, 'removeUnreachableAfterTerminal', () => removeUnreachableAfterTerminal(code));
     }
     details.unusedLabels += tracePeepholeStep(classItem, method, 'removeUnusedLabels', () => removeUnusedLabels(code));
+    details.restoredPcTargetLabels += tracePeepholeStep(classItem, method, 'restoreMissingPcTargetLabels', () => restoreMissingPcTargetLabels(code));
   });
   return details;
 }
@@ -1740,6 +1749,8 @@ function cloneForwardTerminalGotoTails(code, options = {}, context = null) {
   const refCounts = context ? context.instructionLabelReferenceCounts() : collectInstructionLabelReferenceCounts(codeItems);
   const suffixInstructionCounts = context ? context.suffixInstructionCounts() : buildSuffixInstructionCounts(codeItems);
   const maxInsns = Number(options.maxInsns || 0);
+  const maxMethodInsns = Number(options.maxMethodInsns || 0);
+  if (maxMethodInsns > 0 && suffixInstructionCounts[0] > maxMethodInsns) return 0;
   const maxClones = Math.max(1, Number(options.maxClones || 1));
   const candidates = [];
 
@@ -2013,6 +2024,8 @@ function cloneConditionalTerminalTails(code, options = {}, context = null) {
   const suffixInstructionCounts = context ? context.suffixInstructionCounts() : buildSuffixInstructionCounts(codeItems);
   const terminalPrefixCounts = context ? context.terminalPrefixCounts() : buildTerminalPrefixCounts(codeItems);
   const maxInsns = Number(options.maxInsns || 0);
+  const maxMethodInsns = Number(options.maxMethodInsns || 0);
+  if (maxMethodInsns > 0 && suffixInstructionCounts[0] > maxMethodInsns) return 0;
   const maxClones = Math.max(1, Number(options.maxClones || 1));
   const candidates = [];
   const tailCache = new Map();
@@ -2228,6 +2241,97 @@ function removeUnusedLabels(code) {
   }
   codeItems.length = write;
   return removed;
+}
+
+function restoreMissingPcTargetLabels(code) {
+  const codeItems = code.codeItems || [];
+  const labels = buildLabelIndex(codeItems);
+  const pcIndex = new Map();
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (item && typeof item.pc === 'number' && !pcIndex.has(item.pc)) {
+      pcIndex.set(item.pc, i);
+    }
+  }
+
+  let restored = 0;
+  const missingTargets = collectMissingInstructionTargets(codeItems, labels);
+  for (const target of missingTargets) {
+    const match = /^L(\d+)$/.exec(target);
+    if (!match) continue;
+    const index = pcIndex.get(Number(match[1]));
+    if (index == null) continue;
+    const item = codeItems[index];
+    if (!item) continue;
+    const existing = trimLabel(item.labelDef);
+    if (existing) {
+      retargetInstructionLabels(codeItems, target, existing);
+    } else {
+      item.labelDef = `${target}:`;
+      labels.set(target, index);
+    }
+    restored += 1;
+  }
+  return restored;
+}
+
+function collectMissingInstructionTargets(codeItems, labels) {
+  const missing = new Set();
+  for (const item of codeItems) {
+    for (const label of instructionLabelTargets(item && item.instruction)) {
+      const normalized = trimLabel(label);
+      if (normalized && !labels.has(normalized)) {
+        missing.add(normalized);
+      }
+    }
+  }
+  return missing;
+}
+
+function instructionLabelTargets(instruction) {
+  const out = [];
+  collectInstructionLabels(instruction, {
+    add(label) {
+      out.push(label);
+    },
+  });
+  return out;
+}
+
+function retargetInstructionLabels(codeItems, from, to) {
+  for (const item of codeItems) {
+    if (!item || !item.instruction) continue;
+    item.instruction = rewriteOneInstructionLabel(item.instruction, from, to);
+  }
+}
+
+function rewriteOneInstructionLabel(instruction, from, to) {
+  const normalized = trimLabel(from);
+  if (typeof instruction === 'string') {
+    const arg = getBranchArg(instruction);
+    return arg != null && trimLabel(arg) === normalized ? setBranchArg(instruction, to) : instruction;
+  }
+  if (!instruction || typeof instruction !== 'object') return instruction;
+  const out = cloneValue(instruction);
+  out.arg = rewriteOneLabelValue(out.arg, normalized, to);
+  return out;
+}
+
+function rewriteOneLabelValue(value, from, to) {
+  if (typeof value === 'string') {
+    return trimLabel(value) === from ? to : value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => rewriteOneLabelValue(entry, from, to));
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) {
+      out[key] = rewriteOneLabelValue(entry, from, to);
+    }
+    return out;
+  }
+  return value;
 }
 
 function collectUsedLabels(code) {

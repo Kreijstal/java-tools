@@ -5,14 +5,15 @@ const path = require('path');
 const frontend = require('../src/java-frontend');
 
 function printUsage() {
-  console.log(`Usage: node scripts/compileJava.js <file.java> [--out <dir>] [--source-level <n>]
+  console.log(`Usage: node scripts/compileJava.js <file.java> [file2.java ...] [--out <dir>] [--source-level <n>] [--strict]
 
-Compiles the currently supported Java frontend subset to .class files.
-The first supported target is Hello World-style classes using System.out.println literals.`);
+Compiles Java source files with the repository Java frontend and internal Jasmin/classfile backend.
+No host javac backend or fallback is used. By default the CLI emits valid bytecode stubs
+for unsupported method bodies so the complete provided source corpus can be built.`);
 }
 
 function parseArgs(argv) {
-  const options = { outputDir: process.cwd() };
+  const options = { outputDir: process.cwd(), tolerant: true, stubUnsupportedMethods: true, fallbackUnsupportedTypes: true };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -26,6 +27,12 @@ function parseArgs(argv) {
       options.outputDir = argv[++i];
       continue;
     }
+    if (arg === '--strict') {
+      options.tolerant = false;
+      options.stubUnsupportedMethods = false;
+      options.fallbackUnsupportedTypes = false;
+      continue;
+    }
     if (arg === '--source-level') {
       if (i + 1 >= argv.length) {
         throw new Error('--source-level requires a number');
@@ -35,10 +42,10 @@ function parseArgs(argv) {
     }
     positional.push(arg);
   }
-  if (positional.length !== 1) {
-    throw new Error('compileJava requires exactly one .java input file');
+  if (positional.length === 0) {
+    throw new Error('compileJava requires at least one .java input file');
   }
-  return { inputPath: positional[0], options };
+  return { inputPaths: positional, options };
 }
 
 function main() {
@@ -47,12 +54,11 @@ function main() {
     printUsage();
     return;
   }
-  const inputPath = parsed.inputPath;
   const options = {
     ...parsed.options,
-    sourceFileName: path.basename(inputPath),
+    sourceFileName: parsed.inputPaths.length === 1 ? path.basename(parsed.inputPaths[0]) : undefined,
   };
-  const result = frontend.compileJavaFile(inputPath, options);
+  const result = frontend.compileJavaFiles(parsed.inputPaths, options);
   for (const written of result.written) {
     console.log(`Compiled ${written.binaryName} -> ${written.outputPath}`);
   }

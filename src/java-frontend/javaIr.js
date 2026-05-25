@@ -355,7 +355,11 @@ function sourceDirectoryMetadata(sourcePath) {
     const isInterface = declaration.kind === 'InterfaceDeclaration' || declaration.kind === 'AnnotationTypeDeclaration';
     const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
     const classBySimpleName = documentImportMap(document);
-    const classTypeContext = { typeParameters: classTypeParameters, classBySimpleName };
+    const classTypeContext = {
+      typeParameters: classTypeParameters,
+      classBySimpleName,
+      fallbackUnsupportedTypes: false,
+    };
     const fields = new Map();
     const methods = new Map();
     const overloads = new Map();
@@ -5642,7 +5646,11 @@ function lowerAstToJavaIr(document, options = {}) {
     if (!isClassLikeDeclaration(declaration)) return;
     const internalName = internalNameByDeclaration.get(declaration);
     const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
-    const classTypeContext = { typeParameters: classTypeParameters, classBySimpleName };
+    const classTypeContext = {
+      typeParameters: classTypeParameters,
+      classBySimpleName,
+      fallbackUnsupportedTypes: options.fallbackUnsupportedTypes === true,
+    };
     const fieldByName = new Map();
     if (declaration.kind === 'EnumDeclaration') {
       const enumDescriptor = `L${internalName};`;
@@ -5695,7 +5703,11 @@ function lowerAstToJavaIr(document, options = {}) {
       && declaration.kind !== 'EnumDeclaration'
       && !modifierNames(declaration.modifiers).includes('static');
     const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
-    const classTypeContext = { typeParameters: classTypeParameters, classBySimpleName };
+    const classTypeContext = {
+      typeParameters: classTypeParameters,
+      classBySimpleName,
+      fallbackUnsupportedTypes: options.fallbackUnsupportedTypes === true,
+    };
     const internalName = internalNameByDeclaration.get(declaration);
     let nextLambdaId = 0;
     const superName = isEnum
@@ -5746,6 +5758,7 @@ function lowerAstToJavaIr(document, options = {}) {
       isEnum,
       superName: classIr.superName,
       typeParameters: classTypeParameters,
+      fallbackUnsupportedTypes: options.fallbackUnsupportedTypes === true,
       syntheticClasses,
       instanceFieldInitializers: [],
       constructorCaptureArgsByOwner: outerClassContext && outerClassContext.constructorCaptureArgsByOwner

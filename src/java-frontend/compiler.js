@@ -199,6 +199,9 @@ function typeDescriptor(type, context = {}) {
   if (type.kind === 'TypeVariable') {
     return typeVariableErasure(type, context);
   }
+  if (type.kind === 'UnsupportedType' && context.fallbackUnsupportedTypes === true) {
+    return 'Ljava/lang/Object;';
+  }
   throw new JavaFrontendError(`Unsupported type node for JVM descriptor: ${type.kind}`, {
     phase: 'compile',
     details: { type },
@@ -238,6 +241,7 @@ function typeSignature(type, context = {}) {
     return `L${classTypeInternalName(type, context)};`;
   }
   if (type.kind === 'TypeVariable') return `T${type.name};`;
+  if (type.kind === 'UnsupportedType' && context.fallbackUnsupportedTypes === true) return 'Ljava/lang/Object;';
   if (type.kind === 'ParameterizedType') {
     const base = type.baseType;
     if (!base || base.kind !== 'ClassType') return typeSignature(base, context);
@@ -667,7 +671,10 @@ function compileFieldDeclaration(field, options = {}) {
   return {
     kind: 'Field',
     access: normalizeAccessFlags(field.modifiers, []),
-    descriptor: typeDescriptor(field.fieldType, { typeParameters: options.typeParameters || null }),
+    descriptor: typeDescriptor(field.fieldType, {
+      typeParameters: options.typeParameters || null,
+      fallbackUnsupportedTypes: options.fallbackUnsupportedTypes === true,
+    }),
     declarators,
   };
 }
@@ -1078,6 +1085,125 @@ function compileJavaFile(inputPath, options = {}) {
   });
 }
 
+const CLASS_LIKE_DECLARATION_KINDS = new Set([
+  'ClassDeclaration',
+  'InterfaceDeclaration',
+  'AnnotationTypeDeclaration',
+  'EnumDeclaration',
+  'RecordDeclaration',
+]);
+
+function collectDeclaredInternalNames(document) {
+  const packageName = packageNameForDocument(document);
+  const names = [];
+  function visit(declaration, outerInternalName = null) {
+    if (!declaration || !CLASS_LIKE_DECLARATION_KINDS.has(declaration.kind)) {
+      return;
+    }
+    const internalName = outerInternalName
+      ? `${outerInternalName}$${declaration.name}`
+      : internalNameFromClassName(declaration.name, packageName);
+    names.push(internalName);
+    for (const member of declaration.body || []) {
+      visit(member, internalName);
+    }
+  }
+  for (const declaration of document.root.typeDeclarations || []) {
+    visit(declaration);
+  }
+  return names;
+}
+
+function conflictOutputDir(outputDir, inputPath, index) {
+  const relative = path.relative(process.cwd(), path.resolve(inputPath));
+  const safe = (relative || path.basename(inputPath))
+    .replace(/[^A-Za-z0-9_.-]+/g, '_')
+    .replace(/^_+|_+$/g, '') || `input_${index}`;
+  return path.join(outputDir, '.java-frontend-conflicts', `${index}_${safe}`);
+}
+
+function duplicateOutputIndexes(inputPaths, outputDir, options = {}) {
+  if (!outputDir) return new Set();
+  const outputOwners = new Map();
+  for (const [index, inputPath] of inputPaths.entries()) {
+    const source = fs.readFileSync(inputPath, 'utf8');
+    const document = parseJava(source, {
+      ...options,
+      sourcePath: inputPath,
+      sourceFileName: path.basename(inputPath),
+    });
+    for (const internalName of collectDeclaredInternalNames(document)) {
+      const outputPath = path.resolve(outputPathForClass(outputDir, internalName));
+      if (!outputOwners.has(outputPath)) {
+        outputOwners.set(outputPath, new Set());
+      }
+      outputOwners.get(outputPath).add(index);
+    }
+  }
+  const duplicateIndexes = new Set();
+  for (const owners of outputOwners.values()) {
+    if (owners.size <= 1) continue;
+    for (const index of owners) {
+      duplicateIndexes.add(index);
+    }
+  }
+  return duplicateIndexes;
+}
+
+function compileJavaFiles(inputPaths, options = {}) {
+  if (!Array.isArray(inputPaths)) {
+    throw new TypeError('compileJavaFiles expects an array of .java input paths');
+  }
+  if (inputPaths.length === 0) {
+    throw new TypeError('compileJavaFiles requires at least one .java input path');
+  }
+  const duplicateIndexes = duplicateOutputIndexes(inputPaths, options.outputDir, options);
+  const results = [];
+  const classes = [];
+  const written = [];
+  const unsupported = [];
+  for (const [index, inputPath] of inputPaths.entries()) {
+    const outputDir = duplicateIndexes.has(index)
+      ? conflictOutputDir(options.outputDir, inputPath, index)
+      : options.outputDir;
+    const fileOptions = {
+      ...options,
+      outputDir,
+      sourcePath: inputPath,
+      sourceFileName: path.basename(inputPath),
+    };
+    const result = compileJavaFile(inputPath, fileOptions);
+    results.push({
+      inputPath,
+      sourceFileName: fileOptions.sourceFileName,
+      outputDir,
+      status: result.bytecodeIr && result.bytecodeIr.status ? result.bytecodeIr.status : 'complete',
+      classes: result.classes,
+      written: result.written,
+      unsupported: result.bytecodeIr && Array.isArray(result.bytecodeIr.unsupported) ? result.bytecodeIr.unsupported : [],
+    });
+    classes.push(...(result.classes || []));
+    written.push(...(result.written || []));
+    if (result.bytecodeIr && Array.isArray(result.bytecodeIr.unsupported)) {
+      unsupported.push(...result.bytecodeIr.unsupported.map((entry) => ({
+        ...entry,
+        sourcePath: inputPath,
+      })));
+    }
+  }
+  return {
+    schema: COMPILE_RESULT_SCHEMA_ID,
+    version: COMPILE_RESULT_SCHEMA_VERSION,
+    sourceLevel: options.sourceLevel || null,
+    status: unsupported.length ? 'partial' : 'complete',
+    backend: 'java-frontend',
+    classes,
+    written,
+    unsupported,
+    results,
+  };
+}
+
 module.exports = {
   COMPILE_RESULT_SCHEMA_ID,
   COMPILE_RESULT_SCHEMA_VERSION,
@@ -1097,6 +1223,7 @@ module.exports = {
   compileJavaAst,
   compileJavaSource,
   compileJavaFile,
+  compileJavaFiles,
   createEmitBytecodeIrPass,
   createEmitClassFileModelPass,
   createValidateClassFileModelPass,
