@@ -517,6 +517,39 @@ public class TryCatchReturnSmoke {
 }
 `;
 
+const SYNCHRONIZED_THIS_SMOKE_SOURCE = `
+public class SynchronizedThisSmoke {
+  private int value;
+
+  public void set() {
+    synchronized (this) {
+      value = 7;
+    }
+  }
+
+  public static void main(String[] args) {
+    SynchronizedThisSmoke smoke = new SynchronizedThisSmoke();
+    smoke.set();
+    System.out.println(smoke.value);
+  }
+}
+`;
+
+const THREAD_LAMBDA_CONSTRUCTOR_SMOKE_SOURCE = `
+public class ThreadLambdaConstructorSmoke {
+  public static void main(String[] args) {
+    String message = "thread ok";
+    Thread thread = new Thread(() -> System.out.println(message));
+    thread.start();
+    try {
+      thread.join();
+    } catch (InterruptedException e) {
+      System.out.println("interrupted");
+    }
+  }
+}
+`;
+
 test('Java IR document lowers from AST, validates, and serializes', (t) => {
   const astDocument = frontend.parseJava(SOURCE, { sourceLevel: 8 });
   const javaIr = frontend.lowerAstToJavaIr(astDocument);
@@ -601,6 +634,10 @@ test('simple local arithmetic source files compile through IR', (t) => {
     ['sources/ConversionTest.java', ['lstore', 'lload', 'l2i', 'istore']],
     ['sources/TypeConversionTest.java', ['i2l', 'i2f', 'i2d', 'lstore', 'fstore', 'dstore']],
     ['sources/ObscureNumbers.java', ['ldc2_w', 'lstore', 'lload']],
+    ['sources/HexFloatLiteralsTest.java', ['ldc2_w', 'dstore', 'getstatic']],
+    ['sources/ObscureStrictFp.java', ['ldc2_w', 'dmul', 'invokestatic']],
+    ['sources/ObscureStrings.java', ['invokestatic', 'invokevirtual', 'anewarray']],
+    ['sources/RecursionTest.java', ['invokestatic', 'imul', 'ireturn']],
     ['sources/ObscureUnicode.java', ['ldc2_w', 'dstore', 'dload', 'invokevirtual']],
     ['sources/BitwiseOperationsTest.java', ['ishr', 'iushr', 'iand', 'ior', 'ixor']],
     ['sources/LongBitwiseTest.java', ['land', 'lor', 'lxor', 'lshl', 'lshr', 'lushr']],
@@ -619,8 +656,10 @@ test('simple local arithmetic source files compile through IR', (t) => {
     ['sources/NewLambdaCrash.java', ['new', 'checkcast', 'invokeinterface']],
     ['sources/LambdaCrash.java', ['new', 'checkcast', 'invokeinterface']],
     ['sources/InvokeDynamicTest.java', ['ldc', 'invokeinterface']],
+    ['sources/GenericsCrash.java', ['anewarray', 'invokestatic', 'aastore', 'checkcast']],
     ['sources/PotentialCrash1.java', ['monitorenter', 'monitorexit']],
     ['sources/ConcurrencyCrash.java', ['putstatic', 'invokestatic', 'invokevirtual']],
+    ['sources/SynchronizationTest.java', ['monitorenter', 'monitorexit', 'invokevirtual']],
     ['sources/ReflectionCrash.java', ['invokestatic', 'invokevirtual', 'arraylength']],
     ['sources/ReflectionTest.java', ['invokevirtual', 'aaload']],
     ['sources/ReflectionCrashTest.java', ['invokevirtual', 'checkcast', 'invokespecial']],
@@ -751,6 +790,8 @@ test('narrow primitives and reference casts compile through IR', (t) => {
   const unaryResult = frontend.compileJavaSource(UNARY_SMOKE_SOURCE, { sourceFileName: 'UnarySmoke.java' });
   const tryCatchResult = frontend.compileJavaSource(TRY_CATCH_SMOKE_SOURCE, { sourceFileName: 'TryCatchSmoke.java' });
   const tryCatchReturnResult = frontend.compileJavaSource(TRY_CATCH_RETURN_SMOKE_SOURCE, { sourceFileName: 'TryCatchReturnSmoke.java' });
+  const synchronizedThisResult = frontend.compileJavaSource(SYNCHRONIZED_THIS_SMOKE_SOURCE, { sourceFileName: 'SynchronizedThisSmoke.java' });
+  const threadLambdaConstructorResult = frontend.compileJavaSource(THREAD_LAMBDA_CONSTRUCTOR_SMOKE_SOURCE, { sourceFileName: 'ThreadLambdaConstructorSmoke.java' });
   const narrowOpcodes = narrowResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'main').instructions.map((instruction) => instruction.opcode);
   const castOpcodes = castResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'main').instructions.map((instruction) => instruction.opcode);
   const reassignmentOpcodes = reassignmentResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'main').instructions.map((instruction) => instruction.opcode);
@@ -791,6 +832,13 @@ test('narrow primitives and reference casts compile through IR', (t) => {
   const tryCatchOpcodes = tryCatchMethod.instructions.map((instruction) => instruction.opcode);
   const tryCatchReturnMethod = tryCatchReturnResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'safeDivide');
   const tryCatchReturnOpcodes = tryCatchReturnMethod.instructions.map((instruction) => instruction.opcode);
+  const synchronizedThisMethod = synchronizedThisResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'set');
+  const synchronizedThisOpcodes = synchronizedThisMethod.instructions.map((instruction) => instruction.opcode);
+  const threadLambdaInstructions = threadLambdaConstructorResult.bytecodeIr.classes.flatMap((irClass) => irClass.methods.flatMap((method) => method.instructions));
+  const threadLambdaOpcodes = threadLambdaInstructions.map((instruction) => instruction.opcode);
+  const threadLambdaInvokes = threadLambdaInstructions
+    .filter((instruction) => instruction.opcode === 'invokespecial' || instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands.join(' '));
   const classInstanceCalls = classInstanceInstructions
     .filter((instruction) => instruction.opcode === 'ldc' || instruction.opcode === 'getstatic')
     .map((instruction) => instruction.operands.join(' '));
@@ -888,6 +936,13 @@ test('narrow primitives and reference casts compile through IR', (t) => {
   t.equal(tryCatchReturnResult.bytecodeIr.status, 'complete', 'try/catch return smoke compiles completely');
   t.ok(tryCatchReturnOpcodes.includes('ireturn'), 'try/catch non-void return is emitted');
   t.ok(tryCatchReturnOpcodes.includes('getstatic'), 'try/catch catch return static constant is emitted');
+  t.equal(synchronizedThisResult.bytecodeIr.status, 'complete', 'synchronized this smoke compiles completely');
+  t.ok(synchronizedThisOpcodes.includes('monitorenter'), 'synchronized this monitorenter is emitted');
+  t.ok(synchronizedThisOpcodes.includes('monitorexit'), 'synchronized this monitorexit is emitted');
+  t.equal(threadLambdaConstructorResult.bytecodeIr.status, 'complete', 'thread lambda constructor smoke compiles completely');
+  t.ok(threadLambdaOpcodes.includes('putfield'), 'captured lambda local is stored on synthetic Runnable');
+  t.ok(threadLambdaInvokes.some((invoke) => invoke.includes('java/lang/Thread <init> (Ljava/lang/Runnable;)V')), 'Thread(Runnable) constructor is emitted');
+  t.ok(threadLambdaInvokes.some((invoke) => invoke.includes('java/lang/Thread start ()V')), 'Thread.start call is emitted');
   t.end();
 });
 
@@ -934,6 +989,10 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     ['sources/ConversionTest.java', 'ConversionTest', expectedOutputForClass('ConversionTest')],
     ['sources/TypeConversionTest.java', 'TypeConversionTest', expectedOutputForClass('TypeConversionTest')],
     ['sources/ObscureNumbers.java', 'ObscureNumbers', expectedOutputForClass('ObscureNumbers')],
+    ['sources/HexFloatLiteralsTest.java', 'HexFloatLiteralsTest', expectedOutputForClass('HexFloatLiteralsTest')],
+    ['sources/ObscureStrictFp.java', 'ObscureStrictFp', expectedOutputForClass('ObscureStrictFp')],
+    ['sources/ObscureStrings.java', 'ObscureStrings', expectedOutputForClass('ObscureStrings')],
+    ['sources/RecursionTest.java', 'RecursionTest', expectedOutputForClass('RecursionTest')],
     ['sources/ObscureUnicode.java', 'ObscureUnicode', expectedOutputForClass('ObscureUnicode')],
     ['sources/BitwiseOperationsTest.java', 'BitwiseOperationsTest', expectedOutputForClass('BitwiseOperationsTest')],
     ['sources/LongBitwiseTest.java', 'LongBitwiseTest', expectedOutputForClass('LongBitwiseTest')],
@@ -954,11 +1013,13 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     ['sources/NewLambdaCrash.java', 'NewLambdaCrash', expectedOutputForClass('NewLambdaCrash')],
     ['sources/LambdaCrash.java', 'LambdaCrash', expectedOutputForClass('LambdaCrash')],
     ['sources/InvokeDynamicTest.java', 'InvokeDynamicTest', expectedOutputForClass('InvokeDynamicTest')],
+    ['sources/GenericsCrash.java', 'GenericsCrash', expectedOutputForClass('GenericsCrash')],
     ['sources/PotentialCrash1.java', 'PotentialCrash1', expectedOutputForClass('PotentialCrash1')],
     ['sources/ConcurrencyCrash.java', 'ConcurrencyCrash', expectedOutputForClass('ConcurrencyCrash')],
     ['sources/ReflectionCrash.java', 'ReflectionCrash', expectedOutputForClass('ReflectionCrash')],
     ['sources/ReflectionCrashTest.java', 'ReflectionCrashTest', expectedOutputForClass('ReflectionCrashTest')],
     ['sources/AnnotationReflectionTest.java', 'AnnotationReflectionTest', expectedOutputForClass('AnnotationReflectionTest')],
+    ['sources/WideInstructionDemo.java', 'WideInstructionDemo', expectedOutputForClass('WideInstructionDemo')],
     ['sources/SimplestSipushCrash.java', 'SimplestSipushCrash', expectedOutputForClass('SimplestSipushCrash')],
     ['sources/TryCatchFinallyTest.java', 'TryCatchFinallyTest', expectedOutputForClass('TryCatchFinallyTest')],
     ['sources/TryWithResourcesTest.java', 'TryWithResourcesTest', expectedOutputForClass('TryWithResourcesTest')],
@@ -1074,6 +1135,14 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     frontend.compileJavaSource(TRY_CATCH_RETURN_SMOKE_SOURCE, {
       outputDir,
       sourceFileName: 'TryCatchReturnSmoke.java',
+    });
+    frontend.compileJavaSource(SYNCHRONIZED_THIS_SMOKE_SOURCE, {
+      outputDir,
+      sourceFileName: 'SynchronizedThisSmoke.java',
+    });
+    frontend.compileJavaSource(THREAD_LAMBDA_CONSTRUCTOR_SMOKE_SOURCE, {
+      outputDir,
+      sourceFileName: 'ThreadLambdaConstructorSmoke.java',
     });
     for (const [, className, expected] of cases) {
       const result = await runTest(className, expected, null, {
@@ -1286,6 +1355,22 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     });
     t.ok(tryCatchReturnSmoke.success, 'TryCatchReturnSmoke runs on repo JVM');
     t.equal(tryCatchReturnSmoke.output.trim(), '5\n-2147483648', 'TryCatchReturnSmoke repo JVM output matches');
+
+    const synchronizedThisSmoke = await runTest('SynchronizedThisSmoke', '7', null, {
+      classpath: outputDir,
+      timeout: 3000,
+      silent: true,
+    });
+    t.ok(synchronizedThisSmoke.success, 'SynchronizedThisSmoke runs on repo JVM');
+    t.equal(synchronizedThisSmoke.output.trim(), '7', 'SynchronizedThisSmoke repo JVM output matches');
+
+    const threadLambdaConstructorSmoke = await runTest('ThreadLambdaConstructorSmoke', 'thread ok', null, {
+      classpath: outputDir,
+      timeout: 3000,
+      silent: true,
+    });
+    t.ok(threadLambdaConstructorSmoke.success, 'ThreadLambdaConstructorSmoke runs on repo JVM');
+    t.equal(threadLambdaConstructorSmoke.output.trim(), 'thread ok', 'ThreadLambdaConstructorSmoke repo JVM output matches');
 
     const argsJvm = new JVM({ classpath: outputDir });
     const getArgsOutput = setupIntegerPrintCapture(argsJvm);

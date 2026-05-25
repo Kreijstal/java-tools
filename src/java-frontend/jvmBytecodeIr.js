@@ -214,6 +214,18 @@ function stripNumericSuffix(raw) {
   return text.replace(/[lLfFdD]$/, '');
 }
 
+function parseJavaFloatingLiteral(raw) {
+  const text = stripNumericSuffix(raw);
+  const match = /^([+-]?)0[xX]([0-9a-fA-F]*)(?:\.([0-9a-fA-F]*))?[pP]([+-]?[0-9]+)$/.exec(text);
+  if (!match) return Number.parseFloat(text);
+  const [, signText, wholeRaw, fractionRaw = '', exponentRaw] = match;
+  let significand = Number.parseInt(wholeRaw || '0', 16);
+  for (let index = 0; index < fractionRaw.length; index += 1) {
+    significand += Number.parseInt(fractionRaw[index], 16) / (16 ** (index + 1));
+  }
+  return (signText === '-' ? -1 : 1) * significand * (2 ** Number.parseInt(exponentRaw, 10));
+}
+
 function parseIntegerLiteral(raw) {
   const text = String(raw).replace(/_/g, '').replace(/[lL]$/, '');
   const sign = text.startsWith('-') ? -1 : 1;
@@ -232,18 +244,18 @@ function longPushInstruction(value) {
 }
 
 function floatPushInstruction(value) {
-  const parsed = Number.parseFloat(stripNumericSuffix(value));
+  const parsed = parseJavaFloatingLiteral(value);
   if (Object.is(parsed, 0)) return createJvmInstruction('fconst_0');
   if (parsed === 1) return createJvmInstruction('fconst_1');
   if (parsed === 2) return createJvmInstruction('fconst_2');
-  return createJvmInstruction('ldc', [`${stripNumericSuffix(value)}f`]);
+  return createJvmInstruction('ldc', [`${parsed}f`]);
 }
 
 function doublePushInstruction(value) {
-  const parsed = Number.parseFloat(stripNumericSuffix(value));
+  const parsed = parseJavaFloatingLiteral(value);
   if (Object.is(parsed, 0)) return createJvmInstruction('dconst_0');
   if (parsed === 1) return createJvmInstruction('dconst_1');
-  return createJvmInstruction('ldc2_w', [stripNumericSuffix(value)]);
+  return createJvmInstruction('ldc2_w', [String(parsed)]);
 }
 
 function intCompatibleInvokeDescriptor(descriptor) {

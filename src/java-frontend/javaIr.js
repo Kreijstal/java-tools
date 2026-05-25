@@ -427,7 +427,7 @@ function literalToJavaIrValue(expression) {
     let type = 'I';
     if (/[lL]$/.test(raw)) type = 'J';
     else if (/[fF]$/.test(raw)) type = 'F';
-    else if (/[dD]$/.test(raw) || raw.includes('.') || /[eE]/.test(raw)) type = 'D';
+    else if (/[dD]$/.test(raw) || raw.includes('.') || /[eEpP]/.test(raw)) type = 'D';
     return {
       kind: 'LiteralValue',
       type,
@@ -471,7 +471,7 @@ function numericDescriptorFromRaw(raw) {
   if (/[lL]$/.test(text)) return 'J';
   if (/^[+-]?0[xX][0-9a-fA-F_]+$/.test(text)) return 'I';
   if (/[fF]$/.test(text)) return 'F';
-  if (/[dD]$/.test(text) || text.includes('.') || /[eE]/.test(text)) return 'D';
+  if (/[dD]$/.test(text) || text.includes('.') || /[eEpP]/.test(text)) return 'D';
   return 'I';
 }
 
@@ -481,6 +481,32 @@ function tokenText(token) {
 
 function tokenTextJoined(tokens) {
   return (tokens || []).map(tokenText).join(' ');
+}
+
+function recoveredNumericLiteralToken(tokens) {
+  const normalized = tokens || [];
+  if (normalized.length === 3
+      && normalized[0].kind === 'number'
+      && (tokenText(normalized[1]) === '-' || tokenText(normalized[1]) === '+')
+      && normalized[2].kind === 'number'
+      && /(?:[eEpP])$/i.test(tokenText(normalized[0]))) {
+    return { kind: 'number', text: `${tokenText(normalized[0])}${tokenText(normalized[1])}${tokenText(normalized[2])}` };
+  }
+  if ((normalized.length === 3 || normalized.length === 5)
+      && normalized[0].kind === 'number'
+      && /^0[xX][0-9a-fA-F_]+$/.test(tokenText(normalized[0]))
+      && tokenText(normalized[1]) === '.'
+      && /^[0-9a-fA-F_]+(?:[pP][+-]?[0-9_]+)?[fFdD]?$/.test(tokenText(normalized[2]))) {
+    let text = `${tokenText(normalized[0])}.${tokenText(normalized[2])}`;
+    if (normalized.length === 5
+        && (tokenText(normalized[3]) === '-' || tokenText(normalized[3]) === '+')
+        && normalized[4].kind === 'number'
+        && /[pP]$/.test(text)) {
+      text = `${text}${tokenText(normalized[3])}${tokenText(normalized[4])}`;
+    }
+    return { kind: 'number', text };
+  }
+  return null;
 }
 
 function trimParenTokens(tokens) {
@@ -792,6 +818,10 @@ const STATIC_CONSTANT_FIELDS = Object.freeze({
   'java/lang/Double.NaN': 'D',
   'java/lang/Double.NEGATIVE_INFINITY': 'D',
   'java/lang/Double.POSITIVE_INFINITY': 'D',
+  'java/lang/Math.PI': 'D',
+  'java/lang/Math.E': 'D',
+  'java/lang/System.out': 'Ljava/io/PrintStream;',
+  'java/lang/System.err': 'Ljava/io/PrintStream;',
 });
 
 function wrapperDescriptorForPrimitive(descriptor) {
@@ -1123,6 +1153,8 @@ function lowerTokenStaticMethodCallToJavaIrValue(tokens, context) {
 function lowerTokenExpressionToJavaIrValue(tokens, context) {
   const normalized = trimParenTokens(tokens || []);
   if (normalized.length === 0) return null;
+  const recoveredNumber = recoveredNumericLiteralToken(normalized);
+  if (recoveredNumber) return literalTokenToJavaIrValue(recoveredNumber);
 
   if (normalized.length === 4
       && tokenText(normalized[0]) === '('
@@ -1425,6 +1457,9 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
     const token = normalized[0];
     const literal = literalTokenToJavaIrValue(token);
     if (literal) return literal;
+    if (tokenText(token) === 'this' && !context.currentMethodIsStatic) {
+      return thisReceiverValue(context);
+    }
     if (token.kind === 'identifier' && context.localByName.has(token.text)) {
       const local = context.localByName.get(token.text);
       return {
@@ -1510,6 +1545,16 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
           owner,
           name,
           descriptor: 'Ljava/lang/Class;',
+        };
+      }
+      const constantDescriptor = STATIC_CONSTANT_FIELDS[`${owner}.${name}`];
+      if (constantDescriptor) {
+        return {
+          kind: 'StaticFieldValue',
+          type: constantDescriptor,
+          owner,
+          name,
+          descriptor: constantDescriptor,
         };
       }
       if (owner && /^[A-Z][A-Z0-9_]*$/.test(name)) {
@@ -1949,13 +1994,24 @@ function methodDescriptorMatchesArgs(descriptor, args) {
 }
 
 function isJreVarargsMethod(owner, name, descriptor, isStatic) {
-  return Boolean(isStatic
-    && ((owner === 'java/lang/reflect/Array'
+  return Boolean((!isStatic
+      && owner === 'java/lang/reflect/Method'
+      && name === 'invoke'
+      && descriptor === '(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;')
+    || (!isStatic
+      && owner === 'java/io/PrintStream'
+      && name === 'printf'
+      && descriptor === '(Ljava/lang/String;[Ljava/lang/Object;)Ljava/io/PrintStream;')
+    || (isStatic
+    && ((owner === 'java/lang/String'
+      && name === 'join'
+      && descriptor === '(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;')
+    || (owner === 'java/lang/reflect/Array'
       && name === 'newInstance'
       && descriptor === '(Ljava/lang/Class;[I)Ljava/lang/Object;')
     || (owner === 'java/util/Arrays'
       && name === 'asList'
-      && descriptor === '([Ljava/lang/Object;)Ljava/util/List;')));
+      && descriptor === '([Ljava/lang/Object;)Ljava/util/List;'))));
 }
 
 function selectJreMethodDescriptor(owner, name, args, isStatic) {
@@ -2196,10 +2252,26 @@ function expressionLambdaTokens(expression) {
   return null;
 }
 
-function createSyntheticLambdaClass(context, iface, method) {
-  const id = context.allocateLambdaClassName ? context.allocateLambdaClassName() : `${context.classInternalName}$Lambda${context.nextLambdaId || 0}`;
+function createSyntheticLambdaClass(context, iface, method, captures = [], owner = null) {
+  const id = owner || (context.allocateLambdaClassName ? context.allocateLambdaClassName() : `${context.classInternalName}$Lambda${context.nextLambdaId || 0}`);
   context.nextLambdaId = (context.nextLambdaId || 0) + 1;
   const simpleName = id.split('/').pop();
+  const fields = (captures || []).map((capture) => createJavaIrField({
+    name: capture.fieldName,
+    descriptor: capture.descriptor,
+    access: ['private', 'final'],
+    initializer: null,
+    meta: { synthetic: true, capturedName: capture.name },
+  }));
+  const constructorContext = {
+    ...context,
+    classInternalName: id,
+    className: simpleName,
+    superName: 'java/lang/Object',
+    fieldByName: new Map(),
+    currentMethodIsStatic: false,
+  };
+  const constructor = createCapturedClassConstructor(constructorContext, captures);
   const classIr = createJavaIrClass({
     name: simpleName,
     packageName: '',
@@ -2207,17 +2279,409 @@ function createSyntheticLambdaClass(context, iface, method) {
     access: ['final', 'super'],
     superName: 'java/lang/Object',
     interfaces: [iface],
-    methods: [method],
+    fields,
+    methods: [constructor, method],
     sourceNodeKind: 'LambdaExpression',
     meta: { synthetic: true },
   });
+  registerSyntheticClassMembers(classIr, context);
   if (context.syntheticClasses) context.syntheticClasses.push(classIr);
   return {
     kind: 'NewObjectValue',
     type: `L${id};`,
     owner: id,
-    descriptor: '()V',
-    args: [],
+    descriptor: constructor.descriptor,
+    args: (captures || []).map((capture) => capture.value),
+  };
+}
+
+function captureValuesForLambda(context, tokens, excludedNames = []) {
+  const excluded = new Set(excludedNames || []);
+  const names = new Set();
+  for (const token of tokens || []) {
+    if (token && token.kind === 'identifier' && !excluded.has(token.text) && context.localByName && context.localByName.has(token.text)) {
+      names.add(token.text);
+    }
+  }
+  const captures = [];
+  for (const name of names) {
+    const local = context.localByName.get(name);
+    if (!local) continue;
+    captures.push({
+      name,
+      fieldName: name === 'this' ? 'this$0' : `val$${name}`,
+      descriptor: local.descriptor,
+      value: localValue(local),
+    });
+  }
+  return captures;
+}
+
+function captureValuesForLambdaNames(context, names, excludedNames = []) {
+  const excluded = new Set(excludedNames || []);
+  const captures = [];
+  const seen = new Set();
+  for (const name of names || []) {
+    if (seen.has(name) || excluded.has(name) || !context.localByName || !context.localByName.has(name)) continue;
+    seen.add(name);
+    const local = context.localByName.get(name);
+    captures.push({
+      name,
+      fieldName: name === 'this' ? 'this$0' : `val$${name}`,
+      descriptor: local.descriptor,
+      value: localValue(local),
+    });
+  }
+  return captures;
+}
+
+function identifierNamesFromExpression(expression, names = []) {
+  if (!expression) return names;
+  if (expression.kind === 'Identifier') {
+    names.push(expression.name);
+    return names;
+  }
+  if (Array.isArray(expression.tokens)) {
+    for (const token of expression.tokens) {
+      if (token && token.kind === 'identifier') names.push(token.text);
+    }
+  }
+  for (const key of ['target', 'expression', 'left', 'right', 'condition', 'consequent', 'alternate']) {
+    if (expression[key]) identifierNamesFromExpression(expression[key], names);
+  }
+  for (const key of ['arguments', 'elements']) {
+    if (Array.isArray(expression[key])) {
+      for (const child of expression[key]) identifierNamesFromExpression(child, names);
+    }
+  }
+  return names;
+}
+
+function fieldMapForCaptures(owner, captures) {
+  const fields = new Map();
+  for (const capture of captures || []) {
+    fields.set(capture.name, {
+      owner,
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      signature: capture.descriptor,
+      isStatic: false,
+    });
+  }
+  return fields;
+}
+
+function constructorCaptureArgs(owner, context) {
+  const map = context.constructorCaptureArgsByOwner;
+  return map && map.get(owner) ? map.get(owner) : [];
+}
+
+function createCapturedClassConstructor(classContext, captures) {
+  const thisLocal = createJavaIrLocal('param:this', {
+    name: 'this',
+    descriptor: `L${classContext.classInternalName};`,
+    slotHint: 0,
+  });
+  const locals = [thisLocal];
+  const parameters = [];
+  const localByName = new Map([['this', thisLocal]]);
+  let slot = 1;
+  for (const capture of captures || []) {
+    const local = createJavaIrLocal(`param:${capture.fieldName}`, {
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      slotHint: slot,
+      meta: { synthetic: true, captured: capture.name },
+    });
+    parameters.push({ id: local.id, name: local.name, descriptor: local.descriptor, slotHint: local.slotHint, meta: local.meta });
+    locals.push(local);
+    localByName.set(local.name, local);
+    slot += capture.descriptor === 'J' || capture.descriptor === 'D' ? 2 : 1;
+  }
+  const context = {
+    locals,
+    localByName,
+    nextSlot: slot,
+    nextLocalId: 0,
+    methodByName: classContext.methodByName,
+    fieldByName: classContext.fieldByName,
+    classInternalName: classContext.classInternalName,
+    className: classContext.className,
+    superName: classContext.superName,
+    classBySimpleName: classContext.classBySimpleName,
+    classMethodsByInternalName: classContext.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: classContext.classFieldsByInternalName,
+    typeParameters: classContext.typeParameters,
+    currentMethodIsStatic: false,
+    syntheticClasses: classContext.syntheticClasses,
+    allocateLambdaClassName: classContext.allocateLambdaClassName,
+    constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
+  };
+  const ops = [implicitSuperConstructorOp(context)];
+  for (const capture of captures || []) {
+    ops.push(createJavaIrOp('putField', {
+      owner: classContext.classInternalName,
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      value: localValue(localByName.get(capture.fieldName)),
+      args: [localValue(thisLocal)],
+      sourceNodeKind: 'SyntheticCapturedConstructor',
+    }));
+  }
+  for (const fieldInit of classContext.instanceFieldInitializers || []) {
+    ops.push(createJavaIrOp('putField', {
+      owner: classContext.classInternalName,
+      name: fieldInit.name,
+      descriptor: fieldInit.descriptor,
+      value: fieldInit.value,
+      args: [localValue(thisLocal)],
+      sourceNodeKind: 'SyntheticCapturedConstructor',
+    }));
+  }
+  return createJavaIrMethod({
+    name: '<init>',
+    descriptor: `(${(captures || []).map((capture) => capture.descriptor).join('')})V`,
+    access: ['public'],
+    parameters,
+    locals,
+    blocks: [createJavaIrBlock('entry', {
+      kind: 'EntryBlock',
+      ops,
+      terminator: javaIrReturn(null),
+    })],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'SyntheticCapturedConstructor',
+    meta: { synthetic: true, capturedConstructor: true },
+  });
+}
+
+function methodSummaryFromIrMethod(method) {
+  const parameterDescriptors = parameterDescriptorsFromMethodDescriptor(method.descriptor) || [];
+  return {
+    name: method.name,
+    descriptor: method.descriptor,
+    returnDescriptor: method.descriptor.slice(method.descriptor.indexOf(')') + 1),
+    parameterDescriptors,
+    isStatic: (method.access || []).includes('static'),
+    invokeKind: (method.access || []).includes('abstract') ? 'interface' : undefined,
+  };
+}
+
+function registerSyntheticClassMembers(classIr, context) {
+  const methods = new Map();
+  const overloads = new Map();
+  for (const method of classIr.methods || []) {
+    const summary = methodSummaryFromIrMethod(method);
+    methods.set(summary.name, summary);
+    if (!overloads.has(summary.name)) overloads.set(summary.name, []);
+    overloads.get(summary.name).push(summary);
+  }
+  const fields = new Map();
+  for (const field of classIr.fields || []) {
+    fields.set(field.name, {
+      owner: classIr.internalName,
+      name: field.name,
+      descriptor: field.descriptor,
+      signature: field.meta && field.meta.signature ? field.meta.signature : field.descriptor,
+      isStatic: (field.access || []).includes('static'),
+    });
+    if (field.meta && field.meta.capturedName) {
+      fields.set(field.meta.capturedName, {
+        owner: classIr.internalName,
+        name: field.name,
+        descriptor: field.descriptor,
+        signature: field.descriptor,
+        isStatic: false,
+      });
+    }
+  }
+  context.classMethodsByInternalName.set(classIr.internalName, methods);
+  context.classMethodOverloadsByInternalName.set(classIr.internalName, overloads);
+  context.classFieldsByInternalName.set(classIr.internalName, fields);
+}
+
+function captureValuesForLocalClass(context) {
+  const captures = [];
+  if (!context.currentMethodIsStatic && context.localByName && context.localByName.has('this')) {
+    const thisLocal = context.localByName.get('this');
+    captures.push({
+      name: 'this',
+      fieldName: 'this$0',
+      descriptor: thisLocal.descriptor,
+      value: localValue(thisLocal),
+    });
+  }
+  for (const local of context.locals || []) {
+    if (!local || local.name === 'this' || !local.id || !local.id.startsWith('local:')) continue;
+    captures.push({
+      name: local.name,
+      fieldName: `val$${local.name}`,
+      descriptor: local.descriptor,
+      value: localValue(local),
+    });
+  }
+  return captures;
+}
+
+function lowerLocalClassDeclaration(statement, context) {
+  const declaration = statement && statement.declaration;
+  if (!declaration || !isClassLikeDeclaration(declaration)) return null;
+  const captures = captureValuesForLocalClass(context);
+  const owner = `${context.classInternalName}$${declaration.name}`;
+  context.classBySimpleName.set(declaration.name, owner);
+  context.classBySimpleName.set(`${context.className}.${declaration.name}`, owner);
+  if (context.constructorCaptureArgsByOwner) {
+    context.constructorCaptureArgsByOwner.set(owner, captures.map((capture) => capture.value));
+  }
+  const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
+  const fieldByName = new Map();
+  const fields = [];
+  for (const capture of captures) {
+    fields.push(createJavaIrField({
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      access: ['final'],
+      initializer: null,
+      meta: { synthetic: true, capturedName: capture.name },
+    }));
+    fieldByName.set(capture.name, {
+      owner,
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      signature: capture.descriptor,
+      isStatic: false,
+    });
+  }
+  const classContext = {
+    className: declaration.name,
+    classInternalName: owner,
+    methodByName: new Map(),
+    localByName: new Map(),
+    classBySimpleName: context.classBySimpleName,
+    classMethodsByInternalName: context.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: context.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: context.classFieldsByInternalName,
+    fieldByName,
+    outerClassInternalName: context.classInternalName,
+    outerFieldByName: context.fieldByName,
+    outerMethodByName: context.methodByName,
+    outerThisFieldName: captures.some((capture) => capture.name === 'this') ? 'this$0' : null,
+    isInterface: false,
+    superName: 'java/lang/Object',
+    typeParameters: classTypeParameters,
+    syntheticClasses: context.syntheticClasses,
+    allocateLambdaClassName: context.allocateLambdaClassName,
+    constructorCaptureArgsByOwner: context.constructorCaptureArgsByOwner,
+  };
+  const methods = [createCapturedClassConstructor(classContext, captures)];
+  for (const member of declaration.body || []) {
+    if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
+      methods.push(lowerMethodToJavaIr(member, classContext, member.modifiers && modifierNames(member.modifiers).includes('static') ? 0 : 1));
+    }
+  }
+  const classIr = createJavaIrClass({
+    name: declaration.name,
+    packageName: '',
+    internalName: owner,
+    access: ['final', 'super'],
+    superName: 'java/lang/Object',
+    fields,
+    methods,
+    sourceNodeKind: 'LocalClassDeclaration',
+    meta: { synthetic: true, localClass: true },
+  });
+  registerSyntheticClassMembers(classIr, context);
+  if (context.syntheticClasses) context.syntheticClasses.push(classIr);
+  return [];
+}
+
+function lowerAnonymousClassToJavaIrValue(expression, targetDescriptor, context) {
+  if (!expression || expression.kind !== 'UnsupportedExpression' || !Array.isArray(expression.tokens)) return null;
+  const tokens = expression.tokens;
+  if (tokens.length < 5 || tokenText(tokens[0]) !== 'new' || tokens[1].kind !== 'identifier') return null;
+  const openParen = 2;
+  const closeParen = matchingTokenIndex(tokens, openParen, '(', ')');
+  if (closeParen < 0 || tokenText(tokens[closeParen + 1]) !== '{') return null;
+  const closeBrace = matchingTokenIndex(tokens, closeParen + 1, '{', '}');
+  if (closeBrace !== tokens.length - 1) return null;
+  const owner = context.allocateLambdaClassName ? context.allocateLambdaClassName() : `${context.classInternalName}$Anon0`;
+  const iface = targetDescriptor && targetDescriptor.startsWith('L') ? targetDescriptor.slice(1, -1) : constructorOwnerFromName(tokens[1].text, context);
+  const bodyText = expression.text.slice(expression.text.indexOf('{'), expression.text.lastIndexOf('}') + 1);
+  let parsed;
+  try {
+    parsed = parseJava(`class ${owner.split('$').pop()} implements ${tokens[1].text} ${bodyText}`, { sourceFileName: 'AnonymousClass.java' });
+  } catch (_) {
+    return null;
+  }
+  const declaration = parsed.root.typeDeclarations && parsed.root.typeDeclarations[0];
+  if (!declaration) return null;
+  const captures = captureValuesForLocalClass(context).filter((capture) => capture.name === 'this');
+  if (context.constructorCaptureArgsByOwner) {
+    context.constructorCaptureArgsByOwner.set(owner, captures.map((capture) => capture.value));
+  }
+  const fieldByName = new Map();
+  const fields = captures.map((capture) => {
+    fieldByName.set(capture.name, {
+      owner,
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      signature: capture.descriptor,
+      isStatic: false,
+    });
+    return createJavaIrField({
+      name: capture.fieldName,
+      descriptor: capture.descriptor,
+      access: ['final'],
+      initializer: null,
+      meta: { synthetic: true, capturedName: capture.name },
+    });
+  });
+  const classContext = {
+    className: declaration.name,
+    classInternalName: owner,
+    methodByName: new Map(),
+    localByName: new Map(),
+    classBySimpleName: context.classBySimpleName,
+    classMethodsByInternalName: context.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: context.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: context.classFieldsByInternalName,
+    fieldByName,
+    outerClassInternalName: context.classInternalName,
+    outerFieldByName: context.fieldByName,
+    outerMethodByName: context.methodByName,
+    outerThisFieldName: captures.length ? 'this$0' : null,
+    isInterface: false,
+    superName: 'java/lang/Object',
+    typeParameters: new Map(),
+    syntheticClasses: context.syntheticClasses,
+    allocateLambdaClassName: context.allocateLambdaClassName,
+    constructorCaptureArgsByOwner: context.constructorCaptureArgsByOwner,
+  };
+  const methods = [createCapturedClassConstructor(classContext, captures)];
+  for (const member of declaration.body || []) {
+    if (member.kind === 'MethodDeclaration') methods.push(lowerMethodToJavaIr(member, classContext, 1));
+  }
+  const classIr = createJavaIrClass({
+    name: owner.split('/').pop(),
+    packageName: '',
+    internalName: owner,
+    access: ['final', 'super'],
+    superName: 'java/lang/Object',
+    interfaces: [iface],
+    fields,
+    methods,
+    sourceNodeKind: 'AnonymousClassExpression',
+    meta: { synthetic: true, anonymousClass: true },
+  });
+  registerSyntheticClassMembers(classIr, context);
+  if (context.syntheticClasses) context.syntheticClasses.push(classIr);
+  return {
+    kind: 'NewObjectValue',
+    type: `L${owner};`,
+    owner,
+    descriptor: `(${captures.map((capture) => capture.descriptor).join('')})V`,
+    args: captures.map((capture) => capture.value),
   };
 }
 
@@ -2329,15 +2793,26 @@ function lowerRunnableBlockLambdaToJavaIrValue(expression, context) {
   const arrowIndex = lambdaArrowIndex(tokens);
   if (arrowIndex < 0) return null;
   const bodyTokens = stripEnclosingTokenPair(tokens.slice(arrowIndex + 1), '{', '}');
+  const owner = context.allocateLambdaClassName ? context.allocateLambdaClassName() : `${context.classInternalName}$Lambda${context.nextLambdaId || 0}`;
+  const captures = captureValuesForLambda(context, bodyTokens);
   const lambdaContext = {
     ...context,
     locals: [createJavaIrLocal('param:this', {
       name: 'this',
-      descriptor: 'Ljava/lang/Runnable;',
+      descriptor: `L${owner};`,
       slotHint: 0,
     })],
     localByName: new Map(),
+    fieldByName: fieldMapForCaptures(owner, captures),
+    methodOwnerInternalName: context.classInternalName,
+    classInternalName: owner,
+    className: owner.split('/').pop(),
+    outerClassInternalName: context.classInternalName,
+    outerMethodByName: context.methodByName,
+    outerThisFieldName: captures.some((capture) => capture.name === 'this') ? 'this$0' : null,
     currentMethodIsStatic: false,
+    nextSlot: 1,
+    nextLocalId: 0,
   };
   let ops = null;
   if (bodyTokens.length > 0 && tokenText(bodyTokens[0]) === 'for') {
@@ -2367,25 +2842,49 @@ function lowerRunnableBlockLambdaToJavaIrValue(expression, context) {
     sourceNodeKind: 'LambdaExpression',
     meta: { synthetic: true },
   });
-  return createSyntheticLambdaClass(context, 'java/lang/Runnable', method);
+  return createSyntheticLambdaClass(context, 'java/lang/Runnable', method, captures, owner);
 }
 
 function lowerRunnableLambdaToJavaIrValue(expression, context) {
   if (!expression || expression.kind !== 'MethodInvocationExpression' || expression.name !== 'println') return null;
   const targetTokens = expression.target && expression.target.tokens;
   if (!Array.isArray(targetTokens) || lambdaArrowIndex(targetTokens) < 0) return null;
-  const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
+  const owner = context.allocateLambdaClassName ? context.allocateLambdaClassName() : `${context.classInternalName}$Lambda${context.nextLambdaId || 0}`;
+  const captureNames = [];
+  for (const token of targetTokens) {
+    if (token && token.kind === 'identifier') captureNames.push(token.text);
+  }
+  for (const argument of expression.arguments || []) {
+    identifierNamesFromExpression(argument, captureNames);
+  }
+  const captures = captureValuesForLambdaNames(context, captureNames);
+  const lambdaContext = {
+    ...context,
+    locals: [createJavaIrLocal('param:this', {
+      name: 'this',
+      descriptor: `L${owner};`,
+      slotHint: 0,
+    })],
+    localByName: new Map(),
+    fieldByName: fieldMapForCaptures(owner, captures),
+    methodOwnerInternalName: context.classInternalName,
+    classInternalName: owner,
+    className: owner.split('/').pop(),
+    outerClassInternalName: context.classInternalName,
+    outerMethodByName: context.methodByName,
+    outerThisFieldName: captures.some((capture) => capture.name === 'this') ? 'this$0' : null,
+    currentMethodIsStatic: false,
+    nextSlot: 1,
+    nextLocalId: 0,
+  };
+  const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, lambdaContext));
   if (!args.every(Boolean)) return null;
   const method = createJavaIrMethod({
     name: 'run',
     descriptor: '()V',
     access: ['public'],
     parameters: [],
-    locals: [createJavaIrLocal('param:this', {
-      name: 'this',
-      descriptor: 'Ljava/lang/Runnable;',
-      slotHint: 0,
-    })],
+    locals: lambdaContext.locals,
     blocks: [createJavaIrBlock('entry', {
       kind: 'EntryBlock',
       ops: [createJavaIrOp('println', {
@@ -2400,7 +2899,7 @@ function lowerRunnableLambdaToJavaIrValue(expression, context) {
     sourceNodeKind: 'LambdaExpression',
     meta: { synthetic: true },
   });
-  return createSyntheticLambdaClass(context, 'java/lang/Runnable', method);
+  return createSyntheticLambdaClass(context, 'java/lang/Runnable', method, captures, owner);
 }
 
 function lowerFunctionLambdaToJavaIrValue(expression, context) {
@@ -2455,6 +2954,8 @@ function lowerFunctionLambdaToJavaIrValue(expression, context) {
 }
 
 function lowerLambdaToJavaIrValue(expression, targetDescriptor, context) {
+  const anonymous = lowerAnonymousClassToJavaIrValue(expression, targetDescriptor, context);
+  if (anonymous) return anonymous;
   if (targetDescriptor === 'Ljava/lang/Runnable;') {
     return lowerRunnableLambdaToJavaIrValue(expression, context)
       || lowerRunnableBlockLambdaToJavaIrValue(expression, context);
@@ -2694,14 +3195,15 @@ function lowerSameClassMethodCall(expression, context) {
     return null;
   }
   const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
-  const method = selectUserMethodDescriptor(context.classInternalName, expression.name, rawArgs, context, null)
+  const owner = context.methodOwnerInternalName || context.classInternalName;
+  const method = selectUserMethodDescriptor(owner, expression.name, rawArgs, context, null)
     || context.methodByName.get(expression.name);
   const args = prepareMethodArguments(method, rawArgs);
   if (method.isStatic && args) {
     return {
       kind: 'MethodCallValue',
       type: method.returnDescriptor,
-      owner: context.classInternalName,
+      owner,
       name: method.name,
       descriptor: method.descriptor,
       invokeKind: 'static',
@@ -2712,13 +3214,13 @@ function lowerSameClassMethodCall(expression, context) {
     return {
       kind: 'MethodCallValue',
       type: method.returnDescriptor,
-      owner: context.classInternalName,
+      owner,
       name: method.name,
       descriptor: method.descriptor,
       invokeKind: 'virtual',
       receiver: {
         kind: 'LocalValue',
-        type: `L${context.classInternalName};`,
+        type: `L${owner};`,
         local: 'param:this',
         name: 'this',
       },
@@ -2901,6 +3403,25 @@ function lowerExpressionToJavaIrValue(expression, context) {
       && expression.target
       && expression.target.kind === 'UnsupportedExpression'
       && Array.isArray(expression.target.tokens)) {
+    const trailingOperator = expression.target.tokens.length > 1
+      ? tokenText(expression.target.tokens[expression.target.tokens.length - 1])
+      : null;
+    if (['+', '-', '*', '/', '%'].includes(trailingOperator)) {
+      const left = lowerTokenExpressionToJavaIrValue(expression.target.tokens.slice(0, -1), context);
+      const call = lowerSameClassMethodCall({ ...expression, target: null }, context)
+        || lowerKnownStaticMethodCall({ ...expression, target: null }, context);
+      const numericLeft = boxedPrimitiveValue(left) || left;
+      const numericRight = boxedPrimitiveValue(call) || call;
+      if (numericLeft && numericRight && numericLeft.type === numericRight.type && ['I', 'J', 'F', 'D'].includes(numericLeft.type)) {
+        return {
+          kind: 'BinaryValue',
+          type: numericLeft.type,
+          operator: trailingOperator,
+          left: numericLeft,
+          right: numericRight,
+        };
+      }
+    }
     if (expression.target.tokens.length === 3
         && expression.target.tokens[0].kind === 'identifier'
         && tokenText(expression.target.tokens[1]) === '.'
@@ -2921,6 +3442,7 @@ function lowerExpressionToJavaIrValue(expression, context) {
     }
     if (expression.target.tokens.length === 1 && tokenText(expression.target.tokens[0]) === 'new') {
       const owner = constructorOwnerFromName(expression.name, context);
+      const captureArgs = constructorCaptureArgs(owner, context);
       const args = (expression.arguments || []).map((argument) => {
         if (owner === 'java/lang/Thread') {
           const value = lowerLambdaToJavaIrValue(argument, 'Ljava/lang/Runnable;', context)
@@ -2929,13 +3451,16 @@ function lowerExpressionToJavaIrValue(expression, context) {
         }
         return lowerExpressionToJavaIrValue(argument, context);
       });
-      if (args.every(Boolean)) {
+      if (args.every(Boolean) && captureArgs.every(Boolean)) {
+        const constructorArgs = captureArgs.concat(args);
+        const method = methodDescriptorForConstructorCall(owner, constructorArgs, context);
+        const coercedArgs = prepareMethodArguments(method, constructorArgs) || constructorArgs;
         return {
           kind: 'NewObjectValue',
           type: `L${owner};`,
           owner,
-          descriptor: `(${args.map((arg) => arg.type).join('')})V`,
-          args,
+          descriptor: method.descriptor || `(${coercedArgs.map((arg) => arg.type).join('')})V`,
+          args: coercedArgs,
         };
       }
     }
@@ -3729,6 +4254,10 @@ function lowerStatementToJavaIrOps(statement, context) {
   if (statement.kind === 'BlockStatement') {
     return (statement.statements || []).flatMap((child) => lowerStatementToJavaIrOps(child, context));
   }
+  if (statement.kind === 'UnsupportedStatement' && statement.reason === 'local-type-declaration') {
+    const ops = lowerLocalClassDeclaration(statement, context);
+    if (ops) return ops;
+  }
   if (statement.kind === 'ReturnStatement') {
     return [createJavaIrOp('return', {
       value: statement.expression ? lowerExpressionToJavaIrValue(statement.expression, context) || { kind: statement.expression.kind } : null,
@@ -4458,6 +4987,7 @@ function createEnumDefaultConstructor(classContext) {
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
   const block = createJavaIrBlock('entry', {
     kind: 'EntryBlock',
@@ -4842,6 +5372,7 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     currentMethodIsStatic: modifierNames(method.modifiers).includes('static'),
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
   const isAbstract = classContext.isInterface || modifierNames(method.modifiers).includes('abstract');
   let ops = method.body && method.body.kind === 'BlockStatement'
@@ -4961,7 +5492,14 @@ function createInnerMemberDefaultConstructor(classContext) {
         args: [localValue(thisLocal)],
         sourceNodeKind: 'SyntheticInnerConstructor',
       }),
-    ],
+    ].concat((classContext.instanceFieldInitializers || []).map((fieldInit) => createJavaIrOp('putField', {
+      owner: classContext.classInternalName,
+      name: fieldInit.name,
+      descriptor: fieldInit.descriptor,
+      value: fieldInit.value,
+      args: [localValue(thisLocal)],
+      sourceNodeKind: 'SyntheticInnerConstructor',
+    }))),
     terminator: javaIrReturn(null),
   });
   return createJavaIrMethod({
@@ -5209,6 +5747,10 @@ function lowerAstToJavaIr(document, options = {}) {
       superName: classIr.superName,
       typeParameters: classTypeParameters,
       syntheticClasses,
+      instanceFieldInitializers: [],
+      constructorCaptureArgsByOwner: outerClassContext && outerClassContext.constructorCaptureArgsByOwner
+        ? outerClassContext.constructorCaptureArgsByOwner
+        : new Map(),
       allocateLambdaClassName() {
         const id = `${internalName}$Lambda${nextLambdaId}`;
         nextLambdaId += 1;
@@ -5223,9 +5765,6 @@ function lowerAstToJavaIr(document, options = {}) {
         access: ['final'],
         initializer: null,
       }));
-      if (![...methodByName.keys()].includes('<init>')) {
-        classIr.methods.push(createInnerMemberDefaultConstructor(classContext));
-      }
     }
     if (isEnum) {
       const enumDescriptor = `L${classIr.internalName};`;
@@ -5267,6 +5806,13 @@ function lowerAstToJavaIr(document, options = {}) {
               annotations: annotationsMeta(member.annotations, { classBySimpleName }),
             },
           }));
+          if (!modifierNames(member.modifiers).includes('static') && initializer && initializer.kind === 'LiteralValue') {
+            classContext.instanceFieldInitializers.push({
+              name: declarator.name,
+              descriptor: typeDescriptor(member.fieldType, classTypeContext),
+              value: initializer,
+            });
+          }
         }
       } else if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
         if (member.kind === 'ConstructorDeclaration') hasConstructor = true;
@@ -5288,6 +5834,8 @@ function lowerAstToJavaIr(document, options = {}) {
       else unsupported.push({ kind: 'EnumDeclaration', owner: declaration.name, reason: 'enum-static-initializer-merge-not-implemented' });
       classIr.methods.push(createEnumValuesMethod(classContext));
       classIr.methods.push(createEnumValueOfMethod(classContext));
+    } else if (isNonStaticMemberClass && !hasConstructor) {
+      classIr.methods.unshift(createInnerMemberDefaultConstructor(classContext));
     }
     classes.push(classIr);
   }

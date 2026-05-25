@@ -1,6 +1,9 @@
 module.exports = {
   super: 'java/lang/Object',
-  staticFields: {},
+  staticFields: {
+    'PI:D': Math.PI,
+    'E:D': Math.E,
+  },
   staticMethods: {
     'max(II)I': (jvm, obj, args) => {
       return Math.max(args[0], args[1]);

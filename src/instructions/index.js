@@ -20,6 +20,23 @@ const instructions = {
   ...conversions,
 };
 
+function expandWideInstruction(instruction) {
+  const parts = String(instruction && instruction.arg ? instruction.arg : '').trim().split(/\s+/).filter(Boolean);
+  const baseOp = parts[0];
+  if (!baseOp) return null;
+  if (baseOp === 'iinc') {
+    return {
+      op: 'iinc',
+      varnum: parts[1],
+      incr: parts[2],
+    };
+  }
+  return {
+    op: baseOp,
+    arg: parts[1],
+  };
+}
+
 module.exports = async function dispatch(frame, instruction, jvm, thread) {
   if (jvm.verbose) {
     const threadId = thread ? thread.id : 'main';
@@ -39,6 +56,16 @@ module.exports = async function dispatch(frame, instruction, jvm, thread) {
     console.log(`[${threadStates}] [thread:${threadId}, pc:${className}.${frame.method.name} ${pc}, stack:${stackSize}]`, instruction);
   }
   const op = typeof instruction === 'string' ? instruction : instruction.op;
+
+  if (op === 'wide') {
+    const expanded = expandWideInstruction(instruction);
+    const wideFunc = expanded && instructions[expanded.op];
+    if (!wideFunc) {
+      throw new Error(`Unknown or unimplemented wide instruction: ${instruction.arg}`);
+    }
+    await wideFunc(frame, expanded, jvm, thread);
+    return;
+  }
 
   const func = instructions[op];
   if (func) {
