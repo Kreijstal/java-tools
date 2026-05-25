@@ -232,15 +232,6 @@ function methodArgSlots(method) {
   return slots;
 }
 
-function buildLabelIndex(items) {
-  const out = new Map();
-  for (let i = 0; i < items.length; i += 1) {
-    const label = trimLabel(items[i] && items[i].labelDef);
-    if (label) out.set(label, i);
-  }
-  return out;
-}
-
 function loadIndexes(items, local) {
   const out = [];
   for (let i = 0; i < items.length; i += 1) {
@@ -308,6 +299,16 @@ function arg(item) {
 
 function trimLabel(label) {
   return typeof label === 'string' ? label.replace(/:$/, '') : null;
+}
+
+function buildLabelIndex(items) {
+  const index = new Map();
+  items.forEach((item, idx) => {
+    if (item && item.labelDef) {
+      index.set(trimLabel(item.labelDef), idx);
+    }
+  });
+  return index;
 }
 
 module.exports = {

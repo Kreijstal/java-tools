@@ -449,12 +449,12 @@ function collectHandlerLabels(exceptionTable) {
 }
 
 function buildLabelIndex(codeItems) {
-  const map = new Map();
+  const labels = new Map();
   for (let i = 0; i < codeItems.length; i++) {
     const item = codeItems[i];
-    if (item && item.labelDef) map.set(trimLabel(item.labelDef), i);
+    if (item && item.labelDef) labels.set(trimLabel(item.labelDef), i);
   }
-  return map;
+  return labels;
 }
 
 function findLabelIndex(codeItems, label) {

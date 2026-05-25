@@ -93,22 +93,6 @@ function aloadLocalOp(insn) {
   return null;
 }
 
-function buildLabelIndex(codeItems) {
-  const result = new Map();
-  codeItems.forEach((item, i) => {
-    if (item && item.labelDef) result.set(trimLabel(item.labelDef), i);
-  });
-  return result;
-}
-
-function buildPcIndex(codeItems) {
-  const result = new Map();
-  codeItems.forEach((item, i) => {
-    if (item && typeof item.pc === 'number') result.set(item.pc, i);
-  });
-  return result;
-}
-
 function buildHandlerStartIndexes(exceptionTable, labelIndex, pcIndex) {
   const result = new Set();
   for (const entry of exceptionTable) {
@@ -200,6 +184,26 @@ function pcFromLabel(label) {
   if (typeof label !== 'string') return null;
   const match = /^L(\d+)$/.exec(trimLabel(label));
   return match ? Number(match[1]) : null;
+}
+
+function buildLabelIndex(items) {
+  const index = new Map();
+  items.forEach((item, idx) => {
+    if (item && item.labelDef) {
+      index.set(trimLabel(item.labelDef), idx);
+    }
+  });
+  return index;
+}
+
+function buildPcIndex(items) {
+  const index = new Map();
+  items.forEach((item, idx) => {
+    if (item && typeof item.pc === 'number') {
+      index.set(item.pc, idx);
+    }
+  });
+  return index;
 }
 
 module.exports = { runRemoveShadowingTrivialRethrowHandlers, removeFromCode, isPureRethrowBlock };

@@ -89,7 +89,7 @@ function inlineInMethod(method) {
     items.splice(i, 1, ...replacements);
     labels.push(target);
     changed = true;
-    labelIndex = buildLabelIndex(items);
+    labelIndex = buildLabelIndex(codeAttr.code.codeItems);
     i += removed.length - 1;
   }
 
@@ -134,16 +134,6 @@ function computeLabelPredecessors(codeAttr) {
   });
 
   return refs;
-}
-
-function buildLabelIndex(codeItems) {
-  const index = new Map();
-  codeItems.forEach((item, idx) => {
-    if (item && item.labelDef) {
-      index.set(trimLabel(item.labelDef), idx);
-    }
-  });
-  return index;
 }
 
 function extractBlock(codeItems, startIdx) {
@@ -201,6 +191,16 @@ function gatherLabels(value, acc) {
 
 function trimLabel(label) {
   return label && label.endsWith(':') ? label.slice(0, -1) : label;
+}
+
+function buildLabelIndex(codeItems) {
+  const index = new Map();
+  codeItems.forEach((item, idx) => {
+    if (item && item.labelDef) {
+      index.set(trimLabel(item.labelDef), idx);
+    }
+  });
+  return index;
 }
 
 function buildExceptionCoverage(codeAttr) {
