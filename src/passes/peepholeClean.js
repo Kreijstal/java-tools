@@ -20,6 +20,7 @@ function runPeepholeClean(astRoot, options = {}) {
     loopProducerBridges: 0,
     duplicateLoopTails: 0,
     duplicateLoopIncrementTails: 0,
+    duplicateLoopBackedgeTails: 0,
     forwardLoopEntryClones: 0,
     conditionalForwardLoopEntryClones: 0,
     conditionalForwardTailClones: 0,
@@ -109,6 +110,7 @@ function runPeepholeClean(astRoot, options = {}) {
       cloneConditionalTerminalTails: options.cloneConditionalTerminalTails === true,
       cloneConditionalTerminalTailMaxInsns: options.cloneConditionalTerminalTailMaxInsns || 0,
       cloneConditionalTerminalTailMaxClones: options.cloneConditionalTerminalTailMaxClones || 1,
+      coalesceDuplicateLoopBackedgeTails: options.coalesceDuplicateLoopBackedgeTails === true,
     });
     tracePeepholeRound(i, round, roundStart);
     details.nops += round.nops;
@@ -120,6 +122,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.loopProducerBridges += round.loopProducerBridges;
     details.duplicateLoopTails += round.duplicateLoopTails;
     details.duplicateLoopIncrementTails += round.duplicateLoopIncrementTails;
+    details.duplicateLoopBackedgeTails += round.duplicateLoopBackedgeTails;
     details.forwardLoopEntryClones += round.forwardLoopEntryClones;
     details.conditionalForwardLoopEntryClones += round.conditionalForwardLoopEntryClones;
     details.conditionalForwardTailClones += round.conditionalForwardTailClones;
@@ -144,7 +147,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
     const roundChanges = round.nops + round.threadedBranches + round.protectedLoadBridges + round.monitorWaitRegions + round.nullCompareBranches + round.dupStoreCompareBranches + round.loopProducerBridges +
-      round.duplicateLoopTails + round.duplicateLoopIncrementTails +
+      round.duplicateLoopTails + round.duplicateLoopIncrementTails + round.duplicateLoopBackedgeTails +
       round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
@@ -194,6 +197,7 @@ function cleanOneRound(astRoot, options = {}) {
     loopProducerBridges: 0,
     duplicateLoopTails: 0,
     duplicateLoopIncrementTails: 0,
+    duplicateLoopBackedgeTails: 0,
     forwardLoopEntryClones: 0,
     conditionalForwardLoopEntryClones: 0,
     conditionalForwardTailClones: 0,
@@ -237,7 +241,11 @@ function cleanOneRound(astRoot, options = {}) {
       allowProtectedProducer: options.coalesceProtectedLoopProducerBridges,
     }));
     details.duplicateLoopTails += tracePeepholeStep(classItem, method, 'coalesceDuplicateLoopTails', () => coalesceDuplicateLoopTails(code));
-    details.duplicateLoopIncrementTails += tracePeepholeStep(classItem, method, 'coalesceDuplicateLoopIncrementTails', () => coalesceDuplicateLoopIncrementTails(code, passFacts()));
+    const duplicateLoopIncrementTails = tracePeepholeStep(classItem, method, 'coalesceDuplicateLoopIncrementTails', () => coalesceDuplicateLoopIncrementTails(code, passFacts()));
+    details.duplicateLoopIncrementTails += duplicateLoopIncrementTails;
+    if (options.coalesceDuplicateLoopBackedgeTails && duplicateLoopIncrementTails === 0) {
+      details.duplicateLoopBackedgeTails += tracePeepholeStep(classItem, method, 'coalesceDuplicateLoopBackedgeTails', () => coalesceDuplicateLoopBackedgeTails(code, passFacts()));
+    }
     details.forwardLoopEntryClones += tracePeepholeStep(classItem, method, 'cloneForwardLoopEntryGotos', () => cloneForwardLoopEntryGotos(code));
     details.conditionalForwardLoopEntryClones += tracePeepholeStep(classItem, method, 'cloneConditionalForwardLoopEntry', () => cloneConditionalForwardLoopEntry(code));
     if (options.cloneForwardTails) {
@@ -1232,6 +1240,73 @@ function coalesceDuplicateLoopIncrementTails(code, context = null) {
   return changed;
 }
 
+function coalesceDuplicateLoopBackedgeTails(code, context = null) {
+  const codeItems = code.codeItems;
+  const refsByLabel = context ? context.branchRefsByLabel() : collectBranchRefsByLabel(codeItems);
+  const labelIndex = context ? context.labelIndex() : buildLabelIndex(codeItems);
+  const groups = new Map();
+  let changed = 0;
+  const maxChanges = 80;
+
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const label = trimLabel(codeItems[i] && codeItems[i].labelDef);
+    if (!label || isLabelProtected(code, label)) continue;
+    const refs = refsByLabel.get(label) || [];
+    if (refs.length === 0) continue;
+    if (!refs.every((ref) => isBranchOpcode(opcodeMnemonic(ref.item && ref.item.instruction)))) continue;
+    const tail = readDuplicateBackedgeTail(code, codeItems, labelIndex, refsByLabel, i);
+    if (!tail) continue;
+    let group = groups.get(tail.signature);
+    if (!group) {
+      group = [];
+      groups.set(tail.signature, group);
+    }
+    group.push({ idx: i, label, refs, hasFallthrough: hasImmediateFallthroughPredecessor(codeItems, i) });
+  }
+
+  for (const group of groups.values()) {
+    if (changed >= maxChanges || group.length < 2) continue;
+    group.sort((a, b) => Number(b.hasFallthrough) - Number(a.hasFallthrough) || a.idx - b.idx);
+    const canonical = group[0];
+    for (const tail of group.slice(1)) {
+      if (changed >= maxChanges) break;
+      if (tail.hasFallthrough) continue;
+      if (!tail.refs.every((ref) => ref.idx !== tail.idx && isBranchOpcode(opcodeMnemonic(ref.item && ref.item.instruction)))) continue;
+      for (const ref of tail.refs) {
+        ref.item.instruction = setBranchArg(ref.item.instruction, canonical.label);
+      }
+      changed += 1;
+    }
+  }
+
+  if (changed > 0 && context && typeof context.invalidate === 'function') context.invalidate();
+  return changed;
+}
+
+function readDuplicateBackedgeTail(code, codeItems, labelIndex, refsByLabel, startIdx) {
+  if (readLoopValueContinuationBlock(codeItems, labelIndex, startIdx)) return null;
+  const signature = [];
+  let real = 0;
+  for (let i = startIdx; i < Math.min(codeItems.length, startIdx + 8); i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    const opcode = opcodeMnemonic(instruction);
+    if (!opcode) continue;
+    const label = trimLabel(codeItems[i] && codeItems[i].labelDef);
+    if (i > startIdx && label && (isLabelProtected(code, label) || (refsByLabel.get(label) || []).length > 0)) return null;
+    real += 1;
+    signature.push(instructionSignature(instruction));
+    if (opcode === 'goto') {
+      const target = trimLabel(getBranchArg(instruction));
+      const targetIdx = labelIndex.get(target);
+      if (targetIdx == null || targetIdx >= startIdx || real < 2) return null;
+      if (!looksLikeLoopHeader(codeItems, targetIdx)) return null;
+      return { end: i, signature: signature.join('|') };
+    }
+    if (real > 1 && isBranchOpcode(opcode)) return null;
+  }
+  return null;
+}
+
 function hasPotentialDuplicateLoopTail(codeItems) {
   for (let gotoIdx = 0; gotoIdx < codeItems.length; gotoIdx += 1) {
     const item = codeItems[gotoIdx];
@@ -1315,6 +1390,34 @@ function readIincInstruction(instruction) {
   }
   if (!Number.isFinite(local) || !Number.isFinite(incr)) return null;
   return { local, incr };
+}
+
+function instructionSignature(instruction) {
+  return JSON.stringify([opcodeMnemonic(instruction), normalizeSignatureValue(instructionSignatureArg(instruction))]);
+}
+
+function instructionSignatureArg(instruction) {
+  if (!instruction) return null;
+  if (typeof instruction === 'string') {
+    const parts = instruction.trim().split(/\s+/);
+    return parts.slice(1).join(' ') || null;
+  }
+  if (instruction.varnum !== undefined) return [instruction.varnum, instruction.incr];
+  return instruction.arg;
+}
+
+function normalizeSignatureValue(value) {
+  if (typeof value === 'bigint') return value.toString();
+  if (Array.isArray(value)) return value.map(normalizeSignatureValue);
+  if (value && typeof value === 'object') {
+    const out = {};
+    for (const [key, entry] of Object.entries(value)) {
+      if (key === 'pc' || key === 'cp_index') continue;
+      out[key] = normalizeSignatureValue(entry);
+    }
+    return out;
+  }
+  return value;
 }
 
 function instructionIndexAfterSequence(codeItems, startIdx, instructions) {
@@ -3194,6 +3297,7 @@ module.exports = {
   coalesceLoopProducerBridges,
   coalesceDuplicateLoopTails,
   coalesceDuplicateLoopIncrementTails,
+  coalesceDuplicateLoopBackedgeTails,
   cloneForwardLoopEntryGotos,
   cloneConditionalForwardLoopEntry,
   cloneConditionalForwardTailEntry,
