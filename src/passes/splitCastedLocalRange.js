@@ -52,15 +52,6 @@ function rewriteCode(code) {
   return rewrites;
 }
 
-function buildLabelIndex(items) {
-  const labels = new Map();
-  for (let i = 0; i < items.length; i += 1) {
-    const label = items[i] && items[i].labelDef;
-    if (typeof label === 'string') labels.set(label.replace(/:$/, ''), i);
-  }
-  return labels;
-}
-
 function firstBackwardBranchIntoRange(items, labels, start, end, storeIndex) {
   for (let i = start; i < end; i += 1) {
     const target = branchTarget(items[i]);
@@ -152,6 +143,20 @@ function op(item) {
 function arg(item) {
   const insn = item && item.instruction;
   return insn && typeof insn === 'object' ? insn.arg : null;
+}
+
+function trimLabel(label) {
+  return typeof label === 'string' ? label.replace(/:$/, '') : null;
+}
+
+function buildLabelIndex(items) {
+  const index = new Map();
+  items.forEach((item, idx) => {
+    if (item && item.labelDef) {
+      index.set(trimLabel(item.labelDef), idx);
+    }
+  });
+  return index;
 }
 
 module.exports = {

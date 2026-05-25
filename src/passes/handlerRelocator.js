@@ -41,16 +41,7 @@ function relocateInMethod(method) {
   const relocatedLabels = [];
   const processed = new Set();
 
-  const rebuildLabelIndex = () => {
-    const map = new Map();
-    codeAttr.code.codeItems.forEach((item, idx) => {
-      if (!item || !item.labelDef) return;
-      map.set(trimLabel(item.labelDef), idx);
-    });
-    return map;
-  };
-
-  let labelIndex = rebuildLabelIndex();
+  let labelIndex = buildLabelIndex(codeAttr.code.codeItems);
 
   const handlerLabels = exceptionTable
     .map((entry) => resolveHandlerLabel(entry, codeAttr.code.codeItems))
@@ -62,7 +53,7 @@ function relocateInMethod(method) {
     if (moveResult) {
       changed = true;
       relocatedLabels.push(label);
-      labelIndex = rebuildLabelIndex();
+      labelIndex = buildLabelIndex(codeAttr.code.codeItems);
     }
     processed.add(label);
   });
@@ -75,7 +66,7 @@ function relocateInMethod(method) {
 }
 
 function resolveHandlerLabel(entry, codeItems) {
-  if (entry.handlerLbl) return entry.handlerLbl;
+  if (entry.handlerLbl) return trimLabel(entry.handlerLbl);
   if (typeof entry.handler_pc === 'number') {
     for (const item of codeItems) {
       if (item && item.pc === entry.handler_pc && item.labelDef) {
@@ -84,7 +75,7 @@ function resolveHandlerLabel(entry, codeItems) {
     }
   }
   if (entry.handlerLbl == null && entry.handler_pc == null && entry.handlerLblName) {
-    return entry.handlerLblName;
+    return trimLabel(entry.handlerLblName);
   }
   return null;
 }
@@ -198,6 +189,16 @@ function removeFallthroughGotos(codeItems) {
       }
     }
   }
+}
+
+function buildLabelIndex(codeItems) {
+  const index = new Map();
+  codeItems.forEach((item, idx) => {
+    if (item && item.labelDef) {
+      index.set(trimLabel(item.labelDef), idx);
+    }
+  });
+  return index;
 }
 
 function trimLabel(label) {

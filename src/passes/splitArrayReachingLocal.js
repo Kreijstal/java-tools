@@ -519,15 +519,6 @@ function previousInstructionIndex(items, index) {
   return -1;
 }
 
-function buildLabelIndex(items) {
-  const labels = new Map();
-  for (let i = 0; i < items.length; i += 1) {
-    const label = trimLabel(items[i] && items[i].labelDef);
-    if (label) labels.set(label, i);
-  }
-  return labels;
-}
-
 function branchTargets(item) {
   const insn = item && item.instruction;
   if (!insn || typeof insn !== 'object') return [];
@@ -632,6 +623,16 @@ function arg(item) {
 
 function trimLabel(label) {
   return typeof label === 'string' ? label.replace(/:$/, '') : null;
+}
+
+function buildLabelIndex(items) {
+  const index = new Map();
+  items.forEach((item, idx) => {
+    if (item && item.labelDef) {
+      index.set(trimLabel(item.labelDef), idx);
+    }
+  });
+  return index;
 }
 
 module.exports = {

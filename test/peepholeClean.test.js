@@ -723,6 +723,117 @@ test('peephole clean clones shared forward terminal goto tail', (t) => {
   t.end();
 });
 
+test('peephole clean clones bounded terminal goto tail before bridge run', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'ifeq', arg: 'Lalt1' } },
+    { instruction: { op: 'goto', arg: 'Ltail' } },
+    { instruction: { op: 'ifne', arg: 'Lalt2' } },
+    { instruction: { op: 'goto', arg: 'Ltail' } },
+    { labelDef: 'Ltail:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lret' } },
+    { instruction: { op: 'goto', arg: 'Ltail' } },
+    { labelDef: 'Lret:', instruction: 'return' },
+    { labelDef: 'Lalt1:', instruction: 'iconst_0' },
+    { instruction: 'istore_2' },
+    { instruction: { op: 'goto', arg: 'Lafter' } },
+    { labelDef: 'Lalt2:', instruction: 'iconst_0' },
+    { instruction: 'istore_2' },
+    { instruction: { op: 'goto', arg: 'Lafter' } },
+    { labelDef: 'Lafter:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    cloneBoundedTerminalGotoTails: true,
+    cloneBoundedTerminalGotoTailMaxInsns: 20,
+    cloneBoundedTerminalGotoTailMaxClones: 2,
+  });
+  t.equal(result.details.boundedTerminalGotoTailClones, 2);
+  t.equal(code(ast).codeItems.filter((item) => /^Lbt\d+_0:$/.test(item.labelDef || '')).length, 2);
+  t.end();
+});
+
+test('peephole clean simplifies null object compare branches', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'aconst_null' },
+    { instruction: 'aload_2' },
+    { instruction: { op: 'if_acmpeq', arg: 'Ldone' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Ldone:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    simplifyNullCompareBranches: true,
+  });
+  const items = code(ast).codeItems;
+  t.equal(result.details.nullCompareBranches, 1);
+  t.deepEqual(items.slice(0, 2).map((item) => item.instruction), [
+    'aload_2',
+    { op: 'ifnull', arg: 'Ldone' },
+  ]);
+  t.end();
+});
+
+test('peephole clean clones single-use loop value continuations', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'aload_2' },
+    { instruction: { op: 'ifnull', arg: 'Ldone' } },
+    { instruction: 'aload_2' },
+    { instruction: { op: 'ifne', arg: 'Lnext' } },
+    { instruction: 'aload_2' },
+    { instruction: 'iconst_1' },
+    { instruction: 'putfield ag_t Z' },
+    { instruction: { op: 'goto', arg: 'Lcont' } },
+    { labelDef: 'Lnext:', instruction: 'aload_0' },
+    { instruction: 'getfield fg_v Lph;' },
+    { instruction: 'iconst_0' },
+    { instruction: 'invokevirtual ph.a (I)Lwf;' },
+    { instruction: 'checkcast ag' },
+    { instruction: 'astore_2' },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lcont:', instruction: 'aload_0' },
+    { instruction: 'getfield fg_v Lph;' },
+    { instruction: 'iconst_0' },
+    { instruction: 'invokevirtual ph.a (I)Lwf;' },
+    { instruction: 'checkcast ag' },
+    { instruction: 'astore_2' },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Ldone:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    cloneLoopValueContinuations: true,
+    cloneLoopValueContinuationMaxClones: 1,
+  });
+  t.equal(result.details.loopValueContinuationClones, 1);
+  t.notOk(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lcont'));
+  t.end();
+});
+
+test('peephole clean gates loop value continuations by loop-head local', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'aload_3' },
+    { instruction: { op: 'ifnull', arg: 'Ldone' } },
+    { instruction: { op: 'goto', arg: 'Lcont' } },
+    { labelDef: 'Lgap:', instruction: 'return' },
+    { labelDef: 'Lcont:', instruction: 'aload_0' },
+    { instruction: 'getfield fg_v Lph;' },
+    { instruction: 'iconst_0' },
+    { instruction: 'invokevirtual ph.a (I)Lwf;' },
+    { instruction: 'checkcast ag' },
+    { instruction: 'astore_2' },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Ldone:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    cloneLoopValueContinuations: true,
+    cloneLoopValueContinuationMaxClones: 1,
+  });
+  t.equal(result.details.loopValueContinuationClones, 0);
+  t.ok(code(ast).codeItems.some((item) => item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lcont'));
+  t.end();
+});
+
 test('peephole clean clones shared forward conditional terminal tail', (t) => {
   const ast = astWith([
     { instruction: 'iload_1' },
@@ -811,6 +922,36 @@ test('peephole clean can clone lcmp conditional shared joins', (t) => {
   t.ok(branch.instruction.arg !== 'Join');
   const clone = code(ast).codeItems.find((item) => item && item.labelDef === `${branch.instruction.arg}:`);
   t.ok(clone, 'branch points at cloned join');
+  t.end();
+});
+
+test('peephole clean clones small pure forward shared joins', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'Join' } },
+    { instruction: { op: 'goto', arg: 'After' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifne', arg: 'Join' } },
+    { instruction: { op: 'goto', arg: 'After' } },
+    { labelDef: 'Join:', instruction: { op: 'aload', arg: '3' } },
+    { instruction: { op: 'iload', arg: '4' } },
+    { instruction: 'aaload' },
+    { instruction: { op: 'astore', arg: '5' } },
+    { labelDef: 'After:', instruction: { op: 'aload', arg: '5' } },
+    { instruction: 'pop' },
+    { instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, {
+    cloneSharedPureForwardJoins: true,
+    cloneSharedPureForwardJoinMaxInsns: 4,
+  });
+  t.ok(result.changed);
+  t.equal(result.details.sharedPureForwardJoinClones, 2);
+  const refs = code(ast).codeItems
+    .filter((item) => item && item.instruction && /^if/.test(item.instruction.op || ''))
+    .map((item) => item.instruction.arg);
+  t.notOk(refs.includes('Join'), 'conditional refs retarget cloned joins');
   t.end();
 });
 
