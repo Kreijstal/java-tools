@@ -504,6 +504,50 @@ test('peephole clean coalesces duplicate labeled loop increment tails', (t) => {
   t.end();
 });
 
+test('peephole clean coalesces duplicate loop backedge tails', (t) => {
+  const call = ['Method', 'ad', ['a', '(ILnk;I)V']];
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'iload_1' },
+    { instruction: { op: 'ifge', arg: 'Lend' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifeq', arg: 'LtailA' } },
+    { instruction: 'iload_3' },
+    { instruction: { op: 'ifeq', arg: 'LtailB' } },
+    { instruction: { op: 'goto', arg: 'LtailC' } },
+    { labelDef: 'LtailA:', instruction: { op: 'iload', arg: '1' } },
+    { instruction: 'aconst_null' },
+    { instruction: { op: 'bipush', arg: '33' } },
+    { instruction: { op: 'invokestatic', arg: call } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'LtailB:', instruction: { op: 'iload', arg: '1' } },
+    { instruction: 'aconst_null' },
+    { instruction: { op: 'bipush', arg: '33' } },
+    { instruction: { op: 'invokestatic', arg: call } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'LtailC:', instruction: { op: 'iload', arg: '1' } },
+    { instruction: 'aconst_null' },
+    { instruction: { op: 'bipush', arg: '33' } },
+    { instruction: { op: 'invokestatic', arg: call } },
+    { instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { coalesceDuplicateLoopBackedgeTails: true });
+  t.ok(result.changed);
+  t.equal(result.details.duplicateLoopBackedgeTails, 2);
+  const refs = code(ast).codeItems
+    .map((item) => item && item.instruction)
+    .filter((insn) => insn && /^if|goto/.test(typeof insn === 'string' ? insn : insn.op))
+    .map((insn) => (typeof insn === 'string' ? insn.split(/\s+/)[1] : insn.arg));
+  t.equal(refs.filter((label) => label === 'LtailA').length, 3);
+  t.equal(refs.includes('LtailB'), false);
+  t.equal(refs.includes('LtailC'), false);
+  t.end();
+});
+
 test('peephole clean clones conditional forward entry into loop with skip arm', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iload_1' },
