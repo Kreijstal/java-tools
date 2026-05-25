@@ -7,6 +7,7 @@ const File = require('../src/jre/java/io/File');
 const HashMap = require('../src/jre/java/util/HashMap');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
 const Matcher = require('../src/jre/java/util/regex/Matcher');
+const StringClass = require('../src/jre/java/lang/String');
 
 function jvmStub() {
   return {
@@ -45,6 +46,21 @@ test('HashMap.computeIfAbsent does not record null mapping results', (t) => {
   t.equal(value, null);
   t.equal(HashMap.methods['containsKey(Ljava/lang/Object;)Z'](null, map, ['k']), 0);
   t.equal(HashMap.methods['size()I'](null, map, []), 0);
+  t.end();
+});
+
+test('String.format supports javac varargs object array hex formatting', (t) => {
+  const jvm = jvmStub();
+  const result = StringClass.staticMethods['format(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;'](jvm, null, [
+    jvm.internString('#%02x%02x%02x'),
+    [
+      { type: 'java/lang/Integer', value: 255 },
+      { type: 'java/lang/Integer', value: 0 },
+      { type: 'java/lang/Integer', value: 0 },
+    ],
+  ]);
+
+  t.equal(result.toString(), '#ff0000');
   t.end();
 });
 
