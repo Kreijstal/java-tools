@@ -53,7 +53,7 @@ function removeFromMethod(method, options = {}) {
       continue;
     }
     const block = getLabelBlock(code.codeItems, labelIndex, handlerLabel);
-    if (!block || !isBareAthrowBlock(block.items)) {
+    if (!block || !isPureRethrowBlock(block.items)) {
       continue;
     }
     if (hasNormalReferencesToLabel(code.codeItems, handlerLabel, block.startIndex, block.endIndex)) {
@@ -84,7 +84,7 @@ function removeFromMethod(method, options = {}) {
 
   code.exceptionTable = filtered;
   if (options.removeHandlerCode !== false) {
-    removeDeadAthrowInstructions(code.codeItems, removableBlocks);
+    removeDeadHandlerInstructions(code.codeItems, removableBlocks);
   }
   const removedGotos = options.removeHandlerCode === false ? 0 : removeFallthroughGotos(code.codeItems);
   return { changed: filtered.length !== exceptionTable.length || removedGotos > 0, removals };
@@ -141,27 +141,31 @@ function getLabelBlock(codeItems, labelIndex, label) {
   };
 }
 
-function isBareAthrowBlock(items) {
-  let athrowCount = 0;
+function isPureRethrowBlock(items) {
+  const ops = [];
   for (const item of items) {
     if (!item || !item.instruction) {
       continue;
     }
-    const opcode = getOpcode(item.instruction);
-    if (opcode !== 'athrow') {
-      return false;
-    }
-    athrowCount += 1;
+    ops.push({ op: getOpcode(item.instruction), arg: getInstructionArg(item.instruction) });
   }
-  return athrowCount === 1;
+  if (ops.length === 1 && ops[0].op === 'athrow') {
+    return true;
+  }
+  if (ops.length !== 3 || ops[2].op !== 'athrow') {
+    return false;
+  }
+  const stored = astoreLocal(ops[0]);
+  const loaded = aloadLocal(ops[1]);
+  return stored != null && stored === loaded;
 }
 
-function removeDeadAthrowInstructions(codeItems, removableBlocks) {
+function removeDeadHandlerInstructions(codeItems, removableBlocks) {
   const indexes = [];
   for (const block of removableBlocks.values()) {
     for (let i = block.startIndex; i < block.endIndex; i += 1) {
       const item = codeItems[i];
-      if (item && item.instruction && getOpcode(item.instruction) === 'athrow') {
+      if (item && item.instruction) {
         indexes.push(i);
       }
     }
@@ -272,6 +276,39 @@ function getOpcode(instruction) {
     return instruction;
   }
   return instruction.op || null;
+}
+
+function getInstructionArg(instruction) {
+  if (!instruction || typeof instruction !== 'object') {
+    return null;
+  }
+  return instruction.arg == null ? null : instruction.arg;
+}
+
+function astoreLocal(op) {
+  if (!op) {
+    return null;
+  }
+  if (op.op === 'astore') {
+    return String(op.arg);
+  }
+  if (/^astore_[0-3]$/.test(op.op || '')) {
+    return op.op.slice(-1);
+  }
+  return null;
+}
+
+function aloadLocal(op) {
+  if (!op) {
+    return null;
+  }
+  if (op.op === 'aload') {
+    return String(op.arg);
+  }
+  if (/^aload_[0-3]$/.test(op.op || '')) {
+    return op.op.slice(-1);
+  }
+  return null;
 }
 
 function trimLabel(label) {

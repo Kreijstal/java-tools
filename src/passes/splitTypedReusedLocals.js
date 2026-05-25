@@ -37,6 +37,7 @@ function splitCodeOnce(code, options = {}) {
   if (items.length > (options.maxMethodItems || 10000)) return 0;
   const cfg = buildCfg(code);
   if (!cfg.blocks.length) return 0;
+  if (options.requireSimpleReferenceReuseTopology && hasRiskyReferenceReuseTopology(code)) return 0;
   const analysis = reachingDefinitions(code, cfg);
   let candidates = collectCandidates(code, analysis, options);
   const maxCandidates = options.maxCandidates || 64;
@@ -74,6 +75,51 @@ function splitCodeOnce(code, options = {}) {
     rewrites += 1;
   }
   return rewrites;
+}
+
+function hasRiskyReferenceReuseTopology(code) {
+  const items = code.codeItems || [];
+  const labels = new Map();
+  for (let i = 0; i < items.length; i += 1) {
+    const label = trimLabel(items[i] && items[i].labelDef);
+    if (label) labels.set(label, i);
+  }
+
+  const refs = new Map();
+  let branchCount = 0;
+  let backwardBranches = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    const target = branchTarget(items[i]);
+    const label = trimLabel(target);
+    if (!label) continue;
+    branchCount += 1;
+    const targetIndex = labels.get(label);
+    if (targetIndex != null && targetIndex < i) backwardBranches += 1;
+    let incoming = refs.get(label);
+    if (!incoming) {
+      incoming = [];
+      refs.set(label, incoming);
+    }
+    incoming.push(i);
+  }
+
+  let sharedLabels = 0;
+  let fallthroughSharedLabels = 0;
+  let highlySharedLabels = 0;
+  for (const [label, incoming] of refs.entries()) {
+    if (incoming.length < 2) continue;
+    sharedLabels += 1;
+    if (incoming.length >= 6) highlySharedLabels += 1;
+    const targetIndex = labels.get(label);
+    if (targetIndex != null && hasFallthroughPredecessor(items, targetIndex)) {
+      fallthroughSharedLabels += 1;
+    }
+  }
+
+  if (branchCount >= 80 && sharedLabels >= 10 && fallthroughSharedLabels >= 2) return true;
+  if (branchCount >= 120 && highlySharedLabels >= 2) return true;
+  if (backwardBranches >= 12 && sharedLabels >= 8 && fallthroughSharedLabels >= 1) return true;
+  return false;
 }
 
 function collectCandidates(code, analysis, options) {

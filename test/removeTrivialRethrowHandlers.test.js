@@ -89,3 +89,24 @@ test('removeTrivialRethrowHandlers can keep handler code as a CFR-friendly senti
   t.deepEqual(ops, ['goto', 'athrow', 'return'], 'handler athrow remains in the instruction stream');
   t.end();
 });
+
+test('removeTrivialRethrowHandlers removes store/load/athrow rethrow handlers', (t) => {
+  const ast = createTrapAst();
+  const code = ast.classes[0].items[0].method.attributes[0].code;
+  code.codeItems.splice(1, 1,
+    { pc: 1, labelDef: 'L1:', instruction: 'astore_2' },
+    { pc: 2, instruction: 'aload_2' },
+    { pc: 3, instruction: 'athrow' },
+  );
+
+  const removal = removeTrivialRethrowHandlers(ast);
+  t.ok(removal.changed, 'store/load/athrow handler should be removed');
+  t.equal(code.exceptionTable.length, 0, 'exception table is now empty');
+
+  const ops = code.codeItems
+    .map((item) => item.instruction)
+    .filter(Boolean)
+    .map((instruction) => (typeof instruction === 'string' ? instruction : instruction.op));
+  t.deepEqual(ops, ['goto', 'return'], 'dead rethrow instructions are gone');
+  t.end();
+});

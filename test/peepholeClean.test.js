@@ -438,6 +438,37 @@ test('peephole clean removes unreachable labelled code before used label when en
   t.end();
 });
 
+test('peephole clean restores stripped pc labels that remain branch targets', (t) => {
+  const ast = astWith([
+    { pc: 0, instruction: 'iload_0' },
+    { pc: 1, instruction: { op: 'ifeq', arg: 'L10' } },
+    { pc: 4, instruction: 'return' },
+    { pc: 10, instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.restoredPcTargetLabels, 1);
+  t.equal(code(ast).codeItems[3].labelDef, 'L10:');
+  t.end();
+});
+
+test('peephole clean retargets stripped pc labels to an existing label at the same pc', (t) => {
+  const ast = astWith([
+    { pc: 0, instruction: 'iload_0' },
+    { pc: 1, instruction: { op: 'ifeq', arg: 'L10' } },
+    { pc: 4, instruction: 'return' },
+    { pc: 10, labelDef: 'Llive:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.ok(result.changed);
+  t.equal(result.details.restoredPcTargetLabels, 1);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L10' });
+  t.equal(code(ast).codeItems[3].labelDef, 'L10:');
+  t.end();
+});
+
 test('peephole clean keeps reachable labelled code after terminal instructions', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iload_1' },

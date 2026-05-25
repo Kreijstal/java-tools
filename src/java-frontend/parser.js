@@ -172,6 +172,54 @@ function trimTokens(tokens) {
   return tokens.filter(Boolean);
 }
 
+const NON_TYPE_OPERATOR_TOKENS = new Set([
+  '+', '-', '*', '/', '%', '=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
+  '<<=', '>>=', '>>>=', '++', '--', '!', '~', '&&', '||', '==', '!=', '<=',
+  '>=', '->', '::', ':',
+]);
+
+function tokensCouldBeType(tokens) {
+  const normalized = trimTokens(tokens || []);
+  if (normalized.length === 0) {
+    return false;
+  }
+  let angleDepth = 0;
+  for (let i = 0; i < normalized.length; i += 1) {
+    const token = normalized[i];
+    const text = token.text;
+    if (NON_TYPE_OPERATOR_TOKENS.has(text)) {
+      return false;
+    }
+    if (text === '<') {
+      angleDepth += 1;
+      continue;
+    }
+    const closeCount = angleCloseCount(text);
+    if (closeCount) {
+      angleDepth = Math.max(0, angleDepth - closeCount);
+      continue;
+    }
+    if (text === '[') {
+      if (!normalized[i + 1] || normalized[i + 1].text !== ']') {
+        return false;
+      }
+      i += 1;
+      continue;
+    }
+    if (text === ']') {
+      return false;
+    }
+    if (text === '.' || text === ',' || text === '?' || text === '&' || text === 'extends' || text === 'super') {
+      continue;
+    }
+    if (isNameToken(token) || PRIMITIVE_TYPES.has(text)) {
+      continue;
+    }
+    return false;
+  }
+  return angleDepth === 0;
+}
+
 class ParserImpl {
   constructor(source, options = {}) {
     this.source = translateUnicodeEscapes(source);
@@ -1086,7 +1134,7 @@ class ParserImpl {
     }
     const prefix = this.extractInlineModifiersAndAnnotations(parts[0]);
     const firstInfo = this.parseVariableDeclaratorPart(prefix.remaining, null);
-    if (!firstInfo || firstInfo.typeTokens.length === 0) {
+    if (!firstInfo || firstInfo.typeTokens.length === 0 || !tokensCouldBeType(firstInfo.typeTokens)) {
       return null;
     }
     const variableType = this.typeFromTokens(firstInfo.typeTokens);
