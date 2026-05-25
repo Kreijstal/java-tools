@@ -355,6 +355,39 @@ test('peephole clean does not thread shared goto bridges', (t) => {
   t.end();
 });
 
+test('peephole clean can thread multi-use goto bridges when enabled', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { instruction: { op: 'goto', arg: 'L1' } },
+    { labelDef: 'L1:', instruction: { op: 'goto', arg: 'L2' } },
+    { labelDef: 'L2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { threadMultiUseGotoBridges: true });
+  t.ok(result.changed);
+  t.equal(result.details.threadedMultiUseGotoBridges, 2);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L2' });
+  t.deepEqual(code(ast).codeItems[2].instruction, { op: 'goto', arg: 'L2' });
+  t.end();
+});
+
+test('peephole clean does not thread multi-use goto bridge with fallthrough', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'L1' } },
+    { labelDef: 'L1:', instruction: { op: 'goto', arg: 'L2' } },
+    { instruction: { op: 'goto', arg: 'L1' } },
+    { labelDef: 'L2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { threadMultiUseGotoBridges: true });
+  t.equal(result.details.threadedMultiUseGotoBridges, 0);
+  t.deepEqual(code(ast).codeItems[1].instruction, { op: 'ifeq', arg: 'L1' });
+  t.deepEqual(code(ast).codeItems[3].instruction, { op: 'goto', arg: 'L1' });
+  t.end();
+});
+
 test('peephole clean does not thread labels reached by fallthrough', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: 'iload_1' },
@@ -1027,6 +1060,91 @@ test('peephole clean clones small pure forward shared joins', (t) => {
     .filter((item) => item && item.instruction && /^if/.test(item.instruction.op || ''))
     .map((item) => item.instruction.arg);
   t.notOk(refs.includes('Join'), 'conditional refs retarget cloned joins');
+  t.end();
+});
+
+test('peephole clean clones shared side-effect forward joins when enabled', (t) => {
+  const println = ['Method', 'java/io/PrintStream', ['println', '(Ljava/lang/String;)V']];
+  const ast = astWith([
+    { instruction: { op: 'ifeq', arg: 'Join' } },
+    { instruction: { op: 'goto', arg: 'Join' } },
+    { instruction: 'return' },
+    { labelDef: 'Join:', instruction: 'iconst_1' },
+    { instruction: 'istore_1' },
+    { instruction: { op: 'getstatic', arg: ['Field', 'java/lang/System', ['out', 'Ljava/io/PrintStream;']] } },
+    { instruction: { op: 'ldc', arg: 'changed' } },
+    { instruction: { op: 'invokevirtual', arg: println } },
+    { labelDef: 'After:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneSharedSideEffectJoins: true });
+  t.ok(result.changed);
+  t.equal(result.details.sharedSideEffectJoinClones, 2);
+  const refs = code(ast).codeItems
+    .map((item) => item && item.instruction)
+    .filter((insn) => insn && /^(if|goto)/.test(typeof insn === 'string' ? insn : insn.op))
+    .map((insn) => (typeof insn === 'string' ? insn.split(/\s+/)[1] : insn.arg));
+  t.equal(refs.filter((label) => label === 'Join').length, 1, 'guard preserves original join');
+  t.equal(refs.filter((label) => label === 'After').length, 2);
+  t.end();
+});
+
+test('peephole clean does not clone shared side-effect joins reached by fallthrough', (t) => {
+  const println = ['Method', 'java/io/PrintStream', ['println', '(Ljava/lang/String;)V']];
+  const ast = astWith([
+    { instruction: { op: 'ifeq', arg: 'Join' } },
+    { labelDef: 'Join:', instruction: { op: 'getstatic', arg: ['Field', 'java/lang/System', ['out', 'Ljava/io/PrintStream;']] } },
+    { instruction: { op: 'ldc', arg: 'changed' } },
+    { instruction: { op: 'invokevirtual', arg: println } },
+    { instruction: { op: 'goto', arg: 'Join' } },
+    { labelDef: 'After:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneSharedSideEffectJoins: true });
+  t.equal(result.details.sharedSideEffectJoinClones, 0);
+  t.deepEqual(code(ast).codeItems[0].instruction, { op: 'ifeq', arg: 'Join' });
+  t.end();
+});
+
+test('peephole clean clones shared loop increment tails when enabled', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'ifeq', arg: 'Tail' } },
+    { instruction: { op: 'goto', arg: 'Tail' } },
+    { labelDef: 'Lcond:', instruction: 'iload_2' },
+    { instruction: { op: 'iflt', arg: 'Done' } },
+    { labelDef: 'Tail:', instruction: { op: 'iinc', varnum: '2', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lcond' } },
+    { labelDef: 'Done:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneSharedLoopIncrementTails: true });
+  t.ok(result.changed);
+  t.equal(result.details.sharedLoopIncrementTailClones, 2);
+  const refs = code(ast).codeItems
+    .map((item) => item && item.instruction)
+    .filter((insn) => insn && /^(if|goto)/.test(typeof insn === 'string' ? insn : insn.op))
+    .map((insn) => (typeof insn === 'string' ? insn.split(/\s+/)[1] : insn.arg));
+  t.equal(refs.filter((label) => label === 'Tail').length, 1, 'guard preserves original tail');
+  t.equal(refs.filter((label) => /^Lsit/.test(label)).length, 2, 'incoming branches retarget cloned tails');
+  t.end();
+});
+
+test('peephole clean clones branch into fallthrough loop increment tail', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'ifeq', arg: 'Tail' } },
+    { labelDef: 'Lcond:', instruction: 'iload_2' },
+    { instruction: { op: 'iflt', arg: 'Done' } },
+    { labelDef: 'Tail:', instruction: { op: 'iinc', varnum: '2', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lcond' } },
+    { labelDef: 'Done:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { cloneSharedLoopIncrementTails: true });
+  t.ok(result.changed);
+  t.equal(result.details.sharedLoopIncrementTailClones, 1);
+  t.match(code(ast).codeItems[0].instruction.arg, /^Lsit/);
+  const tailGuard = code(ast).codeItems.find((item) => item && item.peepholeGuard);
+  t.deepEqual(tailGuard && tailGuard.instruction, { op: 'goto', arg: 'Tail' });
   t.end();
 });
 
