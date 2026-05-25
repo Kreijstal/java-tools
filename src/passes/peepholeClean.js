@@ -19,6 +19,7 @@ function runPeepholeClean(astRoot, options = {}) {
     dupStoreCompareBranches: 0,
     loopProducerBridges: 0,
     duplicateLoopTails: 0,
+    duplicateLoopIncrementTails: 0,
     forwardLoopEntryClones: 0,
     conditionalForwardLoopEntryClones: 0,
     conditionalForwardTailClones: 0,
@@ -118,6 +119,7 @@ function runPeepholeClean(astRoot, options = {}) {
     details.dupStoreCompareBranches += round.dupStoreCompareBranches;
     details.loopProducerBridges += round.loopProducerBridges;
     details.duplicateLoopTails += round.duplicateLoopTails;
+    details.duplicateLoopIncrementTails += round.duplicateLoopIncrementTails;
     details.forwardLoopEntryClones += round.forwardLoopEntryClones;
     details.conditionalForwardLoopEntryClones += round.conditionalForwardLoopEntryClones;
     details.conditionalForwardTailClones += round.conditionalForwardTailClones;
@@ -142,7 +144,8 @@ function runPeepholeClean(astRoot, options = {}) {
     details.unreachableInstructions += round.unreachableInstructions;
     details.unusedLabels += round.unusedLabels;
     const roundChanges = round.nops + round.threadedBranches + round.protectedLoadBridges + round.monitorWaitRegions + round.nullCompareBranches + round.dupStoreCompareBranches + round.loopProducerBridges +
-      round.duplicateLoopTails + round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
+      round.duplicateLoopTails + round.duplicateLoopIncrementTails +
+      round.forwardLoopEntryClones + round.conditionalForwardLoopEntryClones +
       round.conditionalForwardTailClones + round.sharedFallthroughBlockClones +
       round.sharedFallthroughJoinClones +
       round.smallTerminalSharedBlockClones +
@@ -190,6 +193,7 @@ function cleanOneRound(astRoot, options = {}) {
     dupStoreCompareBranches: 0,
     loopProducerBridges: 0,
     duplicateLoopTails: 0,
+    duplicateLoopIncrementTails: 0,
     forwardLoopEntryClones: 0,
     conditionalForwardLoopEntryClones: 0,
     conditionalForwardTailClones: 0,
@@ -233,6 +237,7 @@ function cleanOneRound(astRoot, options = {}) {
       allowProtectedProducer: options.coalesceProtectedLoopProducerBridges,
     }));
     details.duplicateLoopTails += tracePeepholeStep(classItem, method, 'coalesceDuplicateLoopTails', () => coalesceDuplicateLoopTails(code));
+    details.duplicateLoopIncrementTails += tracePeepholeStep(classItem, method, 'coalesceDuplicateLoopIncrementTails', () => coalesceDuplicateLoopIncrementTails(code, passFacts()));
     details.forwardLoopEntryClones += tracePeepholeStep(classItem, method, 'cloneForwardLoopEntryGotos', () => cloneForwardLoopEntryGotos(code));
     details.conditionalForwardLoopEntryClones += tracePeepholeStep(classItem, method, 'cloneConditionalForwardLoopEntry', () => cloneConditionalForwardLoopEntry(code));
     if (options.cloneForwardTails) {
@@ -1176,6 +1181,57 @@ function coalesceDuplicateLoopTails(code, context = null) {
   return changed;
 }
 
+function coalesceDuplicateLoopIncrementTails(code, context = null) {
+  const codeItems = code.codeItems;
+  const labelIndex = context ? context.labelIndex() : buildLabelIndex(codeItems);
+  const refsByLabel = context ? context.branchRefsByLabel() : collectBranchRefsByLabel(codeItems);
+  const groups = new Map();
+  let changed = 0;
+  const maxChanges = 80;
+
+  for (let i = 0; i + 1 < codeItems.length; i += 1) {
+    const label = trimLabel(codeItems[i] && codeItems[i].labelDef);
+    if (!label || isLabelProtected(code, label)) continue;
+    const iinc = readIincInstruction(codeItems[i] && codeItems[i].instruction);
+    if (!iinc) continue;
+    const jump = codeItems[i + 1] && codeItems[i + 1].instruction;
+    if (opcodeMnemonic(jump) !== 'goto') continue;
+    const loopHead = trimLabel(getBranchArg(jump));
+    const loopHeadIdx = labelIndex.get(loopHead);
+    if (loopHeadIdx == null || loopHeadIdx >= i) continue;
+    if (!looksLikeLoopHeader(codeItems, loopHeadIdx)) continue;
+    const refs = refsByLabel.get(label) || [];
+    if (refs.length === 0) continue;
+    if (!refs.every((ref) => isBranchOpcode(opcodeMnemonic(ref.item && ref.item.instruction)))) continue;
+
+    const key = `${iinc.local}:${iinc.incr}->${loopHead}`;
+    let group = groups.get(key);
+    if (!group) {
+      group = [];
+      groups.set(key, group);
+    }
+    group.push({ idx: i, label, hasFallthrough: hasImmediateFallthroughPredecessor(codeItems, i), refs });
+  }
+
+  for (const group of groups.values()) {
+    if (changed >= maxChanges || group.length < 2) continue;
+    group.sort((a, b) => Number(b.hasFallthrough) - Number(a.hasFallthrough) || a.idx - b.idx);
+    const canonical = group[0];
+    for (const tail of group.slice(1)) {
+      if (changed >= maxChanges) break;
+      if (tail.hasFallthrough) continue;
+      if (!tail.refs.every((ref) => ref.idx !== tail.idx && isBranchOpcode(opcodeMnemonic(ref.item && ref.item.instruction)))) continue;
+      for (const ref of tail.refs) {
+        ref.item.instruction = setBranchArg(ref.item.instruction, canonical.label);
+      }
+      changed += 1;
+    }
+  }
+
+  if (changed > 0 && context && typeof context.invalidate === 'function') context.invalidate();
+  return changed;
+}
+
 function hasPotentialDuplicateLoopTail(codeItems) {
   for (let gotoIdx = 0; gotoIdx < codeItems.length; gotoIdx += 1) {
     const item = codeItems[gotoIdx];
@@ -1224,6 +1280,41 @@ function findDuplicateTail(code, codeItems, labelIndex, startSearch, loopHead, b
     return { label, gotoIdx };
   }
   return null;
+}
+
+function looksLikeLoopHeader(codeItems, idx) {
+  for (let i = idx; i < Math.min(codeItems.length, idx + 8); i += 1) {
+    if (isBranchOpcode(opcodeMnemonic(codeItems[i] && codeItems[i].instruction))) return true;
+  }
+  return false;
+}
+
+function hasImmediateFallthroughPredecessor(codeItems, idx) {
+  const prev = previousInstructionIndex(codeItems, idx - 1);
+  return prev != null && !isTerminalOpcode(opcodeMnemonic(codeItems[prev] && codeItems[prev].instruction));
+}
+
+function readIincInstruction(instruction) {
+  if (opcodeMnemonic(instruction) !== 'iinc') return null;
+  let local;
+  let incr;
+  if (instruction && typeof instruction === 'object' && instruction.varnum !== undefined) {
+    local = Number(instruction.varnum);
+    incr = Number(instruction.incr);
+  } else if (instruction && typeof instruction === 'object' && Array.isArray(instruction.arg)) {
+    local = Number(instruction.arg[0]);
+    incr = Number(instruction.arg[1]);
+  } else if (typeof instruction === 'string') {
+    const parts = instruction.trim().split(/\s+/);
+    local = Number(parts[1]);
+    incr = Number(parts[2]);
+  } else {
+    const parts = String(instruction && instruction.arg || '').split(/\s+/);
+    local = Number(parts[0]);
+    incr = Number(parts[1]);
+  }
+  if (!Number.isFinite(local) || !Number.isFinite(incr)) return null;
+  return { local, incr };
 }
 
 function instructionIndexAfterSequence(codeItems, startIdx, instructions) {
@@ -2001,7 +2092,7 @@ function collectBranchRefsToLabel(codeItems, label) {
   for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     if (!item || !item.instruction) continue;
-    const arg = getInstructionArg(item.instruction);
+    const arg = getBranchArg(item.instruction);
     if (typeof arg === 'string' && trimLabel(arg) === label) {
       out.push({ idx: i, item });
     }
@@ -2014,7 +2105,7 @@ function collectBranchRefsByLabel(codeItems) {
   for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     if (!item || !item.instruction) continue;
-    const arg = getInstructionArg(item.instruction);
+    const arg = getBranchArg(item.instruction);
     if (typeof arg !== 'string') continue;
     const label = trimLabel(arg);
     if (!label) continue;
@@ -3102,6 +3193,7 @@ module.exports = {
   normalizeDupStoreCompareBranches,
   coalesceLoopProducerBridges,
   coalesceDuplicateLoopTails,
+  coalesceDuplicateLoopIncrementTails,
   cloneForwardLoopEntryGotos,
   cloneConditionalForwardLoopEntry,
   cloneConditionalForwardTailEntry,
