@@ -46,6 +46,22 @@ public class RefArraySmoke {
 }
 `;
 
+const ARRAY_INITIALIZER_SMOKE_SOURCE = `
+public class ArrayInitializerSmoke {
+  public static void main(String[] args) {
+    byte[] bytes = {(byte)0xf3, (byte)0x48, (byte)0xcd};
+    int[] ints = new int[]{1, 2, 3};
+    Object obj = new int[]{4, 5};
+    int[] nullable = null;
+    System.out.println(bytes[0]);
+    System.out.println(bytes[1]);
+    System.out.println(ints[2]);
+    System.out.println(obj instanceof Object);
+    System.out.println(nullable == null);
+  }
+}
+`;
+
 const NARROW_PRIMITIVE_SMOKE_SOURCE = `
 public class NarrowPrimitiveSmoke {
   public static void main(String[] args) {
@@ -594,8 +610,12 @@ test('simple local arithmetic source files compile through IR', (t) => {
     ['sources/ExceptionTest.java', ['invokestatic', 'new', 'athrow', 'astore']],
     ['sources/FinallyTest.java', ['athrow', 'astore', 'aload']],
     ['sources/TryWithResourcesTest.java', ['invokevirtual', 'athrow', 'astore', 'aload']],
+    ['sources/MultiCatchTest.java', ['athrow', 'astore', 'aload']],
+    ['sources/JaggedArrayTest.java', ['anewarray', 'newarray', 'aaload', 'aastore', 'iaload', 'iastore']],
     ['sources/FizzBuzz.java', ['irem', 'if_icmpne', 'goto']],
     ['sources/ObjectCreationTest.java', ['putfield', 'getfield', 'invokevirtual']],
+    ['sources/ConstructorPrinter.java', ['new', 'invokespecial', 'return']],
+    ['sources/NestedClassPrivateAccessTest.java', ['getfield', 'putfield', 'invokevirtual']],
     ['sources/NewLambdaCrash.java', ['new', 'checkcast', 'invokeinterface']],
     ['sources/LambdaCrash.java', ['new', 'checkcast', 'invokeinterface']],
     ['sources/InvokeDynamicTest.java', ['ldc', 'invokeinterface']],
@@ -689,8 +709,10 @@ test('main args array length compiles through IR', (t) => {
 test('array load and store compile through IR', (t) => {
   const intResult = frontend.compileJavaSource(ARRAY_SMOKE_SOURCE, { sourceFileName: 'ArraySmoke.java' });
   const refResult = frontend.compileJavaSource(REF_ARRAY_SMOKE_SOURCE, { sourceFileName: 'RefArraySmoke.java' });
+  const initializerResult = frontend.compileJavaSource(ARRAY_INITIALIZER_SMOKE_SOURCE, { sourceFileName: 'ArrayInitializerSmoke.java' });
   const intOpcodes = intResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'main').instructions.map((instruction) => instruction.opcode);
   const refOpcodes = refResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'main').instructions.map((instruction) => instruction.opcode);
+  const initializerOpcodes = initializerResult.bytecodeIr.classes[0].methods.find((method) => method.name === 'main').instructions.map((instruction) => instruction.opcode);
 
   t.equal(intResult.bytecodeIr.status, 'complete', 'int array smoke compiles completely');
   t.ok(intOpcodes.includes('newarray'), 'int array creation is emitted');
@@ -700,6 +722,10 @@ test('array load and store compile through IR', (t) => {
   t.ok(refOpcodes.includes('anewarray'), 'reference array creation is emitted');
   t.ok(refOpcodes.includes('aastore'), 'reference array store is emitted');
   t.ok(refOpcodes.includes('aaload'), 'reference array load is emitted');
+  t.equal(initializerResult.bytecodeIr.status, 'complete', 'array initializer smoke compiles completely');
+  t.ok(initializerOpcodes.includes('bastore'), 'byte array initializer stores are emitted');
+  t.ok(initializerOpcodes.includes('iastore'), 'int array initializer stores are emitted');
+  t.ok(initializerOpcodes.includes('checkcast'), 'array-to-reference assignment coercion is emitted');
   t.end();
 });
 
@@ -916,8 +942,15 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     ['sources/DoubleComparisonTest.java', 'DoubleComparisonTest', expectedOutputForClass('DoubleComparisonTest')],
     ['sources/ExceptionTest.java', 'ExceptionTest', expectedOutputForClass('ExceptionTest')],
     ['sources/FinallyTest.java', 'FinallyTest', expectedOutputForClass('FinallyTest')],
+    ['sources/MultiCatchTest.java', 'MultiCatchTest', expectedOutputForClass('MultiCatchTest')],
+    ['sources/JaggedArrayTest.java', 'JaggedArrayTest', expectedOutputForClass('JaggedArrayTest')],
     ['sources/FizzBuzz.java', 'FizzBuzz', expectedOutputForClass('FizzBuzz')],
     ['sources/ObjectCreationTest.java', 'ObjectCreationTest', expectedOutputForClass('ObjectCreationTest')],
+    ['sources/ConstructorPrinter.java', 'ConstructorPrinter', expectedOutputForClass('ConstructorPrinter')],
+    ['sources/NestedClassPrivateAccessTest.java', 'NestedClassPrivateAccessTest', expectedOutputForClass('NestedClassPrivateAccessTest')],
+    ['sources/EnumTest.java', 'EnumTest', expectedOutputForClass('EnumTest')],
+    ['sources/EnumSwitchCrash.java', 'EnumSwitchCrash', expectedOutputForClass('EnumSwitchCrash')],
+    ['sources/EnumSwitchTest.java', 'EnumSwitchTest', expectedOutputForClass('EnumSwitchTest')],
     ['sources/NewLambdaCrash.java', 'NewLambdaCrash', expectedOutputForClass('NewLambdaCrash')],
     ['sources/LambdaCrash.java', 'LambdaCrash', expectedOutputForClass('LambdaCrash')],
     ['sources/InvokeDynamicTest.java', 'InvokeDynamicTest', expectedOutputForClass('InvokeDynamicTest')],
@@ -953,6 +986,10 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     frontend.compileJavaSource(REF_ARRAY_SMOKE_SOURCE, {
       outputDir,
       sourceFileName: 'RefArraySmoke.java',
+    });
+    frontend.compileJavaSource(ARRAY_INITIALIZER_SMOKE_SOURCE, {
+      outputDir,
+      sourceFileName: 'ArrayInitializerSmoke.java',
     });
     frontend.compileJavaSource(NARROW_PRIMITIVE_SMOKE_SOURCE, {
       outputDir,
@@ -1073,6 +1110,14 @@ test('IR-generated classes execute on the repo JVM', async (t) => {
     });
     t.ok(refArraySmoke.success, 'RefArraySmoke runs on repo JVM');
     t.equal(refArraySmoke.output.trim(), 'x', 'RefArraySmoke repo JVM output matches');
+
+    const arrayInitializerSmoke = await runTest('ArrayInitializerSmoke', '-13\n72\n3\ntrue\ntrue', null, {
+      classpath: outputDir,
+      timeout: 3000,
+      silent: true,
+    });
+    t.ok(arrayInitializerSmoke.success, 'ArrayInitializerSmoke runs on repo JVM');
+    t.equal(arrayInitializerSmoke.output.trim(), '-13\n72\n3\ntrue\ntrue', 'ArrayInitializerSmoke repo JVM output matches');
 
     const narrowPrimitiveSmoke = await runTest('NarrowPrimitiveSmoke', '-126\n32000\nA', null, {
       classpath: outputDir,

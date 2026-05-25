@@ -131,6 +131,17 @@ module.exports = {
       const charStr = String.fromCharCode(charCode);
       return jvm.internString(charStr);
     },
+    "format(Ljava/lang/String;III)Ljava/lang/String;": (jvm, obj, args) => {
+      let text = stringValue(args[0]);
+      const values = args.slice(1);
+      let index = 0;
+      text = text.replace(/%02x|%d|%s/g, (token) => {
+        const value = values[index++];
+        if (token === '%02x') return Number(value || 0).toString(16).padStart(2, '0');
+        return stringValue(value);
+      });
+      return jvm.internString(text);
+    },
   },
   methods: {
     "<init>()V": (jvm, obj, args) => {
