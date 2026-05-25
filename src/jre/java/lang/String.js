@@ -131,6 +131,11 @@ module.exports = {
       const charStr = String.fromCharCode(charCode);
       return jvm.internString(charStr);
     },
+    "join(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;": (jvm, obj, args) => {
+      const delimiter = stringValue(args[0]);
+      const elements = Array.isArray(args[1]) ? args[1] : [];
+      return jvm.internString(elements.map((element) => stringValue(element)).join(delimiter));
+    },
     "format(Ljava/lang/String;III)Ljava/lang/String;": (jvm, obj, args) => {
       let text = stringValue(args[0]);
       const values = args.slice(1);

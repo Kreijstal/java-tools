@@ -758,6 +758,33 @@ function buildBytecodeIr(document, options = {}) {
 }
 
 function formatInstruction(instruction, index) {
+  const localIndexOpcodes = new Set([
+    'iload', 'lload', 'fload', 'dload', 'aload',
+    'istore', 'lstore', 'fstore', 'dstore', 'astore',
+    'ret',
+  ]);
+  const operandsList = instruction.operands || [];
+  if (localIndexOpcodes.has(instruction.opcode) && operandsList.length === 1) {
+    const localIndex = Number(operandsList[0]);
+    if (Number.isInteger(localIndex) && localIndex > 0xff) {
+      const body = `wide ${instruction.opcode} ${localIndex}`;
+      if (instruction.label) return `${instruction.label}:     ${body}`;
+      if (typeof instruction.offset === 'number') return `L${instruction.offset}:     ${body}`;
+      return `L${index}:     ${body}`;
+    }
+  }
+  if (instruction.opcode === 'iinc' && operandsList.length >= 2) {
+    const localIndex = Number(operandsList[0]);
+    const increment = Number(operandsList[1]);
+    if (Number.isInteger(localIndex)
+        && Number.isInteger(increment)
+        && (localIndex > 0xff || increment < -128 || increment > 127)) {
+      const body = `wide iinc ${localIndex} ${increment}`;
+      if (instruction.label) return `${instruction.label}:     ${body}`;
+      if (typeof instruction.offset === 'number') return `L${instruction.offset}:     ${body}`;
+      return `L${index}:     ${body}`;
+    }
+  }
   const operands = instruction.opcode === 'invokeinterface' && instruction.count !== undefined
     ? (instruction.operands || []).concat([instruction.count]).join(' ')
     : (instruction.operands || []).join(' ');
