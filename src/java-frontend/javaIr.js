@@ -1,6 +1,9 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const ast = require('./ast');
+const { parseJava } = require('./parser');
 const { validateAstDocument } = require('./serialization');
 const {
   buildTypeParameterErasureMap,
@@ -9,10 +12,16 @@ const {
   typeDescriptor,
   typeSignature,
 } = require('./compiler');
+const {
+  jreClassInfo,
+  jreInternalNameForSimpleName,
+  jreMethodCandidates,
+} = require('./jreMetadata');
 
 const JAVA_IR_SCHEMA_ID = 'java-tools.java-frontend.java-ir';
 const JAVA_IR_SCHEMA_VERSION = 1;
 const JAVA_IR_AST_META_KEY = 'javaFrontendJavaIr';
+const SOURCE_METADATA_CACHE = new Map();
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype;
@@ -239,6 +248,169 @@ function chainParts(expression) {
   return [];
 }
 
+function isClassLikeDeclaration(declaration) {
+  return declaration
+    && ['ClassDeclaration', 'InterfaceDeclaration', 'AnnotationTypeDeclaration', 'EnumDeclaration'].includes(declaration.kind);
+}
+
+function resolveClassInternalNameFromParts(parts, context = {}) {
+  const normalized = (parts || []).filter(Boolean);
+  if (normalized.length === 0) return null;
+  const dotted = normalized.join('.');
+  if (context.classBySimpleName && context.classBySimpleName.has(dotted)) {
+    return context.classBySimpleName.get(dotted);
+  }
+  const last = normalized[normalized.length - 1];
+  if (context.classBySimpleName && context.classBySimpleName.has(last)) {
+    return context.classBySimpleName.get(last);
+  }
+  if (normalized.length === 1) return constructorOwnerFromName(normalized[0], context);
+  if (/^[A-Z]/.test(normalized[0])) return `${normalized[0]}$${normalized.slice(1).join('$')}`;
+  return normalized.join('/');
+}
+
+function addClassPreludeName(map, name, internalName) {
+  if (!name || !internalName || map.has(name)) return;
+  map.set(name, internalName);
+}
+
+function cloneNestedMap(map) {
+  const out = new Map();
+  for (const [key, value] of map || []) {
+    if (value instanceof Map) out.set(key, new Map(value));
+    else out.set(key, value);
+  }
+  return out;
+}
+
+function formalParameterDescriptor(parameter, context) {
+  const descriptor = typeDescriptor(parameter.parameterType, context);
+  return parameter.isVarargs ? `[${descriptor}` : descriptor;
+}
+
+function formalParameterSignature(parameter, context) {
+  const signature = typeSignature(parameter.parameterType, context);
+  return parameter.isVarargs ? `[${signature}` : signature;
+}
+
+function sourceDirectoryMetadata(sourcePath) {
+  if (!sourcePath) return null;
+  const directory = path.dirname(path.resolve(sourcePath));
+  if (SOURCE_METADATA_CACHE.has(directory)) return SOURCE_METADATA_CACHE.get(directory);
+  const metadata = {
+    classBySimpleName: new Map(),
+    classFieldsByInternalName: new Map(),
+    classMethodsByInternalName: new Map(),
+    classMethodOverloadsByInternalName: new Map(),
+  };
+  let files = [];
+  try {
+    files = fs.readdirSync(directory)
+      .filter((file) => file.endsWith('.java'))
+      .map((file) => path.join(directory, file));
+  } catch (_) {
+    SOURCE_METADATA_CACHE.set(directory, metadata);
+    return metadata;
+  }
+  const documents = [];
+  for (const file of files) {
+    try {
+      documents.push(parseJava(fs.readFileSync(file, 'utf8'), { sourceFileName: path.basename(file) }));
+    } catch (_) {
+      // The prelude is best-effort; the primary compilation path still reports real parse errors.
+    }
+  }
+  const internalNameByDeclaration = new Map();
+  function collectNames(document, declaration, outerInternalName = null) {
+    if (!isClassLikeDeclaration(declaration)) return;
+    const packageName = packageNameForDocument(document);
+    const internalName = outerInternalName
+      ? `${outerInternalName}$${declaration.name}`
+      : internalNameFromClassName(declaration.name, packageName);
+    internalNameByDeclaration.set(declaration, internalName);
+    addClassPreludeName(metadata.classBySimpleName, declaration.name, internalName);
+    addClassPreludeName(metadata.classBySimpleName, internalName.replace(/\$/g, '.').replace(/\//g, '.'), internalName);
+    for (const member of declaration.body || []) {
+      if (isClassLikeDeclaration(member)) collectNames(document, member, internalName);
+    }
+  }
+  for (const document of documents) {
+    for (const declaration of document.root.typeDeclarations || []) collectNames(document, declaration);
+  }
+  function documentImportMap(document) {
+    const map = new Map(metadata.classBySimpleName);
+    for (const importDeclaration of document.root.imports || []) {
+      if (importDeclaration.isStatic || importDeclaration.isWildcard) continue;
+      const parts = importDeclaration.name && importDeclaration.name.parts;
+      if (!Array.isArray(parts) || parts.length === 0) continue;
+      const internalName = parts.join('/');
+      map.set(parts[parts.length - 1], internalName);
+      map.set(parts.join('.'), internalName);
+    }
+    return map;
+  }
+  function collectMembers(document, declaration) {
+    if (!isClassLikeDeclaration(declaration)) return;
+    const internalName = internalNameByDeclaration.get(declaration);
+    const isInterface = declaration.kind === 'InterfaceDeclaration' || declaration.kind === 'AnnotationTypeDeclaration';
+    const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
+    const classBySimpleName = documentImportMap(document);
+    const classTypeContext = { typeParameters: classTypeParameters, classBySimpleName };
+    const fields = new Map();
+    const methods = new Map();
+    const overloads = new Map();
+    for (const member of declaration.body || []) {
+      if (member.kind === 'FieldDeclaration') {
+        for (const declarator of member.declarators || []) {
+          try {
+            fields.set(declarator.name, {
+              owner: internalName,
+              name: declarator.name,
+              descriptor: typeDescriptor(member.fieldType, classTypeContext),
+              signature: typeSignature(member.fieldType, classTypeContext),
+              isStatic: modifierNames(member.modifiers).includes('static'),
+            });
+          } catch (_) {}
+        }
+      }
+      if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
+        try {
+          const methodTypeParameters = buildTypeParameterErasureMap(member.typeParameters || [], classTypeParameters);
+          const descriptor = methodDescriptor(member, classTypeContext);
+          const parameterDescriptors = (member.parameters || []).map((parameter) => formalParameterDescriptor(parameter, {
+            typeParameters: methodTypeParameters,
+            classBySimpleName,
+          }));
+          const name = member.kind === 'ConstructorDeclaration' ? '<init>' : member.name;
+          const summary = {
+            name,
+            descriptor,
+            returnDescriptor: descriptor.slice(descriptor.indexOf(')') + 1),
+            parameterDescriptors,
+            isStatic: modifierNames(member.modifiers).includes('static'),
+            isVarargs: (member.parameters || []).some((parameter) => parameter.isVarargs),
+            invokeKind: isInterface && member.kind === 'MethodDeclaration' ? 'interface' : undefined,
+          };
+          methods.set(name, summary);
+          if (!overloads.has(name)) overloads.set(name, []);
+          overloads.get(name).push(summary);
+        } catch (_) {}
+      }
+    }
+    metadata.classFieldsByInternalName.set(internalName, fields);
+    metadata.classMethodsByInternalName.set(internalName, methods);
+    metadata.classMethodOverloadsByInternalName.set(internalName, overloads);
+    for (const member of declaration.body || []) {
+      if (isClassLikeDeclaration(member)) collectMembers(document, member);
+    }
+  }
+  for (const document of documents) {
+    for (const declaration of document.root.typeDeclarations || []) collectMembers(document, declaration);
+  }
+  SOURCE_METADATA_CACHE.set(directory, metadata);
+  return metadata;
+}
+
 function literalToJavaIrValue(expression) {
   if (!expression || expression.kind !== 'LiteralExpression') return null;
   if (expression.literalKind === 'string') {
@@ -297,6 +469,7 @@ function literalToJavaIrValue(expression) {
 function numericDescriptorFromRaw(raw) {
   const text = String(raw || '');
   if (/[lL]$/.test(text)) return 'J';
+  if (/^[+-]?0[xX][0-9a-fA-F_]+$/.test(text)) return 'I';
   if (/[fF]$/.test(text)) return 'F';
   if (/[dD]$/.test(text) || text.includes('.') || /[eE]/.test(text)) return 'D';
   return 'I';
@@ -304,6 +477,10 @@ function numericDescriptorFromRaw(raw) {
 
 function tokenText(token) {
   return token && typeof token.text === 'string' ? token.text : '';
+}
+
+function tokenTextJoined(tokens) {
+  return (tokens || []).map(tokenText).join(' ');
 }
 
 function trimParenTokens(tokens) {
@@ -356,6 +533,58 @@ function splitTopLevelByComma(tokens) {
   }
   parts.push(tokens.slice(start));
   return parts.filter((part) => part.length > 0);
+}
+
+function splitTopLevelByToken(tokens, separatorText) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const text = tokenText(tokens[i]);
+    if (text === '(' || text === '[' || text === '{') depth += 1;
+    else if (text === ')' || text === ']' || text === '}') depth -= 1;
+    else if (text === separatorText && depth === 0) {
+      parts.push(tokens.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(tokens.slice(start));
+  return parts;
+}
+
+function matchingTokenIndex(tokens, start, openText, closeText) {
+  if (tokenText(tokens[start]) !== openText) return -1;
+  let depth = 0;
+  for (let i = start; i < tokens.length; i += 1) {
+    const text = tokenText(tokens[i]);
+    if (text === openText) depth += 1;
+    else if (text === closeText) {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function findTopLevelConditional(tokens) {
+  let depth = 0;
+  let questionIndex = -1;
+  let conditionalDepth = 0;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const text = tokenText(tokens[i]);
+    if (text === '(' || text === '[' || text === '{') depth += 1;
+    else if (text === ')' || text === ']' || text === '}') depth -= 1;
+    else if (depth === 0 && text === '?') {
+      if (questionIndex === -1) questionIndex = i;
+      conditionalDepth += 1;
+    } else if (depth === 0 && text === ':' && conditionalDepth > 0) {
+      conditionalDepth -= 1;
+      if (conditionalDepth === 0 && questionIndex >= 0) {
+        return { questionIndex, colonIndex: i };
+      }
+    }
+  }
+  return null;
 }
 
 function splitTopLevelBySemicolon(tokens) {
@@ -423,6 +652,11 @@ function foldedStringConcatValue(parts) {
 }
 
 function constructorOwnerFromName(name, context) {
+  if (context && context.classBySimpleName && context.classBySimpleName.has(name)) {
+    return context.classBySimpleName.get(name);
+  }
+  const jreName = jreInternalNameForSimpleName(name);
+  if (jreName) return jreName;
   if ([
     'String',
     'Object',
@@ -433,6 +667,7 @@ function constructorOwnerFromName(name, context) {
     'Class',
     'Comparable',
     'ClassCastException',
+    'Enum',
     'Exception',
     'IllegalArgumentException',
     'InterruptedException',
@@ -470,9 +705,6 @@ function constructorOwnerFromName(name, context) {
   if (name === 'ReentrantLock') return 'java/util/concurrent/locks/ReentrantLock';
   if (name === 'Function') return 'java/util/function/Function';
   if (['Array', 'Field', 'Method', 'Modifier'].includes(name)) return `java/lang/reflect/${name}`;
-  if (context && context.classBySimpleName && context.classBySimpleName.has(name)) {
-    return context.classBySimpleName.get(name);
-  }
   if (name === context.className) return context.classInternalName;
   return String(name || '').replace(/\./g, '/');
 }
@@ -587,6 +819,27 @@ function classLiteralFromTokens(tokens, context) {
   if (tokenText(normalized[normalized.length - 2]) !== '.' || tokenText(normalized[normalized.length - 1]) !== 'class') return null;
   const typeTokens = normalized.slice(0, -2);
   if (typeTokens.length === 0) return null;
+  const dottedParts = [];
+  let dotted = true;
+  for (let index = 0; index < typeTokens.length; index += 1) {
+    if (index % 2 === 0) {
+      if (typeTokens[index].kind !== 'identifier') {
+        dotted = false;
+        break;
+      }
+      dottedParts.push(typeTokens[index].text);
+    } else if (tokenText(typeTokens[index]) !== '.') {
+      dotted = false;
+      break;
+    }
+  }
+  if (dotted && dottedParts.length > 1) {
+    return {
+      kind: 'ClassLiteralValue',
+      type: 'Ljava/lang/Class;',
+      className: resolveClassInternalNameFromParts(dottedParts, context),
+    };
+  }
   const baseName = tokenText(typeTokens[0]);
   const primitive = PRIMITIVE_DESCRIPTOR_BY_NAME[baseName];
   let descriptor = primitive || `L${constructorOwnerFromName(baseName, context)};`;
@@ -694,6 +947,179 @@ function literalTokenToJavaIrValue(token) {
   return null;
 }
 
+function conditionalValueDescriptor(consequent, alternate) {
+  if (!consequent || !alternate) return null;
+  if (consequent.type === alternate.type) return consequent.type;
+  if (consequent.literalKind === 'null' && (alternate.type.startsWith('L') || alternate.type.startsWith('['))) return alternate.type;
+  if (alternate.literalKind === 'null' && (consequent.type.startsWith('L') || consequent.type.startsWith('['))) return consequent.type;
+  if (['B', 'S', 'C', 'Z'].includes(consequent.type) && alternate.type === 'I') return 'I';
+  if (['B', 'S', 'C', 'Z'].includes(alternate.type) && consequent.type === 'I') return 'I';
+  if (['I', 'J', 'F', 'D'].includes(consequent.type) && consequent.type === alternate.type) return consequent.type;
+  if ((consequent.type.startsWith('L') || consequent.type.startsWith('['))
+      && (alternate.type.startsWith('L') || alternate.type.startsWith('['))) {
+    return 'Ljava/lang/Object;';
+  }
+  return null;
+}
+
+function lowerTokenPrimaryWithConsumed(tokens, context) {
+  const normalized = tokens || [];
+  if (normalized.length === 0) return null;
+  for (let end = Math.min(normalized.length, 8); end >= 3; end -= 1) {
+    const value = classLiteralFromTokens(normalized.slice(0, end), context);
+    if (value) return { value, next: end };
+  }
+  const literal = literalTokenToJavaIrValue(normalized[0]);
+  if (literal) return { value: literal, next: 1 };
+  if (normalized[0].kind === 'identifier' && context.localByName && context.localByName.has(normalized[0].text)) {
+    const local = context.localByName.get(normalized[0].text);
+    let current = localValue(local);
+    let currentType = local.descriptor;
+    let index = 1;
+    while (index < normalized.length && tokenText(normalized[index]) === '[') {
+      const closeIndex = matchingTokenIndex(normalized, index, '[', ']');
+      if (closeIndex < 0) return null;
+      const component = arrayComponentDescriptor(currentType);
+      const indexValue = lowerTokenExpressionToJavaIrValue(normalized.slice(index + 1, closeIndex), context);
+      if (!component || !indexValue || indexValue.type !== 'I') return null;
+      current = {
+        kind: 'ArrayLoadValue',
+        type: component,
+        array: current,
+        index: indexValue,
+      };
+      currentType = component;
+      index = closeIndex + 1;
+    }
+    return { value: current, next: index };
+  }
+  if (normalized.length >= 3
+      && normalized[0].kind === 'identifier'
+      && tokenText(normalized[1]) === '.'
+      && normalized[2].kind === 'identifier') {
+    const targetParts = [normalized[0].text];
+    const owner = resolveClassInternalNameFromParts(targetParts, context);
+    const name = normalized[2].text;
+    if (name === 'TYPE' && (primitiveDescriptorForWrapper(`L${owner};`) || owner === 'java/lang/Void')) {
+      return {
+        value: {
+          kind: 'StaticFieldValue',
+          type: 'Ljava/lang/Class;',
+          owner,
+          name,
+          descriptor: 'Ljava/lang/Class;',
+        },
+        next: 3,
+      };
+    }
+    const fields = owner && context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+    const field = fields && fields.get(name);
+    if (field && field.isStatic) {
+      return {
+        value: fieldValueForContext(field, { ...context, classInternalName: owner }),
+        next: 3,
+      };
+    }
+    const descriptor = STATIC_CONSTANT_FIELDS[`${owner}.${name}`];
+    if (descriptor) {
+      return {
+        value: {
+          kind: 'StaticFieldValue',
+          type: descriptor,
+          owner,
+          name,
+          descriptor,
+        },
+        next: 3,
+      };
+    }
+  }
+  return null;
+}
+
+function lowerTokenMemberChainToJavaIrValue(tokens, context) {
+  const normalized = trimParenTokens(tokens || []);
+  const primary = lowerTokenPrimaryWithConsumed(normalized, context);
+  if (!primary || primary.next >= normalized.length) return null;
+  let current = primary.value;
+  let index = primary.next;
+  while (index < normalized.length) {
+    if (tokenText(normalized[index]) !== '.' || !normalized[index + 1] || normalized[index + 1].kind !== 'identifier') return null;
+    const name = normalized[index + 1].text;
+    if (tokenText(normalized[index + 2]) === '(') {
+      const closeIndex = matchingTokenIndex(normalized, index + 2, '(', ')');
+      if (closeIndex < 0) return null;
+      const args = splitTopLevelByComma(normalized.slice(index + 3, closeIndex))
+        .map((part) => lowerTokenExpressionToJavaIrValue(part, context));
+      if (!args.every(Boolean)) return null;
+      const owner = internalNameFromDescriptor(current.type);
+      const method = methodDescriptorForInstanceCall(owner, name, args, context);
+      if (!method) return null;
+      current = {
+        kind: 'MethodCallValue',
+        type: method.returnDescriptor,
+        owner,
+        name,
+        descriptor: method.descriptor,
+        invokeKind: method.invokeKind || 'virtual',
+        receiver: current,
+        args: prepareMethodArguments(method, args) || args,
+      };
+      index = closeIndex + 1;
+      continue;
+    }
+    if (name === 'length' && typeof current.type === 'string' && current.type.startsWith('[')) {
+      current = {
+        kind: 'ArrayLengthValue',
+        type: 'I',
+        array: current,
+      };
+      index += 2;
+      continue;
+    }
+    return null;
+  }
+  return current;
+}
+
+function lowerTokenStaticMethodCallToJavaIrValue(tokens, context) {
+  const normalized = trimParenTokens(tokens || []);
+  if (normalized.length < 5 || normalized[0].kind !== 'identifier' || tokenText(normalized[1]) !== '.') return null;
+  let openIndex = -1;
+  for (let index = 2; index < normalized.length; index += 1) {
+    if (tokenText(normalized[index]) === '(') {
+      openIndex = index;
+      break;
+    }
+  }
+  if (openIndex < 3 || normalized[openIndex - 1].kind !== 'identifier') return null;
+  const closeIndex = matchingTokenIndex(normalized, openIndex, '(', ')');
+  if (closeIndex !== normalized.length - 1) return null;
+  const owner = resolveClassInternalNameFromParts(
+    normalized.slice(0, openIndex - 1)
+      .filter((token) => token.kind === 'identifier')
+      .map((token) => token.text),
+    context,
+  );
+  if (!owner) return null;
+  const rawArgs = splitTopLevelByComma(normalized.slice(openIndex + 1, closeIndex))
+    .map((part) => lowerTokenExpressionToJavaIrValue(part, context));
+  if (!rawArgs.every(Boolean)) return null;
+  const method = selectJreMethodDescriptor(owner, normalized[openIndex - 1].text, rawArgs, true)
+    || selectUserMethodDescriptor(owner, normalized[openIndex - 1].text, rawArgs, context, true);
+  const args = prepareMethodArguments(method, rawArgs);
+  if (!method || !args) return null;
+  return {
+    kind: 'MethodCallValue',
+    type: method.returnDescriptor,
+    owner,
+    name: method.name || normalized[openIndex - 1].text,
+    descriptor: method.descriptor,
+    invokeKind: 'static',
+    args,
+  };
+}
+
 function lowerTokenExpressionToJavaIrValue(tokens, context) {
   const normalized = trimParenTokens(tokens || []);
   if (normalized.length === 0) return null;
@@ -713,13 +1139,35 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
     }
   }
 
+  const conditional = findTopLevelConditional(normalized);
+  if (conditional) {
+    const condition = lowerTokenExpressionToJavaIrValue(normalized.slice(0, conditional.questionIndex), context);
+    const consequentRaw = lowerTokenExpressionToJavaIrValue(normalized.slice(conditional.questionIndex + 1, conditional.colonIndex), context);
+    const alternateRaw = lowerTokenExpressionToJavaIrValue(normalized.slice(conditional.colonIndex + 1), context);
+    const descriptor = conditionalValueDescriptor(consequentRaw, alternateRaw);
+    const consequent = descriptor ? coerceValueToDescriptor(consequentRaw, descriptor) : null;
+    const alternate = descriptor ? coerceValueToDescriptor(alternateRaw, descriptor) : null;
+    if (condition && condition.type === 'Z' && consequent && alternate) {
+      return {
+        kind: 'ConditionalValue',
+        type: descriptor,
+        condition,
+        consequent,
+        alternate,
+      };
+    }
+    return null;
+  }
+
   const equalityIndex = tokenText(normalized[0]) === 'new'
     ? -1
     : findTopLevelOperator(normalized, ['==', '!=', '<=', '>=', '<', '>']);
   if (equalityIndex > 0) {
-    const left = lowerTokenExpressionToJavaIrValue(normalized.slice(0, equalityIndex), context);
-    const right = lowerTokenExpressionToJavaIrValue(normalized.slice(equalityIndex + 1), context);
+    let left = lowerTokenExpressionToJavaIrValue(normalized.slice(0, equalityIndex), context);
+    let right = lowerTokenExpressionToJavaIrValue(normalized.slice(equalityIndex + 1), context);
     const operator = tokenText(normalized[equalityIndex]);
+    if (left && right && left.literalKind === 'null') left = coerceValueToDescriptor(left, right.type);
+    if (left && right && right.literalKind === 'null') right = coerceValueToDescriptor(right, left.type);
     if (left && right && left.type === right.type) {
       if (typeof left.type === 'string' && (left.type.startsWith('L') || left.type.startsWith('[')) && operator !== '==' && operator !== '!=') {
         return null;
@@ -796,6 +1244,12 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
 
   const classLiteral = classLiteralFromTokens(normalized, context);
   if (classLiteral) return classLiteral;
+
+  const staticMethodCall = lowerTokenStaticMethodCallToJavaIrValue(normalized, context);
+  if (staticMethodCall) return staticMethodCall;
+
+  const memberChain = lowerTokenMemberChainToJavaIrValue(normalized, context);
+  if (memberChain) return memberChain;
 
   const bitwiseOrIndex = findTopLevelOperator(normalized, ['|']);
   if (bitwiseOrIndex > 0) {
@@ -984,6 +1438,91 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
       const field = context.fieldByName.get(token.text);
       return fieldValueForContext(field, context);
     }
+    if (token.kind === 'identifier' && context.outerFieldByName && context.outerFieldByName.has(token.text)) {
+      const field = context.outerFieldByName.get(token.text);
+      if (field.isStatic) return fieldValueForContext(field, context);
+      const receiver = outerThisValue(context);
+      if (receiver) {
+        return {
+          kind: 'FieldValue',
+          type: field.descriptor,
+          owner: field.owner,
+          name: field.name,
+          descriptor: field.descriptor,
+          receiver,
+        };
+      }
+    }
+  }
+  if (normalized.length === 3
+      && normalized[0].kind === 'identifier'
+      && tokenText(normalized[1]) === '.'
+      && normalized[2].kind === 'identifier'
+      && context.localByName.has(normalized[0].text)) {
+    const receiverLocal = context.localByName.get(normalized[0].text);
+    const owner = internalNameFromDescriptor(receiverLocal.descriptor);
+    const fields = context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+    const field = fields && fields.get(normalized[2].text);
+    if (field) {
+      return {
+        kind: 'FieldValue',
+        type: field.descriptor,
+        owner,
+        name: field.name,
+        descriptor: field.descriptor,
+        receiver: localValue(receiverLocal),
+      };
+    }
+    return {
+      kind: 'FieldValue',
+      type: 'Ljava/lang/Object;',
+      owner,
+      name: normalized[2].text,
+      descriptor: 'Ljava/lang/Object;',
+      receiver: localValue(receiverLocal),
+    };
+  }
+  if (normalized.length >= 3 && normalized.length % 2 === 1) {
+    const parts = [];
+    let dotted = true;
+    for (let index = 0; index < normalized.length; index += 1) {
+      if (index % 2 === 0) {
+        if (normalized[index].kind !== 'identifier') {
+          dotted = false;
+          break;
+        }
+        parts.push(normalized[index].text);
+      } else if (tokenText(normalized[index]) !== '.') {
+        dotted = false;
+        break;
+      }
+    }
+    if (dotted && parts.length >= 2) {
+      const owner = resolveClassInternalNameFromParts(parts.slice(0, -1), context);
+      const name = parts[parts.length - 1];
+      const fields = owner && context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+      const field = fields && fields.get(name);
+      if (field && field.isStatic) return fieldValueForContext(field, { ...context, classInternalName: owner });
+      if (name === 'TYPE' && (primitiveDescriptorForWrapper(`L${owner};`) || owner === 'java/lang/Void')) {
+        return {
+          kind: 'StaticFieldValue',
+          type: 'Ljava/lang/Class;',
+          owner,
+          name,
+          descriptor: 'Ljava/lang/Class;',
+        };
+      }
+      if (owner && /^[A-Z][A-Z0-9_]*$/.test(name)) {
+        const descriptor = `L${owner};`;
+        return {
+          kind: 'StaticFieldValue',
+          type: descriptor,
+          owner,
+          name,
+          descriptor,
+        };
+      }
+    }
   }
   if (tokenText(normalized[0]) === '{' && tokenText(normalized[normalized.length - 1]) === '}') {
     return {
@@ -998,13 +1537,13 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
     const local = context.localByName.get(normalized[0].text);
     let currentType = local.descriptor;
     while (index < normalized.length && tokenText(normalized[index]) === '[') {
-      const closeIndex = index + 2;
-      if (closeIndex >= normalized.length || tokenText(normalized[closeIndex]) !== ']') {
+      const closeIndex = matchingTokenIndex(normalized, index, '[', ']');
+      if (closeIndex === -1) {
         current = null;
         break;
       }
       const component = arrayComponentDescriptor(currentType);
-      const indexValue = lowerTokenExpressionToJavaIrValue([normalized[index + 1]], context);
+      const indexValue = lowerTokenExpressionToJavaIrValue(normalized.slice(index + 1, closeIndex), context);
       if (!component || !indexValue || indexValue.type !== 'I') {
         current = null;
         break;
@@ -1021,7 +1560,17 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
         index: indexValue,
       };
       currentType = component;
-      index += 3;
+      index = closeIndex + 1;
+    }
+    if (current
+        && index + 2 === normalized.length
+        && tokenText(normalized[index]) === '.'
+        && tokenText(normalized[index + 1]) === 'length') {
+      return {
+        kind: 'ArrayLengthValue',
+        type: 'I',
+        array: current,
+      };
     }
     if (current && index === normalized.length) return current;
   }
@@ -1069,11 +1618,10 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
     let dimensions = 0;
     let index = 2;
     while (index < normalized.length && tokenText(normalized[index]) === '[') {
-      const next = tokenText(normalized[index + 1]);
-      const closeIndex = next === ']' ? index + 1 : index + 2;
-      if (tokenText(normalized[closeIndex]) !== ']') break;
-      if (next !== ']') {
-        const count = lowerTokenExpressionToJavaIrValue([normalized[index + 1]], context);
+      const closeIndex = matchingTokenIndex(normalized, index, '[', ']');
+      if (closeIndex === -1) break;
+      if (closeIndex !== index + 1) {
+        const count = lowerTokenExpressionToJavaIrValue(normalized.slice(index + 1, closeIndex), context);
         if (!count || count.type !== 'I') return null;
         counts.push(count);
       }
@@ -1103,6 +1651,8 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
 }
 
 function methodDescriptorForInstanceCall(owner, name, args, context) {
+  const jreMethod = selectJreMethodDescriptor(owner, name, args, false);
+  if (jreMethod) return jreMethod;
   if (name === 'getClass' && args.length === 0 && typeof owner === 'string') {
     return { descriptor: '()Ljava/lang/Class;', returnDescriptor: 'Ljava/lang/Class;' };
   }
@@ -1144,11 +1694,10 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
     if (name === 'getSuperclass' && args.length === 0) return { descriptor: '()Ljava/lang/Class;', returnDescriptor: 'Ljava/lang/Class;' };
     if (name === 'getMethods' && args.length === 0) return { descriptor: '()[Ljava/lang/reflect/Method;', returnDescriptor: '[Ljava/lang/reflect/Method;' };
     if (name === 'getFields' && args.length === 0) return { descriptor: '()[Ljava/lang/reflect/Field;', returnDescriptor: '[Ljava/lang/reflect/Field;' };
-    if (name === 'getMethod' && args.length === 1 && args[0].type === 'Ljava/lang/String;') return { descriptor: '(Ljava/lang/String;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;' };
-    if (name === 'getMethod' && args.length === 2) return { descriptor: '(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;' };
+    if (name === 'getMethod' && args.length === 1 && args[0].type === 'Ljava/lang/String;') return { descriptor: '(Ljava/lang/String;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;', parameterDescriptors: ['Ljava/lang/String;'] };
+    if (name === 'getMethod' && args.length >= 2) return { descriptor: '(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;', parameterDescriptors: ['Ljava/lang/String;', '[Ljava/lang/Class;'], isVarargs: true };
     if (name === 'getDeclaredMethod' && args.length === 1 && args[0].type === 'Ljava/lang/String;') return { descriptor: '(Ljava/lang/String;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;' };
-    if (name === 'getDeclaredMethod' && args.length === 2 && args[1].type === 'Ljava/lang/Class;') return { descriptor: '(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;' };
-    if (name === 'getDeclaredMethod' && args.length === 2) return { descriptor: '(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;' };
+    if (name === 'getDeclaredMethod' && args.length >= 2) return { descriptor: '(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;', returnDescriptor: 'Ljava/lang/reflect/Method;', parameterDescriptors: ['Ljava/lang/String;', '[Ljava/lang/Class;'], isVarargs: true };
     if (name === 'getDeclaredField' && args.length === 1 && args[0].type === 'Ljava/lang/String;') return { descriptor: '(Ljava/lang/String;)Ljava/lang/reflect/Field;', returnDescriptor: 'Ljava/lang/reflect/Field;' };
     if (name === 'isAnnotationPresent' && args.length === 1 && args[0].type === 'Ljava/lang/Class;') return { descriptor: '(Ljava/lang/Class;)Z', returnDescriptor: 'Z' };
     if (name === 'getAnnotation' && args.length === 1 && args[0].type === 'Ljava/lang/Class;') return { descriptor: '(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;', returnDescriptor: 'Ljava/lang/annotation/Annotation;' };
@@ -1174,6 +1723,66 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
   if (owner === 'java/lang/Object') {
     if (name === 'getClass' && args.length === 0) return { descriptor: '()Ljava/lang/Class;', returnDescriptor: 'Ljava/lang/Class;' };
     if (name === 'toString' && args.length === 0) return { descriptor: '()Ljava/lang/String;', returnDescriptor: 'Ljava/lang/String;' };
+    if (name === 'equals' && args.length === 1) return { descriptor: '(Ljava/lang/Object;)Z', returnDescriptor: 'Z' };
+  }
+  if (typeof owner === 'string') {
+    if (name === 'getClass' && args.length === 0) return { descriptor: '()Ljava/lang/Class;', returnDescriptor: 'Ljava/lang/Class;' };
+    if (name === 'toString' && args.length === 0) return { descriptor: '()Ljava/lang/String;', returnDescriptor: 'Ljava/lang/String;' };
+    if (name === 'equals' && args.length === 1) return { descriptor: '(Ljava/lang/Object;)Z', returnDescriptor: 'Z' };
+  }
+  if (owner === 'java/lang/Comparable') {
+    if (name === 'compareTo' && args.length === 1) {
+      return {
+        descriptor: '(Ljava/lang/Object;)I',
+        returnDescriptor: 'I',
+        parameterDescriptors: ['Ljava/lang/Object;'],
+        invokeKind: 'interface',
+      };
+    }
+  }
+  if (owner === 'java/lang/Iterable') {
+    if (name === 'iterator' && args.length === 0) {
+      return {
+        descriptor: '()Ljava/util/Iterator;',
+        returnDescriptor: 'Ljava/util/Iterator;',
+        parameterDescriptors: [],
+        invokeKind: 'interface',
+      };
+    }
+  }
+  if (owner === 'java/util/Iterator') {
+    if (name === 'hasNext' && args.length === 0) {
+      return { descriptor: '()Z', returnDescriptor: 'Z', parameterDescriptors: [], invokeKind: 'interface' };
+    }
+    if (name === 'next' && args.length === 0) {
+      return { descriptor: '()Ljava/lang/Object;', returnDescriptor: 'Ljava/lang/Object;', parameterDescriptors: [], invokeKind: 'interface' };
+    }
+  }
+  if (owner === 'java/util/Collection' || owner === 'java/util/List') {
+    if (name === 'iterator' && args.length === 0) {
+      return {
+        descriptor: '()Ljava/util/Iterator;',
+        returnDescriptor: 'Ljava/util/Iterator;',
+        parameterDescriptors: [],
+        invokeKind: 'interface',
+      };
+    }
+    if (name === 'add' && args.length === 1) {
+      return {
+        descriptor: '(Ljava/lang/Object;)Z',
+        returnDescriptor: 'Z',
+        parameterDescriptors: ['Ljava/lang/Object;'],
+        invokeKind: 'interface',
+      };
+    }
+    if (name === 'get' && args.length === 1 && args[0].type === 'I') {
+      return {
+        descriptor: '(I)Ljava/lang/Object;',
+        returnDescriptor: 'Ljava/lang/Object;',
+        parameterDescriptors: ['I'],
+        invokeKind: 'interface',
+      };
+    }
   }
   if (owner === 'java/lang/Runnable') {
     if (name === 'run' && args.length === 0) return { descriptor: '()V', returnDescriptor: 'V', invokeKind: 'interface' };
@@ -1219,7 +1828,13 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
   }
   const overload = selectUserMethodDescriptor(owner, name, args, context, false);
   if (overload) {
-    return { descriptor: overload.descriptor, returnDescriptor: overload.returnDescriptor };
+    return {
+      descriptor: overload.descriptor,
+      returnDescriptor: overload.returnDescriptor,
+      parameterDescriptors: overload.parameterDescriptors,
+      invokeKind: overload.invokeKind,
+      isVarargs: overload.isVarargs,
+    };
   }
   if (owner === context.classInternalName && context.methodByName.has(name)) {
     const method = context.methodByName.get(name);
@@ -1232,7 +1847,13 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
     if (methods && methods.has(name)) {
       const method = methods.get(name);
       if (!method.isStatic && method.parameterDescriptors.length === args.length) {
-        return { descriptor: method.descriptor, returnDescriptor: method.returnDescriptor };
+        return {
+          descriptor: method.descriptor,
+          returnDescriptor: method.returnDescriptor,
+          parameterDescriptors: method.parameterDescriptors,
+          invokeKind: method.invokeKind,
+          isVarargs: method.isVarargs,
+        };
       }
     }
   }
@@ -1240,11 +1861,127 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
 }
 
 function methodMatchesArguments(method, args, isStatic = null) {
-  if (!method || !Array.isArray(method.parameterDescriptors) || method.parameterDescriptors.length !== args.length) {
+  if (!method || !Array.isArray(method.parameterDescriptors)) {
     return false;
   }
   if (isStatic !== null && Boolean(method.isStatic) !== isStatic) return false;
+  if (method.isVarargs) {
+    if (args.length < method.parameterDescriptors.length - 1) return false;
+    return Boolean(prepareMethodArguments(method, args));
+  }
+  if (method.parameterDescriptors.length !== args.length) return false;
   return args.every((arg, index) => arg && coerceValueToDescriptor(arg, method.parameterDescriptors[index]));
+}
+
+function prepareMethodArguments(method, args) {
+  if (!method || !Array.isArray(method.parameterDescriptors)) return null;
+  if (!method.isVarargs) {
+    if (args.length !== method.parameterDescriptors.length) return null;
+    const coerced = args.map((arg, index) => coerceValueToDescriptor(arg, method.parameterDescriptors[index]));
+    return coerced.every(Boolean) ? coerced : null;
+  }
+  const parameters = method.parameterDescriptors;
+  const fixedCount = parameters.length - 1;
+  if (args.length < fixedCount) return null;
+  const fixed = args.slice(0, fixedCount)
+    .map((arg, index) => coerceValueToDescriptor(arg, parameters[index]));
+  if (!fixed.every(Boolean)) return null;
+  const varargsDescriptor = parameters[parameters.length - 1];
+  if (!varargsDescriptor || !varargsDescriptor.startsWith('[')) return null;
+  if (args.length === parameters.length) {
+    const arg = args[fixedCount];
+    if (arg && (arg.type === varargsDescriptor || (typeof arg.type === 'string' && arg.type.startsWith('[')) || arg.literalKind === 'null')) {
+      const existingArray = coerceValueToDescriptor(arg, varargsDescriptor);
+      if (existingArray && existingArray.type === varargsDescriptor) return fixed.concat(existingArray);
+    }
+  }
+  const component = arrayComponentDescriptor(varargsDescriptor);
+  const elements = args.slice(fixedCount).map((arg) => coerceValueToDescriptor(arg, component));
+  if (!component || !elements.every(Boolean)) return null;
+  return fixed.concat({
+    kind: 'ArrayInitializerValue',
+    type: varargsDescriptor,
+    elements,
+  });
+}
+
+function parameterDescriptorsFromMethodDescriptor(descriptor) {
+  if (typeof descriptor !== 'string') return null;
+  const close = descriptor.indexOf(')');
+  if (!descriptor.startsWith('(') || close < 0) return null;
+  const descriptors = [];
+  let index = 1;
+  while (index < close) {
+    let dimensions = 0;
+    while (descriptor[index] === '[') {
+      dimensions += 1;
+      index += 1;
+    }
+    if (index >= close) return null;
+    const start = index;
+    if (descriptor[index] === 'L') {
+      const semi = descriptor.indexOf(';', index);
+      if (semi < 0 || semi > close) return null;
+      descriptors.push(`${'['.repeat(dimensions)}${descriptor.slice(start, semi + 1)}`);
+      index = semi + 1;
+    } else {
+      descriptors.push(`${'['.repeat(dimensions)}${descriptor[index]}`);
+      index += 1;
+    }
+  }
+  return descriptors;
+}
+
+function methodDescriptorMatchesArgs(descriptor, args) {
+  const parameters = parameterDescriptorsFromMethodDescriptor(descriptor);
+  if (!parameters || parameters.length !== args.length) return false;
+  return args.every((arg, index) => {
+    if (!arg) return false;
+    const parameter = parameters[index];
+    if (parameter.startsWith('[')
+        && typeof arg.type === 'string'
+        && arg.type.startsWith('L')
+        && arg.literalKind !== 'null') {
+      return false;
+    }
+    return coerceValueToDescriptor(arg, parameter);
+  });
+}
+
+function isJreVarargsMethod(owner, name, descriptor, isStatic) {
+  return Boolean(isStatic
+    && ((owner === 'java/lang/reflect/Array'
+      && name === 'newInstance'
+      && descriptor === '(Ljava/lang/Class;[I)Ljava/lang/Object;')
+    || (owner === 'java/util/Arrays'
+      && name === 'asList'
+      && descriptor === '([Ljava/lang/Object;)Ljava/util/List;')));
+}
+
+function selectJreMethodDescriptor(owner, name, args, isStatic) {
+  const candidates = jreMethodCandidates(owner, name, isStatic);
+  const candidatesWithParameters = candidates.map((candidate) => ({
+    ...candidate,
+    parameterDescriptors: parameterDescriptorsFromMethodDescriptor(candidate.descriptor),
+    isVarargs: isJreVarargsMethod(owner, name, candidate.descriptor, isStatic),
+  }));
+  const exact = candidates.find((candidate) => {
+    const parameters = parameterDescriptorsFromMethodDescriptor(candidate.descriptor);
+    return parameters && parameters.length === args.length
+      && args.every((arg, index) => arg && arg.type === parameters[index]);
+  });
+  const method = exact
+    || candidatesWithParameters.find((candidate) => methodMatchesArguments(candidate, args, isStatic))
+    || candidates.find((candidate) => methodDescriptorMatchesArgs(candidate.descriptor, args));
+  if (!method) return null;
+  return {
+    descriptor: method.descriptor,
+    returnDescriptor: method.returnDescriptor,
+    parameterDescriptors: method.parameterDescriptors || parameterDescriptorsFromMethodDescriptor(method.descriptor),
+    isStatic,
+    isVarargs: Boolean(method.isVarargs),
+    invokeKind: !isStatic && jreClassInfo(owner) && jreClassInfo(owner).isInterface ? 'interface' : undefined,
+  };
 }
 
 function selectUserMethodDescriptor(owner, name, args, context, isStatic = null) {
@@ -1283,6 +2020,18 @@ function thisReceiverValue(context) {
     type: `L${context.classInternalName};`,
     local: 'param:this',
     name: 'this',
+  };
+}
+
+function outerThisValue(context) {
+  if (!context.outerThisFieldName || !context.outerClassInternalName) return null;
+  return {
+    kind: 'FieldValue',
+    type: `L${context.outerClassInternalName};`,
+    owner: context.classInternalName,
+    name: context.outerThisFieldName,
+    descriptor: `L${context.outerClassInternalName};`,
+    receiver: thisReceiverValue(context),
   };
 }
 
@@ -1764,6 +2513,7 @@ function lowerInstanceMethodCall(expression, context, receiverOverride = null) {
   const owner = internalNameFromDescriptor(receiver.type);
   const method = methodDescriptorForInstanceCall(owner, expression.name, args, context);
   if (!method) return null;
+  const callArgs = prepareMethodArguments(method, args) || args;
   return {
     kind: 'MethodCallValue',
     type: method.returnDescriptor,
@@ -1772,7 +2522,28 @@ function lowerInstanceMethodCall(expression, context, receiverOverride = null) {
     descriptor: method.descriptor,
     invokeKind: method.invokeKind || 'virtual',
     receiver,
-    args,
+    args: callArgs,
+  };
+}
+
+function lowerStatementOnlyInstanceCall(expression, context) {
+  if (!expression || expression.kind !== 'MethodInvocationExpression' || !expression.target) return null;
+  const receiver = lowerExpressionToJavaIrValue(expression.target, context);
+  const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
+  if (!receiver || !args.every(Boolean)) return null;
+  const owner = internalNameFromDescriptor(receiver.type);
+  const method = methodDescriptorForInstanceCall(owner, expression.name, args, context);
+  return {
+    kind: 'MethodCallValue',
+    type: method ? method.returnDescriptor : 'V',
+    owner,
+    name: expression.name,
+    descriptor: method ? method.descriptor : `(${args.map((arg) => arg.type).join('')})V`,
+    invokeKind: method && method.invokeKind ? method.invokeKind : 'virtual',
+    receiver,
+    args: method && method.parameterDescriptors
+      ? args.map((arg, index) => coerceValueToDescriptor(arg, method.parameterDescriptors[index]))
+      : args,
   };
 }
 
@@ -1817,12 +2588,14 @@ function lowerStaticWrapperMethodCall(expression, context, targetNameOverride = 
 function lowerStaticUserMethodCall(expression, context, targetNameOverride = null) {
   const targetName = targetNameOverride
     || (expression && expression.target && expression.target.kind === 'Identifier' ? expression.target.name : null);
-  const owner = constructorOwnerFromName(targetName, context);
+  const owner = targetName
+    ? constructorOwnerFromName(targetName, context)
+    : resolveClassInternalNameFromParts(chainParts(expression && expression.target), context);
   const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
   const method = selectUserMethodDescriptor(owner, expression.name, rawArgs, context, true);
   if (!method) return null;
-  const args = rawArgs.map((arg, index) => coerceValueToDescriptor(arg, method.parameterDescriptors[index]));
-  if (!args.every(Boolean) || args.length !== method.parameterDescriptors.length) return null;
+  const args = prepareMethodArguments(method, rawArgs);
+  if (!args) return null;
   return {
     kind: 'MethodCallValue',
     type: method.returnDescriptor,
@@ -1837,9 +2610,23 @@ function lowerStaticUserMethodCall(expression, context, targetNameOverride = nul
 function lowerKnownStaticMethodCall(expression, context) {
   if (!expression || expression.kind !== 'MethodInvocationExpression' || !expression.target) return null;
   const targetParts = chainParts(expression.target);
-  const owner = targetParts.length === 1 ? constructorOwnerFromName(targetParts[0], context) : targetParts.join('/');
+  const owner = resolveClassInternalNameFromParts(targetParts, context);
   const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
   if (!args.every(Boolean)) return null;
+  const jreMethod = selectJreMethodDescriptor(owner, expression.name, args, true);
+  if (jreMethod) {
+    const callArgs = prepareMethodArguments(jreMethod, args);
+    if (!callArgs) return null;
+    return {
+      kind: 'MethodCallValue',
+      type: jreMethod.returnDescriptor,
+      owner,
+      name: expression.name,
+      descriptor: jreMethod.descriptor,
+      invokeKind: 'static',
+      args: callArgs,
+    };
+  }
   if (owner === 'java/lang/Class' && expression.name === 'forName' && args.length === 1 && args[0].type === 'Ljava/lang/String;') {
     return {
       kind: 'MethodCallValue',
@@ -1880,14 +2667,37 @@ function lowerKnownStaticMethodCall(expression, context) {
 }
 
 function lowerSameClassMethodCall(expression, context) {
-  if (!expression || expression.kind !== 'MethodInvocationExpression' || expression.target || !context.methodByName.has(expression.name)) {
+  if (!expression || expression.kind !== 'MethodInvocationExpression' || expression.target) {
+    return null;
+  }
+  if (!context.methodByName.has(expression.name)) {
+    const outerMethod = context.outerMethodByName && context.outerMethodByName.get(expression.name);
+    if (!outerMethod || !context.outerClassInternalName) return null;
+    const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
+    const method = selectUserMethodDescriptor(context.outerClassInternalName, expression.name, rawArgs, context, outerMethod.isStatic)
+      || outerMethod;
+    const args = prepareMethodArguments(method, rawArgs);
+    if (args) {
+      const receiver = method.isStatic ? null : outerThisValue(context);
+      if (!method.isStatic && !receiver) return null;
+      return {
+        kind: 'MethodCallValue',
+        type: method.returnDescriptor,
+        owner: context.outerClassInternalName,
+        name: method.name,
+        descriptor: method.descriptor,
+        invokeKind: method.isStatic ? 'static' : 'virtual',
+        receiver,
+        args,
+      };
+    }
     return null;
   }
   const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
   const method = selectUserMethodDescriptor(context.classInternalName, expression.name, rawArgs, context, null)
     || context.methodByName.get(expression.name);
-  const args = rawArgs.map((arg, index) => coerceValueToDescriptor(arg, method.parameterDescriptors[index]));
-  if (method.isStatic && args.every(Boolean) && args.length === method.parameterDescriptors.length) {
+  const args = prepareMethodArguments(method, rawArgs);
+  if (method.isStatic && args) {
     return {
       kind: 'MethodCallValue',
       type: method.returnDescriptor,
@@ -1898,7 +2708,7 @@ function lowerSameClassMethodCall(expression, context) {
       args,
     };
   }
-  if (!method.isStatic && !context.currentMethodIsStatic && args.every(Boolean) && args.length === method.parameterDescriptors.length) {
+  if (!method.isStatic && !context.currentMethodIsStatic && args) {
     return {
       kind: 'MethodCallValue',
       type: method.returnDescriptor,
@@ -1934,6 +2744,21 @@ function lowerExpressionToJavaIrValue(expression, context) {
     const field = context.fieldByName.get(expression.name);
     return fieldValueForContext(field, context);
   }
+  if (expression && expression.kind === 'Identifier' && context.outerFieldByName && context.outerFieldByName.has(expression.name)) {
+    const field = context.outerFieldByName.get(expression.name);
+    if (field.isStatic) return fieldValueForContext(field, context);
+    const receiver = outerThisValue(context);
+    if (receiver) {
+      return {
+        kind: 'FieldValue',
+        type: field.descriptor,
+        owner: field.owner,
+        name: field.name,
+        descriptor: field.descriptor,
+        receiver,
+      };
+    }
+  }
   if (expression && expression.kind === 'FieldAccessExpression' && expression.name === 'length') {
     const target = lowerExpressionToJavaIrValue(expression.target, context);
     if (target && typeof target.type === 'string' && target.type.startsWith('[')) {
@@ -1959,14 +2784,36 @@ function lowerExpressionToJavaIrValue(expression, context) {
   }
   if (expression && expression.kind === 'FieldAccessExpression') {
     const targetParts = chainParts(expression.target);
+    const owner = resolveClassInternalNameFromParts(targetParts, context);
+    const fields = owner && context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+    const field = fields && fields.get(expression.name);
+    if (field && field.isStatic) {
+      return {
+        kind: 'StaticFieldValue',
+        type: field.descriptor,
+        owner,
+        name: expression.name,
+        descriptor: field.descriptor,
+      };
+    }
+    if (owner && /^[A-Z][A-Z0-9_]*$/.test(expression.name) && !STATIC_CONSTANT_FIELDS[`${owner}.${expression.name}`]) {
+      const descriptor = `L${owner};`;
+      return {
+        kind: 'StaticFieldValue',
+        type: descriptor,
+        owner,
+        name: expression.name,
+        descriptor,
+      };
+    }
     if (targetParts.length === 1) {
-      const owner = constructorOwnerFromName(targetParts[0], context);
-      const descriptor = STATIC_CONSTANT_FIELDS[`${owner}.${expression.name}`];
+      const staticOwner = constructorOwnerFromName(targetParts[0], context);
+      const descriptor = STATIC_CONSTANT_FIELDS[`${staticOwner}.${expression.name}`];
       if (descriptor) {
         return {
           kind: 'StaticFieldValue',
           type: descriptor,
-          owner,
+          owner: staticOwner,
           name: expression.name,
           descriptor,
         };
@@ -2024,7 +2871,8 @@ function lowerExpressionToJavaIrValue(expression, context) {
   if (expression && expression.kind === 'FieldAccessExpression') {
     const target = lowerExpressionToJavaIrValue(expression.target, context);
     const owner = target ? internalNameFromDescriptor(target.type) : null;
-    const field = owner === context.classInternalName && context.fieldByName ? context.fieldByName.get(expression.name) : null;
+    const fields = context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+    const field = fields ? fields.get(expression.name) : (owner === context.classInternalName && context.fieldByName ? context.fieldByName.get(expression.name) : null);
     if (target && field) {
       return {
         kind: 'FieldValue',
@@ -2032,6 +2880,16 @@ function lowerExpressionToJavaIrValue(expression, context) {
         owner,
         name: field.name,
         descriptor: field.descriptor,
+        receiver: target,
+      };
+    }
+    if (target && owner && typeof target.type === 'string' && target.type.startsWith('L')) {
+      return {
+        kind: 'FieldValue',
+        type: 'Ljava/lang/Object;',
+        owner,
+        name: expression.name,
+        descriptor: 'Ljava/lang/Object;',
         receiver: target,
       };
     }
@@ -2043,6 +2901,24 @@ function lowerExpressionToJavaIrValue(expression, context) {
       && expression.target
       && expression.target.kind === 'UnsupportedExpression'
       && Array.isArray(expression.target.tokens)) {
+    if (expression.target.tokens.length === 3
+        && expression.target.tokens[0].kind === 'identifier'
+        && tokenText(expression.target.tokens[1]) === '.'
+        && tokenText(expression.target.tokens[2]) === 'new'
+        && context.localByName.has(expression.target.tokens[0].text)) {
+      const outer = localValue(context.localByName.get(expression.target.tokens[0].text));
+      const owner = constructorOwnerFromName(expression.name, context);
+      const args = [outer].concat((expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context)));
+      if (args.every(Boolean)) {
+        return {
+          kind: 'NewObjectValue',
+          type: `L${owner};`,
+          owner,
+          descriptor: `(${args.map((arg) => arg.type).join('')})V`,
+          args,
+        };
+      }
+    }
     if (expression.target.tokens.length === 1 && tokenText(expression.target.tokens[0]) === 'new') {
       const owner = constructorOwnerFromName(expression.name, context);
       const args = (expression.arguments || []).map((argument) => {
@@ -2121,7 +2997,7 @@ function lowerExpressionToJavaIrValue(expression, context) {
   if (expression && expression.kind === 'MethodInvocationExpression' && !expression.target && context.methodByName.has(expression.name)) {
     return lowerSameClassMethodCall(expression, context);
   }
-  if (expression && expression.kind === 'MethodInvocationExpression' && expression.target && expression.target.kind === 'Identifier') {
+  if (expression && expression.kind === 'MethodInvocationExpression' && expression.target) {
     const call = lowerKnownStaticMethodCall(expression, context) || lowerStaticUserMethodCall(expression, context) || lowerStaticWrapperMethodCall(expression, context);
     if (call) return call;
   }
@@ -2133,6 +3009,17 @@ function lowerExpressionToJavaIrValue(expression, context) {
 
 function coerceValueToDescriptor(value, descriptor) {
   if (!value || !descriptor || value.type === descriptor) return value;
+  if (value.kind === 'ConditionalValue') {
+    const consequent = coerceValueToDescriptor(value.consequent, descriptor);
+    const alternate = coerceValueToDescriptor(value.alternate, descriptor);
+    if (!consequent || !alternate) return value;
+    return {
+      ...value,
+      type: descriptor,
+      consequent,
+      alternate,
+    };
+  }
   if (value.kind === 'ArrayInitializerValue' && descriptor.startsWith('[')) {
     const component = arrayComponentDescriptor(descriptor);
     return {
@@ -2144,7 +3031,7 @@ function coerceValueToDescriptor(value, descriptor) {
   if (value.kind === 'LiteralValue' && value.literalKind === 'number' && ['I', 'J', 'F', 'D'].includes(descriptor)) {
     return { ...value, type: descriptor };
   }
-  if (value.literalKind === 'null' && descriptor.startsWith('L')) {
+  if (value.literalKind === 'null' && (descriptor.startsWith('L') || descriptor.startsWith('['))) {
     return { ...value, type: descriptor };
   }
   if (['I', 'J', 'F', 'D', 'B', 'S', 'C'].includes(value.type) && ['I', 'J', 'F', 'D', 'B', 'S', 'C'].includes(descriptor)) {
@@ -2156,6 +3043,17 @@ function coerceValueToDescriptor(value, descriptor) {
     };
   }
   const wrapper = wrapperDescriptorForPrimitive(value.type);
+  if (wrapper && descriptor === 'Ljava/lang/Object;') {
+    return coerceValueToDescriptor({
+      kind: 'MethodCallValue',
+      type: wrapper,
+      owner: internalNameFromDescriptor(wrapper),
+      name: 'valueOf',
+      descriptor: `(${value.type})${wrapper}`,
+      invokeKind: 'static',
+      args: [value],
+    }, descriptor);
+  }
   if (wrapper && descriptor === wrapper) {
     return {
       kind: 'MethodCallValue',
@@ -2174,6 +3072,17 @@ function coerceValueToDescriptor(value, descriptor) {
   }
   if (typeof value.type === 'string' && typeof descriptor === 'string'
       && value.type.startsWith('L') && descriptor.startsWith('L')) {
+    return {
+      kind: 'CastValue',
+      type: descriptor,
+      fromType: value.type,
+      value,
+    };
+  }
+  if (typeof value.type === 'string' && typeof descriptor === 'string'
+      && (value.type.startsWith('L') || value.type.startsWith('['))
+      && (descriptor.startsWith('L') || descriptor.startsWith('['))) {
+    if (descriptor.startsWith('[') && value.type.startsWith('L')) return null;
     return {
       kind: 'CastValue',
       type: descriptor,
@@ -2300,11 +3209,12 @@ function createJavaIrOp(op, fields = {}) {
 }
 
 function fieldValueForContext(field, context) {
+  const owner = field.owner || context.classInternalName;
   if (field.isStatic) {
     return {
       kind: 'StaticFieldValue',
       type: field.descriptor,
-      owner: context.classInternalName,
+      owner,
       name: field.name,
       descriptor: field.descriptor,
     };
@@ -2312,7 +3222,7 @@ function fieldValueForContext(field, context) {
   return {
     kind: 'FieldValue',
     type: field.descriptor,
-    owner: context.classInternalName,
+    owner,
     name: field.name,
     descriptor: field.descriptor,
     receiver: {
@@ -2503,6 +3413,19 @@ function nullValue(descriptor) {
   };
 }
 
+function catchTypeDescriptors(parameterType, context) {
+  const types = parameterType && parameterType.kind === 'UnionType'
+    ? parameterType.alternatives || []
+    : [parameterType];
+  const descriptors = [];
+  for (const type of types) {
+    const descriptor = typeDescriptor(type, context);
+    if (!descriptor.startsWith('L') || !descriptor.endsWith(';')) return null;
+    descriptors.push(descriptor);
+  }
+  return descriptors;
+}
+
 function closeResourceInvokeOp(local) {
   return createJavaIrOp('invoke', {
     value: {
@@ -2642,6 +3565,16 @@ function localIncrementValue(local, operator) {
   };
 }
 
+function isIterableDescriptor(descriptor) {
+  return descriptor === 'Ljava/lang/Iterable;'
+    || descriptor === 'Ljava/util/Collection;'
+    || descriptor === 'Ljava/util/List;'
+    || descriptor === 'Ljava/util/ArrayList;'
+    || descriptor === 'Ljava/util/LinkedList;'
+    || descriptor === 'Ljava/util/Set;'
+    || descriptor === 'Ljava/util/HashSet;';
+}
+
 function numericOneValue(descriptor) {
   return {
     kind: 'LiteralValue',
@@ -2754,6 +3687,43 @@ function lowerTokenUpdateToJavaIrOps(tokens, context) {
   return null;
 }
 
+function lowerCompoundAssignmentMethodCall(expression, context) {
+  if (!expression
+      || expression.kind !== 'MethodInvocationExpression'
+      || !expression.target
+      || expression.target.kind !== 'UnsupportedExpression'
+      || !Array.isArray(expression.target.tokens)) {
+    return null;
+  }
+  const tokens = trimParenTokens(expression.target.tokens);
+  const compoundIndex = findTopLevelOperator(tokens, ['+=', '-=']);
+  if (compoundIndex !== 1 || tokens[0].kind !== 'identifier' || !context.localByName.has(tokens[0].text)) return null;
+  const local = context.localByName.get(tokens[0].text);
+  const receiverTokens = tokens.slice(compoundIndex + 1);
+  const right = coerceValueToDescriptor(lowerInstanceMethodCall({
+    ...expression,
+    target: {
+      kind: 'UnsupportedExpression',
+      tokens: receiverTokens,
+      text: tokenTextJoined(receiverTokens),
+    },
+  }, context), local.descriptor);
+  if (!right) return null;
+  return [createJavaIrOp('assign', {
+    target: local.id,
+    type: local.descriptor,
+    value: {
+      kind: 'BinaryValue',
+      type: local.descriptor,
+      operator: tokenText(tokens[compoundIndex]) === '+=' ? '+' : '-',
+      left: localValue(local),
+      right,
+    },
+    sourceNodeKind: 'ExpressionStatement',
+    meta: { recoveredCompoundMethodAssignment: true },
+  })];
+}
+
 function lowerStatementToJavaIrOps(statement, context) {
   if (!statement) return [];
   if (statement.kind === 'BlockStatement') {
@@ -2828,6 +3798,18 @@ function lowerStatementToJavaIrOps(statement, context) {
     })];
   }
   if (statement.kind === 'ForStatement') {
+    let conditionNode = statement.condition;
+    let updateNode = statement.update;
+    if (!updateNode
+        && conditionNode
+        && conditionNode.kind === 'UnsupportedExpression'
+        && Array.isArray(conditionNode.tokens)) {
+      const headerParts = splitTopLevelByToken(conditionNode.tokens, ';');
+      if (headerParts.length >= 2) {
+        conditionNode = headerParts[0].length ? { ...conditionNode, tokens: headerParts[0], text: tokenTextJoined(headerParts[0]) } : null;
+        updateNode = headerParts[1].length ? { ...conditionNode, tokens: headerParts[1], text: tokenTextJoined(headerParts[1]) } : null;
+      }
+    }
     const initOps = !statement.initializer ? [] : (
       statement.initializer.kind === 'LocalVariableDeclarationStatement'
         ? lowerStatementToJavaIrOps(statement.initializer, context)
@@ -2835,12 +3817,12 @@ function lowerStatementToJavaIrOps(statement, context) {
           ? lowerTokenUpdateToJavaIrOps(statement.initializer.tokens, context)
           : null
     );
-    const condition = statement.condition
-      ? lowerExpressionToJavaIrValue(statement.condition, context)
+    const condition = conditionNode
+      ? lowerExpressionToJavaIrValue(conditionNode, context)
       : { kind: 'LiteralValue', type: 'Z', literalKind: 'boolean', value: true, raw: 'true' };
-    const updateOps = !statement.update ? [] : (
-      statement.update.kind === 'UnsupportedExpression' && Array.isArray(statement.update.tokens)
-        ? lowerTokenUpdateToJavaIrOps(statement.update.tokens, context)
+    const updateOps = !updateNode ? [] : (
+      updateNode.kind === 'UnsupportedExpression' && Array.isArray(updateNode.tokens)
+        ? lowerTokenUpdateToJavaIrOps(updateNode.tokens, context)
         : null
     );
     if (!initOps || !condition || condition.type !== 'Z' || !updateOps) {
@@ -2855,6 +3837,9 @@ function lowerStatementToJavaIrOps(statement, context) {
   }
   if (statement.kind === 'SwitchStatement') {
     const value = lowerExpressionToJavaIrValue(statement.expression, context);
+    if (value && typeof value.type === 'string' && value.type.startsWith('L')) {
+      return lowerEnumSwitchToJavaIrOps(statement, value, context);
+    }
     if (!value || value.type !== 'I') {
       return [javaIrUnsupported('unsupported switch expression', { sourceNodeKind: statement.expression && statement.expression.kind })];
     }
@@ -2890,7 +3875,84 @@ function lowerStatementToJavaIrOps(statement, context) {
       return [javaIrUnsupported('unsupported enhanced for parameter', { sourceNodeKind: statement.kind })];
     }
     const iterable = lowerExpressionToJavaIrValue(statement.iterable, context);
-    if (!iterable || typeof iterable.type !== 'string' || !iterable.type.startsWith('[')) {
+    if (!iterable || typeof iterable.type !== 'string') {
+      return [javaIrUnsupported('unsupported enhanced for iterable', { sourceNodeKind: statement.iterable && statement.iterable.kind })];
+    }
+    if (!iterable.type.startsWith('[') && isIterableDescriptor(iterable.type)) {
+      const parameterDescriptor = typeDescriptor(statement.parameter.parameterType, context);
+      const suffix = context.nextLocalId || 0;
+      const iterableOwner = internalNameFromDescriptor(iterable.type);
+      const iteratorLocal = declareShadowingContextLocal(context, `__foreach_iterator${suffix}`, 'Ljava/util/Iterator;', null, { enhancedFor: true });
+      const previousLocal = context.localByName.get(statement.parameter.name);
+      const itemLocal = declareShadowingContextLocal(context, statement.parameter.name, parameterDescriptor, null, { enhancedFor: true });
+      const nextValue = coerceValueToDescriptor({
+        kind: 'MethodCallValue',
+        type: 'Ljava/lang/Object;',
+        owner: 'java/util/Iterator',
+        name: 'next',
+        descriptor: '()Ljava/lang/Object;',
+        invokeKind: 'interface',
+        receiver: localValue(iteratorLocal),
+        args: [],
+      }, parameterDescriptor);
+      const bodyOps = lowerStatementToJavaIrOps(statement.body, context);
+      if (previousLocal) context.localByName.set(statement.parameter.name, previousLocal);
+      else context.localByName.delete(statement.parameter.name);
+      return [
+        createJavaIrOp('declareLocal', {
+          target: iteratorLocal.id,
+          type: iteratorLocal.descriptor,
+          name: iteratorLocal.name,
+          sourceNodeKind: statement.kind,
+          meta: { slotHint: iteratorLocal.slotHint, enhancedFor: true },
+        }),
+        createJavaIrOp('assign', {
+          target: iteratorLocal.id,
+          type: iteratorLocal.descriptor,
+          value: {
+            kind: 'MethodCallValue',
+            type: 'Ljava/util/Iterator;',
+            owner: iterableOwner,
+            name: 'iterator',
+            descriptor: '()Ljava/util/Iterator;',
+            invokeKind: 'interface',
+            receiver: iterable,
+            args: [],
+          },
+          sourceNodeKind: statement.kind,
+        }),
+        createJavaIrOp('declareLocal', {
+          target: itemLocal.id,
+          type: itemLocal.descriptor,
+          name: itemLocal.name,
+          sourceNodeKind: statement.kind,
+          meta: { slotHint: itemLocal.slotHint, enhancedFor: true },
+        }),
+        createJavaIrOp('loop', {
+          condition: {
+            kind: 'MethodCallValue',
+            type: 'Z',
+            owner: 'java/util/Iterator',
+            name: 'hasNext',
+            descriptor: '()Z',
+            invokeKind: 'interface',
+            receiver: localValue(iteratorLocal),
+            args: [],
+          },
+          bodyOps: [
+            createJavaIrOp('assign', {
+              target: itemLocal.id,
+              type: itemLocal.descriptor,
+              value: nextValue,
+              sourceNodeKind: statement.kind,
+            }),
+          ].concat(bodyOps),
+          updateOps: [],
+          sourceNodeKind: statement.kind,
+        }),
+      ];
+    }
+    if (!iterable.type.startsWith('[')) {
       return [javaIrUnsupported('unsupported enhanced for iterable', { sourceNodeKind: statement.iterable && statement.iterable.kind })];
     }
     const component = arrayComponentDescriptor(iterable.type);
@@ -3029,22 +4091,27 @@ function lowerStatementToJavaIrOps(statement, context) {
       if (!clause.parameter || !clause.parameter.name || !clause.parameter.parameterType) {
         return [javaIrUnsupported('unsupported catch parameter', { sourceNodeKind: clause.kind })];
       }
-      const descriptor = typeDescriptor(clause.parameter.parameterType, context);
-      if (!descriptor.startsWith('L') || !descriptor.endsWith(';')) {
+      const catchDescriptors = catchTypeDescriptors(clause.parameter.parameterType, context);
+      if (!catchDescriptors || catchDescriptors.length === 0) {
         return [javaIrUnsupported('unsupported catch type', { sourceNodeKind: clause.parameter.parameterType.kind })];
       }
+      const descriptor = clause.parameter.parameterType.kind === 'UnionType'
+        ? 'Ljava/lang/Throwable;'
+        : catchDescriptors[0];
       const previousLocal = context.localByName.get(clause.parameter.name);
       const local = declareShadowingContextLocal(context, clause.parameter.name, descriptor, null, { catch: true });
       const bodyOps = lowerStatementToJavaIrOps(clause.body, context);
       if (previousLocal) context.localByName.set(clause.parameter.name, previousLocal);
       else context.localByName.delete(clause.parameter.name);
-      catches.push({
-        type: descriptor.slice(1, -1),
-        local: local.id,
-        name: local.name,
-        descriptor,
-        bodyOps: finallyOverridesCompletion ? stripAbruptCompletionOps(bodyOps) : bodyOps,
-      });
+      for (const catchDescriptor of catchDescriptors) {
+        catches.push({
+          type: catchDescriptor.slice(1, -1),
+          local: local.id,
+          name: local.name,
+          descriptor,
+          bodyOps: finallyOverridesCompletion ? stripAbruptCompletionOps(bodyOps) : bodyOps,
+        });
+      }
     }
     const loweredTryOps = lowerStatementToJavaIrOps(statement.block, context);
     const tryOps = finallyOverridesCompletion ? stripAbruptCompletionOps(loweredTryOps) : loweredTryOps;
@@ -3168,13 +4235,48 @@ function lowerStatementToJavaIrOps(statement, context) {
             })];
           }
         }
+        if (target && target.kind === 'FieldValue') {
+          const value = coerceValueToDescriptor(lowerTokenExpressionToJavaIrValue(tokens.slice(assignIndex + 1), context), target.descriptor);
+          if (value) {
+            return [createJavaIrOp('putField', {
+              owner: target.owner,
+              name: target.name,
+              descriptor: target.descriptor,
+              value,
+              args: [target.receiver],
+              sourceNodeKind: statement.kind,
+            })];
+          }
+        }
+        if (target && target.kind === 'StaticFieldValue') {
+          const value = coerceValueToDescriptor(lowerTokenExpressionToJavaIrValue(tokens.slice(assignIndex + 1), context), target.descriptor);
+          if (value) {
+            return [createJavaIrOp('putStaticField', {
+              owner: target.owner,
+              name: target.name,
+              descriptor: target.descriptor,
+              value,
+              sourceNodeKind: statement.kind,
+            })];
+          }
+        }
       }
     }
+    const compoundMethodAssign = lowerCompoundAssignmentMethodCall(expression, context);
+    if (compoundMethodAssign) return compoundMethodAssign;
     const value = lowerExpressionToJavaIrValue(expression, context);
-    if (value && value.kind === 'MethodCallValue') {
+    if (value && (value.kind === 'MethodCallValue' || value.kind === 'NewObjectValue')) {
       return [createJavaIrOp('invoke', {
         value,
         sourceNodeKind: statement.kind,
+      })];
+    }
+    const statementCall = lowerStatementOnlyInstanceCall(expression, context);
+    if (statementCall) {
+      return [createJavaIrOp('invoke', {
+        value: statementCall,
+        sourceNodeKind: statement.kind,
+        meta: { statementOnlyFallback: true },
       })];
     }
     return [createJavaIrOp('expression', {
@@ -3183,6 +4285,55 @@ function lowerStatementToJavaIrOps(statement, context) {
     })];
   }
   if (statement.kind === 'LocalVariableDeclarationStatement') {
+    if (statement.variableType
+        && statement.variableType.kind === 'ClassType'
+        && context.localByName.has(statement.variableType.name)
+        && (statement.declarators || []).length === 1
+        && statement.declarators[0].initializer) {
+      const declarator = statement.declarators[0];
+      const receiverLocal = context.localByName.get(statement.variableType.name);
+      const owner = internalNameFromDescriptor(receiverLocal.descriptor);
+      const fields = context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+      const field = fields && fields.get(declarator.name);
+      const value = field ? coerceValueToDescriptor(lowerExpressionToJavaIrValue(declarator.initializer, context), field.descriptor) : null;
+      if (field && value) {
+        return [createJavaIrOp('putField', {
+          owner,
+          name: field.name,
+          descriptor: field.descriptor,
+          value,
+          args: [localValue(receiverLocal)],
+          sourceNodeKind: statement.kind,
+          meta: { recoveredFieldAssignment: true },
+        })];
+      }
+    }
+    if (statement.variableType
+        && statement.variableType.kind === 'UnsupportedType'
+        && Array.isArray(statement.variableType.tokens)
+        && (statement.declarators || []).length === 1
+        && statement.declarators[0].initializer) {
+      const declarator = statement.declarators[0];
+      const targetTokens = statement.variableType.tokens.concat([
+        { kind: 'identifier', text: declarator.name },
+        { kind: 'symbol', text: ']' },
+      ]);
+      const target = lowerTokenExpressionToJavaIrValue(targetTokens, context);
+      if (target && target.kind === 'ArrayLoadValue') {
+        const value = coerceValueToDescriptor(lowerExpressionToJavaIrValue(declarator.initializer, context), target.type);
+        if (value) {
+          return [createJavaIrOp('arrayStore', {
+            type: target.type,
+            value,
+            args: [
+              target.array,
+              target.index,
+            ],
+            sourceNodeKind: statement.kind,
+          })];
+        }
+      }
+    }
     const descriptor = typeDescriptor(statement.variableType, context);
     const signature = typeSignature(statement.variableType, context);
     return (statement.declarators || []).flatMap((declarator) => {
@@ -3242,6 +4393,407 @@ function implicitSuperConstructorOp(context) {
   });
 }
 
+function enumSyntheticConstructorPrefixLocals() {
+  return [
+    createJavaIrLocal('param:$enum$name', {
+      name: '$enum$name',
+      descriptor: 'Ljava/lang/String;',
+      slotHint: 1,
+      meta: { synthetic: true, enumName: true },
+    }),
+    createJavaIrLocal('param:$enum$ordinal', {
+      name: '$enum$ordinal',
+      descriptor: 'I',
+      slotHint: 2,
+      meta: { synthetic: true, enumOrdinal: true },
+    }),
+  ];
+}
+
+function enumSuperConstructorOp(context) {
+  return createJavaIrOp('invoke', {
+    value: {
+      kind: 'MethodCallValue',
+      type: 'V',
+      owner: 'java/lang/Enum',
+      name: '<init>',
+      descriptor: '(Ljava/lang/String;I)V',
+      invokeKind: 'special',
+      receiver: thisReceiverValue(context),
+      args: [
+        { kind: 'LocalValue', type: 'Ljava/lang/String;', local: 'param:$enum$name', name: '$enum$name' },
+        { kind: 'LocalValue', type: 'I', local: 'param:$enum$ordinal', name: '$enum$ordinal' },
+      ],
+    },
+    sourceNodeKind: 'ConstructorDeclaration',
+    meta: { synthetic: true, enumSuper: true },
+  });
+}
+
+function createEnumDefaultConstructor(classContext) {
+  const thisLocal = createJavaIrLocal('param:this', {
+    name: 'this',
+    descriptor: `L${classContext.classInternalName};`,
+    slotHint: 0,
+  });
+  const syntheticLocals = enumSyntheticConstructorPrefixLocals();
+  const locals = [thisLocal].concat(syntheticLocals);
+  const localByName = new Map([['this', thisLocal]]);
+  for (const local of syntheticLocals) localByName.set(local.name, local);
+  const context = {
+    locals,
+    localByName,
+    nextSlot: 3,
+    nextLocalId: 0,
+    methodByName: classContext.methodByName,
+    fieldByName: classContext.fieldByName,
+    classInternalName: classContext.classInternalName,
+    className: classContext.className,
+    superName: 'java/lang/Enum',
+    classBySimpleName: classContext.classBySimpleName,
+    classMethodsByInternalName: classContext.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: classContext.classFieldsByInternalName,
+    typeParameters: classContext.typeParameters,
+    currentMethodIsStatic: false,
+    syntheticClasses: classContext.syntheticClasses,
+    allocateLambdaClassName: classContext.allocateLambdaClassName,
+  };
+  const block = createJavaIrBlock('entry', {
+    kind: 'EntryBlock',
+    ops: [enumSuperConstructorOp(context)],
+    terminator: javaIrReturn(null),
+  });
+  return createJavaIrMethod({
+    name: '<init>',
+    descriptor: '(Ljava/lang/String;I)V',
+    access: ['private'],
+    parameters: syntheticLocals.map((local) => ({
+      id: local.id,
+      name: local.name,
+      descriptor: local.descriptor,
+      slotHint: local.slotHint,
+      meta: local.meta,
+    })),
+    locals,
+    blocks: [block],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'EnumConstructorDeclaration',
+    meta: { synthetic: true },
+  });
+}
+
+function lowerEnumConstructorToJavaIr(method, classContext) {
+  const typeParameters = buildTypeParameterErasureMap(method.typeParameters || [], classContext.typeParameters);
+  const typeContext = { typeParameters, classBySimpleName: classContext.classBySimpleName };
+  const thisLocal = createJavaIrLocal('param:this', {
+    name: 'this',
+    descriptor: `L${classContext.classInternalName};`,
+    slotHint: 0,
+  });
+  const syntheticLocals = enumSyntheticConstructorPrefixLocals();
+  const parameters = syntheticLocals.map((local) => ({
+    id: local.id,
+    name: local.name,
+    descriptor: local.descriptor,
+    slotHint: local.slotHint,
+    meta: local.meta,
+  }));
+  const locals = [thisLocal].concat(syntheticLocals);
+  const localByName = new Map([['this', thisLocal]]);
+  for (const local of syntheticLocals) localByName.set(local.name, local);
+  let slot = 3;
+  const declaredDescriptors = [];
+  for (const parameter of method.parameters || []) {
+    const descriptor = formalParameterDescriptor(parameter, typeContext);
+    const signature = formalParameterSignature(parameter, typeContext);
+    const id = `param:${parameter.name}`;
+    const local = createJavaIrLocal(id, { name: parameter.name, descriptor, slotHint: slot, meta: { signature } });
+    parameters.push({ id, name: parameter.name, descriptor, slotHint: slot, meta: { signature } });
+    locals.push(local);
+    localByName.set(parameter.name, local);
+    declaredDescriptors.push(descriptor);
+    slot += descriptor === 'J' || descriptor === 'D' ? 2 : 1;
+  }
+  const context = {
+    locals,
+    localByName,
+    nextSlot: slot,
+    nextLocalId: 0,
+    methodByName: classContext.methodByName,
+    fieldByName: classContext.fieldByName,
+    classInternalName: classContext.classInternalName,
+    className: classContext.className,
+    superName: 'java/lang/Enum',
+    classBySimpleName: classContext.classBySimpleName,
+    classMethodsByInternalName: classContext.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: classContext.classFieldsByInternalName,
+    outerClassInternalName: classContext.outerClassInternalName,
+    outerFieldByName: classContext.outerFieldByName,
+    outerMethodByName: classContext.outerMethodByName,
+    outerThisFieldName: classContext.outerThisFieldName,
+    typeParameters,
+    currentMethodIsStatic: false,
+    syntheticClasses: classContext.syntheticClasses,
+    allocateLambdaClassName: classContext.allocateLambdaClassName,
+  };
+  let ops = method.body && method.body.kind === 'BlockStatement'
+    ? lowerStatementToJavaIrOps(method.body, context)
+    : [javaIrUnsupported(`method body unavailable for ${method.name}`, { sourceNodeKind: method.kind })];
+  if (!isConstructorDelegationOp(ops[0], context)) {
+    ops = [enumSuperConstructorOp(context)].concat(ops);
+  }
+  const access = modifierNames(method.modifiers).filter((name) => name !== 'public' && name !== 'protected');
+  if (!access.includes('private')) access.unshift('private');
+  return createJavaIrMethod({
+    name: '<init>',
+    descriptor: `(Ljava/lang/String;I${declaredDescriptors.join('')})V`,
+    access: dedupePreservingOrder(access),
+    parameters,
+    locals,
+    blocks: [createJavaIrBlock('entry', {
+      kind: 'EntryBlock',
+      ops,
+      terminator: javaIrReturn(null),
+    })],
+    entryBlockId: 'entry',
+    sourceNodeKind: method.kind,
+    meta: {
+      signature: `(Ljava/lang/String;I${(method.parameters || []).map((parameter) => formalParameterSignature(parameter, typeContext)).join('')})V`,
+      annotations: annotationsMeta(method.annotations, { classBySimpleName: classContext.classBySimpleName }),
+      enumConstructor: true,
+    },
+  });
+}
+
+function enumConstantArgumentValues(constant, context) {
+  if (!constant || !constant.arguments) return [];
+  const tokens = constant.arguments.tokens || [];
+  if (tokens.length === 0) return [];
+  return splitTopLevelByComma(tokens).map((part) => lowerTokenExpressionToJavaIrValue(part, context));
+}
+
+function createEnumClassInitializer(declaration, classContext) {
+  const descriptor = `L${classContext.classInternalName};`;
+  const ops = [];
+  for (let index = 0; index < (declaration.constants || []).length; index += 1) {
+    const constant = declaration.constants[index];
+    const declaredArgs = enumConstantArgumentValues(constant, classContext);
+    if (!declaredArgs.every(Boolean)) {
+      ops.push(javaIrUnsupported(`unsupported enum constant arguments for ${constant.name}`, { sourceNodeKind: constant.kind }));
+      continue;
+    }
+    const args = [
+      {
+        kind: 'LiteralValue',
+        type: 'Ljava/lang/String;',
+        literalKind: 'string',
+        value: constant.name,
+        raw: JSON.stringify(constant.name),
+      },
+      {
+        kind: 'LiteralValue',
+        type: 'I',
+        literalKind: 'number',
+        value: String(index),
+        raw: String(index),
+      },
+    ].concat(declaredArgs);
+    ops.push(staticFieldStoreOp({
+      owner: classContext.classInternalName,
+      name: constant.name,
+      descriptor,
+    }, {
+      kind: 'NewObjectValue',
+      type: descriptor,
+      owner: classContext.classInternalName,
+      descriptor: `(${args.map((arg) => arg.type).join('')})V`,
+      args,
+    }));
+  }
+  ops.push(staticFieldStoreOp({
+    owner: classContext.classInternalName,
+    name: '$VALUES',
+    descriptor: `[${descriptor}`,
+  }, {
+    kind: 'ArrayInitializerValue',
+    type: `[${descriptor}`,
+    elements: (declaration.constants || []).map((constant) => ({
+      kind: 'StaticFieldValue',
+      type: descriptor,
+      owner: classContext.classInternalName,
+      name: constant.name,
+      descriptor,
+    })),
+  }));
+  return createJavaIrMethod({
+    name: '<clinit>',
+    descriptor: '()V',
+    access: ['static'],
+    parameters: [],
+    locals: [],
+    blocks: [createJavaIrBlock('entry', {
+      kind: 'EntryBlock',
+      ops,
+      terminator: javaIrReturn(null),
+    })],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'EnumClassInitializer',
+    meta: { synthetic: true },
+  });
+}
+
+function createEnumValuesMethod(classContext) {
+  const descriptor = `L${classContext.classInternalName};`;
+  return createJavaIrMethod({
+    name: 'values',
+    descriptor: `()[${descriptor}`,
+    access: ['public', 'static'],
+    parameters: [],
+    locals: [],
+    blocks: [createJavaIrBlock('entry', {
+      kind: 'EntryBlock',
+      ops: [createJavaIrOp('return', {
+        value: {
+          kind: 'StaticFieldValue',
+          type: `[${descriptor}`,
+          owner: classContext.classInternalName,
+          name: '$VALUES',
+          descriptor: `[${descriptor}`,
+        },
+        sourceNodeKind: 'EnumValuesMethod',
+      })],
+      terminator: javaIrReturn(null),
+    })],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'EnumValuesMethod',
+    meta: { synthetic: true },
+  });
+}
+
+function createEnumValueOfMethod(classContext) {
+  const descriptor = `L${classContext.classInternalName};`;
+  const nameLocal = createJavaIrLocal('param:name', {
+    name: 'name',
+    descriptor: 'Ljava/lang/String;',
+    slotHint: 0,
+  });
+  return createJavaIrMethod({
+    name: 'valueOf',
+    descriptor: `(Ljava/lang/String;)${descriptor}`,
+    access: ['public', 'static'],
+    parameters: [{ id: nameLocal.id, name: nameLocal.name, descriptor: nameLocal.descriptor, slotHint: nameLocal.slotHint }],
+    locals: [nameLocal],
+    blocks: [createJavaIrBlock('entry', {
+      kind: 'EntryBlock',
+      ops: [createJavaIrOp('return', {
+        value: {
+          kind: 'CastValue',
+          type: descriptor,
+          fromType: 'Ljava/lang/Enum;',
+          value: {
+            kind: 'MethodCallValue',
+            type: 'Ljava/lang/Enum;',
+            owner: 'java/lang/Enum',
+            name: 'valueOf',
+            descriptor: '(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;',
+            invokeKind: 'static',
+            args: [
+              { kind: 'ClassLiteralValue', type: 'Ljava/lang/Class;', className: classContext.classInternalName },
+              { kind: 'LocalValue', type: 'Ljava/lang/String;', local: nameLocal.id, name: nameLocal.name },
+            ],
+          },
+        },
+        sourceNodeKind: 'EnumValueOfMethod',
+      })],
+      terminator: javaIrReturn(null),
+    })],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'EnumValueOfMethod',
+    meta: { synthetic: true },
+  });
+}
+
+function stripBreakOps(ops) {
+  return (ops || []).filter((op) => op.op !== 'break');
+}
+
+function enumCaseValue(label, enumDescriptor, context) {
+  if (!label || label.labelKind !== 'case' || !enumDescriptor) return null;
+  const owner = internalNameFromDescriptor(enumDescriptor);
+  const fields = context.classFieldsByInternalName && context.classFieldsByInternalName.get(owner);
+  const expr = label.expression;
+  if (expr && expr.kind === 'UnsupportedExpression' && Array.isArray(expr.tokens) && expr.tokens.length === 1) {
+    const name = tokenText(expr.tokens[0]);
+    const field = fields && fields.get(name);
+    if (field && field.isStatic) return fieldValueForContext(field, { ...context, classInternalName: owner });
+    if (/^[A-Z][A-Z0-9_]*$/.test(name)) {
+      return {
+        kind: 'StaticFieldValue',
+        type: enumDescriptor,
+        owner,
+        name,
+        descriptor: enumDescriptor,
+      };
+    }
+    return null;
+  }
+  if (expr && expr.kind === 'Identifier') {
+    const field = fields && fields.get(expr.name);
+    if (field && field.isStatic) return fieldValueForContext(field, { ...context, classInternalName: owner });
+    if (/^[A-Z][A-Z0-9_]*$/.test(expr.name)) {
+      return {
+        kind: 'StaticFieldValue',
+        type: enumDescriptor,
+        owner,
+        name: expr.name,
+        descriptor: enumDescriptor,
+      };
+    }
+  }
+  return lowerExpressionToJavaIrValue(expr, context);
+}
+
+function lowerEnumSwitchToJavaIrOps(statement, value, context) {
+  const branches = [];
+  let defaultOps = [];
+  for (const group of statement.groups || []) {
+    const bodyOps = stripBreakOps((group.statements || []).flatMap((child) => lowerStatementToJavaIrOps(child, context)));
+    let isDefault = false;
+    for (const label of group.labels || []) {
+      if (label.labelKind === 'default') {
+        isDefault = true;
+        continue;
+      }
+      const caseValue = enumCaseValue(label, value.type, context);
+      if (!caseValue || caseValue.type !== value.type) {
+        return [javaIrUnsupported('unsupported enum switch case label', { sourceNodeKind: label.expression && label.expression.kind })];
+      }
+      branches.push({ caseValue, bodyOps });
+    }
+    if (isDefault) defaultOps = bodyOps;
+  }
+  let ops = defaultOps;
+  for (let index = branches.length - 1; index >= 0; index -= 1) {
+    const branch = branches[index];
+    ops = [createJavaIrOp('if', {
+      condition: {
+        kind: 'CompareValue',
+        type: 'Z',
+        operator: '==',
+        left: value,
+        right: branch.caseValue,
+      },
+      thenOps: branch.bodyOps,
+      elseOps: ops,
+      sourceNodeKind: statement.kind,
+      meta: { enumSwitch: true },
+    })];
+  }
+  return ops;
+}
+
 function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
   const typeParameters = buildTypeParameterErasureMap(method.typeParameters || [], classContext.typeParameters);
   const typeContext = { typeParameters, classBySimpleName: classContext.classBySimpleName };
@@ -3259,8 +4811,8 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     localByName.set('this', thisLocal);
   }
   for (const parameter of method.parameters || []) {
-    const descriptor = typeDescriptor(parameter.parameterType, typeContext);
-    const signature = typeSignature(parameter.parameterType, typeContext);
+    const descriptor = formalParameterDescriptor(parameter, typeContext);
+    const signature = formalParameterSignature(parameter, typeContext);
     const id = `param:${parameter.name}`;
     const local = createJavaIrLocal(id, { name: parameter.name, descriptor, slotHint: slot, meta: { signature } });
     parameters.push({ id, name: parameter.name, descriptor, slotHint: slot, meta: { signature } });
@@ -3281,6 +4833,11 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     classBySimpleName: classContext.classBySimpleName,
     classMethodsByInternalName: classContext.classMethodsByInternalName,
     classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: classContext.classFieldsByInternalName,
+    outerClassInternalName: classContext.outerClassInternalName,
+    outerFieldByName: classContext.outerFieldByName,
+    outerMethodByName: classContext.outerMethodByName,
+    outerThisFieldName: classContext.outerThisFieldName,
     typeParameters,
     currentMethodIsStatic: modifierNames(method.modifiers).includes('static'),
     syntheticClasses: classContext.syntheticClasses,
@@ -3315,6 +4872,110 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
   });
 }
 
+function lowerInitializerBlockToJavaIr(blockMember, classContext) {
+  const locals = [];
+  const localByName = new Map();
+  const context = {
+    locals,
+    localByName,
+    nextSlot: 0,
+    nextLocalId: 0,
+    methodByName: classContext.methodByName,
+    fieldByName: classContext.fieldByName,
+    classInternalName: classContext.classInternalName,
+    className: classContext.className,
+    superName: classContext.superName,
+    classBySimpleName: classContext.classBySimpleName,
+    classMethodsByInternalName: classContext.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: classContext.classFieldsByInternalName,
+    outerClassInternalName: classContext.outerClassInternalName,
+    outerFieldByName: classContext.outerFieldByName,
+    outerMethodByName: classContext.outerMethodByName,
+    outerThisFieldName: classContext.outerThisFieldName,
+    typeParameters: classContext.typeParameters,
+    currentMethodIsStatic: true,
+    syntheticClasses: classContext.syntheticClasses,
+    allocateLambdaClassName: classContext.allocateLambdaClassName,
+  };
+  const block = createJavaIrBlock('entry', {
+    kind: 'EntryBlock',
+    ops: blockMember.body && blockMember.body.kind === 'BlockStatement'
+      ? lowerStatementToJavaIrOps(blockMember.body, context)
+      : [javaIrUnsupported('initializer body unavailable', { sourceNodeKind: blockMember.kind })],
+    terminator: javaIrReturn(null),
+  });
+  return createJavaIrMethod({
+    name: '<clinit>',
+    descriptor: '()V',
+    access: ['static'],
+    parameters: [],
+    locals,
+    blocks: [block],
+    entryBlockId: 'entry',
+    exitBlockId: null,
+    sourceNodeKind: blockMember.kind,
+  });
+}
+
+function createInnerMemberDefaultConstructor(classContext) {
+  const outerDescriptor = `L${classContext.outerClassInternalName};`;
+  const thisLocal = createJavaIrLocal('param:this', {
+    name: 'this',
+    descriptor: `L${classContext.classInternalName};`,
+    slotHint: 0,
+  });
+  const outerLocal = createJavaIrLocal('param:this$0', {
+    name: 'this$0',
+    descriptor: outerDescriptor,
+    slotHint: 1,
+  });
+  const context = {
+    locals: [thisLocal, outerLocal],
+    localByName: new Map([['this', thisLocal], ['this$0', outerLocal]]),
+    nextSlot: 2,
+    nextLocalId: 0,
+    methodByName: classContext.methodByName,
+    fieldByName: classContext.fieldByName,
+    classInternalName: classContext.classInternalName,
+    className: classContext.className,
+    superName: classContext.superName,
+    classBySimpleName: classContext.classBySimpleName,
+    classMethodsByInternalName: classContext.classMethodsByInternalName,
+    classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
+    classFieldsByInternalName: classContext.classFieldsByInternalName,
+    typeParameters: classContext.typeParameters,
+    currentMethodIsStatic: false,
+    syntheticClasses: classContext.syntheticClasses,
+    allocateLambdaClassName: classContext.allocateLambdaClassName,
+  };
+  const block = createJavaIrBlock('entry', {
+    kind: 'EntryBlock',
+    ops: [
+      implicitSuperConstructorOp(context),
+      createJavaIrOp('putField', {
+        owner: classContext.classInternalName,
+        name: classContext.outerThisFieldName,
+        descriptor: outerDescriptor,
+        value: localValue(outerLocal),
+        args: [localValue(thisLocal)],
+        sourceNodeKind: 'SyntheticInnerConstructor',
+      }),
+    ],
+    terminator: javaIrReturn(null),
+  });
+  return createJavaIrMethod({
+    name: '<init>',
+    descriptor: `(${outerDescriptor})V`,
+    access: ['public'],
+    parameters: [{ id: outerLocal.id, name: outerLocal.name, descriptor: outerLocal.descriptor, slotHint: outerLocal.slotHint }],
+    locals: [thisLocal, outerLocal],
+    blocks: [block],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'SyntheticInnerConstructor',
+  });
+}
+
 function lowerAstToJavaIr(document, options = {}) {
   validateAstDocument(document);
   const packageName = packageNameForDocument(document);
@@ -3324,25 +4985,44 @@ function lowerAstToJavaIr(document, options = {}) {
 
   const classBySimpleName = new Map();
   const internalNameByDeclaration = new Map();
+  for (const importDeclaration of document.root.imports || []) {
+    if (importDeclaration.isStatic || importDeclaration.isWildcard) continue;
+    const parts = importDeclaration.name && importDeclaration.name.parts;
+    if (!Array.isArray(parts) || parts.length === 0) continue;
+    const internalName = parts.join('/');
+    classBySimpleName.set(parts[parts.length - 1], internalName);
+    classBySimpleName.set(parts.join('.'), internalName);
+  }
   function collectClassNames(declaration, outerInternalName = null) {
-    if (declaration.kind !== 'ClassDeclaration' && declaration.kind !== 'InterfaceDeclaration' && declaration.kind !== 'AnnotationTypeDeclaration') return;
+    if (!isClassLikeDeclaration(declaration)) return;
     const internalName = outerInternalName
       ? `${outerInternalName}$${declaration.name}`
       : internalNameFromClassName(declaration.name, packageName);
     internalNameByDeclaration.set(declaration, internalName);
     classBySimpleName.set(declaration.name, internalName);
+    classBySimpleName.set(internalName.replace(/\$/g, '.').replace(/\//g, '.'), internalName);
     for (const member of declaration.body || []) {
-      if (member.kind === 'ClassDeclaration' || member.kind === 'InterfaceDeclaration' || member.kind === 'AnnotationTypeDeclaration') {
+      if (isClassLikeDeclaration(member)) {
         collectClassNames(member, internalName);
       }
     }
   }
   for (const declaration of document.root.typeDeclarations || []) collectClassNames(declaration);
 
-  const classMethodsByInternalName = new Map();
-  const classMethodOverloadsByInternalName = new Map();
+  const sourcePrelude = sourceDirectoryMetadata(options.sourcePath);
+  if (sourcePrelude) {
+    for (const [name, internalName] of sourcePrelude.classBySimpleName) {
+      if (!classBySimpleName.has(name)) classBySimpleName.set(name, internalName);
+    }
+  }
+
+  const classMethodsByInternalName = sourcePrelude ? cloneNestedMap(sourcePrelude.classMethodsByInternalName) : new Map();
+  const classMethodOverloadsByInternalName = sourcePrelude ? cloneNestedMap(sourcePrelude.classMethodOverloadsByInternalName) : new Map();
+  const classFieldsByInternalName = sourcePrelude ? cloneNestedMap(sourcePrelude.classFieldsByInternalName) : new Map();
   function buildMethodMap(declaration) {
-    if (declaration.kind !== 'ClassDeclaration' && declaration.kind !== 'InterfaceDeclaration' && declaration.kind !== 'AnnotationTypeDeclaration') return;
+    if (!isClassLikeDeclaration(declaration)) return;
+    const isEnum = declaration.kind === 'EnumDeclaration';
+    const isInterface = declaration.kind === 'InterfaceDeclaration' || declaration.kind === 'AnnotationTypeDeclaration';
     const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
     const methodByName = new Map();
     const methodOverloadsByName = new Map();
@@ -3350,44 +5030,139 @@ function lowerAstToJavaIr(document, options = {}) {
     for (const member of declaration.body || []) {
       if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
         const methodTypeParameters = buildTypeParameterErasureMap(member.typeParameters || [], classTypeParameters);
-        const descriptor = methodDescriptor(member, descriptorContext);
+        const baseDescriptor = methodDescriptor(member, descriptorContext);
+        const descriptor = isEnum && member.kind === 'ConstructorDeclaration'
+          ? `(Ljava/lang/String;I${baseDescriptor.slice(1)}`
+          : baseDescriptor;
         const returnDescriptor = descriptor.slice(descriptor.indexOf(')') + 1);
         const methodName = member.kind === 'ConstructorDeclaration' ? '<init>' : member.name;
+        const baseParameterDescriptors = (member.parameters || []).map((parameter) => formalParameterDescriptor(parameter, {
+          typeParameters: methodTypeParameters,
+          classBySimpleName,
+        }));
+        const parameterDescriptors = isEnum && member.kind === 'ConstructorDeclaration'
+          ? ['Ljava/lang/String;', 'I'].concat(baseParameterDescriptors)
+          : baseParameterDescriptors;
         const summary = {
           name: member.kind === 'ConstructorDeclaration' ? '<init>' : member.name,
           descriptor,
           returnDescriptor,
-          parameterDescriptors: (member.parameters || []).map((parameter) => typeDescriptor(parameter.parameterType, {
-            typeParameters: methodTypeParameters,
-            classBySimpleName,
-          })),
+          parameterDescriptors,
           isStatic: modifierNames(member.modifiers).includes('static'),
+          isVarargs: (member.parameters || []).some((parameter) => parameter.isVarargs),
+          invokeKind: isInterface && member.kind === 'MethodDeclaration' ? 'interface' : undefined,
         };
         methodByName.set(methodName, summary);
         if (!methodOverloadsByName.has(methodName)) methodOverloadsByName.set(methodName, []);
         methodOverloadsByName.get(methodName).push(summary);
       }
     }
+    if (isEnum) {
+      const enumDescriptor = `L${internalNameByDeclaration.get(declaration)};`;
+      const valuesSummary = {
+        name: 'values',
+        descriptor: `()[${enumDescriptor}`,
+        returnDescriptor: `[${enumDescriptor}`,
+        parameterDescriptors: [],
+        isStatic: true,
+      };
+      const valueOfSummary = {
+        name: 'valueOf',
+        descriptor: `(Ljava/lang/String;)${enumDescriptor}`,
+        returnDescriptor: enumDescriptor,
+        parameterDescriptors: ['Ljava/lang/String;'],
+        isStatic: true,
+      };
+      methodByName.set('values', valuesSummary);
+      methodByName.set('valueOf', valueOfSummary);
+      if (!methodOverloadsByName.has('values')) methodOverloadsByName.set('values', []);
+      if (!methodOverloadsByName.has('valueOf')) methodOverloadsByName.set('valueOf', []);
+      methodOverloadsByName.get('values').push(valuesSummary);
+      methodOverloadsByName.get('valueOf').push(valueOfSummary);
+      if (!methodByName.has('<init>')) {
+        const ctorSummary = {
+          name: '<init>',
+          descriptor: '(Ljava/lang/String;I)V',
+          returnDescriptor: 'V',
+          parameterDescriptors: ['Ljava/lang/String;', 'I'],
+          isStatic: false,
+        };
+        methodByName.set('<init>', ctorSummary);
+        if (!methodOverloadsByName.has('<init>')) methodOverloadsByName.set('<init>', []);
+        methodOverloadsByName.get('<init>').push(ctorSummary);
+      }
+    }
     classMethodsByInternalName.set(internalNameByDeclaration.get(declaration), methodByName);
     classMethodOverloadsByInternalName.set(internalNameByDeclaration.get(declaration), methodOverloadsByName);
     for (const member of declaration.body || []) {
-      if (member.kind === 'ClassDeclaration' || member.kind === 'InterfaceDeclaration' || member.kind === 'AnnotationTypeDeclaration') buildMethodMap(member);
+      if (isClassLikeDeclaration(member)) buildMethodMap(member);
     }
   }
   for (const declaration of document.root.typeDeclarations || []) buildMethodMap(declaration);
 
-  function lowerClassDeclaration(declaration) {
-    if (declaration.kind !== 'ClassDeclaration' && declaration.kind !== 'InterfaceDeclaration' && declaration.kind !== 'AnnotationTypeDeclaration') {
+  function buildFieldMap(declaration) {
+    if (!isClassLikeDeclaration(declaration)) return;
+    const internalName = internalNameByDeclaration.get(declaration);
+    const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
+    const classTypeContext = { typeParameters: classTypeParameters, classBySimpleName };
+    const fieldByName = new Map();
+    if (declaration.kind === 'EnumDeclaration') {
+      const enumDescriptor = `L${internalName};`;
+      for (const constant of declaration.constants || []) {
+        fieldByName.set(constant.name, {
+          owner: internalName,
+          name: constant.name,
+          descriptor: enumDescriptor,
+          signature: enumDescriptor,
+          isStatic: true,
+        });
+      }
+      fieldByName.set('$VALUES', {
+        owner: internalName,
+        name: '$VALUES',
+        descriptor: `[${enumDescriptor}`,
+        signature: `[${enumDescriptor}`,
+        isStatic: true,
+      });
+    }
+    for (const member of declaration.body || []) {
+      if (member.kind === 'FieldDeclaration') {
+        for (const declarator of member.declarators || []) {
+          fieldByName.set(declarator.name, {
+            owner: internalName,
+            name: declarator.name,
+            descriptor: typeDescriptor(member.fieldType, classTypeContext),
+            signature: typeSignature(member.fieldType, classTypeContext),
+            isStatic: modifierNames(member.modifiers).includes('static'),
+          });
+        }
+      }
+    }
+    classFieldsByInternalName.set(internalName, fieldByName);
+    for (const member of declaration.body || []) {
+      if (isClassLikeDeclaration(member)) buildFieldMap(member);
+    }
+  }
+  for (const declaration of document.root.typeDeclarations || []) buildFieldMap(declaration);
+
+  function lowerClassDeclaration(declaration, outerClassContext = null) {
+    if (!isClassLikeDeclaration(declaration)) {
       unsupported.push({ kind: declaration.kind, reason: 'unsupported-top-level-declaration' });
       return;
     }
     const isInterface = declaration.kind === 'InterfaceDeclaration';
     const isAnnotation = declaration.kind === 'AnnotationTypeDeclaration';
+    const isEnum = declaration.kind === 'EnumDeclaration';
+    const isNonStaticMemberClass = Boolean(outerClassContext)
+      && declaration.kind !== 'EnumDeclaration'
+      && !modifierNames(declaration.modifiers).includes('static');
     const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
     const classTypeContext = { typeParameters: classTypeParameters, classBySimpleName };
     const internalName = internalNameByDeclaration.get(declaration);
     let nextLambdaId = 0;
-    const superName = isInterface || isAnnotation || !declaration.extendsType
+    const superName = isEnum
+      ? 'java/lang/Enum'
+      : isInterface || isAnnotation || !declaration.extendsType
       ? 'java/lang/Object'
       : typeDescriptor(declaration.extendsType, classTypeContext).slice(1, -1);
     const classIr = createJavaIrClass({
@@ -3396,13 +5171,15 @@ function lowerAstToJavaIr(document, options = {}) {
       internalName,
       access: isInterface || isAnnotation
         ? dedupePreservingOrder(modifierNames(declaration.modifiers).concat(['interface', 'abstract'], isAnnotation ? ['annotation'] : []))
+        : isEnum
+        ? dedupePreservingOrder(modifierNames(declaration.modifiers).concat(['final', 'super']))
         : dedupePreservingOrder(modifierNames(declaration.modifiers).concat(['super'])),
       superName,
       interfaces: isAnnotation
         ? ['java/lang/annotation/Annotation']
         : isInterface
         ? (declaration.extendsTypes || []).map((type) => classTypeInternalName(type))
-        : (declaration.implementsTypes || []).map((type) => classTypeInternalName(type)),
+        : (declaration.implementsTypes || []).map((type) => classTypeInternalName(type, { classBySimpleName })),
       sourceNodeKind: declaration.kind,
       meta: {
         signature: (declaration.typeParameters || []).length
@@ -3412,28 +5189,23 @@ function lowerAstToJavaIr(document, options = {}) {
       },
     });
     const methodByName = classMethodsByInternalName.get(internalName) || new Map();
-    const fieldByName = new Map();
-    for (const member of declaration.body || []) {
-      if (member.kind === 'FieldDeclaration') {
-        for (const declarator of member.declarators || []) {
-          fieldByName.set(declarator.name, {
-            name: declarator.name,
-            descriptor: typeDescriptor(member.fieldType, classTypeContext),
-            signature: typeSignature(member.fieldType, classTypeContext),
-            isStatic: modifierNames(member.modifiers).includes('static'),
-          });
-        }
-      }
-    }
+    const fieldByName = classFieldsByInternalName.get(internalName) || new Map();
     const classContext = {
       className: declaration.name,
       classInternalName: classIr.internalName,
       methodByName,
+      localByName: new Map(),
       classBySimpleName,
       classMethodsByInternalName,
       classMethodOverloadsByInternalName,
+      classFieldsByInternalName,
       fieldByName,
+      outerClassInternalName: outerClassContext && outerClassContext.classInternalName,
+      outerFieldByName: outerClassContext && outerClassContext.fieldByName,
+      outerMethodByName: outerClassContext && outerClassContext.methodByName,
+      outerThisFieldName: isNonStaticMemberClass ? 'this$0' : null,
       isInterface: isInterface || isAnnotation,
+      isEnum,
       superName: classIr.superName,
       typeParameters: classTypeParameters,
       syntheticClasses,
@@ -3443,6 +5215,39 @@ function lowerAstToJavaIr(document, options = {}) {
         return id;
       },
     };
+    if (isNonStaticMemberClass) {
+      const outerDescriptor = `L${outerClassContext.classInternalName};`;
+      classIr.fields.push(createJavaIrField({
+        name: 'this$0',
+        descriptor: outerDescriptor,
+        access: ['final'],
+        initializer: null,
+      }));
+      if (![...methodByName.keys()].includes('<init>')) {
+        classIr.methods.push(createInnerMemberDefaultConstructor(classContext));
+      }
+    }
+    if (isEnum) {
+      const enumDescriptor = `L${classIr.internalName};`;
+      for (const constant of declaration.constants || []) {
+        classIr.fields.push(createJavaIrField({
+          name: constant.name,
+          descriptor: enumDescriptor,
+          access: ['public', 'static', 'final'],
+          initializer: null,
+          meta: { enumConstant: true },
+        }));
+      }
+      classIr.fields.push(createJavaIrField({
+        name: '$VALUES',
+        descriptor: `[${enumDescriptor}`,
+        access: ['private', 'static', 'final'],
+        initializer: null,
+        meta: { synthetic: true, enumValues: true },
+      }));
+    }
+    let hasStaticInitializer = false;
+    let hasConstructor = false;
     for (const member of declaration.body || []) {
       if (member.kind === 'FieldDeclaration') {
         for (const declarator of member.declarators || []) {
@@ -3464,12 +5269,25 @@ function lowerAstToJavaIr(document, options = {}) {
           }));
         }
       } else if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
-        classIr.methods.push(lowerMethodToJavaIr(member, classContext, member.modifiers && modifierNames(member.modifiers).includes('static') ? 0 : 1));
-      } else if (member.kind === 'ClassDeclaration' || member.kind === 'InterfaceDeclaration' || member.kind === 'AnnotationTypeDeclaration') {
-        lowerClassDeclaration(member);
+        if (member.kind === 'ConstructorDeclaration') hasConstructor = true;
+        classIr.methods.push(isEnum && member.kind === 'ConstructorDeclaration'
+          ? lowerEnumConstructorToJavaIr(member, classContext)
+          : lowerMethodToJavaIr(member, classContext, member.modifiers && modifierNames(member.modifiers).includes('static') ? 0 : 1));
+      } else if (member.kind === 'InitializerBlock' && member.isStatic) {
+        hasStaticInitializer = true;
+        classIr.methods.push(lowerInitializerBlockToJavaIr(member, classContext));
+      } else if (isClassLikeDeclaration(member)) {
+        lowerClassDeclaration(member, classContext);
       } else {
         unsupported.push({ kind: member.kind, owner: declaration.name, reason: 'unsupported-member-declaration' });
       }
+    }
+    if (isEnum) {
+      if (!hasConstructor) classIr.methods.push(createEnumDefaultConstructor(classContext));
+      if (!hasStaticInitializer) classIr.methods.push(createEnumClassInitializer(declaration, classContext));
+      else unsupported.push({ kind: 'EnumDeclaration', owner: declaration.name, reason: 'enum-static-initializer-merge-not-implemented' });
+      classIr.methods.push(createEnumValuesMethod(classContext));
+      classIr.methods.push(createEnumValueOfMethod(classContext));
     }
     classes.push(classIr);
   }

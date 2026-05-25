@@ -7,6 +7,7 @@ const { parseJava } = require('./parser');
 const { validateAstDocument } = require('./serialization');
 const { JavaFrontendError, UnsupportedJavaSyntaxError } = require('./errors');
 const { assembleJasminSource } = require('../utils/jasminAssembly');
+const { jreInternalNameForSimpleName } = require('./jreMetadata');
 
 const COMPILE_RESULT_SCHEMA_ID = 'java-tools.java-frontend.compile-result';
 const COMPILE_RESULT_SCHEMA_VERSION = 1;
@@ -32,7 +33,7 @@ const JAVA_LANG_TYPES = new Set([
   'Character', 'Class', 'ClassCastException', 'Double', 'Exception', 'Float',
   'IllegalArgumentException', 'Integer', 'InterruptedException', 'Long', 'NegativeArraySizeException',
   'NullPointerException', 'RuntimeException', 'StackOverflowError', 'Throwable',
-  'Comparable', 'Iterable', 'Math', 'Object', 'Runnable', 'Short', 'String', 'StringBuilder',
+  'Comparable', 'Enum', 'Iterable', 'Math', 'Object', 'Runnable', 'Short', 'String', 'StringBuilder',
   'System', 'Thread', 'Void',
 ]);
 
@@ -123,6 +124,16 @@ function classTypeInternalName(type, context = {}) {
     });
   }
   if (type.packageName) {
+    const qualifiedName = `${type.packageName}.${type.name}`;
+    if (context.classBySimpleName && context.classBySimpleName.has(qualifiedName)) {
+      return context.classBySimpleName.get(qualifiedName);
+    }
+    if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
+      return context.classBySimpleName.get(type.name);
+    }
+    if (/^[A-Z]/.test(String(type.packageName))) {
+      return `${String(type.packageName).replace(/\./g, '$')}$${type.name}`;
+    }
     return `${String(type.packageName).replace(/\./g, '/')}/${type.name}`;
   }
   if (JAVA_LANG_TYPES.has(type.name)) {
@@ -143,6 +154,8 @@ function classTypeInternalName(type, context = {}) {
   if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
     return context.classBySimpleName.get(type.name);
   }
+  const jreName = jreInternalNameForSimpleName(type.name);
+  if (jreName) return jreName;
   return String(type.name).replace(/\./g, '/');
 }
 
@@ -255,7 +268,10 @@ function typeParameterSignature(parameter, context = {}) {
 function methodGenericSignature(method, parent = null) {
   const context = methodTypeContext(method, parent);
   const typeParams = (method.typeParameters || []).map((parameter) => typeParameterSignature(parameter, context)).join('');
-  const params = (method.parameters || []).map((parameter) => typeSignature(parameter.parameterType, context)).join('');
+  const params = (method.parameters || []).map((parameter) => {
+    const signature = typeSignature(parameter.parameterType, context);
+    return parameter.isVarargs ? `[${signature}` : signature;
+  }).join('');
   const ret = method.kind === 'ConstructorDeclaration'
     ? 'V'
     : typeSignature(method.returnType || ast.voidType(), context);
@@ -266,7 +282,10 @@ function methodGenericSignature(method, parent = null) {
 function methodDescriptor(method, parentTypeParameters = null) {
   const context = methodTypeContext(method, parentTypeParameters);
   const parameterDescriptors = (method.parameters || [])
-    .map((parameter) => typeDescriptor(parameter.parameterType, context))
+    .map((parameter) => {
+      const descriptor = typeDescriptor(parameter.parameterType, context);
+      return parameter.isVarargs ? `[${descriptor}` : descriptor;
+    })
     .join('');
   const returnDescriptor = method.kind === 'ConstructorDeclaration'
     ? 'V'
@@ -281,7 +300,10 @@ function slotWidthFromDescriptor(descriptor) {
 function localSlotCountForMethod(method, parentTypeParameters = null) {
   const context = methodTypeContext(method, parentTypeParameters);
   const parameterSlots = (method.parameters || [])
-    .map((parameter) => slotWidthFromDescriptor(typeDescriptor(parameter.parameterType, context)))
+    .map((parameter) => {
+      const descriptor = typeDescriptor(parameter.parameterType, context);
+      return slotWidthFromDescriptor(parameter.isVarargs ? `[${descriptor}` : descriptor);
+    })
     .reduce((sum, width) => sum + width, 0);
   return parameterSlots + (hasModifier(method, 'static') ? 0 : 1);
 }
@@ -1024,6 +1046,7 @@ function compileJavaFile(inputPath, options = {}) {
   const source = fs.readFileSync(inputPath, 'utf8');
   return compileJavaSource(source, {
     ...options,
+    sourcePath: inputPath,
     sourceFileName: options.sourceFileName || path.basename(inputPath),
   });
 }

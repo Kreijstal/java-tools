@@ -74,6 +74,36 @@ module.exports = {
         _classData: superClassData,
       };
     },
+    'getComponentType()Ljava/lang/Class;': async (jvm, classObj, args) => {
+      const classData = classObj && classObj._classData;
+      const componentType = classData && (classData.componentType || (classData.isArray && classData.className && classData.className.slice(1)));
+      if (!componentType) return null;
+      const primitiveDescriptors = {
+        Z: 'boolean',
+        B: 'byte',
+        C: 'char',
+        S: 'short',
+        I: 'int',
+        J: 'long',
+        F: 'float',
+        D: 'double',
+      };
+      if (primitiveDescriptors[componentType]) return jvm.getClassObject(primitiveDescriptors[componentType]);
+      if (componentType.startsWith('L') && componentType.endsWith(';')) return jvm.getClassObject(componentType.slice(1, -1));
+      if (componentType.startsWith('[')) {
+        return {
+          type: 'java/lang/Class',
+          className: componentType,
+          _classData: {
+            isArray: true,
+            arrayType: componentType,
+            className: componentType,
+            componentType: componentType.slice(1),
+          },
+        };
+      }
+      return jvm.getClassObject(componentType);
+    },
     'isInterface()Z': (jvm, classObj, args) => {
       const classData = classObj._classData;
       return classData.ast.classes[0].flags.includes('interface');

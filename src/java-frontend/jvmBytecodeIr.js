@@ -209,7 +209,19 @@ function integerPushInstruction(value) {
 }
 
 function stripNumericSuffix(raw) {
-  return String(raw).replace(/_/g, '').replace(/[lLfFdD]$/, '');
+  const text = String(raw).replace(/_/g, '');
+  if (/^[+-]?0[xX][0-9a-fA-F]+[lL]?$/.test(text)) return text.replace(/[lL]$/, '');
+  return text.replace(/[lLfFdD]$/, '');
+}
+
+function parseIntegerLiteral(raw) {
+  const text = String(raw).replace(/_/g, '').replace(/[lL]$/, '');
+  const sign = text.startsWith('-') ? -1 : 1;
+  const unsigned = text.replace(/^[+-]/, '');
+  if (/^0[xX][0-9a-fA-F]+$/.test(unsigned)) return sign * Number.parseInt(unsigned.slice(2), 16);
+  if (/^0[bB][01]+$/.test(unsigned)) return sign * Number.parseInt(unsigned.slice(2), 2);
+  if (/^0[0-7]+$/.test(unsigned)) return sign * Number.parseInt(unsigned.slice(1), 8);
+  return Number.parseInt(text, 10);
 }
 
 function longPushInstruction(value) {
@@ -280,7 +292,7 @@ function literalLoadInstruction(value) {
         stack: 2,
       };
     }
-    const parsed = Number.parseInt(stripNumericSuffix(value.value), 10);
+    const parsed = parseIntegerLiteral(value.value);
     if (!Number.isFinite(parsed)) return null;
     return {
       descriptor: 'I',
@@ -473,6 +485,24 @@ function emitValue(value, state) {
     ]));
     return { descriptor: 'Ljava/lang/String;', stack: 1 };
   }
+  if (value.kind === 'ConditionalValue') {
+    if (!value.condition || !value.consequent || !value.alternate || value.consequent.type !== value.type || value.alternate.type !== value.type) {
+      return null;
+    }
+    const falseLabel = `Lcond_false_${state.nextLabel++}`;
+    const endLabel = `Lcond_end_${state.nextLabel++}`;
+    if (!emitFalseBranch(value.condition, falseLabel, state)) return null;
+    const consequent = emitValue(value.consequent, state);
+    if (!consequent || consequent.descriptor !== value.type) return null;
+    state.instructions.push(createJvmInstruction('goto', [endLabel]));
+    state.instructions.push(createJvmInstruction('nop', [], { label: falseLabel }));
+    const alternate = emitValue(value.alternate, state);
+    if (!alternate || alternate.descriptor !== value.type) return null;
+    state.instructions.push(createJvmInstruction('nop', [], { label: endLabel }));
+    const stack = slotWidthFromDescriptor(value.type);
+    state.maxStack = Math.max(state.maxStack, consequent.stack, alternate.stack, stack);
+    return { descriptor: value.type, stack };
+  }
   if (value.kind === 'BinaryValue') {
     const left = emitValue(value.left, state);
     const right = emitValue(value.right, state);
@@ -582,6 +612,9 @@ function emitValue(value, state) {
     const emitted = emitValue(value.value, state);
     if (!emitted) return null;
     if (emitted.descriptor === value.type) return emitted;
+    if (['B', 'S', 'C', 'Z'].includes(emitted.descriptor) && value.type === 'I') {
+      return { descriptor: 'I', stack: 1 };
+    }
     const opcode = {
       'I:J': 'i2l',
       'I:F': 'i2f',
@@ -599,8 +632,10 @@ function emitValue(value, state) {
       'D:J': 'd2l',
       'D:F': 'd2f',
     }[`${emitted.descriptor}:${value.type}`];
-    if (!opcode && emitted.descriptor.startsWith('L') && value.type.startsWith('L')) {
-      const owner = value.type.slice(1, -1);
+    if (!opcode
+        && (emitted.descriptor.startsWith('L') || emitted.descriptor.startsWith('['))
+        && (value.type.startsWith('L') || value.type.startsWith('['))) {
+      const owner = value.type.startsWith('L') ? value.type.slice(1, -1) : value.type;
       state.instructions.push(createJvmInstruction('checkcast', [owner]));
       return { descriptor: value.type, stack: 1 };
     }
@@ -1218,7 +1253,7 @@ function javaIrToJvmBytecodeIr(javaIr, options = {}) {
     if (!hasConstructor && !(bytecodeClass.access || []).includes('interface')) {
       bytecodeClass.methods.unshift(defaultConstructorMethod(bytecodeClass));
     }
-    const clinit = staticInitializerMethod(bytecodeClass);
+    const clinit = methods.some((method) => method.name === '<clinit>') ? null : staticInitializerMethod(bytecodeClass);
     if (clinit) bytecodeClass.methods.push(clinit);
     return bytecodeClass;
   });
