@@ -55,7 +55,6 @@ test('repository Java frontend builds every provided .java file without host com
   try {
     const result = frontend.compileJavaFiles(inputPaths, {
       outputDir,
-      tolerant: true,
       stubUnsupportedMethods: true,
       fallbackUnsupportedTypes: true,
     });

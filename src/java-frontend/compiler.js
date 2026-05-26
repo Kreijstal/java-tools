@@ -658,7 +658,7 @@ function defaultConstructorIr(classIr) {
 
 function compileFieldDeclaration(field, options = {}) {
   const declarators = (field.declarators || []).map((declarator) => {
-    if (declarator.initializer && options.tolerant !== true) {
+    if (declarator.initializer) {
       throw unsupportedCompileNode(declarator, 'minimal compiler does not support field initializers yet');
     }
     return {
@@ -736,22 +736,28 @@ function buildBytecodeIr(document, options = {}) {
     try {
       if (declaration.kind === 'ClassDeclaration') {
         classes.push(compileClassDeclaration(declaration, document, options));
-      } else if (options.tolerant === true) {
-        unsupported.push({ kind: declaration.kind, reason: 'unsupported-top-level-declaration' });
       } else {
         throw unsupportedCompileNode(declaration, `minimal compiler only supports top-level classes, not ${declaration.kind}`);
       }
     } catch (error) {
-      if (options.tolerant === true) {
-        unsupported.push({
-          kind: declaration.kind,
-          reason: error.message,
-          code: error.code || 'JAVA_FRONTEND_COMPILE_ERROR',
-        });
-      } else {
-        throw error;
-      }
+      unsupported.push({
+        kind: declaration.kind,
+        reason: error.message,
+        code: error.code || 'JAVA_FRONTEND_COMPILE_ERROR',
+      });
+      break;
     }
+  }
+  if (unsupported.length) {
+    return {
+      schema: BYTECODE_IR_SCHEMA_ID,
+      version: BYTECODE_IR_SCHEMA_VERSION,
+      status: 'partial',
+      backend: 'minimal-jvm-bytecode',
+      sourceLevel: document.sourceLevel || null,
+      classes,
+      unsupported,
+    };
   }
   return {
     schema: BYTECODE_IR_SCHEMA_ID,
@@ -957,7 +963,7 @@ function compileJavaAst(document, options = {}) {
   const { javaIrToJvmBytecodeIr } = require('./jvmBytecodeIr');
   const javaIr = lowerAstToJavaIr(document, options);
   const bytecodeIr = javaIrToJvmBytecodeIr(javaIr, options);
-  if (bytecodeIr.status !== 'complete' && !options.tolerant) {
+  if (bytecodeIr.status !== 'complete') {
     const firstUnsupported = bytecodeIr.unsupported && bytecodeIr.unsupported[0];
     const reason = firstUnsupported && firstUnsupported.reason ? firstUnsupported.reason : 'unsupported Java IR';
     throw new UnsupportedJavaSyntaxError(`minimal compiler does not support ${reason}`, { phase: 'compile' });
@@ -1007,7 +1013,7 @@ function createEmitBytecodeIrPass(options = {}) {
     dependsOn: options.dependsOn || [],
     run(document, context) {
       const meta = ensureMeta(document);
-      meta.javaFrontendBytecodeIr = buildBytecodeIr(document, { ...options, tolerant: options.tolerant !== false });
+      meta.javaFrontendBytecodeIr = buildBytecodeIr(document, options);
       if (context && typeof context.annotate === 'function') {
         context.annotate(document.root, 'frontend.bytecodeIr.backend', {
           backend: meta.javaFrontendBytecodeIr.backend,
@@ -1028,7 +1034,7 @@ function createEmitClassFileModelPass(options = {}) {
     dependsOn: options.dependsOn || [],
     run(document, context) {
       const meta = ensureMeta(document);
-      const bytecodeIr = meta.javaFrontendBytecodeIr || buildBytecodeIr(document, { ...options, tolerant: options.tolerant !== false });
+      const bytecodeIr = meta.javaFrontendBytecodeIr || buildBytecodeIr(document, options);
       meta.javaFrontendBytecodeIr = bytecodeIr;
       meta.javaFrontendClassFileModel = buildClassFileModelFromIr(bytecodeIr, options);
       if (context && typeof context.annotate === 'function') {

@@ -1493,7 +1493,7 @@ function createEmitJvmBytecodeIrPass(options = {}) {
         bytecodeIr = javaIrToJvmBytecodeIr(javaIr, options);
       } else {
         validateAstDocument(document);
-        bytecodeIr = buildBytecodeIr(document, { ...options, tolerant: options.tolerant !== false });
+        bytecodeIr = buildBytecodeIr(document, options);
       }
       attachJvmBytecodeIrDocument(document, bytecodeIr, options.attach || {});
       if (context && typeof context.annotate === 'function') {
