@@ -209,7 +209,14 @@ function tokensCouldBeType(tokens) {
     if (text === ']') {
       return false;
     }
-    if (text === '.' || text === ',' || text === '?' || text === '&' || text === 'extends' || text === 'super') {
+    if (text === '.') {
+      if (!normalized[i - 1] || !normalized[i + 1]
+          || !isNameToken(normalized[i - 1]) || !isNameToken(normalized[i + 1])) {
+        return false;
+      }
+      continue;
+    }
+    if (text === ',' || text === '?' || text === '&' || text === 'extends' || text === 'super') {
       continue;
     }
     if (isNameToken(token) || PRIMITIVE_TYPES.has(text)) {

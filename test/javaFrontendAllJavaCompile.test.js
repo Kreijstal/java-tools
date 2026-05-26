@@ -68,7 +68,8 @@ test('repository Java frontend builds every provided .java file without host com
     t.ok(result.written.length >= inputPaths.length, 'frontend emits at least one class file per Java source');
     t.equal(new Set(writtenPaths).size, writtenPaths.length, 'duplicate binary names are isolated to conflict-safe output paths');
     t.equal(classFiles.length, result.written.length, 'every reported class file exists as a distinct file');
-    t.ok(result.unsupported.length > 0, 'unsupported bodies remain reported instead of hidden behind another compiler');
+    t.equal(result.status, 'complete', 'the full provided corpus lowers without unsupported frontend bodies');
+    t.equal(result.unsupported.length, 0, 'no unsupported frontend diagnostics remain for the provided corpus');
   } finally {
     fs.rmSync(outputDir, { recursive: true, force: true });
   }
