@@ -5,15 +5,15 @@ const path = require('path');
 const frontend = require('../src/java-frontend');
 
 function printUsage() {
-  console.log(`Usage: node scripts/compileJava.js <file.java> [file2.java ...] [--out <dir>] [--source-level <n>] [--strict]
+  console.log(`Usage: node scripts/compileJava.js <file.java> [file2.java ...] [--out <dir>] [--source-level <n>]
 
 Compiles Java source files with the repository Java frontend and internal Jasmin/classfile backend.
-No host javac backend or fallback is used. By default the CLI emits valid bytecode stubs
-for unsupported method bodies so the complete provided source corpus can be built.`);
+No host javac backend or fallback is used. Unsupported constructs fail fast.
+`);
 }
 
 function parseArgs(argv) {
-  const options = { outputDir: process.cwd(), tolerant: true, stubUnsupportedMethods: true, fallbackUnsupportedTypes: true };
+  const options = { outputDir: process.cwd() };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -25,12 +25,6 @@ function parseArgs(argv) {
         throw new Error(`${arg} requires an output directory`);
       }
       options.outputDir = argv[++i];
-      continue;
-    }
-    if (arg === '--strict') {
-      options.tolerant = false;
-      options.stubUnsupportedMethods = false;
-      options.fallbackUnsupportedTypes = false;
       continue;
     }
     if (arg === '--source-level') {
