@@ -1,5 +1,14 @@
 'use strict';
 
+function currentObscureStringsDate() {
+  const now = new Date();
+  const months = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December',
+  ];
+  return `${months[now.getMonth()]} ${now.getDate()}, ${now.getFullYear()}`;
+}
+
 const JVM_OUTPUT_EXPECTATIONS = Object.freeze({
   RuntimeArithmetic: '5\n2\n6',
   ArithmeticTest: 'Integer Arithmetic:\nSum: 13\nDifference: 7\nProduct: 30\nQuotient: 3\nRemainder: 1\n\nDouble Arithmetic:\nSum: 22222.2221\nDifference: 2469.1357000000007\nProduct: 1.219326309891785E8\nQuotient: 1.249999989875\n\nFloat Arithmetic:\nSum: 16.0\nDifference: 9.0\nProduct: 43.75\nQuotient: 3.5714285373687744',
@@ -47,7 +56,7 @@ const JVM_OUTPUT_EXPECTATIONS = Object.freeze({
   ObscureNumbers: 'Demonstrating underscores in numeric literals.\nLarge number: 1000000000000\nBinary number: 255\nHex number: 65535',
   HexFloatLiteralsTest: '=== Hexadecimal Float Literals Test ===\n0x1.0p0 = 1\n0x1.8p0 = 1.5\n0x1.0p1 = 2\n0x1.0p-1 = 0.5\nHex Pi approximation: 3.141592653589793\nHex E approximation: 2.718281828459045\nMath.PI: 3.141592653589793\nMath.E: 2.718281828459045\nHex float: 1\nMax value (hex): 1.7976931348623157e+308\nDouble.MAX_VALUE: 1.7976931348623157e+308\nMin normal (hex): 2.2250738585072014e-308\nDouble.MIN_NORMAL: 2.2250738585072014e-308\nMin subnormal (hex): 5e-324\nDouble.MIN_VALUE: 5e-324\nPositive infinity: Infinity\nIs positive infinite: true\nNegative infinity: -Infinity\nIs negative infinite: true\nNaN: NaN\nIs NaN: true',
   ObscureStrictFp: 'Demonstrating strictfp keyword.\nNote: The difference may not be visible on all platforms.\nStrictFP calculation: Infinity\nNon-StrictFP calculation: Infinity',
-  ObscureStrings: 'Demonstrating advanced string features.\nString.join(): a, b, c\nString.repeat(): AAA\nAdvanced date formatting:\nMay 25, 2026',
+  ObscureStrings: `Demonstrating advanced string features.\nString.join(): a, b, c\nString.repeat(): AAA\nAdvanced date formatting:\n${currentObscureStringsDate()}`,
   ObscureUnicode: 'Hello from ObscureUnicode!\nValue of Π: 3.14159\nValue of Javaは最高: true\nPath: C:\\\\users\\\\default',
   RecursionTest: 'Testing recursion without static fields...\n5! = 120',
   StaticVsInstanceTest: 'Testing static vs instance methods\nStatic method result: 8\nInstance method result: 15',
