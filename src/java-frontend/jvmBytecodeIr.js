@@ -185,38 +185,6 @@ function returnOpcodeForDescriptor(descriptor) {
   return 'areturn';
 }
 
-function defaultReturnInstructions(returnDescriptor) {
-  if (returnDescriptor === 'V') {
-    return { instructions: [createJvmInstruction('return')], maxStack: 0 };
-  }
-  if (returnDescriptor === 'J') {
-    return { instructions: [createJvmInstruction('lconst_0'), createJvmInstruction('lreturn')], maxStack: 2 };
-  }
-  if (returnDescriptor === 'F') {
-    return { instructions: [createJvmInstruction('fconst_0'), createJvmInstruction('freturn')], maxStack: 1 };
-  }
-  if (returnDescriptor === 'D') {
-    return { instructions: [createJvmInstruction('dconst_0'), createJvmInstruction('dreturn')], maxStack: 2 };
-  }
-  if (['I', 'Z', 'B', 'C', 'S'].includes(returnDescriptor)) {
-    return { instructions: [createJvmInstruction('iconst_0'), createJvmInstruction('ireturn')], maxStack: 1 };
-  }
-  return { instructions: [createJvmInstruction('aconst_null'), createJvmInstruction('areturn')], maxStack: 1 };
-}
-
-function unsupportedMethodStub(method, classIr, returnDescriptor) {
-  if (method.name === '<init>') {
-    return {
-      instructions: [
-        createJvmInstruction('aload_0'),
-        createJvmInstruction('invokespecial', ['Method', (classIr && classIr.superName) || 'java/lang/Object', '<init>', '()V']),
-        createJvmInstruction('return'),
-      ],
-      maxStack: 1,
-    };
-  }
-  return defaultReturnInstructions(returnDescriptor);
-}
 
 function arrayLoadOpcodeForDescriptor(descriptor) {
   if (descriptor === 'J') return 'laload';
@@ -1333,20 +1301,8 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
   let finalMaxStack = state.maxStack;
   let finalMeta = method.meta || {};
   if (unsupported.length) {
-    if (options.stubUnsupportedMethods) {
-      const stub = unsupportedMethodStub(method, classIr, returnDescriptor);
-      finalInstructions = stub.instructions;
-      finalExceptionTable = [];
-      finalMaxStack = stub.maxStack;
-      finalMeta = {
-        ...finalMeta,
-        stubbedUnsupportedBody: true,
-        unsupportedReason: unsupported[0],
-      };
-    } else {
-      finalInstructions = [createJvmInstruction('unsupported', [unsupported[0]])];
-      finalExceptionTable = [];
-    }
+    finalInstructions = [createJvmInstruction('unsupported', [unsupported[0]])];
+    finalExceptionTable = [];
   }
 
   return {

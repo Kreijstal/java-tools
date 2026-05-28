@@ -6404,10 +6404,12 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     allocateLambdaClassName: classContext.allocateLambdaClassName,
     constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
-  const isAbstract = classContext.isInterface || modifierNames(method.modifiers).includes('abstract');
+  const methodModifiers = modifierNames(method.modifiers);
+  const isAbstract = classContext.isInterface || methodModifiers.includes('abstract');
+  const hasExternalBody = isAbstract || methodModifiers.includes('native');
   let ops = method.body && method.body.kind === 'BlockStatement'
     ? lowerStatementToJavaIrOps(method.body, context)
-    : (isAbstract ? [] : [javaIrUnsupported(`method body unavailable for ${method.name}`, { sourceNodeKind: method.kind })]);
+    : (hasExternalBody ? [] : [javaIrUnsupported(`method body unavailable for ${method.name}`, { sourceNodeKind: method.kind })]);
   if (method.kind === 'ConstructorDeclaration') {
     const initOps = instanceInitializationOps(classContext, context);
     if (isConstructorDelegationOp(ops[0], context)) {
@@ -6424,7 +6426,7 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
   return createJavaIrMethod({
     name: method.kind === 'ConstructorDeclaration' ? '<init>' : method.name,
     descriptor: declaredDescriptor,
-    access: dedupePreservingOrder((classContext.isInterface ? ['public', 'abstract'] : []).concat(modifierNames(method.modifiers))),
+    access: dedupePreservingOrder((classContext.isInterface ? ['public', 'abstract'] : []).concat(methodModifiers)),
     parameters,
     locals,
     blocks: [block],
