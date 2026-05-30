@@ -1,4 +1,7 @@
 function runtimeClassName(objRef) {
+  if (typeof objRef === 'string' || objRef instanceof String) {
+    return 'java/lang/String';
+  }
   return objRef && (objRef._className || objRef.type);
 }
 
@@ -191,6 +194,18 @@ module.exports = {
         frame.stack.push(currentClassData.staticFields.get(fieldKey));
         return;
       }
+      if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldName)) {
+        frame.stack.push(currentClassData.staticFields.get(fieldName));
+        return;
+      }
+      if (currentClassData && currentClassData.staticFields) {
+        for (const [key, value] of currentClassData.staticFields.entries()) {
+          if (typeof key === 'string' && key.split(':')[0].replace(/'/g, '') === fieldName) {
+            frame.stack.push(value);
+            return;
+          }
+        }
+      }
 
       currentClassName = currentClassData && currentClassData.ast && currentClassData.ast.classes[0]
         ? currentClassData.ast.classes[0].superClassName
@@ -200,7 +215,7 @@ module.exports = {
     // If not found in class registry, try the JRE registry (for JRE classes)
     if (jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields) {
       const jreStaticFields = jvm.jre[className].staticFields;
-      if (jreStaticFields[fieldKey]) {
+      if (Object.prototype.hasOwnProperty.call(jreStaticFields, fieldKey)) {
         frame.stack.push(jreStaticFields[fieldKey]);
         return;
       }
@@ -215,7 +230,7 @@ module.exports = {
       ];
 
       for (const altKey of alternativeKeys) {
-        if (jreStaticFields[altKey]) {
+        if (Object.prototype.hasOwnProperty.call(jreStaticFields, altKey)) {
           frame.stack.push(jreStaticFields[altKey]);
           return;
         }

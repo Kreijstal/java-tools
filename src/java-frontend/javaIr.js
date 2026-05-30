@@ -207,10 +207,17 @@ function internalNameFromClassName(className, packageName = '') {
   return `${String(packageName).replace(/\./g, '/')}/${normalizedClass}`;
 }
 
-function classTypeInternalName(type) {
-  if (type && type.kind === 'ParameterizedType') return classTypeInternalName(type.baseType);
+function classTypeInternalName(type, context = {}) {
+  if (type && type.kind === 'ParameterizedType') return classTypeInternalName(type.baseType, context);
   if (!type || type.kind !== 'ClassType') return 'java/lang/Object';
   if (type.packageName) {
+    const dotted = `${type.packageName}.${type.name}`;
+    if (context.classBySimpleName && context.classBySimpleName.has(dotted)) {
+      return context.classBySimpleName.get(dotted);
+    }
+    if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
+      return context.classBySimpleName.get(type.name);
+    }
     return `${String(type.packageName).replace(/\./g, '/')}/${type.name}`;
   }
   if ([
@@ -230,6 +237,9 @@ function classTypeInternalName(type) {
   if (type.name === 'ReentrantLock') return 'java/util/concurrent/locks/ReentrantLock';
   if (type.name === 'Function') return 'java/util/function/Function';
   if (['Array', 'Field', 'Method', 'Modifier'].includes(type.name)) return `java/lang/reflect/${type.name}`;
+  if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
+    return context.classBySimpleName.get(type.name);
+  }
   return String(type.name).replace(/\./g, '/');
 }
 
@@ -1076,7 +1086,7 @@ function literalTokenToJavaIrValue(token) {
       kind: 'LiteralValue',
       type: 'Ljava/lang/String;',
       literalKind: 'string',
-      value: token.text.slice(1, -1),
+      value: Object.prototype.hasOwnProperty.call(token, 'value') ? token.value : token.text.slice(1, -1),
       raw: token.text,
     };
   }
@@ -3825,7 +3835,14 @@ function lowerMethodInvocationWithExpectedDescriptor(expression, context, expect
   if (expression.target) {
     const targetParts = chainParts(expression.target);
     const targetIsLocal = targetParts.length === 1 && context.localByName.has(targetParts[0]);
-    if (targetParts.length > 0 && !targetIsLocal) {
+    const targetIsField = targetParts.length === 1
+      && ((context.fieldByName && context.fieldByName.has(targetParts[0]))
+        || (context.outerFieldByName && context.outerFieldByName.has(targetParts[0])));
+    const instanceCall = targetIsLocal || targetIsField
+      ? lowerInstanceMethodCall(expression, context)
+      : null;
+    if (instanceCall) return instanceCall;
+    if (targetParts.length > 0 && !targetIsLocal && !targetIsField) {
       const owner = resolveClassInternalNameFromParts(targetParts, context);
       if (owner) {
         return {
@@ -4247,13 +4264,12 @@ function lowerExpressionToJavaIrValue(expression, context) {
     if (inherited) return inherited;
   }
   if (expression && expression.kind === 'MethodInvocationExpression' && expression.target) {
+    const instanceCall = lowerInstanceMethodCall(expression, context);
+    if (instanceCall) return instanceCall;
     const call = lowerKnownStaticMethodCall(expression, context)
       || lowerStaticUserMethodCall(expression, context)
       || lowerStaticWrapperMethodCall(expression, context);
     if (call) return call;
-  }
-  if (expression && expression.kind === 'MethodInvocationExpression' && expression.target) {
-    return lowerInstanceMethodCall(expression, context);
   }
   return null;
 }
@@ -4325,6 +4341,15 @@ function coerceValueToDescriptor(value, descriptor) {
   if (primitive && ['I', 'J', 'F', 'D', 'B', 'S', 'C', 'Z'].includes(descriptor)) {
     const unboxed = boxedPrimitiveValue(value);
     return primitive === descriptor ? unboxed : coerceValueToDescriptor(unboxed, descriptor);
+  }
+  const wrapperOwner = PRIMITIVE_WRAPPER_BY_DESCRIPTOR[descriptor];
+  if (wrapperOwner && value.type === 'Ljava/lang/Object;') {
+    return coerceValueToDescriptor({
+      kind: 'CastValue',
+      type: `L${wrapperOwner};`,
+      fromType: value.type,
+      value,
+    }, descriptor);
   }
   if (typeof value.type === 'string' && typeof descriptor === 'string'
       && value.type.startsWith('L') && descriptor.startsWith('L')) {

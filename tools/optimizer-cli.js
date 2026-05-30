@@ -3,7 +3,7 @@
 const fs = require('fs');
 const fsp = fs.promises;
 const path = require('path');
-const yargs = require('yargs/yargs');
+const yargs = require('yargs');
 const { hideBin } = require('yargs/helpers');
 const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');

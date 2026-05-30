@@ -512,7 +512,16 @@ class JVM {
 
   async createAppletInstance(className) {
     // Ensure class is loaded
-    await this.initializeClassIfNeeded(className, this.threads[0]);
+    const thread = this.threads[0];
+    let wasFramePushed = await this.initializeClassIfNeeded(className, thread);
+    while (wasFramePushed) {
+      const originalStackSize = thread.callStack.size();
+      while (thread.callStack.size() >= originalStackSize) {
+        const result = await this.executeTick();
+        if (result.completed) break;
+      }
+      wasFramePushed = await this.initializeClassIfNeeded(className, thread);
+    }
     /* HARDENED: Rethrow with more context */
     await this.loadClassByName(className).catch(err => {
       throw new Error(`createAppletInstance failed: could not load class ${className}`, { cause: err });
@@ -1569,6 +1578,7 @@ class JVM {
   isInstanceOf(className, target) {
     if (!className) return false;
     if (className === target) return true;
+    if (target && !target.includes('/') && typeof className === 'string' && className.endsWith(`/${target}`)) return true;
     if (target === "java/lang/Object" && className !== null) return true;
 
     if (className.startsWith && className.startsWith('[')) {
@@ -1602,6 +1612,7 @@ class JVM {
   async isInstanceOfAsync(className, target, seen = new Set()) {
     if (!className) return false;
     if (className === target) return true;
+    if (target && !target.includes('/') && typeof className === 'string' && className.endsWith(`/${target}`)) return true;
     if (target === "java/lang/Object" && className !== null) return true;
 
     const visitKey = `${className}->${target}`;

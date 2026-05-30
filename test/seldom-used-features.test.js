@@ -76,7 +76,7 @@ Finally block executed for test case 2
 
 Test case 3:
 Caught multi-catch exception: NullPointerException
-Message: Cannot invoke "String.length()" because "<local4>" is null
+Message: Cannot invoke "String.length()" because "<local6>" is null
 Finally block executed for test case 3
 
 Test case 4:
