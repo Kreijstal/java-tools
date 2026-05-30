@@ -4131,13 +4131,12 @@ function lowerExpressionToJavaIrValue(expression, context) {
     if (recoveredNewOwner) {
       const owner = recoveredNewOwner;
       const captureArgs = constructorCaptureArgs(owner, context);
-      const args = (expression.arguments || []).map((argument) => {
-        if (owner === 'java/lang/Thread') {
-          const value = lowerLambdaToJavaIrValue(argument, 'Ljava/lang/Runnable;', context)
-            || lowerExpressionToJavaIrValue(argument, context);
-          return value ? coerceValueToDescriptor(value, 'Ljava/lang/Runnable;') : null;
-        }
-        return lowerExpressionToJavaIrValue(argument, context);
+      const args = (expression.arguments || []).map((argument, index) => {
+        const value = owner === 'java/lang/Thread' && index === 0
+          ? lowerLambdaToJavaIrValue(argument, 'Ljava/lang/Runnable;', context)
+            || lowerExpressionToJavaIrValue(argument, context)
+          : lowerExpressionToJavaIrValue(argument, context);
+        return value || null;
       });
       if (args.every(Boolean) && captureArgs.every(Boolean)) {
         const constructorArgs = captureArgs.concat(args);
