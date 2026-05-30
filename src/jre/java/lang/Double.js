@@ -1,3 +1,44 @@
+function javaDoubleString(value) {
+  const d = Number(value);
+  if (isNaN(d)) {
+    return "NaN";
+  }
+  if (d === Number.POSITIVE_INFINITY) {
+    return "Infinity";
+  }
+  if (d === Number.NEGATIVE_INFINITY) {
+    return "-Infinity";
+  }
+  if (Object.is(d, -0)) {
+    return "-0.0";
+  }
+  if (d === 0.0) {
+    return "0.0";
+  }
+
+  const absD = Math.abs(d);
+  let s;
+
+  if (absD >= 1e-3 && absD < 1e7) {
+    s = String(d);
+    if (s.indexOf('.') === -1) {
+      s += '.0';
+    }
+  } else {
+    s = d.toExponential().toUpperCase().replace(/E\+/, 'E');
+    let [mantissa, exponent] = s.split('E');
+    if (mantissa.includes('.')) {
+      mantissa = mantissa.replace(/0+$/, '');
+      if (mantissa.endsWith('.')) {
+        mantissa = mantissa.slice(0, -1);
+      }
+    }
+    s = mantissa + 'E' + exponent;
+  }
+
+  return s;
+}
+
 module.exports = {
   super: "java/lang/Object",
   staticFields: {
@@ -44,7 +85,7 @@ module.exports = {
 
       // Add JavaScript toString method for proper string concatenation
       doubleObj.toString = function () {
-        return this.value.toString();
+        return javaDoubleString(this.value);
       };
 
       return doubleObj;
@@ -62,44 +103,7 @@ module.exports = {
       return isFinite(value) ? 1 : 0;
     },
     "toString(D)Ljava/lang/String;": (jvm, obj, args) => {
-      const d = args[0];
-      if (isNaN(d)) {
-        return jvm.internString("NaN");
-      }
-      if (d === Number.POSITIVE_INFINITY) {
-        return jvm.internString("Infinity");
-      }
-      if (d === Number.NEGATIVE_INFINITY) {
-        return jvm.internString("-Infinity");
-      }
-      if (d === 0.0) {
-        return jvm.internString('0.0');
-      }
-      if (d === -0.0) {
-        return jvm.internString('-0.0');
-      }
-
-      const absD = Math.abs(d);
-      let s;
-
-      if (absD >= 1e-3 && absD < 1e7) {
-        s = String(d);
-        if (s.indexOf('.') === -1) {
-            s += '.0';
-        }
-      } else {
-        s = d.toExponential().toUpperCase().replace(/E\+/, 'E');
-        let [mantissa, exponent] = s.split('E');
-        if (mantissa.includes('.')) {
-          mantissa = mantissa.replace(/0+$/, '');
-          if (mantissa.endsWith('.')) {
-            mantissa = mantissa.slice(0, -1);
-          }
-        }
-        s = mantissa + 'E' + exponent;
-      }
-
-      return jvm.internString(s);
+      return jvm.internString(javaDoubleString(args[0]));
     },
   },
   methods: {
@@ -108,7 +112,7 @@ module.exports = {
 
       // Add JavaScript toString method for proper string concatenation
       obj.toString = function () {
-        return this.value.toString();
+        return javaDoubleString(this.value);
       };
     },
     "doubleValue()D": (jvm, obj, args) => {

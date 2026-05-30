@@ -965,6 +965,7 @@ function decompileStructuredControlFlow(code, method, cls, localState) {
     cls,
     localState,
     labelIndex: buildLabelIndex(codeItems),
+    exceptionTable: code.exceptionTable || [],
   };
   const result = decompileRange(codeItems, 0, codeItems.length, context, []);
   if (!result.ok) return null;
@@ -981,6 +982,14 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
     const instruction = getInstructionAt(codeItems, index);
     if (!instruction) {
       index += 1;
+      continue;
+    }
+
+    const tryCatch = tryDecompileTryCatchAt(codeItems, index, end, context, stack);
+    if (tryCatch) {
+      lines.push(...tryCatch.lines);
+      stack.splice(0, stack.length, ...tryCatch.stack);
+      index = tryCatch.next;
       continue;
     }
 
@@ -1005,6 +1014,21 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       lines.push(...doLoop.lines);
       stack.splice(0, stack.length, ...doLoop.stack);
       index = doLoop.next;
+      continue;
+    }
+
+    const stackTernary = tryDecompileStackTernaryAt(codeItems, index, end, context, stack);
+    if (stackTernary) {
+      stack.splice(0, stack.length, ...stackTernary.stack);
+      index = stackTernary.next;
+      continue;
+    }
+
+    const materializedBooleanGuard = tryDecompileMaterializedBooleanGuardAt(codeItems, index, end, context, stack);
+    if (materializedBooleanGuard) {
+      lines.push(...materializedBooleanGuard.lines);
+      stack.splice(0, stack.length, ...materializedBooleanGuard.stack);
+      index = materializedBooleanGuard.next;
       continue;
     }
 
@@ -1074,6 +1098,88 @@ function updateVariableName(updateLine) {
 
 function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
+  if (stack.length) return null;
+  const startLabel = labelName(codeItems[index]);
+  if (!startLabel) return null;
+
+  const entries = (context.exceptionTable || [])
+    .filter((entry) => entry.startLbl === startLabel && entry.catch_type && entry.catch_type !== 'any')
+    .sort((a, b) => {
+      const left = context.labelIndex.get(a.handlerLbl) ?? 0;
+      const right = context.labelIndex.get(b.handlerLbl) ?? 0;
+      return left - right;
+    });
+  if (!entries.length) return null;
+  if (!entries.every((entry) => entry.endLbl === entries[0].endLbl)) return null;
+
+  const tryEnd = context.labelIndex.get(entries[0].endLbl);
+  if (tryEnd === undefined || tryEnd <= index || tryEnd >= end) return null;
+  const endInstruction = getInstructionAt(codeItems, tryEnd);
+  if (!endInstruction || endInstruction.op !== 'goto') return null;
+  const afterIndex = context.labelIndex.get(endInstruction.arg);
+  if (afterIndex === undefined || afterIndex <= tryEnd || afterIndex > end) return null;
+
+  const handlers = [];
+  for (const entry of entries) {
+    const handlerIndex = context.labelIndex.get(entry.handlerLbl);
+    if (handlerIndex === undefined || handlerIndex <= tryEnd || handlerIndex >= afterIndex) return null;
+    handlers.push({ entry, handlerIndex });
+  }
+  if (handlers[0].handlerIndex <= tryEnd) return null;
+
+  const tryBody = decompileRange(codeItems, index, tryEnd, context, []);
+  if (!tryBody.ok || tryBody.stack.length) return null;
+
+  const lines = ['try {'];
+  indentLines(tryBody.lines).forEach((line) => lines.push(line));
+
+  for (let handlerOffset = 0; handlerOffset < handlers.length; handlerOffset += 1) {
+    const handler = handlers[handlerOffset];
+    const nextHandler = handlers[handlerOffset + 1];
+    const rawHandlerEnd = nextHandler ? nextHandler.handlerIndex : afterIndex;
+    const handlerEnd = stripTrailingGotoTo(codeItems, handler.handlerIndex, rawHandlerEnd, endInstruction.arg);
+    if (handlerEnd === -1) return null;
+
+    const catchType = javaTypeFromInternalName(handler.entry.catch_type || 'java/lang/Throwable');
+    let catchVariable = defaultCatchVariableName(handler.entry.catch_type);
+    let bodyStart = handler.handlerIndex;
+    const firstHandlerInstruction = getInstructionAt(codeItems, bodyStart);
+    const storeIndex = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
+    if (storeIndex && storeIndex.type === 'Object') {
+      catchVariable = localCatchName(context.localState, storeIndex.index, catchType, catchVariable);
+      bodyStart += 1;
+    }
+
+    const catchBody = decompileRange(codeItems, bodyStart, handlerEnd, context, []);
+    if (!catchBody.ok || catchBody.stack.length) return null;
+    lines.push(`} catch (${catchType} ${catchVariable}) {`);
+    indentLines(catchBody.lines).forEach((line) => lines.push(line));
+  }
+
+  lines.push('}');
+  return { lines, next: afterIndex, stack: [] };
+}
+
+function stripTrailingGotoTo(codeItems, start, end, targetLabel) {
+  const last = previousExecutableIndex(codeItems, end, start);
+  if (last === -1) return end;
+  const instruction = getInstructionAt(codeItems, last);
+  if (instruction && instruction.op === 'goto' && instruction.arg === targetLabel) return last;
+  if (instruction && (instruction.op === 'athrow' || instruction.op === 'return' || RETURN_OPS.has(instruction.op))) return end;
+  return -1;
+}
+
+function localCatchName(localState, index, catchType, fallbackName) {
+  const existing = localState.nameFor(index, catchType);
+  if (/^var\d+$/.test(existing)) {
+    localState.setLocal(index, fallbackName, catchType, true);
+    return fallbackName;
+  }
+  localState.markDeclared(index);
+  return existing;
 }
 
 function tryDecompileSwitchAt(codeItems, index, end, context, stack) {
@@ -1235,6 +1341,117 @@ function tryDecompileDoWhileAt(codeItems, index, end, context, stack) {
   return null;
 }
 
+function tryDecompileStackTernaryAt(codeItems, index, end, context, stack) {
+  const branchIndex = findNextConditionalBranch(codeItems, index, end);
+  if (branchIndex === -1) return null;
+  const branch = getInstructionAt(codeItems, branchIndex);
+  const falseStart = context.labelIndex.get(branch.arg);
+  if (falseStart === undefined || falseStart <= branchIndex || falseStart >= end) return null;
+  if (!conditionPrefixIsExpressionOnly(codeItems, index, branchIndex)) return null;
+
+  const trueGotoIndex = previousExecutableIndex(codeItems, falseStart, branchIndex + 1);
+  const trueGoto = trueGotoIndex === -1 ? null : getInstructionAt(codeItems, trueGotoIndex);
+  if (!trueGoto || trueGoto.op !== 'goto') return null;
+  const joinIndex = context.labelIndex.get(trueGoto.arg);
+  if (joinIndex === undefined || joinIndex <= falseStart || joinIndex > end) return null;
+
+  const condition = evaluateConditionPrefix(codeItems, index, branchIndex, context, stack, true);
+  if (!condition || condition.prefixLines.length) return null;
+
+  const trueStack = evaluateStackOnlyRange(codeItems, branchIndex + 1, trueGotoIndex, context, condition.stack);
+  if (!trueStack || trueStack.length !== condition.stack.length + 1) return null;
+
+  const falseStack = evaluateStackOnlyRange(codeItems, falseStart, joinIndex, context, condition.stack);
+  if (!falseStack || falseStack.length !== condition.stack.length + 1) return null;
+
+  const trueValue = trueStack[trueStack.length - 1];
+  const falseValue = falseStack[falseStack.length - 1];
+  const nextStack = condition.stack.slice();
+  nextStack.push(expr(`${wrap(condition.condition, 20)} ? ${trueValue.code} : ${falseValue.code}`, trueValue.type || falseValue.type, 20));
+  return { next: joinIndex, stack: nextStack };
+}
+
+function evaluateStackOnlyRange(codeItems, start, end, context, initialStack) {
+  const stack = initialStack.slice();
+  let index = start;
+  while (index < end) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction || instruction.op === 'nop') {
+      index += 1;
+      continue;
+    }
+
+    const stackTernary = tryDecompileStackTernaryAt(codeItems, index, end, context, stack);
+    if (stackTernary) {
+      stack.splice(0, stack.length, ...stackTernary.stack);
+      index = stackTernary.next;
+      continue;
+    }
+
+    const lines = decompileLinearCodeItems([codeItems[index]], context.method, context.cls, context.localState, {
+      initialStack: stack,
+      mutateStack: true,
+      keepTrailingReturn: true,
+    });
+    if (lines.length) return null;
+    index += 1;
+  }
+  return stack;
+}
+
+function tryDecompileMaterializedBooleanGuardAt(codeItems, index, end, context, stack) {
+  const branchIndex = findNextConditionalBranch(codeItems, index, end);
+  if (branchIndex === -1) return null;
+  const branch = getInstructionAt(codeItems, branchIndex);
+  const falseValueIndex = context.labelIndex.get(branch.arg);
+  if (falseValueIndex === undefined || falseValueIndex <= branchIndex || falseValueIndex >= end) return null;
+  if (!conditionPrefixIsExpressionOnly(codeItems, index, branchIndex)) return null;
+
+  const trueValueIndex = nextExecutableIndex(codeItems, branchIndex + 1);
+  if (trueValueIndex === -1 || trueValueIndex >= falseValueIndex) return null;
+  const trueValue = booleanConstantValue(getInstructionAt(codeItems, trueValueIndex));
+  if (trueValue === null) return null;
+
+  const joinGotoIndex = nextExecutableIndex(codeItems, trueValueIndex + 1);
+  const joinGoto = joinGotoIndex === -1 ? null : getInstructionAt(codeItems, joinGotoIndex);
+  if (!joinGoto || joinGoto.op !== 'goto') return null;
+  const joinIndex = context.labelIndex.get(joinGoto.arg);
+  if (joinIndex === undefined || joinIndex <= falseValueIndex || joinIndex >= end) return null;
+
+  const falseValue = booleanConstantValue(getInstructionAt(codeItems, falseValueIndex));
+  if (falseValue === null) return null;
+  const afterFalseValueIndex = nextExecutableIndex(codeItems, falseValueIndex + 1);
+  if (afterFalseValueIndex !== joinIndex) return null;
+
+  const guardIndex = nextNonNopExecutableIndex(codeItems, joinIndex);
+  const guard = guardIndex === -1 ? null : getInstructionAt(codeItems, guardIndex);
+  if (!guard || (guard.op !== 'ifeq' && guard.op !== 'ifne')) return null;
+  const exitIndex = context.labelIndex.get(guard.arg);
+  if (exitIndex === undefined || exitIndex <= guardIndex || exitIndex > end) return null;
+
+  const condition = evaluateConditionPrefix(codeItems, index, branchIndex, context, stack, true);
+  if (!condition || condition.prefixLines.length) return null;
+
+  const bodyWhenTrueValue = guard.op === 'ifeq' ? trueValue !== false : trueValue === false;
+  const bodyWhenFalseValue = guard.op === 'ifeq' ? falseValue !== false : falseValue === false;
+  let bodyCondition = null;
+  if (bodyWhenTrueValue && !bodyWhenFalseValue) {
+    bodyCondition = condition.condition;
+  } else if (!bodyWhenTrueValue && bodyWhenFalseValue) {
+    bodyCondition = negateBooleanExpression(condition.condition);
+  } else {
+    return null;
+  }
+
+  const body = decompileRange(codeItems, guardIndex + 1, exitIndex, context, []);
+  if (!body.ok) return null;
+
+  const lines = [`if (${bodyCondition.code}) {`];
+  indentLines(body.lines).forEach((line) => lines.push(line));
+  lines.push('}');
+  return { lines, next: exitIndex, stack: condition.stack };
+}
+
 function findConditionSuffixStart(codeItems, bodyStart, branchIndex, context, initialStack, invertBranch) {
   for (let start = branchIndex - 1; start >= bodyStart; start -= 1) {
     if (!conditionPrefixIsExpressionOnly(codeItems, start, branchIndex)) continue;
@@ -1355,10 +1572,51 @@ function conditionForBranch(branch, stack, invert) {
       const isTruthy = operator === '!=';
       return isTruthy ? expr(value.code, 'boolean', value.precedence) : negateBooleanExpression(value);
     }
+    const materializedBoolean = simplifyMaterializedBooleanCondition(value, operator);
+    if (materializedBoolean) return materializedBoolean;
     return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60);
   }
 
   return expr(`/* unsupported condition ${op} */`, 'boolean');
+}
+
+function simplifyMaterializedBooleanCondition(value, operator) {
+  if (!value || !value.code || (operator !== '==' && operator !== '!=')) return null;
+  const nested = simplifyNestedMaterializedBooleanCondition(value, operator);
+  if (nested) return nested;
+  const match = /^(?:\(([^?]+)\)|([^?]+)) \? ([01]) : ([01])$/.exec(value.code);
+  if (!match) return null;
+  const conditionCode = match[1] || match[2];
+  const trueValue = match[3] === '1';
+  const falseValue = match[4] === '1';
+  if (trueValue === falseValue) return null;
+  const comparisonTruthy = operator === '!=';
+  const conditionMeansTrue = trueValue === comparisonTruthy;
+  const condition = expr(conditionCode, 'boolean', 20);
+  return conditionMeansTrue ? condition : negateBooleanExpression(condition);
+}
+
+function simplifyNestedMaterializedBooleanCondition(value, operator) {
+  const match = /^(.+?) \? ([01]) : (.+?) \? ([01]) : ([01])$/.exec(value.code);
+  if (!match) return null;
+  const firstCondition = expr(match[1], 'boolean', 20);
+  const firstValue = materializedIntMeansConditionTrue(match[2], operator);
+  const secondCondition = expr(match[3], 'boolean', 20);
+  const secondValue = materializedIntMeansConditionTrue(match[4], operator);
+  const finalValue = materializedIntMeansConditionTrue(match[5], operator);
+
+  if (firstValue && !secondValue && finalValue) {
+    return expr(`${wrap(firstCondition, 30)} || ${negateBooleanExpression(secondCondition).code}`, 'boolean', 30);
+  }
+  if (!firstValue && secondValue && !finalValue) {
+    return expr(`${negateBooleanExpression(firstCondition).code} && ${wrap(secondCondition, 40)}`, 'boolean', 40);
+  }
+  return null;
+}
+
+function materializedIntMeansConditionTrue(value, operator) {
+  const truthy = value === '1';
+  return operator === '!=' ? truthy : !truthy;
 }
 
 function readBooleanReturnArm(codeItems, startIndex, labelIndex) {
@@ -1423,6 +1681,14 @@ function nextExecutableIndex(codeItems, fromInclusive) {
   return -1;
 }
 
+function nextNonNopExecutableIndex(codeItems, fromInclusive) {
+  for (let i = fromInclusive; i < codeItems.length; i += 1) {
+    const instruction = getInstructionAt(codeItems, i);
+    if (instruction && instruction.op !== 'nop') return i;
+  }
+  return -1;
+}
+
 function getInstructionAt(codeItems, index) {
   return getInstructionFromItem(codeItems[index]);
 }
@@ -1449,6 +1715,9 @@ function isBooleanExpression(value) {
 function negateBooleanExpression(value) {
   if (value.code === 'true') return expr('false', 'boolean');
   if (value.code === 'false') return expr('true', 'boolean');
+  if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value.code)) return expr(`!${value.code}`, 'boolean', 90);
+  const comparison = /^(.+) (==|!=|<|<=|>|>=) (.+)$/.exec(value.code);
+  if (comparison) return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60);
   return expr(`!${wrap(value, 90)}`, 'boolean', 90);
 }
 

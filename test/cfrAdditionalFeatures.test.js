@@ -75,6 +75,79 @@ LeitherDone:
     .end code
 .end method
 
+.method public guard : (Z)V
+    .code stack 3 locals 2
+L40: iload_1
+L41: ifeq LguardFalse
+L44: iconst_0
+L45: goto LguardJoin
+LguardFalse: iconst_1
+LguardJoin: ifeq LguardDone
+L49: new java/lang/RuntimeException
+L52: dup
+L53: ldc "bad"
+L55: invokespecial Method java/lang/RuntimeException <init> (Ljava/lang/String;)V
+L58: athrow
+LguardDone: return
+LguardEnd:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from L40 to LguardEnd
+            1 is ok Z from L40 to LguardEnd
+        .end localvariabletable
+    .end code
+.end method
+
+.method public printChoice : (ZLjava/io/PrintStream;Ljava/lang/String;Ljava/lang/String;)V
+    .code stack 2 locals 5
+L65: aload_2
+L66: iload_1
+L67: ifeq LchoiceFalse
+L70: aload_3
+L71: goto LchoiceJoin
+LchoiceFalse: aload 4
+LchoiceJoin: invokevirtual Method java/io/PrintStream print (Ljava/lang/String;)V
+L76: return
+LchoiceEnd:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from L65 to LchoiceEnd
+            1 is flag Z from L65 to LchoiceEnd
+            2 is out Ljava/io/PrintStream; from L65 to LchoiceEnd
+            3 is yes Ljava/lang/String; from L65 to LchoiceEnd
+            4 is no Ljava/lang/String; from L65 to LchoiceEnd
+        .end localvariabletable
+    .end code
+.end method
+
+.method public bounds : (I)V
+    .code stack 2 locals 2
+L80: iload_1
+L81: iconst_0
+L82: if_icmpge LboundsSecond
+L85: iconst_1
+L86: goto LboundsJoin
+LboundsSecond: iload_1
+L89: bipush 100
+L91: if_icmpge LboundsHigh
+L94: iconst_0
+L95: goto LboundsInnerJoin
+LboundsHigh: iconst_1
+LboundsInnerJoin: nop
+LboundsJoin: nop
+L99: ifeq LboundsDone
+L102: new java/lang/RuntimeException
+L105: dup
+L106: ldc "bounds"
+L108: invokespecial Method java/lang/RuntimeException <init> (Ljava/lang/String;)V
+L111: athrow
+LboundsDone: return
+LboundsEnd:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from L80 to LboundsEnd
+            1 is value I from L80 to LboundsEnd
+        .end localvariabletable
+    .end code
+.end method
+
 .method public countDownOnce : (I)I
     .code stack 2 locals 3
 L50: iconst_0
@@ -268,7 +341,7 @@ function decompileFixture(tempDir, name, source) {
 }
 
 test('CFR-JS reconstructs additional expression and declaration features', (t) => {
-  t.plan(14);
+  t.plan(17);
   withTempDir('cfr-additional-', (tempDir) => {
     const source = decompileFixture(tempDir, 'AdditionalFeatureTest', ADDITIONAL_FEATURES_JASMIN);
 
@@ -278,6 +351,9 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public int chooseInt\(boolean flag\) \{\s*return flag \? 10 : 20;\s*}/, 'conditional value branches are reconstructed as ternary returns');
     t.match(source, /public boolean both\(boolean left, boolean right\) \{\s*return left && right;\s*}/, 'short-circuit boolean AND returns are reconstructed');
     t.match(source, /public boolean either\(boolean left, boolean right\) \{\s*return left \|\| right;\s*}/, 'short-circuit boolean OR returns are reconstructed');
+    t.match(source, /public void guard\(boolean ok\) \{\s*if \(!ok\) \{\s*throw new RuntimeException\("bad"\);\s*}\s*}/, 'materialized boolean guard branches are reconstructed');
+    t.match(source, /public void printChoice\(boolean flag, PrintStream out, String yes, String no\) \{\s*out\.print\(flag \? yes : no\);\s*}/, 'stack ternary values survive into following calls');
+    t.match(source, /public void bounds\(int value\) \{\s*if \(\(?value < 0\)? \|\| value >= 100\) \{\s*throw new RuntimeException\("bounds"\);\s*}\s*}/, 'nested materialized boolean guards simplify to boolean expressions');
     t.match(source, /public int countDownOnce\(int n\) \{\s*int count = 0;\s*do \{\s*count = count \+ 1;\s*n--;\s*} while \(n > 0\);\s*return count;\s*}/, 'back-edge conditional loops are reconstructed as do/while');
     t.match(source, /public int sumFor\(int n\) \{\s*int sum = 0;\s*for \(int i = 0; i < n; i\+\+\) \{\s*sum = sum \+ i;\s*}\s*return sum;\s*}/, 'counting loops are reconstructed as for loops');
     t.match(source, /public String\[\] words\(\) \{\s*String\[\] words = new String\[\]\{"alpha", "beta"\};\s*return words;\s*}/, 'object array initialisation is condensed');

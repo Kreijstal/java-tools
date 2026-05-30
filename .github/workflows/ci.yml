@@ -74,7 +74,7 @@ jobs:
         run: npm run build:bundle
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
-        timeout-minutes: 10
+        timeout-minutes: 20
       - name: Run Playwright tests
         run: timeout 300 npm run test:playwright
         timeout-minutes: 6

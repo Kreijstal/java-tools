@@ -1,3 +1,44 @@
+function javaFloatString(value) {
+  const f = Number(value);
+  if (isNaN(f)) {
+    return "NaN";
+  }
+  if (f === Number.POSITIVE_INFINITY) {
+    return "Infinity";
+  }
+  if (f === Number.NEGATIVE_INFINITY) {
+    return "-Infinity";
+  }
+  if (Object.is(f, -0)) {
+    return "-0.0";
+  }
+  if (f === 0.0) {
+    return "0.0";
+  }
+
+  const absF = Math.abs(f);
+  let s;
+
+  if (absF >= 1e-3 && absF < 1e7) {
+    s = String(f);
+    if (s.indexOf('.') === -1) {
+      s += '.0';
+    }
+  } else {
+    s = f.toExponential().toUpperCase().replace(/E\+/, 'E');
+    let [mantissa, exponent] = s.split('E');
+    if (mantissa.includes('.')) {
+      mantissa = mantissa.replace(/0+$/, '');
+      if (mantissa.endsWith('.')) {
+        mantissa = mantissa.slice(0, -1);
+      }
+    }
+    s = mantissa + 'E' + exponent;
+  }
+
+  return s;
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
@@ -39,7 +80,7 @@ module.exports = {
       };
 
       floatObj.toString = function() {
-        return this.value.toString();
+        return javaFloatString(this.value);
       };
 
       return floatObj;
@@ -55,44 +96,7 @@ module.exports = {
       return isFinite(args[0]) ? 1 : 0;
     },
     'toString(F)Ljava/lang/String;': (jvm, obj, args) => {
-      const f = args[0];
-      if (isNaN(f)) {
-        return jvm.internString("NaN");
-      }
-      if (f === Number.POSITIVE_INFINITY) {
-        return jvm.internString("Infinity");
-      }
-      if (f === Number.NEGATIVE_INFINITY) {
-        return jvm.internString("-Infinity");
-      }
-      if (f === 0.0) {
-        return jvm.internString('0.0');
-      }
-      if (f === -0.0) {
-        return jvm.internString('-0.0');
-      }
-
-      const absF = Math.abs(f);
-      let s;
-
-      if (absF >= 1e-3 && absF < 1e7) {
-        s = String(f);
-        if (s.indexOf('.') === -1) {
-            s += '.0';
-        }
-      } else {
-        s = f.toExponential().toUpperCase().replace(/E\+/, 'E');
-        let [mantissa, exponent] = s.split('E');
-        if (mantissa.includes('.')) {
-          mantissa = mantissa.replace(/0+$/, '');
-          if (mantissa.endsWith('.')) {
-            mantissa = mantissa.slice(0, -1);
-          }
-        }
-        s = mantissa + 'E' + exponent;
-      }
-
-      return jvm.internString(s);
+      return jvm.internString(javaFloatString(args[0]));
     },
   },
   methods: {
@@ -100,14 +104,14 @@ module.exports = {
       obj.value = args[0];
 
       obj.toString = function() {
-        return this.value.toString();
+        return javaFloatString(this.value);
       };
     },
     'floatValue()F': (jvm, obj, args) => {
       return obj.value;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      return jvm.internString(obj.value.toString());
+      return jvm.internString(javaFloatString(obj.value));
     },
     'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
       return {

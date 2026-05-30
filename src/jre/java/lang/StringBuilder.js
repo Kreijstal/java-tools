@@ -38,6 +38,9 @@ function valueAsString(value) {
     if (value.type === 'java/lang/Boolean') {
       return value.value ? 'true' : 'false';
     }
+    if ((value.type === 'java/lang/Double' || value.type === 'java/lang/Float') && typeof value.toString === 'function') {
+      return value.toString();
+    }
     if (Object.prototype.hasOwnProperty.call(value, 'value')) {
       return String(value.value);
     }
@@ -123,11 +126,13 @@ module.exports = {
       return obj;
     },
     'append(F)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
-      obj.value += args[0];
+      const floatClass = jvm.classes['java/lang/Float'];
+      obj.value += valueAsString(floatClass.staticMethods['toString(F)Ljava/lang/String;'](jvm, null, args));
       return obj;
     },
     'append(D)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
-      obj.value += args[0];
+      const doubleClass = jvm.classes['java/lang/Double'];
+      obj.value += valueAsString(doubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, args));
       return obj;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
