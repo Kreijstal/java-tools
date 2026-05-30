@@ -89,15 +89,45 @@ function makeRange(startOffset, endOffset, startLine, startColumn, endLine, endC
   };
 }
 
+function decodeJavaEscapes(value) {
+  let result = '';
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (ch !== '\\' || i + 1 >= value.length) {
+      result += ch;
+      continue;
+    }
+
+    const next = value[++i];
+    if (next === 'b') result += '\b';
+    else if (next === 't') result += '\t';
+    else if (next === 'n') result += '\n';
+    else if (next === 'f') result += '\f';
+    else if (next === 'r') result += '\r';
+    else if (next === '"' || next === '\'' || next === '\\') result += next;
+    else if (/[0-7]/.test(next)) {
+      let octal = next;
+      const maxExtra = next <= '3' ? 2 : 1;
+      for (let j = 0; j < maxExtra && i + 1 < value.length && /[0-7]/.test(value[i + 1]); j++) {
+        octal += value[++i];
+      }
+      result += String.fromCharCode(Number.parseInt(octal, 8));
+    } else {
+      result += next;
+    }
+  }
+  return result;
+}
+
 function decodeSimpleLiteral(kind, raw) {
   if (kind === 'string') {
-    return raw.slice(1, -1);
+    return decodeJavaEscapes(raw.slice(1, -1));
   }
   if (kind === 'char') {
-    return raw.slice(1, -1);
+    return decodeJavaEscapes(raw.slice(1, -1));
   }
   if (kind === 'textBlock') {
-    return raw.slice(3, -3);
+    return decodeJavaEscapes(raw.slice(3, -3));
   }
   return raw;
 }

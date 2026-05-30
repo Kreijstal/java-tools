@@ -270,7 +270,7 @@ class JitCompiler {
     if (debug.breakpoints.size === 0) {
       return false;
     }
-    const item = frame.instructions[pc];
+    const item = frame.instructions[pc - 1];
     if (!item || !item.labelDef) {
       return false;
     }

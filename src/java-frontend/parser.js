@@ -29,6 +29,7 @@ function compactToken(token) {
   return {
     kind: token.kind,
     text: token.text,
+    value: token.value,
     range: token.range,
   };
 }

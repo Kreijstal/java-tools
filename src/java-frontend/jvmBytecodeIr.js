@@ -278,7 +278,9 @@ function doublePushInstruction(value) {
   const parsed = parseJavaFloatingLiteral(value);
   if (Object.is(parsed, 0)) return createJvmInstruction('dconst_0');
   if (parsed === 1) return createJvmInstruction('dconst_1');
-  return createJvmInstruction('ldc2_w', [String(parsed)]);
+  const text = String(parsed);
+  const literal = /^[+-]?\d+$/.test(text) ? `${text}.0` : text;
+  return createJvmInstruction('ldc2_w', [literal]);
 }
 
 function intCompatibleInvokeDescriptor(descriptor) {
@@ -862,14 +864,14 @@ function defaultConstructorMethod(classIr) {
   ];
   let maxStack = 1;
   for (const field of classIr.fields || []) {
-    if ((field.access || []).includes('static') || !field.initializer || field.initializer.kind !== 'LiteralValue') continue;
+    if ((field.access || []).includes('static') || !field.initializer) continue;
     const state = { instructions: [], maxStack: 0, locals: new Map() };
-    const literal = emitValue(field.initializer, state);
-    if (!literal || literal.descriptor !== field.descriptor) continue;
+    const value = emitValue(field.initializer, state);
+    if (!value || value.descriptor !== field.descriptor) continue;
     instructions.push(createJvmInstruction('aload_0'));
     instructions.push(...state.instructions);
     instructions.push(createJvmInstruction('putfield', ['Field', classIr.internalName, field.name, field.descriptor]));
-    maxStack = Math.max(maxStack, 1 + literal.stack);
+    maxStack = Math.max(maxStack, 1 + value.stack, 1 + state.maxStack);
   }
   instructions.push(createJvmInstruction('return'));
   return createJvmBytecodeMethod({
