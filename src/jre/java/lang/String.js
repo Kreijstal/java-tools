@@ -38,6 +38,9 @@ function stringValue(obj) {
     if (obj.type === 'java/lang/Boolean') {
       return obj.value ? 'true' : 'false';
     }
+    if ((obj.type === 'java/lang/Double' || obj.type === 'java/lang/Float') && typeof obj.toString === 'function') {
+      return obj.toString();
+    }
     if (Object.prototype.hasOwnProperty.call(obj, 'value')) {
       return String(obj.value);
     }
