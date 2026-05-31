@@ -75,6 +75,48 @@ LeitherDone:
     .end code
 .end method
 
+.method public condAssignNoDup : (ZZ)Z
+    .code stack 2 locals 4
+Lcad0: iload 2
+Lcad2: ifeq Lcad25
+Lcad5: iload 1
+Lcad7: iload 2
+Lcad9: istore 3
+Lcad11: iload 3
+Lcad13: if_icmpeq Lcad20
+Lcad16: iconst_0
+Lcad17: goto Lcad21
+Lcad20: iconst_1
+Lcad21: nop
+Lcad22: goto Lcad27
+Lcad25: nop
+Lcad26: iconst_0
+Lcad27: nop
+Lcad28: ifeq Lcad35
+Lcad31: iconst_1
+Lcad32: goto Lcad53
+Lcad35: nop
+Lcad36: iload 2
+Lcad38: ifeq Lcad50
+Lcad41: iload 1
+Lcad43: istore 3
+Lcad45: iload 3
+Lcad47: goto Lcad52
+Lcad50: nop
+Lcad51: iconst_0
+Lcad52: nop
+Lcad53: nop
+Lcad54: ireturn
+LcadDone:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from Lcad0 to LcadDone
+            1 is a Z from Lcad0 to LcadDone
+            2 is b Z from Lcad0 to LcadDone
+            3 is c Z from Lcad11 to LcadDone
+        .end localvariabletable
+    .end code
+.end method
+
 .method public guard : (Z)V
     .code stack 3 locals 2
 L40: iload_1
@@ -267,6 +309,29 @@ LdoneSync:
     .end code
 .end method
 
+.method public echoLines : (Ljava/io/BufferedReader;)V
+    .code stack 2 locals 3
+LechoLoop: nop
+LechoRead: aload_1
+LechoCall: invokevirtual Method java/io/BufferedReader readLine ()Ljava/lang/String;
+LechoStore: astore_2
+LechoLoad: aload_2
+LechoNull: aconst_null
+LechoIf: if_acmpeq LechoDone
+LechoOut: getstatic Field java/lang/System out Ljava/io/PrintStream;
+LechoLine: aload_2
+LechoPrint: invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+LechoBack: goto LechoLoop
+LechoDone: return
+LechoEnd:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from LechoLoop to LechoEnd
+            1 is reader Ljava/io/BufferedReader; from LechoLoop to LechoEnd
+            2 is line Ljava/lang/String; from LechoLoad to LechoEnd
+        .end localvariabletable
+    .end code
+.end method
+
 .method public throwsIt : ()V
     .code stack 0 locals 1
 L150: return
@@ -284,6 +349,37 @@ L160: return
 L161:
         .localvariabletable
             0 is args [Ljava/lang/String; from L160 to L161
+        .end localvariabletable
+    .end code
+.end method
+
+.method public releaseResource : (Ljava/io/ByteArrayInputStream;Ljava/lang/Throwable;)V
+    .code stack 2 locals 4
+        .catch java/lang/Throwable from LtwrClose to LtwrAfterClose using LtwrHandler
+LtwrStart: aload_1
+LtwrNull: aconst_null
+LtwrIfNull: if_acmpeq LtwrDone
+LtwrPrimary: aload_2
+LtwrPrimaryNull: aconst_null
+LtwrIfPrimaryNull: if_acmpeq LtwrDirect
+LtwrClose: aload_1
+LtwrCall: invokevirtual Method java/io/ByteArrayInputStream close ()V
+LtwrAfterClose: goto LtwrJoin
+LtwrHandler: astore_3
+LtwrSuppressedPrimary: aload_2
+LtwrSuppressedThrown: aload_3
+LtwrAddSuppressed: invokevirtual Method java/lang/Throwable addSuppressed (Ljava/lang/Throwable;)V
+LtwrAfterSuppressed: goto LtwrJoin
+LtwrJoin: goto LtwrDone
+LtwrDirect: aload_1
+LtwrDirectCall: invokevirtual Method java/io/ByteArrayInputStream close ()V
+LtwrDone: return
+LtwrEnd:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from LtwrStart to LtwrEnd
+            1 is resource Ljava/io/ByteArrayInputStream; from LtwrStart to LtwrEnd
+            2 is primary Ljava/lang/Throwable; from LtwrStart to LtwrEnd
+            3 is closeFailure Ljava/lang/Throwable; from LtwrHandler to LtwrAfterSuppressed
         .end localvariabletable
     .end code
 .end method
@@ -341,7 +437,7 @@ function decompileFixture(tempDir, name, source) {
 }
 
 test('CFR-JS reconstructs additional expression and declaration features', (t) => {
-  t.plan(17);
+  t.plan(21);
   withTempDir('cfr-additional-', (tempDir) => {
     const source = decompileFixture(tempDir, 'AdditionalFeatureTest', ADDITIONAL_FEATURES_JASMIN);
 
@@ -351,6 +447,7 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public int chooseInt\(boolean flag\) \{\s*return flag \? 10 : 20;\s*}/, 'conditional value branches are reconstructed as ternary returns');
     t.match(source, /public boolean both\(boolean left, boolean right\) \{\s*return left && right;\s*}/, 'short-circuit boolean AND returns are reconstructed');
     t.match(source, /public boolean either\(boolean left, boolean right\) \{\s*return left \|\| right;\s*}/, 'short-circuit boolean OR returns are reconstructed');
+    t.match(source, /public boolean condAssignNoDup\(boolean a, boolean b\) \{\s*boolean c;\s*return b && a == \(c = b\) \|\| b && \(c = a\);\s*}/, 'frontend assignment-expression boolean condition is reconstructed');
     t.match(source, /public void guard\(boolean ok\) \{\s*if \(!ok\) \{\s*throw new RuntimeException\("bad"\);\s*}\s*}/, 'materialized boolean guard branches are reconstructed');
     t.match(source, /public void printChoice\(boolean flag, PrintStream out, String yes, String no\) \{\s*out\.print\(flag \? yes : no\);\s*}/, 'stack ternary values survive into following calls');
     t.match(source, /public void bounds\(int value\) \{\s*if \(\(?value < 0\)? \|\| value >= 100\) \{\s*throw new RuntimeException\("bounds"\);\s*}\s*}/, 'nested materialized boolean guards simplify to boolean expressions');
@@ -359,8 +456,11 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public String\[\] words\(\) \{\s*String\[\] words = new String\[\]\{"alpha", "beta"\};\s*return words;\s*}/, 'object array initialisation is condensed');
     t.match(source, /public String greet\(String name\) \{\s*return "Hello " \+ name \+ "!";\s*}/, 'StringBuilder append chains are reconstructed as string concatenation');
     t.match(source, /public void syncPrint\(Object lock\) \{\s*synchronized \(lock\) \{\s*System\.out\.print\("locked"\);\s*}\s*}/, 'monitorenter/monitorexit regions are reconstructed as synchronized blocks');
+    t.match(source, /public void echoLines\(BufferedReader reader\) \{\s*while \(true\) \{\s*(?:String )?line = reader\.readLine\(\);\s*if \(line == null\) \{\s*break;\s*}\s*System\.out\.println\(line\);\s*}\s*}/, 'guarded loops with assignment before the condition are reconstructed');
     t.match(source, /public void throwsIt\(\) throws IOException \{\s*}/, 'declared checked exceptions are emitted in method headers');
     t.match(source, /public static void acceptAll\(String\.\.\. args\) \{\s*}/, 'varargs methods use ellipsis syntax');
+    t.match(source, /public void releaseResource\(ByteArrayInputStream resource, Throwable primary\) \{\s*if \(resource != null\) \{\s*resource\.close\(\);\s*}\s*}/, 'try-with-resources release graph lowers to guarded close');
+    t.notOk(/addSuppressed|Ltwr|\/\/\s*goto/.test(source), 'try-with-resources release scaffolding is consumed');
     t.notOk(/new StringBuilder\(\)\.append/.test(source), 'string builder implementation detail is hidden');
   });
 });

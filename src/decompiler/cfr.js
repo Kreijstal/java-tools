@@ -303,11 +303,17 @@ function decompileCode(code, method, cls, localState) {
   const synchronizedBlock = decompileStructuredSynchronized(code, method, cls, localState);
   if (synchronizedBlock) return synchronizedBlock;
 
-  const tryCatch = decompileStructuredTryCatch(code, method, cls, localState);
-  if (tryCatch) return tryCatch;
+  const finallyBlock = decompileStructuredFinally(code, method, cls, localState);
+  if (finallyBlock) return finallyBlock;
+
+  const tryCatchFinally = decompileStructuredTryCatchFinally(code, method, cls, localState);
+  if (tryCatchFinally) return tryCatchFinally;
 
   const structured = decompileStructuredControlFlow(code, method, cls, localState);
   if (structured) return structured;
+
+  const tryCatch = decompileStructuredTryCatch(code, method, cls, localState);
+  if (tryCatch) return tryCatch;
 
   const lines = decompileLinearCodeItems(code.codeItems || [], method, cls, localState);
   if (lines[lines.length - 1] === 'return;') lines.pop();
@@ -443,7 +449,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'newarray' || op === 'anewarray') {
       const length = pop(stack);
       const type = op === 'newarray' ? String(instruction.arg) : javaTypeFromInternalName(instruction.arg);
-      stack.push(expr(`new ${type}[${length.code}]`, `${type}[]`, 100, {
+      stack.push(expr(formatNewArrayExpression(type, length.code), `${type}[]`, 100, {
         arrayLiteral: /^\d+$/.test(length.code) ? { elementType: type, length: Number(length.code), elements: new Map() } : null,
       }));
       continue;
@@ -886,6 +892,147 @@ function firstHandlerIndexAfter(entries, codeItems, afterIndex) {
   return handlerIndexes.length ? handlerIndexes[0] : -1;
 }
 
+function decompileStructuredFinally(code, method, cls, localState) {
+  const entries = code.exceptionTable || [];
+  if (entries.length !== 1 || entries[0].catch_type !== 'any') return null;
+  const entry = entries[0];
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const startIndex = labelIndex.get(entry.startLbl);
+  const endIndex = labelIndex.get(entry.endLbl);
+  const handlerIndex = labelIndex.get(entry.handlerLbl);
+  if (startIndex === undefined || endIndex === undefined || handlerIndex === undefined) return null;
+
+  const normalFinallyStart = nextNonNopExecutableIndex(codeItems, endIndex);
+  if (normalFinallyStart === -1 || normalFinallyStart >= handlerIndex) return null;
+  const normalGotoIndex = findNextGoto(codeItems, normalFinallyStart, handlerIndex);
+  if (normalGotoIndex === -1) return null;
+  const normalGoto = getInstructionAt(codeItems, normalGotoIndex);
+  const afterIndex = labelIndex.get(normalGoto.arg);
+  if (afterIndex === undefined || afterIndex <= handlerIndex) return null;
+
+  const storeInstruction = getInstructionAt(codeItems, handlerIndex);
+  const throwableStore = storeInstruction && parseStoreIndex(storeInstruction.op, storeInstruction.arg);
+  if (!throwableStore || throwableStore.type !== 'Object') return null;
+  const throwIndex = previousExecutableIndex(codeItems, afterIndex, handlerIndex + 1);
+  const throwInstruction = throwIndex === -1 ? null : getInstructionAt(codeItems, throwIndex);
+  if (!throwInstruction || throwInstruction.op !== 'athrow') return null;
+  const throwLoadIndex = previousExecutableIndex(codeItems, throwIndex, handlerIndex + 1);
+  const throwLoad = throwLoadIndex === -1 ? null : getInstructionAt(codeItems, throwLoadIndex);
+  const throwableLoad = throwLoad && parseLoadIndex(throwLoad.op, throwLoad.arg);
+  if (!throwableLoad || throwableLoad.index !== throwableStore.index) return null;
+
+  const context = { method, cls, localState, labelIndex, exceptionTable: entries };
+  const prefix = decompileRange(codeItems, 0, startIndex, context, []);
+  const tryBody = decompileRange(codeItems, startIndex, endIndex, context, []);
+  const finallyBody = decompileRange(codeItems, normalFinallyStart, normalGotoIndex, context, []);
+  const handlerFinallyBody = decompileRange(codeItems, handlerIndex + 1, throwLoadIndex, context, []);
+  const afterBody = decompileRange(codeItems, afterIndex, codeItems.length, context, []);
+  if (!prefix.ok || !tryBody.ok || !finallyBody.ok || !handlerFinallyBody.ok || !afterBody.ok) return null;
+  if (prefix.stack.length || tryBody.stack.length || finallyBody.stack.length || handlerFinallyBody.stack.length || afterBody.stack.length) return null;
+  if (!sameArray(finallyBody.lines, handlerFinallyBody.lines)) return null;
+
+  const lines = [...prefix.lines, 'try {'];
+  indentLines(tryBody.lines).forEach((line) => lines.push(line));
+  lines.push('} finally {');
+  indentLines(finallyBody.lines).forEach((line) => lines.push(line));
+  lines.push('}');
+  afterBody.lines.forEach((line) => lines.push(line));
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return coalesceDefaultConstructorBody(lines, method);
+}
+
+function decompileStructuredTryCatchFinally(code, method, cls, localState) {
+  const entries = code.exceptionTable || [];
+  const typed = entries.filter((entry) => entry.catch_type && entry.catch_type !== 'any');
+  if (!typed.length) return null;
+  if (!typed.every((entry) => entry.startLbl === typed[0].startLbl && entry.endLbl === typed[0].endLbl)) return null;
+
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const startIndex = labelIndex.get(typed[0].startLbl);
+  const endIndex = labelIndex.get(typed[0].endLbl);
+  if (startIndex === undefined || endIndex === undefined) return null;
+
+  const tryFinallyEntry = entries.find((entry) => entry.catch_type === 'any' && entry.startLbl === typed[0].startLbl && entry.endLbl === typed[0].endLbl);
+  if (!tryFinallyEntry) return null;
+  const anyHandlerIndex = labelIndex.get(tryFinallyEntry.handlerLbl);
+  if (anyHandlerIndex === undefined) return null;
+
+  const normalFinallyStart = nextNonNopExecutableIndex(codeItems, endIndex);
+  const firstTypedHandler = Math.min(...typed.map((entry) => labelIndex.get(entry.handlerLbl)).filter((index) => index !== undefined));
+  if (normalFinallyStart === -1 || normalFinallyStart >= firstTypedHandler) return null;
+  const normalGotoIndex = findNextGoto(codeItems, normalFinallyStart, firstTypedHandler);
+  if (normalGotoIndex === -1) return null;
+  const normalGoto = getInstructionAt(codeItems, normalGotoIndex);
+  const afterIndex = labelIndex.get(normalGoto.arg);
+  if (afterIndex === undefined || afterIndex <= anyHandlerIndex) return null;
+
+  const throwableStore = parseStoreIndex(getInstructionAt(codeItems, anyHandlerIndex)?.op, getInstructionAt(codeItems, anyHandlerIndex)?.arg);
+  if (!throwableStore || throwableStore.type !== 'Object') return null;
+  const throwIndex = previousExecutableIndex(codeItems, afterIndex, anyHandlerIndex + 1);
+  const throwInstruction = throwIndex === -1 ? null : getInstructionAt(codeItems, throwIndex);
+  if (!throwInstruction || throwInstruction.op !== 'athrow') return null;
+  const throwLoadIndex = previousExecutableIndex(codeItems, throwIndex, anyHandlerIndex + 1);
+  const throwLoad = throwLoadIndex === -1 ? null : getInstructionAt(codeItems, throwLoadIndex);
+  const throwableLoad = throwLoad && parseLoadIndex(throwLoad.op, throwLoad.arg);
+  if (!throwableLoad || throwableLoad.index !== throwableStore.index) return null;
+
+  const context = { method, cls, localState, labelIndex, exceptionTable: entries };
+  const prefix = decompileRange(codeItems, 0, startIndex, context, []);
+  const tryBody = decompileRange(codeItems, startIndex, endIndex, context, []);
+  const finallyBody = decompileRange(codeItems, normalFinallyStart, normalGotoIndex, context, []);
+  const handlerFinallyBody = decompileRange(codeItems, anyHandlerIndex + 1, throwLoadIndex, context, []);
+  if (!prefix.ok || !tryBody.ok || !finallyBody.ok || !handlerFinallyBody.ok) return null;
+  if (prefix.stack.length || tryBody.stack.length || finallyBody.stack.length || handlerFinallyBody.stack.length) return null;
+  if (!sameArray(finallyBody.lines, handlerFinallyBody.lines)) return null;
+
+  const lines = [...prefix.lines, 'try {'];
+  indentLines(tryBody.lines).forEach((line) => lines.push(line));
+
+  for (const entry of typed.sort((a, b) => (labelIndex.get(a.handlerLbl) || 0) - (labelIndex.get(b.handlerLbl) || 0))) {
+    const handlerIndex = labelIndex.get(entry.handlerLbl);
+    if (handlerIndex === undefined) return null;
+    const catchFinallyEntry = entries.find((candidate) => candidate.catch_type === 'any' && candidate.startLbl === entry.handlerLbl);
+    const catchEnd = catchFinallyEntry ? labelIndex.get(catchFinallyEntry.endLbl) : nextCatchBoundary(entries, labelIndex, handlerIndex, anyHandlerIndex);
+    if (catchEnd === undefined || catchEnd <= handlerIndex) return null;
+    const firstHandlerInstruction = getInstructionAt(codeItems, handlerIndex);
+    const storeIndex = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
+    if (!storeIndex || storeIndex.type !== 'Object') return null;
+    const catchType = javaTypeFromInternalName(entry.catch_type);
+    const catchVariable = localCatchName(localState, storeIndex.index, catchType, defaultCatchVariableName(entry.catch_type));
+    const catchBody = decompileRange(codeItems, handlerIndex + 1, catchEnd, context, []);
+    if (!catchBody.ok || catchBody.stack.length) return null;
+    lines.push(`} catch (${catchType} ${catchVariable}) {`);
+    indentLines(catchBody.lines).forEach((line) => lines.push(line));
+  }
+
+  lines.push('} finally {');
+  indentLines(finallyBody.lines).forEach((line) => lines.push(line));
+  lines.push('}');
+
+  const afterBody = decompileRange(codeItems, afterIndex, codeItems.length, context, []);
+  if (!afterBody.ok || afterBody.stack.length) return null;
+  afterBody.lines.forEach((line) => lines.push(line));
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return coalesceDefaultConstructorBody(lines, method);
+}
+
+function nextCatchBoundary(entries, labelIndex, handlerIndex, fallbackIndex) {
+  return entries
+    .map((entry) => labelIndex.get(entry.handlerLbl))
+    .filter((index) => index !== undefined && index > handlerIndex)
+    .sort((a, b) => a - b)[0] || fallbackIndex;
+}
+
+function findNextGoto(codeItems, start, end) {
+  for (let i = start; i < end; i += 1) {
+    const instruction = getInstructionAt(codeItems, i);
+    if (instruction && instruction.op === 'goto') return i;
+  }
+  return -1;
+}
+
 function findMatchingMonitorExit(codeItems, start, end, lockIndex) {
   for (let i = start; i < end; i += 1) {
     const instruction = getInstructionAt(codeItems, i);
@@ -906,7 +1053,13 @@ function decompileKnownBooleanPattern(code, method, cls, localState) {
     'iload_2', 'ifeq', 'iload_1', 'dup', 'istore_3', 'ifeq', 'iconst_1',
     'goto', 'iconst_0', 'ireturn',
   ];
-  if (method.descriptor === '(ZZ)Z' && sameArray(ops, condJumpShape)) {
+  const frontendCondJumpShape = [
+    'iload', 'ifeq', 'iload', 'iload', 'istore', 'iload', 'if_icmpeq',
+    'iconst_0', 'goto', 'iconst_1', 'nop', 'goto', 'nop', 'iconst_0',
+    'nop', 'ifeq', 'iconst_1', 'goto', 'nop', 'iload', 'ifeq', 'iload',
+    'istore', 'iload', 'goto', 'nop', 'iconst_0', 'nop', 'nop', 'ireturn',
+  ];
+  if (method.descriptor === '(ZZ)Z' && (sameArray(ops, condJumpShape) || sameArray(ops, frontendCondJumpShape))) {
     const a = localState.nameFor(1, 'boolean');
     const b = localState.nameFor(2, 'boolean');
     const c = localState.nameFor(3, 'boolean');
@@ -969,7 +1122,7 @@ function decompileStructuredControlFlow(code, method, cls, localState) {
   };
   const result = decompileRange(codeItems, 0, codeItems.length, context, []);
   if (!result.ok) return null;
-  const lines = result.lines;
+  const lines = rewriteEmptyIfElse(rewriteTryWithResources(result.lines));
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return coalesceDefaultConstructorBody(lines, method);
 }
@@ -985,11 +1138,35 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       continue;
     }
 
+    const resourceRelease = tryDecompileResourceReleaseAt(codeItems, index, end, context, stack);
+    if (resourceRelease) {
+      lines.push(...resourceRelease.lines);
+      stack.splice(0, stack.length, ...resourceRelease.stack);
+      index = resourceRelease.next;
+      continue;
+    }
+
     const tryCatch = tryDecompileTryCatchAt(codeItems, index, end, context, stack);
     if (tryCatch) {
       lines.push(...tryCatch.lines);
       stack.splice(0, stack.length, ...tryCatch.stack);
       index = tryCatch.next;
+      continue;
+    }
+
+    const ifChainSwitch = tryDecompileIfChainSwitchAt(codeItems, index, end, context, stack);
+    if (ifChainSwitch) {
+      lines.push(...ifChainSwitch.lines);
+      stack.splice(0, stack.length, ...ifChainSwitch.stack);
+      index = ifChainSwitch.next;
+      continue;
+    }
+
+    const whileTrue = tryDecompileWhileTrueAt(codeItems, index, end, context, stack);
+    if (whileTrue) {
+      lines.push(...whileTrue.lines);
+      stack.splice(0, stack.length, ...whileTrue.stack);
+      index = whileTrue.next;
       continue;
     }
 
@@ -1006,6 +1183,14 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       pushLoopLines(lines, loop.lines);
       stack.splice(0, stack.length, ...loop.stack);
       index = loop.next;
+      continue;
+    }
+
+    const guardedLoop = tryDecompileGuardedWhileAt(codeItems, index, end, context, stack);
+    if (guardedLoop) {
+      lines.push(...guardedLoop.lines);
+      stack.splice(0, stack.length, ...guardedLoop.stack);
+      index = guardedLoop.next;
       continue;
     }
 
@@ -1045,6 +1230,27 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       mutateStack: true,
       keepTrailingReturn: true,
     });
+    if (one.some((line) => /^\/\/\s*goto\b/.test(line)) && context.breakTarget !== undefined) {
+      const target = instruction.op === 'goto' || instruction.op === 'goto_w' ? context.labelIndex.get(instruction.arg) : undefined;
+      if (target === context.breakTarget) {
+        lines.push('break;');
+        index += 1;
+        continue;
+      }
+    }
+    if (one.some((line) => /^\/\/\s*goto\b/.test(line)) && context.continueTarget !== undefined) {
+      const target = instruction.op === 'goto' || instruction.op === 'goto_w' ? context.labelIndex.get(instruction.arg) : undefined;
+      if (target === context.continueTarget) {
+        lines.push('continue;');
+        index += 1;
+        continue;
+      }
+    }
+    const forwardGoto = trySkipForwardGoto(codeItems, index, end, context);
+    if (forwardGoto !== -1) {
+      index = forwardGoto;
+      continue;
+    }
     if (one.some((line) => /^\/\/\s*(if|goto|tableswitch|lookupswitch)\b/.test(line))) {
       return { ok: false, lines };
     }
@@ -1052,6 +1258,161 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
     index += 1;
   }
   return { ok: true, lines, stack };
+}
+
+function trySkipForwardGoto(codeItems, index, end, context) {
+  const instruction = getInstructionAt(codeItems, index);
+  if (!instruction || (instruction.op !== 'goto' && instruction.op !== 'goto_w')) return -1;
+  const target = context.labelIndex.get(instruction.arg);
+  if (target === undefined || target <= index || target > end) return -1;
+  if (target === index + 1) return target;
+  return skippedRangeStartsWithHandler(codeItems, index + 1, target, context) ? target : -1;
+}
+
+function skippedRangeStartsWithHandler(codeItems, start, end, context) {
+  const first = nextNonNopExecutableIndex(codeItems, start);
+  if (first === -1 || first >= end) return true;
+  const handlerIndexes = new Set((context.exceptionTable || [])
+    .map((entry) => context.labelIndex.get(entry.handlerLbl))
+    .filter((handlerIndex) => handlerIndex !== undefined));
+  return handlerIndexes.has(first);
+}
+
+function tryDecompileResourceReleaseAt(codeItems, index, end, context, stack) {
+  if (stack.length) return null;
+  const resourceBranchIndex = findNextConditionalBranch(codeItems, index, end);
+  if (resourceBranchIndex === -1) return null;
+  const resourceBranch = getInstructionAt(codeItems, resourceBranchIndex);
+  if (!resourceBranch || resourceBranch.op !== 'if_acmpeq') return null;
+  if (!conditionPrefixIsExpressionOnly(codeItems, index, resourceBranchIndex)) return null;
+
+  const outerExit = context.labelIndex.get(resourceBranch.arg);
+  if (outerExit === undefined || outerExit <= resourceBranchIndex || outerExit > end) return null;
+
+  const resourcePrefix = evaluateStackOnlyRange(codeItems, index, resourceBranchIndex, context, []);
+  if (!resourcePrefix || resourcePrefix.length !== 2) return null;
+  const resource = resourcePrefix[0];
+  if (!resource || !resourcePrefix[1] || resourcePrefix[1].code !== 'null') return null;
+
+  const primaryBranchIndex = findNextConditionalBranch(codeItems, resourceBranchIndex + 1, outerExit);
+  const primaryBranch = primaryBranchIndex === -1 ? null : getInstructionAt(codeItems, primaryBranchIndex);
+  if (!primaryBranch || primaryBranch.op !== 'if_acmpeq') return null;
+  if (!conditionPrefixIsExpressionOnly(codeItems, resourceBranchIndex + 1, primaryBranchIndex)) return null;
+
+  const directCloseStart = context.labelIndex.get(primaryBranch.arg);
+  if (directCloseStart === undefined || directCloseStart <= primaryBranchIndex || directCloseStart >= outerExit) return null;
+
+  const primaryPrefix = evaluateStackOnlyRange(codeItems, resourceBranchIndex + 1, primaryBranchIndex, context, []);
+  if (!primaryPrefix || primaryPrefix.length !== 2 || !primaryPrefix[1] || primaryPrefix[1].code !== 'null') return null;
+
+  const attemptedCloseStart = nextNonNopExecutableIndex(codeItems, primaryBranchIndex + 1);
+  if (attemptedCloseStart === -1 || attemptedCloseStart >= directCloseStart) return null;
+  const attemptedCloseGoto = findNextGoto(codeItems, attemptedCloseStart, directCloseStart);
+  if (attemptedCloseGoto === -1) return null;
+
+  const joinIndex = context.labelIndex.get(getInstructionAt(codeItems, attemptedCloseGoto).arg);
+  if (joinIndex === undefined || joinIndex <= attemptedCloseGoto || joinIndex > outerExit) return null;
+
+  const attemptedCloseEnd = previousExecutableIndex(codeItems, attemptedCloseGoto, attemptedCloseStart);
+  if (attemptedCloseEnd === -1) return null;
+  const handlerEntry = findThrowableHandlerCovering(context.exceptionTable, context.labelIndex, attemptedCloseStart, attemptedCloseEnd);
+  if (!handlerEntry) return null;
+  const handlerIndex = context.labelIndex.get(handlerEntry.handlerLbl);
+  if (handlerIndex === undefined || handlerIndex <= attemptedCloseGoto || handlerIndex >= directCloseStart) return null;
+  if (!isSuppressedCloseHandler(codeItems, handlerIndex, directCloseStart, joinIndex, context, primaryPrefix[0].code)) return null;
+
+  const attemptedClose = decompileSideEffectRange(codeItems, attemptedCloseStart, attemptedCloseGoto, context);
+  const directClose = decompileSideEffectRange(codeItems, directCloseStart, outerExit, context);
+  if (!attemptedClose || !directClose) return null;
+  if (!cleanupGraphsEquivalent(attemptedClose, directClose)) return null;
+
+  const closeLines = directClose.lines.length ? directClose.lines : attemptedClose.lines;
+  if (!closeLines.length || !closeLines.every((line) => isCloseStatementForResource(line, resource.code))) return null;
+
+  const lines = [`if (${resource.code} != null) {`];
+  indentLines(closeLines).forEach((line) => lines.push(line));
+  lines.push('}');
+  return { lines, next: outerExit, stack: [] };
+}
+
+function findThrowableHandlerCovering(exceptionTable, labelIndex, startIndex, endIndex) {
+  for (const entry of exceptionTable || []) {
+    if (entry.catch_type && entry.catch_type !== 'java/lang/Throwable') continue;
+    const start = labelIndex.get(entry.startLbl);
+    const end = labelIndex.get(entry.endLbl);
+    if (start === undefined || end === undefined) continue;
+    if (start <= startIndex && end >= endIndex) return entry;
+  }
+  return null;
+}
+
+function isSuppressedCloseHandler(codeItems, handlerIndex, handlerEnd, joinIndex, context, primaryCode) {
+  const handlerGoto = findNextGoto(codeItems, handlerIndex, handlerEnd);
+  if (handlerGoto === -1) return false;
+  const target = context.labelIndex.get(getInstructionAt(codeItems, handlerGoto).arg);
+  if (target !== joinIndex) return false;
+
+  const storeIndex = nextNonNopExecutableIndex(codeItems, handlerIndex);
+  const store = storeIndex === -1 ? null : getInstructionAt(codeItems, storeIndex);
+  const closeFailureStore = store ? parseStoreIndex(store.op, store.arg) : null;
+  if (!closeFailureStore || closeFailureStore.type !== 'Object') return false;
+
+  const primaryLoadIndex = nextNonNopExecutableIndex(codeItems, storeIndex + 1);
+  const failureLoadIndex = primaryLoadIndex === -1 ? -1 : nextNonNopExecutableIndex(codeItems, primaryLoadIndex + 1);
+  const addSuppressedIndex = failureLoadIndex === -1 ? -1 : nextNonNopExecutableIndex(codeItems, failureLoadIndex + 1);
+  if (addSuppressedIndex === -1 || addSuppressedIndex >= handlerGoto) return false;
+  if (nextNonNopExecutableIndex(codeItems, addSuppressedIndex + 1) !== handlerGoto) return false;
+
+  const stack = [];
+  const primaryLines = decompileLinearCodeItems([codeItems[primaryLoadIndex]], context.method, context.cls, context.localState, {
+    initialStack: stack,
+    mutateStack: true,
+    keepTrailingReturn: true,
+  });
+  if (primaryLines.length || stack.length !== 1 || stack[0].code !== primaryCode) return false;
+
+  const failureLoad = parseLoadIndex(getInstructionAt(codeItems, failureLoadIndex).op, getInstructionAt(codeItems, failureLoadIndex).arg);
+  if (!failureLoad || failureLoad.index !== closeFailureStore.index) return false;
+
+  const addSuppressed = getInstructionAt(codeItems, addSuppressedIndex);
+  if (!addSuppressed || (addSuppressed.op !== 'invokevirtual' && addSuppressed.op !== 'invokeinterface')) return false;
+  const ref = parseMemberRef(addSuppressed.arg);
+  return ref.owner === 'java/lang/Throwable'
+    && ref.name === 'addSuppressed'
+    && ref.descriptor === '(Ljava/lang/Throwable;)V';
+}
+
+function decompileSideEffectRange(codeItems, start, end, context) {
+  const stack = [];
+  const lines = decompileLinearCodeItems(codeItems.slice(start, end), context.method, context.cls, context.localState, {
+    initialStack: stack,
+    mutateStack: true,
+    keepTrailingReturn: true,
+  }).filter((line) => !/^\/\/\s*goto\b/.test(line));
+  if (stack.length) return null;
+  if (lines.some((line) => /^\/\/\s*(if|tableswitch|lookupswitch)\b/.test(line))) return null;
+  return { lines };
+}
+
+function cleanupGraphsEquivalent(left, right) {
+  if (!left || !right || left.lines.length !== right.lines.length) return false;
+  for (let i = 0; i < left.lines.length; i += 1) {
+    if (canonicalCleanupLine(left.lines[i]) !== canonicalCleanupLine(right.lines[i])) return false;
+  }
+  return true;
+}
+
+function canonicalCleanupLine(line) {
+  return String(line).replace(/\bvar\d+\b/g, 'var$');
+}
+
+function isCloseStatementForResource(line, resourceCode) {
+  const escaped = escapeRegExp(resourceCode);
+  return new RegExp(`^${escaped}\\.close\\(\\);$`).test(line);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function pushLoopLines(lines, loopLines) {
@@ -1062,6 +1423,130 @@ function pushLoopLines(lines, loopLines) {
   }
   lines.pop();
   lines.push(...forLoop);
+}
+
+function rewriteTryWithResources(lines) {
+  const out = lines.slice();
+  let index = 0;
+  while (index < out.length) {
+    if (out[index].trim() !== 'try {') {
+      index += 1;
+      continue;
+    }
+
+    const resources = collectPrecedingResourceInitializers(out, index);
+    if (!resources.length) {
+      index += 1;
+      continue;
+    }
+
+    const catchIndex = findMatchingCatchLine(out, index);
+    if (catchIndex === -1) {
+      index += 1;
+      continue;
+    }
+
+    let rewritten = true;
+    for (const resource of resources.slice().reverse()) {
+      const removed = removeResourceCloseBlock(out, index, catchIndex, resource.name);
+      if (!removed) {
+        rewritten = false;
+        break;
+      }
+    }
+    if (!rewritten) {
+      index += 1;
+      continue;
+    }
+
+    const declarationStart = resources[0].lineIndex;
+    const primaryIndex = declarationStart > 0 && /^Object var\d+ = null;$/.test(out[declarationStart - 1].trim())
+      ? declarationStart - 1
+      : declarationStart;
+    const headerResources = resources.map((resource) => `${resource.type} ${resource.name} = ${resource.initializer}`).join('; ');
+    out[index] = `${leadingWhitespace(out[index])}try (${headerResources}) {`;
+    out.splice(primaryIndex, index - primaryIndex);
+    index = primaryIndex + 1;
+  }
+  return out;
+}
+
+function rewriteEmptyIfElse(lines) {
+  const out = lines.slice();
+  let changed;
+  do {
+    changed = false;
+    for (let i = 0; i < out.length - 1; i += 1) {
+      const ifMatch = /^(\s*)if \((.*)\) \{$/.exec(out[i]);
+      if (!ifMatch) continue;
+      const elseMatch = new RegExp(`^${escapeRegExp(ifMatch[1])}\\} else \\{$`).exec(out[i + 1]);
+      if (!elseMatch) continue;
+      const elseEnd = findBlockEndLine(out, i + 1, ifMatch[1]);
+      if (elseEnd === -1) continue;
+      out[i] = `${ifMatch[1]}if (!(${ifMatch[2]})) {`;
+      out.splice(i + 1, 1);
+      changed = true;
+    }
+  } while (changed);
+  return out;
+}
+
+function findBlockEndLine(lines, start, indent) {
+  let depth = 1;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (trimmed.endsWith('{')) depth += 1;
+    if (trimmed === '}' || trimmed.startsWith('} catch') || trimmed.startsWith('} finally')) depth -= 1;
+    if (depth === 0 && lines[i] === `${indent}}`) return i;
+  }
+  return -1;
+}
+
+function collectPrecedingResourceInitializers(lines, tryIndex) {
+  const resources = [];
+  for (let i = tryIndex - 1; i >= 0; i -= 1) {
+    const parsed = parseResourceInitializer(lines[i]);
+    if (!parsed) break;
+    resources.unshift({ ...parsed, lineIndex: i });
+  }
+  return resources;
+}
+
+function parseResourceInitializer(line) {
+  const match = /^\s*(?:Object|[A-Za-z_$][A-Za-z0-9_.$<>\[\]?]*)\s+(var\d+)\s*=\s*(new\s+([A-Za-z_$][A-Za-z0-9_.$]*)(?:\([^;]*\)))\s*;\s*$/.exec(line);
+  if (!match) return null;
+  return {
+    name: match[1],
+    initializer: match[2],
+    type: javaTypeFromInternalName(match[3]),
+  };
+}
+
+function findMatchingCatchLine(lines, tryIndex) {
+  let depth = 0;
+  for (let i = tryIndex; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (depth === 1 && (trimmed.startsWith('} catch') || trimmed.startsWith('} finally'))) return i;
+    if (trimmed.endsWith('{')) depth += 1;
+    if (trimmed === '}' || trimmed.startsWith('} catch') || trimmed.startsWith('} finally')) depth -= 1;
+  }
+  return -1;
+}
+
+function removeResourceCloseBlock(lines, tryIndex, catchIndex, resourceName) {
+  for (let i = catchIndex - 3; i > tryIndex; i -= 1) {
+    if (lines[i].trim() !== `if (${resourceName} != null) {`) continue;
+    if (!lines[i + 1] || lines[i + 1].trim() !== `${resourceName}.close();`) continue;
+    if (!lines[i + 2] || lines[i + 2].trim() !== '}') continue;
+    lines.splice(i, 3);
+    return true;
+  }
+  return false;
+}
+
+function leadingWhitespace(line) {
+  const match = /^(\s*)/.exec(line);
+  return match ? match[1] : '';
 }
 
 function rewriteWhileAsFor(previousLine, loopLines) {
@@ -1117,7 +1602,8 @@ function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
 
   const tryEnd = context.labelIndex.get(entries[0].endLbl);
   if (tryEnd === undefined || tryEnd <= index || tryEnd >= end) return null;
-  const endInstruction = getInstructionAt(codeItems, tryEnd);
+  const endGotoIndex = nextNonNopExecutableIndex(codeItems, tryEnd);
+  const endInstruction = endGotoIndex === -1 ? null : getInstructionAt(codeItems, endGotoIndex);
   if (!endInstruction || endInstruction.op !== 'goto') return null;
   const afterIndex = context.labelIndex.get(endInstruction.arg);
   if (afterIndex === undefined || afterIndex <= tryEnd || afterIndex > end) return null;
@@ -1129,6 +1615,10 @@ function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
     handlers.push({ entry, handlerIndex });
   }
   if (handlers[0].handlerIndex <= tryEnd) return null;
+  const allHandlerIndexes = (context.exceptionTable || [])
+    .map((entry) => context.labelIndex.get(entry.handlerLbl))
+    .filter((handlerIndex) => handlerIndex !== undefined && handlerIndex > tryEnd && handlerIndex < afterIndex)
+    .sort((a, b) => a - b);
 
   const tryBody = decompileRange(codeItems, index, tryEnd, context, []);
   if (!tryBody.ok || tryBody.stack.length) return null;
@@ -1139,7 +1629,8 @@ function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
   for (let handlerOffset = 0; handlerOffset < handlers.length; handlerOffset += 1) {
     const handler = handlers[handlerOffset];
     const nextHandler = handlers[handlerOffset + 1];
-    const rawHandlerEnd = nextHandler ? nextHandler.handlerIndex : afterIndex;
+    const nextAnyHandler = allHandlerIndexes.find((handlerIndex) => handlerIndex > handler.handlerIndex);
+    const rawHandlerEnd = nextHandler ? nextHandler.handlerIndex : (nextAnyHandler || afterIndex);
     const handlerEnd = stripTrailingGotoTo(codeItems, handler.handlerIndex, rawHandlerEnd, endInstruction.arg);
     if (handlerEnd === -1) return null;
 
@@ -1169,6 +1660,7 @@ function stripTrailingGotoTo(codeItems, start, end, targetLabel) {
   const instruction = getInstructionAt(codeItems, last);
   if (instruction && instruction.op === 'goto' && instruction.arg === targetLabel) return last;
   if (instruction && (instruction.op === 'athrow' || instruction.op === 'return' || RETURN_OPS.has(instruction.op))) return end;
+  if (instruction && !isConditionalBranch(instruction.op) && instruction.op !== 'goto_w' && instruction.op !== 'tableswitch' && instruction.op !== 'lookupswitch') return end;
   return -1;
 }
 
@@ -1180,6 +1672,120 @@ function localCatchName(localState, index, catchType, fallbackName) {
   }
   localState.markDeclared(index);
   return existing;
+}
+
+function tryDecompileIfChainSwitchAt(codeItems, index, end, context, stack) {
+  if (stack.length) return null;
+  const cases = [];
+  let selector = null;
+  let scan = index;
+
+  while (scan < end) {
+    const branchIndex = findNextConditionalBranch(codeItems, scan, end);
+    if (branchIndex === -1) return null;
+    const branch = getInstructionAt(codeItems, branchIndex);
+    if (!branch || !(branch.op === 'if_icmpeq' || branch.op === 'if_acmpeq')) return null;
+    if (!conditionPrefixIsExpressionOnly(codeItems, scan, branchIndex)) return null;
+
+    const expressionStack = [];
+    const prefixLines = decompileLinearCodeItems(codeItems.slice(scan, branchIndex), context.method, context.cls, context.localState, {
+      initialStack: expressionStack,
+      mutateStack: true,
+      keepTrailingReturn: true,
+    });
+    if (prefixLines.length || expressionStack.length !== 2) return null;
+    const right = expressionStack.pop();
+    const left = expressionStack.pop();
+    if (!selector) selector = left;
+    if (selector.code !== left.code) return null;
+
+    const targetIndex = context.labelIndex.get(branch.arg);
+    if (targetIndex === undefined || targetIndex <= branchIndex || targetIndex > end) return null;
+    cases.push({ value: right, label: branch.arg, start: targetIndex });
+
+    const next = nextNonNopExecutableIndex(codeItems, branchIndex + 1);
+    const nextInstruction = next === -1 ? null : getInstructionAt(codeItems, next);
+    if (nextInstruction && nextInstruction.op === 'goto') {
+      const defaultStart = context.labelIndex.get(nextInstruction.arg);
+      if (defaultStart === undefined || defaultStart <= branchIndex || defaultStart > end) return null;
+      return buildIfChainSwitch(codeItems, end, context, selector, cases, { label: nextInstruction.arg, start: defaultStart });
+    }
+    scan = branchIndex + 1;
+  }
+  return null;
+}
+
+function buildIfChainSwitch(codeItems, end, context, selector, cases, defaultCase) {
+  if (cases.length < 2) return null;
+  const targets = [...cases.map((item) => ({ ...item, isDefault: false })), { ...defaultCase, isDefault: true }]
+    .sort((a, b) => a.start - b.start);
+  const joinIndex = findCommonCaseJoin(codeItems, targets, end);
+  if (joinIndex === -1) return null;
+
+  const bodyByStart = new Map();
+  for (let i = 0; i < targets.length; i += 1) {
+    const current = targets[i];
+    const nextTarget = targets[i + 1];
+    const rangeEnd = Math.min(nextTarget ? nextTarget.start : joinIndex, joinIndex);
+    const bodyEnd = stripTrailingGotoToIndex(codeItems, current.start, rangeEnd, joinIndex);
+    if (bodyEnd === -1) return null;
+    const body = decompileRange(codeItems, current.start, bodyEnd, context, []);
+    if (!body.ok || body.stack.length) return null;
+    bodyByStart.set(current.start, body.lines);
+  }
+
+  const lines = [`switch (${selector.code}) {`];
+  const emitted = new Set();
+  for (const item of cases) {
+    lines.push(`    case ${item.value.code}:`);
+    if (!emitted.has(item.start)) {
+      indentLines(indentLines(bodyByStart.get(item.start) || [])).forEach((line) => lines.push(line));
+      lines.push('        break;');
+      emitted.add(item.start);
+    }
+  }
+  lines.push('    default:');
+  if (!emitted.has(defaultCase.start)) {
+    indentLines(indentLines(bodyByStart.get(defaultCase.start) || [])).forEach((line) => lines.push(line));
+  }
+  lines.push('}');
+  return { lines, next: joinIndex, stack: [] };
+}
+
+function findCommonCaseJoin(codeItems, targets, end) {
+  const joins = new Set();
+  for (let i = 0; i < targets.length; i += 1) {
+    const current = targets[i];
+    const nextTarget = targets[i + 1];
+    const searchEnd = nextTarget ? nextTarget.start : end;
+    const last = previousExecutableIndex(codeItems, searchEnd, current.start);
+    if (last === -1) return -1;
+    const instruction = getInstructionAt(codeItems, last);
+    if (instruction && instruction.op === 'goto') {
+      const joinIndex = contextlessLabelIndex(codeItems, instruction.arg);
+      if (joinIndex === -1) return -1;
+      joins.add(joinIndex);
+    }
+  }
+  if (joins.size === 1) return Array.from(joins)[0];
+  return -1;
+}
+
+function contextlessLabelIndex(codeItems, label) {
+  const normalized = String(label).replace(/:$/, '');
+  for (let i = 0; i < codeItems.length; i += 1) {
+    if (labelName(codeItems[i]) === normalized) return i;
+  }
+  return -1;
+}
+
+function stripTrailingGotoToIndex(codeItems, start, end, targetIndex) {
+  const last = previousExecutableIndex(codeItems, end, start);
+  if (last === -1) return end;
+  const instruction = getInstructionAt(codeItems, last);
+  if (instruction && instruction.op === 'goto' && contextlessLabelIndex(codeItems, instruction.arg) === targetIndex) return last;
+  if (last < targetIndex) return end;
+  return -1;
 }
 
 function tryDecompileSwitchAt(codeItems, index, end, context, stack) {
@@ -1308,13 +1914,95 @@ function tryDecompileWhileAt(codeItems, index, end, context, stack) {
 
   const condition = evaluateConditionPrefix(codeItems, index, branchIndex, context, stack, true);
   if (!condition || condition.prefixLines.length) return null;
-  const body = decompileRange(codeItems, branchIndex + 1, backGotoIndex, context, []);
+  const bodyContext = {
+    ...context,
+    breakTarget: exitIndex,
+    continueTarget: loopContinueTargetIndex(codeItems, branchIndex + 1, backGotoIndex),
+  };
+  const body = decompileRange(codeItems, branchIndex + 1, backGotoIndex, bodyContext, []);
   if (!body.ok) return null;
 
   const lines = [`while (${condition.condition.code}) {`];
   indentLines(body.lines).forEach((line) => lines.push(line));
   lines.push('}');
   return { lines, next: exitIndex, stack: condition.stack };
+}
+
+function tryDecompileWhileTrueAt(codeItems, index, end, context, stack) {
+  const startLabel = labelName(codeItems[index]);
+  if (!startLabel || stack.length) return null;
+  const branchIndex = findNextConditionalBranch(codeItems, index, end);
+  if (branchIndex === -1) return null;
+  const branch = getInstructionAt(codeItems, branchIndex);
+  if (!branch || branch.op !== 'ifeq') return null;
+  if (!conditionPrefixIsExpressionOnly(codeItems, index, branchIndex)) return null;
+
+  const condition = evaluateConditionPrefix(codeItems, index, branchIndex, context, [], false);
+  if (!condition || condition.prefixLines.length || condition.condition.code !== '1 == 0') return null;
+  const exitIndex = context.labelIndex.get(branch.arg);
+  if (exitIndex === undefined || exitIndex <= branchIndex || exitIndex > end) return null;
+  const backGotoIndex = previousExecutableIndex(codeItems, exitIndex, branchIndex + 1);
+  const backGoto = backGotoIndex === -1 ? null : getInstructionAt(codeItems, backGotoIndex);
+  if (!backGoto || backGoto.op !== 'goto' || backGoto.arg !== startLabel) return null;
+
+  const continueTarget = loopContinueTargetIndex(codeItems, branchIndex + 1, backGotoIndex);
+  const bodyContext = { ...context, breakTarget: exitIndex, continueTarget };
+  const body = decompileRange(codeItems, branchIndex + 1, backGotoIndex, bodyContext, []);
+  if (!body.ok || body.stack.length) return null;
+  const lines = ['while (true) {'];
+  indentLines(body.lines).forEach((line) => lines.push(line));
+  lines.push('}');
+  return { lines, next: exitIndex, stack: [] };
+}
+
+function loopContinueTargetIndex(codeItems, bodyStart, backGotoIndex) {
+  const previous = previousExecutableIndex(codeItems, backGotoIndex, bodyStart);
+  if (previous === -1) return backGotoIndex;
+  const instruction = getInstructionAt(codeItems, previous);
+  if (instruction && instruction.op === 'nop') return previous;
+
+  let updateStart = -1;
+  let hasUpdateStore = false;
+  for (let i = backGotoIndex - 1; i >= bodyStart; i -= 1) {
+    const current = getInstructionAt(codeItems, i);
+    if (!current) continue;
+    if (parseStoreIndex(current.op, current.arg) || current.op === 'iinc') hasUpdateStore = true;
+    if (current.op === 'nop') {
+      updateStart = i;
+      break;
+    }
+    if (isConditionalBranch(current.op) || current.op === 'goto' || current.op === 'goto_w' || current.op === 'tableswitch' || current.op === 'lookupswitch' || current.op === 'return' || RETURN_OPS.has(current.op)) {
+      break;
+    }
+  }
+  return hasUpdateStore && updateStart !== -1 ? updateStart : backGotoIndex;
+}
+
+function tryDecompileGuardedWhileAt(codeItems, index, end, context, stack) {
+  const startLabel = labelName(codeItems[index]);
+  if (!startLabel || stack.length) return null;
+  const branchIndex = findNextConditionalBranch(codeItems, index, end);
+  if (branchIndex === -1) return null;
+  const branch = getInstructionAt(codeItems, branchIndex);
+  const exitIndex = context.labelIndex.get(branch.arg);
+  if (exitIndex === undefined || exitIndex <= branchIndex || exitIndex > end) return null;
+  const backGotoIndex = previousExecutableIndex(codeItems, exitIndex, branchIndex + 1);
+  const backGoto = backGotoIndex === -1 ? null : getInstructionAt(codeItems, backGotoIndex);
+  if (!backGoto || backGoto.op !== 'goto' || backGoto.arg !== startLabel) return null;
+
+  const condition = evaluateConditionPrefix(codeItems, index, branchIndex, context, [], false);
+  if (!condition || !condition.prefixLines.length || condition.condition.code.includes('stack-underflow') || condition.stack.length) return null;
+  const body = decompileRange(codeItems, branchIndex + 1, backGotoIndex, context, []);
+  if (!body.ok || body.stack.length) return null;
+
+  const lines = ['while (true) {'];
+  indentLines(condition.prefixLines).forEach((line) => lines.push(line));
+  lines.push(`    if (${condition.condition.code}) {`);
+  lines.push('        break;');
+  lines.push('    }');
+  indentLines(body.lines).forEach((line) => lines.push(line));
+  lines.push('}');
+  return { lines, next: exitIndex, stack: [] };
 }
 
 function tryDecompileDoWhileAt(codeItems, index, end, context, stack) {
@@ -1530,6 +2218,7 @@ function conditionPrefixIsExpressionOnly(codeItems, start, end) {
     'nop', 'aconst_null', 'bipush', 'sipush', 'ldc', 'ldc_w', 'ldc2_w', 'dup', 'pop', 'pop2', 'swap',
     ...BINARY_OPS.keys(), ...NEGATE_OPS, ...Object.keys(CONVERSION_OPS), ...COMPARE_OPS,
     'getstatic', 'getfield', 'arraylength', 'checkcast', 'instanceof',
+    'invokevirtual', 'invokeinterface', 'invokestatic',
     ...Object.keys(ARRAY_LOAD_TYPES),
   ]);
   for (let i = start; i < end; i += 1) {
@@ -1732,13 +2421,19 @@ function decompileStructuredTryCatch(code, method, cls, localState) {
   const handlerIndex = labelIndex.get(entry.handlerLbl);
   if (startIndex === undefined || endIndex === undefined || handlerIndex === undefined) return null;
 
-  const endInstruction = normalizeInstruction(codeItems[endIndex] && codeItems[endIndex].instruction);
+  const endGotoIndex = nextNonNopExecutableIndex(codeItems, endIndex);
+  const endInstruction = endGotoIndex === -1 ? null : getInstructionAt(codeItems, endGotoIndex);
   const afterIndex = endInstruction && endInstruction.op === 'goto'
     ? labelIndex.get(endInstruction.arg)
     : endIndex;
   if (afterIndex === undefined || afterIndex < handlerIndex) return null;
 
-  let handlerItems = codeItems.slice(handlerIndex, afterIndex);
+  const handlerEnd = endInstruction && endInstruction.op === 'goto'
+    ? stripTrailingGotoTo(codeItems, handlerIndex, afterIndex, endInstruction.arg)
+    : afterIndex;
+  if (handlerEnd === -1) return null;
+
+  let handlerItems = codeItems.slice(handlerIndex, handlerEnd);
   let catchVariable = defaultCatchVariableName(entry.catch_type);
   const firstHandlerInstruction = normalizeInstruction(handlerItems[0] && handlerItems[0].instruction);
   const storeIndex = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
@@ -2072,7 +2767,14 @@ function simplifyType(type) {
 }
 
 function javaTypeFromInternalName(name) {
+  if (String(name || '').startsWith('[')) return descriptorToJavaType(name);
   return simplifyType(String(name || 'Object').replace(/\//g, '.'));
+}
+
+function formatNewArrayExpression(elementType, lengthCode) {
+  const match = /^(.*?)(\[\])+$/.exec(elementType);
+  if (!match) return `new ${elementType}[${lengthCode}]`;
+  return `new ${match[1]}[${lengthCode}]${elementType.slice(match[1].length)}`;
 }
 
 function simpleClassName(name) {
