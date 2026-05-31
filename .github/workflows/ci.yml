@@ -72,9 +72,8 @@ jobs:
         run: npm run build:java
       - name: Build browser bundle for Playwright tests
         run: npm run build:bundle
-      - name: Install Playwright browsers
-        run: npx playwright install chromium
-        timeout-minutes: 20
+      - name: Verify Chrome browser
+        run: google-chrome --version
       - name: Run Playwright tests
         run: timeout 300 npm run test:playwright
         timeout-minutes: 6
