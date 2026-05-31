@@ -55,7 +55,7 @@ module.exports = defineConfig({
     command: 'npm run serve',
     url: 'http://localhost:3000/',
     reuseExistingServer: !process.env.CI,
-    timeout: 30 * 1000, // Only 30 seconds to start server
+    timeout: 120 * 1000,
     stdout: 'pipe',
     stderr: 'pipe',
   },
