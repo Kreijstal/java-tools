@@ -209,6 +209,36 @@ LlookupEnd:
         .end localvariabletable
     .end code
 .end method
+
+.method public syntheticSwitch : (I)V
+    .code stack 2 locals 2
+Ls0: iload_1
+Ls1: iconst_0
+Ls2: if_icmpeq LsCase0
+Ls3: iload_1
+Ls4: iconst_1
+Ls5: if_icmpeq LsCase1
+Ls6: goto LsDefault
+LsCase0: getstatic Field java/lang/System out Ljava/io/PrintStream;
+LsCase0b: ldc "zero"
+LsCase0c: invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+LsCase0d: goto LsEnd
+LsCase1: getstatic Field java/lang/System out Ljava/io/PrintStream;
+LsCase1b: ldc "one"
+LsCase1c: invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+LsCase1d: goto LsEnd
+LsDefault: getstatic Field java/lang/System out Ljava/io/PrintStream;
+LsDefaultb: ldc "other"
+LsDefaultc: invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+LsDefaultd: goto LsEnd
+LsEnd: return
+LsDone:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/SwitchFeatureTest; from Ls0 to LsDone
+            1 is key I from Ls0 to LsDone
+        .end localvariabletable
+    .end code
+.end method
 .sourcefile "SwitchFeatureTest.java"
 .end class
 `;
@@ -256,13 +286,14 @@ function decompileSwitchFeatureFixture(tempDir) {
 }
 
 test('CFR-JS reconstructs tableswitch and lookupswitch blocks', (t) => {
-  t.plan(8);
+  t.plan(9);
   withTempDir('cfr-switch-', (tempDir) => {
     const source = decompileSwitchFeatureFixture(tempDir);
 
     t.notOk(/^\s*\/\/\s*(tableswitch|lookupswitch)\b/m.test(source), 'switch bytecode does not fall back to raw comments');
     t.match(source, /public int dispatch\(int key\) \{\s*switch \(key\) \{\s*case 0:\s*return 10;\s*case 1:\s*return 20;\s*default:\s*return -1;\s*}\s*}/, 'tableswitch is reconstructed as a switch statement');
     t.match(source, /public int lookup\(int key\) \{\s*switch \(key\) \{\s*case 10:\s*return 1;\s*case 100:\s*return 2;\s*default:\s*return -1;\s*}\s*}/, 'lookupswitch is reconstructed as a switch statement');
+    t.match(source, /public void syntheticSwitch\(int key\) \{\s*switch \(key\) \{\s*case 0:\s*System\.out\.println\("zero"\);\s*break;\s*case 1:\s*System\.out\.println\("one"\);\s*break;\s*default:\s*System\.out\.println\("other"\);\s*}\s*}/, 'if-chain switch lowering is reconstructed as a switch statement');
     t.match(source, /case 0:/, 'tableswitch low case is emitted');
     t.match(source, /case 1:/, 'tableswitch contiguous case is emitted');
     t.match(source, /case 10:/, 'lookupswitch sparse case is emitted');
