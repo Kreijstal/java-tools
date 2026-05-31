@@ -13,9 +13,37 @@ const { decodeAccessFlags } = require("./access_flags");
  */
 
 function formatStringConstant(str) {
-  return JSON.stringify(str)
-    .replace(/\\u([0-9a-f]{4})/gi, (match, hex) => `\\u${hex.toUpperCase()}`)
-    .replace(/\\n/g, "\\u000A");
+  return `"${Array.from(str, (char) => {
+    switch (char) {
+      case '"':
+        return '\\"';
+      case "\\":
+        return "\\\\";
+      case "\b":
+        return "\\u0008";
+      case "\t":
+        return "\\u0009";
+      case "\n":
+        return "\\u000A";
+      case "\f":
+        return "\\u000C";
+      case "\r":
+        return "\\u000D";
+      default: {
+        const codePoint = char.codePointAt(0);
+        if (codePoint < 0x20 || codePoint > 0x7e) {
+          if (codePoint <= 0xffff) {
+            return `\\u${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+          }
+          const adjusted = codePoint - 0x10000;
+          const high = 0xd800 + (adjusted >> 10);
+          const low = 0xdc00 + (adjusted & 0x3ff);
+          return `\\u${high.toString(16).toUpperCase()}\\u${low.toString(16).toUpperCase()}`;
+        }
+        return char;
+      }
+    }
+  }).join("")}"`;
 }
 
 /**
@@ -835,7 +863,7 @@ function formatInstructionKrakatau(instr, withComments = false) {
     const type = formatInstructionArgKrakatau(instr.arg[0], instr.op);
     const className = formatInstructionArgKrakatau(instr.arg[1], instr.op);
     let methodName = instr.arg[2][0];
-    if (instr.op === "invokeinterface" && KRAKATAU_KEYWORDS.has(methodName)) {
+    if (KRAKATAU_KEYWORDS.has(methodName)) {
       methodName = `"${methodName}"`;
     }
     const descriptor = instr.arg[2][1];
