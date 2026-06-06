@@ -37,6 +37,7 @@ function runMultiEntryLoopNormalizer(astRoot, options = {}) {
   const maxCloneInsns = Math.max(1, options.maxCloneInsns || 64);
   const maxJoinCloneInsns = Math.max(1, options.maxJoinCloneInsns || 4);
   const joinSplit = options.joinSplit !== false;
+  const skipMethods = buildMethodSkipSet(options.skipMethods);
   const verbose = !!options.verbose;
 
   let totalSplits = 0;
@@ -46,6 +47,7 @@ function runMultiEntryLoopNormalizer(astRoot, options = {}) {
   for (const classItem of (astRoot.classes || [])) {
     for (const item of (classItem.items || [])) {
       if (!item || item.type !== 'method' || !item.method) continue;
+      if (shouldSkipMethod(skipMethods, classItem.className, item.method)) continue;
       const codeAttr = (item.method.attributes || []).find((a) => a.type === 'code');
       if (!codeAttr || !codeAttr.code) continue;
       const codeItems = codeAttr.code.codeItems;
@@ -79,6 +81,34 @@ function runMultiEntryLoopNormalizer(astRoot, options = {}) {
     joinSplits: totalJoinSplits,
     merges: totalMerges,
   };
+}
+
+function buildMethodSkipSet(skipMethods) {
+  if (!Array.isArray(skipMethods) || skipMethods.length === 0) return null;
+  const out = new Set();
+  for (const entry of skipMethods) {
+    if (typeof entry === 'string') {
+      out.add(entry);
+      continue;
+    }
+    if (!entry || typeof entry !== 'object') continue;
+    const owner = entry.owner || entry.className || '*';
+    const name = entry.name || '*';
+    const descriptor = entry.descriptor || entry.desc || '*';
+    out.add(`${owner}.${name}${descriptor}`);
+  }
+  return out;
+}
+
+function shouldSkipMethod(skipMethods, owner, method) {
+  if (!skipMethods || !method) return false;
+  const className = owner || '*';
+  const name = method.name || '*';
+  const descriptor = method.descriptor || '*';
+  return skipMethods.has(`${className}.${name}${descriptor}`) ||
+    skipMethods.has(`${className}.${name}*`) ||
+    skipMethods.has(`*.${name}${descriptor}`) ||
+    skipMethods.has(`*.${name}*`);
 }
 
 // ---------------------------------------------------------------------------

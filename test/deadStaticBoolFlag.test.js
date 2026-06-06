@@ -7,7 +7,7 @@ const { runDeadStaticBoolFlag, discoverDeadStaticFlags } = require('../src/passe
 const { parseKrak2Assembly } = require('../src/parsing/parse_krak2');
 const { convertKrak2AstToClassAst } = require('../src/parsing/convert_krak2_ast');
 
-function astWith(codeItems, exceptionTable = []) {
+function astWith(codeItems, exceptionTable = [], descriptor = '(I)V') {
   return {
     classes: [
       {
@@ -17,7 +17,7 @@ function astWith(codeItems, exceptionTable = []) {
             type: 'method',
             method: {
               name: 'f',
-              descriptor: '(I)V',
+              descriptor,
               attributes: [
                 {
                   type: 'code',
@@ -120,6 +120,33 @@ test('dead-flag: can preserve branch shape with a constant false load', (t) => {
   const ops = items.map((it) => (typeof it.instruction === 'string' ? it.instruction : it.instruction.op));
   t.deepEqual(ops, ['getstatic', 'istore', 'iconst_0', 'ifeq', 'return', 'return']);
   t.equal(items[3].instruction.arg, 'L99');
+  t.end();
+});
+
+test('dead-flag: preserve branch shape can require any array parameter', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+    { labelDef: 'L3:', instruction: { op: 'istore', arg: '5' } },
+    { labelDef: 'L6:', instruction: { op: 'iload', arg: '5' } },
+    { labelDef: 'L7:', instruction: { op: 'ifeq', arg: 'L99' } },
+    { labelDef: 'L8:', instruction: 'return' },
+    { labelDef: 'L99:', instruction: 'return' },
+  ];
+  const arrayAst = astWith(JSON.parse(JSON.stringify(codeItems)), [], '(I[B)V');
+  const scalarAst = astWith(JSON.parse(JSON.stringify(codeItems)), [], '(II)V');
+
+  const options = {
+    flags: 'client.A',
+    preserveBranchShape: true,
+    preserveBranchShapeRequireArrayParameter: true,
+  };
+  t.equal(runDeadStaticBoolFlag(arrayAst, options).eliminated, 1);
+  t.deepEqual(realInstrs(arrayAst), ['getstatic', 'istore', 'iconst_0', 'ifeq', 'return', 'return']);
+
+  t.equal(runDeadStaticBoolFlag(scalarAst, options).eliminated, 1);
+  const scalarItems = code(scalarAst).codeItems.filter((it) => it && it.instruction);
+  t.deepEqual(scalarItems.map((it) => (typeof it.instruction === 'string' ? it.instruction : it.instruction.op)),
+    ['getstatic', 'istore', 'goto', 'return', 'return']);
   t.end();
 });
 
