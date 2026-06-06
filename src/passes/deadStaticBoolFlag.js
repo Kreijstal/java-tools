@@ -332,6 +332,10 @@ function methodMatchesPreserveBranchShapeGate(code, method, options = {}) {
     !(method && typeof method.descriptor === 'string' && method.descriptor.startsWith('(') && method.descriptor.includes('[I'))) {
     return false;
   }
+  if (options.preserveBranchShapeRequireArrayParameter &&
+    !(method && typeof method.descriptor === 'string' && method.descriptor.startsWith('(') && /\[[ZBCSIJFDL]/.test(method.descriptor.slice(0, method.descriptor.indexOf(')'))))) {
+    return false;
+  }
   if (options.preserveBranchShapeRequireNoExceptions &&
     Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) {
     return false;
