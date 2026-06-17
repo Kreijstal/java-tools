@@ -157,7 +157,9 @@ function collectCandidates(code, analysis, options) {
 
   return [...byDef.values()].map((candidate) => ({
     ...candidate,
-    loads: candidate.loads.filter((load) =>
+    loads: (shouldExtendToAllReachedLoads(candidate)
+      ? extendToAllReachedLoads(items, analysis, candidate)
+      : candidate.loads).filter((load) =>
       !hasPrimitiveLocalWriteBetween(items, candidate.storeIndex, items.indexOf(load), candidate.local)),
   })).filter((candidate) => {
     if (candidate.loads.length === 0) return false;
@@ -342,6 +344,31 @@ function producedTypeForInstruction(items, index, analysis, seen) {
   const [defId] = reaching;
   const def = analysis.defs.get(defId);
   return def ? producedTypeForStore(items, def.index, analysis, seen) : null;
+}
+
+function shouldExtendToAllReachedLoads(candidate) {
+  return isNonArrayReferenceDescriptor(candidate.produced);
+}
+
+function isNonArrayReferenceDescriptor(desc) {
+  return typeof desc === 'string' && desc.startsWith('L') && desc.endsWith(';');
+}
+
+function extendToAllReachedLoads(items, analysis, candidate) {
+  const out = [...candidate.loads];
+  const seen = new Set(out);
+  for (let i = candidate.storeIndex + 1; i < items.length; i += 1) {
+    if (astoreLocal(items[i]) === candidate.local) break;
+    if (primitiveStoreLocal(items[i]) === candidate.local || iincLocal(items[i]) === candidate.local) break;
+    if (aloadLocal(items[i]) !== candidate.local) continue;
+    const reaching = analysis.before[i] && analysis.before[i].get(candidate.local);
+    if (!reaching || reaching.size !== 1 || !reaching.has(candidate.defId)) continue;
+    if (!seen.has(items[i])) {
+      seen.add(items[i]);
+      out.push(items[i]);
+    }
+  }
+  return out;
 }
 
 function allLoadsTypedForDef(items, analysis, candidate) {

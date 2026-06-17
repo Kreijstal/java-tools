@@ -79,6 +79,14 @@ function parseFieldList(spec) {
   return out;
 }
 
+function asFieldSet(spec) {
+  if (!spec) return new Set();
+  if (spec instanceof Set) return new Set(spec);
+  if (Array.isArray(spec)) return new Set(spec.filter(Boolean));
+  if (typeof spec === 'string') return parseFieldList(spec);
+  return new Set();
+}
+
 function getOp(instruction) {
   if (!instruction) return null;
   if (typeof instruction === 'string') return instruction;
@@ -166,9 +174,45 @@ function isLocalRewritten(codeItems, local, allowedSites) {
   return false;
 }
 
+function firstLocalRewriteIndex(codeItems, local, allowedSites, startIndex) {
+  for (let i = Math.max(0, startIndex + 1); i < codeItems.length; i += 1) {
+    if (allowedSites.has(i)) continue;
+    const item = codeItems[i];
+    if (!item || !item.instruction) continue;
+    const op = getOp(item.instruction);
+    if (op === 'iinc' && localOfIinc(item.instruction) === local) return i;
+    if (!STORE_OPS.has(op)) continue;
+    const l = localOf(op, getLocalArg(item.instruction));
+    if (l === local) return i;
+  }
+  return codeItems.length;
+}
+
+function findBindingRangeForUse(bindingRanges, local, loadIndex, ifIndex) {
+  for (const range of bindingRanges) {
+    if (range.local !== local) continue;
+    if (range.istoreIdx >= loadIndex) continue;
+    if (loadIndex >= range.validUntil || ifIndex >= range.validUntil) continue;
+    return range;
+  }
+  return null;
+}
+
+function labelReferencesStayInsideRange(codeItems, label, startInclusive, endExclusive) {
+  const clean = trimLabel(label);
+  if (!clean) return true;
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const insn = codeItems[i] && codeItems[i].instruction;
+    if (!insn || trimLabel(getArg(insn)) !== clean) continue;
+    if (i < startInclusive || i >= endExclusive) return false;
+  }
+  return true;
+}
+
+
 function findEntryStoreSites(codeItems, alwaysFalseFields, opts = {}) {
   // Returns { sites: Set of istore-codeItem-indices to exclude from
-  // rewritten-checks, bindingDetails: [{ getstaticIdx, istoreIdx, local }] }.
+  // rewritten-checks, bindingDetails: [{ getstaticIdx, istoreIdx, local, field }] }.
   const sites = new Set();
   const bindingDetails = [];
   for (let i = 0; i < codeItems.length; i += 1) {
@@ -178,7 +222,8 @@ function findEntryStoreSites(codeItems, alwaysFalseFields, opts = {}) {
     if (op !== 'getstatic') continue;
     const ref = fieldRefOf(getArg(item.instruction));
     if (!ref || (ref.desc !== 'Z' && !(opts.allowIntFlags && ref.desc === 'I'))) continue;
-    if (!alwaysFalseFields.has(`${ref.cls}.${ref.name}`)) continue;
+    const key = fieldKey(ref);
+    if (!alwaysFalseFields.has(key)) continue;
     // Find next real instruction (a labelDef-only item is OK between them).
     let j = i + 1;
     while (j < codeItems.length) {
@@ -193,7 +238,7 @@ function findEntryStoreSites(codeItems, alwaysFalseFields, opts = {}) {
     const local = localOf(nextOp, getLocalArg(next.instruction));
     if (local === null) continue;
     sites.add(j);
-    bindingDetails.push({ getstaticIdx: i, istoreIdx: j, local });
+    bindingDetails.push({ getstaticIdx: i, istoreIdx: j, local, field: key });
   }
   return { sites, bindingDetails };
 }
@@ -202,12 +247,18 @@ function eliminateInMethod(code, opts) {
   const codeItems = code.codeItems;
   if (!Array.isArray(codeItems) || codeItems.length === 0) return 0;
   const { sites, bindingDetails } = findEntryStoreSites(codeItems, opts.alwaysFalseFields, opts);
-  // Determine which locals are "clean" (never re-stored).
-  const cleanLocals = new Set();
+  // Determine the textual range in which each entry sentinel binding is still
+  // valid. Older gamepacks often reuse the same bytecode local for a later loop
+  // variable; the original clean-local check therefore missed many branches
+  // that are still provably guarded by the default-zero sentinel before that
+  // first overwrite.
+  const bindingRanges = [];
   for (const b of bindingDetails) {
-    if (!isLocalRewritten(codeItems, b.local, sites)) {
-      cleanLocals.add(b.local);
-    }
+    const validUntil = firstLocalRewriteIndex(codeItems, b.local, sites, b.istoreIdx);
+    const localIsCleanForWholeMethod = validUntil >= codeItems.length;
+    const allowRangeLimitedBinding = opts.rangeLimitedFields instanceof Set && opts.rangeLimitedFields.has(b.field);
+    if (!localIsCleanForWholeMethod && !allowRangeLimitedBinding) continue;
+    bindingRanges.push({ ...b, validUntil });
   }
 
   // Walk and rewrite. We collect rewrites first (avoid reindexing during scan)
@@ -242,7 +293,7 @@ function eliminateInMethod(code, opts) {
     }
     if (!ILOAD_OPS.has(op)) continue;
     const local = localOf(op, getLocalArg(item.instruction));
-    if (local === null || !cleanLocals.has(local)) continue;
+    if (local === null) continue;
     // Find next instruction; must be ifne/ifeq with no labelDef between.
     let j = i + 1;
     let labelBetween = false;
@@ -260,6 +311,10 @@ function eliminateInMethod(code, opts) {
     if (nop !== 'ifne' && nop !== 'ifeq') continue;
     const target = getArg(next.instruction);
     if (typeof target !== 'string') continue;
+    const bindingRange = findBindingRangeForUse(bindingRanges, local, i, j);
+    if (!bindingRange) continue;
+    if (bindingRange.validUntil < codeItems.length && Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) continue;
+    if (!labelReferencesStayInsideRange(codeItems, item.labelDef, bindingRange.istoreIdx, bindingRange.validUntil)) continue;
     rewrites.push({ iloadIdx: i, ifIdx: j, ifKind: nop, target });
   }
 
@@ -320,7 +375,7 @@ function eliminateInMethod(code, opts) {
   }
 
   if (opts.verbose) {
-    console.log(`  [dead-flag] ${opts.owner}.${opts.name}${opts.desc}: eliminated ${rewrites.length + directRewrites.length} dead conditional(s) from ${cleanLocals.size} clean local(s)`);
+    console.log(`  [dead-flag] ${opts.owner}.${opts.name}${opts.desc}: eliminated ${rewrites.length + directRewrites.length} dead conditional(s) from ${bindingRanges.length} sentinel binding(s)`);
   }
   return rewrites.length + directRewrites.length;
 }
@@ -389,6 +444,7 @@ function methodHasAccess(method, flag) {
 
 function runDeadStaticBoolFlag(astRoot, options = {}) {
   const alwaysFalseFields = parseFieldList(options.flags);
+  const rangeLimitedFields = asFieldSet(options.rangeLimitedFields);
   const verbose = !!options.verbose;
   const allowIntFlags = !!options.allowIntFlags;
   const preserveBranchShape = !!options.preserveBranchShape;
@@ -407,6 +463,7 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
         const eliminated = eliminateInMethod(attr.code, {
           alwaysFalseFields,
           allowIntFlags,
+          rangeLimitedFields,
           preserveBranchShape: preserveBranchShapeForMethod,
           verbose,
           owner: classItem.className,
