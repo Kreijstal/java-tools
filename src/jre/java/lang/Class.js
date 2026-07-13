@@ -18,11 +18,11 @@ const { withThrows } = require('../../helpers');
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
-    'forName(Ljava/lang/String;)Ljava/lang/Class;': async (jvm, classObj, args) => {
+    'forName(Ljava/lang/String;)Ljava/lang/Class;': withThrows(async (jvm, classObj, args) => {
       const classNameWithDots = args[0] && args[0].value !== undefined ? args[0].value : String(args[0]);
       const classNameWithSlashes = classNameWithDots.replace(/\./g, '/');
       return await jvm.getClassObject(classNameWithSlashes);
-    },
+    }, ['java/lang/ClassNotFoundException']),
   },
   methods: {
     'getFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {

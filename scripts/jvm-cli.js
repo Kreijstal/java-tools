@@ -22,6 +22,7 @@ const { runPeepholeClean } = require('../src/passes/peepholeClean');
 const { runConditionInverter } = require('../src/passes/conditionInverter');
 const { runMultiEntryLoopNormalizer } = require('../src/passes/multiEntryLoopNormalizer');
 const { runLoopGuardEntrySplit } = require('../src/passes/loopGuardEntrySplit');
+const { listRegionSplitCandidates, applyRegionSplit } = require('../src/passes/regionSplit');
 const { runCoalesceLoopLoad } = require('../src/passes/coalesceLoopLoad');
 const { runDeadStaticBoolFlag } = require('../src/passes/deadStaticBoolFlag');
 const { runInlineSharedExitGoto } = require('../src/passes/inlineSharedExitGoto');
@@ -47,6 +48,7 @@ Commands:
   condition-invert <file.{j|class}> [--out file] [--max-distance N]  Invert conditional gotos for CFR friendliness
   multi-entry-normalize <file.{j|class}> [--out file] [--min-incoming N] [--max-clone-insns N] [--verbose]  Clone multi-entry loop headers (CFR-friendly)
   loop-guard-entry-split <file.{j|class}> [--out file] [--max-body-insns N] [--verbose]  Tail-duplicate a loop guard entered by an external goto (CFR-friendly)
+  region-split <file.{j|class}> [--out file] [--max-region-blocks N] [--list] [--verbose]  Controlled node-split irreducible loops (clone a multi-entry SCC per secondary entry) to make the CFG reducible
   coalesce-loop-load <file.{j|class}> [--out file] [--verbose]                             Fold "load X; goto T2; T1: load X; T2: <use>" into "goto T1"
   dead-flag-eliminate <file.{j|class}> [--out file] [--flags Cls.f,Cls.g] [--verbose]      Remove dead conditionals on always-false static boolean flags
   simplify-not-compare <file.{j|class}> [--out file] Simplify comparisons against bitwise-not locals
@@ -749,6 +751,64 @@ function loopGuardEntrySplitCommand(args) {
   try {
     const result = runLoopGuardEntrySplit(artifact.astRoot, { maxBodyInsns, verbose });
     console.log(`LoopGuardEntrySplit: splits=${result.splits}`);
+    writeArtifact(artifact, outPath);
+  } finally {
+    artifact.cleanup();
+  }
+}
+
+function regionSplitCommand(args) {
+  let outPath = null;
+  let maxRegionBlocks = 60;
+  let verbose = false;
+  let listOnly = false;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--out' || arg === '-o') {
+      if (i + 1 >= args.length) throw new Error('--out requires a value');
+      outPath = args[++i];
+    } else if (arg === '--max-region-blocks') {
+      if (i + 1 >= args.length) throw new Error('--max-region-blocks requires a value');
+      maxRegionBlocks = parseInt(args[++i], 10);
+    } else if (arg === '--list') {
+      listOnly = true;
+    } else if (arg === '--verbose') {
+      verbose = true;
+    } else if (arg === '--help' || arg === '-h') {
+      printHelp();
+      return;
+    } else {
+      positional.push(arg);
+    }
+  }
+  if (positional.length !== 1) {
+    throw new Error('region-split requires exactly one input file');
+  }
+  const inputPath = positional[0];
+  ensureFileExists(inputPath);
+  const artifact = loadArtifact(inputPath);
+  try {
+    const candidates = listRegionSplitCandidates(artifact.astRoot, { maxRegionBlocks });
+    if (listOnly) {
+      for (const c of candidates) {
+        console.log(`${c.owner}.${c.name}${c.desc} header=${c.header} region=${c.regionBlocks} entries=${c.entries} secondaries=${c.secondaryLabels.join(',')}`);
+      }
+      console.log(`RegionSplit: ${candidates.length} candidate SCC(s)`);
+      return;
+    }
+    let clonedRegions = 0;
+    // Apply every candidate. Each split targets a distinct multi-entry SCC by
+    // its chosen primary header; applying one does not create new candidates in
+    // the same list, so a single pass over the snapshot is enough.
+    for (const c of candidates) {
+      const result = applyRegionSplit(artifact.astRoot, { ...c, maxRegionBlocks });
+      if (verbose && result.changed) {
+        console.log(`  split ${c.name}${c.desc} header=${c.header} region=${c.regionBlocks} -> cloned ${result.clonedRegions} region(s)`);
+      }
+      clonedRegions += result.clonedRegions;
+    }
+    console.log(`RegionSplit: clonedRegions=${clonedRegions} candidates=${candidates.length}`);
     writeArtifact(artifact, outPath);
   } finally {
     artifact.cleanup();
@@ -1779,6 +1839,9 @@ async function main(argv) {
         break;
       case 'multi-entry-normalize':
         multiEntryNormalizeCommand(args);
+        break;
+      case 'region-split':
+        regionSplitCommand(args);
         break;
       case 'loop-guard-entry-split':
         loopGuardEntrySplitCommand(args);

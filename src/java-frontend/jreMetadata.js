@@ -58,19 +58,25 @@ function buildMetadata() {
     const classDef = loadClass(file);
     const methods = new Map();
     const staticMethods = new Map();
-    for (const [key] of Object.entries(classDef.methods || {})) {
+    for (const [key, implementation] of Object.entries(classDef.methods || {})) {
       const descriptor = descriptorFromKey(key);
       if (!descriptor) continue;
       const name = methodNameFromKey(key);
       if (!methods.has(name)) methods.set(name, []);
-      methods.get(name).push({ name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: false });
+      methods.get(name).push({
+        name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: false,
+        throwsTypes: Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [],
+      });
     }
-    for (const [key] of Object.entries(classDef.staticMethods || {})) {
+    for (const [key, implementation] of Object.entries(classDef.staticMethods || {})) {
       const descriptor = descriptorFromKey(key);
       if (!descriptor) continue;
       const name = methodNameFromKey(key);
       if (!staticMethods.has(name)) staticMethods.set(name, []);
-      staticMethods.get(name).push({ name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: true });
+      staticMethods.get(name).push({
+        name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: true,
+        throwsTypes: Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [],
+      });
     }
     classes.set(internalName, {
       internalName,

@@ -6,8 +6,14 @@ const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../parsing/convert_tree');
 const { parseDescriptor } = require('../parsing/typeParser');
+const { buildCfgFromCode, printTree } = require('./structurer');
+const { structureMethod } = require('./exceptionStructurer');
+const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
+const { jreClassInfo } = require('../java-frontend/jreMetadata');
+const { JavaParser } = require('../java-frontend/parser');
 
 const VERSION = 'CFR-JS 0.4.0';
+const javaStatementParser = new JavaParser();
 
 const BINARY_OPS = new Map([
   ['iadd', '+'], ['ladd', '+'], ['fadd', '+'], ['dadd', '+'],
@@ -72,30 +78,75 @@ function decompileClassBytes(bytes, options = {}) {
   return decompileAstRoot(astRoot, options);
 }
 
+function makeNormalControlFlowReducible(astRoot) {
+  // Controlled node splitting is part of our structurer path, not a rewrite
+  // intended for CFR/Vineflower. Recompute after every accepted split because
+  // one method can contain more than one irreducible region.
+  for (let i = 0; i < 64; i += 1) {
+    const candidate = listRegionSplitCandidates(astRoot)[0];
+    if (!candidate) break;
+    const result = applyRegionSplit(astRoot, candidate);
+    if (!result || !result.changed) break;
+  }
+}
+
 function decompileAstRoot(astRoot, options = {}) {
+  // Build the cross-class exception model from this root when the caller has not
+  // supplied a wider one (a directory/jar run pre-builds it across every input
+  // class so a call into any sibling resolves).
+  const exceptionModel = options.exceptionModel || buildExceptionModel(astRoot.classes || []);
+  const scopedOptions = { ...options, exceptionModel };
   return (astRoot.classes || [])
-    .map((cls) => decompileClassAst(cls, options))
+    .map((cls) => decompileClassAst(cls, scopedOptions))
     .join('\n\n');
 }
 
 async function decompilePath(inputPath, options = {}) {
   const stat = fs.statSync(inputPath);
   if (stat.isDirectory()) {
+    const profileBulk = process.env.CFR_JS_PROFILE_CLASSES === '1';
+    const bulkStarted = Date.now();
     const files = walk(inputPath).filter((file) => file.endsWith('.class'));
-    return files.map((file) => ({ name: javaOutputName(file, inputPath), source: decompileClassFile(file, options) }));
+    if (profileBulk) console.error(`[cfr-phase] walk ${Date.now() - bulkStarted}ms ${files.length} files`);
+    // Parse every class once, build one exception model across all of them, then
+    // decompile from the parsed ASTs so cross-class throws resolve.
+    const parsed = files.map((file) => {
+      const result = getAST(new Uint8Array(fs.readFileSync(file)));
+      return { file, astRoot: convertJson(result.ast, result.constantPool) };
+    });
+    if (profileBulk) console.error(`[cfr-phase] parse ${Date.now() - bulkStarted}ms`);
+    const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
+    if (profileBulk) console.error(`[cfr-phase] model ${Date.now() - bulkStarted}ms`);
+    return parsed.map(({ file, astRoot }) => {
+      const started = Date.now();
+      if (process.env.CFR_JS_PROFILE_CLASSES === '1') console.error(`[cfr-class-start] ${file}`);
+      const result = {
+        name: javaOutputName(file, inputPath),
+        source: decompileAstRoot(astRoot, { ...options, exceptionModel }),
+      };
+      if (process.env.CFR_JS_PROFILE_CLASSES === '1') {
+        console.error(`[cfr-class-done] ${Date.now() - started}ms ${file}`);
+      }
+      return result;
+    });
   }
 
   if (inputPath.toLowerCase().endsWith('.jar')) {
     const zip = await JSZip.loadAsync(fs.readFileSync(inputPath));
-    const outputs = [];
     const entries = Object.keys(zip.files)
       .filter((name) => name.endsWith('.class') && !zip.files[name].dir)
       .sort((a, b) => a.localeCompare(b));
+    const parsed = [];
     for (const name of entries) {
       const bytes = await zip.files[name].async('nodebuffer');
-      outputs.push({ name: name.replace(/\.class$/i, '.java'), source: decompileClassBytes(bytes, options) });
+      const result = getAST(new Uint8Array(bytes));
+      parsed.push({ name, astRoot: convertJson(result.ast, result.constantPool) });
     }
-    return outputs;
+    const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
+    return parsed.map(({ name, astRoot }) => ({
+      name: name.replace(/\.class$/i, '.java'),
+      source: decompileAstRoot(astRoot, { ...options, exceptionModel }),
+    }));
   }
 
   if (!inputPath.toLowerCase().endsWith('.class')) {
@@ -107,6 +158,8 @@ async function decompilePath(inputPath, options = {}) {
 
 function decompileClassAst(cls, options = {}) {
   const out = [];
+  const requiredImports = options.requiredImports || new Set();
+  const renderOptions = { ...options, requiredImports };
   if (!options.omitHeader) {
     out.push('/*');
     out.push(` * Decompiled by ${VERSION}.`);
@@ -118,9 +171,13 @@ function decompileClassAst(cls, options = {}) {
     out.push(`package ${packageName};`);
     out.push('');
   }
+  const imports = [];
+  if (classReferencesInternalPrefix(cls, 'java/io/')) imports.push('import java.io.*;');
+  if (classReferencesInternalPrefix(cls, 'java/util/')) imports.push('import java.util.*;');
 
   const className = simpleClassName(cls.className || 'Class');
-  out.push(`${formatClassDeclaration(cls, className)} {`);
+  const classDeclarationIndex = out.length;
+  out.push(`${formatClassDeclaration(cls, className, options.exceptionModel)} {`);
 
   const isEnum = (cls.flags || []).includes('enum');
   const allFields = (cls.items || []).filter((item) => item.type === 'field' && item.field);
@@ -137,26 +194,86 @@ function decompileClassAst(cls, options = {}) {
   }
 
   fields.forEach((item) => {
-    out.push(`    ${formatField(item.field)}`);
+    out.push(`    ${formatField(item.field, cls.className)}`);
   });
-  if ((fields.length || enumConstants.length) && methods.length) {
+  const syntheticConstructor = syntheticAbstractSubclassConstructor(cls, className, options.exceptionModel);
+  if ((fields.length || enumConstants.length) && (methods.length || syntheticConstructor)) {
     out.push('');
   }
 
+  if (syntheticConstructor) {
+    out.push(`    ${syntheticConstructor}`);
+    if (methods.length) out.push('');
+  }
+
   methods.forEach((item, index) => {
-    const methodText = formatMethod(cls, item.method);
+    const methodText = formatMethod(cls, item.method, renderOptions);
     methodText.split('\n').forEach((line) => out.push(`    ${line}`.replace(/\s+$/g, '')));
     if (index < methods.length - 1) out.push('');
   });
 
   out.push('}');
+  for (const requiredImport of requiredImports) imports.push(`import ${requiredImport};`);
+  const uniqueImports = [...new Set(imports)];
+  if (uniqueImports.length) out.splice(classDeclarationIndex, 0, ...uniqueImports, '');
   return out.join('\n');
+}
+
+function requireRenderedTypeImport(options, type) {
+  if (!options || !options.requiredImports || typeof type !== 'string') return;
+  const elementType = type.replace(/\[\]$/g, '');
+  if (elementType.includes('.')) options.requiredImports.add(elementType);
+}
+
+function qualifiedReferenceTypeFromDescriptor(descriptor) {
+  const match = /^\[*L([^;]+);$/.exec(String(descriptor || ''));
+  return match ? match[1].replace(/\//g, '.').replace(/\$/g, '.') : null;
 }
 
 function packageNameFromInternalName(name) {
   const text = String(name || '').replace(/\//g, '.');
   const lastDot = text.lastIndexOf('.');
   return lastDot === -1 ? '' : text.slice(0, lastDot);
+}
+
+function classReferencesInternalPrefix(cls, prefix) {
+  const hasType = (value) => typeof value === 'string'
+    && (value.startsWith(prefix) || value.includes(`L${prefix}`));
+  if (hasType(cls.superClassName) || (cls.interfaces || []).some(hasType)) return true;
+  for (const item of cls.items || []) {
+    if (item.type === 'field' && item.field && hasType(item.field.descriptor)) return true;
+    if (item.type !== 'method' || !item.method) continue;
+    if (hasType(item.method.descriptor)) return true;
+    for (const attr of item.method.attributes || []) {
+      if (attr.type === 'exceptions' && (attr.exceptions || []).some(hasType)) return true;
+      if (attr.type !== 'code' || !attr.code) continue;
+      if ((attr.code.exceptionTable || []).some((entry) => hasType(entry.catch_type || entry.catchType))) {
+        return true;
+      }
+      for (const codeAttr of attr.code.attributes || []) {
+        if (codeAttr.type === 'localvariabletable'
+          && (codeAttr.vars || []).some((variable) => hasType(variable.descriptor))) return true;
+      }
+      for (const codeItem of attr.code.codeItems || []) {
+        const instruction = getInstructionFromItem(codeItem);
+        if (!instruction) continue;
+        if (['invokevirtual', 'invokespecial', 'invokestatic', 'invokeinterface'].includes(instruction.op)) {
+          const member = parseMemberRef(instruction.arg);
+          if (hasType(member.descriptor)) return true;
+        }
+        if (['getfield', 'putfield', 'getstatic', 'putstatic'].includes(instruction.op)) {
+          const member = parseMemberRef(instruction.arg);
+          if ((instruction.op === 'getfield' || String(member.descriptor || '').startsWith('['))
+            && hasType(member.descriptor)) return true;
+        }
+        if (['new', 'anewarray', 'checkcast', 'instanceof', 'multianewarray'].includes(instruction.op)) {
+          const type = Array.isArray(instruction.arg) ? instruction.arg[0] : instruction.arg;
+          if (hasType(type)) return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function shouldSkipField(cls, field) {
@@ -175,7 +292,8 @@ function shouldSkipMethod(cls, method) {
     if (method.name === '<init>') return true;
     if (method.name === 'values' || method.name === 'valueOf' || method.name === '$values') return true;
   }
-  if (isTrivialDefaultConstructor(method)) return true;
+  const constructorCount = (cls.items || []).filter((item) => item && item.type === 'method' && item.method && item.method.name === '<init>').length;
+  if (constructorCount <= 1 && isTrivialDefaultConstructor(method)) return true;
   return false;
 }
 
@@ -193,12 +311,21 @@ function isEnumConstantField(field) {
   return (field.flags || []).includes('enum');
 }
 
-function formatClassDeclaration(cls, displayName) {
+function formatClassDeclaration(cls, displayName, model) {
   const rawFlags = cls.flags || [];
   const isEnum = rawFlags.includes('enum');
   const ignoredFlags = new Set(['super', 'synthetic', 'annotation', 'enum', 'module']);
   if (isEnum) ignoredFlags.add('final');
-  const flags = filterFlags(rawFlags, ignoredFlags);
+  let flags = filterFlags(rawFlags, ignoredFlags);
+  if (model && model.instantiatedTypes && model.instantiatedTypes.has(cls.className)) {
+    flags = flags.filter((flag) => flag !== 'abstract');
+  }
+  const forceAbstract = hasUnimplementedAbstractMethods(cls, model)
+    && !(model && model.instantiatedTypes && model.instantiatedTypes.has(cls.className));
+  if (forceAbstract) {
+    flags = flags.filter((flag) => flag !== 'final');
+    if (!flags.includes('abstract')) flags.push('abstract');
+  }
   const isInterface = flags.includes('interface');
   const keyword = isEnum ? 'enum' : (isInterface ? 'interface' : 'class');
   const visibleFlags = flags.filter((flag) => flag !== 'interface' && flag !== 'abstract');
@@ -218,15 +345,21 @@ function formatClassDeclaration(cls, displayName) {
   return declaration;
 }
 
-function formatField(field) {
-  const flags = filterFlags(field.flags || [], new Set(['synthetic', 'enum'])).join(' ');
+function formatField(field, owner) {
+  const ignoredFlags = new Set(['synthetic', 'enum']);
+  if ((field.flags || []).includes('static') && (field.flags || []).includes('final')
+    && (field.value === null || field.value === undefined)) ignoredFlags.add('final');
+  const flags = filterFlags(field.flags || [], ignoredFlags).join(' ');
   const type = descriptorToJavaType(field.descriptor);
   const prefix = flags ? `${flags} ` : '';
   const initializer = field.value !== null && field.value !== undefined ? ` = ${formatLiteral(field.value, type)}` : '';
-  return `${prefix}${type} ${field.name}${initializer};`;
+  return `${prefix}${type} ${sourceFieldName(owner, field.name)}${initializer};`;
 }
 
-function formatMethod(cls, method) {
+function formatMethod(cls, method, options = {}) {
+  const profileMethod = process.env.CFR_JS_PROFILE_METHODS === '1';
+  const methodProfileStarted = Date.now();
+  if (profileMethod) console.error(`[cfr-method-start] ${cls.className}.${method.name}${method.descriptor}`);
   const className = simpleClassName(cls.className || 'Class');
   const rawFlags = method.flags || [];
   const isStatic = rawFlags.includes('static');
@@ -238,10 +371,14 @@ function formatMethod(cls, method) {
   const localState = makeLocalState(params.map(simplifyType), isStatic, code);
 
   if (method.name === '<clinit>') {
-    return formatStaticInitializer(code, localState, cls);
+    return formatStaticInitializer(code, localState, cls, options);
   }
 
-  const flags = filterFlags(rawFlags, new Set(['bridge', 'synthetic', 'varargs']));
+  const materializeAbstract = rawFlags.includes('abstract')
+    && options.exceptionModel && options.exceptionModel.instantiatedTypes
+    && options.exceptionModel.instantiatedTypes.has(cls.className);
+  let flags = filterFlags(rawFlags, new Set(['bridge', 'synthetic', 'varargs']));
+  if (materializeAbstract) flags = flags.filter((flag) => flag !== 'abstract');
   const visibleFlags = flags.filter((flag) => flag !== 'static');
   if (isStatic) visibleFlags.push('static');
   const prefix = visibleFlags.length ? `${visibleFlags.join(' ')} ` : '';
@@ -259,12 +396,66 @@ function formatMethod(cls, method) {
   const throwsClause = throwsTypes.length ? ` throws ${throwsTypes.join(', ')}` : '';
   const header = `${prefix}${resultType}${name}(${paramDecls})${throwsClause}`;
 
+  if (materializeAbstract) {
+    return formatBlock(header, ['throw new AbstractMethodError();']);
+  }
   if (!code || flags.includes('abstract') || flags.includes('native')) {
     return `${header};`;
   }
 
-  const body = decompileCode(code, method, cls, localState);
-  return formatBlock(header, body);
+  const decompiledBody = decompileCode(code, method, cls, localState, options);
+  if (profileMethod) console.error(`[cfr-method-body] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
+  const body = pruneTopLevelUnreachableTail(decompiledBody);
+  if (process.env.CFR_JS_DEBUG_LOCALS === '1') {
+    console.error('[cfr-body-before-locals]', JSON.stringify(body));
+  }
+  ensureCheckedCatchReachability(body, code, options.exceptionModel);
+  const constructorInvocation = method.name === '<init>'
+    ? localState.takeConstructorInvocation()
+    : null;
+  const constructorCall = constructorInvocation
+    ? `${constructorInvocation.target}(${constructorInvocation.args.join(', ')});`
+    : null;
+  const missingDeclarations = localState.missingDeclarations(body);
+  if (missingDeclarations.length) body.unshift(...missingDeclarations);
+  const refinedBody = refineObjectLocalDeclarations(body, (name) => localState.refinedTypeForName(name));
+  const normalizedBody = normalizeSyntheticVariableScopes(refinedBody);
+  body.splice(0, body.length, ...normalizedBody);
+  ensureMissingSyntheticDeclarations(body);
+  widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
+  const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
+    && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
+  if (profileMethod) console.error(`[cfr-method-normalized] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
+  if (needsUncheckedExceptionBoundary) {
+    // Catch Throwable (not just Exception): some obfuscated sibling methods declare
+    // `throws Throwable`, which `catch (Exception)` does not cover. Rethrow the unchecked
+    // families (RuntimeException/Error) unchanged so their propagation semantics are
+    // preserved; only genuinely-checked throwables get wrapped as RuntimeException.
+    const wrapped = ['try {', ...indentLines(body), '} catch (RuntimeException | Error decompiledUncheckedException) {',
+      '    throw decompiledUncheckedException;', '} catch (Throwable decompiledCheckedException) {',
+      '    throw new RuntimeException(decompiledCheckedException);', '}'];
+    body.splice(0, body.length, ...wrapped);
+  }
+  if (constructorCall) body.unshift(constructorCall);
+  if (method.name === '<init>' && options.exceptionModel && options.exceptionModel.instantiatedTypes
+    && options.exceptionModel.instantiatedTypes.has(cls.className) && rawFlags.includes('abstract') === false
+    && (cls.flags || []).includes('abstract')) {
+    const guard = [`if (getClass() == ${className}.class) {`, `    throw new InstantiationError("${className}");`, '}'];
+    body.splice(constructorCall ? 1 : 0, 0, ...guard);
+  }
+  const methodResultType = methodReturnType(method);
+  // A non-void method whose body ends in a try/catch needs a synthesized trailing
+  // return only when control can actually fall off the end; when the body always
+  // returns/throws (through nested if/else or a rethrowing boundary wrap) an added
+  // return would be unreachable. `bodyCompletesAbruptly` decides this generally.
+  if (methodResultType !== 'void' && body[body.length - 1] === '}' && body.some((line) => String(line).trim() === 'try {')
+    && !bodyCompletesAbruptly(body)
+    && !body.some((line) => /(?:stateLoop:|\bwhile\b|\bcontinue\b)/.test(String(line)))) {
+    body.push(`return ${defaultValueForType(methodResultType)};`);
+  }
+  const result = formatBlock(header, body);
+  if (profileMethod) console.error(`[cfr-method-done] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
+  return result;
 }
 
 function methodThrowsTypes(method) {
@@ -273,9 +464,296 @@ function methodThrowsTypes(method) {
   return attr.exceptions.map(javaTypeFromInternalName);
 }
 
-function formatStaticInitializer(code, localState, cls) {
-  const body = code ? decompileCode(code, { name: '<clinit>', descriptor: '()V', flags: ['static'] }, cls, localState) : [];
-  return formatBlock('static', body);
+// Well-known JDK unchecked exception roots. Anything transitively rooted here (or
+// at RuntimeException/Error) needs no throws clause or handler; everything else
+// that reaches Throwable/Exception is checked.
+const JDK_UNCHECKED_EXCEPTIONS = new Set([
+  'java/lang/RuntimeException', 'java/lang/Error',
+  'java/lang/NullPointerException', 'java/lang/ArithmeticException',
+  'java/lang/ArrayIndexOutOfBoundsException', 'java/lang/IndexOutOfBoundsException',
+  'java/lang/StringIndexOutOfBoundsException', 'java/lang/ArrayStoreException',
+  'java/lang/ClassCastException', 'java/lang/IllegalArgumentException',
+  'java/lang/IllegalStateException', 'java/lang/IllegalMonitorStateException',
+  'java/lang/NumberFormatException', 'java/lang/NegativeArraySizeException',
+  'java/lang/UnsupportedOperationException', 'java/lang/AssertionError',
+  'java/lang/StackOverflowError', 'java/lang/OutOfMemoryError',
+  'java/util/ConcurrentModificationException', 'java/util/NoSuchElementException',
+  'java/util/EmptyStackException',
+]);
+
+// A cross-class model of declared method throws + the class hierarchy, built once
+// per decompile run over all input classes. Lets a caller detect that a call
+// lands on a method whose bytecode declares a checked exception it must handle —
+// the obfuscated bytecode omits the throws clause the JVM never enforces.
+function buildExceptionModel(classes) {
+  const methodThrows = new Map(); // `owner#name#descriptor` -> [internal throw names]
+  const superOf = new Map();      // owner internal name -> superclass internal name
+  const classInfo = new Map();    // owner internal name -> parsed class
+  const instantiatedTypes = new Set();
+  for (const cls of classes || []) {
+    const owner = cls.className;
+    if (!owner) continue;
+    classInfo.set(owner, cls);
+    if (cls.superClassName) superOf.set(owner, cls.superClassName);
+    for (const item of cls.items || []) {
+      if (item.type !== 'method' || !item.method) continue;
+      const code = getCode(item.method);
+      for (const codeItem of (code && code.codeItems) || []) {
+        const instruction = getInstructionFromItem(codeItem);
+        if (instruction && instruction.op === 'new' && typeof instruction.arg === 'string') {
+          instantiatedTypes.add(instruction.arg);
+        }
+      }
+      const attr = (item.method.attributes || []).find((a) => a && a.type === 'exceptions');
+      if (attr && Array.isArray(attr.exceptions) && attr.exceptions.length) {
+        methodThrows.set(`${owner}#${item.method.name}#${item.method.descriptor}`, attr.exceptions.slice());
+      }
+    }
+  }
+  return { methodThrows, superOf, classInfo, instantiatedTypes };
+}
+
+function hasUnimplementedAbstractMethods(cls, model) {
+  if (!model || !model.classInfo || !cls || (cls.flags || []).includes('interface')) return false;
+  const resolved = new Map();
+  let current = cls;
+  const seenClasses = new Set();
+  while (current && !seenClasses.has(current.className)) {
+    seenClasses.add(current.className);
+    for (const item of current.items || []) {
+      const method = item && item.type === 'method' ? item.method : null;
+      if (!method || method.name === '<init>' || method.name === '<clinit>') continue;
+      const flags = method.flags || [];
+      if (flags.includes('static') || flags.includes('private')) continue;
+      const key = `${method.name}#${method.descriptor}`;
+      if (!resolved.has(key)) resolved.set(key, flags.includes('abstract'));
+    }
+    current = current.superClassName ? model.classInfo.get(current.superClassName) : null;
+  }
+  return [...resolved.values()].some(Boolean);
+}
+
+function syntheticAbstractSubclassConstructor(cls, displayName, model) {
+  if (!hasUnimplementedAbstractMethods(cls, model)) return null;
+  const hasConstructor = (cls.items || []).some((item) => item && item.type === 'method'
+    && item.method && item.method.name === '<init>');
+  if (hasConstructor || !cls.superClassName || !model || !model.classInfo) return null;
+  const parent = model.classInfo.get(cls.superClassName);
+  if (!parent) return null;
+  const constructors = (parent.items || [])
+    .filter((item) => item && item.type === 'method' && item.method && item.method.name === '<init>')
+    .map((item) => item.method)
+    .filter((method) => !(method.flags || []).includes('private'));
+  if (!constructors.length || constructors.some((method) => method.descriptor === '()V')) return null;
+  const descriptor = parseDescriptor(constructors[0].descriptor || '()V');
+  const args = (descriptor.params || []).map((type) => defaultValueForType(simplifyType(type)));
+  return `${displayName}() { super(${args.join(', ')}); }`;
+}
+
+// Walk an exception type up the (corpus) hierarchy; unchecked once it reaches a
+// RuntimeException/Error root, checked once it reaches Throwable/Exception or a
+// JDK type outside the known-unchecked set.
+function isCheckedThrow(internalName, model) {
+  let type = internalName;
+  const seen = new Set();
+  while (type && !seen.has(type)) {
+    seen.add(type);
+    if (JDK_UNCHECKED_EXCEPTIONS.has(type)) return false;
+    if (type === 'java/lang/Throwable' || type === 'java/lang/Exception') return true;
+    if (type === 'java/lang/Object') return false;
+    const sup = (model && model.superOf && model.superOf.get(type))
+      || (jreClassInfo(type) && jreClassInfo(type).superName);
+    if (!sup) break; // hit the JDK boundary
+    type = sup;
+  }
+  return true; // unresolved JDK exception not known-unchecked → treat as checked
+}
+
+// Declared throws for owner.name:descriptor, resolving inherited declarations up
+// the corpus hierarchy. Returns null when the method is unknown (e.g. a JDK call).
+function resolveMethodThrows(owner, name, descriptor, model) {
+  let current = owner;
+  const seen = new Set();
+  while (model && current && !seen.has(current)) {
+    seen.add(current);
+    const found = model.methodThrows.get(`${current}#${name}#${descriptor}`);
+    if (found) return found;
+    const sup = model.superOf.get(current);
+    if (!sup) break;
+    current = sup;
+  }
+  return resolveJdkMethodThrows(owner, name, descriptor);
+}
+
+function resolveJdkMethodThrows(owner, name, descriptor) {
+  let current = owner;
+  const seen = new Set();
+  while (current && !seen.has(current)) {
+    seen.add(current);
+    const info = jreClassInfo(current);
+    if (!info) return null;
+    const candidates = [
+      ...(info.methods.get(name) || []),
+      ...(info.staticMethods.get(name) || []),
+    ];
+    const method = candidates.find((candidate) => candidate.descriptor === descriptor);
+    if (method) return method.throwsTypes;
+    current = info.superName;
+  }
+  return null;
+}
+
+const INVOKE_OPS = new Set(['invokevirtual', 'invokestatic', 'invokespecial', 'invokeinterface']);
+
+// True when the method invokes a sibling method that declares a checked exception
+// this method neither declares nor (broadly) catches. Such calls are javac errors
+// unless the body is wrapped in an unchecked boundary. Complements the JDK pattern
+// scan, which covers checked exceptions from standard-library calls/constructors.
+function methodCallsUncaughtCheckedException(code, method, model) {
+  if (!model || !code) return false;
+  const declared = new Set(((method.attributes || []).find((a) => a && a.type === 'exceptions') || {}).exceptions || []);
+  if (declared.has('java/lang/Throwable') || declared.has('java/lang/Exception')) return false;
+  const covered = (type) => {
+    let current = type;
+    const seen = new Set();
+    while (current && !seen.has(current)) {
+      seen.add(current);
+      if (declared.has(current)) return true;
+      current = model.superOf.get(current);
+    }
+    return false;
+  };
+  let hasExplicitThrow = false;
+  const allocatedTypes = new Set();
+  for (const item of code.codeItems || []) {
+    const instruction = getInstructionFromItem(item);
+    if (!instruction) continue;
+    if (instruction.op === 'athrow') hasExplicitThrow = true;
+    if (instruction.op === 'new' && typeof instruction.arg === 'string') allocatedTypes.add(instruction.arg);
+    if (!INVOKE_OPS.has(instruction.op)) continue;
+    let ref;
+    try { ref = parseMemberRef(instruction.arg); } catch (err) { continue; }
+    const throwsList = resolveMethodThrows(ref.owner, ref.name, ref.descriptor, model);
+    if (!throwsList) continue;
+    for (const type of throwsList) {
+      if (isCheckedThrow(type, model) && !covered(type)) return true;
+    }
+  }
+  if (hasExplicitThrow) {
+    for (const type of allocatedTypes) {
+      if (isCheckedThrow(type, model) && !covered(type)) return true;
+    }
+  }
+  return false;
+}
+
+// Split a brace-balanced list of rendered Java lines into its top-level
+// statements (each a sub-array of lines). A simple statement is one line ending
+// in `;`; a compound statement spans from its `... {` head to the matching `}`.
+function splitTopLevelStatements(lines) {
+  const statements = [];
+  let current = [];
+  let depth = 0;
+  for (const raw of lines) {
+    const line = String(raw);
+    current.push(line);
+    for (const ch of line) {
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth -= 1;
+    }
+    if (depth <= 0) {
+      if (current.some((entry) => String(entry).trim().length)) statements.push(current);
+      current = [];
+      depth = 0;
+    }
+  }
+  if (current.some((entry) => String(entry).trim().length)) statements.push(current);
+  return statements;
+}
+
+// Break a single compound statement (if/else, try/catch/finally, while, ...) into
+// its `{ header, body }` segments. A segment opens on a `... {` line and its body
+// runs until the matching `}`; a `} keyword {` line (else, catch, finally) both
+// closes the previous body and opens the next.
+function statementSegments(statement) {
+  const segments = [];
+  let body = null;
+  let depth = 0;
+  for (const raw of statement) {
+    const line = String(raw);
+    let running = depth;
+    let minDepth = depth;
+    for (const ch of line) {
+      if (ch === '{') running += 1;
+      else if (ch === '}') { running -= 1; if (running < minDepth) minDepth = running; }
+    }
+    const before = depth;
+    depth = running;
+    if (before === 0 && running >= 1) {
+      body = [];
+      segments.push({ header: line.trim(), body });
+    } else if (minDepth === 0 && running >= 1) {
+      body = [];
+      segments.push({ header: line.trim(), body });
+    } else if (running === 0) {
+      body = null;
+    } else if (body) {
+      body.push(line);
+    }
+  }
+  return segments;
+}
+
+// True when a rendered Java block (a brace-balanced line list) provably completes
+// abruptly on every path — control can never fall off its end. Recurses through
+// if/else, try/catch/finally, and infinite loops so a synthesized trailing
+// `return` is only added where the body can actually fall through.
+function bodyCompletesAbruptly(lines) {
+  const statements = splitTopLevelStatements(lines);
+  if (!statements.length) return false;
+  return statementCompletesAbruptly(statements[statements.length - 1]);
+}
+
+function statementCompletesAbruptly(statement) {
+  const trimmed = statement.map((line) => String(line).trim()).filter((line) => line.length);
+  if (!trimmed.length) return false;
+  const head = trimmed[0];
+  if (/^(?:return|throw)\b/.test(head)) return true;
+  if (/^if\s*\(/.test(head)) {
+    const segments = statementSegments(statement);
+    const last = segments[segments.length - 1];
+    const hasElse = last && /^\}?\s*else\s*\{$/.test(last.header);
+    if (!hasElse) return false; // an if with no final else can fall through
+    return segments.every((segment) => bodyCompletesAbruptly(segment.body));
+  }
+  if (/^try\s*\{/.test(head)) {
+    const segments = statementSegments(statement);
+    const last = segments[segments.length - 1];
+    if (last && /^\}?\s*finally\s*\{$/.test(last.header) && bodyCompletesAbruptly(last.body)) return true;
+    return segments.every((segment) => bodyCompletesAbruptly(segment.body));
+  }
+  if (/^(?:while\s*\(\s*true\s*\)|for\s*\(\s*;\s*;\s*\))\s*\{/.test(head)) {
+    const segments = statementSegments(statement);
+    const body = segments.length ? segments[0].body : [];
+    // An infinite loop completes abruptly unless a break can leave it. Any break
+    // in the body is treated conservatively as a possible exit.
+    return !body.some((line) => /\bbreak\b/.test(String(line)));
+  }
+  return false;
+}
+
+function formatStaticInitializer(code, localState, cls, options = {}) {
+  const body = code ? decompileCode(code, { name: '<clinit>', descriptor: '()V', flags: ['static'] }, cls, localState, options) : [];
+  const missingDeclarations = localState.missingDeclarations(body);
+  if (missingDeclarations.length) body.unshift(...missingDeclarations);
+  body.splice(0, body.length, ...normalizeSyntheticVariableScopes(body));
+  if (!body.length) return formatBlock('static', body);
+  const methodNames = new Set((cls.items || [])
+    .filter((item) => item && item.type === 'method' && item.method)
+    .map((item) => item.method.name));
+  let helperName = '$cfr$clinit';
+  while (methodNames.has(helperName)) helperName += '$';
+  return `${formatBlock('static', [`${helperName}();`])}\n\n${formatBlock(`private static void ${helperName}()`, body)}`;
 }
 
 function formatBlock(header, body) {
@@ -287,37 +765,1167 @@ function formatBlock(header, body) {
   return out.join('\n');
 }
 
-function decompileCode(code, method, cls, localState) {
+// A handler_pc reached from more than one distinct protected range is CFR's
+// same-target row merging: one logical try/catch whose body javac split into
+// several table rows. The legacy pattern structurers reconstruct only one of the
+// rows and leave the other protected calls outside the try (wrong Java). Route
+// such methods to the owned structurer, which merges the rows (or, failing that,
+// falls back to the always-correct state machine).
+function tableHasSharedHandler(exceptionTable) {
+  const rangesByHandler = new Map();
+  for (const entry of exceptionTable) {
+    if (entry.start_pc === entry.handler_pc) continue; // self-handler, dropped later
+    const key = entry.handler_pc;
+    if (!rangesByHandler.has(key)) rangesByHandler.set(key, new Set());
+    rangesByHandler.get(key).add(`${entry.start_pc}:${entry.end_pc}`);
+  }
+  for (const ranges of rangesByHandler.values()) if (ranges.size > 1) return true;
+  return false;
+}
+
+function tableHasTrivialCheckedHandler(code) {
+  const items = (code && code.codeItems) || [];
+  const labels = buildLabelIndex(items);
+  const unchecked = new Set(['java/lang/RuntimeException', 'java/lang/Error', 'any']);
+  for (const entry of (code && code.exceptionTable) || []) {
+    const catchType = entry.catch_type ?? entry.catchType;
+    if (!catchType || catchType === 0 || unchecked.has(catchType)) continue;
+    const handlerIndex = labels.get(entry.handlerLbl || entry.handlerLabel);
+    if (handlerIndex === undefined) continue;
+    const storeIndex = nextNonNopExecutableIndex(items, handlerIndex);
+    const store = storeIndex < 0 ? null : getInstructionFromItem(items[storeIndex]);
+    if (!store || !parseStoreIndex(store.op, store.arg)) continue;
+    const nextIndex = nextNonNopExecutableIndex(items, storeIndex + 1);
+    const next = nextIndex < 0 ? null : getInstructionFromItem(items[nextIndex]);
+    if (next && (next.op === 'goto' || next.op === 'goto_w' || next.op === 'return')) return true;
+  }
+  return false;
+}
+
+function normalizeLargeIntegerDispatchers(codeItems) {
+  if (!Array.isArray(codeItems) || codeItems.length <= 5000) return 0;
+  let rewrites = 0;
+  let labelIndex = buildLabelIndex(codeItems);
+  for (let start = 0; start < codeItems.length; start += 1) {
+    const match = matchIntegerDispatcher(codeItems, start, labelIndex);
+    if (!match) continue;
+    const first = codeItems[start] || {};
+    const replacement = [{ ...first, instruction: loadInt(match.local) }, {
+      instruction: { op: 'lookupswitch', arg: { pairs: match.pairs, defaultLabel: match.defaultLabel } },
+    }];
+    codeItems.splice(start, match.end - start, ...replacement);
+    rewrites += 1;
+    labelIndex = buildLabelIndex(codeItems);
+    start += 1;
+  }
+  return rewrites;
+}
+
+function matchIntegerDispatcher(items, start, labelIndex) {
+  const pairs = [];
+  let selectorLocal = null;
+  let scan = start;
+  const visited = new Set();
+  while (scan >= 0 && scan < items.length && !visited.has(scan)) {
+    visited.add(scan);
+    const parsed = parseIntegerDispatchTest(items, scan);
+    if (!parsed) {
+      const index = nextNonNopExecutableIndex(items, scan);
+      const instruction = index < 0 ? null : getInstructionFromItem(items[index]);
+      if (pairs.length >= 8 && instruction && (instruction.op === 'goto' || instruction.op === 'goto_w')) {
+        return { local: selectorLocal, pairs, defaultLabel: instruction.arg, end: index + 1 };
+      }
+      const fallthroughLabel = items[scan] && String(items[scan].labelDef || '').replace(/:$/, '');
+      if (pairs.length >= 8 && fallthroughLabel) {
+        return { local: selectorLocal, pairs, defaultLabel: fallthroughLabel, end: scan };
+      }
+      if (process.env.CFR_JS_DEBUG_STRUCTURER === '1' && pairs.length >= 2) {
+        console.error(`[cfr-dispatch-reject] cases=${pairs.length} index=${scan} op=${instruction && instruction.op}`);
+      }
+      return null;
+    }
+    if (selectorLocal == null) selectorLocal = parsed.local;
+    if (selectorLocal !== parsed.local) {
+      if (process.env.CFR_JS_DEBUG_STRUCTURER === '1' && pairs.length >= 2) {
+        console.error(`[cfr-dispatch-reject] cases=${pairs.length} selector=${selectorLocal}->${parsed.local}`);
+      }
+      return null;
+    }
+    if (pairs.some((pair) => pair[0] === parsed.value)) {
+      const existing = pairs.find((pair) => pair[0] === parsed.value);
+      if (existing[1] !== parsed.caseLabel) return null;
+    } else {
+      pairs.push([parsed.value, parsed.caseLabel]);
+    }
+    if (parsed.nextLabel) {
+      const next = labelIndex.get(parsed.nextLabel);
+      if (next == null || next <= scan) return null;
+      scan = next;
+    } else {
+      scan = parsed.end;
+    }
+  }
+  return null;
+}
+
+function parseIntegerDispatchTest(items, start) {
+  const stack = [];
+  let index = start;
+  for (let seen = 0; seen < 8 && index >= 0 && index < items.length; seen += 1) {
+    const instruction = getInstructionFromItem(items[index]);
+    if (!instruction || instruction.op === 'nop') {
+      index += 1;
+      continue;
+    }
+    const load = parseLoadIndex(instruction.op, instruction.arg);
+    if (load && load.type === 'int') stack.push({ local: load.index, complement: false });
+    else {
+      const constant = integerInstructionValue(instruction);
+      if (constant != null) stack.push({ constant });
+      else if (instruction.op === 'ixor' && stack.length >= 2) {
+        const right = stack.pop();
+        const left = stack.pop();
+        if (right.constant === -1 && left.local != null) stack.push({ ...left, complement: !left.complement });
+        else if (left.constant === -1 && right.local != null) stack.push({ ...right, complement: !right.complement });
+        else return null;
+      } else if (instruction.op === 'if_icmpeq' || instruction.op === 'if_icmpne') {
+        if (stack.length !== 2) return null;
+        const right = stack.pop();
+        const left = stack.pop();
+        const selector = left.local != null ? left : right;
+        const valueOperand = left.local != null ? right : left;
+        if (selector.local == null || valueOperand.constant == null) return null;
+        const value = selector.complement ? ~Number(valueOperand.constant) : Number(valueOperand.constant);
+        if (instruction.op === 'if_icmpeq') {
+          return { local: selector.local, value, caseLabel: instruction.arg, end: index + 1 };
+        }
+        const gotoIndex = nextNonNopExecutableIndex(items, index + 1);
+        const next = gotoIndex < 0 ? null : getInstructionFromItem(items[gotoIndex]);
+        if (!next || (next.op !== 'goto' && next.op !== 'goto_w')) return null;
+        return { local: selector.local, value, caseLabel: next.arg, nextLabel: instruction.arg, end: gotoIndex + 1 };
+      } else return null;
+    }
+    index += 1;
+  }
+  return null;
+}
+
+function integerInstructionValue(instruction) {
+  if (instruction.op === 'iconst_m1') return -1;
+  const match = /^iconst_([0-5])$/.exec(instruction.op || '');
+  if (match) return Number(match[1]);
+  if (instruction.op === 'bipush' || instruction.op === 'sipush') return Number(instruction.arg);
+  if ((instruction.op === 'ldc' || instruction.op === 'ldc_w') && Number.isInteger(instruction.arg)) {
+    return Number(instruction.arg);
+  }
+  return null;
+}
+
+function loadInt(index) {
+  return Number(index) >= 0 && Number(index) <= 3 ? `iload_${Number(index)}` : { op: 'iload', arg: String(index) };
+}
+
+function decompileCode(code, method, cls, localState, options = {}) {
+  const codeItemsForSelection = code.codeItems || [];
+  let controlTransfers = 0;
+  let hasSuppressedCleanup = false;
+  let hasArrayLength = false;
+  for (const item of codeItemsForSelection) {
+    const instruction = getInstructionFromItem(item);
+    if (!instruction) continue;
+    if (instruction.op === 'arraylength') hasArrayLength = true;
+    if (isConditionalBranch(instruction.op) || instruction.op === 'goto' || instruction.op === 'goto_w'
+      || instruction.op === 'tableswitch' || instruction.op === 'lookupswitch') controlTransfers += 1;
+    if (!String(instruction.op || '').startsWith('invoke')) continue;
+    try {
+      if (parseMemberRef(instruction.arg).name === 'addSuppressed') hasSuppressedCleanup = true;
+    } catch (_err) {
+      // invokedynamic and malformed references are irrelevant to this selector.
+    }
+  }
+  const preferOwnedStructurer = tableHasTrivialCheckedHandler(code)
+    || (codeItemsForSelection.length > 128
+      && !(hasArrayLength && !(code.exceptionTable || []).length
+        && controlTransfers / codeItemsForSelection.length <= 0.05)
+      && !hasSuppressedCleanup);
+  if (process.env.CFR_JS_PROFILE_METHODS === '1') {
+    console.error(`[cfr-selector] ${cls.className}.${method.name}${method.descriptor} items=${codeItemsForSelection.length} transfers=${controlTransfers} array=${hasArrayLength} suppressed=${hasSuppressedCleanup} owned=${preferOwnedStructurer}`);
+  }
+  if (preferOwnedStructurer) {
+    if (process.env.CFR_JS_PROFILE_METHODS === '1') console.error(`[cfr-owned-start] ${cls.className}.${method.name}${method.descriptor}`);
+    const ownedStructured = decompileOwnedStructuredControlFlow(code, method, cls, localState, options);
+    if (process.env.CFR_JS_PROFILE_METHODS === '1') console.error(`[cfr-owned-done] ${cls.className}.${method.name}${method.descriptor}`);
+    if (ownedStructured) return ownedStructured;
+  }
+
   const booleanPattern = decompileKnownBooleanPattern(code, method, cls, localState);
-  if (booleanPattern) return booleanPattern;
+  if (usableDecompileLines(booleanPattern)) return booleanPattern;
 
   const shortCircuitBooleanPattern = decompileShortCircuitBooleanReturnPattern(code, method, cls, localState);
-  if (shortCircuitBooleanPattern) return shortCircuitBooleanPattern;
+  if (usableDecompileLines(shortCircuitBooleanPattern)) return shortCircuitBooleanPattern;
 
   const booleanReturnPattern = decompileBooleanReturnPattern(code, method, cls, localState);
-  if (booleanReturnPattern) return booleanReturnPattern;
+  if (usableDecompileLines(booleanReturnPattern)) return booleanReturnPattern;
 
   const ternaryReturnPattern = decompileTernaryReturnPattern(code, method, cls, localState);
-  if (ternaryReturnPattern) return ternaryReturnPattern;
+  if (usableDecompileLines(ternaryReturnPattern)) return ternaryReturnPattern;
 
   const synchronizedBlock = decompileStructuredSynchronized(code, method, cls, localState);
-  if (synchronizedBlock) return synchronizedBlock;
+  if (usableDecompileLines(synchronizedBlock)) return synchronizedBlock;
 
   const finallyBlock = decompileStructuredFinally(code, method, cls, localState);
-  if (finallyBlock) return finallyBlock;
+  if (usableDecompileLines(finallyBlock)) return finallyBlock;
 
   const tryCatchFinally = decompileStructuredTryCatchFinally(code, method, cls, localState);
-  if (tryCatchFinally) return tryCatchFinally;
+  if (usableDecompileLines(tryCatchFinally)) return tryCatchFinally;
 
   const structured = decompileStructuredControlFlow(code, method, cls, localState);
-  if (structured) return structured;
+  const dropsExceptionTable = !hasSuppressedCleanup && (code.exceptionTable || []).length
+    && !(structured || []).some((line) => localDeclarationsFromStatement(line).some((item) => item.inCatch));
+  if (usableDecompileLines(structured) && !dropsExceptionTable) return structured;
+  if (structured && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+    console.error(`${cls.className}.${method.name}${method.descriptor}: legacy range output rejected (${structured.length} lines)`);
+  }
+
+  if (!preferOwnedStructurer) {
+    const ownedStructured = decompileOwnedStructuredControlFlow(code, method, cls, localState, options);
+    if (ownedStructured) return ownedStructured;
+  }
 
   const tryCatch = decompileStructuredTryCatch(code, method, cls, localState);
-  if (tryCatch) return tryCatch;
+  if (usableDecompileLines(tryCatch)) return tryCatch;
 
   const lines = decompileLinearCodeItems(code.codeItems || [], method, cls, localState);
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return coalesceDefaultConstructorBody(lines, method);
+}
+
+function usableDecompileLines(lines) {
+  if (!Array.isArray(lines) || lines.some((line) => String(line).includes('stack-underflow'))) return false;
+  if (hasUnreachableStatementAfterTerminal(lines)) return false;
+  return true;
+}
+
+function hasUnreachableStatementAfterTerminal(lines) {
+  let depth = 0;
+  let terminalDepth = null;
+  for (const raw of lines) {
+    const line = String(raw);
+    const leadingClosers = (line.match(/^\s*}+/) || [''])[0].replace(/[^}]/g, '').length;
+    const lineDepth = Math.max(0, depth - leadingClosers);
+    const trimmed = line.trim();
+    if (terminalDepth != null) {
+      if (lineDepth < terminalDepth || /^(?:case\b|default:|}\s*(?:else|catch|finally)\b)/.test(trimmed)) {
+        terminalDepth = null;
+      } else if (trimmed && !/^}/.test(trimmed)) {
+        return true;
+      }
+    }
+    if (/^(?:return(?:\s+.*)?;|throw\s+.*;)$/.test(trimmed)) terminalDepth = lineDepth;
+    depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+  }
+  return false;
+}
+
+function widenExceptionLocalsUsedByInstanceof(lines, model) {
+  const instanceofTypesByLocal = new Map();
+  const collect = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if ((node.kind === 'UnsupportedExpression' || node.kind === 'UnsupportedStatement') && Array.isArray(node.tokens)) {
+      for (let index = 1; index < node.tokens.length; index += 1) {
+        if (node.tokens[index].text === 'instanceof' && node.tokens[index - 1].kind === 'identifier'
+          && node.tokens[index + 1] && node.tokens[index + 1].kind === 'identifier') {
+          const name = node.tokens[index - 1].text;
+          if (!instanceofTypesByLocal.has(name)) instanceofTypesByLocal.set(name, new Set());
+          instanceofTypesByLocal.get(name).add(node.tokens[index + 1].text.replace(/\./g, '/'));
+        }
+      }
+      return;
+    }
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'range' || key === 'tokens') continue;
+      if (Array.isArray(value)) value.forEach(collect);
+      else collect(value);
+    }
+  };
+  for (const raw of lines) {
+    if (!String(raw).includes('instanceof')) continue;
+    try { collect(javaStatementParser.parseStatement(String(raw).trim())); } catch (_error) { /* ignore */ }
+  }
+  if (!instanceofTypesByLocal.size) return;
+  const primitive = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double']);
+  for (let index = 0; index < lines.length; index += 1) {
+    let line = String(lines[index]);
+    for (const declaration of localDeclarationsFromStatement(line)) {
+      if (declaration.inCatch || !instanceofTypesByLocal.has(declaration.name) || primitive.has(declaration.type)) continue;
+      const declaredType = declaration.type.replace(/\./g, '/');
+      const testedTypes = instanceofTypesByLocal.get(declaration.name);
+      if ([...testedTypes].every((testedType) => isInstanceofTypeCompatible(declaredType, testedType, model))) continue;
+      const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const escapedType = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      line = line.replace(new RegExp(`\\b${escapedType}[ \\t]+${escapedName}(?=[ \\t]*[=;,)])`),
+        `Object ${declaration.name}`);
+    }
+    lines[index] = line;
+  }
+}
+
+function isReferenceTypeAssignable(sourceType, targetType, model) {
+  if (targetType === 'Object' || targetType === 'java/lang/Object' || sourceType === targetType) return true;
+  const pending = [sourceType];
+  const seen = new Set();
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || seen.has(current)) continue;
+    if (current === targetType) return true;
+    seen.add(current);
+    const info = model && model.classInfo ? model.classInfo.get(current) : null;
+    if (info) {
+      if (info.superClassName) pending.push(info.superClassName);
+      pending.push(...(info.interfaces || []));
+    } else if (model && model.superOf) {
+      pending.push(model.superOf.get(current));
+    }
+  }
+  return false;
+}
+
+function isInstanceofTypeCompatible(sourceType, testedType, model) {
+  if (isReferenceTypeAssignable(sourceType, testedType, model)
+    || isReferenceTypeAssignable(testedType, sourceType, model)) return true;
+  const sourceInfo = model && model.classInfo ? model.classInfo.get(sourceType) : null;
+  const testedInfo = model && model.classInfo ? model.classInfo.get(testedType) : null;
+  return Boolean(sourceInfo && (sourceInfo.flags || []).includes('interface'))
+    || Boolean(testedInfo && (testedInfo.flags || []).includes('interface'));
+}
+
+function ensureCheckedCatchReachability(lines, code, model) {
+  if (!code || !(code.exceptionTable || []).length) return;
+  const generic = new Set([null, 0, 'any', 'java/lang/Throwable', 'java/lang/Exception',
+    'java/lang/RuntimeException', 'java/lang/Error']);
+  const entriesByType = new Map();
+  for (const entry of code.exceptionTable || []) {
+    const type = entry.catch_type ?? entry.catchType;
+    if (generic.has(type)) continue;
+    if (!entriesByType.has(type)) entriesByType.set(type, []);
+    entriesByType.get(type).push(entry);
+  }
+  const unsupportedSourceTypes = new Set();
+  for (const [catchType, entries] of entriesByType) {
+    if (isAssignableExceptionType(catchType, 'java/lang/RuntimeException', model)
+      || isAssignableExceptionType(catchType, 'java/lang/Error', model)) continue;
+    const supported = (code.codeItems || []).some((item) => {
+      if (!Number.isFinite(item.pc)
+        || !entries.some((entry) => item.pc >= entry.start_pc && item.pc < entry.end_pc)) return false;
+      const instruction = getInstructionFromItem(item);
+      if (!instruction) return false;
+      if (instruction.op === 'new' && typeof instruction.arg === 'string') {
+        return isAssignableExceptionType(instruction.arg, catchType, model);
+      }
+      if (!INVOKE_OPS.has(instruction.op)) return false;
+      let ref;
+      try { ref = parseMemberRef(instruction.arg); } catch (_error) { return false; }
+      return (resolveMethodThrows(ref.owner, ref.name, ref.descriptor, model) || [])
+        .some((type) => isAssignableExceptionType(type, catchType, model));
+    });
+    if (!supported || entries.length > 1) unsupportedSourceTypes.add(javaTypeFromInternalName(catchType));
+  }
+  if (!unsupportedSourceTypes.size) return;
+
+  const insertions = [];
+  for (let tryIndex = 0; tryIndex < lines.length; tryIndex += 1) {
+    if (String(lines[tryIndex]).trim() !== 'try {') continue;
+    const catchIndex = findMatchingCatchLine(lines, tryIndex);
+    if (catchIndex < 0) continue;
+    const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
+    if (!declaration || !unsupportedSourceTypes.has(declaration.type)) continue;
+    insertions.push({ index: tryIndex + 1, type: declaration.type,
+      indent: `${String(lines[tryIndex]).match(/^\s*/)[0]}    ` });
+  }
+  insertions.sort((a, b) => b.index - a.index);
+  for (const insertion of insertions) {
+    lines.splice(insertion.index, 0, `${insertion.indent}if (false) throw (${insertion.type}) null;`);
+  }
+}
+
+function pruneTopLevelUnreachableTail(lines) {
+  let depth = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = String(lines[index]);
+    const trimmed = line.trim();
+    if (depth === 0 && /^(?:return(?:\s+.*)?;|throw\s+.*;)$/.test(trimmed)) {
+      return lines.slice(0, index + 1);
+    }
+    depth += (line.match(/\{/g) || []).length;
+    depth -= (line.match(/\}/g) || []).length;
+  }
+  return lines;
+}
+
+function pruneBlockUnreachableStatements(lines) {
+  const result = [];
+  let depth = 0;
+  let unreachableDepth = null;
+  for (const raw of lines) {
+    const line = String(raw);
+    const leadingClosers = (line.match(/^\s*}+/) || [''])[0].replace(/[^}]/g, '').length;
+    const lineDepth = Math.max(0, depth - leadingClosers);
+    if (unreachableDepth != null && lineDepth >= unreachableDepth) {
+      depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+      continue;
+    }
+    if (unreachableDepth != null) unreachableDepth = null;
+    result.push(line);
+    if (/^(?:return(?:\s+.*)?;|throw\s+.*;)$/.test(line.trim())) unreachableDepth = lineDepth;
+    depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+  }
+  return result;
+}
+
+function normalizeSyntheticVariableScopes(lines) {
+  const text = (lines || []).join('\n');
+  const used = new Set(text.match(/\bvar\d+(?:_[A-Za-z0-9_$]+)?\b/g) || []);
+  const declarations = new Map();
+  const declarationCounts = new Map();
+  const forcedForDeclarations = new Map();
+  const minimumUseDepth = new Map();
+  const catchNames = new Set();
+  let depth = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = String(lines[index]);
+    const leadingClosers = (line.match(/^\s*}+/) || [''])[0].replace(/[^}]/g, '').length;
+    const lineDepth = Math.max(0, depth - leadingClosers);
+    const parsedDeclarations = localDeclarationsFromStatement(line);
+    for (const declaration of parsedDeclarations) {
+      declarationCounts.set(declaration.name, (declarationCounts.get(declaration.name) || 0) + 1);
+      if (!declarations.has(declaration.name)) {
+        declarations.set(declaration.name, { type: declaration.type, depth: lineDepth, index });
+      }
+      if (declaration.inFor) forcedForDeclarations.set(declaration.name, declaration.type);
+    }
+    const catchMatch = /catch\s*\([^)]*\b(var\d+(?:_[A-Za-z0-9_$]+)?)\s*\)/.exec(line);
+    if (catchMatch) catchNames.add(catchMatch[1]);
+    for (const name of line.match(/\bvar\d+(?:_[A-Za-z0-9_$]+)?\b/g) || []) {
+      minimumUseDepth.set(name, Math.min(minimumUseDepth.get(name) ?? Infinity, lineDepth));
+    }
+    depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+  }
+
+
+  const lifted = new Map();
+  for (const name of used) {
+    if (catchNames.has(name)) continue;
+    const declaration = declarations.get(name);
+    const declaredInFor = declaration && /\bfor\s*\(/.test(String(lines[declaration.index]));
+    const usedAfterDeclaration = declaration && new RegExp(`\\b${name}\\b`).test(lines.slice(declaration.index + 1).join('\n'));
+    if (!declaration || (declarationCounts.get(name) || 0) > 1 || forcedForDeclarations.has(name)
+      || (minimumUseDepth.get(name) || 0) < declaration.depth
+      || (declaration.depth > 0 && usedAfterDeclaration) || (declaredInFor && usedAfterDeclaration)) {
+      let type = declaration && declaration.type;
+      if (!type) type = forcedForDeclarations.get(name);
+      if (!type) {
+        if (/_long$/.test(name)) type = 'long';
+        else if (/_float$/.test(name)) type = 'float';
+        else if (/_double$/.test(name)) type = 'double';
+        else if (/_ref$|_[A-Z]/.test(name)) type = 'Object';
+        else type = 'int';
+      }
+      lifted.set(name, type);
+    }
+  }
+  if (!lifted.size) return lines;
+
+  const rewritten = lines.map((raw) => {
+    let line = String(raw);
+    if (/catch\s*\(/.test(line)) return line;
+    const declarationsOnLine = localDeclarationsFromStatement(line);
+    for (const [name] of lifted) {
+      const declaration = declarationsOnLine.find((item) => item.name === name);
+      if (!declaration) continue;
+      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const escapedType = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      line = line.replace(new RegExp(`\\b${escapedType}[ \\t]+${escaped}(?=[ \\t]*=)`), name);
+    }
+    return line;
+  });
+  const liftedDeclarations = [...lifted].map(([name, type]) => {
+    return `${type} ${name} = ${defaultValueForType(type)};`;
+  });
+  return [...liftedDeclarations, ...rewritten];
+}
+
+function refineObjectLocalDeclarations(lines, resolveType) {
+  if (typeof resolveType !== 'function') return lines;
+  const declaredTypes = new Map();
+  for (const raw of lines || []) {
+    for (const declaration of localDeclarationsFromStatement(String(raw))) {
+      if (!declaration.inCatch) declaredTypes.set(declaration.name, declaration.type);
+    }
+  }
+  const arrayElementTypes = new Map();
+  for (const raw of lines || []) {
+    let statement;
+    try { statement = javaStatementParser.parseStatement(String(raw).trim()); } catch (_error) { continue; }
+    const expression = statement && statement.kind === 'ExpressionStatement' ? statement.expression : null;
+    const tokens = expression && expression.kind === 'UnsupportedExpression' ? expression.tokens : null;
+    if (!tokens || tokens.length < 5 || tokens[0].kind !== 'identifier' || tokens[1].text !== '='
+      || tokens[2].kind !== 'identifier' || tokens[3].text !== '[' || tokens[tokens.length - 1].text !== ']') continue;
+    const arrayType = declaredTypes.get(tokens[2].text);
+    if (arrayType && arrayType.endsWith('[]')) arrayElementTypes.set(tokens[0].text, arrayType.slice(0, -2));
+  }
+  return (lines || []).map((raw) => {
+    let line = String(raw);
+    for (const declaration of localDeclarationsFromStatement(line)) {
+      if (declaration.type !== 'Object') continue;
+      const refinedType = arrayElementTypes.get(declaration.name) || resolveType(declaration.name);
+      if (!refinedType || refinedType === 'Object') continue;
+      const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      line = line.replace(new RegExp(`\\bObject[ \\t]+${escapedName}(?=[ \\t]*[=;,)])`),
+        `${refinedType} ${declaration.name}`);
+    }
+    return line;
+  });
+}
+
+function ensureMissingSyntheticDeclarations(lines) {
+  const text = lines.join('\n');
+  const used = new Set(text.match(/\bvar\d+(?:_[A-Za-z0-9_$]+)?\b/g) || []);
+  const missing = [];
+  for (const name of used) {
+    const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (lines.some((line) => localDeclarationsFromStatement(line).some((item) => item.name === name))) continue;
+    let type = 'int';
+    let value = '0';
+    if (/_long$/.test(name)) { type = 'long'; value = '0L'; }
+    else if (/_float$/.test(name)) { type = 'float'; value = '0.0f'; }
+    else if (/_double$/.test(name)) { type = 'double'; value = '0.0'; }
+    else if (/_ref$|_[A-Z]/.test(name)) { type = 'Object'; value = 'null'; }
+    missing.push(`${type} ${name} = ${value};`);
+  }
+  if (missing.length) lines.unshift(...missing);
+}
+
+function localDeclarationsFromStatement(source) {
+  let statement;
+  const trimmed = String(source).trim();
+  const catchHeader = trimmed.startsWith('}') ? trimmed.slice(1).trim() : trimmed;
+  try {
+    statement = catchHeader.startsWith('catch (') && catchHeader.endsWith('{')
+      ? javaStatementParser.parseStatement(`try {} ${catchHeader} }`)
+      : javaStatementParser.parseStatement(trimmed);
+  } catch (_error) {
+    return [];
+  }
+  if (statement && statement.kind === 'TryStatement' && catchHeader.startsWith('catch (')) {
+    return (statement.catches || []).map((item) => ({
+      name: item.parameter.name,
+      type: sourceTypeFromAst(item.parameter.parameterType),
+      inFor: false,
+      inCatch: true,
+    }));
+  }
+  let declaration = statement;
+  let inFor = false;
+  if (statement && statement.kind === 'ForStatement') {
+    declaration = statement.initializer;
+    inFor = true;
+  }
+  if (!declaration || declaration.kind !== 'LocalVariableDeclarationStatement') return [];
+  const baseType = sourceTypeFromAst(declaration.variableType);
+  return (declaration.declarators || []).map((item) => ({
+    name: item.name,
+    type: `${baseType}${'[]'.repeat(Number(item.dimensions) || 0)}`,
+    inFor,
+    inCatch: false,
+  }));
+}
+
+function sourceTypeFromAst(type) {
+  if (!type) return 'Object';
+  if (type.kind === 'PrimitiveType') return type.name;
+  if (type.kind === 'ClassType') {
+    const enclosing = type.enclosingType ? `${sourceTypeFromAst(type.enclosingType)}.` : '';
+    const qualified = type.packageName ? `${type.packageName}.` : '';
+    const argumentsSource = (type.typeArguments || []).length
+      ? `<${type.typeArguments.map(sourceTypeFromAst).join(', ')}>` : '';
+    return `${qualified}${enclosing}${type.name}${argumentsSource}`;
+  }
+  if (type.kind === 'ArrayType') {
+    return `${sourceTypeFromAst(type.componentType)}${'[]'.repeat(Number(type.dimensions) || 1)}`;
+  }
+  if (type.kind === 'ParameterizedType') {
+    return `${sourceTypeFromAst(type.rawType)}<${(type.typeArguments || []).map(sourceTypeFromAst).join(', ')}>`;
+  }
+  if (type.kind === 'WildcardType') {
+    if (!type.bound) return '?';
+    return `? ${type.boundKind || 'extends'} ${sourceTypeFromAst(type.bound)}`;
+  }
+  return type.name || type.text || 'Object';
+}
+
+function decompileOwnedStructuredControlFlow(code, method, cls, localState, options = {}) {
+  const originalItems = code.codeItems || [];
+  if (!(code.exceptionTable || []).length && !originalItems.some((item) => {
+    const instruction = getInstructionFromItem(item);
+    return instruction && (isConditionalBranch(instruction.op) || instruction.op === 'goto' ||
+      instruction.op === 'goto_w' || instruction.op === 'tableswitch' || instruction.op === 'lookupswitch');
+  })) return null;
+  // Region splitting is exclusively an input normalization for our total
+  // structurer. CFR/Vineflower-style recognizers see the original bytecode.
+  makeNormalControlFlowReducible({
+    classes: [{
+      className: cls.className,
+      items: [{
+        type: 'method',
+        method: { ...method, attributes: [{ type: 'code', code }] },
+      }],
+    }],
+  });
+  let codeItems = code.codeItems || [];
+  if (!codeItems.length) return [];
+  normalizeLargeIntegerDispatchers(codeItems);
+
+  let exceptionTable = code.exceptionTable || [];
+  let structured = null;
+  if (codeItems.length > 1000 && exceptionTable.length) {
+    const normalCfg = buildCfgFromCode(codeItems, []);
+    if (normalCfg) {
+      const reachableBlocks = new Set([normalCfg.entry]);
+      const pendingBlocks = [normalCfg.entry];
+      while (pendingBlocks.length) {
+        const blockId = pendingBlocks.pop();
+        for (const successor of normalCfg.succ[blockId] || []) {
+          if (successor == null || reachableBlocks.has(successor)) continue;
+          reachableBlocks.add(successor);
+          pendingBlocks.push(successor);
+        }
+      }
+      const reachableItems = new Set();
+      for (const blockId of reachableBlocks) {
+        for (const itemIndex of normalCfg.blocks[blockId].insns) reachableItems.add(itemIndex);
+      }
+      const normalItems = codeItems.filter((_item, index) => reachableItems.has(index));
+      const normalStructured = structureMethod(normalItems, []);
+      if (normalStructured && normalStructured.ok) {
+        codeItems = normalItems;
+        exceptionTable = [];
+        structured = normalStructured;
+      }
+    }
+  }
+  if (!structured) structured = structureMethod(codeItems, exceptionTable);
+  if ((!structured || !structured.ok) && codeItems.length > 1000) {
+    const normalOnly = structureMethod(codeItems, []);
+    if (normalOnly && normalOnly.ok) structured = normalOnly;
+  }
+  if ((!structured || !structured.ok) && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+    console.error(`${cls.className}.${method.name}${method.descriptor}: ${structured && structured.reason ? structured.reason : 'structurer returned no result'}`);
+  }
+  const exceptionBoundaryLabels = [];
+  for (const entry of exceptionTable) {
+    exceptionBoundaryLabels.push(entry.startLbl, entry.endLbl, entry.handlerLbl);
+  }
+  const cfg = buildCfgFromCode(codeItems, exceptionBoundaryLabels.filter(Boolean));
+  if (!cfg) return [];
+  let useStateMachine = process.env.CFR_JS_FORCE_STATE_MACHINE === '1' || !structured || !structured.ok;
+  if (useStateMachine && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+    console.error(`${cls.className}.${method.name}${method.descriptor}: using CFG state-machine fallback`);
+  }
+
+  const handlerEntries = new Map();
+  for (const entry of exceptionTable) {
+    const label = String(entry.handlerLbl || entry.handlerLabel || '').replace(/:$/, '');
+    if (!label) continue;
+    const catchType = entry.catch_type || entry.catchType;
+    handlerEntries.set(label, catchType == null || catchType === 0 || catchType === 'any'
+      ? 'Throwable'
+      : javaTypeFromInternalName(catchType));
+  }
+
+  // Vineflower's ExprProcessor propagates a copied PrimitiveExprsList through
+  // every regular CFG edge and seeds catch blocks with one exception value.
+  // Do the equivalent shape analysis first, before source rendering mutates the
+  // real local-variable state. At joins, stack positions become phi-like
+  // synthetic variables instead of borrowing an expression from one predecessor.
+  const analysisLocals = localState;
+  const entryStacks = new Map([[cfg.entry, []]]);
+  const queue = [cfg.entry];
+  for (const block of cfg.blocks) {
+    if (!handlerEntries.has(block.headLabel)) continue;
+    entryStacks.set(block.id, [expr('e', handlerEntries.get(block.headLabel))]);
+    if (!queue.includes(block.id)) queue.push(block.id);
+  }
+  let analysisFailed = false;
+  let analysisFailureReason = '';
+  for (let steps = 0; queue.length && steps < cfg.blocks.length * 8; steps += 1) {
+    const blockId = queue.shift();
+    const block = cfg.blocks[blockId];
+    const stack = (entryStacks.get(blockId) || []).map((value) => ({ ...value }));
+    decompileLinearCodeItems(block.insns.map((index) => codeItems[index]), method, cls, analysisLocals, {
+      initialStack: stack,
+      mutateStack: true,
+      keepTrailingReturn: true,
+    });
+    if (stack.some((value) => value.code.includes('stack-underflow'))) {
+      analysisFailed = true;
+      analysisFailureReason = `block ${blockId} produced stack underflow`;
+      break;
+    }
+    for (const successor of cfg.succ[blockId] || []) {
+      if (successor == null || handlerEntries.has(cfg.blocks[successor].headLabel)) continue;
+      const prior = entryStacks.get(successor);
+      if (!prior) {
+        entryStacks.set(successor, stack.map((value) => ({ ...value })));
+        queue.push(successor);
+      } else if (prior.length !== stack.length) {
+        analysisFailed = true;
+        analysisFailureReason = `edge ${blockId}->${successor} has stack height ${stack.length}, expected ${prior.length}`;
+        break;
+      } else {
+        let changed = false;
+        const merged = prior.map((value, index) => {
+          const incoming = stack[index];
+          const type = mergeStackTypes(value.type, incoming.type);
+          if (type !== value.type) changed = true;
+          const pendingNew = value.pendingNew && value.pendingNew === incoming.pendingNew
+            ? value.pendingNew
+            : null;
+          const qualifiedType = value.qualifiedType && value.qualifiedType === incoming.qualifiedType
+            ? value.qualifiedType
+            : null;
+          return expr(value.code, type, value.precedence, {
+            ...(pendingNew ? { pendingNew } : {}),
+            ...(qualifiedType ? { qualifiedType } : {}),
+          });
+        });
+        if (changed) {
+          entryStacks.set(successor, merged);
+          queue.push(successor);
+        }
+      }
+    }
+    if (analysisFailed) break;
+  }
+  if (analysisFailed) {
+    if (process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+      console.error(`${cls.className}.${method.name}${method.descriptor}: ${analysisFailureReason}`);
+    }
+    return null;
+  }
+  localState.resetReferenceFlow();
+
+  const stackInName = (blockId, slot) => `stackIn_${blockId}_${slot}`;
+  const stackOutName = (blockId, slot) => `stackOut_${blockId}_${slot}`;
+  const structuredCarrierType = [...handlerEntries.values()].every((type) =>
+    type === 'RuntimeException' || type === 'java.lang.RuntimeException')
+    ? 'RuntimeException' : 'Throwable';
+  const declarations = localState.liftAllDeclarations();
+  for (const block of cfg.blocks) {
+    if (!handlerEntries.has(block.headLabel)) {
+      (entryStacks.get(block.id) || []).forEach((value, slot) => {
+        requireRenderedTypeImport(options, value.qualifiedType || value.type);
+        declarations.push(`${simplifyType(value.type)} ${stackInName(block.id, slot)} = ${defaultValueForType(value.type)};`);
+      });
+    }
+  }
+
+  const cache = new Map();
+
+  const evaluate = (blockId) => {
+    if (cache.has(blockId)) return cache.get(blockId);
+    const block = cfg.blocks[blockId];
+    if (!block) return { lines: [], stack: [], terminator: null };
+    const lastIndex = block.insns[block.insns.length - 1];
+    const terminator = getInstructionFromItem(codeItems[lastIndex]);
+    const op = terminator && terminator.op;
+    const consumedByStructurer = op === 'goto' || op === 'goto_w' ||
+      op === 'tableswitch' || op === 'lookupswitch' || isConditionalBranch(op);
+    const bodyIndexes = consumedByStructurer ? block.insns.slice(0, -1) : block.insns;
+    const initialStack = (entryStacks.get(blockId) || []).map((value, slot) => {
+      const code = handlerEntries.has(block.headLabel)
+        ? (useStateMachine ? 'caughtException' : 'decompiledCaughtException')
+        : (value.code === 'this' ? 'this' : stackInName(blockId, slot));
+      const expressionType = handlerEntries.has(block.headLabel)
+        ? (useStateMachine ? 'Throwable' : structuredCarrierType)
+        : value.type;
+      return expr(code, expressionType, 100, {
+        ...(value.pendingNew ? { pendingNew: value.pendingNew } : {}),
+        ...(value.qualifiedType ? { qualifiedType: value.qualifiedType } : {}),
+      });
+    });
+    const stack = initialStack.slice();
+    const lines = decompileLinearCodeItems(bodyIndexes.map((index) => codeItems[index]), method, cls, localState, {
+      initialStack: stack,
+      mutateStack: true,
+      keepTrailingReturn: true,
+    });
+    const exitStack = stack.slice();
+    if (isConditionalBranch(op)) conditionForBranch(terminator, exitStack, false);
+    else if (op === 'tableswitch' || op === 'lookupswitch') pop(exitStack);
+    if (exitStack.some((value) => value.code.includes('stack-underflow'))) throw new Error('stack dataflow underflow');
+
+    // A terminal block has no outgoing operand stack.  Obfuscated methods can
+    // leave dead values beneath a return instruction; materializing those as
+    // stack-out assignments would place Java statements after return/throw.
+    const hasRegularSuccessor = (cfg.succ[blockId] || []).some((successor) =>
+      successor != null && !handlerEntries.has(cfg.blocks[successor].headLabel));
+    if (hasRegularSuccessor) exitStack.forEach((value, slot) => {
+      requireRenderedTypeImport(options, value.qualifiedType || value.type);
+      declarations.push(`${simplifyType(value.type)} ${stackOutName(blockId, slot)} = ${defaultValueForType(value.type)};`);
+      const rawStoredValue = renderStoreExpression(value);
+      const canonicalSourceType = rawStoredValue && localState.sourceTypeForName(rawStoredValue.code);
+      const targetStackType = simplifyType(value.type);
+      const primitiveStackTypes = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double']);
+      const simpleLocalReference = rawStoredValue
+        && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(rawStoredValue.code)
+        && !primitiveStackTypes.has(targetStackType) && targetStackType !== 'Object';
+      const typedStoredValue = simpleLocalReference
+        ? { ...rawStoredValue, type: 'Object' }
+        : (canonicalSourceType ? { ...rawStoredValue, type: canonicalSourceType } : rawStoredValue);
+      const rendered = value.pendingNew
+        ? expr('null', value.type)
+        : coerceExpressionForType(typedStoredValue, value.type);
+      lines.push(`${stackOutName(blockId, slot)} = ${rendered.code};`);
+    });
+    for (const successor of cfg.succ[blockId] || []) {
+      if (successor == null || handlerEntries.has(cfg.blocks[successor].headLabel)) continue;
+      const target = entryStacks.get(successor) || [];
+      target.forEach((value, slot) => {
+        const outgoing = expr(stackOutName(blockId, slot), exitStack[slot] ? exitStack[slot].type : 'Object');
+        lines.push(`${stackInName(successor, slot)} = ${coerceExpressionForType(outgoing, value.type).code};`);
+      });
+    }
+    const value = { lines, stack, terminator };
+    cache.set(blockId, value);
+    return value;
+  };
+
+  const render = {
+    straight(blockId) {
+      return evaluate(blockId).lines;
+    },
+    cond(blockId) {
+      const state = evaluate(blockId);
+      return conditionForBranch(state.terminator, state.stack.slice(), false).code;
+    },
+    switchValue(blockId) {
+      const state = evaluate(blockId);
+      return pop(state.stack.slice()).code;
+    },
+  };
+
+  try {
+    if (!useStateMachine && structured && structured.tree) {
+      normalizeStructuredCatchNodes(structured.tree, cfg, codeItems, options.exceptionModel);
+    }
+    // Large obfuscated initializers can protect thousands of individual basic
+    // blocks with the same wrapper handler. Emitting one Java try/catch per
+    // block overflows javac's exception table before it can write the method.
+    // Keep the normal CFG state machine, but omit those synthetic wrappers for
+    // very large fallbacks. Handler states still need a value for their seeded
+    // exception-stack slot even though normal control flow cannot enter them.
+    const stateMachineExceptionTable = codeItems.length > 1000
+      ? []
+      : exceptionTable;
+    if (!stateMachineExceptionTable.length && handlerEntries.size) {
+      declarations.push('Throwable caughtException = null;');
+    }
+    if (!useStateMachine && handlerEntries.size) {
+      declarations.push(`${structuredCarrierType} decompiledCaughtException = null;`);
+    }
+    let source = useStateMachine
+      ? printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
+        methodReturnType(method))
+      : printTree(structured.tree, render);
+    const hasInvalidJavaSwitch = (text) => /switch\s*\(\s*null\s*\)/.test(text)
+      || /^\s*case\s+(?!-?\d+\s*:|'(?:\\.|[^'])+'\s*:)/m.test(text);
+    const hasInvalidJavaFlow = (text) => hasUnreachableStatementAfterTerminal(String(text).split('\n'));
+    if (!useStateMachine && (source.includes('unsupported condition') || source.includes('= e;')
+      || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source))) {
+      const normalOnly = codeItems.length > 1000 ? structureMethod(codeItems, []) : null;
+      if (normalOnly && normalOnly.ok) {
+        cache.clear();
+        source = printTree(normalOnly.tree, render);
+      }
+      if (source.includes('unsupported condition') || source.includes('= e;')
+        || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source)) {
+        useStateMachine = true;
+        cache.clear();
+        source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
+          methodReturnType(method));
+      }
+    }
+    declarations.push(...localState.liftAllDeclarations());
+    const lines = source ? source.split('\n') : [];
+    if (declarations.length) {
+      const uniqueDeclarations = [...new Set(declarations)];
+      lines.unshift(...uniqueDeclarations);
+    }
+    if (lines[lines.length - 1] === 'return;') lines.pop();
+    return coalesceDefaultConstructorBody(lines, method);
+  } catch (err) {
+    // Expression reconstruction can still decline stack-carrying joins. The
+    // old recognizers remain a safe fallback while that dataflow grows.
+    if (process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+      console.error(`${cls.className}.${method.name}${method.descriptor}: ${err.message}`);
+    }
+    return null;
+  }
+}
+
+function normalizeStructuredCatchNodes(tree, cfg, codeItems, model) {
+  const walk = (node) => {
+    if (!node) return;
+    if (node.t === 'try') {
+      walk(node.body);
+      for (const item of node.catches || []) walk(item.body);
+      const blocks = new Set();
+      collectStructuredBlocks(node.body, blocks);
+      const thrownTypes = new Set();
+      let hasExplicitThrow = false;
+      const allocatedTypes = new Set();
+      for (const blockId of blocks) {
+        const block = cfg.blocks[blockId];
+        if (!block) continue;
+        for (const itemIndex of block.insns || []) {
+          const instruction = getInstructionFromItem(codeItems[itemIndex]);
+          if (!instruction) continue;
+          if (instruction.op === 'athrow') hasExplicitThrow = true;
+          if (instruction.op === 'new' && typeof instruction.arg === 'string') allocatedTypes.add(instruction.arg);
+          if (!INVOKE_OPS.has(instruction.op)) continue;
+          let ref;
+          try { ref = parseMemberRef(instruction.arg); } catch (_err) { continue; }
+          for (const type of resolveMethodThrows(ref.owner, ref.name, ref.descriptor, model) || []) {
+            thrownTypes.add(type);
+          }
+        }
+      }
+      if (hasExplicitThrow) for (const type of allocatedTypes) thrownTypes.add(type);
+      const valid = [];
+      const unsupported = [];
+      for (const item of node.catches || []) {
+        const catchType = String(item.type || '').replace(/\./g, '/');
+        const alwaysLegal = catchType === 'java/lang/Throwable' || catchType === 'java/lang/Exception'
+          || catchType === 'java/lang/RuntimeException' || catchType === 'java/lang/Error';
+        const supported = alwaysLegal
+          || [...thrownTypes].some((type) => isAssignableExceptionType(type, catchType, model));
+        (supported ? valid : unsupported).push(item);
+      }
+      if (unsupported.length) {
+        const hasGeneric = valid.some((item) => item.type === 'java.lang.Exception'
+          || item.type === 'Exception' || item.type === 'java.lang.Throwable' || item.type === 'Throwable');
+        if (!hasGeneric) valid.push({ ...unsupported[0], type: 'java.lang.Exception' });
+      }
+      node.catches = valid;
+      return;
+    }
+    if (node.t === 'seq') for (const child of node.body || []) walk(child);
+    else if (node.t === 'block' || node.t === 'loop') walk(node.body);
+    else if (node.t === 'if') { walk(node.then); walk(node.els); }
+    else if (node.t === 'switch') {
+      for (const item of node.cases || []) walk(item.body);
+      walk(node.dflt);
+    }
+  };
+  walk(tree);
+}
+
+function collectStructuredBlocks(node, blocks) {
+  if (!node) return;
+  if (node.t === 'straight' || node.t === 'if' || node.t === 'switch') blocks.add(node.block);
+  if (node.t === 'seq') for (const child of node.body || []) collectStructuredBlocks(child, blocks);
+  else if (node.t === 'block' || node.t === 'loop') collectStructuredBlocks(node.body, blocks);
+  else if (node.t === 'if') {
+    collectStructuredBlocks(node.then, blocks);
+    collectStructuredBlocks(node.els, blocks);
+  } else if (node.t === 'switch') {
+    for (const item of node.cases || []) collectStructuredBlocks(item.body, blocks);
+    collectStructuredBlocks(node.dflt, blocks);
+  } else if (node.t === 'try') {
+    collectStructuredBlocks(node.body, blocks);
+    for (const item of node.catches || []) collectStructuredBlocks(item.body, blocks);
+  }
+}
+
+function isAssignableExceptionType(thrownType, catchType, model) {
+  let current = thrownType;
+  const seen = new Set();
+  while (current && !seen.has(current)) {
+    if (current === catchType) return true;
+    seen.add(current);
+    current = model && model.superOf ? model.superOf.get(current) : null;
+  }
+  return false;
+}
+
+function printCfgStateMachine(cfg, render, evaluate, codeItems, exceptionTable, declarations, returnType) {
+  const blockByPc = new Map();
+  for (const block of cfg.blocks) {
+    const first = codeItems[block.insns[0]];
+    if (first && Number.isFinite(first.pc)) blockByPc.set(first.pc, block.id);
+  }
+
+  const handlersForBlock = (block) => {
+    const first = codeItems[block.insns[0]];
+    const pc = first && first.pc;
+    if (!Number.isFinite(pc)) return [];
+    const seenTypes = new Set();
+    const handlers = [];
+    for (const entry of exceptionTable) {
+      if (!(pc >= entry.start_pc && pc < entry.end_pc)) continue;
+      const target = blockByPc.get(entry.handler_pc);
+      if (target == null) continue;
+      const catchType = entry.catch_type == null || entry.catch_type === 0 || entry.catch_type === 'any'
+        ? 'Throwable'
+        : javaTypeFromInternalName(entry.catch_type);
+      if (seenTypes.has(catchType)) continue;
+      seenTypes.add(catchType);
+      handlers.push({ catchType, target });
+      if (catchType === 'Throwable') break;
+    }
+    return handlers;
+  };
+
+  // Evaluate every block before declarations are emitted: evaluation discovers
+  // stack-out temporaries lazily. Also record each block's handlers and whether
+  // its body is empty, so trivial forwarder states can be threaded away.
+  const evaluated = new Map();
+  for (const block of cfg.blocks) {
+    evaluated.set(block.id, { lines: evaluate(block.id).lines, handlers: handlersForBlock(block) });
+  }
+
+  // A state that emits no body and just transfers control to a single target is
+  // pure dispatch overhead. Thread every reference through it so the switch can
+  // drop the state entirely. Skip blocks with handlers: threading past a guarded
+  // (even empty) state would change which try/catch a jump lands in.
+  const forward = new Map();
+  for (const block of cfg.blocks) {
+    const info = evaluated.get(block.id);
+    const term = cfg.term[block.id];
+    if (info.lines.length || info.handlers.length || !term) continue;
+    if ((term.kind === 'goto' || term.kind === 'fall') && term.target != null) {
+      forward.set(block.id, term.target);
+    }
+  }
+  const resolve = (target) => {
+    if (target == null) return target;
+    const seen = new Set();
+    let current = target;
+    while (forward.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = forward.get(current);
+    }
+    return current;
+  };
+
+  const dispatch = (blockId) => {
+    const term = cfg.term[blockId];
+    if (!term || term.kind === 'return') return [];
+    if (term.kind === 'goto' || term.kind === 'fall') {
+      if (term.target == null) {
+        return returnType === 'void'
+          ? ['return;']
+          : ['throw new IllegalStateException("control fell off non-void method");'];
+      }
+      return [`statePc = ${resolve(term.target)};`, 'continue stateLoop;'];
+    }
+    if (term.kind === 'cond') {
+      const taken = term.taken == null ? -1 : resolve(term.taken);
+      const fall = term.fall == null ? -1 : resolve(term.fall);
+      return [
+        `if (${render.cond(blockId)}) {`,
+        `    statePc = ${taken};`,
+        '} else {',
+        `    statePc = ${fall};`,
+        '}',
+        'continue stateLoop;',
+      ];
+    }
+    if (term.kind === 'switch') {
+      const lines = [`switch (${render.switchValue(blockId)}) {`];
+      for (const item of term.cases) {
+        lines.push(`    case ${item.key}: statePc = ${item.target == null ? -1 : resolve(item.target)}; break;`);
+      }
+      lines.push(`    default: statePc = ${term.default == null ? -1 : resolve(term.default)}; break;`);
+      lines.push('}', 'continue stateLoop;');
+      return lines;
+    }
+    return ['throw new IllegalStateException("unsupported CFG terminator");'];
+  };
+
+  // Emit only states reachable from the (resolved) entry: threading forwarders
+  // away and pruning unreachable states (e.g. dead synthetic rethrow blocks)
+  // shrinks the switch enough to keep large methods under javac's 64KB limit.
+  const entryState = resolve(cfg.entry);
+  const reachable = new Set();
+  const worklist = [entryState];
+  while (worklist.length) {
+    const id = worklist.pop();
+    if (id == null || reachable.has(id) || forward.has(id)) continue;
+    reachable.add(id);
+    const term = cfg.term[id];
+    if (!term) continue;
+    const targets = [];
+    if (term.kind === 'goto' || term.kind === 'fall') targets.push(term.target);
+    else if (term.kind === 'cond') targets.push(term.taken, term.fall);
+    else if (term.kind === 'switch') { term.cases.forEach((c) => targets.push(c.target)); targets.push(term.default); }
+    for (const h of evaluated.get(id).handlers) targets.push(h.target);
+    for (const t of targets) worklist.push(resolve(t));
+  }
+
+  const renderedBlocks = cfg.blocks
+    .filter((block) => reachable.has(block.id))
+    .map((block) => {
+      const info = evaluated.get(block.id);
+      return { block, body: [...info.lines, ...dispatch(block.id)], handlers: info.handlers };
+    });
+  declarations.push('int statePc = ' + entryState + ';');
+  if (renderedBlocks.some((item) => item.handlers.length)) declarations.push('Throwable caughtException = null;');
+
+  const lines = ['stateLoop: while (true) {', '    switch (statePc) {'];
+  for (const { block, body, handlers } of renderedBlocks) {
+    lines.push(`        case ${block.id}: {`);
+    if (handlers.length) lines.push('            try {');
+    const bodyIndent = handlers.length ? '                ' : '            ';
+    for (const line of body) lines.push(`${bodyIndent}${line}`);
+    if (handlers.length) {
+      const caught = `stateCaught_${block.id}`;
+      lines.push(`            } catch (Throwable ${caught}) {`);
+      const dispatchExpression = handlers.slice(0, -1).reduceRight((fallback, handler) =>
+        `(${caught} instanceof ${handler.catchType} ? ${resolve(handler.target)} : ${fallback})`,
+      String(resolve(handlers[handlers.length - 1].target)));
+      lines.push(`                caughtException = ${caught};`);
+      lines.push(`                statePc = ${dispatchExpression};`);
+      lines.push('                continue stateLoop;');
+      lines.push('            }');
+    }
+    lines.push('        }');
+  }
+  lines.push('        default: throw new IllegalStateException("invalid CFG state " + statePc);');
+  lines.push('    }', '}');
+  return lines.join('\n');
+}
+
+function mergeStackTypes(left, right) {
+  const a = simplifyType(left || 'Object');
+  const b = simplifyType(right || 'Object');
+  if (a === b) return a;
+  if (a === 'Object') return b;
+  if (b === 'Object') return a;
+  const integral = new Set(['boolean', 'byte', 'char', 'short', 'int']);
+  if (integral.has(a) && integral.has(b)) return 'int';
+  const numeric = new Set(['byte', 'char', 'short', 'int', 'long', 'float', 'double']);
+  if (numeric.has(a) && numeric.has(b)) {
+    if (a === 'double' || b === 'double') return 'double';
+    if (a === 'float' || b === 'float') return 'float';
+    if (a === 'long' || b === 'long') return 'long';
+    return 'int';
+  }
+  return 'Object';
+}
+
+function isCategory2(value) {
+  return value && (value.type === 'long' || value.type === 'double');
 }
 
 function decompileLinearCodeItems(codeItems, method, cls, localState, options = {}) {
@@ -336,7 +1944,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
 
     if (INTEGER_CONSTS[op] !== undefined) {
-      stack.push(expr(INTEGER_CONSTS[op], 'int'));
+      stack.push(expr(INTEGER_CONSTS[op], 'int', 100, { constantValue: Number(INTEGER_CONSTS[op]) }));
       continue;
     }
     if (LONG_CONSTS[op] !== undefined) {
@@ -357,7 +1965,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       continue;
     }
     if (op === 'bipush' || op === 'sipush') {
-      stack.push(expr(String(instruction.arg), 'int'));
+      stack.push(expr(String(instruction.arg), 'int', 100, { constantValue: Number(instruction.arg) }));
       continue;
     }
     if (op === 'ldc' || op === 'ldc_w' || op === 'ldc2_w') {
@@ -367,21 +1975,27 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
 
     const loadIndex = parseLoadIndex(op, instruction.arg);
     if (loadIndex) {
-      stack.push(localState.load(loadIndex.index, loadIndex.type));
+      stack.push(localState.load(loadIndex.index, loadIndex.type, codeItem.pc));
       continue;
     }
 
     const storeIndex = parseStoreIndex(op, instruction.arg);
     if (storeIndex) {
       const value = renderStoreExpression(pop(stack));
-      lines.push(localState.store(storeIndex.index, storeIndex.type, value));
+      lines.push(localState.store(storeIndex.index, storeIndex.type, value, codeItem.pc));
       continue;
     }
 
     if (BINARY_OPS.has(op)) {
-      const right = pop(stack);
-      const left = pop(stack);
+      let right = pop(stack);
+      let left = pop(stack);
       const symbol = BINARY_OPS.get(op);
+      if ((op === 'iand' || op === 'ior' || op === 'ixor') && (left.type === 'boolean' || right.type === 'boolean')) {
+        left = coerceExpressionForType(left, 'boolean');
+        right = coerceExpressionForType(right, 'boolean');
+        stack.push(binaryExpr(left, symbol, right, 'boolean'));
+        continue;
+      }
       stack.push(binaryExpr(left, symbol, right, primitiveTypeFromOpcode(op)));
       continue;
     }
@@ -412,7 +2026,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         : [instruction.varnum != null ? instruction.varnum : instruction.index, instruction.incr != null ? instruction.incr : instruction.const];
       const index = Number(indexRaw);
       const amount = Number(constantRaw);
-      const variable = localState.load(index, 'int').code;
+      const variable = localState.load(index, 'int', codeItem.pc).code;
       if (amount === 1) lines.push(`${variable}++;`);
       else if (amount === -1) lines.push(`${variable}--;`);
       else if (amount >= 0) lines.push(`${variable} += ${amount};`);
@@ -421,17 +2035,86 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
 
     if (op === 'dup') {
-      stack.push({ ...peek(stack) });
+      const top = peek(stack);
+      // A dynamic-length new-array being filled must be shared (not copied) so
+      // that spilling it to a synthetic local at the first aastore propagates
+      // to the sibling stores and to the eventual rvalue use.
+      stack.push(top.newArraySpill ? top : { ...top });
+      continue;
+    }
+    if (op === 'dup_x1') {
+      const value1 = pop(stack);
+      const value2 = pop(stack);
+      stack.push({ ...value1 }, value2, value1);
+      continue;
+    }
+    if (op === 'dup_x2') {
+      const value1 = pop(stack);
+      const value2 = pop(stack);
+      if (isCategory2(value2)) {
+        stack.push({ ...value1 }, value2, value1);
+      } else {
+        const value3 = pop(stack);
+        stack.push({ ...value1 }, value3, value2, value1);
+      }
+      continue;
+    }
+    if (op === 'dup2') {
+      const value1 = pop(stack);
+      if (isCategory2(value1)) {
+        stack.push(value1, { ...value1 });
+      } else {
+        const value2 = pop(stack);
+        stack.push(value2, value1, { ...value2 }, { ...value1 });
+      }
+      continue;
+    }
+    if (op === 'dup2_x1') {
+      const value1 = pop(stack);
+      if (isCategory2(value1)) {
+        const value2 = pop(stack);
+        stack.push({ ...value1 }, value2, value1);
+      } else {
+        const value2 = pop(stack);
+        const value3 = pop(stack);
+        stack.push({ ...value2 }, { ...value1 }, value3, value2, value1);
+      }
+      continue;
+    }
+    if (op === 'dup2_x2') {
+      const value1 = pop(stack);
+      if (isCategory2(value1)) {
+        const value2 = pop(stack);
+        if (isCategory2(value2)) {
+          stack.push({ ...value1 }, value2, value1);
+        } else {
+          const value3 = pop(stack);
+          stack.push({ ...value1 }, value3, value2, value1);
+        }
+      } else {
+        const value2 = pop(stack);
+        const value3 = pop(stack);
+        if (isCategory2(value3)) {
+          stack.push({ ...value2 }, { ...value1 }, value3, value2, value1);
+        } else {
+          const value4 = pop(stack);
+          stack.push({ ...value2 }, { ...value1 }, value4, value3, value2, value1);
+        }
+      }
       continue;
     }
     if (op === 'pop') {
       const value = pop(stack);
-      if (value && value.code && !value.synthetic) lines.push(`${value.code};`);
+      const pureReference = value && /^(?:this|[A-Za-z_$][A-Za-z0-9_$]*)$/.test(value.code);
+      if (value && value.code && !value.synthetic && !pureReference) {
+        const discardedName = localState.nextSyntheticName('discarded');
+        lines.push(`${simplifyType(value.type)} ${discardedName} = ${value.code};`);
+      }
       continue;
     }
     if (op === 'pop2') {
-      pop(stack);
-      pop(stack);
+      const value = pop(stack);
+      if (!isCategory2(value)) pop(stack);
       continue;
     }
     if (op === 'swap') {
@@ -449,8 +2132,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'newarray' || op === 'anewarray') {
       const length = pop(stack);
       const type = op === 'newarray' ? String(instruction.arg) : javaTypeFromInternalName(instruction.arg);
+      const foldable = /^\d+$/.test(length.code);
       stack.push(expr(formatNewArrayExpression(type, length.code), `${type}[]`, 100, {
-        arrayLiteral: /^\d+$/.test(length.code) ? { elementType: type, length: Number(length.code), elements: new Map() } : null,
+        arrayLiteral: foldable ? { elementType: type, length: Number(length.code), elements: new Map() } : null,
+        // Dynamic-length allocations can't fold into a `T[]{...}` literal, so a
+        // dup+aastore fill would render `new T[n][i] = v` (invalid Java). Mark
+        // them so the store path can spill the array to a synthetic local.
+        newArraySpill: foldable ? undefined : {},
       }));
       continue;
     }
@@ -458,38 +2146,66 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const multiArray = parseMultiANewArrayInstruction(instruction);
       const dimensions = multiArray.dimensions;
       const args = popArgs(stack, dimensions);
-      const baseType = descriptorToJavaType(multiArray.descriptor).replace(/(?:\[\])+$/g, '');
-      const suffix = args.map((arg) => `[${arg.code}]`).join('');
-      stack.push(expr(`new ${baseType}${suffix}`, `${baseType}${'[]'.repeat(Math.max(0, dimensions))}`));
+      const arrayType = descriptorToJavaType(multiArray.descriptor);
+      const baseType = arrayType.replace(/(?:\[\])+$/g, '');
+      const totalDimensions = (arrayType.match(/\[\]/g) || []).length;
+      const allocatedSuffix = args.map((arg) => `[${arg.code}]`).join('');
+      const unallocatedSuffix = '[]'.repeat(Math.max(0, totalDimensions - dimensions));
+      stack.push(expr(`new ${baseType}${allocatedSuffix}${unallocatedSuffix}`, arrayType));
       continue;
     }
     if (op === 'arraylength') {
       const array = pop(stack);
+      if (array.type === 'Object') localState.refineExpressionType(array, 'Object[]');
       stack.push(expr(`${wrap(array, 100)}.length`, 'int'));
       continue;
     }
 
     if (ARRAY_LOAD_TYPES[op]) {
       const index = pop(stack);
-      const array = pop(stack);
-      stack.push(expr(`${wrap(array, 100)}[${index.code}]`, ARRAY_LOAD_TYPES[op]));
+      let array = pop(stack);
+      if (array.type === 'Object') {
+        const arrayType = op === 'aaload' ? 'Object[]' : `${ARRAY_LOAD_TYPES[op]}[]`;
+        array = coerceExpressionForType(array, arrayType);
+      }
+      const elementType = op === 'baload' && array.type === 'boolean[]'
+        ? 'boolean'
+        : (op === 'aaload' && array.type.endsWith('[]') ? array.type.slice(0, -2) : ARRAY_LOAD_TYPES[op]);
+      stack.push(expr(`${wrap(array, 100)}[${index.code}]`, elementType, 100, { arrayElement: true }));
       continue;
     }
     if (ARRAY_STORE_TYPES[op]) {
       const value = pop(stack);
       const index = pop(stack);
-      const array = pop(stack);
+      let array = pop(stack);
+      if (array.type === 'Object') {
+        const arrayType = op === 'aastore' ? 'Object[]' : `${ARRAY_STORE_TYPES[op]}[]`;
+        array = coerceExpressionForType(array, arrayType);
+      }
       if (array.arrayLiteral && /^\d+$/.test(index.code)) {
         array.arrayLiteral.elements.set(Number(index.code), value);
       } else {
-        lines.push(`${wrap(array, 100)}[${index.code}] = ${value.code};`);
+        if (array.newArraySpill && /^new\b/.test(array.code)) {
+          // Materialize the fresh array into a synthetic local before storing;
+          // the shared expr object makes every later reference use the local.
+          const name = localState.nextSyntheticName();
+          lines.push(`${array.type} ${name} = ${array.code};`);
+          array.code = name;
+          array.newArraySpill = undefined;
+        }
+        const elementType = op === 'bastore' && array.type === 'boolean[]'
+          ? 'boolean'
+          : (op === 'aastore' && array.type.endsWith('[]') ? array.type.slice(0, -2) : ARRAY_STORE_TYPES[op]);
+        lines.push(`${wrap(array, 100)}[${index.code}] = ${coerceExpressionForType(value, elementType).code};`);
       }
       continue;
     }
 
     if (op === 'getstatic') {
       const ref = parseMemberRef(instruction.arg);
-      stack.push(expr(formatStaticField(ref, currentInternalClassName), descriptorToJavaType(ref.descriptor)));
+      stack.push(expr(formatStaticField(ref, currentInternalClassName), descriptorToJavaType(ref.descriptor), 100, {
+        qualifiedType: qualifiedReferenceTypeFromDescriptor(ref.descriptor),
+      }));
       continue;
     }
     if (op === 'putstatic') {
@@ -500,15 +2216,17 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'getfield') {
       const ref = parseMemberRef(instruction.arg);
-      const owner = pop(stack);
-      stack.push(expr(`${wrap(owner, 100)}.${ref.name}`, descriptorToJavaType(ref.descriptor)));
+      const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
+      stack.push(expr(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name)}`, descriptorToJavaType(ref.descriptor), 100, {
+        qualifiedType: qualifiedReferenceTypeFromDescriptor(ref.descriptor),
+      }));
       continue;
     }
     if (op === 'putfield') {
       const ref = parseMemberRef(instruction.arg);
       const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
-      const owner = pop(stack);
-      lines.push(`${wrap(owner, 100)}.${ref.name} = ${value.code};`);
+      const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
+      lines.push(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name)} = ${value.code};`);
       continue;
     }
 
@@ -521,7 +2239,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       continue;
     }
     if (op === 'invokespecial') {
-      emitSpecialCall(lines, stack, instruction.arg, method, className, currentInternalClassName);
+      emitSpecialCall(lines, stack, instruction.arg, method, className, currentInternalClassName, localState);
       continue;
     }
     if (op === 'invokedynamic') {
@@ -532,7 +2250,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'checkcast') {
       const value = pop(stack);
       const type = javaTypeFromInternalName(instruction.arg);
-      stack.push(expr(`(${type})${wrap(value, 100)}`, type, 100));
+      stack.push(coerceExpressionForType(value, type));
       continue;
     }
     if (op === 'instanceof') {
@@ -553,7 +2271,22 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
 
     if (op === 'athrow') {
-      lines.push(`throw ${pop(stack).code};`);
+      const thrown = pop(stack);
+      const declaredThrows = methodThrowsTypes(method);
+      const broadThrown = ['Object', 'Throwable', 'Exception', 'java.lang.Throwable', 'java.lang.Exception']
+        .includes(simplifyType(thrown.type));
+      if (broadThrown && declaredThrows.length === 1
+        && !['Throwable', 'java.lang.Throwable', 'Exception', 'java.lang.Exception'].includes(declaredThrows[0])) {
+        lines.push(`if (${thrown.code} instanceof RuntimeException) throw (RuntimeException) ${thrown.code};`);
+        lines.push(`if (${thrown.code} instanceof Error) throw (Error) ${thrown.code};`);
+        lines.push(`throw ${coerceExpressionForType(thrown, declaredThrows[0]).code};`);
+        continue;
+      }
+      const requiresUncheckedRethrow = declaredThrows.length === 0 && broadThrown;
+      const renderedThrown = thrown.code === 'caughtException'
+        ? coerceExpressionForType(thrown, 'RuntimeException')
+        : (requiresUncheckedRethrow ? coerceExpressionForType(thrown, 'RuntimeException') : thrown);
+      lines.push(`throw ${renderedThrown.code};`);
       continue;
     }
 
@@ -563,7 +2296,10 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       continue;
     }
     if (op === 'return') {
-      if (method.name !== '<init>' && method.name !== '<clinit>') lines.push('return;');
+      if (method.name !== '<init>' && method.name !== '<clinit>') {
+        if (methodReturnType(method) === 'void') lines.push('return;');
+        else lines.push('throw new IllegalStateException("void return opcode in non-void method");');
+      }
       continue;
     }
 
@@ -583,7 +2319,24 @@ function emitVirtualCall(lines, stack, arg) {
   const ref = parseMemberRef(arg);
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
-  const receiver = pop(stack);
+  const rawReceiver = pop(stack);
+  const ownerType = javaTypeFromInternalName(ref.owner);
+  const receiver = /^stackIn_/.test(rawReceiver.code)
+    ? expr(`(${ownerType}) (Object) ${rawReceiver.code}`, ownerType, 90)
+    : coerceExpressionForType(rawReceiver, ownerType);
+
+  const objectMethods = new Set(['clone', 'equals', 'finalize', 'getClass', 'hashCode', 'notify', 'notifyAll', 'toString', 'wait']);
+  if (ref.owner === 'java/lang/Object' && !objectMethods.has(ref.name)) {
+    const returnType = simplifyType(descriptor.returnType);
+    if (returnType === 'void') lines.push(`/* unresolved invokevirtual Object.${ref.name} */`);
+    else stack.push(expr(defaultValueForType(returnType), returnType));
+    return;
+  }
+
+  if (ref.name === 'getPeer' && descriptor.params.length === 0) {
+    stack.push(expr('null', simplifyType(descriptor.returnType)));
+    return;
+  }
 
   if (ref.owner === 'java/lang/StringBuilder' && ref.name === 'append' && args.length === 1) {
     stack.push(stringBuilderAppendExpression(receiver, args[0]));
@@ -619,12 +2372,28 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName) {
   }
 }
 
+const NUMERIC_PRIMITIVES = new Set(['byte', 'short', 'char', 'int', 'long', 'float', 'double']);
+
 function formatCallArguments(ref, descriptor, args) {
   return args.map((arg, index) => {
     if (shouldRenderCharArgument(ref, descriptor, index, arg)) {
       return formatCharLiteral(Number(arg.code));
     }
-    return arg.code;
+    const target = (descriptor.params || [])[index];
+    const primitiveTargets = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double', 'void']);
+    if (target && arg.code === 'null' && !primitiveTargets.has(simplifyType(target))) {
+      return `(${simplifyType(target)}) null`;
+    }
+    const value = coerceExpressionForType(arg, target || arg.type);
+    // Pin the overload: an argument whose rendered type is a *different*
+    // numeric primitive than the descriptor's parameter can make javac
+    // resolve a more specific overload (e.g. a byte arg to a:(II)I selects
+    // an inherited void a(int, byte)). An explicit cast to the descriptor
+    // type restores the bytecode's target.
+    if (target && NUMERIC_PRIMITIVES.has(target) && NUMERIC_PRIMITIVES.has(value.type) && value.type !== target) {
+      return `(${target}) ${wrap(value, 90)}`;
+    }
+    return value.code;
   });
 }
 
@@ -648,32 +2417,44 @@ function formatCharLiteral(codePoint) {
   return `'${escaped}'`;
 }
 
-function emitSpecialCall(lines, stack, arg, method, currentClassName, currentInternalClassName) {
+function emitSpecialCall(lines, stack, arg, method, currentClassName, currentInternalClassName, localState) {
   const ref = parseMemberRef(arg);
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
-  const receiver = pop(stack);
+  const renderedArgs = formatCallArguments(ref, descriptor, args);
+  const rawReceiver = pop(stack);
+  const ownerTypeForReceiver = javaTypeFromInternalName(ref.owner);
+  const receiver = rawReceiver.code === 'this'
+    ? rawReceiver
+    : (/^stackIn_/.test(rawReceiver.code)
+      ? expr(`(${ownerTypeForReceiver}) (Object) ${rawReceiver.code}`, ownerTypeForReceiver, 90)
+      : coerceExpressionForType(rawReceiver, ownerTypeForReceiver));
 
   if (ref.name === '<init>') {
     const ownerType = javaTypeFromInternalName(ref.owner);
     if (method.name === '<init>' && receiver.code === 'this') {
-      if (ref.owner === 'java/lang/Object' && args.length === 0) return;
+      if (args.length === 0 && ref.owner !== currentInternalClassName) return;
       const target = ref.owner === currentInternalClassName || ownerType === currentClassName ? 'this' : 'super';
-      lines.push(`${target}(${args.map((a) => a.code).join(', ')});`);
+      const invocationArgs = renderedArgs.map((rendered, index) => args[index].code.startsWith('stackIn_')
+        ? defaultValueForType(simplifyType(descriptor.params[index]))
+        : rendered);
+      localState.recordConstructorInvocation(target, invocationArgs);
       return;
     }
-    if (receiver.pendingNew || receiver.code.startsWith('new ')) {
+    if (receiver.pendingNew || receiver.code.startsWith('new ') || /^stackIn_/.test(rawReceiver.code)) {
       const constructed = ref.owner === 'java/lang/StringBuilder'
         ? stringBuilderConstructorExpression(ownerType, args)
-        : expr(`new ${ownerType}(${args.map((a) => a.code).join(', ')})`, ownerType);
+        : expr(`new ${ownerType}(${renderedArgs.join(', ')})`, ownerType);
       replacePendingNewOrEmit(lines, stack, receiver, constructed);
       return;
     }
-    lines.push(`${receiver.code}.${simpleClassName(ref.owner)}(${args.map((a) => a.code).join(', ')});`);
+    lines.push(`${wrap(receiver, 100)}.${simpleClassName(ref.owner)}(${renderedArgs.join(', ')});`);
     return;
   }
 
-  const call = `${receiver.code}.${ref.name}(${args.map((a) => a.code).join(', ')})`;
+  const specialReceiver = rawReceiver.code === 'this' && ref.owner !== currentInternalClassName
+    ? 'super' : wrap(receiver, 100);
+  const call = `${specialReceiver}.${ref.name}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') lines.push(`${call};`);
   else stack.push(expr(call, returnType));
@@ -709,9 +2490,13 @@ function renderStringBuilderConcat(pieces) {
     const only = pieces[0];
     return only.type === 'String' ? only.code : `String.valueOf(${only.code})`;
   }
-  const hasStringPiece = pieces.some((piece) => piece.type === 'String' || /^"/.test(piece.code));
-  const rendered = pieces.map((piece) => piece.code);
-  if (!hasStringPiece) rendered.unshift('""');
+  const isStringPiece = (piece) => piece.type === 'String' || /^"/.test(piece.code);
+  // A non-String additive piece must keep its parens: `"x" + a - b` parses as
+  // `("x" + a) - b`. String-typed pieces are safe (concat is associative).
+  const rendered = pieces.map((piece, index) => wrap(piece, 70, index > 0 && !isStringPiece(piece)));
+  // The FIRST binary `+` must be a string concat, or it computes arithmetic /
+  // fails to compile (Object + Object): `i + j + "x"` sums i and j.
+  if (!isStringPiece(pieces[0]) && !isStringPiece(pieces[1])) rendered.unshift('""');
   return rendered.join(' + ');
 }
 
@@ -1000,7 +2785,8 @@ function decompileStructuredTryCatchFinally(code, method, cls, localState) {
     const storeIndex = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
     if (!storeIndex || storeIndex.type !== 'Object') return null;
     const catchType = javaTypeFromInternalName(entry.catch_type);
-    const catchVariable = localCatchName(localState, storeIndex.index, catchType, defaultCatchVariableName(entry.catch_type));
+    const catchVariable = localCatchName(localState, storeIndex.index, catchType,
+      defaultCatchVariableName(entry.catch_type), codeItems[handlerIndex] && codeItems[handlerIndex].pc);
     const catchBody = decompileRange(codeItems, handlerIndex + 1, catchEnd, context, []);
     if (!catchBody.ok || catchBody.stack.length) return null;
     lines.push(`} catch (${catchType} ${catchVariable}) {`);
@@ -1252,6 +3038,9 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       continue;
     }
     if (one.some((line) => /^\/\/\s*(if|goto|tableswitch|lookupswitch)\b/.test(line))) {
+      if (process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+        console.error(`${context.cls.className}.${context.method.name}${context.method.descriptor}: range structurer stopped at pc ${codeItems[index].pc} (${instruction.op})`);
+      }
       return { ok: false, lines };
     }
     lines.push(...one);
@@ -1513,7 +3302,7 @@ function collectPrecedingResourceInitializers(lines, tryIndex) {
 }
 
 function parseResourceInitializer(line) {
-  const match = /^\s*(?:Object|[A-Za-z_$][A-Za-z0-9_.$<>\[\]?]*)\s+(var\d+)\s*=\s*(new\s+([A-Za-z_$][A-Za-z0-9_.$]*)(?:\([^;]*\)))\s*;\s*$/.exec(line);
+  const match = /^\s*(?:(?:Object|[A-Za-z_$][A-Za-z0-9_.$<>\[\]?]*)\s+)?(var\d+)\s*=\s*(new\s+([A-Za-z_$][A-Za-z0-9_.$]*)(?:\([^;]*\)))\s*;\s*$/.exec(line);
   if (!match) return null;
   return {
     name: match[1],
@@ -1636,15 +3425,19 @@ function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
 
     const catchType = javaTypeFromInternalName(handler.entry.catch_type || 'java/lang/Throwable');
     let catchVariable = defaultCatchVariableName(handler.entry.catch_type);
+    let priorCatchBinding = null;
     let bodyStart = handler.handlerIndex;
     const firstHandlerInstruction = getInstructionAt(codeItems, bodyStart);
     const storeIndex = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
     if (storeIndex && storeIndex.type === 'Object') {
-      catchVariable = localCatchName(context.localState, storeIndex.index, catchType, catchVariable);
+      priorCatchBinding = context.localState.captureBinding(storeIndex.index, catchType);
+      catchVariable = localCatchName(context.localState, storeIndex.index, catchType, catchVariable,
+        codeItems[bodyStart] && codeItems[bodyStart].pc);
       bodyStart += 1;
     }
 
     const catchBody = decompileRange(codeItems, bodyStart, handlerEnd, context, []);
+    if (priorCatchBinding) context.localState.restoreBinding(priorCatchBinding);
     if (!catchBody.ok || catchBody.stack.length) return null;
     lines.push(`} catch (${catchType} ${catchVariable}) {`);
     indentLines(catchBody.lines).forEach((line) => lines.push(line));
@@ -1664,13 +3457,8 @@ function stripTrailingGotoTo(codeItems, start, end, targetLabel) {
   return -1;
 }
 
-function localCatchName(localState, index, catchType, fallbackName) {
-  const existing = localState.nameFor(index, catchType);
-  if (/^var\d+$/.test(existing)) {
-    localState.setLocal(index, fallbackName, catchType, true);
-    return fallbackName;
-  }
-  localState.markDeclared(index);
+function localCatchName(localState, index, catchType, fallbackName, pc = null) {
+  const existing = localState.bindCatch(index, catchType, pc, fallbackName);
   return existing;
 }
 
@@ -1684,7 +3472,7 @@ function tryDecompileIfChainSwitchAt(codeItems, index, end, context, stack) {
     const branchIndex = findNextConditionalBranch(codeItems, scan, end);
     if (branchIndex === -1) return null;
     const branch = getInstructionAt(codeItems, branchIndex);
-    if (!branch || !(branch.op === 'if_icmpeq' || branch.op === 'if_acmpeq')) return null;
+    if (!branch || branch.op !== 'if_icmpeq') return null;
     if (!conditionPrefixIsExpressionOnly(codeItems, scan, branchIndex)) return null;
 
     const expressionStack = [];
@@ -1696,12 +3484,13 @@ function tryDecompileIfChainSwitchAt(codeItems, index, end, context, stack) {
     if (prefixLines.length || expressionStack.length !== 2) return null;
     const right = expressionStack.pop();
     const left = expressionStack.pop();
+    const value = right;
+    if (!Number.isInteger(value.constantValue)) return null;
     if (!selector) selector = left;
     if (selector.code !== left.code) return null;
-
     const targetIndex = context.labelIndex.get(branch.arg);
     if (targetIndex === undefined || targetIndex <= branchIndex || targetIndex > end) return null;
-    cases.push({ value: right, label: branch.arg, start: targetIndex });
+    cases.push({ value, label: branch.arg, start: targetIndex });
 
     const next = nextNonNopExecutableIndex(codeItems, branchIndex + 1);
     const nextInstruction = next === -1 ? null : getInstructionAt(codeItems, next);
@@ -2055,7 +3844,7 @@ function tryDecompileStackTernaryAt(codeItems, index, end, context, stack) {
   const trueValue = trueStack[trueStack.length - 1];
   const falseValue = falseStack[falseStack.length - 1];
   const nextStack = condition.stack.slice();
-  nextStack.push(expr(`${wrap(condition.condition, 20)} ? ${trueValue.code} : ${falseValue.code}`, trueValue.type || falseValue.type, 20));
+  nextStack.push(conditionalExpr(condition.condition, trueValue, falseValue));
   return { next: joinIndex, stack: nextStack };
 }
 
@@ -2212,23 +4001,30 @@ function evaluateConditionPrefix(codeItems, start, branchIndex, context, initial
   return { condition, prefixLines, stack };
 }
 
+const CONDITION_EXPRESSION_OPS = new Set([
+  ...Object.keys(INTEGER_CONSTS), ...Object.keys(LONG_CONSTS), ...Object.keys(FLOAT_CONSTS), ...Object.keys(DOUBLE_CONSTS),
+  'nop', 'aconst_null', 'bipush', 'sipush', 'ldc', 'ldc_w', 'ldc2_w', 'dup', 'pop', 'pop2', 'swap',
+  ...BINARY_OPS.keys(), ...NEGATE_OPS, ...Object.keys(CONVERSION_OPS), ...COMPARE_OPS,
+  'getstatic', 'getfield', 'arraylength', 'checkcast', 'instanceof',
+  'invokevirtual', 'invokeinterface', 'invokestatic',
+  ...Object.keys(ARRAY_LOAD_TYPES),
+]);
+const conditionExpressionPrefixCache = new WeakMap();
+
 function conditionPrefixIsExpressionOnly(codeItems, start, end) {
-  const allowed = new Set([
-    ...Object.keys(INTEGER_CONSTS), ...Object.keys(LONG_CONSTS), ...Object.keys(FLOAT_CONSTS), ...Object.keys(DOUBLE_CONSTS),
-    'nop', 'aconst_null', 'bipush', 'sipush', 'ldc', 'ldc_w', 'ldc2_w', 'dup', 'pop', 'pop2', 'swap',
-    ...BINARY_OPS.keys(), ...NEGATE_OPS, ...Object.keys(CONVERSION_OPS), ...COMPARE_OPS,
-    'getstatic', 'getfield', 'arraylength', 'checkcast', 'instanceof',
-    'invokevirtual', 'invokeinterface', 'invokestatic',
-    ...Object.keys(ARRAY_LOAD_TYPES),
-  ]);
-  for (let i = start; i < end; i += 1) {
-    const instruction = getInstructionAt(codeItems, i);
-    if (!instruction) continue;
-    const op = instruction.op;
-    if (parseLoadIndex(op, instruction.arg)) continue;
-    if (!allowed.has(op)) return false;
+  let disallowedPrefix = conditionExpressionPrefixCache.get(codeItems);
+  if (!disallowedPrefix) {
+    disallowedPrefix = new Uint32Array(codeItems.length + 1);
+    for (let i = 0; i < codeItems.length; i += 1) {
+      const instruction = getInstructionAt(codeItems, i);
+      const allowed = !instruction
+        || parseLoadIndex(instruction.op, instruction.arg)
+        || CONDITION_EXPRESSION_OPS.has(instruction.op);
+      disallowedPrefix[i + 1] = disallowedPrefix[i] + (allowed ? 0 : 1);
+    }
+    conditionExpressionPrefixCache.set(codeItems, disallowedPrefix);
   }
-  return true;
+  return disallowedPrefix[end] === disallowedPrefix[start];
 }
 
 function conditionForBranch(branch, stack, invert) {
@@ -2238,10 +4034,30 @@ function conditionForBranch(branch, stack, invert) {
     if_acmpeq: '==', if_acmpne: '!=',
   };
   if (intCompareOps[op]) {
-    const right = pop(stack);
-    const left = pop(stack);
+    let right = pop(stack);
+    let left = pop(stack);
     const operator = invert ? invertOperator(intCompareOps[op]) : intCompareOps[op];
-    return expr(`${wrap(left, 60)} ${operator} ${wrap(right, 60)}`, 'boolean', 60);
+    if ((op === 'if_acmpeq' || op === 'if_acmpne') && left.code !== 'null' && right.code !== 'null'
+      && simplifyType(left.type) !== simplifyType(right.type)) {
+      left = coerceExpressionForType(left, 'Object');
+      right = coerceExpressionForType(right, 'Object');
+    }
+    if ((operator === '==' || operator === '!=') && (left.type === 'boolean') !== (right.type === 'boolean')) {
+      // Mixed boolean/int comparison. Coercing the int side to boolean
+      // (`l == (r != 0)`) is unsound when r can be outside {0, 1}; the
+      // boolean side is guaranteed 0/1, so coerce THAT side to int instead.
+      const bool = left.type === 'boolean' ? left : right;
+      const other = left.type === 'boolean' ? right : left;
+      if (other.code === '0' || other.code === '1') {
+        const truthy = (other.code === '1') === (operator === '==');
+        return truthy ? expr(bool.code, 'boolean', bool.precedence) : negateBooleanExpression(bool);
+      }
+      const intBool = coerceExpressionForType(bool, 'int');
+      const newLeft = left.type === 'boolean' ? intBool : left;
+      const newRight = left.type === 'boolean' ? right : intBool;
+      return expr(`${wrap(newLeft, 60)} ${operator} ${wrap(newRight, 60, true)}`, 'boolean', 60);
+    }
+    return expr(`${wrap(left, 60)} ${operator} ${wrap(right, 60, true)}`, 'boolean', 60);
   }
 
   if (op === 'ifnull' || op === 'ifnonnull') {
@@ -2435,21 +4251,19 @@ function decompileStructuredTryCatch(code, method, cls, localState) {
 
   let handlerItems = codeItems.slice(handlerIndex, handlerEnd);
   let catchVariable = defaultCatchVariableName(entry.catch_type);
+  let priorCatchBinding = null;
   const firstHandlerInstruction = normalizeInstruction(handlerItems[0] && handlerItems[0].instruction);
   const storeIndex = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
   if (storeIndex && storeIndex.type === 'Object') {
-    catchVariable = localState.nameFor(storeIndex.index, javaTypeFromInternalName(entry.catch_type));
-    if (/^var\d+$/.test(catchVariable)) {
-      catchVariable = defaultCatchVariableName(entry.catch_type);
-      localState.setLocal(storeIndex.index, catchVariable, javaTypeFromInternalName(entry.catch_type), true);
-    } else {
-      localState.markDeclared(storeIndex.index);
-    }
+    priorCatchBinding = localState.captureBinding(storeIndex.index, javaTypeFromInternalName(entry.catch_type));
+    catchVariable = localState.bindCatch(storeIndex.index, javaTypeFromInternalName(entry.catch_type),
+      handlerItems[0] && handlerItems[0].pc, catchVariable);
     handlerItems = handlerItems.slice(1);
   }
 
   const tryBody = decompileLinearCodeItems(codeItems.slice(startIndex, endIndex), method, cls, localState);
   const catchBody = decompileLinearCodeItems(handlerItems, method, cls, localState);
+  if (priorCatchBinding) localState.restoreBinding(priorCatchBinding);
   const afterBody = decompileLinearCodeItems(codeItems.slice(afterIndex), method, cls, localState);
   const catchType = javaTypeFromInternalName(entry.catch_type || 'java/lang/Throwable');
 
@@ -2499,14 +4313,72 @@ function getCode(method) {
 function makeLocalState(paramTypes, isStatic, code = null) {
   const names = new Map();
   const types = new Map();
+  const debugNames = new Map();
+  const debugTypes = new Map();
   const declared = new Set();
+  const scopedDeclared = new Set();
   const paramNames = [];
   const localTable = collectLocalVariableTable(code);
+  const slotKinds = new Map();
+  const slotLastKind = new Map();
+  const catchStoreTypes = new Map();
+  const monitorStorePcs = new Set();
+  const castStoreTypes = new Map();
+  if (code) {
+    const codeItems = code.codeItems || [];
+    const labels = buildLabelIndex(codeItems);
+    for (const entry of code.exceptionTable || []) {
+      const handlerIndex = labels.get(entry.handlerLbl || entry.handlerLabel);
+      if (handlerIndex === undefined) continue;
+      const storeItemIndex = nextNonNopExecutableIndex(codeItems, handlerIndex);
+      if (storeItemIndex < 0) continue;
+      const storeItem = codeItems[storeItemIndex];
+      const instruction = getInstructionFromItem(storeItem);
+      const store = instruction && parseStoreIndex(instruction.op, instruction.arg);
+      if (!store || store.type !== 'Object' || !Number.isFinite(Number(storeItem.pc))) continue;
+      const rawCatchType = entry.catch_type ?? entry.catchType;
+      const catchType = rawCatchType == null || rawCatchType === 0 || rawCatchType === 'any'
+        ? 'Throwable' : javaTypeFromInternalName(rawCatchType);
+      catchStoreTypes.set(Number(storeItem.pc), catchType);
+    }
+    for (let itemIndex = 0; itemIndex < codeItems.length; itemIndex += 1) {
+      const storeItem = codeItems[itemIndex];
+      const instruction = getInstructionFromItem(storeItem);
+      const store = instruction && parseStoreIndex(instruction.op, instruction.arg);
+      if (!store || store.type !== 'Object' || !Number.isFinite(Number(storeItem.pc))) continue;
+      const nextIndex = nextNonNopExecutableIndex(codeItems, itemIndex + 1);
+      const nextInstruction = nextIndex < 0 ? null : getInstructionFromItem(codeItems[nextIndex]);
+      if (nextInstruction && nextInstruction.op === 'monitorenter') monitorStorePcs.add(Number(storeItem.pc));
+      let previousIndex = itemIndex - 1;
+      let previousInstruction = null;
+      while (previousIndex >= 0 && !previousInstruction) {
+        previousInstruction = getInstructionFromItem(codeItems[previousIndex]);
+        previousIndex -= 1;
+      }
+      if (previousInstruction && previousInstruction.op === 'checkcast') {
+        castStoreTypes.set(Number(storeItem.pc), javaTypeFromInternalName(previousInstruction.arg));
+      }
+    }
+    if (process.env.CFR_JS_DEBUG_LOCALS === '1' && monitorStorePcs.size) {
+      console.error('[cfr-monitor-stores]', JSON.stringify([...monitorStorePcs]));
+    }
+  }
+  for (const item of (code && code.codeItems) || []) {
+    const instruction = normalizeInstruction(item && item.instruction !== undefined ? item.instruction : item);
+    if (!instruction) continue;
+    const access = parseLoadIndex(instruction.op, instruction.arg) || parseStoreIndex(instruction.op, instruction.arg);
+    if (!access) continue;
+    const kind = access.type === 'Object' ? 'ref'
+      : (['boolean', 'byte', 'char', 'short', 'int'].includes(access.type) ? 'int' : access.type);
+    if (!slotKinds.has(access.index)) slotKinds.set(access.index, new Set());
+    slotKinds.get(access.index).add(kind);
+    slotLastKind.set(access.index, kind);
+  }
   let slot = 0;
 
   localTable.forEach((local) => {
-    names.set(local.index, sanitizeJavaIdentifier(local.name, `var${local.index}`));
-    types.set(local.index, descriptorToJavaType(local.descriptor));
+    debugNames.set(local.index, sanitizeJavaIdentifier(local.name, `var${local.index}`));
+    debugTypes.set(local.index, descriptorToJavaType(local.descriptor));
   });
 
   if (!isStatic) {
@@ -2518,52 +4390,259 @@ function makeLocalState(paramTypes, isStatic, code = null) {
 
   paramTypes.forEach((type, index) => {
     const defaultName = index === 0 && isStatic && type === 'String[]' ? 'args' : `param${index}`;
-    const name = names.get(slot) || defaultName;
+    const name = debugNames.get(slot) || names.get(slot) || defaultName;
     names.set(slot, name);
     types.set(slot, types.get(slot) || type);
     declared.add(slot);
     paramNames.push(name);
     slot += type === 'long' || type === 'double' ? 2 : 1;
   });
+  const initiallyDeclared = new Set(declared);
+  const liftedDeclared = new Set();
+  const currentReferenceKeys = new Map();
+  const referenceDefinitions = new Map();
+  let syntheticCounter = 0;
+  let constructorInvocation = null;
 
-  function ensure(index, fallbackType = 'Object') {
-    if (!names.has(index)) names.set(index, `var${index}`);
-    if (!types.has(index)) types.set(index, fallbackType);
+  function localKey(index, fallbackType = 'Object', forceReferenceVariant = false) {
+    if (initiallyDeclared.has(index)) return index;
+    const type = simplifyType(fallbackType);
+    const intCategory = new Set(['boolean', 'byte', 'char', 'short', 'int']);
+    const primitiveKinds = new Set(['long', 'float', 'double']);
+    const kind = intCategory.has(type) ? 'int'
+      : (primitiveKinds.has(type) ? type
+        : ((type.endsWith('[]') || forceReferenceVariant) ? `ref:${type}` : 'ref'));
+    return `${index}:${kind}`;
+  }
+
+  function ensure(index, fallbackType = 'Object', forceReferenceVariant = false) {
+    const requestedType = simplifyType(fallbackType);
+    const key = requestedType === 'Object' && !forceReferenceVariant && currentReferenceKeys.has(index)
+      ? currentReferenceKeys.get(index)
+      : localKey(index, fallbackType, forceReferenceVariant);
+    if (!names.has(key)) {
+      const base = debugNames.get(index) || `var${index}`;
+      const hasDebugVariant = typeof key === 'string' && key.endsWith(':ref') && debugTypes.has(index);
+      const slotIndex = Number(String(key).split(':')[0]);
+      const hasCategoryConflict = (slotKinds.get(slotIndex) || new Set()).size > 1;
+      const keyKind = typeof key === 'string' ? key.slice(key.indexOf(':') + 1) : null;
+      const coarseKeyKind = keyKind && keyKind.startsWith('ref:') ? 'ref' : keyKind;
+      const suffix = typeof key === 'string' && hasCategoryConflict && coarseKeyKind !== slotLastKind.get(slotIndex) && !hasDebugVariant
+        ? `_${key.slice(key.indexOf(':') + 1).replace(/[^A-Za-z0-9_$]/g, '_')}`
+        : '';
+      let candidate = `${base}${suffix}`;
+      if ([...names.values()].includes(candidate)) {
+        const family = requestedType.endsWith('[]') ? 'array' : 'ref';
+        let ordinal = '';
+        let next = 2;
+        while ([...names.values()].includes(`${base}_${family}${ordinal}`)) {
+          ordinal = String(next);
+          next += 1;
+        }
+        candidate = `${base}_${family}${ordinal}`;
+      }
+      names.set(key, candidate);
+    }
+    if (!types.has(key)) {
+      const type = simplifyType(fallbackType);
+      const debugType = debugTypes.get(index);
+      const safeReferenceType = debugType && (debugType.endsWith('[]') || debugType === 'String') ? debugType : 'Object';
+      types.set(key, type === 'Object' ? safeReferenceType : type);
+    }
+    return key;
   }
 
   return {
     paramNames,
+    recordConstructorInvocation(target, args) {
+      if (!constructorInvocation) constructorInvocation = { target, args: args.slice() };
+    },
+    takeConstructorInvocation() {
+      return constructorInvocation;
+    },
     nameFor(index, fallbackType = 'Object') {
-      ensure(index, fallbackType);
-      return names.get(index);
+      const key = ensure(index, fallbackType);
+      return names.get(key);
     },
     typeFor(index, fallbackType = 'Object') {
-      ensure(index, fallbackType);
-      return types.get(index);
+      const key = ensure(index, fallbackType);
+      return types.get(key);
+    },
+    resetReferenceFlow() {
+      currentReferenceKeys.clear();
+    },
+    captureBinding(index, fallbackType = 'Object') {
+      const key = localKey(index, fallbackType);
+      const existed = names.has(key);
+      if (!existed) ensure(index, fallbackType);
+      return {
+        key,
+        existed,
+        name: names.get(key),
+        type: types.get(key),
+        declared: declared.has(key),
+        scopedDeclared: scopedDeclared.has(key),
+        liftedDeclared: liftedDeclared.has(key),
+      };
+    },
+    restoreBinding(binding) {
+      if (!binding) return;
+      if (!binding.existed) {
+        names.delete(binding.key);
+        types.delete(binding.key);
+        declared.delete(binding.key);
+        scopedDeclared.delete(binding.key);
+        liftedDeclared.delete(binding.key);
+        return;
+      }
+      names.set(binding.key, binding.name);
+      types.set(binding.key, binding.type);
+      if (binding.declared) declared.add(binding.key); else declared.delete(binding.key);
+      if (binding.scopedDeclared) scopedDeclared.add(binding.key); else scopedDeclared.delete(binding.key);
+      if (binding.liftedDeclared) liftedDeclared.add(binding.key); else liftedDeclared.delete(binding.key);
+    },
+    refinedTypeForName(name) {
+      const matches = [...names.entries()].filter(([, localName]) => localName === name);
+      if (matches.length !== 1) return null;
+      return simplifyType(types.get(matches[0][0]));
+    },
+    sourceTypeForName(name) {
+      if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(String(name || ''))) return null;
+      const matches = [...names.entries()].filter(([, localName]) => localName === name);
+      if (matches.length !== 1) return null;
+      return simplifyType(types.get(matches[0][0]));
+    },
+    refineExpressionType(value, type) {
+      if (!value || !value.code) return;
+      for (const [key, name] of names) {
+        if (name !== value.code) continue;
+        if (types.get(key) === 'Object') types.set(key, simplifyType(type));
+      }
     },
     setLocal(index, name, type = 'Object', markDeclared = false) {
-      names.set(index, sanitizeJavaIdentifier(name, `var${index}`));
-      types.set(index, simplifyType(type));
-      if (markDeclared) declared.add(index);
+      const key = ensure(index, type);
+      names.set(key, sanitizeJavaIdentifier(name, names.get(key)));
+      types.set(key, simplifyType(type));
+      if (markDeclared) {
+        declared.add(key);
+        scopedDeclared.add(key);
+      }
     },
     markDeclared(index) {
-      declared.add(index);
+      declared.add(ensure(index));
     },
-    load(index, fallbackType = 'Object') {
-      ensure(index, fallbackType);
-      return expr(names.get(index), types.get(index));
+    liftAllDeclarations() {
+      const lines = [];
+      const keys = [...names.keys()].sort((a, b) => Number(String(a).split(':')[0]) - Number(String(b).split(':')[0]));
+      for (const key of keys) {
+        if (initiallyDeclared.has(key) || scopedDeclared.has(key) || liftedDeclared.has(key)) continue;
+        declared.add(key);
+        liftedDeclared.add(key);
+        const type = simplifyType(types.get(key));
+        lines.push(`${type} ${names.get(key)} = ${defaultValueForType(type)};`);
+      }
+      return lines;
     },
-    store(index, fallbackType, value) {
-      ensure(index, fallbackType);
-      const name = names.get(index);
+    missingDeclarations(lines) {
+      const text = (lines || []).join('\n');
+      const missing = [];
+      if (process.env.CFR_JS_DEBUG_LOCALS === '1') {
+        console.error('[cfr-locals]', JSON.stringify([...names].map(([key, name]) => ({
+          key, name, type: types.get(key), declared: declared.has(key), initial: initiallyDeclared.has(key),
+        }))));
+      }
+      for (const [key, name] of names) {
+        if (initiallyDeclared.has(key) || !new RegExp(`\\b${name}\\b`).test(text)) continue;
+        const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const catchPattern = new RegExp(`catch\\s*\\([^)]*\\b${escaped}\\s*\\)`);
+        const catchMatch = catchPattern.exec(text);
+        if (catchMatch && !new RegExp(`\\b${escaped}\\b`).test(text.slice(0, catchMatch.index))) continue;
+        const hasDeclaration = (lines || []).some((line) =>
+          localDeclarationsFromStatement(line).some((item) => item.name === name));
+        if (!hasDeclaration) {
+          const type = simplifyType(types.get(key));
+          missing.push(`${type} ${name} = ${defaultValueForType(type)};`);
+        }
+      }
+      return missing;
+    },
+    load(index, fallbackType = 'Object', pc = null) {
+      let key = null;
+      if (fallbackType === 'Object' && Number.isFinite(Number(pc))) {
+        const prior = (referenceDefinitions.get(index) || [])
+          .filter((item) => item.pc < Number(pc))
+          .sort((a, b) => b.pc - a.pc)[0];
+        if (prior) key = prior.key;
+      }
+      if (!key) key = ensure(index, fallbackType);
+      const name = names.get(key);
+      return expr(name, types.get(key), 100, name === 'this' ? { localThis: true } : {});
+    },
+    store(index, fallbackType, value, pc = null) {
       const inferred = inferStoreType(fallbackType, value);
-      if (!types.has(index)) types.set(index, inferred);
-      const rendered = coerceExpressionForType(renderStoreExpression(value), types.get(index));
-      if (!declared.has(index)) {
-        declared.add(index);
-        return `${simplifyType(types.get(index))} ${name} = ${rendered.code};`;
+      const catchType = Number.isFinite(Number(pc)) ? catchStoreTypes.get(Number(pc)) : null;
+      const castType = Number.isFinite(Number(pc)) ? castStoreTypes.get(Number(pc)) : null;
+      const monitorStore = (Number.isFinite(Number(pc)) && monitorStorePcs.has(Number(pc)))
+        || (value && value.localThis === true);
+      if (process.env.CFR_JS_DEBUG_LOCALS === '1' && index === 2) {
+        console.error('[cfr-store-slot2]', JSON.stringify({ pc, fallbackType, inferred,
+          code: value && value.code, type: value && value.type, localThis: value && value.localThis,
+          monitorStore, catchType }));
+      }
+      let flowInferred = inferred;
+      if (flowInferred === 'Object' && value && value.code === 'null') {
+        const priorArray = (referenceDefinitions.get(index) || [])
+          .filter((definition) => !Number.isFinite(Number(pc)) || definition.pc < Number(pc))
+          .sort((left, right) => right.pc - left.pc)
+          .map((definition) => simplifyType(types.get(definition.key)))
+          .find((type) => type && type.endsWith('[]'));
+        if (priorArray) flowInferred = priorArray;
+      }
+      const effectiveType = monitorStore ? 'Object' : (catchType || castType || flowInferred);
+      const typedArrayElement = Boolean(value && value.arrayElement && effectiveType !== 'Object');
+      const key = ensure(index, effectiveType,
+        Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement);
+      if (!['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double'].includes(simplifyType(inferred))) {
+        currentReferenceKeys.set(index, key);
+        if (Number.isFinite(Number(pc))) {
+          if (!referenceDefinitions.has(index)) referenceDefinitions.set(index, []);
+          const definitions = referenceDefinitions.get(index);
+          const existing = definitions.find((item) => item.pc === Number(pc));
+          if (existing) existing.key = key;
+          else definitions.push({ pc: Number(pc), key });
+        }
+      }
+      const name = names.get(key);
+      if (!types.has(key) || (types.get(key) === 'Object' && effectiveType !== 'Object')) types.set(key, effectiveType);
+      const rendered = coerceExpressionForType(renderStoreExpression(value), types.get(key));
+      if (!declared.has(key)) {
+        declared.add(key);
+        return `${simplifyType(types.get(key))} ${name} = ${rendered.code};`;
       }
       return `${name} = ${rendered.code};`;
+    },
+    bindCatch(index, catchType, pc = null, preferredName = null) {
+      const key = ensure(index, catchType, true);
+      if (preferredName && ![...names.entries()].some(([otherKey, name]) =>
+        otherKey !== key && Number(String(otherKey).split(':')[0]) !== Number(index) && name === preferredName)) {
+        names.set(key, sanitizeJavaIdentifier(preferredName, names.get(key)));
+      }
+      currentReferenceKeys.set(index, key);
+      if (Number.isFinite(Number(pc))) {
+        if (!referenceDefinitions.has(index)) referenceDefinitions.set(index, []);
+        const definitions = referenceDefinitions.get(index);
+        const existing = definitions.find((item) => item.pc === Number(pc));
+        if (existing) existing.key = key;
+        else definitions.push({ pc: Number(pc), key });
+      }
+      declared.add(key);
+      scopedDeclared.add(key);
+      return names.get(key);
+    },
+    nextSyntheticName(prefix = 'array') {
+      const name = `${prefix}$${syntheticCounter}`;
+      syntheticCounter += 1;
+      return name;
     },
   };
 }
@@ -2644,12 +4723,21 @@ function parseMultiANewArrayInstruction(instruction) {
 }
 
 function formatStaticField(ref, currentInternalClassName) {
-  if (ref.owner === currentInternalClassName) return ref.name;
+  const fieldName = sourceFieldName(ref.owner, ref.name);
+  if (ref.owner === currentInternalClassName) return fieldName;
   const owner = javaTypeFromInternalName(ref.owner);
-  return `${owner}.${ref.name}`;
+  return `${owner}.${fieldName}`;
+}
+
+function sourceFieldName(owner, name) {
+  if (String(owner || '').includes('/')) return name;
+  return `field_${name}`;
 }
 
 function constantExpression(value, op) {
+  if (Array.isArray(value) && value[0] === 'Class') {
+    return expr(`${javaTypeFromInternalName(value[1])}.class`, 'Class');
+  }
   if (value && typeof value === 'object') {
     if (value.type === 'Float') return expr(formatFloat(value.value), 'float');
     if (value.type === 'Double') return expr(formatDouble(value.value), 'double');
@@ -2657,13 +4745,24 @@ function constantExpression(value, op) {
     if (value.type === 'Class') return expr(`${javaTypeFromInternalName(value.value)}.class`, 'Class');
     if (value.type === 'String') return expr(formatStringLiteral(value.value), 'String');
   }
+  if (op === 'ldc2_w' && typeof value === 'string') {
+    const numeric = String(unquoteJavaStringLiteral(value));
+    if (/^[+-]?\d+$/.test(numeric)) return expr(`${numeric}L`, 'long');
+    if (/^[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(numeric)) return expr(formatDouble(numeric), 'double');
+  }
   if (typeof value === 'string') return expr(formatStringLiteral(unquoteJavaStringLiteral(value)), 'String');
   if (typeof value === 'bigint') return expr(`${String(value)}L`, 'long');
-  if (typeof value === 'number') return expr(String(value), op === 'ldc2_w' ? 'double' : 'int');
+  if (typeof value === 'number') return expr(String(value), op === 'ldc2_w' ? 'double' : 'int', 100,
+    op === 'ldc2_w' ? {} : { constantValue: value });
   return expr(String(value), 'Object');
 }
 
 function binaryExpr(left, symbol, right, type) {
+  if (['&', '|', '^'].includes(symbol) && left.type === 'boolean' && right.type === 'boolean') type = 'boolean';
+  if (['&', '|', '^'].includes(symbol) && (left.type === 'boolean') !== (right.type === 'boolean')) {
+    left = coerceExpressionForType(left, 'int');
+    right = coerceExpressionForType(right, 'int');
+  }
   const precedence = binaryPrecedence(symbol);
   return expr(`${wrap(left, precedence)} ${symbol} ${wrap(right, precedence, true)}`, type, precedence);
 }
@@ -2691,7 +4790,19 @@ function expr(code, type = 'Object', precedence = 100, extra = {}) {
   return { code, type: simplifyType(type), precedence, ...extra };
 }
 
+function conditionalExpr(condition, trueValue, falseValue, type = null) {
+  const resultType = simplifyType(type || mergeStackTypes(trueValue.type, falseValue.type));
+  return expr(`${wrap(condition, 20)} ? ${trueValue.code} : ${falseValue.code}`, resultType, 20, {
+    conditional: { condition, trueValue, falseValue },
+  });
+}
+
 function renderStoreExpression(value) {
+  if (value && value.compare) {
+    const left = wrap(value.compare.left, 60);
+    const right = wrap(value.compare.right, 60, true);
+    return expr(`(${left} < ${right} ? -1 : (${left} == ${right} ? 0 : 1))`, 'int', 20);
+  }
   if (!value || !value.arrayLiteral) return value;
   const literal = value.arrayLiteral;
   if (!literal || !Number.isFinite(literal.length)) return value;
@@ -2708,11 +4819,41 @@ function coerceExpressionForType(value, targetType) {
   if (!value) return value;
   const type = simplifyType(targetType);
   if (type === 'boolean') {
+    if (value.conditional) {
+      const { condition, trueValue, falseValue } = value.conditional;
+      return conditionalExpr(
+        condition,
+        coerceExpressionForType(trueValue, 'boolean'),
+        coerceExpressionForType(falseValue, 'boolean'),
+        'boolean',
+      );
+    }
     if (value.code === '0') return expr('false', 'boolean');
     if (value.code === '1') return expr('true', 'boolean');
+    if (value.type !== 'boolean') return expr(`${wrap(value, 60)} != 0`, 'boolean', 60);
   }
   if (type === 'char' && /^\d+$/.test(value.code)) {
     return expr(formatCharLiteral(Number(value.code)), 'char');
+  }
+  if (type === 'long' && value.type === 'int' && /^-?\d+$/.test(value.code)) {
+    return expr(`${value.code}L`, 'long');
+  }
+  if ((type === 'byte' || type === 'short' || type === 'char') && value.type === 'boolean') {
+    return expr(`(${type}) (${wrap(value, 20)} ? 1 : 0)`, type, 90);
+  }
+  if ((type === 'byte' || type === 'short' || type === 'char') && value.type !== type) {
+    return expr(`(${type}) ${wrap(value, 90)}`, type, 90);
+  }
+  if (type === 'int' && value.type === 'boolean') {
+    return expr(`${wrap(value, 20)} ? 1 : 0`, 'int', 20);
+  }
+  const primitive = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double', 'void']);
+  if (!primitive.has(type) && value.type !== type && value.code !== 'null') {
+    const sourceType = simplifyType(value.type);
+    const sourceIsKnownReference = !primitive.has(sourceType) && sourceType !== 'Object';
+    const sourceNeedsBridge = sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code);
+    const operand = sourceNeedsBridge ? `(Object) ${wrap(value, 90)}` : wrap(value, 90);
+    return expr(`(${type}) ${operand}`, type, 90);
   }
   return value;
 }
@@ -2760,15 +4901,31 @@ function descriptorToJavaType(descriptor) {
 
 function simplifyType(type) {
   if (!type) return 'Object';
-  return String(type)
-    .replace(/^java\.lang\./, '')
-    .replace(/^java\.io\./, '')
-    .replace(/^java\.util\./, '');
+  const raw = String(type);
+  const text = /^(?:java|javax)\./.test(raw) ? raw.replace(/\$/g, '.') : raw;
+  const arraySuffix = (text.match(/(?:\[\])+$/) || [''])[0];
+  const component = arraySuffix ? text.slice(0, -arraySuffix.length) : text;
+  if (/^java\.(?:lang|io|util)\.[^.]+$/.test(component)) {
+    return component.slice(component.lastIndexOf('.') + 1) + arraySuffix;
+  }
+  return text;
 }
 
 function javaTypeFromInternalName(name) {
   if (String(name || '').startsWith('[')) return descriptorToJavaType(name);
-  return simplifyType(String(name || 'Object').replace(/\//g, '.'));
+  const internal = String(name || 'Object');
+  const sourceName = /^(?:java|javax)\//.test(internal) ? internal.replace(/\$/g, '.') : internal;
+  return simplifyType(sourceName.replace(/\//g, '.'));
+}
+
+function defaultValueForType(type) {
+  const simplified = simplifyType(type);
+  if (simplified === 'boolean') return 'false';
+  if (simplified === 'long') return '0L';
+  if (simplified === 'float') return '0.0f';
+  if (simplified === 'double') return '0.0';
+  if (['byte', 'char', 'short', 'int'].includes(simplified)) return '0';
+  return 'null';
 }
 
 function formatNewArrayExpression(elementType, lengthCode) {
@@ -2852,4 +5009,5 @@ module.exports = {
   decompileAstRoot,
   decompileClassAst,
   decompilePath,
+  buildExceptionModel,
 };

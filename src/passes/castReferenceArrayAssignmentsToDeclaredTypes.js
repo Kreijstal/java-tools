@@ -243,7 +243,8 @@ function referenceDescriptorFromClassName(value) {
 }
 
 function arrayDescriptorFromClassName(value) {
-  return typeof value === 'string' && !value.startsWith('[') ? `[L${value};` : value;
+  if (typeof value !== 'string') return value;
+  return value.startsWith('[') ? `[${value}` : `[L${value};`;
 }
 
 function fieldDescriptor(ref) {

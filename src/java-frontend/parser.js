@@ -966,8 +966,9 @@ class ParserImpl {
     this.expect('for');
     const headerTokens = this.consumeBalancedEnclosed('(', ')');
     const colonIndex = findTopLevelToken(headerTokens, ':');
+    const semicolonIndex = findTopLevelToken(headerTokens, ';');
     const body = this.parseStatement();
-    if (colonIndex !== -1) {
+    if (colonIndex !== -1 && semicolonIndex === -1) {
       const parameterTokens = headerTokens.slice(0, colonIndex);
       const iterableTokens = headerTokens.slice(colonIndex + 1);
       return ast.createNode('EnhancedForStatement', {

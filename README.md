@@ -85,6 +85,18 @@ npm run cfr -- --outputdir /tmp/decompiled sources/VerySimple.class
 
 `npm run cfr` uses `src/decompiler/cfr.js`, so it does not require `CFR.jar` or a Java process. The CFR fixture tests under `test/fixtures/cfr` assemble bytecode with the repo-native Jasmin assembler and compare the JavaScript decompiler against ported CFR expected-output bodies.
 
+#### Provably goto-free structurer
+
+`src/decompiler/structurer.js` turns any **reducible** control-flow graph into a
+goto-free statement tree (loops + labeled `break`/`continue`), `src/passes/regionSplit.js`
+makes irreducible graphs reducible by controlled node splitting, and
+`src/decompiler/exceptionStructurer.js` adds a conservative try/catch layer that
+bails with a reason rather than ever emitting wrong Java. Together they clear the
+control-flow shapes on which CFR and Vineflower give up. See
+[docs/decompiler.md](docs/decompiler.md) for the design, the algorithms, and the
+rationale for owning the structurer instead of chasing third-party decompiler
+heuristics.
+
 #### Execute Java Bytecode
 
 ```bash

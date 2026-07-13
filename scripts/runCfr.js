@@ -13,12 +13,15 @@ function usage(exitCode) {
   stream.write(`  --version                 Print the JavaScript decompiler version\n`);
   stream.write(`  --outputdir <dir>         Write .java files to a directory instead of stdout\n`);
   stream.write(`  --silent                  Accepted for CFR CLI compatibility\n`);
+  stream.write(`  --classpath <path>        Classpath used for hierarchy/type resolution\n`);
+  stream.write(`  --diagnostics-json <file> Write machine-readable fallback diagnostics\n`);
+  stream.write(`  --fail-on-fallback        Exit non-zero on raw flow or expression placeholders\n`);
   stream.write(`  --help, -h                Show this help text\n`);
   process.exit(exitCode);
 }
 
 function parseArgs(argv) {
-  const options = { outputDir: null, omitHeader: false };
+  const options = { outputDir: null, omitHeader: false, classpath: '', diagnosticsJson: '', failOnFallback: false };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -34,6 +37,14 @@ function parseArgs(argv) {
       options.outputDir = arg.slice('--outputdir='.length);
     } else if (arg === '--silent') {
       options.silent = true;
+    } else if (arg === '--classpath') {
+      if (i + 1 >= argv.length) throw new Error(`${arg} requires a path`);
+      options.classpath = argv[++i];
+    } else if (arg === '--diagnostics-json') {
+      if (i + 1 >= argv.length) throw new Error(`${arg} requires a file`);
+      options.diagnosticsJson = argv[++i];
+    } else if (arg === '--fail-on-fallback') {
+      options.failOnFallback = true;
     } else if (arg === '--removeboilerplate') {
       // Compatibility with a common CFR option. The JS implementation omits
       // bytecode boilerplate by default, so this option is intentionally a no-op.
@@ -53,6 +64,27 @@ function parseArgs(argv) {
   return { options, inputPath: positional[0] };
 }
 
+function collectDiagnostics(outputs) {
+  const files = [];
+  const totals = { stackUnderflow: 0, rawControlFlow: 0, placeholders: 0 };
+  for (const { name, source } of outputs) {
+    const counts = {
+      stackUnderflow: (source.match(/stack-underflow/g) || []).length,
+      rawControlFlow: (source.match(/^\s*\/\/\s*(?:if|goto|tableswitch|lookupswitch)\b/gm) || []).length,
+      placeholders: (source.match(/\/\* unsupported condition|\bstmt_\d+\(\);/g) || []).length,
+    };
+    for (const key of Object.keys(totals)) totals[key] += counts[key];
+    if (Object.values(counts).some((count) => count > 0)) files.push({ name, ...counts });
+  }
+  return {
+    version: VERSION,
+    generatedFiles: outputs.length,
+    hardFailures: Object.values(totals).reduce((sum, count) => sum + count, 0),
+    totals,
+    files,
+  };
+}
+
 function writeOutputs(outputs, outputDir) {
   fs.mkdirSync(outputDir, { recursive: true });
   outputs.forEach(({ name, source }) => {
@@ -68,11 +100,17 @@ async function main() {
     throw new Error(`Input not found: ${inputPath}`);
   }
   const outputs = await decompilePath(inputPath, options);
+  const diagnostics = collectDiagnostics(outputs);
+  if (options.diagnosticsJson) {
+    fs.mkdirSync(path.dirname(path.resolve(options.diagnosticsJson)), { recursive: true });
+    fs.writeFileSync(options.diagnosticsJson, `${JSON.stringify(diagnostics, null, 2)}\n`, 'utf8');
+  }
   if (options.outputDir) {
     writeOutputs(outputs, options.outputDir);
     if (!options.silent) {
       console.log(`Wrote ${outputs.length} Java source file(s) to ${options.outputDir}`);
     }
+    if (options.failOnFallback && diagnostics.hardFailures > 0) process.exitCode = 1;
     return;
   }
 
@@ -81,6 +119,7 @@ async function main() {
     process.stdout.write(source);
     if (!source.endsWith('\n')) process.stdout.write('\n');
   });
+  if (options.failOnFallback && diagnostics.hardFailures > 0) process.exitCode = 1;
 }
 
 main().catch((err) => {
