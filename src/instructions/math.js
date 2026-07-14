@@ -2,20 +2,24 @@
 const toLong = (v) => BigInt.asIntN(64, v);
 
 module.exports = {
+  // Java int arithmetic is signed 32-bit and wraps on overflow. JS `+ - *`
+  // produce full-precision doubles (and overflow to >2^53 / Infinity), so
+  // every result must be truncated back to int32. `| 0` wraps add/sub/neg;
+  // multiply needs Math.imul (a*b can exceed 2^53 and lose bits before |0).
   iadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 + value2);
+    frame.stack.push((value1 + value2) | 0);
   },
   isub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 - value2);
+    frame.stack.push((value1 - value2) | 0);
   },
   imul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 * value2);
+    frame.stack.push(Math.imul(value1, value2));
   },
   idiv: (frame) => {
     const value2 = frame.stack.pop();
@@ -23,17 +27,22 @@ module.exports = {
     if (value2 === 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
-    frame.stack.push(Math.floor(value1 / value2));
+    // Java integer division truncates toward zero (not floor); `| 0` both
+    // truncates and wraps MIN_INT / -1 back to MIN_INT.
+    frame.stack.push((value1 / value2) | 0);
   },
   irem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 % value2);
+    if (value2 === 0) {
+      throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+    }
+    frame.stack.push((value1 % value2) | 0);
   },
   iinc: (frame, instruction) => {
     const index = parseInt(instruction.varnum, 10);
     const amount = parseInt(instruction.incr, 10);
-    frame.locals[index] += amount;
+    frame.locals[index] = (frame.locals[index] + amount) | 0;
   },
   ishl: (frame) => {
     const value2 = frame.stack.pop();
@@ -67,7 +76,7 @@ module.exports = {
   },
   ineg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(-value);
+    frame.stack.push((-value) | 0);
   },
   ladd: (frame) => {
     const value2 = frame.stack.pop();

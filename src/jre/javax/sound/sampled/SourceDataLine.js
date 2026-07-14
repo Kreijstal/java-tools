@@ -34,11 +34,14 @@ module.exports = {
         obj.audioOutput = createAudioOutput(toOutputOptions(formatFields));
         obj.isOpen = true;
       } catch (error) {
-        console.error("Failed to open audio device:", error.message);
-        throw {
-          type: "javax/sound/sampled/LineUnavailableException",
-          message: "Failed to open audio device: " + error.message,
-        };
+        // Headless / no audio device: discard samples instead of leaving the
+        // line closed — games treat a dead line as fatal mid-loop.
+        if (!module.exports._warnedNoAudio) {
+          module.exports._warnedNoAudio = true;
+          console.error("No audio device, discarding sound output:", error.message);
+        }
+        obj.audioOutput = { write() {}, once(event, cb) { if (cb) cb(); } };
+        obj.isOpen = true;
       }
     }, ["javax/sound/sampled/LineUnavailableException"]),
     "open(Ljavax/sound/sampled/AudioFormat;I)V": (jvm, obj, args) => {

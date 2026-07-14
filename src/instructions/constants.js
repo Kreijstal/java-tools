@@ -79,11 +79,22 @@ module.exports = {
   },
   ldc2_w: (frame, instruction) => {
     const value = instruction.arg;
-    if (typeof value === "string" && value.endsWith("L")) {
+    // Long constants arrive as a BigInt (or {value:BigInt|string, type:"Long"}).
+    // They MUST stay BigInt — routing them through Number/parseFloat silently
+    // rounds any value above 2^53 (breaks 64-bit hashing like Whirlpool).
+    if (typeof value === "bigint") {
+      frame.stack.push(value);
+    } else if (typeof value === "string" && value.endsWith("L")) {
       frame.stack.push(BigInt(value.slice(0, -1)));
     } else if (typeof value === "object" && value !== null) {
-      // Handle typed constants from convert_tree.js (e.g., {value: 3.14, type: "Double"})
-      frame.stack.push(value.value);
+      if (value.type === "Long") {
+        frame.stack.push(typeof value.value === "bigint" ? value.value : BigInt(value.value));
+      } else {
+        // Typed floating constants from convert_tree.js, e.g. {value:3.14, type:"Double"}
+        frame.stack.push(value.value);
+      }
+    } else if (typeof value === "string" && /^-?\d+$/.test(value)) {
+      frame.stack.push(BigInt(value));
     } else {
       frame.stack.push(parseFloat(value));
     }
