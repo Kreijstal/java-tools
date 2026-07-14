@@ -3110,24 +3110,32 @@ function lowerLocalClassDeclaration(statement, context) {
 }
 
 function lowerAnonymousClassToJavaIrValue(expression, targetDescriptor, context) {
-  if (!expression || expression.kind !== 'UnsupportedExpression' || !Array.isArray(expression.tokens)) return null;
-  const tokens = expression.tokens;
-  if (tokens.length < 5 || tokenText(tokens[0]) !== 'new' || tokens[1].kind !== 'identifier') return null;
-  const openParen = 2;
-  const closeParen = matchingTokenIndex(tokens, openParen, '(', ')');
-  if (closeParen < 0 || tokenText(tokens[closeParen + 1]) !== '{') return null;
-  const closeBrace = matchingTokenIndex(tokens, closeParen + 1, '{', '}');
-  if (closeBrace !== tokens.length - 1) return null;
   const owner = context.allocateLambdaClassName ? context.allocateLambdaClassName() : `${context.classInternalName}$Anon0`;
-  const iface = targetDescriptor && targetDescriptor.startsWith('L') ? targetDescriptor.slice(1, -1) : constructorOwnerFromName(tokens[1].text, context);
-  const bodyText = expression.text.slice(expression.text.indexOf('{'), expression.text.lastIndexOf('}') + 1);
-  let parsed;
-  try {
-    parsed = parseJava(`class ${owner.split('$').pop()} implements ${tokens[1].text} ${bodyText}`, { sourceFileName: 'AnonymousClass.java' });
-  } catch (_) {
-    return null;
+  let iface;
+  let declaration;
+  if (expression && expression.kind === 'NewClassExpression' && Array.isArray(expression.body)) {
+    try { iface = classTypeInternalName(expression.classType, context); } catch (_) { return null; }
+    declaration = { name: owner.split('$').pop(), body: expression.body };
+  } else {
+    if (!expression || expression.kind !== 'UnsupportedExpression' || !Array.isArray(expression.tokens)) return null;
+    const tokens = expression.tokens;
+    if (tokens.length < 5 || tokenText(tokens[0]) !== 'new' || tokens[1].kind !== 'identifier') return null;
+    const openParen = 2;
+    const closeParen = matchingTokenIndex(tokens, openParen, '(', ')');
+    if (closeParen < 0 || tokenText(tokens[closeParen + 1]) !== '{') return null;
+    const closeBrace = matchingTokenIndex(tokens, closeParen + 1, '{', '}');
+    if (closeBrace !== tokens.length - 1) return null;
+    iface = constructorOwnerFromName(tokens[1].text, context);
+    const bodyText = expression.text.slice(expression.text.indexOf('{'), expression.text.lastIndexOf('}') + 1);
+    let parsed;
+    try {
+      parsed = parseJava(`class ${owner.split('$').pop()} implements ${tokens[1].text} ${bodyText}`, { sourceFileName: 'AnonymousClass.java' });
+    } catch (_) {
+      return null;
+    }
+    declaration = parsed.root.typeDeclarations && parsed.root.typeDeclarations[0];
   }
-  const declaration = parsed.root.typeDeclarations && parsed.root.typeDeclarations[0];
+  if (targetDescriptor && targetDescriptor.startsWith('L')) iface = targetDescriptor.slice(1, -1);
   if (!declaration) return null;
   const captures = captureValuesForLocalClass(context).filter((capture) => capture.name === 'this');
   if (context.constructorCaptureArgsByOwner) {
@@ -4120,12 +4128,18 @@ function lowerExpressionToJavaIrValue(expression, context) {
     return elements.every(Boolean) ? { kind: 'ArrayInitializerValue', type: null, elements } : null;
   }
   if (expression && expression.kind === 'NewClassExpression') {
+    if (Array.isArray(expression.body)) {
+      const anonymous = lowerAnonymousClassToJavaIrValue(expression, null, context);
+      if (anonymous) return anonymous;
+    }
     let owner = null;
     try { owner = classTypeInternalName(expression.classType, context); } catch (_) {}
     const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
-    if (!owner || !args.every(Boolean)) return null;
-    const method = methodDescriptorForConstructorCall(owner, args, context);
-    const coercedArgs = prepareMethodArguments(method, args) || args;
+    const captureArgs = owner ? constructorCaptureArgs(owner, context) : [];
+    if (!owner || !args.every(Boolean) || !captureArgs.every(Boolean)) return null;
+    const constructorArgs = captureArgs.concat(args);
+    const method = methodDescriptorForConstructorCall(owner, constructorArgs, context);
+    const coercedArgs = prepareMethodArguments(method, constructorArgs) || constructorArgs;
     return {
       kind: 'NewObjectValue',
       type: `L${owner};`,
