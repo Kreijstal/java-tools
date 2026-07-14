@@ -24,17 +24,84 @@ L7: return
 .end class
 `;
 
+const REUSED_REFERENCE_SLOT = `.version 52 0
+.class public super ReusedReferenceSlot
+.super java/lang/Object
+
+.field public static THREAD Ljava/lang/Thread;
+
+.method public static use : ()I
+    .code stack 1 locals 1
+L0: getstatic Field ReusedReferenceSlot THREAD Ljava/lang/Thread;
+L3: astore_0
+L4: aload_0
+L5: invokevirtual Method java/lang/Thread start ()V
+L8: ldc "value"
+L10: astore_0
+L11: aload_0
+L12: invokevirtual Method java/lang/String length ()I
+L15: ireturn
+    .end code
+.end method
+.end class
+`;
+
+const BROAD_RETHROW = `.version 52 0
+.class public super BroadRethrow
+.super java/lang/Object
+
+.method public static rethrow : (Ljava/lang/Throwable;)V
+    .code stack 1 locals 1
+L0: aload_0
+L1: athrow
+    .end code
+.end method
+.end class
+`;
+
+function decompileFixture(tempDir, name, source) {
+  const classFile = path.join(tempDir, `${name}.class`);
+  assembleJasminSource(source, classFile);
+  return decompileClassFile(classFile);
+}
+
 test('iinc snapshots operand-stack values loaded before the increment', (t) => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-stack-order-'));
   try {
-    const classFile = path.join(tempDir, 'PostIncrementArrayStore.class');
-    assembleJasminSource(POST_INCREMENT_ARRAY_STORE, classFile);
-    const source = decompileClassFile(classFile);
+    const source = decompileFixture(tempDir, 'PostIncrementArrayStore', POST_INCREMENT_ARRAY_STORE);
 
     t.match(source, /int incrementValue\$\d+ = param1;\s*param1\+\+;\s*param0\[incrementValue\$\d+\] = param2;/,
       'array index uses the value captured before iinc');
     t.notOk(/param1\+\+;\s*param0\[param1\]/.test(source),
       'array store does not reread the incremented local');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('reference locals reused with incompatible descriptor types stay separate', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-reference-slot-'));
+  try {
+    const source = decompileFixture(tempDir, 'ReusedReferenceSlot', REUSED_REFERENCE_SLOT);
+    t.match(source, /Thread \w+ = field_THREAD;[\s\S]*?\.start\(\);/, 'Thread value retains its descriptor type');
+    t.match(source, /String \w+ = "value";[\s\S]*?\.length\(\)/, 'String value uses a separate local binding');
+    t.notOk(/\(String\) \(Object\).*THREAD/.test(source), 'descriptor-proven Thread is not cast to String');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('broad athrow preserves the original Throwable without a runtime downcast', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-broad-rethrow-'));
+  try {
+    const source = decompileFixture(tempDir, 'BroadRethrow', BROAD_RETHROW);
+    t.match(source, /throw BroadRethrow\.<RuntimeException>\$cfr\$sneakyThrow\(param0\);/,
+      'athrow uses type-erasure rethrow');
+    t.match(source, /private static <T extends Throwable> RuntimeException \$cfr\$sneakyThrow/,
+      'class contains the generic rethrow helper');
+    t.notOk(/throw \(RuntimeException\)/.test(source), 'no unconditional RuntimeException cast is emitted');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

@@ -231,9 +231,18 @@ function decompileClassAst(cls, options = {}) {
 
   methods.forEach((item, index) => {
     const methodText = formatMethod(cls, item.method, renderOptions);
+    if (methodText.includes('$cfr$sneakyThrow(')) renderOptions.requiresSneakyThrow = true;
     methodText.split('\n').forEach((line) => out.push(`    ${line}`.replace(/\s+$/g, '')));
     if (index < methods.length - 1) out.push('');
   });
+
+  if (renderOptions.requiresSneakyThrow) {
+    if (methods.length) out.push('');
+    out.push('    @SuppressWarnings("unchecked")');
+    out.push('    private static <T extends Throwable> RuntimeException $cfr$sneakyThrow(Throwable throwable) throws T {');
+    out.push('        throw (T) throwable;');
+    out.push('    }');
+  }
 
   out.push('}');
   for (const requiredImport of requiredImports) imports.push(`import ${requiredImport};`);
@@ -2603,17 +2612,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const declaredThrows = methodThrowsTypes(method);
       const broadThrown = ['Object', 'Throwable', 'Exception', 'java.lang.Throwable', 'java.lang.Exception']
         .includes(simplifyType(thrown.type));
-      if (broadThrown && declaredThrows.length === 1
-        && !['Throwable', 'java.lang.Throwable', 'Exception', 'java.lang.Exception'].includes(declaredThrows[0])) {
-        lines.push(`if (${thrown.code} instanceof RuntimeException) throw (RuntimeException) ${thrown.code};`);
-        lines.push(`if (${thrown.code} instanceof Error) throw (Error) ${thrown.code};`);
-        lines.push(`throw ${coerceExpressionForType(thrown, declaredThrows[0]).code};`);
+      if (broadThrown) {
+        options.requiresSneakyThrow = true;
+        const owner = simpleClassName(cls.className || 'Class');
+        lines.push(`throw ${owner}.<RuntimeException>$cfr$sneakyThrow(${thrown.code});`);
         continue;
       }
-      const requiresUncheckedRethrow = declaredThrows.length === 0 && broadThrown;
-      const renderedThrown = thrown.code === 'caughtException'
-        ? coerceExpressionForType(thrown, 'RuntimeException')
-        : (requiresUncheckedRethrow ? coerceExpressionForType(thrown, 'RuntimeException') : thrown);
+      const renderedThrown = thrown;
       lines.push(`throw ${renderedThrown.code};`);
       continue;
     }
@@ -4931,8 +4936,10 @@ function makeLocalState(paramTypes, isStatic, code = null) {
       }
       const effectiveType = monitorStore ? 'Object' : (catchType || castType || flowInferred);
       const typedArrayElement = Boolean(value && value.arrayElement && effectiveType !== 'Object');
+      const primitiveTypes = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double']);
+      const concreteReference = effectiveType !== 'Object' && !primitiveTypes.has(simplifyType(effectiveType));
       const key = ensure(index, effectiveType,
-        Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement);
+        Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement || concreteReference);
       if (!['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double'].includes(simplifyType(inferred))) {
         currentReferenceKeys.set(index, key);
         if (Number.isFinite(Number(pc))) {
