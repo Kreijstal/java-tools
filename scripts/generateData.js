@@ -78,6 +78,13 @@ try {
     const zipPath = path.join(distDir, 'data.zip');
     execSync(`cd "${dataDir}" && zip -r "${zipPath}" *.class metadata.json`, { stdio: 'pipe' });
     console.log(`  ✓ Created data.zip (${fs.statSync(zipPath).size} bytes)`);
+
+    // Also place data.zip next to the raw debug interface template so that
+    // examples/debug-web-interface.html (served at /examples/...) can fetch
+    // its "./data.zip". This file is gitignored and regenerated on every build.
+    const examplesZipPath = path.join(process.cwd(), 'examples', 'data.zip');
+    fs.copyFileSync(zipPath, examplesZipPath);
+    console.log(`  ✓ Copied data.zip to examples/ for the raw debug interface`);
 } catch (error) {
     console.warn('⚠️  Warning: Could not create data.zip (zip command not available)');
 }
