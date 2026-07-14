@@ -2338,6 +2338,23 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const index = Number(indexRaw);
       const amount = Number(constantRaw);
       const variable = localState.load(index, 'int', codeItem.pc).code;
+      const escapedVariable = variable.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pendingLocal = new RegExp(`(^|[^.$A-Za-z0-9_])${escapedVariable}([^A-Za-z0-9_$]|$)`);
+      const snapshots = new Map();
+      for (let stackIndex = 0; stackIndex < stack.length; stackIndex += 1) {
+        const pending = stack[stackIndex];
+        if (!pending || (pending.localIndex !== index && !pendingLocal.test(pending.code))) continue;
+        const key = `${pending.type}\0${pending.code}`;
+        let snapshot = snapshots.get(key);
+        if (!snapshot) {
+          const name = localState.nextSyntheticName('incrementValue');
+          const rendered = renderStoreExpression(pending);
+          lines.push(`${simplifyType(pending.type)} ${name} = ${rendered.code};`);
+          snapshot = expr(name, pending.type, 100);
+          snapshots.set(key, snapshot);
+        }
+        stack[stackIndex] = { ...snapshot };
+      }
       if (amount === 1) lines.push(`${variable}++;`);
       else if (amount === -1) lines.push(`${variable}--;`);
       else if (amount >= 0) lines.push(`${variable} += ${amount};`);
@@ -4887,7 +4904,10 @@ function makeLocalState(paramTypes, isStatic, code = null) {
       }
       if (!key) key = ensure(index, fallbackType);
       const name = names.get(key);
-      return expr(name, types.get(key), 100, name === 'this' ? { localThis: true } : {});
+      return expr(name, types.get(key), 100, {
+        localIndex: index,
+        ...(name === 'this' ? { localThis: true } : {}),
+      });
     },
     store(index, fallbackType, value, pc = null) {
       const inferred = inferStoreType(fallbackType, value);
