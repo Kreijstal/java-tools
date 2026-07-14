@@ -451,6 +451,16 @@ module.exports = {
       
       return null;
     },
+    'getConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': (jvm, classObj, args) => ({
+      type: 'java/lang/reflect/Constructor',
+      _declaringClass: classObj,
+      _parameterTypes: args[0] || [],
+    }),
+    'getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': (jvm, classObj, args) => ({
+      type: 'java/lang/reflect/Constructor',
+      _declaringClass: classObj,
+      _parameterTypes: args[0] || [],
+    }),
     'newInstance()Ljava/lang/Object;': (jvm, classObj, args) => {
       const classData = classObj._classData;
       const className = classData.ast.classes[0].className;
@@ -483,6 +493,10 @@ module.exports = {
 };
 
 const classJre = module.exports;
+
+classJre.methods['getField(Ljava/lang/String;)Ljava/lang/reflect/Field;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;'](jvm, classObj, args, thread)
+);
 
 classJre.methods['getMethod(Ljava/lang/String;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
   classJre.methods['getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], []], thread)

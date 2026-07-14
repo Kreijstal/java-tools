@@ -50,6 +50,16 @@ module.exports = {
       }
       return obj.items[index];
     }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'elementAt(I)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
+      const index = args[0];
+      if (index < 0 || index >= obj.size) {
+        throw {
+          type: 'java/lang/ArrayIndexOutOfBoundsException',
+          message: 'Index: ' + index + ', Size: ' + obj.size
+        };
+      }
+      return obj.items[index];
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
     'set(ILjava/lang/Object;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const index = args[0];
       const element = args[1];

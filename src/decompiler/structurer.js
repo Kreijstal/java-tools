@@ -326,6 +326,9 @@ function uniquifyLabels(tree) {
         walk(node.body, scope);
         for (const c of node.catches) walk(c.body, scope);
         break;
+      case 'synchronized':
+        walk(node.body, scope);
+        break;
       case 'break':
       case 'continue': {
         const frame = scope.find((f) => f.old === node.label);
@@ -338,6 +341,49 @@ function uniquifyLabels(tree) {
     }
   }
   walk(tree, []);
+  return tree;
+}
+
+// Every catch clause the exception structurer emits uses one fixed parameter
+// name (`decompiledCaughtParameter`). When one try/catch nests inside another
+// catch's body — `catch (IOException e) { try { … } catch (Exception e) { … } }`
+// — the inner parameter re-declares a name still in scope from the outer catch,
+// which javac rejects ("variable … is already defined"). The catch body never
+// references the parameter directly (its only use is the emitter-generated
+// `carrier = <param>;` copy, which reads the node's varName), so a fresh unique
+// name per clause is always safe. Rename every catch parameter sequentially.
+function uniquifyCatchParameters(tree) {
+  let counter = 0;
+  function walk(node) {
+    if (!node) return;
+    switch (node.t) {
+      case 'seq':
+        for (const c of node.body) walk(c);
+        break;
+      case 'block':
+      case 'loop':
+      case 'synchronized':
+        walk(node.body);
+        break;
+      case 'if':
+        walk(node.then); walk(node.els);
+        break;
+      case 'switch':
+        for (const c of node.cases) walk(c.body);
+        walk(node.dflt);
+        break;
+      case 'try':
+        walk(node.body);
+        for (const c of node.catches) {
+          if (c.varName) c.varName = `${c.varName}${counter++}`;
+          walk(c.body);
+        }
+        break;
+      default:
+        break;
+    }
+  }
+  walk(tree);
   return tree;
 }
 
@@ -378,6 +424,8 @@ function repairEmptyLoopExits(node, loopLabels) {
   } else if (node.t === 'try') {
     repairEmptyLoopExits(node.body, loopLabels);
     for (const item of node.catches || []) repairEmptyLoopExits(item.body, loopLabels);
+  } else if (node.t === 'synchronized') {
+    repairEmptyLoopExits(node.body, loopLabels);
   }
 }
 
@@ -426,11 +474,18 @@ function collectRefdLabels(codeItems) {
  * `blocks` (each block's item indices and head label) so a caller can render the
  * straight-line bodies. Returns null if there are no instructions.
  */
-function buildCfgFromCode(codeItems, forcedLeaderLabels = []) {
+function buildCfgFromCode(codeItems, forcedLeaderLabels = [], forcedLeaderPcs = []) {
   const referenced = collectRefdLabels(codeItems);
   for (const label of forcedLeaderLabels) {
     if (typeof label === 'string') referenced.add(cfgTrim(label));
   }
+  // Some block boundaries are not label/branch targets — notably an exception
+  // table's try `start_pc`, which the JVM protects but which no instruction jumps
+  // to, so it may sit mid-block. Callers that need a leader there (the exception
+  // structurer, so the try body lands on a block boundary) pass its pc here.
+  const forcedPcSet = new Set();
+  for (const pc of forcedLeaderPcs) if (pc != null && Number.isFinite(Number(pc))) forcedPcSet.add(Number(pc));
+
   const insnIdx = [];
   for (let i = 0; i < codeItems.length; i++) if (codeItems[i] && codeItems[i].instruction) insnIdx.push(i);
   const nI = insnIdx.length;
@@ -442,6 +497,10 @@ function buildCfgFromCode(codeItems, forcedLeaderLabels = []) {
   for (let k = 0; k < nI; k++) {
     const lbl = labelOf(insnIdx[k]);
     if (lbl && referenced.has(lbl)) isLeader[k] = true;
+    if (forcedPcSet.size) {
+      const pc = codeItems[insnIdx[k]].pc;
+      if (pc != null && forcedPcSet.has(Number(pc))) isLeader[k] = true;
+    }
     const op = cfgOp(codeItems[insnIdx[k]].instruction);
     const ender = op === 'goto' || op === 'goto_w' || op === 'jsr' || op === 'tableswitch'
       || op === 'lookupswitch' || CFG_CONDITIONAL.has(op) || CFG_TERMINAL.has(op);
@@ -540,6 +599,7 @@ module.exports = {
   structure,
   printTree,
   uniquifyLabels,
+  uniquifyCatchParameters,
   buildCfgFromCode,
   // exposed for reuse/testing
   reversePostorder,

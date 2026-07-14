@@ -361,10 +361,33 @@ module.exports = {
       const char = String.fromCharCode(ch);
       return stringValue(obj).indexOf(char);
     },
+    "equalsIgnoreCase(Ljava/lang/String;)Z": (jvm, obj, args) => (
+      stringValue(obj).toLowerCase() === stringValue(args[0]).toLowerCase() ? 1 : 0
+    ),
+    "indexOf(II)I": (jvm, obj, args) => {
+      const char = String.fromCharCode(args[0]);
+      return stringValue(obj).indexOf(char, args[1]);
+    },
+    "indexOf(Ljava/lang/String;)I": (jvm, obj, args) => {
+      return stringValue(obj).indexOf(stringValue(args[0]));
+    },
+    "indexOf(Ljava/lang/String;I)I": (jvm, obj, args) => {
+      return stringValue(obj).indexOf(stringValue(args[0]), args[1]);
+    },
     "lastIndexOf(I)I": (jvm, obj, args) => {
       const ch = args[0];
       const char = String.fromCharCode(ch);
       return stringValue(obj).lastIndexOf(char);
+    },
+    "lastIndexOf(II)I": (jvm, obj, args) => {
+      const char = String.fromCharCode(args[0]);
+      return stringValue(obj).lastIndexOf(char, args[1]);
+    },
+    "lastIndexOf(Ljava/lang/String;)I": (jvm, obj, args) => {
+      return stringValue(obj).lastIndexOf(stringValue(args[0]));
+    },
+    "lastIndexOf(Ljava/lang/String;I)I": (jvm, obj, args) => {
+      return stringValue(obj).lastIndexOf(stringValue(args[0]), args[1]);
     },
     "trim()Ljava/lang/String;": (jvm, obj, args) => {
       return jvm.internString(stringValue(obj).trim());

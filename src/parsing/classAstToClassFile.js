@@ -39,6 +39,13 @@ const BRANCH_16_OPS = new Set([
 
 const BRANCH_32_OPS = new Set(['goto_w', 'jsr_w']);
 
+const INVERTED_CONDITIONAL_BRANCH = {
+  ifeq: 'ifne', ifne: 'ifeq', iflt: 'ifge', ifge: 'iflt', ifgt: 'ifle', ifle: 'ifgt',
+  if_icmpeq: 'if_icmpne', if_icmpne: 'if_icmpeq', if_icmplt: 'if_icmpge', if_icmpge: 'if_icmplt',
+  if_icmpgt: 'if_icmple', if_icmple: 'if_icmpgt', if_acmpeq: 'if_acmpne', if_acmpne: 'if_acmpeq',
+  ifnull: 'ifnonnull', ifnonnull: 'ifnull',
+};
+
 const LOCAL_INDEX_OPS = new Set([
   'iload', 'lload', 'fload', 'dload', 'aload',
   'istore', 'lstore', 'fstore', 'dstore', 'astore', 'ret',
@@ -1799,26 +1806,67 @@ function prepareInstruction(instruction, builder, currentOffset, bootstrapMethod
   return { type: 'simple', op, opcode, length: 1, offset: currentOffset };
 }
 function encodeInstructions(codeItems, builder, bootstrapMethodCount) {
-  const labelOffsets = new Map();
-  const preparedInstructions = [];
-  let offset = 0;
+  const widened = new Map();
+  let labelOffsets;
+  let preparedInstructions;
+  for (;;) {
+    labelOffsets = new Map();
+    preparedInstructions = [];
+    let offset = 0;
+    let instructionIndex = 0;
+    ensureArray(codeItems).forEach((item) => {
+      const label = normalizeCodeItemLabel(item);
+      if (label) labelOffsets.set(label, offset);
+      const instruction = normalizeCodeItemInstruction(item);
+      if (instruction === null || instruction === undefined) return;
+      const prepared = prepareInstruction(instruction, builder, offset, bootstrapMethodCount);
+      const widening = widened.get(instructionIndex);
+      if (widening === 'wide-branch') {
+        prepared.type = 'widenedBranch';
+        prepared.length = 5;
+      } else if (widening === 'wide-conditional') {
+        prepared.type = 'widenedConditional';
+        prepared.length = 8;
+      }
+      prepared.instructionIndex = instructionIndex;
+      preparedInstructions.push(prepared);
+      offset += prepared.length;
+      instructionIndex += 1;
+    });
 
-  ensureArray(codeItems).forEach((item) => {
-    const label = normalizeCodeItemLabel(item);
-    if (label) {
-      labelOffsets.set(label, offset);
+    let changed = false;
+    for (const inst of preparedInstructions) {
+      if (inst.type !== 'branch16') continue;
+      const targetOffset = labelOffsets.get(inst.target);
+      if (targetOffset === undefined) throw new Error(`Unknown branch target: ${inst.target}`);
+      const branchOffset = targetOffset - inst.offset;
+      if (branchOffset >= -32768 && branchOffset <= 32767) continue;
+      widened.set(inst.instructionIndex, inst.op === 'goto' || inst.op === 'jsr' ? 'wide-branch' : 'wide-conditional');
+      changed = true;
     }
-    const instruction = normalizeCodeItemInstruction(item);
-    if (instruction === null || instruction === undefined) {
-      return;
-    }
-    const prepared = prepareInstruction(instruction, builder, offset, bootstrapMethodCount);
-    preparedInstructions.push(prepared);
-    offset += prepared.length;
-  });
+    if (!changed) break;
+  }
 
   const writer = new ByteWriter();
   preparedInstructions.forEach((inst) => {
+    if (inst.type === 'widenedBranch') {
+      const targetOffset = labelOffsets.get(inst.target);
+      if (targetOffset === undefined) throw new Error(`Unknown branch target: ${inst.target}`);
+      writer.writeUint8(MNEMONIC_TO_OPCODE[inst.op === 'jsr' ? 'jsr_w' : 'goto_w']);
+      writer.writeInt32(targetOffset - inst.offset);
+      return;
+    }
+    if (inst.type === 'widenedConditional') {
+      const targetOffset = labelOffsets.get(inst.target);
+      if (targetOffset === undefined) throw new Error(`Unknown branch target: ${inst.target}`);
+      const inverse = INVERTED_CONDITIONAL_BRANCH[inst.op];
+      if (!inverse) throw new Error(`Cannot widen conditional branch: ${inst.op}`);
+      writer.writeUint8(MNEMONIC_TO_OPCODE[inverse]);
+      writer.writeInt16(8);
+      writer.writeUint8(MNEMONIC_TO_OPCODE.goto_w);
+      writer.writeInt32(targetOffset - (inst.offset + 3));
+      return;
+    }
     writer.writeUint8(inst.opcode);
     switch (inst.type) {
       case 'simple':

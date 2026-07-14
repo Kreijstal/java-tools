@@ -105,6 +105,16 @@ module.exports = {
     'getFontMetrics()Ljava/awt/FontMetrics;': (jvm, obj, args) => {
       return { type: 'java/awt/FontMetrics', _awtGraphics: obj._awtGraphics || null };
     },
+
+    'getClipBounds()Ljava/awt/Rectangle;': (jvm, obj, args) => {
+      return obj._clipBounds || null;
+    },
+
+    'getClip()Ljava/awt/Shape;': (jvm, obj) => obj._clip || null,
+
+    'setClip(Ljava/awt/Shape;)V': (jvm, obj, args) => { obj._clip = args[0] || null; },
+
+    'clipRect(IIII)V': () => {},
     
     'dispose()V': (jvm, obj, args) => {
       const graphicsContext = obj._awtGraphics;

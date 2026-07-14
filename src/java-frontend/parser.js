@@ -228,6 +228,261 @@ function tokensCouldBeType(tokens) {
   return angleDepth === 0;
 }
 
+const BINARY_PRECEDENCE = new Map([
+  ['||', 2], ['&&', 3], ['|', 4], ['^', 5], ['&', 6],
+  ['==', 7], ['!=', 7], ['<', 8], ['>', 8], ['<=', 8], ['>=', 8], ['instanceof', 8],
+  ['<<', 9], ['>>', 9], ['>>>', 9], ['+', 10], ['-', 10], ['*', 11], ['/', 11], ['%', 11],
+]);
+const ASSIGNMENT_OPERATORS = new Set(['=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=', '<<=', '>>=', '>>>=']);
+
+function splitExpressionTopLevel(tokens, delimiter) {
+  const parts = [];
+  let start = 0;
+  let parens = 0, brackets = 0, braces = 0;
+  for (let index = 0; index < tokens.length; index += 1) {
+    const text = tokens[index].text;
+    if (text === '(') parens += 1; else if (text === ')') parens -= 1;
+    else if (text === '[') brackets += 1; else if (text === ']') brackets -= 1;
+    else if (text === '{') braces += 1; else if (text === '}') braces -= 1;
+    else if (text === delimiter && parens === 0 && brackets === 0 && braces === 0) { parts.push(tokens.slice(start, index)); start = index + 1; }
+  }
+  parts.push(tokens.slice(start));
+  return parts;
+}
+
+function looksLikeCastType(tokens) {
+  if (!tokens.length) return false;
+  const allowed = new Set(['.', '[', ']', '<', '>', ',', '?', 'extends', 'super']);
+  return tokens.every((token) => isNameToken(token) || PRIMITIVE_TYPES.has(token.text) || allowed.has(token.text));
+}
+
+function isSupportedTypeNode(type) {
+  if (!type || type.kind === 'UnsupportedType') return false;
+  if (type.kind === 'ArrayType') return isSupportedTypeNode(type.componentType);
+  if (type.kind === 'ParameterizedType') return isSupportedTypeNode(type.baseType)
+    && (type.typeArguments || []).every(isSupportedTypeNode);
+  return true;
+}
+
+class TokenExpressionParser {
+  constructor(owner, tokens) {
+    this.owner = owner;
+    this.tokens = tokens || [];
+    this.index = 0;
+  }
+
+  peek(offset = 0) { return this.tokens[this.index + offset] || null; }
+  take() { return this.tokens[this.index++] || null; }
+  match(text) { if (this.peek() && this.peek().text === text) { this.index += 1; return true; } return false; }
+
+  parse() {
+    if (this.tokens.length > 2
+        && this.tokens[this.tokens.length - 2].text === '.'
+        && this.tokens[this.tokens.length - 1].text === 'class') {
+      const literalType = this.owner.typeFromTokens(this.tokens.slice(0, -2));
+      if (isSupportedTypeNode(literalType)) return ast.createNode('ClassLiteralExpression', { literalType });
+    }
+    const expression = this.parseAssignment();
+    return expression && this.index === this.tokens.length ? expression : null;
+  }
+
+  parseAssignment() {
+    const left = this.parseConditional();
+    if (!left) return null;
+    const operator = this.peek() && this.peek().text;
+    if (!ASSIGNMENT_OPERATORS.has(operator)) return left;
+    this.take();
+    const right = this.parseAssignment();
+    return right ? ast.createNode('AssignmentExpression', { operator, left, right }) : null;
+  }
+
+  parseConditional() {
+    const condition = this.parseBinary(2);
+    if (!condition || !this.match('?')) return condition;
+    const consequent = this.parseAssignment();
+    if (!consequent || !this.match(':')) return null;
+    const alternate = this.parseConditional();
+    return alternate ? ast.createNode('ConditionalExpression', { condition, consequent, alternate }) : null;
+  }
+
+  parseBinary(minimum) {
+    let left = this.parsePrefix();
+    if (!left) return null;
+    while (this.peek()) {
+      const operator = this.peek().text;
+      const precedence = BINARY_PRECEDENCE.get(operator);
+      if (!precedence || precedence < minimum) break;
+      this.take();
+      if (operator === 'instanceof') {
+        const typeTokens = [];
+        while (this.peek() && !BINARY_PRECEDENCE.has(this.peek().text) && !['?', ':', ',', ')', ';'].includes(this.peek().text)) typeTokens.push(this.take());
+        if (!typeTokens.length) return null;
+        left = ast.createNode('InstanceofExpression', { expression: left, checkType: this.owner.typeFromTokens(typeTokens) });
+        continue;
+      }
+      const right = this.parseBinary(precedence + 1);
+      if (!right) return null;
+      left = ast.binaryExpression(operator, left, right);
+    }
+    return left;
+  }
+
+  parsePrefix() {
+    const token = this.peek();
+    if (!token) return null;
+    if (['+', '-', '!', '~', '++', '--'].includes(token.text)) {
+      const operator = this.take().text;
+      const operand = this.parsePrefix();
+      return operand ? ast.createNode('UnaryExpression', { operator, operand, prefix: true }) : null;
+    }
+    if (token.text === '(') {
+      const close = findMatchingInTokens(this.tokens, this.index, '(', ')');
+      if (close > this.index && close < this.tokens.length - 1 && looksLikeCastType(this.tokens.slice(this.index + 1, close))) {
+        const type = this.owner.typeFromTokens(this.tokens.slice(this.index + 1, close));
+        if (type.kind !== 'UnsupportedType') {
+          this.index = close + 1;
+          const expression = this.parsePrefix();
+          if (expression) return ast.createNode('CastExpression', { castType: type, expression });
+        }
+      }
+    }
+    return this.parsePostfix();
+  }
+
+  parsePostfix() {
+    let expression = this.parsePrimary();
+    if (!expression) return null;
+    while (this.peek()) {
+      if (this.match('[')) {
+        const indexExpression = this.parseAssignment();
+        if (!indexExpression || !this.match(']')) return null;
+        expression = ast.createNode('ArrayAccessExpression', { array: expression, index: indexExpression });
+        continue;
+      }
+      if (this.match('.')) {
+        const name = this.take();
+        if (!name || (!isNameToken(name) && name.text !== 'class')) return null;
+        if (name.text === 'class') {
+          expression = ast.createNode('ClassLiteralExpression', { literalType: this.typeFromExpression(expression) });
+        } else {
+          expression = ast.createNode('FieldAccessExpression', { target: expression, name: name.text });
+        }
+        continue;
+      }
+      if (this.match('(')) {
+        const args = [];
+        if (!this.match(')')) {
+          do { const arg = this.parseAssignment(); if (!arg) return null; args.push(arg); } while (this.match(','));
+          if (!this.match(')')) return null;
+        }
+        if (expression.kind === 'Identifier') expression = ast.methodInvocationExpression({ target: null, name: expression.name, arguments: args });
+        else if (expression.kind === 'SuperExpression') expression = ast.methodInvocationExpression({ target: expression, name: '<init>', arguments: args });
+        else if (expression.kind === 'ThisExpression') expression = ast.methodInvocationExpression({ target: expression, name: '<init>', arguments: args });
+        else if (expression.kind === 'FieldAccessExpression') expression = ast.methodInvocationExpression({ target: expression.target, name: expression.name, arguments: args });
+        else return null;
+        continue;
+      }
+      if (this.peek().text === '++' || this.peek().text === '--') {
+        expression = ast.createNode('UnaryExpression', { operator: this.take().text, operand: expression, prefix: false });
+        continue;
+      }
+      break;
+    }
+    return expression;
+  }
+
+  typeFromExpression(expression) {
+    const parts = [];
+    let cursor = expression;
+    while (cursor && cursor.kind === 'FieldAccessExpression') { parts.unshift(cursor.name); cursor = cursor.target; }
+    if (cursor && cursor.kind === 'Identifier') parts.unshift(cursor.name);
+    if (parts.length === 1 && PRIMITIVE_TYPES.has(parts[0])) return ast.primitiveType(parts[0]);
+    if (parts.length === 1) return ast.classType(parts[0]);
+    return parts.length ? ast.classType(parts[parts.length - 1], { packageName: parts.slice(0, -1).join('.') }) : ast.createNode('UnsupportedType', { text: '' });
+  }
+
+  parsePrimary() {
+    for (let dot = this.index + 1; dot + 1 < this.tokens.length; dot += 1) {
+      if (this.tokens[dot].text !== '.' || this.tokens[dot + 1].text !== 'class') continue;
+      const typeTokens = this.tokens.slice(this.index, dot);
+      const literalType = this.owner.typeFromTokens(typeTokens);
+      if (looksLikeCastType(typeTokens) && isSupportedTypeNode(literalType)) {
+        this.index = dot + 2;
+        return ast.createNode('ClassLiteralExpression', { literalType });
+      }
+    }
+    const token = this.take();
+    if (!token) return null;
+    if (token.text === '{') {
+      const elements = [];
+      if (!this.match('}')) {
+        do { const element = this.parseAssignment(); if (!element) return null; elements.push(element); } while (this.match(','));
+        this.match(',');
+        if (!this.match('}')) return null;
+      }
+      return ast.createNode('ArrayInitializerExpression', { elements });
+    }
+    if (token.text === 'new') return this.parseNewExpression();
+    if (token.text === '(') {
+      const expression = this.parseAssignment();
+      return expression && this.match(')') ? ast.createNode('ParenthesizedExpression', { expression }) : null;
+    }
+    if (token.kind === 'string') return ast.literalExpression(token.value, 'string', token.text);
+    if (token.kind === 'char') return ast.literalExpression(token.value, 'char', token.text);
+    if (token.kind === 'number') return ast.literalExpression(token.value, 'number', token.text);
+    if (token.text === 'true' || token.text === 'false') return ast.literalExpression(token.text === 'true', 'boolean', token.text);
+    if (token.text === 'null') return ast.literalExpression(null, 'null', token.text);
+    if (token.text === 'this') return ast.createNode('ThisExpression', {});
+    if (token.text === 'super') return ast.createNode('SuperExpression', {});
+    if (isNameToken(token)) return ast.identifier(token.text);
+    return null;
+  }
+
+  parseNewExpression() {
+    const typeTokens = [];
+    let genericDepth = 0;
+    while (this.peek()) {
+      const text = this.peek().text;
+      if (genericDepth === 0 && (text === '(' || text === '[')) break;
+      if (text === '<') genericDepth += 1;
+      if (text === '>') genericDepth -= 1;
+      typeTokens.push(this.take());
+    }
+    if (!typeTokens.length) return null;
+    const createdType = this.owner.typeFromTokens(typeTokens);
+    if (createdType.kind === 'UnsupportedType') return null;
+    if (this.match('(')) {
+      const args = [];
+      if (!this.match(')')) {
+        do { const arg = this.parseAssignment(); if (!arg) return null; args.push(arg); } while (this.match(','));
+        if (!this.match(')')) return null;
+      }
+      let body = null;
+      if (this.peek() && this.peek().text === '{') {
+        const start = this.index;
+        const close = findMatchingInTokens(this.tokens, start, '{', '}');
+        if (close < 0) return null;
+        const bodySource = this.owner.textOf(this.tokens.slice(start, close + 1));
+        const parsed = new ParserImpl(`class __Anonymous ${bodySource}`, this.owner.options).parseCompilationUnit();
+        body = parsed.typeDeclarations[0] ? parsed.typeDeclarations[0].body : [];
+        this.index = close + 1;
+      }
+      return ast.createNode('NewClassExpression', { classType: createdType, arguments: args, body });
+    }
+    const dimensions = [];
+    let emptyDimensions = 0;
+    while (this.match('[')) {
+      if (this.match(']')) { emptyDimensions += 1; continue; }
+      const dimension = this.parseAssignment();
+      if (!dimension || !this.match(']')) return null;
+      dimensions.push(dimension);
+    }
+    let initializer = null;
+    if (this.peek() && this.peek().text === '{') initializer = this.parsePrimary();
+    return ast.createNode('NewArrayExpression', { elementType: createdType, dimensions, emptyDimensions, initializer });
+  }
+}
+
 class ParserImpl {
   constructor(source, options = {}) {
     this.source = translateUnicodeEscapes(source);
@@ -420,12 +675,22 @@ class ParserImpl {
     let kind = 'MarkerAnnotation';
     if (this.peek() && this.peek().text === '(') {
       const tokens = this.consumeBalancedEnclosed('(', ')');
-      values = ast.createNode('UnsupportedExpression', {
-        text: this.textOf(tokens),
-        tokens: tokens.map(compactToken),
-        range: tokenRange(tokens),
+      const parts = splitTopLevel(tokens, ',').filter((part) => part.length > 0);
+      const pairs = parts.map((part) => {
+        const equals = findTopLevelToken(part, '=');
+        if (equals < 1) return null;
+        return ast.createNode('ElementValuePair', {
+          name: part[0].text,
+          value: this.unsupportedExpression(part.slice(equals + 1)),
+        });
       });
-      kind = 'NormalAnnotation';
+      if (parts.length && pairs.every(Boolean)) {
+        values = pairs;
+        kind = 'NormalAnnotation';
+      } else {
+        values = tokens.length ? this.unsupportedExpression(tokens) : null;
+        kind = 'SingleElementAnnotation';
+      }
     }
     return ast.createNode(kind, {
       name: this.qualifiedNameFromTokens(nameTokens),
@@ -977,7 +1242,7 @@ class ParserImpl {
         body,
       });
     }
-    const parts = splitTopLevel(headerTokens, ';');
+    const parts = splitExpressionTopLevel(headerTokens, ';');
     const initializer = parts[0] && parts[0].length
       ? this.tryParseLocalVariableStatement(parts[0]) || this.unsupportedExpression(parts[0])
       : null;
@@ -1439,6 +1704,31 @@ class ParserImpl {
     if (safeTokens.length === 0) {
       return null;
     }
+
+    const arrowIndex = findTopLevelToken(safeTokens, '->');
+    if (arrowIndex > 0) {
+      const parameterTokens = safeTokens.slice(0, arrowIndex);
+      const normalizedParameters = parameterTokens[0] && parameterTokens[0].text === '('
+        && findMatchingInTokens(parameterTokens, 0, '(', ')') === parameterTokens.length - 1
+        ? parameterTokens.slice(1, -1)
+        : parameterTokens;
+      const parameters = splitExpressionTopLevel(normalizedParameters, ',')
+        .filter((part) => part.length)
+        .map((part) => ast.identifier(part[part.length - 1].text));
+      const bodyTokens = safeTokens.slice(arrowIndex + 1);
+      let body;
+      if (bodyTokens[0] && bodyTokens[0].text === '{') {
+        const bodySource = this.textOf(bodyTokens);
+        const parsed = new ParserImpl(`class __Lambda { void __body() ${bodySource} }`, this.options).parseCompilationUnit();
+        body = parsed.typeDeclarations[0].body[0].body;
+      } else {
+        body = this.expressionFromTokens(bodyTokens) || this.unsupportedExpression(bodyTokens);
+      }
+      return ast.createNode('LambdaExpression', { parameters, body });
+    }
+
+    const structured = new TokenExpressionParser(this, safeTokens).parse();
+    if (structured) return structured;
 
     if (safeTokens.length >= 2 && safeTokens[0].text === '(') {
       const closeIndex = findMatchingInTokens(safeTokens, 0, '(', ')');

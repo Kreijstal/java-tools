@@ -10,6 +10,15 @@ module.exports = {
     'MIN_VALUE:J': BigInt('-9223372036854775808'),
   },
   staticMethods: {
+    'toString(J)Ljava/lang/String;': (jvm, obj, args) => {
+      const value = typeof args[0] === 'bigint' ? args[0] : BigInt(args[0] || 0);
+      return jvm.newString(value.toString());
+    },
+    'toString(JI)Ljava/lang/String;': (jvm, obj, args) => {
+      const value = typeof args[0] === 'bigint' ? args[0] : BigInt(args[0] || 0);
+      const radix = args[1] | 0;
+      return jvm.newString(value.toString(radix >= 2 && radix <= 36 ? radix : 10));
+    },
     'parseLong(Ljava/lang/String;)J': (jvm, obj, args) => {
       const str = args[0];
       // Handle both string objects and primitive strings

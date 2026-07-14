@@ -15,7 +15,7 @@ function usage(exitCode) {
   stream.write(`  --silent                  Accepted for CFR CLI compatibility\n`);
   stream.write(`  --classpath <path>        Classpath used for hierarchy/type resolution\n`);
   stream.write(`  --diagnostics-json <file> Write machine-readable fallback diagnostics\n`);
-  stream.write(`  --fail-on-fallback        Exit non-zero on raw flow or expression placeholders\n`);
+  stream.write(`  --fail-on-fallback        Exit non-zero on any method/source fallback\n`);
   stream.write(`  --help, -h                Show this help text\n`);
   process.exit(exitCode);
 }
@@ -66,20 +66,26 @@ function parseArgs(argv) {
 
 function collectDiagnostics(outputs) {
   const files = [];
-  const totals = { stackUnderflow: 0, rawControlFlow: 0, placeholders: 0 };
-  for (const { name, source } of outputs) {
+  const totals = { stackUnderflow: 0, rawControlFlow: 0, placeholders: 0, stateMachineFallback: 0 };
+  for (const { name, source, diagnostics = [] } of outputs) {
+    const stateMachineFallbacks = diagnostics.filter((item) => item && item.kind === 'stateMachineFallback');
     const counts = {
       stackUnderflow: (source.match(/stack-underflow/g) || []).length,
       rawControlFlow: (source.match(/^\s*\/\/\s*(?:if|goto|tableswitch|lookupswitch)\b/gm) || []).length,
       placeholders: (source.match(/\/\* unsupported condition|\bstmt_\d+\(\);/g) || []).length,
+      stateMachineFallback: stateMachineFallbacks.length,
     };
     for (const key of Object.keys(totals)) totals[key] += counts[key];
-    if (Object.values(counts).some((count) => count > 0)) files.push({ name, ...counts });
+    if (Object.values(counts).some((count) => count > 0)) {
+      files.push({ name, ...counts, fallbacks: stateMachineFallbacks });
+    }
   }
+  const panics = (outputs.failures || []).map(({ name, reason }) => ({ name, reason }));
   return {
     version: VERSION,
     generatedFiles: outputs.length,
-    hardFailures: Object.values(totals).reduce((sum, count) => sum + count, 0),
+    hardFailures: Object.values(totals).reduce((sum, count) => sum + count, 0) + panics.length,
+    panics,
     totals,
     files,
   };
@@ -104,6 +110,9 @@ async function main() {
   if (options.diagnosticsJson) {
     fs.mkdirSync(path.dirname(path.resolve(options.diagnosticsJson)), { recursive: true });
     fs.writeFileSync(options.diagnosticsJson, `${JSON.stringify(diagnostics, null, 2)}\n`, 'utf8');
+  }
+  for (const failure of outputs.failures || []) {
+    console.error(`PANIC ${failure.name}: ${failure.reason}`);
   }
   if (options.outputDir) {
     writeOutputs(outputs, options.outputDir);

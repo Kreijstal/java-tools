@@ -44,6 +44,12 @@ function treeToStatements(tree, render) {
     })];
     case 'break': return [createNode('BreakStatement', { label: tree.label })];
     case 'continue': return [createNode('ContinueStatement', { label: tree.label })];
+    case 'synchronized': return [createNode('SynchronizedStatement', {
+      lock: rawExpression(render.syncLock
+        ? render.syncLock(tree.lockLocal, tree.lockPc)
+        : `lock${tree.lockLocal}`),
+      body: block(treeToStatements(tree.body, render)),
+    })];
     case 'try': return [createNode('TryStatement', {
       resources: [],
       block: block(treeToStatements(tree.body, render)),
@@ -106,6 +112,11 @@ function emitStatement(node, indent, lines) {
       return;
     case 'BreakStatement': emit(`break${node.label ? ` ${node.label}` : ''};`); return;
     case 'ContinueStatement': emit(`continue${node.label ? ` ${node.label}` : ''};`); return;
+    case 'SynchronizedStatement':
+      emit(`synchronized (${emitExpression(node.lock)}) {`);
+      emitBlock(node.body, indent + 1, lines);
+      emit('}');
+      return;
     case 'TryStatement':
       emit('try {'); emitBlock(node.block, indent + 1, lines);
       for (const item of node.catches || []) {

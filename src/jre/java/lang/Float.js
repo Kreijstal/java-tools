@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 function javaFloatString(value) {
   const f = Number(value);
   if (isNaN(f)) {
@@ -85,6 +87,16 @@ module.exports = {
 
       return floatObj;
     },
+    'valueOf(Ljava/lang/String;)Ljava/lang/Float;': withThrows((jvm, obj, args) => {
+      const value = Number(args[0] && Object.prototype.hasOwnProperty.call(args[0], 'value') ? args[0].value : args[0]);
+      if (Number.isNaN(value)) throw { type: 'java/lang/NumberFormatException' };
+      return { type: 'java/lang/Float', value };
+    }, ['java/lang/NumberFormatException']),
+    'parseFloat(Ljava/lang/String;)F': withThrows((jvm, obj, args) => {
+      const value = Number(args[0] && Object.prototype.hasOwnProperty.call(args[0], 'value') ? args[0].value : args[0]);
+      if (Number.isNaN(value)) throw { type: 'java/lang/NumberFormatException' };
+      return value;
+    }, ['java/lang/NumberFormatException']),
     'isInfinite(F)Z': (jvm, obj, args) => {
       const value = args[0];
       return !isFinite(value) && !isNaN(value) ? 1 : 0;

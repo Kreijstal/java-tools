@@ -113,13 +113,35 @@ test('Java parser parses a simple class declaration in strict mode', (t) => {
   t.end();
 });
 
-test('Java parser preserves hard expressions as serializable AST nodes', (t) => {
+test('Java parser structures anonymous class creation expressions', (t) => {
   const source = 'class A { void f() { Runnable r = new Runnable() { public void run() { System.out.println("x"); } }; } }';
   const document = frontend.parseJava(source);
   const serialized = frontend.serializeAst(document);
 
-  t.ok(serialized.includes('UnsupportedExpression'), 'hard expression is preserved instead of blocking parsing');
+  t.ok(serialized.includes('NewClassExpression'), 'anonymous construction is represented explicitly');
+  t.notOk(serialized.includes('UnsupportedExpression'), 'anonymous construction contains no expression fallback');
   t.doesNotThrow(() => frontend.deserializeAst(serialized), 'parsed source remains serializable/deserializable');
+  t.end();
+});
+
+test('Java parser structures Java 7 expression forms without fallback nodes', (t) => {
+  const source = `
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    class Expressions {
+      Class type = int[][].class;
+      int[] values = new int[] { 1, 2, 3 };
+      Object object = new String("x");
+      int f(int x, int y) { return (x & y) == 0 ? values[x + 1] : -y; }
+    }
+  `;
+  const serialized = frontend.serializeAst(frontend.parseJava(source));
+
+  t.ok(serialized.includes('NewClassExpression'), 'object creation is structured');
+  t.ok(serialized.includes('NewArrayExpression'), 'array creation is structured');
+  t.ok(serialized.includes('ArrayInitializerExpression'), 'array initializer is structured');
+  t.ok(serialized.includes('ClassLiteralExpression'), 'class literal is structured');
+  t.ok(serialized.includes('ConditionalExpression'), 'conditional expression is structured');
+  t.notOk(serialized.includes('UnsupportedExpression'), 'covered Java 7 expressions contain no fallback nodes');
   t.end();
 });
 

@@ -41,6 +41,10 @@ module.exports = {
       // no-op
     },
 
+    'load(Ljava/lang/String;)V': () => {
+      // Native libraries are provided by the host runtime where available.
+    },
+
     'exec(Ljava/lang/String;)Ljava/lang/Process;': (jvm, _, args) => {
       const processObj = {
         type: 'java/lang/Process',

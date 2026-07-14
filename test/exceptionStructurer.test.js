@@ -34,7 +34,7 @@ test('single try/catch with straight bodies', () => {
   assert.ok(ok, 'should structure');
   assertGotoFree(src);
   assert.match(src, /try \{/);
-  assert.match(src, /\} catch \(java\.io\.IOException e\) \{/);
+  assert.match(src, /} catch \(java\.io\.IOException \w+\) \{/);
   // merge code runs after the try/catch
   assert.match(src, /\}\nreturn;/);
 });
@@ -61,8 +61,8 @@ test('try with two catch clauses', () => {
   assert.ok(ok, 'should structure');
   assertGotoFree(src);
   assert.equal((src.match(/\} catch \(/g) || []).length, 2, `two catch clauses:\n${src}`);
-  assert.match(src, /catch \(java\.io\.IOException e\)/);
-  assert.match(src, /catch \(java\.lang\.RuntimeException e\)/);
+  assert.match(src, /catch \(java\.io\.IOException \w+\)/);
+  assert.match(src, /catch \(java\.lang\.RuntimeException \w+\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ test('catch-all clause renders java.lang.Throwable', () => {
   const { ok, src } = run(code, et);
   assert.ok(ok, 'should structure');
   assertGotoFree(src);
-  assert.match(src, /catch \(java\.lang\.Throwable e\)/);
+  assert.match(src, /catch \(java\.lang\.Throwable \w+\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -131,15 +131,16 @@ test('nested try/catch', () => {
   assert.ok(ok, 'should structure');
   assertGotoFree(src);
   assert.equal((src.match(/try \{/g) || []).length, 2, `two nested try blocks:\n${src}`);
-  assert.match(src, /catch \(java\.lang\.RuntimeException e\)/);
-  assert.match(src, /catch \(java\.lang\.Exception e\)/);
+  assert.match(src, /catch \(java\.lang\.RuntimeException \w+\)/);
+  assert.match(src, /catch \(java\.lang\.Exception \w+\)/);
 });
 
 // ---------------------------------------------------------------------------
-// (f) A try body with two distinct external exits is out of v1 scope: it must
-// bail gracefully (never emit wrong Java).
+// (f) A try body with two distinct external exits structures via a selector: the
+// try/handler set a synthetic selector local at each exit and an if/else chain
+// after the try dispatches to the right join. (No goto, valid Java.)
 // ---------------------------------------------------------------------------
-test('multi-exit try bails gracefully', () => {
+test('multi-exit try structures via a selector dispatch', () => {
   const code = [
     { labelDef: 'L0:', pc: 0, instruction: 'iload_0' },
     { pc: 1, instruction: { op: 'ifeq', arg: 'L12' } },  // exit target #1
@@ -152,8 +153,18 @@ test('multi-exit try bails gracefully', () => {
   ];
   const et = [{ start_pc: 0, end_pc: 7, handler_pc: 7, catch_type: 'java/lang/Exception' }];
   const r = structureMethod(code, et);
-  assert.equal(r.ok, false, 'should bail');
-  assert.match(r.reason, /external exit/);
+  assert.ok(r.ok, 'should structure');
+  r.render.synthetic = r.synthetic;
+  const src = printTree(r.tree, r.render);
+  assertGotoFree(src);
+  assert.match(src, /try \{/);
+  assert.match(src, /catch \(java\.lang\.Exception \w+\)/);
+  // A selector is assigned inside the try and both handler, and tested after.
+  const selector = (src.match(/decompiledRegionSelector\d+/) || [])[0];
+  assert.ok(selector, `expected a selector variable:\n${src}`);
+  assert.ok((src.match(new RegExp(`${selector} = \\d+;`, 'g')) || []).length >= 2,
+    `selector assigned at each exit:\n${src}`);
+  assert.match(src, new RegExp(`if \\(${selector} == \\d+\\)`), 'dispatch on the selector');
 });
 
 // ---------------------------------------------------------------------------
@@ -172,4 +183,33 @@ test('no exception table structures as a plain method', () => {
   assert.ok(ok);
   assertGotoFree(src);
   assert.doesNotMatch(src, /try \{/);
+});
+
+// ---------------------------------------------------------------------------
+// (g) normalizeTable must never fuse a synchronized monitor handler with a real
+// catch that shares a protected range: doing so emits an invalid
+// `catch (Throwable) … catch (RuntimeException)` two-catch try. The sync handler
+// belongs in its own group so it structures as a nested `synchronized` block.
+// ---------------------------------------------------------------------------
+test('sync handler and real catch on a shared range split into separate groups', () => {
+  const { normalizeTable } = require('../src/decompiler/exceptionStructurer');
+  const et = [
+    { start_pc: 8, end_pc: 43, handler_pc: 79, catch_type: 'any' },
+    { start_pc: 44, end_pc: 78, handler_pc: 79, catch_type: 'any' },
+    { start_pc: 0, end_pc: 43, handler_pc: 87, catch_type: 'java/lang/RuntimeException' },
+    { start_pc: 44, end_pc: 78, handler_pc: 87, catch_type: 'java/lang/RuntimeException' },
+  ];
+  const syncHandlers = new Map([[79, { lockLocal: 5, lockPc: 7 }]]);
+  const { groups } = normalizeTable(et, syncHandlers);
+  // Two groups, never one fused two-catch group.
+  assert.equal(groups.length, 2, `expected two groups:\n${JSON.stringify(groups, null, 1)}`);
+  for (const g of groups) {
+    assert.equal(g.catches.length, 1, `each group has a single handler:\n${JSON.stringify(g)}`);
+  }
+  const handlers = groups.map((g) => g.catches[0].handler_pc).sort((a, b) => a - b);
+  assert.deepEqual(handlers, [79, 87]);
+  // Without syncHandlers, the old fused behavior is preserved (a single group
+  // whose catches include both handlers) — the split is sync-specific.
+  const fused = normalizeTable(et).groups;
+  assert.ok(fused.some((g) => g.catches.length === 2), 'non-sync grouping still fuses shared ranges');
 });

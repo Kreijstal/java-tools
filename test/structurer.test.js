@@ -161,3 +161,26 @@ test('nested loops resolve continues to the correct headers', () => {
   assert.match(src, /continue L2;/);
   assert.match(src, /continue L1;/);
 });
+
+test('uniquifyCatchParameters renames nested catch parameters', () => {
+  const { uniquifyCatchParameters } = require('../src/decompiler/structurer');
+  // try { } catch (IOException P) { try { } catch (Exception P) { } }
+  // Inner P re-declares a name still in scope from the outer catch — javac
+  // rejects it. After the pass, every catch varName is unique.
+  const tree = {
+    t: 'try',
+    body: { t: 'seq', body: [] },
+    catches: [{
+      type: 'java.io.IOException', varName: 'e', carrierName: 'carrier',
+      body: {
+        t: 'try',
+        body: { t: 'seq', body: [] },
+        catches: [{ type: 'java.lang.Exception', varName: 'e', carrierName: 'carrier', body: { t: 'seq', body: [] } }],
+      },
+    }],
+  };
+  uniquifyCatchParameters(tree);
+  const outer = tree.catches[0].varName;
+  const inner = tree.catches[0].body.catches[0].varName;
+  assert.notEqual(outer, inner, `nested catch params must differ, got ${outer}/${inner}`);
+});

@@ -7,7 +7,7 @@ const { parseJava } = require('./parser');
 const { validateAstDocument } = require('./serialization');
 const { JavaFrontendError, UnsupportedJavaSyntaxError } = require('./errors');
 const { assembleJasminSource } = require('../utils/jasminAssembly');
-const { jreInternalNameForSimpleName } = require('./jreMetadata');
+const { jreCanonicalInternalName, jreClassInfo, jreInternalNameForSimpleName } = require('./jreMetadata');
 
 const COMPILE_RESULT_SCHEMA_ID = 'java-tools.java-frontend.compile-result';
 const COMPILE_RESULT_SCHEMA_VERSION = 1;
@@ -126,15 +126,22 @@ function classTypeInternalName(type, context = {}) {
   if (type.packageName) {
     const qualifiedName = `${type.packageName}.${type.name}`;
     if (context.classBySimpleName && context.classBySimpleName.has(qualifiedName)) {
-      return context.classBySimpleName.get(qualifiedName);
-    }
-    if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
-      return context.classBySimpleName.get(type.name);
+      const mapped = context.classBySimpleName.get(qualifiedName);
+      return jreCanonicalInternalName(mapped) || mapped;
     }
     if (/^[A-Z]/.test(String(type.packageName))) {
       return `${String(type.packageName).replace(/\./g, '$')}$${type.name}`;
     }
-    return `${String(type.packageName).replace(/\./g, '/')}/${type.name}`;
+    const direct = `${String(type.packageName).replace(/\./g, '/')}/${type.name}`;
+    if (jreClassInfo(direct)) return direct;
+    const parts = String(type.packageName).split('.');
+    for (let boundary = parts.length - 1; boundary > 0; boundary -= 1) {
+      const packagePrefix = parts.slice(0, boundary).join('/');
+      const memberSuffix = parts.slice(boundary).concat(type.name).join('$');
+      const nested = `${packagePrefix}/${memberSuffix}`;
+      if (jreClassInfo(nested)) return nested;
+    }
+    return direct;
   }
   if (JAVA_LANG_TYPES.has(type.name)) {
     return `java/lang/${type.name}`;
@@ -198,6 +205,9 @@ function typeDescriptor(type, context = {}) {
   }
   if (type.kind === 'TypeVariable') {
     return typeVariableErasure(type, context);
+  }
+  if (type.kind === 'UnionType') {
+    return 'Ljava/lang/Throwable;';
   }
   if (type.kind === 'UnsupportedType' && context.fallbackUnsupportedTypes === true) {
     return 'Ljava/lang/Object;';

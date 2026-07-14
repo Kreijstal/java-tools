@@ -117,18 +117,32 @@ async function decompilePath(inputPath, options = {}) {
     if (profileBulk) console.error(`[cfr-phase] parse ${Date.now() - bulkStarted}ms`);
     const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
     if (profileBulk) console.error(`[cfr-phase] model ${Date.now() - bulkStarted}ms`);
-    return parsed.map(({ file, astRoot }) => {
+    // Decompile every class even when some panic: a DecompilationFallbackError
+    // means "no valid Java for this class — emit nothing for it", not "abort the
+    // whole input". Failures are collected on the returned array (`.failures`)
+    // so the CLI can report all of them and still exit non-zero.
+    const outputs = [];
+    const failures = [];
+    for (const { file, astRoot } of parsed) {
       const started = Date.now();
+      const diagnostics = [];
       if (process.env.CFR_JS_PROFILE_CLASSES === '1') console.error(`[cfr-class-start] ${file}`);
-      const result = {
-        name: javaOutputName(file, inputPath),
-        source: decompileAstRoot(astRoot, { ...options, exceptionModel }),
-      };
+      try {
+        outputs.push({
+          name: javaOutputName(file, inputPath),
+          source: decompileAstRoot(astRoot, { ...options, exceptionModel, diagnostics }),
+          diagnostics,
+        });
+      } catch (err) {
+        if (!(err instanceof DecompilationFallbackError)) throw err;
+        failures.push({ name: javaOutputName(file, inputPath), reason: err.message, context: err.context });
+      }
       if (process.env.CFR_JS_PROFILE_CLASSES === '1') {
         console.error(`[cfr-class-done] ${Date.now() - started}ms ${file}`);
       }
-      return result;
-    });
+    }
+    outputs.failures = failures;
+    return outputs;
   }
 
   if (inputPath.toLowerCase().endsWith('.jar')) {
@@ -143,17 +157,26 @@ async function decompilePath(inputPath, options = {}) {
       parsed.push({ name, astRoot: convertJson(result.ast, result.constantPool) });
     }
     const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
-    return parsed.map(({ name, astRoot }) => ({
-      name: name.replace(/\.class$/i, '.java'),
-      source: decompileAstRoot(astRoot, { ...options, exceptionModel }),
-    }));
+    return parsed.map(({ name, astRoot }) => {
+      const diagnostics = [];
+      return {
+        name: name.replace(/\.class$/i, '.java'),
+        source: decompileAstRoot(astRoot, { ...options, exceptionModel, diagnostics }),
+        diagnostics,
+      };
+    });
   }
 
   if (!inputPath.toLowerCase().endsWith('.class')) {
     throw new Error(`CFR-JS currently accepts .class files, .jar files, or directories: ${inputPath}`);
   }
 
-  return [{ name: javaOutputName(inputPath), source: decompileClassFile(inputPath, options) }];
+  const diagnostics = [];
+  return [{
+    name: javaOutputName(inputPath),
+    source: decompileClassFile(inputPath, { ...options, diagnostics }),
+    diagnostics,
+  }];
 }
 
 function decompileClassAst(cls, options = {}) {
@@ -356,6 +379,44 @@ function formatField(field, owner) {
   return `${prefix}${type} ${sourceFieldName(owner, field.name)}${initializer};`;
 }
 
+// Raised when the decompiler cannot produce valid Java for a method and would
+// otherwise fall back to emitting bytecode as comments (raw `// goto`/`// if_*`/
+// `// monitorenter` lines), placeholder statements (`stmt_N();`), or placeholder
+// expressions (`/* unsupported condition */`, `/* stack-underflow */`). We refuse
+// to ship such a "fake" method: fail hard instead. See assertNoFallback.
+class DecompilationFallbackError extends Error {
+  constructor(message, context = {}) {
+    super(message);
+    this.name = 'DecompilationFallbackError';
+    this.context = context;
+  }
+}
+
+// Any full-line `//` comment in a rendered method body is a bytecode-as-comment
+// fallback: every standalone comment line the emitter produces is a dropped JVM
+// opcode (branch, switch, monitorenter/exit, wide, or otherwise unhandled). The
+// emitter never emits legitimate line comments, so a blanket rule is both correct
+// and future-proof against new fallback opcodes.
+const FALLBACK_LINE_COMMENT = /^\s*\/\//;
+// Placeholder expressions/statements the emitter substitutes when it cannot
+// reconstruct a value or condition. These are invalid/fake even though some parse.
+const FALLBACK_PLACEHOLDER = /\/\*\s*unsupported condition|\/\*\s*unresolved invokevirtual|stack-underflow|\bstmt_\d+\(\)\s*;/;
+
+// Scan a finalized method body for any fallback marker and hard-fail if present,
+// so a logically-broken or lossy method is never written to disk.
+function assertNoFallback(bodyLines, context = {}) {
+  const lines = Array.isArray(bodyLines) ? bodyLines : String(bodyLines).split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = String(lines[i]);
+    if (FALLBACK_LINE_COMMENT.test(line) || FALLBACK_PLACEHOLDER.test(line)) {
+      const where = `${context.className || '?'}.${context.methodName || '?'}${context.descriptor || ''}`;
+      throw new DecompilationFallbackError(
+        `cannot emit valid Java for ${where}: fallback marker at body line ${i + 1}: ${line.trim()}`,
+        { ...context, marker: line.trim(), index: i });
+    }
+  }
+}
+
 function formatMethod(cls, method, options = {}) {
   const profileMethod = process.env.CFR_JS_PROFILE_METHODS === '1';
   const methodProfileStarted = Date.now();
@@ -453,6 +514,7 @@ function formatMethod(cls, method, options = {}) {
     && !body.some((line) => /(?:stateLoop:|\bwhile\b|\bcontinue\b)/.test(String(line)))) {
     body.push(`return ${defaultValueForType(methodResultType)};`);
   }
+  assertNoFallback(body, { className: cls.className, methodName: method.name, descriptor: method.descriptor });
   const result = formatBlock(header, body);
   if (profileMethod) console.error(`[cfr-method-done] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
   return result;
@@ -747,6 +809,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   body.splice(0, body.length, ...normalizeSyntheticVariableScopes(body));
+  assertNoFallback(body, { className: cls.className, methodName: '<clinit>', descriptor: '()V' });
   if (!body.length) return formatBlock('static', body);
   const methodNames = new Set((cls.items || [])
     .filter((item) => item && item.type === 'method' && item.method)
@@ -943,7 +1006,8 @@ function decompileCode(code, method, cls, localState, options = {}) {
       // invokedynamic and malformed references are irrelevant to this selector.
     }
   }
-  const preferOwnedStructurer = tableHasTrivialCheckedHandler(code)
+  const preferOwnedStructurer = options.forceOwnedStructurer === true
+    || tableHasTrivialCheckedHandler(code)
     || (codeItemsForSelection.length > 128
       && !(hasArrayLength && !(code.exceptionTable || []).length
         && controlTransfers / codeItemsForSelection.length <= 0.05)
@@ -1002,6 +1066,14 @@ function decompileCode(code, method, cls, localState, options = {}) {
 
 function usableDecompileLines(lines) {
   if (!Array.isArray(lines) || lines.some((line) => String(line).includes('stack-underflow'))) return false;
+  // Reject any candidate that dropped an opcode to a bytecode-as-comment or a
+  // placeholder. An earlier structurer (e.g. the legacy pattern-matcher
+  // `decompileStructuredControlFlow`) that bails on a goto still returns lines with
+  // a `// goto`/`// if_*` comment; accepting them here would ship broken Java and
+  // skip the general Ramsey structurer (`decompileOwnedStructuredControlFlow`),
+  // which structures every reducible CFG cleanly. Falling through to it is strictly
+  // better for those methods (and no worse for the rest — the gate is the backstop).
+  if (lines.some((line) => FALLBACK_LINE_COMMENT.test(String(line)) || FALLBACK_PLACEHOLDER.test(String(line)))) return false;
   if (hasUnreachableStatementAfterTerminal(lines)) return false;
   return true;
 }
@@ -1363,6 +1435,182 @@ function sourceTypeFromAst(type) {
   return type.name || type.text || 'Object';
 }
 
+// ---------------------------------------------------------------------------
+// Synchronized-block lowering for the owned structurer.
+//
+// javac compiles `synchronized (E) { body }` as
+//     E; dup; astore N; monitorenter
+//     body ...  aload N; monitorexit      (before every normal exit)
+//     H:  astore M; aload N; monitorexit; aload M; athrow
+// with exception rows [body ranges -> H] plus a self-protecting [H -> H].
+//
+// Recognize each such catch-any handler, replace the monitor plumbing with nops
+// on a private copy of the codeItems (the lock store itself stays, so the lock
+// variable keeps its name and value), and report {handler_pc -> {lockLocal,
+// lockPc}} so the exception structurer emits `synchronized (lock) { ... }` for
+// that group instead of a try/catch. Anything that does not match the idiom is
+// left untouched: a surviving monitorenter renders as a `// monitorenter`
+// comment and the no-fallback gate turns it into a hard panic — a miss is loud,
+// never silently-unsynchronized Java.
+function lowerSynchronizedRegions(originalItems, exceptionTable) {
+  const codeItems = originalItems.slice();
+  const syncHandlers = new Map();
+  const result = { codeItems, syncHandlers };
+
+  const executablesFrom = (startIndex, count) => {
+    const run = [];
+    for (let i = startIndex; i >= 0 && i < codeItems.length && run.length < count; i += 1) {
+      const instruction = getInstructionFromItem(codeItems[i]);
+      if (instruction) run.push({ index: i, op: instruction.op, instruction });
+    }
+    return run;
+  };
+  const executablesBefore = (endIndex, count) => {
+    const run = []; // nearest-first
+    for (let i = endIndex - 1; i >= 0 && run.length < count; i -= 1) {
+      const instruction = getInstructionFromItem(codeItems[i]);
+      if (instruction) run.push({ index: i, op: instruction.op, instruction });
+    }
+    return run;
+  };
+  const indexOfPc = new Map();
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (item && getInstructionFromItem(item) && Number.isFinite(Number(item.pc))) {
+      indexOfPc.set(Number(item.pc), i);
+    }
+  }
+
+  const rowsByHandler = new Map();
+  for (const row of exceptionTable || []) {
+    const catchType = row.catch_type ?? row.catchType;
+    if (!(catchType == null || catchType === 0 || catchType === 'any')) continue;
+    if (!Number.isFinite(Number(row.handler_pc))) continue;
+    const handlerPc = Number(row.handler_pc);
+    if (!rowsByHandler.has(handlerPc)) rowsByHandler.set(handlerPc, []);
+    rowsByHandler.get(handlerPc).push(row);
+  }
+
+  for (const [handlerPc, rows] of rowsByHandler) {
+    const handlerIndex = indexOfPc.get(handlerPc);
+    if (handlerIndex == null) continue;
+    // Handler idiom: astore M; aload N; monitorexit; aload M; athrow.
+    const h = executablesFrom(handlerIndex, 5);
+    if (h.length < 5) continue;
+    const storeM = parseStoreIndex(h[0].op, h[0].instruction.arg);
+    const loadN = parseLoadIndex(h[1].op, h[1].instruction.arg);
+    const loadM = parseLoadIndex(h[3].op, h[3].instruction.arg);
+    if (!storeM || storeM.type !== 'Object' || !loadN || loadN.type !== 'Object') continue;
+    if (h[2].op !== 'monitorexit' || !loadM || loadM.index !== storeM.index || h[4].op !== 'athrow') continue;
+    const lockLocal = loadN.index;
+
+    // Entry idiom immediately before the earliest protected pc:
+    //   dup; astore N; monitorenter        (javac)
+    //   astore N; aload N; monitorenter    (alternate compiler form)
+    const bodyRows = rows.filter((row) => Number(row.start_pc) !== handlerPc);
+    if (!bodyRows.length) continue;
+    const startPc = Math.min(...bodyRows.map((row) => Number(row.start_pc)));
+    const entryIndex = indexOfPc.get(startPc);
+    if (entryIndex == null) continue;
+    const pre = executablesBefore(entryIndex, 3); // [monitorenter, astore|aload, dup|astore]
+    if (pre.length < 3 || pre[0].op !== 'monitorenter') continue;
+    const enterPc = Number(codeItems[pre[0].index].pc);
+    const preStore = parseStoreIndex(pre[1].op, pre[1].instruction.arg);
+    const preLoad = parseLoadIndex(pre[1].op, pre[1].instruction.arg);
+    let entryNops = null;
+    if (preStore && preStore.type === 'Object' && preStore.index === lockLocal && pre[2].op === 'dup') {
+      entryNops = [pre[0].index, pre[2].index]; // monitorenter + dup
+    } else if (preLoad && preLoad.type === 'Object' && preLoad.index === lockLocal) {
+      const outerStore = parseStoreIndex(pre[2].op, pre[2].instruction.arg);
+      if (outerStore && outerStore.type === 'Object' && outerStore.index === lockLocal) {
+        entryNops = [pre[0].index, pre[1].index]; // monitorenter + aload N
+      }
+    }
+    if (!entryNops) continue;
+
+    // Release idiom: every `aload N; monitorexit` pair inside the protected
+    // ranges belongs to this group (a pair on another local belongs to a nested
+    // group and is left for its own match). Collect all rewrites before
+    // committing: a monitorexit in range that is not part of a recognizable pair
+    // aborts the whole group, leaving the method to panic loudly.
+    //
+    // The `monitorexit` becomes a `pop` (not a nop) and its `aload N` is kept.
+    // An obfuscator can branch *directly* into a shared `monitorexit`, reusing a
+    // lock reference already left on the operand stack instead of re-loading it
+    // with `aload N`; the monitorexit pops that leftover. Nop-ing the monitorexit
+    // would strip that pop and leave the stack one deep on the jump edge but empty
+    // on the fall-through edge — an inconsistent-height join the shape analysis
+    // rejects. A `pop` consumes exactly one reference on every incoming edge
+    // (the re-loaded `aload N` on the fall-through, the leftover lock on the jump)
+    // so all edges stay balanced; `aload N; pop` renders as nothing either way.
+    const inBodyRange = (pc) =>
+      bodyRows.some((row) => pc >= Number(row.start_pc) && pc < Number(row.end_pc));
+    const exitPops = [];
+    let matched = true;
+    for (let i = 0; i < codeItems.length; i += 1) {
+      const instruction = getInstructionFromItem(codeItems[i]);
+      if (!instruction || instruction.op !== 'monitorexit') continue;
+      const pc = Number(codeItems[i].pc);
+      if (!Number.isFinite(pc) || !inBodyRange(pc)) continue;
+      const prev = executablesBefore(i, 1)[0];
+      const prevLoad = prev && parseLoadIndex(prev.op, prev.instruction.arg);
+      if (!prevLoad || prevLoad.type !== 'Object') { matched = false; break; }
+      if (prevLoad.index !== lockLocal) continue; // nested group's release
+      exitPops.push(i);
+    }
+    if (!matched) continue;
+
+    const toNop = (index) => {
+      codeItems[index] = { ...codeItems[index], instruction: 'nop' };
+    };
+    const toPop = (index) => {
+      codeItems[index] = { ...codeItems[index], instruction: 'pop' };
+    };
+    for (const index of entryNops) toNop(index);
+    for (const index of exitPops) toPop(index);
+    toNop(h[1].index); // handler's aload N
+    toNop(h[2].index); // handler's monitorexit
+    syncHandlers.set(handlerPc, { lockLocal, lockPc: enterPc });
+  }
+
+  return result;
+}
+
+// A handler that immediately rethrows the caught exception unchanged — bare
+// `athrow` (the exception is on the stack at handler entry) or `astore M;
+// aload M; athrow` — makes every row targeting it a semantic no-op: catching
+// and rethrowing the same throwable changes nothing, not even the stack trace.
+// Obfuscators wrap code in exactly such rows, and the wrappers often overlap
+// real protected regions without nesting, which defeats structuring. Return
+// the table minus those rows (the handler code itself stays; if normal flow
+// reaches it, it renders as a plain throw).
+function dropRethrowHandlerRows(codeItems, exceptionTable) {
+  const indexOfPc = new Map();
+  for (let i = 0; i < codeItems.length; i += 1) {
+    const item = codeItems[i];
+    if (item && getInstructionFromItem(item) && Number.isFinite(Number(item.pc))) {
+      indexOfPc.set(Number(item.pc), i);
+    }
+  }
+  const isRethrowHandler = (handlerPc) => {
+    const handlerIndex = indexOfPc.get(Number(handlerPc));
+    if (handlerIndex == null) return false;
+    const run = [];
+    for (let i = handlerIndex; i < codeItems.length && run.length < 3; i += 1) {
+      const instruction = getInstructionFromItem(codeItems[i]);
+      if (instruction) run.push(instruction);
+    }
+    if (!run.length) return false;
+    if (run[0].op === 'athrow') return true;
+    if (run.length < 3) return false;
+    const store = parseStoreIndex(run[0].op, run[0].arg);
+    const load = parseLoadIndex(run[1].op, run[1].arg);
+    return Boolean(store && store.type === 'Object' && load && load.index === store.index
+      && run[2].op === 'athrow');
+  };
+  return (exceptionTable || []).filter((row) => !isRethrowHandler(row.handler_pc));
+}
+
 function decompileOwnedStructuredControlFlow(code, method, cls, localState, options = {}) {
   const originalItems = code.codeItems || [];
   if (!(code.exceptionTable || []).length && !originalItems.some((item) => {
@@ -1386,8 +1634,17 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   normalizeLargeIntegerDispatchers(codeItems);
 
   let exceptionTable = code.exceptionTable || [];
+  // Lower javac synchronized regions on a private copy of the codeItems and
+  // strip obfuscator catch-and-rethrow wrapper rows. The original codeItems are
+  // untouched, so when structuring fails and a later strategy runs, it still
+  // sees the monitorenter and panics loudly instead of emitting
+  // silently-unsynchronized Java.
+  const loweredSync = lowerSynchronizedRegions(codeItems, exceptionTable);
+  codeItems = loweredSync.codeItems;
+  const syncHandlers = loweredSync.syncHandlers;
+  exceptionTable = dropRethrowHandlerRows(codeItems, exceptionTable);
   let structured = null;
-  if (codeItems.length > 1000 && exceptionTable.length) {
+  if (codeItems.length > 1000 && exceptionTable.length && !syncHandlers.size) {
     const normalCfg = buildCfgFromCode(codeItems, []);
     if (normalCfg) {
       const reachableBlocks = new Set([normalCfg.entry]);
@@ -1413,8 +1670,8 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       }
     }
   }
-  if (!structured) structured = structureMethod(codeItems, exceptionTable);
-  if ((!structured || !structured.ok) && codeItems.length > 1000) {
+  if (!structured) structured = structureMethod(codeItems, exceptionTable, { syncHandlers });
+  if ((!structured || !structured.ok) && codeItems.length > 1000 && !syncHandlers.size) {
     const normalOnly = structureMethod(codeItems, []);
     if (normalOnly && normalOnly.ok) structured = normalOnly;
   }
@@ -1427,7 +1684,21 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   }
   const cfg = buildCfgFromCode(codeItems, exceptionBoundaryLabels.filter(Boolean));
   if (!cfg) return [];
-  let useStateMachine = process.env.CFR_JS_FORCE_STATE_MACHINE === '1' || !structured || !structured.ok;
+  let stateMachineReason = process.env.CFR_JS_FORCE_STATE_MACHINE === '1'
+    ? 'forced by CFR_JS_FORCE_STATE_MACHINE'
+    : ((!structured || !structured.ok)
+      ? (structured && structured.reason ? structured.reason : 'structurer returned no result')
+      : null);
+  let useStateMachine = stateMachineReason !== null;
+  if (useStateMachine && syncHandlers.size) {
+    // The state machine would render the lowered (nop'd) monitor plumbing as
+    // plain unsynchronized code. Bail out of this strategy instead: the
+    // fallbacks see the original monitorenter and panic loudly.
+    if (process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+      console.error(`${cls.className}.${method.name}${method.descriptor}: synchronized method failed to structure`);
+    }
+    return null;
+  }
   if (useStateMachine && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
     console.error(`${cls.className}.${method.name}${method.descriptor}: using CFG state-machine fallback`);
   }
@@ -1600,7 +1871,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     return value;
   };
 
-  const render = {
+  let render = {
     straight(blockId) {
       return evaluate(blockId).lines;
     },
@@ -1612,7 +1883,32 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const state = evaluate(blockId);
       return pop(state.stack.slice()).code;
     },
+    syncLock(lockLocal, lockPc) {
+      return localState.load(lockLocal, 'Object', lockPc).code;
+    },
   };
+
+  // The exception structurer may introduce synthetic blocks (selector sinks and
+  // if/else dispatch for multi-exit try/synchronized regions) that carry no
+  // bytecode. Their render text comes from `structured.synthetic`; compose it
+  // over the expression-reconstruction render so those ids print correctly.
+  const syntheticRender = structured && structured.synthetic;
+  if (syntheticRender && syntheticRender.size) {
+    const base = render;
+    render = {
+      straight(id) {
+        const syn = syntheticRender.get(id);
+        return syn && syn.straight ? syn.straight : base.straight(id);
+      },
+      cond(id) {
+        const syn = syntheticRender.get(id);
+        return syn && syn.cond ? syn.cond : base.cond(id);
+      },
+      switchValue: (id) => base.switchValue(id),
+      syncLock: (lockLocal, lockPc) => base.syncLock(lockLocal, lockPc),
+    };
+    for (const name of structured.selectorDecls || []) declarations.push(`int ${name} = 0;`);
+  }
 
   try {
     if (!useStateMachine && structured && structured.tree) {
@@ -1642,14 +1938,20 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     const hasInvalidJavaFlow = (text) => hasUnreachableStatementAfterTerminal(String(text).split('\n'));
     if (!useStateMachine && (source.includes('unsupported condition') || source.includes('= e;')
       || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source))) {
-      const normalOnly = codeItems.length > 1000 ? structureMethod(codeItems, []) : null;
+      const normalOnly = codeItems.length > 1000 && !syncHandlers.size ? structureMethod(codeItems, []) : null;
       if (normalOnly && normalOnly.ok) {
         cache.clear();
         source = printTree(normalOnly.tree, render);
       }
       if (source.includes('unsupported condition') || source.includes('= e;')
         || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source)) {
+        if (syncHandlers.size) {
+          // Never route a lowered synchronized method through the state
+          // machine — it would emit unsynchronized code. Fall back loudly.
+          return null;
+        }
         useStateMachine = true;
+        stateMachineReason = 'structured output failed Java source-flow validation';
         cache.clear();
         source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
           methodReturnType(method));
@@ -1662,6 +1964,15 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       lines.unshift(...uniqueDeclarations);
     }
     if (lines[lines.length - 1] === 'return;') lines.pop();
+    if (useStateMachine && Array.isArray(options.diagnostics)) {
+      options.diagnostics.push({
+        kind: 'stateMachineFallback',
+        className: cls.className,
+        methodName: method.name,
+        descriptor: method.descriptor,
+        reason: stateMachineReason || 'state-machine fallback selected',
+      });
+    }
     return coalesceDefaultConstructorBody(lines, method);
   } catch (err) {
     // Expression reconstruction can still decline stack-carrying joins. The
@@ -1720,7 +2031,7 @@ function normalizeStructuredCatchNodes(tree, cfg, codeItems, model) {
       return;
     }
     if (node.t === 'seq') for (const child of node.body || []) walk(child);
-    else if (node.t === 'block' || node.t === 'loop') walk(node.body);
+    else if (node.t === 'block' || node.t === 'loop' || node.t === 'synchronized') walk(node.body);
     else if (node.t === 'if') { walk(node.then); walk(node.els); }
     else if (node.t === 'switch') {
       for (const item of node.cases || []) walk(item.body);
@@ -1734,7 +2045,7 @@ function collectStructuredBlocks(node, blocks) {
   if (!node) return;
   if (node.t === 'straight' || node.t === 'if' || node.t === 'switch') blocks.add(node.block);
   if (node.t === 'seq') for (const child of node.body || []) collectStructuredBlocks(child, blocks);
-  else if (node.t === 'block' || node.t === 'loop') collectStructuredBlocks(node.body, blocks);
+  else if (node.t === 'block' || node.t === 'loop' || node.t === 'synchronized') collectStructuredBlocks(node.body, blocks);
   else if (node.t === 'if') {
     collectStructuredBlocks(node.then, blocks);
     collectStructuredBlocks(node.els, blocks);
@@ -4679,8 +4990,31 @@ function inferStoreType(fallbackType, value) {
 function normalizeInstruction(instruction) {
   if (!instruction) return null;
   if (typeof instruction === 'string') return { op: instruction };
+  if (instruction.op === 'wide') return decodeWideInstruction(instruction);
   if (instruction.op) return instruction;
   return null;
+}
+
+// A `wide`-prefixed instruction widens the local index (and, for iinc, the
+// constant) of a following load/store/iinc/ret to two bytes. The disassembler
+// delivers it verbatim as { op: 'wide', arg: 'iinc 3 198' } / 'iload 300'
+// (space-joined base mnemonic + operands) so the assembler can round-trip it.
+// Decode it into the equivalent base instruction so every consumer — the linear
+// emitter and the structurer alike (both read instructions through
+// normalizeInstruction) — handles it as an ordinary iinc/iload/istore rather
+// than dropping it to a `// wide ...` comment. Unknown targets are left as-is so
+// the fallback gate hard-fails instead of silently discarding an opcode.
+function decodeWideInstruction(instruction) {
+  const parts = String(instruction.arg == null ? '' : instruction.arg).trim().split(/\s+/);
+  const baseOp = parts[0];
+  if (!baseOp) return instruction;
+  if (baseOp === 'iinc') {
+    return { op: 'iinc', arg: [Number(parts[1]), Number(parts[2])] };
+  }
+  if (/^[ilfda](load|store)$/.test(baseOp) || baseOp === 'ret') {
+    return { op: baseOp, arg: Number(parts[1]) };
+  }
+  return instruction;
 }
 
 function parseLoadIndex(op, arg) {
@@ -5004,6 +5338,8 @@ function javaOutputName(file, baseDir = path.dirname(file)) {
 
 module.exports = {
   VERSION,
+  DecompilationFallbackError,
+  assertNoFallback,
   decompileClassFile,
   decompileClassBytes,
   decompileAstRoot,

@@ -13,15 +13,26 @@ module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/lang/Cloneable', 'java/io/Serializable'],
   methods: {
-    '<init>()V': (jvm, obj) => { obj.bits = new Set(); },
-    '<init>(I)V': (jvm, obj) => { obj.bits = new Set(); },
-    'set(I)V': (jvm, obj, args) => { bits(obj).add(args[0]); },
+    '<init>()V': (jvm, obj) => { obj.bits = new Set(); obj.bitCapacity = 64; },
+    '<init>(I)V': (jvm, obj, args) => {
+      obj.bits = new Set();
+      obj.bitCapacity = Math.ceil(args[0] / 64) * 64;
+    },
+    'set(I)V': (jvm, obj, args) => {
+      bits(obj).add(args[0]);
+      obj.bitCapacity = Math.max(obj.bitCapacity || 0, Math.ceil((args[0] + 1) / 64) * 64);
+    },
     'clear(I)V': (jvm, obj, args) => { bits(obj).delete(args[0]); },
     'get(I)Z': (jvm, obj, args) => bits(obj).has(args[0]) ? 1 : 0,
     'or(Ljava/util/BitSet;)V': (jvm, obj, args) => { const b = bits(obj); for (const v of sourceBits(args[0])) b.add(v); },
     'and(Ljava/util/BitSet;)V': (jvm, obj, args) => { const b = bits(obj); const o = sourceBits(args[0]); for (const v of Array.from(b)) if (!o.has(v)) b.delete(v); },
     'xor(Ljava/util/BitSet;)V': (jvm, obj, args) => { const b = bits(obj); for (const v of sourceBits(args[0])) { if (b.has(v)) b.delete(v); else b.add(v); } },
     'cardinality()I': (jvm, obj) => bits(obj).size,
+    'size()I': (jvm, obj) => obj.bitCapacity || 0,
+    'length()I': (jvm, obj) => {
+      const values = sortedValues(bits(obj));
+      return values.length === 0 ? 0 : values[values.length - 1] + 1;
+    },
     'nextSetBit(I)I': (jvm, obj, args) => {
       const start = args[0];
       for (const v of sortedValues(bits(obj))) if (v >= start) return v;

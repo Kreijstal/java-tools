@@ -34,6 +34,7 @@ const {
   structure,
   printTree,
   uniquifyLabels,
+  uniquifyCatchParameters,
   buildCfgFromCode,
   reversePostorder,
   computeDominators,
@@ -59,7 +60,8 @@ class Bail {
  * order (source catch order / JVM priority). Returns `{ groups }` or throws a
  * Bail for a shape we don't handle.
  */
-function normalizeTable(exceptionTable) {
+function normalizeTable(exceptionTable, syncHandlers) {
+  const isSyncHandler = (handlerPc) => !!(syncHandlers && syncHandlers.has(handlerPc));
   const rows = [];
   for (const e of exceptionTable) {
     // 1. Drop a handler that lives inside its own protected range (CFR's
@@ -70,6 +72,34 @@ function normalizeTable(exceptionTable) {
     if (e.start_pc < e.handler_pc && e.handler_pc <= end) end = e.handler_pc;
     if (!(end > e.start_pc)) continue; // empty after shrink — drop
     rows.push({ start_pc: e.start_pc, end_pc: end, handler_pc: e.handler_pc, catch_type: e.catch_type });
+  }
+  // A synchronized region's monitor-release handler (recognized upstream and
+  // recorded in syncHandlers) is never a sibling catch of a real try: the
+  // `synchronized` block is always its own nested region. When the same body
+  // range is protected by both a sync handler and a real catch (a
+  // `try { synchronized (x) { … } } catch (E)`), grouping by (start_pc, end_pc)
+  // below would fuse them into one multi-catch try — emitting an invalid
+  // `catch (Throwable) … catch (E)` pair instead of a nested block. Split the
+  // sync-handler rows out into their own per-handler group up front so the two
+  // structure as sibling groups and nest by protected-range size.
+  const syncGroups = [];
+  if (syncHandlers && syncHandlers.size) {
+    const byHandler = new Map();
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (!isSyncHandler(rows[i].handler_pc)) continue;
+      const r = rows.splice(i, 1)[0];
+      if (!byHandler.has(r.handler_pc)) byHandler.set(r.handler_pc, []);
+      byHandler.get(r.handler_pc).push(r);
+    }
+    for (const [handlerPc, hrows] of byHandler) {
+      const start_pc = Math.min(...hrows.map((r) => r.start_pc));
+      const end_pc = Math.max(...hrows.map((r) => r.end_pc));
+      syncGroups.push({
+        start_pc, end_pc,
+        ranges: hrows.map((r) => ({ start_pc: r.start_pc, end_pc: r.end_pc })),
+        catches: [{ catch_type: hrows[0].catch_type, handler_pc: handlerPc }],
+      });
+    }
   }
   // 3. Group by identical (start_pc, end_pc) → one body, N catches in order.
   const byKey = new Map();
@@ -117,7 +147,7 @@ function normalizeTable(exceptionTable) {
       groups.splice(groups.indexOf(extra), 1);
     }
   }
-  return { groups };
+  return { groups: [...groups, ...syncGroups] };
 }
 
 /** True when `pc` lies in any half-open protected range `[start_pc, end_pc)`. */
@@ -171,6 +201,19 @@ function cfgView(work) {
  * on normal edges, so this is how a handler comes to *dominate* exactly its own
  * region while the shared join — reachable from the entry too — does not.
  */
+/** Blocks reachable over normal edges from any of `roots` (BFS, no dominators). */
+function livenessFrom(work, roots) {
+  const succ = succFromTerms(work.term);
+  const seen = new Array(work.ids.length).fill(false);
+  const stack = [];
+  for (const r of roots) if (r != null && r >= 0 && !seen[r]) { seen[r] = true; stack.push(r); }
+  while (stack.length) {
+    const b = stack.pop();
+    for (const t of succ[b]) if (t != null && !seen[t]) { seen[t] = true; stack.push(t); }
+  }
+  return seen;
+}
+
 function dominatorsFromRoots(work, roots) {
   const n = work.ids.length;
   const succ = succFromTerms(work.term).map((s) => s.slice());
@@ -189,48 +232,161 @@ function dominatorsFromRoots(work, roots) {
  * sub-tree, or a Bail if the region has a second external exit or is
  * irreducible.
  */
-function structureRegion(work, memberSet, entryLocal, mergeLocal, ctx) {
+function structureRegion(work, memberSet, entryLocal, externalToRenderId, ctx) {
   const members = [...memberSet].sort((a, b) => a - b);
   const subOf = new Map(); // local id -> sub id
   members.forEach((loc, i) => subOf.set(loc, i));
-  const sExit = members.length; // synthetic exit id
+
+  // One synthetic exit sink per external target of the whole region. A region
+  // with several external exits (e.g. a synchronized block in a loop that both
+  // `continue`s and falls through) gets one sink per exit; each sink renders the
+  // selector assignment `sel = <index>;`, and the collapsed super-block dispatches
+  // on `sel` in the outer CFG. A single-exit region keeps its old shape: one sink
+  // that renders empty (the region's normal completion).
+  const externals = [...externalToRenderId.keys()];
+  const sinkOf = new Map(); // external local -> sub sink id
+  externals.forEach((ext, i) => sinkOf.set(ext, members.length + i));
 
   const remapTarget = (t) => {
     if (t == null) return null;
-    if (t === mergeLocal) return sExit;
     if (subOf.has(t)) return subOf.get(t);
-    return undefined; // external, and not the (single) merge -> second exit
+    if (sinkOf.has(t)) return sinkOf.get(t);
+    return undefined; // external the region-external analysis did not enumerate
   };
 
   const subTerm = [];
   for (const loc of members) {
     const t = work.term[loc];
-    const mapped = remapTermTargets(t, remapTarget);
-    if (mapped === undefined) return new Bail('region has a second external exit');
+    let unenumeratedTarget;
+    const mapped = remapTermTargets(t, (target) => {
+      const result = remapTarget(target);
+      if (result === undefined) unenumeratedTarget = target;
+      return result;
+    });
+    if (mapped === undefined) {
+      const sourcePc = work.startPc[loc];
+      const targetPc = unenumeratedTarget == null ? unenumeratedTarget : work.startPc[unenumeratedTarget];
+      const knownExternalPcs = externals.map((external) => work.startPc[external]).join(', ');
+      return new Bail(`region has an unenumerated external exit: ${sourcePc} -> ${targetPc} (targetInSubregion=${memberSet.has(unenumeratedTarget)}, knownExternalPcs=[${knownExternalPcs}])`);
+    }
     subTerm.push(mapped);
   }
-  subTerm.push({ kind: 'return' }); // S renders as empty (see codeLines)
+  for (let i = 0; i < externals.length; i++) subTerm.push({ kind: 'return' }); // sinks render via toOrig
 
-  const subCfg = {
-    n: members.length + 1,
+  let structuredTerms = subTerm;
+  let origins = [...Array(subTerm.length).keys()];
+  const makeCfg = () => ({
+    n: structuredTerms.length,
     entry: subOf.get(entryLocal),
-    succ: succFromTerms(subTerm),
-    succAll: succAllFromTerms(subTerm),
-    term: subTerm,
-  };
+    succ: succFromTerms(structuredTerms),
+    succAll: succAllFromTerms(structuredTerms),
+    term: structuredTerms,
+  });
 
   let res;
   try {
-    res = structure(subCfg);
+    res = structure(makeCfg());
   } catch (err) {
-    if (err instanceof IrreducibleError) return new Bail('region sub-CFG is irreducible');
-    throw err;
+    if (err instanceof IrreducibleError) {
+      const split = splitIrreducibleTerms(structuredTerms, subOf.get(entryLocal));
+      if (!split) {
+        const [from, to] = String((err.edges || [])[0] || '').split('->').map(Number);
+        if (!Number.isInteger(from) || !Number.isInteger(to) || !structuredTerms[to]) {
+          return new Bail(`region sub-CFG is irreducible: ${err.message}`);
+        }
+        // Tail-duplicate the retreating edge's target for this predecessor. The
+        // clone executes the identical block and retains its original outgoing
+        // edges, but the awkward join is no longer a retreating edge.
+        const clone = structuredTerms.length;
+        structuredTerms.push(remapTermTargets(structuredTerms[to], (target) => target));
+        origins.push(origins[to]);
+        structuredTerms[from] = remapTermTargets(structuredTerms[from], (target) =>
+          target === to ? clone : target);
+      } else {
+        structuredTerms = split.terms;
+        origins = split.origins;
+      }
+      try {
+        res = structure(makeCfg());
+      } catch (retryError) {
+        if (retryError instanceof IrreducibleError) return new Bail(`region sub-CFG remains irreducible after controlled splitting: ${retryError.message}`);
+        throw retryError;
+      }
+    }
+    else throw err;
   }
 
-  // Map sub ids back to original ids so every straight/cond in the combined tree
-  // names a real (or synthetic super-)block, keeping the global render coherent.
-  const toOrig = (subId) => (subId === sExit ? ctx.emptyId : work.ids[members[subId]]);
+  // Map sub ids back to original/synthetic ids so every straight/cond in the
+  // combined tree names a real (or synthetic super-/sink) block.
+  const toOrig = (subId) => {
+    const originalSubId = origins[subId];
+    if (originalSubId < members.length) return work.ids[members[originalSubId]];
+    return externalToRenderId.get(externals[originalSubId - members.length]);
+  };
   return remapTreeBlocks(res.tree, toOrig);
+}
+
+// Controlled node splitting for an induced exception sub-CFG. The whole method
+// has already been normalized, but carving handler edges can expose a
+// multi-entry SCC inside a try body. Clone the SCC once per secondary entry and
+// redirect only predecessors outside the SCC; cloned nodes render the same
+// bytecode blocks as their originals.
+function splitIrreducibleTerms(inputTerms, entry) {
+  let terms = inputTerms.map((term) => ({ ...term }));
+  let origins = [...Array(terms.length).keys()];
+  for (let round = 0; round < 64; round++) {
+    const succ = succFromTerms(terms);
+    const n = terms.length;
+    const index = new Array(n).fill(-1), low = new Array(n).fill(0);
+    const stack = [], onStack = new Array(n).fill(false), components = [];
+    let nextIndex = 0;
+    const visit = (v) => {
+      index[v] = low[v] = nextIndex++;
+      stack.push(v); onStack[v] = true;
+      for (const w of succ[v]) {
+        if (index[w] < 0) { visit(w); low[v] = Math.min(low[v], low[w]); }
+        else if (onStack[w]) low[v] = Math.min(low[v], index[w]);
+      }
+      if (low[v] === index[v]) {
+        const component = [];
+        for (;;) { const w = stack.pop(); onStack[w] = false; component.push(w); if (w === v) break; }
+        components.push(component);
+      }
+    };
+    for (let v = 0; v < n; v++) if (index[v] < 0) visit(v);
+
+    let candidate = null;
+    for (const component of components) {
+      if (component.length === 1 && !succ[component[0]].includes(component[0])) continue;
+      const inside = new Set(component), entries = [];
+      for (const node of component) {
+        let externalPreds = node === entry ? 1 : 0;
+        for (let pred = 0; pred < n; pred++) if (!inside.has(pred) && succ[pred].includes(node)) externalPreds++;
+        if (externalPreds) entries.push({ node, externalPreds });
+      }
+      if (entries.length > 1) { candidate = { component, inside, entries }; break; }
+    }
+    if (!candidate) return round ? { terms, origins } : null;
+    const primary = candidate.entries.find((item) => item.node === entry)
+      || candidate.entries.slice().sort((a, b) => b.externalPreds - a.externalPreds)[0];
+    const secondary = candidate.entries.find((item) => item !== primary);
+    const cloneOf = new Map();
+    for (const node of candidate.component) {
+      cloneOf.set(node, terms.length);
+      terms.push(null);
+      origins.push(origins[node]);
+    }
+    for (const node of candidate.component) {
+      terms[cloneOf.get(node)] = remapTermTargets(terms[node], (target) =>
+        candidate.inside.has(target) ? cloneOf.get(target) : target);
+    }
+    for (let pred = 0; pred < n; pred++) {
+      if (candidate.inside.has(pred)) continue;
+      terms[pred] = remapTermTargets(terms[pred], (target) =>
+        target === secondary.node ? cloneOf.get(target) : target);
+    }
+  }
+  return { terms, origins };
 }
 
 /** Apply a target remapper to a terminator, returning a fresh terminator with
@@ -284,6 +440,10 @@ function remapTreeBlocks(node, f) {
         type: c.type, varName: c.varName, carrierName: c.carrierName, body: remapTreeBlocks(c.body, f),
       })),
     };
+    case 'synchronized': return {
+      t: 'synchronized', lockLocal: node.lockLocal, lockPc: node.lockPc,
+      body: remapTreeBlocks(node.body, f),
+    };
     default: return node;
   }
 }
@@ -293,7 +453,7 @@ function remapTreeBlocks(node, f) {
  * pre-built try node and whose single successor is the join. Region-internal
  * blocks are removed; the method CFG is re-indexed 0..k-1.
  */
-function collapseRegion(work, regionSet, tryEntryLocal, mergeLocal, superOrigId, superStartPc) {
+function collapseRegion(work, regionSet, superOrigId, superStartPc, exits, ctx) {
   const kept = [];
   for (let i = 0; i < work.ids.length; i++) if (!regionSet.has(i)) kept.push(i);
   const supLocal = kept.length; // super-block goes last
@@ -308,7 +468,32 @@ function collapseRegion(work, regionSet, tryEntryLocal, mergeLocal, superOrigId,
   startPc.push(superStartPc);
 
   const term = kept.map((i) => remapTermTargets(work.term[i], (t) => (t == null ? null : newOf(t))));
-  term.push(mergeLocal == null ? { kind: 'return' } : { kind: 'goto', target: newOf(mergeLocal) });
+
+  // The super-block renders the collapsed try/synchronized node (via
+  // substituteSupers) and then transfers to the region's exit(s):
+  //   - 0 exits: the region always returns/throws — the super-block returns.
+  //   - 1 exit: a plain goto to the join.
+  //   - k exits: a chain of k-1 synthetic `if (sel == j) goto E_j` dispatch
+  //     blocks; the region body set `sel` before leaving. These render via the
+  //     synthetic-cond map so the outer structurer sees a normal if/else chain.
+  if (exits.length === 0) {
+    term.push({ kind: 'return' });
+  } else if (exits.length === 1) {
+    term.push({ kind: 'goto', target: newOf(exits[0].external) });
+  } else {
+    const dispatchBase = supLocal + 1;
+    term.push({ kind: 'goto', target: dispatchBase });
+    for (let j = 0; j < exits.length - 1; j++) {
+      const fall = j === exits.length - 2
+        ? newOf(exits[exits.length - 1].external)
+        : dispatchBase + j + 1;
+      term.push({ kind: 'cond', taken: newOf(exits[j].external), fall });
+      const dispatchId = ctx.allocId();
+      ids.push(dispatchId);
+      startPc.push(superStartPc); // co-located with the region for enclosing-range membership
+      ctx.synthetic.set(dispatchId, { cond: `${exits.selectorName} == ${exits[j].index}` });
+    }
+  }
 
   const entry = regionSet.has(work.entry) ? supLocal : kept.indexOf(work.entry);
   return { ids, entry, term, startPc };
@@ -383,19 +568,31 @@ function reachableFrom(cfg) {
 
 /** Build the pluggable render for a method's blocks, keyed by original id. */
 function makeRender(codeItems, origBlocks) {
-  const codeLines = (origId) => {
-    const b = origBlocks[origId];
-    if (!b) return []; // synthetic empty exit / super-block placeholder
-    const lines = [];
-    for (let k = 0; k < b.insns.length; k++) {
-      const op = insnOp(codeItems[b.insns[k]]);
-      const isLast = k === b.insns.length - 1;
-      if (isLast && CONTROL_TRANSFER.has(op)) continue; // consumed by structuring
-      lines.push(`${op};`);
-    }
-    return lines;
+  const render = {
+    straight: (origId) => {
+      const syn = render.synthetic && render.synthetic.get(origId);
+      if (syn && syn.straight) return syn.straight;
+      const b = origBlocks[origId];
+      if (!b) return []; // synthetic empty exit / super-block placeholder
+      const lines = [];
+      for (let k = 0; k < b.insns.length; k++) {
+        const op = insnOp(codeItems[b.insns[k]]);
+        const isLast = k === b.insns.length - 1;
+        if (isLast && CONTROL_TRANSFER.has(op)) continue; // consumed by structuring
+        lines.push(`${op};`);
+      }
+      return lines;
+    },
+    cond: (id) => {
+      const syn = render.synthetic && render.synthetic.get(id);
+      if (syn && syn.cond) return syn.cond;
+      return `c${id}`;
+    },
+    switchValue: (id) => `sel${id}`,
+    syncLock: (local) => `lv${local}`,
+    synthetic: null,
   };
-  return { straight: codeLines, cond: (id) => `c${id}`, switchValue: (id) => `sel${id}` };
+  return render;
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +622,10 @@ function substituteSupers(node, overrides) {
         type: c.type, varName: c.varName, carrierName: c.carrierName, body: substituteSupers(c.body, overrides),
       })),
     };
+    case 'synchronized': return {
+      t: 'synchronized', lockLocal: node.lockLocal, lockPc: node.lockPc,
+      body: substituteSupers(node.body, overrides),
+    };
     default: return node;
   }
 }
@@ -439,18 +640,29 @@ function substituteSupers(node, overrides) {
  * (render is the block printer for `printTree`), or `{ ok:false, reason }` when
  * the method is outside v1's scope and the caller should fall back.
  */
-function structureMethod(codeItems, exceptionTable) {
-  const res = structureMethodImpl(codeItems, exceptionTable);
+function structureMethod(codeItems, exceptionTable, opts = {}) {
+  const res = structureMethodImpl(codeItems, exceptionTable, opts);
   // Trees composed from several independent structure() calls (a try body nested
   // in the method) can reuse the same L<blockId> label at different nesting
   // depths, which is a Java compile error. Rename to globally-unique labels
   // while preserving nearest-match break/continue resolution.
-  if (res && res.ok && res.tree) uniquifyLabels(res.tree);
+  if (res && res.ok && res.tree) { uniquifyLabels(res.tree); uniquifyCatchParameters(res.tree); }
   return res;
 }
 
-function structureMethodImpl(codeItems, exceptionTable) {
-  const methodCfg = buildCfgFromCode(codeItems);
+function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
+  // Force block leaders at every exception-region boundary pc so a try/handler
+  // body always begins on a block boundary. Without this, a try `start_pc` that
+  // is not a branch target sits mid-block and processGroup bails with "try start
+  // does not land on a block boundary", degrading the whole method to the
+  // comment-dropping state-machine fallback.
+  const boundaryPcs = [];
+  for (const e of (exceptionTable || [])) {
+    if (e.start_pc != null) boundaryPcs.push(e.start_pc);
+    if (e.end_pc != null) boundaryPcs.push(e.end_pc);
+    if (e.handler_pc != null) boundaryPcs.push(e.handler_pc);
+  }
+  const methodCfg = buildCfgFromCode(codeItems, [], boundaryPcs);
   if (!methodCfg) return { ok: true, tree: { t: 'seq', body: [] }, render: makeRender(codeItems, []) };
   const origBlocks = methodCfg.blocks;
   const render = makeRender(codeItems, origBlocks);
@@ -467,15 +679,15 @@ function structureMethodImpl(codeItems, exceptionTable) {
   }
 
   try {
-    return structureWithExceptions(codeItems, exceptionTable, methodCfg, render);
+    return structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts);
   } catch (err) {
     if (err instanceof IrreducibleError) return { ok: false, reason: `irreducible: ${err.message}` };
     return { ok: false, reason: `internal: ${err.message}` };
   }
 }
 
-function structureWithExceptions(codeItems, exceptionTable, methodCfg, render) {
-  const { groups } = normalizeTable(exceptionTable);
+function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts = {}) {
+  const { groups } = normalizeTable(exceptionTable, opts.syncHandlers || null);
   if (groups.length === 0) {
     const { tree } = structure(methodCfg);
     return { ok: true, tree, render };
@@ -526,6 +738,38 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render) {
   const emptyId = allocId();
   overrides.set(emptyId, { t: 'seq', body: [] }); // region normal-completion exit
 
+  // Synthetic-block render text (straight lines / cond expression) for the
+  // selector sinks and dispatch blocks a multi-exit region introduces. The base
+  // structurer has no bytecode for these ids; the caller's render composes this
+  // map over its own so the selector assignments and `sel == j` tests print.
+  const synthetic = new Map();
+  render.synthetic = synthetic; // exposed for the exceptionStructurer's own printTree
+  const selectorDecls = [];
+  let nextSelector = 0;
+  const allocSelector = () => {
+    const name = `decompiledRegionSelector${nextSelector++}`;
+    selectorDecls.push(name);
+    return name;
+  };
+
+  // Every handler entry pc across the whole table. A block can be reachable only
+  // through a *different* group's catch handler that has not collapsed yet (e.g.
+  // code after a try/catch whose try body always returns — reachable solely via
+  // the catch's fall-through). Per-group reachability would wrongly call such a
+  // block dead and empty its try body; method-wide handler liveness fixes that.
+  const allHandlerPcs = new Set();
+  for (const g of groups) for (const c of g.catches) allHandlerPcs.add(c.handler_pc);
+
+  // True when a working-CFG block provably cannot raise a catchable exception.
+  // Synthetic super-blocks (collapsed inner try/catch) are conservatively
+  // treated as throwing.
+  const isNoThrowBlock = (w, local) => {
+    const b = origBlocks[w.ids[local]];
+    if (!b) return false;
+    for (const ii of b.insns) if (canThrow(insnOp(codeItems[ii]))) return false;
+    return true;
+  };
+
   // Innermost first: smallest protected range, then earliest start. Collapsing a
   // nested group turns it into a super-block that the enclosing group then picks
   // up by start pc, so nesting falls out naturally.
@@ -533,7 +777,11 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render) {
     (a.end_pc - a.start_pc) - (b.end_pc - b.start_pc) || a.start_pc - b.start_pc);
 
   for (const g of ordered) {
-    const bail = processGroup(work, g, { overrides, allocId, emptyId }, (w) => { work = w; });
+    const bail = processGroup(work, g, {
+      overrides, allocId, emptyId, isNoThrowBlock, allHandlerPcs,
+      synthetic, allocSelector,
+      syncHandlers: opts.syncHandlers || null,
+    }, (w) => { work = w; });
     if (bail instanceof Bail) return { ok: false, reason: bail.reason };
   }
 
@@ -547,7 +795,7 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render) {
   // Names carried in `work.ids` are original/synthetic ids already.
   let tree = remapTreeBlocks(res.tree, (localId) => work.ids[localId]);
   tree = substituteSupers(tree, overrides);
-  return { ok: true, tree, render };
+  return { ok: true, tree, render, synthetic, selectorDecls };
 }
 
 /** Carve and collapse one try group in `work`. On success calls `commit(work')`
@@ -561,7 +809,7 @@ function processGroup(work, group, ctx, commit) {
   };
 
   // Boundaries must land on block leaders: the try entry and each handler entry.
-  const tryEntry = localOfStartPc(group.start_pc);
+  let tryEntry = localOfStartPc(group.start_pc);
   if (tryEntry < 0) return new Bail('try start does not land on a block boundary');
   const handlerLocals = [];
   for (const c of group.catches) {
@@ -570,16 +818,99 @@ function processGroup(work, group, ctx, commit) {
     handlerLocals.push(h);
   }
 
-  // TRY = blocks whose start offset falls inside any of the group's protected
-  // ranges (one after same-target row merging is the common case; several when
-  // the compiler split one logical try body across table rows).
+  // Liveness over normal edges from the method entry AND every handler entry in
+  // the whole table (handlers not yet collapsed still carry live code, e.g. the
+  // block after a try/catch reachable only via the catch's fall-through).
+  // Obfuscators leave dead blocks that fall into live regions; counting their
+  // edges fabricates spurious region entries/exits, so we ignore dead blocks.
+  const liveRoots = [work.entry];
+  for (const pc of (ctx.allHandlerPcs || [])) {
+    const h = localOfStartPc(pc);
+    if (h >= 0) liveRoots.push(h);
+  }
+  const reachable = livenessFrom(work, liveRoots);
+
+  // Handler-region dominators need every live exception entry as a root, not
+  // only this group's entries. A continuation shared by a nested try and catch
+  // is also reachable through the enclosing handler entry; rooting only the
+  // nested catch falsely makes that catch dominate the continuation and folds
+  // ordinary post-catch code into its body.
+  const dominatorRoots = [work.entry];
+  for (const pc of (ctx.allHandlerPcs || [])) {
+    const h = localOfStartPc(pc);
+    if (h >= 0) dominatorRoots.push(h);
+  }
+  const { idom } = dominatorsFromRoots(work, dominatorRoots);
+  const reachableFromCurrentHandlers = livenessFrom(work, handlerLocals);
+
+  // TRY = reachable blocks whose start offset falls inside any of the group's
+  // protected ranges (one after same-target row merging is the common case;
+  // several when the compiler split one logical try body across table rows).
+  // Overlapping table rows can place a catch handler numerically inside another
+  // protected range in the same logical group. Such a block is still handler
+  // code: handler-entry dominance, not bytecode offset alone, distinguishes it.
   const tryset = new Set();
-  for (let i = 0; i < n; i++) if (inLogicalTryRange(work.startPc[i], group)) tryset.add(i);
+  for (let i = 0; i < n; i++) {
+    const reachedByCurrentHandler = i !== tryEntry && reachableFromCurrentHandlers[i];
+    if (reachable[i] && !reachedByCurrentHandler && inLogicalTryRange(work.startPc[i], group)) tryset.add(i);
+  }
   if (!tryset.has(tryEntry)) return new Bail('try entry is outside its own range');
+
+  // A protected range may start with stack-only glue that cannot throw, and an
+  // obfuscated branch may enter midway through that glue with equivalent stack
+  // operands already prepared. Java cannot spell a try entry in the middle of
+  // an expression, but moving the source-level try start forward across blocks
+  // that provably cannot throw preserves exception behavior exactly.
+  let hasMidTryEntry = false;
+  for (let block = 0; block < n && !hasMidTryEntry; block++) {
+    if (!reachable[block] || tryset.has(block)) continue;
+    for (const target of succOfTerm(work.term[block])) {
+      if (target != null && tryset.has(target) && target !== tryEntry) { hasMidTryEntry = true; break; }
+    }
+  }
+  const throwingTryBlocks = hasMidTryEntry
+    ? [...tryset].filter((block) => !ctx.isNoThrowBlock(work, block)) : [];
+  if (throwingTryBlocks.length) {
+    const firstThrowingPc = Math.min(...throwingTryBlocks.map((block) => work.startPc[block]));
+    const firstThrowing = localOfStartPc(firstThrowingPc);
+    if (firstThrowing >= 0 && firstThrowing !== tryEntry) {
+      for (const block of [...tryset]) {
+        if (work.startPc[block] < firstThrowingPc && ctx.isNoThrowBlock(work, block)) tryset.delete(block);
+      }
+      tryEntry = firstThrowing;
+    }
+  }
+
+  // Extend the try body over trailing no-throw glue. javac ends the protected
+  // range just before the `goto merge` that carries the try body's normal
+  // completion, so that jump block sits outside the region and would count as a
+  // spurious second external exit. A block that cannot throw, is entered only
+  // from the try body, and merely transfers control (goto/fall terminator)
+  // behaves identically inside or outside the protected range — pull it in.
+  {
+    const preds = Array.from({ length: n }, () => []);
+    for (let b = 0; b < n; b++) {
+      if (!reachable[b]) continue;
+      for (const t of succOfTerm(work.term[b])) if (t != null) preds[t].push(b);
+    }
+    const handlerSet = new Set(handlerLocals);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let b = 0; b < n; b++) {
+        if (tryset.has(b) || handlerSet.has(b) || !reachable[b]) continue;
+        if (!preds[b].length || !preds[b].every((p) => tryset.has(p))) continue;
+        const k = work.term[b].kind;
+        if (k !== 'goto' && k !== 'fall') continue;
+        if (!ctx.isNoThrowBlock(work, b)) continue;
+        tryset.add(b);
+        changed = true;
+      }
+    }
+  }
 
   // Handler regions: blocks a handler entry dominates (synthetic root over the
   // method entry + all handler entries), minus the try body.
-  const { idom, reachable } = dominatorsFromRoots(work, [work.entry, ...handlerLocals]);
   const handlerSets = [];
   const inSomeHandler = new Set();
   for (const h of handlerLocals) {
@@ -592,44 +923,82 @@ function processGroup(work, group, ctx, commit) {
         hs.add(b);
       }
     }
-    if (!hs.has(h)) return new Bail('handler entry unreachable / not self-dominating');
+    if (!hs.has(h)) {
+      return new Bail('handler entry unreachable / not self-dominating');
+    }
     handlerSets.push(hs);
   }
 
-  // Whole region and its single external exit (the merge/join).
+  // Whole region and its external exits (the joins reached from inside). A
+  // region may leave to several distinct blocks (a synchronized body in a loop
+  // that both `continue`s and falls through); each becomes a selector-dispatched
+  // exit rather than a bail.
   const region = new Set([...tryset, ...inSomeHandler]);
   const externals = new Set();
   for (const b of region) for (const t of succOfTerm(work.term[b])) if (t != null && !region.has(t)) externals.add(t);
-  if (externals.size > 1) return new Bail('try/catch has more than one external exit');
-  const mergeLocal = externals.size === 1 ? [...externals][0] : null;
+  const externalsList = [...externals];
 
   // Only the try entry may be targeted from outside the region.
   for (let b = 0; b < n; b++) {
-    if (region.has(b)) continue;
+    if (region.has(b) || !reachable[b]) continue;
     for (const t of succOfTerm(work.term[b])) if (t != null && region.has(t) && t !== tryEntry) {
       return new Bail(`region entered other than at its try/handler entry: ${work.startPc[b]} -> ${work.startPc[t]} (entry ${group.start_pc})`);
     }
   }
 
-  // Structure the try body and each handler as exit-to-merge sub-regions.
-  const tryTree = structureRegion(work, tryset, tryEntry, mergeLocal, ctx);
-  if (tryTree instanceof Bail) return tryTree;
-  const catches = [];
-  for (let ci = 0; ci < group.catches.length; ci++) {
-    const hTree = structureRegion(work, handlerSets[ci], handlerLocals[ci], mergeLocal, ctx);
-    if (hTree instanceof Bail) return hTree;
-    catches.push({
-      type: renderCatchType(group.catches[ci].catch_type),
-      varName: 'decompiledCaughtParameter',
-      carrierName: 'decompiledCaughtException',
-      body: hTree,
+  // Map each external exit to the render id its sink block uses. One exit (or
+  // none) keeps the old single-join shape (empty sink). Several exits allocate a
+  // selector variable; each sink assigns `selector = <index>` and the collapsed
+  // super-block dispatches on it.
+  const superId = ctx.allocId();
+  const externalToRenderId = new Map();
+  let exits;
+  if (externalsList.length <= 1) {
+    for (const ext of externalsList) externalToRenderId.set(ext, ctx.emptyId);
+    exits = externalsList.map((ext) => ({ external: ext, index: 0 }));
+  } else {
+    const selectorName = ctx.allocSelector();
+    externalsList.forEach((ext, i) => {
+      const rid = ctx.allocId();
+      ctx.synthetic.set(rid, { straight: [`${selectorName} = ${i};`] });
+      externalToRenderId.set(ext, rid);
     });
+    exits = externalsList.map((ext, i) => ({ external: ext, index: i }));
+    exits.selectorName = selectorName;
   }
 
-  const tryNode = { t: 'try', body: tryTree, catches };
-  const superId = ctx.allocId();
+  // Structure the try body and each handler as sub-regions that exit to the
+  // enumerated sinks.
+  const tryTree = structureRegion(work, tryset, tryEntry, externalToRenderId, ctx);
+  if (tryTree instanceof Bail) return tryTree;
+
+  // A group whose sole catch-all handler is the lowered monitorexit+rethrow
+  // idiom (see cfr.js lowerSynchronizedRegions) is a `synchronized` block, not a
+  // try/catch: the body becomes `synchronized (lock) { ... }` and the handler —
+  // pure lock-release plumbing the Java construct reintroduces implicitly — is
+  // carved away with the region and never rendered.
+  const sync = group.catches.length === 1 && ctx.syncHandlers
+    ? ctx.syncHandlers.get(group.catches[0].handler_pc)
+    : null;
+  let tryNode;
+  if (sync) {
+    tryNode = { t: 'synchronized', lockLocal: sync.lockLocal, lockPc: sync.lockPc, body: tryTree };
+  } else {
+    const catches = [];
+    for (let ci = 0; ci < group.catches.length; ci++) {
+      const hTree = structureRegion(work, handlerSets[ci], handlerLocals[ci], externalToRenderId, ctx);
+      if (hTree instanceof Bail) return hTree;
+      catches.push({
+        type: renderCatchType(group.catches[ci].catch_type),
+        varName: 'decompiledCaughtParameter',
+        carrierName: 'decompiledCaughtException',
+        body: hTree,
+      });
+    }
+    tryNode = { t: 'try', body: tryTree, catches };
+  }
   ctx.overrides.set(superId, tryNode);
-  commit(collapseRegion(work, region, tryEntry, mergeLocal, superId, group.start_pc));
+  commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
   return undefined;
 }
 
