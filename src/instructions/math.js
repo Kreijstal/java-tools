@@ -57,7 +57,10 @@ module.exports = {
   iushr: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 >>> value2);
+    // JS `>>>` yields an UNSIGNED 32-bit value; Java iushr is signed. `| 0`
+    // maps it back to signed int32 (e.g. -1 >>> 0 must stay -1, not 2^32-1),
+    // which matters once the result reaches i2l / comparisons / array indices.
+    frame.stack.push((value1 >>> value2) | 0);
   },
   iand: (frame) => {
     const value2 = frame.stack.pop();

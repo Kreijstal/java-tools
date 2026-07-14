@@ -120,6 +120,29 @@ module.exports = {
       }
     }, ['java/io/IOException']),
     
+    'write([B)V': withThrows(async (jvm, obj, args) => {
+      const arr = args[0] || [];
+      return module.exports.methods['write([BII)V'](jvm, obj, [arr, 0, arr.length]);
+    }, ['java/io/IOException']),
+
+    'write([BII)V': withThrows(async (jvm, obj, args) => {
+      const arr = args[0] || [];
+      const off = args[1] | 0;
+      const len = args[2] | 0;
+      if (!obj.fileHandle) {
+        jvm.throwException('java/io/IOException', 'File not open');
+        return;
+      }
+      try {
+        const buffer = Buffer.alloc(len);
+        for (let i = 0; i < len; i++) buffer[i] = arr[off + i] & 0xff;
+        await obj.fileHandle.write(buffer, 0, len, obj.position);
+        obj.position += len;
+      } catch (e) {
+        jvm.throwException('java/io/IOException', 'Write failed');
+      }
+    }, ['java/io/IOException']),
+
     'seek(J)V': withThrows((jvm, obj, args) => {
       const pos = args[0];
       if (pos < 0) {
