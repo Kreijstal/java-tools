@@ -1,3 +1,6 @@
+// Java long semantics: wrap every result to a signed 64-bit value.
+const toLong = (v) => BigInt.asIntN(64, v);
+
 module.exports = {
   iadd: (frame) => {
     const value2 = frame.stack.pop();
@@ -69,17 +72,17 @@ module.exports = {
   ladd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) + BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) + BigInt(value2)));
   },
   lsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) - BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) - BigInt(value2)));
   },
   lmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) * BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) * BigInt(value2)));
   },
   ldiv: (frame) => {
     const value2 = frame.stack.pop();
@@ -87,7 +90,7 @@ module.exports = {
     if (value2 === 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
-    frame.stack.push(BigInt(value1) / BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) / BigInt(value2)));
   },
   lrem: (frame) => {
     const value2 = frame.stack.pop();
@@ -95,49 +98,44 @@ module.exports = {
     if (value2 === 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
-    frame.stack.push(BigInt(value1) % BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) % BigInt(value2)));
   },
   lshl: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) << BigInt(value2));
+    // Shift distance uses only the low 6 bits (JVM spec).
+    frame.stack.push(toLong(BigInt(value1) << (BigInt(value2) & 63n)));
   },
   lshr: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) >> BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) >> (BigInt(value2) & 63n)));
   },
   lushr: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    const shift = BigInt(value2);
-    if (value1 >= 0) {
-      frame.stack.push(BigInt(value1) >> shift);
-      return;
-    }
-    // For negative BigInts, we simulate the unsigned shift.
-    const sixtyFour = BigInt(64);
-    const result = (BigInt(value1) >> shift) + ((BigInt(1) << sixtyFour) >> shift);
-    frame.stack.push(result);
+    const shift = BigInt(value2) & 63n;
+    const unsigned = BigInt.asUintN(64, BigInt(value1));
+    frame.stack.push(toLong(unsigned >> shift));
   },
   land: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) & BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) & BigInt(value2)));
   },
   lor: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) | BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) | BigInt(value2)));
   },
   lxor: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) ^ BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) ^ BigInt(value2)));
   },
   lneg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(-BigInt(value));
+    frame.stack.push(toLong(-BigInt(value)));
   },
   fadd: (frame) => {
     const value2 = frame.stack.pop();

@@ -40,7 +40,9 @@ const JVM_OUTPUT_EXPECTATIONS = Object.freeze({
   MethodInvocationValidationTest: 'Testing method invocation validation\nStatic method result: 8\nInstance method result: 15\nAll validations passed',
   MathInstructions: 'Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333332538604736\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804',
   ConversionTest: '10',
-  LongArithmeticTest: '8000000000\n2000000000\n15000000000000000000\n1',
+  // 5000000000 * 3000000000 overflows int64; real Java wraps (verified
+  // against OpenJDK): -3446744073709551616.
+  LongArithmeticTest: '8000000000\n2000000000\n-3446744073709551616\n1',
   LongBitwiseTest: '8\n14\n6\n-40\n-3\n4611686018427387901',
   InvokeVirtualTest: 'Hello World\nTest completed',
   ObjectCreationTest: 'Testing object creation...\nCreated object with value: 42\nUpdated value: 100\nSecond object value: 200',

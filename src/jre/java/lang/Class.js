@@ -464,7 +464,8 @@ module.exports = {
     'newInstance()Ljava/lang/Object;': async (jvm, classObj, args, thread) => {
       const classData = classObj._classData;
       const className = classData.ast.classes[0].className;
-      const newObj = await jvm.createAppletInstance(className);
+      const t0 = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+      const newObj = await jvm.createAppletInstance(className, t0);
       const constructor = jvm.findMethod(jvm.classes[className], '<init>', '()V');
       if (constructor) {
         const Frame = require('../../../core/frame');

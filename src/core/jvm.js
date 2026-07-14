@@ -512,9 +512,9 @@ class JVM {
     return this.executeAppletLifecycle(className, mainThread, appletObj);
   }
 
-  async createAppletInstance(className) {
+  async createAppletInstance(className, threadOverride = null) {
     // Ensure class is loaded
-    const thread = this.threads[0];
+    const thread = threadOverride || this.threads[0];
     let wasFramePushed = await this.initializeClassIfNeeded(className, thread);
     while (wasFramePushed) {
       const originalStackSize = thread.callStack.size();
@@ -853,6 +853,28 @@ class JVM {
       ) {
         t.status = "runnable";
       }
+      if (t.status === "WAITING" && t.waitDeadline && Date.now() >= t.waitDeadline) {
+        // Timed wait expired: leave the wait set and re-acquire the monitor.
+        const monitor = t.waitingOn;
+        if (monitor && Array.isArray(monitor.waitSet)) {
+          const idx = monitor.waitSet.indexOf(t);
+          if (idx >= 0) monitor.waitSet.splice(idx, 1);
+        }
+        t.status = "WAIT_REACQUIRE";
+        t.blockingOn = monitor;
+        delete t.waitingOn;
+        delete t.waitDeadline;
+      }
+      if (t.status === "WAIT_REACQUIRE" && t.blockingOn && !t.blockingOn.isLocked) {
+        // Execution resumes AFTER the wait call, so acquire on the thread's
+        // behalf (monitorenter will not run again).
+        t.blockingOn.isLocked = true;
+        t.blockingOn.lockOwner = t.id;
+        t.blockingOn.lockCount = t.waitLockCount || 1;
+        delete t.blockingOn;
+        delete t.waitLockCount;
+        t.status = "runnable";
+      }
     }
 
     if (this.threads.every((t) => t.status === "terminated")) {
@@ -1003,6 +1025,26 @@ class JVM {
     return false;
   }
 
+  // Write headless software canvases (component._pixels painted by the JRE
+  // Graphics fallback) as PNGs into JVM_FRAME_DIR. No-op outside Node.
+  dumpSoftCanvases() {
+    if (typeof process === 'undefined' || !process.env || !process.env.JVM_FRAME_DIR) return;
+    if (!this._softCanvases || !this._softCanvases.size) return;
+    try {
+      const { encodePng } = require('../io/pngEncoder');
+      fs.mkdirSync(process.env.JVM_FRAME_DIR, { recursive: true });
+      let i = 0;
+      for (const comp of this._softCanvases) {
+        if (!comp._pixels) continue;
+        const file = path.join(process.env.JVM_FRAME_DIR, `canvas-${i++}.png`);
+        fs.writeFileSync(file, encodePng(comp._pixels, comp._pixelsWidth, comp._pixelsHeight));
+        console.error(`soft canvas written: ${file} (${comp._pixelsWidth}x${comp._pixelsHeight})`);
+      }
+    } catch (e) {
+      console.error(`soft canvas dump failed: ${e.message}`);
+    }
+  }
+
   async executeInstruction(instruction, frame, thread) {
     if (typeof process !== 'undefined' && process.env && process.env.JVM_TRACE) {
       if (!thread._trace) thread._trace = [];
@@ -1018,8 +1060,14 @@ class JVM {
           console.error(`--- JVM_TRACE_EXIT after ${this._traceCount} instructions ---`);
           for (const t of this.threads) {
             console.error(`thread ${t.id} (${t.name}) status=${t.status} frames=${t.callStack ? t.callStack.size() : '?'}`);
+            const items = t.callStack && t.callStack.items ? t.callStack.items : [];
+            for (let i = items.length - 1; i >= 0; i--) {
+              const fm = items[i].method || {};
+              console.error(`    at ${items[i].className}.${fm.name}${fm.descriptor} pc=${items[i].pc}`);
+            }
             if (t._trace) console.error(t._trace.slice(-40).join('\n'));
           }
+          this.dumpSoftCanvases();
           process.exit(3);
         }
       }

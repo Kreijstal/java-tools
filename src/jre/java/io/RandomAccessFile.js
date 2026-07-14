@@ -132,14 +132,14 @@ module.exports = {
     'length()J': withThrows(async (jvm, obj, args) => {
       if (!obj.fileHandle) {
         jvm.throwException('java/io/IOException', 'File not open');
-        return 0;
+        return BigInt(0);
       }
       
       try {
         const stats = await obj.fileHandle.stat();
-        return stats.size;
+        return BigInt(stats.size);
       } catch (e) {
-        return 0;
+        return BigInt(0);
       }
     }, ['java/io/IOException']),
     

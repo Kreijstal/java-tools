@@ -3,6 +3,31 @@ const { parseDescriptor } = require('../../../../parsing/typeParser');
 const { ASYNC_METHOD_SENTINEL } = require('../../../../core/constants');
 const { withThrows } = require('../../../helpers');
 
+// Method.invoke must return boxed objects for primitive-returning methods;
+// callers checkcast to the wrapper type (e.g. (Long) m.invoke(...)).
+function box(type, value, toStr) {
+  const obj = { type, value };
+  obj.toString = toStr || function () { return String(this.value); };
+  return obj;
+}
+
+function boxReflectiveReturn(descriptor, value) {
+  if (value === null || value === undefined) return null;
+  const retType = descriptor.slice(descriptor.indexOf(')') + 1);
+  switch (retType) {
+    case 'V': return null;
+    case 'J': return box('java/lang/Long', typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value))));
+    case 'I': return box('java/lang/Integer', Number(value) | 0);
+    case 'S': return box('java/lang/Short', Number(value) | 0);
+    case 'B': return box('java/lang/Byte', Number(value) | 0);
+    case 'C': return box('java/lang/Character', Number(value) | 0, function () { return String.fromCharCode(this.value); });
+    case 'Z': return box('java/lang/Boolean', !!Number(value), function () { return this.value ? 'true' : 'false'; });
+    case 'F': return box('java/lang/Float', Number(value));
+    case 'D': return box('java/lang/Double', Number(value));
+    default: return value;
+  }
+}
+
 const MODIFIERS = {
   PUBLIC: 0x00000001,
   PRIVATE: 0x00000002,
@@ -71,8 +96,8 @@ module.exports = {
       if (classNameForLookup) {
         const jreMethod = jvm._jreFindMethod(classNameForLookup, name, descriptor);
         if (jreMethod) {
-          const result = jreMethod(jvm, obj, methodArgs, jvm.threads[jvm.currentThreadIndex]);
-          return result;
+          const result = await jreMethod(jvm, obj, methodArgs, jvm.threads[jvm.currentThreadIndex]);
+          return boxReflectiveReturn(descriptor, result);
         }
       }
 
@@ -106,7 +131,7 @@ module.exports = {
       thread.isAwaitingReflectiveCall = true;
       thread.reflectiveCallResolver = async (ret) => {
         const finalRet = await ret;
-        callingFrame.stack.push(finalRet);
+        callingFrame.stack.push(boxReflectiveReturn(descriptor, finalRet));
       };
       thread.callStack.push(newFrame);
 

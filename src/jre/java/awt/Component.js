@@ -41,18 +41,23 @@ module.exports = {
 
     'getGraphics()Ljava/awt/Graphics;': (jvm, obj, args) => {
       if (obj._awtGraphics) {
-        return { type: 'java/awt/Graphics', _awtGraphics: obj._awtGraphics };
+        return { type: 'java/awt/Graphics', _awtGraphics: obj._awtGraphics, _component: obj };
       }
       if (obj._awtComponent && typeof obj._awtComponent.getGraphics === 'function') {
-        return { type: 'java/awt/Graphics', _awtGraphics: obj._awtComponent.getGraphics() };
+        const g = obj._awtComponent.getGraphics();
+        if (g) {
+          return { type: 'java/awt/Graphics', _awtGraphics: g, _component: obj };
+        }
       }
       if (obj._canvasElement && typeof obj._canvasElement.getContext === 'function') {
         const context = obj._canvasElement.getContext('2d');
         if (context) {
-          return { type: 'java/awt/Graphics', _awtGraphics: new awtFramework.CanvasGraphics(context) };
+          return { type: 'java/awt/Graphics', _awtGraphics: new awtFramework.CanvasGraphics(context), _component: obj };
         }
       }
-      return null;
+      // Headless: hand out a context-less Graphics tied to the component so
+      // raster blits (drawImage of a BufferedImage framebuffer) still land.
+      return { type: 'java/awt/Graphics', _component: obj };
     },
     
     'paint(Ljava/awt/Graphics;)V': (jvm, obj, args) => {
@@ -147,6 +152,23 @@ module.exports = {
     'isVisible()Z': (jvm, obj, args) => {
       return obj._visible;
     },
+
+    'requestFocus()V': (jvm, obj, args) => {
+      obj._focused = true;
+    },
+
+    'requestFocusInWindow()Z': (jvm, obj, args) => {
+      obj._focused = true;
+      return 1;
+    },
+
+    'hasFocus()Z': (jvm, obj, args) => {
+      return obj._focused ? 1 : 0;
+    },
+
+    'isDisplayable()Z': (jvm, obj, args) => 1,
+
+    'isShowing()Z': (jvm, obj, args) => (obj._visible === false ? 0 : 1),
     
     'setLocation(II)V': (jvm, obj, args) => {
       obj._x = args[0];
