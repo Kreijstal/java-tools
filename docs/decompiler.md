@@ -242,39 +242,6 @@ real output is deferred future work ("exception-boundary block split").
 
 ## Tests
 
-## Full game-corpus compile audit (2026-07-13)
-
-The final acceptance gate decompiled every transformed class from all 44 games
-with this JavaScript decompiler and compiled each whole-game source set with
-`javac -source 7 -target 7` against the Deko Bloko stubs. The audit required all
-of the following for every game:
-
-- raw and verifier-safe transformed class counts match;
-- the decompiler exits successfully and emits one Java source per class;
-- whole-game `javac` exits successfully;
-- emitted class count matches emitted source count;
-- the compiler diagnostic category histogram contains zero errors.
-
-Result: **44/44 games pass with zero javac errors**. The shared CFR-JS fixture
-suite also passes **94/94**. Final focused regressions include 36 Card Trick
-(295/295), Arcanists Multi (363/363), Hostile Spawn: Vengeance (335/335),
-Kickabout (543/543), Tetralink (355/355), Tomb Racer (1090/1090), Vertigo 2
-(437/437), and Void Hunters (1570/1570).
-
-Errors found during the campaign were grouped by compiler category before being
-fixed. The final generic fixes cover reference/array typing, imports derived
-from descriptor provenance, constructor and exception flow, unreachable
-terminal tails, invalid non-void fallthrough, large integer dispatchers, and CFG
-state-machine rendering. No game-name or game-specific source rewrite is used.
-
-The authoritative corpus runner and expected baseline live in the companion
-`dekobloko-work` repository:
-
-```bash
-JAVA_TOOLS_DIR=/home/kreijstal/git/java-tools \
-  ./scripts/decompile-all-games.sh .work/games
-```
-
 - `test/structurer.test.js` — loops, diamonds, switches, nested loops, merge
   blocks, irreducibility rejection.
 - `test/regionSplit.test.js` — irreducibility removal, gates, clone identity.

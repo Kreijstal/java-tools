@@ -12,7 +12,7 @@ L4:     return
     .end code
 .end method
 
-; Reduced model of the Dekobloko qc.b(IZ)Z "v1 == null" cluster.
+; Reduced model of an irreducible multi-entry null-check loop.
 ;
 ; Shape:
 ;   - Several different predecessor branches enter cloned loop preheaders.

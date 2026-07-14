@@ -16,7 +16,7 @@ L4:     return
     .end code
 .end method
 
-; Mimics the dekobloko obfuscator's per-method shape:
+; Models a common opaque static-flag guard shape:
 ;   - getstatic FLAG; istore N    at method entry
 ;   - iload N; ifne FAR / ifeq FAR    used as opaque guards
 ;

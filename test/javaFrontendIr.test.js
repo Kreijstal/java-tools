@@ -1784,49 +1784,6 @@ test('JRE metadata resolves methods inherited by collection interfaces', (t) => 
   t.end();
 });
 
-test('library metadata resolves jaggl ARB program calls', (t) => {
-  const result = frontend.compileJavaSource(`
-    class JagglProgramSmoke {
-      static int create(int target, byte[] program, int[] status) {
-        int id = jaggl.OpenGL.glGenProgramARB();
-        jaggl.OpenGL.glBindProgramARB(target, id);
-        jaggl.OpenGL.glProgramRawARB(target, 34933, program);
-        jaggl.OpenGL.glGetIntegerv(34379, status, 0);
-        return id;
-      }
-    }
-  `, { sourceFileName: 'JagglProgramSmoke.java' });
-  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'create');
-  const invokedNames = method.instructions
-    .filter((instruction) => instruction.opcode === 'invokestatic')
-    .map((instruction) => instruction.operands[2]);
-
-  t.equal(result.bytecodeIr.status, 'complete', 'jaggl ARB program calls compile completely');
-  t.deepEqual(invokedNames, ['glGenProgramARB', 'glBindProgramARB', 'glProgramRawARB', 'glGetIntegerv'], 'all native calls use typed static metadata');
-  t.end();
-});
-
-test('library metadata resolves jaclib memory stream calls', (t) => {
-  const result = frontend.compileJavaSource(`
-    class JaclibStreamSmoke {
-      static void write(jaclib.memory.Stream stream, float value) {
-        if (jaclib.memory.Stream.b()) stream.b(value);
-        else stream.a(value);
-        stream.a();
-      }
-    }
-  `, { sourceFileName: 'JaclibStreamSmoke.java' });
-  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'write');
-  const invokedNames = method.instructions
-    .filter((instruction) => instruction.opcode.startsWith('invoke'))
-    .map((instruction) => instruction.operands[2]);
-
-  t.equal(result.bytecodeIr.status, 'complete', 'jaclib stream calls compile completely');
-  t.ok(invokedNames.includes('b'), 'static endian query and stream write are typed');
-  t.ok(invokedNames.includes('a'), 'alternate write and completion calls are typed');
-  t.end();
-});
-
 test('JRE metadata resolves inherited Component.getSize', (t) => {
   const result = frontend.compileJavaSource(`
     class CanvasSizeSmoke {
