@@ -19,8 +19,6 @@
  *
  * Uses CFG analysis to detect the pattern structurally.
  */
-const { BasicBlock } = require('./cfg');
-
 /**
  * @param {import('./cfg').CFG} cfg
  * @returns {{ changed: boolean, fixed: number }}
@@ -94,14 +92,16 @@ function invertConditionalGotos(cfg) {
  * one backedge (a jump to a block that appears earlier in any topological order).
  */
 function hasPathWithBackedge(startId, targetId, cfg) {
-  const visited = new Set();
+  const visitedStates = new Map();
   const stack = [{ id: startId, path: [startId], hasBackedge: false }];
 
   while (stack.length > 0) {
     const { id, path, hasBackedge } = stack.pop();
     if (id === targetId && hasBackedge) return true;
-    if (visited.has(id)) continue;
-    visited.add(id);
+    const stateBit = hasBackedge ? 2 : 1;
+    const seen = visitedStates.get(id) || 0;
+    if ((seen & stateBit) !== 0) continue;
+    visitedStates.set(id, seen | stateBit);
 
     const block = cfg.blocks.get(id);
     if (!block) continue;

@@ -1683,6 +1683,22 @@ test('unqualified identifiers resolve inherited source fields', (t) => {
   t.end();
 });
 
+test('unqualified identifiers resolve fields inherited from JRE classes', (t) => {
+  const result = frontend.compileJavaSource(`
+    class PointChild extends java.awt.Point {
+      int currentX() { return x; }
+    }
+  `, { sourceFileName: 'PointChild.java' });
+  const child = result.bytecodeIr.classes.find((candidate) => candidate.name === 'PointChild');
+  const currentX = child.methods.find((candidate) => candidate.name === 'currentX');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'inherited JRE field compiles completely');
+  t.ok(currentX.instructions.some((instruction) => instruction.opcode === 'getfield'
+    && instruction.operands[1] === 'java/awt/Point'
+    && instruction.operands[2] === 'x'), 'inherited field uses its declaring JRE owner');
+  t.end();
+});
+
 test('qualified JRE member classes use JVM nested-class names', (t) => {
   const result = frontend.compileJavaSource(`
     class MixerInfoSmoke {

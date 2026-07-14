@@ -203,8 +203,26 @@ function labelReferencesStayInsideRange(codeItems, label, startInclusive, endExc
   if (!clean) return true;
   for (let i = 0; i < codeItems.length; i += 1) {
     const insn = codeItems[i] && codeItems[i].instruction;
-    if (!insn || trimLabel(getArg(insn)) !== clean) continue;
-    if (i < startInclusive || i >= endExclusive) return false;
+    if (!insn) continue;
+    const op = getOp(insn);
+    const targets = [];
+    if (op === 'tableswitch') {
+      if (Array.isArray(insn.labels)) targets.push(...insn.labels);
+      if (typeof insn.defaultLbl === 'string') targets.push(insn.defaultLbl);
+    } else if (op === 'lookupswitch') {
+      const arg = getArg(insn);
+      if (arg && typeof arg === 'object') {
+        for (const pair of arg.pairs || []) {
+          if (Array.isArray(pair) && typeof pair[1] === 'string') targets.push(pair[1]);
+        }
+        if (typeof arg.defaultLabel === 'string') targets.push(arg.defaultLabel);
+      }
+    } else {
+      const arg = getArg(insn);
+      if (typeof arg === 'string') targets.push(arg);
+    }
+    if (targets.some((target) => trimLabel(target) === clean)
+      && (i < startInclusive || i >= endExclusive)) return false;
   }
   return true;
 }

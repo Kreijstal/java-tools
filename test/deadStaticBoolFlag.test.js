@@ -194,6 +194,22 @@ test('dead-flag: refuses if labelDef sits between iload and ifne (not flat)', (t
   t.end();
 });
 
+test('dead-flag: preserves labels referenced by switches outside the binding range', (t) => {
+  const ast = astWith([
+    { instruction: { op: 'getstatic', arg: ['Field', 'jn', ['u', 'Z']] } },
+    { instruction: { op: 'istore', arg: '5' } },
+    { labelDef: 'Lguard:', instruction: { op: 'iload', arg: '5' } },
+    { instruction: { op: 'ifne', arg: 'Lret' } },
+    { instruction: 'iconst_1' },
+    { instruction: { op: 'istore', arg: '5' } },
+    { instruction: { op: 'tableswitch', labels: ['Lguard'], defaultLbl: 'Lret' } },
+    { labelDef: 'Lret:', instruction: 'return' },
+  ]);
+  const result = runDeadStaticBoolFlag(ast, { flags: 'jn.u' });
+  t.equal(result.eliminated, 0, 'external switch target prevents removal of the referenced label');
+  t.end();
+});
+
 test('dead-flag: handles numbered istore (istore_2) and numbered iload (iload_2)', (t) => {
   const ast = astWith([
     { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'jn', ['u', 'Z']] } },

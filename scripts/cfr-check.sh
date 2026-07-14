@@ -48,6 +48,7 @@ echo "[*] Checking CFR output for structure markers..."
 GOOD=0
 WARN=0
 BAD=0
+BAD_MARKERS=0
 
 while IFS= read -r -d '' file; do
     filename=$(basename "$file")

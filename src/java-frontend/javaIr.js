@@ -4089,6 +4089,8 @@ function fieldMetadataForOwner(owner, name, context) {
     visited.add(current);
     const fields = context.classFieldsByInternalName && context.classFieldsByInternalName.get(current);
     if (fields && fields.has(name)) return fields.get(name);
+    const jreField = jreFieldInfo(current, name);
+    if (jreField) return jreField;
     const superName = context.classSuperByInternalName && context.classSuperByInternalName.get(current);
     if (superName) pending.push(superName);
     const interfaces = context.classInterfacesByInternalName && context.classInterfacesByInternalName.get(current);
