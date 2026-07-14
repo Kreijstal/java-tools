@@ -149,11 +149,13 @@ module.exports = {
     },
 
     'getCodeBase()Ljava/net/URL;': (jvm, obj, args) => {
-      return obj._codeBase || null;
+      const base = obj._codeBase || 'http://localhost/';
+      return { type: 'java/net/URL', url: jvm.internString(String(base)) };
     },
 
     'getDocumentBase()Ljava/net/URL;': (jvm, obj, args) => {
-      return obj._documentBase || null;
+      const base = obj._documentBase || obj._codeBase || 'http://localhost/';
+      return { type: 'java/net/URL', url: jvm.internString(String(base)) };
     },
 
     'getParameter(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {

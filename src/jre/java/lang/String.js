@@ -374,6 +374,9 @@ module.exports = {
     "indexOf(Ljava/lang/String;I)I": (jvm, obj, args) => {
       return stringValue(obj).indexOf(stringValue(args[0]), args[1]);
     },
+    "lastIndexOf(Ljava/lang/String;)I": (jvm, obj, args) => {
+      return stringValue(obj).lastIndexOf(stringValue(args[0]));
+    },
     "lastIndexOf(I)I": (jvm, obj, args) => {
       const ch = args[0];
       const char = String.fromCharCode(ch);

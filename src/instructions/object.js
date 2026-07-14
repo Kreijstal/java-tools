@@ -253,13 +253,20 @@ module.exports = {
 
   putstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
-    const value = frame.stack.pop();
 
+    // Trigger <clinit> BEFORE popping: if a <clinit> frame is pushed we rewind
+    // pc and re-run this instruction, so the operand must stay on the stack.
     const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) {
       frame.pc--; // Re-run this instruction after <clinit> is done.
       return;
     }
+
+    if (frame.stack.isEmpty()) {
+      const m = frame.method || {};
+      throw new Error(`Stack underflow at putstatic ${className}.${fieldName}:${descriptor} in ${frame.className}.${m.name}${m.descriptor} pc=${frame.pc}`);
+    }
+    const value = frame.stack.pop();
 
     const fieldKey = `${fieldName}:${descriptor}`;
     let currentClassName = className;

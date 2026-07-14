@@ -461,13 +461,23 @@ module.exports = {
       _declaringClass: classObj,
       _parameterTypes: args[0] || [],
     }),
-    'newInstance()Ljava/lang/Object;': (jvm, classObj, args) => {
+    'newInstance()Ljava/lang/Object;': async (jvm, classObj, args, thread) => {
       const classData = classObj._classData;
       const className = classData.ast.classes[0].className;
-      const newObj = jvm.newObject(className);
-      const constructor = jvm.findMethod(className, '<init>()V');
+      const newObj = await jvm.createAppletInstance(className);
+      const constructor = jvm.findMethod(jvm.classes[className], '<init>', '()V');
       if (constructor) {
-        jvm.runMethod(constructor, [newObj]);
+        const Frame = require('../../../core/frame');
+        const initFrame = new Frame(constructor);
+        initFrame.className = className;
+        initFrame.locals[0] = newObj;
+        const t = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+        t.callStack.push(initFrame);
+        const originalStackSize = t.callStack.size();
+        while (t.callStack.size() >= originalStackSize) {
+          const result = await jvm.executeTick();
+          if (result && result.completed) break;
+        }
       }
       return newObj;
     },

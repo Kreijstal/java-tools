@@ -49,6 +49,8 @@ class JVM {
         : [options.classpath]
       : ["."];
     this.verbose = options.verbose || false;
+    this.appletParameters = options.appletParameters || null;
+    this.appletCodeBase = options.appletCodeBase || null;
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
     this.yieldInterval = options.yieldInterval || 4096;
@@ -442,7 +444,7 @@ class JVM {
     }
 
     const mainMethod = this.findMainMethod(classData);
-    const isApplet = this.isAppletClass(classData);
+    const isApplet = await this.isAppletClassAsync(classData);
     
     if (!mainMethod && !isApplet) {
       /* HARDENED: Replaced quiet failure with an explicit error */
@@ -566,7 +568,13 @@ class JVM {
       lockCount: 0,
       waitSet: [],
     };
-    
+    if (this.appletParameters) {
+      objRef._parameters = this.appletParameters;
+    }
+    if (this.appletCodeBase) {
+      objRef._codeBase = this.appletCodeBase;
+    }
+
     // Add JavaScript toString method that calls Java toString
     const jvm = this;
     objRef.toString = function() {
@@ -996,6 +1004,26 @@ class JVM {
   }
 
   async executeInstruction(instruction, frame, thread) {
+    if (typeof process !== 'undefined' && process.env && process.env.JVM_TRACE) {
+      if (!thread._trace) thread._trace = [];
+      const m = frame.method || {};
+      const op = typeof instruction === 'string'
+        ? instruction
+        : (instruction && instruction.op) || JSON.stringify(instruction).slice(0, 60);
+      thread._trace.push(`${frame.className}.${m.name}${m.descriptor} pc=${frame.pc} ${op} stack=${frame.stack.size()}`);
+      if (thread._trace.length > 200) thread._trace.shift();
+      if (process.env.JVM_TRACE_EXIT) {
+        this._traceCount = (this._traceCount || 0) + 1;
+        if (this._traceCount >= Number(process.env.JVM_TRACE_EXIT)) {
+          console.error(`--- JVM_TRACE_EXIT after ${this._traceCount} instructions ---`);
+          for (const t of this.threads) {
+            console.error(`thread ${t.id} (${t.name}) status=${t.status} frames=${t.callStack ? t.callStack.size() : '?'}`);
+            if (t._trace) console.error(t._trace.slice(-40).join('\n'));
+          }
+          process.exit(3);
+        }
+      }
+    }
     await dispatch(frame, instruction, this, thread);
   }
 
@@ -1385,7 +1413,7 @@ class JVM {
     // Check if this class extends java/applet/Applet
     let currentClassName = classData.ast.classes[0].className;
     let currentClassData = classData;
-    
+
     while (currentClassData) {
       const superClassName = currentClassData.ast.classes[0].superClassName;
       if (superClassName === 'java/applet/Applet') {
@@ -1395,6 +1423,25 @@ class JVM {
         return false;
       }
       currentClassData = this.classes[superClassName];
+    }
+    return false;
+  }
+
+  async isAppletClassAsync(classData) {
+    // Like isAppletClass, but loads not-yet-loaded superclasses from the
+    // classpath so applets behind an intermediate superclass are detected.
+    let currentClassData = classData;
+
+    while (currentClassData && currentClassData.ast) {
+      const superClassName = currentClassData.ast.classes[0].superClassName;
+      if (superClassName === 'java/applet/Applet') {
+        return true;
+      }
+      if (!superClassName || superClassName === 'java/lang/Object') {
+        return false;
+      }
+      currentClassData = this.classes[superClassName] ||
+        await this.loadClassByName(superClassName).catch(() => null);
     }
     return false;
   }

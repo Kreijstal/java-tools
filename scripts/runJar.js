@@ -115,7 +115,16 @@ async function main() {
       throw new Error(`No Main-Class in manifest. Pass --class <ClassName>. Classes include: ${sampleClasses}`);
     }
 
-    const jvm = new JVM({ classpath: [tempDir], verbose: options.verbose });
+    const appletParameters = {};
+    for (const arg of options.programArgs) {
+      const eq = arg.indexOf('=');
+      if (eq > 0) appletParameters[arg.slice(0, eq)] = arg.slice(eq + 1);
+    }
+    const jvm = new JVM({
+      classpath: [tempDir],
+      verbose: options.verbose,
+      appletParameters: Object.keys(appletParameters).length ? appletParameters : null,
+    });
     await jvm.run(normalizeMainClass(mainClass), { args: options.programArgs });
   } finally {
     if (options.keepTemp) {
