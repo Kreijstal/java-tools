@@ -1,3 +1,26 @@
+const { withThrows } = require('../../helpers');
+
+function stringValue(value) {
+  return typeof value === 'string' ? value : value && Object.prototype.hasOwnProperty.call(value, 'value') ? String(value.value) : String(value);
+}
+
+function parseJavaInt(value, radix) {
+  const text = stringValue(value);
+  if (radix < 2 || radix > 36 || text.length === 0) throw { type: 'java/lang/NumberFormatException' };
+  let index = text[0] === '-' || text[0] === '+' ? 1 : 0;
+  if (index === text.length) throw { type: 'java/lang/NumberFormatException' };
+  for (; index < text.length; index += 1) {
+    const code = text.charCodeAt(index);
+    const digit = code >= 48 && code <= 57 ? code - 48
+      : code >= 65 && code <= 90 ? code - 65 + 10
+        : code >= 97 && code <= 122 ? code - 97 + 10 : -1;
+    if (digit < 0 || digit >= radix) throw { type: 'java/lang/NumberFormatException' };
+  }
+  const result = Number.parseInt(text, radix);
+  if (!Number.isFinite(result) || result < -2147483648 || result > 2147483647) throw { type: 'java/lang/NumberFormatException' };
+  return result | 0;
+}
+
 module.exports = {
   super: 'java/lang/Number',
   staticFields: {
@@ -21,6 +44,12 @@ module.exports = {
       // Per spec, this should be a new string, not an interned one.
       return jvm.newString(intValue.toString());
     },
+    'toString(II)Ljava/lang/String;': (jvm, obj, args) => {
+      const intValue = args[0] | 0;
+      const radix = args[1] | 0;
+      const effectiveRadix = radix >= 2 && radix <= 36 ? radix : 10;
+      return jvm.newString(intValue.toString(effectiveRadix));
+    },
     'parseInt(Ljava/lang/String;)I': (jvm, obj, args) => {
       const str = args[0];
       if (!str) return 0;
@@ -34,6 +63,7 @@ module.exports = {
       }
       return result;
     },
+    'parseInt(Ljava/lang/String;I)I': withThrows((jvm, obj, args) => parseJavaInt(args[0], args[1]), ['java/lang/NumberFormatException']),
     'toHexString(I)Ljava/lang/String;': (jvm, obj, args) => {
       const intValue = args[0];
       const hexString = (intValue >>> 0).toString(16);

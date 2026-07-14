@@ -221,6 +221,16 @@ module.exports = {
       return 0;
     },
     
+    'getLocationOnScreen()Ljava/awt/Point;': (jvm, obj) => ({
+      type: 'java/awt/Point',
+      x: obj.x || 0,
+      y: obj.y || 0,
+    }),
+    'getLocation()Ljava/awt/Point;': (jvm, obj) => ({
+      type: 'java/awt/Point',
+      x: obj.x || 0,
+      y: obj.y || 0,
+    }),
     'getX()I': (jvm, obj, args) => {
       return obj._x || 0;
     },
@@ -257,6 +267,10 @@ module.exports = {
       const imageImpl = new awtFramework.CanvasImage(width, height);
       return { type: 'java/awt/Image', _awtImage: imageImpl };
     },
+
+    'getSize()Ljava/awt/Dimension;': (jvm, obj) => makeDimension(obj._width || 0, obj._height || 0),
+
+    'getTreeLock()Ljava/lang/Object;': (jvm, obj) => obj._treeLock || obj,
 
     'createImage(Ljava/awt/image/ImageProducer;)Ljava/awt/Image;': (jvm, obj, args) => {
       return null;

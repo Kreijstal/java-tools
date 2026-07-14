@@ -90,6 +90,11 @@ module.exports = {
 
       return doubleObj;
     },
+    "valueOf(Ljava/lang/String;)Ljava/lang/Double;": (jvm, obj, args) => {
+      const value = Number(args[0] && Object.prototype.hasOwnProperty.call(args[0], 'value') ? args[0].value : args[0]);
+      if (Number.isNaN(value)) throw { type: 'java/lang/NumberFormatException' };
+      return { type: 'java/lang/Double', value };
+    },
     "isInfinite(D)Z": (jvm, obj, args) => {
       const value = args[0];
       return !isFinite(value) && !isNaN(value) ? 1 : 0;

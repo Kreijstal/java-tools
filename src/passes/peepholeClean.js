@@ -1728,7 +1728,11 @@ function cloneStackConditionalTargets(code, context = null) {
     if (targetNextIdx == null) continue;
 
     const fallthroughLabel = ensureLabelAtInstruction(codeItems, fallthroughIdx, nextClonePrefix('Lscf'));
-    const targetNextLabel = ensureLabelAtInstruction(codeItems, targetNextIdx, nextClonePrefix('Lsct'));
+    const targetNextInsn = codeItems[targetNextIdx] && codeItems[targetNextIdx].instruction;
+    const targetNextOpcode = opcodeMnemonic(targetNextInsn);
+    const targetNextLabel = targetNextOpcode === 'goto' || targetNextOpcode === 'goto_w'
+      ? trimLabel(getInstructionArg(targetNextInsn))
+      : ensureLabelAtInstruction(codeItems, targetNextIdx, nextClonePrefix('Lsct'));
     if (!fallthroughLabel || !targetNextLabel) continue;
 
     item.instruction = setOpcode(setBranchArg(item.instruction, fallthroughLabel), inverse);

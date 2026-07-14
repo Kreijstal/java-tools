@@ -274,9 +274,12 @@ function tokenizeJava(source) {
       const startLine = line;
       const startColumn = column;
       advance();
-      while (i < source.length && isNumberPart(current())) {
+      while (i < source.length && (isNumberPart(current())
+          || ((current() === '+' || current() === '-') && /[eEpP]$/.test(source.slice(startOffset, i))))) {
         // Do not eat the first dot in constructs such as `1.toString()`.
-        if (current() === '.' && !isDigit(source[i + 1] || '') && source[i + 1] !== '_') {
+        const prefix = source.slice(startOffset, i);
+        const hexFraction = current() === '.' && /^0[xX]/.test(prefix) && /[0-9a-fA-F_]/.test(source[i + 1] || '');
+        if (current() === '.' && !hexFraction && !isDigit(source[i + 1] || '') && source[i + 1] !== '_') {
           break;
         }
         advance();

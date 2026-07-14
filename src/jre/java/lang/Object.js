@@ -67,7 +67,7 @@ module.exports = {
 
       // The JVM scheduler will now be able to run another thread that might have been
       // BLOCKED on this object's monitor.
-    }, ['java/lang/IllegalMonitorStateException']),
+    }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'wait(J)V': withThrows((jvm, obj, args, thread) => {
       // Implementation for wait with timeout (milliseconds)
       const timeout = args[0]; // BigInt or number
@@ -85,7 +85,7 @@ module.exports = {
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
       }
-    }, ['java/lang/IllegalMonitorStateException']),
+    }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'wait(JI)V': withThrows((jvm, obj, args, thread) => {
       // Implementation for wait with timeout (milliseconds) and nanos  
       const timeout = args[0]; // BigInt or number - milliseconds
@@ -104,7 +104,7 @@ module.exports = {
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
       }
-    }, ['java/lang/IllegalMonitorStateException']),
+    }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'notify()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         throw {

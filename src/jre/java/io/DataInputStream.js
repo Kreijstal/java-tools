@@ -1,5 +1,20 @@
 const { withThrows } = require('../../helpers');
 
+function readOne(jvm, obj) {
+  const readMethod = jvm._jreFindMethod(obj.type, 'read', '()I');
+  return readMethod ? readMethod(jvm, obj, []) : -1;
+}
+
+function readBytes(jvm, obj, count) {
+  const bytes = [];
+  for (let index = 0; index < count; index += 1) {
+    const value = readOne(jvm, obj);
+    if (value < 0) throw { type: 'java/io/EOFException' };
+    bytes.push(value & 0xff);
+  }
+  return bytes;
+}
+
 module.exports = {
   super: 'java/io/FilterInputStream',
   interfaces: ['java/io/DataInput'],
@@ -59,6 +74,47 @@ module.exports = {
       }
       return 0;
     }, ['java/io/EOFException']),
+
+    'readUnsignedByte()I': withThrows((jvm, obj) => readBytes(jvm, obj, 1)[0], ['java/io/EOFException']),
+    'readShort()S': withThrows((jvm, obj) => {
+      const bytes = readBytes(jvm, obj, 2);
+      const value = (bytes[0] << 8) | bytes[1];
+      return (value << 16) >> 16;
+    }, ['java/io/EOFException']),
+    'readUnsignedShort()I': withThrows((jvm, obj) => {
+      const bytes = readBytes(jvm, obj, 2);
+      return (bytes[0] << 8) | bytes[1];
+    }, ['java/io/EOFException']),
+    'readChar()C': withThrows((jvm, obj) => {
+      const bytes = readBytes(jvm, obj, 2);
+      return (bytes[0] << 8) | bytes[1];
+    }, ['java/io/EOFException']),
+    'readLong()J': withThrows((jvm, obj) => {
+      const bytes = readBytes(jvm, obj, 8);
+      let value = 0n;
+      for (const byte of bytes) value = (value << 8n) | BigInt(byte);
+      return BigInt.asIntN(64, value);
+    }, ['java/io/EOFException']),
+    'readFloat()F': withThrows((jvm, obj) => {
+      const bytes = readBytes(jvm, obj, 4);
+      const buffer = new ArrayBuffer(4);
+      new Uint8Array(buffer).set(bytes);
+      return new DataView(buffer).getFloat32(0, false);
+    }, ['java/io/EOFException']),
+    'readDouble()D': withThrows((jvm, obj) => {
+      const bytes = readBytes(jvm, obj, 8);
+      const buffer = new ArrayBuffer(8);
+      new Uint8Array(buffer).set(bytes);
+      return new DataView(buffer).getFloat64(0, false);
+    }, ['java/io/EOFException']),
+    'readFully([B)V': withThrows((jvm, obj, args) => {
+      const bytes = readBytes(jvm, obj, args[0].length);
+      for (let index = 0; index < bytes.length; index += 1) args[0][index] = bytes[index];
+    }, ['java/io/EOFException']),
+    'readFully([BII)V': withThrows((jvm, obj, args) => {
+      const bytes = readBytes(jvm, obj, args[2]);
+      for (let index = 0; index < bytes.length; index += 1) args[0][args[1] + index] = bytes[index];
+    }, ['java/io/EOFException', 'java/lang/IndexOutOfBoundsException']),
     
     'readInt()I': withThrows((jvm, obj, args) => {
       const readMethod = jvm._jreFindMethod(obj.type, 'read', '()I');

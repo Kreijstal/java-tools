@@ -37,6 +37,7 @@ function splitCode(code, options = {}) {
     collectSingleCastedRangesBeforeReferenceReuse(code, analysis),
     collectCastedLoopRanges(code),
     collectCastedCursorRanges(code, cfg, analysis, dominators),
+    collectCastedRangesAfterPriorReferenceReuse(code, cfg, analysis, dominators),
   );
   if (candidates.length > 8) {
     candidates = candidates.filter((candidate) =>
@@ -262,6 +263,120 @@ function collectSingleCastedRangesBeforeReferenceReuse(code, analysis) {
     });
   }
   return out;
+}
+
+function collectCastedRangesAfterPriorReferenceReuse(code, cfg, analysis, dominators) {
+  const items = code.codeItems;
+  if (items.length > 10000) return [];
+  const out = [];
+  for (let i = 1; i < items.length; i += 1) {
+    const local = astoreLocal(items[i]);
+    if (local == null || op(items[i - 1]) !== 'checkcast') continue;
+    if (isHandlerStore(code.exceptionTable, items[i])) continue;
+    const desc = referenceDescriptorFromClassName(arg(items[i - 1]));
+    if (!isConcreteObjectDescriptor(desc) || desc.startsWith('[L')) continue;
+    if (!hasPriorIncompatibleLocalWrite(items, i, local, desc, analysis)) continue;
+
+    const storeIndexes = [i];
+    let scanStart = i + 1;
+    let limit = items.length;
+    for (;;) {
+      const nextWrite = nextLocalWriteIndex(items, scanStart, local);
+      if (nextWrite < 0) break;
+      if (!isSameCastedStore(items, nextWrite, local, desc)) {
+        limit = nextWrite;
+        break;
+      }
+      storeIndexes.push(nextWrite);
+      scanStart = nextWrite + 1;
+    }
+
+    const loadItems = [];
+    let typedUses = 0;
+    let ok = true;
+    const storeSet = new Set(storeIndexes);
+    for (let j = i + 1; j < limit; j += 1) {
+      if (astoreLocal(items[j]) === local && !storeSet.has(j)) {
+        ok = false;
+        break;
+      }
+      if (aloadLocal(items[j]) !== local) continue;
+      const reaching = analysis.before[j] && analysis.before[j].get(local);
+      if (!reaching || reaching.size === 0) {
+        ok = false;
+        break;
+      }
+      const defs = [...reaching].map((defId) => analysis.defs.get(defId));
+      if (!defs.every((def) => def && storeSet.has(def.index))) {
+        ok = false;
+        break;
+      }
+      if (dominators && !defs.some((def) => instructionDominates(cfg, dominators, def.index, j))) {
+        ok = false;
+        break;
+      }
+      const useIndex = nextInstructionIndex(items, j);
+      if (useIndex < 0) {
+        ok = false;
+        break;
+      }
+      if (isNullCompare(items[useIndex])) {
+        loadItems.push(items[j]);
+        continue;
+      }
+      if (isMatchingFieldRead(items[useIndex], desc) ||
+          isMatchingFieldReceiverWrite(items, j, desc) ||
+          isMatchingFieldWrite(items[useIndex], desc) ||
+          methodArgumentDescriptorAtUse(items, j) === desc) {
+        typedUses += 1;
+        loadItems.push(items[j]);
+        continue;
+      }
+      ok = false;
+      break;
+    }
+    if (!ok || typedUses === 0 || loadItems.length === 0) continue;
+    out.push({
+      storeIndex: i,
+      storeItem: items[i],
+      storeItems: storeIndexes.map((index) => items[index]),
+      local,
+      desc,
+      explicitCast: true,
+      primitiveLocalWrite: false,
+      loadItems,
+      noPreserveOriginal: true,
+    });
+  }
+  return out;
+}
+
+function hasPriorIncompatibleLocalWrite(items, before, local, desc, analysis) {
+  const index = previousLocalWriteIndex(items, before - 1, local);
+  if (index < 0) return false;
+  if (primitiveStoreLocal(items[index]) === local || iincLocal(items[index]) === local) return true;
+  if (astoreLocal(items[index]) !== local) return false;
+  const priorDesc = concreteObjectProducerDescriptor(items, index, analysis) ||
+    producerDescriptor(items, previousInstructionIndex(items, index));
+  return priorDesc !== desc;
+}
+
+function previousLocalWriteIndex(items, start, local) {
+  for (let i = start; i >= 0; i -= 1) {
+    if (astoreLocal(items[i]) === local ||
+        primitiveStoreLocal(items[i]) === local ||
+        iincLocal(items[i]) === local) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+function isSameCastedStore(items, index, local, desc) {
+  if (astoreLocal(items[index]) !== local) return false;
+  const prev = previousInstructionIndex(items, index);
+  return prev >= 0 && op(items[prev]) === 'checkcast' &&
+    referenceDescriptorFromClassName(arg(items[prev])) === desc;
 }
 
 function collectCastedCursorRanges(code, cfg, analysis, dominators) {

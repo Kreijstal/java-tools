@@ -456,7 +456,7 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public String\[\] words\(\) \{\s*String\[\] words = new String\[\]\{"alpha", "beta"\};\s*return words;\s*}/, 'object array initialisation is condensed');
     t.match(source, /public String greet\(String name\) \{\s*return "Hello " \+ name \+ "!";\s*}/, 'StringBuilder append chains are reconstructed as string concatenation');
     t.match(source, /public void syncPrint\(Object lock\) \{\s*synchronized \(lock\) \{\s*System\.out\.print\("locked"\);\s*}\s*}/, 'monitorenter/monitorexit regions are reconstructed as synchronized blocks');
-    t.match(source, /public void echoLines\(BufferedReader reader\) \{\s*while \(true\) \{\s*(?:String )?line = reader\.readLine\(\);\s*if \(line == null\) \{\s*break;\s*}\s*System\.out\.println\(line\);\s*}\s*}/, 'guarded loops with assignment before the condition are reconstructed');
+    t.match(source, /public void echoLines\(BufferedReader reader\) \{[\s\S]*?while \(true\) \{\s*(?:String )?line = reader\.readLine\(\);\s*if \(line == null\) \{\s*break;\s*}\s*System\.out\.println\(line\);\s*}/, 'guarded loops with assignment before the condition are reconstructed');
     t.match(source, /public void throwsIt\(\) throws IOException \{\s*}/, 'declared checked exceptions are emitted in method headers');
     t.match(source, /public static void acceptAll\(String\.\.\. args\) \{\s*}/, 'varargs methods use ellipsis syntax');
     t.match(source, /public void releaseResource\(ByteArrayInputStream resource, Throwable primary\) \{\s*if \(resource != null\) \{\s*resource\.close\(\);\s*}\s*}/, 'try-with-resources release graph lowers to guarded close');

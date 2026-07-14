@@ -12,6 +12,15 @@ module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
   staticMethods: {
+    'setOut(Ljava/io/PrintStream;)V': (jvm, obj, args) => {
+      const systemClass = jvm.classes['java/lang/System'];
+      systemClass.staticFields.set('out:Ljava/io/PrintStream;', args[0]);
+    },
+    'load(Ljava/lang/String;)V': () => {
+      // Native libraries are provided by the host runtime where available.
+    },
+    'gc()V': () => {},
+    'runFinalization()V': () => {},
     'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': withThrows((jvm, _, args) => {
       const [src, srcPos, dest, destPos, length] = args;
       if (src === null || dest === null) {

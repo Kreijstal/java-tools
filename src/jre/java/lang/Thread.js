@@ -59,6 +59,7 @@ module.exports = {
     'getName()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.name);
     },
+    'getThreadGroup()Ljava/lang/ThreadGroup;': (jvm, obj) => obj.threadGroup || null,
     'start()V': async (jvm, threadObject, args, currentThread) => {
       const Stack = require('../../../core/stack');
       const Frame = require('../../../core/frame');

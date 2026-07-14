@@ -41,6 +41,16 @@ function returnDescriptor(descriptor) {
   return index >= 0 ? descriptor.slice(index + 1) : null;
 }
 
+function fieldMetadataFromKey(key, isStatic) {
+  const separator = String(key).indexOf(':');
+  if (separator <= 0) return null;
+  return {
+    name: String(key).slice(0, separator),
+    descriptor: String(key).slice(separator + 1),
+    isStatic,
+  };
+}
+
 function loadClass(file) {
   try {
     return require(file);
@@ -58,19 +68,35 @@ function buildMetadata() {
     const classDef = loadClass(file);
     const methods = new Map();
     const staticMethods = new Map();
-    for (const [key] of Object.entries(classDef.methods || {})) {
+    const fields = new Map();
+    const staticFields = new Map();
+    for (const key of Object.keys(classDef.fields || {})) {
+      const field = fieldMetadataFromKey(key, false);
+      if (field) fields.set(field.name, field);
+    }
+    for (const key of Object.keys(classDef.staticFields || {})) {
+      const field = fieldMetadataFromKey(key, true);
+      if (field) staticFields.set(field.name, field);
+    }
+    for (const [key, implementation] of Object.entries(classDef.methods || {})) {
       const descriptor = descriptorFromKey(key);
       if (!descriptor) continue;
       const name = methodNameFromKey(key);
       if (!methods.has(name)) methods.set(name, []);
-      methods.get(name).push({ name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: false });
+      methods.get(name).push({
+        name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: false,
+        throwsTypes: Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [],
+      });
     }
-    for (const [key] of Object.entries(classDef.staticMethods || {})) {
+    for (const [key, implementation] of Object.entries(classDef.staticMethods || {})) {
       const descriptor = descriptorFromKey(key);
       if (!descriptor) continue;
       const name = methodNameFromKey(key);
       if (!staticMethods.has(name)) staticMethods.set(name, []);
-      staticMethods.get(name).push({ name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: true });
+      staticMethods.get(name).push({
+        name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: true,
+        throwsTypes: Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [],
+      });
     }
     classes.set(internalName, {
       internalName,
@@ -80,6 +106,8 @@ function buildMetadata() {
       interfaces: classDef.interfaces || [],
       methods,
       staticMethods,
+      fields,
+      staticFields,
     });
     const simpleName = internalName.split('/').pop();
     if (!simpleNames.has(simpleName)) simpleNames.set(simpleName, []);
@@ -106,16 +134,56 @@ function jreClassInfo(internalName) {
   return metadata().classes.get(internalName) || null;
 }
 
+function jreCanonicalInternalName(internalName) {
+  if (metadata().classes.has(internalName)) return internalName;
+  let candidate = String(internalName || '');
+  for (let slash = candidate.lastIndexOf('/'); slash >= 0; slash = candidate.lastIndexOf('/')) {
+    candidate = `${candidate.slice(0, slash)}$${candidate.slice(slash + 1)}`;
+    if (metadata().classes.has(candidate)) return candidate;
+  }
+  return null;
+}
+
 function jreMethodCandidates(internalName, methodName, isStatic) {
-  const classInfo = jreClassInfo(internalName);
-  if (!classInfo) return [];
-  const table = isStatic ? classInfo.staticMethods : classInfo.methods;
-  return table.get(methodName) || [];
+  const candidates = [];
+  const visited = new Set();
+  const pending = [internalName];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+    const classInfo = jreClassInfo(current);
+    if (!classInfo) continue;
+    const table = isStatic ? classInfo.staticMethods : classInfo.methods;
+    candidates.push(...(table.get(methodName) || []));
+    if (classInfo.superName) pending.push(classInfo.superName);
+    pending.push(...(classInfo.interfaces || []));
+  }
+  return candidates;
+}
+
+function jreFieldInfo(internalName, fieldName) {
+  const visited = new Set();
+  const pending = [internalName];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (!current || visited.has(current)) continue;
+    visited.add(current);
+    const classInfo = jreClassInfo(current);
+    if (!classInfo) continue;
+    const field = classInfo.fields.get(fieldName) || classInfo.staticFields.get(fieldName);
+    if (field) return { ...field, owner: current };
+    if (classInfo.superName) pending.push(classInfo.superName);
+    pending.push(...(classInfo.interfaces || []));
+  }
+  return null;
 }
 
 module.exports = {
   jreClassExists,
+  jreCanonicalInternalName,
   jreClassInfo,
+  jreFieldInfo,
   jreInternalNameForSimpleName,
   jreMethodCandidates,
 };

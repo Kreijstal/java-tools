@@ -148,6 +148,14 @@ module.exports = {
       return obj._appletContext || { type: 'java/applet/AppletContext' };
     },
 
+    'getCodeBase()Ljava/net/URL;': (jvm, obj, args) => {
+      return obj._codeBase || null;
+    },
+
+    'getDocumentBase()Ljava/net/URL;': (jvm, obj, args) => {
+      return obj._documentBase || null;
+    },
+
     'getParameter(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
       const params = obj._parameters || {};
       const value = params[String(args[0] || '')];

@@ -83,6 +83,7 @@ run_test() {
     *data-zip-download*) timeout_cmd=(timeout 60);;
     */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
     */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 60);;
+    */javaFrontendIr.test.js) timeout_cmd=(timeout 60);;
     */roundtrip.test.js) timeout_cmd=();; # roundtrip enforces per-case timeouts internally
     # Add other special cases here
   esac

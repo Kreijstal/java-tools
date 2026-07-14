@@ -74,6 +74,10 @@ module.exports = {
       const absolutePath = path.resolve(obj.path);
       return jvm.internString(absolutePath);
     },
+
+    'getCanonicalPath()Ljava/lang/String;': (jvm, obj) => {
+      return jvm.internString(path.resolve(obj.path));
+    },
     
     'exists()Z': (jvm, obj, args) => {
       try {

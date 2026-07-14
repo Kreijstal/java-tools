@@ -88,6 +88,14 @@ module.exports = {
       obj.value = '';
       delete obj.isUninitialized;
     },
+    '<init>(I)V': withThrows((jvm, obj, args) => {
+      if (args[0] < 0) {
+        throw { type: 'java/lang/NegativeArraySizeException' };
+      }
+      obj.value = '';
+      obj.capacity = args[0];
+      delete obj.isUninitialized;
+    }, ['java/lang/NegativeArraySizeException']),
     '<init>(Ljava/lang/String;)V': withThrows((jvm, obj, args) => {
       const str = args[0];
       if (str === null) {

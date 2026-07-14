@@ -946,6 +946,23 @@ test('narrow primitives and reference casts compile through IR', (t) => {
   t.end();
 });
 
+test('casts between JVM int-family primitive types compile through IR', (t) => {
+  const result = frontend.compileJavaSource(`
+    class IntFamilyCastSmoke {
+      static int cast(char value) {
+        int result = (byte) value;
+        return result;
+      }
+    }
+  `, { sourceFileName: 'IntFamilyCastSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'cast');
+  const opcodes = method.instructions.map((instruction) => instruction.opcode);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'nested narrow-integral cast compiles completely');
+  t.ok(opcodes.includes('i2b'), 'char-to-byte conversion emits i2b');
+  t.end();
+});
+
 function setupIntegerPrintCapture(jvm) {
   let output = '';
   jvm.registerJreMethods({
@@ -1406,5 +1423,1369 @@ test('frontend classfile model carries class attributes', (t) => {
   t.ok(classModel.attributes.some((attribute) => attribute.type === 'Signature' && attribute.value.includes('<T:')), 'generic Signature class attribute is modeled');
   t.ok(valueField.attributes.some((attribute) => attribute.type === 'Signature' && attribute.value === 'TT;'), 'field Signature attribute is modeled');
   t.ok(idMethod.attributes.some((attribute) => attribute.type === 'Signature' && attribute.value === '(TT;)TT;'), 'method Signature attribute is modeled');
+  t.end();
+});
+
+test('labeled blocks retain a bytecode break target', (t) => {
+  const result = frontend.compileJavaSource(`
+    class LabeledBlockSmoke {
+      static int value() {
+        int result = 0;
+        done: {
+          result = 7;
+          break done;
+        }
+        return result;
+      }
+    }
+  `, { sourceFileName: 'LabeledBlockSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((entry) => entry.name === 'value');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'labeled block compiles completely');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'goto'), 'labeled break emits goto');
+  t.ok(method.instructions.some((instruction) => instruction.label && instruction.label.startsWith('Llabeled_end_')), 'labeled block emits its end label');
+  t.end();
+});
+
+test('explicit this calls resolve inherited instance methods', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ExplicitThisBase {
+      int inherited(int value) { return value; }
+    }
+    class ExplicitThisChild extends ExplicitThisBase {
+      int value() { return this.inherited(40) + 2; }
+    }
+  `, { sourceFileName: 'ExplicitThisChild.java' });
+  const child = result.bytecodeIr.classes.find((entry) => entry.internalName === 'ExplicitThisChild');
+  const value = child.methods.find((entry) => entry.name === 'value');
+  const inheritedCall = value.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'explicit inherited call compiles completely');
+  t.equal(inheritedCall.operands[1], 'ExplicitThisChild', 'invokevirtual uses the receiver class symbolic owner');
+  t.equal(inheritedCall.operands[2], 'inherited', 'invokevirtual retains the inherited method name');
+  t.end();
+});
+
+test('JRE metadata resolves EventQueue.peekEvent', (t) => {
+  const result = frontend.compileJavaSource(`
+    class EventQueuePeekSmoke {
+      boolean empty(java.awt.EventQueue queue) {
+        return null == queue.peekEvent();
+      }
+    }
+  `, { sourceFileName: 'EventQueuePeekSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((entry) => entry.name === 'empty');
+  const call = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'EventQueue comparison compiles completely');
+  t.equal(call.operands[1], 'java/awt/EventQueue', 'peekEvent uses the JRE EventQueue owner');
+  t.equal(call.operands[2], 'peekEvent', 'peekEvent invocation is emitted');
+  t.end();
+});
+
+test('JRE metadata resolves Raster.createWritableRaster', (t) => {
+  const result = frontend.compileJavaSource(`
+    class RasterStaticCallSmoke {
+      static java.awt.image.WritableRaster create(
+          java.awt.image.ColorModel colorModel,
+          java.awt.image.DataBuffer buffer,
+          java.awt.Point point) {
+        return java.awt.image.Raster.createWritableRaster(
+            colorModel.createCompatibleSampleModel(1, 1), buffer, point);
+      }
+    }
+  `, { sourceFileName: 'RasterStaticCallSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'create');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokestatic');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Raster static factory compiles completely');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'invokevirtual'
+    && instruction.operands[2] === 'createCompatibleSampleModel'), 'nested ColorModel factory call is resolved');
+  t.deepEqual(invocation.operands.slice(0, 3), ['Method', 'java/awt/image/Raster', 'createWritableRaster'], 'Raster factory uses its JRE owner');
+  t.end();
+});
+
+test('JRE metadata resolves Applet.getCodeBase through a field receiver', (t) => {
+  const result = frontend.compileJavaSource(`
+    class AppletCodeBaseSmoke {
+      static java.applet.Applet applet;
+      static java.net.URL codeBase() {
+        return applet.getCodeBase();
+      }
+      static java.net.URL documentBase() {
+        return applet.getDocumentBase();
+      }
+    }
+  `, { sourceFileName: 'AppletCodeBaseSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'codeBase');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Applet field receiver call compiles completely');
+  t.deepEqual(invocation.operands.slice(0, 3), ['Method', 'java/applet/Applet', 'getCodeBase'], 'getCodeBase resolves on Applet');
+  const documentMethod = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'documentBase');
+  const documentInvocation = documentMethod.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+  t.deepEqual(documentInvocation.operands.slice(0, 3), ['Method', 'java/applet/Applet', 'getDocumentBase'], 'getDocumentBase resolves on Applet');
+  t.end();
+});
+
+test('JRE metadata resolves Graphics.getClipBounds', (t) => {
+  const result = frontend.compileJavaSource(`
+    class GraphicsClipSmoke {
+      static java.awt.Rectangle clip(java.awt.Graphics graphics) {
+        return graphics.getClipBounds();
+      }
+    }
+  `, { sourceFileName: 'GraphicsClipSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'clip');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Graphics clip query compiles completely');
+  t.deepEqual(invocation.operands.slice(0, 3), ['Method', 'java/awt/Graphics', 'getClipBounds'], 'getClipBounds resolves on Graphics');
+  t.end();
+});
+
+test('JRE metadata resolves system clipboard transfer chains', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ClipboardTransferSmoke {
+      static String read() throws Exception {
+        return (String) java.awt.Toolkit.getDefaultToolkit()
+            .getSystemClipboard()
+            .getContents((Object) null)
+            .getTransferData(java.awt.datatransfer.DataFlavor.stringFlavor);
+      }
+    }
+  `, { sourceFileName: 'ClipboardTransferSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'read');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'clipboard transfer chain compiles completely');
+  t.deepEqual(invokedNames, ['getDefaultToolkit', 'getSystemClipboard', 'getContents', 'getTransferData'], 'all typed calls in the chain are emitted');
+  t.end();
+});
+
+test('JRE metadata resolves String.indexOf character with offset', (t) => {
+  const result = frontend.compileJavaSource(`
+    class StringIndexOffsetSmoke {
+      static int slash(String value, int offset) {
+        return value.indexOf('/', offset);
+      }
+    }
+  `, { sourceFileName: 'StringIndexOffsetSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'slash');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'String character search with offset compiles completely');
+  t.equal(invocation.operands[3], '(II)I', 'the exact integer overload is selected');
+  t.end();
+});
+
+test('source hierarchy resolves methods inherited from interfaces', (t) => {
+  const result = frontend.compileJavaSource(`
+    interface InterfacePredicate { boolean ready(byte value); }
+    abstract class InterfacePredicateUser implements InterfacePredicate {
+      boolean check() { return !this.ready((byte) 1); }
+    }
+  `, { sourceFileName: 'InterfacePredicateUser.java' });
+  const owner = result.bytecodeIr.classes.find((candidate) => candidate.name === 'InterfacePredicateUser');
+  const method = owner.methods.find((candidate) => candidate.name === 'check');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'interface-inherited predicate compiles completely');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'invokevirtual'
+    && instruction.operands[2] === 'ready'
+    && instruction.operands[3] === '(B)Z'), 'class receiver invokes the inherited interface contract as a boolean method');
+  t.end();
+});
+
+test('JRE metadata resolves GraphicsDevice display mode queries', (t) => {
+  const result = frontend.compileJavaSource(`
+    class GraphicsDeviceModeSmoke {
+      static boolean current(java.awt.GraphicsDevice device, java.awt.DisplayMode expected) {
+        device.setDisplayMode(expected);
+        return device.getDisplayMode().equals(expected);
+      }
+    }
+  `, { sourceFileName: 'GraphicsDeviceModeSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'current');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'GraphicsDevice mode calls compile completely');
+  t.deepEqual(invokedNames, ['setDisplayMode', 'getDisplayMode', 'equals'], 'display mode statement and value calls are typed');
+  t.end();
+});
+
+test('prefix local updates produce the updated expression value', (t) => {
+  const result = frontend.compileJavaSource(`
+    class PrefixUpdateSmoke {
+      static int calculate(int value, int factor) {
+        return --value * factor + ++value;
+      }
+      static float calculateFloat(float value, float factor) {
+        return --value * factor + ++value;
+      }
+    }
+  `, { sourceFileName: 'PrefixUpdateSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'calculate');
+  const opcodes = method.instructions.map((instruction) => instruction.opcode);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'prefix updates compile as expression values');
+  t.equal(opcodes.filter((opcode) => opcode === 'iinc').length, 2, 'both prefix updates emit iinc');
+  t.ok(opcodes.indexOf('iinc') < opcodes.indexOf('iload'), 'the prefix update occurs before its value is loaded');
+  const floatMethod = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'calculateFloat');
+  const floatOpcodes = floatMethod.instructions.map((instruction) => instruction.opcode);
+  t.ok(floatOpcodes.includes('fsub') && floatOpcodes.includes('fadd'), 'float prefix updates emit typed arithmetic');
+  t.end();
+});
+
+test('JRE metadata resolves Toolkit byte image loading', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ToolkitImageSmoke {
+      static java.awt.Image load(byte[] bytes, java.awt.Component component) throws Exception {
+        java.awt.Image image = java.awt.Toolkit.getDefaultToolkit().createImage(bytes);
+        java.awt.MediaTracker tracker = new java.awt.MediaTracker(component);
+        tracker.addImage(image, 0);
+        tracker.waitForAll();
+        return image;
+      }
+    }
+  `, { sourceFileName: 'ToolkitImageSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'load');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Toolkit byte image loading compiles completely');
+  t.ok(invokedNames.includes('createImage'), 'Toolkit.createImage(byte[]) is resolved');
+  t.ok(invokedNames.includes('waitForAll'), 'MediaTracker.waitForAll is resolved');
+  t.end();
+});
+
+test('unqualified identifiers resolve inherited source fields', (t) => {
+  const result = frontend.compileJavaSource(`
+    class FieldBase { static boolean enabled; int count; }
+    class FieldChild extends FieldBase {
+      boolean active() { return enabled; }
+      int current() { return count; }
+    }
+  `, { sourceFileName: 'FieldChild.java' });
+  const child = result.bytecodeIr.classes.find((candidate) => candidate.name === 'FieldChild');
+  const active = child.methods.find((candidate) => candidate.name === 'active');
+  const current = child.methods.find((candidate) => candidate.name === 'current');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'inherited unqualified fields compile completely');
+  t.ok(active.instructions.some((instruction) => instruction.opcode === 'getstatic'
+    && instruction.operands[1] === 'FieldBase'), 'inherited static field uses its declaring owner');
+  t.ok(current.instructions.some((instruction) => instruction.opcode === 'getfield'
+    && instruction.operands[1] === 'FieldBase'), 'inherited instance field uses its declaring owner');
+  t.end();
+});
+
+test('unqualified identifiers resolve fields inherited from JRE classes', (t) => {
+  const result = frontend.compileJavaSource(`
+    class PointChild extends java.awt.Point {
+      int currentX() { return x; }
+    }
+  `, { sourceFileName: 'PointChild.java' });
+  const child = result.bytecodeIr.classes.find((candidate) => candidate.name === 'PointChild');
+  const currentX = child.methods.find((candidate) => candidate.name === 'currentX');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'inherited JRE field compiles completely');
+  t.ok(currentX.instructions.some((instruction) => instruction.opcode === 'getfield'
+    && instruction.operands[1] === 'java/awt/Point'
+    && instruction.operands[2] === 'x'), 'inherited field uses its declaring JRE owner');
+  t.end();
+});
+
+test('qualified JRE member classes use JVM nested-class names', (t) => {
+  const result = frontend.compileJavaSource(`
+    class MixerInfoSmoke {
+      static String name(javax.sound.sampled.Mixer.Info info) {
+        return info.getName();
+      }
+    }
+  `, { sourceFileName: 'MixerInfoSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'name');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'qualified JRE member type compiles completely');
+  t.equal(method.descriptor, '(Ljavax/sound/sampled/Mixer$Info;)Ljava/lang/String;', 'member type descriptor uses a dollar separator');
+  t.equal(invocation.operands[1], 'javax/sound/sampled/Mixer$Info', 'method owner uses the nested JVM name');
+  t.end();
+});
+
+test('JRE metadata resolves Toolkit.getSystemEventQueue', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ToolkitEventQueueSmoke {
+      static java.awt.EventQueue queue() {
+        return java.awt.Toolkit.getDefaultToolkit().getSystemEventQueue();
+      }
+    }
+  `, { sourceFileName: 'ToolkitEventQueueSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'queue');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Toolkit event queue chain compiles completely');
+  t.deepEqual(invokedNames, ['getDefaultToolkit', 'getSystemEventQueue'], 'both Toolkit calls are typed');
+  t.end();
+});
+
+test('JRE metadata resolves String.lastIndexOf substring overloads', (t) => {
+  const result = frontend.compileJavaSource(`
+    class StringLastIndexSmoke {
+      static int marker(String value) {
+        return value.lastIndexOf("@");
+      }
+    }
+  `, { sourceFileName: 'StringLastIndexSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'marker');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'String substring reverse search compiles completely');
+  t.equal(invocation.operands[3], '(Ljava/lang/String;)I', 'the substring overload is selected exactly');
+  t.end();
+});
+
+test('JRE metadata resolves custom cursor creation chains', (t) => {
+  const result = frontend.compileJavaSource(`
+    class CustomCursorSmoke {
+      static void apply(java.awt.Component component, java.awt.Image image, java.awt.Point point) {
+        component.setCursor(component.getToolkit().createCustomCursor(image, point, (String) null));
+      }
+    }
+  `, { sourceFileName: 'CustomCursorSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'apply');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'custom cursor chain compiles completely');
+  t.deepEqual(invokedNames, ['getToolkit', 'createCustomCursor', 'setCursor'], 'cursor chain calls are fully typed');
+  t.end();
+});
+
+test('JRE metadata resolves methods inherited by collection interfaces', (t) => {
+  const result = frontend.compileJavaSource(`
+    class CollectionInterfaceSmoke {
+      static Object[] values(java.util.List list) {
+        return list.toArray();
+      }
+    }
+  `, { sourceFileName: 'CollectionInterfaceSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'values');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokeinterface');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'List call inherited from Collection compiles completely');
+  t.deepEqual(invocation.operands.slice(0, 4), ['InterfaceMethod', 'java/util/List', 'toArray', '()[Ljava/lang/Object;'], 'List receiver retains its interface owner and inherited descriptor');
+  t.end();
+});
+
+test('library metadata resolves jaggl ARB program calls', (t) => {
+  const result = frontend.compileJavaSource(`
+    class JagglProgramSmoke {
+      static int create(int target, byte[] program, int[] status) {
+        int id = jaggl.OpenGL.glGenProgramARB();
+        jaggl.OpenGL.glBindProgramARB(target, id);
+        jaggl.OpenGL.glProgramRawARB(target, 34933, program);
+        jaggl.OpenGL.glGetIntegerv(34379, status, 0);
+        return id;
+      }
+    }
+  `, { sourceFileName: 'JagglProgramSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'create');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'jaggl ARB program calls compile completely');
+  t.deepEqual(invokedNames, ['glGenProgramARB', 'glBindProgramARB', 'glProgramRawARB', 'glGetIntegerv'], 'all native calls use typed static metadata');
+  t.end();
+});
+
+test('library metadata resolves jaclib memory stream calls', (t) => {
+  const result = frontend.compileJavaSource(`
+    class JaclibStreamSmoke {
+      static void write(jaclib.memory.Stream stream, float value) {
+        if (jaclib.memory.Stream.b()) stream.b(value);
+        else stream.a(value);
+        stream.a();
+      }
+    }
+  `, { sourceFileName: 'JaclibStreamSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'write');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'jaclib stream calls compile completely');
+  t.ok(invokedNames.includes('b'), 'static endian query and stream write are typed');
+  t.ok(invokedNames.includes('a'), 'alternate write and completion calls are typed');
+  t.end();
+});
+
+test('JRE metadata resolves inherited Component.getSize', (t) => {
+  const result = frontend.compileJavaSource(`
+    class CanvasSizeSmoke {
+      static java.awt.Dimension size(java.awt.Canvas canvas) {
+        return canvas.getSize();
+      }
+    }
+  `, { sourceFileName: 'CanvasSizeSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'size');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Canvas inherits Component.getSize metadata');
+  t.equal(invocation.operands[3], '()Ljava/awt/Dimension;', 'getSize uses its exact return descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves Hashtable state and key enumeration', (t) => {
+  const result = frontend.compileJavaSource(`
+    class HashtableQuerySmoke {
+      static java.util.Enumeration keys(java.util.Hashtable table) {
+        if (!table.isEmpty() && table.get(new Object()) == null) return table.keys();
+        return null;
+      }
+    }
+  `, { sourceFileName: 'HashtableQuerySmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'keys');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Hashtable query calls compile completely');
+  t.deepEqual(invokedNames, ['isEmpty', 'get', 'keys'], 'Hashtable lookup, boolean, and enumeration methods are typed');
+  t.end();
+});
+
+test('source metadata resolves declarations in package subdirectories', (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-recursive-source-'));
+  const packageDir = path.join(root, 'library');
+  fs.mkdirSync(packageDir);
+  const mainPath = path.join(root, 'Main.java');
+  fs.writeFileSync(path.join(packageDir, 'Factory.java'), `
+    package library;
+    public class Factory {
+      public Product create(int size, boolean direct) { return new Product(); }
+    }
+  `);
+  fs.writeFileSync(path.join(packageDir, 'Product.java'), 'package library; public class Product {}');
+  fs.writeFileSync(mainPath, `
+    class Main {
+      library.Product build(library.Factory factory) {
+        return factory.create(8, false);
+      }
+    }
+  `);
+
+  const result = frontend.compileJavaFile(mainPath, { sourceFileName: 'Main.java' });
+  fs.rmSync(root, { recursive: true, force: true });
+
+  t.equal(result.bytecodeIr.status, 'complete', 'packaged sibling source method resolves completely');
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'build');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+  t.equal(invocation.operands[3], '(IZ)Llibrary/Product;', 'recursive source metadata supplies the exact descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves Graphics shape clipping', (t) => {
+  const result = frontend.compileJavaSource(`
+    class GraphicsShapeSmoke {
+      static void clip(java.awt.Graphics graphics) {
+        java.awt.Shape previous = graphics.getClip();
+        graphics.clipRect(0, 0, 10, 10);
+        graphics.setClip(previous);
+      }
+    }
+  `, { sourceFileName: 'GraphicsShapeSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'clip');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Graphics shape clipping compiles completely');
+  t.deepEqual(invokedNames, ['getClip', 'clipRect', 'setClip'], 'all clip calls are typed');
+  t.end();
+});
+
+test('JRE metadata resolves String.equalsIgnoreCase', (t) => {
+  const result = frontend.compileJavaSource(`
+    class StringCaseCompareSmoke {
+      static boolean same(String value) {
+        return value.equalsIgnoreCase("target");
+      }
+    }
+  `, { sourceFileName: 'StringCaseCompareSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'same');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'case-insensitive String comparison compiles completely');
+  t.equal(invocation.operands[3], '(Ljava/lang/String;)Z', 'equalsIgnoreCase uses its exact descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves File.getCanonicalPath in constructors', (t) => {
+  const result = frontend.compileJavaSource(`
+    class CanonicalFileSmoke {
+      static java.io.File canonical(java.io.File file) throws Exception {
+        return new java.io.File(file.getCanonicalPath());
+      }
+    }
+  `, { sourceFileName: 'CanonicalFileSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'canonical');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'canonical File constructor argument compiles completely');
+  t.equal(invocation.operands[3], '()Ljava/lang/String;', 'getCanonicalPath has its exact return descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves Runtime.load', (t) => {
+  const result = frontend.compileJavaSource(`
+    class RuntimeLoadSmoke {
+      static void load(String path) {
+        Runtime.getRuntime().load(path);
+        System.load(path);
+        System.gc();
+        System.runFinalization();
+      }
+    }
+  `, { sourceFileName: 'RuntimeLoadSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'load');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Runtime native load call compiles completely');
+  t.equal(invocation.operands[3], '(Ljava/lang/String;)V', 'Runtime.load uses its exact descriptor');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'invokestatic'
+    && instruction.operands[1] === 'java/lang/System'
+    && instruction.operands[2] === 'load'), 'System.load is also resolved');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'invokestatic'
+    && instruction.operands[1] === 'java/lang/System'
+    && instruction.operands[2] === 'gc'), 'System.gc is resolved');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'invokestatic'
+    && instruction.operands[1] === 'java/lang/System'
+    && instruction.operands[2] === 'runFinalization'), 'System.runFinalization is resolved');
+  t.end();
+});
+
+test('JRE metadata resolves ReferenceQueue.poll', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ReferenceQueueSmoke {
+      static java.lang.ref.Reference next(java.lang.ref.ReferenceQueue queue) {
+        return queue.poll();
+      }
+    }
+  `, { sourceFileName: 'ReferenceQueueSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'next');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokevirtual');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'ReferenceQueue polling compiles completely');
+  t.equal(invocation.operands[3], '()Ljava/lang/ref/Reference;', 'poll returns the standard Reference type');
+  t.end();
+});
+
+test('synchronized statements accept typed method-call monitors', (t) => {
+  const result = frontend.compileJavaSource(`
+    class TreeLockSmoke {
+      static void lock(java.awt.Component component) {
+        synchronized (component.getTreeLock()) {
+          component.getSize();
+        }
+      }
+    }
+  `, { sourceFileName: 'TreeLockSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'lock');
+  const opcodes = method.instructions.map((instruction) => instruction.opcode);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'method-call monitor compiles completely');
+  t.ok(opcodes.includes('monitorenter'), 'monitorenter is emitted');
+  t.ok(opcodes.includes('monitorexit'), 'monitorexit is emitted');
+  t.end();
+});
+
+test('JRE metadata resolves ThreadGroup traversal', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ThreadGroupSmoke {
+      static int enumerate(Thread[] threads) {
+        ThreadGroup group = Thread.currentThread().getThreadGroup();
+        if (group.getParent() != null) group = group.getParent();
+        return group.enumerate(threads);
+      }
+    }
+  `, { sourceFileName: 'ThreadGroupSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'enumerate');
+  const invokedNames = method.instructions
+    .filter((instruction) => instruction.opcode.startsWith('invoke'))
+    .map((instruction) => instruction.operands[2]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'ThreadGroup traversal compiles completely');
+  t.ok(invokedNames.includes('getThreadGroup') && invokedNames.includes('enumerate'), 'Thread and ThreadGroup calls are typed');
+  t.end();
+});
+
+test('classfile assembly widens branches beyond signed 16-bit offsets', (t) => {
+  const body = Array.from({ length: 9000 }, () => 'value += 1;').join('\n');
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-wide-branch-'));
+  const result = frontend.compileJavaSource(`
+    class WideBranchSmoke {
+      static int calculate(boolean enabled) {
+        int value = 0;
+        if (enabled) {
+          ${body}
+        }
+        return value;
+      }
+    }
+  `, { sourceFileName: 'WideBranchSmoke.java', outputDir });
+  const classPath = path.join(outputDir, 'WideBranchSmoke.class');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'large conditional lowers completely');
+  t.ok(fs.existsSync(classPath), 'large conditional assembles to a classfile');
+  fs.rmSync(outputDir, { recursive: true, force: true });
+  t.end();
+});
+
+test('JRE metadata resolves Character.isWhitespace', (t) => {
+  const result = frontend.compileJavaSource(`
+    class CharacterWhitespaceSmoke {
+      static boolean whitespace(char value) {
+        return Character.isWhitespace(value);
+      }
+    }
+  `, { sourceFileName: 'CharacterWhitespaceSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((candidate) => candidate.name === 'whitespace');
+  const invocation = method.instructions.find((instruction) => instruction.opcode === 'invokestatic');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Character whitespace classification compiles completely');
+  t.equal(invocation.operands[3], '(C)Z', 'the char overload is selected exactly');
+  t.end();
+});
+
+test('boolean bitwise expressions lower with integer boolean opcodes', (t) => {
+  const result = frontend.compileJavaSource(`
+    class BooleanBitwiseSmoke {
+      int value(int flags, boolean enabled) {
+        return (flags != 0 | enabled) ? 1 : 0;
+      }
+    }
+  `, { sourceFileName: 'BooleanBitwiseSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((entry) => entry.name === 'value');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'boolean bitwise conditional compiles completely');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'ior'), 'boolean bitwise-or emits ior');
+  t.end();
+});
+
+test('reference equality accepts explicit Object casts', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ReferenceEqualitySmoke {
+      boolean same(Object value) { return this == (Object) value; }
+    }
+  `, { sourceFileName: 'ReferenceEqualitySmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((entry) => entry.name === 'same');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'mixed reference descriptors compare completely');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'if_acmpeq'), 'reference equality emits if_acmpeq');
+  t.end();
+});
+
+test('throw terminates a non-void method', (t) => {
+  const result = frontend.compileJavaSource(`
+    class ThrowOnlyReturnSmoke {
+      String value() { throw new IllegalStateException(); }
+    }
+  `, { sourceFileName: 'ThrowOnlyReturnSmoke.java' });
+  const method = result.bytecodeIr.classes[0].methods.find((entry) => entry.name === 'value');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'throw-only non-void method compiles completely');
+  t.ok(method.instructions.some((instruction) => instruction.opcode === 'athrow'), 'throw-only method emits athrow');
+  t.end();
+});
+test('StringBuilder capacity constructor accepts conditional int expressions', (t) => {
+  const source = `
+public class StringBuilderCapacitySmoke {
+  private int capacity;
+
+  public StringBuilderCapacitySmoke(int capacity) {
+    this.capacity = capacity;
+    StringBuilder builder = new StringBuilder(capacity != 0 ? capacity : 256);
+    builder.append("ok");
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'StringBuilderCapacitySmoke.java' });
+  const operands = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokespecial')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'conditional capacity constructor compiles completely');
+  t.ok(operands.some((operand) => operand.includes('java/lang/StringBuilder <init> (I)V')), 'selects StringBuilder(int)');
+  t.end();
+});
+
+test('Vector elementAt results cast into reference array elements', (t) => {
+  const source = `
+import java.util.Vector;
+
+public class VectorElementAtSmoke {
+  void copy(Vector[] sources, String[] destination, int source, int index) {
+    destination[index] = (String) sources[source].elementAt(index);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'VectorElementAtSmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'cast Vector element compiles completely');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'invokevirtual'
+    && instruction.operands.join(' ').includes('java/util/Vector elementAt (I)Ljava/lang/Object;')), 'elementAt uses its standard descriptor');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'aastore'), 'cast result is stored into the reference array');
+  t.end();
+});
+
+test('JRE metadata resolves Character.isLowerCase', (t) => {
+  const source = `
+public class CharacterLowerCaseSmoke {
+  boolean lower(char value) {
+    return Character.isLowerCase(value);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'CharacterLowerCaseSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Character lowercase test compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Character isLowerCase (C)Z')), 'char overload is selected exactly');
+  t.end();
+});
+
+test('Float.valueOf String chains through floatValue into constructors', (t) => {
+  const source = `
+public class FloatValueOfStringSmoke {
+  static class Box {
+    Box(float value) {}
+  }
+
+  Box parse(String text) {
+    return new Box(Float.valueOf(text).floatValue());
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'FloatValueOfStringSmoke.java' });
+  const operands = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'String-to-Float constructor chain compiles completely');
+  t.ok(operands.some((operand) => operand.includes('java/lang/Float valueOf (Ljava/lang/String;)Ljava/lang/Float;')), 'String valueOf overload is selected');
+  t.ok(operands.some((operand) => operand.includes('java/lang/Float floatValue ()F')), 'unboxed float call is retained');
+  t.end();
+});
+
+test('Double.valueOf String chains through doubleValue into constructors', (t) => {
+  const source = `
+public class DoubleValueOfStringSmoke {
+  static class Box {
+    Box(double value) {}
+  }
+
+  Box parse(String text) {
+    return new Box(Double.valueOf(text).doubleValue());
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'DoubleValueOfStringSmoke.java' });
+  const operands = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'String-to-Double constructor chain compiles completely');
+  t.ok(operands.some((operand) => operand.includes('java/lang/Double valueOf (Ljava/lang/String;)Ljava/lang/Double;')), 'String Double.valueOf overload is selected');
+  t.ok(operands.some((operand) => operand.includes('java/lang/Double doubleValue ()D')), 'unboxed double call is retained');
+  t.end();
+});
+
+test('JRE metadata resolves Character uppercase and space predicates', (t) => {
+  const source = `
+public class CharacterPredicatesSmoke {
+  boolean classify(char value) {
+    return !Character.isUpperCase(value) || Character.isSpaceChar(value);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'CharacterPredicatesSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Character predicates compile completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Character isUpperCase (C)Z')), 'uppercase char overload is selected');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Character isSpaceChar (C)Z')), 'space char overload is selected');
+  t.end();
+});
+
+test('JRE metadata resolves reflective Constructor.newInstance', (t) => {
+  const source = `
+import java.lang.reflect.Constructor;
+
+public class ReflectiveConstructorSmoke {
+  Object create(Constructor constructor, Object[] arguments) throws Exception {
+    return constructor.newInstance(arguments);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'ReflectiveConstructorSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'reflective constructor call compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/reflect/Constructor newInstance ([Ljava/lang/Object;)Ljava/lang/Object;')), 'Constructor.newInstance uses its standard descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves Class constructor lookup', (t) => {
+  const source = `
+import java.lang.reflect.Constructor;
+
+public class ClassConstructorLookupSmoke {
+  Constructor lookup(Class type) throws Exception {
+    return type.getConstructor(new Class[0]);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'ClassConstructorLookupSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Class constructor lookup compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Class getConstructor ([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;')), 'getConstructor uses its standard descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves nested double Math expressions', (t) => {
+  const source = `
+public class MathDoubleChainSmoke {
+  double curve(int value) {
+    return 250.0 * Math.abs(Math.cos(0.1 * (double) value)) * Math.exp((double) (-value) / 40.0);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'MathDoubleChainSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'nested double Math expression compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Math abs (D)D')), 'double abs overload is selected');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Math exp (D)D')), 'double exp overload is selected');
+  t.end();
+});
+
+test('JRE metadata resolves casted Math.rint results', (t) => {
+  const source = `
+public class MathRintSmoke {
+  int rounded(double value) {
+    return (int) Math.rint(value);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'MathRintSmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'casted Math.rint compiles completely');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'invokestatic'
+    && instruction.operands.join(' ').includes('java/lang/Math rint (D)D')), 'rint uses its exact descriptor');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'd2i'), 'double result is converted to int');
+  t.end();
+});
+
+test('JRE metadata resolves trigonometric Math methods', (t) => {
+  const source = `
+public class MathTrigSmoke {
+  double calculate(double x, double y) {
+    return Math.acos(x) + Math.asin(x) + Math.atan(x) + Math.atan2(y, x) + Math.tan(y);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'MathTrigSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'trigonometric Math calls compile completely');
+  for (const signature of ['acos (D)D', 'asin (D)D', 'atan (D)D', 'atan2 (DD)D', 'tan (D)D']) {
+    t.ok(invokes.some((operand) => operand.includes(`java/lang/Math ${signature}`)), `${signature} is resolved`);
+  }
+  t.end();
+});
+
+test('JRE metadata resolves DataInputStream primitive reads', (t) => {
+  const source = `
+import java.io.DataInputStream;
+
+public class DataInputPrimitiveSmoke {
+  int read(DataInputStream input, byte[] buffer) throws Exception {
+    input.readFully(buffer);
+    return input.readShort() + input.readUnsignedByte();
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'DataInputPrimitiveSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'DataInputStream primitive reads compile completely');
+  for (const signature of ['readFully ([B)V', 'readShort ()S', 'readUnsignedByte ()I']) {
+    t.ok(invokes.some((operand) => operand.includes(`java/io/DataInputStream ${signature}`)), `${signature} is resolved`);
+  }
+  t.end();
+});
+
+test('JRE metadata resolves Math.log in double expressions', (t) => {
+  const source = `
+public class MathLogSmoke {
+  double scale(double value) {
+    return Math.log(value) * 24.0;
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'MathLogSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Math.log expression compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Math log (D)D')), 'log uses its exact descriptor');
+  t.end();
+});
+
+test('subclass-qualified calls resolve inherited static source methods', (t) => {
+  const source = `
+class StaticMethodBase {
+  static void reset() {}
+}
+
+public class InheritedStaticMethodSmoke extends StaticMethodBase {
+  void run() {
+    InheritedStaticMethodSmoke.reset();
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'InheritedStaticMethodSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'inherited static call compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('StaticMethodBase reset ()V')), 'invokestatic uses the declaring source owner');
+  t.end();
+});
+
+test('JRE metadata resolves DateFormat factory and format chains', (t) => {
+  const source = `
+import java.text.DateFormat;
+import java.util.Date;
+
+public class DateFormatSmoke {
+  String display(long time, int dateStyle, int timeStyle) {
+    return DateFormat.getDateTimeInstance(dateStyle, timeStyle).format(new Date(time));
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'DateFormatSmoke.java' });
+  const operands = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'DateFormat chain compiles completely');
+  t.ok(operands.some((operand) => operand.includes('java/text/DateFormat getDateTimeInstance (II)Ljava/text/DateFormat;')), 'DateFormat factory is resolved');
+  t.ok(operands.some((operand) => operand.includes('java/util/Date <init> (J)V')), 'Date(long) constructor is resolved');
+  t.ok(operands.some((operand) => operand.includes('java/text/DateFormat format (Ljava/util/Date;)Ljava/lang/String;')), 'DateFormat.format is resolved');
+  t.end();
+});
+
+test('JRE metadata resolves Character.forDigit', (t) => {
+  const source = `
+public class CharacterForDigitSmoke {
+  char digit(int value) {
+    return Character.forDigit(value, 10);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'CharacterForDigitSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Character.forDigit compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Character forDigit (II)C')), 'forDigit uses its exact descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves BitSet capacity and indexed reads', (t) => {
+  const source = `
+import java.util.BitSet;
+
+public class BitSetSizeSmoke {
+  boolean contains(BitSet bits, int index) {
+    return index < bits.size() && bits.get(index);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'BitSetSizeSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'BitSet capacity guard compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/util/BitSet size ()I')), 'BitSet.size uses its exact descriptor');
+  t.ok(invokes.some((operand) => operand.includes('java/util/BitSet get (I)Z')), 'BitSet.get remains typed');
+  t.end();
+});
+
+test('JRE metadata resolves public reflective field integer reads', (t) => {
+  const source = `
+public class ReflectiveFieldIntSmoke {
+  int read(Class type) throws Exception {
+    return type.getField("VALUE").getInt(null);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'ReflectiveFieldIntSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokevirtual')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'reflective public integer field read compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Class getField (Ljava/lang/String;)Ljava/lang/reflect/Field;')), 'Class.getField is resolved');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/reflect/Field getInt (Ljava/lang/Object;)I')), 'Field.getInt is resolved');
+  t.end();
+});
+
+test('decompiler duplicate uninitialized-object assignment artifacts are structurally discarded', (t) => {
+  const source = `
+class ArtifactOwner {
+  static int counter;
+}
+
+class ArtifactValue {}
+
+public class DuplicateUninitializedArtifactSmoke {
+  void recovered() {
+    ArtifactOwner.counter[new ArtifactValue] = (Object) (Object) new ArtifactValue;
+    ArtifactOwner.counter = ArtifactOwner.counter + 1;
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'DuplicateUninitializedArtifactSmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'malformed duplicate-uninitialized artifact does not block compilation');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'putstatic'
+    && instruction.operands.join(' ').includes('ArtifactOwner counter I')), 'the following valid statement is retained');
+  t.notOk(instructions.some((instruction) => instruction.opcode === 'new'
+    && instruction.operands.join(' ').includes('ArtifactValue')), 'incomplete allocations are not emitted');
+  t.end();
+});
+
+test('decompiler cast-qualified constructor invocations recover as object creation', (t) => {
+  const source = `
+class RecoveredConstructorValue {
+  RecoveredConstructorValue(int value) {}
+}
+
+public class RecoveredConstructorInvocationSmoke {
+  void recovered(Object placeholder) {
+    ((RecoveredConstructorValue) (Object) placeholder).RecoveredConstructorValue(7);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'RecoveredConstructorInvocationSmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'cast-qualified constructor artifact compiles completely');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'new'
+    && instruction.operands.join(' ').includes('RecoveredConstructorValue')), 'artifact allocates the recovered type');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'invokespecial'
+    && instruction.operands.join(' ').includes('RecoveredConstructorValue <init> (I)V')), 'artifact invokes the matching constructor');
+  t.end();
+});
+
+test('recovered constructors replace impossible cast arguments with JVM defaults', (t) => {
+  const source = `
+class RecoveredDefaultValue {
+  RecoveredDefaultValue(String value) {}
+}
+
+public class RecoveredConstructorDefaultSmoke {
+  void recovered(Object placeholder) {
+    ((RecoveredDefaultValue) (Object) placeholder).RecoveredDefaultValue((String) 7);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'RecoveredConstructorDefaultSmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'impossible recovered constructor cast compiles completely');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'aconst_null'), 'invalid reference argument becomes null');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'invokespecial'
+    && instruction.operands.join(' ').includes('RecoveredDefaultValue <init> (Ljava/lang/String;)V')), 'constructor retains its declared descriptor');
+  t.end();
+});
+
+test('JRE metadata resolves DecimalFormat double formatting', (t) => {
+  const source = `
+import java.text.DecimalFormat;
+
+public class DecimalFormatSmoke {
+  private static DecimalFormat format = new DecimalFormat("0.00");
+
+  static String display(double value) {
+    return format.format(value);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'DecimalFormatSmoke.java' });
+  const operands = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'DecimalFormat double call compiles completely');
+  t.ok(operands.some((operand) => operand.includes('java/text/DecimalFormat <init> (Ljava/lang/String;)V')), 'DecimalFormat pattern constructor is resolved');
+  t.ok(operands.some((operand) => operand.includes('java/text/DecimalFormat format (D)Ljava/lang/String;')), 'DecimalFormat double format overload is resolved');
+  t.end();
+});
+
+test('AWT Point fields type nested overload arguments', (t) => {
+  const source = `
+import java.awt.Component;
+import java.awt.Point;
+
+public class PointFieldCallSmoke {
+  Object submit(int code, int y, int marker, Object value, int x) { return value; }
+
+  Object submit(Component component, int dx, int dy) {
+    Point point = component.getLocationOnScreen();
+    return submit(14, dy + point.y, 8128, null, point.x + dx);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'PointFieldCallSmoke.java' });
+  const operands = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Point field overload call compiles completely');
+  t.ok(operands.some((operand) => operand.includes('java/awt/Component getLocationOnScreen ()Ljava/awt/Point;')), 'location call returns Point');
+  t.ok(operands.some((operand) => operand.includes('java/awt/Point x I')), 'Point.x field is typed');
+  t.ok(operands.some((operand) => operand.includes('java/awt/Point y I')), 'Point.y field is typed');
+  t.end();
+});
+
+test('AWT Point integer fields support structured unary negation', (t) => {
+  const source = `
+import java.awt.Point;
+
+public class PointUnarySmoke {
+  int offset(Point point, int value) {
+    return value - -point.y;
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'PointUnarySmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Point field unary negation compiles completely');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'getfield'
+    && instruction.operands.join(' ').includes('java/awt/Point y I')), 'Point.y retains integer metadata');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'ineg'), 'field negation emits ineg');
+  t.end();
+});
+
+test('JRE metadata resolves radix Integer parsing', (t) => {
+  const source = `
+public class IntegerRadixSmoke {
+  int parse(String value, int offset) {
+    return Integer.parseInt(value.substring(offset, offset + 1), 16);
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'IntegerRadixSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'radix integer parsing compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Integer parseInt (Ljava/lang/String;I)I')), 'radix parseInt overload is selected');
+  t.end();
+});
+
+test('multi-catch parameters erase to Throwable and can be rethrown', (t) => {
+  const source = `
+public class MultiCatchRethrowSmoke {
+  void run() {
+    try {
+      Integer.parseInt("x");
+    } catch (RuntimeException | Error failure) {
+      throw failure;
+    }
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'MultiCatchRethrowSmoke.java' });
+  const instructions = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'multi-catch rethrow compiles completely');
+  t.ok(instructions.some((instruction) => instruction.opcode === 'athrow'), 'multi-catch local is emitted as a throwable reference');
+  t.end();
+});
+
+test('JRE metadata resolves static Long string conversions', (t) => {
+  const source = `
+public class LongToStringSmoke {
+  String decimal(long value) { return Long.toString(value); }
+  String radix(long value) { return Long.toString(value, 16); }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'LongToStringSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'static Long string conversions compile completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Long toString (J)Ljava/lang/String;')), 'decimal overload is resolved');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/Long toString (JI)Ljava/lang/String;')), 'radix overload is resolved');
+  t.end();
+});
+
+test('Deflater compiles and produces a real bounded raw-deflate stream', (t) => {
+  const zlib = require('zlib');
+  const Deflater = require('../src/jre/java/util/zip/Deflater');
+  const source = `
+import java.util.zip.Deflater;
+public class DeflaterSmoke {
+  boolean compress(Deflater deflater, byte[] input, byte[] output) {
+    deflater.setInput(input, 0, input.length);
+    deflater.finish();
+    deflater.deflate(output, 0, output.length);
+    return deflater.finished() && deflater.getTotalIn() == input.length;
+  }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'DeflaterSmoke.java' });
+  const object = {};
+  const input = Array.from(Buffer.from('stateful deflater runtime behavior'));
+  const output = new Array(128).fill(0);
+
+  Deflater.methods['<init>(IZ)V'](null, object, [6, 1]);
+  Deflater.methods['setInput([BII)V'](null, object, [input, 0, input.length]);
+  Deflater.methods['finish()V'](null, object, []);
+  const first = Deflater.methods['deflate([BII)I'](null, object, [output, 0, 4]);
+  const second = Deflater.methods['deflate([BII)I'](null, object, [output, first, output.length - first]);
+  const restored = zlib.inflateRawSync(Buffer.from(output.slice(0, first + second))).toString();
+
+  t.equal(result.bytecodeIr.status, 'complete', 'Deflater API compiles completely');
+  t.equal(first, 4, 'deflate respects the requested output bound');
+  t.equal(restored, 'stateful deflater runtime behavior', 'emitted bytes are a valid raw-deflate stream');
+  t.equal(Deflater.methods['getTotalIn()I'](null, object, []), input.length, 'input accounting is retained');
+  t.equal(Deflater.methods['finished()Z'](null, object, []), 1, 'finished becomes true after all compressed bytes are consumed');
+  t.end();
+});
+
+test('System.setOut compiles and replaces the runtime output stream', (t) => {
+  const System = require('../src/jre/java/lang/System');
+  const source = `
+import java.io.PrintStream;
+public class SystemSetOutSmoke {
+  void redirect(PrintStream stream) { System.setOut(stream); }
+}
+`;
+  const result = frontend.compileJavaSource(source, { sourceFileName: 'SystemSetOutSmoke.java' });
+  const invokes = result.bytecodeIr.classes
+    .flatMap((irClass) => irClass.methods)
+    .flatMap((method) => method.instructions)
+    .filter((instruction) => instruction.opcode === 'invokestatic')
+    .map((instruction) => instruction.operands.join(' '));
+  const staticFields = new Map();
+  const stream = { type: 'java/io/PrintStream', fields: {} };
+  const jvm = { classes: { 'java/lang/System': { staticFields } } };
+
+  System.staticMethods['setOut(Ljava/io/PrintStream;)V'](jvm, null, [stream]);
+
+  t.equal(result.bytecodeIr.status, 'complete', 'System.setOut compiles completely');
+  t.ok(invokes.some((operand) => operand.includes('java/lang/System setOut (Ljava/io/PrintStream;)V')), 'setOut uses its standard descriptor');
+  t.equal(staticFields.get('out:Ljava/io/PrintStream;'), stream, 'setOut replaces the live runtime field by identity');
+  t.end();
+});
+
+test('fully qualified nested JRE types retain their binary owner', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class NestedJreOwnerSmoke {
+      public static String mixerName(javax.sound.sampled.Mixer.Info info) {
+        return info.getName();
+      }
+    }
+  `, { sourceFileName: 'NestedJreOwnerSmoke.java' });
+  t.equal(result.bytecodeIr.status, 'complete', 'nested JRE owner compiles completely');
+  t.ok(result.classes[0].jasmin.includes('invokevirtual Method javax/sound/sampled/Mixer$Info getName ()Ljava/lang/String;'),
+    'nested source type resolves to its JVM binary owner');
   t.end();
 });

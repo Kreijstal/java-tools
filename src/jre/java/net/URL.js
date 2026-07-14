@@ -76,3 +76,9 @@ module.exports = {
     },
   }
 };
+
+// java.net.URL's public constructors declare `throws MalformedURLException` (a checked
+// IOException subtype). Record it so callers that don't catch/declare it get an unchecked
+// boundary wrap (mirrors the bytecode's real signature). __throws is read by jreMetadata.
+module.exports.methods['<init>(Ljava/lang/String;)V'].__throws = ['java/net/MalformedURLException'];
+module.exports.methods['<init>(Ljava/net/URL;Ljava/lang/String;)V'].__throws = ['java/net/MalformedURLException'];

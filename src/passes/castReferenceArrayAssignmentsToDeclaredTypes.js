@@ -89,6 +89,13 @@ function collapseImmediateArrayAlias(items, index, locals, parameterLocals = new
   const targetLocal = astoreLocal(items[targetStoreIndex]);
   if (targetLocal == null || targetLocal === sourceLocal) return null;
   if (parameterLocals.has(targetLocal)) return null;
+  // Collapsing deletes sourceLocal's only definition here. The rename below
+  // only walks forward linearly, so any parameter value, earlier load, or
+  // other store of the slot would leave a load reading an undefined local
+  // (real-JVM VerifyError, CFR "Exception decompiling"). Require the slot to
+  // be dead outside this window plus the forward loads we rewrite.
+  if (parameterLocals.has(sourceLocal)) return null;
+  if (!aliasSourceFullyRewritable(items, sourceLocal, index, targetStoreIndex)) return null;
   const produced = producerDescriptor(items, previousInstructionIndex(items, index), locals);
   if (!isConcreteReferenceArrayDescriptor(produced)) return null;
   const expected = locals.get(targetLocal);
@@ -109,6 +116,12 @@ function collapseImmediateCastedAlias(items, index, locals) {
   if (aloadLocal(items[loadIndex]) !== sourceLocal || op(items[castIndex]) !== 'checkcast') return null;
   const targetLocal = astoreLocal(items[targetStoreIndex]);
   if (targetLocal == null || targetLocal === sourceLocal) return null;
+  // Collapsing renames sourceLocal's store and window load to targetLocal but
+  // touches nothing else, so any other reference to the slot would keep
+  // reading a local whose definition was just renamed away (real-JVM
+  // VerifyError, CFR "Exception decompiling"). Require the slot to be dead
+  // outside this window.
+  if (!aliasSourceUnusedOutsideWindow(items, sourceLocal, index, targetStoreIndex)) return null;
   const desc = referenceDescriptorFromClassName(arg(items[castIndex]));
   if (!isConcreteReferenceArrayDescriptor(desc)) return null;
   const expected = locals.get(targetLocal);
@@ -116,6 +129,27 @@ function collapseImmediateCastedAlias(items, index, locals) {
   items[index].instruction = storeRef(targetLocal);
   items[loadIndex].instruction = loadRef(targetLocal);
   return { sourceLocal, targetLocal, desc, endIndex: targetStoreIndex, insertions: [] };
+}
+
+function aliasSourceUnusedOutsideWindow(items, sourceLocal, windowStart, windowEnd) {
+  for (let i = 0; i < items.length; i += 1) {
+    if (i >= windowStart && i <= windowEnd) continue;
+    if (astoreLocal(items[i]) === sourceLocal || aloadLocal(items[i]) === sourceLocal) return false;
+  }
+  return true;
+}
+
+function aliasSourceFullyRewritable(items, sourceLocal, windowStart, windowEnd) {
+  // The caller renames every aload of sourceLocal AFTER the window (stopping
+  // at a redefinition). Anything else referencing the slot — a store
+  // elsewhere (the rename would stop early) or a load before the window
+  // (reads a value the collapse removes) — makes the collapse unsafe.
+  for (let i = 0; i < items.length; i += 1) {
+    if (i >= windowStart && i <= windowEnd) continue;
+    if (astoreLocal(items[i]) === sourceLocal) return false;
+    if (i < windowStart && aloadLocal(items[i]) === sourceLocal) return false;
+  }
+  return true;
 }
 
 function rewriteAliasLoads(items, startIndex, sourceLocal, targetLocal) {
@@ -209,7 +243,8 @@ function referenceDescriptorFromClassName(value) {
 }
 
 function arrayDescriptorFromClassName(value) {
-  return typeof value === 'string' && !value.startsWith('[') ? `[L${value};` : value;
+  if (typeof value !== 'string') return value;
+  return value.startsWith('[') ? `[${value}` : `[L${value};`;
 }
 
 function fieldDescriptor(ref) {
