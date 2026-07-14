@@ -33,7 +33,7 @@
     "decimal.js": "^10.4.3",
     "diff": "^8.0.0",
     "jszip": "^3.10.1",
-    "jvm_parser": "^0.0.12",
+    "jvm_parser": "^0.0.13",
     "node-fetch": "^3.0.0",
     "parsimmon": "^1.18.1",
     "puppeteer": "^24.17.0",
