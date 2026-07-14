@@ -399,34 +399,42 @@ const DEFAULT_RENDER = {
 };
 
 function printTree(tree, render = DEFAULT_RENDER) {
-  repairEmptyLoopExits(tree, []);
-  return emitStatements(treeToStatements(tree, render));
+  return emitStatements(treeToStatements(repairEmptyLoopExits(tree, []), render));
 }
 
 function repairEmptyLoopExits(node, loopLabels) {
-  if (!node) return;
+  if (!node) return node;
+  if (node.t === 'regionExit') {
+    const label = loopLabels[loopLabels.length - 1];
+    if (!label || node.mode === 'normal') return { t: 'seq', body: [] };
+    return { t: node.mode === 'continue' ? 'continue' : 'break', label };
+  }
   if (node.t === 'loop') {
-    repairEmptyLoopExits(node.body, [...loopLabels, node.label]);
-    return;
+    node.body = repairEmptyLoopExits(node.body, [...loopLabels, node.label]);
+    return node;
   }
   if (node.t === 'if') {
     const label = loopLabels[loopLabels.length - 1];
     if (label && isEmptyTree(node.then) && !isEmptyTree(node.els)) node.then = { t: 'break', label };
-    repairEmptyLoopExits(node.then, loopLabels);
-    repairEmptyLoopExits(node.els, loopLabels);
-    return;
+    node.then = repairEmptyLoopExits(node.then, loopLabels);
+    node.els = repairEmptyLoopExits(node.els, loopLabels);
+    return node;
   }
-  if (node.t === 'seq') for (const child of node.body || []) repairEmptyLoopExits(child, loopLabels);
-  else if (node.t === 'block') repairEmptyLoopExits(node.body, loopLabels);
+  if (node.t === 'seq') {
+    const body = node.body || [];
+    node.body = body.map((child) => repairEmptyLoopExits(child, loopLabels));
+  }
+  else if (node.t === 'block') node.body = repairEmptyLoopExits(node.body, loopLabels);
   else if (node.t === 'switch') {
-    for (const item of node.cases || []) repairEmptyLoopExits(item.body, loopLabels);
-    repairEmptyLoopExits(node.dflt, loopLabels);
+    for (const item of node.cases || []) item.body = repairEmptyLoopExits(item.body, loopLabels);
+    node.dflt = repairEmptyLoopExits(node.dflt, loopLabels);
   } else if (node.t === 'try') {
-    repairEmptyLoopExits(node.body, loopLabels);
-    for (const item of node.catches || []) repairEmptyLoopExits(item.body, loopLabels);
+    node.body = repairEmptyLoopExits(node.body, loopLabels);
+    for (const item of node.catches || []) item.body = repairEmptyLoopExits(item.body, loopLabels);
   } else if (node.t === 'synchronized') {
-    repairEmptyLoopExits(node.body, loopLabels);
+    node.body = repairEmptyLoopExits(node.body, loopLabels);
   }
+  return node;
 }
 
 function isEmptyTree(node) {

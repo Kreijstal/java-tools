@@ -67,6 +67,21 @@ test('straight-line diamond (if/else join) needs a labeled block', () => {
   assert.equal((src.match(/break L3;/g) || []).length, 2);
 });
 
+test('exception region exit inside a loop exits the loop', () => {
+  const src = printTree({
+    t: 'loop',
+    label: 'L0',
+    body: {
+      t: 'seq',
+      body: [
+        { t: 'straight', block: 0 },
+        { t: 'regionExit' },
+      ],
+    },
+  });
+  assert.match(src, /break L0;/);
+});
+
 test('simple while loop uses continue to the header', () => {
   // 0: fall 1 ; 1(header): if taken 1 (back) else 2 ; 2: return
   const cfg = cfgFrom([

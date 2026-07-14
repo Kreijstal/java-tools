@@ -954,7 +954,17 @@ function processGroup(work, group, ctx, commit) {
   const externalToRenderId = new Map();
   let exits;
   if (externalsList.length <= 1) {
-    for (const ext of externalsList) externalToRenderId.set(ext, ctx.emptyId);
+    const regionHasCycle = [...tryset].some((source) =>
+      succOfTerm(work.term[source]).some((target) =>
+        target != null && tryset.has(target) && target !== source && dominates(idom, target, source)));
+    for (const ext of externalsList) {
+      const rid = ctx.allocId();
+      ctx.overrides.set(rid, {
+        t: 'regionExit',
+        mode: regionHasCycle ? 'break' : 'normal',
+      });
+      externalToRenderId.set(ext, rid);
+    }
     exits = externalsList.map((ext) => ({ external: ext, index: 0 }));
   } else {
     const selectorName = ctx.allocSelector();
@@ -996,6 +1006,19 @@ function processGroup(work, group, ctx, commit) {
       });
     }
     tryNode = { t: 'try', body: tryTree, catches };
+    // A broader handler followed by a narrower one cannot be represented as
+    // sibling Java catches.  Such JVM tables describe nested protected ranges:
+    // the later handler also covers failures thrown by the earlier handler.
+    // Keep that ordering by wrapping the broad handler in an inner try.
+    const shadowed = catches.findIndex((item, index) => index > 0
+      && catches.slice(0, index).some((earlier) => earlier.type === 'java.lang.Throwable'));
+    if (shadowed > 0) {
+      tryNode = {
+        t: 'try',
+        body: { t: 'try', body: tryTree, catches: catches.slice(0, shadowed) },
+        catches: catches.slice(shadowed),
+      };
+    }
   }
   ctx.overrides.set(superId, tryNode);
   commit(collapseRegion(work, region, superId, group.start_pc, exits, ctx));
