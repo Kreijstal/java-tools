@@ -59,6 +59,28 @@ L1: athrow
 .end class
 `;
 
+const REFERENCE_BRANCH_JOIN = `.version 52 0
+.class public super ReferenceBranchJoin
+.super java/lang/Object
+
+.method public static wrap : (Ljava/lang/RuntimeException;Z)Ljava/lang/RuntimeException;
+    .code stack 3 locals 3
+L0: iload_1
+L1: ifeq L9
+L4: aload_0
+L5: astore_2
+L6: goto L17
+L9: new java/lang/RuntimeException
+L12: dup
+L13: invokespecial Method java/lang/RuntimeException <init> ()V
+L16: astore_2
+L17: aload_2
+L18: areturn
+    .end code
+.end method
+.end class
+`;
+
 function decompileFixture(tempDir, name, source) {
   const classFile = path.join(tempDir, `${name}.class`);
   assembleJasminSource(source, classFile);
@@ -87,6 +109,21 @@ test('reference locals reused with incompatible descriptor types stay separate',
     t.match(source, /Thread \w+ = field_THREAD;[\s\S]*?\.start\(\);/, 'Thread value retains its descriptor type');
     t.match(source, /String \w+ = "value";[\s\S]*?\.length\(\)/, 'String value uses a separate local binding');
     t.notOk(/\(String\) \(Object\).*THREAD/.test(source), 'descriptor-proven Thread is not cast to String');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('reference local written by both branches is returned from the joined binding', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-reference-join-'));
+  try {
+    const source = decompileFixture(tempDir, 'ReferenceBranchJoin', REFERENCE_BRANCH_JOIN);
+    const assignments = [...source.matchAll(/(var\d+(?:_ref\d*)?) = /g)].map((match) => match[1]);
+    const returned = /return (var\d+(?:_ref\d*)?);/.exec(source);
+    t.ok(returned, 'joined reference local is returned');
+    t.ok(assignments.length >= 2, 'both branches assign the joined local');
+    t.ok(returned && assignments.every((name) => name === returned[1]), 'both branches and return use one binding');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
