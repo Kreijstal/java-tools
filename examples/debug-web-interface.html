@@ -526,6 +526,7 @@
                 <option value="">Loading sample classes...</option>
             </select>
             <input type="file" id="classFileInput" accept=".class,.jar" class="is-hidden" style="margin-right: 10px;" title="Upload .class or .jar files">
+            <select id="jarMainClassSelect" class="is-hidden" aria-label="JAR entry class" title="Choose a class from the loaded JAR"></select>
             <button onclick="loadSelectedClass()" id="loadBtn">Load</button>
             <button onclick="runProgram()" id="runBtn" disabled title="Run without debugging">▶ Run</button>
             <button onclick="startDebugging()" id="debugBtn" disabled>Start &amp; Break</button>

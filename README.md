@@ -121,6 +121,12 @@ npm run serve
 
 Then open http://localhost:3000 to access the debugging interface.
 
+To load your own application, select **File**, choose a `.jar`, and click
+**Load**. The site extracts its class files in the browser and uses
+`META-INF/MANIFEST.MF`'s `Main-Class` as the default entry point. If the JAR
+does not declare one, choose a class from the entry-class picker before running
+or debugging it.
+
 ## 🏗️ Architecture
 
 ### Core Components

@@ -2046,10 +2046,26 @@ function loadClassFile() {
 
   jvmDebug
     .loadFile(file)
-    .then(() => {
+    .then(async () => {
       if (isJar) {
-        log(`JAR file ${fileName} loaded successfully`, "success");
+        const jarInfo = jvmDebug.getJarInfo(fileName);
+        if (!jarInfo || jarInfo.classFiles.length === 0) {
+          throw new Error("The archive does not contain any .class files");
+        }
+
+        setupJarClassSelector(jarInfo);
+        const selectedClass = jarInfo.mainClass || jarInfo.classFiles[0];
+        updateState({
+          loadedClass: { name: selectedClass },
+          className: selectedClass.replace(/\.class$/, ""),
+          status: "ready",
+        });
+        const entryDescription = jarInfo.mainClass
+          ? `Manifest entry point: ${jarInfo.mainClass}`
+          : `No Main-Class manifest entry; selected ${selectedClass}`;
+        log(`JAR file ${fileName} loaded successfully (${jarInfo.classFiles.length} classes). ${entryDescription}`, "success");
       } else {
+        hideJarClassSelector();
         const className = fileName.replace(".class", "");
         log(`Class file ${className} loaded successfully`, "success");
         updateState({
@@ -2069,11 +2085,51 @@ function loadClassFile() {
         runBtn.disabled = false;
       }
       setDebugControlsVisible(false);
+      await initializeMethodBrowser();
     })
     .catch((error) => {
       logError(`Failed to load ${fileName}`, error);
       updateStatus(`Failed to load ${fileName}`, "error");
     });
+}
+
+function setupJarClassSelector(jarInfo) {
+  const selector = document.getElementById("jarMainClassSelect");
+  if (!selector) {
+    return;
+  }
+
+  selector.innerHTML = "";
+  jarInfo.classFiles.forEach((classFile) => {
+    const option = document.createElement("option");
+    option.value = classFile;
+    option.textContent = classFile.replace(/\.class$/, "").replace(/\//g, ".");
+    selector.appendChild(option);
+  });
+
+  const manifestClassFile = jarInfo.mainClass
+    ? `${jarInfo.mainClass.replace(/\./g, "/")}.class`
+    : null;
+  selector.value = manifestClassFile && jarInfo.classFiles.includes(manifestClassFile)
+    ? manifestClassFile
+    : jarInfo.classFiles[0];
+  selector.classList.remove("is-hidden");
+  selector.onchange = () => {
+    updateState({
+      loadedClass: { name: selector.value },
+      className: selector.value.replace(/\.class$/, ""),
+      status: "ready",
+    });
+    log(`Selected JAR class: ${selector.options[selector.selectedIndex].textContent}`, "info");
+  };
+}
+
+function hideJarClassSelector() {
+  const selector = document.getElementById("jarMainClassSelect");
+  if (selector) {
+    selector.classList.add("is-hidden");
+    selector.innerHTML = "";
+  }
 }
 
 // Utility Functions for UI

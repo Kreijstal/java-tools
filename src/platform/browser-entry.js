@@ -81,6 +81,15 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Return the classes and manifest entry point found in a previously uploaded JAR.
+   * @param {string} fileName
+   * @returns {{classFiles: string[], mainClass: string|null}|null}
+   */
+  getJarInfo(fileName) {
+    return this.fileProvider.getJarInfo(fileName);
+  }
+
+  /**
    * Start debugging a class
    * @param {string} classPath - Path to the class file (virtual path) or class name
    * @param {object} options - Debug options

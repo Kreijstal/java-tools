@@ -10,6 +10,7 @@ class BrowserFileProvider extends FileProvider {
     // Virtual file system to store loaded files
     this.virtualFS = new Map(); // Map<string, Uint8Array>
     this.loadedJars = new Set(); // Track loaded JAR files
+    this.jarInfo = new Map(); // Map<string, { classFiles: string[], mainClass: string|null }>
   }
 
   /**
@@ -90,7 +91,7 @@ class BrowserFileProvider extends FileProvider {
         const content = new Uint8Array(arrayBuffer);
         
         // Check if it's a JAR file (ZIP archive)
-        if (file.name.endsWith('.jar') || file.name.endsWith('.zip')) {
+        if (/\.(jar|zip)$/i.test(file.name)) {
           this.loadJarArchive(content, file.name)
             .then(() => resolve(virtualPath))
             .catch(reject);
@@ -119,17 +120,29 @@ class BrowserFileProvider extends FileProvider {
       await zip.loadAsync(jarContent);
       
       const extractedFiles = [];
+      let manifestText = null;
       
       // Extract all .class files
       for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
-        if (!zipEntry.dir && relativePath.endsWith('.class')) {
+        const normalizedPath = this.normalizeArchivePath(relativePath);
+        if (!normalizedPath || zipEntry.dir) {
+          continue;
+        }
+
+        if (normalizedPath.toUpperCase() === 'META-INF/MANIFEST.MF') {
+          manifestText = await zipEntry.async('text');
+        } else if (/\.class$/i.test(normalizedPath)) {
           const content = await zipEntry.async('uint8array');
-          this.virtualFS.set(relativePath, content);
-          extractedFiles.push(relativePath);
+          this.virtualFS.set(normalizedPath, content);
+          extractedFiles.push(normalizedPath);
         }
       }
       
       this.loadedJars.add(jarName);
+      this.jarInfo.set(jarName, {
+        classFiles: extractedFiles.sort(),
+        mainClass: this.getManifestMainClass(manifestText),
+      });
       return extractedFiles;
     } catch (error) {
       throw new Error(`Failed to extract JAR ${jarName}: ${error.message}`);
@@ -186,6 +199,7 @@ class BrowserFileProvider extends FileProvider {
   clear() {
     this.virtualFS.clear();
     this.loadedJars.clear();
+    this.jarInfo.clear();
   }
 
   /**
@@ -194,6 +208,47 @@ class BrowserFileProvider extends FileProvider {
    */
   getLoadedJars() {
     return Array.from(this.loadedJars);
+  }
+
+  /**
+   * Return classes and the manifest entry point discovered for a loaded JAR.
+   * @param {string} jarName - Original uploaded file name
+   * @returns {{classFiles: string[], mainClass: string|null}|null}
+   */
+  getJarInfo(jarName) {
+    const info = this.jarInfo.get(jarName);
+    if (!info) {
+      return null;
+    }
+    return { classFiles: [...info.classFiles], mainClass: info.mainClass };
+  }
+
+  /**
+   * Reject archive paths that could escape the virtual filesystem root.
+   * @param {string} archivePath
+   * @returns {string|null}
+   */
+  normalizeArchivePath(archivePath) {
+    const normalized = this.normalizePath(archivePath).replace(/^\/+/, '');
+    if (!normalized || normalized.split('/').some((part) => part === '..')) {
+      return null;
+    }
+    return normalized;
+  }
+
+  /**
+   * Parse the Main-Class attribute, including manifest continuation lines.
+   * @param {string|null} manifestText
+   * @returns {string|null}
+   */
+  getManifestMainClass(manifestText) {
+    if (!manifestText) {
+      return null;
+    }
+
+    const unfolded = manifestText.replace(/\r?\n /g, '');
+    const match = unfolded.match(/^Main-Class:\s*(.+)\s*$/im);
+    return match ? match[1].trim().replace(/\//g, '.') : null;
   }
 
   /**
