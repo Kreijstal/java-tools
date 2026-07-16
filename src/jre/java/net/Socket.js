@@ -11,6 +11,27 @@ function javaStr(v) {
 // Socket*Stream classes can reach them.
 const { Sockets, allocId, register } = require('./socketRegistry');
 
+function installApplicationKeepalive(nativeSocket) {
+  const hex = process.env.JVM_SOCKET_APP_KEEPALIVE_HEX;
+  if (!hex) return;
+  if (!/^(?:[0-9a-fA-F]{2})+$/.test(hex)) {
+    throw new Error('JVM_SOCKET_APP_KEEPALIVE_HEX must contain whole hexadecimal bytes');
+  }
+
+  const payload = Buffer.from(hex, 'hex');
+  const configuredInterval = Number(process.env.JVM_SOCKET_APP_KEEPALIVE_MS);
+  const interval = Number.isFinite(configuredInterval) && configuredInterval > 0
+    ? configuredInterval
+    : 10000;
+  const timer = setInterval(() => {
+    if (!nativeSocket.destroyed && nativeSocket.writable) {
+      nativeSocket.write(payload);
+    }
+  }, interval);
+  timer.unref();
+  nativeSocket.once('close', () => clearInterval(timer));
+}
+
 module.exports = {
   super: 'java/lang/Object',
   methods: {
@@ -30,7 +51,8 @@ module.exports = {
 
       // Node's connect is async. We fire and forget for now.
       nativeSocket.connect(port, host, () => {
-        // Connected.
+        nativeSocket.setKeepAlive(true, 10000);
+        installApplicationKeepalive(nativeSocket);
       });
 
       // Prevent unhandled errors from crashing the process.

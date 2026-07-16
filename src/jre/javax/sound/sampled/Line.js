@@ -6,7 +6,11 @@ module.exports = {
       // up, writes go to a discard sink (headless).
       obj.isOpen = true;
       if (!obj.audioOutput) {
-        obj.audioOutput = { write() {}, once(event, cb) { if (cb) cb(); } };
+        obj.audioOutput = {
+          write() {},
+          once(event, cb) { if (cb) cb(); },
+          end() {},
+        };
       }
     },
     'close()V': (jvm, obj, args) => {

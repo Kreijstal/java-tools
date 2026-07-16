@@ -8,6 +8,14 @@ const HashMap = require('../src/jre/java/util/HashMap');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
 const Matcher = require('../src/jre/java/util/regex/Matcher');
 const StringClass = require('../src/jre/java/lang/String');
+const CRC32 = require('../src/jre/java/util/zip/CRC32');
+const SourceDataLine = require('../src/jre/javax/sound/sampled/SourceDataLine');
+const Toolkit = require('../src/jre/java/awt/Toolkit');
+const ImageClass = require('../src/jre/java/awt/Image');
+const PixelGrabber = require('../src/jre/java/awt/image/PixelGrabber');
+const { setAudioOutputFactory } = require('../src/platform/audio');
+const { encodePng } = require('../src/io/pngEncoder');
+const jpeg = require('jpeg-js');
 
 function jvmStub() {
   return {
@@ -46,6 +54,88 @@ test('HashMap.computeIfAbsent does not record null mapping results', (t) => {
   t.equal(value, null);
   t.equal(HashMap.methods['containsKey(Ljava/lang/Object;)Z'](null, map, ['k']), 0);
   t.equal(HashMap.methods['size()I'](null, map, []), 0);
+  t.end();
+});
+
+test('CRC32 treats signed Java bytes as unsigned octets', (t) => {
+  const obj = {};
+
+  CRC32.methods['<init>()V'](null, obj, []);
+  CRC32.methods['update([BII)V'](null, obj, [[-1, 0, 127, -128], 0, 4]);
+
+  t.equal(CRC32.methods['getValue()J'](null, obj, []), 0xba5e3ff4n);
+  t.end();
+});
+
+test('headless SourceDataLine discard sink closes cleanly', (t) => {
+  const obj = {};
+  const format = {
+    fields: {
+      'javax/sound/sampled/AudioFormat': {},
+    },
+  };
+
+  setAudioOutputFactory(() => { throw new Error('no audio device'); });
+  SourceDataLine.methods['open(Ljavax/sound/sampled/AudioFormat;)V'](null, obj, [format]);
+  t.doesNotThrow(() => SourceDataLine.methods['close()V'](null, obj, []));
+  setAudioOutputFactory(null);
+  t.end();
+});
+
+test('disabled SourceDataLine applies backpressure', (t) => {
+  const previous = process.env.JVM_DISABLE_AUDIO;
+  process.env.JVM_DISABLE_AUDIO = '1';
+
+  t.equal(SourceDataLine.methods['available()I'](null, {}, []), 0);
+
+  if (previous === undefined) delete process.env.JVM_DISABLE_AUDIO;
+  else process.env.JVM_DISABLE_AUDIO = previous;
+  t.end();
+});
+
+test('Toolkit decodes GIF dimensions and PixelGrabber pixels', (t) => {
+  const gif = Array.from(
+    Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64'),
+    (value) => (value << 24) >> 24,
+  );
+  const image = Toolkit.methods['createImage([B)Ljava/awt/Image;'](null, null, [gif]);
+  const target = [0];
+  const grabber = {};
+
+  t.equal(ImageClass.methods['getWidth(Ljava/awt/image/ImageObserver;)I'](null, image, [null]), 1);
+  t.equal(ImageClass.methods['getHeight(Ljava/awt/image/ImageObserver;)I'](null, image, [null]), 1);
+  PixelGrabber.methods['<init>(Ljava/awt/Image;IIII[III)V'](
+    null,
+    grabber,
+    [image, 0, 0, 1, 1, target, 0, 1],
+  );
+  t.equal(PixelGrabber.methods['grabPixels()Z'](null, grabber, []), 1);
+  t.equal(target[0] >>> 0, 0xffffffff);
+  t.end();
+});
+
+test('Toolkit decodes PNG pixels', (t) => {
+  const png = Array.from(encodePng([0x123456, 0xabcdef], 2, 1), (value) => (value << 24) >> 24);
+  const image = Toolkit.methods['createImage([B)Ljava/awt/Image;'](null, null, [png]);
+
+  t.equal(image._width, 2);
+  t.equal(image._height, 1);
+  t.deepEqual(image._pixels.map((pixel) => pixel >>> 0), [0xff123456, 0xffabcdef]);
+  t.end();
+});
+
+test('Toolkit decodes JPEG dimensions and pixels', (t) => {
+  const encoded = jpeg.encode({
+    width: 1,
+    height: 1,
+    data: Buffer.from([220, 40, 20, 255]),
+  }, 100).data;
+  const image = Toolkit.methods['createImage([B)Ljava/awt/Image;'](null, null, [encoded]);
+  const pixel = image._pixels[0] >>> 0;
+
+  t.equal(image._width, 1);
+  t.equal(image._height, 1);
+  t.ok((pixel >> 16 & 0xff) > 180, 'red channel survives JPEG decoding');
   t.end();
 });
 

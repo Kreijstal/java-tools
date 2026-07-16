@@ -12,12 +12,14 @@ module.exports = {
       };
     },
     'getWidth(Ljava/awt/image/ImageObserver;)I': (jvm, obj, args) => {
+      if (Number.isFinite(obj._width)) return obj._width | 0;
       if (!obj._awtImage || !obj._awtImage.getWidth) {
         return 0;
       }
       return obj._awtImage.getWidth();
     },
     'getHeight(Ljava/awt/image/ImageObserver;)I': (jvm, obj, args) => {
+      if (Number.isFinite(obj._height)) return obj._height | 0;
       if (!obj._awtImage || !obj._awtImage.getHeight) {
         return 0;
       }
