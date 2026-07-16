@@ -53,7 +53,8 @@ module.exports = {
 
       const actualLen = Math.min(len, obj.buffer.length - obj.pos);
       for (let i = 0; i < actualLen; i++) {
-        target[off + i] = obj.buffer[obj.pos + i];
+        // obj.buffer is a Node Buffer (unsigned); Java byte arrays hold signed bytes.
+        target[off + i] = (obj.buffer[obj.pos + i] << 24) >> 24;
       }
       obj.pos += actualLen;
       return actualLen;

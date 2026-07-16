@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/image/DataBuffer',
   methods: {
     // Shares the caller's int[] — the game writes pixels into it directly.
     '<init>([II)V': (jvm, obj, args) => {

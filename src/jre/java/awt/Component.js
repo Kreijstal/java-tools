@@ -295,7 +295,11 @@ module.exports = {
     'getTreeLock()Ljava/lang/Object;': (jvm, obj) => obj._treeLock || obj,
 
     'createImage(Ljava/awt/image/ImageProducer;)Ljava/awt/Image;': (jvm, obj, args) => {
-      return null;
+      // The game's own ImageProducer holds the live int[] framebuffer in one of
+      // its fields and pushes it via ImageConsumer.setPixels. Keep a reference
+      // so drawImage can materialise the current framebuffer on demand (see
+      // Graphics.drawImage / materializeProducerImage).
+      return { type: 'java/awt/Image', _producer: args[0] };
     },
 
     'prepareImage(Ljava/awt/Image;Ljava/awt/image/ImageObserver;)Z': (jvm, obj, args) => {

@@ -15,9 +15,48 @@ function dumpFrame(pixels, width, height) {
     fs.mkdirSync(process.env.JVM_FRAME_DIR, { recursive: true });
     const file = path.join(process.env.JVM_FRAME_DIR, `frame-${String(n).padStart(5, '0')}.png`);
     fs.writeFileSync(file, encodePng(pixels, width, height));
+    console.error(`[frame] +${(process.uptime()).toFixed(1)}s ${file} (${width}x${height})`);
   } catch (e) {
     console.error(`frame dump failed: ${e.message}`);
   }
+}
+
+// A game ImageProducer (e.g. the RS-style DrawingArea) keeps its framebuffer
+// as the largest int[] field on the producer object and its width/height as two
+// int fields whose product is that array's usable length (allocated as
+// `new int[1 + w*h]`). Recover them field-name-agnostically and expose the live
+// array as a DataBufferInt-style raster so drawImage can blit/dump it.
+function materializeProducerImage(imageObj) {
+  const producer = imageObj._producer;
+  if (!producer || !producer.fields) return;
+  let pixels = null;
+  const ints = [];
+  for (const key of Object.keys(producer.fields)) {
+    const v = producer.fields[key];
+    if (Array.isArray(v) && v.type === '[I') {
+      if (!pixels || v.length > pixels.length) pixels = v;
+    } else if (typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= 8192) {
+      ints.push(v);
+    }
+  }
+  if (!pixels || pixels.length < 2) return;
+  const L = pixels.length;
+  let w = 0, h = 0;
+  // Prefer a (w,h) pair that are both actual int fields on the producer.
+  for (const a of ints) {
+    for (const target of [L - 1, L]) {
+      if (a > 0 && target % a === 0 && ints.includes(target / a)) { w = a; h = target / a; break; }
+    }
+    if (w) break;
+  }
+  // Fallback: any factor of L-1 drawn from the int fields.
+  if (!w) {
+    for (const a of ints) { if (a > 1 && (L - 1) % a === 0) { w = a; h = (L - 1) / a; break; } }
+  }
+  if (!w || !h) return;
+  imageObj._width = w;
+  imageObj._height = h;
+  imageObj._raster = { _dataBuffer: { _data: pixels } };
 }
 
 // Software raster for headless components: a Graphics with a _component but
@@ -162,6 +201,13 @@ module.exports = {
       const imageObj = args[0];
       if (!imageObj) {
         return 0;
+      }
+      // An image created from the game's own ImageProducer carries a live
+      // reference to that producer. Pull its current int[] framebuffer into a
+      // raster so the shared blit/dump path below observes the real frame
+      // (mutated in place each render), not just the fillRect background.
+      if (imageObj._producer && !imageObj._raster) {
+        materializeProducerImage(imageObj);
       }
 
       // Headless raster path: a BufferedImage over a DataBufferInt is the

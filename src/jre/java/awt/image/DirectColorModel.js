@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/image/ColorModel',
   methods: {
     '<init>(IIII)V': (jvm, obj, args) => {
       obj._bits = args[0];

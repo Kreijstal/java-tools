@@ -55,6 +55,7 @@ class JVM {
     this.maxStackDepth = options.maxStackDepth || 1024;
     this.yieldInterval = options.yieldInterval || 4096;
     this._ticksSinceYield = 0;
+    this._hotMethodCounts = new Map();
     this.jit = new JitCompiler(this, options.jit || {});
 
     // Make fs and path available for JreBootstrap (only in Node.js environment)
@@ -1046,6 +1047,13 @@ class JVM {
   }
 
   async executeInstruction(instruction, frame, thread) {
+    if (typeof process !== 'undefined' && process.env &&
+      (process.env.JVM_PROFILE_HOT_METHODS === '1' ||
+        process.env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1')) {
+      const method = frame.method || {};
+      const key = `${frame.className}.${method.name || '?'}${method.descriptor || ''}`;
+      this._hotMethodCounts.set(key, (this._hotMethodCounts.get(key) || 0) + 1);
+    }
     if (typeof process !== 'undefined' && process.env && process.env.JVM_TRACE) {
       if (!thread._trace) thread._trace = [];
       const m = frame.method || {};
@@ -1073,6 +1081,15 @@ class JVM {
       }
     }
     await dispatch(frame, instruction, this, thread);
+  }
+
+  dumpHotMethods(limit = 10) {
+    const ranked = [...this._hotMethodCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(1, Number(limit) || 10));
+    if (!ranked.length) return;
+    console.error('--- JVM hot methods (interpreted instructions) ---');
+    for (const [method, count] of ranked) console.error(`${count}\t${method}`);
   }
 
   loadClassByPathSync(classFilePath) {
@@ -1750,6 +1767,12 @@ class JVM {
   }
 
   handleException(exception, pc, thread) {
+    if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_THROW) {
+      const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
+      const m = top && top.method ? top.method : {};
+      console.error(`[throw] ${exception && exception.type} msg=${exception && exception.message} ` +
+        `at ${top ? top.className : '?'}.${m.name || '?'}${m.descriptor || ''} pc=${top ? top.pc : '?'} thread=${thread.id}`);
+    }
     if (thread.pendingException) {
       delete thread.pendingException;
     }

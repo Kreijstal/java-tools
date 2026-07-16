@@ -148,7 +148,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     if (typeof boxedObj[methodKey] === "function") {
       const result = boxedObj[methodKey]();
       const { returnType } = parseDescriptor(descriptor);
-      if (returnType !== "V" && result !== undefined) {
+      if (returnType !== "V" && returnType !== "void" && result !== undefined) {
         frame.stack.push(result);
       }
       return;
@@ -169,7 +169,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
       }
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
-        if (returnType !== "V" && result !== undefined) {
+        if (returnType !== "V" && returnType !== "void" && result !== undefined) {
           if (typeof result === "boolean") {
             result = result ? 1 : 0;
           }
@@ -204,7 +204,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
       }
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
-        if (returnType !== "V" && result !== undefined) {
+        if (returnType !== "V" && returnType !== "void" && result !== undefined) {
           if (typeof result === "boolean") {
             result = result ? 1 : 0;
           }
@@ -282,7 +282,7 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
     let result = await jreMethod(jvm, null, args, thread);
     const { returnType } = parseDescriptor(descriptor);
-    if (returnType !== "V" && result !== undefined) {
+    if (returnType !== "V" && returnType !== "void" && result !== undefined) {
       if (typeof result === "boolean") {
         result = result ? 1 : 0;
       }
@@ -368,7 +368,7 @@ async function invokespecial(frame, instruction, jvm, thread) {
     let result = await jreMethod(jvm, obj, args, thread);
     if (result !== ASYNC_METHOD_SENTINEL) {
       const { returnType } = parseDescriptor(descriptor);
-      if (returnType !== "V" && result !== undefined) {
+      if (returnType !== "V" && returnType !== "void" && result !== undefined) {
         if (typeof result === "boolean") {
           result = result ? 1 : 0;
         }
@@ -648,7 +648,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
       thread,
     );
     const { returnType } = parseDescriptor(descriptor);
-    if (returnType !== "V" && result !== undefined) {
+    if (returnType !== "V" && returnType !== "void" && result !== undefined) {
       if (typeof result === "boolean") {
         result = result ? 1 : 0;
       }
@@ -663,7 +663,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     if (typeof boxedObj[methodKey] === "function") {
       const result = boxedObj[methodKey]();
       const { returnType } = parseDescriptor(descriptor);
-      if (returnType !== "V" && result !== undefined) {
+      if (returnType !== "V" && returnType !== "void" && result !== undefined) {
         frame.stack.push(result);
       }
       return;
@@ -681,7 +681,7 @@ async function invokeinterface(frame, instruction, jvm, thread) {
       let result = jreMethod(jvm, boxedObj, args, thread);
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
-        if (returnType !== "V" && result !== undefined) {
+        if (returnType !== "V" && returnType !== "void" && result !== undefined) {
           if (typeof result === "boolean") {
             result = result ? 1 : 0;
           }

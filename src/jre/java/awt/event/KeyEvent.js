@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/event/InputEvent',
   methods: {
     'getKeyCode()I': (jvm, obj) => obj.keyCode || 0,
     'getKeyChar()C': (jvm, obj) => obj.keyChar || 0,

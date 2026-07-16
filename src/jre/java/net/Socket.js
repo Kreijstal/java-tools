@@ -93,9 +93,21 @@ module.exports = {
       }
     },
 
-    'close()V': (jvm, obj, args) => {
+    'close()V': (jvm, obj, args, thread) => {
       if (obj.isClosed) {
           return;
+      }
+      if (process.env.JVM_DEBUG_SOCKET) {
+        // Name the Java frames deciding to close — invaluable when a game
+        // drops a connection and we need to know which code path did it.
+        let stack = '?';
+        const t = thread || jvm.threads[jvm.currentThreadIndex];
+        if (t && t.callStack && t.callStack.items) {
+          stack = t.callStack.items.map((f) => `${f.className}.${f.method && f.method.name}${(f.method && f.method.descriptor) || ''}@${f.pc}`).join(' <- ');
+        }
+        const { Buffers } = require('./socketRegistry');
+        const st = Buffers.get(obj.socketId);
+        console.error(`[socket ${obj.socketId} close()] consumed=${(st && st.consumed) || 0}B pending=${(st && st.size) || 0}B by ${stack}`);
       }
       const nativeSocket = Sockets.get(obj.socketId);
       if (nativeSocket) {

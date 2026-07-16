@@ -421,6 +421,93 @@ Ldone1:
 .end class
 `;
 
+// Reduced from dekobloko qk.run (dekobloko-work issues #4 and #13). The
+// synchronized region has two distinct exits, and the normal exit computes a
+// ring-buffer write length whose shorter branch must skip the tail assignment.
+// Losing either piece produces valid-looking but incorrect Java: wait() runs
+// without the monitor, or `write - read` is always overwritten by
+// `capacity - read`.
+const SYNC_WRITER_REGRESSION_JASMIN = `.version 52 0
+.class public super org/benf/cfr/tests/SyncWriterRegression
+.super java/lang/Object
+
+.field private write I
+.field private read I
+.field private capacity I
+.field private closed Z
+
+.method public <init> : ()V
+    .code stack 1 locals 1
+Linit0: aload_0
+Linit1: invokespecial Method java/lang/Object <init> ()V
+Linit2: return
+    .end code
+.end method
+
+.method public nextLength : (Z)I
+    .code stack 3 locals 7
+        .catch any from Lbody to LafterEarlyRelease using Lhandler
+        .catch any from Lwait to LafterNormalRelease using Lhandler
+        .catch any from Lhandler to LhandlerRelease using Lhandler
+L0: iload_1
+L1: istore 6
+L2: aload_0
+L3: dup
+L4: astore_3
+L5: monitorenter
+Lbody: aload_0
+L7: getfield Field org/benf/cfr/tests/SyncWriterRegression write I
+L10: aload_0
+L11: getfield Field org/benf/cfr/tests/SyncWriterRegression read I
+L14: if_icmpne Lcompute
+L17: aload_0
+L18: getfield Field org/benf/cfr/tests/SyncWriterRegression closed Z
+L21: ifeq Lwait
+LearlyRelease: aload_3
+L25: monitorexit
+LafterEarlyRelease: iload 6
+L28: ifeq Lclosed
+Lwait: aload_0
+L32: invokevirtual Method java/lang/Object wait ()V
+Lcompute: aload_0
+L36: getfield Field org/benf/cfr/tests/SyncWriterRegression read I
+L39: istore_2
+L40: aload_0
+L41: getfield Field org/benf/cfr/tests/SyncWriterRegression read I
+L44: aload_0
+L45: getfield Field org/benf/cfr/tests/SyncWriterRegression write I
+L48: if_icmpgt Lwrapped
+L51: aload_0
+L52: getfield Field org/benf/cfr/tests/SyncWriterRegression write I
+L55: aload_0
+L56: getfield Field org/benf/cfr/tests/SyncWriterRegression read I
+L59: isub
+L60: istore 4
+L62: iload 6
+L64: ifeq LnormalRelease
+Lwrapped: aload_0
+L68: getfield Field org/benf/cfr/tests/SyncWriterRegression capacity I
+L71: aload_0
+L72: getfield Field org/benf/cfr/tests/SyncWriterRegression read I
+L75: isub
+L76: istore 4
+LnormalRelease: aload_3
+L80: monitorexit
+LafterNormalRelease: iload 4
+L83: ireturn
+Lclosed: iconst_m1
+L85: ireturn
+Lhandler: astore 5
+L88: aload_3
+L89: monitorexit
+LhandlerRelease: aload 5
+L92: athrow
+    .end code
+.end method
+.sourcefile "SyncWriterRegression.java"
+.end class
+`;
+
 function withTempDir(prefix, fn) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   try {
@@ -475,5 +562,33 @@ test('CFR-JS reconstructs constructor delegation calls', (t) => {
     t.match(source, /public CtorFeatureTest\(int value\) \{\s*super\(value\);\s*}/, 'super constructor calls are rendered as super(...)');
     t.match(source, /public CtorFeatureTest\(\) \{\s*this\(0\);\s*}/, 'same-class constructor calls are rendered as this(...)');
     t.notOk(/this\.BaseCtor|this\.CtorFeatureTest/.test(source), 'constructor calls are not emitted as illegal receiver-qualified calls');
+  });
+});
+
+test('CFR-JS preserves synchronized multi-exit ring-buffer selection', (t) => {
+  t.plan(6);
+  withTempDir('cfr-sync-writer-', (tempDir) => {
+    const source = decompileFixture(tempDir, 'SyncWriterRegression', SYNC_WRITER_REGRESSION_JASMIN);
+
+    t.notOk(/^\s*\/\/\s*(?:monitorenter|monitorexit)\b/m.test(source),
+      'monitor operations do not fall back to comments');
+    t.match(source, /synchronized \([^)]*\) \{[\s\S]*?this\.wait\(\);[\s\S]*?\n\s*}/,
+      'wait remains inside the reconstructed synchronized block');
+    const contiguous = source.match(/\b(\w+) = [^;\n]*\.write - [^;\n]*\.read;/);
+    t.ok(contiguous, 'contiguous pending-byte length is retained');
+    const lengthLocal = contiguous && contiguous[1];
+    const wrappedPattern = lengthLocal
+      ? new RegExp(`\\b${lengthLocal} = [^;\\n]*\\.capacity - [^;\\n]*\\.read;`)
+      : /$a/;
+    const wrapped = source.match(wrappedPattern);
+    t.ok(wrapped, 'wrapped pending-byte length is retained');
+    const branchGap = contiguous && wrapped
+      ? source.slice(contiguous.index + contiguous[0].length, wrapped.index)
+      : '';
+    t.match(branchGap, /if \([^)]*== 0\) \{[\s\S]*?break [^;]+;/,
+      'normal branch skips the wrapped-length overwrite');
+    t.notOk(lengthLocal && new RegExp(
+      `\\.write - [^;\\n]*\\.read;\\s*${lengthLocal} = [^;\\n]*\\.capacity`).test(source),
+    'the two assignments cannot fall through unconditionally');
   });
 });

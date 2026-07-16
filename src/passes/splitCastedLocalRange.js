@@ -29,6 +29,11 @@ function rewriteCode(code) {
     const nextStore = findNextStore(items, i + 1, local);
     if (nextStore < 0) continue;
     if (nextStore - i > 32) continue;
+    // If the following definition flows back into this definition's load
+    // range, both stores implement one loop-carried source local. Splitting
+    // only the first definition would make the loop condition keep reading
+    // the initializer while the update writes the old slot forever.
+    if (hasBackedgeAfterStoreIntoRange(items, labels, nextStore, i + 1, nextStore)) continue;
     const splitEnd = firstBackwardBranchIntoRange(items, labels, i + 1, nextStore, i);
     const loads = collectLoads(items, i + 1, splitEnd < 0 ? nextStore : splitEnd, local);
     if (!loads.length) continue;
@@ -50,6 +55,16 @@ function rewriteCode(code) {
     rewrites += 1;
   }
   return rewrites;
+}
+
+function hasBackedgeAfterStoreIntoRange(items, labels, storeIndex, start, end) {
+  for (let i = storeIndex + 1; i < items.length; i += 1) {
+    const target = branchTarget(items[i]);
+    if (!target) continue;
+    const targetIndex = labels.get(target.replace(/:$/, ''));
+    if (targetIndex != null && targetIndex >= start && targetIndex < end && targetIndex < i) return true;
+  }
+  return false;
 }
 
 function firstBackwardBranchIntoRange(items, labels, start, end, storeIndex) {

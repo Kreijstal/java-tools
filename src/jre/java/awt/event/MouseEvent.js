@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/event/InputEvent',
   methods: {
     '<init>()V': () => {},
     'getX()I': (jvm, obj, args) => obj.x || 0,

@@ -7,6 +7,14 @@ const Sockets = new Map(); // socketId -> net.Socket
 const Buffers = new Map(); // socketId -> { chunks: Buffer[], size, closed, waiters: fn[] }
 let nextSocketId = 0;
 
+// JVM_DEBUG_SOCKET=1 logs per-socket traffic (first bytes hex) to stderr.
+const DEBUG = typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_SOCKET;
+function debugLog(socketId, dir, buf) {
+  if (!DEBUG) return;
+  const head = Buffer.from(buf).subarray(0, 32).toString('hex').replace(/(..)/g, '$1 ').trim();
+  console.error(`[socket ${socketId} ${dir}] ${buf.length}B: ${head}${buf.length > 32 ? ' …' : ''}`);
+}
+
 function allocId() {
   return nextSocketId++;
 }
@@ -16,12 +24,14 @@ function register(socketId, nativeSocket) {
   const state = { chunks: [], size: 0, closed: false, waiters: [] };
   Buffers.set(socketId, state);
   nativeSocket.on('data', (chunk) => {
+    debugLog(socketId, 'recv', chunk);
     state.chunks.push(chunk);
     state.size += chunk.length;
     const waiters = state.waiters.splice(0);
     for (const w of waiters) w();
   });
   const markClosed = () => {
+    if (DEBUG && !state.closed) console.error(`[socket ${socketId} closed]`);
     state.closed = true;
     const waiters = state.waiters.splice(0);
     for (const w of waiters) w();
@@ -71,4 +81,4 @@ function waitForData(state) {
   return new Promise((resolve) => state.waiters.push(resolve));
 }
 
-module.exports = { Sockets, Buffers, allocId, register, readByte, readInto, waitForData };
+module.exports = { Sockets, Buffers, allocId, register, readByte, readInto, waitForData, debugLog };

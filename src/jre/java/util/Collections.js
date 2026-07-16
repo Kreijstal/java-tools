@@ -1,4 +1,5 @@
 const { withThrows } = require('../../helpers');
+const fakeClock = require('../../../core/fakeClock');
 
 function arrayForCollection(obj) {
   if (!obj) return null;
@@ -206,7 +207,7 @@ module.exports = {
       if (list && list.items) {
         // Fisher-Yates shuffle algorithm
         for (let i = list.items.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
+          const j = Math.floor((fakeClock.enabled ? fakeClock.random() : Math.random()) * (i + 1));
           [list.items[i], list.items[j]] = [list.items[j], list.items[i]];
         }
       }

@@ -26,6 +26,8 @@ class JitCompiler {
     this.generatedRunCount = 0;
     this.runnerRunCount = 0;
     this.methodRunCounts = new Map();
+    this.generatedMethodRunCounts = new Map();
+    this.runnerMethodRunCounts = new Map();
     this.methodDeoptCounts = new Map();
     this.methodDeoptReasons = new Map();
     const configuredThrowMethods = options.exceptionMethodAllowlist ?? (
@@ -34,6 +36,18 @@ class JitCompiler {
     this.exceptionMethodAllowlist = new Set(Array.isArray(configuredThrowMethods)
       ? configuredThrowMethods
       : String(configuredThrowMethods || "").split(",").map((value) => value.trim()).filter(Boolean));
+    const configuredMonitorMethods = options.monitorMethodAllowlist ?? (
+      typeof process !== "undefined" && process.env ? process.env.JVM_JIT_MONITOR_METHODS : ""
+    );
+    this.monitorMethodAllowlist = new Set(Array.isArray(configuredMonitorMethods)
+      ? configuredMonitorMethods
+      : String(configuredMonitorMethods || "").split(",").map((value) => value.trim()).filter(Boolean));
+    const configuredResumeMethods = options.resumeMethodAllowlist ?? (
+      typeof process !== "undefined" && process.env ? process.env.JVM_JIT_RESUME_METHODS : ""
+    );
+    this.resumeMethodAllowlist = new Set(Array.isArray(configuredResumeMethods)
+      ? configuredResumeMethods
+      : String(configuredResumeMethods || "").split(",").map((value) => value.trim()).filter(Boolean));
     this.wasmJit = new WasmJit(jvm, this);
   }
 
@@ -42,6 +56,10 @@ class JitCompiler {
       return false;
     }
     if (this.runningFrames.has(frame)) {
+      return false;
+    }
+    if (frame.jitSkipOnce) {
+      delete frame.jitSkipOnce;
       return false;
     }
     if (this.deoptedMethods.has(frame.method)) {
@@ -127,6 +145,8 @@ class JitCompiler {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
     }
+    this.dumpExecutionCounts("generated callees", this.generatedMethodRunCounts, limit);
+    this.dumpExecutionCounts("runner callees", this.runnerMethodRunCounts, limit);
     const deopts = [...this.methodDeoptCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
@@ -157,7 +177,26 @@ class JitCompiler {
 
   async runGeneratedFrame(generated, frame, thread) {
     this.generatedRunCount += 1;
+    this.recordExecution(this.generatedMethodRunCounts, frame);
     return generated(frame, thread, this);
+  }
+
+  recordExecution(counts, frame) {
+    const method = frame && frame.method;
+    if (!method) return;
+    const methodKey = `${this.getFrameClassName(frame)}.${method.name}${method.descriptor}`;
+    counts.set(methodKey, (counts.get(methodKey) || 0) + 1);
+  }
+
+  dumpExecutionCounts(label, counts, limit) {
+    const rows = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(0, limit));
+    if (!rows.length) return;
+    console.error(`JIT ${label}:`);
+    for (const [method, count] of rows) {
+      console.error(`  ${count.toLocaleString()} runs ${method}`);
+    }
   }
 
   isSupported(method) {
@@ -172,6 +211,13 @@ class JitCompiler {
     }
 
     const codeItems = code.code.codeItems;
+    if (codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op === "monitorenter" || op === "monitorexit";
+    }) && !this.isMonitorMethodAllowed(method)) {
+      this.supportCache.set(method, false);
+      return false;
+    }
     if (codeItems.some((item) => getOp(item && item.instruction) === "athrow") &&
       !this.isExceptionMethodAllowed(method)) {
       this.supportCache.set(method, false);
@@ -193,9 +239,10 @@ class JitCompiler {
       "i2b", "iadd", "iand", "idiv", "imul", "ineg", "ior", "irem",
       "ishl", "ishr", "isub", "ixor",
     ]);
+    const longOps = new Set(["i2l", "lcmp", "ldiv", "lxor"]);
     const hasNumericHotPath = codeItems.some((item) => {
       const op = typeof item.instruction === "string" ? item.instruction : item.instruction && item.instruction.op;
-      return op && (doubleOps.has(op) || floatOps.has(op) || integerOps.has(op) || op === "i2d" ||
+      return op && (doubleOps.has(op) || floatOps.has(op) || integerOps.has(op) || longOps.has(op) || op === "i2d" ||
         op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float" || item.instruction.arg === "int"));
     });
     const eligibleShape = hasNumericHotPath || this.hasBackwardBranch(method) ||
@@ -204,7 +251,7 @@ class JitCompiler {
     const allowed = new Set([
       "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
       "areturn", "astore", "astore_0", "astore_1", "astore_2", "astore_3", "athrow",
-      "aaload", "aastore", "anewarray", "arraylength", "bastore", "baload", "checkcast",
+      "aaload", "aastore", "anewarray", "arraylength", "bastore", "baload", "caload", "castore", "checkcast",
       "bipush", "d2i", "dadd", "daload", "dastore", "dcmpg", "dcmpl",
       "dconst_0", "dconst_1", "ddiv", "dload", "dload_0", "dload_1",
       "dload_2", "dload_3", "dmul", "dneg", "dreturn", "dstore",
@@ -213,15 +260,15 @@ class JitCompiler {
       "fconst_0", "fconst_1", "fconst_2", "fdiv", "fload", "fload_0",
       "fload_1", "fload_2", "fload_3", "fmul", "fneg", "frem", "freturn",
       "fstore", "fstore_0", "fstore_1", "fstore_2", "fstore_3", "fsub", "i2f",
-      "getfield", "getstatic", "goto", "i2b", "i2d", "iadd", "iaload", "iand", "iastore", "idiv",
+      "getfield", "getstatic", "goto", "i2b", "i2d", "i2l", "iadd", "iaload", "iand", "iastore", "idiv",
       "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3", "iconst_4", "iconst_5",
       "if_acmpeq", "if_acmpne", "ifeq", "ifge", "ifgt", "ificmpge",
       "if_icmpeq", "if_icmpge", "if_icmpgt", "if_icmple", "if_icmplt", "if_icmpne",
       "ifle", "iflt", "ifne", "ifnonnull", "ifnull", "iload", "iload_0",
       "iload_1", "iload_2", "iload_3", "imul", "inc", "iinc",
-      "invokespecial", "invokestatic", "invokevirtual", "istore", "istore_0",
-      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "ldc", "ldc_w", "ldc2_w",
-      "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "invokeinterface", "invokespecial", "invokestatic", "invokevirtual", "istore", "istore_0",
+      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lxor",
+      "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return", "saload", "sastore",
       "sipush"
     ]);
 
@@ -247,6 +294,13 @@ class JitCompiler {
     }
 
     const codeItems = code.code.codeItems;
+    if (codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op === "monitorenter" || op === "monitorexit";
+    }) && !this.isMonitorMethodAllowed(method)) {
+      this.codegenSupportCache.set(method, false);
+      return false;
+    }
     if (codeItems.some((item) => getOp(item && item.instruction) === "athrow") &&
       !this.isExceptionMethodAllowed(method)) {
       this.codegenSupportCache.set(method, false);
@@ -255,7 +309,7 @@ class JitCompiler {
     const supportedOps = new Set([
       "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
       "areturn", "astore", "astore_0", "astore_1", "astore_2", "astore_3", "athrow",
-      "aaload", "aastore", "anewarray", "arraylength", "bastore", "baload",
+      "aaload", "aastore", "anewarray", "arraylength", "bastore", "baload", "caload", "castore", "checkcast",
       "bipush", "d2i", "dadd", "daload", "dastore", "dcmpg", "dcmpl",
       "dconst_0", "dconst_1", "ddiv", "dload", "dload_0", "dload_1",
       "dload_2", "dload_3", "dmul", "dneg", "dreturn", "dstore",
@@ -270,10 +324,10 @@ class JitCompiler {
       "if_icmple",
       "if_icmplt", "if_icmpne", "ifle", "iflt", "ifne", "ifnonnull",
       "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
-      "iand", "imul", "ineg", "iinc", "invokespecial", "invokestatic", "invokevirtual",
-      "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
-      "istore_3", "isub", "ixor", "ldc", "ldc_w", "ldc2_w", "new", "newarray", "pop", "putfield", "putstatic", "return",
-      "sipush",
+      "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
+      "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
+      "istore_3", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "monitorenter", "monitorexit", "saload", "sastore", "sipush",
     ]);
 
     const hasNumericHotPath = codeItems.some((item) => {
@@ -283,12 +337,28 @@ class JitCompiler {
         || op.startsWith("f")
         || op === "i2d"
         || op === "i2f"
+        || op === "i2l"
+        || op === "i2b"
+        || op === "iadd"
+        || op === "iand"
         || op === "idiv"
         || op === "imul"
+        || op === "ineg"
+        || op === "ior"
+        || op === "irem"
+        || op === "ishl"
+        || op === "ishr"
+        || op === "isub"
+        || op === "iushr"
+        || op === "ixor"
+        || op === "lcmp"
+        || op === "ldiv"
+        || op === "lxor"
         || (op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float"))
       );
     });
-    const supported = (hasNumericHotPath || this.hasBackwardBranch(method)) && codeItems.every((item) => {
+    const supported = (hasNumericHotPath || this.hasBackwardBranch(method) ||
+      this.isShortSupportedHelper(method)) && codeItems.every((item) => {
       const op = getOp(item && item.instruction);
       return !op || supportedOps.has(op);
     });
@@ -327,6 +397,20 @@ class JitCompiler {
     return this.exceptionMethodAllowlist.has(`${className}.${method.name}${method.descriptor}`);
   }
 
+  isMonitorMethodAllowed(method) {
+    const className = typeof this.jvm.findClassNameForMethod === "function"
+      ? this.jvm.findClassNameForMethod(method)
+      : null;
+    return this.monitorMethodAllowlist.has(`${className}.${method.name}${method.descriptor}`);
+  }
+
+  isResumeMethodAllowed(method) {
+    const className = typeof this.jvm.findClassNameForMethod === "function"
+      ? this.jvm.findClassNameForMethod(method)
+      : null;
+    return this.resumeMethodAllowlist.has(`${className}.${method.name}${method.descriptor}`);
+  }
+
   isShortSupportedHelper(method) {
     const code = method.attributes.find((attr) => attr.type === "code");
     const codeItems = code && code.code && code.code.codeItems || [];
@@ -334,7 +418,7 @@ class JitCompiler {
     const allowed = new Set([
       "aaload", "aload", "aload_0", "aload_1", "aload_2", "aload_3", "areturn",
       "arraylength", "freturn", "getfield", "getstatic", "iconst_0", "iconst_1",
-      "iload", "iload_0", "iload_1", "iload_2", "iload_3", "invokevirtual",
+      "iload", "iload_0", "iload_1", "iload_2", "iload_3", "invokeinterface", "invokevirtual",
       "ireturn", "putfield", "putstatic", "return",
     ]);
     return codeItems.every((item) => !item.instruction || allowed.has(getOp(item.instruction)));
@@ -394,6 +478,11 @@ class JitCompiler {
     return debug.breakpoints.has(numericPc);
   }
 
+  needsBytecodeChecks() {
+    const debug = this.jvm.debugManager;
+    return Boolean(debug && (debug.debugMode || debug.breakpoints.size > 0));
+  }
+
   target(frame, label) {
     const index = this.getLabelMap(frame).get(label);
     if (index === undefined) {
@@ -418,9 +507,12 @@ class JitCompiler {
       "const stack = frame.stack.items;",
       "let pc = frame.pc;",
       "let bytecodesUntilYield = 100000;",
+      "let bytecodeChecks = helpers.needsBytecodeChecks();",
+      "let osrCountdown = 10007;",
       `while (pc < ${codeItems.length}) {`,
-      "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 100000; }",
-      "if (helpers.shouldDeopt(frame, pc)) { helpers.materialize(frame, locals, stack, pc); return { deopt: true }; }",
+      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materialize(frame, locals, stack, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, stack.length); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; } }",
+      "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 100000; bytecodeChecks = helpers.needsBytecodeChecks(); }",
+      "if (bytecodeChecks && helpers.shouldDeopt(frame, pc)) { helpers.materialize(frame, locals, stack, pc); return { deopt: true }; }",
       "switch (pc) {",
     ];
 
@@ -432,7 +524,10 @@ class JitCompiler {
           body.push(`pc = ${index + 1}; break;`);
           return;
         }
-        body.push(`helpers.materialize(frame, locals, stack, ${index});`);
+        // Locals and operand stack are the frame's live arrays already. Keep
+        // only the bytecode PC current here so exception dispatch and save
+        // states remain precise without a helper call on every instruction.
+        body.push(`frame.pc = ${index};`);
         body.push(this.emitInstruction(instruction, index));
       });
     } finally {
@@ -521,7 +616,7 @@ class JitCompiler {
       case "sipush": return `stack.push(${Number(instruction.arg)}); ${goNext}`;
       case "ldc":
       case "ldc_w":
-      case "ldc2_w": return `stack.push(helpers.constantValue(${JSON.stringify(instruction.arg)})); ${goNext}`;
+      case "ldc2_w": return `stack.push(helpers.constantValue(${jsLiteral(instruction.arg)})); ${goNext}`;
       case "dup": return `stack.push(stack[stack.length - 1]); ${goNext}`;
       case "dup2": return `{ const value1 = stack.pop(); if (typeof value1 === "bigint") { stack.push(value1, value1); } else { const value2 = stack.pop(); stack.push(value2, value1, value2, value1); } } ${goNext}`;
       case "pop": return `stack.pop(); ${goNext}`;
@@ -550,34 +645,46 @@ class JitCompiler {
       case "fneg": return `stack.push(Math.fround(-stack.pop())); ${goNext}`;
       case "i2d": return goNext;
       case "i2b": return `stack.push((stack.pop() << 24) >> 24); ${goNext}`;
+      case "i2l": return `stack.push(BigInt(stack.pop())); ${goNext}`;
       case "i2f": return `stack.push(Math.fround(stack.pop())); ${goNext}`;
       case "f2d": return goNext;
       case "d2f": return `stack.push(Math.fround(stack.pop())); ${goNext}`;
       case "f2i": return `stack.push(helpers.floatToInt(stack.pop())); ${goNext}`;
       case "d2i": return `stack.push(Math.trunc(stack.pop()) | 0); ${goNext}`;
+      case "lxor": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); } ${goNext}`;
+      case "ldiv": return `{ const b = stack.pop(); const a = stack.pop(); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push(a / b); } ${goNext}`;
+      case "lcmp": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a < b ? -1 : (a > b ? 1 : 0)); } ${goNext}`;
       case "iinc": return `locals[${Number(instruction.varnum)}] = (locals[${Number(instruction.varnum)}] + ${Number(instruction.incr)}) | 0; ${goNext}`;
       case "dcmpg": return `stack.push(helpers.compareDouble(stack.pop(), stack.pop(), 1)); ${goNext}`;
       case "dcmpl": return `stack.push(helpers.compareDouble(stack.pop(), stack.pop(), -1)); ${goNext}`;
       case "newarray": return `stack.push(helpers.newPrimitiveArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "anewarray": return `stack.push(helpers.newReferenceArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "arraylength": return `stack.push(helpers.arrayLength(stack.pop(), frame)); ${goNext}`;
+      case "checkcast": return `{ const value = stack[stack.length - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
       case "aaload":
       case "iaload":
       case "daload":
       case "faload":
-      case "baload": return `stack.push(helpers.arrayLoad(stack.pop(), stack.pop(), frame)); ${goNext}`;
+      case "baload":
+      case "caload":
+      case "saload": return `stack.push(helpers.arrayLoad(stack.pop(), stack.pop(), frame)); ${goNext}`;
       case "aastore":
       case "iastore":
       case "dastore":
       case "fastore":
-      case "bastore": return `helpers.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); ${goNext}`;
+      case "bastore":
+      case "castore":
+      case "sastore": return `helpers.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); ${goNext}`;
       case "getfield": return `stack.push(helpers.getField(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "putfield": return `{ const value = stack.pop(); const obj = stack.pop(); helpers.putField(obj, ${JSON.stringify(instruction.arg)}, value); } ${goNext}`;
       case "getstatic": return `{ const value = await helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack.push(value); } ${goNext}`;
       case "putstatic": return `{ const changed = await helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[stack.length - 1], thread); if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } stack.pop(); } ${goNext}`;
       case "new": return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack.push(value); } ${goNext}`;
+      case "monitorenter": return `{ const monitor = stack[stack.length - 1]; if (!helpers.monitorEnter(monitor, thread)) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "contended generated monitorenter" }; } stack.pop(); } ${goNext}`;
+      case "monitorexit": return `helpers.monitorExit(stack.pop(), thread); ${goNext}`;
       case "invokestatic":
       case "invokevirtual":
+      case "invokeinterface":
       case "invokespecial": return `{ helpers.materialize(frame, locals, stack, ${next}); const value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; if (value !== helpers.returnVoid()) stack.push(value); if (thread.status !== "runnable") { helpers.materialize(frame, locals, stack, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
       case "ifeq": return `if (stack.pop() === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
@@ -618,16 +725,52 @@ class JitCompiler {
     return index;
   }
 
+  // OSR probe shared by the runner and generated code: a frame that has been
+  // interpreting for thousands of bytecodes is exactly the kind the wasm tier
+  // wants (single-invocation loop monsters like va.d never re-enter through
+  // invoke()). prepare() warms/compiles regardless of position; entering
+  // mid-method is only sound at a supported block leader with an empty
+  // operand stack.
+  wasmOsrProbe(frame, thread, pc, stackLength) {
+    if (!this.wasmJit.enabled) return null;
+    frame.pc = pc;
+    const prep = this.wasmJit.prepare(frame);
+    if (!prep || stackLength !== 0) return null;
+    const result = this.wasmJit.execute(frame, thread, prep.st, prep.blk, true);
+    if (result.returned) {
+      return {
+        returned: true,
+        value: prep.st.meta.retChar === "V" ? RETURN_VOID : prep.st.meta.box.ret,
+      };
+    }
+    return { resumePc: frame.pc };
+  }
+
   async runFrame(frame, thread) {
     this.runnerRunCount += 1;
+    this.recordExecution(this.runnerMethodRunCounts, frame);
     const locals = frame.locals;
     const stack = frame.stack.items;
     const instructions = frame.instructions;
     let pc = frame.pc;
     let bytecodesUntilYield = 100000;
+    // Prime stride so successive probes land on different pcs of a loop body —
+    // a fixed multiple of the body length would hit the same (possibly
+    // non-leader, non-empty-stack) offset forever.
+    let bytecodesUntilOsrProbe = 10007;
 
     while (pc < instructions.length) {
       bytecodesUntilYield -= 1;
+      bytecodesUntilOsrProbe -= 1;
+      if (bytecodesUntilOsrProbe === 0) {
+        bytecodesUntilOsrProbe = 10007;
+        this.materialize(frame, locals, stack, pc);
+        const osr = this.wasmOsrProbe(frame, thread, pc, stack.length);
+        if (osr) {
+          if (osr.returned) return { returned: true, value: osr.value };
+          pc = osr.resumePc; // transient exit: resume interpreting there
+        }
+      }
       if (bytecodesUntilYield === 0) {
         this.materialize(frame, locals, stack, pc);
         await yieldToEventLoop();
@@ -736,12 +879,22 @@ class JitCompiler {
         case "frem": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a % b)); break; }
         case "fneg": stack.push(Math.fround(-stack.pop())); break;
         case "i2d": break;
+        case "i2l": stack.push(BigInt(stack.pop())); break;
         case "i2f": stack.push(Math.fround(stack.pop())); break;
         case "f2d": break;
         case "d2f": stack.push(Math.fround(stack.pop())); break;
         case "f2i": stack.push(floatToInt(stack.pop())); break;
         case "i2b": stack.push((stack.pop() << 24) >> 24); break;
         case "d2i": stack.push(Math.trunc(stack.pop()) | 0); break;
+        case "lxor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
+        case "ldiv": {
+          const b = stack.pop();
+          const a = stack.pop();
+          if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" };
+          stack.push(a / b);
+          break;
+        }
+        case "lcmp": { const b = stack.pop(); const a = stack.pop(); stack.push(a < b ? -1 : (a > b ? 1 : 0)); break; }
         case "iand": stack.push(stack.pop() & stack.pop()); break;
         case "ior": stack.push(stack.pop() | stack.pop()); break;
         case "irem": {
@@ -779,11 +932,15 @@ class JitCompiler {
         case "daload":
         case "faload":
         case "baload": stack.push(this.arrayLoad(stack.pop(), stack.pop(), frame)); break;
+        case "caload":
+        case "saload": stack.push(this.arrayLoad(stack.pop(), stack.pop(), frame)); break;
         case "aastore":
         case "iastore":
         case "dastore":
         case "fastore":
-        case "bastore": this.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); break;
+        case "bastore":
+        case "castore":
+        case "sastore": this.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); break;
         case "getfield": stack.push(this.getField(stack.pop(), instruction.arg)); break;
         case "putfield": { const value = stack.pop(); const obj = stack.pop(); this.putField(obj, instruction.arg, value); break; }
         case "getstatic": {
@@ -813,8 +970,19 @@ class JitCompiler {
           stack.push(value);
           break;
         }
+        case "monitorenter": {
+          const monitor = stack[stack.length - 1];
+          if (!this.monitorEnter(monitor, thread)) {
+            this.materialize(frame, locals, stack, pc - 1);
+            return { deopt: true, transient: true, reason: "contended monitorenter" };
+          }
+          stack.pop();
+          break;
+        }
+        case "monitorexit": this.monitorExit(stack.pop(), thread); break;
         case "invokestatic":
         case "invokevirtual":
+        case "invokeinterface":
         case "invokespecial": {
           const invokePc = pc - 1;
           this.materialize(frame, locals, stack, pc);
@@ -945,6 +1113,50 @@ class JitCompiler {
       throw { type: "java/lang/NullPointerException", message: `Attempted to get length of null array in ${frame.method.name}` };
     }
     return arrayRef.length;
+  }
+
+  async checkCast(value, className) {
+    if (value === null || value === undefined) return;
+    if (!await this.jvm.isInstanceOfAsync(runtimeClassName(value), className)) {
+      throw {
+        type: "java/lang/ClassCastException",
+        message: `${runtimeClassName(value)} cannot be cast to ${className}`,
+      };
+    }
+  }
+
+  monitorEnter(monitor, thread) {
+    if (monitor === null || monitor === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!monitor.isLocked) {
+      monitor.isLocked = true;
+      monitor.lockOwner = thread.id;
+      monitor.lockCount = 1;
+      delete thread.blockingOn;
+      return true;
+    }
+    if (monitor.lockOwner === thread.id) {
+      monitor.lockCount += 1;
+      return true;
+    }
+    thread.status = "BLOCKED";
+    thread.blockingOn = monitor;
+    return false;
+  }
+
+  monitorExit(monitor, thread) {
+    if (monitor === null || monitor === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (monitor.lockOwner !== thread.id) {
+      throw { type: "java/lang/IllegalMonitorStateException", message: null };
+    }
+    monitor.lockCount -= 1;
+    if (monitor.lockCount === 0) {
+      monitor.isLocked = false;
+      monitor.lockOwner = null;
+    }
   }
 
   arrayLoad(index, arrayRef, frame) {
@@ -1100,7 +1312,7 @@ class JitCompiler {
       if (receiver === null || receiver === undefined) {
         throw { type: "java/lang/NullPointerException", message: null };
       }
-      if (op === "invokevirtual") {
+      if (op === "invokevirtual" || op === "invokeinterface") {
         targetClassName = receiver.type || declaredClassName;
       }
     }
@@ -1116,7 +1328,8 @@ class JitCompiler {
     let classData = this.jvm.classes[targetClassName] || await this.jvm.loadClassByName(targetClassName);
     let method = this.jvm.findMethod(classData, methodName, descriptor);
     let lookupClass = targetClassName;
-    while (!method && op === "invokevirtual" && classData && classData.ast.classes[0].superClassName) {
+    while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
+      classData && classData.ast.classes[0].superClassName) {
       lookupClass = classData.ast.classes[0].superClassName;
       classData = this.jvm.classes[lookupClass] || await this.jvm.loadClassByName(lookupClass);
       method = this.jvm.findMethod(classData, methodName, descriptor);
@@ -1131,7 +1344,13 @@ class JitCompiler {
     if (!this.isSupported(method) && !this.isShortSupportedHelper(method)) {
       frame.stack.items = stackSnapshot;
       frame.pc = invokePc;
-      return { deopt: true, reason: `unsupported callee ${targetClassName}.${methodName}${descriptor}` };
+      const transient = this.isResumeMethodAllowed(frame.method);
+      if (transient) frame.jitSkipOnce = true;
+      return {
+        deopt: true,
+        transient,
+        reason: `unsupported callee ${targetClassName}.${methodName}${descriptor}`,
+      };
     }
 
     const child = new Frame(method);
@@ -1146,6 +1365,16 @@ class JitCompiler {
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
     thread.callStack.push(child);
+    if (this.wasmJit.enabled) {
+      // Child frames never pass through tryRunFrame, so give the wasm tier
+      // its shot here. A transient exit leaves the child on the stack with
+      // pc at the resume point and the runner continues it below.
+      const wasmResult = this.wasmJit.runNested(child, thread);
+      if (wasmResult.returned) {
+        if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
+        return wasmResult.value;
+      }
+    }
     const generated = this.getGeneratedFunction(method);
     const result = generated
       ? await this.runGeneratedFrame(generated, child, thread)
@@ -1215,6 +1444,11 @@ function primitiveArrayType(type) {
 function getOp(instruction) {
   if (!instruction) return null;
   return typeof instruction === "string" ? instruction : instruction.op;
+}
+
+function jsLiteral(value) {
+  if (typeof value === "bigint") return `${value}n`;
+  return JSON.stringify(value);
 }
 
 function buildLabelMap(codeItems) {

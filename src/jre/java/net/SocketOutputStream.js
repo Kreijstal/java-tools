@@ -1,8 +1,9 @@
-const { Sockets } = require('./socketRegistry');
+const { Sockets, debugLog } = require('./socketRegistry');
 
 function writeBytes(obj, bytes) {
   const nativeSocket = Sockets.get(obj.socketId);
   if (nativeSocket && !nativeSocket.destroyed) {
+    debugLog(obj.socketId, 'send', bytes);
     nativeSocket.write(Buffer.from(bytes));
   }
 }

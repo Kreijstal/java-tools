@@ -2,6 +2,7 @@
 
 function removeRuntimeExceptionHandlers(astRoot, options = {}) {
   const keepHandlerCode = options.keepHandlerCode !== false;
+  const preserveRecoveryHandlers = options.preserveRecoveryHandlers === true;
   let changed = false;
   const removals = [];
 
@@ -17,6 +18,10 @@ function removeRuntimeExceptionHandlers(astRoot, options = {}) {
       const kept = [];
       for (const entry of code.exceptionTable) {
         if (catchType(entry) !== 'java/lang/RuntimeException') {
+          kept.push(entry);
+          continue;
+        }
+        if (preserveRecoveryHandlers && !isLinearRethrowHandler(code, entry)) {
           kept.push(entry);
           continue;
         }
@@ -38,6 +43,26 @@ function removeRuntimeExceptionHandlers(astRoot, options = {}) {
   }
 
   return { changed, removals };
+}
+
+function isLinearRethrowHandler(code, entry) {
+  const handlerLabel = trimLabel(entry.handlerLbl || entry.handlerLabel || entry.handler);
+  const items = code.codeItems || [];
+  const start = items.findIndex((item) => trimLabel(item && item.labelDef) === handlerLabel);
+  if (start < 0) return false;
+
+  for (let i = start; i < items.length; i += 1) {
+    const instructionOp = op(items[i]);
+    if (!instructionOp) continue;
+    if (instructionOp === 'athrow') return true;
+    if (instructionOp === 'goto' || instructionOp === 'goto_w' || instructionOp === 'jsr' ||
+        instructionOp === 'ret' || instructionOp.startsWith('if') ||
+        instructionOp === 'tableswitch' || instructionOp === 'lookupswitch' ||
+        instructionOp.endsWith('return')) {
+      return false;
+    }
+  }
+  return false;
 }
 
 function catchType(entry) {

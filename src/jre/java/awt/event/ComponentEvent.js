@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/AWTEvent',
   methods: {
     '<init>()V': () => {},
     'getComponent()Ljava/awt/Component;': (jvm, obj, args) => obj.component || obj.source || null,

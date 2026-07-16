@@ -3302,7 +3302,12 @@ function itemWithReplacedInstruction(item, instruction) {
 
 function sameInstruction(a, b) {
   if (getOpcode(a) !== getOpcode(b)) return false;
-  return sameValue(getInstructionArg(a), getInstructionArg(b));
+  // Parsed iinc instructions carry their operands as varnum/incr rather than
+  // arg. Comparing only arg therefore treated every pair of iincs as equal,
+  // allowing duplicate-tail coalescing to merge `local++` into a sibling
+  // `local--` tail. The signature helper covers arg, varnum/incr, and textual
+  // instruction representations uniformly.
+  return sameValue(instructionSignatureArg(a), instructionSignatureArg(b));
 }
 
 function sameValue(a, b) {

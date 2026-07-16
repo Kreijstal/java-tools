@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/AWTEvent',
   methods: {
     'getValue()I': (jvm, obj, args) => {
       return obj.value || 0;

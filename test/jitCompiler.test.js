@@ -192,6 +192,295 @@ public class GeneratedFallbackHarness {
   t.end();
 });
 
+test('generated JIT accelerates integer bitwise loops on their first invocation', async (t) => {
+  const classpath = compileJavaFixture(t, 'IntegerLoopJitHarness', `
+public class IntegerLoopJitHarness {
+  public static void compute(int[] out, int n) {
+    for (int i = 0; i < n; i++) {
+      out[i] = -((i ^ -1) >> 1);
+    }
+  }
+}
+`);
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('IntegerLoopJitHarness');
+  const thread = {
+    id: 0,
+    name: 'integer-loop-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = [0, 0, 0, 0];
+  out.type = '[I';
+  out.length = 4;
+  out.hashCode = jvm.nextHashCode++;
+  await invoke(jvm, thread, 'IntegerLoopJitHarness', 'compute', '([II)V', [out, 4]);
+
+  t.deepEqual(out.slice(0, 4), [1, 1, 2, 2], 'integer bitwise loop preserves interpreter semantics');
+  t.equal(jvm.jit.generatedRunCount, 1, 'backward bitwise loop compiles without warmup calls');
+  t.equal(jvm.jit.runnerRunCount, 0, 'generated bitwise loop bypasses the bytecode runner');
+  t.end();
+});
+
+test('generated callers dispatch supported child methods through generated code', async (t) => {
+  const classpath = compileJavaFixture(t, 'NestedGeneratedJitHarness', `
+public class NestedGeneratedJitHarness {
+  private static int scale(int value) { return value * 3; }
+  public static void compute(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = scale(i);
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('NestedGeneratedJitHarness');
+  const thread = {
+    id: 0,
+    name: 'nested-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0, 0, 0, 0];
+  await invoke(jvm, thread, 'NestedGeneratedJitHarness', 'compute', '([I)V', [out]);
+  t.deepEqual(out, [0, 3, 6, 9], 'nested generated calls preserve results');
+  t.equal(jvm.jit.generatedRunCount, 5, 'outer loop and four child calls use generated code');
+  t.equal(jvm.jit.runnerRunCount, 0, 'nested generated calls avoid the bytecode runner');
+  t.end();
+});
+
+test('generated callers resume after one interpreted unsupported invocation', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedTransientCallJitHarness', `
+public class GeneratedTransientCallJitHarness {
+  private static int selected(int value) {
+    switch (value) {
+      case 0: return 10;
+      case 1: return 20;
+      default: return 30;
+    }
+  }
+  public static void compute(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = selected(i) + 1;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 100,
+    resumeMethodAllowlist: ['GeneratedTransientCallJitHarness.compute([I)V'],
+  } });
+  await jvm.loadClassByName('GeneratedTransientCallJitHarness');
+  const thread = {
+    id: 0,
+    name: 'transient-call-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0, 0, 0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'GeneratedTransientCallJitHarness', 'compute', '([I)V', [out]);
+  t.deepEqual(out.slice(0, 3), [11, 21, 31], 'unsupported child calls preserve results');
+  t.ok(jvm.jit.generatedRunCount > 1, 'generated caller resumes after interpreted child calls');
+  t.notOk(jvm.jit.deoptedMethods.has(
+    await jvm.findMethodInHierarchy('GeneratedTransientCallJitHarness', 'compute', '([I)V')),
+  'transient child exits do not permanently deopt the caller');
+  t.end();
+});
+
+test('generated short helpers dispatch interface methods without runner fallback', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedInterfaceJitHarness', `
+public class GeneratedInterfaceJitHarness {
+  interface Value { int get(); }
+  static class Fixed implements Value {
+    private final int value;
+    Fixed(int value) { this.value = value; }
+    public int get() { return value; }
+  }
+  public static void compute(int[] out, Value value) {
+    for (int i = 0; i < out.length; i++) out[i] = value.get();
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('GeneratedInterfaceJitHarness');
+  await jvm.loadClassByName('GeneratedInterfaceJitHarness$Fixed');
+  const thread = {
+    id: 0,
+    name: 'interface-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0, 0, 0, 0];
+  const value = {
+    type: 'GeneratedInterfaceJitHarness$Fixed',
+    fields: { 'GeneratedInterfaceJitHarness$Fixed.value': 7 },
+  };
+  await invoke(jvm, thread, 'GeneratedInterfaceJitHarness', 'compute',
+    '([ILGeneratedInterfaceJitHarness$Value;)V', [out, value]);
+  t.deepEqual(out, [7, 7, 7, 7], 'invokeinterface preserves dynamic dispatch and return values');
+  t.equal(jvm.jit.runnerRunCount, 0, 'interface accessors avoid the bytecode runner');
+  t.equal(jvm.jit.generatedRunCount, 5, 'outer loop and interface accessor use generated code');
+  t.end();
+});
+
+test('generated JIT accelerates integer byte-array loops', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedIntegerArrayLoopHarness', `
+public class GeneratedIntegerArrayLoopHarness {
+  public static void compute(int[] out, byte[][] left, byte[][] right, int length) {
+    int score = 100;
+    for (int i = 0; i < length; i++) {
+      int value = left[0][i] + right[1][i];
+      if (value < score) score = value;
+    }
+    out[0] = -score;
+    out[1] = 2147483647 + length;
+    out[2] = -7 / length;
+  }
+}
+`);
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('GeneratedIntegerArrayLoopHarness');
+  const thread = {
+    id: 0,
+    name: 'generated-integer-array-loop-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = [0, 0, 0];
+  const left = [[5, 4, 3]];
+  const right = [[0, 0, 0], [2, 1, 0]];
+  await invoke(jvm, thread, 'GeneratedIntegerArrayLoopHarness', 'compute', '([I[[B[[BI)V',
+    [out, left, right, 3]);
+
+  t.deepEqual(out, [-3, -2147483646, -2],
+    'generated integer array loop preserves int overflow and truncating division semantics');
+  t.equal(jvm.jit.generatedRunCount, 1, 'backward integer array loop compiles on first invocation');
+  t.equal(jvm.jit.runnerRunCount, 0, 'generated loop bypasses the bytecode runner');
+  t.end();
+});
+
+test('generated JIT supports short-array loads and checked casts', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedShortArrayJitHarness', `
+public class GeneratedShortArrayJitHarness {
+  public static void compute(int[] out, short[] values, Object checked) {
+    int sum = 0;
+    for (int i = 0; i < values.length; i++) sum += values[i];
+    out[0] = sum + ((int[]) checked).length;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('GeneratedShortArrayJitHarness');
+  const thread = {
+    id: 0,
+    name: 'short-array-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0];
+  out.type = '[I';
+  const values = [300, -20, 7];
+  values.type = '[S';
+  const checked = [1, 2];
+  checked.type = '[I';
+  await invoke(jvm, thread, 'GeneratedShortArrayJitHarness', 'compute',
+    '([I[SLjava/lang/Object;)V', [out, values, checked]);
+  t.equal(out[0], 289, 'short loads and a valid array cast preserve results');
+  t.equal(jvm.jit.generatedRunCount, 1, 'short-array loop uses generated code');
+  t.equal(jvm.jit.runnerRunCount, 0, 'short-array loop avoids runner fallback');
+  t.end();
+});
+
+test('generated JIT preserves long division, xor, and comparison semantics', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedLongJitHarness', `
+public class GeneratedLongJitHarness {
+  public static void compute(int[] out, int value) {
+    out[0] = ((((long) value / 3L) ^ -1L) == -5L) ? 1 : 0;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('GeneratedLongJitHarness');
+  const thread = {
+    id: 0,
+    name: 'long-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'GeneratedLongJitHarness', 'compute', '([II)V', [out, 12]);
+  t.equal(out[0], 1, 'long expression preserves BigInt-backed JVM semantics');
+  t.equal(jvm.jit.generatedRunCount, 1, 'long expression uses generated code');
+  t.end();
+});
+
+test('generated JIT preserves float32 arithmetic in hot array loops', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedFloatLoopHarness', `
+public class GeneratedFloatLoopHarness {
+  public static float mix(float[] values, int rounds) {
+    float total = 0.0f;
+    for (int round = 0; round < rounds; round++) {
+      for (int i = 0; i < values.length; i++) {
+        values[i] = values[i] * 1.25f - 0.5f;
+        total += values[i];
+      }
+    }
+    return total;
+  }
+}
+`);
+
+  async function run(jit) {
+    const jvm = new JVM({ classpath, jit });
+    await jvm.loadClassByName('GeneratedFloatLoopHarness');
+    const thread = {
+      id: 0,
+      name: 'generated-float-loop-test',
+      callStack: new Stack(),
+      status: 'runnable',
+      pendingException: null,
+    };
+    jvm.threads = [thread];
+    jvm.currentThreadIndex = 0;
+    const values = [0.1, -2.25, 3.5];
+    const ticks = await invoke(jvm, thread, 'GeneratedFloatLoopHarness', 'mix', '([FI)F',
+      [values, 4]);
+    return { jvm, values, ticks, result: thread.callStack.isEmpty() ? undefined : thread.callStack.peek() };
+  }
+
+  const interpreted = await run({ enabled: false });
+  const jitted = await run({ warmupThreshold: 100 });
+  t.deepEqual(jitted.values, interpreted.values,
+    'generated loop should match interpreter float32 rounding after every operation');
+  t.equal(jitted.jvm.jit.generatedRunCount, 1, 'backward float loop compiles on its first invocation');
+  t.equal(jitted.jvm.jit.runnerRunCount, 0, 'generated float loop bypasses the bytecode runner');
+  t.equal(jitted.ticks, 1, 'generated float loop completes in one scheduler tick');
+  t.end();
+});
+
 test('debug mode keeps JIT off so executeTick remains one-instruction stepping', async (t) => {
   const classpath = compileJavaFixture(t, 'DebugJitHarness', `
 public class DebugJitHarness {
@@ -295,6 +584,8 @@ class SelectiveOtherHotClass {
 test('JIT routes thrown Java exceptions through exception tables', async (t) => {
   const classpath = compileJavaFixture(t, 'JitExceptionHarness', `
 public class JitExceptionHarness {
+  static class Box { int value; }
+
   public static void catchDivide(int[] out, int a, int b) {
     try {
       out[0] = a / b;
@@ -303,6 +594,16 @@ public class JitExceptionHarness {
     }
 
     double x = (double) a + 1.0;
+    out[1] = (int) x;
+  }
+
+  public static void catchNull(int[] out, Box box) {
+    try {
+      out[0] = box.value;
+    } catch (NullPointerException e) {
+      out[0] = 77;
+    }
+    double x = 3.0;
     out[1] = (int) x;
   }
 }
@@ -328,11 +629,19 @@ public class JitExceptionHarness {
   await invoke(jvm, thread, 'JitExceptionHarness', 'catchDivide', '([III)V', [out, 10, 0]);
 
   t.deepEqual(out.slice(0, 2), [42, 11], 'JIT exception should be caught and execution should continue');
+  const nullOut = [0, 0];
+  nullOut.type = '[I';
+  nullOut.length = 2;
+  nullOut.hashCode = jvm.nextHashCode++;
+  await invoke(jvm, thread, 'JitExceptionHarness', 'catchNull',
+    '([ILJitExceptionHarness$Box;)V', [nullOut, null]);
+  t.deepEqual(nullOut.slice(0, 2), [77, 3],
+    'generated getfield should throw a catchable JVM NullPointerException');
   t.ok(jvm.jit.generatedRunCount > 0, 'exception test should exercise generated code');
   t.end();
 });
 
-test('generated JIT rejects methods outside numeric hotpath subset', async (t) => {
+test('generated JIT rejects synchronized methods outside its safe subset', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedRejectHarness', `
 public class GeneratedRejectHarness {
   static class Box {
@@ -340,10 +649,12 @@ public class GeneratedRejectHarness {
   }
 
   public static void compute(int[] out) {
-    Box box = new Box();
-    box.value = 7;
-    double x = 2.0 + 3.0;
-    out[0] = box.value + (int) x;
+    synchronized (out) {
+      Box box = new Box();
+      box.value = 7;
+      double x = 2.0 + 3.0;
+      out[0] = box.value + (int) x;
+    }
   }
 }
 `);
@@ -352,6 +663,45 @@ public class GeneratedRejectHarness {
   await jvm.loadClassByName('GeneratedRejectHarness');
   const method = await jvm.findMethodInHierarchy('GeneratedRejectHarness', 'compute', '([I)V');
 
-  t.notOk(jvm.jit.isCodegenSupported(method), 'object allocation should keep method out of generated JIT v1');
+  t.notOk(jvm.jit.isCodegenSupported(method), 'monitor bytecodes stay out of generated JIT');
+  t.end();
+});
+
+test('generated JIT preserves monitors for explicitly allowed hot methods', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedMonitorJitHarness', `
+public class GeneratedMonitorJitHarness {
+  public static void compute(int[] out, int value) {
+    synchronized (out) {
+      for (int i = 0; i < out.length; i++) out[i] += value;
+    }
+  }
+}
+`);
+  const methodKey = 'GeneratedMonitorJitHarness.compute([II)V';
+  const jvm = new JVM({
+    classpath,
+    jit: {
+      warmupThreshold: 100,
+      exceptionMethodAllowlist: [methodKey],
+      monitorMethodAllowlist: [methodKey],
+    },
+  });
+  await jvm.loadClassByName('GeneratedMonitorJitHarness');
+  const thread = {
+    id: 0,
+    name: 'monitor-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [1, 2, 3];
+  out.type = '[I';
+  await invoke(jvm, thread, 'GeneratedMonitorJitHarness', 'compute', '([II)V', [out, 4]);
+  t.deepEqual(out.slice(0, 3), [5, 6, 7], 'generated synchronized loop preserves results');
+  t.notOk(out.isLocked, 'generated monitorexit releases the monitor');
+  t.equal(out.lockOwner, null, 'released monitor clears its owner');
+  t.equal(jvm.jit.generatedRunCount, 1, 'explicitly allowed synchronized loop uses generated code');
   t.end();
 });
