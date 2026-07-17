@@ -995,6 +995,24 @@ function simulateBlock(block, entryStack, entryLocals, blockId, context, options
         produced = [createConstantValue(context, 'double', doubleConstant, 2, blockId, item, true)];
       } else if (normalized.op === 'aconst_null') {
         produced = [createConstantValue(context, 'null', null, 1, blockId, item, true)];
+      } else if (normalized.op === 'i2b' || normalized.op === 'i2c' || normalized.op === 'i2s') {
+        const source = consumed[0];
+        if (source && source.kind === 'constant' && source.type === 'int') {
+          let converted;
+          if (normalized.op === 'i2b') {
+            converted = (toInt32(source.value) << 24) >> 24;
+          } else if (normalized.op === 'i2c') {
+            converted = toInt32(source.value) & 0xffff;
+          } else {
+            converted = (toInt32(source.value) << 16) >> 16;
+          }
+          const replacement = createIntConstantInstruction(converted);
+          const removable = Boolean(replacement) && canRemoveValue(source, blockId);
+          if (replacement && removable) {
+            fold = { replacement, consumed: [...consumed], value: converted };
+            produced = [createConstantValue(context, 'int', converted, 1, blockId, item, true)];
+          }
+        }
       } else if (INT_BINARY_OPS.has(normalized.op)) {
         const right = consumed[0];
         const left = consumed[1];
@@ -1231,7 +1249,11 @@ function simulateBlock(block, entryStack, entryLocals, blockId, context, options
 
 function constantFoldCfg(cfg, options = {}) {
   if (!cfg || !cfg.blocks || cfg.blocks.size === 0) {
-    return { changed: false, optimizedCfg: cfg };
+    return {
+      changed: false,
+      optimizedCfg: cfg,
+      ...(options.captureAnalysis ? { analysis: { invocations: [] } } : {}),
+    };
   }
 
   const context = createFoldContext(options);
@@ -1308,6 +1330,11 @@ function constantFoldCfg(cfg, options = {}) {
         worklist.push(successorId);
       }
     }
+  }
+
+  const analysis = options.captureAnalysis ? collectInvocationAnalysis(blockInfos) : null;
+  if (options.analyzeOnly) {
+    return { changed: false, optimizedCfg: cfg, limited: context.bailReason, analysis };
   }
 
   let changed = false;
@@ -1419,9 +1446,49 @@ function constantFoldCfg(cfg, options = {}) {
     }
   }
 
-  return { changed, optimizedCfg: cfg, limited: context.bailReason };
+  return {
+    changed,
+    optimizedCfg: cfg,
+    limited: context.bailReason,
+    ...(analysis ? { analysis } : {}),
+  };
+}
+
+function collectInvocationAnalysis(blockInfos) {
+  const invocations = [];
+  for (const [blockId, info] of blockInfos) {
+    for (const instruction of info.instructions || []) {
+      if (!instruction.normalized || !/^invoke/.test(instruction.normalized.op || '')) continue;
+      invocations.push({
+        blockId,
+        item: instruction.item,
+        op: instruction.normalized.op,
+        arg: instruction.normalized.arg,
+        consumed: (instruction.consumed || []).map((value) => ({
+          kind: value && value.kind,
+          type: value && value.type,
+          value: value && value.value,
+          width: value && value.width,
+        })),
+      });
+    }
+  }
+  return { invocations };
+}
+
+function analyzeConstantCfg(cfg, options = {}) {
+  const result = constantFoldCfg(cfg, {
+    ...options,
+    analyzeOnly: true,
+    captureAnalysis: true,
+  });
+  return {
+    invocations: result.analysis ? result.analysis.invocations : [],
+    limited: result.limited || (result.analysis ? null : 'constant analysis failed'),
+  };
 }
 
 module.exports = {
+  analyzeConstantCfg,
   constantFoldCfg,
 };

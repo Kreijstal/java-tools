@@ -112,6 +112,22 @@ node scripts/runJar.js app.jar
 node scripts/runJar.js --class VecDemo vector.jar
 ```
 
+The JVM JIT selects methods from bytecode shape and observed execution; it does
+not use application class names or method-signature allowlists. Exception and
+monitor control flow (`athrow`, `monitorenter`, and `monitorexit`) is compiled by
+default only for leaf normal-flow regions, where generated execution cannot move
+a Java call across an interpreter scheduler boundary. Calls that are reachable
+only from an exception handler do not disqualify the leaf body. Set
+`JVM_JIT_EXPERIMENTAL_CONTROL_FLOW=1` to enable the broader capability globally
+for runtime experiments. Calls to unsupported methods permanently deopt their
+compiled caller instead of using application-specific resume rules.
+
+The Wasm numeric tier links fully translatable loop-free static helpers into hot
+loops on demand, including helpers with reference parameters. It also recognizes
+bounded, forward-only, always-rethrow diagnostic handlers as non-recovering, so
+their protected compute loops remain eligible. A catch that returns, acquires a
+monitor, loops backwards, or writes recovery state remains interpreted.
+
 #### Web-Based Debugging
 
 ```bash

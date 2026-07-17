@@ -496,6 +496,7 @@ function formatMethod(cls, method, options = {}) {
   if (process.env.CFR_JS_DEBUG_LOCALS === '1') {
     console.error('[cfr-body-before-locals]', JSON.stringify(body));
   }
+  removeImpossibleCheckedCatchBlocks(body, options.exceptionModel);
   ensureCheckedCatchReachability(body, code, options.exceptionModel);
   const constructorInvocation = method.name === '<init>'
     ? localState.takeConstructorInvocation()
@@ -1237,11 +1238,14 @@ function ensureCheckedCatchReachability(lines, code, model) {
   }
   const unsupportedSourceTypes = new Set();
   for (const [catchType, entries] of entriesByType) {
-    if (isAssignableExceptionType(catchType, 'java/lang/RuntimeException', model)
-      || isAssignableExceptionType(catchType, 'java/lang/Error', model)) continue;
-    const supported = (code.codeItems || []).some((item) => {
+    // Reuse the canonical classifier here. The corpus hierarchy generally
+    // stops at the JDK boundary, so a plain assignability walk cannot discover
+    // that types such as NumberFormatException are RuntimeExceptions and would
+    // inject a visible `if (false) throw ...` anchor unnecessarily.
+    if (!isCheckedThrow(catchType, model)) continue;
+    const supported = entries.every((entry) => (code.codeItems || []).some((item) => {
       if (!Number.isFinite(item.pc)
-        || !entries.some((entry) => item.pc >= entry.start_pc && item.pc < entry.end_pc)) return false;
+        || item.pc < entry.start_pc || item.pc >= entry.end_pc) return false;
       const instruction = getInstructionFromItem(item);
       if (!instruction) return false;
       if (instruction.op === 'new' && typeof instruction.arg === 'string') {
@@ -1252,8 +1256,8 @@ function ensureCheckedCatchReachability(lines, code, model) {
       try { ref = parseMemberRef(instruction.arg); } catch (_error) { return false; }
       return (resolveMethodThrows(ref.owner, ref.name, ref.descriptor, model) || [])
         .some((type) => isAssignableExceptionType(type, catchType, model));
-    });
-    if (!supported || entries.length > 1) unsupportedSourceTypes.add(javaTypeFromInternalName(catchType));
+    }));
+    if (!supported) unsupportedSourceTypes.add(javaTypeFromInternalName(catchType));
   }
   if (!unsupportedSourceTypes.size) return;
 
@@ -1264,6 +1268,7 @@ function ensureCheckedCatchReachability(lines, code, model) {
     if (catchIndex < 0) continue;
     const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
     if (!declaration || !unsupportedSourceTypes.has(declaration.type)) continue;
+    if (sourceRangeHasDeclaredThrower(lines, tryIndex + 1, catchIndex, declaration.type, model)) continue;
     insertions.push({ index: tryIndex + 1, type: declaration.type,
       indent: `${String(lines[tryIndex]).match(/^\s*/)[0]}    ` });
   }
@@ -1271,6 +1276,136 @@ function ensureCheckedCatchReachability(lines, code, model) {
   for (const insertion of insertions) {
     lines.splice(insertion.index, 0, `${insertion.indent}if (false) throw (${insertion.type}) null;`);
   }
+}
+
+function sourceRangeHasDeclaredThrower(lines, start, end, catchSourceType, model) {
+  const declaredTypes = new Map();
+  for (const line of lines) {
+    for (const declaration of localDeclarationsFromStatement(String(line))) {
+      if (!declaredTypes.has(declaration.name)) declaredTypes.set(declaration.name, declaration.type);
+    }
+  }
+  for (let index = start; index < end; index += 1) {
+    const line = String(lines[index]);
+    // Chained reflection obscures the Field receiver's source type, but this
+    // exact JDK declaration is unambiguous and carries checked throws metadata.
+    if (/\.getInt\s*\(/.test(line)
+      && throwsTypesCoverSourceCatch(
+        resolveMethodThrows('java/lang/reflect/Field', 'getInt', '(Ljava/lang/Object;)I', model),
+        catchSourceType, model)) return true;
+
+    for (const call of line.matchAll(/\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(([^;]*)/g)) {
+      const receiver = call[1];
+      const methodName = call[2];
+      const ownerSourceType = declaredTypes.get(receiver);
+      if (!ownerSourceType) continue;
+      const arity = sourceArgumentCount(call[3]);
+      const candidates = sourceMethodCandidates(ownerSourceType.replace(/\./g, '/'), methodName, arity, model);
+      if (candidates.length && candidates.every((throwsTypes) =>
+        throwsTypesCoverSourceCatch(throwsTypes, catchSourceType, model))) return true;
+    }
+  }
+  return false;
+}
+
+function sourceArgumentCount(rawArguments) {
+  const text = String(rawArguments || '');
+  let depth = 0;
+  let count = 0;
+  let sawToken = false;
+  for (const char of text) {
+    if (char === '(' || char === '[' || char === '{') depth += 1;
+    else if (char === ')' || char === ']' || char === '}') {
+      if (depth === 0 && char === ')') break;
+      depth = Math.max(0, depth - 1);
+    } else if (char === ',' && depth === 0) count += 1;
+    else if (!/\s/.test(char)) sawToken = true;
+  }
+  return sawToken ? count + 1 : 0;
+}
+
+function sourceMethodCandidates(owner, name, arity, model) {
+  const result = [];
+  const pending = [owner];
+  const seen = new Set();
+  while (pending.length) {
+    const current = pending.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    const info = model && model.classInfo ? model.classInfo.get(current) : null;
+    if (!info) continue;
+    for (const item of info.items || []) {
+      if (!item || item.type !== 'method' || !item.method || item.method.name !== name) continue;
+      if ((parseDescriptor(item.method.descriptor || '()V').params || []).length !== arity) continue;
+      result.push(methodThrowsTypes(item.method).map((type) => type.replace(/\./g, '/')));
+    }
+    if (info.superClassName) pending.push(info.superClassName);
+    pending.push(...(info.interfaces || []));
+  }
+  return result;
+}
+
+function throwsTypesCoverSourceCatch(throwsTypes, catchSourceType, model) {
+  const catchType = String(catchSourceType || '').replace(/\./g, '/');
+  return (throwsTypes || []).some((type) => {
+    const internal = String(type).replace(/\./g, '/');
+    return internal === catchType || simpleClassName(internal) === simpleClassName(catchType)
+      || isAssignableExceptionType(internal, catchType, model);
+  });
+}
+
+// Remove a source-level checked catch only after control-flow reconstruction.
+// Doing this to the bytecode exception table is tempting, but overlapping rows
+// are also input to synchronized/region recovery and deleting one can make the
+// emitted source less structured. Under this explicitly gated source-cleanup
+// policy, a specific checked catch is live only when an emitted call declares
+// that type. Broad unchecked/Throwable families remain conservative.
+function removeImpossibleCheckedCatchBlocks(lines, model) {
+  if (process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE !== '1') return;
+  for (let tryIndex = lines.length - 1; tryIndex >= 0; tryIndex -= 1) {
+    if (String(lines[tryIndex]).trim() !== 'try {') continue;
+    const catchIndex = findMatchingCatchLine(lines, tryIndex);
+    if (catchIndex < 0) continue;
+    const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
+    if (!declaration || !isCheckedOnlyCatchSourceType(declaration.type, model)) continue;
+    if (sourceRangeHasDeclaredThrower(lines, tryIndex + 1, catchIndex, declaration.type, model)) continue;
+
+    let depth = 1;
+    let catchEnd = -1;
+    let hasFollowingClause = false;
+    for (let index = catchIndex + 1; index < lines.length; index += 1) {
+      const line = String(lines[index]);
+      const trimmed = line.trim();
+      if (depth === 1 && (/^}\s*catch\b/.test(trimmed) || /^}\s*finally\b/.test(trimmed))) {
+        hasFollowingClause = true;
+        break;
+      }
+      depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+      if (depth === 0) {
+        catchEnd = index;
+        break;
+      }
+    }
+    if (hasFollowingClause || catchEnd < 0) continue;
+
+    // Retain a plain lexical block. Flattening it could collide with locals in
+    // the surrounding method even though the catch itself is unreachable.
+    const indent = (String(lines[tryIndex]).match(/^\s*/) || [''])[0];
+    lines[tryIndex] = `${indent}{`;
+    lines.splice(catchIndex, catchEnd - catchIndex + 1, `${indent}}`);
+  }
+}
+
+function isCheckedOnlyCatchSourceType(sourceType, model) {
+  const type = String(sourceType || '').replace(/\./g, '/');
+  if (!type) return false;
+  if (type === 'Throwable' || type === 'Exception' || type === 'Error'
+    || type === 'java/lang/Throwable' || type === 'java/lang/Exception'
+    || type === 'java/lang/Error') return false;
+  for (const unchecked of JDK_UNCHECKED_EXCEPTIONS) {
+    if (type === unchecked || (!type.includes('/') && type === simpleClassName(unchecked))) return false;
+  }
+  return isCheckedThrow(type, model);
 }
 
 function pruneTopLevelUnreachableTail(lines) {
@@ -1398,15 +1533,27 @@ function refineObjectLocalDeclarations(lines, resolveType) {
     const arrayType = declaredTypes.get(tokens[2].text);
     if (arrayType && arrayType.endsWith('[]')) arrayElementTypes.set(tokens[0].text, arrayType.slice(0, -2));
   }
+  const refinements = new Map();
+  for (const [name, declaredType] of declaredTypes) {
+    if (declaredType !== 'Object') continue;
+    const refinedType = arrayElementTypes.get(name) || resolveType(name);
+    if (refinedType && refinedType !== 'Object') refinements.set(name, refinedType);
+  }
   return (lines || []).map((raw) => {
     let line = String(raw);
-    for (const declaration of localDeclarationsFromStatement(line)) {
-      if (declaration.type !== 'Object') continue;
-      const refinedType = arrayElementTypes.get(declaration.name) || resolveType(declaration.name);
-      if (!refinedType || refinedType === 'Object') continue;
-      const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const [name, refinedType] of refinements) {
+      const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       line = line.replace(new RegExp(`\\bObject[ \\t]+${escapedName}(?=[ \\t]*[=;,)])`),
-        `${refinedType} ${declaration.name}`);
+        `${refinedType} ${name}`);
+      // Retyping a declaration after emission must also bridge assignments
+      // that were originally valid Object-to-Object stores. The verifier has
+      // already established the concrete reference type at the later use.
+      const assignment = new RegExp(`^(\\s*(?:${escapeRegExp(refinedType)}[ \\t]+)?${escapedName}[ \\t]*=[ \\t]*)([^;]+);$`);
+      line = line.replace(assignment, (whole, prefix, value) => {
+        const trimmed = value.trim();
+        if (trimmed === 'null' || trimmed.startsWith(`(${refinedType})`)) return whole;
+        return `${prefix}(${refinedType}) (Object) ${trimmed};`;
+      });
     }
     return line;
   });
@@ -2603,9 +2750,14 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (ARRAY_LOAD_TYPES[op]) {
       const index = pop(stack);
       let array = pop(stack);
-      if (array.type === 'Object') {
-        const arrayType = op === 'aaload' ? 'Object[]' : `${ARRAY_LOAD_TYPES[op]}[]`;
-        array = coerceExpressionForType(array, arrayType);
+      const arrayType = op === 'aaload' ? 'Object[]' : `${ARRAY_LOAD_TYPES[op]}[]`;
+      const compatibleBooleanArray = op === 'baload' && array.type === 'boolean[]';
+      if (array.type === 'Object'
+        || (op !== 'aaload' && array.type !== arrayType && !compatibleBooleanArray)) {
+        localState.refineExpressionType(array, arrayType);
+        const refined = localState.sourceTypeForName(array.code);
+        if (refined === arrayType) array = { ...array, type: refined };
+        else array = coerceExpressionForType(array, arrayType);
       }
       const elementType = op === 'baload' && array.type === 'boolean[]'
         ? 'boolean'
@@ -2617,9 +2769,14 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const value = pop(stack);
       const index = pop(stack);
       let array = pop(stack);
-      if (array.type === 'Object') {
-        const arrayType = op === 'aastore' ? 'Object[]' : `${ARRAY_STORE_TYPES[op]}[]`;
-        array = coerceExpressionForType(array, arrayType);
+      const arrayType = op === 'aastore' ? 'Object[]' : `${ARRAY_STORE_TYPES[op]}[]`;
+      const compatibleBooleanArray = op === 'bastore' && array.type === 'boolean[]';
+      if (array.type === 'Object'
+        || (op !== 'aastore' && array.type !== arrayType && !compatibleBooleanArray)) {
+        localState.refineExpressionType(array, arrayType);
+        const refined = localState.sourceTypeForName(array.code);
+        if (refined === arrayType) array = { ...array, type: refined };
+        else array = coerceExpressionForType(array, arrayType);
       }
       if (array.arrayLiteral && /^\d+$/.test(index.code)) {
         array.arrayLiteral.elements.set(Number(index.code), value);
@@ -2788,7 +2945,7 @@ function emitVirtualCall(lines, stack, arg) {
   }
 
   if (ref.owner === 'java/lang/StringBuilder' && ref.name === 'append' && args.length === 1) {
-    stack.push(stringBuilderAppendExpression(receiver, args[0]));
+    stack.push(stringBuilderAppendExpression(receiver, args[0], descriptor.params[0]));
     return;
   }
   if (ref.owner === 'java/lang/StringBuilder' && ref.name === 'toString' && args.length === 0 && receiver.stringBuilderPieces) {
@@ -2928,10 +3085,17 @@ function stringBuilderConstructorExpression(ownerType, args) {
   });
 }
 
-function stringBuilderAppendExpression(receiver, value) {
+function stringBuilderAppendExpression(receiver, value, targetType) {
+  // StringBuilder append chains are reconstructed specially so they can later
+  // collapse to source-level string concatenation. Do not lose the invoked
+  // overload's descriptor while doing so: JVM int-category locals also carry
+  // byte/short/char values, but javac selects append(int) unless the emitted
+  // expression is narrowed explicitly. That changes visible strings (for
+  // example, appending 'L' as the decimal text "76").
+  const renderedValue = coerceExpressionForType(value, targetType || value.type);
   const pieces = receiver.stringBuilderPieces ? receiver.stringBuilderPieces.slice() : [];
-  pieces.push(value);
-  return expr(`${wrap(receiver, 100)}.append(${value.code})`, 'StringBuilder', 100, {
+  pieces.push(renderedValue);
+  return expr(`${wrap(receiver, 100)}.append(${renderedValue.code})`, 'StringBuilder', 100, {
     stringBuilderPieces: pieces,
   });
 }
@@ -4489,10 +4653,20 @@ function conditionForBranch(branch, stack, invert) {
     let right = pop(stack);
     let left = pop(stack);
     const operator = invert ? invertOperator(intCompareOps[op]) : intCompareOps[op];
+    const complementedComparison = simplifyBitwiseComplementComparison(left, operator, right);
+    if (complementedComparison) return complementedComparison;
     if ((op === 'if_acmpeq' || op === 'if_acmpne') && left.code !== 'null' && right.code !== 'null'
       && simplifyType(left.type) !== simplifyType(right.type)) {
       left = coerceExpressionForType(left, 'Object');
       right = coerceExpressionForType(right, 'Object');
+    }
+    if ((operator === '<' || operator === '<=' || operator === '>' || operator === '>=')
+      && (left.type === 'boolean' || right.type === 'boolean')) {
+      // JVM verifier int-category values can carry a descriptor-Z value into
+      // an integer relational comparison. Java source cannot compare boolean
+      // to an int, so materialize the boolean operand as its JVM 0/1 value.
+      if (left.type === 'boolean') left = coerceExpressionForType(left, 'int');
+      if (right.type === 'boolean') right = coerceExpressionForType(right, 'int');
     }
     if ((operator === '==' || operator === '!=') && (left.type === 'boolean') !== (right.type === 'boolean')) {
       // Mixed boolean/int comparison. Coercing the int side to boolean
@@ -4523,6 +4697,12 @@ function conditionForBranch(branch, stack, invert) {
     const value = pop(stack);
     const operator = invert ? invertOperator(unaryOps[op]) : unaryOps[op];
     if (value.compare) {
+      const complementedComparison = simplifyBitwiseComplementComparison(
+        value.compare.left,
+        operator,
+        value.compare.right,
+      );
+      if (complementedComparison) return complementedComparison;
       return expr(`${wrap(value.compare.left, 60)} ${operator} ${wrap(value.compare.right, 60)}`, 'boolean', 60);
     }
     if (isBooleanExpression(value) && (op === 'ifeq' || op === 'ifne')) {
@@ -4531,6 +4711,12 @@ function conditionForBranch(branch, stack, invert) {
     }
     const materializedBoolean = simplifyMaterializedBooleanCondition(value, operator);
     if (materializedBoolean) return materializedBoolean;
+    const complementedComparison = simplifyBitwiseComplementComparison(
+      value,
+      operator,
+      expr('0', 'int', 100, { constantValue: 0 }),
+    );
+    if (complementedComparison) return complementedComparison;
     return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60);
   }
 
@@ -5112,11 +5298,21 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null)
       if (!value || !value.code) return;
       for (const [key, name] of names) {
         if (name !== value.code) continue;
+        // Method headers were rendered before body inference. Keep parameter
+        // declarations stable and cast verifier-constrained uses instead.
+        if (initiallyDeclared.has(key)) continue;
         // Collapsed (plain-forced) locals must stay Object: their stores were
         // rendered against Object, so re-typing the declaration would break.
         const slotIndex = Number(String(key).split(':')[0]);
         if (typeof key === 'string' && key.endsWith(':ref') && isPlainForced(slotIndex)) continue;
-        if (types.get(key) === 'Object') types.set(key, simplifyType(type));
+        const currentType = simplifyType(types.get(key));
+        const refinedType = simplifyType(type);
+        // arraylength establishes only Object[]; a following primitive array
+        // opcode carries the concrete verifier type.
+        if (currentType === 'Object'
+          || (currentType === 'Object[]' && refinedType.endsWith('[]') && refinedType !== 'Object[]')) {
+          types.set(key, refinedType);
+        }
       }
     },
     setLocal(index, name, type = 'Object', markDeclared = false) {
@@ -5400,8 +5596,107 @@ function binaryExpr(left, symbol, right, type) {
     left = coerceExpressionForType(left, 'int');
     right = coerceExpressionForType(right, 'int');
   }
+  const identity = simplifyIntegralIdentityExpression(left, symbol, right, type);
+  if (identity) return identity;
+  if (experimentalConstantEvaluationEnabled()
+    && symbol === '^' && (type === 'int' || type === 'long')) {
+    const leftConstant = integralConstantValue(left, type);
+    const rightConstant = integralConstantValue(right, type);
+    if (leftConstant === minusOneForType(type)) {
+      return expr(`~${wrap(right, 90)}`, type, 90, { bitwiseComplement: right });
+    }
+    if (rightConstant === minusOneForType(type)) {
+      return expr(`~${wrap(left, 90)}`, type, 90, { bitwiseComplement: left });
+    }
+  }
   const precedence = binaryPrecedence(symbol);
   return expr(`${wrap(left, precedence)} ${symbol} ${wrap(right, precedence, true)}`, type, precedence);
+}
+
+function simplifyIntegralIdentityExpression(left, symbol, right, type) {
+  if (!experimentalConstantEvaluationEnabled() || (type !== 'int' && type !== 'long')) return null;
+  const leftConstant = integralConstantValue(left, type);
+  const rightConstant = integralConstantValue(right, type);
+  const zero = type === 'long' ? 0n : 0;
+  const one = type === 'long' ? 1n : 1;
+  const minusOne = minusOneForType(type);
+
+  const rightIdentity = (rightConstant === zero && (
+    symbol === '+' || symbol === '-' || symbol === '|' || symbol === '^'
+      || symbol === '<<' || symbol === '>>' || symbol === '>>>'
+  )) || (rightConstant === one && (symbol === '*' || symbol === '/'))
+    || (rightConstant === minusOne && symbol === '&');
+  if (rightIdentity && simplifyType(left.type) === type) return { ...left, type };
+
+  const leftIdentity = (leftConstant === zero && (
+    symbol === '+' || symbol === '|' || symbol === '^'
+  )) || (leftConstant === one && symbol === '*')
+    || (leftConstant === minusOne && symbol === '&');
+  if (leftIdentity && simplifyType(right.type) === type) return { ...right, type };
+  return null;
+}
+
+function simplifyBitwiseComplementComparison(left, operator, right) {
+  if (!experimentalConstantEvaluationEnabled()) return null;
+  let value = null;
+  let constantExpression = null;
+  let normalizedOperator = operator;
+  if (left && left.bitwiseComplement) {
+    value = left.bitwiseComplement;
+    constantExpression = right;
+  } else if (right && right.bitwiseComplement) {
+    value = right.bitwiseComplement;
+    constantExpression = left;
+    normalizedOperator = swapComparisonOperator(operator);
+  } else {
+    return null;
+  }
+
+  const type = simplifyType(left && left.bitwiseComplement ? left.type : right.type);
+  if (type !== 'int' && type !== 'long') return null;
+  const constant = integralConstantValue(constantExpression, type);
+  if (constant == null) return null;
+  const complementedConstant = complementConstant(constant, type);
+  const simplifiedOperator = reverseComparisonOperator(normalizedOperator);
+  const renderedConstant = type === 'long'
+    ? `${String(complementedConstant)}L`
+    : String(complementedConstant);
+  return expr(`${wrap(value, 60)} ${simplifiedOperator} ${renderedConstant}`, 'boolean', 60);
+}
+
+function experimentalConstantEvaluationEnabled() {
+  return process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE === '1';
+}
+
+function integralConstantValue(value, type) {
+  if (!value || simplifyType(value.type) !== type) return null;
+  if (type === 'int') {
+    if (Number.isInteger(value.constantValue)) return value.constantValue | 0;
+    if (/^-?\d+$/.test(value.code || '')) return Number(value.code) | 0;
+    return null;
+  }
+  if (!/^-?\d+L$/.test(value.code || '')) return null;
+  try {
+    return BigInt.asIntN(64, BigInt(value.code.slice(0, -1)));
+  } catch (error) {
+    return null;
+  }
+}
+
+function minusOneForType(type) {
+  return type === 'long' ? -1n : -1;
+}
+
+function complementConstant(value, type) {
+  return type === 'long' ? BigInt.asIntN(64, ~value) : (~value | 0);
+}
+
+function swapComparisonOperator(operator) {
+  return ({ '<': '>', '<=': '>=', '>': '<', '>=': '<=' })[operator] || operator;
+}
+
+function reverseComparisonOperator(operator) {
+  return ({ '<': '>', '<=': '>=', '>': '<', '>=': '<=' })[operator] || operator;
 }
 
 function binaryPrecedence(symbol) {
@@ -5455,6 +5750,15 @@ function renderStoreExpression(value) {
 function coerceExpressionForType(value, targetType) {
   if (!value) return value;
   const type = simplifyType(targetType);
+  if (value.conditional) {
+    const { condition, trueValue, falseValue } = value.conditional;
+    return conditionalExpr(
+      condition,
+      coerceExpressionForType(trueValue, type),
+      coerceExpressionForType(falseValue, type),
+      type,
+    );
+  }
   if (type === 'boolean') {
     if (value.conditional) {
       const { condition, trueValue, falseValue } = value.conditional;
@@ -5686,4 +5990,11 @@ module.exports = {
   decompileClassAst,
   decompilePath,
   buildExceptionModel,
+  _internals: {
+    binaryExpr,
+    dropUnthrowableProtectedRows,
+    isCheckedThrow,
+    removeImpossibleCheckedCatchBlocks,
+    simplifyBitwiseComplementComparison,
+  },
 };

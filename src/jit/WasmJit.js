@@ -16,6 +16,18 @@
 // loop followed by a single SourceDataLine.write call — run its loop in wasm
 // and only the tail interpreted.
 //
+// Operand-stack values may cross block boundaries: a pre-pass infers each
+// block's entry stack shape (types) by propagating along CFG edges from the
+// method entry — verifier-valid bytecode has a unique shape per merge point.
+// Carried values travel in dedicated per-(depth,type) wasm locals: a
+// transfer stores the live stack into them and the target block's prologue
+// reloads. Blocks whose inferred entry stack is non-empty can only be
+// reached through compiled predecessors — external entry (call, OSR probe,
+// resume) is restricted to blocks with an empty entry shape AND an empty
+// frame.stack. When a block with carried entry values is demoted, its exit
+// stub also pushes those values into frame.stack so the interpreter resumes
+// with the true operand stack.
+//
 // Heap access stays in JS: array element ops, arraylength and field access
 // are imported functions that replicate the interpreter's exact semantics
 // (including its bounds-check and `.elements` behavior), so results are
@@ -28,21 +40,27 @@
 // scheduler: on exhaustion the method exits transiently at the current block
 // and re-enters on a later tick.
 //
-// Exception tables: methods whose every handler is a semantic no-op are
-// compiled with the table ignored. Two obfuscator shapes qualify: a bare
-// `athrow` at the handler pc (catch-and-rethrow — identical semantics), and
-// the wrap-and-rethrow reporter (astore, StringBuilder site-signature
-// append, wrapper invoke, athrow — no branches, no recovery). Handlers that
-// recover, retry or return keep the method interpreted. If an import throws
-// while a tolerated method runs in wasm, the interpreter's handler lookup
-// sees a stale frame.pc, but the only handlers it can match are the no-op
-// shapes, so behavior stays equivalent (modulo the wrapper's site string).
+// Exception tables: handlers that are semantic no-ops are ignored. Two
+// obfuscator shapes qualify: a bare `athrow` at the handler pc
+// (catch-and-rethrow — identical semantics), and the wrap-and-rethrow
+// reporter (astore, StringBuilder site-signature append, wrapper invoke,
+// athrow — no branches, no recovery). Handlers that recover, retry or
+// return are "live": every block intersecting a live handler's try-range is
+// demoted, so anything that can throw inside such a range runs interpreted
+// with correct pc/locals for the catch. Compiled blocks always lie outside
+// live ranges, and a throw escaping wasm surfaces at the (stale) entry pc —
+// also outside live ranges, since external entry is limited to supported
+// blocks — so a live handler can never match on stale state; only the no-op
+// shapes can, and those behave identically (modulo the wrapper's site
+// string).
 //
-// invokestatic sites can bind directly to other fully-compiled wasm methods
-// (numeric-only signatures), so e.g. va.d's table-generation loops stay in
-// wasm across their va.b/va.c helper calls. Methods whose invoke blocks were
-// demoted are recompiled after an exit storm to pick up callees that became
-// ready later. Synchronized methods stay interpreted.
+// invokestatic sites can bind directly to other fully-compiled wasm
+// methods, so e.g. va.d's table-generation loops stay in wasm across their
+// va.b/va.c helper calls. Methods whose invoke blocks were demoted are
+// recompiled after an exit storm to pick up callees that became ready
+// later. Synchronized methods compile too: this green-thread interpreter
+// implements no implicit method monitor (only explicit monitorenter/exit
+// opcodes), and wasm replicates interpreter semantics, not the JLS.
 
 const { resolveInstanceFieldKey } = require('../instructions/object');
 
@@ -130,6 +148,17 @@ function descToWasm(ch) {
   }
 }
 
+function toWasmValue(t, value) {
+  if (t === T.i64) {
+    if (typeof value === 'bigint') return value;
+    if (typeof value === 'number' && Number.isFinite(value)) return BigInt(Math.trunc(value));
+    return 0n;
+  }
+  if (t === T.f32) return Math.fround(typeof value === 'number' ? value : 0);
+  if (t === T.f64 || t === T.i32) return typeof value === 'number' ? value : 0;
+  return value === undefined ? null : value;
+}
+
 function parseMethodDescriptor(descriptor) {
   const m = /^\((.*)\)(.+)$/.exec(descriptor);
   if (!m) throw new Error(`bad descriptor ${descriptor}`);
@@ -190,27 +219,70 @@ const MATH_INTRINSICS = new Set([
 class Unsupported extends Error {}
 
 // Ops that may appear in a wrap-and-rethrow reporter handler before its
-// terminating athrow. Any branch, return or store-into-the-world op makes
-// the handler "live" and the method stays interpreted.
+// terminating athrow. Forward branches are handled separately: obfuscator
+// reporters commonly select "null" versus "{...}" while formatting args.
 const REPORTER_OPS = /^(astore|aload|iload|lload|fload|dload|ldc|ldc_w|ldc2_w|bipush|sipush|iconst|lconst|fconst|dconst|aconst_null|new|dup|checkcast|getstatic|invokespecial|invokevirtual|invokestatic|invokedynamic|i2l|i2c|l2i)/;
 
-function classifyExceptionTable(code, labelIndex) {
+function isNoOpExceptionHandler(codeItems, handlerIndex, labelIndex) {
+  let furthestForwardTarget = handlerIndex;
+  // Large game methods can have reporters that append dozens of arguments.
+  // Keep discovery bounded, but do not confuse their size with recovery.
+  const end = Math.min(codeItems.length, handlerIndex + 512);
+  for (let i = handlerIndex; i < end; i++) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    const op = getOp(instruction);
+    if (!op) continue;
+    if (op === 'athrow') return i >= furthestForwardTarget;
+    if (op === 'goto' || op.startsWith('if')) {
+      const target = instruction && typeof instruction === 'object'
+        ? labelIndex.get(instruction.arg) : undefined;
+      // Backedges can run arbitrary recovery logic; unresolved targets are
+      // not a proof either.
+      if (target === undefined || target <= i) return false;
+      furthestForwardTarget = Math.max(furthestForwardTarget, target);
+      continue;
+    }
+    if (/^(return|[a-z]return|putfield|putstatic|[a-z]astore|monitorenter|monitorexit)$/.test(op)) {
+      return false;
+    }
+    if (!REPORTER_OPS.test(op)) return false;
+  }
+  return false;
+}
+
+// Returns the item-index ranges [start, end) protected by LIVE (non-no-op)
+// handlers. Blocks intersecting these ranges must stay interpreted. No-op
+// handler entries (bare rethrow, wrap-and-rethrow reporter) contribute none.
+function catchesOnlyCheckedExceptions(jvm, catchType) {
+  if (!catchType || catchType === 'any') return false;
+
+  // Every operation emitted by this tier is either non-throwing or can only
+  // raise an unchecked VM exception (null/bounds/arithmetic). Calls capable
+  // of throwing a declared checked exception remain exit stubs and execute in
+  // the interpreter at their precise bytecode pc. Therefore a handler for a
+  // checked-exception subtype cannot observe a failure from a compiled block.
+  // Require a resolved hierarchy on both sides: broad Exception/Throwable
+  // handlers and unknown application exception types stay conservative.
+  return jvm.isInstanceOf(catchType, 'java/lang/Exception') &&
+    !jvm.isInstanceOf(catchType, 'java/lang/RuntimeException') &&
+    !jvm.isInstanceOf('java/lang/RuntimeException', catchType);
+}
+
+function liveExceptionRanges(jvm, code, labelIndex) {
   const table = code.exceptionTable || [];
+  const ranges = [];
   for (const entry of table) {
     const label = entry.handlerLbl || `L${entry.handler_pc}`;
     const h = labelIndex.get(label);
-    if (h === undefined) return 'live';
-    if (getOp(code.codeItems[h] && code.codeItems[h].instruction) === 'athrow') continue; // bare rethrow
-    let sawThrow = false;
-    for (let i = h; i < Math.min(h + 60, code.codeItems.length); i++) {
-      const op = getOp(code.codeItems[i] && code.codeItems[i].instruction);
-      if (!op) continue;
-      if (op === 'athrow') { sawThrow = true; break; }
-      if (!REPORTER_OPS.test(op)) return 'live';
+    const live = h === undefined || !isNoOpExceptionHandler(code.codeItems, h, labelIndex);
+    if (live && !catchesOnlyCheckedExceptions(jvm, entry.catch_type)) {
+      const s = labelIndex.get(entry.startLbl || `L${entry.start_pc}`);
+      const e = labelIndex.get(entry.endLbl || `L${entry.end_pc}`);
+      // an unresolvable range must poison the whole method, not vanish
+      ranges.push([s === undefined ? 0 : s, e === undefined ? code.codeItems.length : e]);
     }
-    if (!sawThrow) return 'live';
   }
-  return table.length ? 'ignorable' : 'none';
+  return ranges;
 }
 
 class MethodTranslator {
@@ -264,7 +336,7 @@ class MethodTranslator {
     const mk = (suffix, t) => {
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], (a, i) => {
         const arr = self.elemsOf(a, i, 'load');
-        return arr.elements ? arr.elements[i] : arr[i];
+        return toWasmValue(t, arr.elements ? arr.elements[i] : arr[i]);
       });
       self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
         self.elemsOf(a, i, 'store')[i] = v;
@@ -284,6 +356,13 @@ class MethodTranslator {
     this.addImport('spill_f', [T.i32, T.f32], [], (s, v) => { box.frame.locals[s] = v; });
     this.addImport('spill_d', [T.i32, T.f64], [], (s, v) => { box.frame.locals[s] = v; });
     this.addImport('spill_r', [T.i32, T.ref], [], (s, v) => { box.frame.locals[s] = v; });
+    // push a carried operand-stack value into frame.stack on transient exit
+    this.addImport('push_i', [T.i32], [], (v) => { box.frame.stack.push(v); });
+    this.addImport('push_l', [T.i64], [], (v) => { box.frame.stack.push(v); });
+    this.addImport('push_f', [T.f32], [], (v) => { box.frame.stack.push(Math.fround(v)); });
+    this.addImport('push_d', [T.f64], [], (v) => { box.frame.stack.push(v); });
+    this.addImport('push_r', [T.ref], [], (v) => { box.frame.stack.push(v); });
+    this.addImport('ref_eq', [T.ref, T.ref], [T.i32], (a, b) => a === b ? 1 : 0);
     this.addImport('ret_i', [T.i32], [], (v) => { box.ret = v; });
     this.addImport('ret_l', [T.i64], [], (v) => { box.ret = v; });
     this.addImport('ret_f', [T.f32], [], (v) => { box.ret = Math.fround(v); });
@@ -301,6 +380,72 @@ class MethodTranslator {
       case T.f32: return this.importIndexByName.get('spill_f');
       case T.f64: return this.importIndexByName.get('spill_d');
       default: return this.importIndexByName.get('spill_r');
+    }
+  }
+
+  pushImportFor(t) {
+    switch (t) {
+      case T.i32: return this.importIndexByName.get('push_i');
+      case T.i64: return this.importIndexByName.get('push_l');
+      case T.f32: return this.importIndexByName.get('push_f');
+      case T.f64: return this.importIndexByName.get('push_d');
+      default: return this.importIndexByName.get('push_r');
+    }
+  }
+
+  // Dedicated wasm local carrying operand-stack depth d of type t across
+  // block boundaries. Allocation is stable across pass 2 and exit stubs.
+  stackLocalFor(d, t) {
+    const key = `${d}|${t}`;
+    let idx = this.stackLocals.get(key);
+    if (idx === undefined) {
+      idx = this.nextLocal++;
+      this.declared.push(t);
+      this.stackLocals.set(key, idx);
+    }
+    return idx;
+  }
+
+  // store the simulated stack (types bottom-up) into carry locals, top first
+  storeCarrySeq(types) {
+    const seq = [];
+    for (let d = types.length - 1; d >= 0; d--) {
+      seq.push(OP.local_set, ...uleb(this.stackLocalFor(d, types[d])));
+    }
+    return seq;
+  }
+
+  // reload carry locals onto the wasm stack, bottom-up
+  loadCarrySeq(types) {
+    const seq = [];
+    for (let d = 0; d < types.length; d++) {
+      seq.push(OP.local_get, ...uleb(this.stackLocalFor(d, types[d])));
+    }
+    return seq;
+  }
+
+  // push carried entry values into frame.stack (bottom-up) for an exit
+  pushCarrySeq(types) {
+    const seq = [];
+    for (let d = 0; d < types.length; d++) {
+      seq.push(OP.local_get, ...uleb(this.stackLocalFor(d, types[d])),
+        OP.call, ...uleb(this.pushImportFor(types[d])));
+    }
+    return seq;
+  }
+
+  // CFG edge with the given stack shape: pass 1 records the target's entry
+  // shape; pass 2 verifies the recorded shape matches (demoting the source
+  // block on mismatch — only paths through already-demoted blocks disagree).
+  edgeShape(targetBlk, types) {
+    const known = this.entryStacks.get(targetBlk);
+    if (known === undefined) {
+      this.entryStacks.set(targetBlk, types.slice());
+      return;
+    }
+    if (!this.dryRun &&
+        (known.length !== types.length || known.some((t, i) => t !== types[i]))) {
+      throw new Unsupported('stack shape mismatch at edge');
     }
   }
 
@@ -329,7 +474,7 @@ class MethodTranslator {
       return {
         t,
         idx: isGet
-          ? this.addImport(name, [], [t], () => container.get(key))
+          ? this.addImport(name, [], [t], () => toWasmValue(t, container.get(key)))
           : this.addImport(name, [t], [], (v) => container.set(key, v)),
       };
     }
@@ -349,7 +494,7 @@ class MethodTranslator {
       idx: isGet
         ? this.addImport(name, [T.ref], [t], (obj) => {
           if (obj === null || obj === undefined) throw new Error('NullPointerException');
-          return obj.fields[resolveKey(obj)];
+          return toWasmValue(t, obj.fields[resolveKey(obj)]);
         })
         : this.addImport(name, [T.ref, t], [], (obj, v) => {
           if (obj === null || obj === undefined) throw new Error('NullPointerException');
@@ -384,8 +529,8 @@ class MethodTranslator {
   compiledCallee(ins) {
     const [, className, [name, descriptor]] = ins.arg;
     const { params, ret } = parseMethodDescriptor(descriptor);
-    if (![...params, ret].every((c) => 'IJFDZBCSV'.includes(c))) {
-      throw new Unsupported(`invoke ${className}.${name} non-numeric`);
+    if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
+      throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
     }
     const calleeSt = this.wasmJit && this.wasmJit.findReadyStatic(className, name, descriptor);
     if (!calleeSt || !calleeSt.meta.fullyCompiled || calleeSt.meta.boxedCount) {
@@ -469,18 +614,13 @@ class MethodTranslator {
     }
     return this.addImport(name, [T.i32], [t], (s) => {
       const v = box.frame.locals[s];
-      if (t === T.i64) return typeof v === 'bigint' ? v : 0n;
-      if (t === T.ref) return v === undefined ? null : v;
-      return typeof v === 'number' ? v : 0;
+      return toWasmValue(t, v);
     });
   }
 
   translate() {
-    if ((this.method.flags || []).includes('synchronized')) throw new Unsupported('synchronized');
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
-    if (classifyExceptionTable(codeAttr.code, this.labelIndex) === 'live') {
-      throw new Unsupported('live exception handlers');
-    }
+    const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, this.labelIndex);
     this.inferSlotTypes();
     this.runtimeImports();
     this.arrayImports();
@@ -511,32 +651,81 @@ class MethodTranslator {
     this.declared = [];
     this.nextLocal = this.paramSlots.length + 2;
     this.scratchPool = new Map(); // wasm type -> [localIdx]
+    this.stackLocals = new Map(); // `${depth}|${type}` -> localIdx
 
-    // compile each block; failures demote to exit stubs
+    // blocks intersecting a live handler's try-range must stay interpreted
+    const rangeDemoted = new Set();
+    for (const [rs, re] of liveRanges) {
+      for (let b = 0; b < N; b++) {
+        const from = this.blockStarts[b];
+        const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
+        if (from < re && to > rs) rangeDemoted.add(b);
+      }
+    }
+
+    // pass 1 (dry run): fix each block's entry stack shape by propagating
+    // along CFG edges from the method entry; blocks unreached by propagation
+    // (dead code, handler-only targets) are assumed empty. Emitted code and
+    // local allocations from this pass are discarded.
+    this.entryStacks = new Map([[0, []]]);
+    this.dryRun = true;
+    {
+      const savedNextLocal = this.nextLocal;
+      const savedDeclaredLen = this.declared.length;
+      const processed = new Set();
+      while (processed.size < N) {
+        let b = -1;
+        for (let i = 0; i < N; i++) {
+          if (!processed.has(i) && this.entryStacks.has(i)) { b = i; break; }
+        }
+        if (b < 0) {
+          for (let i = 0; i < N; i++) if (!processed.has(i)) { b = i; break; }
+          this.entryStacks.set(b, []);
+        }
+        processed.add(b);
+        try { this.compileBlock(b, N); } catch (err) {
+          if (!(err instanceof Unsupported)) throw err;
+        }
+      }
+      this.nextLocal = savedNextLocal;
+      this.declared.length = savedDeclaredLen;
+      this.scratchPool = new Map();
+      this.stackLocals = new Map();
+    }
+    this.dryRun = false;
+
+    // pass 2: compile each block against the fixed entry shapes;
+    // failures demote to exit stubs
     const blockBodies = [];
     this.supportedBlocks = new Set();
     for (let b = 0; b < N; b++) {
+      if (rangeDemoted.has(b)) {
+        this.demoteReasons.set(b, 'live handler range');
+        blockBodies[b] = this.exitStub(b);
+        continue;
+      }
       try {
         blockBodies[b] = this.compileBlock(b, N);
         this.supportedBlocks.add(b);
       } catch (err) {
         if (!(err instanceof Unsupported)) throw err;
         this.demoteReasons.set(b, err.message);
-        blockBodies[b] = this.exitStub(this.blockStarts[b]);
+        blockBodies[b] = this.exitStub(b);
       }
     }
     if (!this.supportedBlocks.size) throw new Unsupported('no supported blocks');
+    this.normalFlowFullyCompiled = [...this.normalReachableBlocks(N)]
+      .every((b) => this.supportedBlocks.has(b));
 
-    // function body: fuel check + dispatcher loop
+    // external entry (invocation, OSR, resume-after-exit) is only sound at a
+    // supported block whose inferred entry stack is empty
+    this.externalEntry = new Set(
+      [...this.supportedBlocks].filter((b) => (this.entryStacks.get(b) || []).length === 0));
+    if (!this.externalEntry.size) throw new Unsupported('no supported blocks');
+
+    // function body: dispatcher loop (fuel is checked per block prologue)
     const body = [];
     body.push(OP.loop, 0x40);
-    // fuel: one unit per block transfer; exhaustion exits at the current block
-    body.push(OP.local_get, ...uleb(this.fuelLocal), OP.i32_const, ...sleb(1), OP.i32_sub,
-      OP.local_tee, ...uleb(this.fuelLocal), OP.i32_eqz);
-    body.push(OP.if, 0x40);
-    body.push(...this.spillSeq());
-    body.push(OP.local_get, ...uleb(this.blkLocal), ...this.blockIdxToItemIdxSeq(N), OP.return);
-    body.push(OP.end);
     for (let i = 0; i < N; i++) body.push(OP.block, 0x40);
     body.push(OP.local_get, ...uleb(this.blkLocal));
     body.push(OP.br_table, ...uleb(N));
@@ -551,6 +740,45 @@ class MethodTranslator {
     body.push(OP.end);          // function
 
     return this.assemble(body);
+  }
+
+  normalReachableBlocks(N) {
+    const reachable = new Set();
+    const pending = [0];
+    const blockForTarget = (instruction) => {
+      if (!instruction || typeof instruction !== 'object') return undefined;
+      const item = this.labelIndex.get(instruction.arg);
+      return item === undefined ? undefined : this.blockOfItem.get(item);
+    };
+    while (pending.length) {
+      const b = pending.pop();
+      if (b < 0 || b >= N || reachable.has(b)) continue;
+      reachable.add(b);
+      const from = this.blockStarts[b];
+      const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
+      let instruction = null;
+      for (let i = to - 1; i >= from; i--) {
+        if (this.items[i] && this.items[i].instruction) {
+          instruction = this.items[i].instruction;
+          break;
+        }
+      }
+      const op = getOp(instruction);
+      if (op === 'goto' || op === 'goto_w') {
+        const target = blockForTarget(instruction);
+        if (target !== undefined) pending.push(target);
+        continue;
+      }
+      if (op && (op.startsWith('if'))) {
+        const target = blockForTarget(instruction);
+        if (target !== undefined) pending.push(target);
+        if (b + 1 < N) pending.push(b + 1);
+        continue;
+      }
+      if (op === 'athrow' || op === 'return' || /^[a-z]return$/.test(op || '')) continue;
+      if (b + 1 < N) pending.push(b + 1);
+    }
+    return reachable;
   }
 
   // maps the value on the stack (block index) to its item index via a chain of
@@ -590,8 +818,13 @@ class MethodTranslator {
     return seq;
   }
 
-  exitStub(itemIndex) {
-    return [...this.spillSeq(), OP.i32_const, ...sleb(itemIndex), OP.return];
+  exitStub(blockIndex) {
+    const entry = this.entryStacks.get(blockIndex) || [];
+    return [
+      ...this.spillSeq(),
+      ...this.pushCarrySeq(entry),
+      OP.i32_const, ...sleb(this.blockStarts[blockIndex]), OP.return,
+    ];
   }
 
   compileBlock(b, N) {
@@ -599,7 +832,7 @@ class MethodTranslator {
     const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
     const depthToTop = N - 1 - b;
     const code = [];
-    const stack = []; // wasm types
+    const stack = (this.entryStacks.get(b) || []).slice(); // wasm types, bottom-up
     const emit = (...bytes) => code.push(...bytes);
     const push = (t) => stack.push(t);
     const pop = (expected) => {
@@ -608,15 +841,28 @@ class MethodTranslator {
       if (expected !== undefined && t !== expected) throw new Unsupported(`stack type mismatch`);
       return t;
     };
-    const jump = (targetBlk, extraDepth) => {
+    const jump = (targetBlk, extraDepth, carryStored = false) => {
+      this.edgeShape(targetBlk, stack);
+      if (!carryStored) emit(...this.storeCarrySeq(stack));
       emit(OP.i32_const, ...sleb(targetBlk), OP.local_set, ...uleb(this.blkLocal),
         OP.br, ...uleb(depthToTop + extraDepth));
     };
     const condBranch = (ins) => {
-      if (stack.length) throw new Unsupported('non-empty stack at branch');
+      const target = this.blockOfTarget(this.targetOf(ins));
+      const fallthrough = this.blockOfItem.get(to);
+      if (fallthrough === undefined) throw new Unsupported('conditional without fallthrough block');
+      const condition = this.scratch(T.i32);
+      // The branch condition sits above any values carried to both successors.
+      // Save it, move the carried values into locals, and reload those values
+      // after the not-taken arm so the ordinary fallthrough transfer can store
+      // them in exactly the same way as an unconditional edge.
+      emit(OP.local_set, ...uleb(condition), ...this.storeCarrySeq(stack));
+      this.edgeShape(fallthrough, stack);
+      emit(OP.local_get, ...uleb(condition));
       emit(OP.if, 0x40);
-      jump(this.blockOfTarget(this.targetOf(ins)), 1);
+      jump(target, 1, true);
       emit(OP.end);
+      emit(...this.loadCarrySeq(stack));
     };
     const localOf = (s) => {
       const l = this.localOfSlot.get(s);
@@ -655,6 +901,14 @@ class MethodTranslator {
       emit(OP.end, OP.end);
       pop(); pop(); push(T.i32);
     };
+
+    // Charge fuel per basic block. Carry locals already contain this block's
+    // entry stack, so a fuel exit can materialize the interpreter frame before
+    // the values are reloaded onto the wasm operand stack.
+    emit(OP.local_get, ...uleb(this.fuelLocal), OP.i32_const, ...sleb(1), OP.i32_sub,
+      OP.local_tee, ...uleb(this.fuelLocal), OP.i32_eqz, OP.if, 0x40,
+      ...this.exitStub(b), OP.end,
+      ...this.loadCarrySeq(stack));
 
     for (let i = from; i < to; i++) {
       const ins = this.items[i].instruction;
@@ -855,8 +1109,12 @@ class MethodTranslator {
         emit(OP.ref_is_null);
         if (op === 'ifnonnull') emit(OP.i32_eqz);
         condBranch(ins);
+      } else if (op === 'if_acmpeq' || op === 'if_acmpne') {
+        pop(T.ref); pop(T.ref);
+        emit(OP.call, ...uleb(this.importIndexByName.get('ref_eq')));
+        if (op === 'if_acmpne') emit(OP.i32_eqz);
+        condBranch(ins);
       } else if (op === 'goto' || op === 'goto_w') {
-        if (stack.length) throw new Unsupported('non-empty stack at goto');
         jump(this.blockOfTarget(this.targetOf(ins)), 0);
         return code; // block terminated
       } else if (op === 'ireturn' || op === 'freturn') {
@@ -884,7 +1142,6 @@ class MethodTranslator {
       }
     }
     // fall through to next block
-    if (stack.length) throw new Unsupported('non-empty stack at block end');
     if (this.blockOfItem.has(to)) {
       jump(this.blockOfItem.get(to), 0);
     } else {
@@ -947,9 +1204,11 @@ class MethodTranslator {
       retChar: this.desc.ret,
       blockOfItem: this.blockOfItem,
       supportedBlocks: this.supportedBlocks,
+      externalEntry: this.externalEntry,
       demoteReasons: this.demoteReasons,
       blockCount: this.blockStarts.length,
       fullyCompiled: this.supportedBlocks.size === this.blockStarts.length,
+      normalFlowFullyCompiled: this.normalFlowFullyCompiled,
       boxedCount: this.boxedSlots.size,
     };
   }
@@ -1010,9 +1269,12 @@ class WasmJit {
     }
     if (st.status !== 'ready') return null;
 
-    // enter only at a supported block leader
+    // External calls and interpreter resumptions have no wasm carry locals.
+    // Enter only where the verifier shape is empty and the materialized JVM
+    // operand stack agrees; non-empty shapes are reachable solely through a
+    // compiled predecessor inside the same wasm run.
     const blk = st.meta.blockOfItem.get(frame.pc);
-    if (blk === undefined || !st.meta.supportedBlocks.has(blk)) return null;
+    if (blk === undefined || !st.meta.externalEntry.has(blk) || !frame.stack.isEmpty()) return null;
     return { st, blk };
   }
 
@@ -1026,9 +1288,12 @@ class WasmJit {
   // which never pass through tryRunFrame. On return the child is popped and
   // the value handed back to invoke(); on a transient exit the child stays on
   // the stack with frame.pc at the resume point and the runner continues it.
-  runNested(frame, thread) {
+  runNested(frame, thread, options = {}) {
     const prep = this.prepare(frame);
     if (!prep) return { handled: false };
+    if (options.requireNormalFlowFullyCompiled && !prep.st.meta.normalFlowFullyCompiled) {
+      return { handled: false };
+    }
     const result = this.execute(frame, thread, prep.st, prep.blk, true);
     if (result.returned) {
       return { returned: true, isVoid: prep.st.meta.retChar === 'V', value: prep.st.meta.box.ret };
@@ -1036,16 +1301,31 @@ class WasmJit {
     return { exited: true };
   }
 
-  compile(frame, st) {
+  compile(frame, st, options = {}) {
+    const asCallee = options.asCallee === true;
     const isRecompile = st.status === 'ready';
     const className = frame.className || (frame.method.className) || '?';
     st.key = `${className}.${frame.method.name}${frame.method.descriptor}`;
+    // Prevent recursive static call graphs from trying to compile the same
+    // method again while its translator is still discovering callees.
+    st.status = 'compiling';
     try {
       const translator = new MethodTranslator(this.jvm, frame.method, className, this);
       const meta = translator.translate();
-      // require at least one fully-compiled loop, else wasm entry is pure overhead
-      const hasCompiledLoop = this.hasSupportedBackwardBranch(frame.method, meta);
-      if (!hasCompiledLoop) throw new Unsupported('no compiled loop');
+      if (asCallee) {
+        // A linked callee cannot spill back into a Java frame in the middle of
+        // its synchronous wasm import. Only whole, unboxed numeric helpers are
+        // valid. They need not contain a loop: removing their call boundary is
+        // precisely what lets the caller's loop remain compiled.
+        if (!meta.fullyCompiled || meta.boxedCount) {
+          throw new Unsupported('callee is not fully compiled');
+        }
+      } else {
+        // Standalone entry has call/materialization overhead, so require at
+        // least one fully compiled loop.
+        const hasCompiledLoop = this.hasSupportedBackwardBranch(frame.method, meta);
+        if (!hasCompiledLoop) throw new Unsupported('no compiled loop');
+      }
       const module = new WebAssembly.Module(meta.bytes);
       const instance = new WebAssembly.Instance(module, meta.importObject);
       st.meta = meta;
@@ -1060,7 +1340,18 @@ class WasmJit {
     } catch (err) {
       if (isRecompile) {
         // keep the previous working module
+        st.status = 'ready';
         if (this.debug) console.error(`[wasmjit] recompile of ${st.key} failed (${err.message}), keeping old module`);
+        return;
+      }
+      if (asCallee && err instanceof Unsupported && (st.calleeFails || 0) < 2) {
+        // A dependency may not be initialized/compiled yet. Permit bounded
+        // rediscovery from later parent compilations without probing on every
+        // interpreter tick.
+        st.calleeFails = (st.calleeFails || 0) + 1;
+        st.status = 'cold';
+        st.entries = 0;
+        if (this.debug) console.error(`[wasmjit] deferred callee ${st.key}: ${err.message}`);
         return;
       }
       // "no compiled loop" is often transient — the loop's callee just isn't
@@ -1113,9 +1404,8 @@ class WasmJit {
     for (let i = 0; i < meta.paramSlots.length; i++) {
       const { slot, t } = meta.paramSlots[i];
       const v = frame.locals[slot];
-      if (t === T.i64) args[i] = typeof v === 'bigint' ? v : 0n;
-      else if (t === T.ref) args[i] = v === undefined ? null : v;
-      else args[i] = typeof v === 'number' ? v : (typeof v === 'boolean' ? (v ? 1 : 0) : 0);
+      if (t === T.i32 && typeof v === 'boolean') args[i] = v ? 1 : 0;
+      else args[i] = toWasmValue(t, v);
     }
     args[meta.paramSlots.length] = blk;
     args[meta.paramSlots.length + 1] = FUEL;
@@ -1150,7 +1440,18 @@ class WasmJit {
     const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
       .find((m) => m.name === name && m.descriptor === descriptor);
     if (!method || !(method.flags || []).includes('static')) return null;
-    const st = this.state.get(method);
+    let st = this.state.get(method);
+    if (!st) st = this.methodState({ method });
+    if (st.status === 'cold' && (st.calleeFails || 0) < 3) {
+      const hasClassInitializer = clsAst.items
+        .filter((i) => i.type === 'method')
+        .some((i) => i.method.name === '<clinit>');
+      // Linking must not bypass an observable class initializer. Classes with
+      // no <clinit> are safe because their initialization has no Java code.
+      if (!hasClassInitializer || this.jvm.classInitializationState.get(className) === 'INITIALIZED') {
+        this.compile({ method, className }, st, { asCallee: true });
+      }
+    }
     return st && st.status === 'ready' ? st : null;
   }
 

@@ -507,6 +507,7 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
 function discoverDeadStaticFlags(astRoot, options = {}) {
   const allowIntFlags = !!options.allowIntFlags;
   const allowTerminalSelfIncrementFlags = !!options.allowTerminalSelfIncrementFlags;
+  const allowMutuallyGuardedFalseCycles = !!options.allowMutuallyGuardedFalseCycles;
   const candidates = collectZeroStaticFields(astRoot, { allowIntFlags });
   const writesByField = collectStaticWrites(astRoot, candidates);
   const deps = new Map();
@@ -542,6 +543,31 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
     }
   }
 
+  propagateRejectedDependencies(deps, rejected);
+
+  // A mutually guarded cycle is a valid closed-world fixed-point proof only
+  // if no reflective/native/runtime code can seed one of its fields. Keep
+  // that stronger assumption opt-in so gamepacks can be A/B tested before it
+  // becomes part of their runtime-safe configuration.
+  const cyclicDependencies = findCyclicDependencies(deps, rejected);
+  if (!allowMutuallyGuardedFalseCycles) {
+    for (const key of cyclicDependencies) rejected.add(key);
+    propagateRejectedDependencies(deps, rejected);
+  }
+
+  const consumerFields = collectSentinelConsumerFields(astRoot, candidates);
+  const fields = [...candidates.keys()]
+    .filter((key) => !rejected.has(key) && (candidates.get(key).desc === 'I' || consumerFields.has(key)))
+    .sort();
+  return {
+    fields,
+    rejected: [...rejected].sort(),
+    dependencies: deps,
+    cyclicDependencies: [...cyclicDependencies].sort(),
+  };
+}
+
+function propagateRejectedDependencies(deps, rejected) {
   let changed = true;
   while (changed) {
     changed = false;
@@ -556,12 +582,53 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
       }
     }
   }
+}
 
-  const consumerFields = collectSentinelConsumerFields(astRoot, candidates);
-  const fields = [...candidates.keys()]
-    .filter((key) => !rejected.has(key) && (candidates.get(key).desc === 'I' || consumerFields.has(key)))
-    .sort();
-  return { fields, rejected: [...rejected].sort(), dependencies: deps };
+function findCyclicDependencies(deps, rejected) {
+  let nextIndex = 0;
+  const indices = new Map();
+  const lowLinks = new Map();
+  const stack = [];
+  const onStack = new Set();
+  const cyclic = new Set();
+
+  function visit(key) {
+    indices.set(key, nextIndex);
+    lowLinks.set(key, nextIndex);
+    nextIndex += 1;
+    stack.push(key);
+    onStack.add(key);
+
+    for (const dep of deps.get(key) || []) {
+      if (!deps.has(dep) || rejected.has(dep)) continue;
+      if (!indices.has(dep)) {
+        visit(dep);
+        lowLinks.set(key, Math.min(lowLinks.get(key), lowLinks.get(dep)));
+      } else if (onStack.has(dep)) {
+        lowLinks.set(key, Math.min(lowLinks.get(key), indices.get(dep)));
+      }
+    }
+
+    if (lowLinks.get(key) !== indices.get(key)) return;
+    const component = [];
+    let member;
+    do {
+      member = stack.pop();
+      onStack.delete(member);
+      component.push(member);
+    } while (member !== key);
+
+    if (component.length > 1) {
+      for (const field of component) cyclic.add(field);
+    } else if ((deps.get(key) || new Set()).has(key)) {
+      cyclic.add(key);
+    }
+  }
+
+  for (const key of deps.keys()) {
+    if (!rejected.has(key) && !indices.has(key)) visit(key);
+  }
+  return cyclic;
 }
 
 function isTerminalSelfIncrementWrite(write, key, candidates) {

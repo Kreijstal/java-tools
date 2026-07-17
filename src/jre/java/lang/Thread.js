@@ -1,4 +1,5 @@
 const { ASYNC_METHOD_SENTINEL } = require('../../../core/constants');
+const { withThrows } = require('../../helpers');
 
 function stringValue(value, fallback) {
   if (value === undefined || value === null) {
@@ -137,11 +138,11 @@ module.exports = {
       thread.status = 'JOINING';
       thread.joiningOn = threadToJoin;
     },
-    'sleep(J)V': (jvm, obj, args, thread) => {
+    'sleep(J)V': withThrows((jvm, obj, args, thread) => {
       const time = args[0];
       thread.status = 'SLEEPING';
       thread.sleepUntil = Date.now() + Number(time);
-    },
+    }, ['java/lang/InterruptedException']),
     'interrupt()V': (jvm, obj, args) => {
       obj.interrupted = true;
       if (obj.nativeThread && obj.nativeThread.status === 'SLEEPING') {

@@ -156,6 +156,48 @@ public class GeneratedNumericHarness {
   t.end();
 });
 
+test('generated JIT resolves inherited instance fields from subclass references', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedInheritedFieldHarness', `
+class GeneratedInheritedFieldBase {
+  int cursor;
+}
+public class GeneratedInheritedFieldHarness extends GeneratedInheritedFieldBase {
+  int output;
+  public void sync() {
+    output = 8 * cursor;
+  }
+}
+`);
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('GeneratedInheritedFieldHarness');
+  await jvm.loadClassByName('GeneratedInheritedFieldBase');
+  const thread = {
+    id: 0,
+    name: 'generated-inherited-field-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const object = {
+    type: 'GeneratedInheritedFieldHarness',
+    _className: 'GeneratedInheritedFieldHarness',
+    fields: {
+      'GeneratedInheritedFieldBase.cursor': 7,
+      'GeneratedInheritedFieldHarness.output': 0,
+    },
+  };
+
+  await invoke(jvm, thread, 'GeneratedInheritedFieldHarness', 'sync', '()V', [object]);
+
+  t.equal(object.fields['GeneratedInheritedFieldHarness.output'], 56,
+    'subclass-owned getfield resolves the inherited storage slot');
+  t.ok(jvm.jit.generatedRunCount > 0, 'method runs through generated code');
+  t.end();
+});
+
 test('generated JIT falls back when Function codegen is unavailable', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedFallbackHarness', `
 public class GeneratedFallbackHarness {
@@ -255,7 +297,7 @@ public class NestedGeneratedJitHarness {
   t.end();
 });
 
-test('generated callers resume after one interpreted unsupported invocation', async (t) => {
+test('generated callers permanently deopt at unsupported callees', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedTransientCallJitHarness', `
 public class GeneratedTransientCallJitHarness {
   private static int selected(int value) {
@@ -270,10 +312,7 @@ public class GeneratedTransientCallJitHarness {
   }
 }
 `);
-  const jvm = new JVM({ classpath, jit: {
-    warmupThreshold: 100,
-    resumeMethodAllowlist: ['GeneratedTransientCallJitHarness.compute([I)V'],
-  } });
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
   await jvm.loadClassByName('GeneratedTransientCallJitHarness');
   const thread = {
     id: 0,
@@ -288,10 +327,11 @@ public class GeneratedTransientCallJitHarness {
   out.type = '[I';
   await invoke(jvm, thread, 'GeneratedTransientCallJitHarness', 'compute', '([I)V', [out]);
   t.deepEqual(out.slice(0, 3), [11, 21, 31], 'unsupported child calls preserve results');
-  t.ok(jvm.jit.generatedRunCount > 1, 'generated caller resumes after interpreted child calls');
-  t.notOk(jvm.jit.deoptedMethods.has(
+  t.equal(jvm.jit.generatedRunCount, 1,
+    'caller crosses from generated code to the interpreter once');
+  t.ok(jvm.jit.deoptedMethods.has(
     await jvm.findMethodInHierarchy('GeneratedTransientCallJitHarness', 'compute', '([I)V')),
-  'transient child exits do not permanently deopt the caller');
+  'unsupported child permanently deopts the caller without a materialization proof');
   t.end();
 });
 
@@ -481,6 +521,291 @@ public class GeneratedFloatLoopHarness {
   t.end();
 });
 
+test('Wasm JIT carries category-2 values across control-flow merges', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmLongCarryHarness', `
+public class WasmLongCarryHarness {
+  public static void compute(long[] out, long[] state, long[] input) {
+    for (int i = 0; i < out.length; i++) {
+      out[i] = state[i] > input[i] ? state[i] : input[i];
+    }
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmLongCarryHarness');
+  jvm.classInitializationState.set('WasmLongCarryHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-long-carry-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = [0n, 0n, 0n];
+  const state = [1n, 2n, 3n];
+  const input = [4n, 6n, 7n];
+  for (const array of [out, state, input]) array.type = '[J';
+  await invoke(jvm, thread, 'WasmLongCarryHarness', 'compute', '([J[J[J)V',
+    [out, state, input]);
+
+  t.deepEqual(out.slice(0, 3), [4n, 6n, 7n], 'merged long branch values are preserved');
+  const compiled = jvm.jit.wasmJit.compiled.map((entry) => entry.key);
+  t.ok(compiled.includes('WasmLongCarryHarness.compute([J[J[J)V'), 'loop uses the Wasm tier');
+  t.end();
+});
+
+test('Wasm JIT links loop-free static numeric helpers into hot loops', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmLinkedHelperHarness', `
+public class WasmLinkedHelperHarness {
+  private static int mix(int[] values, int index, int salt) {
+    int value = values[index];
+    return (value * 31 + salt) ^ (value >>> 3);
+  }
+  public static void compute(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = mix(out, i, i + 7);
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmLinkedHelperHarness');
+  jvm.classInitializationState.set('WasmLinkedHelperHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-linked-helper-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [3, 5, 8];
+  out.type = '[I';
+
+  await invoke(jvm, thread, 'WasmLinkedHelperHarness', 'compute', '([I)V', [out]);
+
+  t.deepEqual(out.slice(0, 3), [100, 163, 256], 'linked helper preserves JVM integer results');
+  const compiled = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiled.has('WasmLinkedHelperHarness.mix([III)I'),
+    'loop-free helper with a reference argument compiles on demand');
+  t.ok(compiled.has('WasmLinkedHelperHarness.compute([I)V'), 'caller loop compiles with the linked helper');
+  t.equal(compiled.get('WasmLinkedHelperHarness.compute([I)V').exits, 0,
+    'linked call does not bounce through the interpreter');
+  t.end();
+});
+
+test('Wasm JIT recognizes forward-branching wrap-and-rethrow reporters', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmReporterHarness', `
+public class WasmReporterHarness {
+  public static void compute(int[] out, String site) {
+    try {
+      for (int i = 0; i < out.length; i++) out[i] = out[i] * 3 + i;
+    } catch (RuntimeException failure) {
+      String detail = site == null ? "null" : "{...}";
+      throw new IllegalStateException("compute(" + detail + ")", failure);
+    }
+  }
+
+  public static void recover(int[] out) {
+    try {
+      for (int i = 0; i <= out.length; i++) out[i]++;
+    } catch (RuntimeException failure) {
+      out[0] = 42;
+    }
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmReporterHarness');
+  jvm.classInitializationState.set('WasmReporterHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-reporter-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [2, 4, 6];
+  out.type = '[I';
+
+  await invoke(jvm, thread, 'WasmReporterHarness', 'compute',
+    '([ILjava/lang/String;)V', [out, null]);
+
+  t.deepEqual(out.slice(0, 3), [6, 13, 20], 'normal reporter-covered loop preserves results');
+  const compiled = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiled.has('WasmReporterHarness.compute([ILjava/lang/String;)V'),
+    'forward-only diagnostic formatting does not poison the protected loop');
+  t.equal(compiled.get('WasmReporterHarness.compute([ILjava/lang/String;)V').exits, 0,
+    'successful protected loop remains in wasm');
+  const recover = await jvm.findMethodInHierarchy('WasmReporterHarness', 'recover', '([I)V');
+  const recoverFrame = new Frame(recover);
+  recoverFrame.className = 'WasmReporterHarness';
+  t.equal(jvm.jit.wasmJit.prepare(recoverFrame), null,
+    'a handler that writes a recovery value remains interpreted');
+  t.end();
+});
+
+test('Wasm JIT compiles loops protected only by checked-exception handlers', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmCheckedHandlerHarness', `
+import java.io.IOException;
+
+public class WasmCheckedHandlerHarness {
+  private static void maybeFail(boolean fail) throws IOException {
+    if (fail) throw new IOException("expected");
+  }
+
+  public static void checked(int[] out, boolean fail) {
+    try {
+      for (int i = 0; i < out.length; i++) out[i] = out[i] * 3 + i;
+      maybeFail(fail);
+    } catch (IOException expected) {
+      out[0] = 42;
+    }
+  }
+
+  public static void broad(int[] out) {
+    try {
+      for (int i = 0; i <= out.length; i++) out[i]++;
+    } catch (Exception expected) {
+      out[0] = 99;
+    }
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('WasmCheckedHandlerHarness');
+  jvm.classInitializationState.set('WasmCheckedHandlerHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-checked-handler-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const success = [2, 4, 6];
+  success.type = '[I';
+  await invoke(jvm, thread, 'WasmCheckedHandlerHarness', 'checked', '([IZ)V', [success, 0]);
+  t.deepEqual(success.slice(0, 3), [6, 13, 20],
+    'normal protected loop preserves its result');
+
+  const failure = [1, 2, 3];
+  failure.type = '[I';
+  await invoke(jvm, thread, 'WasmCheckedHandlerHarness', 'checked', '([IZ)V', [failure, 1]);
+  t.deepEqual(failure.slice(0, 3), [42, 7, 11],
+    'checked exception still exits at the invoke and reaches its handler');
+
+  const compiled = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiled.has('WasmCheckedHandlerHarness.checked([IZ)V'),
+    'checked-exception protection does not poison the numeric loop');
+
+  const broad = await jvm.findMethodInHierarchy('WasmCheckedHandlerHarness', 'broad', '([I)V');
+  const broadFrame = new Frame(broad);
+  broadFrame.className = 'WasmCheckedHandlerHarness';
+  t.equal(jvm.jit.wasmJit.prepare(broadFrame), null,
+    'broad Exception recovery remains interpreted');
+  t.end();
+});
+
+test('generated JS callers give policy-rejected children a Wasm chance before deoptimizing', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmBeforeDeoptHarness', `
+public class WasmBeforeDeoptHarness {
+  private static int increment(int value) {
+    return value + 1;
+  }
+
+  private static void wrappedLoop(int[] out) {
+    try {
+      for (int i = 0; i < out.length; i++) out[i] = increment(out[i]);
+    } catch (RuntimeException failure) {
+      throw new IllegalStateException("wrappedLoop", failure);
+    }
+  }
+
+  public static void caller(int[] out) {
+    wrappedLoop(out);
+    out[0] += 10;
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('WasmBeforeDeoptHarness');
+  jvm.classInitializationState.set('WasmBeforeDeoptHarness', 'INITIALIZED');
+  const wrapped = await jvm.findMethodInHierarchy(
+    'WasmBeforeDeoptHarness', 'wrappedLoop', '([I)V');
+  t.notOk(jvm.jit.isCodegenSupported(wrapped),
+    'normal-path call under an exception handler remains outside JS-JIT policy');
+
+  const thread = {
+    id: 0,
+    name: 'wasm-before-deopt-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [1, 2, 3];
+  out.type = '[I';
+
+  await invoke(jvm, thread, 'WasmBeforeDeoptHarness', 'caller', '([I)V', [out]);
+
+  t.deepEqual(out.slice(0, 3), [12, 3, 4], 'Wasm child and generated caller preserve results');
+  const caller = await jvm.findMethodInHierarchy('WasmBeforeDeoptHarness', 'caller', '([I)V');
+  t.notOk(jvm.jit.deoptedMethods.has(caller),
+    'a Wasm-capable child does not permanently deopt its generated caller');
+  t.ok(jvm.jit.wasmJit.compiled.some((entry) =>
+    entry.key === 'WasmBeforeDeoptHarness.wrappedLoop([I)V'),
+  'the policy-rejected child compiles through Wasm on demand');
+  t.end();
+});
+
 test('debug mode keeps JIT off so executeTick remains one-instruction stepping', async (t) => {
   const classpath = compileJavaFixture(t, 'DebugJitHarness', `
 public class DebugJitHarness {
@@ -606,10 +931,22 @@ public class JitExceptionHarness {
     double x = 3.0;
     out[1] = (int) x;
   }
+
+  public static void catchExplicit(int[] out, RuntimeException failure) {
+    try {
+      if (failure != null) throw failure;
+    } catch (RuntimeException e) {
+      out[0] = 91;
+    }
+    for (int i = 1; i < out.length; i++) out[i] = i + 10;
+  }
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({
+    classpath,
+    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+  });
   await jvm.loadClassByName('JitExceptionHarness');
   const thread = {
     id: 0,
@@ -637,13 +974,21 @@ public class JitExceptionHarness {
     '([ILJitExceptionHarness$Box;)V', [nullOut, null]);
   t.deepEqual(nullOut.slice(0, 2), [77, 3],
     'generated getfield should throw a catchable JVM NullPointerException');
+  const explicitOut = [0, 0];
+  explicitOut.type = '[I';
+  explicitOut.length = 2;
+  explicitOut.hashCode = jvm.nextHashCode++;
+  await invoke(jvm, thread, 'JitExceptionHarness', 'catchExplicit',
+    '([ILjava/lang/RuntimeException;)V', [explicitOut, { type: 'java/lang/RuntimeException' }]);
+  t.deepEqual(explicitOut.slice(0, 2), [91, 11],
+    'generated athrow should route through the method exception table');
   t.ok(jvm.jit.generatedRunCount > 0, 'exception test should exercise generated code');
   t.end();
 });
 
-test('generated JIT rejects synchronized methods outside its safe subset', async (t) => {
+test('generated JIT derives leaf exception and monitor control flow from bytecodes', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedRejectHarness', `
-public class GeneratedRejectHarness {
+public class GeneratedRejectHarness implements Runnable {
   static class Box {
     int value;
   }
@@ -656,18 +1001,88 @@ public class GeneratedRejectHarness {
       out[0] = box.value + (int) x;
     }
   }
+
+  public static int leafWrapped(int value, int divisor) {
+    try {
+      return value / divisor;
+    } catch (RuntimeException failure) {
+      throw new IllegalStateException(failure);
+    }
+  }
+
+  public static void leafSynchronized(int[] out) {
+    synchronized (out) {
+      for (int i = 0; i < out.length; i++) out[i] += 2;
+    }
+  }
+
+  public void run() {
+    int[] out = new int[2];
+    synchronized (out) {
+      for (int i = 0; i < out.length; i++) out[i]++;
+    }
+  }
 }
 `);
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
-  await jvm.loadClassByName('GeneratedRejectHarness');
-  const method = await jvm.findMethodInHierarchy('GeneratedRejectHarness', 'compute', '([I)V');
+  const safeJvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await safeJvm.loadClassByName('GeneratedRejectHarness');
+  const safeMethod = await safeJvm.findMethodInHierarchy('GeneratedRejectHarness', 'compute', '([I)V');
+  t.notOk(safeJvm.jit.isCodegenSupported(safeMethod),
+    'normal-flow constructor calls keep effectful control flow interpreted');
+  const leafWrappedMethod = await safeJvm.findMethodInHierarchy(
+    'GeneratedRejectHarness', 'leafWrapped', '(II)I');
+  t.ok(safeJvm.jit.isCodegenSupported(leafWrappedMethod),
+    'an invoke reachable only from the exception handler does not reject a leaf body');
+  const leafSynchronizedMethod = await safeJvm.findMethodInHierarchy(
+    'GeneratedRejectHarness', 'leafSynchronized', '([I)V');
+  t.ok(safeJvm.jit.isCodegenSupported(leafSynchronizedMethod),
+    'a leaf synchronized numeric loop is derived without a signature allowlist');
+  const safeRunMethod = await safeJvm.findMethodInHierarchy('GeneratedRejectHarness', 'run', '()V');
+  t.notOk(safeJvm.jit.isCodegenSupported(safeRunMethod),
+    'thread lifecycle entrypoint remains interpreted by default');
 
-  t.notOk(jvm.jit.isCodegenSupported(method), 'monitor bytecodes stay out of generated JIT');
+  const experimentalJvm = new JVM({
+    classpath,
+    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+  });
+  await experimentalJvm.loadClassByName('GeneratedRejectHarness');
+  const experimentalMethod = await experimentalJvm.findMethodInHierarchy(
+    'GeneratedRejectHarness', 'compute', '([I)V');
+  t.ok(experimentalJvm.jit.isCodegenSupported(experimentalMethod),
+    'capability gate enables supported bytecodes without naming the method');
+  const experimentalRunMethod = await experimentalJvm.findMethodInHierarchy(
+    'GeneratedRejectHarness', 'run', '()V');
+  t.ok(experimentalJvm.jit.isCodegenSupported(experimentalRunMethod),
+    'explicit experimental gate can enable lifecycle control flow');
   t.end();
 });
 
-test('generated JIT preserves monitors for explicitly allowed hot methods', async (t) => {
+test('generated JIT leaves monitor-parking methods in the interpreter', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedMonitorWaitHarness', `
+public class GeneratedMonitorWaitHarness {
+  public static void compute(int[] out) throws InterruptedException {
+    synchronized (out) {
+      out.wait();
+      for (int i = 0; i < out.length; i++) out[i]++;
+    }
+  }
+}
+`);
+
+  const jvm = new JVM({
+    classpath,
+    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+  });
+  await jvm.loadClassByName('GeneratedMonitorWaitHarness');
+  const method = await jvm.findMethodInHierarchy('GeneratedMonitorWaitHarness', 'compute', '([I)V');
+
+  t.notOk(jvm.jit.isCodegenSupported(method),
+    'a wait while holding a monitor requires interpreter scheduler semantics');
+  t.end();
+});
+
+test('generated JIT preserves monitors for structurally supported hot methods', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedMonitorJitHarness', `
 public class GeneratedMonitorJitHarness {
   public static void compute(int[] out, int value) {
@@ -677,14 +1092,9 @@ public class GeneratedMonitorJitHarness {
   }
 }
 `);
-  const methodKey = 'GeneratedMonitorJitHarness.compute([II)V';
   const jvm = new JVM({
     classpath,
-    jit: {
-      warmupThreshold: 100,
-      exceptionMethodAllowlist: [methodKey],
-      monitorMethodAllowlist: [methodKey],
-    },
+    jit: { warmupThreshold: 100 },
   });
   await jvm.loadClassByName('GeneratedMonitorJitHarness');
   const thread = {
@@ -702,6 +1112,94 @@ public class GeneratedMonitorJitHarness {
   t.deepEqual(out.slice(0, 3), [5, 6, 7], 'generated synchronized loop preserves results');
   t.notOk(out.isLocked, 'generated monitorexit releases the monitor');
   t.equal(out.lockOwner, null, 'released monitor clears its owner');
-  t.equal(jvm.jit.generatedRunCount, 1, 'explicitly allowed synchronized loop uses generated code');
+  t.equal(jvm.jit.generatedRunCount, 1, 'structurally supported synchronized loop uses generated code');
+  t.end();
+});
+
+test('generated synchronized regions resume around unsupported interpreted callees', async (t) => {
+  const classpath = compileJavaFixture(t, 'MonitorCallIslandHarness', `
+public class MonitorCallIslandHarness {
+  private static int opaque(int value) {
+    switch (value) {
+      case 1: return 7;
+      case 2: return 11;
+      case 3: return 13;
+      default: return value * 3;
+    }
+  }
+
+  public static void compute(int[] out) {
+    synchronized (out) {
+      for (int i = 0; i < out.length; i++) out[i] = opaque(out[i]) + i;
+    }
+  }
+}
+`);
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('MonitorCallIslandHarness');
+  jvm.classInitializationState.set('MonitorCallIslandHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'monitor-call-island-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [1, 2, 3, 4];
+  out.type = '[I';
+  out.isLocked = false;
+  out.lockOwner = null;
+  out.lockCount = 0;
+  out.waitSet = [];
+
+  await invoke(jvm, thread, 'MonitorCallIslandHarness', 'compute', '([I)V', [out]);
+
+  t.deepEqual(out.slice(0, 4), [7, 12, 15, 15],
+    'compiled parent and interpreted switch helper preserve results');
+  const compute = await jvm.findMethodInHierarchy('MonitorCallIslandHarness', 'compute', '([I)V');
+  t.notOk(jvm.jit.deoptedMethods.has(compute),
+    'interpreted call islands do not permanently deopt the synchronized parent');
+  t.ok(jvm.jit.generatedMethodRunCounts.get('MonitorCallIslandHarness.compute([I)V') >= 2,
+    'generated parent resumes after interpreted children');
+  t.notOk(out.isLocked, 'resumed generated monitorexit releases the monitor');
+  t.end();
+});
+
+test('generated JIT resolves class literals for native-only JRE classes', async (t) => {
+  const classpath = compileJavaFixture(t, 'JitClassLiteralHarness', `
+public class JitClassLiteralHarness {
+  public static void store(Object[] out) {
+    for (int i = 0; i < out.length; i++) {
+      out[i] = javax.sound.sampled.SourceDataLine.class;
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 1 } });
+  await jvm.loadClassByName('JitClassLiteralHarness');
+  const thread = {
+    id: 0,
+    name: 'jit-class-literal-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [null, null];
+  out.type = '[Ljava/lang/Object;';
+  out.length = 2;
+  out.hashCode = jvm.nextHashCode++;
+
+  await invoke(jvm, thread, 'JitClassLiteralHarness', 'store', '([Ljava/lang/Object;)V', [out]);
+  await invoke(jvm, thread, 'JitClassLiteralHarness', 'store', '([Ljava/lang/Object;)V', [out]);
+
+  t.equal(out[0]._classData.ast.classes[0].className,
+    'javax/sound/sampled/SourceDataLine', 'class literal becomes a usable java.lang.Class object');
+  t.ok(jvm.jit.generatedRunCount + jvm.jit.runnerRunCount > 0,
+    'class literal executes through a JIT tier');
   t.end();
 });

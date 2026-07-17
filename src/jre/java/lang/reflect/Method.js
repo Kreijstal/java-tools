@@ -136,7 +136,12 @@ module.exports = {
       thread.callStack.push(newFrame);
 
       return ASYNC_METHOD_SENTINEL;
-    }, ['java/lang/NullPointerException', 'java/lang/IllegalArgumentException']),
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+      'java/lang/reflect/InvocationTargetException',
+    ]),
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, methodObj, args) => {
       const annotationClass = args[0];
       const annotations = methodObj._annotations || [];

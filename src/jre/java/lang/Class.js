@@ -451,16 +451,16 @@ module.exports = {
       
       return null;
     },
-    'getConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': (jvm, classObj, args) => ({
+    'getConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': withThrows((jvm, classObj, args) => ({
       type: 'java/lang/reflect/Constructor',
       _declaringClass: classObj,
       _parameterTypes: args[0] || [],
-    }),
-    'getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': (jvm, classObj, args) => ({
+    }), ['java/lang/NoSuchMethodException']),
+    'getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': withThrows((jvm, classObj, args) => ({
       type: 'java/lang/reflect/Constructor',
       _declaringClass: classObj,
       _parameterTypes: args[0] || [],
-    }),
+    }), ['java/lang/NoSuchMethodException']),
     'newInstance()Ljava/lang/Object;': async (jvm, classObj, args, thread) => {
       const classData = classObj._classData;
       const className = classData.ast.classes[0].className;

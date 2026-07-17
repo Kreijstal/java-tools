@@ -69,3 +69,24 @@ test('removeRuntimeExceptionHandlers preserves recovery handlers when requested'
     'branching RuntimeException recovery remains in the table');
   t.end();
 });
+
+test('removeRuntimeExceptionHandlers preserves static primitive loop reporters when requested', (t) => {
+  const ast = astWithHandlers();
+  const method = ast.classes[0].items[0].method;
+  const code = method.attributes[0].code;
+  method.flags = ['static'];
+  method.descriptor = '(BII)I';
+  code.codeItems.splice(1, 0,
+    { labelDef: 'Lloop:', instruction: { op: 'iinc', arg: [1, -1] } },
+    { instruction: { op: 'ifne', arg: 'Lloop' } },
+  );
+
+  const result = removeRuntimeExceptionHandlers(ast, {
+    preserveRecoveryHandlers: true,
+    preserveStaticPrimitiveLoopHandlers: true,
+  });
+
+  t.equal(result.removals.length, 0, 'keeps the reporter on the primitive loop helper');
+  t.equal(code.exceptionTable.length, 2, 'keeps both exception-table entries');
+  t.end();
+});

@@ -12,6 +12,7 @@ const {
 } = require("../parsing/convert_tree");
 const jreClasses = require("../jre");
 const dispatch = require("../instructions");
+const { dispatchSync } = dispatch;
 const Frame = require("./frame");
 const DebugManager = require("../debug/DebugManager");
 const JNI = require("./jni");
@@ -53,8 +54,13 @@ class JVM {
     this.appletCodeBase = options.appletCodeBase || null;
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
-    this.yieldInterval = options.yieldInterval || 4096;
-    this._ticksSinceYield = 0;
+    const env = (typeof process !== 'undefined' && process.env) || {};
+    const configuredYieldMs = options.eventLoopYieldMs ?? env.JVM_EVENT_LOOP_YIELD_MS;
+    this.eventLoopYieldMs = Math.max(1, Number(configuredYieldMs) || 16);
+    const configuredBurst = options.interpreterBurst ??
+      env.JVM_INTERPRETER_BURST;
+    this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
+    this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
     this._hotMethodCounts = new Map();
     this.jit = new JitCompiler(this, options.jit || {});
 
@@ -345,7 +351,7 @@ class JVM {
         !thread.callStack.isEmpty() &&
         thread.callStack.peek().method === staticInitializer.method
       ) {
-        const result = await this.executeTick();
+        const result = await this.executeTick({ allowBurst: true });
         if (result.completed) break;
       }
     }
@@ -789,7 +795,7 @@ class JVM {
 
     try {
       while (!this.debugManager.isPaused) {
-        const result = await this.executeTick();
+        const result = await this.executeTick({ allowBurst: true });
         if (result.completed) {
           this.debugManager.pause();
           return { completed: true, paused: false };
@@ -798,6 +804,7 @@ class JVM {
         // Check for breakpoints
         const currentThread = this.threads[this.currentThreadIndex];
         if (
+          this.debugManager.breakpoints.size > 0 &&
           currentThread &&
           currentThread.status === "runnable" &&
           !currentThread.callStack.isEmpty()
@@ -819,12 +826,12 @@ class JVM {
             }
           }
         }
-        // Yield periodically rather than after every bytecode. CFR executes enough
-        // bytecode that yielding per instruction dominates runtime.
-        this._ticksSinceYield += 1;
-        if (this._ticksSinceYield >= this.yieldInterval) {
-          this._ticksSinceYield = 0;
+        // Bytecode throughput varies drastically between interpreter and JIT
+        // regions. A wall-clock budget keeps timers and I/O responsive without
+        // making fast bytecodes pay excessive scheduler overhead.
+        if (Date.now() >= this._nextEventLoopYieldAt) {
           await yieldToEventLoop();
+          this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
         }
       }
     } catch (e) {
@@ -835,7 +842,7 @@ class JVM {
     return { paused: true, completed: false };
   }
 
-  async executeTick() {
+  async executeTick(options = {}) {
     // On each tick, check for threads that need to be woken up.
     for (const t of this.threads) {
       if (t.status === "SLEEPING" && Date.now() >= t.sleepUntil) {
@@ -970,44 +977,77 @@ class JVM {
       return { completed: false };
     }
 
-    const instructionItem = frame.instructions[frame.pc];
-    const instruction = instructionItem.instruction;
+    const env = (typeof process !== 'undefined' && process.env) || {};
+    const burstAllowed = options.allowBurst === true && !this.debugManager.debugMode &&
+      !this.verbose && !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1' &&
+      env.JVM_PROFILE_HOT_METHODS_WITH_JIT !== '1';
+    const instructionInstrumentation = env.JVM_TRACE ||
+      env.JVM_PROFILE_HOT_METHODS === '1' || env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1';
+    const limit = burstAllowed ? this.interpreterBurst : 1;
+    let executedBytecodes = 0;
 
-    frame.pc++;
+    for (let executed = 0; executed < limit; executed++) {
+      const currentFrame = callStack.isEmpty() ? null : callStack.peek();
+      if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
+          thread.status !== 'runnable') break;
 
-    try {
-      if (instruction) {
-        // Check if this is a return instruction that will complete an applet method in debug mode
-        const isReturnInstruction = instruction === 'return' || 
-          (instruction.op && (instruction.op === 'ireturn' || instruction.op === 'areturn'));
-        const shouldSetupNextAppletMethod = isReturnInstruction && 
-          this.debugManager.debugMode && 
-          thread.appletInfo && 
-          thread.appletInfo.nextMethods.length > 0;
+      // Never step across a debugger breakpoint inside one quantum. The
+      // outer execute loop observes it immediately after this tick.
+      if (executed > 0 && this.debugManager.breakpoints.size > 0) {
+        const nextItem = currentFrame.instructions[currentFrame.pc];
+        const nextLabel = nextItem && nextItem.labelDef;
+        const nextPc = nextLabel ? parseInt(nextLabel.substring(1, nextLabel.length - 1)) : -1;
+        if (this.debugManager.breakpoints.has(nextPc)) break;
+      }
 
-        if (shouldSetupNextAppletMethod) {
-          // Execute the return instruction first
-          await this.executeInstruction(instruction, frame, thread);
-          // Then set up the next applet method
-          this.setupNextAppletMethod(thread);
-        } else {
-          await this.executeInstruction(instruction, frame, thread);
+      const instructionItem = currentFrame.instructions[currentFrame.pc];
+      const instruction = instructionItem.instruction;
+      currentFrame.pc++;
+      executedBytecodes++;
+
+      try {
+        if (instruction) {
+          const isReturnInstruction = instruction === 'return' ||
+            (instruction.op && (instruction.op === 'ireturn' || instruction.op === 'areturn'));
+          const shouldSetupNextAppletMethod = isReturnInstruction &&
+            this.debugManager.debugMode && thread.appletInfo &&
+            thread.appletInfo.nextMethods.length > 0;
+
+          if (shouldSetupNextAppletMethod) {
+            await this.executeInstruction(instruction, currentFrame, thread);
+            this.setupNextAppletMethod(thread);
+            break;
+          }
+
+          if (!burstAllowed || !dispatchSync(currentFrame, instruction, this, thread)) {
+            if (instructionInstrumentation) {
+              await this.executeInstruction(instruction, currentFrame, thread);
+            } else {
+              await dispatch(currentFrame, instruction, this, thread);
+            }
+            break;
+          }
         }
+      } catch (e) {
+        const isJavaException = e && typeof e.type === "string" && e.type.includes("/");
+        if (!isJavaException && this.verbose) {
+          console.error(
+            `>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`,
+          );
+          console.error(e);
+        }
+        const label = instructionItem.labelDef;
+        const currentPc = label
+          ? parseInt(label.substring(1, label.length - 1))
+          : -1;
+        this.handleException(e, currentPc, thread);
+        break;
       }
-    } catch (e) {
-      const isJavaException =
-        e && typeof e.type === "string" && e.type.includes("/");
-      if (!isJavaException && this.verbose) {
-        console.error(
-          `>>>>>> BUG HUNT: Caught exception in executeTick for thread ${thread.id} <<<<<<`,
-        );
-        console.error(e); // Log the raw error object to see its stack trace
-      }
-      const label = instructionItem.labelDef;
-      const currentPc = label
-        ? parseInt(label.substring(1, label.length - 1))
-        : -1;
-      this.handleException(e, currentPc, thread);
+
+      // Returns and monitor operations can change the active frame or thread
+      // state even though their handlers are synchronous.
+      if (callStack.isEmpty() || callStack.peek() !== currentFrame ||
+          thread.status !== 'runnable') break;
     }
 
     if (this.threads.length > 0) {
@@ -1015,7 +1055,7 @@ class JVM {
         (this.currentThreadIndex + 1) % this.threads.length;
     }
 
-    return { completed: false };
+    return { completed: false, bytecodes: executedBytecodes };
   }
 
   shouldPause(currentPc, frame) {
@@ -1266,7 +1306,24 @@ class JVM {
     }
 
     // Load class data for regular classes
-    const classData = await this.loadClassByName(classNameWithSlashes);
+    let classData = await this.loadClassByName(classNameWithSlashes);
+    if (!classData && this.jre[classNameWithSlashes]) {
+      const jreClass = this.jre[classNameWithSlashes];
+      classData = {
+        isJreStub: true,
+        ast: {
+          classes: [{
+            className: classNameWithSlashes,
+            superClassName: jreClass.super || 'java/lang/Object',
+            interfaces: jreClass.interfaces || [],
+            flags: [],
+            items: [],
+          }],
+        },
+        staticFields: jreClass.staticFields || new Map(),
+      };
+      this.classes[classNameWithSlashes] = classData;
+    }
     if (!classData) {
       throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
     }

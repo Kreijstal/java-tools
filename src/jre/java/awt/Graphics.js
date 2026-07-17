@@ -16,6 +16,11 @@ function dumpFrame(pixels, width, height) {
     const file = path.join(process.env.JVM_FRAME_DIR, `frame-${String(n).padStart(5, '0')}.png`);
     fs.writeFileSync(file, encodePng(pixels, width, height));
     console.error(`[frame] +${(process.uptime()).toFixed(1)}s ${file} (${width}x${height})`);
+    if (process.env.JVM_EXIT_AFTER_FRAME_LIMIT === '1' && n / every + 1 >= limit) {
+      // Profilers and repeatable boot benchmarks need a normal process exit so
+      // V8 can flush its output. Defer until the completed frame is observable.
+      setImmediate(() => process.exit(0));
+    }
   } catch (e) {
     console.error(`frame dump failed: ${e.message}`);
   }

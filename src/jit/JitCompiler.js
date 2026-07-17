@@ -1,5 +1,6 @@
 const Frame = require("../core/frame");
 const { parseDescriptor } = require("../parsing/typeParser");
+const { resolveInstanceFieldKey } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
 
 const RETURN_VOID = Symbol("jit.return.void");
@@ -30,24 +31,11 @@ class JitCompiler {
     this.runnerMethodRunCounts = new Map();
     this.methodDeoptCounts = new Map();
     this.methodDeoptReasons = new Map();
-    const configuredThrowMethods = options.exceptionMethodAllowlist ?? (
-      typeof process !== "undefined" && process.env ? process.env.JVM_JIT_EXCEPTION_METHODS : ""
+    this.experimentalControlFlow = options.experimentalControlFlow ?? (
+      typeof process !== "undefined" && process.env
+        ? process.env.JVM_JIT_EXPERIMENTAL_CONTROL_FLOW === "1"
+        : false
     );
-    this.exceptionMethodAllowlist = new Set(Array.isArray(configuredThrowMethods)
-      ? configuredThrowMethods
-      : String(configuredThrowMethods || "").split(",").map((value) => value.trim()).filter(Boolean));
-    const configuredMonitorMethods = options.monitorMethodAllowlist ?? (
-      typeof process !== "undefined" && process.env ? process.env.JVM_JIT_MONITOR_METHODS : ""
-    );
-    this.monitorMethodAllowlist = new Set(Array.isArray(configuredMonitorMethods)
-      ? configuredMonitorMethods
-      : String(configuredMonitorMethods || "").split(",").map((value) => value.trim()).filter(Boolean));
-    const configuredResumeMethods = options.resumeMethodAllowlist ?? (
-      typeof process !== "undefined" && process.env ? process.env.JVM_JIT_RESUME_METHODS : ""
-    );
-    this.resumeMethodAllowlist = new Set(Array.isArray(configuredResumeMethods)
-      ? configuredResumeMethods
-      : String(configuredResumeMethods || "").split(",").map((value) => value.trim()).filter(Boolean));
     this.wasmJit = new WasmJit(jvm, this);
   }
 
@@ -63,6 +51,7 @@ class JitCompiler {
       return false;
     }
     if (this.deoptedMethods.has(frame.method)) {
+      frame.jitJsDisabled = true;
       return false;
     }
     // Tracing/profiling must observe every interpreted bytecode. Debug stepping
@@ -84,7 +73,9 @@ class JitCompiler {
     if (count < this.warmupThreshold && !this.hasBackwardBranch(frame.method)) {
       return false;
     }
-    return this.isSupported(frame.method);
+    const supported = this.isSupported(frame.method);
+    if (!supported) frame.jitJsDisabled = true;
+    return supported;
   }
 
   hasBackwardBranch(method) {
@@ -106,7 +97,23 @@ class JitCompiler {
   async tryRunFrame(frame, thread) {
     if (this.wasmJit.enabled && !this.runningFrames.has(frame)) {
       const wasmResult = this.wasmJit.tryRunFrame(frame, thread);
-      if (wasmResult.handled) return { handled: true };
+      if (wasmResult.handled) {
+        if (wasmResult.returned) return { handled: true };
+        // A partial-Wasm exit has already materialized locals, operand stack,
+        // and the exact resume pc. Let executeTick interpret the unsupported
+        // island immediately instead of consuming an otherwise empty thread
+        // turn; the next tick can re-enter Wasm at the following eligible
+        // block. Do not probe the JS tier in between these two regions.
+        return { handled: false, wasmExited: true };
+      }
+    }
+    // Structural rejection and permanent deoptimization are method-stable.
+    // Remember them on the frame so interpreted bytecodes do not repeat the
+    // full JS-JIT policy check on every scheduler tick. The Wasm tier still
+    // gets its probe above because it can compile supported regions of a
+    // method that the JS tier rejects as a whole.
+    if (frame.jitJsDisabled) {
+      return { handled: false };
     }
     if (!this.canRun(frame)) {
       return { handled: false };
@@ -124,7 +131,10 @@ class JitCompiler {
         this.lastDeoptReason = result.reason;
         this.methodDeoptCounts.set(methodKey, (this.methodDeoptCounts.get(methodKey) || 0) + 1);
         this.methodDeoptReasons.set(methodKey, result.reason || "unspecified");
-        if (!result.transient) this.deoptedMethods.add(frame.method);
+        if (!result.transient) {
+          this.deoptedMethods.add(frame.method);
+          frame.jitJsDisabled = true;
+        }
         return { handled: true };
       }
       if (result && result.returned && result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
@@ -211,15 +221,12 @@ class JitCompiler {
     }
 
     const codeItems = code.code.codeItems;
-    if (codeItems.some((item) => {
-      const op = getOp(item && item.instruction);
-      return op === "monitorenter" || op === "monitorexit";
-    }) && !this.isMonitorMethodAllowed(method)) {
+    if (hasExperimentalControlFlow(codeItems) && !this.experimentalControlFlow &&
+      !this.hasJitSafeControlFlow(method, codeItems)) {
       this.supportCache.set(method, false);
       return false;
     }
-    if (codeItems.some((item) => getOp(item && item.instruction) === "athrow") &&
-      !this.isExceptionMethodAllowed(method)) {
+    if (hasMonitorBytecode(codeItems) && !this.hasJitSafeMonitorBody(codeItems)) {
       this.supportCache.set(method, false);
       return false;
     }
@@ -267,7 +274,7 @@ class JitCompiler {
       "ifle", "iflt", "ifne", "ifnonnull", "ifnull", "iload", "iload_0",
       "iload_1", "iload_2", "iload_3", "imul", "inc", "iinc",
       "invokeinterface", "invokespecial", "invokestatic", "invokevirtual", "istore", "istore_0",
-      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lxor",
+      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lreturn", "lxor",
       "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return", "saload", "sastore",
       "sipush"
     ]);
@@ -294,15 +301,12 @@ class JitCompiler {
     }
 
     const codeItems = code.code.codeItems;
-    if (codeItems.some((item) => {
-      const op = getOp(item && item.instruction);
-      return op === "monitorenter" || op === "monitorexit";
-    }) && !this.isMonitorMethodAllowed(method)) {
+    if (hasExperimentalControlFlow(codeItems) && !this.experimentalControlFlow &&
+      !this.hasJitSafeControlFlow(method, codeItems)) {
       this.codegenSupportCache.set(method, false);
       return false;
     }
-    if (codeItems.some((item) => getOp(item && item.instruction) === "athrow") &&
-      !this.isExceptionMethodAllowed(method)) {
+    if (hasMonitorBytecode(codeItems) && !this.hasJitSafeMonitorBody(codeItems)) {
       this.codegenSupportCache.set(method, false);
       return false;
     }
@@ -326,7 +330,7 @@ class JitCompiler {
       "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
       "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
       "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
-      "istore_3", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "istore_3", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lreturn", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
     ]);
 
@@ -390,25 +394,51 @@ class JitCompiler {
     });
   }
 
-  isExceptionMethodAllowed(method) {
-    const className = typeof this.jvm.findClassNameForMethod === "function"
-      ? this.jvm.findClassNameForMethod(method)
-      : null;
-    return this.exceptionMethodAllowlist.has(`${className}.${method.name}${method.descriptor}`);
+  hasJitSafeMonitorBody(codeItems) {
+    // A compiled frame may run across many interpreter scheduler ticks. Do
+    // not keep it compiled across JVM operations that can park the current
+    // thread while a Java monitor is in scope. Ordinary synchronized blocks
+    // remain eligible; wait/join/sleep/park methods resume in the interpreter.
+    return !codeItems.some((item) => {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op || !op.startsWith("invoke") || !instruction || typeof instruction !== "object") {
+        return false;
+      }
+      const arg = instruction.arg;
+      if (!Array.isArray(arg) || !Array.isArray(arg[2])) return false;
+      const owner = arg[1];
+      const name = arg[2][0];
+      return owner === "java/lang/Object" && name === "wait"
+        || owner === "java/lang/Thread" && (name === "join" || name === "sleep" || name === "yield")
+        || owner === "java/util/concurrent/locks/LockSupport" && String(name).startsWith("park");
+    });
   }
 
-  isMonitorMethodAllowed(method) {
-    const className = typeof this.jvm.findClassNameForMethod === "function"
-      ? this.jvm.findClassNameForMethod(method)
-      : null;
-    return this.monitorMethodAllowlist.has(`${className}.${method.name}${method.descriptor}`);
-  }
-
-  isResumeMethodAllowed(method) {
-    const className = typeof this.jvm.findClassNameForMethod === "function"
-      ? this.jvm.findClassNameForMethod(method)
-      : null;
-    return this.resumeMethodAllowlist.has(`${className}.${method.name}${method.descriptor}`);
+  hasJitSafeControlFlow(method, codeItems) {
+    // A generated frame runs until it returns or deoptimizes, whereas the
+    // interpreter rotates threads between bytecodes. Restrict automatic
+    // exception/monitor compilation to leaf normal-flow regions so it cannot
+    // move a call (and its arbitrary scheduling effects) across that boundary.
+    // Invokes that exist only in an exception handler do not disqualify a
+    // compute body: the generated exception table preserves those paths.
+    if (method.name === "<init>" || method.name === "<clinit>" || method.name === "run") {
+      return false;
+    }
+    if (hasMonitorBytecode(codeItems)) {
+      // Generated monitorenter/exit keep frame.pc and frame locals live. Calls
+      // that cannot run in a JIT tier yield as interpreted child frames, so
+      // the parent can resume after the call without abandoning its compiled
+      // numeric regions. Parking primitives remain excluded above.
+      if (!this.hasJitSafeMonitorBody(codeItems)) return false;
+      return !codeItems.some((item) => {
+        const instruction = item && item.instruction;
+        return getOp(instruction) === 'invokespecial' && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][0] === '<init>';
+      });
+    }
+    return !normalFlowContainsInvoke(codeItems);
   }
 
   isShortSupportedHelper(method) {
@@ -616,6 +646,10 @@ class JitCompiler {
       case "sipush": return `stack.push(${Number(instruction.arg)}); ${goNext}`;
       case "ldc":
       case "ldc_w":
+        if (isClassConstant(instruction.arg)) {
+          return `stack.push(await helpers.classConstant(${JSON.stringify(instruction.arg[1])})); ${goNext}`;
+        }
+        return `stack.push(helpers.constantValue(${jsLiteral(instruction.arg)})); ${goNext}`;
       case "ldc2_w": return `stack.push(helpers.constantValue(${jsLiteral(instruction.arg)})); ${goNext}`;
       case "dup": return `stack.push(stack[stack.length - 1]); ${goNext}`;
       case "dup2": return `{ const value1 = stack.pop(); if (typeof value1 === "bigint") { stack.push(value1, value1); } else { const value2 = stack.pop(); stack.push(value2, value1, value2, value1); } } ${goNext}`;
@@ -708,6 +742,7 @@ class JitCompiler {
         return `helpers.materialize(frame, locals, stack, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
       case "areturn":
       case "ireturn":
+      case "lreturn":
       case "freturn":
       case "dreturn":
         return `{ const ret = stack.pop(); helpers.materialize(frame, locals, stack, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
@@ -847,7 +882,11 @@ class JitCompiler {
         case "bipush":
         case "sipush": stack.push(Number(instruction.arg)); break;
         case "ldc":
-        case "ldc_w": stack.push(this.constantValue(instruction.arg)); break;
+        case "ldc_w":
+          stack.push(isClassConstant(instruction.arg)
+            ? await this.classConstant(instruction.arg[1])
+            : this.constantValue(instruction.arg));
+          break;
         case "ldc2_w": stack.push(this.constantValue(instruction.arg)); break;
         case "dup": stack.push(stack[stack.length - 1]); break;
         case "dup2": {
@@ -1019,6 +1058,7 @@ class JitCompiler {
           return { returned: true, value: RETURN_VOID };
         case "areturn":
         case "ireturn":
+        case "lreturn":
         case "freturn":
         case "dreturn": {
           const ret = stack.pop();
@@ -1065,6 +1105,10 @@ class JitCompiler {
       return this.jvm.internString(arg);
     }
     return arg;
+  }
+
+  async classConstant(className) {
+    return this.jvm.getClassObject(className);
   }
 
   newPrimitiveArray(count, type) {
@@ -1184,7 +1228,11 @@ class JitCompiler {
     if (objRef === null || objRef === undefined) {
       throw { type: "java/lang/NullPointerException", message: null };
     }
-    return objRef.fields ? objRef.fields[`${className}.${fieldName}`] : objRef[`${className}.${fieldName}`] ?? objRef[fieldName];
+    if (objRef.fields) {
+      const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName);
+      return fieldKey ? objRef.fields[fieldKey] : undefined;
+    }
+    return objRef[`${className}.${fieldName}`] ?? objRef[fieldName];
   }
 
   putField(objRef, arg, value) {
@@ -1193,7 +1241,8 @@ class JitCompiler {
       throw { type: "java/lang/NullPointerException", message: null };
     }
     if (!objRef.fields) objRef.fields = {};
-    objRef.fields[`${className}.${fieldName}`] = value;
+    const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
+    objRef.fields[fieldKey] = value;
     objRef[fieldName] = value;
   }
 
@@ -1340,18 +1389,7 @@ class JitCompiler {
       frame.pc = invokePc;
       throw new Error(`Unsupported ${op}: ${targetClassName}.${methodName}${descriptor}`);
     }
-
-    if (!this.isSupported(method) && !this.isShortSupportedHelper(method)) {
-      frame.stack.items = stackSnapshot;
-      frame.pc = invokePc;
-      const transient = this.isResumeMethodAllowed(frame.method);
-      if (transient) frame.jitSkipOnce = true;
-      return {
-        deopt: true,
-        transient,
-        reason: `unsupported callee ${targetClassName}.${methodName}${descriptor}`,
-      };
-    }
+    const jsChildSupported = this.isSupported(method) || this.isShortSupportedHelper(method);
 
     const child = new Frame(method);
     child.className = lookupClass;
@@ -1366,14 +1404,57 @@ class JitCompiler {
     }
     thread.callStack.push(child);
     if (this.wasmJit.enabled) {
-      // Child frames never pass through tryRunFrame, so give the wasm tier
-      // its shot here. A transient exit leaves the child on the stack with
-      // pc at the resume point and the runner continues it below.
-      const wasmResult = this.wasmJit.runNested(child, thread);
+      // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
+      // can prove numeric loops covered by a wrap-and-rethrow diagnostic
+      // handler even when the whole-method JS tier conservatively rejects the
+      // same exceptional call graph. This ordering is important for callers
+      // such as rasterizers: permanently deoptimizing the parent first meant a
+      // child compiled successfully later but could no longer help it.
+      const wasmResult = this.wasmJit.runNested(child, thread, {
+        // A JS-policy-rejected child has no in-call runner fallback. Execute it
+        // speculatively only when every normally reachable block is compiled;
+        // handler-only diagnostic blocks may remain outside Wasm.
+        requireNormalFlowFullyCompiled: !jsChildSupported,
+      });
       if (wasmResult.returned) {
         if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
         return wasmResult.value;
       }
+      if (wasmResult.exited && !jsChildSupported) {
+        // The child remains on the Java call stack at its materialized exit
+        // PC. Yield the generated parent transiently; executeTick will resume
+        // the child through the normal scheduler and then continue the parent
+        // at the already-materialized post-invoke PC.
+        return {
+          deopt: true,
+          transient: true,
+          reason: `wasm callee exit ${targetClassName}.${methodName}${descriptor}`,
+        };
+      }
+    }
+    if (!jsChildSupported) {
+      if (hasMonitorBytecode(frame.instructions)) {
+        // Preserve a generated synchronized parent as a resumable compiled
+        // region. Its post-invoke pc is already materialized and the child has
+        // initialized locals, so executeTick can interpret the child. If it
+        // throws, parent.pc - 1 recovers the invoke site for monitor cleanup.
+        return {
+          deopt: true,
+          transient: true,
+          reason: `interpreted monitor callee ${targetClassName}.${methodName}${descriptor}`,
+        };
+      }
+      // Outside a monitor-protected region, retain the conservative whole-
+      // method deoptimization policy until arbitrary stack-carry call islands
+      // have a verifier-backed materialization proof.
+      thread.callStack.pop();
+      frame.stack.items = stackSnapshot;
+      frame.pc = invokePc;
+      return {
+        deopt: true,
+        transient: false,
+        reason: `unsupported callee ${targetClassName}.${methodName}${descriptor}`,
+      };
     }
     const generated = this.getGeneratedFunction(method);
     const result = generated
@@ -1399,6 +1480,10 @@ class JitCompiler {
     }
     return null;
   }
+}
+
+function isClassConstant(arg) {
+  return Array.isArray(arg) && arg[0] === 'Class' && typeof arg[1] === 'string';
 }
 
 function compareDouble(value2, value1, nanValue) {
@@ -1444,6 +1529,67 @@ function primitiveArrayType(type) {
 function getOp(instruction) {
   if (!instruction) return null;
   return typeof instruction === "string" ? instruction : instruction.op;
+}
+
+function hasMonitorBytecode(codeItems) {
+  return codeItems.some((item) => {
+    const op = getOp(item && item.instruction);
+    return op === "monitorenter" || op === "monitorexit";
+  });
+}
+
+function hasExperimentalControlFlow(codeItems) {
+  return codeItems.some((item) => {
+    const op = getOp(item && item.instruction);
+    return op === "athrow" || op === "monitorenter" || op === "monitorexit";
+  });
+}
+
+function normalFlowContainsInvoke(codeItems) {
+  const labels = buildLabelMap(codeItems);
+  const pending = [0];
+  const visited = new Set();
+
+  while (pending.length) {
+    const index = pending.pop();
+    if (index < 0 || index >= codeItems.length || visited.has(index)) continue;
+    visited.add(index);
+
+    const instruction = codeItems[index] && codeItems[index].instruction;
+    const op = getOp(instruction);
+    if (op && op.startsWith("invoke")) return true;
+
+    if (op === "athrow" || op === "return" || op === "areturn" ||
+      op === "dreturn" || op === "freturn" || op === "ireturn" || op === "lreturn") {
+      continue;
+    }
+    if (op === "goto" || op === "goto_w") {
+      const target = branchTargetIndex(instruction, labels);
+      if (target === undefined) return codeItems.some(hasInvokeInstruction);
+      pending.push(target);
+      continue;
+    }
+    if (op && op.startsWith("if")) {
+      const target = branchTargetIndex(instruction, labels);
+      if (target === undefined) return codeItems.some(hasInvokeInstruction);
+      pending.push(target);
+    }
+    // Label-only entries and ordinary instructions both fall through.
+    pending.push(index + 1);
+  }
+
+  return false;
+}
+
+function branchTargetIndex(instruction, labels) {
+  if (!instruction || typeof instruction !== "object") return undefined;
+  const arg = Array.isArray(instruction.arg) ? instruction.arg[0] : instruction.arg;
+  return labels.get(arg);
+}
+
+function hasInvokeInstruction(item) {
+  const op = getOp(item && item.instruction);
+  return Boolean(op && op.startsWith("invoke"));
 }
 
 function jsLiteral(value) {

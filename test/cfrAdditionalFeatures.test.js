@@ -5,7 +5,7 @@ const os = require('os');
 const path = require('path');
 const test = require('tape');
 const { assembleJasminSource } = require('../src/utils/jasminAssembly');
-const { decompileClassFile } = require('../src/decompiler/cfr');
+const { decompileClassFile, _internals: cfrInternals } = require('../src/decompiler/cfr');
 
 const ADDITIONAL_FEATURES_JASMIN = `.version 52 0
 .class public super org/benf/cfr/tests/AdditionalFeatureTest
@@ -33,6 +33,23 @@ Ldone:
         .localvariabletable
             0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from L0 to Ldone
             1 is flag Z from L0 to Ldone
+        .end localvariabletable
+    .end code
+.end method
+
+.method public booleanAsIntRelational : (Z)Z
+    .code stack 2 locals 2
+Lbir0: iload_1
+Lbir1: bipush 107
+Lbir3: if_icmpgt LbirTrue
+Lbir6: iconst_0
+Lbir7: ireturn
+LbirTrue: iconst_1
+LbirEnd: ireturn
+LbirDone:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from Lbir0 to LbirDone
+            1 is flag Z from Lbir0 to LbirDone
         .end localvariabletable
     .end code
 .end method
@@ -283,6 +300,23 @@ LdoneGreet:
     .end code
 .end method
 
+.method public appendCharFromInt : (I)Ljava/lang/String;
+    .code stack 2 locals 2
+Lchar0: new java/lang/StringBuilder
+Lchar3: dup
+Lchar4: invokespecial Method java/lang/StringBuilder <init> ()V
+Lchar7: iload_1
+Lchar8: invokevirtual Method java/lang/StringBuilder append (C)Ljava/lang/StringBuilder;
+Lchar11: invokevirtual Method java/lang/StringBuilder toString ()Ljava/lang/String;
+Lchar14: areturn
+LcharDone:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from Lchar0 to LcharDone
+            1 is value I from Lchar0 to LcharDone
+        .end localvariabletable
+    .end code
+.end method
+
 .method public syncPrint : (Ljava/lang/Object;)V
     .code stack 2 locals 4
         .catch java/lang/Throwable from LsyncBody to LsyncExit using LsyncHandler
@@ -383,6 +417,102 @@ LtwrEnd:
         .end localvariabletable
     .end code
 .end method
+
+.method public firstPrimitiveArrayValue : (Z)I
+    .code stack 3 locals 5
+        .catch java/io/IOException from LprimitiveStart to LprimitiveReturn using LprimitiveHandler
+LprimitiveStart: aconst_null
+LprimitiveNullStore: astore_2
+LprimitiveFlag: iload_1
+LprimitiveJoinIf: ifeq LprimitiveJoin
+LprimitiveLength: iconst_1
+LprimitiveNew: newarray int
+LprimitiveDup: dup
+LprimitiveIndex: iconst_0
+LprimitiveValue: bipush 42
+LprimitiveStoreElement: iastore
+LprimitiveStoreArray: astore_2
+LprimitiveJoin: aload_2
+LprimitiveNull: ifnull LprimitiveEmpty
+LprimitiveCopyLoad: aload_2
+LprimitiveCopyStore: astore_3
+LprimitiveArrayLength: aload_3
+LprimitiveLengthRead: arraylength
+LprimitivePop: pop
+LprimitiveArrayLoad: aload_3
+LprimitiveZero: iconst_0
+LprimitiveElement: iaload
+LprimitiveReturn: ireturn
+LprimitiveEmpty: iconst_m1
+LprimitiveEmptyReturn: ireturn
+LprimitiveHandler: astore 4
+LprimitiveHandlerReturnValue: iconst_m1
+LprimitiveHandlerReturn: ireturn
+    .end code
+.end method
+
+.method public firstObjectArrayValue : (Z)Ljava/lang/String;
+    .code stack 4 locals 4
+LObjectStart: aconst_null
+LObjectNullStore: astore_2
+LObjectFlag: iload_1
+LObjectJoinIf: ifeq LObjectJoin
+LObjectLength: iconst_1
+LObjectNew: anewarray java/lang/String
+LObjectDup: dup
+LObjectIndex: iconst_0
+LObjectValue: ldc "ok"
+LObjectStoreElement: aastore
+LObjectStoreArray: astore_2
+LObjectJoin: aload_2
+LObjectNull: ifnull LObjectEmpty
+LObjectCopyLoad: aload_2
+LObjectCopyStore: astore_3
+LObjectArrayLength: aload_3
+LObjectLengthRead: arraylength
+LObjectPop: pop
+LObjectArrayLoad: aload_3
+LObjectZero: iconst_0
+LObjectElement: aaload
+LObjectCast: checkcast java/lang/String
+LObjectReturn: areturn
+LObjectEmpty: aconst_null
+LObjectEmptyReturn: areturn
+    .end code
+.end method
+
+.method public booleanOrOne : (ZZ)I
+    .code stack 1 locals 3
+LBooleanOrOneStart: iload_1
+LBooleanOrOneBranch: ifeq LBooleanOrOneFallback
+LBooleanOrOneOne: iconst_1
+LBooleanOrOneJoinJump: goto LBooleanOrOneJoin
+LBooleanOrOneFallback: iload_2
+LBooleanOrOneJoin: ireturn
+    .end code
+.end method
+
+.method public writePrimitiveCarrier : (Ljava/lang/Object;)V
+    .code stack 3 locals 2
+LPrimitiveCarrierStart: aload_1
+LPrimitiveCarrierIndex: iconst_0
+LPrimitiveCarrierValue: bipush 7
+LPrimitiveCarrierStore: iastore
+LPrimitiveCarrierReturn: return
+    .end code
+.end method
+
+.method public uncheckedCatchNeedsNoAnchor : ()V
+    .code stack 1 locals 2
+        .catch java/lang/NumberFormatException from LUncheckedStart to LUncheckedEnd using LUncheckedHandler
+LUncheckedStart: iconst_0
+LUncheckedStore: istore_1
+LUncheckedEnd: goto LUncheckedReturn
+LUncheckedHandler: astore_1
+LUncheckedReturn: return
+    .end code
+.end method
+
 .sourcefile "AdditionalFeatureTest.java"
 .end class
 `;
@@ -524,7 +654,7 @@ function decompileFixture(tempDir, name, source) {
 }
 
 test('CFR-JS reconstructs additional expression and declaration features', (t) => {
-  t.plan(21);
+  t.plan(29);
   withTempDir('cfr-additional-', (tempDir) => {
     const source = decompileFixture(tempDir, 'AdditionalFeatureTest', ADDITIONAL_FEATURES_JASMIN);
 
@@ -532,6 +662,8 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.notOk(/^\s*\/\/\s*(if|goto|monitorenter|monitorexit)\b/m.test(source), 'supported additional features do not fall back to raw bytecode comments');
     t.match(source, /public static final boolean READY = true;/, 'boolean constant values are rendered as booleans');
     t.match(source, /public int chooseInt\(boolean flag\) \{\s*return flag \? 10 : 20;\s*}/, 'conditional value branches are reconstructed as ternary returns');
+    t.match(source, /public boolean booleanAsIntRelational\(boolean flag\) \{[\s\S]*?\(flag \? 1 : 0\) <= 107/,
+      'boolean verifier values are materialized as JVM ints for relational comparisons');
     t.match(source, /public boolean both\(boolean left, boolean right\) \{\s*return left && right;\s*}/, 'short-circuit boolean AND returns are reconstructed');
     t.match(source, /public boolean either\(boolean left, boolean right\) \{\s*return left \|\| right;\s*}/, 'short-circuit boolean OR returns are reconstructed');
     t.match(source, /public boolean condAssignNoDup\(boolean a, boolean b\) \{\s*boolean c;\s*return b && a == \(c = b\) \|\| b && \(c = a\);\s*}/, 'frontend assignment-expression boolean condition is reconstructed');
@@ -542,6 +674,8 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public int sumFor\(int n\) \{\s*int sum = 0;\s*for \(int i = 0; i < n; i\+\+\) \{\s*sum = sum \+ i;\s*}\s*return sum;\s*}/, 'counting loops are reconstructed as for loops');
     t.match(source, /public String\[\] words\(\) \{\s*String\[\] words = new String\[\]\{"alpha", "beta"\};\s*return words;\s*}/, 'object array initialisation is condensed');
     t.match(source, /public String greet\(String name\) \{\s*return "Hello " \+ name \+ "!";\s*}/, 'StringBuilder append chains are reconstructed as string concatenation');
+    t.match(source, /public String appendCharFromInt\(int value\) \{\s*return String\.valueOf\(\(char\) value\);\s*}/,
+      'StringBuilder append keeps the descriptor-selected char overload when its verifier value is int-typed');
     t.match(source, /public void syncPrint\(Object lock\) \{\s*synchronized \(lock\) \{\s*System\.out\.print\("locked"\);\s*}\s*}/, 'monitorenter/monitorexit regions are reconstructed as synchronized blocks');
     t.match(source, /public void echoLines\(BufferedReader reader\) \{[\s\S]*?while \(true\) \{\s*(?:String )?line = reader\.readLine\(\);\s*if \(line == null\) \{\s*break;\s*}\s*System\.out\.println\(line\);\s*}/, 'guarded loops with assignment before the condition are reconstructed');
     t.match(source, /public void throwsIt\(\) throws IOException \{\s*}/, 'declared checked exceptions are emitted in method headers');
@@ -549,6 +683,18 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public void releaseResource\(ByteArrayInputStream resource, Throwable primary\) \{\s*if \(resource != null\) \{\s*resource\.close\(\);\s*}\s*}/, 'try-with-resources release graph lowers to guarded close');
     t.notOk(/addSuppressed|Ltwr|\/\/\s*goto/.test(source), 'try-with-resources release scaffolding is consumed');
     t.notOk(/new StringBuilder\(\)\.append/.test(source), 'string builder implementation detail is hidden');
+    t.match(source, /int\[\] (\w+) = null;[\s\S]*?\1 = \(int\[\]\) \w+;[\s\S]*?\1\[0\]/,
+      'primitive array opcodes refine an Object[] carrier to the verifier array type');
+    t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) \(Object\) \w+;/,
+      'post-emission Object[] refinement casts earlier Object assignments');
+    t.match(source, /int booleanOrOne\(boolean param0, boolean param1\) \{\s*return param0 \? 1 : \(?param1 \? 1 : 0\)?;\s*}/,
+      'mixed int/boolean ternary branches materialize verifier booleans as ints');
+    t.match(source, /void writePrimitiveCarrier\(Object param0\) \{\s*\(\(int\[\]\) param0\)\[0\] = 7;\s*}/,
+      'primitive array stores cast incompatible reference carriers at the lvalue');
+    t.notOk(/if \(false\) throw \(NumberFormatException\) null;/.test(source),
+      'unchecked catches do not receive a synthetic reachability anchor');
+    t.ok(cfrInternals.isCheckedThrow('java/io/IOException'),
+      'genuinely checked catches remain classified for javac reachability anchors');
   });
 });
 
@@ -563,6 +709,55 @@ test('CFR-JS reconstructs constructor delegation calls', (t) => {
     t.match(source, /public CtorFeatureTest\(\) \{\s*this\(0\);\s*}/, 'same-class constructor calls are rendered as this(...)');
     t.notOk(/this\.BaseCtor|this\.CtorFeatureTest/.test(source), 'constructor calls are not emitted as illegal receiver-qualified calls');
   });
+});
+
+test('checked catches are removed only after source structuring proves them unreachable', (t) => {
+  const previous = process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE;
+  process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE = '1';
+  const localOnly = [
+    'try {',
+    '    int value = 1;',
+    '} catch (IOException ignored) {',
+    '    value = 2;',
+    '}',
+  ];
+  const calling = [
+    'try {',
+    '    worker.run();',
+    '} catch (IOException ignored) {',
+    '    recover();',
+    '}',
+  ];
+  const declaredReflectionCall = [
+    'try {',
+    '    field.getInt(null);',
+    '} catch (IllegalAccessException ignored) {',
+    '    recover();',
+    '}',
+  ];
+  const unchecked = [
+    'try {',
+    '    int value = 1;',
+    '} catch (RuntimeException ignored) {',
+    '    value = 2;',
+    '}',
+  ];
+
+  cfrInternals.removeImpossibleCheckedCatchBlocks(localOnly);
+  cfrInternals.removeImpossibleCheckedCatchBlocks(calling);
+  cfrInternals.removeImpossibleCheckedCatchBlocks(declaredReflectionCall);
+  cfrInternals.removeImpossibleCheckedCatchBlocks(unchecked);
+  t.deepEqual(localOnly, ['{', '    int value = 1;', '}'],
+    'an impossible checked catch becomes a scoped plain block');
+  t.notOk(/catch \(IOException ignored\)/.test(calling.join('\n')),
+    'an undeclared checked throw does not keep a source-level catch alive');
+  t.match(declaredReflectionCall.join('\n'), /catch \(IllegalAccessException ignored\)/,
+    'a call with a matching checked throws declaration keeps its catch');
+  t.match(unchecked.join('\n'), /catch \(RuntimeException ignored\)/,
+    'unchecked catches remain conservative around VM instructions');
+  if (previous === undefined) delete process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE;
+  else process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE = previous;
+  t.end();
 });
 
 test('CFR-JS preserves synchronized multi-exit ring-buffer selection', (t) => {
@@ -591,4 +786,41 @@ test('CFR-JS preserves synchronized multi-exit ring-buffer selection', (t) => {
       `\\.write - [^;\\n]*\\.read;\\s*${lengthLocal} = [^;\\n]*\\.capacity`).test(source),
     'the two assignments cannot fall through unconditionally');
   });
+});
+
+test('CFR-JS renders integral xor-minus-one as complement and evaluates comparison constants', (t) => {
+  const previousExperimentalValue = process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE;
+  process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE = '1';
+  const intValue = { code: 'value', type: 'int', precedence: 100 };
+  const intMinusOne = { code: '-1', type: 'int', precedence: 100, constantValue: -1 };
+  const intFive = { code: '5', type: 'int', precedence: 100, constantValue: 5 };
+  const longValue = { code: 'wide', type: 'long', precedence: 100 };
+  const longMinusOne = { code: '-1L', type: 'long', precedence: 100 };
+  const longMin = { code: '-9223372036854775808L', type: 'long', precedence: 100 };
+
+  const intComplement = cfrInternals.binaryExpr(intValue, '^', intMinusOne, 'int');
+  const intOne = { code: '1', type: 'int', precedence: 100, constantValue: 1 };
+  const call = { code: 'readValue()', type: 'int', precedence: 100 };
+  const leftIdentity = cfrInternals.binaryExpr(intOne, '*', call, 'int');
+  const rightIdentity = cfrInternals.binaryExpr(call, '+', { code: '0', type: 'int', precedence: 100, constantValue: 0 }, 'int');
+  const floatIdentity = cfrInternals.binaryExpr(
+    { code: 'factor', type: 'float', precedence: 100 }, '*',
+    { code: '1.0f', type: 'float', precedence: 100 }, 'float',
+  );
+  const reversedIntComparison = cfrInternals.simplifyBitwiseComplementComparison(intComplement, '<', intFive);
+  const constantFirstComparison = cfrInternals.simplifyBitwiseComplementComparison(intFive, '>=', intComplement);
+  const longComplement = cfrInternals.binaryExpr(longMinusOne, '^', longValue, 'long');
+  const overflowSafeLongComparison = cfrInternals.simplifyBitwiseComplementComparison(longComplement, '==', longMin);
+
+  t.equal(intComplement.code, '~value', 'int xor -1 uses Java complement syntax');
+  t.equal(leftIdentity.code, 'readValue()', 'left identity keeps an arbitrary int expression exactly once');
+  t.equal(rightIdentity.code, 'readValue()', 'right identity keeps an arbitrary int expression exactly once');
+  t.equal(floatIdentity.code, 'factor * 1.0f', 'floating-point identities are deliberately not simplified');
+  t.equal(reversedIntComparison.code, 'value > -6', 'signed comparison direction and constant are complemented');
+  t.equal(constantFirstComparison.code, 'value >= -6', 'constant-first comparison is normalized without changing meaning');
+  t.equal(longComplement.code, '~wide', 'long xor -1L uses Java complement syntax');
+  t.equal(overflowSafeLongComparison.code, 'wide == 9223372036854775807L', 'long complement uses 64-bit JVM wrapping');
+  if (previousExperimentalValue == null) delete process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE;
+  else process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE = previousExperimentalValue;
+  t.end();
 });
