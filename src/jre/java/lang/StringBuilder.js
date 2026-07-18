@@ -108,6 +108,10 @@ module.exports = {
       obj.value += valueAsString(args[0]);
       return obj;
     },
+    'append(Ljava/lang/CharSequence;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
+      obj.value += valueAsString(args[0]);
+      return obj;
+    },
     'append(Ljava/lang/Object;)Ljava/lang/StringBuilder;': (jvm, obj, args) => {
       obj.value += valueAsString(args[0]);
       return obj;

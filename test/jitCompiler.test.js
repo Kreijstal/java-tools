@@ -306,6 +306,31 @@ public class NestedGeneratedJitHarness {
   t.end();
 });
 
+test('Wasm leaves constructors and class initializers atomic', (t) => {
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+  const jvm = new JVM({ jit: { warmupThreshold: 100 } });
+  const frame = (name) => ({ method: { name }, instructions: [{}] });
+  const method = (name) => ({
+    name,
+    attributes: [{ type: 'code', code: { codeItems: [{ instruction: 'return' }] } }],
+  });
+
+  t.equal(jvm.jit.wasmJit.prepare(frame('<init>')), null,
+    'instance constructor stays outside partial Wasm');
+  t.equal(jvm.jit.wasmJit.prepare(frame('<clinit>')), null,
+    'class initializer stays outside partial Wasm');
+  t.notOk(jvm.jit.isSupported(method('<init>')),
+    'instance constructor stays outside JavaScript JIT');
+  t.notOk(jvm.jit.isSupported(method('<clinit>')),
+    'class initializer stays outside JavaScript JIT');
+  t.end();
+});
+
 test('generated callers permanently deopt at unsupported callees', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedTransientCallJitHarness', `
 public class GeneratedTransientCallJitHarness {

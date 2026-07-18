@@ -2132,6 +2132,10 @@ class JVM {
         for (const item of items) value.add(resolve(item));
       } else if (ArrayBuffer.isView(value)) {
         return value;
+      } else if (value instanceof String) {
+        // Boxed strings expose enumerable, read-only character indices and
+        // cannot contain decoded thread placeholders.
+        return value;
       } else {
         for (const key of Object.keys(value)) value[key] = resolve(value[key]);
       }

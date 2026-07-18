@@ -215,6 +215,11 @@ class JitCompiler {
       return this.supportCache.get(method);
     }
 
+    if (method.name === "<init>" || method.name === "<clinit>") {
+      this.supportCache.set(method, false);
+      return false;
+    }
+
     const code = method.attributes.find((attr) => attr.type === "code");
     if (!code) {
       this.supportCache.set(method, false);
@@ -253,8 +258,7 @@ class JitCompiler {
       return op && (doubleOps.has(op) || floatOps.has(op) || integerOps.has(op) || longOps.has(op) || op === "i2d" ||
         op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float" || item.instruction.arg === "int"));
     });
-    const eligibleShape = hasNumericHotPath || this.hasBackwardBranch(method) ||
-      this.isSimpleConstructor(method, codeItems);
+    const eligibleShape = hasNumericHotPath || this.hasBackwardBranch(method);
 
     const allowed = new Set([
       "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
@@ -370,29 +374,6 @@ class JitCompiler {
 
     this.codegenSupportCache.set(method, supported);
     return supported;
-  }
-
-  isSimpleConstructor(method, codeItems) {
-    if (method.name !== "<init>") {
-      return false;
-    }
-
-    const allowed = new Set([
-      "aload", "aload_0", "aload_1", "aload_2", "aload_3",
-      "bipush", "dconst_0", "dconst_1", "iconst_0", "iconst_1",
-      "iconst_2", "iconst_3", "iconst_4", "iconst_5", "invokespecial",
-      "ldc", "ldc2_w", "putfield", "return", "sipush",
-    ]);
-
-    return codeItems.every((item) => {
-      if (!item.instruction) return true;
-      const instruction = item.instruction;
-      const op = typeof instruction === "string" ? instruction : instruction.op;
-      if (!allowed.has(op)) return false;
-      if (op !== "invokespecial") return true;
-      const [, className, [methodName, descriptor]] = instruction.arg;
-      return methodName === "<init>" && descriptor === "()V" && className === "java/lang/Object";
-    });
   }
 
   hasJitSafeMonitorBody(codeItems) {

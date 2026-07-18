@@ -52,6 +52,7 @@ test('portable JVM save states preserve heap identity and deterministic executio
   shared.fields.self = shared;
   shared.fields.array = array;
   shared.fields.pixels = new Uint8Array([1, 2, 3, 255]);
+  shared.fields.boxedString = new String('saved'); // eslint-disable-line no-new-wrappers
   shared.fields.raf = raf;
   classData.staticFields.set('root:Ljava/lang/Object;', shared);
 
@@ -86,6 +87,8 @@ test('portable JVM save states preserve heap identity and deterministic executio
   t.equal(restoredRoot.fields.array[1], 7n, 'long/BigInt values survive');
   t.deepEqual(Array.from(restoredRoot.fields.pixels), [1, 2, 3, 255],
     'typed arrays survive without object-graph element traversal');
+  t.equal(String(restoredRoot.fields.boxedString), 'saved',
+    'boxed strings survive thread-reference restoration');
   t.equal(typeof restoredRoot.fields.raf.fileHandle.read, 'function',
     'portable file metadata reopens its host handle');
   t.equal(restored.threads[0].callStack.peek().locals[1], restoredRoot,
