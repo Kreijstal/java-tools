@@ -257,6 +257,12 @@ async function decompilePath(inputPath, options = {}) {
 }
 
 function decompileClassAst(cls, options = {}) {
+  if (String(cls.className || '').endsWith('/package-info')) {
+    return formatPackageInfoClass(cls, options);
+  }
+  if (isEnumConstantSubclass(cls)) {
+    return `/* Enum constant implementation ${javaTypeFromInternalName(cls.className)} is emitted in ${javaTypeFromInternalName(cls.superClassName)}. */`;
+  }
   const out = [];
   const requiredImports = options.requiredImports || new Set();
   const renderOptions = { ...options, requiredImports };
@@ -280,11 +286,15 @@ function decompileClassAst(cls, options = {}) {
   for (const annotation of cls.annotations || []) out.push(formatAnnotation(annotation));
   out.push(`${formatClassDeclaration(cls, className, options.exceptionModel)} {`);
 
-  const isEnum = (cls.flags || []).includes('enum');
+  const isEnum = isSourceEnumClass(cls);
+  const isInterface = (cls.flags || []).includes('interface');
   const allFields = (cls.items || []).filter((item) => item.type === 'field' && item.field);
   const enumConstants = isEnum ? allFields.filter((item) => isEnumConstantField(item.field)) : [];
   const enumConstantSpecs = isEnum ? recoverEnumConstantSpecs(cls, options.exceptionModel) : new Map();
   const fields = allFields.filter((item) => !shouldSkipField(cls, item.field));
+  const interfaceInitializers = isInterface
+    ? extractInterfaceFieldInitializers(cls, renderOptions)
+    : { values: new Map(), consumedClinit: false };
   const methods = (cls.items || [])
     .filter((item) => item.type === 'method' && item.method)
     .filter((item) => !shouldSkipMethod(cls, item.method))
@@ -342,7 +352,7 @@ function decompileClassAst(cls, options = {}) {
   if (renderOptions.requiresSneakyThrow) {
     if (methods.length) out.push('');
     out.push('    @SuppressWarnings("unchecked")');
-    out.push('    private static <T extends Throwable> RuntimeException $cfr$sneakyThrow(Throwable throwable) throws T {');
+    out.push(`    ${isInterface ? '' : 'private '}static <T extends Throwable> RuntimeException $cfr$sneakyThrow(Throwable throwable) throws T {`);
     out.push('        throw (T) throwable;');
     out.push('    }');
   }
@@ -518,7 +528,11 @@ function classReferencesInternalPrefix(cls, prefix) {
         if (!instruction) continue;
         if (['invokevirtual', 'invokespecial', 'invokestatic', 'invokeinterface'].includes(instruction.op)) {
           const member = parseMemberRef(instruction.arg);
-          if (hasType(member.descriptor)) return true;
+          // Instance-call owners are represented by their receiver expression,
+          // so importing (for example) PrintStream merely because println was
+          // invoked adds an unused java.io import. Static owners are rendered
+          // as source-level class names and do require the import.
+          if ((instruction.op === 'invokestatic' && hasType(member.owner)) || hasType(member.descriptor)) return true;
         }
         if (['getfield', 'putfield', 'getstatic', 'putstatic'].includes(instruction.op)) {
           const member = parseMemberRef(instruction.arg);
@@ -536,8 +550,7 @@ function classReferencesInternalPrefix(cls, prefix) {
 }
 
 function shouldSkipField(cls, field) {
-  if ((field.flags || []).includes('synthetic')) return true;
-  if ((cls.flags || []).includes('enum')) {
+  if (isSourceEnumClass(cls)) {
     if (isEnumConstantField(field)) return true;
     if (field.name === '$VALUES' || field.name === 'ENUM$VALUES') return true;
   }
@@ -558,6 +571,217 @@ function shouldSkipMethod(cls, method) {
   return false;
 }
 
+function bridgeCollidesInJavaSource(cls, method) {
+  const parameterDescriptor = String(method.descriptor || '').split(')')[0];
+  return (cls.items || []).some((item) => item.type === 'method' && item.method
+    && item.method !== method
+    && item.method.name === method.name
+    && String(item.method.descriptor || '').split(')')[0] === parameterDescriptor);
+}
+
+function formatEnumConstants(cls, constants, options) {
+  const clinit = (cls.items || []).find((item) => item.type === 'method'
+    && item.method && item.method.name === '<clinit>');
+  if (!clinit) return constants.map((item) => item.field.name);
+  const code = getCode(clinit.method);
+  if (!code) return constants.map((item) => item.field.name);
+  const state = makeLocalState([], true, code, null, options);
+  const rendered = formatStaticInitializer(code, state, cls, options);
+  const className = simpleClassName(cls.className || 'Enum');
+  return constants.map((item) => {
+    const fieldName = sourceFieldName(cls.className, item.field.name);
+    const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const pattern = new RegExp(`${escaped}\\s*=\\s*(?:\\([^;=]+?\\)\\s*)*new\\s+([A-Za-z_$][A-Za-z0-9_$.]*)\\(([^;]*)\\);`);
+    const match = pattern.exec(rendered);
+    if (!match) return item.field.name;
+    const instantiatedType = match[1];
+    const args = splitSourceArguments(match[2]);
+    const sourceArgs = args.slice(2);
+    const head = sourceArgs.length ? `${item.field.name}(${sourceArgs.join(', ')})` : item.field.name;
+    const subclass = findClassForRenderedType(instantiatedType, options.exceptionModel);
+    if (!subclass || subclass.className === cls.className || !isEnumConstantSubclass(subclass)) return head;
+    return formatEnumConstantSubclass(head, subclass, options);
+  });
+}
+
+function extractInterfaceFieldInitializers(cls, options) {
+  const result = { values: new Map(), consumedClinit: false };
+  const clinit = (cls.items || []).find((item) => item.type === 'method'
+    && item.method && item.method.name === '<clinit>');
+  if (!clinit) return result;
+  const code = getCode(clinit.method);
+  if (!code) return result;
+  const rendered = formatStaticInitializer(code, makeLocalState([], true, code, null, options), cls, options);
+  const body = rendered.split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line && line !== 'static {' && line !== '}');
+  const assignments = [];
+  for (const line of body) {
+    const assignment = parseOwnedStaticFieldAssignment(line, cls.className);
+    if (!assignment) return result;
+    assignments.push([assignment.name, assignment.valueSource]);
+  }
+  const fieldNames = new Set((cls.items || [])
+    .filter((item) => item.type === 'field' && item.field)
+    .map((item) => sourceFieldName(cls.className, item.field.name)));
+  if (!assignments.length || assignments.some(([name]) => !fieldNames.has(name))) return result;
+  for (const [name, value] of assignments) result.values.set(name, value);
+  result.consumedClinit = true;
+  return result;
+}
+
+function parseOwnedStaticFieldAssignment(source, ownerInternalName) {
+  const parts = topLevelAssignmentParts(String(source));
+  if (!parts) return null;
+  let statement;
+  try { statement = javaStatementParser.parseStatement(`${parts.left} = null;`); } catch (_error) { return null; }
+  const assignment = statement && statement.kind === 'ExpressionStatement'
+    ? statement.expression
+    : null;
+  if (!assignment || assignment.kind !== 'AssignmentExpression' || assignment.operator !== '=') return null;
+
+  const targetPath = fieldAccessPath(assignment.left);
+  if (!targetPath.length) return null;
+  const name = targetPath[targetPath.length - 1];
+  const ownerPath = javaTypeFromInternalName(ownerInternalName).split('.');
+  const qualifier = targetPath.slice(0, -1);
+  if (qualifier.length && qualifier.join('.') !== ownerPath.join('.')) return null;
+
+  // The frontend parser proves the exact owned assignment target. Preserve the
+  // already-rendered RHS: lambda/postfix parsing is intentionally irrelevant to
+  // deciding whether this putstatic may become an interface field initializer.
+  return parts.right ? { name, valueSource: parts.right } : null;
+}
+
+function fieldAccessPath(node) {
+  if (!node) return [];
+  if (node.kind === 'Identifier') return [node.name];
+  if (node.kind !== 'FieldAccessExpression') return [];
+  const target = fieldAccessPath(node.target);
+  return target.length ? [...target, node.name] : [];
+}
+
+function topLevelAssignmentParts(source) {
+  let parenDepth = 0;
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = source[index];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '(') parenDepth += 1;
+    else if (ch === ')') parenDepth -= 1;
+    else if (ch === '[') bracketDepth += 1;
+    else if (ch === ']') bracketDepth -= 1;
+    else if (ch === '{') braceDepth += 1;
+    else if (ch === '}') braceDepth -= 1;
+    else if (ch === '=' && parenDepth === 0 && bracketDepth === 0 && braceDepth === 0
+      && source[index - 1] !== '=' && source[index + 1] !== '=') {
+      const left = source.slice(0, index).trim();
+      const right = source.slice(index + 1).trim();
+      return {
+        left,
+        right: right.endsWith(';') ? right.slice(0, -1).trimEnd() : right,
+      };
+    }
+  }
+  return null;
+}
+
+function findClassForRenderedType(type, model) {
+  if (!model || !model.classInfo) return null;
+  const rendered = String(type || '');
+  for (const [internalName, cls] of model.classInfo) {
+    if (internalName === rendered.replace(/\./g, '/')
+      || javaTypeFromInternalName(internalName) === rendered
+      || simpleClassName(internalName) === rendered) return cls;
+  }
+  return null;
+}
+
+function formatEnumConstantSubclass(head, subclass, options) {
+  const memberTexts = [];
+  const fields = (subclass.items || [])
+    .filter((item) => item.type === 'field' && item.field)
+    .filter((item) => !shouldSkipField(subclass, item.field));
+  for (const item of fields) {
+    memberTexts.push(formatField(item.field, subclass.className, options.exceptionModel));
+  }
+
+  const methods = (subclass.items || [])
+    .filter((item) => item.type === 'method' && item.method)
+    .filter((item) => !shouldSkipMethod(subclass, item.method));
+  for (const item of methods) {
+    if (item.method.name === '<clinit>') continue;
+    const rendered = formatMethod(subclass, item.method, {
+      ...options,
+      foldedSelfType: subclass.superClassName,
+      staticOwnerAliases: new Map([[subclass.className, subclass.superClassName]]),
+    });
+    if (item.method.name !== '<init>') {
+      memberTexts.push(rendered);
+      continue;
+    }
+    const open = rendered.indexOf('{');
+    const close = rendered.lastIndexOf('}');
+    if (open < 0 || close <= open) continue;
+    const body = rendered.slice(open + 1, close).split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !/^(?:super|this)\s*\(/.test(line));
+    if (body.length) memberTexts.push(`{\n${body.map((line) => `    ${line}`).join('\n')}\n}`);
+  }
+  if (!memberTexts.length) return head;
+  const body = memberTexts.map((text) => text.split('\n').map((line) => `        ${line}`).join('\n')).join('\n\n');
+  return `${head} {\n${body}\n    }`;
+}
+
+function splitSourceArguments(source) {
+  const args = [];
+  let start = 0;
+  let depth = 0;
+  let quote = '';
+  let escaped = false;
+  for (let i = 0; i < source.length; i += 1) {
+    const ch = source[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue; }
+    if (ch === '(' || ch === '[' || ch === '{') depth += 1;
+    else if (ch === ')' || ch === ']' || ch === '}') depth -= 1;
+    else if (ch === ',' && depth === 0) {
+      args.push(source.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  const tail = source.slice(start).trim();
+  if (tail) args.push(tail);
+  return args;
+}
+
+function isLambdaImplementationMethod(cls, method) {
+  return (cls.bootstrapMethods || []).some((bootstrap) => {
+    const bootstrapRef = bootstrap && bootstrap.method_ref && bootstrap.method_ref.value
+      && bootstrap.method_ref.value.reference;
+    if (!bootstrapRef || bootstrapRef.className !== 'java/lang/invoke/LambdaMetafactory') return false;
+    const impl = bootstrap.arguments && bootstrap.arguments[1] && bootstrap.arguments[1].value;
+    const ref = impl && impl.reference;
+    return ref && ref.className === cls.className && ref.nameAndType
+      && ref.nameAndType.name === method.name
+      && ref.nameAndType.descriptor === method.descriptor;
+  });
+}
+
 function isTrivialDefaultConstructor(method) {
   if (method.name !== '<init>' || method.descriptor !== '()V') return false;
   const instructions = executableInstructions(getCode(method));
@@ -570,6 +794,22 @@ function isTrivialDefaultConstructor(method) {
 
 function isEnumConstantField(field) {
   return (field.flags || []).includes('enum');
+}
+
+// ACC_ENUM also appears on the anonymous implementation classes used for enum
+// constants with class bodies.  Those classes extend the real enum and cannot
+// themselves be declared with Java's `enum` keyword; only the direct
+// java/lang/Enum subclass has source-level enum syntax.
+function isSourceEnumClass(cls) {
+  return Boolean(cls)
+    && (cls.flags || []).includes('enum')
+    && cls.superClassName === 'java/lang/Enum';
+}
+
+function isEnumConstantSubclass(cls) {
+  return Boolean(cls)
+    && (cls.flags || []).includes('enum')
+    && cls.superClassName !== 'java/lang/Enum';
 }
 
 function formatClassDeclaration(cls, displayName, model) {
@@ -607,14 +847,26 @@ function formatClassDeclaration(cls, displayName, model) {
   return declaration;
 }
 
-function formatField(field, owner) {
+function formatField(field, owner, model, initializerOverride = undefined) {
   const ignoredFlags = new Set(['synthetic', 'enum']);
-  if ((field.flags || []).includes('static') && (field.flags || []).includes('final')
-    && (field.value === null || field.value === undefined)) ignoredFlags.add('final');
-  const flags = filterFlags(field.flags || [], ignoredFlags).join(' ');
+  // A JVM blank-final assignment can be expressed through receiver shapes that
+  // javac does not recognize as a source-level definite-assignment to `this`
+  // (notably `((Owner) this).field = value`). Preserve the data flow and make
+  // the regenerated source compilable; ConstantValue-backed finals retain the
+  // modifier.
+  if ((field.flags || []).includes('final')
+    && initializerOverride === undefined
+    && (!(field.flags || []).includes('static') || field.value === null || field.value === undefined)) {
+    ignoredFlags.add('final');
+  }
+  let visibleFlags = filterFlags(field.flags || [], ignoredFlags);
+  if (hasSplitNestMates(owner, model)) visibleFlags = visibleFlags.filter((flag) => flag !== 'private');
+  const flags = visibleFlags.join(' ');
   const type = descriptorToJavaType(field.descriptor);
   const prefix = flags ? `${flags} ` : '';
-  const initializer = field.value !== null && field.value !== undefined ? ` = ${formatLiteral(field.value, type)}` : '';
+  const initializer = initializerOverride !== undefined
+    ? ` = ${initializerOverride}`
+    : (field.value !== null && field.value !== undefined ? ` = ${formatLiteral(field.value, type)}` : '');
   return `${prefix}${type} ${sourceFieldName(owner, field.name)}${initializer};`;
 }
 
@@ -639,7 +891,7 @@ class DecompilationFallbackError extends Error {
 const FALLBACK_LINE_COMMENT = /^\s*\/\//;
 // Placeholder expressions/statements the emitter substitutes when it cannot
 // reconstruct a value or condition. These are invalid/fake even though some parse.
-const FALLBACK_PLACEHOLDER = /\/\*\s*unsupported condition|\/\*\s*unresolved invokevirtual|stack-underflow|\bstmt_\d+\(\)\s*;/;
+const FALLBACK_PLACEHOLDER = /\/\*\s*unsupported condition|\/\*\s*unresolved invokevirtual|\/\*\s*invokedynamic\s*\*\/|stack-underflow|\bstmt_\d+\(\)\s*;/;
 
 // Scan a finalized method body for any fallback marker and hard-fail if present,
 // so a logically-broken or lossy method is never written to disk.
@@ -656,6 +908,33 @@ function assertNoFallback(bodyLines, context = {}) {
   }
 }
 
+function hasSplitNestMates(owner, model) {
+  if (!owner || !model || !model.classInfo) return false;
+  const nest = String(owner).split('$')[0];
+  for (const name of model.classInfo.keys()) {
+    if (name !== owner && String(name).split('$')[0] === nest) return true;
+  }
+  return false;
+}
+
+function privateMethodHasIncompatibleSubclassDeclaration(cls, method, model) {
+  if (!(method.flags || []).includes('private') || !model || !model.classInfo) return false;
+  const descriptor = String(method.descriptor || '');
+  const parameterDescriptor = descriptor.split(')')[0];
+  const returnDescriptor = descriptor.slice(descriptor.indexOf(')') + 1);
+  for (const [internalName, candidate] of model.classInfo) {
+    if (internalName === cls.className
+      || !isReferenceTypeAssignable(internalName, cls.className, model)) continue;
+    for (const item of candidate.items || []) {
+      if (item.type !== 'method' || !item.method || item.method.name !== method.name) continue;
+      const candidateDescriptor = String(item.method.descriptor || '');
+      if (candidateDescriptor.split(')')[0] !== parameterDescriptor) continue;
+      if (candidateDescriptor.slice(candidateDescriptor.indexOf(')') + 1) !== returnDescriptor) return true;
+    }
+  }
+  return false;
+}
+
 function formatMethod(cls, method, options = {}) {
   const profileMethod = process.env.CFR_JS_PROFILE_METHODS === '1';
   const methodProfileStarted = Date.now();
@@ -664,6 +943,7 @@ function formatMethod(cls, method, options = {}) {
   const rawFlags = method.flags || [];
   const isStatic = rawFlags.includes('static');
   const isVarargs = rawFlags.includes('varargs');
+  const isEnumConstructor = isSourceEnumClass(cls) && method.name === '<init>';
   const descriptor = parseDescriptor(method.descriptor || '()V');
   const params = descriptor.params || [];
   const returnType = descriptor.returnType || 'void';
@@ -681,7 +961,20 @@ function formatMethod(cls, method, options = {}) {
   const materializeAbstract = rawFlags.includes('abstract')
     && options.exceptionModel && options.exceptionModel.instantiatedTypes
     && options.exceptionModel.instantiatedTypes.has(cls.className);
-  let flags = filterFlags(rawFlags, new Set(['bridge', 'synthetic', 'varargs']));
+  const ignoredMethodFlags = new Set(['bridge', 'synthetic', 'varargs']);
+  if (method.name === '<init>') ignoredMethodFlags.add('strictfp');
+  let flags = filterFlags(rawFlags, ignoredMethodFlags);
+  const isInterfaceMethodWithCode = (cls.flags || []).includes('interface') && code
+    && method.name !== '<clinit>' && method.name !== '<init>';
+  if (isInterfaceMethodWithCode) {
+    flags = flags.filter((flag) => flag !== 'private' && flag !== 'protected');
+    if (!isStatic && !flags.includes('default')) flags.push('default');
+  }
+  if (!isSourceEnumClass(cls)
+    && hasSplitNestMates(cls.className, options.exceptionModel)
+    && !privateMethodHasIncompatibleSubclassDeclaration(cls, method, options.exceptionModel)) {
+    flags = flags.filter((flag) => flag !== 'private');
+  }
   if (materializeAbstract) flags = flags.filter((flag) => flag !== 'abstract');
   const visibleFlags = flags.filter((flag) => flag !== 'static');
   if (isStatic) visibleFlags.push('static');
@@ -739,9 +1032,11 @@ function formatMethod(cls, method, options = {}) {
   const constructorInvocation = method.name === '<init>'
     ? localState.takeConstructorInvocation()
     : null;
-  const constructorCall = constructorInvocation
+  const constructorCall = constructorInvocation && !isEnumConstructor
     ? `${constructorInvocation.target}(${constructorInvocation.args.join(', ')});`
     : null;
+  rewriteDuplicateLocalDeclarations(body);
+  hoistEscapingLocalDeclarations(body, localState);
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   const refinedBody = refineObjectLocalDeclarations(body, (name) => localState.refinedTypeForName(name));
@@ -1333,6 +1628,9 @@ function decompileCode(code, method, cls, localState, options = {}) {
   // their own option bags.  Keep the run-wide hierarchy on the shared local
   // state so expression coercion remains cross-class-aware in every path.
   localState.exceptionModel = options.exceptionModel || localState.exceptionModel;
+  localState.currentInternalClassName = cls.className;
+  localState.foldedSelfType = options.foldedSelfType || localState.foldedSelfType;
+  localState.staticOwnerAliases = options.staticOwnerAliases || localState.staticOwnerAliases;
   const codeItemsForSelection = code.codeItems || [];
   let controlTransfers = 0;
   let hasSuppressedCleanup = false;
@@ -1359,6 +1657,8 @@ function decompileCode(code, method, cls, localState, options = {}) {
   if (process.env.CFR_JS_PROFILE_METHODS === '1') {
     console.error(`[cfr-selector] ${cls.className}.${method.name}${method.descriptor} items=${codeItemsForSelection.length} transfers=${controlTransfers} array=${hasArrayLength} suppressed=${hasSuppressedCleanup} owned=${preferOwnedStructurer}`);
   }
+  const sequentialTryCatches = decompileStructuredSequentialTryCatches(code, method, cls, localState);
+  if (usableDecompileLines(sequentialTryCatches)) return sequentialTryCatches;
   if (preferOwnedStructurer) {
     if (process.env.CFR_JS_PROFILE_METHODS === '1') console.error(`[cfr-owned-start] ${cls.className}.${method.name}${method.descriptor}`);
     const ownedStructured = decompileOwnedStructuredControlFlow(code, method, cls, localState, options);
@@ -1810,6 +2110,7 @@ function normalizeSyntheticVariableScopes(lines) {
   const used = new Set();
   const declarations = new Map();
   const declarationCounts = new Map();
+  const resourceDeclarationCounts = new Map();
   const forcedForDeclarations = new Map();
   const minimumUseDepth = new Map();
   const lineDepths = [];
@@ -1824,6 +2125,9 @@ function normalizeSyntheticVariableScopes(lines) {
     for (const declaration of parsedDeclarations) {
       used.add(declaration.name);
       declarationCounts.set(declaration.name, (declarationCounts.get(declaration.name) || 0) + 1);
+      if (declaration.inResource) {
+        resourceDeclarationCounts.set(declaration.name, (resourceDeclarationCounts.get(declaration.name) || 0) + 1);
+      }
       if (!declarations.has(declaration.name)) {
         declarations.set(declaration.name, { type: declaration.type, depth: lineDepth, index });
       }
@@ -1872,7 +2176,10 @@ function normalizeSyntheticVariableScopes(lines) {
       .test(lines.slice(declaration.index + 1).join('\n'));
     const usedOutsideScope = declaration && new RegExp(`\\b${escapedName}\\b`)
       .test(lines.slice(scopeEnd + 1).join('\n'));
-    if (!declaration || (declarationCounts.get(name) || 0) > 1
+    const declarationCount = declarationCounts.get(name) || 0;
+    const duplicateNeedsLift = declarationCount > 1
+      && (resourceDeclarationCounts.get(name) || 0) !== declarationCount;
+    if (!declaration || duplicateNeedsLift
       || (minimumUseDepth.get(name) || 0) < declaration.depth
       || (syntheticLocal && (forcedForDeclarations.has(name)
         || (declaration.depth > 0 && usedAfterDeclaration)))
@@ -1992,6 +2299,28 @@ function localDeclarationsFromStatement(source) {
       inCatch: true,
     }));
   }
+  if (statement && statement.kind === 'TryStatement' && Array.isArray(statement.resources)) {
+    const resources = [];
+    for (const resource of statement.resources) {
+      const text = resource && (resource.text || (resource.tokens || []).map((token) => token.text).join(' '));
+      if (!text) continue;
+      try {
+        const declaration = javaStatementParser.parseStatement(`${text};`);
+        if (!declaration || declaration.kind !== 'LocalVariableDeclarationStatement') continue;
+        const baseType = sourceTypeFromAst(declaration.variableType);
+        for (const item of declaration.declarators || []) {
+          resources.push({
+            name: item.name,
+            type: `${baseType}${'[]'.repeat(Number(item.dimensions) || 0)}`,
+            inFor: false,
+            inCatch: false,
+            inResource: true,
+          });
+        }
+      } catch (_error) { /* malformed resources remain visible to the compiler */ }
+    }
+    return resources;
+  }
   let declaration = statement;
   let inFor = false;
   if (statement && statement.kind === 'ForStatement') {
@@ -2006,6 +2335,102 @@ function localDeclarationsFromStatement(source) {
     inFor,
     inCatch: false,
   }));
+}
+
+function hoistEscapingLocalDeclarations(lines, localState) {
+  const depthBefore = [];
+  const depthAfter = [];
+  const depthMinimum = [];
+  let depth = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    depthBefore[i] = depth;
+    let minimum = depth;
+    for (const ch of String(lines[i])) {
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth = Math.max(0, depth - 1);
+      minimum = Math.min(minimum, depth);
+    }
+    depthMinimum[i] = minimum;
+    depthAfter[i] = depth;
+  }
+
+  const hoisted = new Map();
+  for (let i = 0; i < lines.length; i += 1) {
+    // A try-with-resources declaration is scoped to the try statement and is
+    // required syntactically to remain a declaration. Brace-depth accounting
+    // sees the header before the opening brace and can otherwise mistake its
+    // body use (or a later resource reusing the same slot name) for an escaping
+    // local, producing the illegal `try (name = new Resource())` form.
+    if (/^\s*try\s*\(/.test(String(lines[i]))) continue;
+    const declarations = localDeclarationsFromStatement(lines[i]);
+    if (declarations.length !== 1) continue;
+    const declaration = declarations[0];
+    if (declaration.inCatch || declaration.inResource) continue;
+    const scoped = declaration.inFor || depthBefore[i] > 0;
+    if (!scoped) continue;
+    const scopeDepth = declaration.inFor ? depthBefore[i] + 1 : depthBefore[i];
+    let scopeEnd = lines.length;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (depthMinimum[j] < scopeDepth) { scopeEnd = j + 1; break; }
+    }
+    const escaped = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const usedLater = new RegExp(`\\b${escaped}\\b`).test(lines.slice(scopeEnd).join('\n'));
+    if (!usedLater) continue;
+
+    const type = localState.sourceTypeForName(declaration.name) || declaration.type;
+    hoisted.set(declaration.name, type);
+    const typePattern = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (declaration.inFor) {
+      lines[i] = String(lines[i]).replace(
+        new RegExp(`(for\\s*\\(\\s*)${typePattern}\\s+${escaped}\\s*=`),
+        `$1${declaration.name} =`);
+    } else {
+      lines[i] = String(lines[i]).replace(
+        new RegExp(`^(\\s*)${typePattern}\\s+${escaped}\\s*=`),
+        `$1${declaration.name} =`);
+    }
+  }
+  if (hoisted.size) {
+    lines.unshift(...[...hoisted].map(([name, type]) => `${type} ${name} = ${defaultValueForType(type)};`));
+  }
+}
+
+function rewriteDuplicateLocalDeclarations(lines) {
+  const resourceNames = new Set();
+  for (const line of lines) {
+    for (const declaration of localDeclarationsFromStatement(line)) {
+      if (declaration.inResource) resourceNames.add(declaration.name);
+    }
+  }
+  // A state-machine fallback may lift a resource slot to method scope even
+  // though the structured try header redeclares it. The lifted null is unused
+  // and makes every resource declaration illegal, so remove it.
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const declarations = localDeclarationsFromStatement(lines[i]);
+    if (declarations.length !== 1 || declarations[0].inFor
+      || declarations[0].inCatch || declarations[0].inResource) continue;
+    if (resourceNames.has(declarations[0].name) && /^\S/.test(String(lines[i]))) lines.splice(i, 1);
+  }
+
+  const seen = new Set();
+  for (let i = 0; i < lines.length; i += 1) {
+    const declarations = localDeclarationsFromStatement(lines[i]);
+    if (declarations.length !== 1) continue;
+    const declaration = declarations[0];
+    if (declaration.inCatch || declaration.inResource) continue;
+    if (!seen.has(declaration.name)) { seen.add(declaration.name); continue; }
+    const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedType = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (declaration.inFor) {
+      lines[i] = String(lines[i]).replace(
+        new RegExp(`(for\\s*\\(\\s*)${escapedType}\\s+${escapedName}\\s*=`),
+        `$1${declaration.name} =`);
+    } else {
+      lines[i] = String(lines[i]).replace(
+        new RegExp(`^(\\s*)${escapedType}\\s+${escapedName}\\s*=`),
+        `$1${declaration.name} =`);
+    }
+  }
 }
 
 function sourceTypeFromAst(type) {
@@ -2263,34 +2688,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   const syncHandlers = loweredSync.syncHandlers;
   exceptionTable = dropRethrowHandlerRows(codeItems, exceptionTable);
   exceptionTable = dropUnthrowableProtectedRows(codeItems, exceptionTable);
-  let structured = null;
-  if (codeItems.length > 1000 && exceptionTable.length && !syncHandlers.size) {
-    const normalCfg = buildCfgFromCode(codeItems, []);
-    if (normalCfg) {
-      const reachableBlocks = new Set([normalCfg.entry]);
-      const pendingBlocks = [normalCfg.entry];
-      while (pendingBlocks.length) {
-        const blockId = pendingBlocks.pop();
-        for (const successor of normalCfg.succ[blockId] || []) {
-          if (successor == null || reachableBlocks.has(successor)) continue;
-          reachableBlocks.add(successor);
-          pendingBlocks.push(successor);
-        }
-      }
-      const reachableItems = new Set();
-      for (const blockId of reachableBlocks) {
-        for (const itemIndex of normalCfg.blocks[blockId].insns) reachableItems.add(itemIndex);
-      }
-      const normalItems = codeItems.filter((_item, index) => reachableItems.has(index));
-      const normalStructured = structureMethod(normalItems, []);
-      if (normalStructured && normalStructured.ok) {
-        codeItems = normalItems;
-        exceptionTable = [];
-        structured = normalStructured;
-      }
-    }
-  }
-  if (!structured) structured = structureMethod(codeItems, exceptionTable, { syncHandlers });
+  let structured = structureMethod(codeItems, exceptionTable, { syncHandlers });
   if ((!structured || !structured.ok) && codeItems.length > 1000 && !syncHandlers.size) {
     const normalOnly = structureMethod(codeItems, []);
     if (normalOnly && normalOnly.ok) structured = normalOnly;
@@ -2324,6 +2722,20 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   }
 
   const handlerEntries = new Map();
+  const handlerTypesByPc = new Map();
+  for (const entry of exceptionTable) {
+    const catchType = entry.catch_type || entry.catchType;
+    const sourceType = catchType == null || catchType === 0 || catchType === 'any'
+      ? 'Throwable'
+      : javaTypeFromInternalName(catchType);
+    const handlerKey = Number.isFinite(Number(entry.handler_pc))
+      ? `pc:${Number(entry.handler_pc)}`
+      : `label:${String(entry.handlerLbl || entry.handlerLabel || '').replace(/:$/, '')}`;
+    const previousType = handlerTypesByPc.get(handlerKey);
+    handlerTypesByPc.set(handlerKey, previousType
+      ? commonExceptionHandlerStackType(previousType, sourceType)
+      : sourceType);
+  }
   for (const entry of exceptionTable) {
     const label = String(entry.handlerLbl || entry.handlerLabel || '').replace(/:$/, '');
     if (!label) continue;
@@ -2334,7 +2746,6 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     handlerEntries.set(label, commonExceptionSourceType(
       [handlerEntries.get(label), sourceType], options.exceptionModel));
   }
-
   // Vineflower's ExprProcessor propagates a copied PrimitiveExprsList through
   // every regular CFG edge and seeds catch blocks with one exception value.
   // Do the equivalent shape analysis first, before source rendering mutates the
@@ -2437,11 +2848,16 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       op === 'tableswitch' || op === 'lookupswitch' || isConditionalBranch(op);
     const bodyIndexes = consumedByStructurer ? block.insns.slice(0, -1) : block.insns;
     const initialStack = (entryStacks.get(blockId) || []).map((value, slot) => {
+      const handlerType = handlerEntries.get(block.headLabel);
       const code = handlerEntries.has(block.headLabel)
-        ? (useStateMachine ? 'caughtException' : 'decompiledCaughtException')
+        ? (useStateMachine
+          ? 'caughtException'
+          : (handlerType === structuredCarrierType
+            ? 'decompiledCaughtException'
+            : `(${simplifyType(handlerType)}) (Object) decompiledCaughtException`))
         : (value.code === 'this' ? 'this' : stackInName(blockId, slot));
       const expressionType = handlerEntries.has(block.headLabel)
-        ? (useStateMachine ? 'Throwable' : structuredCarrierType)
+        ? (useStateMachine ? 'Throwable' : handlerType)
         : value.type;
       return expr(code, expressionType, 100, {
         ...(value.pendingNew ? { pendingNew: value.pendingNew } : {}),
@@ -2606,6 +3022,24 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     }
     return null;
   }
+}
+
+function commonExceptionHandlerStackType(left, right) {
+  if (left === right) return left;
+  const internal = (type) => {
+    const value = String(type).replace(/\./g, '/');
+    return value.includes('/') ? value : `java/lang/${value}`;
+  };
+  const leftInternal = internal(left);
+  const rightInternal = internal(right);
+  if (leftInternal === 'java/lang/Throwable' || rightInternal === 'java/lang/Throwable') return 'Throwable';
+  const isError = (type) => type === 'java/lang/Error' || /(?:Error)$/.test(type);
+  const leftError = isError(leftInternal);
+  const rightError = isError(rightInternal);
+  if (leftError || rightError) return leftError && rightError ? 'Error' : 'Throwable';
+  const leftUnchecked = JDK_UNCHECKED_EXCEPTIONS.has(leftInternal);
+  const rightUnchecked = JDK_UNCHECKED_EXCEPTIONS.has(rightInternal);
+  return leftUnchecked && rightUnchecked ? 'RuntimeException' : 'Exception';
 }
 
 function normalizeStructuredCatchNodes(tree, cfg, codeItems, model) {
@@ -3146,9 +3580,10 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'arraylength') {
       const array = pop(stack);
       let rendered = array;
-      if (array.type === 'Object') {
-        localState.refineExpressionType(array, 'Object[]');
-        // Collapsed Object locals reject declaration refinement; cast at use.
+      if (!simplifyType(array.type).endsWith('[]')) {
+        if (array.type === 'Object') localState.refineExpressionType(array, 'Object[]');
+        // The verifier proves an array here even when a reused source local was
+        // inferred as another reference type. Cast through Object when needed.
         const refined = localState.sourceTypeForName(array.code);
         if (!refined || !refined.endsWith('[]')) rendered = coerceExpressionForType(array, 'Object[]');
       }
@@ -3171,7 +3606,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const elementType = op === 'baload' && array.type === 'boolean[]'
         ? 'boolean'
         : (op === 'aaload' && array.type.endsWith('[]') ? array.type.slice(0, -2) : ARRAY_LOAD_TYPES[op]);
-      stack.push(expr(`${wrap(array, 100)}[${index.code}]`, elementType, 100, { arrayElement: true }));
+      stack.push(expr(`${renderArrayReceiver(array)}[${index.code}]`, elementType, 100, { arrayElement: true }));
       continue;
     }
     if (ARRAY_STORE_TYPES[op]) {
@@ -3200,17 +3635,33 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         if (array.newArraySpill && /^new\b/.test(array.code)) {
           materializeNewArraySpill(array, lines, localState);
         }
+        if (value.newArraySpill && /^new\b/.test(value.code)) {
+          // A fresh dynamic array may be the value stored into an outer array
+          // while a dup_x2-preserved copy remains live for a following astore.
+          // Spill the allocation once; shared stack references then retain the
+          // required object identity instead of allocating a second array.
+          const name = localState.nextSyntheticName();
+          lines.push(`${value.type} ${name} = ${value.code};`);
+          value.code = name;
+          value.newArraySpill = undefined;
+        }
         const elementType = op === 'bastore' && array.type === 'boolean[]'
           ? 'boolean'
           : (op === 'aastore' && array.type.endsWith('[]') ? array.type.slice(0, -2) : ARRAY_STORE_TYPES[op]);
-        lines.push(`${wrap(array, 100)}[${index.code}] = ${coerceExpressionForType(value, elementType).code};`);
+        // The stored value may itself be a dup-filled array literal (for
+        // example, assigning `new int[]{...}` into an `int[][]` element).
+        // Render its recorded stores before consuming it as the outer
+        // aastore value; otherwise only `new int[n]` is emitted and every
+        // initializer is silently replaced by zero.
+        const renderedValue = renderStoreExpression(value);
+        lines.push(`${renderArrayReceiver(array)}[${index.code}] = ${coerceExpressionForType(renderedValue, elementType).code};`);
       }
       continue;
     }
 
     if (op === 'getstatic') {
       const ref = parseMemberRef(instruction.arg);
-      stack.push(expr(formatStaticField(ref, currentInternalClassName), descriptorToJavaType(ref.descriptor), 100, {
+      stack.push(expr(formatStaticField(ref, localState), descriptorToJavaType(ref.descriptor), 100, {
         qualifiedType: qualifiedReferenceTypeFromDescriptor(ref.descriptor),
       }));
       continue;
@@ -3226,7 +3677,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       // below the store target in a post-increment `f[x++]=v` idiom) would re-read
       // the *mutated* field after this assignment. Spill such reads to a temp first.
       materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name), lines, localState);
-      lines.push(`${formatStaticField(ref, currentInternalClassName)} = ${value.code};`);
+      lines.push(`${formatStaticField(ref, localState)} = ${value.code};`);
       continue;
     }
     if (op === 'getfield') {
@@ -3269,14 +3720,24 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       continue;
     }
     if (op === 'invokedynamic') {
-      emitInvokeDynamic(stack, instruction.arg, cls);
+      emitInvokeDynamic(lines, stack, instruction.arg, cls, localState);
       continue;
     }
 
     if (op === 'checkcast') {
       const value = pop(stack);
-      const type = javaTypeFromInternalName(instruction.arg);
-      stack.push(coerceExpressionForType(value, type));
+      const foldedSelfCast = value.code === 'this'
+        && localState.foldedSelfType
+        && instruction.arg === currentInternalClassName;
+      const type = javaTypeFromInternalName(foldedSelfCast ? localState.foldedSelfType : instruction.arg);
+      // A bare null literal cannot be used as a receiver (`null.m()`), while
+      // the bytecode's checkcast supplies exactly the source type needed for
+      // overload selection and dereference. Preserve that explicit cast.
+      stack.push(foldedSelfCast
+        ? expr('this', type, 100)
+        : value.code === 'null'
+        ? expr(`(${type}) null`, type, 90)
+        : coerceExpressionForType(value, type));
       continue;
     }
     if (op === 'instanceof') {
@@ -3349,8 +3810,12 @@ function emitVirtualCall(lines, stack, arg, localState) {
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
   const rawReceiver = pop(stack);
-  const ownerType = javaTypeFromInternalName(ref.owner);
-  const receiver = /^stackIn_/.test(rawReceiver.code)
+  const ownerType = sourceOwnerType(ref.owner, localState);
+  const receiver = rawReceiver.code === 'this'
+    ? expr('this', ownerType)
+    : rawReceiver.code === 'null'
+    ? expr(`(${ownerType}) null`, ownerType, 90)
+    : /^stackIn_/.test(rawReceiver.code)
     ? expr(`(${ownerType}) (Object) ${rawReceiver.code}`, ownerType, 90)
     : coerceExpressionForType(rawReceiver, ownerType);
 
@@ -3379,6 +3844,10 @@ function emitVirtualCall(lines, stack, arg, localState) {
   const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
   const call = `${wrap(receiver, 100)}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
+  if (ref.owner === 'java/lang/invoke/MethodHandle'
+    && (ref.name === 'invoke' || ref.name === 'invokeExact') && returnType !== 'void') {
+    call = `(${returnType}) ${call}`;
+  }
   if (returnType === 'void') {
     lines.push(`${call};`);
   } else {
@@ -3390,7 +3859,7 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName, localState)
   const ref = parseMemberRef(arg);
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
-  const owner = ref.owner === currentInternalClassName ? simpleClassName(ref.owner) : javaTypeFromInternalName(ref.owner);
+  const owner = sourceOwnerType(ref.owner, localState);
   const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
   const call = `${owner}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
@@ -3414,9 +3883,13 @@ function formatCallArguments(ref, descriptor, args, exceptionModel) {
     if (target && arg.code === 'null' && !primitiveTargets.has(simplifyType(target))) {
       return `(${simplifyType(target)}) null`;
     }
+    // A dup-filled array can remain as an arrayLiteral on the operand stack
+    // until it is consumed directly by a call. Render that metadata before
+    // applying the descriptor-aware coercion.
+    const renderedArg = renderStoreExpression(arg);
     const value = coerceExpressionForType(
-      renderStoreExpression(arg),
-      target || arg.type,
+      renderedArg,
+      target || renderedArg.type,
       exceptionModel,
       !mustPinReferenceOverload,
     );
@@ -3619,17 +4092,19 @@ function renderStringBuilderConcat(pieces) {
   return rendered.join(' + ');
 }
 
-function emitInvokeDynamic(stack, arg, cls) {
+function emitInvokeDynamic(lines, stack, arg, cls, localState) {
   const descriptor = parseDescriptor(arg.nameAndType.descriptor);
   const args = popArgs(stack, descriptor.params.length);
   const bootstrap = (cls.bootstrapMethods || [])[arg.bootstrap_method_attr_index];
+  const bootstrapOwner = bootstrap && bootstrap.method_ref && bootstrap.method_ref.value
+    && bootstrap.method_ref.value.reference && bootstrap.method_ref.value.reference.className;
   const recipe = bootstrap && bootstrap.arguments && bootstrap.arguments[0] && bootstrap.arguments[0].value;
   if (typeof recipe === 'string' && recipe.includes('\u0001')) {
     const chunks = recipe.split('\u0001');
     const pieces = [];
     chunks.forEach((chunk, index) => {
       if (chunk) pieces.push(formatStringLiteral(chunk));
-      if (index < args.length) pieces.push(args[index].code);
+      if (index < args.length) pieces.push(wrap(args[index], 70, true));
     });
     stack.push(expr(pieces.length ? pieces.join(' + ') : '""', 'String', 40));
     return;
@@ -3680,6 +4155,58 @@ function emitInvokeDynamic(stack, arg, cls) {
     return;
   }
   stack.push(expr(`/* invokedynamic */ ${args.map((a) => a.code).join(', ')}`, simplifyType(descriptor.returnType)));
+}
+
+function renderLambdaMetafactoryExpression(bootstrap, capturedArgs, functionalType) {
+  const samDescriptorText = bootstrap.arguments && bootstrap.arguments[0]
+    && bootstrap.arguments[0].value;
+  const implHandle = bootstrap.arguments && bootstrap.arguments[1] && bootstrap.arguments[1].value;
+  const instantiatedDescriptor = bootstrap.arguments && bootstrap.arguments[2]
+    && bootstrap.arguments[2].value;
+  const implRef = implHandle && implHandle.reference;
+  if (!implRef || !implRef.nameAndType || typeof samDescriptorText !== 'string'
+    || typeof instantiatedDescriptor !== 'string') return null;
+
+  const samDescriptor = parseDescriptor(samDescriptorText);
+  const instantiated = parseDescriptor(instantiatedDescriptor);
+  const owner = javaTypeFromInternalName(implRef.className);
+  const methodName = implRef.nameAndType.name;
+  const targetType = simplifyType(functionalType);
+  const implDescriptor = parseDescriptor(implRef.nameAndType.descriptor || '()V');
+  if (samDescriptor.params.length !== instantiated.params.length) return null;
+  const lambdaValues = samDescriptor.params.map((type, index) =>
+    expr(`lambdaParam${index}`, simplifyType(type)));
+  const lambdaHeader = `(${lambdaValues.map((value) => value.code).join(', ')})`;
+  let invocation;
+
+  if (implHandle.kind === 'invokeStatic') {
+    const values = [...capturedArgs, ...lambdaValues];
+    if (values.length !== implDescriptor.params.length) return null;
+    const args = formatCallArguments(implRef, implDescriptor, values, null);
+    invocation = `${owner}.${methodName}(${args.join(', ')})`;
+  } else if (implHandle.kind === 'invokeVirtual'
+    || implHandle.kind === 'invokeInterface'
+    || implHandle.kind === 'invokeSpecial') {
+    const values = capturedArgs.length
+      ? [...capturedArgs]
+      : [...lambdaValues];
+    const receiverValue = values.shift();
+    if (!receiverValue) return null;
+    values.push(...(capturedArgs.length ? lambdaValues : []));
+    if (values.length !== implDescriptor.params.length) return null;
+    const receiver = coerceExpressionForType(receiverValue, owner);
+    const args = formatCallArguments(implRef, implDescriptor, values, null);
+    invocation = `${wrap(receiver, 100)}.${methodName}(${args.join(', ')})`;
+  } else if (implHandle.kind === 'newInvokeSpecial') {
+    const values = [...capturedArgs, ...lambdaValues];
+    if (values.length !== implDescriptor.params.length) return null;
+    const args = formatCallArguments(implRef, implDescriptor, values, null);
+    invocation = `new ${owner}(${args.join(', ')})`;
+  } else {
+    return null;
+  }
+
+  return expr(`(${targetType}) (${lambdaHeader} -> ${invocation})`, targetType, 90);
 }
 
 function handleControlFlowFallback(lines, stack, instruction) {
@@ -3810,7 +4337,7 @@ function decompileStructuredSynchronized(code, method, cls, localState) {
     mutateStack: true,
     keepTrailingReturn: true,
   });
-  if (prefixLines.length || lockStack.length !== 1) return null;
+  if (lockStack.length !== 1) return null;
   const lockExpression = lockStack[0];
 
   const handlerIndex = firstHandlerIndexAfter(code.exceptionTable || [], codeItems, monitorIndex);
@@ -3824,7 +4351,8 @@ function decompileStructuredSynchronized(code, method, cls, localState) {
   const after = decompileRange(codeItems, exit.monitorIndex + 1, searchEnd, context, []);
   if (!after.ok) return null;
 
-  const lines = [`synchronized (${lockExpression.code}) {`];
+  const lines = prefixLines.slice();
+  lines.push(`synchronized (${lockExpression.code}) {`);
   indentLines(body.lines).forEach((line) => lines.push(line));
   lines.push('}');
   after.lines.forEach((line) => lines.push(line));
@@ -4088,6 +4616,14 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       continue;
     }
 
+    const synchronizedBlock = tryDecompileSynchronizedAt(codeItems, index, end, context, stack);
+    if (synchronizedBlock) {
+      lines.push(...synchronizedBlock.lines);
+      stack.splice(0, stack.length, ...synchronizedBlock.stack);
+      index = synchronizedBlock.next;
+      continue;
+    }
+
     const resourceRelease = tryDecompileResourceReleaseAt(codeItems, index, end, context, stack);
     if (resourceRelease) {
       lines.push(...resourceRelease.lines);
@@ -4211,6 +4747,42 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
     index += 1;
   }
   return { ok: true, lines, stack };
+}
+
+// javac.js emits the normal `dup; astore lock; monitorenter ... aload lock;
+// monitorexit` shape but, unlike javac, does not add a catch-all release
+// handler. Recognize that shape wherever it occurs inside a structured range
+// (not only at the method root), so a synchronized block nested in a loop keeps
+// both its synchronization semantics and the surrounding control flow.
+function tryDecompileSynchronizedAt(codeItems, index, end, context, stack) {
+  const monitorIndex = findNextInstruction(codeItems, index, end, 'monitorenter');
+  if (monitorIndex === -1) return null;
+  const storeIndex = previousExecutableIndex(codeItems, monitorIndex, index);
+  const dupIndex = previousExecutableIndex(codeItems, storeIndex, index);
+  if (storeIndex === -1 || dupIndex === -1) return null;
+  const storeInstruction = getInstructionAt(codeItems, storeIndex);
+  const dupInstruction = getInstructionAt(codeItems, dupIndex);
+  const lockStore = storeInstruction && parseStoreIndex(storeInstruction.op, storeInstruction.arg);
+  if (!lockStore || lockStore.type !== 'Object' || !dupInstruction || dupInstruction.op !== 'dup') return null;
+
+  const lockStack = stack.slice();
+  const prefixLines = decompileLinearCodeItems(codeItems.slice(index, dupIndex), context.method, context.cls, context.localState, {
+    initialStack: lockStack,
+    mutateStack: true,
+    keepTrailingReturn: true,
+  });
+  if (prefixLines.length || lockStack.length !== stack.length + 1) return null;
+  const lockExpression = lockStack.pop();
+
+  const exit = findMatchingMonitorExit(codeItems, monitorIndex + 1, end, lockStore.index);
+  if (!exit) return null;
+  const body = decompileRange(codeItems, monitorIndex + 1, exit.loadIndex, context, []);
+  if (!body.ok || body.stack.length) return null;
+
+  const lines = [`synchronized (${lockExpression.code}) {`];
+  indentLines(body.lines).forEach((line) => lines.push(line));
+  lines.push('}');
+  return { lines, next: exit.monitorIndex + 1, stack: lockStack };
 }
 
 function trySkipForwardGoto(codeItems, index, end, context) {
@@ -4994,7 +5566,19 @@ function tryDecompileStackTernaryAt(codeItems, index, end, context, stack) {
   const trueGoto = trueGotoIndex === -1 ? null : getInstructionAt(codeItems, trueGotoIndex);
   if (!trueGoto || trueGoto.op !== 'goto') return null;
   const joinIndex = context.labelIndex.get(trueGoto.arg);
-  if (joinIndex === undefined || joinIndex <= falseStart || joinIndex > end) return null;
+  if (joinIndex === undefined || joinIndex <= falseStart) return null;
+  let falseEnd = joinIndex;
+  let next = joinIndex;
+  if (joinIndex > end) {
+    // javac flattens nested conditional expressions by sending every inner
+    // value arm directly to the enclosing join. During recursive evaluation,
+    // the enclosing arm ends on the final goto to that same join, so the join
+    // itself is deliberately outside this subrange.
+    const boundaryGoto = getInstructionAt(codeItems, end);
+    if (!boundaryGoto || boundaryGoto.op !== 'goto' || boundaryGoto.arg !== trueGoto.arg) return null;
+    falseEnd = end;
+    next = end;
+  }
 
   const condition = evaluateConditionPrefix(codeItems, index, branchIndex, context, stack, true);
   if (!condition || condition.prefixLines.length) return null;
@@ -5002,14 +5586,14 @@ function tryDecompileStackTernaryAt(codeItems, index, end, context, stack) {
   const trueStack = evaluateStackOnlyRange(codeItems, branchIndex + 1, trueGotoIndex, context, condition.stack);
   if (!trueStack || trueStack.length !== condition.stack.length + 1) return null;
 
-  const falseStack = evaluateStackOnlyRange(codeItems, falseStart, joinIndex, context, condition.stack);
+  const falseStack = evaluateStackOnlyRange(codeItems, falseStart, falseEnd, context, condition.stack);
   if (!falseStack || falseStack.length !== condition.stack.length + 1) return null;
 
   const trueValue = trueStack[trueStack.length - 1];
   const falseValue = falseStack[falseStack.length - 1];
   const nextStack = condition.stack.slice();
   nextStack.push(conditionalExpr(condition.condition, trueValue, falseValue));
-  return { next: joinIndex, stack: nextStack };
+  return { next, stack: nextStack };
 }
 
 function evaluateStackOnlyRange(codeItems, start, end, context, initialStack) {
@@ -5140,11 +5724,20 @@ function tryDecompileIfAt(codeItems, index, end, context, stack) {
 
   const thenBody = decompileRange(codeItems, branchIndex + 1, thenEnd, context, []);
   if (!thenBody.ok) return null;
+  if (condition.condition.code === 'true') {
+    return { lines: thenBody.lines, next, stack: condition.stack };
+  }
+  if (condition.condition.code === 'false' && elseStart === -1) {
+    return { lines: [], next, stack: condition.stack };
+  }
   const lines = [`if (${condition.condition.code}) {`];
   indentLines(thenBody.lines).forEach((line) => lines.push(line));
   if (elseStart !== -1) {
     const elseBody = decompileRange(codeItems, elseStart, elseEnd, context, []);
     if (!elseBody.ok) return null;
+    if (condition.condition.code === 'false') {
+      return { lines: elseBody.lines, next, stack: condition.stack };
+    }
     lines.push('} else {');
     indentLines(elseBody.lines).forEach((line) => lines.push(line));
   }
@@ -5203,10 +5796,21 @@ function conditionForBranch(branch, stack, invert) {
     const operator = invert ? invertOperator(intCompareOps[op]) : intCompareOps[op];
     const complementedComparison = simplifyBitwiseComplementComparison(left, operator, right);
     if (complementedComparison) return complementedComparison;
+    const literalComparison = evaluateLiteralIntegerComparison(left, operator, right);
+    if (literalComparison !== null) return expr(String(literalComparison), 'boolean', 100);
     if ((op === 'if_acmpeq' || op === 'if_acmpne') && left.code !== 'null' && right.code !== 'null'
       && simplifyType(left.type) !== simplifyType(right.type)) {
       left = coerceExpressionForType(left, 'Object');
       right = coerceExpressionForType(right, 'Object');
+    }
+    // The JVM compares references at runtime, but javac folds identical String
+    // constant expressions in source (and can consequently reject following
+    // bytecode as unreachable). Preserve runtime comparison semantics in the
+    // expression IR by widening one operand before source rendering.
+    if ((op === 'if_acmpeq' || op === 'if_acmpne')
+      && left.constantKind === 'String' && right.constantKind === 'String'
+      && left.code === right.code) {
+      left = expr(`(Object) ${wrap(left, 90)}`, 'Object', 90);
     }
     if ((operator === '<' || operator === '<=' || operator === '>' || operator === '>=')
       && (left.type === 'boolean' || right.type === 'boolean')) {
@@ -5269,6 +5873,28 @@ function conditionForBranch(branch, stack, invert) {
   }
 
   return expr(`/* unsupported condition ${op} */`, 'boolean');
+}
+
+function evaluateLiteralIntegerComparison(left, operator, right) {
+  const leftValue = integerLiteralValue(left);
+  const rightValue = integerLiteralValue(right);
+  if (leftValue === null || rightValue === null) return null;
+  if (operator === '==') return leftValue === rightValue;
+  if (operator === '!=') return leftValue !== rightValue;
+  if (operator === '<') return leftValue < rightValue;
+  if (operator === '<=') return leftValue <= rightValue;
+  if (operator === '>') return leftValue > rightValue;
+  if (operator === '>=') return leftValue >= rightValue;
+  return null;
+}
+
+function integerLiteralValue(value) {
+  if (!value || !['byte', 'char', 'short', 'int'].includes(simplifyType(value.type))) return null;
+  if (Number.isInteger(value.constantValue)) return value.constantValue | 0;
+  const source = String(value.code || '').trim();
+  if (!/^-?(?:0|[1-9][0-9]*)$/.test(source)) return null;
+  const parsed = Number(source);
+  return Number.isSafeInteger(parsed) && parsed >= -2147483648 && parsed <= 2147483647 ? parsed : null;
 }
 
 function simplifyMaterializedBooleanCondition(value, operator) {
@@ -5459,6 +6085,65 @@ function decompileStructuredTryCatch(code, method, cls, localState) {
   indentLines(catchBody).forEach((line) => lines.push(line));
   lines.push('}');
   afterBody.forEach((line) => lines.push(line));
+  return lines;
+}
+
+function decompileStructuredSequentialTryCatches(code, method, cls, localState) {
+  const entries = code.exceptionTable || [];
+  if (entries.length < 2 || entries.some((entry) => !entry.catch_type || entry.catch_type === 'any')) return null;
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const regions = entries.map((entry) => ({
+    entry,
+    start: labelIndex.get(entry.startLbl),
+    end: labelIndex.get(entry.endLbl),
+    handler: labelIndex.get(entry.handlerLbl),
+  }));
+  if (regions.some((region) => region.start === undefined || region.end === undefined || region.handler === undefined)) return null;
+  regions.sort((left, right) => left.start - right.start || left.end - right.end);
+
+  for (const region of regions) {
+    const gotoIndex = nextNonNopExecutableIndex(codeItems, region.end);
+    const gotoInstruction = gotoIndex < 0 ? null : getInstructionAt(codeItems, gotoIndex);
+    if (!gotoInstruction || (gotoInstruction.op !== 'goto' && gotoInstruction.op !== 'goto_w')) return null;
+    region.after = labelIndex.get(gotoInstruction.arg);
+    if (region.after === undefined || region.handler <= gotoIndex || region.handler >= region.after) return null;
+  }
+  for (let index = 1; index < regions.length; index += 1) {
+    if (regions[index].start < regions[index - 1].after) return null;
+  }
+
+  const context = { method, cls, localState, labelIndex, exceptionTable: entries };
+  const prefix = decompileRange(codeItems, 0, regions[0].start, context, []);
+  if (!prefix.ok || prefix.stack.length) return null;
+  const lines = prefix.lines.slice();
+
+  for (const region of regions) {
+    const tryBody = decompileRange(codeItems, region.start, region.end, context, []);
+    if (!tryBody.ok || tryBody.stack.length) return null;
+    const firstHandlerInstruction = getInstructionAt(codeItems, region.handler);
+    const store = firstHandlerInstruction && parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg);
+    if (!store || store.type !== 'Object') return null;
+    const catchType = javaTypeFromInternalName(region.entry.catch_type);
+    const priorBinding = localState.captureBinding(store.index, catchType);
+    const catchVariable = localState.bindCatch(store.index, catchType,
+      codeItems[region.handler] && codeItems[region.handler].pc,
+      defaultCatchVariableName(region.entry.catch_type));
+    const catchBody = decompileRange(codeItems, region.handler + 1, region.after, context, []);
+    localState.restoreBinding(priorBinding);
+    if (!catchBody.ok || catchBody.stack.length) return null;
+
+    lines.push('try {');
+    indentLines(tryBody.lines).forEach((line) => lines.push(line));
+    lines.push(`} catch (${catchType} ${catchVariable}) {`);
+    indentLines(catchBody.lines).forEach((line) => lines.push(line));
+    lines.push('}');
+  }
+
+  const after = decompileRange(codeItems, regions[regions.length - 1].after, codeItems.length, context, []);
+  if (!after.ok || after.stack.length) return null;
+  after.lines.forEach((line) => lines.push(line));
+  if (lines[lines.length - 1] === 'return;') lines.pop();
   return lines;
 }
 
@@ -5655,10 +6340,20 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   }
   let slot = 0;
 
+  const debugLocalsBySlot = new Map();
   localTable.forEach((local) => {
-    debugNames.set(local.index, sanitizeJavaIdentifier(local.name, `var${local.index}`));
-    debugTypes.set(local.index, descriptorToJavaType(local.descriptor));
+    if (!debugLocalsBySlot.has(local.index)) debugLocalsBySlot.set(local.index, []);
+    debugLocalsBySlot.get(local.index).push(local);
   });
+  for (const [index, locals] of debugLocalsBySlot) {
+    const signatures = new Set(locals.map((local) => `${local.name}:${local.descriptor}`));
+    // A reused JVM slot has distinct source variables with disjoint ranges.
+    // Binding the whole method to the first LocalVariableTable row mis-types
+    // later stores (e.g. String followed by int[]) and emits invalid Java.
+    if (signatures.size !== 1) continue;
+    debugNames.set(index, sanitizeJavaIdentifier(locals[0].name, `var${index}`));
+    debugTypes.set(index, descriptorToJavaType(locals[0].descriptor));
+  }
 
   if (!isStatic) {
     names.set(0, 'this');
@@ -5776,10 +6471,14 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
         declared: declared.has(key),
         scopedDeclared: scopedDeclared.has(key),
         liftedDeclared: liftedDeclared.has(key),
+        currentReferenceKey: currentReferenceKeys.get(index),
+        index,
       };
     },
     restoreBinding(binding) {
       if (!binding) return;
+      if (binding.currentReferenceKey === undefined) currentReferenceKeys.delete(binding.index);
+      else currentReferenceKeys.set(binding.index, binding.currentReferenceKey);
       if (!binding.existed) {
         names.delete(binding.key);
         types.delete(binding.key);
@@ -5844,6 +6543,9 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       if (matches.length !== 1) return null;
       return simplifyType(types.get(matches[0][0]));
     },
+    hasLocalName(name) {
+      return [...names.values()].includes(name);
+    },
     refineExpressionType(value, type) {
       if (!value || !value.code) return;
       for (const [key, name] of names) {
@@ -5898,11 +6600,8 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
         }))));
       }
       for (const [key, name] of names) {
-        if (initiallyDeclared.has(key) || !new RegExp(`\\b${name}\\b`).test(text)) continue;
         const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const catchPattern = new RegExp(`catch\\s*\\([^)]*\\b${escaped}\\s*\\)`);
-        const catchMatch = catchPattern.exec(text);
-        if (catchMatch && !new RegExp(`\\b${escaped}\\b`).test(text.slice(0, catchMatch.index))) continue;
+        if (initiallyDeclared.has(key) || !new RegExp(`\\b${escaped}\\b`).test(text)) continue;
         const hasDeclaration = (lines || []).some((line) =>
           localDeclarationsFromStatement(line).some((item) => item.name === name));
         if (!hasDeclaration) {
@@ -6004,24 +6703,27 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       syntheticCounter += 1;
       return name;
     },
+    requireRenderedType(type) {
+      requireRenderedTypeImport(renderOptions, type);
+    },
   };
 }
 
 function collectLocalVariableTable(code) {
-  const locals = new Map();
+  const locals = [];
   for (const attr of (code && code.attributes) || []) {
     if (attr.type !== 'localvariabletable') continue;
     for (const variable of attr.vars || []) {
       const index = Number(variable.index);
-      if (!Number.isFinite(index) || locals.has(index)) continue;
-      locals.set(index, {
+      if (!Number.isFinite(index)) continue;
+      locals.push({
         index,
         name: variable.name,
         descriptor: variable.descriptor,
       });
     }
   }
-  return Array.from(locals.values());
+  return locals;
 }
 
 function sanitizeJavaIdentifier(name, fallback) {
@@ -6105,11 +6807,24 @@ function parseMultiANewArrayInstruction(instruction) {
   };
 }
 
-function formatStaticField(ref, currentInternalClassName) {
+function formatStaticField(ref, localState = null) {
   const fieldName = sourceFieldName(ref.owner, ref.name);
-  if (ref.owner === currentInternalClassName) return fieldName;
-  const owner = javaTypeFromInternalName(ref.owner);
+  const currentOwner = localState && localState.currentInternalClassName;
+  const classNameCollision = currentOwner && simpleClassName(currentOwner) === fieldName;
+  const localCollision = localState && localState.hasLocalName && localState.hasLocalName(fieldName);
+  if (ref.owner === currentOwner && !classNameCollision && !localCollision) return fieldName;
+  const owner = sourceOwnerType(ref.owner, localState);
   return `${owner}.${fieldName}`;
+}
+
+function sourceOwnerType(internalName, localState = null) {
+  const aliases = localState && localState.staticOwnerAliases;
+  return javaTypeFromInternalName(aliases && aliases.get(internalName) || internalName);
+}
+
+function renderArrayReceiver(value) {
+  const rendered = wrap(value, 100);
+  return /^new\s/.test(rendered) ? `(${rendered})` : rendered;
 }
 
 function sourceFieldName(owner, name) {
@@ -6131,14 +6846,14 @@ function constantExpression(value, op) {
     if (value.type === 'Double') return expr(formatDouble(value.value), 'double');
     if (value.type === 'Long') return expr(`${String(value.value)}L`, 'long');
     if (value.type === 'Class') return expr(`${javaTypeFromInternalName(value.value)}.class`, 'Class');
-    if (value.type === 'String') return expr(formatStringLiteral(value.value), 'String');
+    if (value.type === 'String') return expr(formatStringLiteral(value.value), 'String', 100, { constantKind: 'String' });
   }
   if (op === 'ldc2_w' && typeof value === 'string') {
     const numeric = String(unquoteJavaStringLiteral(value));
     if (/^[+-]?\d+$/.test(numeric)) return expr(`${numeric}L`, 'long');
     if (/^[+-]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(numeric)) return expr(formatDouble(numeric), 'double');
   }
-  if (typeof value === 'string') return expr(formatStringLiteral(unquoteJavaStringLiteral(value)), 'String');
+  if (typeof value === 'string') return expr(formatStringLiteral(unquoteJavaStringLiteral(value)), 'String', 100, { constantKind: 'String' });
   if (typeof value === 'bigint') return expr(`${String(value)}L`, 'long');
   if (typeof value === 'number') return expr(String(value), op === 'ldc2_w' ? 'double' : 'int', 100,
     op === 'ldc2_w' ? {} : { constantValue: value });
@@ -6297,7 +7012,8 @@ function renderStoreExpression(value) {
   for (let i = 0; i < literal.length; i += 1) {
     const element = literal.elements.get(i);
     if (!element) return value;
-    elements.push(coerceExpressionForType(element, literal.elementType).code);
+    const renderedElement = renderStoreExpression(element);
+    elements.push(coerceExpressionForType(renderedElement, literal.elementType).code);
   }
   return expr(`new ${literal.elementType}[]{${elements.join(', ')}}`, `${literal.elementType}[]`);
 }
@@ -6462,6 +7178,13 @@ function descriptorToJavaType(descriptor) {
 function simplifyType(type) {
   if (!type) return 'Object';
   const raw = String(type);
+  const nestedJreTypes = {
+    'MethodHandles$Lookup': 'java.lang.invoke.MethodHandles.Lookup',
+    'MethodHandles.Lookup': 'java.lang.invoke.MethodHandles.Lookup',
+    'DataLine$Info': 'javax.sound.sampled.DataLine.Info',
+    'DataLine.Info': 'javax.sound.sampled.DataLine.Info',
+  };
+  if (nestedJreTypes[raw]) return nestedJreTypes[raw];
   const text = /^(?:java|javax)\./.test(raw) ? raw.replace(/\$/g, '.') : raw;
   const arraySuffix = (text.match(/(?:\[\])+$/) || [''])[0];
   const component = arraySuffix ? text.slice(0, -arraySuffix.length) : text;

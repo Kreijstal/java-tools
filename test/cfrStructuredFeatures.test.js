@@ -55,6 +55,18 @@ L49:
     .end code
 .end method
 
+.method public static literalTrue : ()I
+    .code stack 2 locals 0
+Lliteral0: bipush 51
+Lliteral1: bipush 49
+Lliteral2: if_icmplt LliteralElse
+Lliteral3: bipush 7
+Lliteral4: ireturn
+LliteralElse: bipush 9
+LliteralElseReturn: ireturn
+    .end code
+.end method
+
 .method public sumDown : (I)I
     .code stack 2 locals 3
 L60: iconst_0
@@ -259,7 +271,7 @@ function decompileStructuredFeatureFixture(tempDir) {
 }
 
 test('CFR-JS reconstructs structured if, if/else, while, arrays, comparisons, and casts', (t) => {
-  t.plan(12);
+  t.plan(14);
   withTempDir('cfr-structured-', (tempDir) => {
     const source = decompileStructuredFeatureFixture(tempDir);
 
@@ -267,6 +279,8 @@ test('CFR-JS reconstructs structured if, if/else, while, arrays, comparisons, an
     t.notOk(/^\s*\/\/\s*(if|goto|tableswitch|lookupswitch)\b/m.test(source), 'supported structured features do not fall back to raw control-flow comments');
     t.match(source, /public int abs\(int value\) \{\s*if \(value < 0\) \{\s*return -value;\s*}\s*return value;\s*}/, 'simple if-return is structured');
     t.match(source, /public static void printChoice\(boolean flag\) \{\s*if \(flag\) \{\s*System\.out\.print\("yes"\);\s*} else \{\s*System\.out\.print\("no"\);\s*}\s*}/, 'if/else print branch is structured');
+    t.match(source, /public static int literalTrue\(\) \{\s*return 7;\s*}/, 'a true literal comparison emits its selected body directly');
+    t.notOk(/51\s*>=\s*49|return 9;/.test(source), 'the constant condition and dead else body are omitted');
     t.match(source, /public int sumDown\(int n\) \{\s*int sum = 0;\s*while \(n > 0\) \{\s*sum = sum \+ n;\s*n--;\s*}\s*return sum;\s*}/, 'while loop with iinc is structured');
     t.match(source, /public int\[\] makeArray\(\) \{\s*int\[\] values = new int\[\]\{1, 2, 3\};\s*return values;\s*}/, 'primitive array literal stores are condensed');
     t.match(source, /public boolean greater\(long left, long right\) \{\s*return left > right;\s*}/, 'lcmp boolean return is reconstructed');

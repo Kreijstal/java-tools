@@ -793,6 +793,51 @@ function convertJson(inputJson, constantPool) {
     },
   });
 
+  const decodeAnnotationElement = (element) => {
+    if (!element) return null;
+    const tag = typeof element.tag === "number" ? String.fromCharCode(element.tag) : element.tag;
+    if ("BCDFIJSZs".includes(tag)) {
+      const resolved = resolveConstant(element.value && element.value.const_value_index, constantPool).value;
+      if (tag === "Z") return Boolean(resolved);
+      if (tag === "C") return { kind: "char", value: Number(resolved) };
+      return resolved;
+    }
+    if (tag === "e") {
+      return {
+        kind: "enum",
+        type: resolveConstant(element.value.type_name_index, constantPool).value,
+        name: resolveConstant(element.value.const_name_index, constantPool).value,
+      };
+    }
+    if (tag === "c") {
+      return { kind: "class", descriptor: resolveConstant(element.value.class_info_index, constantPool).value };
+    }
+    if (tag === "@") return decodeAnnotation(element.value.annotation_value || element.value);
+    if (tag === "[") {
+      return ((element.value && element.value.values) || []).map(decodeAnnotationElement);
+    }
+    return null;
+  };
+  const decodeAnnotation = (annotation) => ({
+    kind: "annotation",
+    descriptor: resolveConstant(annotation.type_index, constantPool).value,
+    elements: Object.fromEntries((annotation.element_value_pairs || []).map((pair) => [
+      resolveConstant(pair.element_name_index, constantPool).value,
+      decodeAnnotationElement(pair.value),
+    ])),
+  });
+  outputJson.classes[0].annotations = [];
+  for (const attribute of inputJson.attributes || []) {
+    const name = attributeName(attribute);
+    if (name !== "RuntimeVisibleAnnotations" && name !== "RuntimeInvisibleAnnotations") continue;
+    for (const annotation of (attribute.info && attribute.info.annotations) || []) {
+      outputJson.classes[0].annotations.push({
+        ...decodeAnnotation(annotation),
+        visible: name === "RuntimeVisibleAnnotations",
+      });
+    }
+  }
+
   const bootstrapMethodsAttr = inputJson.attributes.find(
     (attr) =>
       resolveConstant(attr.attribute_name_index.index, constantPool).value ===

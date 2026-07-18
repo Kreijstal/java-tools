@@ -303,7 +303,9 @@ function intCompatibleInvokeDescriptor(descriptor) {
 }
 
 function escapeJasminStringLiteral(value) {
-  return JSON.stringify(value === undefined || value === null ? '' : String(value));
+  return JSON.stringify(value === undefined || value === null ? '' : String(value))
+    .split('\\b').join('\\u0008')
+    .split('\\f').join('\\u000c');
 }
 
 function literalLoadInstruction(value) {
@@ -983,6 +985,9 @@ function classAttributesForIr(classIr, sourceFile) {
 function memberAttributesForIr(member) {
   const attributes = [];
   if (member.meta && member.meta.signature) attributes.push({ type: 'Signature', value: member.meta.signature });
+  if (member.meta && Array.isArray(member.meta.exceptions) && member.meta.exceptions.length) {
+    attributes.push({ type: 'exceptions', exceptions: member.meta.exceptions.slice() });
+  }
   if (member.meta && Array.isArray(member.meta.annotations) && member.meta.annotations.length) {
     attributes.push({ type: 'RuntimeVisibleAnnotations', annotations: member.meta.annotations });
   }
@@ -1194,11 +1199,11 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       instructions.push(createJvmInstruction('nop', [], { label: endLabel }));
     } else if (op.op === 'switch') {
       const endLabel = `Lswitch_end_${state.nextLabel++}`;
+      const previousBreakLabel = op.label ? state.labeledBreakLabels.get(op.label) : undefined;
+      if (op.label) state.labeledBreakLabels.set(op.label, endLabel);
       const defaultGroup = (op.groups || []).find((group) => group.isDefault);
       const groupLabels = (op.groups || []).map(() => `Lswitch_case_${state.nextLabel++}`);
       const defaultLabel = defaultGroup ? groupLabels[(op.groups || []).indexOf(defaultGroup)] : endLabel;
-      const previousBreakLabel = op.label ? state.labeledBreakLabels.get(op.label) : undefined;
-      if (op.label) state.labeledBreakLabels.set(op.label, endLabel);
       for (let groupIndex = 0; groupIndex < (op.groups || []).length; groupIndex += 1) {
         const group = op.groups[groupIndex];
         for (const caseValue of group.caseValues || []) {
