@@ -78,6 +78,31 @@ test('splitting the region removes the irreducibility', () => {
   assert.ok(items.some((it) => it.labelDef === `${startJump.arg}:`));
 });
 
+test('redirects switch predecessors when splitting a secondary loop entry', () => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: 'iload_0' },
+    { instruction: { op: 'ifeq', arg: 'LSW' } },
+    { labelDef: 'LA:', instruction: 'iload_0' },
+    { instruction: { op: 'ifeq', arg: 'LB' } },
+    { instruction: 'return' },
+    { labelDef: 'LB:', instruction: 'iload_0' },
+    { instruction: { op: 'ifeq', arg: 'LA' } },
+    { instruction: 'return' },
+    { labelDef: 'LSW:', instruction: 'iload_0' },
+    { instruction: { op: 'lookupswitch', arg: { pairs: [[0, 'LB']], defaultLabel: 'LEXIT' } } },
+    { labelDef: 'LEXIT:', instruction: 'return' },
+  ]);
+
+  const candidate = listRegionSplitCandidates(ast)[0];
+  assert.ok(candidate);
+  assert.deepEqual(candidate.secondaryLabels, ['LB']);
+  const result = applyRegionSplit(ast, candidate);
+  assert.equal(result.changed, true);
+  const switchInstruction = codeItems(ast)[9].instruction;
+  assert.notEqual(switchInstruction.arg.pairs[0][1], 'LB');
+  assert.match(switchInstruction.arg.pairs[0][1], /^L98\d+$/);
+});
+
 test('refuses a region that overlaps an exception range', () => {
   const items = irreducibleLoop();
   // Cover the loop body with a try range: cloning to method end would drop it

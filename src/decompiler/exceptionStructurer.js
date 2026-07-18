@@ -944,9 +944,15 @@ function processGroup(work, group, ctx, commit) {
   // that provably cannot throw preserves exception behavior exactly.
   let hasMidTryEntry = false;
   for (let block = 0; block < n && !hasMidTryEntry; block++) {
-    if (!reachable[block] || tryset.has(block)) continue;
+    // A catch handler can fall into a later protected range that belongs to the
+    // same normalized logical group.  That is handler continuation, not an
+    // obfuscated second entry into the try body, and must not move the try start.
+    if (!reachable[block] || tryset.has(block) || reachableFromCurrentHandlers[block]) continue;
     for (const target of succOfTerm(work.term[block])) {
-      if (target != null && tryset.has(target) && target !== tryEntry) { hasMidTryEntry = true; break; }
+      if (target != null && tryset.has(target) && target !== tryEntry) {
+        hasMidTryEntry = true;
+        break;
+      }
     }
   }
   const throwingTryBlocks = hasMidTryEntry

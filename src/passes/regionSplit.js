@@ -488,12 +488,38 @@ function findLabelIndex(codeItems, label) {
 function retargetJump(instruction, fromLabel, toLabel) {
   if (!instruction || typeof instruction !== 'object') return false;
   const op = getOp(instruction);
-  if (op !== 'goto' && !CONDITIONAL_JUMPS.has(op)) return false;
-  if (typeof instruction.arg === 'string' && trimLabel(instruction.arg) === trimLabel(fromLabel)) {
-    instruction.arg = toLabel;
-    return true;
+  const from = trimLabel(fromLabel);
+  let changed = false;
+  if (op === 'goto' || op === 'jsr' || CONDITIONAL_JUMPS.has(op)) {
+    if (typeof instruction.arg === 'string' && trimLabel(instruction.arg) === from) {
+      instruction.arg = toLabel;
+      changed = true;
+    }
+  } else if (op === 'tableswitch') {
+    if (Array.isArray(instruction.labels)) {
+      instruction.labels = instruction.labels.map((label) => {
+        if (trimLabel(label) !== from) return label;
+        changed = true;
+        return toLabel;
+      });
+    }
+    if (typeof instruction.defaultLbl === 'string' && trimLabel(instruction.defaultLbl) === from) {
+      instruction.defaultLbl = toLabel;
+      changed = true;
+    }
+  } else if (op === 'lookupswitch' && instruction.arg && typeof instruction.arg === 'object') {
+    for (const pair of (instruction.arg.pairs || [])) {
+      if (Array.isArray(pair) && typeof pair[1] === 'string' && trimLabel(pair[1]) === from) {
+        pair[1] = toLabel;
+        changed = true;
+      }
+    }
+    if (typeof instruction.arg.defaultLabel === 'string' && trimLabel(instruction.arg.defaultLabel) === from) {
+      instruction.arg.defaultLabel = toLabel;
+      changed = true;
+    }
   }
-  return false;
+  return changed;
 }
 
 function deepCloneInstruction(instruction) {

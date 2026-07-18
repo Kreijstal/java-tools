@@ -7,6 +7,17 @@ const test = require('tape');
 const { assembleJasminSource } = require('../src/utils/jasminAssembly');
 const { decompileClassFile, _internals: cfrInternals } = require('../src/decompiler/cfr');
 
+test('rendered type imports omit fully qualified nested-type collisions', (t) => {
+  const requiredImports = new Set();
+  const options = { requiredImports };
+  cfrInternals.requireRenderedTypeImport(options, 'javax.sound.sampled.DataLine.Info');
+  cfrInternals.requireRenderedTypeImport(options, 'javax.sound.sampled.Mixer.Info');
+  cfrInternals.requireRenderedTypeImport(options, 'java.util.List');
+  t.deepEqual([...requiredImports], ['java.util.List'],
+    'only a type rendered by simple name requires an import');
+  t.end();
+});
+
 const ADDITIONAL_FEATURES_JASMIN = `.version 52 0
 .class public super org/benf/cfr/tests/AdditionalFeatureTest
 .super java/lang/Object
@@ -845,11 +856,28 @@ test('checked catches are removed only after source structuring proves them unre
     '    value = 2;',
     '}',
   ];
+  const castReceiver = [
+    'try {',
+    '    ((Thread) holder.value).join();',
+    '} catch (InterruptedException ignored) {',
+    '}',
+  ];
+  const castReceiverCode = {
+    codeItems: [{
+      pc: 97,
+      instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/Thread', ['join', '()V']] },
+    }],
+    exceptionTable: [{
+      start_pc: 87, end_pc: 100, handler_pc: 103,
+      catch_type: 'java/lang/InterruptedException',
+    }],
+  };
 
   cfrInternals.removeImpossibleCheckedCatchBlocks(localOnly);
   cfrInternals.removeImpossibleCheckedCatchBlocks(calling);
   cfrInternals.removeImpossibleCheckedCatchBlocks(declaredReflectionCall);
   cfrInternals.removeImpossibleCheckedCatchBlocks(unchecked);
+  cfrInternals.removeImpossibleCheckedCatchBlocks(castReceiver, undefined, castReceiverCode);
   t.deepEqual(localOnly, ['{', '    int value = 1;', '}'],
     'an impossible checked catch becomes a scoped plain block');
   t.notOk(/catch \(IOException ignored\)/.test(calling.join('\n')),
@@ -858,6 +886,8 @@ test('checked catches are removed only after source structuring proves them unre
     'a call with a matching checked throws declaration keeps its catch');
   t.match(unchecked.join('\n'), /catch \(RuntimeException ignored\)/,
     'unchecked catches remain conservative around VM instructions');
+  t.match(castReceiver.join('\n'), /catch \(InterruptedException ignored\)/,
+    'a protected cast-receiver call retains its declared checked catch');
   if (previous === undefined) delete process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE;
   else process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE = previous;
   t.end();

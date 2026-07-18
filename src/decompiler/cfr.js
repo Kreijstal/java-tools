@@ -495,7 +495,15 @@ function requireRenderedTypeImport(options, type) {
   // remains a legal top-level source identifier, not a member type that can be
   // imported through `Outer.Inner`.
   if (elementType.includes('$')) return;
-  if (elementType.includes('.')) options.requiredImports.add(elementType);
+  if (!elementType.includes('.')) return;
+  // Import only when simplifyType actually renders the type by its simple name.
+  // Nested javax types such as DataLine.Info and Mixer.Info remain fully
+  // qualified in declarations; importing both merely creates an Info/Info
+  // collision without shortening either reference.
+  const renderedType = simplifyType(elementType);
+  if (!renderedType.includes('.') && !elementType.startsWith('java.lang.')) {
+    options.requiredImports.add(elementType);
+  }
 }
 
 function qualifiedReferenceTypeFromDescriptor(descriptor) {
@@ -1043,7 +1051,7 @@ function formatMethod(cls, method, options = {}) {
   if (process.env.CFR_JS_DEBUG_LOCALS === '1') {
     console.error('[cfr-body-before-locals]', JSON.stringify(body));
   }
-  removeImpossibleCheckedCatchBlocks(body, options.exceptionModel);
+  removeImpossibleCheckedCatchBlocks(body, options.exceptionModel, code);
   ensureCheckedCatchReachability(body, code, options.exceptionModel);
   const constructorInvocation = method.name === '<init>'
     ? localState.takeConstructorInvocation()
@@ -2044,7 +2052,34 @@ function throwsTypesCoverSourceCatch(throwsTypes, catchSourceType, model) {
 // emitted source less structured. Under this explicitly gated source-cleanup
 // policy, a specific checked catch is live only when an emitted call declares
 // that type. Broad unchecked/Throwable families remain conservative.
-function removeImpossibleCheckedCatchBlocks(lines, model) {
+function protectedBytecodeRangeHasDeclaredThrower(code, catchSourceType, model) {
+  if (!code || !(code.exceptionTable || []).length) return false;
+  const catchSimpleName = simpleClassName(String(catchSourceType || '').replace(/\./g, '/'));
+  for (const entry of code.exceptionTable || []) {
+    const entryType = entry.catch_type ?? entry.catchType;
+    if (!entryType || entryType === 'any' || entryType === 0
+      || simpleClassName(String(entryType).replace(/\./g, '/')) !== catchSimpleName) continue;
+    for (const item of code.codeItems || []) {
+      const pc = Number(item && item.pc);
+      if (!Number.isFinite(pc) || pc < entry.start_pc || pc >= entry.end_pc) continue;
+      const instruction = getInstructionFromItem(item);
+      if (!instruction) continue;
+      if (instruction.op === 'new' && typeof instruction.arg === 'string'
+        && throwsTypesCoverSourceCatch([instruction.arg], catchSourceType, model)) return true;
+      if (!INVOKE_OPS.has(instruction.op)) continue;
+      let ref;
+      try { ref = parseMemberRef(instruction.arg); } catch (_error) { continue; }
+      if (throwsTypesCoverSourceCatch(
+        resolveMethodThrows(ref.owner, ref.name, ref.descriptor, model),
+        catchSourceType,
+        model,
+      )) return true;
+    }
+  }
+  return false;
+}
+
+function removeImpossibleCheckedCatchBlocks(lines, model, code = null) {
   if (process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE !== '1') return;
   for (let tryIndex = lines.length - 1; tryIndex >= 0; tryIndex -= 1) {
     if (String(lines[tryIndex]).trim() !== 'try {') continue;
@@ -2053,6 +2088,7 @@ function removeImpossibleCheckedCatchBlocks(lines, model) {
     const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
     if (!declaration || !isCheckedOnlyCatchSourceType(declaration.type, model)) continue;
     if (sourceRangeHasDeclaredThrower(lines, tryIndex + 1, catchIndex, declaration.type, model)) continue;
+    if (protectedBytecodeRangeHasDeclaredThrower(code, declaration.type, model)) continue;
 
     let depth = 1;
     let catchEnd = -1;
@@ -7335,6 +7371,7 @@ module.exports = {
     isCheckedThrow,
     isSourceReferenceTypeAssignable,
     removeImpossibleCheckedCatchBlocks,
+    requireRenderedTypeImport,
     simplifyBitwiseComplementComparison,
   },
 };

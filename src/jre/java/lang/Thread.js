@@ -129,7 +129,7 @@ module.exports = {
       
       return ASYNC_METHOD_SENTINEL;
     },
-    'join()V': (jvm, obj, args, thread) => {
+    'join()V': withThrows((jvm, obj, args, thread) => {
       const threadToJoin = obj.nativeThread;
       if (!threadToJoin || threadToJoin.status === 'terminated') {
         return;
@@ -137,7 +137,7 @@ module.exports = {
 
       thread.status = 'JOINING';
       thread.joiningOn = threadToJoin;
-    },
+    }, ['java/lang/InterruptedException']),
     'sleep(J)V': withThrows((jvm, obj, args, thread) => {
       const time = args[0];
       thread.status = 'SLEEPING';

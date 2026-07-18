@@ -85,6 +85,47 @@ test('same handler rows structure as one Java multi-catch', () => {
   assert.match(src, /catch \(java\.io\.IOException \| java\.sql\.SQLException \w+\)/);
 });
 
+test('handler continuation inside a later protected range does not move the try entry', () => {
+  const invoke = (pc, name) => ({ pc, instruction: { op: 'invokevirtual', arg: ['Method', 'X', [name, '()V']] } });
+  const code = [
+    { labelDef: 'L0:', pc: 0, instruction: { op: 'goto', arg: 'L5' } },
+    { labelDef: 'L5:', pc: 5, instruction: 'iload_0' },
+    { pc: 6, instruction: { op: 'ifeq', arg: 'L29' } },
+    { labelDef: 'L11:', pc: 11, instruction: 'aload_0' },
+    invoke(12, 'a'),
+    { pc: 15, instruction: { op: 'goto', arg: 'L29' } },
+    { labelDef: 'L29:', pc: 29, instruction: 'aload_0' },
+    invoke(30, 'b'),
+    { pc: 33, instruction: { op: 'goto', arg: 'L152' } },
+    { labelDef: 'L151:', pc: 151, instruction: 'nop' },
+    { labelDef: 'L152:', pc: 152, instruction: 'nop' },
+    { pc: 155, instruction: { op: 'goto', arg: 'L170' } },
+    { labelDef: 'L158:', pc: 158, instruction: 'nop' },
+    { labelDef: 'L159:', pc: 159, instruction: 'astore_1' },
+    { labelDef: 'L160:', pc: 160, instruction: 'aload_0' },
+    invoke(161, 'c'),
+    { labelDef: 'L170:', pc: 170, instruction: { op: 'goto', arg: 'L180' } },
+    { labelDef: 'L171:', pc: 171, instruction: 'aload_0' },
+    invoke(172, 'd'),
+    { labelDef: 'L178:', pc: 178, instruction: { op: 'goto', arg: 'L180' } },
+    { labelDef: 'L179:', pc: 179, instruction: 'astore_2' },
+    { labelDef: 'L180:', pc: 180, instruction: 'return' },
+  ];
+  const et = [
+    { start_pc: 5, end_pc: 151, handler_pc: 159, catch_type: 'java/lang/Throwable' },
+    { start_pc: 152, end_pc: 158, handler_pc: 159, catch_type: 'java/lang/Throwable' },
+    { start_pc: 5, end_pc: 151, handler_pc: 179, catch_type: 'java/lang/RuntimeException' },
+    { start_pc: 152, end_pc: 170, handler_pc: 179, catch_type: 'java/lang/RuntimeException' },
+    { start_pc: 171, end_pc: 178, handler_pc: 179, catch_type: 'java/lang/RuntimeException' },
+  ];
+
+  const { ok, src, r } = run(code, et);
+  assert.ok(ok, r.reason || 'overlapping logical handlers should structure');
+  assertGotoFree(src);
+  assert.match(src, /catch \(java\.lang\.Throwable/);
+  assert.match(src, /catch \(java\.lang\.RuntimeException/);
+});
+
 // ---------------------------------------------------------------------------
 // (c) A catch-all clause (catch_type 0) renders as java.lang.Throwable.
 // ---------------------------------------------------------------------------
