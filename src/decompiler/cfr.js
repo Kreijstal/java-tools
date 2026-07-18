@@ -2694,7 +2694,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const raw1 = pop(stack);
       const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
       const value1 = materializeDuplicatedValue(raw1, lines, localState);
-      stack.push({ ...value1 }, value2, value1);
+      stack.push(duplicateStackExpression(value1), value2, value1);
       continue;
     }
     if (op === 'dup_x2') {
@@ -2896,7 +2896,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'putstatic') {
       const ref = parseMemberRef(instruction.arg);
-      const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
+      const rawValue = pop(stack);
+      if (stack.includes(rawValue) && rawValue.newArraySpill && /^new\b/.test(rawValue.code)) {
+        materializeNewArraySpill(rawValue, lines, localState);
+      }
+      const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
       // A live stack value that reads this same field (e.g. the old value dup_x1'd
       // below the store target in a post-increment `f[x++]=v` idiom) would re-read
       // the *mutated* field after this assignment. Spill such reads to a temp first.
@@ -2914,7 +2918,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'putfield') {
       const ref = parseMemberRef(instruction.arg);
-      const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
+      const rawValue = pop(stack);
+      if (stack.includes(rawValue) && rawValue.newArraySpill && /^new\b/.test(rawValue.code)) {
+        materializeNewArraySpill(rawValue, lines, localState);
+      }
+      const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
       const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
       // Spill any live stack value that reads this field before mutating it, so a
       // post-increment index (`this.r[this.n++] = v`) keeps its pre-increment value.
@@ -5982,7 +5990,7 @@ function materializeDuplicatedValue(value, lines, localState) {
 // same expression object; a shallow clone shares the element map but not later
 // code/spill updates, which can emit a second allocation for one JVM value.
 function duplicateStackExpression(value) {
-  if (value && (value.newArraySpill || value.arrayLiteral)) return value;
+  if (!value || value.newArraySpill || value.arrayLiteral) return value;
   return { ...value };
 }
 
