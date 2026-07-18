@@ -17,6 +17,10 @@ function fractionDigits(pattern) {
 module.exports = {
   super: 'java/text/NumberFormat',
   staticFields: {},
+  staticMethods: {
+    'getInstance()Ljava/text/NumberFormat;': () => ({ type: 'java/text/NumberFormat' }),
+    'getInstance(Ljava/util/Locale;)Ljava/text/NumberFormat;': () => ({ type: 'java/text/NumberFormat' }),
+  },
   methods: {
     '<init>()V': (jvm, obj) => { obj.pattern = ''; },
     '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {

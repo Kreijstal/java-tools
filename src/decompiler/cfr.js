@@ -491,12 +491,16 @@ function enumClinitIsOnlyCompilerScaffolding(cls, enumConstants) {
 function requireRenderedTypeImport(options, type) {
   if (!options || !options.requiredImports || typeof type !== 'string') return;
   const elementType = type.replace(/\[\]$/g, '');
+  // CFR-JS emits one classfile per source file. A binary `$` name therefore
+  // remains a legal top-level source identifier, not a member type that can be
+  // imported through `Outer.Inner`.
+  if (elementType.includes('$')) return;
   if (elementType.includes('.')) options.requiredImports.add(elementType);
 }
 
 function qualifiedReferenceTypeFromDescriptor(descriptor) {
   const match = /^\[*L([^;]+);$/.exec(String(descriptor || ''));
-  return match ? match[1].replace(/\//g, '.').replace(/\$/g, '.') : null;
+  return match ? match[1].replace(/\//g, '.') : null;
 }
 
 function packageNameFromInternalName(name) {
@@ -559,10 +563,20 @@ function shouldSkipField(cls, field) {
 
 function shouldSkipMethod(cls, method) {
   const flags = method.flags || [];
+  // A previous CFR-JS pass may already have materialized its checked-exception
+  // escape helper. Calls remain and cause the canonical source helper to be
+  // emitted once; retaining this method duplicates the Java signature.
+  if (method.name === '$cfr$sneakyThrow'
+    && method.descriptor === '(Ljava/lang/Throwable;)Ljava/lang/RuntimeException;'
+    && flags.includes('static')) return true;
   const sourceRequiredSynthetic = flags.includes('synthetic')
     && (/^lambda\$/.test(String(method.name || '')) || /^access\$\d+$/.test(String(method.name || '')));
   if ((flags.includes('synthetic') && !sourceRequiredSynthetic) || flags.includes('bridge')) return true;
-  if ((cls.flags || []).includes('enum')) {
+  if (isSourceEnumClass(cls)) {
+    // Enum constants are reconstructed from this initializer before methods
+    // are rendered; emitting javac's backing assignments again produces an
+    // invalid duplicate static block.
+    if (method.name === '<clinit>') return true;
     if (method.name === '<init>' && isTrivialEnumConstructor(method)) return true;
     if (method.name === 'values' || method.name === 'valueOf' || method.name === '$values') return true;
   }
@@ -585,7 +599,7 @@ function formatEnumConstants(cls, constants, options) {
   if (!clinit) return constants.map((item) => item.field.name);
   const code = getCode(clinit.method);
   if (!code) return constants.map((item) => item.field.name);
-  const state = makeLocalState([], true, code, null, options);
+  const state = makeLocalState([], true, code, null, options.exceptionModel, options);
   const rendered = formatStaticInitializer(code, state, cls, options);
   const className = simpleClassName(cls.className || 'Enum');
   return constants.map((item) => {
@@ -611,7 +625,8 @@ function extractInterfaceFieldInitializers(cls, options) {
   if (!clinit) return result;
   const code = getCode(clinit.method);
   if (!code) return result;
-  const rendered = formatStaticInitializer(code, makeLocalState([], true, code, null, options), cls, options);
+  const rendered = formatStaticInitializer(code,
+    makeLocalState([], true, code, null, options.exceptionModel, options), cls, options);
   const body = rendered.split('\n')
     .map((line) => line.trim())
     .filter((line) => line && line !== 'static {' && line !== '}');
@@ -948,7 +963,8 @@ function formatMethod(cls, method, options = {}) {
   const params = descriptor.params || [];
   const returnType = descriptor.returnType || 'void';
   const code = getCode(method);
-  let localState = makeLocalState(params.map(simplifyType), isStatic, code, null, options.exceptionModel);
+  let localState = makeLocalState(params.map(simplifyType), isStatic, code, null,
+    options.exceptionModel, options);
 
   if ((cls.flags || []).includes('enum') && method.name === '<init>') {
     return formatEnumConstructor(cls, method, params, localState, options);
@@ -1015,7 +1031,7 @@ function formatMethod(cls, method, options = {}) {
     if (!conflictSlots.length) break;
     conflictSlots.forEach((slotIndex) => collapsedSlots.add(slotIndex));
     const retryState = makeLocalState(params.map(simplifyType), isStatic, code, new Set(collapsedSlots),
-      options.exceptionModel);
+      options.exceptionModel, options);
     if (Array.isArray(options.diagnostics)) options.diagnostics.length = diagnosticsMark;
     const retryBody = decompileCode(code, method, cls, retryState, options);
     if (!retryBody) break;
@@ -1041,7 +1057,7 @@ function formatMethod(cls, method, options = {}) {
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   const refinedBody = refineObjectLocalDeclarations(body, (name) => localState.refinedTypeForName(name));
   const normalizedBody = normalizeSyntheticVariableScopes(refinedBody);
-  body.splice(0, body.length, ...normalizedBody);
+  replaceArrayContents(body, normalizedBody);
   ensureMissingSyntheticDeclarations(body);
   widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
@@ -1414,7 +1430,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   const body = code ? decompileCode(code, { name: '<clinit>', descriptor: '()V', flags: ['static'] }, cls, localState, options) : [];
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
-  body.splice(0, body.length, ...normalizeSyntheticVariableScopes(body));
+  replaceArrayContents(body, normalizeSyntheticVariableScopes(body));
   assertNoFallback(body, { className: cls.className, methodName: '<clinit>', descriptor: '()V' });
   if (!body.length) return formatBlock('static', body);
 
@@ -1709,7 +1725,11 @@ function decompileCode(code, method, cls, localState, options = {}) {
 }
 
 function usableDecompileLines(lines) {
-  if (!Array.isArray(lines) || lines.some((line) => String(line).includes('stack-underflow'))) return false;
+  // An empty structured candidate is not evidence that a non-empty bytecode
+  // body was handled.  Let selection continue to the linear emitter; genuinely
+  // empty methods still end there as an empty Java block.
+  if (!Array.isArray(lines) || lines.length === 0
+    || lines.some((line) => String(line).includes('stack-underflow'))) return false;
   // Reject any candidate that dropped an opcode to a bytecode-as-comment or a
   // placeholder. An earlier structurer (e.g. the legacy pattern-matcher
   // `decompileStructuredControlFlow`) that bails on a goto still returns lines with
@@ -3362,6 +3382,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         materializeNewArraySpill(value, lines, localState);
       }
       const renderedValue = renderStoreExpression(value);
+      localState.requireRenderedType(renderedValue.qualifiedType || renderedValue.type);
       lines.push(localState.store(storeIndex.index, storeIndex.type, renderedValue, codeItem.pc));
       continue;
     }
@@ -6272,7 +6293,8 @@ function computeObjectSlotReachability(code) {
   return { loads };
 }
 
-function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null, exceptionModel = null) {
+function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
+  exceptionModel = null, renderOptions = null) {
   const names = new Map();
   const types = new Map();
   const debugNames = new Map();
@@ -6994,8 +7016,12 @@ function expr(code, type = 'Object', precedence = 100, extra = {}) {
 
 function conditionalExpr(condition, trueValue, falseValue, type = null) {
   const resultType = simplifyType(type || mergeStackTypes(trueValue.type, falseValue.type));
+  const qualifiedType = trueValue.qualifiedType && trueValue.qualifiedType === falseValue.qualifiedType
+    ? trueValue.qualifiedType
+    : null;
   return expr(`${wrap(condition, 20)} ? ${trueValue.code} : ${falseValue.code}`, resultType, 20, {
     conditional: { condition, trueValue, falseValue },
+    ...(qualifiedType ? { qualifiedType } : {}),
   });
 }
 
@@ -7167,6 +7193,13 @@ function formatUnknownInstruction(instruction) {
 
 function filterFlags(flags, ignored) {
   return flags.filter((flag) => !ignored.has(flag));
+}
+
+function replaceArrayContents(target, values) {
+  if (target === values) return target;
+  target.length = 0;
+  for (const value of values || []) target.push(value);
+  return target;
 }
 
 function descriptorToJavaType(descriptor) {

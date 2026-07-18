@@ -12,6 +12,24 @@ module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
   staticMethods: {
+    'getProperties()Ljava/util/Properties;': (jvm) => {
+      return {
+        type: 'java/util/Properties',
+        properties: module.exports.staticFields.get('props'),
+        defaults: null,
+      };
+    },
+    'identityHashCode(Ljava/lang/Object;)I': (jvm, obj, args) => {
+      const value = args[0];
+      if (value === null || value === undefined) return 0;
+      if (!Object.prototype.hasOwnProperty.call(value, 'hashCode')) value.hashCode = jvm.nextHashCode++;
+      return value.hashCode;
+    },
+    'getenv(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const key = javaString(args[0]);
+      const value = typeof process !== 'undefined' && process.env ? process.env[key] : undefined;
+      return value === undefined ? null : jvm.internString(value);
+    },
     'setOut(Ljava/io/PrintStream;)V': (jvm, obj, args) => {
       const systemClass = jvm.classes['java/lang/System'];
       systemClass.staticFields.set('out:Ljava/io/PrintStream;', args[0]);

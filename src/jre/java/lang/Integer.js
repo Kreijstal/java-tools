@@ -92,6 +92,10 @@ module.exports = {
       
       return integerObj;
     },
+    'valueOf(Ljava/lang/String;)Ljava/lang/Integer;': withThrows((jvm, obj, args) => ({
+      type: 'java/lang/Integer',
+      value: parseJavaInt(args[0], 10),
+    }), ['java/lang/NumberFormatException']),
   },
   methods: {
     '<init>(I)V': (jvm, obj, args) => {

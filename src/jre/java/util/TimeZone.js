@@ -14,5 +14,7 @@ module.exports = {
       };
     },
   },
-  methods: {},
+  methods: {
+    'getID()Ljava/lang/String;': (jvm, obj) => jvm.internString(obj._zoneId || 'UTC'),
+  },
 };

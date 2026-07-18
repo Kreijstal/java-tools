@@ -923,7 +923,7 @@ test('narrow primitives and reference casts compile through IR', (t) => {
   t.ok(constructorOperands.some((operand) => operand.includes('ConstructorSmoke <init> (I)V')), 'this constructor delegation target is emitted');
   t.ok(constructorOperands.some((operand) => operand.includes('java/lang/Object <init> ()V')), 'implicit super constructor target is emitted');
   t.equal(switchResult.bytecodeIr.status, 'complete', 'switch smoke compiles completely');
-  t.ok(switchOpcodes.includes('if_icmpeq'), 'switch case dispatch branches are emitted');
+  t.ok(switchOpcodes.includes('lookupswitch'), 'switch case dispatch table is emitted');
   t.ok(switchOpcodes.includes('goto'), 'switch break/default branches are emitted');
   t.equal(unaryResult.bytecodeIr.status, 'complete', 'unary smoke compiles completely');
   t.ok(unaryOpcodes.includes('ifeq'), 'logical not branch is emitted');

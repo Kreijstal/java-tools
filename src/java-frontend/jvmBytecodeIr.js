@@ -538,22 +538,7 @@ function emitValue(value, state) {
     return { descriptor: 'Ljava/lang/String;', stack: 1 };
   }
   if (value.kind === 'ConditionalValue') {
-    if (!value.condition || !value.consequent || !value.alternate || value.consequent.type !== value.type || value.alternate.type !== value.type) {
-      return null;
-    }
-    const falseLabel = `Lcond_false_${state.nextLabel++}`;
-    const endLabel = `Lcond_end_${state.nextLabel++}`;
-    if (!emitFalseBranch(value.condition, falseLabel, state)) return null;
-    const consequent = emitValue(value.consequent, state);
-    if (!consequent || consequent.descriptor !== value.type) return null;
-    state.instructions.push(createJvmInstruction('goto', [endLabel]));
-    state.instructions.push(createJvmInstruction('nop', [], { label: falseLabel }));
-    const alternate = emitValue(value.alternate, state);
-    if (!alternate || alternate.descriptor !== value.type) return null;
-    state.instructions.push(createJvmInstruction('nop', [], { label: endLabel }));
-    const stack = slotWidthFromDescriptor(value.type);
-    state.maxStack = Math.max(state.maxStack, consequent.stack, alternate.stack, stack);
-    return { descriptor: value.type, stack };
+    return emitConditionalValue(value, state);
   }
   if (value.kind === 'AssignValue') {
     const local = state.locals.get(value.target);
@@ -905,6 +890,71 @@ function isLiteralTrue(value) {
     && value.value === true;
 }
 
+function constantIntValue(value) {
+  if (!value) return null;
+  if (value.kind === 'CastValue') return constantIntValue(value.value);
+  if (value.kind === 'LiteralValue') {
+    if (value.literalKind === 'char' && typeof value.value === 'string') {
+      return value.value.length ? value.value.codePointAt(0) : null;
+    }
+    const numeric = Number(value.value !== undefined ? value.value : value.raw);
+    return Number.isFinite(numeric) && Number.isInteger(numeric) ? numeric | 0 : null;
+  }
+  if (value.kind === 'UnaryValue') {
+    const operand = constantIntValue(value.value);
+    if (operand === null) return null;
+    if (value.operator === '+') return operand;
+    if (value.operator === '-') return (-operand) | 0;
+    if (value.operator === '~') return ~operand;
+    return null;
+  }
+  if (value.kind !== 'BinaryValue') return null;
+  const left = constantIntValue(value.left);
+  const right = constantIntValue(value.right);
+  if (left === null || right === null) return null;
+  switch (value.operator) {
+    case '+': return (left + right) | 0;
+    case '-': return (left - right) | 0;
+    case '*': return Math.imul(left, right);
+    case '/': return right === 0 ? null : (left / right) | 0;
+    case '%': return right === 0 ? null : (left % right) | 0;
+    case '<<': return left << right;
+    case '>>': return left >> right;
+    case '>>>': return left >>> right;
+    case '&': return left & right;
+    case '|': return left | right;
+    case '^': return left ^ right;
+    default: return null;
+  }
+}
+
+function emitConditionalBranchValue(value, endLabel, fallsThrough, state) {
+  if (value && value.kind === 'ConditionalValue') {
+    if (!value.condition || !value.consequent || !value.alternate
+        || value.consequent.type !== value.type || value.alternate.type !== value.type) return false;
+    const falseLabel = `Lcond_false_${state.nextLabel++}`;
+    if (!emitFalseBranch(value.condition, falseLabel, state)) return false;
+    if (!emitConditionalBranchValue(value.consequent, endLabel, false, state)) return false;
+    state.instructions.push(createJvmInstruction('nop', [], { label: falseLabel }));
+    return emitConditionalBranchValue(value.alternate, endLabel, fallsThrough, state);
+  }
+  const emitted = emitValue(value, state);
+  if (!emitted) return false;
+  if (!fallsThrough) state.instructions.push(createJvmInstruction('goto', [endLabel]));
+  return true;
+}
+
+function emitConditionalValue(value, state) {
+  if (!value.condition || !value.consequent || !value.alternate
+      || value.consequent.type !== value.type || value.alternate.type !== value.type) return null;
+  const endLabel = `Lcond_end_${state.nextLabel++}`;
+  if (!emitConditionalBranchValue(value, endLabel, true, state)) return null;
+  state.instructions.push(createJvmInstruction('nop', [], { label: endLabel }));
+  const stack = slotWidthFromDescriptor(value.type);
+  state.maxStack = Math.max(state.maxStack, stack);
+  return { descriptor: value.type, stack };
+}
+
 
 function defaultConstructorMethod(classIr) {
   const instructions = [
@@ -1027,6 +1077,7 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
     continueLabels: [],
     labeledBreakLabels: new Map(),
     labeledContinueLabels: new Map(),
+    monitorSlots: [],
     nextSyntheticSlot: maxLocalSlots(method),
     maxLocals: maxLocalSlots(method),
   };
@@ -1207,9 +1258,31 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       const defaultGroup = (op.groups || []).find((group) => group.isDefault);
       const groupLabels = (op.groups || []).map(() => `Lswitch_case_${state.nextLabel++}`);
       const defaultLabel = defaultGroup ? groupLabels[(op.groups || []).indexOf(defaultGroup)] : endLabel;
+      const constantCases = [];
+      let allCasesConstant = true;
       for (let groupIndex = 0; groupIndex < (op.groups || []).length; groupIndex += 1) {
-        const group = op.groups[groupIndex];
-        for (const caseValue of group.caseValues || []) {
+        for (const caseValue of op.groups[groupIndex].caseValues || []) {
+          const key = constantIntValue(caseValue);
+          if (key === null) allCasesConstant = false;
+          else constantCases.push([key, groupLabels[groupIndex]]);
+        }
+      }
+      if (allCasesConstant) {
+        const emittedSwitchValue = emitValue(op.value, state);
+        if (!emittedSwitchValue || emittedSwitchValue.descriptor !== 'I') {
+          unsupported.push(`unsupported switch value in ${method.name}`);
+          return;
+        }
+        constantCases.sort((left, right) => left[0] - right[0]);
+        instructions.push(createJvmInstruction('lookupswitch', [], {
+          pairs: constantCases,
+          defaultLabel,
+        }));
+        state.maxStack = Math.max(state.maxStack, emittedSwitchValue.stack, 1);
+      } else {
+        for (let groupIndex = 0; groupIndex < (op.groups || []).length; groupIndex += 1) {
+          const group = op.groups[groupIndex];
+          for (const caseValue of group.caseValues || []) {
           const emittedSwitchValue = emitValue(op.value, state);
           const emittedCaseValue = emitValue(caseValue, state);
           if (!emittedSwitchValue || !emittedCaseValue || emittedSwitchValue.descriptor !== 'I' || emittedCaseValue.descriptor !== 'I') {
@@ -1218,9 +1291,10 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
           }
           instructions.push(createJvmInstruction('if_icmpeq', [groupLabels[groupIndex]]));
           state.maxStack = Math.max(state.maxStack, 2);
+          }
         }
+        instructions.push(createJvmInstruction('goto', [defaultLabel]));
       }
-      instructions.push(createJvmInstruction('goto', [defaultLabel]));
       state.breakLabels.push(endLabel);
       for (let groupIndex = 0; groupIndex < (op.groups || []).length; groupIndex += 1) {
         instructions.push(createJvmInstruction('nop', [], { label: groupLabels[groupIndex] }));
@@ -1313,7 +1387,13 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       instructions.push(createJvmInstruction('nop', [], { label: endLabel }));
     } else if (op.op === 'synchronized') {
       const lockSlot = state.nextSyntheticSlot++;
+      const exceptionSlot = state.nextSyntheticSlot++;
       state.maxLocals = Math.max(state.maxLocals, state.nextSyntheticSlot);
+      const tryStart = `Lsync_start_${state.nextLabel++}`;
+      const tryEnd = `Lsync_end_${state.nextLabel++}`;
+      const handlerLabel = `Lsync_handler_${state.nextLabel++}`;
+      const handlerEnd = `Lsync_handler_end_${state.nextLabel++}`;
+      const doneLabel = `Lsync_done_${state.nextLabel++}`;
       const lock = emitValue(op.value, state);
       if (!lock || !(lock.descriptor.startsWith('L') || lock.descriptor.startsWith('['))) {
         unsupported.push(`unsupported synchronized lock in ${method.name}`);
@@ -1322,12 +1402,38 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       instructions.push(createJvmInstruction('dup'));
       instructions.push(createJvmInstruction('astore', [String(lockSlot)]));
       instructions.push(createJvmInstruction('monitorenter'));
+      instructions.push(createJvmInstruction('nop', [], { label: tryStart }));
+      state.monitorSlots.push(lockSlot);
       for (const child of op.bodyOps || []) emitOp(child);
+      state.monitorSlots.pop();
       instructions.push(createJvmInstruction('aload', [String(lockSlot)]));
       instructions.push(createJvmInstruction('monitorexit'));
+      instructions.push(createJvmInstruction('goto', [doneLabel], { label: tryEnd }));
+      instructions.push(createJvmInstruction('astore', [String(exceptionSlot)], { label: handlerLabel }));
+      instructions.push(createJvmInstruction('aload', [String(lockSlot)]));
+      instructions.push(createJvmInstruction('monitorexit'));
+      instructions.push(createJvmInstruction('aload', [String(exceptionSlot)], { label: handlerEnd }));
+      instructions.push(createJvmInstruction('athrow'));
+      instructions.push(createJvmInstruction('nop', [], { label: doneLabel }));
+      state.exceptionTable.push({
+        startLabel: tryStart,
+        endLabel: tryEnd,
+        handlerLabel,
+        catchType: 'any',
+      });
+      state.exceptionTable.push({
+        startLabel: handlerLabel,
+        endLabel: handlerEnd,
+        handlerLabel,
+        catchType: 'any',
+      });
       state.maxStack = Math.max(state.maxStack, lock.stack + 1);
     } else if (op.op === 'return') {
       if (returnDescriptor === 'V' && !op.value) {
+        for (let index = state.monitorSlots.length - 1; index >= 0; index -= 1) {
+          instructions.push(createJvmInstruction('aload', [String(state.monitorSlots[index])]));
+          instructions.push(createJvmInstruction('monitorexit'));
+        }
         instructions.push(createJvmInstruction('return'));
         hasExplicitReturn = true;
         return;
@@ -1336,6 +1442,17 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       if (!value || value.descriptor !== returnDescriptor) {
         unsupported.push(`non-void return in ${method.name}`);
         return;
+      }
+      if (state.monitorSlots.length) {
+        const returnSlot = state.nextSyntheticSlot;
+        state.nextSyntheticSlot += slotWidthFromDescriptor(returnDescriptor);
+        state.maxLocals = Math.max(state.maxLocals, state.nextSyntheticSlot);
+        instructions.push(createJvmInstruction(storeOpcodeForDescriptor(returnDescriptor), [String(returnSlot)]));
+        for (let index = state.monitorSlots.length - 1; index >= 0; index -= 1) {
+          instructions.push(createJvmInstruction('aload', [String(state.monitorSlots[index])]));
+          instructions.push(createJvmInstruction('monitorexit'));
+        }
+        instructions.push(createJvmInstruction(loadOpcodeForDescriptor(returnDescriptor), [String(returnSlot)]));
       }
       instructions.push(createJvmInstruction(returnOpcodeForDescriptor(returnDescriptor)));
       hasExplicitReturn = true;

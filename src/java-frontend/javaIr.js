@@ -263,7 +263,7 @@ function classTypeInternalName(type, context = {}) {
     return `java/lang/${type.name}`;
   }
   if ([
-    'ArrayList', 'Collection', 'Collections', 'Deque', 'HashMap', 'HashSet',
+    'ArrayList', 'Collection', 'Collections', 'Comparator', 'Deque', 'HashMap', 'HashSet',
     'Iterator', 'LinkedList', 'List', 'ListIterator', 'Map', 'Optional', 'Random', 'Set',
   ].includes(type.name)) return `java/util/${type.name}`;
   if (type.name === 'ReentrantLock') return 'java/util/concurrent/locks/ReentrantLock';
@@ -404,6 +404,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
   function collectMembers(document, declaration) {
     if (!isClassLikeDeclaration(declaration)) return;
     const internalName = internalNameByDeclaration.get(declaration);
+    const isEnum = declaration.kind === 'EnumDeclaration';
     const isInterface = declaration.kind === 'InterfaceDeclaration' || declaration.kind === 'AnnotationTypeDeclaration';
     const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
     const classBySimpleName = documentImportMap(document);
@@ -414,7 +415,9 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
     };
     metadata.classSuperByInternalName.set(
       internalName,
-      declaration.extendsType ? classTypeInternalName(declaration.extendsType, classTypeContext) : 'java/lang/Object',
+      isEnum
+        ? 'java/lang/Enum'
+        : declaration.extendsType ? classTypeInternalName(declaration.extendsType, classTypeContext) : 'java/lang/Object',
     );
     metadata.classInterfacesByInternalName.set(
       internalName,
@@ -424,6 +427,25 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
     const fields = new Map();
     const methods = new Map();
     const overloads = new Map();
+    if (isEnum) {
+      const enumDescriptor = `L${internalName};`;
+      for (const constant of declaration.constants || []) {
+        fields.set(constant.name, {
+          owner: internalName,
+          name: constant.name,
+          descriptor: enumDescriptor,
+          signature: enumDescriptor,
+          isStatic: true,
+        });
+      }
+      fields.set('$VALUES', {
+        owner: internalName,
+        name: '$VALUES',
+        descriptor: `[${enumDescriptor}`,
+        signature: `[${enumDescriptor}`,
+        isStatic: true,
+      });
+    }
     for (const member of declaration.body || []) {
       if (member.kind === 'FieldDeclaration') {
         for (const declarator of member.declarators || []) {
@@ -462,18 +484,28 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
         } catch (_) {}
       }
     }
-    if (declaration.kind === 'EnumDeclaration') {
+    if (isEnum) {
       const enumDescriptor = `L${internalName};`;
       const implicitMethods = [
-        { name: 'values', descriptor: `()[${enumDescriptor}`, returnDescriptor: `[${enumDescriptor}`,
-          parameterDescriptors: [], isStatic: true },
-        { name: 'valueOf', descriptor: `(Ljava/lang/String;)${enumDescriptor}`, returnDescriptor: enumDescriptor,
-          parameterDescriptors: ['Ljava/lang/String;'], isStatic: true },
+        {
+          name: 'values',
+          descriptor: `()[${enumDescriptor}`,
+          returnDescriptor: `[${enumDescriptor}`,
+          parameterDescriptors: [],
+          isStatic: true,
+        },
+        {
+          name: 'valueOf',
+          descriptor: `(Ljava/lang/String;)${enumDescriptor}`,
+          returnDescriptor: enumDescriptor,
+          parameterDescriptors: ['Ljava/lang/String;'],
+          isStatic: true,
+        },
       ];
-      for (const summary of implicitMethods) {
-        methods.set(summary.name, summary);
-        if (!overloads.has(summary.name)) overloads.set(summary.name, []);
-        overloads.get(summary.name).push(summary);
+      for (const method of implicitMethods) {
+        methods.set(method.name, method);
+        if (!overloads.has(method.name)) overloads.set(method.name, []);
+        overloads.get(method.name).push(method);
       }
     }
     metadata.classFieldsByInternalName.set(internalName, fields);
@@ -3093,6 +3125,7 @@ function createCapturedClassConstructor(classContext, captures) {
     classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
     classFieldsByInternalName: classContext.classFieldsByInternalName,
     classSuperByInternalName: classContext.classSuperByInternalName,
+    classInterfacesByInternalName: classContext.classInterfacesByInternalName,
     typeParameters: classContext.typeParameters,
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
@@ -3689,8 +3722,17 @@ function lowerFunctionLambdaToJavaIrValue(expression, context) {
 }
 
 function lowerFunctionMethodReferenceToJavaIrValue(expression, context) {
+  while (expression && (expression.kind === 'ParenthesizedExpression' || expression.kind === 'CastExpression')) {
+    expression = expression.expression;
+  }
   if (!expression || expression.kind !== 'UnsupportedExpression' || !Array.isArray(expression.tokens)) return null;
-  const tokens = trimParenTokens(expression.tokens);
+  let tokens = trimParenTokens(expression.tokens);
+  if (tokenText(tokens[0]) === '(') {
+    const castClose = matchingTokenIndex(tokens, 0, '(', ')');
+    if (castClose > 0 && tokens.slice(castClose + 1).some((token) => tokenText(token) === '::')) {
+      tokens = tokens.slice(castClose + 1);
+    }
+  }
   const refIndex = findTopLevelOperator(tokens, ['::']);
   if (refIndex <= 0 || refIndex !== tokens.length - 2 || tokens[refIndex + 1].kind !== 'identifier') return null;
   const owner = resolveClassInternalNameFromParts(
@@ -4635,6 +4677,26 @@ function lowerExpressionToJavaIrValueAsDescriptor(expression, context, descripto
   const direct = lowerExpressionToJavaIrValue(expression, context);
   const coerced = coerceValueToDescriptor(direct, descriptor);
   if (coerced && coerced.type === descriptor) return coerced;
+  if (expression && expression.kind === 'ConditionalExpression') {
+    const condition = lowerExpressionToJavaIrValueAsDescriptor(expression.condition, context, 'Z');
+    const consequent = lowerExpressionToJavaIrValueAsDescriptor(expression.consequent, context, descriptor);
+    const alternate = lowerExpressionToJavaIrValueAsDescriptor(expression.alternate, context, descriptor);
+    if (condition && consequent && alternate) {
+      return {
+        kind: 'ConditionalValue',
+        type: descriptor,
+        condition,
+        consequent,
+        alternate,
+      };
+    }
+  }
+  if (expression && expression.kind === 'UnaryExpression'
+      && expression.operator === '!'
+      && descriptor === 'Z') {
+    const value = lowerExpressionToJavaIrValueAsDescriptor(expression.operand, context, 'Z');
+    if (value) return { kind: 'UnaryValue', type: 'Z', operator: '!', value };
+  }
   const expectedCall = lowerMethodInvocationWithExpectedDescriptor(expression, context, descriptor);
   return coerceValueToDescriptor(expectedCall, descriptor);
 }
@@ -4877,7 +4939,10 @@ function lowerExpressionToJavaIrValue(expression, context) {
     return value ? { kind: 'AssignValue', type: local.descriptor, target: local.id, value } : null;
   }
   if (expression && expression.kind === 'UnaryExpression') {
-    const value = lowerExpressionToJavaIrValue(expression.operand, context);
+    let value = lowerExpressionToJavaIrValue(expression.operand, context);
+    if (!value && expression.operator === '!') {
+      value = lowerExpressionToJavaIrValueAsDescriptor(expression.operand, context, 'Z');
+    }
     if (expression.prefix && value && value.kind === 'LocalValue' && ['I', 'J', 'F', 'D'].includes(value.type) && ['++', '--'].includes(expression.operator)) {
       return { kind: 'PreUpdateValue', type: value.type, target: value.local, operator: expression.operator };
     }
@@ -4900,8 +4965,18 @@ function lowerExpressionToJavaIrValue(expression, context) {
   if (expression && expression.kind === 'BinaryExpression') {
     let left = lowerExpressionToJavaIrValue(expression.left, context);
     let right = lowerExpressionToJavaIrValue(expression.right, context);
-    if (['||', '&&'].includes(expression.operator)) return logicalShortCircuitValue(expression.operator, left, right);
+    if (['||', '&&'].includes(expression.operator)) {
+      left = left || lowerExpressionToJavaIrValueAsDescriptor(expression.left, context, 'Z');
+      right = right || lowerExpressionToJavaIrValueAsDescriptor(expression.right, context, 'Z');
+      return logicalShortCircuitValue(expression.operator, left, right);
+    }
     if (['==', '!=', '<', '>', '<=', '>='].includes(expression.operator)) {
+      if (!left && right) left = lowerExpressionToJavaIrValueAsDescriptor(expression.left, context, right.type);
+      if (!right && left) right = lowerExpressionToJavaIrValueAsDescriptor(expression.right, context, left.type);
+      if (!left && !right && ['<', '>', '<=', '>='].includes(expression.operator)) {
+        left = lowerExpressionToJavaIrValueAsDescriptor(expression.left, context, 'I');
+        right = lowerExpressionToJavaIrValueAsDescriptor(expression.right, context, 'I');
+      }
       if (left && right && left.literalKind === 'null') left = coerceValueToDescriptor(left, right.type);
       if (left && right && right.literalKind === 'null') right = coerceValueToDescriptor(right, left.type);
       const recovered = recoverBinaryNumericOperands(left, right);
@@ -5141,6 +5216,24 @@ function lowerExpressionToJavaIrValue(expression, context) {
       && expression.target
       && expression.target.kind === 'UnsupportedExpression'
       && Array.isArray(expression.target.tokens)) {
+    const explicitTypeArgumentOpen = expression.target.tokens.findIndex((token, index) => (
+      index > 1
+      && tokenText(token) === '<'
+      && tokenText(expression.target.tokens[index - 1]) === '.'
+    ));
+    if (explicitTypeArgumentOpen > 1
+        && tokenText(expression.target.tokens[expression.target.tokens.length - 1]) === '>') {
+      const ownerParts = expression.target.tokens.slice(0, explicitTypeArgumentOpen - 1)
+        .filter((token) => token.kind === 'identifier')
+        .map((token) => token.text);
+      const ownerExpression = ownerParts.reduce((target, name) => (target
+        ? { kind: 'FieldAccessExpression', target, name }
+        : { kind: 'Identifier', name }), null);
+      const staticCall = ownerExpression
+        ? lowerStaticUserMethodCall({ ...expression, target: ownerExpression }, context)
+        : null;
+      if (staticCall) return staticCall;
+    }
     const logicalOrIndex = findTopLevelOperator(expression.target.tokens, ['||']);
     if (logicalOrIndex > 0) {
       const left = lowerTokenExpressionToJavaIrValue(expression.target.tokens.slice(0, logicalOrIndex), context);
@@ -6274,7 +6367,9 @@ function lowerStatementToJavaIrOps(statement, context) {
       ...context,
       pendingStatementLabel: null,
     });
-    if (bodyOps.length === 1 && ['loop', 'doLoop', 'switch'].includes(bodyOps[0].op)) {
+    if (bodyOps.length === 1
+        && ['loop', 'doLoop', 'switch'].includes(bodyOps[0].op)
+        && !bodyOps[0].label) {
       return [{ ...bodyOps[0], label: statement.label || null }];
     }
     return [createJavaIrOp('labeled', {
@@ -6337,7 +6432,7 @@ function lowerStatementToJavaIrOps(statement, context) {
     })];
   }
   if (statement.kind === 'IfStatement') {
-    const condition = lowerExpressionToJavaIrValue(statement.condition, context);
+    const condition = lowerExpressionToJavaIrValueAsDescriptor(statement.condition, context, 'Z');
     if (!condition || condition.type !== 'Z') {
       const describeNode = (node) => {
         if (!node) return 'null';
@@ -7252,6 +7347,10 @@ function lowerEnumConstructorToJavaIr(method, classContext) {
 
 function enumConstantArgumentValues(constant, context) {
   if (!constant || !constant.arguments) return [];
+  if (constant.arguments.kind !== 'UnsupportedExpression') {
+    const value = lowerExpressionToJavaIrValue(constant.arguments, context);
+    return value ? [value] : [null];
+  }
   const tokens = constant.arguments.tokens || [];
   if (tokens.length > 0) {
     return splitTopLevelByComma(tokens).map((part) => lowerTokenExpressionToJavaIrValue(part, context));
@@ -7657,6 +7756,8 @@ function createStaticInitializerContext(classContext) {
     classMethodsByInternalName: classContext.classMethodsByInternalName,
     classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
     classFieldsByInternalName: classContext.classFieldsByInternalName,
+    classSuperByInternalName: classContext.classSuperByInternalName,
+    classInterfacesByInternalName: classContext.classInterfacesByInternalName,
     outerClassInternalName: classContext.outerClassInternalName,
     outerFieldByName: classContext.outerFieldByName,
     outerMethodByName: classContext.outerMethodByName,
@@ -7790,6 +7891,15 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     meta: {
       signature: methodGenericSignature(method, classContext.typeParameters),
       annotations: annotationsMeta(method.annotations, { classBySimpleName: classContext.classBySimpleName }),
+      exceptions: (method.throwsTypes || []).map((type) => {
+        const descriptor = typeDescriptor(type, {
+          classBySimpleName: classContext.classBySimpleName,
+          typeParameters,
+        });
+        return descriptor.startsWith('L') && descriptor.endsWith(';')
+          ? descriptor.slice(1, -1)
+          : classTypeInternalName(type, { classBySimpleName: classContext.classBySimpleName });
+      }),
     },
   });
 }
@@ -8003,7 +8113,9 @@ function lowerAstToJavaIr(document, options = {}) {
     classMethodOverloadsByInternalName.set(internalNameByDeclaration.get(declaration), methodOverloadsByName);
     classSuperByInternalName.set(
       internalNameByDeclaration.get(declaration),
-      declaration.extendsType ? classTypeInternalName(declaration.extendsType, descriptorContext) : 'java/lang/Object',
+      isEnum
+        ? 'java/lang/Enum'
+        : (declaration.extendsType ? classTypeInternalName(declaration.extendsType, descriptorContext) : 'java/lang/Object'),
     );
     classInterfacesByInternalName.set(
       internalNameByDeclaration.get(declaration),
@@ -8171,7 +8283,7 @@ function lowerAstToJavaIr(document, options = {}) {
         classIr.fields.push(createJavaIrField({
           name: constant.name,
           descriptor: enumDescriptor,
-          access: ['public', 'static', 'final'],
+          access: ['public', 'static', 'final', 'enum'],
           initializer: null,
           meta: { enumConstant: true },
         }));
@@ -8196,15 +8308,16 @@ function lowerAstToJavaIr(document, options = {}) {
     for (const member of declaration.body || []) {
       if (member.kind === 'FieldDeclaration') {
         for (const declarator of member.declarators || []) {
+          const fieldDescriptor = typeDescriptor(member.fieldType, classTypeContext);
           const initializer = declarator.initializer
             ? (lowerLambdaToJavaIrValue(declarator.initializer, typeDescriptor(member.fieldType, classTypeContext), classContext)
-              || lowerExpressionToJavaIrValue(declarator.initializer, classContext)
-              || literalToJavaIrValue(declarator.initializer)
+              || lowerExpressionToJavaIrValueAsDescriptor(declarator.initializer, classContext, fieldDescriptor)
+              || coerceValueToDescriptor(literalToJavaIrValue(declarator.initializer), fieldDescriptor)
               || { kind: declarator.initializer.kind })
             : null;
           classIr.fields.push(createJavaIrField({
             name: declarator.name,
-            descriptor: typeDescriptor(member.fieldType, classTypeContext),
+            descriptor: fieldDescriptor,
             access: modifierNames(member.modifiers),
             initializer,
             meta: {
@@ -8216,7 +8329,7 @@ function lowerAstToJavaIr(document, options = {}) {
             classContext.staticInitializerOps.push(createJavaIrOp('putStaticField', {
               owner: classContext.classInternalName,
               name: declarator.name,
-              descriptor: typeDescriptor(member.fieldType, classTypeContext),
+              descriptor: fieldDescriptor,
               value: initializer,
               sourceNodeKind: member.kind,
             }));
@@ -8224,7 +8337,7 @@ function lowerAstToJavaIr(document, options = {}) {
           if (!modifierNames(member.modifiers).includes('static') && initializer) {
             classContext.instanceFieldInitializers.push({
               name: declarator.name,
-              descriptor: typeDescriptor(member.fieldType, classTypeContext),
+              descriptor: fieldDescriptor,
               value: initializer,
               sourceNodeKind: member.kind,
             });

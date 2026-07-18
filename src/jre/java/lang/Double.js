@@ -55,6 +55,15 @@ module.exports = {
     "NaN:D": Number.NaN,
   },
   staticMethods: {
+    'compare(DD)I': (jvm, obj, args) => {
+      const [left, right] = args;
+      if (left < right) return -1;
+      if (left > right) return 1;
+      if (Object.is(left, right)) return 0;
+      if (Number.isNaN(left)) return Number.isNaN(right) ? 0 : 1;
+      if (Number.isNaN(right)) return -1;
+      return Object.is(left, -0) ? -1 : 1;
+    },
     'longBitsToDouble(J)D': (jvm, obj, args) => {
       const buffer = new ArrayBuffer(8);
       const view = new DataView(buffer);

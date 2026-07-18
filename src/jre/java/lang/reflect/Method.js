@@ -44,6 +44,7 @@ module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
   methods: {
+    'getExceptionTypes()[Ljava/lang/Class;': () => [],
     'getName()Ljava/lang/String;': (jvm, methodObj, args) => {
       const methodName = methodObj._methodData.name;
       return jvm.internString(methodName);

@@ -7,6 +7,7 @@ const { parseJava } = require('./parser');
 const { validateAstDocument } = require('./serialization');
 const { JavaFrontendError, UnsupportedJavaSyntaxError } = require('./errors');
 const { assembleJasminSource } = require('../utils/jasminAssembly');
+const { writeClassAstToClassFile } = require('../parsing/classAstToClassFile');
 const { jreCanonicalInternalName, jreClassInfo, jreInternalNameForSimpleName } = require('./jreMetadata');
 
 const COMPILE_RESULT_SCHEMA_ID = 'java-tools.java-frontend.compile-result';
@@ -290,7 +291,12 @@ function methodGenericSignature(method, parent = null) {
     ? 'V'
     : typeSignature(method.returnType || ast.voidType(), context);
   const prefix = typeParams ? `<${typeParams}>` : '';
-  return `${prefix}(${params})${ret}`;
+  const throwsSignatures = (method.throwsTypes || [])
+    .map((type) => typeSignature(type, context))
+    .filter(Boolean)
+    .map((signature) => `^${signature}`)
+    .join('');
+  return `${prefix}(${params})${ret}${throwsSignatures}`;
 }
 
 function methodDescriptor(method, parentTypeParameters = null) {
@@ -330,6 +336,33 @@ function escapeJasminStringLiteral(value) {
   return JSON.stringify(value === undefined || value === null ? '' : String(value))
     .split('\\b').join('\\u0008')
     .split('\\f').join('\\u000c');
+}
+
+function jasminUtf(value) {
+  const text = String(value === undefined || value === null ? '' : value);
+  return /^(?:(?:[a-zA-Z_$\(<]|\[[A-Z\[])[\w$;/\[\]()<>*+\-]*)$/.test(text)
+    ? text
+    : escapeJasminStringLiteral(text);
+}
+
+function formatInstructionOperands(instruction) {
+  const operands = (instruction.operands || []).slice();
+  if (['getfield', 'getstatic', 'putfield', 'putstatic', 'invokevirtual', 'invokespecial',
+    'invokestatic', 'invokeinterface'].includes(instruction.opcode)
+      && ['Field', 'Method', 'InterfaceMethod'].includes(operands[0])) {
+    for (let index = 1; index < Math.min(4, operands.length); index += 1) {
+      operands[index] = jasminUtf(operands[index]);
+    }
+  } else if (['new', 'anewarray', 'checkcast', 'instanceof'].includes(instruction.opcode)
+      && operands.length > 0) {
+    operands[0] = jasminUtf(operands[0]);
+  } else if (instruction.opcode === 'multianewarray' && operands.length > 0) {
+    operands[0] = jasminUtf(operands[0]);
+  }
+  if (instruction.opcode === 'invokeinterface' && instruction.count !== undefined) {
+    operands.push(instruction.count);
+  }
+  return operands;
 }
 
 function annotationElementType(value) {
@@ -815,9 +848,17 @@ function formatInstruction(instruction, index) {
       return `L${index}:     ${body}`;
     }
   }
-  const operands = instruction.opcode === 'invokeinterface' && instruction.count !== undefined
-    ? (instruction.operands || []).concat([instruction.count]).join(' ')
-    : (instruction.operands || []).join(' ');
+  if (instruction.opcode === 'lookupswitch') {
+    const prefix = instruction.label
+      ? `${instruction.label}:     `
+      : (typeof instruction.offset === 'number' ? `L${instruction.offset}:     ` : `L${index}:     `);
+    const pairs = (instruction.pairs || [])
+      .map(([key, label]) => `            ${key} : ${label}`)
+      .join('\n');
+    const pairLines = pairs ? `${pairs}\n` : '';
+    return `${prefix}lookupswitch\n${pairLines}            default : ${instruction.defaultLabel}`;
+  }
+  const operands = formatInstructionOperands(instruction).join(' ');
   const body = operands ? `${instruction.opcode} ${operands}` : instruction.opcode;
   if (instruction.label) {
     return `${instruction.label}:     ${body}`;
@@ -834,11 +875,11 @@ function fieldLines(field) {
     const access = jasminAccess(field.access || []);
     const attrs = attributeLines((field.attributes && field.attributes.length) ? field.attributes : memberAttributesFromMeta(field.meta));
     if (attrs.length) {
-      lines.push(`.field ${access}${field.name} ${field.descriptor}.fieldattributes`);
+      lines.push(`.field ${access}${jasminUtf(field.name)} ${jasminUtf(field.descriptor)}.fieldattributes`);
       lines.push(...attrs);
       lines.push('.end fieldattributes');
     } else {
-      lines.push(`.field ${access}${field.name} ${field.descriptor}`);
+      lines.push(`.field ${access}${jasminUtf(field.name)} ${jasminUtf(field.descriptor)}`);
     }
     return lines;
   }
@@ -851,7 +892,7 @@ function fieldLines(field) {
     if (declarator.initializer) {
       throw unsupportedCompileNode(declarator, 'minimal classfile model does not support field initializers yet');
     }
-    lines.push(`.field ${access}${declarator.name} ${descriptor}`);
+    lines.push(`.field ${access}${jasminUtf(declarator.name)} ${jasminUtf(descriptor)}`);
   }
   return lines;
 }
@@ -875,8 +916,8 @@ function stackMapFrameLines(frame) {
 function methodLines(method) {
   const lines = [];
   const access = jasminAccess(method.access || []);
-  lines.push(`.method ${access}${method.name} : ${method.descriptor}`);
-  const attrs = attributeLines((method.attributes || []).filter((attribute) => attribute.type !== 'Signature'));
+  lines.push(`.method ${access}${jasminUtf(method.name)} : ${jasminUtf(method.descriptor)}`);
+  const attrs = attributeLines(method.attributes || []);
   lines.push(...attrs);
   if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
     lines.push(`    .code stack ${Math.max(0, method.maxStack || 0)} locals ${Math.max(0, method.maxLocals || 0)}`);
@@ -888,7 +929,7 @@ function methodLines(method) {
     });
     for (const entry of method.exceptionTable || []) {
       const catchType = entry.catchType || entry.catch_type || 'any';
-      lines.push(`    .catch ${catchType} from ${entry.startLabel} to ${entry.endLabel} using ${entry.handlerLabel}`);
+      lines.push(`    .catch ${jasminUtf(catchType)} from ${entry.startLabel} to ${entry.endLabel} using ${entry.handlerLabel}`);
     }
     lines.push('    .end code');
   }
@@ -899,12 +940,12 @@ function methodLines(method) {
 function jasminFromClassIr(classIr) {
   const lines = [];
   lines.push('.version 52 0');
-  lines.push(`.class ${jasminAccess(classIr.access || [])}${classIr.internalName}`);
-  lines.push(`.super ${classIr.superName || 'java/lang/Object'}`);
+  lines.push(`.class ${jasminAccess(classIr.access || [])}${jasminUtf(classIr.internalName)}`);
+  lines.push(`.super ${jasminUtf(classIr.superName || 'java/lang/Object')}`);
   for (const iface of classIr.interfaces || []) {
-    lines.push(`.implements ${iface}`);
+    lines.push(`.implements ${jasminUtf(iface)}`);
   }
-  const classAttrLines = attributeLines((classIr.attributes || []).filter((attribute) => attribute.type !== 'SourceFile' && attribute.type !== 'Signature'));
+  const classAttrLines = attributeLines((classIr.attributes || []).filter((attribute) => attribute.type !== 'SourceFile'));
   if (classAttrLines.length) {
     lines.push(...classAttrLines);
   }
@@ -935,39 +976,212 @@ function classAttributesFromIr(classIr) {
 }
 
 function buildClassFileModelFromIr(bytecodeIr, options = {}) {
-  const classes = (bytecodeIr.classes || []).map((classIr) => ({
-    kind: 'ClassFileModel',
-    internalName: classIr.internalName,
-    binaryName: classIr.internalName.replace(/\//g, '.'),
-    sourceFile: classIr.sourceFile || null,
-    superName: classIr.superName || 'java/lang/Object',
-    access: (classIr.access || []).slice(),
-    attributes: classAttributesFromIr(classIr),
-    fields: (classIr.fields || []).map((field) => ({
-      access: (field.access || []).slice(),
-      descriptor: field.descriptor,
-      declarators: (field.declarators || []).map((declarator) => ({ ...declarator })),
-      name: field.name,
-      initializer: field.initializer || null,
-      attributes: memberAttributesFromMeta(field.meta),
-    })),
-    methods: (classIr.methods || []).map((method) => ({
-      name: method.name,
-      descriptor: method.descriptor,
-      access: (method.access || []).slice(),
-      maxStack: method.maxStack || 0,
-      maxLocals: method.maxLocals || 0,
-      instructionCount: (method.instructions || []).length,
-      attributes: Array.isArray(method.attributes) ? method.attributes.map((attribute) => ({ ...attribute })) : [],
-    })),
-    jasmin: jasminFromClassIr(classIr),
-  }));
+  const classes = (bytecodeIr.classes || []).map((classIr) => {
+    const model = {
+      kind: 'ClassFileModel',
+      internalName: classIr.internalName,
+      binaryName: classIr.internalName.replace(/\//g, '.'),
+      sourceFile: classIr.sourceFile || null,
+      superName: classIr.superName || 'java/lang/Object',
+      access: (classIr.access || []).slice(),
+      attributes: classAttributesFromIr(classIr),
+      fields: (classIr.fields || []).map((field) => ({
+        access: (field.access || []).slice(),
+        descriptor: field.descriptor,
+        declarators: (field.declarators || []).map((declarator) => ({ ...declarator })),
+        name: field.name,
+        initializer: field.initializer || null,
+        attributes: memberAttributesFromMeta(field.meta),
+      })),
+      methods: (classIr.methods || []).map((method) => ({
+        name: method.name,
+        descriptor: method.descriptor,
+        access: (method.access || []).slice(),
+        maxStack: method.maxStack || 0,
+        maxLocals: method.maxLocals || 0,
+        instructionCount: (method.instructions || []).length,
+        attributes: Array.isArray(method.attributes) ? method.attributes.map((attribute) => ({ ...attribute })) : [],
+      })),
+      jasmin: jasminFromClassIr(classIr),
+    };
+    Object.defineProperty(model, 'bytecodeClass', { value: classIr, enumerable: false });
+    return model;
+  });
   return {
     schema: CLASSFILE_MODEL_SCHEMA_ID,
     version: CLASSFILE_MODEL_SCHEMA_VERSION,
     status: bytecodeIr.status || 'complete',
     backend: 'jasmin-assembler',
     classes,
+  };
+}
+
+function directInstruction(instruction) {
+  const op = instruction.opcode;
+  const operands = instruction.operands || [];
+  let value;
+  if (/^[ilfda](?:load|store)$/.test(op)
+      && operands.length === 1
+      && Number.isInteger(Number(operands[0]))
+      && Number(operands[0]) >= 0
+      && Number(operands[0]) <= 3) {
+    value = `${op}_${Number(operands[0])}`;
+  } else if (op === 'lookupswitch') {
+    value = {
+      op,
+      arg: {
+        pairs: (instruction.pairs || []).map((pair) => pair.slice()),
+        defaultLabel: instruction.defaultLabel,
+      },
+    };
+  } else if (operands.length === 0) {
+    value = op;
+  } else if (['getfield', 'getstatic', 'putfield', 'putstatic', 'invokevirtual', 'invokespecial',
+    'invokestatic', 'invokeinterface'].includes(op)
+      && ['Field', 'Method', 'InterfaceMethod'].includes(operands[0])) {
+    value = { op, arg: [operands[0], operands[1], [operands[2], operands[3]]] };
+    if (op === 'invokeinterface') value.count = instruction.count;
+  } else if (op === 'iinc') {
+    value = { op, varnum: operands[0], incr: operands[1] };
+  } else if (op === 'multianewarray') {
+    value = { op, arg: [operands[0], operands[1]] };
+  } else if (op === 'wide') {
+    value = { op, arg: operands.join(' ') };
+  } else {
+    value = { op, arg: operands.length === 1 ? operands[0] : operands.slice() };
+  }
+  return {
+    ...(instruction.label ? { labelDef: `${instruction.label}:` } : {}),
+    instruction: value,
+  };
+}
+
+function compactDirectMethod(method) {
+  const aliases = new Map();
+  const compacted = [];
+  let pendingLabels = [];
+  for (const raw of method.instructions || []) {
+    const instruction = { ...raw, operands: (raw.operands || []).slice() };
+    if (instruction.opcode === 'nop' && instruction.label) {
+      pendingLabels.push(instruction.label);
+      continue;
+    }
+    if (pendingLabels.length) {
+      const canonical = instruction.label || pendingLabels[0];
+      if (!instruction.label) instruction.label = canonical;
+      for (const label of pendingLabels) {
+        if (label !== canonical) aliases.set(label, canonical);
+      }
+      pendingLabels = [];
+    }
+    compacted.push(instruction);
+  }
+  for (const label of pendingLabels) compacted.push({ opcode: 'nop', operands: [], label });
+
+  const resolveLabel = (label) => {
+    let current = label;
+    const seen = new Set();
+    while (aliases.has(current) && !seen.has(current)) {
+      seen.add(current);
+      current = aliases.get(current);
+    }
+    return current;
+  };
+  const branchOpcodes = new Set([
+    'goto', 'goto_w', 'jsr', 'jsr_w', 'ifeq', 'ifne', 'iflt', 'ifge', 'ifgt', 'ifle',
+    'if_icmpeq', 'if_icmpne', 'if_icmplt', 'if_icmpge', 'if_icmpgt', 'if_icmple',
+    'if_acmpeq', 'if_acmpne', 'ifnull', 'ifnonnull',
+  ]);
+  for (const instruction of compacted) {
+    if (branchOpcodes.has(instruction.opcode) && instruction.operands.length) {
+      instruction.operands[0] = resolveLabel(instruction.operands[0]);
+    } else if (instruction.opcode === 'lookupswitch') {
+      instruction.pairs = (instruction.pairs || []).map(([key, label]) => [key, resolveLabel(label)]);
+      instruction.defaultLabel = resolveLabel(instruction.defaultLabel);
+    }
+  }
+  return {
+    instructions: compacted,
+    exceptionTable: (method.exceptionTable || []).map((entry) => ({
+      ...entry,
+      startLabel: resolveLabel(entry.startLabel || entry.startLbl),
+      endLabel: resolveLabel(entry.endLabel || entry.endLbl),
+      handlerLabel: resolveLabel(entry.handlerLabel || entry.handlerLbl),
+    })),
+  };
+}
+
+function directAttribute(attribute) {
+  if (!attribute) return null;
+  if (attribute.type === 'SourceFile') return { type: 'sourcefile', value: attribute.value };
+  if (attribute.type === 'Signature') return { type: 'signature', value: attribute.value };
+  return { ...attribute };
+}
+
+function canDirectAssembleClass(classIr) {
+  const allowedClassAttributes = new Set(['SourceFile', 'Signature']);
+  const allowedMemberAttributes = new Set(['Signature', 'exceptions']);
+  if (classAttributesFromIr(classIr).some((attribute) => !allowedClassAttributes.has(attribute.type))) return false;
+  if ((classIr.fields || []).some((field) => memberAttributesFromMeta(field.meta)
+    .some((attribute) => !allowedMemberAttributes.has(attribute.type)))) return false;
+  return (classIr.methods || []).every((method) => (method.attributes || [])
+    .every((attribute) => allowedMemberAttributes.has(attribute.type)));
+}
+
+function directClassAst(classIr) {
+  const items = [];
+  for (const field of classIr.fields || []) {
+    items.push({
+      type: 'field',
+      field: {
+        flags: (field.access || []).slice(),
+        name: field.name,
+        descriptor: field.descriptor,
+        value: null,
+        attributes: memberAttributesFromMeta(field.meta).map(directAttribute).filter(Boolean),
+      },
+    });
+  }
+  for (const method of classIr.methods || []) {
+    const compacted = compactDirectMethod(method);
+    const attributes = (method.attributes || []).map(directAttribute).filter(Boolean);
+    if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
+      attributes.push({
+        type: 'code',
+        code: {
+          stackSize: method.maxStack || 0,
+          localsSize: method.maxLocals || 0,
+          codeItems: compacted.instructions.map(directInstruction),
+          exceptionTable: compacted.exceptionTable.map((entry) => ({
+            startLbl: entry.startLabel || entry.startLbl,
+            endLbl: entry.endLabel || entry.endLbl,
+            handlerLbl: entry.handlerLabel || entry.handlerLbl,
+            catchType: entry.catchType || 'any',
+          })),
+          attributes: [],
+        },
+      });
+    }
+    items.push({
+      type: 'method',
+      method: {
+        flags: (method.access || []).slice(),
+        name: method.name,
+        descriptor: method.descriptor,
+        attributes,
+      },
+    });
+  }
+  for (const attribute of classAttributesFromIr(classIr).map(directAttribute).filter(Boolean)) {
+    items.push({ type: 'attribute', attribute });
+  }
+  return {
+    version: [{ major: 52, minor: 0 }],
+    flags: (classIr.access || []).slice(),
+    className: classIr.internalName,
+    superClassName: classIr.superName || 'java/lang/Object',
+    interfaces: (classIr.interfaces || []).slice(),
+    items,
   };
 }
 
@@ -984,7 +1198,13 @@ function writeClassFilesFromModel(classFileModel, outputDir, options = {}) {
   for (const classModel of classFileModel.classes || []) {
     const outputPath = outputPathForClass(outputDir, classModel.internalName);
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    assembleJasminSource(classModel.jasmin, outputPath, options.assembly || {});
+    if (classModel.jasmin.length > 500000
+        && classModel.bytecodeClass
+        && canDirectAssembleClass(classModel.bytecodeClass)) {
+      writeClassAstToClassFile(directClassAst(classModel.bytecodeClass), outputPath, options.assembly || {});
+    } else {
+      assembleJasminSource(classModel.jasmin, outputPath, options.assembly || {});
+    }
     written.push({
       internalName: classModel.internalName,
       binaryName: classModel.binaryName,

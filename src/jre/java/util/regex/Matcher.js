@@ -34,7 +34,9 @@ function ensureMatch(matcher) {
 
 module.exports = {
   super: 'java/lang/Object',
+  interfaces: ['java/util/regex/MatchResult'],
   methods: {
+    'toMatchResult()Ljava/util/regex/MatchResult;': (jvm, obj) => obj,
     'matches()Z': (jvm, obj) => {
       const pattern = obj.pattern ? Pattern.helpers.regexSource(obj.pattern) : '';
       const match = new RegExp(`^(?:${pattern})$`, flagsNoGlobalWithIndices(obj)).exec(obj.input || '');

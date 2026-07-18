@@ -14,6 +14,7 @@ module.exports = {
     "toString()Ljava/lang/String;": (jvm, obj) => jvm.newString(String.fromCharCode(obj.value)),
   },
   staticMethods: {
+    "charCount(I)I": (jvm, obj, args) => (args[0] >= 0x10000 ? 2 : 1),
     "valueOf(C)Ljava/lang/Character;": (jvm, obj, args) => ({
       type: 'java/lang/Character',
       value: args[0],

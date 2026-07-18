@@ -4,6 +4,9 @@ module.exports = {
   super: {
     type: 'java/lang/Object'
   },
+  staticMethods: {
+    'getSystemClassLoader()Ljava/lang/ClassLoader;': (jvm) => jvm.systemClassLoader,
+  },
   methods: {
     '<init>()V': (jvm, obj, args, thread) => {
       obj.parent = null;

@@ -1714,12 +1714,16 @@ function prepareInstruction(instruction, builder, currentOffset, bootstrapMethod
 
   if (op === 'lookupswitch') {
     const arg = instruction.arg || {};
-    const defaultLabel = arg.defaultLabel != null ? String(arg.defaultLabel) : String(arg.defaultLbl);
-    const pairs = ensureArray(arg.pairs).map((pair) => {
-      if (!Array.isArray(pair) || pair.length < 2) {
+    const defaultValue = arg.defaultLabel != null ? arg.defaultLabel
+      : (arg.defaultLbl != null ? arg.defaultLbl
+        : (instruction.defaultLabel != null ? instruction.defaultLabel : instruction.defaultLbl));
+    const defaultLabel = String(defaultValue);
+    const pairs = ensureArray(arg.pairs != null ? arg.pairs : instruction.pairs).map((pair) => {
+      const tuple = Array.isArray(pair) ? pair : [pair && pair.key, pair && (pair.lbl || pair.label)];
+      if (tuple.length < 2 || tuple[0] == null || tuple[1] == null) {
         throw new Error('Invalid lookupswitch pair');
       }
-      return { match: parseInteger(pair[0], 0), label: String(pair[1]) };
+      return { match: parseInteger(tuple[0], 0), label: String(tuple[1]) };
     });
     const padding = (4 - ((currentOffset + 1) % 4)) % 4;
     const length = 1 + padding + 8 + 8 * pairs.length;

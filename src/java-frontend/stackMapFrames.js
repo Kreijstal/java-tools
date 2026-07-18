@@ -230,6 +230,7 @@ function transfer(instruction, input, index, classIr) {
     frame.stack.push(INTEGER);
   } else if (/^if_icmp/.test(opcode) || /^if_acmp/.test(opcode)) pop(frame, 2);
   else if (/^if(?:eq|ne|lt|le|gt|ge|null|nonnull)$/.test(opcode)) pop(frame);
+  else if (opcode === 'lookupswitch') pop(frame);
   else if (opcode === 'monitorenter' || opcode === 'monitorexit' || opcode === 'athrow') pop(frame);
   else if (opcode === 'ireturn' || opcode === 'lreturn' || opcode === 'freturn' || opcode === 'dreturn' || opcode === 'areturn') pop(frame);
   else if (opcode === 'return' || opcode === 'goto') { /* no stack effect */ }
@@ -299,10 +300,17 @@ function computeStackMapFrames(method, classIr) {
     if (branch.test(instruction.opcode) && instruction.operands && instruction.operands[0]) {
       targets.add(labels.get(String(instruction.operands[0])));
     }
+    if (instruction.opcode === 'lookupswitch') {
+      targets.add(labels.get(String(instruction.defaultLabel)));
+      for (const pair of instruction.pairs || []) {
+        const label = Array.isArray(pair) ? pair[1] : pair && (pair.label || pair.lbl);
+        targets.add(labels.get(String(label)));
+      }
+    }
   });
   for (const entry of method.exceptionTable || []) targets.add(labels.get(entry.handlerLabel));
   const structuralTargets = new Set(targets);
-  const terminalOpcodes = new Set(['goto', 'return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow']);
+  const terminalOpcodes = new Set(['goto', 'lookupswitch', 'return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow']);
   instructions.forEach((instruction, index) => {
     if (terminalOpcodes.has(instruction.opcode) && index + 1 < instructions.length
       && !structuralTargets.has(index + 1)) targets.add(index + 1);
@@ -340,6 +348,13 @@ function computeStackMapFrames(method, classIr) {
     if (/^if/.test(opcode)) {
       enqueue(labels.get(String(instruction.operands[0])), output);
       enqueue(index + 1, output);
+    } else if (opcode === 'lookupswitch') {
+      enqueue(labels.get(String(instruction.defaultLabel)), output);
+      for (const pair of instruction.pairs || []) {
+        const label = Array.isArray(pair) ? pair[1] : pair && (pair.label || pair.lbl);
+        enqueue(labels.get(String(label)), output);
+      }
+      if (!structuralTargets.has(index + 1)) enqueue(index + 1, output);
     } else if (opcode === 'goto') {
       enqueue(labels.get(String(instruction.operands[0])), output);
       if (!structuralTargets.has(index + 1)) enqueue(index + 1, output);
