@@ -22,6 +22,7 @@ const { getAST } = require("jvm_parser");
 const JSZip = require("jszip");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
+const { encodeGraph, decodeGraph } = require("./stateCodec");
 
 function yieldToEventLoop() {
   return new Promise((resolve) => {
@@ -62,7 +63,8 @@ class JVM {
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
     this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
     this._hotMethodCounts = new Map();
-    this.jit = new JitCompiler(this, options.jit || {});
+    this.jitOptions = options.jit || {};
+    this.jit = new JitCompiler(this, this.jitOptions);
 
     // Make fs and path available for JreBootstrap (only in Node.js environment)
     if (typeof window === "undefined") {
@@ -1916,6 +1918,201 @@ class JVM {
       classpath: this.classpath,
     };
     return JSON.parse(JSON.stringify(serialized));
+  }
+
+  saveState() {
+    const savedAt = Date.now();
+    const threadTokens = this.threads.map((thread) => ({ $jvmThreadId: thread.id }));
+    const threadReplacements = new Map(this.threads.map((thread, index) =>
+      [thread, threadTokens[index]]));
+    const threadSnapshots = this.threads.map((thread) => {
+      const properties = {};
+      for (const [key, value] of Object.entries(thread)) {
+        if (key === 'callStack' || key === 'joiningOn' || key === 'sleepUntil') continue;
+        properties[key] = value;
+      }
+      if (thread.sleepUntil !== undefined) {
+        properties.sleepRemaining = Math.max(0, Number(thread.sleepUntil) - savedAt);
+      }
+      return {
+        properties,
+        joiningOnId: thread.joiningOn ? thread.joiningOn.id : null,
+        frames: thread.callStack.items.map((frame) => ({
+          pc: frame.pc,
+          className: frame.className || this.findClassNameForMethod(frame.method),
+          methodName: frame.method.name,
+          descriptor: frame.method.descriptor,
+          locals: frame.locals,
+          stack: frame.stack.items,
+        })),
+      };
+    });
+    const classStatics = Object.entries(this.classes)
+      .filter(([, classData]) => classData && classData.staticFields !== undefined)
+      .map(([className, classData]) => [className, classData.staticFields]);
+    const graph = encodeGraph({
+      threads: threadSnapshots,
+      classStatics,
+      stringPool: this.stringPool || new Map(),
+      classObjectCache: this.classObjectCache,
+      invokedynamicCache: this.invokedynamicCache,
+    }, { replacements: threadReplacements });
+    return {
+      format: 'jvmjs-save-state',
+      version: 1,
+      savedAt,
+      classpath: this.classpath,
+      loadedClasses: Object.keys(this.classes),
+      classInitializationState: [...this.classInitializationState],
+      currentThreadIndex: this.currentThreadIndex,
+      nextHashCode: this.nextHashCode,
+      appletParameters: this.appletParameters,
+      appletCodeBase: this.appletCodeBase,
+      debugManager: this.debugManager.serialize(),
+      graph,
+      externalResources: graph.omitted,
+    };
+  }
+
+  async loadState(state) {
+    if (!state || state.format !== 'jvmjs-save-state' || state.version !== 1) {
+      throw new Error('Unsupported JVM save-state format');
+    }
+    this.classpath = Array.isArray(state.classpath) ? state.classpath : [state.classpath || '.'];
+    this.appletParameters = state.appletParameters || null;
+    this.appletCodeBase = state.appletCodeBase || null;
+    for (const className of state.loadedClasses || []) {
+      await this.loadClassByName(className);
+    }
+
+    const decoded = decodeGraph(state.graph);
+    for (const [className, staticFields] of decoded.classStatics || []) {
+      const classData = this.classes[className] || await this.loadClassByName(className);
+      if (classData) {
+        classData.staticFields = staticFields;
+        classData.staticFieldsInitialized = true;
+      }
+    }
+    this.stringPool = decoded.stringPool || new Map();
+    this.classObjectCache = decoded.classObjectCache || new Map();
+    for (const [className, classObject] of this.classObjectCache) {
+      if (classObject && typeof classObject === 'object') classObject._classData = this.classes[className];
+    }
+    this.invokedynamicCache = decoded.invokedynamicCache || new Map();
+    await this._rehydrateSaveStateResources(decoded);
+
+    const restoredAt = Date.now();
+    this.threads = [];
+    for (const snapshot of decoded.threads || []) {
+      const properties = snapshot.properties || {};
+      const thread = { ...properties, callStack: new Stack() };
+      if (properties.sleepRemaining !== undefined) {
+        thread.sleepUntil = restoredAt + Number(properties.sleepRemaining);
+        delete thread.sleepRemaining;
+      }
+      for (const frameState of snapshot.frames || []) {
+        const method = await this.findMethodInHierarchy(
+          frameState.className, frameState.methodName, frameState.descriptor);
+        if (!method) {
+          throw new Error(`Could not restore ${frameState.className}.${frameState.methodName}${frameState.descriptor}`);
+        }
+        const frame = new Frame(method);
+        frame.className = frameState.className;
+        frame.pc = frameState.pc;
+        frame.locals = frameState.locals;
+        frame.stack.items = frameState.stack;
+        thread.callStack.push(frame);
+      }
+      this.threads.push(thread);
+    }
+    (decoded.threads || []).forEach((snapshot, index) => {
+      const thread = this.threads[index];
+      if (snapshot.joiningOnId !== null && snapshot.joiningOnId !== undefined) {
+        thread.joiningOn = this.threads.find((candidate) => candidate.id === snapshot.joiningOnId);
+      }
+      if (thread.javaThread && typeof thread.javaThread === 'object') {
+        thread.javaThread.nativeThread = thread;
+      }
+    });
+    this._restoreSaveStateThreadRefs(decoded);
+    this.currentThreadIndex = Math.min(state.currentThreadIndex || 0,
+      Math.max(0, this.threads.length - 1));
+    this.classInitializationState = new Map(state.classInitializationState || []);
+    this.nextHashCode = state.nextHashCode || 1;
+    if (state.debugManager) this.debugManager.deserialize(state.debugManager);
+    this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
+    this._hotMethodCounts = new Map();
+    // Generated JS/Wasm code is deliberately not persisted. Rebuilding it
+    // keeps save files portable across engines and avoids stale heap bindings.
+    this.jit = new JitCompiler(this, this.jitOptions);
+    return {
+      status: 'restored',
+      externalResources: state.externalResources || [],
+    };
+  }
+
+  async _rehydrateSaveStateResources(root) {
+    const seen = new WeakSet();
+    const pending = [root];
+    while (pending.length) {
+      const value = pending.pop();
+      if (!value || typeof value !== 'object' || seen.has(value)) continue;
+      seen.add(value);
+      if (value.type === 'java/io/RandomAccessFile' && value.path && !value.fileHandle && this.fs) {
+        const mode = String(value.mode || 'r');
+        const writable = mode.includes('w');
+        try {
+          value.fileHandle = await this.fs.promises.open(value.path, writable ? 'r+' : 'r');
+        } catch (error) {
+          if (writable && error && error.code === 'ENOENT') {
+            try { value.fileHandle = await this.fs.promises.open(value.path, 'w+'); } catch (_ignored) {}
+          }
+        }
+      }
+      if (value.type === 'java/io/ConsoleOutputStream' && !value.writer &&
+        typeof process !== 'undefined' && process.stdout) {
+        value.writer = process.stdout.write.bind(process.stdout);
+      }
+      if (value instanceof Map) {
+        for (const [key, item] of value) pending.push(key, item);
+      } else if (value instanceof Set) {
+        for (const item of value) pending.push(item);
+      } else {
+        for (const item of Object.values(value)) pending.push(item);
+      }
+    }
+    const systemClass = this.classes['java/lang/System'];
+    if (systemClass && systemClass.staticFields instanceof Map && typeof process !== 'undefined') {
+      const out = systemClass.staticFields.get('out:Ljava/io/PrintStream;');
+      const err = systemClass.staticFields.get('err:Ljava/io/PrintStream;');
+      if (out && out.out && process.stdout) out.out.writer = process.stdout.write.bind(process.stdout);
+      if (err && err.out && process.stderr) err.out.writer = process.stderr.write.bind(process.stderr);
+    }
+  }
+
+  _restoreSaveStateThreadRefs(root) {
+    const seen = new WeakSet();
+    const resolve = (value) => {
+      if (!value || typeof value !== 'object') return value;
+      if (Object.prototype.hasOwnProperty.call(value, '$jvmThreadId')) {
+        return this.threads.find((thread) => thread.id === value.$jvmThreadId) || null;
+      }
+      if (seen.has(value)) return value;
+      seen.add(value);
+      if (value instanceof Map) {
+        const entries = [...value.entries()];
+        value.clear();
+        for (const [key, item] of entries) value.set(resolve(key), resolve(item));
+      } else if (value instanceof Set) {
+        const items = [...value];
+        value.clear();
+        for (const item of items) value.add(resolve(item));
+      } else {
+        for (const key of Object.keys(value)) value[key] = resolve(value[key]);
+      }
+      return value;
+    };
+    resolve(root);
   }
 
   async deserialize(state) {

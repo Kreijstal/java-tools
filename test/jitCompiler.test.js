@@ -4,6 +4,7 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 const { JVM } = require('../src/core/jvm');
+const { _test: wasmJitTest } = require('../src/jit/WasmJit');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const awt = require('../src/platform/awt');
@@ -612,6 +613,56 @@ public class WasmLinkedHelperHarness {
   t.end();
 });
 
+test('Wasm JIT links helpers whose only unsupported blocks are exception reporters', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmLinkedReporterHelperHarness', `
+public class WasmLinkedReporterHelperHarness {
+  private static int mix(int value) {
+    try {
+      return value * 31 + 7;
+    } catch (RuntimeException failure) {
+      throw new IllegalStateException("mix(" + value + ")", failure);
+    }
+  }
+  public static void compute(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = mix(out[i]);
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmLinkedReporterHelperHarness');
+  jvm.classInitializationState.set('WasmLinkedReporterHelperHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-linked-reporter-helper-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [2, 4, 6];
+  out.type = '[I';
+
+  await invoke(jvm, thread, 'WasmLinkedReporterHelperHarness', 'compute', '([I)V', [out]);
+
+  t.deepEqual(out.slice(0, 3), [69, 131, 193],
+    'linked reporter helper preserves normal-flow results');
+  const compiled = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiled.has('WasmLinkedReporterHelperHarness.mix(I)I'),
+    'normal-flow-complete helper links despite handler-only blocks');
+  t.equal(compiled.get('WasmLinkedReporterHelperHarness.compute([I)V').exits, 0,
+    'linked reporter helper does not force caller exits');
+  t.end();
+});
+
 test('Wasm JIT recognizes forward-branching wrap-and-rethrow reporters', async (t) => {
   const classpath = compileJavaFixture(t, 'WasmReporterHarness', `
 public class WasmReporterHarness {
@@ -670,6 +721,71 @@ public class WasmReporterHarness {
   recoverFrame.className = 'WasmReporterHarness';
   t.equal(jvm.jit.wasmJit.prepare(recoverFrame), null,
     'a handler that writes a recovery value remains interpreted');
+  t.end();
+});
+
+test('Wasm JIT reporter scan skips unreachable throws before a forward join', (t) => {
+  const codeItems = [
+    { instruction: { op: 'astore', varnum: 1 } },
+    { instruction: { op: 'aload', varnum: 2 } },
+    { instruction: { op: 'ifnull', arg: 'Lnull' } },
+    { instruction: { op: 'ldc', arg: '{...}' } },
+    { instruction: { op: 'goto', arg: 'Ljoin' } },
+    { instruction: 'athrow' },
+    { labelDef: 'Lnull:' },
+    { instruction: { op: 'ldc', arg: 'null' } },
+    { labelDef: 'Ljoin:' },
+    { instruction: { op: 'invokestatic', arg: [null, 'Reporter', ['wrap', '()V']] } },
+    { instruction: 'athrow' },
+  ];
+  const labels = new Map([['Lnull', 6], ['Ljoin', 8]]);
+
+  t.ok(wasmJitTest.isNoOpExceptionHandler(codeItems, 0, labels),
+    'an unreachable trap before the pending join is not mistaken for handler recovery');
+  t.end();
+});
+
+test('Wasm JIT retries a deferred loop after its static helper becomes available', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmDeferredHarness', `
+public class WasmDeferredHarness {
+  static class Helper {
+    static int marker;
+    static { marker = 1; }
+    static int mix(int value) { return value * 3 + 1; }
+  }
+  public static void compute(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = Helper.mix(out[i]);
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmDeferredHarness');
+  jvm.classInitializationState.set('WasmDeferredHarness', 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy('WasmDeferredHarness', 'compute', '([I)V');
+  const frame = new Frame(method);
+  frame.className = 'WasmDeferredHarness';
+
+  t.equal(jvm.jit.wasmJit.prepare(frame), null,
+    'caller initially defers while the helper class is unavailable');
+  t.equal(jvm.jit.wasmJit.methodState(frame).status, 'cold',
+    'a dependency miss does not permanently reject the caller');
+
+  await jvm.loadClassByName('WasmDeferredHarness$Helper');
+  jvm.classInitializationState.set('WasmDeferredHarness$Helper', 'INITIALIZED');
+  // The first retry observes the adaptive two-entry backoff.
+  jvm.jit.wasmJit.prepare(frame);
+  const prepared = jvm.jit.wasmJit.prepare(frame);
+  t.ok(prepared, 'caller recompiles after its helper becomes linkable');
+  t.equal(jvm.jit.wasmJit.methodState(frame).status, 'ready',
+    'successfully retried caller remains ready');
   t.end();
 });
 
@@ -1086,8 +1202,14 @@ test('generated JIT preserves monitors for structurally supported hot methods', 
   const classpath = compileJavaFixture(t, 'GeneratedMonitorJitHarness', `
 public class GeneratedMonitorJitHarness {
   public static void compute(int[] out, int value) {
-    synchronized (out) {
-      for (int i = 0; i < out.length; i++) out[i] += value;
+    try {
+      synchronized (out) {
+        for (int i = 0; i < out.length; i++) out[i] += value;
+      }
+    } catch (RuntimeException failure) {
+      throw new IllegalStateException(
+        new StringBuilder().append("compute(").append(out).append(")").toString(),
+        failure);
     }
   }
 }
@@ -1097,6 +1219,10 @@ public class GeneratedMonitorJitHarness {
     jit: { warmupThreshold: 100 },
   });
   await jvm.loadClassByName('GeneratedMonitorJitHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'GeneratedMonitorJitHarness', 'compute', '([II)V');
+  t.ok(jvm.jit.isCodegenSupported(method),
+    'constructor calls reachable only from a monitor exception reporter do not reject the hot body');
   const thread = {
     id: 0,
     name: 'monitor-generated-jit-test',

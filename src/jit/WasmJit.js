@@ -232,7 +232,13 @@ function isNoOpExceptionHandler(codeItems, handlerIndex, labelIndex) {
     const instruction = codeItems[i] && codeItems[i].instruction;
     const op = getOp(instruction);
     if (!op) continue;
-    if (op === 'athrow') return i >= furthestForwardTarget;
+    if (op === 'athrow') {
+      // Obfuscators commonly leave an unreachable throw on one side of a
+      // forward null-selection branch. It is not the handler terminator when
+      // another branch target still has to be visited.
+      if (i >= furthestForwardTarget) return true;
+      continue;
+    }
     if (op === 'goto' || op.startsWith('if')) {
       const target = instruction && typeof instruction === 'object'
         ? labelIndex.get(instruction.arg) : undefined;
@@ -1237,6 +1243,8 @@ class WasmJit {
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
+    this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
+    this.compileEpoch = 0;
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
   }
@@ -1261,7 +1269,10 @@ class WasmJit {
 
     if (st.status === 'cold') {
       st.entries += 1;
-      if (st.entries < this.warmupThreshold || !this.jit.hasBackwardBranch(frame.method)) {
+      const dependencyChanged = st.deferredEpoch !== undefined &&
+        st.deferredEpoch !== this.compileEpoch;
+      const threshold = dependencyChanged ? 1 : (st.retryAfter || this.warmupThreshold);
+      if (st.entries < threshold || !this.jit.hasBackwardBranch(frame.method)) {
         return null;
       }
       this.compile(frame, st);
@@ -1314,23 +1325,35 @@ class WasmJit {
       const meta = translator.translate();
       if (asCallee) {
         // A linked callee cannot spill back into a Java frame in the middle of
-        // its synchronous wasm import. Only whole, unboxed numeric helpers are
-        // valid. They need not contain a loop: removing their call boundary is
-        // precisely what lets the caller's loop remain compiled.
-        if (!meta.fullyCompiled || meta.boxedCount) {
+        // its synchronous wasm import. Its normal flow must therefore be
+        // complete and unboxed; handler-only diagnostic reporters may remain
+        // outside Wasm. It need not contain a loop: removing the call boundary
+        // is precisely what lets the caller's loop remain compiled.
+        if (!meta.normalFlowFullyCompiled || meta.boxedCount) {
           throw new Unsupported('callee is not fully compiled');
         }
       } else {
         // Standalone entry has call/materialization overhead, so require at
         // least one fully compiled loop.
         const hasCompiledLoop = this.hasSupportedBackwardBranch(frame.method, meta);
-        if (!hasCompiledLoop) throw new Unsupported('no compiled loop');
+        if (!hasCompiledLoop) {
+          if (this.debug && meta.demoteReasons.size) {
+            const details = [...meta.demoteReasons.entries()]
+              .map(([block, reason]) => `${block}:${reason}`).join(', ');
+            console.error(`[wasmjit] no compiled loop ${st.key}: ${details}`);
+          }
+          throw new Unsupported('no compiled loop');
+        }
       }
       const module = new WebAssembly.Module(meta.bytes);
       const instance = new WebAssembly.Instance(module, meta.importObject);
       st.meta = meta;
       st.run = instance.exports.run;
       st.status = 'ready';
+      st.retryAfter = undefined;
+      st.deferredEpoch = undefined;
+      st.calleeDeferredEpoch = undefined;
+      this.compileEpoch += 1;
       if (!isRecompile) this.compiled.push(st);
       if (this.debug) {
         console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${meta.bytes.length}B, ` +
@@ -1344,23 +1367,28 @@ class WasmJit {
         if (this.debug) console.error(`[wasmjit] recompile of ${st.key} failed (${err.message}), keeping old module`);
         return;
       }
-      if (asCallee && err instanceof Unsupported && (st.calleeFails || 0) < 2) {
-        // A dependency may not be initialized/compiled yet. Permit bounded
-        // rediscovery from later parent compilations without probing on every
-        // interpreter tick.
-        st.calleeFails = (st.calleeFails || 0) + 1;
+      if (asCallee && err instanceof Unsupported) {
+        // Callee linking is stricter than standalone execution. A failed link
+        // must not blacklist the method from later standalone compilation.
+        // Reconsider it as a callee after some other dependency compiles.
+        st.calleeDeferredEpoch = this.compileEpoch;
         st.status = 'cold';
         st.entries = 0;
         if (this.debug) console.error(`[wasmjit] deferred callee ${st.key}: ${err.message}`);
         return;
       }
-      // "no compiled loop" is often transient — the loop's callee just isn't
-      // compiled yet. Retry with backoff instead of failing permanently.
-      if (err instanceof Unsupported && err.message === 'no compiled loop' && (st.fails || 0) < 3) {
-        st.fails = (st.fails || 0) + 1;
+      // "no compiled loop" is often transient: a class or numeric callee may
+      // become ready later in startup. Never permanently blacklist that
+      // method. A successful compilation elsewhere retries it immediately;
+      // otherwise use bounded exponential entry backoff.
+      if (err instanceof Unsupported && err.message === 'no compiled loop') {
+        const previous = st.retryAfter || Math.max(1, this.warmupThreshold);
+        st.retryAfter = Math.min(this.retryBackoffMax, previous * 2);
+        st.deferredEpoch = this.compileEpoch;
         st.status = 'cold';
-        st.entries = 0; // retry on next entry/probe — a compile attempt is ~1ms
-        if (this.debug) console.error(`[wasmjit] deferred ${st.key}: no compiled loop yet (retry ${st.fails})`);
+        st.entries = 0;
+        if (this.debug) console.error(`[wasmjit] deferred ${st.key}: no compiled loop yet ` +
+          `(retry after ${st.retryAfter} entries or dependency compilation)`);
         return;
       }
       st.status = 'failed';
@@ -1442,7 +1470,7 @@ class WasmJit {
     if (!method || !(method.flags || []).includes('static')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
-    if (st.status === 'cold' && (st.calleeFails || 0) < 3) {
+    if (st.status === 'cold' && st.calleeDeferredEpoch !== this.compileEpoch) {
       const hasClassInitializer = clsAst.items
         .filter((i) => i.type === 'method')
         .some((i) => i.method.name === '<clinit>');
@@ -1452,7 +1480,8 @@ class WasmJit {
         this.compile({ method, className }, st, { asCallee: true });
       }
     }
-    return st && st.status === 'ready' ? st : null;
+    return st && st.status === 'ready' && st.meta.normalFlowFullyCompiled && !st.meta.boxedCount
+      ? st : null;
   }
 
   dumpStats() {
@@ -1463,3 +1492,4 @@ class WasmJit {
 }
 
 module.exports = WasmJit;
+module.exports._test = { isNoOpExceptionHandler };

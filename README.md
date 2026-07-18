@@ -128,6 +128,30 @@ bounded, forward-only, always-rethrow diagnostic handlers as non-recovering, so
 their protected compute loops remain eligible. A catch that returns, acquires a
 monitor, loops backwards, or writes recovery state remains interpreted.
 
+#### Portable save states
+
+`JVM.saveState()` captures a JSON-compatible execution checkpoint and
+`await JVM.loadState(state)` restores it into a fresh JVM. Unlike the debugger's
+lightweight `serialize()` history, a save state includes loaded-class statics,
+the shared/cyclic Java heap, frame locals and operand stacks, thread and monitor
+references, class initialization, interned strings, relative sleep deadlines,
+and `long`/BigInt values.
+
+```js
+const checkpoint = jvm.saveState();
+fs.writeFileSync('game.state.json', JSON.stringify(checkpoint));
+
+const resumed = new JVM({ classpath });
+await resumed.loadState(JSON.parse(fs.readFileSync('game.state.json', 'utf8')));
+await resumed.execute();
+```
+
+Generated JS and Wasm are rebuilt after loading, keeping states portable across
+JavaScript engines. Random-access files reopen from their saved path, mode, and
+position. Host sockets, audio devices, and canvas objects are not serialized;
+`externalResources` lists omissions so an embedding can reconnect or recreate
+them. Capture at a scheduler boundary rather than during a pending native call.
+
 #### Web-Based Debugging
 
 ```bash

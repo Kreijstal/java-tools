@@ -431,12 +431,10 @@ class JitCompiler {
       // the parent can resume after the call without abandoning its compiled
       // numeric regions. Parking primitives remain excluded above.
       if (!this.hasJitSafeMonitorBody(codeItems)) return false;
-      return !codeItems.some((item) => {
-        const instruction = item && item.instruction;
-        return getOp(instruction) === 'invokespecial' && instruction &&
+      return !normalFlowContains(codeItems, (instruction, op) =>
+        op === 'invokespecial' && instruction &&
           Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
-          instruction.arg[2][0] === '<init>';
-      });
+          instruction.arg[2][0] === '<init>');
     }
     return !normalFlowContainsInvoke(codeItems);
   }
@@ -1546,6 +1544,11 @@ function hasExperimentalControlFlow(codeItems) {
 }
 
 function normalFlowContainsInvoke(codeItems) {
+  return normalFlowContains(codeItems, (_instruction, op) =>
+    Boolean(op && op.startsWith("invoke")));
+}
+
+function normalFlowContains(codeItems, predicate) {
   const labels = buildLabelMap(codeItems);
   const pending = [0];
   const visited = new Set();
@@ -1557,7 +1560,7 @@ function normalFlowContainsInvoke(codeItems) {
 
     const instruction = codeItems[index] && codeItems[index].instruction;
     const op = getOp(instruction);
-    if (op && op.startsWith("invoke")) return true;
+    if (predicate(instruction, op)) return true;
 
     if (op === "athrow" || op === "return" || op === "areturn" ||
       op === "dreturn" || op === "freturn" || op === "ireturn" || op === "lreturn") {
@@ -1565,13 +1568,23 @@ function normalFlowContainsInvoke(codeItems) {
     }
     if (op === "goto" || op === "goto_w") {
       const target = branchTargetIndex(instruction, labels);
-      if (target === undefined) return codeItems.some(hasInvokeInstruction);
+      if (target === undefined) {
+        return codeItems.some((item) => {
+          const candidate = item && item.instruction;
+          return predicate(candidate, getOp(candidate));
+        });
+      }
       pending.push(target);
       continue;
     }
     if (op && op.startsWith("if")) {
       const target = branchTargetIndex(instruction, labels);
-      if (target === undefined) return codeItems.some(hasInvokeInstruction);
+      if (target === undefined) {
+        return codeItems.some((item) => {
+          const candidate = item && item.instruction;
+          return predicate(candidate, getOp(candidate));
+        });
+      }
       pending.push(target);
     }
     // Label-only entries and ordinary instructions both fall through.
@@ -1585,11 +1598,6 @@ function branchTargetIndex(instruction, labels) {
   if (!instruction || typeof instruction !== "object") return undefined;
   const arg = Array.isArray(instruction.arg) ? instruction.arg[0] : instruction.arg;
   return labels.get(arg);
-}
-
-function hasInvokeInstruction(item) {
-  const op = getOp(item && item.instruction);
-  return Boolean(op && op.startsWith("invoke"));
 }
 
 function jsLiteral(value) {
