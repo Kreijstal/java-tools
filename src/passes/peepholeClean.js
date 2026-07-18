@@ -2100,17 +2100,34 @@ function removeDeadGotoIslandsAfterTerminals(code, context = null) {
     const instruction = codeItems[i] && codeItems[i].instruction;
     if (!isTerminalOpcode(opcodeMnemonic(instruction))) continue;
 
-    let j = nextInstructionIndex(codeItems, i + 1);
+    let scanStart = i + 1;
+    let j = nextInstructionIndex(codeItems, scanStart);
     while (j != null) {
-      const label = trimLabel(codeItems[j] && codeItems[j].labelDef);
-      if (label && ((refCounts.get(label) || 0) > 0 || isLabelProtected(code, label))) break;
+      // nextInstructionIndex deliberately skips label-only and nop entries.
+      // A referenced label in that skipped range is a live alternate entry,
+      // so the following goto is not a dead post-terminal island: removing it
+      // changes the branch target's continuation (and can disconnect a whole
+      // region, as in Dekobloko's flat-triangle rasterizer).
+      let hasLiveEntry = false;
+      for (let k = scanStart; k <= j; k += 1) {
+        const label = trimLabel(codeItems[k] && codeItems[k].labelDef);
+        if (label && ((refCounts.get(label) || 0) > 0 || isLabelProtected(code, label))) {
+          hasLiveEntry = true;
+          break;
+        }
+      }
+      if (hasLiveEntry) break;
       const op = opcodeMnemonic(codeItems[j] && codeItems[j].instruction);
       if (op !== 'goto' && op !== 'goto_w') break;
       const target = trimLabel(getBranchArg(codeItems[j].instruction));
       if (target) refCounts.set(target, Math.max(0, (refCounts.get(target) || 0) - 1));
+      const previousLength = codeItems.length;
       removeInstructionOnly(codeItems, j);
       removed += 1;
-      j = nextInstructionIndex(codeItems, j + 1);
+      // An unlabelled item is spliced, so the next unscanned entry shifts into
+      // j. A labelled item stays in place with only its instruction removed.
+      scanStart = codeItems.length < previousLength ? j : j + 1;
+      j = nextInstructionIndex(codeItems, scanStart);
     }
   }
 
