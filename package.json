@@ -31,7 +31,7 @@
     "@modelcontextprotocol/sdk": "^1.21.1",
     "crc-32": "^1.2.2",
     "decimal.js": "^10.4.3",
-    "diff": "^8.0.0",
+    "diff": "^9.0.0",
     "jpeg-js": "^0.4.4",
     "jszip": "^3.10.1",
     "jvm_parser": "^0.0.13",
