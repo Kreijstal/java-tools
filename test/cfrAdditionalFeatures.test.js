@@ -720,7 +720,7 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public boolean condAssignNoDup\(boolean a, boolean b\) \{\s*boolean c;\s*return b && a == \(c = b\) \|\| b && \(c = a\);\s*}/, 'frontend assignment-expression boolean condition is reconstructed');
     t.match(source, /public void guard\(boolean ok\) \{\s*if \(!ok\) \{\s*throw new RuntimeException\("bad"\);\s*}\s*}/, 'materialized boolean guard branches are reconstructed');
     t.match(source, /public void printChoice\(boolean flag, PrintStream out, String yes, String no\) \{\s*out\.print\(flag \? yes : no\);\s*}/, 'stack ternary values survive into following calls');
-    t.match(source, /public void printAsObject\(PrintStream out, String value\) \{\s*out\.print\(\(Object\) value\);\s*}/,
+    t.match(source, /public void printAsObject\(PrintStream out, String value\) \{\s*out\.print\(\(Object\) \(value\)\);\s*}/,
       'JRE overload metadata pins a deliberately broad bytecode descriptor');
     t.match(source, /public void bounds\(int value\) \{\s*if \(\(?value < 0\)? \|\| value >= 100\) \{\s*throw new RuntimeException\("bounds"\);\s*}\s*}/, 'nested materialized boolean guards simplify to boolean expressions');
     t.match(source, /public int countDownOnce\(int n\) \{\s*int count = 0;\s*do \{\s*count = count \+ 1;\s*n--;\s*} while \(n > 0\);\s*return count;\s*}/, 'back-edge conditional loops are reconstructed as do/while');
@@ -736,13 +736,13 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public void releaseResource\(ByteArrayInputStream resource, Throwable primary\) \{\s*if \(resource != null\) \{\s*resource\.close\(\);\s*}\s*}/, 'try-with-resources release graph lowers to guarded close');
     t.notOk(/addSuppressed|Ltwr|\/\/\s*goto/.test(source), 'try-with-resources release scaffolding is consumed');
     t.notOk(/new StringBuilder\(\)\.append/.test(source), 'string builder implementation detail is hidden');
-    t.match(source, /int\[\] (\w+) = null;[\s\S]*?\1 = \(int\[\]\) \w+;[\s\S]*?\1\[0\]/,
+    t.match(source, /int\[\] (\w+) = null;[\s\S]*?\1 = \(int\[\]\) \(\w+\);[\s\S]*?\1\[0\]/,
       'primitive array opcodes refine an Object[] carrier to the verifier array type');
     t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) \(Object\) \w+;/,
       'post-emission Object[] refinement casts earlier Object assignments');
     t.match(source, /int booleanOrOne\(boolean param0, boolean param1\) \{\s*return param0 \? 1 : \(?param1 \? 1 : 0\)?;\s*}/,
       'mixed int/boolean ternary branches materialize verifier booleans as ints');
-    t.match(source, /void writePrimitiveCarrier\(Object param0\) \{\s*\(\(int\[\]\) param0\)\[0\] = 7;\s*}/,
+    t.match(source, /void writePrimitiveCarrier\(Object param0\) \{\s*\(\(int\[\]\) \(param0\)\)\[0\] = 7;\s*}/,
       'primitive array stores cast incompatible reference carriers at the lvalue');
     t.notOk(/if \(false\) throw \(NumberFormatException\) null;/.test(source),
       'unchecked catches do not receive a synthetic reachability anchor');

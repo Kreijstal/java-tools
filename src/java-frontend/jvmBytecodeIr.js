@@ -799,7 +799,7 @@ function emitValue(value, state) {
   }
   if (value.kind === 'MethodCallValue') {
     let argStack = 0;
-    if (value.invokeKind !== 'static') {
+    if (value.invokeKind !== 'static' && value.invokeKind !== 'staticInterface') {
       const receiver = emitValue(value.receiver, state);
       if (!receiver) return null;
       argStack += receiver.stack;
@@ -809,10 +809,10 @@ function emitValue(value, state) {
       if (!emitted) return null;
       argStack += emitted.stack;
     }
-    const opcode = value.invokeKind === 'static'
+    const opcode = value.invokeKind === 'static' || value.invokeKind === 'staticInterface'
       ? 'invokestatic'
       : (value.invokeKind === 'special' ? 'invokespecial' : (value.invokeKind === 'interface' ? 'invokeinterface' : 'invokevirtual'));
-    const referenceKind = opcode === 'invokeinterface' ? 'InterfaceMethod' : 'Method';
+    const referenceKind = opcode === 'invokeinterface' || value.invokeKind === 'staticInterface' ? 'InterfaceMethod' : 'Method';
     const fields = opcode === 'invokeinterface' ? { count: String(1 + parameterSlotCount(value.descriptor)) } : {};
     state.instructions.push(createJvmInstruction(opcode, [referenceKind, value.owner, value.name, value.descriptor], fields));
     const stack = value.type === 'V' ? 0 : slotWidthFromDescriptor(value.type);
@@ -1197,6 +1197,8 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       const defaultGroup = (op.groups || []).find((group) => group.isDefault);
       const groupLabels = (op.groups || []).map(() => `Lswitch_case_${state.nextLabel++}`);
       const defaultLabel = defaultGroup ? groupLabels[(op.groups || []).indexOf(defaultGroup)] : endLabel;
+      const previousBreakLabel = op.label ? state.labeledBreakLabels.get(op.label) : undefined;
+      if (op.label) state.labeledBreakLabels.set(op.label, endLabel);
       for (let groupIndex = 0; groupIndex < (op.groups || []).length; groupIndex += 1) {
         const group = op.groups[groupIndex];
         for (const caseValue of group.caseValues || []) {
@@ -1217,6 +1219,10 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
         for (const child of op.groups[groupIndex].bodyOps || []) emitOp(child);
       }
       state.breakLabels.pop();
+      if (op.label) {
+        if (previousBreakLabel === undefined) state.labeledBreakLabels.delete(op.label);
+        else state.labeledBreakLabels.set(op.label, previousBreakLabel);
+      }
       instructions.push(createJvmInstruction('nop', [], { label: endLabel }));
     } else if (op.op === 'break') {
       const label = op.label ? state.labeledBreakLabels.get(op.label) : state.breakLabels[state.breakLabels.length - 1];

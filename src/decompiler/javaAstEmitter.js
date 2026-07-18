@@ -1,10 +1,28 @@
 'use strict';
 
-const { createNode, blockStatement } = require('../java-frontend/ast');
+const {
+  createNode,
+  blockStatement,
+  formalParameter,
+  classType,
+} = require('../java-frontend/ast');
 
 const rawExpression = (source) => createNode('UnsupportedExpression', { source: String(source) });
 const rawStatement = (source) => createNode('UnsupportedStatement', { source: String(source) });
 const block = (statements) => blockStatement(statements || []);
+
+function classTypeFromSourceName(sourceName) {
+  const parts = String(sourceName).split('.');
+  return classType(parts.pop(), { packageName: parts.join('.') || null });
+}
+
+function catchParameter(name, types) {
+  const alternatives = types.map(classTypeFromSourceName);
+  const parameterType = alternatives.length === 1
+    ? alternatives[0]
+    : createNode('UnionType', { alternatives });
+  return formalParameter(name, parameterType);
+}
 
 function treeToStatements(tree, render) {
   if (!tree) return [];
@@ -54,7 +72,7 @@ function treeToStatements(tree, render) {
       resources: [],
       block: block(treeToStatements(tree.body, render)),
       catches: tree.catches.map((item) => createNode('CatchClause', {
-        parameter: { name: item.varName, typeSource: item.type },
+        parameter: catchParameter(item.varName, item.types || [item.type]),
         body: block([
           ...(item.carrierName ? [rawStatement(`${item.carrierName} = ${item.varName};`)] : []),
           ...treeToStatements(item.body, render),
@@ -120,7 +138,7 @@ function emitStatement(node, indent, lines) {
     case 'TryStatement':
       emit('try {'); emitBlock(node.block, indent + 1, lines);
       for (const item of node.catches || []) {
-        emit(`} catch (${item.parameter.typeSource} ${item.parameter.name}) {`);
+        emit(`} catch (${emitType(item.parameter.parameterType)} ${item.parameter.name}) {`);
         emitBlock(item.body, indent + 1, lines);
       }
       emit('}');
@@ -132,6 +150,14 @@ function emitStatement(node, indent, lines) {
 function emitExpression(node) {
   if (node && node.kind === 'UnsupportedExpression') return node.source;
   throw new Error(`cannot emit Java expression node ${node && node.kind}`);
+}
+
+function emitType(node) {
+  if (node && node.kind === 'UnionType') return node.alternatives.map(emitType).join(' | ');
+  if (node && node.kind === 'ClassType') {
+    return `${node.packageName ? `${node.packageName}.` : ''}${node.name}`;
+  }
+  throw new Error(`cannot emit Java type node ${node && node.kind}`);
 }
 
 module.exports = { treeToStatements, emitStatements, rawExpression, rawStatement };

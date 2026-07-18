@@ -113,3 +113,36 @@ test('CFR-JS writes outputdir Java sources', (t) => {
   });
   t.end();
 });
+
+test('CFR-JS output recompiles for lambdas, synthetic accessors, and enum constant bodies', (t) => {
+  withTempDir('cfr-js-recompile-', (tempDir) => {
+    const inputClasses = path.join(tempDir, 'input-classes');
+    const outputSources = path.join(tempDir, 'output-sources');
+    const outputClasses = path.join(tempDir, 'output-classes');
+    fs.mkdirSync(inputClasses);
+    fs.mkdirSync(outputClasses);
+    const fixture = path.join(projectRoot, 'test', 'fixtures', 'cfr', 'CompileFeatureFixture.java');
+    const compileInput = spawnSync('javac', [
+      '-source', '8', '-target', '8', '-d', inputClasses, fixture,
+    ], { encoding: 'utf8' });
+    t.equal(compileInput.status, 0, `fixture compiles: ${combined(compileInput)}`);
+
+    const decompile = node(['scripts/runCfr.js', '--outputdir', outputSources, inputClasses]);
+    t.equal(decompile.status, 0, `fixture decompiles: ${combined(decompile)}`);
+    const generated = fs.readdirSync(outputSources)
+      .filter((name) => name.endsWith('.java'))
+      .map((name) => path.join(outputSources, name));
+    t.notOk(generated.some((name) => /Operation\$\d+\.java$/.test(name)),
+      'enum constant body classes are folded into the parent enum');
+
+    const compileOutput = spawnSync('javac', [
+      '-source', '8', '-target', '8', '-d', outputClasses, ...generated,
+    ], { encoding: 'utf8' });
+    t.equal(compileOutput.status, 0, `all decompiled sources recompile: ${combined(compileOutput)}`);
+    const runOutput = spawnSync('java', [
+      '-cp', outputClasses, 'CompileFeatureFixture',
+    ], { encoding: 'utf8' });
+    t.equal(runOutput.status, 0, `decompiled runtime annotation is preserved: ${combined(runOutput)}`);
+  });
+  t.end();
+});

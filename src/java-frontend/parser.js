@@ -1706,6 +1706,12 @@ class ParserImpl {
     }
 
     const arrowIndex = findTopLevelToken(safeTokens, '->');
+    const assignmentIndex = findTopLevelToken(safeTokens, '=');
+    if (assignmentIndex > 0 && arrowIndex > assignmentIndex) {
+      const left = this.expressionFromTokens(safeTokens.slice(0, assignmentIndex));
+      const right = this.expressionFromTokens(safeTokens.slice(assignmentIndex + 1));
+      if (left && right) return ast.createNode('AssignmentExpression', { operator: '=', left, right });
+    }
     if (arrowIndex > 0) {
       const parameterTokens = safeTokens.slice(0, arrowIndex);
       const normalizedParameters = parameterTokens[0] && parameterTokens[0].text === '('

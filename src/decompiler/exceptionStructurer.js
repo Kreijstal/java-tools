@@ -113,7 +113,17 @@ function normalizeTable(exceptionTable, syncHandlers) {
   for (const r of rows) {
     const key = `${r.start_pc}:${r.end_pc}`;
     if (!byKey.has(key)) { byKey.set(key, { start_pc: r.start_pc, end_pc: r.end_pc, catches: [] }); order.push(key); }
-    byKey.get(key).catches.push({ catch_type: r.catch_type, handler_pc: r.handler_pc });
+    const catches = byKey.get(key).catches;
+    const sharedHandler = catches.find((item) => item.handler_pc === r.handler_pc);
+    if (sharedHandler) {
+      const types = Array.isArray(sharedHandler.catch_type)
+        ? sharedHandler.catch_type
+        : [sharedHandler.catch_type];
+      if (!types.includes(r.catch_type)) types.push(r.catch_type);
+      sharedHandler.catch_type = types;
+    } else {
+      catches.push({ catch_type: r.catch_type, handler_pc: r.handler_pc });
+    }
   }
   // Each group carries an explicit `ranges` list so downstream membership tests
   // stay uniform. Rows are kept one range per group (no cross-handler merging):
@@ -172,8 +182,13 @@ function inLogicalTryRange(pc, group) {
 /** Render a catch_type (class-internal name, or 0/"any"/null catch-all) as a
  * Java type. Catch-all becomes java.lang.Throwable. */
 function renderCatchType(catch_type) {
-  if (catch_type == null || catch_type === 0 || catch_type === 'any') return 'java.lang.Throwable';
-  return String(catch_type).replace(/\//g, '.');
+  return renderCatchTypes(catch_type).join(' | ');
+}
+
+function renderCatchTypes(catch_type) {
+  if (Array.isArray(catch_type)) return catch_type.flatMap(renderCatchTypes);
+  if (catch_type == null || catch_type === 0 || catch_type === 'any') return ['java.lang.Throwable'];
+  return [String(catch_type).replace(/\//g, '.')];
 }
 
 // JRE ancestry for the throwable types these class files actually catch. Used
@@ -201,10 +216,12 @@ const CATCH_TYPE_ANCESTORS = new Map([
 /** True when a `catch (earlier)` clause makes a following `catch (later)`
  * unreachable for javac: same type, catch-all Throwable, or a known JRE
  * ancestor/descendant pair. */
-function catchTypeSubsumes(earlier, later) {
-  if (earlier === later) return true;
-  if (earlier === 'java.lang.Throwable') return true;
-  return (CATCH_TYPE_ANCESTORS.get(later) || []).includes(earlier);
+function catchTypesSubsumes(earlierTypes, laterTypes) {
+  return earlierTypes.some((earlierType) => laterTypes.some((laterType) => {
+    if (earlierType === laterType) return true;
+    if (earlierType === 'java.lang.Throwable') return true;
+    return (CATCH_TYPE_ANCESTORS.get(laterType) || []).includes(earlierType);
+  }));
 }
 
 // ---------------------------------------------------------------------------
@@ -474,7 +491,7 @@ function remapTreeBlocks(node, f) {
     case 'try': return {
       t: 'try', body: remapTreeBlocks(node.body, f),
       catches: node.catches.map((c) => ({
-        type: c.type, varName: c.varName, carrierName: c.carrierName, body: remapTreeBlocks(c.body, f),
+        types: c.types, varName: c.varName, carrierName: c.carrierName, body: remapTreeBlocks(c.body, f),
       })),
     };
     case 'synchronized': return {
@@ -656,7 +673,7 @@ function substituteSupers(node, overrides) {
     case 'try': return {
       t: 'try', body: substituteSupers(node.body, overrides),
       catches: node.catches.map((c) => ({
-        type: c.type, varName: c.varName, carrierName: c.carrierName, body: substituteSupers(c.body, overrides),
+        types: c.types, varName: c.varName, carrierName: c.carrierName, body: substituteSupers(c.body, overrides),
       })),
     };
     case 'synchronized': return {
@@ -1067,7 +1084,7 @@ function processGroup(work, group, ctx, commit) {
       if (hTree instanceof Bail) return hTree;
       hTree = wrapRegionExits(hTree);
       catches.push({
-        type: renderCatchType(group.catches[ci].catch_type),
+        types: renderCatchTypes(group.catches[ci].catch_type),
         varName: 'decompiledCaughtParameter',
         carrierName: 'decompiledCaughtException',
         body: hTree,
@@ -1083,7 +1100,7 @@ function processGroup(work, group, ctx, commit) {
     for (;;) {
       const siblings = tryNode.catches;
       const shadowed = siblings.findIndex((item, index) => index > 0
-        && siblings.slice(0, index).some((earlier) => catchTypeSubsumes(earlier.type, item.type)));
+        && siblings.slice(0, index).some((earlier) => catchTypesSubsumes(earlier.types, item.types)));
       if (shadowed <= 0) break;
       tryNode = {
         t: 'try',

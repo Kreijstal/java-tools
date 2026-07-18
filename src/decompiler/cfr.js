@@ -58,6 +58,80 @@ const LONG_CONSTS = { lconst_0: '0L', lconst_1: '1L' };
 const FLOAT_CONSTS = { fconst_0: '0.0f', fconst_1: '1.0f', fconst_2: '2.0f' };
 const DOUBLE_CONSTS = { dconst_0: '0.0', dconst_1: '1.0' };
 
+function rawConstantPoolValue(pool, index) {
+  const entry = pool[index];
+  if (!entry) return null;
+  if (entry.tag === 1) return entry.info.bytes;
+  if (entry.tag === 3) return entry.info.bytes | 0;
+  if (entry.tag === 4) {
+    const view = new DataView(new ArrayBuffer(4));
+    view.setUint32(0, entry.info.bytes >>> 0, false);
+    return view.getFloat32(0, false);
+  }
+  if (entry.tag === 5) {
+    const bits = (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes);
+    return bits >= (1n << 63n) ? bits - (1n << 64n) : bits;
+  }
+  if (entry.tag === 6) {
+    const view = new DataView(new ArrayBuffer(8));
+    view.setBigUint64(0, (BigInt(entry.info.high_bytes) << 32n) | BigInt(entry.info.low_bytes), false);
+    return view.getFloat64(0, false);
+  }
+  if (entry.tag === 7) return rawConstantPoolValue(pool, entry.info.name_index);
+  if (entry.tag === 8) return rawConstantPoolValue(pool, entry.info.string_index);
+  return null;
+}
+
+function parseAnnotationValue(raw, pool) {
+  if (!raw) return { kind: 'unknown', value: null };
+  const tag = String.fromCharCode(Number(raw.tag));
+  const value = raw.value || {};
+  if (tag === 'e') return {
+    kind: 'enum',
+    type: rawConstantPoolValue(pool, value.type_name_index),
+    name: rawConstantPoolValue(pool, value.const_name_index),
+  };
+  if (tag === 'c') return { kind: 'class', value: rawConstantPoolValue(pool, value.class_info_index) };
+  if (tag === '@') return { kind: 'annotation', value: parseRawAnnotation(value.annotation_value, pool) };
+  if (tag === '[') return { kind: 'array', values: (value.values || []).map((item) => parseAnnotationValue(item, pool)) };
+  return { kind: tag, value: rawConstantPoolValue(pool, value.const_value_index) };
+}
+
+function parseRawAnnotation(annotation, pool) {
+  const type = rawConstantPoolValue(pool, annotation.type_index);
+  const elements = {};
+  for (const pair of annotation.element_value_pairs || []) {
+    elements[rawConstantPoolValue(pool, pair.element_name_index)] = parseAnnotationValue(pair.value, pool);
+  }
+  return { type: String(type || '').replace(/^L|;$/g, ''), elements };
+}
+
+function runtimeVisibleAnnotations(attributes, pool) {
+  const attribute = (attributes || []).find((item) => item && item.attribute_name_index
+    && item.attribute_name_index.name && item.attribute_name_index.name.info
+    && item.attribute_name_index.name.info.bytes === 'RuntimeVisibleAnnotations');
+  return attribute && attribute.info
+    ? (attribute.info.annotations || []).map((annotation) => parseRawAnnotation(annotation, pool)) : [];
+}
+
+function convertParsedClass(parsed) {
+  const converted = convertJson(parsed.ast, parsed.constantPool);
+  const cls = (converted.classes || [])[0];
+  if (!cls) return converted;
+  cls.annotations = runtimeVisibleAnnotations(parsed.ast.attributes, parsed.constantPool);
+  const convertedFields = (cls.items || []).filter((item) => item.type === 'field' && item.field);
+  (parsed.ast.fields || []).forEach((field, index) => {
+    if (convertedFields[index]) convertedFields[index].field.annotations =
+      runtimeVisibleAnnotations(field.attributes, parsed.constantPool);
+  });
+  const convertedMethods = (cls.items || []).filter((item) => item.type === 'method' && item.method);
+  (parsed.ast.methods || []).forEach((method, index) => {
+    if (convertedMethods[index]) convertedMethods[index].method.annotations =
+      runtimeVisibleAnnotations(method.attributes, parsed.constantPool);
+  });
+  return converted;
+}
+
 const JAVA_KEYWORDS = new Set([
   'abstract', 'assert', 'boolean', 'break', 'byte', 'case', 'catch', 'char', 'class',
   'const', 'continue', 'default', 'do', 'double', 'else', 'enum', 'extends', 'final',
@@ -74,7 +148,7 @@ function decompileClassFile(classFilePath, options = {}) {
 
 function decompileClassBytes(bytes, options = {}) {
   const parsed = getAST(new Uint8Array(bytes));
-  const astRoot = convertJson(parsed.ast, parsed.constantPool);
+  const astRoot = convertParsedClass(parsed);
   return decompileAstRoot(astRoot, options);
 }
 
@@ -112,7 +186,7 @@ async function decompilePath(inputPath, options = {}) {
     // decompile from the parsed ASTs so cross-class throws resolve.
     const parsed = files.map((file) => {
       const result = getAST(new Uint8Array(fs.readFileSync(file)));
-      return { file, astRoot: convertJson(result.ast, result.constantPool) };
+      return { file, astRoot: convertParsedClass(result) };
     });
     if (profileBulk) console.error(`[cfr-phase] parse ${Date.now() - bulkStarted}ms`);
     const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
@@ -124,6 +198,8 @@ async function decompilePath(inputPath, options = {}) {
     const outputs = [];
     const failures = [];
     for (const { file, astRoot } of parsed) {
+      const primaryClass = (astRoot.classes || [])[0];
+      if (isEnumConstantBodyClass(primaryClass, exceptionModel)) continue;
       const started = Date.now();
       const diagnostics = [];
       if (process.env.CFR_JS_PROFILE_CLASSES === '1') console.error(`[cfr-class-start] ${file}`);
@@ -154,10 +230,11 @@ async function decompilePath(inputPath, options = {}) {
     for (const name of entries) {
       const bytes = await zip.files[name].async('nodebuffer');
       const result = getAST(new Uint8Array(bytes));
-      parsed.push({ name, astRoot: convertJson(result.ast, result.constantPool) });
+      parsed.push({ name, astRoot: convertParsedClass(result) });
     }
     const exceptionModel = buildExceptionModel(parsed.flatMap((entry) => entry.astRoot.classes || []));
-    return parsed.map(({ name, astRoot }) => {
+    return parsed.filter(({ astRoot }) =>
+      !isEnumConstantBodyClass((astRoot.classes || [])[0], exceptionModel)).map(({ name, astRoot }) => {
       const diagnostics = [];
       return {
         name: name.replace(/\.class$/i, '.java'),
@@ -200,23 +277,48 @@ function decompileClassAst(cls, options = {}) {
 
   const className = simpleClassName(cls.className || 'Class');
   const classDeclarationIndex = out.length;
+  for (const annotation of cls.annotations || []) out.push(formatAnnotation(annotation));
   out.push(`${formatClassDeclaration(cls, className, options.exceptionModel)} {`);
 
   const isEnum = (cls.flags || []).includes('enum');
   const allFields = (cls.items || []).filter((item) => item.type === 'field' && item.field);
   const enumConstants = isEnum ? allFields.filter((item) => isEnumConstantField(item.field)) : [];
+  const enumConstantSpecs = isEnum ? recoverEnumConstantSpecs(cls, options.exceptionModel) : new Map();
   const fields = allFields.filter((item) => !shouldSkipField(cls, item.field));
   const methods = (cls.items || [])
     .filter((item) => item.type === 'method' && item.method)
-    .filter((item) => !shouldSkipMethod(cls, item.method));
+    .filter((item) => !shouldSkipMethod(cls, item.method))
+    .filter((item) => !(isEnum && item.method.name === '<clinit>'
+      && enumClinitIsOnlyCompilerScaffolding(cls, enumConstants)));
 
   if (enumConstants.length) {
     const suffix = fields.length || methods.length ? ';' : '';
-    out.push(`    ${enumConstants.map((item) => item.field.name).join(', ')}${suffix}`);
+    enumConstants.forEach((item, index) => {
+      const spec = enumConstantSpecs.get(item.field.name) || { args: [], bodyClass: null };
+      const argumentSource = spec.args.length ? `(${spec.args.join(', ')})` : '';
+      const bodyClass = spec.bodyClass && options.exceptionModel && options.exceptionModel.classInfo
+        ? options.exceptionModel.classInfo.get(spec.bodyClass) : null;
+      const bodyMethods = bodyClass ? (bodyClass.items || [])
+        .filter((childItem) => childItem.type === 'method' && childItem.method
+          && childItem.method.name !== '<init>' && !shouldSkipMethod(bodyClass, childItem.method)) : [];
+      const separator = index === enumConstants.length - 1 ? suffix : ',';
+      if (!bodyMethods.length) {
+        out.push(`    ${item.field.name}${argumentSource}${separator}`);
+      } else {
+        out.push(`    ${item.field.name}${argumentSource} {`);
+        bodyMethods.forEach((childItem, methodIndex) => {
+          formatMethod(bodyClass, childItem.method, renderOptions).split('\n')
+            .forEach((line) => out.push(`        ${line}`));
+          if (methodIndex < bodyMethods.length - 1) out.push('');
+        });
+        out.push(`    }${separator}`);
+      }
+    });
     if (fields.length || methods.length) out.push('');
   }
 
   fields.forEach((item) => {
+    for (const annotation of item.field.annotations || []) out.push(`    ${formatAnnotation(annotation)}`);
     out.push(`    ${formatField(item.field, cls.className)}`);
   });
   const syntheticConstructor = syntheticAbstractSubclassConstructor(cls, className, options.exceptionModel);
@@ -230,6 +332,7 @@ function decompileClassAst(cls, options = {}) {
   }
 
   methods.forEach((item, index) => {
+    for (const annotation of item.method.annotations || []) out.push(`    ${formatAnnotation(annotation)}`);
     const methodText = formatMethod(cls, item.method, renderOptions);
     if (methodText.includes('$cfr$sneakyThrow(')) renderOptions.requiresSneakyThrow = true;
     methodText.split('\n').forEach((line) => out.push(`    ${line}`.replace(/\s+$/g, '')));
@@ -249,6 +352,130 @@ function decompileClassAst(cls, options = {}) {
   const uniqueImports = [...new Set(imports)];
   if (uniqueImports.length) out.splice(classDeclarationIndex, 0, ...uniqueImports, '');
   return out.join('\n');
+}
+
+function annotationDescriptorType(descriptor) {
+  const value = String(descriptor || 'java/lang/Object');
+  if (value.startsWith('[')) return descriptorToJavaType(value);
+  return javaTypeFromInternalName(value.replace(/^L|;$/g, ''));
+}
+
+function formatAnnotationValue(value) {
+  if (!value) return 'null';
+  if (value.kind === 'enum') return `${annotationDescriptorType(value.type)}.${value.name}`;
+  if (value.kind === 'class') return `${annotationDescriptorType(value.value)}.class`;
+  if (value.kind === 'annotation') return formatAnnotation(value.value);
+  if (value.kind === 'array') return `{${(value.values || []).map(formatAnnotationValue).join(', ')}}`;
+  if (value.kind === 's') return formatStringLiteral(String(value.value));
+  if (value.kind === 'C') return formatCharLiteral(Number(value.value));
+  if (value.kind === 'Z') return Number(value.value) === 0 ? 'false' : 'true';
+  if (value.kind === 'J') return `${String(value.value)}L`;
+  if (value.kind === 'F') return formatFloat(value.value);
+  if (value.kind === 'D') return formatDouble(value.value);
+  return String(value.value);
+}
+
+function formatAnnotation(annotation) {
+  const type = javaTypeFromInternalName(annotation.type || 'java/lang/annotation/Annotation');
+  const entries = Object.entries(annotation.elements || {});
+  if (!entries.length) return `@${type}`;
+  if (entries.length === 1 && entries[0][0] === 'value') {
+    return `@${type}(${formatAnnotationValue(entries[0][1])})`;
+  }
+  return `@${type}(${entries.map(([name, value]) =>
+    `${name} = ${formatAnnotationValue(value)}`).join(', ')})`;
+}
+
+function isEnumConstantBodyClass(cls, model) {
+  if (!cls || !(cls.flags || []).includes('enum') || !cls.superClassName
+    || cls.superClassName === 'java/lang/Enum') return false;
+  const parent = model && model.classInfo ? model.classInfo.get(cls.superClassName) : null;
+  return Boolean(parent && (parent.flags || []).includes('enum'));
+}
+
+function constantInstructionSource(instruction) {
+  if (!instruction) return null;
+  if (instruction.op === 'aconst_null') return 'null';
+  if (INTEGER_CONSTS[instruction.op] !== undefined) return INTEGER_CONSTS[instruction.op];
+  if (LONG_CONSTS[instruction.op] !== undefined) return LONG_CONSTS[instruction.op];
+  if (FLOAT_CONSTS[instruction.op] !== undefined) return FLOAT_CONSTS[instruction.op];
+  if (DOUBLE_CONSTS[instruction.op] !== undefined) return DOUBLE_CONSTS[instruction.op];
+  if (instruction.op === 'bipush' || instruction.op === 'sipush') return String(instruction.arg);
+  if (instruction.op !== 'ldc' && instruction.op !== 'ldc_w' && instruction.op !== 'ldc2_w') return null;
+  if (typeof instruction.arg === 'string') return formatStringLiteral(instruction.arg);
+  if (instruction.arg && typeof instruction.arg === 'object' && 'value' in instruction.arg) {
+    return String(instruction.arg.value);
+  }
+  return String(instruction.arg);
+}
+
+function recoverEnumConstantSpecs(cls, model) {
+  const result = new Map();
+  const clinit = (cls.items || []).find((item) => item.type === 'method' && item.method
+    && item.method.name === '<clinit>');
+  const instructions = executableInstructions(clinit && getCode(clinit.method));
+  let construction = null;
+  for (const item of instructions) {
+    const instruction = getInstructionFromItem(item);
+    if (!instruction) continue;
+    if (instruction.op === 'new') {
+      const createdClass = String(instruction.arg || '');
+      const createdInfo = model && model.classInfo ? model.classInfo.get(createdClass) : null;
+      if (createdClass === cls.className || (createdInfo && createdInfo.superClassName === cls.className)) {
+        construction = { bodyClass: createdClass === cls.className ? null : createdClass, constants: [], args: [] };
+      }
+      continue;
+    }
+    if (!construction) continue;
+    const constant = constantInstructionSource(instruction);
+    if (constant != null) {
+      construction.constants.push(constant);
+      continue;
+    }
+    if (instruction.op === 'invokespecial') {
+      let reference;
+      try { reference = parseMemberRef(instruction.arg); } catch (_error) { continue; }
+      if (reference.name !== '<init>') continue;
+      const parameterCount = parseDescriptor(reference.descriptor).params.length;
+      construction.args = construction.constants.slice(-parameterCount).slice(2);
+      continue;
+    }
+    if (instruction.op === 'putstatic') {
+      let reference;
+      try { reference = parseMemberRef(instruction.arg); } catch (_error) { continue; }
+      if (reference.owner === cls.className && reference.name !== '$VALUES' && reference.name !== 'ENUM$VALUES') {
+        result.set(reference.name, construction);
+      }
+      construction = null;
+    }
+  }
+  return result;
+}
+
+function enumClinitIsOnlyCompilerScaffolding(cls, enumConstants) {
+  const constantNames = new Set(enumConstants.map((item) => item.field.name));
+  const clinit = (cls.items || []).find((item) => item.type === 'method' && item.method
+    && item.method.name === '<clinit>');
+  const instructions = executableInstructions(clinit && getCode(clinit.method));
+  if (!instructions.length) return false;
+  const allowedSimple = new Set([
+    'dup', 'aastore', 'anewarray', 'aconst_null', 'return',
+    ...Object.keys(INTEGER_CONSTS), ...Object.keys(LONG_CONSTS),
+    ...Object.keys(FLOAT_CONSTS), ...Object.keys(DOUBLE_CONSTS),
+    'bipush', 'sipush', 'ldc', 'ldc_w', 'ldc2_w', 'new', 'invokespecial', 'getstatic', 'putstatic',
+  ]);
+  let sawValues = false;
+  for (const item of instructions) {
+    const instruction = getInstructionFromItem(item);
+    if (!instruction || !allowedSimple.has(instruction.op)) return false;
+    if (instruction.op !== 'putstatic') continue;
+    let reference;
+    try { reference = parseMemberRef(instruction.arg); } catch (_error) { return false; }
+    if (reference.owner !== cls.className) return false;
+    if (reference.name === '$VALUES' || reference.name === 'ENUM$VALUES') sawValues = true;
+    else if (!constantNames.has(reference.name)) return false;
+  }
+  return sawValues;
 }
 
 function requireRenderedTypeImport(options, type) {
@@ -319,9 +546,11 @@ function shouldSkipField(cls, field) {
 
 function shouldSkipMethod(cls, method) {
   const flags = method.flags || [];
-  if (flags.includes('synthetic') || flags.includes('bridge')) return true;
+  const sourceRequiredSynthetic = flags.includes('synthetic')
+    && (/^lambda\$/.test(String(method.name || '')) || /^access\$\d+$/.test(String(method.name || '')));
+  if ((flags.includes('synthetic') && !sourceRequiredSynthetic) || flags.includes('bridge')) return true;
   if ((cls.flags || []).includes('enum')) {
-    if (method.name === '<init>') return true;
+    if (method.name === '<init>' && isTrivialEnumConstructor(method)) return true;
     if (method.name === 'values' || method.name === 'valueOf' || method.name === '$values') return true;
   }
   const constructorCount = (cls.items || []).filter((item) => item && item.type === 'method' && item.method && item.method.name === '<init>').length;
@@ -346,6 +575,7 @@ function isEnumConstantField(field) {
 function formatClassDeclaration(cls, displayName, model) {
   const rawFlags = cls.flags || [];
   const isEnum = rawFlags.includes('enum');
+  const isAnnotation = rawFlags.includes('annotation');
   const ignoredFlags = new Set(['super', 'synthetic', 'annotation', 'enum', 'module']);
   if (isEnum) ignoredFlags.add('final');
   let flags = filterFlags(rawFlags, ignoredFlags);
@@ -359,7 +589,7 @@ function formatClassDeclaration(cls, displayName, model) {
     if (!flags.includes('abstract')) flags.push('abstract');
   }
   const isInterface = flags.includes('interface');
-  const keyword = isEnum ? 'enum' : (isInterface ? 'interface' : 'class');
+  const keyword = isAnnotation ? '@interface' : (isEnum ? 'enum' : (isInterface ? 'interface' : 'class'));
   const visibleFlags = flags.filter((flag) => flag !== 'interface' && flag !== 'abstract');
   if (isInterface && flags.includes('abstract')) {
     // Java interfaces are implicitly abstract.
@@ -371,7 +601,7 @@ function formatClassDeclaration(cls, displayName, model) {
   if (!isInterface && !isEnum && cls.superClassName && cls.superClassName !== 'java/lang/Object') {
     declaration += ` extends ${javaTypeFromInternalName(cls.superClassName)}`;
   }
-  if (cls.interfaces && cls.interfaces.length) {
+  if (!isAnnotation && cls.interfaces && cls.interfaces.length) {
     declaration += ` ${isInterface ? 'extends' : 'implements'} ${cls.interfaces.map(javaTypeFromInternalName).join(', ')}`;
   }
   return declaration;
@@ -438,7 +668,11 @@ function formatMethod(cls, method, options = {}) {
   const params = descriptor.params || [];
   const returnType = descriptor.returnType || 'void';
   const code = getCode(method);
-  let localState = makeLocalState(params.map(simplifyType), isStatic, code);
+  let localState = makeLocalState(params.map(simplifyType), isStatic, code, null, options.exceptionModel);
+
+  if ((cls.flags || []).includes('enum') && method.name === '<init>') {
+    return formatEnumConstructor(cls, method, params, localState, options);
+  }
 
   if (method.name === '<clinit>') {
     return formatStaticInitializer(code, localState, cls, options);
@@ -451,6 +685,9 @@ function formatMethod(cls, method, options = {}) {
   if (materializeAbstract) flags = flags.filter((flag) => flag !== 'abstract');
   const visibleFlags = flags.filter((flag) => flag !== 'static');
   if (isStatic) visibleFlags.push('static');
+  const isDefaultInterfaceMethod = (cls.flags || []).includes('interface') && code
+    && !isStatic && !flags.includes('abstract') && !flags.includes('native');
+  if (isDefaultInterfaceMethod && !visibleFlags.includes('default')) visibleFlags.push('default');
   const prefix = visibleFlags.length ? `${visibleFlags.join(' ')} ` : '';
 
   const paramDecls = params.map((type, index) => {
@@ -460,7 +697,7 @@ function formatMethod(cls, method, options = {}) {
     }
     return `${renderedType} ${localState.paramNames[index]}`;
   }).join(', ');
-  const name = method.name === '<init>' ? className : method.name;
+  const name = method.name === '<init>' ? className : sourceMethodName(method.name);
   const resultType = method.name === '<init>' ? '' : `${simplifyType(returnType)} `;
   const throwsTypes = methodThrowsTypes(method);
   const throwsClause = throwsTypes.length ? ` throws ${throwsTypes.join(', ')}` : '';
@@ -484,7 +721,8 @@ function formatMethod(cls, method, options = {}) {
     const conflictSlots = localState.refConflictSlots();
     if (!conflictSlots.length) break;
     conflictSlots.forEach((slotIndex) => collapsedSlots.add(slotIndex));
-    const retryState = makeLocalState(params.map(simplifyType), isStatic, code, new Set(collapsedSlots));
+    const retryState = makeLocalState(params.map(simplifyType), isStatic, code, new Set(collapsedSlots),
+      options.exceptionModel);
     if (Array.isArray(options.diagnostics)) options.diagnostics.length = diagnosticsMark;
     const retryBody = decompileCode(code, method, cls, retryState, options);
     if (!retryBody) break;
@@ -545,6 +783,27 @@ function formatMethod(cls, method, options = {}) {
   const result = formatBlock(header, body);
   if (profileMethod) console.error(`[cfr-method-done] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
   return result;
+}
+
+function isTrivialEnumConstructor(method) {
+  const allowed = new Set(['aload_0', 'aload_1', 'iload_2', 'invokespecial', 'return']);
+  const instructions = executableInstructions(getCode(method)).map(getInstructionFromItem).filter(Boolean);
+  return instructions.length > 0 && instructions.every((instruction) => allowed.has(instruction.op));
+}
+
+function formatEnumConstructor(cls, method, params, localState, options) {
+  const visibleParams = params.slice(2);
+  const paramDecls = visibleParams.map((type, index) =>
+    `${simplifyType(type)} ${localState.paramNames[index + 2]}`).join(', ');
+  const body = pruneTopLevelUnreachableTail(
+    decompileCode(getCode(method), method, cls, localState, options));
+  const missingDeclarations = localState.missingDeclarations(body);
+  if (missingDeclarations.length) body.unshift(...missingDeclarations);
+  body.splice(0, body.length, ...normalizeSyntheticVariableScopes(
+    refineObjectLocalDeclarations(body, (name) => localState.refinedTypeForName(name))));
+  ensureMissingSyntheticDeclarations(body);
+  assertNoFallback(body, { className: cls.className, methodName: '<init>', descriptor: method.descriptor });
+  return formatBlock(`private ${simpleClassName(cls.className)}(${paramDecls})`, body);
 }
 
 function methodThrowsTypes(method) {
@@ -658,6 +917,29 @@ function isCheckedThrow(internalName, model) {
     type = sup;
   }
   return true; // unresolved JDK exception not known-unchecked → treat as checked
+}
+
+function exceptionTypeAncestors(sourceType, model) {
+  let type = String(sourceType || 'java.lang.Throwable').replace(/\./g, '/');
+  const result = [];
+  const seen = new Set();
+  while (type && !seen.has(type)) {
+    seen.add(type);
+    result.push(type);
+    type = (model && model.superOf && model.superOf.get(type))
+      || (jreClassInfo(type) && jreClassInfo(type).superName);
+  }
+  if (!result.includes('java/lang/Throwable')) result.push('java/lang/Throwable');
+  return result;
+}
+
+function commonExceptionSourceType(sourceTypes, model) {
+  const types = sourceTypes.filter(Boolean);
+  if (!types.length) return 'Throwable';
+  const ancestry = types.map((type) => exceptionTypeAncestors(type, model));
+  const common = ancestry[0].find((candidate) => ancestry.slice(1)
+    .every((chain) => chain.includes(candidate))) || 'java/lang/Throwable';
+  return javaTypeFromInternalName(common);
 }
 
 // Declared throws for owner.name:descriptor, resolving inherited declarations up
@@ -1525,30 +1807,43 @@ function pruneBlockUnreachableStatements(lines) {
 }
 
 function normalizeSyntheticVariableScopes(lines) {
-  const text = (lines || []).join('\n');
-  const used = new Set(text.match(/\bvar\d+(?:_[A-Za-z0-9_$]+)?\b/g) || []);
+  const used = new Set();
   const declarations = new Map();
   const declarationCounts = new Map();
   const forcedForDeclarations = new Map();
   const minimumUseDepth = new Map();
+  const lineDepths = [];
   const catchNames = new Set();
   let depth = 0;
   for (let index = 0; index < lines.length; index += 1) {
     const line = String(lines[index]);
     const leadingClosers = (line.match(/^\s*}+/) || [''])[0].replace(/[^}]/g, '').length;
     const lineDepth = Math.max(0, depth - leadingClosers);
+    lineDepths.push(lineDepth);
     const parsedDeclarations = localDeclarationsFromStatement(line);
     for (const declaration of parsedDeclarations) {
+      used.add(declaration.name);
       declarationCounts.set(declaration.name, (declarationCounts.get(declaration.name) || 0) + 1);
       if (!declarations.has(declaration.name)) {
         declarations.set(declaration.name, { type: declaration.type, depth: lineDepth, index });
       }
       if (declaration.inFor) forcedForDeclarations.set(declaration.name, declaration.type);
     }
-    const catchMatch = /catch\s*\([^)]*\b(var\d+(?:_[A-Za-z0-9_$]+)?)\s*\)/.exec(line);
+    const catchMatch = /catch\s*\([^)]*\b([A-Za-z_$][A-Za-z0-9_$]*)\s*\)/.exec(line);
     if (catchMatch) catchNames.add(catchMatch[1]);
-    for (const name of line.match(/\bvar\d+(?:_[A-Za-z0-9_$]+)?\b/g) || []) {
-      minimumUseDepth.set(name, Math.min(minimumUseDepth.get(name) ?? Infinity, lineDepth));
+    depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+  }
+
+  depth = 0;
+  for (const raw of lines) {
+    const line = String(raw);
+    const leadingClosers = (line.match(/^\s*}+/) || [''])[0].replace(/[^}]/g, '').length;
+    const lineDepth = Math.max(0, depth - leadingClosers);
+    for (const name of used) {
+      const escaped = name.replace(/[^A-Za-z0-9_$]/g, '\\$&');
+      if (new RegExp('\\b' + escaped + '\\b').test(line)) {
+        minimumUseDepth.set(name, Math.min(minimumUseDepth.get(name) ?? Infinity, lineDepth));
+      }
     }
     depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
   }
@@ -1559,10 +1854,29 @@ function normalizeSyntheticVariableScopes(lines) {
     if (catchNames.has(name)) continue;
     const declaration = declarations.get(name);
     const declaredInFor = declaration && /\bfor\s*\(/.test(String(lines[declaration.index]));
-    const usedAfterDeclaration = declaration && new RegExp(`\\b${name}\\b`).test(lines.slice(declaration.index + 1).join('\n'));
-    if (!declaration || (declarationCounts.get(name) || 0) > 1 || forcedForDeclarations.has(name)
+    let scopeEnd = lines.length - 1;
+    if (declaration && (declaration.depth > 0 || declaredInFor)) {
+      for (let index = declaration.index + 1; index < lines.length; index += 1) {
+        const closesDeclaringBlock = declaration.depth > 0 && lineDepths[index] < declaration.depth;
+        const closesFor = declaredInFor && lineDepths[index] <= declaration.depth
+          && /^\s*}/.test(String(lines[index]));
+        if (closesDeclaringBlock || closesFor) {
+          scopeEnd = index;
+          break;
+        }
+      }
+    }
+    const escapedName = name.replace(/[^A-Za-z0-9_$]/g, '\\$&');
+    const syntheticLocal = /^var\d+(?:_[A-Za-z0-9_$]+)?$/.test(name);
+    const usedAfterDeclaration = declaration && new RegExp(`\\b${escapedName}\\b`)
+      .test(lines.slice(declaration.index + 1).join('\n'));
+    const usedOutsideScope = declaration && new RegExp(`\\b${escapedName}\\b`)
+      .test(lines.slice(scopeEnd + 1).join('\n'));
+    if (!declaration || (declarationCounts.get(name) || 0) > 1
       || (minimumUseDepth.get(name) || 0) < declaration.depth
-      || (declaration.depth > 0 && usedAfterDeclaration) || (declaredInFor && usedAfterDeclaration)) {
+      || (syntheticLocal && (forcedForDeclarations.has(name)
+        || (declaration.depth > 0 && usedAfterDeclaration)))
+      || ((declaration.depth > 0 || forcedForDeclarations.has(name)) && usedOutsideScope)) {
       let type = declaration && declaration.type;
       if (!type) type = forcedForDeclarations.get(name);
       if (!type) {
@@ -2014,9 +2328,11 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     const label = String(entry.handlerLbl || entry.handlerLabel || '').replace(/:$/, '');
     if (!label) continue;
     const catchType = entry.catch_type || entry.catchType;
-    handlerEntries.set(label, catchType == null || catchType === 0 || catchType === 'any'
+    const sourceType = catchType == null || catchType === 0 || catchType === 'any'
       ? 'Throwable'
-      : javaTypeFromInternalName(catchType));
+      : javaTypeFromInternalName(catchType);
+    handlerEntries.set(label, commonExceptionSourceType(
+      [handlerEntries.get(label), sourceType], options.exceptionModel));
   }
 
   // Vineflower's ExprProcessor propagates a copied PrimitiveExprsList through
@@ -2323,17 +2639,21 @@ function normalizeStructuredCatchNodes(tree, cfg, codeItems, model) {
       const valid = [];
       const unsupported = [];
       for (const item of node.catches || []) {
-        const catchType = String(item.type || '').replace(/\./g, '/');
-        const alwaysLegal = catchType === 'java/lang/Throwable' || catchType === 'java/lang/Exception'
-          || catchType === 'java/lang/RuntimeException' || catchType === 'java/lang/Error';
-        const supported = alwaysLegal
-          || [...thrownTypes].some((type) => isAssignableExceptionType(type, catchType, model));
+        const catchTypes = (item.types || [item.type]).map((type) => type.replace(/\./g, '/'));
+        const supported = catchTypes.every((catchType) => {
+          const alwaysLegal = catchType === 'java/lang/Throwable' || catchType === 'java/lang/Exception'
+            || catchType === 'java/lang/RuntimeException' || catchType === 'java/lang/Error'
+            || !isCheckedThrow(catchType, model);
+          return alwaysLegal
+            || [...thrownTypes].some((type) => isAssignableExceptionType(type, catchType, model));
+        });
         (supported ? valid : unsupported).push(item);
       }
       if (unsupported.length) {
-        const hasGeneric = valid.some((item) => item.type === 'java.lang.Exception'
-          || item.type === 'Exception' || item.type === 'java.lang.Throwable' || item.type === 'Throwable');
-        if (!hasGeneric) valid.push({ ...unsupported[0], type: 'java.lang.Exception' });
+        const hasGeneric = valid.some((item) => (item.types || [item.type]).some((type) =>
+          type === 'java.lang.Exception' || type === 'Exception'
+          || type === 'java.lang.Throwable' || type === 'Throwable'));
+        if (!hasGeneric) valid.push({ ...unsupported[0], types: ['java.lang.Exception'] });
       }
       node.catches = valid;
       return;
@@ -2911,7 +3231,9 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'getfield') {
       const ref = parseMemberRef(instruction.arg);
-      const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
+      const rawOwner = pop(stack);
+      const owner = rawOwner.localThis ? rawOwner
+        : coerceExpressionForType(rawOwner, javaTypeFromInternalName(ref.owner));
       stack.push(expr(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name)}`, descriptorToJavaType(ref.descriptor), 100, {
         qualifiedType: qualifiedReferenceTypeFromDescriptor(ref.descriptor),
       }));
@@ -2924,7 +3246,9 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         materializeNewArraySpill(rawValue, lines, localState);
       }
       const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
-      const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
+      const rawOwner = pop(stack);
+      const owner = rawOwner.localThis ? rawOwner
+        : coerceExpressionForType(rawOwner, javaTypeFromInternalName(ref.owner));
       // Spill any live stack value that reads this field before mutating it, so a
       // post-increment index (`this.r[this.n++] = v`) keeps its pre-increment value.
       materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name), lines, localState);
@@ -3053,7 +3377,7 @@ function emitVirtualCall(lines, stack, arg, localState) {
   }
 
   const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
-  const call = `${wrap(receiver, 100)}.${ref.name}(${renderedArgs.join(', ')})`;
+  const call = `${wrap(receiver, 100)}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') {
     lines.push(`${call};`);
@@ -3068,7 +3392,7 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName, localState)
   const args = popArgs(stack, descriptor.params.length);
   const owner = ref.owner === currentInternalClassName ? simpleClassName(ref.owner) : javaTypeFromInternalName(ref.owner);
   const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
-  const call = `${owner}.${ref.name}(${renderedArgs.join(', ')})`;
+  const call = `${owner}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') {
     lines.push(`${call};`);
@@ -3242,7 +3566,7 @@ function emitSpecialCall(lines, stack, arg, method, currentClassName, currentInt
 
   const specialReceiver = rawReceiver.code === 'this' && ref.owner !== currentInternalClassName
     ? 'super' : wrap(receiver, 100);
-  const call = `${specialReceiver}.${ref.name}(${renderedArgs.join(', ')})`;
+  const call = `${specialReceiver}.${sourceMethodName(ref.name)}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') lines.push(`${call};`);
   else stack.push(expr(call, returnType));
@@ -3308,6 +3632,51 @@ function emitInvokeDynamic(stack, arg, cls) {
       if (index < args.length) pieces.push(args[index].code);
     });
     stack.push(expr(pieces.length ? pieces.join(' + ') : '""', 'String', 40));
+    return;
+  }
+  const bootstrapHandle = bootstrap && bootstrap.method_ref && bootstrap.method_ref.value;
+  const implementation = bootstrap && bootstrap.arguments && bootstrap.arguments[1]
+    && bootstrap.arguments[1].type === 'MethodHandle'
+    ? bootstrap.arguments[1].value : null;
+  if (bootstrapHandle && bootstrapHandle.reference
+    && bootstrapHandle.reference.className === 'java/lang/invoke/LambdaMetafactory'
+    && implementation && implementation.reference && implementation.reference.nameAndType) {
+    const reference = implementation.reference;
+    const implementationDescriptor = parseDescriptor(reference.nameAndType.descriptor);
+    const samMethodType = bootstrap.arguments[0] && bootstrap.arguments[0].type === 'MethodType'
+      ? parseDescriptor(bootstrap.arguments[0].value) : { params: [] };
+    const instantiatedMethodType = bootstrap.arguments[2] && bootstrap.arguments[2].type === 'MethodType'
+      ? parseDescriptor(bootstrap.arguments[2].value) : samMethodType;
+    const lambdaParameterCount = samMethodType.params.length;
+    const lambdaParameters = Array.from({ length: lambdaParameterCount }, (_unused, index) => `lambdaParam${index}`);
+    const lambdaValues = lambdaParameters.map((name, index) => expr(name,
+      simplifyType(samMethodType.params[index] || instantiatedMethodType.params[index] || 'Object')));
+    const owner = javaTypeFromInternalName(reference.className);
+    const methodName = sourceMethodName(reference.nameAndType.name);
+    let invocation;
+    if (implementation.kind === 'invokeStatic') {
+      const values = [...args, ...lambdaValues];
+      const invocationArgs = values.map((value, index) =>
+        coerceExpressionForType(value, implementationDescriptor.params[index] || value.type).code);
+      invocation = `${owner}.${methodName}(${invocationArgs.join(', ')})`;
+    } else if (implementation.kind === 'newInvokeSpecial') {
+      const values = [...args, ...lambdaValues];
+      const invocationArgs = values.map((value, index) =>
+        coerceExpressionForType(value, implementationDescriptor.params[index] || value.type).code);
+      invocation = `new ${owner}(${invocationArgs.join(', ')})`;
+    } else {
+      const hasCapturedReceiver = args.length > 0;
+      const receiver = hasCapturedReceiver ? args[0] : lambdaValues.shift();
+      const values = [...(hasCapturedReceiver ? args.slice(1) : []), ...lambdaValues];
+      const invocationArgs = values.map((value, index) =>
+        coerceExpressionForType(value, implementationDescriptor.params[index] || value.type).code);
+      const renderedReceiver = coerceExpressionForType(receiver || expr('null', owner), owner);
+      invocation = `${wrap(renderedReceiver, 100)}.${methodName}(${invocationArgs.join(', ')})`;
+    }
+    const parameters = lambdaParameters.length === 1 ? lambdaParameters[0] : `(${lambdaParameters.join(', ')})`;
+    const source = `${parameters} -> ${invocation}`;
+    const functionalType = simplifyType(descriptor.returnType);
+    stack.push(expr(source, functionalType, 20, { lambdaTarget: functionalType }));
     return;
   }
   stack.push(expr(`/* invokedynamic */ ${args.map((a) => a.code).join(', ')}`, simplifyType(descriptor.returnType)));
@@ -5218,7 +5587,7 @@ function computeObjectSlotReachability(code) {
   return { loads };
 }
 
-function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null) {
+function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null, exceptionModel = null) {
   const names = new Map();
   const types = new Map();
   const debugNames = new Map();
@@ -5247,7 +5616,9 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null)
       const rawCatchType = entry.catch_type ?? entry.catchType;
       const catchType = rawCatchType == null || rawCatchType === 0 || rawCatchType === 'any'
         ? 'Throwable' : javaTypeFromInternalName(rawCatchType);
-      catchStoreTypes.set(Number(storeItem.pc), catchType);
+      const storePc = Number(storeItem.pc);
+      catchStoreTypes.set(storePc, commonExceptionSourceType(
+        [catchStoreTypes.get(storePc), catchType], exceptionModel));
     }
     for (let itemIndex = 0; itemIndex < codeItems.length; itemIndex += 1) {
       const storeItem = codeItems[itemIndex];
@@ -5746,6 +6117,11 @@ function sourceFieldName(owner, name) {
   return `field_${name}`;
 }
 
+function sourceMethodName(name) {
+  const text = String(name || '');
+  return text.startsWith('lambda$') ? `cfr$${text}` : text;
+}
+
 function constantExpression(value, op) {
   if (Array.isArray(value) && value[0] === 'Class') {
     return expr(`${javaTypeFromInternalName(value[1])}.class`, 'Class');
@@ -5929,6 +6305,9 @@ function renderStoreExpression(value) {
 function coerceExpressionForType(value, targetType, exceptionModel = null, allowWideningReference = true) {
   if (!value) return value;
   const type = simplifyType(targetType);
+  if (value.lambdaTarget && type !== simplifyType(value.lambdaTarget)) {
+    return expr(`(${value.lambdaTarget}) (${value.code})`, value.lambdaTarget, 90);
+  }
   if (value.conditional) {
     const { condition, trueValue, falseValue } = value.conditional;
     return conditionalExpr(
@@ -5978,7 +6357,7 @@ function coerceExpressionForType(value, targetType, exceptionModel = null, allow
     const sourceNeedsBridge = !isAssignable
       && (sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code));
     const operand = sourceNeedsBridge ? `(Object) ${wrap(value, 90)}` : wrap(value, 90);
-    return expr(`(${type}) ${operand}`, type, 90);
+    return expr(`(${type}) (${operand})`, type, 90);
   }
   return value;
 }

@@ -956,8 +956,24 @@ function writeAnnotationElementValue(writer, elementValue, builder) {
     : elementValue;
   const type = elementValue && typeof elementValue === 'object' ? elementValue.type : typeof value;
   if (type === 'int' || type === 'byte' || type === 'short' || type === 'char') {
-    writer.writeUint8('I'.charCodeAt(0));
+    const tag = { int: 'I', byte: 'B', short: 'S', char: 'C' }[type];
+    writer.writeUint8(tag.charCodeAt(0));
     writer.writeUint16(builder.addInteger(parseInteger(value, 0)));
+    return;
+  }
+  if (type === 'long') {
+    writer.writeUint8('J'.charCodeAt(0));
+    writer.writeUint16(builder.addLong(parseBigInt(value)));
+    return;
+  }
+  if (type === 'float') {
+    writer.writeUint8('F'.charCodeAt(0));
+    writer.writeUint16(builder.addFloat(value));
+    return;
+  }
+  if (type === 'double') {
+    writer.writeUint8('D'.charCodeAt(0));
+    writer.writeUint16(builder.addDouble(value));
     return;
   }
   if (type === 'boolean') {
@@ -1717,7 +1733,9 @@ function prepareInstruction(instruction, builder, currentOffset, bootstrapMethod
       throw new Error(`Invalid method reference for ${op}`);
     }
     const [name, descriptor] = nameAndType;
-    const cpIndex = builder.addMethodRef(owner, name, descriptor);
+    const cpIndex = kind === 'InterfaceMethod'
+      ? builder.addInterfaceMethodRef(owner, name, descriptor)
+      : builder.addMethodRef(owner, name, descriptor);
     return { type: 'cp_u16', op, opcode, cpIndex, length: 3, offset: currentOffset };
   }
 

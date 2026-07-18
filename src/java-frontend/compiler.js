@@ -32,14 +32,14 @@ const JAVA_LANG_TYPES = new Set([
   'ArithmeticException', 'ArrayIndexOutOfBoundsException', 'Boolean', 'Byte',
   'Character', 'Class', 'ClassCastException', 'Double', 'Exception', 'Float',
   'IllegalArgumentException', 'Integer', 'InterruptedException', 'Long', 'NegativeArraySizeException',
-  'NullPointerException', 'RuntimeException', 'StackOverflowError', 'Throwable',
+  'NullPointerException', 'RuntimeException', 'StackOverflowError', 'Throwable', 'UnsupportedOperationException',
   'Comparable', 'Enum', 'Iterable', 'Math', 'Object', 'Runnable', 'Short', 'String', 'StringBuilder',
   'System', 'Thread', 'Void',
 ]);
 
 const JAVA_UTIL_TYPES = new Set([
   'ArrayList', 'Collection', 'Collections', 'Deque', 'HashMap', 'HashSet',
-  'Iterator', 'LinkedList', 'List', 'ListIterator', 'Map', 'Random', 'Set',
+  'Iterator', 'LinkedList', 'List', 'ListIterator', 'Map', 'Optional', 'Random', 'Set',
 ]);
 
 const ACCESS_MODIFIERS = new Set([
@@ -1174,6 +1174,15 @@ function compileJavaFiles(inputPaths, options = {}) {
     throw new TypeError('compileJavaFiles requires at least one .java input path');
   }
   const duplicateIndexes = duplicateOutputIndexes(inputPaths, options.outputDir, options);
+  const resolvedDirectories = inputPaths.map((inputPath) => path.dirname(path.resolve(inputPath)));
+  let sourceRoot = resolvedDirectories[0];
+  for (const directory of resolvedDirectories.slice(1)) {
+    while (directory !== sourceRoot && !directory.startsWith(`${sourceRoot}${path.sep}`)) {
+      const parent = path.dirname(sourceRoot);
+      if (parent === sourceRoot) break;
+      sourceRoot = parent;
+    }
+  }
   const results = [];
   const classes = [];
   const written = [];
@@ -1184,11 +1193,18 @@ function compileJavaFiles(inputPaths, options = {}) {
       : options.outputDir;
     const fileOptions = {
       ...options,
+      sourceRoot: options.sourceRoot || sourceRoot,
       outputDir,
       sourcePath: inputPath,
       sourceFileName: path.basename(inputPath),
     };
-    const result = compileJavaFile(inputPath, fileOptions);
+    let result;
+    try {
+      result = compileJavaFile(inputPath, fileOptions);
+    } catch (error) {
+      error.message = `${inputPath}: ${error.message}`;
+      throw error;
+    }
     results.push({
       inputPath,
       sourceFileName: fileOptions.sourceFileName,

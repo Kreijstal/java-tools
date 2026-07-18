@@ -65,6 +65,26 @@ test('try with two catch clauses', () => {
   assert.match(src, /catch \(java\.lang\.RuntimeException \w+\)/);
 });
 
+test('same handler rows structure as one Java multi-catch', () => {
+  const code = [
+    { labelDef: 'L0:', pc: 0, instruction: 'aload_0' },
+    { pc: 1, instruction: { op: 'invokevirtual', arg: ['Method', 'X', ['m', '()V']] } },
+    { labelDef: 'L4:', pc: 4, instruction: { op: 'goto', arg: 'L10' } },
+    { labelDef: 'L7:', pc: 7, instruction: 'astore_1' },
+    { pc: 8, instruction: { op: 'goto', arg: 'L10' } },
+    { labelDef: 'L10:', pc: 10, instruction: 'return' },
+  ];
+  const et = [
+    { start_pc: 0, end_pc: 4, handler_pc: 7, catch_type: 'java/io/IOException' },
+    { start_pc: 0, end_pc: 4, handler_pc: 7, catch_type: 'java/sql/SQLException' },
+  ];
+  const { ok, src } = run(code, et);
+  assert.ok(ok, 'should structure');
+  assertGotoFree(src);
+  assert.equal((src.match(/\} catch \(/g) || []).length, 1, `one multi-catch clause:\n${src}`);
+  assert.match(src, /catch \(java\.io\.IOException \| java\.sql\.SQLException \w+\)/);
+});
+
 // ---------------------------------------------------------------------------
 // (c) A catch-all clause (catch_type 0) renders as java.lang.Throwable.
 // ---------------------------------------------------------------------------
