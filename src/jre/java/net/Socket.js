@@ -1,8 +1,36 @@
 const net = require('net');
 
-// Using a map to store native sockets, as we can't store complex JS objects in Java fields.
-const Sockets = new Map();
-let nextSocketId = 0;
+// Java strings may be plain JS strings or {value} objects.
+function javaStr(v) {
+  if (typeof v === 'string') return v;
+  if (v && v.value !== undefined) return String(v.value);
+  return String(v);
+}
+
+// Native sockets and receive buffers live in the shared socketRegistry so the
+// Socket*Stream classes can reach them.
+const { Sockets, allocId, register } = require('./socketRegistry');
+
+function installApplicationKeepalive(nativeSocket) {
+  const hex = process.env.JVM_SOCKET_APP_KEEPALIVE_HEX;
+  if (!hex) return;
+  if (!/^(?:[0-9a-fA-F]{2})+$/.test(hex)) {
+    throw new Error('JVM_SOCKET_APP_KEEPALIVE_HEX must contain whole hexadecimal bytes');
+  }
+
+  const payload = Buffer.from(hex, 'hex');
+  const configuredInterval = Number(process.env.JVM_SOCKET_APP_KEEPALIVE_MS);
+  const interval = Number.isFinite(configuredInterval) && configuredInterval > 0
+    ? configuredInterval
+    : 10000;
+  const timer = setInterval(() => {
+    if (!nativeSocket.destroyed && nativeSocket.writable) {
+      nativeSocket.write(payload);
+    }
+  }, interval);
+  timer.unref();
+  nativeSocket.once('close', () => clearInterval(timer));
+}
 
 module.exports = {
   super: 'java/lang/Object',
@@ -12,18 +40,19 @@ module.exports = {
       const address = args[0]; // This is an InetAddress object from our JRE
       const port = args[1];
 
-      const host = address.hostName.value; // Get JS string from the Java String object
+      const host = javaStr(address.hostName);
 
       const nativeSocket = new net.Socket();
-      const socketId = nextSocketId++;
-      Sockets.set(socketId, nativeSocket);
+      const socketId = allocId();
+      register(socketId, nativeSocket);
 
       obj.socketId = socketId;
       obj.isClosed = false;
 
       // Node's connect is async. We fire and forget for now.
       nativeSocket.connect(port, host, () => {
-        // Connected.
+        nativeSocket.setKeepAlive(true, 10000);
+        installApplicationKeepalive(nativeSocket);
       });
 
       // Prevent unhandled errors from crashing the process.
@@ -37,7 +66,7 @@ module.exports = {
 
     'connect(Ljava/net/SocketAddress;)V': (jvm, obj, args) => {
       const endpoint = args[0]; // This is an InetSocketAddress object
-      const host = endpoint.hostname.value;
+      const host = javaStr(endpoint.hostname);
       const port = endpoint.port;
 
       const nativeSocket = Sockets.get(obj.socketId);
@@ -64,9 +93,21 @@ module.exports = {
       }
     },
 
-    'close()V': (jvm, obj, args) => {
+    'close()V': (jvm, obj, args, thread) => {
       if (obj.isClosed) {
           return;
+      }
+      if (process.env.JVM_DEBUG_SOCKET) {
+        // Name the Java frames deciding to close — invaluable when a game
+        // drops a connection and we need to know which code path did it.
+        let stack = '?';
+        const t = thread || jvm.threads[jvm.currentThreadIndex];
+        if (t && t.callStack && t.callStack.items) {
+          stack = t.callStack.items.map((f) => `${f.className}.${f.method && f.method.name}${(f.method && f.method.descriptor) || ''}@${f.pc}`).join(' <- ');
+        }
+        const { Buffers } = require('./socketRegistry');
+        const st = Buffers.get(obj.socketId);
+        console.error(`[socket ${obj.socketId} close()] consumed=${(st && st.consumed) || 0}B pending=${(st && st.size) || 0}B by ${stack}`);
       }
       const nativeSocket = Sockets.get(obj.socketId);
       if (nativeSocket) {
@@ -77,19 +118,11 @@ module.exports = {
     },
 
     'getOutputStream()Ljava/io/OutputStream;': (jvm, obj, args) => {
-      const outputStream = {
-        type: 'java/io/OutputStream',
-        socketId: obj.socketId,
-      };
-      return outputStream;
+      return { type: 'java/net/SocketOutputStream', socketId: obj.socketId };
     },
 
     'getInputStream()Ljava/io/InputStream;': (jvm, obj, args) => {
-      const inputStream = {
-        type: 'java/io/InputStream',
-        socketId: obj.socketId,
-      };
-      return inputStream;
+      return { type: 'java/net/SocketInputStream', socketId: obj.socketId };
     }
   }
 };

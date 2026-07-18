@@ -114,3 +114,32 @@ test('splits only pre-backedge loads when range loops through producer', (t) => 
   t.equal(code.codeItems[10].instruction, 'aload_2');
   t.end();
 });
+
+test('does not split a loop-carried cast local across initializer and update', (t) => {
+  const code = {
+    localsSize: '4',
+    stackSize: '2',
+    codeItems: [
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'rd', ['a', '(B)Lbh;']] } },
+      { instruction: { op: 'checkcast', arg: 'ce' } },
+      { instruction: 'astore_3' },
+      { labelDef: 'Loop:', instruction: 'aload_3' },
+      { instruction: { op: 'ifnull', arg: 'Done' } },
+      { instruction: 'aload_3' },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'ce', ['f', '(I)V']] } },
+      { instruction: { op: 'invokevirtual', arg: ['Method', 'rd', ['a', '(I)Lbh;']] } },
+      { instruction: { op: 'checkcast', arg: 'ce' } },
+      { instruction: 'astore_3' },
+      { instruction: { op: 'goto', arg: 'Loop' } },
+      { labelDef: 'Done:', instruction: 'return' },
+    ],
+  };
+
+  t.equal(rewriteCode(code), 0);
+  t.equal(code.localsSize, '4');
+  t.equal(code.codeItems[2].instruction, 'astore_3');
+  t.equal(code.codeItems[3].instruction, 'aload_3');
+  t.equal(code.codeItems[5].instruction, 'aload_3');
+  t.equal(code.codeItems[9].instruction, 'astore_3');
+  t.end();
+});

@@ -54,6 +54,7 @@ module.exports = {
 
       // 2. Change the thread's status to WAITING.
       thread.status = 'WAITING';
+      thread.waitingOn = obj;
 
       // 3. Atomically release the lock.
       // We must also remember how many times the lock was held recursively.
@@ -79,11 +80,13 @@ module.exports = {
         };
       }
       
-      // For simplicity, treat timed wait same as regular wait in this mock implementation
-      // In a real JVM, this would involve timers and timeout handling
       const waitMethod = obj.methods ? obj.methods['wait()V'] : module.exports.methods['wait()V'];
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
+      }
+      const millis = Number(timeout);
+      if (millis > 0) {
+        thread.waitDeadline = jvm.clock.millis() + millis;
       }
     }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'wait(JI)V': withThrows((jvm, obj, args, thread) => {
@@ -98,11 +101,13 @@ module.exports = {
         };
       }
       
-      // For simplicity, treat timed wait same as regular wait in this mock implementation
-      // In a real JVM, this would involve precise timing with milliseconds + nanoseconds
       const waitMethod = obj.methods ? obj.methods['wait()V'] : module.exports.methods['wait()V'];
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
+      }
+      const millis = Number(timeout);
+      if (millis > 0 || nanos > 0) {
+        thread.waitDeadline = jvm.clock.millis() + Math.max(1, millis);
       }
     }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'notify()V': withThrows((jvm, obj, args, thread) => {
@@ -114,8 +119,13 @@ module.exports = {
       }
       if (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
-        notifiedThread.status = 'BLOCKED';
+        // WAIT_REACQUIRE: the scheduler re-acquires the monitor for the thread
+        // before resuming it (execution continues AFTER the wait call, so the
+        // thread cannot re-run monitorenter itself).
+        notifiedThread.status = 'WAIT_REACQUIRE';
         notifiedThread.blockingOn = obj;
+        delete notifiedThread.waitingOn;
+        delete notifiedThread.waitDeadline;
       }
     }, ['java/lang/IllegalMonitorStateException']),
     'notifyAll()V': withThrows((jvm, obj, args, thread) => {
@@ -127,8 +137,10 @@ module.exports = {
       }
       while (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
-        notifiedThread.status = 'BLOCKED';
+        notifiedThread.status = 'WAIT_REACQUIRE';
         notifiedThread.blockingOn = obj;
+        delete notifiedThread.waitingOn;
+        delete notifiedThread.waitDeadline;
       }
     }, ['java/lang/IllegalMonitorStateException']),
   },

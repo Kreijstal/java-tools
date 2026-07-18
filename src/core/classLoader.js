@@ -371,7 +371,9 @@ async function loadClassByPath(classFilePath, options = {}) {
 
   if (!(await fileProvider.exists(classFilePath))) {
     /* HARDENED: Replaced quiet failure with an explicit error */
-    throw new Error(`Class file not found: ${classFilePath}`);
+    const err = new Error(`Class file not found: ${classFilePath}`);
+    err.code = 'ENOENT'; // let classpath search continue to the next root
+    throw err;
   }
 
   // Read the class file content

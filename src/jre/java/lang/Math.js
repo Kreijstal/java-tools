@@ -1,3 +1,4 @@
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
@@ -64,7 +65,7 @@ module.exports = {
       return Math.round(args[0]);
     },
     'random()D': (jvm, obj, args) => {
-      return Math.random();
+      return jvm.clock.random();
     },
   },
   methods: {},

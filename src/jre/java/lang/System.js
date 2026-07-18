@@ -71,10 +71,10 @@ module.exports = {
       jvm.exit(status);
     },
     'nanoTime()J': (jvm, obj, args) => {
-      return BigInt(Math.floor(performance.now() * 1000000));
+      return BigInt(jvm.clock.nanos());
     },
     'currentTimeMillis()J': (jvm, obj, args) => {
-      return BigInt(Date.now());
+      return BigInt(jvm.clock.millis());
     }
   },
   methods: {

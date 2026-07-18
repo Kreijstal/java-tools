@@ -26,15 +26,15 @@ module.exports = {
 
     'freeMemory()J': (jvm, _, args) => {
       const memUsage = process.memoryUsage();
-      return memUsage.heapTotal - memUsage.heapUsed;
+      return BigInt(memUsage.heapTotal - memUsage.heapUsed);
     },
 
     'totalMemory()J': (jvm, _, args) => {
-      return process.memoryUsage().heapTotal;
+      return BigInt(process.memoryUsage().heapTotal);
     },
 
     'maxMemory()J': (jvm, _, args) => {
-      return v8.getHeapStatistics().heap_size_limit;
+      return BigInt(v8.getHeapStatistics().heap_size_limit);
     },
 
     'exit(I)V': (jvm, _, args) => {

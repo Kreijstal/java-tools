@@ -19,6 +19,8 @@ const instructions = {
   ...object,
   ...conversions,
 };
+const syncInstructions = Object.fromEntries(Object.entries(instructions)
+  .filter(([, func]) => func.constructor.name !== 'AsyncFunction'));
 
 function expandWideInstruction(instruction) {
   const parts = String(instruction && instruction.arg ? instruction.arg : '').trim().split(/\s+/).filter(Boolean);
@@ -37,7 +39,7 @@ function expandWideInstruction(instruction) {
   };
 }
 
-module.exports = async function dispatch(frame, instruction, jvm, thread) {
+function dispatch(frame, instruction, jvm, thread) {
   if (jvm.verbose) {
     const threadId = thread ? thread.id : 'main';
     let pc = -1;
@@ -63,14 +65,35 @@ module.exports = async function dispatch(frame, instruction, jvm, thread) {
     if (!wideFunc) {
       throw new Error(`Unknown or unimplemented wide instruction: ${instruction.arg}`);
     }
-    await wideFunc(frame, expanded, jvm, thread);
-    return;
+    return wideFunc(frame, expanded, jvm, thread);
   }
 
   const func = instructions[op];
   if (func) {
-    await func(frame, instruction, jvm, thread);
+    return func(frame, instruction, jvm, thread);
   } else {
     throw new Error(`Unknown or unimplemented instruction: ${op}`);
   }
-};
+}
+
+// Fast path used by the interpreter's bounded execution quantum. Most JVM
+// bytecodes are implemented by ordinary synchronous handlers; routing each
+// one through an async dispatcher creates two Promises per instruction even
+// though no suspension is possible. Async handlers (class loading, invokes,
+// allocation, casts, and class literals) deliberately remain on dispatch().
+function dispatchSync(frame, instruction, jvm, thread) {
+  if (jvm.verbose) return false;
+  const op = typeof instruction === 'string' ? instruction : instruction.op;
+  const expanded = op === 'wide' ? expandWideInstruction(instruction) : instruction;
+  const expandedOp = op === 'wide' && expanded ? expanded.op : op;
+  const func = expandedOp && syncInstructions[expandedOp];
+  if (!func) return false;
+  const result = func(frame, expanded, jvm, thread);
+  if (result && typeof result.then === 'function') {
+    throw new Error(`Synchronous instruction handler returned a Promise: ${expandedOp}`);
+  }
+  return true;
+}
+
+module.exports = dispatch;
+module.exports.dispatchSync = dispatchSync;

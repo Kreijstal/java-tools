@@ -1,18 +1,25 @@
+// Java long semantics: wrap every result to a signed 64-bit value.
+const toLong = (v) => BigInt.asIntN(64, v);
+
 module.exports = {
+  // Java int arithmetic is signed 32-bit and wraps on overflow. JS `+ - *`
+  // produce full-precision doubles (and overflow to >2^53 / Infinity), so
+  // every result must be truncated back to int32. `| 0` wraps add/sub/neg;
+  // multiply needs Math.imul (a*b can exceed 2^53 and lose bits before |0).
   iadd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 + value2);
+    frame.stack.push((value1 + value2) | 0);
   },
   isub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 - value2);
+    frame.stack.push((value1 - value2) | 0);
   },
   imul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 * value2);
+    frame.stack.push(Math.imul(value1, value2));
   },
   idiv: (frame) => {
     const value2 = frame.stack.pop();
@@ -20,17 +27,22 @@ module.exports = {
     if (value2 === 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
-    frame.stack.push(Math.floor(value1 / value2));
+    // Java integer division truncates toward zero (not floor); `| 0` both
+    // truncates and wraps MIN_INT / -1 back to MIN_INT.
+    frame.stack.push((value1 / value2) | 0);
   },
   irem: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 % value2);
+    if (value2 === 0) {
+      throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
+    }
+    frame.stack.push((value1 % value2) | 0);
   },
   iinc: (frame, instruction) => {
     const index = parseInt(instruction.varnum, 10);
     const amount = parseInt(instruction.incr, 10);
-    frame.locals[index] += amount;
+    frame.locals[index] = (frame.locals[index] + amount) | 0;
   },
   ishl: (frame) => {
     const value2 = frame.stack.pop();
@@ -45,7 +57,10 @@ module.exports = {
   iushr: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(value1 >>> value2);
+    // JS `>>>` yields an UNSIGNED 32-bit value; Java iushr is signed. `| 0`
+    // maps it back to signed int32 (e.g. -1 >>> 0 must stay -1, not 2^32-1),
+    // which matters once the result reaches i2l / comparisons / array indices.
+    frame.stack.push((value1 >>> value2) | 0);
   },
   iand: (frame) => {
     const value2 = frame.stack.pop();
@@ -64,22 +79,22 @@ module.exports = {
   },
   ineg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(-value);
+    frame.stack.push((-value) | 0);
   },
   ladd: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) + BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) + BigInt(value2)));
   },
   lsub: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) - BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) - BigInt(value2)));
   },
   lmul: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) * BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) * BigInt(value2)));
   },
   ldiv: (frame) => {
     const value2 = frame.stack.pop();
@@ -87,7 +102,7 @@ module.exports = {
     if (value2 === 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
-    frame.stack.push(BigInt(value1) / BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) / BigInt(value2)));
   },
   lrem: (frame) => {
     const value2 = frame.stack.pop();
@@ -95,49 +110,44 @@ module.exports = {
     if (value2 === 0) {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     }
-    frame.stack.push(BigInt(value1) % BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) % BigInt(value2)));
   },
   lshl: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) << BigInt(value2));
+    // Shift distance uses only the low 6 bits (JVM spec).
+    frame.stack.push(toLong(BigInt(value1) << (BigInt(value2) & 63n)));
   },
   lshr: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) >> BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) >> (BigInt(value2) & 63n)));
   },
   lushr: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    const shift = BigInt(value2);
-    if (value1 >= 0) {
-      frame.stack.push(BigInt(value1) >> shift);
-      return;
-    }
-    // For negative BigInts, we simulate the unsigned shift.
-    const sixtyFour = BigInt(64);
-    const result = (BigInt(value1) >> shift) + ((BigInt(1) << sixtyFour) >> shift);
-    frame.stack.push(result);
+    const shift = BigInt(value2) & 63n;
+    const unsigned = BigInt.asUintN(64, BigInt(value1));
+    frame.stack.push(toLong(unsigned >> shift));
   },
   land: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) & BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) & BigInt(value2)));
   },
   lor: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) | BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) | BigInt(value2)));
   },
   lxor: (frame) => {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
-    frame.stack.push(BigInt(value1) ^ BigInt(value2));
+    frame.stack.push(toLong(BigInt(value1) ^ BigInt(value2)));
   },
   lneg: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(-BigInt(value));
+    frame.stack.push(toLong(-BigInt(value)));
   },
   fadd: (frame) => {
     const value2 = frame.stack.pop();

@@ -28,10 +28,21 @@ module.exports = {
         };
       }
       
-      const slicedB = byteArray.slice(off, off + len);
+      // Java byte arrays contain signed values (-128..127), while crc-32
+      // expects octets. Passing the signed JS array through directly changes
+      // every byte with its high bit set and produces a different checksum.
+      const slicedB = Uint8Array.from(
+        byteArray.slice(off, off + len),
+        (value) => value & 0xff,
+      );
       let crc = obj['java/util/zip/CRC32/crc'];
       crc = crc32.buf(slicedB, crc);
       obj['java/util/zip/CRC32/crc'] = crc;
+      if (process.env.JVM_DEBUG_ZIP) {
+        let h = 0x811c9dc5;
+        for (let i = 0; i < slicedB.length; i++) { h ^= slicedB[i] & 0xff; h = (h * 0x01000193) >>> 0; }
+        console.error(`[crc32] update off=${off} len=${len} -> ${(crc >>> 0).toString(16)} fnv=${h.toString(16)}`);
+      }
     }, ['java/lang/IllegalArgumentException']),
     'getValue()J': (jvm, obj, args) => {
       const crc = obj['java/util/zip/CRC32/crc'];

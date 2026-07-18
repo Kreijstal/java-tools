@@ -55,13 +55,16 @@ module.exports = {
             decompressed = zlib.inflateSync(buffer);
         }
       } catch (e) {
+        if (process.env.JVM_DEBUG_ZIP) console.error(`[inflate] FAIL nowrap=${nowrap} in=${buffer.length}B: ${e.message} head=${buffer.subarray(0,8).toString('hex')}`);
         throw { type: 'java/util/zip/DataFormatException', message: e.message };
       }
+      if (process.env.JVM_DEBUG_ZIP) console.error(`[inflate] ok nowrap=${nowrap} in=${buffer.length}B out=${decompressed.length}B dest=${destArray.length}B`);
 
       if (decompressed) {
         const length = Math.min(decompressed.length, destArray.length);
         for (let i = 0; i < length; i++) {
-          destArray[i] = decompressed[i];
+          // Java byte arrays hold signed bytes.
+          destArray[i] = (decompressed[i] << 24) >> 24;
         }
         return length;
       } else {

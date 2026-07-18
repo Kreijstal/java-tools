@@ -451,26 +451,40 @@ module.exports = {
       
       return null;
     },
-    'getConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': (jvm, classObj, args) => ({
+    'getConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': withThrows((jvm, classObj, args) => ({
       type: 'java/lang/reflect/Constructor',
       _declaringClass: classObj,
       _parameterTypes: args[0] || [],
-    }),
-    'getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': (jvm, classObj, args) => ({
+    }), ['java/lang/NoSuchMethodException']),
+    'getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': withThrows((jvm, classObj, args) => ({
       type: 'java/lang/reflect/Constructor',
       _declaringClass: classObj,
       _parameterTypes: args[0] || [],
-    }),
-    'newInstance()Ljava/lang/Object;': (jvm, classObj, args) => {
+    }), ['java/lang/NoSuchMethodException']),
+    'newInstance()Ljava/lang/Object;': withThrows(async (jvm, classObj, args, thread) => {
       const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes || !classData.ast.classes[0]) {
+        throw { type: 'java/lang/InstantiationException', message: classObj.className || 'class' };
+      }
       const className = classData.ast.classes[0].className;
-      const newObj = jvm.newObject(className);
-      const constructor = jvm.findMethod(className, '<init>()V');
+      const t0 = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+      const newObj = await jvm.createAppletInstance(className, t0);
+      const constructor = jvm.findMethod(jvm.classes[className], '<init>', '()V');
       if (constructor) {
-        jvm.runMethod(constructor, [newObj]);
+        const Frame = require('../../../core/frame');
+        const initFrame = new Frame(constructor);
+        initFrame.className = className;
+        initFrame.locals[0] = newObj;
+        const t = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+        t.callStack.push(initFrame);
+        const originalStackSize = t.callStack.size();
+        while (t.callStack.size() >= originalStackSize) {
+          const result = await jvm.executeTick();
+          if (result && result.completed) break;
+        }
       }
       return newObj;
-    },
+    }, ['java/lang/InstantiationException', 'java/lang/IllegalAccessException']),
     'getResource(Ljava/lang/String;)Ljava/net/URL;': (jvm, classObj, args) => {
       const name = String(args[0]);
       const classData = classObj._classData;

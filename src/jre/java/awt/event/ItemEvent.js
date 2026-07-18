@@ -1,5 +1,5 @@
 module.exports = {
-  super: 'java/lang/Object',
+  super: 'java/awt/AWTEvent',
   methods: {
     '<init>()V': () => {},
     'getItemSelectable()Ljava/awt/ItemSelectable;': (jvm, obj, args) => obj.itemSelectable || obj.source || null,

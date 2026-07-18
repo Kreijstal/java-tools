@@ -568,6 +568,30 @@ test('peephole clean coalesces duplicate labeled loop increment tails', (t) => {
   t.end();
 });
 
+test('peephole clean keeps opposite iinc loop tails distinct', (t) => {
+  const ast = astWith([
+    { labelDef: 'Lhead:', instruction: 'iload_0' },
+    { instruction: { op: 'ifeq', arg: 'Lend' } },
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifne', arg: 'Ldecrement' } },
+    { instruction: { op: 'iinc', varnum: '17', incr: '1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Ldecrement:', instruction: { op: 'iinc', varnum: '17', incr: '-1' } },
+    { instruction: { op: 'goto', arg: 'Lhead' } },
+    { labelDef: 'Lend:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast);
+  t.equal(result.details.duplicateLoopTails, 0,
+    'opposite increments are not coalesced as duplicate tails');
+  const increments = code(ast).codeItems
+    .map((item) => item && item.instruction)
+    .filter((instruction) => instruction && instruction.op === 'iinc')
+    .map((instruction) => Number(instruction.incr));
+  t.deepEqual(increments, [1, -1], 'both increment directions survive');
+  t.end();
+});
+
 test('peephole clean coalesces duplicate loop backedge tails', (t) => {
   const call = ['Method', 'ad', ['a', '(ILnk;I)V']];
   const ast = astWith([

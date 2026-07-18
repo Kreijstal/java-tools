@@ -261,6 +261,14 @@ class BrowserJVMDebug {
     return this.debugController.deserialize(state);
   }
 
+  saveState() {
+    return this.debugController.jvm.saveState();
+  }
+
+  loadState(state) {
+    return this.debugController.jvm.loadState(state);
+  }
+
   /**
    * Reset debug session
    * @returns {object} - Reset result

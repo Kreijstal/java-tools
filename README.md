@@ -112,6 +112,46 @@ node scripts/runJar.js app.jar
 node scripts/runJar.js --class VecDemo vector.jar
 ```
 
+The JVM JIT selects methods from bytecode shape and observed execution; it does
+not use application class names or method-signature allowlists. Exception and
+monitor control flow (`athrow`, `monitorenter`, and `monitorexit`) is compiled by
+default only for leaf normal-flow regions, where generated execution cannot move
+a Java call across an interpreter scheduler boundary. Calls that are reachable
+only from an exception handler do not disqualify the leaf body. Set
+`JVM_JIT_EXPERIMENTAL_CONTROL_FLOW=1` to enable the broader capability globally
+for runtime experiments. Calls to unsupported methods permanently deopt their
+compiled caller instead of using application-specific resume rules.
+
+The Wasm numeric tier links fully translatable loop-free static helpers into hot
+loops on demand, including helpers with reference parameters. It also recognizes
+bounded, forward-only, always-rethrow diagnostic handlers as non-recovering, so
+their protected compute loops remain eligible. A catch that returns, acquires a
+monitor, loops backwards, or writes recovery state remains interpreted.
+
+#### Portable save states
+
+`JVM.saveState()` captures a JSON-compatible execution checkpoint and
+`await JVM.loadState(state)` restores it into a fresh JVM. Unlike the debugger's
+lightweight `serialize()` history, a save state includes loaded-class statics,
+the shared/cyclic Java heap, frame locals and operand stacks, thread and monitor
+references, class initialization, interned strings, relative sleep deadlines,
+and `long`/BigInt values.
+
+```js
+const checkpoint = jvm.saveState();
+fs.writeFileSync('game.state.json', JSON.stringify(checkpoint));
+
+const resumed = new JVM({ classpath });
+await resumed.loadState(JSON.parse(fs.readFileSync('game.state.json', 'utf8')));
+await resumed.execute();
+```
+
+Generated JS and Wasm are rebuilt after loading, keeping states portable across
+JavaScript engines. Random-access files reopen from their saved path, mode, and
+position. Host sockets, audio devices, and canvas objects are not serialized;
+`externalResources` lists omissions so an embedding can reconnect or recreate
+them. Capture at a scheduler boundary rather than during a pending native call.
+
 #### Web-Based Debugging
 
 ```bash

@@ -50,6 +50,12 @@ class Bail {
   constructor(reason) { this.reason = reason; }
 }
 
+// Label name for the block that wraps each structured try/handler sub-region so
+// its exit sinks can `break` out explicitly. Several wrappers may nest (inner
+// try inside an outer one); break resolves to the nearest frame and
+// uniquifyLabels renames them apart afterwards.
+const REGION_EXIT_LABEL = 'RegionExit';
+
 // ---------------------------------------------------------------------------
 // Phase A — normalise the exception table into try groups.
 // ---------------------------------------------------------------------------
@@ -168,6 +174,37 @@ function inLogicalTryRange(pc, group) {
 function renderCatchType(catch_type) {
   if (catch_type == null || catch_type === 0 || catch_type === 'any') return 'java.lang.Throwable';
   return String(catch_type).replace(/\//g, '.');
+}
+
+// JRE ancestry for the throwable types these class files actually catch. Used
+// to detect a later sibling catch that javac rejects because an earlier one
+// already covers it. Unknown (application) types have no known ancestors:
+// treating them as unrelated only risks leaving the javac error in place,
+// never a wrong wrap.
+const CATCH_TYPE_ANCESTORS = new Map([
+  ['java.lang.Exception', ['java.lang.Throwable']],
+  ['java.lang.Error', ['java.lang.Throwable']],
+  ['java.lang.RuntimeException', ['java.lang.Exception', 'java.lang.Throwable']],
+  ['java.io.IOException', ['java.lang.Exception', 'java.lang.Throwable']],
+  ['java.io.InterruptedIOException', ['java.io.IOException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.InterruptedException', ['java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.SecurityException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.IllegalArgumentException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.IllegalStateException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.NullPointerException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.ClassCastException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.ArithmeticException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.IndexOutOfBoundsException', ['java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+  ['java.lang.ArrayIndexOutOfBoundsException', ['java.lang.IndexOutOfBoundsException', 'java.lang.RuntimeException', 'java.lang.Exception', 'java.lang.Throwable']],
+]);
+
+/** True when a `catch (earlier)` clause makes a following `catch (later)`
+ * unreachable for javac: same type, catch-all Throwable, or a known JRE
+ * ancestor/descendant pair. */
+function catchTypeSubsumes(earlier, later) {
+  if (earlier === later) return true;
+  if (earlier === 'java.lang.Throwable') return true;
+  return (CATCH_TYPE_ANCESTORS.get(later) || []).includes(earlier);
 }
 
 // ---------------------------------------------------------------------------
@@ -848,11 +885,15 @@ function processGroup(work, group, ctx, commit) {
   // several when the compiler split one logical try body across table rows).
   // Overlapping table rows can place a catch handler numerically inside another
   // protected range in the same logical group. Such a block is still handler
-  // code: handler-entry dominance, not bytecode offset alone, distinguishes it.
+  // code: handler-entry *dominance*, not mere reachability, distinguishes it —
+  // a protected block that is only reachable-from (not dominated-by) a handler
+  // is a shared continuation of the try body, and excluding it would emit that
+  // protected code outside the try, dropping its exception coverage.
   const tryset = new Set();
   for (let i = 0; i < n; i++) {
-    const reachedByCurrentHandler = i !== tryEntry && reachableFromCurrentHandlers[i];
-    if (reachable[i] && !reachedByCurrentHandler && inLogicalTryRange(work.startPc[i], group)) tryset.add(i);
+    const dominatedByHandler = i !== tryEntry
+      && handlerLocals.some((h) => dominates(idom, h, i));
+    if (reachable[i] && !dominatedByHandler && inLogicalTryRange(work.startPc[i], group)) tryset.add(i);
   }
   if (!tryset.has(tryEntry)) return new Bail('try entry is outside its own range');
 
@@ -954,15 +995,9 @@ function processGroup(work, group, ctx, commit) {
   const externalToRenderId = new Map();
   let exits;
   if (externalsList.length <= 1) {
-    const regionHasCycle = [...tryset].some((source) =>
-      succOfTerm(work.term[source]).some((target) =>
-        target != null && tryset.has(target) && target !== source && dominates(idom, target, source)));
     for (const ext of externalsList) {
       const rid = ctx.allocId();
-      ctx.overrides.set(rid, {
-        t: 'regionExit',
-        mode: regionHasCycle ? 'break' : 'normal',
-      });
+      ctx.overrides.set(rid, { t: 'seq', body: [] });
       externalToRenderId.set(ext, rid);
     }
     exits = externalsList.map((ext) => ({ external: ext, index: 0 }));
@@ -978,9 +1013,41 @@ function processGroup(work, group, ctx, commit) {
   }
 
   // Structure the try body and each handler as sub-regions that exit to the
-  // enumerated sinks.
-  const tryTree = structureRegion(work, tryset, tryEntry, externalToRenderId, ctx);
+  // enumerated sinks. A sink is modeled as a `return` terminator inside the
+  // sub-CFG, but it renders as plain text (nothing, or a selector assignment) —
+  // so if block layout places another terminal block (a real throw/return merge
+  // node) after the sink's inline position, falling through the sink would run
+  // that block. Wrap each sub-region in a labeled block and make every sink an
+  // explicit `break` to it: reaching a sink always means "leave the region now".
+  const sinkRids = new Set(externalToRenderId.values());
+  const wrapRegionExits = (tree) => {
+    let used = false;
+    const walk = (node) => {
+      if (!node) return node;
+      switch (node.t) {
+        case 'straight':
+          if (!sinkRids.has(node.block)) return node;
+          used = true;
+          return { t: 'seq', body: [node, { t: 'break', label: REGION_EXIT_LABEL }] };
+        case 'seq': return { t: 'seq', body: node.body.map(walk) };
+        case 'block': return { ...node, body: walk(node.body) };
+        case 'loop': return { ...node, body: walk(node.body) };
+        case 'if': return { ...node, then: walk(node.then), els: node.els ? walk(node.els) : null };
+        case 'switch': return {
+          ...node,
+          cases: node.cases.map((c) => ({ ...c, body: walk(c.body) })),
+          dflt: node.dflt ? walk(node.dflt) : null,
+        };
+        default: return node;
+      }
+    };
+    const body = walk(tree);
+    return used ? { t: 'block', label: REGION_EXIT_LABEL, body } : body;
+  };
+
+  let tryTree = structureRegion(work, tryset, tryEntry, externalToRenderId, ctx);
   if (tryTree instanceof Bail) return tryTree;
+  tryTree = wrapRegionExits(tryTree);
 
   // A group whose sole catch-all handler is the lowered monitorexit+rethrow
   // idiom (see cfr.js lowerSynchronizedRegions) is a `synchronized` block, not a
@@ -996,8 +1063,9 @@ function processGroup(work, group, ctx, commit) {
   } else {
     const catches = [];
     for (let ci = 0; ci < group.catches.length; ci++) {
-      const hTree = structureRegion(work, handlerSets[ci], handlerLocals[ci], externalToRenderId, ctx);
+      let hTree = structureRegion(work, handlerSets[ci], handlerLocals[ci], externalToRenderId, ctx);
       if (hTree instanceof Bail) return hTree;
+      hTree = wrapRegionExits(hTree);
       catches.push({
         type: renderCatchType(group.catches[ci].catch_type),
         varName: 'decompiledCaughtParameter',
@@ -1007,16 +1075,20 @@ function processGroup(work, group, ctx, commit) {
     }
     tryNode = { t: 'try', body: tryTree, catches };
     // A broader handler followed by a narrower one cannot be represented as
-    // sibling Java catches.  Such JVM tables describe nested protected ranges:
-    // the later handler also covers failures thrown by the earlier handler.
-    // Keep that ordering by wrapping the broad handler in an inner try.
-    const shadowed = catches.findIndex((item, index) => index > 0
-      && catches.slice(0, index).some((earlier) => earlier.type === 'java.lang.Throwable'));
-    if (shadowed > 0) {
+    // sibling Java catches ("exception X has already been caught"). Such JVM
+    // tables describe nested protected ranges: the later handler also covers
+    // failures thrown by the earlier handler. Keep that ordering by wrapping
+    // the earlier handlers in an inner try. Repeat while any later catch is
+    // still subsumed by an earlier sibling.
+    for (;;) {
+      const siblings = tryNode.catches;
+      const shadowed = siblings.findIndex((item, index) => index > 0
+        && siblings.slice(0, index).some((earlier) => catchTypeSubsumes(earlier.type, item.type)));
+      if (shadowed <= 0) break;
       tryNode = {
         t: 'try',
-        body: { t: 'try', body: tryTree, catches: catches.slice(0, shadowed) },
-        catches: catches.slice(shadowed),
+        body: { t: 'try', body: tryNode.body, catches: siblings.slice(0, shadowed) },
+        catches: siblings.slice(shadowed),
       };
     }
   }

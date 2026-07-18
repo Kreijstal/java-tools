@@ -160,6 +160,10 @@ module.exports = {
     }
     const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName);
     const value = fieldKey ? objRef.fields[fieldKey] : undefined;
+    if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_GETFIELD === `${className}.${fieldName}` && Array.isArray(value)) {
+      const locals = (frame.locals || []).slice(0, 5).map((l) => (l !== null && typeof l === 'object' ? `<${l.type}${l.__dbgId ? '#' + l.__dbgId : ''}>` : String(l))).join(' ');
+      console.error(`[getfield] ${className}.${fieldName} in ${frame.className || '?'}.${frame.method && frame.method.name}@${frame.pc} locals=[${locals}] [len ${value.length}] ${value.slice(0, 48).join(',')}`);
+    }
     frame.stack.push(value);
   },
 
@@ -171,6 +175,24 @@ module.exports = {
       throw new Error('NullPointerException');
     }
     const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
+    if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_PUTFIELD &&
+        process.env.JVM_DEBUG_PUTFIELD.split(',').includes(className)) {
+      if (!objRef.__dbgId) objRef.__dbgId = (module.exports.__dbgNext = (module.exports.__dbgNext || 0) + 1);
+      let rendered;
+      if (value === null) rendered = 'null';
+      else if (Array.isArray(value)) rendered = `[len ${value.length}] ${value.slice(0, 48).map((v) => (typeof v === 'object' && v !== null ? `<${v.type}>` : String(v))).join(',')}`;
+      else if (typeof value === 'object') rendered = `<${value.type}>`;
+      else rendered = String(value);
+      let by = '';
+      if (process.env.JVM_DEBUG_PUTFIELD_STACK) {
+        const t = jvm.threads && jvm.threads[jvm.currentThreadIndex];
+        if (t && t.callStack && t.callStack.items) {
+          by = ' by ' + t.callStack.items.slice(-4).reverse()
+            .map((f) => `${f.className}.${f.method && f.method.name}${(f.method && f.method.descriptor) || ''}@${f.pc}`).join(' <- ');
+        }
+      }
+      console.error(`[putfield] ${className}#${objRef.__dbgId}.${fieldName}:${descriptor} = ${rendered}${by}`);
+    }
     objRef.fields[fieldKey] = value;
   },
 
@@ -253,13 +275,20 @@ module.exports = {
 
   putstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
-    const value = frame.stack.pop();
 
+    // Trigger <clinit> BEFORE popping: if a <clinit> frame is pushed we rewind
+    // pc and re-run this instruction, so the operand must stay on the stack.
     const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) {
       frame.pc--; // Re-run this instruction after <clinit> is done.
       return;
     }
+
+    if (frame.stack.isEmpty()) {
+      const m = frame.method || {};
+      throw new Error(`Stack underflow at putstatic ${className}.${fieldName}:${descriptor} in ${frame.className}.${m.name}${m.descriptor} pc=${frame.pc}`);
+    }
+    const value = frame.stack.pop();
 
     const fieldKey = `${fieldName}:${descriptor}`;
     let currentClassName = className;
@@ -346,7 +375,7 @@ module.exports = {
       }
     })();
 
-    const createMultiArray = (dims) => {
+    const createMultiArray = (dims, depth = 0) => {
       const count = dims[0];
       const remaining = dims.slice(1);
       let arr;
@@ -355,9 +384,16 @@ module.exports = {
       } else {
         arr = new Array(count).fill(null);
         for (let i = 0; i < count; i++) {
-          arr[i] = createMultiArray(remaining);
+          arr[i] = createMultiArray(remaining, depth + 1);
         }
       }
+      // Each nested Java array has its own runtime class. For example, rows of
+      // an [[I are [I instances and must pass checkcast [I. Without this tag,
+      // runtimeClassName returned undefined for rows produced by
+      // multianewarray even though newarray/anewarray were already tagged.
+      arr.type = className.slice(depth);
+      arr.elementType = arr.type.slice(1);
+      arr.hashCode = jvm.nextHashCode++;
       return arr;
     };
 
@@ -424,3 +460,5 @@ module.exports = {
     frame.stack.push(array);
   },
 };
+
+module.exports.resolveInstanceFieldKey = resolveInstanceFieldKey;

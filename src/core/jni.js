@@ -179,11 +179,11 @@ class JNI {
     // This maintains backward compatibility while using the new JNI system
     
     // System native methods
-    this.registerNativeMethod('java/lang/System', 'currentTimeMillis', '()J', 
-      (jniEnv) => Date.now());
-    
-    this.registerNativeMethod('java/lang/System', 'nanoTime', '()J', 
-      (jniEnv) => process.hrtime.bigint ? Number(process.hrtime.bigint()) : Date.now() * 1000000);
+    this.registerNativeMethod('java/lang/System', 'currentTimeMillis', '()J',
+      (jniEnv) => jniEnv.jvm.clock.millis());
+
+    this.registerNativeMethod('java/lang/System', 'nanoTime', '()J',
+      (jniEnv) => jniEnv.jvm.clock.nanos());
 
     // Object native methods  
     this.registerNativeMethod('java/lang/Object', 'hashCode', '()I',

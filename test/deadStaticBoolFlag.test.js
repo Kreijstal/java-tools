@@ -269,7 +269,7 @@ test('dead-flag discovery: finds zero int field with no writes', (t) => {
   t.end();
 });
 
-test('dead-flag discovery: finds mutually gated zero sentinel cycle', (t) => {
+test('dead-flag discovery: mutually gated zero sentinel cycle is opt-in', (t) => {
   const ast = astWithClasses([
     {
       className: 'Main',
@@ -300,9 +300,17 @@ test('dead-flag discovery: finds mutually gated zero sentinel cycle', (t) => {
       ],
     },
   ]);
-  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
-  t.ok(r.fields.includes('Main.J'));
-  t.notOk(r.fields.includes('Flags.L'), 'dependency-only guard is not returned without a consumer');
+  const conservative = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.notOk(conservative.fields.includes('Main.J'), 'default rejects the fixed-point cycle');
+  t.ok(conservative.rejected.includes('Main.J'));
+  t.deepEqual(conservative.cyclicDependencies, ['Flags.L', 'Main.J']);
+
+  const experimental = discoverDeadStaticFlags(ast, {
+    allowIntFlags: true,
+    allowMutuallyGuardedFalseCycles: true,
+  });
+  t.ok(experimental.fields.includes('Main.J'), 'explicit option enables the fixed-point proof');
+  t.notOk(experimental.fields.includes('Flags.L'), 'dependency-only guard is not returned without a consumer');
   t.end();
 });
 

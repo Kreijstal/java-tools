@@ -34,11 +34,18 @@ module.exports = {
         obj.audioOutput = createAudioOutput(toOutputOptions(formatFields));
         obj.isOpen = true;
       } catch (error) {
-        console.error("Failed to open audio device:", error.message);
-        throw {
-          type: "javax/sound/sampled/LineUnavailableException",
-          message: "Failed to open audio device: " + error.message,
+        // Headless / no audio device: discard samples instead of leaving the
+        // line closed — games treat a dead line as fatal mid-loop.
+        if (!module.exports._warnedNoAudio) {
+          module.exports._warnedNoAudio = true;
+          console.error("No audio device, discarding sound output:", error.message);
+        }
+        obj.audioOutput = {
+          write() {},
+          once(event, cb) { if (cb) cb(); },
+          end() {},
         };
+        obj.isOpen = true;
       }
     }, ["javax/sound/sampled/LineUnavailableException"]),
     "open(Ljavax/sound/sampled/AudioFormat;I)V": (jvm, obj, args) => {
@@ -68,6 +75,13 @@ module.exports = {
       }
     }, ["java/lang/IllegalStateException", "java/io/IOException"]),
     "available()I": (jvm, obj, args) => {
+      // A discard sink drains instantaneously. Reporting it as permanently
+      // empty makes games spend every cycle decoding audio that nobody can
+      // hear. In explicitly headless mode, model a full output buffer so the
+      // producer applies normal backpressure and yields to rendering.
+      if (process.env.JVM_DISABLE_AUDIO === '1' || process.env.JVM_DISABLE_AUDIO === 'true') {
+        return 0;
+      }
       // Return a reasonable buffer size estimate
       return 4096;
     },

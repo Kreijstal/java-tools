@@ -438,7 +438,7 @@ function formatMethod(cls, method, options = {}) {
   const params = descriptor.params || [];
   const returnType = descriptor.returnType || 'void';
   const code = getCode(method);
-  const localState = makeLocalState(params.map(simplifyType), isStatic, code);
+  let localState = makeLocalState(params.map(simplifyType), isStatic, code);
 
   if (method.name === '<clinit>') {
     return formatStaticInitializer(code, localState, cls, options);
@@ -473,12 +473,30 @@ function formatMethod(cls, method, options = {}) {
     return `${header};`;
   }
 
-  const decompiledBody = decompileCode(code, method, cls, localState, options);
+  const diagnosticsMark = Array.isArray(options.diagnostics) ? options.diagnostics.length : 0;
+  let decompiledBody = decompileCode(code, method, cls, localState, options);
+  // Per-type local splitting binds each load to the variant of the textually
+  // preceding store, which is wrong when differently-typed stores merge at a
+  // control-flow join (the untouched variants read as null). Re-emit with the
+  // offending slots collapsed to one Object local until no hazards remain.
+  const collapsedSlots = new Set();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const conflictSlots = localState.refConflictSlots();
+    if (!conflictSlots.length) break;
+    conflictSlots.forEach((slotIndex) => collapsedSlots.add(slotIndex));
+    const retryState = makeLocalState(params.map(simplifyType), isStatic, code, new Set(collapsedSlots));
+    if (Array.isArray(options.diagnostics)) options.diagnostics.length = diagnosticsMark;
+    const retryBody = decompileCode(code, method, cls, retryState, options);
+    if (!retryBody) break;
+    decompiledBody = retryBody;
+    localState = retryState;
+  }
   if (profileMethod) console.error(`[cfr-method-body] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
   const body = pruneTopLevelUnreachableTail(decompiledBody);
   if (process.env.CFR_JS_DEBUG_LOCALS === '1') {
     console.error('[cfr-body-before-locals]', JSON.stringify(body));
   }
+  removeImpossibleCheckedCatchBlocks(body, options.exceptionModel);
   ensureCheckedCatchReachability(body, code, options.exceptionModel);
   const constructorInvocation = method.name === '<init>'
     ? localState.takeConstructorInvocation()
@@ -1112,6 +1130,17 @@ function widenExceptionLocalsUsedByInstanceof(lines, model) {
   const instanceofTypesByLocal = new Map();
   const collect = (node) => {
     if (!node || typeof node !== 'object') return;
+    if (node.kind === 'InstanceofExpression') {
+      if (node.expression && node.expression.kind === 'Identifier'
+        && node.checkType && node.checkType.kind === 'ClassType' && node.checkType.name) {
+        const name = node.expression.name;
+        const tested = (node.checkType.packageName ? `${node.checkType.packageName}.` : '') + node.checkType.name;
+        if (!instanceofTypesByLocal.has(name)) instanceofTypesByLocal.set(name, new Set());
+        instanceofTypesByLocal.get(name).add(tested.replace(/\./g, '/'));
+      }
+      collect(node.expression);
+      return;
+    }
     if ((node.kind === 'UnsupportedExpression' || node.kind === 'UnsupportedStatement') && Array.isArray(node.tokens)) {
       for (let index = 1; index < node.tokens.length; index += 1) {
         if (node.tokens[index].text === 'instanceof' && node.tokens[index - 1].kind === 'identifier'
@@ -1135,19 +1164,35 @@ function widenExceptionLocalsUsedByInstanceof(lines, model) {
   }
   if (!instanceofTypesByLocal.size) return;
   const primitive = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double']);
-  for (let index = 0; index < lines.length; index += 1) {
-    let line = String(lines[index]);
-    for (const declaration of localDeclarationsFromStatement(line)) {
-      if (declaration.inCatch || !instanceofTypesByLocal.has(declaration.name) || primitive.has(declaration.type)) continue;
-      const declaredType = declaration.type.replace(/\./g, '/');
-      const testedTypes = instanceofTypesByLocal.get(declaration.name);
-      if ([...testedTypes].every((testedType) => isInstanceofTypeCompatible(declaredType, testedType, model))) continue;
-      const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const escapedType = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      line = line.replace(new RegExp(`\\b${escapedType}[ \\t]+${escapedName}(?=[ \\t]*[=;,)])`),
-        `Object ${declaration.name}`);
+  // Declared type of every local in the body (including catch parameters).
+  const declaredTypeOf = new Map();
+  for (const raw of lines) {
+    for (const declaration of localDeclarationsFromStatement(String(raw))) {
+      if (!declaredTypeOf.has(declaration.name)) declaredTypeOf.set(declaration.name, declaration.type);
     }
-    lines[index] = line;
+  }
+  // Rewrite the instanceof expression itself rather than widening the local's
+  // declaration: `(Object) x instanceof T` is always legal Java for reference
+  // x, while retyping the declaration to Object breaks every other use of the
+  // local (field access, method calls) that relied on the declared type.
+  for (const [name, testedTypes] of instanceofTypesByLocal) {
+    const declared = declaredTypeOf.get(name);
+    if (!declared || primitive.has(declared)) continue;
+    const declaredType = declared.replace(/\./g, '/');
+    const incompatible = [...testedTypes].filter(
+      (testedType) => !isInstanceofTypeCompatible(declaredType, testedType, model));
+    if (!incompatible.length) continue;
+    const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const testedType of incompatible) {
+      const renderedTested = testedType.replace(/\//g, '.');
+      const escapedTested = renderedTested.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const pattern = new RegExp(`(?<![\\w.$])${escapedName}[ \\t]+instanceof[ \\t]+${escapedTested}\\b`, 'g');
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = String(lines[index]);
+        if (!line.includes('instanceof')) continue;
+        lines[index] = line.replace(pattern, `(Object) ${name} instanceof ${renderedTested}`);
+      }
+    }
   }
 }
 
@@ -1193,11 +1238,14 @@ function ensureCheckedCatchReachability(lines, code, model) {
   }
   const unsupportedSourceTypes = new Set();
   for (const [catchType, entries] of entriesByType) {
-    if (isAssignableExceptionType(catchType, 'java/lang/RuntimeException', model)
-      || isAssignableExceptionType(catchType, 'java/lang/Error', model)) continue;
-    const supported = (code.codeItems || []).some((item) => {
+    // Reuse the canonical classifier here. The corpus hierarchy generally
+    // stops at the JDK boundary, so a plain assignability walk cannot discover
+    // that types such as NumberFormatException are RuntimeExceptions and would
+    // inject a visible `if (false) throw ...` anchor unnecessarily.
+    if (!isCheckedThrow(catchType, model)) continue;
+    const supported = entries.every((entry) => (code.codeItems || []).some((item) => {
       if (!Number.isFinite(item.pc)
-        || !entries.some((entry) => item.pc >= entry.start_pc && item.pc < entry.end_pc)) return false;
+        || item.pc < entry.start_pc || item.pc >= entry.end_pc) return false;
       const instruction = getInstructionFromItem(item);
       if (!instruction) return false;
       if (instruction.op === 'new' && typeof instruction.arg === 'string') {
@@ -1208,8 +1256,8 @@ function ensureCheckedCatchReachability(lines, code, model) {
       try { ref = parseMemberRef(instruction.arg); } catch (_error) { return false; }
       return (resolveMethodThrows(ref.owner, ref.name, ref.descriptor, model) || [])
         .some((type) => isAssignableExceptionType(type, catchType, model));
-    });
-    if (!supported || entries.length > 1) unsupportedSourceTypes.add(javaTypeFromInternalName(catchType));
+    }));
+    if (!supported) unsupportedSourceTypes.add(javaTypeFromInternalName(catchType));
   }
   if (!unsupportedSourceTypes.size) return;
 
@@ -1220,6 +1268,7 @@ function ensureCheckedCatchReachability(lines, code, model) {
     if (catchIndex < 0) continue;
     const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
     if (!declaration || !unsupportedSourceTypes.has(declaration.type)) continue;
+    if (sourceRangeHasDeclaredThrower(lines, tryIndex + 1, catchIndex, declaration.type, model)) continue;
     insertions.push({ index: tryIndex + 1, type: declaration.type,
       indent: `${String(lines[tryIndex]).match(/^\s*/)[0]}    ` });
   }
@@ -1227,6 +1276,136 @@ function ensureCheckedCatchReachability(lines, code, model) {
   for (const insertion of insertions) {
     lines.splice(insertion.index, 0, `${insertion.indent}if (false) throw (${insertion.type}) null;`);
   }
+}
+
+function sourceRangeHasDeclaredThrower(lines, start, end, catchSourceType, model) {
+  const declaredTypes = new Map();
+  for (const line of lines) {
+    for (const declaration of localDeclarationsFromStatement(String(line))) {
+      if (!declaredTypes.has(declaration.name)) declaredTypes.set(declaration.name, declaration.type);
+    }
+  }
+  for (let index = start; index < end; index += 1) {
+    const line = String(lines[index]);
+    // Chained reflection obscures the Field receiver's source type, but this
+    // exact JDK declaration is unambiguous and carries checked throws metadata.
+    if (/\.getInt\s*\(/.test(line)
+      && throwsTypesCoverSourceCatch(
+        resolveMethodThrows('java/lang/reflect/Field', 'getInt', '(Ljava/lang/Object;)I', model),
+        catchSourceType, model)) return true;
+
+    for (const call of line.matchAll(/\b([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(([^;]*)/g)) {
+      const receiver = call[1];
+      const methodName = call[2];
+      const ownerSourceType = declaredTypes.get(receiver);
+      if (!ownerSourceType) continue;
+      const arity = sourceArgumentCount(call[3]);
+      const candidates = sourceMethodCandidates(ownerSourceType.replace(/\./g, '/'), methodName, arity, model);
+      if (candidates.length && candidates.every((throwsTypes) =>
+        throwsTypesCoverSourceCatch(throwsTypes, catchSourceType, model))) return true;
+    }
+  }
+  return false;
+}
+
+function sourceArgumentCount(rawArguments) {
+  const text = String(rawArguments || '');
+  let depth = 0;
+  let count = 0;
+  let sawToken = false;
+  for (const char of text) {
+    if (char === '(' || char === '[' || char === '{') depth += 1;
+    else if (char === ')' || char === ']' || char === '}') {
+      if (depth === 0 && char === ')') break;
+      depth = Math.max(0, depth - 1);
+    } else if (char === ',' && depth === 0) count += 1;
+    else if (!/\s/.test(char)) sawToken = true;
+  }
+  return sawToken ? count + 1 : 0;
+}
+
+function sourceMethodCandidates(owner, name, arity, model) {
+  const result = [];
+  const pending = [owner];
+  const seen = new Set();
+  while (pending.length) {
+    const current = pending.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    const info = model && model.classInfo ? model.classInfo.get(current) : null;
+    if (!info) continue;
+    for (const item of info.items || []) {
+      if (!item || item.type !== 'method' || !item.method || item.method.name !== name) continue;
+      if ((parseDescriptor(item.method.descriptor || '()V').params || []).length !== arity) continue;
+      result.push(methodThrowsTypes(item.method).map((type) => type.replace(/\./g, '/')));
+    }
+    if (info.superClassName) pending.push(info.superClassName);
+    pending.push(...(info.interfaces || []));
+  }
+  return result;
+}
+
+function throwsTypesCoverSourceCatch(throwsTypes, catchSourceType, model) {
+  const catchType = String(catchSourceType || '').replace(/\./g, '/');
+  return (throwsTypes || []).some((type) => {
+    const internal = String(type).replace(/\./g, '/');
+    return internal === catchType || simpleClassName(internal) === simpleClassName(catchType)
+      || isAssignableExceptionType(internal, catchType, model);
+  });
+}
+
+// Remove a source-level checked catch only after control-flow reconstruction.
+// Doing this to the bytecode exception table is tempting, but overlapping rows
+// are also input to synchronized/region recovery and deleting one can make the
+// emitted source less structured. Under this explicitly gated source-cleanup
+// policy, a specific checked catch is live only when an emitted call declares
+// that type. Broad unchecked/Throwable families remain conservative.
+function removeImpossibleCheckedCatchBlocks(lines, model) {
+  if (process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE !== '1') return;
+  for (let tryIndex = lines.length - 1; tryIndex >= 0; tryIndex -= 1) {
+    if (String(lines[tryIndex]).trim() !== 'try {') continue;
+    const catchIndex = findMatchingCatchLine(lines, tryIndex);
+    if (catchIndex < 0) continue;
+    const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
+    if (!declaration || !isCheckedOnlyCatchSourceType(declaration.type, model)) continue;
+    if (sourceRangeHasDeclaredThrower(lines, tryIndex + 1, catchIndex, declaration.type, model)) continue;
+
+    let depth = 1;
+    let catchEnd = -1;
+    let hasFollowingClause = false;
+    for (let index = catchIndex + 1; index < lines.length; index += 1) {
+      const line = String(lines[index]);
+      const trimmed = line.trim();
+      if (depth === 1 && (/^}\s*catch\b/.test(trimmed) || /^}\s*finally\b/.test(trimmed))) {
+        hasFollowingClause = true;
+        break;
+      }
+      depth += (line.match(/{/g) || []).length - (line.match(/}/g) || []).length;
+      if (depth === 0) {
+        catchEnd = index;
+        break;
+      }
+    }
+    if (hasFollowingClause || catchEnd < 0) continue;
+
+    // Retain a plain lexical block. Flattening it could collide with locals in
+    // the surrounding method even though the catch itself is unreachable.
+    const indent = (String(lines[tryIndex]).match(/^\s*/) || [''])[0];
+    lines[tryIndex] = `${indent}{`;
+    lines.splice(catchIndex, catchEnd - catchIndex + 1, `${indent}}`);
+  }
+}
+
+function isCheckedOnlyCatchSourceType(sourceType, model) {
+  const type = String(sourceType || '').replace(/\./g, '/');
+  if (!type) return false;
+  if (type === 'Throwable' || type === 'Exception' || type === 'Error'
+    || type === 'java/lang/Throwable' || type === 'java/lang/Exception'
+    || type === 'java/lang/Error') return false;
+  for (const unchecked of JDK_UNCHECKED_EXCEPTIONS) {
+    if (type === unchecked || (!type.includes('/') && type === simpleClassName(unchecked))) return false;
+  }
+  return isCheckedThrow(type, model);
 }
 
 function pruneTopLevelUnreachableTail(lines) {
@@ -1354,15 +1533,27 @@ function refineObjectLocalDeclarations(lines, resolveType) {
     const arrayType = declaredTypes.get(tokens[2].text);
     if (arrayType && arrayType.endsWith('[]')) arrayElementTypes.set(tokens[0].text, arrayType.slice(0, -2));
   }
+  const refinements = new Map();
+  for (const [name, declaredType] of declaredTypes) {
+    if (declaredType !== 'Object') continue;
+    const refinedType = arrayElementTypes.get(name) || resolveType(name);
+    if (refinedType && refinedType !== 'Object') refinements.set(name, refinedType);
+  }
   return (lines || []).map((raw) => {
     let line = String(raw);
-    for (const declaration of localDeclarationsFromStatement(line)) {
-      if (declaration.type !== 'Object') continue;
-      const refinedType = arrayElementTypes.get(declaration.name) || resolveType(declaration.name);
-      if (!refinedType || refinedType === 'Object') continue;
-      const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    for (const [name, refinedType] of refinements) {
+      const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       line = line.replace(new RegExp(`\\bObject[ \\t]+${escapedName}(?=[ \\t]*[=;,)])`),
-        `${refinedType} ${declaration.name}`);
+        `${refinedType} ${name}`);
+      // Retyping a declaration after emission must also bridge assignments
+      // that were originally valid Object-to-Object stores. The verifier has
+      // already established the concrete reference type at the later use.
+      const assignment = new RegExp(`^(\\s*(?:${escapeRegExp(refinedType)}[ \\t]+)?${escapedName}[ \\t]*=[ \\t]*)([^;]+);$`);
+      line = line.replace(assignment, (whole, prefix, value) => {
+        const trimmed = value.trim();
+        if (trimmed === 'null' || trimmed.startsWith(`(${refinedType})`)) return whole;
+        return `${prefix}(${refinedType}) (Object) ${trimmed};`;
+      });
     }
     return line;
   });
@@ -1620,6 +1811,29 @@ function dropRethrowHandlerRows(codeItems, exceptionTable) {
   return (exceptionTable || []).filter((row) => !isRethrowHandler(row.handler_pc));
 }
 
+// Dead-code sweeps replace unreachable instructions with nop but keep the
+// exception table intact (nopping preserves every pc/label). A row whose
+// protected range now holds only nops can never throw, yet it still seeds a
+// phantom handler edge that defeats both the structurer ("try entry is
+// outside its own range") and the state-machine stack analysis (the handler's
+// exception slot joins a live path with a different stack height). Drop it.
+function dropUnthrowableProtectedRows(codeItems, exceptionTable) {
+  const rows = exceptionTable || [];
+  if (!rows.length) return rows;
+  return rows.filter((row) => {
+    const start = Number(row.start_pc);
+    const end = Number(row.end_pc);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return true;
+    for (const item of codeItems) {
+      const pc = Number(item && item.pc);
+      if (!Number.isFinite(pc) || pc < start || pc >= end) continue;
+      const instruction = getInstructionFromItem(item);
+      if (instruction && instruction.op !== 'nop') return true;
+    }
+    return false;
+  });
+}
+
 function decompileOwnedStructuredControlFlow(code, method, cls, localState, options = {}) {
   const originalItems = code.codeItems || [];
   if (!(code.exceptionTable || []).length && !originalItems.some((item) => {
@@ -1652,6 +1866,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   codeItems = loweredSync.codeItems;
   const syncHandlers = loweredSync.syncHandlers;
   exceptionTable = dropRethrowHandlerRows(codeItems, exceptionTable);
+  exceptionTable = dropUnthrowableProtectedRows(codeItems, exceptionTable);
   let structured = null;
   if (codeItems.length > 1000 && exceptionTable.length && !syncHandlers.size) {
     const normalCfg = buildCfgFromCode(codeItems, []);
@@ -1770,9 +1985,11 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           const pendingNew = value.pendingNew && value.pendingNew === incoming.pendingNew
             ? value.pendingNew
             : null;
+          if ((value.pendingNew || null) !== pendingNew) changed = true;
           const qualifiedType = value.qualifiedType && value.qualifiedType === incoming.qualifiedType
             ? value.qualifiedType
             : null;
+          if ((value.qualifiedType || null) !== qualifiedType) changed = true;
           return expr(value.code, type, value.precedence, {
             ...(pendingNew ? { pendingNew } : {}),
             ...(qualifiedType ? { qualifiedType } : {}),
@@ -2376,65 +2593,91 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       // A dynamic-length new-array being filled must be shared (not copied) so
       // that spilling it to a synthetic local at the first aastore propagates
       // to the sibling stores and to the eventual rvalue use.
-      stack.push(top.newArraySpill ? top : { ...top });
+      if (top.newArraySpill) {
+        stack.push(top);
+        continue;
+      }
+      const value = materializeDuplicatedValue(top, lines, localState);
+      stack[stack.length - 1] = value;
+      stack.push({ ...value });
       continue;
     }
     if (op === 'dup_x1') {
-      const value1 = pop(stack);
-      const value2 = pop(stack);
+      const raw1 = pop(stack);
+      const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
+      const value1 = materializeDuplicatedValue(raw1, lines, localState);
       stack.push({ ...value1 }, value2, value1);
       continue;
     }
     if (op === 'dup_x2') {
-      const value1 = pop(stack);
-      const value2 = pop(stack);
-      if (isCategory2(value2)) {
+      const raw1 = pop(stack);
+      const raw2 = pop(stack);
+      if (isCategory2(raw2)) {
+        const value2 = materializeDuplicatedValue(raw2, lines, localState);
+        const value1 = materializeDuplicatedValue(raw1, lines, localState);
         stack.push({ ...value1 }, value2, value1);
       } else {
-        const value3 = pop(stack);
+        const value3 = materializeDuplicatedValue(pop(stack), lines, localState);
+        const value2 = materializeDuplicatedValue(raw2, lines, localState);
+        const value1 = materializeDuplicatedValue(raw1, lines, localState);
         stack.push({ ...value1 }, value3, value2, value1);
       }
       continue;
     }
     if (op === 'dup2') {
-      const value1 = pop(stack);
-      if (isCategory2(value1)) {
+      const raw1 = pop(stack);
+      if (isCategory2(raw1)) {
+        const value1 = materializeDuplicatedValue(raw1, lines, localState);
         stack.push(value1, { ...value1 });
       } else {
-        const value2 = pop(stack);
+        const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
+        const value1 = materializeDuplicatedValue(raw1, lines, localState);
         stack.push(value2, value1, { ...value2 }, { ...value1 });
       }
       continue;
     }
     if (op === 'dup2_x1') {
-      const value1 = pop(stack);
-      if (isCategory2(value1)) {
-        const value2 = pop(stack);
+      const raw1 = pop(stack);
+      if (isCategory2(raw1)) {
+        const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
+        const value1 = materializeDuplicatedValue(raw1, lines, localState);
         stack.push({ ...value1 }, value2, value1);
       } else {
-        const value2 = pop(stack);
-        const value3 = pop(stack);
+        const raw2 = pop(stack);
+        const value3 = materializeDuplicatedValue(pop(stack), lines, localState);
+        const value2 = materializeDuplicatedValue(raw2, lines, localState);
+        const value1 = materializeDuplicatedValue(raw1, lines, localState);
         stack.push({ ...value2 }, { ...value1 }, value3, value2, value1);
       }
       continue;
     }
     if (op === 'dup2_x2') {
-      const value1 = pop(stack);
-      if (isCategory2(value1)) {
-        const value2 = pop(stack);
-        if (isCategory2(value2)) {
+      const raw1 = pop(stack);
+      if (isCategory2(raw1)) {
+        const raw2 = pop(stack);
+        if (isCategory2(raw2)) {
+          const value2 = materializeDuplicatedValue(raw2, lines, localState);
+          const value1 = materializeDuplicatedValue(raw1, lines, localState);
           stack.push({ ...value1 }, value2, value1);
         } else {
-          const value3 = pop(stack);
+          const value3 = materializeDuplicatedValue(pop(stack), lines, localState);
+          const value2 = materializeDuplicatedValue(raw2, lines, localState);
+          const value1 = materializeDuplicatedValue(raw1, lines, localState);
           stack.push({ ...value1 }, value3, value2, value1);
         }
       } else {
-        const value2 = pop(stack);
-        const value3 = pop(stack);
-        if (isCategory2(value3)) {
+        const raw2 = pop(stack);
+        const raw3 = pop(stack);
+        if (isCategory2(raw3)) {
+          const value3 = materializeDuplicatedValue(raw3, lines, localState);
+          const value2 = materializeDuplicatedValue(raw2, lines, localState);
+          const value1 = materializeDuplicatedValue(raw1, lines, localState);
           stack.push({ ...value2 }, { ...value1 }, value3, value2, value1);
         } else {
-          const value4 = pop(stack);
+          const value4 = materializeDuplicatedValue(pop(stack), lines, localState);
+          const value3 = materializeDuplicatedValue(raw3, lines, localState);
+          const value2 = materializeDuplicatedValue(raw2, lines, localState);
+          const value1 = materializeDuplicatedValue(raw1, lines, localState);
           stack.push({ ...value2 }, { ...value1 }, value4, value3, value2, value1);
         }
       }
@@ -2493,17 +2736,28 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'arraylength') {
       const array = pop(stack);
-      if (array.type === 'Object') localState.refineExpressionType(array, 'Object[]');
-      stack.push(expr(`${wrap(array, 100)}.length`, 'int'));
+      let rendered = array;
+      if (array.type === 'Object') {
+        localState.refineExpressionType(array, 'Object[]');
+        // Collapsed Object locals reject declaration refinement; cast at use.
+        const refined = localState.sourceTypeForName(array.code);
+        if (!refined || !refined.endsWith('[]')) rendered = coerceExpressionForType(array, 'Object[]');
+      }
+      stack.push(expr(`${wrap(rendered, 100)}.length`, 'int'));
       continue;
     }
 
     if (ARRAY_LOAD_TYPES[op]) {
       const index = pop(stack);
       let array = pop(stack);
-      if (array.type === 'Object') {
-        const arrayType = op === 'aaload' ? 'Object[]' : `${ARRAY_LOAD_TYPES[op]}[]`;
-        array = coerceExpressionForType(array, arrayType);
+      const arrayType = op === 'aaload' ? 'Object[]' : `${ARRAY_LOAD_TYPES[op]}[]`;
+      const compatibleBooleanArray = op === 'baload' && array.type === 'boolean[]';
+      if (array.type === 'Object'
+        || (op !== 'aaload' && array.type !== arrayType && !compatibleBooleanArray)) {
+        localState.refineExpressionType(array, arrayType);
+        const refined = localState.sourceTypeForName(array.code);
+        if (refined === arrayType) array = { ...array, type: refined };
+        else array = coerceExpressionForType(array, arrayType);
       }
       const elementType = op === 'baload' && array.type === 'boolean[]'
         ? 'boolean'
@@ -2515,9 +2769,14 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const value = pop(stack);
       const index = pop(stack);
       let array = pop(stack);
-      if (array.type === 'Object') {
-        const arrayType = op === 'aastore' ? 'Object[]' : `${ARRAY_STORE_TYPES[op]}[]`;
-        array = coerceExpressionForType(array, arrayType);
+      const arrayType = op === 'aastore' ? 'Object[]' : `${ARRAY_STORE_TYPES[op]}[]`;
+      const compatibleBooleanArray = op === 'bastore' && array.type === 'boolean[]';
+      if (array.type === 'Object'
+        || (op !== 'aastore' && array.type !== arrayType && !compatibleBooleanArray)) {
+        localState.refineExpressionType(array, arrayType);
+        const refined = localState.sourceTypeForName(array.code);
+        if (refined === arrayType) array = { ...array, type: refined };
+        else array = coerceExpressionForType(array, arrayType);
       }
       if (array.arrayLiteral && /^\d+$/.test(index.code)) {
         array.arrayLiteral.elements.set(Number(index.code), value);
@@ -2548,6 +2807,10 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'putstatic') {
       const ref = parseMemberRef(instruction.arg);
       const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
+      // A live stack value that reads this same field (e.g. the old value dup_x1'd
+      // below the store target in a post-increment `f[x++]=v` idiom) would re-read
+      // the *mutated* field after this assignment. Spill such reads to a temp first.
+      materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name), lines, localState);
       lines.push(`${formatStaticField(ref, currentInternalClassName)} = ${value.code};`);
       continue;
     }
@@ -2563,6 +2826,9 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const ref = parseMemberRef(instruction.arg);
       const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
       const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
+      // Spill any live stack value that reads this field before mutating it, so a
+      // post-increment index (`this.r[this.n++] = v`) keeps its pre-increment value.
+      materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name), lines, localState);
       lines.push(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name)} = ${value.code};`);
       continue;
     }
@@ -2615,7 +2881,10 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       if (broadThrown) {
         options.requiresSneakyThrow = true;
         const owner = simpleClassName(cls.className || 'Class');
-        lines.push(`throw ${owner}.<RuntimeException>$cfr$sneakyThrow(${thrown.code});`);
+        const thrownCode = simplifyType(thrown.type) === 'Object'
+          ? `(Throwable) ${wrap(thrown, 90)}`
+          : thrown.code;
+        lines.push(`throw ${owner}.<RuntimeException>$cfr$sneakyThrow(${thrownCode});`);
         continue;
       }
       const renderedThrown = thrown;
@@ -2629,9 +2898,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       continue;
     }
     if (op === 'return') {
-      if (method.name !== '<init>' && method.name !== '<clinit>') {
-        if (methodReturnType(method) === 'void') lines.push('return;');
-        else lines.push('throw new IllegalStateException("void return opcode in non-void method");');
+      // Always emit `return;`, even in <init>/<clinit>: a void return inside a
+      // loop-exit branch must terminate the method, or the enclosing while(true)
+      // spins forever. The redundant trailing return (method fall-off) is
+      // stripped by the trailing-return cleanup on each emit path.
+      if (methodReturnType(method) === 'void') lines.push('return;');
+      else if (method.name !== '<init>' && method.name !== '<clinit>') {
+        lines.push('throw new IllegalStateException("void return opcode in non-void method");');
       }
       continue;
     }
@@ -2672,7 +2945,7 @@ function emitVirtualCall(lines, stack, arg) {
   }
 
   if (ref.owner === 'java/lang/StringBuilder' && ref.name === 'append' && args.length === 1) {
-    stack.push(stringBuilderAppendExpression(receiver, args[0]));
+    stack.push(stringBuilderAppendExpression(receiver, args[0], descriptor.params[0]));
     return;
   }
   if (ref.owner === 'java/lang/StringBuilder' && ref.name === 'toString' && args.length === 0 && receiver.stringBuilderPieces) {
@@ -2774,11 +3047,14 @@ function emitSpecialCall(lines, stack, arg, method, currentClassName, currentInt
       localState.recordConstructorInvocation(target, invocationArgs);
       return;
     }
-    if (receiver.pendingNew || receiver.code.startsWith('new ') || /^stackIn_/.test(rawReceiver.code)) {
+    if (rawReceiver.pendingNew || receiver.code.startsWith('new ') || /^stackIn_/.test(rawReceiver.code)) {
       const constructed = ref.owner === 'java/lang/StringBuilder'
         ? stringBuilderConstructorExpression(ownerType, args)
         : expr(`new ${ownerType}(${renderedArgs.join(', ')})`, ownerType);
-      replacePendingNewOrEmit(lines, stack, receiver, constructed);
+      // Compare via rawReceiver: casts/coercions drop pendingNew metadata, and
+      // losing it here silently discards the constructed value (the dup'd twin
+      // slot keeps reading its null carrier).
+      replacePendingNewOrEmit(lines, stack, rawReceiver, constructed);
       return;
     }
     lines.push(`${wrap(receiver, 100)}.${simpleClassName(ref.owner)}(${renderedArgs.join(', ')});`);
@@ -2795,7 +3071,7 @@ function emitSpecialCall(lines, stack, arg, method, currentClassName, currentInt
 
 function replacePendingNewOrEmit(lines, stack, receiver, constructed) {
   const last = stack.length ? stack[stack.length - 1] : null;
-  if (last && (last.pendingNew === receiver.pendingNew || last.code === receiver.code)) {
+  if (last && ((last.pendingNew && last.pendingNew === receiver.pendingNew) || last.code === receiver.code)) {
     stack[stack.length - 1] = constructed;
   } else {
     lines.push(`${constructed.code};`);
@@ -2809,10 +3085,17 @@ function stringBuilderConstructorExpression(ownerType, args) {
   });
 }
 
-function stringBuilderAppendExpression(receiver, value) {
+function stringBuilderAppendExpression(receiver, value, targetType) {
+  // StringBuilder append chains are reconstructed specially so they can later
+  // collapse to source-level string concatenation. Do not lose the invoked
+  // overload's descriptor while doing so: JVM int-category locals also carry
+  // byte/short/char values, but javac selects append(int) unless the emitted
+  // expression is narrowed explicitly. That changes visible strings (for
+  // example, appending 'L' as the decimal text "76").
+  const renderedValue = coerceExpressionForType(value, targetType || value.type);
   const pieces = receiver.stringBuilderPieces ? receiver.stringBuilderPieces.slice() : [];
-  pieces.push(value);
-  return expr(`${wrap(receiver, 100)}.append(${value.code})`, 'StringBuilder', 100, {
+  pieces.push(renderedValue);
+  return expr(`${wrap(receiver, 100)}.append(${renderedValue.code})`, 'StringBuilder', 100, {
     stringBuilderPieces: pieces,
   });
 }
@@ -4370,10 +4653,20 @@ function conditionForBranch(branch, stack, invert) {
     let right = pop(stack);
     let left = pop(stack);
     const operator = invert ? invertOperator(intCompareOps[op]) : intCompareOps[op];
+    const complementedComparison = simplifyBitwiseComplementComparison(left, operator, right);
+    if (complementedComparison) return complementedComparison;
     if ((op === 'if_acmpeq' || op === 'if_acmpne') && left.code !== 'null' && right.code !== 'null'
       && simplifyType(left.type) !== simplifyType(right.type)) {
       left = coerceExpressionForType(left, 'Object');
       right = coerceExpressionForType(right, 'Object');
+    }
+    if ((operator === '<' || operator === '<=' || operator === '>' || operator === '>=')
+      && (left.type === 'boolean' || right.type === 'boolean')) {
+      // JVM verifier int-category values can carry a descriptor-Z value into
+      // an integer relational comparison. Java source cannot compare boolean
+      // to an int, so materialize the boolean operand as its JVM 0/1 value.
+      if (left.type === 'boolean') left = coerceExpressionForType(left, 'int');
+      if (right.type === 'boolean') right = coerceExpressionForType(right, 'int');
     }
     if ((operator === '==' || operator === '!=') && (left.type === 'boolean') !== (right.type === 'boolean')) {
       // Mixed boolean/int comparison. Coercing the int side to boolean
@@ -4404,6 +4697,12 @@ function conditionForBranch(branch, stack, invert) {
     const value = pop(stack);
     const operator = invert ? invertOperator(unaryOps[op]) : unaryOps[op];
     if (value.compare) {
+      const complementedComparison = simplifyBitwiseComplementComparison(
+        value.compare.left,
+        operator,
+        value.compare.right,
+      );
+      if (complementedComparison) return complementedComparison;
       return expr(`${wrap(value.compare.left, 60)} ${operator} ${wrap(value.compare.right, 60)}`, 'boolean', 60);
     }
     if (isBooleanExpression(value) && (op === 'ifeq' || op === 'ifne')) {
@@ -4412,6 +4711,12 @@ function conditionForBranch(branch, stack, invert) {
     }
     const materializedBoolean = simplifyMaterializedBooleanCondition(value, operator);
     if (materializedBoolean) return materializedBoolean;
+    const complementedComparison = simplifyBitwiseComplementComparison(
+      value,
+      operator,
+      expr('0', 'int', 100, { constantValue: 0 }),
+    );
+    if (complementedComparison) return complementedComparison;
     return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60);
   }
 
@@ -4643,7 +4948,98 @@ function getCode(method) {
   return attr ? attr.code : null;
 }
 
-function makeLocalState(paramTypes, isStatic, code = null) {
+// Reaching-definitions for object locals over the bytecode CFG: for every
+// aload, which astores can supply its value at runtime. Exception edges are
+// approximated conservatively (a handler sees the OUT state of every block
+// overlapping its protected range). Used to decide whether per-type local
+// splitting is sound for a slot.
+function computeObjectSlotReachability(code) {
+  const codeItems = code && code.codeItems ? code.codeItems : [];
+  const cfg = buildCfgFromCode(codeItems, []);
+  if (!cfg) return null;
+  const labels = buildLabelIndex(codeItems);
+  const blockOfItem = new Map();
+  cfg.blocks.forEach((block) => block.insns.forEach((itemIndex) => blockOfItem.set(itemIndex, block.id)));
+
+  const accessesByBlock = cfg.blocks.map((block) => {
+    const accesses = [];
+    for (const itemIndex of block.insns) {
+      const item = codeItems[itemIndex];
+      const instruction = getInstructionFromItem(item);
+      if (!instruction || !Number.isFinite(Number(item.pc))) continue;
+      const store = parseStoreIndex(instruction.op, instruction.arg);
+      if (store && store.type === 'Object') {
+        accesses.push({ kind: 'store', slot: store.index, pc: Number(item.pc) });
+        continue;
+      }
+      const load = parseLoadIndex(instruction.op, instruction.arg);
+      if (load && load.type === 'Object') accesses.push({ kind: 'load', slot: load.index, pc: Number(item.pc) });
+    }
+    return accesses;
+  });
+
+  const edges = cfg.blocks.map((block, id) => new Set((cfg.succ[id] || []).filter((s) => s != null)));
+  for (const entry of code.exceptionTable || []) {
+    const handlerLabel = String(entry.handlerLbl || entry.handlerLabel || '').replace(/:$/, '');
+    const handlerIndex = labels.get(handlerLabel);
+    const handlerBlock = handlerIndex === undefined ? null : blockOfItem.get(handlerIndex);
+    if (handlerBlock == null) continue;
+    const startPc = Number(entry.start_pc);
+    const endPc = Number(entry.end_pc);
+    cfg.blocks.forEach((block, id) => {
+      const overlaps = block.insns.some((itemIndex) => {
+        const pc = Number(codeItems[itemIndex] && codeItems[itemIndex].pc);
+        return Number.isFinite(pc) && pc >= startPc && pc < endPc;
+      });
+      if (overlaps) edges[id].add(handlerBlock);
+    });
+  }
+
+  const mergeInto = (target, source) => {
+    let changed = false;
+    for (const [slot, pcs] of source) {
+      if (!target.has(slot)) { target.set(slot, new Set(pcs)); changed = true; continue; }
+      const set = target.get(slot);
+      for (const pc of pcs) if (!set.has(pc)) { set.add(pc); changed = true; }
+    }
+    return changed;
+  };
+  const transfer = (blockId, inState) => {
+    const out = new Map();
+    for (const [slot, pcs] of inState) out.set(slot, new Set(pcs));
+    for (const access of accessesByBlock[blockId]) {
+      if (access.kind === 'store') out.set(access.slot, new Set([access.pc]));
+    }
+    return out;
+  };
+
+  const ins = cfg.blocks.map(() => new Map());
+  const outs = cfg.blocks.map((block, id) => transfer(id, ins[id]));
+  const queue = cfg.blocks.map((block) => block.id);
+  for (let steps = 0; queue.length && steps < cfg.blocks.length * 64; steps += 1) {
+    const blockId = queue.shift();
+    const out = outs[blockId];
+    for (const successor of edges[blockId]) {
+      if (mergeInto(ins[successor], out)) {
+        outs[successor] = transfer(successor, ins[successor]);
+        if (!queue.includes(successor)) queue.push(successor);
+      }
+    }
+  }
+
+  const loads = [];
+  cfg.blocks.forEach((block, id) => {
+    const state = new Map();
+    for (const [slot, pcs] of ins[id]) state.set(slot, new Set(pcs));
+    for (const access of accessesByBlock[id]) {
+      if (access.kind === 'store') state.set(access.slot, new Set([access.pc]));
+      else loads.push({ slot: access.slot, pc: access.pc, reaching: [...(state.get(access.slot) || [])] });
+    }
+  });
+  return { loads };
+}
+
+function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null) {
   const names = new Map();
   const types = new Map();
   const debugNames = new Map();
@@ -4734,6 +5130,7 @@ function makeLocalState(paramTypes, isStatic, code = null) {
   const liftedDeclared = new Set();
   const currentReferenceKeys = new Map();
   const referenceDefinitions = new Map();
+  const objectLoadBindings = new Map();
   let syntheticCounter = 0;
   let constructorInvocation = null;
 
@@ -4742,10 +5139,20 @@ function makeLocalState(paramTypes, isStatic, code = null) {
     const type = simplifyType(fallbackType);
     const intCategory = new Set(['boolean', 'byte', 'char', 'short', 'int']);
     const primitiveKinds = new Set(['long', 'float', 'double']);
+    // Slots in plainRefSlots hold references of more than one type on merging
+    // control-flow paths; per-type variants would leave some paths writing a
+    // variable the join never reads. Collapse every reference access to one
+    // Object-typed variable instead.
+    const plainForced = plainRefSlots && plainRefSlots.has(index)
+      && !intCategory.has(type) && !primitiveKinds.has(type);
     const kind = intCategory.has(type) ? 'int'
       : (primitiveKinds.has(type) ? type
-        : ((type.endsWith('[]') || forceReferenceVariant) ? `ref:${type}` : 'ref'));
+        : (plainForced ? 'ref'
+          : ((type.endsWith('[]') || forceReferenceVariant) ? `ref:${type}` : 'ref')));
     return `${index}:${kind}`;
+  }
+  function isPlainForced(index) {
+    return Boolean(plainRefSlots && plainRefSlots.has(index) && !initiallyDeclared.has(index));
   }
 
   function ensure(index, fallbackType = 'Object', forceReferenceVariant = false) {
@@ -4781,6 +5188,9 @@ function makeLocalState(paramTypes, isStatic, code = null) {
       const debugType = debugTypes.get(index);
       const safeReferenceType = debugType && (debugType.endsWith('[]') || debugType === 'String') ? debugType : 'Object';
       types.set(key, type === 'Object' ? safeReferenceType : type);
+    }
+    if (typeof key === 'string' && key.endsWith(':ref') && isPlainForced(index)) {
+      types.set(key, 'Object');
     }
     return key;
   }
@@ -4834,9 +5244,48 @@ function makeLocalState(paramTypes, isStatic, code = null) {
       if (binding.scopedDeclared) scopedDeclared.add(binding.key); else scopedDeclared.delete(binding.key);
       if (binding.liftedDeclared) liftedDeclared.add(binding.key); else liftedDeclared.delete(binding.key);
     },
+    // Slots whose reference accesses split into variant variables in a way the
+    // bytecode dataflow does not support: some load can observe stores that
+    // were emitted into different variants (or a variant other than the one
+    // the load bound to). A caller that sees any should re-run emission with
+    // these slots collapsed to one Object local (plainRefSlots).
+    refConflictSlots() {
+      const bySlot = new Map();
+      for (const key of names.keys()) {
+        const match = String(key).match(/^(\d+):(ref.*)$/);
+        if (!match) continue;
+        const slotIndex = Number(match[1]);
+        if (!bySlot.has(slotIndex)) bySlot.set(slotIndex, new Set());
+        bySlot.get(slotIndex).add(match[2]);
+      }
+      const splitSlots = [...bySlot.entries()]
+        .filter(([slotIndex, kinds]) => kinds.size > 1 && !(plainRefSlots && plainRefSlots.has(slotIndex)))
+        .map(([slotIndex]) => slotIndex);
+      if (!splitSlots.length) return [];
+      const reachability = code ? computeObjectSlotReachability(code) : null;
+      if (!reachability) return splitSlots;
+      const hazards = new Set();
+      for (const load of reachability.loads) {
+        if (!splitSlots.includes(load.slot) || hazards.has(load.slot)) continue;
+        const boundKey = objectLoadBindings.get(load.pc);
+        if (boundKey === undefined) continue; // load sits in unemitted (dead) code
+        const keyByPc = new Map((referenceDefinitions.get(load.slot) || []).map((item) => [item.pc, item.key]));
+        const reachingKeys = new Set();
+        for (const storePc of load.reaching) {
+          const key = keyByPc.get(storePc);
+          if (key !== undefined) reachingKeys.add(key);
+        }
+        if (reachingKeys.size > 1) hazards.add(load.slot);
+        else if (reachingKeys.size === 1 && ![...reachingKeys].includes(boundKey)) hazards.add(load.slot);
+      }
+      return [...hazards];
+    },
     refinedTypeForName(name) {
       const matches = [...names.entries()].filter(([, localName]) => localName === name);
       if (matches.length !== 1) return null;
+      const [key] = matches[0];
+      const slotIndex = Number(String(key).split(':')[0]);
+      if (typeof key === 'string' && key.endsWith(':ref') && isPlainForced(slotIndex)) return null;
       return simplifyType(types.get(matches[0][0]));
     },
     sourceTypeForName(name) {
@@ -4849,7 +5298,21 @@ function makeLocalState(paramTypes, isStatic, code = null) {
       if (!value || !value.code) return;
       for (const [key, name] of names) {
         if (name !== value.code) continue;
-        if (types.get(key) === 'Object') types.set(key, simplifyType(type));
+        // Method headers were rendered before body inference. Keep parameter
+        // declarations stable and cast verifier-constrained uses instead.
+        if (initiallyDeclared.has(key)) continue;
+        // Collapsed (plain-forced) locals must stay Object: their stores were
+        // rendered against Object, so re-typing the declaration would break.
+        const slotIndex = Number(String(key).split(':')[0]);
+        if (typeof key === 'string' && key.endsWith(':ref') && isPlainForced(slotIndex)) continue;
+        const currentType = simplifyType(types.get(key));
+        const refinedType = simplifyType(type);
+        // arraylength establishes only Object[]; a following primitive array
+        // opcode carries the concrete verifier type.
+        if (currentType === 'Object'
+          || (currentType === 'Object[]' && refinedType.endsWith('[]') && refinedType !== 'Object[]')) {
+          types.set(key, refinedType);
+        }
       }
     },
     setLocal(index, name, type = 'Object', markDeclared = false) {
@@ -4908,6 +5371,9 @@ function makeLocalState(paramTypes, isStatic, code = null) {
         if (prior) key = prior.key;
       }
       if (!key) key = ensure(index, fallbackType);
+      if (fallbackType === 'Object' && Number.isFinite(Number(pc))) {
+        objectLoadBindings.set(Number(pc), key);
+      }
       const name = names.get(key);
       return expr(name, types.get(key), 100, {
         localIndex: index,
@@ -4951,7 +5417,8 @@ function makeLocalState(paramTypes, isStatic, code = null) {
         }
       }
       const name = names.get(key);
-      if (!types.has(key) || (types.get(key) === 'Object' && effectiveType !== 'Object')) types.set(key, effectiveType);
+      const upgradeBlocked = typeof key === 'string' && key.endsWith(':ref') && isPlainForced(index);
+      if (!upgradeBlocked && (!types.has(key) || (types.get(key) === 'Object' && effectiveType !== 'Object'))) types.set(key, effectiveType);
       const rendered = coerceExpressionForType(renderStoreExpression(value), types.get(key));
       if (!declared.has(key)) {
         declared.add(key);
@@ -4960,7 +5427,12 @@ function makeLocalState(paramTypes, isStatic, code = null) {
       return `${name} = ${rendered.code};`;
     },
     bindCatch(index, catchType, pc = null, preferredName = null) {
+      // Catch parameters need a typed declaration even when the slot's other
+      // reference accesses are collapsed to Object.
+      const plainSuspended = plainRefSlots && plainRefSlots.has(index);
+      if (plainSuspended) plainRefSlots.delete(index);
       const key = ensure(index, catchType, true);
+      if (plainSuspended) plainRefSlots.add(index);
       if (preferredName && ![...names.entries()].some(([otherKey, name]) =>
         otherKey !== key && Number(String(otherKey).split(':')[0]) !== Number(index) && name === preferredName)) {
         names.set(key, sanitizeJavaIdentifier(preferredName, names.get(key)));
@@ -5124,8 +5596,107 @@ function binaryExpr(left, symbol, right, type) {
     left = coerceExpressionForType(left, 'int');
     right = coerceExpressionForType(right, 'int');
   }
+  const identity = simplifyIntegralIdentityExpression(left, symbol, right, type);
+  if (identity) return identity;
+  if (experimentalConstantEvaluationEnabled()
+    && symbol === '^' && (type === 'int' || type === 'long')) {
+    const leftConstant = integralConstantValue(left, type);
+    const rightConstant = integralConstantValue(right, type);
+    if (leftConstant === minusOneForType(type)) {
+      return expr(`~${wrap(right, 90)}`, type, 90, { bitwiseComplement: right });
+    }
+    if (rightConstant === minusOneForType(type)) {
+      return expr(`~${wrap(left, 90)}`, type, 90, { bitwiseComplement: left });
+    }
+  }
   const precedence = binaryPrecedence(symbol);
   return expr(`${wrap(left, precedence)} ${symbol} ${wrap(right, precedence, true)}`, type, precedence);
+}
+
+function simplifyIntegralIdentityExpression(left, symbol, right, type) {
+  if (!experimentalConstantEvaluationEnabled() || (type !== 'int' && type !== 'long')) return null;
+  const leftConstant = integralConstantValue(left, type);
+  const rightConstant = integralConstantValue(right, type);
+  const zero = type === 'long' ? 0n : 0;
+  const one = type === 'long' ? 1n : 1;
+  const minusOne = minusOneForType(type);
+
+  const rightIdentity = (rightConstant === zero && (
+    symbol === '+' || symbol === '-' || symbol === '|' || symbol === '^'
+      || symbol === '<<' || symbol === '>>' || symbol === '>>>'
+  )) || (rightConstant === one && (symbol === '*' || symbol === '/'))
+    || (rightConstant === minusOne && symbol === '&');
+  if (rightIdentity && simplifyType(left.type) === type) return { ...left, type };
+
+  const leftIdentity = (leftConstant === zero && (
+    symbol === '+' || symbol === '|' || symbol === '^'
+  )) || (leftConstant === one && symbol === '*')
+    || (leftConstant === minusOne && symbol === '&');
+  if (leftIdentity && simplifyType(right.type) === type) return { ...right, type };
+  return null;
+}
+
+function simplifyBitwiseComplementComparison(left, operator, right) {
+  if (!experimentalConstantEvaluationEnabled()) return null;
+  let value = null;
+  let constantExpression = null;
+  let normalizedOperator = operator;
+  if (left && left.bitwiseComplement) {
+    value = left.bitwiseComplement;
+    constantExpression = right;
+  } else if (right && right.bitwiseComplement) {
+    value = right.bitwiseComplement;
+    constantExpression = left;
+    normalizedOperator = swapComparisonOperator(operator);
+  } else {
+    return null;
+  }
+
+  const type = simplifyType(left && left.bitwiseComplement ? left.type : right.type);
+  if (type !== 'int' && type !== 'long') return null;
+  const constant = integralConstantValue(constantExpression, type);
+  if (constant == null) return null;
+  const complementedConstant = complementConstant(constant, type);
+  const simplifiedOperator = reverseComparisonOperator(normalizedOperator);
+  const renderedConstant = type === 'long'
+    ? `${String(complementedConstant)}L`
+    : String(complementedConstant);
+  return expr(`${wrap(value, 60)} ${simplifiedOperator} ${renderedConstant}`, 'boolean', 60);
+}
+
+function experimentalConstantEvaluationEnabled() {
+  return process.env.PIPELINE_EXPERIMENTAL_INTERCLASS_DCE === '1';
+}
+
+function integralConstantValue(value, type) {
+  if (!value || simplifyType(value.type) !== type) return null;
+  if (type === 'int') {
+    if (Number.isInteger(value.constantValue)) return value.constantValue | 0;
+    if (/^-?\d+$/.test(value.code || '')) return Number(value.code) | 0;
+    return null;
+  }
+  if (!/^-?\d+L$/.test(value.code || '')) return null;
+  try {
+    return BigInt.asIntN(64, BigInt(value.code.slice(0, -1)));
+  } catch (error) {
+    return null;
+  }
+}
+
+function minusOneForType(type) {
+  return type === 'long' ? -1n : -1;
+}
+
+function complementConstant(value, type) {
+  return type === 'long' ? BigInt.asIntN(64, ~value) : (~value | 0);
+}
+
+function swapComparisonOperator(operator) {
+  return ({ '<': '>', '<=': '>=', '>': '<', '>=': '<=' })[operator] || operator;
+}
+
+function reverseComparisonOperator(operator) {
+  return ({ '<': '>', '<=': '>=', '>': '<', '>=': '<=' })[operator] || operator;
 }
 
 function binaryPrecedence(symbol) {
@@ -5179,6 +5750,15 @@ function renderStoreExpression(value) {
 function coerceExpressionForType(value, targetType) {
   if (!value) return value;
   const type = simplifyType(targetType);
+  if (value.conditional) {
+    const { condition, trueValue, falseValue } = value.conditional;
+    return conditionalExpr(
+      condition,
+      coerceExpressionForType(trueValue, type),
+      coerceExpressionForType(falseValue, type),
+      type,
+    );
+  }
   if (type === 'boolean') {
     if (value.conditional) {
       const { condition, trueValue, falseValue } = value.conditional;
@@ -5217,6 +5797,43 @@ function coerceExpressionForType(value, targetType) {
     return expr(`(${type}) ${operand}`, type, 90);
   }
   return value;
+}
+
+function expressionHasSideEffects(value) {
+  if (!value || !value.code || value.pendingNew) return false;
+  return /[A-Za-z0-9_$]\s*\(/.test(value.code) || /\bnew\b/.test(value.code) || /\+\+|--/.test(value.code);
+}
+
+// A dup of a side-effecting expression must not render it once per consumer:
+// spill it to a synthetic local so the effect happens exactly once. Pending
+// new-array fills (dynamic and literal) and StringBuilder concat chains keep
+// their shared entries so the dedicated pattern handling still sees them.
+function materializeDuplicatedValue(value, lines, localState) {
+  if (!expressionHasSideEffects(value) || value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) return value;
+  const rendered = renderStoreExpression(value);
+  const name = localState.nextSyntheticName('dupTemp');
+  lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
+  return expr(name, value.type, 100);
+}
+
+// Before a field write, freeze any live stack expression that reads the same
+// field into a temp. Otherwise the operand — captured before the store but
+// rendered lazily as a field access — would read the post-store value. The
+// field-name check over-approximates (a same-named field on another object is
+// spilled too), which is always safe: spilling a pure re-read changes nothing.
+function materializeStackFieldReads(stack, fieldName, lines, localState) {
+  if (!fieldName) return;
+  const needle = `.${fieldName}`;
+  for (let i = 0; i < stack.length; i += 1) {
+    const value = stack[i];
+    if (!value || typeof value.code !== 'string') continue;
+    if (!value.code.includes(needle)) continue;
+    if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) continue;
+    const rendered = renderStoreExpression(value);
+    const name = localState.nextSyntheticName('fieldTemp');
+    lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
+    stack[i] = expr(name, value.type, 100);
+  }
 }
 
 function methodReturnType(method) {
@@ -5373,4 +5990,11 @@ module.exports = {
   decompileClassAst,
   decompilePath,
   buildExceptionModel,
+  _internals: {
+    binaryExpr,
+    dropUnthrowableProtectedRows,
+    isCheckedThrow,
+    removeImpossibleCheckedCatchBlocks,
+    simplifyBitwiseComplementComparison,
+  },
 };

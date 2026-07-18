@@ -10,7 +10,10 @@ module.exports = {
     'getByName(Ljava/lang/String;)Ljava/net/InetAddress;': withThrows(async (jvm, obj, args) => {
 
       const hostname = args[0];
-      const jsHostname = hostname.value;
+      // Java strings may be plain JS strings or {value} objects here.
+      const jsHostname = typeof hostname === 'string'
+        ? hostname
+        : (hostname && hostname.value !== undefined ? String(hostname.value) : String(hostname));
 
       const inetAddress = {
         type: 'java/net/InetAddress',

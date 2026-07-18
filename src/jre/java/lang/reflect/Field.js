@@ -112,7 +112,11 @@ module.exports = {
         }
         return obj[fieldName];
       }
-    }, ['java/lang/NullPointerException']),
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
     'set(Ljava/lang/Object;Ljava/lang/Object;)V': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const value = args[1];
@@ -137,7 +141,11 @@ module.exports = {
         }
         obj[fieldName] = value;
       }
-    }, ['java/lang/NullPointerException']),
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, fieldObj, args) => {
       const annotationClass = args[0];
       const annotations = fieldObj._annotations || [];
@@ -192,7 +200,11 @@ module.exports = {
         }
         return obj[fieldName];
       }
-    }, ['java/lang/NullPointerException']),
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
     'setInt(Ljava/lang/Object;I)V': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const value = args[1];
@@ -215,6 +227,10 @@ module.exports = {
         }
         obj[fieldName] = value;
       }
-    }, ['java/lang/NullPointerException'])
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ])
   }
 };

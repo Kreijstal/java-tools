@@ -115,8 +115,18 @@ async function main() {
       throw new Error(`No Main-Class in manifest. Pass --class <ClassName>. Classes include: ${sampleClasses}`);
     }
 
-    const jvm = new JVM({ classpath: [tempDir], verbose: options.verbose });
-    await jvm.run(normalizeMainClass(mainClass), { args: options.programArgs });
+    const appletParameters = {};
+    const programArgs = options.programArgs || [];
+    for (const arg of programArgs) {
+      const eq = arg.indexOf('=');
+      if (eq > 0) appletParameters[arg.slice(0, eq)] = arg.slice(eq + 1);
+    }
+    const jvm = new JVM({
+      classpath: [tempDir],
+      verbose: options.verbose,
+      appletParameters: Object.keys(appletParameters).length ? appletParameters : null,
+    });
+    await jvm.run(normalizeMainClass(mainClass), { args: programArgs });
   } finally {
     if (options.keepTemp) {
       console.error(`Kept extracted jar at ${tempDir}`);

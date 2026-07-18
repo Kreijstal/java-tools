@@ -2,6 +2,8 @@
 
 function removeRuntimeExceptionHandlers(astRoot, options = {}) {
   const keepHandlerCode = options.keepHandlerCode !== false;
+  const preserveRecoveryHandlers = options.preserveRecoveryHandlers === true;
+  const preserveStaticPrimitiveLoopHandlers = options.preserveStaticPrimitiveLoopHandlers === true;
   let changed = false;
   const removals = [];
 
@@ -13,10 +15,26 @@ function removeRuntimeExceptionHandlers(astRoot, options = {}) {
       const codeAttr = (method.attributes || []).find((attr) => attr && attr.type === 'code');
       const code = codeAttr && codeAttr.code;
       if (!code || !Array.isArray(code.exceptionTable) || code.exceptionTable.length === 0) continue;
+      const preserveLoopReporter = preserveStaticPrimitiveLoopHandlers &&
+        (method.flags || []).includes('static') && hasPrimitiveOnlyDescriptor(method.descriptor) &&
+        methodHasBackwardBranch(code);
 
       const kept = [];
       for (const entry of code.exceptionTable) {
         if (catchType(entry) !== 'java/lang/RuntimeException') {
+          kept.push(entry);
+          continue;
+        }
+        const linearRethrow = isLinearRethrowHandler(code, entry);
+        if (preserveRecoveryHandlers && !linearRethrow) {
+          kept.push(entry);
+          continue;
+        }
+        // Static primitive loop helpers are commonly called while building
+        // shared decode tables. Keeping their reporter boundary prevents the
+        // rebuilt method from becoming a new fully-atomic JIT unit while still
+        // allowing ordinary non-loop wrappers to be cleaned up.
+        if (preserveLoopReporter && linearRethrow) {
           kept.push(entry);
           continue;
         }
@@ -38,6 +56,48 @@ function removeRuntimeExceptionHandlers(astRoot, options = {}) {
   }
 
   return { changed, removals };
+}
+
+function hasPrimitiveOnlyDescriptor(descriptor) {
+  return typeof descriptor === 'string' && /^\([ZBCSIJFD]*\)[ZBCSIJFDV]$/.test(descriptor);
+}
+
+function methodHasBackwardBranch(code) {
+  const items = code.codeItems || [];
+  const labels = new Map();
+  for (let i = 0; i < items.length; i += 1) {
+    const label = trimLabel(items[i] && items[i].labelDef);
+    if (label) labels.set(label, i);
+  }
+  for (let i = 0; i < items.length; i += 1) {
+    const insn = items[i] && items[i].instruction;
+    const instructionOp = op(items[i]);
+    if (!instructionOp || !(instructionOp === 'goto' || instructionOp === 'goto_w' ||
+        instructionOp.startsWith('if'))) continue;
+    const target = trimLabel(typeof insn === 'object' && insn ? insn.arg : null);
+    if (target && labels.has(target) && labels.get(target) <= i) return true;
+  }
+  return false;
+}
+
+function isLinearRethrowHandler(code, entry) {
+  const handlerLabel = trimLabel(entry.handlerLbl || entry.handlerLabel || entry.handler);
+  const items = code.codeItems || [];
+  const start = items.findIndex((item) => trimLabel(item && item.labelDef) === handlerLabel);
+  if (start < 0) return false;
+
+  for (let i = start; i < items.length; i += 1) {
+    const instructionOp = op(items[i]);
+    if (!instructionOp) continue;
+    if (instructionOp === 'athrow') return true;
+    if (instructionOp === 'goto' || instructionOp === 'goto_w' || instructionOp === 'jsr' ||
+        instructionOp === 'ret' || instructionOp.startsWith('if') ||
+        instructionOp === 'tableswitch' || instructionOp === 'lookupswitch' ||
+        instructionOp.endsWith('return')) {
+      return false;
+    }
+  }
+  return false;
 }
 
 function catchType(entry) {
