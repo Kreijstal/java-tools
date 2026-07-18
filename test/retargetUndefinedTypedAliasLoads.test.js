@@ -56,6 +56,56 @@ test('leaves defined locals alone', (t) => {
   t.end();
 });
 
+test('treats this as an entry definition instead of a same-typed checked alias', (t) => {
+  const method = {
+    flags: [],
+    descriptor: '()V',
+  };
+  const code = {
+    codeItems: [
+      { instruction: { op: 'aload', arg: '3' } },
+      { instruction: 'iconst_0' },
+      { instruction: 'aaload' },
+      { instruction: { op: 'checkcast', arg: 'w' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: 'aload_0' },
+      { instruction: { op: 'getfield', arg: ['Field', 'w', ['M', 'Lvj;']] } },
+      { instruction: 'pop' },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(rewriteCode(code, method), 0);
+  t.equal(code.codeItems[5].instruction, 'aload_0');
+  t.end();
+});
+
+test('treats reference parameters as entry definitions', (t) => {
+  const method = {
+    flags: [],
+    descriptor: '(Lw;)V',
+  };
+  const code = {
+    codeItems: [
+      { instruction: { op: 'aload', arg: '3' } },
+      { instruction: 'iconst_0' },
+      { instruction: 'aaload' },
+      { instruction: { op: 'checkcast', arg: 'w' } },
+      { instruction: { op: 'astore', arg: '4' } },
+      { instruction: 'aload_1' },
+      { instruction: { op: 'getfield', arg: ['Field', 'w', ['M', 'Lvj;']] } },
+      { instruction: 'pop' },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(rewriteCode(code, method), 0);
+  t.equal(code.codeItems[5].instruction, 'aload_1');
+  t.end();
+});
+
 test('retargets undefined reference-array load to unique compatible parameter', (t) => {
   const method = {
     flags: [],

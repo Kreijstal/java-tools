@@ -31,11 +31,13 @@ function rewriteCode(code, methodOrOptions = {}, maybeOptions = {}) {
   if (!cfg.blocks.length) return 0;
   const analysis = reachingDefinitions(code, cfg);
   const dominators = computeDominators(cfg);
+  const entryDefinitions = method ? entryDefinedLocals(method) : new Set();
   const replacements = [];
 
   for (let i = 0; i < items.length; i += 1) {
     const stale = aloadLocal(items[i]);
-    if (stale == null || hasDominatingDefinition(cfg, dominators, analysis, i, stale)) continue;
+    if (stale == null || entryDefinitions.has(stale) ||
+        hasDominatingDefinition(cfg, dominators, analysis, i, stale)) continue;
     const owner = fieldOwnerAtUse(items, i);
     const isAliasCopy = owner == null && astoreLocal(items[nextInstructionIndex(items, i)]) != null;
     if (!owner && !isAliasCopy) {
@@ -121,6 +123,12 @@ function parameterLocals(method) {
     local += descriptor === 'J' || descriptor === 'D' ? 2 : 1;
   }
   return out;
+}
+
+function entryDefinedLocals(method) {
+  const locals = new Set(parameterLocals(method).map((param) => param.local));
+  if (!(method.flags && method.flags.includes('static'))) locals.add('0');
+  return locals;
 }
 
 function argumentDescriptors(desc) {
