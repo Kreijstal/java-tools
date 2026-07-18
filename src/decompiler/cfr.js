@@ -2599,8 +2599,15 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
 
     const storeIndex = parseStoreIndex(op, instruction.arg);
     if (storeIndex) {
-      const value = renderStoreExpression(pop(stack));
-      lines.push(localState.store(storeIndex.index, storeIndex.type, value, codeItem.pc));
+      const value = pop(stack);
+      // A dup can leave the freshly allocated array live for a field/array
+      // store after this local store.  Materialize the shared expression now
+      // so every consumer observes the one JVM allocation.
+      if (stack.includes(value) && value.newArraySpill && /^new\b/.test(value.code)) {
+        materializeNewArraySpill(value, lines, localState);
+      }
+      const renderedValue = renderStoreExpression(value);
+      lines.push(localState.store(storeIndex.index, storeIndex.type, renderedValue, codeItem.pc));
       continue;
     }
 

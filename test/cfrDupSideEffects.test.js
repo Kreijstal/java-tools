@@ -70,6 +70,23 @@ const DUP_ARRAY_PATTERNS = `.version 52 0
 .method public static native consume : ([Ljava/lang/String;)V
 .end method
 
+.field public values [I
+
+.method public shareLocalAndField : (I)[I
+    .code stack 3 locals 3
+L0: aload_0
+L1: iload_1
+L2: iconst_2
+L3: imul
+L4: newarray int
+L6: dup
+L7: astore_2
+L8: putfield Field DupArray values [I
+L11: aload_2
+L12: areturn
+    .end code
+.end method
+
 .method public static shareDynamic : ([[BI)[B
     .code stack 4 locals 3
 L0: aload_0
@@ -187,6 +204,20 @@ test('dup array patterns preserve allocation identity and recorded elements', (t
         'outer array stores the shared allocation');
       t.match(dynamicSource, new RegExp(`byte\\[\\] var2 = ${escaped};`),
         'local stores the same allocation');
+    }
+    const localAndFieldMethod = /public int\[\] shareLocalAndField[\s\S]*?\n    }/.exec(source);
+    t.ok(localAndFieldMethod, 'local-and-field shared-array method is emitted');
+    const localAndFieldSource = localAndFieldMethod ? localAndFieldMethod[0] : source;
+    t.equal((localAndFieldSource.match(/new int\[/g) || []).length, 1,
+      'local and field share one int-array allocation');
+    const fieldSpill = /int\[\] (\w+\$\d+) = new int\[param0 \* 2\];/.exec(localAndFieldSource);
+    t.ok(fieldSpill, 'local-and-field allocation is spilled once');
+    if (fieldSpill) {
+      const escaped = fieldSpill[1].replace(/\$/g, '\\$');
+      t.match(localAndFieldSource, new RegExp(`int\\[\\] var2 = ${escaped};`),
+        'local stores the shared int array');
+      t.match(localAndFieldSource, new RegExp(`field_values = ${escaped};`),
+        'field stores the shared int array');
     }
     t.match(source, /DupArray\.consume\(new String\[\]\{"left", "right"\}\);/,
       'inline reference-array call retains its elements');
