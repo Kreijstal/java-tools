@@ -584,7 +584,7 @@ function buildExceptionModel(classes) {
     const owner = cls.className;
     if (!owner) continue;
     classInfo.set(owner, cls);
-    sourceNameToInternal.set(simplifyType(javaTypeFromInternalName(owner)), owner);
+    sourceNameToInternal.set(javaTypeFromInternalName(owner), owner);
     if (cls.superClassName) superOf.set(owner, cls.superClassName);
     for (const item of cls.items || []) {
       if (item.type !== 'method' || !item.method) continue;
@@ -847,7 +847,8 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   // executing. A JVM return inside a structured branch is represented as a
   // break from a labelled block because Java forbids return statements in an
   // initializer.
-  const hasEarlyReturn = body.some((line) => String(line).trim() === 'return;');
+  const isVoidReturn = (line) => /^return\s*;$/.test(String(line).trim());
+  const hasEarlyReturn = body.some(isVoidReturn);
   if (!bodyCompletesAbruptly(body)) {
     if (!hasEarlyReturn) return formatBlock('static', body);
 
@@ -856,7 +857,7 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
     while (renderedBody.includes(`${label}:`)) label += '$';
     const labelledBody = body.map((line) => {
       const text = String(line);
-      if (text.trim() !== 'return;') return text;
+      if (!isVoidReturn(text)) return text;
       return `${text.slice(0, text.length - text.trimStart().length)}break ${label};`;
     });
     return formatBlock('static', [
@@ -2694,7 +2695,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const raw1 = pop(stack);
       const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
       const value1 = materializeDuplicatedValue(raw1, lines, localState);
-      stack.push({ ...value1 }, value2, value1);
+      stack.push(duplicateStackExpression(value1), value2, value1);
       continue;
     }
     if (op === 'dup_x2') {
@@ -2896,7 +2897,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'putstatic') {
       const ref = parseMemberRef(instruction.arg);
-      const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
+      const rawValue = pop(stack);
+      if (stack.includes(rawValue) && rawValue.newArraySpill && /^new\b/.test(rawValue.code)) {
+        materializeNewArraySpill(rawValue, lines, localState);
+      }
+      const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
       // A live stack value that reads this same field (e.g. the old value dup_x1'd
       // below the store target in a post-increment `f[x++]=v` idiom) would re-read
       // the *mutated* field after this assignment. Spill such reads to a temp first.
@@ -2914,7 +2919,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
     if (op === 'putfield') {
       const ref = parseMemberRef(instruction.arg);
-      const value = coerceExpressionForType(renderStoreExpression(pop(stack)), descriptorToJavaType(ref.descriptor));
+      const rawValue = pop(stack);
+      if (stack.includes(rawValue) && rawValue.newArraySpill && /^new\b/.test(rawValue.code)) {
+        materializeNewArraySpill(rawValue, lines, localState);
+      }
+      const value = coerceExpressionForType(renderStoreExpression(rawValue), descriptorToJavaType(ref.descriptor));
       const owner = coerceExpressionForType(pop(stack), javaTypeFromInternalName(ref.owner));
       // Spill any live stack value that reads this field before mutating it, so a
       // post-increment index (`this.r[this.n++] = v`) keeps its pre-increment value.
@@ -3107,14 +3116,26 @@ function methodDescriptorsNamed(owner, name, model) {
     const current = pending.pop();
     if (!current || seen.has(current)) continue;
     seen.add(current);
-    const info = model && model.classInfo ? model.classInfo.get(current) : null;
-    if (!info) continue;
-    for (const item of info.items || []) {
-      const method = item && item.type === 'method' ? item.method : null;
-      if (method && method.name === name) descriptors.push(method.descriptor);
+    const corpusInfo = model && model.classInfo ? model.classInfo.get(current) : null;
+    if (corpusInfo) {
+      for (const item of corpusInfo.items || []) {
+        const method = item && item.type === 'method' ? item.method : null;
+        if (method && method.name === name) descriptors.push(method.descriptor);
+      }
+      if (corpusInfo.superClassName) pending.push(corpusInfo.superClassName);
+      pending.push(...(corpusInfo.interfaces || []));
+      continue;
     }
-    if (info.superClassName) pending.push(info.superClassName);
-    pending.push(...(info.interfaces || []));
+
+    const jreInfo = jreClassInfo(current);
+    if (!jreInfo) continue;
+    const candidates = [
+      ...(jreInfo.methods.get(name) || []),
+      ...(jreInfo.staticMethods.get(name) || []),
+    ];
+    for (const candidate of candidates) descriptors.push(candidate.descriptor);
+    if (jreInfo.superName) pending.push(jreInfo.superName);
+    pending.push(...(jreInfo.interfaces || []));
   }
   return descriptors;
 }
@@ -5949,11 +5970,13 @@ function coerceExpressionForType(value, targetType, exceptionModel = null, allow
   const primitive = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double', 'void']);
   if (!primitive.has(type) && value.type !== type && value.code !== 'null') {
     const sourceType = simplifyType(value.type);
-    if (allowWideningReference && isSourceReferenceTypeAssignable(sourceType, type, exceptionModel)) {
+    const isAssignable = isSourceReferenceTypeAssignable(sourceType, type, exceptionModel);
+    if (allowWideningReference && isAssignable) {
       return { ...value, type };
     }
     const sourceIsKnownReference = !primitive.has(sourceType) && sourceType !== 'Object';
-    const sourceNeedsBridge = sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code);
+    const sourceNeedsBridge = !isAssignable
+      && (sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code));
     const operand = sourceNeedsBridge ? `(Object) ${wrap(value, 90)}` : wrap(value, 90);
     return expr(`(${type}) ${operand}`, type, 90);
   }
@@ -5982,7 +6005,7 @@ function materializeDuplicatedValue(value, lines, localState) {
 // same expression object; a shallow clone shares the element map but not later
 // code/spill updates, which can emit a second allocation for one JVM value.
 function duplicateStackExpression(value) {
-  if (value && (value.newArraySpill || value.arrayLiteral)) return value;
+  if (!value || value.newArraySpill || value.arrayLiteral) return value;
   return { ...value };
 }
 

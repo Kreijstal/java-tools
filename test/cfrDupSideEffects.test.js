@@ -87,6 +87,17 @@ L12: areturn
     .end code
 .end method
 
+.method public shareFieldAndReturn : (I)[I
+    .code stack 3 locals 2
+L20: aload_0
+L21: iload_1
+L22: newarray int
+L24: dup_x1
+L25: putfield Field DupArray values [I
+L28: areturn
+    .end code
+.end method
+
 .method public static shareDynamic : ([[BI)[B
     .code stack 4 locals 3
 L0: aload_0
@@ -218,6 +229,20 @@ test('dup array patterns preserve allocation identity and recorded elements', (t
         'local stores the shared int array');
       t.match(localAndFieldSource, new RegExp(`field_values = ${escaped};`),
         'field stores the shared int array');
+    }
+    const fieldAndReturnMethod = /public int\[\] shareFieldAndReturn[\s\S]*?\n    }/.exec(source);
+    t.ok(fieldAndReturnMethod, 'dup_x1 field-and-return shared-array method is emitted');
+    const fieldAndReturnSource = fieldAndReturnMethod ? fieldAndReturnMethod[0] : source;
+    t.equal((fieldAndReturnSource.match(/new int\[/g) || []).length, 1,
+      'dup_x1 preserves one allocation for the field and return value');
+    const returnSpill = /int\[\] (\w+\$\d+) = new int\[param0\];/.exec(fieldAndReturnSource);
+    t.ok(returnSpill, 'dup_x1 allocation is spilled once');
+    if (returnSpill) {
+      const escaped = returnSpill[1].replace(/\$/g, '\\$');
+      t.match(fieldAndReturnSource, new RegExp(`field_values = ${escaped};`),
+        'field stores the shared dup_x1 array');
+      t.match(fieldAndReturnSource, new RegExp(`return ${escaped};`),
+        'method returns the shared dup_x1 array');
     }
     t.match(source, /DupArray\.consume\(new String\[\]\{"left", "right"\}\);/,
       'inline reference-array call retains its elements');
