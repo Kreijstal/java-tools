@@ -1,7 +1,10 @@
 'use strict';
 
 const test = require('tape');
-const { runPeepholeClean, normalizeDupStoreCompareBranches } = require('../src/passes/peepholeClean');
+const {
+  runPeepholeClean,
+  normalizeDupStoreCompareBranches,
+} = require('../src/passes/peepholeClean');
 
 function astWith(codeItems, exceptionTable = []) {
   return {
@@ -262,6 +265,32 @@ test('peephole clean removes dead goto islands after terminals', (t) => {
   t.equal(result.details.deadGotoIslands, 2);
   t.equal(code(ast).codeItems.some((item) => item.instruction && item.instruction.arg === 'LdeadBody'), false);
   t.equal(code(ast).codeItems.some((item) => item.instruction && item.instruction.arg === 'LdeadBody2'), false);
+  t.end();
+});
+
+test('peephole clean preserves a goto after a referenced label-only entry', (t) => {
+  const ast = astWith([
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifeq', arg: 'Llive' } },
+    { instruction: 'iload_2' },
+    { instruction: { op: 'ifeq', arg: 'Llive' } },
+    { instruction: 'return' },
+    { labelDef: 'Llive:', instruction: 'nop' },
+    { instruction: 'nop' },
+    { instruction: { op: 'goto', arg: 'Lbody' } },
+    { instruction: 'return' },
+    { labelDef: 'Lbody:', instruction: 'iconst_0' },
+    { instruction: 'pop' },
+    { instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { removeDeadGotoIslands: true });
+
+  t.equal(result.details.deadGotoIslands, 0,
+    'the referenced entry prevents post-terminal island deletion');
+  t.ok(code(ast).codeItems.some((item) =>
+    item.instruction && item.instruction.op === 'goto' && item.instruction.arg === 'Lbody'),
+  'the live entry still jumps over the intervening return');
   t.end();
 });
 

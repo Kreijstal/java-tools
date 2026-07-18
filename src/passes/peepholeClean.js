@@ -2102,8 +2102,20 @@ function removeDeadGotoIslandsAfterTerminals(code, context = null) {
 
     let j = nextInstructionIndex(codeItems, i + 1);
     while (j != null) {
-      const label = trimLabel(codeItems[j] && codeItems[j].labelDef);
-      if (label && ((refCounts.get(label) || 0) > 0 || isLabelProtected(code, label))) break;
+      // nextInstructionIndex deliberately skips label-only and nop entries.
+      // A referenced label in that skipped range is a live alternate entry,
+      // so the following goto is not a dead post-terminal island: removing it
+      // changes the branch target's continuation (and can disconnect a whole
+      // region, as in Dekobloko's flat-triangle rasterizer).
+      let hasLiveEntry = false;
+      for (let k = i + 1; k <= j; k += 1) {
+        const label = trimLabel(codeItems[k] && codeItems[k].labelDef);
+        if (label && ((refCounts.get(label) || 0) > 0 || isLabelProtected(code, label))) {
+          hasLiveEntry = true;
+          break;
+        }
+      }
+      if (hasLiveEntry) break;
       const op = opcodeMnemonic(codeItems[j] && codeItems[j].instruction);
       if (op !== 'goto' && op !== 'goto_w') break;
       const target = trimLabel(getBranchArg(codeItems[j].instruction));
