@@ -7149,7 +7149,7 @@ function createEnumDefaultConstructor(classContext) {
   return createJavaIrMethod({
     name: '<init>',
     descriptor: '(Ljava/lang/String;I)V',
-    access: ['private'],
+    access: classContext.enumHasConstantBodies ? [] : ['private'],
     parameters: syntheticLocals.map((local) => ({
       id: local.id,
       name: local.name,
@@ -7226,8 +7226,9 @@ function lowerEnumConstructorToJavaIr(method, classContext) {
   if (!isConstructorDelegationOp(ops[0], context)) {
     ops = [enumSuperConstructorOp(context)].concat(ops);
   }
-  const access = modifierNames(method.modifiers).filter((name) => name !== 'public' && name !== 'protected');
-  if (!access.includes('private')) access.unshift('private');
+  const access = modifierNames(method.modifiers).filter((name) =>
+    name !== 'public' && name !== 'protected' && (name !== 'private' || !classContext.enumHasConstantBodies));
+  if (!classContext.enumHasConstantBodies && !access.includes('private')) access.unshift('private');
   return createJavaIrMethod({
     name: '<init>',
     descriptor: `(Ljava/lang/String;I${declaredDescriptors.join('')})V`,
@@ -7252,8 +7253,119 @@ function lowerEnumConstructorToJavaIr(method, classContext) {
 function enumConstantArgumentValues(constant, context) {
   if (!constant || !constant.arguments) return [];
   const tokens = constant.arguments.tokens || [];
-  if (tokens.length === 0) return [];
-  return splitTopLevelByComma(tokens).map((part) => lowerTokenExpressionToJavaIrValue(part, context));
+  if (tokens.length > 0) {
+    return splitTopLevelByComma(tokens).map((part) => lowerTokenExpressionToJavaIrValue(part, context));
+  }
+  const value = lowerExpressionToJavaIrValue(constant.arguments, context)
+    || literalToJavaIrValue(constant.arguments);
+  return value ? [value] : [null];
+}
+
+function createEnumConstantSubclassConstructor(subclassInternalName, parentInternalName, descriptor) {
+  const parameterDescriptors = parameterDescriptorsFromMethodDescriptor(descriptor) || [];
+  const thisLocal = createJavaIrLocal('param:this', {
+    name: 'this',
+    descriptor: `L${subclassInternalName};`,
+    slotHint: 0,
+  });
+  const locals = [thisLocal];
+  const parameters = [];
+  const args = [];
+  let slot = 1;
+  parameterDescriptors.forEach((parameterDescriptor, index) => {
+    const id = `param:$enum$${index}`;
+    const local = createJavaIrLocal(id, {
+      name: `$enum$${index}`,
+      descriptor: parameterDescriptor,
+      slotHint: slot,
+      meta: { synthetic: true },
+    });
+    locals.push(local);
+    parameters.push({
+      id,
+      name: local.name,
+      descriptor: parameterDescriptor,
+      slotHint: slot,
+      meta: local.meta,
+    });
+    args.push({ kind: 'LocalValue', type: parameterDescriptor, local: id, name: local.name });
+    slot += parameterDescriptor === 'J' || parameterDescriptor === 'D' ? 2 : 1;
+  });
+  return createJavaIrMethod({
+    name: '<init>',
+    descriptor,
+    access: [],
+    parameters,
+    locals,
+    blocks: [createJavaIrBlock('entry', {
+      kind: 'EntryBlock',
+      ops: [createJavaIrOp('invoke', {
+        value: {
+          kind: 'MethodCallValue',
+          type: 'V',
+          owner: parentInternalName,
+          name: '<init>',
+          descriptor,
+          invokeKind: 'special',
+          receiver: { kind: 'LocalValue', type: `L${subclassInternalName};`, local: 'param:this', name: 'this' },
+          args,
+        },
+        sourceNodeKind: 'EnumConstantDeclaration',
+      })],
+      terminator: javaIrReturn(null),
+    })],
+    entryBlockId: 'entry',
+    sourceNodeKind: 'EnumConstantConstructor',
+    meta: { synthetic: true, enumConstantConstructor: true },
+  });
+}
+
+function createEnumConstantSubclass(constant, index, classContext) {
+  const internalName = `${classContext.classInternalName}$${index + 1}`;
+  const subclass = createJavaIrClass({
+    name: `${classContext.className}$${index + 1}`,
+    packageName: classContext.packageName || '',
+    internalName,
+    access: ['final', 'super', 'enum', 'synthetic'],
+    superName: classContext.classInternalName,
+    interfaces: [],
+    sourceNodeKind: 'EnumConstantDeclaration',
+    meta: { synthetic: true, enumConstant: constant.name },
+  });
+  const constructorSummaries = (classContext.classMethodOverloadsByInternalName.get(classContext.classInternalName)
+    && classContext.classMethodOverloadsByInternalName.get(classContext.classInternalName).get('<init>')) || [];
+  for (const summary of constructorSummaries) {
+    subclass.methods.push(createEnumConstantSubclassConstructor(internalName, classContext.classInternalName, summary.descriptor));
+  }
+  const methodByName = new Map(classContext.methodByName);
+  const subclassContext = {
+    ...classContext,
+    className: subclass.name,
+    classInternalName: internalName,
+    superName: classContext.classInternalName,
+    methodByName,
+    isEnum: false,
+    instanceFieldInitializers: [],
+    instanceInitializerBlocks: [],
+  };
+  for (const member of constant.body || []) {
+    if (member.kind === 'MethodDeclaration') {
+      const lowered = lowerMethodToJavaIr(member, subclassContext,
+        modifierNames(member.modifiers).includes('static') ? 0 : 1);
+      subclass.methods.push(lowered);
+      methodByName.set(member.name, {
+        name: member.name,
+        descriptor: lowered.descriptor,
+        returnDescriptor: lowered.descriptor.slice(lowered.descriptor.indexOf(')') + 1),
+        parameterDescriptors: parameterDescriptorsFromMethodDescriptor(lowered.descriptor) || [],
+        isStatic: (lowered.access || []).includes('static'),
+      });
+    }
+  }
+  classContext.classSuperByInternalName.set(internalName, classContext.classInternalName);
+  classContext.classInterfacesByInternalName.set(internalName, []);
+  classContext.classMethodsByInternalName.set(internalName, methodByName);
+  return subclass;
 }
 
 function createEnumClassInitializer(declaration, classContext) {
@@ -7266,6 +7378,20 @@ function createEnumClassInitializer(declaration, classContext) {
       ops.push(javaIrUnsupported(`unsupported enum constant arguments for ${constant.name}`, { sourceNodeKind: constant.kind }));
       continue;
     }
+    const constructorCandidates = (classContext.classMethodOverloadsByInternalName.get(classContext.classInternalName)
+      && classContext.classMethodOverloadsByInternalName.get(classContext.classInternalName).get('<init>')) || [];
+    const constructor = constructorCandidates.find((candidate) => {
+      const declaredParameters = (candidate.parameterDescriptors || []).slice(2);
+      return declaredParameters.length === declaredArgs.length
+        && declaredArgs.every((arg, argIndex) => Boolean(coerceValueToDescriptor(arg, declaredParameters[argIndex])));
+    });
+    if (!constructor) {
+      ops.push(javaIrUnsupported(`no matching enum constructor for ${constant.name}`, { sourceNodeKind: constant.kind }));
+      continue;
+    }
+    const declaredParameters = constructor.parameterDescriptors.slice(2);
+    const coercedDeclaredArgs = declaredArgs.map((arg, argIndex) =>
+      coerceValueToDescriptor(arg, declaredParameters[argIndex]));
     const args = [
       {
         kind: 'LiteralValue',
@@ -7281,7 +7407,10 @@ function createEnumClassInitializer(declaration, classContext) {
         value: String(index),
         raw: String(index),
       },
-    ].concat(declaredArgs);
+    ].concat(coercedDeclaredArgs);
+    const constantOwner = classContext.enumConstantClassByName
+      ? classContext.enumConstantClassByName.get(constant.name) || classContext.classInternalName
+      : classContext.classInternalName;
     ops.push(staticFieldStoreOp({
       owner: classContext.classInternalName,
       name: constant.name,
@@ -7289,8 +7418,8 @@ function createEnumClassInitializer(declaration, classContext) {
     }, {
       kind: 'NewObjectValue',
       type: descriptor,
-      owner: classContext.classInternalName,
-      descriptor: `(${args.map((arg) => arg.type).join('')})V`,
+      owner: constantOwner,
+      descriptor: constructor.descriptor,
       args,
     }));
   }
@@ -7338,11 +7467,25 @@ function createEnumValuesMethod(classContext) {
       kind: 'EntryBlock',
       ops: [createJavaIrOp('return', {
         value: {
-          kind: 'StaticFieldValue',
+          kind: 'CastValue',
           type: `[${descriptor}`,
-          owner: classContext.classInternalName,
-          name: '$VALUES',
-          descriptor: `[${descriptor}`,
+          fromType: 'Ljava/lang/Object;',
+          value: {
+            kind: 'MethodCallValue',
+            type: 'Ljava/lang/Object;',
+            owner: `[${descriptor}`,
+            name: 'clone',
+            descriptor: '()Ljava/lang/Object;',
+            invokeKind: 'virtual',
+            receiver: {
+              kind: 'StaticFieldValue',
+              type: `[${descriptor}`,
+              owner: classContext.classInternalName,
+              name: '$VALUES',
+              descriptor: `[${descriptor}`,
+            },
+            args: [],
+          },
         },
         sourceNodeKind: 'EnumValuesMethod',
       })],
@@ -7930,6 +8073,9 @@ function lowerAstToJavaIr(document, options = {}) {
     const isInterface = declaration.kind === 'InterfaceDeclaration';
     const isAnnotation = declaration.kind === 'AnnotationTypeDeclaration';
     const isEnum = declaration.kind === 'EnumDeclaration';
+    const enumHasConstantBodies = isEnum && (declaration.constants || []).some((constant) => (constant.body || []).length > 0);
+    const enumHasAbstractMethods = isEnum && (declaration.body || []).some((member) =>
+      member.kind === 'MethodDeclaration' && modifierNames(member.modifiers).includes('abstract'));
     const isNonStaticMemberClass = Boolean(outerClassContext)
       && declaration.kind !== 'EnumDeclaration'
       && !modifierNames(declaration.modifiers).includes('static');
@@ -7953,7 +8099,8 @@ function lowerAstToJavaIr(document, options = {}) {
       access: isInterface || isAnnotation
         ? dedupePreservingOrder(modifierNames(declaration.modifiers).concat(['interface', 'abstract'], isAnnotation ? ['annotation'] : []))
         : isEnum
-        ? dedupePreservingOrder(modifierNames(declaration.modifiers).concat(['final', 'super', 'enum']))
+        ? dedupePreservingOrder(modifierNames(declaration.modifiers).concat(
+          enumHasConstantBodies ? [] : ['final'], ['super', 'enum'], enumHasAbstractMethods ? ['abstract'] : []))
         : dedupePreservingOrder(modifierNames(declaration.modifiers).concat(['super'])),
       superName,
       interfaces: isAnnotation
@@ -7973,6 +8120,7 @@ function lowerAstToJavaIr(document, options = {}) {
     const fieldByName = classFieldsByInternalName.get(internalName) || new Map();
     const classContext = {
       className: declaration.name,
+      packageName,
       classInternalName: classIr.internalName,
       methodByName,
       localByName: new Map(),
@@ -7989,6 +8137,8 @@ function lowerAstToJavaIr(document, options = {}) {
       outerThisFieldName: isNonStaticMemberClass ? 'this$0' : null,
       isInterface: isInterface || isAnnotation,
       isEnum,
+      enumHasConstantBodies,
+      enumConstantClassByName: new Map(),
       superName: classIr.superName,
       typeParameters: classTypeParameters,
       fallbackUnsupportedTypes: options.fallbackUnsupportedTypes === true,
@@ -8033,6 +8183,13 @@ function lowerAstToJavaIr(document, options = {}) {
         initializer: null,
         meta: { synthetic: true, enumValues: true },
       }));
+      for (let index = 0; index < (declaration.constants || []).length; index += 1) {
+        const constant = declaration.constants[index];
+        if (!(constant.body || []).length) continue;
+        const subclass = createEnumConstantSubclass(constant, index, classContext);
+        classContext.enumConstantClassByName.set(constant.name, subclass.internalName);
+        syntheticClasses.push(subclass);
+      }
     }
     let hasStaticInitializer = false;
     let hasConstructor = false;

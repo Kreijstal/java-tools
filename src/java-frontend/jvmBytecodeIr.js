@@ -7,6 +7,7 @@ const {
 } = require('./compiler');
 const { validateAstDocument } = require('./serialization');
 const { getAttachedJavaIrDocument, validateJavaIrDocument } = require('./javaIr');
+const { computeStackMapFrames } = require('./stackMapFrames');
 
 const JVM_BYTECODE_IR_SCHEMA_ID = BYTECODE_IR_SCHEMA_ID;
 const JVM_BYTECODE_IR_SCHEMA_VERSION = BYTECODE_IR_SCHEMA_VERSION;
@@ -132,6 +133,7 @@ function createJvmBytecodeMethod(fields = {}) {
     returnDescriptor: fields.returnDescriptor || (fields.descriptor ? fields.descriptor.slice(fields.descriptor.indexOf(')') + 1) : 'V'),
     instructions,
     exceptionTable: fields.exceptionTable || [],
+    stackMapFrames: fields.stackMapFrames || [],
     sourceNodeKind: fields.sourceNodeKind || null,
     meta: fields.meta || {},
   };
@@ -156,6 +158,7 @@ function parameterSlotCount(descriptor) {
   let count = 0;
   for (let index = start + 1; index < end; index += 1) {
     let char = descriptor[index];
+    const isArray = char === '[';
     while (char === '[') {
       index += 1;
       char = descriptor[index];
@@ -164,7 +167,7 @@ function parameterSlotCount(descriptor) {
       while (index < end && descriptor[index] !== ';') index += 1;
       count += 1;
     } else {
-      count += slotWidthFromDescriptor(char);
+      count += isArray ? 1 : slotWidthFromDescriptor(char);
     }
   }
   return count;
@@ -1369,6 +1372,16 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
     }
   } else if (!hasExplicitReturn) {
     unsupported.push(`non-void method ${method.name}`);
+  } else {
+    const last = instructions[instructions.length - 1];
+    const terminal = last && ['ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow'].includes(last.opcode);
+    if (!terminal) {
+      // Structured branches can leave a physically trailing but semantically
+      // unreachable label. Classfile verification still forbids falling off a
+      // non-void method, so terminate that dead block explicitly.
+      instructions.push(createJvmInstruction('aconst_null'));
+      instructions.push(createJvmInstruction('athrow'));
+    }
   }
 
   let finalInstructions = instructions;
@@ -1392,7 +1405,7 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       exceptionTable: finalExceptionTable,
       sourceNodeKind: method.sourceNodeKind,
       attributes: memberAttributesForIr(method),
-      meta: finalMeta,
+      meta: { ...finalMeta, locals: method.locals || [] },
     }),
     unsupported,
   };
@@ -1502,6 +1515,11 @@ function javaIrToJvmBytecodeIr(javaIr, options = {}) {
     }
     const clinit = methods.some((method) => method.name === '<clinit>') ? null : staticInitializerMethod(bytecodeClass);
     if (clinit) bytecodeClass.methods.push(clinit);
+    for (const method of bytecodeClass.methods) {
+      if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
+        method.stackMapFrames = computeStackMapFrames(method, bytecodeClass);
+      }
+    }
     return bytecodeClass;
   });
   return createJvmBytecodeIrDocument(classes, {

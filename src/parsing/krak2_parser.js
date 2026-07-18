@@ -665,6 +665,7 @@ const Lang = P.createLanguage({
     vtype: (r) =>
       P.alt(
         P.string("Float"),
+        P.string("Double"),
         P.string("Integer"),
         P.string("Long"),
         P.string("Null"),
@@ -678,7 +679,7 @@ const Lang = P.createLanguage({
           lbl
         })),
         P.string("UninitializedThis")
-      ).desc("vtype"),
+      ).skip(P.regexp(/[ \t]*/)).desc("vtype"),
 
     // stack_map_item Parser
     stack_map_item: (r) =>

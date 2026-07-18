@@ -268,6 +268,8 @@ function convertAttribute(attribute, invokeDynamicMap) {
     const code = attribute.code;
     const exceptionTable = [];
     const convertedItems = [];
+    const stackMapFrames = [];
+    let lastLabel = null;
     ensureArray(code.codeItems).forEach((item) => {
       if (item && item.type === 'catch') {
         exceptionTable.push({
@@ -278,9 +280,16 @@ function convertAttribute(attribute, invokeDynamicMap) {
         });
         return;
       }
+      if (item && item.type === 'stack') {
+        if (!lastLabel) throw new Error('StackMapTable frame has no preceding bytecode label');
+        stackMapFrames.push({ ...item.item, label: lastLabel });
+        return;
+      }
       const converted = convertCodeItem(item, invokeDynamicMap);
       if (converted) {
         convertedItems.push(converted);
+        const rawLabel = converted.labelDef ?? converted.lineLabel;
+        if (rawLabel) lastLabel = String(rawLabel).replace(/:$/, '');
       }
     });
 
@@ -303,7 +312,10 @@ function convertAttribute(attribute, invokeDynamicMap) {
         localsSize: code.localsSize,
         codeItems: convertedItems,
         exceptionTable,
-        attributes: code.attributes.map(attr => convertAttribute(attr, invokeDynamicMap)).filter(Boolean)
+        attributes: [
+          ...code.attributes.map(attr => convertAttribute(attr, invokeDynamicMap)).filter(Boolean),
+          ...(stackMapFrames.length ? [{ type: 'stackmaptable', frames: stackMapFrames }] : []),
+        ]
       }
     };
   }

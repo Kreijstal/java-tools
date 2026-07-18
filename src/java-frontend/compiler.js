@@ -856,6 +856,22 @@ function fieldLines(field) {
   return lines;
 }
 
+function stackMapVerificationType(type) {
+  if (typeof type === 'string') return type;
+  if (type && type.type === 'Object') return `Object ${type.cls}`;
+  if (type && type.type === 'Uninitialized') return `Uninitialized ${type.lbl}`;
+  throw new Error(`Unsupported generated StackMapTable verification type: ${JSON.stringify(type)}`);
+}
+
+function stackMapFrameLines(frame) {
+  return [
+    '    .stack full',
+    `    locals ${(frame.locals || []).map(stackMapVerificationType).join(' ')}`.trimEnd(),
+    `    stack ${(frame.stack || []).map(stackMapVerificationType).join(' ')}`.trimEnd(),
+    '    .end stack',
+  ];
+}
+
 function methodLines(method) {
   const lines = [];
   const access = jasminAccess(method.access || []);
@@ -864,8 +880,11 @@ function methodLines(method) {
   lines.push(...attrs);
   if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
     lines.push(`    .code stack ${Math.max(0, method.maxStack || 0)} locals ${Math.max(0, method.maxLocals || 0)}`);
+    const framesByLabel = new Map((method.stackMapFrames || []).map((frame) => [frame.label, frame]));
     (method.instructions || []).forEach((instruction, index) => {
       lines.push(formatInstruction(instruction, index));
+      const frame = framesByLabel.get(instruction.label || `L${index}`);
+      if (frame) lines.push(...stackMapFrameLines(frame));
     });
     for (const entry of method.exceptionTable || []) {
       const catchType = entry.catchType || entry.catch_type || 'any';

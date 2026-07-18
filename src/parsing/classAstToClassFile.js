@@ -1352,7 +1352,7 @@ function normalizeVerificationType(entry, labelOffsets, builder) {
     }
 
     if (tag === 7) {
-      const className = entry.class ?? entry.className ?? entry.name ?? entry.value ?? entry.descriptor ?? entry.internalName;
+      const className = entry.class ?? entry.className ?? entry.cls ?? entry.name ?? entry.value ?? entry.descriptor ?? entry.internalName;
       if (!className) {
         throw new Error('Object verification type requires a class name');
       }
@@ -1569,8 +1569,17 @@ function buildStackMapTableAttribute(attribute, labelOffsets, builder) {
   const frames = ensureArray(attribute.frames ?? attribute.entries ?? attribute.frameList);
   const bodyWriter = new ByteWriter();
   bodyWriter.writeUint16(frames.length);
+  let previousFrameOffset = -1;
   frames.forEach((frame, index) => {
-    const normalized = normalizeStackMapFrame(frame, labelOffsets, builder, index);
+    let frameWithDelta = frame;
+    const frameLabel = frame && (frame.label ?? frame.lbl ?? frame.targetLabel);
+    if (frameLabel != null) {
+      const frameOffset = resolveLabelOffset(frameLabel, labelOffsets, 'StackMapTable');
+      frameWithDelta = { ...frame, offsetDelta: frameOffset - previousFrameOffset - 1 };
+      previousFrameOffset = frameOffset;
+    }
+    const normalized = normalizeStackMapFrame(frameWithDelta, labelOffsets, builder, index);
+    if (frameLabel == null) previousFrameOffset += normalized.offsetDelta + 1;
     bodyWriter.writeUint8(normalized.frameType);
     switch (normalized.kind) {
       case 'same':

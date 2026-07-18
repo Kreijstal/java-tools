@@ -16,6 +16,59 @@ public class Hello {
 }
 `;
 
+const STACK_MAP_SOURCE = `
+public class StackMaps {
+    public static int choose(int value) {
+        try {
+            if (value < 0) {
+                throw new IllegalArgumentException("negative");
+            }
+            return value == 0 ? 1 : value;
+        } catch (IllegalArgumentException exception) {
+            return -1;
+        }
+    }
+
+    public static void main(String[] args) {
+        System.out.println(choose(-2));
+        System.out.println(choose(0));
+        System.out.println(choose(7));
+    }
+}
+`;
+
+const ENUM_LOWERING_SOURCE = `
+public enum EnumOps {
+    ADD("+") {
+        public int apply(int left, int right) {
+            return left + right;
+        }
+    },
+    SUB(null) {
+        public int apply(int left, int right) {
+            return left - right;
+        }
+    };
+
+    private final String symbol;
+
+    private EnumOps(String symbol) {
+        this.symbol = symbol;
+    }
+
+    public abstract int apply(int left, int right);
+
+    public static void main(String[] args) {
+        System.out.println(ADD.apply(7, 3));
+        System.out.println(SUB.apply(7, 3));
+        System.out.println(values().length);
+        System.out.println(valueOf("ADD").symbol);
+        System.out.println(SUB.symbol);
+        System.out.println(values() == values());
+    }
+}
+`;
+
 function hasJavaCommand() {
   try {
     execFileSync('java', ['-version'], { stdio: 'ignore' });
@@ -66,6 +119,65 @@ test('JavaFrontend.compile compiles an AST document and preserves serializable m
   t.equal(result.bytecodeIr.classes[0].methods[1].name, 'main', 'main method is emitted after the default constructor');
   t.doesNotThrow(() => JSON.stringify(result.bytecodeIr), 'bytecode IR is JSON-serializable');
   t.doesNotThrow(() => JSON.stringify(result.classFileModel), 'classfile model is JSON-serializable');
+  t.end();
+});
+
+test('frontend emits verifier StackMapTable frames for branches and exception handlers', (t) => {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-stackmaps-'));
+  try {
+    const result = frontend.compileJavaSource(STACK_MAP_SOURCE, {
+      outputDir,
+      sourceFileName: 'StackMaps.java',
+      sourceLevel: 8,
+    });
+    const choose = result.bytecodeIr.classes[0].methods.find((method) => method.name === 'choose');
+    t.ok(choose.stackMapFrames.length >= 3, 'bytecode IR records control-flow frames');
+    t.ok(choose.stackMapFrames.some((frame) => frame.stack.some((entry) =>
+      entry && entry.type === 'Object' && entry.cls === 'java/lang/IllegalArgumentException')),
+    'exception handler frame carries the caught throwable');
+
+    if (hasJavaCommand()) {
+      const classPath = path.join(outputDir, 'StackMaps.class');
+      const verbose = execFileSync('javap', ['-verbose', classPath], { encoding: 'utf8' });
+      t.match(verbose, /StackMapTable: number_of_entries = [1-9]/,
+        'classfile contains an encoded StackMapTable');
+      const output = execFileSync('java', ['-cp', outputDir, 'StackMaps'], { encoding: 'utf8' }).trim();
+      t.equal(output, '-1\n1\n7', 'ordinary JVM verification accepts and executes the generated frames');
+    } else {
+      t.comment('java command is unavailable; bytecode IR frame assertions were still checked');
+    }
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('frontend lowers enum constructor arguments and constant-specific class bodies', (t) => {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-enum-lowering-'));
+  try {
+    const result = frontend.compileJavaSource(ENUM_LOWERING_SOURCE, {
+      outputDir,
+      sourceFileName: 'EnumOps.java',
+      sourceLevel: 8,
+    });
+    const internalNames = result.classes.map((entry) => entry.internalName).sort();
+    t.deepEqual(internalNames, ['EnumOps', 'EnumOps$1', 'EnumOps$2'],
+      'constant bodies become synthetic enum subclasses');
+    const enumClass = result.bytecodeIr.classes.find((entry) => entry.internalName === 'EnumOps');
+    const constructor = enumClass.methods.find((method) => method.name === '<init>');
+    t.equal(constructor.descriptor, '(Ljava/lang/String;ILjava/lang/String;)V',
+      'declared constructor includes synthetic name and ordinal parameters');
+
+    if (hasJavaCommand()) {
+      const output = execFileSync('java', ['-cp', outputDir, 'EnumOps'], { encoding: 'utf8' }).trim();
+      t.equal(output, '10\n4\n2\n+\nnull\nfalse',
+        'enum constants dispatch overrides and retain coerced constructor arguments');
+    } else {
+      t.comment('java command is unavailable; enum IR assertions were still checked');
+    }
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
   t.end();
 });
 
