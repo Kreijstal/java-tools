@@ -2133,7 +2133,13 @@ class JVM {
       } else if (ArrayBuffer.isView(value)) {
         return value;
       } else {
-        for (const key of Object.keys(value)) value[key] = resolve(value[key]);
+        for (const key of Object.keys(value)) {
+          const descriptor = Object.getOwnPropertyDescriptor(value, key);
+          // Boxed strings expose enumerable, read-only character indices.
+          // They cannot contain thread placeholders and assigning them throws.
+          if (descriptor && descriptor.writable === false && !descriptor.set) continue;
+          value[key] = resolve(value[key]);
+        }
       }
       return value;
     };

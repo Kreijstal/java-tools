@@ -24,6 +24,29 @@ L7: return
 .end class
 `;
 
+const STATIC_FIELD_POST_INCREMENT_ARRAY_STORE = `.version 52 0
+.class public super StaticFieldPostIncrementArrayStore
+.super java/lang/Object
+
+.field public static INDEX I
+.field public static VALUES [I
+
+.method public static fill : ()V
+    .code stack 3 locals 0
+L0: getstatic Field StaticFieldPostIncrementArrayStore VALUES [I
+L3: getstatic Field StaticFieldPostIncrementArrayStore INDEX I
+L6: dup
+L7: iconst_1
+L8: iadd
+L9: putstatic Field StaticFieldPostIncrementArrayStore INDEX I
+L12: bipush 7
+L14: iastore
+L15: return
+    .end code
+.end method
+.end class
+`;
+
 const REUSED_REFERENCE_SLOT = `.version 52 0
 .class public super ReusedReferenceSlot
 .super java/lang/Object
@@ -96,6 +119,26 @@ test('iinc snapshots operand-stack values loaded before the increment', (t) => {
       'array index uses the value captured before iinc');
     t.notOk(/param1\+\+;\s*param0\[param1\]/.test(source),
       'array store does not reread the incremented local');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('putstatic snapshots an unqualified field index loaded before its update', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-static-field-order-'));
+  try {
+    const source = decompileFixture(
+      tempDir,
+      'StaticFieldPostIncrementArrayStore',
+      STATIC_FIELD_POST_INCREMENT_ARRAY_STORE,
+    );
+
+    t.match(source,
+      /int fieldTemp\$\d+ = field_INDEX;\s*field_INDEX = field_INDEX \+ 1;\s*field_VALUES\[fieldTemp\$\d+\] = 7;/,
+      'array store retains the field index captured before putstatic');
+    t.notOk(/field_INDEX = field_INDEX \+ 1;\s*field_VALUES\[field_INDEX\]/.test(source),
+      'array store does not reread the incremented static field');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

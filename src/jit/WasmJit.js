@@ -502,11 +502,15 @@ class MethodTranslator {
       t,
       idx: isGet
         ? this.addImport(name, [T.ref], [t], (obj) => {
-          if (obj === null || obj === undefined) throw new Error('NullPointerException');
+          if (obj === null || obj === undefined) {
+            throw { type: 'java/lang/NullPointerException', message: null };
+          }
           return toWasmValue(t, obj.fields[resolveKey(obj)]);
         })
         : this.addImport(name, [T.ref, t], [], (obj, v) => {
-          if (obj === null || obj === undefined) throw new Error('NullPointerException');
+          if (obj === null || obj === undefined) {
+            throw { type: 'java/lang/NullPointerException', message: null };
+          }
           obj.fields[resolveKey(obj)] = v;
         }),
     };
@@ -1264,6 +1268,10 @@ class WasmJit {
   // shared gating/warmup/compile; returns {st, blk} when the frame can run now
   prepare(frame) {
     if (!this.enabled || !frame || !frame.method || !frame.instructions) return null;
+    // Object construction and class initialization have observable all-or-
+    // nothing ordering. A partial Wasm exit around new/invokespecial can leave
+    // an allocated object visible without having run the rest of <init>.
+    if (frame.method.name === '<init>' || frame.method.name === '<clinit>') return null;
     const debug = this.jvm.debugManager;
     if (debug && debug.debugMode) return null;
 

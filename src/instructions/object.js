@@ -156,7 +156,7 @@ module.exports = {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const objRef = frame.stack.pop();
     if (objRef === null) {
-      throw new Error('NullPointerException');
+      throw { type: 'java/lang/NullPointerException', message: null };
     }
     const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName);
     const value = fieldKey ? objRef.fields[fieldKey] : undefined;
@@ -172,7 +172,7 @@ module.exports = {
     const value = frame.stack.pop();
     const objRef = frame.stack.pop();
     if (objRef === null) {
-      throw new Error('NullPointerException');
+      throw { type: 'java/lang/NullPointerException', message: null };
     }
     const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
     if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_PUTFIELD &&

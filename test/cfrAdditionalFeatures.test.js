@@ -517,6 +517,42 @@ LUncheckedReturn: return
 .end class
 `;
 
+const STATIC_INITIALIZER_JASMIN = `.version 52 0
+.class public super org/benf/cfr/tests/StaticInitializerTest
+.super java/lang/Object
+
+.field private static values [I
+
+.method public <init> : ()V
+    .code stack 1 locals 1
+Linit0: aload_0
+Linit1: invokespecial Method java/lang/Object <init> ()V
+Linit2: return
+    .end code
+.end method
+
+.method static <clinit> : ()V
+    .code stack 3 locals 1
+L0: bipush 8
+L2: newarray int
+L4: putstatic Field org/benf/cfr/tests/StaticInitializerTest values [I
+L7: iconst_0
+L8: istore_0
+L9: iload_0
+L10: bipush 8
+L12: if_icmpge L25
+L15: getstatic Field org/benf/cfr/tests/StaticInitializerTest values [I
+L18: iload_0
+L19: iload_0
+L20: iastore
+L21: iinc 0 1
+L24: goto L9
+L25: return
+    .end code
+.end method
+.end class
+`;
+
 const CONSTRUCTOR_FEATURES_JASMIN = `.version 52 0
 .class public super org/benf/cfr/tests/CtorFeatureTest
 .super org/benf/cfr/tests/BaseCtor
@@ -696,6 +732,56 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.ok(cfrInternals.isCheckedThrow('java/io/IOException'),
       'genuinely checked catches remain classified for javac reachability anchors');
   });
+});
+
+test('CFR-JS keeps ordinary class initialization inside the static initializer', (t) => {
+  withTempDir('cfr-static-initializer-', (tempDir) => {
+    const source = decompileFixture(tempDir, 'StaticInitializerTest', STATIC_INITIALIZER_JASMIN);
+
+    t.match(source, /static \{[\s\S]*?values = new int\[8\];[\s\S]*?for \(var0 = 0; var0 < 8; var0\+\+\)/,
+      'array initialization and its loop are emitted directly in static {}');
+    t.notOk(source.includes('$cfr$clinit'), 'ordinary static initialization does not gain a helper method');
+    t.end();
+  });
+});
+
+test('reference coercion recognizes widening array conversions', (t) => {
+  const base = { className: 'example/Base', superClassName: 'java/lang/Object', interfaces: [] };
+  const child = { className: 'example/Child', superClassName: 'example/Base', interfaces: [] };
+  const model = {
+    classInfo: new Map([[base.className, base], [child.className, child]]),
+    superOf: new Map([[base.className, base.superClassName], [child.className, child.superClassName]]),
+    sourceNameToInternal: new Map([['example.Base', base.className], ['example.Child', child.className]]),
+  };
+
+  t.ok(cfrInternals.isSourceReferenceTypeAssignable('example.Child', 'example.Base', model),
+    'a subclass widens to its superclass');
+  t.ok(cfrInternals.isSourceReferenceTypeAssignable('example.Child[]', 'example.Base[]', model),
+    'a subclass array widens covariantly to its superclass array');
+  t.ok(cfrInternals.isSourceReferenceTypeAssignable('example.Child[][]', 'Object[]', model),
+    'nested reference arrays widen recursively');
+  t.notOk(cfrInternals.isSourceReferenceTypeAssignable('int[]', 'Object[]', model),
+    'primitive arrays do not widen to Object arrays');
+  t.equal(
+    cfrInternals.coerceExpressionForType(
+      { code: 'children', type: 'example.Child[]', precedence: 100 },
+      'example.Base[]',
+      model,
+    ).code,
+    'children',
+    'a proven widening array conversion emits no runtime cast',
+  );
+  t.match(
+    cfrInternals.coerceExpressionForType(
+      { code: 'children', type: 'example.Child[]', precedence: 100 },
+      'example.Base[]',
+      model,
+      false,
+    ).code,
+    /^\(example\.Base\[\]\)/,
+    'overload pinning can retain an explicit descriptor cast',
+  );
+  t.end();
 });
 
 test('CFR-JS reconstructs constructor delegation calls', (t) => {

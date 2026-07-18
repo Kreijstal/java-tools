@@ -578,11 +578,13 @@ function buildExceptionModel(classes) {
   const methodThrows = new Map(); // `owner#name#descriptor` -> [internal throw names]
   const superOf = new Map();      // owner internal name -> superclass internal name
   const classInfo = new Map();    // owner internal name -> parsed class
+  const sourceNameToInternal = new Map(); // rendered Java type -> owner internal name
   const instantiatedTypes = new Set();
   for (const cls of classes || []) {
     const owner = cls.className;
     if (!owner) continue;
     classInfo.set(owner, cls);
+    sourceNameToInternal.set(simplifyType(javaTypeFromInternalName(owner)), owner);
     if (cls.superClassName) superOf.set(owner, cls.superClassName);
     for (const item of cls.items || []) {
       if (item.type !== 'method' || !item.method) continue;
@@ -599,7 +601,7 @@ function buildExceptionModel(classes) {
       }
     }
   }
-  return { methodThrows, superOf, classInfo, instantiatedTypes };
+  return { methodThrows, superOf, classInfo, sourceNameToInternal, instantiatedTypes };
 }
 
 function hasUnimplementedAbstractMethods(cls, model) {
@@ -838,6 +840,34 @@ function formatStaticInitializer(code, localState, cls, options = {}) {
   body.splice(0, body.length, ...normalizeSyntheticVariableScopes(body));
   assertNoFallback(body, { className: cls.className, methodName: '<clinit>', descriptor: '()V' });
   if (!body.length) return formatBlock('static', body);
+
+  // Keep ordinary initializer bytecode in Java's actual static-initializer
+  // construct. Moving every body into a helper changes the shape of <clinit>
+  // and exposes a partially initialized class to runtimes while that helper is
+  // executing. A JVM return inside a structured branch is represented as a
+  // break from a labelled block because Java forbids return statements in an
+  // initializer.
+  const hasEarlyReturn = body.some((line) => String(line).trim() === 'return;');
+  if (!bodyCompletesAbruptly(body)) {
+    if (!hasEarlyReturn) return formatBlock('static', body);
+
+    let label = '$cfr$clinit';
+    const renderedBody = body.join('\n');
+    while (renderedBody.includes(`${label}:`)) label += '$';
+    const labelledBody = body.map((line) => {
+      const text = String(line);
+      if (text.trim() !== 'return;') return text;
+      return `${text.slice(0, text.length - text.trimStart().length)}break ${label};`;
+    });
+    return formatBlock('static', [
+      `${label}: {`,
+      ...labelledBody.map((line) => `    ${line}`),
+      '}',
+    ]);
+  }
+
+  // Java rejects an initializer that provably cannot complete normally. Retain
+  // a helper only for that source-language edge case.
   const methodNames = new Set((cls.items || [])
     .filter((item) => item && item.type === 'method' && item.method)
     .map((item) => item.method.name));
@@ -1016,6 +1046,10 @@ function loadInt(index) {
 }
 
 function decompileCode(code, method, cls, localState, options = {}) {
+  // Linear emitters are also called by nested structuring strategies that have
+  // their own option bags.  Keep the run-wide hierarchy on the shared local
+  // state so expression coercion remains cross-class-aware in every path.
+  localState.exceptionModel = options.exceptionModel || localState.exceptionModel;
   const codeItemsForSelection = code.codeItems || [];
   let controlTransfers = 0;
   let hasSuppressedCleanup = false;
@@ -1214,6 +1248,53 @@ function isReferenceTypeAssignable(sourceType, targetType, model) {
     }
   }
   return false;
+}
+
+const JAVA_PRIMITIVE_TYPES = new Set([
+  'boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double', 'void',
+]);
+
+function internalNameForSourceType(type, model) {
+  const rendered = simplifyType(type);
+  if (model && model.sourceNameToInternal && model.sourceNameToInternal.has(rendered)) {
+    return model.sourceNameToInternal.get(rendered);
+  }
+  const wellKnown = {
+    Object: 'java/lang/Object',
+    Cloneable: 'java/lang/Cloneable',
+    Serializable: 'java/io/Serializable',
+  };
+  return wellKnown[rendered] || rendered.replace(/\./g, '/');
+}
+
+// Source expressions can be more specific than a bytecode descriptor's
+// parameter or storage type.  A Java widening reference conversion needs no
+// cast; forcing it through Object creates a real checkcast in the recompiled
+// bytecode.  Arrays are covariant for reference components, and every array is
+// assignable to Object, Cloneable, and Serializable.
+function isSourceReferenceTypeAssignable(sourceType, targetType, model) {
+  const source = simplifyType(sourceType);
+  const target = simplifyType(targetType);
+  if (source === target) return true;
+  if (JAVA_PRIMITIVE_TYPES.has(source) || JAVA_PRIMITIVE_TYPES.has(target)) return false;
+
+  const sourceIsArray = source.endsWith('[]');
+  const targetIsArray = target.endsWith('[]');
+  if (sourceIsArray && !targetIsArray) {
+    return target === 'Object' || target === 'Cloneable' || target === 'Serializable'
+      || target === 'java.lang.Object' || target === 'java.lang.Cloneable'
+      || target === 'java.io.Serializable';
+  }
+  if (sourceIsArray !== targetIsArray) return false;
+  if (sourceIsArray) {
+    return isSourceReferenceTypeAssignable(source.slice(0, -2), target.slice(0, -2), model);
+  }
+
+  return isReferenceTypeAssignable(
+    internalNameForSourceType(source, model),
+    internalNameForSourceType(target, model),
+    model,
+  );
 }
 
 function isInstanceofTypeCompatible(sourceType, testedType, model) {
@@ -2834,11 +2915,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     }
 
     if (op === 'invokevirtual' || op === 'invokeinterface') {
-      emitVirtualCall(lines, stack, instruction.arg);
+      emitVirtualCall(lines, stack, instruction.arg, localState);
       continue;
     }
     if (op === 'invokestatic') {
-      emitStaticCall(lines, stack, instruction.arg, currentInternalClassName);
+      emitStaticCall(lines, stack, instruction.arg, currentInternalClassName, localState);
       continue;
     }
     if (op === 'invokespecial') {
@@ -2921,7 +3002,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
   return lines;
 }
 
-function emitVirtualCall(lines, stack, arg) {
+function emitVirtualCall(lines, stack, arg, localState) {
   const ref = parseMemberRef(arg);
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
@@ -2953,7 +3034,7 @@ function emitVirtualCall(lines, stack, arg) {
     return;
   }
 
-  const renderedArgs = formatCallArguments(ref, descriptor, args, receiver);
+  const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
   const call = `${wrap(receiver, 100)}.${ref.name}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') {
@@ -2963,12 +3044,12 @@ function emitVirtualCall(lines, stack, arg) {
   }
 }
 
-function emitStaticCall(lines, stack, arg, currentInternalClassName) {
+function emitStaticCall(lines, stack, arg, currentInternalClassName, localState) {
   const ref = parseMemberRef(arg);
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
   const owner = ref.owner === currentInternalClassName ? simpleClassName(ref.owner) : javaTypeFromInternalName(ref.owner);
-  const renderedArgs = formatCallArguments(ref, descriptor, args, null);
+  const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
   const call = `${owner}.${ref.name}(${renderedArgs.join(', ')})`;
   const returnType = simplifyType(descriptor.returnType);
   if (returnType === 'void') {
@@ -2980,7 +3061,8 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName) {
 
 const NUMERIC_PRIMITIVES = new Set(['byte', 'short', 'char', 'int', 'long', 'float', 'double']);
 
-function formatCallArguments(ref, descriptor, args) {
+function formatCallArguments(ref, descriptor, args, exceptionModel) {
+  const mustPinReferenceOverload = callHasApplicableOverload(ref, descriptor, args, exceptionModel);
   return args.map((arg, index) => {
     if (shouldRenderCharArgument(ref, descriptor, index, arg)) {
       return formatCharLiteral(Number(arg.code));
@@ -2990,7 +3072,12 @@ function formatCallArguments(ref, descriptor, args) {
     if (target && arg.code === 'null' && !primitiveTargets.has(simplifyType(target))) {
       return `(${simplifyType(target)}) null`;
     }
-    const value = coerceExpressionForType(arg, target || arg.type);
+    const value = coerceExpressionForType(
+      arg,
+      target || arg.type,
+      exceptionModel,
+      !mustPinReferenceOverload,
+    );
     // Pin the overload: an argument whose rendered type is a *different*
     // numeric primitive than the descriptor's parameter can make javac
     // resolve a more specific overload (e.g. a byte arg to a:(II)I selects
@@ -3000,6 +3087,68 @@ function formatCallArguments(ref, descriptor, args) {
       return `(${target}) ${wrap(value, 90)}`;
     }
     return value.code;
+  });
+}
+
+function methodDescriptorsNamed(owner, name, model) {
+  const descriptors = [];
+  const pending = [owner];
+  const seen = new Set();
+  while (pending.length) {
+    const current = pending.pop();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    const info = model && model.classInfo ? model.classInfo.get(current) : null;
+    if (!info) continue;
+    for (const item of info.items || []) {
+      const method = item && item.type === 'method' ? item.method : null;
+      if (method && method.name === name) descriptors.push(method.descriptor);
+    }
+    if (info.superClassName) pending.push(info.superClassName);
+    pending.push(...(info.interfaces || []));
+  }
+  return descriptors;
+}
+
+function isMethodInvocationConvertible(sourceType, targetType, model) {
+  const source = simplifyType(sourceType);
+  const target = simplifyType(targetType);
+  if (source === target) return true;
+  const wideningPrimitives = {
+    byte: new Set(['short', 'int', 'long', 'float', 'double']),
+    short: new Set(['int', 'long', 'float', 'double']),
+    char: new Set(['int', 'long', 'float', 'double']),
+    int: new Set(['long', 'float', 'double']),
+    long: new Set(['float', 'double']),
+    float: new Set(['double']),
+  };
+  if (wideningPrimitives[source]) return wideningPrimitives[source].has(target);
+  if (JAVA_PRIMITIVE_TYPES.has(source) || JAVA_PRIMITIVE_TYPES.has(target)) return false;
+  return isSourceReferenceTypeAssignable(source, target, model);
+}
+
+function callHasApplicableOverload(ref, descriptor, args, model) {
+  if (!model || !model.classInfo) return false;
+  // Arguments that already need an exact primitive/reference coercion are
+  // rendered with the descriptor type.  Only proven widening references are
+  // left at their source type and can affect overload selection.
+  const renderedTypes = (descriptor.params || []).map((target, index) => {
+    const arg = args[index];
+    return arg && arg.code !== 'null'
+      && isSourceReferenceTypeAssignable(arg.type, target, model)
+      ? simplifyType(arg.type)
+      : simplifyType(target);
+  });
+  const descriptors = methodDescriptorsNamed(ref.owner, ref.name, model);
+  return descriptors.some((candidateDescriptor) => {
+    if (!candidateDescriptor || candidateDescriptor === ref.descriptor) return false;
+    const candidate = parseDescriptor(candidateDescriptor);
+    if ((candidate.params || []).length !== renderedTypes.length) return false;
+    return candidate.params.every((target, index) => {
+      const arg = args[index];
+      if (arg && arg.code === 'null') return !JAVA_PRIMITIVE_TYPES.has(simplifyType(target));
+      return isMethodInvocationConvertible(renderedTypes[index], target, model);
+    });
   });
 }
 
@@ -3027,7 +3176,7 @@ function emitSpecialCall(lines, stack, arg, method, currentClassName, currentInt
   const ref = parseMemberRef(arg);
   const descriptor = parseDescriptor(ref.descriptor);
   const args = popArgs(stack, descriptor.params.length);
-  const renderedArgs = formatCallArguments(ref, descriptor, args);
+  const renderedArgs = formatCallArguments(ref, descriptor, args, localState && localState.exceptionModel);
   const rawReceiver = pop(stack);
   const ownerTypeForReceiver = javaTypeFromInternalName(ref.owner);
   const receiver = rawReceiver.code === 'this'
@@ -5747,15 +5896,15 @@ function renderStoreExpression(value) {
   return expr(`new ${literal.elementType}[]{${elements.join(', ')}}`, `${literal.elementType}[]`);
 }
 
-function coerceExpressionForType(value, targetType) {
+function coerceExpressionForType(value, targetType, exceptionModel = null, allowWideningReference = true) {
   if (!value) return value;
   const type = simplifyType(targetType);
   if (value.conditional) {
     const { condition, trueValue, falseValue } = value.conditional;
     return conditionalExpr(
       condition,
-      coerceExpressionForType(trueValue, type),
-      coerceExpressionForType(falseValue, type),
+      coerceExpressionForType(trueValue, type, exceptionModel, allowWideningReference),
+      coerceExpressionForType(falseValue, type, exceptionModel, allowWideningReference),
       type,
     );
   }
@@ -5764,8 +5913,8 @@ function coerceExpressionForType(value, targetType) {
       const { condition, trueValue, falseValue } = value.conditional;
       return conditionalExpr(
         condition,
-        coerceExpressionForType(trueValue, 'boolean'),
-        coerceExpressionForType(falseValue, 'boolean'),
+        coerceExpressionForType(trueValue, 'boolean', exceptionModel, allowWideningReference),
+        coerceExpressionForType(falseValue, 'boolean', exceptionModel, allowWideningReference),
         'boolean',
       );
     }
@@ -5791,6 +5940,9 @@ function coerceExpressionForType(value, targetType) {
   const primitive = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double', 'void']);
   if (!primitive.has(type) && value.type !== type && value.code !== 'null') {
     const sourceType = simplifyType(value.type);
+    if (allowWideningReference && isSourceReferenceTypeAssignable(sourceType, type, exceptionModel)) {
+      return { ...value, type };
+    }
     const sourceIsKnownReference = !primitive.has(sourceType) && sourceType !== 'Object';
     const sourceNeedsBridge = sourceIsKnownReference || /^stack(?:In|Out)_/.test(value.code);
     const operand = sourceNeedsBridge ? `(Object) ${wrap(value, 90)}` : wrap(value, 90);
@@ -5823,11 +5975,12 @@ function materializeDuplicatedValue(value, lines, localState) {
 // spilled too), which is always safe: spilling a pure re-read changes nothing.
 function materializeStackFieldReads(stack, fieldName, lines, localState) {
   if (!fieldName) return;
-  const needle = `.${fieldName}`;
+  const escapedFieldName = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldRead = new RegExp(`(^|[^A-Za-z0-9_$])${escapedFieldName}([^A-Za-z0-9_$]|$)`);
   for (let i = 0; i < stack.length; i += 1) {
     const value = stack[i];
     if (!value || typeof value.code !== 'string') continue;
-    if (!value.code.includes(needle)) continue;
+    if (!fieldRead.test(value.code)) continue;
     if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) continue;
     const rendered = renderStoreExpression(value);
     const name = localState.nextSyntheticName('fieldTemp');
@@ -5992,8 +6145,10 @@ module.exports = {
   buildExceptionModel,
   _internals: {
     binaryExpr,
+    coerceExpressionForType,
     dropUnthrowableProtectedRows,
     isCheckedThrow,
+    isSourceReferenceTypeAssignable,
     removeImpossibleCheckedCatchBlocks,
     simplifyBitwiseComplementComparison,
   },
