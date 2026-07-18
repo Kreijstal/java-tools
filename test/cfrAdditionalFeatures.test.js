@@ -177,6 +177,21 @@ LchoiceEnd:
     .end code
 .end method
 
+.method public printAsObject : (Ljava/io/PrintStream;Ljava/lang/String;)V
+    .code stack 2 locals 3
+Lobject0: aload_1
+Lobject1: aload_2
+Lobject2: invokevirtual Method java/io/PrintStream print (Ljava/lang/Object;)V
+Lobject5: return
+LobjectDone:
+        .localvariabletable
+            0 is this Lorg/benf/cfr/tests/AdditionalFeatureTest; from Lobject0 to LobjectDone
+            1 is out Ljava/io/PrintStream; from Lobject0 to LobjectDone
+            2 is value Ljava/lang/String; from Lobject0 to LobjectDone
+        .end localvariabletable
+    .end code
+.end method
+
 .method public bounds : (I)V
     .code stack 2 locals 2
 L80: iload_1
@@ -690,7 +705,7 @@ function decompileFixture(tempDir, name, source) {
 }
 
 test('CFR-JS reconstructs additional expression and declaration features', (t) => {
-  t.plan(29);
+  t.plan(30);
   withTempDir('cfr-additional-', (tempDir) => {
     const source = decompileFixture(tempDir, 'AdditionalFeatureTest', ADDITIONAL_FEATURES_JASMIN);
 
@@ -705,6 +720,8 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.match(source, /public boolean condAssignNoDup\(boolean a, boolean b\) \{\s*boolean c;\s*return b && a == \(c = b\) \|\| b && \(c = a\);\s*}/, 'frontend assignment-expression boolean condition is reconstructed');
     t.match(source, /public void guard\(boolean ok\) \{\s*if \(!ok\) \{\s*throw new RuntimeException\("bad"\);\s*}\s*}/, 'materialized boolean guard branches are reconstructed');
     t.match(source, /public void printChoice\(boolean flag, PrintStream out, String yes, String no\) \{\s*out\.print\(flag \? yes : no\);\s*}/, 'stack ternary values survive into following calls');
+    t.match(source, /public void printAsObject\(PrintStream out, String value\) \{\s*out\.print\(\(Object\) value\);\s*}/,
+      'JRE overload metadata pins a deliberately broad bytecode descriptor');
     t.match(source, /public void bounds\(int value\) \{\s*if \(\(?value < 0\)? \|\| value >= 100\) \{\s*throw new RuntimeException\("bounds"\);\s*}\s*}/, 'nested materialized boolean guards simplify to boolean expressions');
     t.match(source, /public int countDownOnce\(int n\) \{\s*int count = 0;\s*do \{\s*count = count \+ 1;\s*n--;\s*} while \(n > 0\);\s*return count;\s*}/, 'back-edge conditional loops are reconstructed as do/while');
     t.match(source, /public int sumFor\(int n\) \{\s*int sum = 0;\s*for \(int i = 0; i < n; i\+\+\) \{\s*sum = sum \+ i;\s*}\s*return sum;\s*}/, 'counting loops are reconstructed as for loops');
