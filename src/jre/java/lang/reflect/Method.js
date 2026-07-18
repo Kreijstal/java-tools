@@ -129,9 +129,11 @@ module.exports = {
       const callingFrame = thread.callStack.peek();
 
       thread.isAwaitingReflectiveCall = true;
-      thread.reflectiveCallResolver = async (ret) => {
-        const finalRet = await ret;
-        callingFrame.stack.push(boxReflectiveReturn(descriptor, finalRet));
+      // Return bytecodes hand the resolver a concrete JVM value. Keep this
+      // synchronous so the fast interpreter cannot resume the caller before
+      // its reflected result has been materialized.
+      thread.reflectiveCallResolver = (ret) => {
+        callingFrame.stack.push(boxReflectiveReturn(descriptor, ret));
       };
       thread.callStack.push(newFrame);
 

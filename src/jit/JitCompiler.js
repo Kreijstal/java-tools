@@ -1,4 +1,5 @@
 const Frame = require("../core/frame");
+const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
 const { resolveInstanceFieldKey } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
@@ -1368,6 +1369,20 @@ class JitCompiler {
     if (jreMethod) {
       let result = jreMethod(this.jvm, receiver, args, thread);
       if (result && typeof result.then === "function") result = await result;
+      if (result === ASYNC_METHOD_SENTINEL) {
+        // Some JRE shims (notably Method.invoke) install a Java child frame
+        // and use the sentinel to tell the interpreter not to push a result.
+        // Yield the compiled caller when that happened; its post-invoke PC is
+        // already materialized and the child will supply the eventual value.
+        if (!thread.callStack.isEmpty() && thread.callStack.peek() !== frame) {
+          return {
+            deopt: true,
+            transient: true,
+            reason: `async JRE handoff ${targetClassName}.${methodName}${descriptor}`,
+          };
+        }
+        return RETURN_VOID;
+      }
       if (returnType === "V" || result === undefined) return RETURN_VOID;
       return typeof result === "boolean" ? (result ? 1 : 0) : result;
     }
