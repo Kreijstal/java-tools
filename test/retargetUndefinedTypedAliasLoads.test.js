@@ -77,7 +77,17 @@ test('treats this as an entry definition instead of a same-typed checked alias',
   };
 
   t.equal(rewriteCode(code, method), 0);
-  t.equal(code.codeItems[5].instruction, 'aload_0');
+  t.deepEqual(code.codeItems.map((item) => item.instruction), [
+    { op: 'aload', arg: '3' },
+    'iconst_0',
+    'aaload',
+    { op: 'checkcast', arg: 'w' },
+    { op: 'astore', arg: '4' },
+    'aload_0',
+    { op: 'getfield', arg: ['Field', 'w', ['M', 'Lvj;']] },
+    'pop',
+    'return',
+  ]);
   t.end();
 });
 
