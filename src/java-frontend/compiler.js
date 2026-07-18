@@ -327,7 +327,9 @@ function jasminAccess(flags) {
 }
 
 function escapeJasminStringLiteral(value) {
-  return JSON.stringify(value === undefined || value === null ? '' : String(value));
+  return JSON.stringify(value === undefined || value === null ? '' : String(value))
+    .split('\\b').join('\\u0008')
+    .split('\\f').join('\\u000c');
 }
 
 function annotationElementType(value) {
@@ -369,6 +371,8 @@ function attributeLines(attributes = []) {
       lines.push(`.signature ${escapeJasminStringLiteral(attribute.value)}`);
     } else if (attribute.type === 'SourceFile' && attribute.value) {
       lines.push(`.sourcefile ${escapeJasminStringLiteral(attribute.value)}`);
+    } else if (attribute.type === 'exceptions' && Array.isArray(attribute.exceptions) && attribute.exceptions.length) {
+      lines.push(`.exceptions ${attribute.exceptions.join(' ')}`);
     }
   }
   return lines;
@@ -377,6 +381,9 @@ function attributeLines(attributes = []) {
 function memberAttributesFromMeta(meta = {}) {
   const attributes = [];
   if (meta && meta.signature) attributes.push({ type: 'Signature', value: meta.signature });
+  if (meta && Array.isArray(meta.exceptions) && meta.exceptions.length) {
+    attributes.push({ type: 'exceptions', exceptions: meta.exceptions.slice() });
+  }
   if (meta && Array.isArray(meta.annotations) && meta.annotations.length) {
     attributes.push({ type: 'RuntimeVisibleAnnotations', annotations: meta.annotations });
   }

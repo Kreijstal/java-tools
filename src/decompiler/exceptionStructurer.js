@@ -153,7 +153,26 @@ function normalizeTable(exceptionTable, syncHandlers) {
       groups.splice(groups.indexOf(extra), 1);
     }
   }
-  return { groups: [...groups, ...syncGroups] };
+  const mergeSameHandlerCatches = (group) => {
+    const byHandler = new Map();
+    const catches = [];
+    for (const item of group.catches || []) {
+      let merged = byHandler.get(item.handler_pc);
+      if (!merged) {
+        merged = { handler_pc: item.handler_pc, catchTypes: [] };
+        byHandler.set(item.handler_pc, merged);
+        catches.push(merged);
+      }
+      const types = Array.isArray(item.catch_type) ? item.catch_type : [item.catch_type];
+      for (const type of types) if (!merged.catchTypes.includes(type)) merged.catchTypes.push(type);
+    }
+    group.catches = catches.map((item) => ({
+      handler_pc: item.handler_pc,
+      catch_type: item.catchTypes.length === 1 ? item.catchTypes[0] : item.catchTypes,
+    }));
+    return group;
+  };
+  return { groups: [...groups, ...syncGroups].map(mergeSameHandlerCatches) };
 }
 
 /** True when `pc` lies in any half-open protected range `[start_pc, end_pc)`. */
@@ -172,6 +191,7 @@ function inLogicalTryRange(pc, group) {
 /** Render a catch_type (class-internal name, or 0/"any"/null catch-all) as a
  * Java type. Catch-all becomes java.lang.Throwable. */
 function renderCatchType(catch_type) {
+  if (Array.isArray(catch_type)) return catch_type.map(renderCatchType).join(' | ');
   if (catch_type == null || catch_type === 0 || catch_type === 'any') return 'java.lang.Throwable';
   return String(catch_type).replace(/\//g, '.');
 }
@@ -807,11 +827,13 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
     return true;
   };
 
-  // Innermost first: smallest protected range, then earliest start. Collapsing a
-  // nested group turns it into a super-block that the enclosing group then picks
-  // up by start pc, so nesting falls out naturally.
+  // Innermost first: smallest protected range. For equal-size regions, process
+  // the later bytecode range first: javac duplicates finally bodies after the
+  // primary try/catch, and an earlier handler can normally flow into that later
+  // copy. Collapsing the later region first keeps its entry from being absorbed
+  // as ordinary handler continuation before it has been structured.
   const ordered = groups.slice().sort((a, b) =>
-    (a.end_pc - a.start_pc) - (b.end_pc - b.start_pc) || a.start_pc - b.start_pc);
+    (a.end_pc - a.start_pc) - (b.end_pc - b.start_pc) || b.start_pc - a.start_pc);
 
   for (const g of ordered) {
     const bail = processGroup(work, g, {
@@ -847,7 +869,9 @@ function processGroup(work, group, ctx, commit) {
 
   // Boundaries must land on block leaders: the try entry and each handler entry.
   let tryEntry = localOfStartPc(group.start_pc);
-  if (tryEntry < 0) return new Bail('try start does not land on a block boundary');
+  if (tryEntry < 0) {
+    return new Bail(`try start ${group.start_pc} does not land on a block boundary (leaders: ${work.startPc.join(', ')})`);
+  }
   const handlerLocals = [];
   for (const c of group.catches) {
     const h = localOfStartPc(c.handler_pc);
@@ -970,13 +994,22 @@ function processGroup(work, group, ctx, commit) {
     handlerSets.push(hs);
   }
 
-  // Whole region and its external exits (the joins reached from inside). A
-  // region may leave to several distinct blocks (a synchronized body in a loop
-  // that both `continue`s and falls through); each becomes a selector-dispatched
-  // exit rather than a bail.
+  // Whole region and the exits of each independently structured component.
+  // A catch can continue back to the try entry (or a try arm can enter a shared
+  // handler continuation): that target is internal to the union, but external
+  // to the catch/try sub-CFG currently being carved. Include such cross-component
+  // edges so structureRegion can terminate at a sink; collapseRegion maps a
+  // target inside `region` back to the synthetic super-block, preserving the
+  // resulting loop.
   const region = new Set([...tryset, ...inSomeHandler]);
   const externals = new Set();
-  for (const b of region) for (const t of succOfTerm(work.term[b])) if (t != null && !region.has(t)) externals.add(t);
+  for (const component of [tryset, ...handlerSets]) {
+    for (const b of component) {
+      for (const t of succOfTerm(work.term[b])) {
+        if (t != null && !component.has(t)) externals.add(t);
+      }
+    }
+  }
   const externalsList = [...externals];
 
   // Only the try entry may be targeted from outside the region.

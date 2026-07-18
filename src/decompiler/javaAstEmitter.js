@@ -22,11 +22,16 @@ function treeToStatements(tree, render) {
         body: block(treeToStatements(tree.body, render)),
       }),
     })];
-    case 'if': return [createNode('IfStatement', {
-      condition: rawExpression(render.cond(tree.block)),
-      consequent: block(treeToStatements(tree.then, render)),
-      alternate: tree.els ? block(treeToStatements(tree.els, render)) : null,
-    })];
+    case 'if': {
+      const conditionSource = render.cond(tree.block);
+      if (conditionSource === 'true') return treeToStatements(tree.then, render);
+      if (conditionSource === 'false') return tree.els ? treeToStatements(tree.els, render) : [];
+      return [createNode('IfStatement', {
+        condition: rawExpression(conditionSource),
+        consequent: block(treeToStatements(tree.then, render)),
+        alternate: tree.els ? block(treeToStatements(tree.els, render)) : null,
+      })];
+    }
     case 'switch': return [createNode('SwitchStatement', {
       expression: rawExpression(render.switchValue(tree.block)),
       groups: [
