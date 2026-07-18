@@ -294,6 +294,26 @@ test('peephole clean preserves a goto after a referenced label-only entry', (t) 
   t.end();
 });
 
+test('peephole clean removes consecutive unlabelled post-terminal gotos', (t) => {
+  const ast = astWith([
+    { instruction: 'return' },
+    { instruction: { op: 'goto', arg: 'Ldead1' } },
+    { instruction: { op: 'goto', arg: 'Ldead2' } },
+    { labelDef: 'Ldead1:', instruction: 'iconst_1' },
+    { instruction: 'pop' },
+    { labelDef: 'Ldead2:', instruction: 'return' },
+  ]);
+
+  const result = runPeepholeClean(ast, { removeDeadGotoIslands: true });
+
+  t.equal(result.details.deadGotoIslands, 2,
+    'splicing the first goto does not skip the next shifted entry');
+  t.notOk(code(ast).codeItems.some((item) =>
+    item.instruction && (item.instruction.op === 'goto' || item.instruction.op === 'goto_w')),
+  'both dead gotos are removed');
+  t.end();
+});
+
 test('peephole clean can clone conditional shared loop tail for one predecessor', (t) => {
   const ast = astWith([
     { labelDef: 'Lhead:', instruction: 'aload_1' },
