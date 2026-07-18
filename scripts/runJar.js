@@ -116,7 +116,8 @@ async function main() {
     }
 
     const appletParameters = {};
-    for (const arg of options.programArgs) {
+    const programArgs = options.programArgs || [];
+    for (const arg of programArgs) {
       const eq = arg.indexOf('=');
       if (eq > 0) appletParameters[arg.slice(0, eq)] = arg.slice(eq + 1);
     }
@@ -125,7 +126,7 @@ async function main() {
       verbose: options.verbose,
       appletParameters: Object.keys(appletParameters).length ? appletParameters : null,
     });
-    await jvm.run(normalizeMainClass(mainClass), { args: options.programArgs });
+    await jvm.run(normalizeMainClass(mainClass), { args: programArgs });
   } finally {
     if (options.keepTemp) {
       console.error(`Kept extracted jar at ${tempDir}`);

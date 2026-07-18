@@ -86,7 +86,7 @@ module.exports = {
       }
       const millis = Number(timeout);
       if (millis > 0) {
-        thread.waitDeadline = Date.now() + millis;
+        thread.waitDeadline = jvm.clock.millis() + millis;
       }
     }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'wait(JI)V': withThrows((jvm, obj, args, thread) => {
@@ -107,7 +107,7 @@ module.exports = {
       }
       const millis = Number(timeout);
       if (millis > 0 || nanos > 0) {
-        thread.waitDeadline = Date.now() + Math.max(1, millis);
+        thread.waitDeadline = jvm.clock.millis() + Math.max(1, millis);
       }
     }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
     'notify()V': withThrows((jvm, obj, args, thread) => {

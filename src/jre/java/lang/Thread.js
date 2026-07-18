@@ -141,7 +141,7 @@ module.exports = {
     'sleep(J)V': withThrows((jvm, obj, args, thread) => {
       const time = args[0];
       thread.status = 'SLEEPING';
-      thread.sleepUntil = Date.now() + Number(time);
+      thread.sleepUntil = jvm.clock.millis() + Number(time);
     }, ['java/lang/InterruptedException']),
     'interrupt()V': (jvm, obj, args) => {
       obj.interrupted = true;

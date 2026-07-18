@@ -1,4 +1,3 @@
-const fakeClock = require('../../../core/fakeClock');
 
 module.exports = {
   super: 'java/lang/Object',
@@ -66,8 +65,7 @@ module.exports = {
       return Math.round(args[0]);
     },
     'random()D': (jvm, obj, args) => {
-      if (fakeClock.enabled) return fakeClock.random();
-      return Math.random();
+      return jvm.clock.random();
     },
   },
   methods: {},

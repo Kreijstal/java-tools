@@ -1,6 +1,5 @@
 const fs = require('fs');
 const path = require('path');
-const fakeClock = require('./fakeClock');
 
 /**
  * Java Native Interface (JNI) implementation for the JavaScript JVM
@@ -181,11 +180,10 @@ class JNI {
     
     // System native methods
     this.registerNativeMethod('java/lang/System', 'currentTimeMillis', '()J',
-      (jniEnv) => fakeClock.enabled ? fakeClock.millis() : Date.now());
+      (jniEnv) => jniEnv.jvm.clock.millis());
 
     this.registerNativeMethod('java/lang/System', 'nanoTime', '()J',
-      (jniEnv) => fakeClock.enabled ? fakeClock.nanos()
-        : (process.hrtime.bigint ? Number(process.hrtime.bigint()) : Date.now() * 1000000));
+      (jniEnv) => jniEnv.jvm.clock.nanos());
 
     // Object native methods  
     this.registerNativeMethod('java/lang/Object', 'hashCode', '()I',

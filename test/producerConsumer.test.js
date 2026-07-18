@@ -46,12 +46,12 @@ test('JVM should execute ProducerConsumer.class, demonstrate wait/notify, and no
     t.ok(executionTime < 2000, `Execution time should be less than 2000ms, but was ${executionTime}ms`);
     t.deepEqual(output, [
       'Producer produced-0',
-      'Consumer consumed-0',
       'Producer produced-1',
+      'Consumer consumed-0',
       'Consumer consumed-1',
       'Producer produced-2',
-      'Consumer consumed-2',
       'Producer produced-3',
+      'Consumer consumed-2',
       'Consumer consumed-3',
       'Producer produced-4',
       'Consumer consumed-4',

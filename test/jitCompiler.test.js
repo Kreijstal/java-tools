@@ -60,6 +60,14 @@ async function createPyramidHarness(jitOptions) {
   return { jvm, thread, applet };
 }
 
+test('Wasm value imports preserve JavaScript boolean fields', (t) => {
+  t.equal(wasmJitTest.toWasmValue(wasmJitTest.T.i32, true), 1,
+    'true is imported as Java boolean 1');
+  t.equal(wasmJitTest.toWasmValue(wasmJitTest.T.i32, false), 0,
+    'false is imported as Java boolean 0');
+  t.end();
+});
+
 test('JIT produces same PyramidApplet mock drawing operations as interpreter', async (t) => {
   const interpreted = await createPyramidHarness({ enabled: false });
   const jitted = await createPyramidHarness({ warmupThreshold: 0 });

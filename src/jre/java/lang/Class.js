@@ -461,8 +461,11 @@ module.exports = {
       _declaringClass: classObj,
       _parameterTypes: args[0] || [],
     }), ['java/lang/NoSuchMethodException']),
-    'newInstance()Ljava/lang/Object;': async (jvm, classObj, args, thread) => {
+    'newInstance()Ljava/lang/Object;': withThrows(async (jvm, classObj, args, thread) => {
       const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes || !classData.ast.classes[0]) {
+        throw { type: 'java/lang/InstantiationException', message: classObj.className || 'class' };
+      }
       const className = classData.ast.classes[0].className;
       const t0 = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
       const newObj = await jvm.createAppletInstance(className, t0);
@@ -481,7 +484,7 @@ module.exports = {
         }
       }
       return newObj;
-    },
+    }, ['java/lang/InstantiationException', 'java/lang/IllegalAccessException']),
     'getResource(Ljava/lang/String;)Ljava/net/URL;': (jvm, classObj, args) => {
       const name = String(args[0]);
       const classData = classObj._classData;

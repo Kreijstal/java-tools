@@ -23,6 +23,7 @@ const JSZip = require("jszip");
 const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
+const { createClock } = require('./fakeClock');
 
 function yieldToEventLoop() {
   return new Promise((resolve) => {
@@ -56,6 +57,10 @@ class JVM {
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
     const env = (typeof process !== 'undefined' && process.env) || {};
+    this.clock = options.clock || createClock({
+      fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
+      fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,
+    });
     const configuredYieldMs = options.eventLoopYieldMs ?? env.JVM_EVENT_LOOP_YIELD_MS;
     this.eventLoopYieldMs = Math.max(1, Number(configuredYieldMs) || 16);
     const configuredBurst = options.interpreterBurst ??
@@ -846,8 +851,12 @@ class JVM {
 
   async executeTick(options = {}) {
     // On each tick, check for threads that need to be woken up.
+    const hasTimedThread = this.threads.some((t) =>
+      (t.status === 'SLEEPING' && t.sleepUntil !== undefined) ||
+      (t.status === 'WAITING' && t.waitDeadline !== undefined));
+    const schedulerNow = hasTimedThread ? this.clock.millis() : 0;
     for (const t of this.threads) {
-      if (t.status === "SLEEPING" && Date.now() >= t.sleepUntil) {
+      if (t.status === "SLEEPING" && schedulerNow >= t.sleepUntil) {
         t.status = "runnable";
         delete t.sleepUntil;
       }
@@ -863,7 +872,7 @@ class JVM {
       ) {
         t.status = "runnable";
       }
-      if (t.status === "WAITING" && t.waitDeadline && Date.now() >= t.waitDeadline) {
+      if (t.status === "WAITING" && t.waitDeadline && schedulerNow >= t.waitDeadline) {
         // Timed wait expired: leave the wait set and re-acquire the monitor.
         const monitor = t.waitingOn;
         if (monitor && Array.isArray(monitor.waitSet)) {
@@ -1921,18 +1930,22 @@ class JVM {
   }
 
   saveState() {
-    const savedAt = Date.now();
+    const savedAt = this.clock.millis();
     const threadTokens = this.threads.map((thread) => ({ $jvmThreadId: thread.id }));
     const threadReplacements = new Map(this.threads.map((thread, index) =>
       [thread, threadTokens[index]]));
     const threadSnapshots = this.threads.map((thread) => {
       const properties = {};
       for (const [key, value] of Object.entries(thread)) {
-        if (key === 'callStack' || key === 'joiningOn' || key === 'sleepUntil') continue;
+        if (key === 'callStack' || key === 'joiningOn' || key === 'sleepUntil' ||
+          key === 'waitDeadline') continue;
         properties[key] = value;
       }
       if (thread.sleepUntil !== undefined) {
         properties.sleepRemaining = Math.max(0, Number(thread.sleepUntil) - savedAt);
+      }
+      if (thread.waitDeadline !== undefined) {
+        properties.waitRemaining = Math.max(0, Number(thread.waitDeadline) - savedAt);
       }
       return {
         properties,
@@ -1961,6 +1974,7 @@ class JVM {
       format: 'jvmjs-save-state',
       version: 1,
       savedAt,
+      clock: this.clock.snapshot(),
       classpath: this.classpath,
       loadedClasses: Object.keys(this.classes),
       classInitializationState: [...this.classInitializationState],
@@ -1979,6 +1993,7 @@ class JVM {
       throw new Error('Unsupported JVM save-state format');
     }
     this.classpath = Array.isArray(state.classpath) ? state.classpath : [state.classpath || '.'];
+    if (state.clock) this.clock.restore(state.clock);
     this.appletParameters = state.appletParameters || null;
     this.appletCodeBase = state.appletCodeBase || null;
     for (const className of state.loadedClasses || []) {
@@ -2001,7 +2016,7 @@ class JVM {
     this.invokedynamicCache = decoded.invokedynamicCache || new Map();
     await this._rehydrateSaveStateResources(decoded);
 
-    const restoredAt = Date.now();
+    const restoredAt = this.clock.millis();
     this.threads = [];
     for (const snapshot of decoded.threads || []) {
       const properties = snapshot.properties || {};
@@ -2009,6 +2024,10 @@ class JVM {
       if (properties.sleepRemaining !== undefined) {
         thread.sleepUntil = restoredAt + Number(properties.sleepRemaining);
         delete thread.sleepRemaining;
+      }
+      if (properties.waitRemaining !== undefined) {
+        thread.waitDeadline = restoredAt + Number(properties.waitRemaining);
+        delete thread.waitRemaining;
       }
       for (const frameState of snapshot.frames || []) {
         const method = await this.findMethodInHierarchy(
@@ -2077,8 +2096,12 @@ class JVM {
         for (const [key, item] of value) pending.push(key, item);
       } else if (value instanceof Set) {
         for (const item of value) pending.push(item);
+      } else if (ArrayBuffer.isView(value)) {
+        continue;
       } else {
-        for (const item of Object.values(value)) pending.push(item);
+        for (const item of Object.values(value)) {
+          if (item && typeof item === 'object') pending.push(item);
+        }
       }
     }
     const systemClass = this.classes['java/lang/System'];
@@ -2107,6 +2130,8 @@ class JVM {
         const items = [...value];
         value.clear();
         for (const item of items) value.add(resolve(item));
+      } else if (ArrayBuffer.isView(value)) {
+        return value;
       } else {
         for (const key of Object.keys(value)) value[key] = resolve(value[key]);
       }

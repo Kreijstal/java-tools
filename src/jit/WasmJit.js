@@ -155,7 +155,10 @@ function toWasmValue(t, value) {
     return 0n;
   }
   if (t === T.f32) return Math.fround(typeof value === 'number' ? value : 0);
-  if (t === T.f64 || t === T.i32) return typeof value === 'number' ? value : 0;
+  if (t === T.f64 || t === T.i32) {
+    if (typeof value === 'boolean') return value ? 1 : 0;
+    return typeof value === 'number' ? value : 0;
+  }
   return value === undefined ? null : value;
 }
 
@@ -1492,4 +1495,4 @@ class WasmJit {
 }
 
 module.exports = WasmJit;
-module.exports._test = { isNoOpExceptionHandler };
+module.exports._test = { isNoOpExceptionHandler, toWasmValue, T };

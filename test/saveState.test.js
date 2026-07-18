@@ -51,6 +51,7 @@ test('portable JVM save states preserve heap identity and deterministic executio
   array.type = '[Ljava/lang/Object;';
   shared.fields.self = shared;
   shared.fields.array = array;
+  shared.fields.pixels = new Uint8Array([1, 2, 3, 255]);
   shared.fields.raf = raf;
   classData.staticFields.set('root:Ljava/lang/Object;', shared);
 
@@ -83,6 +84,8 @@ test('portable JVM save states preserve heap identity and deterministic executio
   t.equal(restoredRoot.fields.self, restoredRoot, 'cyclic Java object identity survives');
   t.equal(restoredRoot.fields.array[0], restoredRoot, 'shared array reference survives');
   t.equal(restoredRoot.fields.array[1], 7n, 'long/BigInt values survive');
+  t.deepEqual(Array.from(restoredRoot.fields.pixels), [1, 2, 3, 255],
+    'typed arrays survive without object-graph element traversal');
   t.equal(typeof restoredRoot.fields.raf.fileHandle.read, 'function',
     'portable file metadata reopens its host handle');
   t.equal(restored.threads[0].callStack.peek().locals[1], restoredRoot,

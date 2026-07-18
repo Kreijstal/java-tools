@@ -2,7 +2,6 @@
 const process = require('process');
 const path = require('path');
 const { withThrows } = require('../../helpers');
-const fakeClock = require('../../../core/fakeClock');
 function javaString(value) {
   if (value === null || value === undefined) return '';
   if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
@@ -72,12 +71,10 @@ module.exports = {
       jvm.exit(status);
     },
     'nanoTime()J': (jvm, obj, args) => {
-      if (fakeClock.enabled) return BigInt(fakeClock.nanos());
-      return BigInt(Math.floor(performance.now() * 1000000));
+      return BigInt(jvm.clock.nanos());
     },
     'currentTimeMillis()J': (jvm, obj, args) => {
-      if (fakeClock.enabled) return BigInt(fakeClock.millis());
-      return BigInt(Date.now());
+      return BigInt(jvm.clock.millis());
     }
   },
   methods: {

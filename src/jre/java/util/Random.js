@@ -1,5 +1,4 @@
 const { withThrows } = require('../../helpers');
-const fakeClock = require('../../../core/fakeClock');
 
 module.exports = {
   super: "java/lang/Object",
@@ -7,7 +6,7 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       // Initialize with current time, similar to Java's default.
       // Under JVM_FAKE_TIME, use a deterministic per-instance seed instead.
-      const entropy = fakeClock.enabled ? fakeClock.nextSeed() : BigInt(Date.now());
+      const entropy = jvm.clock.nextSeed();
       const seed = entropy & ((1n << 48n) - 1n);
       obj['java/util/Random/seed'] = seed;
     },

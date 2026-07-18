@@ -16,6 +16,7 @@ const PixelGrabber = require('../src/jre/java/awt/image/PixelGrabber');
 const { setAudioOutputFactory } = require('../src/platform/audio');
 const { encodePng } = require('../src/io/pngEncoder');
 const jpeg = require('jpeg-js');
+const Class = require('../src/jre/java/lang/Class');
 
 function jvmStub() {
   return {
@@ -27,6 +28,19 @@ function jvmStub() {
     },
   };
 }
+
+test('Class.newInstance reports InstantiationException for primitive classes', async (t) => {
+  let error = null;
+  try {
+    await Class.methods['newInstance()Ljava/lang/Object;'](
+      {}, { className: 'int', _classData: null }, [], null,
+    );
+  } catch (caught) {
+    error = caught;
+  }
+  t.equal(error && error.type, 'java/lang/InstantiationException');
+  t.end();
+});
 
 test('File constructors coerce Java String objects without value fields', (t) => {
   const jvm = jvmStub();
