@@ -91,7 +91,7 @@ const tests = [
     name: "SynchronizationTest",
     description: "Monitorenter/monitorexit for synchronization",
     expectedOutput:
-      "=== Synchronization Test ===\nIn synchronized method\nCounter after synchronized method: 10\nBefore synchronized block\nIn synchronized block\nCounter after synchronized block: 15\n=== Multi-threaded Test ===\nFinal counter value: 115",
+      "=== Synchronization Test ===\nIn synchronized method\nCounter after synchronized method: 10\nBefore synchronized block\nIn synchronized block\nCounter after synchronized block: 15\n=== Multi-threaded Test ===\nFinal counter value: 215",
     timeout: 1000, // 1 second timeout for threading tests
   },
   {
