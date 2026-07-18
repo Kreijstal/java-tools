@@ -2680,7 +2680,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       }
       const value = materializeDuplicatedValue(top, lines, localState);
       stack[stack.length - 1] = value;
-      stack.push({ ...value });
+      stack.push(duplicateStackExpression(value));
       continue;
     }
     if (op === 'dup_x1') {
@@ -2696,12 +2696,12 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       if (isCategory2(raw2)) {
         const value2 = materializeDuplicatedValue(raw2, lines, localState);
         const value1 = materializeDuplicatedValue(raw1, lines, localState);
-        stack.push({ ...value1 }, value2, value1);
+        stack.push(duplicateStackExpression(value1), value2, value1);
       } else {
         const value3 = materializeDuplicatedValue(pop(stack), lines, localState);
         const value2 = materializeDuplicatedValue(raw2, lines, localState);
         const value1 = materializeDuplicatedValue(raw1, lines, localState);
-        stack.push({ ...value1 }, value3, value2, value1);
+        stack.push(duplicateStackExpression(value1), value3, value2, value1);
       }
       continue;
     }
@@ -2709,11 +2709,11 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const raw1 = pop(stack);
       if (isCategory2(raw1)) {
         const value1 = materializeDuplicatedValue(raw1, lines, localState);
-        stack.push(value1, { ...value1 });
+        stack.push(value1, duplicateStackExpression(value1));
       } else {
         const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
         const value1 = materializeDuplicatedValue(raw1, lines, localState);
-        stack.push(value2, value1, { ...value2 }, { ...value1 });
+        stack.push(value2, value1, duplicateStackExpression(value2), duplicateStackExpression(value1));
       }
       continue;
     }
@@ -2722,13 +2722,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       if (isCategory2(raw1)) {
         const value2 = materializeDuplicatedValue(pop(stack), lines, localState);
         const value1 = materializeDuplicatedValue(raw1, lines, localState);
-        stack.push({ ...value1 }, value2, value1);
+        stack.push(duplicateStackExpression(value1), value2, value1);
       } else {
         const raw2 = pop(stack);
         const value3 = materializeDuplicatedValue(pop(stack), lines, localState);
         const value2 = materializeDuplicatedValue(raw2, lines, localState);
         const value1 = materializeDuplicatedValue(raw1, lines, localState);
-        stack.push({ ...value2 }, { ...value1 }, value3, value2, value1);
+        stack.push(duplicateStackExpression(value2), duplicateStackExpression(value1), value3, value2, value1);
       }
       continue;
     }
@@ -2739,12 +2739,12 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         if (isCategory2(raw2)) {
           const value2 = materializeDuplicatedValue(raw2, lines, localState);
           const value1 = materializeDuplicatedValue(raw1, lines, localState);
-          stack.push({ ...value1 }, value2, value1);
+          stack.push(duplicateStackExpression(value1), value2, value1);
         } else {
           const value3 = materializeDuplicatedValue(pop(stack), lines, localState);
           const value2 = materializeDuplicatedValue(raw2, lines, localState);
           const value1 = materializeDuplicatedValue(raw1, lines, localState);
-          stack.push({ ...value1 }, value3, value2, value1);
+          stack.push(duplicateStackExpression(value1), value3, value2, value1);
         }
       } else {
         const raw2 = pop(stack);
@@ -2753,13 +2753,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
           const value3 = materializeDuplicatedValue(raw3, lines, localState);
           const value2 = materializeDuplicatedValue(raw2, lines, localState);
           const value1 = materializeDuplicatedValue(raw1, lines, localState);
-          stack.push({ ...value2 }, { ...value1 }, value3, value2, value1);
+          stack.push(duplicateStackExpression(value2), duplicateStackExpression(value1), value3, value2, value1);
         } else {
           const value4 = materializeDuplicatedValue(pop(stack), lines, localState);
           const value3 = materializeDuplicatedValue(raw3, lines, localState);
           const value2 = materializeDuplicatedValue(raw2, lines, localState);
           const value1 = materializeDuplicatedValue(raw1, lines, localState);
-          stack.push({ ...value2 }, { ...value1 }, value4, value3, value2, value1);
+          stack.push(duplicateStackExpression(value2), duplicateStackExpression(value1), value4, value3, value2, value1);
         }
       }
       continue;
@@ -2847,7 +2847,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       continue;
     }
     if (ARRAY_STORE_TYPES[op]) {
-      const value = pop(stack);
+      let value = pop(stack);
       const index = pop(stack);
       let array = pop(stack);
       const arrayType = op === 'aastore' ? 'Object[]' : `${ARRAY_STORE_TYPES[op]}[]`;
@@ -2859,16 +2859,18 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         if (refined === arrayType) array = { ...array, type: refined };
         else array = coerceExpressionForType(array, arrayType);
       }
+      // A dup_x2 can leave the freshly allocated value below this outer-array
+      // store for a following astore.  Materialize it once and mutate the
+      // shared expression so both consumers retain JVM reference identity.
+      if (stack.includes(value) && value.newArraySpill && /^new\b/.test(value.code)) {
+        materializeNewArraySpill(value, lines, localState);
+      }
+      value = renderStoreExpression(value);
       if (array.arrayLiteral && /^\d+$/.test(index.code)) {
         array.arrayLiteral.elements.set(Number(index.code), value);
       } else {
         if (array.newArraySpill && /^new\b/.test(array.code)) {
-          // Materialize the fresh array into a synthetic local before storing;
-          // the shared expr object makes every later reference use the local.
-          const name = localState.nextSyntheticName();
-          lines.push(`${array.type} ${name} = ${array.code};`);
-          array.code = name;
-          array.newArraySpill = undefined;
+          materializeNewArraySpill(array, lines, localState);
         }
         const elementType = op === 'bastore' && array.type === 'boolean[]'
           ? 'boolean'
@@ -3073,7 +3075,7 @@ function formatCallArguments(ref, descriptor, args, exceptionModel) {
       return `(${simplifyType(target)}) null`;
     }
     const value = coerceExpressionForType(
-      arg,
+      renderStoreExpression(arg),
       target || arg.type,
       exceptionModel,
       !mustPinReferenceOverload,
@@ -5966,6 +5968,24 @@ function materializeDuplicatedValue(value, lines, localState) {
   const name = localState.nextSyntheticName('dupTemp');
   lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
   return expr(name, value.type, 100);
+}
+
+// Array construction metadata is intentionally mutable while dup-based fills
+// are reconstructed.  Every duplicated stack slot must therefore retain the
+// same expression object; a shallow clone shares the element map but not later
+// code/spill updates, which can emit a second allocation for one JVM value.
+function duplicateStackExpression(value) {
+  if (value && (value.newArraySpill || value.arrayLiteral)) return value;
+  return { ...value };
+}
+
+function materializeNewArraySpill(value, lines, localState) {
+  const name = localState.nextSyntheticName();
+  lines.push(`${value.type} ${name} = ${value.code};`);
+  value.code = name;
+  value.newArraySpill = undefined;
+  value.arrayLiteral = undefined;
+  return value;
 }
 
 // Before a field write, freeze any live stack expression that reads the same

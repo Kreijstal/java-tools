@@ -63,6 +63,75 @@ L11: areturn
 .end class
 `;
 
+const DUP_ARRAY_PATTERNS = `.version 52 0
+.class public super DupArray
+.super java/lang/Object
+
+.method public static native consume : ([Ljava/lang/String;)V
+.end method
+
+.method public static shareDynamic : ([[BI)[B
+    .code stack 4 locals 3
+L0: aload_0
+L1: iconst_0
+L2: iload_1
+L3: newarray byte
+L5: dup_x2
+L6: aastore
+L7: astore_2
+L8: aload_2
+L9: iconst_0
+L10: bipush 7
+L12: bastore
+L13: aload_2
+L14: areturn
+    .end code
+.end method
+
+.method public static passReferenceLiteral : ()V
+    .code stack 4 locals 0
+L20: iconst_2
+L21: anewarray java/lang/String
+L24: dup
+L25: iconst_0
+L26: ldc "left"
+L28: aastore
+L29: dup
+L30: iconst_1
+L31: ldc "right"
+L33: aastore
+L34: invokestatic Method DupArray consume ([Ljava/lang/String;)V
+L37: return
+    .end code
+.end method
+
+.method public static nestedPrimitiveLiteral : ()[[I
+    .code stack 6 locals 0
+L40: iconst_1
+L41: anewarray [I
+L44: dup
+L45: iconst_0
+L46: iconst_3
+L47: newarray int
+L49: dup
+L50: iconst_0
+L51: iconst_0
+L52: iastore
+L53: dup
+L54: iconst_1
+L55: ldc 16777215
+L57: iastore
+L58: dup
+L59: iconst_2
+L60: iconst_1
+L61: iastore
+L62: aastore
+L63: areturn
+    .end code
+.end method
+.end class
+`;
+
 function decompileFixture(tempDir, name, source) {
   const classFile = path.join(tempDir, `${name}.class`);
   assembleJasminSource(source, classFile);
@@ -95,6 +164,34 @@ test('new/dup/<init> constructor pattern still allocates exactly once', (t) => {
     const source = decompileFixture(tempDir, 'DupNew', DUP_CONSTRUCTOR_PATTERN);
     const allocations = (source.match(/new Object\(\)/g) || []).length;
     t.equal(allocations, 1, 'constructed object is allocated exactly once');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('dup array patterns preserve allocation identity and recorded elements', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-dup-array-'));
+  try {
+    const source = decompileFixture(tempDir, 'DupArray', DUP_ARRAY_PATTERNS);
+    const dynamicMethod = /public static byte\[\] shareDynamic[\s\S]*?\n    }/.exec(source);
+    t.ok(dynamicMethod, 'dynamic shared-array method is emitted');
+    const dynamicSource = dynamicMethod ? dynamicMethod[0] : source;
+    t.equal((dynamicSource.match(/new byte\[param1\]/g) || []).length, 1,
+      'dynamic byte array is allocated exactly once');
+    const spill = /byte\[\] (\w+\$\d+) = new byte\[param1\];/.exec(dynamicSource);
+    t.ok(spill, 'dynamic allocation is spilled to a shared local');
+    if (spill) {
+      const escaped = spill[1].replace(/\$/g, '\\$');
+      t.match(dynamicSource, new RegExp(`param0\\[0\\] = ${escaped};`),
+        'outer array stores the shared allocation');
+      t.match(dynamicSource, new RegExp(`byte\\[\\] var2 = ${escaped};`),
+        'local stores the same allocation');
+    }
+    t.match(source, /DupArray\.consume\(new String\[\]\{"left", "right"\}\);/,
+      'inline reference-array call retains its elements');
+    t.match(source, /return new int\[\]\[\]\{new int\[\]\{0, 16777215, 1\}\};/,
+      'primitive inner-array values survive the outer array store');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
