@@ -148,9 +148,92 @@ function decompileClassFile(classFilePath, options = {}) {
 }
 
 function decompileClassBytes(bytes, options = {}) {
-  const parsed = getAST(new Uint8Array(bytes));
+  const parsed = getAST(new Uint8Array(normalizeLegacyClassFile(bytes)));
   const astRoot = convertParsedClass(parsed);
   return decompileAstRoot(astRoot, options);
+}
+
+// Class-file version 45.2 and earlier used u1 max_stack/max_locals and a u2
+// code_length in Code attributes. Modern parsers expect the post-45.2 u2/u2/u4
+// layout. Expand only those four legacy header bytes before handing the class
+// to jvm_parser; instruction offsets and every nested Code payload stay intact.
+function normalizeLegacyClassFile(bytes) {
+  const input = Buffer.from(bytes);
+  if (input.length < 10 || input.readUInt32BE(0) !== 0xcafebabe) return input;
+  const minor = input.readUInt16BE(4);
+  const major = input.readUInt16BE(6);
+  if (major > 45 || (major === 45 && minor > 2)) return input;
+
+  let offset = 10;
+  const utf8 = new Map();
+  const cpCount = input.readUInt16BE(8);
+  for (let index = 1; index < cpCount; index += 1) {
+    const tag = input.readUInt8(offset++);
+    if (tag === 1) {
+      const length = input.readUInt16BE(offset);
+      offset += 2;
+      utf8.set(index, input.toString('utf8', offset, offset + length));
+      offset += length;
+    } else if (tag === 3 || tag === 4 || tag === 9 || tag === 10 || tag === 11
+      || tag === 12 || tag === 17 || tag === 18) offset += 4;
+    else if (tag === 5 || tag === 6) { offset += 8; index += 1; }
+    else if (tag === 7 || tag === 8 || tag === 16 || tag === 19 || tag === 20) offset += 2;
+    else if (tag === 15) offset += 3;
+    else return input;
+  }
+
+  const skipAttributes = (start, collectCode) => {
+    let cursor = start;
+    const count = input.readUInt16BE(cursor);
+    cursor += 2;
+    for (let i = 0; i < count; i += 1) {
+      const nameIndex = input.readUInt16BE(cursor);
+      const lengthOffset = cursor + 2;
+      const length = input.readUInt32BE(lengthOffset);
+      const infoOffset = cursor + 6;
+      if (collectCode && utf8.get(nameIndex) === 'Code' && length >= 4) {
+        collectCode.push({ lengthOffset, infoOffset, length });
+      }
+      cursor = infoOffset + length;
+    }
+    return cursor;
+  };
+  const skipMembers = (start, collectCode) => {
+    let cursor = start;
+    const count = input.readUInt16BE(cursor);
+    cursor += 2;
+    for (let i = 0; i < count; i += 1) {
+      cursor += 6;
+      cursor = skipAttributes(cursor, collectCode);
+    }
+    return cursor;
+  };
+
+  offset += 6;
+  const interfacesCount = input.readUInt16BE(offset);
+  offset += 2 + interfacesCount * 2;
+  offset = skipMembers(offset, null);
+  const codeAttributes = [];
+  skipMembers(offset, codeAttributes);
+  if (!codeAttributes.length) return input;
+
+  const chunks = [];
+  let copiedThrough = 0;
+  for (const attribute of codeAttributes) {
+    chunks.push(input.subarray(copiedThrough, attribute.lengthOffset));
+    const newLength = Buffer.allocUnsafe(4);
+    newLength.writeUInt32BE(attribute.length + 4);
+    chunks.push(newLength);
+    chunks.push(input.subarray(attribute.lengthOffset + 4, attribute.infoOffset));
+    const header = Buffer.allocUnsafe(8);
+    header.writeUInt16BE(input.readUInt8(attribute.infoOffset), 0);
+    header.writeUInt16BE(input.readUInt8(attribute.infoOffset + 1), 2);
+    header.writeUInt32BE(input.readUInt16BE(attribute.infoOffset + 2), 4);
+    chunks.push(header);
+    copiedThrough = attribute.infoOffset + 4;
+  }
+  chunks.push(input.subarray(copiedThrough));
+  return Buffer.concat(chunks);
 }
 
 function makeNormalControlFlowReducible(astRoot) {
@@ -174,6 +257,41 @@ function decompileAstRoot(astRoot, options = {}) {
   return (astRoot.classes || [])
     .map((cls) => decompileClassAst(cls, scopedOptions))
     .join('\n\n');
+}
+
+function detectObfuscationGuards(cls) {
+  const guards = [];
+  for (const item of cls.items || []) {
+    const method = item && item.type === 'method' ? item.method : null;
+    if (!method || method.name !== 'toString' || method.descriptor !== '()Ljava/lang/String;'
+      || (method.flags || []).includes('static')) continue;
+    const instructions = executableInstructions(getCode(method)).map((entry) => entry.instruction);
+    if (instructions.length < 4
+      || instructions[0].op !== 'new'
+      || instructions[0].arg !== 'java/lang/IllegalStateException'
+      || instructions[1].op !== 'dup') continue;
+    const constructor = instructions[2];
+    let constructorRef = null;
+    if (constructor.op === 'invokespecial') {
+      try { constructorRef = parseMemberRef(constructor.arg); } catch (err) { constructorRef = null; }
+    }
+    if (!constructorRef
+      || constructorRef.owner !== 'java/lang/IllegalStateException'
+      || constructorRef.name !== '<init>'
+      || constructorRef.descriptor !== '()V'
+      || instructions[3].op !== 'athrow') continue;
+    guards.push({
+      kind: 'obfuscationGuard',
+      guard: 'throwingToString',
+      severity: 'warning',
+      className: cls.className,
+      methodName: method.name,
+      descriptor: method.descriptor,
+      exceptionType: 'java/lang/IllegalStateException',
+      message: 'toString override immediately throws IllegalStateException',
+    });
+  }
+  return guards;
 }
 
 async function decompilePath(inputPath, options = {}) {
@@ -258,6 +376,9 @@ async function decompilePath(inputPath, options = {}) {
 }
 
 function decompileClassAst(cls, options = {}) {
+  if (options.detectObfuscationGuards && Array.isArray(options.diagnostics)) {
+    options.diagnostics.push(...detectObfuscationGuards(cls));
+  }
   if (String(cls.className || '').endsWith('/package-info')) {
     return formatPackageInfoClass(cls, options);
   }
@@ -1149,6 +1270,28 @@ const JDK_UNCHECKED_EXCEPTIONS = new Set([
   'java/util/EmptyStackException',
 ]);
 
+// A few exception classes used by bytecode corpora are outside the lightweight
+// executable JRE shim. Keep their hierarchy here so catch reachability and
+// multi-catch legality do not depend on whether a runtime stub happens to exist.
+const JDK_EXCEPTION_SUPER = new Map([
+  ['java/io/IOException', 'java/lang/Exception'],
+  ['java/net/MalformedURLException', 'java/io/IOException'],
+  ['java/nio/channels/FileLockInterruptionException', 'java/io/IOException'],
+  ['java/lang/InterruptedException', 'java/lang/Exception'],
+  ['java/text/ParseException', 'java/lang/Exception'],
+  ['java/util/IllegalFormatException', 'java/lang/IllegalArgumentException'],
+  ['java/util/UnknownFormatFlagsException', 'java/util/IllegalFormatException'],
+  ['java/util/DuplicateFormatFlagsException', 'java/util/IllegalFormatException'],
+  ['java/nio/charset/UnsupportedCharsetException', 'java/lang/IllegalArgumentException'],
+]);
+
+function exceptionSuperType(type, model) {
+  return (model && model.superOf && model.superOf.get(type))
+    || JDK_EXCEPTION_SUPER.get(type)
+    || (jreClassInfo(type) && jreClassInfo(type).superName)
+    || null;
+}
+
 // A cross-class model of declared method throws + the class hierarchy, built once
 // per decompile run over all input classes. Lets a caller detect that a call
 // lands on a method whose bytecode declares a checked exception it must handle —
@@ -1231,8 +1374,7 @@ function isCheckedThrow(internalName, model) {
     if (JDK_UNCHECKED_EXCEPTIONS.has(type)) return false;
     if (type === 'java/lang/Throwable' || type === 'java/lang/Exception') return true;
     if (type === 'java/lang/Object') return false;
-    const sup = (model && model.superOf && model.superOf.get(type))
-      || (jreClassInfo(type) && jreClassInfo(type).superName);
+    const sup = exceptionSuperType(type, model);
     if (!sup) break; // hit the JDK boundary
     type = sup;
   }
@@ -1246,8 +1388,7 @@ function exceptionTypeAncestors(sourceType, model) {
   while (type && !seen.has(type)) {
     seen.add(type);
     result.push(type);
-    type = (model && model.superOf && model.superOf.get(type))
-      || (jreClassInfo(type) && jreClassInfo(type).superName);
+    type = exceptionSuperType(type, model);
   }
   if (!result.includes('java/lang/Throwable')) result.push('java/lang/Throwable');
   return result;
@@ -1656,7 +1797,16 @@ function decompileCode(code, method, cls, localState, options = {}) {
   localState.currentInternalClassName = cls.className;
   localState.foldedSelfType = options.foldedSelfType || localState.foldedSelfType;
   localState.staticOwnerAliases = options.staticOwnerAliases || localState.staticOwnerAliases;
+  const hasLegacyJsr = (code.codeItems || []).some((item) => {
+    const instruction = getInstructionFromItem(item);
+    return instruction && (instruction.op === 'jsr' || instruction.op === 'jsr_w' || instruction.op === 'ret');
+  });
+  if (!hasLegacyJsr) nopNormallyUnreachableBlocks(code);
   const codeItemsForSelection = code.codeItems || [];
+  if (hasLegacyJsr) {
+    const legacyJsr = decompileLegacyJsrStateMachine(code, method, cls, localState);
+    if (usableDecompileLines(legacyJsr)) return legacyJsr;
+  }
   let controlTransfers = 0;
   let hasSuppressedCleanup = false;
   let hasArrayLength = false;
@@ -1682,8 +1832,18 @@ function decompileCode(code, method, cls, localState, options = {}) {
   if (process.env.CFR_JS_PROFILE_METHODS === '1') {
     console.error(`[cfr-selector] ${cls.className}.${method.name}${method.descriptor} items=${codeItemsForSelection.length} transfers=${controlTransfers} array=${hasArrayLength} suppressed=${hasSuppressedCleanup} owned=${preferOwnedStructurer}`);
   }
+  const sharedExceptionStackJoin = decompileSharedExceptionStackJoin(code, method, cls, localState);
+  if (usableDecompileLines(sharedExceptionStackJoin)) return sharedExceptionStackJoin;
+  const fallthroughExceptionJoin = decompileFallthroughExceptionHandlerJoin(code, method, cls, localState);
+  if (usableDecompileLines(fallthroughExceptionJoin)) return fallthroughExceptionJoin;
+  const nestedHandlerTryChain = decompileNestedHandlerTryChain(code, method, cls, localState);
+  if (usableDecompileLines(nestedHandlerTryChain)) return nestedHandlerTryChain;
   const sequentialTryCatches = decompileStructuredSequentialTryCatches(code, method, cls, localState);
   if (usableDecompileLines(sequentialTryCatches)) return sequentialTryCatches;
+  const duplicateInitialization = decompileDuplicateInitializationPattern(code, method, cls, localState);
+  if (usableDecompileLines(duplicateInitialization)) return duplicateInitialization;
+  const storedUninitialized = decompileStoredUninitializedNonNullPattern(code, method, cls, localState);
+  if (usableDecompileLines(storedUninitialized)) return storedUninitialized;
   if (preferOwnedStructurer) {
     if (process.env.CFR_JS_PROFILE_METHODS === '1') console.error(`[cfr-owned-start] ${cls.className}.${method.name}${method.descriptor}`);
     const ownedStructured = decompileOwnedStructuredControlFlow(code, method, cls, localState, options);
@@ -1731,6 +1891,302 @@ function decompileCode(code, method, cls, localState, options = {}) {
   const lines = decompileLinearCodeItems(code.codeItems || [], method, cls, localState);
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return coalesceDefaultConstructorBody(lines, method);
+}
+
+function nopNormallyUnreachableBlocks(code) {
+  const codeItems = code && code.codeItems || [];
+  const cfg = buildCfgFromCode(codeItems, []);
+  if (!cfg) return;
+  const roots = [cfg.entry];
+  const byLabel = new Map(cfg.blocks.map((block) => [block.headLabel, block.id]));
+  for (const entry of code.exceptionTable || []) {
+    const label = String(entry.handlerLbl || entry.handlerLabel || '').replace(/:$/, '');
+    const blockId = byLabel.get(label);
+    if (blockId != null) roots.push(blockId);
+  }
+  const reachable = new Set();
+  const pending = [...new Set(roots)];
+  while (pending.length) {
+    const blockId = pending.pop();
+    if (blockId == null || reachable.has(blockId)) continue;
+    reachable.add(blockId);
+    for (const successor of cfg.succ[blockId] || []) if (successor != null) pending.push(successor);
+  }
+  const unreachableInstructions = [];
+  for (const block of cfg.blocks) {
+    if (reachable.has(block.id)) continue;
+    for (const itemIndex of block.insns) {
+      const instruction = getInstructionAt(codeItems, itemIndex);
+      if (instruction) unreachableInstructions.push({ itemIndex, instruction });
+    }
+  }
+  // Only erase verifier-noise made entirely from dead control transfers. More
+  // substantial unreachable regions can still be part of compiler exception
+  // scaffolding: nopping a close()/addSuppressed path, for example, destroys
+  // the shape needed to recover try-with-resources even though normal CFG
+  // reachability alone cannot enter it.
+  const hasDeadConditional = unreachableInstructions.some(({ instruction }) =>
+    isConditionalBranch(instruction.op));
+  const onlyDeadControlFlow = unreachableInstructions.every(({ instruction }) =>
+    instruction.op === 'nop' || instruction.op === 'goto' || instruction.op === 'goto_w'
+      || isConditionalBranch(instruction.op));
+  if (!hasDeadConditional || !onlyDeadControlFlow) return;
+  const noppedUnreachable = new Set();
+  for (const { itemIndex } of unreachableInstructions) {
+    codeItems[itemIndex] = { ...codeItems[itemIndex], instruction: 'nop' };
+    noppedUnreachable.add(itemIndex);
+  }
+  const labels = buildLabelIndex(codeItems);
+  for (let index = 0; index < codeItems.length; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction || (instruction.op !== 'goto' && instruction.op !== 'goto_w')) continue;
+    const target = labels.get(instruction.arg);
+    if (target === undefined || target <= index) continue;
+    let hasInterveningInstruction = false;
+    let crossesNoppedUnreachable = false;
+    for (let cursor = index + 1; cursor < target; cursor += 1) {
+      if (noppedUnreachable.has(cursor)) crossesNoppedUnreachable = true;
+      const candidate = getInstructionAt(codeItems, cursor);
+      if (candidate && candidate.op !== 'nop') { hasInterveningInstruction = true; break; }
+    }
+    if (crossesNoppedUnreachable && !hasInterveningInstruction) {
+      codeItems[index] = { ...codeItems[index], instruction: 'nop' };
+    }
+  }
+}
+
+// `jsr`/`ret` subroutines predate Java 6 stack-map frames and can treat return
+// addresses as ordinary stack/local values. Rather than pretending they are
+// gotos, emit a small typed operand-stack state machine for legacy methods. It
+// preserves unusual cases such as returning with values above the address.
+function decompileLegacyJsrStateMachine(code, method, cls, localState) {
+  if ((code.exceptionTable || []).length) return null;
+  const codeItems = code.codeItems || [];
+  const executables = [];
+  const stateByItem = new Map();
+  for (let itemIndex = 0; itemIndex < codeItems.length; itemIndex += 1) {
+    const instruction = getInstructionAt(codeItems, itemIndex);
+    if (!instruction || instruction.op === 'nop') continue;
+    stateByItem.set(itemIndex, executables.length);
+    executables.push({ itemIndex, instruction });
+  }
+  if (!executables.length) return [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const stateAtOrAfter = (itemIndex) => {
+    for (let index = itemIndex; index < codeItems.length; index += 1) {
+      if (stateByItem.has(index)) return stateByItem.get(index);
+    }
+    return -1;
+  };
+  const targetState = (label) => {
+    const itemIndex = labelIndex.get(String(label || '').replace(/:$/, ''));
+    return itemIndex === undefined ? -1 : stateAtOrAfter(itemIndex);
+  };
+  const maxLocal = executables.reduce((maximum, entry) => {
+    const access = parseLoadIndex(entry.instruction.op, entry.instruction.arg)
+      || parseStoreIndex(entry.instruction.op, entry.instruction.arg);
+    if (access) return Math.max(maximum, access.index);
+    if (entry.instruction.op === 'iinc') {
+      const values = Array.isArray(entry.instruction.arg)
+        ? entry.instruction.arg
+        : [entry.instruction.varnum ?? entry.instruction.index, entry.instruction.incr ?? entry.instruction.const];
+      return Math.max(maximum, Number(values[0]) || 0);
+    }
+    return maximum;
+  }, 0);
+  const stackSize = Math.max(64, executables.length * 4);
+  const lines = [
+    `Object[] legacyLocals = new Object[${Math.max(1, maxLocal + 1)}];`,
+    `Object[] legacyStack = new Object[${stackSize}];`,
+    'int legacySp = 0;',
+    'int legacyPc = 0;',
+  ];
+  const descriptor = parseDescriptor(method.descriptor || '()V');
+  let slot = (method.flags || []).includes('static') ? 0 : 1;
+  if (!(method.flags || []).includes('static')) lines.push('legacyLocals[0] = this;');
+  for (let index = 0; index < descriptor.params.length; index += 1) {
+    lines.push(`legacyLocals[${slot}] = ${localState.paramNames[index]};`);
+    slot += descriptor.params[index] === 'long' || descriptor.params[index] === 'double' ? 2 : 1;
+  }
+  lines.push('legacyStateLoop: while (true) {', '    switch (legacyPc) {');
+
+  const primitiveInt = new Set(['boolean', 'byte', 'char', 'short', 'int']);
+  const popSource = (type) => {
+    const simplified = simplifyType(type);
+    const raw = 'legacyStack[--legacySp]';
+    if (primitiveInt.has(simplified)) return `((Number) ${raw}).intValue()`;
+    if (simplified === 'long') return `((Number) ${raw}).longValue()`;
+    if (simplified === 'float') return `((Number) ${raw}).floatValue()`;
+    if (simplified === 'double') return `((Number) ${raw}).doubleValue()`;
+    return `(${simplified}) ${raw}`;
+  };
+  let pushTempCounter = 0;
+  const push = (body, source) => {
+    if (String(source).includes('--legacySp')) {
+      const name = `legacyPushTemp${pushTempCounter++}`;
+      body.push(`Object ${name} = ${source};`, `legacyStack[legacySp++] = ${name};`);
+    } else {
+      body.push(`legacyStack[legacySp++] = ${source};`);
+    }
+  };
+  const advance = (body, next) => {
+    if (next < 0) body.push('return;');
+    else body.push(`legacyPc = ${next};`, 'continue legacyStateLoop;');
+  };
+  const binarySource = (body, state, symbol, type) => {
+    const right = `legacyRight${state}`;
+    const left = `legacyLeft${state}`;
+    body.push(`${type} ${right} = ${popSource(type)};`, `${type} ${left} = ${popSource(type)};`);
+    push(body, `${left} ${symbol} ${right}`);
+  };
+
+  for (let state = 0; state < executables.length; state += 1) {
+    const { instruction } = executables[state];
+    const op = instruction.op;
+    const next = state + 1 < executables.length ? state + 1 : -1;
+    const body = [];
+    if (INTEGER_CONSTS[op] !== undefined) push(body, INTEGER_CONSTS[op]);
+    else if (LONG_CONSTS[op] !== undefined) push(body, LONG_CONSTS[op]);
+    else if (FLOAT_CONSTS[op] !== undefined) push(body, FLOAT_CONSTS[op]);
+    else if (DOUBLE_CONSTS[op] !== undefined) push(body, DOUBLE_CONSTS[op]);
+    else if (op === 'aconst_null') push(body, 'null');
+    else if (op === 'bipush' || op === 'sipush') push(body, String(instruction.arg));
+    else if (op === 'ldc' || op === 'ldc_w' || op === 'ldc2_w') push(body, constantExpression(instruction.arg, op).code);
+    else {
+      const load = parseLoadIndex(op, instruction.arg);
+      const store = parseStoreIndex(op, instruction.arg);
+      if (load) push(body, `legacyLocals[${load.index}]`);
+      else if (store) body.push(`legacyLocals[${store.index}] = legacyStack[--legacySp];`);
+      else if (op === 'iinc') {
+        const values = Array.isArray(instruction.arg)
+          ? instruction.arg
+          : [instruction.varnum ?? instruction.index, instruction.incr ?? instruction.const];
+        body.push(`legacyLocals[${Number(values[0])}] = Integer.valueOf(((Number) legacyLocals[${Number(values[0])}]).intValue() + ${Number(values[1])});`);
+      } else if (op === 'dup') {
+        body.push('legacyStack[legacySp] = legacyStack[legacySp - 1];', 'legacySp++;');
+      } else if (op === 'dup_x1') {
+        body.push(`Object legacyTop${state} = legacyStack[legacySp - 1];`,
+          `legacyStack[legacySp - 1] = legacyStack[legacySp - 2];`,
+          `legacyStack[legacySp - 2] = legacyTop${state};`,
+          `legacyStack[legacySp++] = legacyTop${state};`);
+      } else if (op === 'dup2') {
+        body.push(`Object legacyTop${state} = legacyStack[legacySp - 1];`,
+          `if (legacyTop${state} instanceof Long || legacyTop${state} instanceof Double) {`,
+          `    legacyStack[legacySp++] = legacyTop${state};`,
+          '} else {',
+          `    Object legacyBelow${state} = legacyStack[legacySp - 2];`,
+          `    legacyStack[legacySp++] = legacyBelow${state};`,
+          `    legacyStack[legacySp++] = legacyTop${state};`,
+          '}');
+      } else if (op === 'swap') {
+        body.push(`Object legacyTop${state} = legacyStack[legacySp - 1];`,
+          `legacyStack[legacySp - 1] = legacyStack[legacySp - 2];`,
+          `legacyStack[legacySp - 2] = legacyTop${state};`);
+      } else if (op === 'pop') body.push('legacySp--;');
+      else if (op === 'pop2') {
+        body.push(`Object legacyTop${state} = legacyStack[--legacySp];`,
+          `if (!(legacyTop${state} instanceof Long) && !(legacyTop${state} instanceof Double)) legacySp--;`);
+      } else if (BINARY_OPS.has(op)) {
+        const type = primitiveTypeFromOpcode(op);
+        binarySource(body, state, BINARY_OPS.get(op), type);
+      } else if (op === 'i2d') {
+        push(body, `(double) ${popSource('int')}`);
+      } else if (op === 'arraylength') {
+        body.push(`Object legacyArray${state} = legacyStack[--legacySp];`);
+        push(body, `java.lang.reflect.Array.getLength(legacyArray${state})`);
+      } else if (op === 'newarray') {
+        push(body, `new ${String(instruction.arg)}[${popSource('int')}]`);
+      } else if (op === 'aaload' || op === 'daload') {
+        body.push(`int legacyIndex${state} = ${popSource('int')};`);
+        const arrayType = op === 'daload' ? 'double[]' : 'Object[]';
+        push(body, `(${popSource(arrayType)})[legacyIndex${state}]`);
+      } else if (op === 'aastore' || op === 'dastore') {
+        const valueType = op === 'dastore' ? 'double' : 'Object';
+        body.push(`${valueType} legacyValue${state} = ${popSource(valueType)};`,
+          `int legacyIndex${state} = ${popSource('int')};`,
+          `(${popSource(op === 'dastore' ? 'double[]' : 'Object[]')})[legacyIndex${state}] = legacyValue${state};`);
+      } else if (op === 'getstatic') {
+        const ref = parseMemberRef(instruction.arg);
+        push(body, formatStaticField(ref, localState));
+      } else if (op === 'invokestatic' || op === 'invokevirtual' || op === 'invokeinterface') {
+        const ref = parseMemberRef(instruction.arg);
+        const callDescriptor = parseDescriptor(ref.descriptor);
+        const args = new Array(callDescriptor.params.length);
+        for (let index = callDescriptor.params.length - 1; index >= 0; index -= 1) {
+          const name = `legacyArg${state}_${index}`;
+          const type = simplifyType(callDescriptor.params[index]);
+          body.push(`${type} ${name} = ${popSource(type)};`);
+          args[index] = name;
+        }
+        let call;
+        if (op === 'invokestatic') {
+          call = `${sourceOwnerType(ref.owner, localState)}.${sourceMethodName(ref.name)}(${args.join(', ')})`;
+        } else {
+          const ownerType = /^(?:java|javax)\//.test(ref.owner)
+            ? ref.owner.replace(/\//g, '.')
+            : javaTypeFromInternalName(ref.owner);
+          const receiver = `legacyReceiver${state}`;
+          body.push(`${ownerType} ${receiver} = (${ownerType}) legacyStack[--legacySp];`);
+          call = `${receiver}.${sourceMethodName(ref.name)}(${args.join(', ')})`;
+        }
+        if (callDescriptor.returnType === 'void') body.push(`${call};`);
+        else push(body, call);
+      } else if (op === 'checkcast') {
+        const type = javaTypeFromInternalName(instruction.arg);
+        body.push(`legacyStack[legacySp - 1] = (${type}) legacyStack[legacySp - 1];`);
+      } else if (op === 'goto' || op === 'goto_w') {
+        body.push(`legacyPc = ${targetState(instruction.arg)};`, 'continue legacyStateLoop;');
+      } else if (op === 'jsr' || op === 'jsr_w') {
+        push(body, String(next));
+        body.push(`legacyPc = ${targetState(instruction.arg)};`, 'continue legacyStateLoop;');
+      } else if (op === 'ret') {
+        body.push(`legacyPc = ((Number) legacyLocals[${Number(instruction.arg)}]).intValue();`,
+          'continue legacyStateLoop;');
+      } else if (isConditionalBranch(op)) {
+        const binary = {
+          if_icmpeq: '==', if_icmpne: '!=', if_icmplt: '<', if_icmpge: '>=', if_icmpgt: '>', if_icmple: '<=',
+          if_acmpeq: '==', if_acmpne: '!=',
+        };
+        let condition;
+        if (binary[op]) {
+          const reference = op.startsWith('if_a');
+          const type = reference ? 'Object' : 'int';
+          body.push(`${type} legacyRight${state} = ${popSource(type)};`,
+            `${type} legacyLeft${state} = ${popSource(type)};`);
+          condition = `legacyLeft${state} ${binary[op]} legacyRight${state}`;
+        } else if (op === 'ifnull' || op === 'ifnonnull') {
+          condition = `${popSource('Object')} ${op === 'ifnull' ? '==' : '!='} null`;
+        } else {
+          const operator = ({ ifeq: '==', ifne: '!=', iflt: '<', ifle: '<=', ifgt: '>', ifge: '>=' })[op];
+          condition = `${popSource('int')} ${operator} 0`;
+        }
+        body.push(`legacyPc = ${condition} ? ${targetState(instruction.arg)} : ${next};`,
+          'continue legacyStateLoop;');
+      } else if (op === 'tableswitch' || op === 'lookupswitch') {
+        body.push(`int legacySelector${state} = ${popSource('int')};`, `switch (legacySelector${state}) {`);
+        for (const entry of switchEntries(instruction)) {
+          if (entry.default) body.push(`    default: legacyPc = ${targetState(entry.label)}; break;`);
+          else body.push(`    case ${entry.value}: legacyPc = ${targetState(entry.label)}; break;`);
+        }
+        body.push('}', 'continue legacyStateLoop;');
+      } else if (op === 'athrow') {
+        body.push(`throw (Throwable) legacyStack[--legacySp];`);
+      } else if (op === 'return') {
+        body.push('return;');
+      } else if (RETURN_OPS.has(op)) {
+        body.push(`return ${popSource(methodReturnType(method))};`);
+      } else {
+        return null;
+      }
+    }
+    if (!body.some((line) => /(?:continue legacyStateLoop;|return;|^return |^throw )/.test(line))) advance(body, next);
+    lines.push(`        case ${state}: {`);
+    indentLines(indentLines(indentLines(body))).forEach((line) => lines.push(line));
+    lines.push('        }');
+  }
+  lines.push('        default: throw new IllegalStateException("invalid legacy jsr state " + legacyPc);',
+    '    }', '}');
+  return lines;
 }
 
 function usableDecompileLines(lines) {
@@ -2375,7 +2831,7 @@ function refineObjectLocalDeclarations(lines, resolveType) {
       line = line.replace(assignment, (whole, prefix, value) => {
         const trimmed = value.trim();
         if (trimmed === 'null' || trimmed.startsWith(`(${refinedType})`)) return whole;
-        return `${prefix}(${refinedType}) (Object) ${trimmed};`;
+        return `${prefix}(${refinedType}) (Object) (${trimmed});`;
       });
     }
     return line;
@@ -2792,14 +3248,7 @@ function dropRethrowHandlerRows(codeItems, exceptionTable) {
     // named type. Stating it outright also covers types the JRE metadata index
     // does not carry (java/lang/ThreadDeath among them).
     if (ancestor === 'java/lang/Throwable') return true;
-    let current = descendant;
-    for (let guard = 0; guard < 64 && current; guard += 1) {
-      const info = jreClassInfo(current);
-      if (!info || !info.superName) return false;
-      current = info.superName;
-      if (current === ancestor) return true;
-    }
-    return false;
+    return isAssignableExceptionType(descendant, ancestor);
   };
   // A rethrow row R shields every later overlapping row from the exceptions R
   // catches. The shield is invisible when R's handler pc sits inside that later
@@ -2855,6 +3304,37 @@ function dropUnthrowableProtectedRows(codeItems, exceptionTable) {
   });
 }
 
+function hasNormalBranchIntoExceptionHandler(codeItems, exceptionTable) {
+  const handlerPcs = new Set((exceptionTable || [])
+    .map((entry) => Number(entry.handler_pc))
+    .filter(Number.isFinite));
+  if (!handlerPcs.size) return false;
+  const labels = buildLabelIndex(codeItems);
+  const targetPcs = (instruction) => {
+    if (!instruction) return [];
+    if (instruction.op === 'tableswitch') {
+      return [...(instruction.labels || []), instruction.defaultLbl];
+    }
+    if (instruction.op === 'lookupswitch') {
+      const arg = instruction.arg || {};
+      return [...(arg.pairs || []).map((pair) => pair && pair[1]), arg.defaultLabel];
+    }
+    if (instruction.op === 'goto' || instruction.op === 'goto_w' || isConditionalBranch(instruction.op)) {
+      return [instruction.arg];
+    }
+    return [];
+  };
+  for (const item of codeItems || []) {
+    const instruction = getInstructionFromItem(item);
+    for (const target of targetPcs(instruction)) {
+      const index = labels.get(String(target || '').replace(/:$/, ''));
+      const targetPc = index == null ? NaN : Number(codeItems[index] && codeItems[index].pc);
+      if (handlerPcs.has(targetPc)) return true;
+    }
+  }
+  return false;
+}
+
 function decompileOwnedStructuredControlFlow(code, method, cls, localState, options = {}) {
   const originalItems = code.codeItems || [];
   if (!(code.exceptionTable || []).length && !originalItems.some((item) => {
@@ -2888,7 +3368,11 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   const syncHandlers = loweredSync.syncHandlers;
   exceptionTable = dropRethrowHandlerRows(codeItems, exceptionTable);
   exceptionTable = dropUnthrowableProtectedRows(codeItems, exceptionTable);
-  let structured = structureMethod(codeItems, exceptionTable, { syncHandlers });
+  let structured = structureMethod(codeItems, exceptionTable, {
+    syncHandlers,
+    isCatchAssignable: (subtype, supertype) => isAssignableExceptionType(
+      subtype, supertype, options.exceptionModel),
+  });
   if ((!structured || !structured.ok) && codeItems.length > 1000 && !syncHandlers.size) {
     const normalOnly = structureMethod(codeItems, []);
     if (normalOnly && normalOnly.ok) structured = normalOnly;
@@ -2902,11 +3386,14 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   }
   const cfg = buildCfgFromCode(codeItems, exceptionBoundaryLabels.filter(Boolean));
   if (!cfg) return [];
+  const normalBranchIntoHandler = hasNormalBranchIntoExceptionHandler(codeItems, exceptionTable);
   let stateMachineReason = process.env.CFR_JS_FORCE_STATE_MACHINE === '1'
     ? 'forced by CFR_JS_FORCE_STATE_MACHINE'
-    : ((!structured || !structured.ok)
+    : (normalBranchIntoHandler
+      ? 'normal control-flow edge enters an exception handler'
+      : ((!structured || !structured.ok)
       ? (structured && structured.reason ? structured.reason : 'structurer returned no result')
-      : null);
+      : null));
   let useStateMachine = stateMachineReason !== null;
   if (useStateMachine && syncHandlers.size) {
     // The state machine would render the lowered (nop'd) monitor plumbing as
@@ -2989,8 +3476,16 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         let changed = false;
         const merged = prior.map((value, index) => {
           const incoming = stack[index];
-          const type = mergeStackTypes(value.type, incoming.type);
+          const leftType = simplifyType(value.type || 'Object');
+          const rightType = simplifyType(incoming.type || 'Object');
+          const referenceConflict = leftType !== rightType
+            && leftType !== 'Object' && rightType !== 'Object'
+            && mergeStackTypes(leftType, rightType) === 'Object';
+          const mergedReferenceTop = Boolean(value.mergedReferenceTop
+            || incoming.mergedReferenceTop || referenceConflict);
+          const type = mergedReferenceTop ? 'Object' : mergeStackTypes(value.type, incoming.type);
           if (type !== value.type) changed = true;
+          if (mergedReferenceTop !== Boolean(value.mergedReferenceTop)) changed = true;
           const pendingNew = value.pendingNew && value.pendingNew === incoming.pendingNew
             ? value.pendingNew
             : null;
@@ -3000,6 +3495,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
             : null;
           if ((value.qualifiedType || null) !== qualifiedType) changed = true;
           return expr(value.code, type, value.precedence, {
+            ...(mergedReferenceTop ? { mergedReferenceTop: true } : {}),
             ...(pendingNew ? { pendingNew } : {}),
             ...(qualifiedType ? { qualifiedType } : {}),
           });
@@ -3328,7 +3824,7 @@ function isAssignableExceptionType(thrownType, catchType, model) {
   while (current && !seen.has(current)) {
     if (current === catchType) return true;
     seen.add(current);
-    current = model && model.superOf ? model.superOf.get(current) : null;
+    current = exceptionSuperType(current, model);
   }
   return false;
 }
@@ -3962,6 +4458,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
 
     if (op === 'athrow') {
       const thrown = pop(stack);
+      // `athrow` on a null reference has a precise Java spelling. Routing it
+      // through the generic checked-exception helper changes the observable
+      // stack trace by adding a helper frame.
+      if (thrown.code === 'null') {
+        lines.push('throw null;');
+        continue;
+      }
       const declaredThrows = methodThrowsTypes(method);
       const broadThrown = ['Object', 'Throwable', 'Exception', 'java.lang.Throwable', 'java.lang.Exception']
         .includes(simplifyType(thrown.type));
@@ -4054,7 +4557,14 @@ function emitVirtualCall(lines, stack, arg, localState) {
   if (returnType === 'void') {
     lines.push(`${call};`);
   } else {
-    stack.push(expr(call, returnType));
+    // The JVM descriptor for an array clone is Object, while Java assigns a
+    // covariant array type to the same source expression. Preserve the JVM
+    // type explicitly so javac does not select a more-specific overload.
+    if (ref.name === 'clone' && returnType === 'Object' && simplifyType(receiver.type).endsWith('[]')) {
+      stack.push(expr(`(Object) ${call}`, 'Object', 90));
+    } else {
+      stack.push(expr(call, returnType));
+    }
   }
 }
 
@@ -5650,6 +6160,10 @@ function tryDecompileWhileAt(codeItems, index, end, context, stack) {
   const body = decompileRange(codeItems, branchIndex + 1, backGotoIndex, bodyContext, []);
   if (!body.ok) return null;
 
+  if (condition.condition.code === 'false') {
+    return { lines: [], next: exitIndex, stack: condition.stack };
+  }
+
   const lines = [`while (${condition.condition.code}) {`];
   indentLines(body.lines).forEach((line) => lines.push(line));
   lines.push('}');
@@ -6044,6 +6558,7 @@ function conditionForBranch(branch, stack, invert) {
   if (op === 'ifnull' || op === 'ifnonnull') {
     const value = pop(stack);
     const operator = invert ? invertOperator(op === 'ifnull' ? '==' : '!=') : (op === 'ifnull' ? '==' : '!=');
+    if (value.pendingNew) return expr(operator === '!=' ? 'true' : 'false', 'boolean', 100);
     return expr(`${wrap(value, 60)} ${operator} null`, 'boolean', 60);
   }
 
@@ -6072,6 +6587,9 @@ function conditionForBranch(branch, stack, invert) {
       expr('0', 'int', 100, { constantValue: 0 }),
     );
     if (complementedComparison) return complementedComparison;
+    const literalComparison = evaluateLiteralIntegerComparison(
+      value, operator, expr('0', 'int', 100, { constantValue: 0 }));
+    if (literalComparison !== null) return expr(String(literalComparison), 'boolean', 100);
     return expr(`${wrap(value, 60)} ${operator} 0`, 'boolean', 60);
   }
 
@@ -6320,8 +6838,15 @@ function decompileStructuredSequentialTryCatches(code, method, cls, localState) 
   const prefix = decompileRange(codeItems, 0, regions[0].start, context, []);
   if (!prefix.ok || prefix.stack.length) return null;
   const lines = prefix.lines.slice();
+  let cursor = regions[0].start;
 
   for (const region of regions) {
+    if (cursor < region.start) {
+      const gap = decompileRange(codeItems, cursor, region.start, context, []);
+      if (!gap.ok || gap.stack.length) return null;
+      gap.lines.forEach((line) => lines.push(line));
+    }
+
     const tryBody = decompileRange(codeItems, region.start, region.end, context, []);
     if (!tryBody.ok || tryBody.stack.length) return null;
     const firstHandlerInstruction = getInstructionAt(codeItems, region.handler);
@@ -6341,11 +6866,314 @@ function decompileStructuredSequentialTryCatches(code, method, cls, localState) 
     lines.push(`} catch (${catchType} ${catchVariable}) {`);
     indentLines(catchBody.lines).forEach((line) => lines.push(line));
     lines.push('}');
+    cursor = region.after;
   }
 
-  const after = decompileRange(codeItems, regions[regions.length - 1].after, codeItems.length, context, []);
+  const after = decompileRange(codeItems, cursor, codeItems.length, context, []);
   if (!after.ok || after.stack.length) return null;
   after.lines.forEach((line) => lines.push(line));
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return lines;
+}
+
+// javac can place a new protected range directly inside the preceding catch
+// handler. Every level jumps to one shared continuation when it completes
+// normally. Treating these disjoint table rows as sibling catches loses the
+// inner handlers and lets their exceptions escape.
+function decompileNestedHandlerTryChain(code, method, cls, localState) {
+  const entries = code.exceptionTable || [];
+  if (entries.length < 2 || entries.some((entry) => !entry.catch_type || entry.catch_type === 'any')) return null;
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const regions = entries.map((entry) => ({
+    entry,
+    start: labelIndex.get(entry.startLbl),
+    end: labelIndex.get(entry.endLbl),
+    handler: labelIndex.get(entry.handlerLbl),
+  }));
+  if (regions.some((region) => region.start === undefined || region.end === undefined || region.handler === undefined)) return null;
+  regions.sort((left, right) => left.start - right.start);
+
+  let sharedAfter = null;
+  for (const region of regions) {
+    const gotoIndex = nextNonNopExecutableIndex(codeItems, region.end);
+    const gotoInstruction = gotoIndex < 0 ? null : getInstructionAt(codeItems, gotoIndex);
+    if (!gotoInstruction || (gotoInstruction.op !== 'goto' && gotoInstruction.op !== 'goto_w')) return null;
+    region.after = labelIndex.get(gotoInstruction.arg);
+    if (region.after === undefined || region.handler <= gotoIndex || region.handler >= region.after) return null;
+    if (sharedAfter === null) sharedAfter = region.after;
+    else if (region.after !== sharedAfter) return null;
+    const store = getInstructionAt(codeItems, region.handler);
+    region.store = store && parseStoreIndex(store.op, store.arg);
+    if (!region.store || region.store.type !== 'Object') return null;
+  }
+  for (let index = 1; index < regions.length; index += 1) {
+    const nestedStart = nextExecutableIndex(codeItems, regions[index - 1].handler + 1);
+    if (nestedStart !== nextExecutableIndex(codeItems, regions[index].start)) return null;
+  }
+
+  const context = { method, cls, localState, labelIndex, exceptionTable: entries };
+  const prefix = decompileRange(codeItems, 0, regions[0].start, context, []);
+  if (!prefix.ok || prefix.stack.length) return null;
+
+  const renderRegion = (index) => {
+    const region = regions[index];
+    const tryBody = decompileRange(codeItems, region.start, region.end, context, []);
+    if (!tryBody.ok || tryBody.stack.length) return null;
+    const catchType = javaTypeFromInternalName(region.entry.catch_type);
+    const priorBinding = localState.captureBinding(region.store.index, catchType);
+    const catchVariable = localState.bindCatch(region.store.index, catchType,
+      codeItems[region.handler] && codeItems[region.handler].pc,
+      defaultCatchVariableName(region.entry.catch_type));
+    const catchLines = index + 1 < regions.length
+      ? renderRegion(index + 1)
+      : (() => {
+        const body = decompileRange(codeItems, region.handler + 1, sharedAfter, context, []);
+        return body.ok && !body.stack.length ? body.lines : null;
+      })();
+    localState.restoreBinding(priorBinding);
+    if (!catchLines) return null;
+    const lines = ['try {'];
+    indentLines(tryBody.lines).forEach((line) => lines.push(line));
+    lines.push(`} catch (${catchType} ${catchVariable}) {`);
+    indentLines(catchLines).forEach((line) => lines.push(line));
+    lines.push('}');
+    return lines;
+  };
+
+  const nested = renderRegion(0);
+  if (!nested) return null;
+  const tail = decompileRange(codeItems, sharedAfter, codeItems.length, context, []);
+  if (!tail.ok || tail.stack.length) return null;
+  const lines = [...prefix.lines, ...nested, ...tail.lines];
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return lines;
+}
+
+// Multiple copies of one uninitialized reference may cross a branch and all
+// become initialized by either constructor call. Java source cannot name an
+// uninitialized object, so materialize the selected `new` expression first and
+// assign every saved alias after construction.
+function decompileDuplicateInitializationPattern(code, method, cls, localState) {
+  if ((code.exceptionTable || []).length) return null;
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const newIndex = codeItems.findIndex((item) => {
+    const instruction = getInstructionFromItem(item);
+    return instruction && instruction.op === 'new';
+  });
+  if (newIndex < 0) return null;
+  const executable = [];
+  for (let index = newIndex; index < codeItems.length && executable.length < 6; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (instruction && instruction.op !== 'nop') executable.push({ index, instruction });
+  }
+  if (executable.length < 5 || executable[0].instruction.op !== 'new'
+    || executable[1].instruction.op !== 'dup' || executable[2].instruction.op !== 'dup2') return null;
+  const aliasStore = parseStoreIndex(executable[3].instruction.op, executable[3].instruction.arg);
+  if (!aliasStore || aliasStore.type !== 'Object' || executable[4].instruction.op !== 'pop') return null;
+
+  const branchIndex = findNextConditionalBranch(codeItems, executable[4].index + 1, codeItems.length);
+  if (branchIndex < 0) return null;
+  const branch = getInstructionAt(codeItems, branchIndex);
+  const falseStart = labelIndex.get(branch.arg);
+  if (falseStart === undefined || falseStart <= branchIndex) return null;
+  const trueGotoIndex = previousExecutableIndex(codeItems, falseStart, branchIndex + 1);
+  const trueGoto = trueGotoIndex < 0 ? null : getInstructionAt(codeItems, trueGotoIndex);
+  if (!trueGoto || (trueGoto.op !== 'goto' && trueGoto.op !== 'goto_w')) return null;
+  const joinIndex = labelIndex.get(trueGoto.arg);
+  if (joinIndex === undefined || joinIndex <= falseStart) return null;
+  const trueInvokeIndex = previousExecutableIndex(codeItems, trueGotoIndex, branchIndex + 1);
+  const falseInvokeIndex = previousExecutableIndex(codeItems, joinIndex, falseStart);
+  const trueInvoke = trueInvokeIndex < 0 ? null : getInstructionAt(codeItems, trueInvokeIndex);
+  const falseInvoke = falseInvokeIndex < 0 ? null : getInstructionAt(codeItems, falseInvokeIndex);
+  if (!trueInvoke || !falseInvoke || trueInvoke.op !== 'invokespecial' || falseInvoke.op !== 'invokespecial') return null;
+  let trueRef;
+  let falseRef;
+  try {
+    trueRef = parseMemberRef(trueInvoke.arg);
+    falseRef = parseMemberRef(falseInvoke.arg);
+  } catch (_err) {
+    return null;
+  }
+  const owner = executable[0].instruction.arg;
+  if (trueRef.owner !== owner || falseRef.owner !== owner
+    || trueRef.name !== '<init>' || falseRef.name !== '<init>') return null;
+
+  const context = { method, cls, localState, labelIndex, exceptionTable: [] };
+  const prefix = decompileRange(codeItems, 0, newIndex, context, []);
+  if (!prefix.ok || prefix.stack.length) return null;
+  const condition = evaluateConditionPrefix(codeItems, executable[4].index + 1,
+    branchIndex, context, [], true);
+  if (!condition || condition.prefixLines.length) return null;
+  const trueDescriptor = parseDescriptor(trueRef.descriptor);
+  const falseDescriptor = parseDescriptor(falseRef.descriptor);
+  const trueStack = evaluateStackOnlyRange(codeItems, branchIndex + 1, trueInvokeIndex,
+    context, condition.stack.slice());
+  const falseStack = evaluateStackOnlyRange(codeItems, falseStart, falseInvokeIndex,
+    context, condition.stack.slice());
+  if (!trueStack || !falseStack || trueStack.length !== trueDescriptor.params.length
+    || falseStack.length !== falseDescriptor.params.length) return null;
+  const trueArgs = trueStack.map((value, index) =>
+    coerceExpressionForType(value, trueDescriptor.params[index]).code);
+  const falseArgs = falseStack.map((value, index) =>
+    coerceExpressionForType(value, falseDescriptor.params[index]).code);
+  const ownerType = javaTypeFromInternalName(owner);
+  const selected = conditionalExpr(condition.condition,
+    expr(`new ${ownerType}(${trueArgs.join(', ')})`, ownerType),
+    expr(`new ${ownerType}(${falseArgs.join(', ')})`, ownerType), ownerType);
+  const constructedName = localState.nextSyntheticName('initializedValue');
+  const aliasLine = localState.store(aliasStore.index, ownerType,
+    expr(constructedName, ownerType), codeItems[executable[3].index] && codeItems[executable[3].index].pc);
+  const tail = decompileRange(codeItems, joinIndex, codeItems.length, context,
+    [expr(constructedName, ownerType)]);
+  if (!tail.ok || tail.stack.length) return null;
+  const lines = [...prefix.lines, `${ownerType} ${constructedName} = ${selected.code};`, aliasLine, ...tail.lines];
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return lines;
+}
+
+function decompileStoredUninitializedNonNullPattern(code, method, cls, localState) {
+  const rows = code.exceptionTable || [];
+  if (rows.some((entry) => Number(entry.start_pc) !== Number(entry.handler_pc))) return null;
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const newIndex = codeItems.findIndex((item) => {
+    const instruction = getInstructionFromItem(item);
+    return instruction && instruction.op === 'new';
+  });
+  if (newIndex < 0) return null;
+  const owner = getInstructionAt(codeItems, newIndex).arg;
+  const storeIndex = nextExecutableIndex(codeItems, newIndex + 1);
+  const storeInstruction = storeIndex < 0 ? null : getInstructionAt(codeItems, storeIndex);
+  const store = storeInstruction && parseStoreIndex(storeInstruction.op, storeInstruction.arg);
+  if (!store || store.type !== 'Object') return null;
+
+  let branchIndex = -1;
+  for (let index = storeIndex + 1; index < codeItems.length; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction) continue;
+    if (instruction.op === 'ifnonnull') { branchIndex = index; break; }
+    const interveningLoad = parseLoadIndex(instruction.op, instruction.arg);
+    if (!['aconst_null', 'pop'].includes(instruction.op)
+      && (!interveningLoad || interveningLoad.index !== store.index)) return null;
+  }
+  if (branchIndex < 0) return null;
+  const target = labelIndex.get(getInstructionAt(codeItems, branchIndex).arg);
+  if (target === undefined || target <= branchIndex) return null;
+  const loadIndex = nextExecutableIndex(codeItems, target);
+  const load = loadIndex < 0 ? null : parseLoadIndex(
+    getInstructionAt(codeItems, loadIndex).op, getInstructionAt(codeItems, loadIndex).arg);
+  const dupIndex = nextExecutableIndex(codeItems, loadIndex + 1);
+  if (!load || load.type !== 'Object' || load.index !== store.index
+    || dupIndex < 0 || getInstructionAt(codeItems, dupIndex).op !== 'dup') return null;
+  let invokeIndex = -1;
+  let constructorRef = null;
+  for (let index = dupIndex + 1; index < codeItems.length; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction) continue;
+    if (instruction.op !== 'invokespecial') continue;
+    try { constructorRef = parseMemberRef(instruction.arg); } catch (_err) { return null; }
+    invokeIndex = index;
+    break;
+  }
+  if (invokeIndex < 0 || constructorRef.owner !== owner || constructorRef.name !== '<init>') return null;
+  const constructorDescriptor = parseDescriptor(constructorRef.descriptor);
+  const context = { method, cls, localState, labelIndex, exceptionTable: rows };
+  const prefix = decompileRange(codeItems, 0, newIndex, context, []);
+  const args = evaluateStackOnlyRange(codeItems, dupIndex + 1, invokeIndex, context, []);
+  if (!prefix.ok || prefix.stack.length || !args || args.length !== constructorDescriptor.params.length) return null;
+  const renderedArgs = args.map((value, index) =>
+    coerceExpressionForType(value, constructorDescriptor.params[index]).code);
+  const ownerType = javaTypeFromInternalName(owner);
+  const aliasName = localState.nextSyntheticName('initializedValue');
+  const aliasLine = `${ownerType} ${aliasName} = new ${ownerType}(${renderedArgs.join(', ')});`;
+  const tail = decompileRange(codeItems, invokeIndex + 1, codeItems.length, context,
+    [expr(aliasName, ownerType)]);
+  if (!tail.ok || tail.stack.length) return null;
+  const lines = [...prefix.lines, aliasLine, ...tail.lines];
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return lines;
+}
+
+function decompileFallthroughExceptionHandlerJoin(code, method, cls, localState) {
+  const entries = code.exceptionTable || [];
+  if (entries.length !== 1) return null;
+  const entry = entries[0];
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const start = labelIndex.get(entry.startLbl || entry.startLabel);
+  const end = labelIndex.get(entry.endLbl || entry.endLabel);
+  const handler = labelIndex.get(entry.handlerLbl || entry.handlerLabel);
+  if (start === undefined || end === undefined || handler === undefined || handler <= end) return null;
+  const firstHandlerInstruction = getInstructionAt(codeItems, handler);
+  if (!firstHandlerInstruction || parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg)) return null;
+  for (let index = end; index < handler; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction) continue;
+    if (isConditionalBranch(instruction.op) || instruction.op === 'goto' || instruction.op === 'goto_w'
+      || instruction.op === 'athrow' || instruction.op === 'return' || RETURN_OPS.has(instruction.op)) return null;
+  }
+  const catchValue = entry.catch_type || entry.catchType;
+  const catchType = !catchValue || catchValue === 'any'
+    ? 'Throwable' : javaTypeFromInternalName(catchValue);
+  const context = { method, cls, localState, labelIndex, exceptionTable: entries };
+  const prefix = decompileRange(codeItems, 0, start, context, []);
+  if (!prefix.ok) return null;
+  const normal = decompileRange(codeItems, start, handler, context, prefix.stack.slice());
+  if (!normal.ok) return null;
+  const tail = decompileRange(codeItems, handler, codeItems.length, context, []);
+  if (!tail.ok) return null;
+  const caughtName = localState.nextSyntheticName('ignoredException');
+  const lines = [...prefix.lines, 'try {'];
+  indentLines(normal.lines).forEach((line) => lines.push(line));
+  lines.push(`} catch (${catchType} ${caughtName}) {`, '}');
+  tail.lines.forEach((line) => lines.push(line));
+  if (lines[lines.length - 1] === 'return;') lines.pop();
+  return lines;
+}
+
+// A handler PC may also be the normal successor of its protected range. On the
+// normal edge the operand stack carries the protected expression's result; on
+// the exceptional edge the JVM supplies the caught Throwable in that same
+// slot. This old-verifier shape appears in Krakatau's DoubleEdge test and is
+// naturally represented in Java as a value assignment in both try/catch arms.
+function decompileSharedExceptionStackJoin(code, method, cls, localState) {
+  const entries = code.exceptionTable || [];
+  if (entries.length !== 1) return null;
+  const entry = entries[0];
+  const catchTypeValue = entry.catch_type || entry.catchType;
+  if (catchTypeValue && catchTypeValue !== 'any'
+    && catchTypeValue !== 'java/lang/Throwable' && catchTypeValue !== 'java.lang.Throwable') return null;
+
+  const codeItems = code.codeItems || [];
+  const labelIndex = buildLabelIndex(codeItems);
+  const start = labelIndex.get(entry.startLbl || entry.startLabel);
+  const end = labelIndex.get(entry.endLbl || entry.endLabel);
+  const handler = labelIndex.get(entry.handlerLbl || entry.handlerLabel);
+  if (start === undefined || end === undefined || handler === undefined || handler !== end) return null;
+  const firstHandlerInstruction = getInstructionAt(codeItems, handler);
+  if (!firstHandlerInstruction || parseStoreIndex(firstHandlerInstruction.op, firstHandlerInstruction.arg)) return null;
+
+  const context = { method, cls, localState, labelIndex, exceptionTable: entries };
+  const prefix = decompileRange(codeItems, 0, start, context, []);
+  if (!prefix.ok) return null;
+  const tryBody = decompileRange(codeItems, start, end, context, prefix.stack.slice());
+  if (!tryBody.ok || tryBody.stack.length !== 1) return null;
+
+  const joinedName = localState.nextSyntheticName('exceptionJoin');
+  const caughtName = localState.nextSyntheticName('caughtException');
+  const normalValue = coerceExpressionForType(renderStoreExpression(tryBody.stack[0]), 'Object');
+  const tail = decompileRange(codeItems, handler, codeItems.length, context, [expr(joinedName, 'Object')]);
+  if (!tail.ok || tail.stack.length) return null;
+
+  const lines = [`Object ${joinedName} = null;`, ...prefix.lines, 'try {'];
+  indentLines(tryBody.lines).forEach((line) => lines.push(line));
+  lines.push(`    ${joinedName} = ${normalValue.code};`);
+  lines.push(`} catch (Throwable ${caughtName}) {`);
+  lines.push(`    ${joinedName} = ${caughtName};`);
+  lines.push('}');
+  tail.lines.forEach((line) => lines.push(line));
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return lines;
 }
@@ -6584,10 +7412,18 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   let constructorInvocation = null;
 
   function localKey(index, fallbackType = 'Object', forceReferenceVariant = false) {
-    if (initiallyDeclared.has(index)) return index;
     const type = simplifyType(fallbackType);
     const intCategory = new Set(['boolean', 'byte', 'char', 'short', 'int']);
     const primitiveKinds = new Set(['long', 'float', 'double']);
+    if (initiallyDeclared.has(index)) {
+      const initialType = simplifyType(types.get(index));
+      const bothIntCategory = intCategory.has(initialType) && intCategory.has(type);
+      const primitive = new Set([...intCategory, ...primitiveKinds]);
+      const bothReferences = !primitive.has(initialType) && !primitive.has(type);
+      const compatibleReference = bothReferences && (type === 'Object'
+        || isSourceReferenceTypeAssignable(initialType, type, exceptionModel));
+      if (initialType === type || bothIntCategory || compatibleReference) return index;
+    }
     // Slots in plainRefSlots hold references of more than one type on merging
     // control-flow paths; per-type variants would leave some paths writing a
     // variable the join never reads. Collapse every reference access to one
@@ -7410,7 +8246,10 @@ function simplifyType(type) {
 }
 
 function javaTypeFromInternalName(name) {
-  if (String(name || '').startsWith('[')) return descriptorToJavaType(name);
+  if (String(name || '').startsWith('[')
+    || (String(name || '').startsWith('L') && String(name || '').endsWith(';'))) {
+    return descriptorToJavaType(name);
+  }
   const internal = String(name || 'Object');
   const sourceName = /^(?:java|javax)\//.test(internal) ? internal.replace(/\$/g, '.') : internal;
   return simplifyType(sourceName.replace(/\//g, '.'));
@@ -7472,6 +8311,7 @@ function formatFloat(value) {
   if (Number.isNaN(value)) return 'Float.NaN';
   if (value === Infinity) return 'Float.POSITIVE_INFINITY';
   if (value === -Infinity) return 'Float.NEGATIVE_INFINITY';
+  if (Object.is(Number(value), -0)) return '-0.0f';
   const raw = String(value);
   return /[.eE]/.test(raw) ? `${raw}f` : `${raw}.0f`;
 }
@@ -7480,6 +8320,7 @@ function formatDouble(value) {
   if (Number.isNaN(value)) return 'Double.NaN';
   if (value === Infinity) return 'Double.POSITIVE_INFINITY';
   if (value === -Infinity) return 'Double.NEGATIVE_INFINITY';
+  if (Object.is(Number(value), -0)) return '-0.0';
   const raw = String(value);
   return /[.eE]/.test(raw) ? raw : `${raw}.0`;
 }
@@ -7519,5 +8360,10 @@ module.exports = {
     removeImpossibleCheckedCatchBlocks,
     requireRenderedTypeImport,
     simplifyBitwiseComplementComparison,
+    detectObfuscationGuards,
+    formatDouble,
+    formatFloat,
+    javaTypeFromInternalName,
+    normalizeLegacyClassFile,
   },
 };

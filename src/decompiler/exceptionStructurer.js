@@ -66,7 +66,7 @@ const REGION_EXIT_LABEL = 'RegionExit';
  * order (source catch order / JVM priority). Returns `{ groups }` or throws a
  * Bail for a shape we don't handle.
  */
-function normalizeTable(exceptionTable, syncHandlers) {
+function normalizeTable(exceptionTable, syncHandlers, isCatchAssignable = null) {
   const isSyncHandler = (handlerPc) => !!(syncHandlers && syncHandlers.has(handlerPc));
   const rows = [];
   for (const e of exceptionTable) {
@@ -150,22 +150,32 @@ function normalizeTable(exceptionTable, syncHandlers) {
     group.catches.push({ catch_type: item.catch_type, handler_pc: item.handler_pc });
   }
   const mergeSameHandlerCatches = (group) => {
-    const byHandler = new Map();
     const catches = [];
     for (const item of group.catches || []) {
-      let merged = byHandler.get(item.handler_pc);
-      if (!merged) {
+      let merged = catches[catches.length - 1];
+      // Only adjacent rows may become one multi-catch. Reusing a handler after
+      // an intervening row is a priority table (A->H1, B->H2, C->H1); merging
+      // the two H1 rows would move C ahead of B and change JVM semantics.
+      if (!merged || merged.handler_pc !== item.handler_pc) {
         merged = { handler_pc: item.handler_pc, catchTypes: [] };
-        byHandler.set(item.handler_pc, merged);
         catches.push(merged);
       }
       const types = Array.isArray(item.catch_type) ? item.catch_type : [item.catch_type];
       for (const type of types) if (!merged.catchTypes.includes(type)) merged.catchTypes.push(type);
     }
-    group.catches = catches.map((item) => ({
+    group.catches = catches.map((item) => {
+      const catchTypes = item.catchTypes.filter((type, index, all) => !all.some((candidate, candidateIndex) => {
+        if (candidateIndex === index) return false;
+        if (candidate == null || candidate === 0 || candidate === 'any') return true;
+        if (type == null || type === 0 || type === 'any') return false;
+        return isCatchAssignable ? isCatchAssignable(type, candidate) : catchTypesSubsumes(
+          renderCatchTypes(candidate), renderCatchTypes(type));
+      }));
+      return {
       handler_pc: item.handler_pc,
-      catch_type: item.catchTypes.length === 1 ? item.catchTypes[0] : item.catchTypes,
-    }));
+      catch_type: catchTypes.length === 1 ? catchTypes[0] : catchTypes,
+      };
+    });
     return group;
   };
   return { groups: [...groups, ...syncGroups].map(mergeSameHandlerCatches) };
@@ -221,10 +231,12 @@ const CATCH_TYPE_ANCESTORS = new Map([
 /** True when a `catch (earlier)` clause makes a following `catch (later)`
  * unreachable for javac: same type, catch-all Throwable, or a known JRE
  * ancestor/descendant pair. */
-function catchTypesSubsumes(earlierTypes, laterTypes) {
+function catchTypesSubsumes(earlierTypes, laterTypes, isCatchAssignable = null) {
   return earlierTypes.some((earlierType) => laterTypes.some((laterType) => {
     if (earlierType === laterType) return true;
     if (earlierType === 'java.lang.Throwable') return true;
+    if (isCatchAssignable && isCatchAssignable(
+      laterType.replace(/\./g, '/'), earlierType.replace(/\./g, '/'))) return true;
     return (CATCH_TYPE_ANCESTORS.get(laterType) || []).includes(earlierType);
   }));
 }
@@ -756,7 +768,8 @@ function structureMethodImpl(codeItems, exceptionTable, opts = {}) {
 }
 
 function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, opts = {}) {
-  const { groups } = normalizeTable(exceptionTable, opts.syncHandlers || null);
+  const { groups } = normalizeTable(
+    exceptionTable, opts.syncHandlers || null, opts.isCatchAssignable || null);
   if (groups.length === 0) {
     const { tree } = structure(methodCfg);
     return { ok: true, tree, render };
@@ -852,6 +865,7 @@ function structureWithExceptions(codeItems, exceptionTable, methodCfg, render, o
       overrides, allocId, emptyId, isNoThrowBlock, allHandlerPcs,
       synthetic, allocSelector,
       syncHandlers: opts.syncHandlers || null,
+      isCatchAssignable: opts.isCatchAssignable || null,
     }, (w) => { work = w; });
     if (bail instanceof Bail) return { ok: false, reason: bail.reason };
   }
@@ -926,10 +940,19 @@ function processGroup(work, group, ctx, commit) {
   // is a shared continuation of the try body, and excluding it would emit that
   // protected code outside the try, dropping its exception coverage.
   const tryset = new Set();
+  const isSynchronizedGroup = (group.catches || []).some((item) =>
+    ctx.syncHandlers && ctx.syncHandlers.has(item.handler_pc));
   for (let i = 0; i < n; i++) {
     const dominatedByHandler = i !== tryEntry
       && handlerLocals.some((h) => dominates(idom, h, i));
-    if (reachable[i] && !dominatedByHandler && inLogicalTryRange(work.startPc[i], group)) tryset.add(i);
+    // Preserve the exception table's exact half-open ranges. A shared handler
+    // can own several disjoint ranges (notably try-with-resources cleanup); the
+    // gap between them may call close() and must not be caught by that same
+    // cleanup handler or the resource is closed a second time.
+    const insideProtectedBody = isSynchronizedGroup
+      ? inLogicalTryRange(work.startPc[i], group)
+      : inAnyRange(work.startPc[i], group.ranges || []);
+    if (reachable[i] && !dominatedByHandler && insideProtectedBody) tryset.add(i);
   }
   if (!tryset.has(tryEntry)) return new Bail('try entry is outside its own range');
 
@@ -1134,7 +1157,8 @@ function processGroup(work, group, ctx, commit) {
     for (;;) {
       const siblings = tryNode.catches;
       const shadowed = siblings.findIndex((item, index) => index > 0
-        && siblings.slice(0, index).some((earlier) => catchTypesSubsumes(earlier.types, item.types)));
+        && siblings.slice(0, index).some((earlier) => catchTypesSubsumes(
+          earlier.types, item.types, ctx.isCatchAssignable)));
       if (shadowed <= 0) break;
       tryNode = {
         t: 'try',

@@ -521,6 +521,9 @@ function convertJson(inputJson, constantPool) {
             break;
 
           case "goto":
+          case "goto_w":
+          case "jsr":
+          case "jsr_w":
           case "ifnonnull":
           case "ifne":
           case "if_icmpge":
@@ -635,6 +638,7 @@ function convertJson(inputJson, constantPool) {
           case "fload":
           case "dstore":
           case "dload":
+          case "ret":
             // Instructions that take a local variable index
             codeItem.instruction = {
               op: instr.opcodeName,

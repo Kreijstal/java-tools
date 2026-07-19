@@ -309,3 +309,16 @@ test('sync handler and real catch on a shared range split into separate groups',
   assert.equal(nested.length, 2);
   assert.ok(nested.every((g) => g.catches.length === 1));
 });
+
+test('same-handler multi-catch drops alternatives covered by a broader type', () => {
+  const { normalizeTable } = require('../src/decompiler/exceptionStructurer');
+  const et = [
+    { start_pc: 0, end_pc: 4, handler_pc: 8, catch_type: 'Child' },
+    { start_pc: 0, end_pc: 4, handler_pc: 8, catch_type: 'Parent' },
+    { start_pc: 0, end_pc: 4, handler_pc: 8, catch_type: 'Unrelated' },
+  ];
+  const isAssignable = (subtype, supertype) => subtype === supertype
+    || (subtype === 'Child' && supertype === 'Parent');
+  const { groups } = normalizeTable(et, null, isAssignable);
+  assert.deepEqual(groups[0].catches[0].catch_type, ['Parent', 'Unrelated']);
+});

@@ -1384,10 +1384,15 @@ const STACK_MAP_KIND_ALIASES = {
   same: 'same',
   sameframe: 'same',
   'same_locals_1_stack_item': 'same_locals_1_stack_item',
+  samelocals1stackitem: 'same_locals_1_stack_item',
+  stack1: 'same_locals_1_stack_item',
   'samlocals1stackitem': 'same_locals_1_stack_item',
   'same_locals_1_stack_item_frame': 'same_locals_1_stack_item',
+  samelocals1stackitemframe: 'same_locals_1_stack_item',
   'samestack': 'same_locals_1_stack_item',
   'same_locals_1_stack_item_extended': 'same_locals_1_stack_item_extended',
+  samelocals1stackitemextended: 'same_locals_1_stack_item_extended',
+  stack1extended: 'same_locals_1_stack_item_extended',
   'sameextended': 'same_extended',
   'same_frame_extended': 'same_extended',
   append: 'append',
@@ -1409,7 +1414,10 @@ function normalizeStackMapFrame(frame, labelOffsets, builder, index) {
   let kind = null;
   let offsetDelta = frame.offsetDelta ?? frame.offset_delta ?? frame.delta ?? frame.offset ?? frameData.offset_delta ?? frameData.offsetDelta ?? frameData.offset;
   let localsRaw = frame.locals ?? frame.localTypes ?? frame.localsTypes ?? frameData.locals;
-  let stackRaw = frame.stack ?? frame.stackItems ?? frame.stack_types ?? frameData.stack ?? frameData.stack_items;
+  // Krakatau assembly spells these frames as `stack_1 <vtype>` and stores the
+  // sole stack entry in `vtype`, rather than in a one-element `stack` array.
+  let stackRaw = frame.stack ?? frame.stackItems ?? frame.stack_types ?? frame.vtype
+    ?? frameData.stack ?? frameData.stack_items ?? frameData.vtype;
   let chopCount = frame.chop ?? frame.localsToDrop ?? frame.chopped ?? frame.count ?? frameData.chop ?? frameData.locals_to_drop ?? frameData.localsToDrop;
 
   if (typeof rawType === 'number') {

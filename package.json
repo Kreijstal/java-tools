@@ -20,7 +20,8 @@
     "lint:jasmin": "node scripts/jvm-cli.js lint",
     "cfr": "node scripts/runCfr.js",
     "compile:java": "node scripts/compileJava.js",
-    "test:cfr": "node node_modules/tape/bin/tape test/cfrIntegration.test.js test/cfrFixtures.test.js test/cfrStructuredFeatures.test.js test/cfrAdditionalFeatures.test.js test/cfrStackOrdering.test.js",
+    "test:cfr": "node node_modules/tape/bin/tape test/cfrIntegration.test.js test/cfrFixtures.test.js test/cfrStructuredFeatures.test.js test/cfrAdditionalFeatures.test.js test/cfrStackOrdering.test.js test/cfrObfuscationGuards.test.js",
+    "test:krakatau-decompiler": "node scripts/run-krakatau-decompiler-tests.js",
     "test:java-frontend": "node node_modules/tape/bin/tape test/javaFrontendAst.test.js test/javaFrontendPassManager.test.js test/javaFrontendCfg.test.js test/javaFrontendCfgJoinStubs.test.js test/javaFrontendExpectedPassStubs.test.js test/javaFrontendIr.test.js test/javaFrontendHelloWorldCompile.test.js test/javaFrontendAllJavaCompile.test.js"
   },
   "keywords": [],

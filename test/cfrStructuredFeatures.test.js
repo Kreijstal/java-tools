@@ -183,7 +183,7 @@ Linit2: return
 .method public dispatch : (I)I
     .code stack 1 locals 2
 L0: iload_1
-L1: tableswitch 0
+L1: tableswitch 1
 Lcase0
 Lcase1
 default : Ldefault
@@ -305,11 +305,11 @@ test('CFR-JS reconstructs tableswitch and lookupswitch blocks', (t) => {
     const source = decompileSwitchFeatureFixture(tempDir);
 
     t.notOk(/^\s*\/\/\s*(tableswitch|lookupswitch)\b/m.test(source), 'switch bytecode does not fall back to raw comments');
-    t.match(source, /public int dispatch\(int key\) \{\s*switch \(key\) \{\s*case 0:\s*return 10;\s*case 1:\s*return 20;\s*default:\s*return -1;\s*}\s*}/, 'tableswitch is reconstructed as a switch statement');
+    t.match(source, /public int dispatch\(int key\) \{\s*switch \(key\) \{\s*case 1:\s*return 10;\s*case 2:\s*return 20;\s*default:\s*return -1;\s*}\s*}/, 'tableswitch is reconstructed with its non-zero low key');
     t.match(source, /public int lookup\(int key\) \{\s*switch \(key\) \{\s*case 10:\s*return 1;\s*case 100:\s*return 2;\s*default:\s*return -1;\s*}\s*}/, 'lookupswitch is reconstructed as a switch statement');
     t.match(source, /public void syntheticSwitch\(int key\) \{\s*switch \(key\) \{\s*case 0:\s*System\.out\.println\("zero"\);\s*break;\s*case 1:\s*System\.out\.println\("one"\);\s*break;\s*default:\s*System\.out\.println\("other"\);\s*}\s*}/, 'if-chain switch lowering is reconstructed as a switch statement');
-    t.match(source, /case 0:/, 'tableswitch low case is emitted');
-    t.match(source, /case 1:/, 'tableswitch contiguous case is emitted');
+    t.match(source, /case 1:/, 'tableswitch low case is emitted');
+    t.match(source, /case 2:/, 'tableswitch contiguous case is emitted');
     t.match(source, /case 10:/, 'lookupswitch sparse case is emitted');
     t.match(source, /case 100:/, 'lookupswitch second sparse case is emitted');
     t.match(source, /default:/, 'default switch label is emitted');

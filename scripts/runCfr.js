@@ -15,13 +15,21 @@ function usage(exitCode) {
   stream.write(`  --silent                  Accepted for CFR CLI compatibility\n`);
   stream.write(`  --classpath <path>        Classpath used for hierarchy/type resolution\n`);
   stream.write(`  --diagnostics-json <file> Write machine-readable fallback diagnostics\n`);
+  stream.write(`  --detect-obfuscation-guards Report hostile overrides such as throwing toString methods\n`);
   stream.write(`  --fail-on-fallback        Exit non-zero on any method/source fallback\n`);
   stream.write(`  --help, -h                Show this help text\n`);
   process.exit(exitCode);
 }
 
 function parseArgs(argv) {
-  const options = { outputDir: null, omitHeader: false, classpath: '', diagnosticsJson: '', failOnFallback: false };
+  const options = {
+    outputDir: null,
+    omitHeader: false,
+    classpath: '',
+    diagnosticsJson: '',
+    detectObfuscationGuards: false,
+    failOnFallback: false,
+  };
   const positional = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -43,6 +51,8 @@ function parseArgs(argv) {
     } else if (arg === '--diagnostics-json') {
       if (i + 1 >= argv.length) throw new Error(`${arg} requires a file`);
       options.diagnosticsJson = argv[++i];
+    } else if (arg === '--detect-obfuscation-guards') {
+      options.detectObfuscationGuards = true;
     } else if (arg === '--fail-on-fallback') {
       options.failOnFallback = true;
     } else if (arg === '--removeboilerplate') {
@@ -66,9 +76,13 @@ function parseArgs(argv) {
 
 function collectDiagnostics(outputs) {
   const files = [];
+  const obfuscationGuards = [];
   const totals = { stackUnderflow: 0, rawControlFlow: 0, placeholders: 0, stateMachineFallback: 0 };
   for (const { name, source, diagnostics = [] } of outputs) {
     const stateMachineFallbacks = diagnostics.filter((item) => item && item.kind === 'stateMachineFallback');
+    for (const guard of diagnostics.filter((item) => item && item.kind === 'obfuscationGuard')) {
+      obfuscationGuards.push({ name, ...guard });
+    }
     const counts = {
       stackUnderflow: (source.match(/stack-underflow/g) || []).length,
       rawControlFlow: (source.match(/^\s*\/\/\s*(?:if|goto|tableswitch|lookupswitch)\b/gm) || []).length,
@@ -88,6 +102,7 @@ function collectDiagnostics(outputs) {
     panics,
     totals,
     files,
+    obfuscationGuards,
   };
 }
 
@@ -107,6 +122,11 @@ async function main() {
   }
   const outputs = await decompilePath(inputPath, options);
   const diagnostics = collectDiagnostics(outputs);
+  if (options.detectObfuscationGuards) {
+    for (const guard of diagnostics.obfuscationGuards) {
+      console.error(`OBFUSCATION_GUARD ${guard.className}.${guard.methodName}${guard.descriptor}: ${guard.message}`);
+    }
+  }
   if (options.diagnosticsJson) {
     fs.mkdirSync(path.dirname(path.resolve(options.diagnosticsJson)), { recursive: true });
     fs.writeFileSync(options.diagnosticsJson, `${JSON.stringify(diagnostics, null, 2)}\n`, 'utf8');

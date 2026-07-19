@@ -163,6 +163,19 @@ L1: athrow
 .end class
 `;
 
+const NULL_THROW = `.version 52 0
+.class public super NullThrow
+.super java/lang/Object
+
+.method public static fail : ()V
+    .code stack 1 locals 0
+L0: aconst_null
+L1: athrow
+    .end code
+.end method
+.end class
+`;
+
 const REFERENCE_BRANCH_JOIN = `.version 52 0
 .class public super ReferenceBranchJoin
 .super java/lang/Object
@@ -313,6 +326,18 @@ test('broad athrow preserves the original Throwable without a runtime downcast',
     t.match(source, /private static <T extends Throwable> RuntimeException \$cfr\$sneakyThrow/,
       'class contains the generic rethrow helper');
     t.notOk(/throw \(RuntimeException\)/.test(source), 'no unconditional RuntimeException cast is emitted');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('null athrow preserves the direct throw site', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-null-throw-'));
+  try {
+    const source = decompileFixture(tempDir, 'NullThrow', NULL_THROW);
+    t.match(source, /static void fail\(\) \{\s*throw null;\s*}/, 'null is thrown directly');
+    t.notOk(/\$cfr\$sneakyThrow/.test(source), 'no stack-trace-changing helper is emitted');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

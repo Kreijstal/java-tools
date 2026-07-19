@@ -7,6 +7,16 @@ const test = require('tape');
 const { assembleJasminSource } = require('../src/utils/jasminAssembly');
 const { decompileClassFile, _internals: cfrInternals } = require('../src/decompiler/cfr');
 
+test('CFR-JS preserves signed zero and descriptor-form class names', (t) => {
+  t.equal(cfrInternals.formatFloat(-0), '-0.0f', 'negative float zero keeps its sign');
+  t.equal(cfrInternals.formatDouble(-0), '-0.0', 'negative double zero keeps its sign');
+  t.equal(cfrInternals.javaTypeFromInternalName('Ljava/lang/Object;'), 'Object',
+    'descriptor-form JDK class name is normalized');
+  t.equal(cfrInternals.javaTypeFromInternalName('LLClassLiteralTest;'), 'LClassLiteralTest',
+    'descriptor-form default-package class name is normalized');
+  t.end();
+});
+
 test('rendered type imports omit fully qualified nested-type collisions', (t) => {
   const requiredImports = new Set();
   const options = { requiredImports };
@@ -700,6 +710,70 @@ L92: athrow
 .end class
 `;
 
+const SEQUENTIAL_TRY_GAP_JASMIN = `.version 52 0
+.class public super ArrayRegression
+.super java/lang/Object
+
+.method public <init> : ()V
+    .code stack 1 locals 1
+        aload_0
+        invokespecial Method java/lang/Object <init> ()V
+        return
+    .end code
+.end method
+
+.method public static main : ([Ljava/lang/String;)V
+    .code stack 3 locals 6
+        .catch java/lang/Throwable from LtryOneStart to LtryOneEnd using LhandlerOne
+        .catch java/lang/ArrayStoreException from LtryTwoStart to LtryTwoEnd using LhandlerTwo
+        iconst_1
+        anewarray java/lang/Object
+        astore_1
+LtryOneStart: aload_1
+        iconst_0
+        aconst_null
+        aastore
+LtryOneEnd: goto LafterOne
+LhandlerOne: astore 4
+        getstatic Field java/lang/System out Ljava/io/PrintStream;
+        ldc "first"
+        invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+LafterOne: aload_1
+        invokevirtual Method [Ljava/lang/Object; clone ()Ljava/lang/Object;
+        invokestatic Method ArrayRegression foo (Ljava/lang/Object;)V
+        getstatic Field java/lang/System out Ljava/io/PrintStream;
+        ldc "middle"
+        invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+        aload_0
+        arraylength
+        ifle LfalseArray
+        iconst_1
+        anewarray java/lang/String
+        goto LarrayJoin
+LfalseArray: iconst_2
+        anewarray java/lang/Integer
+LarrayJoin: astore_3
+LtryTwoStart: aload_3
+        iconst_0
+        ldc "value"
+        aastore
+LtryTwoEnd: goto Ldone
+LhandlerTwo: astore 5
+        getstatic Field java/lang/System out Ljava/io/PrintStream;
+        ldc "second"
+        invokevirtual Method java/io/PrintStream println (Ljava/lang/String;)V
+Ldone: return
+    .end code
+.end method
+
+.method public static foo : (Ljava/lang/Object;)V
+    .code stack 0 locals 1
+        return
+    .end code
+.end method
+.end class
+`;
+
 function withTempDir(prefix, fn) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   try {
@@ -708,6 +782,19 @@ function withTempDir(prefix, fn) {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 }
+
+test('CFR-JS preserves code between sequential try/catch regions', (t) => {
+  t.plan(4);
+  withTempDir('cfr-sequential-try-gap-', (tempDir) => {
+    const source = decompileFixture(tempDir, 'ArrayRegression', SEQUENTIAL_TRY_GAP_JASMIN);
+    t.notOk(/^\s*\/\/\s*(?:if|goto)\b/m.test(source), 'fixture decompiles without raw control flow');
+    t.match(source, /System\.out\.println\("middle"\);/, 'ordinary code between protected regions is retained');
+    t.match(source, /foo\(\(Object\) [^;]*\.clone\(\)\);/,
+      'array clone retains the Object return type selected by the bytecode descriptor');
+    t.match(source, /Object\[\] \w+ = \(Object\[\]\) \(Object\) \([^;]*\? new String\[1\] : new Integer\[2\]\);/,
+      'a refined ternary assignment casts the complete conditional expression');
+  });
+});
 
 function decompileFixture(tempDir, name, source) {
   const classPath = path.join(tempDir, `${name}.class`);
@@ -749,7 +836,7 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
     t.notOk(/new StringBuilder\(\)\.append/.test(source), 'string builder implementation detail is hidden');
     t.match(source, /int\[\] (\w+) = null;[\s\S]*?\1 = \(int\[\]\) \(\w+\);[\s\S]*?\1\[0\]/,
       'primitive array opcodes refine an Object[] carrier to the verifier array type');
-    t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) \(Object\) \w+;/,
+    t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) \(Object\) \(\w+\);/,
       'post-emission Object[] refinement casts earlier Object assignments');
     t.match(source, /int booleanOrOne\(boolean param0, boolean param1\) \{\s*return param0 \? 1 : \(?param1 \? 1 : 0\)?;\s*}/,
       'mixed int/boolean ternary branches materialize verifier booleans as ints');

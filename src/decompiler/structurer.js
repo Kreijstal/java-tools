@@ -544,7 +544,8 @@ function buildCfgFromCode(codeItems, forcedLeaderLabels = [], forcedLeaderPcs = 
     } else if (CFG_TERMINAL.has(op)) {
       t = { kind: 'return' };
     } else if (op === 'tableswitch') {
-      const cases = (insn.labels || []).map((l, i) => ({ key: i, target: blockOfLabel(l) }));
+      const low = Number(insn.low || 0);
+      const cases = (insn.labels || []).map((l, i) => ({ key: low + i, target: blockOfLabel(l) }));
       t = { kind: 'switch', cases, default: insn.defaultLbl != null ? blockOfLabel(insn.defaultLbl) : null };
     } else if (op === 'lookupswitch' && insn.arg && typeof insn.arg === 'object') {
       const cases = (insn.arg.pairs || []).filter(Array.isArray).map((p) => ({ key: p[0], target: blockOfLabel(p[1]) }));

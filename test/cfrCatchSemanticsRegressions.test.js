@@ -38,6 +38,36 @@ function decompileFixture(tempDir, name, source) {
   return decompileClassFile(classPath);
 }
 
+const SHARED_HANDLER_JOIN_JASMIN = `.version 52 0
+.class public super SharedHandlerJoin
+.super java/lang/Object
+
+.method public static main : ([Ljava/lang/String;)V
+    .code stack 2 locals 1
+        .catch any from Lprotected to Ljoin using Ljoin
+        aload_0
+        iconst_0
+Lprotected: aaload
+Ljoin: getstatic Field java/lang/System out Ljava/io/PrintStream;
+        swap
+        invokevirtual Method java/io/PrintStream println (Ljava/lang/Object;)V
+        return
+    .end code
+.end method
+.end class
+`;
+
+test('CFR-JS joins normal and exceptional stack values at a shared handler PC', (t) => {
+  t.plan(3);
+  withTempDir('cfr-shared-handler-join-', (tempDir) => {
+    const source = decompileFixture(tempDir, 'SharedHandlerJoin', SHARED_HANDLER_JOIN_JASMIN);
+    t.match(source, /Object ([\w$]+) = null;\s*try \{\s*\1 = args\[0\];\s*} catch \(Throwable ([\w$]+)\) \{\s*\1 = \2;\s*}/,
+      'the protected result and caught exception assign one Java join value');
+    t.match(source, /System\.out\.println\([\w$]+\);/, 'the shared tail consumes the joined value');
+    t.notOk(/while \(true\)/.test(source), 'normal completion does not become an infinite state loop');
+  });
+});
+
 // Two checked handlers over one protected range whose types no call in the
 // range declares -- the obfuscator's undeclared-throw idiom. javac cannot prove
 // either is reachable, which is what used to trigger the widening.
@@ -131,7 +161,7 @@ test('CFR-JS keeps the precise type of a javac-unprovable checked catch', (t) =>
 // assertions below differ in exactly one token, which is the whole point: a
 // strictly broader later row must keep the rethrow row, an equal-typed later
 // row (the obfuscator wrapper this pass exists to strip) must still drop it.
-function buildShieldFixture(rethrowCatchType) {
+function buildShieldFixture(rethrowCatchType, broaderCatchType = 'java/lang/Throwable') {
   return `.version 52 0
 .class public super ShieldTest
 .super java/lang/Object
@@ -153,7 +183,7 @@ L0: return
 .method public run : ()V
     .code stack 3 locals 3
         .catch ${rethrowCatchType} from Lstart to Lafter using Lrethrow
-        .catch java/lang/Throwable from Lstart to Lafter using Lbroad
+        .catch ${broaderCatchType} from Lstart to Lafter using Lbroad
         .catch java/io/IOException from Ltrivial to Ltrivend using Ltrivh
 Lstart: aload_0
 Ls1: invokevirtual Method ShieldTest work ()V
@@ -211,6 +241,16 @@ test('CFR-JS still drops a same-type catch-and-rethrow wrapper row', (t) => {
     t.notOk(/\$cfr\$sneakyThrow/.test(source),
       'the wrapper rethrow is not re-emitted as a duplicate handler');
   });
+});
+
+test('CFR-JS keeps a checked rethrow that shields its broader superclass catch', (t) => {
+  withTempDir('cfr-checked-rethrow-shield-', (tempDir) => {
+    const source = decompileFixture(tempDir, 'ShieldTest',
+      buildShieldFixture('java/net/MalformedURLException', 'java/lang/Exception'));
+    t.match(source, /catch \(\s*(?:java\.net\.)?MalformedURLException\b|instanceof\s+(?:java\.net\.)?MalformedURLException\b/,
+      'MalformedURLException is rethrown before the broader Exception handler');
+  });
+  t.end();
 });
 
 test('the unthrowable-checked-catch DCE treats an unresolvable callee as possibly-throwing', (t) => {
