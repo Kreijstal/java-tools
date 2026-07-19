@@ -457,3 +457,95 @@ test('dead-flag discovery: accepts terminal self-increment int sentinel when ena
   t.ok(enabled.fields.includes('client.G'));
   t.end();
 });
+
+// The "this write is unreachable" proof used to accept any earlier `ifeq` on a
+// candidate field whose branch target sat textually after the `putstatic`.
+// Textual order is not dominance: any goto, switch arm or exception-handler
+// edge can re-enter the region with the guard already bypassed, and the write
+// then executes. That is how `qd.Nb = wg.f` got deleted -- a live write
+// silently removed, leaving a genuinely dynamic field folded to false.
+test('dead-flag discovery: rejects a write reachable through a guard-bypassing edge', (t) => {
+  const consume = methodWith('consume', [
+    { instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+    { instruction: 'istore_1' },
+    { instruction: 'iload_1' },
+    { instruction: { op: 'ifne', arg: 'Lret' } },
+    { instruction: 'return' },
+    { labelDef: 'Lret:', instruction: 'return' },
+  ]);
+  const ast = astWithClasses([
+    { className: 'client', items: [staticField('A', 'Z'), consume] },
+    // hn.j is never written, so it is a candidate always-false flag and its
+    // `ifeq` is the guard the old textual check happily accepted.
+    { className: 'hn', items: [staticField('j', 'Z')] },
+    // Dyn.d is written unguarded, so it is not a candidate. Its branch is just
+    // an ordinary edge -- and it jumps straight past the guard into the store.
+    {
+      className: 'Dyn',
+      items: [staticField('d', 'Z'), methodWith('set', [
+        { instruction: 'iconst_1' },
+        { instruction: { op: 'putstatic', arg: ['Field', 'Dyn', ['d', 'Z']] } },
+        { instruction: 'return' },
+      ])],
+    },
+    {
+      className: 'Writer',
+      items: [methodWith('toggleA', [
+        { instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+        { instruction: 'istore_1' },
+        { instruction: { op: 'getstatic', arg: ['Field', 'Dyn', ['d', 'Z']] } },
+        { instruction: { op: 'ifne', arg: 'Lbypass' } },
+        { instruction: { op: 'getstatic', arg: ['Field', 'hn', ['j', 'Z']] } },
+        { instruction: { op: 'ifeq', arg: 'Lret' } },
+        { instruction: 'iload_1' },
+        { instruction: { op: 'ifeq', arg: 'Ltrue' } },
+        { instruction: 'iconst_0' },
+        { instruction: { op: 'goto', arg: 'Lstore' } },
+        { labelDef: 'Ltrue:', instruction: 'iconst_1' },
+        { instruction: { op: 'goto', arg: 'Lstore' } },
+        // Reached without ever evaluating the hn.j guard.
+        { labelDef: 'Lbypass:', instruction: 'iconst_1' },
+        { labelDef: 'Lstore:', instruction: { op: 'putstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+        { labelDef: 'Lret:', instruction: 'return' },
+      ])],
+    },
+  ]);
+  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.notOk(r.fields.includes('client.A'),
+    'a write the guard does not dominate keeps the field alive');
+  t.ok(r.rejected.includes('client.A'),
+    'the field is explicitly rejected rather than silently accepted');
+  t.end();
+});
+
+// A write that can only ever store zero cannot make the field true, so it needs
+// no reachability argument at all -- the CFG proof must not be the only way in.
+test('dead-flag discovery: accepts an unguarded write that can only store zero', (t) => {
+  const ast = astWithClasses([
+    {
+      className: 'client',
+      items: [staticField('A', 'Z'), methodWith('consume', [
+        { instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+        { instruction: 'istore_1' },
+        { instruction: 'iload_1' },
+        { instruction: { op: 'ifne', arg: 'Lret' } },
+        { instruction: 'return' },
+        { labelDef: 'Lret:', instruction: 'return' },
+      ])],
+    },
+    {
+      className: 'Writer',
+      items: [methodWith('clearA', [
+        { instruction: 'iconst_0' },
+        { instruction: { op: 'putstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+        { instruction: 'return' },
+      ])],
+    },
+  ]);
+  const r = discoverDeadStaticFlags(ast, { allowIntFlags: true });
+  t.ok(r.fields.includes('client.A'),
+    'a zero-only write does not defeat the always-false proof');
+  t.notOk(r.rejected.includes('client.A'),
+    'the zero-only write is not counted as a rejection either');
+  t.end();
+});
