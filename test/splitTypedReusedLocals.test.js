@@ -169,6 +169,61 @@ test('split-typed-reused-locals: permits primitive reuse outside candidate range
   t.end();
 });
 
+test('split-typed-reused-locals: preserves a seed that reaches a join around a conditional store', (t) => {
+  const makeAst = () => astWith([
+    { instruction: 'aconst_null' },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: { op: 'aload', arg: '0' } },
+    { instruction: { op: 'getfield', arg: ['Field', 'Demo', ['name', 'Ljava/lang/String;']] } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'ifeq', arg: 'LafterRank0' } },
+    { instruction: { op: 'new', arg: 'java/lang/StringBuilder' } },
+    { instruction: 'dup' },
+    { instruction: { op: 'invokespecial', arg: ['Method', 'java/lang/StringBuilder', ['<init>', '()V']] } },
+    { instruction: { op: 'ldc', arg: '<img=0>' } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/StringBuilder', ['append', '(Ljava/lang/String;)Ljava/lang/StringBuilder;']] } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/StringBuilder', ['append', '(Ljava/lang/String;)Ljava/lang/StringBuilder;']] } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/StringBuilder', ['toString', '()Ljava/lang/String;']] } },
+    { instruction: { op: 'astore', arg: '1' } },
+    { labelDef: 'LafterRank0', instruction: { op: 'new', arg: 'java/lang/StringBuilder' } },
+    { instruction: 'dup' },
+    { instruction: { op: 'invokespecial', arg: ['Method', 'java/lang/StringBuilder', ['<init>', '()V']] } },
+    { instruction: { op: 'ldc', arg: '<img=1>' } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/StringBuilder', ['append', '(Ljava/lang/String;)Ljava/lang/StringBuilder;']] } },
+    { instruction: { op: 'aload', arg: '1' } },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/StringBuilder', ['append', '(Ljava/lang/String;)Ljava/lang/StringBuilder;']] } },
+    { instruction: 'pop' },
+    { instruction: 'return' },
+  ]);
+  const ast = makeAst();
+
+  const result = runSplitTypedReusedLocals(ast, { preserveOriginalLocals: true });
+
+  t.equal(result.rewrites, 1);
+  t.deepEqual(opsAndArgs(ast).slice(2, 9), [
+    'aload 0',
+    'getfield Field,Demo,name,Ljava/lang/String;',
+    'astore_2',
+    'aload_2',
+    'astore_1',
+    'iconst_0',
+    'ifeq LafterRank0',
+  ]);
+  t.equal(opsAndArgs(ast)[14], 'aload_2', 'typed branch load uses the fresh local');
+  t.equal(opsAndArgs(ast)[23], 'aload 1', 'join load keeps the original local');
+
+  const skippedAst = makeAst();
+  const skipped = runSplitTypedReusedLocals(skippedAst, {
+    preserveOriginalLocals: true,
+    skipIfReachesUnrewrittenLoad: true,
+  });
+  t.equal(skipped.rewrites, 0, 'can reject a split whose seed still reaches an unrewritten join');
+  t.equal(opsAndArgs(skippedAst)[4], 'astore 1', 'rejected split leaves the original seed intact');
+  t.end();
+});
+
 test('split-typed-reused-locals: infers invoke argument type through later stack pushes', (t) => {
   const ast = astWith([
     { instruction: { op: 'aload', arg: '0' } },

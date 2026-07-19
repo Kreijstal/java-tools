@@ -66,6 +66,7 @@ function splitCodeOnce(code, options = {}) {
     if (storeIndex < 0) continue;
     const preserveOriginal = options.preserveOriginalLocals && (
       isBranchTarget(code, candidate.storeItem) ||
+      candidate.reachesUnrewrittenLoad ||
       hasUnrewrittenLoadBeforeNextStore(items, storeIndex, candidate.local, candidate.loads)
     );
     candidate.storeItem.instruction = storeRef(candidate.fresh);
@@ -161,13 +162,31 @@ function collectCandidates(code, analysis, options) {
       ? extendToAllReachedLoads(items, analysis, candidate)
       : candidate.loads).filter((load) =>
       !hasPrimitiveLocalWriteBetween(items, candidate.storeIndex, items.indexOf(load), candidate.local)),
+  })).map((candidate) => ({
+    ...candidate,
+    // A later conditional store can appear before a join in linear bytecode
+    // without dominating that join. In that case this definition still
+    // reaches an unrewritten load along the path that skips the store, so the
+    // original local must retain a copy of the split value.
+    reachesUnrewrittenLoad: reachesUnrewrittenLoad(items, analysis, candidate),
   })).filter((candidate) => {
     if (candidate.loads.length === 0) return false;
+    if (options.skipIfReachesUnrewrittenLoad && candidate.reachesUnrewrittenLoad) return false;
     if (!hasOtherReferenceStore(items, candidate.storeIndex, candidate.local) && !isPrimitiveArrayDescriptor(candidate.produced)) return false;
     if (hasPrimitiveLocalWriteBeforeLastCandidateLoad(items, candidate.storeIndex, candidate.local, candidate.loads)) return false;
     if (options.requireAllLoadsTyped && !allLoadsTypedForDef(items, analysis, candidate)) return false;
     return true;
   });
+}
+
+function reachesUnrewrittenLoad(items, analysis, candidate) {
+  const rewrittenLoads = new Set(candidate.loads);
+  for (let i = candidate.storeIndex + 1; i < items.length; i += 1) {
+    if (aloadLocal(items[i]) !== candidate.local || rewrittenLoads.has(items[i])) continue;
+    const reaching = analysis.before[i] && analysis.before[i].get(candidate.local);
+    if (reaching && reaching.has(candidate.defId)) return true;
+  }
+  return false;
 }
 
 function expectedTypeForLoad(items, index) {
