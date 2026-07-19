@@ -11,6 +11,7 @@ const { structureMethod } = require('./exceptionStructurer');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
+const { tokenizeJava } = require('../java-frontend/lexer');
 
 const VERSION = 'CFR-JS 0.4.0';
 const javaStatementParser = new JavaParser();
@@ -1917,8 +1918,19 @@ function isInstanceofTypeCompatible(sourceType, testedType, model) {
     || Boolean(testedInfo && (testedInfo.flags || []).includes('interface'));
 }
 
-function ensureCheckedCatchReachability(lines, code, model) {
-  if (!code || !(code.exceptionTable || []).length) return;
+// Checked catch types the bytecode exception table routes to even though no
+// instruction in the protected range declares a matching throw.
+//
+// This is the one analysis behind two opposite-looking decisions, so it lives in
+// one place. `ensureCheckedCatchReachability` injects an `if (false) throw (T)
+// null;` anchor for these types to satisfy javac's reachability rule, while
+// `removeImpossibleCheckedCatchBlocks` must *decline* to delete them: an
+// unattributable row is evidence the obfuscator throws the type without
+// declaring it, not evidence the handler is dead. Deriving both from this set
+// keeps one pass from deleting what the other is about to vouch for.
+function collectUnsupportedCheckedCatchTypes(code, model) {
+  const unsupportedSourceTypes = new Set();
+  if (!code || !(code.exceptionTable || []).length) return unsupportedSourceTypes;
   const generic = new Set([null, 0, 'any', 'java/lang/Throwable', 'java/lang/Exception',
     'java/lang/RuntimeException', 'java/lang/Error']);
   const entriesByType = new Map();
@@ -1928,7 +1940,6 @@ function ensureCheckedCatchReachability(lines, code, model) {
     if (!entriesByType.has(type)) entriesByType.set(type, []);
     entriesByType.get(type).push(entry);
   }
-  const unsupportedSourceTypes = new Set();
   for (const [catchType, entries] of entriesByType) {
     // Reuse the canonical classifier here. The corpus hierarchy generally
     // stops at the JDK boundary, so a plain assignability walk cannot discover
@@ -1951,6 +1962,12 @@ function ensureCheckedCatchReachability(lines, code, model) {
     }));
     if (!supported) unsupportedSourceTypes.add(javaTypeFromInternalName(catchType));
   }
+  return unsupportedSourceTypes;
+}
+
+function ensureCheckedCatchReachability(lines, code, model) {
+  if (!code || !(code.exceptionTable || []).length) return;
+  const unsupportedSourceTypes = collectUnsupportedCheckedCatchTypes(code, model);
   if (!unsupportedSourceTypes.size) return;
 
   const insertions = [];
@@ -2052,6 +2069,32 @@ function throwsTypesCoverSourceCatch(throwsTypes, catchSourceType, model) {
 // emitted source less structured. Under this explicitly gated source-cleanup
 // policy, a specific checked catch is live only when an emitted call declares
 // that type. Broad unchecked/Throwable families remain conservative.
+// True when some invoke inside a protected range for `catchSourceType` targets a
+// method the exception model cannot resolve, so its throws clause is unknown
+// rather than known-empty. `resolveMethodThrows` returns [] in both cases, and
+// the model indexes only corpus classes, so every JDK callee lands here.
+// Unknown must not be read as proof of no-throw.
+function protectedRangeHasUnresolvableInvoke(code, catchSourceType, model) {
+  if (!code || !(code.exceptionTable || []).length) return false;
+  const catchSimpleName = simpleClassName(String(catchSourceType || '').replace(/\./g, '/'));
+  const known = model && model.classInfo ? model.classInfo : null;
+  for (const entry of code.exceptionTable || []) {
+    const entryType = entry.catch_type ?? entry.catchType;
+    if (!entryType || entryType === 'any' || entryType === 0
+      || simpleClassName(String(entryType).replace(/\./g, '/')) !== catchSimpleName) continue;
+    for (const item of code.codeItems || []) {
+      const pc = Number(item && item.pc);
+      if (!Number.isFinite(pc) || pc < entry.start_pc || pc >= entry.end_pc) continue;
+      const instruction = getInstructionFromItem(item);
+      if (!instruction || !INVOKE_OPS.has(instruction.op)) continue;
+      let ref;
+      try { ref = parseMemberRef(instruction.arg); } catch (_error) { return true; }
+      if (!known || !known.has(ref.owner)) return true;
+    }
+  }
+  return false;
+}
+
 function protectedBytecodeRangeHasDeclaredThrower(code, catchSourceType, model) {
   if (!code || !(code.exceptionTable || []).length) return false;
   const catchSimpleName = simpleClassName(String(catchSourceType || '').replace(/\./g, '/'));
@@ -2081,14 +2124,35 @@ function protectedBytecodeRangeHasDeclaredThrower(code, catchSourceType, model) 
 
 function removeImpossibleCheckedCatchBlocks(lines, model, code = null) {
   if (process.env.PIPELINE_EXPERIMENTAL_UNTHROWABLE_CATCH_DCE !== '1') return;
+  // Types the exception table routes to without any declared thrower. javac
+  // calls these unreachable, but that is exactly the obfuscator's undeclared
+  // throw idiom, and normalizeStructuredCatchNodes now keeps their precise type
+  // rather than widening it to Exception. Widening used to mask them from
+  // isCheckedOnlyCatchSourceType below; without this guard the fix that
+  // preserved these handlers would hand them straight to this pass to delete.
+  const unattributableTypes = collectUnsupportedCheckedCatchTypes(code, model);
+  // The set is keyed by whatever form javaTypeFromInternalName produced, while a
+  // rendered catch may be written fully qualified. Compare on the simple name so
+  // `InterruptedException` and `java.lang.InterruptedException` are one key.
+  const unattributableSimpleNames = new Set(
+    [...unattributableTypes].map((type) => simpleClassName(String(type).replace(/\./g, '/'))));
   for (let tryIndex = lines.length - 1; tryIndex >= 0; tryIndex -= 1) {
     if (String(lines[tryIndex]).trim() !== 'try {') continue;
     const catchIndex = findMatchingCatchLine(lines, tryIndex);
     if (catchIndex < 0) continue;
     const declaration = localDeclarationsFromStatement(lines[catchIndex])[0];
     if (!declaration || !isCheckedOnlyCatchSourceType(declaration.type, model)) continue;
+    if (unattributableSimpleNames.has(
+      simpleClassName(String(declaration.type).replace(/\./g, '/')))) continue;
     if (sourceRangeHasDeclaredThrower(lines, tryIndex + 1, catchIndex, declaration.type, model)) continue;
     if (protectedBytecodeRangeHasDeclaredThrower(code, declaration.type, model)) continue;
+    // The exception model only indexes corpus classes, so resolveMethodThrows
+    // answers [] for every JDK method — indistinguishable from "declares no
+    // throws". javac compiles against the real JDK and knows better, so deleting
+    // a handler on that silence produces code javac then rejects with
+    // "unreported exception" (java.awt.MediaTracker.waitForAll in ck.<init>).
+    // Treat an unresolvable callee as possibly-throwing.
+    if (protectedRangeHasUnresolvableInvoke(code, declaration.type, model)) continue;
 
     let depth = 1;
     let catchEnd = -1;
@@ -2336,6 +2400,40 @@ function ensureMissingSyntheticDeclarations(lines) {
   if (missing.length) lines.unshift(...missing);
 }
 
+// Demote `Type name = ...` to `name = ...` by deleting the source range the type
+// occupies, located with the Java lexer rather than a pattern match. A regex
+// rewrite is unsafe here: synthetic names such as `dupTemp$13` contain `$`
+// followed by digits, which a replacement string reinterprets as a capture-group
+// backreference and splices the captured indentation into the middle of the name.
+function stripDeclarationType(source, name, inFor) {
+  const line = String(source);
+  let tokens;
+  try {
+    ({ tokens } = tokenizeJava(line));
+  } catch (_error) {
+    return line;
+  }
+  if (!Array.isArray(tokens) || !tokens.length) return line;
+
+  let typeStart = 0;
+  if (inFor) {
+    const forIndex = tokens.findIndex((token) => token.text === 'for');
+    if (forIndex < 0) return line;
+    const parenIndex = tokens.findIndex((token, index) => index > forIndex && token.text === '(');
+    if (parenIndex < 0) return line;
+    typeStart = parenIndex + 1;
+  }
+
+  const nameIndex = tokens.findIndex((token, index) => index >= typeStart
+    && token.kind === 'identifier'
+    && token.text === name
+    && tokens[index + 1] && tokens[index + 1].text === '=');
+  if (nameIndex <= typeStart) return line;
+
+  return line.slice(0, tokens[typeStart].range.startOffset)
+    + line.slice(tokens[nameIndex].range.startOffset);
+}
+
 function localDeclarationsFromStatement(source) {
   let statement;
   const trimmed = String(source).trim();
@@ -2435,16 +2533,7 @@ function hoistEscapingLocalDeclarations(lines, localState) {
 
     const type = localState.sourceTypeForName(declaration.name) || declaration.type;
     hoisted.set(declaration.name, type);
-    const typePattern = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (declaration.inFor) {
-      lines[i] = String(lines[i]).replace(
-        new RegExp(`(for\\s*\\(\\s*)${typePattern}\\s+${escaped}\\s*=`),
-        `$1${declaration.name} =`);
-    } else {
-      lines[i] = String(lines[i]).replace(
-        new RegExp(`^(\\s*)${typePattern}\\s+${escaped}\\s*=`),
-        `$1${declaration.name} =`);
-    }
+    lines[i] = stripDeclarationType(lines[i], declaration.name, declaration.inFor);
   }
   if (hoisted.size) {
     lines.unshift(...[...hoisted].map(([name, type]) => `${type} ${name} = ${defaultValueForType(type)};`));
@@ -2475,17 +2564,7 @@ function rewriteDuplicateLocalDeclarations(lines) {
     const declaration = declarations[0];
     if (declaration.inCatch || declaration.inResource) continue;
     if (!seen.has(declaration.name)) { seen.add(declaration.name); continue; }
-    const escapedName = declaration.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const escapedType = declaration.type.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    if (declaration.inFor) {
-      lines[i] = String(lines[i]).replace(
-        new RegExp(`(for\\s*\\(\\s*)${escapedType}\\s+${escapedName}\\s*=`),
-        `$1${declaration.name} =`);
-    } else {
-      lines[i] = String(lines[i]).replace(
-        new RegExp(`^(\\s*)${escapedType}\\s+${escapedName}\\s*=`),
-        `$1${declaration.name} =`);
-    }
+    lines[i] = stripDeclarationType(lines[i], declaration.name, declaration.inFor);
   }
 }
 
@@ -2661,6 +2740,17 @@ function lowerSynchronizedRegions(originalItems, exceptionTable) {
 // real protected regions without nesting, which defeats structuring. Return
 // the table minus those rows (the handler code itself stays; if normal flow
 // reaches it, it renders as a plain throw).
+//
+// "Semantic no-op" only holds while the rethrown exception lands where it
+// would have landed anyway. A rethrow row also *shields*: rows are searched in
+// table order, so a rethrow row R makes every later row overlapping R's range
+// unreachable for the exceptions R catches. The shield is invisible exactly
+// when R's handler pc sits inside that later row's own protected range -- then
+// the athrow re-dispatches into the very handler that would have caught the
+// exception without R. When it does not (e.g. the ThreadDeath-rethrow-before-
+// catch-Throwable idiom, where `catch (ThreadDeath t) { throw t; }` exists
+// solely to keep ThreadDeath out of the broad Throwable handler), dropping R
+// silently reroutes the exception into that broader handler. Keep those rows.
 function dropRethrowHandlerRows(codeItems, exceptionTable) {
   const indexOfPc = new Map();
   for (let i = 0; i < codeItems.length; i += 1) {
@@ -2685,7 +2775,61 @@ function dropRethrowHandlerRows(codeItems, exceptionTable) {
     return Boolean(store && store.type === 'Object' && load && load.index === store.index
       && run[2].op === 'athrow');
   };
-  return (exceptionTable || []).filter((row) => !isRethrowHandler(row.handler_pc));
+  const rows = exceptionTable || [];
+  const typeOf = (row) => {
+    const value = row.catch_type ?? row.catchType;
+    return value == null || value === 0 || value === 'any' ? null : String(value);
+  };
+  // Is `ancestor` a proper superclass of `descendant`? `null` means the
+  // catch-all `any`, which is a proper widening of every named type. Obfuscated
+  // (non-JRE) types resolve to no metadata, so they answer false and keep the
+  // pre-existing drop behaviour.
+  const isProperSupertype = (ancestor, descendant) => {
+    if (!descendant) return false;
+    if (!ancestor) return true;
+    if (ancestor === descendant) return false;
+    // Throwable roots the whole catchable hierarchy, so it widens every other
+    // named type. Stating it outright also covers types the JRE metadata index
+    // does not carry (java/lang/ThreadDeath among them).
+    if (ancestor === 'java/lang/Throwable') return true;
+    let current = descendant;
+    for (let guard = 0; guard < 64 && current; guard += 1) {
+      const info = jreClassInfo(current);
+      if (!info || !info.superName) return false;
+      current = info.superName;
+      if (current === ancestor) return true;
+    }
+    return false;
+  };
+  // A rethrow row R shields every later overlapping row from the exceptions R
+  // catches. The shield is invisible when R's handler pc sits inside that later
+  // row's range (the athrow re-dispatches straight into it), and it is
+  // immaterial when the later row catches the same type or narrower -- that is
+  // the obfuscator wrapper this function exists to strip. It matters only when
+  // the later row is a strictly broader catch that would swallow what R
+  // deliberately lets escape, e.g. `catch (ThreadDeath t) { throw t; }` guarding
+  // a following `catch (Throwable)`.
+  const shieldsABroaderLaterRow = (index) => {
+    const row = rows[index];
+    const start = Number(row.start_pc);
+    const end = Number(row.end_pc);
+    const handlerPc = Number(row.handler_pc);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return false;
+    const rowType = typeOf(row);
+    if (!rowType) return false; // an `any` rethrow shields nothing broader
+    for (let j = index + 1; j < rows.length; j += 1) {
+      const later = rows[j];
+      const laterStart = Number(later.start_pc);
+      const laterEnd = Number(later.end_pc);
+      if (!Number.isFinite(laterStart) || !Number.isFinite(laterEnd)) continue;
+      if (laterStart >= end || start >= laterEnd) continue; // no overlap
+      if (handlerPc >= laterStart && handlerPc < laterEnd) continue; // re-dispatches there anyway
+      if (isProperSupertype(typeOf(later), rowType)) return true;
+    }
+    return false;
+  };
+  return rows.filter((row, index) => !isRethrowHandler(row.handler_pc)
+    || shieldsABroaderLaterRow(index));
 }
 
 // Dead-code sweeps replace unreachable instructions with nop but keep the
@@ -3139,13 +3283,15 @@ function normalizeStructuredCatchNodes(tree, cfg, codeItems, model) {
         });
         (supported ? valid : unsupported).push(item);
       }
-      if (unsupported.length) {
-        const hasGeneric = valid.some((item) => (item.types || [item.type]).some((type) =>
-          type === 'java.lang.Exception' || type === 'Exception'
-          || type === 'java.lang.Throwable' || type === 'Throwable'));
-        if (!hasGeneric) valid.push({ ...unsupported[0], types: ['java.lang.Exception'] });
-      }
-      node.catches = valid;
+      // Catches javac would reject ("exception is never thrown in body of the
+      // corresponding try statement") must keep their precise type anyway.
+      // Widening them to Exception silently changes behavior — the handler then
+      // swallows RuntimeExceptions the original let propagate — and collapsing
+      // the group to unsupported[0] discards the remaining handler bodies
+      // outright. javac accepts the narrow type because
+      // ensureCheckedCatchReachability injects an `if (false) throw (T) null;`
+      // reachability anchor into the try body for exactly these types.
+      if (!unsupported.length) node.catches = valid;
       return;
     }
     if (node.t === 'seq') for (const child of node.body || []) walk(child);

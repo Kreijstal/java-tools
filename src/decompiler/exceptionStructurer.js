@@ -705,7 +705,17 @@ function structureMethod(codeItems, exceptionTable, opts = {}) {
   // in the method) can reuse the same L<blockId> label at different nesting
   // depths, which is a Java compile error. Rename to globally-unique labels
   // while preserving nearest-match break/continue resolution.
-  if (res && res.ok && res.tree) { uniquifyLabels(res.tree); uniquifyCatchParameters(res.tree); }
+  if (res && res.ok && res.tree) {
+    try {
+      uniquifyLabels(res.tree);
+      uniquifyCatchParameters(res.tree);
+    } catch (err) {
+      // A tree carrying a break whose target block is not an ancestor is not
+      // expressible as Java. Decline it so the caller falls back, per this
+      // function's contract, instead of aborting the whole decompilation.
+      return { ok: false, reason: `internal: ${err.message}` };
+    }
+  }
   return res;
 }
 

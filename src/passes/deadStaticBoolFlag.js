@@ -46,6 +46,8 @@
  *   Before: iload(+1) ifeq(-1) = 0   →  After: goto = 0 ✓
  */
 
+const { buildCfg } = require('./splitArrayReachingLocal');
+
 const DEFAULT_ALWAYS_FALSE_FIELDS = [];
 
 const LOAD_OPS = {
@@ -520,7 +522,10 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
       if (allowTerminalSelfIncrementFlags && isTerminalSelfIncrementWrite(write, key, candidates)) {
         continue;
       }
-      const guard = findNonZeroGuard(write.codeItems, write.index, candidates);
+      // A write that can only ever store zero cannot make the field true, so
+      // it needs no reachability argument at all.
+      if (writesOnlyZero(write.codeItems, write.index)) continue;
+      const guard = findNonZeroGuard(write.code, write.index, candidates);
       if (!guard) {
         rejected.add(key);
         continue;
@@ -722,6 +727,7 @@ function collectStaticWrites(astRoot, candidates) {
           const key = fieldKey(ref);
           if (!candidates.has(key)) continue;
           writes.get(key).push({
+            code,
             codeItems,
             index: i,
             owner: cls.className,
@@ -815,20 +821,120 @@ function guardsCandidateWrite(codeItems, ifIdx, candidates) {
   return false;
 }
 
-function findNonZeroGuard(codeItems, writeIdx, candidates) {
-  const labels = collectLabelIndices(codeItems);
+/**
+ * Find a candidate field whose being false makes `writeIdx` unreachable.
+ *
+ * Every `ifeq` in the method whose condition is a candidate field read is a
+ * potential guard: if that field is zero the branch is TAKEN, so the guard's
+ * fall-through edge is not executed. We prove the guard really covers the
+ * write by deleting that fall-through edge from the CFG and checking the
+ * write becomes unreachable from the method entry.
+ *
+ * The previous implementation only checked that some earlier `ifeq` had a
+ * branch target textually after the write. That is not a dominance proof: any
+ * other jump, switch arm, or exception handler landing between the guard and
+ * the write re-enters the region with the guard bypassed, and the obfuscated
+ * gamepack is full of exactly those edges. Trusting the textual form deleted
+ * live writes such as `qd.Nb = wg.f`, which in turn made a genuinely dynamic
+ * field look permanently false.
+ */
+function findNonZeroGuard(code, writeIdx, candidates) {
+  const codeItems = code && code.codeItems;
+  if (!Array.isArray(codeItems)) return null;
+  let cfg = null;
+  let entryId = null;
   for (let i = writeIdx - 1; i >= 0; i -= 1) {
     const item = codeItems[i];
     const insn = item && item.instruction;
     if (!insn) continue;
     if (getOp(insn) !== 'ifeq') continue;
-    const target = trimLabel(getArg(insn));
-    const targetIdx = labels.get(target);
-    if (targetIdx == null || targetIdx <= writeIdx) continue;
     const source = findPreviousStackSource(codeItems, i, candidates);
-    if (source) return source;
+    if (!source) continue;
+    if (cfg == null) {
+      cfg = buildCfg(code);
+      if (!cfg.blocks.length) return null;
+      const first = firstInstructionIndex(codeItems);
+      entryId = first < 0 ? null : cfg.indexToBlock.get(first);
+      if (!entryId) return null;
+    }
+    if (writeUnreachableWithoutFallthrough(cfg, codeItems, entryId, i, writeIdx)) return source;
   }
   return null;
+}
+
+/**
+ * True when the value consumed by the `putstatic` at `writeIdx` is a literal
+ * zero pushed by the immediately preceding instruction, with no label in
+ * between that another edge could jump to (which would let a different value
+ * reach the store).
+ */
+function writesOnlyZero(codeItems, writeIdx) {
+  const prev = previousInstruction(codeItems, writeIdx);
+  if (!prev) return false;
+  const op = getOp(prev.item.instruction);
+  if (op !== 'iconst_0' && op !== 'lconst_0') {
+    if (op !== 'bipush' && op !== 'sipush' && op !== 'ldc' && op !== 'ldc_w') return false;
+    const arg = getArg(prev.item.instruction);
+    const numeric = typeof arg === 'number' ? arg : parseInt(String(arg), 10);
+    if (!(numeric === 0)) return false;
+  }
+  for (let i = prev.index + 1; i <= writeIdx; i += 1) {
+    if (codeItems[i] && codeItems[i].labelDef) return false;
+  }
+  return true;
+}
+
+function firstInstructionIndex(codeItems) {
+  for (let i = 0; i < codeItems.length; i += 1) {
+    if (codeItems[i] && codeItems[i].instruction) return i;
+  }
+  return -1;
+}
+
+/**
+ * True when `writeIdx` cannot be reached from the entry block once the
+ * fall-through successor of the branch at `branchIdx` is removed.
+ *
+ * The branch must be the final instruction of its block for the removal to
+ * describe a single edge; otherwise we refuse the proof. Exception-handler
+ * edges stay in the graph, so a handler that can still be entered keeps the
+ * write reachable and correctly defeats the guard.
+ */
+function writeUnreachableWithoutFallthrough(cfg, codeItems, entryId, branchIdx, writeIdx) {
+  const branchBlockId = cfg.indexToBlock.get(branchIdx);
+  const writeBlockId = cfg.indexToBlock.get(writeIdx);
+  if (!branchBlockId || !writeBlockId) return false;
+  const branchBlock = cfg.byId.get(branchBlockId);
+  if (!branchBlock) return false;
+  if (lastInstructionIndexIn(codeItems, branchBlock) !== branchIdx) return false;
+
+  // The fall-through successor is the block starting immediately after this
+  // one. Anything else in `successors` is the branch target itself.
+  const fallthroughId = cfg.indexToBlock.get(branchBlock.end + 1);
+  if (!fallthroughId) return false;
+
+  const reachable = new Set();
+  const work = [entryId];
+  while (work.length) {
+    const id = work.pop();
+    if (reachable.has(id)) continue;
+    reachable.add(id);
+    if (id === writeBlockId) return false;
+    const block = cfg.byId.get(id);
+    if (!block) continue;
+    for (const succ of block.successors) {
+      if (id === branchBlockId && succ === fallthroughId) continue;
+      if (!reachable.has(succ)) work.push(succ);
+    }
+  }
+  return !reachable.has(writeBlockId);
+}
+
+function lastInstructionIndexIn(codeItems, block) {
+  for (let i = block.end; i >= block.start; i -= 1) {
+    if (codeItems[i] && codeItems[i].instruction) return i;
+  }
+  return -1;
 }
 
 function findPreviousStackSource(codeItems, ifIdx, candidates) {
@@ -846,23 +952,34 @@ function findPreviousStackSource(codeItems, ifIdx, candidates) {
   return localFieldBindingAt(codeItems, local, prev.index, candidates);
 }
 
+/**
+ * Resolve which candidate field a local holds at `useIdx`.
+ *
+ * Textual order is not execution order, so taking the nearest preceding store
+ * is only valid when the local has exactly one definition in the whole method
+ * and it reads the field. Any second store (or an `iinc`) means some path can
+ * reach the use with an unrelated value, so we refuse the binding.
+ */
 function localFieldBindingAt(codeItems, local, useIdx, candidates) {
-  for (let i = useIdx - 1; i >= 0; i -= 1) {
+  let binding = null;
+  for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     const insn = item && item.instruction;
     if (!insn) continue;
     const op = getOp(insn);
     if (op === 'iinc' && localOfIinc(insn) === local) return null;
-    if (!ISTORE_OPS.has(op)) continue;
-    const storedLocal = localOf(op, getArg(insn));
-    if (storedLocal !== local) continue;
+    if (!STORE_OPS.has(op)) continue;
+    if (localOf(op, getLocalArg(insn)) !== local) continue;
+    if (binding != null) return null;
+    if (!ISTORE_OPS.has(op)) return null;
     const prev = previousInstruction(codeItems, i);
     if (!prev || getOp(prev.item.instruction) !== 'getstatic') return null;
     const ref = fieldRefOf(getArg(prev.item.instruction));
-    if (ref && candidates.has(fieldKey(ref))) return fieldKey(ref);
-    return null;
+    if (!ref || !candidates.has(fieldKey(ref))) return null;
+    if (i >= useIdx) return null;
+    binding = fieldKey(ref);
   }
-  return null;
+  return binding;
 }
 
 function localOfIinc(instruction) {
