@@ -107,61 +107,47 @@ function normalizeTable(exceptionTable, syncHandlers) {
       });
     }
   }
-  // 3. Group by identical (start_pc, end_pc) → one body, N catches in order.
-  const byKey = new Map();
-  const order = [];
+  // 3. Reconstruct each handler's complete protected-range set before grouping
+  // sibling catches. Comparing one table row at a time is insufficient: javac
+  // commonly splits adjacent ranges around a handler, and an enclosing catch
+  // then shares the first rows but extends across that inner handler. Merging
+  // groups merely because they share either a row or a handler flattens the two
+  // nested tries. A catch continuation into the enclosing protected tail is
+  // subsequently mistaken for a loop back to the try entry.
+  const casesByHandlerAndType = new Map();
+  const cases = [];
   for (const r of rows) {
-    const key = `${r.start_pc}:${r.end_pc}`;
-    if (!byKey.has(key)) { byKey.set(key, { start_pc: r.start_pc, end_pc: r.end_pc, catches: [] }); order.push(key); }
-    const catches = byKey.get(key).catches;
-    const sharedHandler = catches.find((item) => item.handler_pc === r.handler_pc);
-    if (sharedHandler) {
-      const types = Array.isArray(sharedHandler.catch_type)
-        ? sharedHandler.catch_type
-        : [sharedHandler.catch_type];
-      if (!types.includes(r.catch_type)) types.push(r.catch_type);
-      sharedHandler.catch_type = types;
-    } else {
-      catches.push({ catch_type: r.catch_type, handler_pc: r.handler_pc });
+    const key = `${r.handler_pc}:${String(r.catch_type)}`;
+    let item = casesByHandlerAndType.get(key);
+    if (!item) {
+      item = { handler_pc: r.handler_pc, catch_type: r.catch_type, ranges: [] };
+      casesByHandlerAndType.set(key, item);
+      cases.push(item);
+    }
+    if (!item.ranges.some((range) => range.start_pc === r.start_pc && range.end_pc === r.end_pc)) {
+      item.ranges.push({ start_pc: r.start_pc, end_pc: r.end_pc });
     }
   }
-  // Each group carries an explicit `ranges` list so downstream membership tests
-  // stay uniform. Rows are kept one range per group (no cross-handler merging):
-  // a handler shared by several ranges is left for the caller's deferral guard
-  // rather than merged, since merging re-structured methods the state-machine
-  // fallback already handled correctly.
-  const initialGroups = order.map((k) => {
-    const g = byKey.get(k);
-    return { start_pc: g.start_pc, end_pc: g.end_pc, ranges: [{ start_pc: g.start_pc, end_pc: g.end_pc }], catches: g.catches };
-  });
+  for (const item of cases) item.ranges.sort((a, b) => a.start_pc - b.start_pc || a.end_pc - b.end_pc);
+
+  // Handlers are siblings only when their complete protected-range sets are
+  // identical. The first-seen order remains JVM exception-table priority.
+  const groupsByRanges = new Map();
   const groups = [];
-  for (const initial of initialGroups) {
-    const sharedHandlers = new Set(initial.catches.map((item) => item.handler_pc));
-    const connected = groups.filter((group) => group.catches.some((item) => sharedHandlers.has(item.handler_pc)));
-    if (!connected.length) {
-      groups.push(initial);
-      continue;
+  for (const item of cases) {
+    const key = item.ranges.map((range) => `${range.start_pc}:${range.end_pc}`).join(',');
+    let group = groupsByRanges.get(key);
+    if (!group) {
+      group = {
+        start_pc: Math.min(...item.ranges.map((range) => range.start_pc)),
+        end_pc: Math.max(...item.ranges.map((range) => range.end_pc)),
+        ranges: item.ranges.map((range) => ({ ...range })),
+        catches: [],
+      };
+      groupsByRanges.set(key, group);
+      groups.push(group);
     }
-    const target = connected[0];
-    target.ranges.push(...initial.ranges);
-    target.start_pc = Math.min(target.start_pc, initial.start_pc);
-    target.end_pc = Math.max(target.end_pc, initial.end_pc);
-    for (const item of initial.catches) {
-      if (!target.catches.some((existing) => existing.handler_pc === item.handler_pc && existing.catch_type === item.catch_type)) {
-        target.catches.push(item);
-      }
-    }
-    for (const extra of connected.slice(1)) {
-      target.ranges.push(...extra.ranges);
-      target.start_pc = Math.min(target.start_pc, extra.start_pc);
-      target.end_pc = Math.max(target.end_pc, extra.end_pc);
-      for (const item of extra.catches) {
-        if (!target.catches.some((existing) => existing.handler_pc === item.handler_pc && existing.catch_type === item.catch_type)) {
-          target.catches.push(item);
-        }
-      }
-      groups.splice(groups.indexOf(extra), 1);
-    }
+    group.catches.push({ catch_type: item.catch_type, handler_pc: item.handler_pc });
   }
   const mergeSameHandlerCatches = (group) => {
     const byHandler = new Map();

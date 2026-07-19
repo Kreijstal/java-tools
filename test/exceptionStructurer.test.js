@@ -126,6 +126,40 @@ test('handler continuation inside a later protected range does not move the try 
   assert.match(src, /catch \(java\.lang\.RuntimeException/);
 });
 
+test('catch fallthrough into an enclosing protected tail does not become a retry loop', () => {
+  const code = [
+    { labelDef: 'L0:', pc: 0, instruction: 'iconst_0' },
+    { pc: 1, instruction: 'istore_0' },
+    { labelDef: 'L5:', pc: 5, instruction: 'aload_0' },
+    { pc: 6, instruction: { op: 'invokevirtual', arg: ['Method', 'X', ['read', '()I']] } },
+    { pc: 9, instruction: { op: 'ifeq', arg: 'L103' } },
+    { pc: 12, instruction: 'aconst_null' },
+    { pc: 13, instruction: 'areturn' },
+    { labelDef: 'L95:', pc: 95, instruction: 'iinc 0 1' },
+    { pc: 98, instruction: { op: 'goto', arg: 'L5' } },
+    { labelDef: 'L101:', pc: 101, instruction: 'nop' },
+    { labelDef: 'L102:', pc: 102, instruction: 'astore_1' },
+    { labelDef: 'L103:', pc: 103, instruction: 'aconst_null' },
+    { pc: 104, instruction: 'areturn' },
+    { labelDef: 'L105:', pc: 105, instruction: 'astore_2' },
+    { pc: 106, instruction: 'aload_2' },
+    { pc: 107, instruction: 'athrow' },
+  ];
+  const et = [
+    { start_pc: 5, end_pc: 94, handler_pc: 102, catch_type: 'java/lang/Throwable' },
+    { start_pc: 95, end_pc: 101, handler_pc: 102, catch_type: 'java/lang/Throwable' },
+    { start_pc: 5, end_pc: 94, handler_pc: 105, catch_type: 'java/lang/RuntimeException' },
+    { start_pc: 95, end_pc: 104, handler_pc: 105, catch_type: 'java/lang/RuntimeException' },
+  ];
+
+  const { ok, src, r } = run(code, et);
+  assert.ok(ok, r.reason || 'nested handler ranges should structure');
+  assertGotoFree(src);
+  assert.equal((src.match(/try \{/g) || []).length, 2, `expected nested tries:\n${src}`);
+  assert.match(src, /catch \(java\.lang\.Throwable[^]*?areturn;/);
+  assert.doesNotMatch(src, /decompiledRegionSelector/);
+});
+
 // ---------------------------------------------------------------------------
 // (c) A catch-all clause (catch_type 0) renders as java.lang.Throwable.
 // ---------------------------------------------------------------------------
@@ -269,8 +303,9 @@ test('sync handler and real catch on a shared range split into separate groups',
   }
   const handlers = groups.map((g) => g.catches[0].handler_pc).sort((a, b) => a - b);
   assert.deepEqual(handlers, [79, 87]);
-  // Without syncHandlers, the old fused behavior is preserved (a single group
-  // whose catches include both handlers) — the split is sync-specific.
-  const fused = normalizeTable(et).groups;
-  assert.ok(fused.some((g) => g.catches.length === 2), 'non-sync grouping still fuses shared ranges');
+  // Even without the synchronized-handler hint, the handlers have different
+  // complete protected-range sets and therefore remain nested groups.
+  const nested = normalizeTable(et).groups;
+  assert.equal(nested.length, 2);
+  assert.ok(nested.every((g) => g.catches.length === 1));
 });
