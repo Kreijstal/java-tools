@@ -128,6 +128,11 @@ bounded, forward-only, always-rethrow diagnostic handlers as non-recovering, so
 their protected compute loops remain eligible. A catch that returns, acquires a
 monitor, loops backwards, or writes recovery state remains interpreted.
 
+The Dekobloko Firefox investigation, including measured wins, rejected
+experiments, correctness traps, and the reproducible changed-frame probe, is
+recorded in
+[docs/dekobloko-firefox-performance.md](docs/dekobloko-firefox-performance.md).
+
 #### Portable save states
 
 `JVM.saveState()` captures a JSON-compatible execution checkpoint and
