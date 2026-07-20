@@ -1048,7 +1048,11 @@ class JVM {
             } else {
               await dispatch(currentFrame, instruction, this, thread);
             }
-            break;
+            // Many async-capable handlers only need to await on their cold
+            // path (class initialization, loading, or a Java call). Once warm,
+            // getstatic/casts/native invokes complete on this same frame. Keep
+            // those in the bounded quantum; the frame/status checks below
+            // still stop immediately for calls, sleeps, waits, and blocking.
           } else {
             const result = handler(
               currentFrame,

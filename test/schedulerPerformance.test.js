@@ -3,6 +3,8 @@
 const test = require('tape');
 const { JVM } = require('../src/core/jvm');
 const instructions = require('../src/instructions');
+const Frame = require('../src/core/frame');
+const Stack = require('../src/core/stack');
 
 test('idle scheduler waits instead of spinning zero-delay tasks', (t) => {
   const jvm = new JVM({ eventLoopYieldMs: 16 });
@@ -48,5 +50,39 @@ test('synchronous bytecode handlers are prepared once per shared code body', (t)
     'preparing the same shared method body is idempotent');
   t.deepEqual(Object.keys(codeItems[0]), ['instruction'],
     'prepared dispatch metadata is not serialized or shown by debuggers');
+  t.end();
+});
+
+test('warm async-capable handlers remain inside an interpreter quantum', async (t) => {
+  const method = {
+    name: 'warmStatics',
+    descriptor: '()V',
+    attributes: [{
+      type: 'code',
+      code: {
+        localsSize: '0',
+        exceptionTable: [],
+        codeItems: [
+          { instruction: { op: 'getstatic', arg: [null, 'Test', ['value', 'I']] } },
+          { instruction: 'pop' },
+          { instruction: 'return' },
+        ],
+      },
+    }],
+  };
+  const jvm = new JVM({ interpreterBurst: 16, jit: { enabled: false } });
+  jvm.classes.Test = {
+    ast: { classes: [{ superClassName: null }] },
+    staticFields: new Map([['value:I', 7]]),
+  };
+  jvm.classInitializationState.set('Test', 'INITIALIZED');
+  const thread = { id: 0, status: 'runnable', callStack: new Stack() };
+  thread.callStack.push(new Frame(method));
+  jvm.threads = [thread];
+
+  const result = await jvm.executeTick({ allowBurst: true });
+  t.equal(result.bytecodes, 3,
+    'getstatic, pop, and return execute in one bounded scheduler tick');
+  t.equal(thread.callStack.size(), 0, 'the method completes in that quantum');
   t.end();
 });
