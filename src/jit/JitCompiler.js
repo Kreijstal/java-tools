@@ -3,6 +3,7 @@ const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
 const { resolveInstanceFieldKey } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
+const { isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
 const STATIC_DEOPT = Symbol("jit.static.deopt");
@@ -25,6 +26,9 @@ class JitCompiler {
     this.codegenSupportCache = new WeakMap();
     this.codegenUnavailable = false;
     this.codegenCompileErrors = new WeakMap();
+    const firefoxDefault = typeof navigator !== "undefined" &&
+      /Firefox\//.test(navigator.userAgent || "");
+    this.preferWholeMethodJs = options.preferWholeMethodJs ?? firefoxDefault;
     this.generatedRunCount = 0;
     this.runnerRunCount = 0;
     this.methodRunCounts = new Map();
@@ -96,7 +100,17 @@ class JitCompiler {
   }
 
   async tryRunFrame(frame, thread) {
-    if (this.wasmJit.enabled && !this.runningFrames.has(frame)) {
+    // SpiderMonkey pays a high cost for frequent Wasm -> JS -> Wasm exits.
+    // When the whole method has a generated implementation, prefer that
+    // single tier over partial Wasm. Compilation is intentionally allowed to
+    // cost more up front so animation/render loops remain in one engine tier.
+    let canRunGenerated = null;
+    if (this.preferWholeMethodJs && !this.runningFrames.has(frame) &&
+        !frame.jitJsDisabled && this.isCodegenSupported(frame.method)) {
+      canRunGenerated = this.canRun(frame);
+    }
+
+    if (!canRunGenerated && this.wasmJit.enabled && !this.runningFrames.has(frame)) {
       const wasmResult = this.wasmJit.tryRunFrame(frame, thread);
       if (wasmResult.handled) {
         if (wasmResult.returned) return { handled: true };
@@ -116,7 +130,7 @@ class JitCompiler {
     if (frame.jitJsDisabled) {
       return { handled: false };
     }
-    if (!this.canRun(frame)) {
+    if ((canRunGenerated === null && !this.canRun(frame)) || canRunGenerated === false) {
       return { handled: false };
     }
 
@@ -407,6 +421,9 @@ class JitCompiler {
     if (method.name === "<init>" || method.name === "<clinit>" || method.name === "run") {
       return false;
     }
+    if (this.hasOnlyNoOpExceptionHandlers(method, codeItems)) {
+      return true;
+    }
     if (hasMonitorBytecode(codeItems)) {
       // Generated monitorenter/exit keep frame.pc and frame locals live. Calls
       // that cannot run in a JIT tier yield as interpreted child frames, so
@@ -419,6 +436,18 @@ class JitCompiler {
           instruction.arg[2][0] === '<init>');
     }
     return !normalFlowContainsInvoke(codeItems);
+  }
+
+  hasOnlyNoOpExceptionHandlers(method, codeItems) {
+    const codeAttr = method.attributes.find((attr) => attr.type === "code");
+    const table = codeAttr && codeAttr.code && codeAttr.code.exceptionTable || [];
+    if (!table.length) return false;
+    const labels = buildLabelMap(codeItems);
+    return table.every((entry) => {
+      const label = entry.handlerLbl || `L${entry.handler_pc}`;
+      const handler = labels.get(label);
+      return handler !== undefined && isNoOpExceptionHandler(codeItems, handler, labels);
+    });
   }
 
   isShortSupportedHelper(method) {
@@ -691,8 +720,8 @@ class JitCompiler {
       case "sastore": return `helpers.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); ${goNext}`;
       case "getfield": return `stack.push(helpers.getField(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "putfield": return `{ const value = stack.pop(); const obj = stack.pop(); helpers.putField(obj, ${JSON.stringify(instruction.arg)}, value); } ${goNext}`;
-      case "getstatic": return `{ const value = await helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack.push(value); } ${goNext}`;
-      case "putstatic": return `{ const changed = await helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[stack.length - 1], thread); if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } stack.pop(); } ${goNext}`;
+      case "getstatic": return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack.push(value); } ${goNext}`;
+      case "putstatic": return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[stack.length - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } stack.pop(); } ${goNext}`;
       case "new": return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack.push(value); } ${goNext}`;
       case "monitorenter": return `{ const monitor = stack[stack.length - 1]; if (!helpers.monitorEnter(monitor, thread)) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "contended generated monitorenter" }; } stack.pop(); } ${goNext}`;
       case "monitorexit": return `helpers.monitorExit(stack.pop(), thread); ${goNext}`;
@@ -1226,10 +1255,22 @@ class JitCompiler {
     objRef[fieldName] = value;
   }
 
-  async getStatic(arg, thread) {
+  getStatic(arg, thread) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+      return this.getStaticCold(arg, thread);
+    }
+    return this.getStaticInitialized(className, fieldName, descriptor);
+  }
+
+  async getStaticCold(arg, thread) {
     const [, className, [fieldName, descriptor]] = arg;
     const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) return STATIC_DEOPT;
+    return this.getStaticInitialized(className, fieldName, descriptor);
+  }
+
+  getStaticInitialized(className, fieldName, descriptor) {
     const key = `${fieldName}:${descriptor}`;
     let currentClassName = className;
     while (currentClassName) {
@@ -1258,10 +1299,22 @@ class JitCompiler {
     throw new Error(`Unresolved static field: ${className}.${fieldName}`);
   }
 
-  async putStatic(arg, value, thread) {
+  putStatic(arg, value, thread) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+      return this.putStaticCold(arg, value, thread);
+    }
+    return this.putStaticInitialized(className, fieldName, descriptor, value);
+  }
+
+  async putStaticCold(arg, value, thread) {
     const [, className, [fieldName, descriptor]] = arg;
     const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) return STATIC_DEOPT;
+    return this.putStaticInitialized(className, fieldName, descriptor, value);
+  }
+
+  putStaticInitialized(className, fieldName, descriptor, value) {
     const key = `${fieldName}:${descriptor}`;
     let currentClassName = className;
     while (currentClassName) {
@@ -1427,27 +1480,16 @@ class JitCompiler {
       }
     }
     if (!jsChildSupported) {
-      if (hasMonitorBytecode(frame.instructions)) {
-        // Preserve a generated synchronized parent as a resumable compiled
-        // region. Its post-invoke pc is already materialized and the child has
-        // initialized locals, so executeTick can interpret the child. If it
-        // throws, parent.pc - 1 recovers the invoke site for monitor cleanup.
-        return {
-          deopt: true,
-          transient: true,
-          reason: `interpreted monitor callee ${targetClassName}.${methodName}${descriptor}`,
-        };
-      }
-      // Outside a monitor-protected region, retain the conservative whole-
-      // method deoptimization policy until arbitrary stack-carry call islands
-      // have a verifier-backed materialization proof.
-      thread.callStack.pop();
-      frame.stack.items = stackSnapshot;
-      frame.pc = invokePc;
+      // The generated caller materializes its post-invoke pc and operand stack
+      // before entering this helper. Keep the initialized child on the Java
+      // call stack so the interpreter can finish only that unsupported call;
+      // its return instruction supplies any result to the caller's materialized
+      // stack, after which the hot caller resumes generated execution. This is
+      // also exception-safe: propagation uses parent.pc - 1 as the invoke site.
       return {
         deopt: true,
-        transient: false,
-        reason: `unsupported callee ${targetClassName}.${methodName}${descriptor}`,
+        transient: true,
+        reason: `interpreted callee ${targetClassName}.${methodName}${descriptor}`,
       };
     }
     const generated = this.getGeneratedFunction(method);
@@ -1464,6 +1506,16 @@ class JitCompiler {
       || this.jvm._jreFindMethod(declaredClassName, methodName, descriptor);
     if (direct) return direct;
 
+    // Arrays implement Object's virtual methods even though they do not have
+    // ordinary class metadata to walk. Keep generated invokevirtual behavior
+    // aligned with the interpreter (notably for array clone()).
+    if (typeof targetClassName === "string" && targetClassName.startsWith("[")) {
+      const objectMethod = this.jvm._jreFindMethod(
+        "java/lang/Object", methodName, descriptor,
+      );
+      if (objectMethod) return objectMethod;
+    }
+
     let currentClassName = targetClassName;
     while (currentClassName) {
       const classData = this.jvm.classes[currentClassName] || await this.jvm.loadClassByName(currentClassName);
@@ -1474,6 +1526,7 @@ class JitCompiler {
     }
     return null;
   }
+
 }
 
 function isClassConstant(arg) {

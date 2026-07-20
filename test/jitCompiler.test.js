@@ -68,6 +68,25 @@ test('Wasm value imports preserve JavaScript boolean fields', (t) => {
   t.end();
 });
 
+test('initialized static fields stay on the synchronous generated fast path', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classes.FastStatics = {
+    staticFields: new Map([['value:I', 41]]),
+    ast: { classes: [{ superClassName: null }] },
+  };
+  jvm.classInitializationState.set('FastStatics', 'INITIALIZED');
+  const field = [null, 'FastStatics', ['value', 'I']];
+  const value = jvm.jit.getStatic(field, {});
+
+  t.equal(value, 41, 'warm getstatic returns its value directly');
+  t.notOk(value && typeof value.then === 'function', 'warm getstatic creates no Promise');
+  const changed = jvm.jit.putStatic(field, 42, {});
+  t.equal(changed, true, 'warm putstatic completes synchronously');
+  t.equal(jvm.classes.FastStatics.staticFields.get('value:I'), 42,
+    'warm putstatic updates the field');
+  t.end();
+});
+
 test('JIT produces same PyramidApplet mock drawing operations as interpreter', async (t) => {
   const interpreted = await createPyramidHarness({ enabled: false });
   const jitted = await createPyramidHarness({ warmupThreshold: 0 });
@@ -331,7 +350,7 @@ test('Wasm leaves constructors and class initializers atomic', (t) => {
   t.end();
 });
 
-test('generated callers permanently deopt at unsupported callees', async (t) => {
+test('generated callers resume around unsupported interpreted callees', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedTransientCallJitHarness', `
 public class GeneratedTransientCallJitHarness {
   private static int selected(int value) {
@@ -361,11 +380,48 @@ public class GeneratedTransientCallJitHarness {
   out.type = '[I';
   await invoke(jvm, thread, 'GeneratedTransientCallJitHarness', 'compute', '([I)V', [out]);
   t.deepEqual(out.slice(0, 3), [11, 21, 31], 'unsupported child calls preserve results');
-  t.equal(jvm.jit.generatedRunCount, 1,
-    'caller crosses from generated code to the interpreter once');
-  t.ok(jvm.jit.deoptedMethods.has(
+  t.equal(jvm.jit.generatedRunCount, 4,
+    'caller resumes generated execution after each interpreted child');
+  t.notOk(jvm.jit.deoptedMethods.has(
     await jvm.findMethodInHierarchy('GeneratedTransientCallJitHarness', 'compute', '([I)V')),
-  'unsupported child permanently deopts the caller without a materialization proof');
+  'unsupported child does not permanently deopt its caller');
+  t.end();
+});
+
+test('generated invokevirtual resolves Object methods on arrays', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedArrayCloneJitHarness', `
+public class GeneratedArrayCloneJitHarness {
+  public static void copy(int[] input, int[][] out) {
+    for (int i = 0; i < out.length; i++) out[i] = (int[]) input.clone();
+  }
+}
+`);
+  const jvm = new JVM({
+    classpath,
+    jit: { warmupThreshold: 0, experimentalControlFlow: true },
+  });
+  await jvm.loadClassByName('GeneratedArrayCloneJitHarness');
+  const thread = {
+    id: 0,
+    name: 'array-clone-generated-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const input = [3, 5, 8];
+  input.type = '[I';
+  const out = [null];
+  out.type = '[[I';
+
+  await invoke(jvm, thread, 'GeneratedArrayCloneJitHarness', 'copy',
+    '([I[[I)V', [input, out]);
+
+  t.deepEqual(out[0].slice(), [3, 5, 8], 'array clone preserves its elements');
+  t.notEqual(out[0], input, 'array clone returns a distinct array');
+  t.equal(out[0].type, '[I', 'array clone preserves runtime type metadata');
+  t.ok(jvm.jit.generatedRunCount > 0, 'array clone call executes from generated code');
   t.end();
 });
 
@@ -778,6 +834,35 @@ test('Wasm JIT reporter scan skips unreachable throws before a forward join', (t
   t.end();
 });
 
+test('whole-method JS tier accepts invoke loops with rethrow-only handlers', (t) => {
+  const codeItems = [
+    { labelDef: 'Lstart:' },
+    { instruction: { op: 'invokestatic', arg: [null, 'Helper', ['mix', '(I)I']] } },
+    { instruction: { op: 'goto', arg: 'Lstart' } },
+    { labelDef: 'Lend:' },
+    { instruction: 'return' },
+    { labelDef: 'Lhandler:' },
+    { instruction: { op: 'astore', varnum: 1 } },
+    { instruction: { op: 'aload', varnum: 1 } },
+    { instruction: 'athrow' },
+  ];
+  const method = {
+    name: 'render',
+    descriptor: '()V',
+    attributes: [{ type: 'code', code: {
+      codeItems,
+      exceptionTable: [{ startLbl: 'Lstart', endLbl: 'Lend', handlerLbl: 'Lhandler' }],
+    } }],
+  };
+  const jvm = new JVM({ jit: { preferWholeMethodJs: true } });
+
+  t.ok(jvm.jit.hasOnlyNoOpExceptionHandlers(method, codeItems),
+    'bare rethrow handler is proven semantically transparent');
+  t.ok(jvm.jit.hasJitSafeControlFlow(method, codeItems),
+    'normal-flow invokes are eligible when every handler only rethrows');
+  t.end();
+});
+
 test('Wasm JIT retries a deferred loop after its static helper becomes available', async (t) => {
   const classpath = compileJavaFixture(t, 'WasmDeferredHarness', `
 public class WasmDeferredHarness {
@@ -894,7 +979,7 @@ public class WasmCheckedHandlerHarness {
   t.end();
 });
 
-test('generated JS callers give policy-rejected children a Wasm chance before deoptimizing', async (t) => {
+test('generated JS callers use proven rethrow-only children without deoptimizing', async (t) => {
   const classpath = compileJavaFixture(t, 'WasmBeforeDeoptHarness', `
 public class WasmBeforeDeoptHarness {
   private static int increment(int value) {
@@ -923,13 +1008,16 @@ public class WasmBeforeDeoptHarness {
     else process.env.JVM_WASM_JIT = previous;
   });
 
-  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  const jvm = new JVM({
+    classpath,
+    jit: { warmupThreshold: 0, preferWholeMethodJs: true },
+  });
   await jvm.loadClassByName('WasmBeforeDeoptHarness');
   jvm.classInitializationState.set('WasmBeforeDeoptHarness', 'INITIALIZED');
   const wrapped = await jvm.findMethodInHierarchy(
     'WasmBeforeDeoptHarness', 'wrappedLoop', '([I)V');
-  t.notOk(jvm.jit.isCodegenSupported(wrapped),
-    'normal-path call under an exception handler remains outside JS-JIT policy');
+  t.ok(jvm.jit.isCodegenSupported(wrapped),
+    'rethrow-only handler permits whole-method generated code');
 
   const thread = {
     id: 0,
@@ -945,13 +1033,10 @@ public class WasmBeforeDeoptHarness {
 
   await invoke(jvm, thread, 'WasmBeforeDeoptHarness', 'caller', '([I)V', [out]);
 
-  t.deepEqual(out.slice(0, 3), [12, 3, 4], 'Wasm child and generated caller preserve results');
+  t.deepEqual(out.slice(0, 3), [12, 3, 4], 'generated child and caller preserve results');
   const caller = await jvm.findMethodInHierarchy('WasmBeforeDeoptHarness', 'caller', '([I)V');
   t.notOk(jvm.jit.deoptedMethods.has(caller),
-    'a Wasm-capable child does not permanently deopt its generated caller');
-  t.ok(jvm.jit.wasmJit.compiled.some((entry) =>
-    entry.key === 'WasmBeforeDeoptHarness.wrappedLoop([I)V'),
-  'the policy-rejected child compiles through Wasm on demand');
+    'a generated child does not permanently deopt its generated caller');
   t.end();
 });
 
