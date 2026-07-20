@@ -39,6 +39,9 @@ const asyncInstructionOps = new Set([
 const syncInstructions = Object.fromEntries(Object.entries(instructions)
   .filter(([op, func]) => !asyncInstructionOps.has(op) &&
     func.constructor.name !== 'AsyncFunction'));
+const syncCodePrepared = Symbol('syncCodePrepared');
+const syncHandler = Symbol('syncHandler');
+const syncInstruction = Symbol('syncInstruction');
 
 function expandWideInstruction(instruction) {
   const parts = String(instruction && instruction.arg ? instruction.arg : '').trim().split(/\s+/).filter(Boolean);
@@ -55,6 +58,40 @@ function expandWideInstruction(instruction) {
     op: baseOp,
     arg: parts[1],
   };
+}
+
+// Resolve opcode handlers once for each method body. Code items are shared by
+// every Frame for that method, so this removes the string lookup and `wide`
+// decoding from the interpreter's hottest loop without increasing per-frame
+// memory. Symbol properties stay out of AST serialization and debugger views.
+function prepareSyncInstructions(codeItems) {
+  if (!codeItems || codeItems[syncCodePrepared]) return;
+
+  for (const item of codeItems) {
+    if (!item) continue;
+    const instruction = item && item.instruction;
+    const op = typeof instruction === 'string' ? instruction : instruction && instruction.op;
+    const expanded = op === 'wide' ? expandWideInstruction(instruction) : instruction;
+    const expandedOp = op === 'wide' && expanded ? expanded.op : op;
+    Object.defineProperties(item, {
+      [syncHandler]: {
+        configurable: false,
+        enumerable: false,
+        value: expandedOp ? syncInstructions[expandedOp] || null : null,
+      },
+      [syncInstruction]: {
+        configurable: false,
+        enumerable: false,
+        value: expanded,
+      },
+    });
+  }
+
+  Object.defineProperty(codeItems, syncCodePrepared, {
+    configurable: false,
+    enumerable: false,
+    value: true,
+  });
 }
 
 function dispatch(frame, instruction, jvm, thread) {
@@ -115,3 +152,6 @@ function dispatchSync(frame, instruction, jvm, thread) {
 
 module.exports = dispatch;
 module.exports.dispatchSync = dispatchSync;
+module.exports.prepareSyncInstructions = prepareSyncInstructions;
+module.exports.syncHandler = syncHandler;
+module.exports.syncInstruction = syncInstruction;

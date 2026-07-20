@@ -12,7 +12,11 @@ const {
 } = require("../parsing/convert_tree");
 const jreClasses = require("../jre");
 const dispatch = require("../instructions");
-const { dispatchSync } = dispatch;
+const {
+  prepareSyncInstructions,
+  syncHandler,
+  syncInstruction,
+} = dispatch;
 const Frame = require("./frame");
 const DebugManager = require("../debug/DebugManager");
 const JNI = require("./jni");
@@ -25,9 +29,11 @@ const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
 const { createClock } = require('./fakeClock');
 
-function yieldToEventLoop() {
+function yieldToEventLoop(delayMs = 0) {
   return new Promise((resolve) => {
-    if (typeof setImmediate === "function") {
+    if (delayMs > 0) {
+      setTimeout(resolve, delayMs);
+    } else if (typeof setImmediate === "function") {
       setImmediate(resolve);
     } else {
       setTimeout(resolve, 0);
@@ -917,8 +923,11 @@ class JVM {
           (t) => t.status !== "terminated",
         );
         if (nonTerminated.length > 0) {
-          // Yield to allow time to pass for sleeping threads or external events.
-          await yieldToEventLoop();
+          // Do not spin a zero-delay task while every guest thread is parked.
+          // A short timer still lets browser I/O, rendering, and notifications
+          // wake a thread promptly, while eliminating tens of thousands of
+          // postMessage-based scheduler polls per second.
+          await yieldToEventLoop(this._idleWaitDelay(schedulerNow));
           return { completed: false };
           //		continue;
         } else {
@@ -988,6 +997,8 @@ class JVM {
       return { completed: false };
     }
 
+    prepareSyncInstructions(frame.instructions);
+
     const env = (typeof process !== 'undefined' && process.env) || {};
     const burstAllowed = options.allowBurst === true && !this.debugManager.debugMode &&
       !this.verbose && !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1' &&
@@ -1030,13 +1041,24 @@ class JVM {
             break;
           }
 
-          if (!burstAllowed || !dispatchSync(currentFrame, instruction, this, thread)) {
+          const handler = instructionItem[syncHandler];
+          if (!burstAllowed || !handler) {
             if (instructionInstrumentation) {
               await this.executeInstruction(instruction, currentFrame, thread);
             } else {
               await dispatch(currentFrame, instruction, this, thread);
             }
             break;
+          } else {
+            const result = handler(
+              currentFrame,
+              instructionItem[syncInstruction],
+              this,
+              thread,
+            );
+            if (result && typeof result.then === 'function') {
+              throw new Error('Synchronous instruction handler returned a Promise');
+            }
           }
         }
       } catch (e) {
@@ -1067,6 +1089,25 @@ class JVM {
     }
 
     return { completed: false, bytecodes: executedBytecodes };
+  }
+
+  _idleWaitDelay(schedulerNow) {
+    // Deterministic clocks advance when queried, not with wall time. Preserve
+    // their fast, reproducible scheduler behavior instead of sleeping.
+    if (this.clock && this.clock.enabled) return 0;
+
+    let nextDeadline = Infinity;
+    for (const thread of this.threads) {
+      if (thread.status === 'SLEEPING' && thread.sleepUntil !== undefined) {
+        nextDeadline = Math.min(nextDeadline, Number(thread.sleepUntil));
+      } else if (thread.status === 'WAITING' && thread.waitDeadline !== undefined) {
+        nextDeadline = Math.min(nextDeadline, Number(thread.waitDeadline));
+      }
+    }
+
+    if (!Number.isFinite(nextDeadline)) return this.eventLoopYieldMs;
+    const remaining = Math.ceil(nextDeadline - schedulerNow);
+    return Math.max(1, Math.min(this.eventLoopYieldMs, remaining));
   }
 
   shouldPause(currentPc, frame) {
