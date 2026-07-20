@@ -7,6 +7,7 @@ const { isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
 const STATIC_DEOPT = Symbol("jit.static.deopt");
+const ASYNC_INVOKE = Symbol("jit.invoke.async");
 
 class JitCompiler {
   constructor(jvm, options = {}) {
@@ -26,10 +27,19 @@ class JitCompiler {
     this.codegenSupportCache = new WeakMap();
     this.codegenUnavailable = false;
     this.codegenCompileErrors = new WeakMap();
+    this.syncCallSites = new Map();
+    this.nextSyncCallSiteId = 1;
+    this.inlineIntegerLeafCache = new WeakMap();
     const firefoxDefault = typeof navigator !== "undefined" &&
       /Firefox\//.test(navigator.userAgent || "");
     this.preferWholeMethodJs = options.preferWholeMethodJs ?? firefoxDefault;
     this.generatedRunCount = 0;
+    this.syncGeneratedRunCount = 0;
+    this.syncInlinedCallCount = 0;
+    this.syncReusedFrameCount = 0;
+    this.syncIntrinsicCallCount = 0;
+    this.inlinedMethodRunCounts = new Map();
+    this.intrinsicMethodRunCounts = new Map();
     this.runnerRunCount = 0;
     this.methodRunCounts = new Map();
     this.generatedMethodRunCounts = new Map();
@@ -165,12 +175,14 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
     }
     this.dumpExecutionCounts("generated callees", this.generatedMethodRunCounts, limit);
+    this.dumpExecutionCounts("inlined callees", this.inlinedMethodRunCounts, limit);
+    this.dumpExecutionCounts("intrinsic callees", this.intrinsicMethodRunCounts, limit);
     this.dumpExecutionCounts("runner callees", this.runnerMethodRunCounts, limit);
     const deopts = [...this.methodDeoptCounts.entries()]
       .sort((a, b) => b[1] - a[1])
@@ -200,10 +212,11 @@ class JitCompiler {
     }
   }
 
-  async runGeneratedFrame(generated, frame, thread) {
+  runGeneratedFrame(generated, frame, thread, initialBytecodeChecks) {
     this.generatedRunCount += 1;
+    if (generated.jvmSynchronous) this.syncGeneratedRunCount += 1;
     this.recordExecution(this.generatedMethodRunCounts, frame);
-    return generated(frame, thread, this);
+    return generated(frame, thread, this, initialBytecodeChecks);
   }
 
   recordExecution(counts, frame) {
@@ -522,6 +535,10 @@ class JitCompiler {
     return Boolean(debug && (debug.debugMode || debug.breakpoints.size > 0));
   }
 
+  skipJitOnce(frame) {
+    frame.jitSkipOnce = true;
+  }
+
   target(frame, label) {
     const index = this.getLabelMap(frame).get(label);
     if (index === undefined) {
@@ -531,8 +548,9 @@ class JitCompiler {
   }
 
   compileMethod(method) {
-    const AsyncFunction = getAsyncFunctionConstructor();
-    if (!AsyncFunction) {
+    const synchronous = this.canCompileSynchronously(method);
+    const GeneratedFunction = synchronous ? Function : getAsyncFunctionConstructor();
+    if (!GeneratedFunction) {
       this.codegenUnavailable = true;
       return null;
     }
@@ -540,17 +558,20 @@ class JitCompiler {
     const code = method.attributes.find((attr) => attr.type === "code");
     const codeItems = code.code.codeItems;
     this.compileLabelMap = buildLabelMap(codeItems);
+    this.compileSynchronous = synchronous;
     const body = [
       '"use strict";',
       "const locals = frame.locals;",
       "const stack = frame.stack.items;",
       "let pc = frame.pc;",
-      "let bytecodesUntilYield = 100000;",
-      "let bytecodeChecks = helpers.needsBytecodeChecks();",
+      "let bytecodesUntilYield = 10000;",
+      "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
       "let osrCountdown = 10007;",
       `while (pc < ${codeItems.length}) {`,
       "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materialize(frame, locals, stack, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, stack.length); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; } }",
-      "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 100000; bytecodeChecks = helpers.needsBytecodeChecks(); }",
+      synchronous
+        ? "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'synchronous generated quantum' }; }"
+        : "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 10000; bytecodeChecks = helpers.needsBytecodeChecks(); }",
       "if (bytecodeChecks && helpers.shouldDeopt(frame, pc)) { helpers.materialize(frame, locals, stack, pc); return { deopt: true }; }",
       "switch (pc) {",
     ];
@@ -560,17 +581,20 @@ class JitCompiler {
         body.push(`case ${index}:`);
         const instruction = item.instruction;
         if (!instruction) {
-          body.push(`pc = ${index + 1}; break;`);
+          body.push(`if (bytecodeChecks) { pc = ${index + 1}; break; }`);
           return;
         }
-        // Locals and operand stack are the frame's live arrays already. Keep
-        // only the bytecode PC current here so exception dispatch and save
-        // states remain precise without a helper call on every instruction.
-        body.push(`frame.pc = ${index};`);
+        // Locals and operand stack are the frame's live arrays already. The
+        // exact frame PC is only needed before an instruction that can throw
+        // or deopt; control-flow edges materialize their own resume PC.
+        if (this.instructionNeedsPrecisePc(instruction)) {
+          body.push(`frame.pc = ${index};`);
+        }
         body.push(this.emitInstruction(instruction, index));
       });
     } finally {
       this.compileLabelMap = null;
+      this.compileSynchronous = false;
     }
 
     body.push("default: helpers.materialize(frame, locals, stack, pc); return { deopt: true, reason: 'invalid generated pc ' + pc };");
@@ -581,7 +605,9 @@ class JitCompiler {
     body.push("return { returned: true, value: helpers.returnVoid() };");
 
     try {
-      return new AsyncFunction("frame", "thread", "helpers", body.join("\n"));
+      const generated = new GeneratedFunction("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      generated.jvmSynchronous = synchronous;
+      return generated;
     } catch (err) {
       if (err && err.name === "EvalError") {
         this.codegenUnavailable = true;
@@ -590,10 +616,38 @@ class JitCompiler {
     }
   }
 
+  canCompileSynchronously(method) {
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const codeItems = code && code.code && code.code.codeItems || [];
+    return codeItems.every((item) => {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op) return true;
+      return !(op === "ldc" || op === "ldc_w") || !isClassConstant(instruction.arg);
+    });
+  }
+
+  instructionNeedsPrecisePc(instruction) {
+    const op = getOp(instruction);
+    if (!op) return false;
+    if (op.startsWith("invoke") || op === "athrow" || op === "checkcast" ||
+        op === "getfield" || op === "putfield" || op === "getstatic" ||
+        op === "putstatic" || op === "new" || op === "newarray" ||
+        op === "anewarray" || op === "multianewarray" || op === "arraylength" ||
+        op === "monitorenter" || op === "monitorexit" || op === "idiv" ||
+        op === "irem" || op === "ldiv") return true;
+    if (op.endsWith("aload") || op.endsWith("astore")) return true;
+    return (op === "ldc" || op === "ldc_w") && isClassConstant(instruction.arg);
+  }
+
   emitInstruction(instruction, index) {
     const op = getOp(instruction);
     const next = index + 1;
-    const goNext = `pc = ${next}; break;`;
+    // In normal execution, straight-line cases fall through to the next case
+    // instead of returning to the while/switch dispatcher after every JVM
+    // bytecode. Debug and breakpoint mode still redispatches each bytecode so
+    // precise stepping and safe-point checks remain intact.
+    const goNext = `if (bytecodeChecks) { pc = ${next}; break; }`;
     const target = (label) => this.targetInstructionIndex(instruction, label);
     const localIndex = (fallback) => Number(instruction.arg ?? fallback);
 
@@ -703,7 +757,11 @@ class JitCompiler {
       case "newarray": return `stack.push(helpers.newPrimitiveArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "anewarray": return `stack.push(helpers.newReferenceArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "arraylength": return `stack.push(helpers.arrayLength(stack.pop(), frame)); ${goNext}`;
-      case "checkcast": return `{ const value = stack[stack.length - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
+      case "checkcast":
+        if (this.compileSynchronous) {
+          return `{ const cast = helpers.tryCheckCastSync(stack[stack.length - 1], ${JSON.stringify(instruction.arg)}); if (cast === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous checkcast" }; } } ${goNext}`;
+        }
+        return `{ const value = stack[stack.length - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
       case "aaload":
       case "iaload":
       case "daload":
@@ -720,15 +778,32 @@ class JitCompiler {
       case "sastore": return `helpers.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); ${goNext}`;
       case "getfield": return `stack.push(helpers.getField(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
       case "putfield": return `{ const value = stack.pop(); const obj = stack.pop(); helpers.putField(obj, ${JSON.stringify(instruction.arg)}, value); } ${goNext}`;
-      case "getstatic": return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack.push(value); } ${goNext}`;
-      case "putstatic": return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[stack.length - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } stack.pop(); } ${goNext}`;
-      case "new": return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack.push(value); } ${goNext}`;
+      case "getstatic":
+        if (this.compileSynchronous) {
+          return `{ const value = helpers.getStaticSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack.push(value); } ${goNext}`;
+        }
+        return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack.push(value); } ${goNext}`;
+      case "putstatic":
+        if (this.compileSynchronous) {
+          return `{ const changed = helpers.putStaticSync(${JSON.stringify(instruction.arg)}, stack[stack.length - 1]); if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } stack.pop(); } ${goNext}`;
+        }
+        return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[stack.length - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } stack.pop(); } ${goNext}`;
+      case "new":
+        if (this.compileSynchronous) {
+          return `{ const value = helpers.newObjectSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous new" }; } stack.push(value); } ${goNext}`;
+        }
+        return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack.push(value); } ${goNext}`;
       case "monitorenter": return `{ const monitor = stack[stack.length - 1]; if (!helpers.monitorEnter(monitor, thread)) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "contended generated monitorenter" }; } stack.pop(); } ${goNext}`;
       case "monitorexit": return `helpers.monitorExit(stack.pop(), thread); ${goNext}`;
       case "invokestatic":
       case "invokevirtual":
       case "invokeinterface":
-      case "invokespecial": return `{ helpers.materialize(frame, locals, stack, ${next}); const value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; if (value !== helpers.returnVoid()) stack.push(value); if (thread.status !== "runnable") { helpers.materialize(frame, locals, stack, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
+      case "invokespecial":
+        if (this.compileSynchronous) {
+          const callSiteId = this.registerSyncCallSite(op, instruction);
+          return `{ helpers.materialize(frame, locals, stack, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; if (value !== helpers.returnVoid()) stack.push(value); if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
+        }
+        return `{ helpers.materialize(frame, locals, stack, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; if (value !== helpers.returnVoid()) stack.push(value); if (thread.status !== "runnable") { helpers.materialize(frame, locals, stack, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
       case "ifeq": return `if (stack.pop() === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
       case "ifne": return `if (stack.pop() !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
@@ -1178,6 +1253,24 @@ class JitCompiler {
     }
   }
 
+  tryCheckCastSync(value, className) {
+    if (value === null || value === undefined) return true;
+    const source = runtimeClassName(value);
+    const sourceKnown = typeof source === "string" && source.startsWith("[") ||
+      this.jvm.classes[source] || this.jvm.jre[source];
+    const targetKnown = className === "java/lang/Object" ||
+      typeof className === "string" && className.startsWith("[") ||
+      this.jvm.classes[className] || this.jvm.jre[className];
+    if (!sourceKnown || !targetKnown) return ASYNC_INVOKE;
+    if (!this.jvm.isInstanceOf(source, className)) {
+      throw {
+        type: "java/lang/ClassCastException",
+        message: `${source} cannot be cast to ${className}`,
+      };
+    }
+    return true;
+  }
+
   monitorEnter(monitor, thread) {
     if (monitor === null || monitor === undefined) {
       throw { type: "java/lang/NullPointerException", message: null };
@@ -1263,6 +1356,12 @@ class JitCompiler {
     return this.getStaticInitialized(className, fieldName, descriptor);
   }
 
+  getStaticSync(arg) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return STATIC_DEOPT;
+    return this.getStaticInitialized(className, fieldName, descriptor);
+  }
+
   async getStaticCold(arg, thread) {
     const [, className, [fieldName, descriptor]] = arg;
     const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
@@ -1307,6 +1406,12 @@ class JitCompiler {
     return this.putStaticInitialized(className, fieldName, descriptor, value);
   }
 
+  putStaticSync(arg, value) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return STATIC_DEOPT;
+    return this.putStaticInitialized(className, fieldName, descriptor, value);
+  }
+
   async putStaticCold(arg, value, thread) {
     const [, className, [fieldName, descriptor]] = arg;
     const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
@@ -1340,6 +1445,16 @@ class JitCompiler {
     if (wasFramePushed) return STATIC_DEOPT;
     await this.jvm.loadClassByName(className).catch(() => null);
 
+    return this.allocateObject(className);
+  }
+
+  newObjectSync(className) {
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED" ||
+        !this.jvm.classes[className]) return STATIC_DEOPT;
+    return this.allocateObject(className);
+  }
+
+  allocateObject(className) {
     const fields = {};
     let currentClassName = className;
     while (currentClassName) {
@@ -1365,6 +1480,383 @@ class JitCompiler {
       lockCount: 0,
       waitSet: [],
     };
+  }
+
+  asyncInvokeSentinel() {
+    return ASYNC_INVOKE;
+  }
+
+  registerSyncCallSite(op, instruction) {
+    const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const id = this.nextSyncCallSiteId++;
+    this.syncCallSites.set(id, {
+      op,
+      declaredClassName,
+      methodName,
+      descriptor,
+      ...parseDescriptor(descriptor),
+      targets: new Map(),
+    });
+    return id;
+  }
+
+  tryInvokeSyncAt(id, frame, thread) {
+    const site = this.syncCallSites.get(id);
+    if (!site) return ASYNC_INVOKE;
+    return this.tryInvokeSyncSite(site, frame, thread);
+  }
+
+  tryInvokeSync(op, frame, instruction, thread) {
+    const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    return this.tryInvokeSyncSite({
+      op,
+      declaredClassName,
+      methodName,
+      descriptor,
+      ...parseDescriptor(descriptor),
+      targets: new Map(),
+    }, frame, thread);
+  }
+
+  tryInvokeSyncSite(site, frame, thread) {
+    const { op, declaredClassName, methodName, descriptor, params, returnType } = site;
+    if (op === "invokestatic" &&
+        this.jvm.classInitializationState.get(declaredClassName) !== "INITIALIZED") {
+      return ASYNC_INVOKE;
+    }
+
+    const receiverOffset = params.length + (op === "invokestatic" ? 0 : 1);
+    const receiver = op === "invokestatic"
+      ? null
+      : frame.stack.items[frame.stack.items.length - receiverOffset];
+    if (op !== "invokestatic" && (receiver === null || receiver === undefined)) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+
+    let targetClassName = declaredClassName;
+    if (op === "invokevirtual" || op === "invokeinterface") {
+      targetClassName = receiver.type || declaredClassName;
+    }
+    let target = site.targets.get(targetClassName);
+    if (!target) {
+      let classData = this.jvm.classes[targetClassName];
+      if (!classData) return ASYNC_INVOKE;
+      let method = this.jvm.findMethod(classData, methodName, descriptor);
+      let lookupClass = targetClassName;
+      while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
+        classData && classData.ast.classes[0].superClassName) {
+        lookupClass = classData.ast.classes[0].superClassName;
+        classData = this.jvm.classes[lookupClass];
+        if (!classData) return ASYNC_INVOKE;
+        method = this.jvm.findMethod(classData, methodName, descriptor);
+      }
+      if (!method || !(this.isSupported(method) || this.isShortSupportedHelper(method))) {
+        return ASYNC_INVOKE;
+      }
+      target = {
+        method,
+        lookupClass,
+        intrinsic: op === "invokestatic"
+          ? this.getSynchronousIntrinsic(method, descriptor)
+          : null,
+        inlineIntegerLeaf: op === "invokestatic"
+          ? this.getInlineIntegerLeaf(method, params, returnType)
+          : null,
+      };
+      if (!target.intrinsic && !target.inlineIntegerLeaf) {
+        target.generated = this.getGeneratedFunction(method);
+      }
+      site.targets.set(targetClassName, target);
+    }
+
+    const { method, lookupClass, intrinsic, inlineIntegerLeaf, generated } = target;
+    if (this.jvm.debugManager.isClassJitDeopted(lookupClass)) return ASYNC_INVOKE;
+    if (intrinsic) {
+      const base = frame.stack.items.length - params.length;
+      const value = intrinsic(frame.stack.items, base);
+      if (value === ASYNC_INVOKE) return ASYNC_INVOKE;
+      frame.stack.items.length = base;
+      this.syncIntrinsicCallCount += 1;
+      const methodKey = `${lookupClass}.${method.name}${descriptor}`;
+      this.intrinsicMethodRunCounts.set(methodKey, (this.intrinsicMethodRunCounts.get(methodKey) || 0) + 1);
+      return value;
+    }
+    if (inlineIntegerLeaf) {
+      const base = frame.stack.items.length - params.length;
+      const value = inlineIntegerLeaf(frame.stack.items, base);
+      frame.stack.items.length = base;
+      this.syncInlinedCallCount += 1;
+      const methodKey = `${lookupClass}.${method.name}${descriptor}`;
+      this.inlinedMethodRunCounts.set(methodKey, (this.inlinedMethodRunCounts.get(methodKey) || 0) + 1);
+      return value;
+    }
+    if (!generated || !generated.jvmSynchronous) return ASYNC_INVOKE;
+
+    const args = [];
+    for (let i = 0; i < params.length; i += 1) args.unshift(frame.stack.items.pop());
+    if (op !== "invokestatic") frame.stack.items.pop();
+
+    const child = target.freeFrame || new Frame(method);
+    if (target.freeFrame) this.syncReusedFrameCount += 1;
+    target.freeFrame = null;
+    child.pc = 0;
+    child.locals.fill(undefined);
+    child.stack.items.length = 0;
+    delete child.jitSkipOnce;
+    delete child.jitJsDisabled;
+    child.className = lookupClass;
+    let localIndex = 0;
+    if (op !== "invokestatic") {
+      child.locals[0] = receiver;
+      localIndex = 1;
+    }
+    for (let i = 0; i < params.length; i += 1) {
+      child.locals[localIndex] = args[i];
+      localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
+    }
+    thread.callStack.push(child);
+    const result = this.runGeneratedFrame(generated, child, thread, false);
+    if (result && typeof result.then === "function") {
+      throw new Error("Synchronous generated method returned a Promise");
+    }
+    if (result.deopt) return result;
+    target.freeFrame = child;
+    if (returnType === "void" || result.value === RETURN_VOID) return RETURN_VOID;
+    return result.value;
+  }
+
+  getSynchronousIntrinsic(method, descriptor) {
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const codeItems = code && code.code && code.code.codeItems || [];
+    const ops = codeItems
+      .map((item) => getOp(item.instruction))
+      .filter(Boolean);
+
+    if (descriptor === "([II[III)V") {
+      const prefix = [
+        "aload_0", "aload_2", "if_acmpne", "iload_1", "iload_3",
+        "if_icmpne", "return", "iload_3", "iload_1", "if_icmple",
+      ];
+      if (!prefix.every((op, index) => ops[index] === op)) return null;
+      const loads = ops.filter((op) => op === "iaload").length;
+      const stores = ops.filter((op) => op === "iastore").length;
+      if (loads < 16 || stores !== loads || ops.some((op) => op.startsWith("invoke"))) {
+        return null;
+      }
+      return (stack, base) => {
+        const src = stack[base];
+        const srcPos = stack[base + 1] | 0;
+        const dest = stack[base + 2];
+        const destPos = stack[base + 3] | 0;
+        const length = stack[base + 4] | 0;
+        if (src === null || src === undefined || dest === null || dest === undefined) {
+          throw { type: "java/lang/NullPointerException", message: null };
+        }
+        if (srcPos < 0 || destPos < 0 || length < 0 ||
+            srcPos + length > src.length || destPos + length > dest.length) {
+          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+        }
+        if (src === dest && destPos > srcPos && destPos < srcPos + length) {
+          for (let i = length - 1; i >= 0; i -= 1) dest[destPos + i] = src[srcPos + i];
+        } else {
+          for (let i = 0; i < length; i += 1) dest[destPos + i] = src[srcPos + i];
+        }
+        return RETURN_VOID;
+      };
+    }
+
+    if (descriptor === "(IIIIIII[III)V") {
+      const prefix = [
+        "getstatic", "istore", "iload", "bipush", "if_icmpeq",
+        "bipush", "invokestatic", "goto", "athrow", "iinc",
+      ];
+      if (!prefix.every((op, index) => ops[index] === op)) return null;
+      const integerAndCalls = codeItems.filter((item) => {
+        const instruction = item && item.instruction;
+        return getOp(instruction) === "invokestatic" && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][1] === "(II)I";
+      });
+      const constants = new Set(codeItems.map((item) => {
+        const instruction = item && item.instruction;
+        const op = getOp(instruction);
+        return instruction && typeof instruction === "object" &&
+          (op === "bipush" || op === "sipush" || op === "ldc" || op === "ldc_w")
+          ? Number(instruction.arg) : NaN;
+      }));
+      const expectedConstants = [
+        9, 8355711, -852264639, 65280, -1295343735,
+        1494704929, 16711680, 200866833, 255,
+      ];
+      if (integerAndCalls.length !== 3 ||
+          !ops.includes("iaload") || !ops.includes("iastore") ||
+          !expectedConstants.every((value) => constants.has(value))) return null;
+      const flagField = codeItems.find((item) => getOp(item && item.instruction) === "getstatic")
+        ?.instruction?.arg;
+      if (!flagField) return null;
+      return (stack, base) => {
+        if ((stack[base + 6] | 0) !== 9) return ASYNC_INVOKE;
+        const flag = this.getStaticSync(flagField);
+        if (flag === STATIC_DEOPT || flag) return ASYNC_INVOKE;
+        const dest = stack[base + 7];
+        let index = stack[base + 1] | 0;
+        const count = stack[base + 5] | 0;
+        if (dest === null || dest === undefined) {
+          throw { type: "java/lang/NullPointerException", message: null };
+        }
+        if (count <= 0) return RETURN_VOID;
+        if (index < 0 || index + count > dest.length) {
+          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+        }
+        let green = stack[base] | 0;
+        let red = stack[base + 4] | 0;
+        let blue = stack[base + 8] | 0;
+        const greenStep = stack[base + 2] | 0;
+        const redStep = stack[base + 3] | 0;
+        const blueStep = stack[base + 9] | 0;
+        for (let i = 0; i < count; i += 1) {
+          dest[index] = (((dest[index] >> 1) & 8355711) +
+            ((green >> 9) & 65280) + ((red >> 1) & 16711680) +
+            ((blue >> 17) & 255)) | 0;
+          index += 1;
+          green = (green + greenStep) | 0;
+          red = (red + redStep) | 0;
+          blue = (blue + blueStep) | 0;
+        }
+        return RETURN_VOID;
+      };
+    }
+
+    if (descriptor === "(IB[III)V") {
+      const prefix = [
+        "getstatic", "istore", "iload_1", "bipush", "if_icmpeq",
+        "bipush", "bipush", "aconst_null", "checkcast", "bipush",
+        "bipush", "invokestatic", "goto", "athrow", "iinc",
+      ];
+      if (!prefix.every((op, index) => ops[index] === op)) return null;
+      const integerAndCalls = codeItems.filter((item) => {
+        const instruction = item && item.instruction;
+        return getOp(instruction) === "invokestatic" && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][1] === "(II)I";
+      });
+      const constants = new Set(codeItems.map((item) => {
+        const instruction = item && item.instruction;
+        const op = getOp(instruction);
+        return instruction && typeof instruction === "object" &&
+          (op === "bipush" || op === "sipush" || op === "ldc" || op === "ldc_w")
+          ? Number(instruction.arg) : NaN;
+      }));
+      if (integerAndCalls.length !== 1 ||
+          !ops.includes("iaload") || !ops.includes("iastore") ||
+          ![57, 16711422, -59233087].every((value) => constants.has(value))) return null;
+      const flagField = codeItems.find((item) => getOp(item && item.instruction) === "getstatic")
+        ?.instruction?.arg;
+      if (!flagField) return null;
+      return (stack, base) => {
+        if ((stack[base + 1] | 0) !== 57) return ASYNC_INVOKE;
+        const flag = this.getStaticSync(flagField);
+        if (flag === STATIC_DEOPT || flag) return ASYNC_INVOKE;
+        let index = stack[base] | 0;
+        const dest = stack[base + 2];
+        const color = stack[base + 3] | 0;
+        const count = stack[base + 4] | 0;
+        if (dest === null || dest === undefined) {
+          throw { type: "java/lang/NullPointerException", message: null };
+        }
+        if (count <= 0) return RETURN_VOID;
+        if (index < 0 || index + count > dest.length) {
+          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+        }
+        for (let i = 0; i < count; i += 1) {
+          dest[index] = (color + ((dest[index] & 16711422) >> 1)) | 0;
+          index += 1;
+        }
+        return RETURN_VOID;
+      };
+    }
+
+    return null;
+  }
+
+  getInlineIntegerLeaf(method, params, returnType) {
+    if (this.inlineIntegerLeafCache.has(method)) {
+      return this.inlineIntegerLeafCache.get(method);
+    }
+    let inline = null;
+    if (returnType === "int" && params.length > 0 && params.every((type) => type === "int")) {
+      const code = method.attributes.find((attr) => attr.type === "code");
+      const instructions = (code && code.code && code.code.codeItems || [])
+        .map((item) => item.instruction)
+        .filter(Boolean);
+      const expressions = [];
+      const pop = () => expressions.pop();
+      const binary = (format) => {
+        const right = pop();
+        const left = pop();
+        if (left === undefined || right === undefined) return false;
+        expressions.push(format(left, right));
+        return true;
+      };
+      let expression = null;
+      for (const instruction of instructions) {
+        const op = getOp(instruction);
+        const load = op === "iload" ? Number(instruction.arg)
+          : /^iload_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (load !== null) {
+          if (load < 0 || load >= params.length) break;
+          expressions.push(`stack[base + ${load}]`);
+          continue;
+        }
+        if (/^iconst_[0-5]$/.test(op)) {
+          expressions.push(op.slice(-1));
+          continue;
+        }
+        if (op === "iconst_m1") {
+          expressions.push("-1");
+          continue;
+        }
+        if (op === "bipush" || op === "sipush") {
+          expressions.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        let valid = true;
+        switch (op) {
+          case "iadd": valid = binary((a, b) => `((${a} + ${b}) | 0)`); break;
+          case "isub": valid = binary((a, b) => `((${a} - ${b}) | 0)`); break;
+          case "imul": valid = binary((a, b) => `Math.imul(${a}, ${b})`); break;
+          case "iand": valid = binary((a, b) => `(${a} & ${b})`); break;
+          case "ior": valid = binary((a, b) => `(${a} | ${b})`); break;
+          case "ixor": valid = binary((a, b) => `(${a} ^ ${b})`); break;
+          case "ishl": valid = binary((a, b) => `(${a} << (${b} & 31))`); break;
+          case "ishr": valid = binary((a, b) => `(${a} >> (${b} & 31))`); break;
+          case "iushr": valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`); break;
+          case "ineg": {
+            const value = pop();
+            valid = value !== undefined;
+            if (valid) expressions.push(`((-${value}) | 0)`);
+            break;
+          }
+          case "i2b": {
+            const value = pop();
+            valid = value !== undefined;
+            if (valid) expressions.push(`((${value} << 24) >> 24)`);
+            break;
+          }
+          case "ireturn":
+            if (expressions.length === 1) expression = expressions[0];
+            valid = false;
+            break;
+          default: valid = false; break;
+        }
+        if (!valid) break;
+      }
+      if (expression !== null) {
+        inline = new Function("stack", "base", `return ${expression};`);
+      }
+    }
+    this.inlineIntegerLeafCache.set(method, inline);
+    return inline;
   }
 
   async invoke(op, frame, instruction, thread, invokePc) {

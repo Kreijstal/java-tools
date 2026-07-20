@@ -87,6 +87,103 @@ test('initialized static fields stay on the synchronous generated fast path', (t
   t.end();
 });
 
+test('structural primitive array-copy intrinsic preserves overlap semantics', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const prefix = [
+    'aload_0', 'aload_2', 'if_acmpne', 'iload_1', 'iload_3',
+    'if_icmpne', 'return', 'iload_3', 'iload_1', 'if_icmple',
+  ];
+  const body = [];
+  for (let i = 0; i < 16; i += 1) body.push('iaload', 'iastore');
+  const method = {
+    attributes: [{
+      type: 'code',
+      code: { codeItems: [...prefix, ...body].map((instruction) => ({ instruction })) },
+    }],
+  };
+  const intrinsic = jvm.jit.getSynchronousIntrinsic(method, '([II[III)V');
+  t.equal(typeof intrinsic, 'function', 'unrolled primitive copy shape is recognized');
+
+  const source = [1, 2, 3, 4];
+  const destination = [0, 0, 0, 0];
+  intrinsic([source, 1, destination, 0, 3], 0);
+  t.deepEqual(destination, [2, 3, 4, 0], 'distinct arrays copy the selected range');
+
+  const overlapping = [1, 2, 3, 4, 5];
+  intrinsic([overlapping, 0, overlapping, 1, 4], 0);
+  t.deepEqual(overlapping, [1, 1, 2, 3, 4], 'overlapping copies retain memmove ordering');
+  t.end();
+});
+
+test('structural packed-color scanline intrinsic preserves pixel arithmetic', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classes.Flags = {
+    staticFields: new Map([['enabled:Z', 0]]),
+    ast: { classes: [{ superClassName: null }] },
+  };
+  jvm.classInitializationState.set('Flags', 'INITIALIZED');
+  const flag = ['Field', 'Flags', ['enabled', 'Z']];
+  const integerAnd = () => ({
+    instruction: { op: 'invokestatic', arg: ['Method', 'Masks', ['and', '(II)I']] },
+  });
+  const items = [
+    { instruction: { op: 'getstatic', arg: flag } },
+    ...['istore', 'iload', 'bipush', 'if_icmpeq', 'bipush'].map((instruction) => ({ instruction })),
+    integerAnd(),
+    ...['goto', 'athrow', 'iinc', 'iaload'].map((instruction) => ({ instruction })),
+    integerAnd(), integerAnd(),
+    { instruction: 'iastore' },
+    ...[
+      9, 8355711, -852264639, 65280, -1295343735,
+      1494704929, 16711680, 200866833, 255,
+    ].map((arg) => ({ instruction: { op: 'ldc', arg } })),
+  ];
+  const method = {
+    attributes: [{ type: 'code', code: { codeItems: items } }],
+  };
+  const intrinsic = jvm.jit.getSynchronousIntrinsic(method, '(IIIIIII[III)V');
+  t.equal(typeof intrinsic, 'function', 'packed-color scanline shape is recognized');
+
+  const pixels = [0x123456, 0xabcdef];
+  intrinsic([0x224400, 0, 0x200, 2, 0x6688aa, 2, 9, pixels, 0x336699, 0x20000], 0);
+  t.deepEqual(pixels, [0x3c2b44, 0x887791],
+    'native scanline loop matches generated integer shifts, masks, and overflow');
+  t.end();
+});
+
+test('structural constant-color scanline intrinsic preserves pixel arithmetic', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classes.Flags = {
+    staticFields: new Map([['enabled:Z', 0]]),
+    ast: { classes: [{ superClassName: null }] },
+  };
+  jvm.classInitializationState.set('Flags', 'INITIALIZED');
+  const flag = ['Field', 'Flags', ['enabled', 'Z']];
+  const prefix = [
+    { instruction: { op: 'getstatic', arg: flag } },
+    ...[
+      'istore', 'iload_1', 'bipush', 'if_icmpeq', 'bipush', 'bipush',
+      'aconst_null', 'checkcast', 'bipush', 'bipush',
+    ].map((instruction) => ({ instruction })),
+    { instruction: {
+      op: 'invokestatic', arg: ['Method', 'Masks', ['and', '(II)I']],
+    } },
+    ...['goto', 'athrow', 'iinc', 'iaload', 'iastore'].map((instruction) => ({ instruction })),
+    ...[57, 16711422, -59233087].map((arg) => ({ instruction: { op: 'ldc', arg } })),
+  ];
+  const method = {
+    attributes: [{ type: 'code', code: { codeItems: prefix } }],
+  };
+  const intrinsic = jvm.jit.getSynchronousIntrinsic(method, '(IB[III)V');
+  t.equal(typeof intrinsic, 'function', 'constant-color scanline shape is recognized');
+
+  const pixels = [0x123456, 0xabcdef];
+  intrinsic([0, 57, pixels, 0x10203, 2], 0);
+  t.deepEqual(pixels, [0x0a1c2e, 0x56687a],
+    'native constant-color loop matches generated mask, shift, and addition');
+  t.end();
+});
+
 test('JIT produces same PyramidApplet mock drawing operations as interpreter', async (t) => {
   const interpreted = await createPyramidHarness({ enabled: false });
   const jitted = await createPyramidHarness({ warmupThreshold: 0 });
@@ -320,7 +417,12 @@ public class NestedGeneratedJitHarness {
   const out = [0, 0, 0, 0];
   await invoke(jvm, thread, 'NestedGeneratedJitHarness', 'compute', '([I)V', [out]);
   t.deepEqual(out, [0, 3, 6, 9], 'nested generated calls preserve results');
-  t.equal(jvm.jit.generatedRunCount, 5, 'outer loop and four child calls use generated code');
+  t.equal(jvm.jit.generatedRunCount, 2,
+    'caller and first helper cross the initial class-initialization boundary');
+  t.equal(jvm.jit.syncGeneratedRunCount, 2,
+    'generated caller and helper complete synchronously without Promise handoffs');
+  t.equal(jvm.jit.syncInlinedCallCount, 3,
+    'remaining integer leaf calls execute inline without child frames');
   t.equal(jvm.jit.runnerRunCount, 0, 'nested generated calls avoid the bytecode runner');
   t.end();
 });
@@ -461,6 +563,8 @@ public class GeneratedInterfaceJitHarness {
   t.deepEqual(out, [7, 7, 7, 7], 'invokeinterface preserves dynamic dispatch and return values');
   t.equal(jvm.jit.runnerRunCount, 0, 'interface accessors avoid the bytecode runner');
   t.equal(jvm.jit.generatedRunCount, 5, 'outer loop and interface accessor use generated code');
+  t.equal(jvm.jit.syncReusedFrameCount, 3,
+    'repeated interface calls recycle their completed child frame');
   t.end();
 });
 
