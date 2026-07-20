@@ -374,6 +374,40 @@ one in 16 calls), activate only after nonblack pixels, and compare multiple
 runs. Use counters to explain control flow, then use timings to choose the next
 target.
 
+### Use the native Firefox sampler to separate tiers
+
+A Gecko profiler run used 1 ms sampling with the `js` and `stackwalk` features,
+then selected the approximately three-second content-process window containing
+the first 20 nonblack logo changes. Sampling itself reduced the observed rate
+from the normal 8.2-ish range to 7.10 changed images/s, so treat the percentages
+as attribution rather than an FPS baseline. The selected window contained 3,000
+samples:
+
+| Execution context | Samples |
+|---|---:|
+| generated JavaScript tier | 47.1% |
+| partial Wasm plus its JavaScript imports | 13.2% |
+| bytecode interpreter | 12.9% |
+| AWT/presentation | 1.6% |
+| unresolved native/browser/other JVM frames | 25.3% |
+
+Exclusive leaves within the generated-JavaScript share were 33.6% in generated
+guest/JIT code, 7.4% in generated field helpers, 1.7% in generated call
+dispatch, 1.5% in checked array helpers, 0.6% in recognized raster intrinsics,
+and 0.2% in frame materialization. `getStaticSyncAt` alone was the largest
+named runtime leaf at 5.8% of all selected samples. This explains why removing
+only Java call-stack push/pop was neutral: the profiler found little exclusive
+time there.
+
+The partial-Wasm result is also important. JavaScript import/conversion glue
+accounted for 8.2% of all samples, while actual Wasm bodies and trampolines were
+only 2.9%; the remainder was unresolved native/Wasm frames. Do not assume that
+more partial Wasm coverage is automatically faster in Firefox. The next useful
+A/B test is to keep import-heavy or exit-heavy methods in a whole JavaScript
+tier, or make their field/array access stay within Wasm. Disabling Wasm globally
+would send unsupported methods back to the interpreter and is not an adequate
+test of that hypothesis.
+
 ### Establish the plain-JavaScript canvas ceiling
 
 Use `npm run benchmark:canvas:firefox` to separate browser canvas cost from JVM
