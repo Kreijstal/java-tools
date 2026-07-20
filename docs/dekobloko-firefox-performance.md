@@ -8,9 +8,10 @@ them.
 
 The results below were obtained on 2026-07-20 with Firefox/SpiderMonkey, an
 800x600 software canvas, and `dekobloko.jar` served from a test page listening on
-`0.0.0.0:3765`. The last validated JVM revision was `ab3769b`. Absolute timings
-depend on the machine and Firefox build; comparisons are useful only with the
-same JAR, bundle, browser, probe window, and host load.
+`0.0.0.0:3765`. The initial optimized baseline was JVM revision `ab3769b`; the
+later results described below include the follow-up field-site and generated-call
+changes. Absolute timings depend on the machine and Firefox build; comparisons
+are useful only with the same JAR, bundle, browser, probe window, and host load.
 
 ## What was fixed
 
@@ -39,10 +40,12 @@ causes.
 
 The measured Firefox logo-animation rate progressed from approximately
 **1.4-1.5 changed frames/s**, through **4.4-4.6 changed frames/s**, to about
-**5.3-5.4 changed frames/s** at `ab3769b` (20 observed changed images over about
-3.7 seconds). This is a changed-image throughput measurement, not the browser's
-`requestAnimationFrame` presentation rate. The corresponding interval-based
-rate has 19 intervals and is slightly lower; the probe reports both values.
+**5.3-5.4 changed frames/s** at `ab3769b`, then **7.14 changed frames/s** with
+cached generated field sites, and finally **7.64-7.90 changed frames/s** after
+removing generated-call argument shuffling. This is a changed-image throughput
+measurement, not the browser's `requestAnimationFrame` presentation rate. The
+corresponding interval-based rate has 19 intervals and is slightly lower; the
+probe reports both values.
 
 Cold time remained roughly 52-54 seconds in the final headless test. That was
 accepted because the product decision was to prioritize sustained runtime speed
@@ -131,6 +134,26 @@ frame, thread status, and call stack still permit it. Calls, sleeps, waits,
 blocking operations, instrumentation, debugger mode, and the quantum limit still
 stop execution at safe boundaries.
 
+### Cache generated field access sites
+
+The direct-JavaScript ceiling experiment exposed another large source/JVM gap:
+generated `getfield` and `getstatic` originally repeated descriptor unpacking,
+class-hierarchy walking, field-key discovery, and map lookup for every access.
+The logo model loop performs these operations for every vertex and face.
+
+Generated code now registers field sites at compile time. An instance site
+caches the resolved owner slot per runtime type; a static site caches the
+declaring class's field map and key while still checking class initialization on
+every access. In the checked-in Node microbenchmark, cached instance reads
+improved from about 16.0M to 82-89M accesses/s and inherited static reads from
+about 10.1M to 73-75M/s on the validated host.
+
+In Firefox, this raised the 20-image logo measurement from 5.33 images/s to
+7.10, 6.98, and finally 7.14 images/s, about a 34% improvement at the best
+matched run. The expected logo and final surface hashes remained present.
+Inlining array helper checks afterward measured 7.06 images/s, which was
+neutral, so that experiment was removed.
+
 ### Keep Firefox in one engine tier when possible
 
 SpiderMonkey performed poorly when a hot method repeatedly crossed from partial
@@ -162,6 +185,19 @@ intrinsics cover:
 These are recognized from bytecode structure and constants, not application
 class names. Every intrinsic retains Java null, bounds, overflow, shift, and
 class-initialization behavior or falls back to normal invocation.
+
+Registered call sites and field sites use integer-indexed arrays rather than
+maps. A generated call copies arguments directly from the caller's existing
+operand array into the recycled child locals; it does not build an argument
+array with repeated `unshift` and then pop every source operand. Recycled locals
+are cleared only while debugger or breakpoint checks are active. Verified
+bytecode cannot read a non-parameter local before storing it, so erasing all 43
+locals on every `oj` triangle invocation was redundant during normal play.
+
+The direct argument transfer moved repeated Firefox measurements from 7.14 to
+7.64 and 7.90 changed images/s. A subsequent no-local-clear run measured 7.69,
+inside the same band; treat the local clear as removed work, not as a separately
+demonstrated FPS gain.
 
 ### Fuse generated basic blocks
 
@@ -242,6 +278,14 @@ forgotten.
   on the main thread. A worker design would require copying, atomics, or RPC at
   synchronization points. No evidence showed that this overhead would beat
   reducing dispatch inside one thread, so it was not implemented.
+- **Mapping Java threads directly to Web Workers is a runtime redesign, not a
+  scheduler toggle.** The current heap consists of ordinary JavaScript objects,
+  maps, arrays, monitors, and call stacks, none of which can be shared directly
+  between workers. A correct mapping needs a SharedArrayBuffer-backed heap,
+  atomic monitor/wait semantics, cross-worker class initialization, exception
+  delivery, debugger coordination, and main-thread AWT presentation. A single
+  raster worker could improve UI responsiveness, but copying or sharing its
+  model/pixel buffers would not make the same computation intrinsically faster.
 - **Batching repeated JIT attempts up to 64 was neutral and initially harmful.**
   A transient deopt can return `handled: true` without advancing PC or changing
   the Java call stack. The loop retried the same frame 64 times and caused about
@@ -323,6 +367,32 @@ one in 16 calls), activate only after nonblack pixels, and compare multiple
 runs. Use counters to explain control flow, then use timings to choose the next
 target.
 
+### Establish the plain-JavaScript canvas ceiling
+
+Use `npm run benchmark:canvas:firefox` to separate browser canvas cost from JVM
+cost. On the validated Firefox 146 headless build, all requestAnimationFrame
+tests sustained 60 FPS:
+
+| Work per 800x600 frame | Render time |
+|---|---:|
+| `requestAnimationFrame` only | 0.01 ms |
+| `putImageData` only | 1.02 ms |
+| full JavaScript color raster plus upload | 3.29 ms |
+| full-frame Jagex-style blend plus upload | 4.28 ms |
+
+The same blend ran about 810-815 times/s in a tight loop including
+`putImageData`; the checked-in benchmark reports both its rAF and unconstrained
+tests. This rules out Firefox's canvas upload and raw integer pixel math as the
+reason for 5 FPS. The useful optimization target is JVM representation and
+generated control/call overhead.
+
+The non-invasive logo counter window also measured 323 `ug` model renders,
+40,660 `wf`/`oj` gradient triangles, and 8,816 `tb`/`ib` triangles for 20 changed
+images. That is roughly 16 model submissions and 2,474 triangle submissions per
+changed image, plus 391,849 array-copy/constant-scanline intrinsic calls. These
+counts justify optimizing compiled field and call sites before moving the
+renderer to a worker.
+
 ## Reproducing the Firefox measurement
 
 Build the production bundle, because the unbundled and bundled async behavior
@@ -351,6 +421,19 @@ With the page running locally, profile it using the checked-in probe:
 PROBE_WAIT_MS=65000 npm run profile:dekobloko:firefox
 ```
 
+Measure the raw browser/canvas ceiling with:
+
+```bash
+FIREFOX_EXECUTABLE_PATH=/path/to/firefox \
+npm run benchmark:canvas:firefox
+```
+
+Reproduce the generated field-resolution microbenchmark with:
+
+```bash
+npm run benchmark:jit:fields
+```
+
 Useful overrides are:
 
 ```bash
@@ -369,12 +452,16 @@ was not installed.
 
 The output includes the raw surface changes, both changed-frame rate
 conventions, page status, JIT tier counters, hot generated/inlined/intrinsic
-method counts, and deoptimization reasons. A validation run of this checked-in
-probe observed the expected first hashes `4025147891`, `4136367231`, reached the
-logo endpoint hash `2740534465`, and measured 20 changed images in 3749.46 ms:
-5.33 changed images/s or 5.07 transition intervals/s. Save the JSON together
-with the JVM commit, JAR hash, Firefox version, bundle hash, and host details for
-a defensible comparison.
+method counts, and deoptimization reasons. The `ab3769b` baseline observed the
+expected first hashes `4025147891`, `4136367231`, reached the logo endpoint hash
+`2740534465`, and measured 20 changed images in 3749.46 ms: 5.33 changed
+images/s or 5.07 transition intervals/s. The field-site build retained those
+hashes and measured 20 images in 2800 ms: 7.14 changed images/s or 6.79
+transition intervals/s. The final call-transfer build measured 7.64 and 7.90
+changed images/s in two runs; the no-local-clear follow-up measured 20 images in
+2600.32 ms, or 7.69 changed images/s and 7.31 transition intervals/s. Save the
+JSON together with the JVM commit, JAR hash, Firefox version, bundle hash, and
+host details for a defensible comparison.
 
 Run the focused correctness suite after JIT edits:
 
@@ -382,8 +469,8 @@ Run the focused correctness suite after JIT edits:
 timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
 ```
 
-At `ab3769b` this passed all 123 assertions. Scheduler/dispatch edits should also
-run:
+The field-site build passed all 127 assertions. Scheduler/dispatch edits should
+also run:
 
 ```bash
 timeout 120s node node_modules/tape/bin/tape \

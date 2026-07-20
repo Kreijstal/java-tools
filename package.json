@@ -6,6 +6,8 @@
     "test": "node scripts/run-tests.js",
     "test:specific": "node scripts/run-tests.js",
     "test:playwright": "playwright test",
+    "benchmark:canvas:firefox": "node scripts/benchmarkFirefoxCanvas.js",
+    "benchmark:jit:fields": "node scripts/benchmarkJitFieldSites.js",
     "profile:dekobloko:firefox": "node scripts/profileDekoblokoFirefox.js",
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",

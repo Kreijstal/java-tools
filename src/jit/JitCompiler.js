@@ -27,8 +27,10 @@ class JitCompiler {
     this.codegenSupportCache = new WeakMap();
     this.codegenUnavailable = false;
     this.codegenCompileErrors = new WeakMap();
-    this.syncCallSites = new Map();
+    this.syncCallSites = [];
     this.nextSyncCallSiteId = 1;
+    this.fieldSites = [];
+    this.nextFieldSiteId = 1;
     this.inlineIntegerLeafCache = new WeakMap();
     const firefoxDefault = typeof navigator !== "undefined" &&
       /Firefox\//.test(navigator.userAgent || "");
@@ -827,7 +829,8 @@ class JitCompiler {
           body.push(`locals[${variable}] = (locals[${variable}] + ${increment}) | 0;`);
         } else if (op === "getstatic") {
           const value = temp();
-          body.push(`frame.pc = ${index}; const ${value} = helpers.getStaticSync(${JSON.stringify(instruction.arg)});`);
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          body.push(`frame.pc = ${index}; const ${value} = helpers.getStaticSyncAt(${fieldSiteId});`);
           if (expressions.length) body.push(...saveStack(expressions));
           body.push(`if (${value} === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization in stackless raster" }; }`);
           expressions.push(value);
@@ -1136,16 +1139,24 @@ class JitCompiler {
       case "bastore":
       case "castore":
       case "sastore": return `{ const value = stack[--sp]; const index = stack[--sp]; helpers.arrayStore(value, index, stack[--sp], frame); } ${goNext}`;
-      case "getfield": return `stack[sp - 1] = helpers.getField(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
-      case "putfield": return `{ const value = stack[--sp]; helpers.putField(stack[--sp], ${JSON.stringify(instruction.arg)}, value); } ${goNext}`;
+      case "getfield": {
+        const fieldSiteId = this.registerFieldSite(instruction.arg);
+        return `stack[sp - 1] = helpers.getFieldAt(${fieldSiteId}, stack[sp - 1]); ${goNext}`;
+      }
+      case "putfield": {
+        const fieldSiteId = this.registerFieldSite(instruction.arg);
+        return `{ const value = stack[--sp]; helpers.putFieldAt(${fieldSiteId}, stack[--sp], value); } ${goNext}`;
+      }
       case "getstatic":
         if (this.compileSynchronous) {
-          return `{ const value = helpers.getStaticSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack[sp++] = value; } ${goNext}`;
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          return `{ const value = helpers.getStaticSyncAt(${fieldSiteId}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack[sp++] = value; } ${goNext}`;
         }
         return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack[sp++] = value; } ${goNext}`;
       case "putstatic":
         if (this.compileSynchronous) {
-          return `{ const changed = helpers.putStaticSync(${JSON.stringify(instruction.arg)}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          return `{ const changed = helpers.putStaticSyncAt(${fieldSiteId}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
         }
         return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[sp - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } sp -= 1; } ${goNext}`;
       case "new":
@@ -1685,6 +1696,154 @@ class JitCompiler {
     arrayRef[index] = value;
   }
 
+  registerFieldSite(arg) {
+    const [, className, [fieldName, descriptor]] = arg;
+    const id = this.nextFieldSiteId++;
+    this.fieldSites[id] = {
+      arg,
+      className,
+      fieldName,
+      descriptor,
+      directKey: `${className}.${fieldName}`,
+      instanceKeys: new Map(),
+      staticTarget: null,
+    };
+    return id;
+  }
+
+  getFieldAt(id, objRef) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated field site ${id}`);
+    if (objRef === null || objRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!objRef.fields) {
+      return objRef[site.directKey] ?? objRef[site.fieldName];
+    }
+
+    const runtimeType = objRef.type || objRef._className || site.className;
+    if (Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)) {
+      return objRef.fields[site.directKey];
+    }
+    const cachedKey = site.instanceKeys.get(runtimeType);
+    if (cachedKey && Object.prototype.hasOwnProperty.call(objRef.fields, cachedKey)) {
+      return objRef.fields[cachedKey];
+    }
+    const fieldKey = resolveInstanceFieldKey(
+      this.jvm, objRef, site.className, site.fieldName,
+    );
+    if (fieldKey) site.instanceKeys.set(runtimeType, fieldKey);
+    return fieldKey ? objRef.fields[fieldKey] : undefined;
+  }
+
+  putFieldAt(id, objRef, value) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated field site ${id}`);
+    if (objRef === null || objRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!objRef.fields) objRef.fields = {};
+    const runtimeType = objRef.type || objRef._className || site.className;
+    let fieldKey = Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)
+      ? site.directKey
+      : site.instanceKeys.get(runtimeType);
+    if (!fieldKey || !Object.prototype.hasOwnProperty.call(objRef.fields, fieldKey)) {
+      fieldKey = resolveInstanceFieldKey(this.jvm, objRef, site.className, site.fieldName)
+        || site.directKey;
+      site.instanceKeys.set(runtimeType, fieldKey);
+    }
+    objRef.fields[fieldKey] = value;
+    objRef[site.fieldName] = value;
+  }
+
+  resolveStaticFieldSite(site, forWrite = false) {
+    const key = `${site.fieldName}:${site.descriptor}`;
+    let currentClassName = site.className;
+    while (currentClassName) {
+      const classData = this.jvm.classes[currentClassName];
+      if (classData && classData.staticFields) {
+        if (classData.staticFields.has(key)) {
+          return { kind: "map", fields: classData.staticFields, key };
+        }
+        if (!forWrite && classData.staticFields.has(site.fieldName)) {
+          return { kind: "map", fields: classData.staticFields, key: site.fieldName };
+        }
+        if (!forWrite) {
+          for (const candidate of classData.staticFields.keys()) {
+            if (typeof candidate === "string" &&
+                candidate.split(":")[0].replace(/'/g, "") === site.fieldName) {
+              return { kind: "map", fields: classData.staticFields, key: candidate };
+            }
+          }
+        }
+      }
+      currentClassName = classData && classData.ast && classData.ast.classes[0]
+        ? classData.ast.classes[0].superClassName
+        : null;
+    }
+
+    if (!forWrite) {
+      const jreFields = this.jvm.jre[site.className] &&
+        this.jvm.jre[site.className].staticFields;
+      if (jreFields) {
+        for (const candidate of [
+          key, `'${key}'`, `${key}'`, `'${key}`, site.fieldName, `'${site.fieldName}'`,
+        ]) {
+          if (Object.prototype.hasOwnProperty.call(jreFields, candidate)) {
+            return { kind: "object", fields: jreFields, key: candidate };
+          }
+        }
+      }
+    }
+
+    if (forWrite) {
+      const classData = this.jvm.classes[site.className];
+      if (classData && classData.staticFields) {
+        return { kind: "map", fields: classData.staticFields, key };
+      }
+    }
+    return null;
+  }
+
+  getStaticSyncAt(id) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated static field site ${id}`);
+    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+      return STATIC_DEOPT;
+    }
+    let target = site.staticTarget;
+    if (!target) {
+      target = this.resolveStaticFieldSite(site);
+      if (!target) {
+        return this.getStaticInitialized(site.className, site.fieldName, site.descriptor);
+      }
+      site.staticTarget = target;
+    }
+    return target.kind === "map"
+      ? target.fields.get(target.key)
+      : target.fields[target.key];
+  }
+
+  putStaticSyncAt(id, value) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated static field site ${id}`);
+    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+      return STATIC_DEOPT;
+    }
+    let target = site.staticTarget;
+    if (!target || target.kind !== "map") {
+      target = this.resolveStaticFieldSite(site, true);
+      if (!target) {
+        return this.putStaticInitialized(
+          site.className, site.fieldName, site.descriptor, value,
+        );
+      }
+      site.staticTarget = target;
+    }
+    target.fields.set(target.key, value);
+    return true;
+  }
+
   getField(objRef, arg) {
     const [, className, [fieldName]] = arg;
     if (objRef === null || objRef === undefined) {
@@ -1849,19 +2008,19 @@ class JitCompiler {
   registerSyncCallSite(op, instruction) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
     const id = this.nextSyncCallSiteId++;
-    this.syncCallSites.set(id, {
+    this.syncCallSites[id] = {
       op,
       declaredClassName,
       methodName,
       descriptor,
       ...parseDescriptor(descriptor),
       targets: new Map(),
-    });
+    };
     return id;
   }
 
   tryInvokeSyncAt(id, frame, thread) {
-    const site = this.syncCallSites.get(id);
+    const site = this.syncCallSites[id];
     if (!site) return ASYNC_INVOKE;
     return this.tryInvokeSyncSite(site, frame, thread);
   }
@@ -1952,15 +2111,17 @@ class JitCompiler {
     }
     if (!generated || !generated.jvmSynchronous) return ASYNC_INVOKE;
 
-    const args = [];
-    for (let i = 0; i < params.length; i += 1) args.unshift(frame.stack.items.pop());
-    if (op !== "invokestatic") frame.stack.items.pop();
+    const argumentBase = frame.stack.items.length - params.length;
 
     const child = target.freeFrame || new Frame(method);
     if (target.freeFrame) this.syncReusedFrameCount += 1;
     target.freeFrame = null;
     child.pc = 0;
-    child.locals.fill(undefined);
+    // Verified bytecode cannot read a non-parameter local before storing it, so
+    // normal execution does not need to erase every slot in a recycled frame.
+    // Keep the clear when debugger/breakpoint checks are active so a suspended
+    // frame never exposes values left by its previous invocation.
+    if (this.needsBytecodeChecks()) child.locals.fill(undefined);
     child.stack.items.length = 0;
     delete child.jitSkipOnce;
     delete child.jitJsDisabled;
@@ -1971,9 +2132,10 @@ class JitCompiler {
       localIndex = 1;
     }
     for (let i = 0; i < params.length; i += 1) {
-      child.locals[localIndex] = args[i];
+      child.locals[localIndex] = frame.stack.items[argumentBase + i];
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
+    frame.stack.items.length = argumentBase - (op === "invokestatic" ? 0 : 1);
     thread.callStack.push(child);
     const result = this.runGeneratedFrame(generated, child, thread, false);
     if (result && typeof result.then === "function") {

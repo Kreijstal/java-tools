@@ -87,6 +87,42 @@ test('initialized static fields stay on the synchronous generated fast path', (t
   t.end();
 });
 
+test('generated field sites preserve inherited instance and static storage', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classes.FieldBase = {
+    staticFields: new Map([['shared:I', 7]]),
+    ast: { classes: [{ superClassName: null }] },
+  };
+  jvm.classes.FieldChild = {
+    staticFields: new Map(),
+    ast: { classes: [{ superClassName: 'FieldBase' }] },
+  };
+  jvm.classInitializationState.set('FieldBase', 'INITIALIZED');
+  jvm.classInitializationState.set('FieldChild', 'INITIALIZED');
+  const object = {
+    type: 'FieldChild',
+    fields: { 'FieldBase.value': 11 },
+  };
+  const instanceSite = jvm.jit.registerFieldSite([
+    null, 'FieldBase', ['value', 'I'],
+  ]);
+  const staticSite = jvm.jit.registerFieldSite([
+    null, 'FieldChild', ['shared', 'I'],
+  ]);
+
+  t.equal(jvm.jit.getFieldAt(instanceSite, object), 11,
+    'field site resolves inherited instance storage');
+  jvm.jit.putFieldAt(instanceSite, object, 12);
+  t.equal(object.fields['FieldBase.value'], 12,
+    'cached instance field site writes the resolved owner slot');
+  t.equal(jvm.jit.getStaticSyncAt(staticSite), 7,
+    'static field site resolves inherited static storage');
+  jvm.jit.putStaticSyncAt(staticSite, 8);
+  t.equal(jvm.classes.FieldBase.staticFields.get('shared:I'), 8,
+    'cached static field site writes the declaring class storage');
+  t.end();
+});
+
 test('structural primitive array-copy intrinsic preserves overlap semantics', (t) => {
   const jvm = new JVM({ jit: { warmupThreshold: 0 } });
   const prefix = [
