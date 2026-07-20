@@ -148,6 +148,37 @@ test('structural primitive array-copy intrinsic preserves overlap semantics', (t
   const overlapping = [1, 2, 3, 4, 5];
   intrinsic([overlapping, 0, overlapping, 1, 4], 0);
   t.deepEqual(overlapping, [1, 1, 2, 3, 4], 'overlapping copies retain memmove ordering');
+
+  const identical = [1, 2, 3];
+  t.doesNotThrow(() => intrinsic([identical, 99, identical, 99, -1], 0),
+    'identical ranges return before bounds checks like the Java method');
+  t.equal(jvm.jit.intrinsicArrayCopyNoopCount, 1,
+    'identical range is counted as an eliminated copy');
+  t.equal(jvm.jit.intrinsicArrayCopyWithinCount, 1,
+    'overlapping self-copy uses the native memmove path');
+
+  method.name = 'copy';
+  method.descriptor = '([II[III)V';
+  jvm.classes.Copies = {
+    ast: { classes: [{ superClassName: null, items: [{ type: 'method', method }] }] },
+  };
+  jvm.classInitializationState.set('Copies', 'INITIALIZED');
+  jvm.jit.supportCache.set(method, true);
+  const siteId = jvm.jit.registerSyncCallSite('invokestatic', {
+    arg: ['Method', 'Copies', ['copy', '([II[III)V']],
+  });
+  const fastSource = [4, 5, 6];
+  const fastDestination = [0, 0, 0];
+  const frame = { stack: { items: [fastSource, 0, fastDestination, 0, 3] } };
+  jvm.jit.tryInvokeSyncAt(siteId, frame, {});
+  t.deepEqual(fastDestination, [4, 5, 6], 'resolved intrinsic call site copies correctly');
+  t.ok(jvm.jit.syncCallSites[siteId].fastIntrinsic,
+    'first resolution installs the direct intrinsic call-site target');
+
+  frame.stack.items.push(fastDestination, 0, fastDestination, 1, 2);
+  jvm.jit.tryInvokeSyncAt(siteId, frame, {});
+  t.deepEqual(fastDestination, [4, 4, 5], 'direct intrinsic call site preserves overlap');
+  t.equal(frame.stack.items.length, 0, 'direct intrinsic consumes its arguments');
   t.end();
 });
 
@@ -505,6 +536,44 @@ public class IntegerLoopJitHarness {
   t.deepEqual(out.slice(0, 4), [1, 1, 2, 2], 'integer bitwise loop preserves interpreter semantics');
   t.equal(jvm.jit.generatedRunCount, 1, 'backward bitwise loop compiles without warmup calls');
   t.equal(jvm.jit.runnerRunCount, 0, 'generated bitwise loop bypasses the bytecode runner');
+  t.end();
+});
+
+test('generated JIT expands wide local increments before eligibility checks', async (t) => {
+  const classpath = compileJavaFixture(t, 'WideIncrementJitHarness', `
+public class WideIncrementJitHarness {
+  public static void compute(int[] out) {
+    int value = 0;
+    for (int i = 0; i < out.length; i++) {
+      value += 3171;
+      out[i] = value;
+    }
+  }
+}
+`);
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName('WideIncrementJitHarness');
+  const thread = {
+    id: 0,
+    name: 'wide-increment-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = [0, 0, 0, 0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'WideIncrementJitHarness', 'compute', '([I)V', [out]);
+
+  t.deepEqual(out.slice(), [3171, 6342, 9513, 12684],
+    'wide iinc preserves Java integer loop results');
+  t.equal(jvm.jit.generatedRunCount, 1,
+    'wide iinc loop executes through generated code');
+  t.equal(jvm.jit.runnerRunCount, 0,
+    'wide iinc loop does not fall back to the bytecode runner');
   t.end();
 });
 

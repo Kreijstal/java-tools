@@ -7,6 +7,7 @@ const waitMs = positiveNumber('PROBE_WAIT_MS', 65000);
 const stride = positiveNumber('PROBE_SAMPLE_STRIDE', 16);
 const changedFrameCount = positiveNumber('PROBE_CHANGED_FRAMES', 20);
 const executablePath = process.env.FIREFOX_EXECUTABLE_PATH;
+const profileJitMethods = process.env.PROBE_JIT_METHODS === '1';
 
 function positiveNumber(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -18,6 +19,13 @@ function positiveNumber(name, fallback) {
 
 function ranked(entries, limit = 15) {
   return [...(entries || [])].sort((a, b) => b[1] - a[1]).slice(0, limit);
+}
+
+function subtractEntries(finalEntries, initialEntries) {
+  const initial = new Map(initialEntries || []);
+  return (finalEntries || []).map(([name, count]) => [
+    name, count - (initial.get(name) || 0),
+  ]).filter(([, count]) => count > 0);
 }
 
 function animationEstimate(changes) {
@@ -46,15 +54,31 @@ function animationEstimate(changes) {
   const browser = await firefox.launch(launchOptions);
   try {
     const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
-    await page.addInitScript((sampleStride) => {
+    await page.addInitScript(({ sampleStride, collectJitMethods }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
         surfaceAt: null,
         changes: [],
+        jitAtFirstNonBlack: null,
       };
+      const snapshotJit = (jit) => jit ? {
+        generated: jit.generatedRunCount,
+        synchronous: jit.syncGeneratedRunCount,
+        inlined: jit.syncInlinedCallCount,
+        reusedFrames: jit.syncReusedFrameCount,
+        intrinsics: jit.syncIntrinsicCallCount,
+        arrayCopyNoops: jit.intrinsicArrayCopyNoopCount,
+        arrayCopyWithin: jit.intrinsicArrayCopyWithinCount,
+        runner: jit.runnerRunCount,
+        generatedMethods: [...jit.generatedMethodRunCounts.entries()],
+        inlinedMethods: [...jit.inlinedMethodRunCounts.entries()],
+        intrinsicMethods: [...jit.intrinsicMethodRunCounts.entries()],
+        deopts: [...jit.methodDeoptCounts.entries()],
+      } : null;
       let previousHash = null;
       const sample = (now) => {
         const jvm = window.jvmDebug?.debugController?.jvm;
+        if (jvm?.jit) jvm.jit.profileMethods = collectJitMethods;
         const pixels = [...(jvm?._softCanvases || [])][0]?._pixels;
         if (pixels) {
           if (probe.surfaceAt === null) probe.surfaceAt = now - probe.started;
@@ -69,11 +93,14 @@ function animationEstimate(changes) {
             probe.changes.push({ t: now - probe.started, hash, nonBlack });
             previousHash = hash;
           }
+          if (nonBlack > 0 && probe.jitAtFirstNonBlack === null) {
+            probe.jitAtFirstNonBlack = snapshotJit(jvm?.jit);
+          }
         }
         requestAnimationFrame(sample);
       };
       requestAnimationFrame(sample);
-    }, stride);
+    }, { sampleStride: stride, collectJitMethods: profileJitMethods });
 
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     await page.waitForTimeout(waitMs);
@@ -88,6 +115,8 @@ function animationEstimate(changes) {
         inlined: jit?.syncInlinedCallCount || 0,
         reusedFrames: jit?.syncReusedFrameCount || 0,
         intrinsics: jit?.syncIntrinsicCallCount || 0,
+        arrayCopyNoops: jit?.intrinsicArrayCopyNoopCount || 0,
+        arrayCopyWithin: jit?.intrinsicArrayCopyWithinCount || 0,
         runner: jit?.runnerRunCount || 0,
         presentation: jvm?._awtPresentationStats || null,
         generatedMethods: jit ? [...jit.generatedMethodRunCounts.entries()] : [],
@@ -101,7 +130,32 @@ function animationEstimate(changes) {
     result.url = url;
     result.waitMs = waitMs;
     result.sampleStride = stride;
+    result.profileJitMethods = profileJitMethods;
     result.animation = animationEstimate(result.probe.changes);
+    const initial = result.probe.jitAtFirstNonBlack;
+    if (initial && profileJitMethods) {
+      result.animationJit = {
+        generated: result.generated - initial.generated,
+        synchronous: result.synchronous - initial.synchronous,
+        inlined: result.inlined - initial.inlined,
+        reusedFrames: result.reusedFrames - initial.reusedFrames,
+        intrinsics: result.intrinsics - initial.intrinsics,
+        arrayCopyNoops: result.arrayCopyNoops - initial.arrayCopyNoops,
+        arrayCopyWithin: result.arrayCopyWithin - initial.arrayCopyWithin,
+        runner: result.runner - initial.runner,
+        generatedMethods: ranked(subtractEntries(
+          result.generatedMethods, initial.generatedMethods,
+        )),
+        inlinedMethods: ranked(subtractEntries(
+          result.inlinedMethods, initial.inlinedMethods,
+        )),
+        intrinsicMethods: ranked(subtractEntries(
+          result.intrinsicMethods, initial.intrinsicMethods,
+        )),
+        deopts: ranked(subtractEntries(result.deopts, initial.deopts)),
+      };
+    }
+    delete result.probe.jitAtFirstNonBlack;
     result.generatedMethods = ranked(result.generatedMethods);
     result.inlinedMethods = ranked(result.inlinedMethods);
     result.intrinsicMethods = ranked(result.intrinsicMethods);

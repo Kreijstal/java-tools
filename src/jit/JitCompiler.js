@@ -25,6 +25,7 @@ class JitCompiler {
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
     this.codegenSupportCache = new WeakMap();
+    this.normalizedCodeItemsCache = new WeakMap();
     this.codegenUnavailable = false;
     this.codegenCompileErrors = new WeakMap();
     this.syncCallSites = [];
@@ -34,12 +35,16 @@ class JitCompiler {
     this.inlineIntegerLeafCache = new WeakMap();
     const firefoxDefault = typeof navigator !== "undefined" &&
       /Firefox\//.test(navigator.userAgent || "");
+    const browserRuntime = typeof window !== "undefined" && typeof navigator !== "undefined";
+    this.profileMethods = options.profileMethods ?? !browserRuntime;
     this.preferWholeMethodJs = options.preferWholeMethodJs ?? firefoxDefault;
     this.generatedRunCount = 0;
     this.syncGeneratedRunCount = 0;
     this.syncInlinedCallCount = 0;
     this.syncReusedFrameCount = 0;
     this.syncIntrinsicCallCount = 0;
+    this.intrinsicArrayCopyNoopCount = 0;
+    this.intrinsicArrayCopyWithinCount = 0;
     this.inlinedMethodRunCounts = new Map();
     this.intrinsicMethodRunCounts = new Map();
     this.runnerRunCount = 0;
@@ -97,8 +102,7 @@ class JitCompiler {
 
   hasBackwardBranch(method) {
     if (this.backwardBranchCache.has(method)) return this.backwardBranchCache.get(method);
-    const code = method.attributes.find((attr) => attr.type === "code");
-    const codeItems = code && code.code && code.code.codeItems || [];
+    const codeItems = this.getCodeItems(method);
     const labels = buildLabelMap(codeItems);
     const backward = codeItems.some((item, index) => {
       const instruction = item && item.instruction;
@@ -109,6 +113,26 @@ class JitCompiler {
     });
     this.backwardBranchCache.set(method, backward);
     return backward;
+  }
+
+  getCodeItems(method) {
+    if (this.normalizedCodeItemsCache.has(method)) {
+      return this.normalizedCodeItemsCache.get(method);
+    }
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const original = code && code.code && code.code.codeItems || [];
+    let normalized = original;
+    for (let index = 0; index < original.length; index += 1) {
+      const item = original[index];
+      const instruction = item && item.instruction;
+      if (getOp(instruction) !== "wide") continue;
+      const expanded = expandWideInstruction(instruction);
+      if (!expanded) continue;
+      if (normalized === original) normalized = original.slice();
+      normalized[index] = { ...item, instruction: expanded };
+    }
+    this.normalizedCodeItemsCache.set(method, normalized);
+    return normalized;
   }
 
   async tryRunFrame(frame, thread) {
@@ -147,7 +171,9 @@ class JitCompiler {
     }
 
     const methodKey = `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`;
-    this.methodRunCounts.set(methodKey, (this.methodRunCounts.get(methodKey) || 0) + 1);
+    if (this.profileMethods) {
+      this.methodRunCounts.set(methodKey, (this.methodRunCounts.get(methodKey) || 0) + 1);
+    }
     this.runningFrames.add(frame);
     try {
       const generated = this.getGeneratedFunction(frame.method);
@@ -155,9 +181,13 @@ class JitCompiler {
         ? await this.runGeneratedFrame(generated, frame, thread)
         : await this.runFrame(frame, thread);
       if (result && result.deopt) {
-        this.lastDeoptReason = result.reason;
-        this.methodDeoptCounts.set(methodKey, (this.methodDeoptCounts.get(methodKey) || 0) + 1);
-        this.methodDeoptReasons.set(methodKey, result.reason || "unspecified");
+        if (this.profileMethods) {
+          this.lastDeoptReason = result.reason;
+          this.methodDeoptCounts.set(
+            methodKey, (this.methodDeoptCounts.get(methodKey) || 0) + 1,
+          );
+          this.methodDeoptReasons.set(methodKey, result.reason || "unspecified");
+        }
         if (!result.transient) {
           this.deoptedMethods.add(frame.method);
           frame.jitJsDisabled = true;
@@ -215,13 +245,16 @@ class JitCompiler {
   }
 
   runGeneratedFrame(generated, frame, thread, initialBytecodeChecks) {
-    this.generatedRunCount += 1;
-    if (generated.jvmSynchronous) this.syncGeneratedRunCount += 1;
-    this.recordExecution(this.generatedMethodRunCounts, frame);
+    if (this.profileMethods) {
+      this.generatedRunCount += 1;
+      if (generated.jvmSynchronous) this.syncGeneratedRunCount += 1;
+      this.recordExecution(this.generatedMethodRunCounts, frame);
+    }
     return generated(frame, thread, this, initialBytecodeChecks);
   }
 
   recordExecution(counts, frame) {
+    if (!this.profileMethods) return;
     const method = frame && frame.method;
     if (!method) return;
     const methodKey = `${this.getFrameClassName(frame)}.${method.name}${method.descriptor}`;
@@ -255,7 +288,7 @@ class JitCompiler {
       return false;
     }
 
-    const codeItems = code.code.codeItems;
+    const codeItems = this.getCodeItems(method);
     if (hasExperimentalControlFlow(codeItems) && !this.experimentalControlFlow &&
       !this.hasJitSafeControlFlow(method, codeItems)) {
       this.supportCache.set(method, false);
@@ -334,7 +367,7 @@ class JitCompiler {
       return false;
     }
 
-    const codeItems = code.code.codeItems;
+    const codeItems = this.getCodeItems(method);
     if (hasExperimentalControlFlow(codeItems) && !this.experimentalControlFlow &&
       !this.hasJitSafeControlFlow(method, codeItems)) {
       this.codegenSupportCache.set(method, false);
@@ -466,8 +499,7 @@ class JitCompiler {
   }
 
   isShortSupportedHelper(method) {
-    const code = method.attributes.find((attr) => attr.type === "code");
-    const codeItems = code && code.code && code.code.codeItems || [];
+    const codeItems = this.getCodeItems(method);
     if (codeItems.filter((item) => item.instruction).length > 16) return false;
     const allowed = new Set([
       "aaload", "aload", "aload_0", "aload_1", "aload_2", "aload_3", "areturn",
@@ -570,7 +602,7 @@ class JitCompiler {
     }
 
     const code = method.attributes.find((attr) => attr.type === "code");
-    const codeItems = code.code.codeItems;
+    const codeItems = this.getCodeItems(method);
     this.compileLabelMap = buildLabelMap(codeItems);
     this.compileSynchronous = synchronous;
     const body = [
@@ -637,7 +669,7 @@ class JitCompiler {
     if (method.name !== "a" ||
         method.descriptor !== rasterDescriptor && method.descriptor !== wrapperDescriptor) return null;
     const code = method.attributes.find((attr) => attr.type === "code");
-    const codeItems = code && code.code && code.code.codeItems || [];
+    const codeItems = this.getCodeItems(method);
     if (!this.canCompileSynchronously(method)) return null;
 
     const ops = codeItems.map((item) => getOp(item && item.instruction)).filter(Boolean);
@@ -980,8 +1012,7 @@ class JitCompiler {
   }
 
   canCompileSynchronously(method) {
-    const code = method.attributes.find((attr) => attr.type === "code");
-    const codeItems = code && code.code && code.code.codeItems || [];
+    const codeItems = this.getCodeItems(method);
     return codeItems.every((item) => {
       const instruction = item && item.instruction;
       const op = getOp(instruction);
@@ -1237,8 +1268,10 @@ class JitCompiler {
   }
 
   async runFrame(frame, thread) {
-    this.runnerRunCount += 1;
-    this.recordExecution(this.runnerMethodRunCounts, frame);
+    if (this.profileMethods) {
+      this.runnerRunCount += 1;
+      this.recordExecution(this.runnerMethodRunCounts, frame);
+    }
     const locals = frame.locals;
     const stack = frame.stack.items;
     const instructions = frame.instructions;
@@ -2022,6 +2055,32 @@ class JitCompiler {
   tryInvokeSyncAt(id, frame, thread) {
     const site = this.syncCallSites[id];
     if (!site) return ASYNC_INVOKE;
+    const fast = site.fastIntrinsic;
+    if (fast) {
+      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED" ||
+          this.jvm.debugManager.isClassJitDeopted(fast.lookupClass)) {
+        return ASYNC_INVOKE;
+      }
+      const base = frame.stack.items.length - site.params.length;
+      const value = fast.intrinsic(frame.stack.items, base);
+      if (value === ASYNC_INVOKE) return ASYNC_INVOKE;
+      frame.stack.items.length = base;
+      if (this.profileMethods) {
+        this.syncIntrinsicCallCount += 1;
+        this.intrinsicMethodRunCounts.set(
+          fast.methodKey,
+          (this.intrinsicMethodRunCounts.get(fast.methodKey) || 0) + 1,
+        );
+      }
+      return value;
+    }
+    const target = site.fastStaticTarget;
+    if (target) {
+      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED") {
+        return ASYNC_INVOKE;
+      }
+      return this.tryInvokeResolvedTarget(site, target, frame, thread);
+    }
     return this.tryInvokeSyncSite(site, frame, thread);
   }
 
@@ -2086,27 +2145,52 @@ class JitCompiler {
         target.generated = this.getGeneratedFunction(method);
       }
       site.targets.set(targetClassName, target);
+      if (op === "invokestatic" && target.intrinsic) {
+        site.fastIntrinsic = {
+          intrinsic: target.intrinsic,
+          lookupClass,
+          methodKey: `${lookupClass}.${method.name}${descriptor}`,
+        };
+      } else if (op === "invokestatic") {
+        site.fastStaticTarget = target;
+      }
     }
 
+    return this.tryInvokeResolvedTarget(site, target, frame, thread);
+  }
+
+  tryInvokeResolvedTarget(site, target, frame, thread) {
+    const { op, descriptor, params, returnType } = site;
     const { method, lookupClass, intrinsic, inlineIntegerLeaf, generated } = target;
+    const receiver = op === "invokestatic"
+      ? null
+      : frame.stack.items[frame.stack.items.length - params.length - 1];
     if (this.jvm.debugManager.isClassJitDeopted(lookupClass)) return ASYNC_INVOKE;
     if (intrinsic) {
       const base = frame.stack.items.length - params.length;
       const value = intrinsic(frame.stack.items, base);
       if (value === ASYNC_INVOKE) return ASYNC_INVOKE;
       frame.stack.items.length = base;
-      this.syncIntrinsicCallCount += 1;
-      const methodKey = `${lookupClass}.${method.name}${descriptor}`;
-      this.intrinsicMethodRunCounts.set(methodKey, (this.intrinsicMethodRunCounts.get(methodKey) || 0) + 1);
+      if (this.profileMethods) {
+        this.syncIntrinsicCallCount += 1;
+        const methodKey = `${lookupClass}.${method.name}${descriptor}`;
+        this.intrinsicMethodRunCounts.set(
+          methodKey, (this.intrinsicMethodRunCounts.get(methodKey) || 0) + 1,
+        );
+      }
       return value;
     }
     if (inlineIntegerLeaf) {
       const base = frame.stack.items.length - params.length;
       const value = inlineIntegerLeaf(frame.stack.items, base);
       frame.stack.items.length = base;
-      this.syncInlinedCallCount += 1;
-      const methodKey = `${lookupClass}.${method.name}${descriptor}`;
-      this.inlinedMethodRunCounts.set(methodKey, (this.inlinedMethodRunCounts.get(methodKey) || 0) + 1);
+      if (this.profileMethods) {
+        this.syncInlinedCallCount += 1;
+        const methodKey = `${lookupClass}.${method.name}${descriptor}`;
+        this.inlinedMethodRunCounts.set(
+          methodKey, (this.inlinedMethodRunCounts.get(methodKey) || 0) + 1,
+        );
+      }
       return value;
     }
     if (!generated || !generated.jvmSynchronous) return ASYNC_INVOKE;
@@ -2114,7 +2198,7 @@ class JitCompiler {
     const argumentBase = frame.stack.items.length - params.length;
 
     const child = target.freeFrame || new Frame(method);
-    if (target.freeFrame) this.syncReusedFrameCount += 1;
+    if (target.freeFrame && this.profileMethods) this.syncReusedFrameCount += 1;
     target.freeFrame = null;
     child.pc = 0;
     // Verified bytecode cannot read a non-parameter local before storing it, so
@@ -2148,8 +2232,7 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
-    const code = method.attributes.find((attr) => attr.type === "code");
-    const codeItems = code && code.code && code.code.codeItems || [];
+    const codeItems = this.getCodeItems(method);
     const ops = codeItems
       .map((item) => getOp(item.instruction))
       .filter(Boolean);
@@ -2174,12 +2257,20 @@ class JitCompiler {
         if (src === null || src === undefined || dest === null || dest === undefined) {
           throw { type: "java/lang/NullPointerException", message: null };
         }
+        // The recognized Java implementation returns before checking length
+        // when source, destination, and offsets are identical. Preserve that
+        // observable order and avoid copying an already-identical range.
+        if (src === dest && srcPos === destPos) {
+          if (this.profileMethods) this.intrinsicArrayCopyNoopCount += 1;
+          return RETURN_VOID;
+        }
         if (srcPos < 0 || destPos < 0 || length < 0 ||
             srcPos + length > src.length || destPos + length > dest.length) {
           throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
         }
-        if (src === dest && destPos > srcPos && destPos < srcPos + length) {
-          for (let i = length - 1; i >= 0; i -= 1) dest[destPos + i] = src[srcPos + i];
+        if (src === dest) {
+          dest.copyWithin(destPos, srcPos, srcPos + length);
+          if (this.profileMethods) this.intrinsicArrayCopyWithinCount += 1;
         } else {
           for (let i = 0; i < length; i += 1) dest[destPos + i] = src[srcPos + i];
         }
@@ -2338,8 +2429,7 @@ class JitCompiler {
     }
     let inline = null;
     if (returnType === "int" && params.length > 0 && params.every((type) => type === "int")) {
-      const code = method.attributes.find((attr) => attr.type === "code");
-      const instructions = (code && code.code && code.code.codeItems || [])
+      const instructions = this.getCodeItems(method)
         .map((item) => item.instruction)
         .filter(Boolean);
       const expressions = [];
@@ -2621,6 +2711,17 @@ function primitiveArrayType(type) {
 function getOp(instruction) {
   if (!instruction) return null;
   return typeof instruction === "string" ? instruction : instruction.op;
+}
+
+function expandWideInstruction(instruction) {
+  const parts = String(instruction && instruction.arg ? instruction.arg : "")
+    .trim().split(/\s+/).filter(Boolean);
+  const op = parts[0];
+  if (!op) return null;
+  if (op === "iinc") {
+    return { op, varnum: parts[1], incr: parts[2] };
+  }
+  return { op, arg: parts[1] };
 }
 
 function stackEffect(instruction) {

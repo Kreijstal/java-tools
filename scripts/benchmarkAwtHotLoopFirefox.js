@@ -55,6 +55,10 @@ function phase(frames, nanos) {
       window.jvmDebug = debug;
       await debug.initialize();
       await debug.loadFile(file);
+      debug.debugController.options.jit = {
+        ...(debug.debugController.options.jit || {}),
+        profileMethods: true,
+      };
       window.__awtHotLoopRun = { state: 'running' };
       debug.run('AwtHotLoop').then(
         () => { window.__awtHotLoopRun = { state: 'completed' }; },
@@ -94,6 +98,10 @@ function phase(frames, nanos) {
       const jvm = window.jvmDebug.debugController.jvm;
       const fields = jvm.classes.AwtHotLoop.staticFields;
       const value = (name, descriptor) => fields.get(`${name}:${descriptor}`);
+      const rasterMethod = jvm.findMethod(
+        { ast: jvm.classes.AwtHotLoop.ast }, 'raster', '(I)V',
+      );
+      const rasterKey = 'AwtHotLoop.raster(I)V';
       return {
         rasterNanos: Number(value('rasterNanos', 'J')),
         publishNanos: Number(value('publishNanos', 'J')),
@@ -108,6 +116,16 @@ function phase(frames, nanos) {
         done: value('done', 'I') | 0,
         run: window.__awtHotLoopRun,
         presentation: jvm._awtPresentationStats || null,
+        rasterJit: {
+          enabled: jvm.jit.enabled,
+          invocations: jvm.jit.invocationCounts.get(rasterMethod) || 0,
+          supported: jvm.jit.isSupported(rasterMethod),
+          codegenSupported: jvm.jit.isCodegenSupported(rasterMethod),
+          generatedRuns: jvm.jit.generatedMethodRunCounts.get(rasterKey) || 0,
+          runnerRuns: jvm.jit.runnerMethodRunCounts.get(rasterKey) || 0,
+          deoptimizations: jvm.jit.methodDeoptCounts.get(rasterKey) || 0,
+          deoptReason: jvm.jit.methodDeoptReasons.get(rasterKey) || null,
+        },
         canvas: [...document.querySelectorAll('canvas')].map((item) => ({
           width: item.width,
           height: item.height,
@@ -122,6 +140,7 @@ function phase(frames, nanos) {
       schedulerPaced: phase(raw.pacedFrames, raw.pacedNanos),
       awtPresentedWithoutRaster: phase(raw.presentFrames, raw.presentNanos),
       presentation: raw.presentation,
+      rasterJit: raw.rasterJit,
       checksum: raw.checksum,
       phase: raw.phase,
       done: raw.done,
@@ -131,7 +150,9 @@ function phase(frames, nanos) {
       browserErrors,
     };
     process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    if (!raw.done || browserErrors.length) process.exitCode = 1;
+    if (!raw.done || browserErrors.length || raw.rasterJit.generatedRuns === 0) {
+      process.exitCode = 1;
+    }
   } finally {
     if (browser) await browser.close();
     fs.rmSync(fixture.directory, { recursive: true, force: true });

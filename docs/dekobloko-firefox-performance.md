@@ -404,26 +404,33 @@ renderer to a worker.
 
 `npm run benchmark:awt:firefox` compiles and runs the checked-in Java applet in
 JVM.js. It uses the same integer blend shape but separates four phases. The
-validated Firefox run at 64x64 measured:
+first version of this experiment accidentally contained `wide iinc` bytecodes.
+The interpreter expanded `wide`, but JIT eligibility inspected the raw opcode
+and rejected the entire raster method. Its reported 0.76 frames/s was therefore
+interpreter performance, not evidence about the generated JIT.
+
+JIT analysis and code generation now share a normalized view that expands
+`wide` without changing bytecode indices. The benchmark also fails unless its
+raster records generated executions. A corrected Firefox run at 64x64 measured:
 
 | Guest work | Rate |
 |---|---:|
-| Java `int[]` raster only | 0.7624 frames/s |
-| Java raster plus `MemoryImageSource.newPixels` and `Graphics.drawImage` | 0.7625 frames/s |
-| `Thread.sleep(1)` pacing control | 263 iterations/s |
-| AWT publication plus pacing, without raster | 220 iterations/s |
+| generated Java `int[]` raster only | 588 frames/s |
+| generated raster plus `MemoryImageSource.newPixels` and `Graphics.drawImage` | 769 frames/s |
+| `Thread.sleep(1)` pacing control | 313 iterations/s |
+| AWT publication plus pacing, without raster | 213 iterations/s |
 
-Twenty paced AWT publications added 15 ms over the sleep-only control. Seven
-coalesced browser uploads consumed 1 ms in total at 64x64. The raster and
-raster-plus-AWT measurements are effectively identical: the expensive part is
-executing the per-pixel Java bytecode, not publishing or displaying its result.
+All 21 raster invocations used generated code, with no runner fallback or
+deoptimization. The raster phases are short enough that their ordering is
+measurement noise; both demonstrate hundreds of frames/s. Twenty paced AWT
+publications remained inexpensive. This changes the attribution: a compact
+generated Java pixel loop is fast, while Dekobloko's large geometry/raster call
+graph and JVM call/state representation remain expensive.
 
-The small surface is deliberate. Earlier 800x600 fixtures containing only a
-handful of full Java frames exceeded a 90-second bound, and larger samples were
-stopped after more than 200 seconds. Reducing the frame count was insufficient;
-reducing the surface made the phase comparison finish while retaining the same
-bytecode and AWT paths. Do not extrapolate its absolute FPS linearly, but do use
-the matched phases to attribute cost.
+The earlier large-surface timeouts were another symptom of the same `wide`
+eligibility hole. Keep the surface small so this remains a focused compiler/AWT
+test, and keep the generated-run assertion so future coverage regressions
+cannot silently turn it back into an interpreter benchmark.
 
 The browser AWT path now snapshots a producer framebuffer when `drawImage`
 publishes it, marks that surface dirty, and coalesces presentation on
@@ -492,6 +499,12 @@ PROBE_CHANGED_FRAMES=20 \
 npm run profile:dekobloko:firefox
 ```
 
+Detailed per-method JIT maps are disabled during ordinary browser execution;
+updating them on every generated call and intrinsic polluted the hot path.
+Enable them for attribution runs with `PROBE_JIT_METHODS=1`. The profiler also
+reports deltas beginning at the first nonblack software frame, so cold audio
+and archive work no longer dominate the hot-method ranking.
+
 If Playwright reports that its expected Firefox executable does not exist,
 either run `npx playwright install firefox` or set `FIREFOX_EXECUTABLE_PATH` to
 an already installed compatible build. The validated host used Playwright
@@ -516,13 +529,21 @@ present and the probe measured 20 images in 2483.38 ms: 8.05 changed images/s
 or 7.65 transition intervals/s. It also reported 108 actual AWT presentations
 and 237 ms of total browser upload work.
 
+After `wide` normalization, direct cached static/intrinsic call targets, native
+overlap copies, and opt-in browser statistics, two clean runs measured 8.51 and
+8.28 changed images/s. Treat this as a modest improvement, not a solved
+performance gap. A method-profile run over the animation observed roughly
+638,000 overlap-copy intrinsics, 180,000 constant-fill intrinsics, and 83,000
+executions each of the raster and wrapper; the next large gain must reduce that
+render call graph's frame/state traffic rather than tune AWT or yielding.
+
 Run the focused correctness suite after JIT edits:
 
 ```bash
 timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
 ```
 
-The field-site build passed all 127 assertions. Scheduler/dispatch edits should
+The final focused JIT run passed all 137 assertions. Scheduler/dispatch edits should
 also run:
 
 ```bash
