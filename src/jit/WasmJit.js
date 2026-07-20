@@ -1244,7 +1244,8 @@ class WasmJit {
     this.jvm = jvm;
     this.jit = jit;
     const env = (typeof process !== 'undefined' && process.env) || {};
-    this.enabled = env.JVM_WASM_JIT === '1' && typeof WebAssembly !== 'undefined' &&
+    const browserDefault = typeof window !== 'undefined' && typeof document !== 'undefined';
+    this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     // Loop-bearing methods compile on first sight: warmup by invocation count

@@ -1254,7 +1254,10 @@ class JVM {
     const classNameWithSlashes = className.replace(/\./g, '/');
     const existingClass = this.classes[classNameWithSlashes];
     const isKnownJreClass = !!this.jre[classNameWithSlashes];
-    if (existingClass && (!existingClass.isJreStub || isKnownJreClass)) {
+    const allowsApplicationFallback = isKnownJreClass &&
+      this.jre[classNameWithSlashes].applicationFallback;
+    if (existingClass && (!existingClass.isJreStub ||
+        (isKnownJreClass && !allowsApplicationFallback))) {
       return existingClass;
     }
 
@@ -1369,9 +1372,14 @@ class JVM {
 
     // For JRE classes, we should already have them preloaded in this.classes
     let classData = this.classes[className];
+    if (classData && classData.isJreStub &&
+        this.jre[className] && this.jre[className].applicationFallback) {
+      classData = await this.loadClassByName(className);
+    }
     if (!classData) {
-      // Only try to load from file system if not a JRE class
-      if (!this.jre[className]) {
+      // Targeted overrides may augment an application class without replacing
+      // its bytecode implementation.
+      if (!this.jre[className] || this.jre[className].applicationFallback) {
         classData = await this.loadClassByName(className);
       } else {
         // JRE class should have been preloaded, something went wrong

@@ -257,7 +257,8 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
 
   throw new Error(
-    `Unsupported invokevirtual: ${runtimeClassName(boxedObj) || typeof boxedObj}.${methodName}${descriptor}`,
+    `Unsupported invokevirtual: ${runtimeClassName(boxedObj) || typeof boxedObj}.${methodName}${descriptor} ` +
+    `(declared ${className}, caller ${frame.className}.${frame.method && frame.method.name}${frame.method && frame.method.descriptor}, pc ${frame.pc - 1})`,
   );
 }
 
@@ -291,8 +292,11 @@ async function invokestatic(frame, instruction, jvm, thread) {
     return;
   }
 
-  // If it's a JRE class and we didn't find a method, it's likely unimplemented.
-  if (jvm.jre[className]) {
+  // A caller may register a targeted override for an application class. In
+  // that case an unoverridden method must still resolve from the loaded class;
+  // treating the whole class as a platform stub leaves its arguments on the
+  // operand stack and corrupts the next instruction.
+  if (jvm.jre[className] && !jvm.jre[className].applicationFallback) {
     return;
   }
 

@@ -19,8 +19,26 @@ const instructions = {
   ...object,
   ...conversions,
 };
+// Babel lowers async functions to ordinary functions that return Promises.
+// Classify the bytecodes explicitly so production browser bundles never send
+// a lowered async handler through the synchronous burst dispatcher.
+const asyncInstructionOps = new Set([
+  'ldc',
+  'ldc_w',
+  'new',
+  'getstatic',
+  'putstatic',
+  'instanceof',
+  'checkcast',
+  'invokevirtual',
+  'invokestatic',
+  'invokespecial',
+  'invokedynamic',
+  'invokeinterface',
+]);
 const syncInstructions = Object.fromEntries(Object.entries(instructions)
-  .filter(([, func]) => func.constructor.name !== 'AsyncFunction'));
+  .filter(([op, func]) => !asyncInstructionOps.has(op) &&
+    func.constructor.name !== 'AsyncFunction'));
 
 function expandWideInstruction(instruction) {
   const parts = String(instruction && instruction.arg ? instruction.arg : '').trim().split(/\s+/).filter(Boolean);
