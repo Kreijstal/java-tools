@@ -33,7 +33,16 @@ function dumpFrame(pixels, width, height) {
 // array as a DataBufferInt-style raster so drawImage can blit/dump it.
 function materializeProducerImage(imageObj) {
   const producer = imageObj._producer;
-  if (!producer || !producer.fields) return;
+  if (!producer) return;
+  // java.awt.image.MemoryImageSource is implemented by the browser JRE and
+  // stores its constructor arguments directly on the host object.
+  if (producer.pixels && producer.width > 0 && producer.height > 0) {
+    imageObj._width = producer.width | 0;
+    imageObj._height = producer.height | 0;
+    imageObj._raster = { _dataBuffer: { _data: producer.pixels } };
+    return;
+  }
+  if (!producer.fields) return;
   let pixels = null;
   const ints = [];
   for (const key of Object.keys(producer.fields)) {
@@ -81,6 +90,84 @@ function softSurface(jvm, obj) {
   return { pixels: comp._pixels, width, height };
 }
 
+function presentationStats(jvm) {
+  if (!jvm) return null;
+  if (!jvm._awtPresentationStats) {
+    jvm._awtPresentationStats = {
+      dirtyMarks: 0,
+      scheduled: 0,
+      coalesced: 0,
+      presented: 0,
+      uploadMs: 0,
+      drawImageCalls: 0,
+      producerImages: 0,
+      softwareBlits: 0,
+    };
+  }
+  return jvm._awtPresentationStats;
+}
+
+function presentSoftSurface(jvm, comp) {
+  const canvas = comp && comp._canvasElement;
+  const width = comp && comp._pixelsWidth;
+  const height = comp && comp._pixelsHeight;
+  const pixels = comp && comp._pixels;
+  if (!canvas || !width || !height || !pixels ||
+      typeof canvas.getContext !== 'function') return false;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+    comp._presentImageData = null;
+    comp._presentPixels32 = null;
+  }
+  const context = canvas.getContext('2d');
+  if (!context) return false;
+  if (!comp._presentImageData || comp._presentImageData.width !== width ||
+      comp._presentImageData.height !== height) {
+    comp._presentImageData = context.createImageData(width, height);
+    comp._presentPixels32 = new Uint32Array(comp._presentImageData.data.buffer);
+  }
+  const started = typeof performance !== 'undefined' && performance.now
+    ? performance.now() : Date.now();
+  const output = comp._presentPixels32;
+  const count = Math.min(width * height, pixels.length);
+  for (let index = 0; index < count; index += 1) {
+    const rgb = Number(pixels[index]) >>> 0;
+    // ImageData is RGBA bytes. On the little-endian browser platforms used by
+    // Canvas, its Uint32 representation is AABBGGRR.
+    output[index] = (0xff000000 | (rgb & 0xff) << 16 |
+      rgb & 0xff00 | rgb >>> 16 & 0xff) >>> 0;
+  }
+  context.putImageData(comp._presentImageData, 0, 0);
+  comp._presentedVersion = comp._pixelsVersion;
+  const stats = presentationStats(jvm);
+  if (stats) {
+    const ended = typeof performance !== 'undefined' && performance.now
+      ? performance.now() : Date.now();
+    stats.presented += 1;
+    stats.uploadMs += ended - started;
+  }
+  return true;
+}
+
+function markSoftSurfaceDirty(jvm, comp) {
+  if (!comp) return;
+  comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
+  const stats = presentationStats(jvm);
+  if (stats) stats.dirtyMarks += 1;
+  if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') return;
+  if (comp._presentScheduled) {
+    if (stats) stats.coalesced += 1;
+    return;
+  }
+  comp._presentScheduled = true;
+  if (stats) stats.scheduled += 1;
+  requestAnimationFrame(() => {
+    comp._presentScheduled = false;
+    presentSoftSurface(jvm, comp);
+  });
+}
+
 function colorToRgb(colorObj) {
   if (!colorObj) return 0;
   const v = colorObj.value !== undefined ? colorObj.value : colorObj;
@@ -99,6 +186,7 @@ function softFillRect(jvm, obj, x, y, w, h) {
     const row = yy * surface.width;
     for (let xx = x0; xx < x1; xx++) surface.pixels[row + xx] = rgb;
   }
+  markSoftSurfaceDirty(jvm, obj._component);
 }
 
 module.exports = {
@@ -202,6 +290,8 @@ module.exports = {
     },
 
     'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z': (jvm, obj, args) => {
+      const stats = presentationStats(jvm);
+      if (stats) stats.drawImageCalls += 1;
       const graphicsContext = obj._awtGraphics;
       const imageObj = args[0];
       if (!imageObj) {
@@ -213,6 +303,7 @@ module.exports = {
       // (mutated in place each render), not just the fillRect background.
       if (imageObj._producer && !imageObj._raster) {
         materializeProducerImage(imageObj);
+        if (stats && imageObj._raster) stats.producerImages += 1;
       }
 
       // Headless raster path: a BufferedImage over a DataBufferInt is the
@@ -221,7 +312,17 @@ module.exports = {
       const raster = imageObj._raster;
       const pixels = raster && raster._dataBuffer && raster._dataBuffer._data;
       if (pixels && imageObj._width && imageObj._height) {
-        const target = obj._component;
+        let target = obj._component;
+        if (!target && graphicsContext && graphicsContext.ctx && graphicsContext.ctx.canvas) {
+          const canvas = graphicsContext.ctx.canvas;
+          target = obj._softComponent || {
+            _width: canvas.width,
+            _height: canvas.height,
+            _canvasElement: canvas,
+          };
+          obj._softComponent = target;
+        }
+        let presentedBySoftwareSurface = false;
         if (target) {
           target._lastFrame = {
             pixels,
@@ -230,23 +331,53 @@ module.exports = {
             x: args[1],
             y: args[2],
           };
-          const surface = softSurface(jvm, obj);
-          if (surface) {
-            const dx = args[1] | 0, dy = args[2] | 0;
-            const w = imageObj._width, h = imageObj._height;
-            for (let yy = 0; yy < h; yy++) {
-              const ty = dy + yy;
-              if (ty < 0 || ty >= surface.height) continue;
-              const srow = yy * w, trow = ty * surface.width;
-              for (let xx = 0; xx < w; xx++) {
-                const tx = dx + xx;
-                if (tx >= 0 && tx < surface.width) surface.pixels[trow + tx] = pixels[srow + xx] & 0xffffff;
+          const dx = args[1] | 0, dy = args[2] | 0;
+          const w = imageObj._width, h = imageObj._height;
+          const targetWidth = target._width || 800;
+          const targetHeight = target._height || 600;
+          if (dx === 0 && dy === 0 && w === targetWidth && h === targetHeight &&
+              pixels.length >= w * h) {
+            const count = w * h;
+            if (!(target._pixels instanceof Int32Array) || target._pixels.length !== count) {
+              target._pixels = new Int32Array(count);
+            }
+            if (pixels.length === count && typeof target._pixels.set === 'function') {
+              target._pixels.set(pixels);
+            } else {
+              for (let index = 0; index < count; index += 1) {
+                target._pixels[index] = pixels[index] | 0;
               }
             }
+            target._pixelsWidth = w;
+            target._pixelsHeight = h;
+            if (!jvm._softCanvases) jvm._softCanvases = new Set();
+            jvm._softCanvases.add(target);
+            presentedBySoftwareSurface = true;
+          } else {
+            const surface = softSurface(jvm, obj);
+            if (surface) {
+              for (let yy = 0; yy < h; yy++) {
+                const ty = dy + yy;
+                if (ty < 0 || ty >= surface.height) continue;
+                const srow = yy * w, trow = ty * surface.width;
+                for (let xx = 0; xx < w; xx++) {
+                  const tx = dx + xx;
+                  if (tx >= 0 && tx < surface.width) {
+                    surface.pixels[trow + tx] = pixels[srow + xx] & 0xffffff;
+                  }
+                }
+              }
+              presentedBySoftwareSurface = true;
+            }
           }
+          if (target && !target._canvasElement && jvm._awtCanvasElement) {
+            target._canvasElement = jvm._awtCanvasElement;
+          }
+          if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target);
+          if (stats && presentedBySoftwareSurface) stats.softwareBlits += 1;
         }
         dumpFrame(pixels, imageObj._width, imageObj._height);
-        if (!graphicsContext || !graphicsContext.drawImage) {
+        if (presentedBySoftwareSurface || !graphicsContext || !graphicsContext.drawImage) {
           return 1;
         }
       }

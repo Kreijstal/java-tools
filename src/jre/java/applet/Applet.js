@@ -22,6 +22,7 @@ module.exports = {
         // Store reference to canvas element
         obj._awtComponent.canvasElement = canvas;
         obj._canvasElement = canvas;
+        jvm._awtCanvasElement = canvas;
         
         // Add canvas to DOM - look for AWT container or create one
         let awtContainer = document.getElementById('awt-container');

@@ -47,6 +47,13 @@ measurement, not the browser's `requestAnimationFrame` presentation rate. The
 corresponding interval-based rate has 19 intervals and is slightly lower; the
 probe reports both values.
 
+After replacing the temporary harness's fixed 100 ms canvas poll with
+dirty-driven AWT presentation, a final run measured **8.05 changed images/s**
+and 7.65 transition intervals/s. The presentation change is primarily a
+correctness and latency fix; treat the small throughput difference from the
+7.64-7.90 band as normal run variance unless repeated measurements establish
+otherwise.
+
 Cold time remained roughly 52-54 seconds in the final headless test. That was
 accepted because the product decision was to prioritize sustained runtime speed
 over cold-start parity. Do not reject a runtime optimization solely because it
@@ -393,6 +400,40 @@ changed image, plus 391,849 array-copy/constant-scanline intrinsic calls. These
 counts justify optimizing compiled field and call sites before moving the
 renderer to a worker.
 
+### Isolate Java raster, AWT publication, and browser presentation
+
+`npm run benchmark:awt:firefox` compiles and runs the checked-in Java applet in
+JVM.js. It uses the same integer blend shape but separates four phases. The
+validated Firefox run at 64x64 measured:
+
+| Guest work | Rate |
+|---|---:|
+| Java `int[]` raster only | 0.7624 frames/s |
+| Java raster plus `MemoryImageSource.newPixels` and `Graphics.drawImage` | 0.7625 frames/s |
+| `Thread.sleep(1)` pacing control | 263 iterations/s |
+| AWT publication plus pacing, without raster | 220 iterations/s |
+
+Twenty paced AWT publications added 15 ms over the sleep-only control. Seven
+coalesced browser uploads consumed 1 ms in total at 64x64. The raster and
+raster-plus-AWT measurements are effectively identical: the expensive part is
+executing the per-pixel Java bytecode, not publishing or displaying its result.
+
+The small surface is deliberate. Earlier 800x600 fixtures containing only a
+handful of full Java frames exceeded a 90-second bound, and larger samples were
+stopped after more than 200 seconds. Reducing the frame count was insufficient;
+reducing the surface made the phase comparison finish while retaining the same
+bytecode and AWT paths. Do not extrapolate its absolute FPS linearly, but do use
+the matched phases to attribute cost.
+
+The browser AWT path now snapshots a producer framebuffer when `drawImage`
+publishes it, marks that surface dirty, and coalesces presentation on
+`requestAnimationFrame`. It intentionally does not alias the producer array:
+doing so exposed partially rendered frames while the game mutated its next
+frame. The JVM records dirty, scheduled, coalesced, presented, and upload-time
+counters. A Dekobloko validation run presented 108 completed 800x600 frames in
+the 65-second probe and spent 237 ms uploading them, about 2.19 ms per upload.
+There is no longer a harness-imposed 10 FPS ceiling.
+
 ## Reproducing the Firefox measurement
 
 Build the production bundle, because the unbundled and bundled async behavior
@@ -426,6 +467,13 @@ Measure the raw browser/canvas ceiling with:
 ```bash
 FIREFOX_EXECUTABLE_PATH=/path/to/firefox \
 npm run benchmark:canvas:firefox
+```
+
+Run the Java/AWT phase benchmark with:
+
+```bash
+FIREFOX_EXECUTABLE_PATH=/path/to/firefox \
+npm run benchmark:awt:firefox
 ```
 
 Reproduce the generated field-resolution microbenchmark with:
@@ -462,6 +510,11 @@ changed images/s in two runs; the no-local-clear follow-up measured 20 images in
 2600.32 ms, or 7.69 changed images/s and 7.31 transition intervals/s. Save the
 JSON together with the JVM commit, JAR hash, Firefox version, bundle hash, and
 host details for a defensible comparison.
+
+With dirty-driven presentation enabled, the expected initial hashes remained
+present and the probe measured 20 images in 2483.38 ms: 8.05 changed images/s
+or 7.65 transition intervals/s. It also reported 108 actual AWT presentations
+and 237 ms of total browser upload work.
 
 Run the focused correctness suite after JIT edits:
 

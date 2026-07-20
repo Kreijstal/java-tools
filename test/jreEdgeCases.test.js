@@ -13,6 +13,7 @@ const SourceDataLine = require('../src/jre/javax/sound/sampled/SourceDataLine');
 const Toolkit = require('../src/jre/java/awt/Toolkit');
 const ImageClass = require('../src/jre/java/awt/Image');
 const PixelGrabber = require('../src/jre/java/awt/image/PixelGrabber');
+const Graphics = require('../src/jre/java/awt/Graphics');
 const { setAudioOutputFactory } = require('../src/platform/audio');
 const { encodePng } = require('../src/io/pngEncoder');
 const jpeg = require('jpeg-js');
@@ -150,6 +151,56 @@ test('Toolkit decodes JPEG dimensions and pixels', (t) => {
   t.equal(image._width, 1);
   t.equal(image._height, 1);
   t.ok((pixel >> 16 & 0xff) > 180, 'red channel survives JPEG decoding');
+  t.end();
+});
+
+test('AWT producer blits coalesce dirty presentation on animation frames', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = (callback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  };
+  const uploads = [];
+  const context = {
+    createImageData(width, height) {
+      return { width, height, data: new Uint8ClampedArray(width * height * 4) };
+    },
+    putImageData(image) {
+      uploads.push(Array.from(image.data));
+    },
+  };
+  const target = {
+    _width: 2,
+    _height: 1,
+    _canvasElement: { width: 2, height: 1, getContext: () => context },
+  };
+  const jvm = {};
+  const graphics = { _component: target };
+  const sourcePixels = [0x112233, 0xaabbcc];
+  const image = {
+    _producer: { width: 2, height: 1, pixels: sourcePixels },
+  };
+  const draw = Graphics.methods['drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'];
+
+  t.equal(draw(jvm, graphics, [image, 0, 0, null]), 1,
+    'software producer image is accepted');
+  t.equal(draw(jvm, graphics, [image, 0, 0, null]), 1,
+    'a second dirty frame is accepted before presentation');
+  t.equal(callbacks.length, 1, 'dirty frames share one pending animation callback');
+  t.equal(jvm._awtPresentationStats.coalesced, 1, 'coalesced frame is counted');
+  t.notEqual(target._pixels, sourcePixels, 'full-frame publication snapshots the producer buffer');
+  sourcePixels[0] = 0xffffff;
+  t.equal(target._pixels[0], 0x112233, 'published frame is stable while producer renders the next frame');
+
+  callbacks.shift()(0);
+  t.equal(uploads.length, 1, 'latest dirty surface is uploaded once');
+  t.deepEqual(uploads[0], [0x11, 0x22, 0x33, 0xff, 0xaa, 0xbb, 0xcc, 0xff],
+    'RGB producer pixels are converted to RGBA ImageData');
+  t.equal(jvm._awtPresentationStats.presented, 1, 'completed upload is counted');
+
+  if (previousRaf === undefined) delete global.requestAnimationFrame;
+  else global.requestAnimationFrame = previousRaf;
   t.end();
 });
 

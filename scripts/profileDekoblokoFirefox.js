@@ -89,6 +89,7 @@ function animationEstimate(changes) {
         reusedFrames: jit?.syncReusedFrameCount || 0,
         intrinsics: jit?.syncIntrinsicCallCount || 0,
         runner: jit?.runnerRunCount || 0,
+        presentation: jvm?._awtPresentationStats || null,
         generatedMethods: jit ? [...jit.generatedMethodRunCounts.entries()] : [],
         inlinedMethods: jit ? [...jit.inlinedMethodRunCounts.entries()] : [],
         intrinsicMethods: jit ? [...jit.intrinsicMethodRunCounts.entries()] : [],
