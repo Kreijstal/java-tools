@@ -537,6 +537,20 @@ performance gap. A method-profile run over the animation observed roughly
 executions each of the raster and wrapper; the next large gain must reduce that
 render call graph's frame/state traffic rather than tune AWT or yielding.
 
+A verifier-backed direct-call experiment then removed the Java call-stack
+push/pop around the structurally recognized stackless raster. The first broad
+prototype recorded about 158,000 direct wrapper/raster calls during the measured
+animation, proving that the path was active, but nested direct calls complicated
+exception and deoptimization frame ordering. A conservative version therefore
+kept the wrapper frame and bypassed the stack only for the verified raster leaf.
+Its two clean runs measured 8.16 and 8.28 changed images/s versus the 8.51 and
+8.28 baseline above. The optimization was removed: call-stack container traffic
+is not a material bottleneck by itself. Future cross-method optimization needs
+to eliminate child `Frame`, locals, operand-stack, and materialization work, not
+merely push/pop. Bytecode verification can justify such inlining, but building a
+general verifier before a cross-boundary prototype demonstrates a repeatable
+gain would be premature.
+
 Run the focused correctness suite after JIT edits:
 
 ```bash
