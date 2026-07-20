@@ -148,6 +148,14 @@ test('structural packed-color scanline intrinsic preserves pixel arithmetic', (t
   intrinsic([0x224400, 0, 0x200, 2, 0x6688aa, 2, 9, pixels, 0x336699, 0x20000], 0);
   t.deepEqual(pixels, [0x3c2b44, 0x887791],
     'native scanline loop matches generated integer shifts, masks, and overflow');
+  const directPixels = [0x123456, 0xabcdef];
+  jvm.classInitializationState.set('RasterLine', 'INITIALIZED');
+  jvm.jit.packedColorScanlineDirect(
+    0x224400, 0, 0x200, 2, 0x6688aa, 2, 9, directPixels, 0x336699, 0x20000, 0,
+    'RasterLine',
+  );
+  t.deepEqual(directPixels, pixels,
+    'stackless direct scanline path preserves intrinsic pixel arithmetic');
   t.end();
 });
 
@@ -181,6 +189,76 @@ test('structural constant-color scanline intrinsic preserves pixel arithmetic', 
   intrinsic([0, 57, pixels, 0x10203, 2], 0);
   t.deepEqual(pixels, [0x0a1c2e, 0x56687a],
     'native constant-color loop matches generated mask, shift, and addition');
+  t.end();
+});
+
+test('stackless integer raster preserves operands across chained branches', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const codeItems = [
+    { labelDef: 'L0:', instruction: 'iload_0' },
+    { labelDef: 'L1:', instruction: 'iload_1' },
+    { labelDef: 'L2:', instruction: 'iload_2' },
+    { labelDef: 'L3:', instruction: { op: 'ifne', arg: 'Lnonzero' } },
+    { labelDef: 'L4:', instruction: { op: 'if_icmplt', arg: 'Lless' } },
+    { labelDef: 'L5:', instruction: 'iconst_0' },
+    { labelDef: 'L6:', instruction: { op: 'istore', arg: 17 } },
+    { labelDef: 'L7:', instruction: { op: 'goto', arg: 'Lreturn' } },
+    { labelDef: 'Lless:', instruction: 'iconst_1' },
+    { labelDef: 'L9:', instruction: { op: 'istore', arg: 17 } },
+    { labelDef: 'L10:', instruction: { op: 'goto', arg: 'Lreturn' } },
+    { labelDef: 'Lnonzero:', instruction: 'pop' },
+    { labelDef: 'L12:', instruction: 'pop' },
+    { labelDef: 'L13:', instruction: 'iconst_2' },
+    { labelDef: 'L14:', instruction: { op: 'istore', arg: 17 } },
+    { labelDef: 'Lreturn:', instruction: 'return' },
+  ];
+  for (let i = 0; i < 301; i += 1) {
+    codeItems.push({ labelDef: `LUload${i}:`, instruction: { op: 'iload', arg: 0 } });
+  }
+  for (let i = 0; i < 101; i += 1) {
+    codeItems.push({ labelDef: `LUstore${i}:`, instruction: { op: 'istore', arg: 20 } });
+  }
+  for (let i = 0; i < 5; i += 1) {
+    codeItems.push({
+      labelDef: `LUcall${i}:`,
+      instruction: {
+        op: 'invokestatic',
+        arg: ['Method', 'RasterLine', ['draw', '(IIIIIII[III)V']],
+      },
+    });
+  }
+  while (codeItems.length < 1000) {
+    codeItems.push({ labelDef: `LUnop${codeItems.length}:`, instruction: 'nop' });
+  }
+  const method = {
+    name: 'a',
+    descriptor: '(IIIIIIIBIIII[IIIII)V',
+    attributes: [{ type: 'code', code: { codeItems, exceptionTable: [] } }],
+  };
+  const generated = jvm.jit.compileStacklessIntegerRaster(method);
+  t.ok(generated && generated.jvmStacklessRaster,
+    'large structurally recognized raster selects stackless code generation');
+
+  const run = (left, right, bypass) => {
+    const frame = {
+      method,
+      instructions: codeItems,
+      locals: new Array(43).fill(null),
+      stack: { items: [] },
+      pc: 0,
+    };
+    frame.locals[0] = left;
+    frame.locals[1] = right;
+    frame.locals[2] = bypass;
+    const callStack = new Stack();
+    callStack.push(frame);
+    generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
+    return frame.locals[17];
+  };
+  t.equal(run(5, 10, 0), 1,
+    'second branch sees the two values preserved by the first branch');
+  t.equal(run(10, 5, 0), 0, 'comparison false path remains correct');
+  t.equal(run(5, 10, 1), 2, 'first branch target retains and discards both values');
   t.end();
 });
 

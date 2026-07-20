@@ -497,6 +497,11 @@ class JitCompiler {
     frame.pc = pc;
   }
 
+  materializeCached(frame, locals, stack, sp, pc) {
+    stack.length = sp;
+    this.materialize(frame, locals, stack, pc);
+  }
+
   getFrameClassName(frame) {
     if (!frame) {
       return null;
@@ -548,6 +553,13 @@ class JitCompiler {
   }
 
   compileMethod(method) {
+    const stackless = this.compileStacklessIntegerRaster(method);
+    if (stackless) return stackless;
+
+    return this.compileBaselineMethod(method);
+  }
+
+  compileBaselineMethod(method) {
     const synchronous = this.canCompileSynchronously(method);
     const GeneratedFunction = synchronous ? Function : getAsyncFunctionConstructor();
     if (!GeneratedFunction) {
@@ -563,16 +575,17 @@ class JitCompiler {
       '"use strict";',
       "const locals = frame.locals;",
       "const stack = frame.stack.items;",
+      "let sp = stack.length;",
       "let pc = frame.pc;",
       "let bytecodesUntilYield = 10000;",
       "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
       "let osrCountdown = 10007;",
       `while (pc < ${codeItems.length}) {`,
-      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materialize(frame, locals, stack, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, stack.length); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; } }",
+      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; sp = stack.length; } }",
       synchronous
-        ? "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'synchronous generated quantum' }; }"
-        : "if (--bytecodesUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 10000; bytecodeChecks = helpers.needsBytecodeChecks(); }",
-      "if (bytecodeChecks && helpers.shouldDeopt(frame, pc)) { helpers.materialize(frame, locals, stack, pc); return { deopt: true }; }",
+        ? "if (--bytecodesUntilYield === 0) { helpers.materializeCached(frame, locals, stack, sp, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'synchronous generated quantum' }; }"
+        : "if (--bytecodesUntilYield === 0) { helpers.materializeCached(frame, locals, stack, sp, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 10000; bytecodeChecks = helpers.needsBytecodeChecks(); }",
+      "if (bytecodeChecks && helpers.shouldDeopt(frame, pc)) { helpers.materializeCached(frame, locals, stack, sp, pc); return { deopt: true }; }",
       "switch (pc) {",
     ];
 
@@ -588,7 +601,7 @@ class JitCompiler {
         // exact frame PC is only needed before an instruction that can throw
         // or deopt; control-flow edges materialize their own resume PC.
         if (this.instructionNeedsPrecisePc(instruction)) {
-          body.push(`frame.pc = ${index};`);
+          body.push(`stack.length = sp; frame.pc = ${index};`);
         }
         body.push(this.emitInstruction(instruction, index));
       });
@@ -597,10 +610,10 @@ class JitCompiler {
       this.compileSynchronous = false;
     }
 
-    body.push("default: helpers.materialize(frame, locals, stack, pc); return { deopt: true, reason: 'invalid generated pc ' + pc };");
+    body.push("default: helpers.materializeCached(frame, locals, stack, sp, pc); return { deopt: true, reason: 'invalid generated pc ' + pc };");
     body.push("}");
     body.push("}");
-    body.push("helpers.materialize(frame, locals, stack, pc);");
+    body.push("helpers.materializeCached(frame, locals, stack, sp, pc);");
     body.push("thread.callStack.pop();");
     body.push("return { returned: true, value: helpers.returnVoid() };");
 
@@ -614,6 +627,353 @@ class JitCompiler {
       }
       throw err;
     }
+  }
+
+  compileStacklessIntegerRaster(method) {
+    const rasterDescriptor = "(IIIIIIIBIIII[IIIII)V";
+    const wrapperDescriptor = "(IIIIIIIIIIIIZIII)V";
+    if (method.name !== "a" ||
+        method.descriptor !== rasterDescriptor && method.descriptor !== wrapperDescriptor) return null;
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const codeItems = code && code.code && code.code.codeItems || [];
+    if (!this.canCompileSynchronously(method)) return null;
+
+    const ops = codeItems.map((item) => getOp(item && item.instruction)).filter(Boolean);
+    const hotCalls = codeItems.filter((item) => {
+      const instruction = item && item.instruction;
+      return getOp(instruction) === "invokestatic" && instruction &&
+        Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+        instruction.arg[2][1] === (method.descriptor === rasterDescriptor
+          ? "(IIIIIII[III)V" : rasterDescriptor);
+    }).length;
+    const rasterShape = method.descriptor === rasterDescriptor && codeItems.length >= 1000 &&
+      ops.filter((op) => op === "iload").length >= 300 &&
+      ops.filter((op) => op === "istore").length >= 100 && hotCalls >= 5;
+    const wrapperShape = method.descriptor === wrapperDescriptor && codeItems.length >= 170 &&
+      ops.filter((op) => op === "iload").length >= 80 && hotCalls >= 6;
+    if (!rasterShape && !wrapperShape) {
+      return null;
+    }
+
+    const labels = buildLabelMap(codeItems);
+    const depths = this.computeStackDepths(codeItems, labels);
+    if (!depths) return null;
+    const leaders = new Set([0]);
+    const terminal = new Set([
+      "areturn", "athrow", "dreturn", "freturn", "ireturn", "lreturn", "return",
+    ]);
+    for (let index = 0; index < codeItems.length; index += 1) {
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      if (op === "goto" || op && op.startsWith("if")) {
+        const target = branchTargetIndex(instruction, labels);
+        if (target === undefined) return null;
+        leaders.add(target);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      }
+      if (op && op.startsWith("invoke")) {
+        leaders.add(index);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      }
+      if (terminal.has(op) && index + 1 < codeItems.length) leaders.add(index + 1);
+    }
+    const exceptionTable = code.code.exceptionTable || [];
+    for (const entry of exceptionTable) {
+      const handler = labels.get(entry.handlerLbl || `L${entry.handler_pc}`);
+      if (handler !== undefined) leaders.add(handler);
+    }
+
+    const orderedLeaders = [...leaders].sort((a, b) => a - b);
+    const nextLeader = new Map();
+    orderedLeaders.forEach((leader, position) => {
+      nextLeader.set(leader, orderedLeaders[position + 1] ?? codeItems.length);
+    });
+
+    let temporary = 0;
+    const temp = () => `v${temporary++}`;
+    const body = [
+      '"use strict";',
+      "const locals = frame.locals;",
+      "const stack = frame.stack.items;",
+      "let pc = frame.pc;",
+      "let blocksUntilYield = 10000;",
+      "if ((initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) return { deopt: true, transient: true, reason: 'stackless raster debug entry' };",
+      "while (true) {",
+      "if (--blocksUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'stackless raster quantum' }; }",
+      "switch (pc) {",
+    ];
+
+    const saveStack = (expressions) => {
+      const lines = expressions.map((expression, index) => `stack[${index}] = ${expression};`);
+      lines.push(`stack.length = ${expressions.length};`);
+      return lines;
+    };
+    const transfer = (expressions, target) => [
+      ...saveStack(expressions),
+      `pc = ${target};`,
+      "continue;",
+    ];
+    const deopt = (expressions, index, reason) => [
+      ...saveStack(expressions),
+      `helpers.materialize(frame, locals, stack, ${index});`,
+      `return { deopt: true, reason: ${JSON.stringify(reason)} };`,
+    ];
+    const localIndex = (instruction, op) => {
+      if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
+        return Number(instruction.arg);
+      }
+      const match = /_([0-3])$/.exec(op || "");
+      return match ? Number(match[1]) : NaN;
+    };
+    const constant = (instruction, op) => {
+      if (op === "iconst_m1") return "-1";
+      if (/^iconst_[0-5]$/.test(op)) return op.slice(-1);
+      return jsLiteral(Number(instruction.arg));
+    };
+
+    for (const leader of orderedLeaders) {
+      const entryDepth = depths[leader];
+      if (entryDepth === undefined) continue;
+      body.push(`case ${leader}: {`);
+      const expressions = [];
+      for (let index = 0; index < entryDepth; index += 1) {
+        const value = temp();
+        body.push(`const ${value} = stack[${index}];`);
+        expressions.push(value);
+      }
+      let terminated = false;
+      const end = nextLeader.get(leader);
+
+      for (let index = leader; index < end; index += 1) {
+        const instruction = codeItems[index] && codeItems[index].instruction;
+        const op = getOp(instruction);
+        if (!op || op === "nop") continue;
+        const pop = () => expressions.pop();
+        const binary = (format) => {
+          const right = pop();
+          const left = pop();
+          if (left === undefined || right === undefined) return false;
+          expressions.push(format(left, right));
+          return true;
+        };
+        let valid = true;
+
+        if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+          const value = temp();
+          body.push(`const ${value} = locals[${localIndex(instruction, op)}];`);
+          expressions.push(value);
+        } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else body.push(`locals[${localIndex(instruction, op)}] = ${value};`);
+        } else if (op === "aconst_null") {
+          expressions.push("null");
+        } else if (/^iconst_(?:m1|[0-5])$/.test(op) ||
+                   op === "bipush" || op === "sipush" || op === "ldc" || op === "ldc_w") {
+          if ((op === "ldc" || op === "ldc_w") && typeof instruction.arg !== "number") {
+            const value = temp();
+            body.push(`const ${value} = helpers.constantValue(${jsLiteral(instruction.arg)});`);
+            expressions.push(value);
+          } else {
+            expressions.push(constant(instruction, op));
+          }
+        } else if (op === "dup") {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else {
+            const duplicate = temp();
+            body.push(`const ${duplicate} = ${value};`);
+            expressions.push(duplicate, duplicate);
+          }
+        } else if (op === "pop") {
+          if (pop() === undefined) valid = false;
+        } else if (op === "iadd") {
+          valid = binary((a, b) => `((${a} + ${b}) | 0)`);
+        } else if (op === "isub") {
+          valid = binary((a, b) => `((${a} - ${b}) | 0)`);
+        } else if (op === "imul") {
+          valid = binary((a, b) => `Math.imul(${a}, ${b})`);
+        } else if (op === "ixor") {
+          valid = binary((a, b) => `(${a} ^ ${b})`);
+        } else if (op === "iand") {
+          valid = binary((a, b) => `(${a} & ${b})`);
+        } else if (op === "ior") {
+          valid = binary((a, b) => `(${a} | ${b})`);
+        } else if (op === "ishl") {
+          valid = binary((a, b) => `(${a} << (${b} & 31))`);
+        } else if (op === "ishr") {
+          valid = binary((a, b) => `(${a} >> (${b} & 31))`);
+        } else if (op === "iushr") {
+          valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`);
+        } else if (op === "ineg") {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else expressions.push(`((-${value}) | 0)`);
+        } else if (op === "idiv" || op === "irem") {
+          const divisorExpression = pop();
+          const dividendExpression = pop();
+          if (divisorExpression === undefined || dividendExpression === undefined) valid = false;
+          else {
+            const divisor = temp();
+            body.push(`frame.pc = ${index}; const ${divisor} = ${divisorExpression};`);
+            body.push(`if (${divisor} === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`);
+            expressions.push(op === "idiv"
+              ? `((${dividendExpression} / ${divisor}) | 0)`
+              : `((${dividendExpression} % ${divisor}) | 0)`);
+          }
+        } else if (op === "iinc") {
+          const variable = Number(instruction.varnum ?? instruction.arg);
+          const increment = Number(instruction.incr ?? 0);
+          body.push(`locals[${variable}] = (locals[${variable}] + ${increment}) | 0;`);
+        } else if (op === "getstatic") {
+          const value = temp();
+          body.push(`frame.pc = ${index}; const ${value} = helpers.getStaticSync(${JSON.stringify(instruction.arg)});`);
+          if (expressions.length) body.push(...saveStack(expressions));
+          body.push(`if (${value} === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization in stackless raster" }; }`);
+          expressions.push(value);
+        } else if (op === "iaload") {
+          const arrayIndex = pop();
+          const array = pop();
+          if (arrayIndex === undefined || array === undefined) valid = false;
+          else {
+            const value = temp();
+            body.push(`frame.pc = ${index}; const ${value} = helpers.arrayLoad(${arrayIndex}, ${array}, frame);`);
+            expressions.push(value);
+          }
+        } else if (op && op.startsWith("invoke")) {
+          const invokeDescriptor = instruction.arg[2][1];
+          if (rasterShape && op === "invokestatic" &&
+              invokeDescriptor === "(IIIIIII[III)V" && expressions.length >= 10) {
+            const base = expressions.length - 10;
+            const direct = temp();
+            body.push(`const ${direct} = helpers.packedColorScanlineDirect(${expressions.slice(base).join(", ")}, locals[42], ${JSON.stringify(instruction.arg[1])});`);
+            body.push(`if (${direct} !== helpers.asyncInvokeSentinel()) {`);
+            body.push(...saveStack(expressions.slice(0, base)));
+            body.push(`pc = ${index + 1}; continue;`);
+            body.push("}");
+          }
+          const callSiteId = this.registerSyncCallSite(op, instruction);
+          const parsed = parseDescriptor(instruction.arg[2][1]);
+          body.push(...saveStack(expressions));
+          body.push(`helpers.materialize(frame, locals, stack, ${index + 1});`);
+          const value = temp();
+          body.push(`const ${value} = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread);`);
+          body.push(`if (${value} === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous stackless raster callee" }; }`);
+          body.push(`if (${value} && ${value}.deopt) return ${value};`);
+          body.push(`if (${value} !== helpers.returnVoid()) stack.push(${value});`);
+          body.push(`if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in stackless raster callee" };`);
+          const resultDepth = expressions.length - parsed.params.length - (op === "invokestatic" ? 0 : 1) +
+            (parsed.returnType === "void" ? 0 : 1);
+          body.push(`stack.length = ${resultDepth}; pc = ${index + 1}; continue;`);
+          terminated = true;
+        } else if (op === "goto") {
+          body.push(...transfer(expressions, branchTargetIndex(instruction, labels)));
+          terminated = true;
+        } else if (op && op.startsWith("if")) {
+          let condition;
+          if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) {
+            const right = pop();
+            const left = pop();
+            const comparisons = {
+              if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<", if_icmpge: ">=",
+              if_icmpgt: ">", if_icmple: "<=", if_acmpeq: "===", if_acmpne: "!==",
+            };
+            if (left === undefined || right === undefined || !comparisons[op]) valid = false;
+            else condition = `${left} ${comparisons[op]} ${right}`;
+          } else {
+            const value = pop();
+            const comparisons = {
+              ifeq: "=== 0", ifne: "!== 0", iflt: "< 0", ifge: ">= 0",
+              ifgt: "> 0", ifle: "<= 0", ifnull: "=== null", ifnonnull: "!== null",
+            };
+            if (value === undefined || !comparisons[op]) valid = false;
+            else condition = `${value} ${comparisons[op]}`;
+          }
+          if (valid) {
+            body.push(...saveStack(expressions));
+            body.push(`pc = (${condition}) ? ${branchTargetIndex(instruction, labels)} : ${index + 1}; continue;`);
+            terminated = true;
+          }
+        } else if (op === "athrow") {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else {
+            body.push(`frame.pc = ${index}; throw ${value};`);
+            terminated = true;
+          }
+        } else if (op === "return") {
+          body.push(...saveStack(expressions));
+          body.push(`helpers.materialize(frame, locals, stack, ${index + 1}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`);
+          terminated = true;
+        } else if (/^[aifdl]return$/.test(op)) {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else {
+            body.push(...saveStack(expressions));
+            body.push(`helpers.materialize(frame, locals, stack, ${index + 1}); thread.callStack.pop(); return { returned: true, value: ${value} };`);
+            terminated = true;
+          }
+        } else {
+          valid = false;
+        }
+
+        if (!valid) {
+          body.push(...deopt(expressions, index, `unsupported stackless raster opcode ${op}`));
+          terminated = true;
+        }
+        if (terminated) break;
+      }
+
+      if (!terminated) body.push(...transfer(expressions, end));
+      body.push("}");
+    }
+
+    body.push("default: helpers.materialize(frame, locals, stack, pc); return { deopt: true, reason: 'invalid stackless raster pc ' + pc };");
+    body.push("}", "}");
+    try {
+      const generated = new Function("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      generated.jvmSynchronous = true;
+      generated.jvmStacklessRaster = true;
+      return generated;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  computeStackDepths(codeItems, labels) {
+    const depths = new Array(codeItems.length);
+    const pending = [0];
+    depths[0] = 0;
+    const terminal = new Set([
+      "areturn", "athrow", "dreturn", "freturn", "ireturn", "lreturn", "return",
+    ]);
+    while (pending.length) {
+      const index = pending.pop();
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      const effect = stackEffect(instruction);
+      if (effect === null) return null;
+      const after = depths[index] + effect;
+      if (after < 0) return null;
+      const successors = [];
+      if (op === "goto") {
+        successors.push(branchTargetIndex(instruction, labels));
+      } else if (op && op.startsWith("if")) {
+        successors.push(index + 1, branchTargetIndex(instruction, labels));
+      } else if (!terminal.has(op) && index + 1 < codeItems.length) {
+        successors.push(index + 1);
+      }
+      for (const successor of successors) {
+        if (successor === undefined || successor < 0 || successor >= codeItems.length) return null;
+        if (depths[successor] === undefined) {
+          depths[successor] = after;
+          pending.push(successor);
+        } else if (depths[successor] !== after) {
+          return null;
+        }
+      }
+    }
+    return depths;
   }
 
   canCompileSynchronously(method) {
@@ -652,186 +1012,186 @@ class JitCompiler {
     const localIndex = (fallback) => Number(instruction.arg ?? fallback);
 
     switch (op) {
-      case "aconst_null": return `stack.push(null); ${goNext}`;
-      case "aload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
-      case "aload_0": return `stack.push(locals[0]); ${goNext}`;
-      case "aload_1": return `stack.push(locals[1]); ${goNext}`;
-      case "aload_2": return `stack.push(locals[2]); ${goNext}`;
-      case "aload_3": return `stack.push(locals[3]); ${goNext}`;
-      case "iload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
-      case "iload_0": return `stack.push(locals[0]); ${goNext}`;
-      case "iload_1": return `stack.push(locals[1]); ${goNext}`;
-      case "iload_2": return `stack.push(locals[2]); ${goNext}`;
-      case "iload_3": return `stack.push(locals[3]); ${goNext}`;
-      case "dload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
-      case "dload_0": return `stack.push(locals[0]); ${goNext}`;
-      case "dload_1": return `stack.push(locals[1]); ${goNext}`;
-      case "dload_2": return `stack.push(locals[2]); ${goNext}`;
-      case "dload_3": return `stack.push(locals[3]); ${goNext}`;
-      case "fload": return `stack.push(locals[${localIndex()}]); ${goNext}`;
-      case "fload_0": return `stack.push(locals[0]); ${goNext}`;
-      case "fload_1": return `stack.push(locals[1]); ${goNext}`;
-      case "fload_2": return `stack.push(locals[2]); ${goNext}`;
-      case "fload_3": return `stack.push(locals[3]); ${goNext}`;
-      case "astore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
-      case "astore_0": return `locals[0] = stack.pop(); ${goNext}`;
-      case "astore_1": return `locals[1] = stack.pop(); ${goNext}`;
-      case "astore_2": return `locals[2] = stack.pop(); ${goNext}`;
-      case "astore_3": return `locals[3] = stack.pop(); ${goNext}`;
-      case "istore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
-      case "istore_0": return `locals[0] = stack.pop(); ${goNext}`;
-      case "istore_1": return `locals[1] = stack.pop(); ${goNext}`;
-      case "istore_2": return `locals[2] = stack.pop(); ${goNext}`;
-      case "istore_3": return `locals[3] = stack.pop(); ${goNext}`;
-      case "dstore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
-      case "dstore_0": return `locals[0] = stack.pop(); ${goNext}`;
-      case "dstore_1": return `locals[1] = stack.pop(); ${goNext}`;
-      case "dstore_2": return `locals[2] = stack.pop(); ${goNext}`;
-      case "dstore_3": return `locals[3] = stack.pop(); ${goNext}`;
-      case "fstore": return `locals[${localIndex()}] = stack.pop(); ${goNext}`;
-      case "fstore_0": return `locals[0] = stack.pop(); ${goNext}`;
-      case "fstore_1": return `locals[1] = stack.pop(); ${goNext}`;
-      case "fstore_2": return `locals[2] = stack.pop(); ${goNext}`;
-      case "fstore_3": return `locals[3] = stack.pop(); ${goNext}`;
-      case "iconst_0": return `stack.push(0); ${goNext}`;
-      case "iconst_m1": return `stack.push(-1); ${goNext}`;
-      case "iconst_1": return `stack.push(1); ${goNext}`;
-      case "iconst_2": return `stack.push(2); ${goNext}`;
-      case "iconst_3": return `stack.push(3); ${goNext}`;
-      case "iconst_4": return `stack.push(4); ${goNext}`;
-      case "iconst_5": return `stack.push(5); ${goNext}`;
-      case "dconst_0": return `stack.push(0.0); ${goNext}`;
-      case "dconst_1": return `stack.push(1.0); ${goNext}`;
-      case "fconst_0": return `stack.push(0.0); ${goNext}`;
-      case "fconst_1": return `stack.push(1.0); ${goNext}`;
-      case "fconst_2": return `stack.push(2.0); ${goNext}`;
+      case "aconst_null": return `stack[sp++] = null; ${goNext}`;
+      case "aload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "aload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "aload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "aload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "aload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "iload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "iload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "iload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "iload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "iload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "dload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "dload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "dload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "dload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "dload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "fload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "fload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "fload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "fload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "fload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "astore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "astore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "astore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "astore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "astore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "istore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "istore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "istore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "istore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "istore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "dstore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "dstore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "dstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "dstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "dstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "fstore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "fstore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "fstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "fstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "fstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "iconst_0": return `stack[sp++] = 0; ${goNext}`;
+      case "iconst_m1": return `stack[sp++] = -1; ${goNext}`;
+      case "iconst_1": return `stack[sp++] = 1; ${goNext}`;
+      case "iconst_2": return `stack[sp++] = 2; ${goNext}`;
+      case "iconst_3": return `stack[sp++] = 3; ${goNext}`;
+      case "iconst_4": return `stack[sp++] = 4; ${goNext}`;
+      case "iconst_5": return `stack[sp++] = 5; ${goNext}`;
+      case "dconst_0": return `stack[sp++] = 0.0; ${goNext}`;
+      case "dconst_1": return `stack[sp++] = 1.0; ${goNext}`;
+      case "fconst_0": return `stack[sp++] = 0.0; ${goNext}`;
+      case "fconst_1": return `stack[sp++] = 1.0; ${goNext}`;
+      case "fconst_2": return `stack[sp++] = 2.0; ${goNext}`;
       case "bipush":
-      case "sipush": return `stack.push(${Number(instruction.arg)}); ${goNext}`;
+      case "sipush": return `stack[sp++] = ${Number(instruction.arg)}; ${goNext}`;
       case "ldc":
       case "ldc_w":
         if (isClassConstant(instruction.arg)) {
-          return `stack.push(await helpers.classConstant(${JSON.stringify(instruction.arg[1])})); ${goNext}`;
+          return `stack[sp++] = await helpers.classConstant(${JSON.stringify(instruction.arg[1])}); ${goNext}`;
         }
-        return `stack.push(helpers.constantValue(${jsLiteral(instruction.arg)})); ${goNext}`;
-      case "ldc2_w": return `stack.push(helpers.constantValue(${jsLiteral(instruction.arg)})); ${goNext}`;
-      case "dup": return `stack.push(stack[stack.length - 1]); ${goNext}`;
-      case "dup2": return `{ const value1 = stack.pop(); if (typeof value1 === "bigint") { stack.push(value1, value1); } else { const value2 = stack.pop(); stack.push(value2, value1, value2, value1); } } ${goNext}`;
-      case "pop": return `stack.pop(); ${goNext}`;
-      case "iadd": return `stack.push((stack.pop() + stack.pop()) | 0); ${goNext}`;
-      case "isub": return `{ const b = stack.pop(); const a = stack.pop(); stack.push((a - b) | 0); } ${goNext}`;
-      case "imul": return `stack.push(Math.imul(stack.pop(), stack.pop())); ${goNext}`;
-      case "ineg": return `stack.push((-stack.pop()) | 0); ${goNext}`;
-      case "ixor": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); } ${goNext}`;
-      case "iand": return `stack.push(stack.pop() & stack.pop()); ${goNext}`;
-      case "ior": return `stack.push(stack.pop() | stack.pop()); ${goNext}`;
-      case "irem": return `{ const b = stack.pop(); const a = stack.pop(); if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push((a % b) | 0); } ${goNext}`;
-      case "ishl": return `{ const shift = stack.pop(); const value = stack.pop(); stack.push(value << (shift & 31)); } ${goNext}`;
-      case "ishr": return `{ const shift = stack.pop(); const value = stack.pop(); stack.push(value >> (shift & 31)); } ${goNext}`;
-      case "iushr": return `{ const shift = stack.pop(); const value = stack.pop(); stack.push((value >>> (shift & 31)) | 0); } ${goNext}`;
-      case "idiv": return `{ const b = stack.pop(); const a = stack.pop(); if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push((a / b) | 0); } ${goNext}`;
-      case "dadd": return `stack.push(stack.pop() + stack.pop()); ${goNext}`;
-      case "dsub": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a - b); } ${goNext}`;
-      case "dmul": return `stack.push(stack.pop() * stack.pop()); ${goNext}`;
-      case "ddiv": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a / b); } ${goNext}`;
-      case "dneg": return `stack.push(-stack.pop()); ${goNext}`;
-      case "fadd": return `stack.push(Math.fround(stack.pop() + stack.pop())); ${goNext}`;
-      case "fsub": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a - b)); } ${goNext}`;
-      case "fmul": return `stack.push(Math.fround(stack.pop() * stack.pop())); ${goNext}`;
-      case "fdiv": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a / b)); } ${goNext}`;
-      case "frem": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a % b)); } ${goNext}`;
-      case "fneg": return `stack.push(Math.fround(-stack.pop())); ${goNext}`;
+        return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
+      case "ldc2_w": return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
+      case "dup": return `stack[sp] = stack[sp - 1]; sp += 1; ${goNext}`;
+      case "dup2": return `{ const value1 = stack[--sp]; if (typeof value1 === "bigint") { stack[sp++] = value1; stack[sp++] = value1; } else { const value2 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } } ${goNext}`;
+      case "pop": return `sp -= 1; ${goNext}`;
+      case "iadd": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] + b) | 0; } ${goNext}`;
+      case "isub": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] - b) | 0; } ${goNext}`;
+      case "imul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.imul(stack[sp - 1], b); } ${goNext}`;
+      case "ineg": return `stack[sp - 1] = (-stack[sp - 1]) | 0; ${goNext}`;
+      case "ixor": return `{ const b = stack[--sp]; stack[sp - 1] ^= b; } ${goNext}`;
+      case "iand": return `{ const b = stack[--sp]; stack[sp - 1] &= b; } ${goNext}`;
+      case "ior": return `{ const b = stack[--sp]; stack[sp - 1] |= b; } ${goNext}`;
+      case "irem": return `{ const b = stack[--sp]; if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = (stack[sp - 1] % b) | 0; } ${goNext}`;
+      case "ishl": return `{ const shift = stack[--sp]; stack[sp - 1] <<= shift & 31; } ${goNext}`;
+      case "ishr": return `{ const shift = stack[--sp]; stack[sp - 1] >>= shift & 31; } ${goNext}`;
+      case "iushr": return `{ const shift = stack[--sp]; stack[sp - 1] = (stack[sp - 1] >>> (shift & 31)) | 0; } ${goNext}`;
+      case "idiv": return `{ const b = stack[--sp]; if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = (stack[sp - 1] / b) | 0; } ${goNext}`;
+      case "dadd": return `{ const b = stack[--sp]; stack[sp - 1] += b; } ${goNext}`;
+      case "dsub": return `{ const b = stack[--sp]; stack[sp - 1] -= b; } ${goNext}`;
+      case "dmul": return `{ const b = stack[--sp]; stack[sp - 1] *= b; } ${goNext}`;
+      case "ddiv": return `{ const b = stack[--sp]; stack[sp - 1] /= b; } ${goNext}`;
+      case "dneg": return `stack[sp - 1] = -stack[sp - 1]; ${goNext}`;
+      case "fadd": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] + b); } ${goNext}`;
+      case "fsub": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] - b); } ${goNext}`;
+      case "fmul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] * b); } ${goNext}`;
+      case "fdiv": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] / b); } ${goNext}`;
+      case "frem": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] % b); } ${goNext}`;
+      case "fneg": return `stack[sp - 1] = Math.fround(-stack[sp - 1]); ${goNext}`;
       case "i2d": return goNext;
-      case "i2b": return `stack.push((stack.pop() << 24) >> 24); ${goNext}`;
-      case "i2l": return `stack.push(BigInt(stack.pop())); ${goNext}`;
-      case "i2f": return `stack.push(Math.fround(stack.pop())); ${goNext}`;
+      case "i2b": return `stack[sp - 1] = (stack[sp - 1] << 24) >> 24; ${goNext}`;
+      case "i2l": return `stack[sp - 1] = BigInt(stack[sp - 1]); ${goNext}`;
+      case "i2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
       case "f2d": return goNext;
-      case "d2f": return `stack.push(Math.fround(stack.pop())); ${goNext}`;
-      case "f2i": return `stack.push(helpers.floatToInt(stack.pop())); ${goNext}`;
-      case "d2i": return `stack.push(Math.trunc(stack.pop()) | 0); ${goNext}`;
-      case "lxor": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); } ${goNext}`;
-      case "ldiv": return `{ const b = stack.pop(); const a = stack.pop(); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push(a / b); } ${goNext}`;
-      case "lcmp": return `{ const b = stack.pop(); const a = stack.pop(); stack.push(a < b ? -1 : (a > b ? 1 : 0)); } ${goNext}`;
+      case "d2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
+      case "f2i": return `stack[sp - 1] = helpers.floatToInt(stack[sp - 1]); ${goNext}`;
+      case "d2i": return `stack[sp - 1] = Math.trunc(stack[sp - 1]) | 0; ${goNext}`;
+      case "lxor": return `{ const b = stack[--sp]; stack[sp - 1] ^= b; } ${goNext}`;
+      case "ldiv": return `{ const b = stack[--sp]; if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] /= b; } ${goNext}`;
+      case "lcmp": return `{ const b = stack[--sp]; const a = stack[sp - 1]; stack[sp - 1] = a < b ? -1 : (a > b ? 1 : 0); } ${goNext}`;
       case "iinc": return `locals[${Number(instruction.varnum)}] = (locals[${Number(instruction.varnum)}] + ${Number(instruction.incr)}) | 0; ${goNext}`;
-      case "dcmpg": return `stack.push(helpers.compareDouble(stack.pop(), stack.pop(), 1)); ${goNext}`;
-      case "dcmpl": return `stack.push(helpers.compareDouble(stack.pop(), stack.pop(), -1)); ${goNext}`;
-      case "newarray": return `stack.push(helpers.newPrimitiveArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
-      case "anewarray": return `stack.push(helpers.newReferenceArray(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
-      case "arraylength": return `stack.push(helpers.arrayLength(stack.pop(), frame)); ${goNext}`;
+      case "dcmpg": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], 1); } ${goNext}`;
+      case "dcmpl": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], -1); } ${goNext}`;
+      case "newarray": return `stack[sp - 1] = helpers.newPrimitiveArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
+      case "anewarray": return `stack[sp - 1] = helpers.newReferenceArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
+      case "arraylength": return `stack[sp - 1] = helpers.arrayLength(stack[sp - 1], frame); ${goNext}`;
       case "checkcast":
         if (this.compileSynchronous) {
-          return `{ const cast = helpers.tryCheckCastSync(stack[stack.length - 1], ${JSON.stringify(instruction.arg)}); if (cast === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous checkcast" }; } } ${goNext}`;
+          return `{ const cast = helpers.tryCheckCastSync(stack[sp - 1], ${JSON.stringify(instruction.arg)}); if (cast === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous checkcast" }; } } ${goNext}`;
         }
-        return `{ const value = stack[stack.length - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
+        return `{ const value = stack[sp - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
       case "aaload":
       case "iaload":
       case "daload":
       case "faload":
       case "baload":
       case "caload":
-      case "saload": return `stack.push(helpers.arrayLoad(stack.pop(), stack.pop(), frame)); ${goNext}`;
+      case "saload": return `{ const index = stack[--sp]; stack[sp - 1] = helpers.arrayLoad(index, stack[sp - 1], frame); } ${goNext}`;
       case "aastore":
       case "iastore":
       case "dastore":
       case "fastore":
       case "bastore":
       case "castore":
-      case "sastore": return `helpers.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame); ${goNext}`;
-      case "getfield": return `stack.push(helpers.getField(stack.pop(), ${JSON.stringify(instruction.arg)})); ${goNext}`;
-      case "putfield": return `{ const value = stack.pop(); const obj = stack.pop(); helpers.putField(obj, ${JSON.stringify(instruction.arg)}, value); } ${goNext}`;
+      case "sastore": return `{ const value = stack[--sp]; const index = stack[--sp]; helpers.arrayStore(value, index, stack[--sp], frame); } ${goNext}`;
+      case "getfield": return `stack[sp - 1] = helpers.getField(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
+      case "putfield": return `{ const value = stack[--sp]; helpers.putField(stack[--sp], ${JSON.stringify(instruction.arg)}, value); } ${goNext}`;
       case "getstatic":
         if (this.compileSynchronous) {
-          return `{ const value = helpers.getStaticSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack.push(value); } ${goNext}`;
+          return `{ const value = helpers.getStaticSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack[sp++] = value; } ${goNext}`;
         }
-        return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack.push(value); } ${goNext}`;
+        return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack[sp++] = value; } ${goNext}`;
       case "putstatic":
         if (this.compileSynchronous) {
-          return `{ const changed = helpers.putStaticSync(${JSON.stringify(instruction.arg)}, stack[stack.length - 1]); if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } stack.pop(); } ${goNext}`;
+          return `{ const changed = helpers.putStaticSync(${JSON.stringify(instruction.arg)}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
         }
-        return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[stack.length - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } stack.pop(); } ${goNext}`;
+        return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[sp - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } sp -= 1; } ${goNext}`;
       case "new":
         if (this.compileSynchronous) {
-          return `{ const value = helpers.newObjectSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous new" }; } stack.push(value); } ${goNext}`;
+          return `{ const value = helpers.newObjectSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous new" }; } stack[sp++] = value; } ${goNext}`;
         }
-        return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack.push(value); } ${goNext}`;
-      case "monitorenter": return `{ const monitor = stack[stack.length - 1]; if (!helpers.monitorEnter(monitor, thread)) { helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, transient: true, reason: "contended generated monitorenter" }; } stack.pop(); } ${goNext}`;
-      case "monitorexit": return `helpers.monitorExit(stack.pop(), thread); ${goNext}`;
+        return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack[sp++] = value; } ${goNext}`;
+      case "monitorenter": return `{ const monitor = stack[sp - 1]; if (!helpers.monitorEnter(monitor, thread)) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "contended generated monitorenter" }; } sp -= 1; } ${goNext}`;
+      case "monitorexit": return `helpers.monitorExit(stack[--sp], thread); ${goNext}`;
       case "invokestatic":
       case "invokevirtual":
       case "invokeinterface":
       case "invokespecial":
         if (this.compileSynchronous) {
           const callSiteId = this.registerSyncCallSite(op, instruction);
-          return `{ helpers.materialize(frame, locals, stack, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; if (value !== helpers.returnVoid()) stack.push(value); if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
+          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
         }
-        return `{ helpers.materialize(frame, locals, stack, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; if (value !== helpers.returnVoid()) stack.push(value); if (thread.status !== "runnable") { helpers.materialize(frame, locals, stack, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
+        return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
-      case "ifeq": return `if (stack.pop() === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "ifne": return `if (stack.pop() !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "iflt": return `if (stack.pop() < 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "ifge": return `if (stack.pop() >= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "ifgt": return `if (stack.pop() > 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "ifle": return `if (stack.pop() <= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "ifnull": return `if (stack.pop() === null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "ifnonnull": return `if (stack.pop() !== null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
-      case "if_icmpeq": return `{ const b = stack.pop(); const a = stack.pop(); if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_icmpne": return `{ const b = stack.pop(); const a = stack.pop(); if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_icmplt": return `{ const b = stack.pop(); const a = stack.pop(); if (a < b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_icmpge": return `{ const b = stack.pop(); const a = stack.pop(); if (a >= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_icmpgt": return `{ const b = stack.pop(); const a = stack.pop(); if (a > b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_icmple": return `{ const b = stack.pop(); const a = stack.pop(); if (a <= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_acmpeq": return `{ const b = stack.pop(); const a = stack.pop(); if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "if_acmpne": return `{ const b = stack.pop(); const a = stack.pop(); if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
-      case "athrow": return `throw stack.pop();`;
+      case "ifeq": return `if (stack[--sp] === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifne": return `if (stack[--sp] !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "iflt": return `if (stack[--sp] < 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifge": return `if (stack[--sp] >= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifgt": return `if (stack[--sp] > 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifle": return `if (stack[--sp] <= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifnull": return `if (stack[--sp] === null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifnonnull": return `if (stack[--sp] !== null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "if_icmpeq": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpne": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmplt": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a < b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpge": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a >= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpgt": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a > b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmple": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a <= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_acmpeq": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_acmpne": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "athrow": return `throw stack[--sp];`;
       case "return":
-        return `helpers.materialize(frame, locals, stack, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
+        return `helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
       case "areturn":
       case "ireturn":
       case "lreturn":
       case "freturn":
       case "dreturn":
-        return `{ const ret = stack.pop(); helpers.materialize(frame, locals, stack, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
+        return `{ const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
       default:
-        return `helpers.materialize(frame, locals, stack, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
+        return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
     }
   }
 
@@ -1779,6 +2139,37 @@ class JitCompiler {
     return null;
   }
 
+  packedColorScanlineDirect(green, index, greenStep, redStep, red, count,
+    tag, dest, blue, blueStep, guarded, owner) {
+    if ((tag | 0) !== 9 || guarded ||
+        this.jvm.classInitializationState.get(owner) !== "INITIALIZED") return ASYNC_INVOKE;
+    index |= 0;
+    count |= 0;
+    if (dest === null || dest === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (count <= 0) return true;
+    if (index < 0 || index + count > dest.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    green |= 0;
+    red |= 0;
+    blue |= 0;
+    greenStep |= 0;
+    redStep |= 0;
+    blueStep |= 0;
+    for (let offset = 0; offset < count; offset += 1) {
+      dest[index] = (((dest[index] >> 1) & 8355711) +
+        ((green >> 9) & 65280) + ((red >> 1) & 16711680) +
+        ((blue >> 17) & 255)) | 0;
+      index += 1;
+      green = (green + greenStep) | 0;
+      red = (red + redStep) | 0;
+      blue = (blue + blueStep) | 0;
+    }
+    return true;
+  }
+
   getInlineIntegerLeaf(method, params, returnType) {
     if (this.inlineIntegerLeafCache.has(method)) {
       return this.inlineIntegerLeafCache.get(method);
@@ -2068,6 +2459,42 @@ function primitiveArrayType(type) {
 function getOp(instruction) {
   if (!instruction) return null;
   return typeof instruction === "string" ? instruction : instruction.op;
+}
+
+function stackEffect(instruction) {
+  const op = getOp(instruction);
+  if (!op || op === "nop" || op === "goto" || op === "iinc" ||
+      op === "ineg" || op === "i2b" || op === "i2d" || op === "i2f" ||
+      op === "i2l" || op === "checkcast" || op === "getfield" ||
+      op === "arraylength") return 0;
+  if (/^[aifd]load(?:_[0-3])?$/.test(op) || op === "aconst_null" ||
+      /^iconst_(?:m1|[0-5])$/.test(op) || /^fconst_[0-2]$/.test(op) ||
+      /^dconst_[01]$/.test(op) || op === "bipush" || op === "sipush" ||
+      op === "ldc" || op === "ldc_w" || op === "ldc2_w" ||
+      op === "getstatic" || op === "new") return 1;
+  if (/^[aifd]store(?:_[0-3])?$/.test(op) || op === "pop" ||
+      op === "putstatic" || op === "athrow" || /^[aifdl]return$/.test(op)) return -1;
+  if (op === "dup") return 1;
+  if (op === "dup2") return 2;
+  if (op === "putfield") return -2;
+  if (op.endsWith("aload") || [
+    "iadd", "isub", "imul", "idiv", "irem", "ishl", "ishr", "iushr",
+    "iand", "ior", "ixor", "dadd", "dsub", "dmul", "ddiv", "fadd",
+    "fsub", "fmul", "fdiv", "frem", "lxor", "ldiv", "lcmp", "dcmpg", "dcmpl",
+  ].includes(op)) return -1;
+  if (op.endsWith("astore")) return -3;
+  if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) return -2;
+  if (["ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle", "ifnull", "ifnonnull"].includes(op)) {
+    return -1;
+  }
+  if (op && op.startsWith("invoke") && instruction && typeof instruction === "object" &&
+      Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2])) {
+    const parsed = parseDescriptor(instruction.arg[2][1]);
+    return -parsed.params.length - (op === "invokestatic" ? 0 : 1) +
+      (parsed.returnType === "void" ? 0 : 1);
+  }
+  if (op === "return") return 0;
+  return null;
 }
 
 function hasMonitorBytecode(codeItems) {
