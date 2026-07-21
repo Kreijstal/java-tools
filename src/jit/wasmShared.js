@@ -190,7 +190,18 @@ const MATH_INTRINSICS = new Set([
   'sqrt', 'pow', 'floor', 'ceil', 'log', 'exp',
 ]);
 
-class Unsupported extends Error {}
+// Control-flow exception (per-block demotion, callee-link deferral, whole-
+// method rejection) thrown thousands of times per boot: V8's stack capture in
+// the Error constructor was ~1s of a profiled run, so skip it — nothing ever
+// reads .stack, only .message.
+class Unsupported extends Error {
+  constructor(message) {
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    super(message);
+    Error.stackTraceLimit = limit;
+  }
+}
 
 const FUEL = 5_000_000;
 

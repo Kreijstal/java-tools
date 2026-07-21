@@ -86,12 +86,18 @@ const monoArray = require('./monoArray');
 // innermost first. Never visible to guest code — execute() always catches it.
 class NestedDeopt extends Error {
   constructor(frames) {
+    // fired on every partial-callee deopt at steady state: skip V8's stack
+    // capture, nothing reads .stack
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
     super('wasm nested deopt');
+    Error.stackTraceLimit = limit;
     this.frames = frames;
   }
 }
 
 const EMPTY_WRITE_SET = new Set();
+
 
 
 
@@ -1752,6 +1758,7 @@ class WasmJit {
     // Prevent recursive static call graphs from trying to compile the same
     // method again while its translator is still discovering callees.
     st.status = 'compiling';
+    let validatingBytes = null; // last bytes handed to WebAssembly.Module, for reject dumps
     try {
       let structuredMeta = null;
       if (this.structuredEnabled) {
@@ -1811,11 +1818,13 @@ class WasmJit {
           throw new Unsupported('no compiled loop');
         }
       }
+      validatingBytes = primary.bytes;
       const module = new WebAssembly.Module(primary.bytes);
       const instance = new WebAssembly.Instance(module, primary.importObject);
       st.meta = primary;
       st.run = instance.exports.run;
       if (structuredMeta && meta) {
+        validatingBytes = meta.bytes;
         const osrModule = new WebAssembly.Module(meta.bytes);
         st.osr = { meta, run: new WebAssembly.Instance(osrModule, meta.importObject).exports.run };
       } else {
@@ -1841,6 +1850,12 @@ class WasmJit {
           (primary.demoteReasons.size ? ` (exits: ${[...primary.demoteReasons.values()].join('; ')})` : ''));
       }
     } catch (err) {
+      if (process.env.JVM_WASM_DUMP_REJECT && validatingBytes &&
+          /WebAssembly/.test(err.message)) {
+        const file = `${process.env.JVM_WASM_DUMP_REJECT}/${st.key.replace(/[^\w.]/g, '_')}.wasm`;
+        try { require('fs').writeFileSync(file, Buffer.from(validatingBytes)); } catch { /* dump only */ }
+        if (this.debug) console.error(`[wasmjit] dumped rejected module to ${file}`);
+      }
       if (isRecompile) {
         // keep the previous working module
         st.status = 'ready';
@@ -1955,7 +1970,11 @@ class WasmJit {
     if (status === frame.pc) st.fuelExits += 1; // fuel exit at entry pc is possible but rare
     frame.pc = status;
     // Exit storms usually mean a loop keeps leaving wasm for an invoke whose
-    // callee wasn't compiled yet — recompile to bind callees that are now ready.
+    // callee wasn't compiled yet — recompile to bind callees that are now
+    // ready. Do NOT trigger earlier or on exit rate: eager schedules measured
+    // -1.4 to -2.4 fps — recompiles replace working modules with ones that
+    // bind more partial callees (per-call scratch-frame overhead) and perturb
+    // compile ordering for later methods.
     if (st.exits % 20000 === 0 && (st.recompiles || 0) < 3 && meta.demoteReasons.size) {
       st.recompiles = (st.recompiles || 0) + 1;
       this.compile(frame, st);
