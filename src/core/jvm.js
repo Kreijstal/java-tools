@@ -46,6 +46,9 @@ class JVM {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
+    // Bumped on every class registration; closed-world analyses (class
+    // hierarchy, devirtualization facts) memoize against it.
+    this.classEpoch = 0;
     this.classInitializationState = new Map();
     this.invokedynamicCache = new Map();
     this.classObjectCache = new Map(); // className -> Class object (for maintaining identity)
@@ -1267,6 +1270,7 @@ class JVM {
     
     // Store it in the classes registry
     this.classes[arrayClassName] = arrayClass;
+    this.classEpoch += 1;
     return arrayClass;
   }
 
@@ -1318,6 +1322,7 @@ class JVM {
         const classData = await this.loadClassFromJar(cp, classNameWithSlashes);
         if (classData && classData.ast) {
           this.classes[classNameWithSlashes] = classData;
+          this.classEpoch += 1;
           return classData;
         }
         continue;
@@ -1328,6 +1333,7 @@ class JVM {
         const classData = await this.loadClassAsync(classFilePath);
         if (classData && classData.ast) {
           this.classes[classNameWithSlashes] = classData;
+          this.classEpoch += 1;
           return classData;
         }
       } catch (error) {
@@ -1382,6 +1388,7 @@ class JVM {
         staticFields: jreClass.staticFields || new Map(),
       };
       this.classes[classNameWithSlashes] = classData;
+      this.classEpoch += 1;
     }
     if (!classData) {
       throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };

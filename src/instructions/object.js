@@ -462,3 +462,4 @@ module.exports = {
 };
 
 module.exports.resolveInstanceFieldKey = resolveInstanceFieldKey;
+module.exports.runtimeClassName = runtimeClassName;

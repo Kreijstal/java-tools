@@ -62,8 +62,9 @@
 // implements no implicit method monitor (only explicit monitorenter/exit
 // opcodes), and wasm replicates interpreter semantics, not the JLS.
 
-const { resolveInstanceFieldKey } = require('../instructions/object');
+const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const { addTimeImport } = require('./wasmRuntimeImports');
+const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const Frame = require('../core/frame');
 const {
   T, CAT2, OP, TRUNC_SAT,
@@ -441,7 +442,7 @@ class MethodTranslator {
   // and unwinds with NestedDeopt. Runtime counters veto callees whose
   // "never" path turns out hot, and the caller's periodic recompile then
   // drops the link.
-  compiledCallee(ins, itemIndex, simulatedStackLen) {
+  compiledCallee(ins, itemIndex, underTypes) {
     const [, className, [name, descriptor]] = ins.arg;
     const { params, ret } = parseMethodDescriptor(descriptor);
     if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
@@ -452,29 +453,37 @@ class MethodTranslator {
     if (!calleeSt || (calleeSt.callee || calleeSt).meta.boxedCount) {
       throw new Unsupported(`invoke ${className}.${name}`);
     }
-    const partial = !(calleeSt.callee || calleeSt).meta.fullyCompiled;
-    if (partial) {
-      if (calleeSt.linkVetoed) {
-        throw new Unsupported(`partial callee ${className}.${name} vetoed`);
-      }
-      // A deopt resumes the caller interpreted just after the invoke, which
-      // is only materializable when nothing sits under the arguments.
-      if (simulatedStackLen !== params.length) {
-        throw new Unsupported(`partial callee ${className}.${name} needs empty under-stack`);
-      }
+    const calleeMeta = (calleeSt.callee || calleeSt).meta;
+    const partial = !calleeMeta.fullyCompiled || calleeMeta.deoptableCalls > 0;
+    if (partial && calleeSt.linkVetoed) {
+      throw new Unsupported(`partial callee ${className}.${name} vetoed`);
     }
+    // A deopt resumes the caller interpreted just after the invoke; values
+    // under the arguments ride through the import so the deopt path can
+    // rebuild the operand stack. Fully-compiled callees never deopt and
+    // skip the shuffle entirely.
+    const underCount = partial ? underTypes.length : 0;
+    const unders = partial ? underTypes : [];
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
     let slot = 0;
     params.forEach((p, i) => { argPosBySlot.set(slot, i); slot += (p === 'J' || p === 'D') ? 2 : 1; });
-    const wParams = params.map(descToWasm);
+    const wParams = [...unders, ...params.map(descToWasm)];
     const results = ret === 'V' ? [] : [descToWasm(ret)];
     const key = `${className}.${name}${descriptor}`;
     const callerBox = this.box;
     const resumePc = itemIndex + 1;
     let scratchFrame = null;
-    const fn = (...args) => {
-      const calleeMod = calleeSt.callee || calleeSt;
+    // Non-partial sites skip the empty-under-stack requirement, so their
+    // callee must never deopt. A recompile may repoint the state to a module
+    // with instance-dispatch sites (which can miss); pin the link-time pair
+    // as the safe fallback for those sites.
+    const pinned = { run: (calleeSt.callee || calleeSt).run, meta: calleeMeta };
+    const fn = (...all) => {
+      const args = underCount ? all.slice(underCount) : all;
+      const current = calleeSt.callee || calleeSt;
+      const calleeMod = (partial || (current.meta.fullyCompiled &&
+        !current.meta.deoptableCalls && !current.meta.boxedCount)) ? current : pinned;
       const meta = calleeMod.meta;
       const full = new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {
@@ -516,6 +525,7 @@ class MethodTranslator {
           err.frames.push(frame);
           if (frame === scratchFrame) scratchFrame = null;
           callerBox.frame.pc = resumePc;
+          for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
         }
         throw err;
       } finally {
@@ -527,6 +537,7 @@ class MethodTranslator {
         frame.pc = status;
         if (frame === scratchFrame) scratchFrame = null; // donated to the call stack
         callerBox.frame.pc = resumePc;
+        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
         calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
         if (calleeSt.nestedDeopts > 256 &&
             calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
@@ -540,9 +551,250 @@ class MethodTranslator {
     // baked into the closure
     const importName = `call_${key}${partial ? `_${itemIndex}` : ''}`.replace(/[^\w]/g, '_');
     return {
-      params: wParams,
+      argTypes: wParams.slice(underCount),
+      underTypes: unders,
       partial,
       idx: this.addImport(importName, wParams, results, fn),
+    };
+  }
+
+  // invokevirtual/invokeinterface/invokespecial bound through a complete
+  // closed-world dispatch table: the import selects the target module by the
+  // receiver's runtime class. invokespecial is the statically-bound
+  // degenerate case. A receiver whose class loaded after compilation (map
+  // miss) deopts to the interpreter AT the invoke: the import restores the
+  // receiver and arguments onto the caller's operand stack — materializable
+  // because linking requires nothing underneath them — and the interpreter
+  // re-executes the site with full dynamic dispatch, so late class loading
+  // is safe without invalidation. A null receiver throws the guest NPE like
+  // err_div0; per-block demotion already keeps compiled blocks outside live
+  // handler ranges. Any target may deopt (partial) or miss, so the caller
+  // spills its typed slots before every instance call.
+  compiledInstanceCallee(ins, itemIndex, underTypes, op) {
+    const [, owner, [name, descriptor]] = ins.arg;
+    if (name === '<init>' || name === '<clinit>') {
+      throw new Unsupported(`${op} ${owner}.${name}`);
+    }
+    const { params, ret } = parseMethodDescriptor(descriptor);
+    if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
+      throw new Unsupported(`invoke ${owner}.${name} unsupported descriptor`);
+    }
+    if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled) {
+      throw new Unsupported('instance linking disabled');
+    }
+    const hierarchy = this.wasmJit.hierarchy;
+    // runtime class -> target method state; invokespecial uses a single
+    // statically-bound target for every receiver
+    let dispatch = null;
+    let direct = null;
+    const readyOrThrow = (implClassName) => {
+      const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
+      if (!st) throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`);
+      if (st.linkVetoed && !(st.callee || st).meta.fullyCompiled) {
+        throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`);
+      }
+      return st;
+    };
+    if (op === 'invokespecial') {
+      const impl = hierarchy.resolveSpecial(this.className, owner, name, descriptor);
+      if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
+      direct = readyOrThrow(impl.className);
+    } else {
+      const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
+      if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
+      if (resolved.impls.size > 4) throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      const readyByImpl = new Map();
+      for (const impl of resolved.impls.values()) {
+        readyByImpl.set(impl.className, readyOrThrow(impl.className));
+      }
+      dispatch = new Map();
+      for (const [runtimeClass, impl] of resolved.targets) {
+        dispatch.set(runtimeClass, readyByImpl.get(impl.className));
+      }
+    }
+    // java arg slot -> position in the wasm arg list (receiver = slot 0)
+    const argPosBySlot = new Map([[0, 0]]);
+    let slot = 1;
+    params.forEach((p, i) => { argPosBySlot.set(slot, i + 1); slot += (p === 'J' || p === 'D') ? 2 : 1; });
+    const underCount = underTypes.length;
+    const wParams = [...underTypes, T.ref, ...params.map(descToWasm)];
+    const results = ret === 'V' ? [] : [descToWasm(ret)];
+    const key = `${owner}.${name}${descriptor}`;
+    const callerBox = this.box;
+    const resumePc = itemIndex + 1;
+    const scratchFrames = new Map(); // target st -> reusable deopt frame
+    const stats = this.siteStatsFor(`vcall_${owner}.${name}@${this.className}.${this.method.name}:${itemIndex}`);
+    const fn = (...all) => {
+      if (stats) stats.calls += 1;
+      const args = underCount ? all.slice(underCount) : all;
+      const receiver = args[0];
+      if (receiver === null || receiver === undefined) {
+        throw NPE(`invoke ${key} on null`);
+      }
+      const calleeSt = direct || dispatch.get(runtimeClassName(receiver));
+      if (!calleeSt) {
+        // class loaded after compilation: hand the site back to the
+        // interpreter with its operands restored
+        if (stats) stats.deopts += 1;
+        callerBox.frame.pc = itemIndex;
+        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+        for (const v of args) callerBox.frame.stack.push(v);
+        throw new NestedDeopt([]);
+      }
+      const calleeMod = calleeSt.callee || calleeSt;
+      const meta = calleeMod.meta;
+      const partial = !meta.fullyCompiled || meta.deoptableCalls > 0;
+      if (stats && partial) stats.scratch += 1;
+      const full = new Array(meta.paramSlots.length + 2);
+      for (let i = 0; i < meta.paramSlots.length; i++) {
+        const p = meta.paramSlots[i];
+        const pos = argPosBySlot.get(p.slot);
+        if (pos !== undefined) full[i] = args[pos];
+        else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
+      }
+      full[meta.paramSlots.length] = 0;
+      full[meta.paramSlots.length + 1] = 100_000_000;
+      const savedFrame = meta.box.frame;
+      let frame;
+      if (partial) {
+        calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
+        const scratch = scratchFrames.get(calleeSt);
+        if (scratch && !scratch.inUse) {
+          frame = scratch;
+          frame.pc = 0;
+        } else {
+          frame = new Frame(calleeSt.method);
+          frame.className = calleeSt.targetClassName;
+          if (!scratch) scratchFrames.set(calleeSt, frame);
+        }
+        frame.inUse = true;
+      } else {
+        frame = { locals: [] }; // junk sink should a fuel exit ever spill
+      }
+      meta.box.frame = frame;
+      meta.box.ret = undefined;
+      let status;
+      try {
+        status = calleeMod.run(...full);
+      } catch (err) {
+        if (partial && err instanceof NestedDeopt) {
+          if (stats) stats.deopts += 1;
+          err.frames.push(frame);
+          if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          callerBox.frame.pc = resumePc;
+          // the interpreter resumes mid-expression: the values under the
+          // call's arguments must be back on the caller's operand stack
+          for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+        }
+        throw err;
+      } finally {
+        if (partial) frame.inUse = false;
+        meta.box.frame = savedFrame;
+      }
+      if (status !== -1) {
+        if (!partial) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
+        if (stats) stats.deopts += 1;
+        frame.pc = status;
+        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+        callerBox.frame.pc = resumePc;
+        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+        calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
+        if (calleeSt.nestedDeopts > 256 &&
+            calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
+          calleeSt.linkVetoed = true;
+        }
+        throw new NestedDeopt([frame]);
+      }
+      return meta.box.ret;
+    };
+    // resume pc and dispatch map are baked in: one import per call site
+    this.instanceSites = (this.instanceSites || 0) + 1;
+    const importName = `vcall_${key}_${itemIndex}`.replace(/[^\w]/g, '_');
+    // union of the baked targets' write summaries; a later-loaded receiver
+    // class misses the map and deopts, so it cannot stale these caches
+    let writes = new Set();
+    for (const st of direct ? [direct] : new Set(dispatch.values())) {
+      const sub = this.wasmJit.instanceWriteSummary(st.targetClassName, name, descriptor);
+      if (sub === null) { writes = null; break; }
+      for (const k of sub) writes.add(k);
+    }
+    return {
+      argTypes: wParams.slice(underCount),
+      underTypes,
+      writes,
+      idx: this.addImport(importName, wParams, results, fn),
+    };
+  }
+
+  // checkcast compiled as a per-site import: known classes resolve with the
+  // synchronous hierarchy walk (matching the JS tier's tryCheckCastSync) and
+  // throw the guest ClassCastException on failure; an unknown class deopts to
+  // the interpreter at the checkcast, which can load classes asynchronously.
+  checkcastImport(ins, itemIndex, underTypes) {
+    // Opt-in: compiling casts is correct (see wasmInstanceLink tests) but
+    // measured net-negative on dekobloko — it unlocks tiny deoptable
+    // callees (mi.c-style getter chains) whose per-call partial-protocol
+    // overhead exceeds interpreting them. Revisit with SSA inlining.
+    if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled ||
+        !this.wasmJit.checkcastEnabled) {
+      throw new Unsupported('op checkcast');
+    }
+    const target = ins.arg;
+    if (typeof target !== 'string') throw new Unsupported('op checkcast');
+    const jvm = this.jvm;
+    const callerBox = this.box;
+    const underCount = underTypes.length;
+    // The caller's typed slots ride along as leading params and reach
+    // frame.locals only on the deopt path — the fast path pays a single
+    // JS crossing (no spill_all) and a memo hit. A hierarchy verdict for a
+    // loaded (source, target) pair is immutable, so the memo never expires;
+    // a CCE unwinds past this frame (compiled blocks sit outside live
+    // handler ranges), so stale locals cannot be observed on that path.
+    const slots = this.paramSlots.slice();
+    const slotCount = slots.length;
+    const verdicts = new Map();
+    const stats = this.siteStatsFor(`cast_${target}@${this.className}.${this.method.name}:${itemIndex}`);
+    const fn = (...all) => {
+      if (stats) stats.calls += 1;
+      const ref = all[slotCount + underCount];
+      if (ref === null || ref === undefined) return null;
+      const source = runtimeClassName(ref);
+      const memo = verdicts.get(source);
+      if (memo === true) return ref;
+      if (memo === undefined) {
+        const sourceKnown = (typeof source === 'string' && source.startsWith('[')) ||
+          jvm.classes[source] || jvm.jre[source];
+        const targetKnown = target === 'java/lang/Object' || target.startsWith('[') ||
+          jvm.classes[target] || jvm.jre[target];
+        if (sourceKnown && targetKnown) {
+          const ok = jvm.isInstanceOf(source, target);
+          if (verdicts.size < 64) verdicts.set(source, ok);
+          if (ok) return ref;
+        } else {
+          if (stats) stats.deopts += 1;
+          const locals = callerBox.frame.locals;
+          for (let i = 0; i < slotCount; i++) locals[slots[i]] = all[i];
+          callerBox.frame.pc = itemIndex;
+          for (let i = 0; i < underCount; i++) {
+            callerBox.frame.stack.push(all[slotCount + i]);
+          }
+          callerBox.frame.stack.push(ref);
+          throw new NestedDeopt([]);
+        }
+      }
+      throw {
+        type: 'java/lang/ClassCastException',
+        message: `${source} cannot be cast to ${target}`,
+      };
+    };
+    this.instanceSites = (this.instanceSites || 0) + 1;
+    const importName = `cast_${target}_${itemIndex}`.replace(/[^\w]/g, '_');
+    const slotTypes = slots.map((s) => this.slotTypes.get(s));
+    return {
+      argTypes: [T.ref],
+      underTypes,
+      leadGets: slots.map((s) => this.localOfSlot.get(s)),
+      idx: this.addImport(importName, [...slotTypes, ...underTypes, T.ref], [T.ref], fn),
     };
   }
 
@@ -783,6 +1035,16 @@ class MethodTranslator {
     return seq;
   }
 
+  // cumulative per-site runtime counters (debug only); keyed by site name so
+  // recompiles keep accumulating into the same object
+  siteStatsFor(key) {
+    const map = this.wasmJit && this.wasmJit.siteStats;
+    if (!map) return null;
+    let stats = map.get(key);
+    if (!stats) { stats = { calls: 0, deopts: 0, scratch: 0 }; map.set(key, stats); }
+    return stats;
+  }
+
   scratch(t) {
     const pool = this.scratchPool.get(t) || [];
     this.scratchPool.set(t, pool);
@@ -791,6 +1053,26 @@ class MethodTranslator {
     this.declared.push(t);
     pool.push(idx);
     return idx;
+  }
+
+  // Call an import that may deopt while values sit UNDER its arguments on the
+  // wasm stack. The unders are copied into scratch locals, restored in place,
+  // and passed to the import a second time as leading parameters so a deopt
+  // path can rebuild the interpreter operand stack. Stack shape afterwards:
+  // [unders..., result?] — identical to a plain call.
+  callSeqWithUnders(idx, argTypes, underTypes, leadGets = []) {
+    const seq = [];
+    const argScr = argTypes.map((t) => this.scratch(t));
+    for (let i = argTypes.length - 1; i >= 0; i--) seq.push(OP.local_set, ...uleb(argScr[i]));
+    const undScr = underTypes.map((t) => this.scratch(t));
+    for (let j = underTypes.length - 1; j >= 0; j--) seq.push(OP.local_set, ...uleb(undScr[j]));
+    for (let j = 0; j < underTypes.length; j++) seq.push(OP.local_get, ...uleb(undScr[j]));
+    // leading params (e.g. the caller's typed slots for a fused deopt spill)
+    for (const l of leadGets) seq.push(OP.local_get, ...uleb(l));
+    for (let j = 0; j < underTypes.length; j++) seq.push(OP.local_get, ...uleb(undScr[j]));
+    for (let i = 0; i < argTypes.length; i++) seq.push(OP.local_get, ...uleb(argScr[i]));
+    seq.push(OP.call, ...uleb(idx));
+    return seq;
   }
 
   spillSeq() {
@@ -1082,24 +1364,58 @@ class MethodTranslator {
             bound = addTimeImport(this, this.jvm, ins);
           } catch (err2) {
             if (!(err2 instanceof Unsupported)) throw err2;
-            bound = this.compiledCallee(ins, i, stack.length);
+            const pcount = parseMethodDescriptor(ins.arg[2][1]).params.length;
+            if (stack.length < pcount) throw new Unsupported('invokestatic stack underflow');
+            bound = this.compiledCallee(ins, i, stack.slice(0, stack.length - pcount));
             const [, calleeClass, [calleeName, calleeDesc]] = ins.arg;
             writes = this.wasmJit
               ? this.wasmJit.staticWriteSummary(calleeClass, calleeName, calleeDesc)
               : null;
           }
         }
-        for (let k = 0; k < bound.params.length; k++) pop();
+        const boundArgTypes = bound.argTypes || bound.params;
+        const boundUnders = bound.underTypes || [];
+        for (let k = 0; k < boundArgTypes.length; k++) pop();
         // a partial callee can deopt: the caller's typed slots must already
         // be in frame.locals so the interpreter can resume after the invoke
         if (bound.partial) emit(...this.spillSeq());
-        emit(OP.call, ...uleb(bound.idx));
+        if (boundUnders.length) {
+          emit(...this.callSeqWithUnders(bound.idx, boundArgTypes, boundUnders));
+        } else {
+          emit(OP.call, ...uleb(bound.idx));
+        }
         // kill only the field caches the callee may transitively write; an
         // unknowable callee (null summary) may put any field or static
         if (writes === null) emit(...this.killSeqWhere(() => true));
         else if (writes.size) emit(...this.killSeqWhere((entry) => writes.has(entry.killKey)));
         const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
         if (retC !== 'V') push(descToWasm(retC));
+      } else if (op === 'invokevirtual' || op === 'invokeinterface' || op === 'invokespecial') {
+        const argCount = parseMethodDescriptor(ins.arg[2][1]).params.length + 1;
+        if (stack.length < argCount) throw new Unsupported(`${op} stack underflow`);
+        const bound = this.compiledInstanceCallee(ins, i, stack.slice(0, stack.length - argCount), op);
+        for (let k = 0; k < argCount; k++) pop();
+        // every instance site can deopt (map miss or partial target): the
+        // caller's typed slots must be in frame.locals first
+        emit(...this.spillSeq());
+        if (bound.underTypes.length) {
+          emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes));
+        } else {
+          emit(OP.call, ...uleb(bound.idx));
+        }
+        if (bound.writes === null) emit(...this.killSeqWhere(() => true));
+        else if (bound.writes.size) {
+          emit(...this.killSeqWhere((entry) => bound.writes.has(entry.killKey)));
+        }
+        const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
+        if (retC !== 'V') push(descToWasm(retC));
+      } else if (op === 'checkcast') {
+        if (!stack.length) throw new Unsupported('checkcast on empty stack');
+        const bound = this.checkcastImport(ins, i, stack.slice(0, stack.length - 1));
+        pop(T.ref);
+        emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes,
+          bound.leadGets));
+        push(T.ref);
       } else if (op === 'pop') { pop(); emit(OP.drop); }
       else if (op === 'pop2') {
         const t = pop(); emit(OP.drop);
@@ -1262,6 +1578,10 @@ class MethodTranslator {
       blockCount: this.blockStarts.length,
       fullyCompiled: this.supportedBlocks.size === this.blockStarts.length,
       normalFlowFullyCompiled: this.normalFlowFullyCompiled,
+      // instance-dispatch sites can deopt at runtime (dispatch-map miss or
+      // partial target), so callers must give this module a real frame and
+      // the NestedDeopt protocol even when it is fully compiled
+      deoptableCalls: this.instanceSites || 0,
       boxedCount: this.boxedSlots.size,
       fieldCacheCount: this.fieldCaches.size,
     };
@@ -1284,8 +1604,21 @@ class WasmJit {
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
     this.structuredEnabled = env.JVM_WASM_STRUCTURED === '1';
+    this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
+    this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
+    this.hierarchy = new ClassHierarchy(jvm);
     this.structuredCompiles = 0;
     this.compileEpoch = 0;
+    // debug-only runtime counters keyed by call-site import name
+    this.siteStats = this.debug ? new Map() : null;
+    if (this.siteStats && typeof process !== 'undefined' && process.on) {
+      process.on('exit', () => {
+        const rows = [...this.siteStats].sort((a, b) => b[1].calls - a[1].calls);
+        for (const [site, s] of rows.slice(0, 40)) {
+          console.error(`[wasmjit-sites] ${site}: calls=${s.calls} deopts=${s.deopts} scratch=${s.scratch}`);
+        }
+      });
+    }
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
     this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
@@ -1610,7 +1943,22 @@ class WasmJit {
     return keys;
   }
 
-  computeWriteSummary(className, name, descriptor, inProgress) {
+  // Write summary for a resolved instance-method implementation. Sound
+  // without epoch invalidation: the call site's dispatch map is baked, so
+  // only these exact impls can complete without a deopt (a receiver of a
+  // later-loaded class misses the map and exits the module, after which
+  // every cache reloads); each summary reads only the impl's immutable
+  // bytecode and goes pessimistic (null) on any nested instance dispatch.
+  instanceWriteSummary(className, name, descriptor) {
+    const key = `${className}.${name}${descriptor}#inst`;
+    const memo = this.writeSummaries.get(key);
+    if (memo && (memo.keys !== null || memo.epoch === this.compileEpoch)) return memo.keys;
+    const keys = this.computeWriteSummary(className, name, descriptor, new Set(), true);
+    this.writeSummaries.set(key, { keys, epoch: this.compileEpoch });
+    return keys;
+  }
+
+  computeWriteSummary(className, name, descriptor, inProgress, instance = false) {
     if (className === 'java/lang/Math') return EMPTY_WRITE_SET;
     if (className === 'java/lang/System' &&
         (name === 'currentTimeMillis' || name === 'nanoTime')) {
@@ -1621,7 +1969,7 @@ class WasmJit {
     if (!clsAst) return null;
     const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
       .find((m) => m.name === name && m.descriptor === descriptor);
-    if (!method || !(method.flags || []).includes('static')) return null;
+    if (!method || (method.flags || []).includes('static') !== !instance) return null;
     const code = method.attributes && method.attributes.find((a) => a.type === 'code');
     if (!code) return null;
     const keys = new Set();
@@ -1670,6 +2018,33 @@ class WasmJit {
     // partial callees deopt on demoted blocks; the entry block at least must
     // run in wasm or every call would deopt immediately
     return allowPartial && cm.externalEntry.has(0) ? st : null;
+  }
+
+  // Instance-method counterpart of findReadyStatic for devirtualized sites.
+  // No <clinit> gate: an instance method only runs on an existing object,
+  // whose class was initialized at instantiation, so linking cannot bypass
+  // an observable class initializer.
+  findReadyInstance(className, name, descriptor) {
+    const cd = this.jvm.classes[className];
+    const clsAst = cd && cd.ast && cd.ast.classes[0];
+    if (!clsAst) return null;
+    const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
+      .find((m) => m.name === name && m.descriptor === descriptor);
+    if (!method) return null;
+    const flags = method.flags || [];
+    if (flags.includes('static') || flags.includes('abstract') || flags.includes('native')) return null;
+    let st = this.state.get(method);
+    if (!st) st = this.methodState({ method });
+    if (!st.method) st.method = method;
+    st.targetClassName = className;
+    if (st.status === 'cold' && st.calleeDeferredEpoch !== this.compileEpoch) {
+      this.compile({ method, className }, st, { asCallee: true });
+    }
+    if (!st || st.status !== 'ready') return null;
+    const cm = (st.callee || st).meta;
+    if (cm.boxedCount) return null;
+    if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
+    return cm.externalEntry.has(0) ? st : null;
   }
 
   dumpStats() {

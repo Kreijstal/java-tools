@@ -627,9 +627,15 @@ class StructuredWasmCompiler {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, false);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
-    if (!linked || !linked.meta.fullyCompiled || linked.meta.boxedCount) {
+    if (!linked || !linked.meta.fullyCompiled || linked.meta.boxedCount ||
+        linked.meta.deoptableCalls) {
       throw new Unsupported(`invoke ${className}.${name}`);
     }
+    // Structured callers keep locals in wasm and cannot materialize a frame,
+    // so the callee must never deopt. A later recompile may repoint the
+    // state to a module with instance-dispatch sites (which can miss); pin
+    // the link-time pair as the safe fallback.
+    const pinned = { run: linked.run, meta: linked.meta };
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
     let slot = 0;
@@ -639,7 +645,9 @@ class StructuredWasmCompiler {
     const key = `${className}.${name}${descriptor}`;
     const junk = { locals: [] }; // spill sink; a fully-compiled callee never exits
     const fn = (...args) => {
-      const mod = calleeSt.callee || calleeSt; // recompiles may repoint it
+      const current = calleeSt.callee || calleeSt; // recompiles may repoint it
+      const mod = (current.meta.fullyCompiled && !current.meta.boxedCount &&
+        !current.meta.deoptableCalls) ? current : pinned;
       const meta = mod.meta;
       const full = new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {
