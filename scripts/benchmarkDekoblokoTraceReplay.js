@@ -31,6 +31,17 @@ const tiers = [
     scalarSsaOptimizations: false, structuredIrreducibleSplitting } },
 ];
 
+// JVM_WASM_VERIFY=1: differential replay — every JS tier runs three times
+// (wasm off, dispatcher wasm, structured wasm) and all nine results must
+// produce identical surface and static-field hashes. WasmJit reads
+// process.env in its constructor, so the variant env is applied just before
+// each runtime is created.
+const wasmVariants = process.env.JVM_WASM_VERIFY === '1' ? [
+  { name: 'nowasm', env: { JVM_WASM_JIT: '0', JVM_WASM_STRUCTURED: '0' } },
+  { name: 'wasm', env: { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '0' } },
+  { name: 'wasm-structured', env: { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '1' } },
+] : [null];
+
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name] || fallback);
   if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${name} must be positive`);
@@ -266,11 +277,14 @@ async function benchmark(trace, tier) {
     roundHashes,
     roundStaticHashes,
     fusedRuns: runtime.jvm.jit.fusedRunCount,
+    wasmCompiles: runtime.jvm.jit.wasmJit?.compiled?.length || 0,
+    wasmStructuredCompiles: runtime.jvm.jit.wasmJit?.structuredCompiles || 0,
     structuredRuns: runtime.jvm.jit.structuredSsa.runCount,
     structuredSplitBlocks: generated?.jvmStructuredSplitBlocks || 0,
     scalarRuns: runtime.jvm.jit.scalarLoopRunCount,
     targetShape: describeMethod(runtime.jvm, runtime.method),
   };
+  await runtime.jvm.closeSaveStateFileHandles?.();
   if (profileMethods) {
     result.topGeneratedEntries = ranked(runtime.jvm.jit.generatedMethodRunCounts);
     result.topDeopts = ranked(runtime.jvm.jit.methodDeoptCounts).map(([methodKey, count]) => [
@@ -287,7 +301,13 @@ async function benchmark(trace, tier) {
   const trace = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
   if (!trace?.state || !trace.methodKey) throw new Error('Invalid Dekobloko entry trace');
   const results = [];
-  for (const tier of tiers) results.push(await benchmark(trace, tier));
+  for (const tier of tiers) {
+    for (const variant of wasmVariants) {
+      if (variant) Object.assign(process.env, variant.env);
+      const named = variant ? { ...tier, name: `${tier.name}+${variant.name}` } : tier;
+      results.push(await benchmark(trace, named));
+    }
+  }
   const reference = JSON.stringify(results[0].roundHashes);
   const staticReference = JSON.stringify(results[0].roundStaticHashes);
   for (const result of results.slice(1)) {

@@ -2123,6 +2123,17 @@ class JVM {
     };
   }
 
+  // Node 26 raises ERR_INVALID_STATE when a FileHandle is closed by garbage
+  // collection; harnesses that restore several save states in one process
+  // must close rehydrated handles before dropping the JVM.
+  async closeSaveStateFileHandles() {
+    const handles = this._saveStateFileHandles || [];
+    this._saveStateFileHandles = [];
+    for (const handle of handles) {
+      try { await handle.close(); } catch (_ignored) { /* already closed */ }
+    }
+  }
+
   async _rehydrateSaveStateResources(root) {
     const seen = new WeakSet();
     const pending = [root];
@@ -2140,6 +2151,7 @@ class JVM {
             try { value.fileHandle = await this.fs.promises.open(value.path, 'w+'); } catch (_ignored) {}
           }
         }
+        if (value.fileHandle) (this._saveStateFileHandles ||= []).push(value.fileHandle);
       }
       if (value.type === 'java/io/ConsoleOutputStream' && !value.writer &&
         typeof process !== 'undefined' && process.stdout) {
