@@ -63,6 +63,7 @@
 // opcodes), and wasm replicates interpreter semantics, not the JLS.
 
 const { resolveInstanceFieldKey } = require('../instructions/object');
+const { addTimeImport } = require('./wasmRuntimeImports');
 const Frame = require('../core/frame');
 const {
   T, CAT2, OP, TRUNC_SAT,
@@ -74,6 +75,7 @@ const {
   MATH_INTRINSICS,
   Unsupported,
   FUEL,
+  isNoOpExceptionHandler, liveExceptionRanges,
 } = require('./wasmShared');
 
 // Thrown through wasm frames when a linked partial callee reaches one of its
@@ -88,78 +90,7 @@ class NestedDeopt extends Error {
 
 const EMPTY_WRITE_SET = new Set();
 
-// Ops that may appear in a wrap-and-rethrow reporter handler before its
-// terminating athrow. Forward branches are handled separately: obfuscator
-// reporters commonly select "null" versus "{...}" while formatting args.
-const REPORTER_OPS = /^(astore|aload|iload|lload|fload|dload|ldc|ldc_w|ldc2_w|bipush|sipush|iconst|lconst|fconst|dconst|aconst_null|new|dup|checkcast|getstatic|invokespecial|invokevirtual|invokestatic|invokedynamic|i2l|i2c|l2i)/;
 
-function isNoOpExceptionHandler(codeItems, handlerIndex, labelIndex) {
-  let furthestForwardTarget = handlerIndex;
-  // Large game methods can have reporters that append dozens of arguments.
-  // Keep discovery bounded, but do not confuse their size with recovery.
-  const end = Math.min(codeItems.length, handlerIndex + 512);
-  for (let i = handlerIndex; i < end; i++) {
-    const instruction = codeItems[i] && codeItems[i].instruction;
-    const op = getOp(instruction);
-    if (!op) continue;
-    if (op === 'athrow') {
-      // Obfuscators commonly leave an unreachable throw on one side of a
-      // forward null-selection branch. It is not the handler terminator when
-      // another branch target still has to be visited.
-      if (i >= furthestForwardTarget) return true;
-      continue;
-    }
-    if (op === 'goto' || op.startsWith('if')) {
-      const target = instruction && typeof instruction === 'object'
-        ? labelIndex.get(instruction.arg) : undefined;
-      // Backedges can run arbitrary recovery logic; unresolved targets are
-      // not a proof either.
-      if (target === undefined || target <= i) return false;
-      furthestForwardTarget = Math.max(furthestForwardTarget, target);
-      continue;
-    }
-    if (/^(return|[a-z]return|putfield|putstatic|[a-z]astore|monitorenter|monitorexit)$/.test(op)) {
-      return false;
-    }
-    if (!REPORTER_OPS.test(op)) return false;
-  }
-  return false;
-}
-
-// Returns the item-index ranges [start, end) protected by LIVE (non-no-op)
-// handlers. Blocks intersecting these ranges must stay interpreted. No-op
-// handler entries (bare rethrow, wrap-and-rethrow reporter) contribute none.
-function catchesOnlyCheckedExceptions(jvm, catchType) {
-  if (!catchType || catchType === 'any') return false;
-
-  // Every operation emitted by this tier is either non-throwing or can only
-  // raise an unchecked VM exception (null/bounds/arithmetic). Calls capable
-  // of throwing a declared checked exception remain exit stubs and execute in
-  // the interpreter at their precise bytecode pc. Therefore a handler for a
-  // checked-exception subtype cannot observe a failure from a compiled block.
-  // Require a resolved hierarchy on both sides: broad Exception/Throwable
-  // handlers and unknown application exception types stay conservative.
-  return jvm.isInstanceOf(catchType, 'java/lang/Exception') &&
-    !jvm.isInstanceOf(catchType, 'java/lang/RuntimeException') &&
-    !jvm.isInstanceOf('java/lang/RuntimeException', catchType);
-}
-
-function liveExceptionRanges(jvm, code, labelIndex) {
-  const table = code.exceptionTable || [];
-  const ranges = [];
-  for (const entry of table) {
-    const label = entry.handlerLbl || `L${entry.handler_pc}`;
-    const h = labelIndex.get(label);
-    const live = h === undefined || !isNoOpExceptionHandler(code.codeItems, h, labelIndex);
-    if (live && !catchesOnlyCheckedExceptions(jvm, entry.catch_type)) {
-      const s = labelIndex.get(entry.startLbl || `L${entry.start_pc}`);
-      const e = labelIndex.get(entry.endLbl || `L${entry.end_pc}`);
-      // an unresolvable range must poison the whole method, not vanish
-      ranges.push([s === undefined ? 0 : s, e === undefined ? code.codeItems.length : e]);
-    }
-  }
-  return ranges;
-}
 
 class MethodTranslator {
   constructor(jvm, method, className, wasmJit) {
@@ -518,10 +449,10 @@ class MethodTranslator {
     }
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
-    if (!calleeSt || calleeSt.meta.boxedCount) {
+    if (!calleeSt || (calleeSt.callee || calleeSt).meta.boxedCount) {
       throw new Unsupported(`invoke ${className}.${name}`);
     }
-    const partial = !calleeSt.meta.fullyCompiled;
+    const partial = !(calleeSt.callee || calleeSt).meta.fullyCompiled;
     if (partial) {
       if (calleeSt.linkVetoed) {
         throw new Unsupported(`partial callee ${className}.${name} vetoed`);
@@ -543,7 +474,8 @@ class MethodTranslator {
     const resumePc = itemIndex + 1;
     let scratchFrame = null;
     const fn = (...args) => {
-      const meta = calleeSt.meta;
+      const calleeMod = calleeSt.callee || calleeSt;
+      const meta = calleeMod.meta;
       const full = new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {
         const p = meta.paramSlots[i];
@@ -577,7 +509,7 @@ class MethodTranslator {
       meta.box.ret = undefined;
       let status;
       try {
-        status = calleeSt.run(...full);
+        status = calleeMod.run(...full);
       } catch (err) {
         if (partial && err instanceof NestedDeopt) {
           // the deeper site set frame.pc through its own callerBox
@@ -1141,16 +1073,21 @@ class MethodTranslator {
           entry.kind === (st ? 's' : 'f') && entry.killKey === killKey));
       } else if (op === 'invokestatic') {
         let bound;
-        let writes = EMPTY_WRITE_SET; // Math intrinsics write nothing
+        let writes = EMPTY_WRITE_SET; // Math/time intrinsics write nothing
         try {
           bound = this.mathIntrinsic(ins);
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
-          bound = this.compiledCallee(ins, i, stack.length);
-          const [, calleeClass, [calleeName, calleeDesc]] = ins.arg;
-          writes = this.wasmJit
-            ? this.wasmJit.staticWriteSummary(calleeClass, calleeName, calleeDesc)
-            : null;
+          try {
+            bound = addTimeImport(this, this.jvm, ins);
+          } catch (err2) {
+            if (!(err2 instanceof Unsupported)) throw err2;
+            bound = this.compiledCallee(ins, i, stack.length);
+            const [, calleeClass, [calleeName, calleeDesc]] = ins.arg;
+            writes = this.wasmJit
+              ? this.wasmJit.staticWriteSummary(calleeClass, calleeName, calleeDesc)
+              : null;
+          }
         }
         for (let k = 0; k < bound.params.length; k++) pop();
         // a partial callee can deopt: the caller's typed slots must already
@@ -1464,6 +1401,15 @@ class WasmJit {
       } catch (err) {
         if (!(err instanceof Unsupported) || !structuredMeta) throw err;
       }
+      // A structured module that covers fewer blocks than the dispatcher's
+      // (e.g. it must demote a call the dispatcher links partially) would
+      // give that coverage away on every pc-0 entry, then exit into a tier
+      // that keeps the frame. Only prefer structured when it covers at least
+      // as much; a discarded structured module has no OSR value either.
+      if (structuredMeta && meta &&
+          meta.supportedBlocks.size > structuredMeta.supportedBlocks.size) {
+        structuredMeta = null;
+      }
       const primary = structuredMeta || meta;
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
@@ -1498,6 +1444,11 @@ class WasmJit {
       } else {
         st.osr = null;
       }
+      // Callee links want the most-complete module, which is not always the
+      // primary: a structured module with demoted blocks deopts per call
+      // where a fully-compiled dispatcher module would run through.
+      const rank = (m) => (m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
+      st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
       st.retryAfter = undefined;
       st.deferredEpoch = undefined;
@@ -1660,6 +1611,10 @@ class WasmJit {
 
   computeWriteSummary(className, name, descriptor, inProgress) {
     if (className === 'java/lang/Math') return EMPTY_WRITE_SET;
+    if (className === 'java/lang/System' &&
+        (name === 'currentTimeMillis' || name === 'nanoTime')) {
+      return EMPTY_WRITE_SET;
+    }
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
@@ -1707,11 +1662,13 @@ class WasmJit {
         this.compile({ method, className }, st, { asCallee: true });
       }
     }
-    if (!st || st.status !== 'ready' || st.meta.boxedCount) return null;
-    if (st.meta.fullyCompiled || st.meta.normalFlowFullyCompiled) return st;
+    if (!st || st.status !== 'ready') return null;
+    const cm = (st.callee || st).meta;
+    if (cm.boxedCount) return null;
+    if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
     // partial callees deopt on demoted blocks; the entry block at least must
     // run in wasm or every call would deopt immediately
-    return allowPartial && st.meta.externalEntry.has(0) ? st : null;
+    return allowPartial && cm.externalEntry.has(0) ? st : null;
   }
 
   dumpStats() {

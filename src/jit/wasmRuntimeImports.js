@@ -179,10 +179,26 @@ function addMathImport(reg, ins) {
   };
 }
 
+// System time natives — like Math intrinsics they can never be compiled (JS
+// natives), but they are pure reads off the jvm clock (fake-time aware), so
+// both backends import them directly instead of demoting the call block.
+function addTimeImport(reg, jvm, ins) {
+  const [, className, [name, descriptor]] = ins.arg;
+  if (className !== 'java/lang/System' || descriptor !== '()J' ||
+      (name !== 'currentTimeMillis' && name !== 'nanoTime')) {
+    throw new Unsupported(`invoke ${className}.${name}`);
+  }
+  const fn = name === 'nanoTime'
+    ? () => BigInt(jvm.clock.nanos())
+    : () => BigInt(jvm.clock.millis());
+  return { params: [], partial: false, idx: reg.addImport(`sys_${name}`, [], [T.i64], fn) };
+}
+
 module.exports = {
   addRuntimeImports,
   pushImportFor,
   addArrayImports,
   addFieldImport,
   addMathImport,
+  addTimeImport,
 };

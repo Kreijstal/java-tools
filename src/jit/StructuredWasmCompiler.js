@@ -10,22 +10,27 @@
 // linking contract (externalEntry={0}, run(slots.., blk(ignored), fuel)->i32,
 // -1 = returned via box.ret).
 //
-// v1 scope: fully-compiled methods only. Rejected (fall back to the
-// dispatcher tier): exception tables, athrow, monitors, allocation,
-// checkcast/instanceof, string/class constants, and every invoke except
-// Math intrinsics. Everything rejects with Unsupported — the caller decides
-// the ladder.
+// Coverage mirrors the dispatcher's per-block demotion: blocks intersecting
+// a live (non-no-op) exception-handler range, and blocks whose body or
+// terminator uses an op this backend cannot emit (athrow, monitors,
+// allocation, checkcast/instanceof, string/class constants, virtual
+// invokes), become exit stubs — spill the block's reaching slot defs + entry
+// stack and return its item index; the interpreter (and the dispatcher OSR
+// module kept alongside) take over from there. invokestatic binds directly
+// to fully-compiled wasm callees. Whole-method rejection remains only for
+// missing/irreducible CFGs, SSA rejection, or a demoted entry block.
 
 const { buildCfgFromCode, structure, IrreducibleError } = require('../decompiler/structurer');
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
-  wasmProfilerName, parseMethodDescriptor,
+  wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
-  Unsupported, sig, assembleModule,
+  Unsupported, sig, assembleModule, liveExceptionRanges,
 } = require('./wasmShared');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
+  addTimeImport,
 } = require('./wasmRuntimeImports');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
@@ -67,9 +72,7 @@ class StructuredWasmCompiler {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     if (!codeAttr) throw new Unsupported('no code');
     const items = codeAttr.code.codeItems;
-    if ((codeAttr.code.exceptionTable || []).length) {
-      throw new Unsupported('exception table');
-    }
+    const table = codeAttr.code.exceptionTable || [];
 
     const cfg = buildCfgFromCode(items);
     if (!cfg) throw new Unsupported('no cfg');
@@ -82,7 +85,7 @@ class StructuredWasmCompiler {
     }
 
     const fn = buildSsa(
-      { codeItems: items, exceptionTable: [], method: this.method },
+      { codeItems: items, exceptionTable: table, method: this.method },
       { cfg },
     );
     if (fn.rejected) throw new Unsupported(`ssa: ${fn.rejected}`);
@@ -129,6 +132,41 @@ class StructuredWasmCompiler {
       }
     }
 
+    // Per-block demotion: live handler ranges first, then a dry-run of every
+    // tree block's body + terminator — any Unsupported demotes just that
+    // block to an exit stub instead of rejecting the method.
+    const labelIndex = new Map();
+    items.forEach((it, i) => {
+      if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), i);
+    });
+    const treeBlocks = collectTreeBlocks(structured.tree);
+    this.demoted = new Map();
+    const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, labelIndex);
+    if (liveRanges.length) {
+      for (const id of treeBlocks) {
+        const insns = cfg.blocks[id].insns;
+        const s = insns[0];
+        const e = insns[insns.length - 1];
+        if (liveRanges.some(([rs, re]) => s < re && e >= rs)) {
+          this.demoted.set(id, 'live handler range');
+        }
+      }
+    }
+    for (const id of treeBlocks) {
+      if (this.demoted.has(id)) continue;
+      try {
+        const scratch = [];
+        this.emitBlockBody(id, scratch);
+        this.dryRunTerm(id, scratch);
+      } catch (err) {
+        if (!(err instanceof Unsupported)) throw err;
+        this.demoted.set(id, err.message);
+      }
+    }
+    if (this.demoted.has(cfg.entry)) {
+      throw new Unsupported(`entry demoted: ${this.demoted.get(cfg.entry)}`);
+    }
+
     const body = [];
     // Entry seed: a loop-header entry joins params with back edges; phi arg 0
     // is the seed (params/undef), copied once at function start.
@@ -154,10 +192,13 @@ class StructuredWasmCompiler {
     const supportedBlocks = new Set();
     for (const block of cfg.blocks) {
       blockOfItem.set(block.insns[0], block.id);
-      supportedBlocks.add(block.id);
+      if (treeBlocks.has(block.id) && !this.demoted.has(block.id)) {
+        supportedBlocks.add(block.id);
+      }
     }
     const env = {};
     this.importDecls.forEach((d, i) => { env[d.name] = this.importFns[i]; });
+    const normalFlowFullyCompiled = this.demoted.size === 0;
     return {
       bytes,
       importObject: { env },
@@ -167,14 +208,24 @@ class StructuredWasmCompiler {
       blockOfItem,
       supportedBlocks,
       externalEntry: new Set([0]),
-      demoteReasons: new Map(),
+      demoteReasons: this.demoted,
       blockCount: cfg.n,
-      fullyCompiled: true,
-      normalFlowFullyCompiled: true,
+      fullyCompiled: normalFlowFullyCompiled && table.length === 0,
+      normalFlowFullyCompiled,
       boxedCount: 0,
       fieldCacheCount: 0,
       structured: true,
     };
+  }
+
+  // Validates a block's terminator lowering without emitting into the real
+  // body — mirrors what lowerNode will ask of this block later.
+  dryRunTerm(id, out) {
+    const term = this.cfg.term[id];
+    if (!term) return;
+    if (term.kind === 'return') { this.emitTermIfFinal(id, out); return; }
+    if (term.cases) { out.push(...this.useOf(this.blockOf(id).term.args[0])); return; }
+    if (term.taken !== undefined) this.emitCondition(id, out);
   }
 
   // ---- tree lowering ----
@@ -187,6 +238,12 @@ class StructuredWasmCompiler {
         return;
       case 'straight': {
         env.curBlock = node.block;
+        if (this.demoted.has(node.block)) {
+          // Exit stub: hand the block to the interpreter (the dispatcher OSR
+          // module picks the method back up at the next supported block).
+          this.emitSpillResume(node.block, out);
+          return;
+        }
         this.emitBlockBody(node.block, out);
         const term = this.cfg.term[node.block];
         // Edges are copied at their SOURCE context, before whatever encodes
@@ -217,6 +274,10 @@ class StructuredWasmCompiler {
       }
       case 'if': {
         const from = node.block;
+        // A demoted branching block already emitted its exit stub in the
+        // 'straight' case; its arms are unreachable and the wasm stack is
+        // empty between nodes, so skipping them entirely stays valid.
+        if (this.demoted.has(from)) return;
         this.emitCondition(from, out);
         out.push(OP.if, 0x40);
         this.frames.push({ label: null });
@@ -231,6 +292,7 @@ class StructuredWasmCompiler {
       }
       case 'switch': {
         const from = node.block;
+        if (this.demoted.has(from)) return;
         const term = this.cfg.term[from];
         const selector = this.useOf(this.blockOf(from).term.args[0]);
         // if/else chain; each arm is already a break/continue/inline subtree
@@ -325,9 +387,15 @@ class StructuredWasmCompiler {
       OP.i32_const, ...sleb(0), OP.i32_le_s,
       OP.if, 0x40,
     );
-    // Spill the header's reaching slot defs into frame.locals, push its entry
-    // stack into frame.stack, and resume interpretation at the header.
-    const block = this.blockOf(header);
+    this.emitSpillResume(header, out);
+    out.push(OP.end);
+  }
+
+  // Spill the block's reaching slot defs into frame.locals, push its entry
+  // stack into frame.stack, and resume interpretation at the block. Shared by
+  // fuel-exhaustion exits (inside the fuel if) and demoted-block exit stubs.
+  emitSpillResume(blockId, out) {
+    const block = this.blockOf(blockId);
     const spills = [];
     for (const [slot, value] of block.slotDefsIn || []) {
       const t = KIND_T[value.kind];
@@ -338,7 +406,7 @@ class StructuredWasmCompiler {
       const slots = spills.map((s) => s.slot);
       const box = this.box;
       const idx = this.addImport(
-        `spill_h${header}`, spills.map((s) => s.t), [],
+        `spill_h${blockId}`, spills.map((s) => s.t), [],
         (...values) => {
           const locals = box.frame.locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
@@ -349,11 +417,10 @@ class StructuredWasmCompiler {
     }
     for (const value of block.entryStack) {
       const t = KIND_T[value.kind];
-      if (t === undefined) throw new Unsupported('unkinded entry stack at fuel exit');
+      if (t === undefined) throw new Unsupported('unkinded entry stack at exit');
       out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, t)));
     }
-    out.push(OP.i32_const, ...sleb(this.cfg.blocks[header].insns[0]), OP.return);
-    out.push(OP.end);
+    out.push(OP.i32_const, ...sleb(this.cfg.blocks[blockId].insns[0]), OP.return);
   }
 
   emitCondition(blockId, out) {
@@ -495,15 +562,69 @@ class StructuredWasmCompiler {
       return finish();
     }
 
-    // calls: Math intrinsics only in v1
+    // calls: Math intrinsics, or direct binding to a fully-compiled callee
     if (op === 'invokestatic') {
-      const math = addMathImport(this, { arg: node.imm });
+      const call = this.staticCallImport(node);
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
-      out.push(OP.call, ...uleb(math.idx));
+      out.push(OP.call, ...uleb(call.idx));
       return finish();
     }
 
     throw new Unsupported(`op ${op}`);
+  }
+
+  // invokestatic bound directly to another compiled wasm method — the
+  // fully-compiled-only subset of the dispatcher's compiledCallee: no scratch
+  // frames, no NestedDeopt, because a fully-compiled callee cannot exit.
+  staticCallImport(node) {
+    const [, className, [name, descriptor]] = node.imm;
+    if (className === 'java/lang/Math') return addMathImport(this, { arg: node.imm });
+    if (className === 'java/lang/System') return addTimeImport(this, this.jvm, { arg: node.imm });
+    const { params, ret } = parseMethodDescriptor(descriptor);
+    if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
+      throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
+    }
+    const calleeSt = this.wasmJit &&
+      this.wasmJit.findReadyStatic(className, name, descriptor, false);
+    const linked = calleeSt && (calleeSt.callee || calleeSt);
+    if (!linked || !linked.meta.fullyCompiled || linked.meta.boxedCount) {
+      throw new Unsupported(`invoke ${className}.${name}`);
+    }
+    // java arg slot -> position in the wasm arg list
+    const argPosBySlot = new Map();
+    let slot = 0;
+    params.forEach((p, i) => { argPosBySlot.set(slot, i); slot += (p === 'J' || p === 'D') ? 2 : 1; });
+    const wParams = params.map(descToWasm);
+    const results = ret === 'V' ? [] : [descToWasm(ret)];
+    const key = `${className}.${name}${descriptor}`;
+    const junk = { locals: [] }; // spill sink; a fully-compiled callee never exits
+    const fn = (...args) => {
+      const mod = calleeSt.callee || calleeSt; // recompiles may repoint it
+      const meta = mod.meta;
+      const full = new Array(meta.paramSlots.length + 2);
+      for (let i = 0; i < meta.paramSlots.length; i++) {
+        const p = meta.paramSlots[i];
+        const pos = argPosBySlot.get(p.slot);
+        if (pos !== undefined) full[i] = args[pos];
+        else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
+      }
+      full[meta.paramSlots.length] = 0;
+      full[meta.paramSlots.length + 1] = 100_000_000;
+      const savedFrame = meta.box.frame;
+      meta.box.frame = junk;
+      meta.box.ret = undefined;
+      let status;
+      try {
+        status = mod.run(...full);
+      } finally {
+        meta.box.frame = savedFrame;
+      }
+      if (status !== -1) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
+      return meta.box.ret;
+    };
+    return {
+      idx: this.addImport(`call_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+    };
   }
 
   constSeq(op, node) {
@@ -528,6 +649,29 @@ class StructuredWasmCompiler {
 
 function headerOfLabel(label) {
   return Number(label.slice(1));
+}
+
+// Every block the structurer tree will ask this backend to emit.
+function collectTreeBlocks(node, set = new Set()) {
+  if (!node) return set;
+  switch (node.t) {
+    case 'seq': node.body.forEach((child) => collectTreeBlocks(child, set)); break;
+    case 'straight': set.add(node.block); break;
+    case 'block':
+    case 'loop': collectTreeBlocks(node.body, set); break;
+    case 'if':
+      set.add(node.block);
+      collectTreeBlocks(node.then, set);
+      collectTreeBlocks(node.els, set);
+      break;
+    case 'switch':
+      set.add(node.block);
+      node.cases.forEach((c) => collectTreeBlocks(c.body, set));
+      collectTreeBlocks(node.dflt, set);
+      break;
+    default: break;
+  }
+  return set;
 }
 
 function zeroConst(t) {

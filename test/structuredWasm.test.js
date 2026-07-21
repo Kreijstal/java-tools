@@ -251,6 +251,100 @@ public class StructuredKernel {
   t.end();
 });
 
+test('structured wasm compiles methods with exception tables (loop outside range)', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredCatch', `
+public class StructuredCatch {
+  public static int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum = sum * 31 + (i ^ (sum >>> 16));
+    int guard = 0;
+    try { guard = 100 / (n - n); } catch (ArithmeticException e) { guard = 7; }
+    out[0] = sum + guard;
+    return sum + guard;
+  }
+}
+`);
+  const n = 5000;
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum = (Math.imul(sum, 31) + (i ^ (sum >>> 16))) | 0;
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredCatch', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], (sum + 7) | 0, 'loop + interpreted catch path matches reference');
+  t.ok(structuredKeys(jvm).includes('StructuredCatch.drive([II)I'),
+    'compiled by the structured backend despite the exception table');
+  const method = await jvm.findMethodInHierarchy('StructuredCatch', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok([...st.meta.demoteReasons.values()].includes('live handler range'),
+    `try range demoted (${[...st.meta.demoteReasons.values()].join(', ')})`);
+  t.notOk(st.meta.fullyCompiled, 'not fullyCompiled with an exception table');
+  t.end();
+});
+
+test('structured wasm demotes unsupported blocks to exit stubs mid-loop', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredDemote', `
+public class StructuredDemote {
+  static int slow(int v) { return new int[]{v, v + 1}[1]; }
+  public static int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum = sum * 31 + i;
+      if ((i & 63) == 0) sum += slow(i);
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const n = 4000;
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    sum = (Math.imul(sum, 31) + i) | 0;
+    if ((i & 63) === 0) sum = (sum + i + 1) | 0;
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredDemote', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], sum, 'result matches across repeated stub exits');
+  t.ok(structuredKeys(jvm).includes('StructuredDemote.drive([II)I'),
+    'compiled by the structured backend with a demoted call block');
+  const method = await jvm.findMethodInHierarchy('StructuredDemote', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st.meta.demoteReasons.size >= 1, 'the unlinkable call block is demoted');
+  t.end();
+});
+
+test('structured wasm links invokestatic to a fully-compiled callee', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredLink', `
+public class StructuredLink {
+  static int mix(int a, int b) { int x = a * 0x9E3775 + b; x ^= x >>> 7; return x; }
+  public static int drive(int[] out, int n) {
+    int acc = 1;
+    for (int i = 0; i < n; i++) acc = mix(acc, i);
+    out[0] = acc;
+    return acc;
+  }
+}
+`);
+  const n = 6000;
+  let acc = 1;
+  for (let i = 0; i < n; i++) {
+    let x = (Math.imul(acc, 0x9E3775) + i) | 0;
+    x = (x ^ (x >>> 7)) | 0;
+    acc = x;
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredLink', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], acc, 'linked-callee loop matches reference');
+  const method = await jvm.findMethodInHierarchy('StructuredLink', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st && st.meta.structured, 'driver compiled structured');
+  t.ok(st.meta.fullyCompiled, 'driver fully compiled (call bound in wasm)');
+  t.equal(st.exits, 0, 'no exits: the loop stays in wasm across the calls');
+  t.end();
+});
+
 test('structured wasm fuel exhaustion spills and resumes correctly', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredFuel', `
 public class StructuredFuel {

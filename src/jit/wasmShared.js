@@ -233,6 +233,80 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   ]);
 }
 
+// Ops that may appear in a wrap-and-rethrow reporter handler before its
+// terminating athrow. Forward branches are handled separately: obfuscator
+// reporters commonly select "null" versus "{...}" while formatting args.
+const REPORTER_OPS = /^(astore|aload|iload|lload|fload|dload|ldc|ldc_w|ldc2_w|bipush|sipush|iconst|lconst|fconst|dconst|aconst_null|new|dup|checkcast|getstatic|invokespecial|invokevirtual|invokestatic|invokedynamic|i2l|i2c|l2i)/;
+
+function isNoOpExceptionHandler(codeItems, handlerIndex, labelIndex) {
+  let furthestForwardTarget = handlerIndex;
+  // Large game methods can have reporters that append dozens of arguments.
+  // Keep discovery bounded, but do not confuse their size with recovery.
+  const end = Math.min(codeItems.length, handlerIndex + 512);
+  for (let i = handlerIndex; i < end; i++) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    const op = getOp(instruction);
+    if (!op) continue;
+    if (op === 'athrow') {
+      // Obfuscators commonly leave an unreachable throw on one side of a
+      // forward null-selection branch. It is not the handler terminator when
+      // another branch target still has to be visited.
+      if (i >= furthestForwardTarget) return true;
+      continue;
+    }
+    if (op === 'goto' || op.startsWith('if')) {
+      const target = instruction && typeof instruction === 'object'
+        ? labelIndex.get(instruction.arg) : undefined;
+      // Backedges can run arbitrary recovery logic; unresolved targets are
+      // not a proof either.
+      if (target === undefined || target <= i) return false;
+      furthestForwardTarget = Math.max(furthestForwardTarget, target);
+      continue;
+    }
+    if (/^(return|[a-z]return|putfield|putstatic|[a-z]astore|monitorenter|monitorexit)$/.test(op)) {
+      return false;
+    }
+    if (!REPORTER_OPS.test(op)) return false;
+  }
+  return false;
+}
+
+function catchesOnlyCheckedExceptions(jvm, catchType) {
+  if (!catchType || catchType === 'any') return false;
+
+  // Every operation emitted by the wasm tiers is either non-throwing or can
+  // only raise an unchecked VM exception (null/bounds/arithmetic). Calls
+  // capable of throwing a declared checked exception remain exit stubs and
+  // execute in the interpreter at their precise bytecode pc. Therefore a
+  // handler for a checked-exception subtype cannot observe a failure from a
+  // compiled block. Require a resolved hierarchy on both sides: broad
+  // Exception/Throwable handlers and unknown application exception types
+  // stay conservative.
+  return jvm.isInstanceOf(catchType, 'java/lang/Exception') &&
+    !jvm.isInstanceOf(catchType, 'java/lang/RuntimeException') &&
+    !jvm.isInstanceOf('java/lang/RuntimeException', catchType);
+}
+
+// Returns the item-index ranges [start, end) protected by LIVE (non-no-op)
+// handlers. Blocks intersecting these ranges must stay interpreted. No-op
+// handler entries (bare rethrow, wrap-and-rethrow reporter) contribute none.
+function liveExceptionRanges(jvm, code, labelIndex) {
+  const table = code.exceptionTable || [];
+  const ranges = [];
+  for (const entry of table) {
+    const label = entry.handlerLbl || `L${entry.handler_pc}`;
+    const h = labelIndex.get(label);
+    const live = h === undefined || !isNoOpExceptionHandler(code.codeItems, h, labelIndex);
+    if (live && !catchesOnlyCheckedExceptions(jvm, entry.catch_type)) {
+      const s = labelIndex.get(entry.startLbl || `L${entry.start_pc}`);
+      const e = labelIndex.get(entry.endLbl || `L${entry.end_pc}`);
+      // an unresolvable range must poison the whole method, not vanish
+      ranges.push([s === undefined ? 0 : s, e === undefined ? code.codeItems.length : e]);
+    }
+  }
+  return ranges;
+}
+
 module.exports = {
   T, CAT2, OP, TRUNC_SAT,
   uleb, sleb, f32bytes, f64bytes,
@@ -244,4 +318,5 @@ module.exports = {
   Unsupported,
   FUEL,
   assembleModule,
+  isNoOpExceptionHandler, catchesOnlyCheckedExceptions, liveExceptionRanges,
 };
