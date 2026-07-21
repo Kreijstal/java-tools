@@ -156,6 +156,17 @@ class StructuredWasmCompiler {
     addRuntimeImports(this, this.box);
     addArrayImports(this, this.method.name);
 
+    // Field-value caches (ported from the dispatcher tier, SSA-keyed).
+    // Instance caches key on the receiver's SSA value id: an SSA value is
+    // immutable for the whole run, so — unlike the dispatcher's slot
+    // provenance — no kills on local stores are ever needed. Kills remain at
+    // putfield/putstatic (matching field) and at linked static callees
+    // (transitive write summary; unknowable summary kills all). No other
+    // import in this tier runs guest code or a thread switch. The demotion
+    // dry-run below doubles as the discovery pass: every fill site registers
+    // its entry before real emission, so kill sites always see the full set.
+    this.fieldCaches = new Map();
+
     const localFor = (value) => {
       let idx = this.localOf.get(value);
       if (idx === undefined) {
@@ -276,7 +287,7 @@ class StructuredWasmCompiler {
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
       boxedCount: 0,
-      fieldCacheCount: 0,
+      fieldCacheCount: this.fieldCaches.size,
       structured: true,
       inlinedCalls,
       // CHA instanceof guards bake the compile-time world; the jit re-checks
@@ -659,9 +670,29 @@ class StructuredWasmCompiler {
     // fields
     if (op === 'getstatic' || op === 'getfield' || op === 'putstatic' || op === 'putfield') {
       const isGet = op[0] === 'g';
-      const field = addFieldImport(this, this.jvm, { arg: node.imm }, op.endsWith('static'), isGet);
+      const isStatic = op.endsWith('static');
+      const field = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, isGet);
+      const [, , [fieldName, descriptor]] = node.imm;
+      const killKey = `${fieldName}:${descriptor}`;
+      const caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
+      if (isGet && caching) {
+        const cacheKey = isStatic
+          ? `s|${field.name}` : `f|${node.args[0].id}|${field.name}`;
+        const entry = this.fieldCacheFor(cacheKey, field.t, killKey, isStatic ? 's' : 'f');
+        // cached instance path skips the null check: a filled flag proves
+        // this exact SSA value already loaded this field successfully
+        const loadSeq = isStatic
+          ? [OP.call, ...uleb(field.idx)]
+          : [...use(0), OP.call, ...uleb(field.idx)];
+        out.push(...this.cachedReadSeq(entry, loadSeq));
+        return finish();
+      }
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
       out.push(OP.call, ...uleb(field.idx));
+      if (!isGet) {
+        out.push(...this.killSeqWhere((entry) => (
+          entry.kind === (isStatic ? 's' : 'f') && entry.killKey === killKey)));
+      }
       return finish();
     }
 
@@ -670,6 +701,13 @@ class StructuredWasmCompiler {
       const call = this.staticCallImport(node);
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
       out.push(OP.call, ...uleb(call.idx));
+      // kill only the caches the callee may transitively write (math/time
+      // intrinsics carry no summary and write nothing); an unknowable
+      // callee (null summary) may put any field or static
+      if (call.writes === null) out.push(...this.killSeqWhere(() => true));
+      else if (call.writes && call.writes.size) {
+        out.push(...this.killSeqWhere((entry) => call.writes.has(entry.killKey)));
+      }
       return finish();
     }
 
@@ -687,6 +725,42 @@ class StructuredWasmCompiler {
     }
 
     throw new Unsupported(`op ${op}`);
+  }
+
+  fieldCacheFor(cacheKey, t, killKey, kind) {
+    let entry = this.fieldCaches.get(cacheKey);
+    if (!entry) {
+      const valLocal = this.nextLocal++;
+      this.declared.push(t);
+      const filledLocal = this.nextLocal++;
+      this.declared.push(T.i32);
+      entry = { valLocal, filledLocal, t, killKey, kind };
+      this.fieldCaches.set(cacheKey, entry);
+    }
+    return entry;
+  }
+
+  killSeqWhere(predicate) {
+    const seq = [];
+    for (const entry of this.fieldCaches.values()) {
+      if (predicate(entry)) {
+        seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(entry.filledLocal));
+      }
+    }
+    return seq;
+  }
+
+  // read through the cache entry; on miss run `loadSeq` (which must leave
+  // exactly the loaded value on the wasm stack) and fill the cache
+  cachedReadSeq(entry, loadSeq) {
+    return [
+      OP.local_get, ...uleb(entry.filledLocal), OP.if, entry.t,
+      OP.local_get, ...uleb(entry.valLocal),
+      OP.else, ...loadSeq,
+      OP.local_set, ...uleb(entry.valLocal),
+      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(entry.filledLocal),
+      OP.local_get, ...uleb(entry.valLocal), OP.end,
+    ];
   }
 
   // Memoized subtype-verdict imports. Never deopts: a hierarchy verdict for a
@@ -734,6 +808,9 @@ class StructuredWasmCompiler {
     const [, className, [name, descriptor]] = node.imm;
     if (className === 'java/lang/Math') return addMathImport(this, { arg: node.imm });
     if (className === 'java/lang/System') return addTimeImport(this, this.jvm, { arg: node.imm });
+    const writes = this.wasmJit
+      ? this.wasmJit.staticWriteSummary(className, name, descriptor)
+      : null;
     const { params, ret } = parseMethodDescriptor(descriptor);
     if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
       throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
@@ -786,6 +863,7 @@ class StructuredWasmCompiler {
     };
     return {
       idx: this.addImport(`call_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+      writes,
     };
   }
 

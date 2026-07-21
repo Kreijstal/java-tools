@@ -98,6 +98,12 @@ public class InstInline {
     try { r = drive(out, b, n); } catch (NullPointerException e) { r = -42; }
     out[0] = r;
   }
+  public static int drain(int[] out, Base b, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) { s += b.f; b.f = b.f - 1; }
+    out[0] = s;
+    return s;
+  }
 }
 class Base { int f; int val() { return f; } }
 class Sub extends Base { int val() { return f * 2; } }
@@ -167,6 +173,31 @@ test('class loaded after compile misses the guards and invalidates the module', 
   const after = metaOf(jvm, 'InstInline.drive([ILBase;I)I');
   t.ok(!after || !after.speculations || after.specEpoch === (jvm.classEpoch || 0),
     'no stale speculative module survives the epoch bump');
+  t.end();
+});
+
+test('structured field caches: fills hit, putfield kills, runs stay fresh', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'InstInline', BIMORPHIC_SOURCE, ['Base', 'Sub']);
+  const n = 5000;
+  const out = [0];
+  out.type = '[I';
+  const base = { type: 'Base', fields: { 'Base.f': 100000 } };
+  // s = sum of (f0 - i): wrong (n * f0) if the putfield fails to kill the cache
+  await invoke(jvm, thread, 'InstInline', 'drain', '([ILBase;I)I', [out, base, n]);
+  t.equal(out[0], (100000 * n - (n * (n - 1)) / 2) | 0, 'read-decrement loop is exact');
+  t.equal(base.fields['Base.f'], 100000 - n, 'field visibly decremented');
+  const meta = metaOf(jvm, 'InstInline.drain([ILBase;I)I');
+  t.ok(meta && meta.structured, 'drain compiled by the structured backend');
+  const caching = process.env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
+  if (caching) t.ok(meta.fieldCacheCount >= 1, 'getfield registered a cache entry');
+  else t.equal(meta.fieldCacheCount, 0, 'kill switch leaves no cache entries');
+
+  // caches are per-run locals: a mutation between invokes must be seen
+  base.fields['Base.f'] = 9;
+  await invoke(jvm, thread, 'InstInline', 'drive', '([ILBase;I)I', [out, base, n]);
+  t.equal(out[0], expectedSum(9, n), 'fresh run reads the mutated field');
+  const drive = metaOf(jvm, 'InstInline.drive([ILBase;I)I');
+  if (caching) t.ok(drive && drive.fieldCacheCount >= 1, 'inlined val() getfield is cached');
   t.end();
 });
 
