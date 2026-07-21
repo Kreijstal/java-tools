@@ -1459,6 +1459,7 @@ class WasmJit {
         console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${primary.bytes.length}B, ` +
           `${primary.supportedBlocks.size}/${primary.blockCount} blocks, ${primary.fieldCacheCount} field caches` +
           (structuredMeta ? ` structured${st.osr ? '+osr' : ''}` : '') +
+          (primary.inlinedCalls ? ` +${primary.inlinedCalls} inlined` : '') +
           (primary.demoteReasons.size ? ` (exits: ${[...primary.demoteReasons.values()].join('; ')})` : ''));
       }
     } catch (err) {

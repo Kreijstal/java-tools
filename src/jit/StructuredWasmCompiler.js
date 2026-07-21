@@ -32,6 +32,7 @@ const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
   addTimeImport,
 } = require('./wasmRuntimeImports');
+const { inlineStaticCalls } = require('./wasmInline');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
 const LCONST = { lconst_0: 0n, lconst_1: 1n };
@@ -69,10 +70,34 @@ class StructuredWasmCompiler {
   }
 
   translate() {
+    const inlineEnabled = process.env.JVM_WASM_INLINE !== '0';
+    try {
+      return this.translateWith(inlineEnabled);
+    } catch (err) {
+      // Inlining can create blocks with no interpreter resume pc; if one of
+      // those ends up needing an exit stub, redo the method without inlining.
+      if (!(err instanceof Unsupported) || !this.didInline) throw err;
+      return new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit)
+        .translateWith(false);
+    }
+  }
+
+  translateWith(inline) {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     if (!codeAttr) throw new Unsupported('no code');
-    const items = codeAttr.code.codeItems;
+    let items = codeAttr.code.codeItems;
     const table = codeAttr.code.exceptionTable || [];
+    this.origIdx = null;
+    let inlinedCalls = 0;
+    if (inline) {
+      const expanded = inlineStaticCalls(this.jvm, codeAttr);
+      if (expanded) {
+        items = expanded.items;
+        this.origIdx = expanded.origIdx;
+        this.didInline = true;
+        inlinedCalls = expanded.inlined;
+      }
+    }
 
     const cfg = buildCfgFromCode(items);
     if (!cfg) throw new Unsupported('no cfg');
@@ -191,7 +216,12 @@ class StructuredWasmCompiler {
     const blockOfItem = new Map();
     const supportedBlocks = new Set();
     for (const block of cfg.blocks) {
-      blockOfItem.set(block.insns[0], block.id);
+      // keys are ORIGINAL item indices (frame.pc space); blocks that begin
+      // inside inlined code have no external identity and are skipped
+      const orig = this.origIdx ? this.origIdx[block.insns[0]] : block.insns[0];
+      if (orig !== undefined && orig >= 0 && !blockOfItem.has(orig)) {
+        blockOfItem.set(orig, block.id);
+      }
       if (treeBlocks.has(block.id) && !this.demoted.has(block.id)) {
         supportedBlocks.add(block.id);
       }
@@ -215,6 +245,7 @@ class StructuredWasmCompiler {
       boxedCount: 0,
       fieldCacheCount: 0,
       structured: true,
+      inlinedCalls,
     };
   }
 
@@ -420,7 +451,16 @@ class StructuredWasmCompiler {
       if (t === undefined) throw new Unsupported('unkinded entry stack at exit');
       out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, t)));
     }
-    out.push(OP.i32_const, ...sleb(this.cfg.blocks[blockId].insns[0]), OP.return);
+    out.push(OP.i32_const, ...sleb(this.resumeItemOf(blockId)), OP.return);
+  }
+
+  // The ORIGINAL caller item index the interpreter resumes at for this
+  // block. Blocks that begin inside inlined callee code have none.
+  resumeItemOf(blockId) {
+    const first = this.cfg.blocks[blockId].insns[0];
+    const orig = this.origIdx ? this.origIdx[first] : first;
+    if (orig === undefined || orig < 0) throw new Unsupported('resume inside inlined code');
+    return orig;
   }
 
   emitCondition(blockId, out) {

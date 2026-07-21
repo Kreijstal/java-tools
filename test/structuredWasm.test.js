@@ -345,6 +345,44 @@ public class StructuredLink {
   t.end();
 });
 
+test('structured wasm inlines small loop-free static callees', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredInline', `
+public class StructuredInline {
+  static int mask(int a, int b) { return a & b; }
+  static int sel(int a, int b) { return a > b ? a - b : b - a; }
+  public static int drive(int[] out, int n) {
+    int acc = 1;
+    for (int i = 0; i < n; i++) {
+      acc = acc * 31 + mask(acc, i) + sel(i, acc & 255);
+    }
+    out[0] = acc;
+    return acc;
+  }
+}
+`);
+  const n = 6000;
+  let acc = 1;
+  for (let i = 0; i < n; i++) {
+    const m = acc & i;
+    const b = acc & 255;
+    const s = i > b ? i - b : b - i;
+    acc = (Math.imul(acc, 31) + m + s) | 0;
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredInline', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], acc, 'inlined-callee loop matches reference');
+  const method = await jvm.findMethodInHierarchy('StructuredInline', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st && st.meta.structured, 'driver compiled structured');
+  t.equal(st.meta.inlinedCalls, 2, 'both callees spliced into the caller');
+  t.ok(st.meta.fullyCompiled, 'fully compiled with the calls dissolved');
+  t.equal(st.exits, 0, 'no exits: no call boundary left to cross');
+  // (mask/sel may still be compiled as callees by the dispatcher module
+  // built alongside — the structured module itself has no call imports)
+  t.end();
+});
+
 test('structured wasm fuel exhaustion spills and resumes correctly', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredFuel', `
 public class StructuredFuel {
