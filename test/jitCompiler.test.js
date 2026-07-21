@@ -2266,6 +2266,82 @@ public class WasmFieldCacheHarness {
   t.end();
 });
 
+test('Wasm JIT field-write summaries keep caches alive across pure callees', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmWriteSummaryHarness', `
+public class WasmWriteSummaryHarness {
+  static int base;
+  static int scale;
+  static int pure(int v) { return v * 2 + 1; }
+  static int pureNested(int v) { return pure(v) + Math.abs(v); }
+  static void bump(int d) { scale += d; }
+  public static int drive(int[] out, int n) {
+    base = 7;
+    scale = 3;
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum += base + pureNested(i);
+      if (i == n / 2) { bump(2); }
+      sum += scale * base;
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmWriteSummaryHarness');
+  jvm.classInitializationState.set('WasmWriteSummaryHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-write-summary-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const n = 12;
+  let expected = 0;
+  let base = 7;
+  let scale = 3;
+  for (let i = 0; i < n; i++) {
+    expected += base + (i * 2 + 1) + Math.abs(i);
+    if (i === Math.floor(n / 2)) scale += 2;
+    expected += scale * base;
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'WasmWriteSummaryHarness', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], expected, 'impure callee still invalidates exactly the field it writes');
+
+  const wasmJit = jvm.jit.wasmJit;
+  const pureSummary = wasmJit.staticWriteSummary('WasmWriteSummaryHarness', 'pureNested', '(I)I');
+  t.ok(pureSummary && pureSummary.size === 0,
+    'transitively pure helper (incl. Math call) summarizes to an empty write set');
+  const bumpSummary = wasmJit.staticWriteSummary('WasmWriteSummaryHarness', 'bump', '(I)V');
+  t.same(bumpSummary && [...bumpSummary], ['scale:I'],
+    'writing helper summarizes to exactly its written field');
+  const driveSummary = wasmJit.staticWriteSummary('WasmWriteSummaryHarness', 'drive', '([II)I');
+  t.same(driveSummary && [...driveSummary].sort(), ['base:I', 'scale:I'],
+    'caller summary is the transitive union of its own and its callees writes');
+  t.equal(wasmJit.staticWriteSummary('WasmWriteSummaryHarness', 'missing', '()V'), null,
+    'unknown methods stay unknowable (kill everything)');
+
+  const compiled = jvm.jit.wasmJit.compiled.map((entry) => entry.key);
+  t.ok(compiled.includes('WasmWriteSummaryHarness.drive([II)I'),
+    'summary-guided loop uses the Wasm tier');
+  t.end();
+});
+
 test('Wasm JIT links partial callees and deopts through their diagnostic guards', async (t) => {
   const classpath = compileJavaFixture(t, 'WasmPartialLinkHarness', `
 public class WasmPartialLinkHarness {

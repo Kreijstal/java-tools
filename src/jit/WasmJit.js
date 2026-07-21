@@ -243,6 +243,7 @@ const MATH_INTRINSICS = new Set([
   'abs', 'max', 'min', 'sin', 'cos', 'tan', 'asin', 'acos', 'atan', 'atan2',
   'sqrt', 'pow', 'floor', 'ceil', 'log', 'exp',
 ]);
+const EMPTY_WRITE_SET = new Set();
 
 class Unsupported extends Error {}
 
@@ -477,8 +478,9 @@ class MethodTranslator {
   //  - a putfield/putstatic of the same name:descriptor clears every matching
   //    flag (inheritance can alias distinct owner classes onto one storage
   //    key, so the kill ignores the owner);
-  //  - linked wasm callees may write any field, so calls clear all flags
-  //    (Math intrinsics are pure and exempt);
+  //  - a linked wasm callee clears the flags matching its transitive
+  //    field-write summary (WasmJit.staticWriteSummary); callees whose writes
+  //    are unknowable clear all flags, and Math intrinsics clear none;
   //  - a store to slot s clears caches keyed on s and strips the compile-time
   //    provenance of values already on the simulated stack, so a stale
   //    receiver can never seed a cache for the slot's new object;
@@ -1298,21 +1300,26 @@ class MethodTranslator {
           entry.kind === (st ? 's' : 'f') && entry.killKey === killKey));
       } else if (op === 'invokestatic') {
         let bound;
-        let pure = true;
+        let writes = EMPTY_WRITE_SET; // Math intrinsics write nothing
         try {
           bound = this.mathIntrinsic(ins);
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
           bound = this.compiledCallee(ins, i, stack.length);
-          pure = false;
+          const [, calleeClass, [calleeName, calleeDesc]] = ins.arg;
+          writes = this.wasmJit
+            ? this.wasmJit.staticWriteSummary(calleeClass, calleeName, calleeDesc)
+            : null;
         }
         for (let k = 0; k < bound.params.length; k++) pop();
         // a partial callee can deopt: the caller's typed slots must already
         // be in frame.locals so the interpreter can resume after the invoke
         if (bound.partial) emit(...this.spillSeq());
         emit(OP.call, ...uleb(bound.idx));
-        // a linked wasm callee may put any field or static
-        if (!pure) emit(...this.killSeqWhere(() => true));
+        // kill only the field caches the callee may transitively write; an
+        // unknowable callee (null summary) may put any field or static
+        if (writes === null) emit(...this.killSeqWhere(() => true));
+        else if (writes.size) emit(...this.killSeqWhere((entry) => writes.has(entry.killKey)));
         const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
         if (retC !== 'V') push(descToWasm(retC));
       } else if (op === 'pop') { pop(); emit(OP.drop); }
@@ -1512,6 +1519,7 @@ class WasmJit {
     this.compileEpoch = 0;
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
+    this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
   }
 
   methodState(frame) {
@@ -1752,6 +1760,60 @@ class WasmJit {
       this.compile(frame, st);
     }
     return { handled: true };
+  }
+
+  // Transitive set of field kill-keys (`name:descriptor`) a static method may
+  // write, or null when unknowable (unresolved class, virtual dispatch,
+  // invokedynamic). Call sites use it to kill only the matching field caches:
+  // the deobfuscated-helper shape writes no fields at all, and calling it
+  // should not blow away the caller's cached reads. Bytecode is immutable, so
+  // a known summary is final; unknown (null) summaries are retried once per
+  // compile epoch because the callee's class may load later.
+  staticWriteSummary(className, name, descriptor, inProgress) {
+    const key = `${className}.${name}${descriptor}`;
+    const memo = this.writeSummaries.get(key);
+    if (memo && (memo.keys !== null || memo.epoch === this.compileEpoch)) return memo.keys;
+    if (inProgress) {
+      // recursion: pessimistic on the cycle member, and do not memoize —
+      // the outer walk still accumulates its own writes correctly
+      if (inProgress.has(key)) return null;
+    } else {
+      inProgress = new Set();
+    }
+    inProgress.add(key);
+    const keys = this.computeWriteSummary(className, name, descriptor, inProgress);
+    inProgress.delete(key);
+    this.writeSummaries.set(key, { keys, epoch: this.compileEpoch });
+    return keys;
+  }
+
+  computeWriteSummary(className, name, descriptor, inProgress) {
+    if (className === 'java/lang/Math') return EMPTY_WRITE_SET;
+    const cd = this.jvm.classes[className];
+    const clsAst = cd && cd.ast && cd.ast.classes[0];
+    if (!clsAst) return null;
+    const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
+      .find((m) => m.name === name && m.descriptor === descriptor);
+    if (!method || !(method.flags || []).includes('static')) return null;
+    const code = method.attributes && method.attributes.find((a) => a.type === 'code');
+    if (!code) return null;
+    const keys = new Set();
+    for (const item of code.code.codeItems) {
+      if (!item.instruction) continue;
+      const op = getOp(item.instruction);
+      if (op === 'putfield' || op === 'putstatic') {
+        const [, , [fieldName, fieldDesc]] = item.instruction.arg;
+        keys.add(`${fieldName}:${fieldDesc}`);
+      } else if (op === 'invokestatic') {
+        const [, calleeClass, [calleeName, calleeDesc]] = item.instruction.arg;
+        const sub = this.staticWriteSummary(calleeClass, calleeName, calleeDesc, inProgress);
+        if (sub === null) return null;
+        for (const k of sub) keys.add(k);
+      } else if (op && op.startsWith('invoke')) {
+        return null; // virtual/interface/special/dynamic: unknown target
+      }
+    }
+    return keys.size ? keys : EMPTY_WRITE_SET;
   }
 
   findReadyStatic(className, name, descriptor, allowPartial = false) {
