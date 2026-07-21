@@ -19,7 +19,7 @@ module.exports = {
       let byteArray;
       if (b && b.array) {
         byteArray = b.array;
-      } else if (Array.isArray(b)) {
+      } else if (Array.isArray(b) || ArrayBuffer.isView(b)) {
         byteArray = b;
       } else {
         throw {

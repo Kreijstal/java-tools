@@ -31,6 +31,11 @@ const OP = {
   f32_convert_i32_s: 0xb2, f32_convert_i64_s: 0xb4, f32_demote_f64: 0xb6,
   f64_convert_i32_s: 0xb7, f64_convert_i64_s: 0xb9, f64_promote_f32: 0xbb,
   i32_extend8_s: 0xc0, i32_extend16_s: 0xc1,
+  i32_lt_u: 0x49, i32_ge_u: 0x4f,
+  i32_load: 0x28, i64_load: 0x29, f32_load: 0x2a, f64_load: 0x2b,
+  i32_load8_s: 0x2c, i32_load8_u: 0x2d, i32_load16_s: 0x2e, i32_load16_u: 0x2f,
+  i32_store: 0x36, i64_store: 0x37, f32_store: 0x38, f64_store: 0x39,
+  i32_store8: 0x3a, i32_store16: 0x3b,
 };
 // saturating truncation (0xFC prefix) — matches Java's NaN->0 / clamping f2i family
 const TRUNC_SAT = {
@@ -192,7 +197,8 @@ const FUEL = 5_000_000;
 // Assemble a single-function module exporting `run`. Caller provides the
 // import declarations ({name, params, results}), the main signature, local
 // declarations (wasm types in index order after params) and the body bytes.
-function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName }) {
+function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
+  importMemory }) {
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -206,6 +212,11 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   };
 
   const importEntries = [];
+  if (importMemory) {
+    // (import "env" "mem" (memory 1)) — memories index separately from
+    // functions, so this does not shift any call target
+    importEntries.push([3, 0x65, 0x6e, 0x76, 3, 0x6d, 0x65, 0x6d, 0x02, 0x00, ...uleb(1)]);
+  }
   for (const d of importDecls) {
     const ti = internType(d.params, d.results);
     const nameBytes = [...d.name].map((c) => c.charCodeAt(0));

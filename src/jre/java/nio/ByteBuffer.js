@@ -40,7 +40,7 @@ module.exports = {
       let destArray;
       if (dest && dest.array) {
         destArray = dest.array;
-      } else if (Array.isArray(dest)) {
+      } else if (Array.isArray(dest) || ArrayBuffer.isView(dest)) {
         destArray = dest;
       } else {
         throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for get' };
@@ -65,7 +65,7 @@ module.exports = {
       let srcArray;
       if (src && src.array) {
         srcArray = src.array;
-      } else if (Array.isArray(src)) {
+      } else if (Array.isArray(src) || ArrayBuffer.isView(src)) {
         srcArray = src;
       } else {
         throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for put' };

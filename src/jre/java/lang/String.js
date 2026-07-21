@@ -89,7 +89,7 @@ function byteArrayValue(bytes) {
   if (bytes && bytes.array) {
     return bytes.array;
   }
-  if (Array.isArray(bytes)) {
+  if (Array.isArray(bytes) || ArrayBuffer.isView(bytes)) {
     return bytes;
   }
   throw {

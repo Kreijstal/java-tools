@@ -47,7 +47,7 @@ function materializeProducerImage(imageObj) {
   const ints = [];
   for (const key of Object.keys(producer.fields)) {
     const v = producer.fields[key];
-    if (Array.isArray(v) && v.type === '[I') {
+    if ((Array.isArray(v) || ArrayBuffer.isView(v)) && v.type === '[I') {
       if (!pixels || v.length > pixels.length) pixels = v;
     } else if (typeof v === 'number' && Number.isInteger(v) && v > 0 && v <= 8192) {
       ints.push(v);

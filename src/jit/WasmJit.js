@@ -79,6 +79,7 @@ const {
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges,
 } = require('./wasmShared');
+const monoArray = require('./monoArray');
 
 // Thrown through wasm frames when a linked partial callee reaches one of its
 // demoted (diagnostic) blocks: carries the interpreter frames to materialize,
@@ -133,43 +134,37 @@ class MethodTranslator {
     return idx;
   }
 
-  elemsOf(a, i, opName) {
-    // bug-compatible with instructions/utils.js: bounds use arrayRef.length
-    if (a === null || a === undefined) throw NPE(`Attempted ${opName} on null array in ${this.method.name}`);
-    if (i < 0 || i >= a.length) throw AIOOBE(i, a.length);
-    return a;
-  }
-
   arrayImports() {
     const self = this;
+    const name = this.method.name;
     const mk = (suffix, t) => {
-      // Each import has one fixed result type. Give SpiderMonkey a monomorphic
-      // integer/reference closure instead of routing every element through
-      // the polymorphic toWasmValue switch at the Wasm boundary.
+      // Each import has one fixed result type, and element access goes through
+      // monoArray so each backing class (plain Array vs the wasm-heap
+      // TypedArray views) keeps its own monomorphic keyed IC — one shared
+      // `a[i]` site over that mix goes megamorphic and dominates the profile.
       const load = t === T.i32
         ? (a, i) => {
-          const arr = self.elemsOf(a, i, 'load');
-          const value = arr.elements ? arr.elements[i] : arr[i];
+          if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${name}`);
+          const value = monoArray.load(a, i);
+          if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
           return typeof value === 'boolean' ? (value ? 1 : 0) : value;
         }
-        : t === T.ref
-          ? (a, i) => {
-            const arr = self.elemsOf(a, i, 'load');
-            return arr.elements ? arr.elements[i] : arr[i];
-          }
-          : (a, i) => {
-            const arr = self.elemsOf(a, i, 'load');
-            return toWasmValue(t, arr.elements ? arr.elements[i] : arr[i]);
-          };
+        : (a, i) => {
+          if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${name}`);
+          const value = monoArray.load(a, i);
+          if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
+          return t === T.ref ? value : toWasmValue(t, value);
+        };
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
       self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-        self.elemsOf(a, i, 'store')[i] = v;
+        if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${name}`);
+        if (!monoArray.store(a, i, v)) throw AIOOBE(i, monoArray.len(a));
       });
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
     self.addImport('alen', [T.ref], [T.i32], (a) => {
-      if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${self.method.name}`);
-      return a.length;
+      if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${name}`);
+      return monoArray.len(a);
     });
   }
 
@@ -1840,6 +1835,7 @@ class WasmJit {
       if (this.debug) {
         console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${primary.bytes.length}B, ` +
           `${primary.supportedBlocks.size}/${primary.blockCount} blocks, ${primary.fieldCacheCount} field caches` +
+          (primary.arrayCacheCount ? ` ${primary.arrayCacheCount} array caches` : '') +
           (structuredMeta ? ` structured${st.osr ? '+osr' : ''}` : '') +
           (primary.inlinedCalls ? ` +${primary.inlinedCalls} inlined` : '') +
           (primary.demoteReasons.size ? ` (exits: ${[...primary.demoteReasons.values()].join('; ')})` : ''));

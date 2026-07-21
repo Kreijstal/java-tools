@@ -5,7 +5,7 @@ const PREFIX = 'java/util/zip/Deflater/';
 
 function byteArray(value, message) {
   if (value && value.array) return value.array;
-  if (Array.isArray(value)) return value;
+  if (Array.isArray(value) || ArrayBuffer.isView(value)) return value;
   throw { type: 'java/lang/IllegalArgumentException', message };
 }
 

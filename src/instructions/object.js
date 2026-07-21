@@ -380,7 +380,9 @@ module.exports = {
       const remaining = dims.slice(1);
       let arr;
       if (remaining.length === 0) {
-        arr = new Array(count).fill(leafDefault);
+        arr = (jvm.wasmHeap && !baseType.startsWith('L') &&
+          jvm.wasmHeap.alloc(`[${baseType}`, count)) ||
+          new Array(count).fill(leafDefault);
       } else {
         arr = new Array(count).fill(null);
         for (let i = 0; i < count; i++) {
@@ -427,34 +429,43 @@ module.exports = {
       throw new Error('NegativeArraySizeException');
     }
     
-    // Create array based on type name
-    let array;
-    switch (atype) {
-      case 'boolean':
-      case 'byte':
-      case 'short':
-      case 'int':
-        array = new Array(count).fill(0);
-        break;
-      case 'long':
-        array = new Array(count).fill(BigInt(0));
-        break;
-      case 'float':
-      case 'double':
-        array = new Array(count).fill(0.0);
-        break;
-      case 'char':
-        array = new Array(count).fill(0); // char as int
-        break;
-      default:
-        throw new Error(`Unsupported array type: ${atype}`);
-    }
-    
-    // Set array type for proper runtime behavior
     const descriptors = { boolean: '[Z', byte: '[B', char: '[C', short: '[S', int: '[I', long: '[J', float: '[F', double: '[D' };
-    array.type = descriptors[atype] || 'array';
+    const desc = descriptors[atype];
+    if (!desc) throw new Error(`Unsupported array type: ${atype}`);
+
+    // Create array based on type name; with the linear heap on, primitive
+    // arrays are TypedArray views over wasm memory (zeroed by construction,
+    // element coercion matches Java) instead of plain JS arrays.
+    let array;
+    if (jvm.wasmHeap) {
+      array = jvm.wasmHeap.alloc(desc, count);
+    } else {
+      switch (atype) {
+        case 'boolean':
+        case 'byte':
+        case 'short':
+        case 'int':
+          array = new Array(count).fill(0);
+          break;
+        case 'long':
+          array = new Array(count).fill(BigInt(0));
+          break;
+        case 'float':
+        case 'double':
+          array = new Array(count).fill(0.0);
+          break;
+        case 'char':
+          array = new Array(count).fill(0); // char as int
+          break;
+        default:
+          throw new Error(`Unsupported array type: ${atype}`);
+      }
+      array.length = count;
+    }
+
+    // Set array type for proper runtime behavior
+    array.type = desc;
     array.elementType = atype;
-    array.length = count;
     array.hashCode = jvm.nextHashCode++;
     
     frame.stack.push(array);

@@ -15,6 +15,7 @@ const {
   T, NPE, AIOOBE, MATH_INTRINSICS, Unsupported,
   descToWasm, toWasmValue, parseMethodDescriptor,
 } = require('./wasmShared');
+const monoArray = require('./monoArray');
 
 function addRuntimeImports(reg, box) {
   reg.addImport('push_i', [T.i32], [], (v) => { box.frame.stack.push(v); });
@@ -44,37 +45,33 @@ function pushImportFor(reg, t) {
 }
 
 function addArrayImports(reg, methodName) {
-  const elemsOf = (a, i, opName) => {
-    // bug-compatible with instructions/utils.js: bounds use arrayRef.length
-    if (a === null || a === undefined) throw NPE(`Attempted ${opName} on null array in ${methodName}`);
-    if (i < 0 || i >= a.length) throw AIOOBE(i, a.length);
-    return a;
-  };
   const mk = (suffix, t) => {
+    // monoArray keeps each backing class (plain Array vs wasm-heap TypedArray
+    // views) on its own monomorphic keyed IC — one shared `a[i]` site over
+    // that mix goes megamorphic and dominates the profile.
     const load = t === T.i32
       ? (a, i) => {
-        const arr = elemsOf(a, i, 'load');
-        const value = arr.elements ? arr.elements[i] : arr[i];
+        if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
+        const value = monoArray.load(a, i);
+        if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
         return typeof value === 'boolean' ? (value ? 1 : 0) : value;
       }
-      : t === T.ref
-        ? (a, i) => {
-          const arr = elemsOf(a, i, 'load');
-          return arr.elements ? arr.elements[i] : arr[i];
-        }
-        : (a, i) => {
-          const arr = elemsOf(a, i, 'load');
-          return toWasmValue(t, arr.elements ? arr.elements[i] : arr[i]);
-        };
+      : (a, i) => {
+        if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
+        const value = monoArray.load(a, i);
+        if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
+        return t === T.ref ? value : toWasmValue(t, value);
+      };
     reg.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
     reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-      elemsOf(a, i, 'store')[i] = v;
+      if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${methodName}`);
+      if (!monoArray.store(a, i, v)) throw AIOOBE(i, monoArray.len(a));
     });
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
   reg.addImport('alen', [T.ref], [T.i32], (a) => {
     if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${methodName}`);
-    return a.length;
+    return monoArray.len(a);
   });
 }
 

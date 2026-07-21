@@ -21,7 +21,7 @@ module.exports = {
       let byteArray;
       if (b && b.array) {
         byteArray = b.array;
-      } else if (Array.isArray(b)) {
+      } else if (Array.isArray(b) || ArrayBuffer.isView(b)) {
         byteArray = b;
       } else {
         throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };
@@ -34,7 +34,7 @@ module.exports = {
       let destArray;
       if (dest && dest.array) {
         destArray = dest.array;
-      } else if (Array.isArray(dest)) {
+      } else if (Array.isArray(dest) || ArrayBuffer.isView(dest)) {
         destArray = dest;
       } else {
         throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for inflate' };

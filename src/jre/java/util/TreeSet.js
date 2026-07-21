@@ -13,7 +13,7 @@ function copyCollection(src) {
   if (src.items instanceof Set) return Array.from(src.items);
   if (Array.isArray(src.array)) return src.array.slice();
   if (Array.isArray(src.items)) return src.items.slice();
-  if (Array.isArray(src)) return src.slice();
+  if (Array.isArray(src) || ArrayBuffer.isView(src)) return Array.from(src);
   return [];
 }
 

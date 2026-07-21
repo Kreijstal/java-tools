@@ -29,7 +29,7 @@ module.exports = {
       let bytes;
       if (byteArray && byteArray.array) {
         bytes = byteArray.array;
-      } else if (Array.isArray(byteArray)) {
+      } else if (Array.isArray(byteArray) || ArrayBuffer.isView(byteArray)) {
         bytes = byteArray;
       } else {
         throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };

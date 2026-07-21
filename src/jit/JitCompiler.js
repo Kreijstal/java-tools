@@ -5,6 +5,7 @@ const { resolveInstanceFieldKey } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
 const FusedRegionCompiler = require("./FusedRegionCompiler");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
+const monoArray = require("./monoArray");
 const { isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
@@ -2701,10 +2702,11 @@ class JitCompiler {
     if (arrayRef === null || arrayRef === undefined) {
       throw { type: "java/lang/NullPointerException", message: `Attempted to load from null array in ${frame.method.name}` };
     }
-    if (index < 0 || index >= arrayRef.length) {
-      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    const value = monoArray.load(arrayRef, index);
+    if (value === monoArray.OOB) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
     }
-    return arrayRef.elements ? arrayRef.elements[index] : arrayRef[index];
+    return value;
   }
 
   // A generated region may keep this raw storage pointer in a scalar local.
@@ -2720,10 +2722,9 @@ class JitCompiler {
     if (arrayRef === null || arrayRef === undefined) {
       throw { type: "java/lang/NullPointerException", message: `Attempted to store into null array in ${frame.method.name}` };
     }
-    if (index < 0 || index >= arrayRef.length) {
-      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${arrayRef.length}` };
+    if (!monoArray.store(arrayRef, index, value)) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
     }
-    arrayRef[index] = value;
   }
 
   registerFieldSite(arg) {

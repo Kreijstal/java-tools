@@ -36,6 +36,27 @@ const { inlineCalls } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
+// Linear-heap element access per bytecode op: wasm load/store opcode and the
+// element size shift. baload/bastore also serve boolean arrays (Int8Array,
+// values 0/1); caload is the only unsigned load (Java char).
+const HEAP_LOAD = {
+  iaload: { op: 'i32_load', shift: 2, t: T.i32 },
+  laload: { op: 'i64_load', shift: 3, t: T.i64 },
+  faload: { op: 'f32_load', shift: 2, t: T.f32 },
+  daload: { op: 'f64_load', shift: 3, t: T.f64 },
+  baload: { op: 'i32_load8_s', shift: 0, t: T.i32 },
+  caload: { op: 'i32_load16_u', shift: 1, t: T.i32 },
+  saload: { op: 'i32_load16_s', shift: 1, t: T.i32 },
+};
+const HEAP_STORE = {
+  iastore: { op: 'i32_store', shift: 2, t: T.i32 },
+  lastore: { op: 'i64_store', shift: 3, t: T.i64 },
+  fastore: { op: 'f32_store', shift: 2, t: T.f32 },
+  dastore: { op: 'f64_store', shift: 3, t: T.f64 },
+  bastore: { op: 'i32_store8', shift: 0, t: T.i32 },
+  castore: { op: 'i32_store16', shift: 1, t: T.i32 },
+  sastore: { op: 'i32_store16', shift: 1, t: T.i32 },
+};
 const LCONST = { lconst_0: 0n, lconst_1: 1n };
 const FCONST = { fconst_0: 0, fconst_1: 1, fconst_2: 2 };
 const DCONST = { dconst_0: 0, dconst_1: 1 };
@@ -156,6 +177,15 @@ class StructuredWasmCompiler {
     addRuntimeImports(this, this.box);
     addArrayImports(this, this.method.name);
 
+    // Linear-heap array caches: per receiver SSA value, three locals holding
+    // the array's byte base (-1 = null or not heap-backed), length, and a
+    // filled flag. Base and length are immutable per array object, so these
+    // are never killed. Element access inlines to a bounds check + raw
+    // load/store when base >= 0, else takes the aget/aset import path.
+    this.heap = (process.env.JVM_WASM_HEAP_ARRAYS !== '0' && this.jvm.wasmHeap) || null;
+    this.arrayCaches = new Map();
+    this.usedHeap = false;
+
     // Field-value caches (ported from the dispatcher tier, SSA-keyed).
     // Instance caches key on the receiver's SSA value id: an SSA value is
     // immutable for the whole run, so — unlike the dispatcher's slot
@@ -252,6 +282,7 @@ class StructuredWasmCompiler {
       declared: this.declared,
       body,
       profilerName: wasmProfilerName(this.className, this.method),
+      importMemory: this.usedHeap,
     });
 
     const blockOfItem = new Map();
@@ -270,6 +301,7 @@ class StructuredWasmCompiler {
     }
     const env = {};
     this.importDecls.forEach((d, i) => { env[d.name] = this.importFns[i]; });
+    if (this.usedHeap) env.mem = this.heap.memory;
     // Deopt stubs exit mid-method needing a real frame, so modules that have
     // them must take the partial-callee protocol (and are never pinned).
     const normalFlowFullyCompiled = this.demoted.size === 0 && this.deoptBlocks.size === 0;
@@ -297,6 +329,7 @@ class StructuredWasmCompiler {
       specSites,
       specEpoch: this.jvm.classEpoch || 0,
       deoptStubCount: this.deoptBlocks.size,
+      arrayCacheCount: this.arrayCaches.size,
     };
   }
 
@@ -660,12 +693,20 @@ class StructuredWasmCompiler {
     // arrays
     if (ARRAY_LOAD[op] !== undefined) {
       const t = ARRAY_LOAD[op];
+      if (this.heap && HEAP_LOAD[op]) {
+        out.push(...this.heapAccessSeq(node, HEAP_LOAD[op], null, t));
+        return finish();
+      }
       out.push(...use(0), ...use(1), OP.call,
         ...uleb(this.importIndexByName.get(`aget_${sig(t)}`)));
       return finish();
     }
     if (ARRAY_STORE[op] !== undefined) {
       const t = ARRAY_STORE[op];
+      if (this.heap && HEAP_STORE[op]) {
+        out.push(...this.heapAccessSeq(node, HEAP_STORE[op], use(2), t));
+        return finish();
+      }
       out.push(...use(0), ...use(1), ...use(2), OP.call,
         ...uleb(this.importIndexByName.get(`aset_${sig(t)}`)));
       return finish();
@@ -739,6 +780,76 @@ class StructuredWasmCompiler {
     throw new Unsupported(`op ${op}`);
   }
 
+  // base/len/filled locals for the array behind an SSA value; never killed
+  // (array identity, base, and length are immutable for the whole run)
+  arrayCacheFor(arrValue) {
+    let entry = this.arrayCaches.get(arrValue.id);
+    if (!entry) {
+      const base = this.nextLocal++;
+      this.declared.push(T.i32);
+      const len = this.nextLocal++;
+      this.declared.push(T.i32);
+      const filled = this.nextLocal++;
+      this.declared.push(T.i32);
+      entry = { base, len, filled };
+      this.arrayCaches.set(arrValue.id, entry);
+    }
+    return entry;
+  }
+
+  heapImports() {
+    if (this.abaseIdx === undefined) {
+      this.abaseIdx = this.addImport('abase', [T.ref], [T.i32], (a) => (
+        a && a.wasmBase !== undefined ? a.wasmBase : -1));
+      this.alen0Idx = this.addImport('alen0', [T.ref], [T.i32], (a) => (
+        a === null || a === undefined ? 0 : a.length));
+      this.aioobIdx = this.addImport('err_aioob', [T.i32, T.i32], [], (i, len) => {
+        throw {
+          type: 'java/lang/ArrayIndexOutOfBoundsException',
+          message: `Index ${i} out of bounds for length ${len}`,
+        };
+      });
+    }
+  }
+
+  // Element access through the linear heap: fill the array's base/len cache
+  // on first touch, then `base >= 0` selects raw memory access (unsigned
+  // bounds check covers negative and past-end in one compare) over the
+  // aget/aset import fallback for null or non-heap arrays.
+  heapAccessSeq(node, acc, storeSeq, importT) {
+    this.heapImports();
+    this.usedHeap = true;
+    const c = this.arrayCacheFor(node.args[0]);
+    const arr = this.useOf(node.args[0]);
+    const idx = this.useOf(node.args[1]);
+    const addr = [
+      OP.local_get, ...uleb(c.base),
+      ...idx, ...(acc.shift ? [OP.i32_const, ...sleb(acc.shift), OP.i32_shl] : []),
+      OP.i32_add,
+    ];
+    const bounds = [
+      ...idx, OP.local_get, ...uleb(c.len), OP.i32_ge_u, OP.if, 0x40,
+      ...idx, OP.local_get, ...uleb(c.len), OP.call, ...uleb(this.aioobIdx), OP.end,
+    ];
+    const importCall = storeSeq
+      ? [...arr, ...idx, ...storeSeq, OP.call,
+        ...uleb(this.importIndexByName.get(`aset_${sig(importT)}`))]
+      : [...arr, ...idx, OP.call,
+        ...uleb(this.importIndexByName.get(`aget_${sig(importT)}`))];
+    const heapOp = [OP[acc.op], ...uleb(acc.shift), ...uleb(0)];
+    return [
+      // fill once per run: base (-1 for null/non-heap) and length
+      OP.local_get, ...uleb(c.filled), OP.i32_eqz, OP.if, 0x40,
+      ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(c.base),
+      ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(c.len),
+      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(c.filled), OP.end,
+      OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
+      OP.if, storeSeq ? 0x40 : acc.t,
+      ...bounds, ...addr, ...(storeSeq || []), ...heapOp,
+      OP.else, ...importCall, OP.end,
+    ];
+  }
+
   fieldCacheFor(cacheKey, t, killKey, kind, recvId) {
     let entry = this.fieldCaches.get(cacheKey);
     if (!entry) {
@@ -757,6 +868,8 @@ class StructuredWasmCompiler {
   // execution of the defining node (loop-carried receiver) never survives it.
   cacheKillsFor(id) {
     const seq = [];
+    const arr = this.arrayCaches.get(id);
+    if (arr) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(arr.filled));
     for (const e of this.fieldCaches.values()) {
       if (e.recvId === id) {
         seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filledLocal));

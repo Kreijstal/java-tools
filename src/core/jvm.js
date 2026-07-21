@@ -66,6 +66,11 @@ class JVM {
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
     const env = (typeof process !== 'undefined' && process.env) || {};
+    // Linear heap for primitive arrays: TypedArray views over one wasm
+    // memory, so compiled code can access elements without import crossings.
+    this.wasmHeap = env.JVM_WASM_HEAP === '1'
+      ? new (require('./wasmHeap').WasmHeap)(Number(env.JVM_WASM_HEAP_MB) || 256)
+      : null;
     this.clock = options.clock || createClock({
       fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
       fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,

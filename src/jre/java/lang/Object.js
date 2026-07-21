@@ -28,10 +28,17 @@ module.exports = {
     'clone()Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       // Handle array cloning
       if (obj.type && obj.type.startsWith('[')) {
-        const cloned = [...obj]; // Shallow copy of array elements
+        let cloned;
+        if (ArrayBuffer.isView(obj) && jvm.wasmHeap) {
+          // keep the clone heap-backed so compiled code stays on the fast path
+          cloned = jvm.wasmHeap.alloc(obj.type, obj.length);
+          cloned.set(obj);
+        } else {
+          cloned = [...obj]; // Shallow copy of array elements
+          cloned.length = obj.length;
+        }
         cloned.type = obj.type;
         cloned.elementType = obj.elementType;
-        cloned.length = obj.length;
         cloned.hashCode = jvm.nextHashCode++;
         return cloned;
       }
