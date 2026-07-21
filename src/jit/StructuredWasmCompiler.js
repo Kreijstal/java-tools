@@ -479,13 +479,21 @@ class StructuredWasmCompiler {
       if (!arg || arg === phi) continue;
       copies.push({ phi, arg, t });
     }
-    for (const { arg, t } of copies) {
+    for (const { phi, arg, t } of copies) {
       // An unkinded arg is a conflicted slot join that was never loaded on
       // this path: verified bytecode cannot observe a slot whose types
       // conflict at the join, so the value riding this edge is dead garbage
       // and a zero constant is equivalent (same rule as slotDefsIn spills).
       if (arg.op === 'undef' || KIND_T[arg.kind] === undefined) out.push(...zeroConst(t));
-      else out.push(OP.local_get, ...uleb(this.mustLocal(arg)));
+      else if (KIND_T[arg.kind] !== t) {
+        // A kinded arg of a different kind than the phi would emit a
+        // local.get/local.set wasm type mismatch (invalid module). Stack
+        // phis have no kind cross-check in buildSsa, so this is the last
+        // line of defense; reject with enough detail to chase the source.
+        throw new Unsupported(`phi arg kind mismatch: phi ${phi.kind} ` +
+          `${phi.origin && phi.origin.slot !== undefined ? `slot ${phi.origin.slot}` : `stack ${phi.origin ? phi.origin.stackDepth : '?'}`} ` +
+          `block ${phi.block} <- arg ${arg.op} kind ${arg.kind}`);
+      } else out.push(OP.local_get, ...uleb(this.mustLocal(arg)));
     }
     for (let i = copies.length - 1; i >= 0; i -= 1) {
       out.push(OP.local_set, ...uleb(this.mustLocal(copies[i].phi)));
