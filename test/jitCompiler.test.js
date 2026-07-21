@@ -5,6 +5,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { JVM } = require('../src/core/jvm');
 const { _test: wasmJitTest } = require('../src/jit/WasmJit');
+const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const awt = require('../src/platform/awt');
@@ -65,6 +66,81 @@ test('Wasm value imports preserve JavaScript boolean fields', (t) => {
     'true is imported as Java boolean 1');
   t.equal(wasmJitTest.toWasmValue(wasmJitTest.T.i32, false), 0,
     'false is imported as Java boolean 0');
+  t.end();
+});
+
+test('sampled generated-method timing attributes arbitrary method identities', (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, profileMethods: false, profileTimings: true,
+    methodTimingSampleRate: 1,
+  } });
+  const method = { name: 'renamedRegion', descriptor: '(I)V', attributes: [] };
+  const frame = new Frame(method);
+  frame.className = 'ArbitraryOwner';
+  const generated = () => ({ returned: true });
+  generated.jvmSynchronous = true;
+  jvm.jit.runGeneratedFrame(generated, frame, { status: 'runnable' }, false);
+  const timing = jvm.jit.methodTimingSamples.get('ArbitraryOwner.renamedRegion(I)V');
+  t.equal(timing?.samples, 1, 'sample is recorded without enabling method-count profiling');
+  t.equal(timing?.tier, 'generated-sync', 'sample retains its generated tier');
+  t.ok(timing?.totalMs >= 0, 'sample records monotonic elapsed time');
+  t.end();
+});
+
+test('exclusive region timing subtracts nested generated and fused time', (t) => {
+  const jvm = new JVM({ jit: { profileMethods: false } });
+  const jit = jvm.jit;
+  jit.exclusiveTimingsEnabled = true;
+  jit.exclusiveTimingRootKey = 'ArbitraryRoot.work()V';
+  const times = [0, 2, 5, 9];
+  jit.monotonicNow = () => times.shift();
+  t.equal(jit.beginExclusiveTiming('Unrelated.work()V', 'generated-sync'), null,
+    'root filter ignores unrelated outer regions');
+  const outer = jit.beginExclusiveTiming('ArbitraryRoot.work()V', 'generated-sync');
+  const child = jit.beginExclusiveTiming('RenamedChild.draw()V', 'fused-gradient');
+  jit.endExclusiveTiming(child);
+  jit.endExclusiveTiming(outer);
+  t.equal(jit.exclusiveTimingSamples.get('ArbitraryRoot.work()V').totalMs, 6,
+    'outer time excludes the nested interval');
+  t.equal(jit.exclusiveTimingSamples.get('RenamedChild.draw()V').totalMs, 3,
+    'nested region owns its complete interval');
+  t.equal([...jit.exclusiveTimingSamples.values()].reduce((sum, value) =>
+    sum + value.totalMs, 0), 9, 'exclusive totals do not overlap');
+  t.equal(jit.exclusiveTimingEdges.get(
+    'ArbitraryRoot.work()V\0RenamedChild.draw()V').totalMs, 3,
+  'parent-child edge records nested inclusive time');
+  t.end();
+});
+
+test('generated JIT supports generic long fixed-point multiply and shift helpers', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const instructions = [
+    'iload_0', 'i2l', 'iload_1', 'i2l', 'lmul', 'iload_2', 'lshr', 'l2i', 'ireturn',
+  ];
+  const method = {
+    name: 'arbitraryFixedPoint', descriptor: '(III)I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: `L${index}:`, instruction,
+      })),
+      localsSize: '3', stackSize: '3', exceptionTable: [],
+    } }],
+  };
+  t.ok(jvm.jit.isSupported(method) && jvm.jit.isCodegenSupported(method),
+    'long arithmetic capability is selected by opcode structure');
+  const generated = jvm.jit.getGeneratedFunction(method);
+  const frame = new Frame(method);
+  frame.className = 'RenamedFixedPointOwner';
+  frame.locals.splice(0, 3, 2147483647, -2147483648, 71);
+  const thread = { status: 'runnable', callStack: new Stack() };
+  const caller = new Frame({ name: 'caller', descriptor: '()V', attributes: [] });
+  thread.callStack.push(caller);
+  thread.callStack.push(frame);
+  const result = generated(frame, thread, jvm.jit, false);
+  const product = BigInt.asIntN(64, 2147483647n * -2147483648n);
+  const expected = Number(BigInt.asIntN(32, product >> 7n));
+  t.equal(result.value, expected,
+    'lmul, masked arithmetic lshr, and l2i preserve Java fixed-point semantics');
   t.end();
 });
 
@@ -159,6 +235,7 @@ test('structural primitive array-copy intrinsic preserves overlap semantics', (t
 
   method.name = 'copy';
   method.descriptor = '([II[III)V';
+  method.flags = ['static'];
   jvm.classes.Copies = {
     ast: { classes: [{ superClassName: null, items: [{ type: 'method', method }] }] },
   };
@@ -179,6 +256,156 @@ test('structural primitive array-copy intrinsic preserves overlap semantics', (t
   jvm.jit.tryInvokeSyncAt(siteId, frame, {});
   t.deepEqual(fastDestination, [4, 4, 5], 'direct intrinsic call site preserves overlap');
   t.equal(frame.stack.items.length, 0, 'direct intrinsic consumes its arguments');
+
+  jvm.jit.structuredSsa.enabled = true;
+  const callerInstructions = [
+    'iconst_0', 'istore', 'iload', 'iconst_1', { op: 'if_icmpge', arg: 'Lreturn' },
+    'aload_0', 'iload_1', 'aload_2', 'iload_3', 'iload',
+    { op: 'invokestatic', arg: ['Method', 'Copies', ['copy', '([II[III)V']] },
+    { op: 'iinc', varnum: 5, incr: 1 }, { op: 'goto', arg: 'Lloop' }, 'return',
+  ];
+  callerInstructions[1] = { op: 'istore', arg: 5 };
+  callerInstructions[2] = { op: 'iload', arg: 5 };
+  callerInstructions[9] = { op: 'iload', arg: 4 };
+  const caller = {
+    name: 'arbitraryCopyLoop', descriptor: '([II[III)V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: callerInstructions.map((instruction, index) => ({
+        labelDef: index === 2 ? 'Lloop:' : index === 13 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '6', stackSize: '5', exceptionTable: [],
+    } }],
+  };
+  const directGenerated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(directGenerated?.jvmStructuredSsa,
+    'loop caller with a verified copy shape selects structured SSA');
+  t.ok(directGenerated.jvmStructuredSource.includes('primitiveArrayCopyDirect') &&
+      !directGenerated.jvmStructuredSource.includes('tryInvokeSyncAt'),
+    'verified copy intrinsic is emitted positionally without generic dispatch');
+
+  const directSource = [9, 8, 7, 6];
+  const directDestination = [0, 0, 0, 0];
+  const directFrame = new Frame(caller);
+  directFrame.locals.splice(0, 5, directSource, 1, directDestination, 0, 3);
+  const directThread = { status: 'runnable', callStack: new Stack() };
+  directThread.callStack.push(directFrame);
+  directGenerated(directFrame, directThread, jvm.jit, false);
+  t.deepEqual(directDestination, [8, 7, 6, 0],
+    'positionally emitted copy preserves distinct-array results');
+
+  const throwingFrame = new Frame(caller);
+  throwingFrame.locals.splice(0, 5, null, 0, directDestination, 0, 1);
+  directThread.callStack.push(throwingFrame);
+  let directThrown;
+  try {
+    directGenerated(throwingFrame, directThread, jvm.jit, false);
+  } catch (error) {
+    directThrown = error;
+  }
+  t.equal(directThrown?.type, 'java/lang/NullPointerException',
+    'positionally emitted copy preserves the JVM null exception');
+  t.equal(throwingFrame.pc, 10, 'direct intrinsic exception records the invoke PC');
+  t.deepEqual(throwingFrame.stack.items, [null, 0, directDestination, 0, 1],
+    'direct intrinsic exception reconstructs call operands in JVM order');
+  directThread.callStack.pop();
+  t.end();
+});
+
+test('structured SSA emits verified clipped static spans without call dispatch', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, structuredSsa: true } });
+  const field = (name, descriptor = 'I') => [null, 'SpanShape', [name, descriptor]];
+  const top = field('top'), bottom = field('bottom'), left = field('left');
+  const right = field('right'), width = field('width'), pixelsField = field('pixels', '[I');
+  const spanOps = [
+    'iload_1', ['getstatic', top], 'if_icmplt', 'iload_1', ['getstatic', bottom],
+    'if_icmplt', 'return', 'iload_0', ['getstatic', left], 'if_icmpge', 'iload_2',
+    ['getstatic', left], 'iload_0', 'isub', 'isub', 'istore_2', ['getstatic', left],
+    'istore_0', 'iload_0', 'iload_2', 'iadd', ['getstatic', right], 'if_icmple',
+    ['getstatic', right], 'iload_0', 'isub', 'istore_2', 'iload_0', 'iload_1',
+    ['getstatic', width], 'imul', 'iadd', ['istore', 4], 'iconst_0', ['istore', 5],
+    ['iload', 5], 'iload_2', 'if_icmpge', ['getstatic', pixelsField], ['iload', 4],
+    ['iload', 5], 'iadd', 'iload_3', 'iastore', 'iinc', 'goto', 'return',
+  ];
+  const spanMethod = {
+    name: 'arbitrarySpan', descriptor: '(IIII)V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: spanOps.map((entry) => ({
+        instruction: Array.isArray(entry) ? { op: entry[0], arg: entry[1] } : entry,
+      })),
+    } }],
+  };
+  const call = { op: 'invokestatic',
+    arg: ['Method', 'SpanShape', ['arbitrarySpan', '(IIII)V']] };
+  const callerInstructions = [
+    'iconst_0', { op: 'istore', arg: 4 }, { op: 'iload', arg: 4 }, 'iconst_1',
+    { op: 'if_icmpge', arg: 'Lreturn' }, 'iload_0', 'iload_1', 'iload_2', 'iload_3',
+    call, { op: 'iinc', varnum: 4, incr: 1 }, { op: 'goto', arg: 'Lloop' }, 'return',
+  ];
+  const caller = {
+    name: 'arbitrarySpanLoop', descriptor: '(IIII)V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: callerInstructions.map((instruction, index) => ({
+        labelDef: index === 2 ? 'Lloop:' : index === 12 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '5', stackSize: '4', exceptionTable: [],
+    } }],
+  };
+  const pixels = new Array(32).fill(0);
+  jvm.classes.SpanShape = {
+    staticFields: new Map([
+      ['top:I', 0], ['bottom:I', 4], ['left:I', 0], ['right:I', 8], ['width:I', 8],
+      ['pixels:[I', pixels],
+    ]),
+    ast: { classes: [{ superClassName: null,
+      items: [{ type: 'method', method: spanMethod }, { type: 'method', method: caller }] }] },
+  };
+  jvm.classInitializationState.set('SpanShape', 'INITIALIZED');
+
+  const intrinsic = jvm.jit.getSynchronousIntrinsic(spanMethod, '(IIII)V');
+  t.equal(intrinsic?.jvmDirectKind, 'clippedStaticSpan',
+    'descriptor, bytecodes, and repeated field identities recognize an arbitrary method name');
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(generated?.jvmStructuredSsa, 'verified span caller selects structured SSA');
+  t.ok(generated.jvmStructuredSource.includes('clippedStaticSpanDirectAt') &&
+      !generated.jvmStructuredSource.includes('tryInvokeSyncAt'),
+    'verified span is emitted positionally without generic call dispatch');
+
+  const thread = { status: 'runnable', callStack: new Stack() };
+  const frame = new Frame(caller);
+  frame.locals.splice(0, 4, -1, 1, 4, 0x123456);
+  thread.callStack.push(frame);
+  generated(frame, thread, jvm.jit, false);
+  t.deepEqual(pixels.slice(8, 16), [0x123456, 0x123456, 0x123456, 0, 0, 0, 0, 0],
+    'direct span preserves clipping and pixel writes');
+
+  jvm.classes.SpanShape.staticFields.set('pixels:[I', null);
+  const throwingFrame = new Frame(caller);
+  throwingFrame.locals.splice(0, 4, 0, 1, 1, 7);
+  thread.callStack.push(throwingFrame);
+  let thrown;
+  try { generated(throwingFrame, thread, jvm.jit, false); } catch (error) { thrown = error; }
+  t.equal(thrown?.type, 'java/lang/NullPointerException',
+    'direct span preserves the JVM null exception');
+  t.equal(throwingFrame.pc, 9, 'direct span exception records the exact invoke PC');
+  t.deepEqual(throwingFrame.stack.items, [0, 1, 1, 7],
+    'direct span reconstructs call operands in JVM order');
+  thread.callStack.pop();
+
+  const untouched = new Array(32).fill(0);
+  jvm.classes.SpanShape.staticFields.set('pixels:[I', untouched);
+  jvm.classInitializationState.set('SpanShape', 'UNINITIALIZED');
+  const guardedFrame = new Frame(caller);
+  guardedFrame.locals.splice(0, 4, 0, 1, 1, 9);
+  thread.callStack.push(guardedFrame);
+  const guarded = generated(guardedFrame, thread, jvm.jit, false);
+  t.ok(guarded?.deopt, 'runtime class-initialization guard falls back');
+  t.equal(guardedFrame.pc, 9, 'guard falls back at the unexecuted call');
+  t.deepEqual(guardedFrame.stack.items, [0, 1, 1, 9],
+    'guard reconstructs the unconsumed call operands');
+  t.ok(untouched.every((value) => value === 0), 'guard runs before span side effects');
+  thread.callStack.pop();
   t.end();
 });
 
@@ -326,6 +553,802 @@ test('stackless integer raster preserves operands across chained branches', (t) 
     'second branch sees the two values preserved by the first branch');
   t.equal(run(10, 5, 0), 0, 'comparison false path remains correct');
   t.equal(run(5, 10, 1), 2, 'first branch target retains and discards both values');
+  t.end();
+});
+
+function scalarIntegerLoopMethod(name = 'nameDoesNotMatter', exceptionTable = []) {
+  const instructions = [
+    'iconst_0', 'istore_2', 'iload_2', 'iload_0',
+    { op: 'if_icmpge', arg: 'Lreturn' },
+    'iload_1', 'iload_2', 'iadd', 'istore_1',
+    { op: 'iinc', varnum: 2, incr: 1 },
+    { op: 'goto', arg: 'Lloop' }, 'iload_1', 'ireturn',
+  ];
+  return {
+    name, descriptor: '(II)I', flags: ['public', 'static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 2 ? 'Lloop:' : index === 11 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '3', stackSize: '2', exceptionTable,
+    } }],
+  };
+}
+
+test('scalar integer loops are selected by verified structure and spill at safe points', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  // Force the "yield due" side of the safe-point policy so the spill path is
+  // exercised deterministically; quantum continuation has its own test.
+  jvm._nextEventLoopYieldAt = 0;
+  const method = scalarIntegerLoopMethod('arbitraryObfuscatedName');
+  const generated = jvm.jit.compileScalarIntegerLoop(method);
+  t.ok(generated && generated.jvmScalarLoop,
+    'a handler-free integer backedge selects scalar code generation');
+
+  const frame = new Frame(method);
+  frame.className = 'ShapeOwner';
+  frame.locals[0] = 10001;
+  frame.locals[1] = 7;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const thread = { status: 'runnable', callStack };
+  const safePoint = generated(frame, thread, jvm.jit, false);
+  t.ok(safePoint.deopt && safePoint.transient,
+    'the generated loop exits transiently at its bounded backedge safe point');
+  t.equal(frame.pc, 2, 'safe point records the exact loop-header PC');
+  t.equal(frame.locals[2], 10000, 'scalar induction variable is materialized');
+  t.equal(frame.locals[1], 49995007, 'scalar accumulator is materialized');
+  t.deepEqual(frame.stack.items, [], 'operand stack is materialized at the empty join');
+  t.equal(jvm.jit.scalarLoopSafePointCount, 1, 'safe-point exit is counted');
+
+  delete frame.jitSkipOnce;
+  const completed = generated(frame, thread, jvm.jit, false);
+  t.ok(completed.returned, 'materialized loop state resumes and completes');
+  t.equal(completed.value, 50005007, 'resumed scalar result matches Java integer arithmetic');
+  t.equal(jvm.jit.scalarLoopRunCount, 2, 'both scalar entries are counted');
+
+  const renamed = scalarIntegerLoopMethod('totallyDifferentName');
+  t.ok(jvm.jit.compileScalarIntegerLoop(renamed)?.jvmScalarLoop,
+    'renaming the same bytecode shape does not affect selection');
+  const guarded = scalarIntegerLoopMethod('guarded', [{ handlerLbl: 'Lreturn' }]);
+  t.equal(jvm.jit.compileScalarIntegerLoop(guarded), null,
+    'an exception table rejects the scalar tier');
+  const disabled = new JVM({ jit: { scalarLoops: false, profileMethods: false } });
+  t.equal(disabled.jit.compileScalarIntegerLoop(method), null,
+    'the scalar tier can be disabled for differential measurement');
+  t.end();
+});
+
+test('safe points continue the quantum when the scheduler has nothing due', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  jvm._nextEventLoopYieldAt = Date.now() + 60000;
+  const method = scalarIntegerLoopMethod('arbitraryObfuscatedName');
+  const generated = jvm.jit.compileScalarIntegerLoop(method);
+
+  const run = (thread) => {
+    const frame = new Frame(method);
+    frame.locals[0] = 25001;
+    frame.locals[1] = 7;
+    thread.callStack.push(frame);
+    return { result: generated(frame, thread, jvm.jit, false), frame };
+  };
+
+  const soloStack = new Stack();
+  const solo = run({ status: 'runnable', callStack: soloStack });
+  t.ok(solo.result.returned, 'a solo runnable thread runs past the budget boundary');
+  t.equal(solo.result.value, (25000 * 25001) / 2 + 7 | 0,
+    'the continued quantum preserves Java integer arithmetic');
+  t.equal(jvm.jit.scalarLoopSafePointCount, 0, 'no safe-point exit was recorded');
+
+  jvm.threads.push({ status: 'runnable' });
+  const contendedStack = new Stack();
+  const contended = run({ status: 'runnable', callStack: contendedStack });
+  t.ok(contended.result.deopt && contended.result.transient,
+    'a second runnable thread forces the safe-point exit');
+  t.equal(jvm.jit.scalarLoopSafePointCount, 1, 'the contended safe point is counted');
+  jvm.threads.pop();
+
+  jvm.threads.push({ status: 'SLEEPING', sleepUntil: Date.now() - 1 });
+  const timerStack = new Stack();
+  const timed = run({ status: 'runnable', callStack: timerStack });
+  t.ok(timed.result.deopt && timed.result.transient,
+    'an expired sleep deadline forces the safe-point exit');
+  jvm.threads.pop();
+
+  jvm._nextEventLoopYieldAt = 0;
+  const dueStack = new Stack();
+  const due = run({ status: 'runnable', callStack: dueStack });
+  t.ok(due.result.deopt && due.result.transient,
+    'an expired event-loop yield deadline forces the safe-point exit');
+  t.end();
+});
+
+test('scalar loop debugger entry guard falls back before side effects', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const method = scalarIntegerLoopMethod();
+  const generated = jvm.jit.compileScalarIntegerLoop(method);
+  const frame = new Frame(method);
+  frame.locals[0] = 20;
+  frame.locals[1] = 9;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const result = generated(frame, { status: 'runnable', callStack }, jvm.jit, true);
+  t.ok(result.deopt && result.transient, 'debug entry takes the existing execution path');
+  t.equal(frame.pc, 0, 'debug fallback leaves the bytecode PC unchanged');
+  t.equal(frame.locals[1], 9, 'debug fallback leaves locals unchanged');
+  t.equal(jvm.jit.scalarLoopRunCount, 0, 'guard runs before the scalar-loop side effect counter');
+  t.end();
+});
+
+function structuredSsaJoinMethod() {
+  const instructions = [
+    { op: 'bipush', arg: '5' }, 'iconst_0', 'istore_1', 'iload_1', 'iload_0',
+    { op: 'if_icmpge', arg: 'Lreturn' },
+    'iload_1', 'iadd', { op: 'iinc', varnum: 1, incr: 1 },
+    { op: 'goto', arg: 'Lloop' }, 'ireturn',
+  ];
+  return {
+    name: 'operandJoin', descriptor: '(I)I', flags: ['public', 'static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 3 ? 'Lloop:' : index === 10 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '2', stackSize: '3', exceptionTable: [],
+    } }],
+  };
+}
+
+test('structured JVM SSA feeds operand values across block joins', (t) => {
+  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const method = structuredSsaJoinMethod();
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa, 'verified reducible loop selects the structured SSA renderer');
+  t.ok(generated.jvmStructuredSource.includes('while (true)') &&
+      !generated.jvmStructuredSource.includes('switch (pc)'),
+    'renderer emits lexical JavaScript control flow instead of a bytecode dispatcher');
+  t.ok(/ssaStack\d+_0 = ssaValue\d+/.test(generated.jvmStructuredSource),
+    'predecessor edge explicitly feeds its operand value into the successor join');
+
+  const frame = new Frame(method);
+  frame.locals[0] = 10;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const result = generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
+  t.deepEqual(result, { returned: true, value: 50 }, 'loop result preserves the live operand phi value');
+  t.equal(jvm.jit.structuredSsa.runCount, 1, 'successful structured entries are counted');
+  t.equal(callStack.size(), 0, 'normal return removes the generated frame');
+
+  const combined = new JVM({ jit: { rendererPipeline: true, profileMethods: false } });
+  t.ok(combined.jit.scalarGuestBodiesEnabled && combined.jit.fusedRegions.enabled &&
+      combined.jit.structuredSsa.enabled,
+    'one renderer-pipeline option composes guest scalarization, fusion, and structured SSA');
+  t.end();
+});
+
+test('structured JVM SSA splits bounded irreducible integer regions without name gates', (t) => {
+  const instructions = [
+    'iload_0', { op: 'ifne', arg: 'Lsecondary' },
+    { op: 'iinc', varnum: 1, incr: 1 }, 'iload_1', 'iload_2',
+    { op: 'if_icmpge', arg: 'Lreturn' }, { op: 'goto', arg: 'Lsecondary' },
+    { op: 'iinc', varnum: 1, incr: 2 }, 'iload_1', 'iload_2',
+    { op: 'if_icmpge', arg: 'Lreturn' }, { op: 'goto', arg: 'Lprimary' },
+    'return',
+  ];
+  const method = {
+    name: 'arbitraryMultiEntryBody', descriptor: '(III)V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 2 ? 'Lprimary:' : index === 7 ? 'Lsecondary:'
+          : index === 12 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '3', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  const island = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  const islandGenerated = island.jit.structuredSsa.compile(method);
+  t.ok(islandGenerated?.jvmStructuredDispatchIslands === 1 &&
+      islandGenerated.jvmStructuredSplitBlocks === 0,
+    'dispatch islands make the multi-entry CFG reducible by default without cloning');
+  t.equal(island.jit.structuredSsa.dispatchIslandMethodCount, 1,
+    'the island compilation is counted');
+  const jvm = new JVM({ jit: { structuredSsa: true, structuredDispatchIslands: false,
+    structuredIrreducibleSplitting: true, profileMethods: false } });
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa, 'controlled splitting makes the multi-entry CFG reducible');
+  t.ok(generated.jvmStructuredSplitBlocks > 0 &&
+      !generated.jvmStructuredSource.includes('switch (pc)'),
+    'split remains bounded and emits lexical JavaScript control flow');
+  t.equal(jvm.jit.structuredSsa.splitMethodCount, 1,
+    'the structurally split compilation is counted');
+  t.equal(jvm.jit.structuredSsa.splitBlockCount, generated.jvmStructuredSplitBlocks,
+    'the bounded cloned-block count is exposed');
+
+  for (const [entry, expected] of [[0, 6], [1, 5]]) {
+    const frame = new Frame(method);
+    frame.locals[0] = entry;
+    frame.locals[1] = 0;
+    frame.locals[2] = 5;
+    const callStack = new Stack();
+    callStack.push(frame);
+    const result = generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
+    t.deepEqual(result, { returned: true, value: jvm.jit.returnVoid() },
+      `entry ${entry} returns through the cloned CFG`);
+    t.equal(frame.locals[1], expected, `entry ${entry} preserves local updates`);
+
+    const islandFrame = new Frame(method);
+    islandFrame.locals[0] = entry;
+    islandFrame.locals[1] = 0;
+    islandFrame.locals[2] = 5;
+    const islandStack = new Stack();
+    islandStack.push(islandFrame);
+    const islandResult = islandGenerated(
+      islandFrame, { status: 'runnable', callStack: islandStack }, island.jit, false);
+    t.deepEqual(islandResult, { returned: true, value: island.jit.returnVoid() },
+      `entry ${entry} returns through the dispatch island`);
+    t.equal(islandFrame.locals[1], expected, `entry ${entry} matches the cloned CFG result`);
+  }
+  t.end();
+});
+
+test('structured JVM SSA recognizes bundled irreducibility errors structurally', (t) => {
+  const bundledError = new Error('irreducible from another module instance');
+  bundledError.name = 'IrreducibleError';
+  bundledError.edges = ['7->3'];
+  t.ok(structuredRendererTest.isIrreducibleError(bundledError),
+    'constructor identity is not required across bundles or realms');
+  bundledError.edges = null;
+  t.notOk(structuredRendererTest.isIrreducibleError(bundledError),
+    'an ordinary renamed error without verified edges is rejected');
+  t.end();
+});
+
+test('structured JVM SSA materializes operand joins at safe points and guards debug entry', (t) => {
+  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  // Force the "yield due" side of the safe-point policy so the spill path is
+  // exercised deterministically; quantum continuation has its own test.
+  jvm._nextEventLoopYieldAt = 0;
+  const method = structuredSsaJoinMethod();
+  const generated = jvm.jit.structuredSsa.compile(method);
+
+  const guarded = new Frame(method);
+  guarded.locals[0] = 4;
+  const guardedStack = new Stack();
+  guardedStack.push(guarded);
+  const fallback = generated(guarded, { status: 'runnable', callStack: guardedStack }, jvm.jit, true);
+  t.ok(fallback.deopt && fallback.transient, 'debug mode uses the existing execution path');
+  t.equal(guarded.pc, 0, 'debug guard leaves the bytecode PC unchanged');
+  t.deepEqual(guarded.stack.items, [], 'debug guard runs before operand-stack changes');
+  t.equal(jvm.jit.structuredSsa.runCount, 0, 'debug guard runs before SSA counters');
+
+  const frame = new Frame(method);
+  frame.locals[0] = 10001;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const safePoint = generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
+  t.ok(safePoint.deopt && safePoint.transient, 'bounded loop execution reaches a scheduler safe point');
+  t.equal(frame.pc, 3, 'safe point records the loop-header bytecode PC');
+  t.equal(frame.locals[1], 9999, 'safe point spills the scalar induction local');
+  t.deepEqual(frame.stack.items, [5 + (9998 * 9999) / 2],
+    'safe point reconstructs the live operand value at the block join');
+  t.equal(jvm.jit.structuredSsa.safePointCount, 1, 'materialized SSA safe point is counted');
+  t.end();
+});
+
+test('scalar loop arithmetic exceptions materialize precise frame state', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, profileMethods: false } });
+  const instructions = [
+    'iconst_0', 'istore_2', 'iload_2', 'iload_0',
+    { op: 'if_icmpge', arg: 'Lreturn' },
+    'iload_1', 'iload_2', 'idiv', 'istore_1',
+    { op: 'iinc', varnum: 2, incr: 1 }, { op: 'goto', arg: 'Lloop' },
+    'iload_1', 'ireturn',
+  ];
+  const method = {
+    name: 'divisionShape', descriptor: '(II)I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 2 ? 'Lloop:' : index === 11 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '3', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  const generated = jvm.jit.compileScalarIntegerLoop(method);
+  t.ok(generated?.jvmScalarLoop, 'division loop remains structurally scalarizable');
+  const frame = new Frame(method);
+  frame.locals[0] = 1;
+  frame.locals[1] = 12;
+  const callStack = new Stack();
+  callStack.push(frame);
+  let thrown;
+  try {
+    generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
+  } catch (error) {
+    thrown = error;
+  }
+  t.equal(thrown?.type, 'java/lang/ArithmeticException', 'division by zero throws Java arithmetic exception');
+  t.equal(frame.pc, 7, 'throwing bytecode PC is precise');
+  t.deepEqual(frame.stack.items, [12, 0], 'throwing operands are reconstructed in JVM order');
+  t.equal(frame.locals[2], 0, 'scalar locals are reconstructed before throwing');
+  t.end();
+});
+
+test('scalar feature loops preserve arrays, fields, calls, and reporter handlers', async (t) => {
+  const classpath = compileJavaFixture(t, 'ScalarFeatureHarness', `
+public class ScalarFeatureHarness {
+  static int staticBias = 3;
+  static class Box { int[] values; int bias; volatile int changing; }
+  static void record(int[] out, int index, int value) { out[index] = value; }
+  static int adjust(int value) { return value * 3 + 1; }
+  static int branchedAdjust(int value, int threshold) {
+    int mixed = (value ^ (value >>> 16)) + 13;
+    if (mixed < threshold) mixed = threshold - mixed;
+    return (mixed & 255) * 65793;
+  }
+  static void inlineInto(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = adjust(i);
+  }
+  static void inlineBranchInto(int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = branchedAdjust(i - 20, 7);
+  }
+  static void clearPostIncrement(int[] out) {
+    int index = 0;
+    while (index < out.length) out[index++] = 0;
+  }
+  static void repeatedReads(Box box, int[] out) {
+    for (int i = 0; i < out.length; i++) {
+      out[i] = box.bias + box.bias + box.values.length + box.values.length;
+    }
+  }
+  static void volatileReads(Box box, int[] out) {
+    for (int i = 0; i < out.length; i++) out[i] = box.changing + box.changing;
+  }
+  public static void compute(Box box, int rounds, int[] out) {
+    try {
+      int sum = 0;
+      for (int i = 0; i < rounds; i++) {
+        int[] values = box.values;
+        sum += values[i % values.length] + box.bias + staticBias;
+        record(out, i, sum);
+      }
+      out[rounds] = sum;
+    } catch (RuntimeException error) {
+      throw error;
+    }
+  }
+}
+`);
+
+  async function run(scalarLoops, scalarGuestBodies = scalarLoops,
+      scalarSsaOptimizations = true, wrappedValues = false, structuredSsa = false) {
+    const jvm = new JVM({ classpath, jit: {
+      warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false, scalarLoops,
+      scalarGuestBodies, scalarSsaOptimizations, structuredSsa,
+    } });
+    for (const className of ['ScalarFeatureHarness', 'ScalarFeatureHarness$Box']) {
+      const classData = await jvm.loadClassByName(className);
+      jvm.classInitializationState.set(className, 'INITIALIZED');
+      if (!classData.staticFields) classData.staticFields = new Map();
+    }
+    jvm.classes.ScalarFeatureHarness.staticFields.set('staticBias:I', 3);
+    const thread = {
+      id: 0, name: `scalar-features-${scalarLoops}`, callStack: new Stack(),
+      status: 'runnable', pendingException: null,
+    };
+    jvm.threads = [thread];
+    jvm.currentThreadIndex = 0;
+    const rawValues = [2, 4];
+    rawValues.type = '[I';
+    const values = wrappedValues
+      ? { type: '[I', elements: rawValues, length: rawValues.length }
+      : rawValues;
+    const box = { type: 'ScalarFeatureHarness$Box', fields: {
+      'ScalarFeatureHarness$Box.values': values,
+      'ScalarFeatureHarness$Box.bias': 8,
+      'ScalarFeatureHarness$Box.changing': 6,
+    } };
+    const out = [0, 0, 0, 0];
+    out.type = '[I';
+    await invoke(jvm, thread, 'ScalarFeatureHarness', 'compute',
+      '(LScalarFeatureHarness$Box;I[I)V', [box, 3, out]);
+    const postIncrement = [9, 8, 7, 6];
+    postIncrement.type = '[I';
+    await invoke(jvm, thread, 'ScalarFeatureHarness', 'clearPostIncrement',
+      '([I)V', [postIncrement]);
+    const repeated = [0, 0];
+    repeated.type = '[I';
+    await invoke(jvm, thread, 'ScalarFeatureHarness', 'repeatedReads',
+      '(LScalarFeatureHarness$Box;[I)V', [box, repeated]);
+    const volatileOut = [0, 0];
+    volatileOut.type = '[I';
+    await invoke(jvm, thread, 'ScalarFeatureHarness', 'volatileReads',
+      '(LScalarFeatureHarness$Box;[I)V', [box, volatileOut]);
+    const inlineOut = [0, 0, 0, 0];
+    inlineOut.type = '[I';
+    await invoke(jvm, thread, 'ScalarFeatureHarness', 'inlineInto', '([I)V', [inlineOut]);
+    const inlineBranchOut = new Array(32).fill(0);
+    inlineBranchOut.type = '[I';
+    await invoke(jvm, thread, 'ScalarFeatureHarness', 'inlineBranchInto', '([I)V',
+      [inlineBranchOut]);
+    const method = await jvm.findMethodInHierarchy('ScalarFeatureHarness', 'compute',
+      '(LScalarFeatureHarness$Box;I[I)V');
+    const clearMethod = await jvm.findMethodInHierarchy('ScalarFeatureHarness',
+      'clearPostIncrement', '([I)V');
+    const repeatedMethod = await jvm.findMethodInHierarchy('ScalarFeatureHarness',
+      'repeatedReads', '(LScalarFeatureHarness$Box;[I)V');
+    const volatileMethod = await jvm.findMethodInHierarchy('ScalarFeatureHarness',
+      'volatileReads', '(LScalarFeatureHarness$Box;[I)V');
+    const inlineMethod = await jvm.findMethodInHierarchy('ScalarFeatureHarness',
+      'inlineInto', '([I)V');
+    const inlineBranchMethod = await jvm.findMethodInHierarchy('ScalarFeatureHarness',
+      'inlineBranchInto', '([I)V');
+    return {
+      jvm, thread, method, generated: jvm.jit.codegenCache.get(method), box, out,
+      postIncrement, clearGenerated: jvm.jit.codegenCache.get(clearMethod),
+      repeated, repeatedGenerated: jvm.jit.codegenCache.get(repeatedMethod),
+      volatileOut, volatileGenerated: jvm.jit.codegenCache.get(volatileMethod),
+      inlineOut, inlineGenerated: jvm.jit.codegenCache.get(inlineMethod),
+      inlineBranchOut, inlineBranchGenerated: jvm.jit.codegenCache.get(inlineBranchMethod),
+    };
+  }
+
+  const baseline = await run(false);
+  const scalar = await run(true);
+  const scalarWithoutSsa = await run(true, true, false);
+  const wrappedScalar = await run(true, true, true, true);
+  const defaultTier = await run(true, false);
+  const structured = await run(false, false, false, false, true);
+  t.deepEqual(scalar.out, baseline.out, 'scalar region matches baseline array mutations');
+  t.deepEqual(scalar.out.slice(), [13, 28, 41, 41],
+    'instance/static fields and synchronous record calls preserve results');
+  t.ok(scalar.generated?.jvmScalarLoop,
+    'array/field loop with a bare reporter handler selects scalar generation');
+  t.deepEqual(scalar.postIncrement, baseline.postIncrement,
+    'iload snapshots its operand before a following iinc');
+  t.deepEqual(scalar.postIncrement.slice(), [0, 0, 0, 0],
+    'post-increment array stores preserve every destination index');
+  t.ok(scalar.clearGenerated?.jvmScalarLoop,
+    'post-increment array stores stay in scalar generation');
+  t.deepEqual(scalar.out, scalarWithoutSsa.out,
+    'SSA-style scalar optimizations preserve the non-optimized result');
+  t.deepEqual(wrappedScalar.out, scalar.out,
+    'cached raw array views preserve wrapped-array reads');
+  t.deepEqual(scalar.repeated.slice(), [20, 20],
+    'repeated field and length reads preserve their values');
+  t.ok(scalar.repeatedGenerated?.jvmScalarEliminatedReadCount >= 2,
+    'local value numbering removes redundant field and array-length reads');
+  t.deepEqual(scalar.volatileOut.slice(), [12, 12],
+    'volatile field reads preserve their values');
+  t.equal((scalar.volatileGenerated?.toString().match(/helpers\.getFieldAt/g) || []).length, 4,
+    'both volatile field reads remain in the generated body');
+  t.ok(scalar.generated?.jvmScalarArrayViewCount > 0,
+    'scalar array operations use cached raw-storage companions');
+  t.ok(scalar.generated?.jvmScalarThreadedEdgeCount > 0,
+    'verified fall-through edges are threaded without redispatch');
+  t.notOk(scalarWithoutSsa.generated?.jvmScalarSsa,
+    'the SSA-style pass can be disabled for differential measurement');
+  t.notOk(defaultTier.generated?.jvmScalarLoop,
+    'array/field/call guest bodies remain opt-in after performance acceptance fails');
+  t.deepEqual(structured.out, baseline.out,
+    'structured SSA preserves array, field, remainder, and static-call effects');
+  t.ok(structured.generated?.jvmStructuredSsa,
+    'array/field/call loop selects structured SSA without method-name recognition');
+  t.deepEqual(structured.inlineOut, baseline.inlineOut,
+    'structured SSA preserves a loop with an inlined integer leaf');
+  t.notOk(structured.inlineGenerated.jvmStructuredSource.includes('tryInvokeSyncAt'),
+    'verified integer leaf is emitted directly without generic call dispatch');
+  t.deepEqual(structured.inlineBranchOut, baseline.inlineBranchOut,
+    'forward-branching integer leaf preserves baseline results');
+  t.notOk(structured.inlineBranchGenerated.jvmStructuredSource.includes('tryInvokeSyncAt'),
+    'verified forward-branching integer leaf is emitted without generic call dispatch');
+
+  const nullBox = { type: 'ScalarFeatureHarness$Box', fields: {
+    'ScalarFeatureHarness$Box.values': null,
+    'ScalarFeatureHarness$Box.bias': 8,
+  } };
+  const frame = new Frame(scalar.method);
+  frame.className = 'ScalarFeatureHarness';
+  frame.locals[0] = nullBox;
+  frame.locals[1] = 1;
+  frame.locals[2] = [0, 0];
+  scalar.thread.callStack.push(frame);
+  let thrown;
+  try {
+    scalar.generated(frame, scalar.thread, scalar.jvm.jit, false);
+  } catch (error) {
+    thrown = error;
+  }
+  const arrayLengthPc = frame.instructions.findIndex((item) =>
+    (typeof item.instruction === 'string' ? item.instruction : item.instruction?.op) === 'arraylength');
+  t.equal(thrown?.type, 'java/lang/NullPointerException', 'null array raises the JVM exception');
+  t.equal(frame.pc, arrayLengthPc, 'null array records the exact throwing PC');
+  t.deepEqual(frame.stack.items, [0, null, 0, null], 'the complete JVM operand stack is reconstructed');
+  scalar.thread.callStack.pop();
+
+  const structuredFrame = new Frame(structured.method);
+  structuredFrame.className = 'ScalarFeatureHarness';
+  structuredFrame.locals[0] = nullBox;
+  structuredFrame.locals[1] = 1;
+  structuredFrame.locals[2] = [0, 0];
+  structured.thread.callStack.push(structuredFrame);
+  let structuredThrown;
+  try {
+    structured.generated(structuredFrame, structured.thread, structured.jvm.jit, false);
+  } catch (error) {
+    structuredThrown = error;
+  }
+  t.equal(structuredThrown?.type, 'java/lang/NullPointerException',
+    'structured SSA preserves the JVM null exception');
+  t.equal(structuredFrame.pc, arrayLengthPc,
+    'structured SSA records the exact throwing bytecode PC');
+  t.deepEqual(structuredFrame.stack.items, [0, null, 0, null],
+    'structured SSA reconstructs throwing operands in JVM order');
+  structured.thread.callStack.pop();
+  t.end();
+});
+
+// Doubles and putfield in a verified loop: the structured tier must produce
+// the same result and heap effect as the baseline generated tier.
+test('structured JVM SSA covers double arithmetic and putfield', (t) => {
+  // Instance (I)I layout: locals[0]=this, locals[1]=n, locals[2]=i,
+  // locals[3]=acc (double).
+  const instructions = [
+    'iconst_0', 'istore_2', 'dconst_0', { op: 'dstore', arg: '3' },
+    'iload_2', 'iload_1', { op: 'if_icmpge', arg: 'Lexit' },
+    { op: 'dload', arg: '3' }, 'iload_2', 'i2d',
+    { op: 'ldc2_w', arg: 3.0 }, 'ddiv', 'dadd', { op: 'dstore', arg: '3' },
+    'aload_0', { op: 'dload', arg: '3' }, 'd2i',
+    { op: 'putfield', arg: [null, 'DoubleHolder', ['total', 'I']] },
+    { op: 'iinc', varnum: 2, incr: 1 }, { op: 'goto', arg: 'Lloop' },
+    { op: 'dload', arg: '3' }, { op: 'dload', arg: '3' }, 'dcmpl',
+    { op: 'ifne', arg: 'Lnan' },
+    { op: 'dload', arg: '3' }, 'dconst_1', 'dadd', 'd2i', 'ireturn',
+    'iconst_m1', 'ireturn',
+  ];
+  const labelFor = (index) => index === 4 ? 'Lloop:' : index === 20 ? 'Lexit:'
+    : index === 29 ? 'Lnan:' : `L${index}:`;
+  const method = {
+    name: 'accumulate', descriptor: '(I)I', flags: ['public'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: labelFor(index), instruction,
+      })),
+      localsSize: '5', stackSize: '6', exceptionTable: [],
+    } }],
+  };
+  const run = (useStructured) => {
+    const jvm = new JVM({ jit: useStructured
+      ? { structuredSsa: true, profileMethods: false }
+      : { structuredSsa: false, scalarLoops: false, profileMethods: false } });
+    const receiver = { type: 'DoubleHolder', fields: { 'DoubleHolder.total': 0 } };
+    const generated = useStructured
+      ? jvm.jit.structuredSsa.compile(method)
+      : jvm.jit.compileBaselineMethod(method);
+    const frame = new Frame(method);
+    frame.className = 'DoubleHolder';
+    frame.locals[0] = receiver;
+    frame.locals[1] = 9;
+    const callStack = new Stack();
+    callStack.push(frame);
+    const result = generated(frame, { status: 'runnable', callStack }, jvm.jit, false);
+    return { result, receiver, generated };
+  };
+  const structured = run(true);
+  t.ok(structured.generated?.jvmStructuredSsa,
+    'double/putfield loop selects the structured SSA renderer');
+  const baseline = run(false);
+  t.equal(structured.result.returned, true, 'structured loop returns normally');
+  t.deepEqual(structured.result, baseline.result,
+    'structured double arithmetic matches the baseline generated tier');
+  t.equal(structured.receiver.fields['DoubleHolder.total'],
+    baseline.receiver.fields['DoubleHolder.total'],
+    'structured putfield stores the same narrowed value');
+  t.end();
+});
+
+function fusedShapeMethod(name, descriptor, targetDescriptor, callCount, options = {}) {
+  const targetOwner = options.targetOwner || 'ShapeTarget';
+  const targetName = options.targetName || 'renderAnything';
+  const codeItems = [];
+  if (options.integerNative) {
+    codeItems.push(
+      { instruction: 'iconst_0' },
+      { instruction: 'iconst_1' },
+      { instruction: {
+        op: 'invokestatic',
+        arg: ['Method', 'java/lang/Math', ['min', '(II)I']],
+      } },
+      { instruction: 'pop' },
+    );
+  }
+  const { params } = require('../src/parsing/typeParser').parseDescriptor(targetDescriptor);
+  for (let call = 0; call < callCount; call += 1) {
+    for (const type of params) {
+      codeItems.push({ instruction: type.endsWith('[]') ? 'aconst_null' : 'iconst_0' });
+    }
+    codeItems.push({ instruction: {
+      op: 'invokestatic',
+      arg: ['Method', targetOwner, [targetName, targetDescriptor]],
+    } });
+  }
+  codeItems.push({ instruction: 'return' });
+  codeItems.forEach((item, index) => { item.labelDef = `L${index}:`; });
+  return {
+    name,
+    descriptor,
+    attributes: [{ type: 'code', code: {
+      codeItems,
+      localsSize: String(options.localsSize || 48),
+      stackSize: '24',
+      exceptionTable: options.exceptionTable || [],
+    } }],
+  };
+}
+
+test('fused renderer families are selected by verified structure, not names', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  const families = [
+    ['(IIIIIIIIIIIIZIII)V', '(IIIIIIIBIIII[IIIII)V', '(IIIIIII[III)V'],
+    ['(IIIIIIII)V', '(IIIIIBII[I)V', '(IB[III)V'],
+  ];
+  for (const [wrapperDescriptor, rasterDescriptor, scanlineDescriptor] of families) {
+    const family = jvm.jit.fusedRegions.constructor.FAMILY_BY_WRAPPER.get(wrapperDescriptor);
+    const wrapper = fusedShapeMethod(
+      'nameChosenAtRandom', wrapperDescriptor, rasterDescriptor, 6,
+      { targetName: 'alsoNotObfuscatedA' },
+    );
+    const raster = fusedShapeMethod(
+      'differentRandomName', rasterDescriptor, scanlineDescriptor, 6,
+      { integerNative: true, targetName: 'scanRowsWithoutANameDependency' },
+    );
+    t.ok(jvm.jit.fusedRegions.verifyMethod(wrapper, family, 'wrapper'),
+      `${family.name} wrapper shape is accepted under an arbitrary method name`);
+    t.ok(jvm.jit.fusedRegions.verifyMethod(raster, family, 'raster'),
+      `${family.name} raster shape is accepted under an arbitrary method name`);
+
+    const shortCalls = fusedShapeMethod('short', wrapperDescriptor, rasterDescriptor, 5);
+    t.notOk(jvm.jit.fusedRegions.verifyMethod(shortCalls, family, 'wrapper'),
+      `${family.name} rejects a changed wrapper call count`);
+    const badStack = fusedShapeMethod('badStack', wrapperDescriptor, rasterDescriptor, 6);
+    badStack.attributes[0].code.codeItems.shift();
+    t.notOk(jvm.jit.fusedRegions.verifyMethod(badStack, family, 'wrapper'),
+      `${family.name} rejects an invalid operand-stack shape`);
+  }
+
+  const family = jvm.jit.fusedRegions.constructor.FAMILY_BY_WRAPPER.get('(IIIIIIII)V');
+  const wrongDescriptor = fusedShapeMethod('wrong', '(IIIIIIIV)V', '(IIIIIBII[I)V', 6);
+  t.notOk(jvm.jit.fusedRegions.verifyMethod(wrongDescriptor, family, 'wrapper'),
+    'an altered wrapper descriptor is rejected');
+  const badHandler = fusedShapeMethod('badHandler', '(IIIIIIII)V', '(IIIIIBII[I)V', 6, {
+    exceptionTable: [{ handlerLbl: 'L0', catch_type: 'java/lang/Exception' }],
+  });
+  t.notOk(jvm.jit.fusedRegions.verifyMethod(badHandler, family, 'wrapper'),
+    'an unsupported exception handler is rejected');
+  t.end();
+});
+
+test('fused entry guards fall back before consuming operands or side effects', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
+  const descriptor = '(IIIIIIII)V';
+  const wrapper = fusedShapeMethod('arbitraryWrapper', descriptor, '(IIIIIBII[I)V', 6);
+  const owner = 'ArbitraryRendererOwner';
+  jvm.classes[owner] = {
+    ast: { classes: [{ superClassName: null, items: [{ type: 'method', method: wrapper }] }] },
+    staticFields: new Map(),
+  };
+  const callerMethod = {
+    name: 'caller', descriptor: '()V',
+    attributes: [{ type: 'code', code: {
+      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
+      localsSize: '0', stackSize: '8', exceptionTable: [],
+    } }],
+  };
+  const caller = new Frame(callerMethod);
+  const callStack = new Stack();
+  callStack.push(caller);
+  const thread = { status: 'runnable', callStack };
+  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
+  let sideEffects = 0;
+  const codeItems = wrapper.attributes[0].code.codeItems;
+  const region = {
+    wrapperMethod: wrapper,
+    wrapperOwner: owner,
+    wrapperKernel: () => { sideEffects += 1; },
+    dependencies: [{ owner, method: wrapper, codeItems }],
+    staticOwners: [], falseGuardTargets: [],
+  };
+  jvm.jit.fusedRegions.cache.set(wrapper, region);
+  const site = {
+    op: 'invokestatic', descriptor,
+    params: new Array(8).fill('int'), returnType: 'void',
+  };
+  const target = { method: wrapper, lookupClass: owner };
+
+  let result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  t.notOk(result.handled, 'an uninitialized participant uses the normal path');
+  t.equal(sideEffects, 0, 'class initialization guard runs before fused effects');
+  t.equal(caller.stack.items.length, 8, 'guarded fallback leaves caller operands intact');
+
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+  jvm.debugManager.enable();
+  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  t.notOk(result.handled, 'debug mode uses the normal path');
+  t.equal(sideEffects, 0, 'debug guard also precedes fused effects');
+  t.equal(caller.stack.items.length, 8, 'debug fallback leaves operands intact');
+
+  jvm.debugManager.disable();
+  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  t.ok(result.handled, 'the same structurally cached region runs after guards clear');
+  t.equal(sideEffects, 1, 'unguarded invocation enters the fused kernel once');
+  t.equal(caller.stack.items.length, 0, 'successful fused void call consumes its operands');
+  t.equal(jvm.jit.fusedRunCount, 1, 'successful fused execution is counted');
+  t.equal(jvm.jit.fusedGuardedFallbackCount, 2, 'both guarded fallbacks are counted');
+  t.end();
+});
+
+test('fused exceptions restore omitted wrapper and raster frames', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
+  const descriptor = '(IIIIIIII)V';
+  const wrapper = fusedShapeMethod('wrapperWithNoFixedName', descriptor, '(IIIIIBII[I)V', 6);
+  const raster = fusedShapeMethod('rasterWithNoFixedName', '(IIIIIBII[I)V', '(IB[III)V', 6,
+    { integerNative: true });
+  const owner = 'RestoredWrapperOwner';
+  const rasterOwner = 'RestoredRasterOwner';
+  jvm.classes[owner] = {
+    ast: { classes: [{ superClassName: null, items: [{ type: 'method', method: wrapper }] }] },
+    staticFields: new Map(),
+  };
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+  const callerMethod = {
+    name: 'caller', descriptor: '()V',
+    attributes: [{ type: 'code', code: {
+      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
+      localsSize: '0', stackSize: '8', exceptionTable: [],
+    } }],
+  };
+  const caller = new Frame(callerMethod);
+  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
+  const callStack = new Stack();
+  callStack.push(caller);
+  const thread = { status: 'runnable', callStack };
+  const thrown = { type: 'java/lang/ArrayIndexOutOfBoundsException', message: null };
+  const region = {
+    wrapperMethod: wrapper, wrapperOwner: owner,
+    rasterMethod: raster, rasterOwner,
+    dependencies: [{
+      owner, method: wrapper, codeItems: wrapper.attributes[0].code.codeItems,
+    }],
+    staticOwners: [], falseGuardTargets: [],
+    wrapperKernel: (state) => {
+      state.outerPc = 12;
+      state.outerExtra = 9;
+      state.method = 'raster';
+      state.pc = 37;
+      state.locals = [4, 5, 6];
+      state.stack = [null, 99];
+      throw thrown;
+    },
+  };
+  jvm.jit.fusedRegions.cache.set(wrapper, region);
+  const site = { op: 'invokestatic', descriptor,
+    params: new Array(8).fill('int'), returnType: 'void' };
+  const target = { method: wrapper, lookupClass: owner };
+  let observed;
+  try {
+    jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  } catch (error) {
+    observed = error;
+  }
+  t.equal(observed, thrown, 'the original JVM exception is rethrown');
+  t.equal(callStack.size(), 3, 'caller plus both omitted frames are present');
+  t.equal(callStack.items[1].method, wrapper, 'wrapper is restored outside the raster');
+  t.equal(callStack.peek().method, raster, 'throwing raster is the innermost frame');
+  t.equal(callStack.peek().pc, 37, 'throwing bytecode PC is restored exactly');
+  t.deepEqual(callStack.peek().stack.items, [null, 99], 'throwing operands are restored');
+  t.equal(jvm.jit.fusedRestoredExceptionFrameCount, 2, 'restored frames are counted');
   t.end();
 });
 
@@ -607,6 +1630,175 @@ public class NestedGeneratedJitHarness {
   t.equal(jvm.jit.syncInlinedCallCount, 3,
     'remaining integer leaf calls execute inline without child frames');
   t.equal(jvm.jit.runnerRunCount, 0, 'nested generated calls avoid the bytecode runner');
+  t.end();
+});
+
+test('generated JIT emits verified integer leaves directly into callers', async (t) => {
+  const classpath = compileJavaFixture(t, 'DirectIntegerInlineHarness', `
+class DirectIntegerLeafTarget {
+  static int transform(int value) {
+    return ((value + 7) * 3) ^ (value >>> 5);
+  }
+}
+public class DirectIntegerInlineHarness {
+  public static void compute(int[] out) {
+    int value = 1;
+    for (int i = 0; i < 100; i++) {
+      value = DirectIntegerLeafTarget.transform(value + i);
+    }
+    out[0] = value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
+  } });
+  for (const className of ['DirectIntegerInlineHarness', 'DirectIntegerLeafTarget']) {
+    await jvm.loadClassByName(className);
+    jvm.classInitializationState.set(className, 'INITIALIZED');
+  }
+  const thread = {
+    id: 0,
+    name: 'direct-integer-inline-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0];
+  out.type = '[I';
+
+  const ticks = await invoke(jvm, thread, 'DirectIntegerInlineHarness',
+    'compute', '([I)V', [out]);
+  let expected = 1;
+  for (let i = 0; i < 100; i++) {
+    const input = (expected + i) | 0;
+    expected = (Math.imul((input + 7) | 0, 3) ^ (input >>> 5)) | 0;
+  }
+  t.equal(out[0], expected, 'directly emitted expression preserves Java integer semantics');
+  t.equal(ticks, 1, 'caller and leaves finish in one generated scheduler tick');
+
+  const method = await jvm.findMethodInHierarchy(
+    'DirectIntegerInlineHarness', 'compute', '([I)V');
+  const generated = jvm.jit.codegenCache.get(method);
+  t.equal(generated.jvmDirectInlineCount, 1,
+    'generated source contains one structural direct-inline site');
+  t.equal(jvm.jit.syncCallSites.filter(Boolean).length, 0,
+    'direct inline creates no runtime dispatch call site');
+
+  jvm.debugManager.addBreakpoint(0, { className: 'DirectIntegerLeafTarget' });
+  const debugOut = [0];
+  debugOut.type = '[I';
+  const debugFrame = new Frame(method);
+  debugFrame.className = 'DirectIntegerInlineHarness';
+  debugFrame.locals[0] = debugOut;
+  thread.callStack.push(debugFrame);
+  const result = generated(debugFrame, thread, jvm.jit);
+  t.equal(result.reason, generated.jvmScalarLoop
+    ? 'scalar loop debug entry' : 'debuggable direct integer inline',
+  'callee breakpoint deoptimizes before executing the omitted call');
+  const invokeIndex = debugFrame.instructions.findIndex((item) =>
+    item.instruction && item.instruction.op === 'invokestatic');
+  t.equal(debugFrame.pc, generated.jvmScalarLoop ? 0 : invokeIndex,
+    'debug deoptimization restores the earliest unexecuted bytecode PC');
+  thread.callStack.pop();
+
+  const coldJvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
+  } });
+  await coldJvm.loadClassByName('DirectIntegerInlineHarness');
+  await coldJvm.loadClassByName('DirectIntegerLeafTarget');
+  coldJvm.classInitializationState.set('DirectIntegerInlineHarness', 'INITIALIZED');
+  const coldMethod = await coldJvm.findMethodInHierarchy(
+    'DirectIntegerInlineHarness', 'compute', '([I)V');
+  const coldGenerated = coldJvm.jit.getGeneratedFunction(coldMethod);
+  t.equal(coldGenerated.jvmDirectInlineCount, 0,
+    'uninitialized target retains the class-initializing dispatch path');
+  t.end();
+});
+
+test('generated JIT keeps call-dense static and monomorphic dynamic helpers synchronous', async (t) => {
+  const classpath = compileJavaFixture(t, 'IntermethodCallJitHarness', `
+public class IntermethodCallJitHarness {
+  public abstract static class Base { public abstract int apply(int value); }
+  public interface Contract { int apply(int value); }
+  public static final class Worker extends Base implements Contract {
+    public int apply(int value) { return chain(value); }
+  }
+  static int add(int value) { return value + 1; }
+  static int multiply(int value) { return value * 3; }
+  static int mix(int value) { return value ^ 7; }
+  static int chain(int value) {
+    value = add(value);
+    value = multiply(value);
+    return mix(value);
+  }
+  public static void runStatic(int[] out) {
+    int value = 5;
+    for (int i = 0; i < 20; i++) value = chain(value + i);
+    out[0] = value;
+  }
+  public static void runVirtual(Base worker, int[] out) {
+    int value = 5;
+    for (int i = 0; i < 20; i++) value = worker.apply(value + i);
+    out[1] = value;
+  }
+  public static void runInterface(Contract worker, int[] out) {
+    int value = 5;
+    for (int i = 0; i < 20; i++) value = worker.apply(value + i);
+    out[2] = value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: true,
+  } });
+  const classes = [
+    'IntermethodCallJitHarness',
+    'IntermethodCallJitHarness$Base',
+    'IntermethodCallJitHarness$Contract',
+    'IntermethodCallJitHarness$Worker',
+  ];
+  for (const className of classes) {
+    await jvm.loadClassByName(className);
+    jvm.classInitializationState.set(className, 'INITIALIZED');
+  }
+  const thread = {
+    id: 0,
+    name: 'intermethod-call-jit-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0, 0, 0];
+  out.type = '[I';
+  const worker = { type: 'IntermethodCallJitHarness$Worker', fields: {} };
+
+  await invoke(jvm, thread, 'IntermethodCallJitHarness', 'runStatic', '([I)V', [out]);
+  await invoke(jvm, thread, 'IntermethodCallJitHarness', 'runVirtual',
+    '(LIntermethodCallJitHarness$Base;[I)V', [worker, out]);
+  await invoke(jvm, thread, 'IntermethodCallJitHarness', 'runInterface',
+    '(LIntermethodCallJitHarness$Contract;[I)V', [worker, out]);
+
+  t.deepEqual(out.slice(), [out[0], out[0], out[0]],
+    'static, virtual, and interface dispatch preserve identical results');
+  t.ok(jvm.jit.syncInlinedCallCount >= 60,
+    'all three hot call sites execute through straight-line integer kernels');
+  t.ok(jvm.jit.inlinedMethodRunCounts.get('IntermethodCallJitHarness.chain(I)I') >= 20,
+    'static call chain is collapsed into one inline region');
+  t.ok(jvm.jit.inlinedMethodRunCounts.get(
+    'IntermethodCallJitHarness$Worker.apply(I)I') >= 40,
+    'virtual and interface forwarding wrappers collapse their nested static chain');
+  t.notOk(jvm.jit.generatedMethodRunCounts.has('IntermethodCallJitHarness.chain(I)I'),
+    'collapsed chain creates no generated child frames');
+  const dynamicSites = jvm.jit.syncCallSites.filter((site) => site &&
+    (site.op === 'invokevirtual' || site.op === 'invokeinterface'));
+  t.ok(dynamicSites.every((site) => site.fastDynamicTarget),
+    'resolved dynamic sites retain a monomorphic fast target');
+  t.equal(jvm.jit.runnerRunCount, 0, 'hot call chains avoid the bytecode runner');
   t.end();
 });
 

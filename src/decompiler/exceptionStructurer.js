@@ -402,7 +402,9 @@ function structureRegion(work, memberSet, entryLocal, externalToRenderId, ctx) {
 // multi-entry SCC inside a try body. Clone the SCC once per secondary entry and
 // redirect only predecessors outside the SCC; cloned nodes render the same
 // bytecode blocks as their originals.
-function splitIrreducibleTerms(inputTerms, entry) {
+function splitIrreducibleTerms(inputTerms, entry, options = {}) {
+  const maxTerms = Number.isSafeInteger(options.maxTerms) && options.maxTerms > 0
+    ? options.maxTerms : Number.POSITIVE_INFINITY;
   let terms = inputTerms.map((term) => ({ ...term }));
   let origins = [...Array(terms.length).keys()];
   for (let round = 0; round < 64; round++) {
@@ -441,6 +443,7 @@ function splitIrreducibleTerms(inputTerms, entry) {
     const primary = candidate.entries.find((item) => item.node === entry)
       || candidate.entries.slice().sort((a, b) => b.externalPreds - a.externalPreds)[0];
     const secondary = candidate.entries.find((item) => item !== primary);
+    if (terms.length + candidate.component.length > maxTerms) return null;
     const cloneOf = new Map();
     for (const node of candidate.component) {
       cloneOf.set(node, terms.length);
@@ -1174,6 +1177,7 @@ function processGroup(work, group, ctx, commit) {
 
 module.exports = {
   structureMethod,
+  splitIrreducibleTerms,
   // exposed for tests
   normalizeTable,
   renderCatchType,

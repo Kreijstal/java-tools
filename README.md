@@ -122,16 +122,231 @@ only from an exception handler do not disqualify the leaf body. Set
 for runtime experiments. Calls to unsupported methods permanently deopt their
 compiled caller instead of using application-specific resume rules.
 
+For generated JavaScript, bounded straight-line integer regions are compiled
+across static call chains. Verified static leaves are emitted directly into the
+caller, while monomorphic virtual and interface sites cache the observed target
+and execute its collapsed integer region without child frames. Debugging,
+class initialization, unsupported bytecodes, exceptions, recursion, and
+oversized regions retain the normal dispatch path. Direct source emission is
+disabled when per-method profiling is enabled so call-site counters remain
+available.
+
+Verified handler-free integer loops also have a scalar tier. It derives CFG and
+operand-stack depths from bytecode, keeps used locals and stack expressions in
+JavaScript scalars, and emits bounded backedge safe points that reconstruct the
+ordinary `Frame` before yielding. Static callees are accepted only when their
+entire integer body is structurally inlineable; no class or method names take
+part in selection. Set `jit: { scalarLoops: false }` to retain the existing
+generated implementation for differential tests.
+
+An experimental extension accepts structurally verified array/field loops,
+rethrow-only reporter handlers, and synchronous static call islands. It keeps
+internal CFG joins in fixed scalar slots and materializes the `Frame` only at
+calls, safe points, returns, and throwing bytecodes. This broader tier is off by
+default because its Dekobloko result remains below the renderer acceptance
+target; enable it with `jit: { scalarGuestBodies: true }` or
+`JVM_ENABLE_SCALAR_GUEST_BODIES=1`.
+
+A TeaVM-inspired SSA experiment adds raw-array-view companions, basic-block
+value numbering for repeated field/length reads, and verified fall-through edge
+threading. It preserves canonical heap objects for snapshots and precise frame
+materialization for exceptions and safe points. Enable it with
+`jit: { scalarSsaOptimizations: true }` or `JVM_ENABLE_SCALAR_SSA=1`; it remains
+off by default because the combined experimental renderer remains below its
+acceptance target. Basic-block SSA was neutral, and an alias-safe cross-block
+field cache was removed after its final counter-free A/B regressed the median
+from 13.3291 to 13.0458 changed images/s. The browser probe can isolate the
+retained basic pass with `PROBE_SCALAR_SSA=0/1`.
+
+The experimental structured SSA tier removes the remaining basic-block
+dispatcher for verified reducible JVM loops. It assigns every produced operand
+a unique JavaScript value, feeds live operands into fixed successor-block join
+slots, and renders the CFG through lexical `while`, `if`, labeled `break`, and
+`continue` statements. Integer/reference locals, arrays, fields, integer
+arithmetic, synchronous static calls, and rethrow-only handlers are supported;
+throwing operations and bounded loop safe points reconstruct the exact JVM PC,
+locals, and operand order. Selection uses descriptors and verified bytecode/CFG
+properties, never class or method names. Enable it with
+`jit: { structuredSsa: true }`, `JVM_ENABLE_STRUCTURED_SSA=1`, or the Firefox
+probe switch `PROBE_STRUCTURED_SSA=1`. It remains off by default pending broader
+coverage and the 20 changed-images/s acceptance target.
+
+To compose the three renderer experiments without independent switches, use
+`jit: { rendererPipeline: true }`, `JVM_ENABLE_RENDERER_PIPELINE=1`, or
+`PROBE_RENDERER_PIPELINE=1`. This enables broad scalar guest bodies, fused
+wrapper/raster regions, and structured SSA together; individual probe switches
+can still override a component for differential runs. The measured composed
+median was 13.0388 changed images/s with structured SSA versus 12.1244 without
+it (+7.54%), with matching accepted hashes and no browser errors; the combined
+pipeline remains opt-in because it is still below the 20 images/s target.
+
+On the measured Dekobloko Firefox workload, scalarizing the large model/face
+guest body and combining it with the verified renderer region raised throughput
+from 8.82 to 13.19 changed images/s—about a 49% improvement—with matching surface
+hashes and no runtime errors. The result identifies cross-branch operand-stack
+traffic in the large guest CFG as a material cost, while also showing that the
+remaining geometry/raster arithmetic still prevents the 20 images/s target.
+The full measurement and the `array[index++]` JVM-ordering regression discovered
+during the work are documented in
+[`docs/dekobloko-firefox-performance.md`](docs/dekobloko-firefox-performance.md#2026-07-20-breakthrough-compile-the-guest-body-not-just-its-leaves).
+
 The Wasm numeric tier links fully translatable loop-free static helpers into hot
 loops on demand, including helpers with reference parameters. It also recognizes
 bounded, forward-only, always-rethrow diagnostic handlers as non-recovering, so
 their protected compute loops remain eligible. A catch that returns, acquires a
 monitor, loops backwards, or writes recovery state remains interpreted.
 
+The intermethod benchmark compares the same primitive hot loop on HotSpot, the
+generated-JavaScript tier, and the Wasm tier, using zero-call, eight-static-call,
+virtual, and interface shapes:
+
+```bash
+npm run benchmark:jvm:intermethod
+# Optional: INTERMETHOD_ITERATIONS=100000 INTERMETHOD_ROUNDS=7
+```
+
+It validates checksums across all tiers and reports medians, resolved JavaScript
+call-site kinds, and Wasm compilation/exits. `INTERMETHOD_PROFILE_JIT=1` also
+enables per-call JIT counters, at the cost of perturbing timing.
+
+The primary renderer-optimizer benchmark is now a deterministic Java fixture
+distilled from Dekobloko's hot loops rather than the full game startup:
+
+```bash
+npm run benchmark:jvm:dekobloko-hot-loops
+# Optional: DEKOBLOKO_TOY_INVOCATIONS=100 DEKOBLOKO_TOY_PASSES=40 \
+#           DEKOBLOKO_TOY_ROUNDS=5 DEKOBLOKO_TOY_WARMUPS=3
+```
+
+It covers nested vertex transforms and face selection using instance fields,
+`int[]`/`short[]` loads, checked stores, fixed-point multiply/shift/divide,
+visibility branches, and a small static helper. HotSpot, ordinary generated JS,
+broad scalar JS, and structured SSA must produce identical checksums before any
+timing is reported. Use the full JAR only as the final integration/correctness
+check after a toy-loop optimization demonstrates a repeatable improvement.
+
+That benchmark exposed an inner-face generic call transition: the small integer
+helper contained one forward branch, so the straight-line leaf inliner rejected
+it and materialized/dispatched a JVM call for every visible face. The structural
+inliner now lowers bounded forward-branching integer leaves with SSA join values,
+without class or method-name matching. In the clean five-round run, structured
+face work fell from 315.1315 to a three-process median of 11.8466 ns/element
+(**26.60× faster**), combined work fell from 196.1672 to 10.9281 ns/element
+(**17.95× faster**), and all tier
+checksums matched HotSpot. A subsequent three-process Firefox integration run
+measured 11.21, 13.33, and 13.48 changed images/s (13.33 median), with expected
+surface hashes and no page/console errors. This retains the previous ~13 FPS
+class but remains below the 20 images/s target.
+
+The follow-up renderer-traffic benchmark adds the work omitted by the first
+toy: clipped static-surface spans and 22 structurally recognized overlapping
+primitive copies per synthetic unit:
+
+```bash
+npm run benchmark:jvm:dekobloko-renderer-traffic
+# Optional: DEKOBLOKO_TRAFFIC_INVOCATIONS=10 DEKOBLOKO_TRAFFIC_PASSES=2 \
+#           DEKOBLOKO_TRAFFIC_ROUNDS=5 DEKOBLOKO_TRAFFIC_WARMUPS=3
+```
+
+The initial checksums matched HotSpot but exposed 85.27× slower overlap copies
+and 83.82× slower composed traffic. The JIT now emits both verified operations
+positionally into structured callers, selected by descriptor, bytecode shape,
+stack verification, and field identity—not method names. A raw Node
+microbenchmark also showed that `copyWithin` is expensive for these tiny generic
+arrays, so the verified overlapping `int[]` path uses an explicit reverse loop.
+In the subsequent checksum-matched run, structured spans improved from 628.18
+to 235.03 ns/op, copies from 868.64 to 20.11 ns/op, and composed work from
+852.95 to 24.25 ns/op. One synthetic traffic unit fell from 19.618 to 0.558
+microseconds and measured 2.40× HotSpot.
+The rebuilt production bundle did not turn that isolated gain into more game
+FPS: three clean Firefox runs measured 13.95, 12.90, and 13.04 changed images/s
+(13.04 median), with expected initial hashes and no runtime errors. High call
+counts identified real avoidable JVM work, but not the dominant remaining
+wall-clock cost.
+
+For representative renderer work, use the captured entry-state replay rather
+than another hand-written approximation. The Firefox probe can take a portable
+heap/static/local snapshot at an actual generated method's PC 0, and
+`benchmark:jvm:dekobloko-trace-replay` restores and repeatedly executes that
+complete guest body. The first `vk.a(I)V` capture reproduced 3,689 scheduler
+ticks per scene invocation and identical 75,600-pixel hashes across tiers.
+Generated, scalar, and composed structured execution measured 54.60, 35.88,
+and 23.86 ms/invocation respectively. This revealed that repeated partial-region
+resumption—not the isolated copy/span arithmetic—is the representative
+remaining JVM inefficiency. Capture and replay commands are documented in the
+performance investigation below.
+
+The first replay-driven change added generic generated-code support for fixed-
+point `lmul`, arithmetic `lshr`, and `l2i`. It reduced complete-scene scheduler
+entries from 3,689 to 9 and improved structured replay time from 23.86 to 19.63
+ms (21.5%), with all surface and static hashes unchanged. Three Firefox runs
+passing the expected initial-hash gate measured 14.28, 13.80, and 13.95 changed
+images/s (13.95 median), a 7.0% improvement over the immediate 13.04 baseline.
+This validates the captured replay as a useful predictor, while confirming that
+reaching 30 FPS requires attacking more than scene-transition overhead.
+
+Smaller real-input benchmarks can be derived from that same scene state with
+`trace:dekobloko:derive-region` and run together with
+`benchmark:jvm:dekobloko-regions`. Unlike the earlier handwritten toys, these
+cases preserve the live locals, heap, statics, and raster surface and verify the
+complete surface plus scalar/static-array state after every timing round. The
+first four-case suite isolated two large geometry bodies and the gradient/flat
+wrapper-to-raster chains. Composed structured execution measured 3.04x and
+1.97x faster than generated JS for the geometry bodies, versus 1.45x and 1.24x
+for individual wrapper chains. This makes the mixed 592-bytecode geometry body,
+not a single raster call, the most useful focused benchmark for the next generic
+optimizer change. Method keys configure trace capture only; optimizer selection
+remains descriptor-, CFG-, opcode-, and runtime-shape-based.
+
+The first optimization driven by those focused cases tested bounded controlled
+splitting for irreducible integer CFGs. The 592-bytecode geometry body contained
+one secondary loop entry; cloning 39 abstract CFG blocks made it reducible and
+allowed the lexical SSA renderer to compile it, without changing guest bytecode
+or using a method-name gate. Focused Node replay improved from 0.545 to 0.469 ms
+and complete-scene replay from 19.627 to 17.440 ms, with all differential hashes
+unchanged. Firefox contradicted V8: three active, expected-hash runs measured
+13.18, 12.37, and 12.91 images/s (12.91 median), 7.5% below the previous 13.95
+median. Counters proved that two methods and 44 blocks were split. The feature
+is therefore disabled by default and retained only behind
+`structuredIrreducibleSplitting`, with replay and Firefox A/B overrides. This
+teaches that the live replay is a semantic oracle but V8 cannot predict
+SpiderMonkey's response to a roughly 441 KB generated function; the next design
+should use a compact local state-machine island instead of whole-SCC cloning.
+
+For bottleneck attribution, use `PROBE_SCHEDULER_TIMINGS=1` rather than method
+entry counts. It records non-overlapping scheduler-slice wall time owned by the
+active guest frame. The first exact 20-image run attributed 90.7% of the window
+to JVM execution: 32.4% to the complete scene owner and another 26.9% to the
+next five surface, render, game-logic, Canvas, and array bodies. Every-slice
+timing has measurable observer overhead and is diagnostic only; ordinary FPS
+acceptance keeps it disabled.
+
+To subdivide one expensive generated root by wall time, use
+`PROBE_EXCLUSIVE_TIMINGS=1` with `PROBE_EXCLUSIVE_ROOT`. Nested clocks pause
+their parents, so exclusive method totals do not overlap and sum exactly to the
+root; parent-to-child edges retain the hierarchy. A clean Firefox run attributed
+370 of the scene root's 561 ms (66.0%) to the geometry/face subtree: 147 ms in
+its scalar geometry/control body, 164 ms in the fused gradient raster, 39 ms in
+a structured helper, and 20 ms in the fused flat raster. The transform subtree
+used another 153 ms, while the scene root itself used only 15 ms exclusive.
+This identifies geometry plus raster work—not call dispatch—as the next target.
+The configured method key is diagnostic input only and no optimizer contains a
+game method-name gate.
+
 The Dekobloko Firefox investigation, including measured wins, rejected
 experiments, correctness traps, and the reproducible changed-frame probe, is
 recorded in
 [docs/dekobloko-firefox-performance.md](docs/dekobloko-firefox-performance.md).
+Start with its
+[executive synthesis](docs/dekobloko-firefox-performance.md#executive-synthesis),
+then use the sections on the
+[actual hot guest features](docs/dekobloko-firefox-performance.md#what-the-hot-guest-body-actually-contains),
+[current tier defaults](docs/dekobloko-firefox-performance.md#current-tier-and-configuration-status),
+[Java/JavaScript/Wasm intermethod results](docs/dekobloko-firefox-performance.md#latest-intermethod-benchmark-what-should-and-should-not-become-wasm),
+[snapshot and debugger constraints](docs/dekobloko-firefox-performance.md#snapshots-debugging-scheduling-and-exceptions),
+[measurement procedure](docs/dekobloko-firefox-performance.md#reproducing-the-firefox-measurement),
+and the
+[structured-loop implementation handoff](docs/dekobloko-firefox-performance.md#structured-natural-loops-completed-foundation-and-remaining-work).
 
 #### Portable save states
 

@@ -3,11 +3,27 @@ const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
 const { resolveInstanceFieldKey } = require("../instructions/object");
 const WasmJit = require("./WasmJit");
+const FusedRegionCompiler = require("./FusedRegionCompiler");
+const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
 const { isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
 const STATIC_DEOPT = Symbol("jit.static.deopt");
 const ASYNC_INVOKE = Symbol("jit.invoke.async");
+
+// Widened opcode eligibility (long arithmetic/locals/arrays, instanceof,
+// dup_x1, i2s/i2c). The emitter implements all of these with interpreter
+// parity, but admitting the methods they unlock measured as a Firefox
+// wall-time regression (six-run median 12.77 vs 13.79 images/s) even though
+// each unlocked method got individually faster, so eligibility stays off
+// until the whole-app cost is understood. Flip to true to re-run that A/B.
+const EXTENDED_TIER_OPCODES_ENABLED = false;
+const EXTENDED_TIER_OPCODES = EXTENDED_TIER_OPCODES_ENABLED ? [
+  "i2c", "i2s", "dup_x1", "instanceof",
+  "ladd", "land", "laload", "lastore", "lconst_0", "lconst_1",
+  "lload", "lload_0", "lload_1", "lload_2", "lload_3", "lneg", "lor", "lrem", "lshl",
+  "lstore", "lstore_0", "lstore_1", "lstore_2", "lstore_3", "lsub", "lushr",
+] : [];
 
 class JitCompiler {
   constructor(jvm, options = {}) {
@@ -32,11 +48,25 @@ class JitCompiler {
     this.nextSyncCallSiteId = 1;
     this.fieldSites = [];
     this.nextFieldSiteId = 1;
-    this.inlineIntegerLeafCache = new WeakMap();
+    this.inlineIntegerRegionCache = new WeakMap();
+    this.inlineIntegerPlanCache = new WeakMap();
     const firefoxDefault = typeof navigator !== "undefined" &&
       /Firefox\//.test(navigator.userAgent || "");
     const browserRuntime = typeof window !== "undefined" && typeof navigator !== "undefined";
     this.profileMethods = options.profileMethods ?? !browserRuntime;
+    this.profileTimings = options.profileTimings === true;
+    this.methodTimingSampleRate = Math.max(1, Number(options.methodTimingSampleRate) || 256);
+    this.methodTimingFilter = options.methodTimingFilter instanceof Set
+      ? options.methodTimingFilter : null;
+    this.methodTimingRandomState = 0x6d2b79f5;
+    this.methodTimingSamples = new Map();
+    this.exclusiveTimingsEnabled = false;
+    this.exclusiveTimingRootKey = null;
+    this.exclusiveTimingStack = [];
+    this.exclusiveTimingSamples = new Map();
+    this.exclusiveTimingEdges = new Map();
+    this.methodEntryTraceKey = null;
+    this.methodEntryTrace = null;
     this.preferWholeMethodJs = options.preferWholeMethodJs ?? firefoxDefault;
     this.generatedRunCount = 0;
     this.syncGeneratedRunCount = 0;
@@ -45,6 +75,27 @@ class JitCompiler {
     this.syncIntrinsicCallCount = 0;
     this.intrinsicArrayCopyNoopCount = 0;
     this.intrinsicArrayCopyWithinCount = 0;
+    this.fusedRunCount = 0;
+    this.fusedGuardedFallbackCount = 0;
+    this.fusedRestoredExceptionFrameCount = 0;
+    this.scalarLoopRunCount = 0;
+    this.scalarLoopSafePointCount = 0;
+    this.scalarSsaRunCount = 0;
+    this.scalarSsaArrayViewCount = 0;
+    this.scalarSsaEliminatedReadCount = 0;
+    this.scalarSsaThreadedEdgeCount = 0;
+    this.scalarLoopMethodRunCounts = new Map();
+    this.structuredSsaMethodRunCounts = new Map();
+    this.rendererPipelineEnabled = options.rendererPipeline === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
+    this.scalarLoopsEnabled = options.scalarLoops !== false;
+    this.scalarGuestBodiesEnabled = this.rendererPipelineEnabled || options.scalarGuestBodies === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_SCALAR_GUEST_BODIES === "1");
+    this.scalarSsaOptimizationsEnabled = options.scalarSsaOptimizations === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_SCALAR_SSA === "1");
     this.inlinedMethodRunCounts = new Map();
     this.intrinsicMethodRunCounts = new Map();
     this.runnerRunCount = 0;
@@ -59,6 +110,11 @@ class JitCompiler {
         : false
     );
     this.wasmJit = new WasmJit(jvm, this);
+    const regionOptions = this.rendererPipelineEnabled
+      ? { ...options, fusedRegions: true, structuredSsa: true }
+      : options;
+    this.fusedRegions = new FusedRegionCompiler(this, regionOptions);
+    this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
   }
 
   canRun(frame) {
@@ -207,7 +263,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -249,8 +305,148 @@ class JitCompiler {
       this.generatedRunCount += 1;
       if (generated.jvmSynchronous) this.syncGeneratedRunCount += 1;
       this.recordExecution(this.generatedMethodRunCounts, frame);
+      if (generated.jvmScalarLoop) this.recordExecution(this.scalarLoopMethodRunCounts, frame);
+      if (generated.jvmStructuredSsa) this.recordExecution(this.structuredSsaMethodRunCounts, frame);
     }
-    return generated(frame, thread, this, initialBytecodeChecks);
+    const frameMethodKey = `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`;
+    if (this.methodEntryTraceKey === frameMethodKey && !this.methodEntryTrace && frame.pc === 0) {
+      try {
+        this.methodEntryTrace = {
+          methodKey: frameMethodKey,
+          capturedAt: this.monotonicNow(),
+          state: this.jvm.saveState(),
+        };
+      } catch (error) {
+        this.methodEntryTrace = {
+          methodKey: frameMethodKey,
+          error: error?.stack || error?.message || String(error),
+        };
+      }
+    }
+    let timingKey = null;
+    let timingStarted = 0;
+    const candidateTimingKey = this.profileTimings ? frameMethodKey : null;
+    if (candidateTimingKey &&
+        (!this.methodTimingFilter || this.methodTimingFilter.has(candidateTimingKey))) {
+      // Use a deterministic pseudo-random sample rather than every Nth call:
+      // render call patterns are strongly periodic and a modulo sampler can
+      // repeatedly select (or miss) one callee. Only sampled calls pay for a
+      // clock read.
+      this.methodTimingRandomState = (Math.imul(this.methodTimingRandomState, 1664525) +
+        1013904223) >>> 0;
+      if (this.methodTimingRandomState < 0x100000000 / this.methodTimingSampleRate) {
+        timingKey = candidateTimingKey;
+        timingStarted = this.monotonicNow();
+      }
+    }
+    const exclusiveTiming = this.exclusiveTimingsEnabled
+      ? this.beginExclusiveTiming(frameMethodKey,
+        generated.jvmStructuredSsa ? "structured"
+          : generated.jvmScalarLoop ? "scalar"
+            : generated.jvmSynchronous ? "generated-sync" : "generated-async")
+      : null;
+    if (!timingKey && !exclusiveTiming) {
+      return generated(frame, thread, this, initialBytecodeChecks);
+    }
+    let result;
+    try {
+      result = generated(frame, thread, this, initialBytecodeChecks);
+    } catch (error) {
+      this.endExclusiveTiming(exclusiveTiming);
+      throw error;
+    }
+    if (result && typeof result.then === "function") {
+      return result.then((value) => {
+        if (timingKey) this.recordMethodTiming(timingKey,
+          this.monotonicNow() - timingStarted, generated);
+        this.endExclusiveTiming(exclusiveTiming);
+        return value;
+      }, (error) => {
+        if (timingKey) this.recordMethodTiming(timingKey,
+          this.monotonicNow() - timingStarted, generated);
+        this.endExclusiveTiming(exclusiveTiming);
+        throw error;
+      });
+    }
+    if (timingKey) this.recordMethodTiming(timingKey,
+      this.monotonicNow() - timingStarted, generated);
+    this.endExclusiveTiming(exclusiveTiming);
+    return result;
+  }
+
+  beginExclusiveTiming(methodKey, tier) {
+    if (!this.exclusiveTimingsEnabled) return null;
+    const stack = this.exclusiveTimingStack;
+    if (!stack.length && this.exclusiveTimingRootKey &&
+        methodKey !== this.exclusiveTimingRootKey) return null;
+    const now = this.monotonicNow();
+    const parent = stack[stack.length - 1];
+    if (parent) parent.exclusiveMs += now - parent.resumedAt;
+    const context = {
+      methodKey, tier, startedAt: now, resumedAt: now, exclusiveMs: 0,
+    };
+    stack.push(context);
+    return context;
+  }
+
+  endExclusiveTiming(context) {
+    if (!context) return;
+    const now = this.monotonicNow();
+    const stack = this.exclusiveTimingStack;
+    if (stack[stack.length - 1] !== context) {
+      // A profiler must never affect guest execution. Drop inconsistent state
+      // rather than throwing through the JVM if an unexpected async re-entry
+      // violates the single-threaded nesting assumption.
+      stack.length = 0;
+      return;
+    }
+    context.exclusiveMs += now - context.resumedAt;
+    stack.pop();
+    const previous = this.exclusiveTimingSamples.get(context.methodKey) || {
+      tier: context.tier, samples: 0, totalMs: 0, inclusiveMs: 0, maxMs: 0,
+    };
+    previous.samples += 1;
+    previous.totalMs += context.exclusiveMs;
+    previous.inclusiveMs += now - context.startedAt;
+    previous.maxMs = Math.max(previous.maxMs, context.exclusiveMs);
+    previous.tier = context.tier;
+    this.exclusiveTimingSamples.set(context.methodKey, previous);
+    const parent = stack[stack.length - 1];
+    if (parent) {
+      const edgeKey = `${parent.methodKey}\0${context.methodKey}`;
+      const edge = this.exclusiveTimingEdges.get(edgeKey) || {
+        parent: parent.methodKey, child: context.methodKey,
+        tier: context.tier, totalMs: 0, maxMs: 0,
+      };
+      const inclusiveMs = now - context.startedAt;
+      edge.totalMs += inclusiveMs;
+      edge.maxMs = Math.max(edge.maxMs, inclusiveMs);
+      edge.tier = context.tier;
+      this.exclusiveTimingEdges.set(edgeKey, edge);
+      parent.resumedAt = now;
+    }
+  }
+
+  monotonicNow() {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") return performance.now();
+    if (typeof process !== "undefined" && process.hrtime?.bigint) {
+      return Number(process.hrtime.bigint()) / 1e6;
+    }
+    return Date.now();
+  }
+
+  recordMethodTiming(methodKey, elapsedMs, generated) {
+    const previous = this.methodTimingSamples.get(methodKey) || {
+      samples: 0, totalMs: 0, maxMs: 0,
+      tier: generated.jvmStructuredSsa ? "structured"
+        : generated.jvmScalarLoop ? "scalar"
+          : generated.jvmSynchronous ? "generated-sync" : "generated-async",
+    };
+    previous.samples += 1;
+    previous.totalMs += elapsedMs;
+    previous.maxMs = Math.max(previous.maxMs, elapsedMs);
+    this.methodTimingSamples.set(methodKey, previous);
   }
 
   recordExecution(counts, frame) {
@@ -314,13 +510,14 @@ class JitCompiler {
       "i2b", "iadd", "iand", "idiv", "imul", "ineg", "ior", "irem",
       "ishl", "ishr", "isub", "ixor",
     ]);
-    const longOps = new Set(["i2l", "lcmp", "ldiv", "lxor"]);
+    const longOps = new Set(["i2l", "l2i", "lcmp", "ldiv", "lmul", "lshr", "lxor"]);
     const hasNumericHotPath = codeItems.some((item) => {
       const op = typeof item.instruction === "string" ? item.instruction : item.instruction && item.instruction.op;
       return op && (doubleOps.has(op) || floatOps.has(op) || integerOps.has(op) || longOps.has(op) || op === "i2d" ||
         op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float" || item.instruction.arg === "int"));
     });
-    const eligibleShape = hasNumericHotPath || this.hasBackwardBranch(method);
+    const eligibleShape = hasNumericHotPath || this.hasBackwardBranch(method) ||
+      this.hasCallDenseComputeShape(method, codeItems);
 
     const allowed = new Set([
       "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
@@ -341,7 +538,8 @@ class JitCompiler {
       "ifle", "iflt", "ifne", "ifnonnull", "ifnull", "iload", "iload_0",
       "iload_1", "iload_2", "iload_3", "imul", "inc", "iinc",
       "invokeinterface", "invokespecial", "invokestatic", "invokevirtual", "istore", "istore_0",
-      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lreturn", "lxor",
+      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor",
+      ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return", "saload", "sastore",
       "sipush"
     ]);
@@ -397,7 +595,8 @@ class JitCompiler {
       "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
       "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
       "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
-      "istore_3", "isub", "ixor", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lreturn", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
     ]);
 
@@ -424,11 +623,14 @@ class JitCompiler {
         || op === "ixor"
         || op === "lcmp"
         || op === "ldiv"
+        || op === "lmul"
+        || op === "lshr"
         || op === "lxor"
         || (op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float"))
       );
     });
     const supported = (hasNumericHotPath || this.hasBackwardBranch(method) ||
+      this.hasCallDenseComputeShape(method, codeItems) ||
       this.isShortSupportedHelper(method)) && codeItems.every((item) => {
       const op = getOp(item && item.instruction);
       return !op || supportedOps.has(op);
@@ -504,10 +706,23 @@ class JitCompiler {
     const allowed = new Set([
       "aaload", "aload", "aload_0", "aload_1", "aload_2", "aload_3", "areturn",
       "arraylength", "freturn", "getfield", "getstatic", "iconst_0", "iconst_1",
-      "iload", "iload_0", "iload_1", "iload_2", "iload_3", "invokeinterface", "invokevirtual",
+      "iload", "iload_0", "iload_1", "iload_2", "iload_3", "invokeinterface", "invokestatic", "invokevirtual",
       "ireturn", "putfield", "putstatic", "return",
     ]);
     return codeItems.every((item) => !item.instruction || allowed.has(getOp(item.instruction)));
+  }
+
+  hasCallDenseComputeShape(method, codeItems) {
+    if (method.name === "<init>" || method.name === "<clinit>") return false;
+    // Small forwarding/call-chain helpers can be hot without containing a
+    // loop or arithmetic of their own. Keep this a bytecode-shape decision;
+    // supported-op and control-flow checks still run at the caller.
+    const instructions = codeItems.filter((item) => item && item.instruction);
+    if (instructions.length > 64) return false;
+    return instructions.filter((item) => {
+      const op = getOp(item.instruction);
+      return op && op.startsWith("invoke");
+    }).length >= 2;
   }
 
   getLabelMap(frame) {
@@ -574,6 +789,32 @@ class JitCompiler {
     return Boolean(debug && (debug.debugMode || debug.breakpoints.size > 0));
   }
 
+  // A generated region's safe-point budget is a fairness heuristic, not a JVM
+  // observable. At a budget boundary the region may keep running only while
+  // nothing can observe the difference: no debugger, no deterministic clock,
+  // no other runnable thread, no expired sleep/wait deadline, and the
+  // wall-clock event-loop yield deadline has not passed.
+  continueQuantum(thread) {
+    const jvm = this.jvm;
+    if (!jvm || !thread || thread.status !== "runnable") return false;
+    const debug = jvm.debugManager;
+    if (debug && (debug.debugMode || debug.breakpoints.size > 0)) return false;
+    if (jvm.clock && jvm.clock.enabled) return false;
+    const now = Date.now();
+    if (!(now < jvm._nextEventLoopYieldAt)) return false;
+    const threads = jvm.threads || [];
+    for (let index = 0; index < threads.length; index += 1) {
+      const other = threads[index];
+      if (other === thread) continue;
+      if (other.status === "runnable") return false;
+      if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
+          now >= Number(other.sleepUntil)) return false;
+      if (other.status === "WAITING" && other.waitDeadline !== undefined &&
+          now >= Number(other.waitDeadline)) return false;
+    }
+    return true;
+  }
+
   skipJitOnce(frame) {
     frame.jitSkipOnce = true;
   }
@@ -587,10 +828,646 @@ class JitCompiler {
   }
 
   compileMethod(method) {
+    const structuredSsa = this.structuredSsa.compile(method);
+    if (structuredSsa) return this.withResumeBody(structuredSsa, method);
+    const scalarLoop = this.compileScalarIntegerLoop(method);
+    if (scalarLoop) return this.withResumeBody(scalarLoop, method);
+
     const stackless = this.compileStacklessIntegerRaster(method);
-    if (stackless) return stackless;
+    if (stackless) return this.withResumeBody(stackless, method);
 
     return this.compileBaselineMethod(method);
+  }
+
+  // Fast tiers enter only at PC 0 (or block leaders). Without a resumable
+  // companion, a frame that exits mid-method (safe point, transient deopt)
+  // finishes its invocation one interpreted bytecode per scheduler tick. The
+  // baseline generated body can resume at any PC, so entry dispatches on the
+  // frame PC instead of deoptimizing.
+  withResumeBody(fast, method) {
+    let resume = null;
+    try { resume = this.compileBaselineMethod(method); } catch (_) { resume = null; }
+    if (!resume || resume.jvmSynchronous !== true) return fast;
+    const dispatcher = function (frame, thread, helpers, initialBytecodeChecks) {
+      return frame.pc === 0
+        ? fast(frame, thread, helpers, initialBytecodeChecks)
+        : resume(frame, thread, helpers, initialBytecodeChecks);
+    };
+    for (const key of Object.keys(fast)) dispatcher[key] = fast[key];
+    dispatcher.jvmSynchronous = true;
+    dispatcher.jvmResumeBody = true;
+    dispatcher.jvmFastBody = fast;
+    dispatcher.jvmResumeBodyFn = resume;
+    // Source inspection (diagnostics, tests) should see the fast tier's body.
+    dispatcher.toString = () => fast.toString();
+    return dispatcher;
+  }
+
+  compileScalarIntegerLoop(method) {
+    if (!this.scalarLoopsEnabled || !this.canCompileSynchronously(method) ||
+        !this.hasBackwardBranch(method)) {
+      return null;
+    }
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code) return null;
+    const codeItems = this.getCodeItems(method);
+    if ((code.code.exceptionTable || []).length &&
+        !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return null;
+    if (codeItems.length < 6 || codeItems.length > 1024) return null;
+    const labels = buildLabelMap(codeItems);
+    const depths = this.computeStackDepths(codeItems, labels);
+    if (!depths) return null;
+    const reachable = new Set(depths.map((depth, index) => depth === undefined ? -1 : index)
+      .filter((index) => index >= 0));
+
+    const localIndex = (instruction, op) => {
+      if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
+        return Number(instruction.arg);
+      }
+      const match = /_([0-3])$/.exec(op || "");
+      return match ? Number(match[1]) : NaN;
+    };
+    const inlinePlans = new Map();
+    const callSites = new Map();
+    const fieldSites = new Map();
+    const supported = codeItems.every((item, index) => {
+      if (!reachable.has(index)) return true;
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (op === "ldc" || op === "ldc_w") return typeof instruction.arg === "number";
+      if (!op || op === "nop" || op === "goto" || op === "return" ||
+          op === "ireturn" || op === "athrow" || op === "iinc" || op === "dup" ||
+          op === "pop" || op === "aconst_null" || op === "arraylength" ||
+          op === "newarray" || op === "checkcast" ||
+          /^[ai]load(?:_[0-3])?$/.test(op) || /^[ai]store(?:_[0-3])?$/.test(op) ||
+          /^iconst_(?:m1|[0-5])$/.test(op) || op === "bipush" || op === "sipush" ||
+          ["iadd", "isub", "imul", "idiv", "irem", "iand", "ior", "ixor",
+            "ishl", "ishr", "iushr", "ineg", "i2b"].includes(op) ||
+          ["iaload", "saload", "aaload", "iastore"].includes(op) ||
+          ["ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle",
+            "if_icmpeq", "if_icmpne", "if_icmplt", "if_icmpge",
+            "if_icmpgt", "if_icmple", "if_acmpeq", "if_acmpne",
+            "ifnull", "ifnonnull"].includes(op)) {
+        return true;
+      }
+      if (op === "getfield" || op === "getstatic" || op === "putstatic") {
+        fieldSites.set(index, this.registerFieldSite(instruction.arg));
+        return true;
+      }
+      if (op === "invokestatic" && instruction && Array.isArray(instruction.arg) &&
+          Array.isArray(instruction.arg[2])) {
+        const plan = this.getCompileTimeIntegerLeaf(instruction);
+        if (plan) inlinePlans.set(index, plan);
+        else callSites.set(index, {
+          id: this.registerSyncCallSite(op, instruction),
+          op,
+          ...parseDescriptor(instruction.arg[2][1]),
+        });
+        return true;
+      }
+      return false;
+    });
+    if (!supported) return null;
+    const expandedGuestBody = (code.code.exceptionTable || []).length > 0 ||
+      callSites.size > 0 || fieldSites.size > 0 || codeItems.some((item, index) => {
+        if (!reachable.has(index)) return false;
+        const op = getOp(item && item.instruction);
+        return op && (/^a(?:load|store)(?:_[0-3])?$/.test(op) ||
+          ["aconst_null", "arraylength", "newarray", "checkcast",
+            "iaload", "saload", "aaload", "iastore",
+            "if_acmpeq", "if_acmpne", "ifnull", "ifnonnull"].includes(op));
+      });
+    if (expandedGuestBody && !this.scalarGuestBodiesEnabled) return null;
+    // Per-method profiling must retain observable callee entries. Pure loops
+    // still use the scalar tier; loops with omitted static frames keep the
+    // normal generated call path while profiling is active.
+    if (this.profileMethods && inlinePlans.size) return null;
+
+    const usedLocals = new Set();
+    const referenceLocals = new Set();
+    for (let itemIndex = 0; itemIndex < codeItems.length; itemIndex += 1) {
+      if (!reachable.has(itemIndex)) continue;
+      const item = codeItems[itemIndex];
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (/^[ai]load(?:_[0-3])?$/.test(op) || /^[ai]store(?:_[0-3])?$/.test(op)) {
+        const index = localIndex(instruction, op);
+        if (!Number.isSafeInteger(index) || index < 0) return null;
+        usedLocals.add(index);
+        if (op[0] === "a") referenceLocals.add(index);
+      } else if (op === "iinc") {
+        const index = Number(instruction.varnum ?? instruction.arg);
+        if (!Number.isSafeInteger(index) || index < 0) return null;
+        usedLocals.add(index);
+      }
+    }
+
+    const terminal = new Set(["athrow", "ireturn", "return"]);
+    const leaders = new Set([0]);
+    for (let index = 0; index < codeItems.length; index += 1) {
+      if (!reachable.has(index)) continue;
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      if (op === "goto" || op && op.startsWith("if")) {
+        const target = branchTargetIndex(instruction, labels);
+        if (target === undefined) return null;
+        leaders.add(target);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      } else if (callSites.has(index)) {
+        leaders.add(index);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      } else if (terminal.has(op) && index + 1 < codeItems.length) {
+        leaders.add(index + 1);
+      }
+    }
+    const orderedLeaders = [...leaders].filter((index) => reachable.has(index))
+      .sort((a, b) => a - b);
+    const maxStackDepth = depths.reduce((maximum, depth) =>
+      depth === undefined ? maximum : Math.max(maximum, depth), 0);
+    const nextLeader = new Map();
+    orderedLeaders.forEach((leader, position) => {
+      nextLeader.set(leader, orderedLeaders[position + 1] ?? codeItems.length);
+    });
+
+    let temporary = 0;
+    const temp = () => `scalarValue${temporary++}`;
+    const ssaOptimizations = this.scalarSsaOptimizationsEnabled;
+    let arrayViewCount = 0;
+    let eliminatedReadCount = 0;
+    let threadedEdgeCount = 0;
+    const body = [
+      '"use strict";',
+      "const locals = frame.locals;",
+      "const stack = frame.stack.items;",
+      "let pc = frame.pc;",
+      "let backedgesUntilSafePoint = 10000;",
+      ...[...usedLocals].sort((a, b) => a - b)
+        .map((index) => `let local${index} = locals[${index}];`),
+      ...(ssaOptimizations ? [...referenceLocals].sort((a, b) => a - b)
+        .map((index) => `let local${index}ArrayData = helpers.arrayData(local${index});`) : []),
+      ...Array.from({ length: maxStackDepth }, (_unused, index) =>
+        `let scalarJoin${index} = stack[${index}];`),
+      ...(ssaOptimizations ? Array.from({ length: maxStackDepth }, (_unused, index) =>
+        `let scalarJoin${index}ArrayData = helpers.arrayData(stack[${index}]);`) : []),
+      "if ((initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) return { deopt: true, transient: true, reason: 'scalar loop debug entry' };",
+      "helpers.scalarLoopRunCount += 1;",
+      ...(ssaOptimizations ? ["helpers.scalarSsaRunCount += 1;"] : []),
+      "while (true) {",
+      "switch (pc) {",
+    ];
+    const spillLocals = () => [...usedLocals].sort((a, b) => a - b)
+      .map((index) => `locals[${index}] = local${index};`);
+    const saveStack = (expressions) => [
+      ...expressions.map((expression, index) => `stack[${index}] = ${expression};`),
+      `stack.length = ${expressions.length};`,
+    ];
+    let activeArrayViews = null;
+    const saveJoin = (expressions) => expressions.flatMap((expression, index) => {
+      const lines = [`scalarJoin${index} = ${expression};`];
+      if (ssaOptimizations) {
+        lines.push(`scalarJoin${index}ArrayData = ${activeArrayViews?.get(expression) || "null"};`);
+      }
+      return lines;
+    });
+    const materialize = (expressions, pc) => [
+      ...spillLocals(), ...saveStack(expressions),
+      `helpers.materialize(frame, locals, stack, ${pc});`,
+    ];
+    const transfer = (expressions, target, source) => {
+      const lines = [];
+      if (target <= source) {
+        lines.push("if (--backedgesUntilSafePoint === 0) {");
+        lines.push("if (helpers.continueQuantum(thread)) { backedgesUntilSafePoint = 10000; } else {");
+        lines.push(...materialize(expressions, target));
+        lines.push("helpers.scalarLoopSafePointCount += 1;");
+        lines.push("helpers.skipJitOnce(frame);");
+        lines.push("return { deopt: true, transient: true, reason: 'scalar loop backedge safe point' };", "}", "}");
+      }
+      lines.push(...saveJoin(expressions), `pc = ${target};`, "continue;");
+      return lines;
+    };
+
+    for (const leader of orderedLeaders) {
+      const entryDepth = depths[leader];
+      if (entryDepth === undefined) continue;
+      body.push(`case ${leader}: {`);
+      const expressions = [];
+      const arrayViews = new Map();
+      const valueIdentities = new Map();
+      const localVersions = new Map();
+      const fieldValues = new Map();
+      const arrayLengths = new Map();
+      activeArrayViews = arrayViews;
+      for (let index = 0; index < entryDepth; index += 1) {
+        const value = temp();
+        body.push(`const ${value} = scalarJoin${index};`);
+        expressions.push(value);
+        if (ssaOptimizations) {
+          arrayViews.set(value, `scalarJoin${index}ArrayData`);
+          valueIdentities.set(value, `join:${index}`);
+        }
+      }
+      const pop = () => expressions.length ? expressions.pop() : null;
+      const binary = (format) => {
+        const right = pop();
+        const left = pop();
+        if (left === null || right === null) return false;
+        expressions.push(format(left, right));
+        return true;
+      };
+      let terminated = false;
+      const end = nextLeader.get(leader);
+      for (let index = leader; index < end; index += 1) {
+        const instruction = codeItems[index] && codeItems[index].instruction;
+        const op = getOp(instruction);
+        if (!op || op === "nop") continue;
+        let valid = true;
+        if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+          // A JVM load snapshots the local at this bytecode. A later iinc or
+          // store must not change an operand that is already on the stack.
+          const value = temp();
+          const variable = localIndex(instruction, op);
+          body.push(`const ${value} = local${variable};`);
+          expressions.push(value);
+          if (ssaOptimizations && op[0] === "a") {
+            arrayViews.set(value, `local${variable}ArrayData`);
+            valueIdentities.set(value, `local:${variable}:${localVersions.get(variable) || 0}`);
+          }
+        } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            const variable = localIndex(instruction, op);
+            body.push(`local${variable} = ${value};`);
+            if (ssaOptimizations && op[0] === "a") {
+              body.push(`local${variable}ArrayData = ${arrayViews.get(value) || `helpers.arrayData(${value})`};`);
+              localVersions.set(variable, (localVersions.get(variable) || 0) + 1);
+            }
+          }
+        } else if (op === "aconst_null") {
+          expressions.push("null");
+        } else if (/^iconst_(?:m1|[0-5])$/.test(op)) {
+          expressions.push(op === "iconst_m1" ? "-1" : op.slice(-1));
+        } else if (op === "bipush" || op === "sipush") {
+          expressions.push(String(Number(instruction.arg) | 0));
+        } else if (op === "ldc" || op === "ldc_w") {
+          expressions.push(String(Number(instruction.arg) | 0));
+        } else if (op === "dup") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            const duplicate = temp();
+            body.push(`const ${duplicate} = ${value};`);
+            expressions.push(duplicate, duplicate);
+            if (ssaOptimizations && arrayViews.has(value)) {
+              arrayViews.set(duplicate, arrayViews.get(value));
+            }
+            if (ssaOptimizations && valueIdentities.has(value)) {
+              valueIdentities.set(duplicate, valueIdentities.get(value));
+            }
+          }
+        } else if (op === "pop") {
+          if (pop() === null) valid = false;
+        } else if (op === "iadd") valid = binary((a, b) => `((${a} + ${b}) | 0)`);
+        else if (op === "isub") valid = binary((a, b) => `((${a} - ${b}) | 0)`);
+        else if (op === "imul") valid = binary((a, b) => `Math.imul(${a}, ${b})`);
+        else if (op === "iand") valid = binary((a, b) => `(${a} & ${b})`);
+        else if (op === "ior") valid = binary((a, b) => `(${a} | ${b})`);
+        else if (op === "ixor") valid = binary((a, b) => `(${a} ^ ${b})`);
+        else if (op === "ishl") valid = binary((a, b) => `(${a} << (${b} & 31))`);
+        else if (op === "ishr") valid = binary((a, b) => `(${a} >> (${b} & 31))`);
+        else if (op === "iushr") valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`);
+        else if (op === "ineg" || op === "i2b") {
+          const value = pop();
+          if (value === null) valid = false;
+          else expressions.push(op === "ineg" ? `((-${value}) | 0)` : `((${value} << 24) >> 24)`);
+        } else if (op === "idiv" || op === "irem") {
+          const divisorExpression = pop();
+          const dividendExpression = pop();
+          if (divisorExpression === null || dividendExpression === null) valid = false;
+          else {
+            const dividend = temp();
+            const divisor = temp();
+            body.push(`const ${dividend} = ${dividendExpression};`, `const ${divisor} = ${divisorExpression};`);
+            body.push(`if (${divisor} === 0) {`);
+            body.push(...materialize([...expressions, dividend, divisor], index));
+            body.push('throw { type: "java/lang/ArithmeticException", message: "/ by zero" };', "}");
+            expressions.push(op === "idiv" ? `((${dividend} / ${divisor}) | 0)`
+              : `((${dividend} % ${divisor}) | 0)`);
+          }
+        } else if (op === "iinc") {
+          const variable = Number(instruction.varnum ?? instruction.arg);
+          const increment = Number(instruction.incr ?? 0);
+          body.push(`local${variable} = (local${variable} + ${increment}) | 0;`);
+        } else if (op === "newarray") {
+          const countExpression = pop();
+          if (countExpression === null) valid = false;
+          else {
+            const count = temp();
+            const value = temp();
+            const caught = temp();
+            body.push(`const ${count} = ${countExpression}; let ${value}; try { ${value} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`);
+            body.push(...materialize([...expressions, count], index));
+            body.push(`throw ${caught};`, "}");
+            expressions.push(value);
+            if (ssaOptimizations) arrayViews.set(value, value);
+          }
+        } else if (op === "checkcast") {
+          const value = expressions[expressions.length - 1];
+          if (value === undefined) valid = false;
+          else {
+            const cast = temp();
+            const caught = temp();
+            body.push(`let ${cast}; try { ${cast} = helpers.tryCheckCastSync(${value}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`);
+            body.push(...materialize(expressions, index));
+            body.push(`throw ${caught};`, "}");
+            body.push(`if (${cast} === helpers.asyncInvokeSentinel()) {`);
+            body.push(...materialize(expressions, index));
+            body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'cold scalar checkcast' };", "}");
+          }
+        } else if (op === "arraylength") {
+          const arrayExpression = pop();
+          if (arrayExpression === null) valid = false;
+          else {
+            const identity = ssaOptimizations && valueIdentities.get(arrayExpression);
+            const previousLength = identity && arrayLengths.get(identity);
+            if (previousLength) {
+              expressions.push(previousLength);
+              eliminatedReadCount += 1;
+              continue;
+            }
+            const array = temp();
+            const length = temp();
+            body.push(`const ${array} = ${arrayExpression};`);
+            body.push(`if (${array} === null || ${array} === undefined) {`);
+            body.push(...materialize([...expressions, array], index));
+            body.push(`helpers.arrayLength(${array}, frame);`, "}");
+            body.push(`const ${length} = ${array}.length;`);
+            expressions.push(length);
+            if (identity) arrayLengths.set(identity, length);
+          }
+        } else if (op === "iaload" || op === "saload" || op === "aaload") {
+          const arrayIndexExpression = pop();
+          const arrayExpression = pop();
+          if (arrayIndexExpression === null || arrayExpression === null) valid = false;
+          else {
+            const array = temp();
+            const arrayData = ssaOptimizations ? temp() : null;
+            const arrayIndex = temp();
+            const value = temp();
+            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `helpers.arrayData(${array})`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; let ${value};`);
+            body.push(`if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`);
+            body.push(...materialize([...expressions, array, arrayIndex], index));
+            body.push(`${value} = helpers.arrayLoad(${arrayIndex}, ${array}, frame);`, "} else {");
+            if (ssaOptimizations) {
+              body.push(`${value} = ${arrayData} !== null ? ${arrayData}[${arrayIndex}] : (${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}]);`, "}");
+              arrayViewCount += 1;
+            } else {
+              body.push(`${value} = ${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}];`, "}");
+            }
+            expressions.push(value);
+          }
+        } else if (op === "iastore") {
+          const valueExpression = pop();
+          const arrayIndexExpression = pop();
+          const arrayExpression = pop();
+          if (valueExpression === null || arrayIndexExpression === null || arrayExpression === null) {
+            valid = false;
+          } else {
+            const array = temp();
+            const arrayData = ssaOptimizations ? temp() : null;
+            const arrayIndex = temp();
+            const value = temp();
+            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `helpers.arrayData(${array})`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; const ${value} = ${valueExpression};`);
+            body.push(`if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`);
+            body.push(...materialize([...expressions, array, arrayIndex, value], index));
+            if (ssaOptimizations) {
+              body.push(`helpers.arrayStore(${value}, ${arrayIndex}, ${array}, frame);`, `} else if (${arrayData} !== null) {`, `${arrayData}[${arrayIndex}] = ${value};`, `} else if (${array}.elements) {`, `${array}.elements[${arrayIndex}] = ${value};`, "} else {", `${array}[${arrayIndex}] = ${value};`, "}");
+              arrayViewCount += 1;
+            } else {
+              body.push(`helpers.arrayStore(${value}, ${arrayIndex}, ${array}, frame);`, "} else if (", `${array}.elements) {`, `${array}.elements[${arrayIndex}] = ${value};`, "} else {", `${array}[${arrayIndex}] = ${value};`, "}");
+            }
+          }
+        } else if (op === "getfield") {
+          const objectExpression = pop();
+          if (objectExpression === null) valid = false;
+          else {
+            const siteId = fieldSites.get(index);
+            const identity = ssaOptimizations && valueIdentities.get(objectExpression);
+            // Field-site ids are deliberately per-bytecode for inline caches;
+            // value numbering instead uses the symbolic constant-pool target.
+            const symbolicField = ssaOptimizations &&
+              this.canEliminateFieldRead(instruction.arg) && JSON.stringify(instruction.arg);
+            const fieldIdentity = symbolicField && identity && `${symbolicField}|${identity}`;
+            const previousValue = fieldIdentity && fieldValues.get(fieldIdentity);
+            if (previousValue) {
+              expressions.push(previousValue);
+              eliminatedReadCount += 1;
+              continue;
+            }
+            const object = temp();
+            const value = temp();
+            body.push(`const ${object} = ${objectExpression};`);
+            body.push(`if (${object} === null || ${object} === undefined) {`);
+            body.push(...materialize([...expressions, object], index));
+            body.push(`helpers.getFieldAt(${siteId}, ${object});`, "}");
+            body.push(`const ${value} = helpers.getFieldAt(${siteId}, ${object});`);
+            expressions.push(value);
+            if (fieldIdentity) {
+              fieldValues.set(fieldIdentity, value);
+              valueIdentities.set(value, `field:${fieldIdentity}`);
+            }
+            if (ssaOptimizations && this.fieldSites[siteId]?.descriptor?.startsWith("[")) {
+              const data = temp();
+              body.push(`const ${data} = helpers.arrayData(${value});`);
+              arrayViews.set(value, data);
+            }
+          }
+        } else if (op === "getstatic") {
+          const value = temp();
+          const siteId = fieldSites.get(index);
+          body.push(`const ${value} = helpers.getStaticSyncAt(${siteId});`);
+          body.push(`if (${value} === helpers.staticDeopt()) {`);
+          body.push(...materialize(expressions, index));
+          body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'class initialization in scalar getstatic' };", "}");
+          expressions.push(value);
+          if (ssaOptimizations && this.fieldSites[siteId]?.descriptor?.startsWith("[")) {
+            const data = temp();
+            body.push(`const ${data} = helpers.arrayData(${value});`);
+            arrayViews.set(value, data);
+          }
+        } else if (op === "putstatic") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            const changed = temp();
+            const siteId = fieldSites.get(index);
+            body.push(`const ${changed} = helpers.putStaticSyncAt(${siteId}, ${value});`);
+            body.push(`if (${changed} === helpers.staticDeopt()) {`);
+            body.push(...materialize([...expressions, value], index));
+            body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'class initialization in scalar putstatic' };", "}");
+          }
+        } else if (op === "invokestatic") {
+          const plan = inlinePlans.get(index);
+          if (plan) {
+            const args = new Array(plan.paramCount);
+            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
+              args[argument] = pop();
+              if (args[argument] === null) valid = false;
+            }
+            if (!valid) return null;
+            const result = temp();
+            const substitute = (source) => source.replace(/stack\[base \+ (\d+)\]/g,
+              (_match, argument) => `(${args[Number(argument)]})`);
+            body.push(`let ${result};`, "{");
+            body.push(...plan.statements.map(substitute));
+            body.push(`${result} = ${substitute(plan.result)};`, "}");
+            expressions.push(result);
+          } else {
+            const site = callSites.get(index);
+            if (!site) valid = false;
+            else {
+              const argumentCount = site.params.length;
+              const base = expressions.length - argumentCount;
+              if (base < 0) valid = false;
+              else {
+                const beforeCall = expressions.slice();
+                body.push(...saveStack(beforeCall), `frame.pc = ${index + 1};`);
+                const value = temp();
+                const caught = temp();
+                body.push(`let ${value}; try { ${value} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`);
+                body.push(...materialize(beforeCall, index));
+                body.push(`throw ${caught};`, "}");
+                body.push(`if (${value} === helpers.asyncInvokeSentinel()) {`);
+                body.push(...materialize(beforeCall, index));
+                body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'asynchronous scalar callee' };", "}");
+                body.push(`if (${value} && ${value}.deopt) {`, ...spillLocals(), `return ${value};`, "}");
+                body.push(`if (${value} !== helpers.returnVoid()) stack.push(${value});`);
+                body.push("if (thread.status !== 'runnable') {", ...spillLocals(),
+                  `helpers.materialize(frame, locals, stack, ${index + 1});`,
+                  "return { deopt: true, transient: true, reason: 'thread yielded in scalar callee' };", "}");
+                const resultDepth = base + (site.returnType === "void" ? 0 : 1);
+                body.push(`stack.length = ${resultDepth};`);
+                body.push(...Array.from({ length: resultDepth }, (_unused, slot) =>
+                  `scalarJoin${slot} = stack[${slot}];`));
+                if (ssaOptimizations) {
+                  body.push(...Array.from({ length: resultDepth }, (_unused, slot) =>
+                    `scalarJoin${slot}ArrayData = helpers.arrayData(stack[${slot}]);`));
+                }
+                body.push(`pc = ${index + 1}; continue;`);
+                terminated = true;
+              }
+            }
+          }
+        } else if (op === "goto") {
+          const target = branchTargetIndex(instruction, labels);
+          if (ssaOptimizations && target === end) {
+            body.push(...saveJoin(expressions));
+            threadedEdgeCount += 1;
+            terminated = true;
+          } else {
+            body.push(...transfer(expressions, target, index));
+            terminated = true;
+          }
+        } else if (op && op.startsWith("if")) {
+          let condition;
+          if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) {
+            const right = pop();
+            const left = pop();
+            const comparisons = {
+              if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<", if_icmpge: ">=",
+              if_icmpgt: ">", if_icmple: "<=", if_acmpeq: "===", if_acmpne: "!==",
+            };
+            if (left === null || right === null || !comparisons[op]) valid = false;
+            else condition = `${left} ${comparisons[op]} ${right}`;
+          } else {
+            const value = pop();
+            const comparisons = {
+              ifeq: "=== 0", ifne: "!== 0", iflt: "< 0", ifge: ">= 0",
+              ifgt: "> 0", ifle: "<= 0", ifnull: "=== null", ifnonnull: "!== null",
+            };
+            if (value === null || !comparisons[op]) valid = false;
+            else condition = `${value} ${comparisons[op]}`;
+          }
+          if (valid) {
+            const target = branchTargetIndex(instruction, labels);
+            const backward = target <= index;
+            if (backward) {
+              body.push(`if (${condition}) {`);
+              body.push(...transfer(expressions, target, index));
+              body.push("}");
+              if (ssaOptimizations && index + 1 === end) {
+                body.push(...saveJoin(expressions));
+                threadedEdgeCount += 1;
+              } else {
+                body.push(...transfer(expressions, index + 1, -1));
+              }
+            } else {
+              body.push(...saveJoin(expressions));
+              if (ssaOptimizations && index + 1 === end) {
+                body.push(`if (${condition}) { pc = ${target}; continue; }`);
+                threadedEdgeCount += 1;
+              } else {
+                body.push(`pc = (${condition}) ? ${target} : ${index + 1};`, "continue;");
+              }
+            }
+            terminated = true;
+          }
+        } else if (op === "athrow") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            body.push(...materialize([...expressions, value], index));
+            body.push(`throw ${value};`);
+            terminated = true;
+          }
+        } else if (op === "ireturn") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            body.push(...materialize(expressions, index + 1));
+            body.push(`thread.callStack.pop(); return { returned: true, value: ${value} };`);
+            terminated = true;
+          }
+        } else if (op === "return") {
+          body.push(...materialize(expressions, index + 1));
+          body.push("thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };");
+          terminated = true;
+        } else valid = false;
+
+        if (!valid) return null;
+        if (terminated) break;
+      }
+      if (!terminated) {
+        if (ssaOptimizations && orderedLeaders.includes(end)) {
+          body.push(...saveJoin(expressions));
+          threadedEdgeCount += 1;
+        } else {
+          body.push(...transfer(expressions, end, -1));
+        }
+      }
+      body.push("}");
+    }
+    body.push("default: helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'scalar loop non-leader entry' };");
+    body.push("}", "}");
+    try {
+      const generated = new Function("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      generated.jvmSynchronous = true;
+      generated.jvmScalarLoop = true;
+      generated.jvmScalarSsa = ssaOptimizations;
+      generated.jvmScalarArrayViewCount = arrayViewCount;
+      generated.jvmScalarEliminatedReadCount = eliminatedReadCount;
+      generated.jvmScalarThreadedEdgeCount = threadedEdgeCount;
+      generated.jvmDirectInlineCount = inlinePlans.size;
+      if (ssaOptimizations) {
+        this.scalarSsaArrayViewCount += arrayViewCount;
+        this.scalarSsaEliminatedReadCount += eliminatedReadCount;
+        this.scalarSsaThreadedEdgeCount += threadedEdgeCount;
+      }
+      return generated;
+    } catch (_) {
+      return null;
+    }
   }
 
   compileBaselineMethod(method) {
@@ -605,6 +1482,8 @@ class JitCompiler {
     const codeItems = this.getCodeItems(method);
     this.compileLabelMap = buildLabelMap(codeItems);
     this.compileSynchronous = synchronous;
+    this.compileDirectInlineCount = 0;
+    let directInlineCount = 0;
     const body = [
       '"use strict";',
       "const locals = frame.locals;",
@@ -617,8 +1496,8 @@ class JitCompiler {
       `while (pc < ${codeItems.length}) {`,
       "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; sp = stack.length; } }",
       synchronous
-        ? "if (--bytecodesUntilYield === 0) { helpers.materializeCached(frame, locals, stack, sp, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'synchronous generated quantum' }; }"
-        : "if (--bytecodesUntilYield === 0) { helpers.materializeCached(frame, locals, stack, sp, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 10000; bytecodeChecks = helpers.needsBytecodeChecks(); }",
+        ? "if (--bytecodesUntilYield === 0) { if (helpers.continueQuantum(thread)) { bytecodesUntilYield = 10000; } else { helpers.materializeCached(frame, locals, stack, sp, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'synchronous generated quantum' }; } }"
+        : "if (--bytecodesUntilYield === 0) { if (helpers.continueQuantum(thread)) { bytecodesUntilYield = 10000; } else { helpers.materializeCached(frame, locals, stack, sp, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 10000; bytecodeChecks = helpers.needsBytecodeChecks(); } }",
       "if (bytecodeChecks && helpers.shouldDeopt(frame, pc)) { helpers.materializeCached(frame, locals, stack, sp, pc); return { deopt: true }; }",
       "switch (pc) {",
     ];
@@ -639,9 +1518,11 @@ class JitCompiler {
         }
         body.push(this.emitInstruction(instruction, index));
       });
+      directInlineCount = this.compileDirectInlineCount;
     } finally {
       this.compileLabelMap = null;
       this.compileSynchronous = false;
+      this.compileDirectInlineCount = 0;
     }
 
     body.push("default: helpers.materializeCached(frame, locals, stack, sp, pc); return { deopt: true, reason: 'invalid generated pc ' + pc };");
@@ -654,6 +1535,7 @@ class JitCompiler {
     try {
       const generated = new GeneratedFunction("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
       generated.jvmSynchronous = synchronous;
+      generated.jvmDirectInlineCount = directInlineCount;
       return generated;
     } catch (err) {
       if (err && err.name === "EvalError") {
@@ -666,8 +1548,7 @@ class JitCompiler {
   compileStacklessIntegerRaster(method) {
     const rasterDescriptor = "(IIIIIIIBIIII[IIIII)V";
     const wrapperDescriptor = "(IIIIIIIIIIIIZIII)V";
-    if (method.name !== "a" ||
-        method.descriptor !== rasterDescriptor && method.descriptor !== wrapperDescriptor) return null;
+    if (method.descriptor !== rasterDescriptor && method.descriptor !== wrapperDescriptor) return null;
     const code = method.attributes.find((attr) => attr.type === "code");
     const codeItems = this.getCodeItems(method);
     if (!this.canCompileSynchronously(method)) return null;
@@ -733,7 +1614,7 @@ class JitCompiler {
       "let blocksUntilYield = 10000;",
       "if ((initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) return { deopt: true, transient: true, reason: 'stackless raster debug entry' };",
       "while (true) {",
-      "if (--blocksUntilYield === 0) { helpers.materialize(frame, locals, stack, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'stackless raster quantum' }; }",
+      "if (--blocksUntilYield === 0) { if (helpers.continueQuantum(thread)) { blocksUntilYield = 10000; } else { helpers.materialize(frame, locals, stack, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'stackless raster quantum' }; } }",
       "switch (pc) {",
     ];
 
@@ -991,7 +1872,7 @@ class JitCompiler {
       const after = depths[index] + effect;
       if (after < 0) return null;
       const successors = [];
-      if (op === "goto") {
+      if (op === "goto" || op === "goto_w") {
         successors.push(branchTargetIndex(instruction, labels));
       } else if (op && op.startsWith("if")) {
         successors.push(index + 1, branchTargetIndex(instruction, labels));
@@ -1029,7 +1910,8 @@ class JitCompiler {
         op === "putstatic" || op === "new" || op === "newarray" ||
         op === "anewarray" || op === "multianewarray" || op === "arraylength" ||
         op === "monitorenter" || op === "monitorexit" || op === "idiv" ||
-        op === "irem" || op === "ldiv") return true;
+        op === "irem" || op === "ldiv" || op === "lrem" ||
+        op === "instanceof") return true;
     if (op.endsWith("aload") || op.endsWith("astore")) return true;
     return (op === "ldc" || op === "ldc_w") && isClassConstant(instruction.arg);
   }
@@ -1067,6 +1949,11 @@ class JitCompiler {
       case "fload_1": return `stack[sp++] = locals[1]; ${goNext}`;
       case "fload_2": return `stack[sp++] = locals[2]; ${goNext}`;
       case "fload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "lload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "lload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "lload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "lload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "lload_3": return `stack[sp++] = locals[3]; ${goNext}`;
       case "astore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
       case "astore_0": return `locals[0] = stack[--sp]; ${goNext}`;
       case "astore_1": return `locals[1] = stack[--sp]; ${goNext}`;
@@ -1087,6 +1974,11 @@ class JitCompiler {
       case "fstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
       case "fstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
       case "fstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "lstore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "lstore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "lstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "lstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "lstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
       case "iconst_0": return `stack[sp++] = 0; ${goNext}`;
       case "iconst_m1": return `stack[sp++] = -1; ${goNext}`;
       case "iconst_1": return `stack[sp++] = 1; ${goNext}`;
@@ -1099,6 +1991,8 @@ class JitCompiler {
       case "fconst_0": return `stack[sp++] = 0.0; ${goNext}`;
       case "fconst_1": return `stack[sp++] = 1.0; ${goNext}`;
       case "fconst_2": return `stack[sp++] = 2.0; ${goNext}`;
+      case "lconst_0": return `stack[sp++] = 0n; ${goNext}`;
+      case "lconst_1": return `stack[sp++] = 1n; ${goNext}`;
       case "bipush":
       case "sipush": return `stack[sp++] = ${Number(instruction.arg)}; ${goNext}`;
       case "ldc":
@@ -1109,6 +2003,7 @@ class JitCompiler {
         return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
       case "ldc2_w": return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
       case "dup": return `stack[sp] = stack[sp - 1]; sp += 1; ${goNext}`;
+      case "dup_x1": return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
       case "dup2": return `{ const value1 = stack[--sp]; if (typeof value1 === "bigint") { stack[sp++] = value1; stack[sp++] = value1; } else { const value2 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } } ${goNext}`;
       case "pop": return `sp -= 1; ${goNext}`;
       case "iadd": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] + b) | 0; } ${goNext}`;
@@ -1136,15 +2031,32 @@ class JitCompiler {
       case "fneg": return `stack[sp - 1] = Math.fround(-stack[sp - 1]); ${goNext}`;
       case "i2d": return goNext;
       case "i2b": return `stack[sp - 1] = (stack[sp - 1] << 24) >> 24; ${goNext}`;
+      case "i2s": return `stack[sp - 1] = (stack[sp - 1] << 16) >> 16; ${goNext}`;
+      case "i2c": return `stack[sp - 1] = stack[sp - 1] & 0xffff; ${goNext}`;
       case "i2l": return `stack[sp - 1] = BigInt(stack[sp - 1]); ${goNext}`;
       case "i2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
       case "f2d": return goNext;
       case "d2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
       case "f2i": return `stack[sp - 1] = helpers.floatToInt(stack[sp - 1]); ${goNext}`;
       case "d2i": return `stack[sp - 1] = Math.trunc(stack[sp - 1]) | 0; ${goNext}`;
-      case "lxor": return `{ const b = stack[--sp]; stack[sp - 1] ^= b; } ${goNext}`;
-      case "ldiv": return `{ const b = stack[--sp]; if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] /= b; } ${goNext}`;
-      case "lcmp": return `{ const b = stack[--sp]; const a = stack[sp - 1]; stack[sp - 1] = a < b ? -1 : (a > b ? 1 : 0); } ${goNext}`;
+      // Long operands are BigInt on the fast path but may arrive as plain
+      // Number 0 (uninitialized long fields); the interpreter wraps every
+      // operand in BigInt() before operating, and mixing throws in JS, so the
+      // generated tier must convert identically.
+      case "l2i": return `{ const value = stack[sp - 1]; stack[sp - 1] = Number(BigInt.asIntN(32, typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value))))); } ${goNext}`;
+      case "lxor": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) ^ BigInt(b)); } ${goNext}`;
+      case "ladd": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) + BigInt(b)); } ${goNext}`;
+      case "lsub": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) - BigInt(b)); } ${goNext}`;
+      case "land": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) & BigInt(b)); } ${goNext}`;
+      case "lor": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) | BigInt(b)); } ${goNext}`;
+      case "lneg": return `stack[sp - 1] = BigInt.asIntN(64, -BigInt(stack[sp - 1])); ${goNext}`;
+      case "lshl": return `{ const shift = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) << (BigInt(shift) & 63n)); } ${goNext}`;
+      case "lushr": return `{ const shift = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt.asUintN(64, BigInt(stack[sp - 1])) >> (BigInt(shift) & 63n)); } ${goNext}`;
+      case "lrem": return `{ const b = BigInt(stack[--sp]); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) % b); } ${goNext}`;
+      case "ldiv": return `{ const b = BigInt(stack[--sp]); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) / b); } ${goNext}`;
+      case "lmul": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) * BigInt(b)); } ${goNext}`;
+      case "lshr": return `{ const shift = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) >> (BigInt(shift) & 63n)); } ${goNext}`;
+      case "lcmp": return `{ const b = BigInt(stack[--sp]); const a = BigInt(stack[sp - 1]); stack[sp - 1] = a < b ? -1 : (a > b ? 1 : 0); } ${goNext}`;
       case "iinc": return `locals[${Number(instruction.varnum)}] = (locals[${Number(instruction.varnum)}] + ${Number(instruction.incr)}) | 0; ${goNext}`;
       case "dcmpg": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], 1); } ${goNext}`;
       case "dcmpl": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], -1); } ${goNext}`;
@@ -1156,12 +2068,18 @@ class JitCompiler {
           return `{ const cast = helpers.tryCheckCastSync(stack[sp - 1], ${JSON.stringify(instruction.arg)}); if (cast === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous checkcast" }; } } ${goNext}`;
         }
         return `{ const value = stack[sp - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
+      case "instanceof":
+        if (this.compileSynchronous) {
+          return `{ const result = helpers.tryInstanceOfSync(stack[sp - 1], ${JSON.stringify(instruction.arg)}); if (result === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous instanceof" }; } stack[sp - 1] = result; } ${goNext}`;
+        }
+        return `stack[sp - 1] = await helpers.instanceOf(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
       case "aaload":
       case "iaload":
       case "daload":
       case "faload":
       case "baload":
       case "caload":
+      case "laload":
       case "saload": return `{ const index = stack[--sp]; stack[sp - 1] = helpers.arrayLoad(index, stack[sp - 1], frame); } ${goNext}`;
       case "aastore":
       case "iastore":
@@ -1169,6 +2087,7 @@ class JitCompiler {
       case "fastore":
       case "bastore":
       case "castore":
+      case "lastore":
       case "sastore": return `{ const value = stack[--sp]; const index = stack[--sp]; helpers.arrayStore(value, index, stack[--sp], frame); } ${goNext}`;
       case "getfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
@@ -1202,6 +2121,17 @@ class JitCompiler {
       case "invokeinterface":
       case "invokespecial":
         if (this.compileSynchronous) {
+          const directInline = op === "invokestatic" && !this.profileMethods
+            ? this.getCompileTimeIntegerLeaf(instruction)
+            : null;
+          if (directInline) {
+            this.compileDirectInlineCount += 1;
+            const base = `inlineBase${this.compileDirectInlineCount}`;
+            const statements = directInline.statements
+              .map((line) => line.split("base").join(base)).join(" ");
+            const result = directInline.result.split("base").join(base);
+            return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
+          }
           const callSiteId = this.registerSyncCallSite(op, instruction);
           return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
         }
@@ -1413,6 +2343,7 @@ class JitCompiler {
         case "f2i": stack.push(floatToInt(stack.pop())); break;
         case "i2b": stack.push((stack.pop() << 24) >> 24); break;
         case "d2i": stack.push(Math.trunc(stack.pop()) | 0); break;
+        case "l2i": stack.push(Number(BigInt.asIntN(32, stack.pop()))); break;
         case "lxor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
         case "ldiv": {
           const b = stack.pop();
@@ -1421,6 +2352,8 @@ class JitCompiler {
           stack.push(a / b);
           break;
         }
+        case "lmul": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, a * b)); break; }
+        case "lshr": { const shift = stack.pop(); const value = stack.pop(); stack.push(value >> BigInt(shift & 63)); break; }
         case "lcmp": { const b = stack.pop(); const a = stack.pop(); stack.push(a < b ? -1 : (a > b ? 1 : 0)); break; }
         case "iand": stack.push(stack.pop() & stack.pop()); break;
         case "ior": stack.push(stack.pop() | stack.pop()); break;
@@ -1675,6 +2608,23 @@ class JitCompiler {
     return true;
   }
 
+  async instanceOf(value, className) {
+    if (value === null || value === undefined) return 0;
+    return await this.jvm.isInstanceOfAsync(runtimeClassName(value), className) ? 1 : 0;
+  }
+
+  tryInstanceOfSync(value, className) {
+    if (value === null || value === undefined) return 0;
+    const source = runtimeClassName(value);
+    const sourceKnown = typeof source === "string" && source.startsWith("[") ||
+      this.jvm.classes[source] || this.jvm.jre[source];
+    const targetKnown = className === "java/lang/Object" ||
+      typeof className === "string" && className.startsWith("[") ||
+      this.jvm.classes[className] || this.jvm.jre[className];
+    if (!sourceKnown || !targetKnown) return ASYNC_INVOKE;
+    return this.jvm.isInstanceOf(source, className) ? 1 : 0;
+  }
+
   monitorEnter(monitor, thread) {
     if (monitor === null || monitor === undefined) {
       throw { type: "java/lang/NullPointerException", message: null };
@@ -1719,6 +2669,15 @@ class JitCompiler {
     return arrayRef.elements ? arrayRef.elements[index] : arrayRef[index];
   }
 
+  // A generated region may keep this raw storage pointer in a scalar local.
+  // The Java array object itself remains canonical in locals/fields/snapshots.
+  arrayData(arrayRef) {
+    if (arrayRef === null || arrayRef === undefined) return null;
+    if (arrayRef.elements) return arrayRef.elements;
+    if (Array.isArray(arrayRef) || ArrayBuffer.isView(arrayRef)) return arrayRef;
+    return null;
+  }
+
   arrayStore(value, index, arrayRef, frame) {
     if (arrayRef === null || arrayRef === undefined) {
       throw { type: "java/lang/NullPointerException", message: `Attempted to store into null array in ${frame.method.name}` };
@@ -1742,6 +2701,26 @@ class JitCompiler {
       staticTarget: null,
     };
     return id;
+  }
+
+  canEliminateFieldRead(arg) {
+    if (!Array.isArray(arg) || !Array.isArray(arg[2])) return false;
+    const [, declaredClassName, [fieldName, descriptor]] = arg;
+    let className = declaredClassName;
+    while (className) {
+      const classData = this.jvm.classes[className];
+      const classAst = classData?.ast?.classes?.[0];
+      if (!classAst) return false;
+      const field = (classAst.items || []).find((item) => item?.type === "field" &&
+        item.field?.name === fieldName && item.field?.descriptor === descriptor);
+      if (field) {
+        if ((field.field.flags || []).includes("volatile")) return false;
+        const accessFlags = Number(field.field.accessFlags);
+        return Number.isFinite(accessFlags) && (accessFlags & 0x0040) === 0;
+      }
+      className = classAst.superClassName || null;
+    }
+    return false;
   }
 
   getFieldAt(id, objRef) {
@@ -2081,6 +3060,16 @@ class JitCompiler {
       }
       return this.tryInvokeResolvedTarget(site, target, frame, thread);
     }
+    const dynamic = site.fastDynamicTarget;
+    if (dynamic) {
+      const receiver = frame.stack.items[frame.stack.items.length - site.params.length - 1];
+      if (receiver === null || receiver === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if ((receiver.type || site.declaredClassName) === dynamic.targetClassName) {
+        return this.tryInvokeResolvedTarget(site, dynamic.target, frame, thread);
+      }
+    }
     return this.tryInvokeSyncSite(site, frame, thread);
   }
 
@@ -2137,11 +3126,11 @@ class JitCompiler {
         intrinsic: op === "invokestatic"
           ? this.getSynchronousIntrinsic(method, descriptor)
           : null,
-        inlineIntegerLeaf: op === "invokestatic"
-          ? this.getInlineIntegerLeaf(method, params, returnType)
+        inlineIntegerRegion: op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface"
+          ? this.getInlineIntegerRegion(method, params, returnType)
           : null,
       };
-      if (!target.intrinsic && !target.inlineIntegerLeaf) {
+      if (!target.intrinsic && !target.inlineIntegerRegion) {
         target.generated = this.getGeneratedFunction(method);
       }
       site.targets.set(targetClassName, target);
@@ -2153,6 +3142,9 @@ class JitCompiler {
         };
       } else if (op === "invokestatic") {
         site.fastStaticTarget = target;
+      } else if ((op === "invokevirtual" || op === "invokeinterface") &&
+          !site.fastDynamicTarget) {
+        site.fastDynamicTarget = { targetClassName, target };
       }
     }
 
@@ -2161,11 +3153,15 @@ class JitCompiler {
 
   tryInvokeResolvedTarget(site, target, frame, thread) {
     const { op, descriptor, params, returnType } = site;
-    const { method, lookupClass, intrinsic, inlineIntegerLeaf, generated } = target;
+    const { method, lookupClass, intrinsic, inlineIntegerRegion, generated } = target;
     const receiver = op === "invokestatic"
       ? null
       : frame.stack.items[frame.stack.items.length - params.length - 1];
     if (this.jvm.debugManager.isClassJitDeopted(lookupClass)) return ASYNC_INVOKE;
+    if (this.fusedRegions.enabled) {
+      const fused = this.fusedRegions.tryInvoke(site, target, frame, thread);
+      if (fused.matched && fused.handled) return RETURN_VOID;
+    }
     if (intrinsic) {
       const base = frame.stack.items.length - params.length;
       const value = intrinsic(frame.stack.items, base);
@@ -2180,9 +3176,11 @@ class JitCompiler {
       }
       return value;
     }
-    if (inlineIntegerLeaf) {
-      const base = frame.stack.items.length - params.length;
-      const value = inlineIntegerLeaf(frame.stack.items, base);
+    if (inlineIntegerRegion) {
+      if (inlineIntegerRegion.jvmNested && this.needsBytecodeChecks()) return ASYNC_INVOKE;
+      const receiverSlots = op === "invokestatic" ? 0 : 1;
+      const base = frame.stack.items.length - params.length - receiverSlots;
+      const value = inlineIntegerRegion(frame.stack.items, base);
       frame.stack.items.length = base;
       if (this.profileMethods) {
         this.syncInlinedCallCount += 1;
@@ -2248,34 +3246,44 @@ class JitCompiler {
       if (loads < 16 || stores !== loads || ops.some((op) => op.startsWith("invoke"))) {
         return null;
       }
-      return (stack, base) => {
-        const src = stack[base];
-        const srcPos = stack[base + 1] | 0;
-        const dest = stack[base + 2];
-        const destPos = stack[base + 3] | 0;
-        const length = stack[base + 4] | 0;
-        if (src === null || src === undefined || dest === null || dest === undefined) {
-          throw { type: "java/lang/NullPointerException", message: null };
-        }
-        // The recognized Java implementation returns before checking length
-        // when source, destination, and offsets are identical. Preserve that
-        // observable order and avoid copying an already-identical range.
-        if (src === dest && srcPos === destPos) {
-          if (this.profileMethods) this.intrinsicArrayCopyNoopCount += 1;
-          return RETURN_VOID;
-        }
-        if (srcPos < 0 || destPos < 0 || length < 0 ||
-            srcPos + length > src.length || destPos + length > dest.length) {
-          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
-        }
-        if (src === dest) {
-          dest.copyWithin(destPos, srcPos, srcPos + length);
-          if (this.profileMethods) this.intrinsicArrayCopyWithinCount += 1;
-        } else {
-          for (let i = 0; i < length; i += 1) dest[destPos + i] = src[srcPos + i];
-        }
-        return RETURN_VOID;
+      const intrinsic = (stack, base) => this.primitiveArrayCopyDirect(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3], stack[base + 4]);
+      intrinsic.jvmDirectKind = "primitiveArrayCopy";
+      return intrinsic;
+    }
+
+    if (descriptor === "(IIII)V") {
+      const spanOps = [
+        "iload_1", "getstatic", "if_icmplt", "iload_1", "getstatic", "if_icmplt", "return",
+        "iload_0", "getstatic", "if_icmpge", "iload_2", "getstatic", "iload_0", "isub",
+        "isub", "istore_2", "getstatic", "istore_0", "iload_0", "iload_2", "iadd",
+        "getstatic", "if_icmple", "getstatic", "iload_0", "isub", "istore_2", "iload_0",
+        "iload_1", "getstatic", "imul", "iadd", "istore", "iconst_0", "istore", "iload",
+        "iload_2", "if_icmpge", "getstatic", "iload", "iload", "iadd", "iload_3",
+        "iastore", "iinc", "goto", "return",
+      ];
+      if (ops.length !== spanOps.length || !spanOps.every((op, index) => ops[index] === op)) {
+        return null;
+      }
+      const fields = codeItems.filter((item) => getOp(item.instruction) === "getstatic")
+        .map((item) => item.instruction.arg);
+      const fieldKey = (field) => JSON.stringify(field);
+      if (fields.length !== 9 ||
+          fields.slice(0, 8).some((field) => field?.[2]?.[1] !== "I") ||
+          fields[8]?.[2]?.[1] !== "[I" ||
+          fieldKey(fields[2]) !== fieldKey(fields[3]) ||
+          fieldKey(fields[2]) !== fieldKey(fields[4]) ||
+          fieldKey(fields[5]) !== fieldKey(fields[6])) return null;
+      const staticFields = [fields[0], fields[1], fields[2], fields[5], fields[7], fields[8]];
+      const intrinsic = (stack, base) => {
+        const values = staticFields.map((field) => this.getStaticSync(field));
+        if (values.some((item) => item === STATIC_DEOPT)) return ASYNC_INVOKE;
+        return this.clippedSpanDirect(stack[base], stack[base + 1], stack[base + 2],
+          stack[base + 3], ...values);
       };
+      intrinsic.jvmDirectKind = "clippedStaticSpan";
+      intrinsic.jvmDirectData = { staticFields };
+      return intrinsic;
     }
 
     if (descriptor === "(IIIIIII[III)V") {
@@ -2392,6 +3400,91 @@ class JitCompiler {
     return null;
   }
 
+  primitiveArrayCopyDirect(source, sourceIndex, destination, destinationIndex, length) {
+    sourceIndex |= 0;
+    destinationIndex |= 0;
+    length |= 0;
+    if (source === null || source === undefined ||
+        destination === null || destination === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    // The recognized Java implementation returns before checking length when
+    // source, destination, and offsets are identical.
+    if (source === destination && sourceIndex === destinationIndex) {
+      if (this.profileMethods) this.intrinsicArrayCopyNoopCount += 1;
+      return RETURN_VOID;
+    }
+    if (sourceIndex < 0 || destinationIndex < 0 || length < 0 ||
+        sourceIndex + length > source.length || destinationIndex + length > destination.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    if (source === destination && destinationIndex > sourceIndex &&
+        destinationIndex < sourceIndex + length) {
+      // Array.prototype.copyWithin carries generic property/holes/species
+      // semantics that Java primitive arrays do not need. For the small,
+      // overlapping moves used by the renderer an explicit reverse loop is
+      // dramatically cheaper and preserves memmove ordering exactly.
+      for (let index = length - 1; index >= 0; index -= 1) {
+        destination[destinationIndex + index] = source[sourceIndex + index];
+      }
+      if (this.profileMethods) this.intrinsicArrayCopyWithinCount += 1;
+    } else {
+      for (let index = 0; index < length; index += 1) {
+        destination[destinationIndex + index] = source[sourceIndex + index];
+      }
+    }
+    return RETURN_VOID;
+  }
+
+  clippedSpanDirect(x, y, count, color, clipTop, clipBottom,
+    clipLeft, clipRight, surfaceWidth, pixels) {
+    x |= 0;
+    y |= 0;
+    count |= 0;
+    color |= 0;
+    if (y < (clipTop | 0) || y >= (clipBottom | 0)) return RETURN_VOID;
+    if (x < (clipLeft | 0)) {
+      count = (count - ((clipLeft | 0) - x)) | 0;
+      x = clipLeft | 0;
+    }
+    if (((x + count) | 0) > (clipRight | 0)) count = ((clipRight | 0) - x) | 0;
+    if (count <= 0) return RETURN_VOID;
+    if (pixels === null || pixels === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    const start = (x + Math.imul(y, surfaceWidth | 0)) | 0;
+    const data = this.arrayData(pixels);
+    if (start >= 0 && start + count <= pixels.length && data !== null) {
+      for (let offset = 0; offset < count; offset += 1) data[start + offset] = color;
+      return RETURN_VOID;
+    }
+    for (let offset = 0; offset < count; offset += 1) {
+      const index = (start + offset) | 0;
+      if (index < 0 || index >= pixels.length) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      if (data !== null) data[index] = color;
+      else if (pixels.elements) pixels.elements[index] = color;
+      else pixels[index] = color;
+    }
+    return RETURN_VOID;
+  }
+
+  clippedStaticSpanDirectAt(x, y, count, color,
+    topSite, bottomSite, leftSite, rightSite, widthSite, pixelsSite) {
+    const clipTop = this.getStaticSyncAt(topSite);
+    const clipBottom = this.getStaticSyncAt(bottomSite);
+    const clipLeft = this.getStaticSyncAt(leftSite);
+    const clipRight = this.getStaticSyncAt(rightSite);
+    const surfaceWidth = this.getStaticSyncAt(widthSite);
+    const pixels = this.getStaticSyncAt(pixelsSite);
+    if (clipTop === STATIC_DEOPT || clipBottom === STATIC_DEOPT ||
+        clipLeft === STATIC_DEOPT || clipRight === STATIC_DEOPT ||
+        surfaceWidth === STATIC_DEOPT || pixels === STATIC_DEOPT) return STATIC_DEOPT;
+    return this.clippedSpanDirect(x, y, count, color, clipTop, clipBottom,
+      clipLeft, clipRight, surfaceWidth, pixels);
+  }
+
   packedColorScanlineDirect(green, index, greenStep, redStep, red, count,
     tag, dest, blue, blueStep, guarded, owner) {
     if ((tag | 0) !== 9 || guarded ||
@@ -2423,44 +3516,298 @@ class JitCompiler {
     return true;
   }
 
-  getInlineIntegerLeaf(method, params, returnType) {
-    if (this.inlineIntegerLeafCache.has(method)) {
-      return this.inlineIntegerLeafCache.get(method);
+  packedColorScanlineFused(green, index, greenStep, redStep, red, count,
+    tag, dest, blue, blueStep) {
+    if ((tag | 0) !== 9) throw FusedRegionCompiler.BAILOUT;
+    index |= 0;
+    count |= 0;
+    if (dest === null || dest === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
     }
-    let inline = null;
-    if (returnType === "int" && params.length > 0 && params.every((type) => type === "int")) {
-      const instructions = this.getCodeItems(method)
-        .map((item) => item.instruction)
-        .filter(Boolean);
-      const expressions = [];
-      const pop = () => expressions.pop();
-      const binary = (format) => {
-        const right = pop();
-        const left = pop();
-        if (left === undefined || right === undefined) return false;
-        expressions.push(format(left, right));
+    if (count <= 0) return;
+    if (index < 0 || index + count > dest.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    green |= 0; red |= 0; blue |= 0;
+    greenStep |= 0; redStep |= 0; blueStep |= 0;
+    for (let offset = 0; offset < count; offset += 1) {
+      dest[index] = (((dest[index] >> 1) & 8355711) +
+        ((green >> 9) & 65280) + ((red >> 1) & 16711680) +
+        ((blue >> 17) & 255)) | 0;
+      index += 1;
+      green = (green + greenStep) | 0;
+      red = (red + redStep) | 0;
+      blue = (blue + blueStep) | 0;
+    }
+  }
+
+  constantColorScanlineFused(index, tag, dest, color, count) {
+    if ((tag | 0) !== 57) throw FusedRegionCompiler.BAILOUT;
+    index |= 0; color |= 0; count |= 0;
+    if (dest === null || dest === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (count <= 0) return;
+    if (index < 0 || index + count > dest.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    for (let offset = 0; offset < count; offset += 1) {
+      dest[index] = (color + ((dest[index] & 16711422) >> 1)) | 0;
+      index += 1;
+    }
+  }
+
+  fusedBailout() {
+    return FusedRegionCompiler.BAILOUT;
+  }
+
+  invokeFusedIntegerNative(nativeMethod, left, right) {
+    const result = nativeMethod(this.jvm, null, [left | 0, right | 0]);
+    if (result && typeof result.then === "function") throw FusedRegionCompiler.BAILOUT;
+    return result;
+  }
+
+  getInlineIntegerRegion(method, params, returnType) {
+    if (this.inlineIntegerRegionCache.has(method)) {
+      return this.inlineIntegerRegionCache.get(method);
+    }
+    const plan = this.getInlineIntegerPlan(method, params, returnType);
+    if (!plan) return null;
+    const inline = new Function("stack", "base",
+      `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`);
+    inline.jvmPlan = plan;
+    inline.jvmReceiverSlots = plan.receiverSlots;
+    inline.jvmNested = plan.methodCount > 1;
+    this.inlineIntegerRegionCache.set(method, inline);
+    return inline;
+  }
+
+  getInlineIntegerPlan(method, params, returnType) {
+    if (this.inlineIntegerPlanCache.has(method)) {
+      return this.inlineIntegerPlanCache.get(method);
+    }
+    if (returnType !== "int" || !params.every((type) => type === "int")) return null;
+    const isStatic = (method.flags || []).includes("static");
+    const receiverSlots = isStatic ? 0 : 1;
+    const args = new Array(params.length + receiverSlots);
+    for (let index = 0; index < args.length; index += 1) {
+      args[index] = `stack[base + ${index}]`;
+    }
+    const state = {
+      active: new Set(), statements: [], nextTemp: 0,
+      instructionCount: 0, methodCount: 0,
+    };
+    const result = this.emitInlineIntegerMethod(method, params, returnType, args, state, 0);
+    if (result === null) return null;
+    const plan = {
+      statements: state.statements,
+      result,
+      receiverSlots,
+      inputCount: args.length,
+      methodCount: state.methodCount,
+    };
+    this.inlineIntegerPlanCache.set(method, plan);
+    return plan;
+  }
+
+  emitInlineIntegerMethod(method, params, returnType, args, state, depth) {
+    if (returnType !== "int" || !params.every((type) => type === "int") || depth > 4 ||
+        state.active.has(method)) return null;
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code || (code.code.exceptionTable || []).length) return null;
+    const items = this.getCodeItems(method).filter((item) => item && item.instruction);
+    const instructions = items.map((item) => item.instruction);
+    const labels = buildLabelMap(items);
+    if (instructions.length > 64 || state.instructionCount + instructions.length > 256) return null;
+
+    const isStatic = (method.flags || []).includes("static");
+    const receiverSlots = isStatic ? 0 : 1;
+    if (args.length !== params.length + receiverSlots) return null;
+    const locals = [];
+    for (let index = 0; index < params.length; index += 1) {
+      locals[index + receiverSlots] = args[index + receiverSlots];
+    }
+    const stack = [];
+    const pop = () => stack.length ? stack.pop() : null;
+    const materialize = (expression) => {
+      const temporary = `inlineValue${state.nextTemp++}`;
+      state.statements.push(`const ${temporary} = ${expression};`);
+      return temporary;
+    };
+    const binary = (format) => {
+      const right = pop();
+      const left = pop();
+      if (left === null || right === null) return false;
+      stack.push(materialize(format(left, right)));
+      return true;
+    };
+    const emitStraightRange = (start, end, rangeLocals, rangeStack) => {
+      const statements = [];
+      const rangePop = () => rangeStack.length ? rangeStack.pop() : null;
+      const rangeMaterialize = (expression) => {
+        const temporary = `inlineValue${state.nextTemp++}`;
+        statements.push(`const ${temporary} = ${expression};`);
+        return temporary;
+      };
+      const rangeBinary = (format) => {
+        const right = rangePop(), left = rangePop();
+        if (left === null || right === null) return false;
+        rangeStack.push(rangeMaterialize(format(left, right)));
         return true;
       };
-      let expression = null;
-      for (const instruction of instructions) {
+      for (let index = start; index < end; index += 1) {
+        const instruction = instructions[index];
         const op = getOp(instruction);
         const load = op === "iload" ? Number(instruction.arg)
           : /^iload_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
         if (load !== null) {
-          if (load < 0 || load >= params.length) break;
-          expressions.push(`stack[base + ${load}]`);
+          if (rangeLocals[load] === undefined) return null;
+          rangeStack.push(rangeLocals[load]);
+          continue;
+        }
+        const store = op === "istore" ? Number(instruction.arg)
+          : /^istore_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (store !== null) {
+          const stored = rangePop();
+          if (stored === null) return null;
+          rangeLocals[store] = stored;
+          continue;
+        }
+        if (/^iconst_[0-5]$/.test(op)) { rangeStack.push(op.slice(-1)); continue; }
+        if (op === "iconst_m1") { rangeStack.push("-1"); continue; }
+        if (["bipush", "sipush", "ldc", "ldc_w"].includes(op) &&
+            Number.isInteger(Number(instruction.arg))) {
+          rangeStack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        let valid = true;
+        switch (op) {
+          case "iadd": valid = rangeBinary((a, b) => `((${a} + ${b}) | 0)`); break;
+          case "isub": valid = rangeBinary((a, b) => `((${a} - ${b}) | 0)`); break;
+          case "imul": valid = rangeBinary((a, b) => `Math.imul(${a}, ${b})`); break;
+          case "iand": valid = rangeBinary((a, b) => `(${a} & ${b})`); break;
+          case "ior": valid = rangeBinary((a, b) => `(${a} | ${b})`); break;
+          case "ixor": valid = rangeBinary((a, b) => `(${a} ^ ${b})`); break;
+          case "ishl": valid = rangeBinary((a, b) => `(${a} << (${b} & 31))`); break;
+          case "ishr": valid = rangeBinary((a, b) => `(${a} >> (${b} & 31))`); break;
+          case "iushr": valid = rangeBinary((a, b) => `((${a} >>> (${b} & 31)) | 0)`); break;
+          case "ineg": {
+            const input = rangePop();
+            valid = input !== null;
+            if (valid) rangeStack.push(rangeMaterialize(`((-${input}) | 0)`));
+            break;
+          }
+          case "i2b": {
+            const input = rangePop();
+            valid = input !== null;
+            if (valid) rangeStack.push(rangeMaterialize(`((${input} << 24) >> 24)`));
+            break;
+          }
+          default: valid = false; break;
+        }
+        if (!valid) return null;
+      }
+      return statements;
+    };
+
+    state.active.add(method);
+    state.instructionCount += instructions.length;
+    state.methodCount += 1;
+    try {
+      for (let index = 0; index < instructions.length; index += 1) {
+        const instruction = instructions[index];
+        const op = getOp(instruction);
+        const load = op === "iload" ? Number(instruction.arg)
+          : /^iload_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (load !== null) {
+          if (locals[load] === undefined) return null;
+          stack.push(locals[load]);
+          continue;
+        }
+        const store = op === "istore" ? Number(instruction.arg)
+          : /^istore_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (store !== null) {
+          const value = pop();
+          if (value === null) return null;
+          locals[store] = value;
           continue;
         }
         if (/^iconst_[0-5]$/.test(op)) {
-          expressions.push(op.slice(-1));
+          stack.push(op.slice(-1));
           continue;
         }
         if (op === "iconst_m1") {
-          expressions.push("-1");
+          stack.push("-1");
           continue;
         }
         if (op === "bipush" || op === "sipush") {
-          expressions.push(String(Number(instruction.arg) | 0));
+          stack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        if ((op === "ldc" || op === "ldc_w") && Number.isInteger(Number(instruction.arg))) {
+          stack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        if (op && op.startsWith("if")) {
+          let condition;
+          if (op.startsWith("if_icmp")) {
+            const right = pop(), left = pop();
+            const comparison = { if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<",
+              if_icmpge: ">=", if_icmpgt: ">", if_icmple: "<=" }[op];
+            if (left === null || right === null || !comparison) return null;
+            condition = `${left} ${comparison} ${right}`;
+          } else {
+            const input = pop();
+            const comparison = { ifeq: "=== 0", ifne: "!== 0", iflt: "< 0",
+              ifge: ">= 0", ifgt: "> 0", ifle: "<= 0" }[op];
+            if (input === null || !comparison) return null;
+            condition = `${input} ${comparison}`;
+          }
+          const target = branchTargetIndex(instruction, labels);
+          if (!Number.isInteger(target) || target <= index || target >= instructions.length) return null;
+          const fallLocals = [...locals], fallStack = [...stack];
+          const branchStatements = emitStraightRange(index + 1, target, fallLocals, fallStack);
+          if (!branchStatements || fallStack.length !== stack.length) return null;
+          const phis = [];
+          const mergedLocals = [...locals], mergedStack = [...stack];
+          const merge = (before, after, assign) => {
+            if (before === after) return true;
+            if (before === undefined || after === undefined) return false;
+            const phi = `inlineValue${state.nextTemp++}`;
+            state.statements.push(`let ${phi} = ${before};`);
+            phis.push(`${phi} = ${after};`);
+            assign(phi);
+            return true;
+          };
+          const localSlots = Math.max(locals.length, fallLocals.length);
+          for (let slot = 0; slot < localSlots; slot += 1) {
+            if (!merge(locals[slot], fallLocals[slot], (phi) => { mergedLocals[slot] = phi; })) {
+              return null;
+            }
+          }
+          for (let slot = 0; slot < stack.length; slot += 1) {
+            if (!merge(stack[slot], fallStack[slot], (phi) => { mergedStack[slot] = phi; })) {
+              return null;
+            }
+          }
+          state.statements.push(`if (!(${condition})) {`, ...branchStatements, ...phis, "}");
+          locals.length = 0; locals.push(...mergedLocals);
+          stack.length = 0; stack.push(...mergedStack);
+          index = target - 1;
+          continue;
+        }
+        if (op === "invokestatic") {
+          const target = this.resolveInlineIntegerStaticTarget(instruction);
+          if (!target) return null;
+          const callArgs = new Array(target.params.length);
+          for (let argument = target.params.length - 1; argument >= 0; argument -= 1) {
+            callArgs[argument] = pop();
+            if (callArgs[argument] === null) return null;
+          }
+          const value = this.emitInlineIntegerMethod(target.method, target.params,
+            target.returnType, callArgs, state, depth + 1);
+          if (value === null) return null;
+          stack.push(value);
           continue;
         }
         let valid = true;
@@ -2476,30 +3823,83 @@ class JitCompiler {
           case "iushr": valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`); break;
           case "ineg": {
             const value = pop();
-            valid = value !== undefined;
-            if (valid) expressions.push(`((-${value}) | 0)`);
+            valid = value !== null;
+            if (valid) stack.push(materialize(`((-${value}) | 0)`));
             break;
           }
           case "i2b": {
             const value = pop();
-            valid = value !== undefined;
-            if (valid) expressions.push(`((${value} << 24) >> 24)`);
+            valid = value !== null;
+            if (valid) stack.push(materialize(`((${value} << 24) >> 24)`));
             break;
           }
-          case "ireturn":
-            if (expressions.length === 1) expression = expressions[0];
-            valid = false;
-            break;
+          case "ireturn": {
+            if (index !== instructions.length - 1 || stack.length !== 1) return null;
+            return pop();
+          }
           default: valid = false; break;
         }
-        if (!valid) break;
+        if (!valid) return null;
       }
-      if (expression !== null) {
-        inline = new Function("stack", "base", `return ${expression};`);
-      }
+      return null;
+    } finally {
+      state.active.delete(method);
     }
-    this.inlineIntegerLeafCache.set(method, inline);
-    return inline;
+  }
+
+  resolveInlineIntegerStaticTarget(instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    const parsed = parseDescriptor(descriptor);
+    if (parsed.returnType !== "int" || !parsed.params.every((type) => type === "int")) return null;
+    return { method, ...parsed };
+  }
+
+  getCompileTimeIntegerLeaf(instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    const { params, returnType } = parseDescriptor(descriptor);
+    const plan = this.getInlineIntegerPlan(method, params, returnType);
+    if (!plan || plan.receiverSlots) return null;
+    return { statements: plan.statements, result: plan.result, paramCount: params.length };
+  }
+
+  getCompileTimeSynchronousIntrinsic(instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    let parsed;
+    try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
+    const intrinsic = this.getSynchronousIntrinsic(method, descriptor);
+    if (!intrinsic?.jvmDirectKind) return null;
+    const direct = {
+      kind: intrinsic.jvmDirectKind,
+      paramCount: parsed.params.length,
+      returnsVoid: parsed.returnType === "void",
+    };
+    if (intrinsic.jvmDirectKind === "clippedStaticSpan") {
+      const staticFields = intrinsic.jvmDirectData?.staticFields;
+      if (!Array.isArray(staticFields) || staticFields.length !== 6) return null;
+      direct.staticFieldSites = staticFields.map((field) => this.registerFieldSite(field));
+    }
+    return direct;
   }
 
   async invoke(op, frame, instruction, thread, invokePc) {
@@ -2726,24 +4126,32 @@ function expandWideInstruction(instruction) {
 
 function stackEffect(instruction) {
   const op = getOp(instruction);
-  if (!op || op === "nop" || op === "goto" || op === "iinc" ||
-      op === "ineg" || op === "i2b" || op === "i2d" || op === "i2f" ||
-      op === "i2l" || op === "checkcast" || op === "getfield" ||
-      op === "arraylength") return 0;
-  if (/^[aifd]load(?:_[0-3])?$/.test(op) || op === "aconst_null" ||
+  if (!op || op === "nop" || op === "goto" || op === "goto_w" || op === "iinc" ||
+      op === "ineg" || op === "i2b" || op === "i2s" || op === "i2c" ||
+      op === "i2d" || op === "i2f" || op === "i2l" || op === "l2i" ||
+      op === "d2i" || op === "f2i" || op === "d2f" || op === "f2d" ||
+      op === "d2l" || op === "l2d" || op === "f2l" || op === "l2f" ||
+      op === "dneg" || op === "fneg" || op === "lneg" || op === "instanceof" ||
+      op === "checkcast" || op === "getfield" ||
+      op === "arraylength" || op === "newarray" || op === "anewarray") return 0;
+  if (/^[aifdl]load(?:_[0-3])?$/.test(op) || op === "aconst_null" ||
       /^iconst_(?:m1|[0-5])$/.test(op) || /^fconst_[0-2]$/.test(op) ||
-      /^dconst_[01]$/.test(op) || op === "bipush" || op === "sipush" ||
+      /^dconst_[01]$/.test(op) || /^lconst_[01]$/.test(op) ||
+      op === "bipush" || op === "sipush" ||
       op === "ldc" || op === "ldc_w" || op === "ldc2_w" ||
       op === "getstatic" || op === "new") return 1;
-  if (/^[aifd]store(?:_[0-3])?$/.test(op) || op === "pop" ||
+  if (/^[aifdl]store(?:_[0-3])?$/.test(op) || op === "pop" ||
       op === "putstatic" || op === "athrow" || /^[aifdl]return$/.test(op)) return -1;
   if (op === "dup") return 1;
+  if (op === "dup_x1") return 1;
   if (op === "dup2") return 2;
   if (op === "putfield") return -2;
   if (op.endsWith("aload") || [
     "iadd", "isub", "imul", "idiv", "irem", "ishl", "ishr", "iushr",
-    "iand", "ior", "ixor", "dadd", "dsub", "dmul", "ddiv", "fadd",
-    "fsub", "fmul", "fdiv", "frem", "lxor", "ldiv", "lcmp", "dcmpg", "dcmpl",
+    "iand", "ior", "ixor", "dadd", "dsub", "dmul", "ddiv", "drem", "fadd",
+    "fsub", "fmul", "fdiv", "frem", "ladd", "lsub", "land", "lor",
+    "lxor", "ldiv", "lrem", "lmul", "lshl", "lshr", "lushr",
+    "lcmp", "dcmpg", "dcmpl", "fcmpg", "fcmpl",
   ].includes(op)) return -1;
   if (op.endsWith("astore")) return -3;
   if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) return -2;
