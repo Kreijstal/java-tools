@@ -885,6 +885,82 @@ dynamic-JNI and bundle-size warnings; the generated browser asset was about
 and a real Firefox page whose live JVM reported `rendererPipeline`, broad scalar
 guest bodies, fused regions, and structured SSA all enabled.
 
+## 2026-07-21: the node fps harness is the primary benchmark
+
+The whole-app frame rate can be measured on plain node, and as of 2026-07-21
+this is the **primary** optimization benchmark; Firefox is the acceptance
+check, run only when a change survives the node bench.
+
+Why node measures the same thing: with the JIT on, node/V8 reaches ~16.4 fps
+at the title screen while Firefox/SpiderMonkey medians ~15.2 with every tier
+enabled. The two engines converge because the bottleneck is the JVM emulation
+layer (interpreted residue + JS↔wasm boundary traffic), not the browser
+(canvas, compositing, DOM are all absent on node and the number barely moves).
+A change that does not move the node number will not move Firefox; the 30 fps
+goal restates as "make the node harness exceed 30".
+
+Why the node bench is better for iteration:
+
+- **Setup.** No Playwright, no pinned Firefox build (the package expects
+  firefox-1511 while only 1509 is installed — every Firefox run needs
+  `FIREFOX_EXECUTABLE_PATH=~/.cache/ms-playwright/firefox-1509/firefox/firefox`),
+  no `0.0.0.0:3765` page server, no production bundle build/deploy cycle. The
+  node run consumes the working tree directly — edit, run, measure.
+- **Feedback latency.** One node run is ~60 s wall (boot ~20 s, then ~7 fps·s
+  of measurement window). A defensible Firefox comparison needs a bundle build,
+  a deploy, and ≥3 alternated runs per side of 65 s probe windows plus browser
+  startup — tens of minutes per A/B.
+- **Determinism.** Frame timestamps come from `[frame] +<t>s` stderr lines —
+  exact arithmetic over a chosen window, no browser scheduling, thermal or
+  background-tab noise, no `changedFramesPerSecond` probe-window truncation.
+- **Debuggability.** stderr is right there: `JVM_DEBUG_WASMJIT=1` compile
+  logs, frame PNGs (`JVM_FRAME_DIR`) for visual regression, plus every other
+  JVM_* diagnostic — none of which survive the browser boundary comfortably.
+
+The recipe (all of it is load-bearing):
+
+```bash
+JVM_FAKE_TIME=1000000000000 JVM_WASM_JIT=1 \
+JVM_FRAME_DIR=/tmp/frames JVM_FRAME_EVERY=25 JVM_FRAME_LIMIT=9 \
+JVM_EXIT_AFTER_FRAME_LIMIT=1 \
+node scripts/run-jvmjs.js <classesDir> gameport1=43595 gameport2=43595
+```
+
+- **A local dekobloko server must be listening** (the tracked
+  `apps/server` in dekobloko-work). The game streams its JS5 cache over the
+  game TCP port; without a server every run loops `ECONNREFUSED` and never
+  blits, and JIT-on runs die *faster* into `error_game_js5connect` (the
+  compiled retry loop exhausts the connect budget) — which looks exactly like
+  a JIT hang and is not one. Two 30-minute "regressions" were chased before
+  this was understood.
+- `gameport1=43595 gameport2=43595` are applet-parameter overrides
+  (run-jvmjs.js defaults to 43594); bare `key=value` CLI args become applet
+  params.
+- `JVM_FAKE_TIME` unfreezes the game's sleeps; the `[frame] +<t>s` uptime is
+  REAL wall clock, so fps = frames / Δt directly.
+- fps over a warm window: skip to frame 25, e.g. 175 / (t₂₀₀ − t₂₅).
+
+Known caveats: the measured scene is the title screen, not gameplay; every
+25th frame pays a PNG encode (a few percent); node cannot replace the Firefox
+acceptance run because SpiderMonkey's wasm/JS optimizer mix differs (the
+history of node-side microbenchmarks mispredicting Firefox is documented
+above — whole-app node fps has tracked Firefox where the toys did not).
+
+Measured with it (2026-07-21): original obfuscated jar 16.4 fps (first blit
++20.1 s) vs decompiled+javac-recompiled classes 11.4 fps (first blit +26.0 s)
+— the recompiled world is ~30% slower under identical conditions; javac's
+~1.5–1.8× instruction verbosity dominates its better wasm coverage. Trace
+replay cannot drive the recompiled classes (frame state binds to original
+bytecode layout), so this boot-level harness is also the only recompiled-world
+whole-app benchmark.
+
+One Firefox-side trap recorded here because the node bench surfaced it: the
+probe's *default* flags leave the fused/scalar/structured tiers off and
+measure ~10.6 fps; the documented baselines (14.13 attribution, 15.18 best)
+require the full override set (`PROBE_FUSED_REGIONS=1 PROBE_SCALAR_LOOPS=1
+PROBE_SCALAR_SSA=0 PROBE_STRUCTURED_SSA=1 PROBE_RENDERER_PIPELINE=1`). Never
+compare a default-flag run against those baselines.
+
 ## Reproducing the Firefox measurement
 
 Build the production bundle, because the unbundled and bundled async behavior

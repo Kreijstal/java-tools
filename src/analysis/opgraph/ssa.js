@@ -253,6 +253,7 @@ function buildSsaOrThrow(input, options) {
       locals = new Map(pred.slotDefsOut);
       block.entryStack = stack.slice();
     }
+    block.slotDefsIn = new Map(locals);
 
     simulateBlock({
       fn, cfg, items, block, stack, locals, makeValue, imposeKind,
@@ -496,6 +497,9 @@ function pruneTrivialPhis(fn) {
     if (block.exitStack) block.exitStack = block.exitStack.map(map);
     if (block.slotDefsOut) {
       for (const [slot, value] of block.slotDefsOut) block.slotDefsOut.set(slot, map(value));
+    }
+    if (block.slotDefsIn) {
+      for (const [slot, value] of block.slotDefsIn) block.slotDefsIn.set(slot, map(value));
     }
     if (block.term && block.term.args) block.term.args = block.term.args.map(map);
     block.body = block.body.filter((node) => !replacements.has(node));
