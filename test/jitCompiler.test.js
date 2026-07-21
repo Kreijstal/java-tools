@@ -2266,6 +2266,71 @@ public class WasmFieldCacheHarness {
   t.end();
 });
 
+test('Wasm JIT links partial callees and deopts through their diagnostic guards', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmPartialLinkHarness', `
+public class WasmPartialLinkHarness {
+  static boolean diag;
+  static int mix(int v, int[] log) {
+    if (diag) { log[0] = ("v=" + v).length(); }
+    return v * 3 + 1;
+  }
+  public static int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      int t = mix(i, out);
+      sum += t;
+      if (i == 5) { diag = true; }
+      if (i == 7) { diag = false; }
+    }
+    out[1] = sum;
+    return sum;
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmPartialLinkHarness');
+  jvm.classInitializationState.set('WasmPartialLinkHarness', 'INITIALIZED');
+  jvm.classes.WasmPartialLinkHarness.staticFields.set('diag:Z', false);
+  const thread = {
+    id: 0,
+    name: 'wasm-partial-link-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = [0, 0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'WasmPartialLinkHarness', 'drive', '([II)I', [out, 10]);
+
+  // sum of 3i+1 for i in 0..9 = 145; the guard is true for i=6,7 so the
+  // diagnostic path last logs "v=7".length() = 3
+  t.equal(out[1], 145, 'loop result is exact across the deopt round trips');
+  t.equal(out[0], 3, 'the diagnostic path executed interpreted with correct state');
+
+  const compiled = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiled.has('WasmPartialLinkHarness.drive([II)I'), 'caller loop uses the Wasm tier');
+  const mixState = compiled.get('WasmPartialLinkHarness.mix(I[I)I');
+  t.ok(mixState, 'helper with a guarded diagnostic block still links');
+  t.ok(mixState.meta && !mixState.meta.normalFlowFullyCompiled,
+    'the helper is genuinely partial (its diagnostic block is demoted)');
+  t.ok((mixState.nestedDeopts || 0) >= 1 && (mixState.nestedDeopts || 0) <= 4,
+    `deopts happened only while the guard was hot (saw ${mixState.nestedDeopts})`);
+  t.ok((mixState.nestedCalls || 0) > (mixState.nestedDeopts || 0),
+    'most nested calls completed inside wasm');
+  t.end();
+});
+
 test('Wasm JIT links loop-free static numeric helpers into hot loops', async (t) => {
   const classpath = compileJavaFixture(t, 'WasmLinkedHelperHarness', `
 public class WasmLinkedHelperHarness {

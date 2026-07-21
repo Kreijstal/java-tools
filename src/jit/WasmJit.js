@@ -63,6 +63,17 @@
 // opcodes), and wasm replicates interpreter semantics, not the JLS.
 
 const { resolveInstanceFieldKey } = require('../instructions/object');
+const Frame = require('../core/frame');
+
+// Thrown through wasm frames when a linked partial callee reaches one of its
+// demoted (diagnostic) blocks: carries the interpreter frames to materialize,
+// innermost first. Never visible to guest code — execute() always catches it.
+class NestedDeopt extends Error {
+  constructor(frames) {
+    super('wasm nested deopt');
+    this.frames = frames;
+  }
+}
 
 const T = { i32: 0x7f, i64: 0x7e, f32: 0x7d, f64: 0x7c, ref: 0x6f };
 const CAT2 = new Set([T.i64, T.f64]);
@@ -646,16 +657,37 @@ class MethodTranslator {
     };
   }
 
-  // invokestatic bound directly to another fully-compiled wasm method
-  compiledCallee(ins) {
+  // invokestatic bound directly to another compiled wasm method. A callee
+  // whose NORMAL flow still contains unsupported blocks may link as
+  // "partial": the obfuscator's if-(never)-guarded diagnostic paths are the
+  // dominant shape, so the call runs entirely in wasm and only pays when a
+  // guard actually flips. The caller spills its typed slots before such a
+  // call; if the callee (or anything it linked) reaches a demoted block, the
+  // import materializes real interpreter frames for the whole nested chain
+  // and unwinds with NestedDeopt. Runtime counters veto callees whose
+  // "never" path turns out hot, and the caller's periodic recompile then
+  // drops the link.
+  compiledCallee(ins, itemIndex, simulatedStackLen) {
     const [, className, [name, descriptor]] = ins.arg;
     const { params, ret } = parseMethodDescriptor(descriptor);
     if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
       throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
     }
-    const calleeSt = this.wasmJit && this.wasmJit.findReadyStatic(className, name, descriptor);
-    if (!calleeSt || !calleeSt.meta.fullyCompiled || calleeSt.meta.boxedCount) {
+    const calleeSt = this.wasmJit &&
+      this.wasmJit.findReadyStatic(className, name, descriptor, true);
+    if (!calleeSt || calleeSt.meta.boxedCount) {
       throw new Unsupported(`invoke ${className}.${name}`);
+    }
+    const partial = !calleeSt.meta.fullyCompiled;
+    if (partial) {
+      if (calleeSt.linkVetoed) {
+        throw new Unsupported(`partial callee ${className}.${name} vetoed`);
+      }
+      // A deopt resumes the caller interpreted just after the invoke, which
+      // is only materializable when nothing sits under the arguments.
+      if (simulatedStackLen !== params.length) {
+        throw new Unsupported(`partial callee ${className}.${name} needs empty under-stack`);
+      }
     }
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
@@ -664,6 +696,9 @@ class MethodTranslator {
     const wParams = params.map(descToWasm);
     const results = ret === 'V' ? [] : [descToWasm(ret)];
     const key = `${className}.${name}${descriptor}`;
+    const callerBox = this.box;
+    const resumePc = itemIndex + 1;
+    let scratchFrame = null;
     const fn = (...args) => {
       const meta = calleeSt.meta;
       const full = new Array(meta.paramSlots.length + 2);
@@ -676,20 +711,63 @@ class MethodTranslator {
       full[meta.paramSlots.length] = 0;
       full[meta.paramSlots.length + 1] = 100_000_000;
       const savedFrame = meta.box.frame;
-      meta.box.frame = { locals: [] }; // junk sink should a fuel exit ever spill
+      let frame;
+      if (partial) {
+        calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
+        // The scratch frame stays clean unless the callee actually exits
+        // (spill/push imports only run in exit stubs), so it is reused
+        // forever on the never-deopts path. Recursion through the same site
+        // gets a throwaway frame.
+        if (scratchFrame && !scratchFrame.inUse) {
+          frame = scratchFrame;
+          frame.pc = 0;
+        } else {
+          frame = new Frame(calleeSt.method);
+          frame.className = className;
+          if (!scratchFrame) scratchFrame = frame;
+        }
+        frame.inUse = true;
+      } else {
+        frame = { locals: [] }; // junk sink should a fuel exit ever spill
+      }
+      meta.box.frame = frame;
       meta.box.ret = undefined;
       let status;
       try {
         status = calleeSt.run(...full);
+      } catch (err) {
+        if (partial && err instanceof NestedDeopt) {
+          // the deeper site set frame.pc through its own callerBox
+          err.frames.push(frame);
+          if (frame === scratchFrame) scratchFrame = null;
+          callerBox.frame.pc = resumePc;
+        }
+        throw err;
       } finally {
+        if (partial) frame.inUse = false;
         meta.box.frame = savedFrame;
       }
-      if (status !== -1) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
+      if (status !== -1) {
+        if (!partial) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
+        frame.pc = status;
+        if (frame === scratchFrame) scratchFrame = null; // donated to the call stack
+        callerBox.frame.pc = resumePc;
+        calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
+        if (calleeSt.nestedDeopts > 256 &&
+            calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
+          calleeSt.linkVetoed = true;
+        }
+        throw new NestedDeopt([frame]);
+      }
       return meta.box.ret;
     };
+    // partial sites need a distinct import per call site: the resume pc is
+    // baked into the closure
+    const importName = `call_${key}${partial ? `_${itemIndex}` : ''}`.replace(/[^\w]/g, '_');
     return {
       params: wParams,
-      idx: this.addImport(`call_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+      partial,
+      idx: this.addImport(importName, wParams, results, fn),
     };
   }
 
@@ -1225,10 +1303,13 @@ class MethodTranslator {
           bound = this.mathIntrinsic(ins);
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
-          bound = this.compiledCallee(ins);
+          bound = this.compiledCallee(ins, i, stack.length);
           pure = false;
         }
         for (let k = 0; k < bound.params.length; k++) pop();
+        // a partial callee can deopt: the caller's typed slots must already
+        // be in frame.locals so the interpreter can resume after the invoke
+        if (bound.partial) emit(...this.spillSeq());
         emit(OP.call, ...uleb(bound.idx));
         // a linked wasm callee may put any field or static
         if (!pure) emit(...this.killSeqWhere(() => true));
@@ -1497,7 +1578,9 @@ class WasmJit {
     if (result.returned) {
       return { returned: true, isVoid: prep.st.meta.retChar === 'V', value: prep.st.meta.box.ret };
     }
-    return { exited: true };
+    // deopted: nested callee frames were materialized ABOVE this child — the
+    // caller must yield to the scheduler rather than resume the child itself
+    return { exited: true, deopted: result.deopted === true };
   }
 
   compile(frame, st, options = {}) {
@@ -1512,13 +1595,14 @@ class WasmJit {
       const translator = new MethodTranslator(this.jvm, frame.method, className, this);
       const meta = translator.translate();
       if (asCallee) {
-        // A linked callee cannot spill back into a Java frame in the middle of
-        // its synchronous wasm import. Its normal flow must therefore be
-        // complete and unboxed; handler-only diagnostic reporters may remain
-        // outside Wasm. It need not contain a loop: removing the call boundary
-        // is precisely what lets the caller's loop remain compiled.
-        if (!meta.normalFlowFullyCompiled || meta.boxedCount) {
-          throw new Unsupported('callee is not fully compiled');
+        // A linked callee spills into a real scratch frame and unwinds via
+        // NestedDeopt when it reaches a demoted block, so demoted diagnostic
+        // blocks in normal flow are acceptable — but the entry block must be
+        // compiled and slots unboxed (boxed slots would read the junk/scratch
+        // frame mid-run). It need not contain a loop: removing the call
+        // boundary is precisely what lets the caller's loop remain compiled.
+        if (!meta.externalEntry.has(0) || meta.boxedCount) {
+          throw new Unsupported('callee entry is not compiled');
         }
       } else {
         // Standalone entry has call/materialization overhead, so require at
@@ -1627,7 +1711,28 @@ class WasmJit {
     args[meta.paramSlots.length + 1] = FUEL;
 
     st.runs += 1;
-    const status = st.run(...args);
+    let status;
+    try {
+      status = st.run(...args);
+    } catch (err) {
+      if (err instanceof NestedDeopt) {
+        // A linked partial callee hit a demoted block. The import closures
+        // already spilled every frame's state and set this frame's pc to the
+        // post-invoke resume point; materialize the nested chain (frames are
+        // innermost-first) and let the scheduler run it interpreted.
+        st.exits += 1;
+        for (let i = err.frames.length - 1; i >= 0; i--) {
+          thread.callStack.push(err.frames[i]);
+        }
+        if (st.exits % 20000 === 0 && (st.recompiles || 0) < 3) {
+          // pick up callee vetoes after a deopt storm
+          st.recompiles = (st.recompiles || 0) + 1;
+          this.compile(frame, st);
+        }
+        return { handled: true, deopted: true };
+      }
+      throw err;
+    }
 
     if (status === -1) {
       thread.callStack.pop();
@@ -1649,7 +1754,7 @@ class WasmJit {
     return { handled: true };
   }
 
-  findReadyStatic(className, name, descriptor) {
+  findReadyStatic(className, name, descriptor, allowPartial = false) {
     const cd = this.jvm.classes[className];
     const clsAst = cd && cd.ast && cd.ast.classes[0];
     if (!clsAst) return null;
@@ -1658,6 +1763,7 @@ class WasmJit {
     if (!method || !(method.flags || []).includes('static')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
+    if (!st.method) st.method = method; // partial-link deopts materialize a Frame
     if (st.status === 'cold' && st.calleeDeferredEpoch !== this.compileEpoch) {
       const hasClassInitializer = clsAst.items
         .filter((i) => i.type === 'method')
@@ -1668,8 +1774,11 @@ class WasmJit {
         this.compile({ method, className }, st, { asCallee: true });
       }
     }
-    return st && st.status === 'ready' && st.meta.normalFlowFullyCompiled && !st.meta.boxedCount
-      ? st : null;
+    if (!st || st.status !== 'ready' || st.meta.boxedCount) return null;
+    if (st.meta.fullyCompiled || st.meta.normalFlowFullyCompiled) return st;
+    // partial callees deopt on demoted blocks; the entry block at least must
+    // run in wasm or every call would deopt immediately
+    return allowPartial && st.meta.externalEntry.has(0) ? st : null;
   }
 
   dumpStats() {

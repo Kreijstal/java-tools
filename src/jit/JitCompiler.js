@@ -4054,11 +4054,12 @@ class JitCompiler {
         if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
         return wasmResult.value;
       }
-      if (wasmResult.exited && !jsChildSupported) {
+      if (wasmResult.exited && (wasmResult.deopted || !jsChildSupported)) {
         // The child remains on the Java call stack at its materialized exit
-        // PC. Yield the generated parent transiently; executeTick will resume
-        // the child through the normal scheduler and then continue the parent
-        // at the already-materialized post-invoke PC.
+        // PC (a deopt may also have materialized deeper callee frames above
+        // it). Yield the generated parent transiently; executeTick will resume
+        // the top frame through the normal scheduler and then continue the
+        // parent at the already-materialized post-invoke PC.
         return {
           deopt: true,
           transient: true,

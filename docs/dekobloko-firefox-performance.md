@@ -2397,3 +2397,47 @@ Design conclusions recorded from this round:
    compose here (handwritten toys mispredicting Firefox; the 9.9x kernel
    moving the app +0.3 fps). Captured replays validate kernels; whole-app
    differential A/Bs decide what is real.
+
+## Guard-tolerant partial callee linking (deopt on the never-path)
+
+The user's observation that obfuscator guards are `if (never) throw x` turned
+into a linking policy: a wasm callee whose normal flow still contains
+unsupported blocks now links anyway ("partial"), because those blocks are
+almost always diagnostic paths behind a boolean static that never flips.
+Before this, one such block anywhere in a callee forced the caller to exit
+wasm at every call site — the mid-computation transitions worth eliminating.
+
+Mechanism: at a linked call to a partial callee the caller first spills its
+typed slots (one batched `spill_all`), and the site requires an empty operand
+stack under the arguments (void statement calls — the raster family shape —
+qualify). The callee runs against a reusable scratch `Frame`; the frame stays
+clean unless the callee actually exits, so the never-deopts path allocates
+nothing. If any callee in the nested chain reaches a demoted block, its exit
+stub spills into the scratch frame, and the import closures unwind with a
+`NestedDeopt` carrying the frames innermost-first: each level stamps its
+caller's resume pc (the item after the invoke — the interpreter increments pc
+before dispatch, so returns land correctly), the top-level `execute()`
+pushes the chain onto the Java call stack, and the scheduler resumes it
+interpreted. Runtime counters veto a callee whose "never" path turns out hot
+(>256 deopts and >25% of calls), and the caller's periodic recompile then
+drops the link. The JS-jit runner treats a nested deopt as a transient yield
+even when it could otherwise continue the child itself, since deopt frames
+sit above the child.
+
+Validation: 322 jit assertions, including a fixture whose helper guard flips
+true mid-loop — the deopt round trip produces exact sums, the diagnostic
+path executes interpreted with correct state, and deopts count only while
+the guard is hot. The vk replay stays bit-identical. In the replay, `wf.a`
+now links; most other raster callees still defer because their entry blocks
+read statics of classes the replay never initializes (`client.A` etc.) —
+a replay artifact, not a policy failure; the browser initializes those
+classes, so linking should engage more broadly there.
+
+Follow-on lever, per the same exceptions-are-exceptional assumption: blocks
+inside LIVE exception-handler ranges are still demoted wholesale because a
+live handler needs precise state at the throw. With wasm exception handling
+(supported in Firefox), those blocks could compile speculatively: wrap the
+block body in a wasm `try`; on `catch_all` the wasm locals are exactly the
+precise state, so spill them, then rethrow to the interpreter's handler
+dispatch. `checkcast` (an import calling isInstanceOf) and carried-stack
+shapes at demoted-adjacent blocks are the other remaining demotion sources.
