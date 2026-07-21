@@ -72,8 +72,11 @@ class FusedRegionCompiler {
         `${region.wrapperOwner}.${region.wrapperMethod.name}${region.wrapperMethod.descriptor}`,
         `fused-${family.name}`)
       : null;
+    const wrapperKernel = region.handwrittenWrapperKernel &&
+      this.handwrittenKernelsEnabled
+      ? region.handwrittenWrapperKernel : region.wrapperKernel;
     try {
-      invokePositionalFromStack(region.wrapperKernel, frame.stack.items, base,
+      invokePositionalFromStack(wrapperKernel, frame.stack.items, base,
         site.params.length, state, region, this.jit);
       // All guards are above the kernel entry. Consume the caller arguments
       // only after success, avoiding a per-triangle slice on the normal path.
@@ -174,8 +177,10 @@ class FusedRegionCompiler {
     }
     if (this.handwrittenKernelsEnabled && family.name === "gradient" &&
         HandwrittenFusedGradient.matches(this.jit, region)) {
-      region.generatedWrapperKernel = region.wrapperKernel;
-      region.wrapperKernel = HandwrittenFusedGradient.install(region, this.jit);
+      // Kept separate from wrapperKernel so the probe can live-toggle
+      // handwrittenKernelsEnabled per run for differential attribution.
+      region.handwrittenWrapperKernel =
+        HandwrittenFusedGradient.install(region, this.jit);
       this.jit.handwrittenFusedRegionCount =
         (this.jit.handwrittenFusedRegionCount | 0) + 1;
     }

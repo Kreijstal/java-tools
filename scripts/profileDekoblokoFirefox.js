@@ -33,6 +33,8 @@ const structuredSplitOverride = process.env.PROBE_STRUCTURED_SPLIT === undefined
   ? null : process.env.PROBE_STRUCTURED_SPLIT === '1';
 const rendererPipelineOverride = process.env.PROBE_RENDERER_PIPELINE === undefined
   ? null : process.env.PROBE_RENDERER_PIPELINE === '1';
+const handwrittenFusedOverride = process.env.PROBE_HANDWRITTEN_FUSED === undefined
+  ? null : process.env.PROBE_HANDWRITTEN_FUSED === '1';
 
 function positiveNumber(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -137,7 +139,7 @@ function animationEstimate(changes) {
       timingSampleRate, timingFilter, methodTraceKey,
       fusedRegions, scalarLoops, scalarSsa, structuredSsa,
       structuredSplit,
-      rendererPipeline }) => {
+      rendererPipeline, handwrittenFused }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
         surfaceAt: null,
@@ -270,6 +272,9 @@ function animationEstimate(changes) {
         if (jvm?.jit?.fusedRegions && fusedRegions !== null) {
           jvm.jit.fusedRegions.enabled = fusedRegions;
         }
+        if (jvm?.jit?.fusedRegions && handwrittenFused !== null) {
+          jvm.jit.fusedRegions.handwrittenKernelsEnabled = handwrittenFused;
+        }
         if (jvm?.jit && scalarLoops !== null) {
           jvm.jit.scalarLoopsEnabled = scalarLoops;
           jvm.jit.scalarGuestBodiesEnabled = scalarLoops;
@@ -328,6 +333,7 @@ function animationEstimate(changes) {
       structuredSsa: structuredSsaOverride,
       structuredSplit: structuredSplitOverride,
       rendererPipeline: rendererPipelineOverride,
+      handwrittenFused: handwrittenFusedOverride,
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded' });
