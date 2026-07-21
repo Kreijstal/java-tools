@@ -1393,15 +1393,24 @@ class WasmJit {
     // Enter only where the verifier shape is empty and the materialized JVM
     // operand stack agrees; non-empty shapes are reachable solely through a
     // compiled predecessor inside the same wasm run.
+    if (!frame.stack.isEmpty()) return null;
     const blk = st.meta.blockOfItem.get(frame.pc);
-    if (blk === undefined || !st.meta.externalEntry.has(blk) || !frame.stack.isEmpty()) return null;
-    return { st, blk };
+    if (blk !== undefined && st.meta.externalEntry.has(blk)) return { st, blk };
+    // structured primary only admits pc 0; mid-method (loop OSR, fuel-exit
+    // resume) entries go through the dispatcher module kept alongside it
+    if (st.osr) {
+      const oblk = st.osr.meta.blockOfItem.get(frame.pc);
+      if (oblk !== undefined && st.osr.meta.externalEntry.has(oblk)) {
+        return { st, blk: oblk, osr: true };
+      }
+    }
+    return null;
   }
 
   tryRunFrame(frame, thread) {
     const prep = this.prepare(frame);
     if (!prep) return { handled: false };
-    return this.execute(frame, thread, prep.st, prep.blk);
+    return this.execute(frame, thread, prep.st, prep.blk, false, prep.osr === true);
   }
 
   // Called from the JS-jit runner's invoke() for freshly pushed child frames,
@@ -1414,9 +1423,10 @@ class WasmJit {
     if (options.requireNormalFlowFullyCompiled && !prep.st.meta.normalFlowFullyCompiled) {
       return { handled: false };
     }
-    const result = this.execute(frame, thread, prep.st, prep.blk, true);
+    const result = this.execute(frame, thread, prep.st, prep.blk, true, prep.osr === true);
     if (result.returned) {
-      return { returned: true, isVoid: prep.st.meta.retChar === 'V', value: prep.st.meta.box.ret };
+      const meta = prep.osr === true ? prep.st.osr.meta : prep.st.meta;
+      return { returned: true, isVoid: meta.retChar === 'V', value: meta.box.ret };
     }
     // deopted: nested callee frames were materialized ABOVE this child — the
     // caller must yield to the scheduler rather than resume the child itself
@@ -1432,21 +1442,29 @@ class WasmJit {
     // method again while its translator is still discovering callees.
     st.status = 'compiling';
     try {
-      let meta = null;
+      let structuredMeta = null;
       if (this.structuredEnabled) {
         try {
           const StructuredWasmCompiler = require('./StructuredWasmCompiler');
-          meta = new StructuredWasmCompiler(this.jvm, frame.method, className, this).translate();
+          structuredMeta = new StructuredWasmCompiler(this.jvm, frame.method, className, this).translate();
           this.structuredCompiles += 1;
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
           if (this.debug) console.error(`[wasmjit] structured fallback ${st.key}: ${err.message}`);
         }
       }
-      if (!meta) {
+      // The dispatcher module is built even when the structured one succeeds:
+      // structured control flow admits entry at pc 0 only, but hot loops are
+      // first observed mid-method and fuel exits resume mid-loop — both need
+      // dispatcher OSR entry or the hottest kernels never run compiled.
+      let meta = null;
+      try {
         const translator = new MethodTranslator(this.jvm, frame.method, className, this);
         meta = translator.translate();
+      } catch (err) {
+        if (!(err instanceof Unsupported) || !structuredMeta) throw err;
       }
+      const primary = structuredMeta || meta;
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
         // NestedDeopt when it reaches a demoted block, so demoted diagnostic
@@ -1454,15 +1472,15 @@ class WasmJit {
         // compiled and slots unboxed (boxed slots would read the junk/scratch
         // frame mid-run). It need not contain a loop: removing the call
         // boundary is precisely what lets the caller's loop remain compiled.
-        if (!meta.externalEntry.has(0) || meta.boxedCount) {
+        if (!primary.externalEntry.has(0) || primary.boxedCount) {
           throw new Unsupported('callee entry is not compiled');
         }
       } else {
         // Standalone entry has call/materialization overhead, so require at
         // least one fully compiled loop.
-        const hasCompiledLoop = this.hasSupportedBackwardBranch(frame.method, meta);
+        const hasCompiledLoop = this.hasSupportedBackwardBranch(frame.method, meta || structuredMeta);
         if (!hasCompiledLoop) {
-          if (this.debug && meta.demoteReasons.size) {
+          if (this.debug && meta && meta.demoteReasons.size) {
             const details = [...meta.demoteReasons.entries()]
               .map(([block, reason]) => `${block}:${reason}`).join(', ');
             console.error(`[wasmjit] no compiled loop ${st.key}: ${details}`);
@@ -1470,10 +1488,16 @@ class WasmJit {
           throw new Unsupported('no compiled loop');
         }
       }
-      const module = new WebAssembly.Module(meta.bytes);
-      const instance = new WebAssembly.Instance(module, meta.importObject);
-      st.meta = meta;
+      const module = new WebAssembly.Module(primary.bytes);
+      const instance = new WebAssembly.Instance(module, primary.importObject);
+      st.meta = primary;
       st.run = instance.exports.run;
+      if (structuredMeta && meta) {
+        const osrModule = new WebAssembly.Module(meta.bytes);
+        st.osr = { meta, run: new WebAssembly.Instance(osrModule, meta.importObject).exports.run };
+      } else {
+        st.osr = null;
+      }
       st.status = 'ready';
       st.retryAfter = undefined;
       st.deferredEpoch = undefined;
@@ -1481,9 +1505,10 @@ class WasmJit {
       this.compileEpoch += 1;
       if (!isRecompile) this.compiled.push(st);
       if (this.debug) {
-        console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${meta.bytes.length}B, ` +
-          `${meta.supportedBlocks.size}/${meta.blockCount} blocks, ${meta.fieldCacheCount} field caches` +
-          (meta.demoteReasons.size ? ` (exits: ${[...meta.demoteReasons.values()].join('; ')})` : ''));
+        console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${primary.bytes.length}B, ` +
+          `${primary.supportedBlocks.size}/${primary.blockCount} blocks, ${primary.fieldCacheCount} field caches` +
+          (structuredMeta ? ` structured${st.osr ? '+osr' : ''}` : '') +
+          (primary.demoteReasons.size ? ` (exits: ${[...primary.demoteReasons.values()].join('; ')})` : ''));
       }
     } catch (err) {
       if (isRecompile) {
@@ -1549,8 +1574,9 @@ class WasmJit {
     return blk;
   }
 
-  execute(frame, thread, st, blk, nested = false) {
-    const meta = st.meta;
+  execute(frame, thread, st, blk, nested = false, osr = false) {
+    const mod = osr && st.osr ? st.osr : st;
+    const meta = mod.meta;
     meta.box.frame = frame;
     meta.box.ret = undefined;
     const args = new Array(meta.paramSlots.length + 2);
@@ -1566,7 +1592,7 @@ class WasmJit {
     st.runs += 1;
     let status;
     try {
-      status = st.run(...args);
+      status = mod.run(...args);
     } catch (err) {
       if (err instanceof NestedDeopt) {
         // A linked partial callee hit a demoted block. The import closures
@@ -1600,7 +1626,7 @@ class WasmJit {
     frame.pc = status;
     // Exit storms usually mean a loop keeps leaving wasm for an invoke whose
     // callee wasn't compiled yet — recompile to bind callees that are now ready.
-    if (st.exits % 20000 === 0 && (st.recompiles || 0) < 3 && st.meta.demoteReasons.size) {
+    if (st.exits % 20000 === 0 && (st.recompiles || 0) < 3 && meta.demoteReasons.size) {
       st.recompiles = (st.recompiles || 0) + 1;
       this.compile(frame, st);
     }
@@ -1690,7 +1716,8 @@ class WasmJit {
 
   dumpStats() {
     for (const st of this.compiled) {
-      console.error(`[wasmjit] ${st.key}: runs=${st.runs} exits=${st.exits}`);
+      console.error(`[wasmjit] ${st.key}: runs=${st.runs} exits=${st.exits}` +
+        `${st.fuelExits ? ` fuelExits=${st.fuelExits}` : ''}${st.meta && st.meta.structured ? ' structured' : ''}`);
     }
   }
 }
