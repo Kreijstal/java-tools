@@ -65,6 +65,7 @@
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const { addTimeImport } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
+const { revalidateSpeculations } = require('./wasmInline');
 const Frame = require('../core/frame');
 const {
   T, CAT2, OP, TRUNC_SAT,
@@ -1680,6 +1681,30 @@ class WasmJit {
     }
     if (st.status !== 'ready') return null;
 
+    // Speculative modules (CHA instanceof guards from inlined instance calls)
+    // bake the compile-time world. They are excluded from every linking path
+    // (findReadyStatic/findReadyInstance), so this pre-entry check is the
+    // single gate: when the class world grew, re-run the plan-time site
+    // checks; the module survives when every speculated cone is unchanged
+    // (the common case — most loads are unrelated) and is dropped for a
+    // recompile only when one actually grew.
+    if (st.meta && st.meta.speculations &&
+        st.meta.specEpoch !== (this.jvm.classEpoch || 0)) {
+      if (st.meta.specSites &&
+          revalidateSpeculations(this.jvm, this.hierarchy, st.meta.specSites)) {
+        st.meta.specEpoch = this.jvm.classEpoch || 0;
+      } else {
+        st.status = 'cold';
+        st.entries = 0;
+        st.retryAfter = 1;
+        st.meta = null;
+        st.run = null;
+        st.osr = null;
+        st.callee = null;
+        return null;
+      }
+    }
+
     // External calls and interpreter resumptions have no wasm carry locals.
     // Enter only where the verifier shape is empty and the materialized JVM
     // operand stack agrees; non-empty shapes are reachable solely through a
@@ -1777,8 +1802,11 @@ class WasmJit {
         }
       } else {
         // Standalone entry has call/materialization overhead, so require at
-        // least one fully compiled loop.
-        const hasCompiledLoop = this.hasSupportedBackwardBranch(frame.method, meta || structuredMeta);
+        // least one fully compiled loop — in EITHER module: inlining can make
+        // the structured module cover a loop whose call the dispatcher could
+        // only demote (uncompilable callee), and vice versa.
+        const hasCompiledLoop = (meta && this.hasSupportedBackwardBranch(frame.method, meta)) ||
+          (structuredMeta && this.hasSupportedBackwardBranch(frame.method, structuredMeta));
         if (!hasCompiledLoop) {
           if (this.debug && meta && meta.demoteReasons.size) {
             const details = [...meta.demoteReasons.entries()]
@@ -1808,7 +1836,7 @@ class WasmJit {
       st.deferredEpoch = undefined;
       st.calleeDeferredEpoch = undefined;
       this.compileEpoch += 1;
-      if (!isRecompile) this.compiled.push(st);
+      if (!st.listed) { st.listed = true; this.compiled.push(st); }
       if (this.debug) {
         console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${primary.bytes.length}B, ` +
           `${primary.supportedBlocks.size}/${primary.blockCount} blocks, ${primary.fieldCacheCount} field caches` +
@@ -2035,6 +2063,9 @@ class WasmJit {
     if (!st || st.status !== 'ready') return null;
     const cm = (st.callee || st).meta;
     if (cm.boxedCount) return null;
+    // speculative modules are entered only through prepare(), whose epoch
+    // check invalidates them; a captured link would outlive that check
+    if (cm.speculations) return null;
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
     // partial callees deopt on demoted blocks; the entry block at least must
     // run in wasm or every call would deopt immediately
@@ -2064,6 +2095,8 @@ class WasmJit {
     if (!st || st.status !== 'ready') return null;
     const cm = (st.callee || st).meta;
     if (cm.boxedCount) return null;
+    // same speculative-module exclusion as findReadyStatic
+    if (cm.speculations) return null;
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
     return cm.externalEntry.has(0) ? st : null;
   }

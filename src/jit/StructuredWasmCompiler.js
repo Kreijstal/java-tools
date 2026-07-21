@@ -32,7 +32,8 @@ const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
   addTimeImport,
 } = require('./wasmRuntimeImports');
-const { inlineStaticCalls } = require('./wasmInline');
+const { inlineCalls } = require('./wasmInline');
+const { runtimeClassName } = require('../instructions/object');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
 const LCONST = { lconst_0: 0n, lconst_1: 1n };
@@ -88,14 +89,24 @@ class StructuredWasmCompiler {
     let items = codeAttr.code.codeItems;
     const table = codeAttr.code.exceptionTable || [];
     this.origIdx = null;
+    this.deoptStubs = null;
     let inlinedCalls = 0;
+    let speculations = 0;
+    let specSites = null;
     if (inline) {
-      const expanded = inlineStaticCalls(this.jvm, codeAttr);
+      const instanceInline = process.env.JVM_WASM_INSTANCE_INLINE !== '0';
+      const expanded = inlineCalls(this.jvm, codeAttr, {
+        hierarchy: instanceInline && this.wasmJit ? this.wasmJit.hierarchy : null,
+        callerClassName: this.className,
+      });
       if (expanded) {
         items = expanded.items;
         this.origIdx = expanded.origIdx;
+        this.deoptStubs = expanded.deoptStubs;
         this.didInline = true;
         inlinedCalls = expanded.inlined;
+        speculations = expanded.speculations;
+        specSites = expanded.specSites;
       }
     }
 
@@ -117,6 +128,20 @@ class StructuredWasmCompiler {
     this.fn = fn;
     this.cfg = cfg;
     this.items = items;
+
+    // Guard-miss deopt stubs from inlined instance calls: blocks that exit to
+    // the interpreter at the ORIGINAL call site with [recv, args...] rebuilt
+    // from the argument-store slots.
+    this.deoptBlocks = new Map();
+    if (this.deoptStubs && this.deoptStubs.size) {
+      const blockOfFirst = new Map();
+      for (const block of cfg.blocks) blockOfFirst.set(block.insns[0], block.id);
+      for (const [idx, stub] of this.deoptStubs) {
+        const id = blockOfFirst.get(idx);
+        if (id === undefined) throw new Unsupported('deopt stub not at block start');
+        this.deoptBlocks.set(id, stub);
+      }
+    }
 
     // wasm locals: params (slot order), blk, fuel, then one local per value
     this.paramSlots = fn.params.map((p) => ({ slot: p.imm.slot, t: KIND_T[p.kind] }));
@@ -166,7 +191,12 @@ class StructuredWasmCompiler {
     });
     const treeBlocks = collectTreeBlocks(structured.tree);
     this.demoted = new Map();
-    const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, labelIndex);
+    // labelIndex is in EXPANDED item space; hand liveExceptionRanges a code
+    // view whose codeItems match, or handlers after a splice point read the
+    // wrong items and misclassify as live (spurious demotions).
+    const liveRanges = liveExceptionRanges(
+      this.jvm, { ...codeAttr.code, codeItems: items }, labelIndex,
+    );
     if (liveRanges.length) {
       for (const id of treeBlocks) {
         const insns = cfg.blocks[id].insns;
@@ -178,7 +208,7 @@ class StructuredWasmCompiler {
       }
     }
     for (const id of treeBlocks) {
-      if (this.demoted.has(id)) continue;
+      if (this.demoted.has(id) || this.deoptBlocks.has(id)) continue;
       try {
         const scratch = [];
         this.emitBlockBody(id, scratch);
@@ -222,13 +252,16 @@ class StructuredWasmCompiler {
       if (orig !== undefined && orig >= 0 && !blockOfItem.has(orig)) {
         blockOfItem.set(orig, block.id);
       }
-      if (treeBlocks.has(block.id) && !this.demoted.has(block.id)) {
+      if (treeBlocks.has(block.id) && !this.demoted.has(block.id) &&
+          !this.deoptBlocks.has(block.id)) {
         supportedBlocks.add(block.id);
       }
     }
     const env = {};
     this.importDecls.forEach((d, i) => { env[d.name] = this.importFns[i]; });
-    const normalFlowFullyCompiled = this.demoted.size === 0;
+    // Deopt stubs exit mid-method needing a real frame, so modules that have
+    // them must take the partial-callee protocol (and are never pinned).
+    const normalFlowFullyCompiled = this.demoted.size === 0 && this.deoptBlocks.size === 0;
     return {
       bytes,
       importObject: { env },
@@ -246,6 +279,13 @@ class StructuredWasmCompiler {
       fieldCacheCount: 0,
       structured: true,
       inlinedCalls,
+      // CHA instanceof guards bake the compile-time world; the jit re-checks
+      // specEpoch before every entry, revalidates the sites when the world
+      // grew, and recompiles only when a speculated cone actually changed.
+      speculations,
+      specSites,
+      specEpoch: this.jvm.classEpoch || 0,
+      deoptStubCount: this.deoptBlocks.size,
     };
   }
 
@@ -269,6 +309,10 @@ class StructuredWasmCompiler {
         return;
       case 'straight': {
         env.curBlock = node.block;
+        if (this.deoptBlocks.has(node.block)) {
+          this.emitSpillResume(node.block, out, this.deoptBlocks.get(node.block));
+          return;
+        }
         if (this.demoted.has(node.block)) {
           // Exit stub: hand the block to the interpreter (the dispatcher OSR
           // module picks the method back up at the next supported block).
@@ -392,7 +436,11 @@ class StructuredWasmCompiler {
       copies.push({ phi, arg, t });
     }
     for (const { arg, t } of copies) {
-      if (arg.op === 'undef') out.push(...zeroConst(t));
+      // An unkinded arg is a conflicted slot join that was never loaded on
+      // this path: verified bytecode cannot observe a slot whose types
+      // conflict at the join, so the value riding this edge is dead garbage
+      // and a zero constant is equivalent (same rule as slotDefsIn spills).
+      if (arg.op === 'undef' || KIND_T[arg.kind] === undefined) out.push(...zeroConst(t));
       else out.push(OP.local_get, ...uleb(this.mustLocal(arg)));
     }
     for (let i = copies.length - 1; i >= 0; i -= 1) {
@@ -424,8 +472,12 @@ class StructuredWasmCompiler {
 
   // Spill the block's reaching slot defs into frame.locals, push its entry
   // stack into frame.stack, and resume interpretation at the block. Shared by
-  // fuel-exhaustion exits (inside the fuel if) and demoted-block exit stubs.
-  emitSpillResume(blockId, out) {
+  // fuel-exhaustion exits (inside the fuel if), demoted-block exit stubs, and
+  // — with `stub` — inlined-call deopt stubs, which additionally push the
+  // original invoke's operands [recv, args...] (read from the argument-store
+  // slots; the entry stack holds only whatever sat UNDER them) and resume at
+  // the original call-site pc so the interpreter re-executes the invoke.
+  emitSpillResume(blockId, out, stub = null) {
     const block = this.blockOf(blockId);
     const spills = [];
     for (const [slot, value] of block.slotDefsIn || []) {
@@ -450,6 +502,17 @@ class StructuredWasmCompiler {
       const t = KIND_T[value.kind];
       if (t === undefined) throw new Unsupported('unkinded entry stack at exit');
       out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, t)));
+    }
+    if (stub) {
+      const defs = block.slotDefsIn || new Map();
+      for (const slot of stub.valueSlots) {
+        const def = defs.get(slot);
+        const t = def && def.op !== 'undef' ? KIND_T[def.kind] : undefined;
+        if (t === undefined) throw new Unsupported('deopt stub operand unavailable');
+        out.push(...this.useOf(def), OP.call, ...uleb(pushImportFor(this, t)));
+      }
+      out.push(OP.i32_const, ...sleb(stub.resumeIdx), OP.return);
+      return;
     }
     out.push(OP.i32_const, ...sleb(this.resumeItemOf(blockId)), OP.return);
   }
@@ -610,7 +673,58 @@ class StructuredWasmCompiler {
       return finish();
     }
 
+    // Casts compile only inside spliced callee bodies (those blocks have no
+    // interpreter resume pc, so demotion is not an option there). Original-
+    // method casts keep the demotion status quo: compiling them was measured
+    // net-negative on the dispatcher tier (it unlocks tiny cast-bearing
+    // callees whose import-dispatch overhead exceeds interpreting them).
+    if (op === 'checkcast' || op === 'instanceof') {
+      if (!this.origIdx || this.origIdx[node.itemIdx] !== -1) {
+        throw new Unsupported(`op ${op}`);
+      }
+      out.push(...use(0), OP.call, ...uleb(this.castImport(op, node.imm)));
+      return finish();
+    }
+
     throw new Unsupported(`op ${op}`);
+  }
+
+  // Memoized subtype-verdict imports. Never deopts: a hierarchy verdict for a
+  // loaded (source, target) pair is immutable, a failed checkcast throws the
+  // guest CCE (which unwinds past this frame exactly like the interpreter's),
+  // and a live object's class chain is always loaded.
+  castImport(op, target) {
+    if (typeof target !== 'string') throw new Unsupported(`${op} target`);
+    const known = target === 'java/lang/Object' || target.startsWith('[') ||
+      this.jvm.classes[target] || this.jvm.jre[target];
+    if (!known) throw new Unsupported(`${op} ${target} unloaded`);
+    const name = `${op === 'checkcast' ? 'cast' : 'isof'}_${target}`.replace(/[^\w]/g, '_');
+    const existing = this.importIndexByName.get(name);
+    if (existing !== undefined) return existing;
+    const jvm = this.jvm;
+    const verdicts = new Map();
+    const verdictOf = (ref) => {
+      const source = runtimeClassName(ref);
+      let ok = verdicts.get(source);
+      if (ok === undefined) {
+        ok = jvm.isInstanceOf(source, target);
+        if (verdicts.size < 64) verdicts.set(source, ok);
+      }
+      return ok;
+    };
+    if (op === 'checkcast') {
+      return this.addImport(name, [T.ref], [T.ref], (ref) => {
+        if (ref === null || ref === undefined) return null;
+        if (verdictOf(ref)) return ref;
+        throw {
+          type: 'java/lang/ClassCastException',
+          message: `${runtimeClassName(ref)} cannot be cast to ${target}`,
+        };
+      });
+    }
+    return this.addImport(name, [T.ref], [T.i32], (ref) => (
+      ref === null || ref === undefined ? 0 : (verdictOf(ref) ? 1 : 0)
+    ));
   }
 
   // invokestatic bound directly to another compiled wasm method — the
