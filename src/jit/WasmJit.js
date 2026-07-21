@@ -462,6 +462,11 @@ class MethodTranslator {
     // under the arguments ride through the import so the deopt path can
     // rebuild the operand stack. Fully-compiled callees never deopt and
     // skip the shuffle entirely.
+    // A partial static link can propagate a NestedDeopt through this module,
+    // so it makes this module deoptable for ITS callers exactly like an
+    // instance site does; non-partial links stay non-deoptable because they
+    // pin a fully-compiled, zero-deoptable-site module.
+    if (partial) this.instanceSites = (this.instanceSites || 0) + 1;
     const underCount = partial ? underTypes.length : 0;
     const unders = partial ? underTypes : [];
     // java arg slot -> position in the wasm arg list
@@ -617,16 +622,31 @@ class MethodTranslator {
     let slot = 1;
     params.forEach((p, i) => { argPosBySlot.set(slot, i + 1); slot += (p === 'J' || p === 'D') ? 2 : 1; });
     const underCount = underTypes.length;
-    const wParams = [...underTypes, T.ref, ...params.map(descToWasm)];
+    // The caller's typed slots ride as leading params (same fused-spill
+    // scheme as checkcastImport): the fast path pays a single JS crossing,
+    // and every deopt path writes the slots into frame.locals before the
+    // interpreter resumes. Throw paths (NPE) unwind past this frame —
+    // compiled blocks sit outside live handler ranges — so stale locals
+    // are unobservable there.
+    const callerSlots = this.paramSlots.slice();
+    const slotCount = callerSlots.length;
+    const wParams = [
+      ...callerSlots.map((s) => this.slotTypes.get(s)),
+      ...underTypes, T.ref, ...params.map(descToWasm),
+    ];
     const results = ret === 'V' ? [] : [descToWasm(ret)];
     const key = `${owner}.${name}${descriptor}`;
     const callerBox = this.box;
     const resumePc = itemIndex + 1;
     const scratchFrames = new Map(); // target st -> reusable deopt frame
     const stats = this.siteStatsFor(`vcall_${owner}.${name}@${this.className}.${this.method.name}:${itemIndex}`);
+    const spillCallerSlots = (all) => {
+      const locals = callerBox.frame.locals;
+      for (let i = 0; i < slotCount; i++) locals[callerSlots[i]] = all[i];
+    };
     const fn = (...all) => {
       if (stats) stats.calls += 1;
-      const args = underCount ? all.slice(underCount) : all;
+      const args = all.slice(slotCount + underCount);
       const receiver = args[0];
       if (receiver === null || receiver === undefined) {
         throw NPE(`invoke ${key} on null`);
@@ -636,8 +656,9 @@ class MethodTranslator {
         // class loaded after compilation: hand the site back to the
         // interpreter with its operands restored
         if (stats) stats.deopts += 1;
+        spillCallerSlots(all);
         callerBox.frame.pc = itemIndex;
-        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[slotCount + i]);
         for (const v of args) callerBox.frame.stack.push(v);
         throw new NestedDeopt([]);
       }
@@ -681,10 +702,11 @@ class MethodTranslator {
           if (stats) stats.deopts += 1;
           err.frames.push(frame);
           if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          spillCallerSlots(all);
           callerBox.frame.pc = resumePc;
           // the interpreter resumes mid-expression: the values under the
           // call's arguments must be back on the caller's operand stack
-          for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+          for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[slotCount + i]);
         }
         throw err;
       } finally {
@@ -696,8 +718,9 @@ class MethodTranslator {
         if (stats) stats.deopts += 1;
         frame.pc = status;
         if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+        spillCallerSlots(all);
         callerBox.frame.pc = resumePc;
-        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[i]);
+        for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[slotCount + i]);
         calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
         if (calleeSt.nestedDeopts > 256 &&
             calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
@@ -719,9 +742,10 @@ class MethodTranslator {
       for (const k of sub) writes.add(k);
     }
     return {
-      argTypes: wParams.slice(underCount),
+      argTypes: wParams.slice(slotCount + underCount),
       underTypes,
       writes,
+      leadGets: callerSlots.map((s) => this.localOfSlot.get(s)),
       idx: this.addImport(importName, wParams, results, fn),
     };
   }
@@ -1395,14 +1419,11 @@ class MethodTranslator {
         if (stack.length < argCount) throw new Unsupported(`${op} stack underflow`);
         const bound = this.compiledInstanceCallee(ins, i, stack.slice(0, stack.length - argCount), op);
         for (let k = 0; k < argCount; k++) pop();
-        // every instance site can deopt (map miss or partial target): the
-        // caller's typed slots must be in frame.locals first
-        emit(...this.spillSeq());
-        if (bound.underTypes.length) {
-          emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes));
-        } else {
-          emit(OP.call, ...uleb(bound.idx));
-        }
+        // every instance site can deopt (map miss or partial target); the
+        // caller's typed slots ride as leading import params and reach
+        // frame.locals only on the deopt paths
+        emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes,
+          bound.leadGets));
         if (bound.writes === null) emit(...this.killSeqWhere(() => true));
         else if (bound.writes.size) {
           emit(...this.killSeqWhere((entry) => bound.writes.has(entry.killKey)));
