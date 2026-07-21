@@ -3,7 +3,7 @@
 const {
   getStackEffect,
   normalizeInstruction,
-} = require('../../utils/instructionUtils');
+} = require('./stackEffects');
 
 const CONDITIONAL_BRANCH_OPS = new Set([
   'ifeq', 'ifne', 'iflt', 'ifge', 'ifgt', 'ifle',
@@ -137,8 +137,14 @@ function populateStackInfo(graph, options = {}) {
 
   const work = [{ node: graph.entry, stack: [] }];
   const queued = new Set();
+  // Merge-heavy CFGs can re-enqueue nodes once per fresh merged-value
+  // identity; callers doing bulk sweeps bound that with maxSteps.
+  const maxSteps = options.maxSteps || Infinity;
+  let steps = 0;
 
   while (work.length > 0) {
+    steps += 1;
+    if (steps > maxSteps) throw new Error('op02 step budget exceeded');
     const { node, stack } = work.shift();
     queued.delete(queueKey(node, stack));
     const changed = applyStackAtNode(graph, node, stack, options);
@@ -229,8 +235,17 @@ function applySpecialStackEffect(stack, special, node) {
     stack.push(copy);
     produced.push(copy);
   };
-  const take = (count) => {
-    const values = stack.splice(Math.max(0, stack.length - count), count);
+  // The dup2/dup_x2 family is slot-counted, not entry-counted: a wide value
+  // is ONE entry worth TWO slots, so take by slots or wide operands (e.g.
+  // dup2_x1 over [ref, long]) miscount the depth.
+  const takeSlots = (slots) => {
+    const values = [];
+    let remaining = slots;
+    while (remaining > 0 && stack.length > 0) {
+      const value = stack.pop();
+      values.unshift(value);
+      remaining -= (value && value.width) || 1;
+    }
     return values;
   };
   const put = (value) => {
@@ -238,41 +253,38 @@ function applySpecialStackEffect(stack, special, node) {
   };
 
   if (special === 'dup') {
-    const [v1] = take(1);
+    const [v1] = takeSlots(1);
     put(v1);
     pushCopy(v1);
   } else if (special === 'dup_x1') {
-    const [v2, v1] = take(2);
+    const [v2, v1] = takeSlots(2);
     pushCopy(v1);
     put(v2);
     put(v1);
   } else if (special === 'dup_x2') {
-    const [v3, v2, v1] = take(3);
-    pushCopy(v1);
-    put(v3);
-    put(v2);
-    put(v1);
+    const top = takeSlots(1);
+    const below = takeSlots(2);
+    pushCopy(top[0]);
+    for (const value of below) put(value);
+    put(top[0]);
   } else if (special === 'dup2') {
-    const values = take(2);
+    const values = takeSlots(2);
     for (const value of values) put(value);
     for (const value of values) pushCopy(value);
   } else if (special === 'dup2_x1') {
-    const [v3, v2, v1] = take(3);
-    pushCopy(v2);
-    pushCopy(v1);
-    put(v3);
-    put(v2);
-    put(v1);
+    const top = takeSlots(2);
+    const below = takeSlots(1);
+    for (const value of top) pushCopy(value);
+    for (const value of below) put(value);
+    for (const value of top) put(value);
   } else if (special === 'dup2_x2') {
-    const [v4, v3, v2, v1] = take(4);
-    pushCopy(v2);
-    pushCopy(v1);
-    put(v4);
-    put(v3);
-    put(v2);
-    put(v1);
+    const top = takeSlots(2);
+    const below = takeSlots(2);
+    for (const value of top) pushCopy(value);
+    for (const value of below) put(value);
+    for (const value of top) put(value);
   } else if (special === 'swap') {
-    const [v2, v1] = take(2);
+    const [v2, v1] = takeSlots(2);
     put(v1);
     put(v2);
   }
