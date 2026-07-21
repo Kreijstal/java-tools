@@ -457,6 +457,9 @@ class StructuredWasmCompiler {
     for (let i = copies.length - 1; i >= 0; i -= 1) {
       out.push(OP.local_set, ...uleb(this.mustLocal(copies[i].phi)));
     }
+    // a phi assignment rebinds its local (loop-carried receivers): caches
+    // keyed on the phi describe the previous iteration's object
+    for (const { phi } of copies) out.push(...this.cacheKillsFor(phi.id));
   }
 
   mustLocal(value) {
@@ -588,7 +591,12 @@ class StructuredWasmCompiler {
     const op = node.op;
     const use = (i) => this.useOf(node.args[i]);
     const finish = () => {
-      if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+      if (node.kind !== 'V') {
+        out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+        // this value's local now holds a fresh (re)computation — caches
+        // keyed on it describe the previous one and must refill
+        out.push(...this.cacheKillsFor(node.id));
+      }
     };
 
     // constants
@@ -678,14 +686,18 @@ class StructuredWasmCompiler {
       if (isGet && caching) {
         const cacheKey = isStatic
           ? `s|${field.name}` : `f|${node.args[0].id}|${field.name}`;
-        const entry = this.fieldCacheFor(cacheKey, field.t, killKey, isStatic ? 's' : 'f');
+        const entry = this.fieldCacheFor(cacheKey, field.t, killKey, isStatic ? 's' : 'f',
+          isStatic ? null : node.args[0].id);
         // cached instance path skips the null check: a filled flag proves
         // this exact SSA value already loaded this field successfully
         const loadSeq = isStatic
           ? [OP.call, ...uleb(field.idx)]
           : [...use(0), OP.call, ...uleb(field.idx)];
-        out.push(...this.cachedReadSeq(entry, loadSeq));
-        return finish();
+        // dependent caches (arrays/fields keyed on this value) are killed on
+        // the refill path only — a hit reproduces the cached value verbatim
+        out.push(...this.cachedReadSeq(entry, loadSeq, this.cacheKillsFor(node.id)));
+        if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+        return;
       }
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
       out.push(OP.call, ...uleb(field.idx));
@@ -727,17 +739,30 @@ class StructuredWasmCompiler {
     throw new Unsupported(`op ${op}`);
   }
 
-  fieldCacheFor(cacheKey, t, killKey, kind) {
+  fieldCacheFor(cacheKey, t, killKey, kind, recvId) {
     let entry = this.fieldCaches.get(cacheKey);
     if (!entry) {
       const valLocal = this.nextLocal++;
       this.declared.push(t);
       const filledLocal = this.nextLocal++;
       this.declared.push(T.i32);
-      entry = { valLocal, filledLocal, t, killKey, kind };
+      entry = { valLocal, filledLocal, t, killKey, kind, recvId };
       this.fieldCaches.set(cacheKey, entry);
     }
     return entry;
+  }
+
+  // Clears every cache keyed on this SSA value: emitted right after the
+  // value's wasm local is (re)written, so a cache filled from a previous
+  // execution of the defining node (loop-carried receiver) never survives it.
+  cacheKillsFor(id) {
+    const seq = [];
+    for (const e of this.fieldCaches.values()) {
+      if (e.recvId === id) {
+        seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filledLocal));
+      }
+    }
+    return seq;
   }
 
   killSeqWhere(predicate) {
@@ -751,14 +776,17 @@ class StructuredWasmCompiler {
   }
 
   // read through the cache entry; on miss run `loadSeq` (which must leave
-  // exactly the loaded value on the wasm stack) and fill the cache
-  cachedReadSeq(entry, loadSeq) {
+  // exactly the loaded value on the wasm stack) and fill the cache. `onMiss`
+  // bytes run only when the cache refills — a hit proves the produced value
+  // is identical to the cached one, so caches keyed on it stay valid.
+  cachedReadSeq(entry, loadSeq, onMiss = []) {
     return [
       OP.local_get, ...uleb(entry.filledLocal), OP.if, entry.t,
       OP.local_get, ...uleb(entry.valLocal),
       OP.else, ...loadSeq,
       OP.local_set, ...uleb(entry.valLocal),
       OP.i32_const, ...sleb(1), OP.local_set, ...uleb(entry.filledLocal),
+      ...onMiss,
       OP.local_get, ...uleb(entry.valLocal), OP.end,
     ];
   }

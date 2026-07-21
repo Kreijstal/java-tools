@@ -273,3 +273,36 @@ test('JVM_WASM_INSTANCE_INLINE=0 disables the instance path but stays correct', 
   t.ok(!meta || !meta.speculations, 'no speculative module with the flag off');
   t.end();
 });
+
+const WALK_SOURCE = `
+public class ChainWalk {
+  public static void chainSum(int[] out, Node h, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) { s += h.v; h = h.next; }
+    out[0] = s;
+  }
+}
+class Node { int v; Node next; }
+`;
+
+test('loop-phi field receiver: cache refills as the walk advances', async (t) => {
+  // h is a loop phi (h = h.next): the SSA value id backing the h.v cache is
+  // rebound every iteration. Without the def-site kills, the cache filled on
+  // node 0 survives the rebinding and every read returns the first node's v.
+  const { jvm, thread } = await makeHarness(t, 'ChainWalk', WALK_SOURCE, ['Node']);
+  const n = 300;
+  let head = null;
+  let expect = 0;
+  for (let i = n - 1; i >= 0; i -= 1) {
+    head = { type: 'Node', fields: { 'Node.v': i * 7, 'Node.next': head } };
+  }
+  for (let i = 0; i < n; i += 1) expect = (expect + i * 7) | 0;
+  const out = [0];
+  out.type = '[I';
+  for (let k = 0; k < 150; k += 1) {
+    await invoke(jvm, thread, 'ChainWalk', 'chainSum', '([ILNode;I)V', [out, head, n]);
+  }
+  t.equal(out[0], expect, 'walk reads each node’s field, not the first forever');
+  t.ok(metaOf(jvm, 'ChainWalk.chainSum([ILNode;I)V'), 'chainSum is compiled');
+  t.end();
+});
