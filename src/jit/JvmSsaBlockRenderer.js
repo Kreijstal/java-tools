@@ -229,13 +229,24 @@ class JvmSsaBlockRenderer {
     }
     const localCount = Number(code.code.localsSize) || 0;
     const fieldSites = new Map();
+    const directStaticSites = new Map();
+    const directStaticOwners = new Set();
     const callSites = new Map();
     for (let index = 0; index < items.length; index += 1) {
       if (depths[index] === undefined) continue;
       const instruction = items[index]?.instruction;
       const op = typeof instruction === "string" ? instruction : instruction?.op;
       if (op === "getfield" || op === "putfield" || op === "getstatic" || op === "putstatic") {
-        fieldSites.set(index, this.jit.registerFieldSite(instruction.arg));
+        const fieldSite = this.jit.registerFieldSite(instruction.arg);
+        fieldSites.set(index, fieldSite);
+        if (op === "getstatic" || op === "putstatic") {
+          const direct = this.jit.registerDirectStaticTarget(fieldSite, op === "putstatic");
+          if (direct) {
+            direct.variable = `ssaStaticFields${directStaticSites.size}`;
+            directStaticSites.set(index, direct);
+            directStaticOwners.add(direct.className);
+          }
+        }
       } else if ((op === "invokestatic" || op === "invokevirtual" ||
           op === "invokespecial" || op === "invokeinterface") &&
           Array.isArray(instruction?.arg) && Array.isArray(instruction.arg[2])) {
@@ -579,8 +590,14 @@ class JvmSsaBlockRenderer {
             "  return { deopt: true, transient: true, reason: 'class initialization in structured SSA new' };", "}");
           stack.push(out);
         } else if (op === "getstatic") {
-          const site = fieldSites.get(index), out = value();
+          const site = fieldSites.get(index), direct = directStaticSites.get(index), out = value();
           if (site === undefined) valid = false;
+          else if (direct) {
+            const key = JSON.stringify(direct.key);
+            lines.push(`const ${out} = ${direct.kind === "map"
+              ? `${direct.variable}.get(${key})` : `${direct.variable}[${key}]`};`);
+            stack.push(out);
+          }
           else {
             lines.push(`const ${out} = helpers.getStaticSyncAt(${site});`,
               `if (${out} === helpers.staticDeopt()) {`,
@@ -590,8 +607,10 @@ class JvmSsaBlockRenderer {
             stack.push(out);
           }
         } else if (op === "putstatic") {
-          const input = pop(), site = fieldSites.get(index), changed = value();
+          const input = pop(), site = fieldSites.get(index), direct = directStaticSites.get(index),
+            changed = value();
           if (input === null || site === undefined) valid = false;
+          else if (direct) lines.push(`${direct.variable}.set(${JSON.stringify(direct.key)}, ${input});`);
           else lines.push(`const ${changed} = helpers.putStaticSyncAt(${site}, ${input});`,
             `if (${changed} === helpers.staticDeopt()) {`,
             ...materializeLines([...stack, input], index).map((line) => `  ${line}`),
@@ -813,8 +832,16 @@ class JvmSsaBlockRenderer {
       declarations.push(`let ${variable} = 0;`);
       for (let slot = 0; slot < island.maxDepth; slot += 1) declarations.push(`let ${island.transfer}${slot};`);
     }
+    const staticEntryGuard = directStaticOwners.size
+      ? `if (${[...directStaticOwners].map((owner) =>
+        `helpers.jvm.classInitializationState.get(${JSON.stringify(owner)}) !== "INITIALIZED"`).join(" || ")}) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }`
+      : null;
+    const directStaticDeclarations = [...directStaticSites.values()].map((direct) =>
+      `const ${direct.variable} = helpers.directStaticTargets[${direct.targetId}].fields;`);
     const body = ["'use strict';", "const locals = frame.locals;", "const stack = frame.stack.items;",
       "if (frame.pc !== 0 || (initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA entry' }; }",
+      staticEntryGuard,
+      ...directStaticDeclarations,
       "helpers.structuredSsa.runCount += 1;",
       "let safePointBudget = 10000;",
       ...Array.from({ length: localCount }, (_u, i) => `let local${i} = locals[${i}];`),
@@ -822,7 +849,8 @@ class JvmSsaBlockRenderer {
         (_u, i) => ` locals[${i}] = local${i};`).join("")} };`,
       ...declarations, ...render(structured.tree)];
     try {
-      const generated = new Function("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      const generated = this.jit.createGeneratedFunction(method, "structured-ssa",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"));
       generated.jvmSynchronous = true;
       generated.jvmStructuredSsa = true;
       generated.jvmStructuredLoopCount = structured.loopHeaders.size;

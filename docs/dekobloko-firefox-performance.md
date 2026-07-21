@@ -2144,3 +2144,256 @@ or an obfuscated-name allowlist remains unacceptable.
 Do not prioritize canvas upload, scanline arithmetic, Java thread-to-worker
 mapping, more frequent yielding, call-stack container push/pop, or another
 guarded field cache unless new profiling contradicts the evidence above.
+
+## Native Firefox sampling: the actual post-raster bottlenecks
+
+The high-frequency exclusive timer attribution above was replaced with a raw
+Gecko sampling profile. Generated JavaScript functions now receive stable
+profiler names derived from the runtime method identity, descriptor, and
+compiler tier. These names are diagnostic metadata only: optimizer selection
+continues to use descriptors, bytecode/CFG structure, and verified callee
+shapes, never game method or class names.
+
+The labeled run used a 1 ms interval and the `js`, `stackwalk`, and `cpu`
+features. It produced the expected initial surface hash, no runtime errors, and
+20 changed images at 14.29 changed images/s under profiler overhead. The exact
+post-nonblack interval was `[50383.40, 51783.14)` ms: 1,400 Gecko samples.
+
+The largest leaf costs in that window were:
+
+| leaf | samples | whole window |
+| --- | ---: | ---: |
+| `getStaticSyncAt` | 160 | 11.4% |
+| partial-Wasm field import | 57 | 4.1% |
+| partial-Wasm array imports | 70 | 5.0% |
+| two largest structured guest bodies, combined self time | 60 | 4.3% |
+| Wasm exit trampoline | 28 | 2.0% |
+| `elemsOf` plus reference conversion | 48 | 3.4% |
+| `getFieldAt` | 20 | 1.4% |
+| fused flat raster | 19 | 1.4% |
+| `executeTick` | 18 | 1.3% |
+| `tryInvokeSyncAt` plus `tryInvokeResolvedTarget` | 15 | 1.1% |
+
+There were 571 samples (40.8%) containing a named generated guest frame and
+283 (20.2%) on the partial-Wasm path. A separate unlabeled capture attributed
+about 41% to partial Wasm; run-to-run tier composition varies, so the exact
+aggregate is less stable than the repeated observation that host imports and
+boundary machinery consume more time than the Wasm arithmetic itself.
+
+This resolves the earlier ambiguity:
+
+- Generic Java call dispatch is not currently the largest cost. Its directly
+  sampled helpers are around 1% of the window.
+- Canvas/AWT and the raster arithmetic are not the missing path to 30 fps.
+- The hottest guest owners are the model/face routines, but most of their
+  inclusive samples land in JVM helpers rather than their own arithmetic.
+- The first generic follow-up was initialized-static specialization: resolve
+  an exact static slot once, retain mutable value reads, and bypass repeated
+  field-site and class-state map lookup only while initialization and debugger
+  guards hold. Its result is recorded below.
+- Partial Wasm should become a whole-region backend with a stable heap
+  interface or be avoided for reference-heavy loops. Crossing into JavaScript
+  for individual array, field, and reference operations defeats the purpose of
+  compiling a small arithmetic fragment to Wasm.
+
+Raw profiles can be analyzed without enabling any JVM timing probe:
+
+```sh
+npm run analyze:dekobloko:firefox-profile -- \
+  /tmp/dekobloko-gecko-named-PID.json \
+  --url 127.0.0.1:3766 --start 50383.40 --end 51783.14
+```
+
+The analyzer selects the matching content `GeckoMain` thread, walks raw stack
+tables, and reports top leaf frames plus inclusive and self samples for all
+generated guest functions. Each optimization should be measured on an exact
+animation window with this probe-free method, then validated with the existing
+surface-hash and differential checks.
+
+### Initialized-static specialization result
+
+The structured SSA compiler now resolves static storage locations while it is
+building a method, emits one class-initialization guard at method entry, and
+then emits direct `Map.get`, `Map.set`, or object-property access. This remains
+fully structural and class-name independent. It binds the storage location,
+not the value, so static mutations after compilation remain visible. If any
+participating class is not initialized, the guard returns to the existing JVM
+path before executing a guest side effect. Debug entry still takes the older
+path first.
+
+Save states do not retain a stale binding: `loadState` installs restored static
+maps and then constructs a new `JitCompiler`. Generated JavaScript and its
+direct-static target table are deliberately not serialized.
+
+Focused tests verify mutable post-compilation values, inherited field storage,
+the before-side-effects initialization fallback, and profiler identity
+metadata. The exact command passed 311 assertions:
+
+```sh
+timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
+```
+
+The production bundle rebuilt successfully. Three probe-free Firefox runs on
+the same profiling-server bundle measured:
+
+| run | changed images/s | elapsed for 20 images |
+| ---: | ---: | ---: |
+| 1 | 14.998 | 1333.50 ms |
+| 2 | 14.627 | 1367.32 ms |
+| 3 | 15.192 | 1316.48 ms |
+| **median** | **14.998** | |
+
+The previous best median was 14.46, so this is about a 3.7% whole-application
+improvement. All runs had the expected first animation hash `4025147891` and
+no page or console errors.
+
+A second 1 ms Gecko capture confirmed the intended mechanical result:
+`getStaticSyncAt` fell from 160/1400 samples (11.4%) to zero in the measured
+animation window. The time did not all become frame rate because the next
+bottleneck expanded into the available CPU budget. Partial Wasm occupied
+365/1333 samples (27.4%), including 7.4% in field imports, 4.7% in array
+imports, 4.4% in reference conversion, and 3.5% in the Wasm exit trampoline.
+The capture itself rendered at 15.00 changed images/s with correct hashes and
+no runtime errors.
+
+Wasm modules now also carry a standard function-name custom section derived
+from the runtime owner, method identity, descriptor, and tier. Like the
+JavaScript profiler labels, this metadata never participates in optimization
+selection. The next capture identified the partial-Wasm owners:
+
+| Wasm guest body | inclusive samples | field-import leaf | array-import leaf |
+| --- | ---: | ---: | ---: |
+| `hk.a(IIIIII)V` | 149 (11.8%) | 41 | 14 |
+| `hk.b()V` | 110 (8.7%) | 29 | 17 |
+| `ck.a(IIIIIIII)V` | 65 (5.1%) | 4 | 16 |
+
+This exposed a plausible tier-ordering experiment: the asynchronous nested-call
+path asked partial Wasm before using an available complete synchronous
+structured-JavaScript body. Reversing that order was correct but slower:
+
+| run | JS-first changed images/s |
+| ---: | ---: |
+| 1 | 13.946 |
+| 2 | 14.814 |
+| 3 | 14.110 |
+| **median** | **14.110** |
+
+That is 5.9% below the 14.998 direct-static median. The runtime tier-ordering
+change was therefore reverted. The important conclusion is subtler than
+"partial Wasm is bad": boundary traffic is expensive, but these Wasm kernels
+still save more arithmetic time than the boundary costs. Moving the same guest
+bodies wholesale to the current JavaScript emitter does not solve it.
+
+The next optimization should target the boundary *inside the winning Wasm
+tier*, not generic invoke dispatch, another raster micro-kernel, or blanket
+JS-first policy. Promising shapes are larger linked Wasm regions, batched
+array/field access, or a stable heap representation that lets repeated
+operations remain inside the module. The checked-in analyzer now reports
+named Wasm owners and attributes field/array import leaf samples to them.
+
+Source-map resolution found one more concrete boundary cost: the largest leaf
+in the named-Wasm capture, minified as `S` (91/1266 samples, 7.2%), maps to
+`toWasmValue` in `WasmJit.js`. Every generated import already has one fixed
+result type, but integer and reference field/array reads still passed through
+that shared polymorphic converter on every access.
+
+The retained follow-up specializes those import closures when the module is
+built. Integer imports perform only Java-boolean normalization; reference
+imports return the reference directly; long/float/double imports retain the
+generic converter. This changes no tier selection, bounds/null checks, heap
+location, or write behavior.
+
+Three probe-free Firefox runs measured:
+
+| run | specialized-import changed images/s |
+| ---: | ---: |
+| 1 | 15.182 |
+| 2 | 15.392 |
+| 3 | 14.123 |
+| **median** | **15.182** |
+
+That is 1.2% above direct-static alone and 5.0% above the previous 14.46 best
+median. Every run completed 20 changed images without page or console errors.
+Two captured the usual first animation hash `4025147891`; the other 16 ms
+sampling pass first observed the following known state `4136367231`.
+
+## Wasm boundary traffic: field-value caching, batched spill, key inline cache
+
+The named-owner capture left three boundary costs inside the winning partial-
+Wasm tier: field imports (7.4%), array imports (4.7%), reference conversion
+(4.4%), and the exit trampoline (3.5%). Three changes attack the import-call
+count itself rather than the per-call conversion cost.
+
+**Field-value caching in wasm locals.** `getstatic` results and
+`aload s; getfield f` results now live in a pair of wasm locals (value +
+filled flag). A repeated read — including across loop iterations, which is
+where `hk.a`'s 41 field-import leaf samples came from — becomes a branch on
+the flag instead of a wasm→JS import call. Soundness leans on the tier's
+existing structure:
+
+- wasm locals zero on every `run()` entry, so caches start invalid per run;
+- a `putfield`/`putstatic` of the same `name:descriptor` clears every
+  matching flag (inheritance can alias two owner classes onto one storage
+  key, so the kill ignores the owner class);
+- linked wasm callees may write any field, so calls clear all flags (Math
+  intrinsics are pure and exempt);
+- a store to slot `s` clears caches keyed on `s` and strips the compile-time
+  provenance of values still on the simulated stack, so a stale receiver can
+  never seed a cache for the slot's new object;
+- no import in this tier runs guest code or a scheduler switch, so nothing
+  else can write a field mid-run.
+
+The dry pass discovers the full cache-entry set and pass 2 reuses it, so a
+kill site emitted early in block order still covers a cache whose fill
+compiles later — the alternative (per-block discovery) misses kills across
+backedges. The cached instance path skips the null check: a filled flag
+proves the same slot's object already loaded this field successfully in this
+run. Kill switch: `JVM_DISABLE_WASM_FIELD_CACHE=1`.
+
+**Batched exit spill.** Exit stubs previously spilled locals with one import
+call per typed slot, and the stub is replicated into every block's fuel
+prologue. One `spill_all` import now writes every slot in a single call —
+fewer boundary crossings on the trampoline path and a smaller module.
+
+**Monomorphic field-key cache.** The instance field import resolved its
+storage key through a `Map.get` per access. Nearly every site is
+monomorphic, so the closure now keeps the last class's key one identity
+compare away.
+
+Validation: the full jit suite passes (315 assertions, including a new
+fixture whose loops mix cached reads with mid-loop `putstatic`/`putfield`
+writes and a receiver-slot swap — the sums are wrong if any kill is
+missing). The captured vk replay on original classes produces bit-identical
+round hashes with the wasm tier off, on, and on-with-caching-disabled. Node
+replay medians (V8, single runs, structured config): caching on 270.1 ms,
+off 276.3 ms.
+
+The profiler gained `PROBE_WASM_JIT` and `PROBE_WASM_FIELD_CACHE`
+live-toggle overrides, and the attribution loop gained `no-wasm-jit` and
+`no-wasm-field-cache` configurations, so the next attribution pass measures
+the whole tier's and this change's honest whole-app contributions.
+
+Interim differential attribution (n≈24 per config, loop still running):
+disabling fused regions costs −1.36 fps and is the only configuration
+separated from noise; disabling the handwritten gradient kernel measures
++0.00 — the honest confirmation of the probe-inflation finding. Disabling
+structured SSA measures −0.00 with partial Wasm active, i.e. the tiers
+overlap: wasm absorbs the bodies structured SSA used to carry.
+
+Design conclusions recorded from this round:
+
+1. **Exit transitions are synchronous control transfers, not waits.** There
+   is nothing to overlap with threads or a message queue; bytecode needs
+   each result before the next instruction. The lever is fewer/cheaper
+   crossings, which is what call linking, field caching, and batched spill
+   do.
+2. **Data first, then code.** Moving the scheduler/JVM core into wasm while
+   the heap stays JS-side would multiply import traffic. The enabling step
+   is heap residency — primitive arrays as typed-array views over a shared
+   `WebAssembly.Memory`, so `iaload` becomes a memory load for wasm and
+   plain indexing for JS — after which moving more runtime code into wasm
+   stops costing conversions.
+3. **No toy-benchmark roadmap.** Piece-wise toy wins have twice failed to
+   compose here (handwritten toys mispredicting Firefox; the 9.9x kernel
+   moving the app +0.3 fps). Captured replays validate kernels; whole-app
+   differential A/Bs decide what is real.

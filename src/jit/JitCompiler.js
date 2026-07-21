@@ -48,6 +48,11 @@ class JitCompiler {
     this.nextSyncCallSiteId = 1;
     this.fieldSites = [];
     this.nextFieldSiteId = 1;
+    // Generated bodies may bind a verified static-field container once and
+    // keep reading its current value directly. These are heap locations, not
+    // constant values. loadState replaces the JIT after replacing static maps,
+    // so a binding cannot outlive the canonical container it references.
+    this.directStaticTargets = [];
     this.inlineIntegerRegionCache = new WeakMap();
     this.inlineIntegerPlanCache = new WeakMap();
     const firefoxDefault = typeof navigator !== "undefined" &&
@@ -434,6 +439,33 @@ class JitCompiler {
       return Number(process.hrtime.bigint()) / 1e6;
     }
     return Date.now();
+  }
+
+  generatedSource(method, tier, source, ownerOverride = null) {
+    // A sourceURL lets Firefox's native sampling profiler identify generated
+    // guest bodies without adding a clock read or counter to their hot path.
+    // The identity is diagnostic metadata only; tier selection never reads it.
+    const owner = ownerOverride || method?.className ||
+      this.jvm.findClassNameForMethod?.(method) || "unknown";
+    const methodIdentity = `${method?.name || "unknown"}${method?.descriptor || ""}`;
+    const url = `jvm-generated://${encodeURIComponent(owner)}/` +
+      `${encodeURIComponent(methodIdentity)}?tier=${encodeURIComponent(tier)}`;
+    const functionName = `jvm$${tier}$${owner}$${methodIdentity}`
+      .replace(/[^A-Za-z0-9_$]/g, "_");
+    return { source: `${source}\n//# sourceURL=${url}`, url, functionName };
+  }
+
+  createGeneratedFunction(method, tier, parameters, source,
+    ownerOverride = null, asynchronous = false) {
+    const labeled = this.generatedSource(method, tier, source, ownerOverride);
+    // Function constructors themselves remain anonymous in Gecko profiles.
+    // Return a named literal so stack sampling exposes the guest identity.
+    const factory = new Function(`"use strict"; return ${asynchronous ? "async " : ""}` +
+      `function ${labeled.functionName}(${parameters.join(",")}) {\n` +
+      `${labeled.source}\n}`);
+    const generated = factory();
+    generated.jvmSourceUrl = labeled.url;
+    return generated;
   }
 
   recordMethodTiming(methodKey, elapsedMs, generated) {
@@ -1451,7 +1483,9 @@ class JitCompiler {
     body.push("default: helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'scalar loop non-leader entry' };");
     body.push("}", "}");
     try {
-      const generated = new Function("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      const generated = this.createGeneratedFunction(method,
+        ssaOptimizations ? "scalar-ssa" : "scalar",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"));
       generated.jvmSynchronous = true;
       generated.jvmScalarLoop = true;
       generated.jvmScalarSsa = ssaOptimizations;
@@ -1533,7 +1567,10 @@ class JitCompiler {
     body.push("return { returned: true, value: helpers.returnVoid() };");
 
     try {
-      const generated = new GeneratedFunction("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      const generated = this.createGeneratedFunction(method,
+        synchronous ? "generated-sync" : "generated-async",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"),
+        null, !synchronous);
       generated.jvmSynchronous = synchronous;
       generated.jvmDirectInlineCount = directInlineCount;
       return generated;
@@ -1847,7 +1884,8 @@ class JitCompiler {
     body.push("default: helpers.materialize(frame, locals, stack, pc); return { deopt: true, reason: 'invalid stackless raster pc ' + pc };");
     body.push("}", "}");
     try {
-      const generated = new Function("frame", "thread", "helpers", "initialBytecodeChecks", body.join("\n"));
+      const generated = this.createGeneratedFunction(method, "stackless-raster",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"));
       generated.jvmSynchronous = true;
       generated.jvmStacklessRaster = true;
       return generated;
@@ -2817,6 +2855,20 @@ class JitCompiler {
     return null;
   }
 
+  registerDirectStaticTarget(id, forWrite = false) {
+    const site = this.fieldSites[id];
+    if (!site) return null;
+    let target = site.staticTarget;
+    if (!target || (forWrite && target.kind !== "map")) {
+      target = this.resolveStaticFieldSite(site, forWrite);
+    }
+    if (!target || (forWrite && target.kind !== "map")) return null;
+    site.staticTarget = target;
+    const targetId = this.directStaticTargets.length;
+    this.directStaticTargets.push(target);
+    return { targetId, kind: target.kind, key: target.key, className: site.className };
+  }
+
   getStaticSyncAt(id) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated static field site ${id}`);
@@ -3573,7 +3625,7 @@ class JitCompiler {
     }
     const plan = this.getInlineIntegerPlan(method, params, returnType);
     if (!plan) return null;
-    const inline = new Function("stack", "base",
+    const inline = this.createGeneratedFunction(method, "inline-integer", ["stack", "base"],
       `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`);
     inline.jvmPlan = plan;
     inline.jvmReceiverSlots = plan.receiverSlots;

@@ -69,6 +69,18 @@ test('Wasm value imports preserve JavaScript boolean fields', (t) => {
   t.end();
 });
 
+test('Wasm modules expose arbitrary guest identities to native profilers', (t) => {
+  const method = { name: 'renamedLoop', descriptor: '([II)V' };
+  const name = wasmJitTest.wasmProfilerName('ArbitraryOwner', method);
+  const section = wasmJitTest.wasmFunctionNameSection(37, name);
+  t.equal(name, 'jvm$wasm$ArbitraryOwner$renamedLoop__II_V',
+    'profiler identity comes from the runtime owner and descriptor');
+  t.equal(section[0], 0, 'identity is emitted as a standard custom section');
+  t.ok(String.fromCharCode(...section).includes(name),
+    'function-name subsection contains the generated guest identity');
+  t.end();
+});
+
 test('sampled generated-method timing attributes arbitrary method identities', (t) => {
   const jvm = new JVM({ jit: {
     warmupThreshold: 0, profileMethods: false, profileTimings: true,
@@ -84,6 +96,24 @@ test('sampled generated-method timing attributes arbitrary method identities', (
   t.equal(timing?.samples, 1, 'sample is recorded without enabling method-count profiling');
   t.equal(timing?.tier, 'generated-sync', 'sample retains its generated tier');
   t.ok(timing?.totalMs >= 0, 'sample records monotonic elapsed time');
+  t.end();
+});
+
+test('generated bodies expose profiler identities without runtime probes', (t) => {
+  const jvm = new JVM({ jit: { profileMethods: false } });
+  const method = { name: 'renamedHotBody', descriptor: '([II)V' };
+  const labeled = jvm.jit.generatedSource(method, 'structured-ssa',
+    '"use strict"; return 7;', 'ArbitraryOwner');
+  t.equal(labeled.url,
+    'jvm-generated://ArbitraryOwner/renamedHotBody(%5BII)V?tier=structured-ssa',
+  'source identity is derived from the arbitrary owner, descriptor, and tier');
+  t.ok(labeled.source.endsWith(`//# sourceURL=${labeled.url}`),
+    'the label is static source metadata rather than a hot-path timing call');
+  const generated = jvm.jit.createGeneratedFunction(method, 'structured-ssa', [],
+    '"use strict"; return 7;', 'ArbitraryOwner');
+  t.equal(generated.name, 'jvm$structured_ssa$ArbitraryOwner$renamedHotBody__II_V',
+    'generated function name is visible to native stack sampling');
+  t.equal(generated(), 7, 'the profiler label does not change generated behavior');
   t.end();
 });
 
@@ -1036,6 +1066,35 @@ public class ScalarFeatureHarness {
     'structured SSA preserves array, field, remainder, and static-call effects');
   t.ok(structured.generated?.jvmStructuredSsa,
     'array/field/call loop selects structured SSA without method-name recognition');
+  t.notOk(structured.generated.jvmStructuredSource.includes('getStaticSyncAt'),
+    'initialized static target is read directly without the generic helper');
+  t.ok(structured.generated.jvmStructuredSource.includes('.get("staticBias:I")'),
+    'direct static access retains a live read from the canonical field map');
+  structured.jvm.classes.ScalarFeatureHarness.staticFields.set('staticBias:I', 9);
+  const changedStaticOut = [0, 0];
+  changedStaticOut.type = '[I';
+  await invoke(structured.jvm, structured.thread, 'ScalarFeatureHarness', 'compute',
+    '(LScalarFeatureHarness$Box;I[I)V', [structured.box, 1, changedStaticOut]);
+  t.deepEqual(changedStaticOut.slice(), [19, 19],
+    'direct static target observes values changed after compilation');
+
+  structured.jvm.classInitializationState.set('ScalarFeatureHarness', 'UNINITIALIZED');
+  const guardedStaticOut = [0, 0];
+  guardedStaticOut.type = '[I';
+  const guardedStaticFrame = new Frame(structured.method);
+  guardedStaticFrame.className = 'ScalarFeatureHarness';
+  guardedStaticFrame.locals[0] = structured.box;
+  guardedStaticFrame.locals[1] = 1;
+  guardedStaticFrame.locals[2] = guardedStaticOut;
+  structured.thread.callStack.push(guardedStaticFrame);
+  const guardedStatic = structured.generated(
+    guardedStaticFrame, structured.thread, structured.jvm.jit, false);
+  t.ok(guardedStatic.deopt && guardedStatic.transient,
+    'class initialization guard falls back at structured entry');
+  t.deepEqual(guardedStaticOut.slice(), [0, 0],
+    'static entry guard runs before guest side effects');
+  structured.thread.callStack.pop();
+  structured.jvm.classInitializationState.set('ScalarFeatureHarness', 'INITIALIZED');
   t.deepEqual(structured.inlineOut, baseline.inlineOut,
     'structured SSA preserves a loop with an inlined integer leaf');
   t.notOk(structured.inlineGenerated.jvmStructuredSource.includes('tryInvokeSyncAt'),
@@ -2131,6 +2190,79 @@ public class WasmLongCarryHarness {
   t.deepEqual(out.slice(0, 3), [4n, 6n, 7n], 'merged long branch values are preserved');
   const compiled = jvm.jit.wasmJit.compiled.map((entry) => entry.key);
   t.ok(compiled.includes('WasmLongCarryHarness.compute([J[J[J)V'), 'loop uses the Wasm tier');
+  t.end();
+});
+
+test('Wasm JIT field-value caching observes same-run writes and slot reassignment', async (t) => {
+  const classpath = compileJavaFixture(t, 'WasmFieldCacheHarness', `
+public class WasmFieldCacheHarness {
+  static int bias;
+  int scale;
+  public static int compute(int[] out) {
+    bias = 1;
+    WasmFieldCacheHarness h = new WasmFieldCacheHarness();
+    h.scale = 2;
+    int sum = 0;
+    for (int i = 0; i < out.length; i++) {
+      sum += bias + h.scale;
+      if (i == 1) { bias = 5; h.scale = 9; }
+      sum += bias + h.scale;
+    }
+    out[0] = sum;
+    return sum;
+  }
+  public static int swapAlias(int[] out) {
+    WasmFieldCacheHarness p = new WasmFieldCacheHarness();
+    WasmFieldCacheHarness q = new WasmFieldCacheHarness();
+    p.scale = 1;
+    q.scale = 100;
+    int sum = 0;
+    for (int i = 0; i < out.length; i++) {
+      sum += p.scale;
+      WasmFieldCacheHarness t = p; p = q; q = t;
+      sum += p.scale;
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+
+  const previous = process.env.JVM_WASM_JIT;
+  process.env.JVM_WASM_JIT = '1';
+  t.teardown(() => {
+    if (previous === undefined) delete process.env.JVM_WASM_JIT;
+    else process.env.JVM_WASM_JIT = previous;
+  });
+
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('WasmFieldCacheHarness');
+  jvm.classInitializationState.set('WasmFieldCacheHarness', 'INITIALIZED');
+  const thread = {
+    id: 0,
+    name: 'wasm-field-cache-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const out = [0, 0, 0, 0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'WasmFieldCacheHarness', 'compute', '([I)I', [out]);
+  t.equal(out[0], 79, 'putstatic and putfield invalidate cached reads mid-loop');
+
+  const swapped = [0, 0, 0];
+  swapped.type = '[I';
+  await invoke(jvm, thread, 'WasmFieldCacheHarness', 'swapAlias', '([I)I', [swapped]);
+  t.equal(swapped[0], 303, 'reassigning a receiver slot invalidates its field cache');
+
+  const compiled = jvm.jit.wasmJit.compiled.map((entry) => entry.key);
+  t.ok(compiled.includes('WasmFieldCacheHarness.compute([I)I'),
+    'field-reading loop still uses the Wasm tier');
+  t.ok(compiled.includes('WasmFieldCacheHarness.swapAlias([I)I'),
+    'slot-swapping loop still uses the Wasm tier');
   t.end();
 });
 

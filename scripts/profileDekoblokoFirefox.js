@@ -35,6 +35,10 @@ const rendererPipelineOverride = process.env.PROBE_RENDERER_PIPELINE === undefin
   ? null : process.env.PROBE_RENDERER_PIPELINE === '1';
 const handwrittenFusedOverride = process.env.PROBE_HANDWRITTEN_FUSED === undefined
   ? null : process.env.PROBE_HANDWRITTEN_FUSED === '1';
+const wasmJitOverride = process.env.PROBE_WASM_JIT === undefined
+  ? null : process.env.PROBE_WASM_JIT === '1';
+const wasmFieldCacheOverride = process.env.PROBE_WASM_FIELD_CACHE === undefined
+  ? null : process.env.PROBE_WASM_FIELD_CACHE === '1';
 
 function positiveNumber(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -139,7 +143,7 @@ function animationEstimate(changes) {
       timingSampleRate, timingFilter, methodTraceKey,
       fusedRegions, scalarLoops, scalarSsa, structuredSsa,
       structuredSplit,
-      rendererPipeline, handwrittenFused }) => {
+      rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
         surfaceAt: null,
@@ -275,6 +279,14 @@ function animationEstimate(changes) {
         if (jvm?.jit?.fusedRegions && handwrittenFused !== null) {
           jvm.jit.fusedRegions.handwrittenKernelsEnabled = handwrittenFused;
         }
+        if (jvm?.jit?.wasmJit && wasmJit !== null) {
+          jvm.jit.wasmJit.enabled = wasmJit;
+        }
+        // affects modules compiled after the flag lands (compilation happens
+        // during warmup, so a first-frame set covers the hot bodies)
+        if (jvm?.jit?.wasmJit && wasmFieldCache !== null) {
+          jvm.jit.wasmJit.fieldCacheEnabled = wasmFieldCache;
+        }
         if (jvm?.jit && scalarLoops !== null) {
           jvm.jit.scalarLoopsEnabled = scalarLoops;
           jvm.jit.scalarGuestBodiesEnabled = scalarLoops;
@@ -334,6 +346,8 @@ function animationEstimate(changes) {
       structuredSplit: structuredSplitOverride,
       rendererPipeline: rendererPipelineOverride,
       handwrittenFused: handwrittenFusedOverride,
+      wasmJit: wasmJitOverride,
+      wasmFieldCache: wasmFieldCacheOverride,
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -431,6 +445,8 @@ function animationEstimate(changes) {
     result.structuredSsaEnabled = structuredSsaOverride;
     result.structuredSplitEnabled = structuredSplitOverride;
     result.rendererPipelineEnabled = rendererPipelineOverride;
+    result.wasmJitEnabled = wasmJitOverride;
+    result.wasmFieldCacheEnabled = wasmFieldCacheOverride;
     result.animation = animationEstimate(result.probe.changes);
     const initial = result.probe.jitAtFirstNonBlack;
     const animationEnd = result.probe.jitAtAnimationEnd;

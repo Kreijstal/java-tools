@@ -49,6 +49,8 @@ const CONFIGS = [
   { name: 'no-fused-regions', env: { PROBE_FUSED_REGIONS: '0' } },
   { name: 'no-structured-ssa', env: { PROBE_STRUCTURED_SSA: '0' } },
   { name: 'no-scalar-loops', env: { PROBE_SCALAR_LOOPS: '0' } },
+  { name: 'no-wasm-jit', env: { PROBE_WASM_JIT: '0' } },
+  { name: 'no-wasm-field-cache', env: { PROBE_WASM_FIELD_CACHE: '0' } },
 ];
 
 function firefoxExecutable() {

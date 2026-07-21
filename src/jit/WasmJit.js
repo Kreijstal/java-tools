@@ -136,6 +136,20 @@ function f64bytes(v) {
   return [...new Uint8Array(buf.buffer)];
 }
 
+function wasmProfilerName(className, method) {
+  return `jvm$wasm$${className || 'unknown'}$${method?.name || 'unknown'}${method?.descriptor || ''}`
+    .replace(/[^A-Za-z0-9_$]/g, '_');
+}
+
+function wasmFunctionNameSection(functionIndex, functionName) {
+  const asciiName = [...functionName].map((character) => character.charCodeAt(0) & 0x7f);
+  const association = [1, ...uleb(functionIndex), ...uleb(asciiName.length), ...asciiName];
+  const subsection = [1, ...uleb(association.length), ...association];
+  const sectionName = [0x6e, 0x61, 0x6d, 0x65]; // "name"
+  const content = [sectionName.length, ...sectionName, ...subsection];
+  return [0, ...uleb(content.length), ...content];
+}
+
 function getOp(ins) { return typeof ins === 'string' ? ins : ins && ins.op; }
 
 function descToWasm(ch) {
@@ -343,10 +357,25 @@ class MethodTranslator {
   arrayImports() {
     const self = this;
     const mk = (suffix, t) => {
-      self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], (a, i) => {
-        const arr = self.elemsOf(a, i, 'load');
-        return toWasmValue(t, arr.elements ? arr.elements[i] : arr[i]);
-      });
+      // Each import has one fixed result type. Give SpiderMonkey a monomorphic
+      // integer/reference closure instead of routing every element through
+      // the polymorphic toWasmValue switch at the Wasm boundary.
+      const load = t === T.i32
+        ? (a, i) => {
+          const arr = self.elemsOf(a, i, 'load');
+          const value = arr.elements ? arr.elements[i] : arr[i];
+          return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+        }
+        : t === T.ref
+          ? (a, i) => {
+            const arr = self.elemsOf(a, i, 'load');
+            return arr.elements ? arr.elements[i] : arr[i];
+          }
+          : (a, i) => {
+            const arr = self.elemsOf(a, i, 'load');
+            return toWasmValue(t, arr.elements ? arr.elements[i] : arr[i]);
+          };
+      self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
       self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
         self.elemsOf(a, i, 'store')[i] = v;
       });
@@ -360,11 +389,6 @@ class MethodTranslator {
 
   runtimeImports() {
     const box = this.box;
-    this.addImport('spill_i', [T.i32, T.i32], [], (s, v) => { box.frame.locals[s] = v; });
-    this.addImport('spill_l', [T.i32, T.i64], [], (s, v) => { box.frame.locals[s] = v; });
-    this.addImport('spill_f', [T.i32, T.f32], [], (s, v) => { box.frame.locals[s] = v; });
-    this.addImport('spill_d', [T.i32, T.f64], [], (s, v) => { box.frame.locals[s] = v; });
-    this.addImport('spill_r', [T.i32, T.ref], [], (s, v) => { box.frame.locals[s] = v; });
     // push a carried operand-stack value into frame.stack on transient exit
     this.addImport('push_i', [T.i32], [], (v) => { box.frame.stack.push(v); });
     this.addImport('push_l', [T.i64], [], (v) => { box.frame.stack.push(v); });
@@ -380,16 +404,6 @@ class MethodTranslator {
     this.addImport('err_div0', [], [], () => {
       throw { type: 'java/lang/ArithmeticException', message: '/ by zero' };
     });
-  }
-
-  spillImportFor(t) {
-    switch (t) {
-      case T.i32: return this.importIndexByName.get('spill_i');
-      case T.i64: return this.importIndexByName.get('spill_l');
-      case T.f32: return this.importIndexByName.get('spill_f');
-      case T.f64: return this.importIndexByName.get('spill_d');
-      default: return this.importIndexByName.get('spill_r');
-    }
   }
 
   pushImportFor(t) {
@@ -443,6 +457,68 @@ class MethodTranslator {
     return seq;
   }
 
+  // ---- redundant field-load caching ----
+  // getstatic results and `aload s; getfield f` results are kept in a pair of
+  // wasm locals (value + filled flag). Repeated reads inside one wasm run —
+  // including across loop iterations — become a branch on the flag instead of
+  // a wasm->JS import call. Soundness:
+  //  - locals zero on every run() entry, so caches start invalid per run;
+  //  - a putfield/putstatic of the same name:descriptor clears every matching
+  //    flag (inheritance can alias distinct owner classes onto one storage
+  //    key, so the kill ignores the owner);
+  //  - linked wasm callees may write any field, so calls clear all flags
+  //    (Math intrinsics are pure and exempt);
+  //  - a store to slot s clears caches keyed on s and strips the compile-time
+  //    provenance of values already on the simulated stack, so a stale
+  //    receiver can never seed a cache for the slot's new object;
+  //  - no import in this tier runs guest code or a thread switch, so nothing
+  //    else can write a field mid-run.
+  // The first (dry) pass discovers the full cache-entry set; pass 2 reuses
+  // that set so kill sites cover entries whose fills compile later.
+  refScratchLocal() {
+    if (this.refScratch === undefined) {
+      this.refScratch = this.nextLocal++;
+      this.declared.push(T.ref);
+    }
+    return this.refScratch;
+  }
+
+  fieldCacheFor(cacheKey, t, killKey, slot, kind) {
+    let entry = this.fieldCaches.get(cacheKey);
+    if (!entry) {
+      const valLocal = this.nextLocal++;
+      this.declared.push(t);
+      const filledLocal = this.nextLocal++;
+      this.declared.push(T.i32);
+      entry = { valLocal, filledLocal, t, killKey, slot, kind };
+      this.fieldCaches.set(cacheKey, entry);
+    }
+    return entry;
+  }
+
+  killSeqWhere(predicate) {
+    const seq = [];
+    for (const entry of this.fieldCaches.values()) {
+      if (predicate(entry)) {
+        seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(entry.filledLocal));
+      }
+    }
+    return seq;
+  }
+
+  // emit: read through the cache entry; on miss run `loadSeq` (which must
+  // leave exactly the loaded value on the wasm stack) and fill the cache
+  cachedReadSeq(entry, loadSeq) {
+    return [
+      OP.local_get, ...uleb(entry.filledLocal), OP.if, entry.t,
+      OP.local_get, ...uleb(entry.valLocal),
+      OP.else, ...loadSeq,
+      OP.local_set, ...uleb(entry.valLocal),
+      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(entry.filledLocal),
+      OP.local_get, ...uleb(entry.valLocal), OP.end,
+    ];
+  }
+
   // CFG edge with the given stack shape: pass 1 records the target's entry
   // shape; pass 2 verifies the recorded shape matches (demoting the source
   // block on mismatch — only paths through already-demoted blocks disagree).
@@ -480,33 +556,65 @@ class MethodTranslator {
       }
       if (!container) throw new Unsupported(`unresolved static ${className}.${fieldName}`);
       const name = `${isGet ? 'gs' : 'ps'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
+      const getStatic = t === T.i32
+        ? () => {
+          const value = container.get(key);
+          return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+        }
+        : t === T.ref ? () => container.get(key)
+          : () => toWasmValue(t, container.get(key));
       return {
         t,
+        name,
         idx: isGet
-          ? this.addImport(name, [], [t], () => toWasmValue(t, container.get(key)))
+          ? this.addImport(name, [], [t], getStatic)
           : this.addImport(name, [t], [], (v) => container.set(key, v)),
       };
     }
     const name = `${isGet ? 'gf' : 'pf'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
     const keyCache = new Map();
+    // Almost every site is monomorphic; keep the last class's key one
+    // identity compare away instead of a Map lookup per access.
+    let cachedClassName;
+    let cachedFieldKey;
     const resolveKey = (obj) => {
       const ct = obj._className || obj.type;
+      if (ct === cachedClassName) return cachedFieldKey;
       let key = keyCache.get(ct);
       if (key === undefined) {
         key = resolveInstanceFieldKey(jvm, obj, className, fieldName) || `${className}.${fieldName}`;
         keyCache.set(ct, key);
       }
+      cachedClassName = ct;
+      cachedFieldKey = key;
       return key;
     };
-    return {
-      t,
-      idx: isGet
-        ? this.addImport(name, [T.ref], [t], (obj) => {
+    const getInstance = t === T.i32
+      ? (obj) => {
+        if (obj === null || obj === undefined) {
+          throw { type: 'java/lang/NullPointerException', message: null };
+        }
+        const value = obj.fields[resolveKey(obj)];
+        return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+      }
+      : t === T.ref
+        ? (obj) => {
+          if (obj === null || obj === undefined) {
+            throw { type: 'java/lang/NullPointerException', message: null };
+          }
+          return obj.fields[resolveKey(obj)];
+        }
+        : (obj) => {
           if (obj === null || obj === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
           return toWasmValue(t, obj.fields[resolveKey(obj)]);
-        })
+        };
+    return {
+      t,
+      name,
+      idx: isGet
+        ? this.addImport(name, [T.ref], [t], getInstance)
         : this.addImport(name, [T.ref, t], [], (obj, v) => {
           if (obj === null || obj === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
@@ -665,6 +773,8 @@ class MethodTranslator {
     this.nextLocal = this.paramSlots.length + 2;
     this.scratchPool = new Map(); // wasm type -> [localIdx]
     this.stackLocals = new Map(); // `${depth}|${type}` -> localIdx
+    this.fieldCaches = new Map(); // cacheKey -> {valLocal, filledLocal, ...}
+    this.refScratch = undefined;
 
     // blocks intersecting a live handler's try-range must stay interpreted
     const rangeDemoted = new Set();
@@ -704,6 +814,15 @@ class MethodTranslator {
       this.declared.length = savedDeclaredLen;
       this.scratchPool = new Map();
       this.stackLocals = new Map();
+      // Reallocate every cache entry pass 1 discovered so pass-2 kill sites
+      // cover fills that compile later in block order (pass 2 can only see a
+      // subset of pass 1's sites — demotions remove, never add).
+      const discovered = this.fieldCaches;
+      this.fieldCaches = new Map();
+      this.refScratch = undefined;
+      for (const [cacheKey, entry] of discovered) {
+        this.fieldCacheFor(cacheKey, entry.t, entry.killKey, entry.slot, entry.kind);
+      }
     }
     this.dryRun = false;
 
@@ -822,12 +941,20 @@ class MethodTranslator {
   }
 
   spillSeq() {
+    if (!this.paramSlots.length) return [];
+    // One import call spilling every typed slot at once: exit stubs are
+    // replicated into every block's fuel prologue, so per-slot calls cost
+    // both boundary crossings and module bytes.
+    const slots = this.paramSlots.slice();
+    const box = this.box;
+    const idx = this.addImport('spill_all', slots.map((s) => this.slotTypes.get(s)), [],
+      (...values) => {
+        const locals = box.frame.locals;
+        for (let i = 0; i < slots.length; i++) locals[slots[i]] = values[i];
+      });
     const seq = [];
-    for (const s of this.paramSlots) {
-      const t = this.slotTypes.get(s);
-      seq.push(OP.i32_const, ...sleb(s), OP.local_get, ...uleb(this.localOfSlot.get(s)),
-        OP.call, ...uleb(this.spillImportFor(t)));
-    }
+    for (const s of slots) seq.push(OP.local_get, ...uleb(this.localOfSlot.get(s)));
+    seq.push(OP.call, ...uleb(idx));
     return seq;
   }
 
@@ -846,10 +973,14 @@ class MethodTranslator {
     const depthToTop = N - 1 - b;
     const code = [];
     const stack = (this.entryStacks.get(b) || []).slice(); // wasm types, bottom-up
+    // provenance: which local slot (if any) a stacked value was loaded from —
+    // carried values entering the block have unknown origin
+    const prov = stack.map(() => null);
     const emit = (...bytes) => code.push(...bytes);
-    const push = (t) => stack.push(t);
+    const push = (t, p = null) => { stack.push(t); prov.push(p); };
     const pop = (expected) => {
       if (!stack.length) throw new Unsupported('stack underflow (value flows across block boundary)');
+      prov.pop();
       const t = stack.pop();
       if (expected !== undefined && t !== expected) throw new Unsupported(`stack type mismatch`);
       return t;
@@ -965,7 +1096,8 @@ class MethodTranslator {
           emit(OP.i32_const, ...sleb(s), OP.call, ...uleb(this.boxedAccess(s, t, false)));
           push(t);
         } else {
-          emit(OP.local_get, ...uleb(localOf(s))); push(this.slotTypes.get(s));
+          emit(OP.local_get, ...uleb(localOf(s)));
+          push(this.slotTypes.get(s), op[0] === 'a' ? { slot: s } : null);
         }
       } else if (/^[ilfda]store(_\d)?$/.test(op)) {
         const s = localArg();
@@ -976,6 +1108,10 @@ class MethodTranslator {
             OP.local_get, ...uleb(tmp), OP.call, ...uleb(this.boxedAccess(s, t, true)));
         } else {
           pop(); emit(OP.local_set, ...uleb(localOf(s)));
+        }
+        emit(...this.killSeqWhere((entry) => entry.slot === s));
+        for (let d = 0; d < prov.length; d++) {
+          if (prov[d] && prov[d].slot === s) prov[d] = null;
         }
       } else if (op === 'iinc') {
         const s = Number(ins.varnum);
@@ -1046,24 +1182,56 @@ class MethodTranslator {
         push(T.i32);
       } else if (op === 'getfield' || op === 'getstatic') {
         const st = op === 'getstatic';
-        const { t, idx } = this.fieldImports(ins, st, true);
-        if (!st) pop(T.ref);
-        emit(OP.call, ...uleb(idx)); push(t);
+        const { t, idx, name } = this.fieldImports(ins, st, true);
+        const [, , [fieldName, descriptor]] = ins.arg;
+        const killKey = `${fieldName}:${descriptor}`;
+        const caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
+        if (st) {
+          if (caching) {
+            const entry = this.fieldCacheFor(`s|${name}`, t, killKey, undefined, 's');
+            emit(...this.cachedReadSeq(entry, [OP.call, ...uleb(idx)]));
+          } else {
+            emit(OP.call, ...uleb(idx));
+          }
+          push(t);
+        } else {
+          const receiver = prov[prov.length - 1];
+          pop(T.ref);
+          if (caching && receiver && receiver.slot !== undefined) {
+            const entry = this.fieldCacheFor(`f|${receiver.slot}|${name}`, t, killKey, receiver.slot, 'f');
+            const rs = this.refScratchLocal();
+            // cached path skips the null check: a filled flag proves the same
+            // slot's object already loaded this field successfully this run
+            emit(OP.local_set, ...uleb(rs),
+              ...this.cachedReadSeq(entry, [OP.local_get, ...uleb(rs), OP.call, ...uleb(idx)]));
+          } else {
+            emit(OP.call, ...uleb(idx));
+          }
+          push(t);
+        }
       } else if (op === 'putfield' || op === 'putstatic') {
         const st = op === 'putstatic';
         const { idx } = this.fieldImports(ins, st, false);
+        const [, , [fieldName, descriptor]] = ins.arg;
+        const killKey = `${fieldName}:${descriptor}`;
         pop(); if (!st) pop(T.ref);
         emit(OP.call, ...uleb(idx));
+        emit(...this.killSeqWhere((entry) =>
+          entry.kind === (st ? 's' : 'f') && entry.killKey === killKey));
       } else if (op === 'invokestatic') {
         let bound;
+        let pure = true;
         try {
           bound = this.mathIntrinsic(ins);
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
           bound = this.compiledCallee(ins);
+          pure = false;
         }
         for (let k = 0; k < bound.params.length; k++) pop();
         emit(OP.call, ...uleb(bound.idx));
+        // a linked wasm callee may put any field or static
+        if (!pure) emit(...this.killSeqWhere(() => true));
         const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
         if (retC !== 'V') push(descToWasm(retC));
       } else if (op === 'pop') { pop(); emit(OP.drop); }
@@ -1075,35 +1243,38 @@ class MethodTranslator {
         if (t === undefined) throw new Unsupported('dup on empty stack');
         const s = this.scratch(t);
         emit(OP.local_tee, ...uleb(s), OP.local_get, ...uleb(s));
-        push(t);
+        push(t, prov[prov.length - 1]);
       } else if (op === 'dup2') {
         const t1 = stack[stack.length - 1];
         if (t1 === undefined) throw new Unsupported('dup2 on empty stack');
         if (CAT2.has(t1)) {
           const s = this.scratch(t1);
           emit(OP.local_tee, ...uleb(s), OP.local_get, ...uleb(s));
-          push(t1);
+          push(t1, prov[prov.length - 1]);
         } else {
           const t2 = stack[stack.length - 2];
           if (t2 === undefined) throw new Unsupported('dup2 underflow');
+          const p1 = prov[prov.length - 1]; const p2 = prov[prov.length - 2];
           const s1 = this.scratch(t1); const s2 = this.scratch(t2);
           emit(OP.local_set, ...uleb(s1), OP.local_set, ...uleb(s2));
           emit(OP.local_get, ...uleb(s2), OP.local_get, ...uleb(s1));
           emit(OP.local_get, ...uleb(s2), OP.local_get, ...uleb(s1));
-          push(t2); push(t1);
+          push(t2, p2); push(t1, p1);
         }
       } else if (op === 'dup_x1') {
+        const p1 = prov[prov.length - 1]; const p2 = prov[prov.length - 2];
         const t1 = pop(); const t2 = pop();
         const s1 = this.scratch(t1); const s2 = this.scratch(t2);
         emit(OP.local_set, ...uleb(s1), OP.local_set, ...uleb(s2));
         emit(OP.local_get, ...uleb(s1), OP.local_get, ...uleb(s2), OP.local_get, ...uleb(s1));
-        push(t1); push(t2); push(t1);
+        push(t1, p1); push(t2, p2); push(t1, p1);
       } else if (op === 'swap') {
+        const p1 = prov[prov.length - 1]; const p2 = prov[prov.length - 2];
         const t1 = pop(); const t2 = pop();
         const s1 = this.scratch(t1); const s2 = this.scratch(t2);
         emit(OP.local_set, ...uleb(s1), OP.local_set, ...uleb(s2));
         emit(OP.local_get, ...uleb(s1), OP.local_get, ...uleb(s2));
-        push(t1); push(t2);
+        push(t1, p1); push(t2, p2);
       } else if (BRANCH_COND[op]) {
         pop(T.i32); pop(T.i32);
         emit(BRANCH_COND[op]);
@@ -1197,6 +1368,8 @@ class MethodTranslator {
     const localDecls = [...uleb(this.declared.length), ...this.declared.flatMap((t) => [1, t])];
     const funcBody = [...localDecls, ...body];
     const exportName = [...'run'].map((c) => c.charCodeAt(0));
+    const profilerNameSection = wasmFunctionNameSection(
+      mainIdx, wasmProfilerName(this.className, this.method));
 
     const bytes = Uint8Array.from([
       0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
@@ -1205,6 +1378,7 @@ class MethodTranslator {
       ...section(3, [1, ...uleb(mainType)]),
       ...section(7, [1, exportName.length, ...exportName, 0x00, ...uleb(mainIdx)]),
       ...section(10, [1, ...uleb(funcBody.length), ...funcBody]),
+      ...profilerNameSection,
     ]);
 
     const env = {};
@@ -1223,6 +1397,7 @@ class MethodTranslator {
       fullyCompiled: this.supportedBlocks.size === this.blockStarts.length,
       normalFlowFullyCompiled: this.normalFlowFullyCompiled,
       boxedCount: this.boxedSlots.size,
+      fieldCacheCount: this.fieldCaches.size,
     };
   }
 }
@@ -1248,6 +1423,7 @@ class WasmJit {
     this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
+    this.fieldCacheEnabled = env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
@@ -1369,7 +1545,7 @@ class WasmJit {
       if (!isRecompile) this.compiled.push(st);
       if (this.debug) {
         console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${meta.bytes.length}B, ` +
-          `${meta.supportedBlocks.size}/${meta.blockCount} blocks` +
+          `${meta.supportedBlocks.size}/${meta.blockCount} blocks, ${meta.fieldCacheCount} field caches` +
           (meta.demoteReasons.size ? ` (exits: ${[...meta.demoteReasons.values()].join('; ')})` : ''));
       }
     } catch (err) {
@@ -1504,4 +1680,6 @@ class WasmJit {
 }
 
 module.exports = WasmJit;
-module.exports._test = { isNoOpExceptionHandler, toWasmValue, T };
+module.exports._test = {
+  isNoOpExceptionHandler, toWasmValue, wasmFunctionNameSection, wasmProfilerName, T,
+};

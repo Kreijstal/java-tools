@@ -582,7 +582,11 @@ class FusedRegionCompiler {
       body.push("}");
     }
     body.push("default: throw new Error('invalid fused pc '+pc);", "}", "}");
-    return new Function("state", "region", "helpers", ...argNames, body.join("\n"));
+    const owner = role === "wrapper" ? region.wrapperOwner
+      : role === "raster" ? region.rasterOwner : region.scanlineOwner;
+    return this.jit.createGeneratedFunction(method,
+      `fused-${region.family.name}-${role}`,
+      ["state", "region", "helpers", ...argNames], body.join("\n"), owner);
   }
 }
 

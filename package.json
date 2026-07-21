@@ -16,6 +16,7 @@
     "benchmark:jvm:dekobloko-regions": "node scripts/benchmarkDekoblokoRegionSuite.js",
     "trace:dekobloko:derive-region": "node scripts/deriveDekoblokoRegionTrace.js",
     "profile:dekobloko:firefox": "node scripts/profileDekoblokoFirefox.js",
+    "analyze:dekobloko:firefox-profile": "node scripts/analyzeFirefoxProfile.js",
     "test:fused-renderers": "node scripts/differentialFusedRenderers.js",
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
