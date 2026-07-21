@@ -39,6 +39,8 @@ const wasmJitOverride = process.env.PROBE_WASM_JIT === undefined
   ? null : process.env.PROBE_WASM_JIT === '1';
 const wasmFieldCacheOverride = process.env.PROBE_WASM_FIELD_CACHE === undefined
   ? null : process.env.PROBE_WASM_FIELD_CACHE === '1';
+const wasmStructuredOverride = process.env.PROBE_WASM_STRUCTURED === undefined
+  ? null : process.env.PROBE_WASM_STRUCTURED === '1';
 
 function positiveNumber(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -143,7 +145,7 @@ function animationEstimate(changes) {
       timingSampleRate, timingFilter, methodTraceKey,
       fusedRegions, scalarLoops, scalarSsa, structuredSsa,
       structuredSplit,
-      rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache }) => {
+      rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache, wasmStructured }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
         surfaceAt: null,
@@ -287,6 +289,9 @@ function animationEstimate(changes) {
         if (jvm?.jit?.wasmJit && wasmFieldCache !== null) {
           jvm.jit.wasmJit.fieldCacheEnabled = wasmFieldCache;
         }
+        if (jvm?.jit?.wasmJit && wasmStructured !== null) {
+          jvm.jit.wasmJit.structuredEnabled = wasmStructured;
+        }
         if (jvm?.jit && scalarLoops !== null) {
           jvm.jit.scalarLoopsEnabled = scalarLoops;
           jvm.jit.scalarGuestBodiesEnabled = scalarLoops;
@@ -348,6 +353,7 @@ function animationEstimate(changes) {
       handwrittenFused: handwrittenFusedOverride,
       wasmJit: wasmJitOverride,
       wasmFieldCache: wasmFieldCacheOverride,
+      wasmStructured: wasmStructuredOverride,
     });
 
     await page.goto(url, { waitUntil: 'domcontentloaded' });
@@ -447,6 +453,7 @@ function animationEstimate(changes) {
     result.rendererPipelineEnabled = rendererPipelineOverride;
     result.wasmJitEnabled = wasmJitOverride;
     result.wasmFieldCacheEnabled = wasmFieldCacheOverride;
+    result.wasmStructuredEnabled = wasmStructuredOverride;
     result.animation = animationEstimate(result.probe.changes);
     const initial = result.probe.jitAtFirstNonBlack;
     const animationEnd = result.probe.jitAtAnimationEnd;
