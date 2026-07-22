@@ -53,8 +53,8 @@ function withEnv(t, vars) {
   });
 }
 
-async function makeHarness(t, className, source) {
-  withEnv(t, { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '1' });
+async function makeHarness(t, className, source, extraEnv = {}) {
+  withEnv(t, { JVM_WASM_JIT: '1', JVM_WASM_STRUCTURED: '1', ...extraEnv });
   const classpath = compileJavaFixture(t, className, source);
   const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
   await jvm.loadClassByName(className);
@@ -746,5 +746,90 @@ public class StructuredVCallEh {
   t.notOk(reasons.some((r) => r.includes('invoke')),
     `no invoke demotions in the caller (${reasons.join(', ') || 'none'})`);
   t.ok(st.runs > 0, 'structured module executed');
+  t.end();
+});
+
+test('dispatcher tier compiles live-handler-range blocks with EH', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'DispatchEh', `
+public class DispatchEh {
+  public static int drive(int[] out, int n) {
+    int[] a = new int[8];
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      try {
+        a[i & 15] = i;
+        sum += a[i & 7];
+      } catch (ArrayIndexOutOfBoundsException e) {
+        sum += 1000;
+      }
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`, { JVM_WASM_STRUCTURED: '0' });
+  const n = 4000;
+  const a = new Array(8).fill(0);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    if ((i & 15) < 8) {
+      a[i & 15] = i;
+      sum = (sum + a[i & 7]) | 0;
+    } else {
+      sum = (sum + 1000) | 0;
+    }
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'DispatchEh', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], sum, 'recovering try/catch loop matches JS reference');
+  const method = await jvm.findMethodInHierarchy('DispatchEh', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st && st.meta && !st.meta.structured, 'compiled by the dispatcher tier');
+  const reasons = [...st.meta.demoteReasons.values()];
+  t.notOk(reasons.includes('live handler range'),
+    `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
+  t.ok(st.meta.usedEh, 'module carries the EH flag');
+  t.ok(st.exits > 0, 'EH -3 exits were taken (handler dispatched from wasm)');
+  t.end();
+});
+
+test('nested EH callee dispatches its own handler without leaving the caller', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'NestedEhCallee', `
+public class NestedEhCallee {
+  int[] tab = null;
+  int risky(int i) {
+    try {
+      return tab[i & 7];
+    } catch (NullPointerException e) {
+      return 5;
+    }
+  }
+  public int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += risky(i) + (i & 1);
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  // tab stays null: every risky() call throws NPE internally and recovers to 5
+  const n = 64;
+  let ref = 0;
+  for (let i = 0; i < n; i++) ref = (ref + 5 + (i & 1)) | 0;
+  const out = [0];
+  out.type = '[I';
+  const recv = { type: 'NestedEhCallee', fields: { 'NestedEhCallee.tab': null }, hashCode: 13 };
+  let mismatches = 0;
+  for (let k = 0; k < 300; k++) {
+    out[0] = 0;
+    await invoke(jvm, thread, 'NestedEhCallee', 'drive', '([II)I', [recv, out, n]);
+    if (out[0] !== ref) mismatches += 1;
+  }
+  t.equal(mismatches, 0, 'every call matches the JS reference');
+  const risky = await jvm.findMethodInHierarchy('NestedEhCallee', 'risky', '(I)I');
+  const riskySt = jvm.jit.wasmJit.state.get(risky);
+  t.ok(riskySt && riskySt.meta && riskySt.meta.usedEh, 'callee is an EH module');
+  t.ok(riskySt && riskySt.nestedCalls > 0, 'EH callee ran nested');
   t.end();
 });

@@ -208,6 +208,14 @@ class Unsupported extends Error {
 
 const FUEL = 5_000_000;
 
+// Guest exceptions are plain objects with a string `type` (never Error
+// instances); host errors (TypeError, NestedDeopt, ...) are everything else.
+// The EH import wrappers use this to decide catch-and-dispatch vs rethrow.
+function isGuestThrow(e) {
+  return e !== null && typeof e === 'object' &&
+    typeof e.type === 'string' && !(e instanceof Error);
+}
+
 // Thrown through wasm frames when a linked partial callee reaches one of its
 // demoted (diagnostic) blocks: carries the interpreter frames to materialize,
 // innermost first. Never visible to guest code — execute() always catches it.
@@ -359,6 +367,7 @@ module.exports = {
   MATH_INTRINSICS,
   Unsupported,
   NestedDeopt,
+  isGuestThrow,
   FUEL,
   assembleModule,
   isNoOpExceptionHandler, catchesOnlyCheckedExceptions, liveExceptionRanges,

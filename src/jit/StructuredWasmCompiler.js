@@ -29,7 +29,7 @@ const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
-  Unsupported, NestedDeopt, sig, assembleModule, liveExceptionRanges,
+  Unsupported, NestedDeopt, isGuestThrow, sig, assembleModule, liveExceptionRanges,
 } = require('./wasmShared');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
@@ -71,11 +71,6 @@ function dummyRet(ret) {
   if (ret === 'J') return 0n;
   if (ret === 'L' || ret === '[') return null;
   return 0;
-}
-
-function isGuestThrow(e) {
-  return e !== null && typeof e === 'object' &&
-    typeof e.type === 'string' && !(e instanceof Error);
 }
 
 const LCONST = { lconst_0: 0n, lconst_1: 1n };
@@ -387,6 +382,13 @@ class StructuredWasmCompiler {
       // callers must nest this module with a real scratch frame, never the
       // junk sink (same contract as the dispatcher tier's deoptable calls).
       deoptableCalls: this.deoptableSites.size,
+      // Normal-flow coverage gap for compile()'s tier preference:
+      // instruction-bearing items in DEMOTED tree blocks (counted like the
+      // dispatcher's uncoveredItems). Inline guard-miss deopt stubs are
+      // rare-path exits by design, not gaps.
+      uncoveredItems: [...this.demoted.keys()].filter((id) => treeBlocks.has(id))
+        .reduce((sum, id) => sum +
+          cfg.blocks[id].insns.filter((i) => items[i] && items[i].instruction).length, 0),
       boxedCount: 0,
       fieldCacheCount: this.fieldCaches.size,
       structured: true,
@@ -1177,16 +1179,18 @@ class StructuredWasmCompiler {
     const results = ret === 'V' ? [] : [descToWasm(ret)];
     const key = `${className}.${name}${descriptor}`;
     if (linked.meta.fullyCompiled && !linked.meta.boxedCount &&
-        !linked.meta.deoptableCalls) {
+        !linked.meta.deoptableCalls && !linked.meta.usedEh) {
       // Never-exits fast path: no scratch frame, no flag check. A later
       // recompile may repoint the state to a module with deoptable sites;
-      // pin the link-time pair as the safe fallback.
+      // pin the link-time pair as the safe fallback. usedEh matters here:
+      // a dispatcher-tier EH module can be fullyCompiled (its fullyCompiled
+      // has no empty-table requirement) yet return -3.
       const pinned = { run: linked.run, meta: linked.meta };
       const junk = { locals: [] }; // spill sink; a fully-compiled callee never exits
       const fn = (...args) => {
         const current = calleeSt.callee || calleeSt; // recompiles may repoint it
         const mod = (current.meta.fullyCompiled && !current.meta.boxedCount &&
-          !current.meta.deoptableCalls) ? current : pinned;
+          !current.meta.deoptableCalls && !current.meta.usedEh) ? current : pinned;
         const meta = mod.meta;
         const full = new Array(meta.paramSlots.length + 2);
         for (let i = 0; i < meta.paramSlots.length; i++) {
@@ -1214,7 +1218,6 @@ class StructuredWasmCompiler {
         writes,
       };
     }
-    if (linked.meta.usedEh) throw new Unsupported(`EH callee ${key}`);
     if (calleeSt.linkVetoed) throw new Unsupported(`partial callee ${key} vetoed`);
     const scratchFrames = new Map();
     const dummy = dummyRet(ret);
@@ -1251,7 +1254,6 @@ class StructuredWasmCompiler {
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
       if (!st) throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`);
       const m = (st.callee || st).meta;
-      if (m.usedEh) throw new Unsupported(`EH callee ${implClassName}.${name}`);
       if (st.linkVetoed && !m.fullyCompiled) {
         throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`);
       }
@@ -1342,12 +1344,10 @@ class StructuredWasmCompiler {
     const box = this.box;
     const calleeMod = calleeSt.callee || calleeSt;
     const meta = calleeMod.meta;
-    if (meta.usedEh) {
-      // a -3 exit would aim its spill at the top frame — never nestable
-      box.deoptFlag = 1;
-      return dummy;
-    }
-    const partial = !meta.fullyCompiled || meta.boxedCount > 0 || meta.deoptableCalls > 0;
+    // usedEh forces a scratch frame: a -3 exit spills into box.frame and
+    // dispatches inside it below.
+    const partial = !meta.fullyCompiled || meta.boxedCount > 0 ||
+      meta.deoptableCalls > 0 || meta.usedEh;
     const full = new Array(meta.paramSlots.length + 2);
     for (let i = 0; i < meta.paramSlots.length; i += 1) {
       const p = meta.paramSlots[i];
@@ -1391,6 +1391,22 @@ class StructuredWasmCompiler {
     } finally {
       if (partial) frame.inUse = false;
       meta.box.frame = savedFrame;
+    }
+    if (status === -3) {
+      // The callee caught a guest exception in wasm: its spill import
+      // already wrote the throw-point locals into `frame` (its scratch).
+      // Dispatch inside the callee's own table; a handler match parks the
+      // frame positioned at the handler, no match propagates the exception
+      // to this module's wrap (EH catch or plain unwind).
+      const exn = meta.box.pendingException;
+      meta.box.pendingException = null;
+      if (this.jvm.dispatchExceptionInFrame(frame, exn, meta.box.throwPc)) {
+        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+        box.pendingFrames = [frame];
+        box.deoptFlag = 2;
+        return dummy;
+      }
+      throw exn;
     }
     if (status !== -1) {
       if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);

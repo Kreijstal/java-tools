@@ -79,6 +79,7 @@ const {
   MATH_INTRINSICS,
   Unsupported,
   NestedDeopt,
+  isGuestThrow,
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges,
 } = require('./wasmShared');
@@ -108,7 +109,10 @@ class MethodTranslator {
     this.importFns = [];        // JS functions in index order
     this.importDecls = [];      // {name, params:[wasmtype], results:[wasmtype]}
     this.importIndexByName = new Map();
-    this.box = { frame: null, ret: undefined };
+    this.box = {
+      frame: null, ret: undefined,
+      pendingException: null, lastThrown: null, throwPc: -1,
+    };
     this.demoteReasons = new Map();
   }
 
@@ -118,12 +122,46 @@ class MethodTranslator {
     return idx;
   }
 
+  // Bytecode pc of a block's first instruction (the space handleException
+  // compares handler ranges in), or null when the block has no label or
+  // pc-annotated item to derive it from.
+  pcOfBlock(b) {
+    const from = this.blockStarts[b];
+    const to = b + 1 < this.blockStarts.length ? this.blockStarts[b + 1] : this.items.length;
+    for (let i = from; i < to; i++) {
+      const it = this.items[i];
+      if (!it) continue;
+      if (it.labelDef) {
+        const pc = parseInt(it.labelDef.slice(1, -1), 10);
+        if (!Number.isNaN(pc)) return pc;
+      }
+      if (typeof it.pc === 'number') return it.pc;
+    }
+    return null;
+  }
+
   // ---- import registry ----
   addImport(name, params, results, fn) {
     if (this.importIndexByName.has(name)) return this.importIndexByName.get(name);
     const idx = this.importDecls.length;
+    let wrapped = fn;
+    if (this.ehMethod) {
+      // EH protocol (mirrors the structured tier): record what an import
+      // threw so the catch_all arm — which cannot inspect the exception —
+      // can tell guest exceptions from host errors.
+      const box = this.box;
+      wrapped = (...args) => {
+        try {
+          return fn(...args);
+        } catch (e) {
+          box.lastThrown = e;
+          box.pendingException = isGuestThrow(e) ? e : null;
+          throw e;
+        }
+      };
+    }
     this.importDecls.push({ name, params, results });
-    this.importFns.push(fn);
+    this.importFns.push(wrapped);
     this.importIndexByName.set(name, idx);
     return idx;
   }
@@ -483,8 +521,9 @@ class MethodTranslator {
     const fn = (...all) => {
       const args = underCount ? all.slice(underCount) : all;
       const current = calleeSt.callee || calleeSt;
-      const calleeMod = (partial || (current.meta.fullyCompiled &&
-        !current.meta.deoptableCalls && !current.meta.boxedCount)) ? current : pinned;
+      const calleeMod = ((partial && !current.meta.usedEh) ||
+        (current.meta.fullyCompiled && !current.meta.deoptableCalls &&
+          !current.meta.boxedCount && !current.meta.usedEh)) ? current : pinned;
       const meta = calleeMod.meta;
       const full = new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {
@@ -608,13 +647,27 @@ class MethodTranslator {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
       if (resolved.impls.size > 4) throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      // Impls that cannot be linked (never-compiling entry, EH module,
+      // vetoed) drop out of the map: their receivers miss at runtime and
+      // take the existing deopt-at-the-invoke path, which is always sound.
+      // Only a site with no ready impl at all keeps the demotion status quo.
       const readyByImpl = new Map();
+      let readyCount = 0;
       for (const impl of resolved.impls.values()) {
-        readyByImpl.set(impl.className, readyOrThrow(impl.className));
+        let st = null;
+        try {
+          st = readyOrThrow(impl.className);
+        } catch (err) {
+          if (!(err instanceof Unsupported)) throw err;
+        }
+        readyByImpl.set(impl.className, st);
+        if (st) readyCount += 1;
       }
+      if (!readyCount) throw new Unsupported(`invoke ${owner}.${name} no ready impl`);
       dispatch = new Map();
       for (const [runtimeClass, impl] of resolved.targets) {
-        dispatch.set(runtimeClass, readyByImpl.get(impl.className));
+        const st = readyByImpl.get(impl.className);
+        if (st) dispatch.set(runtimeClass, st);
       }
     }
     // java arg slot -> position in the wasm arg list (receiver = slot 0)
@@ -652,10 +705,9 @@ class MethodTranslator {
         throw NPE(`invoke ${key} on null`);
       }
       const calleeSt = direct || dispatch.get(runtimeClassName(receiver));
-      if (!calleeSt || (calleeSt.callee || calleeSt).meta.usedEh) {
-        // class loaded after compilation, or an EH callee (returns -3 with
-        // its spill aimed at the top frame — never nestable): hand the site
-        // back to the interpreter with its operands restored
+      if (!calleeSt) {
+        // class loaded after compilation: hand the site back to the
+        // interpreter with its operands restored
         if (stats) stats.deopts += 1;
         spillCallerSlots(all);
         callerBox.frame.pc = itemIndex;
@@ -665,7 +717,9 @@ class MethodTranslator {
       }
       const calleeMod = calleeSt.callee || calleeSt;
       const meta = calleeMod.meta;
-      const partial = !meta.fullyCompiled || meta.deoptableCalls > 0;
+      // usedEh forces a scratch frame: a -3 exit spills into it and the
+      // exception dispatches inside the callee's own table below
+      const partial = !meta.fullyCompiled || meta.deoptableCalls > 0 || meta.usedEh;
       if (stats && partial) stats.scratch += 1;
       const full = new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {
@@ -713,6 +767,22 @@ class MethodTranslator {
       } finally {
         if (partial) frame.inUse = false;
         meta.box.frame = savedFrame;
+      }
+      if (status === -3) {
+        // the callee caught a guest exception in wasm; its spill wrote the
+        // throw-point locals into the scratch frame — dispatch there, or
+        // propagate when its own table has no handler
+        const exn = meta.box.pendingException;
+        meta.box.pendingException = null;
+        if (this.jvm.dispatchExceptionInFrame(frame, exn, meta.box.throwPc)) {
+          if (stats) stats.deopts += 1;
+          if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+          spillCallerSlots(all);
+          callerBox.frame.pc = resumePc;
+          for (let i = 0; i < underCount; i++) callerBox.frame.stack.push(all[slotCount + i]);
+          throw new NestedDeopt([frame]);
+        }
+        throw exn;
       }
       if (status !== -1) {
         if (!partial) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
@@ -876,6 +946,11 @@ class MethodTranslator {
   translate() {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, this.labelIndex);
+    // EH (mirrors the structured tier): one try/catch_all around the whole
+    // dispatcher loop plus a per-block current-pc local. Must be decided
+    // before the first addImport so every import gets the recording wrapper.
+    const env = (typeof process !== 'undefined' && process.env) || {};
+    this.ehMethod = env.JVM_WASM_EH !== '0' && liveRanges.length > 0;
     this.inferSlotTypes();
     this.runtimeImports();
     this.arrayImports();
@@ -891,6 +966,16 @@ class MethodTranslator {
         if (i + 1 < this.items.length) leaders.add(i + 1);
       }
     });
+    // Split blocks at live-range boundaries: EH dispatch uses the block's
+    // start pc for every op in it, which requires no block to straddle a
+    // range edge. javac ranges are statement-aligned, so these splits land
+    // on empty-stack boundaries.
+    if (this.ehMethod) {
+      for (const [rs, re] of liveRanges) {
+        leaders.add(rs);
+        if (re < this.items.length) leaders.add(re);
+      }
+    }
     this.blockStarts = [...leaders].sort((a, b) => a - b);
     const N = this.blockStarts.length;
     this.blockOfItem = new Map();
@@ -910,14 +995,36 @@ class MethodTranslator {
     this.fieldCaches = new Map(); // cacheKey -> {valLocal, filledLocal, ...}
     this.refScratch = undefined;
 
-    // blocks intersecting a live handler's try-range must stay interpreted
+    // With EH the whole dispatcher loop runs under try/catch_all and a throw
+    // dispatches at the current block's start pc. That pc stands in for every
+    // op in the block, which is only sound when the block sits entirely
+    // inside (or entirely outside) each live range — blocks STRADDLING a
+    // live-range boundary would catch or miss handlers depending on which op
+    // threw, so they stay interpreted. Without EH every intersecting block
+    // demotes as before.
     const rangeDemoted = new Set();
-    for (const [rs, re] of liveRanges) {
-      for (let b = 0; b < N; b++) {
-        const from = this.blockStarts[b];
-        const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
-        if (from < re && to > rs) rangeDemoted.add(b);
+    this.ehBlockPc = new Map();
+    for (let b = 0; b < N; b++) {
+      const from = this.blockStarts[b];
+      const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
+      let straddles = false;
+      let intersects = false;
+      for (const [rs, re] of liveRanges) {
+        if (from < re && to > rs) {
+          intersects = true;
+          if (!(rs <= from && to <= re)) straddles = true;
+        }
       }
+      if (!this.ehMethod) {
+        if (intersects) rangeDemoted.add(b);
+        continue;
+      }
+      const pc = this.pcOfBlock(b);
+      // covered blocks need a real pc to reach their handler; uncovered
+      // blocks without one dispatch at -1 (matches no range — the same
+      // propagate-out the stale-pc unwind gave them before EH)
+      if (straddles || (intersects && pc === null)) rangeDemoted.add(b);
+      else this.ehBlockPc.set(b, pc === null ? -1 : pc);
     }
 
     // pass 1 (dry run): fix each block's entry stack shape by propagating
@@ -980,8 +1087,22 @@ class MethodTranslator {
       }
     }
     if (!this.supportedBlocks.size) throw new Unsupported('no supported blocks');
-    this.normalFlowFullyCompiled = [...this.normalReachableBlocks(N)]
+    const normalReachable = this.normalReachableBlocks(N);
+    this.normalFlowFullyCompiled = [...normalReachable]
       .every((b) => this.supportedBlocks.has(b));
+    // Normal-flow items NOT covered by supported blocks: compile()'s tier
+    // preference compares coverage GAPS across tiers. Gaps, not covered
+    // counts: the tiers partition and expand items differently, so covered
+    // totals are incomparable, but "how much normal flow falls back to the
+    // interpreter" is — and a gap-free structured module must always win.
+    this.uncoveredItems = 0;
+    for (const b of normalReachable) {
+      if (this.supportedBlocks.has(b)) continue;
+      const end = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
+      for (let i = this.blockStarts[b]; i < end; i++) {
+        if (this.items[i] && this.items[i].instruction) this.uncoveredItems += 1;
+      }
+    }
 
     // external entry (invocation, OSR, resume-after-exit) is only sound at a
     // supported block whose inferred entry stack is empty
@@ -991,6 +1112,23 @@ class MethodTranslator {
 
     // function body: dispatcher loop (fuel is checked per block prologue)
     const body = [];
+    if (this.ehMethod) {
+      // Every block prologue stamps its start pc into curPcLocal; the single
+      // try/catch_all around the dispatcher loop then dispatches any guest
+      // exception at that pc via status -3 (slot locals are continuously
+      // live in this tier, so the catch arm's spill sees throw-point state;
+      // boxed slots live in frame.locals already and must not be spilled).
+      this.curPcLocal = this.nextLocal++;
+      this.declared.push(T.i32);
+      for (let b = 0; b < N; b++) {
+        const pc = this.ehBlockPc.has(b) ? this.ehBlockPc.get(b) : -1;
+        blockBodies[b] = [
+          OP.i32_const, ...sleb(pc), OP.local_set, ...uleb(this.curPcLocal),
+          ...blockBodies[b],
+        ];
+      }
+      body.push(OP.try, 0x40);
+    }
     body.push(OP.loop, 0x40);
     for (let i = 0; i < N; i++) body.push(OP.block, 0x40);
     body.push(OP.local_get, ...uleb(this.blkLocal));
@@ -1003,6 +1141,24 @@ class MethodTranslator {
     }
     body.push(OP.end);          // loop
     body.push(OP.unreachable);  // all paths return explicitly
+    if (this.ehMethod) {
+      const box = this.box;
+      body.push(OP.catch_all);
+      body.push(OP.call, ...uleb(this.addImport('eh_pending', [], [T.i32],
+        () => (box.pendingException !== null ? 1 : 0))));
+      body.push(OP.if, 0x40);
+      body.push(...this.spillSeq());
+      body.push(OP.local_get, ...uleb(this.curPcLocal));
+      body.push(OP.call, ...uleb(this.addImport('eh_pc', [T.i32], [],
+        (pc) => { box.throwPc = pc; })));
+      body.push(OP.i32_const, ...sleb(-3), OP.return);
+      body.push(OP.end);
+      body.push(OP.call, ...uleb(this.addImport('eh_rethrow', [], [],
+        () => { throw box.lastThrown; })));
+      body.push(OP.unreachable);
+      body.push(OP.end);        // try
+      body.push(OP.unreachable);
+    }
     body.push(OP.end);          // function
 
     return this.assemble(body);
@@ -1540,6 +1696,20 @@ class MethodTranslator {
       } else if (op === 'return') {
         emit(OP.i32_const, ...sleb(-1), OP.return);
         return code;
+      } else if (op === 'athrow' && this.ehMethod) {
+        // Throw the ref JS-side; the method-level try/catch_all dispatches it
+        // at this block's pc via -3. Only compiled under EH — without the
+        // try, an unwind here would lose to the interpreter's precise-pc
+        // handling that demotion currently provides.
+        pop();
+        emit(OP.call, ...uleb(this.addImport('athrow', [T.ref], [], (ref) => {
+          if (ref === null || ref === undefined) {
+            throw { type: 'java/lang/NullPointerException', message: null };
+          }
+          throw ref;
+        })));
+        emit(OP.unreachable);
+        return code;
       } else if (op === 'nop') {
         // nothing
       } else {
@@ -1622,6 +1792,10 @@ class MethodTranslator {
       // the NestedDeopt protocol even when it is fully compiled
       deoptableCalls: this.instanceSites || 0,
       boxedCount: this.boxedSlots.size,
+      // EH modules return -3 with the spill aimed at the top frame — never
+      // link them as nested callees (every link path checks this flag)
+      usedEh: !!this.ehMethod,
+      uncoveredItems: this.uncoveredItems,
       fieldCacheCount: this.fieldCaches.size,
     };
   }
@@ -1798,13 +1972,19 @@ class WasmJit {
       } catch (err) {
         if (!(err instanceof Unsupported) || !structuredMeta) throw err;
       }
-      // A structured module that covers fewer blocks than the dispatcher's
-      // (e.g. it must demote a call the dispatcher links partially) would
-      // give that coverage away on every pc-0 entry, then exit into a tier
-      // that keeps the frame. Only prefer structured when it covers at least
-      // as much; a discarded structured module has no OSR value either.
+      // A structured module with BIGGER normal-flow coverage gaps than the
+      // dispatcher's (e.g. it must demote a call the dispatcher links
+      // partially) would give that coverage away on every pc-0 entry, then
+      // exit into a tier that keeps the frame. Gap counts, not covered
+      // counts: the tiers partition and expand items differently. A
+      // gap-free structured module always wins — it is the faster tier.
+      // ... unless discarding would lose callee-linkability: links require a
+      // compiled pc-0 entry and unboxed slots — a dispatcher module missing
+      // either can never be linked no matter how much more it covers.
+      const linkable = (m) => m.externalEntry.has(0) && !m.boxedCount;
       if (structuredMeta && meta &&
-          meta.supportedBlocks.size > structuredMeta.supportedBlocks.size) {
+          structuredMeta.uncoveredItems > meta.uncoveredItems &&
+          (linkable(meta) || !linkable(structuredMeta))) {
         structuredMeta = null;
       }
       const primary = structuredMeta || meta;

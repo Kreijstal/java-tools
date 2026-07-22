@@ -1929,47 +1929,42 @@ class JVM {
       }
     }
 
+    if (this.dispatchExceptionInFrame(frame, exception, pcToCheck)) return;
+
+    callStack.pop();
+    this.handleException(exception, -1, thread);
+  }
+
+  // Search ONE frame's exception table for a handler covering pcToCheck and,
+  // on a match, position the frame at the handler with [exception] as its
+  // operand stack. Returns true when dispatched. Shared by the interpreter's
+  // unwinding above and the wasm tiers' nested EH-callee links (a nested -3
+  // dispatches inside the callee's scratch frame before it is materialized).
+  dispatchExceptionInFrame(frame, exception, pcToCheck) {
     const table = frame.exceptionTable;
-    if (table) {
-      for (const entry of table) {
-        if (pcToCheck >= entry.start_pc && pcToCheck < entry.end_pc) {
-          if (entry.catch_type === "any") {
-            const targetIndex = frame.instructions.findIndex((inst) => {
-              if (!inst || !inst.labelDef) return false;
-              const labelPc = parseInt(
-                inst.labelDef.substring(1, inst.labelDef.length - 1),
-              );
-              return labelPc === entry.handler_pc;
-            });
+    if (!table) return false;
+    for (const entry of table) {
+      if (pcToCheck >= entry.start_pc && pcToCheck < entry.end_pc) {
+        if (entry.catch_type === "any" ||
+            this.isInstanceOf(exception.type, entry.catch_type)) {
+          const targetIndex = frame.instructions.findIndex((inst) => {
+            if (!inst || !inst.labelDef) return false;
+            const labelPc = parseInt(
+              inst.labelDef.substring(1, inst.labelDef.length - 1),
+            );
+            return labelPc === entry.handler_pc;
+          });
 
-            if (targetIndex !== -1) {
-              frame.stack.clear();
-              frame.stack.push(exception);
-              frame.pc = targetIndex;
-              return;
-            }
-          } else if (this.isInstanceOf(exception.type, entry.catch_type)) {
-            const targetIndex = frame.instructions.findIndex((inst) => {
-              if (!inst || !inst.labelDef) return false;
-              const labelPc = parseInt(
-                inst.labelDef.substring(1, inst.labelDef.length - 1),
-              );
-              return labelPc === entry.handler_pc;
-            });
-
-            if (targetIndex !== -1) {
-              frame.stack.clear();
-              frame.stack.push(exception);
-              frame.pc = targetIndex;
-              return;
-            }
+          if (targetIndex !== -1) {
+            frame.stack.clear();
+            frame.stack.push(exception);
+            frame.pc = targetIndex;
+            return true;
           }
         }
       }
     }
-
-    callStack.pop();
-    this.handleException(exception, -1, thread);
+    return false;
   }
 
   serialize() {
