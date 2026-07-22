@@ -82,6 +82,12 @@ class JVM {
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
     this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
     this._hotMethodCounts = new Map();
+    // process.env property reads go through libuv (~600ns for the set below);
+    // executeTick consults these every tick, so latch them once here.
+    this._envTrace = !!env.JVM_TRACE;
+    this._envProfileHot = env.JVM_PROFILE_HOT_METHODS === '1' ||
+      env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1';
+    this._envDebugThrow = !!env.JVM_DEBUG_THROW;
     this.jitOptions = options.jit || {};
     this.jit = new JitCompiler(this, this.jitOptions);
 
@@ -1007,12 +1013,9 @@ class JVM {
 
     prepareSyncInstructions(frame.instructions);
 
-    const env = (typeof process !== 'undefined' && process.env) || {};
     const burstAllowed = options.allowBurst === true && !this.debugManager.debugMode &&
-      !this.verbose && !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1' &&
-      env.JVM_PROFILE_HOT_METHODS_WITH_JIT !== '1';
-    const instructionInstrumentation = env.JVM_TRACE ||
-      env.JVM_PROFILE_HOT_METHODS === '1' || env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1';
+      !this.verbose && !this._envTrace && !this._envProfileHot;
+    const instructionInstrumentation = this._envTrace || this._envProfileHot;
     const limit = burstAllowed ? this.interpreterBurst : 1;
     let executedBytecodes = 0;
 
@@ -1900,7 +1903,7 @@ class JVM {
   }
 
   handleException(exception, pc, thread) {
-    if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_THROW) {
+    if (this._envDebugThrow) {
       const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
       const m = top && top.method ? top.method : {};
       console.error(`[throw] ${exception && exception.type} msg=${exception && exception.message} ` +

@@ -117,6 +117,10 @@ class JitCompiler {
         ? process.env.JVM_JIT_EXPERIMENTAL_CONTROL_FLOW === "1"
         : false
     );
+    // canRun runs on every scheduler tick; process.env reads cost ~150ns each,
+    // so latch the instrumentation flags once.
+    this._envInstrumented = Boolean(typeof process !== "undefined" && process.env &&
+      (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
     this.wasmJit = new WasmJit(jvm, this);
     const regionOptions = this.rendererPipelineEnabled
       ? { ...options, fusedRegions: true, structuredSsa: true }
@@ -143,8 +147,7 @@ class JitCompiler {
     // Tracing/profiling must observe every interpreted bytecode. Debug stepping
     // is handled below through DebugManager; these environment modes are used
     // by the headless runner and need the same one-instruction semantics.
-    if (typeof process !== "undefined" && process.env &&
-      (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1")) {
+    if (this._envInstrumented) {
       return false;
     }
     const debug = this.jvm.debugManager;
