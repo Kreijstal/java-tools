@@ -274,3 +274,78 @@ test('narrow and wide element types keep Java coercion semantics', async (t) => 
   t.equal(out[0], (N * (N - 1)) / 4, 'float[] halves sum exactly');
   t.end();
 });
+
+test('compiled newarray allocates heap-backed views', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'HeapAlloc', `
+public class HeapAlloc {
+  public static int drive(Object[] out, int n) {
+    int sum = 0;
+    int[] keep = null;
+    for (int i = 0; i < n; i++) {
+      int[] a = new int[8];
+      a[i & 7] = i;
+      sum += a[i & 7];
+      keep = a;
+    }
+    out[0] = keep;
+    return sum;
+  }
+}
+`);
+  const out = [null];
+  out.type = '[Ljava/lang/Object;';
+  const n = 2000;
+  await invoke(jvm, thread, 'HeapAlloc', 'drive', '([Ljava/lang/Object;I)I', [out, n]);
+  const meta = metaOf(jvm, 'HeapAlloc.drive([Ljava/lang/Object;I)I');
+  t.ok(meta && meta.structured, 'drive compiled by the structured backend');
+  t.equal(meta.demoteReasons.size, 0, 'no demoted blocks');
+  const kept = out[0];
+  t.ok(ArrayBuffer.isView(kept), 'compiled newarray produced a TypedArray view');
+  t.ok(kept.wasmBase !== undefined, 'view is heap-backed (wasmBase set)');
+  t.equal(kept[(n - 1) & 7], n - 1, 'last allocation holds its stored element');
+  t.end();
+});
+
+test('field-held array reassigned in-loop: sibling readers see the new array', async (t) => {
+  // ja.c-shaped: this.b doubles when full, then keeps being indexed through
+  // OTHER getfield nodes. Their array base/len caches must die when the
+  // shared field-cache entry refills after the putfield, or the next access
+  // reads the old array's bounds (AIOOBE index >= old length).
+  const { jvm, thread } = await makeHarness(t, 'HeapGrow', `
+public class HeapGrow {
+  int[] b;
+  int run(int n) {
+    b = new int[8];
+    int idx = 0;
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      if (idx >= b.length) {
+        int[] nb = new int[b.length * 2];
+        for (int j = 0; j < b.length; j++) nb[j] = b[j];
+        b = nb;
+      }
+      b[idx] = i;
+      sum += b[idx];
+      idx++;
+    }
+    return sum;
+  }
+  public static int drive(int[] out, HeapGrow g, int n) {
+    out[0] = g.run(n);
+    return out[0];
+  }
+}
+`);
+  const n = 600;
+  const out = [0];
+  out.type = '[I';
+  const g = { type: 'HeapGrow', fields: { 'HeapGrow.b': null } };
+  await invoke(jvm, thread, 'HeapGrow', 'drive', '([ILHeapGrow;I)I', [out, g, n]);
+  let expect = 0;
+  for (let i = 0; i < n; i++) expect = (expect + i) | 0;
+  t.equal(out[0], expect, 'grow-in-loop sums correctly (no stale base/len read)');
+  const meta = metaOf(jvm, 'HeapGrow.run(I)I');
+  t.ok(meta && meta.structured, 'run compiled by the structured backend');
+  t.equal(meta.demoteReasons.size, 0, 'allocation blocks compiled, no demotions');
+  t.end();
+});

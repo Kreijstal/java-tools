@@ -10,7 +10,9 @@
 // fieldImports/mathIntrinsic byte-for-byte in behavior; the translator still
 // carries its own copies until its strangler step lands.
 
-const { resolveInstanceFieldKey } = require('../instructions/object');
+const {
+  resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray,
+} = require('../instructions/object');
 const {
   T, NPE, AIOOBE, MATH_INTRINSICS, Unsupported,
   descToWasm, toWasmValue, parseMethodDescriptor,
@@ -176,6 +178,68 @@ function addMathImport(reg, ins) {
   };
 }
 
+// Allocation imports (new / newarray / anewarray). None of these run guest
+// code or a thread switch, so both backends' field-cache invariants hold:
+// array classes have no <clinit>, and `new` compiles only against classes
+// whose <clinit> already ran (gated below; INITIALIZED is permanent, so the
+// compile-time check stays valid for the module's lifetime). Negative array
+// sizes throw the guest NegativeArraySizeException, which unwinds through
+// wasm exactly like NPE/AIOOBE from the array imports.
+const PRIM_ATYPES = new Set([
+  'boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double',
+]);
+
+function addNewArrayImport(reg, jvm, atype) {
+  if (!PRIM_ATYPES.has(atype)) throw new Unsupported(`newarray ${atype}`);
+  return reg.addImport(`newarr_${atype}`, [T.i32], [T.ref],
+    (count) => allocPrimitiveArray(jvm, atype, count));
+}
+
+function addANewArrayImport(reg, jvm, elementType) {
+  if (typeof elementType !== 'string') throw new Unsupported('anewarray arg');
+  const name = `anewarr_${elementType}`.replace(/[^\w]/g, '_');
+  return reg.addImport(name, [T.i32], [T.ref],
+    (count) => allocReferenceArray(jvm, elementType, count));
+}
+
+function addNewImport(reg, jvm, className) {
+  if (typeof className !== 'string') throw new Unsupported('new arg');
+  // Same gate as the JS tier's newObjectSync: allocation of a not-yet-
+  // initialized class must reach the interpreter so <clinit> can run.
+  if (jvm.classInitializationState.get(className) !== 'INITIALIZED' ||
+      !jvm.classes[className]) {
+    throw new Unsupported(`new ${className} not initialized`);
+  }
+  // Default field map precomputed once at compile time (the hierarchy above
+  // an initialized class is loaded and immutable); each allocation clones it.
+  const template = {};
+  let currentClassName = className;
+  while (currentClassName) {
+    const cd = jvm.classes[currentClassName];
+    if (!cd || !cd.ast || !cd.ast.classes[0]) break;
+    for (const item of cd.ast.classes[0].items) {
+      if (item.type !== 'field') continue;
+      const d = item.field.descriptor;
+      let dv = null;
+      if (d === 'I' || d === 'B' || d === 'S' || d === 'Z' || d === 'C') dv = 0;
+      else if (d === 'J') dv = BigInt(0);
+      else if (d === 'F' || d === 'D') dv = 0.0;
+      template[`${currentClassName}.${item.field.name}`] = dv;
+    }
+    currentClassName = cd.ast.classes[0].superClassName;
+  }
+  const name = `new_${className}`.replace(/[^\w]/g, '_');
+  return reg.addImport(name, [], [T.ref], () => ({
+    type: className,
+    fields: { ...template },
+    hashCode: jvm.nextHashCode++,
+    isLocked: false,
+    lockOwner: null,
+    lockCount: 0,
+    waitSet: [],
+  }));
+}
+
 // System time natives — like Math intrinsics they can never be compiled (JS
 // natives), but they are pure reads off the jvm clock (fake-time aware), so
 // both backends import them directly instead of demoting the call block.
@@ -198,4 +262,7 @@ module.exports = {
   addFieldImport,
   addMathImport,
   addTimeImport,
+  addNewArrayImport,
+  addANewArrayImport,
+  addNewImport,
 };

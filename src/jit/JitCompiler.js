@@ -1,7 +1,9 @@
 const Frame = require("../core/frame");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 const { parseDescriptor } = require("../parsing/typeParser");
-const { resolveInstanceFieldKey } = require("../instructions/object");
+const {
+  resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray,
+} = require("../instructions/object");
 const WasmJit = require("./WasmJit");
 const FusedRegionCompiler = require("./FusedRegionCompiler");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
@@ -2571,22 +2573,15 @@ class JitCompiler {
     return this.jvm.getClassObject(className);
   }
 
+  // Shared with the interpreter and the wasm allocation imports (heap-backed
+  // views with the linear heap on, long arrays default to 0n, negative sizes
+  // throw the guest NegativeArraySizeException).
   newPrimitiveArray(count, type) {
-    const defaultValue = type === "double" || type === "float" ? 0.0 : 0;
-    const array = new Array(count).fill(defaultValue);
-    array.type = primitiveArrayType(type);
-    array.length = count;
-    array.hashCode = this.jvm.nextHashCode++;
-    return array;
+    return allocPrimitiveArray(this.jvm, type, count);
   }
 
   newReferenceArray(count, elementType) {
-    const array = new Array(count).fill(null);
-    array.type = elementType.startsWith("[") ? `[${elementType}` : `[L${elementType};`;
-    array.elementType = elementType;
-    array.length = count;
-    array.hashCode = this.jvm.nextHashCode++;
-    return array;
+    return allocReferenceArray(this.jvm, elementType, count);
   }
 
   newMultiArray(arg, stack) {
@@ -4148,19 +4143,6 @@ function yieldToEventLoop() {
   });
 }
 
-function primitiveArrayType(type) {
-  switch (type) {
-    case "double": return "[D";
-    case "float": return "[F";
-    case "boolean": return "[Z";
-    case "byte": return "[B";
-    case "char": return "[C";
-    case "short": return "[S";
-    case "long": return "[J";
-    case "int":
-    default: return "[I";
-  }
-}
 
 function getOp(instruction) {
   if (!instruction) return null;

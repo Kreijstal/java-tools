@@ -284,7 +284,10 @@ public class StructuredCatch {
 test('structured wasm demotes unsupported blocks to exit stubs mid-loop', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredDemote', `
 public class StructuredDemote {
-  static int slow(int v) { return new int[]{v, v + 1}[1]; }
+  // the virtual call on a JRE class keeps slow unlinkable and uninlinable,
+  // so drive's call block demotes to an exit stub; newarray alone no longer
+  // demotes
+  static int slow(int v) { return Integer.toString(v).length() + v; }
   public static int drive(int[] out, int n) {
     int sum = 0;
     for (int i = 0; i < n; i++) {
@@ -300,7 +303,7 @@ public class StructuredDemote {
   let sum = 0;
   for (let i = 0; i < n; i++) {
     sum = (Math.imul(sum, 31) + i) | 0;
-    if ((i & 63) === 0) sum = (sum + i + 1) | 0;
+    if ((i & 63) === 0) sum = (sum + String(i).length + i) | 0;
   }
   const out = [0];
   out.type = '[I';
@@ -410,5 +413,67 @@ public class StructuredFuel {
   t.ok(st && st.meta && st.meta.structured, 'compiled by the structured backend');
   t.ok(st.fuelExits >= 1 || st.exits >= 1, `took a transient exit (exits=${st.exits})`);
   t.equal(out[0], acc, 'sum across the fuel exit matches BigInt reference');
+  t.end();
+});
+
+test('structured wasm compiles allocation ops without demotion', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredAlloc', `
+public class StructuredAlloc {
+  public static int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      int[] a = new int[4];
+      a[i & 3] = i;
+      long[] w = new long[2];
+      w[0] = (long) i * 3L;
+      int[][] rows = new int[3][];
+      rows[i % 3] = a;
+      sum += a[i & 3] + (int) w[0] + rows[i % 3][i & 3];
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const n = 3000;
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum = (sum + 5 * i) | 0;
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredAlloc', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], sum, 'allocation loop matches reference');
+  t.ok(structuredKeys(jvm).includes('StructuredAlloc.drive([II)I'),
+    'compiled by the structured backend');
+  const method = await jvm.findMethodInHierarchy('StructuredAlloc', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.equal(st.meta.demoteReasons.size, 0,
+    `no demoted blocks (${[...st.meta.demoteReasons.values()].join(', ')})`);
+  t.ok(st.meta.fullyCompiled, 'fully compiled: allocation never exits to the interpreter');
+  t.end();
+});
+
+test('compiled newarray throws a catchable NegativeArraySizeException', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredNegSize', `
+public class StructuredNegSize {
+  static int alloc(int size) { int[] a = new int[size]; return a.length; }
+  public static int warm(int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += alloc(3);
+    return sum;
+  }
+  public static void neg(int[] out, int size) {
+    try { out[0] = alloc(size); } catch (NegativeArraySizeException e) { out[0] = -7; }
+  }
+}
+`);
+  await invoke(jvm, thread, 'StructuredNegSize', 'warm', '(I)I', [500]);
+  t.ok(jvm.jit.wasmJit.compiled.some((st) => st.key.startsWith('StructuredNegSize.alloc')),
+    'alloc is compiled before the failing call');
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredNegSize', 'neg', '([II)V', [out, -1]);
+  t.equal(out[0], -7, 'guest catch saw NegativeArraySizeException from compiled code');
+  await invoke(jvm, thread, 'StructuredNegSize', 'neg', '([II)V', [out, 6]);
+  t.equal(out[0], 6, 'positive size still allocates');
   t.end();
 });

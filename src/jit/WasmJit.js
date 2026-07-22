@@ -63,7 +63,9 @@
 // opcodes), and wasm replicates interpreter semantics, not the JLS.
 
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
-const { addTimeImport } = require('./wasmRuntimeImports');
+const {
+  addTimeImport, addNewArrayImport, addANewArrayImport, addNewImport,
+} = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
 const Frame = require('../core/frame');
@@ -1341,6 +1343,19 @@ class MethodTranslator {
         pop(T.ref);
         emit(OP.call, ...uleb(this.importIndexByName.get('alen')));
         push(T.i32);
+      } else if (op === 'newarray') {
+        // allocation imports run no guest code (`new` compiles only for
+        // already-initialized classes) and cannot deopt — no spill needed
+        pop(T.i32);
+        emit(OP.call, ...uleb(addNewArrayImport(this, this.jvm, ins.arg)));
+        push(T.ref);
+      } else if (op === 'anewarray') {
+        pop(T.i32);
+        emit(OP.call, ...uleb(addANewArrayImport(this, this.jvm, ins.arg)));
+        push(T.ref);
+      } else if (op === 'new') {
+        emit(OP.call, ...uleb(addNewImport(this, this.jvm, ins.arg)));
+        push(T.ref);
       } else if (op === 'getfield' || op === 'getstatic') {
         const st = op === 'getstatic';
         const { t, idx, name } = this.fieldImports(ins, st, true);

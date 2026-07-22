@@ -13,8 +13,8 @@
 // Coverage mirrors the dispatcher's per-block demotion: blocks intersecting
 // a live (non-no-op) exception-handler range, and blocks whose body or
 // terminator uses an op this backend cannot emit (athrow, monitors,
-// allocation, checkcast/instanceof, string/class constants, virtual
-// invokes), become exit stubs — spill the block's reaching slot defs + entry
+// checkcast/instanceof, string/class constants, virtual invokes, `new` of a
+// not-yet-initialized class), become exit stubs — spill the block's reaching slot defs + entry
 // stack and return its item index; the interpreter (and the dispatcher OSR
 // module kept alongside) take over from there. invokestatic binds directly
 // to fully-compiled wasm callees. Whole-method rejection remains only for
@@ -30,7 +30,7 @@ const {
 } = require('./wasmShared');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
-  addTimeImport,
+  addTimeImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
 const { inlineCalls } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
@@ -737,14 +737,23 @@ class StructuredWasmCompiler {
           ? `s|${field.name}` : `f|${node.args[0].id}|${field.name}`;
         const entry = this.fieldCacheFor(cacheKey, field.t, killKey, isStatic ? 's' : 'f',
           isStatic ? null : node.args[0].id);
+        entry.readerIds.add(node.id);
         // cached instance path skips the null check: a filled flag proves
         // this exact SSA value already loaded this field successfully
         const loadSeq = isStatic
           ? [OP.call, ...uleb(field.idx)]
           : [...use(0), OP.call, ...uleb(field.idx)];
-        // dependent caches (arrays/fields keyed on this value) are killed on
-        // the refill path only — a hit reproduces the cached value verbatim
-        out.push(...this.cachedReadSeq(entry, loadSeq, this.cacheKillsFor(node.id)));
+        // Dependent caches (arrays/fields keyed on a reader's value) are
+        // killed on the refill path only — a hit reproduces the entry's
+        // cached value verbatim. The entry is SHARED by every reader node of
+        // this field, so a refill must kill the dependents of ALL readers:
+        // a sibling's later hit hands it the refilled (possibly different)
+        // object while its dependents still describe the previous one
+        // (in-loop `b = grow(b)` reassignment was read through a stale
+        // array base/len exactly this way).
+        const onMiss = [];
+        for (const id of entry.readerIds) onMiss.push(...this.cacheKillsFor(id));
+        out.push(...this.cachedReadSeq(entry, loadSeq, onMiss));
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         return;
       }
@@ -769,6 +778,21 @@ class StructuredWasmCompiler {
       else if (call.writes && call.writes.size) {
         out.push(...this.killSeqWhere((entry) => call.writes.has(entry.killKey)));
       }
+      return finish();
+    }
+
+    // allocation: pure JS-side imports, no guest code (see wasmRuntimeImports);
+    // `new` demotes unless the class is already initialized at compile time
+    if (op === 'newarray') {
+      out.push(...use(0), OP.call, ...uleb(addNewArrayImport(this, this.jvm, node.imm)));
+      return finish();
+    }
+    if (op === 'anewarray') {
+      out.push(...use(0), OP.call, ...uleb(addANewArrayImport(this, this.jvm, node.imm)));
+      return finish();
+    }
+    if (op === 'new') {
+      out.push(OP.call, ...uleb(addNewImport(this, this.jvm, node.imm)));
       return finish();
     }
 
@@ -865,7 +889,7 @@ class StructuredWasmCompiler {
       this.declared.push(t);
       const filledLocal = this.nextLocal++;
       this.declared.push(T.i32);
-      entry = { valLocal, filledLocal, t, killKey, kind, recvId };
+      entry = { valLocal, filledLocal, t, killKey, kind, recvId, readerIds: new Set() };
       this.fieldCaches.set(cacheKey, entry);
     }
     return entry;

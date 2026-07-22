@@ -22,6 +22,49 @@ function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
   return Object.keys(objRef.fields).find((fieldKey) => fieldKey.endsWith(`.${fieldName}`));
 }
 
+const PRIMITIVE_ARRAY_DESC = {
+  boolean: '[Z', byte: '[B', char: '[C', short: '[S',
+  int: '[I', long: '[J', float: '[F', double: '[D',
+};
+
+// Shared allocators for newarray/anewarray — one home for the semantics so
+// the interpreter and the wasm allocation imports cannot drift. Negative
+// sizes throw the guest NegativeArraySizeException (catchable, like a real
+// JVM), never a host error.
+function allocPrimitiveArray(jvm, atype, count) {
+  const desc = PRIMITIVE_ARRAY_DESC[atype];
+  if (!desc) throw new Error(`Unsupported array type: ${atype}`);
+  if (count < 0) {
+    throw { type: 'java/lang/NegativeArraySizeException', message: String(count) };
+  }
+  // With the linear heap on, primitive arrays are TypedArray views over wasm
+  // memory (zeroed by construction, element coercion matches Java) instead
+  // of plain JS arrays.
+  let array;
+  if (jvm.wasmHeap) {
+    array = jvm.wasmHeap.alloc(desc, count);
+  } else {
+    array = new Array(count).fill(atype === 'long' ? BigInt(0) : 0);
+  }
+  array.type = desc;
+  array.elementType = atype;
+  array.hashCode = jvm.nextHashCode++;
+  return array;
+}
+
+function allocReferenceArray(jvm, elementType, count) {
+  if (count < 0) {
+    throw { type: 'java/lang/NegativeArraySizeException', message: String(count) };
+  }
+  const array = new Array(count).fill(null);
+  // An array elementType is already a descriptor ('[I' rows of an int[][]);
+  // a class elementType needs the L...; wrapping.
+  array.type = elementType.startsWith('[') ? `[${elementType}` : `[L${elementType};`;
+  array.elementType = elementType;
+  array.hashCode = jvm.nextHashCode++;
+  return array;
+}
+
 module.exports = {
   new: async (frame, instruction, jvm, thread) => {
     const className = instruction.arg;
@@ -326,16 +369,7 @@ module.exports = {
   },
   anewarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
-    const elementType = instruction.arg;
-    const array = new Array(count).fill(null);
-    
-    // Set array type for proper runtime behavior
-    array.type = `[L${elementType};`;
-    array.elementType = elementType;
-    array.length = count;
-    array.hashCode = jvm.nextHashCode++;
-    
-    frame.stack.push(array);
+    frame.stack.push(allocReferenceArray(jvm, instruction.arg, count));
   },
 
   instanceof: async (frame, instruction, jvm, thread) => {
@@ -423,54 +457,11 @@ module.exports = {
 
   newarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
-    const atype = instruction.arg;
-    
-    if (count < 0) {
-      throw new Error('NegativeArraySizeException');
-    }
-    
-    const descriptors = { boolean: '[Z', byte: '[B', char: '[C', short: '[S', int: '[I', long: '[J', float: '[F', double: '[D' };
-    const desc = descriptors[atype];
-    if (!desc) throw new Error(`Unsupported array type: ${atype}`);
-
-    // Create array based on type name; with the linear heap on, primitive
-    // arrays are TypedArray views over wasm memory (zeroed by construction,
-    // element coercion matches Java) instead of plain JS arrays.
-    let array;
-    if (jvm.wasmHeap) {
-      array = jvm.wasmHeap.alloc(desc, count);
-    } else {
-      switch (atype) {
-        case 'boolean':
-        case 'byte':
-        case 'short':
-        case 'int':
-          array = new Array(count).fill(0);
-          break;
-        case 'long':
-          array = new Array(count).fill(BigInt(0));
-          break;
-        case 'float':
-        case 'double':
-          array = new Array(count).fill(0.0);
-          break;
-        case 'char':
-          array = new Array(count).fill(0); // char as int
-          break;
-        default:
-          throw new Error(`Unsupported array type: ${atype}`);
-      }
-      array.length = count;
-    }
-
-    // Set array type for proper runtime behavior
-    array.type = desc;
-    array.elementType = atype;
-    array.hashCode = jvm.nextHashCode++;
-    
-    frame.stack.push(array);
+    frame.stack.push(allocPrimitiveArray(jvm, instruction.arg, count));
   },
 };
 
 module.exports.resolveInstanceFieldKey = resolveInstanceFieldKey;
 module.exports.runtimeClassName = runtimeClassName;
+module.exports.allocPrimitiveArray = allocPrimitiveArray;
+module.exports.allocReferenceArray = allocReferenceArray;
