@@ -9,7 +9,10 @@ const T = { i32: 0x7f, i64: 0x7e, f32: 0x7d, f64: 0x7c, ref: 0x6f };
 const CAT2 = new Set([T.i64, T.f64]);
 
 const OP = {
-  unreachable: 0x00, block: 0x02, loop: 0x03, if: 0x04, else: 0x05, end: 0x0b,
+  unreachable: 0x00, block: 0x02, loop: 0x03, if: 0x04, else: 0x05,
+  // legacy exception-handling proposal (supported by V8 and SpiderMonkey):
+  // try/catch_all catch JS exceptions thrown by imports; traps stay uncatchable
+  try: 0x06, catch_all: 0x19, end: 0x0b,
   br: 0x0c, br_if: 0x0d, br_table: 0x0e, return: 0x0f, call: 0x10,
   drop: 0x1a, select: 0x1b,
   local_get: 0x20, local_set: 0x21, local_tee: 0x22,

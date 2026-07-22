@@ -343,6 +343,10 @@ function simulateBlock(context) {
     if (terminal || isBranch(op)) {
       block.term = { ...cfg.term[blockId], insnOp: op, args };
       annotateTermThrow(block, op);
+      if (block.term.mayThrow) {
+        block.term.itemIdx = itemIdx;
+        block.term.slotState = new Map(locals);
+      }
       continue;
     }
 
@@ -352,6 +356,10 @@ function simulateBlock(context) {
         const node = makeValue(op, 'V', args, instruction.arg ?? null);
         annotate(node, blockId, itemIdx, item);
         node.effects = { mayThrow: effect.mayThrow };
+        // Locals reaching a throwing op: an exception handler observes the
+        // frame's locals as of the throw, so backends that catch in compiled
+        // code need this exact state to spill (operand stack is discarded).
+        if (effect.mayThrow) node.slotState = new Map(locals);
         block.body.push(node);
       }
       continue;
@@ -361,6 +369,7 @@ function simulateBlock(context) {
     annotate(value, blockId, itemIdx, item);
     if (effect.essential || effect.mayThrow) {
       value.effects = { mayThrow: effect.mayThrow };
+      if (effect.mayThrow) value.slotState = new Map(locals);
       block.body.push(value);
     } else {
       block.body.push(value); // pinned order keeps provenance simple in v1
@@ -490,7 +499,12 @@ function pruneTrivialPhis(fn) {
   }
   if (replacements.size === 0) return;
   const map = (value) => (value ? resolve(value) : value);
-  for (const value of fn.values) value.args = value.args.map(map);
+  for (const value of fn.values) {
+    value.args = value.args.map(map);
+    if (value.slotState) {
+      for (const [slot, v] of value.slotState) value.slotState.set(slot, map(v));
+    }
+  }
   for (const block of fn.blocks) {
     block.phis = block.phis.filter((phi) => !replacements.has(phi));
     block.entryStack = block.entryStack.map(map);
@@ -502,6 +516,9 @@ function pruneTrivialPhis(fn) {
       for (const [slot, value] of block.slotDefsIn) block.slotDefsIn.set(slot, map(value));
     }
     if (block.term && block.term.args) block.term.args = block.term.args.map(map);
+    if (block.term && block.term.slotState) {
+      for (const [slot, v] of block.term.slotState) block.term.slotState.set(slot, map(v));
+    }
     block.body = block.body.filter((node) => !replacements.has(node));
   }
   fn.values = fn.values.filter((value) => !replacements.has(value));

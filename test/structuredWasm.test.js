@@ -275,8 +275,9 @@ public class StructuredCatch {
     'compiled by the structured backend despite the exception table');
   const method = await jvm.findMethodInHierarchy('StructuredCatch', 'drive', '([II)I');
   const st = jvm.jit.wasmJit.state.get(method);
-  t.ok([...st.meta.demoteReasons.values()].includes('live handler range'),
-    `try range demoted (${[...st.meta.demoteReasons.values()].join(', ')})`);
+  t.notOk([...st.meta.demoteReasons.values()].includes('live handler range'),
+    `try range compiles under EH (${[...st.meta.demoteReasons.values()].join(', ') || 'none'})`);
+  t.ok(st.meta.usedEh, 'EH catch sites were emitted for the try range');
   t.notOk(st.meta.fullyCompiled, 'not fullyCompiled with an exception table');
   t.end();
 });
@@ -475,5 +476,135 @@ public class StructuredNegSize {
   t.equal(out[0], -7, 'guest catch saw NegativeArraySizeException from compiled code');
   await invoke(jvm, thread, 'StructuredNegSize', 'neg', '([II)V', [out, 6]);
   t.equal(out[0], 6, 'positive size still allocates');
+  t.end();
+});
+
+test('structured wasm compiles live-handler-range blocks with EH', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredEh', `
+public class StructuredEh {
+  public static int drive(int[] out, int n) {
+    int[] a = new int[8];
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      try {
+        a[i & 15] = i;
+        sum += a[i & 7];
+      } catch (ArrayIndexOutOfBoundsException e) {
+        sum += 1000;
+      }
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const n = 4000;
+  const a = new Array(8).fill(0);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    if ((i & 15) < 8) {
+      a[i & 15] = i;
+      sum = (sum + a[i & 7]) | 0;
+    } else {
+      sum = (sum + 1000) | 0;
+    }
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredEh', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], sum, 'recovering try/catch loop matches JS reference');
+  t.ok(structuredKeys(jvm).includes('StructuredEh.drive([II)I'),
+    'compiled by the structured backend');
+  const method = await jvm.findMethodInHierarchy('StructuredEh', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  const reasons = [...st.meta.demoteReasons.values()];
+  t.notOk(reasons.includes('live handler range'),
+    `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
+  t.ok(st.meta.usedEh, 'EH catch sites were emitted');
+  t.end();
+});
+
+test('EH spill delivers locals as of the throw point, not block entry', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredEhLocals', `
+public class StructuredEhLocals {
+  public static int drive(int[] out, int n) {
+    int[] a = new int[8];
+    int witness = -1;
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      try {
+        witness = i * 2 + 1;
+        sum += a[(i & 7) - 1];
+      } catch (ArrayIndexOutOfBoundsException e) {
+        sum += witness;
+      }
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const n = 4000;
+  const a = new Array(8).fill(0);
+  let sum = 0;
+  for (let i = 0; i < n; i++) {
+    const witness = i * 2 + 1;
+    const idx = (i & 7) - 1;
+    if (idx >= 0) sum = (sum + a[idx]) | 0;
+    else sum = (sum + witness) | 0;
+  }
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'StructuredEhLocals', 'drive', '([II)I', [out, n]);
+  t.equal(out[0], sum,
+    'handler observed the local updated in the same block before the throw');
+  const method = await jvm.findMethodInHierarchy('StructuredEhLocals', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st.meta.usedEh, 'EH catch sites were emitted');
+  t.end();
+});
+
+test('compiled athrow rethrow dispatches through nested guest handlers', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredEhThrow', `
+public class StructuredEhThrow {
+  public static int drive(int[] out, int n, RuntimeException boom) {
+    int caught = 0;
+    for (int i = 0; i < n; i++) {
+      try {
+        try {
+          if ((i & 63) == 0) throw boom;
+          caught += 1;
+        } catch (RuntimeException e) {
+          caught += 10;
+          if ((i & 127) == 0) throw e;
+        }
+      } catch (RuntimeException e2) {
+        caught += 100;
+      }
+    }
+    out[0] = caught;
+    return caught;
+  }
+}
+`);
+  const n = 4000;
+  let caught = 0;
+  for (let i = 0; i < n; i++) {
+    if ((i & 63) === 0) caught += (i & 127) === 0 ? 110 : 10;
+    else caught += 1;
+  }
+  caught |= 0;
+  const out = [0];
+  out.type = '[I';
+  const boom = { type: 'java/lang/RuntimeException', fields: {}, hashCode: 991 };
+  await invoke(jvm, thread, 'StructuredEhThrow', 'drive',
+    '([IILjava/lang/RuntimeException;)I', [out, n, boom]);
+  t.equal(out[0], caught, 'throw/rethrow chain matches JS reference');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredEhThrow', 'drive', '([IILjava/lang/RuntimeException;)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  const reasons = [...st.meta.demoteReasons.values()];
+  t.notOk(reasons.includes('live handler range'),
+    `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
   t.end();
 });

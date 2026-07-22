@@ -458,6 +458,12 @@ class MethodTranslator {
       throw new Unsupported(`invoke ${className}.${name}`);
     }
     const calleeMeta = (calleeSt.callee || calleeSt).meta;
+    if (calleeMeta.usedEh) {
+      // An EH module returns -3 with its spill import aimed at the top
+      // frame; a partial-link resume at the throw pc would also re-execute
+      // the throwing op. Never link these — the scheduler runs them.
+      throw new Unsupported(`callee ${className}.${name} has EH sites`);
+    }
     const partial = !calleeMeta.fullyCompiled || calleeMeta.deoptableCalls > 0;
     if (partial && calleeSt.linkVetoed) {
       throw new Unsupported(`partial callee ${className}.${name} vetoed`);
@@ -656,9 +662,10 @@ class MethodTranslator {
         throw NPE(`invoke ${key} on null`);
       }
       const calleeSt = direct || dispatch.get(runtimeClassName(receiver));
-      if (!calleeSt) {
-        // class loaded after compilation: hand the site back to the
-        // interpreter with its operands restored
+      if (!calleeSt || (calleeSt.callee || calleeSt).meta.usedEh) {
+        // class loaded after compilation, or an EH callee (returns -3 with
+        // its spill aimed at the top frame — never nestable): hand the site
+        // back to the interpreter with its operands restored
         if (stats) stats.deopts += 1;
         spillCallerSlots(all);
         callerBox.frame.pc = itemIndex;
@@ -1973,6 +1980,17 @@ class WasmJit {
       throw err;
     }
 
+    if (status === -3) {
+      // EH catch site: a guest exception was thrown at a precise pc inside a
+      // live handler range. The spill import already wrote the locals
+      // reaching the throw and frame.pc; dispatch through the interpreter's
+      // handler search (same-frame handler, or pop-and-propagate).
+      st.exits += 1;
+      const exn = meta.box.pendingException;
+      meta.box.pendingException = null;
+      this.jvm.handleException(exn, meta.box.throwPc, thread);
+      return { handled: true };
+    }
     if (status === -1) {
       thread.callStack.pop();
       if (!nested && meta.retChar !== 'V' && !thread.callStack.isEmpty()) {

@@ -10,13 +10,16 @@
 // linking contract (externalEntry={0}, run(slots.., blk(ignored), fuel)->i32,
 // -1 = returned via box.ret).
 //
-// Coverage mirrors the dispatcher's per-block demotion: blocks intersecting
-// a live (non-no-op) exception-handler range, and blocks whose body or
-// terminator uses an op this backend cannot emit (athrow, monitors,
-// checkcast/instanceof, string/class constants, virtual invokes, `new` of a
-// not-yet-initialized class), become exit stubs — spill the block's reaching slot defs + entry
+// Coverage mirrors the dispatcher's per-block demotion: blocks whose body or
+// terminator uses an op this backend cannot emit (monitors, string/class
+// constants, virtual invokes, `new` of a not-yet-initialized class), become
+// exit stubs — spill the block's reaching slot defs + entry
 // stack and return its item index; the interpreter (and the dispatcher OSR
-// module kept alongside) take over from there. invokestatic binds directly
+// module) take over. Blocks inside live exception-handler ranges compile with
+// wasm try/catch_all around every throwing op (status -3 = guest exception
+// dispatched at a precise pc); athrow compiles as a throwing import. The
+// handler bodies themselves stay interpreter-entered (exception dispatch).
+// invokestatic binds directly
 // to fully-compiled wasm callees. Whole-method rejection remains only for
 // missing/irreducible CFGs, SSA rejection, or a demoted entry block.
 
@@ -57,6 +60,14 @@ const HEAP_STORE = {
   castore: { op: 'i32_store16', shift: 1, t: T.i32 },
   sastore: { op: 'i32_store16', shift: 1, t: T.i32 },
 };
+// Guest throwables are plain objects (or guest instances) carrying a string
+// `type`; host errors (Unsupported, NestedDeopt, TypeError...) are Error
+// instances or lack the tag. The EH catch path must never swallow the latter.
+function isGuestThrow(e) {
+  return e !== null && typeof e === 'object' &&
+    typeof e.type === 'string' && !(e instanceof Error);
+}
+
 const LCONST = { lconst_0: 0n, lconst_1: 1n };
 const FCONST = { fconst_0: 0, fconst_1: 1, fconst_2: 2 };
 const DCONST = { dconst_0: 0, dconst_1: 1 };
@@ -79,14 +90,33 @@ class StructuredWasmCompiler {
     this.importFns = [];
     this.importDecls = [];
     this.importIndexByName = new Map();
-    this.box = { frame: null, ret: undefined };
+    this.box = {
+      frame: null, ret: undefined,
+      // EH protocol: the wrapper below records what an import threw so the
+      // catch_all arm (which cannot inspect the exception) can tell guest
+      // exceptions from host errors, spill, and return -3 — or rethrow.
+      pendingException: null, lastThrown: null, throwPc: -1,
+    };
   }
 
   addImport(name, params, results, fn) {
     if (this.importIndexByName.has(name)) return this.importIndexByName.get(name);
     const idx = this.importDecls.length;
+    let wrapped = fn;
+    if (this.ehMethod) {
+      const box = this.box;
+      wrapped = (...args) => {
+        try {
+          return fn(...args);
+        } catch (e) {
+          box.lastThrown = e;
+          box.pendingException = isGuestThrow(e) ? e : null;
+          throw e;
+        }
+      };
+    }
     this.importDecls.push({ name, params, results });
-    this.importFns.push(fn);
+    this.importFns.push(wrapped);
     this.importIndexByName.set(name, idx);
     return idx;
   }
@@ -149,6 +179,25 @@ class StructuredWasmCompiler {
     this.fn = fn;
     this.cfg = cfg;
     this.items = items;
+    this.originalItems = codeAttr.code.codeItems;
+
+    // Live handler ranges. With EH enabled (default), blocks they cover
+    // compile anyway: every throwing op inside such a method is wrapped in
+    // wasm try/catch_all — a guest exception spills the locals reaching that
+    // op, records the throw pc, and returns status -3 so the interpreter's
+    // handleException dispatches precisely. Without EH (JVM_WASM_EH=0) the
+    // covered blocks demote as before. labelIndex is in EXPANDED item space;
+    // hand liveExceptionRanges a code view whose codeItems match, or handlers
+    // after a splice point read the wrong items and misclassify as live.
+    this.labelIndex = new Map();
+    items.forEach((it, i) => {
+      if (it.labelDef) this.labelIndex.set(it.labelDef.slice(0, -1), i);
+    });
+    this.liveRanges = liveExceptionRanges(
+      this.jvm, { ...codeAttr.code, codeItems: items }, this.labelIndex,
+    );
+    this.ehMethod = process.env.JVM_WASM_EH !== '0' && this.liveRanges.length > 0;
+    this.usedEh = false;
 
     // Guard-miss deopt stubs from inlined instance calls: blocks that exit to
     // the interpreter at the ORIGINAL call site with [recv, args...] rebuilt
@@ -223,27 +272,18 @@ class StructuredWasmCompiler {
       }
     }
 
-    // Per-block demotion: live handler ranges first, then a dry-run of every
-    // tree block's body + terminator — any Unsupported demotes just that
-    // block to an exit stub instead of rejecting the method.
-    const labelIndex = new Map();
-    items.forEach((it, i) => {
-      if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), i);
-    });
+    // Per-block demotion: live handler ranges first (only when EH is off),
+    // then a dry-run of every tree block's body + terminator — any
+    // Unsupported demotes just that block to an exit stub instead of
+    // rejecting the method.
     const treeBlocks = collectTreeBlocks(structured.tree);
     this.demoted = new Map();
-    // labelIndex is in EXPANDED item space; hand liveExceptionRanges a code
-    // view whose codeItems match, or handlers after a splice point read the
-    // wrong items and misclassify as live (spurious demotions).
-    const liveRanges = liveExceptionRanges(
-      this.jvm, { ...codeAttr.code, codeItems: items }, labelIndex,
-    );
-    if (liveRanges.length) {
+    if (this.liveRanges.length && !this.ehMethod) {
       for (const id of treeBlocks) {
         const insns = cfg.blocks[id].insns;
         const s = insns[0];
         const e = insns[insns.length - 1];
-        if (liveRanges.some(([rs, re]) => s < re && e >= rs)) {
+        if (this.liveRanges.some(([rs, re]) => s < re && e >= rs)) {
           this.demoted.set(id, 'live handler range');
         }
       }
@@ -318,6 +358,11 @@ class StructuredWasmCompiler {
       blockCount: cfg.n,
       fullyCompiled: normalFlowFullyCompiled && table.length === 0,
       normalFlowFullyCompiled,
+      // Modules with EH catch sites return -3 (exception pending) and must
+      // never be linked as nested/partial callees: their spill imports write
+      // the top frame, and a partial-link resume would re-execute the
+      // throwing op (double side effects for invokes).
+      usedEh: this.usedEh,
       boxedCount: 0,
       fieldCacheCount: this.fieldCaches.size,
       structured: true,
@@ -610,7 +655,33 @@ class StructuredWasmCompiler {
     const term = this.blockOf(blockId).term;
     if (term.kind !== 'return') return;
     const op = term.insnOp;
-    if (op === 'athrow') throw new Unsupported('athrow');
+    if (op === 'athrow') {
+      // Throw the ref JS-side; it unwinds through the wasm frames. In a
+      // method with live ranges the site is EH-wrapped for a precise pc; in
+      // one without, every table entry is a no-op handler and the stale-pc
+      // unwind through executeTick's catch is the status quo for NPE/AIOOBE
+      // thrown from compiled blocks.
+      const value = term.args[0];
+      if (!value || KIND_T[value.kind] !== T.ref) throw new Unsupported('athrow arg kind');
+      const idx = this.addImport('athrow', [T.ref], [], (ref) => {
+        if (ref === null || ref === undefined) {
+          throw { type: 'java/lang/NullPointerException', message: null };
+        }
+        throw ref;
+      });
+      if (this.ehMethod) {
+        const site = this.ehSiteFor(term.itemIdx);
+        out.push(OP.try, 0x40);
+        out.push(...this.useOf(value), OP.call, ...uleb(idx));
+        out.push(OP.catch_all);
+        this.emitEhCatch(term.slotState, site, out);
+        out.push(OP.end);
+      } else {
+        out.push(...this.useOf(value), OP.call, ...uleb(idx));
+      }
+      out.push(OP.unreachable);
+      return;
+    }
     if (op && op !== 'return') {
       const value = term.args[0];
       const t = KIND_T[value.kind];
@@ -624,8 +695,68 @@ class StructuredWasmCompiler {
   emitBlockBody(blockId, out) {
     const block = this.blockOf(blockId);
     for (const node of block.body) {
-      this.emitNode(node, out);
+      if (this.ehMethod && node.effects && node.effects.mayThrow) {
+        this.emitEhWrapped(node, out);
+      } else {
+        this.emitNode(node, out);
+      }
     }
+  }
+
+  // In a method with live handler ranges every throwing op — covered or not —
+  // must dispatch exceptions with a precise pc: an unwrapped throw would reach
+  // handleException with a stale frame.pc that can falsely match a live range.
+  // try/catch_all is free when nothing throws; on a guest exception the catch
+  // arm spills the locals reaching this op (its wasm locals are all still
+  // live), records the throw pc, and returns -3. Host errors rethrow.
+  emitEhWrapped(node, out) {
+    const site = this.ehSiteFor(node.itemIdx);
+    out.push(OP.try, 0x40);
+    this.emitNode(node, out);
+    out.push(OP.catch_all);
+    this.emitEhCatch(node.slotState, site, out);
+    out.push(OP.end);
+  }
+
+  ehSiteFor(itemIdx) {
+    const orig = this.origIdx ? this.origIdx[itemIdx] : itemIdx;
+    if (orig === undefined || orig < 0) throw new Unsupported('eh site inside inlined code');
+    const item = this.originalItems[orig];
+    const label = item && item.labelDef;
+    if (!label) throw new Unsupported('eh site without label');
+    return { resumeIdx: orig, pc: parseInt(label.slice(1, -1), 10) };
+  }
+
+  emitEhCatch(slotState, site, out) {
+    this.usedEh = true;
+    const box = this.box;
+    out.push(OP.call, ...uleb(this.addImport('eh_pending', [], [T.i32],
+      () => (box.pendingException !== null ? 1 : 0))));
+    out.push(OP.if, 0x40);
+    const spills = [];
+    for (const [slot, value] of slotState || []) {
+      const t = KIND_T[value.kind];
+      if (t === undefined || value.op === 'undef') continue; // dead or conflicted
+      spills.push({ slot, value, t });
+    }
+    const slots = spills.map((s) => s.slot);
+    const { resumeIdx, pc } = site;
+    const idx = this.addImport(
+      `eh_spill_${resumeIdx}`, spills.map((s) => s.t), [],
+      (...values) => {
+        const frame = box.frame;
+        for (let i = 0; i < slots.length; i += 1) frame.locals[slots[i]] = values[i];
+        frame.pc = resumeIdx;
+        box.throwPc = pc;
+      },
+    );
+    for (const { value } of spills) out.push(...this.useOf(value));
+    out.push(OP.call, ...uleb(idx));
+    out.push(OP.i32_const, ...sleb(-3), OP.return);
+    out.push(OP.end);
+    out.push(OP.call, ...uleb(this.addImport('eh_rethrow', [], [],
+      () => { throw box.lastThrown; })));
+    out.push(OP.unreachable);
   }
 
   emitNode(node, out) {
