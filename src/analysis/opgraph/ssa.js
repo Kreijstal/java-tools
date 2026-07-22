@@ -359,7 +359,12 @@ function simulateBlock(context) {
         // Locals reaching a throwing op: an exception handler observes the
         // frame's locals as of the throw, so backends that catch in compiled
         // code need this exact state to spill (operand stack is discarded).
-        if (effect.mayThrow) node.slotState = new Map(locals);
+        if (effect.mayThrow) {
+          node.slotState = new Map(locals);
+          // A call-site deopt resumes the interpreter AT or AFTER the invoke,
+          // which needs the operand stack beneath the call's arguments too.
+          if (op.startsWith('invoke')) node.stackUnder = stack.slice();
+        }
         block.body.push(node);
       }
       continue;
@@ -369,7 +374,10 @@ function simulateBlock(context) {
     annotate(value, blockId, itemIdx, item);
     if (effect.essential || effect.mayThrow) {
       value.effects = { mayThrow: effect.mayThrow };
-      if (effect.mayThrow) value.slotState = new Map(locals);
+      if (effect.mayThrow) {
+        value.slotState = new Map(locals);
+        if (op.startsWith('invoke')) value.stackUnder = stack.slice();
+      }
       block.body.push(value);
     } else {
       block.body.push(value); // pinned order keeps provenance simple in v1
@@ -504,6 +512,7 @@ function pruneTrivialPhis(fn) {
     if (value.slotState) {
       for (const [slot, v] of value.slotState) value.slotState.set(slot, map(v));
     }
+    if (value.stackUnder) value.stackUnder = value.stackUnder.map(map);
   }
   for (const block of fn.blocks) {
     block.phis = block.phis.filter((phi) => !replacements.has(phi));

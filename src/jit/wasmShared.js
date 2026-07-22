@@ -208,6 +208,23 @@ class Unsupported extends Error {
 
 const FUEL = 5_000_000;
 
+// Thrown through wasm frames when a linked partial callee reaches one of its
+// demoted (diagnostic) blocks: carries the interpreter frames to materialize,
+// innermost first. Never visible to guest code — execute() always catches it.
+// Lives here (not WasmJit) so StructuredWasmCompiler can catch it without a
+// circular require.
+class NestedDeopt extends Error {
+  constructor(frames) {
+    // fired on every partial-callee deopt at steady state: skip V8's stack
+    // capture, nothing reads .stack
+    const limit = Error.stackTraceLimit;
+    Error.stackTraceLimit = 0;
+    super('wasm nested deopt');
+    Error.stackTraceLimit = limit;
+    this.frames = frames;
+  }
+}
+
 // Assemble a single-function module exporting `run`. Caller provides the
 // import declarations ({name, params, results}), the main signature, local
 // declarations (wasm types in index order after params) and the body bytes.
@@ -341,6 +358,7 @@ module.exports = {
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   MATH_INTRINSICS,
   Unsupported,
+  NestedDeopt,
   FUEL,
   assembleModule,
   isNoOpExceptionHandler, catchesOnlyCheckedExceptions, liveExceptionRanges,

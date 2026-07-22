@@ -29,7 +29,7 @@ const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
-  Unsupported, sig, assembleModule, liveExceptionRanges,
+  Unsupported, NestedDeopt, sig, assembleModule, liveExceptionRanges,
 } = require('./wasmShared');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
@@ -37,6 +37,7 @@ const {
 } = require('./wasmRuntimeImports');
 const { inlineCalls } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
+const Frame = require('../core/frame');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
 // Linear-heap element access per bytecode op: wasm load/store opcode and the
@@ -63,6 +64,15 @@ const HEAP_STORE = {
 // Guest throwables are plain objects (or guest instances) carrying a string
 // `type`; host errors (Unsupported, NestedDeopt, TypeError...) are Error
 // instances or lack the tag. The EH catch path must never swallow the latter.
+// Placeholder return value while the deopt flag is set; the wasm-side flag
+// check exits before the value is observed.
+function dummyRet(ret) {
+  if (ret === 'V') return undefined;
+  if (ret === 'J') return 0n;
+  if (ret === 'L' || ret === '[') return null;
+  return 0;
+}
+
 function isGuestThrow(e) {
   return e !== null && typeof e === 'object' &&
     typeof e.type === 'string' && !(e instanceof Error);
@@ -96,6 +106,12 @@ class StructuredWasmCompiler {
       // catch_all arm (which cannot inspect the exception) can tell guest
       // exceptions from host errors, spill, and return -3 — or rethrow.
       pendingException: null, lastThrown: null, throwPc: -1,
+      // Call-site deopt protocol: a linked-call import that cannot complete
+      // sets deoptFlag (1 = nothing ran, re-execute the invoke interpreted;
+      // 2 = the callee exited mid-method, resume after the invoke with
+      // pendingFrames materialized above the caller) and returns a dummy;
+      // the wasm code checks the flag right after every deoptable call.
+      deoptFlag: 0, pendingFrames: null,
     };
   }
 
@@ -198,6 +214,10 @@ class StructuredWasmCompiler {
     );
     this.ehMethod = process.env.JVM_WASM_EH !== '0' && this.liveRanges.length > 0;
     this.usedEh = false;
+    // Invoke sites that can hand the call back to the interpreter (partial
+    // or late-bound callees). Keyed by item index: the demotion dry-run
+    // emits each block twice, so a plain counter would double-count.
+    this.deoptableSites = new Set();
 
     // Guard-miss deopt stubs from inlined instance calls: blocks that exit to
     // the interpreter at the ORIGINAL call site with [recv, args...] rebuilt
@@ -363,6 +383,10 @@ class StructuredWasmCompiler {
       // the top frame, and a partial-link resume would re-execute the
       // throwing op (double side effects for invokes).
       usedEh: this.usedEh,
+      // Sites that may exit mid-method through the deopt-flag protocol:
+      // callers must nest this module with a real scratch frame, never the
+      // junk sink (same contract as the dispatcher tier's deoptable calls).
+      deoptableCalls: this.deoptableSites.size,
       boxedCount: 0,
       fieldCacheCount: this.fieldCaches.size,
       structured: true,
@@ -897,9 +921,25 @@ class StructuredWasmCompiler {
       return finish();
     }
 
-    // calls: Math intrinsics, or direct binding to a fully-compiled callee
-    if (op === 'invokestatic') {
-      const call = this.staticCallImport(node);
+    // calls: Math/System intrinsics, direct binding to compiled wasm
+    // callees, and devirtualized instance calls through a closed-world
+    // dispatch map. Sites whose callee can hand the call back (deoptable)
+    // get a flag check + exit stub right after the import call.
+    if (op === 'invokestatic' || op === 'invokevirtual' ||
+        op === 'invokespecial' || op === 'invokeinterface') {
+      const call = op === 'invokestatic'
+        ? this.staticCallImport(node)
+        : this.instanceCallImport(node, op);
+      let site = null;
+      let unders = null;
+      if (call.deoptable) {
+        site = this.ehSiteFor(node.itemIdx); // Unsupported inside inlined code
+        unders = node.stackUnder || [];
+        for (const v of unders) {
+          if (KIND_T[v.kind] === undefined) throw new Unsupported('unkinded call under');
+        }
+        this.deoptableSites.add(node.itemIdx);
+      }
       for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
       out.push(OP.call, ...uleb(call.idx));
       // kill only the caches the callee may transitively write (math/time
@@ -909,7 +949,12 @@ class StructuredWasmCompiler {
       else if (call.writes && call.writes.size) {
         out.push(...this.killSeqWhere((entry) => call.writes.has(entry.killKey)));
       }
-      return finish();
+      if (node.kind !== 'V') {
+        out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+        out.push(...this.cacheKillsFor(node.id));
+      }
+      if (call.deoptable) this.emitCallDeoptCheck(node, site, unders, out);
+      return;
     }
 
     // allocation: pure JS-side imports, no guest code (see wasmRuntimeImports);
@@ -1105,9 +1150,10 @@ class StructuredWasmCompiler {
     ));
   }
 
-  // invokestatic bound directly to another compiled wasm method — the
-  // fully-compiled-only subset of the dispatcher's compiledCallee: no scratch
-  // frames, no NestedDeopt, because a fully-compiled callee cannot exit.
+  // invokestatic bound directly to another compiled wasm method. A callee
+  // that can never exit (fully compiled, no deoptable calls) is called with
+  // a junk frame; any other ready callee takes the scratch-frame nested-call
+  // protocol (runNested) behind a deoptable site.
   staticCallImport(node) {
     const [, className, [name, descriptor]] = node.imm;
     if (className === 'java/lang/Math') return addMathImport(this, { arg: node.imm });
@@ -1120,17 +1166,9 @@ class StructuredWasmCompiler {
       throw new Unsupported(`invoke ${className}.${name} unsupported descriptor`);
     }
     const calleeSt = this.wasmJit &&
-      this.wasmJit.findReadyStatic(className, name, descriptor, false);
+      this.wasmJit.findReadyStatic(className, name, descriptor, true);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
-    if (!linked || !linked.meta.fullyCompiled || linked.meta.boxedCount ||
-        linked.meta.deoptableCalls) {
-      throw new Unsupported(`invoke ${className}.${name}`);
-    }
-    // Structured callers keep locals in wasm and cannot materialize a frame,
-    // so the callee must never deopt. A later recompile may repoint the
-    // state to a module with instance-dispatch sites (which can miss); pin
-    // the link-time pair as the safe fallback.
-    const pinned = { run: linked.run, meta: linked.meta };
+    if (!linked) throw new Unsupported(`invoke ${className}.${name}`);
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
     let slot = 0;
@@ -1138,37 +1176,295 @@ class StructuredWasmCompiler {
     const wParams = params.map(descToWasm);
     const results = ret === 'V' ? [] : [descToWasm(ret)];
     const key = `${className}.${name}${descriptor}`;
-    const junk = { locals: [] }; // spill sink; a fully-compiled callee never exits
-    const fn = (...args) => {
-      const current = calleeSt.callee || calleeSt; // recompiles may repoint it
-      const mod = (current.meta.fullyCompiled && !current.meta.boxedCount &&
-        !current.meta.deoptableCalls) ? current : pinned;
-      const meta = mod.meta;
-      const full = new Array(meta.paramSlots.length + 2);
-      for (let i = 0; i < meta.paramSlots.length; i++) {
-        const p = meta.paramSlots[i];
-        const pos = argPosBySlot.get(p.slot);
-        if (pos !== undefined) full[i] = args[pos];
-        else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
-      }
-      full[meta.paramSlots.length] = 0;
-      full[meta.paramSlots.length + 1] = 100_000_000;
-      const savedFrame = meta.box.frame;
-      meta.box.frame = junk;
-      meta.box.ret = undefined;
-      let status;
-      try {
-        status = mod.run(...full);
-      } finally {
-        meta.box.frame = savedFrame;
-      }
-      if (status !== -1) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
-      return meta.box.ret;
-    };
+    if (linked.meta.fullyCompiled && !linked.meta.boxedCount &&
+        !linked.meta.deoptableCalls) {
+      // Never-exits fast path: no scratch frame, no flag check. A later
+      // recompile may repoint the state to a module with deoptable sites;
+      // pin the link-time pair as the safe fallback.
+      const pinned = { run: linked.run, meta: linked.meta };
+      const junk = { locals: [] }; // spill sink; a fully-compiled callee never exits
+      const fn = (...args) => {
+        const current = calleeSt.callee || calleeSt; // recompiles may repoint it
+        const mod = (current.meta.fullyCompiled && !current.meta.boxedCount &&
+          !current.meta.deoptableCalls) ? current : pinned;
+        const meta = mod.meta;
+        const full = new Array(meta.paramSlots.length + 2);
+        for (let i = 0; i < meta.paramSlots.length; i++) {
+          const p = meta.paramSlots[i];
+          const pos = argPosBySlot.get(p.slot);
+          if (pos !== undefined) full[i] = args[pos];
+          else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
+        }
+        full[meta.paramSlots.length] = 0;
+        full[meta.paramSlots.length + 1] = 100_000_000;
+        const savedFrame = meta.box.frame;
+        meta.box.frame = junk;
+        meta.box.ret = undefined;
+        let status;
+        try {
+          status = mod.run(...full);
+        } finally {
+          meta.box.frame = savedFrame;
+        }
+        if (status !== -1) throw new Error(`wasmjit: nested callee ${key} exited at ${status}`);
+        return meta.box.ret;
+      };
+      return {
+        idx: this.addImport(`call_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+        writes,
+      };
+    }
+    if (linked.meta.usedEh) throw new Unsupported(`EH callee ${key}`);
+    if (calleeSt.linkVetoed) throw new Unsupported(`partial callee ${key} vetoed`);
+    const scratchFrames = new Map();
+    const dummy = dummyRet(ret);
+    const fn = (...args) => this.runNested(
+      calleeSt, className, args, argPosBySlot, scratchFrames, dummy,
+    );
     return {
-      idx: this.addImport(`call_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+      idx: this.addImport(`pcall_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
       writes,
+      deoptable: true,
     };
+  }
+
+  // invokevirtual/invokeinterface/invokespecial bound through a closed-world
+  // dispatch table, mirroring the dispatcher tier's compiledInstanceCallee.
+  // The import selects the target module by the receiver's runtime class; a
+  // map miss (class loaded after compilation) or an EH-compiled target sets
+  // deopt flag 1 so the interpreter re-executes the invoke with full dynamic
+  // dispatch. Targets that can exit run under the scratch-frame protocol.
+  instanceCallImport(node, op) {
+    const [, owner, [name, descriptor]] = node.imm;
+    if (name === '<init>' || name === '<clinit>') {
+      throw new Unsupported(`${op} ${owner}.${name}`);
+    }
+    const { params, ret } = parseMethodDescriptor(descriptor);
+    if (![...params, ret].every((c) => 'IJFDZBCSV[L'.includes(c))) {
+      throw new Unsupported(`invoke ${owner}.${name} unsupported descriptor`);
+    }
+    if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled) {
+      throw new Unsupported('instance linking disabled');
+    }
+    const hierarchy = this.wasmJit.hierarchy;
+    const readyOrThrow = (implClassName) => {
+      const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
+      if (!st) throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`);
+      const m = (st.callee || st).meta;
+      if (m.usedEh) throw new Unsupported(`EH callee ${implClassName}.${name}`);
+      if (st.linkVetoed && !m.fullyCompiled) {
+        throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`);
+      }
+      return st;
+    };
+    let dispatch = null;
+    let direct = null;
+    if (op === 'invokespecial') {
+      const impl = hierarchy.resolveSpecial(this.className, owner, name, descriptor);
+      if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
+      direct = readyOrThrow(impl.className);
+    } else {
+      const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
+      if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
+      if (resolved.impls.size > 4) throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      // Impls that cannot be linked (never-compiling entry, EH module,
+      // vetoed) just drop out of the map: their receivers miss at runtime
+      // and deopt before anything runs, which is always sound. Only a site
+      // with no ready impl at all keeps the demotion status quo.
+      const readyByImpl = new Map();
+      let readyCount = 0;
+      for (const impl of resolved.impls.values()) {
+        let st = null;
+        try {
+          st = readyOrThrow(impl.className);
+        } catch (err) {
+          if (!(err instanceof Unsupported)) throw err;
+        }
+        readyByImpl.set(impl.className, st);
+        if (st) readyCount += 1;
+      }
+      if (!readyCount) throw new Unsupported(`invoke ${owner}.${name} no ready impl`);
+      dispatch = new Map();
+      for (const [runtimeClass, impl] of resolved.targets) {
+        const st = readyByImpl.get(impl.className);
+        if (st) dispatch.set(runtimeClass, st);
+      }
+    }
+    // java arg slot -> position in the wasm arg list (receiver = slot 0)
+    const argPosBySlot = new Map([[0, 0]]);
+    let slot = 1;
+    params.forEach((p, i) => { argPosBySlot.set(slot, i + 1); slot += (p === 'J' || p === 'D') ? 2 : 1; });
+    const wParams = [T.ref, ...params.map(descToWasm)];
+    const results = ret === 'V' ? [] : [descToWasm(ret)];
+    const key = `${owner}.${name}${descriptor}`;
+    const box = this.box;
+    const scratchFrames = new Map();
+    const dummy = dummyRet(ret);
+    const fn = (...args) => {
+      const receiver = args[0];
+      if (receiver === null || receiver === undefined) {
+        throw { type: 'java/lang/NullPointerException', message: null };
+      }
+      const calleeSt = direct || dispatch.get(runtimeClassName(receiver));
+      if (!calleeSt) {
+        box.deoptFlag = 1; // nothing ran: re-execute the invoke interpreted
+        return dummy;
+      }
+      return this.runNested(
+        calleeSt, calleeSt.targetClassName, args, argPosBySlot, scratchFrames, dummy,
+      );
+    };
+    // union of the baked targets' write summaries; a later-loaded receiver
+    // class misses the map and deopts, so it cannot stale these caches
+    let writes = new Set();
+    for (const st of direct ? [direct] : new Set(dispatch.values())) {
+      const sub = this.wasmJit.instanceWriteSummary(st.targetClassName, name, descriptor);
+      if (sub === null) { writes = null; break; }
+      for (const k of sub) writes.add(k);
+    }
+    // invokespecial binds statically: keep its import distinct from a
+    // virtual site sharing the same method key
+    const prefix = op === 'invokespecial' ? 'scall' : 'vcall';
+    return {
+      idx: this.addImport(`${prefix}_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
+      writes,
+      deoptable: true,
+    };
+  }
+
+  // One nested call into a linked callee module for a deoptable site. On a
+  // clean return hands back the callee's value. When the callee cannot be
+  // nested (EH module after a recompile) sets deopt flag 1 without running
+  // anything; when it exits mid-method (or a deeper link deopts) parks the
+  // callee frames on the box innermost-first and sets flag 2. Guest
+  // exceptions from the callee propagate to this module's own wrap.
+  runNested(calleeSt, frameClassName, javaArgs, argPosBySlot, scratchFrames, dummy) {
+    const box = this.box;
+    const calleeMod = calleeSt.callee || calleeSt;
+    const meta = calleeMod.meta;
+    if (meta.usedEh) {
+      // a -3 exit would aim its spill at the top frame — never nestable
+      box.deoptFlag = 1;
+      return dummy;
+    }
+    const partial = !meta.fullyCompiled || meta.boxedCount > 0 || meta.deoptableCalls > 0;
+    const full = new Array(meta.paramSlots.length + 2);
+    for (let i = 0; i < meta.paramSlots.length; i += 1) {
+      const p = meta.paramSlots[i];
+      const pos = argPosBySlot.get(p.slot);
+      if (pos !== undefined) full[i] = javaArgs[pos];
+      else full[i] = p.t === T.i64 ? 0n : (p.t === T.ref ? null : 0);
+    }
+    full[meta.paramSlots.length] = 0;
+    full[meta.paramSlots.length + 1] = 100_000_000;
+    const savedFrame = meta.box.frame;
+    let frame;
+    if (partial) {
+      calleeSt.nestedCalls = (calleeSt.nestedCalls || 0) + 1;
+      const scratch = scratchFrames.get(calleeSt);
+      if (scratch && !scratch.inUse) {
+        frame = scratch;
+        frame.pc = 0;
+      } else {
+        frame = new Frame(calleeSt.method);
+        frame.className = frameClassName;
+        if (!scratch) scratchFrames.set(calleeSt, frame);
+      }
+      frame.inUse = true;
+    } else {
+      frame = { locals: [] }; // junk sink; this callee never exits
+    }
+    meta.box.frame = frame;
+    meta.box.ret = undefined;
+    let status;
+    try {
+      status = calleeMod.run(...full);
+    } catch (err) {
+      if (partial && err instanceof NestedDeopt) {
+        err.frames.push(frame);
+        if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+        box.pendingFrames = err.frames;
+        box.deoptFlag = 2;
+        return dummy;
+      }
+      throw err;
+    } finally {
+      if (partial) frame.inUse = false;
+      meta.box.frame = savedFrame;
+    }
+    if (status !== -1) {
+      if (!partial) throw new Error(`wasmjit: nested callee exited at ${status}`);
+      frame.pc = status;
+      if (frame === scratchFrames.get(calleeSt)) scratchFrames.delete(calleeSt);
+      // the callee's own call-site deopt may have parked deeper frames
+      const deeper = meta.box.pendingFrames;
+      meta.box.pendingFrames = null;
+      box.pendingFrames = deeper ? [...deeper, frame] : [frame];
+      box.deoptFlag = 2;
+      calleeSt.nestedDeopts = (calleeSt.nestedDeopts || 0) + 1;
+      return dummy;
+    }
+    return meta.box.ret;
+  }
+
+  // Wasm-side check right after a deoptable call: read-and-clear the box
+  // flag; 1 = re-execute the invoke interpreted (push unders + operands),
+  // 2 = the callee exited mid-method (push unders only; the parked callee
+  // frames finish first and the interpreter's return push delivers the
+  // result), resuming after the invoke.
+  emitCallDeoptCheck(node, site, unders, out) {
+    const box = this.box;
+    const flagIdx = this.addImport('call_deopt_flag', [], [T.i32], () => {
+      const f = box.deoptFlag;
+      box.deoptFlag = 0;
+      return f;
+    });
+    const tmp = this.nextLocal++;
+    this.declared.push(T.i32);
+    out.push(OP.call, ...uleb(flagIdx), OP.local_tee, ...uleb(tmp));
+    out.push(OP.if, 0x40);
+    out.push(OP.local_get, ...uleb(tmp), OP.i32_const, ...sleb(1), OP.i32_eq);
+    out.push(OP.if, 0x40);
+    this.emitCallExitStub(node, site, unders, true, out);
+    out.push(OP.end);
+    this.emitCallExitStub(node, site, unders, false, out);
+    out.push(OP.end);
+  }
+
+  emitCallExitStub(node, site, unders, reexecute, out) {
+    // locals as of the call, from the SSA snapshot (same filter as EH spill)
+    const spills = [];
+    for (const [slot, value] of node.slotState || []) {
+      const t = KIND_T[value.kind];
+      if (t === undefined || value.op === 'undef') continue; // dead or conflicted
+      spills.push({ slot, value, t });
+    }
+    if (spills.length) {
+      const slots = spills.map((s) => s.slot);
+      const box = this.box;
+      const idx = this.addImport(
+        `call_spill_${site.resumeIdx}`, spills.map((s) => s.t), [],
+        (...values) => {
+          const locals = box.frame.locals;
+          for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
+        },
+      );
+      for (const { value } of spills) out.push(...this.useOf(value));
+      out.push(OP.call, ...uleb(idx));
+    }
+    // interpreter operand stack, bottom-up: values under the call's args,
+    // then — only when the invoke re-executes — the operands themselves
+    for (const value of unders) {
+      out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, KIND_T[value.kind])));
+    }
+    if (reexecute) {
+      for (const value of node.args) {
+        const t = KIND_T[value.kind];
+        if (t === undefined) throw new Unsupported('unkinded call operand');
+        out.push(...this.useOf(value), OP.call, ...uleb(pushImportFor(this, t)));
+      }
+    }
+    out.push(OP.i32_const, ...sleb(reexecute ? site.resumeIdx : site.resumeIdx + 1), OP.return);
   }
 
   constSeq(op, node) {

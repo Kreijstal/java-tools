@@ -78,25 +78,11 @@ const {
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   MATH_INTRINSICS,
   Unsupported,
+  NestedDeopt,
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
-
-// Thrown through wasm frames when a linked partial callee reaches one of its
-// demoted (diagnostic) blocks: carries the interpreter frames to materialize,
-// innermost first. Never visible to guest code — execute() always catches it.
-class NestedDeopt extends Error {
-  constructor(frames) {
-    // fired on every partial-callee deopt at steady state: skip V8's stack
-    // capture, nothing reads .stack
-    const limit = Error.stackTraceLimit;
-    Error.stackTraceLimit = 0;
-    super('wasm nested deopt');
-    Error.stackTraceLimit = limit;
-    this.frames = frames;
-  }
-}
 
 const EMPTY_WRITE_SET = new Set();
 
@@ -558,7 +544,11 @@ class MethodTranslator {
             calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
           calleeSt.linkVetoed = true;
         }
-        throw new NestedDeopt([frame]);
+        // a structured callee's own call-site deopt parks deeper frames on
+        // its box; they sit below the callee frame, innermost first
+        const deeper = meta.box.pendingFrames;
+        meta.box.pendingFrames = null;
+        throw new NestedDeopt(deeper ? [...deeper, frame] : [frame]);
       }
       return meta.box.ret;
     };
@@ -737,7 +727,11 @@ class MethodTranslator {
             calleeSt.nestedDeopts * 4 > calleeSt.nestedCalls) {
           calleeSt.linkVetoed = true;
         }
-        throw new NestedDeopt([frame]);
+        // a structured callee's own call-site deopt parks deeper frames on
+        // its box; they sit below the callee frame, innermost first
+        const deeper = meta.box.pendingFrames;
+        meta.box.pendingFrames = null;
+        throw new NestedDeopt(deeper ? [...deeper, frame] : [frame]);
       }
       return meta.box.ret;
     };
@@ -2002,6 +1996,14 @@ class WasmJit {
     st.exits += 1;
     if (status === frame.pc) st.fuelExits += 1; // fuel exit at entry pc is possible but rare
     frame.pc = status;
+    // A structured call-site deopt exits with the nested callee's frames
+    // parked on the box (innermost first): materialize them above this frame
+    // so the interpreter finishes the callee before resuming here.
+    const pending = meta.box.pendingFrames;
+    if (pending) {
+      meta.box.pendingFrames = null;
+      for (let i = pending.length - 1; i >= 0; i--) thread.callStack.push(pending[i]);
+    }
     // Exit storms usually mean a loop keeps leaving wasm for an invoke whose
     // callee wasn't compiled yet — recompile to bind callees that are now
     // ready. Do NOT trigger earlier or on exit rate: eager schedules measured

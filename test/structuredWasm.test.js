@@ -608,3 +608,143 @@ public class StructuredEhThrow {
     `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
   t.end();
 });
+
+test('structured tier compiles instance calls through linked callees', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredVCall', `
+public class StructuredVCall {
+  int acc;
+  int step(int i) { return (i & 7) + 1; }
+  private int twice(int i) { return i + i; }
+  public int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum += step(i);
+      sum += twice(i & 3);
+    }
+    acc = sum;
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const n = 64;
+  let ref = 0;
+  for (let i = 0; i < n; i++) {
+    ref = (ref + ((i & 7) + 1)) | 0;
+    ref = (ref + 2 * (i & 3)) | 0;
+  }
+  const out = [0];
+  out.type = '[I';
+  const recv = { type: 'StructuredVCall', fields: {}, hashCode: 7 };
+  for (let k = 0; k < 300; k++) {
+    out[0] = 0;
+    await invoke(jvm, thread, 'StructuredVCall', 'drive', '([II)I', [recv, out, n]);
+    t.assert(out[0] === ref, `call ${k} matches`);
+    if (out[0] !== ref) break;
+  }
+  t.ok(structuredKeys(jvm).includes('StructuredVCall.drive([II)I'),
+    'caller compiled by the structured backend');
+  const method = await jvm.findMethodInHierarchy('StructuredVCall', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  const reasons = [...st.meta.demoteReasons.values()];
+  t.notOk(reasons.some((r) => r.includes('invoke')),
+    `no invoke demotions (${reasons.join(', ') || 'none'})`);
+  t.ok(st.runs > 0, 'structured module executed');
+  t.end();
+});
+
+test('structured call-site deopt resumes the interpreter mid-expression', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredPCall', `
+public class StructuredPCall {
+  static int shim(int i) {
+    if ((i & 63) == 63) return "abc".length() + i;
+    return i * 3;
+  }
+  int pick(int i) {
+    if ((i & 127) == 127) return "x".length() + i;
+    return (i & 7) + 1;
+  }
+  public int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum += i + shim(i);
+      sum += pick(i);
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const n = 128;
+  let ref = 0;
+  for (let i = 0; i < n; i++) {
+    ref = (ref + i + ((i & 63) === 63 ? 3 + i : i * 3)) | 0;
+    ref = (ref + ((i & 127) === 127 ? 1 + i : (i & 7) + 1)) | 0;
+  }
+  const out = [0];
+  out.type = '[I';
+  const recv = { type: 'StructuredPCall', fields: {}, hashCode: 9 };
+  let mismatches = 0;
+  for (let k = 0; k < 300; k++) {
+    out[0] = 0;
+    await invoke(jvm, thread, 'StructuredPCall', 'drive', '([II)I', [recv, out, n]);
+    if (out[0] !== ref) mismatches += 1;
+  }
+  t.equal(mismatches, 0, 'every call matches the JS reference');
+  const method = await jvm.findMethodInHierarchy('StructuredPCall', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  const reasons = [...st.meta.demoteReasons.values()];
+  t.notOk(reasons.some((r) => r.includes('invoke')),
+    `no invoke demotions in the caller (${reasons.join(', ') || 'none'})`);
+  const shim = await jvm.findMethodInHierarchy('StructuredPCall', 'shim', '(I)I');
+  const shimSt = jvm.jit.wasmJit.state.get(shim);
+  t.ok(shimSt && shimSt.nestedCalls > 0, 'static callee ran nested');
+  t.ok(shimSt && shimSt.nestedDeopts > 0, 'mid-method callee exit took the deopt path');
+  const pick = await jvm.findMethodInHierarchy('StructuredPCall', 'pick', '(I)I');
+  const pickSt = jvm.jit.wasmJit.state.get(pick);
+  t.ok(pickSt && pickSt.nestedCalls > 0, 'instance callee ran nested');
+  t.end();
+});
+
+test('guest exception from a nested callee dispatches through caller EH', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredVCallEh', `
+public class StructuredVCallEh {
+  int[] tab;
+  int pick(int i) { return tab[(i & 15) - 1]; }
+  public int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      try { sum += pick(i); } catch (ArrayIndexOutOfBoundsException e) { sum += 7; }
+    }
+    out[0] = sum;
+    return sum;
+  }
+}
+`);
+  const tab = [];
+  tab.type = '[I';
+  for (let j = 0; j < 15; j++) tab.push(j * j);
+  const n = 64;
+  let ref = 0;
+  for (let i = 0; i < n; i++) {
+    ref = (ref + ((i & 15) === 0 ? 7 : tab[(i & 15) - 1])) | 0;
+  }
+  const out = [0];
+  out.type = '[I';
+  const recv = { type: 'StructuredVCallEh', fields: { 'StructuredVCallEh.tab': tab }, hashCode: 11 };
+  let mismatches = 0;
+  for (let k = 0; k < 300; k++) {
+    out[0] = 0;
+    await invoke(jvm, thread, 'StructuredVCallEh', 'drive', '([II)I', [recv, out, n]);
+    if (out[0] !== ref) mismatches += 1;
+  }
+  t.equal(mismatches, 0, 'every call matches the JS reference');
+  const method = await jvm.findMethodInHierarchy('StructuredVCallEh', 'drive', '([II)I');
+  const st = jvm.jit.wasmJit.state.get(method);
+  t.ok(st.meta.usedEh, 'caller compiled with EH catch sites');
+  const reasons = [...st.meta.demoteReasons.values()];
+  t.notOk(reasons.some((r) => r.includes('invoke')),
+    `no invoke demotions in the caller (${reasons.join(', ') || 'none'})`);
+  t.ok(st.runs > 0, 'structured module executed');
+  t.end();
+});
