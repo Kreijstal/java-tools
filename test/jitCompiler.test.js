@@ -2557,11 +2557,16 @@ public class WasmReporterHarness {
     'forward-only diagnostic formatting does not poison the protected loop');
   t.equal(compiled.get('WasmReporterHarness.compute([ILjava/lang/String;)V').exits, 0,
     'successful protected loop remains in wasm');
-  const recover = await jvm.findMethodInHierarchy('WasmReporterHarness', 'recover', '([I)V');
-  const recoverFrame = new Frame(recover);
-  recoverFrame.className = 'WasmReporterHarness';
-  t.equal(jvm.jit.wasmJit.prepare(recoverFrame), null,
-    'a handler that writes a recovery value remains interpreted');
+  // Dispatcher-tier EH now compiles live handler ranges, so the recovery
+  // handler runs in wasm; verify the out-of-bounds path still recovers.
+  const recovered = [10, 20, 30];
+  recovered.type = '[I';
+  await invoke(jvm, thread, 'WasmReporterHarness', 'recover', '([I)V', [recovered]);
+  t.deepEqual(recovered.slice(0, 3), [42, 21, 31],
+    'a handler that writes a recovery value dispatches to the compiled handler');
+  const compiledAfter = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiledAfter.has('WasmReporterHarness.recover([I)V'),
+    'recovery handler compiles under dispatcher EH');
   t.end();
 });
 
@@ -2723,11 +2728,16 @@ public class WasmCheckedHandlerHarness {
   t.ok(compiled.has('WasmCheckedHandlerHarness.checked([IZ)V'),
     'checked-exception protection does not poison the numeric loop');
 
-  const broad = await jvm.findMethodInHierarchy('WasmCheckedHandlerHarness', 'broad', '([I)V');
-  const broadFrame = new Frame(broad);
-  broadFrame.className = 'WasmCheckedHandlerHarness';
-  t.equal(jvm.jit.wasmJit.prepare(broadFrame), null,
-    'broad Exception recovery remains interpreted');
+  // Dispatcher-tier EH compiles the broad-catch recovery range too; verify
+  // the out-of-bounds path still reaches its handler and writes the marker.
+  const recovered = [5, 6, 7];
+  recovered.type = '[I';
+  await invoke(jvm, thread, 'WasmCheckedHandlerHarness', 'broad', '([I)V', [recovered]);
+  t.deepEqual(recovered.slice(0, 3), [99, 7, 8],
+    'broad Exception recovery dispatches to the compiled handler');
+  const compiledBroad = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
+  t.ok(compiledBroad.has('WasmCheckedHandlerHarness.broad([I)V'),
+    'broad-catch recovery handler compiles under dispatcher EH');
   t.end();
 });
 

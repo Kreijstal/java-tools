@@ -945,6 +945,7 @@ class MethodTranslator {
 
   translate() {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
+    const excTable = codeAttr.code.exceptionTable || [];
     const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, this.labelIndex);
     // EH (mirrors the structured tier): one try/catch_all around the whole
     // dispatcher loop plus a per-block current-pc local. Must be decided
@@ -974,6 +975,12 @@ class MethodTranslator {
       for (const [rs, re] of liveRanges) {
         leaders.add(rs);
         if (re < this.items.length) leaders.add(re);
+      }
+      // handler entries become blocks so the catch arm can dispatch to them
+      // in-module (their entry stack is seeded [exn] below)
+      for (const e of excTable) {
+        const idx = this.labelIndex.get(`L${e.handler_pc}`);
+        if (idx !== undefined) leaders.add(idx);
       }
     }
     this.blockStarts = [...leaders].sort((a, b) => a - b);
@@ -1032,6 +1039,19 @@ class MethodTranslator {
     // (dead code, handler-only targets) are assumed empty. Emitted code and
     // local allocations from this pass are discarded.
     this.entryStacks = new Map([[0, []]]);
+    if (this.ehMethod) {
+      // JVM handler semantics: operand stack discarded, [exception] pushed.
+      // Seed handler blocks with a single ref so both passes compile them
+      // against the real entry shape; the catch arm below fills the depth-0
+      // ref carry local before re-dispatching.
+      for (const e of excTable) {
+        const idx = this.labelIndex.get(`L${e.handler_pc}`);
+        const hb = idx !== undefined ? this.blockOfItem.get(idx) : undefined;
+        if (hb !== undefined && hb !== 0 && !this.entryStacks.has(hb)) {
+          this.entryStacks.set(hb, [T.ref]);
+        }
+      }
+    }
     this.dryRun = true;
     {
       const savedNextLocal = this.nextLocal;
@@ -1113,11 +1133,13 @@ class MethodTranslator {
     // function body: dispatcher loop (fuel is checked per block prologue)
     const body = [];
     if (this.ehMethod) {
-      // Every block prologue stamps its start pc into curPcLocal; the single
-      // try/catch_all around the dispatcher loop then dispatches any guest
-      // exception at that pc via status -3 (slot locals are continuously
-      // live in this tier, so the catch arm's spill sees throw-point state;
-      // boxed slots live in frame.locals already and must not be spilled).
+      // Every block prologue stamps its start pc into curPcLocal; the
+      // try/catch_all INSIDE the dispatcher loop then dispatches any guest
+      // exception at that pc — to a compiled handler block by re-entering
+      // the br_table (the throw→handler→continue cycle never leaves wasm),
+      // or to the interpreter via -3 (slot locals are continuously live in
+      // this tier, so the spill sees throw-point state; boxed slots live in
+      // frame.locals already and must not be spilled).
       this.curPcLocal = this.nextLocal++;
       this.declared.push(T.i32);
       for (let b = 0; b < N; b++) {
@@ -1127,9 +1149,9 @@ class MethodTranslator {
           ...blockBodies[b],
         ];
       }
-      body.push(OP.try, 0x40);
     }
     body.push(OP.loop, 0x40);
+    if (this.ehMethod) body.push(OP.try, 0x40);
     for (let i = 0; i < N; i++) body.push(OP.block, 0x40);
     body.push(OP.local_get, ...uleb(this.blkLocal));
     body.push(OP.br_table, ...uleb(N));
@@ -1139,14 +1161,53 @@ class MethodTranslator {
       body.push(OP.end);
       body.push(...blockBodies[b]);
     }
-    body.push(OP.end);          // loop
-    body.push(OP.unreachable);  // all paths return explicitly
     if (this.ehMethod) {
       const box = this.box;
+      const jvm = this.jvm;
+      // First-matching table entry decides, exactly like the interpreter's
+      // search; blk is -1 when that handler block did not compile, which
+      // falls back to the precise -3 interpreter dispatch (never falls
+      // through to a LATER entry — order is observable).
+      const ehTargets = excTable.map((e) => {
+        const idx = this.labelIndex.get(`L${e.handler_pc}`);
+        const hb = idx !== undefined ? this.blockOfItem.get(idx) : undefined;
+        return {
+          start_pc: e.start_pc, end_pc: e.end_pc, catch_type: e.catch_type,
+          blk: hb !== undefined && this.supportedBlocks.has(hb) ? hb : -1,
+        };
+      });
+      const ehTargetIdx = this.addImport('eh_target', [T.i32], [T.i32], (pc) => {
+        const exn = box.pendingException;
+        for (const e of ehTargets) {
+          if (pc >= e.start_pc && pc < e.end_pc &&
+              (e.catch_type === 'any' || jvm.isInstanceOf(exn.type, e.catch_type))) {
+            return e.blk;
+          }
+        }
+        return -1;
+      });
+      const ehTakeIdx = this.addImport('eh_take', [], [T.ref], () => {
+        const e = box.pendingException;
+        box.pendingException = null;
+        return e;
+      });
+      const ehTgt = this.nextLocal++;
+      this.declared.push(T.i32);
       body.push(OP.catch_all);
       body.push(OP.call, ...uleb(this.addImport('eh_pending', [], [T.i32],
         () => (box.pendingException !== null ? 1 : 0))));
       body.push(OP.if, 0x40);
+      body.push(OP.local_get, ...uleb(this.curPcLocal));
+      body.push(OP.call, ...uleb(ehTargetIdx));
+      body.push(OP.local_tee, ...uleb(ehTgt), OP.i32_const, ...sleb(0), OP.i32_ge_s);
+      body.push(OP.if, 0x40);
+      // in-module dispatch: exception into the depth-0 ref carry (the
+      // handler block's seeded entry stack), target into blk, loop again
+      body.push(OP.call, ...uleb(ehTakeIdx));
+      body.push(OP.local_set, ...uleb(this.stackLocalFor(0, T.ref)));
+      body.push(OP.local_get, ...uleb(ehTgt), OP.local_set, ...uleb(this.blkLocal));
+      body.push(OP.br, ...uleb(3)); // 0=this if, 1=outer if, 2=try, 3=loop
+      body.push(OP.end);
       body.push(...this.spillSeq());
       body.push(OP.local_get, ...uleb(this.curPcLocal));
       body.push(OP.call, ...uleb(this.addImport('eh_pc', [T.i32], [],
@@ -1159,6 +1220,8 @@ class MethodTranslator {
       body.push(OP.end);        // try
       body.push(OP.unreachable);
     }
+    body.push(OP.end);          // loop
+    body.push(OP.unreachable);  // all paths return explicitly
     body.push(OP.end);          // function
 
     return this.assemble(body);
@@ -1290,7 +1353,8 @@ class MethodTranslator {
   compileBlock(b, N) {
     const from = this.blockStarts[b];
     const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
-    const depthToTop = N - 1 - b;
+    // under EH a `try` sits between the loop label and the block nest
+    const depthToTop = N - 1 - b + (this.ehMethod ? 1 : 0);
     const code = [];
     const stack = (this.entryStacks.get(b) || []).slice(); // wasm types, bottom-up
     // provenance: which local slot (if any) a stacked value was loaded from —

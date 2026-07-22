@@ -790,7 +790,10 @@ public class DispatchEh {
   t.notOk(reasons.includes('live handler range'),
     `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
   t.ok(st.meta.usedEh, 'module carries the EH flag');
-  t.ok(st.exits > 0, 'EH -3 exits were taken (handler dispatched from wasm)');
+  // ~2000 of the 4000 iterations throw; in-module handler dispatch keeps
+  // them inside wasm, so exits stay far below the throw count
+  t.ok(st.exits < 100,
+    `throws dispatch to the compiled handler in-module (exits=${st.exits})`);
   t.end();
 });
 
