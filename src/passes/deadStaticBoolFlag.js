@@ -283,8 +283,8 @@ function eliminateInMethod(code, opts) {
 
   // Walk and rewrite. We collect rewrites first (avoid reindexing during scan)
   // and apply in descending order.
-  const rewrites = []; // { iloadIdx, ifIdx, ifKind, target, ifLabelDef }
-  const directRewrites = []; // { loadIdx, ifIdx, ifKind, target }
+  const rewrites = []; // { iloadIdx, ifIdx, ifKind, target, preserveStackBoundary }
+  const directRewrites = []; // { loadIdx, ifIdx, ifKind, target, preserveStackBoundary }
   for (let i = 0; i < codeItems.length; i += 1) {
     const item = codeItems[i];
     if (!item || !item.instruction) continue;
@@ -305,7 +305,13 @@ function eliminateInMethod(code, opts) {
           const nextOp = getOp(codeItems[j] && codeItems[j].instruction);
           const target = getArg(codeItems[j] && codeItems[j].instruction);
           if ((nextOp === 'ifeq' || nextOp === 'ifne') && typeof target === 'string') {
-            directRewrites.push({ loadIdx: i, ifIdx: j, ifKind: nextOp, target });
+            directRewrites.push({
+              loadIdx: i,
+              ifIdx: j,
+              ifKind: nextOp,
+              target,
+              preserveStackBoundary: followedByOperandControlBranch(codeItems, j),
+            });
           }
         }
       }
@@ -335,7 +341,13 @@ function eliminateInMethod(code, opts) {
     if (!bindingRange) continue;
     if (bindingRange.validUntil < codeItems.length && Array.isArray(code.exceptionTable) && code.exceptionTable.length > 0) continue;
     if (!labelReferencesStayInsideRange(codeItems, item.labelDef, bindingRange.istoreIdx, bindingRange.validUntil)) continue;
-    rewrites.push({ iloadIdx: i, ifIdx: j, ifKind: nop, target });
+    rewrites.push({
+      iloadIdx: i,
+      ifIdx: j,
+      ifKind: nop,
+      target,
+      preserveStackBoundary: followedByOperandControlBranch(codeItems, j),
+    });
   }
 
   if (rewrites.length === 0 && directRewrites.length === 0) return 0;
@@ -351,7 +363,7 @@ function eliminateInMethod(code, opts) {
   for (const r of rewrites) {
     const iloadItem = codeItems[r.iloadIdx];
     const ifItem = codeItems[r.ifIdx];
-    if (opts.preserveBranchShape) {
+    if (opts.preserveBranchShape || r.preserveStackBoundary) {
       iloadItem.instruction = 'iconst_0';
       continue;
     }
@@ -370,7 +382,7 @@ function eliminateInMethod(code, opts) {
   for (const r of directRewrites) {
     const loadItem = codeItems[r.loadIdx];
     const ifItem = codeItems[r.ifIdx];
-    if (opts.preserveBranchShape) {
+    if (opts.preserveBranchShape || r.preserveStackBoundary) {
       loadItem.instruction = 'iconst_0';
       continue;
     }
@@ -398,6 +410,21 @@ function eliminateInMethod(code, opts) {
     console.log(`  [dead-flag] ${opts.owner}.${opts.name}${opts.desc}: eliminated ${rewrites.length + directRewrites.length} dead conditional(s) from ${bindingRanges.length} sentinel binding(s)`);
   }
   return rewrites.length + directRewrites.length;
+}
+
+function followedByOperandControlBranch(codeItems, branchIndex) {
+  for (let i = branchIndex + 1; i < codeItems.length; i += 1) {
+    const instruction = codeItems[i] && codeItems[i].instruction;
+    if (!instruction) continue;
+    const nextOp = getOp(instruction);
+    // Two adjacent operand-consuming control branches mean the dead flag sits
+    // above an older value on the JVM operand stack. Although deleting
+    // `load; if*` is stack-neutral by itself, exposing that older value to CFG
+    // rewriting lets later branch-threading mistake the second branch for the
+    // first branch's condition. Retain the known-zero branch boundary.
+    return /^if/.test(nextOp || '') || nextOp === 'tableswitch' || nextOp === 'lookupswitch';
+  }
+  return false;
 }
 
 function methodMatchesPreserveBranchShapeGate(code, method, options = {}) {

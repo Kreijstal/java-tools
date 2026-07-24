@@ -38,6 +38,46 @@ function decompileFixture(tempDir, name, source) {
   return decompileClassFile(classPath);
 }
 
+const REFERENCE_JOIN_JASMIN = `.version 52 0
+.class public super ReferenceJoin
+.super java/lang/Object
+
+.method public static eventOrObject : (Ljava/lang/Object;Ljava/awt/EventQueue;Z)Z
+    .code stack 3 locals 3
+        aconst_null
+        aload_1
+        invokevirtual Method java/awt/EventQueue peekEvent ()Ljava/awt/AWTEvent;
+        iload_2
+        ifne Ljoin
+        if_acmpeq Lobject
+        goto Lobject
+Lobject:
+        aconst_null
+        aload_0
+Ljoin:  if_acmpne Ldifferent
+        iconst_0
+        ireturn
+Ldifferent:
+        iconst_1
+        ireturn
+    .end code
+.end method
+.end class
+`;
+
+test('CFR-JS keeps a concrete Object path broad at an operand-stack join', (t) => {
+  t.plan(3);
+  withTempDir('cfr-reference-join-', (tempDir) => {
+    const source = decompileFixture(tempDir, 'ReferenceJoin', REFERENCE_JOIN_JASMIN);
+    t.ok(/Object stackIn_\d+_1/.test(source) || /param0/.test(source),
+      'the Object path remains present in the joined comparison');
+    t.notOk(/\(java\.awt\.AWTEvent\)\s*\([^;]*param0/.test(source),
+      'the Object parameter is not narrowed to the sibling path type');
+    t.ok(/stackIn_\d+_0 != stackIn_\d+_1/.test(source) || /null [!=]= param0/.test(source),
+      'the joined references remain directly comparable');
+  });
+});
+
 const SHARED_HANDLER_JOIN_JASMIN = `.version 52 0
 .class public super SharedHandlerJoin
 .super java/lang/Object

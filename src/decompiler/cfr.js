@@ -1150,7 +1150,10 @@ function formatMethod(cls, method, options = {}) {
   }
 
   const diagnosticsMark = Array.isArray(options.diagnostics) ? options.diagnostics.length : 0;
-  let decompiledBody = decompileCode(code, method, cls, localState, options);
+  let decompiledBody = decompileCode(code, method, cls, localState, {
+    ...options,
+    plainRefSlots: null,
+  });
   // Per-type local splitting binds each load to the variant of the textually
   // preceding store, which is wrong when differently-typed stores merge at a
   // control-flow join (the untouched variants read as null). Re-emit with the
@@ -1163,7 +1166,10 @@ function formatMethod(cls, method, options = {}) {
     const retryState = makeLocalState(params.map(simplifyType), isStatic, code, new Set(collapsedSlots),
       options.exceptionModel, options);
     if (Array.isArray(options.diagnostics)) options.diagnostics.length = diagnosticsMark;
-    const retryBody = decompileCode(code, method, cls, retryState, options);
+    const retryBody = decompileCode(code, method, cls, retryState, {
+      ...options,
+      plainRefSlots: new Set(collapsedSlots),
+    });
     if (!retryBody) break;
     decompiledBody = retryBody;
     localState = retryState;
@@ -1173,23 +1179,29 @@ function formatMethod(cls, method, options = {}) {
   if (process.env.CFR_JS_DEBUG_LOCALS === '1') {
     console.error('[cfr-body-before-locals]', JSON.stringify(body));
   }
-  removeImpossibleCheckedCatchBlocks(body, options.exceptionModel, code);
-  ensureCheckedCatchReachability(body, code, options.exceptionModel);
+  const hasPartitionedState = body.some((line) =>
+    String(line).trim() === 'class $CfrPartitionedState {');
+  if (!hasPartitionedState) {
+    removeImpossibleCheckedCatchBlocks(body, options.exceptionModel, code);
+    ensureCheckedCatchReachability(body, code, options.exceptionModel);
+  }
   const constructorInvocation = method.name === '<init>'
     ? localState.takeConstructorInvocation()
     : null;
   const constructorCall = constructorInvocation && !isEnumConstructor
     ? `${constructorInvocation.target}(${constructorInvocation.args.join(', ')});`
     : null;
-  rewriteDuplicateLocalDeclarations(body);
-  hoistEscapingLocalDeclarations(body, localState);
-  const missingDeclarations = localState.missingDeclarations(body);
-  if (missingDeclarations.length) body.unshift(...missingDeclarations);
-  const refinedBody = refineObjectLocalDeclarations(body, (name) => localState.refinedTypeForName(name));
-  const normalizedBody = normalizeSyntheticVariableScopes(refinedBody);
-  replaceArrayContents(body, normalizedBody);
-  ensureMissingSyntheticDeclarations(body);
-  widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
+  if (!hasPartitionedState) {
+    rewriteDuplicateLocalDeclarations(body);
+    hoistEscapingLocalDeclarations(body, localState);
+    const missingDeclarations = localState.missingDeclarations(body);
+    if (missingDeclarations.length) body.unshift(...missingDeclarations);
+    const refinedBody = refineObjectLocalDeclarations(body, (name) => localState.refinedTypeForName(name));
+    const normalizedBody = normalizeSyntheticVariableScopes(refinedBody);
+    replaceArrayContents(body, normalizedBody);
+    ensureMissingSyntheticDeclarations(body);
+    widenExceptionLocalsUsedByInstanceof(body, options.exceptionModel);
+  }
   const needsUncheckedExceptionBoundary = methodThrowsTypes(method).length === 0
     && methodCallsUncaughtCheckedException(code, method, options.exceptionModel);
   if (profileMethod) console.error(`[cfr-method-normalized] ${Date.now() - methodProfileStarted}ms ${cls.className}.${method.name}${method.descriptor}`);
@@ -2796,8 +2808,10 @@ function normalizeSyntheticVariableScopes(lines) {
 function refineObjectLocalDeclarations(lines, resolveType) {
   if (typeof resolveType !== 'function') return lines;
   const declaredTypes = new Map();
+  const allDeclaredTypes = new Map();
   for (const raw of lines || []) {
     for (const declaration of localDeclarationsFromStatement(String(raw))) {
+      allDeclaredTypes.set(declaration.name, declaration.type);
       if (!declaration.inCatch) declaredTypes.set(declaration.name, declaration.type);
     }
   }
@@ -2818,6 +2832,14 @@ function refineObjectLocalDeclarations(lines, resolveType) {
     const refinedType = arrayElementTypes.get(name) || resolveType(name);
     if (refinedType && refinedType !== 'Object') refinements.set(name, refinedType);
   }
+  const effectiveTypes = new Map(declaredTypes);
+  for (const [name, type] of allDeclaredTypes) {
+    if (!effectiveTypes.has(name)) effectiveTypes.set(name, type);
+  }
+  for (const [name, refinedType] of refinements) effectiveTypes.set(name, refinedType);
+  const primitiveTypes = new Set([
+    'boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double', 'void',
+  ]);
   return (lines || []).map((raw) => {
     let line = String(raw);
     for (const [name, refinedType] of refinements) {
@@ -2834,6 +2856,20 @@ function refineObjectLocalDeclarations(lines, resolveType) {
         return `${prefix}(${refinedType}) (Object) (${trimmed});`;
       });
     }
+    // A slot widened to Object at a multi-path join can be copied into a
+    // second local whose concrete verifier type is discovered only by a later
+    // array/member operation. Source emission has already rendered the copy as
+    // `typed = carrier`; restore the verifier's implicit checkcast explicitly.
+    // This is deliberately local/type driven: no guest names or descriptors
+    // participate in the rewrite.
+    line = line.replace(/^(\s*)((?:[A-Za-z_$][A-Za-z0-9_$.<>\[\]]*[ \t]+)?)([A-Za-z_$][A-Za-z0-9_$]*)[ \t]*=[ \t]*([A-Za-z_$][A-Za-z0-9_$]*);$/,
+      (whole, indent, declarationPrefix, targetName, sourceName) => {
+        const targetType = simplifyType(effectiveTypes.get(targetName));
+        const sourceType = simplifyType(effectiveTypes.get(sourceName));
+        if (!targetType || targetType === 'Object' || primitiveTypes.has(targetType)
+          || !effectiveTypes.has(sourceName) || sourceType !== 'Object') return whole;
+        return `${indent}${declarationPrefix}${targetName} = (${targetType}) (Object) (${sourceName});`;
+      });
     return line;
   });
 }
@@ -3387,13 +3423,30 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   const cfg = buildCfgFromCode(codeItems, exceptionBoundaryLabels.filter(Boolean));
   if (!cfg) return [];
   const normalBranchIntoHandler = hasNormalBranchIntoExceptionHandler(codeItems, exceptionTable);
+  // Java source has to materialize operand-stack joins as locals.  On hostile
+  // methods with thousands of blocks that can make otherwise valid structured
+  // output exceed the classfile's hard 64 KiB Code_attribute limit.  Use the
+  // same typed CFG representation, but partition its state dispatcher into
+  // bounded local-class methods.  This is deliberately selected by bytecode
+  // size and source-representable method shape, never by owner/method names.
+  //
+  // Constructors, instance methods and value-returning methods remain on the
+  // ordinary structurer until their receiver/return carriers are supported by
+  // the partitioner.  The corpus case which exposed the limit is static void.
+  const partitionOversizedStateMachine = codeItems.length > 5000
+    && (method.flags || []).includes('static')
+    && methodReturnType(method) === 'void'
+    && !(method.flags || []).includes('synchronized')
+    && !syncHandlers.size;
   let stateMachineReason = process.env.CFR_JS_FORCE_STATE_MACHINE === '1'
     ? 'forced by CFR_JS_FORCE_STATE_MACHINE'
-    : (normalBranchIntoHandler
+    : (partitionOversizedStateMachine
+      ? 'partitioned oversized CFG'
+      : (normalBranchIntoHandler
       ? 'normal control-flow edge enters an exception handler'
       : ((!structured || !structured.ok)
       ? (structured && structured.reason ? structured.reason : 'structurer returned no result')
-      : null));
+      : null)));
   let useStateMachine = stateMachineReason !== null;
   if (useStateMachine && syncHandlers.size) {
     // The state machine would render the lowered (nop'd) monitor plumbing as
@@ -3438,7 +3491,20 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   // Do the equivalent shape analysis first, before source rendering mutates the
   // real local-variable state. At joins, stack positions become phi-like
   // synthetic variables instead of borrowing an expression from one predecessor.
-  const analysisLocals = localState;
+  // Stack-shape discovery visits CFG blocks in worklist order, including
+  // exception handlers that are not in lexical bytecode order.  It must not
+  // mutate the local-binding state later used for source emission: a handler
+  // store can otherwise leave a reused slot bound to RuntimeException and make
+  // an earlier normal load (Canvas, AWTEvent, etc.) emit a bogus checkcast.
+  const analysisDescriptor = parseDescriptor(method.descriptor || '()V');
+  const analysisLocals = makeLocalState(
+    (analysisDescriptor.params || []).map(simplifyType),
+    (method.flags || []).includes('static'),
+    code,
+    options.plainRefSlots || null,
+    options.exceptionModel,
+    options,
+  );
   const entryStacks = new Map([[cfg.entry, []]]);
   const queue = [cfg.entry];
   for (const block of cfg.blocks) {
@@ -3478,9 +3544,17 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           const incoming = stack[index];
           const leftType = simplifyType(value.type || 'Object');
           const rightType = simplifyType(incoming.type || 'Object');
+          const primitiveStackTypes = new Set([
+            'boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double',
+          ]);
+          const leftIsReference = !primitiveStackTypes.has(leftType);
+          const rightIsReference = !primitiveStackTypes.has(rightType);
+          const concreteObjectTop = leftIsReference && rightIsReference
+            && ((leftType === 'Object' && value.code !== 'null')
+              || (rightType === 'Object' && incoming.code !== 'null'));
           const referenceConflict = leftType !== rightType
-            && leftType !== 'Object' && rightType !== 'Object'
-            && mergeStackTypes(leftType, rightType) === 'Object';
+            && leftIsReference && rightIsReference
+            && (concreteObjectTop || mergeStackTypes(leftType, rightType) === 'Object');
           const mergedReferenceTop = Boolean(value.mergedReferenceTop
             || incoming.mergedReferenceTop || referenceConflict);
           const type = mergedReferenceTop ? 'Object' : mergeStackTypes(value.type, incoming.type);
@@ -3516,6 +3590,33 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   }
   localState.resetReferenceFlow();
 
+  const regularPredecessors = cfg.blocks.map(() => []);
+  for (const predecessor of cfg.blocks) {
+    for (const successor of cfg.succ[predecessor.id] || []) {
+      if (successor == null || handlerEntries.has(cfg.blocks[successor].headLabel)) continue;
+      regularPredecessors[successor].push(predecessor.id);
+    }
+  }
+  // A loop header with two or more live operand values is not a Java
+  // expression join. Obfuscators use this shape to park a comparison beneath
+  // an opaque predicate and branch back to the comparison instruction. The
+  // structured printer can otherwise mistake the two different comparisons
+  // reaching that header for one loop condition, dropping the increment block
+  // or repeating one iteration forever. Keep ordinary one-value accumulator
+  // loops structured, but render these multi-value backedge phis through the
+  // exact CFG state machine.
+  const hasMultiValueStackBackedge = cfg.blocks.some((block) => {
+    const predecessors = regularPredecessors[block.id] || [];
+    return (entryStacks.get(block.id) || []).length >= 2
+      && predecessors.length >= 2
+      && predecessors.some((predecessor) => predecessor >= block.id);
+  });
+  if (!useStateMachine && hasMultiValueStackBackedge) {
+    if (syncHandlers.size) return null;
+    useStateMachine = true;
+    stateMachineReason = 'multi-value operand stack carried across a CFG backedge';
+  }
+
   const stackInName = (blockId, slot) => `stackIn_${blockId}_${slot}`;
   const stackOutName = (blockId, slot) => `stackOut_${blockId}_${slot}`;
   const structuredCarrierType = [...handlerEntries.values()].every((type) =>
@@ -3524,34 +3625,71 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
   const declarations = localState.liftAllDeclarations();
   for (const block of cfg.blocks) {
     if (!handlerEntries.has(block.headLabel)) {
-      (entryStacks.get(block.id) || []).forEach((value, slot) => {
+      const entryValues = entryStacks.get(block.id) || [];
+      entryValues.forEach((value, slot) => {
         requireRenderedTypeImport(options, value.qualifiedType || value.type);
-        declarations.push(`${simplifyType(value.type)} ${stackInName(block.id, slot)} = ${defaultValueForType(value.type)};`);
+        const tail = getInstructionFromItem(codeItems[block.insns[block.insns.length - 1]]);
+        const returnCarrier = useStateMachine || tail && (
+          ['areturn', 'dreturn', 'freturn', 'ireturn', 'lreturn', 'return',
+            'tableswitch', 'lookupswitch'].includes(tail.op) || isConditionalBranch(tail.op)) ||
+          entryValues.length < 4;
+        declarations.push(`${simplifyType(value.type)} ${stackInName(block.id, slot)}` +
+          `${returnCarrier ? ` = ${defaultValueForType(value.type)}` : ''};`);
       });
     }
   }
 
   const cache = new Map();
+  const evaluating = new Set();
+  const forwardedStackIns = new Set();
+  const edgeStackInSources = new Map();
+  const recordEdgeStackInSource = (target, source) => {
+    const state = edgeStackInSources.get(target) || {
+      edges: 0, sources: new Set(), invalid: false,
+    };
+    state.edges += 1;
+    if (typeof source === 'string' && /^stackIn_\d+_\d+$/.test(source)) {
+      state.sources.add(source);
+    } else {
+      state.invalid = true;
+    }
+    edgeStackInSources.set(target, state);
+  };
 
   const evaluate = (blockId) => {
     if (cache.has(blockId)) return cache.get(blockId);
     const block = cfg.blocks[blockId];
     if (!block) return { lines: [], stack: [], terminator: null };
+    evaluating.add(blockId);
     const lastIndex = block.insns[block.insns.length - 1];
     const terminator = getInstructionFromItem(codeItems[lastIndex]);
     const op = terminator && terminator.op;
     const consumedByStructurer = op === 'goto' || op === 'goto_w' ||
       op === 'tableswitch' || op === 'lookupswitch' || isConditionalBranch(op);
     const bodyIndexes = consumedByStructurer ? block.insns.slice(0, -1) : block.insns;
+    const predecessors = regularPredecessors[blockId] || [];
+    const forwardingPredecessor = !useStateMachine && blockId !== cfg.entry &&
+      !handlerEntries.has(block.headLabel) && predecessors.length === 1 &&
+      !evaluating.has(predecessors[0])
+      ? evaluate(predecessors[0]) : null;
     const initialStack = (entryStacks.get(blockId) || []).map((value, slot) => {
       const handlerType = handlerEntries.get(block.headLabel);
-      const code = handlerEntries.has(block.headLabel)
+      let code = handlerEntries.has(block.headLabel)
         ? (useStateMachine
           ? 'caughtException'
           : (handlerType === structuredCarrierType
             ? 'decompiledCaughtException'
             : `(${simplifyType(handlerType)}) (Object) decompiledCaughtException`))
         : (value.code === 'this' ? 'this' : stackInName(blockId, slot));
+      if (forwardingPredecessor) {
+        const incoming = forwardingPredecessor.exitStack &&
+          forwardingPredecessor.exitStack[slot];
+        if (incoming && /^stackIn_\d+_\d+$/.test(incoming.code) &&
+            simplifyType(incoming.type) === simplifyType(value.type)) {
+          forwardedStackIns.add(stackInName(blockId, slot));
+          code = incoming.code;
+        }
+      }
       const expressionType = handlerEntries.has(block.headLabel)
         ? (useStateMachine ? 'Throwable' : handlerType)
         : value.type;
@@ -3574,11 +3712,10 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // A terminal block has no outgoing operand stack.  Obfuscated methods can
     // leave dead values beneath a return instruction; materializing those as
     // stack-out assignments would place Java statements after return/throw.
-    const hasRegularSuccessor = (cfg.succ[blockId] || []).some((successor) =>
+    const regularSuccessors = (cfg.succ[blockId] || []).filter((successor) =>
       successor != null && !handlerEntries.has(cfg.blocks[successor].headLabel));
-    if (hasRegularSuccessor) exitStack.forEach((value, slot) => {
+    if (regularSuccessors.length) exitStack.forEach((value, slot) => {
       requireRenderedTypeImport(options, value.qualifiedType || value.type);
-      declarations.push(`${simplifyType(value.type)} ${stackOutName(blockId, slot)} = ${defaultValueForType(value.type)};`);
       const rawStoredValue = renderStoreExpression(value);
       const canonicalSourceType = rawStoredValue && localState.sourceTypeForName(rawStoredValue.code);
       const targetStackType = simplifyType(value.type);
@@ -3592,18 +3729,49 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const rendered = value.pendingNew
         ? expr('null', value.type)
         : coerceExpressionForType(typedStoredValue, value.type);
-      lines.push(`${stackOutName(blockId, slot)} = ${rendered.code};`);
+      const targets = regularSuccessors.map((successor) => ({
+        successor,
+        value: (entryStacks.get(successor) || [])[slot],
+      })).filter((target) => target.value);
+      const homogeneousTargets = targets.length > 0 && targets.every((target) =>
+        simplifyType(target.value.type) === simplifyType(targets[0].value.type));
+      if (homogeneousTargets) {
+        // The old form always introduced an intermediate stackOut local and
+        // then copied it to every successor stackIn local. Feed the first join
+        // slot directly from the already-snapshotted expression and fan out
+        // from that slot. This removes one javac local store per live operand
+        // without duplicating evaluation or changing edge coercions.
+        const first = targets[0];
+        const firstName = stackInName(first.successor, slot);
+        const firstRendered = coerceExpressionForType(rendered, first.value.type);
+        lines.push(`${firstName} = ${firstRendered.code};`);
+        recordEdgeStackInSource(firstName, firstRendered.code);
+        const outgoing = expr(firstName, first.value.type);
+        for (let index = 1; index < targets.length; index += 1) {
+          const target = targets[index];
+          const targetName = stackInName(target.successor, slot);
+          lines.push(`${targetName} = ` +
+            `${coerceExpressionForType(outgoing, target.value.type).code};`);
+          recordEdgeStackInSource(targetName, firstName);
+        }
+      } else {
+        // Different verifier types can require distinct coercions. Retain one
+        // source-typed carrier so no narrowing performed for one successor is
+        // observed by another.
+        declarations.push(`${simplifyType(value.type)} ${stackOutName(blockId, slot)};`);
+        lines.push(`${stackOutName(blockId, slot)} = ${rendered.code};`);
+        const outgoing = expr(stackOutName(blockId, slot), value.type);
+        for (const target of targets) {
+          const targetName = stackInName(target.successor, slot);
+          lines.push(`${targetName} = ` +
+            `${coerceExpressionForType(outgoing, target.value.type).code};`);
+          recordEdgeStackInSource(targetName, null);
+        }
+      }
     });
-    for (const successor of cfg.succ[blockId] || []) {
-      if (successor == null || handlerEntries.has(cfg.blocks[successor].headLabel)) continue;
-      const target = entryStacks.get(successor) || [];
-      target.forEach((value, slot) => {
-        const outgoing = expr(stackOutName(blockId, slot), exitStack[slot] ? exitStack[slot].type : 'Object');
-        lines.push(`${stackInName(successor, slot)} = ${coerceExpressionForType(outgoing, value.type).code};`);
-      });
-    }
-    const value = { lines, stack, terminator };
+    const value = { lines, stack, exitStack, terminator };
     cache.set(blockId, value);
+    evaluating.delete(blockId);
     return value;
   };
 
@@ -3657,6 +3825,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // very large fallbacks. Handler states still need a value for their seeded
     // exception-stack slot even though normal control flow cannot enter them.
     const stateMachineExceptionTable = codeItems.length > 1000
+      && !partitionOversizedStateMachine
       ? []
       : exceptionTable;
     if (!stateMachineExceptionTable.length && handlerEntries.size) {
@@ -3677,6 +3846,9 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const normalOnly = codeItems.length > 1000 && !syncHandlers.size ? structureMethod(codeItems, []) : null;
       if (normalOnly && normalOnly.ok) {
         cache.clear();
+        evaluating.clear();
+        forwardedStackIns.clear();
+        edgeStackInSources.clear();
         source = printTree(normalOnly.tree, render);
       }
       if (source.includes('unsupported condition') || source.includes('= e;')
@@ -3689,17 +3861,80 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         useStateMachine = true;
         stateMachineReason = 'structured output failed Java source-flow validation';
         cache.clear();
+        evaluating.clear();
+        forwardedStackIns.clear();
+        edgeStackInSources.clear();
         source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
           methodReturnType(method));
       }
     }
     declarations.push(...localState.liftAllDeclarations());
+    const redundantStackInAliases = new Map();
+    if (!useStateMachine) {
+      for (const [target, state] of edgeStackInSources) {
+        const match = /^stackIn_(\d+)_\d+$/.exec(target);
+        const predecessorCount = match ? (regularPredecessors[Number(match[1])] || []).length : 0;
+        if (!state.invalid && state.edges === predecessorCount && state.sources.size === 1) {
+          redundantStackInAliases.set(target, [...state.sources][0]);
+        }
+      }
+      for (const block of cfg.blocks) {
+        if (block.id === cfg.entry || handlerEntries.has(block.headLabel)) continue;
+        const predecessors = regularPredecessors[block.id] || [];
+        if (!predecessors.length) continue;
+        const entryValues = entryStacks.get(block.id) || [];
+        for (let slot = 0; slot < entryValues.length; slot += 1) {
+          const incoming = predecessors.map((predecessor) =>
+            cache.get(predecessor)?.exitStack?.[slot]);
+          if (incoming.some((value) => !value ||
+              !/^stackIn_\d+_\d+$/.test(value.code))) continue;
+          const source = incoming[0].code;
+          if (!incoming.every((value) => value.code === source &&
+              simplifyType(value.type) === simplifyType(entryValues[slot].type))) continue;
+          const target = stackInName(block.id, slot);
+          if (source !== target) redundantStackInAliases.set(target, source);
+        }
+      }
+      const resolveAlias = (name) => {
+        const seen = new Set([name]);
+        let current = name;
+        while (redundantStackInAliases.has(current)) {
+          const next = redundantStackInAliases.get(current);
+          if (seen.has(next)) return name;
+          seen.add(next);
+          current = next;
+        }
+        return current;
+      };
+      for (const [target, source] of redundantStackInAliases) {
+        redundantStackInAliases.set(target, resolveAlias(source));
+      }
+    }
+    if (forwardedStackIns.size) {
+      const escapedNames = [...forwardedStackIns].map((name) =>
+        name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+      const assignment = new RegExp(`^\\s*(?:${escapedNames.join('|')})\\s*=.*;\\s*$`, 'gm');
+      source = source.replace(assignment, '');
+    }
+    for (const [target, replacement] of redundantStackInAliases) {
+      const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      source = source.replace(new RegExp(`\\b${escaped}\\b`, 'g'), replacement);
+    }
+    source = source.replace(/^\s*(stackIn_\d+_\d+)\s*=\s*\1;\s*$/gm, '');
     const lines = source ? source.split('\n') : [];
     if (declarations.length) {
-      const uniqueDeclarations = [...new Set(declarations)];
+      const eliminatedStackIns = new Set([
+        ...forwardedStackIns, ...redundantStackInAliases.keys(),
+      ]);
+      const uniqueDeclarations = [...new Set(declarations)].filter((declaration) =>
+        ![...eliminatedStackIns].some((name) =>
+          new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(declaration)));
       lines.unshift(...uniqueDeclarations);
     }
     if (lines[lines.length - 1] === 'return;') lines.pop();
+    if (partitionOversizedStateMachine) {
+      return partitionVoidStateMachine(lines, method, localState);
+    }
     if (useStateMachine && Array.isArray(options.diagnostics)) {
       options.diagnostics.push({
         kind: 'stateMachineFallback',
@@ -3718,6 +3953,128 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     }
     return null;
   }
+}
+
+/**
+ * Split a very large static-void CFG state machine into bounded methods on a
+ * method-local carrier class.  `lines` is the finalized state-machine source:
+ * declarations followed by `stateLoop: while (...) { switch (...) { ... } }`.
+ *
+ * Moving declarations to fields preserves their Java default initialization
+ * while allowing every partition to see the same locals and operand-stack join
+ * slots.  A partition runs blocks until control transfers outside its state
+ * range, then the small dispatcher selects the next partition.  Per-block
+ * exception handlers remain inside their partition.
+ */
+function partitionVoidStateMachine(lines, method, localState) {
+  const loopIndex = lines.findIndex((line) =>
+    String(line).trim() === 'stateLoop: while (true) {');
+  if (loopIndex < 0) return lines;
+
+  const declarations = lines.slice(0, loopIndex);
+  const fieldLines = [];
+  let entryState = 0;
+  for (const raw of declarations) {
+    const line = String(raw).trim();
+    const match = /^(.+?)\s+([A-Za-z_$][\w$]*)(?:\s*=\s*(.*))?;$/.exec(line);
+    if (!match) return lines;
+    const [, type, name, initializer] = match;
+    fieldLines.push(`${type} ${name};`);
+    if (name === 'statePc' && initializer != null) {
+      const parsed = Number(initializer);
+      if (Number.isFinite(parsed)) entryState = parsed;
+    }
+  }
+
+  const cases = [];
+  for (let index = loopIndex + 2; index < lines.length; index += 1) {
+    const start = /^\s{8}case\s+(-?\d+):\s*\{$/.exec(String(lines[index]));
+    if (!start) continue;
+    const body = [String(lines[index]).slice(8)];
+    index += 1;
+    while (index < lines.length && String(lines[index]) !== '        }') {
+      body.push(String(lines[index]).slice(8));
+      index += 1;
+    }
+    if (index >= lines.length) return lines;
+    body.push('}');
+    cases.push({ state: Number(start[1]), lines: body });
+  }
+  if (!cases.length) return lines;
+
+  // Keep helper bytecode comfortably below 64 KiB even when one source block
+  // carries many stack-join stores.  Group by rendered source weight rather
+  // than method identity or fixed block counts.
+  const groups = [];
+  let group = [];
+  let weight = 0;
+  for (const item of cases) {
+    const itemWeight = item.lines.reduce((sum, line) => sum + line.length + 1, 0);
+    if (group.length && weight + itemWeight > 24000) {
+      groups.push(group);
+      group = [];
+      weight = 0;
+    }
+    group.push(item);
+    weight += itemWeight;
+  }
+  if (group.length) groups.push(group);
+
+  const descriptor = parseDescriptor(method.descriptor || '()V');
+  const parameterTypes = (descriptor.params || []).map(simplifyType);
+  const parameterNames = localState.paramNames || [];
+  const className = '$CfrPartitionedState';
+  const out = [`class ${className} {`];
+  for (const field of fieldLines) out.push(`    ${field}`);
+  for (let index = 0; index < parameterTypes.length; index += 1) {
+    out.push(`    final ${parameterTypes[index]} ${parameterNames[index]};`);
+  }
+  out.push('    boolean finished;');
+
+  const constructorParameters = parameterTypes.map(
+    (type, index) => `${type} initialParam${index}`).join(', ');
+  out.push(`    ${className}(${constructorParameters}) {`);
+  for (let index = 0; index < parameterTypes.length; index += 1) {
+    out.push(`        this.${parameterNames[index]} = initialParam${index};`);
+  }
+  out.push(`        this.statePc = ${entryState};`, '    }');
+
+  const renderCaseLine = (line) => {
+    if (line.trim() === 'return;') {
+      const indent = line.slice(0, line.length - line.trimStart().length);
+      return `${indent}finished = true; return;`;
+    }
+    return line.replace(/\bcontinue stateLoop;/g, 'continue stateLoop;');
+  };
+
+  groups.forEach((items, groupIndex) => {
+    out.push(`    void runPartition${groupIndex}() {`,
+      '        stateLoop: while (true) {',
+      '            switch (statePc) {');
+    for (const item of items) {
+      for (const line of item.lines) {
+        out.push(`                ${renderCaseLine(line)}`);
+      }
+    }
+    out.push('                default: return;', '            }', '        }', '    }');
+  });
+
+  out.push('    void run() {', '        while (!finished) {');
+  groups.forEach((items, groupIndex) => {
+    const maxState = items[items.length - 1].state;
+    out.push(`${groupIndex === 0 ? '            if' : '            else if'} (statePc <= ${maxState}) {`,
+      `                runPartition${groupIndex}();`, '            }');
+  });
+  out.push('            else {',
+    '                throw new IllegalStateException("invalid CFG state " + statePc);',
+    '            }',
+    '        }',
+    '    }',
+    '}');
+  const argumentsList = parameterNames.slice(0, parameterTypes.length).join(', ');
+  out.push(`${className} decompiledState = new ${className}(${argumentsList});`,
+    'decompiledState.run();');
+  return out;
 }
 
 function commonExceptionHandlerStackType(left, right) {
@@ -4353,6 +4710,13 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         // aastore value; otherwise only `new int[n]` is emitted and every
         // initializer is silently replaced by zero.
         const renderedValue = renderStoreExpression(value);
+        // A dup/dup_x2 may keep the pre-store value of an array element live
+        // beneath this store (the bytecode form of counts[g]++ used as a later
+        // index). Java expressions are rendered lazily, so re-reading it after
+        // the mutation would observe the incremented value. Freeze every live
+        // array read before emitting the store; spilling a non-aliasing read is
+        // conservative but semantically exact.
+        materializeStackArrayReads(stack, lines, localState);
         lines.push(`${renderArrayReceiver(array)}[${index.code}] = ${coerceExpressionForType(renderedValue, elementType).code};`);
       }
       continue;
@@ -7440,9 +7804,11 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
     return Boolean(plainRefSlots && plainRefSlots.has(index) && !initiallyDeclared.has(index));
   }
 
-  function ensure(index, fallbackType = 'Object', forceReferenceVariant = false) {
+  function ensure(index, fallbackType = 'Object', forceReferenceVariant = false,
+    ignoreTraversalBinding = false) {
     const requestedType = simplifyType(fallbackType);
-    const key = requestedType === 'Object' && !forceReferenceVariant && currentReferenceKeys.has(index)
+    const key = requestedType === 'Object' && !forceReferenceVariant
+      && !ignoreTraversalBinding && currentReferenceKeys.has(index)
       ? currentReferenceKeys.get(index)
       : localKey(index, fallbackType, forceReferenceVariant);
     if (!names.has(key)) {
@@ -7693,8 +8059,13 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       const typedArrayElement = Boolean(value && value.arrayElement && effectiveType !== 'Object');
       const primitiveTypes = new Set(['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double']);
       const concreteReference = effectiveType !== 'Object' && !primitiveTypes.has(simplifyType(effectiveType));
+      // CFG rendering is recursive, not lexical. A previously rendered catch
+      // block must not select the variable family for an earlier normal store.
+      // Stores with a bytecode pc are bound from their own value/type; loads
+      // subsequently select the nearest reaching definition by pc.
       const key = ensure(index, effectiveType,
-        Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement || concreteReference);
+        Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement || concreteReference,
+        Number.isFinite(Number(pc)));
       if (!['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double'].includes(simplifyType(inferred))) {
         currentReferenceKeys.set(index, key);
         if (Number.isFinite(Number(pc))) {
@@ -8132,7 +8503,10 @@ function expressionHasSideEffects(value) {
 // new-array fills (dynamic and literal) and StringBuilder concat chains keep
 // their shared entries so the dedicated pattern handling still sees them.
 function materializeDuplicatedValue(value, lines, localState) {
-  if (!expressionHasSideEffects(value) || value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) return value;
+  const readsArrayElement = value && typeof value.code === 'string' &&
+    /\[[^\]]+\]/.test(value.code);
+  if ((!expressionHasSideEffects(value) && !readsArrayElement) ||
+      value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) return value;
   const rendered = renderStoreExpression(value);
   const name = localState.nextSyntheticName('dupTemp');
   lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
@@ -8173,6 +8547,17 @@ function materializeStackFieldReads(stack, fieldName, lines, localState) {
     if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) continue;
     const rendered = renderStoreExpression(value);
     const name = localState.nextSyntheticName('fieldTemp');
+    lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
+    stack[i] = expr(name, value.type, 100);
+  }
+}
+
+function materializeStackArrayReads(stack, lines, localState) {
+  for (let i = 0; i < stack.length; i += 1) {
+    const value = stack[i];
+    if (!value || !value.arrayElement) continue;
+    const rendered = renderStoreExpression(value);
+    const name = localState.nextSyntheticName('arrayValue');
     lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
     stack[i] = expr(name, value.type, 100);
   }

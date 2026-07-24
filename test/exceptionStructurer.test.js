@@ -201,6 +201,37 @@ test('control flow (a loop) inside the try body', () => {
   assert.match(src, /continue L\d+;/);
 });
 
+test('trailing synchronized glue does not absorb the next loop lock setup', () => {
+  // monitorenter/monitorexit have already been lowered to nop/pop, matching
+  // the input that cfr.js gives the exception structurer.
+  const code = [
+    { labelDef: 'L0:', pc: 0, instruction: 'aload_0' },
+    { pc: 1, instruction: 'astore_1' },
+    { pc: 2, instruction: 'nop' },
+    { labelDef: 'Lbody:', pc: 3, instruction: 'aload_0' },
+    { pc: 4, instruction: { op: 'invokevirtual', arg: ['Method', 'X', ['work', '()V']] } },
+    { labelDef: 'Lrelease:', pc: 7, instruction: 'aload_1' },
+    { pc: 8, instruction: 'pop' },
+    { pc: 9, instruction: { op: 'goto', arg: 'L0' } },
+    { labelDef: 'Lhandler:', pc: 12, instruction: 'astore_2' },
+    { pc: 13, instruction: 'aload_2' },
+    { pc: 14, instruction: 'athrow' },
+  ];
+  const et = [{ start_pc: 3, end_pc: 7, handler_pc: 12, catch_type: 'any' }];
+  const r = structureMethod(code, et, {
+    syncHandlers: new Map([[12, { lockLocal: 1, lockPc: 2 }]]),
+  });
+  assert.ok(r.ok, r.reason || 'synchronized loop should structure');
+  const src = printTree(r.tree, r.render);
+  assertGotoFree(src);
+  assert.match(src, /aload_0;\s*astore_1;\s*nop;\s*synchronized \(lv1\)/,
+    `the next iteration prepares its lock before entering synchronized:\n${src}`);
+  const syncBody = src.match(/synchronized \(lv1\) \{([^]*?)\n\}/);
+  assert.ok(syncBody, `expected synchronized body:\n${src}`);
+  assert.doesNotMatch(syncBody[1], /astore_1/,
+    `lock setup must not rotate into the previous iteration's body:\n${src}`);
+});
+
 // ---------------------------------------------------------------------------
 // (e) A nested try: an inner try/catch inside an outer try/catch. Innermost is
 // collapsed first, then absorbed into the outer body as a single super-block.

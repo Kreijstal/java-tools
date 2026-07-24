@@ -123,6 +123,26 @@ test('dead-flag: can preserve branch shape with a constant false load', (t) => {
   t.end();
 });
 
+test('dead-flag: preserves a guard above a buried comparison value', (t) => {
+  const ast = astWith([
+    { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },
+    { labelDef: 'L3:', instruction: { op: 'istore', arg: '5' } },
+    { labelDef: 'L6:', instruction: 'dcmpg' },
+    { labelDef: 'L7:', instruction: { op: 'iload', arg: '5' } },
+    { labelDef: 'L8:', instruction: { op: 'ifne', arg: 'L99' } },
+    { labelDef: 'L9:', instruction: { op: 'iflt', arg: 'L20' } },
+    { labelDef: 'L10:', instruction: 'return' },
+    { labelDef: 'L20:', instruction: 'return' },
+    { labelDef: 'L99:', instruction: 'return' },
+  ]);
+  const r = runDeadStaticBoolFlag(ast, { flags: 'client.A' });
+  t.equal(r.eliminated, 1);
+  t.deepEqual(realInstrs(ast), [
+    'getstatic', 'istore', 'dcmpg', 'iconst_0', 'ifne', 'iflt', 'return', 'return', 'return',
+  ]);
+  t.end();
+});
+
 test('dead-flag: preserve branch shape can require any array parameter', (t) => {
   const codeItems = [
     { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'client', ['A', 'Z']] } },

@@ -1009,6 +1009,12 @@ function processGroup(work, group, ctx, commit) {
       for (let b = 0; b < n; b++) {
         if (tryset.has(b) || handlerSet.has(b) || !reachable[b]) continue;
         if (!preds[b].length || !preds[b].every((p) => tryset.has(p))) continue;
+        // This pass only absorbs the compiler's lexical continuation directly
+        // after a protected range.  Never grow through a retreating edge: a
+        // synchronized tail commonly ends in `goto loopHeader`, and absorbing
+        // that lower-PC header rotates the next iteration's lock setup into the
+        // current synchronized body (the first iteration then locks null).
+        if (preds[b].some((p) => work.startPc[b] <= work.startPc[p])) continue;
         const k = work.term[b].kind;
         if (k !== 'goto' && k !== 'fall') continue;
         if (!ctx.isNoThrowBlock(work, b)) continue;

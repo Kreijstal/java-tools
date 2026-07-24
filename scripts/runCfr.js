@@ -16,7 +16,8 @@ function usage(exitCode) {
   stream.write(`  --classpath <path>        Classpath used for hierarchy/type resolution\n`);
   stream.write(`  --diagnostics-json <file> Write machine-readable fallback diagnostics\n`);
   stream.write(`  --detect-obfuscation-guards Report hostile overrides such as throwing toString methods\n`);
-  stream.write(`  --fail-on-fallback        Exit non-zero on any method/source fallback\n`);
+  stream.write(`  --fail-on-hard-failure    Exit non-zero on invalid output markers or panics\n`);
+  stream.write(`  --fail-on-fallback        Exit non-zero on hard failures or valid state-machine fallbacks\n`);
   stream.write(`  --help, -h                Show this help text\n`);
   process.exit(exitCode);
 }
@@ -28,6 +29,7 @@ function parseArgs(argv) {
     classpath: '',
     diagnosticsJson: '',
     detectObfuscationGuards: false,
+    failOnHardFailure: false,
     failOnFallback: false,
   };
   const positional = [];
@@ -55,6 +57,8 @@ function parseArgs(argv) {
       options.detectObfuscationGuards = true;
     } else if (arg === '--fail-on-fallback') {
       options.failOnFallback = true;
+    } else if (arg === '--fail-on-hard-failure') {
+      options.failOnHardFailure = true;
     } else if (arg === '--removeboilerplate') {
       // Compatibility with a common CFR option. The JS implementation omits
       // bytecode boilerplate by default, so this option is intentionally a no-op.
@@ -95,10 +99,13 @@ function collectDiagnostics(outputs) {
     }
   }
   const panics = (outputs.failures || []).map(({ name, reason }) => ({ name, reason }));
+  const hardFailures = totals.stackUnderflow + totals.rawControlFlow +
+    totals.placeholders + panics.length;
   return {
     version: VERSION,
     generatedFiles: outputs.length,
-    hardFailures: Object.values(totals).reduce((sum, count) => sum + count, 0) + panics.length,
+    hardFailures,
+    validFallbacks: totals.stateMachineFallback,
     panics,
     totals,
     files,
@@ -139,7 +146,11 @@ async function main() {
     if (!options.silent) {
       console.log(`Wrote ${outputs.length} Java source file(s) to ${options.outputDir}`);
     }
-    if (options.failOnFallback && diagnostics.hardFailures > 0) process.exitCode = 1;
+    if ((options.failOnHardFailure && diagnostics.hardFailures > 0) ||
+        (options.failOnFallback &&
+          (diagnostics.hardFailures > 0 || diagnostics.validFallbacks > 0))) {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -148,7 +159,11 @@ async function main() {
     process.stdout.write(source);
     if (!source.endsWith('\n')) process.stdout.write('\n');
   });
-  if (options.failOnFallback && diagnostics.hardFailures > 0) process.exitCode = 1;
+  if ((options.failOnHardFailure && diagnostics.hardFailures > 0) ||
+      (options.failOnFallback &&
+        (diagnostics.hardFailures > 0 || diagnostics.validFallbacks > 0))) {
+    process.exitCode = 1;
+  }
 }
 
 main().catch((err) => {
