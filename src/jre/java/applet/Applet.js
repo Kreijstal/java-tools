@@ -1,5 +1,6 @@
 // Requires AWT framework
 const awtFramework = require('../../../platform/awt.js');
+const browserInput = require('../../../platform/browser-awt-input.js');
 
 module.exports = {
   super: 'java/awt/Panel',
@@ -23,6 +24,7 @@ module.exports = {
         obj._awtComponent.canvasElement = canvas;
         obj._canvasElement = canvas;
         jvm._awtCanvasElement = canvas;
+        browserInput.attachBrowserInput(jvm, canvas);
         
         // Add canvas to DOM - look for AWT container or create one
         let awtContainer = document.getElementById('awt-container');

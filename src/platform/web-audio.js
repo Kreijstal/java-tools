@@ -4,6 +4,27 @@
   }
 
   let sharedAudioContext = null;
+  let resumeListenersInstalled = false;
+
+  function resumeSharedAudioContext() {
+    if (!sharedAudioContext || sharedAudioContext.state !== "suspended" ||
+        typeof sharedAudioContext.resume !== "function") {
+      return;
+    }
+    sharedAudioContext.resume().catch(function() {});
+  }
+
+  function installResumeListeners() {
+    if (resumeListenersInstalled || !global.document ||
+        typeof global.document.addEventListener !== "function") {
+      return;
+    }
+    resumeListenersInstalled = true;
+    const resume = () => resumeSharedAudioContext();
+    global.document.addEventListener("pointerdown", resume, { passive: true });
+    global.document.addEventListener("keydown", resume, { passive: true });
+    global.document.addEventListener("touchstart", resume, { passive: true });
+  }
 
   function getAudioContext() {
     const AudioContextCtor = global.AudioContext || global.webkitAudioContext;
@@ -12,6 +33,7 @@
     }
     if (!sharedAudioContext || sharedAudioContext.state === "closed") {
       sharedAudioContext = new AudioContextCtor();
+      installResumeListeners();
     }
     return sharedAudioContext;
   }
@@ -44,7 +66,7 @@
       }
 
       if (this.context.state === "suspended" && typeof this.context.resume === "function") {
-        this.context.resume().catch(function() {});
+        resumeSharedAudioContext();
       }
 
       const audioBuffer = this.context.createBuffer(

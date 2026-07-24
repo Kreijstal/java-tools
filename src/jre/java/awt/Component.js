@@ -1,5 +1,6 @@
 // java.awt.Component - Base class for all AWT components
 const awtFramework = require('../../../platform/awt.js');
+const browserInput = require('../../../platform/browser-awt-input.js');
 
 module.exports = {
   super: 'java/lang/Object',
@@ -135,9 +136,7 @@ module.exports = {
     },
 
     'requestFocus()Z': (jvm, obj, args) => {
-      if (obj._awtElement && typeof obj._awtElement.focus === 'function') {
-        obj._awtElement.focus();
-      }
+      browserInput.focusInputComponent(jvm, obj);
       return 1;
     },
 
@@ -154,11 +153,11 @@ module.exports = {
     },
 
     'requestFocus()V': (jvm, obj, args) => {
-      obj._focused = true;
+      browserInput.focusInputComponent(jvm, obj);
     },
 
     'requestFocusInWindow()Z': (jvm, obj, args) => {
-      obj._focused = true;
+      browserInput.focusInputComponent(jvm, obj);
       return 1;
     },
 
@@ -310,18 +309,18 @@ module.exports = {
       return 0;
     },
 
-    'addKeyListener(Ljava/awt/event/KeyListener;)V': (jvm, obj, args) => addListener(obj, 'key', args[0]),
-    'removeKeyListener(Ljava/awt/event/KeyListener;)V': (jvm, obj, args) => removeListener(obj, 'key', args[0]),
-    'addFocusListener(Ljava/awt/event/FocusListener;)V': (jvm, obj, args) => addListener(obj, 'focus', args[0]),
-    'removeFocusListener(Ljava/awt/event/FocusListener;)V': (jvm, obj, args) => removeListener(obj, 'focus', args[0]),
-    'addMouseListener(Ljava/awt/event/MouseListener;)V': (jvm, obj, args) => addListener(obj, 'mouse', args[0]),
-    'removeMouseListener(Ljava/awt/event/MouseListener;)V': (jvm, obj, args) => removeListener(obj, 'mouse', args[0]),
-    'addMouseMotionListener(Ljava/awt/event/MouseMotionListener;)V': (jvm, obj, args) => addListener(obj, 'mouseMotion', args[0]),
-    'removeMouseMotionListener(Ljava/awt/event/MouseMotionListener;)V': (jvm, obj, args) => removeListener(obj, 'mouseMotion', args[0]),
-    'addMouseWheelListener(Ljava/awt/event/MouseWheelListener;)V': (jvm, obj, args) => addListener(obj, 'mouseWheel', args[0]),
-    'removeMouseWheelListener(Ljava/awt/event/MouseWheelListener;)V': (jvm, obj, args) => removeListener(obj, 'mouseWheel', args[0]),
-    'addComponentListener(Ljava/awt/event/ComponentListener;)V': (jvm, obj, args) => addListener(obj, 'component', args[0]),
-    'removeComponentListener(Ljava/awt/event/ComponentListener;)V': (jvm, obj, args) => removeListener(obj, 'component', args[0]),
+    'addKeyListener(Ljava/awt/event/KeyListener;)V': (jvm, obj, args) => addListener(jvm, obj, 'key', args[0]),
+    'removeKeyListener(Ljava/awt/event/KeyListener;)V': (jvm, obj, args) => removeListener(jvm, obj, 'key', args[0]),
+    'addFocusListener(Ljava/awt/event/FocusListener;)V': (jvm, obj, args) => addListener(jvm, obj, 'focus', args[0]),
+    'removeFocusListener(Ljava/awt/event/FocusListener;)V': (jvm, obj, args) => removeListener(jvm, obj, 'focus', args[0]),
+    'addMouseListener(Ljava/awt/event/MouseListener;)V': (jvm, obj, args) => addListener(jvm, obj, 'mouse', args[0]),
+    'removeMouseListener(Ljava/awt/event/MouseListener;)V': (jvm, obj, args) => removeListener(jvm, obj, 'mouse', args[0]),
+    'addMouseMotionListener(Ljava/awt/event/MouseMotionListener;)V': (jvm, obj, args) => addListener(jvm, obj, 'mouseMotion', args[0]),
+    'removeMouseMotionListener(Ljava/awt/event/MouseMotionListener;)V': (jvm, obj, args) => removeListener(jvm, obj, 'mouseMotion', args[0]),
+    'addMouseWheelListener(Ljava/awt/event/MouseWheelListener;)V': (jvm, obj, args) => addListener(jvm, obj, 'mouseWheel', args[0]),
+    'removeMouseWheelListener(Ljava/awt/event/MouseWheelListener;)V': (jvm, obj, args) => removeListener(jvm, obj, 'mouseWheel', args[0]),
+    'addComponentListener(Ljava/awt/event/ComponentListener;)V': (jvm, obj, args) => addListener(jvm, obj, 'component', args[0]),
+    'removeComponentListener(Ljava/awt/event/ComponentListener;)V': (jvm, obj, args) => removeListener(jvm, obj, 'component', args[0]),
   },
 };
 
@@ -343,21 +342,23 @@ function makeDimension(width, height) {
   };
 }
 
-function addListener(obj, kind, listener) {
+function addListener(jvm, obj, kind, listener) {
   if (!listener) return;
   obj._listeners = obj._listeners || {};
   obj._listeners[kind] = obj._listeners[kind] || [];
   if (!obj._listeners[kind].includes(listener)) {
     obj._listeners[kind].push(listener);
   }
+  browserInput.registerInputComponent(jvm, obj, kind);
 }
 
-function removeListener(obj, kind, listener) {
+function removeListener(jvm, obj, kind, listener) {
   if (!obj._listeners || !obj._listeners[kind]) return;
   const index = obj._listeners[kind].indexOf(listener);
   if (index !== -1) {
     obj._listeners[kind].splice(index, 1);
   }
+  browserInput.unregisterInputComponent(jvm, obj, kind);
 }
 
 function allocateComponentHandle(jvm, component) {

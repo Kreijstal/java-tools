@@ -6,6 +6,8 @@ module.exports = {
     'isShiftDown()Z': (jvm, obj) => Boolean(obj.shiftDown),
     'isControlDown()Z': (jvm, obj) => Boolean(obj.controlDown),
     'isAltDown()Z': (jvm, obj) => Boolean(obj.altDown),
+    'isMetaDown()Z': (jvm, obj) => Boolean(obj.metaDown),
+    'getModifiersEx()I': (jvm, obj) => obj.modifiersEx || obj.modifiers || 0,
     'consume()V': (jvm, obj) => { obj._consumed = true; },
   },
 };

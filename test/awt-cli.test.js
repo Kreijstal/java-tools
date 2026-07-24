@@ -1,5 +1,6 @@
 const test = require('tape');
 const awt = require('../src/platform/awt');
+const browserInput = require('../src/platform/browser-awt-input');
 const { Canvas, Frame, Component, AwtMouseEvent, AwtKeyEvent } = awt;
 
 test('AWT framework - CLI compatibility with mocks', (t) => {
@@ -72,6 +73,52 @@ test('AWT framework - Event handling', (t) => {
     t.ok(mousePressed, 'Mouse event should be processed');
     t.ok(keyPressed, 'Key event should be processed');
     
+    t.end();
+});
+
+test('browser AWT input bridge translates DOM input for guest listeners', (t) => {
+    const handlers = new Map();
+    const canvas = {
+        width: 800,
+        height: 600,
+        style: {},
+        addEventListener: (name, handler) => handlers.set(name, handler),
+        getBoundingClientRect: () => ({ left: 10, top: 20, width: 400, height: 300 }),
+        focus: () => {},
+    };
+    const calls = [];
+    const jvm = {
+        _awtCanvasElement: canvas,
+        enqueueAwtEventInvocation: (listener, method, descriptor, event, coalesce) =>
+            calls.push({ listener, method, descriptor, event, coalesce }),
+    };
+    const listener = { type: 'ArbitraryGuestListener' };
+    const component = { _visible: true, _listeners: {
+        mouse: [listener], mouseMotion: [listener], key: [listener],
+    } };
+    browserInput.registerInputComponent(jvm, component, 'mouse');
+    browserInput.registerInputComponent(jvm, component, 'mouseMotion');
+    browserInput.registerInputComponent(jvm, component, 'key');
+    browserInput.focusInputComponent(jvm, component);
+    browserInput.attachBrowserInput(jvm, canvas);
+    const domEvent = (extra = {}) => ({
+        clientX: 210, clientY: 170, button: 0, buttons: 1, detail: 1,
+        shiftKey: false, ctrlKey: false, metaKey: false, altKey: false,
+        preventDefault: () => {}, ...extra,
+    });
+    handlers.get('mousedown')(domEvent());
+    handlers.get('mousemove')(domEvent());
+    handlers.get('keydown')(domEvent({ key: 'ArrowUp', keyCode: 38, buttons: 0 }));
+
+    t.equal(calls[0].method, 'mousePressed', 'DOM press selects the Java listener method');
+    t.equal(calls[0].event.x, 400, 'CSS X is scaled into the canvas coordinate space');
+    t.equal(calls[0].event.y, 300, 'CSS Y is scaled into the canvas coordinate space');
+    t.equal(calls[0].event.button, 1, 'DOM primary button becomes AWT BUTTON1');
+    t.equal(calls[1].method, 'mouseDragged', 'movement with a held button becomes a drag');
+    t.ok(calls[1].coalesce, 'high-frequency pointer movement is coalescible');
+    t.equal(calls[2].method, 'keyPressed', 'focused key input selects keyPressed');
+    t.equal(calls[2].event.keyCode, 38, 'browser arrow code is retained as the AWT code');
+    t.equal(calls.length, 3, 'non-character arrows do not manufacture keyTyped');
     t.end();
 });
 

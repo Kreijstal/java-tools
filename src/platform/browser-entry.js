@@ -14,6 +14,34 @@ const audioPlatform = require('./audio');
 const legacyPlatform = require('./legacy');
 // const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
+function thrownValueMessage(error) {
+  if (error === null) return 'null';
+  if (error === undefined) return 'undefined';
+  if (typeof error !== 'object') return String(error);
+  const type = typeof error.type === 'string' ? error.type : '';
+  let message = error.message;
+  if (message && typeof message === 'object' &&
+      Object.prototype.hasOwnProperty.call(message, 'value')) {
+    message = message.value;
+  }
+  if (message !== undefined && message !== null && String(message)) {
+    return type ? `${type}: ${String(message)}` : String(message);
+  }
+  if (type) return type;
+  if (error.name && error.name !== 'Error') return String(error.name);
+  if (error.message !== undefined) return String(error.message);
+  try {
+    const serialized = JSON.stringify(error);
+    if (serialized && serialized !== '{}') return serialized;
+  } catch (_) {
+    // A host Error or Java object may be cyclic. The constructor name is still
+    // more useful than silently producing an empty message.
+  }
+  return error.constructor && error.constructor.name
+    ? error.constructor.name
+    : String(error);
+}
+
 // Browser-compatible JVM Debug API
 class BrowserJVMDebug {
   constructor() {
@@ -141,7 +169,13 @@ class BrowserJVMDebug {
     } catch (error) {
       this.debugController.executionState = 'stopped';
       console.error('Failed to run class:', error);
-      throw new Error(`Run failed: ${error.message}`);
+      const wrapped = new Error(`Run failed: ${thrownValueMessage(error)}`);
+      wrapped.cause = error;
+      if (error && typeof error.type === 'string') {
+        wrapped.jvmExceptionType = error.type;
+        wrapped.jvmExceptionMessage = thrownValueMessage(error);
+      }
+      throw wrapped;
     }
   }
 
@@ -419,6 +453,7 @@ class BrowserJVMDebug {
 // Export for browser use
 module.exports = {
   BrowserJVMDebug,
+  thrownValueMessage,
   JVM,
   Frame,
   DebugController,
@@ -440,4 +475,8 @@ if (typeof window !== 'undefined') {
     legacyPlatform
   };
   window.awtFramework = awtFramework;
+  // Register the browser javax.sound backend as part of the runtime bundle.
+  // Some embedders load only jvm-debug.js (without the full debug-site HTML);
+  // leaving registration to a second script silently selected MockAudioOutput.
+  require('./web-audio');
 }

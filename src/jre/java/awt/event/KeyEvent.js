@@ -3,6 +3,7 @@ module.exports = {
   methods: {
     'getKeyCode()I': (jvm, obj) => obj.keyCode || 0,
     'getKeyChar()C': (jvm, obj) => obj.keyChar || 0,
+    'getKeyLocation()I': (jvm, obj) => obj.keyLocation || 0,
     'getModifiers()I': (jvm, obj) => obj.modifiers || 0,
     'consume()V': (jvm, obj) => { obj.consumed = true; },
   },

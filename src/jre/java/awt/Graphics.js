@@ -2,7 +2,49 @@
 const awtFramework = require('../../../platform/awt.js');
 
 let frameCount = 0;
-function dumpFrame(pixels, width, height) {
+const COLOR_SWIZZLE_WASM = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+  0x01, 0x7f, 0x00, 0x03, 0x02, 0x01, 0x00, 0x05, 0x03, 0x01, 0x00, 0x01,
+  0x07, 0x14, 0x02, 0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00,
+  0x07, 0x73, 0x77, 0x69, 0x7a, 0x7a, 0x6c, 0x65, 0x00, 0x00, 0x0a, 0x4f,
+  0x01, 0x4d, 0x01, 0x02, 0x7f, 0x02, 0x40, 0x03, 0x40, 0x20, 0x01, 0x20,
+  0x00, 0x4f, 0x0d, 0x01, 0x20, 0x01, 0x41, 0x02, 0x74, 0x28, 0x02, 0x00,
+  0x21, 0x02, 0x20, 0x01, 0x41, 0x02, 0x74, 0x41, 0x80, 0x80, 0x80, 0x78,
+  0x20, 0x02, 0x41, 0xff, 0x01, 0x71, 0x41, 0x10, 0x74, 0x72, 0x20, 0x02,
+  0x41, 0x80, 0xfe, 0x03, 0x71, 0x72, 0x20, 0x02, 0x41, 0x10, 0x76, 0x41,
+  0xff, 0x01, 0x71, 0x72, 0x36, 0x02, 0x00, 0x20, 0x01, 0x41, 0x01, 0x6a,
+  0x21, 0x01, 0x0c, 0x00, 0x0b, 0x0b, 0x0b,
+]);
+let colorSwizzleWasm;
+
+function swizzleRgbToImageData(output, pixels, count) {
+  const source = pixels && pixels.elements ? pixels.elements : pixels;
+  if (!source || count < 65536 || typeof WebAssembly === 'undefined') return false;
+  try {
+    if (colorSwizzleWasm === undefined) {
+      const instance = new WebAssembly.Instance(
+        new WebAssembly.Module(COLOR_SWIZZLE_WASM));
+      colorSwizzleWasm = instance.exports;
+    }
+    if (!colorSwizzleWasm) return false;
+    const requiredBytes = count * 4;
+    const memory = colorSwizzleWasm.memory;
+    if (memory.buffer.byteLength < requiredBytes) {
+      memory.grow(Math.ceil((requiredBytes - memory.buffer.byteLength) / 65536));
+    }
+    const staging = new Uint32Array(memory.buffer, 0, count);
+    staging.set(source.length === count ? source : source.subarray
+      ? source.subarray(0, count) : Array.from(source).slice(0, count));
+    colorSwizzleWasm.swizzle(count);
+    output.set(staging);
+    return true;
+  } catch (_) {
+    colorSwizzleWasm = null;
+    return false;
+  }
+}
+
+function dumpFrame(pixels, width, height, jvm) {
   if (typeof process === 'undefined' || !process.env || !process.env.JVM_FRAME_DIR) return;
   const every = Number(process.env.JVM_FRAME_EVERY) || 1;
   const limit = Number(process.env.JVM_FRAME_LIMIT) || 50;
@@ -16,10 +58,19 @@ function dumpFrame(pixels, width, height) {
     const file = path.join(process.env.JVM_FRAME_DIR, `frame-${String(n).padStart(5, '0')}.png`);
     fs.writeFileSync(file, encodePng(pixels, width, height));
     console.error(`[frame] +${(process.uptime()).toFixed(1)}s ${file} (${width}x${height})`);
+    if (jvm && Number(process.env.JVM_PROFILE_SCHEDULER_RESET_FRAME) === n &&
+        typeof jvm.resetSchedulerTimings === 'function') {
+      jvm.resetSchedulerTimings();
+    }
     if (process.env.JVM_EXIT_AFTER_FRAME_LIMIT === '1' && n / every + 1 >= limit) {
       // Profilers and repeatable boot benchmarks need a normal process exit so
       // V8 can flush its output. Defer until the completed frame is observable.
-      setImmediate(() => process.exit(0));
+      setImmediate(() => {
+        if (jvm && typeof jvm.dumpSchedulerTimings === 'function') {
+          jvm.dumpSchedulerTimings(Number(process.env.JVM_PROFILE_SCHEDULER_LIMIT) || 30);
+        }
+        process.exit(0);
+      });
     }
   } catch (e) {
     console.error(`frame dump failed: ${e.message}`);
@@ -102,6 +153,9 @@ function presentationStats(jvm) {
       drawImageCalls: 0,
       producerImages: 0,
       softwareBlits: 0,
+      blitCopyMs: 0,
+      wasmSwizzles: 0,
+      jsSwizzles: 0,
     };
   }
   return jvm._awtPresentationStats;
@@ -131,16 +185,22 @@ function presentSoftSurface(jvm, comp) {
     ? performance.now() : Date.now();
   const output = comp._presentPixels32;
   const count = Math.min(width * height, pixels.length);
-  for (let index = 0; index < count; index += 1) {
-    const rgb = Number(pixels[index]) >>> 0;
-    // ImageData is RGBA bytes. On the little-endian browser platforms used by
-    // Canvas, its Uint32 representation is AABBGGRR.
-    output[index] = (0xff000000 | (rgb & 0xff) << 16 |
-      rgb & 0xff00 | rgb >>> 16 & 0xff) >>> 0;
+  const stats = presentationStats(jvm);
+  const usedWasmSwizzle = swizzleRgbToImageData(output, pixels, count);
+  if (usedWasmSwizzle) {
+    if (stats) stats.wasmSwizzles += 1;
+  } else {
+    if (stats) stats.jsSwizzles += 1;
+    for (let index = 0; index < count; index += 1) {
+      const rgb = Number(pixels[index]) >>> 0;
+      // ImageData is RGBA bytes. On little-endian browser platforms its
+      // Uint32 representation is AABBGGRR.
+      output[index] = (0xff000000 | (rgb & 0xff) << 16 |
+        rgb & 0xff00 | rgb >>> 16 & 0xff) >>> 0;
+    }
   }
   context.putImageData(comp._presentImageData, 0, 0);
   comp._presentedVersion = comp._pixelsVersion;
-  const stats = presentationStats(jvm);
   if (stats) {
     const ended = typeof performance !== 'undefined' && performance.now
       ? performance.now() : Date.now();
@@ -155,7 +215,25 @@ function markSoftSurfaceDirty(jvm, comp) {
   comp._pixelsVersion = (comp._pixelsVersion || 0) + 1;
   const stats = presentationStats(jvm);
   if (stats) stats.dirtyMarks += 1;
-  if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') return;
+  if (!comp._canvasElement || typeof requestAnimationFrame !== 'function') {
+    // Headless jvm.js has no browser upload, but a completed software frame is
+    // still an observable presentation boundary. Coalesce all publications in
+    // one host event-loop turn, matching the browser requestAnimationFrame
+    // path without imposing a timer/FPS cap or copying the framebuffer.
+    if (typeof setImmediate !== 'function') return;
+    if (comp._presentScheduled) {
+      if (stats) stats.coalesced += 1;
+      return;
+    }
+    comp._presentScheduled = true;
+    if (stats) stats.scheduled += 1;
+    setImmediate(() => {
+      comp._presentScheduled = false;
+      comp._presentedVersion = comp._pixelsVersion;
+      if (stats) stats.presented += 1;
+    });
+    return;
+  }
   if (comp._presentScheduled) {
     if (stats) stats.coalesced += 1;
     return;
@@ -337,6 +415,8 @@ module.exports = {
           const targetHeight = target._height || 600;
           if (dx === 0 && dy === 0 && w === targetWidth && h === targetHeight &&
               pixels.length >= w * h) {
+            const copyStarted = stats && typeof performance !== 'undefined' &&
+              performance.now ? performance.now() : 0;
             const count = w * h;
             if (!(target._pixels instanceof Int32Array) || target._pixels.length !== count) {
               target._pixels = new Int32Array(count);
@@ -348,6 +428,7 @@ module.exports = {
                 target._pixels[index] = pixels[index] | 0;
               }
             }
+            if (copyStarted) stats.blitCopyMs += performance.now() - copyStarted;
             target._pixelsWidth = w;
             target._pixelsHeight = h;
             if (!jvm._softCanvases) jvm._softCanvases = new Set();
@@ -376,7 +457,7 @@ module.exports = {
           if (presentedBySoftwareSurface) markSoftSurfaceDirty(jvm, target);
           if (stats && presentedBySoftwareSurface) stats.softwareBlits += 1;
         }
-        dumpFrame(pixels, imageObj._width, imageObj._height);
+        dumpFrame(pixels, imageObj._width, imageObj._height, jvm);
         if (presentedBySoftwareSurface || !graphicsContext || !graphicsContext.drawImage) {
           return 1;
         }
