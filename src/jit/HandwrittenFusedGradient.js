@@ -1,15 +1,17 @@
 "use strict";
-// Handwritten structured replacement for the fused gradient triangle region
-// (wf.a wrapper -> oj.a raster -> inlined scanline). Derived from and validated
+// Handwritten structured replacement for a fused gradient triangle region.
+// Derived from and validated
 // bit-exact against the generated fused kernels on captured scene workloads
 // (2140-triangle vk scene, FNV hash equality), then measured at 9.9x the
 // generated kernel in SpiderMonkey (79ms -> 8ms per 20 scene passes).
 //
 // Safety model:
-// - Installation is gated on an exact bytecode fingerprint of the wrapper,
-//   raster, and scanline methods: these obfuscated classes are shared across
-//   game builds with per-build argument reordering, and this translation
-//   encodes one specific build's permutations and shift constants.
+// - Installation is gated on an exact, identity-canonicalized bytecode
+//   fingerprint of the wrapper, raster, and scanline methods. Owner and member
+//   names never enter the fingerprint; only their repeated-identity relations,
+//   normalized descriptors, opcodes, constants, and control flow do. These
+//   obfuscated classes are shared across game builds with per-build argument
+//   reordering, and this translation encodes one specific verified shape.
 // - Every call runs a layout pre-flight (linear row-offset table, destination
 //   bounds). Anything non-standard delegates to the generated kernel before
 //   any side effect, preserving exact semantics including exception behavior.
@@ -31,27 +33,71 @@ function getOp(instruction) {
   return typeof instruction === "string" ? instruction : instruction && instruction.op;
 }
 
-function fingerprintMethods(jit, methods) {
+function fingerprintMethods(jit, methods, options = {}) {
   let hash = FNV_OFFSET;
+  const classIds = new Map();
+  const memberIds = new Map();
+  const idFor = (map, key) => {
+    if (!map.has(key)) map.set(key, map.size);
+    return map.get(key);
+  };
+  const classId = (name) => idFor(classIds, String(name));
+  const normalizeDescriptor = (descriptor) => String(descriptor).replace(
+    /L([^;]+);/g, (_match, name) => `L#${classId(name)};`);
+  const canonicalArg = (arg, op = null) => {
+    if (options.normalizeLdcStrings && op === "ldc" &&
+        typeof arg === "string") {
+      return ["StringConstant"];
+    }
+    if (Array.isArray(arg) && arg.length >= 3 &&
+        (arg[0] === "Method" || arg[0] === "InterfaceMethod" || arg[0] === "Field") &&
+        Array.isArray(arg[2])) {
+      const kind = arg[0];
+      const owner = classId(arg[1]);
+      const descriptor = normalizeDescriptor(arg[2][1]);
+      const member = idFor(memberIds,
+        `${kind}\0${String(arg[1])}\0${String(arg[2][0])}\0${String(arg[2][1])}`);
+      return [kind, owner, member, descriptor];
+    }
+    if (Array.isArray(arg)) return arg.map((value) => canonicalArg(value));
+    if (arg && typeof arg === "object") {
+      return Object.fromEntries(Object.entries(arg).map(([key, value]) =>
+        [key, canonicalArg(value)]));
+    }
+    if (typeof arg === "string" &&
+        (op === "new" || op === "anewarray" || op === "checkcast" ||
+          op === "instanceof" || op === "multianewarray")) {
+      return ["Class", classId(arg)];
+    }
+    return arg;
+  };
   for (const method of methods) {
+    hash = mixString(hash, normalizeDescriptor(method.descriptor));
     for (const item of jit.getCodeItems(method)) {
       const instruction = item && item.instruction;
       const op = getOp(instruction);
       if (!op) continue;
       hash = mixString(hash, op);
       if (instruction && typeof instruction === "object" && "arg" in instruction) {
-        hash = mixString(hash, JSON.stringify(instruction.arg) ?? "");
+        hash = mixString(hash, JSON.stringify(canonicalArg(instruction.arg, op)) ?? "");
       }
     }
   }
   return hash >>> 0;
 }
 
-// dekobloko (original jar): wf.a(IIIIIIIIIIIIZIII)V + oj.a(IIIIIIIBIIII[IIIII)V
-// + ve.a(IIIIIII[III)V — value printed via JVM_PRINT_FUSED_FINGERPRINT=1
-const KNOWN_FINGERPRINTS = new Set([4128814000]);
+// Original gradient wrapper+raster+scanline shape. The value is independent of
+// the three class/member names; print it via JVM_PRINT_FUSED_FINGERPRINT=1.
+const KNOWN_FINGERPRINTS = new Set([4103814565]);
 
-module.exports = { fingerprintMethods, matches, install };
+module.exports = {
+  fingerprintMethods,
+  matches,
+  install,
+  installRaster(region, jit, plan) {
+    return install(region, jit, { rasterPlan: plan });
+  },
+};
 
 function matches(jit, region) {
   const fingerprint = fingerprintMethods(jit, [
@@ -59,12 +105,14 @@ function matches(jit, region) {
   ]);
   if (typeof process !== "undefined" && process.env &&
       process.env.JVM_PRINT_FUSED_FINGERPRINT === "1") {
-    console.error(`fused ${region.family.name} fingerprint: ${fingerprint}`);
+    console.error(`fused ${region.family.name} fingerprint: ${fingerprint} ` +
+      `${region.wrapperMethod.descriptor} -> ${region.rasterMethod.descriptor} -> ` +
+      `${region.scanlineMethod.descriptor}`);
   }
   return KNOWN_FINGERPRINTS.has(fingerprint);
 }
 
-function install(region, jit) {
+function install(region, jit, options = {}) {
   const targets = region.staticTargets;
   const generatedWrapper = region.wrapperKernel;
   const readStatic = (i) => targets[i].kind === "map"
@@ -311,6 +359,35 @@ function install(region, jit) {
     if (rowTop < fieldE && fieldD[rowTop] !== Math.imul(rowTop, stride)) return false;
     if (rowMid < fieldE && fieldD[rowMid] !== Math.imul(rowMid, stride)) return false;
     return true;
+  }
+
+  if (options.rasterPlan) {
+    const plan = options.rasterPlan;
+    const generatedRaster = region.rasterKernel;
+    const semanticGradientRaster = function semanticGradientRaster(state, regionArg, helpers,
+      a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16) {
+      const fieldE = readStatic(plan.heightStatic) | 0;
+      const fieldA = readStatic(plan.widthStatic) | 0;
+      const fieldD = readStatic(plan.rowsStatic);
+      const stride = readStatic(plan.strideStatic) | 0;
+      if (!standardLayout(a12, fieldD, fieldE, fieldA, stride, a11, a3)) {
+        return generatedRaster(state, regionArg, helpers,
+          a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+      }
+      if (jit) jit.semanticFusedRasterRunCount =
+        (jit.semanticFusedRasterRunCount | 0) + 1;
+      return raster(fieldE, fieldA, fieldD, stride,
+        a0, a1, a2, a3, a4, a5, a6, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+    };
+    semanticGradientRaster.directKernel = function directGradientRaster(
+      fieldE, fieldA, fieldD, stride,
+      a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16) {
+      if (jit) jit.semanticFusedRasterRunCount =
+        (jit.semanticFusedRasterRunCount | 0) + 1;
+      return raster(fieldE | 0, fieldA | 0, fieldD, stride | 0,
+        a0, a1, a2, a3, a4, a5, a6, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+    };
+    return semanticGradientRaster;
   }
 
   function wrapper(state, regionArg, helpers, p0, p1, p2, p3, p4, p5, p6, p7,

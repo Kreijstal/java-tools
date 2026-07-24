@@ -53,8 +53,13 @@ function withEnv(t, vars) {
   });
 }
 
-async function makeHarness(t, className, source) {
-  withEnv(t, { JVM_WASM_JIT: '1', JVM_WASM_CHECKCAST: '1' });
+async function makeHarness(t, className, source, extraEnv = {}) {
+  withEnv(t, {
+    JVM_WASM_JIT: '1',
+    JVM_WASM_CHECKCAST: '1',
+    JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS: '0',
+    ...extraEnv,
+  });
   const classpath = compileJavaFixture(t, className, source);
   const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
   await jvm.loadClassByName(className);
@@ -102,6 +107,14 @@ public class InstanceLink {
     out[0] = sum;
     return sum;
   }
+  public static int driveParam(int[] out, Shape s, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      sum = (sum + s.mul(sum + i)) & 0xfffff;
+    }
+    out[0] = sum;
+    return sum;
+  }
   public static int driveCast(int[] out, int n) {
     Object a = new ShapeA();
     Object b = new ShapeB();
@@ -117,9 +130,11 @@ public class InstanceLink {
   }
   public static void plantA() { Holder.c = new ShapeA(); }
   public static void plantC() { Holder.c = new ShapeC(); }
+  public static void plantD() { Holder.c = new ShapeD(); }
   public static int driveMixed(int[] out, int n) {
     Shape a = new ShapeA();
     Shape c = Holder.c;
+    int writesBefore = Holder.writes;
     int sum = 0;
     for (int i = 0; i < n; i++) {
       Shape s;
@@ -128,6 +143,7 @@ public class InstanceLink {
       sum = (sum + r) & 0xfffff;
     }
     out[0] = sum;
+    out[1] = Holder.writes - writesBefore;
     return sum;
   }
   public static int driveSuper(int[] out, int n) {
@@ -160,7 +176,10 @@ abstract class Shape { abstract int mul(int v); }
 class ShapeA extends Shape { int mul(int v) { return (v & 0xffff) * 3; } }
 class ShapeB extends Shape { int mul(int v) { return (v ^ 31) + 1; } }
 class ShapeC extends Shape { int mul(int v) { return v - 7; } }
-class Holder { static Shape c; }
+class ShapeD extends Shape {
+  int mul(int v) { Holder.writes++; return v + 11; }
+}
+class Holder { static Shape c; static int writes; }
 class Sup2 { int g(int v) { return (v & 0xffff) * 3 + 1; } }
 class Sub2 extends Sup2 { int g(int v) { return super.g(v) ^ 5; } }
 `;
@@ -168,6 +187,7 @@ class Sub2 extends Sup2 { int g(int v) { return super.g(v) ^ 5; } }
 const mulA = (v) => ((v & 0xffff) * 3) | 0;
 const mulB = (v) => ((v ^ 31) + 1) | 0;
 const mulC = (v) => (v - 7) | 0;
+const mulD = (v) => (v + 11) | 0;
 
 function referenceDrive(n, mulEven, mulOdd) {
   let sum = 0;
@@ -232,10 +252,10 @@ test('checkcast compiles as a guarded import inside the loop', async (t) => {
   t.end();
 });
 
-test('a class loaded after compilation misses the map and deopts correctly', async (t) => {
+test('a pure target loaded after compilation installs without deoptimizing', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'InstanceLink', FIXTURE);
   const n = 4000;
-  const out = [0];
+  const out = [0, 0];
   out.type = '[I';
   await invoke(jvm, thread, 'InstanceLink', 'plantA', '()V', []);
   const expectedAA = referenceDrive(n, mulA, mulA);
@@ -254,9 +274,84 @@ test('a class loaded after compilation misses the map and deopts correctly', asy
   const expectedAC = referenceDrive(n, mulA, mulC);
   await invoke(jvm, thread, 'InstanceLink', 'driveMixed', '([II)I', [out, n]);
   t.equal(out[0], expectedAC, 'post-load round dispatches ShapeC correctly');
+  t.equal(out[1], 0, 'pure late target leaves caller-visible writes unchanged');
   if (st) {
-    t.ok(st.exits > exitsBefore, 'the unseen class took the miss-deopt path');
+    t.equal(st.exits, exitsBefore, 'late target continued without exiting the caller');
   }
+  t.ok(jvm.jit.wasmJit.lateInstanceTargetInstalls >= 1,
+    'the call-site map recorded a late target installation');
+  t.end();
+});
+
+test('late target with uncovered writes retains the safe deopt path', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'InstanceLink', FIXTURE);
+  const n = 4000;
+  const out = [0, 0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'InstanceLink', 'plantA', '()V', []);
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'InstanceLink', 'driveMixed', '([II)I', [out, n]);
+  }
+  const st = stateOf(jvm, 'InstanceLink.driveMixed([II)I');
+  const exitsBefore = st ? st.exits : 0;
+  await invoke(jvm, thread, 'InstanceLink', 'plantD', '()V', []);
+  await invoke(jvm, thread, 'InstanceLink', 'driveMixed', '([II)I', [out, n]);
+  t.equal(out[0], referenceDrive(n, mulA, mulD), 'stateful late target computes correctly');
+  t.equal(out[1], n >> 1, 'every target write remains visible across the call loop');
+  if (st) t.ok(st.exits > exitsBefore, 'uncovered writes force a pre-side-effect deopt');
+  t.ok(jvm.jit.wasmJit.lateInstanceTargetWriteRejects >= 1,
+    'write-summary guard rejected unsafe installation');
+  t.end();
+});
+
+test('late-target kill switch retains map-miss deoptimization', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'InstanceLink', FIXTURE, {
+    JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS: '1',
+  });
+  const n = 4000;
+  const out = [0, 0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'InstanceLink', 'plantA', '()V', []);
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'InstanceLink', 'driveMixed', '([II)I', [out, n]);
+  }
+  const st = stateOf(jvm, 'InstanceLink.driveMixed([II)I');
+  const exitsBefore = st ? st.exits : 0;
+  await invoke(jvm, thread, 'InstanceLink', 'plantC', '()V', []);
+  await invoke(jvm, thread, 'InstanceLink', 'driveMixed', '([II)I', [out, n]);
+  t.equal(out[0], referenceDrive(n, mulA, mulC), 'disabled path remains correct');
+  if (st) t.ok(st.exits > exitsBefore, 'disabled path deoptimizes on the unseen receiver');
+  t.equal(jvm.jit.wasmJit.lateInstanceTargetInstalls, 0, 'kill switch installs no targets');
+  t.end();
+});
+
+test('structured call import installs a pure late target', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'InstanceLink', FIXTURE, {
+    JVM_WASM_STRUCTURED: '1',
+    JVM_WASM_INSTANCE_INLINE: '0',
+  });
+  const n = 4000;
+  const out = [0];
+  out.type = '[I';
+  await jvm.loadClassByName('Shape');
+  jvm.classInitializationState.set('Shape', 'INITIALIZED');
+  await jvm.loadClassByName('ShapeA');
+  jvm.classInitializationState.set('ShapeA', 'INITIALIZED');
+  const shapeA = { type: 'ShapeA', fields: {} };
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'InstanceLink', 'driveParam', '([ILShape;I)I', [out, shapeA, n]);
+  }
+  const st = stateOf(jvm, 'InstanceLink.driveParam([ILShape;I)I');
+  t.ok(st && st.meta.structured, 'driveParam uses the structured call import');
+  const exitsBefore = st ? st.exits : 0;
+  await jvm.loadClassByName('ShapeC');
+  jvm.classInitializationState.set('ShapeC', 'INITIALIZED');
+  const shapeC = { type: 'ShapeC', fields: {} };
+  await invoke(jvm, thread, 'InstanceLink', 'driveParam', '([ILShape;I)I', [out, shapeC, n]);
+  t.equal(out[0], referenceDrive(n, mulC, mulC), 'structured late target computes correctly');
+  if (st) t.equal(st.exits, exitsBefore, 'structured caller stays in wasm');
+  t.ok(jvm.jit.wasmJit.lateInstanceTargetInstalls >= 1,
+    'structured import recorded a late target installation');
   t.end();
 });
 

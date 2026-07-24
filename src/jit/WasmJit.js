@@ -84,8 +84,56 @@ const {
   isNoOpExceptionHandler, liveExceptionRanges,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
+const {
+  normalizeArrayLoad,
+  normalizeArrayStore,
+} = require('../instructions/utils');
+const { expandWideInstruction } = require('../instructions');
 
 const EMPTY_WRITE_SET = new Set();
+
+function capturesBooleanStatic(method) {
+  const code = method && method.attributes &&
+    method.attributes.find((attribute) => attribute.type === 'code');
+  const items = code && code.code && code.code.codeItems;
+  const localIndex = (instruction, op, prefix) => {
+    const compact = op.match(new RegExp(`^${prefix}_([0-3])$`));
+    if (compact) return Number(compact[1]);
+    if (op !== prefix) return null;
+    const value = instruction && typeof instruction === 'object'
+      ? instruction.varnum ?? instruction.arg
+      : null;
+    const numeric = Number(value);
+    return Number.isInteger(numeric) ? numeric : null;
+  };
+  return Boolean(items && items.some((item, index) => {
+    const instruction = item && item.instruction;
+    if (!(getOp(instruction) === 'getstatic' &&
+      Array.isArray(instruction.arg) &&
+      Array.isArray(instruction.arg[2]) &&
+      instruction.arg[2][1] === 'Z')) return false;
+    for (let next = index + 1; next < items.length; next += 1) {
+      const nextInstruction = items[next] && items[next].instruction;
+      const nextOp = getOp(nextInstruction);
+      if (!nextOp) continue;
+      const capturedLocal = localIndex(nextInstruction, nextOp, 'istore');
+      if (capturedLocal === null) return false;
+      let crossedCall = false;
+      for (let use = next + 1; use < items.length; use += 1) {
+        const useInstruction = items[use] && items[use].instruction;
+        const useOp = getOp(useInstruction);
+        if (!useOp) continue;
+        if (useOp && useOp.startsWith('invoke')) crossedCall = true;
+        if (localIndex(useInstruction, useOp, 'istore') === capturedLocal) return false;
+        if (localIndex(useInstruction, useOp, 'iload') === capturedLocal) {
+          return crossedCall;
+        }
+      }
+      return false;
+    }
+    return false;
+  }));
+}
 
 
 
@@ -97,7 +145,12 @@ class MethodTranslator {
     this.className = className;
     this.wasmJit = wasmJit;
     const codeAttr = method.attributes.find((a) => a.type === 'code');
-    this.items = codeAttr.code.codeItems;
+    this.items = codeAttr.code.codeItems.map((item) => {
+      const instruction = item && item.instruction;
+      if (getOp(instruction) !== 'wide') return item;
+      const expanded = expandWideInstruction(instruction);
+      return expanded ? { ...item, instruction: expanded } : item;
+    });
     this.desc = parseMethodDescriptor(method.descriptor);
     this.isStatic = (method.flags || []).includes('static');
 
@@ -179,7 +232,7 @@ class MethodTranslator {
           if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${name}`);
           const value = monoArray.load(a, i);
           if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
-          return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+          return normalizeArrayLoad(value, null, a);
         }
         : (a, i) => {
           if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${name}`);
@@ -190,7 +243,9 @@ class MethodTranslator {
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
       self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
         if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${name}`);
-        if (!monoArray.store(a, i, v)) throw AIOOBE(i, monoArray.len(a));
+        if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+          throw AIOOBE(i, monoArray.len(a));
+        }
       });
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
@@ -605,13 +660,13 @@ class MethodTranslator {
   // invokevirtual/invokeinterface/invokespecial bound through a complete
   // closed-world dispatch table: the import selects the target module by the
   // receiver's runtime class. invokespecial is the statically-bound
-  // degenerate case. A receiver whose class loaded after compilation (map
-  // miss) deopts to the interpreter AT the invoke: the import restores the
-  // receiver and arguments onto the caller's operand stack — materializable
-  // because linking requires nothing underneath them — and the interpreter
-  // re-executes the site with full dynamic dispatch, so late class loading
-  // is safe without invalidation. A null receiver throws the guest NPE like
-  // err_div0; per-block demotion already keeps compiled blocks outside live
+  // degenerate case. A map miss may install an exact later-loaded target when
+  // its writes fit the caller's already-emitted cache kills. Other misses
+  // deopt to the interpreter AT the invoke: the import restores the receiver
+  // and arguments onto the caller's operand stack — materializable because
+  // linking requires nothing underneath them — and the interpreter
+  // re-executes the site with full dynamic dispatch. A null receiver throws
+  // the guest NPE like err_div0; per-block demotion keeps compiled blocks outside live
   // handler ranges. Any target may deopt (partial) or miss, so the caller
   // spills its typed slots before every instance call.
   compiledInstanceCallee(ins, itemIndex, underTypes, op) {
@@ -693,6 +748,16 @@ class MethodTranslator {
     const resumePc = itemIndex + 1;
     const scratchFrames = new Map(); // target st -> reusable deopt frame
     const stats = this.siteStatsFor(`vcall_${owner}.${name}@${this.className}.${this.method.name}:${itemIndex}`);
+    // Union of the targets known when the caller is emitted. A late target
+    // may be installed only when this already-emitted kill set covers all of
+    // its writes (`null` means every cache is killed).
+    let writes = new Set();
+    for (const st of direct ? [direct] : new Set(dispatch.values())) {
+      const sub = this.wasmJit.instanceWriteSummary(st.targetClassName, name, descriptor);
+      if (sub === null) { writes = null; break; }
+      for (const k of sub) writes.add(k);
+    }
+    const lateMissEpoch = new Map();
     const spillCallerSlots = (all) => {
       const locals = callerBox.frame.locals;
       for (let i = 0; i < slotCount; i++) locals[callerSlots[i]] = all[i];
@@ -704,10 +769,28 @@ class MethodTranslator {
       if (receiver === null || receiver === undefined) {
         throw NPE(`invoke ${key} on null`);
       }
-      const calleeSt = direct || dispatch.get(runtimeClassName(receiver));
+      const receiverClass = runtimeClassName(receiver);
+      let calleeSt = direct || dispatch.get(receiverClass);
+      if (!calleeSt && dispatch) {
+        // Do not redo an expensive failed resolution until either the class
+        // world or the set of ready compiled callees changes.
+        const epoch = `${this.jvm.classEpoch || 0}:${this.wasmJit.compileEpoch}`;
+        if (lateMissEpoch.get(receiverClass) !== epoch) {
+          lateMissEpoch.set(receiverClass, epoch);
+          calleeSt = this.wasmJit.resolveLateInstanceTarget(
+            owner, name, descriptor, receiverClass, writes,
+          );
+          if (calleeSt) {
+            dispatch.set(receiverClass, calleeSt);
+            lateMissEpoch.delete(receiverClass);
+            if (stats) stats.lateTargets += 1;
+          }
+        }
+      }
       if (!calleeSt) {
-        // class loaded after compilation: hand the site back to the
-        // interpreter with its operands restored
+        // A new target that is unavailable or has writes not covered by the
+        // caller's baked cache kills takes the original deopt path before
+        // any callee side effect.
         if (stats) stats.deopts += 1;
         spillCallerSlots(all);
         callerBox.frame.pc = itemIndex;
@@ -805,17 +888,9 @@ class MethodTranslator {
       }
       return meta.box.ret;
     };
-    // resume pc and dispatch map are baked in: one import per call site
+    // Resume pc and the patchable dispatch map live in one import per site.
     this.instanceSites = (this.instanceSites || 0) + 1;
     const importName = `vcall_${key}_${itemIndex}`.replace(/[^\w]/g, '_');
-    // union of the baked targets' write summaries; a later-loaded receiver
-    // class misses the map and deopts, so it cannot stale these caches
-    let writes = new Set();
-    for (const st of direct ? [direct] : new Set(dispatch.values())) {
-      const sub = this.wasmJit.instanceWriteSummary(st.targetClassName, name, descriptor);
-      if (sub === null) { writes = null; break; }
-      for (const k of sub) writes.add(k);
-    }
     return {
       argTypes: wParams.slice(slotCount + underCount),
       underTypes,
@@ -832,8 +907,8 @@ class MethodTranslator {
   checkcastImport(ins, itemIndex, underTypes) {
     // Opt-in: compiling casts is correct (see wasmInstanceLink tests) but
     // measured net-negative on dekobloko — it unlocks tiny deoptable
-    // callees (mi.c-style getter chains) whose per-call partial-protocol
-    // overhead exceeds interpreting them. Revisit with SSA inlining.
+    // callees whose per-call partial-protocol overhead exceeds interpreting
+    // them. Revisit when a larger region can keep these operations in wasm.
     if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled ||
         !this.wasmJit.checkcastEnabled) {
       throw new Unsupported('op checkcast');
@@ -947,8 +1022,8 @@ class MethodTranslator {
     const codeAttr = this.method.attributes.find((a) => a.type === 'code');
     const excTable = codeAttr.code.exceptionTable || [];
     const liveRanges = liveExceptionRanges(this.jvm, codeAttr.code, this.labelIndex);
-    // EH (mirrors the structured tier): one try/catch_all around the whole
-    // dispatcher loop plus a per-block current-pc local. Must be decided
+    // EH (mirrors the structured tier): one try_table/catch_all around the
+    // dispatcher body plus a per-block current-pc local. Must be decided
     // before the first addImport so every import gets the recording wrapper.
     const env = (typeof process !== 'undefined' && process.env) || {};
     this.ehMethod = env.JVM_WASM_EH !== '0' && liveRanges.length > 0;
@@ -1002,7 +1077,7 @@ class MethodTranslator {
     this.fieldCaches = new Map(); // cacheKey -> {valLocal, filledLocal, ...}
     this.refScratch = undefined;
 
-    // With EH the whole dispatcher loop runs under try/catch_all and a throw
+    // With EH the whole dispatcher loop runs under try_table/catch_all and a throw
     // dispatches at the current block's start pc. That pc stands in for every
     // op in the block, which is only sound when the block sits entirely
     // inside (or entirely outside) each live range — blocks STRADDLING a
@@ -1134,7 +1209,7 @@ class MethodTranslator {
     const body = [];
     if (this.ehMethod) {
       // Every block prologue stamps its start pc into curPcLocal; the
-      // try/catch_all INSIDE the dispatcher loop then dispatches any guest
+      // try_table/catch_all INSIDE the dispatcher loop then dispatches any guest
       // exception at that pc — to a compiled handler block by re-entering
       // the br_table (the throw→handler→continue cycle never leaves wasm),
       // or to the interpreter via -3 (slot locals are continuously live in
@@ -1151,7 +1226,17 @@ class MethodTranslator {
       }
     }
     body.push(OP.loop, 0x40);
-    if (this.ehMethod) body.push(OP.try, 0x40);
+    if (this.ehMethod) {
+      // try_table handlers branch to an enclosing label. Normal completion
+      // skips the handler through $done; an exception branches through
+      // $catch and falls into the handler after that inner block.
+      body.push(
+        OP.block, 0x40, // $done
+        OP.block, 0x40, // $catch
+        OP.try_table, 0x40,
+        ...uleb(1), OP.catch_all_clause, ...uleb(0),
+      );
+    }
     for (let i = 0; i < N; i++) body.push(OP.block, 0x40);
     body.push(OP.local_get, ...uleb(this.blkLocal));
     body.push(OP.br_table, ...uleb(N));
@@ -1193,7 +1278,9 @@ class MethodTranslator {
       });
       const ehTgt = this.nextLocal++;
       this.declared.push(T.i32);
-      body.push(OP.catch_all);
+      body.push(OP.end); // try_table
+      body.push(OP.br, ...uleb(1)); // normal completion -> $done
+      body.push(OP.end); // $catch; caught exceptions enter the handler here
       body.push(OP.call, ...uleb(this.addImport('eh_pending', [], [T.i32],
         () => (box.pendingException !== null ? 1 : 0))));
       body.push(OP.if, 0x40);
@@ -1206,7 +1293,7 @@ class MethodTranslator {
       body.push(OP.call, ...uleb(ehTakeIdx));
       body.push(OP.local_set, ...uleb(this.stackLocalFor(0, T.ref)));
       body.push(OP.local_get, ...uleb(ehTgt), OP.local_set, ...uleb(this.blkLocal));
-      body.push(OP.br, ...uleb(3)); // 0=this if, 1=outer if, 2=try, 3=loop
+      body.push(OP.br, ...uleb(3)); // 0=this if, 1=outer if, 2=$done, 3=loop
       body.push(OP.end);
       body.push(...this.spillSeq());
       body.push(OP.local_get, ...uleb(this.curPcLocal));
@@ -1217,7 +1304,7 @@ class MethodTranslator {
       body.push(OP.call, ...uleb(this.addImport('eh_rethrow', [], [],
         () => { throw box.lastThrown; })));
       body.push(OP.unreachable);
-      body.push(OP.end);        // try
+      body.push(OP.end);        // $done
       body.push(OP.unreachable);
     }
     body.push(OP.end);          // loop
@@ -1289,7 +1376,10 @@ class MethodTranslator {
     const map = this.wasmJit && this.wasmJit.siteStats;
     if (!map) return null;
     let stats = map.get(key);
-    if (!stats) { stats = { calls: 0, deopts: 0, scratch: 0 }; map.set(key, stats); }
+    if (!stats) {
+      stats = { calls: 0, deopts: 0, scratch: 0, lateTargets: 0 };
+      map.set(key, stats);
+    }
     return stats;
   }
 
@@ -1353,8 +1443,9 @@ class MethodTranslator {
   compileBlock(b, N) {
     const from = this.blockStarts[b];
     const to = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
-    // under EH a `try` sits between the loop label and the block nest
-    const depthToTop = N - 1 - b + (this.ehMethod ? 1 : 0);
+    // Under EH, $done, $catch, and try_table sit between the loop label and
+    // the block nest. Branches that re-enter the dispatcher cross all three.
+    const depthToTop = N - 1 - b + (this.ehMethod ? 3 : 0);
     const code = [];
     const stack = (this.entryStacks.get(b) || []).slice(); // wasm types, bottom-up
     // provenance: which local slot (if any) a stacked value was loaded from —
@@ -1761,7 +1852,7 @@ class MethodTranslator {
         emit(OP.i32_const, ...sleb(-1), OP.return);
         return code;
       } else if (op === 'athrow' && this.ehMethod) {
-        // Throw the ref JS-side; the method-level try/catch_all dispatches it
+        // Throw the ref JS-side; the method-level try_table handler dispatches it
         // at this block's pc via -3. Only compiled under EH — without the
         // try, an unwind here would lose to the interpreter's precise-pc
         // handling that demotion currently provides.
@@ -1882,6 +1973,7 @@ class WasmJit {
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
     this.structuredEnabled = env.JVM_WASM_STRUCTURED === '1';
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
+    this.lateInstanceTargetsEnabled = env.JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS !== '1';
     this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
     this.hierarchy = new ClassHierarchy(jvm);
     this.structuredCompiles = 0;
@@ -1892,13 +1984,18 @@ class WasmJit {
       process.on('exit', () => {
         const rows = [...this.siteStats].sort((a, b) => b[1].calls - a[1].calls);
         for (const [site, s] of rows.slice(0, 40)) {
-          console.error(`[wasmjit-sites] ${site}: calls=${s.calls} deopts=${s.deopts} scratch=${s.scratch}`);
+          console.error(`[wasmjit-sites] ${site}: calls=${s.calls} deopts=${s.deopts} ` +
+            `scratch=${s.scratch}${s.lateTargets ? ` lateTargets=${s.lateTargets}` : ''}`);
         }
       });
     }
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
     this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
+    this.lateInstanceTargetAttempts = 0;
+    this.lateInstanceTargetInstalls = 0;
+    this.lateInstanceTargetWriteRejects = 0;
+    this.lateInstanceTargetNotReady = 0;
   }
 
   methodState(frame) {
@@ -2052,6 +2149,14 @@ class WasmJit {
         structuredMeta = null;
       }
       const primary = structuredMeta || meta;
+      // A partial module can leave and later resume with locals captured
+      // before its first compiled block. Until boolean-static values have a
+      // verifier-backed spill proof across every unsupported edge, keep this
+      // uncommon shape in the generated/interpreted tiers. Treating a lost
+      // opaque-predicate local as true can skip arbitrary guest side effects.
+      if (!primary.fullyCompiled && capturesBooleanStatic(frame.method)) {
+        throw new Unsupported('partial module captures a boolean static');
+      }
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
         // NestedDeopt when it reaches a demoted block, so demoted diagnostic
@@ -2395,7 +2500,46 @@ class WasmJit {
     return cm.externalEntry.has(0) ? st : null;
   }
 
+  // A virtual-call import is built from the classes loaded at compile time.
+  // When a receiver from a later-loaded class reaches that import, resolve
+  // its exact immutable implementation and install it into this call site's
+  // map. Continuing inside wasm is sound only when the new implementation's
+  // transitive field writes are covered by the cache kills already emitted
+  // in the caller; otherwise retain the original deopt-before-side-effects
+  // behavior. `null` means the caller already kills every field cache.
+  resolveLateInstanceTarget(owner, name, descriptor, runtimeClass, allowedWrites) {
+    if (!this.lateInstanceTargetsEnabled) return null;
+    this.lateInstanceTargetAttempts += 1;
+    const resolved = this.hierarchy.resolveDispatch(owner, name, descriptor);
+    const impl = resolved && resolved.targets.get(runtimeClass);
+    if (!impl) {
+      this.lateInstanceTargetNotReady += 1;
+      return null;
+    }
+    const targetWrites = this.instanceWriteSummary(impl.className, name, descriptor);
+    if (allowedWrites !== null &&
+        (targetWrites === null || [...targetWrites].some((key) => !allowedWrites.has(key)))) {
+      this.lateInstanceTargetWriteRejects += 1;
+      return null;
+    }
+    const st = this.findReadyInstance(impl.className, name, descriptor);
+    if (!st) {
+      this.lateInstanceTargetNotReady += 1;
+      return null;
+    }
+    const meta = (st.callee || st).meta;
+    if (st.linkVetoed && !meta.fullyCompiled) {
+      this.lateInstanceTargetNotReady += 1;
+      return null;
+    }
+    this.lateInstanceTargetInstalls += 1;
+    return st;
+  }
+
   dumpStats() {
+    console.error(`[wasmjit] late instance targets: attempts=${this.lateInstanceTargetAttempts} ` +
+      `installs=${this.lateInstanceTargetInstalls} writeRejects=${this.lateInstanceTargetWriteRejects} ` +
+      `notReady=${this.lateInstanceTargetNotReady}`);
     for (const st of this.compiled) {
       console.error(`[wasmjit] ${st.key}: runs=${st.runs} exits=${st.exits}` +
         `${st.fuelExits ? ` fuelExits=${st.fuelExits}` : ''}${st.meta && st.meta.structured ? ' structured' : ''}`);
@@ -2405,5 +2549,6 @@ class WasmJit {
 
 module.exports = WasmJit;
 module.exports._test = {
-  isNoOpExceptionHandler, toWasmValue, wasmFunctionNameSection, wasmProfilerName, T,
+  capturesBooleanStatic, isNoOpExceptionHandler, toWasmValue,
+  wasmFunctionNameSection, wasmProfilerName, T,
 };

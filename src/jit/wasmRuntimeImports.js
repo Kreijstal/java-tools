@@ -18,6 +18,10 @@ const {
   descToWasm, toWasmValue, parseMethodDescriptor,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
+const {
+  normalizeArrayLoad,
+  normalizeArrayStore,
+} = require('../instructions/utils');
 
 function addRuntimeImports(reg, box) {
   reg.addImport('push_i', [T.i32], [], (v) => { box.frame.stack.push(v); });
@@ -56,7 +60,7 @@ function addArrayImports(reg, methodName) {
         if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
         const value = monoArray.load(a, i);
         if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
-        return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+        return normalizeArrayLoad(value, null, a);
       }
       : (a, i) => {
         if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
@@ -67,7 +71,9 @@ function addArrayImports(reg, methodName) {
     reg.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
     reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
       if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${methodName}`);
-      if (!monoArray.store(a, i, v)) throw AIOOBE(i, monoArray.len(a));
+      if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+        throw AIOOBE(i, monoArray.len(a));
+      }
     });
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);

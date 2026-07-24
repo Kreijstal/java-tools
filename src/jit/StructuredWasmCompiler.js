@@ -16,7 +16,7 @@
 // exit stubs — spill the block's reaching slot defs + entry
 // stack and return its item index; the interpreter (and the dispatcher OSR
 // module) take over. Blocks inside live exception-handler ranges compile with
-// wasm try/catch_all around every throwing op (status -3 = guest exception
+// wasm try_table/catch_all around every throwing op (status -3 = guest exception
 // dispatched at a precise pc); athrow compiles as a throwing import. The
 // handler bodies themselves stay interpreter-entered (exception dispatch).
 // invokestatic binds directly
@@ -27,6 +27,7 @@ const { buildCfgFromCode, structure, IrreducibleError } = require('../decompiler
 const { buildSsa } = require('../analysis/opgraph/ssa');
 const {
   T, OP, TRUNC_SAT, uleb, sleb, f32bytes, f64bytes,
+  emitTryTableCatchAll,
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   Unsupported, NestedDeopt, isGuestThrow, sig, assembleModule, liveExceptionRanges,
@@ -194,7 +195,7 @@ class StructuredWasmCompiler {
 
     // Live handler ranges. With EH enabled (default), blocks they cover
     // compile anyway: every throwing op inside such a method is wrapped in
-    // wasm try/catch_all — a guest exception spills the locals reaching that
+    // wasm try_table/catch_all — a guest exception spills the locals reaching that
     // op, records the throw pc, and returns status -3 so the interpreter's
     // handleException dispatches precisely. Without EH (JVM_WASM_EH=0) the
     // covered blocks demote as before. labelIndex is in EXPANDED item space;
@@ -697,11 +698,11 @@ class StructuredWasmCompiler {
       });
       if (this.ehMethod) {
         const site = this.ehSiteFor(term.itemIdx);
-        out.push(OP.try, 0x40);
-        out.push(...this.useOf(value), OP.call, ...uleb(idx));
-        out.push(OP.catch_all);
-        this.emitEhCatch(term.slotState, site, out);
-        out.push(OP.end);
+        emitTryTableCatchAll(
+          out,
+          body => body.push(...this.useOf(value), OP.call, ...uleb(idx)),
+          handler => this.emitEhCatch(term.slotState, site, handler),
+        );
       } else {
         out.push(...this.useOf(value), OP.call, ...uleb(idx));
       }
@@ -732,16 +733,16 @@ class StructuredWasmCompiler {
   // In a method with live handler ranges every throwing op — covered or not —
   // must dispatch exceptions with a precise pc: an unwrapped throw would reach
   // handleException with a stale frame.pc that can falsely match a live range.
-  // try/catch_all is free when nothing throws; on a guest exception the catch
-  // arm spills the locals reaching this op (its wasm locals are all still
+  // try_table/catch_all is free when nothing throws; on a guest exception the
+  // handler spills the locals reaching this op (its wasm locals are all still
   // live), records the throw pc, and returns -3. Host errors rethrow.
   emitEhWrapped(node, out) {
     const site = this.ehSiteFor(node.itemIdx);
-    out.push(OP.try, 0x40);
-    this.emitNode(node, out);
-    out.push(OP.catch_all);
-    this.emitEhCatch(node.slotState, site, out);
-    out.push(OP.end);
+    emitTryTableCatchAll(
+      out,
+      body => this.emitNode(node, body),
+      handler => this.emitEhCatch(node.slotState, site, handler),
+    );
   }
 
   ehSiteFor(itemIdx) {
@@ -1233,10 +1234,11 @@ class StructuredWasmCompiler {
 
   // invokevirtual/invokeinterface/invokespecial bound through a closed-world
   // dispatch table, mirroring the dispatcher tier's compiledInstanceCallee.
-  // The import selects the target module by the receiver's runtime class; a
-  // map miss (class loaded after compilation) or an EH-compiled target sets
-  // deopt flag 1 so the interpreter re-executes the invoke with full dynamic
-  // dispatch. Targets that can exit run under the scratch-frame protocol.
+  // The import selects the target module by the receiver's runtime class. A
+  // map miss may install an exact later-loaded target when its writes fit the
+  // caller's already-emitted cache kills; otherwise deopt flag 1 makes the
+  // interpreter re-execute the invoke with full dynamic dispatch. Targets
+  // that can exit run under the scratch-frame protocol.
   instanceCallImport(node, op) {
     const [, owner, [name, descriptor]] = node.imm;
     if (name === '<init>' || name === '<clinit>') {
@@ -1302,12 +1304,35 @@ class StructuredWasmCompiler {
     const box = this.box;
     const scratchFrames = new Map();
     const dummy = dummyRet(ret);
+    // Union of the targets known when the caller is emitted. Late targets
+    // can continue in wasm only when this kill set covers their writes.
+    let writes = new Set();
+    for (const st of direct ? [direct] : new Set(dispatch.values())) {
+      const sub = this.wasmJit.instanceWriteSummary(st.targetClassName, name, descriptor);
+      if (sub === null) { writes = null; break; }
+      for (const k of sub) writes.add(k);
+    }
+    const lateMissEpoch = new Map();
     const fn = (...args) => {
       const receiver = args[0];
       if (receiver === null || receiver === undefined) {
         throw { type: 'java/lang/NullPointerException', message: null };
       }
-      const calleeSt = direct || dispatch.get(runtimeClassName(receiver));
+      const receiverClass = runtimeClassName(receiver);
+      let calleeSt = direct || dispatch.get(receiverClass);
+      if (!calleeSt && dispatch) {
+        const epoch = `${this.jvm.classEpoch || 0}:${this.wasmJit.compileEpoch}`;
+        if (lateMissEpoch.get(receiverClass) !== epoch) {
+          lateMissEpoch.set(receiverClass, epoch);
+          calleeSt = this.wasmJit.resolveLateInstanceTarget(
+            owner, name, descriptor, receiverClass, writes,
+          );
+          if (calleeSt) {
+            dispatch.set(receiverClass, calleeSt);
+            lateMissEpoch.delete(receiverClass);
+          }
+        }
+      }
       if (!calleeSt) {
         box.deoptFlag = 1; // nothing ran: re-execute the invoke interpreted
         return dummy;
@@ -1316,14 +1341,6 @@ class StructuredWasmCompiler {
         calleeSt, calleeSt.targetClassName, args, argPosBySlot, scratchFrames, dummy,
       );
     };
-    // union of the baked targets' write summaries; a later-loaded receiver
-    // class misses the map and deopts, so it cannot stale these caches
-    let writes = new Set();
-    for (const st of direct ? [direct] : new Set(dispatch.values())) {
-      const sub = this.wasmJit.instanceWriteSummary(st.targetClassName, name, descriptor);
-      if (sub === null) { writes = null; break; }
-      for (const k of sub) writes.add(k);
-    }
     // invokespecial binds statically: keep its import distinct from a
     // virtual site sharing the same method key
     const prefix = op === 'invokespecial' ? 'scall' : 'vcall';

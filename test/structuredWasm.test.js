@@ -77,6 +77,16 @@ function structuredKeys(jvm) {
     .map((st) => st.key);
 }
 
+function containsBytes(bytes, pattern) {
+  outer: for (let offset = 0; offset <= bytes.length - pattern.length; offset += 1) {
+    for (let index = 0; index < pattern.length; index += 1) {
+      if (bytes[offset + index] !== pattern[index]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
 test('structured wasm compiles an int loop with branches and matches semantics', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredLoop', `
 public class StructuredLoop {
@@ -278,6 +288,8 @@ public class StructuredCatch {
   t.notOk([...st.meta.demoteReasons.values()].includes('live handler range'),
     `try range compiles under EH (${[...st.meta.demoteReasons.values()].join(', ') || 'none'})`);
   t.ok(st.meta.usedEh, 'EH catch sites were emitted for the try range');
+  t.ok(containsBytes(st.meta.bytes, [0x1f, 0x40, 0x01, 0x02, 0x00]),
+    'EH uses try_table with a catch_all clause');
   t.notOk(st.meta.fullyCompiled, 'not fullyCompiled with an exception table');
   t.end();
 });
@@ -790,6 +802,8 @@ public class DispatchEh {
   t.notOk(reasons.includes('live handler range'),
     `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
   t.ok(st.meta.usedEh, 'module carries the EH flag');
+  t.ok(containsBytes(st.meta.bytes, [0x1f, 0x40, 0x01, 0x02, 0x00]),
+    'dispatcher EH uses try_table with a catch_all clause');
   // ~2000 of the 4000 iterations throw; in-module handler dispatch keeps
   // them inside wasm, so exits stay far below the throw count
   t.ok(st.exits < 100,

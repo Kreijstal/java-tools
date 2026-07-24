@@ -10,9 +10,9 @@ const CAT2 = new Set([T.i64, T.f64]);
 
 const OP = {
   unreachable: 0x00, block: 0x02, loop: 0x03, if: 0x04, else: 0x05,
-  // legacy exception-handling proposal (supported by V8 and SpiderMonkey):
-  // try/catch_all catch JS exceptions thrown by imports; traps stay uncatchable
-  try: 0x06, catch_all: 0x19, end: 0x0b,
+  // Final exception-handling encoding. try_table catch clauses branch to an
+  // enclosing label instead of embedding a legacy catch body.
+  try_table: 0x1f, catch_all_clause: 0x02, end: 0x0b,
   br: 0x0c, br_if: 0x0d, br_table: 0x0e, return: 0x0f, call: 0x10,
   drop: 0x1a, select: 0x1b,
   local_get: 0x20, local_set: 0x21, local_tee: 0x22,
@@ -56,6 +56,38 @@ function uleb(n) {
     out.push(b);
   } while (n);
   return out;
+}
+
+// Emit:
+//   block $done
+//     block $catch
+//       try_table (catch_all $catch) { protected body }
+//       br $done
+//     end
+//     handler
+//   end
+//
+// A caught exception branches to $catch's end and enters the handler; normal
+// completion skips it. Both callbacks emit void-typed code. The handler runs
+// with one enclosing control label, matching the depth formerly occupied by
+// the legacy `try`, so branches in existing handler bodies retain their depth.
+function emitTryTableCatchAll(out, emitBody, emitCatch) {
+  const body = [];
+  const handler = [];
+  emitBody(body);
+  emitCatch(handler);
+  out.push(
+    OP.block, 0x40,
+    OP.block, 0x40,
+    OP.try_table, 0x40,
+    ...uleb(1), OP.catch_all_clause, ...uleb(0),
+    ...body,
+    OP.end,
+    OP.br, ...uleb(1),
+    OP.end,
+    ...handler,
+    OP.end,
+  );
 }
 
 function sleb(value) {
@@ -360,6 +392,7 @@ function liveExceptionRanges(jvm, code, labelIndex) {
 module.exports = {
   T, CAT2, OP, TRUNC_SAT,
   uleb, sleb, f32bytes, f64bytes,
+  emitTryTableCatchAll,
   wasmProfilerName, wasmFunctionNameSection,
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
   NPE, AIOOBE,
