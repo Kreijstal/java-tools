@@ -16,6 +16,8 @@ const {
   prepareSyncInstructions,
   syncHandler,
   syncInstruction,
+  syncFallback,
+  syncInvokeFallback,
 } = dispatch;
 const Frame = require("./frame");
 const DebugManager = require("../debug/DebugManager");
@@ -29,16 +31,56 @@ const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
 const { createClock } = require('./fakeClock');
 
+let browserYieldChannel = null;
+const browserYieldQueue = [];
+
 function yieldToEventLoop(delayMs = 0) {
   return new Promise((resolve) => {
     if (delayMs > 0) {
       setTimeout(resolve, delayMs);
     } else if (typeof setImmediate === "function") {
       setImmediate(resolve);
+    } else if (typeof MessageChannel === "function") {
+      // Browser setTimeout(0) is clamped after repeated scheduling. The JVM
+      // reaches this safe point every wall-clock slice, so that clamp can
+      // consume a material fraction of a render frame. MessageChannel queues
+      // a real browser task (allowing input, timers, and paint to progress)
+      // without the nested-timer delay.
+      if (!browserYieldChannel) {
+        browserYieldChannel = new MessageChannel();
+        browserYieldChannel.port1.onmessage = () => {
+          const resume = browserYieldQueue.shift();
+          if (resume) resume();
+        };
+      }
+      browserYieldQueue.push(resolve);
+      browserYieldChannel.port2.postMessage(0);
     } else {
       setTimeout(resolve, 0);
     }
   });
+}
+
+const BURST_TICK_OPTIONS = Object.freeze({ allowBurst: true });
+const TICK_CONTINUE = Object.freeze({ completed: false });
+const TICK_COMPLETE = Object.freeze({ completed: true });
+const JIT_TICK_SLOW = Object.freeze({ slow: true, skipJit: false });
+const JIT_TICK_SLOW_AFTER_PROBE = Object.freeze({ slow: true, skipJit: true });
+const PRIMITIVE_ARRAY_COMPONENTS = new Set(["Z", "B", "C", "S", "I", "J", "F", "D"]);
+
+function arrayComponentType(descriptor) {
+  if (typeof descriptor !== "string" || descriptor[0] !== "[") return null;
+  const component = descriptor.slice(1);
+  if (component.length === 1 && PRIMITIVE_ARRAY_COMPONENTS.has(component)) {
+    return { primitive: true, name: component };
+  }
+  if (component[0] === "L" && component.endsWith(";")) {
+    return { primitive: false, name: component.slice(1, -1) };
+  }
+  if (component[0] === "[") {
+    return { primitive: false, name: component };
+  }
+  return null;
 }
 
 class JVM {
@@ -50,30 +92,47 @@ class JVM {
     // hierarchy, devirtualization facts) memoize against it.
     this.classEpoch = 0;
     this.classInitializationState = new Map();
+    this.classInitializationOwners = new Map();
+    // Separate from classEpoch because a loaded class can become initialized
+    // without registering another class. Link-time JIT decisions that depend
+    // on initialized statics memoize against both epochs.
+    this.classInitializationEpoch = 0;
     this.invokedynamicCache = new Map();
     this.classObjectCache = new Map(); // className -> Class object (for maintaining identity)
     this.jarCache = new Map(); // jarPath -> JSZip instance
+    // Class loading is asynchronous in both Node and the browser. Multiple
+    // guest threads may request the same previously unseen class before the
+    // first archive read completes. Keep one in-flight load per normalized
+    // name so a later completion cannot replace an initialized class with a
+    // fresh static-field map.
+    this.classLoadPromises = new Map();
     this.jre = jreClasses;
     this.debugManager = new DebugManager();
+    const env = (typeof process !== 'undefined' && process.env) || {};
     this.classpath = options.classpath
       ? Array.isArray(options.classpath)
         ? options.classpath
         : [options.classpath]
       : ["."];
     this.verbose = options.verbose || false;
+    this._debugGetfield = env.JVM_DEBUG_GETFIELD || null;
+    this._debugPutfield = env.JVM_DEBUG_PUTFIELD || null;
+    this._debugPutfieldStack = Boolean(env.JVM_DEBUG_PUTFIELD_STACK);
     this.appletParameters = options.appletParameters || null;
     this.appletCodeBase = options.appletCodeBase || null;
     this.nextHashCode = 1;
     this.maxStackDepth = options.maxStackDepth || 1024;
-    const env = (typeof process !== 'undefined' && process.env) || {};
     // Linear heap for primitive arrays: TypedArray views over one wasm
     // memory, so compiled code can access elements without import crossings.
-    this.wasmHeap = env.JVM_WASM_HEAP === '1'
-      ? new (require('./wasmHeap').WasmHeap)(Number(env.JVM_WASM_HEAP_MB) || 256)
+    const wasmHeapEnabled = options.wasmHeap ?? env.JVM_WASM_HEAP === '1';
+    const wasmHeapMb = Number(options.wasmHeapMb ?? env.JVM_WASM_HEAP_MB) || 256;
+    this.wasmHeap = wasmHeapEnabled
+      ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
       : null;
     this.clock = options.clock || createClock({
       fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
       fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,
+      fakeTimeRealtime: options.fakeTimeRealtime ?? env.JVM_FAKE_TIME_REALTIME === '1',
     });
     const configuredYieldMs = options.eventLoopYieldMs ?? env.JVM_EVENT_LOOP_YIELD_MS;
     this.eventLoopYieldMs = Math.max(1, Number(configuredYieldMs) || 16);
@@ -87,7 +146,13 @@ class JVM {
     this._envTrace = !!env.JVM_TRACE;
     this._envProfileHot = env.JVM_PROFILE_HOT_METHODS === '1' ||
       env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1';
+    const schedulerTimingRate = Number(env.JVM_PROFILE_SCHEDULER_TIMES);
+    this._schedulerTimingProfile = Number.isFinite(schedulerTimingRate) && schedulerTimingRate > 0
+      ? { rate: Math.max(1, Math.floor(schedulerTimingRate)), random: 0x9e3779b9,
+        methods: new WeakMap(), samples: new Map() }
+      : null;
     this._envDebugThrow = !!env.JVM_DEBUG_THROW;
+    this._envDebugThrowType = env.JVM_DEBUG_THROW_TYPE || null;
     this.jitOptions = options.jit || {};
     this.jit = new JitCompiler(this, this.jitOptions);
 
@@ -99,6 +164,8 @@ class JVM {
 
     // Initialize JNI system
     this.jni = new JNI(this);
+    this._jreMethodCache = new Map();
+    this._jreMethodCacheVersion = this.jni.registryVersion;
     if (options.verbose) {
       this.jni.setVerbose(true);
     }
@@ -194,6 +261,7 @@ class JVM {
    * - And other JRE components
    */
   registerJreOverrides(overrides) {
+    if (this._jreMethodCache) this._jreMethodCache.clear();
     for (const className in overrides) {
       const classOverrides = overrides[className];
 
@@ -260,6 +328,26 @@ class JVM {
   }
 
   _jreFindMethod(className, methodName, descriptor) {
+    if (this._jreMethodCacheVersion !== this.jni.registryVersion) {
+      this._jreMethodCache.clear();
+      this._jreMethodCacheVersion = this.jni.registryVersion;
+    }
+    let classCache = this._jreMethodCache.get(className);
+    if (!classCache) {
+      classCache = new Map();
+      this._jreMethodCache.set(className, classCache);
+    }
+    let methodCache = classCache.get(methodName);
+    if (!methodCache) {
+      methodCache = new Map();
+      classCache.set(methodName, methodCache);
+    }
+    if (methodCache.has(descriptor)) return methodCache.get(descriptor);
+    const remember = (method) => {
+      const resolved = method || null;
+      methodCache.set(descriptor, resolved);
+      return resolved;
+    };
     // First check JNI registry for registered native methods
     const nativeMethod = this.jni.findNativeMethod(
       className,
@@ -267,12 +355,12 @@ class JVM {
       descriptor,
     );
     if (nativeMethod) {
-      return nativeMethod;
+      return remember(nativeMethod);
     }
 
     // It's not a JNI method. Only proceed if it's a JRE class.
     if (!this.jre[className]) {
-      return null;
+      return remember(null);
     }
 
     // Continue with original JRE method lookup.  Several existing JRE
@@ -286,14 +374,14 @@ class JVM {
       // Check instance methods
       const method = currentClass.methods && currentClass.methods[methodKey];
       if (method) {
-        return method;
+        return remember(method);
       }
 
       // Check static methods
       const staticMethod =
         currentClass.staticMethods && currentClass.staticMethods[methodKey];
       if (staticMethod) {
-        return staticMethod;
+        return remember(staticMethod);
       }
 
       // Check superclass
@@ -311,12 +399,12 @@ class JVM {
       if (methodHandleClass && methodHandleClass.methods) {
         const universalMethod = methodHandleClass.methods['invoke([Ljava/lang/Object;)Ljava/lang/Object;'];
         if (universalMethod) {
-          return universalMethod;
+          return remember(universalMethod);
         }
       }
     }
 
-    return null;
+    return remember(null);
   }
 
 
@@ -546,16 +634,28 @@ class JVM {
     return this.executeAppletLifecycle(className, mainThread, appletObj);
   }
 
+  async executeUntilStackBelow(thread, stackSize) {
+    while (thread.callStack.size() >= stackSize) {
+      const result = await this.executeTick();
+      if (result.completed) break;
+      // Applet constructor/init/start execution happens before execute() owns
+      // the scheduler. Maintain the same wall-clock yield deadline here so a
+      // generated safe point does not see one permanently expired deadline
+      // and repeatedly materialize the rest of a lifecycle method.
+      if (Date.now() >= this._nextEventLoopYieldAt) {
+        await yieldToEventLoop();
+        this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
+      }
+    }
+  }
+
   async createAppletInstance(className, threadOverride = null) {
     // Ensure class is loaded
     const thread = threadOverride || this.threads[0];
     let wasFramePushed = await this.initializeClassIfNeeded(className, thread);
     while (wasFramePushed) {
       const originalStackSize = thread.callStack.size();
-      while (thread.callStack.size() >= originalStackSize) {
-        const result = await this.executeTick();
-        if (result.completed) break;
-      }
+      await this.executeUntilStackBelow(thread, originalStackSize);
       wasFramePushed = await this.initializeClassIfNeeded(className, thread);
     }
     /* HARDENED: Rethrow with more context */
@@ -769,10 +869,7 @@ class JVM {
       
       // Execute constructor to completion
       const originalStackSize = mainThread.callStack.size();
-      while (mainThread.callStack.size() >= originalStackSize) {
-        const result = await this.executeTick();
-        if (result.completed) break;
-      }
+      await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
     // Call init() method if it exists
@@ -786,10 +883,7 @@ class JVM {
       
       // Execute init to completion
       const originalStackSize = mainThread.callStack.size();
-      while (mainThread.callStack.size() >= originalStackSize) {
-        const result = await this.executeTick();
-        if (result.completed) break;
-      }
+      await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
     // Call start() method if it exists
@@ -803,10 +897,7 @@ class JVM {
       
       // Execute start to completion
       const originalStackSize = mainThread.callStack.size();
-      while (mainThread.callStack.size() >= originalStackSize) {
-        const result = await this.executeTick();
-        if (result.completed) break;
-      }
+      await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
     // Call repaint() to trigger paint method
@@ -822,7 +913,17 @@ class JVM {
 
     try {
       while (!this.debugManager.isPaused) {
-        const result = await this.executeTick({ allowBurst: true });
+        const scheduled = this._prepareSchedulerTick();
+        const timingSample = this._beginSchedulerTiming(scheduled);
+        const fastResult = this._tryExecuteSynchronousJitTick(scheduled);
+        let result;
+        if (fastResult && fastResult.slow) {
+          result = this.executeTick(BURST_TICK_OPTIONS, scheduled, fastResult.skipJit);
+        } else {
+          result = fastResult;
+        }
+        if (result && typeof result.then === "function") result = await result;
+        this._endSchedulerTiming(timingSample);
         if (result.completed) {
           this.debugManager.pause();
           return { completed: true, paused: false };
@@ -869,7 +970,106 @@ class JVM {
     return { paused: true, completed: false };
   }
 
-  async executeTick(options = {}) {
+  enqueueAwtEventInvocation(listener, methodName, descriptor, event, coalesce = false) {
+    if (!listener || !listener.type || !methodName || !descriptor) return;
+    if (!this._awtEventQueue) this._awtEventQueue = [];
+    const record = { listener, methodName, descriptor, event };
+    const tail = this._awtEventQueue[this._awtEventQueue.length - 1];
+    if (coalesce && tail && tail.listener === listener &&
+        tail.methodName === methodName && tail.descriptor === descriptor) {
+      tail.event = event;
+    } else {
+      this._awtEventQueue.push(record);
+    }
+    this._scheduleAwtEventPump();
+  }
+
+  _scheduleAwtEventPump() {
+    if (this._awtEventPumpTimer !== undefined) return;
+    this._awtEventPumpTimer = setTimeout(async () => {
+      delete this._awtEventPumpTimer;
+      let thread = this._awtEventThread;
+      if (thread && !thread.callStack.isEmpty()) {
+        this._scheduleAwtEventPump();
+        return;
+      }
+      const record = this._awtEventQueue && this._awtEventQueue.shift();
+      if (!record) return;
+      const method = await this.findMethodInHierarchy(
+        record.listener.type, record.methodName, record.descriptor);
+      if (method) {
+        if (!thread) {
+          thread = {
+            id: this.threads.length,
+            name: 'AWT-EventQueue-0',
+            callStack: new Stack(),
+            status: 'terminated',
+            pendingException: null,
+          };
+          this._awtEventThread = thread;
+          this.threads.push(thread);
+        }
+        const frame = new Frame(method);
+        frame.className = record.listener.type;
+        frame.locals[0] = record.listener;
+        frame.locals[1] = record.event;
+        thread.callStack.push(frame);
+        thread.status = 'runnable';
+        this._awtInputDispatchCount = (this._awtInputDispatchCount || 0) + 1;
+      }
+      if (this._awtEventQueue.length || thread && !thread.callStack.isEmpty()) {
+        this._scheduleAwtEventPump();
+      }
+    }, 4);
+  }
+
+  _beginSchedulerTiming(scheduled) {
+    const profile = this._schedulerTimingProfile;
+    if (!profile || !scheduled || !scheduled.thread) return null;
+    profile.random = (Math.imul(profile.random, 1664525) + 1013904223) >>> 0;
+    if (profile.random >= 0x100000000 / profile.rate) return null;
+    const frame = scheduled.callStack && !scheduled.callStack.isEmpty()
+      ? scheduled.callStack.peek() : null;
+    if (!frame || !frame.method) return null;
+    let key = profile.methods.get(frame.method);
+    if (!key) {
+      const owner = frame.className || this.findClassNameForMethod(frame.method) || '<unknown>';
+      key = `${owner}.${frame.method.name}${frame.method.descriptor}`;
+      profile.methods.set(frame.method, key);
+    }
+    return { key, started: performance.now() };
+  }
+
+  _endSchedulerTiming(sample) {
+    if (!sample) return;
+    const elapsedMs = performance.now() - sample.started;
+    const samples = this._schedulerTimingProfile.samples;
+    const previous = samples.get(sample.key) || { samples: 0, totalMs: 0, maxMs: 0 };
+    previous.samples += 1;
+    previous.totalMs += elapsedMs;
+    previous.maxMs = Math.max(previous.maxMs, elapsedMs);
+    samples.set(sample.key, previous);
+  }
+
+  dumpSchedulerTimings(limit = 30) {
+    const profile = this._schedulerTimingProfile;
+    if (!profile) return;
+    console.error(`--- sampled scheduler wall time (1/${profile.rate}) ---`);
+    const rows = [...profile.samples.entries()]
+      .sort((a, b) => b[1].totalMs - a[1].totalMs)
+      .slice(0, Math.max(1, Number(limit) || 30));
+    for (const [method, value] of rows) {
+      console.error(`${value.totalMs.toFixed(3)}ms\t${value.samples}\t` +
+        `${value.maxMs.toFixed(3)}ms max\t${method}`);
+    }
+  }
+
+  resetSchedulerTimings() {
+    const profile = this._schedulerTimingProfile;
+    if (profile) profile.samples.clear();
+  }
+
+  _prepareSchedulerTick() {
     // On each tick, check for threads that need to be woken up.
     const hasTimedThread = this.threads.some((t) =>
       (t.status === 'SLEEPING' && t.sleepUntil !== undefined) ||
@@ -883,6 +1083,12 @@ class JVM {
       if (t.status === "JOINING" && t.joiningOn.status === "terminated") {
         t.status = "runnable";
         delete t.joiningOn;
+      }
+      if (t.status === "CLASS_INITIALIZATION_WAIT" &&
+          this.classInitializationState.get(t.waitingForClassInitialization) !==
+            "INITIALIZING") {
+        t.status = "runnable";
+        delete t.waitingForClassInitialization;
       }
       if (
         t.status === "BLOCKED" &&
@@ -917,7 +1123,7 @@ class JVM {
     }
 
     if (this.threads.every((t) => t.status === "terminated")) {
-      return { completed: true };
+      return { completed: true, schedulerNow };
     }
 
     // console.error(`Tick. Current thread: ${this.currentThreadIndex}. Statuses: ${this.threads.map(t => `${t.id}:${t.status}`).join(', ')}`);
@@ -925,33 +1131,78 @@ class JVM {
     let thread = this.threads[this.currentThreadIndex];
 
     // Find the next runnable thread
-    let initialThreadIndex = this.currentThreadIndex;
+    const initialThreadIndex = this.currentThreadIndex;
     while (thread.status !== "runnable") {
       this.currentThreadIndex =
         (this.currentThreadIndex + 1) % this.threads.length;
       thread = this.threads[this.currentThreadIndex];
       if (this.currentThreadIndex === initialThreadIndex) {
-        // We've looped through all threads and none are runnable.
-        // This could be a deadlock or all threads are waiting/blocked.
-        const nonTerminated = this.threads.filter(
-          (t) => t.status !== "terminated",
-        );
-        if (nonTerminated.length > 0) {
-          // Do not spin a zero-delay task while every guest thread is parked.
-          // A short timer still lets browser I/O, rendering, and notifications
-          // wake a thread promptly, while eliminating tens of thousands of
-          // postMessage-based scheduler polls per second.
-          await yieldToEventLoop(this._idleWaitDelay(schedulerNow));
-          return { completed: false };
-          //		continue;
-        } else {
-          // All threads are terminated.
-          return { completed: true };
-        }
+        // The completion scan above proved at least one thread is parked.
+        return { idle: true, schedulerNow };
       }
     }
 
-    const callStack = thread.callStack;
+    return { thread, callStack: thread.callStack, schedulerNow };
+  }
+
+  _tryExecuteSynchronousJitTick(scheduled) {
+    if (scheduled.completed) return TICK_COMPLETE;
+    if (scheduled.idle) return JIT_TICK_SLOW;
+
+    const { thread, callStack } = scheduled;
+    if (callStack.size() > this.maxStackDepth || callStack.isEmpty()) {
+      return JIT_TICK_SLOW;
+    }
+    const frame = callStack.peek();
+    if (frame.pc >= frame.instructions.length) {
+      return JIT_TICK_SLOW;
+    }
+
+    try {
+      const jitResult = this.jit.tryRunFrame(frame, thread);
+      if (jitResult && typeof jitResult.then === "function") {
+        return jitResult.then(
+          (resolved) => this._finishSynchronousJitTick(resolved),
+          (error) => this._failSynchronousJitTick(error, thread),
+        );
+      }
+      return this._finishSynchronousJitTick(jitResult);
+    } catch (error) {
+      return this._failSynchronousJitTick(error, thread);
+    }
+  }
+
+  _finishSynchronousJitTick(jitResult) {
+    if (!jitResult.handled) return JIT_TICK_SLOW_AFTER_PROBE;
+    if (this.threads.length > 0) {
+      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+    }
+    return TICK_CONTINUE;
+  }
+
+  _failSynchronousJitTick(error, thread) {
+    const currentFrame = thread.callStack.peek();
+    const currentInstructionItem = currentFrame && currentFrame.instructions
+      ? currentFrame.instructions[currentFrame.pc]
+      : null;
+    const label = currentInstructionItem && currentInstructionItem.labelDef;
+    const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
+    this.handleException(error, currentPc, thread);
+    if (this.threads.length > 0) {
+      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+    }
+    return TICK_CONTINUE;
+  }
+
+  async executeTick(options = {}, scheduled = null, skipJit = false) {
+    scheduled = scheduled || this._prepareSchedulerTick();
+    if (scheduled.completed) return { completed: true };
+    if (scheduled.idle) {
+      await yieldToEventLoop(this._idleWaitDelay(scheduled.schedulerNow));
+      return { completed: false };
+    }
+
+    const { thread, callStack } = scheduled;
 
     if (callStack.size() > this.maxStackDepth) {
       const error = {
@@ -972,6 +1223,7 @@ class JVM {
     const frame = callStack.peek();
     if (frame.pc >= frame.instructions.length) {
       const popped = callStack.pop();
+      this.completeClassInitialization(popped);
       
       if (thread.isAwaitingReflectiveCall) {
         let ret = null;
@@ -986,13 +1238,22 @@ class JVM {
     }
 
     try {
-      const jitResult = await this.jit.tryRunFrame(frame, thread);
-      if (jitResult.handled) {
-        if (this.threads.length > 0) {
-          this.currentThreadIndex =
-            (this.currentThreadIndex + 1) % this.threads.length;
+      // Generated JavaScript and Wasm entries normally complete
+      // synchronously. Do not force a Promise/microtask round trip for those
+      // hot scheduler entries; the interpreter runner still returns a Promise
+      // when it genuinely reaches an asynchronous path.
+      if (!skipJit) {
+        let jitResult = this.jit.tryRunFrame(frame, thread);
+        if (jitResult && typeof jitResult.then === "function") {
+          jitResult = await jitResult;
         }
-        return { completed: false };
+        if (jitResult.handled) {
+          if (this.threads.length > 0) {
+            this.currentThreadIndex =
+              (this.currentThreadIndex + 1) % this.threads.length;
+          }
+          return { completed: false };
+        }
       }
     } catch (e) {
       const currentFrame = thread.callStack.peek();
@@ -1011,7 +1272,7 @@ class JVM {
       return { completed: false };
     }
 
-    prepareSyncInstructions(frame.instructions);
+    prepareSyncInstructions(frame.instructions, frame.method, frame.exceptionTable);
 
     const burstAllowed = options.allowBurst === true && !this.debugManager.debugMode &&
       !this.verbose && !this._envTrace && !this._envProfileHot;
@@ -1071,8 +1332,12 @@ class JVM {
               this,
               thread,
             );
-            if (result && typeof result.then === 'function') {
-              throw new Error('Synchronous instruction handler returned a Promise');
+            let resolvedResult = result;
+            if (resolvedResult && typeof resolvedResult.then === 'function') {
+              resolvedResult = await resolvedResult;
+            }
+            if (resolvedResult === syncFallback || resolvedResult === syncInvokeFallback) {
+              await dispatch(currentFrame, instruction, this, thread);
             }
           }
         }
@@ -1109,7 +1374,7 @@ class JVM {
   _idleWaitDelay(schedulerNow) {
     // Deterministic clocks advance when queried, not with wall time. Preserve
     // their fast, reproducible scheduler behavior instead of sleeping.
-    if (this.clock && this.clock.enabled) return 0;
+    if (this.clock && this.clock.enabled && !this.clock.realtime) return 0;
 
     let nextDeadline = Infinity;
     for (const thread of this.threads) {
@@ -1323,35 +1588,48 @@ class JVM {
       return this.createArrayClass(classNameWithSlashes);
     }
 
-    for (const cp of this.classpath) {
-      const lowerCp = String(cp).toLowerCase();
+    const pendingLoad = this.classLoadPromises.get(classNameWithSlashes);
+    if (pendingLoad) return pendingLoad;
 
-      if (lowerCp.endsWith('.jar') || lowerCp.endsWith('.zip')) {
-        const classData = await this.loadClassFromJar(cp, classNameWithSlashes);
-        if (classData && classData.ast) {
-          this.classes[classNameWithSlashes] = classData;
-          this.classEpoch += 1;
-          return classData;
+    const loadPromise = (async () => {
+      for (const cp of this.classpath) {
+        const lowerCp = String(cp).toLowerCase();
+
+        if (lowerCp.endsWith('.jar') || lowerCp.endsWith('.zip')) {
+          const classData = await this.loadClassFromJar(cp, classNameWithSlashes);
+          if (classData && classData.ast) {
+            this.classes[classNameWithSlashes] = classData;
+            this.classEpoch += 1;
+            return classData;
+          }
+          continue;
         }
-        continue;
+
+        const classFilePath = path.join(cp, `${classNameWithSlashes}.class`);
+        try {
+          const classData = await this.loadClassAsync(classFilePath);
+          if (classData && classData.ast) {
+            this.classes[classNameWithSlashes] = classData;
+            this.classEpoch += 1;
+            return classData;
+          }
+        } catch (error) {
+          if (error.code !== 'ENOENT') {
+            throw error;
+          }
+        }
       }
 
-      const classFilePath = path.join(cp, `${classNameWithSlashes}.class`);
-      try {
-        const classData = await this.loadClassAsync(classFilePath);
-        if (classData && classData.ast) {
-          this.classes[classNameWithSlashes] = classData;
-          this.classEpoch += 1;
-          return classData;
-        }
-      } catch (error) {
-        if (error.code !== 'ENOENT') {
-          throw error;
-        }
+      return null;
+    })();
+    this.classLoadPromises.set(classNameWithSlashes, loadPromise);
+    try {
+      return await loadPromise;
+    } finally {
+      if (this.classLoadPromises.get(classNameWithSlashes) === loadPromise) {
+        this.classLoadPromises.delete(classNameWithSlashes);
       }
     }
-
-    return null;
   }
 
   /**
@@ -1412,16 +1690,25 @@ class JVM {
   }
 
   async initializeClassIfNeeded(className, thread) {
-    if (
-      !className ||
-      this.classInitializationState.get(className) === "INITIALIZED"
-    ) {
+    const state = className && this.classInitializationState.get(className);
+    if (!className || state === "INITIALIZED") {
       return false;
     }
 
-    if (this.classInitializationState.get(className) === "INITIALIZING") {
-      // In a real multi-threaded JVM, the current thread would wait.
-      return false;
+    if (state === "ERRONEOUS") {
+      throw {
+        type: "java/lang/NoClassDefFoundError",
+        message: `Could not initialize class ${className}`,
+      };
+    }
+
+    if (state === "INITIALIZING") {
+      if (this.classInitializationOwners.get(className) === thread.id) {
+        return false;
+      }
+      thread.status = "CLASS_INITIALIZATION_WAIT";
+      thread.waitingForClassInitialization = className;
+      return true;
     }
 
     if (this.verbose) {
@@ -1429,6 +1716,7 @@ class JVM {
     }
 
     this.classInitializationState.set(className, "INITIALIZING");
+    this.classInitializationOwners.set(className, thread.id);
 
     // For JRE classes, we should already have them preloaded in this.classes
     let classData = this.classes[className];
@@ -1446,7 +1734,7 @@ class JVM {
         if (this.verbose) {
           console.warn(`JRE class ${className} not found in preloaded classes`);
         }
-        this.classInitializationState.set(className, "INITIALIZED");
+        this._markClassInitialized(className);
         return false;
       }
     }
@@ -1460,6 +1748,7 @@ class JVM {
         );
         if (wasSuperPushed) {
           this.classInitializationState.delete(className);
+          this.classInitializationOwners.delete(className);
           return true;
         }
       }
@@ -1586,17 +1875,50 @@ class JVM {
       if (staticInitializer) {
         const clinitFrame = new Frame(staticInitializer);
         clinitFrame.className = className; // Add className to the frame
+        clinitFrame.initializingClassName = className;
         thread.callStack.push(clinitFrame);
         // We pushed a bytecode initializer, so the calling instruction needs to be re-run.
-        // We set the state to initialized here to prevent re-entry, but the <clinit>
-        // code itself will run before any other instruction on this thread.
-        this.classInitializationState.set(className, "INITIALIZED");
         return true;
       }
     }
 
-    this.classInitializationState.set(className, "INITIALIZED");
+    this._markClassInitialized(className);
     return false;
+  }
+
+  _markClassInitialized(className) {
+    if (this.classInitializationState.get(className) !== "INITIALIZED") {
+      this.classInitializationEpoch += 1;
+    }
+    this.classInitializationState.set(className, "INITIALIZED");
+    this.classInitializationOwners.delete(className);
+    this._wakeClassInitializationWaiters(className);
+  }
+
+  completeClassInitialization(frame) {
+    const className = frame && frame.initializingClassName;
+    if (!className) return;
+    delete frame.initializingClassName;
+    this._markClassInitialized(className);
+  }
+
+  failClassInitialization(frame) {
+    const className = frame && frame.initializingClassName;
+    if (!className) return;
+    delete frame.initializingClassName;
+    this.classInitializationState.set(className, "ERRONEOUS");
+    this.classInitializationOwners.delete(className);
+    this._wakeClassInitializationWaiters(className);
+  }
+
+  _wakeClassInitializationWaiters(className) {
+    for (const candidate of this.threads) {
+      if (candidate.status === "CLASS_INITIALIZATION_WAIT" &&
+          candidate.waitingForClassInitialization === className) {
+        candidate.status = "runnable";
+        delete candidate.waitingForClassInitialization;
+      }
+    }
   }
 
   findMainMethod(classData) {
@@ -1830,10 +2152,17 @@ class JVM {
     if (target === "java/lang/Object" && className !== null) return true;
 
     if (className.startsWith && className.startsWith('[')) {
-      return target === 'java/lang/Object' ||
-        target === 'java/lang/Cloneable' ||
-        target === 'java/io/Serializable' ||
-        className === target;
+      if (target === 'java/lang/Object' ||
+          target === 'java/lang/Cloneable' ||
+          target === 'java/io/Serializable') return true;
+      const sourceComponent = arrayComponentType(className);
+      const targetComponent = arrayComponentType(target);
+      if (!sourceComponent || !targetComponent) return false;
+      if (sourceComponent.primitive || targetComponent.primitive) {
+        return sourceComponent.primitive && targetComponent.primitive &&
+          sourceComponent.name === targetComponent.name;
+      }
+      return this.isInstanceOf(sourceComponent.name, targetComponent.name);
     }
 
     const classData = this.classes[className];
@@ -1857,6 +2186,70 @@ class JVM {
     return false;
   }
 
+  // Loading-free assignability with an explicit "unknown" result. Generated
+  // code must not turn an unloaded array component (or an incomplete loaded
+  // hierarchy) into a definitive ClassCastException; it deoptimizes so the
+  // asynchronous resolver can load the missing classes first.
+  isInstanceOfSync(className, target, seen = new Set()) {
+    if (!className) return false;
+    if (className === target) return true;
+    if (target && !target.includes('/') && typeof className === 'string' &&
+        className.endsWith(`/${target}`)) return true;
+    if (target === "java/lang/Object" && className !== null) return true;
+
+    const visitKey = `${className}->${target}`;
+    if (seen.has(visitKey)) return false;
+    seen.add(visitKey);
+
+    if (className.startsWith && className.startsWith('[')) {
+      if (target === 'java/lang/Object' ||
+          target === 'java/lang/Cloneable' ||
+          target === 'java/io/Serializable') return true;
+      const sourceComponent = arrayComponentType(className);
+      const targetComponent = arrayComponentType(target);
+      if (!sourceComponent || !targetComponent) return false;
+      if (sourceComponent.primitive || targetComponent.primitive) {
+        return sourceComponent.primitive && targetComponent.primitive &&
+          sourceComponent.name === targetComponent.name;
+      }
+      return this.isInstanceOfSync(sourceComponent.name, targetComponent.name, seen);
+    }
+
+    const classData = this.classes[className];
+    if (classData && classData.ast && classData.ast.classes && classData.ast.classes[0]) {
+      const cls = classData.ast.classes[0];
+      let unknown = false;
+      const superResult = this.isInstanceOfSync(cls.superClassName, target, seen);
+      if (superResult === true) return true;
+      if (superResult === null) unknown = true;
+      for (const iface of cls.interfaces || []) {
+        const interfaceResult = this.isInstanceOfSync(iface, target, seen);
+        if (interfaceResult === true) return true;
+        if (interfaceResult === null) unknown = true;
+      }
+      return unknown ? null : false;
+    }
+
+    const jreClass = this.jre[className];
+    if (jreClass) {
+      const superName = typeof jreClass.super === "string"
+        ? jreClass.super
+        : (jreClass.super && jreClass.super.type) || null;
+      let unknown = false;
+      const superResult = this.isInstanceOfSync(superName, target, seen);
+      if (superResult === true) return true;
+      if (superResult === null) unknown = true;
+      for (const iface of jreClass.interfaces || []) {
+        const interfaceResult = this.isInstanceOfSync(iface, target, seen);
+        if (interfaceResult === true) return true;
+        if (interfaceResult === null) unknown = true;
+      }
+      return unknown ? null : false;
+    }
+
+    return null;
+  }
+
   async isInstanceOfAsync(className, target, seen = new Set()) {
     if (!className) return false;
     if (className === target) return true;
@@ -1868,10 +2261,17 @@ class JVM {
     seen.add(visitKey);
 
     if (className.startsWith && className.startsWith('[')) {
-      return target === 'java/lang/Object' ||
-        target === 'java/lang/Cloneable' ||
-        target === 'java/io/Serializable' ||
-        className === target;
+      if (target === 'java/lang/Object' ||
+          target === 'java/lang/Cloneable' ||
+          target === 'java/io/Serializable') return true;
+      const sourceComponent = arrayComponentType(className);
+      const targetComponent = arrayComponentType(target);
+      if (!sourceComponent || !targetComponent) return false;
+      if (sourceComponent.primitive || targetComponent.primitive) {
+        return sourceComponent.primitive && targetComponent.primitive &&
+          sourceComponent.name === targetComponent.name;
+      }
+      return this.isInstanceOfAsync(sourceComponent.name, targetComponent.name, seen);
     }
 
     let classData = this.classes[className];
@@ -1903,11 +2303,47 @@ class JVM {
   }
 
   handleException(exception, pc, thread) {
-    if (this._envDebugThrow) {
+    if (this._envDebugThrow ||
+        this._envDebugThrowType && exception &&
+          exception.type === this._envDebugThrowType) {
       const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
       const m = top && top.method ? top.method : {};
+      const scalar = (value) => {
+        if (value === null || value === undefined) return value;
+        if (typeof value === "bigint") return `${value}n`;
+        if (typeof value !== "object") return value;
+        if (Array.isArray(value) || ArrayBuffer.isView(value)) return `[${value.length}]`;
+        if (typeof value.type !== "string") return "<object>";
+        const summary = { type: value.type };
+        const fields = value.fields;
+        if (fields && typeof fields === "object") {
+          summary.fields = {};
+          for (const [name, fieldValue] of Object.entries(fields).slice(0, 24)) {
+            if (fieldValue === null || fieldValue === undefined ||
+                typeof fieldValue === "number" || typeof fieldValue === "boolean" ||
+                typeof fieldValue === "string") {
+              summary.fields[name] = fieldValue;
+            } else if (typeof fieldValue === "bigint") {
+              summary.fields[name] = `${fieldValue}n`;
+            } else if (Array.isArray(fieldValue) || ArrayBuffer.isView(fieldValue)) {
+              summary.fields[name] = `[${fieldValue.length}]`;
+            } else {
+              summary.fields[name] = `<${fieldValue.type || "object"}>`;
+            }
+          }
+        }
+        return summary;
+      };
       console.error(`[throw] ${exception && exception.type} msg=${exception && exception.message} ` +
-        `at ${top ? top.className : '?'}.${m.name || '?'}${m.descriptor || ''} pc=${top ? top.pc : '?'} thread=${thread.id}`);
+        `at ${top ? top.className : '?'}.${m.name || '?'}${m.descriptor || ''} ` +
+        `pc=${top ? top.pc : '?'} thread=${thread.id} ` +
+        `locals=${JSON.stringify(top && top.locals ? top.locals.map(scalar) : [])} ` +
+        `frames=${JSON.stringify((thread.callStack.items || []).slice(-5).reverse().map((item) => ({
+          method: `${item.className || "?"}.${item.method && item.method.name || "?"}` +
+            `${item.method && item.method.descriptor || ""}`,
+          pc: item.pc,
+          locals: (item.locals || []).map(scalar),
+        })))}`);
     }
     if (thread.pendingException) {
       delete thread.pendingException;
@@ -1931,6 +2367,7 @@ class JVM {
 
     if (this.dispatchExceptionInFrame(frame, exception, pcToCheck)) return;
 
+    this.failClassInitialization(frame);
     callStack.pop();
     this.handleException(exception, -1, thread);
   }
@@ -2018,6 +2455,7 @@ class JVM {
           className: frame.className || this.findClassNameForMethod(frame.method),
           methodName: frame.method.name,
           descriptor: frame.method.descriptor,
+          initializingClassName: frame.initializingClassName || null,
           locals: frame.locals,
           stack: frame.stack.items,
         })),
@@ -2101,6 +2539,9 @@ class JVM {
         const frame = new Frame(method);
         frame.className = frameState.className;
         frame.pc = frameState.pc;
+        if (frameState.initializingClassName) {
+          frame.initializingClassName = frameState.initializingClassName;
+        }
         frame.locals = frameState.locals;
         frame.stack.items = frameState.stack;
         thread.callStack.push(frame);
@@ -2120,6 +2561,14 @@ class JVM {
     this.currentThreadIndex = Math.min(state.currentThreadIndex || 0,
       Math.max(0, this.threads.length - 1));
     this.classInitializationState = new Map(state.classInitializationState || []);
+    this.classInitializationOwners = new Map();
+    for (const thread of this.threads) {
+      for (const frame of thread.callStack.items) {
+        if (frame.initializingClassName) {
+          this.classInitializationOwners.set(frame.initializingClassName, thread.id);
+        }
+      }
+    }
     this.nextHashCode = state.nextHashCode || 1;
     if (state.debugManager) this.debugManager.deserialize(state.debugManager);
     this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;

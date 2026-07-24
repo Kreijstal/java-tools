@@ -49,3 +49,22 @@ test('portable save states restore deterministic clock state', async (t) => {
     'restored entropy stream resumes from the checkpoint');
   t.end();
 });
+
+test('fake epoch can advance at wall-clock speed without query amplification', (t) => {
+  const clock = new (require('../src/core/fakeClock').RuntimeClock)({
+    fakeTime: 1000,
+    fakeTimeRealtime: true,
+  });
+  clock.wallOrigin = 5000;
+  const originalNow = Date.now;
+  Date.now = () => 5017;
+  t.teardown(() => { Date.now = originalNow; });
+  t.equal(clock.millis(), 1017, 'elapsed wall time is added to the fake epoch');
+  t.equal(clock.millis(), 1017, 'repeated queries do not advance guest time');
+  const snapshot = clock.snapshot();
+  const restored = new (require('../src/core/fakeClock').RuntimeClock)({ fakeTime: 9000 });
+  restored.restore(snapshot);
+  Date.now = () => 5022;
+  t.equal(restored.millis(), 1022, 'restored realtime clocks resume from the saved epoch');
+  t.end();
+});

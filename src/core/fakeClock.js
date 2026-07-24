@@ -12,12 +12,19 @@ class RuntimeClock {
       String(options.fakeTime) !== '';
     this.ms = this.enabled && Number.isFinite(base) && base > 0 ? base : 1000000000000;
     this.step = this.enabled && Number.isFinite(step) && step > 0 ? step : 1;
+    this.realtime = this.enabled && options.fakeTimeRealtime === true;
+    this.wallOrigin = Date.now();
+    this.msOrigin = this.ms;
     this.seedCounter = 0;
     this.lcg = 0x5DEECE66Dn;
   }
 
   millis() {
     if (!this.enabled) return Date.now();
+    if (this.realtime) {
+      this.ms = this.msOrigin + (Date.now() - this.wallOrigin);
+      return Math.floor(this.ms);
+    }
     this.ms += this.step;
     return Math.floor(this.ms);
   }
@@ -28,6 +35,10 @@ class RuntimeClock {
         return Number(process.hrtime.bigint());
       }
       return Date.now() * 1000000;
+    }
+    if (this.realtime) {
+      this.ms = this.msOrigin + (Date.now() - this.wallOrigin);
+      return Math.floor(this.ms * 1000000);
     }
     this.ms += this.step;
     return Math.floor(this.ms * 1000000);
@@ -47,10 +58,12 @@ class RuntimeClock {
 
   snapshot() {
     if (!this.enabled) return null;
+    if (this.realtime) this.millis();
     return {
       enabled: true,
       ms: this.ms,
       step: this.step,
+      realtime: this.realtime,
       seedCounter: this.seedCounter,
       lcg: String(this.lcg),
     };
@@ -61,6 +74,9 @@ class RuntimeClock {
     this.enabled = true;
     this.ms = Number(snapshot.ms);
     this.step = Number(snapshot.step);
+    this.realtime = snapshot.realtime === true;
+    this.wallOrigin = Date.now();
+    this.msOrigin = Number(snapshot.ms);
     this.seedCounter = Number(snapshot.seedCounter) || 0;
     this.lcg = BigInt(snapshot.lcg || '25214903917');
   }

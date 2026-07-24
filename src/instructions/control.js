@@ -24,6 +24,7 @@ module.exports = {
       delete thread.pendingException;
     }
     thread.callStack.pop();
+    jvm.completeClassInitialization(frame);
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(null);
       thread.isAwaitingReflectiveCall = false;
