@@ -277,6 +277,7 @@ async function benchmark(trace, tier) {
     roundHashes,
     roundStaticHashes,
     fusedRuns: runtime.jvm.jit.fusedRunCount,
+    fusedDirectRuns: runtime.jvm.jit.fusedDirectRunCount,
     wasmCompiles: runtime.jvm.jit.wasmJit?.compiled?.length || 0,
     wasmStructuredCompiles: runtime.jvm.jit.wasmJit?.structuredCompiles || 0,
     structuredRuns: runtime.jvm.jit.structuredSsa.runCount,

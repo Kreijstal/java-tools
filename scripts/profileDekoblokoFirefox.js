@@ -23,6 +23,8 @@ const traceMethod = process.env.PROBE_TRACE_METHOD || '';
 const traceOutput = process.env.PROBE_TRACE_OUTPUT || '';
 const fusedRegionsOverride = process.env.PROBE_FUSED_REGIONS === undefined
   ? null : process.env.PROBE_FUSED_REGIONS === '1';
+const directFusedCallsOverride = process.env.PROBE_DIRECT_FUSED_CALLS === undefined
+  ? null : process.env.PROBE_DIRECT_FUSED_CALLS === '1';
 const scalarLoopsOverride = process.env.PROBE_SCALAR_LOOPS === undefined
   ? null : process.env.PROBE_SCALAR_LOOPS === '1';
 const scalarSsaOverride = process.env.PROBE_SCALAR_SSA === undefined
@@ -31,6 +33,9 @@ const structuredSsaOverride = process.env.PROBE_STRUCTURED_SSA === undefined
   ? null : process.env.PROBE_STRUCTURED_SSA === '1';
 const structuredSplitOverride = process.env.PROBE_STRUCTURED_SPLIT === undefined
   ? null : process.env.PROBE_STRUCTURED_SPLIT === '1';
+const structuredDeferredCallsOverride =
+  process.env.PROBE_STRUCTURED_DEFERRED_CALLS === undefined
+    ? null : process.env.PROBE_STRUCTURED_DEFERRED_CALLS === '1';
 const rendererPipelineOverride = process.env.PROBE_RENDERER_PIPELINE === undefined
   ? null : process.env.PROBE_RENDERER_PIPELINE === '1';
 const handwrittenFusedOverride = process.env.PROBE_HANDWRITTEN_FUSED === undefined
@@ -143,8 +148,8 @@ function animationEstimate(changes) {
     await page.addInitScript(({ sampleStride, animationChangeTarget, collectJitMethods, collectJitTimings,
       collectSchedulerTimings, schedulerSampleRate, collectExclusiveTimings, exclusiveRoot,
       timingSampleRate, timingFilter, methodTraceKey,
-      fusedRegions, scalarLoops, scalarSsa, structuredSsa,
-      structuredSplit,
+      fusedRegions, directFusedCalls, scalarLoops, scalarSsa, structuredSsa,
+      structuredSplit, structuredDeferredCalls,
       rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache, wasmStructured }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
@@ -162,8 +167,14 @@ function animationEstimate(changes) {
         arrayCopyNoops: jit.intrinsicArrayCopyNoopCount,
         arrayCopyWithin: jit.intrinsicArrayCopyWithinCount,
         fused: jit.fusedRunCount,
+        fusedDirect: jit.fusedDirectRunCount,
         fusedFallbacks: jit.fusedGuardedFallbackCount,
         fusedRestoredFrames: jit.fusedRestoredExceptionFrameCount,
+        fusedDirectEntries: (jit.fusedRegions?.directEntries || []).map((entry) => ({
+          descriptor: entry.target?.method?.descriptor || null,
+          paramCount: entry.paramCount,
+          linked: Boolean(entry.region),
+        })),
         scalarLoops: jit.scalarLoopRunCount,
         scalarLoopSafePoints: jit.scalarLoopSafePointCount,
         scalarSsa: jit.scalarSsaRunCount,
@@ -197,6 +208,20 @@ function animationEstimate(changes) {
         jit.schedulerTimingInstalled = true;
         jit.schedulerTimingSamples = new Map();
         jit.schedulerTimingSampleRate = schedulerSampleRate;
+        // The main scheduler has a synchronous generated-code fast path which
+        // deliberately bypasses executeTick().  Feed the profiler into the
+        // scheduler's own timing hooks when available so those hot regions are
+        // included.  Keep the executeTick wrapper below for older bundles.
+        if (typeof jvm._beginSchedulerTiming === 'function' &&
+            typeof jvm._endSchedulerTiming === 'function') {
+          jvm._schedulerTimingProfile = {
+            rate: schedulerSampleRate,
+            random: 0x9e3779b9,
+            methods: new WeakMap(),
+            samples: jit.schedulerTimingSamples,
+          };
+          return;
+        }
         let randomState = 0x9e3779b9;
         const methodKeys = new WeakMap();
         const methodKey = (frame) => {
@@ -278,6 +303,9 @@ function animationEstimate(changes) {
         if (jvm?.jit?.fusedRegions && fusedRegions !== null) {
           jvm.jit.fusedRegions.enabled = fusedRegions;
         }
+        if (jvm?.jit?.fusedRegions && directFusedCalls !== null) {
+          jvm.jit.fusedRegions.directCallsEnabled = directFusedCalls;
+        }
         if (jvm?.jit?.fusedRegions && handwrittenFused !== null) {
           jvm.jit.fusedRegions.handwrittenKernelsEnabled = handwrittenFused;
         }
@@ -304,6 +332,10 @@ function animationEstimate(changes) {
         }
         if (jvm?.jit?.structuredSsa && structuredSplit !== null) {
           jvm.jit.structuredSsa.irreducibleSplittingEnabled = structuredSplit;
+        }
+        if (jvm?.jit?.structuredSsa && structuredDeferredCalls !== null) {
+          jvm.jit.structuredSsa.deferredCallMaterializationEnabled =
+            structuredDeferredCalls;
         }
         const pixels = [...(jvm?._softCanvases || [])][0]?._pixels;
         if (pixels) {
@@ -345,10 +377,12 @@ function animationEstimate(changes) {
       timingFilter: jitTimingFilter,
       methodTraceKey: traceMethod,
       fusedRegions: fusedRegionsOverride,
+      directFusedCalls: directFusedCallsOverride,
       scalarLoops: scalarLoopsOverride,
       scalarSsa: scalarSsaOverride,
       structuredSsa: structuredSsaOverride,
       structuredSplit: structuredSplitOverride,
+      structuredDeferredCalls: structuredDeferredCallsOverride,
       rendererPipeline: rendererPipelineOverride,
       handwrittenFused: handwrittenFusedOverride,
       wasmJit: wasmJitOverride,
@@ -393,8 +427,14 @@ function animationEstimate(changes) {
         arrayCopyNoops: jit?.intrinsicArrayCopyNoopCount || 0,
         arrayCopyWithin: jit?.intrinsicArrayCopyWithinCount || 0,
         fused: jit?.fusedRunCount || 0,
+        fusedDirect: jit?.fusedDirectRunCount || 0,
         fusedFallbacks: jit?.fusedGuardedFallbackCount || 0,
         fusedRestoredFrames: jit?.fusedRestoredExceptionFrameCount || 0,
+        fusedDirectEntries: (jit?.fusedRegions?.directEntries || []).map((entry) => ({
+          descriptor: entry.target?.method?.descriptor || null,
+          paramCount: entry.paramCount,
+          linked: Boolean(entry.region),
+        })),
         scalarLoops: jit?.scalarLoopRunCount || 0,
         scalarLoopSafePoints: jit?.scalarLoopSafePointCount || 0,
         scalarSsa: jit?.scalarSsaRunCount || 0,
@@ -450,6 +490,7 @@ function animationEstimate(changes) {
     result.scalarSsaEnabled = scalarSsaOverride;
     result.structuredSsaEnabled = structuredSsaOverride;
     result.structuredSplitEnabled = structuredSplitOverride;
+    result.structuredDeferredCallsEnabled = structuredDeferredCallsOverride;
     result.rendererPipelineEnabled = rendererPipelineOverride;
     result.wasmJitEnabled = wasmJitOverride;
     result.wasmFieldCacheEnabled = wasmFieldCacheOverride;

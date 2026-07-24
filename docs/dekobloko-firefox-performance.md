@@ -12,6 +12,9 @@ The results below were obtained on 2026-07-20 with Firefox/SpiderMonkey, an
 later results described below include the follow-up field-site and generated-call
 changes. Absolute timings depend on the machine and Firefox build; comparisons
 are useful only with the same JAR, bundle, browser, probe window, and host load.
+For the latest retained implementation, measurements, rejected experiments,
+and next action, see
+[the consolidated fused-renderer handoff](#2026-07-22-consolidated-handoff-the-fused-recompiled-renderer-investigation).
 
 ## Executive synthesis
 
@@ -920,7 +923,9 @@ Why the node bench is better for iteration:
 The recipe (all of it is load-bearing):
 
 ```bash
-JVM_FAKE_TIME=1000000000000 JVM_WASM_JIT=1 \
+JVM_FAKE_TIME=1000000000000 JVM_FAKE_TIME_REALTIME=1 \
+JVM_WASM_JIT=1 JVM_WASM_STRUCTURED=1 \
+JVM_ENABLE_RENDERER_PIPELINE=1 \
 JVM_FRAME_DIR=/tmp/frames JVM_FRAME_EVERY=25 JVM_FRAME_LIMIT=9 \
 JVM_EXIT_AFTER_FRAME_LIMIT=1 \
 node scripts/run-jvmjs.js <classesDir> gameport1=43595 gameport2=43595
@@ -936,9 +941,22 @@ node scripts/run-jvmjs.js <classesDir> gameport1=43595 gameport2=43595
 - `gameport1=43595 gameport2=43595` are applet-parameter overrides
   (run-jvmjs.js defaults to 43594); bare `key=value` CLI args become applet
   params.
-- `JVM_FAKE_TIME` unfreezes the game's sleeps; the `[frame] +<t>s` uptime is
-  REAL wall clock, so fps = frames / Δt directly.
+- `JVM_FAKE_TIME` supplies the old epoch the game expects, while
+  `JVM_FAKE_TIME_REALTIME=1` advances that epoch with wall time. Do not omit
+  realtime mode for throughput: legacy deterministic mode advances one step
+  per clock query and makes timed guest work scale with JVM execution speed.
+  The `[frame] +<t>s` uptime is REAL wall clock, so fps = frames / Δt directly.
 - fps over a warm window: skip to frame 25, e.g. 175 / (t₂₀₀ − t₂₅).
+
+Do not omit `JVM_ENABLE_RENDERER_PIPELINE=1` when comparing current results.
+The pipeline flag composes scalar guest bodies, fused wrapper/raster regions,
+and structured SSA; Wasm flags alone benchmark a materially slower tier mix.
+On revision `db4f5b0` plus the late-target working change, a configuration audit
+measured 20.833 frames/s for dispatcher Wasm alone, 21.341 for structured Wasm,
+and 23.333 for the composed pipeline. Three clean composed runs all measured
+**23.333 frames/s**, produced identical frame-0/frame-200 SHA-256 hashes, and
+reported no runtime errors. The earlier reported 20.833 median was therefore a
+benchmark-command regression, not a JVM performance regression.
 
 Known caveats: the measured scene is the title screen, not gameplay; every
 25th frame pays a PNG encode (a few percent); node cannot replace the Firefox
@@ -2517,3 +2535,1597 @@ block body in a wasm `try`; on `catch_all` the wasm locals are exactly the
 precise state, so spill them, then rethrow to the interpreter's handler
 dispatch. `checkcast` (an import calling isInstanceOf) and carried-stack
 shapes at demoted-adjacent blocks are the other remaining demotion sources.
+
+## 2026-07-22: late virtual targets and the audio-deopt false lead
+
+A class loaded after a virtual-call module was emitted used to miss that
+module's closed-world dispatch map forever. The dispatcher and structured
+Wasm tiers can now resolve and install the exact later-loaded implementation
+at the first miss. This remains class- and method-name independent. A target
+is admitted only when its transitive field writes are a subset of the cache
+kill set already emitted in the caller; otherwise the call takes the original
+deopt-before-side-effects path. Class/compile epochs suppress repeated failed
+resolution, and `JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS=1` is the kill switch.
+Tests cover a pure late target, a target rejected for uncovered writes, the
+kill switch, and both dispatcher and structured call imports.
+
+The real-game diagnostic produced a useful negative result. The two highest
+deopt-count sites were:
+
+- `en.a([II)V` calling the `ol.b([III)V` family: 16,284 calls and 16,284
+  deopts by frame 50;
+- `rc.run()V` calling `en.g()V`: about 16,000 calls and the same number of
+  deopts.
+
+Exact runtime-target attribution showed that the first site selects
+`mi.b([III)V`, the synchronized audio-mixer body, not a renderer raster. Its
+common child-list traversal is split by two `checkcast` operations. Enabling
+guarded casts made `mi.c([III)V` contiguous and reduced the first site's
+deopts to **zero** (roughly 30,000 calls in the comparable short run), while
+preserving the initial and frame-25 hashes. No late target was installed in
+this workload: the receiver class was already present and the selected target
+was partial, so late dispatch was not the missing link.
+
+The cast experiment was then narrowed to a structural default (only
+loop-bearing methods) and measured in a balanced three-run Node A/B over
+frames 25 through 200:
+
+| guarded loop casts | frame rates (frames/s) | median |
+| --- | --- | ---: |
+| off | 21.084, 20.588, 20.588 | **20.588** |
+| on | 20.833, 20.588, 20.588 | **20.588** |
+
+This diagnostic accidentally omitted `JVM_ENABLE_RENDERER_PIPELINE=1`; it is
+valid for comparing the audio-cast switch within that fixed tier mix, but it
+is **not** the current composed-pipeline FPS baseline. The corrected composed
+baseline is the 23.333 frames/s series documented in the Node recipe above.
+
+All six processes reported no runtime errors and the same initial surface
+hash. The short frame-25 differential also matched exactly. Later time-indexed
+hashes differed consistently because the two configurations reached different
+animation/server states; as documented above, those hashes are not a semantic
+oracle at unequal host progress. The throughput median was exactly neutral,
+so the automatic loop-cast policy was removed and guarded casts remain opt-in
+with `JVM_WASM_CHECKCAST=1`.
+
+This falsifies invocation/deopt count as the next-target heuristic once more:
+the large exit storm belongs to audio-thread work and is not limiting visual
+throughput. Do not spend the next renderer iteration on `mi`/`en` merely
+because their counters dominate. Use probe-free wall-time samples to select
+the next model/face or partial-Wasm boundary block.
+
+The final production-bundle Firefox 1509 acceptance series, with all timing
+and invocation probes disabled, measured 14.9972, 14.4573, and 14.8168 changed
+images/s: **14.8168 median**. Every run completed the 20-image window, began
+at the expected `4025147891` hash, and reported empty page/console error lists.
+This is a correctness and non-regression check for late dispatch, not evidence
+of an FPS gain: the feature installed no target in the observed game path and
+the result remains in the established ~15 FPS band, below both the 20 FPS
+acceptance threshold and the 30 FPS playability goal. Raw results are in
+`/tmp/dekobloko-late-dispatch-firefox.4WMGFv` for the measuring workspace.
+
+## 2026-07-22: remove method-boundary dispatch tax (23.33 → 28.69 Node FPS)
+
+The next successful optimization did not recognize a Dekobloko method at all.
+Time sampling showed that complete generated JS/Wasm entries were still paying
+an `async executeTick()` Promise/microtask round trip at every guest method
+boundary, while interpreted field and invoke sites repeatedly resolved facts
+that are stable after class loading. The runtime now has a guarded synchronous
+scheduler path and structural per-site caches:
+
+- `JitCompiler.tryRunFrame()` returns synchronously when the selected generated
+  body does. The main execution loop stays synchronous across those ticks;
+  genuine runner/native Promises, idle waits, reflection, and cold class work
+  retain the old async path.
+- initialized `getstatic` sites cache the declaring owner/key, while
+  `getfield`/`putfield` sites cache the resolved declaring slot. Cache metadata
+  is stored under Symbol keys, so it is absent from snapshots, JSON, AST
+  serialization, and debugger views.
+- interpreted static/special/virtual/interface bytecode calls use a two-entry,
+  class-epoch-guarded inline cache for already loaded bytecode or JRE/JNI
+  targets. Cold initialization/loading, null/boxed receivers, annotations,
+  lambdas, blocking calls, and actual Promises preserve the normal dispatcher.
+  Descriptors are parsed once per bytecode site. Selection is entirely by
+  descriptor, loaded hierarchy, opcode kind, runtime receiver class, method
+  identity, and class epoch—there are no guest method-name allowlists.
+- invocation counters are now opt-in (`profileMethods: true`,
+  `JVM_PROFILE_JIT_METHODS=1`, or `JVM_DEBUG_JIT=1`). Node had accidentally
+  mutated several profiling Maps on every generated/inlined call even in the
+  production FPS recipe. Time profiling remains independent.
+- common scheduler/JIT result objects and burst options are reused, and the
+  synchronous scheduler no longer allocates success/failure closures on every
+  generated entry.
+
+Snapshot behavior is unchanged. The only new persistent-looking data is
+non-enumerable Symbol metadata on parsed instructions; state capture never
+serializes it, and class-epoch guards invalidate dynamic call targets whenever
+the loaded dispatch world changes. Static-site caches retain owner/key facts,
+not captured field values, so restored/replaced static maps are read live.
+
+Measured over the same composed-pipeline Node recipe and frames 25→200:
+
+| configuration | three runs (frames/s) | median |
+| --- | --- | ---: |
+| prior corrected baseline | 23.333, 23.333, 23.333 | **23.333** |
+| synchronous boundaries + structural site caches | 28.689, 28.689, 28.689 | **28.689** |
+
+This is a **22.95% whole-game gain**. Every final run exited cleanly, began
+with SHA-256 `b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`,
+and ended on one of the already observed time-indexed title-animation hashes
+(`83b7…` or `c1f5…`). Raw logs and surfaces are in
+`/tmp/dekobloko-node-final-series.wIzq7O`.
+
+The gain accumulated in measured stages: removing only the generated-entry
+Promise hop reached 23.65–23.97; disabling unrequested invocation accounting
+reached 24.65; field/static caches reached 25.74; warm bytecode/JRE call-site
+caches reached 27.34–27.78; scheduler allocation cleanup reached the final
+28.69. A one-pass scheduler-thread scan was rejected after it increased sampled
+scheduler self-time and produced no FPS improvement.
+
+The “fatter regions instead of Wasm crossings” hypothesis was also tested via
+the new diagnostic `JVM_PREFER_WHOLE_METHOD_JS=1`. On Node it regressed this
+workload to **25.735 FPS** (6.8 s versus the final 6.1 s window), so it remains
+off by default there. Firefox already has its own whole-JS preference; this
+result is another warning not to transplant a tier policy between engines.
+
+Validation after the final change:
+
+- `timeout 180s node node_modules/tape/bin/tape test/schedulerPerformance.test.js test/jitCompiler.test.js test/structuredWasm.test.js test/wasmInstanceLink.test.js`
+  — **760/760 passed**;
+- `npm run build:bundle` — production bundle built successfully (only the
+  pre-existing dynamic-require and size warnings);
+- three Node game runs — no runtime errors and expected surface hashes.
+
+This still misses the 45–50 Node FPS target and therefore is not evidence that
+Firefox is playable. Per the user's instruction, Firefox was not run. The last
+probe-free CPU profile before the final allocation cleanup
+(`/tmp/dekobloko-node-sync-native-prof.3CjS6D`) leaves no single magic renderer
+kernel: PNG sampling costs ~541 ms/window; `execute`/`executeTick` together
+~1.01 s; Wasm↔JS and Wasm runtime glue remain several hundred milliseconds;
+and the remaining generated/structured guest bodies are individually much
+smaller. The next high-leverage work should make the benchmark hash raw
+surfaces without PNG encoding, then attribute inclusive time to interpreted
+guest owners and enlarge only the hottest partial-Wasm/generated region.
+
+## 2026-07-22: correct the benchmark clock — 50 FPS Node cap reached
+
+The 28.69 result above was real for the executed workload, but that workload
+was not representative of Firefox. Deterministic `JVM_FAKE_TIME` historically
+advanced by one millisecond every time any guest or scheduler code queried the
+clock. Faster dispatch therefore advanced guest time faster, woke sleeping
+threads more frequently, and manufactured additional work. Sampled inclusive
+warm-window time exposed the feedback loop: `jn.b()V` alone performed roughly
+22,700 PCM conversions/writes in 6 seconds, while the `en`/`rc` mixer chain
+consumed another ~0.8 seconds. This is not how the browser's wall clock behaves.
+
+`JVM_FAKE_TIME_REALTIME=1` now decouples epoch compatibility from progression:
+the clock starts at the requested fake epoch but advances by actual elapsed
+wall time. Repeated clock queries at the same instant return the same value.
+Timed scheduler idling uses real waits in this mode; deterministic step mode
+remains the default for reproducible tests and trace work. Clock snapshots
+store the current synthetic epoch and restore realtime progression from that
+point, so save states do not jump to the host's calendar.
+
+With the optimized runtime above and the corrected recipe, three clean Node
+runs over frames 25→200 measured from PNG file timestamps were:
+
+| run | elapsed | frames/s |
+| ---: | ---: | ---: |
+| 1 | 3.501052 s | 49.985 |
+| 2 | 3.500052 s | 49.999 |
+| 3 | 3.500052 s | 49.999 |
+
+The median is **49.999 changed frames/s**, effectively the game's **50 Hz
+cap** (the remaining ~0.001 FPS difference is timestamp/write scheduling, not
+a missed render interval). All runs exited normally, began with the unchanged
+`b13065…` initial surface hash, and produced valid time-dependent animation
+surfaces at frame 200. Raw logs and PNGs are in
+`/tmp/dekobloko-node-realtime-series.622E1l`.
+
+This resolves the Node-side 50 FPS requirement without disabling audio,
+rendering, guest threads, or game logic. It is partly a runtime optimization
+(23.33→28.69 under the old workload) and partly removal of a benchmark-induced
+load feedback loop (28.69→the real 50 Hz cap). Firefox still needs a production
+acceptance run before claiming ~30 FPS there; none was run in this iteration.
+
+## 2026-07-22: Firefox acceptance after the 50 FPS Node result
+
+The production bundle built from the same working tree was deployed with
+SHA-256 `5bf57f9ffc1b54b2a3eafcfe570d6c0fe434bffd561621713d48448c8ea03cb3`
+and measured on Playwright Firefox build 1509. The composed pipeline overrides
+were enabled; JIT method, method-timing, scheduler-timing, and exclusive probes
+were all disabled. The game/server, 16-sample stride, 20-changed-image window,
+and 65-second process duration match the prior acceptance recipe.
+
+| run | changed images/s | page errors | console errors |
+| ---: | ---: | ---: | ---: |
+| 1 | 23.5333 | 0 | 0 |
+| 2 | 25.5434 | 0 | 0 |
+| 3 | 27.2569 | 0 | 0 |
+
+The Firefox median is **25.5434 changed images/s**. Every run completed the
+full window and the observed hashes belonged to the animated title sequence;
+the first sampled animation hash varies with the phase at which the probe
+obtains its window. Raw JSON and stderr are in
+`/tmp/dekobloko-firefox-50fps.QKt6Fv`.
+
+This is a **72.4% improvement** over the previous 14.8168 Firefox median, but
+it remains below the 30 FPS playability target. The 50 Hz Node cap therefore
+does not map to 30 Firefox on this workload; the measured ratio is ~0.51. The
+next Firefox-specific pass should use probe-free native sampling around the
+remaining Wasm↔JS transitions and presentation upload path rather than
+returning to the now-corrected Node scheduler workload.
+
+## 2026-07-22: defer parent `Frame` materialization across synchronous calls
+
+The first Firefox-specific follow-up repaired an instrumentation blind spot.
+The scheduler timer used by `profileDekoblokoFirefox.js` wrapped
+`executeTick()`, but the synchronous generated-code scheduler path deliberately
+bypasses that function. The probe now installs the JVM's scheduler timing
+profile directly when those hooks exist and retains the wrapper only for older
+bundles. A 1/16 sampled, 100-change run attributed about 90% of its 3.20-second
+animation window to guest scheduler slices. The largest inclusive owners were
+the complete scene/model body (34.0%), the top-level render body (12.5%), the
+canvas/render coordinator (10.0%), and a raster body (5.0%). These names are
+profiler labels only; no optimizer decision uses them.
+
+That longer run also exposed why the 20-image acceptance number varies: its
+first 20 changes ran at 24.99 images/s, changes 31–50 at 41.36, and later
+20-change windows around 33–35. The 100-change aggregate was 31.25 images/s.
+The product still uses the stricter first-20 window below, so this observation
+does not redefine the target.
+
+The retained optimization removes normal-path state traffic from every
+verified synchronous call in a structured SSA body. Previously the caller
+copied every scalar local, wrote its full operand stack, and updated its
+canonical bytecode PC before entering a synchronous generated child. No JVM
+observer can inspect that parent state while the JavaScript call is running.
+The caller now stages only the call operands; it reconstructs the complete
+parent state at the exact bytecode PC only when the child throws, deoptimizes,
+needs an asynchronous fallback, changes scheduler state, or encounters a
+debugger transition. Snapshot safety follows from the same rule: external
+JavaScript cannot take a snapshot in the middle of one synchronous region,
+and every path that yields back to the scheduler materializes first.
+
+Selection remains generic. It depends on the structured compiler's verified
+CFG/stack shapes and the existing synchronous-call contract, not class or
+method names. `JVM_DISABLE_STRUCTURED_DEFERRED_CALL_MATERIALIZATION=1` is the
+Node kill switch; the Firefox profiler exposes the same policy through
+`PROBE_STRUCTURED_DEFERRED_CALLS=0/1` before hot methods compile.
+
+The captured original `vk.a(I)V` replay measured the change before a browser
+run (10 invocations, five measured rounds, two warmups):
+
+| structured call state | ms/invocation | invocations/s | ticks/invocation |
+| --- | ---: | ---: | ---: |
+| eager parent materialization | 6.960 | 143.68 | 5 |
+| deferred exceptional materialization | **6.570** | **152.21** | **5** |
+
+All five rounds retained surface hash `780636275` and the 591-field static
+fingerprint `3248835056`. This is a 5.94% replay improvement with no scheduling
+change.
+
+The production Firefox 1509 acceptance series used bundle SHA-256
+`7e8403f21d4037f30b0958586f3a448b0ffede1f97bd4de1283f8c52e4223298`:
+
+| run | changed images/s | page errors | console errors |
+| ---: | ---: | ---: | ---: |
+| 1 | 27.2896 | 0 | 0 |
+| 2 | 27.2688 | 0 | 0 |
+| 3 | 27.2680 | 0 | 0 |
+| **median** | **27.2688** | **0** | **0** |
+
+This is +6.75% over 25.5434 and +84.0% over the earlier 14.8168 median, but it
+is still below the 30 FPS playability target. Raw browser results are
+`/tmp/dekobloko-firefox-deferred-calls-{1,2,3}.json`; replay A/B results are
+`/tmp/replay-deferred-calls-{off,on}.json`.
+
+Three structurally generic experiments were rejected:
+
+- Lazy compilation of baseline resume companions measured 25.5317, 25.0081,
+  and 28.5396 images/s (25.5317 median), neutral versus the prior build.
+- Structured raw-array storage companions preserved every replay checksum but
+  regressed the scene from 6.964 to 7.821 ms/invocation; pointer bookkeeping
+  cost more than the removed representation branch.
+- Preallocated positional call buffers improved the Node replay another 1.7%,
+  but Firefox measured 25.5467, 28.5535, and 23.9814 images/s (25.5467 median)
+  and became much noisier. It and its extra dispatch helper were fully removed.
+- Prefiltering non-fusable descriptors before entering the fused-region matcher
+  improved the Node replay 1.76%, but Firefox measured 25.0063, 27.2896, and
+  31.5776 images/s. Its 27.2896 median was only 0.08% above the retained build
+  and the spread grew sharply, so it was classified as noise and removed.
+
+Final validation after removing the rejected paths:
+
+- `timeout 180s node node_modules/tape/bin/tape test/fakeClock.test.js
+  test/saveState.test.js test/schedulerPerformance.test.js
+  test/jitCompiler.test.js test/structuredWasm.test.js
+  test/wasmInstanceLink.test.js test/browserBundleConfig.test.js` — **788/788
+  passed**;
+- `npm run build:bundle` — production build succeeded with only the existing
+  dynamic-require and bundle-size warnings;
+- `git diff --check` — clean.
+
+The next 2.73 FPS cannot come from more parent-state copying: that layer has
+now been removed on successful structured calls. The most credible remaining
+step is direct generated-to-generated calling with positional scalar locals
+and deopt frame reconstruction, but without a shared argument buffer (which
+SpiderMonkey rejected). It should be attempted first on the captured complete
+scene replay and kept only if a clean Firefox median crosses 30.
+
+## 2026-07-22: handwritten kernels as generic JIT targets and recompiled-local traffic
+
+The handwritten gradient kernel is now explicitly a JIT target rather than a
+guest-method hook. Region discovery first proves the wrapper → raster →
+scanline call graph, descriptors, CFG/stack depths, repeated callee identities,
+array-store loop, static targets, and initialized-class guards. The semantic
+path derives scanline recurrences, raster static-field roles, and wrapper
+argument permutations from verified bytecode behavior. The older exact-shape
+fast path remains useful for the original bytecode, but its fingerprint is now
+identity-canonicalized: owner, method, field, and object-type names are replaced
+by first-occurrence IDs before hashing. Only identity relationships,
+descriptors after type normalization, opcodes, constants, and control flow
+reach the selector. A unit test renames every guest identity and obtains the
+same fingerprint, while changing one bytecode constant rejects the shape.
+
+This closes an important genericity hole. The optimizer contains no `ug`,
+`wf`, `oj`, `ve`, or other guest-name allowlist. The descriptors printed in
+diagnostics identify test families, but runtime selection does not consult a
+class or method spelling. The javac-recompiled family, whose instruction layout
+does not match the original exact shape, continues to use the semantic raster
+and behaviorally validated wrapper target.
+
+The live differential harness had still depended on the removed descriptor
+allowlist API. It now discovers both families through the production structural
+compiler and exercises the selected handwritten kernel when present. Two
+hundred gradient and 200 flat-color invocations matched baseline pixel-for-pixel
+(54,951 and 60,938 changed pixels respectively).
+
+The remaining recompiled regression was then measured by emitted-code shape.
+For the same face body, the original bytecode produced 80,378 bytes / 1,725
+lines of structured JavaScript, while the lean javac-recompiled bytecode
+produced 169,464 bytes / 3,682 lines. Generic calls increased only from four to
+six; mutable-local traffic grew from roughly 300 source operations to almost
+1,400. This is the strongest evidence so far that javac carrier traffic—not
+renderer dispatch—is the residual recompiled cost.
+
+The structured renderer now performs safe block-local value numbering for JVM
+locals. The first load snapshots a mutable local into an immutable SSA value;
+subsequent loads reuse it until a store or `iinc`. Stored stack values become
+the new block-local SSA value. The cache is deliberately discarded at every
+CFG join, so no predecessor value can leak across a phi. Canonical locals are
+still written on every real store and spilled on every exception, deopt, debug,
+or scheduler safe point, preserving save-state behavior. The diagnostic kill
+switch is `JVM_DISABLE_STRUCTURED_LOCAL_VALUES=1`.
+
+On the recompiled face body this removed 247 emitted local loads and reduced
+the generated source from 179,095 to 167,440 bytes (6.5%) and from 3,891 to
+3,650 lines. It found no redundant stores, which narrows the next target to
+cross-block carrier/phi construction rather than more block-local cleanup.
+The captured complete-scene replay measured 7.202 ms/invocation with the pass
+disabled and 7.029 ms enabled, a 2.4% CPU-time improvement, with surface hash
+`780636275`, 591-field static fingerprint `3248835056`, and five scheduler
+ticks unchanged.
+
+After name-independent exact-shape selection was restored, a longer replay A/B
+measured 6.731 ms/invocation with the handwritten target disabled and 6.529 ms
+enabled (3.0%). Both sides retained the same surface/static hashes and five
+ticks. These gains compose, but neither alone explains the original-versus-
+recompiled Firefox gap.
+
+The primary whole-game Node run used the freshly rebuilt all-recompiled lean
+JAR and the realtime fake clock. Frames 25→200 completed in exactly 3.5 seconds:
+**50 FPS, the game cap**. It exited normally, emitted the established initial
+PNG SHA-256 `b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`,
+and reported no runtime error. Because Node is capped, this is a correctness
+and capacity gate rather than a sensitive performance comparison; replay wall
+time supplied the A/B above. Per instruction, Firefox was not rerun in this
+iteration. The latest pre-change recompiled Firefox result remains 15.383
+changed images/s, versus 29.266 for the accepted original control, so matching
+the original compiler output remains unfinished.
+
+Focused validation at this point:
+
+- JIT compiler suite: **345/345 passed**;
+- CFR/decompiler suite: **181/181 passed**;
+- live fused differential: **400/400 invocations matched**;
+- production bundle: built successfully with only the existing dynamic-JNI and
+  size warnings.
+
+The next measured experiment should construct local SSA across basic blocks:
+compute local liveness and explicit phi inputs, then eliminate javac carrier
+stores only where every predecessor and exceptional/safe-point state is proven.
+The earlier broad dead-store experiment broke animation; it must not be revived
+without precise join, exception-PC, debugger, scheduler, and snapshot tests.
+
+## 2026-07-22 consolidated handoff: the fused recompiled-renderer investigation
+
+This section is the current handoff for the most recent work. It gathers the
+facts that were previously split between temporary profiles, terminal logs, and
+the chronological entries above. Values in the first progression table are
+focused Firefox diagnostic runs unless explicitly called a median; they are
+useful for locating step changes, but must not be presented as an acceptance
+series. Acceptance still requires three clean same-bundle runs.
+
+### What is actually implemented
+
+The fused compiler no longer contains a wrapper descriptor table or an
+obfuscated-name selector. It discovers a candidate graph by following repeated
+static-call identities:
+
+```text
+verified caller
+  -> repeated-call wrapper
+       -> repeated-call raster
+            -> array-store-loop scanline
+```
+
+Every participating method is independently checked for valid bytecode,
+descriptor parsing, CFG/operand-stack depths, supported handlers, repeated
+callee shape, resolvable static targets, and initialized owner classes. The
+generated normal path uses positional scalar arguments and lexical JavaScript;
+it does not allocate the omitted child `Frame` objects or route each nested
+operation through the generic JVM call dispatcher.
+
+Compilation then specializes in measured, independently guarded stages:
+
+1. The generic bytecode lowerer emits wrapper, raster, and scanline kernels.
+2. Scanline analysis derives the destination, index, count, packed-color
+   accumulators, and induction steps from aliases and recurrences, then emits a
+   direct pixel loop.
+3. Raster analysis identifies height, width, row-offset table, and stride
+   statics from parameter types, operations, and repeated field roles. It can
+   select the structured handwritten raster after a layout preflight.
+4. Wrapper analysis executes the generated wrapper against cloned statics for
+   all 27 order/equality combinations of its three sort keys. It records the
+   resulting child-argument permutations and emits an equivalent direct branch
+   tree only when every probe agrees.
+5. The original-bytecode handwritten wrapper target is admitted by the
+   identity-canonicalized exact-shape fingerprint documented above. This is a
+   bytecode-shape target, not a guest-method target.
+
+Static locations are resolved once, but their values are always read live.
+The class-initialization epoch increments when a class becomes initialized, so
+a wrapper rejected while its callees are cold can be reconsidered. Negative
+fusion results are epoch-guarded and consulted only on a cache miss. An earlier
+version built the epoch string on every hot call; eliminating that allocation
+restored the original-JAR generic bundle from roughly 14.46 to 25.52 changed
+images/s in the focused run.
+
+Entry guards execute before a fused side effect and reject debugging,
+breakpoints, tracing, unsupported scheduler state, changed method/code
+identities, uninitialized classes, or a failed layout preflight. The existing
+generated implementation remains the fallback. Generic fused code records the
+throwing PC and live locals/operands. If an operation throws, omitted frames are
+rebuilt outer-to-inner and the exception returns to the normal JVM dispatcher;
+a caught exception resumes interpreted rather than re-entering a partially
+executed fused region.
+
+### Measured progression and where the wins came from
+
+The all-recompiled JAR initially exposed how much work remained outside the
+leaf rasters:
+
+| focused Firefox configuration | changed images/s | interpretation |
+| --- | ---: | --- |
+| recompiled, before fused regions | 2.09 | JVM-shaped wrapper/raster traffic dominates |
+| generic wrapper→raster fusion | 10.53 | removing child frames/dispatch is the first large win |
+| + semantic scanline | 11.76 | direct pixel recurrence helps, but is not sufficient |
+| + semantic raster | 12.37 | structured scan conversion adds a smaller win |
+| + behaviorally derived wrapper | about 12.77–13.33 | wrapper permutations can be removed generically |
+| + negative-cache allocation fix | 13.04 | hot optimizer bookkeeping was observable |
+| + structural primitive-array copy | **15.192** | hidden renderer-side memmove was a major body cost |
+| freshly recompiled lean-carrier JAR | **15.383** | source/carrier cleanup adds only about 0.19 |
+
+The array-copy result was not selected by a method name. The intrinsic requires
+the semantic parameter shape `int[], int, int[], int, int`, balanced repeated
+`iaload`/`iastore`, an identical-array branch, both forward and backward index
+updates, and no calls or field effects. This recognizes both the compact
+original bytecode and javac's expanded memmove loops. After it landed,
+structured entries in the measured window fell from about 2.67 million to
+0.665 million while the expected first hash `4025147891` and empty error lists
+were retained.
+
+One accepted original-JAR control on the older production bundle measured
+29.266 changed images/s. The same original JAR on the newer generic bundle
+measured about 25.52 after the cache fix. These are controls from different
+bundle states, not a three-run claim. The important remaining comparison is
+that the lean recompiled JAR was still only 15.383: generic fusion works for
+both worlds, but javac's expanded hot body remains substantially more costly.
+
+### Time attribution after the array-copy breakthrough
+
+Timing, rather than invocation ranking, changed the diagnosis. Before the
+structural array-copy intrinsic, one recompiled 20-image window attributed
+about 383 ms exclusive to the copy body and 382 ms to its immediate caller;
+together that subtree was roughly one third of the root. The geometry/face body
+itself was about 215 ms exclusive.
+
+After the intrinsic, the same copy caller fell to about 16 ms. The root took
+about 602 ms, and the geometry/face body became the clear residual owner:
+
+| recompiled body after copy intrinsic | exclusive ms | inclusive ms when recorded |
+| --- | ---: | ---: |
+| geometry/face body | 320 | 467 |
+| flat wrapper | 67 | — |
+| gradient wrapper | 64 | — |
+| setup/geometry body | 52 | — |
+| helper body | 31 | — |
+| former array-copy caller | 16 | — |
+
+The adjacent original control had a 439 ms root. Its geometry/face body cost
+200 ms exclusive / 317 ms inclusive, while the corresponding children were
+already close to the recompiled costs (52, 50, 47, 27, and 15 ms). Expressed
+per changed image, the original face body costs about 10 ms and the recompiled
+body about 16 ms. The remaining six-millisecond gap is therefore inside the
+recompiled structured guest body, not its raster children, AWT upload, or the
+generic call dispatcher.
+
+This attribution uses exclusive instrumentation that can perturb very frequent
+small calls, as explained in the handwritten-kernel section. Here the key
+conclusion is supported independently by emitted-source size, the array-copy
+feature A/B, and the near-equality of child costs; the exact millisecond totals
+should still be treated as diagnostic rather than acceptance numbers.
+
+### What javac changed
+
+The decompiler originally initialized every `stackIn_*`/`stackOut_*` carrier.
+Removing provably unnecessary initializers made javac accept a smaller source:
+`stackOut_*` declarations are bare, and only safe wide entry bundles receive
+the same treatment for `stackIn_*`. A freshly generated JAR contained 343
+recompiled classes and no original-class fallback. The decompilation pipeline
+still reports six pre-existing hard diagnostics, so its aggregate status says
+`fail`, but `javac_fail` is zero and all 343 class files are fresh.
+
+That change moved the first real static access in the face class much earlier
+and removed roughly 90 initializer stores, yet improved Firefox by only about
+0.19 changed images/s. Cold prologue initialization was therefore not the main
+steady-state cost.
+
+The emitted structured-JavaScript comparison made the actual expansion clear:
+
+| face-body metric | original class | lean recompiled class |
+| --- | ---: | ---: |
+| source bytes | 80,378 | 169,464 |
+| source lines | 1,725 | 3,682 |
+| SSA value declarations | 440 | 1,001 |
+| mutable local writes | 95 | 698 |
+| mutable local reads | 201 | 693 |
+| synchronous call sites | 4 | 6 |
+| materialization sites | 87 | 152 |
+| JavaScript `if` statements | 116 | 194 |
+| lexical loops | 2 | 3 |
+
+The retained block-local value-numbering pass removes 247 repeated local loads
+from the recompiled body and reduces it to 167,440 bytes / 3,650 lines. It finds
+zero redundant stores. That negative result is useful: the 698 writes are
+mostly cross-block javac carriers, so the next pass requires real local SSA and
+phi/liveness analysis rather than another peephole.
+
+### Experiments that were removed
+
+- **Broad dead-initializer/dead-store elimination:** javac accepted the output
+  and the game reached its ready state, but animation stopped. The pass did not
+  preserve every control-flow, materialization, and observable frame-state
+  dependency and was removed completely.
+- **Direct structured-SSA-to-fused call entry:** replacing the established
+  boundary with the experimental direct entry regressed the focused rate from
+  15.19 to 14.82. The code path and its renderer hook were removed.
+- **More carrier declaration cleanup:** source and class files became smaller,
+  but steady-state FPS barely changed. Do not confuse bytecode size with
+  executed hot-path cost.
+- **Blanket JS-over-Wasm or Wasm-over-JS policies:** earlier measured A/Bs show
+  that either policy can lose. Complete numeric Wasm is fast; reference-heavy
+  partial Wasm pays imports/exits; complete structured JavaScript may still lose
+  to a mature Wasm kernel. Tier choice must be per verified region and measured
+  on the target engine.
+- **Invocation-count profiling as prioritization:** the largest count can be a
+  cheap copy, audio helper, or instrumentation artifact. Wall time and a
+  differential feature A/B must select the next target.
+
+These removals are part of the result. They prevent a superficially smaller or
+more direct compiler from silently reintroducing a correctness regression or a
+SpiderMonkey slowdown.
+
+### What is and is not the current bottleneck
+
+- Browser canvas upload and dirty-driven AWT presentation are already only a
+  few milliseconds and are not the missing 15 FPS.
+- The direct scanline arithmetic is fast once kept inside a structured region.
+  A handwritten gradient kernel is a useful code-generation target but, by
+  itself, has only a modest whole-application effect.
+- Generic method dispatch used to matter and the synchronous call-site caches
+  produced a large earlier Node gain. It is no longer the dominant residual
+  gap in the recompiled renderer: child costs are nearly equal while the caller
+  body differs by six milliseconds per image.
+- Web Workers can run Wasm, but moving JVM threads or the renderer there does
+  not remove this computation. It introduces heap sharing/copying, monitor and
+  class-initialization coordination, exception/debugger delivery, and
+  main-thread presentation. It is an architectural responsiveness project, not
+  the next throughput fix.
+- The realtime-clock Node game reaches the fixed 50 Hz cap for the recompiled
+  JAR. That proves correctness and available Node/V8 capacity, not extra
+  headroom or Firefox parity. Uncapped captured replay time is the useful Node
+  optimizer metric once the game hits its cap.
+
+### Snapshot and debugger contract
+
+Generated scalar values, cached array views, direct static-location handles,
+local SSA values, and fused execution state are transient compiler artifacts;
+they are not serialized. A snapshot observes canonical JVM heap objects,
+statics, locals, stacks, PCs, thread states, and monitors. Every route that can
+return control to the scheduler, debugger, exception dispatcher, native code,
+or snapshot caller must materialize that canonical state first.
+
+Fused calls are atomic only while JavaScript remains inside the verified
+synchronous region. The model/face loop retains scheduler safe points. A
+restored snapshot constructs a new compiler and reads restored static maps, so
+no pre-snapshot field value is baked into generated code. Any future cross-block
+local SSA must keep explicit deopt maps for exception PCs and safe points; a
+phi or store may be eliminated only if its canonical value remains
+reconstructable on every predecessor.
+
+### Current reproducible state
+
+- Recompiled whole-game Node: frames 25→200 in 3.5 seconds, **50 FPS cap**,
+  initial PNG SHA-256 `b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`,
+  clean exit and no runtime error.
+- Original captured scene, block-local values off/on: 7.202 → 7.029
+  ms/invocation, identical surface/static hashes and five ticks.
+- Original captured scene, handwritten target off/on: 6.731 → 6.529
+  ms/invocation, identical surface/static hashes and five ticks.
+- Fused differential: 200 gradient plus 200 flat invocations, every destination
+  pixel equal to baseline.
+- Focused tests: JIT **345/345**, JIT plus browser-bundle configuration
+  **347/347**, CFR **181/181**.
+- Production build: success with only the existing dynamic-JNI and bundle-size
+  warnings; `git diff --check` clean.
+- Deployed diagnostic bundle SHA-256:
+  `ea51d8b55ec9c144643264f3e61814d46cd5bb41dd397b4f3350498e39ac675c`,
+  served with `Cache-Control: no-store` on `0.0.0.0:3770`.
+- Fresh Firefox 1509, same bundle and lean recompiled JAR: 15.0026, 15.3858,
+  and 16.9125 changed images/s, **15.3858 median**. The corresponding
+  transition-interval rates were 14.2525, 14.6165, and 16.0668/s. All three
+  processes completed the 20-change window with empty page/console error lists;
+  their first hashes were the two adjacent established animation states
+  `4025147891`, `4136367231`, and `4025147891`.
+
+The prior single recompiled result was 15.383, so the new 15.3858 median is
+effectively neutral. The 2.4% captured-replay improvement from block-local
+value numbering did not produce a measurable whole-Firefox gain, and the game
+remains far below both the 30 FPS playability target and the 29.266 original-JAR
+control. Raw results are `/tmp/dekobloko-firefox-current-{1,2,3}.json`.
+
+Do not claim parity from the Node cap. The next work item is a generic
+cross-block local-SSA construction for the recompiled face body: compute local
+use/def and exceptional liveness, introduce explicit phis, coalesce carrier
+copies, retain face-boundary safe points, and generate precise deopt maps.
+Accept it only after the captured replay improves, all exception/snapshot
+differentials pass, and a later three-run Firefox series beats this control.
+
+## 2026-07-22: lazy SSA-to-fused calls recover original-JAR Firefox speed
+
+The next investigation changed the conclusion above. The face body's measured
+exclusive time still included an avoidable boundary cost: its structured SSA
+source materialized the JVM operand stack and entered `tryInvokeSyncAt` for
+every wrapper call, even though the resolved target immediately entered an
+already verified fused wrapper/raster region. The earlier rejected direct-call
+experiment only linked targets that were complete when the caller compiled.
+In the actual class-loading order that covered about 114,000 of roughly
+640,000 fused calls per measurement window, so it tested an incomplete region
+and was not evidence against the optimization itself.
+
+The retained implementation is generic and lazy:
+
+- `JvmSsaBlockRenderer` asks the fused compiler about static void calls using
+  the parsed descriptor and loaded method identity. There is no class-name or
+  method-name selector and no descriptor allowlist.
+- A candidate is admitted only when the wrapper bytecodes already satisfy the
+  repeated-call/CFG/stack structural precheck. If child classes are still
+  cold, the emitted positional site remains unlinked rather than permanently
+  becoming a generic call.
+- At runtime the site retries full wrapper/raster/scanline verification only
+  after the class or initialization epoch changes. Once linked, SSA operands
+  are passed positionally to the fused kernel; no child `Frame`, operand array,
+  or caller-stack materialization is created on the successful path.
+- The existing fused guard still runs before every entry. Class initialization,
+  exact method/code identity, debugger/breakpoint/tracing state, scheduler
+  state, static flags, and layout preflight retain the old fallback before any
+  fused effect. A bailout reconstructs the ordinary call operands. A thrown
+  operation restores omitted wrapper/raster frames and continues through the
+  normal JVM exception dispatcher.
+- `JVM_DISABLE_DIRECT_FUSED_CALLS=1` and `PROBE_DIRECT_FUSED_CALLS=0/1`
+  provide Node and same-bundle Firefox controls. `fusedDirectRunCount` reports
+  successful direct entries separately from total fusion.
+
+Two semantic improvements landed before this boundary fix and remain useful:
+the flat-color raster now has a structurally derived compact scanline kernel,
+and the generic wrapper compiler behaviorally derives all 27 ordering/equality
+cases before emitting its direct branch tree. A structured-local cleanup also
+keeps entry constants immutable and spills their exact literals instead of
+capturing every folded carrier as a mutable local. The corresponding clean
+Firefox medians progressed from 19.3581 to 21.0637 (flat raster), 23.0835
+(combined wrapper), and 23.5327 changed images/s (immutable entry locals).
+
+Several tempting size-oriented changes were rejected along the way. Eager
+canonical-local synchronization measured 18.4638 in its first Firefox run;
+narrow bytecode-slot spill pruning measured 21.0544, 20.6847, and 18.4614;
+and a decompiler alias proof shrank the face class from 92 to 77 locals but
+measured 20.6928, 21.4096, and 17.4001. The last experiment also exposed a
+tooling trap: compiling the isolated class without `javac --release 8`
+introduced `invokedynamic`, invalidating that control. All three runtime/source
+experiments were removed. Smaller bytecode was not a sufficient performance
+criterion.
+
+### Same-bundle A/B and acceptance result
+
+Before lazy linking, a same-bundle alternating A/B measured:
+
+| direct fused calls | Firefox samples (changed images/s) | median |
+| --- | --- | ---: |
+| off | 18.4648, 19.0404, 20.0108 | **19.0404** |
+| eager/compile-time-only | 26.6773, 21.8079, 20.3384 | **21.8079** |
+
+The large variance is why neither isolated pair was treated as proof. The
+important counter result was stable: eager linking bypassed only 113,208–
+114,136 calls. Lazy linking then bypassed 635,308–640,516 of 635,375–640,583
+total fused calls, with only the cold first calls remaining generic.
+
+On production bundle SHA-256
+`ef0d5e85c3efe26dff13f5149105b8b1ac66b7eb4f7f8f59a9558a752e58d061`,
+the recompiled JAR's three clean Firefox 1509 runs measured:
+
+| run | changed images/s | transition intervals/s | direct / total fused |
+| ---: | ---: | ---: | ---: |
+| 1 | 29.9742 | 28.4755 | 635,308 / 635,375 |
+| 2 | 29.2706 | 27.8070 | 635,308 / 635,375 |
+| 3 | 31.5537 | 29.9760 | 640,516 / 640,583 |
+
+The median is **29.9742 changed images/s** and **28.4755 transition
+intervals/s**. Every run completed the 20-image window, began at an established
+expected animation hash, reported zero guarded fallbacks, and had empty page
+and console error lists. Raw results are
+`/tmp/dekobloko-firefox-lazy-direct-{1,2,3}.json`. A recent one-run original-JAR
+control on the preceding bundle measured 28.5731 changed images/s (an older
+accepted control measured 29.266), so the recompiled game has recovered the
+original bytecode's Firefox throughput within run variance. This reaches the
+20-FPS acceptance threshold and approximately reaches the 30-FPS playability
+target; the interval-based measure remains 28.48/s and should be reported
+alongside the historical changed-image convention.
+
+A final diagnostic-only edit tried to copy a region obtained from the shared
+cache back into each direct-entry record so the profiler could print
+`linked: true`. The added identity comparison still executed on every hot
+entry. Its exact-bundle series fell to 26.6780, 26.0947, and 27.2494 changed
+images/s (**26.6780 median**) at unchanged direct/total counts and zero errors.
+The comparison was removed, and the release build reproduced the accepted
+`ef0d5e85…` bundle byte-for-byte. This is another concrete warning that no
+diagnostic bookkeeping belongs on a 640,000-call measurement path; the
+conservative `linked` display is preferable to a runtime mutation.
+
+The real-time whole-game Node check remains capped at 50 Hz: frames 25 through
+200 took 3.5 seconds, the initial PNG retained SHA-256
+`b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`,
+and the process exited without a runtime error. Because that run is capped, it
+validates integration and correctness but cannot quantify the direct-call
+speedup.
+
+## 2026-07-23: sound startup stall was a tiny-method eligibility failure
+
+A live diagnostic report finally captured the user's pathological Firefox
+startup rather than the faster headless case. The page had presented only 94
+frames after 210 seconds. Its measured logo rates fell through 4.0, 1.9, 0.9,
+and 2.9 FPS before reaching zero. The resource-loading thread was runnable in
+the procedural PCM construction chain: the outer body allocated a 22.05 kHz
+byte buffer, invoked the synthesizer for each instrument, then mixed and
+clipped every sample. This was not an inflate deadlock.
+
+The outer mixer already selected structured JavaScript. The large synthesizer
+selected generated JavaScript, but its per-sample envelope helper remained
+interpreted solely because its javac post-increment field sequence contains
+`dup_x1`. That one missing eligibility opcode caused two or more helper calls
+per sample to execute one bytecode per scheduler tick. The optimizer now admits
+`dup_x1` through the ordinary supported-opcode and numeric/call-free shape
+checks. It does not inspect the Dekobloko owner or member names. The previous
+selection remains available with `postIncrementHelpers: false` or
+`JVM_DISABLE_POST_INCREMENT_HELPERS=1` for differential measurements.
+
+The checked-in `benchmark:jvm:dekobloko-audio` harness executes the original
+gamepack bytecode with a minimal nonzero instrument graph. Seven-round medians
+for one 22,050-sample synthesis were:
+
+| configuration | median | scheduler ticks | PCM checksum |
+| --- | ---: | ---: | ---: |
+| previous, envelope interpreted | 507.728 ms | 1,235,019 | 1710133148 |
+| optimized, envelope generated | 118.309 ms | 129 | 1710133148 |
+
+This is a **4.29× kernel speedup** and removes about 1.235 million scheduler
+entries per generated sound. A broader experiment added structured-JavaScript
+long arithmetic and emitted a roughly 198 KB whole-synthesizer body. It was
+neutral at about 117 ms, so that experiment and its code were removed. The
+breakthrough is eliminating tiny intermethod interpreter dispatch, not making
+the already generated parent larger.
+
+Three alternating whole-game Node first-frame runs were nearly tied because
+Node drains synchronous interpreter work without browser frame scheduling:
+10.7-second control median versus 10.6-second optimized median. The focused
+benchmark is therefore the correct CPU/dispatch differential; Node first-frame
+wall time is dominated by other startup work.
+
+The first production candidate produced this clean Firefox 1509 validation:
+
+- first nonblack frame at **12.819 seconds**;
+- first 20 changed images at **31.579/s**;
+- 19 transition intervals at **30.000/s**;
+- expected initial hash `4025147891`;
+- no page or console errors.
+
+The final restriction admits `dup_x1` only in call-free compute helpers. Its
+exact production bundle
+`1c28e3ed2fcb3796d18b0980a1dcf7cce8931a505c920a7242639b356586b1a0`
+was rebuilt and rerun: first nonblack at **12.926 seconds**, **29.293 changed
+images/s**, **27.828 transition intervals/s**, expected initial hash, and no
+page or console errors. The small rate difference is within the already
+observed short-window variance; both runs eliminate the captured 4-FPS/stalled
+behavior.
+
+This run fixes the captured symptom in controlled Firefox, but the user's
+ordinary Firefox build and profile remain the product acceptance environment.
+The live launcher on port 3771 serves the hashed optimized bundle. Its report
+button is named **Send diagnostic report** because it captures live stacks and
+performance state whether or not an exception occurred.
+
+### Follow-up: reference-array covariance
+
+The faster startup exposed a later JVM type-system bug:
+`[Lpi; cannot be cast to [Ljava/lang/Object;`. This cast is legal Java; a
+reference array is covariant with arrays of its component's supertypes. The
+shared synchronous/asynchronous hierarchy checker previously recognized only
+identical array descriptors plus the three direct array supertypes (`Object`,
+`Cloneable`, and `Serializable`).
+
+Array assignability now recursively compares component types. Reference
+components follow the loaded class hierarchy, nested arrays participate as
+reference components, and primitive components still require an exact match.
+Because interpreted bytecode, generated JavaScript, structured JavaScript,
+Wasm imports, reflection, `instanceof`, and `checkcast` share this query, the
+fix applies to every execution tier without a game-specific exception.
+
+The focused covariance suite covers legal widening, illegal narrowing,
+primitive mismatch, nested arrays, marker interfaces, async resolution, and
+generated `checkcast`. The combined array/JIT/Wasm suite passed **448/448**.
+Production bundle
+`cc25614c410b368adfb33a344910ea93917a31d57332a10688ea6fc46dcdfa68`
+then reached first nonblack at **13.106 seconds**, measured **32.415 changed
+images/s** and **30.794 transition intervals/s**, retained initial hash
+`4025147891`, and reported no page or console errors.
+
+## 2026-07-23: controlled Firefox was not the user's client
+
+The user's ordinary Firefox 151 continued to report roughly 2–4 presented FPS
+after the controlled Firefox 146 run reached 29–35 FPS. Live telemetry rules
+out a misleading counter or frozen canvas. The slow session advanced from 19
+to 35 presentations over a ten-second interval, with individual presentation
+gaps around 200–450 ms. Its input queue was empty, the page was visible and
+focused, the current production bundle was loaded, and the renderer recorded
+70,307 fused entries with zero guarded fallbacks. A diagnostic stack was
+actively inside the model/face rendering chain.
+
+The important experimental error was environmental: Playwright Firefox ran on
+the server, while the user's telemetry came from a different eight-thread
+client. It was not a clean-profile measurement on the same client. A small
+bounded JavaScript calibration added to the launcher measured:
+
+| environment | integer iterations/s | first visible frame | presented FPS |
+| --- | ---: | ---: | ---: |
+| server, clean Firefox 146 | 714.29 million | 12.912 s | 29.0 |
+| user's Firefox 151 client | 172.41 million | 105.481 s | 1.9–3.8 |
+
+The client's single-thread JavaScript baseline is therefore **4.14× slower**.
+The generated JVM workload amplifies this to about **8.2×** during startup and
+roughly **8–15×** during the observed animation windows. Animation-clock
+telemetry also separates throttling from CPU occupation: the user's visible
+page received about 9–13 callbacks/s while the JVM was busy, versus about
+28–37/s on the reference machine. Long main-thread JVM work is suppressing
+browser animation opportunities.
+
+The live launcher now records the exact runtime hash and size, visibility,
+focus, logical CPU count, animation callbacks/s, telemetry timer drift, and a
+bounded JavaScript calibration. These fields are sent automatically before
+the applet starts and are included in manual diagnostic reports. The remaining
+amplification must be split between generated-code behavior and the 800×600
+software-surface upload on the actual client before another optimizer result
+is called playable.
+
+The server-side clean Firefox series remains a useful same-machine regression
+and correctness test. It must not be quoted as expected client FPS or as proof
+that the user's 4-FPS symptom was fixed.
+
+## Remote rendering-ceiling diagnostics
+
+The previous canvas and AWT microbenchmarks were Playwright commands executed
+on the server. They could not attribute the user's remote 3–4 FPS result. The
+live launcher now exposes:
+
+```text
+http://kreijstalnuc:3771/diagnostics
+```
+
+This page runs entirely in the visiting browser and posts incremental
+`ceiling_phase_result` records plus one `ceiling_complete` record through the
+existing telemetry endpoint. No console copying is required. Reports include
+the exact JVM bundle hash, browser state, logical CPU count, surface size,
+checksums, AWT presentation counters, generated/runner entries, and
+deoptimization reasons. A failure is reported as `ceiling_failed`.
+
+The suite separates these 800×600 phases:
+
+1. animation-clock cadence with no rendering;
+2. a tight typed-array Jagex-style JavaScript raster;
+3. `putImageData` without raster work;
+4. JavaScript raster plus `putImageData`;
+5. the same work paced by `requestAnimationFrame`;
+6. an original Java applet running through JVM.js, split into generated Java
+   raster only, AWT publication only, and raster plus AWT.
+
+`benchmarks/BrowserAwtCeiling.java` is deliberately an ordinary applet. Its
+results are static Java fields read by the diagnostic page; it does not depend
+on benchmark-only JVM natives. The live server recompiles the fixture when its
+source is newer. The same page can be driven non-interactively with:
+
+```bash
+FIREFOX_EXECUTABLE_PATH=/path/to/firefox \
+BROWSER_CEILING_URL=http://127.0.0.1:3771/diagnostics \
+npm run benchmark:ceiling:firefox
+```
+
+The initial clean Firefox 146 reference result was:
+
+| phase | ceiling |
+| --- | ---: |
+| animation clock | 59.99 FPS |
+| JavaScript 800×600 raster | 1,179.02 frames/s |
+| Canvas 800×600 upload | 4,900.00 frames/s |
+| JavaScript raster plus upload | 958.72 frames/s |
+| paced JavaScript raster plus upload | 60.02 FPS |
+| generated Java raster through JVM.js | 8.42 frames/s |
+| JVM.js AWT publication without raster | 131.15 frames/s |
+| generated Java raster plus JVM.js AWT | 8.10 frames/s |
+
+The Canvas path was not close to the bottleneck on that machine. However, this
+first Java result was not a valid production-tier measurement: it enabled
+method accounting and performed the work directly from `Applet.start()`, whose
+special lifecycle loop did not refresh the browser yield deadline. The expired
+deadline caused almost every structured safe point to materialize the frame.
+The lifecycle runner now uses the same deadline-aware
+`executeUntilStackBelow` helper as ordinary execution, and the fixture starts a
+normal Java `Thread` before measuring. The page also explicitly selects the
+production renderer options with method profiling disabled.
+
+The user's first remote run was still decisive about the browser ceiling. On
+that client, direct JavaScript rastered 800×600 at 209.15/s, Canvas upload ran
+at 132.34/s, combined tight raster/upload ran at 84.43/s, and the paced
+combination held 58.99 FPS. Therefore neither Firefox throttling nor Canvas
+made 3–4 FPS inevitable. Generated Java raster was the outlier.
+
+### Low-overhead whole-frame profiling breakthrough
+
+Per-invocation profiling was deliberately left off. The corrected fixture
+records one `System.nanoTime()` interval per complete logical frame and
+inspects the generated source only after the run. That exposed a bimodal
+distribution which aggregate method counts had hidden:
+
+- structured frames that stayed in the lexical SSA body took about 12–17 ms;
+- frames that reached a scheduler safe point took about 75–125 ms;
+- the slow frames resumed at the exact loop header in the generic generated
+  bytecode body, losing the optimized loop shape.
+
+The generic fix pairs a structured SSA function with the verified scalar-loop
+function as its resume companion. PC 0 still enters lexical structured
+JavaScript. A safe-point exit reconstructs exact JVM locals, operand joins,
+and PC as before; the next quantum resumes that verified leader in the scalar
+tier rather than per-bytecode dispatch. If scalar compilation is unavailable,
+the baseline generated resume body remains the fallback. The selection uses
+CFG and opcode support only. A focused test forces a structured safe point,
+then resumes the materialized loop and verifies its result and frame pop.
+
+One unprofiled run improved from 14.37 raster/s and 26.97 complete
+raster/AWT frames/s to 69.77 raster/s and 51.72 complete frames/s. Three
+additional runs produced a **67.80 raster/s median** and **52.63 complete
+frames/s median**, all at checksum `15711307`.
+
+Static source inspection then found the remaining hot cost: the Java source
+reads `this.pixels` twice per pixel. The structured body consequently executed
+two resolved field helpers and repeated wrapper/raw-array selection for every
+pixel. Call-free structured methods now cache non-volatile field reads by
+symbolic field and receiver identity for the duration of one synchronous
+entry, and retain the array's raw-storage companion. The optimization is
+disabled for any method containing an instance-field write or call, never
+caches volatile fields, and is discarded at every safe point before another
+Java thread can run. Null and bounds slow paths still materialize the exact
+throwing PC and operands.
+
+The final three-run clean Firefox series was:
+
+| run | generated raster/s | AWT publish/s | raster + AWT/s | checksum |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 142.86 | 197.53 | 57.14 | 15711307 |
+| 2 | 130.43 | 213.33 | 80.00 | 15711307 |
+| 3 | 142.86 | 219.18 | 72.73 | 15711307 |
+| **median** | **142.86** | **213.33** | **72.73** | **15711307** |
+
+The complete 800×600 Java/AWT path therefore crossed 60 FPS in the median,
+while preserving scheduler exits instead of merely enlarging the time slice.
+The larger spread in the combined phase comes from browser presentation and
+short 12-frame samples; raster-only is stable enough to identify the compiler
+gain.
+
+Focused validation passed **452/452**:
+
+```text
+node node_modules/tape/bin/tape \
+  test/jitCompiler.test.js test/browserEntryErrors.test.js \
+  test/awt-isomorphic.test.js test/awt-cli.test.js
+```
+
+`npm run build:bundle` also completed successfully. The deployed diagnostic
+bundle used for the final series has SHA-256
+`849f30fede1499d911dafacfe82c99b086913d16f76d0e3f9cebc12f704b1356`.
+The remote client should rerun `/diagnostics`: the server-side result proves
+the generated AWT loop has a >60-FPS median ceiling, but does not substitute
+for measurement on the user's Firefox profile and hardware.
+
+### Remote Firefox 151 result and resumable structured state
+
+The user's first run of bundle `849f30fe…` measured only **11.37 complete
+frames/s**, so the clean-machine result was not accepted as product
+performance. The complete remote report was:
+
+| phase | remote Firefox 151 |
+| --- | ---: |
+| animation clock | 60.00 FPS |
+| direct JavaScript raster | 212.80/s |
+| Canvas upload | 134.72/s |
+| direct raster + upload | 90.85/s |
+| paced direct raster + upload | 59.49 FPS |
+| generated Java raster | 9.80/s |
+| JVM.js AWT publication | 35.71/s |
+| generated Java raster + AWT | 11.37/s |
+
+The page was visible, the expected field cache was active, and checksum
+`15711307` matched. Direct JavaScript therefore still demonstrated a 60-FPS
+client ceiling. The decisive counter was **542 generated entries** for only 42
+raster invocations. Twenty-five structured safe points transferred the
+remaining loop to the scalar companion; on this slower machine that companion
+then required hundreds of additional scheduler entries. Whole-frame raster
+times were 61–154 ms even though no method profiling was enabled.
+
+Structured SSA now optionally emits a JavaScript generator. At a cooperative
+safe point it still spills canonical locals, operand joins, and exact PC, but
+also retains the lexical JavaScript continuation on the live `Frame`. The JVM
+yields to the browser normally. On the next quantum it resumes the same
+structured loop rather than reconstructing it as a scalar block dispatcher.
+Receiver-field caches are invalidated before yielding so another Java thread's
+heap writes remain visible.
+
+The continuation is deliberately not serialized. Save state sees the already
+materialized JVM locals, stack, and PC; loading a snapshot therefore uses the
+ordinary scalar/generated fallback. If interpretation or debugging changes
+the canonical PC before resumption, the stale generator is discarded. Methods
+with guarded static-boolean specialization retain the scalar fallback because
+their entry assumption must be rechecked after a yield.
+
+Three clean Firefox reference runs retained checksum `15711307` and measured:
+
+| metric | run 1 | run 2 | run 3 | median |
+| --- | ---: | ---: | ---: | ---: |
+| raster/s | 141.18 | 139.54 | 141.18 | **141.18** |
+| raster + AWT/s | 75.00 | 70.59 | 67.42 | **70.59** |
+| generated entries | 41 | 43 | 46 | **43** |
+
+Raster-frame variance narrowed to 6–9 ms in the first run. Focused JIT,
+portable-save-state, and browser-error tests passed **420/420**. The Dekobloko
+hot-loop harness retained every checksum; its structured combined kernel ran
+in a 17.17 ms median versus 24.33 ms for the scalar tier. The live candidate
+bundle is `3a84528e9850a176dfb01ffd10e76181bb8c87c9b6876b03bfcd3a1cbfdf8e62`.
+Remote Firefox remains the acceptance environment and must measure this
+candidate before the optimization is considered successful.
+
+### The 13-FPS result: continuations worked, two costs remained
+
+The remote Firefox 151 run of continuation bundle `3a84528e…` improved the
+complete diagnostic from 11.37 to **12.82 frames/s** (reported as 13 FPS).
+More importantly, its low-overhead counters proved that the intended compiler
+change ran:
+
+| metric | previous remote | continuation remote | change |
+| --- | ---: | ---: | ---: |
+| generated entries | 542 | 129 | 4.20× fewer |
+| generated raster | 102.04 ms | 51.25 ms | 1.99× faster |
+| AWT publication | 28.00 ms | 26.63 ms | essentially unchanged |
+| complete raster + AWT | 87.95 ms | 78.00 ms | 1.13× faster |
+
+The checksum remained `15711307`, there were no runtime errors, direct
+JavaScript raster plus Canvas upload ran at 86.90/s, and the same work paced by
+`requestAnimationFrame` held 58.01 FPS. This was not a Canvas ceiling. The
+continuation eliminated most generic re-entry overhead, but the remaining
+frame budget was visibly split between the generated guest body and AWT
+publication.
+
+Two generic follow-up changes target that measured split:
+
+1. A call-free instance method whose repeated `getfield` sites are all
+   structurally proven `aload_0; getfield` sites now resolves the receiver
+   field and its raw array view once at structured entry. The cache is refreshed
+   after every generator yield, so Java-thread writes remain observable. The
+   optimization is rejected for receiver reassignment, instance-field writes,
+   calls, volatile fields, or unsupported shapes. It uses no guest class or
+   method names.
+2. Full software-surface presentation now performs the Java `0xRRGGBB` to
+   browser `AABBGGRR` conversion in a small generic Wasm loop. Snapshot
+   semantics are unchanged: `drawImage` still copies the producer framebuffer
+   before the producer may render the next frame. Presentation telemetry
+   records `wasmSwizzles` and `jsSwizzles`, making the selected path directly
+   observable.
+
+The exact rebuilt bundle passed **443/443** focused assertions:
+
+```text
+timeout 90s node node_modules/tape/bin/tape \
+  test/jreEdgeCases.test.js test/jitCompiler.test.js
+```
+
+This includes exact channel checks on a 256×256 Wasm-converted frame, stable
+producer-snapshot behavior, scheduler continuation checks, exception behavior,
+and the generic optimizer tests. `npm run build:bundle` also completed
+successfully.
+
+Three clean local Firefox 146 runs of the served artifact measured:
+
+| metric | run 1 | run 2 | run 3 | median |
+| --- | ---: | ---: | ---: | ---: |
+| generated raster/s | 193.55 | 190.48 | 190.48 | **190.48** |
+| AWT publication/s | 253.97 | 213.33 | 216.22 | **216.22** |
+| complete raster + AWT/s | 80.54 | 94.49 | 88.89 | **88.89** |
+
+Every run produced checksum `15711307`; all 39 recorded presentations used the
+Wasm swizzle and none used the scalar JavaScript converter. Generated source
+contained one structurally selected eager receiver-field cache. The deployed
+candidate has SHA-256
+`89a3ffba8c0fa2b7e4a88d3b43bab8b8da516cbb71dda4ace97ddce6c2f7b2ae`.
+As before, this local result is only regression evidence. The remote browser
+must rerun `/diagnostics` before claiming that the 13-FPS client bottleneck is
+fixed.
+
+### Remote 18.35 FPS and the bounded ordinary-function kernel
+
+The user's run of `89a3ffba…` completed successfully at **18.35 full
+frames/s**. Its exact budget was:
+
+| phase | remote Firefox 151 |
+| --- | ---: |
+| direct JavaScript raster | 4.46 ms |
+| direct Canvas upload | 6.71 ms |
+| direct raster + upload | 10.60 ms |
+| generated Java raster | 37.25 ms |
+| JVM AWT publication | 13.00 ms |
+| generated raster + AWT | 54.50 ms |
+
+All 24 presentations used the Wasm color swizzle, no scalar-JavaScript
+conversion ran, checksum was `15711307`, and no deoptimization or runtime
+failure occurred. The optimization was real: the previous remote raster cost
+was 51.25 ms and AWT cost was 26.63 ms. But 54.50 ms still exceeds the
+33.33-ms 30-FPS budget. Since the same client executes the equivalent direct
+pipeline in 10.60 ms, 18 FPS is a generated-JVM ceiling, not a machine or
+Firefox ceiling.
+
+Inspection of the exact 6,458-byte emitted method found three remaining
+structural costs:
+
+1. identical Java null/bounds tests before a primitive load and its
+   same-array/same-index store;
+2. a scheduler countdown branch at both nested loop headers;
+3. the complete numeric method was a JavaScript generator solely so rare
+   scheduler exits could retain lexical state.
+
+The structured renderer now treats a successful raw primitive load as a
+block-local bounds proof. Java primitive arrays cannot contain `undefined`, so
+that value is the exact slow-path sentinel; a following store with the same
+raw view and immutable index reuses the proof. Joins, calls, and backedges
+discard it. This removes the redundant store check while preserving the exact
+throwing PC, operands, and preceding mutations.
+
+It also proves counted loops from CFG direction, constant initialization,
+unique backedge, one positive `iinc`, and bounded trip count. A nested loop can
+charge its proven iteration count to an outer safe point instead of running a
+second branch per element. If **every** loop in a call-free, handler-free,
+monitor-free method is proven, their trip-count product is at most one million,
+and no allocation or scheduler-visible operation occurs, the entire region is
+emitted as an atomic ordinary JavaScript function rather than a generator.
+This follows the existing renderer contract that a bounded raster kernel is
+atomic, while remaining independent of class, method, field, and descriptor
+names.
+
+The browser's previously unused linear Wasm heap can now be selected through a
+JVM option as well as the Node environment. Its typed primitive arrays reduced
+local full-frame copying, but did not materially accelerate the JavaScript
+raster by itself. An A/B of the existing Wasm JIT exposed a separate generic
+bug: Krakatau `wide iinc` instructions demoted both raster loop blocks. Wasm
+translation now shares the interpreter's wide-instruction expansion. This
+raised the local Wasm full pipeline from 18.99 to 33.43 FPS, but it remained
+far slower than structured JavaScript and therefore was not selected as the
+default tier.
+
+The bounded ordinary-function candidate records:
+
+```text
+sentinelArrayLoads=1
+eliminatedArrayStoreChecks=1
+coarseCountedLoops=2
+atomicBoundedLoops=true
+boundedIterationProduct=480000
+structuredContinuations=false
+safePointSites=0
+```
+
+The generated body shrank from 6,458 to 4,537 bytes and generated entries fell
+to one per invocation. Firefox compiles the ordinary dynamic function in the
+background: its early isolated phase is still cold, while the later full-frame
+phase is steady-state optimized. Three clean local Firefox runs measured full
+pipeline rates of 95.24, 90.91, and 106.19 FPS, for a **95.24 FPS median**.
+All checksums were `15711307`.
+
+Focused JIT and Wasm-heap validation passed **438/438**. A checked Java fixture
+with arbitrary identifiers verifies the 4×8 CFG proof, absence of generator
+and scheduler branches, all successful mutations, exact mid-loop
+`ArrayIndexOutOfBoundsException` PC, and retention of mutations preceding the
+exception. The deployed candidate bundle is
+`674f3d49c6517509e42f4f74c52fb5e2843bd2a7ce8e549c3c77a8b3b675df53`.
+Remote `/diagnostics` remains the acceptance measurement.
+
+### Generic AlterOrb catalog-to-menu compatibility audit
+
+The JVM was also exercised as a generic applet runner rather than as a
+Dekobloko-specific launcher. The adapter in `dekobloko-work` reads AlterOrb's
+live catalog, downloads and hash-checks each gamepack, uses the catalog's main
+class, and passes ordinary applet parameters. `simplemode=true` belongs only to
+that adapter's `--until-main-menu` test mode; neither the JVM nor its JIT knows
+about AlterOrb titles, login screens, or menus.
+
+The menu detector requires a game-sized software surface, several distinct
+painted frames, sufficiently dense/colorful artwork, and a ten-second settling
+interval. Applet startup or the sparse Jagex progress panel cannot satisfy it.
+Every success also writes a PNG. The consolidated report
+`dekobloko-work/.work/alterorb-jvmjs/all-games-main-menu-consolidated-report.json`
+contains **44/44 main-menu results**. It combines the original catalog pass
+with focused reruns made after generic JVM fixes; it does not relabel timeouts
+as successes. An RGB-hash audit found that 40 of the referenced PNGs still
+match their successful menu surfaces. Four had been overwritten by later
+timeout diagnostics because the first launcher version reused one filename per
+title. Success, timeout, exit, and error screenshots now receive distinct,
+timestamped paths, so future diagnostic runs cannot destroy menu artifacts.
+The four affected success records retain their menu surface hashes and complete
+frame histories, but are not counted as preserved screenshot proof.
+
+The failures exposed reusable JVM/JRE defects:
+
+- class initialization was being published before the owning `<clinit>` frame
+  returned, allowing other threads to observe default static values;
+- primitive byte loads/stores did not consistently apply Java signed-byte
+  narrowing in interpreted, generated, structured-SSA, and Wasm paths;
+- `PixelGrabber`-style ARGB decoding discarded RGB channels when alpha was
+  zero, changing sprite-cropping decisions;
+- synchronous generated `checkcast` treated an unloaded array component class
+  as a definite covariance failure instead of deoptimizing for asynchronous
+  class resolution;
+- a partial Wasm method could spill a captured static boolean incorrectly
+  across unsupported call edges.
+
+The last case is guarded by bytecode shape only: `getstatic` of descriptor `Z`
+captured by `istore`, combined with normal-flow calls. Affected partial Wasm
+and generated-JavaScript methods stay in the canonical interpreter; unrelated
+methods remain JIT eligible. Tests use arbitrary renamed owners, fields, and
+methods. There is no game, class-name, method-name, or descriptor allowlist.
+
+One unusually call-dense title demonstrates that compatibility and startup
+speed are separate. Its serial interpreter run reached the verified menu in
+226.600 seconds. The scoped mixed-tier route no longer reproduced its previous
+null-array corruption, but still timed out at 420 seconds, so tier probing and
+generated/interpreted transitions remain slower than interpretation for that
+initialization body. A later 300-second interpreter rerun remained runnable on
+the changing progress surface but missed its tighter wall-clock deadline; it
+was retained as a timeout, not counted as a second success.
+
+The launcher now exposes `--no-jit` explicitly and records that selection in
+its report. Interpreter-only catalog runs should be serial or use a much larger
+wall-clock budget: four concurrent workers starved the heavy initializers and
+caused artificial 420-second timeouts. The catalog audit therefore uses the
+completed per-title observations, while performance comparisons must remain
+isolated single-worker runs.
+
+The catalog investigation also tightened the fused-renderer acceptance result.
+The first live differential found that both compact handwritten triangle
+translations generalized control flow that the bytecode did not have. In
+particular, the flat raster's verified lower phase emits one scanline and then
+returns; treating it as an ordinary lower loop changed pixels. Valid,
+permutation-driven gradient inputs exposed another handwritten mismatch.
+Consequently compact semantic raster replacements are now disabled by default
+and require the explicit experimental
+`JVM_ENABLE_SEMANTIC_FUSED_RASTERS=1` opt-in. Generated wrapper/raster fusion
+remains enabled and is the correctness path.
+
+While making the differential inputs valid, a fixed tick limit exposed an
+over-broad compatibility predicate: merely storing an unused static boolean
+was enough to demote a hot scanline to per-pixel interpretation. The guard now
+requires the stored local to survive an actual invoke edge and then be read.
+Unused obfuscator flags and flags consumed before a call stay JIT eligible.
+
+The checked harness now derives the three wrapper ordering keys and boolean
+guards from its structural wrapper plan, permutes valid vertices, and reports
+the exact descriptor, iteration, method, and PC on a scheduler-budget failure.
+Its final run compared **200 gradient and 200 flat invocations**, observed
+32,574 and 31,821 changed pixels respectively, and matched every destination
+pixel. The passing default deliberately reports zero compact semantic raster
+runs: that is evidence that the generated fused fallback is correct, not a
+claim that the rejected handwritten shortcut was repaired.
+
+### Live Firefox 1 FPS renderer investigation (2026-07-23)
+
+The reported 1 FPS was real, but it was not the browser canvas ceiling. The
+same Firefox installation sustained 27.91 complete synthetic AWT frames/s
+with the expected surface hash. During the game startup/logo sequence,
+presentation gaps were instead 6.4–7.2 seconds and stack snapshots repeatedly
+stopped in the model/face renderer.
+
+Three generic dispatch defects prevented the already-verified renderer
+pipeline from running:
+
+1. The fused-region admission pre-check scanned unreachable bytecode while
+   full discovery used verified reachable bytecode. Dead obfuscator calls
+   therefore rejected regions that `discoverRegion()` and `compile()` both
+   accepted. Admission now uses the verifier's reachable call set.
+2. Fused entry existed only for generated callers. The hot outer renderer was
+   still interpreted, so every wrapper and raster was materialized as a child
+   `Frame`. Warm synchronous `invokestatic` sites now cache the structural
+   candidacy and enter the same guarded fused region directly. Failed guards
+   leave operands and side effects untouched.
+3. Firefox's whole-method preference proved the broader JavaScript generator
+   could compile a body, then called the narrower legacy-runner eligibility
+   check. Worse, a captured-boolean rejection wrote `false` into the broader
+   generator's cache. The whole-method route now uses its own proved
+   capability set, and legacy rejection updates only the legacy cache.
+
+All selection remains based on descriptors, CFG/stack verification, reachable
+opcode and call structure, and handler semantics. Guest class and method names
+were used only to label diagnostic stack output. No renderer identity is
+hardcoded in the optimizer.
+
+The same local headless Firefox and production bundle showed this progression:
+
+| Candidate | 45 s presented frames | 60 s presented frames | observed rate |
+| --- | ---: | ---: | ---: |
+| fusion unreachable | 4 | 9 | 0–1 FPS |
+| interpreter-to-fused bridge | 17 | 79 | 9 FPS after logo |
+| broad whole-method route | 193 | 374 | 12 FPS after logo |
+| corrected tier cache | 312 | — | 11.3 FPS at 20 s; 12.2 FPS at 45 s |
+
+The final run reached 50 presentations by 20 seconds instead of 8, executed
+132,803 generated fused regions with zero guarded fallbacks, and reported no
+page/runtime errors. The former multi-second wrapper/raster frames disappeared
+from sampled stacks. A first-invocation compilation experiment produced 185
+frames at 45 seconds versus 193 without it and was reverted.
+
+This is a large startup and 3D-rendering improvement, but it is not the
+20 FPS acceptance result. After the 3D logo work finishes, the remaining UI
+and text/image composition path plateaus around 12 FPS. The deployed diagnostic
+bundle is
+`7bcc91a39fef940f602e7a1693f341b71797a7b620b6fe4ee6dde60bab26295b`
+and remains available on port 3771 for the next wall-time attribution pass.
+
+### Static-array SSA breakthrough: 38–41 presented FPS (2026-07-24)
+
+The next investigation measured elapsed time rather than ranking invocation
+counts. After a 30-second warmup, a sampled 10-second window attributed
+approximately 94% of wall time to guest execution. The full-frame RGB snapshot
+copy cost only 81 ms (0.8%), and Wasm swizzle plus `putImageData` cost 251 ms
+(2.5%). Canvas publication was therefore not capable of explaining the
+12 FPS plateau.
+
+Several generic compiler changes were measured independently:
+
+| Candidate | result |
+| --- | ---: |
+| broad nested whole-method admission | 319 frames at 45 s |
+| widened opcode admission | 333 frames at 45 s |
+| acyclic CFGs through structured SSA | 341 frames at 45 s |
+| production method-key allocation removal | 344 frames at 45 s |
+| positional scalar-to-call bridge | 344 frames at 45 s; reverted |
+| adaptive constructor callers | 352 frames at 45 s, no steady-state gain |
+| adaptive non-monitor effectful callers | 381 frames at 45 s, still 12 FPS steady |
+
+The adaptive tier is Firefox-only by default and promotes only after 64
+method-entry observations. Its alternate capability proof still rejects
+constructors, class initializers, thread `run` entries, monitor bodies,
+unsupported opcodes, and asynchronous class literals. Before promotion the
+canonical interpreter executes every effect. The checked fixture verifies that
+a generated child exception reconstructs the parent call PC and resumes the
+original Java recovery handler. This removed the cold-compilation regression
+seen when every constructor-containing caller was admitted immediately, and
+substantially improved the loading phase, but it did not solve the steady
+renderer.
+
+The post-promotion wall-time sample then exposed one small call-free method as
+the largest remaining consumer: a 64-bytecode unrolled `int[]` clear loop took
+about 1.8 seconds of an estimated 10-second guest window. Its structure was:
+repeated initialized `getstatic` of the same array, an induction variable,
+nine `iastore` operations per iteration, and no calls or handlers. The
+structured SSA renderer was already producing lexical JavaScript, but each
+store still repeated a static-map lookup and called generic array-store
+normalization.
+
+The fix is generic and block-local:
+
+- repeated resolved static locations reuse their current value and raw array
+  view inside one straight-line SSA block;
+- every call and `putstatic` invalidates that block-local value;
+- no value survives a block edge, continuation, scheduler safe point, or
+  separate invocation;
+- `iastore` emits its exact Java narrowing directly as `value | 0`;
+- exceptional bounds/null paths still materialize the precise JVM PC, locals,
+  and operand stack.
+
+This retains snapshot/state semantics. The canonical static field and Java
+array remain the saved state; the raw view and SSA value are ephemeral
+generated-function locals and are never serialized. A checked fixture swaps
+the static array inside a child call and verifies that stores before the call
+reach the old array while stores after it reach the replacement. It also
+verifies that direct `iastore` narrowing is emitted without the generic helper.
+
+The performance change was immediate:
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| sampled steady presentations | 121 / 10.02 s | 411 / 10.01 s |
+| sampled steady rate | 12.07 FPS | **41.05 FPS** |
+| uninstrumented presentations at 45 s | 381 | **1,115** |
+| uninstrumented displayed steady rate | 12 FPS | **38–40 FPS** |
+| page/runtime errors | 0 | 0 |
+
+The hash probe retained the expected initial animation hashes
+`4025147891 → 1583173216` and reported no page or console errors. Its first
+20-changing-image window spans the still-warming/loading transition and
+measured 16.01 changed images/s; it is not the 30-second steady presentation
+window above. This distinction should remain explicit in future acceptance
+runs: the browser now presents above the requested 30 FPS after warmup, while
+the earliest hash-changing startup window still misses the older 20
+changed-images/s criterion.
+
+The focused JIT/scheduler suite passed **484/484** before the final regression
+fixture, and the final JIT suite passed **456/456**. The production build
+completed with only the existing dynamic-JNI and bundle-size warnings. The
+served bundle on `0.0.0.0:3771` is
+`fb1548fc05b984614af4c9576d4e2773f66f3e6273dff9dddfb2ac1d615efe48`.
+
+## 2026-07-24: deep asset unpacking and browser audio
+
+A remote diagnostic taken during “unpacking graphics, music and sound”
+captured the runnable client inside a 2,980-instruction one-shot asset method
+at instruction 1,526 after 71 seconds. This was guest execution, not network
+download or host inflate time. Structural inspection of the exact JAR method
+found the real exclusion: nine `dup_x2` bytecodes. The method was rejected even
+by the relaxed JavaScript tier and therefore executed its first invocation
+through interpreter scheduling.
+
+The generic fixes are:
+
+- adaptive constructor/effectful callers now sample elapsed residency once per
+  64 interpreter probes and may OSR after 8 ms, instead of depending only on
+  repeated method entries;
+- `dup_x2` is emitted from verifier-derived operand widths, including the
+  category-2 form, with the baseline resume body retaining arbitrary-PC OSR;
+- a `dup_x1` post-increment helper is no longer rejected merely because another
+  branch contains calls. Calls retain the existing generated dispatch,
+  materialization, exception, and deoptimization paths.
+
+No guest owner or method name participates in these decisions. The exact
+reported outer method now passes structural admission and compiles to a
+resumable baseline JavaScript body in about 67 ms. More importantly, the
+archive byte reader beneath it no longer performs one scheduler entry per byte.
+
+The forced `simplemode` Firefox run provides a same-path comparison:
+
+| Deep asset progress | Before | After |
+| --- | ---: | ---: |
+| first enters the large asset body | 25 s | 20 s |
+| compressed block 21 | 35–40 s | before 30 s |
+| compressed block 31 | 50 s | before 35 s |
+| all 34 compressed blocks | not complete at 120 s | **35 s** |
+| runtime/page errors | 0 | 0 |
+
+This fixes the reported unpacking regression, but it does not declare the whole
+menu performant. After unpacking, that forced route displayed only about
+1–2 FPS in a different set of menu/layout guest bodies; those remain a separate
+profiling target.
+
+Firefox audio was independently silent for a concrete integration reason.
+`SourceDataLine` and the WebAudio implementation existed, but custom embedders
+that loaded only `jvm-debug.js` never loaded the separate registration script,
+so `SourceDataLine` selected `MockAudioOutput`. The browser entry now registers
+WebAudio inside the runtime bundle and installs pointer, keyboard, and touch
+handlers that resume a suspended `AudioContext` under Firefox's autoplay
+policy. A Firefox probe verified a real context, queued PCM while suspended,
+transition to `running` after a pointer gesture, buffer completion, and zero
+page errors.
+
+The final focused JIT suite passed **471/471** and the audio/browser-JRE checks
+passed **75/75**. `npm run build:bundle` completed with only the existing
+dynamic-JNI and size warnings. The served bundle is
+`0217a4771e0c60c689fb4da6ee2267d9614875f9318be0ace930b8516fa14f63`.
+
+## 2026-07-24: scheduler handoffs, not the inner span, limit the forced menu
+
+The forced `simplemode` menu regression was measured separately from the
+earlier 38–41 FPS animation path. Its comparable uninstrumented Firefox
+baseline was **1.89 presented FPS** after asset loading. The first hypothesis
+was that software raster arithmetic itself had become the limiter. Full
+descriptor/opcode/CFG/static-field-identity verification was added for the
+alpha span, byte-mask color blit, and instance glyph wrapper shapes. These
+paths use positional scalar operands and preserve the generic generated path
+behind initialization/debugger/shape guards. They do not inspect guest class
+or method names.
+
+Those raster changes removed the intended child calls, but the menu remained
+at about 1.9 FPS. Time-based scheduler profiling then found the real boundary:
+warm generated callers repeatedly handed synchronous library and small guest
+callees back to the scheduler. One text body alone recorded about 303,000
+generated exits in ten seconds because a synchronous `String` operation was
+available through the JRE shim table but not through the classfile-only
+synchronous resolver.
+
+The generic corrections were measured in sequence:
+
+| Firefox forced-menu configuration | sustained presented FPS |
+| --- | ---: |
+| comparable baseline | 1.89 |
+| structural alpha/glyph raster intrinsics | 1.89–1.90 |
+| direct proven-synchronous instance JRE leaves | 3.14 |
+| direct proven-synchronous static JRE leaves in whole-JS mode | 3.63 |
+| short primitive-array state helpers | 4.86 |
+| short forward-conditional state helpers | **6.74** |
+
+JRE leaves are admitted only when the resolved shim is a plain synchronous
+function and does not use the runtime's asynchronous-method sentinel.
+Unexpected Promise/sentinel results disable the fast target and retain the
+canonical path. Operands remain on the caller stack until the shim returns, so
+a thrown Java exception still reconstructs the exact call PC and operands.
+Static JRE leaves remain available to the Wasm linker when Wasm is the
+preferred tier; direct static execution is used by the Firefox whole-method
+JavaScript policy.
+
+The small-helper change is also structural. A method must remain under 32
+instructions and contain only the verified scalar field, primitive-array,
+invoke, return, and forward conditional operations supported by the generator.
+This admitted four-slot clip save/restore and clip narrowing helpers that had
+previously incurred a scheduler transition on every drawing primitive.
+Renamed fixtures verify both array/static mutations and conditional writes.
+
+The final clean run presented 236 frames from 40 to 75 seconds:
+**6.7429 FPS**, with zero page or runtime errors. A low-rate follow-up profile
+showed the former high-volume clipping deoptimizations had disappeared.
+Remaining scheduler exits were sparse; the dominant work had moved inside
+generated scan conversion and text rendering. Two generated edge helpers ran
+about 1.45 million times and the synchronous character/glyph paths ran about
+1.3 million/0.95 million times in the ten-second profiled interval.
+
+A per-call-site reusable JRE argument-array experiment measured **6.49 FPS**
+against 6.74 and was reverted. This rules out those short-lived argument
+arrays as the missing large gain. The next optimization should be generic
+positional intermethod emission/inlining for verified generated helpers, so
+the scan-conversion loop does not construct and recycle a child `Frame` for
+millions of synchronous calls.
+
+This is a 3.57× improvement over the forced-menu baseline, but **6.74 FPS is
+still unplayable and is not an acceptance result**. The measured-best served
+bundle is
+`812d1edfd6ed33fc7875b4f1b44492a80ef34dfaf6f7993a6da1b398d0ccae62`;
+no game JAR or guest method-name table is involved.

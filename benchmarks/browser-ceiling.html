@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Browser JVM rendering diagnostics</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      padding: 28px;
+      color: #eef3fb;
+      background: #0d121c;
+      font: 15px system-ui, sans-serif;
+    }
+    main { width: min(980px, 100%); margin: auto; }
+    h1 { margin: 0 0 8px; font-size: 27px; }
+    #summary { margin: 0 0 22px; color: #aebbd0; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 22px;
+      align-items: start;
+    }
+    section {
+      padding: 18px;
+      border: 1px solid #283448;
+      border-radius: 12px;
+      background: #151d2a;
+    }
+    canvas { width: 100%; height: auto; background: #000; }
+    ol { margin: 0; padding-left: 22px; }
+    li { margin: 9px 0; color: #92a0b6; }
+    li.running { color: #70c9ff; }
+    li.complete { color: #79ddb5; }
+    li.failed { color: #ff8088; }
+    pre {
+      min-height: 180px;
+      overflow: auto;
+      margin: 18px 0 0;
+      padding: 14px;
+      border-radius: 9px;
+      color: #cfdaed;
+      background: #090d14;
+      font: 12px/1.45 ui-monospace, monospace;
+      white-space: pre-wrap;
+    }
+    @media (max-width: 780px) {
+      body { padding: 14px; }
+      .layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Browser JVM rendering diagnostics</h1>
+    <p id="summary">Preparing client-side benchmarks… Results are sent automatically.</p>
+    <div class="layout">
+      <section>
+        <canvas id="surface" width="800" height="600"></canvas>
+      </section>
+      <section>
+        <ol id="phases"></ol>
+      </section>
+    </div>
+    <pre id="result">Waiting to start…</pre>
+  </main>
+  <script>window.__BROWSER_CEILING_CONFIG__ = __BROWSER_CEILING_CONFIG_JSON__;</script>
+  <script src="__JVM_RUNTIME_URL__"></script>
+  <script src="/browser-ceiling.js"></script>
+</body>
+</html>

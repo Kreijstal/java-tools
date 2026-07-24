@@ -64,13 +64,13 @@ async function createRuntime() {
 }
 
 function findWrapper(runtime, descriptor) {
-  const family = runtime.jvm.jit.fusedRegions.constructor.FAMILY_BY_WRAPPER.get(descriptor);
+  const compiler = runtime.jvm.jit.fusedRegions;
   for (const [owner, classData] of Object.entries(runtime.jvm.classes)) {
     for (const item of classData.ast?.classes?.[0]?.items || []) {
       if (item.type !== 'method' || item.method.descriptor !== descriptor) continue;
-      if (runtime.jvm.jit.fusedRegions.verifyMethod(item.method, family, 'wrapper')) {
-        return { owner, method: item.method, family };
-      }
+      const discovered = compiler.discoverRegion(item.method);
+      if (discovered) return { owner, method: item.method,
+        family: discovered.family, discovered };
     }
   }
   throw new Error(`No structurally verified wrapper for ${descriptor}`);
@@ -83,12 +83,14 @@ function setField(runtime, arg, value) {
   classData.staticFields.set(`${name}:${descriptor}`, value);
 }
 
+function writeTarget(target, value) {
+  if (target.kind === 'map') target.fields.set(target.key, value);
+  else target.fields[target.key] = value;
+}
+
 function configureRegion(runtime, candidate, pixels) {
   const compiler = runtime.jvm.jit.fusedRegions;
-  const wrapper = compiler.verifyMethod(candidate.method, candidate.family, 'wrapper');
-  const rasterRef = wrapper.calls.find((call) => call.descriptor === candidate.family.raster);
-  const rasterMethod = compiler.resolveMethod(rasterRef);
-  const raster = compiler.verifyMethod(rasterMethod, candidate.family, 'raster');
+  const { wrapper, raster, rasterMethod, scanlineMethod } = candidate.discovered;
   for (const arg of wrapper.staticRefs) {
     const descriptor = arg[2][1];
     setField(runtime, arg, descriptor === '[I' ? pixels : defaultValue(descriptor));
@@ -100,15 +102,21 @@ function configureRegion(runtime, candidate, pixels) {
       : descriptor === 'I' ? 64 : defaultValue(descriptor);
     setField(runtime, arg, value);
   }
-  const scanlineRef = raster.calls.find((call) => call.descriptor === candidate.family.scanline);
-  const scanlineMethod = compiler.resolveMethod(scanlineRef);
   for (const arg of compiler.staticRefs(scanlineMethod)) setField(runtime, arg, defaultValue(arg[2][1]));
-  const region = compiler.compile(candidate.method, candidate.owner, candidate.family);
+  const region = compiler.compile(candidate.method, candidate.owner);
   if (!region) throw new Error(`Could not compile verified ${candidate.family.name} region`);
+  const rasterPlan = region.semanticGradientRasterPlan || region.semanticFlatRasterPlan;
+  if (rasterPlan) {
+    writeTarget(region.staticTargets[rasterPlan.heightStatic], 48);
+    writeTarget(region.staticTargets[rasterPlan.widthStatic], 64);
+    writeTarget(region.staticTargets[rasterPlan.rowsStatic],
+      Array.from({ length: 48 }, (_, row) => row * 64));
+    writeTarget(region.staticTargets[rasterPlan.strideStatic], 64);
+  }
   return region;
 }
 
-async function invokeBaseline(runtime, candidate, args) {
+async function invokeBaseline(runtime, candidate, args, label) {
   const frame = new Frame(candidate.method);
   frame.className = candidate.owner;
   args.forEach((value, index) => { frame.locals[index] = value; });
@@ -117,7 +125,12 @@ async function invokeBaseline(runtime, candidate, args) {
   let ticks = 0;
   while (!runtime.thread.callStack.isEmpty()) {
     await runtime.jvm.executeTick();
-    if (++ticks > 10000) throw new Error('baseline tick limit');
+    if (++ticks > 10000) {
+      const current = runtime.thread.callStack.peek();
+      throw new Error(`baseline tick limit at ${label}: ` +
+        `${current && current.className}.${current && current.method && current.method.name}` +
+        `@${current && current.pc}`);
+    }
   }
 }
 
@@ -126,16 +139,32 @@ function nextRandom(state) {
   return state.value;
 }
 
-function argumentsFor(family, random) {
+function argumentsFor(family, random, region) {
   const coordinate = () => 2 + nextRandom(random) % 60;
   const color = () => nextRandom(random) & 0xffffff;
-  if (family.name === 'flat-color') {
-    return [coordinate(), coordinate(), coordinate(), color(), coordinate(),
+  let args;
+  if (family.wrapper === '(IIIIIIII)V') {
+    args = [coordinate(), coordinate(), coordinate(), color(), coordinate(),
       coordinate(), coordinate(), coordinate()];
+  } else {
+    args = Array.from({ length: 16 }, (_, index) =>
+      [1, 2, 3, 4, 5, 8, 11, 14].includes(index) ? coordinate() : color());
   }
-  const args = Array.from({ length: 16 }, (_, index) => index === 12
-    ? 0 : (index === 1 || index === 2 || index === 3 || index === 4 || index === 5 ||
-      index === 8 || index === 11 || index === 14 ? coordinate() : color()));
+
+  const plan = region.semanticWrapperPlan;
+  if (plan) {
+    for (const parameter of plan.booleanParameters) args[parameter] = 1;
+    const ordered = [
+      4 + nextRandom(random) % 12,
+      22 + nextRandom(random) % 12,
+      40 + nextRandom(random) % 12,
+    ];
+    for (let index = ordered.length - 1; index > 0; index -= 1) {
+      const swap = nextRandom(random) % (index + 1);
+      [ordered[index], ordered[swap]] = [ordered[swap], ordered[index]];
+    }
+    plan.keys.forEach((parameter, index) => { args[parameter] = ordered[index]; });
+  }
   return args;
 }
 
@@ -156,10 +185,27 @@ function assertPixels(left, right, label) {
   for (const descriptor of descriptors) {
     const baselineCandidate = findWrapper(baseline, descriptor);
     const fusedCandidate = findWrapper(fused, descriptor);
+    if (process.env.JVM_DEBUG_FUSED_DIFFERENTIAL === '1') {
+      console.error(`differential ${descriptor}: ` +
+        `${baselineCandidate.owner}.${baselineCandidate.method.name} -> ` +
+        `${baselineCandidate.discovered.rasterOwner}.` +
+        `${baselineCandidate.discovered.rasterMethod.name}`);
+    }
     const baselinePixels = new Array(64 * 64);
     const fusedPixels = new Array(64 * 64);
     configureRegion(baseline, baselineCandidate, baselinePixels);
     const region = configureRegion(fused, fusedCandidate, fusedPixels);
+    if (process.env.JVM_DEBUG_FUSED_DIFFERENTIAL === '1') {
+      console.error(JSON.stringify({
+        keys: region.semanticWrapperPlan?.keys,
+        booleanParameters: region.semanticWrapperPlan?.booleanParameters,
+        templates: region.semanticWrapperPlan
+          ? [...region.semanticWrapperPlan.templates.entries()]
+          : [],
+      }));
+    }
+    const beforeGradient = fused.jvm.jit.semanticFusedRasterRunCount | 0;
+    const beforeFlat = fused.jvm.jit.semanticFusedFlatRasterRunCount | 0;
     const random = { value: descriptor.length * 0x9e3779b1 >>> 0 };
     let changedPixels = 0;
     for (let iteration = 0; iteration < iterations; iteration += 1) {
@@ -168,16 +214,24 @@ function assertPixels(left, right, label) {
         baselinePixels[index] = value;
         fusedPixels[index] = value;
       }
-      const args = argumentsFor(baselineCandidate.family, random);
-      await invokeBaseline(baseline, baselineCandidate, args);
+      const args = argumentsFor(baselineCandidate.family, random, region);
+      await invokeBaseline(baseline, baselineCandidate, args,
+        `${descriptor} iteration ${iteration}`);
       const state = region.executionState;
-      region.wrapperKernel(state, region, fused.jvm.jit, ...args);
+      const kernel = region.handwrittenWrapperKernel || region.wrapperKernel;
+      kernel(state, region, fused.jvm.jit, ...args);
       assertPixels(baselinePixels, fusedPixels,
-        `${baselineCandidate.family.name} iteration ${iteration}`);
+        `${descriptor} iteration ${iteration}`);
       changedPixels += fusedPixels.reduce((count, value, index) =>
         count + ((value | 0) !== (Math.imul(index + 1, 0x10203) & 0xffffff) ? 1 : 0), 0);
     }
-    report.push({ family: baselineCandidate.family.name, iterations, changedPixels });
+    report.push({ descriptor, iterations, changedPixels,
+      compactGradientInstalled: Boolean(region.semanticGradientRasterPlan),
+      compactFlatInstalled: Boolean(region.semanticFlatRasterPlan),
+      handwrittenWrapperInstalled: Boolean(region.handwrittenWrapperKernel),
+      compactGradientRuns: (fused.jvm.jit.semanticFusedRasterRunCount | 0) - beforeGradient,
+      compactFlatRuns: (fused.jvm.jit.semanticFusedFlatRasterRunCount | 0) - beforeFlat,
+      compactFlatRejection: region.semanticFlatRasterRejection || null });
   }
   process.stdout.write(`${JSON.stringify({ ok: true, classpath, report }, null, 2)}\n`);
 })().catch((error) => {
