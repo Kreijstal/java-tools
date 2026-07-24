@@ -110,6 +110,42 @@ function bytesToString(bytes, offset, length) {
   return str;
 }
 
+const stringLengthMethod = (jvm, obj) => stringValue(obj).length;
+const stringCharAtMethod = withThrows((jvm, obj, args) => {
+  const value = stringValue(obj);
+  const index = args[0];
+  if (index < 0 || index >= value.length) {
+    throw {
+      type: 'java/lang/StringIndexOutOfBoundsException',
+      message: `String index out of range: ${index}`,
+    };
+  }
+  return value.charCodeAt(index);
+}, ['java/lang/StringIndexOutOfBoundsException']);
+
+stringLengthMethod.jvmDirectFinal = true;
+stringLengthMethod.jvmDirectIntrinsic = (receiver) => {
+  if (receiver === null || receiver === undefined) {
+    throw { type: 'java/lang/NullPointerException', message: null };
+  }
+  return (typeof receiver === 'string' ? receiver : stringValue(receiver)).length;
+};
+stringCharAtMethod.jvmDirectFinal = true;
+stringCharAtMethod.jvmDirectIntrinsic = (receiver, rawIndex) => {
+  if (receiver === null || receiver === undefined) {
+    throw { type: 'java/lang/NullPointerException', message: null };
+  }
+  const value = typeof receiver === 'string' ? receiver : stringValue(receiver);
+  const index = rawIndex | 0;
+  if (index < 0 || index >= value.length) {
+    throw {
+      type: 'java/lang/StringIndexOutOfBoundsException',
+      message: `String index out of range: ${index}`,
+    };
+  }
+  return value.charCodeAt(index);
+};
+
 module.exports = {
   super: "java/lang/Object",
   interfaces: [
@@ -222,23 +258,11 @@ module.exports = {
       const count = args[0];
       return jvm.internString(stringValue(obj).repeat(count));
     },
-    "length()I": (jvm, obj, args) => {
-      return stringValue(obj).length;
-    },
+    "length()I": stringLengthMethod,
     "isEmpty()Z": (jvm, obj, args) => {
       return stringValue(obj).length === 0 ? 1 : 0;
     },
-    "charAt(I)C": withThrows((jvm, obj, args) => {
-      const value = stringValue(obj);
-      const index = args[0];
-      if (index < 0 || index >= value.length) {
-        throw {
-          type: 'java/lang/StringIndexOutOfBoundsException',
-          message: `String index out of range: ${index}`,
-        };
-      }
-      return value.charCodeAt(index);
-    }, ['java/lang/StringIndexOutOfBoundsException']),
+    "charAt(I)C": stringCharAtMethod,
     "toCharArray()[C": (jvm, obj) => {
       const chars = Array.from(stringValue(obj), (ch) => ch.charCodeAt(0));
       chars.type = "[C";

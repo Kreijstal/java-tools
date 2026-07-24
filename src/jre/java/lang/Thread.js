@@ -8,12 +8,45 @@ function stringValue(value, fallback) {
   return value.valueOf ? String(value.valueOf()) : String(value);
 }
 
-function initializeThread(jvm, obj, { runnable = null, name = null } = {}) {
+function addThreadToGroup(group, threadObject) {
+  if (!group.threads) group.threads = [];
+  if (!group.threads.includes(threadObject)) group.threads.push(threadObject);
+}
+
+function ensureJavaThread(jvm, internalThread) {
+  if (!internalThread.javaThread) {
+    internalThread.javaThread = {
+      type: 'java/lang/Thread',
+      name: internalThread.name || 'Unknown',
+      nativeThread: internalThread,
+      hashCode: jvm.nextHashCode++,
+    };
+  }
+  if (!internalThread.javaThread.threadGroup) {
+    const group = internalThread.threadGroup || {
+      type: 'java/lang/ThreadGroup',
+      name: jvm.internString('system'),
+      parent: null,
+      threads: [],
+    };
+    internalThread.threadGroup = group;
+    internalThread.javaThread.threadGroup = group;
+  }
+  addThreadToGroup(internalThread.javaThread.threadGroup,
+    internalThread.javaThread);
+  return internalThread.javaThread;
+}
+
+function initializeThread(jvm, obj, { runnable = null, name = null } = {},
+    currentThread = null) {
   obj.hashCode = jvm.nextHashCode++;
   obj.name = name || `Thread-${obj.hashCode}`;
   obj.runnable = runnable;
   obj.daemon = false;
   obj.priority = 5;
+  if (currentThread) {
+    obj.threadGroup = ensureJavaThread(jvm, currentThread).threadGroup;
+  }
   delete obj.isUninitialized;
 }
 
@@ -24,32 +57,26 @@ module.exports = {
   staticMethods: {
     'currentThread()Ljava/lang/Thread;': (jvm, obj, args) => {
       const internalThread = jvm.threads[jvm.currentThreadIndex];
-      if (!internalThread.javaThread) {
-        internalThread.javaThread = {
-          type: 'java/lang/Thread',
-          name: internalThread.name || 'Unknown',
-          nativeThread: internalThread,
-          hashCode: jvm.nextHashCode++,
-        };
-      }
-      return internalThread.javaThread;
+      return ensureJavaThread(jvm, internalThread);
     }
   },
   methods: {
-    '<init>()V': (jvm, obj, args) => {
-      initializeThread(jvm, obj);
+    '<init>()V': (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, {}, currentThread);
     },
-    '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args) => {
-      initializeThread(jvm, obj, { runnable: args[0] });
+    '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, { runnable: args[0] }, currentThread);
     },
-    '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
-      initializeThread(jvm, obj, { name: stringValue(args[0], null) });
+    '<init>(Ljava/lang/String;)V': (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, { name: stringValue(args[0], null) },
+        currentThread);
     },
-    '<init>(Ljava/lang/Runnable;Ljava/lang/String;)V': (jvm, obj, args) => {
+    '<init>(Ljava/lang/Runnable;Ljava/lang/String;)V':
+        (jvm, obj, args, currentThread) => {
       initializeThread(jvm, obj, {
         runnable: args[0],
         name: stringValue(args[1], null),
-      });
+      }, currentThread);
     },
     'setDaemon(Z)V': (jvm, obj, args) => {
       obj.daemon = args[0];
@@ -60,7 +87,8 @@ module.exports = {
     'getName()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.name);
     },
-    'getThreadGroup()Ljava/lang/ThreadGroup;': (jvm, obj) => obj.threadGroup || null,
+    'getThreadGroup()Ljava/lang/ThreadGroup;': (jvm, obj) =>
+      obj.threadGroup || null,
     'start()V': async (jvm, threadObject, args, currentThread) => {
       const Stack = require('../../../core/stack');
       const Frame = require('../../../core/frame');
@@ -73,6 +101,10 @@ module.exports = {
         javaThread: threadObject,
       };
       threadObject.nativeThread = newThread;
+      if (threadObject.threadGroup) {
+        newThread.threadGroup = threadObject.threadGroup;
+        addThreadToGroup(threadObject.threadGroup, threadObject);
+      }
       
       // Handle lambda Runnables (created by invokedynamic)
       if (target.methodHandle) {
@@ -152,3 +184,5 @@ module.exports = {
     },
   },
 };
+
+module.exports.ensureJavaThread = ensureJavaThread;

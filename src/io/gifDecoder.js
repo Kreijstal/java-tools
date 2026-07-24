@@ -155,6 +155,7 @@ function decodePng(input) {
   let height = 0;
   let bitDepth = 0;
   let colorType = 0;
+  let interlace = 0;
   let palette = null;
   let transparency = null;
   const idat = [];
@@ -168,7 +169,10 @@ function decodePng(input) {
       height = readU32(pos - length);
       bitDepth = data[8];
       colorType = data[9];
-      if (data[12] !== 0) throw new Error('Interlaced PNGs are not supported');
+      interlace = data[12];
+      if (interlace !== 0 && interlace !== 1) {
+        throw new Error(`Unsupported PNG interlace method ${interlace}`);
+      }
     } else if (type === 'PLTE') {
       palette = [];
       for (let i = 0; i + 2 < data.length; i += 3) palette.push((data[i] << 16) | (data[i + 1] << 8) | data[i + 2]);
@@ -184,27 +188,63 @@ function decodePng(input) {
   const channels = ({ 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 })[colorType];
   if (!channels) throw new Error(`Unsupported PNG color type ${colorType}`);
   const packed = zlib.inflateSync(Buffer.concat(idat));
-  const stride = width * channels;
-  const raw = new Uint8Array(height * stride);
+  const raw = new Uint8Array(width * height * channels);
   let source = 0;
   const paeth = (a, b, c) => {
     const p = a + b - c;
     const pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
     return pa <= pb && pa <= pc ? a : (pb <= pc ? b : c);
   };
-  for (let y = 0; y < height; y++) {
-    const filter = packed[source++];
-    for (let x = 0; x < stride; x++) {
-      const left = x >= channels ? raw[y * stride + x - channels] : 0;
-      const above = y > 0 ? raw[(y - 1) * stride + x] : 0;
-      const upperLeft = y > 0 && x >= channels ? raw[(y - 1) * stride + x - channels] : 0;
-      let value = packed[source++];
-      if (filter === 1) value += left;
-      else if (filter === 2) value += above;
-      else if (filter === 3) value += Math.floor((left + above) / 2);
-      else if (filter === 4) value += paeth(left, above, upperLeft);
-      else if (filter !== 0) throw new Error(`Unsupported PNG filter ${filter}`);
-      raw[y * stride + x] = value & 0xff;
+  const decodePass = (startX, startY, stepX, stepY) => {
+    const passWidth = width <= startX
+      ? 0 : Math.ceil((width - startX) / stepX);
+    const passHeight = height <= startY
+      ? 0 : Math.ceil((height - startY) / stepY);
+    if (!passWidth || !passHeight) return;
+    const rowBytes = passWidth * channels;
+    let previous = new Uint8Array(rowBytes);
+    for (let passY = 0; passY < passHeight; passY++) {
+      const filter = packed[source++];
+      const row = new Uint8Array(rowBytes);
+      for (let x = 0; x < rowBytes; x++) {
+        const left = x >= channels ? row[x - channels] : 0;
+        const above = previous[x];
+        const upperLeft = x >= channels ? previous[x - channels] : 0;
+        let value = packed[source++];
+        if (value === undefined) throw new Error('Truncated PNG image data');
+        if (filter === 1) value += left;
+        else if (filter === 2) value += above;
+        else if (filter === 3) value += Math.floor((left + above) / 2);
+        else if (filter === 4) value += paeth(left, above, upperLeft);
+        else if (filter !== 0) throw new Error(`Unsupported PNG filter ${filter}`);
+        row[x] = value & 0xff;
+      }
+      const targetY = startY + passY * stepY;
+      for (let passX = 0; passX < passWidth; passX++) {
+        const targetX = startX + passX * stepX;
+        const sourceOffset = passX * channels;
+        const targetOffset = (targetY * width + targetX) * channels;
+        for (let channel = 0; channel < channels; channel++) {
+          raw[targetOffset + channel] = row[sourceOffset + channel];
+        }
+      }
+      previous = row;
+    }
+  };
+  if (interlace === 0) {
+    decodePass(0, 0, 1, 1);
+  } else {
+    // Adam7: seven independently filtered sparse images.
+    for (const pass of [
+      [0, 0, 8, 8],
+      [4, 0, 8, 8],
+      [0, 4, 4, 8],
+      [2, 0, 4, 4],
+      [0, 2, 2, 4],
+      [1, 0, 2, 2],
+      [0, 1, 1, 2],
+    ]) {
+      decodePass(...pass);
     }
   }
   const pixels = new Array(width * height);
@@ -223,7 +263,11 @@ function decodePng(input) {
       r = rgb >> 16; g = rgb >> 8 & 0xff; b = rgb & 0xff;
       if (transparency && transparency[index] !== undefined) a = transparency[index];
     }
-    pixels[i] = a === 0 ? 0 : ((a << 24) | (r << 16) | (g << 8) | b) | 0;
+    // PixelGrabber's default RGB model returns unpremultiplied ARGB. Fully
+    // transparent pixels may still carry meaningful RGB bits; Java software
+    // sprites sometimes distinguish those from the all-zero transparent
+    // pixel when finding their drawable bounds.
+    pixels[i] = ((a << 24) | (r << 16) | (g << 8) | b) | 0;
   }
   return { width, height, pixels };
 }
@@ -241,7 +285,7 @@ function decodeImage(input) {
       const g = decoded.data[offset + 1];
       const b = decoded.data[offset + 2];
       const a = decoded.data[offset + 3];
-      pixels[i] = a === 0 ? 0 : ((a << 24) | (r << 16) | (g << 8) | b) | 0;
+      pixels[i] = ((a << 24) | (r << 16) | (g << 8) | b) | 0;
     }
     return { width: decoded.width, height: decoded.height, pixels };
   }

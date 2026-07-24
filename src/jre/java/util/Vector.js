@@ -10,7 +10,10 @@ module.exports = {
       obj.size = 0;
     },
     '<init>(I)V': (jvm, obj, args, thread) => {
-      obj.items = new Array(args[0] || 10); // initial capacity
+      // Capacity is storage policy, not logical contents. A Java Vector
+      // constructed with a capacity still has size zero.
+      obj.items = [];
+      obj.capacity = Math.max(0, args[0] | 0);
       obj.size = 0;
     },
     '<init>(Ljava/util/Collection;)V': (jvm, obj, args, thread) => {
@@ -24,7 +27,13 @@ module.exports = {
       }
     },
     'add(Ljava/lang/Object;)Z': (jvm, obj, args) => {
-      return obj.methods['add(ILjava/lang/Object;)V'].call(null, jvm, obj, [obj.size, args[0]], thread) !== null ? 1 : 0;
+      obj.items.push(args[0]);
+      obj.size++;
+      return 1;
+    },
+    'addElement(Ljava/lang/Object;)V': (jvm, obj, args) => {
+      obj.items.push(args[0]);
+      obj.size++;
     },
     'add(ILjava/lang/Object;)V': withThrows((jvm, obj, args, thread) => {
       const index = args[0];
@@ -59,6 +68,18 @@ module.exports = {
         };
       }
       return obj.items[index];
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'insertElementAt(Ljava/lang/Object;I)V': withThrows((jvm, obj, args) => {
+      const element = args[0];
+      const index = args[1];
+      if (index < 0 || index > obj.size) {
+        throw {
+          type: 'java/lang/ArrayIndexOutOfBoundsException',
+          message: 'Index: ' + index + ', Size: ' + obj.size
+        };
+      }
+      obj.items.splice(index, 0, element);
+      obj.size++;
     }, ['java/lang/ArrayIndexOutOfBoundsException']),
     'set(ILjava/lang/Object;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const index = args[0];

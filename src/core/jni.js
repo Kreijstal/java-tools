@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const { ensureJavaThread } = require('../jre/java/lang/Thread');
 
 /**
  * Java Native Interface (JNI) implementation for the JavaScript JVM
@@ -13,6 +14,7 @@ class JNI {
     this.jvm = jvm;
     this.nativeRegistry = new Map(); // className:methodName:descriptor -> native function
     this.nativeLibraries = new Map(); // library name -> library object
+    this.registryVersion = 0;
     this.verbose = false;
     
     // Initialize with built-in JRE native methods
@@ -43,6 +45,7 @@ class JNI {
     const wrappedImplementation = this._wrapNativeMethod(implementation, className, methodName, descriptor);
     
     this.nativeRegistry.set(key, wrappedImplementation);
+    this.registryVersion += 1;
   }
 
   /**
@@ -180,10 +183,10 @@ class JNI {
     
     // System native methods
     this.registerNativeMethod('java/lang/System', 'currentTimeMillis', '()J',
-      (jniEnv) => jniEnv.jvm.clock.millis());
+      (jniEnv) => BigInt(jniEnv.jvm.clock.millis()));
 
     this.registerNativeMethod('java/lang/System', 'nanoTime', '()J',
-      (jniEnv) => jniEnv.jvm.clock.nanos());
+      (jniEnv) => BigInt(jniEnv.jvm.clock.nanos()));
 
     // Object native methods  
     this.registerNativeMethod('java/lang/Object', 'hashCode', '()I',
@@ -203,15 +206,7 @@ class JNI {
     this.registerNativeMethod('java/lang/Thread', 'currentThread', '()Ljava/lang/Thread;',
       (jniEnv) => {
         const currentThread = jniEnv.jvm.threads[jniEnv.jvm.currentThreadIndex];
-        if (!currentThread.javaThread) {
-          currentThread.javaThread = {
-            type: 'java/lang/Thread',
-            nativeThread: currentThread,
-            id: currentThread.id,
-            hashCode: jniEnv.jvm.nextHashCode++,
-          };
-        }
-        return currentThread.javaThread;
+        return ensureJavaThread(jniEnv.jvm, currentThread);
       });
 
     if (this.verbose) {

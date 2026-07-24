@@ -1,5 +1,17 @@
 const { withThrows } = require('../../helpers');
 
+function nextDouble(obj) {
+  let seed = obj['java/util/Random/seed'];
+
+  seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
+  const high27 = Number(seed >> 21n);
+  seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
+  const low26 = Number(seed >> 22n);
+  obj['java/util/Random/seed'] = seed;
+
+  return (high27 * (2 ** 26) + low26) / (2 ** 53);
+}
+
 module.exports = {
   super: "java/lang/Object",
   methods: {
@@ -92,20 +104,7 @@ module.exports = {
       return intVal / (1 << 24); // Divide by 2^24 to get [0, 1)
     },
     'nextDouble()D': (jvm, obj, args) => {
-      let seed = obj['java/util/Random/seed'];
-      
-      // Generate first 27 bits
-      seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
-      const high27 = Number(seed >> 21n);
-      
-      // Generate second 26 bits  
-      seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
-      const low26 = Number(seed >> 22n);
-      
-      obj['java/util/Random/seed'] = seed;
-      
-      // Combine for 53 bits of precision
-      return (high27 * (1 << 26) + low26) / (1 << 53);
+      return nextDouble(obj);
     },
     'nextBytes([B)V': withThrows((jvm, obj, args) => {
       const byteArray = args[0];
@@ -145,8 +144,8 @@ module.exports = {
       let v1, v2, s;
       do {
         // Generate two uniform random values in [-1, 1)
-        v1 = 2 * obj.nextDouble() - 1;
-        v2 = 2 * obj.nextDouble() - 1;
+        v1 = 2 * nextDouble(obj) - 1;
+        v2 = 2 * nextDouble(obj) - 1;
         s = v1 * v1 + v2 * v2;
       } while (s >= 1 || s === 0);
       

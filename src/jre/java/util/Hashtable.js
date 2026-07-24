@@ -5,6 +5,15 @@ module.exports = {
     '<init>()V': function(jvm, obj, args) {
       obj.map = new Map();
     },
+    '<init>(I)V': function(jvm, obj, args) {
+      obj.map = new Map();
+      obj.capacity = Math.max(0, args[0] | 0);
+    },
+    '<init>(IF)V': function(jvm, obj, args) {
+      obj.map = new Map();
+      obj.capacity = Math.max(0, args[0] | 0);
+      obj.loadFactor = Number(args[1]);
+    },
     'put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;': function(jvm, obj, args) {
       const key = args[0];
       const value = args[1];
