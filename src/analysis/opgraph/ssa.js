@@ -168,6 +168,7 @@ function buildSsaOrThrow(input, options) {
     localsSize,
     reachable,
     depthBefore: new Map(), // itemIdx -> operand slots before the instruction (op02 differential)
+    stackKindsBefore: new Map(), // itemIdx -> JVM verification kinds, bottom-to-top
     facts: options.facts || null,
     handlerEntries,
   };
@@ -298,6 +299,7 @@ function simulateBlock(context) {
     const op = instruction && instruction.op;
     if (!op) continue;
     fn.depthBefore.set(itemIdx, stack.reduce((total, v) => total + (kindWidth(v.kind) || 1), 0));
+    fn.stackKindsBefore.set(itemIdx, stack.map((value) => value.kind));
 
     const local = localOperation(instruction, instruction);
     if (local && local.isLoad) {

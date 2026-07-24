@@ -5,6 +5,9 @@ const path = require("path");
 const { MethodHandle, MethodType, Lookup } = require("../jre/java/lang/invoke");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
 
+const resolvedSyncInvokeSite = Symbol('resolvedSyncInvokeSite');
+const SYNC_INVOKE_FALLBACK = Symbol('syncInvokeFallback');
+
 function runtimeClassName(obj) {
   return obj && (obj._className || obj.type);
 }
@@ -19,6 +22,184 @@ function assignArgsToLocals(locals, args, params, startIndex) {
       localIndex += 1;
     }
   }
+}
+
+function syncSiteState(instruction, descriptor) {
+  let state = instruction && instruction[resolvedSyncInvokeSite];
+  if (state) return state;
+  const parsed = parseDescriptor(descriptor);
+  state = {
+    params: parsed.params,
+    returnType: parsed.returnType,
+    epoch: -1,
+    fusedCandidate: undefined,
+    staticTarget: undefined,
+    receiverClass0: null,
+    target0: undefined,
+    receiverClass1: null,
+    target1: undefined,
+  };
+  if (instruction && typeof instruction === 'object') {
+    try {
+      Object.defineProperty(instruction, resolvedSyncInvokeSite, {
+        configurable: true, writable: true, value: state,
+      });
+    } catch (_) {
+      // Frozen diagnostic fixtures retain a per-execution temporary state.
+    }
+  }
+  return state;
+}
+
+function resolveLoadedBytecodeTarget(jvm, startClassName, methodName, descriptor,
+  kind, receiverClassName) {
+  let currentClassName = receiverClassName || startClassName;
+  while (currentClassName) {
+    // Resolve already-registered targeted overrides and platform methods once;
+    // their returned Promise/blocking behavior is still honored by the caller.
+    const mayResolveNative = kind === 'static' ||
+      (kind === 'special' ? currentClassName === startClassName && jvm.jre[currentClassName]
+        : jvm.jre[currentClassName]);
+    const native = mayResolveNative
+      ? jvm._jreFindMethod(currentClassName, methodName, descriptor)
+      : null;
+    if (native) return { native, owner: currentClassName };
+    const classData = jvm.classes[currentClassName];
+    const knownJre = Boolean(jvm.jre[currentClassName]);
+    if (!classData || (classData.isJreStub && !knownJre)) return null;
+    const method = jvm.findMethod(classData, methodName, descriptor);
+    if (method) {
+      const isStatic = Boolean(method.flags && method.flags.includes('static'));
+      if ((kind === 'static') !== isStatic) return null;
+      return { method, owner: currentClassName };
+    }
+    if (kind === 'special' && methodName === '<init>') return null;
+    currentClassName = classData.ast && classData.ast.classes[0]
+      ? classData.ast.classes[0].superClassName
+      : null;
+  }
+  return null;
+}
+
+function pushBytecodeInvokeFrame(frame, thread, target, params, receiver, isStatic) {
+  const args = new Array(params.length);
+  for (let i = params.length - 1; i >= 0; i -= 1) args[i] = frame.stack.pop();
+  if (!isStatic) frame.stack.pop();
+  const child = new Frame(target.method);
+  child.className = target.owner;
+  let start = 0;
+  if (!isStatic) {
+    child.locals[0] = receiver;
+    start = 1;
+  }
+  assignArgsToLocals(child.locals, args, params, start);
+  thread.callStack.push(child);
+  if (target.method && target.method.name === '<init>' &&
+      typeof process !== 'undefined' && process.env &&
+      String(process.env.JVM_DEBUG_CONSTRUCTORS || '').split(',').includes(target.owner)) {
+    console.error(`[constructor] sync push ${target.owner}${target.method.descriptor}`);
+  }
+}
+
+function invokeNativeSync(frame, thread, target, state, receiver, kind, jvm) {
+  const args = new Array(state.params.length);
+  for (let i = state.params.length - 1; i >= 0; i -= 1) args[i] = frame.stack.pop();
+  if (kind !== 'static') frame.stack.pop();
+  const finish = (result) => {
+    if (kind === 'virtual' && thread.status === 'BLOCKED') {
+      frame.stack.push(receiver);
+      for (const arg of args) frame.stack.push(arg);
+      return undefined;
+    }
+    const isVoid = state.returnType === 'V' || state.returnType === 'void';
+    const suppressSentinel = kind !== 'static' && result === ASYNC_METHOD_SENTINEL;
+    if (!isVoid && !suppressSentinel && result !== undefined) {
+      frame.stack.push(typeof result === 'boolean' ? (result ? 1 : 0) : result);
+    }
+    return undefined;
+  };
+  const result = target.native(jvm,
+    kind === 'static' ? null : receiver, args, thread);
+  return result && typeof result.then === 'function' ? result.then(finish) : finish(result);
+}
+
+function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
+  const [_, className, [methodName, descriptor]] = instruction.arg;
+  const state = syncSiteState(instruction, descriptor);
+  if (state.epoch !== jvm.classEpoch) {
+    state.epoch = jvm.classEpoch;
+    state.fusedCandidate = undefined;
+    state.staticTarget = undefined;
+    state.receiverClass0 = null;
+    state.target0 = undefined;
+    state.receiverClass1 = null;
+    state.target1 = undefined;
+  }
+  if (kind === 'static') {
+    const init = jvm.classInitializationState.get(className);
+    if (init !== 'INITIALIZED' &&
+        !(init === 'INITIALIZING' &&
+          jvm.classInitializationOwners.get(className) === thread.id)) {
+      return SYNC_INVOKE_FALLBACK;
+    }
+    let target = state.staticTarget;
+    if (target === undefined) {
+      target = resolveLoadedBytecodeTarget(
+        jvm, className, methodName, descriptor, kind, null,
+      ) || null;
+      state.staticTarget = target;
+    }
+    if (!target) return SYNC_INVOKE_FALLBACK;
+    if (target.native) {
+      return invokeNativeSync(frame, thread, target, state, null, kind, jvm);
+    }
+    const fusedRegions = jvm.jit && jvm.jit.fusedRegions;
+    if (fusedRegions && fusedRegions.enabled) {
+      if (state.fusedCandidate === undefined) {
+        state.fusedCandidate = fusedRegions.mayFuse(target.method);
+      }
+      if (state.fusedCandidate) {
+        const fused = fusedRegions.tryInvoke({
+          op: 'invokestatic',
+          descriptor,
+          params: state.params,
+          returnType: state.returnType,
+        }, {
+          method: target.method,
+          lookupClass: target.owner,
+        }, frame, thread);
+        if (fused.handled) return undefined;
+      }
+    }
+    pushBytecodeInvokeFrame(frame, thread, target, state.params, null, true);
+    return undefined;
+  }
+
+  const receiverIndex = frame.stack.items.length - state.params.length - 1;
+  const receiver = frame.stack.items[receiverIndex];
+  if (receiver === null || receiver === undefined ||
+      typeof receiver === 'number' || typeof receiver === 'boolean' ||
+      receiver._annotationData || receiver.methodHandle) return SYNC_INVOKE_FALLBACK;
+  let receiverClassName = kind === 'special' ? className : runtimeClassName(receiver);
+  if (!receiverClassName || receiverClassName.startsWith('[')) return SYNC_INVOKE_FALLBACK;
+  let target;
+  if (state.receiverClass0 === receiverClassName) target = state.target0;
+  else if (state.receiverClass1 === receiverClassName) target = state.target1;
+  if (target === undefined) {
+    target = resolveLoadedBytecodeTarget(
+      jvm, className, methodName, descriptor, kind, receiverClassName,
+    ) || null;
+    state.receiverClass1 = state.receiverClass0;
+    state.target1 = state.target0;
+    state.receiverClass0 = receiverClassName;
+    state.target0 = target;
+  }
+  if (!target) return SYNC_INVOKE_FALLBACK;
+  if (target.native) {
+    return invokeNativeSync(frame, thread, target, state, receiver, kind, jvm);
+  }
+  pushBytecodeInvokeFrame(frame, thread, target, state.params, receiver, false);
+  return undefined;
 }
 
 // Helper function to format numbers according to Java's rules
@@ -356,12 +537,26 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
 async function invokespecial(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
+  const debugConstructor = methodName === '<init>' &&
+    typeof process !== 'undefined' && process.env &&
+    String(process.env.JVM_DEBUG_CONSTRUCTORS || '').split(',').includes(className);
+  if (debugConstructor) {
+    console.error(`[constructor] dispatch ${className}${descriptor} from ` +
+      `${frame.className}.${frame.method && frame.method.name}@${frame.pc - 1}`);
+  }
   const { params } = parseDescriptor(descriptor);
   const args = [];
   for (let i = 0; i < params.length; i++) {
     args.unshift(frame.stack.pop());
   }
   const obj = frame.stack.pop();
+  if (debugConstructor) {
+    const describe = (value) => value === null ? "null"
+      : value === undefined ? "undefined"
+        : runtimeClassName(value) || typeof value;
+    console.error(`[constructor] operands receiver=${describe(obj)} ` +
+      `args=${args.map(describe).join(",")}`);
+  }
 
   let jreMethod = null;
   if (jvm.jre[className]) {
@@ -450,9 +645,9 @@ async function invokespecial(frame, instruction, jvm, thread) {
     newFrame.locals[0] = obj; // 'this'
     assignArgsToLocals(newFrame.locals, args, params, 1);
     thread.callStack.push(newFrame);
-  } else if (methodName === "<init>") {
-    // If no constructor is found, it might be an empty constructor from a superclass (e.g. Object).
-    // For now, we do nothing, assuming the object is already created by 'new'.
+    if (debugConstructor) {
+      console.error(`[constructor] async push ${resolvedClassName}${descriptor}`);
+    }
   } else {
     throw new Error(
       `Unsupported invokespecial: ${className}.${methodName}${descriptor}`,
@@ -748,5 +943,15 @@ const invokeHandlers = {
   invokedynamic,
   invokeinterface,
 };
+
+invokeHandlers.invokevirtualSync = (frame, instruction, jvm, thread) =>
+  invokeBytecodeSync(frame, instruction, jvm, thread, 'virtual');
+invokeHandlers.invokestaticSync = (frame, instruction, jvm, thread) =>
+  invokeBytecodeSync(frame, instruction, jvm, thread, 'static');
+invokeHandlers.invokespecialSync = (frame, instruction, jvm, thread) =>
+  invokeBytecodeSync(frame, instruction, jvm, thread, 'special');
+invokeHandlers.invokeinterfaceSync = (frame, instruction, jvm, thread) =>
+  invokeBytecodeSync(frame, instruction, jvm, thread, 'interface');
+invokeHandlers.SYNC_INVOKE_FALLBACK = SYNC_INVOKE_FALLBACK;
 
 module.exports = invokeHandlers;

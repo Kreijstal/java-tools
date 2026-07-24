@@ -7,6 +7,9 @@ const control = require('./control');
 const invoke = require('./invoke');
 const object = require('./object');
 const conversions = require('./conversions');
+const { buildSsa } = require('../analysis/opgraph/ssa');
+const { kindWidth } = require('../analysis/opgraph/ssaTypes');
+const { stackWidthsBefore } = require('./stackMetadata');
 
 const instructions = {
   ...constants,
@@ -39,9 +42,19 @@ const asyncInstructionOps = new Set([
 const syncInstructions = Object.fromEntries(Object.entries(instructions)
   .filter(([op, func]) => !asyncInstructionOps.has(op) &&
     func.constructor.name !== 'AsyncFunction'));
+// getstatic is asynchronous only while class initialization/loading is cold.
+// Its warm initialized-field path is safe inside the synchronous quantum.
+syncInstructions.getstatic = object.getstaticSync;
+syncInstructions.invokevirtual = invoke.invokevirtualSync;
+syncInstructions.invokestatic = invoke.invokestaticSync;
+syncInstructions.invokespecial = invoke.invokespecialSync;
+syncInstructions.invokeinterface = invoke.invokeinterfaceSync;
 const syncCodePrepared = Symbol('syncCodePrepared');
 const syncHandler = Symbol('syncHandler');
 const syncInstruction = Symbol('syncInstruction');
+const categorySensitiveStackOps = new Set([
+  'pop2', 'dup_x2', 'dup2', 'dup2_x1', 'dup2_x2',
+]);
 
 function expandWideInstruction(instruction) {
   const parts = String(instruction && instruction.arg ? instruction.arg : '').trim().split(/\s+/).filter(Boolean);
@@ -64,8 +77,36 @@ function expandWideInstruction(instruction) {
 // every Frame for that method, so this removes the string lookup and `wide`
 // decoding from the interpreter's hottest loop without increasing per-frame
 // memory. Symbol properties stay out of AST serialization and debugger views.
-function prepareSyncInstructions(codeItems) {
+function prepareSyncInstructions(codeItems, method = null, exceptionTable = null) {
   if (!codeItems || codeItems[syncCodePrepared]) return;
+
+  const needsStackKinds = method && codeItems.some((item) => {
+    const instruction = item && item.instruction;
+    const op = typeof instruction === 'string' ? instruction : instruction && instruction.op;
+    return categorySensitiveStackOps.has(op);
+  });
+  if (needsStackKinds) {
+    const analysis = buildSsa({
+      codeItems,
+      exceptionTable: exceptionTable || [],
+      method,
+    });
+    if (analysis && !analysis.rejected && analysis.stackKindsBefore) {
+      for (const [itemIndex, kinds] of analysis.stackKindsBefore) {
+        const item = codeItems[itemIndex];
+        if (!item || !categorySensitiveStackOps.has(
+          typeof item.instruction === 'string'
+            ? item.instruction
+            : item.instruction && item.instruction.op,
+        )) continue;
+        Object.defineProperty(item, stackWidthsBefore, {
+          configurable: false,
+          enumerable: false,
+          value: kinds.map(kindWidth),
+        });
+      }
+    }
+  }
 
   for (const item of codeItems) {
     if (!item) continue;
@@ -134,8 +175,9 @@ function dispatch(frame, instruction, jvm, thread) {
 // Fast path used by the interpreter's bounded execution quantum. Most JVM
 // bytecodes are implemented by ordinary synchronous handlers; routing each
 // one through an async dispatcher creates two Promises per instruction even
-// though no suspension is possible. Async handlers (class loading, invokes,
-// allocation, casts, and class literals) deliberately remain on dispatch().
+// though no suspension is possible. Invoke/getstatic sites add guarded warm
+// handlers and return a fallback sentinel for cold loading/initialization;
+// allocation, casts, class literals, and actual Promises remain asynchronous.
 function dispatchSync(frame, instruction, jvm, thread) {
   if (jvm.verbose) return false;
   const op = typeof instruction === 'string' ? instruction : instruction.op;
@@ -155,3 +197,6 @@ module.exports.dispatchSync = dispatchSync;
 module.exports.prepareSyncInstructions = prepareSyncInstructions;
 module.exports.syncHandler = syncHandler;
 module.exports.syncInstruction = syncInstruction;
+module.exports.syncFallback = object.SYNC_STATIC_FALLBACK;
+module.exports.syncInvokeFallback = invoke.SYNC_INVOKE_FALLBACK;
+module.exports.expandWideInstruction = expandWideInstruction;

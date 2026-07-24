@@ -87,27 +87,27 @@ module.exports = {
     frame.locals[3] = frame.stack.pop();
   },
   iastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "iastore");
   },
   lastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "lastore");
   },
   fastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "fastore");
   },
   dastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "dastore");
   },
   bastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "bastore");
   },
   castore: (frame) => {
-    _astore(frame);
+    _astore(frame, "castore");
   },
   sastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "sastore");
   },
   aastore: (frame) => {
-    _astore(frame);
+    _astore(frame, "aastore");
   },
 };

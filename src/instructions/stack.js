@@ -1,9 +1,20 @@
-// Longs are stored as a SINGLE BigInt stack slot in this interpreter, while
-// the class file's dup2/pop2 family assumes category-2 values occupy two
-// slots. Treat a BigInt as a category-2 value so those forms stay coherent.
-// (Doubles are plain numbers and indistinguishable from ints; they keep the
-// historical slot-wise behavior.)
-const isCat2 = (v) => typeof v === 'bigint';
+const { stackWidthsBefore } = require('./stackMetadata');
+
+// Longs and doubles are each stored as one JavaScript value even though JVM
+// stack-manipulation bytecodes count them as two slots. Longs are identifiable
+// at runtime (BigInt); doubles are plain Numbers, so use the verifier-derived
+// widths attached to the current bytecode item.
+function widthsBefore(frame) {
+  const item = frame && frame.instructions && frame.instructions[frame.pc - 1];
+  return item && item[stackWidthsBefore];
+}
+
+function isCat2(value, widths, depthFromTop = 0) {
+  if (widths) {
+    return widths[widths.length - 1 - depthFromTop] === 2;
+  }
+  return typeof value === 'bigint';
+}
 
 module.exports = {
   dup: (frame) => {
@@ -14,8 +25,9 @@ module.exports = {
     frame.stack.pop();
   },
   pop2: (frame) => {
+    const widths = widthsBefore(frame);
     const value1 = frame.stack.pop();
-    if (isCat2(value1)) return; // one cat2 value == two slots
+    if (isCat2(value1, widths)) return; // one cat2 value == two slots
     frame.stack.pop();
   },
   swap: (frame) => {
@@ -32,9 +44,10 @@ module.exports = {
     frame.stack.push(value1);
   },
   dup_x2: (frame) => {
+    const widths = widthsBefore(frame);
     const value1 = frame.stack.pop(); // top (cat1)
     const value2 = frame.stack.pop();
-    if (isCat2(value2)) {
+    if (isCat2(value2, widths, 1)) {
       // Form 2: value2 is cat2
       frame.stack.push(value1);
       frame.stack.push(value2);
@@ -48,8 +61,9 @@ module.exports = {
     frame.stack.push(value1);
   },
   dup2: (frame) => {
+    const widths = widthsBefore(frame);
     const value1 = frame.stack.pop();
-    if (isCat2(value1)) {
+    if (isCat2(value1, widths)) {
       // Form 2: duplicate a single cat2 value
       frame.stack.push(value1);
       frame.stack.push(value1);
@@ -62,8 +76,9 @@ module.exports = {
     frame.stack.push(value1);
   },
   dup2_x1: (frame) => {
+    const widths = widthsBefore(frame);
     const value1 = frame.stack.pop();
-    if (isCat2(value1)) {
+    if (isCat2(value1, widths)) {
       // Form 2: cat2 over cat1
       const value2 = frame.stack.pop();
       frame.stack.push(value1);
@@ -80,10 +95,11 @@ module.exports = {
     frame.stack.push(value1);
   },
   dup2_x2: (frame) => {
+    const widths = widthsBefore(frame);
     const value1 = frame.stack.pop();
-    if (isCat2(value1)) {
+    if (isCat2(value1, widths)) {
       const value2 = frame.stack.pop();
-      if (isCat2(value2)) {
+      if (isCat2(value2, widths, 1)) {
         // Form 4: cat2 over cat2
         frame.stack.push(value1);
         frame.stack.push(value2);
@@ -100,7 +116,7 @@ module.exports = {
     }
     const value2 = frame.stack.pop();
     const value3 = frame.stack.pop();
-    if (isCat2(value3)) {
+    if (isCat2(value3, widths, 2)) {
       // Form 3: cat1,cat1 over cat2
       frame.stack.push(value2);
       frame.stack.push(value1);

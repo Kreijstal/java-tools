@@ -6,10 +6,11 @@ function runtimeClassName(objRef) {
 }
 
 function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
+  const fields = objRef.fields || {};
   let currentClassName = className;
   while (currentClassName) {
     const fieldKey = `${currentClassName}.${fieldName}`;
-    if (Object.prototype.hasOwnProperty.call(objRef.fields, fieldKey)) {
+    if (Object.prototype.hasOwnProperty.call(fields, fieldKey)) {
       return fieldKey;
     }
 
@@ -19,7 +20,112 @@ function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
       : null;
   }
 
-  return Object.keys(objRef.fields).find((fieldKey) => fieldKey.endsWith(`.${fieldName}`));
+  return Object.keys(fields).find((fieldKey) =>
+    fieldKey.endsWith(`.${fieldName}`));
+}
+
+// A fieldref resolves to one declaring-class slot regardless of the runtime
+// subclass of its receiver. Cache that verified slot on the parsed instruction
+// itself; Symbols stay out of snapshots, JSON, and debugger views. The own-key
+// check keeps synthetic/JRE objects with unusual layouts on the full resolver.
+const resolvedInstanceFieldKey = Symbol('resolvedInstanceFieldKey');
+const resolvedStaticFieldSite = Symbol('resolvedStaticFieldSite');
+const SYNC_STATIC_FALLBACK = Symbol('syncStaticFallback');
+function resolveInstanceFieldKeyAtSite(jvm, objRef, instruction, className, fieldName) {
+  if (instruction && typeof instruction === 'object') {
+    const cached = instruction[resolvedInstanceFieldKey];
+    if (cached && objRef.fields &&
+        Object.prototype.hasOwnProperty.call(objRef.fields, cached)) {
+      return cached;
+    }
+  }
+  const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName);
+  if (fieldKey && instruction && typeof instruction === 'object') {
+    try {
+      Object.defineProperty(instruction, resolvedInstanceFieldKey, {
+        configurable: true,
+        writable: true,
+        value: fieldKey,
+      });
+    } catch (_) {
+      // Frozen diagnostic fixtures simply retain the uncached resolver path.
+    }
+  }
+  return fieldKey;
+}
+
+function resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor) {
+  if (instruction && typeof instruction === 'object' && instruction[resolvedStaticFieldSite]) {
+    return instruction[resolvedStaticFieldSite];
+  }
+  const fieldKey = `${fieldName}:${descriptor}`;
+  let currentClassName = className;
+  let site = null;
+  while (currentClassName) {
+    const classData = jvm.classes[currentClassName];
+    if (classData && classData.staticFields) {
+      if (classData.staticFields.has(fieldKey)) {
+        site = { kind: 'class', owner: currentClassName, key: fieldKey };
+        break;
+      }
+      if (classData.staticFields.has(fieldName)) {
+        site = { kind: 'class', owner: currentClassName, key: fieldName };
+        break;
+      }
+      for (const key of classData.staticFields.keys()) {
+        if (typeof key === 'string' && key.split(':')[0].replace(/'/g, '') === fieldName) {
+          site = { kind: 'class', owner: currentClassName, key };
+          break;
+        }
+      }
+      if (site) break;
+    }
+    currentClassName = classData && classData.ast && classData.ast.classes[0]
+      ? classData.ast.classes[0].superClassName
+      : null;
+  }
+  if (!site && jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields) {
+    const fields = jvm.jre[className].staticFields;
+    const alternatives = [
+      fieldKey, `'${fieldName}:${descriptor}'`, `${fieldName}:${descriptor}'`,
+      `'${fieldName}:${descriptor}`, fieldName, `'${fieldName}'`,
+    ];
+    const key = alternatives.find((candidate) =>
+      Object.prototype.hasOwnProperty.call(fields, candidate));
+    if (key !== undefined) site = { kind: 'jre', owner: className, key };
+  }
+  if (site && instruction && typeof instruction === 'object') {
+    try {
+      Object.defineProperty(instruction, resolvedStaticFieldSite, {
+        configurable: true, writable: true, value: site,
+      });
+    } catch (_) {
+      // Frozen diagnostic fixtures retain the uncached lookup path.
+    }
+  }
+  return site;
+}
+
+function readStaticFieldSite(jvm, site) {
+  if (site.kind === 'class') {
+    const classData = jvm.classes[site.owner];
+    return classData && classData.staticFields ? classData.staticFields.get(site.key) : undefined;
+  }
+  return jvm.jre[site.owner].staticFields[site.key];
+}
+
+function getstaticSync(frame, instruction, jvm, thread) {
+  const [_, className, [fieldName, descriptor]] = instruction.arg;
+  const state = jvm.classInitializationState.get(className);
+  if (state !== 'INITIALIZED' &&
+      !(state === 'INITIALIZING' &&
+        jvm.classInitializationOwners.get(className) === thread.id)) {
+    return SYNC_STATIC_FALLBACK;
+  }
+  const site = resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor);
+  if (!site) throw new Error(`Unresolved static field: ${className}.${fieldName}`);
+  frame.stack.push(readStaticFieldSite(jvm, site));
+  return undefined;
 }
 
 const PRIMITIVE_ARRAY_DESC = {
@@ -76,7 +182,7 @@ module.exports = {
     }
 
     try {
-      jvm.loadClassByName(className);
+      await jvm.loadClassByName(className);
     } catch (e) {
       if (e.code === 'ENOENT') {
         throw {
@@ -107,7 +213,7 @@ module.exports = {
         }
         const superClassName = currentClassData.ast.classes[0].superClassName;
         if (superClassName) {
-            jvm.loadClassByName(superClassName);
+          await jvm.loadClassByName(superClassName);
         }
         currentClassName = superClassName;
       } else {
@@ -161,7 +267,13 @@ module.exports = {
   monitorenter: (frame, instruction, jvm, thread) => {
     const objRef = frame.stack.peek();
     if (!objRef) {
-        throw new Error('NullPointerException in monitorenter');
+        const owner = jvm && typeof jvm.findClassNameForMethod === 'function'
+          ? jvm.findClassNameForMethod(frame.method)
+          : '<unknown>';
+        const descriptor = frame.method && frame.method.descriptor || '';
+        throw new Error(`NullPointerException in monitorenter at ` +
+          `${owner}.${frame.method && frame.method.name || '<unknown>'}` +
+          `${descriptor}@${Math.max(0, Number(frame.pc || 1) - 1)}`);
     }
 
     if (!objRef.isLocked) {
@@ -198,12 +310,15 @@ module.exports = {
   getfield: (frame, instruction, jvm) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const objRef = frame.stack.pop();
-    if (objRef === null) {
+    if (objRef === null || objRef === undefined) {
       throw { type: 'java/lang/NullPointerException', message: null };
     }
-    const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName);
+    const fieldKey = resolveInstanceFieldKeyAtSite(
+      jvm, objRef, instruction, className, fieldName,
+    );
     const value = fieldKey ? objRef.fields[fieldKey] : undefined;
-    if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_GETFIELD === `${className}.${fieldName}` && Array.isArray(value)) {
+    if (jvm._debugGetfield && jvm._debugGetfield === `${className}.${fieldName}` &&
+        Array.isArray(value)) {
       const locals = (frame.locals || []).slice(0, 5).map((l) => (l !== null && typeof l === 'object' ? `<${l.type}${l.__dbgId ? '#' + l.__dbgId : ''}>` : String(l))).join(' ');
       console.error(`[getfield] ${className}.${fieldName} in ${frame.className || '?'}.${frame.method && frame.method.name}@${frame.pc} locals=[${locals}] [len ${value.length}] ${value.slice(0, 48).join(',')}`);
     }
@@ -214,12 +329,14 @@ module.exports = {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const value = frame.stack.pop();
     const objRef = frame.stack.pop();
-    if (objRef === null) {
+    if (objRef === null || objRef === undefined) {
       throw { type: 'java/lang/NullPointerException', message: null };
     }
-    const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
-    if (typeof process !== 'undefined' && process.env && process.env.JVM_DEBUG_PUTFIELD &&
-        process.env.JVM_DEBUG_PUTFIELD.split(',').includes(className)) {
+    const fieldKey = resolveInstanceFieldKeyAtSite(
+      jvm, objRef, instruction, className, fieldName,
+    ) || `${className}.${fieldName}`;
+    if (!objRef.fields) objRef.fields = {};
+    if (jvm._debugPutfield && jvm._debugPutfield.split(',').includes(className)) {
       if (!objRef.__dbgId) objRef.__dbgId = (module.exports.__dbgNext = (module.exports.__dbgNext || 0) + 1);
       let rendered;
       if (value === null) rendered = 'null';
@@ -227,7 +344,7 @@ module.exports = {
       else if (typeof value === 'object') rendered = `<${value.type}>`;
       else rendered = String(value);
       let by = '';
-      if (process.env.JVM_DEBUG_PUTFIELD_STACK) {
+      if (jvm._debugPutfieldStack) {
         const t = jvm.threads && jvm.threads[jvm.currentThreadIndex];
         if (t && t.callStack && t.callStack.items) {
           by = ' by ' + t.callStack.items.slice(-4).reverse()
@@ -248,59 +365,13 @@ module.exports = {
       return;
     }
 
+    const site = resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor);
+    if (site) {
+      frame.stack.push(readStaticFieldSite(jvm, site));
+      return;
+    }
+
     const fieldKey = `${fieldName}:${descriptor}`;
-
-    // First, try to get the field from the class registry (regular classes),
-    // using JVM field resolution through the superclass chain.
-    let currentClassName = className;
-    while (currentClassName) {
-      const currentClassData = jvm.classes[currentClassName];
-      if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldKey)) {
-        frame.stack.push(currentClassData.staticFields.get(fieldKey));
-        return;
-      }
-      if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldName)) {
-        frame.stack.push(currentClassData.staticFields.get(fieldName));
-        return;
-      }
-      if (currentClassData && currentClassData.staticFields) {
-        for (const [key, value] of currentClassData.staticFields.entries()) {
-          if (typeof key === 'string' && key.split(':')[0].replace(/'/g, '') === fieldName) {
-            frame.stack.push(value);
-            return;
-          }
-        }
-      }
-
-      currentClassName = currentClassData && currentClassData.ast && currentClassData.ast.classes[0]
-        ? currentClassData.ast.classes[0].superClassName
-        : null;
-    }
-
-    // If not found in class registry, try the JRE registry (for JRE classes)
-    if (jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields) {
-      const jreStaticFields = jvm.jre[className].staticFields;
-      if (Object.prototype.hasOwnProperty.call(jreStaticFields, fieldKey)) {
-        frame.stack.push(jreStaticFields[fieldKey]);
-        return;
-      }
-
-      // Try alternative field key formats for JRE registry
-      const alternativeKeys = [
-        `'${fieldName}:${descriptor}'`,
-        `${fieldName}:${descriptor}'`,
-        `'${fieldName}:${descriptor}`,
-        fieldName,
-        `'${fieldName}'`
-      ];
-
-      for (const altKey of alternativeKeys) {
-        if (Object.prototype.hasOwnProperty.call(jreStaticFields, altKey)) {
-          frame.stack.push(jreStaticFields[altKey]);
-          return;
-        }
-      }
-    }
 
     // Debug logging for troubleshooting (only in verbose mode)
     if (jvm.verbose) {
@@ -451,7 +522,11 @@ module.exports = {
 
     throw {
       type: 'java/lang/ClassCastException',
-      message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}`,
+      message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}` +
+        ` at ${jvm.findClassNameForMethod(frame.method)}.` +
+        `${frame.method && frame.method.name || '<unknown>'}` +
+        `${frame.method && frame.method.descriptor || ''}` +
+        `@${Math.max(0, Number(frame.pc || 1) - 1)}`,
     };
   },
 
@@ -465,3 +540,5 @@ module.exports.resolveInstanceFieldKey = resolveInstanceFieldKey;
 module.exports.runtimeClassName = runtimeClassName;
 module.exports.allocPrimitiveArray = allocPrimitiveArray;
 module.exports.allocReferenceArray = allocReferenceArray;
+module.exports.getstaticSync = getstaticSync;
+module.exports.SYNC_STATIC_FALLBACK = SYNC_STATIC_FALLBACK;
