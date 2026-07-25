@@ -1,6 +1,6 @@
 'use strict';
 
-const { treeToStatements, emitStatements } = require('./javaAstEmitter');
+const { treeToStatements, emitStatements, hasUnreachableStatement } = require('./javaAstEmitter');
 
 /**
  * structurer — provably-correct control-flow structuring.
@@ -399,7 +399,14 @@ const DEFAULT_RENDER = {
 };
 
 function printTree(tree, render = DEFAULT_RENDER) {
-  return emitStatements(treeToStatements(repairEmptyLoopExits(tree, []), render));
+  return emitStatements(structuredStatements(tree, render));
+}
+
+// The folded Java statement AST that `printTree` renders. Constant conditions are
+// already resolved here (dead if-branches dropped), so this — not the raw
+// structurer tree — is what reachability analysis must inspect to match javac.
+function structuredStatements(tree, render = DEFAULT_RENDER) {
+  return treeToStatements(repairEmptyLoopExits(tree, []), render);
 }
 
 function repairEmptyLoopExits(node, loopLabels) {
@@ -607,6 +614,9 @@ module.exports = {
   IrreducibleError,
   structure,
   printTree,
+  structuredStatements,
+  emitStatements,
+  hasUnreachableStatement,
   uniquifyLabels,
   uniquifyCatchParameters,
   buildCfgFromCode,

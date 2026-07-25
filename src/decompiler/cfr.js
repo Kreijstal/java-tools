@@ -6,7 +6,9 @@ const JSZip = require('jszip');
 const { getAST } = require('jvm_parser');
 const { convertJson } = require('../parsing/convert_tree');
 const { parseDescriptor } = require('../parsing/typeParser');
-const { buildCfgFromCode, printTree } = require('./structurer');
+const {
+  buildCfgFromCode, printTree, structuredStatements, emitStatements, hasUnreachableStatement,
+} = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
 const { jreClassInfo } = require('../java-frontend/jreMetadata');
@@ -3841,25 +3843,34 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     if (!useStateMachine && handlerEntries.size) {
       declarations.push(`${structuredCarrierType} decompiledCaughtException = null;`);
     }
+    // Keep the folded Java statement AST alongside the rendered text: reachability
+    // analysis must inspect the AST (dead if-branches already dropped by constant
+    // folding), which is what javac sees — not the raw structurer tree.
+    let statements = useStateMachine ? null : structuredStatements(structured.tree, render);
     let source = useStateMachine
       ? printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
         methodReturnType(method))
-      : printTree(structured.tree, render);
+      : emitStatements(statements);
     const hasInvalidJavaSwitch = (text) => /switch\s*\(\s*null\s*\)/.test(text)
       || /^\s*case\s+(?!-?\d+\s*:|'(?:\\.|[^'])+'\s*:)/m.test(text);
     const hasInvalidJavaFlow = (text) => hasUnreachableStatementAfterTerminal(String(text).split('\n'));
+    // The owned structurer emits dead loop-continuation clones for some
+    // irreducible CFGs, which javac rejects as "unreachable statement". Detecting
+    // it on the emitted AST routes the method to the CFG state machine (which
+    // prunes unreachable states) instead of shipping invalid Java.
     if (!useStateMachine && (source.includes('unsupported condition') || source.includes('= e;')
-      || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source))) {
+      || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source) || hasUnreachableStatement(statements))) {
       const normalOnly = codeItems.length > 1000 && !syncHandlers.size ? structureMethod(codeItems, []) : null;
       if (normalOnly && normalOnly.ok) {
         cache.clear();
         evaluating.clear();
         forwardedStackIns.clear();
         edgeStackInSources.clear();
-        source = printTree(normalOnly.tree, render);
+        statements = structuredStatements(normalOnly.tree, render);
+        source = emitStatements(statements);
       }
       if (source.includes('unsupported condition') || source.includes('= e;')
-        || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source)) {
+        || hasInvalidJavaSwitch(source) || hasInvalidJavaFlow(source) || hasUnreachableStatement(statements)) {
         if (syncHandlers.size) {
           // Never route a lowered synchronized method through the state
           // machine — it would emit unsynchronized code. Fall back loudly.
@@ -3871,6 +3882,17 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         evaluating.clear();
         forwardedStackIns.clear();
         edgeStackInSources.clear();
+        // The operand-stack carriers were declared for the structured (nested
+        // loop) rendering, where control flow guarantees each is assigned before
+        // use, so only the return/branch carriers received a default initializer
+        // (line ~3774). The state machine dispatches blocks through a switch, so
+        // javac can no longer prove definite assignment for the rest. Give every
+        // uninitialized carrier its Java default now — harmless for live paths
+        // (the real value overwrites it) and required for the method to compile.
+        for (let d = 0; d < declarations.length; d += 1) {
+          const carrier = /^(.+?)\s+(stackIn_\d+_\d+|stackOut_\d+_\d+);$/.exec(declarations[d]);
+          if (carrier) declarations[d] = `${carrier[1]} ${carrier[2]} = ${defaultValueForType(carrier[1])};`;
+        }
         source = printCfgStateMachine(cfg, render, evaluate, codeItems, stateMachineExceptionTable, declarations,
           methodReturnType(method));
       }
