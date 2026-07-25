@@ -8,12 +8,33 @@ const { execFileSync } = require('child_process');
 process.env.JVM_PROFILE_JIT_METHODS = '1';
 const { JVM } = require('../src/core/jvm');
 const { _test: wasmJitTest } = require('../src/jit/WasmJit');
+const {
+  OP,
+  assembleModule,
+  emitTryTableCatchAll,
+} = require('../src/jit/wasmShared');
 const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
 const HandwrittenFusedGradient = require('../src/jit/HandwrittenFusedGradient');
 const invokeHandlers = require('../src/instructions/invoke');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const awt = require('../src/platform/awt');
+
+function supportsWasmTryTable() {
+  const body = [];
+  emitTryTableCatchAll(body, () => {}, () => {});
+  body.push(OP.end);
+  const bytes = assembleModule({
+    importDecls: [],
+    mainParams: [],
+    mainResults: [],
+    declared: [],
+    body,
+  });
+  return WebAssembly.validate(bytes);
+}
+
+const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
 
 test('handwritten region fingerprints ignore guest class and method names', (t) => {
   const shape = (owner, dependency, methodName, fieldName, constant = 7) => ({
@@ -4702,8 +4723,13 @@ public class WasmReporterHarness {
   t.deepEqual(recovered.slice(0, 3), [42, 21, 31],
     'a handler that writes a recovery value dispatches to the compiled handler');
   const compiledAfter = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
-  t.ok(compiledAfter.has('WasmReporterHarness.recover([I)V'),
-    'recovery handler compiles under dispatcher EH');
+  t.equal(
+    compiledAfter.has('WasmReporterHarness.recover([I)V'),
+    WASM_TRY_TABLE_SUPPORTED,
+    WASM_TRY_TABLE_SUPPORTED
+      ? 'recovery handler compiles under dispatcher EH'
+      : 'recovery handler preserves semantics through the engine fallback',
+  );
   t.end();
 });
 
@@ -4873,8 +4899,13 @@ public class WasmCheckedHandlerHarness {
   t.deepEqual(recovered.slice(0, 3), [99, 7, 8],
     'broad Exception recovery dispatches to the compiled handler');
   const compiledBroad = new Map(jvm.jit.wasmJit.compiled.map((entry) => [entry.key, entry]));
-  t.ok(compiledBroad.has('WasmCheckedHandlerHarness.broad([I)V'),
-    'broad-catch recovery handler compiles under dispatcher EH');
+  t.equal(
+    compiledBroad.has('WasmCheckedHandlerHarness.broad([I)V'),
+    WASM_TRY_TABLE_SUPPORTED,
+    WASM_TRY_TABLE_SUPPORTED
+      ? 'broad-catch recovery handler compiles under dispatcher EH'
+      : 'broad-catch recovery preserves semantics through the engine fallback',
+  );
   t.end();
 });
 
