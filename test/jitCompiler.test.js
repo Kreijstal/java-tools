@@ -9,9 +9,7 @@ process.env.JVM_PROFILE_JIT_METHODS = '1';
 const { JVM } = require('../src/core/jvm');
 const { _test: wasmJitTest } = require('../src/jit/WasmJit');
 const {
-  OP,
-  assembleModule,
-  emitTryTableCatchAll,
+  supportsWasmTryTable,
 } = require('../src/jit/wasmShared');
 const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
 const HandwrittenFusedGradient = require('../src/jit/HandwrittenFusedGradient');
@@ -19,20 +17,6 @@ const invokeHandlers = require('../src/instructions/invoke');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const awt = require('../src/platform/awt');
-
-function supportsWasmTryTable() {
-  const body = [];
-  emitTryTableCatchAll(body, () => {}, () => {});
-  body.push(OP.end);
-  const bytes = assembleModule({
-    importDecls: [],
-    mainParams: [],
-    mainResults: [],
-    declared: [],
-    body,
-  });
-  return WebAssembly.validate(bytes);
-}
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
 

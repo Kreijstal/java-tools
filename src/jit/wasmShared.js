@@ -90,6 +90,31 @@ function emitTryTableCatchAll(out, emitBody, emitCatch) {
   );
 }
 
+let wasmTryTableSupport;
+function supportsWasmTryTable() {
+  if (wasmTryTableSupport !== undefined) return wasmTryTableSupport;
+  if (typeof WebAssembly === 'undefined' ||
+      typeof WebAssembly.validate !== 'function') {
+    wasmTryTableSupport = false;
+    return wasmTryTableSupport;
+  }
+  const body = [];
+  emitTryTableCatchAll(body, () => {}, () => {});
+  body.push(OP.end);
+  try {
+    wasmTryTableSupport = WebAssembly.validate(assembleModule({
+      importDecls: [],
+      mainParams: [],
+      mainResults: [],
+      declared: [],
+      body,
+    }));
+  } catch (error) {
+    wasmTryTableSupport = false;
+  }
+  return wasmTryTableSupport;
+}
+
 function sleb(value) {
   let n = BigInt(value);
   const out = [];
@@ -392,7 +417,7 @@ function liveExceptionRanges(jvm, code, labelIndex) {
 module.exports = {
   T, CAT2, OP, TRUNC_SAT,
   uleb, sleb, f32bytes, f64bytes,
-  emitTryTableCatchAll,
+  emitTryTableCatchAll, supportsWasmTryTable,
   wasmProfilerName, wasmFunctionNameSection,
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
   NPE, AIOOBE,
