@@ -155,6 +155,17 @@ class JitCompiler {
       Number(options.adaptiveCodegenTimeThresholdMs ?? 8) || 0);
     this.adaptiveCodegenTimeSampleInterval = Math.max(1,
       Number(options.adaptiveCodegenTimeSampleInterval) || 64);
+    const configuredWholeMethodEscalation =
+      options.adaptiveWholeMethodEscalationThreshold ??
+      (typeof process !== "undefined" && process.env
+        ? process.env.JVM_ADAPTIVE_WHOLE_METHOD_ESCALATION_THRESHOLD
+        : undefined);
+    this.adaptiveWholeMethodEscalationThreshold =
+      configuredWholeMethodEscalation === undefined
+        ? 16
+        : Math.max(0, Number(configuredWholeMethodEscalation) || 0);
+    this.adaptiveWholeMethodPromotionCount = 0;
+    this.adaptiveWholeMethodEscalationCount = 0;
     this.adaptiveEntryPromotionCount = 0;
     this.adaptiveTimePromotionCount = 0;
     this.adaptiveTimeSampleCount = 0;
@@ -346,8 +357,11 @@ class JitCompiler {
     // cost more up front so animation/render loops remain in one engine tier.
     let canRunGenerated = null;
     let awaitingAdaptivePromotion = false;
-    if (this.preferWholeMethodJs && !this.runningFrames.has(frame) &&
-        !frame.jitJsDisabled) {
+    const canProbeGenerated = !this.runningFrames.has(frame) &&
+      !frame.jitJsDisabled;
+    const wholeMethodPreferred =
+      this.prefersWholeMethodJs(frame.method);
+    if (wholeMethodPreferred && canProbeGenerated) {
       let codegenEligible = this.isCodegenSupported(frame.method);
       if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
           this.isCodegenSupported(frame.method, true)) {
@@ -368,6 +382,17 @@ class JitCompiler {
         // block. Do not probe the JS tier in between these two regions.
         return WASM_EXITED_RESULT;
       }
+    }
+    // In Wasm-first mode, observe JavaScript heat only after Wasm declined the
+    // current entry. This admits scheduler-heavy effectful/call-bearing bodies
+    // without stealing fully compiled numeric loops from the faster Wasm tier.
+    if (!wholeMethodPreferred && canProbeGenerated &&
+        this.adaptiveConstructorCallersEnabled &&
+        this.isCodegenSupported(frame.method, true)) {
+      const codegenEligible = this.observeAdaptiveCodegenHeat(frame);
+      awaitingAdaptivePromotion = !codegenEligible &&
+        !this.isSupported(frame.method);
+      if (codegenEligible) canRunGenerated = this.canRun(frame, true);
     }
     // Structural rejection and permanent deoptimization are method-stable.
     // Remember them on the frame so interpreted bytecodes do not repeat the
@@ -421,6 +446,11 @@ class JitCompiler {
     }
   }
 
+  prefersWholeMethodJs(method) {
+    return this.preferWholeMethodJs ||
+      this.adaptiveCodegenMethods.has(method);
+  }
+
   observeAdaptiveCodegenHeat(frame) {
     if (frame.pc === 0 && !frame.jitAdaptiveEntryCounted) {
       frame.jitAdaptiveEntryCounted = true;
@@ -455,8 +485,17 @@ class JitCompiler {
   }
 
   promoteAdaptiveCodegen(method) {
+    if (this.adaptiveCodegenMethods.has(method)) return;
     this.adaptiveCodegenMethods.add(method);
     this.codegenSupportCache.set(method, true);
+    this.adaptiveWholeMethodPromotionCount += 1;
+    if (!this.preferWholeMethodJs &&
+        this.adaptiveWholeMethodEscalationThreshold > 0 &&
+        this.adaptiveWholeMethodPromotionCount >=
+          this.adaptiveWholeMethodEscalationThreshold) {
+      this.preferWholeMethodJs = true;
+      this.adaptiveWholeMethodEscalationCount += 1;
+    }
     // The sampled elapsed-time observation is already stronger heat evidence
     // than the ordinary entry counter. Let this frame OSR immediately even
     // when the method has no backward branch.
@@ -493,7 +532,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -4016,8 +4055,9 @@ class JitCompiler {
     // linker; consuming a Math call in a JS fallback can otherwise prevent a
     // numeric caller from reaching Wasm. Whole-method JavaScript mode instead
     // keeps both static and instance JRE leaves inside the generated region.
+    const wholeMethodCaller = this.prefersWholeMethodJs(frame.method);
     const keepStaticForWasm = op === "invokestatic" &&
-      this.wasmJit.enabled && !this.preferWholeMethodJs;
+      this.wasmJit.enabled && !wholeMethodCaller;
     const synchronousJre = keepStaticForWasm ? null
       : this.resolveSynchronousJreMethod(
         targetClassName, declaredClassName, methodName, descriptor);
@@ -4057,7 +4097,7 @@ class JitCompiler {
       // involved.
       const normallySupported = this.isSupported(method) ||
         this.isShortSupportedHelper(method) ||
-        (this.preferWholeMethodJs && this.isCodegenSupported(method));
+        (wholeMethodCaller && this.isCodegenSupported(method));
       const fusedCandidate = op === "invokestatic" &&
         this.fusedRegions.mayFuse(method);
       // A semantic intrinsic can cover a method whose raw bytecodes are too
@@ -5689,7 +5729,8 @@ class JitCompiler {
     // call and avoids a needless frame/scheduler round trip.
     const jsChildSupported = this.isSupported(method) ||
       this.isShortSupportedHelper(method) ||
-      (this.preferWholeMethodJs && this.isCodegenSupported(method));
+      (this.prefersWholeMethodJs(frame.method) &&
+        this.isCodegenSupported(method));
 
     const child = new Frame(method);
     child.className = lookupClass;

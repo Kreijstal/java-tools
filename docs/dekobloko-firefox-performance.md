@@ -4129,3 +4129,96 @@ still unplayable and is not an acceptance result**. The measured-best served
 bundle is
 `812d1edfd6ed33fc7875b4f1b44492a80ef34dfaf6f7993a6da1b398d0ccae62`;
 no game JAR or guest method-name table is involved.
+
+## 2026-07-25: adaptive tier escalation restores the forced Node menu
+
+The generic AlterOrb `jvm.js` launcher exposed a second form of the same
+scheduler-bound failure. With `simplemode=true`, realtime guest pacing,
+structured Wasm, and the renderer pipeline enabled, the original JAR needed
+297.6 seconds to reach and measure the menu. Its 20.096-second window presented
+24 dirty frames: **1.1943 FPS**. Distinct surface hashes advanced at the same
+roughly 0.8-second interval, so this was real guest/render throughput rather
+than presentation coalescing or a finite-animation measurement artifact.
+
+This workload is deliberately distinct from the historical 50 Hz title
+animation. The relevant comparison is the same forced offline menu under the
+same launcher:
+
+| Node forced-menu configuration | startup + measurement | presented FPS |
+| --- | ---: | ---: |
+| Wasm-first baseline | 297.6 s | 1.19 |
+| restored synchronous scheduler, Wasm-first | 282.1 s | 1.23 |
+| partial-Wasm-exit promotion prototype | 274.6 s | 1.28 |
+| effectful/call-bearing JS promotion gate fixed | 90.5 s | 8.49 |
+| adaptive whole-method escalation, pre-guard-ordering | 88.0 s | 29.05 |
+| final, three clean 20-second runs | 87.9–88.0 s | **29.62 median** |
+
+The partial-Wasm-exit prototype promoted 21 methods but produced only a 4%
+change; it was removed. The breakthrough was an existing policy bug:
+elapsed-time and entry-count promotion was documented and enabled for Node,
+but its observation lived inside the `preferWholeMethodJs` branch. A Wasm-first
+runtime could therefore never accumulate the evidence needed to choose a
+whole JavaScript body for a method Wasm had declined.
+
+The retained policy is structural and adaptive:
+
+- Wasm is probed first and keeps every entry it can handle.
+- Only after Wasm declines an entry does the verified effectful/call-bearing
+  JavaScript capability proof collect entry or elapsed-time heat.
+- A promoted method uses whole-method JavaScript and its synchronous nested
+  call policy; no owner or member name participates.
+- After 16 distinct safe promotions, the application switches its remaining
+  eligible methods to whole-method JavaScript. This threshold is disabled with
+  `JVM_ADAPTIVE_WHOLE_METHOD_ESCALATION_THRESHOLD=0`.
+
+The escalation is intentionally application-wide only after diverse evidence.
+A fixture verifies that a fully handled Wasm entry accumulates no JavaScript
+heat, duplicate observations of one method cannot trigger escalation, and two
+distinct safe promotions trigger a configured threshold of two exactly once.
+
+The final counter profile showed 57 entry promotions, 27 elapsed-time
+promotions, 84 distinct whole-method promotions, and one escalation. Direct
+fused-region execution became active after escalation. It also revealed about
+1.04 million legitimate fused guard failures controlled by live static mode
+flags. Moving those side-effect-free false guards ahead of debugger, class,
+and bytecode-identity checks raised the three clean 20-second runs to 29.62,
+29.66, and 29.14 FPS: **29.62 FPS median**, a 24.8x improvement over the
+1.1943 baseline. The value is reported without rounding it above 30; it is
+consistent with the menu's approximately 30 Hz pacing ceiling.
+
+The focused JIT suite passes **597/597**, the scheduler suite passes **36/36**,
+and both modified compiler files pass syntax and whitespace validation. The
+headless reports are:
+
+- `.work/alterorb-jvmjs/dekobloko-node-fps-current.json`
+- `.work/alterorb-jvmjs/dekobloko-node-fps-adaptive-effectful.json`
+- `.work/alterorb-jvmjs/dekobloko-node-fps-guard-first-clean{1,2,3}.json`
+
+## 2026-07-26: Firefox timing separates guest execution from presentation
+
+The 29.62 FPS Node result did not transfer to Firefox. Remote browser
+diagnostics still measured roughly 1–2 presented FPS even though the same
+generic generated tiers were active. Sampled scheduler wall time identified
+large synchronous generated regions rather than asynchronous waits:
+
+- a hot animation method took roughly 46–61 ms per sampled entry in Firefox,
+  compared with about 1 ms in Node;
+- another lifecycle method took roughly 45 ms in Firefox, compared with about
+  0.18 ms in Node;
+- a larger generated region reached roughly 103 ms in Firefox, compared with
+  about 4.8 ms in Node;
+- canvas upload was roughly 7.5 ms per presented frame and framebuffer copying
+  roughly 1.5 ms, material costs but not enough to explain the full gap.
+
+The scheduler timing sampler now distinguishes synchronous guest time from
+time spent awaiting asynchronous work and exposes a snapshot API suitable for
+lightweight browser telemetry. It is configurable through JVM construction,
+so the diagnostics page does not need process-environment access.
+
+The browser scheduler also now accepts an `eventLoopYieldStrategy` of
+`"timer"` in addition to the existing MessageChannel path. The timer option is
+an explicit experiment for Firefox: a continuously replenished MessageChannel
+queue can complete many guest frames while `requestAnimationFrame` remains
+pending, causing presentation coalescing. This option has unit coverage but is
+not recorded as a performance win yet; it must be measured in the same remote
+browser before becoming the default.

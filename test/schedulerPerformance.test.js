@@ -21,6 +21,9 @@ test('idle scheduler waits instead of spinning zero-delay tasks', (t) => {
   jvm.threads = [{ status: 'WAITING' }];
   t.equal(jvm._idleWaitDelay(1000), 16,
     'untimed waits use the event-loop responsiveness budget');
+  const timerJvm = new JVM({ eventLoopYieldStrategy: 'timer' });
+  t.equal(timerJvm.eventLoopYieldStrategy, 'timer',
+    'browser callers can select a paint-friendly timer yield');
   t.end();
 });
 
@@ -28,6 +31,33 @@ test('deterministic scheduler never waits on wall time', (t) => {
   const jvm = new JVM({ fakeTime: 1000, eventLoopYieldMs: 16 });
   jvm.threads = [{ status: 'SLEEPING', sleepUntil: 2000 }];
   t.equal(jvm._idleWaitDelay(1010), 0);
+  t.end();
+});
+
+test('scheduler wall-time sampling can be enabled without process environment', (t) => {
+  const jvm = new JVM({ schedulerTimingRate: 256 });
+  t.ok(jvm._schedulerTimingProfile,
+    'browser callers can opt into sampled scheduler timing');
+  t.equal(jvm._schedulerTimingProfile.rate, 256,
+    'the configured sampling rate is retained');
+  jvm._schedulerTimingProfile.samples.set('Arbitrary.loop()V', {
+    samples: 3,
+    totalMs: 12.5,
+    maxMs: 7.25,
+  });
+  t.deepEqual(jvm.getSchedulerTimingSnapshot(1), {
+    rate: 256,
+    rows: [{
+      method: 'Arbitrary.loop()V',
+      samples: 3,
+      totalMs: 12.5,
+      maxMs: 7.25,
+      synchronousMs: 0,
+      asyncWaitMs: 0,
+      awaitedSamples: 0,
+      slowPathSamples: 0,
+    }],
+  }, 'diagnostics expose sampled time without enabling invocation profiling');
   t.end();
 });
 

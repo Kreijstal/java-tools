@@ -3774,6 +3774,61 @@ public class NestedGeneratedJitHarness {
   t.end();
 });
 
+test('execute keeps synchronous generated entries off the async tick path', async (t) => {
+  const classpath = compileJavaFixture(t, 'SynchronousExecuteHarness', `
+public class SynchronousExecuteHarness {
+  public static void compute(int[] out) {
+    int value = 0;
+    for (int i = 0; i < 100; i++) value += i;
+    out[0] = value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    preferWholeMethodJs: true,
+    profileMethods: false,
+  } });
+  await jvm.loadClassByName('SynchronousExecuteHarness');
+  jvm.classInitializationState.set(
+    'SynchronousExecuteHarness', 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    'SynchronousExecuteHarness', 'compute', '([I)V');
+  const out = [0];
+  out.type = '[I';
+  const frame = new Frame(method);
+  frame.className = 'SynchronousExecuteHarness';
+  frame.locals[0] = out;
+  const thread = {
+    id: 0,
+    name: 'synchronous-execute-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  thread.callStack.push(frame);
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const executeTick = jvm.executeTick.bind(jvm);
+  let asyncEntriesWithGuestFrame = 0;
+  jvm.executeTick = (...args) => {
+    const scheduled = args[1];
+    if (scheduled && scheduled.callStack &&
+        !scheduled.callStack.isEmpty()) {
+      asyncEntriesWithGuestFrame += 1;
+    }
+    return executeTick(...args);
+  };
+
+  const result = await jvm.execute();
+  t.equal(out[0], 4950, 'generated execution preserves the loop result');
+  t.ok(result.completed, 'the scheduler completes normally');
+  t.equal(asyncEntriesWithGuestFrame, 0,
+    'execute does not wrap a synchronous generated entry in executeTick');
+  t.end();
+});
+
 test('generated JIT emits verified integer leaves directly into callers', async (t) => {
   const classpath = compileJavaFixture(t, 'DirectIntegerInlineHarness', `
 class DirectIntegerLeafTarget {
@@ -5336,7 +5391,7 @@ public class AdaptiveOneShotCallerHarness {
     classpath,
     jit: {
       warmupThreshold: 100,
-      preferWholeMethodJs: true,
+      preferWholeMethodJs: false,
       adaptiveConstructorCallers: true,
       adaptiveCodegenThreshold: 100,
       adaptiveCodegenTimeThresholdMs: 5,
@@ -5353,6 +5408,8 @@ public class AdaptiveOneShotCallerHarness {
   jvm.currentThreadIndex = 0;
   const method = await jvm.findMethodInHierarchy(
     'AdaptiveOneShotCallerHarness', 'compute', '([II)V');
+  t.notOk(jvm.jit.prefersWholeMethodJs(method),
+    'the Wasm-first policy does not start in whole-method mode');
   let now = 0;
   jvm.jit.monotonicNow = () => {
     now += 10;
@@ -5366,6 +5423,8 @@ public class AdaptiveOneShotCallerHarness {
 
   t.ok(jvm.jit.adaptiveCodegenMethods.has(method),
     'elapsed execution promotes the first invocation without entry heat');
+  t.ok(jvm.jit.prefersWholeMethodJs(method),
+    'the hot method selects whole-method JS after promotion');
   t.equal(jvm.jit.adaptiveTimePromotionCount, 1,
     'promotion is attributed to the sampled time policy');
   t.equal(jvm.jit.adaptiveEntryPromotionCount, 0,
@@ -5374,6 +5433,51 @@ public class AdaptiveOneShotCallerHarness {
     'the in-flight frame resumes in generated JavaScript');
   t.equal(out[0], 4950,
     'mid-method OSR preserves the partially executed frame and effects');
+
+  const wasmJvm = new JVM({
+    classpath,
+    jit: {
+      preferWholeMethodJs: false,
+      adaptiveConstructorCallers: true,
+      adaptiveCodegenTimeThresholdMs: 1,
+      adaptiveCodegenTimeSampleInterval: 1,
+    },
+  });
+  await wasmJvm.loadClassByName('AdaptiveOneShotCallerHarness');
+  const wasmMethod = await wasmJvm.findMethodInHierarchy(
+    'AdaptiveOneShotCallerHarness', 'compute', '([II)V');
+  const wasmFrame = new Frame(wasmMethod);
+  wasmFrame.className = 'AdaptiveOneShotCallerHarness';
+  const wasmThread = {
+    id: 0, name: 'adaptive-wasm-preference', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  wasmJvm.jit.wasmJit.enabled = true;
+  wasmJvm.jit.wasmJit.tryRunFrame = () =>
+    ({ handled: true, returned: true });
+  const wasmResult = wasmJvm.jit.tryRunFrame(wasmFrame, wasmThread);
+  t.ok(wasmResult.handled,
+    'a fully handled Wasm entry retains tier priority');
+  t.equal(wasmJvm.jit.adaptiveTimePromotionCount, 0,
+    'handled Wasm execution does not accumulate JavaScript residency heat');
+  t.notOk(wasmJvm.jit.prefersWholeMethodJs(wasmMethod),
+    'the adaptive policy does not steal a method handled by Wasm');
+
+  const escalationJvm = new JVM({ jit: {
+    preferWholeMethodJs: false,
+    adaptiveWholeMethodEscalationThreshold: 2,
+  } });
+  const firstHotMethod = {};
+  const secondHotMethod = {};
+  escalationJvm.jit.promoteAdaptiveCodegen(firstHotMethod);
+  escalationJvm.jit.promoteAdaptiveCodegen(firstHotMethod);
+  t.notOk(escalationJvm.jit.preferWholeMethodJs,
+    'duplicate observations of one method do not escalate the application');
+  escalationJvm.jit.promoteAdaptiveCodegen(secondHotMethod);
+  t.ok(escalationJvm.jit.preferWholeMethodJs,
+    'multiple distinct safe promotions escalate the tier policy');
+  t.equal(escalationJvm.jit.adaptiveWholeMethodEscalationCount, 1,
+    'application-wide escalation occurs at most once');
   t.end();
 });
 

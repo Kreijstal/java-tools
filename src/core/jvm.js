@@ -34,18 +34,24 @@ const { createClock } = require('./fakeClock');
 let browserYieldChannel = null;
 const browserYieldQueue = [];
 
-function yieldToEventLoop(delayMs = 0) {
+function yieldToEventLoop(delayMs = 0, strategy = "message-channel") {
   return new Promise((resolve) => {
     if (delayMs > 0) {
       setTimeout(resolve, delayMs);
     } else if (typeof setImmediate === "function") {
       setImmediate(resolve);
-    } else if (typeof MessageChannel === "function") {
+    } else if (strategy === "timer" || typeof MessageChannel !== "function") {
+      // A timer gives the browser's rendering opportunity a task-queue
+      // boundary. Firefox can otherwise keep selecting a continuously
+      // replenished MessageChannel queue while requestAnimationFrame remains
+      // pending, coalescing many completed guest frames without painting.
+      setTimeout(resolve, 0);
+    } else {
       // Browser setTimeout(0) is clamped after repeated scheduling. The JVM
       // reaches this safe point every wall-clock slice, so that clamp can
-      // consume a material fraction of a render frame. MessageChannel queues
-      // a real browser task (allowing input, timers, and paint to progress)
-      // without the nested-timer delay.
+      // consume a material fraction of a render frame. MessageChannel avoids
+      // that delay, but callers should select the timer strategy when their
+      // browser prioritizes message tasks ahead of rendering opportunities.
       if (!browserYieldChannel) {
         browserYieldChannel = new MessageChannel();
         browserYieldChannel.port1.onmessage = () => {
@@ -55,8 +61,6 @@ function yieldToEventLoop(delayMs = 0) {
       }
       browserYieldQueue.push(resolve);
       browserYieldChannel.port2.postMessage(0);
-    } else {
-      setTimeout(resolve, 0);
     }
   });
 }
@@ -136,6 +140,10 @@ class JVM {
     });
     const configuredYieldMs = options.eventLoopYieldMs ?? env.JVM_EVENT_LOOP_YIELD_MS;
     this.eventLoopYieldMs = Math.max(1, Number(configuredYieldMs) || 16);
+    const configuredYieldStrategy =
+      options.eventLoopYieldStrategy ?? env.JVM_EVENT_LOOP_YIELD_STRATEGY;
+    this.eventLoopYieldStrategy =
+      configuredYieldStrategy === "timer" ? "timer" : "message-channel";
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
@@ -146,7 +154,8 @@ class JVM {
     this._envTrace = !!env.JVM_TRACE;
     this._envProfileHot = env.JVM_PROFILE_HOT_METHODS === '1' ||
       env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1';
-    const schedulerTimingRate = Number(env.JVM_PROFILE_SCHEDULER_TIMES);
+    const schedulerTimingRate = Number(
+      options.schedulerTimingRate ?? env.JVM_PROFILE_SCHEDULER_TIMES);
     this._schedulerTimingProfile = Number.isFinite(schedulerTimingRate) && schedulerTimingRate > 0
       ? { rate: Math.max(1, Math.floor(schedulerTimingRate)), random: 0x9e3779b9,
         methods: new WeakMap(), samples: new Map() }
@@ -643,7 +652,7 @@ class JVM {
       // generated safe point does not see one permanently expired deadline
       // and repeatedly materialize the rest of a lifecycle method.
       if (Date.now() >= this._nextEventLoopYieldAt) {
-        await yieldToEventLoop();
+        await yieldToEventLoop(0, this.eventLoopYieldStrategy);
         this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
       }
     }
@@ -918,11 +927,18 @@ class JVM {
         const fastResult = this._tryExecuteSynchronousJitTick(scheduled);
         let result;
         if (fastResult && fastResult.slow) {
+          if (timingSample) timingSample.slowPath = true;
           result = this.executeTick(BURST_TICK_OPTIONS, scheduled, fastResult.skipJit);
         } else {
           result = fastResult;
         }
-        if (result && typeof result.then === "function") result = await result;
+        if (result && typeof result.then === "function") {
+          if (timingSample) {
+            timingSample.awaited = true;
+            timingSample.beforeAwaitAt = performance.now();
+          }
+          result = await result;
+        }
         this._endSchedulerTiming(timingSample);
         if (result.completed) {
           this.debugManager.pause();
@@ -958,7 +974,7 @@ class JVM {
         // regions. A wall-clock budget keeps timers and I/O responsive without
         // making fast bytecodes pay excessive scheduler overhead.
         if (Date.now() >= this._nextEventLoopYieldAt) {
-          await yieldToEventLoop();
+          await yieldToEventLoop(0, this.eventLoopYieldStrategy);
           this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
         }
       }
@@ -1042,26 +1058,61 @@ class JVM {
 
   _endSchedulerTiming(sample) {
     if (!sample) return;
-    const elapsedMs = performance.now() - sample.started;
+    const ended = performance.now();
+    const elapsedMs = ended - sample.started;
+    const synchronousMs =
+      (sample.beforeAwaitAt === undefined ? ended : sample.beforeAwaitAt) -
+      sample.started;
+    const asyncWaitMs = sample.beforeAwaitAt === undefined
+      ? 0
+      : ended - sample.beforeAwaitAt;
     const samples = this._schedulerTimingProfile.samples;
-    const previous = samples.get(sample.key) || { samples: 0, totalMs: 0, maxMs: 0 };
+    const previous = samples.get(sample.key) || {
+      samples: 0,
+      totalMs: 0,
+      maxMs: 0,
+      synchronousMs: 0,
+      asyncWaitMs: 0,
+      awaitedSamples: 0,
+      slowPathSamples: 0,
+    };
     previous.samples += 1;
     previous.totalMs += elapsedMs;
     previous.maxMs = Math.max(previous.maxMs, elapsedMs);
+    previous.synchronousMs += synchronousMs;
+    previous.asyncWaitMs += asyncWaitMs;
+    if (sample.awaited) previous.awaitedSamples += 1;
+    if (sample.slowPath) previous.slowPathSamples += 1;
     samples.set(sample.key, previous);
   }
 
   dumpSchedulerTimings(limit = 30) {
+    const snapshot = this.getSchedulerTimingSnapshot(limit);
+    if (!snapshot) return;
+    console.error(`--- sampled scheduler wall time (1/${snapshot.rate}) ---`);
+    for (const row of snapshot.rows) {
+      console.error(`${row.totalMs.toFixed(3)}ms\t${row.samples}\t` +
+        `${row.maxMs.toFixed(3)}ms max\t${row.method}`);
+    }
+  }
+
+  getSchedulerTimingSnapshot(limit = 30) {
     const profile = this._schedulerTimingProfile;
-    if (!profile) return;
-    console.error(`--- sampled scheduler wall time (1/${profile.rate}) ---`);
+    if (!profile) return null;
     const rows = [...profile.samples.entries()]
       .sort((a, b) => b[1].totalMs - a[1].totalMs)
-      .slice(0, Math.max(1, Number(limit) || 30));
-    for (const [method, value] of rows) {
-      console.error(`${value.totalMs.toFixed(3)}ms\t${value.samples}\t` +
-        `${value.maxMs.toFixed(3)}ms max\t${method}`);
-    }
+      .slice(0, Math.max(1, Number(limit) || 30))
+      .map(([method, value]) => ({
+        method,
+        samples: value.samples,
+        totalMs: value.totalMs,
+        maxMs: value.maxMs,
+        synchronousMs: value.synchronousMs || 0,
+        asyncWaitMs: value.asyncWaitMs || 0,
+        awaitedSamples: value.awaitedSamples || 0,
+        slowPathSamples: value.slowPathSamples || 0,
+      }));
+    return { rate: profile.rate, rows };
   }
 
   resetSchedulerTimings() {
@@ -1198,7 +1249,10 @@ class JVM {
     scheduled = scheduled || this._prepareSchedulerTick();
     if (scheduled.completed) return { completed: true };
     if (scheduled.idle) {
-      await yieldToEventLoop(this._idleWaitDelay(scheduled.schedulerNow));
+      await yieldToEventLoop(
+        this._idleWaitDelay(scheduled.schedulerNow),
+        this.eventLoopYieldStrategy,
+      );
       return { completed: false };
     }
 

@@ -505,6 +505,13 @@ class FusedRegionCompiler {
 
   guard(region, target, frame, thread) {
     if (target.method !== region.wrapperMethod || target.lookupClass !== region.wrapperOwner) return false;
+    // Mode/feature statics are live heap values, not compile-time constants.
+    // Check them before the more expensive scheduler, debugger, class, and
+    // bytecode-identity guards. A disabled rendering mode can reject millions
+    // of otherwise valid direct-call probes without any fused side effect.
+    for (const target of region.falseGuardTargets) {
+      if (readStatic(target)) return false;
+    }
     if (!thread || thread.status !== "runnable" || !thread.callStack ||
         thread.callStack.isEmpty() || thread.callStack.peek() !== frame) return false;
     const debug = this.jvm.debugManager;
@@ -535,9 +542,6 @@ class FusedRegionCompiler {
         const codeAttr = dependency.method.attributes.find((attr) => attr.type === "code");
         if (!codeAttr || codeAttr.code.codeItems !== dependency.codeItems) return false;
       }
-    }
-    for (const target of region.falseGuardTargets) {
-      if (readStatic(target)) return false;
     }
     return true;
   }
