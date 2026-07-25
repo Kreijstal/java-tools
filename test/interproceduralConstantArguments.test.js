@@ -691,3 +691,102 @@ test('does not remove an identity operator with an alternate entry', (t) => {
   t.equal(codeItems[2].instruction, 'iadd');
   t.end();
 });
+
+// Regression: a constant-argument fact discovered on a pre-pruned analysis AST
+// must not be applied to a program where the pruned-away path is still live.
+//
+// Callers of this pass run dead-static-flag folding plus an unreachable-code
+// sweep before discovery, so obfuscator trap calls that pass a different dummy
+// argument stop hiding real facts. That pruning is NOT applied to the program
+// the decompiler emits, so a parameter that only looks constant because the
+// varying store became unreachable would be specialized to a wrong literal.
+// Observed on Dekobloko: cl.a(String,int,int,String,int)'s second parameter was
+// rewritten to 0 while sf still passed a computed width at a live call site.
+function constantArgumentDivergenceAsts() {
+  const callee = () => method('d', '(I)V', ['static'], [
+    { labelDef: 'L0:', instruction: 'iload_0' },
+    { instruction: 'pop' },
+    { instruction: 'return' },
+  ]);
+  const literalCaller = () => classAst('LiteralCaller', [method('a', '()V', ['static'], [
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'invokestatic', arg: ['Method', 'Target', ['d', '(I)V']] } },
+    { instruction: 'return' },
+  ])]);
+  // Pruned: every path into the call stores 0, so the argument looks constant.
+  const prunedDivergentCaller = classAst('Divergent', [method('b', '()V', ['static'], [
+    { instruction: 'iconst_0' },
+    { instruction: 'istore_0' },
+    { instruction: 'iload_0' },
+    { instruction: { op: 'invokestatic', arg: ['Method', 'Target', ['d', '(I)V']] } },
+    { instruction: 'return' },
+  ])]);
+  // Unpruned: a live branch stores a runtime value into the same local first.
+  const liveDivergentCaller = classAst('Divergent', [method('b', '()V', ['static'], [
+    { instruction: 'iconst_0' },
+    { instruction: 'istore_0' },
+    { instruction: { op: 'getstatic', arg: ['Field', 'runtime', ['tab', 'I']] } },
+    { instruction: { op: 'ifeq', arg: 'Lskip' } },
+    { instruction: { op: 'getstatic', arg: ['Field', 'runtime', ['width', 'I']] } },
+    { instruction: 'istore_0' },
+    { labelDef: 'Lskip:', instruction: 'iload_0' },
+    { instruction: { op: 'invokestatic', arg: ['Method', 'Target', ['d', '(I)V']] } },
+    { instruction: 'return' },
+  ])]);
+  return {
+    analysisAst: { classes: [classAst('Target', [callee()]), literalCaller(), prunedDivergentCaller] },
+    verifyAst: { classes: [classAst('Target', [callee()]), literalCaller(), liveDivergentCaller] },
+  };
+}
+
+test('pruned-only constant arguments are discovered without a verification AST', (t) => {
+  const { analysisAst } = constantArgumentDivergenceAsts();
+  const discovery = discoverInterproceduralConstantArguments(analysisAst);
+  t.equal(discovery.facts.length, 1, 'the pruned AST alone reports the unsound fact');
+  t.equal(discovery.facts[0].signature, 'Target.d(I)V');
+  t.equal(discovery.facts[0].value, 0);
+  t.end();
+});
+
+test('a verification AST rejects a constant that a live call site contradicts', (t) => {
+  const { analysisAst, verifyAst } = constantArgumentDivergenceAsts();
+  const discovery = discoverInterproceduralConstantArguments(analysisAst, {
+    verifyAstRoot: verifyAst,
+  });
+  t.deepEqual(discovery.facts, [], 'the contradicted fact is dropped');
+  t.equal(discovery.unverifiedFacts, 1, 'and is counted as unverified');
+  t.end();
+});
+
+test('verification still ignores call sites the pruning removed', (t) => {
+  // The dead trap call exists only in the unpruned AST. Its differing dummy
+  // argument must not block the fact -- discarding it is why callers prune
+  // before discovery in the first place.
+  const callee = method('d', '(I)V', ['static'], [
+    { labelDef: 'L0:', instruction: 'iload_0' },
+    { instruction: 'pop' },
+    { instruction: 'return' },
+  ]);
+  const liveCaller = () => classAst('LiveCaller', [method('a', '()V', ['static'], [
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'invokestatic', arg: ['Method', 'Target', ['d', '(I)V']] } },
+    { instruction: 'return' },
+  ])]);
+  const trapCaller = classAst('TrapCaller', [method('t', '()V', ['static'], [
+    { instruction: 'iconst_5' },
+    { instruction: { op: 'invokestatic', arg: ['Method', 'Target', ['d', '(I)V']] } },
+    { instruction: 'return' },
+  ])]);
+  const prunedTrapCaller = classAst('TrapCaller', [method('t', '()V', ['static'], [
+    { instruction: 'return' },
+  ])]);
+
+  const discovery = discoverInterproceduralConstantArguments(
+    { classes: [classAst('Target', [callee]), liveCaller(), prunedTrapCaller] },
+    { verifyAstRoot: { classes: [classAst('Target', [callee]), liveCaller(), trapCaller] } },
+  );
+  t.equal(discovery.facts.length, 1, 'the fact survives the removed trap call');
+  t.equal(discovery.facts[0].value, 0);
+  t.equal(discovery.unverifiedFacts, 0);
+  t.end();
+});

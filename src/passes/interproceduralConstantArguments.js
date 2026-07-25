@@ -19,7 +19,7 @@ const INT_LOAD_OPS = new Set(['iload', 'iload_0', 'iload_1', 'iload_2', 'iload_3
 const INT_STORE_OPS = new Set(['istore', 'istore_0', 'istore_1', 'istore_2', 'istore_3']);
 const DIRECT_INVOKE_OPS = new Set(['invokestatic', 'invokespecial']);
 
-function discoverInterproceduralConstantArguments(astRoot) {
+function discoverInterproceduralConstantArguments(astRoot, options = {}) {
   const definitions = collectDefinitions(astRoot);
   const classes = classMap(astRoot);
   const definitionsBySignature = new Map();
@@ -29,49 +29,37 @@ function discoverInterproceduralConstantArguments(astRoot) {
     }
     definitionsBySignature.get(definition.signature).push(definition);
   }
-  const observations = new Map();
-  for (const key of definitions.keys()) {
-    observations.set(key, { callCount: 0, value: undefined, rejected: false });
-  }
+  const { observations, sites } = observeCallSiteArguments(
+    astRoot, definitions, definitionsBySignature, classes,
+  );
 
-  forEachMethod(astRoot, (_cls, method, codeItems) => {
-    const analysis = analyzeConstantCfg(convertAstToCfg(method));
-    if (analysis.limited) {
-      rejectRawMethodCalls(codeItems, definitionsBySignature, observations, classes);
-      return;
-    }
-    for (const invocation of analysis.invocations) {
-      const ref = methodRef(invocation.arg);
-      if (!ref) continue;
-      const resolvedOwner = resolveMethodOwner(ref.owner, ref.name, ref.descriptor, classes);
-      if (!resolvedOwner) continue;
-      const signature = methodSignature(resolvedOwner, ref.name, ref.descriptor);
-      const matchingDefinitions = definitionsBySignature.get(signature);
-      if (!matchingDefinitions) continue;
-      const parameters = parameterDescriptors(ref.descriptor);
-      const argumentsByIndex = invocationArgumentValues(invocation, parameters);
-      for (const definition of matchingDefinitions) {
-        const observation = observations.get(definition.key);
-        observation.callCount += 1;
-        if (!DIRECT_INVOKE_OPS.has(invocation.op) || !argumentsByIndex) {
-          observation.rejected = true;
-          continue;
-        }
-        const constant = argumentsByIndex[definition.parameterIndex];
-        if (constant == null) {
-          observation.rejected = true;
-          continue;
-        }
-        if (observation.value === undefined) observation.value = constant;
-        else if (observation.value !== constant) observation.rejected = true;
-      }
-    }
-  });
+  // A constant fact is only usable if it holds in the program that is actually
+  // emitted. Callers that pre-prune the analysis AST (dead static flags plus an
+  // unreachable-code sweep) hand us a strictly smaller program than the one the
+  // decompiler writes out, and pruning can turn a genuinely varying argument
+  // into an apparent constant. Re-observe every surviving call site in the
+  // unpruned AST and drop any fact those call sites contradict.
+  //
+  // Call sites the pruning REMOVED are deliberately still trusted: dropping
+  // dead obfuscator trap calls that pass a different dummy argument is the
+  // reason the pruning runs first. Only callers whose call-site count is
+  // unchanged are compared, so a removed trap call still hides nothing.
+  const verifySites = options.verifyAstRoot
+    ? observeCallSiteArguments(
+      options.verifyAstRoot, definitions, definitionsBySignature,
+      classMap(options.verifyAstRoot),
+    ).sites
+    : null;
 
   const facts = [];
+  let unverifiedFacts = 0;
   for (const [key, definition] of definitions) {
     const observation = observations.get(key);
     if (observation.rejected || observation.callCount === 0 || observation.value === undefined) continue;
+    if (verifySites && !factHoldsInUnprunedAst(key, observation.value, sites, verifySites)) {
+      unverifiedFacts += 1;
+      continue;
+    }
     facts.push({
       key,
       signature: definition.signature,
@@ -87,7 +75,126 @@ function discoverInterproceduralConstantArguments(astRoot) {
   }
   facts.sort((a, b) => a.signature.localeCompare(b.signature)
     || a.parameterIndex - b.parameterIndex);
-  return { facts, candidateCount: definitions.size };
+  return { facts, candidateCount: definitions.size, unverifiedFacts };
+}
+
+/**
+ * Observe the argument passed at every direct call site of a candidate
+ * parameter, keyed both by definition (for the constant decision) and by
+ * calling method (so two ASTs of the same program can be compared site by
+ * site). A `null` recorded value means "not a known constant here".
+ */
+function observeCallSiteArguments(astRoot, definitions, definitionsBySignature, classes) {
+  const observations = new Map();
+  for (const key of definitions.keys()) {
+    observations.set(key, { callCount: 0, value: undefined, rejected: false });
+  }
+  const sites = new Map();
+  // Owner-independent shapes of every candidate callee. Running the CFG
+  // constant analysis is far more expensive than scanning an instruction list,
+  // so methods that cannot possibly call a candidate are skipped outright.
+  const candidateShapes = new Set();
+  for (const signature of definitionsBySignature.keys()) {
+    const dot = signature.indexOf('.');
+    if (dot >= 0) candidateShapes.add(signature.slice(dot + 1));
+  }
+
+  forEachMethod(astRoot, (cls, method, codeItems) => {
+    if (!callsCandidate(codeItems, candidateShapes)) return;
+    const callerKey = methodSignature(cls.className, method.name, method.descriptor);
+    const analysis = analyzeConstantCfg(convertAstToCfg(method));
+    if (analysis.limited) {
+      rejectRawMethodCalls(codeItems, definitionsBySignature, observations, classes);
+      recordRawCallSites(codeItems, definitionsBySignature, classes, sites, callerKey);
+      return;
+    }
+    for (const invocation of analysis.invocations) {
+      const ref = methodRef(invocation.arg);
+      if (!ref) continue;
+      const resolvedOwner = resolveMethodOwner(ref.owner, ref.name, ref.descriptor, classes);
+      if (!resolvedOwner) continue;
+      const signature = methodSignature(resolvedOwner, ref.name, ref.descriptor);
+      const matchingDefinitions = definitionsBySignature.get(signature);
+      if (!matchingDefinitions) continue;
+      const parameters = parameterDescriptors(ref.descriptor);
+      const argumentsByIndex = invocationArgumentValues(invocation, parameters);
+      const direct = DIRECT_INVOKE_OPS.has(invocation.op);
+      for (const definition of matchingDefinitions) {
+        const observation = observations.get(definition.key);
+        observation.callCount += 1;
+        const constant = direct && argumentsByIndex
+          ? argumentsByIndex[definition.parameterIndex] : null;
+        recordCallSite(sites, definition.key, callerKey, constant == null ? null : constant);
+        if (constant == null) {
+          observation.rejected = true;
+          continue;
+        }
+        if (observation.value === undefined) observation.value = constant;
+        else if (observation.value !== constant) observation.rejected = true;
+      }
+    }
+  });
+
+  return { observations, sites };
+}
+
+function callsCandidate(codeItems, candidateShapes) {
+  for (const item of codeItems) {
+    const instruction = item && item.instruction;
+    const op = instructionOp(instruction);
+    if (!op || !op.startsWith('invoke')) continue;
+    const ref = methodRef(instructionArg(instruction));
+    if (ref && candidateShapes.has(`${ref.name}${ref.descriptor}`)) return true;
+  }
+  return false;
+}
+
+function recordCallSite(sites, factKey, callerKey, value) {
+  if (!sites.has(factKey)) sites.set(factKey, new Map());
+  const byCaller = sites.get(factKey);
+  if (!byCaller.has(callerKey)) byCaller.set(callerKey, []);
+  byCaller.get(callerKey).push(value);
+}
+
+/**
+ * Record an unknown observation per raw call site in a method the constant
+ * analysis could not model, so site counts still line up across two ASTs.
+ */
+function recordRawCallSites(codeItems, definitionsBySignature, classes, sites, callerKey) {
+  for (const item of codeItems) {
+    const instruction = item && item.instruction;
+    const op = instructionOp(instruction);
+    if (!op || !op.startsWith('invoke')) continue;
+    const ref = methodRef(instructionArg(instruction));
+    if (!ref) continue;
+    const resolvedOwner = resolveMethodOwner(ref.owner, ref.name, ref.descriptor, classes);
+    const definitions = resolvedOwner && definitionsBySignature.get(
+      methodSignature(resolvedOwner, ref.name, ref.descriptor),
+    );
+    for (const definition of definitions || []) {
+      recordCallSite(sites, definition.key, callerKey, null);
+    }
+  }
+}
+
+/**
+ * True when no call site that survives into the emitted program contradicts
+ * the discovered constant. Callers whose call-site count changed between the
+ * two ASTs are skipped: the pruning removed a call there, which is exactly the
+ * dead-trap-call case the pre-pruning exists to serve.
+ */
+function factHoldsInUnprunedAst(factKey, value, discoverySites, verifySites) {
+  const discovered = discoverySites.get(factKey);
+  const verified = verifySites.get(factKey);
+  if (!discovered || !verified) return true;
+  for (const [callerKey, values] of discovered) {
+    const unpruned = verified.get(callerKey);
+    if (!unpruned || unpruned.length !== values.length) continue;
+    for (const observed of unpruned) {
+      if (observed !== value) return false;
+    }
+  }
+  return true;
 }
 
 function runInterproceduralConstantArguments(astRoot, options = {}) {
@@ -150,11 +257,20 @@ function runInterproceduralConstantArgumentFixedPoint(astRoot, options = {}) {
   let replacedLoads = 0;
   let foldedBranches = 0;
   let unreachableSweeps = 0;
+  let unverifiedFacts = 0;
+
+  // The verification AST must stay in lockstep with the analysis AST through
+  // every transform this loop applies, so the ONLY difference between them
+  // remains whatever pruning the caller did before calling us. Otherwise later
+  // iterations would compare a specialized AST against an unspecialized one and
+  // reject sound facts.
+  const verifyAstRoot = options.verifyAstRoot || null;
 
   for (let iteration = 1; iteration <= maxIterations; iteration += 1) {
     iterations = iteration;
-    const discovery = discoverInterproceduralConstantArguments(astRoot);
+    const discovery = discoverInterproceduralConstantArguments(astRoot, { verifyAstRoot });
     candidateCount = Math.max(candidateCount, discovery.candidateCount);
+    unverifiedFacts += discovery.unverifiedFacts || 0;
     const newFacts = discovery.facts.filter((fact) => !factsByKey.has(fact.key));
     for (const fact of newFacts) {
       fact.discoveredIteration = iteration;
@@ -170,6 +286,12 @@ function runInterproceduralConstantArgumentFixedPoint(astRoot, options = {}) {
     foldedBranches += branchFold.foldedBranches;
     const unreachable = runRemoveUnreachableCodeCfg(astRoot);
     if (unreachable.changed) unreachableSweeps += 1;
+    if (verifyAstRoot) {
+      runInterproceduralConstantArguments(verifyAstRoot, { facts: newFacts });
+      runConstantExpressionFold(verifyAstRoot);
+      runImmediateConstantBranchDce(verifyAstRoot);
+      runRemoveUnreachableCodeCfg(verifyAstRoot);
+    }
 
     if (!specialization.changed && !expressionFold.changed && !branchFold.changed && !unreachable.changed) {
       converged = true;
@@ -189,6 +311,7 @@ function runInterproceduralConstantArgumentFixedPoint(astRoot, options = {}) {
     replacedLoads,
     foldedBranches,
     unreachableSweeps,
+    unverifiedFacts,
   };
 }
 

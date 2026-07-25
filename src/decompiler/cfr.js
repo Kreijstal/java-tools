@@ -7143,12 +7143,38 @@ function isBooleanExpression(value) {
   return value && (value.type === 'boolean' || value.code === 'true' || value.code === 'false');
 }
 
+/** True when every bracket in the fragment is closed within it, i.e. a split
+ *  point at this position is at the expression's top level rather than inside
+ *  a call argument list, index, or parenthesised subexpression. */
+function isBracketBalanced(fragment) {
+  let depth = 0;
+  for (let i = 0; i < fragment.length; i += 1) {
+    const ch = fragment[i];
+    if (ch === '(' || ch === '[') depth += 1;
+    else if (ch === ')' || ch === ']') {
+      depth -= 1;
+      if (depth < 0) return false;
+    }
+  }
+  return depth === 0;
+}
+
 function negateBooleanExpression(value) {
   if (value.code === 'true') return expr('false', 'boolean');
   if (value.code === 'false') return expr('true', 'boolean');
   if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value.code)) return expr(`!${value.code}`, 'boolean', 90);
   const comparison = /^(.+) (==|!=|<|<=|>|>=) (.+)$/.exec(value.code);
-  if (comparison) return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60);
+  // Only invert an operator that is genuinely the TOP-LEVEL comparison. The
+  // regex is greedy, so for a call expression it happily splits on a `!=` that
+  // sits inside the argument list -- negating an argument instead of the call.
+  // Dekobloko hit exactly that: negating
+  //   ((nm) x).a(a, b, c, stackIn_41_4 != 0, 2, param4)
+  // rewrote the ARGUMENT to `== 0`, inverting the lobby list's skip-the-walk
+  // flag and leaving the player list clipped to nothing. Balanced brackets on
+  // both sides prove the operator is not nested.
+  if (comparison && isBracketBalanced(comparison[1]) && isBracketBalanced(comparison[3])) {
+    return expr(`${comparison[1]} ${invertOperator(comparison[2])} ${comparison[3]}`, 'boolean', 60);
+  }
   return expr(`!${wrap(value, 90)}`, 'boolean', 90);
 }
 
@@ -8768,6 +8794,8 @@ module.exports = {
   _internals: {
     binaryExpr,
     coerceExpressionForType,
+    negateBooleanExpression,
+    isBracketBalanced,
     dropUnthrowableProtectedRows,
     isCheckedThrow,
     isSourceReferenceTypeAssignable,
