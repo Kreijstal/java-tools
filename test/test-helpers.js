@@ -1,5 +1,5 @@
 const path = require("path");
-const { JVM } = require("../src/jvm");
+const { JVM } = require("../src/core/jvm");
 
 /**
  * Normalizes floating point numbers in text for more lenient comparison.

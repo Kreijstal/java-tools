@@ -16,7 +16,8 @@ enum Level {
 @WithClassAndEnum(type = String.class, primitive = int.class, level = Level.HIGH)
 public class AnnotationClassLiteralTest {
     public static void main(String[] args) {
-        WithClassAndEnum annotation = AnnotationClassLiteralTest.class.getAnnotation(WithClassAndEnum.class);
+        WithClassAndEnum annotation =
+            AnnotationClassLiteralTest.class.getAnnotation(WithClassAndEnum.class);
         if (annotation == null) {
             System.out.println("Annotation not found");
             return;

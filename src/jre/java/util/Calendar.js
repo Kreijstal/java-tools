@@ -7,6 +7,18 @@ module.exports = {
     'DATE:I': 5,
   },
   staticMethods: {
+    'getInstance()Ljava/util/Calendar;': (jvm) => {
+      const zoneId = typeof Intl !== 'undefined'
+        ? Intl.DateTimeFormat().resolvedOptions().timeZone
+        : 'UTC';
+      return {
+        type: 'java/util/Calendar',
+        _timeZone: { type: 'java/util/TimeZone', _zoneId: zoneId || 'UTC', fields: {} },
+        _date: new Date(),
+        fields: {},
+        hashCode: jvm.nextHashCode++,
+      };
+    },
     'getInstance(Ljava/util/TimeZone;)Ljava/util/Calendar;': (jvm, obj, args) => {
       const timeZone = args[0];
       // For now, return a dummy Calendar object.
@@ -20,6 +32,11 @@ module.exports = {
     },
   },
   methods: {
+    'getTimeZone()Ljava/util/TimeZone;': (jvm, obj) => obj._timeZone || {
+      type: 'java/util/TimeZone',
+      _zoneId: 'UTC',
+      fields: {},
+    },
     'setTime(Ljava/util/Date;)V': (jvm, obj, args) => {
       obj._date = args[0]._date; // get the underlying JS Date
     },

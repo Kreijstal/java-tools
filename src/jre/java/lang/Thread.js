@@ -1,4 +1,54 @@
-const { ASYNC_METHOD_SENTINEL } = require('../../../constants');
+const { ASYNC_METHOD_SENTINEL } = require('../../../core/constants');
+const { withThrows } = require('../../helpers');
+
+function stringValue(value, fallback) {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  return value.valueOf ? String(value.valueOf()) : String(value);
+}
+
+function addThreadToGroup(group, threadObject) {
+  if (!group.threads) group.threads = [];
+  if (!group.threads.includes(threadObject)) group.threads.push(threadObject);
+}
+
+function ensureJavaThread(jvm, internalThread) {
+  if (!internalThread.javaThread) {
+    internalThread.javaThread = {
+      type: 'java/lang/Thread',
+      name: internalThread.name || 'Unknown',
+      nativeThread: internalThread,
+      hashCode: jvm.nextHashCode++,
+    };
+  }
+  if (!internalThread.javaThread.threadGroup) {
+    const group = internalThread.threadGroup || {
+      type: 'java/lang/ThreadGroup',
+      name: jvm.internString('system'),
+      parent: null,
+      threads: [],
+    };
+    internalThread.threadGroup = group;
+    internalThread.javaThread.threadGroup = group;
+  }
+  addThreadToGroup(internalThread.javaThread.threadGroup,
+    internalThread.javaThread);
+  return internalThread.javaThread;
+}
+
+function initializeThread(jvm, obj, { runnable = null, name = null } = {},
+    currentThread = null) {
+  obj.hashCode = jvm.nextHashCode++;
+  obj.name = name || `Thread-${obj.hashCode}`;
+  obj.runnable = runnable;
+  obj.daemon = false;
+  obj.priority = 5;
+  if (currentThread) {
+    obj.threadGroup = ensureJavaThread(jvm, currentThread).threadGroup;
+  }
+  delete obj.isUninitialized;
+}
 
 module.exports = {
   super: 'java/lang/Object',
@@ -7,31 +57,26 @@ module.exports = {
   staticMethods: {
     'currentThread()Ljava/lang/Thread;': (jvm, obj, args) => {
       const internalThread = jvm.threads[jvm.currentThreadIndex];
-      // This is a hack. In a real JVM, we would have a reference to the
-      // java.lang.Thread object for each thread.
-      const threadObj = {
-        type: 'java/lang/Thread',
-        name: internalThread.name || 'Unknown',
-        hashCode: jvm.nextHashCode++
-      };
-      return threadObj;
+      return ensureJavaThread(jvm, internalThread);
     }
   },
   methods: {
-    '<init>()V': (jvm, obj, args) => {
-      obj.hashCode = jvm.nextHashCode++;
-      obj.name = 'Thread-' + obj.hashCode;
-      obj.daemon = false;
-      obj.priority = 5;
-      delete obj.isUninitialized;
+    '<init>()V': (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, {}, currentThread);
     },
-    '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args) => {
-      obj.hashCode = jvm.nextHashCode++;
-      obj.name = 'Thread-' + obj.hashCode;
-      obj.runnable = args[0];
-      obj.daemon = false;
-      obj.priority = 5;
-      delete obj.isUninitialized;
+    '<init>(Ljava/lang/Runnable;)V': (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, { runnable: args[0] }, currentThread);
+    },
+    '<init>(Ljava/lang/String;)V': (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, { name: stringValue(args[0], null) },
+        currentThread);
+    },
+    '<init>(Ljava/lang/Runnable;Ljava/lang/String;)V':
+        (jvm, obj, args, currentThread) => {
+      initializeThread(jvm, obj, {
+        runnable: args[0],
+        name: stringValue(args[1], null),
+      }, currentThread);
     },
     'setDaemon(Z)V': (jvm, obj, args) => {
       obj.daemon = args[0];
@@ -42,17 +87,24 @@ module.exports = {
     'getName()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.name);
     },
+    'getThreadGroup()Ljava/lang/ThreadGroup;': (jvm, obj) =>
+      obj.threadGroup || null,
     'start()V': async (jvm, threadObject, args, currentThread) => {
-      const Stack = require('../../../stack');
-      const Frame = require('../../../frame');
+      const Stack = require('../../../core/stack');
+      const Frame = require('../../../core/frame');
       const target = threadObject.runnable || threadObject;
 
       const newThread = {
         id: jvm.threads.length,
         callStack: new Stack(),
         status: 'runnable',
+        javaThread: threadObject,
       };
       threadObject.nativeThread = newThread;
+      if (threadObject.threadGroup) {
+        newThread.threadGroup = threadObject.threadGroup;
+        addThreadToGroup(threadObject.threadGroup, threadObject);
+      }
       
       // Handle lambda Runnables (created by invokedynamic)
       if (target.methodHandle) {
@@ -109,7 +161,7 @@ module.exports = {
       
       return ASYNC_METHOD_SENTINEL;
     },
-    'join()V': (jvm, obj, args, thread) => {
+    'join()V': withThrows((jvm, obj, args, thread) => {
       const threadToJoin = obj.nativeThread;
       if (!threadToJoin || threadToJoin.status === 'terminated') {
         return;
@@ -117,11 +169,20 @@ module.exports = {
 
       thread.status = 'JOINING';
       thread.joiningOn = threadToJoin;
-    },
-    'sleep(J)V': (jvm, obj, args, thread) => {
+    }, ['java/lang/InterruptedException']),
+    'sleep(J)V': withThrows((jvm, obj, args, thread) => {
       const time = args[0];
       thread.status = 'SLEEPING';
-      thread.sleepUntil = Date.now() + Number(time);
+      thread.sleepUntil = jvm.clock.millis() + Number(time);
+    }, ['java/lang/InterruptedException']),
+    'interrupt()V': (jvm, obj, args) => {
+      obj.interrupted = true;
+      if (obj.nativeThread && obj.nativeThread.status === 'SLEEPING') {
+        obj.nativeThread.status = 'runnable';
+        delete obj.nativeThread.sleepUntil;
+      }
     },
   },
 };
+
+module.exports.ensureJavaThread = ensureJavaThread;

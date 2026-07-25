@@ -1,113 +1,32 @@
+
+function classNameFor(classObj) {
+  if (!classObj) return null;
+  if (classObj.isPrimitive) return classObj.name || null;
+  if (classObj._classData && classObj._classData.ast && classObj._classData.ast.classes[0]) {
+    return classObj._classData.ast.classes[0].className;
+  }
+  if (classObj.className) return String(classObj.className).replace(/\./g, '/');
+  if (classObj.type && classObj.type !== 'java/lang/Class') return String(classObj.type).replace(/\./g, '/');
+  return null;
+}
+
+function runtimeClassName(obj) {
+  return obj && (obj._className || obj.type);
+}
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   staticMethods: {
-    'forName(Ljava/lang/String;)Ljava/lang/Class;': async (jvm, classObj, args) => {
-      const classNameWithDots = args[0];
+    'forName(Ljava/lang/String;)Ljava/lang/Class;': withThrows(async (jvm, classObj, args) => {
+      const classNameWithDots = args[0] && args[0].value !== undefined ? args[0].value : String(args[0]);
       const classNameWithSlashes = classNameWithDots.replace(/\./g, '/');
       return await jvm.getClassObject(classNameWithSlashes);
-    },
+    }, ['java/lang/ClassNotFoundException']),
   },
   methods: {
     'getFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       return [];
-    },
-    'getField(Ljava/lang/String;)Ljava/lang/reflect/Field;': async (jvm, classObj, args) => {
-      const fieldNameObj = args[0];
-
-      let fieldName;
-      if (typeof fieldNameObj === 'string') {
-        fieldName = fieldNameObj;
-      } else if (fieldNameObj && fieldNameObj.value) {
-        fieldName = fieldNameObj.value;
-      } else if (fieldNameObj && typeof fieldNameObj.toString === 'function') {
-        fieldName = fieldNameObj.toString();
-      } else {
-        fieldName = String(fieldNameObj);
-      }
-
-      const visited = new Set();
-      const queue = [];
-
-      const enqueueClassData = (classData) => {
-        if (
-          !classData ||
-          !classData.ast ||
-          !classData.ast.classes ||
-          !classData.ast.classes[0]
-        ) {
-          return;
-        }
-
-        const className = classData.ast.classes[0].className;
-        if (!visited.has(className)) {
-          queue.push({ classData, className });
-        }
-      };
-
-      enqueueClassData(classObj._classData);
-
-      while (queue.length > 0) {
-        const { classData, className } = queue.shift();
-        if (visited.has(className)) {
-          continue;
-        }
-        visited.add(className);
-
-        const classItems = (classData.ast.classes[0] && classData.ast.classes[0].items) || [];
-        const fieldItem = classItems.find(
-          (item) =>
-            item.type === 'field' &&
-            item.field &&
-            item.field.name === fieldName &&
-            item.field.flags &&
-            item.field.flags.includes('public')
-        );
-
-        if (fieldItem) {
-          const declaringClassObj =
-            classObj._classData &&
-            classObj._classData.ast &&
-            classObj._classData.ast.classes &&
-            classObj._classData.ast.classes[0] &&
-            classObj._classData.ast.classes[0].className === className
-              ? classObj
-              : await jvm.getClassObject(className);
-
-          return {
-            type: 'java/lang/reflect/Field',
-            _fieldData: fieldItem.field,
-            _declaringClass: declaringClassObj,
-            _annotations: fieldItem.field.annotations || [],
-          };
-        }
-
-        const { superClassName, interfaces = [] } = classData.ast.classes[0];
-
-        if (superClassName) {
-          try {
-            const superClassData = await jvm.loadClassByName(superClassName);
-            enqueueClassData(superClassData);
-          } catch (e) {
-            // Ignore classes that cannot be loaded
-          }
-        }
-
-        if (interfaces.length) {
-          for (const ifaceName of interfaces) {
-            try {
-              const interfaceData = await jvm.loadClassByName(ifaceName);
-              enqueueClassData(interfaceData);
-            } catch (e) {
-              // Ignore interfaces that cannot be loaded
-            }
-          }
-        }
-      }
-
-      throw {
-        type: 'java/lang/NoSuchFieldException',
-        message: fieldName,
-      };
     },
     'getName()Ljava/lang/String;': (jvm, classObj, args) => {
       // Handle primitive class objects
@@ -155,6 +74,36 @@ module.exports = {
         _classData: superClassData,
       };
     },
+    'getComponentType()Ljava/lang/Class;': async (jvm, classObj, args) => {
+      const classData = classObj && classObj._classData;
+      const componentType = classData && (classData.componentType || (classData.isArray && classData.className && classData.className.slice(1)));
+      if (!componentType) return null;
+      const primitiveDescriptors = {
+        Z: 'boolean',
+        B: 'byte',
+        C: 'char',
+        S: 'short',
+        I: 'int',
+        J: 'long',
+        F: 'float',
+        D: 'double',
+      };
+      if (primitiveDescriptors[componentType]) return jvm.getClassObject(primitiveDescriptors[componentType]);
+      if (componentType.startsWith('L') && componentType.endsWith(';')) return jvm.getClassObject(componentType.slice(1, -1));
+      if (componentType.startsWith('[')) {
+        return {
+          type: 'java/lang/Class',
+          className: componentType,
+          _classData: {
+            isArray: true,
+            arrayType: componentType,
+            className: componentType,
+            componentType: componentType.slice(1),
+          },
+        };
+      }
+      return jvm.getClassObject(componentType);
+    },
     'isInterface()Z': (jvm, classObj, args) => {
       const classData = classObj._classData;
       return classData.ast.classes[0].flags.includes('interface');
@@ -163,10 +112,55 @@ module.exports = {
       // Check if this is a primitive type class
       return classObj.isPrimitive ? 1 : 0;
     },
+    'isInstance(Ljava/lang/Object;)Z': async (jvm, classObj, args) => {
+      const obj = args[0];
+      if (obj === null || obj === undefined || classObj.isPrimitive) return 0;
+      const target = classNameFor(classObj);
+      return await jvm.isInstanceOfAsync(runtimeClassName(obj), target) ? 1 : 0;
+    },
+    'isAssignableFrom(Ljava/lang/Class;)Z': async (jvm, classObj, args) => {
+      if (!args[0] || classObj.isPrimitive || args[0].isPrimitive) {
+        return classObj === args[0] ? 1 : 0;
+      }
+      const target = classNameFor(classObj);
+      const source = classNameFor(args[0]);
+      return await jvm.isInstanceOfAsync(source, target) ? 1 : 0;
+    },
     'isArray()Z': (jvm, classObj, args) => {
       // Check if this is an array class
       const classData = classObj._classData;
       return classData && classData.isArray ? 1 : 0;
+    },
+    'isEnum()Z': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes[0]) return 0;
+      let current = classData.ast.classes[0].superClassName;
+      while (current) {
+        if (current === 'java/lang/Enum') return 1;
+        const currentData = jvm.classes[current];
+        current = currentData && currentData.ast && currentData.ast.classes[0]
+          ? currentData.ast.classes[0].superClassName
+          : null;
+      }
+      return 0;
+    },
+    'getEnumConstants()[Ljava/lang/Object;': (jvm, classObj, args) => {
+      const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes[0]) return null;
+      const className = classData.ast.classes[0].className;
+      const values = [];
+      if (classData.staticFields) {
+        for (const [fieldKey, value] of classData.staticFields.entries()) {
+          if (!value || (value.type !== className && value._className !== className)) continue;
+          if (String(fieldKey).includes('$VALUES')) continue;
+          values.push(value);
+        }
+      }
+      if (values.length === 0) return null;
+      values.type = `[L${className};`;
+      values.elementType = className;
+      values.hashCode = jvm.nextHashCode++;
+      return values;
     },
     'getMethods()[Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
       const allMethods = {};
@@ -177,8 +171,13 @@ module.exports = {
           return;
         }
 
+        const currentClassName = classData.ast.classes[0].className;
         classData.ast.classes[0].items
-          .filter(item => item.type === 'method' && item.method.flags.includes('public') && item.method.name !== '<init>')
+          .filter(item =>
+            item.type === 'method' &&
+            item.method.flags.includes('public') &&
+            item.method.name !== '<init>' &&
+            !(currentClassName === 'java/lang/Object' && item.method.name === 'clone'))
           .forEach(methodItem => {
             const key = methodItem.method.name + methodItem.method.descriptor;
             if (!allMethods[key]) {
@@ -207,6 +206,9 @@ module.exports = {
         Object.keys(stringMethods.methods).forEach(methodSignature => {
           const openParen = methodSignature.indexOf('(');
           const name = methodSignature.substring(0, openParen);
+          if (name === '<init>') {
+            return;
+          }
           const descriptor = methodSignature.substring(openParen);
           const key = name + descriptor;
           if (!allMethods[key]) {
@@ -250,7 +252,7 @@ module.exports = {
 
       return Object.values(allMethods);
     },
-    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': async (jvm, classObj, args) => {
+    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': withThrows(async (jvm, classObj, args) => {
       const methodName = String(args[0]);
       const paramTypes = args[1];
 
@@ -266,7 +268,11 @@ module.exports = {
             case 'short': return 'S';
             case 'byte': return 'B';
             case 'boolean': return 'Z';
-            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+            default:
+              throw {
+                type: 'java/lang/IllegalArgumentException',
+                message: `Unknown primitive type: ${paramClass.name}`,
+              };
           }
         }
         const paramClassName = paramClass._classData.ast.classes[0].className;
@@ -304,8 +310,8 @@ module.exports = {
         type: 'java/lang/NoSuchMethodException',
         message: methodName,
       };
-    },
-    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': (jvm, classObj, args) => {
+    }, ['java/lang/NoSuchMethodException', 'java/lang/IllegalArgumentException']),
+    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': withThrows((jvm, classObj, args) => {
       const methodNameObj = args[0];
       const paramTypes = args[1];
 
@@ -335,7 +341,11 @@ module.exports = {
             case 'short': return 'S';
             case 'byte': return 'B';
             case 'boolean': return 'Z';
-            default: throw new Error(`Unknown primitive type: ${paramClass.name}`);
+            default:
+              throw {
+                type: 'java/lang/IllegalArgumentException',
+                message: `Unknown primitive type: ${paramClass.name}`,
+              };
           }
         }
         const paramClassName = paramClass._classData.ast.classes[0].className;
@@ -363,8 +373,8 @@ module.exports = {
           message: methodName,
         };
       }
-    },
-    'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
+    }, ['java/lang/NoSuchMethodException', 'java/lang/IllegalArgumentException']),
+    'getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;': withThrows((jvm, classObj, args) => {
       const fieldNameObj = args[0];
       
       let fieldName;
@@ -397,7 +407,7 @@ module.exports = {
           message: fieldName,
         };
       }
-    },
+    }, ['java/lang/NoSuchFieldException']),
     'getDeclaredFields()[Ljava/lang/reflect/Field;': (jvm, classObj, args) => {
       const classData = classObj._classData;
       const fields = classData.ast.classes[0].items.filter(item => item.type === 'field');
@@ -441,15 +451,53 @@ module.exports = {
       
       return null;
     },
-    'newInstance()Ljava/lang/Object;': (jvm, classObj, args) => {
+    'getConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': withThrows((jvm, classObj, args) => ({
+      type: 'java/lang/reflect/Constructor',
+      _declaringClass: classObj,
+      _parameterTypes: args[0] || [],
+    }), ['java/lang/NoSuchMethodException']),
+    'getDeclaredConstructor([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;': withThrows((jvm, classObj, args) => ({
+      type: 'java/lang/reflect/Constructor',
+      _declaringClass: classObj,
+      _parameterTypes: args[0] || [],
+    }), ['java/lang/NoSuchMethodException']),
+    'newInstance()Ljava/lang/Object;': withThrows(async (jvm, classObj, args, thread) => {
       const classData = classObj._classData;
+      if (!classData || !classData.ast || !classData.ast.classes || !classData.ast.classes[0]) {
+        throw { type: 'java/lang/InstantiationException', message: classObj.className || 'class' };
+      }
       const className = classData.ast.classes[0].className;
-      const newObj = jvm.newObject(className);
-      const constructor = jvm.findMethod(className, '<init>()V');
+      const t0 = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+      const newObj = await jvm.createAppletInstance(className, t0);
+      const constructor = jvm.findMethod(jvm.classes[className], '<init>', '()V');
       if (constructor) {
-        jvm.runMethod(constructor, [newObj]);
+        const Frame = require('../../../core/frame');
+        const initFrame = new Frame(constructor);
+        initFrame.className = className;
+        initFrame.locals[0] = newObj;
+        const t = thread || jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+        t.callStack.push(initFrame);
+        const originalStackSize = t.callStack.size();
+        while (t.callStack.size() >= originalStackSize) {
+          const result = await jvm.executeTick();
+          if (result && result.completed) break;
+        }
       }
       return newObj;
+    }, ['java/lang/InstantiationException', 'java/lang/IllegalAccessException']),
+    'getResource(Ljava/lang/String;)Ljava/net/URL;': (jvm, classObj, args) => {
+      const name = String(args[0]);
+      const classData = classObj._classData;
+      const className = classData && classData.ast && classData.ast.classes[0]
+        ? classData.ast.classes[0].className
+        : 'java/lang/Object';
+      const base = className.includes('/') ? className.substring(0, className.lastIndexOf('/') + 1) : '';
+      const resource = name.startsWith('/') ? name.substring(1) : base + name;
+      return {
+        type: 'java/net/URL',
+        url: jvm.internString(`file:/${resource}`),
+        hashCode: jvm.nextHashCode++,
+      };
     },
     'getClassLoader()Ljava/lang/ClassLoader;': (jvm, classObj, args) => {
       // Return null to indicate the bootstrap class loader
@@ -457,3 +505,21 @@ module.exports = {
     }
   }
 };
+
+const classJre = module.exports;
+
+classJre.methods['getField(Ljava/lang/String;)Ljava/lang/reflect/Field;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;'](jvm, classObj, args, thread)
+);
+
+classJre.methods['getMethod(Ljava/lang/String;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], []], thread)
+);
+
+classJre.methods['getDeclaredMethod(Ljava/lang/String;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], []], thread)
+);
+
+classJre.methods['getDeclaredMethod(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/reflect/Method;'] = (jvm, classObj, args, thread) => (
+  classJre.methods['getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'](jvm, classObj, [args[0], [args[1]]], thread)
+);

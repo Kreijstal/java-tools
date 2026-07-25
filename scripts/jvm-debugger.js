@@ -2,7 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const DebugController = require('../src/debugController');
+const DebugController = require('../src/debug/debugController');
 
 async function main() {
   let args = process.argv.slice(2);

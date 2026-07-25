@@ -1,6 +1,6 @@
 const test = require('tape');
 const path = require('path');
-const DebugController = require('../src/debugController');
+const DebugController = require('../src/debug/debugController');
 
 test('Thread-Aware Debugger - jvmStep', async (t) => {
   t.plan(6);

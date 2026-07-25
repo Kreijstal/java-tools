@@ -1,6 +1,32 @@
-const Frame = require('../../../../frame');
-const { parseDescriptor } = require('../../../../typeParser');
-const { ASYNC_METHOD_SENTINEL } = require('../../../../constants');
+const Frame = require('../../../../core/frame');
+const { parseDescriptor } = require('../../../../parsing/typeParser');
+const { ASYNC_METHOD_SENTINEL } = require('../../../../core/constants');
+const { withThrows } = require('../../../helpers');
+
+// Method.invoke must return boxed objects for primitive-returning methods;
+// callers checkcast to the wrapper type (e.g. (Long) m.invoke(...)).
+function box(type, value, toStr) {
+  const obj = { type, value };
+  obj.toString = toStr || function () { return String(this.value); };
+  return obj;
+}
+
+function boxReflectiveReturn(descriptor, value) {
+  if (value === null || value === undefined) return null;
+  const retType = descriptor.slice(descriptor.indexOf(')') + 1);
+  switch (retType) {
+    case 'V': return null;
+    case 'J': return box('java/lang/Long', typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value))));
+    case 'I': return box('java/lang/Integer', Number(value) | 0);
+    case 'S': return box('java/lang/Short', Number(value) | 0);
+    case 'B': return box('java/lang/Byte', Number(value) | 0);
+    case 'C': return box('java/lang/Character', Number(value) | 0, function () { return String.fromCharCode(this.value); });
+    case 'Z': return box('java/lang/Boolean', !!Number(value), function () { return this.value ? 'true' : 'false'; });
+    case 'F': return box('java/lang/Float', Number(value));
+    case 'D': return box('java/lang/Double', Number(value));
+    default: return value;
+  }
+}
 
 const MODIFIERS = {
   PUBLIC: 0x00000001,
@@ -18,6 +44,7 @@ module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
   methods: {
+    'getExceptionTypes()[Ljava/lang/Class;': () => [],
     'getName()Ljava/lang/String;': (jvm, methodObj, args) => {
       const methodName = methodObj._methodData.name;
       return jvm.internString(methodName);
@@ -39,7 +66,7 @@ module.exports = {
     'setAccessible(Z)V': (jvm, methodObj, args) => {
       methodObj.accessible = args[0];
     },
-    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': async (jvm, methodObj, args) => {
+    'invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;': withThrows(async (jvm, methodObj, args) => {
       const methodData = methodObj._methodData;
       const { name, descriptor, flags } = methodData;
       const obj = args[0];
@@ -70,8 +97,8 @@ module.exports = {
       if (classNameForLookup) {
         const jreMethod = jvm._jreFindMethod(classNameForLookup, name, descriptor);
         if (jreMethod) {
-          const result = jreMethod(jvm, obj, methodArgs, jvm.threads[jvm.currentThreadIndex]);
-          return result;
+          const result = await jreMethod(jvm, obj, methodArgs, jvm.threads[jvm.currentThreadIndex]);
+          return boxReflectiveReturn(descriptor, result);
         }
       }
 
@@ -103,14 +130,21 @@ module.exports = {
       const callingFrame = thread.callStack.peek();
 
       thread.isAwaitingReflectiveCall = true;
-      thread.reflectiveCallResolver = async (ret) => {
-        const finalRet = await ret;
-        callingFrame.stack.push(finalRet);
+      // Return bytecodes hand the resolver a concrete JVM value. Keep this
+      // synchronous so the fast interpreter cannot resume the caller before
+      // its reflected result has been materialized.
+      thread.reflectiveCallResolver = (ret) => {
+        callingFrame.stack.push(boxReflectiveReturn(descriptor, ret));
       };
       thread.callStack.push(newFrame);
 
       return ASYNC_METHOD_SENTINEL;
-    },
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+      'java/lang/reflect/InvocationTargetException',
+    ]),
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, methodObj, args) => {
       const annotationClass = args[0];
       const annotations = methodObj._annotations || [];
@@ -146,3 +180,17 @@ module.exports = {
     },
   }
 };
+
+const methodJre = module.exports;
+
+methodJre.methods['invoke(Ljava/lang/Object;)Ljava/lang/Object;'] = (jvm, methodObj, args, thread) => (
+  methodJre.methods['invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;'](jvm, methodObj, [args[0], []], thread)
+);
+
+methodJre.methods['invoke(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;'] = (jvm, methodObj, args, thread) => (
+  methodJre.methods['invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;'](jvm, methodObj, [args[0], [args[1]]], thread)
+);
+
+methodJre.methods['invoke(Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;'] = (jvm, methodObj, args, thread) => (
+  methodJre.methods['invoke(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;'](jvm, methodObj, [args[0], [args[1], args[2]]], thread)
+);

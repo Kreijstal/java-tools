@@ -1,7 +1,9 @@
+const { withThrows } = require('../../../helpers');
+
 module.exports = {
   super: "java/lang/Object",
   staticMethods: {
-    "getLine(Ljavax/sound/sampled/Line$Info;)Ljavax/sound/sampled/Line;": (
+    "getLine(Ljavax/sound/sampled/Line$Info;)Ljavax/sound/sampled/Line;": withThrows((
       jvm,
       obj,
       args,
@@ -36,7 +38,7 @@ module.exports = {
         waitSet: [],
       };
       jvm.throwException(exception);
-    },
+    }, ['javax/sound/sampled/LineUnavailableException']),
     "getMixerInfo()[Ljavax/sound/sampled/Mixer$Info;": (
       jvm,
       obj,

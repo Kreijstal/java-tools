@@ -1,7 +1,7 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
-const Frame = require('../src/frame');
-const DebugController = require('../src/debugController');
+const { JVM } = require('../src/core/jvm');
+const Frame = require('../src/core/frame');
+const DebugController = require('../src/debug/debugController');
 
 test('Enhanced Debug Features - Backtrace with method arguments', async (t) => {
   const controller = new DebugController({ classpath: 'sources' });

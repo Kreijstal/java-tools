@@ -1,5 +1,6 @@
 // Requires AWT framework
-const awtFramework = require('../../../awt.js');
+const awtFramework = require('../../../platform/awt.js');
+const browserInput = require('../../../platform/browser-awt-input.js');
 
 module.exports = {
   super: 'java/awt/Panel',
@@ -10,7 +11,107 @@ module.exports = {
       obj._awtComponent.setSize(800, 600); // Default applet size
       obj._width = 800;
       obj._height = 600;
-      obj._canvasElement = null;
+      
+      // Create and attach canvas to DOM if in browser environment
+      if (typeof document !== 'undefined') {
+        const canvas = document.createElement('canvas');
+        canvas.width = 800;
+        canvas.height = 600;
+        canvas.style.border = '1px solid #ccc';
+        canvas.style.background = 'white';
+        
+        // Store reference to canvas element
+        obj._awtComponent.canvasElement = canvas;
+        obj._canvasElement = canvas;
+        jvm._awtCanvasElement = canvas;
+        browserInput.attachBrowserInput(jvm, canvas);
+        
+        // Add canvas to DOM - look for AWT container or create one
+        let awtContainer = document.getElementById('awt-container');
+        if (!awtContainer) {
+          awtContainer = document.createElement('div');
+          awtContainer.id = 'awt-container';
+          awtContainer.style.cssText = 'margin: 10px 0; padding: 10px; border: 1px solid #ddd; background: #f9f9f9;';
+          
+          // Add title
+          const title = document.createElement('h3');
+          title.textContent = 'Java AWT/Applet Output';
+          title.style.cssText = 'margin: 0 0 10px 0; color: #333;';
+          awtContainer.appendChild(title);
+          
+          // Insert after output section or append to body
+          const outputSection = document.getElementById('output')?.parentNode;
+          if (outputSection && outputSection.parentNode) {
+            outputSection.parentNode.insertBefore(awtContainer, outputSection.nextSibling);
+          } else {
+            document.body.appendChild(awtContainer);
+          }
+        }
+
+        let appletRoot = awtContainer.querySelector('.awt-applet-root');
+        if (!appletRoot) {
+          appletRoot = document.createElement('div');
+          appletRoot.className = 'awt-applet-root';
+          appletRoot.style.position = 'relative';
+          appletRoot.style.boxSizing = 'border-box';
+          awtContainer.appendChild(appletRoot);
+        }
+
+        obj._awtElement = appletRoot;
+        if (obj._width) {
+          appletRoot.style.minWidth = `${obj._width}px`;
+        }
+        if (obj._height) {
+          appletRoot.style.minHeight = `${obj._height}px`;
+        }
+        if (!appletRoot.contains(canvas)) {
+          appletRoot.appendChild(canvas);
+        }
+        canvas.style.display = 'block';
+
+        if (!obj._clickListenerAttached) {
+          obj._clickListenerAttached = true;
+          canvas.addEventListener('click', async (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const clickX = Math.floor(event.clientX - rect.left);
+            const clickY = Math.floor(event.clientY - rect.top);
+
+            const method = jvm.findMethod(jvm.classes[obj.type], 'handleClick', '(II)V');
+            if (!method) {
+              return;
+            }
+
+            const Frame = require('../../../core/frame');
+            const clickFrame = new Frame(method);
+            clickFrame.className = obj.type;
+            clickFrame.locals[0] = obj;
+            clickFrame.locals[1] = clickX;
+            clickFrame.locals[2] = clickY;
+
+            const currentThread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+            if (currentThread) {
+              currentThread.callStack.push(clickFrame);
+              const threadIndex = jvm.threads.indexOf(currentThread);
+              if (threadIndex >= 0) {
+                jvm.currentThreadIndex = threadIndex;
+              }
+              currentThread.status = 'runnable';
+
+              const originalStackSize = currentThread.callStack.size();
+              let maxIterations = 1000;
+              let iterations = 0;
+
+              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
+                const result = await jvm.executeTick();
+                iterations++;
+                if (result && result.completed) break;
+              }
+            }
+          });
+        }
+        
+        console.log('AWT Canvas created and attached to DOM', canvas);
+      }
     },
     
     'init()V': (jvm, obj, args) => {
@@ -45,57 +146,85 @@ module.exports = {
       // Return a Graphics object using JVM's createGraphicsObject method
       return jvm.createGraphicsObject(obj);
     },
+
+    'getAppletContext()Ljava/applet/AppletContext;': (jvm, obj, args) => {
+      return obj._appletContext || { type: 'java/applet/AppletContext' };
+    },
+
+    'getCodeBase()Ljava/net/URL;': (jvm, obj, args) => {
+      const base = obj._codeBase || 'http://localhost/';
+      return { type: 'java/net/URL', url: jvm.internString(String(base)) };
+    },
+
+    'getDocumentBase()Ljava/net/URL;': (jvm, obj, args) => {
+      const base = obj._documentBase || obj._codeBase || 'http://localhost/';
+      return { type: 'java/net/URL', url: jvm.internString(String(base)) };
+    },
+
+    'getParameter(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const params = obj._parameters || {};
+      const value = params[String(args[0] || '')];
+      return value == null ? null : jvm.internString(String(value));
+    },
     
-    'repaint()V': (jvm, obj, args) => {
-      if (!obj._awtComponent) {
-        return;
-      }
-
-      const graphicsObj = jvm.createGraphicsObject(obj);
-      if (!graphicsObj) {
-        return;
-      }
-
-      if (
-        graphicsObj._awtGraphics &&
-        typeof graphicsObj._awtGraphics.setColor === 'function' &&
-        typeof graphicsObj._awtGraphics.fillRect === 'function'
-      ) {
-        graphicsObj._awtGraphics.setColor({ r: 255, g: 255, b: 255 });
-        graphicsObj._awtGraphics.fillRect(0, 0, obj._awtComponent.width || 800, obj._awtComponent.height || 600);
-      }
-
-      const paintMethod = jvm.findMethod(
-        jvm.classes[obj.type],
-        'paint',
-        '(Ljava/awt/Graphics;)V',
-      );
-
-      if (paintMethod) {
-        const Frame = require('../../../frame');
-        const paintFrame = new Frame(paintMethod);
-        paintFrame.className = obj.type;
-        paintFrame.locals[0] = obj;
-        paintFrame.locals[1] = graphicsObj;
-
-        const currentThread = jvm.threads[jvm.currentThreadIndex];
-        if (currentThread) {
-          currentThread.callStack.push(paintFrame);
-
-          const originalStackSize = currentThread.callStack.size();
-          let maxIterations = 1000;
-          let iterations = 0;
-
-          while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
-            const result = jvm.executeTick();
-            iterations++;
-            if (result && result.completed) {
-              break;
+    'repaint()V': async (jvm, obj, args) => {
+      // Trigger a repaint
+      if (obj._awtComponent) {
+        const graphics = obj._awtComponent.getGraphics();
+        if (graphics) {
+          // Clear the canvas first
+          if (obj._canvasElement) {
+            const ctx = obj._canvasElement.getContext('2d');
+            if (ctx) {
+              ctx.clearRect(0, 0, obj._canvasElement.width, obj._canvasElement.height);
+              ctx.fillStyle = 'white';
+              ctx.fillRect(0, 0, obj._canvasElement.width, obj._canvasElement.height);
             }
           }
+          
+          // Create Java Graphics object using JVM's createGraphicsObject method
+          const graphicsObj = jvm.createGraphicsObject(obj);
+          
+          // Call the paint method using JVM method lookup
+          const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
+          if (paintMethod) {
+            // Execute the actual paint method bytecode
+            const Frame = require('../../../core/frame');
+            const paintFrame = new Frame(paintMethod);
+            paintFrame.className = obj.type;
+            paintFrame.locals[0] = obj; // 'this' parameter
+            paintFrame.locals[1] = graphicsObj; // Graphics parameter
+
+            console.log('🎨 Applet.repaint() - Graphics object created:', {
+              hasAwtGraphics: !!graphicsObj._awtGraphics,
+              graphicsType: graphicsObj.type
+            });
+            
+            // Get current thread to execute the paint method
+            const currentThread = jvm.threads[jvm.currentThreadIndex];
+            if (currentThread) {
+              currentThread.status = 'runnable';
+              currentThread.callStack.push(paintFrame);
+              
+              // Execute the paint method synchronously
+              const originalStackSize = currentThread.callStack.size();
+              const maxIterations = 200000; // Allow heavier paint loops to complete
+              let iterations = 0;
+              
+              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
+                const result = await jvm.executeTick();
+                iterations++;
+                if (result && result.completed) break;
+              }
+              if (iterations >= maxIterations) {
+                console.warn('Applet.paint exceeded iteration limit');
+              }
+            }
+          } else if (obj['paint(Ljava/awt/Graphics;)V']) {
+            // Fallback to direct method call
+            obj['paint(Ljava/awt/Graphics;)V'](jvm, obj, [graphicsObj]);
+          }
         }
-      } else if (obj['paint(Ljava/awt/Graphics;)V']) {
-        obj['paint(Ljava/awt/Graphics;)V'](jvm, obj, [graphicsObj]);
       }
     }
   },

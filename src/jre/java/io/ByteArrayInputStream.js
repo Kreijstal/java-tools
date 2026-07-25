@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/io/InputStream',
   staticFields: {},
@@ -28,7 +30,7 @@ module.exports = {
       return -1;
     },
     
-    'read([BII)I': (jvm, obj, args) => {
+    'read([BII)I': withThrows((jvm, obj, args) => {
       const b = args[0];
       const off = args[1];
       const len = args[2];
@@ -55,7 +57,7 @@ module.exports = {
       obj.pos += actualLen;
       
       return actualLen;
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/IndexOutOfBoundsException']),
     
     'available()I': (jvm, obj, args) => {
       return obj.count - obj.pos;

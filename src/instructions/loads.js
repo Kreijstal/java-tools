@@ -87,27 +87,27 @@ module.exports = {
     frame.stack.push(frame.locals[3]);
   },
   iaload: (frame) => {
-    _aload(frame);
+    _aload(frame, "iaload");
   },
   laload: (frame) => {
-    _aload(frame);
+    _aload(frame, "laload");
   },
   faload: (frame) => {
-    _aload(frame);
+    _aload(frame, "faload");
   },
   daload: (frame) => {
-    _aload(frame);
+    _aload(frame, "daload");
   },
   baload: (frame) => {
-    _aload(frame);
+    _aload(frame, "baload");
   },
   caload: (frame) => {
-    _aload(frame);
+    _aload(frame, "caload");
   },
   saload: (frame) => {
-    _aload(frame);
+    _aload(frame, "saload");
   },
   aaload: (frame) => {
-    _aload(frame);
+    _aload(frame, "aaload");
   },
 };

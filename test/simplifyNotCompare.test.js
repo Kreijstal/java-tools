@@ -1,0 +1,499 @@
+'use strict';
+
+const test = require('tape');
+const { simplifyCodeItems } = require('../src/passes/simplifyNotCompare');
+
+test('simplifyCodeItems rewrites ~x > k into x < ~k', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '6' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'bipush', arg: '-66' } },
+    { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems), 1, 'rewrites one comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '6' } },
+    { instruction: { op: 'bipush', arg: '65' } },
+    { instruction: { op: 'if_icmplt', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems rewrites k > ~x into x > ~k', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'bipush', arg: '-91' } },
+    { instruction: { op: 'iload', arg: '6' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems), 1, 'rewrites one comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '6' } },
+    { instruction: { op: 'bipush', arg: '90' } },
+    { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems rewrites k != ~x into x != ~k', (t) => {
+  const codeItems = [
+    { instruction: { op: 'bipush', arg: '-61' } },
+    { instruction: { op: 'iload', arg: '9' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems), 1, 'rewrites one equality comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'iload', arg: '9' } },
+    { instruction: { op: 'bipush', arg: '60' } },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems rewrites ldc k == ~char local into char local == ~k', (t) => {
+  const codeItems = [
+    { instruction: { op: 'ldc', arg: -65536 } },
+    { instruction: { op: 'iload', arg: '2' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set(['2'])), 1, 'rewrites one ldc equality comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'iload', arg: '2' } },
+    { instruction: { op: 'ldc', arg: 65535 } },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems preserves labelled interior instructions', (t) => {
+  const codeItems = [
+    { instruction: { op: 'goto', arg: 'Lmid' } },
+    { instruction: { op: 'iload', arg: '6' } },
+    { labelDef: 'Lmid:', instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'bipush', arg: '-66' } },
+    { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems), 0, 'does not rewrite across label targets');
+  t.equal(codeItems.length, 6, 'items are unchanged');
+  t.end();
+});
+
+test('runSimplifyNotCompare can restrict rewrites to char-derived locals', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'aload', arg: '1' } },
+                      { instruction: 'iconst_0' },
+                      { instruction: { op: 'invokeinterface', arg: ['InterfaceMethod', 'java/lang/CharSequence', ['charAt', '(I)C']] } },
+                      { instruction: { op: 'istore', arg: '6' } },
+                      { instruction: { op: 'iload', arg: '6' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'bipush', arg: '-66' } },
+                      { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+                      { instruction: { op: 'iload', arg: '7' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'bipush', arg: '-66' } },
+                      { instruction: { op: 'if_icmpgt', arg: 'L2' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites only the char local comparison');
+  t.equal(codeItems[4].instruction.op, 'iload', 'keeps char local load');
+  t.equal(codeItems[5].instruction.arg, '65', 'uses positive char bound');
+  t.ok(codeItems.some((item) => item.instruction && item.instruction.op === 'iload' && item.instruction.arg === '7'), 'non-char local comparison remains');
+  t.end();
+});
+
+test('runSimplifyNotCompare can widen ~int comparisons without widening non-negative char facts', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '()V',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'iload', arg: '7' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+                      { instruction: { op: 'iload', arg: '8' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'if_icmpeq', arg: 'L2' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true, generalIntNotCompare: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites only the general ~int comparison');
+  t.deepEqual(codeItems.slice(0, 3), [
+    { instruction: { op: 'iload', arg: '7' } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'if_icmplt', arg: 'L1' } },
+  ]);
+  t.deepEqual(codeItems.slice(3), [
+    { instruction: { op: 'iload', arg: '8' } },
+    { instruction: 'iconst_m1' },
+    { instruction: { op: 'if_icmpeq', arg: 'L2' } },
+  ], 'does not treat arbitrary int locals as non-negative chars');
+  t.end();
+});
+
+test('runSimplifyNotCompare widens simple static int field ~ comparisons', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '()V',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'getstatic', arg: ['Field', 'gk', ['gk_d', 'I']] } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true, generalIntNotCompare: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites the static int comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'getstatic', arg: ['Field', 'gk', ['gk_d', 'I']] } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems rewrites dup-store ~stack comparisons', (t) => {
+  const codeItems = [
+    { instruction: 'dup' },
+    { instruction: { op: 'istore', arg: '47' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: 'iconst_m1' },
+    { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), null, new Set()), 1, 'rewrites one dup-store comparison');
+  t.deepEqual(codeItems, [
+    { instruction: 'dup' },
+    { instruction: { op: 'istore', arg: '47' } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'if_icmplt', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('runSimplifyNotCompare rewrites static char field comparisons', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'bipush', arg: '-94' } },
+                      { instruction: { op: 'getstatic', arg: ['Field', 'el', ['G', 'C']] } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites the static char comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'getstatic', arg: ['Field', 'el', ['G', 'C']] } },
+    { instruction: { op: 'bipush', arg: '93' } },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('runSimplifyNotCompare rewrites char parameter comparisons', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '(IC)Z',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'iload', arg: '1' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'sipush', arg: '-161' } },
+                      { instruction: { op: 'if_icmpgt', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+  const codeItems = ast.classes[0].items[0].method.attributes[0].code.codeItems;
+
+  t.equal(result.rewrites, 1, 'rewrites the char parameter comparison');
+  t.deepEqual(codeItems, [
+    { instruction: { op: 'iload', arg: '1' } },
+    { instruction: { op: 'sipush', arg: '160' } },
+    { instruction: { op: 'if_icmplt', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('runSimplifyNotCompare tracks static char-return helpers into locals', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '()V',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'sipush', arg: '228' } },
+                      { instruction: { op: 'iload', arg: '7' } },
+                      { instruction: { op: 'invokestatic', arg: ['Method', 'un', ['a', '(IC)C']] } },
+                      { instruction: { op: 'istore', arg: '8' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'iload', arg: '8' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+
+  t.equal(result.rewrites, 1, 'rewrites comparison on static helper char local');
+  t.end();
+});
+
+test('runSimplifyNotCompare tracks char fields into locals', (t) => {
+  const ast = {
+    classes: [
+      {
+        items: [
+          {
+            type: 'method',
+            method: {
+              flags: ['static'],
+              descriptor: '()V',
+              attributes: [
+                {
+                  type: 'code',
+                  code: {
+                    codeItems: [
+                      { instruction: { op: 'getstatic', arg: ['Field', 'el', ['G', 'C']] } },
+                      { instruction: { op: 'istore', arg: '5' } },
+                      { instruction: { op: 'iload', arg: '5' } },
+                      { instruction: 'iconst_m1' },
+                      { instruction: 'ixor' },
+                      { instruction: 'iconst_m1' },
+                      { instruction: { op: 'if_icmpge', arg: 'L1' } },
+                    ],
+                    exceptionTable: [],
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    ],
+  };
+  const { runSimplifyNotCompare } = require('../src/passes/simplifyNotCompare');
+  const result = runSimplifyNotCompare(ast, { charLocalsOnly: true });
+
+  t.equal(result.rewrites, 1, 'rewrites comparison on char field local');
+  t.end();
+});
+
+test('simplifyCodeItems rewrites wide k != ~charAt comparisons', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'bipush', arg: '-92' } },
+    { instruction: { op: 'getstatic', arg: ['Field', 'vh', ['vh_h', 'Lhb;']] } },
+    { instruction: { op: 'getfield', arg: ['Field', 'hb', ['Y', 'Ljava/lang/String;']] } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/String', ['charAt', '(I)C']] } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set()), 1, 'rewrites one wide negative char comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: { op: 'getstatic', arg: ['Field', 'vh', ['vh_h', 'Lhb;']] } },
+    { instruction: { op: 'getfield', arg: ['Field', 'hb', ['Y', 'Ljava/lang/String;']] } },
+    { instruction: 'iconst_0' },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/String', ['charAt', '(I)C']] } },
+    { instruction: { op: 'bipush', arg: '91' } },
+    { instruction: { op: 'if_icmpne', arg: 'L1' } },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems does not treat charAt index arithmetic as compare bound', (t) => {
+  const codeItems = [
+    { instruction: { op: 'bipush', arg: '-33' } },
+    { instruction: 'aload_0' },
+    { instruction: { op: 'getfield', arg: ['Field', 'rk', ['E', 'Ljava/lang/String;']] } },
+    { instruction: { op: 'iload', arg: '3' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'iadd' },
+    { instruction: { op: 'invokevirtual', arg: ['Method', 'java/lang/String', ['charAt', '(I)C']] } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set()), 0, 'leaves consumed index arithmetic alone');
+  t.equal(codeItems.length, 10, 'items are unchanged');
+  t.end();
+});
+
+test('simplifyCodeItems rewrites impossible char local == -1 comparisons', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '5' } },
+    { instruction: 'iconst_m1' },
+    { instruction: { op: 'if_icmpeq', arg: 'L1' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(), new Set(['5'])), 1, 'rewrites one impossible negative char local comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: 'nop' },
+  ]);
+  t.end();
+});
+
+test('simplifyCodeItems preserves branch labels on rewritten comparisons', (t) => {
+  const codeItems = [
+    { labelDef: 'L0:', instruction: 'iconst_m1' },
+    { labelDef: 'L1:', instruction: { op: 'iload', arg: '8' } },
+    { instruction: 'iconst_m1' },
+    { instruction: 'ixor' },
+    { labelDef: 'Lbranch:', instruction: { op: 'if_icmpeq', arg: 'L2' } },
+  ];
+
+  t.equal(simplifyCodeItems(codeItems, new Set(['Lbranch'])), 1, 'rewrites the comparison');
+  t.deepEqual(codeItems, [
+    { labelDef: 'L0:', instruction: { op: 'iload', arg: '8' } },
+    { instruction: 'iconst_0' },
+    { labelDef: 'Lbranch:', instruction: { op: 'if_icmpeq', arg: 'L2' } },
+  ]);
+  t.end();
+});

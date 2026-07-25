@@ -21,7 +21,7 @@
 // built-in through environment detection, so explicit window imports are not needed.
 // The AWT classes use CommonJS exports and can be imported normally:
 
-const { Canvas, Frame, AwtMouseEvent } = require('../awt');
+const { Canvas, Frame, AwtMouseEvent } = require('../platform/awt');
 
 console.log('✅ AWT Framework Usage Examples');
 console.log('');

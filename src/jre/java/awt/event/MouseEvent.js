@@ -1,0 +1,14 @@
+module.exports = {
+  super: 'java/awt/event/InputEvent',
+  methods: {
+    '<init>()V': () => {},
+    'getX()I': (jvm, obj, args) => obj.x || 0,
+    'getY()I': (jvm, obj, args) => obj.y || 0,
+    'getButton()I': (jvm, obj) => obj.button || 0,
+    'getClickCount()I': (jvm, obj) => obj.clickCount || 0,
+    'getModifiers()I': (jvm, obj, args) => obj.modifiers || 0,
+    'getSource()Ljava/lang/Object;': (jvm, obj, args) => obj.source || null,
+    'isPopupTrigger()Z': (jvm, obj) => obj.popupTrigger ? 1 : 0,
+    'consume()V': (jvm, obj) => { obj.consumed = true; },
+  },
+};

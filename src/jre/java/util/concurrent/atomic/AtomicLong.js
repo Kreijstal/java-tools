@@ -1,0 +1,22 @@
+module.exports = {
+  super: 'java/lang/Number',
+  methods: {
+    '<init>()V': (jvm, obj) => { obj.value = BigInt(0); },
+    '<init>(J)V': (jvm, obj, args) => { obj.value = BigInt(args[0]); },
+    'get()J': (jvm, obj) => BigInt(obj.value || 0),
+    'set(J)V': (jvm, obj, args) => { obj.value = BigInt(args[0]); },
+    'getAndSet(J)J': (jvm, obj, args) => { const old = BigInt(obj.value || 0); obj.value = BigInt(args[0]); return old; },
+    'incrementAndGet()J': (jvm, obj) => { obj.value = BigInt(obj.value || 0) + BigInt(1); return obj.value; },
+    'getAndIncrement()J': (jvm, obj) => { const old = BigInt(obj.value || 0); obj.value = old + BigInt(1); return old; },
+    'decrementAndGet()J': (jvm, obj) => { obj.value = BigInt(obj.value || 0) - BigInt(1); return obj.value; },
+    'getAndDecrement()J': (jvm, obj) => { const old = BigInt(obj.value || 0); obj.value = old - BigInt(1); return old; },
+    'addAndGet(J)J': (jvm, obj, args) => { obj.value = BigInt(obj.value || 0) + BigInt(args[0]); return obj.value; },
+    'getAndAdd(J)J': (jvm, obj, args) => { const old = BigInt(obj.value || 0); obj.value = old + BigInt(args[0]); return old; },
+    'compareAndSet(JJ)Z': (jvm, obj, args) => { if (BigInt(obj.value || 0) === BigInt(args[0])) { obj.value = BigInt(args[1]); return 1; } return 0; },
+    'longValue()J': (jvm, obj) => BigInt(obj.value || 0),
+    'intValue()I': (jvm, obj) => Number(BigInt(obj.value || 0)),
+    'floatValue()F': (jvm, obj) => Number(BigInt(obj.value || 0)),
+    'doubleValue()D': (jvm, obj) => Number(BigInt(obj.value || 0)),
+    'toString()Ljava/lang/String;': (jvm, obj) => jvm.internString(String(BigInt(obj.value || 0))),
+  },
+};

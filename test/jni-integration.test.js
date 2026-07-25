@@ -1,6 +1,6 @@
 const test = require('tape');
 const { runTest } = require('./test-helpers');
-const { JVM } = require('../src/jvm');
+const { JVM } = require('../src/core/jvm');
 
 test('JNI Integration with Java Bytecode Execution', async (t) => {
   const nativeMethods = {

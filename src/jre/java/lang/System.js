@@ -1,10 +1,45 @@
 'use strict';
 const process = require('process');
+const path = require('path');
+const { withThrows } = require('../../helpers');
+function javaString(value) {
+  if (value === null || value === undefined) return '';
+  if (value && value.type === 'java/lang/String' && Object.prototype.hasOwnProperty.call(value, 'value')) return String(value.value);
+  return String(value);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
   staticMethods: {
-    'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': (jvm, _, args) => {
+    'getProperties()Ljava/util/Properties;': (jvm) => {
+      return {
+        type: 'java/util/Properties',
+        properties: module.exports.staticFields.get('props'),
+        defaults: null,
+      };
+    },
+    'identityHashCode(Ljava/lang/Object;)I': (jvm, obj, args) => {
+      const value = args[0];
+      if (value === null || value === undefined) return 0;
+      if (!Object.prototype.hasOwnProperty.call(value, 'hashCode')) value.hashCode = jvm.nextHashCode++;
+      return value.hashCode;
+    },
+    'getenv(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const key = javaString(args[0]);
+      const value = typeof process !== 'undefined' && process.env ? process.env[key] : undefined;
+      return value === undefined ? null : jvm.internString(value);
+    },
+    'setOut(Ljava/io/PrintStream;)V': (jvm, obj, args) => {
+      const systemClass = jvm.classes['java/lang/System'];
+      systemClass.staticFields.set('out:Ljava/io/PrintStream;', args[0]);
+    },
+    'load(Ljava/lang/String;)V': () => {
+      // Native libraries are provided by the host runtime where available.
+    },
+    'gc()V': () => {},
+    'runFinalization()V': () => {},
+    'arraycopy(Ljava/lang/Object;ILjava/lang/Object;II)V': withThrows((jvm, _, args) => {
       const [src, srcPos, dest, destPos, length] = args;
       if (src === null || dest === null) {
         throw {
@@ -26,15 +61,21 @@ module.exports = {
           dest[destPos + i] = src[srcPos + i];
         }
       }
-    },
+    }, ['java/lang/NullPointerException', 'java/lang/ArrayIndexOutOfBoundsException']),
     'getProperty(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
-      const key = jvm.stringify(args[0]);
+      const key = javaString(args[0]);
       const value = module.exports.staticFields.get('props').get(key);
       return value ? jvm.internString(value) : null;
     },
+    'getProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const key = javaString(args[0]);
+      const defaultValue = args[1];
+      const value = module.exports.staticFields.get('props').get(key);
+      return value !== undefined ? jvm.internString(value) : defaultValue;
+    },
     'setProperty(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
-      const key = jvm.stringify(args[0]);
-      const value = jvm.stringify(args[1]);
+      const key = javaString(args[0]);
+      const value = javaString(args[1]);
       const props = module.exports.staticFields.get('props');
       const old = props.get(key);
       props.set(key, value);
@@ -48,10 +89,10 @@ module.exports = {
       jvm.exit(status);
     },
     'nanoTime()J': (jvm, obj, args) => {
-      return BigInt(Math.floor(performance.now() * 1000000));
+      return BigInt(jvm.clock.nanos());
     },
     'currentTimeMillis()J': (jvm, obj, args) => {
-      return BigInt(Date.now());
+      return BigInt(jvm.clock.millis());
     }
   },
   methods: {
@@ -102,9 +143,10 @@ module.exports = {
       props.set('java.version', '1.8.0');
       props.set('java.vendor', 'JVM Tools Mock');
       props.set('os.name', 'Linux');
-      props.set('user.dir', '/tmp');
-      props.set('file.separator', '/');
-      props.set('path.separator', ':');
+      props.set('user.dir', process.cwd ? process.cwd() : '/tmp');
+      props.set('java.class.path', Array.isArray(jvm.classpath) ? jvm.classpath.join(path.delimiter) : String(jvm.classpath || '.'));
+      props.set('file.separator', path.sep);
+      props.set('path.separator', path.delimiter);
       props.set('line.separator', '\n');
       module.exports.staticFields.set('props', props);
     }

@@ -1,6 +1,95 @@
+const { withThrows } = require('../../helpers');
+
+function arrayForCollection(obj) {
+  if (!obj) return null;
+  if (Array.isArray(obj.array)) return obj.array;
+  if (Array.isArray(obj.items)) { obj.array = obj.items; return obj.array; }
+  if (Array.isArray(obj.list)) { obj.array = obj.list; return obj.array; }
+  if (obj.set instanceof Set) return obj.set;
+  return null;
+}
+
+
+function comparableKey(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'string') return value;
+  if (value instanceof String) return String(value);
+  if (Object.prototype.hasOwnProperty.call(value, 'value')) return value.value;
+  if (value.name !== undefined) return String(value.name);
+  if (value.index !== undefined) return value.index;
+  if (value.idx !== undefined) return value.idx;
+  return String(value);
+}
+
+function naturalCompare(a, b) {
+  const ka = comparableKey(a);
+  const kb = comparableKey(b);
+  if (ka === kb) return 0;
+  if (ka === null || ka === undefined) return -1;
+  if (kb === null || kb === undefined) return 1;
+  if (ka < kb) return -1;
+  if (ka > kb) return 1;
+  return 0;
+}
+
+function binarySearchArray(array, key, comparator) {
+  let low = 0;
+  let high = array.length - 1;
+  while (low <= high) {
+    const mid = (low + high) >> 1;
+    const midVal = array[mid];
+    const cmp = comparator ? comparator(midVal, key) : naturalCompare(midVal, key);
+    if (cmp < 0) {
+      low = mid + 1;
+    } else if (cmp > 0) {
+      high = mid - 1;
+    } else {
+      return mid;
+    }
+  }
+  return -(low + 1);
+}
+
 module.exports = {
   methods: {},
   staticMethods: {
+    'addAll(Ljava/util/Collection;[Ljava/lang/Object;)Z': (jvm, obj, args) => {
+      const collection = args[0];
+      const values = args[1] || [];
+      const target = arrayForCollection(collection);
+      if (!target) return 0;
+      let changed = false;
+      for (const value of values) {
+        if (target instanceof Set) target.add(value);
+        else target.push(value);
+        changed = true;
+      }
+      if (collection && !(target instanceof Set)) {
+        collection.array = target;
+        collection.items = target;
+        collection.size = target.length;
+      }
+      return changed ? 1 : 0;
+    },
+    'unmodifiableMap(Ljava/util/Map;)Ljava/util/Map;': (jvm, obj, args) => args[0],
+    'newSetFromMap(Ljava/util/Map;)Ljava/util/Set;': (jvm, obj, args) => {
+      const backing = args[0];
+      if (!backing.map) backing.map = new Map();
+      backing.entries = backing.map;
+      const set = new Set(backing.map.keys());
+      return {
+        type: 'java/util/HashSet',
+        _className: 'java/util/HashSet',
+        set,
+        items: set,
+        backingMap: backing.map,
+        hashCode: jvm.nextHashCode++,
+      };
+    },
+    'singleton(Ljava/lang/Object;)Ljava/util/Set;': (jvm, obj, args) => {
+      const set = new Set([args[0]]);
+      return { type: 'java/util/HashSet', set, items: set, hashCode: jvm.nextHashCode++ };
+    },
     'emptyList()Ljava/util/List;': () => {
       return {
         type: 'java/util/ArrayList',
@@ -63,6 +152,23 @@ module.exports = {
         }
       });
     },
+    'binarySearch(Ljava/util/List;Ljava/lang/Object;)I': (jvm, obj, args) => {
+      const collection = args[0];
+      const key = args[1];
+      const array = arrayForCollection(collection);
+      return binarySearchArray(Array.from(array || []), key, null);
+    },
+    'binarySearch(Ljava/util/List;Ljava/lang/Object;Ljava/util/Comparator;)I': (jvm, obj, args) => {
+      const collection = args[0];
+      const key = args[1];
+      const comparator = args[2];
+      const array = Array.from(arrayForCollection(collection) || []);
+      let compare = null;
+      if (comparator && comparator.methods && comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I']) {
+        compare = (a, b) => comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I'](jvm, comparator, [a, b]);
+      }
+      return binarySearchArray(array, key, compare);
+    },
     'sort(Ljava/util/List;)V': (jvm, obj, args) => {
       const list = args[0];
       if (list && list.items && typeof list.items.sort === 'function') {
@@ -72,24 +178,21 @@ module.exports = {
     'sort(Ljava/util/List;Ljava/util/Comparator;)V': (jvm, obj, args) => {
       const list = args[0];
       const comparator = args[1];
-      if (list && list.items && typeof list.items.sort === 'function') {
-        if (comparator && comparator.methods && comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I']) {
-          list.items.sort((a, b) => {
-            try {
-              return comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I'](
-                null, comparator, [a, b]
-              );
-            } catch (e) {
-              return 0; // Default comparison
-            }
-          });
-        } else {
-          list.items.sort((a, b) => {
-            if (a < b) return -1;
-            if (a > b) return 1;
-            return 0;
-          });
-        }
+      const array = arrayForCollection(list);
+      if (!array || typeof array.sort !== 'function') return;
+      let compare = null;
+      if (comparator && comparator.methods && comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I']) {
+        compare = (a, b) => comparator.methods['compare(Ljava/lang/Object;Ljava/lang/Object;)I'](jvm, comparator, [a, b]);
+      }
+      if (compare) {
+        array.sort(compare);
+      } else {
+        array.sort((a, b) => naturalCompare(a, b));
+      }
+      if (list && !(array instanceof Set)) {
+        list.array = array;
+        list.items = array;
+        list.size = array.length;
       }
     },
     'reverse(Ljava/util/List;)V': (jvm, obj, args) => {
@@ -103,12 +206,12 @@ module.exports = {
       if (list && list.items) {
         // Fisher-Yates shuffle algorithm
         for (let i = list.items.length - 1; i > 0; i--) {
-          const j = Math.floor(Math.random() * (i + 1));
+          const j = Math.floor(jvm.clock.random() * (i + 1));
           [list.items[i], list.items[j]] = [list.items[j], list.items[i]];
         }
       }
     },
-    'max(Ljava/util/Collection;)Ljava/lang/Object;': (jvm, obj, args) => {
+    'max(Ljava/util/Collection;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const collection = args[0];
       if (!collection || !collection.items || collection.items.length === 0) {
         throw {
@@ -124,8 +227,8 @@ module.exports = {
         }
       }
       return max;
-    },
-    'min(Ljava/util/Collection;)Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/util/NoSuchElementException']),
+    'min(Ljava/util/Collection;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const collection = args[0];
       if (!collection || !collection.items || collection.items.length === 0) {
         throw {
@@ -141,7 +244,7 @@ module.exports = {
         }
       }
       return min;
-    }
+    }, ['java/util/NoSuchElementException'])
   },
   staticFields: {
     EMPTY_LIST: {

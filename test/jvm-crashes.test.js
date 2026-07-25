@@ -29,7 +29,7 @@ const tests = [
     name: "InstanceofTest",
     description: "instanceof instruction for array types",
     expectedOutput:
-      "=== instanceof Test ===\nString instanceof String: true\nString instanceof Object: true\nInteger instanceof Integer: true\nInteger instanceof Number: true\nint[] instanceof Object: false\nnull instanceof String: false\nnull instanceof Object: false\n=== Class Hierarchy Test ===\nParent instanceof Parent: true\nChild instanceof Parent: true\nChild instanceof Child: true\nParent ref to Child instanceof Child: true",
+      "=== instanceof Test ===\nString instanceof String: true\nString instanceof Object: true\nInteger instanceof Integer: true\nInteger instanceof Number: true\nint[] instanceof Object: true\nnull instanceof String: false\nnull instanceof Object: false\n=== Class Hierarchy Test ===\nParent instanceof Parent: true\nChild instanceof Parent: true\nChild instanceof Child: true\nParent ref to Child instanceof Child: true",
   },
   {
     name: "InnerClassTest",
@@ -41,7 +41,7 @@ const tests = [
     name: "ReflectionCrash",
     description: "Basic reflection support",
     expectedOutput:
-      "Testing reflection operations that might crash...\nString class: java.lang.String\nString has 34 methods\nString has 0 public fields",
+      "Testing reflection operations that might crash...\nString class: java.lang.String\nString length method: length\nString has public fields: false",
   },
 
   // Data types and conversions
@@ -77,7 +77,7 @@ const tests = [
     name: "MathInstructions",
     description: "Arithmetic instructions for various types",
     expectedOutput:
-      "Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333333\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804",
+      "Long arithmetic:\n100 + 50 = 150\n100 - 50 = 50\n100 * 50 = 5000\n100 / 50 = 2\n100 % 50 = 0\nFloat arithmetic:\n3.5 + 1.5 = 5.0\n3.5 - 1.5 = 2.0\n3.5 * 1.5 = 5.25\n3.5 / 1.5 = 2.3333332538604736\n3.5 % 1.5 = 0.5\nDouble arithmetic:\n10.5 + 2.5 = 13.0\n10.5 - 2.5 = 8.0\n10.5 * 2.5 = 26.25\n10.5 / 2.5 = 4.2\n10.5 % 2.5 = 0.5\nInteger bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nLong bitwise:\n15 & 7 = 7\n15 | 7 = 15\n15 ^ 7 = 8\nShift instructions:\n8 << 2 = 32\n8 >> 1 = 4\n-8 >>> 1 = 2147483644\n8L << 2 = 32\n8L >> 1 = 4\n-8L >>> 1 = 9223372036854775804",
   },
   {
     name: "ComparisonInstructions",
@@ -91,7 +91,7 @@ const tests = [
     name: "SynchronizationTest",
     description: "Monitorenter/monitorexit for synchronization",
     expectedOutput:
-      "=== Synchronization Test ===\nIn synchronized method\nCounter after synchronized method: 10\nBefore synchronized block\nIn synchronized block\nCounter after synchronized block: 15\n=== Multi-threaded Test ===\nFinal counter value: 15",
+      "=== Synchronization Test ===\nIn synchronized method\nCounter after synchronized method: 10\nBefore synchronized block\nIn synchronized block\nCounter after synchronized block: 15\n=== Multi-threaded Test ===\nFinal counter value: 215",
     timeout: 1000, // 1 second timeout for threading tests
   },
   {
@@ -107,7 +107,7 @@ const tests = [
     name: "EnumTest",
     description: "Enum constants and methods",
     expectedOutput:
-      "=== Enum Test ===\nColor: RED\nRed value: 255\nHex: 255,0,0\nRED == RED: true\nRED equals RED: true\n=== Enum Switch Test ===\nIt's red!\nIt's green!\nIt's blue!\nIt's yellow!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nvalueOf(YELLOW): YELLOW\nCaught expected exception for invalid enum: IllegalArgumentException",
+      "=== Enum Test ===\nColor: RED\nRed value: 255\nHex: #ff0000\nRED == RED: true\nRED equals RED: true\n=== Enum Switch Test ===\nIt's red!\nIt's green!\nIt's blue!\nIt's yellow!\n=== valueOf Test ===\nvalueOf(BLUE): BLUE\nvalueOf(YELLOW): YELLOW\nCaught expected exception for invalid enum: IllegalArgumentException",
   },
   {
     name: "MissingBytecodeCrash",

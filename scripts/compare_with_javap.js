@@ -42,7 +42,7 @@ function runKrak2(classPath) {
 const fs = require('fs');
 const path = require('path');
 const { exec, execFile } = require('child_process');
-const { parseClassFile } = require('../src/create_java_asm');
+const { parseClassFile } = require('../src/parsing/create_java_asm');
 
 /**
  * Runs javap on a class file and returns the output

@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: null,
   staticFields: {},
@@ -5,39 +7,8 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       // Object constructor does nothing
     },
-    'getClass()Ljava/lang/Class;': (jvm, obj, args) => {
-      const className = obj.type;
-
-      // Special handling for arrays
-      if (className && className.startsWith('[')) {
-        // Check if array class is already registered (e.g., from createMultiDimensionalArray)
-        if (jvm.classes[className] && jvm.classes[className].type === 'java/lang/Class') {
-          return jvm.classes[className];
-        }
-
-        // Create new array class if not already registered
-        const classData = {
-          isArray: true,
-          arrayType: className,
-          componentType: className.slice(1), // Remove leading '['
-          className: className
-        };
-
-        // Register the new class
-        jvm.classes[className] = classData;
-
-        return {
-          type: 'java/lang/Class',
-          _classData: classData
-        };
-      }
-
-      // For regular objects, use existing logic
-      const classData = jvm.classes[className];
-      return {
-        type: 'java/lang/Class',
-        _classData: classData,
-      };
+    'getClass()Ljava/lang/Class;': async (jvm, obj, args) => {
+      return await jvm.getClassObject(obj._className || obj.type);
     },
     'hashCode()I': (jvm, obj, args) => {
       return obj.hashCode;
@@ -47,17 +18,27 @@ module.exports = {
       return obj === other ? 1 : 0;
     },
     'toString()Ljava/lang/String;': (jvm, obj, args) => {
-      const className = obj.type.replace(/\//g, '.');
+      const className = (obj._className || obj.type).replace(/\//g, '.');
+      if (obj.hashCode === undefined) {
+        obj.hashCode = jvm.nextHashCode++;
+      }
       const hashCode = obj.hashCode.toString(16);
       return jvm.internString(`${className}@${hashCode}`);
     },
-    'clone()Ljava/lang/Object;': (jvm, obj, args) => {
+    'clone()Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       // Handle array cloning
       if (obj.type && obj.type.startsWith('[')) {
-        const cloned = [...obj]; // Shallow copy of array elements
+        let cloned;
+        if (ArrayBuffer.isView(obj) && jvm.wasmHeap) {
+          // keep the clone heap-backed so compiled code stays on the fast path
+          cloned = jvm.wasmHeap.alloc(obj.type, obj.length);
+          cloned.set(obj);
+        } else {
+          cloned = [...obj]; // Shallow copy of array elements
+          cloned.length = obj.length;
+        }
         cloned.type = obj.type;
         cloned.elementType = obj.elementType;
-        cloned.length = obj.length;
         cloned.hashCode = jvm.nextHashCode++;
         return cloned;
       }
@@ -66,12 +47,13 @@ module.exports = {
       const cloned = Object.assign({}, obj);
       cloned.hashCode = jvm.nextHashCode++;
       return cloned;
-    },
-    'wait()V': (jvm, obj, args, thread) => {
+    }, ['java/lang/CloneNotSupportedException']),
+    'wait()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
-        // In a real implementation, this would throw IllegalMonitorStateException.
-        console.error(`Thread ${thread.id} attempted to wait on a monitor it does not own.`);
-        return;
+        throw {
+          type: 'java/lang/IllegalMonitorStateException',
+          message: 'current thread not owner',
+        };
       }
 
       // 1. Add the current thread to the object's wait set.
@@ -79,6 +61,7 @@ module.exports = {
 
       // 2. Change the thread's status to WAITING.
       thread.status = 'WAITING';
+      thread.waitingOn = obj;
 
       // 3. Atomically release the lock.
       // We must also remember how many times the lock was held recursively.
@@ -92,8 +75,8 @@ module.exports = {
 
       // The JVM scheduler will now be able to run another thread that might have been
       // BLOCKED on this object's monitor.
-    },
-    'wait(J)V': (jvm, obj, args, thread) => {
+    }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
+    'wait(J)V': withThrows((jvm, obj, args, thread) => {
       // Implementation for wait with timeout (milliseconds)
       const timeout = args[0]; // BigInt or number
       
@@ -104,14 +87,16 @@ module.exports = {
         };
       }
       
-      // For simplicity, treat timed wait same as regular wait in this mock implementation
-      // In a real JVM, this would involve timers and timeout handling
       const waitMethod = obj.methods ? obj.methods['wait()V'] : module.exports.methods['wait()V'];
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
       }
-    },
-    'wait(JI)V': (jvm, obj, args, thread) => {
+      const millis = Number(timeout);
+      if (millis > 0) {
+        thread.waitDeadline = jvm.clock.millis() + millis;
+      }
+    }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
+    'wait(JI)V': withThrows((jvm, obj, args, thread) => {
       // Implementation for wait with timeout (milliseconds) and nanos  
       const timeout = args[0]; // BigInt or number - milliseconds
       const nanos = args[1]; // int - nanoseconds
@@ -123,14 +108,16 @@ module.exports = {
         };
       }
       
-      // For simplicity, treat timed wait same as regular wait in this mock implementation
-      // In a real JVM, this would involve precise timing with milliseconds + nanoseconds
       const waitMethod = obj.methods ? obj.methods['wait()V'] : module.exports.methods['wait()V'];
       if (waitMethod) {
         waitMethod(jvm, obj, [], thread);
       }
-    },
-    'notify()V': (jvm, obj, args, thread) => {
+      const millis = Number(timeout);
+      if (millis > 0 || nanos > 0) {
+        thread.waitDeadline = jvm.clock.millis() + Math.max(1, millis);
+      }
+    }, ['java/lang/IllegalMonitorStateException', 'java/lang/InterruptedException']),
+    'notify()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         throw {
           type: 'java/lang/IllegalMonitorStateException',
@@ -139,11 +126,16 @@ module.exports = {
       }
       if (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
-        notifiedThread.status = 'BLOCKED';
+        // WAIT_REACQUIRE: the scheduler re-acquires the monitor for the thread
+        // before resuming it (execution continues AFTER the wait call, so the
+        // thread cannot re-run monitorenter itself).
+        notifiedThread.status = 'WAIT_REACQUIRE';
         notifiedThread.blockingOn = obj;
+        delete notifiedThread.waitingOn;
+        delete notifiedThread.waitDeadline;
       }
-    },
-    'notifyAll()V': (jvm, obj, args, thread) => {
+    }, ['java/lang/IllegalMonitorStateException']),
+    'notifyAll()V': withThrows((jvm, obj, args, thread) => {
       if (obj.lockOwner !== thread.id) {
         throw {
           type: 'java/lang/IllegalMonitorStateException',
@@ -152,9 +144,11 @@ module.exports = {
       }
       while (obj.waitSet.length > 0) {
         const notifiedThread = obj.waitSet.shift();
-        notifiedThread.status = 'BLOCKED';
+        notifiedThread.status = 'WAIT_REACQUIRE';
         notifiedThread.blockingOn = obj;
+        delete notifiedThread.waitingOn;
+        delete notifiedThread.waitDeadline;
       }
-    },
+    }, ['java/lang/IllegalMonitorStateException']),
   },
 };

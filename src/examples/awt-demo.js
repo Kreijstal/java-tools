@@ -3,7 +3,7 @@
  * with the JVM execution environment.
  */
 
-const { Canvas, Frame, AwtMouseEvent, Component } = require('../awt');
+const { Canvas, Frame, AwtMouseEvent, Component } = require('../platform/awt');
 
 /**
  * Simple AWT demo class that creates a canvas and handles mouse events

@@ -26,6 +26,7 @@ scripts/krakatau-disasm
 tools/krakatau/Krakatau
 
 # Build output
+build/
 dist/
 
 # Playwright test artifacts
@@ -41,4 +42,9 @@ jvm-debug.js
 test/temp*
 jvm-debug.js.LICENSE.txt
 src/jre/index.js
-examples/data.zip
+# Example output artifacts
+examples/output/
+
+# Dependency archives
+*.jar
+*.zip

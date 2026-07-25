@@ -17,7 +17,7 @@ test('Real debug controller integration - stepInstruction works', async ({ page 
 
   // Load HelloWorld sample class
   await page.selectOption('#sampleClassSelect', 'HelloWorld');
-  await page.click('button:has-text("Load Sample")');
+  await page.click('#loadBtn');
   
   // Wait for class to load
   await page.waitForFunction(() => {
@@ -28,7 +28,7 @@ test('Real debug controller integration - stepInstruction works', async ({ page 
   console.log('✅ HelloWorld.class loaded successfully');
 
   // Start debugging
-  await page.click('button:has-text("Start Debugging")');
+  await page.click('#debugBtn');
   
   // Wait for debugger to start 
   await page.waitForFunction(() => {

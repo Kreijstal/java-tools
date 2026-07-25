@@ -5,7 +5,7 @@
  * native methods in the JVM.js implementation.
  */
 
-const { JVM } = require('../jvm');
+const { JVM } = require('../core/jvm');
 const nativeLibrary = require('./nativeLibrary');
 
 async function demonstrateJNI() {

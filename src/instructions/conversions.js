@@ -14,7 +14,11 @@ module.exports = {
 
   l2i: (frame) => {
     const value = frame.stack.pop();
-    frame.stack.push(Number(value) | 0);
+    // Mask to the low 32 bits as a BigInt BEFORE converting to Number.
+    // Number(bigint) on a value > 2^53 rounds to the nearest double first,
+    // which would silently zero the low bytes (breaks e.g. Whirlpool).
+    const big = typeof value === 'bigint' ? value : BigInt(Math.trunc(Number(value)));
+    frame.stack.push(Number(BigInt.asIntN(32, big)));
   },
   l2f: (frame) => {
     const value = frame.stack.pop();

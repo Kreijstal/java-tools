@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: {
     type: 'java/util/AbstractList'
@@ -8,7 +10,10 @@ module.exports = {
       obj.size = 0;
     },
     '<init>(I)V': (jvm, obj, args, thread) => {
-      obj.items = new Array(args[0] || 10); // initial capacity
+      // Capacity is storage policy, not logical contents. A Java Vector
+      // constructed with a capacity still has size zero.
+      obj.items = [];
+      obj.capacity = Math.max(0, args[0] | 0);
       obj.size = 0;
     },
     '<init>(Ljava/util/Collection;)V': (jvm, obj, args, thread) => {
@@ -22,9 +27,15 @@ module.exports = {
       }
     },
     'add(Ljava/lang/Object;)Z': (jvm, obj, args) => {
-      return obj.methods['add(ILjava/lang/Object;)V'].call(null, jvm, obj, [obj.size, args[0]], thread) !== null ? 1 : 0;
+      obj.items.push(args[0]);
+      obj.size++;
+      return 1;
     },
-    'add(ILjava/lang/Object;)V': (jvm, obj, args, thread) => {
+    'addElement(Ljava/lang/Object;)V': (jvm, obj, args) => {
+      obj.items.push(args[0]);
+      obj.size++;
+    },
+    'add(ILjava/lang/Object;)V': withThrows((jvm, obj, args, thread) => {
       const index = args[0];
       const element = args[1];
 
@@ -37,8 +48,8 @@ module.exports = {
 
       obj.items.splice(index, 0, element);
       obj.size++;
-    },
-    'get(I)Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'get(I)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const index = args[0];
       if (index < 0 || index >= obj.size) {
         throw {
@@ -47,8 +58,30 @@ module.exports = {
         };
       }
       return obj.items[index];
-    },
-    'set(ILjava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'elementAt(I)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
+      const index = args[0];
+      if (index < 0 || index >= obj.size) {
+        throw {
+          type: 'java/lang/ArrayIndexOutOfBoundsException',
+          message: 'Index: ' + index + ', Size: ' + obj.size
+        };
+      }
+      return obj.items[index];
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'insertElementAt(Ljava/lang/Object;I)V': withThrows((jvm, obj, args) => {
+      const element = args[0];
+      const index = args[1];
+      if (index < 0 || index > obj.size) {
+        throw {
+          type: 'java/lang/ArrayIndexOutOfBoundsException',
+          message: 'Index: ' + index + ', Size: ' + obj.size
+        };
+      }
+      obj.items.splice(index, 0, element);
+      obj.size++;
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'set(ILjava/lang/Object;)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const index = args[0];
       const element = args[1];
 
@@ -62,8 +95,8 @@ module.exports = {
       const oldElement = obj.items[index];
       obj.items[index] = element;
       return oldElement;
-    },
-    'remove(I)Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
+    'remove(I)Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       const index = args[0];
 
       if (index < 0 || index >= obj.size) {
@@ -76,7 +109,7 @@ module.exports = {
       const removed = obj.items.splice(index, 1)[0];
       obj.size--;
       return removed;
-    },
+    }, ['java/lang/ArrayIndexOutOfBoundsException']),
     'remove(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const element = args[0];
       const index = obj.items.indexOf(element);
@@ -114,7 +147,7 @@ module.exports = {
       return {
         type: 'java/util/Iterator',
         hasNext: () => index < obj.size,
-        next: () => {
+        next: withThrows(() => {
           if (index >= obj.size) {
             throw {
               type: 'java/util/NoSuchElementException',
@@ -122,7 +155,7 @@ module.exports = {
             };
           }
           return obj.items[index++];
-        }
+        }, ['java/util/NoSuchElementException'])
       };
     }
   },

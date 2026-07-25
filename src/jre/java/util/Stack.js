@@ -1,3 +1,5 @@
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: {
     type: 'java/util/Vector'
@@ -13,7 +15,7 @@ module.exports = {
       obj.size = obj.items.length;
       return item;
     },
-    'pop()Ljava/lang/Object;': (jvm, obj, args) => {
+    'pop()Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       if (obj.size === 0) {
         throw {
           type: 'java/util/EmptyStackException',
@@ -23,8 +25,8 @@ module.exports = {
       const item = obj.items.pop();
       obj.size = obj.items.length;
       return item;
-    },
-    'peek()Ljava/lang/Object;': (jvm, obj, args) => {
+    }, ['java/util/EmptyStackException']),
+    'peek()Ljava/lang/Object;': withThrows((jvm, obj, args) => {
       if (obj.size === 0) {
         throw {
           type: 'java/util/EmptyStackException',
@@ -32,7 +34,7 @@ module.exports = {
         };
       }
       return obj.items[obj.items.length - 1];
-    },
+    }, ['java/util/EmptyStackException']),
     'empty()Z': (jvm, obj, args) => {
       return obj.size === 0 ? 1 : 0; // true : false
     },
@@ -64,7 +66,7 @@ module.exports = {
       return {
         type: 'java/util/Iterator',
         hasNext: () => index < obj.items.length,
-        next: () => {
+        next: withThrows(() => {
           if (index >= obj.items.length) {
             throw {
               type: 'java/util/NoSuchElementException',
@@ -72,7 +74,7 @@ module.exports = {
             };
           }
           return obj.items[index++];
-        }
+        }, ['java/util/NoSuchElementException'])
       };
     }
   },

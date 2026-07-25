@@ -1,8 +1,9 @@
 const path = require('path');
+const browserBabel = require('./config/browser-babel');
 
 module.exports = {
   mode: 'production',
-  entry: './src/browser-entry.js',
+  entry: './src/platform/browser-entry.js',
   output: {
     filename: 'jvm-debug.js',
     path: path.resolve(__dirname, 'dist'),
@@ -17,9 +18,7 @@ module.exports = {
         exclude: /node_modules/,
         use: {
           loader: 'babel-loader',
-          options: {
-            presets: ['@babel/preset-env']
-          }
+          options: browserBabel
         }
       }
     ]
@@ -56,6 +55,7 @@ module.exports = {
       "node:path": require.resolve("path-browserify"),
       "node:buffer": require.resolve("buffer/"),
       "node:process": require.resolve("process/browser"),
+      "speaker": false,
       // Additional node-fetch dependencies
       "fetch-blob": false,
       "formdata-polyfill": false,

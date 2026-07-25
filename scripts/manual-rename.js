@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
 
 async function main() {
     const tempDir = path.join(__dirname, '../test/temp_manual_rename');

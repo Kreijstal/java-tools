@@ -1,3 +1,44 @@
+function javaDoubleString(value) {
+  const d = Number(value);
+  if (isNaN(d)) {
+    return "NaN";
+  }
+  if (d === Number.POSITIVE_INFINITY) {
+    return "Infinity";
+  }
+  if (d === Number.NEGATIVE_INFINITY) {
+    return "-Infinity";
+  }
+  if (Object.is(d, -0)) {
+    return "-0.0";
+  }
+  if (d === 0.0) {
+    return "0.0";
+  }
+
+  const absD = Math.abs(d);
+  let s;
+
+  if (absD >= 1e-3 && absD < 1e7) {
+    s = String(d);
+    if (s.indexOf('.') === -1) {
+      s += '.0';
+    }
+  } else {
+    s = d.toExponential().toUpperCase().replace(/E\+/, 'E');
+    let [mantissa, exponent] = s.split('E');
+    if (mantissa.includes('.')) {
+      mantissa = mantissa.replace(/0+$/, '');
+      if (mantissa.endsWith('.')) {
+        mantissa = mantissa.slice(0, -1);
+      }
+    }
+    s = mantissa + 'E' + exponent;
+  }
+
+  return s;
+}
+
 module.exports = {
   super: "java/lang/Object",
   staticFields: {
@@ -14,6 +55,33 @@ module.exports = {
     "NaN:D": Number.NaN,
   },
   staticMethods: {
+    'compare(DD)I': (jvm, obj, args) => {
+      const [left, right] = args;
+      if (left < right) return -1;
+      if (left > right) return 1;
+      if (Object.is(left, right)) return 0;
+      if (Number.isNaN(left)) return Number.isNaN(right) ? 0 : 1;
+      if (Number.isNaN(right)) return -1;
+      return Object.is(left, -0) ? -1 : 1;
+    },
+    'longBitsToDouble(J)D': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setBigInt64(0, BigInt(args[0]), false);
+      return view.getFloat64(0, false);
+    },
+    'doubleToLongBits(D)J': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setFloat64(0, args[0], false);
+      return view.getBigInt64(0, false);
+    },
+    'doubleToRawLongBits(D)J': (jvm, obj, args) => {
+      const buffer = new ArrayBuffer(8);
+      const view = new DataView(buffer);
+      view.setFloat64(0, args[0], false);
+      return view.getBigInt64(0, false);
+    },
     "parseDouble(Ljava/lang/String;)D": (jvm, obj, args) => {
       const str = args[0];
       return parseFloat(str);
@@ -26,10 +94,15 @@ module.exports = {
 
       // Add JavaScript toString method for proper string concatenation
       doubleObj.toString = function () {
-        return this.value.toString();
+        return javaDoubleString(this.value);
       };
 
       return doubleObj;
+    },
+    "valueOf(Ljava/lang/String;)Ljava/lang/Double;": (jvm, obj, args) => {
+      const value = Number(args[0] && Object.prototype.hasOwnProperty.call(args[0], 'value') ? args[0].value : args[0]);
+      if (Number.isNaN(value)) throw { type: 'java/lang/NumberFormatException' };
+      return { type: 'java/lang/Double', value };
     },
     "isInfinite(D)Z": (jvm, obj, args) => {
       const value = args[0];
@@ -44,44 +117,7 @@ module.exports = {
       return isFinite(value) ? 1 : 0;
     },
     "toString(D)Ljava/lang/String;": (jvm, obj, args) => {
-      const d = args[0];
-      if (isNaN(d)) {
-        return jvm.internString("NaN");
-      }
-      if (d === Number.POSITIVE_INFINITY) {
-        return jvm.internString("Infinity");
-      }
-      if (d === Number.NEGATIVE_INFINITY) {
-        return jvm.internString("-Infinity");
-      }
-      if (d === 0.0) {
-        return jvm.internString('0.0');
-      }
-      if (d === -0.0) {
-        return jvm.internString('-0.0');
-      }
-
-      const absD = Math.abs(d);
-      let s;
-
-      if (absD >= 1e-3 && absD < 1e7) {
-        s = String(d);
-        if (s.indexOf('.') === -1) {
-            s += '.0';
-        }
-      } else {
-        s = d.toExponential().toUpperCase().replace(/E\+/, 'E');
-        let [mantissa, exponent] = s.split('E');
-        if (mantissa.includes('.')) {
-          mantissa = mantissa.replace(/0+$/, '');
-          if (mantissa.endsWith('.')) {
-            mantissa = mantissa.slice(0, -1);
-          }
-        }
-        s = mantissa + 'E' + exponent;
-      }
-
-      return jvm.internString(s);
+      return jvm.internString(javaDoubleString(args[0]));
     },
   },
   methods: {
@@ -90,17 +126,13 @@ module.exports = {
 
       // Add JavaScript toString method for proper string concatenation
       obj.toString = function () {
-        return this.value.toString();
+        return javaDoubleString(this.value);
       };
     },
     "doubleValue()D": (jvm, obj, args) => {
       return obj.value;
     },
-    "toString()Ljava/lang/String;": (jvm, obj, args) => {
-      // Defer to the static toString method for consistent formatting.
-      const doubleClass = jvm.getStatic('java/lang/Double');
-      return doubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, [obj.value]);
-    },
+    "toString()Ljava/lang/String;": (jvm, obj, args) => module.exports.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, [obj.value]),
     "getClass()Ljava/lang/Class;": (jvm, obj, args) => {
       return {
         type: "java/lang/Class",

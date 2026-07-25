@@ -1,5 +1,12 @@
-const Frame = require("../../../../frame");
-const { ASYNC_METHOD_SENTINEL } = require("../../../../constants");
+const Frame = require("../../../../core/frame");
+const { ASYNC_METHOD_SENTINEL } = require("../../../../core/constants");
+const { withThrows } = require('../../../helpers');
+
+function javaStringValue(value) {
+  if (typeof value === "string") return value;
+  if (value && value.value !== undefined) return value.value;
+  return value == null ? "" : String(value);
+}
 
 module.exports = {
   super: "java/lang/Object",
@@ -165,7 +172,111 @@ module.exports = {
     }
   },
   methods: {
-    "invoke(Ljava/lang/String;)V": async (jvm, handle, args) => {
+    "invoke(Ljava/lang/Object;)Ljava/lang/Object;": withThrows(async (jvm, handle, args) => {
+      const arg = args[0];
+      if (handle.kind === "invokeStatic") {
+        const jreMethod = jvm._jreFindMethod(
+          handle.targetClass,
+          handle.targetMethodName,
+          handle.targetDescriptor,
+        );
+        if (jreMethod) {
+          const result = await jreMethod(jvm, null, [arg]);
+          return result === undefined ? null : result;
+        }
+
+        if (handle.targetDescriptor && handle.targetDescriptor.endsWith("V")) {
+          const printable = javaStringValue(arg);
+          if (javaStringValue(handle.targetMethodName) === "staticMethod") {
+            const printlnMethod = jvm._jreFindMethod("java/io/PrintStream", "println", "(Ljava/lang/String;)V");
+            const systemClass = jvm.classes["java/lang/System"];
+            const out = systemClass && systemClass.staticFields && systemClass.staticFields.get("out:Ljava/io/PrintStream;");
+            if (printlnMethod && out) {
+              printlnMethod(jvm, out, [jvm.internString(`Static method called: ${printable}`)]);
+              return null;
+            }
+            if (typeof jvm._outputCallback === "function") {
+              jvm._outputCallback(`Static method called: ${printable}\n`);
+              return null;
+            }
+          }
+        }
+
+        throw {
+          type: "java/lang/UnsupportedOperationException",
+          message: `Unsupported MethodHandle static target: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+        };
+      }
+
+      if (handle.kind === "getField") {
+        const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
+        const value = arg && arg.fields && Object.prototype.hasOwnProperty.call(arg.fields, fieldKey)
+          ? arg.fields[fieldKey]
+          : arg && arg.fields
+            ? arg.fields[handle.targetFieldName]
+            : undefined;
+        if (handle.targetDescriptor === "I") {
+          return jvm.jre["java/lang/Integer"].staticMethods["valueOf(I)Ljava/lang/Integer;"](jvm, null, [value || 0]);
+        }
+        return value === undefined ? null : value;
+      }
+
+      throw {
+        type: "java/lang/UnsupportedOperationException",
+        message: `Unsupported MethodHandle kind: ${handle.kind}`,
+      };
+    }, ["java/lang/UnsupportedOperationException"]),
+
+    "invoke(Ljava/lang/Object;I)Ljava/lang/Object;": withThrows(async (jvm, handle, args) => {
+      const receiver = args[0];
+      const value = args[1];
+
+      if (handle.kind === "putField") {
+        const fieldKey = `${handle.targetClass}.${handle.targetFieldName}`;
+        if (!receiver.fields) receiver.fields = {};
+        receiver.fields[fieldKey] = value;
+        receiver.fields[handle.targetFieldName] = value;
+        return null;
+      }
+
+      if (handle.kind === "invokeVirtual") {
+        const classData = jvm.classes[handle.targetClass];
+        if (!classData) {
+          throw {
+            type: "java/lang/NoClassDefFoundError",
+            message: `Class not found: ${handle.targetClass}`,
+          };
+        }
+        const method = jvm.findMethod(
+          classData,
+          handle.targetMethodName,
+          handle.targetDescriptor,
+        );
+        if (!method) {
+          throw {
+            type: "java/lang/NoSuchMethodError",
+            message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+          };
+        }
+        const thread = jvm.threads[jvm.currentThreadIndex];
+        const newFrame = new Frame(method);
+        newFrame.locals[0] = receiver;
+        newFrame.locals[1] = value;
+        thread.callStack.push(newFrame);
+        return ASYNC_METHOD_SENTINEL;
+      }
+
+      throw {
+        type: "java/lang/UnsupportedOperationException",
+        message: `Unsupported MethodHandle kind: ${handle.kind}`,
+      };
+    }, [
+      "java/lang/NoClassDefFoundError",
+      "java/lang/NoSuchMethodError",
+      "java/lang/UnsupportedOperationException",
+    ]),
+
+    "invoke(Ljava/lang/String;)V": withThrows(async (jvm, handle, args) => {
       // MethodHandle.invoke(String) for void static methods
       const arg = args[0];
 
@@ -197,7 +308,10 @@ module.exports = {
               `Class not found in jvm.classes: ${handle.targetClass}`,
             );
             console.log(`Available classes:`, Object.keys(jvm.classes));
-            throw new Error(`Class not found: ${handle.targetClass}`);
+            throw {
+              type: 'java/lang/NoClassDefFoundError',
+              message: `Class not found: ${handle.targetClass}`,
+            };
           }
           if (jvm.verbose) {
             console.log(
@@ -217,9 +331,10 @@ module.exports = {
             handle.targetDescriptor,
           );
           if (!method) {
-            throw new Error(
-              `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
-            );
+            throw {
+              type: 'java/lang/NoSuchMethodError',
+              message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+            };
           }
 
           // Create a new frame for the method and push it to the call stack
@@ -235,16 +350,23 @@ module.exports = {
           return ASYNC_METHOD_SENTINEL; // Signal that execution should continue
         }
 
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+        throw {
+          type: 'java/lang/UnsupportedOperationException',
+          message: `Unsupported MethodHandle kind: ${handle.kind}`,
+        };
       } catch (error) {
         if (jvm.verbose) {
           console.error("MethodHandle.invoke(String) error:", error);
         }
         throw error;
       }
-    },
+    }, [
+      'java/lang/NoClassDefFoundError',
+      'java/lang/NoSuchMethodError',
+      'java/lang/UnsupportedOperationException',
+    ]),
 
-    "invoke(Ljava/lang/Object;I)Ljava/lang/String;": async (
+    "invoke(Ljava/lang/Object;I)Ljava/lang/String;": withThrows(async (
       jvm,
       handle,
       args,
@@ -276,7 +398,10 @@ module.exports = {
           // If not in JRE, look in loaded classes
           const classData = jvm.classes[handle.targetClass];
           if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
+            throw {
+              type: 'java/lang/NoClassDefFoundError',
+              message: `Class not found: ${handle.targetClass}`,
+            };
           }
 
           const method = jvm.findMethod(
@@ -285,9 +410,10 @@ module.exports = {
             handle.targetDescriptor,
           );
           if (!method) {
-            throw new Error(
-              `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
-            );
+            throw {
+              type: 'java/lang/NoSuchMethodError',
+              message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+            };
           }
 
           // Create a new frame for the method and push it to the call stack
@@ -302,16 +428,23 @@ module.exports = {
           return ASYNC_METHOD_SENTINEL; // Signal that execution should continue
         }
 
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+        throw {
+          type: 'java/lang/UnsupportedOperationException',
+          message: `Unsupported MethodHandle kind: ${handle.kind}`,
+        };
       } catch (error) {
         if (jvm.verbose) {
           console.error("MethodHandle.invoke(Object, int) error:", error);
         }
         throw error;
       }
-    },
+    }, [
+      'java/lang/NoClassDefFoundError',
+      'java/lang/NoSuchMethodError',
+      'java/lang/UnsupportedOperationException',
+    ]),
 
-    "invoke(Ljava/lang/Object;I)V": async (jvm, handle, args) => {
+    "invoke(Ljava/lang/Object;I)V": withThrows(async (jvm, handle, args) => {
       // MethodHandle.invoke(Object, int) for field setters (void return)
       const receiver = args[0];
       const value = args[1];
@@ -331,16 +464,19 @@ module.exports = {
           return null; // void return
         }
 
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+        throw {
+          type: 'java/lang/UnsupportedOperationException',
+          message: `Unsupported MethodHandle kind: ${handle.kind}`,
+        };
       } catch (error) {
         if (jvm.verbose) {
           console.error("MethodHandle.invoke(Object, int) void error:", error);
         }
         throw error;
       }
-    },
+    }, ['java/lang/UnsupportedOperationException']),
 
-    "invoke(Ljava/lang/Object;)I": async (jvm, handle, args) => {
+    "invoke(Ljava/lang/Object;)I": withThrows(async (jvm, handle, args) => {
       // MethodHandle.invoke(Object) for field getters returning int
       const receiver = args[0];
 
@@ -357,16 +493,19 @@ module.exports = {
           return receiver.fields[handle.targetFieldName];
         }
 
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+        throw {
+          type: 'java/lang/UnsupportedOperationException',
+          message: `Unsupported MethodHandle kind: ${handle.kind}`,
+        };
       } catch (error) {
         if (jvm.verbose) {
           console.error("MethodHandle.invoke(Object) int error:", error);
         }
         throw error;
       }
-    },
+    }, ['java/lang/UnsupportedOperationException']),
 
-    "invoke([Ljava/lang/Object;)Ljava/lang/Object;": async (
+    "invoke([Ljava/lang/Object;)Ljava/lang/Object;": withThrows(async (
       jvm,
       handle,
       args,
@@ -402,7 +541,10 @@ module.exports = {
           // If not in JRE, look in loaded classes
           const classData = jvm.classes[handle.targetClass];
           if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
+            throw {
+              type: 'java/lang/NoClassDefFoundError',
+              message: `Class not found: ${handle.targetClass}`,
+            };
           }
 
           const method = jvm.findMethod(
@@ -411,9 +553,10 @@ module.exports = {
             handle.targetDescriptor,
           );
           if (!method) {
-            throw new Error(
-              `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
-            );
+            throw {
+              type: 'java/lang/NoSuchMethodError',
+              message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+            };
           }
 
           // Create a new frame for the method and push it to the call stack
@@ -444,7 +587,10 @@ module.exports = {
           // If not in JRE, look in loaded classes
           const classData = jvm.classes[handle.targetClass];
           if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
+            throw {
+              type: 'java/lang/NoClassDefFoundError',
+              message: `Class not found: ${handle.targetClass}`,
+            };
           }
 
           const method = jvm.findMethod(
@@ -453,9 +599,10 @@ module.exports = {
             handle.targetDescriptor,
           );
           if (!method) {
-            throw new Error(
-              `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
-            );
+            throw {
+              type: 'java/lang/NoSuchMethodError',
+              message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+            };
           }
 
           // Create a new frame for the method and push it to the call stack
@@ -488,9 +635,10 @@ module.exports = {
             return receiver.fields[handle.targetFieldName];
           }
 
-          throw new Error(
-            `Field not found: ${handle.targetClass}.${handle.targetFieldName}`,
-          );
+          throw {
+            type: 'java/lang/NoSuchFieldError',
+            message: `Field not found: ${handle.targetClass}.${handle.targetFieldName}`,
+          };
         } else if (handle.kind === "putField") {
           // Field setter - first argument is the receiver object, second is the value
           const receiver = methodArgs[0];
@@ -514,15 +662,23 @@ module.exports = {
           return null; // void return
         }
 
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+        throw {
+          type: 'java/lang/UnsupportedOperationException',
+          message: `Unsupported MethodHandle kind: ${handle.kind}`,
+        };
       } catch (error) {
         if (jvm.verbose) {
           console.error("MethodHandle.invoke error:", error);
         }
         throw error;
       }
-    },
-    "invoke(Ljava/lang/String;II)Ljava/lang/String;": async (
+    }, [
+      'java/lang/NoClassDefFoundError',
+      'java/lang/NoSuchMethodError',
+      'java/lang/NoSuchFieldError',
+      'java/lang/UnsupportedOperationException',
+    ]),
+    "invoke(Ljava/lang/String;II)Ljava/lang/String;": withThrows(async (
       jvm,
       handle,
       args,
@@ -554,7 +710,10 @@ module.exports = {
           // If not in JRE, look in loaded classes
           const classData = jvm.classes[handle.targetClass];
           if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
+            throw {
+              type: 'java/lang/NoClassDefFoundError',
+              message: `Class not found: ${handle.targetClass}`,
+            };
           }
 
           const method = jvm.findMethod(
@@ -563,9 +722,10 @@ module.exports = {
             handle.targetDescriptor,
           );
           if (!method) {
-            throw new Error(
-              `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
-            );
+            throw {
+              type: 'java/lang/NoSuchMethodError',
+              message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+            };
           }
 
           // Create a new frame for the method and push it to the call stack
@@ -593,7 +753,10 @@ module.exports = {
           // If not in JRE, look in loaded classes
           const classData = jvm.classes[handle.targetClass];
           if (!classData) {
-            throw new Error(`Class not found: ${handle.targetClass}`);
+            throw {
+              type: 'java/lang/NoClassDefFoundError',
+              message: `Class not found: ${handle.targetClass}`,
+            };
           }
 
           const method = jvm.findMethod(
@@ -602,9 +765,10 @@ module.exports = {
             handle.targetDescriptor,
           );
           if (!method) {
-            throw new Error(
-              `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
-            );
+            throw {
+              type: 'java/lang/NoSuchMethodError',
+              message: `Method not found: ${handle.targetClass}.${handle.targetMethodName}${handle.targetDescriptor}`,
+            };
           }
 
           // Call the method using JVM's method invocation
@@ -620,13 +784,20 @@ module.exports = {
           return null; // void return
         }
 
-        throw new Error(`Unsupported MethodHandle kind: ${handle.kind}`);
+        throw {
+          type: 'java/lang/UnsupportedOperationException',
+          message: `Unsupported MethodHandle kind: ${handle.kind}`,
+        };
       } catch (error) {
         if (jvm.verbose) {
           console.error("MethodHandle.invoke error:", error);
         }
         throw error;
       }
-    },
+    }, [
+      'java/lang/NoClassDefFoundError',
+      'java/lang/NoSuchMethodError',
+      'java/lang/UnsupportedOperationException',
+    ]),
   },
 };

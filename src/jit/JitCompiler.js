@@ -1,0 +1,6188 @@
+const Frame = require("../core/frame");
+const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
+const { parseDescriptor } = require("../parsing/typeParser");
+const {
+  resolveInstanceFieldKey, allocPrimitiveArray, allocReferenceArray,
+} = require("../instructions/object");
+const WasmJit = require("./WasmJit");
+const FusedRegionCompiler = require("./FusedRegionCompiler");
+const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
+const HandwrittenPolygonRaster = require("./HandwrittenPolygonRaster");
+const HandwrittenTiledBlit = require("./HandwrittenTiledBlit");
+const HandwrittenPerspectiveSpan = require("./HandwrittenPerspectiveSpan");
+const monoArray = require("./monoArray");
+const {
+  normalizeArrayLoad,
+  normalizeArrayStore,
+} = require("../instructions/utils");
+const { buildSsa } = require("../analysis/opgraph/ssa");
+const { kindWidth } = require("../analysis/opgraph/ssaTypes");
+const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
+
+const RETURN_VOID = Symbol("jit.return.void");
+const STATIC_DEOPT = Symbol("jit.static.deopt");
+const ASYNC_INVOKE = Symbol("jit.invoke.async");
+const NO_MEMO_KEY = Symbol("jit.memo.no-key");
+const HANDLED_RESULT = Object.freeze({ handled: true });
+const UNHANDLED_RESULT = Object.freeze({ handled: false });
+const WASM_EXITED_RESULT = Object.freeze({ handled: false, wasmExited: true });
+
+// Widened opcode eligibility (long arithmetic/locals/arrays, instanceof,
+// dup_x1, i2s/i2c). These originally regressed when enabled in isolation, but
+// after broad synchronous child admission the same production-bundle
+// wall-time probe improved from 319 to 333 presented frames at 45 seconds.
+// Keep the capability structural: no guest class or method identity participates.
+const EXTENDED_TIER_OPCODES_ENABLED = true;
+const EXTENDED_TIER_OPCODES = EXTENDED_TIER_OPCODES_ENABLED ? [
+  "i2c", "i2s", "dup_x1", "instanceof",
+  "ladd", "land", "laload", "lastore", "lconst_0", "lconst_1",
+  "lload", "lload_0", "lload_1", "lload_2", "lload_3", "lneg", "lor", "lrem", "lshl",
+  "lstore", "lstore_0", "lstore_1", "lstore_2", "lstore_3", "lsub", "lushr",
+] : [];
+
+class JitCompiler {
+  constructor(jvm, options = {}) {
+    this.jvm = jvm;
+    this.enabled = options.enabled !== false &&
+      !(typeof process !== "undefined" && process.env && process.env.JVM_DISABLE_JIT === "1");
+    this.safePoints = options.safePoints || "bytecode";
+    this.supportCache = new WeakMap();
+    this.labelCache = new WeakMap();
+    this.runningFrames = new WeakSet();
+    this.deoptedMethods = new WeakSet();
+    this.invocationCounts = new WeakMap();
+    this.backwardBranchCache = new WeakMap();
+    this.warmupThreshold = options.warmupThreshold ?? 2;
+    this.codegenEnabled = options.codegen !== false;
+    this.codegenCache = new WeakMap();
+    this.codegenSupportCache = new WeakMap();
+    this.adaptiveCodegenSupportCache = new WeakMap();
+    this.adaptiveCodegenMethods = new WeakSet();
+    this.adaptiveCodegenCounts = new WeakMap();
+    this.adaptiveCodegenFrameHeat = new WeakMap();
+    const envHotLoopConstructors =
+      typeof process !== "undefined" && process.env
+        ? process.env.JVM_HOT_LOOP_CONSTRUCTORS
+        : undefined;
+    // Most constructors are short and gain nothing from whole-method
+    // compilation.  A constructor that contains a real loop can be a large
+    // data-expansion kernel, though.  Admit only the verifier-simple shape
+    // proven by isJitSafeConstructor, plus the exact forwarding constructors
+    // needed to reach its superclass body; <clinit> remains scheduler-managed.
+    this.hotLoopConstructorsEnabled =
+      options.hotLoopConstructors ??
+      (envHotLoopConstructors === "0" ? false : true);
+    this.normalizedCodeItemsCache = new WeakMap();
+    this.codegenUnavailable = false;
+    this.codegenCompileErrors = new WeakMap();
+    this.syncCallSites = [];
+    this.nextSyncCallSiteId = 1;
+    this.fieldSites = [];
+    this.nextFieldSiteId = 1;
+    // Loaded class hierarchies are immutable. Cache definitive synchronous
+    // assignability results by source/target identity, while deliberately not
+    // caching "unknown" so later class loading can resolve it.
+    this.syncAssignabilityCache = new Map();
+    // Generated bodies may bind a verified static-field container once and
+    // keep reading its current value directly. These are heap locations, not
+    // constant values. loadState replaces the JIT after replacing static maps,
+    // so a binding cannot outlive the canonical container it references.
+    this.directStaticTargets = [];
+    this.initializedStaticReadTargets = new Map();
+    this.initializedStaticWriteTargets = new Map();
+    // JRE methods may publish a final-receiver positional intrinsic. Generated
+    // callers bind that function once instead of repeating native lookup,
+    // argument slicing, and generic call dispatch.
+    this.directJreIntrinsics = [];
+    this.directSynchronousIntrinsics = [];
+    this.polygonRasterIntrinsicCache = new WeakMap();
+    this.polygonRasterRunCount = 0;
+    this.polygonRasterGuardedFallbackCount = 0;
+    this.polygonRasterFallbackEntry = 0;
+    this.polygonRasterFallbackVertices = 0;
+    this.polygonRasterFallbackCoordinate = 0;
+    this.polygonRasterFallbackDegenerate = 0;
+    this.polygonRasterFallbackSurface = 0;
+    this.polygonRasterFallbackScratch = 0;
+    this.tiledBlitRunCount = 0;
+    this.tiledBlitGuardedFallbackCount = 0;
+    this.tiledBlitFallbackEntry = 0;
+    this.tiledBlitFallbackTag = 0;
+    this.tiledBlitFallbackArrays = 0;
+    this.tiledBlitFallbackLayout = 0;
+    this.tiledBlitFallbackBounds = 0;
+    this.perspectiveSpanIntrinsicCache = new WeakMap();
+    this.perspectiveSpanRunCount = 0;
+    this.perspectiveSpanGuardedFallbackCount = 0;
+    this.semanticBilinearSamplerRunCount = 0;
+    this.semanticBilinearSamplerFallbackCount = 0;
+    this.positionalGeneratedCallsEnabled =
+      options.positionalGeneratedCalls !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_POSITIONAL_GENERATED_CALLS === "1");
+    this.adaptiveFramelessPositionalEnabled =
+      options.adaptiveFramelessPositional !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_ADAPTIVE_FRAMELESS_POSITIONAL === "1");
+    this.adaptiveFramelessBudgetMultiplier = Math.max(1, Math.min(100,
+      Number(options.adaptiveFramelessBudgetMultiplier ??
+        (typeof process !== "undefined" && process.env &&
+          process.env.JVM_ADAPTIVE_FRAMELESS_BUDGET_MULTIPLIER) ?? 8) || 8));
+    this.inlineIntegerRegionCache = new WeakMap();
+    this.inlineIntegerPlanCache = new WeakMap();
+    this.memoizedIntegralLeafCache = new WeakMap();
+    this.memoizedIntegralLeavesEnabled =
+      options.memoizedIntegralLeaves === true &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_MEMOIZED_INTEGRAL_LEAVES === "1");
+    this.memoizedIntegralLeafHitCount = 0;
+    this.memoizedIntegralLeafMissCount = 0;
+    const envAdaptiveConstructorCallers =
+      typeof process !== "undefined" && process.env
+        ? process.env.JVM_ADAPTIVE_CONSTRUCTOR_CALLERS
+        : undefined;
+    // This tier admits only verifier-supported effectful callers after entry
+    // or elapsed-time heat. It was originally browser-only, but isolated Node
+    // measurements showed that the same policy removes long scheduler-bound
+    // object/audio loops without making constructors themselves eligible.
+    this.adaptiveConstructorCallersEnabled =
+      options.adaptiveConstructorCallers ??
+      (envAdaptiveConstructorCallers === "1" ? true
+        : envAdaptiveConstructorCallers === "0" ? false : true);
+    this.adaptiveCodegenThreshold = Math.max(2,
+      Number(options.adaptiveCodegenThreshold) || 64);
+    this.adaptiveCodegenTimeThresholdMs = Math.max(0,
+      Number(options.adaptiveCodegenTimeThresholdMs ?? 8) || 0);
+    this.adaptiveCodegenTimeSampleInterval = Math.max(1,
+      Number(options.adaptiveCodegenTimeSampleInterval) || 64);
+    const configuredWholeMethodEscalation =
+      options.adaptiveWholeMethodEscalationThreshold ??
+      (typeof process !== "undefined" && process.env
+        ? process.env.JVM_ADAPTIVE_WHOLE_METHOD_ESCALATION_THRESHOLD
+        : undefined);
+    this.adaptiveWholeMethodEscalationThreshold =
+      configuredWholeMethodEscalation === undefined
+        ? 16
+        : Math.max(0, Number(configuredWholeMethodEscalation) || 0);
+    this.adaptiveWholeMethodPromotionCount = 0;
+    this.adaptiveWholeMethodEscalationCount = 0;
+    this.adaptiveEntryPromotionCount = 0;
+    this.adaptiveTimePromotionCount = 0;
+    this.adaptiveTimeSampleCount = 0;
+    const envProfileMethods = Boolean(typeof process !== "undefined" && process.env &&
+      (process.env.JVM_DEBUG_JIT === "1" ||
+        process.env.JVM_PROFILE_JIT_METHODS === "1"));
+    // Invocation accounting mutates several Maps on every generated entry and
+    // inlined call. Keep production execution free of that cost; diagnostics
+    // can opt in explicitly (the browser profiler also toggles this field at
+    // runtime).
+    this.profileMethods = options.profileMethods ?? envProfileMethods;
+    this.profileTimings = options.profileTimings === true;
+    this.methodTimingSampleRate = Math.max(1, Number(options.methodTimingSampleRate) || 256);
+    this.methodTimingFilter = options.methodTimingFilter instanceof Set
+      ? options.methodTimingFilter : null;
+    this.methodTimingRandomState = 0x6d2b79f5;
+    this.methodTimingSamples = new Map();
+    this.exclusiveTimingsEnabled = false;
+    this.exclusiveTimingRootKey = null;
+    this.exclusiveTimingStack = [];
+    this.exclusiveTimingSamples = new Map();
+    this.exclusiveTimingEdges = new Map();
+    this.methodEntryTraceKey = null;
+    this.methodEntryTrace = null;
+    const jitEnvironment = typeof process !== "undefined" && process.env
+      ? process.env : {};
+    const envPreferWholeMethodJs = jitEnvironment.JVM_PREFER_WHOLE_METHOD_JS;
+    const generatedBodyDefault =
+      jitEnvironment.JVM_WASM_JIT === "0" ||
+      typeof navigator !== "undefined" &&
+        /Firefox\//.test(navigator.userAgent || "");
+    // Keep one generated JavaScript body as the normal cross-runtime policy.
+    // When Node explicitly disables Wasm (the fast-feedback game benchmark),
+    // use the same policy as Firefox. An explicitly enabled Node Wasm tier
+    // retains priority so Wasm-only deployments and differential tests do not
+    // silently execute a different compiler.
+    this.preferWholeMethodJs = options.preferWholeMethodJs ??
+      (envPreferWholeMethodJs === "1" ? true
+        : envPreferWholeMethodJs === "0" ? false : generatedBodyDefault);
+    this.generatedRunCount = 0;
+    this.syncGeneratedRunCount = 0;
+    this.syncInlinedCallCount = 0;
+    this.syncReusedFrameCount = 0;
+    this.syncIntrinsicCallCount = 0;
+    this.intrinsicArrayCopyNoopCount = 0;
+    this.intrinsicArrayCopyWithinCount = 0;
+    this.fusedRunCount = 0;
+    this.fusedDirectRunCount = 0;
+    this.fusedGuardedFallbackCount = 0;
+    this.fusedRestoredExceptionFrameCount = 0;
+    this.scalarLoopRunCount = 0;
+    this.scalarLoopSafePointCount = 0;
+    this.scalarSsaRunCount = 0;
+    this.scalarSsaArrayViewCount = 0;
+    this.scalarSsaEliminatedReadCount = 0;
+    this.scalarSsaThreadedEdgeCount = 0;
+    this.scalarLoopMethodRunCounts = new Map();
+    this.structuredSsaMethodRunCounts = new Map();
+    this.rendererPipelineEnabled = options.rendererPipeline === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
+    this.scalarLoopsEnabled = options.scalarLoops !== false;
+    this.scalarGuestBodiesEnabled = this.rendererPipelineEnabled || options.scalarGuestBodies === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_SCALAR_GUEST_BODIES === "1");
+    this.scalarSsaOptimizationsEnabled = options.scalarSsaOptimizations === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_SCALAR_SSA === "1");
+    this.postIncrementHelpersEnabled = options.postIncrementHelpers !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_POST_INCREMENT_HELPERS === "1");
+    this.inlinedMethodRunCounts = new Map();
+    this.intrinsicMethodRunCounts = new Map();
+    this.runnerRunCount = 0;
+    this.methodRunCounts = new Map();
+    this.generatedMethodRunCounts = new Map();
+    this.runnerMethodRunCounts = new Map();
+    this.methodDeoptCounts = new Map();
+    this.methodDeoptReasons = new Map();
+    this.methodDeoptSites = new Map();
+    this.experimentalControlFlow = options.experimentalControlFlow ?? (
+      typeof process !== "undefined" && process.env
+        ? process.env.JVM_JIT_EXPERIMENTAL_CONTROL_FLOW === "1"
+        : false
+    );
+    // canRun runs on every scheduler tick; process.env reads cost ~150ns each,
+    // so latch the instrumentation flags once.
+    this._envInstrumented = Boolean(typeof process !== "undefined" && process.env &&
+      (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
+    this.wasmJit = new WasmJit(jvm, this);
+    const regionOptions = this.rendererPipelineEnabled
+      ? { ...options, fusedRegions: true, structuredSsa: true }
+      : options;
+    this.fusedRegions = new FusedRegionCompiler(this, regionOptions);
+    this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
+  }
+
+  requiresOpaqueControlInterpreter(method, codeItems) {
+    // A static boolean captured in a long-lived local and carried across call
+    // edges needs a verifier-backed spill/resume proof. Until that proof
+    // exists, reject only this structurally matched method; unrelated methods
+    // remain eligible for every JIT tier.
+    return capturesBooleanStatic(method) && normalFlowContainsInvoke(codeItems);
+  }
+
+  canRun(frame, codegenEligible = false) {
+    if (!this.enabled || !frame || !frame.method || !frame.instructions) {
+      return false;
+    }
+    if (this.runningFrames.has(frame)) {
+      return false;
+    }
+    if (frame.jitSkipOnce) {
+      delete frame.jitSkipOnce;
+      return false;
+    }
+    if (this.deoptedMethods.has(frame.method)) {
+      frame.jitJsDisabled = true;
+      return false;
+    }
+    // Tracing/profiling must observe every interpreted bytecode. Debug stepping
+    // is handled below through DebugManager; these environment modes are used
+    // by the headless runner and need the same one-instruction semantics.
+    if (this._envInstrumented) {
+      return false;
+    }
+    const debug = this.jvm.debugManager;
+    if (debug.debugMode && debug.runMode !== "continuing") {
+      return false;
+    }
+    if (debug.isClassJitDeopted(this.getFrameClassName(frame))) {
+      return false;
+    }
+    const count = (this.invocationCounts.get(frame.method) || 0) + 1;
+    this.invocationCounts.set(frame.method, count);
+    if (count < this.warmupThreshold && !this.hasBackwardBranch(frame.method)) {
+      return false;
+    }
+    const supported = codegenEligible
+      ? this.isCodegenSupported(frame.method)
+      : this.isSupported(frame.method);
+    if (!supported) frame.jitJsDisabled = true;
+    return supported;
+  }
+
+  hasBackwardBranch(method) {
+    if (this.backwardBranchCache.has(method)) return this.backwardBranchCache.get(method);
+    const codeItems = this.getCodeItems(method);
+    if (this.requiresOpaqueControlInterpreter(method, codeItems)) {
+      this.supportCache.set(method, false);
+      return false;
+    }
+    const labels = buildLabelMap(codeItems);
+    const backward = codeItems.some((item, index) => {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op || (op !== "goto" && !op.startsWith("if"))) return false;
+      const target = instruction && typeof instruction === "object" ? labels.get(instruction.arg) : undefined;
+      return target !== undefined && target <= index;
+    });
+    this.backwardBranchCache.set(method, backward);
+    return backward;
+  }
+
+  getCodeItems(method) {
+    if (this.normalizedCodeItemsCache.has(method)) {
+      return this.normalizedCodeItemsCache.get(method);
+    }
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const original = code && code.code && code.code.codeItems || [];
+    let normalized = original;
+    for (let index = 0; index < original.length; index += 1) {
+      const item = original[index];
+      const instruction = item && item.instruction;
+      if (getOp(instruction) !== "wide") continue;
+      const expanded = expandWideInstruction(instruction);
+      if (!expanded) continue;
+      if (normalized === original) normalized = original.slice();
+      normalized[index] = { ...item, instruction: expanded };
+    }
+    this.normalizedCodeItemsCache.set(method, normalized);
+    return normalized;
+  }
+
+  tryRunFrame(frame, thread) {
+    // SpiderMonkey pays a high cost for frequent Wasm -> JS -> Wasm exits.
+    // When the whole method has a generated implementation, prefer that
+    // single tier over partial Wasm. Compilation is intentionally allowed to
+    // cost more up front so animation/render loops remain in one engine tier.
+    let canRunGenerated = null;
+    let awaitingAdaptivePromotion = false;
+    const canProbeGenerated = !this.runningFrames.has(frame) &&
+      !frame.jitJsDisabled;
+    const wholeMethodPreferred =
+      this.prefersWholeMethodJs(frame.method);
+    if (wholeMethodPreferred && canProbeGenerated) {
+      let codegenEligible = this.isCodegenSupported(frame.method);
+      if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
+          this.isCodegenSupported(frame.method, true)) {
+        codegenEligible = this.observeAdaptiveCodegenHeat(frame);
+        awaitingAdaptivePromotion = !codegenEligible;
+      }
+      if (codegenEligible) canRunGenerated = this.canRun(frame, true);
+    }
+
+    if (!canRunGenerated && this.wasmJit.enabled && !this.runningFrames.has(frame)) {
+      const wasmResult = this.wasmJit.tryRunFrame(frame, thread);
+      if (wasmResult.handled) {
+        if (wasmResult.returned) return HANDLED_RESULT;
+        // A partial-Wasm exit has already materialized locals, operand stack,
+        // and the exact resume pc. Let executeTick interpret the unsupported
+        // island immediately instead of consuming an otherwise empty thread
+        // turn; the next tick can re-enter Wasm at the following eligible
+        // block. Do not probe the JS tier in between these two regions.
+        return WASM_EXITED_RESULT;
+      }
+    }
+    // In Wasm-first mode, observe JavaScript heat only after Wasm declined the
+    // current entry. This admits scheduler-heavy effectful/call-bearing bodies
+    // without stealing fully compiled numeric loops from the faster Wasm tier.
+    if (!wholeMethodPreferred && canProbeGenerated &&
+        this.adaptiveConstructorCallersEnabled &&
+        this.isCodegenSupported(frame.method, true)) {
+      const codegenEligible = this.observeAdaptiveCodegenHeat(frame);
+      awaitingAdaptivePromotion = !codegenEligible &&
+        !this.isSupported(frame.method);
+      if (codegenEligible) canRunGenerated = this.canRun(frame, true);
+    }
+    // Structural rejection and permanent deoptimization are method-stable.
+    // Remember them on the frame so interpreted bytecodes do not repeat the
+    // full JS-JIT policy check on every scheduler tick. The Wasm tier still
+    // gets its probe above because it can compile supported regions of a
+    // method that the JS tier rejects as a whole.
+    if (frame.jitJsDisabled) {
+      return UNHANDLED_RESULT;
+    }
+    // Do not permanently reject a structurally compilable constructor caller
+    // while it is accumulating method-entry heat. Its bytecodes remain on the
+    // canonical interpreter path until promotion.
+    if (awaitingAdaptivePromotion) {
+      return UNHANDLED_RESULT;
+    }
+    if ((canRunGenerated === null && !this.canRun(frame)) || canRunGenerated === false) {
+      return UNHANDLED_RESULT;
+    }
+
+    const methodKey = `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`;
+    if (this.profileMethods) {
+      this.methodRunCounts.set(methodKey, (this.methodRunCounts.get(methodKey) || 0) + 1);
+    }
+    this.runningFrames.add(frame);
+    let result;
+    try {
+      const generated = this.getGeneratedFunction(frame.method);
+      result = generated
+        ? this.runGeneratedFrame(generated, frame, thread)
+        : this.runFrame(frame, thread);
+    } catch (error) {
+      this.runningFrames.delete(frame);
+      throw error;
+    }
+    if (result && typeof result.then === "function") {
+      return result.then((resolved) => {
+        try {
+          return this.finishTryRunFrame(frame, thread, methodKey, resolved);
+        } finally {
+          this.runningFrames.delete(frame);
+        }
+      }, (error) => {
+        this.runningFrames.delete(frame);
+        throw error;
+      });
+    }
+    try {
+      return this.finishTryRunFrame(frame, thread, methodKey, result);
+    } finally {
+      this.runningFrames.delete(frame);
+    }
+  }
+
+  prefersWholeMethodJs(method) {
+    return this.preferWholeMethodJs ||
+      this.adaptiveCodegenMethods.has(method);
+  }
+
+  observeAdaptiveCodegenHeat(frame) {
+    if (frame.pc === 0 && !frame.jitAdaptiveEntryCounted) {
+      frame.jitAdaptiveEntryCounted = true;
+      const count = (this.adaptiveCodegenCounts.get(frame.method) || 0) + 1;
+      this.adaptiveCodegenCounts.set(frame.method, count);
+      if (count >= this.adaptiveCodegenThreshold) {
+        this.promoteAdaptiveCodegen(frame.method);
+        this.adaptiveEntryPromotionCount += 1;
+        this.adaptiveCodegenFrameHeat.delete(frame);
+        return true;
+      }
+    }
+
+    if (this.adaptiveCodegenTimeThresholdMs <= 0) return false;
+    let heat = this.adaptiveCodegenFrameHeat.get(frame);
+    if (!heat) {
+      heat = { startedAt: this.monotonicNow(), probes: 0 };
+      this.adaptiveCodegenFrameHeat.set(frame, heat);
+    }
+    heat.probes += 1;
+    if (heat.probes < this.adaptiveCodegenTimeSampleInterval) return false;
+    heat.probes = 0;
+    this.adaptiveTimeSampleCount += 1;
+    if (this.monotonicNow() - heat.startedAt < this.adaptiveCodegenTimeThresholdMs) {
+      return false;
+    }
+
+    this.promoteAdaptiveCodegen(frame.method);
+    this.adaptiveTimePromotionCount += 1;
+    this.adaptiveCodegenFrameHeat.delete(frame);
+    return true;
+  }
+
+  promoteAdaptiveCodegen(method) {
+    if (this.adaptiveCodegenMethods.has(method)) return;
+    this.adaptiveCodegenMethods.add(method);
+    this.codegenSupportCache.set(method, true);
+    this.adaptiveWholeMethodPromotionCount += 1;
+    if (!this.preferWholeMethodJs &&
+        this.adaptiveWholeMethodEscalationThreshold > 0 &&
+        this.adaptiveWholeMethodPromotionCount >=
+          this.adaptiveWholeMethodEscalationThreshold) {
+      this.preferWholeMethodJs = true;
+      this.adaptiveWholeMethodEscalationCount += 1;
+    }
+    // The sampled elapsed-time observation is already stronger heat evidence
+    // than the ordinary entry counter. Let this frame OSR immediately even
+    // when the method has no backward branch.
+    this.invocationCounts.set(method, this.warmupThreshold);
+  }
+
+  finishTryRunFrame(frame, thread, methodKey, result) {
+    if (result && result.deopt) {
+      if (this.profileMethods) {
+        this.lastDeoptReason = result.reason;
+        this.methodDeoptCounts.set(
+          methodKey, (this.methodDeoptCounts.get(methodKey) || 0) + 1,
+        );
+        this.methodDeoptReasons.set(methodKey, result.reason || "unspecified");
+        const siteKey = `${methodKey}@${frame.pc}:` +
+          `${result.reason || "unspecified"}`;
+        this.methodDeoptSites.set(
+          siteKey, (this.methodDeoptSites.get(siteKey) || 0) + 1,
+        );
+      }
+      if (!result.transient) {
+        this.deoptedMethods.add(frame.method);
+        frame.jitJsDisabled = true;
+      }
+      return HANDLED_RESULT;
+    }
+    if (result && result.returned && result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
+      thread.callStack.peek().stack.push(result.value);
+    }
+    return HANDLED_RESULT;
+  }
+
+  dumpStats(limit = 10) {
+    const rows = [...this.methodRunCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(0, limit));
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
+    for (const [method, count] of rows) {
+      const deopts = this.methodDeoptCounts.get(method) || 0;
+      console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
+    }
+    this.dumpExecutionCounts("generated callees", this.generatedMethodRunCounts, limit);
+    this.dumpExecutionCounts("inlined callees", this.inlinedMethodRunCounts, limit);
+    this.dumpExecutionCounts("intrinsic callees", this.intrinsicMethodRunCounts, limit);
+    this.dumpExecutionCounts("runner callees", this.runnerMethodRunCounts, limit);
+    const deopts = [...this.methodDeoptCounts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(0, limit));
+    if (deopts.length) console.error("JIT deoptimizations:");
+    for (const [method, count] of deopts) {
+      console.error(`  ${count.toLocaleString()} deopt ${method}: ${this.methodDeoptReasons.get(method)}`);
+    }
+    if (this.lastDeoptReason) console.error(`  last deopt: ${this.lastDeoptReason}`);
+    if (this.wasmJit.enabled) this.wasmJit.dumpStats();
+  }
+
+  getGeneratedFunction(method) {
+    if (!this.codegenEnabled || this.codegenUnavailable || !this.isCodegenSupported(method)) {
+      return null;
+    }
+    if (this.codegenCache.has(method)) {
+      return this.codegenCache.get(method);
+    }
+    try {
+      const generated = this.compileMethod(method);
+      this.codegenCache.set(method, generated);
+      return generated;
+    } catch (err) {
+      this.codegenCompileErrors.set(method, err);
+      return null;
+    }
+  }
+
+  runGeneratedFrame(generated, frame, thread, initialBytecodeChecks) {
+    if (this.profileMethods) {
+      this.generatedRunCount += 1;
+      if (generated.jvmSynchronous) this.syncGeneratedRunCount += 1;
+      this.recordExecution(this.generatedMethodRunCounts, frame);
+      if (generated.jvmScalarLoop) this.recordExecution(this.scalarLoopMethodRunCounts, frame);
+      if (generated.jvmStructuredSsa) this.recordExecution(this.structuredSsaMethodRunCounts, frame);
+    }
+    // Method identity formatting allocates a comparatively large string and
+    // used to run on every generated child entry even in production. Build it
+    // only for diagnostics that consume it; hot nested calls otherwise need
+    // no owner/name/descriptor lookup at all.
+    const needsMethodKey = Boolean(this.methodEntryTraceKey) ||
+      this.profileTimings || this.exclusiveTimingsEnabled;
+    const frameMethodKey = needsMethodKey
+      ? `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`
+      : null;
+    if (this.methodEntryTraceKey === frameMethodKey && !this.methodEntryTrace && frame.pc === 0) {
+      try {
+        this.methodEntryTrace = {
+          methodKey: frameMethodKey,
+          capturedAt: this.monotonicNow(),
+          state: this.jvm.saveState(),
+        };
+      } catch (error) {
+        this.methodEntryTrace = {
+          methodKey: frameMethodKey,
+          error: error?.stack || error?.message || String(error),
+        };
+      }
+    }
+    let timingKey = null;
+    let timingStarted = 0;
+    const candidateTimingKey = this.profileTimings ? frameMethodKey : null;
+    if (candidateTimingKey &&
+        (!this.methodTimingFilter || this.methodTimingFilter.has(candidateTimingKey))) {
+      // Use a deterministic pseudo-random sample rather than every Nth call:
+      // render call patterns are strongly periodic and a modulo sampler can
+      // repeatedly select (or miss) one callee. Only sampled calls pay for a
+      // clock read.
+      this.methodTimingRandomState = (Math.imul(this.methodTimingRandomState, 1664525) +
+        1013904223) >>> 0;
+      if (this.methodTimingRandomState < 0x100000000 / this.methodTimingSampleRate) {
+        timingKey = candidateTimingKey;
+        timingStarted = this.monotonicNow();
+      }
+    }
+    const exclusiveTiming = this.exclusiveTimingsEnabled
+      ? this.beginExclusiveTiming(frameMethodKey,
+        generated.jvmStructuredSsa ? "structured"
+          : generated.jvmScalarLoop ? "scalar"
+            : generated.jvmSynchronous ? "generated-sync" : "generated-async")
+      : null;
+    if (!timingKey && !exclusiveTiming) {
+      return generated(frame, thread, this, initialBytecodeChecks);
+    }
+    let result;
+    try {
+      result = generated(frame, thread, this, initialBytecodeChecks);
+    } catch (error) {
+      this.endExclusiveTiming(exclusiveTiming);
+      throw error;
+    }
+    if (result && typeof result.then === "function") {
+      return result.then((value) => {
+        if (timingKey) this.recordMethodTiming(timingKey,
+          this.monotonicNow() - timingStarted, generated);
+        this.endExclusiveTiming(exclusiveTiming);
+        return value;
+      }, (error) => {
+        if (timingKey) this.recordMethodTiming(timingKey,
+          this.monotonicNow() - timingStarted, generated);
+        this.endExclusiveTiming(exclusiveTiming);
+        throw error;
+      });
+    }
+    if (timingKey) this.recordMethodTiming(timingKey,
+      this.monotonicNow() - timingStarted, generated);
+    this.endExclusiveTiming(exclusiveTiming);
+    return result;
+  }
+
+  beginExclusiveTiming(methodKey, tier) {
+    if (!this.exclusiveTimingsEnabled) return null;
+    const stack = this.exclusiveTimingStack;
+    if (!stack.length && this.exclusiveTimingRootKey &&
+        methodKey !== this.exclusiveTimingRootKey) return null;
+    const now = this.monotonicNow();
+    const parent = stack[stack.length - 1];
+    if (parent) parent.exclusiveMs += now - parent.resumedAt;
+    const context = {
+      methodKey, tier, startedAt: now, resumedAt: now, exclusiveMs: 0,
+    };
+    stack.push(context);
+    return context;
+  }
+
+  endExclusiveTiming(context) {
+    if (!context) return;
+    const now = this.monotonicNow();
+    const stack = this.exclusiveTimingStack;
+    if (stack[stack.length - 1] !== context) {
+      // A profiler must never affect guest execution. Drop inconsistent state
+      // rather than throwing through the JVM if an unexpected async re-entry
+      // violates the single-threaded nesting assumption.
+      stack.length = 0;
+      return;
+    }
+    context.exclusiveMs += now - context.resumedAt;
+    stack.pop();
+    const previous = this.exclusiveTimingSamples.get(context.methodKey) || {
+      tier: context.tier, samples: 0, totalMs: 0, inclusiveMs: 0, maxMs: 0,
+    };
+    previous.samples += 1;
+    previous.totalMs += context.exclusiveMs;
+    previous.inclusiveMs += now - context.startedAt;
+    previous.maxMs = Math.max(previous.maxMs, context.exclusiveMs);
+    previous.tier = context.tier;
+    this.exclusiveTimingSamples.set(context.methodKey, previous);
+    const parent = stack[stack.length - 1];
+    if (parent) {
+      const edgeKey = `${parent.methodKey}\0${context.methodKey}`;
+      const edge = this.exclusiveTimingEdges.get(edgeKey) || {
+        parent: parent.methodKey, child: context.methodKey,
+        tier: context.tier, totalMs: 0, maxMs: 0,
+      };
+      const inclusiveMs = now - context.startedAt;
+      edge.totalMs += inclusiveMs;
+      edge.maxMs = Math.max(edge.maxMs, inclusiveMs);
+      edge.tier = context.tier;
+      this.exclusiveTimingEdges.set(edgeKey, edge);
+      parent.resumedAt = now;
+    }
+  }
+
+  monotonicNow() {
+    if (typeof performance !== "undefined" && performance &&
+        typeof performance.now === "function") return performance.now();
+    if (typeof process !== "undefined" && process.hrtime?.bigint) {
+      return Number(process.hrtime.bigint()) / 1e6;
+    }
+    return Date.now();
+  }
+
+  generatedSource(method, tier, source, ownerOverride = null) {
+    // A sourceURL lets Firefox's native sampling profiler identify generated
+    // guest bodies without adding a clock read or counter to their hot path.
+    // The identity is diagnostic metadata only; tier selection never reads it.
+    const owner = ownerOverride || method?.className ||
+      this.jvm.findClassNameForMethod?.(method) || "unknown";
+    const methodIdentity = `${method?.name || "unknown"}${method?.descriptor || ""}`;
+    const url = `jvm-generated://${encodeURIComponent(owner)}/` +
+      `${encodeURIComponent(methodIdentity)}?tier=${encodeURIComponent(tier)}`;
+    const functionName = `jvm$${tier}$${owner}$${methodIdentity}`
+      .replace(/[^A-Za-z0-9_$]/g, "_");
+    return { source: `${source}\n//# sourceURL=${url}`, url, functionName };
+  }
+
+  createGeneratedFunction(method, tier, parameters, source,
+    ownerOverride = null, asynchronous = false, generator = false) {
+    const labeled = this.generatedSource(method, tier, source, ownerOverride);
+    // Function constructors themselves remain anonymous in Gecko profiles.
+    // Return a named literal so stack sampling exposes the guest identity.
+    const prefix = generator ? "function* " : asynchronous ? "async function " : "function ";
+    const factory = new Function(`"use strict"; return ${prefix}` +
+      `${labeled.functionName}(${parameters.join(",")}) {\n` +
+      `${labeled.source}\n}`);
+    const generated = factory();
+    generated.jvmSourceUrl = labeled.url;
+    return generated;
+  }
+
+  recordMethodTiming(methodKey, elapsedMs, generated) {
+    const previous = this.methodTimingSamples.get(methodKey) || {
+      samples: 0, totalMs: 0, maxMs: 0,
+      tier: generated.jvmStructuredSsa ? "structured"
+        : generated.jvmScalarLoop ? "scalar"
+          : generated.jvmSynchronous ? "generated-sync" : "generated-async",
+    };
+    previous.samples += 1;
+    previous.totalMs += elapsedMs;
+    previous.maxMs = Math.max(previous.maxMs, elapsedMs);
+    this.methodTimingSamples.set(methodKey, previous);
+  }
+
+  recordExecution(counts, frame) {
+    if (!this.profileMethods) return;
+    const method = frame && frame.method;
+    if (!method) return;
+    const methodKey = `${this.getFrameClassName(frame)}.${method.name}${method.descriptor}`;
+    counts.set(methodKey, (counts.get(methodKey) || 0) + 1);
+  }
+
+  dumpExecutionCounts(label, counts, limit) {
+    const rows = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(0, limit));
+    if (!rows.length) return;
+    console.error(`JIT ${label}:`);
+    for (const [method, count] of rows) {
+      console.error(`  ${count.toLocaleString()} runs ${method}`);
+    }
+  }
+
+  isSupported(method) {
+    if (this.supportCache.has(method)) {
+      return this.supportCache.get(method);
+    }
+
+    if (method.name === "<init>" || method.name === "<clinit>") {
+      this.supportCache.set(method, false);
+      return false;
+    }
+
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code) {
+      this.supportCache.set(method, false);
+      return false;
+    }
+
+    const codeItems = this.getCodeItems(method);
+    if (this.requiresOpaqueControlInterpreter(method, codeItems)) {
+      this.supportCache.set(method, false);
+      return false;
+    }
+    if (!this.experimentalControlFlow && normalFlowContains(codeItems, (instruction, op) =>
+      op === "invokespecial" && instruction &&
+      Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+      instruction.arg[2][0] === "<init>")) {
+      this.supportCache.set(method, false);
+      return false;
+    }
+    if (hasExperimentalControlFlow(codeItems) && !this.experimentalControlFlow &&
+      !this.hasJitSafeControlFlow(method, codeItems)) {
+      this.supportCache.set(method, false);
+      return false;
+    }
+    if (hasMonitorBytecode(codeItems) && !this.hasJitSafeMonitorBody(codeItems)) {
+      this.supportCache.set(method, false);
+      return false;
+    }
+    const doubleOps = new Set([
+      "d2i", "dadd", "daload", "dastore", "dcmpg", "dcmpl",
+      "dconst_0", "dconst_1", "ddiv", "dload", "dload_0", "dload_1",
+      "dload_2", "dload_3", "dmul", "dneg", "dreturn", "dstore",
+      "dstore_0", "dstore_1", "dstore_2", "dstore_3", "dsub",
+    ]);
+    const floatOps = new Set([
+      "d2f", "f2d", "f2i", "fadd", "faload", "fastore", "fcmpg", "fcmpl",
+      "fconst_0", "fconst_1", "fconst_2", "fdiv", "fload", "fload_0",
+      "fload_1", "fload_2", "fload_3", "fmul", "fneg", "frem", "freturn",
+      "fstore", "fstore_0", "fstore_1", "fstore_2", "fstore_3", "fsub", "i2f",
+    ]);
+    const integerOps = new Set([
+      "i2b", "iadd", "iand", "idiv", "imul", "ineg", "ior", "irem",
+      "ishl", "ishr", "isub", "ixor",
+    ]);
+    const longOps = new Set(["i2l", "l2i", "lcmp", "ldiv", "lmul", "lshr", "lxor"]);
+    const hasNumericHotPath = codeItems.some((item) => {
+      const op = typeof item.instruction === "string" ? item.instruction : item.instruction && item.instruction.op;
+      return op && (doubleOps.has(op) || floatOps.has(op) || integerOps.has(op) || longOps.has(op) || op === "i2d" ||
+        op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float" || item.instruction.arg === "int"));
+    });
+    const eligibleShape = hasNumericHotPath || this.hasBackwardBranch(method) ||
+      this.hasCallDenseComputeShape(method, codeItems);
+    const hasPostIncrementShuffle = codeItems.some((item) =>
+      getOp(item && item.instruction) === "dup_x1");
+    const supportedPostIncrementShape = !hasPostIncrementShuffle ||
+      this.postIncrementHelpersEnabled;
+
+    const allowed = new Set([
+      "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
+      "areturn", "astore", "astore_0", "astore_1", "astore_2", "astore_3", "athrow",
+      "aaload", "aastore", "anewarray", "arraylength", "bastore", "baload", "caload", "castore", "checkcast",
+      "bipush", "d2i", "dadd", "daload", "dastore", "dcmpg", "dcmpl",
+      "dconst_0", "dconst_1", "ddiv", "dload", "dload_0", "dload_1",
+      "dload_2", "dload_3", "dmul", "dneg", "dreturn", "dstore",
+      "dstore_0", "dstore_1", "dstore_2", "dstore_3", "dsub", "dup", "dup2",
+      "d2f", "f2d", "f2i", "fadd", "faload", "fastore", "fcmpg", "fcmpl",
+      "fconst_0", "fconst_1", "fconst_2", "fdiv", "fload", "fload_0",
+      "fload_1", "fload_2", "fload_3", "fmul", "fneg", "frem", "freturn",
+      "fstore", "fstore_0", "fstore_1", "fstore_2", "fstore_3", "fsub", "i2f",
+      "getfield", "getstatic", "goto", "i2b", "i2d", "i2l", "iadd", "iaload", "iand", "iastore", "idiv",
+      "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3", "iconst_4", "iconst_5",
+      "if_acmpeq", "if_acmpne", "ifeq", "ifge", "ifgt", "ificmpge",
+      "if_icmpeq", "if_icmpge", "if_icmpgt", "if_icmple", "if_icmplt", "if_icmpne",
+      "ifle", "iflt", "ifne", "ifnonnull", "ifnull", "iload", "iload_0",
+      "iload_1", "iload_2", "iload_3", "imul", "inc", "iinc",
+      "invokeinterface", "invokespecial", "invokestatic", "invokevirtual", "istore", "istore_0",
+      "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor",
+      ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
+      ...EXTENDED_TIER_OPCODES,
+      "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return", "saload", "sastore",
+      "sipush"
+    ]);
+
+    const supported = eligibleShape && supportedPostIncrementShape && codeItems.every((item) => {
+        if (!item.instruction) return true;
+        const op = typeof item.instruction === "string" ? item.instruction : item.instruction.op;
+        return allowed.has(op);
+      });
+
+    this.supportCache.set(method, supported);
+    return supported;
+  }
+
+  isCodegenSupported(method, allowEffectfulCalls = false) {
+    if (!allowEffectfulCalls && this.adaptiveCodegenMethods.has(method)) {
+      return true;
+    }
+    const supportCache = allowEffectfulCalls
+      ? this.adaptiveCodegenSupportCache : this.codegenSupportCache;
+    if (supportCache.has(method)) {
+      return supportCache.get(method);
+    }
+
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code) {
+      supportCache.set(method, false);
+      return false;
+    }
+
+    const codeItems = this.getCodeItems(method);
+    const safeConstructor = this.hotLoopConstructorsEnabled &&
+      this.isJitSafeConstructor(method, codeItems);
+    if ((method.name === "<init>" && !safeConstructor) ||
+        method.name === "<clinit>" ||
+        allowEffectfulCalls && method.name === "run" ||
+        !safeConstructor && !allowEffectfulCalls &&
+        !this.experimentalControlFlow &&
+        normalFlowContains(codeItems, (instruction, op) =>
+          op === "invokespecial" && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][0] === "<init>")) {
+      supportCache.set(method, false);
+      return false;
+    }
+    if (!allowEffectfulCalls && hasExperimentalControlFlow(codeItems) &&
+      !this.experimentalControlFlow &&
+      !this.hasJitSafeControlFlow(method, codeItems)) {
+      supportCache.set(method, false);
+      return false;
+    }
+    if (hasMonitorBytecode(codeItems) &&
+        (allowEffectfulCalls || !this.hasJitSafeMonitorBody(codeItems))) {
+      supportCache.set(method, false);
+      return false;
+    }
+    const supportedOps = new Set([
+      "aconst_null", "aload", "aload_0", "aload_1", "aload_2", "aload_3",
+      "areturn", "astore", "astore_0", "astore_1", "astore_2", "astore_3", "athrow",
+      "aaload", "aastore", "anewarray", "arraylength", "bastore", "baload", "caload", "castore", "checkcast",
+      "bipush", "d2i", "dadd", "daload", "dastore", "dcmpg", "dcmpl",
+      "dconst_0", "dconst_1", "ddiv", "dload", "dload_0", "dload_1",
+      "dload_2", "dload_3", "dmul", "dneg", "dreturn", "dstore",
+      "dstore_0", "dstore_1", "dstore_2", "dstore_3", "dsub", "dup", "dup_x2", "dup2",
+      "d2f", "f2d", "f2i", "fadd", "faload", "fastore", "fcmpg", "fcmpl",
+      "fconst_0", "fconst_1", "fconst_2", "fdiv", "fload", "fload_0",
+      "fload_1", "fload_2", "fload_3", "fmul", "fneg", "frem", "freturn",
+      "fstore", "fstore_0", "fstore_1", "fstore_2", "fstore_3", "fsub", "i2f",
+      "getfield", "getstatic", "goto", "i2b", "i2d", "iadd", "iaload", "iastore", "idiv",
+      "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3", "iconst_4", "iconst_5",
+      "if_acmpeq", "if_acmpne", "ifeq", "ifge", "ifgt", "if_icmpeq", "if_icmpge", "if_icmpgt",
+      "if_icmple",
+      "if_icmplt", "if_icmpne", "ifle", "iflt", "ifne", "ifnonnull",
+      "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
+      "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
+      "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
+      "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
+      ...EXTENDED_TIER_OPCODES,
+      "monitorenter", "monitorexit", "saload", "sastore", "sipush",
+    ]);
+
+    const hasNumericHotPath = codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op && (
+        op.startsWith("d")
+        || op.startsWith("f")
+        || op === "i2d"
+        || op === "i2f"
+        || op === "i2l"
+        || op === "i2b"
+        || op === "iadd"
+        || op === "iand"
+        || op === "idiv"
+        || op === "imul"
+        || op === "ineg"
+        || op === "ior"
+        || op === "irem"
+        || op === "ishl"
+        || op === "ishr"
+        || op === "isub"
+        || op === "iushr"
+        || op === "ixor"
+        || op === "lcmp"
+        || op === "ldiv"
+        || op === "lmul"
+        || op === "lshr"
+        || op === "lxor"
+        || (op === "newarray" && (item.instruction.arg === "double" || item.instruction.arg === "float"))
+      );
+    });
+    const supported = (safeConstructor || hasNumericHotPath ||
+      this.hasBackwardBranch(method) ||
+      this.hasCallDenseComputeShape(method, codeItems) ||
+      this.isShortSupportedHelper(method)) &&
+      (!codeItems.some((item) => getOp(item && item.instruction) === "dup_x1") ||
+        this.postIncrementHelpersEnabled) &&
+      codeItems.every((item) => {
+      const op = getOp(item && item.instruction);
+      return !op || supportedOps.has(op);
+    });
+
+    supportCache.set(method, supported);
+    return supported;
+  }
+
+  isJitSafeConstructor(method, codeItems = this.getCodeItems(method)) {
+    if (!method || method.name !== "<init>" ||
+        (method.flags || []).includes("static") ||
+        !this.canCompileSynchronously(method)) {
+      return false;
+    }
+    const code = method.attributes.find((attribute) => attribute.type === "code");
+    if (!code || (code.code.exceptionTable || []).length !== 0) return false;
+
+    // The only constructor call may initialize this object through its direct
+    // superclass. This deliberately excludes allocation/initialization of
+    // nested objects, this(...) chains, and try/finally construction shapes.
+    // Those retain the canonical interpreter path.
+    const instructions = codeItems
+      .map((item) => item && item.instruction)
+      .filter(Boolean);
+    if (getOp(instructions[0]) !== "aload_0" ||
+        getOp(instructions[1]) !== "invokespecial") {
+      return false;
+    }
+    const initializationCalls = instructions.filter((instruction) =>
+      getOp(instruction) === "invokespecial" &&
+      Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+      instruction.arg[2][0] === "<init>");
+    if (initializationCalls.length !== 1 ||
+        initializationCalls[0] !== instructions[1]) {
+      return false;
+    }
+    const owner = this.jvm.findClassNameForMethod?.(method);
+    const ownerClass = owner && this.jvm.classes[owner]?.ast?.classes?.[0];
+    const target = instructions[1].arg;
+    if (!ownerClass?.superClassName ||
+        target[1] !== ownerClass.superClassName ||
+        target[2][1] !== "()V") {
+      return false;
+    }
+    const trivialForwarder = instructions.length === 3 &&
+      getOp(instructions[2]) === "return";
+    return trivialForwarder || this.hasBackwardBranch(method);
+  }
+
+  hasJitSafeMonitorBody(codeItems) {
+    // A compiled frame may run across many interpreter scheduler ticks. Do
+    // not keep it compiled across JVM operations that can park the current
+    // thread while a Java monitor is in scope. Ordinary synchronized blocks
+    // remain eligible; wait/join/sleep/park methods resume in the interpreter.
+    return !codeItems.some((item) => {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op || !op.startsWith("invoke") || !instruction || typeof instruction !== "object") {
+        return false;
+      }
+      const arg = instruction.arg;
+      if (!Array.isArray(arg) || !Array.isArray(arg[2])) return false;
+      const owner = arg[1];
+      const name = arg[2][0];
+      return owner === "java/lang/Object" && name === "wait"
+        || owner === "java/lang/Thread" && (name === "join" || name === "sleep" || name === "yield")
+        || owner === "java/util/concurrent/locks/LockSupport" && String(name).startsWith("park");
+    });
+  }
+
+  hasJitSafeControlFlow(method, codeItems) {
+    // A generated frame runs until it returns or deoptimizes, whereas the
+    // interpreter rotates threads between bytecodes. Restrict automatic
+    // exception/monitor compilation to leaf normal-flow regions so it cannot
+    // move a call (and its arbitrary scheduling effects) across that boundary.
+    // Invokes that exist only in an exception handler do not disqualify a
+    // compute body: the generated exception table preserves those paths.
+    if (method.name === "<init>" || method.name === "<clinit>" || method.name === "run") {
+      return false;
+    }
+    if (this.hasOnlyNoOpExceptionHandlers(method, codeItems)) {
+      return true;
+    }
+    if (hasMonitorBytecode(codeItems)) {
+      // Generated monitorenter/exit keep frame.pc and frame locals live. Calls
+      // that cannot run in a JIT tier yield as interpreted child frames, so
+      // the parent can resume after the call without abandoning its compiled
+      // numeric regions. Parking primitives remain excluded above.
+      if (!this.hasJitSafeMonitorBody(codeItems)) return false;
+      return !normalFlowContains(codeItems, (instruction, op) =>
+        op === 'invokespecial' && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][0] === '<init>');
+    }
+    return !normalFlowContainsInvoke(codeItems);
+  }
+
+  hasOnlyNoOpExceptionHandlers(method, codeItems) {
+    const codeAttr = method.attributes.find((attr) => attr.type === "code");
+    const table = codeAttr && codeAttr.code && codeAttr.code.exceptionTable || [];
+    if (!table.length) return false;
+    const labels = buildLabelMap(codeItems);
+    return table.every((entry) => {
+      const label = entry.handlerLbl || `L${entry.handler_pc}`;
+      const handler = labels.get(label);
+      return handler !== undefined && isNoOpExceptionHandler(codeItems, handler, labels);
+    });
+  }
+
+  isShortSupportedHelper(method) {
+    const codeItems = this.getCodeItems(method);
+    if (codeItems.filter((item) => item.instruction).length > 32) return false;
+    const allowed = new Set([
+      "aaload", "aastore", "aconst_null", "aload", "aload_0", "aload_1", "aload_2",
+      "aload_3", "areturn", "arraylength", "baload", "bastore", "bipush", "caload",
+      "castore", "freturn", "getfield", "getstatic", "iaload", "iastore",
+      "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3", "iconst_4",
+      "iconst_5", "iadd", "iand", "imul", "ineg", "ior", "ishl", "ishr", "isub",
+      "iushr", "ixor", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
+      "istore", "istore_0", "istore_1", "istore_2", "istore_3",
+      "goto", "if_acmpeq", "if_acmpne", "ifeq", "ifge", "ifgt",
+      "if_icmpeq", "if_icmpge", "if_icmpgt", "if_icmple", "if_icmplt",
+      "if_icmpne", "ifle", "iflt", "ifne", "ifnonnull", "ifnull",
+      "invokeinterface", "invokestatic", "invokevirtual", "ireturn", "putfield",
+      "putstatic", "return", "saload", "sastore", "sipush",
+    ]);
+    return codeItems.every((item) => !item.instruction || allowed.has(getOp(item.instruction)));
+  }
+
+  hasCallDenseComputeShape(method, codeItems) {
+    if (method.name === "<init>" || method.name === "<clinit>") return false;
+    // Small forwarding/call-chain helpers can be hot without containing a
+    // loop or arithmetic of their own. Keep this a bytecode-shape decision;
+    // supported-op and control-flow checks still run at the caller.
+    const instructions = codeItems.filter((item) => item && item.instruction);
+    if (instructions.length > 64) return false;
+    return instructions.filter((item) => {
+      const op = getOp(item.instruction);
+      return op && op.startsWith("invoke");
+    }).length >= 2;
+  }
+
+  getLabelMap(frame) {
+    if (this.labelCache.has(frame.method)) {
+      return this.labelCache.get(frame.method);
+    }
+    const labels = new Map();
+    frame.instructions.forEach((item, index) => {
+      if (item.labelDef) {
+        const label = item.labelDef.endsWith(":") ? item.labelDef.slice(0, -1) : item.labelDef;
+        labels.set(label, index);
+      }
+    });
+    this.labelCache.set(frame.method, labels);
+    return labels;
+  }
+
+  materialize(frame, locals, stack, pc) {
+    frame.locals = locals;
+    frame.stack.items = stack;
+    frame.pc = pc;
+  }
+
+  materializeCached(frame, locals, stack, sp, pc) {
+    stack.length = sp;
+    this.materialize(frame, locals, stack, pc);
+  }
+
+  getFrameClassName(frame) {
+    if (!frame) {
+      return null;
+    }
+    return frame.className || (
+      typeof this.jvm.findClassNameForMethod === "function"
+        ? this.jvm.findClassNameForMethod(frame.method)
+        : null
+    );
+  }
+
+  shouldDeopt(frame, pc) {
+    if (this.safePoints !== "bytecode") {
+      return false;
+    }
+    const debug = this.jvm.debugManager;
+    if (debug.debugMode && debug.runMode !== "continuing") {
+      return true;
+    }
+    if (debug.hasLocatedBreakpoints() && !debug.isClassJitDeopted(this.getFrameClassName(frame))) {
+      return false;
+    }
+    if (debug.breakpoints.size === 0) {
+      return false;
+    }
+    const item = frame.instructions[pc - 1];
+    if (!item || !item.labelDef) {
+      return false;
+    }
+    const numericPc = parseInt(item.labelDef.substring(1, item.labelDef.length - 1), 10);
+    return debug.breakpoints.has(numericPc);
+  }
+
+  needsBytecodeChecks() {
+    const debug = this.jvm.debugManager;
+    return Boolean(debug && (debug.debugMode || debug.breakpoints.size > 0));
+  }
+
+  // A generated region's safe-point budget is a fairness heuristic, not a JVM
+  // observable. At a budget boundary the region may keep running only while
+  // nothing can observe the difference: no debugger, no deterministic clock,
+  // no other runnable thread, no expired sleep/wait deadline, and the
+  // wall-clock event-loop yield deadline has not passed.
+  continueQuantum(thread) {
+    const jvm = this.jvm;
+    if (!jvm || !thread || thread.status !== "runnable") return false;
+    const debug = jvm.debugManager;
+    if (debug && (debug.debugMode || debug.breakpoints.size > 0)) return false;
+    if (jvm.clock && jvm.clock.enabled) return false;
+    const now = Date.now();
+    if (!(now < jvm._nextEventLoopYieldAt)) return false;
+    const threads = jvm.threads || [];
+    for (let index = 0; index < threads.length; index += 1) {
+      const other = threads[index];
+      if (other === thread) continue;
+      if (other.status === "runnable") return false;
+      if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
+          now >= Number(other.sleepUntil)) return false;
+      if (other.status === "WAITING" && other.waitDeadline !== undefined &&
+          now >= Number(other.waitDeadline)) return false;
+    }
+    return true;
+  }
+
+  // Structured scalar regions keep their state in JavaScript locals. Returning
+  // at every 10k-backedge poll solely because another Java thread is runnable
+  // would spill the region and resume through the generic bytecode dispatcher.
+  // Give those regions the ordinary wall-clock scheduler slice instead. Due
+  // timers, debugger observability, deterministic clocks, and the browser
+  // event-loop deadline still force an exact materialized safe point.
+  continueStructuredQuantum(thread) {
+    const jvm = this.jvm;
+    if (!jvm || !thread || thread.status !== "runnable") return false;
+    const debug = jvm.debugManager;
+    if (debug && (debug.debugMode || debug.breakpoints.size > 0)) return false;
+    if (jvm.clock && jvm.clock.enabled) return false;
+    const now = Date.now();
+    if (!(now < jvm._nextEventLoopYieldAt)) return false;
+    const threads = jvm.threads || [];
+    for (let index = 0; index < threads.length; index += 1) {
+      const other = threads[index];
+      if (other === thread) continue;
+      if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
+          now >= Number(other.sleepUntil)) return false;
+      if (other.status === "WAITING" && other.waitDeadline !== undefined &&
+          now >= Number(other.waitDeadline)) return false;
+    }
+    return true;
+  }
+
+  skipJitOnce(frame) {
+    frame.jitSkipOnce = true;
+  }
+
+  target(frame, label) {
+    const index = this.getLabelMap(frame).get(label);
+    if (index === undefined) {
+      throw new Error(`Label ${label} not found`);
+    }
+    return index;
+  }
+
+  compileMethod(method) {
+    const structuredSsa = this.structuredSsa.compile(method);
+    if (structuredSsa) return this.withResumeBody(structuredSsa, method);
+    const scalarLoop = this.compileScalarIntegerLoop(method);
+    if (scalarLoop) return this.withResumeBody(scalarLoop, method);
+
+    const stackless = this.compileStacklessIntegerRaster(method);
+    if (stackless) return this.withResumeBody(stackless, method);
+
+    return this.compileBaselineMethod(method);
+  }
+
+  // Fast tiers enter only at PC 0 (or block leaders). Without a resumable
+  // companion, a frame that exits mid-method (safe point, transient deopt)
+  // finishes its invocation one interpreted bytecode per scheduler tick. The
+  // baseline generated body can resume at any PC, so entry dispatches on the
+  // frame PC instead of deoptimizing.
+  withResumeBody(fast, method) {
+    let resume = null;
+    try {
+      // Structured SSA exits only at verified loop headers.  Its scalar-loop
+      // sibling accepts those exact leaders and retains scalar locals across
+      // the remaining control flow, avoiding a return to per-bytecode generic
+      // dispatch after a cooperative scheduler safe point.
+      resume = fast.jvmStructuredSsa && this.scalarLoopsEnabled
+        ? this.compileScalarIntegerLoop(method) : null;
+      if (!resume) resume = this.compileBaselineMethod(method);
+    } catch (_) { resume = null; }
+    if (!resume || resume.jvmSynchronous !== true) return fast;
+    const dispatcher = function (
+      frame, thread, helpers, initialBytecodeChecks, framelessEntry,
+    ) {
+      return frame.pc === 0 || fast.jvmHasStructuredContinuation?.(frame)
+        ? fast(frame, thread, helpers, initialBytecodeChecks, framelessEntry)
+        : resume(frame, thread, helpers, initialBytecodeChecks);
+    };
+    for (const key of Object.keys(fast)) dispatcher[key] = fast[key];
+    dispatcher.jvmSynchronous = true;
+    dispatcher.jvmResumeBody = true;
+    dispatcher.jvmScalarResumeBody = resume.jvmScalarLoop === true;
+    dispatcher.jvmFastBody = fast;
+    dispatcher.jvmResumeBodyFn = resume;
+    // Source inspection (diagnostics, tests) should see the fast tier's body.
+    dispatcher.toString = () => fast.toString();
+    return dispatcher;
+  }
+
+  compileScalarIntegerLoop(method) {
+    if (!this.scalarLoopsEnabled || !this.canCompileSynchronously(method) ||
+        !this.hasBackwardBranch(method)) {
+      return null;
+    }
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code) return null;
+    const codeItems = this.getCodeItems(method);
+    if ((code.code.exceptionTable || []).length &&
+        !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return null;
+    if (codeItems.length < 6 || codeItems.length > 1024) return null;
+    const labels = buildLabelMap(codeItems);
+    const depths = this.computeStackDepths(codeItems, labels);
+    if (!depths) return null;
+    const reachable = new Set(depths.map((depth, index) => depth === undefined ? -1 : index)
+      .filter((index) => index >= 0));
+
+    const localIndex = (instruction, op) => {
+      if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
+        return Number(instruction.arg);
+      }
+      const match = /_([0-3])$/.exec(op || "");
+      return match ? Number(match[1]) : NaN;
+    };
+    const inlinePlans = new Map();
+    const callSites = new Map();
+    const fieldSites = new Map();
+    const supported = codeItems.every((item, index) => {
+      if (!reachable.has(index)) return true;
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (op === "ldc" || op === "ldc_w") return typeof instruction.arg === "number";
+      if (!op || op === "nop" || op === "goto" || op === "return" ||
+          op === "ireturn" || op === "athrow" || op === "iinc" || op === "dup" ||
+          op === "pop" || op === "aconst_null" || op === "arraylength" ||
+          op === "newarray" || op === "checkcast" ||
+          /^[ai]load(?:_[0-3])?$/.test(op) || /^[ai]store(?:_[0-3])?$/.test(op) ||
+          /^iconst_(?:m1|[0-5])$/.test(op) || op === "bipush" || op === "sipush" ||
+          ["iadd", "isub", "imul", "idiv", "irem", "iand", "ior", "ixor",
+            "ishl", "ishr", "iushr", "ineg", "i2b"].includes(op) ||
+          ["iaload", "saload", "aaload", "iastore"].includes(op) ||
+          ["ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle",
+            "if_icmpeq", "if_icmpne", "if_icmplt", "if_icmpge",
+            "if_icmpgt", "if_icmple", "if_acmpeq", "if_acmpne",
+            "ifnull", "ifnonnull"].includes(op)) {
+        return true;
+      }
+      if (op === "getfield" || op === "getstatic" || op === "putstatic") {
+        fieldSites.set(index, this.registerFieldSite(instruction.arg));
+        return true;
+      }
+      if (op === "invokestatic" && instruction && Array.isArray(instruction.arg) &&
+          Array.isArray(instruction.arg[2])) {
+        const plan = this.getCompileTimeIntegerLeaf(instruction);
+        if (plan) inlinePlans.set(index, plan);
+        else callSites.set(index, {
+          id: this.registerSyncCallSite(op, instruction),
+          op,
+          ...parseDescriptor(instruction.arg[2][1]),
+        });
+        return true;
+      }
+      return false;
+    });
+    if (!supported) return null;
+    const expandedGuestBody = (code.code.exceptionTable || []).length > 0 ||
+      callSites.size > 0 || fieldSites.size > 0 || codeItems.some((item, index) => {
+        if (!reachable.has(index)) return false;
+        const op = getOp(item && item.instruction);
+        return op && (/^a(?:load|store)(?:_[0-3])?$/.test(op) ||
+          ["aconst_null", "arraylength", "newarray", "checkcast",
+            "iaload", "saload", "aaload", "iastore",
+            "if_acmpeq", "if_acmpne", "ifnull", "ifnonnull"].includes(op));
+      });
+    if (expandedGuestBody && !this.scalarGuestBodiesEnabled) return null;
+    // Per-method profiling must retain observable callee entries. Pure loops
+    // still use the scalar tier; loops with omitted static frames keep the
+    // normal generated call path while profiling is active.
+    if (this.profileMethods && inlinePlans.size) return null;
+
+    const usedLocals = new Set();
+    const referenceLocals = new Set();
+    for (let itemIndex = 0; itemIndex < codeItems.length; itemIndex += 1) {
+      if (!reachable.has(itemIndex)) continue;
+      const item = codeItems[itemIndex];
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (/^[ai]load(?:_[0-3])?$/.test(op) || /^[ai]store(?:_[0-3])?$/.test(op)) {
+        const index = localIndex(instruction, op);
+        if (!Number.isSafeInteger(index) || index < 0) return null;
+        usedLocals.add(index);
+        if (op[0] === "a") referenceLocals.add(index);
+      } else if (op === "iinc") {
+        const index = Number(instruction.varnum ?? instruction.arg);
+        if (!Number.isSafeInteger(index) || index < 0) return null;
+        usedLocals.add(index);
+      }
+    }
+
+    const terminal = new Set(["athrow", "ireturn", "return"]);
+    const leaders = new Set([0]);
+    for (let index = 0; index < codeItems.length; index += 1) {
+      if (!reachable.has(index)) continue;
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      if (op === "goto" || op && op.startsWith("if")) {
+        const target = branchTargetIndex(instruction, labels);
+        if (target === undefined) return null;
+        leaders.add(target);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      } else if (callSites.has(index)) {
+        leaders.add(index);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      } else if (terminal.has(op) && index + 1 < codeItems.length) {
+        leaders.add(index + 1);
+      }
+    }
+    const orderedLeaders = [...leaders].filter((index) => reachable.has(index))
+      .sort((a, b) => a - b);
+    const maxStackDepth = depths.reduce((maximum, depth) =>
+      depth === undefined ? maximum : Math.max(maximum, depth), 0);
+    const nextLeader = new Map();
+    orderedLeaders.forEach((leader, position) => {
+      nextLeader.set(leader, orderedLeaders[position + 1] ?? codeItems.length);
+    });
+
+    let temporary = 0;
+    const temp = () => `scalarValue${temporary++}`;
+    const ssaOptimizations = this.scalarSsaOptimizationsEnabled;
+    let arrayViewCount = 0;
+    let eliminatedReadCount = 0;
+    let threadedEdgeCount = 0;
+    const body = [
+      '"use strict";',
+      "const locals = frame.locals;",
+      "const stack = frame.stack.items;",
+      "let pc = frame.pc;",
+      "let backedgesUntilSafePoint = 10000;",
+      ...[...usedLocals].sort((a, b) => a - b)
+        .map((index) => `let local${index} = locals[${index}];`),
+      ...(ssaOptimizations ? [...referenceLocals].sort((a, b) => a - b)
+        .map((index) => `let local${index}ArrayData = helpers.arrayData(local${index});`) : []),
+      ...Array.from({ length: maxStackDepth }, (_unused, index) =>
+        `let scalarJoin${index} = stack[${index}];`),
+      ...(ssaOptimizations ? Array.from({ length: maxStackDepth }, (_unused, index) =>
+        `let scalarJoin${index}ArrayData = helpers.arrayData(stack[${index}]);`) : []),
+      "if ((initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) return { deopt: true, transient: true, reason: 'scalar loop debug entry' };",
+      "helpers.scalarLoopRunCount += 1;",
+      ...(ssaOptimizations ? ["helpers.scalarSsaRunCount += 1;"] : []),
+      "while (true) {",
+      "switch (pc) {",
+    ];
+    const spillLocals = () => [...usedLocals].sort((a, b) => a - b)
+      .map((index) => `locals[${index}] = local${index};`);
+    const saveStack = (expressions) => [
+      ...expressions.map((expression, index) => `stack[${index}] = ${expression};`),
+      `stack.length = ${expressions.length};`,
+    ];
+    let activeArrayViews = null;
+    const saveJoin = (expressions) => expressions.flatMap((expression, index) => {
+      const lines = [`scalarJoin${index} = ${expression};`];
+      if (ssaOptimizations) {
+        lines.push(`scalarJoin${index}ArrayData = ${activeArrayViews?.get(expression) || "null"};`);
+      }
+      return lines;
+    });
+    const materialize = (expressions, pc) => [
+      ...spillLocals(), ...saveStack(expressions),
+      `helpers.materialize(frame, locals, stack, ${pc});`,
+    ];
+    const transfer = (expressions, target, source) => {
+      const lines = [];
+      if (target <= source) {
+        lines.push("if (--backedgesUntilSafePoint === 0) {");
+        lines.push("if (helpers.continueQuantum(thread)) { backedgesUntilSafePoint = 10000; } else {");
+        lines.push(...materialize(expressions, target));
+        lines.push("helpers.scalarLoopSafePointCount += 1;");
+        lines.push("helpers.skipJitOnce(frame);");
+        lines.push("return { deopt: true, transient: true, reason: 'scalar loop backedge safe point' };", "}", "}");
+      }
+      lines.push(...saveJoin(expressions), `pc = ${target};`, "continue;");
+      return lines;
+    };
+
+    for (const leader of orderedLeaders) {
+      const entryDepth = depths[leader];
+      if (entryDepth === undefined) continue;
+      body.push(`case ${leader}: {`);
+      const expressions = [];
+      const arrayViews = new Map();
+      const valueIdentities = new Map();
+      const localVersions = new Map();
+      const fieldValues = new Map();
+      const arrayLengths = new Map();
+      activeArrayViews = arrayViews;
+      for (let index = 0; index < entryDepth; index += 1) {
+        const value = temp();
+        body.push(`const ${value} = scalarJoin${index};`);
+        expressions.push(value);
+        if (ssaOptimizations) {
+          arrayViews.set(value, `scalarJoin${index}ArrayData`);
+          valueIdentities.set(value, `join:${index}`);
+        }
+      }
+      const pop = () => expressions.length ? expressions.pop() : null;
+      const binary = (format) => {
+        const right = pop();
+        const left = pop();
+        if (left === null || right === null) return false;
+        expressions.push(format(left, right));
+        return true;
+      };
+      let terminated = false;
+      const end = nextLeader.get(leader);
+      for (let index = leader; index < end; index += 1) {
+        const instruction = codeItems[index] && codeItems[index].instruction;
+        const op = getOp(instruction);
+        if (!op || op === "nop") continue;
+        let valid = true;
+        if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+          // A JVM load snapshots the local at this bytecode. A later iinc or
+          // store must not change an operand that is already on the stack.
+          const value = temp();
+          const variable = localIndex(instruction, op);
+          body.push(`const ${value} = local${variable};`);
+          expressions.push(value);
+          if (ssaOptimizations && op[0] === "a") {
+            arrayViews.set(value, `local${variable}ArrayData`);
+            valueIdentities.set(value, `local:${variable}:${localVersions.get(variable) || 0}`);
+          }
+        } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            const variable = localIndex(instruction, op);
+            body.push(`local${variable} = ${value};`);
+            if (ssaOptimizations && op[0] === "a") {
+              body.push(`local${variable}ArrayData = ${arrayViews.get(value) || `helpers.arrayData(${value})`};`);
+              localVersions.set(variable, (localVersions.get(variable) || 0) + 1);
+            }
+          }
+        } else if (op === "aconst_null") {
+          expressions.push("null");
+        } else if (/^iconst_(?:m1|[0-5])$/.test(op)) {
+          expressions.push(op === "iconst_m1" ? "-1" : op.slice(-1));
+        } else if (op === "bipush" || op === "sipush") {
+          expressions.push(String(Number(instruction.arg) | 0));
+        } else if (op === "ldc" || op === "ldc_w") {
+          expressions.push(String(Number(instruction.arg) | 0));
+        } else if (op === "dup") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            const duplicate = temp();
+            body.push(`const ${duplicate} = ${value};`);
+            expressions.push(duplicate, duplicate);
+            if (ssaOptimizations && arrayViews.has(value)) {
+              arrayViews.set(duplicate, arrayViews.get(value));
+            }
+            if (ssaOptimizations && valueIdentities.has(value)) {
+              valueIdentities.set(duplicate, valueIdentities.get(value));
+            }
+          }
+        } else if (op === "pop") {
+          if (pop() === null) valid = false;
+        } else if (op === "iadd") valid = binary((a, b) => `((${a} + ${b}) | 0)`);
+        else if (op === "isub") valid = binary((a, b) => `((${a} - ${b}) | 0)`);
+        else if (op === "imul") valid = binary((a, b) => `Math.imul(${a}, ${b})`);
+        else if (op === "iand") valid = binary((a, b) => `(${a} & ${b})`);
+        else if (op === "ior") valid = binary((a, b) => `(${a} | ${b})`);
+        else if (op === "ixor") valid = binary((a, b) => `(${a} ^ ${b})`);
+        else if (op === "ishl") valid = binary((a, b) => `(${a} << (${b} & 31))`);
+        else if (op === "ishr") valid = binary((a, b) => `(${a} >> (${b} & 31))`);
+        else if (op === "iushr") valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`);
+        else if (op === "ineg" || op === "i2b") {
+          const value = pop();
+          if (value === null) valid = false;
+          else expressions.push(op === "ineg" ? `((-${value}) | 0)` : `((${value} << 24) >> 24)`);
+        } else if (op === "idiv" || op === "irem") {
+          const divisorExpression = pop();
+          const dividendExpression = pop();
+          if (divisorExpression === null || dividendExpression === null) valid = false;
+          else {
+            const dividend = temp();
+            const divisor = temp();
+            body.push(`const ${dividend} = ${dividendExpression};`, `const ${divisor} = ${divisorExpression};`);
+            body.push(`if (${divisor} === 0) {`);
+            body.push(...materialize([...expressions, dividend, divisor], index));
+            body.push('throw { type: "java/lang/ArithmeticException", message: "/ by zero" };', "}");
+            expressions.push(op === "idiv" ? `((${dividend} / ${divisor}) | 0)`
+              : `((${dividend} % ${divisor}) | 0)`);
+          }
+        } else if (op === "iinc") {
+          const variable = Number(instruction.varnum ?? instruction.arg);
+          const increment = Number(instruction.incr ?? 0);
+          body.push(`local${variable} = (local${variable} + ${increment}) | 0;`);
+        } else if (op === "newarray") {
+          const countExpression = pop();
+          if (countExpression === null) valid = false;
+          else {
+            const count = temp();
+            const value = temp();
+            const caught = temp();
+            body.push(`const ${count} = ${countExpression}; let ${value}; try { ${value} = helpers.newPrimitiveArray(${count}, ${JSON.stringify(instruction.arg)}); } catch (${caught}) {`);
+            body.push(...materialize([...expressions, count], index));
+            body.push(`throw ${caught};`, "}");
+            expressions.push(value);
+            if (ssaOptimizations) arrayViews.set(value, value);
+          }
+        } else if (op === "checkcast") {
+          const value = expressions[expressions.length - 1];
+          if (value === undefined) valid = false;
+          else {
+            const castValue = temp();
+            const source = temp();
+            const cast = temp();
+            const caught = temp();
+            const target = JSON.stringify(instruction.arg);
+            body.push(`const ${castValue} = ${value}; if (${castValue} !== null && ${castValue} !== undefined) {`);
+            body.push(`const ${source} = ${generatedRuntimeClassNameExpression(castValue)}; if (${source} !== ${target}) {`);
+            body.push(`let ${cast}; try { ${cast} = helpers.tryCheckCastSourceSync(${source}, ${target}); } catch (${caught}) {`);
+            body.push(...materialize(expressions, index));
+            body.push(`throw ${caught};`, "}");
+            body.push(`if (${cast} === helpers.asyncInvokeSentinel()) {`);
+            body.push(...materialize(expressions, index));
+            body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'cold scalar checkcast' };", "}");
+            body.push("}", "}");
+          }
+        } else if (op === "arraylength") {
+          const arrayExpression = pop();
+          if (arrayExpression === null) valid = false;
+          else {
+            const identity = ssaOptimizations && valueIdentities.get(arrayExpression);
+            const previousLength = identity && arrayLengths.get(identity);
+            if (previousLength) {
+              expressions.push(previousLength);
+              eliminatedReadCount += 1;
+              continue;
+            }
+            const array = temp();
+            const length = temp();
+            body.push(`const ${array} = ${arrayExpression};`);
+            body.push(`if (${array} === null || ${array} === undefined) {`);
+            body.push(...materialize([...expressions, array], index));
+            body.push(`helpers.arrayLength(${array}, frame);`, "}");
+            body.push(`const ${length} = ${array}.length;`);
+            expressions.push(length);
+            if (identity) arrayLengths.set(identity, length);
+          }
+        } else if (op === "iaload" || op === "saload" || op === "aaload") {
+          const arrayIndexExpression = pop();
+          const arrayExpression = pop();
+          if (arrayIndexExpression === null || arrayExpression === null) valid = false;
+          else {
+            const array = temp();
+            const arrayData = ssaOptimizations ? temp() : null;
+            const arrayIndex = temp();
+            const value = temp();
+            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `helpers.arrayData(${array})`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; let ${value};`);
+            body.push(`if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`);
+            body.push(...materialize([...expressions, array, arrayIndex], index));
+            body.push(`${value} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`, "} else {");
+            if (ssaOptimizations) {
+              body.push(`${value} = ${arrayData} !== null ? ${arrayData}[${arrayIndex}] : (${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}]);`, "}");
+              arrayViewCount += 1;
+            } else {
+              body.push(`${value} = ${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}];`, "}");
+            }
+            expressions.push(value);
+          }
+        } else if (op === "iastore") {
+          const valueExpression = pop();
+          const arrayIndexExpression = pop();
+          const arrayExpression = pop();
+          if (valueExpression === null || arrayIndexExpression === null || arrayExpression === null) {
+            valid = false;
+          } else {
+            const array = temp();
+            const arrayData = ssaOptimizations ? temp() : null;
+            const arrayIndex = temp();
+            const value = temp();
+            body.push(`const ${array} = ${arrayExpression};${ssaOptimizations ? ` const ${arrayData} = ${arrayViews.get(arrayExpression) || `helpers.arrayData(${array})`};` : ""} const ${arrayIndex} = ${arrayIndexExpression}; const ${value} = ${valueExpression};`);
+            body.push(`if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`);
+            body.push(...materialize([...expressions, array, arrayIndex, value], index));
+            if (ssaOptimizations) {
+              body.push(`helpers.arrayStore(${value}, ${arrayIndex}, ${array}, frame, "iastore");`, `} else if (${arrayData} !== null) {`, `${arrayData}[${arrayIndex}] = ${value} | 0;`, `} else if (${array}.elements) {`, `${array}.elements[${arrayIndex}] = ${value} | 0;`, "} else {", `${array}[${arrayIndex}] = ${value} | 0;`, "}");
+              arrayViewCount += 1;
+            } else {
+              body.push(`helpers.arrayStore(${value}, ${arrayIndex}, ${array}, frame, "iastore");`, "} else if (", `${array}.elements) {`, `${array}.elements[${arrayIndex}] = ${value} | 0;`, "} else {", `${array}[${arrayIndex}] = ${value} | 0;`, "}");
+            }
+          }
+        } else if (op === "getfield") {
+          const objectExpression = pop();
+          if (objectExpression === null) valid = false;
+          else {
+            const siteId = fieldSites.get(index);
+            const identity = ssaOptimizations && valueIdentities.get(objectExpression);
+            // Field-site ids are deliberately per-bytecode for inline caches;
+            // value numbering instead uses the symbolic constant-pool target.
+            const symbolicField = ssaOptimizations &&
+              this.canEliminateFieldRead(instruction.arg) && JSON.stringify(instruction.arg);
+            const fieldIdentity = symbolicField && identity && `${symbolicField}|${identity}`;
+            const previousValue = fieldIdentity && fieldValues.get(fieldIdentity);
+            if (previousValue) {
+              expressions.push(previousValue);
+              eliminatedReadCount += 1;
+              continue;
+            }
+            const object = temp();
+            const value = temp();
+            body.push(`const ${object} = ${objectExpression};`);
+            body.push(`if (${object} === null || ${object} === undefined) {`);
+            body.push(...materialize([...expressions, object], index));
+            body.push(`helpers.getFieldAt(${siteId}, ${object});`, "}");
+            body.push(`const ${value} = helpers.getFieldAt(${siteId}, ${object});`);
+            expressions.push(value);
+            if (fieldIdentity) {
+              fieldValues.set(fieldIdentity, value);
+              valueIdentities.set(value, `field:${fieldIdentity}`);
+            }
+            if (ssaOptimizations && this.fieldSites[siteId]?.descriptor?.startsWith("[")) {
+              const data = temp();
+              body.push(`const ${data} = helpers.arrayData(${value});`);
+              arrayViews.set(value, data);
+            }
+          }
+        } else if (op === "getstatic") {
+          const value = temp();
+          const siteId = fieldSites.get(index);
+          body.push(`const ${value} = helpers.getStaticSyncAt(${siteId});`);
+          body.push(`if (${value} === helpers.staticDeopt()) {`);
+          body.push(...materialize(expressions, index));
+          body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'class initialization in scalar getstatic' };", "}");
+          expressions.push(value);
+          if (ssaOptimizations && this.fieldSites[siteId]?.descriptor?.startsWith("[")) {
+            const data = temp();
+            body.push(`const ${data} = helpers.arrayData(${value});`);
+            arrayViews.set(value, data);
+          }
+        } else if (op === "putstatic") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            const changed = temp();
+            const siteId = fieldSites.get(index);
+            body.push(`const ${changed} = helpers.putStaticSyncAt(${siteId}, ${value});`);
+            body.push(`if (${changed} === helpers.staticDeopt()) {`);
+            body.push(...materialize([...expressions, value], index));
+            body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'class initialization in scalar putstatic' };", "}");
+          }
+        } else if (op === "invokestatic") {
+          const plan = inlinePlans.get(index);
+          if (plan) {
+            const args = new Array(plan.paramCount);
+            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
+              args[argument] = pop();
+              if (args[argument] === null) valid = false;
+            }
+            if (!valid) return null;
+            const result = temp();
+            const substitute = (source) => source.replace(/stack\[base \+ (\d+)\]/g,
+              (_match, argument) => `(${args[Number(argument)]})`);
+            body.push(`let ${result};`, "{");
+            body.push(...plan.statements.map(substitute));
+            body.push(`${result} = ${substitute(plan.result)};`, "}");
+            expressions.push(result);
+          } else {
+            const site = callSites.get(index);
+            if (!site) valid = false;
+            else {
+              const argumentCount = site.params.length;
+              const base = expressions.length - argumentCount;
+              if (base < 0) valid = false;
+              else {
+                const beforeCall = expressions.slice();
+                body.push(...saveStack(beforeCall), `frame.pc = ${index + 1};`);
+                const value = temp();
+                const caught = temp();
+                body.push(`let ${value}; try { ${value} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`);
+                body.push(...materialize(beforeCall, index));
+                body.push(`throw ${caught};`, "}");
+                body.push(`if (${value} === helpers.asyncInvokeSentinel()) {`);
+                body.push(...materialize(beforeCall, index));
+                body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'asynchronous scalar callee' };", "}");
+                body.push(`if (${value} && ${value}.deopt) {`, ...spillLocals(), `return ${value};`, "}");
+                body.push(`if (${value} !== helpers.returnVoid()) stack.push(${value});`);
+                body.push("if (thread.status !== 'runnable') {", ...spillLocals(),
+                  `helpers.materialize(frame, locals, stack, ${index + 1});`,
+                  "return { deopt: true, transient: true, reason: 'thread yielded in scalar callee' };", "}");
+                const resultDepth = base + (site.returnType === "void" ? 0 : 1);
+                body.push(`stack.length = ${resultDepth};`);
+                body.push(...Array.from({ length: resultDepth }, (_unused, slot) =>
+                  `scalarJoin${slot} = stack[${slot}];`));
+                if (ssaOptimizations) {
+                  body.push(...Array.from({ length: resultDepth }, (_unused, slot) =>
+                    `scalarJoin${slot}ArrayData = helpers.arrayData(stack[${slot}]);`));
+                }
+                body.push(`pc = ${index + 1}; continue;`);
+                terminated = true;
+              }
+            }
+          }
+        } else if (op === "goto") {
+          const target = branchTargetIndex(instruction, labels);
+          if (ssaOptimizations && target === end) {
+            body.push(...saveJoin(expressions));
+            threadedEdgeCount += 1;
+            terminated = true;
+          } else {
+            body.push(...transfer(expressions, target, index));
+            terminated = true;
+          }
+        } else if (op && op.startsWith("if")) {
+          let condition;
+          if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) {
+            const right = pop();
+            const left = pop();
+            const comparisons = {
+              if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<", if_icmpge: ">=",
+              if_icmpgt: ">", if_icmple: "<=", if_acmpeq: "===", if_acmpne: "!==",
+            };
+            if (left === null || right === null || !comparisons[op]) valid = false;
+            else condition = `${left} ${comparisons[op]} ${right}`;
+          } else {
+            const value = pop();
+            const comparisons = {
+              ifeq: "=== 0", ifne: "!== 0", iflt: "< 0", ifge: ">= 0",
+              ifgt: "> 0", ifle: "<= 0", ifnull: "=== null", ifnonnull: "!== null",
+            };
+            if (value === null || !comparisons[op]) valid = false;
+            else condition = `${value} ${comparisons[op]}`;
+          }
+          if (valid) {
+            const target = branchTargetIndex(instruction, labels);
+            const backward = target <= index;
+            if (backward) {
+              body.push(`if (${condition}) {`);
+              body.push(...transfer(expressions, target, index));
+              body.push("}");
+              if (ssaOptimizations && index + 1 === end) {
+                body.push(...saveJoin(expressions));
+                threadedEdgeCount += 1;
+              } else {
+                body.push(...transfer(expressions, index + 1, -1));
+              }
+            } else {
+              body.push(...saveJoin(expressions));
+              if (ssaOptimizations && index + 1 === end) {
+                body.push(`if (${condition}) { pc = ${target}; continue; }`);
+                threadedEdgeCount += 1;
+              } else {
+                body.push(`pc = (${condition}) ? ${target} : ${index + 1};`, "continue;");
+              }
+            }
+            terminated = true;
+          }
+        } else if (op === "athrow") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            body.push(...materialize([...expressions, value], index));
+            body.push(`throw ${value};`);
+            terminated = true;
+          }
+        } else if (op === "ireturn") {
+          const value = pop();
+          if (value === null) valid = false;
+          else {
+            body.push(...materialize(expressions, index + 1));
+            body.push(`thread.callStack.pop(); return { returned: true, value: ${value} };`);
+            terminated = true;
+          }
+        } else if (op === "return") {
+          body.push(...materialize(expressions, index + 1));
+          body.push("thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };");
+          terminated = true;
+        } else valid = false;
+
+        if (!valid) return null;
+        if (terminated) break;
+      }
+      if (!terminated) {
+        if (ssaOptimizations && orderedLeaders.includes(end)) {
+          body.push(...saveJoin(expressions));
+          threadedEdgeCount += 1;
+        } else {
+          body.push(...transfer(expressions, end, -1));
+        }
+      }
+      body.push("}");
+    }
+    body.push("default: helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'scalar loop non-leader entry' };");
+    body.push("}", "}");
+    try {
+      const generated = this.createGeneratedFunction(method,
+        ssaOptimizations ? "scalar-ssa" : "scalar",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"));
+      generated.jvmSynchronous = true;
+      generated.jvmScalarLoop = true;
+      generated.jvmScalarSsa = ssaOptimizations;
+      generated.jvmScalarArrayViewCount = arrayViewCount;
+      generated.jvmScalarEliminatedReadCount = eliminatedReadCount;
+      generated.jvmScalarThreadedEdgeCount = threadedEdgeCount;
+      generated.jvmDirectInlineCount = inlinePlans.size;
+      if (ssaOptimizations) {
+        this.scalarSsaArrayViewCount += arrayViewCount;
+        this.scalarSsaEliminatedReadCount += eliminatedReadCount;
+        this.scalarSsaThreadedEdgeCount += threadedEdgeCount;
+      }
+      return generated;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  compileBaselineMethod(method) {
+    const synchronous = this.canCompileSynchronously(method);
+    const GeneratedFunction = synchronous ? Function : getAsyncFunctionConstructor();
+    if (!GeneratedFunction) {
+      this.codegenUnavailable = true;
+      return null;
+    }
+
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const codeItems = this.getCodeItems(method);
+    let stackWidthsBefore = null;
+    if (codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op === "dup_x2" || op === "dup2";
+    })) {
+      const analysis = buildSsa({
+        codeItems,
+        exceptionTable: code && code.code && code.code.exceptionTable || [],
+        method,
+      });
+      if (analysis && !analysis.rejected && analysis.stackKindsBefore) {
+        stackWidthsBefore = new Map();
+        for (const [index, kinds] of analysis.stackKindsBefore) {
+          stackWidthsBefore.set(index, kinds.map(kindWidth));
+        }
+      }
+    }
+    this.compileLabelMap = buildLabelMap(codeItems);
+    this.compileSynchronous = synchronous;
+    this.compileDirectInlineCount = 0;
+    let directInlineCount = 0;
+    const body = [
+      '"use strict";',
+      "const locals = frame.locals;",
+      "const stack = frame.stack.items;",
+      "let sp = stack.length;",
+      "let pc = frame.pc;",
+      "let bytecodesUntilYield = 10000;",
+      "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
+      "let osrCountdown = 10007;",
+      `while (pc < ${codeItems.length}) {`,
+      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; sp = stack.length; } }",
+      synchronous
+        // A synchronous baseline body also keeps its complete locals/operand
+        // state in JavaScript between polls. As with structured SSA, another
+        // runnable Java thread need not force a costly spill/re-entry every
+        // 10k bytecodes; run until the existing wall-clock/timer/debug
+        // deadline, then materialize the exact PC before yielding.
+        ? "if (--bytecodesUntilYield === 0) { if (helpers.continueStructuredQuantum(thread)) { bytecodesUntilYield = 10000; } else { helpers.materializeCached(frame, locals, stack, sp, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'synchronous generated quantum' }; } }"
+        : "if (--bytecodesUntilYield === 0) { if (helpers.continueQuantum(thread)) { bytecodesUntilYield = 10000; } else { helpers.materializeCached(frame, locals, stack, sp, pc); await helpers.cooperativeYield(); bytecodesUntilYield = 10000; bytecodeChecks = helpers.needsBytecodeChecks(); } }",
+      "if (bytecodeChecks && helpers.shouldDeopt(frame, pc)) { helpers.materializeCached(frame, locals, stack, sp, pc); return { deopt: true }; }",
+      "switch (pc) {",
+    ];
+
+    try {
+      codeItems.forEach((item, index) => {
+        body.push(`case ${index}:`);
+        const instruction = item.instruction;
+        if (!instruction) {
+          body.push(`if (bytecodeChecks) { pc = ${index + 1}; break; }`);
+          return;
+        }
+        // Locals and operand stack are the frame's live arrays already. The
+        // exact frame PC is only needed before an instruction that can throw
+        // or deopt; control-flow edges materialize their own resume PC.
+        if (this.instructionNeedsPrecisePc(instruction)) {
+          body.push(`stack.length = sp; frame.pc = ${index};`);
+        }
+        body.push(this.emitInstruction(
+          instruction, index, stackWidthsBefore && stackWidthsBefore.get(index),
+        ));
+      });
+      directInlineCount = this.compileDirectInlineCount;
+    } finally {
+      this.compileLabelMap = null;
+      this.compileSynchronous = false;
+      this.compileDirectInlineCount = 0;
+    }
+
+    body.push("default: helpers.materializeCached(frame, locals, stack, sp, pc); return { deopt: true, reason: 'invalid generated pc ' + pc };");
+    body.push("}");
+    body.push("}");
+    body.push("helpers.materializeCached(frame, locals, stack, sp, pc);");
+    body.push("thread.callStack.pop();");
+    body.push("return { returned: true, value: helpers.returnVoid() };");
+
+    try {
+      const generated = this.createGeneratedFunction(method,
+        synchronous ? "generated-sync" : "generated-async",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"),
+        null, !synchronous);
+      generated.jvmSynchronous = synchronous;
+      generated.jvmDirectInlineCount = directInlineCount;
+      return generated;
+    } catch (err) {
+      if (err && err.name === "EvalError") {
+        this.codegenUnavailable = true;
+      }
+      throw err;
+    }
+  }
+
+  compileStacklessIntegerRaster(method) {
+    const rasterDescriptor = "(IIIIIIIBIIII[IIIII)V";
+    const wrapperDescriptor = "(IIIIIIIIIIIIZIII)V";
+    if (method.descriptor !== rasterDescriptor && method.descriptor !== wrapperDescriptor) return null;
+    const code = method.attributes.find((attr) => attr.type === "code");
+    const codeItems = this.getCodeItems(method);
+    if (!this.canCompileSynchronously(method)) return null;
+
+    const ops = codeItems.map((item) => getOp(item && item.instruction)).filter(Boolean);
+    const hotCalls = codeItems.filter((item) => {
+      const instruction = item && item.instruction;
+      return getOp(instruction) === "invokestatic" && instruction &&
+        Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+        instruction.arg[2][1] === (method.descriptor === rasterDescriptor
+          ? "(IIIIIII[III)V" : rasterDescriptor);
+    }).length;
+    const rasterShape = method.descriptor === rasterDescriptor && codeItems.length >= 1000 &&
+      ops.filter((op) => op === "iload").length >= 300 &&
+      ops.filter((op) => op === "istore").length >= 100 && hotCalls >= 5;
+    const wrapperShape = method.descriptor === wrapperDescriptor && codeItems.length >= 170 &&
+      ops.filter((op) => op === "iload").length >= 80 && hotCalls >= 6;
+    if (!rasterShape && !wrapperShape) {
+      return null;
+    }
+
+    const labels = buildLabelMap(codeItems);
+    const depths = this.computeStackDepths(codeItems, labels);
+    if (!depths) return null;
+    const leaders = new Set([0]);
+    const terminal = new Set([
+      "areturn", "athrow", "dreturn", "freturn", "ireturn", "lreturn", "return",
+    ]);
+    for (let index = 0; index < codeItems.length; index += 1) {
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      if (op === "goto" || op && op.startsWith("if")) {
+        const target = branchTargetIndex(instruction, labels);
+        if (target === undefined) return null;
+        leaders.add(target);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      }
+      if (op && op.startsWith("invoke")) {
+        leaders.add(index);
+        if (index + 1 < codeItems.length) leaders.add(index + 1);
+      }
+      if (terminal.has(op) && index + 1 < codeItems.length) leaders.add(index + 1);
+    }
+    const exceptionTable = code.code.exceptionTable || [];
+    for (const entry of exceptionTable) {
+      const handler = labels.get(entry.handlerLbl || `L${entry.handler_pc}`);
+      if (handler !== undefined) leaders.add(handler);
+    }
+
+    const orderedLeaders = [...leaders].sort((a, b) => a - b);
+    const nextLeader = new Map();
+    orderedLeaders.forEach((leader, position) => {
+      nextLeader.set(leader, orderedLeaders[position + 1] ?? codeItems.length);
+    });
+
+    let temporary = 0;
+    const temp = () => `v${temporary++}`;
+    const body = [
+      '"use strict";',
+      "const locals = frame.locals;",
+      "const stack = frame.stack.items;",
+      "let pc = frame.pc;",
+      "let blocksUntilYield = 10000;",
+      "if ((initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) return { deopt: true, transient: true, reason: 'stackless raster debug entry' };",
+      "while (true) {",
+      "if (--blocksUntilYield === 0) { if (helpers.continueQuantum(thread)) { blocksUntilYield = 10000; } else { helpers.materialize(frame, locals, stack, pc); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'stackless raster quantum' }; } }",
+      "switch (pc) {",
+    ];
+
+    const saveStack = (expressions) => {
+      const lines = expressions.map((expression, index) => `stack[${index}] = ${expression};`);
+      lines.push(`stack.length = ${expressions.length};`);
+      return lines;
+    };
+    const transfer = (expressions, target) => [
+      ...saveStack(expressions),
+      `pc = ${target};`,
+      "continue;",
+    ];
+    const deopt = (expressions, index, reason) => [
+      ...saveStack(expressions),
+      `helpers.materialize(frame, locals, stack, ${index});`,
+      `return { deopt: true, reason: ${JSON.stringify(reason)} };`,
+    ];
+    const localIndex = (instruction, op) => {
+      if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
+        return Number(instruction.arg);
+      }
+      const match = /_([0-3])$/.exec(op || "");
+      return match ? Number(match[1]) : NaN;
+    };
+    const constant = (instruction, op) => {
+      if (op === "iconst_m1") return "-1";
+      if (/^iconst_[0-5]$/.test(op)) return op.slice(-1);
+      return jsLiteral(Number(instruction.arg));
+    };
+
+    for (const leader of orderedLeaders) {
+      const entryDepth = depths[leader];
+      if (entryDepth === undefined) continue;
+      body.push(`case ${leader}: {`);
+      const expressions = [];
+      for (let index = 0; index < entryDepth; index += 1) {
+        const value = temp();
+        body.push(`const ${value} = stack[${index}];`);
+        expressions.push(value);
+      }
+      let terminated = false;
+      const end = nextLeader.get(leader);
+
+      for (let index = leader; index < end; index += 1) {
+        const instruction = codeItems[index] && codeItems[index].instruction;
+        const op = getOp(instruction);
+        if (!op || op === "nop") continue;
+        const pop = () => expressions.pop();
+        const binary = (format) => {
+          const right = pop();
+          const left = pop();
+          if (left === undefined || right === undefined) return false;
+          expressions.push(format(left, right));
+          return true;
+        };
+        let valid = true;
+
+        if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+          const value = temp();
+          body.push(`const ${value} = locals[${localIndex(instruction, op)}];`);
+          expressions.push(value);
+        } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else body.push(`locals[${localIndex(instruction, op)}] = ${value};`);
+        } else if (op === "aconst_null") {
+          expressions.push("null");
+        } else if (/^iconst_(?:m1|[0-5])$/.test(op) ||
+                   op === "bipush" || op === "sipush" || op === "ldc" || op === "ldc_w") {
+          if ((op === "ldc" || op === "ldc_w") && typeof instruction.arg !== "number") {
+            const value = temp();
+            body.push(`const ${value} = helpers.constantValue(${jsLiteral(instruction.arg)});`);
+            expressions.push(value);
+          } else {
+            expressions.push(constant(instruction, op));
+          }
+        } else if (op === "dup") {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else {
+            const duplicate = temp();
+            body.push(`const ${duplicate} = ${value};`);
+            expressions.push(duplicate, duplicate);
+          }
+        } else if (op === "pop") {
+          if (pop() === undefined) valid = false;
+        } else if (op === "iadd") {
+          valid = binary((a, b) => `((${a} + ${b}) | 0)`);
+        } else if (op === "isub") {
+          valid = binary((a, b) => `((${a} - ${b}) | 0)`);
+        } else if (op === "imul") {
+          valid = binary((a, b) => `Math.imul(${a}, ${b})`);
+        } else if (op === "ixor") {
+          valid = binary((a, b) => `(${a} ^ ${b})`);
+        } else if (op === "iand") {
+          valid = binary((a, b) => `(${a} & ${b})`);
+        } else if (op === "ior") {
+          valid = binary((a, b) => `(${a} | ${b})`);
+        } else if (op === "ishl") {
+          valid = binary((a, b) => `(${a} << (${b} & 31))`);
+        } else if (op === "ishr") {
+          valid = binary((a, b) => `(${a} >> (${b} & 31))`);
+        } else if (op === "iushr") {
+          valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`);
+        } else if (op === "ineg") {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else expressions.push(`((-${value}) | 0)`);
+        } else if (op === "idiv" || op === "irem") {
+          const divisorExpression = pop();
+          const dividendExpression = pop();
+          if (divisorExpression === undefined || dividendExpression === undefined) valid = false;
+          else {
+            const divisor = temp();
+            body.push(`frame.pc = ${index}; const ${divisor} = ${divisorExpression};`);
+            body.push(`if (${divisor} === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" };`);
+            expressions.push(op === "idiv"
+              ? `((${dividendExpression} / ${divisor}) | 0)`
+              : `((${dividendExpression} % ${divisor}) | 0)`);
+          }
+        } else if (op === "iinc") {
+          const variable = Number(instruction.varnum ?? instruction.arg);
+          const increment = Number(instruction.incr ?? 0);
+          body.push(`locals[${variable}] = (locals[${variable}] + ${increment}) | 0;`);
+        } else if (op === "getstatic") {
+          const value = temp();
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          body.push(`frame.pc = ${index}; const ${value} = helpers.getStaticSyncAt(${fieldSiteId});`);
+          if (expressions.length) body.push(...saveStack(expressions));
+          body.push(`if (${value} === helpers.staticDeopt()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization in stackless raster" }; }`);
+          expressions.push(value);
+        } else if (op === "iaload") {
+          const arrayIndex = pop();
+          const array = pop();
+          if (arrayIndex === undefined || array === undefined) valid = false;
+          else {
+            const value = temp();
+            body.push(`frame.pc = ${index}; const ${value} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, "iaload");`);
+            expressions.push(value);
+          }
+        } else if (op && op.startsWith("invoke")) {
+          const invokeDescriptor = instruction.arg[2][1];
+          if (rasterShape && op === "invokestatic" &&
+              invokeDescriptor === "(IIIIIII[III)V" && expressions.length >= 10) {
+            const base = expressions.length - 10;
+            const direct = temp();
+            body.push(`const ${direct} = helpers.packedColorScanlineDirect(${expressions.slice(base).join(", ")}, locals[42], ${JSON.stringify(instruction.arg[1])});`);
+            body.push(`if (${direct} !== helpers.asyncInvokeSentinel()) {`);
+            body.push(...saveStack(expressions.slice(0, base)));
+            body.push(`pc = ${index + 1}; continue;`);
+            body.push("}");
+          }
+          const callSiteId = this.registerSyncCallSite(op, instruction);
+          const parsed = parseDescriptor(instruction.arg[2][1]);
+          body.push(...saveStack(expressions));
+          body.push(`helpers.materialize(frame, locals, stack, ${index + 1});`);
+          const value = temp();
+          body.push(`const ${value} = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread);`);
+          body.push(`if (${value} === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous stackless raster callee" }; }`);
+          body.push(`if (${value} && ${value}.deopt) return ${value};`);
+          body.push(`if (${value} !== helpers.returnVoid()) stack.push(${value});`);
+          body.push(`if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in stackless raster callee" };`);
+          const resultDepth = expressions.length - parsed.params.length - (op === "invokestatic" ? 0 : 1) +
+            (parsed.returnType === "void" ? 0 : 1);
+          body.push(`stack.length = ${resultDepth}; pc = ${index + 1}; continue;`);
+          terminated = true;
+        } else if (op === "goto") {
+          body.push(...transfer(expressions, branchTargetIndex(instruction, labels)));
+          terminated = true;
+        } else if (op && op.startsWith("if")) {
+          let condition;
+          if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) {
+            const right = pop();
+            const left = pop();
+            const comparisons = {
+              if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<", if_icmpge: ">=",
+              if_icmpgt: ">", if_icmple: "<=", if_acmpeq: "===", if_acmpne: "!==",
+            };
+            if (left === undefined || right === undefined || !comparisons[op]) valid = false;
+            else condition = `${left} ${comparisons[op]} ${right}`;
+          } else {
+            const value = pop();
+            const comparisons = {
+              ifeq: "=== 0", ifne: "!== 0", iflt: "< 0", ifge: ">= 0",
+              ifgt: "> 0", ifle: "<= 0", ifnull: "=== null", ifnonnull: "!== null",
+            };
+            if (value === undefined || !comparisons[op]) valid = false;
+            else condition = `${value} ${comparisons[op]}`;
+          }
+          if (valid) {
+            body.push(...saveStack(expressions));
+            body.push(`pc = (${condition}) ? ${branchTargetIndex(instruction, labels)} : ${index + 1}; continue;`);
+            terminated = true;
+          }
+        } else if (op === "athrow") {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else {
+            body.push(`frame.pc = ${index}; throw ${value};`);
+            terminated = true;
+          }
+        } else if (op === "return") {
+          body.push(...saveStack(expressions));
+          body.push(`helpers.materialize(frame, locals, stack, ${index + 1}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`);
+          terminated = true;
+        } else if (/^[aifdl]return$/.test(op)) {
+          const value = pop();
+          if (value === undefined) valid = false;
+          else {
+            body.push(...saveStack(expressions));
+            body.push(`helpers.materialize(frame, locals, stack, ${index + 1}); thread.callStack.pop(); return { returned: true, value: ${value} };`);
+            terminated = true;
+          }
+        } else {
+          valid = false;
+        }
+
+        if (!valid) {
+          body.push(...deopt(expressions, index, `unsupported stackless raster opcode ${op}`));
+          terminated = true;
+        }
+        if (terminated) break;
+      }
+
+      if (!terminated) body.push(...transfer(expressions, end));
+      body.push("}");
+    }
+
+    body.push("default: helpers.materialize(frame, locals, stack, pc); return { deopt: true, reason: 'invalid stackless raster pc ' + pc };");
+    body.push("}", "}");
+    try {
+      const generated = this.createGeneratedFunction(method, "stackless-raster",
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"));
+      generated.jvmSynchronous = true;
+      generated.jvmStacklessRaster = true;
+      return generated;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  computeStackDepths(codeItems, labels) {
+    const depths = new Array(codeItems.length);
+    const pending = [0];
+    depths[0] = 0;
+    const terminal = new Set([
+      "areturn", "athrow", "dreturn", "freturn", "ireturn", "lreturn", "return",
+    ]);
+    while (pending.length) {
+      const index = pending.pop();
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      const effect = stackEffect(instruction);
+      if (effect === null) return null;
+      const after = depths[index] + effect;
+      if (after < 0) return null;
+      const successors = [];
+      if (op === "goto" || op === "goto_w") {
+        successors.push(branchTargetIndex(instruction, labels));
+      } else if (op && op.startsWith("if")) {
+        successors.push(index + 1, branchTargetIndex(instruction, labels));
+      } else if (!terminal.has(op) && index + 1 < codeItems.length) {
+        successors.push(index + 1);
+      }
+      for (const successor of successors) {
+        if (successor === undefined || successor < 0 || successor >= codeItems.length) return null;
+        if (depths[successor] === undefined) {
+          depths[successor] = after;
+          pending.push(successor);
+        } else if (depths[successor] !== after) {
+          return null;
+        }
+      }
+    }
+    return depths;
+  }
+
+  canCompileSynchronously(method) {
+    const codeItems = this.getCodeItems(method);
+    return codeItems.every((item) => {
+      const instruction = item && item.instruction;
+      const op = getOp(instruction);
+      if (!op) return true;
+      return !(op === "ldc" || op === "ldc_w") || !isClassConstant(instruction.arg);
+    });
+  }
+
+  instructionNeedsPrecisePc(instruction) {
+    const op = getOp(instruction);
+    if (!op) return false;
+    if (op.startsWith("invoke") || op === "athrow" || op === "checkcast" ||
+        op === "getfield" || op === "putfield" || op === "getstatic" ||
+        op === "putstatic" || op === "new" || op === "newarray" ||
+        op === "anewarray" || op === "multianewarray" || op === "arraylength" ||
+        op === "monitorenter" || op === "monitorexit" || op === "idiv" ||
+        op === "irem" || op === "ldiv" || op === "lrem" ||
+        op === "instanceof") return true;
+    if (op.endsWith("aload") || op.endsWith("astore")) return true;
+    return (op === "ldc" || op === "ldc_w") && isClassConstant(instruction.arg);
+  }
+
+  emitInstruction(instruction, index, stackWidthsBefore = null) {
+    const op = getOp(instruction);
+    const next = index + 1;
+    // In normal execution, straight-line cases fall through to the next case
+    // instead of returning to the while/switch dispatcher after every JVM
+    // bytecode. Debug and breakpoint mode still redispatches each bytecode so
+    // precise stepping and safe-point checks remain intact.
+    const goNext = `if (bytecodeChecks) { pc = ${next}; break; }`;
+    const target = (label) => this.targetInstructionIndex(instruction, label);
+    const localIndex = (fallback) => Number(instruction.arg ?? fallback);
+
+    switch (op) {
+      case "aconst_null": return `stack[sp++] = null; ${goNext}`;
+      case "aload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "aload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "aload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "aload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "aload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "iload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "iload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "iload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "iload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "iload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "dload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "dload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "dload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "dload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "dload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "fload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "fload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "fload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "fload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "fload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "lload": return `stack[sp++] = locals[${localIndex()}]; ${goNext}`;
+      case "lload_0": return `stack[sp++] = locals[0]; ${goNext}`;
+      case "lload_1": return `stack[sp++] = locals[1]; ${goNext}`;
+      case "lload_2": return `stack[sp++] = locals[2]; ${goNext}`;
+      case "lload_3": return `stack[sp++] = locals[3]; ${goNext}`;
+      case "astore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "astore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "astore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "astore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "astore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "istore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "istore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "istore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "istore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "istore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "dstore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "dstore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "dstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "dstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "dstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "fstore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "fstore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "fstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "fstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "fstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "lstore": return `locals[${localIndex()}] = stack[--sp]; ${goNext}`;
+      case "lstore_0": return `locals[0] = stack[--sp]; ${goNext}`;
+      case "lstore_1": return `locals[1] = stack[--sp]; ${goNext}`;
+      case "lstore_2": return `locals[2] = stack[--sp]; ${goNext}`;
+      case "lstore_3": return `locals[3] = stack[--sp]; ${goNext}`;
+      case "iconst_0": return `stack[sp++] = 0; ${goNext}`;
+      case "iconst_m1": return `stack[sp++] = -1; ${goNext}`;
+      case "iconst_1": return `stack[sp++] = 1; ${goNext}`;
+      case "iconst_2": return `stack[sp++] = 2; ${goNext}`;
+      case "iconst_3": return `stack[sp++] = 3; ${goNext}`;
+      case "iconst_4": return `stack[sp++] = 4; ${goNext}`;
+      case "iconst_5": return `stack[sp++] = 5; ${goNext}`;
+      case "dconst_0": return `stack[sp++] = 0.0; ${goNext}`;
+      case "dconst_1": return `stack[sp++] = 1.0; ${goNext}`;
+      case "fconst_0": return `stack[sp++] = 0.0; ${goNext}`;
+      case "fconst_1": return `stack[sp++] = 1.0; ${goNext}`;
+      case "fconst_2": return `stack[sp++] = 2.0; ${goNext}`;
+      case "lconst_0": return `stack[sp++] = 0n; ${goNext}`;
+      case "lconst_1": return `stack[sp++] = 1n; ${goNext}`;
+      case "bipush":
+      case "sipush": return `stack[sp++] = ${Number(instruction.arg)}; ${goNext}`;
+      case "ldc":
+      case "ldc_w":
+        if (isClassConstant(instruction.arg)) {
+          return `stack[sp++] = await helpers.classConstant(${JSON.stringify(instruction.arg[1])}); ${goNext}`;
+        }
+        return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
+      case "ldc2_w": return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
+      case "dup": return `stack[sp] = stack[sp - 1]; sp += 1; ${goNext}`;
+      case "dup_x1": return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+      case "dup_x2": {
+        if (!stackWidthsBefore || stackWidthsBefore.length < 2) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unverified dup_x2 stack widths" };`;
+        }
+        if (stackWidthsBefore[stackWidthsBefore.length - 2] === 2) {
+          return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+        }
+        return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+      }
+      case "dup2": {
+        const topIsCategory2 = stackWidthsBefore &&
+          stackWidthsBefore[stackWidthsBefore.length - 1] === 2;
+        if (topIsCategory2) {
+          return `{ const value1 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value1; } ${goNext}`;
+        }
+        return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+      }
+      case "pop": return `sp -= 1; ${goNext}`;
+      case "iadd": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] + b) | 0; } ${goNext}`;
+      case "isub": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] - b) | 0; } ${goNext}`;
+      case "imul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.imul(stack[sp - 1], b); } ${goNext}`;
+      case "ineg": return `stack[sp - 1] = (-stack[sp - 1]) | 0; ${goNext}`;
+      case "ixor": return `{ const b = stack[--sp]; stack[sp - 1] ^= b; } ${goNext}`;
+      case "iand": return `{ const b = stack[--sp]; stack[sp - 1] &= b; } ${goNext}`;
+      case "ior": return `{ const b = stack[--sp]; stack[sp - 1] |= b; } ${goNext}`;
+      case "irem": return `{ const b = stack[--sp]; if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = (stack[sp - 1] % b) | 0; } ${goNext}`;
+      case "ishl": return `{ const shift = stack[--sp]; stack[sp - 1] <<= shift & 31; } ${goNext}`;
+      case "ishr": return `{ const shift = stack[--sp]; stack[sp - 1] >>= shift & 31; } ${goNext}`;
+      case "iushr": return `{ const shift = stack[--sp]; stack[sp - 1] = (stack[sp - 1] >>> (shift & 31)) | 0; } ${goNext}`;
+      case "idiv": return `{ const b = stack[--sp]; if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = (stack[sp - 1] / b) | 0; } ${goNext}`;
+      case "dadd": return `{ const b = stack[--sp]; stack[sp - 1] += b; } ${goNext}`;
+      case "dsub": return `{ const b = stack[--sp]; stack[sp - 1] -= b; } ${goNext}`;
+      case "dmul": return `{ const b = stack[--sp]; stack[sp - 1] *= b; } ${goNext}`;
+      case "ddiv": return `{ const b = stack[--sp]; stack[sp - 1] /= b; } ${goNext}`;
+      case "dneg": return `stack[sp - 1] = -stack[sp - 1]; ${goNext}`;
+      case "fadd": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] + b); } ${goNext}`;
+      case "fsub": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] - b); } ${goNext}`;
+      case "fmul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] * b); } ${goNext}`;
+      case "fdiv": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] / b); } ${goNext}`;
+      case "frem": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] % b); } ${goNext}`;
+      case "fneg": return `stack[sp - 1] = Math.fround(-stack[sp - 1]); ${goNext}`;
+      case "i2d": return goNext;
+      case "i2b": return `stack[sp - 1] = (stack[sp - 1] << 24) >> 24; ${goNext}`;
+      case "i2s": return `stack[sp - 1] = (stack[sp - 1] << 16) >> 16; ${goNext}`;
+      case "i2c": return `stack[sp - 1] = stack[sp - 1] & 0xffff; ${goNext}`;
+      case "i2l": return `stack[sp - 1] = BigInt(stack[sp - 1]); ${goNext}`;
+      case "i2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
+      case "f2d": return goNext;
+      case "d2f": return `stack[sp - 1] = Math.fround(stack[sp - 1]); ${goNext}`;
+      case "f2i": return `stack[sp - 1] = helpers.floatToInt(stack[sp - 1]); ${goNext}`;
+      case "d2i": return `stack[sp - 1] = Math.trunc(stack[sp - 1]) | 0; ${goNext}`;
+      // Long operands are BigInt on the fast path but may arrive as plain
+      // Number 0 (uninitialized long fields); the interpreter wraps every
+      // operand in BigInt() before operating, and mixing throws in JS, so the
+      // generated tier must convert identically.
+      case "l2i": return `{ const value = stack[sp - 1]; stack[sp - 1] = Number(BigInt.asIntN(32, typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value))))); } ${goNext}`;
+      case "lxor": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) ^ BigInt(b)); } ${goNext}`;
+      case "ladd": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) + BigInt(b)); } ${goNext}`;
+      case "lsub": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) - BigInt(b)); } ${goNext}`;
+      case "land": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) & BigInt(b)); } ${goNext}`;
+      case "lor": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) | BigInt(b)); } ${goNext}`;
+      case "lneg": return `stack[sp - 1] = BigInt.asIntN(64, -BigInt(stack[sp - 1])); ${goNext}`;
+      case "lshl": return `{ const shift = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) << (BigInt(shift) & 63n)); } ${goNext}`;
+      case "lushr": return `{ const shift = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt.asUintN(64, BigInt(stack[sp - 1])) >> (BigInt(shift) & 63n)); } ${goNext}`;
+      case "lrem": return `{ const b = BigInt(stack[--sp]); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) % b); } ${goNext}`;
+      case "ldiv": return `{ const b = BigInt(stack[--sp]); if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) / b); } ${goNext}`;
+      case "lmul": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) * BigInt(b)); } ${goNext}`;
+      case "lshr": return `{ const shift = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) >> (BigInt(shift) & 63n)); } ${goNext}`;
+      case "lcmp": return `{ const b = BigInt(stack[--sp]); const a = BigInt(stack[sp - 1]); stack[sp - 1] = a < b ? -1 : (a > b ? 1 : 0); } ${goNext}`;
+      case "iinc": return `locals[${Number(instruction.varnum)}] = (locals[${Number(instruction.varnum)}] + ${Number(instruction.incr)}) | 0; ${goNext}`;
+      case "dcmpg": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], 1); } ${goNext}`;
+      case "dcmpl": return `{ const b = stack[--sp]; stack[sp - 1] = helpers.compareDouble(b, stack[sp - 1], -1); } ${goNext}`;
+      case "newarray": return `stack[sp - 1] = helpers.newPrimitiveArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
+      case "anewarray": return `stack[sp - 1] = helpers.newReferenceArray(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
+      case "arraylength": return `stack[sp - 1] = helpers.arrayLength(stack[sp - 1], frame); ${goNext}`;
+      case "checkcast":
+        if (this.compileSynchronous) {
+          return `{ const value = stack[sp - 1]; if (value !== null && value !== undefined) { const source = ${generatedRuntimeClassNameExpression("value")}; if (source !== ${JSON.stringify(instruction.arg)}) { const cast = helpers.tryCheckCastSourceSync(source, ${JSON.stringify(instruction.arg)}); if (cast === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous checkcast" }; } } } } ${goNext}`;
+        }
+        return `{ const value = stack[sp - 1]; await helpers.checkCast(value, ${JSON.stringify(instruction.arg)}); } ${goNext}`;
+      case "instanceof":
+        if (this.compileSynchronous) {
+          return `{ const result = helpers.tryInstanceOfSync(stack[sp - 1], ${JSON.stringify(instruction.arg)}); if (result === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous instanceof" }; } stack[sp - 1] = result; } ${goNext}`;
+        }
+        return `stack[sp - 1] = await helpers.instanceOf(stack[sp - 1], ${JSON.stringify(instruction.arg)}); ${goNext}`;
+      case "aaload":
+      case "iaload":
+      case "daload":
+      case "faload":
+      case "baload":
+      case "caload":
+      case "laload":
+      case "saload": {
+        const rawValue = "arrayData[index]";
+        const normalized = {
+          baload: `(array.type === "[Z" || array.elementType === "boolean") ? (${rawValue} ? 1 : 0) : ((Number(${rawValue}) << 24) >> 24)`,
+          caload: `(Number(${rawValue}) & 0xffff)`,
+          saload: `((Number(${rawValue}) << 16) >> 16)`,
+          iaload: `(Number(${rawValue}) | 0)`,
+          faload: `Math.fround(Number(${rawValue}))`,
+          laload: `BigInt.asIntN(64, BigInt(${rawValue}))`,
+          aaload: rawValue,
+          daload: rawValue,
+        }[op] || rawValue;
+        // Array representation is normally monomorphic at an individual JVM
+        // bytecode. Keep the checked fast access at that generated site rather
+        // than routing every element through one megamorphic helper. The slow
+        // path still owns exact JVM exceptions and optional diagnostics.
+        return `{ const index = stack[--sp]; const array = stack[sp - 1]; if (array === null || array === undefined || (index >>> 0) >= array.length) { stack[sp - 1] = helpers.arrayLoad(index, array, frame, ${JSON.stringify(op)}); } else { const arrayData = array.elements || array; stack[sp - 1] = ${normalized}; } } ${goNext}`;
+      }
+      case "aastore":
+      case "iastore":
+      case "dastore":
+      case "fastore":
+      case "bastore":
+      case "castore":
+      case "lastore":
+      case "sastore": {
+        const narrowed = {
+          bastore: `(array.type === "[Z" || array.elementType === "boolean") ? (Number(value) & 1) : ((Number(value) << 24) >> 24)`,
+          castore: `(Number(value) & 0xffff)`,
+          sastore: `((Number(value) << 16) >> 16)`,
+          iastore: `(Number(value) | 0)`,
+          fastore: `Math.fround(Number(value))`,
+          lastore: `BigInt.asIntN(64, BigInt(value))`,
+          aastore: "value",
+          dastore: "value",
+        }[op] || "value";
+        return `{ const value = stack[--sp]; const index = stack[--sp]; const array = stack[--sp]; if (array === null || array === undefined || (index >>> 0) >= array.length) { helpers.arrayStore(value, index, array, frame, ${JSON.stringify(op)}); } else { const arrayData = array.elements || array; arrayData[index] = ${narrowed}; } } ${goNext}`;
+      }
+      case "getfield": {
+        const fieldSiteId = this.registerFieldSite(instruction.arg);
+        return `stack[sp - 1] = helpers.getFieldAt(${fieldSiteId}, stack[sp - 1]); ${goNext}`;
+      }
+      case "putfield": {
+        const fieldSiteId = this.registerFieldSite(instruction.arg);
+        return `{ const value = stack[--sp]; helpers.putFieldAt(${fieldSiteId}, stack[--sp], value); } ${goNext}`;
+      }
+      case "getstatic":
+        if (this.compileSynchronous) {
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          return `{ const value = helpers.getStaticSyncAt(${fieldSiteId}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack[sp++] = value; } ${goNext}`;
+        }
+        return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack[sp++] = value; } ${goNext}`;
+      case "putstatic":
+        if (this.compileSynchronous) {
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          return `{ const changed = helpers.putStaticSyncAt(${fieldSiteId}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
+        }
+        return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[sp - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } sp -= 1; } ${goNext}`;
+      case "new":
+        if (this.compileSynchronous) {
+          return `{ const value = helpers.newObjectSync(${JSON.stringify(instruction.arg)}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous new" }; } stack[sp++] = value; } ${goNext}`;
+        }
+        return `{ const value = await helpers.newObject(${JSON.stringify(instruction.arg)}, thread); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated new" }; } stack[sp++] = value; } ${goNext}`;
+      case "monitorenter": return `{ const monitor = stack[sp - 1]; if (!helpers.monitorEnter(monitor, thread)) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "contended generated monitorenter" }; } sp -= 1; } ${goNext}`;
+      case "monitorexit": return `helpers.monitorExit(stack[--sp], thread); ${goNext}`;
+      case "invokestatic":
+      case "invokevirtual":
+      case "invokeinterface":
+      case "invokespecial":
+        if (this.compileSynchronous) {
+          const directJre = this.getCompileTimeDirectJre(op, instruction);
+          if (directJre) {
+            const result = directJre.returnsVoid
+              ? ""
+              : "stack[sp++] = directResult;";
+            const args = Array.from({ length: directJre.argumentCount }, (_unused, offset) =>
+              `stack[directBase + ${offset}]`).join(", ");
+            return `{ const directBase = sp - ${directJre.argumentCount}; const directResult = helpers.directJreIntrinsics[${directJre.id}](${args}); sp = directBase; ${result} } ${goNext}`;
+          }
+          const directInline = op === "invokestatic" && !this.profileMethods
+            ? this.getCompileTimeIntegerLeaf(instruction)
+            : null;
+          if (directInline) {
+            this.compileDirectInlineCount += 1;
+            const base = `inlineBase${this.compileDirectInlineCount}`;
+            const statements = directInline.statements
+              .map((line) => line.split("base").join(base)).join(" ");
+            const result = directInline.result.split("base").join(base);
+            return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
+          }
+          const callSiteId = this.registerSyncCallSite(op, instruction);
+          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
+        }
+        return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
+      case "goto": return `pc = ${target(instruction.arg)}; break;`;
+      case "ifeq": return `if (stack[--sp] === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifne": return `if (stack[--sp] !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "iflt": return `if (stack[--sp] < 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifge": return `if (stack[--sp] >= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifgt": return `if (stack[--sp] > 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifle": return `if (stack[--sp] <= 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifnull": return `if (stack[--sp] === null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "ifnonnull": return `if (stack[--sp] !== null) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
+      case "if_icmpeq": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpne": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmplt": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a < b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpge": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a >= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmpgt": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a > b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_icmple": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a <= b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_acmpeq": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a === b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "if_acmpne": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
+      case "athrow": return `throw stack[--sp];`;
+      case "return":
+        return `helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
+      case "areturn":
+      case "ireturn":
+      case "lreturn":
+      case "freturn":
+      case "dreturn":
+        return `{ const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
+      default:
+        return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
+    }
+  }
+
+  targetInstructionIndex(instruction, label) {
+    const labels = this.compileLabelMap;
+    const index = labels && labels.get(label);
+    if (index === undefined) {
+      throw new Error(`Label ${label} not found`);
+    }
+    return index;
+  }
+
+  // OSR probe shared by the runner and generated code: a frame that has been
+  // interpreting for thousands of bytecodes is exactly the kind the wasm tier
+  // wants (single-invocation loop monsters like va.d never re-enter through
+  // invoke()). prepare() warms/compiles regardless of position; entering
+  // mid-method is only sound at a supported block leader with an empty
+  // operand stack.
+  wasmOsrProbe(frame, thread, pc, stackLength) {
+    if (!this.wasmJit.enabled) return null;
+    frame.pc = pc;
+    const prep = this.wasmJit.prepare(frame);
+    if (!prep || stackLength !== 0) return null;
+    const result = this.wasmJit.execute(frame, thread, prep.st, prep.blk, true);
+    if (result.returned) {
+      return {
+        returned: true,
+        value: prep.st.meta.retChar === "V" ? RETURN_VOID : prep.st.meta.box.ret,
+      };
+    }
+    return { resumePc: frame.pc };
+  }
+
+  async runFrame(frame, thread) {
+    if (this.profileMethods) {
+      this.runnerRunCount += 1;
+      this.recordExecution(this.runnerMethodRunCounts, frame);
+    }
+    const locals = frame.locals;
+    const stack = frame.stack.items;
+    const instructions = frame.instructions;
+    let pc = frame.pc;
+    let bytecodesUntilYield = 100000;
+    // Prime stride so successive probes land on different pcs of a loop body —
+    // a fixed multiple of the body length would hit the same (possibly
+    // non-leader, non-empty-stack) offset forever.
+    let bytecodesUntilOsrProbe = 10007;
+
+    while (pc < instructions.length) {
+      bytecodesUntilYield -= 1;
+      bytecodesUntilOsrProbe -= 1;
+      if (bytecodesUntilOsrProbe === 0) {
+        bytecodesUntilOsrProbe = 10007;
+        this.materialize(frame, locals, stack, pc);
+        const osr = this.wasmOsrProbe(frame, thread, pc, stack.length);
+        if (osr) {
+          if (osr.returned) return { returned: true, value: osr.value };
+          pc = osr.resumePc; // transient exit: resume interpreting there
+        }
+      }
+      if (bytecodesUntilYield === 0) {
+        this.materialize(frame, locals, stack, pc);
+        await yieldToEventLoop();
+        bytecodesUntilYield = 100000;
+      }
+      if (this.shouldDeopt(frame, pc)) {
+        this.materialize(frame, locals, stack, pc);
+        return { deopt: true };
+      }
+
+      const item = instructions[pc];
+      const instruction = item.instruction;
+      pc += 1;
+      if (!instruction) {
+        continue;
+      }
+
+      const op = typeof instruction === "string" ? instruction : instruction.op;
+      this.materialize(frame, locals, stack, pc - 1);
+      switch (op) {
+        case "aconst_null": stack.push(null); break;
+        case "aload": stack.push(locals[Number(instruction.arg)]); break;
+        case "aload_0": stack.push(locals[0]); break;
+        case "aload_1": stack.push(locals[1]); break;
+        case "aload_2": stack.push(locals[2]); break;
+        case "aload_3": stack.push(locals[3]); break;
+        case "iload": stack.push(locals[Number(instruction.arg)]); break;
+        case "iload_0": stack.push(locals[0]); break;
+        case "iload_1": stack.push(locals[1]); break;
+        case "iload_2": stack.push(locals[2]); break;
+        case "iload_3": stack.push(locals[3]); break;
+        case "dload": stack.push(locals[Number(instruction.arg)]); break;
+        case "dload_0": stack.push(locals[0]); break;
+        case "dload_1": stack.push(locals[1]); break;
+        case "dload_2": stack.push(locals[2]); break;
+        case "dload_3": stack.push(locals[3]); break;
+        case "fload": stack.push(locals[Number(instruction.arg)]); break;
+        case "fload_0": stack.push(locals[0]); break;
+        case "fload_1": stack.push(locals[1]); break;
+        case "fload_2": stack.push(locals[2]); break;
+        case "fload_3": stack.push(locals[3]); break;
+        case "astore": locals[Number(instruction.arg)] = stack.pop(); break;
+        case "astore_0": locals[0] = stack.pop(); break;
+        case "astore_1": locals[1] = stack.pop(); break;
+        case "astore_2": locals[2] = stack.pop(); break;
+        case "astore_3": locals[3] = stack.pop(); break;
+        case "istore": locals[Number(instruction.arg)] = stack.pop(); break;
+        case "istore_0": locals[0] = stack.pop(); break;
+        case "istore_1": locals[1] = stack.pop(); break;
+        case "istore_2": locals[2] = stack.pop(); break;
+        case "istore_3": locals[3] = stack.pop(); break;
+        case "dstore": locals[Number(instruction.arg)] = stack.pop(); break;
+        case "dstore_0": locals[0] = stack.pop(); break;
+        case "dstore_1": locals[1] = stack.pop(); break;
+        case "dstore_2": locals[2] = stack.pop(); break;
+        case "dstore_3": locals[3] = stack.pop(); break;
+        case "fstore": locals[Number(instruction.arg)] = stack.pop(); break;
+        case "fstore_0": locals[0] = stack.pop(); break;
+        case "fstore_1": locals[1] = stack.pop(); break;
+        case "fstore_2": locals[2] = stack.pop(); break;
+        case "fstore_3": locals[3] = stack.pop(); break;
+        case "iconst_0": stack.push(0); break;
+        case "iconst_1": stack.push(1); break;
+        case "iconst_2": stack.push(2); break;
+        case "iconst_3": stack.push(3); break;
+        case "iconst_4": stack.push(4); break;
+        case "iconst_5": stack.push(5); break;
+        case "iconst_m1": stack.push(-1); break;
+        case "dconst_0": stack.push(0.0); break;
+        case "dconst_1": stack.push(1.0); break;
+        case "fconst_0": stack.push(0.0); break;
+        case "fconst_1": stack.push(1.0); break;
+        case "fconst_2": stack.push(2.0); break;
+        case "bipush":
+        case "sipush": stack.push(Number(instruction.arg)); break;
+        case "ldc":
+        case "ldc_w":
+          stack.push(isClassConstant(instruction.arg)
+            ? await this.classConstant(instruction.arg[1])
+            : this.constantValue(instruction.arg));
+          break;
+        case "ldc2_w": stack.push(this.constantValue(instruction.arg)); break;
+        case "dup": stack.push(stack[stack.length - 1]); break;
+        case "dup2": {
+          const value1 = stack.pop();
+          if (typeof value1 === "bigint") stack.push(value1, value1);
+          else {
+            const value2 = stack.pop();
+            stack.push(value2, value1, value2, value1);
+          }
+          break;
+        }
+        case "pop": stack.pop(); break;
+        case "iadd": stack.push((stack.pop() + stack.pop()) | 0); break;
+        case "isub": { const b = stack.pop(); const a = stack.pop(); stack.push((a - b) | 0); break; }
+        case "imul": stack.push(Math.imul(stack.pop(), stack.pop())); break;
+        case "ineg": stack.push((-stack.pop()) | 0); break;
+        case "ixor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
+        case "ishr": { const shift = stack.pop(); const value = stack.pop(); stack.push(value >> (shift & 31)); break; }
+        case "idiv": { const b = stack.pop(); const a = stack.pop(); if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" }; stack.push((a / b) | 0); break; }
+        case "dadd": stack.push(stack.pop() + stack.pop()); break;
+        case "dsub": { const b = stack.pop(); const a = stack.pop(); stack.push(a - b); break; }
+        case "dmul": stack.push(stack.pop() * stack.pop()); break;
+        case "ddiv": { const b = stack.pop(); const a = stack.pop(); stack.push(a / b); break; }
+        case "dneg": stack.push(-stack.pop()); break;
+        case "fadd": stack.push(Math.fround(stack.pop() + stack.pop())); break;
+        case "fsub": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a - b)); break; }
+        case "fmul": stack.push(Math.fround(stack.pop() * stack.pop())); break;
+        case "fdiv": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a / b)); break; }
+        case "frem": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a % b)); break; }
+        case "fneg": stack.push(Math.fround(-stack.pop())); break;
+        case "i2d": break;
+        case "i2l": stack.push(BigInt(stack.pop())); break;
+        case "i2f": stack.push(Math.fround(stack.pop())); break;
+        case "f2d": break;
+        case "d2f": stack.push(Math.fround(stack.pop())); break;
+        case "f2i": stack.push(floatToInt(stack.pop())); break;
+        case "i2b": stack.push((stack.pop() << 24) >> 24); break;
+        case "d2i": stack.push(Math.trunc(stack.pop()) | 0); break;
+        case "l2i": stack.push(Number(BigInt.asIntN(32, stack.pop()))); break;
+        case "lxor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
+        case "ldiv": {
+          const b = stack.pop();
+          const a = stack.pop();
+          if (b === 0n) throw { type: "java/lang/ArithmeticException", message: "/ by zero" };
+          stack.push(a / b);
+          break;
+        }
+        case "lmul": { const b = stack.pop(); const a = stack.pop(); stack.push(BigInt.asIntN(64, a * b)); break; }
+        case "lshr": { const shift = stack.pop(); const value = stack.pop(); stack.push(value >> BigInt(shift & 63)); break; }
+        case "lcmp": { const b = stack.pop(); const a = stack.pop(); stack.push(a < b ? -1 : (a > b ? 1 : 0)); break; }
+        case "iand": stack.push(stack.pop() & stack.pop()); break;
+        case "ior": stack.push(stack.pop() | stack.pop()); break;
+        case "irem": {
+          const b = stack.pop();
+          const a = stack.pop();
+          if (b === 0) throw { type: "java/lang/ArithmeticException", message: "/ by zero" };
+          stack.push((a % b) | 0);
+          break;
+        }
+        case "ishl": { const shift = stack.pop(); const value = stack.pop(); stack.push(value << (shift & 31)); break; }
+        case "iushr": { const shift = stack.pop(); const value = stack.pop(); stack.push((value >>> (shift & 31)) | 0); break; }
+        case "iinc": {
+          const index = Number(instruction.varnum);
+          locals[index] = (locals[index] + Number(instruction.incr)) | 0;
+          break;
+        }
+        case "dcmpg": stack.push(compareDouble(stack.pop(), stack.pop(), 1)); break;
+        case "dcmpl": stack.push(compareDouble(stack.pop(), stack.pop(), -1)); break;
+        case "newarray": stack.push(this.newPrimitiveArray(stack.pop(), instruction.arg)); break;
+        case "anewarray": stack.push(this.newReferenceArray(stack.pop(), instruction.arg)); break;
+        case "multianewarray": stack.push(this.newMultiArray(instruction.arg, stack)); break;
+        case "arraylength": stack.push(this.arrayLength(stack.pop(), frame)); break;
+        case "checkcast": {
+          const value = stack[stack.length - 1];
+          if (value !== null && !await this.jvm.isInstanceOfAsync(runtimeClassName(value), instruction.arg)) {
+            throw {
+              type: "java/lang/ClassCastException",
+              message: `${runtimeClassName(value)} cannot be cast to ${instruction.arg}`,
+            };
+          }
+          break;
+        }
+        case "aaload":
+        case "iaload":
+        case "daload":
+        case "faload":
+        case "baload": stack.push(this.arrayLoad(stack.pop(), stack.pop(), frame, op)); break;
+        case "caload":
+        case "saload": stack.push(this.arrayLoad(stack.pop(), stack.pop(), frame, op)); break;
+        case "aastore":
+        case "iastore":
+        case "dastore":
+        case "fastore":
+        case "bastore":
+        case "castore":
+        case "sastore": this.arrayStore(stack.pop(), stack.pop(), stack.pop(), frame, op); break;
+        case "getfield": stack.push(this.getField(stack.pop(), instruction.arg)); break;
+        case "putfield": { const value = stack.pop(); const obj = stack.pop(); this.putField(obj, instruction.arg, value); break; }
+        case "getstatic": {
+          const value = await this.getStatic(instruction.arg, thread);
+          if (value === STATIC_DEOPT) {
+            this.materialize(frame, locals, stack, pc - 1);
+            return { deopt: true, transient: true, reason: "class initialization at getstatic" };
+          }
+          stack.push(value);
+          break;
+        }
+        case "putstatic": {
+          const changed = await this.putStatic(instruction.arg, stack[stack.length - 1], thread);
+          if (changed === STATIC_DEOPT) {
+            this.materialize(frame, locals, stack, pc - 1);
+            return { deopt: true, transient: true, reason: "class initialization at putstatic" };
+          }
+          stack.pop();
+          break;
+        }
+        case "new": {
+          const value = await this.newObject(instruction.arg, thread);
+          if (value === STATIC_DEOPT) {
+            this.materialize(frame, locals, stack, pc - 1);
+            return { deopt: true, transient: true, reason: "class initialization at new" };
+          }
+          stack.push(value);
+          break;
+        }
+        case "monitorenter": {
+          const monitor = stack[stack.length - 1];
+          if (!this.monitorEnter(monitor, thread)) {
+            this.materialize(frame, locals, stack, pc - 1);
+            return { deopt: true, transient: true, reason: "contended monitorenter" };
+          }
+          stack.pop();
+          break;
+        }
+        case "monitorexit": this.monitorExit(stack.pop(), thread); break;
+        case "invokestatic":
+        case "invokevirtual":
+        case "invokeinterface":
+        case "invokespecial": {
+          const invokePc = pc - 1;
+          this.materialize(frame, locals, stack, pc);
+          const value = await this.invoke(op, frame, instruction, thread, invokePc);
+          if (value && value.deopt) return value;
+          if (value !== RETURN_VOID) stack.push(value);
+          if (thread.status !== "runnable") {
+            this.materialize(frame, locals, stack, pc);
+            return { deopt: true, reason: `thread yielded in ${frame.className || ""}.${frame.method.name}` };
+          }
+          break;
+        }
+        case "goto": pc = this.target(frame, instruction.arg); break;
+        case "ifeq": if (stack.pop() === 0) pc = this.target(frame, instruction.arg); break;
+        case "ifne": if (stack.pop() !== 0) pc = this.target(frame, instruction.arg); break;
+        case "iflt": if (stack.pop() < 0) pc = this.target(frame, instruction.arg); break;
+        case "ifge": if (stack.pop() >= 0) pc = this.target(frame, instruction.arg); break;
+        case "ifgt": if (stack.pop() > 0) pc = this.target(frame, instruction.arg); break;
+        case "ifle": if (stack.pop() <= 0) pc = this.target(frame, instruction.arg); break;
+        case "ifnull": if (stack.pop() === null) pc = this.target(frame, instruction.arg); break;
+        case "ifnonnull": if (stack.pop() !== null) pc = this.target(frame, instruction.arg); break;
+        case "if_icmpeq": { const b = stack.pop(); const a = stack.pop(); if (a === b) pc = this.target(frame, instruction.arg); break; }
+        case "if_icmpne": { const b = stack.pop(); const a = stack.pop(); if (a !== b) pc = this.target(frame, instruction.arg); break; }
+        case "if_icmplt": { const b = stack.pop(); const a = stack.pop(); if (a < b) pc = this.target(frame, instruction.arg); break; }
+        case "if_icmpge": { const b = stack.pop(); const a = stack.pop(); if (a >= b) pc = this.target(frame, instruction.arg); break; }
+        case "if_icmpgt": { const b = stack.pop(); const a = stack.pop(); if (a > b) pc = this.target(frame, instruction.arg); break; }
+        case "if_icmple": { const b = stack.pop(); const a = stack.pop(); if (a <= b) pc = this.target(frame, instruction.arg); break; }
+        case "if_acmpeq": { const b = stack.pop(); const a = stack.pop(); if (a === b) pc = this.target(frame, instruction.arg); break; }
+        case "if_acmpne": { const b = stack.pop(); const a = stack.pop(); if (a !== b) pc = this.target(frame, instruction.arg); break; }
+        case "athrow": throw stack.pop();
+        case "return":
+          this.materialize(frame, locals, stack, pc);
+          thread.callStack.pop();
+          return { returned: true, value: RETURN_VOID };
+        case "areturn":
+        case "ireturn":
+        case "lreturn":
+        case "freturn":
+        case "dreturn": {
+          const ret = stack.pop();
+          this.materialize(frame, locals, stack, pc);
+          thread.callStack.pop();
+          return { returned: true, value: ret };
+        }
+        default:
+          this.materialize(frame, locals, stack, pc - 1);
+          return { deopt: true, reason: `unsupported opcode ${op} in ${frame.className || ""}.${frame.method.name}` };
+      }
+    }
+
+    this.materialize(frame, locals, stack, pc);
+    thread.callStack.pop();
+    return { returned: true, value: RETURN_VOID };
+  }
+
+  returnVoid() {
+    return RETURN_VOID;
+  }
+
+  staticDeopt() {
+    return STATIC_DEOPT;
+  }
+
+  cooperativeYield() {
+    return yieldToEventLoop();
+  }
+
+  compareDouble(value2, value1, nanValue) {
+    return compareDouble(value2, value1, nanValue);
+  }
+
+  floatToInt(value) {
+    return floatToInt(value);
+  }
+
+  constantValue(arg) {
+    if (arg && typeof arg === "object" && Object.prototype.hasOwnProperty.call(arg, "value")) {
+      return arg.value;
+    }
+    if (typeof arg === "string") {
+      return this.jvm.internString(arg);
+    }
+    return arg;
+  }
+
+  async classConstant(className) {
+    return this.jvm.getClassObject(className);
+  }
+
+  // Shared with the interpreter and the wasm allocation imports (heap-backed
+  // views with the linear heap on, long arrays default to 0n, negative sizes
+  // throw the guest NegativeArraySizeException).
+  newPrimitiveArray(count, type) {
+    return allocPrimitiveArray(this.jvm, type, count);
+  }
+
+  newReferenceArray(count, elementType) {
+    return allocReferenceArray(this.jvm, elementType, count);
+  }
+
+  newMultiArray(arg, stack) {
+    const [className, dimensions] = arg;
+    const counts = [];
+    for (let i = 0; i < dimensions; i += 1) {
+      counts.unshift(stack.pop());
+    }
+    const baseType = className.replace(/^\[+/, "");
+    const leafDefault = baseType.startsWith("L") ? null : 0;
+    const make = (depth) => {
+      const count = counts[depth];
+      const arr = new Array(count);
+      arr.type = className.slice(depth);
+      arr.hashCode = this.jvm.nextHashCode++;
+      if (depth === counts.length - 1) {
+        arr.fill(leafDefault);
+      } else {
+        for (let i = 0; i < count; i += 1) arr[i] = make(depth + 1);
+      }
+      return arr;
+    };
+    return make(0);
+  }
+
+  arrayLength(arrayRef, frame) {
+    if (arrayRef === null || arrayRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: `Attempted to get length of null array in ${frame.method.name}` };
+    }
+    return arrayRef.length;
+  }
+
+  async checkCast(value, className) {
+    if (value === null || value === undefined) return;
+    if (!await this.jvm.isInstanceOfAsync(runtimeClassName(value), className)) {
+      throw {
+        type: "java/lang/ClassCastException",
+        message: `${runtimeClassName(value)} cannot be cast to ${className}`,
+      };
+    }
+  }
+
+  tryCheckCastSync(value, className) {
+    if (value === null || value === undefined) return true;
+    const source = runtimeClassName(value);
+    return this.tryCheckCastSourceSync(source, className);
+  }
+
+  tryCheckCastSourceSync(source, className) {
+    const assignable = this.tryAssignableSourceSync(source, className);
+    if (assignable === null) return ASYNC_INVOKE;
+    if (!assignable) {
+      throw {
+        type: "java/lang/ClassCastException",
+        message: `${source} cannot be cast to ${className}`,
+      };
+    }
+    return true;
+  }
+
+  async instanceOf(value, className) {
+    if (value === null || value === undefined) return 0;
+    return await this.jvm.isInstanceOfAsync(runtimeClassName(value), className) ? 1 : 0;
+  }
+
+  tryInstanceOfSync(value, className) {
+    if (value === null || value === undefined) return 0;
+    const source = runtimeClassName(value);
+    const assignable = this.tryAssignableSourceSync(source, className);
+    if (assignable === null) return ASYNC_INVOKE;
+    return assignable ? 1 : 0;
+  }
+
+  tryAssignableSourceSync(source, className) {
+    let bySource = this.syncAssignabilityCache.get(className);
+    if (bySource && bySource.has(source)) return bySource.get(source);
+    const assignable = this.jvm.isInstanceOfSync(source, className);
+    if (assignable !== null) {
+      if (!bySource) {
+        bySource = new Map();
+        this.syncAssignabilityCache.set(className, bySource);
+      }
+      bySource.set(source, assignable);
+    }
+    return assignable;
+  }
+
+  monitorEnter(monitor, thread) {
+    if (monitor === null || monitor === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!monitor.isLocked) {
+      monitor.isLocked = true;
+      monitor.lockOwner = thread.id;
+      monitor.lockCount = 1;
+      delete thread.blockingOn;
+      return true;
+    }
+    if (monitor.lockOwner === thread.id) {
+      monitor.lockCount += 1;
+      return true;
+    }
+    thread.status = "BLOCKED";
+    thread.blockingOn = monitor;
+    return false;
+  }
+
+  monitorExit(monitor, thread) {
+    if (monitor === null || monitor === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (monitor.lockOwner !== thread.id) {
+      throw { type: "java/lang/IllegalMonitorStateException", message: null };
+    }
+    monitor.lockCount -= 1;
+    if (monitor.lockCount === 0) {
+      monitor.isLocked = false;
+      monitor.lockOwner = null;
+    }
+  }
+
+  arrayLoad(index, arrayRef, frame, kind) {
+    if (arrayRef === null || arrayRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: `Attempted to load from null array in ${frame.method.name}` };
+    }
+    const value = monoArray.load(arrayRef, index);
+    if (value === monoArray.OOB) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
+    }
+    return normalizeArrayLoad(value, kind, arrayRef);
+  }
+
+  normalizeArrayLoad(value, kind, arrayRef) {
+    return normalizeArrayLoad(value, kind, arrayRef);
+  }
+
+  normalizeArrayStore(value, kind, arrayRef) {
+    return normalizeArrayStore(value, kind, arrayRef);
+  }
+
+  // A generated region may keep this raw storage pointer in a scalar local.
+  // The Java array object itself remains canonical in locals/fields/snapshots.
+  arrayData(arrayRef) {
+    if (arrayRef === null || arrayRef === undefined) return null;
+    if (arrayRef.elements) return arrayRef.elements;
+    if (Array.isArray(arrayRef) || ArrayBuffer.isView(arrayRef)) return arrayRef;
+    return null;
+  }
+
+  arrayStore(value, index, arrayRef, frame, kind) {
+    if (arrayRef === null || arrayRef === undefined) {
+      if (typeof process !== "undefined" && process.env &&
+          process.env.JVM_DEBUG_NULL_ARRAY === "1") {
+        const diagnosticScalar = (item) => {
+          if (item === null || item === undefined) return item;
+          if (typeof item === "string" || typeof item === "number" ||
+              typeof item === "boolean" || typeof item === "bigint") {
+            return typeof item === "bigint" ? `${item}n` : item;
+          }
+          if (Array.isArray(item) || ArrayBuffer.isView(item)) return `[${item.length}]`;
+          if (typeof item === "object") {
+            const type = typeof item.type === "string" ? item.type : null;
+            return type ? `<${type}>` : `<${item.constructor && item.constructor.name || "object"}>`;
+          }
+          return typeof item;
+        };
+        const receiver = frame.locals && frame.locals[0];
+        const fields = receiver && receiver.fields
+          ? Object.fromEntries(Object.entries(receiver.fields).map(([key, fieldValue]) => [
+            key,
+            diagnosticScalar(fieldValue),
+          ]))
+          : null;
+        console.error("[null-array-store:jitted]", JSON.stringify({
+          owner: diagnosticScalar(frame.className),
+          method: `${frame.method && frame.method.name}${frame.method && frame.method.descriptor || ""}`,
+          pc: frame.pc - 1,
+          index: diagnosticScalar(index),
+          receiverType: diagnosticScalar(receiver && receiver.type),
+          fields,
+        }));
+      }
+      throw { type: "java/lang/NullPointerException", message: `Attempted to store into null array in ${frame.method.name}` };
+    }
+    const narrowed = normalizeArrayStore(value, kind, arrayRef);
+    if (!monoArray.store(arrayRef, index, narrowed)) {
+      if (typeof process !== "undefined" && process.env &&
+          process.env.JVM_DEBUG_ARRAY_OOB === "1") {
+        const scalar = (item) => {
+          if (item === null || item === undefined) return item;
+          if (typeof item === "bigint") return `${item}n`;
+          if (typeof item !== "object") return item;
+          if (Array.isArray(item) || ArrayBuffer.isView(item)) return `[${item.length}]`;
+          return typeof item.type === "string" ? `<${item.type}>` : "<object>";
+        };
+        console.error("[array-store-oob:jitted]", JSON.stringify({
+          owner: scalar(frame.className),
+          method: `${frame.method && frame.method.name}${frame.method && frame.method.descriptor || ""}`,
+          pc: frame.pc - 1,
+          index: scalar(index),
+          length: monoArray.len(arrayRef),
+          locals: (frame.locals || []).map(scalar),
+        }));
+      }
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
+    }
+  }
+
+  registerFieldSite(arg) {
+    const [, className, [fieldName, descriptor]] = arg;
+    // A fieldref resolves to one declaring-class slot regardless of the
+    // receiver's runtime subclass. Bind that verified slot once from loaded
+    // class metadata; generated code can then use the ordinary Java-object
+    // field map directly and retain the generic resolver only for synthetic
+    // or JRE objects with a nonstandard layout.
+    let declaringClassName = className;
+    let directInstanceKey = null;
+    while (declaringClassName) {
+      const classData = this.jvm.classes[declaringClassName];
+      const classAst = classData?.ast?.classes?.[0];
+      if (!classAst) break;
+      const declared = (classAst.items || []).some((item) =>
+        item?.type === "field" &&
+        item.field?.name === fieldName &&
+        item.field?.descriptor === descriptor &&
+        !(item.field?.flags || []).includes("static") &&
+        !(Number(item.field?.accessFlags) & 0x0008));
+      if (declared) {
+        directInstanceKey = `${declaringClassName}.${fieldName}`;
+        break;
+      }
+      declaringClassName = classAst.superClassName || null;
+    }
+    const id = this.nextFieldSiteId++;
+    this.fieldSites[id] = {
+      arg,
+      className,
+      fieldName,
+      descriptor,
+      directKey: `${className}.${fieldName}`,
+      directInstanceKey,
+      instanceKeys: new Map(),
+      staticTarget: null,
+    };
+    return id;
+  }
+
+  canEliminateFieldRead(arg) {
+    if (!Array.isArray(arg) || !Array.isArray(arg[2])) return false;
+    const [, declaredClassName, [fieldName, descriptor]] = arg;
+    let className = declaredClassName;
+    while (className) {
+      const classData = this.jvm.classes[className];
+      const classAst = classData?.ast?.classes?.[0];
+      if (!classAst) return false;
+      const field = (classAst.items || []).find((item) => item?.type === "field" &&
+        item.field?.name === fieldName && item.field?.descriptor === descriptor);
+      if (field) {
+        if ((field.field.flags || []).includes("volatile")) return false;
+        const accessFlags = Number(field.field.accessFlags);
+        return Number.isFinite(accessFlags) && (accessFlags & 0x0040) === 0;
+      }
+      className = classAst.superClassName || null;
+    }
+    return false;
+  }
+
+  getFieldAt(id, objRef) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated field site ${id}`);
+    if (objRef === null || objRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!objRef.fields) {
+      return objRef[site.directKey] ?? objRef[site.fieldName];
+    }
+
+    const runtimeType = objRef.type || objRef._className || site.className;
+    if (Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)) {
+      return objRef.fields[site.directKey];
+    }
+    const cachedKey = site.instanceKeys.get(runtimeType);
+    if (cachedKey && Object.prototype.hasOwnProperty.call(objRef.fields, cachedKey)) {
+      return objRef.fields[cachedKey];
+    }
+    const fieldKey = resolveInstanceFieldKey(
+      this.jvm, objRef, site.className, site.fieldName,
+    );
+    if (fieldKey) site.instanceKeys.set(runtimeType, fieldKey);
+    return fieldKey ? objRef.fields[fieldKey] : undefined;
+  }
+
+  putFieldAt(id, objRef, value) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated field site ${id}`);
+    if (objRef === null || objRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!objRef.fields) objRef.fields = {};
+    const runtimeType = objRef.type || objRef._className || site.className;
+    let fieldKey = Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)
+      ? site.directKey
+      : site.instanceKeys.get(runtimeType);
+    if (!fieldKey || !Object.prototype.hasOwnProperty.call(objRef.fields, fieldKey)) {
+      fieldKey = resolveInstanceFieldKey(this.jvm, objRef, site.className, site.fieldName)
+        || site.directKey;
+      site.instanceKeys.set(runtimeType, fieldKey);
+    }
+    objRef.fields[fieldKey] = value;
+    objRef[site.fieldName] = value;
+  }
+
+  resolveStaticFieldSite(site, forWrite = false) {
+    const key = `${site.fieldName}:${site.descriptor}`;
+    let currentClassName = site.className;
+    while (currentClassName) {
+      const classData = this.jvm.classes[currentClassName];
+      if (classData && classData.staticFields) {
+        if (classData.staticFields.has(key)) {
+          return { kind: "map", fields: classData.staticFields, key };
+        }
+        if (!forWrite && classData.staticFields.has(site.fieldName)) {
+          return { kind: "map", fields: classData.staticFields, key: site.fieldName };
+        }
+        if (!forWrite) {
+          for (const candidate of classData.staticFields.keys()) {
+            if (typeof candidate === "string" &&
+                candidate.split(":")[0].replace(/'/g, "") === site.fieldName) {
+              return { kind: "map", fields: classData.staticFields, key: candidate };
+            }
+          }
+        }
+      }
+      currentClassName = classData && classData.ast && classData.ast.classes[0]
+        ? classData.ast.classes[0].superClassName
+        : null;
+    }
+
+    if (!forWrite) {
+      const jreFields = this.jvm.jre[site.className] &&
+        this.jvm.jre[site.className].staticFields;
+      if (jreFields) {
+        for (const candidate of [
+          key, `'${key}'`, `${key}'`, `'${key}`, site.fieldName, `'${site.fieldName}'`,
+        ]) {
+          if (Object.prototype.hasOwnProperty.call(jreFields, candidate)) {
+            return { kind: "object", fields: jreFields, key: candidate };
+          }
+        }
+      }
+    }
+
+    if (forWrite) {
+      const classData = this.jvm.classes[site.className];
+      if (classData && classData.staticFields) {
+        return { kind: "map", fields: classData.staticFields, key };
+      }
+    }
+    return null;
+  }
+
+  registerDirectStaticTarget(id, forWrite = false) {
+    const site = this.fieldSites[id];
+    if (!site) return null;
+    let target = site.staticTarget;
+    if (!target || (forWrite && target.kind !== "map")) {
+      target = this.resolveStaticFieldSite(site, forWrite);
+    }
+    if (!target || (forWrite && target.kind !== "map")) return null;
+    site.staticTarget = target;
+    const targetId = this.directStaticTargets.length;
+    this.directStaticTargets.push(target);
+    return { targetId, kind: target.kind, key: target.key, className: site.className };
+  }
+
+  getStaticSyncAt(id) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated static field site ${id}`);
+    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+      return STATIC_DEOPT;
+    }
+    let target = site.staticTarget;
+    if (!target) {
+      target = this.resolveStaticFieldSite(site);
+      if (!target) {
+        return this.getStaticInitialized(site.className, site.fieldName, site.descriptor);
+      }
+      site.staticTarget = target;
+    }
+    return target.kind === "map"
+      ? target.fields.get(target.key)
+      : target.fields[target.key];
+  }
+
+  putStaticSyncAt(id, value) {
+    const site = this.fieldSites[id];
+    if (!site) throw new Error(`Unknown generated static field site ${id}`);
+    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+      return STATIC_DEOPT;
+    }
+    let target = site.staticTarget;
+    if (!target || target.kind !== "map") {
+      target = this.resolveStaticFieldSite(site, true);
+      if (!target) {
+        return this.putStaticInitialized(
+          site.className, site.fieldName, site.descriptor, value,
+        );
+      }
+      site.staticTarget = target;
+    }
+    target.fields.set(target.key, value);
+    return true;
+  }
+
+  getField(objRef, arg) {
+    const [, className, [fieldName]] = arg;
+    if (objRef === null || objRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (objRef.fields) {
+      const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName);
+      return fieldKey ? objRef.fields[fieldKey] : undefined;
+    }
+    return objRef[`${className}.${fieldName}`] ?? objRef[fieldName];
+  }
+
+  putField(objRef, arg, value) {
+    const [, className, [fieldName]] = arg;
+    if (objRef === null || objRef === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (!objRef.fields) objRef.fields = {};
+    const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
+    objRef.fields[fieldKey] = value;
+    objRef[fieldName] = value;
+  }
+
+  getStatic(arg, thread) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+      return this.getStaticCold(arg, thread);
+    }
+    return this.getStaticInitialized(className, fieldName, descriptor);
+  }
+
+  getStaticSync(arg) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return STATIC_DEOPT;
+    return this.getStaticInitialized(className, fieldName, descriptor);
+  }
+
+  async getStaticCold(arg, thread) {
+    const [, className, [fieldName, descriptor]] = arg;
+    const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) return STATIC_DEOPT;
+    return this.getStaticInitialized(className, fieldName, descriptor);
+  }
+
+  getStaticInitialized(className, fieldName, descriptor) {
+    const target = this.getInitializedStaticTarget(
+      this.initializedStaticReadTargets,
+      className,
+      fieldName,
+      descriptor,
+      false,
+    );
+    if (!target) throw new Error(`Unresolved static field: ${className}.${fieldName}`);
+    return target.kind === "map"
+      ? target.fields.get(target.key)
+      : target.fields[target.key];
+  }
+
+  putStatic(arg, value, thread) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+      return this.putStaticCold(arg, value, thread);
+    }
+    return this.putStaticInitialized(className, fieldName, descriptor, value);
+  }
+
+  putStaticSync(arg, value) {
+    const [, className, [fieldName, descriptor]] = arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return STATIC_DEOPT;
+    return this.putStaticInitialized(className, fieldName, descriptor, value);
+  }
+
+  async putStaticCold(arg, value, thread) {
+    const [, className, [fieldName, descriptor]] = arg;
+    const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) return STATIC_DEOPT;
+    return this.putStaticInitialized(className, fieldName, descriptor, value);
+  }
+
+  putStaticInitialized(className, fieldName, descriptor, value) {
+    const target = this.getInitializedStaticTarget(
+      this.initializedStaticWriteTargets,
+      className,
+      fieldName,
+      descriptor,
+      true,
+    );
+    if (!target || target.kind !== "map") {
+      throw new Error(`Unsupported putstatic: ${className}.${fieldName}`);
+    }
+    target.fields.set(target.key, value);
+    return true;
+  }
+
+  getInitializedStaticTarget(
+    cache, className, fieldName, descriptor, forWrite,
+  ) {
+    let classTargets = cache.get(className);
+    if (!classTargets) {
+      classTargets = new Map();
+      cache.set(className, classTargets);
+    }
+    let fieldTargets = classTargets.get(fieldName);
+    if (!fieldTargets) {
+      fieldTargets = new Map();
+      classTargets.set(fieldName, fieldTargets);
+    }
+    if (fieldTargets.has(descriptor)) return fieldTargets.get(descriptor);
+    const target = this.resolveStaticFieldSite({
+      className,
+      fieldName,
+      descriptor,
+    }, forWrite);
+    if (target && (!forWrite || target.kind === "map")) {
+      fieldTargets.set(descriptor, target);
+      return target;
+    }
+    return null;
+  }
+
+  async newObject(className, thread) {
+    const wasFramePushed = await this.jvm.initializeClassIfNeeded(className, thread);
+    if (wasFramePushed) return STATIC_DEOPT;
+    await this.jvm.loadClassByName(className).catch(() => null);
+
+    return this.allocateObject(className);
+  }
+
+  newObjectSync(className) {
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED" ||
+        !this.jvm.classes[className]) return STATIC_DEOPT;
+    return this.allocateObject(className);
+  }
+
+  allocateObject(className) {
+    const fields = {};
+    let currentClassName = className;
+    while (currentClassName) {
+      const currentClassData = this.jvm.classes[currentClassName];
+      if (!currentClassData || !currentClassData.ast || !currentClassData.ast.classes[0]) break;
+      const classFields = currentClassData.ast.classes[0].items.filter((item) => item.type === "field");
+      for (const field of classFields) {
+        const descriptor = field.field.descriptor;
+        let defaultValue = null;
+        if (descriptor === "I" || descriptor === "B" || descriptor === "S" || descriptor === "Z" || descriptor === "C") defaultValue = 0;
+        else if (descriptor === "J") defaultValue = BigInt(0);
+        else if (descriptor === "F" || descriptor === "D") defaultValue = 0.0;
+        fields[`${currentClassName}.${field.field.name}`] = defaultValue;
+      }
+      currentClassName = currentClassData.ast.classes[0].superClassName;
+    }
+    return {
+      type: className,
+      fields,
+      hashCode: this.jvm.nextHashCode++,
+      isLocked: false,
+      lockOwner: null,
+      lockCount: 0,
+      waitSet: [],
+    };
+  }
+
+  asyncInvokeSentinel() {
+    return ASYNC_INVOKE;
+  }
+
+  registerSyncCallSite(op, instruction) {
+    const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const id = this.nextSyncCallSiteId++;
+    this.syncCallSites[id] = {
+      op,
+      declaredClassName,
+      methodName,
+      descriptor,
+      ...parseDescriptor(descriptor),
+      targets: new Map(),
+    };
+    return id;
+  }
+
+  getCompileTimeDirectJre(op, instruction) {
+    if (this.profileMethods || op === "invokestatic" ||
+        !instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const method = this.resolveSynchronousJreMethod(
+      declaredClassName, declaredClassName, methodName, descriptor);
+    if (typeof method?.jvmDirectIntrinsic !== "function" ||
+        method.jvmDirectFinal !== true) return null;
+    let parsed;
+    try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
+    const id = this.directJreIntrinsics.length;
+    this.directJreIntrinsics.push(method.jvmDirectIntrinsic);
+    return {
+      id,
+      argumentCount: parsed.params.length + 1,
+      returnsVoid: parsed.returnType === "void",
+    };
+  }
+
+  tryInvokeSyncAt(id, frame, thread) {
+    const site = this.syncCallSites[id];
+    if (!site) return ASYNC_INVOKE;
+    const jre = site.fastJreTarget;
+    if (jre) {
+      const receiver = site.op === "invokestatic" ? null
+        : frame.stack.items[frame.stack.items.length - site.params.length - 1];
+      if (site.op === "invokestatic" ||
+          receiver !== null && receiver !== undefined &&
+          (receiver.type || site.declaredClassName) === jre.targetClassName) {
+        return this.tryInvokeSynchronousJre(site, jre, frame, thread);
+      }
+    }
+    const fast = site.fastIntrinsic;
+    if (fast) {
+      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED" ||
+          this.jvm.debugManager.isClassJitDeopted(fast.lookupClass)) {
+        return ASYNC_INVOKE;
+      }
+      const base = frame.stack.items.length - site.params.length;
+      const value = fast.intrinsic(frame.stack.items, base);
+      if (value === ASYNC_INVOKE) return ASYNC_INVOKE;
+      frame.stack.items.length = base;
+      if (this.profileMethods) {
+        this.syncIntrinsicCallCount += 1;
+        this.intrinsicMethodRunCounts.set(
+          fast.methodKey,
+          (this.intrinsicMethodRunCounts.get(fast.methodKey) || 0) + 1,
+        );
+      }
+      return value;
+    }
+    const target = site.fastStaticTarget;
+    if (target) {
+      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED") {
+        return ASYNC_INVOKE;
+      }
+      return this.tryInvokeResolvedTarget(site, target, frame, thread);
+    }
+    const special = site.fastSpecialTarget;
+    if (special) {
+      const receiver =
+        frame.stack.items[frame.stack.items.length - site.params.length - 1];
+      if (receiver === null || receiver === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      return this.tryInvokeResolvedTarget(site, special, frame, thread);
+    }
+    const dynamicIntrinsic = site.fastDynamicIntrinsic;
+    if (dynamicIntrinsic) {
+      const base = frame.stack.items.length - site.params.length - 1;
+      const receiver = frame.stack.items[base];
+      if (receiver === null || receiver === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if ((receiver.type || site.declaredClassName) ===
+          dynamicIntrinsic.targetClassName) {
+        if (this.jvm.debugManager.isClassJitDeopted(dynamicIntrinsic.lookupClass)) {
+          return ASYNC_INVOKE;
+        }
+        const value = dynamicIntrinsic.intrinsic(frame.stack.items, base);
+        if (value === ASYNC_INVOKE) return ASYNC_INVOKE;
+        frame.stack.items.length = base;
+        if (this.profileMethods) {
+          this.syncIntrinsicCallCount += 1;
+          this.intrinsicMethodRunCounts.set(
+            dynamicIntrinsic.methodKey,
+            (this.intrinsicMethodRunCounts.get(dynamicIntrinsic.methodKey) || 0) + 1,
+          );
+        }
+        return value;
+      }
+    }
+    const dynamic = site.fastDynamicTarget;
+    if (dynamic) {
+      const receiver = frame.stack.items[frame.stack.items.length - site.params.length - 1];
+      if (receiver === null || receiver === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if ((receiver.type || site.declaredClassName) === dynamic.targetClassName) {
+        return this.tryInvokeResolvedTarget(site, dynamic.target, frame, thread);
+      }
+    }
+    return this.tryInvokeSyncSite(site, frame, thread);
+  }
+
+  tryInvokeSync(op, frame, instruction, thread) {
+    const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    return this.tryInvokeSyncSite({
+      op,
+      declaredClassName,
+      methodName,
+      descriptor,
+      ...parseDescriptor(descriptor),
+      targets: new Map(),
+    }, frame, thread);
+  }
+
+  getPositionalGeneratedInvoker(site, target) {
+    if (!this.positionalGeneratedCallsEnabled) return null;
+    if (!target || target.positionalInvoker === null) return null;
+    if (target.positionalInvoker) return target.positionalInvoker;
+    const { method, lookupClass, generated } = target;
+    if (!method || !generated || generated.jvmSynchronous !== true ||
+        target.intrinsic || target.inlineIntegerRegion || target.memoizedIntegralLeaf ||
+        this.fusedRegions.enabled && this.fusedRegions.mayFuse(method)) {
+      target.positionalInvoker = null;
+      return null;
+    }
+    const receiverSlots = site.op === "invokestatic" ? 0 : 1;
+    const argumentCount = site.params.length + receiverSlots;
+    // Avoid pathological generated signatures while covering ordinary Java
+    // source methods (including the renderer call graph) without an arguments
+    // array or rest-parameter allocation.
+    if (argumentCount > 32) {
+      target.positionalInvoker = null;
+      return null;
+    }
+    if (typeof generated.jvmDirectPositionalBody === "function") {
+      // This structurally proven acyclic integral leaf has its own scalar ABI:
+      // bind the JIT helpers once and let the SSA caller feed operands straight
+      // into the generated body. The caller's trailing thread argument is an
+      // ignored extra JavaScript argument, so no adapter or child Frame is
+      // needed on the normal path.
+      target.positionalInvoker =
+        generated.jvmDirectPositionalBody.bind(null, this);
+      target.positionalInvoker.jvmDebugGuarded = true;
+      return target.positionalInvoker;
+    }
+    if (typeof generated.jvmRestoringDirectPositionalBody === "function") {
+      // A verified acyclic field/primitive-array leaf can use the same scalar
+      // call ABI without eagerly constructing its child Frame.  Its generated
+      // body materializes a cached Frame only at a throwing bytecode, then this
+      // plan restores that omitted callee beneath the ordinary JVM exception
+      // dispatcher.
+      const plan = {
+        target,
+        Frame,
+        method,
+        lookupClass,
+        semantic: generated.jvmRestoringDirectPositionalPlan || null,
+        restoreFrame: (thread, child) => {
+          const frames = thread.callStack.items;
+          if (!frames.includes(child)) frames.push(child);
+        },
+      };
+      target.positionalInvoker =
+        generated.jvmRestoringDirectPositionalBody.bind(null, this, plan);
+      target.positionalInvoker.jvmDebugGuarded = true;
+      return target.positionalInvoker;
+    }
+    const argumentsList = Array.from(
+      { length: argumentCount }, (_unused, index) => `argument${index}`);
+    const localAssignments = [];
+    let local = 0;
+    if (receiverSlots) {
+      localAssignments.push(`child.locals[0] = argument0;`);
+      local = 1;
+    }
+    for (let index = 0; index < site.params.length; index += 1) {
+      localAssignments.push(
+        `child.locals[${local}] = argument${index + receiverSlots};`);
+      local += site.params[index] === "long" || site.params[index] === "double" ? 2 : 1;
+    }
+    const staticGuard = site.op === "invokestatic"
+      ? `if (jit.jvm.classInitializationState.get(plan.staticOwner) !== "INITIALIZED") return plan.asyncInvoke;`
+      : "";
+    const tracePattern = typeof process !== "undefined" && process.env
+      ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+    const methodKey = `${lookupClass}.${method.name}${site.descriptor}`;
+    const trace = Boolean(tracePattern && methodKey.includes(tracePattern));
+    const traceEntry = trace
+      ? `console.error("[positional-entry] ${methodKey} args=" + [${
+        argumentsList.join(", ")}].map(plan.describe).join(","));`
+      : "";
+    const traceResult = trace
+      ? `console.error("[positional-exit] ${methodKey} " + ` +
+        `(result && result.deopt ? "deopt:" + result.reason : ` +
+        `plan.describe(useFrameless ? result : result && result.value)));`
+      : "";
+    const immediateFramelessBody = generated.jvmFramelessPositional === true
+      ? generated : null;
+    const adaptiveFramelessBody = generated.jvmAdaptivePositionalBody || null;
+    // Reference-returning adaptive entries can hand an object back while a
+    // nested scheduler-visible continuation still owns it. Keep those calls on
+    // the canonical child-Frame path until reference liveness is proven.
+    const primitiveReturn = new Set([
+      "boolean", "byte", "char", "short", "int",
+      "long", "float", "double", "void",
+    ]).has(site.returnType);
+    const framelessBody = primitiveReturn &&
+      (immediateFramelessBody || adaptiveFramelessBody);
+    const framelessMode = !framelessBody ? 0
+      : immediateFramelessBody ? 1 : 2;
+    const source = [
+      "'use strict';",
+      "const jit = plan.jit;",
+      staticGuard,
+      traceEntry,
+      "const target = plan.target;",
+      "const child = target.freeFrame || new plan.Frame(plan.method);",
+      "target.freeFrame = null;",
+      "child.pc = 0;",
+      "child.stack.items.length = 0;",
+      "delete child.jitSkipOnce;",
+      "delete child.jitJsDisabled;",
+      "delete child.jitAdaptiveEntryCounted;",
+      "child.className = plan.lookupClass;",
+      ...localAssignments,
+      "const adaptiveFrameless = plan.framelessMode === 2;",
+      "const useFrameless = plan.framelessMode === 1 ||",
+      "  (adaptiveFrameless && target.preferFrameless === true);",
+      "let result;",
+      "let baseDepth = -1;",
+      "if (useFrameless) {",
+      "  baseDepth = thread.callStack.items.length;",
+      "  try {",
+      "    result = plan.framelessBody(child, thread, jit, false, true);",
+      "  } catch (error) {",
+      "    plan.restoreFrame(thread, baseDepth, child);",
+      "    if (adaptiveFrameless) {",
+      "      target.preferFrameless = false;",
+      "      target.framelessRejected = true;",
+      "    }",
+      "    throw error;",
+      "  }",
+      "} else {",
+      "  thread.callStack.push(child);",
+      "  result = jit.runGeneratedFrame(plan.generated, child, thread, false);",
+      "  if (result && typeof result.then === 'function') {",
+      "    throw new Error('Synchronous positional method returned a Promise');",
+      "  }",
+      "}",
+      traceResult,
+      "if (result && result.deopt) {",
+      "  if (useFrameless) {",
+      "    plan.restoreFrame(thread, baseDepth, child);",
+      "    if (adaptiveFrameless) {",
+      "      target.preferFrameless = false;",
+      "      target.framelessRejected = true;",
+      "    }",
+      "  } else if (adaptiveFrameless && !target.framelessRejected &&",
+      "      result.reason === 'structured SSA continuation') {",
+      "    target.framelessBudgetYields = (target.framelessBudgetYields || 0) + 1;",
+      "    if (target.framelessBudgetYields >= plan.adaptiveYieldThreshold) {",
+      "      target.preferFrameless = true;",
+      "    }",
+      "  }",
+      "  return result;",
+      "}",
+      "if (adaptiveFrameless && !useFrameless && !target.framelessRejected) {",
+      "  target.framelessWarmCompletions = (target.framelessWarmCompletions || 0) + 1;",
+      "  if (target.framelessWarmCompletions >= plan.adaptiveThreshold) {",
+      "    target.preferFrameless = true;",
+      "  }",
+      "}",
+      "target.freeFrame = child;",
+      site.returnType === "void"
+        ? "return plan.returnVoid;"
+        : "return useFrameless ? result : result.value;",
+    ].filter(Boolean).join("\n");
+    try {
+      const entry = this.createGeneratedFunction(method, "positional-entry",
+        ["plan", ...argumentsList, "thread"], source, lookupClass);
+      const plan = {
+        jit: this,
+        target,
+        Frame,
+        method,
+        generated,
+        framelessMode,
+        framelessBody,
+        adaptiveThreshold: 4,
+        adaptiveYieldThreshold: 4,
+        lookupClass,
+        staticOwner: site.declaredClassName,
+        asyncInvoke: ASYNC_INVOKE,
+        returnVoid: RETURN_VOID,
+        restoreFrame: (thread, baseDepth, child) => {
+          const frames = thread.callStack.items;
+          if (!frames.includes(child)) {
+            frames.splice(Math.min(baseDepth, frames.length), 0, child);
+          }
+        },
+        describe: (value) => value === null ? "null"
+          : value === undefined ? "undefined"
+            : value && (value._className || value.type) || typeof value,
+      };
+      target.positionalInvoker = entry.bind(null, plan);
+      return target.positionalInvoker;
+    } catch (_) {
+      target.positionalInvoker = null;
+      return null;
+    }
+  }
+
+  getPositionalJreInvoker(site, target) {
+    if (!target || target.positionalInvoker === null) return null;
+    if (target.positionalInvoker) return target.positionalInvoker;
+    const receiverSlots = site.op === "invokestatic" ? 0 : 1;
+    const argumentCount = site.params.length + receiverSlots;
+    if (argumentCount > 32 || typeof target.method !== "function") {
+      target.positionalInvoker = null;
+      return null;
+    }
+    const argumentsList = Array.from(
+      { length: argumentCount }, (_unused, index) => `argument${index}`);
+    const receiver = receiverSlots ? "argument0" : "null";
+    const callArguments = argumentsList.slice(receiverSlots);
+    const direct = receiverSlots === 1 &&
+      typeof target.method.jvmDirectIntrinsic === "function"
+      ? target.method.jvmDirectIntrinsic : null;
+    const invocation = direct
+      ? `plan.direct(${argumentsList.join(", ")})`
+      : `plan.method(plan.jvm, ${receiver}, [${
+        callArguments.join(", ")}], thread)`;
+    const staticGuard = site.op === "invokestatic"
+      ? `if (plan.jvm.classInitializationState.get(plan.staticOwner) !== "INITIALIZED") return plan.asyncInvoke;`
+      : "";
+    const source = [
+      "'use strict';",
+      staticGuard,
+      `const result = ${invocation};`,
+      "if (result === plan.asyncMethod || result && typeof result.then === 'function') {",
+      "  return plan.asyncInvoke;",
+      "}",
+      site.returnType === "void"
+        ? "return plan.returnVoid;"
+        : "return typeof result === 'boolean' ? (result ? 1 : 0) : result;",
+    ].filter(Boolean).join("\n");
+    try {
+      const identity = {
+        name: site.methodName,
+        descriptor: site.descriptor,
+      };
+      const entry = this.createGeneratedFunction(identity, "positional-jre",
+        ["plan", ...argumentsList, "thread"], source, target.targetClassName);
+      const plan = {
+        jvm: this.jvm,
+        method: target.method,
+        direct,
+        staticOwner: site.declaredClassName,
+        asyncMethod: ASYNC_METHOD_SENTINEL,
+        asyncInvoke: ASYNC_INVOKE,
+        returnVoid: RETURN_VOID,
+      };
+      target.positionalInvoker = entry.bind(null, plan);
+      return target.positionalInvoker;
+    } catch (_) {
+      target.positionalInvoker = null;
+      return null;
+    }
+  }
+
+  tryInvokeSyncSite(site, frame, thread) {
+    const { op, declaredClassName, methodName, descriptor, params, returnType } = site;
+    if (op === "invokestatic" &&
+        this.jvm.classInitializationState.get(declaredClassName) !== "INITIALIZED") {
+      return ASYNC_INVOKE;
+    }
+
+    const receiverOffset = params.length + (op === "invokestatic" ? 0 : 1);
+    const receiver = op === "invokestatic"
+      ? null
+      : frame.stack.items[frame.stack.items.length - receiverOffset];
+    if (op !== "invokestatic" && (receiver === null || receiver === undefined)) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+
+    let targetClassName = declaredClassName;
+    if (op === "invokevirtual" || op === "invokeinterface") {
+      targetClassName = receiver.type || declaredClassName;
+    }
+    // When Wasm is the preferred tier, leave static shims available to its
+    // linker; consuming a Math call in a JS fallback can otherwise prevent a
+    // numeric caller from reaching Wasm. Whole-method JavaScript mode instead
+    // keeps both static and instance JRE leaves inside the generated region.
+    const wholeMethodCaller = this.prefersWholeMethodJs(frame.method);
+    const keepStaticForWasm = op === "invokestatic" &&
+      this.wasmJit.enabled && !wholeMethodCaller;
+    const synchronousJre = keepStaticForWasm ? null
+      : this.resolveSynchronousJreMethod(
+        targetClassName, declaredClassName, methodName, descriptor);
+    if (synchronousJre) {
+      const target = { targetClassName, method: synchronousJre };
+      site.fastJreTarget = target;
+      const positional = this.getPositionalJreInvoker(site, target);
+      if (positional && !site.fastPositional) {
+        site.fastPositional = {
+          invoke: positional,
+          lookupClass: targetClassName,
+          receiverType: op === "invokestatic" ? null : targetClassName,
+          debugGuarded: positional.jvmDebugGuarded === true,
+        };
+      }
+      return this.tryInvokeSynchronousJre(site, target, frame, thread);
+    }
+    let target = site.targets.get(targetClassName);
+    if (!target) {
+      let classData = this.jvm.classes[targetClassName];
+      if (!classData) return ASYNC_INVOKE;
+      let method = this.jvm.findMethod(classData, methodName, descriptor);
+      let lookupClass = targetClassName;
+      while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
+        classData && classData.ast.classes[0].superClassName) {
+        lookupClass = classData.ast.classes[0].superClassName;
+        classData = this.jvm.classes[lookupClass];
+        if (!classData) return ASYNC_INVOKE;
+        method = this.jvm.findMethod(classData, methodName, descriptor);
+      }
+      if (!method) return ASYNC_INVOKE;
+      // The Firefox whole-method tier deliberately accepts a wider verified
+      // opcode/control-flow set than the legacy runner. Keep nested calls in
+      // that same tier: otherwise a generated caller yields to the scheduler,
+      // only for the child to be admitted by tryRunFrame on the next turn.
+      // This is a structural capability check; no class or method identity is
+      // involved.
+      const normallySupported = this.isSupported(method) ||
+        this.isShortSupportedHelper(method) ||
+        (wholeMethodCaller && this.isCodegenSupported(method));
+      const fusedCandidate = op === "invokestatic" &&
+        this.fusedRegions.mayFuse(method);
+      // A semantic intrinsic can cover a method whose raw bytecodes are too
+      // large/irregular for the ordinary method tier.  Probe it before the
+      // generic support rejection.  For the polygon family the final span
+      // owner may still be cold; retain only the cheap dependency list and
+      // perform the complete fingerprint proof once that owner loads.
+      const structuralIntrinsic = op === "invokestatic"
+        ? this.getSynchronousIntrinsic(method, descriptor)
+        : null;
+      const pendingIntrinsicOwners = op === "invokestatic" && !structuralIntrinsic
+        ? HandwrittenPolygonRaster.candidateDependencies(this, method, descriptor)
+        : null;
+      if (!normallySupported && !fusedCandidate &&
+          !structuralIntrinsic && !pendingIntrinsicOwners) return ASYNC_INVOKE;
+      target = {
+        method,
+        lookupClass,
+        intrinsic: structuralIntrinsic,
+        pendingIntrinsicOwners,
+        inlineIntegerRegion: normallySupported &&
+          (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
+          ? this.getInlineIntegerRegion(method, params, returnType)
+          : null,
+      };
+      if (normallySupported && op !== "invokestatic") {
+        const instanceIntrinsic = this.getSynchronousIntrinsic(method, descriptor);
+        if (instanceIntrinsic?.jvmReceiverSlots === 1) {
+          target.intrinsic = instanceIntrinsic;
+        }
+      }
+      if (normallySupported && op === "invokestatic" &&
+          !target.intrinsic && !target.inlineIntegerRegion) {
+        target.memoizedIntegralLeaf =
+          this.getMemoizedIntegralLeaf(method, params, returnType);
+      }
+      if (normallySupported && !target.intrinsic && !target.inlineIntegerRegion) {
+        target.generated = this.getGeneratedFunction(method);
+      }
+      site.targets.set(targetClassName, target);
+      if (op === "invokestatic" && target.intrinsic) {
+        site.fastIntrinsic = {
+          intrinsic: target.intrinsic,
+          lookupClass,
+          methodKey: `${lookupClass}.${method.name}${descriptor}`,
+        };
+      } else if (op === "invokestatic") {
+        site.fastStaticTarget = target;
+        const positional = this.getPositionalGeneratedInvoker(site, target);
+        if (positional && !site.fastPositional) {
+          site.fastPositional = {
+            invoke: positional,
+            lookupClass,
+            receiverType: null,
+            debugGuarded: positional.jvmDebugGuarded === true,
+          };
+        }
+      } else if (op === "invokespecial") {
+        // Private/super helpers are monomorphic by bytecode semantics. Cache
+        // them independently from virtual receiver types and publish the same
+        // fixed-arity positional entry used by other generated callees.
+        // Constructors never reach this branch because method admission keeps
+        // <init> outside generated execution.
+        site.fastSpecialTarget = target;
+        const positional = this.getPositionalGeneratedInvoker(site, target);
+        if (positional && !site.fastPositional) {
+          site.fastPositional = {
+            invoke: positional,
+            lookupClass,
+            receiverType: null,
+            debugGuarded: positional.jvmDebugGuarded === true,
+          };
+        }
+      } else if ((op === "invokevirtual" || op === "invokeinterface") &&
+          !site.fastDynamicTarget) {
+        const positional = this.getPositionalGeneratedInvoker(site, target);
+        site.fastDynamicTarget = { targetClassName, target, positional };
+        if (target.intrinsic) {
+          site.fastDynamicIntrinsic = {
+            targetClassName,
+            intrinsic: target.intrinsic,
+            positional: typeof target.intrinsic.jvmPositional === "function"
+              ? target.intrinsic.jvmPositional : null,
+            lookupClass,
+            methodKey: `${lookupClass}.${method.name}${descriptor}`,
+          };
+        }
+        const direct = site.fastDynamicIntrinsic?.positional || positional;
+        if (direct && !site.fastPositional) {
+          site.fastPositional = {
+            invoke: direct,
+            lookupClass,
+            receiverType: targetClassName,
+            debugGuarded: direct.jvmDebugGuarded === true,
+          };
+        }
+      }
+    }
+
+    return this.tryInvokeResolvedTarget(site, target, frame, thread);
+  }
+
+  resolveSynchronousJreMethod(targetClassName, declaredClassName, methodName, descriptor) {
+    const method = this.jvm._jreFindMethod(targetClassName, methodName, descriptor) ||
+      this.jvm._jreFindMethod(declaredClassName, methodName, descriptor);
+    if (typeof method !== "function") return null;
+    const constructorName = method.constructor && method.constructor.name;
+    if (constructorName === "AsyncFunction") return null;
+    // A small number of synchronous-looking reflection/thread shims install
+    // Java frames and return this sentinel. They must retain the canonical
+    // asynchronous handoff path.
+    let source = "";
+    try { source = Function.prototype.toString.call(method); } catch (_) { return null; }
+    if (source.includes("ASYNC_METHOD_SENTINEL")) return null;
+    return method;
+  }
+
+  tryInvokeSynchronousJre(site, target, frame, thread) {
+    const { op, params, returnType } = site;
+    const receiverSlots = op === "invokestatic" ? 0 : 1;
+    const base = frame.stack.items.length - params.length - receiverSlots;
+    const receiver = receiverSlots ? frame.stack.items[base] : null;
+    if (receiverSlots && (receiver === null || receiver === undefined)) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    const args = frame.stack.items.slice(base + receiverSlots);
+    const result = target.method(this.jvm, receiver, args, thread);
+    // Classification above rejects declared async functions. Be conservative
+    // if a plain shim unexpectedly returns an asynchronous handoff: leave the
+    // operands untouched, disable this fast target, and use the canonical path.
+    if (result === ASYNC_METHOD_SENTINEL ||
+        result && typeof result.then === "function") {
+      site.fastJreTarget = null;
+      return ASYNC_INVOKE;
+    }
+    frame.stack.items.length = base;
+    if (this.profileMethods) {
+      this.syncIntrinsicCallCount += 1;
+      const methodKey =
+        `${target.targetClassName}.${site.methodName}${site.descriptor}`;
+      this.intrinsicMethodRunCounts.set(
+        methodKey, (this.intrinsicMethodRunCounts.get(methodKey) || 0) + 1);
+    }
+    if (returnType === "void" || result === undefined) return RETURN_VOID;
+    return typeof result === "boolean" ? (result ? 1 : 0) : result;
+  }
+
+  tryInvokeResolvedTarget(site, target, frame, thread) {
+    const { op, descriptor, params, returnType } = site;
+    const {
+      method, lookupClass, inlineIntegerRegion, memoizedIntegralLeaf, generated,
+    } = target;
+    let intrinsic = target.intrinsic;
+    if (!intrinsic && Array.isArray(target.pendingIntrinsicOwners) &&
+        target.pendingIntrinsicOwners.every((owner) => this.jvm.classes[owner])) {
+      // Dependencies are now loaded.  This is the sole retry: a full-shape
+      // mismatch is permanent, while a match is installed into both the
+      // target and monomorphic call-site cache.
+      target.pendingIntrinsicOwners = null;
+      intrinsic = this.getSynchronousIntrinsic(method, descriptor);
+      if (intrinsic) {
+        target.intrinsic = intrinsic;
+        if (op === "invokestatic") {
+          site.fastIntrinsic = {
+            intrinsic,
+            lookupClass,
+            methodKey: `${lookupClass}.${method.name}${descriptor}`,
+          };
+        }
+      }
+    }
+    const receiver = op === "invokestatic"
+      ? null
+      : frame.stack.items[frame.stack.items.length - params.length - 1];
+    if (this.jvm.debugManager.isClassJitDeopted(lookupClass)) return ASYNC_INVOKE;
+    if (this.fusedRegions.enabled) {
+      const fused = this.fusedRegions.tryInvoke(site, target, frame, thread);
+      if (fused.matched && fused.handled) return RETURN_VOID;
+    }
+    if (intrinsic) {
+      const receiverSlots = intrinsic.jvmReceiverSlots | 0;
+      const base = frame.stack.items.length - params.length - receiverSlots;
+      const value = intrinsic(frame.stack.items, base);
+      if (value === ASYNC_INVOKE) return ASYNC_INVOKE;
+      frame.stack.items.length = base;
+      if (this.profileMethods) {
+        this.syncIntrinsicCallCount += 1;
+        const methodKey = `${lookupClass}.${method.name}${descriptor}`;
+        this.intrinsicMethodRunCounts.set(
+          methodKey, (this.intrinsicMethodRunCounts.get(methodKey) || 0) + 1,
+        );
+      }
+      return value;
+    }
+    if (inlineIntegerRegion) {
+      if (inlineIntegerRegion.jvmNested && this.needsBytecodeChecks()) return ASYNC_INVOKE;
+      const receiverSlots = op === "invokestatic" ? 0 : 1;
+      const base = frame.stack.items.length - params.length - receiverSlots;
+      const value = inlineIntegerRegion(frame.stack.items, base);
+      frame.stack.items.length = base;
+      if (this.profileMethods) {
+        this.syncInlinedCallCount += 1;
+        const methodKey = `${lookupClass}.${method.name}${descriptor}`;
+        this.inlinedMethodRunCounts.set(
+          methodKey, (this.inlinedMethodRunCounts.get(methodKey) || 0) + 1,
+        );
+      }
+      return value;
+    }
+    if (!generated || !generated.jvmSynchronous) return ASYNC_INVOKE;
+
+    const argumentBase = frame.stack.items.length - params.length;
+    let memoKey = NO_MEMO_KEY;
+    if (memoizedIntegralLeaf && !this.needsBytecodeChecks()) {
+      memoKey = this.memoizedIntegralKey(
+        memoizedIntegralLeaf, frame.stack.items, argumentBase);
+      if (memoKey !== NO_MEMO_KEY && memoizedIntegralLeaf.values.has(memoKey)) {
+        const value = memoizedIntegralLeaf.values.get(memoKey);
+        frame.stack.items.length = argumentBase;
+        if (this.profileMethods) this.memoizedIntegralLeafHitCount += 1;
+        return value;
+      }
+      if (memoKey !== NO_MEMO_KEY && this.profileMethods) {
+        this.memoizedIntegralLeafMissCount += 1;
+      }
+    }
+
+    const child = target.freeFrame || new Frame(method);
+    if (target.freeFrame && this.profileMethods) this.syncReusedFrameCount += 1;
+    target.freeFrame = null;
+    child.pc = 0;
+    // Verified bytecode cannot read a non-parameter local before storing it, so
+    // normal execution does not need to erase every slot in a recycled frame.
+    // Keep the clear when debugger/breakpoint checks are active so a suspended
+    // frame never exposes values left by its previous invocation.
+    if (this.needsBytecodeChecks()) child.locals.fill(undefined);
+    child.stack.items.length = 0;
+    delete child.jitSkipOnce;
+    delete child.jitJsDisabled;
+    delete child.jitAdaptiveEntryCounted;
+    child.className = lookupClass;
+    let localIndex = 0;
+    if (op !== "invokestatic") {
+      child.locals[0] = receiver;
+      localIndex = 1;
+    }
+    for (let i = 0; i < params.length; i += 1) {
+      child.locals[localIndex] = frame.stack.items[argumentBase + i];
+      localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
+    }
+    frame.stack.items.length = argumentBase - (op === "invokestatic" ? 0 : 1);
+    thread.callStack.push(child);
+    const result = this.runGeneratedFrame(generated, child, thread, false);
+    if (result && typeof result.then === "function") {
+      throw new Error("Synchronous generated method returned a Promise");
+    }
+    if (result.deopt) return result;
+    target.freeFrame = child;
+    if (memoKey !== NO_MEMO_KEY) {
+      if (memoizedIntegralLeaf.values.size >= memoizedIntegralLeaf.maxEntries) {
+        memoizedIntegralLeaf.values.clear();
+      }
+      memoizedIntegralLeaf.values.set(memoKey, result.value);
+    }
+    if (returnType === "void" || result.value === RETURN_VOID) return RETURN_VOID;
+    return result.value;
+  }
+
+  getMemoizedIntegralLeaf(method, params, returnType) {
+    if (!this.memoizedIntegralLeavesEnabled || !(method.flags || []).includes("static")) {
+      return null;
+    }
+    if (this.memoizedIntegralLeafCache.has(method)) {
+      return this.memoizedIntegralLeafCache.get(method);
+    }
+    const widths = params.map(integralMemoWidth);
+    const returnWidth = integralMemoWidth(returnType);
+    if (!returnWidth || widths.some((width) => !width)) {
+      this.memoizedIntegralLeafCache.set(method, null);
+      return null;
+    }
+    const code = method.attributes.find((attribute) => attribute.type === "code");
+    const codeItems = code && this.getCodeItems(method);
+    const labels = codeItems && buildLabelMap(codeItems);
+    const depths = codeItems && this.computeStackDepths(codeItems, labels);
+    if (!code || !depths || codeItems.length > 4096) {
+      this.memoizedIntegralLeafCache.set(method, null);
+      return null;
+    }
+    const allowed = new Set([
+      "nop", "getstatic", "goto", "goto_w", "i2b", "i2c", "i2s",
+      "iadd", "iand", "imul", "ineg", "ior", "ishl", "ishr", "isub", "iushr", "ixor",
+      "ireturn", "iinc", "bipush", "sipush", "ldc", "ldc_w",
+      "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3", "iconst_4",
+      "iconst_5", "ifeq", "ifne", "iflt", "ifle", "ifgt", "ifge",
+      "if_icmpeq", "if_icmpne", "if_icmplt", "if_icmple", "if_icmpgt", "if_icmpge",
+      "iload", "iload_0", "iload_1", "iload_2", "iload_3",
+      "istore", "istore_0", "istore_1", "istore_2", "istore_3",
+    ]);
+    const staticFields = [];
+    const staticKeys = new Set();
+    let valid = true;
+    for (let index = 0; index < codeItems.length && valid; index += 1) {
+      if (depths[index] === undefined) continue;
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      if (!op || !allowed.has(op)) {
+        valid = false;
+        break;
+      }
+      if ((op === "ldc" || op === "ldc_w") &&
+          !Number.isInteger(Number(instruction.arg))) {
+        valid = false;
+        break;
+      }
+      if (op === "getstatic") {
+        const descriptor = instruction.arg?.[2]?.[1];
+        const width = integralMemoDescriptorWidth(descriptor);
+        const key = JSON.stringify(instruction.arg);
+        if (!width || !key) {
+          valid = false;
+          break;
+        }
+        if (!staticKeys.has(key)) {
+          staticKeys.add(key);
+          staticFields.push({ field: instruction.arg, width });
+        }
+      }
+    }
+    const totalBits = widths.reduce((sum, width) => sum + width, 0) +
+      staticFields.reduce((sum, field) => sum + field.width, 0);
+    // Exact numeric keys avoid allocating a string in the hot caller. Above
+    // 52 bits JavaScript cannot represent every packed combination exactly.
+    if (!valid || totalBits > 52) {
+      this.memoizedIntegralLeafCache.set(method, null);
+      return null;
+    }
+    const plan = {
+      widths,
+      staticFields,
+      values: new Map(),
+      maxEntries: 4096,
+    };
+    this.memoizedIntegralLeafCache.set(method, plan);
+    return plan;
+  }
+
+  memoizedIntegralKey(plan, stack, base) {
+    let key = 0;
+    let factor = 1;
+    for (let index = 0; index < plan.widths.length; index += 1) {
+      const width = plan.widths[index];
+      key += unsignedIntegralMemoValue(stack[base + index], width) * factor;
+      factor *= 2 ** width;
+    }
+    for (const entry of plan.staticFields) {
+      const value = this.getStaticSync(entry.field);
+      if (value === STATIC_DEOPT) return NO_MEMO_KEY;
+      key += unsignedIntegralMemoValue(value, entry.width) * factor;
+      factor *= 2 ** entry.width;
+    }
+    return key;
+  }
+
+  getSynchronousIntrinsic(method, descriptor) {
+    if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
+      if (this.perspectiveSpanIntrinsicCache.has(method)) {
+        return this.perspectiveSpanIntrinsicCache.get(method);
+      }
+      const perspectiveSpan = HandwrittenPerspectiveSpan.createIntrinsic(
+        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+      if (perspectiveSpan) {
+        this.perspectiveSpanIntrinsicCache.set(method, perspectiveSpan);
+        return perspectiveSpan;
+      }
+    }
+    if (descriptor === "([II)V" || descriptor === "([III)V") {
+      if (this.polygonRasterIntrinsicCache.has(method)) {
+        return this.polygonRasterIntrinsicCache.get(method);
+      }
+      const polygon = HandwrittenPolygonRaster.createIntrinsic(
+        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+      // A structurally referenced span owner may not have been loaded on the
+      // first cold query.  Cache only a positive proof so a later hot call can
+      // retry after ordinary class loading completes.
+      if (polygon) {
+        this.polygonRasterIntrinsicCache.set(method, polygon);
+        return polygon;
+      }
+    }
+    if (descriptor === HandwrittenTiledBlit.DESCRIPTOR) {
+      const tiledBlit = HandwrittenTiledBlit.createIntrinsic(
+        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+      if (tiledBlit) return tiledBlit;
+    }
+    const codeItems = this.getCodeItems(method);
+    const rawOps = codeItems
+      .map((item) => getOp(item.instruction))
+      .filter(Boolean);
+    const code = method.attributes.find((attribute) => attribute.type === "code");
+    const intrinsicCodeItems = stripProvenDeadEntryInitializers(
+      codeItems, code?.code?.exceptionTable || []);
+    const ops = normalizeIntrinsicCompilerIdioms(intrinsicCodeItems);
+
+    let parsedDescriptor = null;
+    try { parsedDescriptor = parseDescriptor(descriptor); } catch (_) { /* not an intrinsic */ }
+    const primitiveCopySignature = parsedDescriptor && parsedDescriptor.returnType === "void" &&
+      parsedDescriptor.params.length === 5 && parsedDescriptor.params[0] === "int[]" &&
+      parsedDescriptor.params[1] === "int" && parsedDescriptor.params[2] === "int[]" &&
+      parsedDescriptor.params[3] === "int" && parsedDescriptor.params[4] === "int";
+    if (primitiveCopySignature) {
+      const prefix = [
+        "aload_0", "aload_2", "if_acmpne", "iload_1", "iload_3",
+        "if_icmpne", "return", "iload_3", "iload_1", "if_icmple",
+      ];
+      const loads = ops.filter((op) => op === "iaload").length;
+      const stores = ops.filter((op) => op === "iastore").length;
+      const legacyShape = prefix.every((op, index) => ops[index] === op);
+      const increments = codeItems.filter((item) => getOp(item && item.instruction) === "iinc")
+        .map((item) => Number(item.instruction.incr || 0));
+      const expandedShape = loads >= 8 && stores === loads &&
+        ops.some((op) => op === "if_acmpeq" || op === "if_acmpne") &&
+        increments.some((increment) => increment > 0) &&
+        increments.some((increment) => increment < 0) &&
+        !ops.some((op) => op.startsWith("invoke") ||
+          ["getfield", "putfield", "getstatic", "putstatic"].includes(op));
+      if ((!legacyShape && !expandedShape) || loads < 8 || stores !== loads ||
+          ops.some((op) => op.startsWith("invoke"))) {
+        return null;
+      }
+      const intrinsic = (stack, base) => this.primitiveArrayCopyDirect(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3], stack[base + 4]);
+      intrinsic.jvmDirectKind = "primitiveArrayCopy";
+      return intrinsic;
+    }
+
+    if (descriptor === "(IIII)V") {
+      const spanOps = [
+        "iload_1", "getstatic", "if_icmplt", "iload_1", "getstatic", "if_icmplt", "return",
+        "iload_0", "getstatic", "if_icmpge", "iload_2", "getstatic", "iload_0", "isub",
+        "isub", "istore_2", "getstatic", "istore_0", "iload_0", "iload_2", "iadd",
+        "getstatic", "if_icmple", "getstatic", "iload_0", "isub", "istore_2", "iload_0",
+        "iload_1", "getstatic", "imul", "iadd", "istore", "iconst_0", "istore", "iload",
+        "iload_2", "if_icmpge", "getstatic", "iload", "iload", "iadd", "iload_3",
+        "iastore", "iinc", "goto", "return",
+      ];
+      if (ops.length !== spanOps.length || !spanOps.every((op, index) => ops[index] === op)) {
+        return null;
+      }
+      const fields = codeItems.filter((item) => getOp(item.instruction) === "getstatic")
+        .map((item) => item.instruction.arg);
+      const fieldKey = (field) => JSON.stringify(field);
+      if (fields.length !== 9 ||
+          fields.slice(0, 8).some((field) => field?.[2]?.[1] !== "I") ||
+          fields[8]?.[2]?.[1] !== "[I" ||
+          fieldKey(fields[2]) !== fieldKey(fields[3]) ||
+          fieldKey(fields[2]) !== fieldKey(fields[4]) ||
+          fieldKey(fields[5]) !== fieldKey(fields[6])) return null;
+      const staticFields = [fields[0], fields[1], fields[2], fields[5], fields[7], fields[8]];
+      const intrinsic = (stack, base) => {
+        const values = staticFields.map((field) => this.getStaticSync(field));
+        if (values.some((item) => item === STATIC_DEOPT)) return ASYNC_INVOKE;
+        return this.clippedSpanDirect(stack[base], stack[base + 1], stack[base + 2],
+          stack[base + 3], ...values);
+      };
+      intrinsic.jvmDirectKind = "clippedStaticSpan";
+      intrinsic.jvmDirectData = { staticFields };
+      return intrinsic;
+    }
+
+    if (descriptor === "(IIIII)V") {
+      // Clipped alpha-blended horizontal span.  This is deliberately a full
+      // bytecode-shape match: neither the declaring class nor method/field
+      // names participate in recognition.
+      const alphaSpanOps = [
+        "iload_1", "getstatic", "if_icmplt", "iload_1", "getstatic", "if_icmplt",
+        "return", "iload_0", "getstatic", "if_icmpge", "iload_2", "getstatic",
+        "iload_0", "isub", "isub", "istore_2", "getstatic", "istore_0",
+        "iload_0", "iload_2", "iadd", "getstatic", "if_icmple", "getstatic",
+        "iload_0", "isub", "istore_2", "sipush", "iload", "isub", "istore",
+        "iload_3", "bipush", "ishr", "sipush", "iand", "iload", "imul", "istore",
+        "iload_3", "bipush", "ishr", "sipush", "iand", "iload", "imul", "istore",
+        "iload_3", "sipush", "iand", "iload", "imul", "istore",
+        "iload_0", "iload_1", "getstatic", "imul", "iadd", "istore",
+        "iconst_0", "istore", "iload", "iload_2", "if_icmpge",
+        "getstatic", "iload", "iaload", "bipush", "ishr", "sipush", "iand",
+        "iload", "imul", "istore",
+        "getstatic", "iload", "iaload", "bipush", "ishr", "sipush", "iand",
+        "iload", "imul", "istore",
+        "getstatic", "iload", "iaload", "sipush", "iand", "iload", "imul", "istore",
+        "iload", "iload", "iadd", "bipush", "ishr", "bipush", "ishl",
+        "iload", "iload", "iadd", "bipush", "ishr", "bipush", "ishl", "iadd",
+        "iload", "iload", "iadd", "bipush", "ishr", "iadd", "istore",
+        "getstatic", "iload", "iinc", "iload", "iastore", "iinc", "goto", "return",
+      ];
+      if (ops.length !== alphaSpanOps.length ||
+          !alphaSpanOps.every((op, index) => ops[index] === op)) return null;
+      const fields = codeItems.filter((item) => getOp(item.instruction) === "getstatic")
+        .map((item) => item.instruction.arg);
+      const fieldKey = (field) => JSON.stringify(field);
+      if (fields.length !== 12 ||
+          fields.slice(0, 8).some((field) => field?.[2]?.[1] !== "I") ||
+          fields.slice(8).some((field) => field?.[2]?.[1] !== "[I") ||
+          fieldKey(fields[2]) !== fieldKey(fields[3]) ||
+          fieldKey(fields[2]) !== fieldKey(fields[4]) ||
+          fieldKey(fields[5]) !== fieldKey(fields[6]) ||
+          fields.slice(9).some((field) => fieldKey(field) !== fieldKey(fields[8]))) {
+        return null;
+      }
+      const pushedConstants = codeItems.filter((item) =>
+        ["bipush", "sipush"].includes(getOp(item.instruction)))
+        .map((item) => Number(item.instruction.arg));
+      const expectedConstants = [
+        256, 16, 255, 8, 255, 255, 16, 255, 8, 255, 255, 8, 16, 8, 8, 8,
+      ];
+      if (pushedConstants.length !== expectedConstants.length ||
+          pushedConstants.some((value, index) => value !== expectedConstants[index])) {
+        return null;
+      }
+      const staticFields = [fields[0], fields[1], fields[2], fields[5], fields[7], fields[8]];
+      const intrinsic = (stack, base) => {
+        const values = staticFields.map((field) => this.getStaticSync(field));
+        if (values.some((item) => item === STATIC_DEOPT)) return ASYNC_INVOKE;
+        return this.clippedAlphaSpanDirect(stack[base], stack[base + 1], stack[base + 2],
+          stack[base + 3], stack[base + 4], ...values);
+      };
+      intrinsic.jvmDirectKind = "clippedStaticAlphaSpan";
+      intrinsic.jvmDirectData = { staticFields };
+      return intrinsic;
+    }
+
+    if (descriptor === "([I[BIIIIIII)V") {
+      const maskedBlitOps = [
+        "iload", "iconst_2", "ishr", "ineg", "istore",
+        "iload", "iconst_3", "iand", "ineg", "istore",
+        "iload", "ineg", "istore", "iload", "ifge", "iload", "istore",
+        "iload", "ifge",
+        "aload_1", "iload_3", "iinc", "baload", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
+        "aload_1", "iload_3", "iinc", "baload", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
+        "aload_1", "iload_3", "iinc", "baload", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
+        "aload_1", "iload_3", "iinc", "baload", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
+        "iinc", "goto", "iload", "istore", "iload", "ifge",
+        "aload_1", "iload_3", "iinc", "baload", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "iinc",
+        "iinc", "goto", "iload", "iload", "iadd", "istore",
+        "iload_3", "iload", "iadd", "istore_3", "iinc", "goto", "return",
+      ];
+      if (ops.length !== maskedBlitOps.length ||
+          !maskedBlitOps.every((op, index) => ops[index] === op)) return null;
+      const intrinsic = (stack, base) => this.maskedColorBlitDirect(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
+        stack[base + 8]);
+      intrinsic.jvmDirectKind = "maskedColorBlit";
+      return intrinsic;
+    }
+
+    if (descriptor === "(IIIIIIZ)V") {
+      const glyphWrapperOps = [
+        "iload_2", "iload_3", "getstatic", "imul", "iadd", "istore",
+        "getstatic", "iload", "isub", "istore", "iconst_0", "istore",
+        "iconst_0", "istore", "iload_3", "getstatic", "if_icmpge",
+        "getstatic", "iload_3", "isub", "istore", "iload", "iload", "isub",
+        "istore", "getstatic", "istore_3", "iload", "iload", "iload", "imul",
+        "iadd", "istore", "iload", "iload", "getstatic", "imul", "iadd", "istore",
+        "iload_3", "iload", "iadd", "getstatic", "if_icmple", "iload", "iload_3",
+        "iload", "iadd", "getstatic", "isub", "isub", "istore",
+        "iload_2", "getstatic", "if_icmpge", "getstatic", "iload_2", "isub",
+        "istore", "iload", "iload", "isub", "istore", "getstatic", "istore_2",
+        "iload", "iload", "iadd", "istore", "iload", "iload", "iadd", "istore",
+        "iload", "iload", "iadd", "istore", "iload", "iload", "iadd", "istore",
+        "iload_2", "iload", "iadd", "getstatic", "if_icmple", "iload_2", "iload",
+        "iadd", "getstatic", "isub", "istore", "iload", "iload", "isub", "istore",
+        "iload", "iload", "iadd", "istore", "iload", "iload", "iadd", "istore",
+        "iload", "ifle", "iload", "ifgt", "return", "getstatic", "ifnull",
+        "getstatic", "aload_0", "getfield", "iload_1", "aaload",
+        "iload_2", "iload_3", "iload", "iload", "iload", "iload", "iload",
+        "iload", "iload", "getstatic", "getstatic", "invokestatic", "goto",
+        "getstatic", "aload_0", "getfield", "iload_1", "aaload",
+        "iload", "iload", "iload", "iload", "iload", "iload", "iload",
+        "invokestatic", "return",
+      ];
+      // javac preserves the same clipping and raster-call structure, but emits
+      // dead local initializers and inverted branches for decompiled source.
+      // Keep this as a second complete opcode fingerprint. Guest owner,
+      // method, and field names deliberately remain outside the match.
+      const javacGlyphWrapperOps = [
+        "iconst_0", "istore", "iconst_0", "istore", "iconst_0", "istore",
+        "iconst_0", "istore", "iconst_0", "istore",
+        "iload_2", "iload_3", "getstatic", "imul", "iadd", "istore",
+        "getstatic", "iload", "isub", "istore", "iconst_0", "istore",
+        "iconst_0", "istore", "iload_3", "getstatic", "if_icmplt", "goto",
+        "getstatic", "iload_3", "isub", "istore", "iload", "iload", "isub",
+        "istore", "getstatic", "istore_3", "iload", "iload", "iload", "imul",
+        "iadd", "istore", "iload", "iload", "getstatic", "imul", "iadd",
+        "istore", "iload_3", "iload", "iadd", "getstatic", "if_icmpgt", "goto",
+        "iload", "iload_3", "iload", "iadd", "getstatic", "isub", "isub",
+        "istore", "iload_2", "getstatic", "if_icmplt", "goto", "getstatic",
+        "iload_2", "isub", "istore", "iload", "iload", "isub", "istore",
+        "getstatic", "istore_2", "iload", "iload", "iadd", "istore", "iload",
+        "iload", "iadd", "istore", "iload", "iload", "iadd", "istore",
+        "iload", "iload", "iadd", "istore", "iload_2", "iload", "iadd",
+        "getstatic", "if_icmpgt", "goto", "iload_2", "iload", "iadd",
+        "getstatic", "isub", "istore", "iload", "iload", "isub", "istore",
+        "iload", "iload", "iadd", "istore", "iload", "iload", "iadd",
+        "istore", "iload", "ifgt", "goto", "iload", "ifle", "getstatic",
+        "ifnonnull", "getstatic", "aload_0", "getfield", "iload_1", "aaload",
+        "iload", "iload", "iload", "iload", "iload", "iload", "iload",
+        "invokestatic", "goto", "getstatic", "aload_0", "getfield", "iload_1",
+        "aaload", "iload_2", "iload_3", "iload", "iload", "iload", "iload",
+        "iload", "iload", "iload", "getstatic", "getstatic", "invokestatic",
+        "return", "return",
+      ];
+      const sameOps = (expected) => ops.length === expected.length &&
+        expected.every((op, index) => ops[index] === op);
+      const sameRawOps = (expected) => rawOps.length === expected.length &&
+        expected.every((op, index) => rawOps[index] === op);
+      let glyphShape;
+      if (sameOps(glyphWrapperOps)) {
+        glyphShape = {
+          calls: ["([I[BIIIIIIIII[I[I)V", "([I[BIIIIIII)V"],
+          scanlineFields: [13, 15],
+          pixelFields: [14, 17],
+        };
+      } else if (sameRawOps(javacGlyphWrapperOps)) {
+        glyphShape = {
+          calls: ["([I[BIIIIIII)V", "([I[BIIIIIIIII[I[I)V"],
+          scanlineFields: [13, 16],
+          pixelFields: [14, 15],
+        };
+      } else {
+        return null;
+      }
+      const staticFields = codeItems.filter((item) => getOp(item.instruction) === "getstatic")
+        .map((item) => item.instruction.arg);
+      const instanceFields = codeItems.filter((item) => getOp(item.instruction) === "getfield")
+        .map((item) => item.instruction.arg);
+      const calls = codeItems.filter((item) => getOp(item.instruction) === "invokestatic")
+        .map((item) => item.instruction.arg?.[2]?.[1]);
+      const fieldKey = (field) => JSON.stringify(field);
+      const sameAt = (indices) => indices.every((index) =>
+        fieldKey(staticFields[index]) === fieldKey(staticFields[indices[0]]));
+      if (staticFields.length !== 18 || instanceFields.length !== 2 ||
+          calls.length !== 2 ||
+          calls.some((call, index) => call !== glyphShape.calls[index]) ||
+          staticFields.slice(0, 13).some((field) => field?.[2]?.[1] !== "I") ||
+          staticFields.slice(13).some((field) => field?.[2]?.[1] !== "[I") ||
+          !sameAt([0, 1, 5]) || !sameAt([2, 3, 4]) || !sameAt([6, 7]) ||
+          !sameAt([8, 9, 10]) || !sameAt([11, 12]) ||
+          !sameAt(glyphShape.scanlineFields) ||
+          !sameAt(glyphShape.pixelFields) ||
+          fieldKey(instanceFields[0]) !== fieldKey(instanceFields[1]) ||
+          instanceFields[0]?.[2]?.[1] !== "[[B") return null;
+      const selectedStatics = [
+        staticFields[0], staticFields[2], staticFields[6], staticFields[8],
+        staticFields[11], staticFields[13], staticFields[14],
+      ];
+      if (selectedStatics.slice(0, 5).some((field) => field?.[2]?.[1] !== "I") ||
+          selectedStatics[5]?.[2]?.[1] !== "[I" ||
+          selectedStatics[6]?.[2]?.[1] !== "[I") return null;
+      const selectedStaticSites = selectedStatics.map((field) =>
+        this.registerFieldSite(field));
+      const staticOwners = [...new Set(selectedStaticSites.map((siteId) =>
+        this.fieldSites[siteId].className))];
+      const directStaticTargets = selectedStaticSites.map((siteId) => {
+        const site = this.fieldSites[siteId];
+        if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+          return null;
+        }
+        const direct = this.registerDirectStaticTarget(siteId);
+        return direct ? this.directStaticTargets[direct.targetId] : null;
+      });
+      const allStaticsDirect = directStaticTargets.every(Boolean);
+      const masksFieldSite = this.registerFieldSite(instanceFields[0]);
+      const positional = (receiver, glyphIndex, x, y, width, height, color) => {
+        if (staticOwners.some((owner) =>
+          this.jvm.classInitializationState.get(owner) !== "INITIALIZED")) {
+          return ASYNC_INVOKE;
+        }
+        // Bind initialized storage locations, not values. Reads remain live,
+        // but each glyph avoids repeated hierarchy/key resolution.
+        const values = allStaticsDirect
+          ? directStaticTargets.map((target) => target.kind === "map"
+            ? target.fields.get(target.key) : target.fields[target.key])
+          : selectedStaticSites.map((siteId) => this.getStaticSyncAt(siteId));
+        if (values.some((value) => value === STATIC_DEOPT)) return ASYNC_INVOKE;
+        const [surfaceWidth, clipTop, clipBottom, clipLeft, clipRight,
+          scanlineClip, pixels] = values;
+        if (scanlineClip !== null && scanlineClip !== undefined) return ASYNC_INVOKE;
+        return this.maskedGlyphDirect(
+          receiver, glyphIndex, x, y, width, height, color,
+          surfaceWidth, clipTop, clipBottom, clipLeft, clipRight, pixels,
+          masksFieldSite);
+      };
+      const intrinsic = (stack, base) => positional(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], stack[base + 6]);
+      intrinsic.jvmDirectKind = "maskedGlyph";
+      intrinsic.jvmReceiverSlots = 1;
+      // A runtime-resolved invokevirtual may use this only after the ordinary
+      // resolver has installed the exact receiver-class target.  The structured
+      // caller can then feed its SSA values directly, without first rebuilding
+      // the canonical operand stack.  The final boolean parameter is deliberately
+      // ignored by the verified guest shape, just as the bytecode body ignores it.
+      intrinsic.jvmPositional = positional;
+      return intrinsic;
+    }
+
+    if (descriptor === "(IIIIIII[III)V") {
+      const prefix = [
+        "getstatic", "istore", "iload", "bipush", "if_icmpeq",
+        "bipush", "invokestatic", "goto", "athrow", "iinc",
+      ];
+      if (!prefix.every((op, index) => ops[index] === op)) return null;
+      const integerAndCalls = codeItems.filter((item) => {
+        const instruction = item && item.instruction;
+        return getOp(instruction) === "invokestatic" && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][1] === "(II)I";
+      });
+      const constants = new Set(codeItems.map((item) => {
+        const instruction = item && item.instruction;
+        const op = getOp(instruction);
+        return instruction && typeof instruction === "object" &&
+          (op === "bipush" || op === "sipush" || op === "ldc" || op === "ldc_w")
+          ? Number(instruction.arg) : NaN;
+      }));
+      const expectedConstants = [
+        9, 8355711, -852264639, 65280, -1295343735,
+        1494704929, 16711680, 200866833, 255,
+      ];
+      if (integerAndCalls.length !== 3 ||
+          !ops.includes("iaload") || !ops.includes("iastore") ||
+          !expectedConstants.every((value) => constants.has(value))) return null;
+      const flagField = codeItems.find((item) => getOp(item && item.instruction) === "getstatic")
+        ?.instruction?.arg;
+      if (!flagField) return null;
+      return (stack, base) => {
+        if ((stack[base + 6] | 0) !== 9) return ASYNC_INVOKE;
+        const flag = this.getStaticSync(flagField);
+        if (flag === STATIC_DEOPT || flag) return ASYNC_INVOKE;
+        const dest = stack[base + 7];
+        let index = stack[base + 1] | 0;
+        const count = stack[base + 5] | 0;
+        if (dest === null || dest === undefined) {
+          throw { type: "java/lang/NullPointerException", message: null };
+        }
+        if (count <= 0) return RETURN_VOID;
+        if (index < 0 || index + count > dest.length) {
+          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+        }
+        let green = stack[base] | 0;
+        let red = stack[base + 4] | 0;
+        let blue = stack[base + 8] | 0;
+        const greenStep = stack[base + 2] | 0;
+        const redStep = stack[base + 3] | 0;
+        const blueStep = stack[base + 9] | 0;
+        for (let i = 0; i < count; i += 1) {
+          dest[index] = (((dest[index] >> 1) & 8355711) +
+            ((green >> 9) & 65280) + ((red >> 1) & 16711680) +
+            ((blue >> 17) & 255)) | 0;
+          index += 1;
+          green = (green + greenStep) | 0;
+          red = (red + redStep) | 0;
+          blue = (blue + blueStep) | 0;
+        }
+        return RETURN_VOID;
+      };
+    }
+
+    if (descriptor === "(IB[III)V") {
+      const prefix = [
+        "getstatic", "istore", "iload_1", "bipush", "if_icmpeq",
+        "bipush", "bipush", "aconst_null", "checkcast", "bipush",
+        "bipush", "invokestatic", "goto", "athrow", "iinc",
+      ];
+      if (!prefix.every((op, index) => ops[index] === op)) return null;
+      const integerAndCalls = codeItems.filter((item) => {
+        const instruction = item && item.instruction;
+        return getOp(instruction) === "invokestatic" && instruction &&
+          Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][1] === "(II)I";
+      });
+      const constants = new Set(codeItems.map((item) => {
+        const instruction = item && item.instruction;
+        const op = getOp(instruction);
+        return instruction && typeof instruction === "object" &&
+          (op === "bipush" || op === "sipush" || op === "ldc" || op === "ldc_w")
+          ? Number(instruction.arg) : NaN;
+      }));
+      if (integerAndCalls.length !== 1 ||
+          !ops.includes("iaload") || !ops.includes("iastore") ||
+          ![57, 16711422, -59233087].every((value) => constants.has(value))) return null;
+      const flagField = codeItems.find((item) => getOp(item && item.instruction) === "getstatic")
+        ?.instruction?.arg;
+      if (!flagField) return null;
+      return (stack, base) => {
+        if ((stack[base + 1] | 0) !== 57) return ASYNC_INVOKE;
+        const flag = this.getStaticSync(flagField);
+        if (flag === STATIC_DEOPT || flag) return ASYNC_INVOKE;
+        let index = stack[base] | 0;
+        const dest = stack[base + 2];
+        const color = stack[base + 3] | 0;
+        const count = stack[base + 4] | 0;
+        if (dest === null || dest === undefined) {
+          throw { type: "java/lang/NullPointerException", message: null };
+        }
+        if (count <= 0) return RETURN_VOID;
+        if (index < 0 || index + count > dest.length) {
+          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+        }
+        for (let i = 0; i < count; i += 1) {
+          dest[index] = (color + ((dest[index] & 16711422) >> 1)) | 0;
+          index += 1;
+        }
+        return RETURN_VOID;
+      };
+    }
+
+    return null;
+  }
+
+  primitiveArrayCopyDirect(source, sourceIndex, destination, destinationIndex, length) {
+    sourceIndex |= 0;
+    destinationIndex |= 0;
+    length |= 0;
+    if (source === null || source === undefined ||
+        destination === null || destination === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    // The recognized Java implementation returns before checking length when
+    // source, destination, and offsets are identical.
+    if (source === destination && sourceIndex === destinationIndex) {
+      if (this.profileMethods) this.intrinsicArrayCopyNoopCount += 1;
+      return RETURN_VOID;
+    }
+    if (sourceIndex < 0 || destinationIndex < 0 || length < 0 ||
+        sourceIndex + length > source.length || destinationIndex + length > destination.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    if (source === destination && destinationIndex > sourceIndex &&
+        destinationIndex < sourceIndex + length) {
+      // Array.prototype.copyWithin carries generic property/holes/species
+      // semantics that Java primitive arrays do not need. For the small,
+      // overlapping moves used by the renderer an explicit reverse loop is
+      // dramatically cheaper and preserves memmove ordering exactly.
+      for (let index = length - 1; index >= 0; index -= 1) {
+        destination[destinationIndex + index] = source[sourceIndex + index];
+      }
+      if (this.profileMethods) this.intrinsicArrayCopyWithinCount += 1;
+    } else {
+      for (let index = 0; index < length; index += 1) {
+        destination[destinationIndex + index] = source[sourceIndex + index];
+      }
+    }
+    return RETURN_VOID;
+  }
+
+  clippedSpanDirect(x, y, count, color, clipTop, clipBottom,
+    clipLeft, clipRight, surfaceWidth, pixels) {
+    x |= 0;
+    y |= 0;
+    count |= 0;
+    color |= 0;
+    if (y < (clipTop | 0) || y >= (clipBottom | 0)) return RETURN_VOID;
+    if (x < (clipLeft | 0)) {
+      count = (count - ((clipLeft | 0) - x)) | 0;
+      x = clipLeft | 0;
+    }
+    if (((x + count) | 0) > (clipRight | 0)) count = ((clipRight | 0) - x) | 0;
+    if (count <= 0) return RETURN_VOID;
+    if (pixels === null || pixels === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    const start = (x + Math.imul(y, surfaceWidth | 0)) | 0;
+    const data = this.arrayData(pixels);
+    if (start >= 0 && start + count <= pixels.length && data !== null) {
+      for (let offset = 0; offset < count; offset += 1) data[start + offset] = color;
+      return RETURN_VOID;
+    }
+    for (let offset = 0; offset < count; offset += 1) {
+      const index = (start + offset) | 0;
+      if (index < 0 || index >= pixels.length) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      if (data !== null) data[index] = color;
+      else if (pixels.elements) pixels.elements[index] = color;
+      else pixels[index] = color;
+    }
+    return RETURN_VOID;
+  }
+
+  clippedStaticSpanDirectAt(x, y, count, color,
+    topSite, bottomSite, leftSite, rightSite, widthSite, pixelsSite) {
+    const clipTop = this.getStaticSyncAt(topSite);
+    const clipBottom = this.getStaticSyncAt(bottomSite);
+    const clipLeft = this.getStaticSyncAt(leftSite);
+    const clipRight = this.getStaticSyncAt(rightSite);
+    const surfaceWidth = this.getStaticSyncAt(widthSite);
+    const pixels = this.getStaticSyncAt(pixelsSite);
+    if (clipTop === STATIC_DEOPT || clipBottom === STATIC_DEOPT ||
+        clipLeft === STATIC_DEOPT || clipRight === STATIC_DEOPT ||
+        surfaceWidth === STATIC_DEOPT || pixels === STATIC_DEOPT) return STATIC_DEOPT;
+    return this.clippedSpanDirect(x, y, count, color, clipTop, clipBottom,
+      clipLeft, clipRight, surfaceWidth, pixels);
+  }
+
+  clippedAlphaSpanDirect(x, y, count, color, alpha,
+    clipTop, clipBottom, clipLeft, clipRight, surfaceWidth, pixels) {
+    x |= 0; y |= 0; count |= 0; color |= 0; alpha |= 0;
+    if (y < (clipTop | 0) || y >= (clipBottom | 0)) return RETURN_VOID;
+    if (x < (clipLeft | 0)) {
+      count = (count - ((clipLeft | 0) - x)) | 0;
+      x = clipLeft | 0;
+    }
+    if (((x + count) | 0) > (clipRight | 0)) count = ((clipRight | 0) - x) | 0;
+    if (count <= 0) return RETURN_VOID;
+    if (pixels === null || pixels === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    const start = (x + Math.imul(y, surfaceWidth | 0)) | 0;
+    const data = this.arrayData(pixels);
+    const length = pixels.length ?? (data && data.length) ?? 0;
+    const inverse = (256 - alpha) | 0;
+    const sourceRed = Math.imul((color >> 16) & 255, alpha);
+    const sourceGreen = Math.imul((color >> 8) & 255, alpha);
+    const sourceBlue = Math.imul(color & 255, alpha);
+    const blendAt = (destination) => (
+      ((((sourceRed + Math.imul((destination >> 16) & 255, inverse)) >> 8) << 16) +
+       (((sourceGreen + Math.imul((destination >> 8) & 255, inverse)) >> 8) << 8) +
+       ((sourceBlue + Math.imul(destination & 255, inverse)) >> 8)) | 0
+    );
+    if (data !== null && start >= 0 && start + count <= length) {
+      for (let offset = 0; offset < count; offset += 1) {
+        data[start + offset] = blendAt(data[start + offset] | 0);
+      }
+      return RETURN_VOID;
+    }
+    // Preserve Java's partial-write behavior if a malformed span crosses the
+    // array boundary instead of validating the entire range ahead of time.
+    for (let offset = 0; offset < count; offset += 1) {
+      const index = (start + offset) | 0;
+      if (index < 0 || index >= length) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      const destination = data !== null ? data[index]
+        : pixels.elements ? pixels.elements[index] : pixels[index];
+      const blended = blendAt(destination | 0);
+      if (data !== null) data[index] = blended;
+      else if (pixels.elements) pixels.elements[index] = blended;
+      else pixels[index] = blended;
+    }
+    return RETURN_VOID;
+  }
+
+  clippedStaticAlphaSpanDirectAt(x, y, count, color, alpha,
+    topSite, bottomSite, leftSite, rightSite, widthSite, pixelsSite) {
+    const clipTop = this.getStaticSyncAt(topSite);
+    const clipBottom = this.getStaticSyncAt(bottomSite);
+    const clipLeft = this.getStaticSyncAt(leftSite);
+    const clipRight = this.getStaticSyncAt(rightSite);
+    const surfaceWidth = this.getStaticSyncAt(widthSite);
+    const pixels = this.getStaticSyncAt(pixelsSite);
+    if (clipTop === STATIC_DEOPT || clipBottom === STATIC_DEOPT ||
+        clipLeft === STATIC_DEOPT || clipRight === STATIC_DEOPT ||
+        surfaceWidth === STATIC_DEOPT || pixels === STATIC_DEOPT) return STATIC_DEOPT;
+    return this.clippedAlphaSpanDirect(x, y, count, color, alpha,
+      clipTop, clipBottom, clipLeft, clipRight, surfaceWidth, pixels);
+  }
+
+  maskedColorBlitDirect(destination, mask, color, maskIndex, destinationIndex,
+    width, height, destinationRowSkip, maskRowSkip) {
+    color |= 0;
+    maskIndex |= 0;
+    destinationIndex |= 0;
+    width |= 0;
+    height |= 0;
+    destinationRowSkip |= 0;
+    maskRowSkip |= 0;
+    const destinationData = this.arrayData(destination);
+    const maskData = this.arrayData(mask);
+    const destinationLength = destination?.length ??
+      (destinationData && destinationData.length) ?? 0;
+    const maskLength = mask?.length ?? (maskData && maskData.length) ?? 0;
+    if (width >= 0 && height >= 0 && destinationData !== null && maskData !== null) {
+      let checkedMask = maskIndex;
+      let checkedDestination = destinationIndex;
+      let validRanges = true;
+      for (let rowIndex = 0; rowIndex < height; rowIndex += 1) {
+        if (checkedMask < 0 || checkedMask + width > maskLength ||
+            checkedDestination < 0 || checkedDestination + width > destinationLength) {
+          validRanges = false;
+          break;
+        }
+        checkedMask = (checkedMask + width + maskRowSkip) | 0;
+        checkedDestination = (checkedDestination + width + destinationRowSkip) | 0;
+      }
+      if (validRanges) {
+        for (let rowIndex = 0; rowIndex < height; rowIndex += 1) {
+          const rowEnd = (maskIndex + width) | 0;
+          while (maskIndex < rowEnd) {
+            if (maskData[maskIndex] !== 0) destinationData[destinationIndex] = color;
+            maskIndex += 1;
+            destinationIndex += 1;
+          }
+          destinationIndex = (destinationIndex + destinationRowSkip) | 0;
+          maskIndex = (maskIndex + maskRowSkip) | 0;
+        }
+        return RETURN_VOID;
+      }
+    }
+    const readMask = (index) => {
+      if (mask === null || mask === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (index < 0 || index >= maskLength) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      return maskData !== null ? maskData[index]
+        : mask.elements ? mask.elements[index] : mask[index];
+    };
+    const writeDestination = (index) => {
+      if (destination === null || destination === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (index < 0 || index >= destinationLength) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      if (destinationData !== null) destinationData[index] = color;
+      else if (destination.elements) destination.elements[index] = color;
+      else destination[index] = color;
+    };
+    const groups = -(width >> 2);
+    const remainder = -(width & 3);
+    let row = -height;
+    while (row < 0) {
+      let group = groups;
+      while (group < 0) {
+        for (let lane = 0; lane < 4; lane += 1) {
+          const present = readMask(maskIndex);
+          maskIndex = (maskIndex + 1) | 0;
+          if (present !== 0) writeDestination(destinationIndex);
+          destinationIndex = (destinationIndex + 1) | 0;
+        }
+        group += 1;
+      }
+      let tail = remainder;
+      while (tail < 0) {
+        const present = readMask(maskIndex);
+        maskIndex = (maskIndex + 1) | 0;
+        if (present !== 0) writeDestination(destinationIndex);
+        destinationIndex = (destinationIndex + 1) | 0;
+        tail += 1;
+      }
+      destinationIndex = (destinationIndex + destinationRowSkip) | 0;
+      maskIndex = (maskIndex + maskRowSkip) | 0;
+      row += 1;
+    }
+    return RETURN_VOID;
+  }
+
+  maskedGlyphDirect(receiver, glyphIndex, x, y, width, height, color,
+    surfaceWidth, clipTop, clipBottom, clipLeft, clipRight, pixels, masksFieldSite) {
+    glyphIndex |= 0; x |= 0; y |= 0; width |= 0; height |= 0; color |= 0;
+    surfaceWidth |= 0; clipTop |= 0; clipBottom |= 0; clipLeft |= 0; clipRight |= 0;
+    let destinationIndex = (x + Math.imul(y, surfaceWidth)) | 0;
+    let destinationRowSkip = (surfaceWidth - width) | 0;
+    let maskIndex = 0;
+    let maskRowSkip = 0;
+    if (y < clipTop) {
+      const clipped = (clipTop - y) | 0;
+      height = (height - clipped) | 0;
+      y = clipTop;
+      maskIndex = (maskIndex + Math.imul(clipped, width)) | 0;
+      destinationIndex =
+        (destinationIndex + Math.imul(clipped, surfaceWidth)) | 0;
+    }
+    if (((y + height) | 0) > clipBottom) {
+      height = (height - (((y + height) | 0) - clipBottom)) | 0;
+    }
+    if (x < clipLeft) {
+      const clipped = (clipLeft - x) | 0;
+      width = (width - clipped) | 0;
+      x = clipLeft;
+      maskIndex = (maskIndex + clipped) | 0;
+      destinationIndex = (destinationIndex + clipped) | 0;
+      maskRowSkip = (maskRowSkip + clipped) | 0;
+      destinationRowSkip = (destinationRowSkip + clipped) | 0;
+    }
+    if (((x + width) | 0) > clipRight) {
+      const clipped = (((x + width) | 0) - clipRight) | 0;
+      width = (width - clipped) | 0;
+      maskRowSkip = (maskRowSkip + clipped) | 0;
+      destinationRowSkip = (destinationRowSkip + clipped) | 0;
+    }
+    if (width <= 0 || height <= 0) return RETURN_VOID;
+    const masks = this.getFieldAt(masksFieldSite, receiver);
+    if (masks === null || masks === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    const masksData = this.arrayData(masks);
+    const masksLength = masks.length ?? (masksData && masksData.length) ?? 0;
+    if (glyphIndex < 0 || glyphIndex >= masksLength) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    const mask = masksData !== null ? masksData[glyphIndex]
+      : masks.elements ? masks.elements[glyphIndex] : masks[glyphIndex];
+    return this.maskedColorBlitDirect(pixels, mask, color, maskIndex,
+      destinationIndex, width, height, destinationRowSkip, maskRowSkip);
+  }
+
+  packedColorScanlineDirect(green, index, greenStep, redStep, red, count,
+    tag, dest, blue, blueStep, guarded, owner) {
+    if ((tag | 0) !== 9 || guarded ||
+        this.jvm.classInitializationState.get(owner) !== "INITIALIZED") return ASYNC_INVOKE;
+    index |= 0;
+    count |= 0;
+    if (dest === null || dest === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (count <= 0) return true;
+    if (index < 0 || index + count > dest.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    green |= 0;
+    red |= 0;
+    blue |= 0;
+    greenStep |= 0;
+    redStep |= 0;
+    blueStep |= 0;
+    for (let offset = 0; offset < count; offset += 1) {
+      dest[index] = (((dest[index] >> 1) & 8355711) +
+        ((green >> 9) & 65280) + ((red >> 1) & 16711680) +
+        ((blue >> 17) & 255)) | 0;
+      index += 1;
+      green = (green + greenStep) | 0;
+      red = (red + redStep) | 0;
+      blue = (blue + blueStep) | 0;
+    }
+    return true;
+  }
+
+  packedColorScanlineFused(green, index, greenStep, redStep, red, count,
+    tag, dest, blue, blueStep) {
+    if ((tag | 0) !== 9) throw FusedRegionCompiler.BAILOUT;
+    index |= 0;
+    count |= 0;
+    if (dest === null || dest === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (count <= 0) return;
+    if (index < 0 || index + count > dest.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    green |= 0; red |= 0; blue |= 0;
+    greenStep |= 0; redStep |= 0; blueStep |= 0;
+    for (let offset = 0; offset < count; offset += 1) {
+      dest[index] = (((dest[index] >> 1) & 8355711) +
+        ((green >> 9) & 65280) + ((red >> 1) & 16711680) +
+        ((blue >> 17) & 255)) | 0;
+      index += 1;
+      green = (green + greenStep) | 0;
+      red = (red + redStep) | 0;
+      blue = (blue + blueStep) | 0;
+    }
+  }
+
+  constantColorScanlineFused(index, tag, dest, color, count) {
+    if ((tag | 0) !== 57) throw FusedRegionCompiler.BAILOUT;
+    index |= 0; color |= 0; count |= 0;
+    if (dest === null || dest === undefined) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    if (count <= 0) return;
+    if (index < 0 || index + count > dest.length) {
+      throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+    }
+    for (let offset = 0; offset < count; offset += 1) {
+      dest[index] = (color + ((dest[index] & 16711422) >> 1)) | 0;
+      index += 1;
+    }
+  }
+
+  fusedBailout() {
+    return FusedRegionCompiler.BAILOUT;
+  }
+
+  invokeFusedIntegerNative(nativeMethod, left, right) {
+    const result = nativeMethod(this.jvm, null, [left | 0, right | 0]);
+    if (result && typeof result.then === "function") throw FusedRegionCompiler.BAILOUT;
+    return result;
+  }
+
+  getInlineIntegerRegion(method, params, returnType) {
+    if (this.inlineIntegerRegionCache.has(method)) {
+      return this.inlineIntegerRegionCache.get(method);
+    }
+    const plan = this.getInlineIntegerPlan(method, params, returnType);
+    if (!plan) return null;
+    const inline = this.createGeneratedFunction(method, "inline-integer", ["stack", "base"],
+      `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`);
+    inline.jvmPlan = plan;
+    inline.jvmReceiverSlots = plan.receiverSlots;
+    inline.jvmNested = plan.methodCount > 1;
+    this.inlineIntegerRegionCache.set(method, inline);
+    return inline;
+  }
+
+  getInlineIntegerPlan(method, params, returnType) {
+    if (this.inlineIntegerPlanCache.has(method)) {
+      return this.inlineIntegerPlanCache.get(method);
+    }
+    if (returnType !== "int" || !params.every((type) => type === "int")) return null;
+    const isStatic = (method.flags || []).includes("static");
+    const receiverSlots = isStatic ? 0 : 1;
+    const args = new Array(params.length + receiverSlots);
+    for (let index = 0; index < args.length; index += 1) {
+      args[index] = `stack[base + ${index}]`;
+    }
+    const state = {
+      active: new Set(), statements: [], nextTemp: 0,
+      instructionCount: 0, methodCount: 0,
+    };
+    const result = this.emitInlineIntegerMethod(method, params, returnType, args, state, 0);
+    if (result === null) return null;
+    const plan = {
+      statements: state.statements,
+      result,
+      receiverSlots,
+      inputCount: args.length,
+      methodCount: state.methodCount,
+    };
+    this.inlineIntegerPlanCache.set(method, plan);
+    return plan;
+  }
+
+  emitInlineIntegerMethod(method, params, returnType, args, state, depth) {
+    if (returnType !== "int" || !params.every((type) => type === "int") || depth > 4 ||
+        state.active.has(method)) return null;
+    const code = method.attributes.find((attr) => attr.type === "code");
+    if (!code || (code.code.exceptionTable || []).length) return null;
+    const items = this.getCodeItems(method).filter((item) => item && item.instruction);
+    const instructions = items.map((item) => item.instruction);
+    const labels = buildLabelMap(items);
+    if (instructions.length > 64 || state.instructionCount + instructions.length > 256) return null;
+
+    const isStatic = (method.flags || []).includes("static");
+    const receiverSlots = isStatic ? 0 : 1;
+    if (args.length !== params.length + receiverSlots) return null;
+    const locals = [];
+    for (let index = 0; index < params.length; index += 1) {
+      locals[index + receiverSlots] = args[index + receiverSlots];
+    }
+    const stack = [];
+    const pop = () => stack.length ? stack.pop() : null;
+    const materialize = (expression) => {
+      const temporary = `inlineValue${state.nextTemp++}`;
+      state.statements.push(`const ${temporary} = ${expression};`);
+      return temporary;
+    };
+    const binary = (format) => {
+      const right = pop();
+      const left = pop();
+      if (left === null || right === null) return false;
+      stack.push(materialize(format(left, right)));
+      return true;
+    };
+    const emitStraightRange = (start, end, rangeLocals, rangeStack) => {
+      const statements = [];
+      const rangePop = () => rangeStack.length ? rangeStack.pop() : null;
+      const rangeMaterialize = (expression) => {
+        const temporary = `inlineValue${state.nextTemp++}`;
+        statements.push(`const ${temporary} = ${expression};`);
+        return temporary;
+      };
+      const rangeBinary = (format) => {
+        const right = rangePop(), left = rangePop();
+        if (left === null || right === null) return false;
+        rangeStack.push(rangeMaterialize(format(left, right)));
+        return true;
+      };
+      for (let index = start; index < end; index += 1) {
+        const instruction = instructions[index];
+        const op = getOp(instruction);
+        const load = op === "iload" ? Number(instruction.arg)
+          : /^iload_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (load !== null) {
+          if (rangeLocals[load] === undefined) return null;
+          rangeStack.push(rangeLocals[load]);
+          continue;
+        }
+        const store = op === "istore" ? Number(instruction.arg)
+          : /^istore_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (store !== null) {
+          const stored = rangePop();
+          if (stored === null) return null;
+          rangeLocals[store] = stored;
+          continue;
+        }
+        if (/^iconst_[0-5]$/.test(op)) { rangeStack.push(op.slice(-1)); continue; }
+        if (op === "iconst_m1") { rangeStack.push("-1"); continue; }
+        if (["bipush", "sipush", "ldc", "ldc_w"].includes(op) &&
+            Number.isInteger(Number(instruction.arg))) {
+          rangeStack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        let valid = true;
+        switch (op) {
+          case "iadd": valid = rangeBinary((a, b) => `((${a} + ${b}) | 0)`); break;
+          case "isub": valid = rangeBinary((a, b) => `((${a} - ${b}) | 0)`); break;
+          case "imul": valid = rangeBinary((a, b) => `Math.imul(${a}, ${b})`); break;
+          case "iand": valid = rangeBinary((a, b) => `(${a} & ${b})`); break;
+          case "ior": valid = rangeBinary((a, b) => `(${a} | ${b})`); break;
+          case "ixor": valid = rangeBinary((a, b) => `(${a} ^ ${b})`); break;
+          case "ishl": valid = rangeBinary((a, b) => `(${a} << (${b} & 31))`); break;
+          case "ishr": valid = rangeBinary((a, b) => `(${a} >> (${b} & 31))`); break;
+          case "iushr": valid = rangeBinary((a, b) => `((${a} >>> (${b} & 31)) | 0)`); break;
+          case "ineg": {
+            const input = rangePop();
+            valid = input !== null;
+            if (valid) rangeStack.push(rangeMaterialize(`((-${input}) | 0)`));
+            break;
+          }
+          case "i2b": {
+            const input = rangePop();
+            valid = input !== null;
+            if (valid) rangeStack.push(rangeMaterialize(`((${input} << 24) >> 24)`));
+            break;
+          }
+          default: valid = false; break;
+        }
+        if (!valid) return null;
+      }
+      return statements;
+    };
+
+    state.active.add(method);
+    state.instructionCount += instructions.length;
+    state.methodCount += 1;
+    try {
+      for (let index = 0; index < instructions.length; index += 1) {
+        const instruction = instructions[index];
+        const op = getOp(instruction);
+        const load = op === "iload" ? Number(instruction.arg)
+          : /^iload_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (load !== null) {
+          if (locals[load] === undefined) return null;
+          stack.push(locals[load]);
+          continue;
+        }
+        const store = op === "istore" ? Number(instruction.arg)
+          : /^istore_[0-3]$/.test(op) ? Number(op.slice(-1)) : null;
+        if (store !== null) {
+          const value = pop();
+          if (value === null) return null;
+          locals[store] = value;
+          continue;
+        }
+        if (/^iconst_[0-5]$/.test(op)) {
+          stack.push(op.slice(-1));
+          continue;
+        }
+        if (op === "iconst_m1") {
+          stack.push("-1");
+          continue;
+        }
+        if (op === "bipush" || op === "sipush") {
+          stack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        if ((op === "ldc" || op === "ldc_w") && Number.isInteger(Number(instruction.arg))) {
+          stack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        if (op && op.startsWith("if")) {
+          let condition;
+          if (op.startsWith("if_icmp")) {
+            const right = pop(), left = pop();
+            const comparison = { if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<",
+              if_icmpge: ">=", if_icmpgt: ">", if_icmple: "<=" }[op];
+            if (left === null || right === null || !comparison) return null;
+            condition = `${left} ${comparison} ${right}`;
+          } else {
+            const input = pop();
+            const comparison = { ifeq: "=== 0", ifne: "!== 0", iflt: "< 0",
+              ifge: ">= 0", ifgt: "> 0", ifle: "<= 0" }[op];
+            if (input === null || !comparison) return null;
+            condition = `${input} ${comparison}`;
+          }
+          const target = branchTargetIndex(instruction, labels);
+          if (!Number.isInteger(target) || target <= index || target >= instructions.length) return null;
+          const fallLocals = [...locals], fallStack = [...stack];
+          const branchStatements = emitStraightRange(index + 1, target, fallLocals, fallStack);
+          if (!branchStatements || fallStack.length !== stack.length) return null;
+          const phis = [];
+          const mergedLocals = [...locals], mergedStack = [...stack];
+          const merge = (before, after, assign) => {
+            if (before === after) return true;
+            if (before === undefined || after === undefined) return false;
+            const phi = `inlineValue${state.nextTemp++}`;
+            state.statements.push(`let ${phi} = ${before};`);
+            phis.push(`${phi} = ${after};`);
+            assign(phi);
+            return true;
+          };
+          const localSlots = Math.max(locals.length, fallLocals.length);
+          for (let slot = 0; slot < localSlots; slot += 1) {
+            if (!merge(locals[slot], fallLocals[slot], (phi) => { mergedLocals[slot] = phi; })) {
+              return null;
+            }
+          }
+          for (let slot = 0; slot < stack.length; slot += 1) {
+            if (!merge(stack[slot], fallStack[slot], (phi) => { mergedStack[slot] = phi; })) {
+              return null;
+            }
+          }
+          state.statements.push(`if (!(${condition})) {`, ...branchStatements, ...phis, "}");
+          locals.length = 0; locals.push(...mergedLocals);
+          stack.length = 0; stack.push(...mergedStack);
+          index = target - 1;
+          continue;
+        }
+        if (op === "invokestatic") {
+          const target = this.resolveInlineIntegerStaticTarget(instruction);
+          if (!target) return null;
+          const callArgs = new Array(target.params.length);
+          for (let argument = target.params.length - 1; argument >= 0; argument -= 1) {
+            callArgs[argument] = pop();
+            if (callArgs[argument] === null) return null;
+          }
+          const value = this.emitInlineIntegerMethod(target.method, target.params,
+            target.returnType, callArgs, state, depth + 1);
+          if (value === null) return null;
+          stack.push(value);
+          continue;
+        }
+        let valid = true;
+        switch (op) {
+          case "iadd": valid = binary((a, b) => `((${a} + ${b}) | 0)`); break;
+          case "isub": valid = binary((a, b) => `((${a} - ${b}) | 0)`); break;
+          case "imul": valid = binary((a, b) => `Math.imul(${a}, ${b})`); break;
+          case "iand": valid = binary((a, b) => `(${a} & ${b})`); break;
+          case "ior": valid = binary((a, b) => `(${a} | ${b})`); break;
+          case "ixor": valid = binary((a, b) => `(${a} ^ ${b})`); break;
+          case "ishl": valid = binary((a, b) => `(${a} << (${b} & 31))`); break;
+          case "ishr": valid = binary((a, b) => `(${a} >> (${b} & 31))`); break;
+          case "iushr": valid = binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`); break;
+          case "ineg": {
+            const value = pop();
+            valid = value !== null;
+            if (valid) stack.push(materialize(`((-${value}) | 0)`));
+            break;
+          }
+          case "i2b": {
+            const value = pop();
+            valid = value !== null;
+            if (valid) stack.push(materialize(`((${value} << 24) >> 24)`));
+            break;
+          }
+          case "ireturn": {
+            if (index !== instructions.length - 1 || stack.length !== 1) return null;
+            return pop();
+          }
+          default: valid = false; break;
+        }
+        if (!valid) return null;
+      }
+      return null;
+    } finally {
+      state.active.delete(method);
+    }
+  }
+
+  resolveInlineIntegerStaticTarget(instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    const parsed = parseDescriptor(descriptor);
+    if (parsed.returnType !== "int" || !parsed.params.every((type) => type === "int")) return null;
+    return { method, ...parsed };
+  }
+
+  getCompileTimeIntegerLeaf(instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    const { params, returnType } = parseDescriptor(descriptor);
+    const plan = this.getInlineIntegerPlan(method, params, returnType);
+    if (!plan || plan.receiverSlots) return null;
+    return { statements: plan.statements, result: plan.result, paramCount: params.length };
+  }
+
+  getCompileTimeSynchronousIntrinsic(instruction) {
+    if (!instruction || !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    let parsed;
+    try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
+    const intrinsic = this.getSynchronousIntrinsic(method, descriptor);
+    if (!intrinsic?.jvmDirectKind) return null;
+    const direct = {
+      kind: intrinsic.jvmDirectKind,
+      paramCount: parsed.params.length,
+      returnsVoid: parsed.returnType === "void",
+    };
+    if (intrinsic.jvmDirectKind === "clippedStaticSpan" ||
+        intrinsic.jvmDirectKind === "clippedStaticAlphaSpan") {
+      const staticFields = intrinsic.jvmDirectData?.staticFields;
+      if (!Array.isArray(staticFields) || staticFields.length !== 6) return null;
+      direct.staticFieldSites = staticFields.map((field) => this.registerFieldSite(field));
+    } else if (intrinsic.jvmDirectKind === "polygonFlatRaster" ||
+        intrinsic.jvmDirectKind === "polygonAlphaRaster" ||
+        intrinsic.jvmDirectKind === "tiledIntArrayBlit" ||
+        intrinsic.jvmDirectKind === "perspectiveTexturedSpan") {
+      if (typeof intrinsic.jvmPositional !== "function") return null;
+      direct.positionalId = this.directSynchronousIntrinsics.length;
+      this.directSynchronousIntrinsics.push(intrinsic.jvmPositional);
+    }
+    return direct;
+  }
+
+  async invoke(op, frame, instruction, thread, invokePc) {
+    const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const { params, returnType } = parseDescriptor(descriptor);
+    const stackSnapshot = frame.stack.items.slice();
+    if (op === "invokestatic") {
+      const wasFramePushed = await this.jvm.initializeClassIfNeeded(declaredClassName, thread);
+      if (wasFramePushed) {
+        frame.pc = invokePc;
+        return {
+          deopt: true,
+          transient: true,
+          reason: `class initialization at invokestatic ${declaredClassName}.${methodName}${descriptor}`,
+        };
+      }
+    }
+    const args = [];
+    for (let i = 0; i < params.length; i += 1) {
+      args.unshift(frame.stack.items.pop());
+    }
+
+    let receiver = null;
+    let targetClassName = declaredClassName;
+    if (op !== "invokestatic") {
+      receiver = frame.stack.items.pop();
+      if (receiver === null || receiver === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (op === "invokevirtual" || op === "invokeinterface") {
+        targetClassName = receiver.type || declaredClassName;
+      }
+    }
+
+    const jreMethod = await this.findJreMethod(targetClassName, declaredClassName, methodName, descriptor);
+    if (jreMethod) {
+      let result = jreMethod(this.jvm, receiver, args, thread);
+      if (result && typeof result.then === "function") result = await result;
+      if (result === ASYNC_METHOD_SENTINEL) {
+        // Some JRE shims (notably Method.invoke) install a Java child frame
+        // and use the sentinel to tell the interpreter not to push a result.
+        // Yield the compiled caller when that happened; its post-invoke PC is
+        // already materialized and the child will supply the eventual value.
+        if (!thread.callStack.isEmpty() && thread.callStack.peek() !== frame) {
+          return {
+            deopt: true,
+            transient: true,
+            reason: `async JRE handoff ${targetClassName}.${methodName}${descriptor}`,
+          };
+        }
+        return RETURN_VOID;
+      }
+      if (returnType === "V" || result === undefined) return RETURN_VOID;
+      return typeof result === "boolean" ? (result ? 1 : 0) : result;
+    }
+
+    // Platform classes are implemented by the JRE shim table. Their parsed
+    // classfiles are linkage/type stubs and may contain native methods with no
+    // Code attribute; treating such an empty Frame as a successful call
+    // silently skips required work. Match the interpreter and fail explicitly
+    // when no shim exists.
+    if (this.jvm.jre[targetClassName] || this.jvm.jre[declaredClassName]) {
+      frame.stack.items = stackSnapshot;
+      frame.pc = invokePc;
+      throw new Error(
+        `Unsupported ${op}: ${targetClassName}.${methodName}${descriptor}`,
+      );
+    }
+
+    let classData = this.jvm.classes[targetClassName] || await this.jvm.loadClassByName(targetClassName);
+    let method = this.jvm.findMethod(classData, methodName, descriptor);
+    let lookupClass = targetClassName;
+    while (!method && (op === "invokevirtual" || op === "invokeinterface") &&
+      classData && classData.ast.classes[0].superClassName) {
+      lookupClass = classData.ast.classes[0].superClassName;
+      classData = this.jvm.classes[lookupClass] || await this.jvm.loadClassByName(lookupClass);
+      method = this.jvm.findMethod(classData, methodName, descriptor);
+    }
+    if (!method) {
+      frame.stack.items = stackSnapshot;
+      frame.pc = invokePc;
+      throw new Error(`Unsupported ${op}: ${targetClassName}.${methodName}${descriptor}`);
+    }
+    if (methodName === "<init>" && typeof process !== "undefined" && process.env &&
+        String(process.env.JVM_DEBUG_CONSTRUCTORS || "").split(",").includes(targetClassName)) {
+      console.error(`[constructor] jit resolved ${targetClassName}${descriptor} ` +
+        `from ${frame.className}.${frame.method && frame.method.name}@${invokePc}`);
+    }
+    // Match synchronous call-site admission above. A broad whole-method body
+    // that is safe as a scheduler entry is equally safe as a nested generated
+    // call and avoids a needless frame/scheduler round trip.
+    const jsChildSupported = this.isSupported(method) ||
+      this.isShortSupportedHelper(method) ||
+      (this.prefersWholeMethodJs(frame.method) &&
+        this.isCodegenSupported(method));
+
+    const child = new Frame(method);
+    child.className = lookupClass;
+    let localIndex = 0;
+    if (op !== "invokestatic") {
+      child.locals[0] = receiver;
+      localIndex = 1;
+    }
+    for (let i = 0; i < params.length; i += 1) {
+      child.locals[localIndex] = args[i];
+      localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
+    }
+    thread.callStack.push(child);
+    if (this.wasmJit.enabled) {
+      // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
+      // can prove numeric loops covered by a wrap-and-rethrow diagnostic
+      // handler even when the whole-method JS tier conservatively rejects the
+      // same exceptional call graph. This ordering is important for callers
+      // such as rasterizers: permanently deoptimizing the parent first meant a
+      // child compiled successfully later but could no longer help it.
+      const wasmResult = this.wasmJit.runNested(child, thread, {
+        // A JS-policy-rejected child has no in-call runner fallback. Execute it
+        // speculatively only when every normally reachable block is compiled;
+        // handler-only diagnostic blocks may remain outside Wasm.
+        requireNormalFlowFullyCompiled: !jsChildSupported,
+      });
+      if (wasmResult.returned) {
+        if (returnType === "V" || wasmResult.isVoid) return RETURN_VOID;
+        return wasmResult.value;
+      }
+      if (wasmResult.exited && (wasmResult.deopted || !jsChildSupported)) {
+        // The child remains on the Java call stack at its materialized exit
+        // PC (a deopt may also have materialized deeper callee frames above
+        // it). Yield the generated parent transiently; executeTick will resume
+        // the top frame through the normal scheduler and then continue the
+        // parent at the already-materialized post-invoke PC.
+        return {
+          deopt: true,
+          transient: true,
+          reason: `wasm callee exit ${targetClassName}.${methodName}${descriptor}`,
+        };
+      }
+    }
+    if (!jsChildSupported) {
+      // The generated caller materializes its post-invoke pc and operand stack
+      // before entering this helper. Keep the initialized child on the Java
+      // call stack so the interpreter can finish only that unsupported call;
+      // its return instruction supplies any result to the caller's materialized
+      // stack, after which the hot caller resumes generated execution. This is
+      // also exception-safe: propagation uses parent.pc - 1 as the invoke site.
+      return {
+        deopt: true,
+        transient: true,
+        reason: `interpreted callee ${targetClassName}.${methodName}${descriptor}`,
+      };
+    }
+    const generated = this.getGeneratedFunction(method);
+    const result = generated
+      ? await this.runGeneratedFrame(generated, child, thread)
+      : await this.runFrame(child, thread);
+    if (result.deopt) return result;
+    if (returnType === "V" || result.value === RETURN_VOID) return RETURN_VOID;
+    return result.value;
+  }
+
+  async findJreMethod(targetClassName, declaredClassName, methodName, descriptor) {
+    const direct = this.jvm._jreFindMethod(targetClassName, methodName, descriptor)
+      || this.jvm._jreFindMethod(declaredClassName, methodName, descriptor);
+    if (direct) return direct;
+
+    // Arrays implement Object's virtual methods even though they do not have
+    // ordinary class metadata to walk. Keep generated invokevirtual behavior
+    // aligned with the interpreter (notably for array clone()).
+    if (typeof targetClassName === "string" && targetClassName.startsWith("[")) {
+      const objectMethod = this.jvm._jreFindMethod(
+        "java/lang/Object", methodName, descriptor,
+      );
+      if (objectMethod) return objectMethod;
+    }
+
+    let currentClassName = targetClassName;
+    while (currentClassName) {
+      const classData = this.jvm.classes[currentClassName] || await this.jvm.loadClassByName(currentClassName);
+      if (!classData || !classData.ast || !classData.ast.classes[0]) break;
+      currentClassName = classData.ast.classes[0].superClassName;
+      const method = this.jvm._jreFindMethod(currentClassName, methodName, descriptor);
+      if (method) return method;
+    }
+    return null;
+  }
+
+}
+
+function isClassConstant(arg) {
+  return Array.isArray(arg) && arg[0] === 'Class' && typeof arg[1] === 'string';
+}
+
+function compareDouble(value2, value1, nanValue) {
+  if (Number.isNaN(value1) || Number.isNaN(value2)) return nanValue;
+  if (value1 < value2) return -1;
+  if (value1 > value2) return 1;
+  return 0;
+}
+
+function floatToInt(value) {
+  if (Number.isNaN(value)) return 0;
+  if (value >= 2147483647) return 2147483647;
+  if (value <= -2147483648) return -2147483648;
+  return Math.trunc(value) | 0;
+}
+
+function runtimeClassName(value) {
+  if (typeof value === "string" || value instanceof String) return "java/lang/String";
+  return value && (value._className || value.type);
+}
+
+function generatedRuntimeClassNameExpression(value) {
+  return `(typeof ${value} === "string" || ${value} instanceof String ` +
+    `? "java/lang/String" : (${value}._className || ${value}.type))`;
+}
+
+function integralMemoWidth(type) {
+  switch (type) {
+    case "boolean": return 1;
+    case "byte": return 8;
+    case "short":
+    case "char": return 16;
+    case "int": return 32;
+    default: return 0;
+  }
+}
+
+function integralMemoDescriptorWidth(descriptor) {
+  switch (descriptor) {
+    case "Z": return 1;
+    case "B": return 8;
+    case "S":
+    case "C": return 16;
+    case "I": return 32;
+    default: return 0;
+  }
+}
+
+function unsignedIntegralMemoValue(value, width) {
+  const integer = Number(value) | 0;
+  if (width === 1) return integer === 0 ? 0 : 1;
+  if (width === 8) return integer & 0xff;
+  if (width === 16) return integer & 0xffff;
+  return integer >>> 0;
+}
+
+function yieldToEventLoop() {
+  return new Promise((resolve) => {
+    if (typeof setImmediate === "function") setImmediate(resolve);
+    else setTimeout(resolve, 0);
+  });
+}
+
+
+function getOp(instruction) {
+  if (!instruction) return null;
+  return typeof instruction === "string" ? instruction : instruction.op;
+}
+
+function expandWideInstruction(instruction) {
+  const parts = String(instruction && instruction.arg ? instruction.arg : "")
+    .trim().split(/\s+/).filter(Boolean);
+  const op = parts[0];
+  if (!op) return null;
+  if (op === "iinc") {
+    return { op, varnum: parts[1], incr: parts[2] };
+  }
+  return { op, arg: parts[1] };
+}
+
+function stackEffect(instruction) {
+  const op = getOp(instruction);
+  if (!op || op === "nop" || op === "goto" || op === "goto_w" || op === "iinc" ||
+      op === "ineg" || op === "i2b" || op === "i2s" || op === "i2c" ||
+      op === "i2d" || op === "i2f" || op === "i2l" || op === "l2i" ||
+      op === "d2i" || op === "f2i" || op === "d2f" || op === "f2d" ||
+      op === "d2l" || op === "l2d" || op === "f2l" || op === "l2f" ||
+      op === "dneg" || op === "fneg" || op === "lneg" || op === "instanceof" ||
+      op === "checkcast" || op === "getfield" ||
+      op === "arraylength" || op === "newarray" || op === "anewarray") return 0;
+  if (/^[aifdl]load(?:_[0-3])?$/.test(op) || op === "aconst_null" ||
+      /^iconst_(?:m1|[0-5])$/.test(op) || /^fconst_[0-2]$/.test(op) ||
+      /^dconst_[01]$/.test(op) || /^lconst_[01]$/.test(op) ||
+      op === "bipush" || op === "sipush" ||
+      op === "ldc" || op === "ldc_w" || op === "ldc2_w" ||
+      op === "getstatic" || op === "new") return 1;
+  if (/^[aifdl]store(?:_[0-3])?$/.test(op) || op === "pop" ||
+      op === "putstatic" || op === "athrow" || /^[aifdl]return$/.test(op)) return -1;
+  if (op === "dup") return 1;
+  if (op === "dup_x1") return 1;
+  if (op === "dup_x2") return 1;
+  if (op === "dup2") return 2;
+  if (op === "putfield") return -2;
+  if (op.endsWith("aload") || [
+    "iadd", "isub", "imul", "idiv", "irem", "ishl", "ishr", "iushr",
+    "iand", "ior", "ixor", "dadd", "dsub", "dmul", "ddiv", "drem", "fadd",
+    "fsub", "fmul", "fdiv", "frem", "ladd", "lsub", "land", "lor",
+    "lxor", "ldiv", "lrem", "lmul", "lshl", "lshr", "lushr",
+    "lcmp", "dcmpg", "dcmpl", "fcmpg", "fcmpl",
+  ].includes(op)) return -1;
+  if (op.endsWith("astore")) return -3;
+  if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) return -2;
+  if (["ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle", "ifnull", "ifnonnull"].includes(op)) {
+    return -1;
+  }
+  if (op && op.startsWith("invoke") && instruction && typeof instruction === "object" &&
+      Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2])) {
+    const parsed = parseDescriptor(instruction.arg[2][1]);
+    return -parsed.params.length - (op === "invokestatic" ? 0 : 1) +
+      (parsed.returnType === "void" ? 0 : 1);
+  }
+  if (op === "return") return 0;
+  return null;
+}
+
+function hasMonitorBytecode(codeItems) {
+  return codeItems.some((item) => {
+    const op = getOp(item && item.instruction);
+    return op === "monitorenter" || op === "monitorexit";
+  });
+}
+
+function hasExperimentalControlFlow(codeItems) {
+  return codeItems.some((item) => {
+    const op = getOp(item && item.instruction);
+    return op === "athrow" || op === "monitorenter" || op === "monitorexit";
+  });
+}
+
+function normalFlowContainsInvoke(codeItems) {
+  return normalFlowContains(codeItems, (_instruction, op) =>
+    Boolean(op && op.startsWith("invoke")));
+}
+
+function normalFlowContains(codeItems, predicate) {
+  const labels = buildLabelMap(codeItems);
+  const pending = [0];
+  const visited = new Set();
+
+  while (pending.length) {
+    const index = pending.pop();
+    if (index < 0 || index >= codeItems.length || visited.has(index)) continue;
+    visited.add(index);
+
+    const instruction = codeItems[index] && codeItems[index].instruction;
+    const op = getOp(instruction);
+    if (predicate(instruction, op)) return true;
+
+    if (op === "athrow" || op === "return" || op === "areturn" ||
+      op === "dreturn" || op === "freturn" || op === "ireturn" || op === "lreturn") {
+      continue;
+    }
+    if (op === "goto" || op === "goto_w") {
+      const target = branchTargetIndex(instruction, labels);
+      if (target === undefined) {
+        return codeItems.some((item) => {
+          const candidate = item && item.instruction;
+          return predicate(candidate, getOp(candidate));
+        });
+      }
+      pending.push(target);
+      continue;
+    }
+    if (op && op.startsWith("if")) {
+      const target = branchTargetIndex(instruction, labels);
+      if (target === undefined) {
+        return codeItems.some((item) => {
+          const candidate = item && item.instruction;
+          return predicate(candidate, getOp(candidate));
+        });
+      }
+      pending.push(target);
+    }
+    // Label-only entries and ordinary instructions both fall through.
+    pending.push(index + 1);
+  }
+
+  return false;
+}
+
+function branchTargetIndex(instruction, labels) {
+  if (!instruction || typeof instruction !== "object") return undefined;
+  const arg = Array.isArray(instruction.arg) ? instruction.arg[0] : instruction.arg;
+  return labels.get(arg);
+}
+
+function bytecodeLocalSlot(instruction, op) {
+  if (!op) return null;
+  const compact = /_([0-3])$/.exec(op);
+  if (compact) return Number(compact[1]);
+  if (instruction && typeof instruction === "object") {
+    const raw = op === "iinc"
+      ? instruction.varnum ?? instruction.arg
+      : instruction.arg;
+    const slot = Number(raw);
+    return Number.isSafeInteger(slot) && slot >= 0 ? slot : null;
+  }
+  return null;
+}
+
+function localReadBeforeWrite(codeItems, start, slot, labels) {
+  const pending = [start];
+  const visited = new Set();
+  while (pending.length) {
+    const index = pending.pop();
+    if (index < 0 || index >= codeItems.length || visited.has(index)) continue;
+    visited.add(index);
+    const instruction = codeItems[index]?.instruction;
+    const op = getOp(instruction);
+    if (op && /^[aifdl]load(?:_[0-3])?$/.test(op) &&
+        bytecodeLocalSlot(instruction, op) === slot) return true;
+    if (op === "iinc" && bytecodeLocalSlot(instruction, op) === slot) return true;
+    if (op && /^[aifdl]store(?:_[0-3])?$/.test(op) &&
+        bytecodeLocalSlot(instruction, op) === slot) {
+      // Every use beyond this point observes the replacement, not the entry
+      // initializer, so this path is proven dead without scanning its suffix.
+      continue;
+    }
+    if (op === "tableswitch" || op === "lookupswitch" ||
+        op === "jsr" || op === "jsr_w" || op === "ret") return true;
+    if (op === "athrow" || op === "return" ||
+        op === "areturn" || op === "dreturn" || op === "freturn" ||
+        op === "ireturn" || op === "lreturn") continue;
+    if (op === "goto" || op === "goto_w") {
+      const target = branchTargetIndex(instruction, labels);
+      if (target === undefined) return true;
+      pending.push(target);
+      continue;
+    }
+    if (op && op.startsWith("if")) {
+      const target = branchTargetIndex(instruction, labels);
+      if (target === undefined) return true;
+      pending.push(target);
+    }
+    pending.push(index + 1);
+  }
+  return false;
+}
+
+function stripProvenDeadEntryInitializers(codeItems, exceptionTable) {
+  if (!Array.isArray(codeItems) || codeItems.length < 2 ||
+      Array.isArray(exceptionTable) && exceptionTable.length > 0) return codeItems;
+  const candidates = [];
+  const slots = new Set();
+  let end = 0;
+  while (end + 1 < codeItems.length) {
+    const constant = getOp(codeItems[end]?.instruction);
+    const storeInstruction = codeItems[end + 1]?.instruction;
+    const store = getOp(storeInstruction);
+    const compatible = constant === "iconst_0" &&
+        /^istore(?:_[0-3])?$/.test(store) ||
+      constant === "aconst_null" && /^astore(?:_[0-3])?$/.test(store);
+    if (!compatible) break;
+    const slot = bytecodeLocalSlot(storeInstruction, store);
+    if (slot === null || slots.has(slot)) return codeItems;
+    slots.add(slot);
+    candidates.push(slot);
+    end += 2;
+  }
+  if (!candidates.length) return codeItems;
+  const labels = buildLabelMap(codeItems);
+  if (candidates.some((slot) =>
+    localReadBeforeWrite(codeItems, end, slot, labels))) return codeItems;
+  return codeItems.slice(end);
+}
+
+function normalizeIntrinsicCompilerIdioms(codeItems) {
+  const ops = [];
+  for (let index = 0; index < codeItems.length; index += 1) {
+    const instruction = codeItems[index]?.instruction;
+    const op = getOp(instruction);
+    if (!op) continue;
+    if (index + 6 < codeItems.length &&
+        /^iload(?:_[0-3])?$/.test(op)) {
+      const storeInstruction = codeItems[index + 1]?.instruction;
+      const incrementInstruction = codeItems[index + 2]?.instruction;
+      const staticInstruction = codeItems[index + 3]?.instruction;
+      const temporaryLoad = codeItems[index + 4]?.instruction;
+      const valueLoad = codeItems[index + 5]?.instruction;
+      const arrayStore = codeItems[index + 6]?.instruction;
+      const storeOp = getOp(storeInstruction);
+      const incrementOp = getOp(incrementInstruction);
+      const temporaryLoadOp = getOp(temporaryLoad);
+      if (/^istore(?:_[0-3])?$/.test(storeOp) &&
+          incrementOp === "iinc" &&
+          getOp(staticInstruction) === "getstatic" &&
+          /^iload(?:_[0-3])?$/.test(temporaryLoadOp) &&
+          /^iload(?:_[0-3])?$/.test(getOp(valueLoad)) &&
+          getOp(arrayStore) === "iastore") {
+        const source = bytecodeLocalSlot(instruction, op);
+        const temporary = bytecodeLocalSlot(storeInstruction, storeOp);
+        const incremented = bytecodeLocalSlot(incrementInstruction, incrementOp);
+        const loadedTemporary =
+          bytecodeLocalSlot(temporaryLoad, temporaryLoadOp);
+        if (source !== null && temporary !== null && temporary !== source &&
+            source === incremented && temporary === loadedTemporary &&
+            Number(incrementInstruction.incr ?? 0) === 1) {
+          // javac lowers `array[index++] = value` from some decompiled sources
+          // through a one-use temporary. Canonicalize that verified lowering
+          // back to the same operand behavior used by the original classfile
+          // fingerprint. Local identities and increment direction are checked;
+          // owner/member names are irrelevant.
+          ops.push("getstatic", "iload", "iinc", "iload", "iastore");
+          index += 6;
+          continue;
+        }
+      }
+    }
+    ops.push(op);
+  }
+  // Labeled decompiled source can leave two adjacent void exits at the end of
+  // an otherwise identical region. They have the same observable behavior.
+  while (ops.length > 1 && ops[ops.length - 1] === "return" &&
+      ops[ops.length - 2] === "return") {
+    ops.pop();
+  }
+  return ops;
+}
+
+function jsLiteral(value) {
+  if (typeof value === "bigint") return `${value}n`;
+  return JSON.stringify(value);
+}
+
+function buildLabelMap(codeItems) {
+  const labels = new Map();
+  codeItems.forEach((item, index) => {
+    if (item && item.labelDef) {
+      const label = item.labelDef.endsWith(":") ? item.labelDef.slice(0, -1) : item.labelDef;
+      labels.set(label, index);
+    }
+  });
+  return labels;
+}
+
+function getAsyncFunctionConstructor() {
+  try {
+    return Object.getPrototypeOf(async function generatedProbe() {}).constructor;
+  } catch (_) {
+    return null;
+  }
+}
+
+module.exports = JitCompiler;
+module.exports._test = {
+  bytecodeLocalSlot,
+  localReadBeforeWrite,
+  normalizeIntrinsicCompilerIdioms,
+  stripProvenDeadEntryInitializers,
+};

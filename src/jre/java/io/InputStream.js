@@ -1,23 +1,25 @@
 // JRE Class: java/io/InputStream
+const { withThrows } = require('../../helpers');
+
 module.exports = {
   super: 'java/lang/Object',
   methods: {
-    'read()I': function(jvm, obj, args, thread) {
+    'read()I': withThrows(function(jvm, obj, args, thread) {
       // Default implementation - return -1 (end of stream)
       return -1;
-    },
-    'read([BII)I': function(jvm, obj, args, thread) {
+    }, ['java/io/IOException']),
+    'read([BII)I': withThrows(function(jvm, obj, args, thread) {
       // Default implementation - return -1 (end of stream)
       return -1;
-    },
-    'close()V': function(jvm, obj, args, thread) {
+    }, ['java/io/IOException']),
+    'close()V': withThrows(function(jvm, obj, args, thread) {
       // Default implementation - do nothing
-    },
-    'available()I': function(jvm, obj, args, thread) {
+    }, ['java/io/IOException']),
+    'available()I': withThrows(function(jvm, obj, args, thread) {
       // Default implementation - return 0 (no bytes available)
       return 0;
-    },
-    'readAllBytes()[B': async function(jvm, obj, args, thread) {
+    }, ['java/io/IOException']),
+    'readAllBytes()[B': withThrows(async function(jvm, obj, args, thread) {
       const stream = obj.stream;
       if (!stream) {
         // This is a default InputStream, not one from a URL.
@@ -35,6 +37,6 @@ module.exports = {
         });
         stream.on('error', reject);
       });
-    }
+    }, ['java/io/IOException'])
   }
 };

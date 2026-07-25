@@ -1,6 +1,6 @@
 const fs = require('fs');
 const path = require('path');
-const { parseClassFile } = require('../src/create_java_asm');
+const { parseClassFile } = require('../src/parsing/create_java_asm');
 
 function main() {
   const args = process.argv.slice(2);

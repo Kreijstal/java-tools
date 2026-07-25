@@ -1,7 +1,7 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
+const { JVM } = require('../src/core/jvm');
 const invokeHandlers = require('../src/instructions/invoke');
-const Frame = require('../src/frame');
+const Frame = require('../src/core/frame');
 
 test('Invoke instructions should validate method access flags', async function(t) {
   t.plan(4);

@@ -1,9 +1,30 @@
+const labelIndexCache = new WeakMap();
+
+function targetPcFor(frame, label) {
+  const instructions = frame.instructions;
+  let labels = labelIndexCache.get(instructions);
+  if (!labels) {
+    labels = new Map();
+    instructions.forEach((item, index) => {
+      if (!item || !item.labelDef) return;
+      const name = item.labelDef.endsWith(':')
+        ? item.labelDef.slice(0, -1)
+        : item.labelDef;
+      labels.set(name, index);
+    });
+    labelIndexCache.set(instructions, labels);
+  }
+  const target = labels.get(label);
+  return target === undefined ? -1 : target;
+}
+
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
     if (thread.pendingException) {
       delete thread.pendingException;
     }
     thread.callStack.pop();
+    jvm.completeClassInitialization(frame);
     if (thread.isAwaitingReflectiveCall) {
       thread.reflectiveCallResolver(null);
       thread.isAwaitingReflectiveCall = false;
@@ -37,7 +58,7 @@ module.exports = {
   },
   goto: (frame, instruction) => {
     const label = instruction.arg;
-    const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+    const targetPc = targetPcFor(frame, label);
     if (targetPc !== -1) {
       frame.pc = targetPc;
     } else {
@@ -48,7 +69,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value !== 0) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -61,7 +82,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 < value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -73,7 +94,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value !== null) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -86,7 +107,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 === value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -98,7 +119,33 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value === null) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
+  if_icmple: (frame, instruction) => {
+    const label = instruction.arg;
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value1 <= value2) {
+      const targetPc = targetPcFor(frame, label);
+      if (targetPc !== -1) {
+        frame.pc = targetPc;
+      } else {
+        throw new Error(`Label ${label} not found`);
+      }
+    }
+  },
+  if_icmple: (frame, instruction) => {
+    const label = instruction.arg;
+    const value2 = frame.stack.pop();
+    const value1 = frame.stack.pop();
+    if (value1 <= value2) {
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -111,7 +158,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 > value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -128,7 +175,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 >= value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -140,7 +187,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value <= 0) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -152,7 +199,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value > 0) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -164,7 +211,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value === 0) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -176,7 +223,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value >= 0) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -188,7 +235,7 @@ module.exports = {
     const label = instruction.arg;
     const value = frame.stack.pop();
     if (value < 0) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -201,7 +248,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 !== value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -214,7 +261,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 === value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -227,7 +274,7 @@ module.exports = {
     const value2 = frame.stack.pop();
     const value1 = frame.stack.pop();
     if (value1 !== value2) {
-      const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+      const targetPc = targetPcFor(frame, label);
       if (targetPc !== -1) {
         frame.pc = targetPc;
       } else {
@@ -251,7 +298,7 @@ module.exports = {
       targetLabel = defaultLabel;
     }
     
-    const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${targetLabel}:`);
+    const targetPc = targetPcFor(frame, targetLabel);
     if (targetPc !== -1) {
       frame.pc = targetPc;
     } else {
@@ -270,7 +317,7 @@ module.exports = {
       }
     }
     
-    const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${targetLabel}:`);
+    const targetPc = targetPcFor(frame, targetLabel);
     if (targetPc !== -1) {
       frame.pc = targetPc;
     } else {
@@ -279,7 +326,7 @@ module.exports = {
   },
   jsr: (frame, instruction) => {
     const label = instruction.arg;
-    const targetPc = frame.instructions.findIndex(inst => inst.labelDef === `${label}:`);
+    const targetPc = targetPcFor(frame, label);
     if (targetPc !== -1) {
       frame.stack.push(frame.pc);
       frame.pc = targetPc;

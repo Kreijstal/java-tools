@@ -1,62 +1,62 @@
-let Speaker;
-try {
-  Speaker = require("speaker");
-} catch (err) {
-  // Fallback for environments where speaker package is not available
-  // console.warn("Speaker package not available, audio output disabled");
-  Speaker = class MockSpeaker {
-    constructor(options) {
-      this.options = options;
-    }
-    write(data) {
-      // Mock write - do nothing
-    }
-    end() {
-      // Mock end - do nothing
-    }
-    once(event, callback) {
-      if (event === "drain") {
-        setTimeout(callback, 0);
-      }
-    }
+const { createAudioOutput } = require('../../../../platform/audio');
+const { withThrows } = require('../../../helpers');
+
+function getFormatFields(format) {
+  return format.fields["javax/sound/sampled/AudioFormat"];
+}
+
+function toOutputOptions(formatFields) {
+  return {
+    channels: formatFields.channels || 1,
+    bitDepth: formatFields.sampleSizeInBits || 16,
+    sampleRate: formatFields.sampleRate || 44100,
+    signed: formatFields.signed !== undefined ? formatFields.signed : true,
+    bigEndian: formatFields.bigEndian !== undefined ? formatFields.bigEndian : false,
   };
+}
+
+function toAudioBytes(buffer, offset, len) {
+  const slice = buffer.slice(offset, offset + len);
+  if (typeof Buffer !== 'undefined') {
+    return Buffer.from(slice);
+  }
+  return new Uint8Array(slice);
 }
 
 module.exports = {
   super: "javax/sound/sampled/DataLine",
   methods: {
-    "open(Ljavax/sound/sampled/AudioFormat;)V": (jvm, obj, args) => {
+    "open(Ljavax/sound/sampled/AudioFormat;)V": withThrows((jvm, obj, args) => {
       const [format] = args;
-      const formatFields = format.fields["javax/sound/sampled/AudioFormat"];
+      const formatFields = getFormatFields(format);
 
       try {
-        const speaker = new Speaker({
-          channels: formatFields.channels || 1,
-          bitDepth: formatFields.sampleSizeInBits || 16,
-          sampleRate: formatFields.sampleRate || 44100,
-          signed:
-            formatFields.signed !== undefined ? formatFields.signed : true,
-        });
-
-        obj.speaker = speaker;
+        obj.audioOutput = createAudioOutput(toOutputOptions(formatFields));
         obj.isOpen = true;
       } catch (error) {
-        console.error("Failed to open audio device:", error.message);
-        throw {
-          type: "javax/sound/sampled/LineUnavailableException",
-          message: "Failed to open audio device: " + error.message,
+        // Headless / no audio device: discard samples instead of leaving the
+        // line closed — games treat a dead line as fatal mid-loop.
+        if (!module.exports._warnedNoAudio) {
+          module.exports._warnedNoAudio = true;
+          console.error("No audio device, discarding sound output:", error.message);
+        }
+        obj.audioOutput = {
+          write() {},
+          once(event, cb) { if (cb) cb(); },
+          end() {},
         };
+        obj.isOpen = true;
       }
-    },
+    }, ["javax/sound/sampled/LineUnavailableException"]),
     "open(Ljavax/sound/sampled/AudioFormat;I)V": (jvm, obj, args) => {
       // bufferSize is ignored for now
       const self = jvm.jre["javax/sound/sampled/SourceDataLine"];
       self.methods["open(Ljavax/sound/sampled/AudioFormat;)V"](jvm, obj, args);
     },
-    "write([BII)I": (jvm, obj, args) => {
+    "write([BII)I": withThrows((jvm, obj, args) => {
       const [buffer, offset, len] = args;
 
-      if (!obj.speaker || !obj.isOpen) {
+      if (!obj.audioOutput || !obj.isOpen) {
         throw {
           type: "java/lang/IllegalStateException",
           message: "Line is not open",
@@ -64,8 +64,7 @@ module.exports = {
       }
 
       try {
-        const data = Buffer.from(buffer.slice(offset, offset + len));
-        obj.speaker.write(data);
+        obj.audioOutput.write(toAudioBytes(buffer, offset, len));
         return len;
       } catch (error) {
         console.error("Audio write error:", error.message);
@@ -74,39 +73,45 @@ module.exports = {
           message: "Audio write failed: " + error.message,
         };
       }
-    },
+    }, ["java/lang/IllegalStateException", "java/io/IOException"]),
     "available()I": (jvm, obj, args) => {
+      // A discard sink drains instantaneously. Reporting it as permanently
+      // empty makes games spend every cycle decoding audio that nobody can
+      // hear. In explicitly headless mode, model a full output buffer so the
+      // producer applies normal backpressure and yields to rendering.
+      if (process.env.JVM_DISABLE_AUDIO === '1' || process.env.JVM_DISABLE_AUDIO === 'true') {
+        return 0;
+      }
       // Return a reasonable buffer size estimate
       return 4096;
     },
     "flush()V": (jvm, obj, args) => {
-      // Not implemented for speaker - data is sent immediately
+      // Data is sent immediately by the current audio outputs.
     },
     "start()V": (jvm, obj, args) => {
-      // Speaker starts automatically on first write
+      // Audio outputs start automatically on first write.
       obj.isStarted = true;
     },
     "stop()V": (jvm, obj, args) => {
-      // Not implemented - speaker continues until closed
       obj.isStarted = false;
     },
     "drain()V": async (jvm, obj, args) => {
-      if (!obj.speaker) {
+      if (!obj.audioOutput) {
         return;
       }
 
       await new Promise((resolve) => {
-        obj.speaker.once("drain", resolve);
+        obj.audioOutput.once("drain", resolve);
       });
     },
     "close()V": (jvm, obj, args) => {
-      if (obj.speaker) {
+      if (obj.audioOutput) {
         try {
-          obj.speaker.end();
+          obj.audioOutput.end();
         } catch (error) {
-          console.error("Error closing speaker:", error.message);
+          console.error("Error closing audio output:", error.message);
         }
-        obj.speaker = null;
+        obj.audioOutput = null;
       }
       obj.isOpen = false;
       obj.isStarted = false;

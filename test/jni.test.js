@@ -1,5 +1,5 @@
 const test = require('tape');
-const { JVM } = require('../src/jvm');
+const { JVM } = require('../src/core/jvm');
 
 test('JNI Native Method Registration and Execution', (t) => {
   const jvm = new JVM({ verbose: false });
@@ -76,7 +76,18 @@ test('JNI Native Method Registration and Execution', (t) => {
     
     if (currentTimeMethod) {
       const time = currentTimeMethod(jvm, null, [], null);
-      st.ok(typeof time === 'number' && time > 0, 'Should return a positive timestamp');
+      st.ok(typeof time === 'bigint' && time > 0n,
+        'long timestamps use the JVM category-2 BigInt representation');
+    }
+
+    const nanoTimeMethod = jvm._jreFindMethod(
+      'java/lang/System', 'nanoTime', '()J',
+    );
+    st.ok(nanoTimeMethod, 'System.nanoTime should be registered');
+    if (nanoTimeMethod) {
+      const time = nanoTimeMethod(jvm, null, [], null);
+      st.ok(typeof time === 'bigint' && time > 0n,
+        'nanosecond timestamps use the JVM category-2 BigInt representation');
     }
 
     // Test Object.hashCode()  
@@ -99,6 +110,20 @@ test('JNI Native Method Registration and Execution', (t) => {
     // This tests that existing JRE methods still work
     const stringMethod = jvm._jreFindMethod('java/lang/String', 'length', '()I');
     st.ok(stringMethod, 'Legacy JRE methods should still be found');
+    st.end();
+  });
+
+  t.test('cached JRE lookups invalidate when a native is registered later', (st) => {
+    const className = 'com/test/LateNative';
+    st.equal(jvm._jreFindMethod(className, 'value', '()I'), null,
+      'an unresolved lookup is cached as a miss');
+    jvm.registerNativeMethod(className, 'value', '()I', () => 73);
+    const resolved = jvm._jreFindMethod(className, 'value', '()I');
+    st.equal(typeof resolved, 'function', 'registration invalidates the cached miss');
+    st.equal(jvm._jreFindMethod(className, 'value', '()I'), resolved,
+      'repeated lookup returns the cached resolved function');
+    st.equal(resolved(jvm, null, [], null), 73,
+      'the cached wrapper retains native behavior');
     st.end();
   });
 

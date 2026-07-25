@@ -1,9 +1,25 @@
+const { withThrows } = require('../../helpers');
+
+function nextDouble(obj) {
+  let seed = obj['java/util/Random/seed'];
+
+  seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
+  const high27 = Number(seed >> 21n);
+  seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
+  const low26 = Number(seed >> 22n);
+  obj['java/util/Random/seed'] = seed;
+
+  return (high27 * (2 ** 26) + low26) / (2 ** 53);
+}
+
 module.exports = {
   super: "java/lang/Object",
   methods: {
     '<init>()V': (jvm, obj, args) => {
-      // Initialize with current time, similar to Java's default
-      const seed = BigInt(Date.now()) & ((1n << 48n) - 1n);
+      // Initialize with current time, similar to Java's default.
+      // Under JVM_FAKE_TIME, use a deterministic per-instance seed instead.
+      const entropy = jvm.clock.nextSeed();
+      const seed = entropy & ((1n << 48n) - 1n);
       obj['java/util/Random/seed'] = seed;
     },
     '<init>(J)V': (jvm, obj, args) => {
@@ -27,11 +43,11 @@ module.exports = {
       // Convert to 32-bit signed integer
       return result | 0;
     },
-    'nextInt(I)I': (jvm, obj, args) => {
+    'nextInt(I)I': withThrows((jvm, obj, args) => {
       const bound = args[0];
       
       if (bound <= 0) {
-        throw new Error('bound must be positive');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'bound must be positive' };
       }
       
       // Use the nextInt() method and apply modulo bound
@@ -52,7 +68,7 @@ module.exports = {
         let val = signedResult >>> 1; // Use only 31 bits to ensure positive
         return val % bound;
       }
-    },
+    }, ['java/lang/IllegalArgumentException']),
     'nextLong()J': (jvm, obj, args) => {
       let seed = obj['java/util/Random/seed'];
       
@@ -88,32 +104,19 @@ module.exports = {
       return intVal / (1 << 24); // Divide by 2^24 to get [0, 1)
     },
     'nextDouble()D': (jvm, obj, args) => {
-      let seed = obj['java/util/Random/seed'];
-      
-      // Generate first 27 bits
-      seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
-      const high27 = Number(seed >> 21n);
-      
-      // Generate second 26 bits  
-      seed = (seed * 0x5DEECE66Dn + 0xBn) & ((1n << 48n) - 1n);
-      const low26 = Number(seed >> 22n);
-      
-      obj['java/util/Random/seed'] = seed;
-      
-      // Combine for 53 bits of precision
-      return (high27 * (1 << 26) + low26) / (1 << 53);
+      return nextDouble(obj);
     },
-    'nextBytes([B)V': (jvm, obj, args) => {
+    'nextBytes([B)V': withThrows((jvm, obj, args) => {
       const byteArray = args[0];
       
       // Handle both array formats
       let bytes;
       if (byteArray && byteArray.array) {
         bytes = byteArray.array;
-      } else if (Array.isArray(byteArray)) {
+      } else if (Array.isArray(byteArray) || ArrayBuffer.isView(byteArray)) {
         bytes = byteArray;
       } else {
-        throw new Error('Invalid byte array format');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };
       }
       
       let seed = obj['java/util/Random/seed'];
@@ -128,7 +131,7 @@ module.exports = {
       }
       
       obj['java/util/Random/seed'] = seed;
-    },
+    }, ['java/lang/IllegalArgumentException']),
     'nextGaussian()D': (jvm, obj, args) => {
       // Check if we have a cached Gaussian value
       if (obj['java/util/Random/haveNextNextGaussian']) {
@@ -141,8 +144,8 @@ module.exports = {
       let v1, v2, s;
       do {
         // Generate two uniform random values in [-1, 1)
-        v1 = 2 * obj.nextDouble() - 1;
-        v2 = 2 * obj.nextDouble() - 1;
+        v1 = 2 * nextDouble(obj) - 1;
+        v2 = 2 * nextDouble(obj) - 1;
         s = v1 * v1 + v2 * v2;
       } while (s >= 1 || s === 0);
       

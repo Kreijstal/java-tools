@@ -1,3 +1,10 @@
+function javaString(value) {
+  if (value === null || value === undefined) return 'null';
+  if (value && value.type === 'java/lang/String') return String(value);
+  if (value && typeof value.toString === 'function') return String(value.toString());
+  return String(value);
+}
+
 module.exports = {
   methods: {},
   staticMethods: {
@@ -86,6 +93,31 @@ module.exports = {
 
       return copy;
     },
+    'toString([Ljava/lang/Object;)Ljava/lang/String;': (jvm, obj, args) => {
+      const array = args[0];
+      if (!array) return jvm.internString('null');
+      return jvm.internString('[' + Array.from(array).map(javaString).join(', ') + ']');
+    },
+    'copyOf([Ljava/lang/Object;I)[Ljava/lang/Object;': (jvm, obj, args) => {
+      const original = args[0] || [];
+      const newLength = args[1];
+      const copy = new Array(newLength).fill(null);
+      for (let i = 0; i < Math.min(original.length, newLength); i++) copy[i] = original[i];
+      copy.type = original.type || '[Ljava/lang/Object;';
+      copy.elementType = original.elementType || 'java/lang/Object';
+      copy.hashCode = jvm.nextHashCode++;
+      return copy;
+    },
+    'copyOf([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;': (jvm, obj, args) => {
+      const original = args[0] || [];
+      const newLength = args[1];
+      const copy = new Array(newLength).fill(null);
+      for (let i = 0; i < Math.min(original.length, newLength); i++) copy[i] = original[i];
+      copy.type = original.type || '[Ljava/lang/Object;';
+      copy.elementType = original.elementType || 'java/lang/Object';
+      copy.hashCode = jvm.nextHashCode++;
+      return copy;
+    },
     'toString([I)Ljava/lang/String;': (jvm, obj, args) => {
       const array = args[0];
       if (!array) return "null";
@@ -106,6 +138,7 @@ module.exports = {
       // Return an ArrayList containing the elements of the array
       return {
         type: 'java/util/ArrayList',
+        array: [...array],
         items: [...array],
         size: array.length
       };

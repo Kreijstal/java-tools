@@ -1,3 +1,5 @@
+const { withThrows } = require('../../../helpers');
+
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
@@ -6,7 +8,7 @@ module.exports = {
       const fieldName = fieldObj._fieldData.name;
       return jvm.internString(fieldName);
     },
-    'getType()Ljava/lang/Class;': async (jvm, fieldObj, args) => {
+    'getType()Ljava/lang/Class;': withThrows(async (jvm, fieldObj, args) => {
       const descriptor = fieldObj._fieldData.descriptor;
       
       // Parse the field descriptor to get the type
@@ -81,13 +83,13 @@ module.exports = {
         };
       }
       
-      throw new Error(`Unsupported field descriptor: ${descriptor}`);
-    },
+      throw { type: 'java/lang/IllegalArgumentException', message: `Unsupported field descriptor: ${descriptor}` };
+    }, ['java/lang/ClassNotFoundException', 'java/lang/IllegalArgumentException']),
     'getModifiers()I': (jvm, fieldObj, args) => {
       const accessFlags = fieldObj._fieldData.accessFlags;
       return accessFlags;
     },
-    'get(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, fieldObj, args) => {
+    'get(Ljava/lang/Object;)Ljava/lang/Object;': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const fieldData = fieldObj._fieldData;
       const fieldName = fieldData.name;
@@ -96,17 +98,8 @@ module.exports = {
         // Static field - get from class static fields
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
-
-        if (classData.staticFields instanceof Map) {
-          if (classData.staticFields.has(fieldKey)) {
-            return classData.staticFields.get(fieldKey);
-          }
-        } else if (
-          classData.staticFields &&
-          Object.prototype.hasOwnProperty.call(classData.staticFields, fieldKey)
-        ) {
-          return classData.staticFields[fieldKey];
+        if (classData.staticFields && classData.staticFields.has(fieldName)) {
+          return classData.staticFields.get(fieldName);
         }
         return null;
       } else {
@@ -119,8 +112,12 @@ module.exports = {
         }
         return obj[fieldName];
       }
-    },
-    'set(Ljava/lang/Object;Ljava/lang/Object;)V': (jvm, fieldObj, args) => {
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
+    'set(Ljava/lang/Object;Ljava/lang/Object;)V': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const value = args[1];
       const fieldData = fieldObj._fieldData;
@@ -130,11 +127,10 @@ module.exports = {
         // Static field - set in class static fields
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (!(classData.staticFields instanceof Map)) {
+        if (!classData.staticFields) {
           classData.staticFields = new Map();
         }
-        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
-        classData.staticFields.set(fieldKey, value);
+        classData.staticFields.set(fieldName, value);
       } else {
         // Instance field
         if (obj === null) {
@@ -145,7 +141,11 @@ module.exports = {
         }
         obj[fieldName] = value;
       }
-    },
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
     'isAnnotationPresent(Ljava/lang/Class;)Z': (jvm, fieldObj, args) => {
       const annotationClass = args[0];
       const annotations = fieldObj._annotations || [];
@@ -179,7 +179,7 @@ module.exports = {
       
       return null;
     },
-    'getInt(Ljava/lang/Object;)I': (jvm, fieldObj, args) => {
+    'getInt(Ljava/lang/Object;)I': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const fieldData = fieldObj._fieldData;
       const fieldName = fieldData.name;
@@ -187,17 +187,8 @@ module.exports = {
       if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
-
-        if (classData.staticFields instanceof Map) {
-          if (classData.staticFields.has(fieldKey)) {
-            return classData.staticFields.get(fieldKey);
-          }
-        } else if (
-          classData.staticFields &&
-          Object.prototype.hasOwnProperty.call(classData.staticFields, fieldKey)
-        ) {
-          return classData.staticFields[fieldKey];
+        if (classData.staticFields && classData.staticFields.has(fieldName)) {
+          return classData.staticFields.get(fieldName);
         }
         return 0;
       } else {
@@ -209,8 +200,12 @@ module.exports = {
         }
         return obj[fieldName];
       }
-    },
-    'setInt(Ljava/lang/Object;I)V': (jvm, fieldObj, args) => {
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
+    'setInt(Ljava/lang/Object;I)V': withThrows((jvm, fieldObj, args) => {
       const obj = args[0];
       const value = args[1];
       const fieldData = fieldObj._fieldData;
@@ -219,11 +214,10 @@ module.exports = {
       if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (!(classData.staticFields instanceof Map)) {
+        if (!classData.staticFields) {
           classData.staticFields = new Map();
         }
-        const fieldKey = `${fieldName}:${fieldData.descriptor}`;
-        classData.staticFields.set(fieldKey, value);
+        classData.staticFields.set(fieldName, value);
       } else {
         if (obj === null) {
           throw {
@@ -233,6 +227,10 @@ module.exports = {
         }
         obj[fieldName] = value;
       }
-    }
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ])
   }
 };

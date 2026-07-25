@@ -1,7 +1,7 @@
 const test = require('tape');
 const path = require('path');
-const { KrakatauWorkspace } = require('../src/KrakatauWorkspace');
-const { SymbolIdentifier, SymbolLocation, WorkspaceEdit, RefactorOperation } = require('../src/symbols');
+const { KrakatauWorkspace } = require('../src/workspace/KrakatauWorkspace');
+const { SymbolIdentifier, SymbolLocation, WorkspaceEdit, RefactorOperation } = require('../src/workspace/symbols');
 
 test('KrakatauWorkspace basic functionality', async function(t) {
   t.plan(8);

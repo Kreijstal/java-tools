@@ -1,3 +1,5 @@
+const { withThrows } = require('../../../helpers');
+
 module.exports = {
   super: {
     type: 'java/lang/Enum'
@@ -57,7 +59,7 @@ module.exports = {
         module.exports.staticFields.PACKAGE
       ];
     },
-    'valueOf(Ljava/lang/String;)Ljava/lang/annotation/ElementType;': (jvm, obj, args) => {
+    'valueOf(Ljava/lang/String;)Ljava/lang/annotation/ElementType;': withThrows((jvm, obj, args) => {
       const name = args[0];
       switch (name) {
         case 'TYPE': return module.exports.staticFields.TYPE;
@@ -74,7 +76,7 @@ module.exports = {
             message: `No enum constant java.lang.annotation.ElementType.${name}`
           };
       }
-    }
+    }, ['java/lang/IllegalArgumentException'])
   },
   methods: {
     'name()Ljava/lang/String;': (jvm, obj, args) => {

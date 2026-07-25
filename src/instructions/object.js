@@ -1,3 +1,176 @@
+function runtimeClassName(objRef) {
+  if (typeof objRef === 'string' || objRef instanceof String) {
+    return 'java/lang/String';
+  }
+  return objRef && (objRef._className || objRef.type);
+}
+
+function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
+  const fields = objRef.fields || {};
+  let currentClassName = className;
+  while (currentClassName) {
+    const fieldKey = `${currentClassName}.${fieldName}`;
+    if (Object.prototype.hasOwnProperty.call(fields, fieldKey)) {
+      return fieldKey;
+    }
+
+    const classData = jvm.classes[currentClassName];
+    currentClassName = classData && classData.ast && classData.ast.classes[0]
+      ? classData.ast.classes[0].superClassName
+      : null;
+  }
+
+  return Object.keys(fields).find((fieldKey) =>
+    fieldKey.endsWith(`.${fieldName}`));
+}
+
+// A fieldref resolves to one declaring-class slot regardless of the runtime
+// subclass of its receiver. Cache that verified slot on the parsed instruction
+// itself; Symbols stay out of snapshots, JSON, and debugger views. The own-key
+// check keeps synthetic/JRE objects with unusual layouts on the full resolver.
+const resolvedInstanceFieldKey = Symbol('resolvedInstanceFieldKey');
+const resolvedStaticFieldSite = Symbol('resolvedStaticFieldSite');
+const SYNC_STATIC_FALLBACK = Symbol('syncStaticFallback');
+function resolveInstanceFieldKeyAtSite(jvm, objRef, instruction, className, fieldName) {
+  if (instruction && typeof instruction === 'object') {
+    const cached = instruction[resolvedInstanceFieldKey];
+    if (cached && objRef.fields &&
+        Object.prototype.hasOwnProperty.call(objRef.fields, cached)) {
+      return cached;
+    }
+  }
+  const fieldKey = resolveInstanceFieldKey(jvm, objRef, className, fieldName);
+  if (fieldKey && instruction && typeof instruction === 'object') {
+    try {
+      Object.defineProperty(instruction, resolvedInstanceFieldKey, {
+        configurable: true,
+        writable: true,
+        value: fieldKey,
+      });
+    } catch (_) {
+      // Frozen diagnostic fixtures simply retain the uncached resolver path.
+    }
+  }
+  return fieldKey;
+}
+
+function resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor) {
+  if (instruction && typeof instruction === 'object' && instruction[resolvedStaticFieldSite]) {
+    return instruction[resolvedStaticFieldSite];
+  }
+  const fieldKey = `${fieldName}:${descriptor}`;
+  let currentClassName = className;
+  let site = null;
+  while (currentClassName) {
+    const classData = jvm.classes[currentClassName];
+    if (classData && classData.staticFields) {
+      if (classData.staticFields.has(fieldKey)) {
+        site = { kind: 'class', owner: currentClassName, key: fieldKey };
+        break;
+      }
+      if (classData.staticFields.has(fieldName)) {
+        site = { kind: 'class', owner: currentClassName, key: fieldName };
+        break;
+      }
+      for (const key of classData.staticFields.keys()) {
+        if (typeof key === 'string' && key.split(':')[0].replace(/'/g, '') === fieldName) {
+          site = { kind: 'class', owner: currentClassName, key };
+          break;
+        }
+      }
+      if (site) break;
+    }
+    currentClassName = classData && classData.ast && classData.ast.classes[0]
+      ? classData.ast.classes[0].superClassName
+      : null;
+  }
+  if (!site && jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields) {
+    const fields = jvm.jre[className].staticFields;
+    const alternatives = [
+      fieldKey, `'${fieldName}:${descriptor}'`, `${fieldName}:${descriptor}'`,
+      `'${fieldName}:${descriptor}`, fieldName, `'${fieldName}'`,
+    ];
+    const key = alternatives.find((candidate) =>
+      Object.prototype.hasOwnProperty.call(fields, candidate));
+    if (key !== undefined) site = { kind: 'jre', owner: className, key };
+  }
+  if (site && instruction && typeof instruction === 'object') {
+    try {
+      Object.defineProperty(instruction, resolvedStaticFieldSite, {
+        configurable: true, writable: true, value: site,
+      });
+    } catch (_) {
+      // Frozen diagnostic fixtures retain the uncached lookup path.
+    }
+  }
+  return site;
+}
+
+function readStaticFieldSite(jvm, site) {
+  if (site.kind === 'class') {
+    const classData = jvm.classes[site.owner];
+    return classData && classData.staticFields ? classData.staticFields.get(site.key) : undefined;
+  }
+  return jvm.jre[site.owner].staticFields[site.key];
+}
+
+function getstaticSync(frame, instruction, jvm, thread) {
+  const [_, className, [fieldName, descriptor]] = instruction.arg;
+  const state = jvm.classInitializationState.get(className);
+  if (state !== 'INITIALIZED' &&
+      !(state === 'INITIALIZING' &&
+        jvm.classInitializationOwners.get(className) === thread.id)) {
+    return SYNC_STATIC_FALLBACK;
+  }
+  const site = resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor);
+  if (!site) throw new Error(`Unresolved static field: ${className}.${fieldName}`);
+  frame.stack.push(readStaticFieldSite(jvm, site));
+  return undefined;
+}
+
+const PRIMITIVE_ARRAY_DESC = {
+  boolean: '[Z', byte: '[B', char: '[C', short: '[S',
+  int: '[I', long: '[J', float: '[F', double: '[D',
+};
+
+// Shared allocators for newarray/anewarray — one home for the semantics so
+// the interpreter and the wasm allocation imports cannot drift. Negative
+// sizes throw the guest NegativeArraySizeException (catchable, like a real
+// JVM), never a host error.
+function allocPrimitiveArray(jvm, atype, count) {
+  const desc = PRIMITIVE_ARRAY_DESC[atype];
+  if (!desc) throw new Error(`Unsupported array type: ${atype}`);
+  if (count < 0) {
+    throw { type: 'java/lang/NegativeArraySizeException', message: String(count) };
+  }
+  // With the linear heap on, primitive arrays are TypedArray views over wasm
+  // memory (zeroed by construction, element coercion matches Java) instead
+  // of plain JS arrays.
+  let array;
+  if (jvm.wasmHeap) {
+    array = jvm.wasmHeap.alloc(desc, count);
+  } else {
+    array = new Array(count).fill(atype === 'long' ? BigInt(0) : 0);
+  }
+  array.type = desc;
+  array.elementType = atype;
+  array.hashCode = jvm.nextHashCode++;
+  return array;
+}
+
+function allocReferenceArray(jvm, elementType, count) {
+  if (count < 0) {
+    throw { type: 'java/lang/NegativeArraySizeException', message: String(count) };
+  }
+  const array = new Array(count).fill(null);
+  // An array elementType is already a descriptor ('[I' rows of an int[][]);
+  // a class elementType needs the L...; wrapping.
+  array.type = elementType.startsWith('[') ? `[${elementType}` : `[L${elementType};`;
+  array.elementType = elementType;
+  array.hashCode = jvm.nextHashCode++;
+  return array;
+}
+
 module.exports = {
   new: async (frame, instruction, jvm, thread) => {
     const className = instruction.arg;
@@ -9,7 +182,7 @@ module.exports = {
     }
 
     try {
-      jvm.loadClassByName(className);
+      await jvm.loadClassByName(className);
     } catch (e) {
       if (e.code === 'ENOENT') {
         throw {
@@ -40,7 +213,7 @@ module.exports = {
         }
         const superClassName = currentClassData.ast.classes[0].superClassName;
         if (superClassName) {
-            jvm.loadClassByName(superClassName);
+          await jvm.loadClassByName(superClassName);
         }
         currentClassName = superClassName;
       } else {
@@ -50,6 +223,7 @@ module.exports = {
 
     const objRef = {
       type: className,
+      _className: className,
       fields,
       hashCode: jvm.nextHashCode++,
       isLocked: false,
@@ -60,9 +234,9 @@ module.exports = {
     
     // Add JavaScript toString method that calls Java toString
     objRef.toString = function() {
+      const currentType = runtimeClassName(this);
       try {
         // Try to find toString method in the class hierarchy
-        let currentType = this.type;
         let toStringMethod = null;
         
         // First check if it's a JRE class
@@ -79,11 +253,11 @@ module.exports = {
         
         if (toStringMethod) {
           const result = toStringMethod(jvm, this, []);
-          return (result && result.value !== undefined) ? result.value : this.type.split('/').pop();
+          return (result && result.value !== undefined) ? result.value : currentType.split('/').pop();
         }
-        return this.type.split('/').pop();
+        return currentType.split('/').pop();
       } catch (e) {
-        return this.type.split('/').pop();
+        return currentType.split('/').pop();
       }
     };
     
@@ -93,7 +267,13 @@ module.exports = {
   monitorenter: (frame, instruction, jvm, thread) => {
     const objRef = frame.stack.peek();
     if (!objRef) {
-        throw new Error('NullPointerException in monitorenter');
+        const owner = jvm && typeof jvm.findClassNameForMethod === 'function'
+          ? jvm.findClassNameForMethod(frame.method)
+          : '<unknown>';
+        const descriptor = frame.method && frame.method.descriptor || '';
+        throw new Error(`NullPointerException in monitorenter at ` +
+          `${owner}.${frame.method && frame.method.name || '<unknown>'}` +
+          `${descriptor}@${Math.max(0, Number(frame.pc || 1) - 1)}`);
     }
 
     if (!objRef.isLocked) {
@@ -130,10 +310,18 @@ module.exports = {
   getfield: (frame, instruction, jvm) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const objRef = frame.stack.pop();
-    if (objRef === null) {
-      throw new Error('NullPointerException');
+    if (objRef === null || objRef === undefined) {
+      throw { type: 'java/lang/NullPointerException', message: null };
     }
-    const value = objRef.fields[`${className}.${fieldName}`];
+    const fieldKey = resolveInstanceFieldKeyAtSite(
+      jvm, objRef, instruction, className, fieldName,
+    );
+    const value = fieldKey ? objRef.fields[fieldKey] : undefined;
+    if (jvm._debugGetfield && jvm._debugGetfield === `${className}.${fieldName}` &&
+        Array.isArray(value)) {
+      const locals = (frame.locals || []).slice(0, 5).map((l) => (l !== null && typeof l === 'object' ? `<${l.type}${l.__dbgId ? '#' + l.__dbgId : ''}>` : String(l))).join(' ');
+      console.error(`[getfield] ${className}.${fieldName} in ${frame.className || '?'}.${frame.method && frame.method.name}@${frame.pc} locals=[${locals}] [len ${value.length}] ${value.slice(0, 48).join(',')}`);
+    }
     frame.stack.push(value);
   },
 
@@ -141,10 +329,31 @@ module.exports = {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
     const value = frame.stack.pop();
     const objRef = frame.stack.pop();
-    if (objRef === null) {
-      throw new Error('NullPointerException');
+    if (objRef === null || objRef === undefined) {
+      throw { type: 'java/lang/NullPointerException', message: null };
     }
-    objRef.fields[`${className}.${fieldName}`] = value;
+    const fieldKey = resolveInstanceFieldKeyAtSite(
+      jvm, objRef, instruction, className, fieldName,
+    ) || `${className}.${fieldName}`;
+    if (!objRef.fields) objRef.fields = {};
+    if (jvm._debugPutfield && jvm._debugPutfield.split(',').includes(className)) {
+      if (!objRef.__dbgId) objRef.__dbgId = (module.exports.__dbgNext = (module.exports.__dbgNext || 0) + 1);
+      let rendered;
+      if (value === null) rendered = 'null';
+      else if (Array.isArray(value)) rendered = `[len ${value.length}] ${value.slice(0, 48).map((v) => (typeof v === 'object' && v !== null ? `<${v.type}>` : String(v))).join(',')}`;
+      else if (typeof value === 'object') rendered = `<${value.type}>`;
+      else rendered = String(value);
+      let by = '';
+      if (jvm._debugPutfieldStack) {
+        const t = jvm.threads && jvm.threads[jvm.currentThreadIndex];
+        if (t && t.callStack && t.callStack.items) {
+          by = ' by ' + t.callStack.items.slice(-4).reverse()
+            .map((f) => `${f.className}.${f.method && f.method.name}${(f.method && f.method.descriptor) || ''}@${f.pc}`).join(' <- ');
+        }
+      }
+      console.error(`[putfield] ${className}#${objRef.__dbgId}.${fieldName}:${descriptor} = ${rendered}${by}`);
+    }
+    objRef.fields[fieldKey] = value;
   },
 
   getstatic: async (frame, instruction, jvm, thread) => {
@@ -156,42 +365,17 @@ module.exports = {
       return;
     }
 
-    const fieldKey = `${fieldName}:${descriptor}`;
-
-    // First, try to get the field from the class registry (regular classes)
-    const classData = jvm.classes[className];
-    if (classData && classData.staticFields && classData.staticFields.has(fieldKey)) {
-      frame.stack.push(classData.staticFields.get(fieldKey));
+    const site = resolveStaticFieldSite(jvm, instruction, className, fieldName, descriptor);
+    if (site) {
+      frame.stack.push(readStaticFieldSite(jvm, site));
       return;
     }
 
-    // If not found in class registry, try the JRE registry (for JRE classes)
-    if (jvm.jre && jvm.jre[className] && jvm.jre[className].staticFields) {
-      const jreStaticFields = jvm.jre[className].staticFields;
-      if (jreStaticFields[fieldKey]) {
-        frame.stack.push(jreStaticFields[fieldKey]);
-        return;
-      }
-
-      // Try alternative field key formats for JRE registry
-      const alternativeKeys = [
-        `'${fieldName}:${descriptor}'`,
-        `${fieldName}:${descriptor}'`,
-        `'${fieldName}:${descriptor}`,
-        fieldName,
-        `'${fieldName}'`
-      ];
-
-      for (const altKey of alternativeKeys) {
-        if (jreStaticFields[altKey]) {
-          frame.stack.push(jreStaticFields[altKey]);
-          return;
-        }
-      }
-    }
+    const fieldKey = `${fieldName}:${descriptor}`;
 
     // Debug logging for troubleshooting (only in verbose mode)
     if (jvm.verbose) {
+      const classData = jvm.classes[className];
       console.log(`Static field lookup failed for ${className}.${fieldName}`);
       console.log(`Looking for field key: "${fieldKey}"`);
       console.log(`Class registry static fields:`, classData && classData.staticFields ? Array.from(classData.staticFields.keys()) : 'none');
@@ -205,17 +389,37 @@ module.exports = {
 
   putstatic: async (frame, instruction, jvm, thread) => {
     const [_, className, [fieldName, descriptor]] = instruction.arg;
-    const value = frame.stack.pop();
 
+    // Trigger <clinit> BEFORE popping: if a <clinit> frame is pushed we rewind
+    // pc and re-run this instruction, so the operand must stay on the stack.
     const wasFramePushed = await jvm.initializeClassIfNeeded(className, thread);
     if (wasFramePushed) {
       frame.pc--; // Re-run this instruction after <clinit> is done.
       return;
     }
 
+    if (frame.stack.isEmpty()) {
+      const m = frame.method || {};
+      throw new Error(`Stack underflow at putstatic ${className}.${fieldName}:${descriptor} in ${frame.className}.${m.name}${m.descriptor} pc=${frame.pc}`);
+    }
+    const value = frame.stack.pop();
+
+    const fieldKey = `${fieldName}:${descriptor}`;
+    let currentClassName = className;
+    while (currentClassName) {
+      const currentClassData = jvm.classes[currentClassName];
+      if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldKey)) {
+        currentClassData.staticFields.set(fieldKey, value);
+        return;
+      }
+
+      currentClassName = currentClassData && currentClassData.ast && currentClassData.ast.classes[0]
+        ? currentClassData.ast.classes[0].superClassName
+        : null;
+    }
+
     const classData = jvm.classes[className];
     if (classData && classData.staticFields) {
-      const fieldKey = `${fieldName}:${descriptor}`;
       classData.staticFields.set(fieldKey, value);
       return;
     }
@@ -225,10 +429,10 @@ module.exports = {
 
   arraylength: (frame, instruction, jvm) => {
     const arrayRef = frame.stack.pop();
-    if (arrayRef === null) {
+    if (arrayRef === null || arrayRef === undefined) {
       throw {
         type: 'java/lang/NullPointerException',
-        message: 'Attempted to get length of null array'
+        message: `Attempted to get length of null array in ${frame.method.name}`
       };
     }
     const length = arrayRef.length;
@@ -236,94 +440,17 @@ module.exports = {
   },
   anewarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
-    const elementType = instruction.arg;
-    const array = new Array(count).fill(null);
-    
-    // Set array type for proper runtime behavior
-    array.type = `[L${elementType};`;
-    array.elementType = elementType;
-    array.length = count;
-    array.hashCode = jvm.nextHashCode++;
-    
-    frame.stack.push(array);
+    frame.stack.push(allocReferenceArray(jvm, instruction.arg, count));
   },
 
   instanceof: async (frame, instruction, jvm, thread) => {
     const targetClassName = instruction.arg;
-
-    // Ensure the target class is initialized before checking
-    const wasFramePushed = await jvm.initializeClassIfNeeded(targetClassName, thread);
-    if (wasFramePushed) {
-      frame.pc--; // Re-run this instruction
-      return;
-    }
-
     const objRef = frame.stack.pop();
-    if (objRef === null) {
+    if (objRef === null || objRef === undefined) {
       frame.stack.push(0);
       return;
     }
-
-    const isInstanceOf = async (className, target) => {
-      if (!className) {
-        return false;
-      }
-      if (className === target) {
-        return true;
-      }
-
-      const classData = jvm.classes[className];
-      if (!classData) {
-        // This should not happen if classes are initialized correctly
-        return false;
-      }
-
-      // Check superclass
-      const superClassName = classData.ast.classes[0].superClassName;
-      if (superClassName) {
-        const wasSuperInitialized = await jvm.initializeClassIfNeeded(superClassName, thread);
-        if (wasSuperInitialized) {
-            // If we had to initialize a superclass, we need to restart the check
-            // to ensure the whole chain is loaded before we continue.
-            // By decrementing PC, we re-run the instanceof instruction from the top.
-            frame.pc--;
-            return 'RETRY'; // Special value to indicate a retry is needed.
-        }
-        if (await isInstanceOf(superClassName, target)) {
-          return true;
-        }
-      }
-
-      // Check interfaces
-      const interfaces = classData.ast.classes[0].interfaces;
-      if (interfaces) {
-        for (const iface of interfaces) {
-          const wasInterfaceInitialized = await jvm.initializeClassIfNeeded(iface, thread);
-          if (wasInterfaceInitialized) {
-              frame.pc--;
-              return 'RETRY';
-          }
-          if (await isInstanceOf(iface, target)) {
-            return true;
-          }
-        }
-      }
-      return false;
-    };
-
-    const result = await isInstanceOf(objRef.type, targetClassName);
-
-    if (result === 'RETRY') {
-        // A class was initialized during the check.
-        // The PC has been rewound, so we just return to let the instruction re-run.
-        return;
-    }
-
-    if (result) {
-      frame.stack.push(1);
-    } else {
-      frame.stack.push(0);
-    }
+    frame.stack.push(await jvm.isInstanceOfAsync(runtimeClassName(objRef), targetClassName) ? 1 : 0);
   },
 
   multianewarray: (frame, instruction, jvm) => {
@@ -333,14 +460,47 @@ module.exports = {
       counts.unshift(frame.stack.pop());
     }
 
-    const createMultiArray = (dims) => {
-      const count = dims.shift();
-      const arr = new Array(count).fill(null);
-      if (dims.length > 0) {
+    const baseType = className.replace(/^\[+/, '');
+    const leafDefault = (() => {
+      if (baseType.startsWith('L')) return null;
+      switch (baseType) {
+        case 'Z':
+        case 'B':
+        case 'S':
+        case 'I':
+        case 'C':
+          return 0;
+        case 'J':
+          return BigInt(0);
+        case 'F':
+        case 'D':
+          return 0.0;
+        default:
+          return null;
+      }
+    })();
+
+    const createMultiArray = (dims, depth = 0) => {
+      const count = dims[0];
+      const remaining = dims.slice(1);
+      let arr;
+      if (remaining.length === 0) {
+        arr = (jvm.wasmHeap && !baseType.startsWith('L') &&
+          jvm.wasmHeap.alloc(`[${baseType}`, count)) ||
+          new Array(count).fill(leafDefault);
+      } else {
+        arr = new Array(count).fill(null);
         for (let i = 0; i < count; i++) {
-          arr[i] = createMultiArray([...dims]);
+          arr[i] = createMultiArray(remaining, depth + 1);
         }
       }
+      // Each nested Java array has its own runtime class. For example, rows of
+      // an [[I are [I instances and must pass checkcast [I. Without this tag,
+      // runtimeClassName returned undefined for rows produced by
+      // multianewarray even though newarray/anewarray were already tagged.
+      arr.type = className.slice(depth);
+      arr.elementType = arr.type.slice(1);
+      arr.hashCode = jvm.nextHashCode++;
       return arr;
     };
 
@@ -348,82 +508,37 @@ module.exports = {
     frame.stack.push(newArray);
   },
 
-  checkcast: (frame, instruction, jvm) => {
+  checkcast: async (frame, instruction, jvm) => {
     const targetClassName = instruction.arg;
-    const objRef = frame.stack.peek(); // Don't pop, just peek
+    const objRef = frame.stack.peek();
 
     if (objRef === null) {
-      return; // null can be cast to anything
+      return;
     }
 
-    let currentClassName = objRef.type;
-    while (currentClassName) {
-      if (currentClassName === targetClassName) {
-        return; // Cast is valid
-      }
-      const classData = jvm.classes[currentClassName];
-      if (!classData) {
-        // This should not happen if classes are loaded correctly
-        throw new Error('ClassCastException');
-      }
-
-      const interfaces = classData.ast.classes[0].interfaces;
-      if (interfaces && interfaces.length > 0) {
-        const interfaceQueue = [...interfaces];
-        while (interfaceQueue.length > 0) {
-          const interfaceName = interfaceQueue.shift();
-          if (interfaceName === targetClassName) {
-            return; // Cast is valid
-          }
-          const interfaceData = jvm.classes[interfaceName];
-          if (interfaceData && interfaceData.ast.classes[0].interfaces) {
-            interfaceQueue.push(...interfaceData.ast.classes[0].interfaces);
-          }
-        }
-      }
-
-      currentClassName = classData.ast.classes[0].superClassName;
+    if (await jvm.isInstanceOfAsync(runtimeClassName(objRef), targetClassName)) {
+      return;
     }
 
-    // If we get here, the cast is invalid
-    throw { type: 'java/lang/ClassCastException', message: `${objRef.type} cannot be cast to ${targetClassName}` };
+    throw {
+      type: 'java/lang/ClassCastException',
+      message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}` +
+        ` at ${jvm.findClassNameForMethod(frame.method)}.` +
+        `${frame.method && frame.method.name || '<unknown>'}` +
+        `${frame.method && frame.method.descriptor || ''}` +
+        `@${Math.max(0, Number(frame.pc || 1) - 1)}`,
+    };
   },
 
   newarray: (frame, instruction, jvm) => {
     const count = frame.stack.pop();
-    const atype = instruction.arg;
-    
-    if (count < 0) {
-      throw new Error('NegativeArraySizeException');
-    }
-    
-    // Create array based on type name
-    let array;
-    switch (atype) {
-      case 'boolean':
-      case 'byte':
-      case 'short':
-      case 'int':
-        array = new Array(count).fill(0);
-        break;
-      case 'long':
-        array = new Array(count).fill(BigInt(0));
-        break;
-      case 'float':
-      case 'double':
-        array = new Array(count).fill(0.0);
-        break;
-      case 'char':
-        array = new Array(count).fill(0); // char as int
-        break;
-      default:
-        throw new Error(`Unsupported array type: ${atype}`);
-    }
-    
-    // Set array type for proper runtime behavior
-    array.type = 'array';
-    array.elementType = atype;
-    
-    frame.stack.push(array);
+    frame.stack.push(allocPrimitiveArray(jvm, instruction.arg, count));
   },
 };
+
+module.exports.resolveInstanceFieldKey = resolveInstanceFieldKey;
+module.exports.runtimeClassName = runtimeClassName;
+module.exports.allocPrimitiveArray = allocPrimitiveArray;
+module.exports.allocReferenceArray = allocReferenceArray;
+module.exports.getstaticSync = getstaticSync;
+module.exports.SYNC_STATIC_FALLBACK = SYNC_STATIC_FALLBACK;

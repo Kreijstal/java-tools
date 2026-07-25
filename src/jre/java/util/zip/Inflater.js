@@ -1,4 +1,5 @@
 const zlib = require('zlib');
+const { withThrows } = require('../../../helpers');
 
 module.exports = {
   super: "java/lang/Object",
@@ -12,7 +13,7 @@ module.exports = {
       obj['java/util/zip/Inflater/nowrap'] = nowrap;
       obj['java/util/zip/Inflater/buffer'] = null;
     },
-    'setInput([BII)V': (jvm, obj, args) => {
+    'setInput([BII)V': withThrows((jvm, obj, args) => {
       const b = args[0];
       const off = args[1];
       const len = args[2];
@@ -20,23 +21,23 @@ module.exports = {
       let byteArray;
       if (b && b.array) {
         byteArray = b.array;
-      } else if (Array.isArray(b)) {
+      } else if (Array.isArray(b) || ArrayBuffer.isView(b)) {
         byteArray = b;
       } else {
-        throw new Error('Invalid byte array format');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format' };
       }
 
       obj['java/util/zip/Inflater/buffer'] = Buffer.from(byteArray.slice(off, off + len));
-    },
-    'inflate([B)I': (jvm, obj, args) => {
+    }, ['java/lang/IllegalArgumentException']),
+    'inflate([B)I': withThrows((jvm, obj, args) => {
       const dest = args[0];
       let destArray;
       if (dest && dest.array) {
         destArray = dest.array;
-      } else if (Array.isArray(dest)) {
+      } else if (Array.isArray(dest) || ArrayBuffer.isView(dest)) {
         destArray = dest;
       } else {
-        throw new Error('Invalid byte array format for inflate');
+        throw { type: 'java/lang/IllegalArgumentException', message: 'Invalid byte array format for inflate' };
       }
 
       const buffer = obj['java/util/zip/Inflater/buffer'];
@@ -54,19 +55,22 @@ module.exports = {
             decompressed = zlib.inflateSync(buffer);
         }
       } catch (e) {
+        if (process.env.JVM_DEBUG_ZIP) console.error(`[inflate] FAIL nowrap=${nowrap} in=${buffer.length}B: ${e.message} head=${buffer.subarray(0,8).toString('hex')}`);
         throw { type: 'java/util/zip/DataFormatException', message: e.message };
       }
+      if (process.env.JVM_DEBUG_ZIP) console.error(`[inflate] ok nowrap=${nowrap} in=${buffer.length}B out=${decompressed.length}B dest=${destArray.length}B`);
 
       if (decompressed) {
         const length = Math.min(decompressed.length, destArray.length);
         for (let i = 0; i < length; i++) {
-          destArray[i] = decompressed[i];
+          // Java byte arrays hold signed bytes.
+          destArray[i] = (decompressed[i] << 24) >> 24;
         }
         return length;
       } else {
         return 0;
       }
-    },
+    }, ['java/lang/IllegalArgumentException', 'java/util/zip/DataFormatException']),
     'reset()V': (jvm, obj, args) => {
       obj['java/util/zip/Inflater/buffer'] = null;
     },
