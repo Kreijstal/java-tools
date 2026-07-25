@@ -3356,6 +3356,12 @@ class JVM {
         const owner = normalizeClassName(value.className || value.descriptor);
         return `${owner.replace(/\//g, ".")}.${value.constName}`;
       }
+      if (value && value.type === "annotation") {
+        return `@${value.annotationValue.type.replace(/\//g, ".")}`;
+      }
+      if (Array.isArray(value)) {
+        return `{${value.map(formatValue).join(", ")}}`;
+      }
       if (typeof value === "string") return `\"${value}\"`;
       return String(value);
     };
@@ -3412,6 +3418,13 @@ class JVM {
           `${rawValue.constName} with fieldKey ${fieldKey}`);
       }
 
+      if (rawValue && rawValue.type === "annotation") {
+        if (!rawValue.annotationValue) {
+          throw new Error("Nested annotation element has no annotation value");
+        }
+        return jvm.createAnnotationProxy(rawValue.annotationValue);
+      }
+
       if (typeof rawValue === "string") {
         return jvm.internString(rawValue);
       }
@@ -3442,42 +3455,49 @@ class JVM {
     };
 
     if (annotation.elements) {
+      const annotationClass = jvm.classes[annotation.type];
+      const annotationMethods = annotationClass && annotationClass.ast &&
+        annotationClass.ast.classes && annotationClass.ast.classes[0] &&
+        annotationClass.ast.classes[0].items || [];
       Object.keys(annotation.elements).forEach((elementName) => {
         const elementValue = annotation.elements[elementName];
         let methodSignature;
-        let methodImplementation;
+        const declaredMethod = annotationMethods.find(item =>
+          item.type === "method" && item.method &&
+          item.method.name === elementName &&
+          item.method.descriptor.startsWith("()"));
 
-        if (elementValue && elementValue.type === "class") {
+        if (declaredMethod) {
+          methodSignature = `${elementName}${declaredMethod.method.descriptor}`;
+        } else if (elementValue && elementValue.type === "class") {
           methodSignature = `${elementName}()Ljava/lang/Class;`;
-          methodImplementation = (thread) =>
-            resolveElement(elementValue, thread);
         } else if (elementValue && elementValue.type === "enum") {
           const descriptor = elementValue.descriptor ||
             `L${elementValue.className};`;
           methodSignature = `${elementName}()${descriptor}`;
-          methodImplementation = (thread) =>
-            resolveElement(elementValue, thread);
+        } else if (elementValue && elementValue.type === "annotation") {
+          methodSignature =
+            `${elementName}()L${elementValue.annotationValue.type};`;
         } else if (typeof elementValue === "string") {
           methodSignature = `${elementName}()Ljava/lang/String;`;
-          methodImplementation = () => jvm.internString(String(elementValue));
         } else if (typeof elementValue === "number") {
           methodSignature = `${elementName}()I`;
-          methodImplementation = () => elementValue;
         } else if (typeof elementValue === "boolean") {
           methodSignature = `${elementName}()Z`;
-          methodImplementation = () => (elementValue ? 1 : 0);
         } else if (Array.isArray(elementValue)) {
           methodSignature = `${elementName}()[Ljava/lang/Object;`;
-          methodImplementation = (thread) =>
-            resolveElement(elementValue, thread);
         } else {
-          // Nested annotations and other complex values are resolved lazily.
           methodSignature = `${elementName}()Ljava/lang/Object;`;
-          methodImplementation = (thread) =>
-            resolveElement(elementValue, thread);
         }
 
-        proxy[methodSignature] = methodImplementation;
+        proxy[methodSignature] = async (thread) => {
+          const resolved = await resolveElement(elementValue, thread);
+          const returnDescriptor = methodSignature.slice(elementName.length + 2);
+          if (Array.isArray(resolved) && returnDescriptor.startsWith("[")) {
+            resolved.type = returnDescriptor;
+          }
+          return resolved;
+        };
       });
     }
 

@@ -139,6 +139,18 @@ function parseAnnotationsFromAst(ast) {
       };
     }
 
+    if (tagChar === '@') {
+      return {
+        type: 'annotation',
+        annotationValue: parseAnnotation(value.annotation_value || value),
+      };
+    }
+
+    if (tagChar === '[') {
+      return (value.values || []).map(element =>
+        parseAnnotationElementValue(element.tag, element.value));
+    }
+
     if (value && value.const_value_index !== undefined) {
       return resolveAnnotationValue(tag, value.const_value_index);
     }
@@ -164,37 +176,21 @@ function parseAnnotationsFromAst(ast) {
     
     return resolveString(index);
   }
-  
-  // Parse class-level annotations from the new AST structure
-  if (ast.ast.attributes) {
-    ast.ast.attributes.forEach(attr => {
-      /* HARDENED: Replaced defensive optional chaining with direct access */
-      const attrName = attr.attribute_name_index.name.info.bytes;
-      if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-        result.classAnnotations = attr.info.annotations.map(annotation => {
-          const typeName = resolveAnnotationType(annotation.type_index);
-          const elements = {};
 
-          if (annotation.element_value_pairs) {
-            annotation.element_value_pairs.forEach(pair => {
-              const elementName = resolveString(pair.element_name_index);
-
-              const elementValue = parseAnnotationElementValue(
-                pair.value.tag, pair.value.value);
-
-              if (elementName && elementValue !== undefined) {
-                elements[elementName] = elementValue;
-              }
-            });
-          }
-
-          return {
-            type: typeName,
-            elements: elements
-          };
-        });
+  function parseAnnotation(annotation) {
+    const elements = {};
+    for (const pair of annotation.element_value_pairs || []) {
+      const elementName = resolveString(pair.element_name_index);
+      const elementValue = parseAnnotationElementValue(
+        pair.value.tag, pair.value.value);
+      if (elementName && elementValue !== undefined && elementValue !== null) {
+        elements[elementName] = elementValue;
       }
-    });
+    }
+    return {
+      type: resolveAnnotationType(annotation.type_index),
+      elements,
+    };
   }
 
   // Parse class-level annotations from the new AST structure
@@ -203,28 +199,7 @@ function parseAnnotationsFromAst(ast) {
       /* HARDENED: Replaced defensive optional chaining with direct access */
       const attrName = attr.attribute_name_index.name.info.bytes;
       if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-        result.classAnnotations = attr.info.annotations.map(annotation => {
-          const typeName = resolveAnnotationType(annotation.type_index);
-          const elements = {};
-
-          if (annotation.element_value_pairs) {
-            annotation.element_value_pairs.forEach(pair => {
-              const elementName = resolveString(pair.element_name_index);
-
-              const elementValue = parseAnnotationElementValue(
-                pair.value.tag, pair.value.value);
-
-              if (elementName && elementValue !== undefined) {
-                elements[elementName] = elementValue;
-              }
-            });
-          }
-
-          return {
-            type: typeName,
-            elements: elements
-          };
-        });
+        result.classAnnotations = attr.info.annotations.map(parseAnnotation);
       }
     });
   }
@@ -239,28 +214,8 @@ function parseAnnotationsFromAst(ast) {
           /* HARDENED: Replaced defensive optional chaining with direct access */
           const attrName = attr.attribute_name_index.name.info.bytes;
           if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-            result.fieldAnnotations[fieldName] = attr.info.annotations.map(annotation => {
-              const typeName = resolveAnnotationType(annotation.type_index);
-              const elements = {};
-              
-              if (annotation.element_value_pairs) {
-                annotation.element_value_pairs.forEach(pair => {
-                  const elementName = resolveString(pair.element_name_index);
-                  
-                  const elementValue = parseAnnotationElementValue(
-                    pair.value.tag, pair.value.value);
-                  
-                  if (elementName && elementValue !== undefined) {
-                    elements[elementName] = elementValue;
-                  }
-                });
-              }
-              
-              return {
-                type: typeName,
-                elements: elements
-              };
-            });
+            result.fieldAnnotations[fieldName] =
+              attr.info.annotations.map(parseAnnotation);
           }
         });
       }
@@ -277,28 +232,8 @@ function parseAnnotationsFromAst(ast) {
           /* HARDENED: Replaced defensive optional chaining with direct access */
           const attrName = attr.attribute_name_index.name.info.bytes;
           if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-            result.methodAnnotations[methodName] = attr.info.annotations.map(annotation => {
-              const typeName = resolveAnnotationType(annotation.type_index);
-              const elements = {};
-              
-              if (annotation.element_value_pairs) {
-                annotation.element_value_pairs.forEach(pair => {
-                  const elementName = resolveString(pair.element_name_index);
-                  
-                  const elementValue = parseAnnotationElementValue(
-                    pair.value.tag, pair.value.value);
-                  
-                  if (elementName && elementValue !== undefined) {
-                    elements[elementName] = elementValue;
-                  }
-                });
-              }
-              
-              return {
-                type: typeName,
-                elements: elements
-              };
-            });
+            result.methodAnnotations[methodName] =
+              attr.info.annotations.map(parseAnnotation);
           }
         });
       }
