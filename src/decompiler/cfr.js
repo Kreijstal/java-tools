@@ -3611,8 +3611,15 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       && predecessors.length >= 2
       && predecessors.some((predecessor) => predecessor >= block.id);
   });
-  if (!useStateMachine && hasMultiValueStackBackedge) {
-    if (syncHandlers.size) return null;
+  // The multi-value backedge state machine cannot represent synchronized
+  // regions (it renders the lowered monitor plumbing as plain code). When a
+  // synchronized method also has this shape, do NOT bail to the fallbacks:
+  // the ordinary owned-structurer rendering (reached with useStateMachine
+  // false) already materializes the backedge operands through stackIn/stackOut
+  // carriers, which is exactly how these methods structured before the state
+  // machine existed. Bailing here instead discards correct structured output
+  // and hard-fails otherwise-valid synchronized methods (e.g. oe.h, ena.a).
+  if (!useStateMachine && hasMultiValueStackBackedge && !syncHandlers.size) {
     useStateMachine = true;
     stateMachineReason = 'multi-value operand stack carried across a CFG backedge';
   }
