@@ -830,16 +830,19 @@ function convertJson(inputJson, constantPool) {
       decodeAnnotationElement(pair.value),
     ])),
   });
-  outputJson.classes[0].annotations = [];
+  const classAnnotations = [];
   for (const attribute of inputJson.attributes || []) {
     const name = attributeName(attribute);
     if (name !== "RuntimeVisibleAnnotations" && name !== "RuntimeInvisibleAnnotations") continue;
     for (const annotation of (attribute.info && attribute.info.annotations) || []) {
-      outputJson.classes[0].annotations.push({
+      classAnnotations.push({
         ...decodeAnnotation(annotation),
         visible: name === "RuntimeVisibleAnnotations",
       });
     }
+  }
+  if (classAnnotations.length > 0) {
+    outputJson.classes[0].annotations = classAnnotations;
   }
 
   const bootstrapMethodsAttr = inputJson.attributes.find(
