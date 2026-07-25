@@ -4,6 +4,7 @@ import java.lang.annotation.RetentionPolicy;
 @Retention(RetentionPolicy.RUNTIME)
 @interface WithClassAndEnum {
     Class<?> type();
+    Class<?> primitive();
     Level level();
 }
 
@@ -12,7 +13,7 @@ enum Level {
     HIGH
 }
 
-@WithClassAndEnum(type = String.class, level = Level.HIGH)
+@WithClassAndEnum(type = String.class, primitive = int.class, level = Level.HIGH)
 public class AnnotationClassLiteralTest {
     public static void main(String[] args) {
         WithClassAndEnum annotation = AnnotationClassLiteralTest.class.getAnnotation(WithClassAndEnum.class);
@@ -23,6 +24,7 @@ public class AnnotationClassLiteralTest {
 
         System.out.println("=== Annotation Class Literal Test ===");
         System.out.println("Type: " + annotation.type().getName());
+        System.out.println("Primitive: " + annotation.primitive().getName());
         System.out.println("Level: " + annotation.level());
     }
 }

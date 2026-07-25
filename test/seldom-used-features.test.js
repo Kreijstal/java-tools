@@ -39,6 +39,7 @@ Is static: false`,
     shouldFail: false,
     expectedOutput: `=== Annotation Class Literal Test ===
 Type: java.lang.String
+Primitive: int
 Level: HIGH`,
   },
   {
