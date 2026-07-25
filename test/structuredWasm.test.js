@@ -8,6 +8,16 @@ const { execFileSync } = require('child_process');
 const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const { supportsWasmTryTable } = require('../src/jit/wasmShared');
+
+const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
+
+function assertEhTierOrFallback(t, state) {
+  if (WASM_TRY_TABLE_SUPPORTED) return true;
+  t.notOk(state && state.meta,
+    'engine without try_table support preserves semantics through fallback');
+  return false;
+}
 
 function compileJavaFixture(t, className, source) {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'structured-fixture-'));
@@ -281,10 +291,14 @@ public class StructuredCatch {
   out.type = '[I';
   await invoke(jvm, thread, 'StructuredCatch', 'drive', '([II)I', [out, n]);
   t.equal(out[0], (sum + 7) | 0, 'loop + interpreted catch path matches reference');
-  t.ok(structuredKeys(jvm).includes('StructuredCatch.drive([II)I'),
-    'compiled by the structured backend despite the exception table');
   const method = await jvm.findMethodInHierarchy('StructuredCatch', 'drive', '([II)I');
   const st = jvm.jit.wasmJit.state.get(method);
+  if (!assertEhTierOrFallback(t, st)) {
+    t.end();
+    return;
+  }
+  t.ok(structuredKeys(jvm).includes('StructuredCatch.drive([II)I'),
+    'compiled by the structured backend despite the exception table');
   t.notOk([...st.meta.demoteReasons.values()].includes('live handler range'),
     `try range compiles under EH (${[...st.meta.demoteReasons.values()].join(', ') || 'none'})`);
   t.ok(st.meta.usedEh, 'EH catch sites were emitted for the try range');
@@ -525,10 +539,14 @@ public class StructuredEh {
   out.type = '[I';
   await invoke(jvm, thread, 'StructuredEh', 'drive', '([II)I', [out, n]);
   t.equal(out[0], sum, 'recovering try/catch loop matches JS reference');
-  t.ok(structuredKeys(jvm).includes('StructuredEh.drive([II)I'),
-    'compiled by the structured backend');
   const method = await jvm.findMethodInHierarchy('StructuredEh', 'drive', '([II)I');
   const st = jvm.jit.wasmJit.state.get(method);
+  if (!assertEhTierOrFallback(t, st)) {
+    t.end();
+    return;
+  }
+  t.ok(structuredKeys(jvm).includes('StructuredEh.drive([II)I'),
+    'compiled by the structured backend');
   const reasons = [...st.meta.demoteReasons.values()];
   t.notOk(reasons.includes('live handler range'),
     `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
@@ -572,6 +590,10 @@ public class StructuredEhLocals {
     'handler observed the local updated in the same block before the throw');
   const method = await jvm.findMethodInHierarchy('StructuredEhLocals', 'drive', '([II)I');
   const st = jvm.jit.wasmJit.state.get(method);
+  if (!assertEhTierOrFallback(t, st)) {
+    t.end();
+    return;
+  }
   t.ok(st.meta.usedEh, 'EH catch sites were emitted');
   t.end();
 });
@@ -615,6 +637,10 @@ public class StructuredEhThrow {
   const method = await jvm.findMethodInHierarchy(
     'StructuredEhThrow', 'drive', '([IILjava/lang/RuntimeException;)I');
   const st = jvm.jit.wasmJit.state.get(method);
+  if (!assertEhTierOrFallback(t, st)) {
+    t.end();
+    return;
+  }
   const reasons = [...st.meta.demoteReasons.values()];
   t.notOk(reasons.includes('live handler range'),
     `no live-handler-range demotions (${reasons.join(', ') || 'none'})`);
@@ -753,6 +779,10 @@ public class StructuredVCallEh {
   t.equal(mismatches, 0, 'every call matches the JS reference');
   const method = await jvm.findMethodInHierarchy('StructuredVCallEh', 'drive', '([II)I');
   const st = jvm.jit.wasmJit.state.get(method);
+  if (!assertEhTierOrFallback(t, st)) {
+    t.end();
+    return;
+  }
   t.ok(st.meta.usedEh, 'caller compiled with EH catch sites');
   const reasons = [...st.meta.demoteReasons.values()];
   t.notOk(reasons.some((r) => r.includes('invoke')),
@@ -797,6 +827,10 @@ public class DispatchEh {
   t.equal(out[0], sum, 'recovering try/catch loop matches JS reference');
   const method = await jvm.findMethodInHierarchy('DispatchEh', 'drive', '([II)I');
   const st = jvm.jit.wasmJit.state.get(method);
+  if (!assertEhTierOrFallback(t, st)) {
+    t.end();
+    return;
+  }
   t.ok(st && st.meta && !st.meta.structured, 'compiled by the dispatcher tier');
   const reasons = [...st.meta.demoteReasons.values()];
   t.notOk(reasons.includes('live handler range'),
@@ -846,6 +880,10 @@ public class NestedEhCallee {
   t.equal(mismatches, 0, 'every call matches the JS reference');
   const risky = await jvm.findMethodInHierarchy('NestedEhCallee', 'risky', '(I)I');
   const riskySt = jvm.jit.wasmJit.state.get(risky);
+  if (!assertEhTierOrFallback(t, riskySt)) {
+    t.end();
+    return;
+  }
   t.ok(riskySt && riskySt.meta && riskySt.meta.usedEh, 'callee is an EH module');
   t.ok(riskySt && riskySt.nestedCalls > 0, 'EH callee ran nested');
   t.end();
