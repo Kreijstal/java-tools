@@ -39,11 +39,24 @@ function splitCode(code, options = {}) {
     collectCastedCursorRanges(code, cfg, analysis, dominators),
     collectCastedRangesAfterPriorReferenceReuse(code, cfg, analysis, dominators),
   );
+  // Only three of the collectors above consult `dominators`; the rest can offer a
+  // candidate whose stores do not dominate every load they feed. Re-check the
+  // merged set so requireDominance holds no matter which collector proposed it.
+  if (dominators) {
+    candidates = candidates.filter((candidate) => storesDominateLoads(code, cfg, dominators, candidate));
+  }
   if (candidates.length > 8) {
     candidates = candidates.filter((candidate) =>
       candidate.explicitCast && !candidate.primitiveLocalWrite && !candidate.desc.startsWith('[L'));
   }
   if (candidates.length > 8) return 0;
+
+  // A store instruction can only define one local, but two candidates may claim
+  // the same one. The rewrite loop below would then point it at the second
+  // candidate's fresh local, leaving the first candidate's loads with no
+  // definition at all. Keep the first claimer in rewrite order and drop any
+  // candidate overlapping it, so its loads stay on the original local.
+  candidates = withoutSharedStores(candidates);
 
   for (const candidate of candidates) {
     candidate.fresh = allocateLocal(code);
@@ -681,6 +694,41 @@ function branchTargets(item) {
   return typeof insn.arg === 'string' ? [insn.arg] : [];
 }
 
+/** Drops candidates that claim a store instruction another candidate already
+ *  claimed. Ordered by descending storeIndex to match the rewrite loop, so the
+ *  candidate that would have won the clobber is the one kept. */
+function withoutSharedStores(candidates) {
+  if (candidates.length < 2) return candidates;
+  const claimed = new Set();
+  const accepted = new Set();
+  for (const candidate of [...candidates].sort((a, b) => b.storeIndex - a.storeIndex)) {
+    const storeItems = candidate.storeItems || [candidate.storeItem];
+    if (storeItems.some((storeItem) => claimed.has(storeItem))) continue;
+    for (const storeItem of storeItems) claimed.add(storeItem);
+    accepted.add(candidate);
+  }
+  return candidates.filter((candidate) => accepted.has(candidate));
+}
+
+/** True when each rewritten load is dominated by one of the stores that will
+ *  define the fresh local. Every storeItem becomes `storeRef(candidate.fresh)`,
+ *  so a load reachable on a path that passes none of them would read the fresh
+ *  local before it is ever written. */
+function storesDominateLoads(code, cfg, dominators, candidate) {
+  const items = code.codeItems;
+  const storeIndices = [];
+  for (const storeItem of candidate.storeItems || [candidate.storeItem]) {
+    const index = items.indexOf(storeItem);
+    if (index >= 0) storeIndices.push(index);
+  }
+  if (!storeIndices.length) return false;
+  return (candidate.loadItems || []).every((item) => {
+    const loadIndex = items.indexOf(item);
+    if (loadIndex < 0) return false;
+    return storeIndices.some((storeIndex) => instructionDominates(cfg, dominators, storeIndex, loadIndex));
+  });
+}
+
 function mergeCandidates(...groups) {
   const byKey = new Map();
   for (const group of groups) {
@@ -1177,4 +1225,6 @@ module.exports = {
   runSplitConcreteObjectReachingLocal,
   splitCode,
   collectLinearExplicitCastRanges,
+  withoutSharedStores,
+  storesDominateLoads,
 };
