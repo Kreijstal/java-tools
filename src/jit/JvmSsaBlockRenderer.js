@@ -1233,6 +1233,27 @@ class JvmSsaBlockRenderer {
                 "  helpers.skipJitOnce(frame);",
                 "  return { deopt: true, transient: true, reason: 'class initialization in direct structured alpha span' };", "}");
             }
+          } else if (site.directIntrinsic?.kind === "clippedStaticGradient" &&
+              site.directIntrinsic.paramCount === 6 && site.directIntrinsic.returnsVoid &&
+              site.directIntrinsic.staticFieldSites?.length === 6) {
+            const callStack = [...stack];
+            const args = new Array(6);
+            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
+              args[argument] = pop();
+              if (args[argument] === null) valid = false;
+            }
+            if (valid) {
+              const result = value(), caught = value();
+              const fields = site.directIntrinsic.staticFieldSites.join(", ");
+              lines.push(`let ${result};`,
+                `try { ${result} = helpers.clippedStaticGradientDirectAt(${args.join(", ")}, ${fields}); } catch (${caught}) {`,
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                `  throw ${caught};`, "}",
+                `if (${result} === helpers.staticDeopt()) {`,
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                "  helpers.skipJitOnce(frame);",
+                "  return { deopt: true, transient: true, reason: 'class initialization in direct structured gradient' };", "}");
+            }
           } else if ((site.directIntrinsic?.kind === "polygonFlatRaster" ||
               site.directIntrinsic?.kind === "polygonAlphaRaster" ||
               site.directIntrinsic?.kind === "tiledIntArrayBlit" ||
@@ -1267,6 +1288,54 @@ class JvmSsaBlockRenderer {
             if (valid) {
               const caught = value();
               lines.push(`try { helpers.maskedColorBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                `  throw ${caught};`, "}");
+            }
+          } else if (site.directIntrinsic?.kind === "alphaMaskedColorBlit" &&
+              site.directIntrinsic.paramCount === 10 &&
+              site.directIntrinsic.returnsVoid) {
+            const callStack = [...stack];
+            const args = new Array(10);
+            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
+              args[argument] = pop();
+              if (args[argument] === null) valid = false;
+            }
+            if (valid) {
+              const caught = value();
+              if (site.directIntrinsic.initializationOwner) {
+                lines.push(`if (helpers.jvm.classInitializationState.get(${
+                  JSON.stringify(site.directIntrinsic.initializationOwner)
+                }) !== "INITIALIZED") {`,
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                "  helpers.skipJitOnce(frame);",
+                "  return { deopt: true, transient: true, reason: 'class initialization in direct alpha-masked blit' };",
+                "}");
+              }
+              lines.push(`try { helpers.alphaMaskedColorBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                `  throw ${caught};`, "}");
+            }
+          } else if (site.directIntrinsic?.kind === "transparentIntBlit" &&
+              site.directIntrinsic.paramCount === 9 &&
+              site.directIntrinsic.returnsVoid) {
+            const callStack = [...stack];
+            const args = new Array(9);
+            for (let argument = args.length - 1; argument >= 0; argument -= 1) {
+              args[argument] = pop();
+              if (args[argument] === null) valid = false;
+            }
+            if (valid) {
+              const caught = value();
+              if (site.directIntrinsic.initializationOwner) {
+                lines.push(`if (helpers.jvm.classInitializationState.get(${
+                  JSON.stringify(site.directIntrinsic.initializationOwner)
+                }) !== "INITIALIZED") {`,
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                "  helpers.skipJitOnce(frame);",
+                "  return { deopt: true, transient: true, reason: 'class initialization in direct transparent int blit' };",
+                "}");
+              }
+              lines.push(`try { helpers.transparentIntBlitDirect(${args.join(", ")}); } catch (${caught}) {`,
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 `  throw ${caught};`, "}");
             }
@@ -1612,6 +1681,13 @@ class JvmSsaBlockRenderer {
         op === "newarray" || op === "anewarray" ||
         op === "multianewarray");
     });
+    // Coarsening is safe for throughput only when the complete method is a
+    // bounded numeric kernel. In an effectful method, one "counted" inner loop
+    // can still contain a very large data-dependent unit of work (asset
+    // decoding is a common example). Let those inner loops retain their own
+    // scheduler polls so an outer backedge is not the first observable point
+    // after hundreds of milliseconds.
+    if (hasAtomicUnsafeOperation) coarseCountedLoops.clear();
     // A fully verified, call-free counted kernel has a finite upper bound and
     // no scheduler-visible operation inside it. Run it as one ordinary
     // JavaScript function so SpiderMonkey can optimize the numeric loops;
@@ -1631,11 +1707,33 @@ class JvmSsaBlockRenderer {
       }
     }
     const maximumCoarseTripCount = Math.max(1, ...coarseCountedLoops.values());
+    const invokeCount = items.reduce((count, item) => {
+      const op = opOf(item?.instruction);
+      return count + (op?.startsWith("invoke") ? 1 : 0);
+    }, 0);
+    const allocationCount = items.reduce((count, item) => {
+      const op = opOf(item?.instruction);
+      return count + (op === "new" || op === "newarray" ||
+        op === "anewarray" || op === "multianewarray" ? 1 : 0);
+    }, 0);
+    // Polling every 10k backedges works for tiny arithmetic loops, but a
+    // single iteration of a large call/allocation-heavy guest body can do
+    // orders of magnitude more work. Scale the poll interval by verified
+    // bytecode work rather than guest identity. This only reads Date.now() at
+    // the resulting boundary; an actual spill/yield still occurs solely when
+    // the ordinary scheduler deadline, debugger, timer, or thread state says
+    // it is observable. Fully bounded call-free numeric kernels retain their
+    // atomic path above.
+    const loopWorkEstimate = Math.max(1,
+      items.length + invokeCount * 32 + allocationCount * 16);
+    const structuralPollBudget = hasAtomicUnsafeOperation
+      ? Math.max(64, Math.min(10000, Math.floor(16384 / loopWorkEstimate)))
+      : 10000;
     // Charge the outer safe point once per completed bounded inner loop. This
     // retains approximately the original 10k-iteration scheduler quantum
     // without executing a second branch in every inner-loop iteration.
     const safePointInitialBudget = Math.max(
-      1, Math.floor(10000 / maximumCoarseTripCount));
+      1, Math.floor(structuralPollBudget / maximumCoarseTripCount));
     const indent = (lines) => lines.map((line) => `  ${line}`);
     const render = (
       node, continuationMode = useContinuations, directPositional = false,
@@ -2141,80 +2239,98 @@ class JvmSsaBlockRenderer {
       }
       let adaptivePositionalBody = null;
       let adaptivePositionalSource = null;
+      let ordinaryAdaptive = false;
       if (useContinuations && this.jit.adaptiveFramelessPositionalEnabled) {
         const adaptiveSafePointBudget = Math.min(
           1_000_000,
           safePointInitialBudget * this.jit.adaptiveFramelessBudgetMultiplier,
         );
-        adaptivePositionalSource =
-          buildBody(
-            render(structured.tree, true, false, adaptiveSafePointBudget),
-            adaptiveSafePointBudget,
-          ).join("\n");
+        ordinaryAdaptive =
+          this.jit.ordinaryAdaptiveFramelessPositionalEnabled;
+        const adaptiveBody = buildBody(
+          render(structured.tree, !ordinaryAdaptive, false,
+            adaptiveSafePointBudget),
+          adaptiveSafePointBudget,
+        );
+        if (ordinaryAdaptive) {
+          adaptiveBody.splice(1, 0,
+            "helpers.ordinaryAdaptiveFramelessRunCount += 1;");
+        }
+        adaptivePositionalSource = adaptiveBody.join("\n");
         const adaptiveGeneratedBody = this.jit.createGeneratedFunction(
           method,
           "structured-ssa-adaptive-positional",
           ["frame", "thread", "helpers", "initialBytecodeChecks", "framelessEntry"],
           adaptivePositionalSource,
-          null,
-          false,
-          true,
+          null, false, !ordinaryAdaptive,
         );
-        // The enlarged frameless quantum can still meet a wall-clock safe
-        // point in a genuinely large guest loop. Keep its lexical iterator on
-        // the lazily restored child Frame so the canonical structured entry
-        // resumes the same scalar state on the next scheduler turn. An
-        // ordinary-function adaptive body used to materialize the bytecode PC
-        // without retaining its iterator, forcing the rest of that invocation
-        // through the baseline operand-stack dispatcher.
-        adaptivePositionalBody = function (
-          frame, thread, helpers, initialBytecodeChecks, framelessEntry,
-        ) {
-          let continuation = frame[STRUCTURED_CONTINUATION];
-          if (continuation) {
-            const bytecodeChecks = initialBytecodeChecks === undefined
-              ? helpers.needsBytecodeChecks() : initialBytecodeChecks;
-            const guardedStaticChanged =
-              !guardedStaticBooleanStateMatches();
-            if (continuation.pc !== frame.pc || bytecodeChecks ||
-                guardedStaticChanged) {
-              delete frame[STRUCTURED_CONTINUATION];
-              try { continuation.iterator.return(); } catch (_) {}
-              if (guardedStaticChanged) {
-                helpers.structuredSsa.guardedBooleanFallbackCount += 1;
+        if (ordinaryAdaptive) {
+          // Most hot browser loops finish inside the enlarged quantum. An
+          // ordinary function lets SpiderMonkey optimize their numeric body;
+          // the emitted non-generator safe point still materializes the exact
+          // PC/locals/stack and deoptimizes if a run exceeds that quantum.
+          adaptivePositionalBody = adaptiveGeneratedBody;
+        } else {
+          // The enlarged frameless quantum can still meet a wall-clock safe
+          // point in a genuinely large guest loop. Keep its lexical iterator
+          // on the lazily restored child Frame so the canonical structured
+          // entry resumes the same scalar state on the next scheduler turn.
+          adaptivePositionalBody = function (
+            frame, thread, helpers, initialBytecodeChecks, framelessEntry,
+          ) {
+            let continuation = frame[STRUCTURED_CONTINUATION];
+            if (continuation) {
+              const bytecodeChecks = initialBytecodeChecks === undefined
+                ? helpers.needsBytecodeChecks() : initialBytecodeChecks;
+              const guardedStaticChanged =
+                !guardedStaticBooleanStateMatches();
+              if (continuation.pc !== frame.pc || bytecodeChecks ||
+                  guardedStaticChanged) {
+                delete frame[STRUCTURED_CONTINUATION];
+                try { continuation.iterator.return(); } catch (_) {}
+                if (guardedStaticChanged) {
+                  helpers.structuredSsa.guardedBooleanFallbackCount += 1;
+                }
+                helpers.skipJitOnce(frame);
+                return {
+                  deopt: true, transient: true,
+                  reason: "invalidated structured SSA continuation",
+                };
               }
-              helpers.skipJitOnce(frame);
-              return {
-                deopt: true, transient: true,
-                reason: "invalidated structured SSA continuation",
-              };
             }
-          }
-          const iterator = continuation?.iterator ||
-            adaptiveGeneratedBody(
-              frame, thread, helpers, initialBytecodeChecks, framelessEntry);
-          let step;
-          try {
-            step = iterator.next();
-          } catch (error) {
-            delete frame[STRUCTURED_CONTINUATION];
-            throw error;
-          }
-          if (step.done) {
-            delete frame[STRUCTURED_CONTINUATION];
+            const iterator = continuation?.iterator ||
+              adaptiveGeneratedBody(
+                frame, thread, helpers, initialBytecodeChecks, framelessEntry);
+            let step;
+            try {
+              step = iterator.next();
+            } catch (error) {
+              delete frame[STRUCTURED_CONTINUATION];
+              throw error;
+            }
+            if (step.done) {
+              delete frame[STRUCTURED_CONTINUATION];
+              return step.value;
+            }
+            frame[STRUCTURED_CONTINUATION] = {
+              iterator, pc: frame.pc, framelessEntry: true,
+            };
             return step.value;
-          }
-          frame[STRUCTURED_CONTINUATION] = {
-            iterator, pc: frame.pc, framelessEntry: true,
           };
-          return step.value;
-        };
-        adaptivePositionalBody.jvmSourceUrl = adaptiveGeneratedBody.jvmSourceUrl;
-        adaptivePositionalBody.toString = () => adaptiveGeneratedBody.toString();
+        }
+        if (!ordinaryAdaptive) {
+          adaptivePositionalBody.jvmSourceUrl = adaptiveGeneratedBody.jvmSourceUrl;
+          adaptivePositionalBody.toString = () => adaptiveGeneratedBody.toString();
+        }
       }
       const generated = useContinuations
         ? function (frame, thread, helpers, initialBytecodeChecks) {
           let continuation = frame[STRUCTURED_CONTINUATION];
+          if (!continuation && ordinaryAdaptive &&
+              adaptivePositionalBody) {
+            return adaptivePositionalBody(
+              frame, thread, helpers, initialBytecodeChecks, false);
+          }
           if (continuation) {
             const bytecodeChecks = initialBytecodeChecks === undefined
               ? helpers.needsBytecodeChecks() : initialBytecodeChecks;
@@ -2287,6 +2403,9 @@ class JvmSsaBlockRenderer {
       generated.jvmRestoringDirectPositionalSource = restoringDirectPositionalSource;
       generated.jvmAdaptivePositionalBody = adaptivePositionalBody;
       generated.jvmAdaptivePositionalSource = adaptivePositionalSource;
+      generated.jvmAdaptivePositionalOrdinary =
+        Boolean(adaptivePositionalBody &&
+          this.jit.ordinaryAdaptiveFramelessPositionalEnabled);
       generated.jvmStructuredLoopCount = structured.loopHeaders.size;
       generated.jvmStructuredSplitBlocks = splitBlocks;
       generated.jvmStructuredDispatchIslands = dispatchIslands;
@@ -2305,6 +2424,8 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredEagerThisFieldCount = [...fieldReadCaches.values()]
         .filter((cache) => cache.eagerThis).length;
       generated.jvmStructuredCoarseCountedLoopCount = coarseCountedLoops.size;
+      generated.jvmStructuredSafePointBudget = safePointInitialBudget;
+      generated.jvmStructuredLoopWorkEstimate = loopWorkEstimate;
       generated.jvmStructuredAtomicBoundedLoops = atomicBoundedLoops;
       generated.jvmStructuredBoundedIterationProduct =
         atomicBoundedLoops ? boundedIterationProduct : 0;

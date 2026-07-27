@@ -11,6 +11,7 @@ const Matcher = require('../src/jre/java/util/regex/Matcher');
 const StringClass = require('../src/jre/java/lang/String');
 const CRC32 = require('../src/jre/java/util/zip/CRC32');
 const SourceDataLine = require('../src/jre/javax/sound/sampled/SourceDataLine');
+const AudioSystem = require('../src/jre/javax/sound/sampled/AudioSystem');
 const Toolkit = require('../src/jre/java/awt/Toolkit');
 const ImageClass = require('../src/jre/java/awt/Image');
 const PixelGrabber = require('../src/jre/java/awt/image/PixelGrabber');
@@ -273,6 +274,64 @@ test('headless SourceDataLine discard sink closes cleanly', (t) => {
   SourceDataLine.methods['open(Ljavax/sound/sampled/AudioFormat;)V'](null, obj, [format]);
   t.doesNotThrow(() => SourceDataLine.methods['close()V'](null, obj, []));
   setAudioOutputFactory(null);
+  t.end();
+});
+
+test('AudioSystem preserves DataLine.Info format for no-arg open', (t) => {
+  const formatFields = {
+    sampleRate: 22050,
+    sampleSizeInBits: 16,
+    channels: 1,
+    signed: 1,
+    bigEndian: 0,
+  };
+  const format = {
+    fields: {
+      'javax/sound/sampled/AudioFormat': formatFields,
+    },
+  };
+  const info = {
+    fields: {
+      'javax/sound/sampled/Line$Info': {
+        lineClass: {
+          _classData: {
+            ast: { classes: [{ className: 'javax/sound/sampled/SourceDataLine' }] },
+          },
+        },
+      },
+      'javax/sound/sampled/DataLine$Info': {
+        formats: { elements: [format] },
+        minBufferSize: 2048,
+        maxBufferSize: 2048,
+      },
+    },
+  };
+  const jvm = { nextHashCode: 1 };
+  let openedOptions = null;
+  setAudioOutputFactory((options) => {
+    openedOptions = options;
+    return { write() {}, once(_event, callback) { callback(); }, end() {} };
+  });
+  t.teardown(() => setAudioOutputFactory(null));
+
+  const line = AudioSystem.staticMethods[
+    'getLine(Ljavax/sound/sampled/Line$Info;)Ljavax/sound/sampled/Line;'
+  ](jvm, null, [info]);
+  SourceDataLine.methods['open()V'](jvm, line, []);
+
+  t.equal(line.requestedFormat, format,
+    'getLine retains the format selected by DataLine.Info');
+  t.equal(line.requestedBufferSize, 2048,
+    'getLine retains the requested buffer size');
+  t.deepEqual(openedOptions, {
+    channels: 1,
+    bitDepth: 16,
+    sampleRate: 22050,
+    signed: 1,
+    bigEndian: 0,
+    bufferSize: 2048,
+  }, 'no-arg open creates the concrete output with the negotiated format');
+  t.ok(line.isOpen, 'the line is open after the inherited Java Sound sequence');
   t.end();
 });
 

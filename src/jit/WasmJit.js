@@ -1977,6 +1977,7 @@ class WasmJit {
     this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
     this.hierarchy = new ClassHierarchy(jvm);
     this.structuredCompiles = 0;
+    this.runCount = 0;
     this.compileEpoch = 0;
     // debug-only runtime counters keyed by call-site import name
     this.siteStats = this.debug ? new Map() : null;
@@ -2300,6 +2301,7 @@ class WasmJit {
     args[meta.paramSlots.length + 1] = FUEL;
 
     st.runs += 1;
+    this.runCount += 1;
     let status;
     try {
       status = mod.run(...args);

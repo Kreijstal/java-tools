@@ -6,7 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
+const HOST = process.env.HOST || '0.0.0.0';
 const PUBLIC_DIR = path.join(__dirname, '..');
 
 // MIME types for common file extensions
@@ -137,10 +138,10 @@ const server = http.createServer((req, res) => {
 // Ensure build dependencies before starting server
 ensureBuildDependencies();
 
-server.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-  console.log(`Debug interface available at http://localhost:${PORT}/ (built version with sample classes)`);
-  console.log(`Raw template available at http://localhost:${PORT}/examples/debug-web-interface.html (no sample classes)`);
+server.listen(PORT, HOST, () => {
+  console.log(`Server running at http://${HOST}:${PORT} (bound to ${HOST})`);
+  console.log(`Debug interface available at http://${HOST}:${PORT}/ (built version with sample classes)`);
+  console.log(`Raw template available at http://${HOST}:${PORT}/examples/debug-web-interface.html (no sample classes)`);
 });
 
 // Graceful shutdown

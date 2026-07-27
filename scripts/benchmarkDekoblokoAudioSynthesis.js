@@ -17,8 +17,8 @@ const samples = positiveInteger('DEKOBLOKO_AUDIO_SAMPLES', 22050);
 const rounds = positiveInteger('DEKOBLOKO_AUDIO_ROUNDS', 3);
 const warmups = positiveInteger('DEKOBLOKO_AUDIO_WARMUPS', 1);
 const tiers = [
-  { name: 'previous', structuredSsa: true, postIncrementHelpers: false },
-  { name: 'optimized', structuredSsa: true, postIncrementHelpers: true },
+  { name: 'javascript-long', longArithmeticWasmFirst: false },
+  { name: 'wasm-native-long', longArithmeticWasmFirst: true },
 ];
 
 function positiveInteger(name, fallback) {
@@ -109,6 +109,8 @@ function sentinelFrame() {
 }
 
 async function createRuntime(tier) {
+  process.env.JVM_WASM_JIT = '1';
+  process.env.JVM_WASM_STRUCTURED = '1';
   const jvm = new JVM({
     classpath: [jar],
     jit: {
@@ -116,8 +118,9 @@ async function createRuntime(tier) {
       preferWholeMethodJs: true,
       profileMethods: false,
       scalarLoops: false,
-      structuredSsa: tier.structuredSsa,
-      postIncrementHelpers: tier.postIncrementHelpers,
+      structuredSsa: true,
+      postIncrementHelpers: true,
+      longArithmeticWasmFirst: tier.longArithmeticWasmFirst,
       fusedRegions: false,
     },
   });
@@ -202,6 +205,9 @@ async function main() {
       synthTier: synthBody?.jvmStructuredSsa ? 'structured'
         : synthBody?.jvmSynchronous ? 'generated' : 'interpreted',
       envelopeTier: envelopeBody?.jvmSynchronous ? 'generated' : 'interpreted',
+      wasmRuns: runtime.jvm.jit.wasmJit.runCount,
+      longArithmeticWasmFirstMethods:
+        runtime.jvm.jit.longArithmeticWasmFirstMethodCount,
     });
   }
   const expected = results[0].checksum;

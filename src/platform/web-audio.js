@@ -5,13 +5,22 @@
 
   let sharedAudioContext = null;
   let resumeListenersInstalled = false;
+  let outputCount = 0;
+  let closedOutputCount = 0;
+  let writeCount = 0;
+  let writtenFrames = 0;
+  let sampledFrames = 0;
+  let nonSilentSampledFrames = 0;
+  let peakSampledAmplitude = 0;
+  const activeOutputs = new Set();
 
   function resumeSharedAudioContext() {
-    if (!sharedAudioContext || sharedAudioContext.state !== "suspended" ||
+    const context = getAudioContext();
+    if (!context || context.state !== "suspended" ||
         typeof sharedAudioContext.resume !== "function") {
       return;
     }
-    sharedAudioContext.resume().catch(function() {});
+    context.resume().catch(function() {});
   }
 
   function installResumeListeners() {
@@ -21,9 +30,10 @@
     }
     resumeListenersInstalled = true;
     const resume = () => resumeSharedAudioContext();
-    global.document.addEventListener("pointerdown", resume, { passive: true });
-    global.document.addEventListener("keydown", resume, { passive: true });
-    global.document.addEventListener("touchstart", resume, { passive: true });
+    const options = { passive: true, capture: true };
+    global.document.addEventListener("pointerdown", resume, options);
+    global.document.addEventListener("keydown", resume, options);
+    global.document.addEventListener("touchstart", resume, options);
   }
 
   function getAudioContext() {
@@ -45,9 +55,16 @@
       if (!this.context) {
         throw new Error("WebAudio is not available");
       }
+      outputCount += 1;
       this.pendingSources = 0;
+      this.sources = new Set();
       this.drainCallbacks = [];
       this.scheduledTime = this.context.currentTime;
+      this.bufferSize = Math.max(1, Number(options.bufferSize) || 4096);
+      this.bytesPerFrame = Math.max(1, options.channels || 1) *
+        Math.max(1, (options.bitDepth || 16) / 8);
+      this.closed = false;
+      activeOutputs.add(this);
     }
 
     write(data) {
@@ -64,6 +81,8 @@
         this.flushDrainCallbacks();
         return;
       }
+      writeCount += 1;
+      writtenFrames += frameCount;
 
       if (this.context.state === "suspended" && typeof this.context.resume === "function") {
         resumeSharedAudioContext();
@@ -88,13 +107,30 @@
           );
         }
       }
+      // Sample the already-decoded signal sparsely. This is diagnostics, not
+      // a second full PCM pass through a hot audio loop.
+      const diagnosticChannel = audioBuffer.getChannelData(0);
+      for (let frame = 0; frame < frameCount; frame += 128) {
+        const amplitude = Math.abs(diagnosticChannel[frame]);
+        sampledFrames += 1;
+        if (amplitude > 1 / 32768) {
+          nonSilentSampledFrames += 1;
+        }
+        if (amplitude > peakSampledAmplitude) {
+          peakSampledAmplitude = amplitude;
+        }
+      }
 
       const source = this.context.createBufferSource();
       source.buffer = audioBuffer;
       source.connect(this.context.destination);
       this.pendingSources += 1;
+      this.sources.add(source);
       source.onended = () => {
-        this.pendingSources -= 1;
+        if (!this.sources.delete(source)) {
+          return;
+        }
+        this.pendingSources = Math.max(0, this.pendingSources - 1);
         if (this.pendingSources === 0) {
           this.flushDrainCallbacks();
         }
@@ -103,6 +139,20 @@
       const startTime = Math.max(this.context.currentTime, this.scheduledTime);
       source.start(startTime);
       this.scheduledTime = startTime + audioBuffer.duration;
+    }
+
+    available() {
+      if (this.closed) {
+        return this.bufferSize;
+      }
+      const sampleRate = this.options.sampleRate ||
+        this.context.sampleRate ||
+        44100;
+      const queuedFrames = Math.ceil(
+        Math.max(0, this.scheduledTime - this.context.currentTime) * sampleRate,
+      );
+      return Math.max(0,
+        this.bufferSize - queuedFrames * this.bytesPerFrame);
     }
 
     once(event, callback) {
@@ -121,9 +171,35 @@
       callbacks.forEach((callback) => setTimeout(callback, 0));
     }
 
-    end() {
+    queuedSeconds() {
+      return Math.max(0, this.scheduledTime - this.context.currentTime);
+    }
+
+    flush() {
+      for (const source of this.sources) {
+        source.onended = null;
+        if (typeof source.stop === "function") {
+          try {
+            source.stop();
+          } catch (error) {
+            // A source that ended between iteration and stop is already done.
+          }
+        }
+      }
+      this.sources.clear();
       this.pendingSources = 0;
+      this.scheduledTime = this.context.currentTime;
       this.flushDrainCallbacks();
+    }
+
+    end() {
+      if (this.closed) {
+        return;
+      }
+      this.flush();
+      this.closed = true;
+      activeOutputs.delete(this);
+      closedOutputCount += 1;
     }
   }
 
@@ -163,5 +239,34 @@
     return Math.max(-1, Math.min(1, value));
   }
 
+  // Install the unlock path before the game creates SourceDataLine. Dekobloko
+  // opens audio only after its login gesture; installing here lets Firefox
+  // create and resume the context inside that gesture instead of creating a
+  // permanently suspended context several seconds later.
+  installResumeListeners();
+  global.JVMDebug.audioPlatform.getWebAudioDiagnostics = () => {
+    let queuedSeconds = 0;
+    let maxOutputQueueSeconds = 0;
+    for (const output of activeOutputs) {
+      const outputQueueSeconds = output.queuedSeconds();
+      queuedSeconds += outputQueueSeconds;
+      maxOutputQueueSeconds = Math.max(maxOutputQueueSeconds, outputQueueSeconds);
+    }
+    return {
+      registered: true,
+      contextCreated: Boolean(sharedAudioContext),
+      contextState: sharedAudioContext ? sharedAudioContext.state : "uncreated",
+      outputs: outputCount,
+      activeOutputs: activeOutputs.size,
+      closedOutputs: closedOutputCount,
+      writes: writeCount,
+      writtenFrames,
+      sampledFrames,
+      nonSilentSampledFrames,
+      peakSampledAmplitude: Math.round(peakSampledAmplitude * 1000000) / 1000000,
+      queuedSeconds: Math.round(queuedSeconds * 1000) / 1000,
+      maxOutputQueueSeconds: Math.round(maxOutputQueueSeconds * 1000) / 1000,
+    };
+  };
   global.JVMDebug.audioPlatform.setAudioOutputFactory((options) => new WebAudioOutput(options));
 })(typeof window !== "undefined" ? window : globalThis);

@@ -26,6 +26,10 @@ const NO_MEMO_KEY = Symbol("jit.memo.no-key");
 const HANDLED_RESULT = Object.freeze({ handled: true });
 const UNHANDLED_RESULT = Object.freeze({ handled: false });
 const WASM_EXITED_RESULT = Object.freeze({ handled: false, wasmExited: true });
+const WASM_NATIVE_LONG_OPS = new Set([
+  "i2l", "l2i", "ladd", "land", "lcmp", "ldiv", "lmul", "lneg",
+  "lor", "lrem", "lshl", "lshr", "lsub", "lushr", "lxor",
+]);
 
 // Widened opcode eligibility (long arithmetic/locals/arrays, instanceof,
 // dup_x1, i2s/i2c). These originally regressed when enabled in isolation, but
@@ -116,6 +120,12 @@ class JitCompiler {
     this.perspectiveSpanGuardedFallbackCount = 0;
     this.semanticBilinearSamplerRunCount = 0;
     this.semanticBilinearSamplerFallbackCount = 0;
+    this.transparentIntBlitRunCount = 0;
+    this.transparentIntBlitSlowPathCount = 0;
+    this.clippedGradientRunCount = 0;
+    this.clippedGradientSlowPathCount = 0;
+    this.alphaMaskedColorBlitRunCount = 0;
+    this.alphaMaskedColorBlitSlowPathCount = 0;
     this.positionalGeneratedCallsEnabled =
       options.positionalGeneratedCalls !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -124,6 +134,12 @@ class JitCompiler {
       options.adaptiveFramelessPositional !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_ADAPTIVE_FRAMELESS_POSITIONAL === "1");
+    this.ordinaryAdaptiveFramelessPositionalEnabled =
+      options.ordinaryAdaptiveFramelessPositional === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_ORDINARY_ADAPTIVE_FRAMELESS === "1");
+    this.ordinaryAdaptiveFramelessRunCount = 0;
+    this.referenceFramelessPositionalRunCount = 0;
     this.adaptiveFramelessBudgetMultiplier = Math.max(1, Math.min(100,
       Number(options.adaptiveFramelessBudgetMultiplier ??
         (typeof process !== "undefined" && process.env &&
@@ -224,6 +240,14 @@ class JitCompiler {
     this.scalarSsaThreadedEdgeCount = 0;
     this.scalarLoopMethodRunCounts = new Map();
     this.structuredSsaMethodRunCounts = new Map();
+    this.oversizedWasmFirstMethods = new WeakMap();
+    this.oversizedWasmFirstMethodCount = 0;
+    this.longArithmeticWasmFirstMethods = new WeakMap();
+    this.longArithmeticWasmFirstMethodCount = 0;
+    this.longArithmeticWasmFirstEnabled =
+      options.longArithmeticWasmFirst !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_LONG_ARITHMETIC_WASM_FIRST === "1");
     this.rendererPipelineEnabled = options.rendererPipeline === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
@@ -359,8 +383,11 @@ class JitCompiler {
     let awaitingAdaptivePromotion = false;
     const canProbeGenerated = !this.runningFrames.has(frame) &&
       !frame.jitJsDisabled;
+    const wasmPriorityLoop = this.wasmJit.enabled &&
+      (this.isOversizedLoopMethod(frame.method) ||
+        this.isLongArithmeticLoopMethod(frame.method));
     const wholeMethodPreferred =
-      this.prefersWholeMethodJs(frame.method);
+      this.prefersWholeMethodJs(frame.method) && !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       let codegenEligible = this.isCodegenSupported(frame.method);
       if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
@@ -444,6 +471,46 @@ class JitCompiler {
     } finally {
       this.runningFrames.delete(frame);
     }
+  }
+
+  isOversizedLoopMethod(method) {
+    if (!method || method.name === "<init>" || method.name === "<clinit>") return false;
+    if (this.oversizedWasmFirstMethods.has(method)) {
+      return this.oversizedWasmFirstMethods.get(method);
+    }
+    const codeItems = this.getCodeItems(method);
+    const oversized = codeItems.filter((item) => item?.instruction).length >= 2048 &&
+      this.hasBackwardBranch(method);
+    this.oversizedWasmFirstMethods.set(method, oversized);
+    if (oversized) this.oversizedWasmFirstMethodCount += 1;
+    return oversized;
+  }
+
+  isLongArithmeticLoopMethod(method) {
+    if (!this.longArithmeticWasmFirstEnabled) return false;
+    if (!method || method.name === "<init>" || method.name === "<clinit>") return false;
+    if (this.longArithmeticWasmFirstMethods.has(method)) {
+      return this.longArithmeticWasmFirstMethods.get(method);
+    }
+    const codeItems = this.getCodeItems(method);
+    let instructionCount = 0;
+    let nativeLongOpCount = 0;
+    for (const item of codeItems) {
+      const op = getOp(item && item.instruction);
+      if (!op) continue;
+      instructionCount += 1;
+      if (WASM_NATIVE_LONG_OPS.has(op)) nativeLongOpCount += 1;
+    }
+    // JavaScript implements exact Java long arithmetic with BigInt. In a
+    // substantial numeric loop that conversion/allocation cost dominates,
+    // while Wasm represents the same verified values directly as i64. Keep
+    // small helpers in JavaScript so module compilation and crossings do not
+    // outweigh the saved work.
+    const selected = instructionCount >= 256 && nativeLongOpCount >= 8 &&
+      this.hasBackwardBranch(method);
+    this.longArithmeticWasmFirstMethods.set(method, selected);
+    if (selected) this.longArithmeticWasmFirstMethodCount += 1;
+    return selected;
   }
 
   prefersWholeMethodJs(method) {
@@ -581,8 +648,18 @@ class JitCompiler {
     // used to run on every generated child entry even in production. Build it
     // only for diagnostics that consume it; hot nested calls otherwise need
     // no owner/name/descriptor lookup at all.
+    let timingSelected = false;
+    if (this.profileTimings) {
+      // Decide whether this entry is sampled before formatting its guest
+      // identity. The old order allocated an owner/name/descriptor string on
+      // every generated entry even though 127 of 128 entries used no clock.
+      this.methodTimingRandomState = (Math.imul(this.methodTimingRandomState, 1664525) +
+        1013904223) >>> 0;
+      timingSelected =
+        this.methodTimingRandomState < 0x100000000 / this.methodTimingSampleRate;
+    }
     const needsMethodKey = Boolean(this.methodEntryTraceKey) ||
-      this.profileTimings || this.exclusiveTimingsEnabled;
+      timingSelected || this.exclusiveTimingsEnabled;
     const frameMethodKey = needsMethodKey
       ? `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`
       : null;
@@ -602,19 +679,14 @@ class JitCompiler {
     }
     let timingKey = null;
     let timingStarted = 0;
-    const candidateTimingKey = this.profileTimings ? frameMethodKey : null;
+    const candidateTimingKey = timingSelected ? frameMethodKey : null;
     if (candidateTimingKey &&
         (!this.methodTimingFilter || this.methodTimingFilter.has(candidateTimingKey))) {
-      // Use a deterministic pseudo-random sample rather than every Nth call:
-      // render call patterns are strongly periodic and a modulo sampler can
-      // repeatedly select (or miss) one callee. Only sampled calls pay for a
-      // clock read.
-      this.methodTimingRandomState = (Math.imul(this.methodTimingRandomState, 1664525) +
-        1013904223) >>> 0;
-      if (this.methodTimingRandomState < 0x100000000 / this.methodTimingSampleRate) {
-        timingKey = candidateTimingKey;
-        timingStarted = this.monotonicNow();
-      }
+      // Render call patterns are strongly periodic, so retain pseudo-random
+      // sampling rather than every Nth call. Only the selected entry pays for
+      // identity formatting and a clock read.
+      timingKey = candidateTimingKey;
+      timingStarted = this.monotonicNow();
     }
     const exclusiveTiming = this.exclusiveTimingsEnabled
       ? this.beginExclusiveTiming(frameMethodKey,
@@ -3863,13 +3935,17 @@ class JitCompiler {
     const adaptiveFramelessBody = generated.jvmAdaptivePositionalBody || null;
     // Reference-returning adaptive entries can hand an object back while a
     // nested scheduler-visible continuation still owns it. Keep those calls on
-    // the canonical child-Frame path until reference liveness is proven.
+    // the canonical child-Frame path. Acyclic entries explicitly marked
+    // jvmFramelessPositional cannot suspend, so their reference return is just
+    // as safe as a primitive and needs no child Frame.
     const primitiveReturn = new Set([
       "boolean", "byte", "char", "short", "int",
       "long", "float", "double", "void",
     ]).has(site.returnType);
-    const framelessBody = primitiveReturn &&
-      (immediateFramelessBody || adaptiveFramelessBody);
+    const referenceFrameless =
+      !primitiveReturn && Boolean(immediateFramelessBody);
+    const framelessBody = immediateFramelessBody ||
+      (primitiveReturn ? adaptiveFramelessBody : null);
     const framelessMode = !framelessBody ? 0
       : immediateFramelessBody ? 1 : 2;
     const source = [
@@ -3892,17 +3968,31 @@ class JitCompiler {
       "  (adaptiveFrameless && target.preferFrameless === true);",
       "let result;",
       "let baseDepth = -1;",
+      "let positionalTimingStarted = -1;",
       "if (useFrameless) {",
       "  baseDepth = thread.callStack.items.length;",
+      "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
+      "  if (jit.profileTimings) {",
+      "    jit.methodTimingRandomState = (Math.imul(jit.methodTimingRandomState, 1664525) + 1013904223) >>> 0;",
+      "    if (jit.methodTimingRandomState < 0x100000000 / jit.methodTimingSampleRate) {",
+      "      positionalTimingStarted = jit.monotonicNow();",
+      "    }",
+      "  }",
       "  try {",
       "    result = plan.framelessBody(child, thread, jit, false, true);",
       "  } catch (error) {",
+      "    if (positionalTimingStarted >= 0) {",
+      "      jit.recordMethodTiming(plan.methodKey, jit.monotonicNow() - positionalTimingStarted, plan.generated);",
+      "    }",
       "    plan.restoreFrame(thread, baseDepth, child);",
       "    if (adaptiveFrameless) {",
       "      target.preferFrameless = false;",
       "      target.framelessRejected = true;",
       "    }",
       "    throw error;",
+      "  }",
+      "  if (positionalTimingStarted >= 0) {",
+      "    jit.recordMethodTiming(plan.methodKey, jit.monotonicNow() - positionalTimingStarted, plan.generated);",
       "  }",
       "} else {",
       "  thread.callStack.push(child);",
@@ -3947,9 +4037,11 @@ class JitCompiler {
         target,
         Frame,
         method,
+        methodKey,
         generated,
         framelessMode,
         framelessBody,
+        referenceFrameless,
         adaptiveThreshold: 4,
         adaptiveYieldThreshold: 4,
         lookupClass,
@@ -4629,6 +4721,83 @@ class JitCompiler {
       return intrinsic;
     }
 
+    if (descriptor === "(IIIIII)V") {
+      // Clipped vertical RGB gradient. Recognition deliberately uses the
+      // complete bytecode shape, constants, CFG/stack proof, and repeated
+      // static-field identities. Guest class, method, and field names do not
+      // participate.
+      const gradientOps = [
+        "iconst_0", "istore", "ldc", "iload_3", "idiv", "istore",
+        "iload_0", "getstatic", "if_icmpge",
+        "iload_2", "getstatic", "iload_0", "isub", "isub", "istore_2",
+        "getstatic", "istore_0",
+        "iload_1", "getstatic", "if_icmpge",
+        "iload", "getstatic", "iload_1", "isub", "iload", "imul", "iadd", "istore",
+        "iload_3", "getstatic", "iload_1", "isub", "isub", "istore_3",
+        "getstatic", "istore_1",
+        "iload_0", "iload_2", "iadd", "getstatic", "if_icmple",
+        "getstatic", "iload_0", "isub", "istore_2",
+        "iload_1", "iload_3", "iadd", "getstatic", "if_icmple",
+        "getstatic", "iload_1", "isub", "istore_3",
+        "getstatic", "iload_2", "isub", "istore",
+        "iload_0", "iload_1", "getstatic", "imul", "iadd", "istore",
+        "iload_3", "ineg", "istore", "iload", "ifge",
+        "ldc", "iload", "isub", "bipush", "ishr", "istore",
+        "iload", "bipush", "ishr", "istore",
+        "iload", "ldc", "iand", "iload", "imul",
+        "iload", "ldc", "iand", "iload", "imul", "iadd", "ldc", "iand",
+        "iload", "ldc", "iand", "iload", "imul",
+        "iload", "ldc", "iand", "iload", "imul", "iadd", "ldc", "iand",
+        "iadd", "bipush", "iushr", "istore",
+        "iload_2", "ineg", "istore", "iload", "ifge",
+        "getstatic", "iload", "iinc", "iload", "iastore",
+        "iinc", "goto",
+        "iload", "iload", "iadd", "istore",
+        "iload", "iload", "iadd", "istore",
+        "iinc", "goto", "return",
+      ];
+      const exceptionTable = code?.code?.exceptionTable || [];
+      const codeVerified =
+        (!exceptionTable.length ||
+          this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
+        Boolean(this.computeStackDepths(codeItems, buildLabelMap(codeItems)));
+      if (!codeVerified || ops.length !== gradientOps.length ||
+          !gradientOps.every((op, index) => ops[index] === op)) return null;
+      const constants = codeItems.filter((item) =>
+        ["ldc", "bipush"].includes(getOp(item.instruction)))
+        .map((item) => Number(item.instruction.arg));
+      const expectedConstants = [
+        65536, 65536, 8, 8, 16711935, 16711935, -16711936,
+        65280, 65280, 16711680, 8,
+      ];
+      if (constants.length !== expectedConstants.length ||
+          constants.some((value, index) => value !== expectedConstants[index])) return null;
+      const fields = codeItems.filter((item) => getOp(item.instruction) === "getstatic")
+        .map((item) => item.instruction.arg);
+      const fieldKey = (field) => JSON.stringify(field);
+      const repeated = (indexes) => indexes.every((index) =>
+        fieldKey(fields[index]) === fieldKey(fields[indexes[0]]));
+      if (fields.length !== 14 ||
+          fields.slice(0, 13).some((field) => field?.[2]?.[1] !== "I") ||
+          fields[13]?.[2]?.[1] !== "[I" ||
+          !repeated([0, 1, 2]) || !repeated([3, 4, 5, 6]) ||
+          !repeated([7, 8]) || !repeated([9, 10]) ||
+          !repeated([11, 12])) return null;
+      const staticFields = [
+        fields[0], fields[3], fields[7], fields[9], fields[11], fields[13],
+      ];
+      const intrinsic = (stack, base) => {
+        const values = staticFields.map((field) => this.getStaticSync(field));
+        if (values.some((item) => item === STATIC_DEOPT)) return ASYNC_INVOKE;
+        return this.clippedGradientDirect(
+          stack[base], stack[base + 1], stack[base + 2],
+          stack[base + 3], stack[base + 4], stack[base + 5], ...values);
+      };
+      intrinsic.jvmDirectKind = "clippedStaticGradient";
+      intrinsic.jvmDirectData = { staticFields };
+      return intrinsic;
+    }
+
     if (descriptor === "([I[BIIIIIII)V") {
       const maskedBlitOps = [
         "iload", "iconst_2", "ishr", "ineg", "istore",
@@ -4656,6 +4825,81 @@ class JitCompiler {
         stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
         stack[base + 8]);
       intrinsic.jvmDirectKind = "maskedColorBlit";
+      return intrinsic;
+    }
+
+    if (descriptor === "([I[IIIIIIII)V") {
+      // Transparent int-source rectangle copy, including the four-pixel
+      // unroll used by older javac output. The complete verified bytecode
+      // shape is the identity; declaring class and member names are irrelevant.
+      const transparentIntBlitOps = [
+        "iload", "iconst_2", "ishr", "ineg", "istore",
+        "iload", "iconst_3", "iand", "ineg", "istore",
+        "iload", "ineg", "istore", "iload", "ifge",
+        "iload", "istore", "iload", "ifge",
+        "aload_1", "iload_3", "iinc", "iaload", "istore_2", "iload_2", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "athrow", "iinc",
+        "aload_1", "iload_3", "iinc", "iaload", "istore_2", "iload_2", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "athrow", "iinc",
+        "aload_1", "iload_3", "iinc", "iaload", "istore_2", "iload_2", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "athrow", "iinc",
+        "aload_1", "iload_3", "iinc", "iaload", "istore_2", "iload_2", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "athrow", "iinc",
+        "iinc", "goto",
+        "iload", "istore", "iload", "ifge",
+        "aload_1", "iload_3", "iinc", "iaload", "istore_2", "iload_2", "ifeq",
+        "aload_0", "iload", "iinc", "iload_2", "iastore", "goto", "athrow", "iinc",
+        "iinc", "goto",
+        "iload", "iload", "iadd", "istore",
+        "iload_3", "iload", "iadd", "istore_3",
+        "iinc", "goto", "return",
+      ];
+      const exceptionTable = code?.code?.exceptionTable || [];
+      const codeVerified =
+        (!exceptionTable.length ||
+          this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
+        Boolean(this.computeStackDepths(codeItems, buildLabelMap(codeItems)));
+      if (!codeVerified || ops.length !== transparentIntBlitOps.length ||
+          !transparentIntBlitOps.every((op, index) => ops[index] === op)) return null;
+      const intrinsic = (stack, base) => this.transparentIntBlitDirect(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
+        stack[base + 8]);
+      intrinsic.jvmDirectKind = "transparentIntBlit";
+      return intrinsic;
+    }
+
+    if (descriptor === "([I[IIIIIIIII)V") {
+      // Transparent-source alpha rectangle. Match the complete loop and its
+      // packed-channel constants; owner/member names are intentionally absent.
+      const alphaMaskedBlitOps = [
+        "iload", "ineg", "istore", "iload", "ifge",
+        "iload", "ineg", "istore", "iload", "ifge",
+        "aload_1", "iload_3", "iinc", "iaload", "istore_2", "iload_2", "ifeq",
+        "iload_2", "ldc", "iand", "iload", "imul", "ldc", "iand", "istore",
+        "iload_2", "ldc", "iand", "iload", "imul", "ldc", "iand", "istore",
+        "aload_0", "iload", "iinc", "iload", "iload", "ior", "bipush",
+        "iushr", "iastore", "goto", "iinc",
+        "iinc", "goto",
+        "iload", "iload", "iadd", "istore",
+        "iload_3", "iload", "iadd", "istore_3",
+        "iinc", "goto", "return",
+      ];
+      if (ops.length !== alphaMaskedBlitOps.length ||
+          !alphaMaskedBlitOps.every((op, index) => ops[index] === op)) return null;
+      const constants = codeItems.filter((item) =>
+        getOp(item.instruction) === "ldc" || getOp(item.instruction) === "bipush")
+        .map((item) => Number(item.instruction.arg));
+      const expectedConstants = [
+        0x00ff00ff, 0xff00ff00 | 0, 0x0000ff00, 0x00ff0000, 8,
+      ];
+      if (constants.length !== expectedConstants.length ||
+          constants.some((value, index) => value !== expectedConstants[index])) return null;
+      const intrinsic = (stack, base) => this.alphaMaskedColorBlitDirect(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
+        stack[base + 8], stack[base + 9]);
+      intrinsic.jvmDirectKind = "alphaMaskedColorBlit";
       return intrinsic;
     }
 
@@ -5072,6 +5316,113 @@ class JitCompiler {
       clipTop, clipBottom, clipLeft, clipRight, surfaceWidth, pixels);
   }
 
+  clippedGradientDirect(x, y, width, height, startColor, endColor,
+    clipLeft, clipTop, clipRight, clipBottom, surfaceWidth, pixels) {
+    this.clippedGradientRunCount += 1;
+    x |= 0; y |= 0; width |= 0; height |= 0;
+    startColor |= 0; endColor |= 0;
+    clipLeft |= 0; clipTop |= 0; clipRight |= 0; clipBottom |= 0;
+    surfaceWidth |= 0;
+    // idiv is the first potentially throwing operation in the recognized
+    // guest body, before any clipping or pixel side effect.
+    if (height === 0) {
+      throw { type: "java/lang/ArithmeticException", message: "/ by zero" };
+    }
+    let phase = 0;
+    const phaseStep = (65536 / height) | 0;
+    if (x < clipLeft) {
+      width = (width - (clipLeft - x)) | 0;
+      x = clipLeft;
+    }
+    if (y < clipTop) {
+      phase = (phase + Math.imul((clipTop - y) | 0, phaseStep)) | 0;
+      height = (height - (clipTop - y)) | 0;
+      y = clipTop;
+    }
+    if (((x + width) | 0) > clipRight) width = (clipRight - x) | 0;
+    if (((y + height) | 0) > clipBottom) height = (clipBottom - y) | 0;
+    const rowSkip = (surfaceWidth - width) | 0;
+    let pixelIndex = (x + Math.imul(y, surfaceWidth)) | 0;
+    if (width <= 0 || height <= 0) return RETURN_VOID;
+    const data = this.arrayData(pixels);
+    const length = pixels?.length ?? (data && data.length) ?? 0;
+    let rangesValid = data !== null;
+    let checkedIndex = pixelIndex;
+    for (let checkedRow = 0; rangesValid && checkedRow < height; checkedRow += 1) {
+      if (checkedIndex < 0 || checkedIndex + width > length) rangesValid = false;
+      checkedIndex = (checkedIndex + surfaceWidth) | 0;
+    }
+    if (rangesValid) {
+      let fastRow = (-height) | 0;
+      while (fastRow < 0) {
+        const startWeight = ((65536 - phase) >> 8) | 0;
+        const endWeight = (phase >> 8) | 0;
+        const mixedRb = (
+          (Math.imul(startColor & 16711935, startWeight) +
+            Math.imul(endColor & 16711935, endWeight)) | 0) & -16711936;
+        const mixedG = (
+          (Math.imul(startColor & 65280, startWeight) +
+            Math.imul(endColor & 65280, endWeight)) | 0) & 16711680;
+        const color = ((mixedRb + mixedG) >>> 8) | 0;
+        const rowEnd = (pixelIndex + width) | 0;
+        while (pixelIndex < rowEnd) {
+          data[pixelIndex] = color;
+          pixelIndex += 1;
+        }
+        pixelIndex = (pixelIndex + rowSkip) | 0;
+        phase = (phase + phaseStep) | 0;
+        fastRow = (fastRow + 1) | 0;
+      }
+      return RETURN_VOID;
+    }
+    this.clippedGradientSlowPathCount += 1;
+    let row = (-height) | 0;
+    while (row < 0) {
+      const startWeight = ((65536 - phase) >> 8) | 0;
+      const endWeight = (phase >> 8) | 0;
+      const mixedRb = (
+        (Math.imul(startColor & 16711935, startWeight) +
+          Math.imul(endColor & 16711935, endWeight)) | 0) & -16711936;
+      const mixedG = (
+        (Math.imul(startColor & 65280, startWeight) +
+          Math.imul(endColor & 65280, endWeight)) | 0) & 16711680;
+      const color = ((mixedRb + mixedG) >>> 8) | 0;
+      let column = (-width) | 0;
+      while (column < 0) {
+        if (pixels === null || pixels === undefined) {
+          throw { type: "java/lang/NullPointerException", message: null };
+        }
+        if (pixelIndex < 0 || pixelIndex >= length) {
+          throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+        }
+        if (data !== null) data[pixelIndex] = color;
+        else if (pixels.elements) pixels.elements[pixelIndex] = color;
+        else pixels[pixelIndex] = color;
+        pixelIndex = (pixelIndex + 1) | 0;
+        column = (column + 1) | 0;
+      }
+      pixelIndex = (pixelIndex + rowSkip) | 0;
+      phase = (phase + phaseStep) | 0;
+      row = (row + 1) | 0;
+    }
+    return RETURN_VOID;
+  }
+
+  clippedStaticGradientDirectAt(x, y, width, height, startColor, endColor,
+    leftSite, topSite, rightSite, bottomSite, widthSite, pixelsSite) {
+    const clipLeft = this.getStaticSyncAt(leftSite);
+    const clipTop = this.getStaticSyncAt(topSite);
+    const clipRight = this.getStaticSyncAt(rightSite);
+    const clipBottom = this.getStaticSyncAt(bottomSite);
+    const surfaceWidth = this.getStaticSyncAt(widthSite);
+    const pixels = this.getStaticSyncAt(pixelsSite);
+    if (clipLeft === STATIC_DEOPT || clipTop === STATIC_DEOPT ||
+        clipRight === STATIC_DEOPT || clipBottom === STATIC_DEOPT ||
+        surfaceWidth === STATIC_DEOPT || pixels === STATIC_DEOPT) return STATIC_DEOPT;
+    return this.clippedGradientDirect(x, y, width, height, startColor, endColor,
+      clipLeft, clipTop, clipRight, clipBottom, surfaceWidth, pixels);
+  }
+
   maskedColorBlitDirect(destination, mask, color, maskIndex, destinationIndex,
     width, height, destinationRowSkip, maskRowSkip) {
     color |= 0;
@@ -5159,6 +5510,211 @@ class JitCompiler {
       destinationIndex = (destinationIndex + destinationRowSkip) | 0;
       maskIndex = (maskIndex + maskRowSkip) | 0;
       row += 1;
+    }
+    return RETURN_VOID;
+  }
+
+  transparentIntBlitDirect(destination, source, _pixel, sourceIndex,
+    destinationIndex, width, height, destinationRowSkip, sourceRowSkip) {
+    sourceIndex |= 0;
+    destinationIndex |= 0;
+    width |= 0;
+    height |= 0;
+    destinationRowSkip |= 0;
+    sourceRowSkip |= 0;
+    this.transparentIntBlitRunCount += 1;
+
+    // The verified bytecodes perform no array access in these cases.
+    if (height <= 0 || width === 0) return RETURN_VOID;
+
+    const destinationData = this.arrayData(destination);
+    const sourceData = this.arrayData(source);
+    const destinationLength = destination?.length ??
+      (destinationData && destinationData.length) ?? 0;
+    const sourceLength = source?.length ?? (sourceData && sourceData.length) ?? 0;
+    if (width > 0 && destinationData !== null && sourceData !== null) {
+      let checkedSource = sourceIndex;
+      let checkedDestination = destinationIndex;
+      let validRanges = true;
+      for (let row = 0; row < height; row += 1) {
+        if (checkedSource < 0 || checkedSource + width > sourceLength ||
+            checkedDestination < 0 ||
+            checkedDestination + width > destinationLength) {
+          validRanges = false;
+          break;
+        }
+        checkedSource = (checkedSource + width + sourceRowSkip) | 0;
+        checkedDestination =
+          (checkedDestination + width + destinationRowSkip) | 0;
+      }
+      if (validRanges) {
+        for (let row = 0; row < height; row += 1) {
+          const rowEnd = (sourceIndex + width) | 0;
+          while (sourceIndex < rowEnd) {
+            const pixel = sourceData[sourceIndex++] | 0;
+            if (pixel !== 0) destinationData[destinationIndex] = pixel;
+            destinationIndex += 1;
+          }
+          destinationIndex =
+            (destinationIndex + destinationRowSkip) | 0;
+          sourceIndex = (sourceIndex + sourceRowSkip) | 0;
+        }
+        return RETURN_VOID;
+      }
+    }
+
+    // Preserve source-before-destination access order and partial writes for
+    // malformed inputs. A zero source pixel never touches its destination.
+    this.transparentIntBlitSlowPathCount += 1;
+    const readSource = (index) => {
+      if (source === null || source === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (index < 0 || index >= sourceLength) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      return (sourceData !== null ? sourceData[index]
+        : source.elements ? source.elements[index] : source[index]) | 0;
+    };
+    const writeDestination = (index, value) => {
+      if (destination === null || destination === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (index < 0 || index >= destinationLength) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      if (destinationData !== null) destinationData[index] = value;
+      else if (destination.elements) destination.elements[index] = value;
+      else destination[index] = value;
+    };
+    const copyPixel = () => {
+      const pixel = readSource(sourceIndex);
+      sourceIndex = (sourceIndex + 1) | 0;
+      if (pixel !== 0) writeDestination(destinationIndex, pixel);
+      destinationIndex = (destinationIndex + 1) | 0;
+    };
+    const groups = -(width >> 2);
+    const remainder = -(width & 3);
+    let row = -height;
+    while (row < 0) {
+      let group = groups;
+      while (group < 0) {
+        copyPixel();
+        copyPixel();
+        copyPixel();
+        copyPixel();
+        group += 1;
+      }
+      let tail = remainder;
+      while (tail < 0) {
+        copyPixel();
+        tail += 1;
+      }
+      destinationIndex = (destinationIndex + destinationRowSkip) | 0;
+      sourceIndex = (sourceIndex + sourceRowSkip) | 0;
+      row += 1;
+    }
+    return RETURN_VOID;
+  }
+
+  alphaMaskedColorBlitDirect(destination, source, _pixel, sourceIndex,
+    destinationIndex, width, height, destinationRowSkip, sourceRowSkip, alpha) {
+    sourceIndex |= 0;
+    destinationIndex |= 0;
+    width |= 0;
+    height |= 0;
+    destinationRowSkip |= 0;
+    sourceRowSkip |= 0;
+    alpha |= 0;
+    this.alphaMaskedColorBlitRunCount += 1;
+
+    // The verified bytecodes perform no array access for an empty rectangle.
+    if (width <= 0 || height <= 0) return RETURN_VOID;
+
+    const destinationData = this.arrayData(destination);
+    const sourceData = this.arrayData(source);
+    const destinationLength = destination?.length ??
+      (destinationData && destinationData.length) ?? 0;
+    const sourceLength = source?.length ?? (sourceData && sourceData.length) ?? 0;
+    if (destinationData !== null && sourceData !== null) {
+      let checkedSource = sourceIndex;
+      let checkedDestination = destinationIndex;
+      let validRanges = true;
+      for (let row = 0; row < height; row += 1) {
+        if (checkedSource < 0 || checkedSource + width > sourceLength ||
+            checkedDestination < 0 ||
+            checkedDestination + width > destinationLength) {
+          validRanges = false;
+          break;
+        }
+        checkedSource = (checkedSource + width + sourceRowSkip) | 0;
+        checkedDestination =
+          (checkedDestination + width + destinationRowSkip) | 0;
+      }
+      if (validRanges) {
+        for (let row = 0; row < height; row += 1) {
+          const rowEnd = (sourceIndex + width) | 0;
+          while (sourceIndex < rowEnd) {
+            const pixel = sourceData[sourceIndex++] | 0;
+            if (pixel !== 0) {
+              const redBlue =
+                Math.imul(pixel & 0x00ff00ff, alpha) & 0xff00ff00;
+              const green =
+                Math.imul(pixel & 0x0000ff00, alpha) & 0x00ff0000;
+              destinationData[destinationIndex] =
+                ((redBlue | green) >>> 8) | 0;
+            }
+            destinationIndex += 1;
+          }
+          destinationIndex =
+            (destinationIndex + destinationRowSkip) | 0;
+          sourceIndex = (sourceIndex + sourceRowSkip) | 0;
+        }
+        return RETURN_VOID;
+      }
+    }
+
+    // Preserve the bytecode's access order and partial-write behavior for
+    // malformed inputs. In particular, a transparent source pixel does not
+    // touch (and therefore cannot fault on) its destination index.
+    this.alphaMaskedColorBlitSlowPathCount += 1;
+    const readSource = (index) => {
+      if (source === null || source === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (index < 0 || index >= sourceLength) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      return (sourceData !== null ? sourceData[index]
+        : source.elements ? source.elements[index] : source[index]) | 0;
+    };
+    const writeDestination = (index, value) => {
+      if (destination === null || destination === undefined) {
+        throw { type: "java/lang/NullPointerException", message: null };
+      }
+      if (index < 0 || index >= destinationLength) {
+        throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: null };
+      }
+      if (destinationData !== null) destinationData[index] = value;
+      else if (destination.elements) destination.elements[index] = value;
+      else destination[index] = value;
+    };
+    for (let row = 0; row < height; row += 1) {
+      for (let column = 0; column < width; column += 1) {
+        const pixel = readSource(sourceIndex);
+        sourceIndex = (sourceIndex + 1) | 0;
+        if (pixel !== 0) {
+          const redBlue =
+            Math.imul(pixel & 0x00ff00ff, alpha) & 0xff00ff00;
+          const green =
+            Math.imul(pixel & 0x0000ff00, alpha) & 0x00ff0000;
+          writeDestination(destinationIndex,
+            ((redBlue | green) >>> 8) | 0);
+        }
+        destinationIndex = (destinationIndex + 1) | 0;
+      }
+      destinationIndex = (destinationIndex + destinationRowSkip) | 0;
+      sourceIndex = (sourceIndex + sourceRowSkip) | 0;
     }
     return RETURN_VOID;
   }
@@ -5608,7 +6164,8 @@ class JitCompiler {
     if (!instruction || !Array.isArray(instruction.arg) ||
         !Array.isArray(instruction.arg[2])) return null;
     const [, className, [methodName, descriptor]] = instruction.arg;
-    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") return null;
+    const classInitialized =
+      this.jvm.classInitializationState.get(className) === "INITIALIZED";
     const classData = this.jvm.classes[className];
     if (!classData) return null;
     const method = this.jvm.findMethod(classData, methodName, descriptor);
@@ -5617,13 +6174,22 @@ class JitCompiler {
     try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
     const intrinsic = this.getSynchronousIntrinsic(method, descriptor);
     if (!intrinsic?.jvmDirectKind) return null;
+    // Most direct intrinsics retain the historical initialized-only binding.
+    // The complete alpha-rectangle proof can also be installed while its
+    // owner is merely loaded: the structured caller emits an initialization
+    // guard and falls back before any pixel effect until publication.
+    if (!classInitialized &&
+        intrinsic.jvmDirectKind !== "transparentIntBlit" &&
+        intrinsic.jvmDirectKind !== "alphaMaskedColorBlit") return null;
     const direct = {
       kind: intrinsic.jvmDirectKind,
       paramCount: parsed.params.length,
       returnsVoid: parsed.returnType === "void",
+      initializationOwner: classInitialized ? null : className,
     };
     if (intrinsic.jvmDirectKind === "clippedStaticSpan" ||
-        intrinsic.jvmDirectKind === "clippedStaticAlphaSpan") {
+        intrinsic.jvmDirectKind === "clippedStaticAlphaSpan" ||
+        intrinsic.jvmDirectKind === "clippedStaticGradient") {
       const staticFields = intrinsic.jvmDirectData?.staticFields;
       if (!Array.isArray(staticFields) || staticFields.length !== 6) return null;
       direct.staticFieldSites = staticFields.map((field) => this.registerFieldSite(field));

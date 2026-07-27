@@ -4222,3 +4222,480 @@ queue can complete many guest frames while `requestAnimationFrame` remains
 pending, causing presentation coalescing. This option has unit coverage but is
 not recorded as a performance win yet; it must be measured in the same remote
 browser before becoming the default.
+
+## 2026-07-26: ordinary adaptive SSA removes generator dispatch
+
+Timing the guest body, rather than counting invocations, separated two very
+different costs. Canvas upload remained about 7.8 ms per presented image and
+the structurally fused gradient/flat raster wrappers averaged less than
+0.1 ms. The expensive remaining text, layout, and dynamic scan loops were
+compiled as `structured-ssa-adaptive-positional` JavaScript generators solely
+to retain a continuation at rare scheduler safe points. Those generator
+resumptions were cheap in V8 but disproportionately expensive in SpiderMonkey.
+
+The structured renderer now has an opt-in ordinary adaptive ABI. It emits the
+same verified scalar CFG and fixed operand-join slots as an ordinary function,
+with an enlarged but bounded loop budget. If the budget expires, the generated
+body spills its exact bytecode PC, scalar locals, and live operand values and
+returns to canonical execution. It never attempts to re-enter a partially
+completed ordinary region. Debugger and bytecode guards still run before guest
+effects. Selection uses only the verified CFG/capability shape; no guest owner
+or method name is present.
+
+The exact-source Node A/B at the forced main menu measured:
+
+| Node configuration | presented FPS |
+| --- | ---: |
+| generator adaptive positional control | 23.66 |
+| ordinary adaptive positional | **30.12** |
+
+That is a 27.3% improvement. Reports:
+
+- `.work/alterorb-jvmjs/dekobloko-menu-ordinary-adaptive-control.json`
+- `.work/alterorb-jvmjs/dekobloko-menu-ordinary-adaptive.json`
+
+The first clean local Firefox 146 A/B used the production bundle, identical
+JAR, sample stride 16, and the same first surface hash (`4025147891`). It was
+measured during the initial non-black animation while the launcher still
+reported asset block 9 of 9:
+
+| Firefox configuration | changed images/s | transition intervals/s |
+| --- | ---: | ---: |
+| ordinary adaptive off | 12.12 | 11.51 |
+| intermethod ordinary adaptive, run 1 | 19.05 | 18.10 |
+| intermethod ordinary adaptive, run 2 | 20.32 | 19.31 |
+
+The second on-run executed 1,302,113 ordinary adaptive entries and reached
+only 114 structured safe points. Both on-runs and the off control had zero
+page or console errors. Local reports:
+
+- `/tmp/dekobloko-ordinary-firefox-off.json`
+- `/tmp/dekobloko-ordinary-firefox.json`
+- `/tmp/dekobloko-ordinary-firefox-on-confirm.json`
+
+One generic wrapper still remained: scheduler-visible structured entries
+entered the generator even though their nested positional calls used ordinary
+SSA. Routing a fresh canonical entry through the same ordinary body retains
+normal `Frame` pop/return behavior and falls back to canonical bytecodes at a
+materialized safe point. It measured 29.20 FPS in Node, statistically neutral
+against the 30.12 intermethod-only result, but removed the remaining
+SpiderMonkey generator penalty. Three clean Firefox runs measured:
+
+| canonical + intermethod ordinary SSA | changed images/s | transition intervals/s |
+| --- | ---: | ---: |
+| run 1 | 22.62 | 21.49 |
+| run 2 | 21.81 | 20.72 |
+| run 3 | 24.01 | 22.81 |
+| **median** | **22.62** | **21.49** |
+
+All three used first hash `4025147891`, had zero page/console errors, and
+recorded exactly one structured safe point. This passes the ≥20 changed
+images/s acceptance threshold. The Firefox profiler accepts
+`PROBE_ORDINARY_ADAPTIVE=0/1` and reports the ordinary-entry counter, allowing
+same-bundle differential runs. Reports:
+
+- `/tmp/dekobloko-ordinary-canonical-firefox.json`
+- `/tmp/dekobloko-ordinary-canonical-firefox-2.json`
+- `/tmp/dekobloko-ordinary-canonical-firefox-3.json`
+
+The focused JIT suite passes 610/610, including an exact safe-point test for
+the loop-header PC, induction local, live operand join, and absence of a
+generator continuation, plus canonical `Frame` completion. The scheduler suite
+passes 36/36. The production bundle builds successfully and is served as
+`05df8314b0385f2b9e2ac5415546d490a1421f77d932d499c5fda907bd6a4c03`.
+
+This is a verified breakthrough and acceptance result, but not yet a 30 FPS
+Firefox result. Relative to the feature-off control, the median changed-image
+rate improved by 86.6% and the median transition-interval rate by 86.6%. The
+remote Firefox profile must still be reloaded onto the new hash and measured
+separately; the previous 2 FPS report came from the older `e899c8…` bundle.
+
+### Remote Firefox 151 still at 2 FPS: alpha rectangle attribution
+
+The remote profile subsequently reproduced 1.8–2.9 FPS on the accepted
+ordinary-SSA bundle (`05df8314…`). This was not stale code: the session used
+the expected hash, structured mode, and a visible focused tab. Its lightweight
+JavaScript calibration reached 166.67 million iterations/s versus 500 million/s
+on the local Firefox 146 acceptance machine. Canvas upload averaged about
+6.8 ms per presented image, so presentation still could not explain a
+350–550 ms image interval.
+
+A cumulative-timing delta over a 60-second visible window attributed an
+estimated 43.4 seconds to one structured wrapper, with 13 sampled entries
+averaging 26.08 ms. A second structured body accounted for an estimated
+11.6 seconds. The first wrapper's bytecodes select one of a clear, direct
+image, or alpha-image path; its nested alpha path is a two-loop primitive
+integer-array rectangle with transparent-pixel skips and packed RGB
+multiplication. Multiple such rectangles are drawn per changed image, turning
+the per-call cost into the observed frame rate.
+
+The JIT now recognizes that inner leaf by its complete descriptor, opcode
+sequence, and four packed-channel constants. The direct kernel:
+
+- prevalidates source and destination rectangles and then uses scalar raw-array
+  loops;
+- retains a bytecode-order slow path for null/bounds failures and partial
+  writes;
+- does not touch an invalid destination for a transparent source pixel;
+- restores the exact invoke PC and all ten operands if it throws;
+- contains no declaring-class or method-name condition.
+
+The first production attempt exposed a generic lifecycle hole: the original
+method matched the intrinsic, but its caller compiled while the owner was
+loaded and not yet published as initialized, so compile-time binding was
+skipped permanently. The retained version installs this one complete verified
+shape behind a runtime class-initialization guard. Before publication it
+deoptimizes before pixel effects; the same compiled caller enters the direct
+kernel after publication.
+
+The focused JIT suite passes 626/626. A direct original-JAR compile in the
+`LOADED` state contains both the direct alpha kernel and initialization guard.
+Node measured 29.56 FPS versus 29.20 immediately before this change. Local
+Firefox's early window measured 24.48 changed images/s, but simple mode on that
+machine never takes the alpha branch (the counter remains zero), so it cannot
+validate the remote-only hot phase. The corrected production artifact is
+`151ab7cb9110d9fd36735a246ce6c613661f3cf681bfa39ada5387982eb3893b`;
+remote Firefox 151 measurement at the same logo/menu phase remains required.
+
+### Telemetry correction: the 2 FPS path uses opaque transparent copies
+
+Remote session `ms1k0el9-pc7uk6un` removed the ambiguity. It loaded exactly
+`151ab7cb…`, used Firefox 151 on the reported eight-core machine, remained
+visible, restored all 35 browser-cached assets, and ran structured SSA without
+timing profiling. At the animated phase it reported 2.3 FPS while canvas upload
+accounted for only about 2 ms per presented image. Across 3.46 million
+structured-region entries, however, the alpha-rectangle counter remained zero.
+The previous timing attribution to the wrapper was correct, but the inference
+that its alpha branch was active was not.
+
+The active wrapper branch passes the sentinel opacity value and calls a
+different leaf: a transparent-pixel `int[]` source copy with a four-pixel
+unrolled inner loop. The JIT now recognizes this leaf through its descriptor,
+complete normalized opcode sequence, verified CFG/stack depths, and
+rethrow-only handler proof. It does not inspect the declaring class or method
+name. Its direct scalar kernel prevalidates each row, copies only nonzero source
+pixels, and retains a bytecode-order slow path for null/bounds faults and
+partial writes. Structured callers emit it positionally, with the same
+pre-effect class-initialization guard and exact invoke-state reconstruction used
+by the alpha kernel.
+
+The original JAR contains two methods with the same descriptor. Structural
+recognition accepts only the transparent-copy body and rejects its
+non-equivalent sibling. The focused JIT suite passes 643/643 and the
+scheduler/browser configuration suite passes 38/38. In the Node menu run the
+new counter reached 161,970 with zero slow paths, proving activation, but the
+fixed-window result was 28.81 FPS. This is not a Node performance breakthrough
+relative to the previous roughly 29 FPS runs. The production artifact
+`0f002782e97d501cd766890c379d1b1c1c91f7de5cdb3cf12c2c6e19271ae503`
+is deployed with both activation counters in browser telemetry; a fresh remote
+Firefox session is required to measure whether the much slower Firefox guest
+body benefits materially.
+
+Remote session `ms1kwhs4-mbswuyeu` then verified that artifact and the direct
+kernel: the counter rose from zero to 120,683 with no slow paths. The displayed
+FPS still oscillated from roughly 3 to 12, while presentation deltas over the
+visible stable window were about 9–10 changed images/s. Cumulative canvas upload
+and copy time remained small relative to wall time. Thus the new leaf is real
+and removes work from the correct active branch, but it is not the dominant
+remaining logo cost.
+
+To locate that remaining cost without returning to invocation profiling, the
+sampled generated-body timer now chooses its 1-in-128 sample before formatting
+the guest method identity. Unsampled entries no longer allocate an
+owner/name/descriptor string and perform no clock read. The browser diagnostic
+page enables this elapsed-time sampler by default (it can be disabled with
+`?timings=0`) and reports cumulative sampled rows through telemetry. Artifact
+`30af4729b25d3c5b2c2358335442b719c7755ab6e0baa0b829e573d469744b9a`
+contains this profiler; the focused JIT suite passes 645/645.
+
+### Remote time profile: reference-returning calls retained Frames
+
+Remote session `ms1le776-xmmcahpx` loaded `30af4729…` with the low-overhead
+timer. Its visible logo window averaged roughly 7–8 presented images/s and
+still dipped to 3 FPS. The recurring time was no longer concentrated in the
+fused gradient wrapper. It appeared across recursive UI/component traversal
+bodies: container draw methods, child-list iteration, and virtual child calls.
+Audio mixing and byte conversion were measurable but represented only a
+minority of the wall time.
+
+Inspection of the generated call adapters exposed a generic asymmetry.
+Structurally proven acyclic callees already advertise
+`jvmFramelessPositional`, but the adapter accepted that proof only for primitive
+return types. The hot child-list cursor methods return object references, so
+every `next()` call still acquired, initialized, pushed, popped, and cached a
+child `Frame`, despite having no continuation or scheduler safe point.
+
+The positional adapter now permits reference returns only for the immediate
+acyclic frameless body. Adaptive/suspendable reference-returning bodies retain
+the canonical framed path because their reference liveness across a
+continuation is not yet proven. Exceptions from the immediate body still
+restore the omitted child frame before normal JVM dispatch. Selection uses the
+callee's verified structural capability and return category, never a guest
+class or method name.
+
+The original-JAR Node menu run exercised 1,131,525 newly frameless reference
+calls. It measured 28.83 FPS versus 28.81 before the change, so there is no
+Node performance claim. The focused JIT suite passes 650/650 and the
+scheduler/browser configuration suite passes 38/38. Production artifact
+`000b0e6f9fe0e20de36d87bbe38b47114c50bb6b937ed923ad9adb6f1dbc2355`
+is deployed with a telemetry counter for remote activation and measurement.
+
+Remote session `ms1lyu7e-w3uofl1b` verified 68,760 frameless reference calls by
+213 seconds with no runtime error. The first post-frame sample was 1.8 FPS and
+the displayed value continued to dip to 3 FPS, but the matched 123–213 second
+presentation window reached 8.51 changed images/s versus 7.93 for the preceding
+bundle (+7.3%). The optimization is therefore retained, but the modest gain and
+deep transient dips are nowhere near the 30 FPS requirement.
+
+That run also exposed a profiler blind spot: a frameless positional call no
+longer passes through `runGeneratedFrame`, so its elapsed time was absent from
+the sampled method table. Artifact
+`e02cd6f1e7b2650e5435fc45b14d6f1975c793f041e553afc9a449ef1347fb0c`
+extends the same preselected 1-in-128 timer into frameless positional bodies.
+The method identity is already bound in the call plan; unsampled calls allocate
+no identity string and read no clock. This allows telemetry to attribute the
+previously missing majority of generated intermethod time. The focused JIT
+suite passes 651/651.
+
+### The 3 FPS logo path includes a clipped framebuffer gradient
+
+The extended timer closed the frameless-call attribution gap on remote Firefox
+151. In session `ms1mgy7o-zfi52cyk`, the largest sampled inclusive bodies were
+`lj.a(IIIZ)V` (1,368 ms across 41 samples), `ai.e(B)V` (799 ms across 12
+samples), and `dl.a(BZLck;II)V` (531 ms across 17 samples). These values
+overlap: the logo renderer divides the 640x480 surface into eight clipped
+regions, its image helper enters `lj.a` for the sentinel image, and `lj.a`
+performs the background, logo, particle, and optional overlay work.
+
+Following that chain to its leaves identified a previously generic framebuffer
+operation. A six-int static method computes a 16.16 vertical interpolation
+phase, clips a rectangle against six static surface values, and stores one
+interpolated RGB value across every pixel of each scanline. The generated guest
+body still executed its inner pixel loop as scalar JVM operations.
+
+The JIT now recognizes this operation using only its `(IIIIII)V` descriptor,
+the complete normalized opcode and packed-channel constant sequence, verified
+CFG/stack depths and transparent handlers, and repeated static-field descriptor
+and identity relationships. No guest class, method, or field name participates.
+Against the original obfuscated JAR, the matcher accepts only the gradient
+member and rejects the three other methods with the same descriptor. It also
+accepts the equivalent recompiled class.
+
+The direct kernel preserves clipping phase, Java integer overflow and signed
+shifts, division-by-zero ordering, null behavior, and partial writes before a
+bounds exception. The focused JIT suite passes 657/657 and the
+scheduler/browser configuration suite passes 36/36.
+
+The first original-JAR Node menu run executed 7,128 gradient kernels and
+measured 30.13 changed images/s over 20 seconds, versus the prior 28.83 result.
+Hoisting normal-array null and bounds checks from every pixel to a proven range
+per scanline then measured 31.56 changed images/s, with 7,429 gradient calls
+and zero slow paths. That is about +9.5% over the pre-change run; these are
+adjacent fixed-window runs, not a multi-run median. The malformed-array path
+still performs checks per store so that partial-write exception behavior is
+unchanged.
+
+This is useful but is not a 3-to-30 FPS explanation on its own. Production
+artifact
+`1bdd8898aa4fe0d3ae33e448e1a524e914e058fa38499418b2aac13ddccbf052`
+is served on port 3771 with `clippedGradientRuns` and
+`clippedGradientSlowPaths` telemetry. A fresh remote logo run must verify both
+activation and the Firefox delta before the next leaf is selected.
+
+### The post-gradient 3 FPS report was asset-worker starvation
+
+Remote session `ms1nqzxr-i2e2u13t` loaded the exact gradient artifact and
+verified 9,756 clipped-gradient entries with zero slow paths. The manual report
+still showed 2.4 FPS, but it was not a steady logo or menu sample: the loader
+was at `Preparing game assets · block 9 of 9`. Ten-second deltas show the
+distinction:
+
+- before the heavy block, presentation sustained roughly 11–12 changed
+  images/s;
+- from 10:39 onward, several complete ten-second intervals presented no image
+  while runnable asset code continued;
+- canvas upload remained about 8 ms per presented image and therefore did not
+  explain the multi-second gaps;
+- sampled generated asset entries reached 337–397 ms.
+
+The scheduler already had a 16 ms wall-clock deadline, but structured SSA
+coarsened nested counted loops and polled only their outer loop. A 100,000-trip
+decoder loop could consequently complete atomically before the deadline was
+observed. This was a generic compiler scheduling bug, not a Dekobloko renderer
+identity.
+
+Effectful structured methods now retain polls in every nested loop. Their poll
+interval scales from verified instruction, invocation, allocation, and nested
+loop structure; fully bounded call-free numeric kernels retain the atomic
+optimization. The original decoder shape now compiles with 33 loop headers,
+zero coarse loops, and a 64-backedge poll budget. No guest method or class name
+participates.
+
+The focused JIT suite passes 661/661 and scheduler/browser tests pass 36/36.
+Node steady menu performance remained 31.71 changed images/s. Time to the end
+of that fixed menu window increased from 97.1 to 116.6 seconds because other
+Java threads and loading animation now receive CPU during asset decoding.
+Therefore this is explicitly a responsiveness/fairness fix, not a loading-time
+optimization. Artifact
+`ecba84a376fdd704ee038a7f78d201d695cf5dbc49102973be3fa9219f31b49e`
+is deployed on port 3771 for a fresh Firefox paint-gap measurement.
+
+### Fair scheduling exposed an oversized audio state machine
+
+Session `ms1otmbj-pm96jhyn` loaded the fairness artifact. Structured safe
+points rose from 9 to 49, confirming activation, but the loader remained at
+asset block 9 after 22 minutes and the reported rate was still 1.5–2.7 FPS.
+The active worker stack had moved beyond decompression into audio generation:
+`ia.c()Z`, called through the audio-buffer chain.
+
+This method is a structurally exceptional compiler input: 2,675 bytecodes,
+419 field reads, 289 primitive-array accesses, eight loops, and fifteen calls.
+The structured JavaScript renderer emits one 733 KB generator for it. Because
+the method remains active across repeated buffer work, completed-entry timing
+does not attribute its in-progress wall time.
+
+The existing Wasm tier can compile 369 of its 380 CFG blocks into a 58 KB
+partial module. It was never attempted because the global JavaScript-first
+policy preferred any available whole-method JavaScript body. The policy now
+tries Wasm first for methods selected only by:
+
+- at least 2,048 verified bytecode instructions;
+- at least one backward branch;
+- non-constructor method identity.
+
+Smaller renderer methods retain JavaScript-first behavior, and unsupported
+Wasm regions retain exact materialized fallback. Guest class and method names
+do not participate.
+
+The focused JIT suite passes 666/666 and scheduler/browser tests pass 36/36.
+Node verified two selected oversized methods and 148,534 Wasm entries. Its
+time-to-menu was statistically neutral (115.7 versus 116.6 seconds), while the
+menu window moved from 31.71 to 30.83 changed images/s. This is not a Node
+performance claim; it is a targeted test of Firefox's severe giant-generator
+pathology. Artifact
+`13c6b93e37a5da376dace8d00c8c340ec07a29b3bb838ca9b8e8492d635bee83`
+is deployed with aggregate `wasmRuns` and `oversizedWasmFirstMethods`
+telemetry.
+
+### Native-long loop routing removes the Firefox asset stall
+
+Remote session `ms1tqx6n-tave1q09` made the late startup gap precise. The
+loader remained at its generic asset label for more than 36 minutes, but the
+active JVM stack was sound-effect generation:
+
+`bi.b()Lud;` → `bi.a()[B` → `kj.a(II)[I`.
+
+The leaf is an 824-bytecode sample synthesizer with repeated array operations,
+double arithmetic, and exact Java `long` fixed-point operations. Structured
+JavaScript rejected it at `i2l`, so Firefox repeatedly entered the generic
+generated dispatcher and represented the long values with `BigInt`. This was
+not ZIP inflation, Canvas upload, or AWT drawing time.
+
+The tier policy now recognizes this generic shape without any guest owner,
+method, or descriptor identity:
+
+- a verified backward branch;
+- at least 256 bytecode instructions;
+- at least eight operations from the native-Wasm `i64` arithmetic/conversion
+  set.
+
+Such methods try Wasm before whole-method JavaScript. Small helpers retain the
+ordinary JavaScript policy, constructors and class initializers retain their
+atomic lifecycle rules, and unsupported Wasm regions still spill exact JVM
+state to the existing fallback. `JVM_DISABLE_LONG_ARITHMETIC_WASM_FIRST=1`
+provides a differential control, while
+`longArithmeticWasmFirstMethodCount` verifies activation.
+
+The checked-in extracted synthesizer benchmark compares the actual
+`kj.a(II)[I` bytecode under both policies. At 22,050 samples its three-run
+median improved from 21.21 ms to 9.83 ms (2.16×), and the output checksum was
+identical (`1710133148`). At 2,000 samples it improved from 7.46 ms to 1.44 ms
+(5.18×). The complete Node launch was neutral: time-to-menu was 118.3 seconds
+and the menu window was 30.38 FPS, versus the recent 115.7-second/30.83-FPS
+run. The isolated win therefore must not be presented as a Node whole-game
+speedup.
+
+The clean Firefox 1509 run against artifact
+`c2bbfe1538cc1086f9e5067c29d865526c6c87b50592dbe808b5ac283466745e`
+reached the first visible frame in 9.87 seconds. The policy selected one
+long-arithmetic method by that point. Three clean standard expected-hash
+20-image runs measured 20.01, 23.55, and 19.35 changed images/s: median 20.01,
+with zero page or console errors in every run. After the startup window,
+ten-second telemetry intervals sustained 43–50 presented images/s. (The
+acceptance probe counts sampled image changes, while the side panel counts all
+presented images.) This also resolves the apparent 1–2 FPS “main menu”
+contradiction:
+the earlier report was captured while asset work was still active, not at a
+settled menu ceiling.
+
+The browser launcher had an independent progress-state bug. Lazy compressed
+blocks processed after the first visible frame could call the startup progress
+hook again, replacing the completed `Game ready` status with the stale 95%
+asset label. The hook now becomes display-inert after the first visible frame;
+the compression logging remains available, but it cannot regress the completed
+loader.
+
+### The remote 2 FPS logo is blocked by a table-building class initializer
+
+Session `ms1w94du-180w4qto` on the remote eight-core Firefox machine loaded the
+correct `c2bbfe…` artifact and reproduced the report. After the first visible
+frame at 54.4 seconds it briefly reported 2.9 FPS, then stopped presenting for
+long intervals. Canvas was not the cause: only 339 ms total had been spent
+uploading all 46 images at the 81-second diagnostic.
+
+The active game thread was still performing asset initialization. Its
+innermost frame was `kj.<clinit>()V`, reached through sound-bank construction.
+That 64-bytecode initializer creates eight arrays and fills two 32,768-element
+lookup tables through repeated random-number and sine calls. The JVM had a
+blanket rule excluding every class initializer from every generated tier, so
+Firefox ran the table loops bytecode-by-bytecode while the logo shared the same
+game thread.
+
+Class initializer compilation is now admitted only by a lifecycle-specific
+structural proof:
+
+- the reserved JVM `<clinit>()V` lifecycle method is static, handler-free,
+  monitor-free, synchronously compilable, and contains a real backedge;
+- every static write resolves to the class currently being initialized;
+- instance-field writes, explicit throws, interface/dynamic invokes, and
+  non-constructor special invokes are rejected;
+- debugger/tracing entry still takes the canonical path;
+- generated return calls the normal `completeClassInitialization` hook, so the
+  class is published and waiters wake only after every generated effect;
+- exceptions retain the normal unwinding path and mark the class erroneous;
+- `JVM_DISABLE_HOT_LOOP_CLASS_INITIALIZERS=1` restores the interpreter for
+  differential measurement.
+
+The SSA renderer also gained ordinary `lconst_0`/`lconst_1` scalar support,
+which is required to feed exact Java long constructor operands without
+materializing the bytecode stack. No guest class, field, or ordinary method
+name participates in selection.
+
+The extracted original initializer produces identical checksums for every
+static array under both tiers, and both paths publish the same `INITIALIZED`
+state. Node's isolated median regresses from 69.45 ms interpreted to 116.93 ms
+structured because Node's burst interpreter is exceptionally fast and the
+generated safe-point/call boundaries nearly double scheduler entries. This is
+therefore a targeted Firefox experiment, not a Node performance claim. Artifact
+`7a476e62019758155ad45bb3ed2495c4a555bfa0e3cb1ee2a66fb59044d787ac`
+is deployed with the `hotLoopClassInitializers` activation counter; the remote
+logo run decides whether the browser's multi-second interpreter cost is
+removed.
+
+That remote decision was negative. Session `ms1yfzap-1gtwlpwt` activated two
+generated class initializers but, after 33 minutes, had presented only 16
+images while 72,331 dirty paints accumulated and were coalesced. The generated
+initializer monopolized the browser task queue instead of shortening the
+phase. The experiment was removed and the deployed runtime returned byte-for-
+byte to artifact `c2bbfe1538cc1086f9e5067c29d865526c6c87b50592dbe808b5ac283466745e`.
+No class initializer fast path remains enabled.
+
+Validation:
+
+- `timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js`:
+  681/681 passing.
+- `timeout 90s node node_modules/tape/bin/tape
+  test/schedulerPerformance.test.js test/browserBundleConfig.test.js`:
+  38/38 passing.
+- `npm run build:bundle`: successful with the four existing webpack size and
+  dynamic-require warnings.

@@ -36,6 +36,9 @@ const structuredSplitOverride = process.env.PROBE_STRUCTURED_SPLIT === undefined
 const structuredDeferredCallsOverride =
   process.env.PROBE_STRUCTURED_DEFERRED_CALLS === undefined
     ? null : process.env.PROBE_STRUCTURED_DEFERRED_CALLS === '1';
+const ordinaryAdaptiveOverride =
+  process.env.PROBE_ORDINARY_ADAPTIVE === undefined
+    ? null : process.env.PROBE_ORDINARY_ADAPTIVE === '1';
 const rendererPipelineOverride = process.env.PROBE_RENDERER_PIPELINE === undefined
   ? null : process.env.PROBE_RENDERER_PIPELINE === '1';
 const handwrittenFusedOverride = process.env.PROBE_HANDWRITTEN_FUSED === undefined
@@ -149,7 +152,7 @@ function animationEstimate(changes) {
       collectSchedulerTimings, schedulerSampleRate, collectExclusiveTimings, exclusiveRoot,
       timingSampleRate, timingFilter, methodTraceKey,
       fusedRegions, directFusedCalls, scalarLoops, scalarSsa, structuredSsa,
-      structuredSplit, structuredDeferredCalls,
+      structuredSplit, structuredDeferredCalls, ordinaryAdaptive,
       rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache, wasmStructured }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
@@ -186,6 +189,16 @@ function animationEstimate(changes) {
         structuredSsaCompiledLoops: jit.structuredSsa?.compiledLoopCount || 0,
         structuredSsaSplitMethods: jit.structuredSsa?.splitMethodCount || 0,
         structuredSsaSplitBlocks: jit.structuredSsa?.splitBlockCount || 0,
+        ordinaryAdaptiveFrameless:
+          jit.ordinaryAdaptiveFramelessRunCount || 0,
+        alphaMaskedColorBlit: jit.alphaMaskedColorBlitRunCount || 0,
+        alphaMaskedColorBlitSlowPaths:
+          jit.alphaMaskedColorBlitSlowPathCount || 0,
+        transparentIntBlit: jit.transparentIntBlitRunCount || 0,
+        transparentIntBlitSlowPaths:
+          jit.transparentIntBlitSlowPathCount || 0,
+        referenceFramelessPositional:
+          jit.referenceFramelessPositionalRunCount || 0,
         structuredSsaMethods: [...(jit.structuredSsaMethodRunCounts || new Map()).entries()],
         scalarLoopMethods: [...jit.scalarLoopMethodRunCounts.entries()],
         runner: jit.runnerRunCount,
@@ -337,6 +350,10 @@ function animationEstimate(changes) {
           jvm.jit.structuredSsa.deferredCallMaterializationEnabled =
             structuredDeferredCalls;
         }
+        if (jvm?.jit && ordinaryAdaptive !== null) {
+          jvm.jit.ordinaryAdaptiveFramelessPositionalEnabled =
+            ordinaryAdaptive;
+        }
         const pixels = [...(jvm?._softCanvases || [])][0]?._pixels;
         if (pixels) {
           if (probe.surfaceAt === null) probe.surfaceAt = now - probe.started;
@@ -383,6 +400,7 @@ function animationEstimate(changes) {
       structuredSsa: structuredSsaOverride,
       structuredSplit: structuredSplitOverride,
       structuredDeferredCalls: structuredDeferredCallsOverride,
+      ordinaryAdaptive: ordinaryAdaptiveOverride,
       rendererPipeline: rendererPipelineOverride,
       handwrittenFused: handwrittenFusedOverride,
       wasmJit: wasmJitOverride,
@@ -446,6 +464,16 @@ function animationEstimate(changes) {
         structuredSsaCompiledLoops: jit?.structuredSsa?.compiledLoopCount || 0,
         structuredSsaSplitMethods: jit?.structuredSsa?.splitMethodCount || 0,
         structuredSsaSplitBlocks: jit?.structuredSsa?.splitBlockCount || 0,
+        ordinaryAdaptiveFrameless:
+          jit?.ordinaryAdaptiveFramelessRunCount || 0,
+        alphaMaskedColorBlit: jit?.alphaMaskedColorBlitRunCount || 0,
+        alphaMaskedColorBlitSlowPaths:
+          jit?.alphaMaskedColorBlitSlowPathCount || 0,
+        transparentIntBlit: jit?.transparentIntBlitRunCount || 0,
+        transparentIntBlitSlowPaths:
+          jit?.transparentIntBlitSlowPathCount || 0,
+        referenceFramelessPositional:
+          jit?.referenceFramelessPositionalRunCount || 0,
         structuredSsaLastRejection: jit?.structuredSsa?.lastRejectionReason || null,
         structuredSsaLastCompileError: jit?.structuredSsa?.lastCompileError?.stack ||
           jit?.structuredSsa?.lastCompileError?.message || null,
@@ -491,6 +519,7 @@ function animationEstimate(changes) {
     result.structuredSsaEnabled = structuredSsaOverride;
     result.structuredSplitEnabled = structuredSplitOverride;
     result.structuredDeferredCallsEnabled = structuredDeferredCallsOverride;
+    result.ordinaryAdaptiveEnabled = ordinaryAdaptiveOverride;
     result.rendererPipelineEnabled = rendererPipelineOverride;
     result.wasmJitEnabled = wasmJitOverride;
     result.wasmFieldCacheEnabled = wasmFieldCacheOverride;
@@ -576,6 +605,22 @@ function animationEstimate(changes) {
         scalarSsa: finish.scalarSsa - initial.scalarSsa,
         structuredSsa: finish.structuredSsa - initial.structuredSsa,
         structuredSsaSafePoints: finish.structuredSsaSafePoints - initial.structuredSsaSafePoints,
+        ordinaryAdaptiveFrameless:
+          finish.ordinaryAdaptiveFrameless -
+          initial.ordinaryAdaptiveFrameless,
+        alphaMaskedColorBlit:
+          finish.alphaMaskedColorBlit - initial.alphaMaskedColorBlit,
+        alphaMaskedColorBlitSlowPaths:
+          finish.alphaMaskedColorBlitSlowPaths -
+          initial.alphaMaskedColorBlitSlowPaths,
+        transparentIntBlit:
+          finish.transparentIntBlit - initial.transparentIntBlit,
+        transparentIntBlitSlowPaths:
+          finish.transparentIntBlitSlowPaths -
+          initial.transparentIntBlitSlowPaths,
+        referenceFramelessPositional:
+          finish.referenceFramelessPositional -
+          initial.referenceFramelessPositional,
         structuredSsaMethods: ranked(subtractEntries(
           finish.structuredSsaMethods, initial.structuredSsaMethods,
         )),

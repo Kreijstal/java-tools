@@ -15,7 +15,12 @@ module.exports = {
       const className = lineClass._classData.ast.classes[0].className;
 
       if (className === "javax/sound/sampled/SourceDataLine") {
-        // Create a basic SourceDataLine object
+        const dataLineInfo = info.fields["javax/sound/sampled/DataLine$Info"];
+        const formats = dataLineInfo && dataLineInfo.formats;
+        const formatElements = formats && (formats.elements || formats);
+        // Preserve the format negotiated through DataLine.Info. Java Sound
+        // clients commonly call Line.open() with no arguments after getLine();
+        // the concrete SourceDataLine must still open with this format.
         const sourceDataLine = {
           type: "javax/sound/sampled/SourceDataLine",
           fields: {},
@@ -24,6 +29,11 @@ module.exports = {
           lockOwner: null,
           lockCount: 0,
           waitSet: [],
+          requestedFormat: formatElements && formatElements[0] || null,
+          requestedBufferSize: dataLineInfo &&
+            Number(dataLineInfo.maxBufferSize) >= 0
+            ? Number(dataLineInfo.maxBufferSize)
+            : null,
         };
         return sourceDataLine;
       }
