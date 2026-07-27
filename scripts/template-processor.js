@@ -12,12 +12,14 @@ function processDebugInterfaceTemplate(htmlContent) {
 
     // Remove old simulated script block to prevent conflicts
     htmlContent = removeOldSimulatedScript(htmlContent);
+    htmlContent = removeLegacyInlineWorkbenchScript(htmlContent);
 
     // Fix ACE editor CDN to use local copy
     htmlContent = fixAceEditorCDN(htmlContent);
 
     // Add browser-specific enhancements
     htmlContent = addBrowserUIScript(htmlContent);
+    htmlContent = addWorkbenchAssets(htmlContent);
     htmlContent = addXtermSupport(htmlContent);
     htmlContent = addBreakpointUI(htmlContent);
     htmlContent = updateFileInputs(htmlContent);
@@ -26,6 +28,21 @@ function processDebugInterfaceTemplate(htmlContent) {
 
     console.log('  ✓ Template processed successfully');
     return htmlContent;
+}
+
+function removeLegacyInlineWorkbenchScript(htmlContent) {
+    return htmlContent.replace(
+        /\s*<script>\s*\/\/ Real JVM debug controller integration[\s\S]*?<\/script>\s*(?=<\/body>)/,
+        '\n'
+    );
+}
+
+function addWorkbenchAssets(htmlContent) {
+    const assets = `
+    <link rel="stylesheet" href="./workbench.css">
+    <script src="./workbench-ui.js" defer></script>
+    `;
+    return htmlContent.replace('</head>', assets + '</head>');
 }
 
 /**

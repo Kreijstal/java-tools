@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>JVM Debug API Example</title>
+  <title>Java Tools Workbench</title>
   <link rel="icon" href="data:,">
     <!-- Include Ace Editor from CDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.43.3/ace.js"></script>
@@ -508,98 +508,292 @@
     </style>
 </head>
 <body>
-    <h1>🔍 JVM Debug API Example</h1>
-    <p>This example demonstrates how to use the JVM debug API from JavaScript/Web applications.</p>
-    
-    <div class="panel controls">
-        <h3>Debug Controls</h3>
-        <div id="status" class="status">Ready - No program loaded</div>
-        
-        <!-- Class Source -->
-        <h4>📚 Sample Classes</h4>
-        <div class="button-group source-row">
-            <div class="source-toggle">
-                <label><input type="radio" name="classSource" value="sample" checked onclick="setClassSource('sample')"> Sample</label>
-                <label><input type="radio" name="classSource" value="file" onclick="setClassSource('file')"> File</label>
-            </div>
-            <select id="sampleClassSelect" style="color: #d4d4d4; background-color: #1e1e1e; border: 1px solid #3e3e42; border-radius: 3px; padding: 6px; font-family: inherit; font-size: 12px; margin-right: 10px;">
-                <option value="">Loading sample classes...</option>
-            </select>
-            <input type="file" id="classFileInput" accept=".class,.jar" class="is-hidden" style="margin-right: 10px;" title="Upload .class or .jar files">
-            <select id="jarMainClassSelect" class="is-hidden" aria-label="JAR entry class" title="Choose a class from the loaded JAR"></select>
-            <button onclick="loadSelectedClass()" id="loadBtn">Load</button>
-            <button onclick="runProgram()" id="runBtn" disabled title="Run without debugging">▶ Run</button>
-            <button onclick="startDebugging()" id="debugBtn" disabled>Start &amp; Break</button>
-        </div>
-        
-        <!-- Debug Execution Controls -->
-        <div class="debug-row is-hidden">
-            <div class="debug-controls">
-                <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>▶️</button>
-                <button onclick="pauseExecution()" id="pauseBtn" title="Pause" disabled>⏸</button>
-                <button onclick="stepOver()" id="stepOverBtn" title="Step Over (F10)" disabled>↷</button>
-                <button onclick="stepInto()" id="stepIntoBtn" title="Step Into (F11)" disabled>↪️</button>
-                <button onclick="stepOut()" id="stepOutBtn" title="Step Out (Shift+F11)" disabled>↩️</button>
-                <button onclick="finish()" id="finishBtn" title="Finish Method" disabled>⏩</button>
-                <button onclick="stepInstruction()" id="stepInstructionBtn" title="Step Instruction" disabled>↯</button>
-                <button onclick="rewind()" id="rewindBtn" title="Rewind (Undo Last Step)" disabled>⏪</button>
-            </div>
-
-            <!-- Breakpoints and State Management -->
-            <div class="button-group breakpoint-controls">
-            <input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" min="0">
-            <button onclick="setBreakpoint()">Set Breakpoint</button>
-            <button onclick="clearAllBreakpoints()">Clear All Breakpoints</button>
-            <button onclick="serializeState()" title="Serialize State">💾</button>
-            <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">📂</button>
-            <input type="file" id="stateFileInput" style="display: none;" accept=".json">
-        </div>
-        </div>
-    </div>
-
-    <!-- Main UI Layout with IDE-style interface -->
-    <div class="main-container">
-        <!-- Left Column: Debugger -->
-        <div class="debugger-panel">
-            <div class="panel method-browser">
-                <h3>Method Browser</h3>
-                <input type="text" id="method-search" class="method-search" placeholder="Search classes or methods">
-                <div id="method-tree" class="method-tree">Loading classes...</div>
-            </div>
-            <div class="panel disassembly-panel">
-                <h3>Disassembly View</h3>
-                <div id="disassembly-editor"></div>
-            </div>
-        </div>
-
-        <!-- Right Column: State & Output -->
-        <div class="state-panel-stack">
-            <div class="panel">
-                <h3>Execution State</h3>
-                <div id="executionState" class="state-display">Not started</div>
-                <div class="state-item" style="margin-top: 10px;">
-                  <span class="key">Thread:</span>
-                  <select id="threadSelect" class="value" onchange="selectThread()"></select>
+    <main class="app-shell">
+        <header class="app-header">
+            <div class="brand">
+                <div class="brand-mark" aria-hidden="true">J::</div>
+                <div>
+                    <h1>Java Tools Workbench</h1>
+                    <p>Open a JAR, inspect and rebuild its classes, then run or debug it in the browser.</p>
                 </div>
             </div>
-            <div class="panel">
-                <h3>Stack</h3>
-                <div id="stackDisplay" class="state-display">Empty</div>
+            <div class="header-actions">
+                <div id="status" class="status">Ready - No program loaded</div>
+                <button onclick="runProgram()" id="runBtn" disabled title="Run without debugging">Run</button>
+                <button onclick="startDebugging()" id="debugBtn" class="primary-action" disabled>Debug</button>
             </div>
-            <div class="panel">
-                <h3>Locals</h3>
-                <div id="localsDisplay" class="state-display">No locals</div>
+        </header>
+
+        <nav class="menu-bar" aria-label="Application menu">
+            <details id="fileMenu" class="app-menu">
+                <summary>File</summary>
+                <div class="app-menu-popover" role="menu">
+                    <button id="newJavaFileBtn" type="button" role="menuitem">New Java file <kbd>Ctrl+N</kbd></button>
+                    <button id="newFolderBtn" type="button" role="menuitem">New folder…</button>
+                    <button id="openFileMenuBtn" type="button" role="menuitem">Open file… <kbd>Ctrl+O</kbd></button>
+                    <button id="openSampleMenuBtn" type="button" role="menuitem">Open built-in sample…</button>
+                    <a href="./data.zip" download role="menuitem">Download sample classes</a>
+                    <span class="menu-separator" role="separator"></span>
+                    <button id="saveFileBtn" type="button" role="menuitem" disabled>Save <kbd>Ctrl+S</kbd></button>
+                    <button id="saveAsFileBtn" type="button" role="menuitem" disabled>Save As… <kbd>Ctrl+Shift+S</kbd></button>
+                    <button id="closeFileBtn" type="button" role="menuitem" disabled>Close file <kbd>Ctrl+W</kbd></button>
+                </div>
+            </details>
+            <button id="quickOpenBtn" class="menu-command" type="button">Open…</button>
+            <button id="quickSaveBtn" class="menu-command" type="button" disabled>Save</button>
+            <span class="menu-document" id="activeDocumentPath">No file open</span>
+        </nav>
+
+        <section class="target-bar" aria-label="Java target">
+            <div class="target-controls">
+                <span class="target-label">Workspace</span>
+                <h4 class="visually-hidden">Java program source</h4>
+                <details id="workspaceExplorer" class="workspace-explorer">
+                    <summary>
+                        <span>Project files</span>
+                        <span id="workspaceEntryCount" class="sample-count">0</span>
+                    </summary>
+                    <div class="workspace-tree-popover">
+                        <div id="workspaceTree" class="workspace-tree">The workspace is empty.</div>
+                        <div class="workspace-tree-footer">
+                            <span id="workspaceTreeStatus">In-memory browser filesystem</span>
+                            <button id="workspaceNewFolderBtn" type="button">New folder…</button>
+                        </div>
+                    </div>
+                </details>
+                <div class="source-toggle">
+                    <label><input type="radio" name="classSource" value="file" onclick="setClassSource('file')"> Uploaded file</label>
+                    <label><input type="radio" name="classSource" value="sample" checked onclick="setClassSource('sample')"> Built-in samples</label>
+                </div>
+                <select id="sampleClassSelect" class="visually-hidden" aria-label="Selected sample class">
+                    <option value="">Loading sample classes…</option>
+                </select>
+                <details id="sampleCatalog" class="sample-catalog">
+                    <summary><span id="sampleCatalogLabel">Loading runnable samples…</span></summary>
+                    <div id="sampleCatalogTree" class="sample-catalog-tree"></div>
+                </details>
+                <label class="file-picker" for="classFileInput">
+                    <span>Choose a file</span>
+                    <input type="file" id="classFileInput" accept=".class,.jar,.java,.j" title="Open Java, assembly, class, or JAR files">
+                </label>
+                <select id="jarMainClassSelect" class="is-hidden" aria-label="JAR entry class" title="Choose a class from the loaded JAR"></select>
+                <button onclick="loadSelectedClass()" id="loadBtn">Open selected</button>
             </div>
-            <div class="panel">
-                <h3>Call Stack</h3>
-                <div id="callStackDisplay" class="state-display">No frames</div>
+            <div id="jarProjectSummary" class="project-summary is-hidden" aria-live="polite"></div>
+        </section>
+
+        <div id="documentTabs" class="document-tabs" role="tablist" aria-label="Open files"></div>
+
+        <nav class="workspace-nav" role="tablist" aria-label="Java tools">
+            <button class="workspace-tab" type="button" role="tab" aria-selected="true"
+                    aria-controls="workspace-disassemble" data-workspace="disassemble">
+                <span class="workspace-index">J</span>
+                <span class="workspace-label"><strong>Assembly</strong><span>Class-file view</span></span>
+            </button>
+            <button class="workspace-tab" type="button" role="tab" aria-selected="false"
+                    aria-controls="workspace-compile" data-workspace="compile" tabindex="-1">
+                <span class="workspace-index">J</span>
+                <span class="workspace-label"><strong>Java</strong><span>Source editor</span></span>
+            </button>
+            <button class="workspace-tab" type="button" role="tab" aria-selected="false"
+                    aria-controls="workspace-run" data-workspace="run" tabindex="-1">
+                <span class="workspace-index">▶</span>
+                <span class="workspace-label"><strong>Run</strong><span>Terminal or AWT canvas</span></span>
+            </button>
+            <button class="workspace-tab" type="button" role="tab" aria-selected="false"
+                    aria-controls="workspace-debug" data-workspace="debug" tabindex="-1">
+                <span class="workspace-index">◆</span>
+                <span class="workspace-label"><strong>Debug</strong><span>Code, steps, and state</span></span>
+            </button>
+        </nav>
+
+        <section id="workspace-disassemble" class="workspace-panel" role="tabpanel">
+            <div class="workspace-heading">
+                <div>
+                    <h2>Assembly editor</h2>
+                    <p>Opening a .class presents an editable .j document while retaining the class as its backing file.</p>
+                </div>
+                <div class="workspace-actions">
+                    <span id="assemblyStatus" class="tool-status">Open a class to edit its bytecode.</span>
+                    <button id="resetAssemblyBtn" type="button" disabled>Revert</button>
+                    <button id="assembleBtn" class="primary-action" type="button" disabled>Save class</button>
+                </div>
             </div>
-            <div class="panel">
-                <h3>Output Console</h3>
-                <div id="output" class="output"></div>
+            <div class="disassemble-layout">
+                <aside class="panel method-browser">
+                    <h3>Classes &amp; methods</h3>
+                    <p class="panel-note">Support classes remain inspectable here even when they cannot be launched.</p>
+                    <input type="text" id="method-search" class="method-search" placeholder="Filter classes or methods…">
+                    <div id="method-tree" class="method-tree">Loading classes…</div>
+                </aside>
+                <div class="panel disassembly-panel">
+                    <h3 id="assemblyDocumentLabel">No assembly file open</h3>
+                    <div id="disassembly-editor"></div>
+                </div>
             </div>
-        </div>
-    </div>
+        </section>
+
+        <dialog id="saveAsDialog" class="save-dialog">
+            <form method="dialog">
+                <h2>Save As</h2>
+                <p>A <strong>.class</strong> name assembles bytecode. A <strong>.j</strong> name preserves the assembly text, comments, and directives.</p>
+                <label for="saveAsName">File name</label>
+                <input id="saveAsName" type="text" autocomplete="off" spellcheck="false">
+                <p id="saveAsHint" class="tool-status"></p>
+                <div class="dialog-actions">
+                    <button value="cancel" type="submit">Cancel</button>
+                    <button id="confirmSaveAsBtn" value="default" class="primary-action" type="button">Save</button>
+                </div>
+            </form>
+        </dialog>
+
+        <dialog id="newFolderDialog" class="save-dialog">
+            <form method="dialog">
+                <h2>New folder</h2>
+                <p>Create a directory in the browser workspace. Nested paths are created together.</p>
+                <label for="newFolderPath">Workspace path</label>
+                <input id="newFolderPath" type="text" value="/src/new-folder"
+                       autocomplete="off" spellcheck="false" placeholder="/src/example">
+                <p id="newFolderHint" class="tool-status">For example: /src/example</p>
+                <div class="dialog-actions">
+                    <button value="cancel" type="submit">Cancel</button>
+                    <button id="confirmNewFolderBtn" value="default" class="primary-action" type="button">Create folder</button>
+                </div>
+            </form>
+        </dialog>
+
+        <section id="workspace-compile" class="workspace-panel" role="tabpanel" hidden>
+            <div class="workspace-heading">
+                <div>
+                    <h2>Java compiler</h2>
+                    <p>Compile source in the browser, inspect emitted bytecode, or run it immediately.</p>
+                </div>
+                <div class="button-group">
+                    <button id="compileBtn" type="button">Compile source</button>
+                    <button id="compileRunBtn" class="primary-action" type="button">Compile &amp; Run</button>
+                </div>
+            </div>
+            <div class="tool-layout">
+                <div class="tool-pane">
+                    <div class="tool-pane-header"><h3>Java source</h3></div>
+                    <div id="java-source-editor" class="code-editor" aria-label="Editable Java source"></div>
+                    <p id="compileStatus" class="tool-status">Java 8 class-file target</p>
+                </div>
+                <div class="tool-pane">
+                    <div class="tool-pane-header">
+                        <h3>Emitted bytecode</h3>
+                        <div class="button-group">
+                            <select id="compiledClassSelect" class="is-hidden" aria-label="Compiled class"></select>
+                            <button id="downloadCompiledBtn" type="button" disabled>Download .class</button>
+                            <button id="loadCompiledBtn" type="button" disabled>Load into JVM</button>
+                        </div>
+                    </div>
+                    <pre id="compiler-output" class="code-output empty"></pre>
+                </div>
+            </div>
+        </section>
+
+        <section id="workspace-run" class="workspace-panel" role="tabpanel" hidden>
+            <div class="workspace-heading">
+                <div>
+                    <h2>Run program</h2>
+                    <p>Applications use xterm; applets switch automatically to the browser AWT canvas.</p>
+                </div>
+                <div class="surface-toggle" aria-label="Runtime surface">
+                    <button type="button" data-runtime-view="terminal" aria-pressed="true">Terminal</button>
+                    <button type="button" data-runtime-view="canvas" aria-pressed="false">AWT canvas</button>
+                </div>
+            </div>
+            <div class="run-workspace">
+                <div class="runtime-pane-header">
+                    <h3>Program surface</h3>
+                    <span id="runtimeModeHint">Application output uses the terminal.</span>
+                </div>
+                <div id="runtime-surface" class="runtime-surface" data-view="terminal">
+                    <div id="run-terminal-slot" class="terminal-slot">
+                        <div id="xterm-container" aria-label="Java terminal"></div>
+                    </div>
+                    <div id="awt-container" tabindex="-1" aria-label="Applet canvas"></div>
+                </div>
+            </div>
+        </section>
+
+        <section id="workspace-debug" class="workspace-panel" role="tabpanel" hidden>
+            <div class="workspace-heading">
+                <div>
+                    <h2>JVM debugger</h2>
+                    <p>Follow the current bytecode instruction alongside stack, locals, and call frames.</p>
+                </div>
+            </div>
+            <div class="debug-workspace">
+                <div class="debug-code-column">
+                    <div class="runtime-toolbar">
+                        <div class="debug-row is-hidden">
+                            <div class="debug-controls">
+                                <button onclick="continue_()" id="continueBtn" title="Continue (F8)" disabled>Continue</button>
+                                <button onclick="pauseExecution()" id="pauseBtn" title="Pause" disabled>Pause</button>
+                                <button onclick="stepOver()" id="stepOverBtn" title="Step Over (F10)" disabled>Step over</button>
+                                <button onclick="stepInto()" id="stepIntoBtn" title="Step Into (F11)" disabled>Step into</button>
+                                <button onclick="stepOut()" id="stepOutBtn" title="Step Out (Shift+F11)" disabled>Step out</button>
+                                <button onclick="finish()" id="finishBtn" title="Finish Method" disabled>Finish</button>
+                                <button onclick="stepInstruction()" id="stepInstructionBtn" title="Step Instruction" disabled>Instruction</button>
+                                <button onclick="rewind()" id="rewindBtn" title="Rewind (Undo Last Step)" disabled>Rewind</button>
+                            </div>
+                            <div class="breakpoint-controls">
+                                <input type="number" id="breakpointInput" class="breakpoint-input" placeholder="PC" min="0" aria-label="Breakpoint PC">
+                                <button onclick="setBreakpoint()">Set Breakpoint</button>
+                                <button onclick="clearAllBreakpoints()">Clear All Breakpoints</button>
+                                <button onclick="serializeState()" title="Serialize State">Save state</button>
+                                <button onclick="document.getElementById('stateFileInput').click()" title="Restore State">Restore state</button>
+                                <input type="file" id="stateFileInput" class="is-hidden" accept=".json">
+                            </div>
+                        </div>
+                    </div>
+                    <div class="debug-code-header">
+                        <h3>Current code</h3>
+                        <span id="debugCodeContext">Load a class, then start debugging.</span>
+                    </div>
+                    <div id="debug-code-editor" aria-label="Current bytecode and instruction"></div>
+                    <div class="debug-terminal-pane">
+                        <div class="runtime-pane-header">
+                            <h3>Program terminal</h3>
+                            <span>Standard input, output, and errors from the debugged JVM.</span>
+                        </div>
+                        <div id="debug-terminal-slot" class="terminal-slot"></div>
+                    </div>
+                </div>
+
+                <aside class="inspector-column">
+                    <div class="panel">
+                        <h3>Execution</h3>
+                        <div id="executionState" class="state-display">Not started</div>
+                        <div class="state-item">
+                            <span class="key">Thread:</span>
+                            <select id="threadSelect" class="value is-empty" onchange="selectThread()" disabled>
+                                <option value="" selected>No active threads</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <h3>Stack</h3>
+                        <div id="stackDisplay" class="state-display">Empty</div>
+                    </div>
+                    <div class="panel">
+                        <h3>Locals</h3>
+                        <div id="localsDisplay" class="state-display">No locals</div>
+                    </div>
+                    <div class="panel">
+                        <h3>Call stack</h3>
+                        <div id="callStackDisplay" class="state-display">No frames</div>
+                    </div>
+                    <div class="panel">
+                        <h3>Output Console</h3>
+                        <div id="output" class="output"></div>
+                    </div>
+                </aside>
+            </div>
+        </section>
+    </main>
 
     <script>
         // Real JVM debug controller integration
@@ -1018,7 +1212,7 @@
 
         // Initialize
         updateState(uiState);
-        log('JVM Debug API Example loaded', 'info');
+        log('Java Tools Workbench loaded', 'info');
         log('Click "Start & Break" to debug, or Run to execute', 'info');
     </script>
 </body>

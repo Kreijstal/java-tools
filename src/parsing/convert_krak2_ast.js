@@ -437,7 +437,7 @@ function convertConstToBootstrapMethod(constItem, methodHandleMap) {
     const [, bootstrapSpec] = constItem.constValue;
 
     let methodHandleValue = null;
-    const arguments = [];
+    const bootstrapArguments = [];
 
     if (Array.isArray(bootstrapSpec)) {
       const [methodHandleInfo, bootstrapArgs] = bootstrapSpec;
@@ -452,17 +452,17 @@ function convertConstToBootstrapMethod(constItem, methodHandleMap) {
           if (Array.isArray(arg) && arg.length >= 2) {
             const [argType, rawValue] = arg;
             if (argType === 'String') {
-              arguments.push({
+              bootstrapArguments.push({
                 type: 'String',
                 value: parseStringLiteral(rawValue)
               });
             } else if (argType === 'MethodType') {
-              arguments.push({
+              bootstrapArguments.push({
                 type: 'MethodType',
                 value: rawValue
               });
             } else if (argType === 'Class') {
-              arguments.push({
+              bootstrapArguments.push({
                 type: 'Class',
                 value: rawValue
               });
@@ -470,7 +470,7 @@ function convertConstToBootstrapMethod(constItem, methodHandleMap) {
           } else if (typeof arg === 'string') {
             const handle = methodHandleMap ? methodHandleMap.get(arg) : null;
             if (handle) {
-              arguments.push({
+              bootstrapArguments.push({
                 type: 'MethodHandle',
                 value: handle.value
               });
@@ -489,7 +489,7 @@ function convertConstToBootstrapMethod(constItem, methodHandleMap) {
 
     return {
       method_ref,
-      arguments
+      arguments: bootstrapArguments
     };
   }
 

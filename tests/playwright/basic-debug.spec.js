@@ -16,7 +16,7 @@ test.describe('JVM Debug Browser Interface - Basic Tests', () => {
     await page.waitForLoadState('networkidle', { timeout: 10000 });
     
     // Verify basic elements are present
-    await expect(page.locator('h1')).toContainText('JVM Debug API Example', { timeout: 5000 });
+    await expect(page.locator('h1')).toContainText('Java Tools Workbench', { timeout: 5000 });
     await expect(page.locator('#status')).toBeVisible({ timeout: 5000 });
     
     // Check no major JavaScript errors occurred

@@ -20,6 +20,7 @@
     "profile:dekobloko:firefox": "node scripts/profileDekoblokoFirefox.js",
     "analyze:dekobloko:firefox-profile": "node scripts/analyzeFirefoxProfile.js",
     "test:fused-renderers": "node scripts/differentialFusedRenderers.js",
+    "test:fused-hot-loop-regression": "node node_modules/tape/bin/tape test/fusedHotLoopRegression.test.js",
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
     "run:jar": "node scripts/runJar.js",
@@ -44,6 +45,7 @@
   "license": "AGPLv3",
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
+    "@zenfs/core": "^2.6.1",
     "@modelcontextprotocol/sdk": "^1.21.1",
     "crc-32": "^1.2.2",
     "decimal.js": "^10.4.3",

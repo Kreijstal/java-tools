@@ -9,10 +9,10 @@ test.describe('JVM Debug Browser Interface', () => {
 
   test('should load the debug interface successfully', async ({ page }) => {
     // Check that the page title is correct
-    await expect(page).toHaveTitle(/JVM Debug API Example/, { timeout: 5000 });
+    await expect(page).toHaveTitle(/Java Tools Workbench/, { timeout: 5000 });
 
     // Check that main elements are present
-    await expect(page.locator('h1')).toContainText('JVM Debug API Example', { timeout: 5000 });
+    await expect(page.locator('h1')).toContainText('Java Tools Workbench', { timeout: 5000 });
     await expect(page.locator('#status')).toContainText('Ready - No program loaded', { timeout: 5000 });
 
     // Check that main control buttons are present (step buttons are hidden until debugging starts)
@@ -208,7 +208,7 @@ test.describe('JVM Debug Browser Interface', () => {
     expect(outputText).toMatch(/\[\d{1,2}:\d{2}:\d{2}(\s?(AM|PM))?\]/);
     
     // Should contain initial load message
-    expect(outputText).toContain('JVM Debug API Example loaded');
+    expect(outputText).toContain('Java Tools Workbench loaded');
   });
 
   test('should handle multiple step operations', async ({ page }) => {

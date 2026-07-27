@@ -1322,8 +1322,38 @@ class JitCompiler {
   }
 
   compileMethod(method) {
+    const tracePattern = typeof process !== "undefined" && process.env
+      ? process.env.JVM_TRACE_JIT_METHOD || "" : "";
+    const traceIdentity = tracePattern
+      ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
+        "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`
+      : "";
     const structuredSsa = this.structuredSsa.compile(method);
-    if (structuredSsa) return this.withResumeBody(structuredSsa, method);
+    if (structuredSsa) {
+      if (tracePattern && traceIdentity.includes(tracePattern)) {
+        const source = String(structuredSsa);
+        console.error("[jit-tier-selection] " + JSON.stringify({
+          method: traceIdentity,
+          tier: "structured-ssa",
+          directFusedSiteIds: [...source.matchAll(
+            /tryInvokeDirectAt\((\d+)/g)].map((match) => Number(match[1])),
+          continuation: Boolean(structuredSsa.jvmStructuredContinuation),
+          resumeBody: Boolean(structuredSsa.jvmResumeBody),
+        }));
+      }
+      return this.withResumeBody(structuredSsa, method);
+    }
+    if (tracePattern) {
+      if (traceIdentity.includes(tracePattern)) {
+        console.error("[jit-tier-rejection] " + JSON.stringify({
+          method: traceIdentity,
+          structuredSsa: this.structuredSsa.lastRejectionReason,
+          structuredError: this.structuredSsa.lastCompileError &&
+            String(this.structuredSsa.lastCompileError.message ||
+              this.structuredSsa.lastCompileError),
+        }));
+      }
+    }
     const scalarLoop = this.compileScalarIntegerLoop(method);
     if (scalarLoop) return this.withResumeBody(scalarLoop, method);
 

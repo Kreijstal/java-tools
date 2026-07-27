@@ -6,6 +6,7 @@ const path = require('path');
 const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
+const { parseDescriptor } = require('../src/parsing/typeParser');
 
 const classpath = path.resolve(process.argv[2] || '');
 const iterations = Number(process.argv[3] || 200);
@@ -34,11 +35,13 @@ function defaultValue(descriptor) {
   return null;
 }
 
-async function createRuntime() {
+async function createRuntime(jitOptions = {}) {
   const jvm = new JVM({ classpath: [classpath], jit: {
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     fusedRegions: false,
+    handwrittenFusedKernels: false,
+    ...jitOptions,
   } });
   for (const className of classNames(classpath)) {
     const classData = await jvm.loadClassByName(className);
@@ -107,10 +110,10 @@ function configureRegion(runtime, candidate, pixels) {
   if (!region) throw new Error(`Could not compile verified ${candidate.family.name} region`);
   const rasterPlan = region.semanticGradientRasterPlan || region.semanticFlatRasterPlan;
   if (rasterPlan) {
-    writeTarget(region.staticTargets[rasterPlan.heightStatic], 48);
+    writeTarget(region.staticTargets[rasterPlan.heightStatic], 64);
     writeTarget(region.staticTargets[rasterPlan.widthStatic], 64);
     writeTarget(region.staticTargets[rasterPlan.rowsStatic],
-      Array.from({ length: 48 }, (_, row) => row * 64));
+      Array.from({ length: 64 }, (_, row) => row * 64));
     writeTarget(region.staticTargets[rasterPlan.strideStatic], 64);
   }
   return region;
@@ -177,14 +180,47 @@ function assertPixels(left, right, label) {
   }
 }
 
+function generatedShape(region) {
+  const wrapper = String(region.wrapperKernel);
+  const raster = String(region.rasterKernel);
+  const scanline = String(region.scanlineKernel);
+  const combined = `${wrapper}\n${raster}\n${scanline}`;
+  const forbidden = [
+    'new Frame', 'tryInvokeSyncAt', 'runGeneratedFrame', '.stack.items',
+  ].filter((token) => combined.includes(token));
+  return {
+    handwrittenInstalled: Boolean(region.handwrittenWrapperKernel),
+    lexicalWrapper: Boolean(region.wrapperKernel.jvmLexicalFusedKernel),
+    lexicalRaster: Boolean(region.rasterKernel.jvmLexicalFusedKernel),
+    lexicalScanline: Boolean(region.scanlineKernel.jvmLexicalFusedKernel),
+    positionalWrapper: region.wrapperKernel.length === 3 +
+      parseDescriptor(region.wrapperMethod.descriptor).params.length,
+    structuredWrapper: region.semanticWrapperPlan
+      ? wrapper.includes('switch(order)')
+      : Boolean(region.wrapperKernel.jvmLexicalFusedKernel),
+    scalarRasterLocals:
+      /\blet l\d+/.test(raster) &&
+      (region.rasterKernel.jvmLexicalFusedKernel || raster.includes('switch (pc)')),
+    rasterPcSwitch: raster.includes('switch (pc)'),
+    countedScalarScanline:
+      scanline.includes('for(let offset=0;offset<count;offset+=1)'),
+    forbiddenRuntimeDispatch: forbidden,
+  };
+}
+
 (async () => {
   const baseline = await createRuntime();
-  const fused = await createRuntime();
+  const fused = await createRuntime({ semanticFusedRasters: false });
+  // The plan-driven compact raster is the handwritten target. It is enabled
+  // only in this differential oracle; the measured/generated runtime above
+  // must remain independent from it.
+  const target = await createRuntime({ semanticFusedRasters: true });
   const descriptors = ['(IIIIIIIIIIIIZIII)V', '(IIIIIIII)V'];
   const report = [];
   for (const descriptor of descriptors) {
     const baselineCandidate = findWrapper(baseline, descriptor);
     const fusedCandidate = findWrapper(fused, descriptor);
+    const targetCandidate = findWrapper(target, descriptor);
     if (process.env.JVM_DEBUG_FUSED_DIFFERENTIAL === '1') {
       console.error(`differential ${descriptor}: ` +
         `${baselineCandidate.owner}.${baselineCandidate.method.name} -> ` +
@@ -193,8 +229,22 @@ function assertPixels(left, right, label) {
     }
     const baselinePixels = new Array(64 * 64);
     const fusedPixels = new Array(64 * 64);
+    const targetPixels = new Array(64 * 64);
     configureRegion(baseline, baselineCandidate, baselinePixels);
     const region = configureRegion(fused, fusedCandidate, fusedPixels);
+    const targetRegion = configureRegion(target, targetCandidate, targetPixels);
+    const shape = generatedShape(region);
+    if (shape.handwrittenInstalled || shape.forbiddenRuntimeDispatch.length ||
+        !shape.positionalWrapper || !shape.structuredWrapper ||
+        !shape.lexicalRaster || !shape.scalarRasterLocals ||
+        shape.rasterPcSwitch || !shape.countedScalarScanline) {
+      throw new Error(`Generated kernel contract failed for ${descriptor}: ` +
+        JSON.stringify(shape));
+    }
+    if (!(targetRegion.semanticGradientRasterPlan ||
+        targetRegion.semanticFlatRasterPlan)) {
+      throw new Error(`Handwritten target was not structurally derived for ${descriptor}`);
+    }
     if (process.env.JVM_DEBUG_FUSED_DIFFERENTIAL === '1') {
       console.error(JSON.stringify({
         keys: region.semanticWrapperPlan?.keys,
@@ -206,6 +256,8 @@ function assertPixels(left, right, label) {
     }
     const beforeGradient = fused.jvm.jit.semanticFusedRasterRunCount | 0;
     const beforeFlat = fused.jvm.jit.semanticFusedFlatRasterRunCount | 0;
+    const beforeTargetGradient = target.jvm.jit.semanticFusedRasterRunCount | 0;
+    const beforeTargetFlat = target.jvm.jit.semanticFusedFlatRasterRunCount | 0;
     const random = { value: descriptor.length * 0x9e3779b1 >>> 0 };
     let changedPixels = 0;
     for (let iteration = 0; iteration < iterations; iteration += 1) {
@@ -213,6 +265,7 @@ function assertPixels(left, right, label) {
         const value = Math.imul(index + 1, 0x10203) & 0xffffff;
         baselinePixels[index] = value;
         fusedPixels[index] = value;
+        targetPixels[index] = value;
       }
       const args = argumentsFor(baselineCandidate.family, random, region);
       await invokeBaseline(baseline, baselineCandidate, args,
@@ -220,15 +273,31 @@ function assertPixels(left, right, label) {
       const state = region.executionState;
       const kernel = region.handwrittenWrapperKernel || region.wrapperKernel;
       kernel(state, region, fused.jvm.jit, ...args);
+      targetRegion.wrapperKernel(
+        targetRegion.executionState, targetRegion, target.jvm.jit, ...args);
       assertPixels(baselinePixels, fusedPixels,
         `${descriptor} iteration ${iteration}`);
+      assertPixels(fusedPixels, targetPixels,
+        `${descriptor} handwritten target iteration ${iteration} args=${JSON.stringify(args)}`);
       changedPixels += fusedPixels.reduce((count, value, index) =>
         count + ((value | 0) !== (Math.imul(index + 1, 0x10203) & 0xffffff) ? 1 : 0), 0);
+    }
+    const handwrittenTargetRuns =
+      (target.jvm.jit.semanticFusedRasterRunCount | 0) - beforeTargetGradient +
+      (target.jvm.jit.semanticFusedFlatRasterRunCount | 0) - beforeTargetFlat;
+    if (handwrittenTargetRuns !== iterations) {
+      throw new Error(`Handwritten target ran ${handwrittenTargetRuns}/${iterations} ` +
+        `times for ${descriptor}`);
     }
     report.push({ descriptor, iterations, changedPixels,
       compactGradientInstalled: Boolean(region.semanticGradientRasterPlan),
       compactFlatInstalled: Boolean(region.semanticFlatRasterPlan),
       handwrittenWrapperInstalled: Boolean(region.handwrittenWrapperKernel),
+      generatedShape: shape,
+      lexicalKernelFailures: region.lexicalKernelFailures || {},
+      handwrittenTargetDerived: Boolean(targetRegion.semanticGradientRasterPlan ||
+        targetRegion.semanticFlatRasterPlan),
+      handwrittenTargetRuns,
       compactGradientRuns: (fused.jvm.jit.semanticFusedRasterRunCount | 0) - beforeGradient,
       compactFlatRuns: (fused.jvm.jit.semanticFusedFlatRasterRunCount | 0) - beforeFlat,
       compactFlatRejection: region.semanticFlatRasterRejection || null });

@@ -353,6 +353,9 @@ async function initializeXterm() {
 
     // Open terminal in container
     xtermTerminal.open(xtermContainer);
+    window.fitJvmTerminal = () => {
+      if (xtermFitAddon) xtermFitAddon.fit();
+    };
 
     // Mark as initialized only after open() succeeds
     xtermContainer.dataset.xtermInitialized = "true";
@@ -755,7 +758,7 @@ function setupStateFileInput() {
 
 async function initializeJVM() {
   try {
-    log("JVM Debug API Example loaded", "info");
+    log("Java Tools Workbench loaded", "info");
     log("Starting JVM Debug initialization...", "info");
 
     // Check if JVMDebug is available
@@ -893,6 +896,76 @@ async function getDataZipUrl() {
   return "./data.zip";
 }
 
+function sampleCategory(classPath, launchMode) {
+  const modeLabel = launchMode === "applet" ? "Applets" : "Applications";
+  const withoutExtension = classPath.replace(/\.class$/, "");
+  const segments = withoutExtension.split("/");
+  if (segments.length > 1) {
+    return `${modeLabel} · ${segments.slice(0, -1).join(".")}`;
+  }
+
+  const first = (segments[0][0] || "#").toUpperCase();
+  if (first >= "A" && first <= "F") return `${modeLabel} · A–F`;
+  if (first >= "G" && first <= "L") return `${modeLabel} · G–L`;
+  if (first >= "M" && first <= "R") return `${modeLabel} · M–R`;
+  if (first >= "S" && first <= "Z") return `${modeLabel} · S–Z`;
+  return `${modeLabel} · Other`;
+}
+
+function renderSampleCatalog(sampleSelect, runnableEntries) {
+  const catalog = document.getElementById("sampleCatalog");
+  const tree = document.getElementById("sampleCatalogTree");
+  const label = document.getElementById("sampleCatalogLabel");
+  if (!catalog || !tree || !label) return;
+
+  tree.innerHTML = "";
+  label.textContent = `Choose runnable sample · ${runnableEntries.length}`;
+  const categories = new Map();
+  runnableEntries.forEach(({ classPath, launchMode }) => {
+    const category = sampleCategory(classPath, launchMode);
+    if (!categories.has(category)) categories.set(category, []);
+    categories.get(category).push({ classPath, launchMode });
+  });
+
+  for (const [category, classes] of categories) {
+    const section = document.createElement("details");
+    section.className = "sample-category";
+    const summary = document.createElement("summary");
+    const categoryName = document.createElement("span");
+    categoryName.textContent = category;
+    const count = document.createElement("span");
+    count.className = "sample-count";
+    count.textContent = String(classes.length);
+    summary.append(categoryName, count);
+    section.appendChild(summary);
+
+    const choices = document.createElement("div");
+    choices.className = "sample-choices";
+    classes.forEach(({ classPath, launchMode }) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.samplePath = classPath;
+      button.dataset.launchMode = launchMode;
+      button.textContent = classPath
+        .replace(/\.class$/, "")
+        .split("/")
+        .pop();
+      button.addEventListener("click", () => {
+        sampleSelect.value = classPath;
+        tree.querySelectorAll("[aria-current]").forEach((selected) => {
+          selected.removeAttribute("aria-current");
+        });
+        button.setAttribute("aria-current", "true");
+        label.textContent = button.textContent;
+        catalog.open = false;
+      });
+      choices.appendChild(button);
+    });
+    section.appendChild(choices);
+    tree.appendChild(section);
+  }
+}
+
 async function populateSampleClasses() {
   const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
   if (sampleSelect && jvmDebug) {
@@ -901,17 +974,52 @@ async function populateSampleClasses() {
       const availableClasses = await jvmDebug.listFiles();
       log(`Found ${availableClasses.length} classes in data.zip`, "info");
 
-      // Clear existing options except the first one
-      sampleSelect.innerHTML =
-        '<option value="">Select a sample class...</option>';
+      const classFiles = availableClasses.filter((file) => file.endsWith(".class"));
+      const runnableChecks = await Promise.all(classFiles.map(async (classPath) => {
+        try {
+          const launchInfo = await jvmDebug.getClassLaunchInfo(classPath);
+          return launchInfo.launchMode
+            ? { classPath, launchMode: launchInfo.launchMode }
+            : null;
+        } catch (error) {
+          log(`Skipping unreadable sample ${classPath}: ${error.message}`, "warning");
+          return null;
+        }
+      }));
+      const runnableEntries = runnableChecks
+        .filter(Boolean)
+        .sort((left, right) => left.classPath.localeCompare(right.classPath));
+      const runnableClasses = runnableEntries.map((entry) => entry.classPath);
 
-      // Add all classes to the dropdown
-      availableClasses.forEach((cls) => {
+      sampleSelect.innerHTML =
+        '<option value="">Select a runnable sample...</option>';
+
+      const optionGroups = new Map();
+      runnableEntries.forEach(({ classPath, launchMode }) => {
+        const category = sampleCategory(classPath, launchMode);
+        if (!optionGroups.has(category)) {
+          const group = document.createElement("optgroup");
+          group.label = category;
+          sampleSelect.appendChild(group);
+          optionGroups.set(category, group);
+        }
         const option = document.createElement("option");
-        option.value = cls;
-        option.textContent = cls.replace(".class", "");
-        sampleSelect.appendChild(option);
+        option.value = classPath;
+        option.textContent = classPath.replace(/\.class$/, "").replace(/\//g, ".");
+        optionGroups.get(category).appendChild(option);
       });
+      renderSampleCatalog(sampleSelect, runnableEntries);
+      log(
+        `Exposed ${runnableClasses.length} runnable samples; ` +
+        `${classFiles.length - runnableClasses.length} support classes remain inspectable only`,
+        "success",
+      );
+      window.dispatchEvent(new CustomEvent("javatools:samples-populated", {
+        detail: {
+          runnableClasses: [...runnableClasses],
+          hiddenSupportClassCount: classFiles.length - runnableClasses.length,
+        },
+      }));
 
       // Update the heading to show the count
       const samplesHeading = document.querySelector("h4");
@@ -922,17 +1030,6 @@ async function populateSampleClasses() {
         samplesHeading.textContent = `📚 Sample Classes`;
       }
 
-      // Enable the Start & Break button now that sample classes are available
-      const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
-      if (debugBtn) {
-        debugBtn.disabled = false;
-        log("Start & Break button enabled - sample classes ready", "info");
-      }
-
-      const runBtn = document.getElementById(DOM_IDS.RUN_BTN);
-      if (runBtn) {
-        runBtn.disabled = false;
-      }
     } catch (error) {
       logError("Failed to populate sample classes", error);
       throw error; // Don't hide the error with fallbacks
@@ -1049,8 +1146,13 @@ async function buildMethodBrowserData() {
     return;
   }
 
+  const jarSelector = document.getElementById("jarMainClassSelect");
   const files = await jvmDebug.listFiles();
-  const classFiles = files.filter((file) => file.endsWith(".class"));
+  const classFiles = jarSelector &&
+    !jarSelector.classList.contains("is-hidden") &&
+    jarSelector.options.length
+    ? Array.from(jarSelector.options, (option) => option.value)
+    : files.filter((file) => file.endsWith(".class"));
 
   for (const file of classFiles) {
     try {
@@ -1200,13 +1302,10 @@ async function initializeMethodBrowser() {
   }
 }
 
-// Sample Class Loading
-async function loadSampleClass() {
-  const select = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
-  const selectedClass = select.value;
-
+// Class Loading
+async function loadVirtualClass(selectedClass) {
   if (!selectedClass) {
-    log("Please select a sample class", "error");
+    log("Please select a class", "error");
     return;
   }
 
@@ -1215,7 +1314,7 @@ async function loadSampleClass() {
   }
 
   try {
-    log(`Loading sample class: ${selectedClass}`, "info");
+    log(`Loading class: ${selectedClass}`, "info");
 
     // Get the class data from the JVM's loaded files
     const classData = await jvmDebug.fileProvider.readFile(selectedClass);
@@ -1228,7 +1327,7 @@ async function loadSampleClass() {
       "success",
     );
     updateStatus(
-      `Sample class loaded: ${selectedClass.replace(".class", "")}`,
+      `Class loaded: ${selectedClass.replace(".class", "")}`,
       "success",
     );
 
@@ -1251,31 +1350,46 @@ async function loadSampleClass() {
     setDebugControlsVisible(false);
 
     // Update ACE editor to show actual disassembled bytecode
+    let assemblyText = "";
     if (window.aceEditor) {
+      window.dispatchEvent(new CustomEvent("javatools:class-loading", {
+        detail: { classPath: selectedClass, bytes: classData },
+      }));
       try {
         // Get actual disassembly immediately when class is loaded
-        const disassembly = jvmDebug.getClassDisassembly(classData);
-        window.aceEditor.setValue(disassembly, -1);
+        assemblyText = jvmDebug.getClassDisassembly(classData);
+        window.aceEditor.setValue(assemblyText, -1);
         log(`Disassembly loaded for ${selectedClass}`, "success");
       } catch (error) {
         // Fallback to placeholder if disassembly fails
         const className = selectedClass.replace(".class", "");
-        window.aceEditor.setValue(
-          `// BROWSER-UI ERROR - Bytecode for ${className}\n// Error loading disassembly: ${error.message}\n// Click 'Start & Break' to debug, or Run to execute`,
-          -1,
-        );
+        assemblyText =
+          `// BROWSER-UI ERROR - Bytecode for ${className}\n` +
+          `// Error loading disassembly: ${error.message}\n` +
+          "// Click 'Start & Break' to debug, or Run to execute";
+        window.aceEditor.setValue(assemblyText, -1);
         logError("Failed to disassemble class", error);
       }
+    } else {
+      assemblyText = jvmDebug.getClassDisassembly(classData);
     }
 
     // Keep the selection so startDebugging knows which class to use
     // Don't clear the selection - this was causing the issue
     log(`Class ${selectedClass} loaded and ready for debugging`, "info");
+    window.dispatchEvent(new CustomEvent("javatools:class-loaded", {
+      detail: { classPath: selectedClass, bytes: classData, assemblyText },
+    }));
   } catch (error) {
-    logError("Failed to load sample class", error);
-    updateStatus("Failed to load sample class", "error");
+    logError("Failed to load class", error);
+    updateStatus("Failed to load class", "error");
     throw error; // Don't hide errors with fallbacks
   }
+}
+
+async function loadSampleClass() {
+  const select = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
+  return loadVirtualClass(select.value);
 }
 
 // Helper function to update disassembly state info outside the editor
@@ -1504,15 +1618,27 @@ function updateDebugDisplay() {
       const selectedThreadId =
         jvmDebug.debugController.jvm.debugManager.selectedThreadId;
       threadSelect.innerHTML = "";
-      threads.forEach((thread) => {
+      if (threads.length === 0) {
         const option = document.createElement("option");
-        option.value = thread.id;
-        option.textContent = `Thread ${thread.id} (${thread.status})`;
-        if (thread.id === selectedThreadId) {
-          option.selected = true;
-        }
+        option.value = "";
+        option.textContent = "No active threads";
+        option.selected = true;
         threadSelect.appendChild(option);
-      });
+        threadSelect.disabled = true;
+        threadSelect.classList.add("is-empty");
+      } else {
+        threadSelect.disabled = false;
+        threadSelect.classList.remove("is-empty");
+        threads.forEach((thread) => {
+          const option = document.createElement("option");
+          option.value = thread.id;
+          option.textContent = `Thread ${thread.id} (${thread.status})`;
+          if (thread.id === selectedThreadId) {
+            option.selected = true;
+          }
+          threadSelect.appendChild(option);
+        });
+      }
     }
 
     // Update stack display
@@ -1548,8 +1674,9 @@ function updateDebugDisplay() {
         // log(`Got disassembly view`, 'debug');
 
         if (view && view.formattedDisassembly) {
-          const editor = window.aceEditor || aceEditor;
-          if (editor) {
+          const editors = [window.aceEditor || aceEditor, window.debugCodeEditor]
+            .filter((editor, index, items) => editor && items.indexOf(editor) === index);
+          if (editors.length > 0) {
             // Reduced verbosity: Only log in verbose mode
             // log('Updating disassembly content', 'debug');
 
@@ -1598,16 +1725,28 @@ function updateDebugDisplay() {
 
             // Set clean content
             const cleanContent = cleanLines.join("\n");
-            editor.setValue(cleanContent, -1);
+            editors.forEach((editor) => {
+              editor.setValue(cleanContent, -1);
+              editor.session.clearBreakpoints();
+              if (currentExecutionLine !== -1) {
+                editor.session.setBreakpoint(
+                  currentExecutionLine,
+                  "ace_execution_line",
+                );
+                editor.scrollToLine(currentExecutionLine + 1, true, true);
+              }
+              editor.clearSelection();
+            });
 
-            // Highlight current execution line using ACE's built-in highlighting
-            editor.session.clearBreakpoints();
-            if (currentExecutionLine !== -1) {
-              editor.session.setBreakpoint(
-                currentExecutionLine,
-                "ace_execution_line",
-              );
-              editor.scrollToLine(currentExecutionLine + 1, true, true);
+            const debugContext = document.getElementById("debugCodeContext");
+            if (debugContext) {
+              const method = state.method
+                ? `${state.method.name}${state.method.descriptor}`
+                : "No active method";
+              const pc = state.pc === null || state.pc === undefined
+                ? "–"
+                : state.pc;
+              debugContext.textContent = `${method} · PC ${pc}`;
             }
 
             // Update external disassembly state info in HTML
@@ -1674,7 +1813,7 @@ function initializeEditor() {
     }
 
     aceEditor.session.setMode("ace/mode/text");
-    aceEditor.setReadOnly(true);
+    aceEditor.setReadOnly(false);
     aceEditor.renderer.setShowGutter(true);
     aceEditor.renderer.setPadding(10);
     aceEditor.setOptions({
@@ -1687,6 +1826,7 @@ function initializeEditor() {
 
     // Make editor instance available globally
     window.aceEditor = aceEditor;
+    window.dispatchEvent(new CustomEvent("javatools:assembly-editor-ready"));
 
     // Ensure ACE matches the container size after layout
     requestAnimationFrame(() => aceEditor.resize(true));
@@ -2044,7 +2184,7 @@ function loadClassFile() {
 
   log(`Loading ${isJar ? "JAR" : "class"} file: ${fileName}...`, "info");
 
-  jvmDebug
+  return jvmDebug
     .loadFile(file)
     .then(async () => {
       if (isJar) {
@@ -2064,15 +2204,17 @@ function loadClassFile() {
           ? `Manifest entry point: ${jarInfo.mainClass}`
           : `No Main-Class manifest entry; selected ${selectedClass}`;
         log(`JAR file ${fileName} loaded successfully (${jarInfo.classFiles.length} classes). ${entryDescription}`, "success");
+        await loadVirtualClass(selectedClass);
       } else {
         hideJarClassSelector();
         const className = fileName.replace(".class", "");
         log(`Class file ${className} loaded successfully`, "success");
         updateState({
-          loadedClass: { name: className },
+          loadedClass: { name: fileName },
           className: className,
           status: "ready",
         });
+        await loadVirtualClass(fileName);
       }
 
       const debugBtn = document.getElementById(DOM_IDS.DEBUG_BTN);
@@ -2090,6 +2232,7 @@ function loadClassFile() {
     .catch((error) => {
       logError(`Failed to load ${fileName}`, error);
       updateStatus(`Failed to load ${fileName}`, "error");
+      throw error;
     });
 }
 
@@ -2121,6 +2264,9 @@ function setupJarClassSelector(jarInfo) {
       status: "ready",
     });
     log(`Selected JAR class: ${selector.options[selector.selectedIndex].textContent}`, "info");
+    loadVirtualClass(selector.value).catch((error) => {
+      logError("Failed to load selected JAR class", error);
+    });
   };
 }
 
@@ -2243,6 +2389,7 @@ window.__realUpdateState = updateState;
 window.__realLoadSampleClass = loadSampleClass;
 window.__realLoadClassFile = loadClassFile;
 window.updateButtons = updateButtons;
+window.loadVirtualClass = loadVirtualClass;
 window.loadSampleClass = loadSampleClass;
 window.loadClassFile = loadClassFile;
 window.clearOutput = clearOutput;
@@ -2253,6 +2400,9 @@ window.initializeEditor = initializeEditor;
 // toggleOutputMode function removed - both XTerm and DOM output are now always available
 window.initializeXterm = initializeXterm;
 window.setupXtermIntegration = setupXtermIntegration;
+window.focusJvmTerminal = () => {
+  if (xtermTerminal) xtermTerminal.focus();
+};
 
 // Initialize when DOM is ready
 document.addEventListener("DOMContentLoaded", initializeJVM);

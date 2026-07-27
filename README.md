@@ -22,7 +22,7 @@ A comprehensive toolkit for Java bytecode analysis, manipulation, and execution.
 - **Memory Management**: Stack, heap, and garbage collection
 
 ### 🐛 Web-Based Debugging
-- **Visual Debugger**: Step-by-step execution with web interface
+- **Visual Debugger**: Instruction-level execution control in the web interface
 - **Real-Time Inspection**: Examine JVM state, stack, and local variables
 - **Breakpoint Management**: Set and manage execution breakpoints
 - **State Serialization**: Save and restore JVM execution state
@@ -64,17 +64,32 @@ A comprehensive toolkit for Java bytecode analysis, manipulation, and execution.
 npm install
 ```
 
+### Documentation
+
+- [Browser workbench](docs/workbench.md) — files, directories, `.class`/`.j`
+  behavior, Java documents, Run, Debug, xterm, and JARs
+- [Java compiler](docs/compiler.md) — command line, Node.js API, browser API,
+  supported input, and limitations
+- [Assembler and disassembler](docs/assembly.md)
+- [Unified CLI, MCP, and LSP tooling](docs/tooling.md)
+- [Debugger API](DEBUG_API.md)
+- [Decompiler](docs/decompiler.md)
+- [Language server protocol](docs/lsp.md)
+
 ### Basic Usage
 
-#### Parse and Analyze a Java Class
+#### Compile and inspect a Java class
 
 ```bash
-# Compile a Java source file
-javac sources/Hello.java
+# Compile with the repository JavaScript compiler (no host javac fallback)
+node scripts/compileJava.js sources/Hello.java --out build/classes
 
-# Parse and analyze the class file
-node scripts/runLoadAndTraverse.js Hello sources
+# Disassemble the emitted class
+node scripts/jvm-cli.js disassemble build/classes/Hello.class --stdout
 ```
+
+See [docs/compiler.md](docs/compiler.md) for multi-file compilation and the
+Node.js/browser APIs.
 
 #### Run the native JavaScript CFR-style decompiler
 
@@ -381,11 +396,16 @@ npm run serve
 
 Then open http://localhost:3000 to access the debugging interface.
 
-To load your own application, select **File**, choose a `.jar`, and click
-**Load**. The site extracts its class files in the browser and uses
-`META-INF/MANIFEST.MF`'s `Main-Class` as the default entry point. If the JAR
-does not declare one, choose a class from the entry-class picker before running
-or debugging it.
+To load your own application, choose **File → Open file…** and select a `.jar`,
+`.class`, `.j`, or `.java` file. JAR class files and resources are extracted in
+the browser, and `META-INF/MANIFEST.MF`'s `Main-Class` becomes the default entry
+point when present. If the JAR does not declare one, choose a runnable class
+from the entry-class picker.
+
+The workbench is file-centric: opening a `.class` presents a class-backed `.j`
+document, selecting Java opens the Java representation linked to that class,
+and the browser workspace supports nested directories. See
+[docs/workbench.md](docs/workbench.md).
 
 ## 🏗️ Architecture
 
@@ -393,15 +413,19 @@ or debugging it.
 
 ```
 src/
-├── jvm.js                 # Main JVM implementation and execution engine
-├── frame.js              # Stack frame management and local variables
-├── classLoader.js        # Dynamic class loading and resolution
-├── debugController.js    # Debugging functionality and controls
-├── browser-entry.js      # Browser-specific entry point and API
+├── core/
+│   ├── jvm.js             # Main JVM implementation and execution engine
+│   ├── frame.js           # Stack frame management and local variables
+│   └── classLoader.js     # Dynamic class loading and resolution
+├── debug/
+│   └── debugController.js # Debugging functionality and controls
+├── platform/
+│   ├── browser-entry.js   # Browser API
+│   └── workbench-ui.js    # File-centric browser workbench
+├── java-frontend/         # Java parser, IR, and compiler
 ├── instructions/         # Complete bytecode instruction set
 ├── jre/                  # Java Runtime Environment implementation
-├── awt.js               # Browser AWT (Abstract Window Toolkit)
-└── convert_tree.js      # AST conversion and bytecode manipulation
+└── parsing/              # Class/Jasmin parsing and class-file emission
 ```
 
 ### Key Features
@@ -442,54 +466,63 @@ const { JVM } = require('./src/core/jvm');
 
 const jvm = new JVM({
     verbose: true,
-    classpath: 'sources'
+    classpath: ['sources']
 });
 
 // Execute a Java class
-await jvm.run('Hello.class');
+await jvm.run('Hello');
 ```
 
 ### 3. Web-Based Debugging
 
 ```javascript
-// In browser environment
+// In a browser page that loaded the bundle
 const { BrowserJVMDebug } = window.JVMDebug;
 
-const debugger = new BrowserJVMDebug();
+const debug = new BrowserJVMDebug();
+await debug.initialize();
 
-// Initialize with data package
-await debugger.initialize({
-    dataUrl: '/dist/data.zip'
-});
+// `classFile` is a browser File selected by the user.
+const loaded = await debug.loadFile(classFile);
 
-// Start debugging session
-await debugger.start('com.example.MyClass');
+await debug.start(loaded.virtualPath);
 
 // Control execution
-debugger.setBreakpoint(10);
-debugger.stepInto();
-debugger.continue();
+debug.setBreakpoint(10);
+await debug.stepInstruction();
+await debug.continue();
 ```
+
+`dataUrl` accepts a JSON data-package URL; it does not accept the workbench ZIP
+archive. See [DEBUG_API.md](DEBUG_API.md) for initialization, thread selection,
+inspection, snapshots, and current stepping limitations.
 
 ### 4. Bytecode Manipulation
 
 ```javascript
-const { getAST, convertJson } = require('./src/parsing/convert_tree');
-const { unparseDataStructures } = require('./src/parsing/convert_tree');
+const fs = require('fs');
+const { getAST } = require('jvm_parser');
+const {
+    convertJson,
+    unparseDataStructures
+} = require('./src/parsing/convert_tree');
 
 // Parse class file
-const classData = fs.readFileSync('MyClass.class');
-const ast = getAST(classData);
-const converted = convertJson(ast.ast, ast.constantPool);
+const parsed = getAST(new Uint8Array(fs.readFileSync('MyClass.class')));
+const converted = convertJson(parsed.ast, parsed.constantPool);
 
 // Modify the AST as needed
 // ... modify converted.classes[0] ...
 
-// Generate new bytecode
-const newBytecode = unparseDataStructures(converted.classes[0], converted.constantPool);
+// Emit canonical Jasmin; assemble it with src/utils/jasminAssembly.js.
+const jasmin = unparseDataStructures(
+    converted.classes[0],
+    parsed.constantPool
+);
 ```
 
-See `docs/dead_code_elimination.md` for a detailed walkthrough of assembling `.j` sources, parsing the resulting `.class`, running the stack-based dead-code eliminator, and emitting updated assembly.
+See [docs/tooling.md](docs/tooling.md) for assembly, disassembly, linting,
+optimization, and structural-refactoring workflows.
 
 ### Jasmin Lint & Fix CLI
 
@@ -541,9 +574,13 @@ node scripts/jvm-cli.js optimize examples/sources/jasmin/MisplacedCatch.j --out 
 node scripts/jvm-cli.js format examples/sources/jasmin/MisplacedCatch.j -n   # preview diff only
 ```
 
-Use `node scripts/jvm-cli.js --help` to see the complete list of subcommands and flags. All mutating operations accept `-n/--dry-run` to preview the unified diff without touching the input file.
+Use `node scripts/jvm-cli.js --help` to see the complete list of subcommands and
+flags. Refactoring, formatting, and optimization commands document
+`-n/--dry-run` when supported. Assembly and disassembly use `--out`;
+disassembly additionally supports `--stdout`.
 
-See `docs/tooling.md` for a deeper tour of the CLI, the workspace TUI, the MCP server’s JSON-RPC surface, and how these building blocks roll up into the planned LSP.
+See [docs/tooling.md](docs/tooling.md) for the CLI, workspace TUI, MCP server
+JSON-RPC surface, and LSP integration.
 
 ## 🔧 Configuration
 
@@ -582,14 +619,18 @@ npm run serve
 
 ### Visual Debugger Features
 - **Disassembly View**: Syntax-highlighted bytecode with current instruction indicator
-- **Execution Controls**: Step into, over, out, continue, and rewind
+- **Execution Controls**: Continue, pause, instruction stepping, and rewind
 - **State Inspection**: Real-time display of stack, locals, and JVM state
-- **Breakpoint Management**: Set breakpoints by clicking in the disassembly view
+- **Thread Selection**: Select a live JVM thread; the selector has an explicit empty state
+- **Breakpoint Management**: Set numeric bytecode-PC breakpoints
+- **Terminal**: The same xterm.js session is available in Run and Debug
 
 ### Sample Applications
 - **Built-in Examples**: Pre-compiled Java test cases
-- **File Upload**: Load your own .class and .jar files
+- **File Workspace**: Open `.java`, `.j`, `.class`, and `.jar` files and create directories
 - **Class Browser**: Navigate methods and fields
+
+The complete UI guide is [docs/workbench.md](docs/workbench.md).
 
 ### AWT Graphics
 - **Canvas Rendering**: Java GUI components in HTML5 Canvas
@@ -623,11 +664,13 @@ npm run test:playwright
 
 ```
 ├── src/                    # Core implementation
-│   ├── jvm.js             # Main JVM engine
-│   ├── classLoader.js     # Class loading system
+│   ├── core/              # JVM, frames, class loading
+│   ├── debug/             # Debug controller
+│   ├── java-frontend/     # Java compiler
+│   ├── platform/          # Browser API and workbench
 │   ├── instructions/      # Bytecode instructions
 │   ├── jre/               # Java Runtime Environment
-│   └── awt.js             # Browser graphics
+│   └── parsing/           # Assembly/class-file conversion
 ├── sources/               # Java source files and examples
 ├── test/                  # Test files and test runners
 ├── scripts/               # Build and utility scripts
@@ -644,6 +687,10 @@ The repository has native JavaScript bytecode tooling:
 - **Assembly**: `node scripts/jvm-cli.js assemble Foo.j --out Foo.class`
 - **Manipulation**: Modify class ASTs and write `.class` files with `src/parsing/classAstToClassFile.js`
 - **Decompilation**: `npm run cfr -- Foo.class` uses the JavaScript CFR-style decompiler
+
+See [docs/tooling.md](docs/tooling.md) for command behavior and
+[docs/workbench.md](docs/workbench.md) for class-backed `.j` editing in the
+browser.
 
 ## 🤝 Contributing
 

@@ -1,4 +1,4 @@
-# JVM Tooling, MCP Server, and LSP Plan
+# JVM tooling, MCP server, and LSP
 
 ## Unified CLI
 
@@ -6,11 +6,26 @@
 
 - `assemble`/`disassemble` convert between Jasmin and bytecode without depending on Krakatau’s Java tools.
 - `lint`/`optimize` run the dead-handler eliminator; `--fix` rewrites the file, `-n/--dry-run` shows a unified diff, `--stdout` prints the optimized Jasmin without touching disk, and `--xref-comments` injects caller/field-reference comments plus purity/throws summaries (requires a `--classpath` so the workspace can be indexed).
-- `format` reassembles/disassembles `.j` sources to enforce a canonical layout (same defaults used by the forthcoming LSP formatter).
+- `format` reassembles/disassembles `.j` sources to enforce a canonical layout.
 - `rename-class`/`rename-method` patch both definitions and call sites; they understand descriptors and emit diffs.
 - `workspace` subcommands query any classpath (default `sources`) for methods, fields, constants, class descriptors, and reference graph lookups.
 
-All mutating commands accept `--out` to redirect writes and `-n/--dry-run` to preview a diff without touching the inputs.
+The exact assembler and disassembler options, APIs, and round-trip behavior are
+documented in [assembly.md](assembly.md).
+
+Assembly and disassembly accept `--out`; disassembly also accepts `--stdout`.
+Refactoring, formatting, and optimization commands document `-n/--dry-run`
+when they support diff-only operation. Do not pass `-n` to `assemble` or
+`disassemble`.
+
+The repository Java compiler is a separate command:
+
+```bash
+node scripts/compileJava.js src/example/Main.java --out build/classes
+```
+
+There is currently no `jvm-cli.js compile` subcommand. See
+[compiler.md](compiler.md) for the compiler CLI and APIs.
 
 ## Workspace TUI
 
@@ -45,6 +60,11 @@ The in-process harness in `src/lsp/inProcessHarness.js` lets us spin up an LSP-c
 3. **Workspace Symbols & Navigation** — reuse `workspace.listMethods`, `workspace.listFields`, `workspace.listClasses`, and `workspace.findReferences` for `workspace/symbol`, `textDocument/documentSymbol`, and `textDocument/references`.
 4. **Auto-fix Suggestions** — dead-code optimizations can surface as auto-fixable diagnostics both in the CLI (`-n` diffs) and in editors; future passes (constant folding, verifier hints) can follow the same shape.
 
-Because all heavy lifting lives in plain JS modules (parser, CFG builder, optimizer, renamers), the LSP server can share code with the CLI/MCP server without bundlers. The same primitives also power CLI-based workflows, ensuring feature parity between headless pipelines (CI, MCP clients) and editor integrations.
+Because the heavy lifting lives in plain JS modules (parser, CFG builder,
+optimizer, and renamers), the LSP server shares code with the CLI and MCP
+server. Individual client capabilities remain documented in `docs/lsp.md`;
+do not infer that every CLI command has an LSP counterpart.
 
 For client authors and protocol implementers, see `docs/lsp.md` for the detailed request/response breakdown, sample payloads, and configuration knobs exposed during the LSP handshake.
+
+For the browser file/editor workflow, see [workbench.md](workbench.md).

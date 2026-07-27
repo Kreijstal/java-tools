@@ -6212,10 +6212,6 @@ function updateVariableName(updateLine) {
   return match ? match[1] : '';
 }
 
-function escapeRegExp(value) {
-  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
   if (stack.length) return null;
   const startLabel = labelName(codeItems[index]);

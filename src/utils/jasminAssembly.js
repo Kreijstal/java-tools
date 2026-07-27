@@ -6,7 +6,10 @@ const { getAST } = require('jvm_parser');
 const { convertJson, unparseDataStructures } = require('../parsing/convert_tree');
 const { parseKrak2Assembly } = require('../parsing/parse_krak2');
 const { convertKrak2AstToClassAst } = require('../parsing/convert_krak2_ast');
-const { writeClassAstToClassFile } = require('../parsing/classAstToClassFile');
+const {
+  assembleClass,
+  writeClassAstToClassFile,
+} = require('../parsing/classAstToClassFile');
 
 function parseJasminSource(sourceText) {
   return convertKrak2AstToClassAst(parseKrak2Assembly(sourceText), {
@@ -18,6 +21,12 @@ function assembleJasminSource(sourceText, outputClassPath, options = {}) {
   const classAst = parseJasminSource(sourceText);
   writeClassAstToClassFile(classAst, outputClassPath, options);
   return outputClassPath;
+}
+
+function assembleJasminBytes(sourceText, options = {}) {
+  const classAst = parseJasminSource(sourceText);
+  const cls = classAst.classes ? classAst.classes[0] : classAst;
+  return assembleClass(cls, options);
 }
 
 function assembleJasminFile(inputPath, outputClassPath = null, options = {}) {
@@ -61,6 +70,7 @@ function assembleJasminFixture(jasminDir, tempDir, jasminFile, options = {}) {
 
 module.exports = {
   parseJasminSource,
+  assembleJasminBytes,
   assembleJasminSource,
   assembleJasminFile,
   assembleJasminFixture,

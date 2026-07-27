@@ -2368,6 +2368,7 @@ function writeClassAstRootToDirectory(root, outputDir, options = {}) {
 }
 
 module.exports = {
+  assembleClass,
   encodeModifiedUtf8,
   writeClassAstToClassFile,
   writeClassAstRootToDirectory,

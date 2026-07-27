@@ -1,9 +1,11 @@
-# Java frontend scaffold
+# Java frontend internals
 
-This directory defines the source-level Java frontend boundary for `java-tools`.
-The AST schema and serialization layer are usable now, the lexer/parser cover the
-current repository Java corpus, and the later compiler phases remain explicit
-stubs.
+This directory contains the source-level frontend and JavaScript compiler used
+by `java-tools`. The lexer, parser, semantic model, Java IR, JVM bytecode IR, and
+class-file emission path compile the repository Java corpus without invoking a
+host `javac`. The same directory also contains a broader catalog of planned
+analysis passes; those pass-catalog entries remain explicit stubs where their
+sections say so and should not be confused with the working compiler pipeline.
 
 Pipeline shape:
 
@@ -12,11 +14,11 @@ Java source
   -> lexer/token stream
   -> parser
   -> serializable AST document
-  -> binder / symbol table              stubbed
-  -> type attribution                   stubbed
-  -> overload resolution                stubbed
-  -> control-flow / definite assignment stubbed
-  -> lowering / bytecode emission       stubbed
+  -> semantic model and descriptor resolution
+  -> Java IR
+  -> JVM bytecode IR and stack-map frames
+  -> class-file model / canonical Jasmin
+  -> binary .class files
 ```
 
 The parser is intentionally frontend-shaped instead of CFR-output-shaped. It
@@ -277,11 +279,13 @@ assignment, CFG initialization, skeletal Java CFG construction, bytecode CFG
 normalization, and CFG join validation, are included in the same catalog so the
 pipeline can run end-to-end while still making stub precision explicit.
 
-## Minimal source compiler scaffold
+## Source compiler
 
-The frontend now includes a first concrete Java-source-to-classfile path for the
-smallest useful executable subset: Hello World-style classes with `main` methods
-that call `System.out.println` with literal arguments.
+The frontend includes a concrete Java-source-to-classfile path. It compiles all
+Java sources in the repository compiler regression corpus, including ordinary
+control flow, exceptions, arrays, nested classes, interfaces, and covered enum
+lowering. Unsupported constructs fail explicitly; there is no host-compiler
+fallback.
 
 ```js
 const frontend = require('./src/java-frontend');
@@ -319,3 +323,6 @@ java -cp /tmp/hello-classes Hello
 The CLI uses the repository parser/lowering pipeline and the existing Jasmin
 assembly/classfile writer only; it never shells out to `javac`. By default, the
 CLI is fail-fast on unsupported constructs.
+
+For the supported public commands, browser API, result fields, and limitations,
+see [`docs/compiler.md`](../../docs/compiler.md).

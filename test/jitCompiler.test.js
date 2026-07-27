@@ -3981,6 +3981,191 @@ test('structured SSA feeds scalar operands directly into a verified fused region
   t.end();
 });
 
+test('structured fused sites resolve wrapper owners loaded after caller compilation', (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
+  } });
+  const owner = 'LateLoadedDirectFusedOwner';
+  const descriptor = '(I)V';
+  const call = {
+    op: 'invokestatic',
+    arg: ['Method', owner, ['arbitraryMember', descriptor]],
+  };
+  const site = jvm.jit.fusedRegions.getCompileTimeDirectCall(call);
+  t.ok(site, 'a cold wrapper owner retains an unresolved positional site');
+  t.equal(jvm.jit.fusedRegions.directEntries[site.id].target, null,
+    'caller compilation does not invent a cold method identity');
+
+  const callee = {
+    name: 'arbitraryMember', descriptor, flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
+      localsSize: '1', stackSize: '0', exceptionTable: [],
+    } }],
+  };
+  jvm.classes[owner] = {
+    ast: { classes: [{
+      className: owner, superClassName: null,
+      items: [{ type: 'method', method: callee }],
+    }] },
+    staticFields: new Map(),
+  };
+  jvm.classInitializationState.set(owner, 'INITIALIZED');
+  const observed = [];
+  const region = {
+    wrapperMethod: callee,
+    wrapperOwner: owner,
+    wrapperKernel: (_state, _region, _jit, value) => observed.push(value),
+    executionState: {},
+    dependencies: [],
+    staticOwners: [],
+    falseGuardTargets: [],
+  };
+  jvm.jit.fusedRegions.mayFuse = (method) => method === callee;
+  jvm.jit.fusedRegions.compile = (method, lookupClass) =>
+    method === callee && lookupClass === owner ? region : null;
+  jvm.jit.fusedRegions.guard = () => true;
+
+  const caller = new Frame({
+    name: 'caller', descriptor: '()V',
+    attributes: [{ type: 'code', code: {
+      codeItems: [{ labelDef: 'L0:', instruction: 'return' }],
+      localsSize: '0', stackSize: '1', exceptionTable: [],
+    } }],
+  });
+  const callStack = new Stack();
+  callStack.push(caller);
+  const handled = jvm.jit.fusedRegions.tryInvokeDirectAt(
+    site.id, caller, { status: 'runnable', callStack }, 73);
+  t.ok(handled, 'the same compiled site links after its owner loads');
+  t.deepEqual(observed, [73], 'resolved direct site feeds the scalar operand');
+  t.equal(jvm.jit.fusedRegions.directEntries[site.id].target.method, callee,
+    'runtime linkage retains the exact verified method identity');
+  t.equal(jvm.jit.fusedDirectRunCount, 1, 'late-linked direct execution is counted');
+  t.end();
+});
+
+test('structured callers retain continuations across cold fused void calls', (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
+  } });
+  const owner = 'ColdContinuationFusedOwner';
+  const descriptor = '(I)V';
+  const call = {
+    op: 'invokestatic',
+    arg: ['Method', owner, ['shapeOnlyMember', descriptor]],
+  };
+  const caller = {
+    name: 'callerWithColdVoidSite', descriptor: '(I)I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { instruction: 'iload_0' },
+        { instruction: call },
+        { instruction: 'iconst_0' },
+        { instruction: 'istore_1' },
+        { labelDef: 'Lloop:', instruction: 'iload_1' },
+        { instruction: 'iconst_1' },
+        { instruction: { op: 'if_icmpge', arg: 'Lreturn' } },
+        { instruction: { op: 'iinc', varnum: 1, incr: 1 } },
+        { instruction: { op: 'goto', arg: 'Lloop' } },
+        { labelDef: 'Lreturn:', instruction: 'iload_0' },
+        { instruction: 'iconst_1' },
+        { instruction: 'iadd' },
+        { instruction: 'ireturn' },
+      ],
+      localsSize: '2', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  jvm.jit.fusedRegions.mayFuse = () => true;
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(generated?.jvmStructuredContinuation,
+    'cold-call caller uses a resumable structured body');
+  const frame = new Frame(caller);
+  frame.locals[0] = 41;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const thread = { status: 'runnable', callStack };
+
+  const first = generated(frame, thread, jvm.jit, false);
+  t.ok(first?.deopt && first.transient,
+    'cold owner requests the canonical invocation path');
+  t.equal(frame.pc, 1, 'cold call operands are materialized at the invoke PC');
+  t.ok(generated.jvmHasStructuredContinuation(frame),
+    'the post-call scalar continuation is retained');
+
+  // The canonical interpreter executes the void invocation at PC 1 and leaves
+  // the caller at its post-call PC after the child completes.
+  frame.pc = 2;
+  frame.stack.items.length = 0;
+  delete frame.jitSkipOnce;
+  const resumed = generated(frame, thread, jvm.jit, false);
+  t.equal(resumed.value, 42, 'the exact post-call SSA continuation resumes');
+  t.notOk(generated.jvmHasStructuredContinuation(frame),
+    'normal return clears the retained continuation');
+  t.ok(callStack.isEmpty(), 'resumed return completes the caller frame');
+  t.end();
+});
+
+test('structured callers retain continuations while a void child is deoptimized', (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, fusedRegions: true, structuredSsa: true,
+  } });
+  const call = {
+    op: 'invokestatic',
+    arg: ['Method', 'ArbitraryDeoptimizingVoidOwner', ['member', '(I)V']],
+  };
+  const caller = {
+    name: 'callerWithDeoptimizingVoidChild', descriptor: '(I)I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { instruction: 'iload_0' },
+        { instruction: call },
+        { instruction: 'iconst_0' },
+        { instruction: 'istore_1' },
+        { labelDef: 'LvoidLoop:', instruction: 'iload_1' },
+        { instruction: 'iconst_1' },
+        { instruction: { op: 'if_icmpge', arg: 'LvoidReturn' } },
+        { instruction: { op: 'iinc', varnum: 1, incr: 1 } },
+        { instruction: { op: 'goto', arg: 'LvoidLoop' } },
+        { labelDef: 'LvoidReturn:', instruction: 'iload_0' },
+        { instruction: 'iconst_1' },
+        { instruction: 'iadd' },
+        { instruction: 'ireturn' },
+      ],
+      localsSize: '2', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  jvm.jit.fusedRegions.getCompileTimeDirectCall = () => ({
+    id: 0, paramCount: 1, returnsVoid: true,
+  });
+  jvm.jit.fusedRegions.tryInvokeDirectAt = () => false;
+  jvm.jit.tryInvokeSyncAt = (_id, frame) => {
+    frame.stack.items.length = 0;
+    return { deopt: true, transient: true, reason: 'deoptimized void child' };
+  };
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(generated?.jvmStructuredContinuation,
+    'the caller uses a resumable structured body');
+  const frame = new Frame(caller);
+  frame.locals[0] = 41;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const thread = { status: 'runnable', callStack };
+
+  const first = generated(frame, thread, jvm.jit, false);
+  t.equal(first?.reason, 'deoptimized void child',
+    'the exact child deoptimization is propagated');
+  t.equal(frame.pc, 2, 'the completed void invoke records its post-call PC');
+  t.ok(generated.jvmHasStructuredContinuation(frame),
+    'the caller retains its scalar post-call continuation');
+
+  const resumed = generated(frame, thread, jvm.jit, false);
+  t.equal(resumed.value, 42, 'execution resumes after the void child');
+  t.notOk(generated.jvmHasStructuredContinuation(frame),
+    'normal return clears the continuation');
+  t.end();
+});
+
 test('fused exceptions restore omitted wrapper and raster frames', (t) => {
   const jvm = new JVM({ jit: { warmupThreshold: 0, fusedRegions: true } });
   const descriptor = '(IIIIIIII)V';

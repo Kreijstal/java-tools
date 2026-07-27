@@ -125,6 +125,16 @@ async function buildSite() {
     const browserUITarget = path.join(distDir, 'browser-ui-enhancements.js');
     copyFile(browserUISource, browserUITarget);
 
+    console.log('📋 Copying workbench interface...');
+    copyFile(
+        path.join(srcDir, 'platform', 'workbench-ui.js'),
+        path.join(distDir, 'workbench-ui.js')
+    );
+    copyFile(
+        path.join(srcDir, 'platform', 'workbench.css'),
+        path.join(distDir, 'workbench.css')
+    );
+
     // Step 3.5: Copy AWT framework to dist for browser usage
     console.log('🎨 Copying AWT framework...');
     const awtSource = path.join(srcDir, 'platform', 'awt.js');

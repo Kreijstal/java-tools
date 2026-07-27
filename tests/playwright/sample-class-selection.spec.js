@@ -7,7 +7,7 @@ test.describe('Sample Class Selection UI', () => {
     await page.waitForLoadState('networkidle', { timeout: 10000 });
   });
 
-  test('should populate sample class dropdown with all 25 classes', async ({ page }) => {
+  test('should populate the sample browser with runnable classes only', async ({ page }) => {
     // Wait for the page to load and initialize the JVM
     await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
     
@@ -17,26 +17,25 @@ test.describe('Sample Class Selection UI', () => {
     // Get all options in the dropdown
     const options = await page.locator('#sampleClassSelect option').allTextContents();
     
-    // Should have at least 25 class options plus the default "Select a sample class..." option
-    const classOptions = options.filter(option => !option.includes('Select a sample class') && !option.includes('Loading...'));
-    expect(classOptions.length).toBeGreaterThanOrEqual(25);
+    const classOptions = options.filter(option => !option.includes('Select a runnable sample') && !option.includes('Loading...'));
+    expect(classOptions.length).toBeGreaterThan(10);
     
     // Check that some specific classes are present
     const optionText = options.join(' ');
     expect(optionText).toContain('Hello');
     expect(optionText).toContain('VerySimple');
     expect(optionText).toContain('RuntimeArithmetic');
-    expect(optionText).toContain('Calculator');
     expect(optionText).toContain('StringConcat');
     expect(optionText).toContain('ExceptionTest');
     expect(optionText).toContain('InvokeVirtualTest');
     expect(optionText).toContain('MainApp');
-    expect(optionText).toContain('TestMethods');
     expect(optionText).toContain('ArithmeticTest');
+    expect(optionText).toContain('PyramidApplet');
+    expect(optionText).not.toContain('Animal');
 
-    // Verify the sample classes heading is present
-    const heading = await page.locator('h4').filter({ hasText: 'Sample Classes' }).textContent();
-    expect(heading).toContain('Sample Classes');
+    await expect(page.locator('#sampleCatalog')).toBeVisible();
+    await page.locator('#sampleCatalog > summary').click();
+    expect(await page.locator('.sample-category').count()).toBeGreaterThanOrEqual(4);
   });
 
   test('should load a sample class successfully', async ({ page }) => {
@@ -55,7 +54,7 @@ test.describe('Sample Class Selection UI', () => {
     
     // Check that the status indicates successful loading
     const output = await page.locator('#output').textContent();
-    expect(output).toContain('Loading sample class: VerySimple.class');
+    expect(output).toContain('Loading class: VerySimple.class');
     
     // Verify that the Start Debugging button is enabled
     await expect(page.locator('#debugBtn')).toBeEnabled();
@@ -94,7 +93,7 @@ test.describe('Sample Class Selection UI', () => {
     const options = await page.locator('#sampleClassSelect option').allTextContents();
     
     // Filter out the default option
-    const classOptions = options.filter(option => !option.includes('Select a sample class') && !option.includes('Loading'));
+    const classOptions = options.filter(option => !option.includes('Select a runnable sample') && !option.includes('Loading'));
     
     // Each class option should be just the class name (no descriptions)
     for (const option of classOptions.slice(0, 5)) { // Check first 5 to avoid timeout
@@ -130,7 +129,7 @@ test.describe('Sample Class Selection UI', () => {
     
     // Check that the latest class was loaded successfully
     const output = await page.locator('#output').textContent();
-    expect(output).toContain('Loading sample class: RuntimeArithmetic.class');
+    expect(output).toContain('Loading class: RuntimeArithmetic.class');
     
     // Verify debugging can start with the latest class
     await page.click('#debugBtn');

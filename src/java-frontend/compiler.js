@@ -1,13 +1,13 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+const hostFs = require('fs');
+const hostPath = require('path');
 const ast = require('./ast');
 const { parseJava } = require('./parser');
 const { validateAstDocument } = require('./serialization');
 const { JavaFrontendError, UnsupportedJavaSyntaxError } = require('./errors');
-const { assembleJasminSource } = require('../utils/jasminAssembly');
-const { writeClassAstToClassFile } = require('../parsing/classAstToClassFile');
+const { assembleJasminBytes } = require('../utils/jasminAssembly');
+const { assembleClass } = require('../parsing/classAstToClassFile');
 const { jreCanonicalInternalName, jreClassInfo, jreInternalNameForSimpleName } = require('./jreMetadata');
 
 const COMPILE_RESULT_SCHEMA_ID = 'java-tools.java-frontend.compile-result';
@@ -16,6 +16,14 @@ const BYTECODE_IR_SCHEMA_ID = 'java-tools.java-frontend.bytecode-ir';
 const BYTECODE_IR_SCHEMA_VERSION = 1;
 const CLASSFILE_MODEL_SCHEMA_ID = 'java-tools.java-frontend.classfile-model';
 const CLASSFILE_MODEL_SCHEMA_VERSION = 1;
+
+function fileSystemFor(options = {}) {
+  return options.fileSystem || options.fs || hostFs;
+}
+
+function pathModuleFor(options = {}) {
+  return options.pathModule || hostPath;
+}
 
 const PRIMITIVE_DESCRIPTORS = Object.freeze({
   void: 'V',
@@ -1185,26 +1193,27 @@ function directClassAst(classIr) {
   };
 }
 
-function outputPathForClass(outputDir, internalName) {
-  return path.join(outputDir, `${internalName}.class`);
+function outputPathForClass(outputDir, internalName, pathModule = hostPath) {
+  return pathModule.join(outputDir, `${internalName}.class`);
 }
 
 function writeClassFilesFromModel(classFileModel, outputDir, options = {}) {
   if (!outputDir) {
     throw new TypeError('outputDir is required to write class files');
   }
+  const fileSystem = fileSystemFor(options);
+  const pathModule = pathModuleFor(options);
   const written = [];
-  fs.mkdirSync(outputDir, { recursive: true });
+  fileSystem.mkdirSync(outputDir, { recursive: true });
   for (const classModel of classFileModel.classes || []) {
-    const outputPath = outputPathForClass(outputDir, classModel.internalName);
-    fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    if (classModel.jasmin.length > 500000
+    const outputPath = outputPathForClass(outputDir, classModel.internalName, pathModule);
+    fileSystem.mkdirSync(pathModule.dirname(outputPath), { recursive: true });
+    const classBytes = classModel.jasmin.length > 500000
         && classModel.bytecodeClass
-        && canDirectAssembleClass(classModel.bytecodeClass)) {
-      writeClassAstToClassFile(directClassAst(classModel.bytecodeClass), outputPath, options.assembly || {});
-    } else {
-      assembleJasminSource(classModel.jasmin, outputPath, options.assembly || {});
-    }
+        && canDirectAssembleClass(classModel.bytecodeClass)
+      ? assembleClass(directClassAst(classModel.bytecodeClass), options.assembly || {})
+      : assembleJasminBytes(classModel.jasmin, options.assembly || {});
+    fileSystem.writeFileSync(outputPath, classBytes);
     written.push({
       internalName: classModel.internalName,
       binaryName: classModel.binaryName,
@@ -1339,11 +1348,13 @@ function createValidateClassFileModelPass(options = {}) {
 }
 
 function compileJavaFile(inputPath, options = {}) {
-  const source = fs.readFileSync(inputPath, 'utf8');
+  const fileSystem = fileSystemFor(options);
+  const pathModule = pathModuleFor(options);
+  const source = fileSystem.readFileSync(inputPath, 'utf8');
   return compileJavaSource(source, {
     ...options,
     sourcePath: inputPath,
-    sourceFileName: options.sourceFileName || path.basename(inputPath),
+    sourceFileName: options.sourceFileName || pathModule.basename(inputPath),
   });
 }
 
@@ -1376,26 +1387,31 @@ function collectDeclaredInternalNames(document) {
   return names;
 }
 
-function conflictOutputDir(outputDir, inputPath, index) {
-  const relative = path.relative(process.cwd(), path.resolve(inputPath));
-  const safe = (relative || path.basename(inputPath))
+function conflictOutputDir(outputDir, inputPath, index, options = {}) {
+  const fileSystem = fileSystemFor(options);
+  const pathModule = pathModuleFor(options);
+  const currentDirectory = options.cwd || (fileSystem === hostFs ? process.cwd() : '/');
+  const relative = pathModule.relative(currentDirectory, pathModule.resolve(inputPath));
+  const safe = (relative || pathModule.basename(inputPath))
     .replace(/[^A-Za-z0-9_.-]+/g, '_')
     .replace(/^_+|_+$/g, '') || `input_${index}`;
-  return path.join(outputDir, '.java-frontend-conflicts', `${index}_${safe}`);
+  return pathModule.join(outputDir, '.java-frontend-conflicts', `${index}_${safe}`);
 }
 
 function duplicateOutputIndexes(inputPaths, outputDir, options = {}) {
   if (!outputDir) return new Set();
+  const fileSystem = fileSystemFor(options);
+  const pathModule = pathModuleFor(options);
   const outputOwners = new Map();
   for (const [index, inputPath] of inputPaths.entries()) {
-    const source = fs.readFileSync(inputPath, 'utf8');
+    const source = fileSystem.readFileSync(inputPath, 'utf8');
     const document = parseJava(source, {
       ...options,
       sourcePath: inputPath,
-      sourceFileName: path.basename(inputPath),
+      sourceFileName: pathModule.basename(inputPath),
     });
     for (const internalName of collectDeclaredInternalNames(document)) {
-      const outputPath = path.resolve(outputPathForClass(outputDir, internalName));
+      const outputPath = pathModule.resolve(outputPathForClass(outputDir, internalName, pathModule));
       if (!outputOwners.has(outputPath)) {
         outputOwners.set(outputPath, new Set());
       }
@@ -1419,12 +1435,13 @@ function compileJavaFiles(inputPaths, options = {}) {
   if (inputPaths.length === 0) {
     throw new TypeError('compileJavaFiles requires at least one .java input path');
   }
+  const pathModule = pathModuleFor(options);
   const duplicateIndexes = duplicateOutputIndexes(inputPaths, options.outputDir, options);
-  const resolvedDirectories = inputPaths.map((inputPath) => path.dirname(path.resolve(inputPath)));
+  const resolvedDirectories = inputPaths.map((inputPath) => pathModule.dirname(pathModule.resolve(inputPath)));
   let sourceRoot = resolvedDirectories[0];
   for (const directory of resolvedDirectories.slice(1)) {
-    while (directory !== sourceRoot && !directory.startsWith(`${sourceRoot}${path.sep}`)) {
-      const parent = path.dirname(sourceRoot);
+    while (directory !== sourceRoot && !directory.startsWith(`${sourceRoot}${pathModule.sep}`)) {
+      const parent = pathModule.dirname(sourceRoot);
       if (parent === sourceRoot) break;
       sourceRoot = parent;
     }
@@ -1435,14 +1452,14 @@ function compileJavaFiles(inputPaths, options = {}) {
   const unsupported = [];
   for (const [index, inputPath] of inputPaths.entries()) {
     const outputDir = duplicateIndexes.has(index)
-      ? conflictOutputDir(options.outputDir, inputPath, index)
+      ? conflictOutputDir(options.outputDir, inputPath, index, options)
       : options.outputDir;
     const fileOptions = {
       ...options,
       sourceRoot: options.sourceRoot || sourceRoot,
       outputDir,
       sourcePath: inputPath,
-      sourceFileName: path.basename(inputPath),
+      sourceFileName: pathModule.basename(inputPath),
     };
     let result;
     try {

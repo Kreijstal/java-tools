@@ -1,7 +1,7 @@
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
+const hostFs = require('fs');
+const hostPath = require('path');
 const ast = require('./ast');
 const { parseJava } = require('./parser');
 const { validateAstDocument } = require('./serialization');
@@ -337,10 +337,15 @@ function formalParameterSignature(parameter, context) {
   return parameter.isVarargs ? `[${signature}` : signature;
 }
 
-function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
+function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, options = {}) {
   if (!sourcePath) return null;
-  const directory = sourcePathIsDirectory ? path.resolve(sourcePath) : path.dirname(path.resolve(sourcePath));
-  if (SOURCE_METADATA_CACHE.has(directory)) return SOURCE_METADATA_CACHE.get(directory);
+  const fileSystem = options.fileSystem || options.fs || hostFs;
+  const pathModule = options.pathModule || hostPath;
+  const directory = sourcePathIsDirectory
+    ? pathModule.resolve(sourcePath)
+    : pathModule.dirname(pathModule.resolve(sourcePath));
+  const useCache = fileSystem === hostFs;
+  if (useCache && SOURCE_METADATA_CACHE.has(directory)) return SOURCE_METADATA_CACHE.get(directory);
   const metadata = {
     classBySimpleName: new Map(),
     classFieldsByInternalName: new Map(),
@@ -351,8 +356,8 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
   };
   let files = [];
   function collectJavaFiles(current, out = []) {
-    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
-      const full = path.join(current, entry.name);
+    for (const entry of fileSystem.readdirSync(current, { withFileTypes: true })) {
+      const full = pathModule.join(current, entry.name);
       if (entry.isDirectory()) collectJavaFiles(full, out);
       else if (entry.isFile() && entry.name.endsWith('.java')) out.push(full);
     }
@@ -361,13 +366,15 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
   try {
     files = collectJavaFiles(directory);
   } catch (_) {
-    SOURCE_METADATA_CACHE.set(directory, metadata);
+    if (useCache) SOURCE_METADATA_CACHE.set(directory, metadata);
     return metadata;
   }
   const documents = [];
   for (const file of files) {
     try {
-      documents.push(parseJava(fs.readFileSync(file, 'utf8'), { sourceFileName: path.basename(file) }));
+      documents.push(parseJava(fileSystem.readFileSync(file, 'utf8'), {
+        sourceFileName: pathModule.basename(file),
+      }));
     } catch (_) {
       // The prelude is best-effort; the primary compilation path still reports real parse errors.
     }
@@ -518,7 +525,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false) {
   for (const document of documents) {
     for (const declaration of document.root.typeDeclarations || []) collectMembers(document, declaration);
   }
-  SOURCE_METADATA_CACHE.set(directory, metadata);
+  if (useCache) SOURCE_METADATA_CACHE.set(directory, metadata);
   return metadata;
 }
 
@@ -4674,9 +4681,42 @@ function lowerMethodInvocationWithExpectedDescriptor(expression, context, expect
 function lowerExpressionToJavaIrValueAsDescriptor(expression, context, descriptor) {
   const lambda = lowerLambdaToJavaIrValue(expression, descriptor, context);
   if (lambda) return coerceValueToDescriptor(lambda, descriptor);
-  const direct = lowerExpressionToJavaIrValue(expression, context);
+  let direct = lowerExpressionToJavaIrValue(expression, context);
+  if (direct && direct.meta && direct.meta.recoveredUnknownInstanceField
+      && descriptor !== 'Ljava/lang/Object;') {
+    const field = {
+      owner: direct.owner,
+      name: direct.name,
+      descriptor,
+      isStatic: false,
+    };
+    if (!context.inferredUnknownFields) context.inferredUnknownFields = new Map();
+    context.inferredUnknownFields.set(`${field.owner}.${field.name}`, field);
+    direct = { ...direct, type: descriptor, descriptor };
+  }
   const coerced = coerceValueToDescriptor(direct, descriptor);
   if (coerced && coerced.type === descriptor) return coerced;
+  if (expression && expression.kind === 'ArrayAccessExpression') {
+    const array = lowerExpressionToJavaIrValueAsDescriptor(
+      expression.array,
+      context,
+      `[${descriptor}`,
+    );
+    const index = lowerExpressionToJavaIrValueAsDescriptor(
+      expression.index,
+      context,
+      'I',
+    );
+    if (array && index) {
+      return {
+        kind: 'ArrayLoadValue',
+        type: descriptor,
+        array,
+        index,
+        meta: { recoveredExpectedArrayElement: true },
+      };
+    }
+  }
   if (expression && expression.kind === 'ConditionalExpression') {
     const condition = lowerExpressionToJavaIrValueAsDescriptor(expression.condition, context, 'Z');
     const consequent = lowerExpressionToJavaIrValueAsDescriptor(expression.consequent, context, descriptor);
@@ -4734,6 +4774,9 @@ function fieldMetadataForOwner(owner, name, context) {
     const current = pending.shift();
     if (!current || visited.has(current)) continue;
     visited.add(current);
+    const inferred = context.inferredUnknownFields
+      && context.inferredUnknownFields.get(`${current}.${name}`);
+    if (inferred) return inferred;
     const fields = context.classFieldsByInternalName && context.classFieldsByInternalName.get(current);
     if (fields && fields.has(name)) return fields.get(name);
     const jreField = jreFieldInfo(current, name);
@@ -5194,6 +5237,7 @@ function lowerExpressionToJavaIrValue(expression, context) {
         name: expression.name,
         descriptor: 'Ljava/lang/Object;',
         receiver: target,
+        meta: { recoveredUnknownInstanceField: true },
       };
     }
   }
@@ -6855,9 +6899,12 @@ function lowerStatementToJavaIrOps(statement, context) {
       }
     }
     if (expression && expression.kind === 'AssignmentExpression') {
-      const target = lowerExpressionToJavaIrValue(expression.left, context);
+      let target = lowerExpressionToJavaIrValue(expression.left, context);
+      const targetNeedsInference = target && target.meta
+        && target.meta.recoveredUnknownInstanceField;
       const rawValue = expression.operator === '='
-        ? (target ? lowerExpressionToJavaIrValueAsDescriptor(expression.right, context, target.type)
+        ? (target && !targetNeedsInference
+          ? lowerExpressionToJavaIrValueAsDescriptor(expression.right, context, target.type)
           : lowerExpressionToJavaIrValue(expression.right, context))
         : lowerExpressionToJavaIrValue({
           kind: 'BinaryExpression',
@@ -6865,6 +6912,17 @@ function lowerStatementToJavaIrOps(statement, context) {
           left: expression.left,
           right: expression.right,
         }, context);
+      if (targetNeedsInference && rawValue && rawValue.type) {
+        const field = {
+          owner: target.owner,
+          name: target.name,
+          descriptor: rawValue.type,
+          isStatic: false,
+        };
+        if (!context.inferredUnknownFields) context.inferredUnknownFields = new Map();
+        context.inferredUnknownFields.set(`${field.owner}.${field.name}`, field);
+        target = { ...target, type: rawValue.type, descriptor: rawValue.type };
+      }
       const value = target && coerceValueToDescriptor(rawValue, target.type);
       if (target && value) {
         if (target.kind === 'LocalValue') {
@@ -7850,6 +7908,7 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     currentMethodName: method.kind === 'ConstructorDeclaration' ? '<init>' : method.name,
     currentMethodIsStatic: modifierNames(method.modifiers).includes('static'),
     currentReturnDescriptor,
+    inferredUnknownFields: new Map(),
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
     constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
@@ -8022,7 +8081,11 @@ function lowerAstToJavaIr(document, options = {}) {
   }
   for (const declaration of document.root.typeDeclarations || []) collectClassNames(declaration);
 
-  const sourcePrelude = sourceDirectoryMetadata(options.sourceRoot || options.sourcePath, Boolean(options.sourceRoot));
+  const sourcePrelude = sourceDirectoryMetadata(
+    options.sourceRoot || options.sourcePath,
+    Boolean(options.sourceRoot),
+    options,
+  );
   if (sourcePrelude) {
     for (const [name, internalName] of sourcePrelude.classBySimpleName) {
       if (!classBySimpleName.has(name)) classBySimpleName.set(name, internalName);

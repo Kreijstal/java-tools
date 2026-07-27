@@ -1,439 +1,329 @@
-# JVM Debug API and Serialization
+# JVM debugger API
 
-This document describes the comprehensive JVM debugging and state serialization features added to the java-tools project.
+This document describes the current Node.js and browser debugger APIs. For the
+visual interface, see [`docs/workbench.md`](docs/workbench.md).
 
-## Overview
+## DebugController in Node.js
 
-The enhanced JVM implementation now supports:
-
-1. **Complete JVM state serialization/deserialization** - pause and resume execution across different Node.js runtime instances
-2. **Comprehensive debug API** - step-by-step execution control with breakpoints
-3. **Backtrace and call stack inspection** - detailed view of method calls with arguments
-4. **Value inspection** - examine stack values, local variables, and object fields
-5. **JavaScript debug interface** - high-level API for debug operations
-
-## Features
-
-### JVM State Serialization
-
-The JVM can now serialize its complete execution state, including:
-- Call stack with all frames
-- Operand stacks and local variables
-- Program counters and method information
-- Loaded classes and debug state
-- Breakpoints and stepping configuration
+`DebugController` owns a JVM, starts it paused, and exposes execution control,
+breakpoints, thread selection, inspection, rewind history, and debug-state
+serialization.
 
 ```javascript
-const jvm = new JVM();
-// ... load class and set up execution
+const DebugController = require("./src/debug/debugController");
 
-// Serialize complete state
-const state = jvm.serialize();
-
-// Create new JVM instance and restore state
-const newJvm = new JVM();
-newJvm.deserialize(state);
-// Execution continues from exact same point
-```
-
-### Debug API
-
-The debug API provides fine-grained control over JVM execution:
-
-#### Step Commands
-- **Step Into** - Execute next instruction, entering method calls
-- **Step Over** - Execute next instruction, but skip over method calls  
-- **Step Out** - Continue until current method returns
-- **Step Instruction** - Execute exactly one bytecode instruction
-- **Finish** - Run until current method completes
-
-#### Breakpoint Management
-- Set breakpoints at specific program counter locations
-- Remove individual breakpoints or clear all
-
-#### Backtrace and Call Stack Inspection
-
-The debugger now provides detailed call stack information with method arguments:
-
-```javascript
-const controller = new DebugController();
-controller.start('MyClass.class');
-
-// Get detailed backtrace with arguments and local variables
-const backtrace = controller.getBacktrace();
-backtrace.forEach(frame => {
-  console.log(`${frame.className}.${frame.methodName}`);
-  console.log(`  PC: ${frame.pc}, Line: ${frame.sourceLine}`);
-  
-  frame.arguments.forEach(arg => {
-    console.log(`  Arg ${arg.name} (${arg.type}): ${arg.value}`);
-  });
-});
-```
-
-#### Value Inspection
-
-Comprehensive value inspection capabilities for debugging:
-
-```javascript
-// Inspect execution stack
-const stackValues = controller.inspectStack();
-stackValues.forEach(item => {
-  console.log(`Stack[${item.index}]: ${item.description}`);
-});
-
-// Inspect local variables
-const locals = controller.inspectLocals();
-locals.forEach(local => {
-  console.log(`${local.name}: ${local.value} (${local.type})`);
-});
-
-// Inspect specific values
-const localVar = controller.inspectLocalVariable(1);
-const stackTop = controller.inspectStackValue(-1);
-
-// Get available variable names
-const variableNames = controller.getAvailableVariableNames();
-
-// Find variable by name (if debug info available)
-const variable = controller.findVariableByName('myVar');
-
-// Inspect object fields
-const objectInfo = controller.inspectObject(objReference);
-```
-- Automatic pause when breakpoints are hit
-
-#### State Inspection
-- View current program counter, stack, and local variables
-- Examine call stack depth and current method
-- Access complete execution state at any time
-
-## Usage Examples
-
-### Basic Debug Controller
-
-```javascript
-const DebugController = require('./src/debug/debugController');
-
-const controller = new DebugController();
-
-// Start debugging a program
-const result = controller.start('sources/Hello.class');
-console.log(`Status: ${result.status}`); // "started"
-
-// Set breakpoints
-controller.setBreakpoint(5);
-controller.setBreakpoint(10);
-
-// Step through execution
-const stepResult = controller.stepInto();
-console.log(`Current PC: ${stepResult.pc}`);
-
-// Continue until breakpoint or completion
-const continueResult = controller.continue();
-console.log(`Status: ${continueResult.status}`); // "paused" or "completed"
-
-// Inspect current state
-const state = controller.getCurrentState();
-console.log(`Stack: [${state.stack.join(', ')}]`);
-console.log(`Locals: [${state.locals.join(', ')}]`);
-
-// Enhanced debugging features
-const backtrace = controller.getBacktrace();
-console.log('Call Stack:');
-backtrace.forEach((frame, index) => {
-  console.log(`  Frame ${index}: ${frame.className}.${frame.methodName}`);
-  console.log(`    PC: ${frame.pc}, Line: ${frame.sourceLine}`);
-  frame.arguments.forEach(arg => {
-    console.log(`    ${arg.name}: ${arg.value} (${arg.type})`);
-  });
-});
-
-// Inspect stack and local variables
-const stackInspection = controller.inspectStack();
-const localsInspection = controller.inspectLocals();
-
-console.log('Stack Values:', stackInspection.map(s => s.description));
-console.log('Local Variables:', localsInspection.map(l => `${l.name}: ${l.value}`));
-```
-
-### State Serialization
-
-```javascript
-// Start debugging and make some progress
-controller.start('sources/Calculator.class');
-controller.stepInto();
-controller.stepInto();
-controller.setBreakpoint(15);
-
-// Serialize the state
-const serializedState = controller.serialize();
-
-// Save to file or database
-require('fs').writeFileSync('debug-state.json', JSON.stringify(serializedState));
-
-// Later, in different process/runtime:
-const savedState = JSON.parse(require('fs').readFileSync('debug-state.json'));
-
-const newController = new DebugController();
-newController.deserialize(savedState);
-
-// Continue from exact same execution point
-const continueResult = newController.continue();
-```
-
-### Web Application Integration
-
-```javascript
-// Express.js route example
-app.post('/debug/start', (req, res) => {
-    const controller = new DebugController();
-    const result = controller.start(req.body.classFile);
-    
-    res.json({
-        status: result.status,
-        state: controller.getCurrentState()
+async function main() {
+    const controller = new DebugController({
+        classpath: ["sources"],
+        rewindHistorySize: 50
     });
-});
 
-app.post('/debug/step/:type', (req, res) => {
-    const { type } = req.params;
-    let result;
-    
-    switch (type) {
-        case 'into': result = controller.stepInto(); break;
-        case 'over': result = controller.stepOver(); break;
-        case 'out': result = controller.stepOut(); break;
-        case 'instruction': result = controller.stepInstruction(); break;
-    }
-    
-    res.json(result);
-});
+    const started = await controller.start("VerySimple");
+    console.log(started.status); // started
+    console.log(controller.getCurrentState().executionState); // paused
 
-app.post('/debug/serialize', (req, res) => {
-    const state = controller.serialize();
-    // Store in session or database
-    req.session.debugState = state;
-    res.json({ status: 'serialized', size: JSON.stringify(state).length });
-});
+    await controller.stepInstruction();
+    console.log(controller.getCurrentState().pc);
+
+    controller.setBreakpoint(5);
+    const result = await controller.continue();
+    console.log(result.status); // paused or stopped
+}
+
+main().catch(console.error);
 ```
 
-### Enhanced Value Inspection
+`start` expects a class name resolvable through the configured classpath, not a
+host filesystem path such as `sources/VerySimple.class`.
+
+### Construction
 
 ```javascript
-// Detailed variable inspection example
-const controller = new DebugController();
-controller.start('sources/Calculator.class');
-
-// Execute a few steps to have data on stack and in locals
-controller.stepInto();
-controller.stepInto();
-
-// Get complete backtrace with method arguments
-const backtrace = controller.getBacktrace();
-console.log('=== CALL STACK BACKTRACE ===');
-backtrace.forEach((frame, index) => {
-  console.log(`Frame ${index}: ${frame.className}.${frame.methodName}${frame.methodDescriptor}`);
-  console.log(`  PC: ${frame.pc}, Source Line: ${frame.sourceLine || 'unknown'}`);
-  console.log(`  Return Type: ${frame.returnType}`);
-  
-  console.log('  Arguments:');
-  frame.arguments.forEach(arg => {
-    console.log(`    ${arg.name} (${arg.type}): ${arg.value !== undefined ? arg.value : 'undefined'}`);
-  });
-  
-  console.log('  Local Variables:');
-  frame.localVariables.forEach(local => {
-    console.log(`    [${local.index}] ${local.name} (${local.type}): ${local.value !== undefined ? local.value : 'undefined'}`);
-  });
-  
-  if (frame.stack.length > 0) {
-    console.log(`  Stack: [${frame.stack.join(', ')}]`);
-  }
-  console.log('');
+const controller = new DebugController({
+    classpath: ["classes", "lib"],
+    rewindHistorySize: 50
 });
+```
 
-// Inspect specific values
-console.log('=== VALUE INSPECTION ===');
+The controller passes JVM options through its constructor. A positive
+`rewindHistorySize` saves lightweight debugger snapshots before steps.
 
-// Stack inspection
-const stackValues = controller.inspectStack();
-console.log('Stack Values:');
-stackValues.forEach(item => {
-  console.log(`  [${item.index}] ${item.description}`);
-});
+### Execution control
 
-// Local variable inspection
-const locals = controller.inspectLocals();
-console.log('Local Variables:');
-locals.forEach(local => {
-  console.log(`  ${local.name} [${local.index}]: ${local.value !== undefined ? local.value : 'undefined'} (${local.type})`);
-});
+These methods are asynchronous unless noted:
 
-// Specific variable inspection
-const localVar1 = controller.inspectLocalVariable(1);
-if (localVar1) {
-  console.log(`Local variable 1: ${localVar1.description}`);
-}
+| Method | Result |
+| --- | --- |
+| `await start(className, options?)` | Resets execution at the class entry point and pauses |
+| `await continue()` | Runs until completion, a breakpoint, or another pause |
+| `pause()` | Requests a pause; valid while running |
+| `await stepInstruction()` | Executes one JVM tick |
+| `await stepInto()` | Executes one JVM tick |
+| `await stepOver()` | Executes one JVM tick |
+| `await stepOut()` | Executes one JVM tick |
+| `await finish()` | Executes one JVM tick |
+| `await threadStep()` | Advances until the selected thread becomes current again |
+| `reset()` | Replaces the owned JVM and clears the session |
 
-// Stack value inspection (negative index for top of stack)
-const topStackValue = controller.inspectStackValue(-1);
-if (topStackValue) {
-  console.log(`Top stack value: ${topStackValue.description}`);
-}
+Important current limitation: `stepInto`, `stepOver`, `stepOut`, `finish`, and
+`stepInstruction` currently share the same single-tick implementation. Their
+names reserve the intended debugger semantics, but callers must not yet assume
+method-level step-over, step-out, or finish behavior.
 
-// Available variable names
-const variableNames = controller.getAvailableVariableNames();
-console.log(`Available variables: ${variableNames.join(', ')}`);
+The controller state is one of `stopped`, `running`, or `paused`.
 
-// Find variable by name (if debug info is available)
-const variable = controller.findVariableByName('myVar');
-if (variable) {
-  console.log(`Found variable 'myVar': ${variable.description}`);
+### Breakpoints
+
+```javascript
+controller.setBreakpoint(12);
+controller.removeBreakpoint(12);
+controller.clearBreakpoints();
+console.log(controller.getBreakpoints());
+```
+
+Breakpoints are numeric bytecode program counters. They are currently stored as
+PC values rather than source-line or fully qualified method breakpoints.
+
+### Threads
+
+```javascript
+const threads = controller.getThreads();
+// [{ id, status }, ...]
+
+if (threads.length > 0) {
+    controller.selectThread(threads[0].id);
 }
 ```
 
-## API Reference
+`threadStep()` and inspection methods use the selected/current thread. The
+browser workbench disables its selector and displays “No active threads” before
+a session creates any threads.
 
-### JVM Class Methods
+### Current state and inspection
 
-#### Serialization
-- `serialize()` → `Object` - Returns complete JVM state
-- `deserialize(state)` - Restores JVM from serialized state
+```javascript
+const state = controller.getCurrentState();
 
-#### Debug Control  
-- `enableDebugMode()` - Enable debug stepping and breakpoints
-- `disableDebugMode()` - Disable debug features
-- `execute()` → `{paused: boolean, pc?: number, completed?: boolean}` - Execute with debug support
+console.log(state.executionState);
+console.log(state.currentThreadId);
+console.log(state.pc);
+console.log(state.method);          // { name, descriptor }
+console.log(state.stack);
+console.log(state.locals);
+console.log(state.callStackDepth);
+console.log(state.breakpoints);
+```
 
-#### Breakpoints
-- `addBreakpoint(pc)` - Add breakpoint at program counter
-- `removeBreakpoint(pc)` - Remove specific breakpoint  
-- `clearBreakpoints()` - Remove all breakpoints
+Additional inspection methods:
 
-#### Stepping
-- `stepInto()` - Prepare to step into next instruction
-- `stepOver()` - Prepare to step over method calls
-- `stepOut()` - Prepare to step out of current method
-- `stepInstruction()` - Prepare to step single instruction
-- `finish()` - Prepare to run until method return
-- `continue()` - Clear step mode and continue execution
+| Method | Description |
+| --- | --- |
+| `getBacktrace(threadId?)` | Frames for a thread |
+| `inspectStack(threadId?)` | Described operand-stack values |
+| `inspectLocals(threadId?)` | Described local variables |
+| `inspectLocalVariable(index, threadId?)` | One local variable |
+| `inspectStackValue(index, threadId?)` | One operand; negative indexes count from the top |
+| `inspectObject(reference)` | Object fields and values |
+| `getAvailableVariableNames(threadId?)` | Names supplied by class debug metadata |
+| `getDisassemblyView()` | Disassembly, PC mapping, and current instruction |
+| `isPaused()` | Whether the controller is paused |
+| `isCompleted()` | Whether the controller is stopped |
 
-#### State Inspection
-- `getCurrentState()` → `Object` - Get current execution state
-- `getBacktrace()` → `Array` - Get detailed call stack with arguments
-- `inspectStack()` → `Array` - Inspect execution stack values
-- `inspectLocals()` → `Array` - Inspect local variables with type info
-- `inspectLocalVariable(index)` → `Object|null` - Inspect specific local variable
-- `inspectStackValue(index)` → `Object|null` - Inspect specific stack value
-- `inspectObject(objRef)` → `Object|null` - Inspect object fields
-- `findVariableByName(name)` → `Object|null` - Find variable by name
-- `getAvailableVariableNames()` → `Array` - Get all variable names
-- `getSourceLineMapping(pc, method)` → `Object` - Get source line for PC
+Variable names and source mappings depend on optional class-file debug
+attributes. Slot and PC inspection remains available without them.
 
-### DebugController Class Methods
+## Debug snapshots and portable JVM save states
 
-#### Session Management
-- `start(classFilePath, options?)` → `{status, state}` - Start debug session
-- `reset()` → `{status}` - Reset to initial state
+There are two related state mechanisms.
 
-#### Execution Control
-- `continue()` → `{status, pc?, state}` - Continue execution
-- `stepInto()` → `{status, pc?, state}` - Step into next instruction
-- `stepOver()` → `{status, pc?, state}` - Step over method calls
-- `stepOut()` → `{status, pc?, state}` - Step out of current method
-- `stepInstruction()` → `{status, pc?, state}` - Execute single instruction
-- `finish()` → `{status, pc?, state}` - Run until method returns
+### Controller serialization
 
-#### Breakpoint Management
-- `setBreakpoint(pc)` → `{status, pc}` - Set breakpoint
-- `removeBreakpoint(pc)` → `{status, pc}` - Remove breakpoint
-- `clearBreakpoints()` → `{status}` - Clear all breakpoints
-- `getBreakpoints()` → `number[]` - Get all breakpoint locations
+`DebugController.serialize()` captures the controller execution state and the
+JVM’s debugger-oriented serialization. `deserialize` is asynchronous:
 
-#### State Management
-- `serialize()` → `Object` - Serialize complete state
-- `deserialize(state)` → `{status, state}` - Restore from serialized state
-- `getCurrentState()` → `Object` - Get current execution state
-- `getDisassemblyView()` → `Object` - Get formatted disassembly with current position
-- `getCurrentSourceMapping()` → `Object` - Get source line mapping for current PC
+```javascript
+const snapshot = controller.serialize();
 
-#### Enhanced Debugging
-- `getBacktrace()` → `Array` - Get detailed call stack with arguments and locals
-- `inspectStack()` → `Array` - Inspect execution stack values with type information
-- `inspectLocals()` → `Array` - Inspect local variables with names and types
-- `inspectLocalVariable(index)` → `Object|null` - Inspect specific local variable by index
-- `inspectStackValue(index)` → `Object|null` - Inspect specific stack value by index (supports negative indices)
-- `inspectObject(objRef)` → `Object|null` - Inspect object fields and properties
-- `findVariableByName(name)` → `Object|null` - Find variable by name (requires debug info)
-- `getAvailableVariableNames()` → `Array` - Get list of all available variable names
+const restored = new DebugController({
+    classpath: ["sources"],
+    rewindHistorySize: 50
+});
+await restored.deserialize(snapshot);
 
-#### Status Queries
-- `isPaused()` → `boolean` - Check if execution is paused
-- `isCompleted()` → `boolean` - Check if execution completed
+if (restored.isPaused()) {
+    await restored.continue();
+}
+```
 
-## Examples and Demos
+This is the mechanism used by rewind history. Treat it as an implementation-
+compatible debugger snapshot.
 
-### Command Line Demo
+### Portable JVM save state
+
+For application checkpoints across fresh JVM instances, prefer
+`JVM.saveState()` and `await JVM.loadState(state)`. These include loaded-class
+statics, heap objects, threads, frames, monitors, clocks, random state, and
+supported open-file state. Generated JIT code is rebuilt after restoration.
+
+Host sockets, audio devices, and canvas objects are not serialized. The
+`externalResources` section reports resources the embedding must reconnect.
+
+See the portable save-state section in [`README.md`](README.md#portable-save-states)
+for the runtime example and constraints.
+
+## BrowserJVMDebug
+
+The browser bundle exports:
+
+```javascript
+const { BrowserJVMDebug } = window.JVMDebug;
+const debug = new BrowserJVMDebug();
+await debug.initialize();
+```
+
+Initialization options:
+
+- `workspaceFileSystem`: attach an existing workspace;
+- `workspace: true`: create the default in-memory ZenFS workspace;
+- `dataPackage`: load a decoded data-package object;
+- `dataUrl`: fetch a JSON data-package URL.
+
+`dataUrl` expects JSON. Do not pass the workbench’s ZIP archive to this option;
+the workbench fetches and extracts `data.zip` through its file provider.
+
+### Upload and start
+
+```javascript
+const loaded = await debug.loadFile(classFile);
+await debug.start(loaded.virtualPath);
+
+await debug.stepInstruction();
+console.log(debug.getCurrentState());
+```
+
+`loadFile` accepts a browser `File`. JAR uploads are extracted by the file
+provider; `getJarInfo(fileName)` reports their classes, resources, and manifest
+entry point.
+
+### Running without debugging
+
+```javascript
+await debug.run("example/Main");
+```
+
+`run` executes to completion without the initial debugger pause. It rejects use
+before `initialize()`.
+
+### Browser execution and inspection API
+
+`BrowserJVMDebug` forwards the controller methods:
+
+- `continue`, `pause`, `stepInto`, `stepOver`, `stepOut`,
+  `stepInstruction`, and `rewind`;
+- `setBreakpoint`, `removeBreakpoint`, `clearBreakpoints`, and
+  `getBreakpoints`;
+- `getCurrentState`, `getDisassemblyView`, `getBacktrace`, `inspectStack`,
+  `inspectLocals`, and `getAvailableVariableNames`;
+- `getThreads` and `selectThread`;
+- `serialize`, `deserialize`, `saveState`, `loadState`, and `reset`.
+
+Execution and restoration methods that return promises must be awaited.
+
+## Browser compiler, assembler, disassembler, and workspace
+
+The same browser entry point exposes the workbench’s bytecode tools:
+
+```javascript
+const tools = window.JVMDebug.javaTools;
+
+const compiled = tools.compileJava(javaSource, {
+    sourceFileName: "Main.java",
+    sourceLevel: 8
+});
+
+const classBytes = tools.assembleJasmin(jasminSource);
+const javaSource = tools.decompileClass(classBytes, { allowFallback: true });
+```
+
+Class disassembly is available from the debug instance:
+
+```javascript
+const jasmin = debug.getClassDisassembly(classBytes);
+```
+
+For multi-file compilation:
+
+```javascript
+await debug.ensureWorkspace();
+debug.writeWorkspaceFile("/src/example/Main.java", source);
+
+const result = debug.compileWorkspace(
+    ["/src/example/Main.java"],
+    {
+        sourceRoot: "/src",
+        outputDir: "/classes",
+        sourceLevel: 8
+    }
+);
+```
+
+Workspace methods include `ensureWorkspace`, `writeWorkspaceFile`,
+`readWorkspaceFile`, `compileWorkspace`, and `getFileProvider`.
+
+See [compiler.md](docs/compiler.md) and [workbench.md](docs/workbench.md) for the
+complete workflows.
+
+## Visual debugger
+
+Build and serve the current browser workbench:
+
+```bash
+npm run build
+npm run serve
+```
+
+Open <http://localhost:3000/>, load a class or JAR, and choose **Debug**.
+The view combines bytecode, the current instruction, xterm.js, thread selection,
+stack, locals, call frames, breakpoints, and rewind controls.
+
+Do not open `examples/debug-web-interface.html` directly from `file://`; use the
+built site so the browser bundle, sample archive, worker assets, and styles are
+available.
+
+## Tests and executable example
+
+The command-line demonstration is:
+
 ```bash
 node scripts/debugDemo.js
 ```
-Demonstrates all debug features with VerySimple.class
 
-### Web Interface Demo
-Open `examples/debug-web-interface.html` in a browser to see a visual debug interface demonstration.
-
-## Testing
-
-The debug functionality is thoroughly tested:
+Focused tests live in:
 
 ```bash
-npm test
+node node_modules/tape/bin/tape \
+  test/debug.test.js \
+  test/debug-enhanced.test.js \
+  test/thread-debugger.test.js \
+  test/rewind-debugger.test.js
+npx playwright test tests/playwright/workbench-interface.spec.js \
+  --project=chromium
 ```
 
-Tests include:
-- JVM state serialization and deserialization
-- Debug controller operations
-- Step execution modes
-- Breakpoint management
-- Error handling
-- State persistence across runtime instances
+Use the repository test runner if a focused filename changes:
 
-## Integration Notes
+```bash
+npm test -- debug
+```
 
-### Node.js Backend Integration
-The debug controller is designed to run in Node.js backend services. For web applications:
+## Current limitations
 
-1. Create debug sessions on the backend
-2. Expose debug controls via REST API or WebSocket
-3. Store serialized state in databases or session storage
-4. Allow multiple clients to debug the same session
-
-### Multi-Runtime Support
-State serialization enables:
-- Pausing execution in one Node.js process
-- Transferring state to another process/server
-- Resuming execution with full fidelity
-- Load balancing debug sessions across servers
-
-### Performance Considerations
-- Debug mode adds minimal overhead when not stepping
-- Serialization creates deep copies of all state
-- Large call stacks will increase serialization time
-- Consider compression for stored debug states
-
-## Limitations
-
-- Only supports bytecode instructions currently implemented in the JVM
-- Exception handling during debug mode needs more testing
-- Native method calls are not debuggable
-- Multi-threading not yet supported
-
-## Future Enhancements
-
-- Watch expressions and variable modification
-- Conditional breakpoints
-- Call stack navigation
-- Memory and performance profiling
-- Integration with standard debug protocols (DAP)
-- Hot code reloading during debug sessions
+- semantic step-over, step-out, and finish are not yet distinct from a single
+  JVM tick;
+- breakpoints are numeric bytecode PCs, not source breakpoints;
+- local names and source lines require class debug metadata;
+- native host operations cannot be stepped through internally;
+- portable save states cannot contain live host sockets, audio devices, or
+  canvas objects;
+- entering debugger/tracing mode disables optimized execution paths that cannot
+  preserve exact frame and PC visibility.

@@ -2118,6 +2118,11 @@ the 2140-triangle hash gate, 400+800 randomized differential iterations
 (including an extended ±30 out-of-bounds coordinate range), 299 jit tests,
 clean boot, and acceptance.
 
+This describes the historical deployment. As of 2026-07-27 the fingerprint
+translation is an opt-in differential/code-shape oracle
+(`JVM_ENABLE_HANDWRITTEN_FUSED=1`), not a default runtime tier. Production
+performance must come from bytecode-derived generated kernels.
+
 Acceptance: 13.79 / 14.46 / 14.81 → **median 14.46, new best** (prior 14.12).
 
 **The bigger finding: the old attribution was inflated by its own probe.**
@@ -4699,3 +4704,338 @@ Validation:
   38/38 passing.
 - `npm run build:bundle`: successful with the four existing webpack size and
   dynamic-require warnings.
+
+## 2026-07-27: phase-aware Node logo profile corrects the 50 FPS claim
+
+The historical 49.999 FPS Node result was valid for its fixed frame-25→200
+window, but it was not a Jagex-logo benchmark. Visual inspection of the saved
+surfaces shows frame 25 on the logo and frame 50 onward on the login screen.
+Most of that interval therefore measured login-screen publications. It cannot
+be used as the old side of a "50 FPS logo → 18 FPS logo" regression.
+
+The checked-in `dekobloko-work/scripts/benchmark-dekobloko-node-logo.js`
+harness now classifies sampled 640×480 surfaces before calculating FPS. The
+verified logo frames contain at most about 16,000 non-black pixels; the login
+panel contains about 68,000. The deliberately wide 50,000-pixel boundary
+separates every captured state. The benchmark reports the complete cold phase
+and a warm phase beginning at published frame 20, and stops the phase at the
+first login-classified sample. PNG work occurs only every ten frames.
+
+Three fresh unprofiled Node processes measured:
+
+| run | full logo FPS | warm logo FPS | last logo | first login | errors |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 15.3007 | 21.0144 | 90 | 100 | 0 |
+| 2 | 14.8930 | 20.5396 | 90 | 100 | 0 |
+| 3 | 16.0339 | 20.5516 | 90 | 100 | 0 |
+| **median** | **15.3007** | **20.5516** | — | — | **0** |
+
+The initial surface in all three runs retained SHA-256
+`b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`.
+Animated logo and login hashes legitimately varied with clock phase. The
+phase transition and non-black-pixel classification were stable.
+
+### Low-overhead CPU profile
+
+V8 native sampling was enabled around a separate frame-0→70 run; JVM method
+and per-entry timing probes remained disabled. In the final 2.750 seconds,
+which correspond to the warm logo:
+
+- `ug.a(Lvg;IIIZIII)V` owned 68.3% inclusive;
+- the fused gradient raster `oj.a(IIIIIIIBIIII[IIIII)V` owned 25.4%;
+- the generic generated `ug` resume body alone used 29.6% self;
+- fused-entry guards used 5.1% self;
+- PNG encoding used 0.3% self.
+
+The complete profile showed why the generic resume body appeared. Node begins
+with the Wasm-first policy. A partial `ug` module can exit at a nonzero
+bytecode PC; structured SSA requires PC 0 or its own continuation, so that
+invocation resumes in the generic generated body. This transition is real,
+but it is not the main explanation for the apparent 50→18 regression:
+
+- increasing `JVM_EVENT_LOOP_YIELD_MS` from the resolved default 16 to 1000
+  raised the comparable warm interval from 18.2146 to 20.4246 FPS;
+- forcing `JVM_PREFER_WHOLE_METHOD_JS=1` measured only 18.8188 warm FPS and
+  delayed the login transition beyond sampled frame 100;
+- the default three-run series converged at 20.55 warm FPS, and the enlarged
+  scheduler-slice run published each ten-frame group in about 0.49 seconds.
+
+The conclusion is that current Node logo publication is approximately a 20 Hz
+phase with roughly 10% avoidable resume/scheduler overhead. The old 50 FPS
+number described a different screen. Firefox's observed 1–3 FPS startup
+remains a separate problem: remote diagnostics showed asset/audio/class-
+initialization work starving visible logo publication, not a 2 FPS Canvas or
+steady renderer ceiling.
+
+### Reproducibility record
+
+The authoritative run must include immutable source and generated-artifact
+identity. The three-run series above used:
+
+- Node `v26.4.0`, Linux x64;
+- `java-tools` commit SHA-1
+  `f2cd1a8b2189a73e3ac8ecd7da072dd8ec9dc4cd`, tree SHA-1
+  `66117dad014dd56e2d7497cad743f645d22a807f`, tracked clean; the checkout
+  had unrelated untracked runtime files;
+- `dekobloko-work` commit SHA-1
+  `b8ef21dae3f68bb6075789a2b0cdbdff1a6e6d3a`, tree SHA-1
+  `22729e097d6db21b824231472e9000dd390f6969`, tracked dirty because the
+  benchmark/provenance implementation itself was under test; its tracked
+  binary patch SHA-1 was `7d6e032defde7ff842f89f6d60e257dd0929afa8`;
+- declared generating JAR `/home/kreijstal/git/dekobloko-work/dekobloko.jar`,
+  SHA-1 `0247481f656556ba685ce399f119f074fa679951`, SHA-256
+  `a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`;
+- measured 344-file generated class tree at
+  `.work/jvmjs/hybrid-all-recompiled-lean-carriers/classes`, deterministic
+  SHA-256
+  `b2e7bce0e174a31bb0a0984f6bde2e2312e2ed5c009b058e29c4145c3cfce411`.
+
+The exact environment was
+`JVM_BENCHMARK_METADATA=1`, `JVM_FAKE_TIME=1000000000000`,
+`JVM_FAKE_TIME_REALTIME=1`, `JVM_WASM_JIT=1`,
+`JVM_WASM_STRUCTURED=1`, `JVM_ENABLE_RENDERER_PIPELINE=1`,
+`JVM_FRAME_EVERY=10`, `JVM_FRAME_LIMIT=11`, and
+`JVM_EXIT_AFTER_FRAME_LIMIT=1`, plus the per-run `JVM_FRAME_DIR`.
+
+Resolved gates were: 16 ms message-channel scheduler yield, interpreter burst
+1024, realtime fake clock, method/time profiling off, Node Wasm-first policy,
+renderer pipeline/scalar loops/scalar guest bodies on, scalar-SSA extras off,
+long-arithmetic Wasm-first on, structured Wasm on, structured SSA
+continuations/dispatch islands/deferred call materialization/local value
+numbering/static-boolean guards/coarse counted-loop safe points/atomic bounded
+loops on, and fused direct calls/handwritten kernels on with semantic raster
+kernels off.
+
+Going forward, an FPS result is authoritative only when it records the two
+commit and tree SHA-1s, dirty state and recoverable tracked patches, generating
+JAR hashes, generated class-tree hash, exact environment, resolved gates,
+phase rule, surface hashes, Node/browser version, and runtime errors. The new
+benchmark writes all of these to `result.json`; it also saves dirty tracked
+patches and hashes the exact benchmark and runner scripts.
+
+## 2026-07-27: preserving SSA across void-child deopts unlocks direct fusion
+
+The preceding conclusion that only about 10% of the logo cost was avoidable
+was wrong. It described the symptom in the native profile, but not why the
+structured body had fallen permanently into its generic resume companion.
+
+Exit-only linkage telemetry found two verified direct wrapper entries and
+hundreds of thousands of ordinary fused executions, but exactly zero direct
+fused executions. A trace of the generated outer body proved that the direct
+sites were present. The first structured invocation reached them before all
+wrapper/raster dependencies were linkable. Its canonical void-child fallback
+then returned a transient child deoptimization from the generated function.
+Although the child later completed, the caller's scalar generator continuation
+had been discarded. Every subsequent face therefore ran through the generic
+resume body, materialized the operand stack, and dispatched the wrapper call
+through `tryInvokeSyncAt`.
+
+The SSA renderer now retains a continuation across three scheduler-visible
+void-call outcomes:
+
+- the target is not synchronously linkable yet and must execute canonically;
+- a generated child returns a transient deoptimization;
+- the child changes the thread out of the runnable state.
+
+Before yielding, it records the exact invoke or post-invoke PC and materializes
+the JVM state required by the child/interpreter. After the void child completes,
+the caller resumes its existing scalar locals at the post-call PC. Non-void
+children retain the conservative old behavior because their eventual return
+value must be reconstructed before an SSA continuation can consume it.
+Exceptions still materialize the throwing invoke operands and use the normal
+dispatcher. Cold direct sites are linked only after the owner loads and still
+require the exact descriptor, static method identity, complete bytecode/CFG
+shape proof, initialized classes, and normal debugger/trace guards. No guest
+class or method name is used by tier selection.
+
+The direct counter changed from 0 to the complete fused population. In the
+accepted three clean processes:
+
+| run | full logo FPS | warm logo FPS | last logo | first login | direct / fused | errors |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 27.7532 | 36.1377 | 160 | 170 | 427,055 / 427,055 | 0 |
+| 2 | 26.9764 | 35.5775 | 160 | 170 | 421,847 / 421,847 | 0 |
+| 3 | 26.7509 | 36.3159 | 160 | 170 | 427,055 / 427,055 | 0 |
+| **median** | **26.9764** | **36.1377** | — | — | — | **0** |
+
+This is a 75.8% increase over the preceding 20.5516 warm median. The logo lasts
+for a fixed wall-clock interval, so a faster renderer publishes more logo
+frames before the login transition; the capture window was increased from 11
+to 22 ten-frame samples. All runs retained initial surface SHA-256
+`b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`,
+classified the first login surface at frame 170, and reported no runtime
+errors. The complete per-sample hashes are in each `result.json`.
+
+The accepted result used Node `v26.4.0` on Linux x64 and:
+
+- `java-tools` commit
+  `f2cd1a8b2189a73e3ac8ecd7da072dd8ec9dc4cd`, tree
+  `66117dad014dd56e2d7497cad743f645d22a807f`, tracked dirty; run-two
+  tracked-diff SHA-1 `1e7c67f4431fe8ba13794fc9e498b396cb21e858`
+  and saved patch SHA-256
+  `9f441aca1ae08b9b4bb0486cbc1da4be5a9cfa65f9709f8871887ce4d818e97a`;
+- `dekobloko-work` commit
+  `b8ef21dae3f68bb6075789a2b0cdbdff1a6e6d3a`, tree
+  `22729e097d6db21b824231472e9000dd390f6969`, tracked dirty; run-two
+  tracked-diff SHA-1 `ba8de1f091e00c9a48cd4636d7cec32fa72704ae`
+  and saved patch SHA-256
+  `89e1683dba9dbe140a3e6671e825334e7b699de9010cea74f405bbed68c2ec44`;
+- generating `dekobloko.jar` SHA-1
+  `0247481f656556ba685ce399f119f074fa679951`, SHA-256
+  `a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`;
+- 344 generated class files with tree SHA-256
+  `b2e7bce0e174a31bb0a0984f6bde2e2312e2ed5c009b058e29c4145c3cfce411`.
+
+The exact explicit environment was:
+
+```text
+JVM_BENCHMARK_METADATA=1
+JVM_ENABLE_RENDERER_PIPELINE=1
+JVM_EXIT_AFTER_FRAME_LIMIT=1
+JVM_FAKE_TIME=1000000000000
+JVM_FAKE_TIME_REALTIME=1
+JVM_FRAME_DIR=<per-run artifact>/frames
+JVM_FRAME_EVERY=10
+JVM_FRAME_LIMIT=22
+JVM_WASM_JIT=1
+JVM_WASM_STRUCTURED=1
+```
+
+Resolved gates were a 16 ms message-channel yield, interpreter burst 1024,
+realtime fake clock, JIT enabled, method/timing probes disabled, Wasm-first
+whole-method policy, renderer pipeline/scalar loops/scalar guest bodies
+enabled, scalar-SSA extras disabled, long-arithmetic Wasm-first enabled,
+structured Wasm enabled, all structured-SSA continuation/dispatch/deferred
+materialization/local-value/static-boolean/coarse-safe-point/atomic-loop gates
+enabled, and fused direct calls plus handwritten kernels enabled with semantic
+raster kernels disabled.
+
+Validation:
+
+- `timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js`:
+  691/691 passing;
+- `timeout 90s node node_modules/tape/bin/tape
+  test/schedulerPerformance.test.js test/browserBundleConfig.test.js`:
+  38/38 passing;
+- `node scripts/differentialFusedRenderers.js
+  ../dekobloko-work/.work/jvmjs/hybrid-all-recompiled-lean-carriers/classes`:
+  200 gradient and 200 flat invocations passed;
+- `npm run build:bundle`: successful with the four existing webpack warnings.
+
+### Handwritten code is the target, not the tier
+
+Exit counters added after the accepted series verified that its 36 FPS result
+installed and executed zero fingerprint-selected handwritten regions.
+`JVM_DISABLE_HANDWRITTEN_FUSED=1` measured 35.8601 warm FPS versus 35.6773
+without the variable, with 424,451 direct generated fused executions in both
+runs. The difference is noise. The fingerprint implementation is now opt-in
+only via `JVM_ENABLE_HANDWRITTEN_FUSED=1`.
+
+The live differential harness now uses three independent runtimes:
+
+1. canonical baseline execution;
+2. generated fusion with every handwritten kernel disabled;
+3. the structurally derived compact handwritten raster as the target oracle.
+
+For both renderer descriptors, all 200 cases produce identical pixels across
+all three runtimes and the oracle counter proves the handwritten target really
+ran 200 times. The generated-source contract additionally requires a fixed
+positional wrapper ABI, scalar wrapper/raster locals, a counted scalar
+scanline loop, and no `Frame`, operand-stack access, `tryInvokeSyncAt`, or
+`runGeneratedFrame`.
+
+This does not yet mean textual/code-shape identity. The generated raster still
+uses scalar `pc` plus `switch` to represent its verified CFG, while the target
+uses lexical loops. Removing that final scalar dispatch through generic CFG
+structuring is the remaining compiler task; copying or fingerprint-selecting
+the handwritten implementation would not satisfy it.
+
+## 2026-07-27: generic lexical fused kernels recover 50 FPS
+
+The remaining task above is complete for the fused-region opcode subset.
+`FusedRegionCompiler` now feeds each verified wrapper/raster/scanline CFG to
+the shared Ramsey structurer and emits lexical JavaScript blocks, `if` branches,
+labeled `while` loops, `break`, and `continue`. Operand values crossing an edge
+are assigned to fixed destination-block join slots; there is no runtime
+operand stack and no scalar `pc` dispatcher. Locals remain scalar JavaScript
+variables. Static locations, child kernels, precise throwing PCs, locals, and
+operand snapshots use the same verified region metadata as the state-machine
+fallback.
+
+The compiler is generic:
+
+- admission is still descriptor/opcode/CFG/stack and repeated-callee shape;
+- method and class names do not participate;
+- irreducible/switch/unsupported CFGs retain the existing generated fallback;
+- handler-only code is excluded from normal CFG emission but exception state
+  is still reconstructed for the JVM dispatcher;
+- an always-throwing early bailout keeps a compile-time placeholder solely to
+  preserve verifier stack shape for syntactically following code;
+- `JVM_DISABLE_LEXICAL_FUSED_KERNELS=1` selects the old scalar state machine
+  for same-bundle differential measurement.
+
+The checked differential harness now requires `lexicalRaster: true` and
+`rasterPcSwitch: false` for both families. Canonical JVM execution, generated
+lexical fusion, and the handwritten target produced identical pixels for 200
+gradient plus 200 flat invocations. The target counter proved that the
+handwritten oracle actually executed every case. The focused exception,
+initialization, debugger, and restored-frame tests also execute with lexical
+kernels enabled by default.
+
+One same-bundle state-machine control measured 33.5565 warm logo FPS with
+445,283 direct fused calls, zero lexical kernels, zero handwritten kernels,
+and no errors. The lexical series measured:
+
+| run | full logo FPS | warm logo FPS | first login | lexical kernels | direct fused | errors |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 38.1041 | 49.8804 | 240 | 6 | 604,127 | 0 |
+| 2 | 38.3455 | 49.9991 | 240 | 6 | 604,127 | 0 |
+| 3 | 37.9219 | 49.9991 | 240 | 6 | 604,127 | 0 |
+| **median** | **38.1041** | **49.9991** | — | — | — | **0** |
+
+The repeated 49.999 values indicate that the generated renderer has reached
+the guest's approximately 50 Hz pacing boundary in this realtime-fake-clock
+Node configuration. Unlike the historical fixed frame-25→200 result, every
+sample used for this rate is classified as Jagex-logo; the first login sample
+is frame 240.
+
+Run-two provenance:
+
+- Node `v26.4.0`, Linux x64;
+- `java-tools` commit/tree
+  `f2cd1a8b2189a73e3ac8ecd7da072dd8ec9dc4cd` /
+  `66117dad014dd56e2d7497cad743f645d22a807f`, tracked dirty,
+  tracked-diff SHA-1 `cda06ac5804e46569443f07789c97a7c7f8d12ed`,
+  saved patch SHA-256
+  `7ae87a2f3e3479b2bb897338c27a186cd93984cd9d5b253bec698fa4c8d87428`;
+- `dekobloko-work` commit/tree
+  `b8ef21dae3f68bb6075789a2b0cdbdff1a6e6d3a` /
+  `22729e097d6db21b824231472e9000dd390f6969`, tracked dirty,
+  tracked-diff SHA-1 `53f63ca4c7fb69160f7bf1693dda1db4327aafe6`,
+  saved patch SHA-256
+  `fc8d79ca1089fc7caddc69e3bee844ff7e3cd19a754a9eb0036d7578d103682f`;
+- generating JAR SHA-1
+  `0247481f656556ba685ce399f119f074fa679951`, SHA-256
+  `a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`;
+- generated 344-file class-tree SHA-256
+  `b2e7bce0e174a31bb0a0984f6bde2e2312e2ed5c009b058e29c4145c3cfce411`;
+- benchmark/runner SHA-256
+  `01aa65963cc62590ccaa15ae33cfacd35f0a626cec57fd20994b2788de2937ee` /
+  `1e61a3047d34ddb1fb9bb57aea288a05cd85ed92d9884027a7f525ab8c7bfa4e`.
+
+Explicit environment was `JVM_BENCHMARK_METADATA=1`,
+`JVM_ENABLE_RENDERER_PIPELINE=1`, `JVM_EXIT_AFTER_FRAME_LIMIT=1`,
+`JVM_FAKE_TIME=1000000000000`, `JVM_FAKE_TIME_REALTIME=1`,
+the per-run `JVM_FRAME_DIR`, `JVM_FRAME_EVERY=10`, `JVM_FRAME_LIMIT=36`,
+`JVM_WASM_JIT=1`, and `JVM_WASM_STRUCTURED=1`.
+
+Resolved fused gates were enabled/direct/lexical
+`true/true/true`, handwritten/semantic-raster `false/false`; all previously
+recorded structured-SSA, Wasm, scheduler, and profiling gates were unchanged.
+The initial surface SHA-256 remained
+`b13065a65ee4864a589226b72c486efb790f4ce7bfe2434570e79d8506c48191`.
+
+Validation after the lexical emitter change: 691/691 focused JIT assertions,
+38/38 scheduler/browser assertions, the 400-invocation three-runtime
+differential, and `npm run build:bundle` all passed. The bundle retained only
+the four existing webpack warnings.

@@ -12,6 +12,10 @@ const { setFileProvider } = require('../core/classLoader');
 const awtFramework = require('./awt');
 const audioPlatform = require('./audio');
 const legacyPlatform = require('./legacy');
+const { decompileClassBytes } = require('../decompiler/cfr');
+const { compileJavaSource, compileJavaFiles } = require('../java-frontend/compiler');
+const { assembleJasminBytes } = require('../utils/jasminAssembly');
+const { getDefaultZenFSWorkspace } = require('../io/ZenFSWorkspace');
 // const { getDisassembled } = require('jvm_parser'); // No longer needed - using krak2 format
 
 function thrownValueMessage(error) {
@@ -42,6 +46,64 @@ function thrownValueMessage(error) {
     : String(error);
 }
 
+function compileJavaForBrowser(source, options = {}) {
+  const result = compileJavaSource(source, options);
+  const artifacts = result.classes.map((classEntry) => {
+    const bytes = assembleJasminBytes(classEntry.jasmin, options.assembly || {});
+    return {
+      internalName: classEntry.internalName,
+      binaryName: classEntry.binaryName,
+      sourceFile: classEntry.sourceFile,
+      jasmin: classEntry.jasmin,
+      bytes: new Uint8Array(bytes),
+    };
+  });
+  return {
+    schema: result.schema,
+    version: result.version,
+    sourceLevel: result.sourceLevel,
+    status: result.bytecodeIr.status,
+    artifacts,
+  };
+}
+
+function compileJavaFilesForBrowser(inputPaths, options = {}) {
+  const fileSystem = options.fileSystem || options.fs;
+  if (!fileSystem) {
+    throw new TypeError('Browser multi-file compilation requires a workspace filesystem');
+  }
+  const result = compileJavaFiles(inputPaths, options);
+  const writtenByInternalName = new Map(
+    result.written.map((entry) => [entry.internalName, entry]),
+  );
+  const artifacts = result.classes.map((classEntry) => {
+    const written = writtenByInternalName.get(classEntry.internalName);
+    const bytes = written
+      ? fileSystem.readFileSync(written.outputPath)
+      : assembleJasminBytes(classEntry.jasmin, options.assembly || {});
+    return {
+      internalName: classEntry.internalName,
+      binaryName: classEntry.binaryName,
+      sourceFile: classEntry.sourceFile,
+      outputPath: written ? written.outputPath : null,
+      jasmin: classEntry.jasmin,
+      bytes: new Uint8Array(bytes),
+    };
+  });
+  return { ...result, artifacts };
+}
+
+const browserJavaTools = {
+  assembleJasmin(source, options = {}) {
+    return new Uint8Array(assembleJasminBytes(source, options));
+  },
+  compileJava: compileJavaForBrowser,
+  compileJavaFiles: compileJavaFilesForBrowser,
+  decompileClass(classData, options = {}) {
+    return decompileClassBytes(classData, options);
+  },
+};
+
 // Browser-compatible JVM Debug API
 class BrowserJVMDebug {
   constructor() {
@@ -61,6 +123,12 @@ class BrowserJVMDebug {
    */
   async initialize(options = {}) {
     try {
+      if (options.workspaceFileSystem) {
+        this.fileProvider.attachWorkspace(options.workspaceFileSystem);
+      } else if (options.workspace) {
+        await this.ensureWorkspace();
+      }
+
       // Load data package if provided
       if (options.dataPackage) {
         await this.fileProvider.loadDataPackage(options.dataPackage);
@@ -111,7 +179,7 @@ class BrowserJVMDebug {
   /**
    * Return the classes and manifest entry point found in a previously uploaded JAR.
    * @param {string} fileName
-   * @returns {{classFiles: string[], mainClass: string|null}|null}
+   * @returns {{classFiles: string[], resourceFiles: string[], mainClass: string|null}|null}
    */
   getJarInfo(fileName) {
     return this.fileProvider.getJarInfo(fileName);
@@ -368,6 +436,59 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Lazily enable the editor workspace without adding ZenFS to ordinary JVM
+   * startup. Existing uploaded classes and resources are migrated intact.
+   * @returns {Promise<WorkspaceFileSystem>}
+   */
+  async ensureWorkspace() {
+    let workspace = this.fileProvider.getWorkspaceFileSystem();
+    if (!workspace) {
+      workspace = await getDefaultZenFSWorkspace();
+      this.fileProvider.attachWorkspace(workspace);
+    }
+    return workspace;
+  }
+
+  /**
+   * Write an editor or generated file into the shared browser workspace.
+   * @param {string} filePath
+   * @param {string|Uint8Array} content
+   */
+  writeWorkspaceFile(filePath, content) {
+    const workspace = this.fileProvider.getWorkspaceFileSystem();
+    if (!workspace) throw new Error('Browser workspace is not initialized');
+    workspace.map.set(filePath, content);
+  }
+
+  /**
+   * Read a file from the shared browser workspace.
+   * @param {string} filePath
+   * @param {string|null} encoding
+   */
+  readWorkspaceFile(filePath, encoding = null) {
+    const workspace = this.fileProvider.getWorkspaceFileSystem();
+    if (!workspace) throw new Error('Browser workspace is not initialized');
+    return workspace.readFileSync(filePath, encoding || undefined);
+  }
+
+  /**
+   * Compile Java source files from the browser workspace and emit class files
+   * back into the same workspace.
+   * @param {string[]} inputPaths
+   * @param {object} options
+   */
+  compileWorkspace(inputPaths, options = {}) {
+    const workspace = this.fileProvider.getWorkspaceFileSystem();
+    if (!workspace) throw new Error('Browser workspace is not initialized');
+    return compileJavaFilesForBrowser(inputPaths, {
+      ...options,
+      fileSystem: workspace,
+      sourceRoot: options.sourceRoot || '/src',
+      outputDir: options.outputDir || '/classes',
+    });
+  }
+
+  /**
    * Get file provider for advanced operations
    * @returns {BrowserFileProvider} - File provider instance
    */
@@ -442,6 +563,48 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Describe whether a class can be launched by this JVM as an application or
+   * applet. Superclasses are resolved from the browser virtual classpath.
+   * @param {string} classPath
+   * @returns {Promise<{className: string, launchMode: "application"|"applet"|null}>}
+   */
+  async getClassLaunchInfo(classPath) {
+    const normalizedPath = classPath.endsWith(".class")
+      ? classPath
+      : `${classPath}.class`;
+    const { getAST } = require("jvm_parser");
+    const { convertJson } = require("../parsing/convert_tree");
+    const parseClass = (classData) => {
+      const parsed = getAST(classData);
+      return convertJson(parsed.ast, parsed.constantPool).classes[0];
+    };
+
+    const rootClass = parseClass(await this.fileProvider.readFile(normalizedPath));
+    const hasMain = (rootClass.items || []).some((item) =>
+      item.type === "method" &&
+      item.method.name === "main" &&
+      item.method.descriptor === "([Ljava/lang/String;)V" &&
+      (item.method.accessFlags & 0x0009) === 0x0009);
+    let current = rootClass;
+    const visited = new Set();
+    while (current && !visited.has(current.className)) {
+      visited.add(current.className);
+      const superName = current.superClassName;
+      if (superName === "java/applet/Applet") {
+        return { className: rootClass.className, launchMode: "applet" };
+      }
+      if (!superName || superName === "java/lang/Object") break;
+      const superPath = `${superName}.class`;
+      if (!await this.fileProvider.exists(superPath)) break;
+      current = parseClass(await this.fileProvider.readFile(superPath));
+    }
+    return {
+      className: rootClass.className,
+      launchMode: hasMain ? "application" : null,
+    };
+  }
+
+  /**
    * Check if debugger is ready
    * @returns {boolean} - Ready status
    */
@@ -458,6 +621,8 @@ module.exports = {
   Frame,
   DebugController,
   BrowserFileProvider,
+  browserJavaTools,
+  javaTools: browserJavaTools,
   awtFramework,
   audioPlatform,
   legacyPlatform
@@ -471,6 +636,7 @@ if (typeof window !== 'undefined') {
     Frame,
     DebugController,
     BrowserFileProvider,
+    javaTools: browserJavaTools,
     audioPlatform,
     legacyPlatform
   };

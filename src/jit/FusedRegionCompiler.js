@@ -1,4 +1,5 @@
 const { parseDescriptor } = require("../parsing/typeParser");
+const { buildCfgFromCode, structure } = require("../decompiler/structurer");
 const HandwrittenFusedGradient = require("./HandwrittenFusedGradient");
 const HandwrittenFusedFlat = require("./HandwrittenFusedFlat");
 
@@ -11,7 +12,13 @@ class FusedRegionCompiler {
     this.enabled = options.fusedRegions === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_FUSED_REGIONS === "1");
-    this.handwrittenKernelsEnabled = options.handwrittenFusedKernels !== false &&
+    // Fingerprint-selected translations are differential oracles and code-shape
+    // targets, not a production compiler tier. Keep them opt-in so normal
+    // execution proves the bytecode-derived kernels themselves are fast.
+    this.handwrittenKernelsEnabled =
+      (options.handwrittenFusedKernels === true ||
+        Boolean(typeof process !== "undefined" && process.env &&
+          process.env.JVM_ENABLE_HANDWRITTEN_FUSED === "1")) &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_HANDWRITTEN_FUSED === "1");
     // Compact handwritten raster translations are experimental until the
@@ -23,6 +30,9 @@ class FusedRegionCompiler {
     this.directCallsEnabled = options.directFusedCalls !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_DIRECT_FUSED_CALLS === "1");
+    this.lexicalKernelsEnabled = options.lexicalFusedKernels !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_LEXICAL_FUSED_KERNELS === "1");
     this.cache = new WeakMap();
     // A missing child class is a normal first-invocation condition.  Negative
     // results are valid only for the current linkage epoch; loading another
@@ -32,6 +42,16 @@ class FusedRegionCompiler {
     this.lastCompileFailure = null;
     this.directEntries = [];
     this.directEntryByMethod = new WeakMap();
+    this.profileDirectCalls = Boolean(typeof process !== "undefined" &&
+      process.env && process.env.JVM_PROFILE_FUSED_DIRECT_CALLS === "1");
+    this.directAttemptCount = 0;
+    this.directFallbackCounts = new Map();
+  }
+
+  recordDirectFallback(reason) {
+    if (!this.profileDirectCalls) return;
+    this.directFallbackCounts.set(
+      reason, (this.directFallbackCounts.get(reason) || 0) + 1);
   }
 
   getCompileTimeDirectCall(instruction) {
@@ -43,7 +63,23 @@ class FusedRegionCompiler {
     if (parsed.returnType !== "void" || parsed.params.length > 16) return null;
     const classData = this.jvm.classes[owner];
     const method = classData && this.jvm.findMethod(classData, name, descriptor);
-    if (!method || !(method.flags || []).includes("static") || !this.mayFuse(method)) return null;
+    // A caller commonly becomes hot before the wrapper owner itself has been
+    // loaded. Retain an unresolved positional site in that case instead of
+    // permanently baking generic dispatch into the caller. Runtime resolution
+    // below still requires the exact loaded method identity, static flag, and
+    // complete structural fusion proof before the first fused side effect.
+    if (!method) {
+      const entry = {
+        id: this.directEntries.length,
+        paramCount: parsed.params.length,
+        unresolved: { owner, name, descriptor },
+        target: null,
+        region: null,
+      };
+      this.directEntries.push(entry);
+      return { id: entry.id, paramCount: entry.paramCount, returnsVoid: true };
+    }
+    if (!(method.flags || []).includes("static") || !this.mayFuse(method)) return null;
 
     let entry = this.directEntryByMethod.get(method);
     if (!entry) {
@@ -71,18 +107,55 @@ class FusedRegionCompiler {
   tryInvokeDirectAt(id, frame, thread,
     a0, a1, a2, a3, a4, a5, a6, a7,
     a8, a9, a10, a11, a12, a13, a14, a15) {
-    if (!this.enabled || !this.directCallsEnabled) return false;
+    if (this.profileDirectCalls) this.directAttemptCount += 1;
+    if (!this.enabled || !this.directCallsEnabled) {
+      this.recordDirectFallback("disabled");
+      return false;
+    }
     const entry = this.directEntries[id];
-    if (!entry) return false;
-    const { target, paramCount } = entry;
+    if (!entry || entry.permanentlyRejected) {
+      this.recordDirectFallback(!entry ? "missing-entry" : "permanently-rejected");
+      return false;
+    }
+    let target = entry.target;
+    if (!target) {
+      const unresolved = entry.unresolved;
+      const classData = unresolved && this.jvm.classes[unresolved.owner];
+      if (!classData) {
+        this.recordDirectFallback("owner-not-loaded");
+        return false;
+      }
+      const method = this.jvm.findMethod(
+        classData, unresolved.name, unresolved.descriptor);
+      if (!method || !(method.flags || []).includes("static") ||
+          !this.mayFuse(method)) {
+        entry.permanentlyRejected = true;
+        this.recordDirectFallback("shape-rejected");
+        return false;
+      }
+      target = { method, lookupClass: unresolved.owner };
+      entry.target = target;
+      entry.unresolved = null;
+      if (!this.directEntryByMethod.has(method)) {
+        this.directEntryByMethod.set(method, entry);
+      }
+    }
+    const { paramCount } = entry;
     let region = entry.region || this.cache.get(target.method);
     if (!region) {
-      if (this.jvm.classInitializationState.get(target.lookupClass) !== "INITIALIZED") return false;
+      if (this.jvm.classInitializationState.get(target.lookupClass) !== "INITIALIZED") {
+        this.recordDirectFallback("owner-not-initialized");
+        return false;
+      }
       const linkageEpoch = `${this.jvm.classEpoch || 0}:${this.jvm.classInitializationEpoch || 0}`;
-      if (entry.rejectedEpoch === linkageEpoch) return false;
+      if (entry.rejectedEpoch === linkageEpoch) {
+        this.recordDirectFallback("region-rejected-this-epoch");
+        return false;
+      }
       region = this.compile(target.method, target.lookupClass);
       if (!region) {
         entry.rejectedEpoch = linkageEpoch;
+        this.recordDirectFallback("region-compile-failed");
         return false;
       }
       entry.region = region;
@@ -91,6 +164,7 @@ class FusedRegionCompiler {
     }
     if (!this.guard(region, target, frame, thread)) {
       this.jit.fusedGuardedFallbackCount += 1;
+      this.recordDirectFallback("entry-guard");
       return false;
     }
     const state = region.executionState || (region.executionState = {
@@ -121,6 +195,7 @@ class FusedRegionCompiler {
     } catch (error) {
       if (error === BAILOUT) {
         this.jit.fusedGuardedFallbackCount += 1;
+        this.recordDirectFallback("kernel-bailout");
         return false;
       }
       const arguments_ = [a0, a1, a2, a3, a4, a5, a6, a7,
@@ -580,7 +655,369 @@ class FusedRegionCompiler {
     }
   }
 
+  // Render the verified bytecode CFG as lexical JavaScript. Values crossing a
+  // block edge are assigned to fixed join slots; Java operand-stack state is
+  // otherwise absent. This is the generic counterpart of the structured
+  // handwritten target and is selected solely from the verified CFG.
+  compileLexicalKernel(method, verified, region, role) {
+    const reject = (stage, error) => {
+      if (!region.lexicalKernelFailures) region.lexicalKernelFailures = {};
+      region.lexicalKernelFailures[role] = {
+        stage, message: String(error && error.message || error),
+      };
+      return null;
+    };
+    let cfg;
+    let structured;
+    try {
+      cfg = buildCfgFromCode(verified.codeItems);
+      if (!cfg || cfg.term.some((term) => term.kind === "switch")) return null;
+      structured = structure(cfg);
+    } catch (error) {
+      return reject("structure", error);
+    }
+    const { codeItems, depths } = verified;
+    const descriptor = parseDescriptor(method.descriptor);
+    const callByIndex = new Map(verified.calls.map((call) => [call.index, call]));
+    const params = descriptor.params;
+    const localTypes = [];
+    let parameterLocal = 0;
+    for (const type of params) {
+      localTypes[parameterLocal] = type;
+      parameterLocal += type === "long" || type === "double" ? 2 : 1;
+    }
+    const argNames = params.map((_, index) => `a${index}`);
+    const reachableBlocks = new Set(structured.rpo);
+    const declarations = [];
+    let argIndex = 0;
+    for (let index = 0; index < verified.localsSize; index += 1) {
+      if (localTypes[index]) {
+        const input = argNames[argIndex++];
+        declarations.push(`let l${index}=${isIntType(localTypes[index])
+          ? `${input}|0` : input};`);
+      } else {
+        declarations.push(`let l${index};`);
+      }
+    }
+    for (const block of cfg.blocks) {
+      if (!reachableBlocks.has(block.id)) continue;
+      const depth = depths[block.insns[0]] || 0;
+      for (let slot = 0; slot < depth; slot += 1) {
+        declarations.push(`let j${block.id}_${slot};`);
+      }
+    }
+
+    let temporary = 0;
+    const temp = () => `v${temporary++}`;
+    const localsSnapshot = () =>
+      `[${Array.from({ length: verified.localsSize }, (_unused, index) =>
+        `l${index}`).join(",")}]`;
+    const captureThrow = (pc, operands, exception) =>
+      `{state.method=${JSON.stringify(role)};state.pc=${pc};` +
+      `state.locals=${localsSnapshot()};state.stack=[${operands.join(",")}];` +
+      `throw ${exception};}`;
+    const plans = [];
+    let planningIndex = -1;
+    let planningOp = null;
+    let planningBlock = null;
+
+    try {
+      for (const block of cfg.blocks) {
+        if (!reachableBlocks.has(block.id)) continue;
+        planningBlock = block;
+        const lines = [];
+        const expressions = Array.from(
+          { length: depths[block.insns[0]] || 0 },
+          (_unused, slot) => `j${block.id}_${slot}`);
+        const pop = () => expressions.pop();
+        const binary = (format) => {
+          const right = pop();
+          const left = pop();
+          if (left === undefined || right === undefined) {
+            throw new Error("stack underflow");
+          }
+          expressions.push(format(left, right));
+        };
+        let condition = null;
+        let returned = false;
+        for (const index of block.insns) {
+          const instruction = codeItems[index] && codeItems[index].instruction;
+          const op = getOp(instruction);
+          planningIndex = index;
+          planningOp = op;
+          if (!op || op === "nop") continue;
+          if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+            const output = temp();
+            lines.push(`const ${output}=l${localIndex(instruction, op)};`);
+            expressions.push(output);
+          } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+            const input = pop();
+            if (input === undefined) throw new Error("stack underflow");
+            lines.push(`l${localIndex(instruction, op)}=${input};`);
+          } else if (op === "aconst_null") {
+            expressions.push("null");
+          } else if (/^iconst_(?:m1|[0-5])$/.test(op) || op === "bipush" ||
+                     op === "sipush" || op === "ldc" || op === "ldc_w") {
+            const constant = constantValue(instruction, op);
+            if (constant === null) throw new Error("non-numeric constant");
+            expressions.push(constant);
+          } else if (op === "checkcast") {
+            // Structurally accepted casts are null diagnostic operands.
+          } else if (op === "dup") {
+            const input = pop();
+            if (input === undefined) throw new Error("stack underflow");
+            const output = temp();
+            lines.push(`const ${output}=${input};`);
+            expressions.push(output, output);
+          } else if (op === "pop") {
+            if (pop() === undefined) throw new Error("stack underflow");
+          } else if (op === "iadd") binary((a, b) => `((${a}+${b})|0)`);
+          else if (op === "isub") binary((a, b) => `((${a}-${b})|0)`);
+          else if (op === "imul") binary((a, b) => `Math.imul(${a},${b})`);
+          else if (op === "iand") binary((a, b) => `(${a}&${b})`);
+          else if (op === "ior") binary((a, b) => `(${a}|${b})`);
+          else if (op === "ixor") binary((a, b) => `(${a}^${b})`);
+          else if (op === "ishl") binary((a, b) => `(${a}<<(${b}&31))`);
+          else if (op === "ishr") binary((a, b) => `(${a}>>(${b}&31))`);
+          else if (op === "iushr") binary((a, b) => `(${a}>>>(${b}&31))`);
+          else if (op === "ineg") {
+            const input = pop();
+            if (input === undefined) throw new Error("stack underflow");
+            expressions.push(`((-${input})|0)`);
+          } else if (op === "idiv" || op === "irem") {
+            const divisorExpression = pop();
+            const dividend = pop();
+            if (dividend === undefined || divisorExpression === undefined) {
+              throw new Error("stack underflow");
+            }
+            const divisor = temp();
+            lines.push(`const ${divisor}=${divisorExpression};`);
+            lines.push(`if(${divisor}===0)${captureThrow(index,
+              [dividend, divisor],
+              '{type:"java/lang/ArithmeticException",message:"/ by zero"}')}`);
+            expressions.push(op === "idiv"
+              ? `((${dividend}/${divisor})|0)`
+              : `((${dividend}%${divisor})|0)`);
+          } else if (op === "iinc") {
+            const variable = Number(instruction.varnum ?? instruction.arg);
+            const increment = Number(instruction.incr ?? 0);
+            lines.push(`l${variable}=(l${variable}+${increment})|0;`);
+          } else if (op === "getstatic") {
+            const staticIndex =
+              region.staticIndex.get(JSON.stringify(instruction.arg));
+            if (staticIndex === undefined) throw new Error("unresolved static");
+            expressions.push(
+              `(region.staticTargets[${staticIndex}].kind==="map"?` +
+              `region.staticTargets[${staticIndex}].fields.get(` +
+              `region.staticTargets[${staticIndex}].key):` +
+              `region.staticTargets[${staticIndex}].fields[` +
+              `region.staticTargets[${staticIndex}].key])`);
+          } else if (op === "putstatic") {
+            const input = pop();
+            const staticIndex =
+              region.staticIndex.get(JSON.stringify(instruction.arg));
+            if (input === undefined || staticIndex === undefined) {
+              throw new Error("unresolved static store");
+            }
+            lines.push(
+              `if(region.staticTargets[${staticIndex}].kind==="map")` +
+              `region.staticTargets[${staticIndex}].fields.set(` +
+              `region.staticTargets[${staticIndex}].key,${input});else ` +
+              `region.staticTargets[${staticIndex}].fields[` +
+              `region.staticTargets[${staticIndex}].key]=${input};`);
+          } else if (op === "iaload") {
+            const arrayIndex = pop();
+            const array = pop();
+            if (array === undefined || arrayIndex === undefined) {
+              throw new Error("stack underflow");
+            }
+            const output = temp();
+            lines.push(`if(${array}==null)${captureThrow(index,
+              [array, arrayIndex],
+              '{type:"java/lang/NullPointerException",message:null}')}`);
+            lines.push(`if((${arrayIndex}|0)<0||(${arrayIndex}|0)>=${array}.length)` +
+              captureThrow(index, [array, arrayIndex],
+                '{type:"java/lang/ArrayIndexOutOfBoundsException",message:null}'));
+            lines.push(`const ${output}=${array}[${arrayIndex}|0];`);
+            expressions.push(output);
+          } else if (op === "iastore") {
+            const input = pop();
+            const arrayIndex = pop();
+            const array = pop();
+            if (array === undefined || arrayIndex === undefined || input === undefined) {
+              throw new Error("stack underflow");
+            }
+            lines.push(`if(${array}==null)${captureThrow(index,
+              [array, arrayIndex, input],
+              '{type:"java/lang/NullPointerException",message:null}')}`);
+            lines.push(`if((${arrayIndex}|0)<0||(${arrayIndex}|0)>=${array}.length)` +
+              captureThrow(index, [array, arrayIndex, input],
+                '{type:"java/lang/ArrayIndexOutOfBoundsException",message:null}'));
+            lines.push(`${array}[${arrayIndex}|0]=${input}|0;`);
+          } else if (op === "invokestatic") {
+            const parsed = parseDescriptor(instruction.arg[2][1]);
+            const args = expressions.splice(
+              expressions.length - parsed.params.length);
+            const call = callByIndex.get(index);
+            if (role === "wrapper" &&
+                memberKey(call) === region.family.rasterKey) {
+              lines.push(`state.outerPc=${index + 1};` +
+                `state.outerExtra=l${verified.localsSize - 1};`);
+              lines.push(`region.rasterKernel(state,region,helpers,` +
+                `${args.join(",")});`);
+            } else if (role === "raster" &&
+                memberKey(call) === region.family.scanlineKey) {
+              lines.push(`region.scanlineKernel(state,region,helpers,` +
+                `${args.join(",")});`);
+            } else if (call && call.kind === "integer-inline") {
+              const output = temp();
+              const substitute = (source) => source.replace(
+                /stack\[base \+ (\d+)\]/g,
+                (_match, argument) => `(${args[Number(argument)]})`);
+              lines.push(`let ${output};`, "{",
+                ...call.inline.statements.map((statement) =>
+                  substitute(statement)),
+                `${output}=${substitute(call.inline.result)};`, "}");
+              expressions.push(`(${output}|0)`);
+            } else if (call && call.kind === "integer-native") {
+              const nativeIndex = region.nativeCalls.length;
+              region.nativeCalls.push(call.native);
+              const output = temp();
+              const thrown = temp();
+              lines.push(`let ${output};try{${output}=` +
+                `helpers.invokeFusedIntegerNative(` +
+                `region.nativeCalls[${nativeIndex}],${args[0]},${args[1]});}` +
+                `catch(${thrown})${captureThrow(index, args, thrown)}`);
+              expressions.push(`(${output}|0)`);
+            } else {
+              lines.push("throw helpers.fusedBailout();");
+              // Keep verifier stack shape available while planning the
+              // syntactically following instructions. Runtime cannot reach
+              // the placeholder because the bailout above always throws.
+              if (parsed.returnType !== "void") expressions.push("undefined");
+            }
+            if (parsed.returnType !== "void" &&
+                !(call && (call.kind === "integer-native" ||
+                  call.kind === "integer-inline" ||
+                  call.kind === "early-bailout"))) {
+              throw new Error("unsupported call result");
+            }
+          } else if (op === "goto" || op === "goto_w") {
+            // The structured tree renders this edge.
+          } else if (op && op.startsWith("if")) {
+            if (op.startsWith("if_icmp")) {
+              const right = pop();
+              const left = pop();
+              const compare = {
+                if_icmpeq: "===", if_icmpne: "!==", if_icmplt: "<",
+                if_icmpge: ">=", if_icmpgt: ">", if_icmple: "<=",
+              }[op];
+              if (left === undefined || right === undefined || !compare) {
+                throw new Error("invalid conditional stack");
+              }
+              condition = `${left}${compare}${right}`;
+            } else {
+              const input = pop();
+              const compare = {
+                ifeq: "===0", ifne: "!==0", iflt: "<0",
+                ifge: ">=0", ifgt: ">0", ifle: "<=0",
+              }[op];
+              if (input === undefined || !compare) {
+                throw new Error("invalid conditional stack");
+              }
+              condition = `${input}${compare}`;
+            }
+          } else if (op === "return") {
+            lines.push("return;");
+            returned = true;
+          } else {
+            throw new Error(`unsupported lexical fused opcode ${op}`);
+          }
+        }
+        plans[block.id] = { lines, stack: expressions, condition, returned };
+      }
+    } catch (error) {
+      return reject("plan", new Error(
+        `${error && error.message || error} at ${planningIndex} ${planningOp} ` +
+        `block=${planningBlock && planningBlock.id} ` +
+        `first=${planningBlock && planningBlock.insns[0]} ` +
+        `depth=${planningBlock && depths[planningBlock.insns[0]]} ` +
+        `normal=${Boolean(planningBlock &&
+          verified.reachable.has(planningBlock.insns[0]))} ops=${planningBlock &&
+          planningBlock.insns.map((index) =>
+            getOp(codeItems[index] && codeItems[index].instruction)).join(",")}`));
+    }
+
+    const edgeLines = (target, expressions) => {
+      const depth = depths[cfg.blocks[target].insns[0]] || 0;
+      if (expressions.length !== depth) {
+        throw new Error("lexical fused stack-depth mismatch");
+      }
+      return expressions.map((expression, slot) =>
+        `j${target}_${slot}=${expression};`);
+    };
+    const indent = (lines) => lines.map((line) => `  ${line}`);
+    const render = (node) => {
+      if (!node) return [];
+      if (node.t === "seq") return node.body.flatMap(render);
+      if (node.t === "straight") {
+        const plan = plans[node.block];
+        const term = cfg.term[node.block];
+        const lines = [...plan.lines];
+        if (!plan.returned &&
+            (term.kind === "goto" || term.kind === "fall")) {
+          lines.push(...edgeLines(term.target, plan.stack));
+        }
+        return lines;
+      }
+      if (node.t === "if") {
+        const plan = plans[node.block];
+        const term = cfg.term[node.block];
+        if (!plan.condition || term.kind !== "cond") {
+          throw new Error("missing lexical fused condition");
+        }
+        return [`if(${plan.condition}){`,
+          ...indent([...edgeLines(term.taken, plan.stack),
+            ...render(node.then)]),
+          "}else{",
+          ...indent([...edgeLines(term.fall, plan.stack),
+            ...render(node.els)]),
+          "}"];
+      }
+      if (node.t === "loop") {
+        return [`${node.label}:while(true){`,
+          ...indent(render(node.body)), "}"];
+      }
+      if (node.t === "block") {
+        return [`${node.label}:{`, ...indent(render(node.body)), "}"];
+      }
+      if (node.t === "break") return [`break ${node.label};`];
+      if (node.t === "continue") return [`continue ${node.label};`];
+      throw new Error(`unsupported lexical fused node ${node.t}`);
+    };
+
+    try {
+      const body = ["\"use strict\";", ...declarations,
+        ...render(structured.tree)];
+      const owner = role === "wrapper" ? region.wrapperOwner
+        : role === "raster" ? region.rasterOwner : region.scanlineOwner;
+      const generated = this.jit.createGeneratedFunction(method,
+        `fused-${region.family.name}-lexical-${role}`,
+        ["state", "region", "helpers", ...argNames], body.join("\n"), owner);
+      generated.jvmLexicalFusedKernel = true;
+      generated.jvmLexicalFusedSource = body.join("\n");
+      this.jit.lexicalFusedKernelCount =
+        (this.jit.lexicalFusedKernelCount | 0) + 1;
+      return generated;
+    } catch (error) {
+      return reject("render", error);
+    }
+  }
+
   compileKernel(method, verified, region, role) {
+    const lexical = this.lexicalKernelsEnabled
+      ? this.compileLexicalKernel(method, verified, region, role) : null;
+    if (lexical) return lexical;
     const { codeItems, labels, depths, reachable } = verified;
     const descriptor = parseDescriptor(method.descriptor);
     const callByIndex = new Map(verified.calls.map((call) => [call.index, call]));

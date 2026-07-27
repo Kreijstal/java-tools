@@ -4,6 +4,9 @@ const fs = require('fs');
 const path = require('path');
 
 const JRE_ROOT = path.resolve(__dirname, '..', 'jre');
+const indexedJreClasses = typeof fs.existsSync === 'function'
+  ? null
+  : require('../jre');
 
 let cache = null;
 
@@ -62,10 +65,11 @@ function loadClass(file) {
 function buildMetadata() {
   const classes = new Map();
   const simpleNames = new Map();
-  for (const file of walk(JRE_ROOT)) {
-    const internalName = internalNameFromFile(file);
+  const definitions = indexedJreClasses
+    ? Object.entries(indexedJreClasses)
+    : walk(JRE_ROOT).map((file) => [internalNameFromFile(file), loadClass(file)]);
+  for (const [internalName, classDef] of definitions) {
     if (internalName === 'helpers' || internalName.endsWith('/index') || internalName === 'index') continue;
-    const classDef = loadClass(file);
     const methods = new Map();
     const staticMethods = new Map();
     const fields = new Map();

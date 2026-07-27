@@ -1,5 +1,7 @@
 // @ts-check
 const { defineConfig, devices } = require('@playwright/test');
+const playwrightPort = Number(process.env.PLAYWRIGHT_PORT) || 3000;
+const playwrightBaseUrl = `http://localhost:${playwrightPort}`;
 
 /**
  * @see https://playwright.dev/docs/test-configuration
@@ -27,7 +29,7 @@ module.exports = defineConfig({
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
     /* Base URL to use in actions like `await page.goto('/')`. */
-    baseURL: 'http://localhost:3000',
+    baseURL: playwrightBaseUrl,
 
     /* Shorter navigation timeout */
     navigationTimeout: 10000,
@@ -52,8 +54,8 @@ module.exports = defineConfig({
 
   /* Run your local dev server before starting the tests */
   webServer: {
-    command: 'npm run serve',
-    url: 'http://localhost:3000/',
+    command: `PORT=${playwrightPort} npm run serve`,
+    url: `${playwrightBaseUrl}/`,
     reuseExistingServer: !process.env.CI,
     timeout: 120 * 1000,
     stdout: 'pipe',

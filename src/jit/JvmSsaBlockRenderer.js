@@ -364,6 +364,7 @@ class JvmSsaBlockRenderer {
     let nextValue = 0;
     const value = () => `ssaValue${nextValue++}`;
     const plans = [];
+    const continuationFallbacks = new Map();
     let deferredCallMaterializationCount = 0;
     let reusedLocalLoadCount = 0;
     let eliminatedLocalStoreCount = 0;
@@ -1350,6 +1351,53 @@ class JvmSsaBlockRenderer {
             if (valid) {
               const handled = value(), out = value(), caught = value();
               const deferMaterialization = this.deferredCallMaterializationEnabled;
+              const asynchronousFallbackMarker =
+                `__JVM_ASYNC_FUSED_FALLBACK_${index}_${site.id}__`;
+              continuationFallbacks.set(asynchronousFallbackMarker, {
+                continuation: [
+                  ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                  "  helpers.skipJitOnce(frame);",
+                  `  yield { deopt: true, transient: true, structuredResumePc: ${
+                    index + 1
+                  }, reason: 'asynchronous structured SSA callee' };`,
+                ],
+                ordinary: [
+                  ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                  "  helpers.skipJitOnce(frame);",
+                  "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
+                ],
+              });
+              const deoptFallbackMarker =
+                `__JVM_DEOPT_FUSED_FALLBACK_${index}_${site.id}__`;
+              continuationFallbacks.set(deoptFallbackMarker, {
+                continuation: [
+                  ...(deferMaterialization
+                    ? materializeLines(stack, index + 1).map((line) => `  ${line}`)
+                    : []),
+                  `  ${out}.structuredResumePc = ${index + 1};`,
+                  `  yield ${out};`,
+                ],
+                ordinary: [
+                  ...(deferMaterialization
+                    ? materializeLines(stack, index + 1).map((line) => `  ${line}`)
+                    : []),
+                  `  return ${out};`,
+                ],
+              });
+              const yieldedFallbackMarker =
+                `__JVM_YIELDED_FUSED_FALLBACK_${index}_${site.id}__`;
+              continuationFallbacks.set(yieldedFallbackMarker, {
+                continuation: [
+                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                  `  yield { deopt: true, transient: true, structuredResumePc: ${
+                    index + 1
+                  }, reason: 'thread yielded in structured SSA callee' };`,
+                ],
+                ordinary: [
+                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                  "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };",
+                ],
+              });
               const fallbackLines = [
                 ...(deferMaterialization
                   ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
@@ -1358,16 +1406,11 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 `  throw ${caught};`, "}",
                 `if (${out} === helpers.asyncInvokeSentinel()) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };", "}",
+                asynchronousFallbackMarker, "}",
                 `if (${out} && ${out}.deopt) {`,
-                ...(deferMaterialization
-                  ? materializeLines(stack, index + 1).map((line) => `  ${line}`) : []),
-                `  return ${out};`, "}",
+                deoptFallbackMarker, "}",
                 "if (thread.status !== 'runnable') {",
-                ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-                "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };", "}",
+                yieldedFallbackMarker, "}",
               ];
               lines.push(`let ${handled};`,
                 `try { ${handled} = helpers.fusedRegions.tryInvokeDirectAt(${site.directFused.id}, frame, thread, ${args.join(", ")}); } catch (${caught}) {`,
@@ -1388,15 +1431,36 @@ class JvmSsaBlockRenderer {
             if (!valid) continue;
             const out = value(), caught = value();
             const deferMaterialization = this.deferredCallMaterializationEnabled;
+            const resumableVoidCall = site.returnsVoid;
+            const asynchronousCallMarker =
+              `__JVM_ASYNC_VOID_CALL_${index}_${site.id}__`;
+            if (resumableVoidCall) {
+              continuationFallbacks.set(asynchronousCallMarker, {
+                continuation: [
+                  ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                  "  helpers.skipJitOnce(frame);",
+                  `  yield { deopt: true, transient: true, structuredResumePc: ${
+                    index + 1
+                  }, reason: 'asynchronous structured SSA callee' };`,
+                ],
+                ordinary: [
+                  ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                  "  helpers.skipJitOnce(frame);",
+                  "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
+                ],
+              });
+            }
             const fallbackLines = [
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
               `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
               ...materializeLines(callStack, index).map((line) => `  ${line}`), `  throw ${caught};`, "}",
               `if (${out} === helpers.asyncInvokeSentinel()) {`,
-              ...materializeLines(callStack, index).map((line) => `  ${line}`),
-              "  helpers.skipJitOnce(frame);",
-              "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };", "}",
+              ...(resumableVoidCall ? [asynchronousCallMarker] : [
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                "  helpers.skipJitOnce(frame);",
+                "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
+              ]), "}",
             ];
             lines.push(`let ${out};`);
             if (site.id !== null && site.id !== undefined) {
@@ -1429,14 +1493,51 @@ class JvmSsaBlockRenderer {
             } else {
               lines.push(...fallbackLines);
             }
-            lines.push(`if (${out} && ${out}.deopt) {`,
-              ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-              `  return ${out};`, "}");
+            if (resumableVoidCall) {
+              const deoptCallMarker =
+                `__JVM_DEOPT_VOID_CALL_${index}_${site.id}__`;
+              continuationFallbacks.set(deoptCallMarker, {
+                continuation: [
+                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                  `  ${out}.structuredResumePc = ${index + 1};`,
+                  `  yield ${out};`,
+                ],
+                ordinary: [
+                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                  `  return ${out};`,
+                ],
+              });
+              lines.push(`if (${out} && ${out}.deopt) {`,
+                deoptCallMarker, "}");
+            } else {
+              lines.push(`if (${out} && ${out}.deopt) {`,
+                ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                `  return ${out};`, "}");
+            }
             if (deferMaterialization) deferredCallMaterializationCount += 1;
             if (!site.returnsVoid) stack.push(out);
-            lines.push("if (thread.status !== 'runnable') {",
-              ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
-              "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };", "}");
+            if (resumableVoidCall) {
+              const yieldedCallMarker =
+                `__JVM_YIELDED_VOID_CALL_${index}_${site.id}__`;
+              continuationFallbacks.set(yieldedCallMarker, {
+                continuation: [
+                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                  `  yield { deopt: true, transient: true, structuredResumePc: ${
+                    index + 1
+                  }, reason: 'thread yielded in structured SSA callee' };`,
+                ],
+                ordinary: [
+                  ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                  "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };",
+                ],
+              });
+              lines.push("if (thread.status !== 'runnable') {",
+                yieldedCallMarker, "}");
+            } else {
+              lines.push("if (thread.status !== 'runnable') {",
+                ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+                "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };", "}");
+            }
           }
         } else if (op === "goto" || op === "goto_w") {
           const edge = edgeLines(cfg.term[block.id].target, stack);
@@ -1735,6 +1836,14 @@ class JvmSsaBlockRenderer {
     const safePointInitialBudget = Math.max(
       1, Math.floor(structuralPollBudget / maximumCoarseTripCount));
     const indent = (lines) => lines.map((line) => `  ${line}`);
+    const expandContinuationFallbacks = (lines, continuationMode) =>
+      lines.flatMap((line) => {
+        const fallback = continuationFallbacks.get(line.trim());
+        if (!fallback) return [line];
+        const prefix = line.slice(0, line.length - line.trimStart().length);
+        return (continuationMode ? fallback.continuation : fallback.ordinary)
+          .map((fallbackLine) => `${prefix}${fallbackLine}`);
+      });
     const render = (
       node, continuationMode = useContinuations, directPositional = false,
       loopSafePointBudget = safePointInitialBudget,
@@ -1746,7 +1855,11 @@ class JvmSsaBlockRenderer {
       }
       if (node.t === "straight") {
         const plan = plans[node.block];
-        const lines = [...plan.lines];
+        const lines = plan.lines.flatMap((line) => {
+          const fallback = continuationFallbacks.get(line);
+          if (!fallback) return [line];
+          return continuationMode ? fallback.continuation : fallback.ordinary;
+        });
         if (plan.returnKind && plan.returnKind !== "throw") {
           if (directPositional) {
             lines.push(plan.returnKind === "void"
@@ -1916,7 +2029,8 @@ class JvmSsaBlockRenderer {
           : `${direct.variable}[${JSON.stringify(direct.key)}]`} ? 1 : 0) !== ${
         direct.guardedBooleanValue})`).join(" || ")}) { helpers.structuredSsa.guardedBooleanFallbackCount += 1; helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static boolean guard' }; }`
       : null;
-    const renderedTree = render(structured.tree);
+    const renderedTree = expandContinuationFallbacks(
+      render(structured.tree), useContinuations);
     const renderedLocalSlots = new Set();
     const renderedAssignedLocalSlots = new Set();
     for (const line of renderedTree) {
@@ -2133,7 +2247,8 @@ class JvmSsaBlockRenderer {
                 ? entryLocalInitialValues.get(index)
                 : entryArguments.get(index) || "undefined"};`),
           ...declarations,
-          ...render(structured.tree, false, true),
+          ...expandContinuationFallbacks(
+            render(structured.tree, false, true), false),
         ].filter(Boolean).join("\n");
         directPositionalBody = this.jit.createGeneratedFunction(
           method,
@@ -2212,7 +2327,8 @@ class JvmSsaBlockRenderer {
           ...fieldReadCacheDeclarations,
           ...fieldReadCacheInitializations,
           ...declarations,
-          ...render(structured.tree, false, true),
+          ...expandContinuationFallbacks(
+            render(structured.tree, false, true), false),
         ].filter(Boolean);
         restoringDirectPositionalSource = [
           "'use strict';",
@@ -2248,8 +2364,10 @@ class JvmSsaBlockRenderer {
         ordinaryAdaptive =
           this.jit.ordinaryAdaptiveFramelessPositionalEnabled;
         const adaptiveBody = buildBody(
-          render(structured.tree, !ordinaryAdaptive, false,
-            adaptiveSafePointBudget),
+          expandContinuationFallbacks(
+            render(structured.tree, !ordinaryAdaptive, false,
+              adaptiveSafePointBudget),
+            !ordinaryAdaptive),
           adaptiveSafePointBudget,
         );
         if (ordinaryAdaptive) {
@@ -2313,7 +2431,10 @@ class JvmSsaBlockRenderer {
               return step.value;
             }
             frame[STRUCTURED_CONTINUATION] = {
-              iterator, pc: frame.pc, framelessEntry: true,
+              iterator,
+              pc: Number.isInteger(step.value?.structuredResumePc)
+                ? step.value.structuredResumePc : frame.pc,
+              framelessEntry: true,
             };
             return step.value;
           };
@@ -2374,7 +2495,11 @@ class JvmSsaBlockRenderer {
             }
             return step.value;
           }
-          frame[STRUCTURED_CONTINUATION] = { iterator, pc: frame.pc };
+          frame[STRUCTURED_CONTINUATION] = {
+            iterator,
+            pc: Number.isInteger(step.value?.structuredResumePc)
+              ? step.value.structuredResumePc : frame.pc,
+          };
           return step.value;
         }
         : generatedBody;

@@ -5,12 +5,37 @@ const FileProvider = require('./FileProvider');
  * Supports loading files from URLs, file uploads, and JAR archives
  */
 class BrowserFileProvider extends FileProvider {
-  constructor() {
+  constructor(options = {}) {
     super();
     // Virtual file system to store loaded files
-    this.virtualFS = new Map(); // Map<string, Uint8Array>
+    this.workspaceFileSystem = options.workspaceFileSystem || null;
+    this.virtualFS = this.workspaceFileSystem
+      ? this.workspaceFileSystem.map
+      : new Map(); // Map-compatible <string, Uint8Array>
     this.loadedJars = new Set(); // Track loaded JAR files
-    this.jarInfo = new Map(); // Map<string, { classFiles: string[], mainClass: string|null }>
+    this.jarInfo = new Map(); // Map<string, { classFiles: string[], resourceFiles: string[], mainClass: string|null }>
+  }
+
+  /**
+   * Move the current browser classpath into a real workspace filesystem.
+   * Existing Map-based callers remain compatible through WorkspaceMapAdapter.
+   * @param {WorkspaceFileSystem} workspaceFileSystem
+   */
+  attachWorkspace(workspaceFileSystem) {
+    if (!workspaceFileSystem || !workspaceFileSystem.map) {
+      throw new TypeError('attachWorkspace requires a WorkspaceFileSystem');
+    }
+    if (this.workspaceFileSystem === workspaceFileSystem) return;
+    const existingEntries = Array.from(this.virtualFS.entries());
+    this.workspaceFileSystem = workspaceFileSystem;
+    this.virtualFS = workspaceFileSystem.map;
+    for (const [filePath, content] of existingEntries) {
+      this.virtualFS.set(filePath, content);
+    }
+  }
+
+  getWorkspaceFileSystem() {
+    return this.workspaceFileSystem;
   }
 
   /**
@@ -40,13 +65,13 @@ class BrowserFileProvider extends FileProvider {
   async readFile(filePath) {
     const normalized = this.normalizePath(filePath);
     let content = this.virtualFS.get(normalized);
-    if (!content && normalized.startsWith('./')) {
+    if (content === undefined && normalized.startsWith('./')) {
       content = this.virtualFS.get(normalized.slice(2));
     }
-    if (!content && normalized.startsWith('/')) {
+    if (content === undefined && normalized.startsWith('/')) {
       content = this.virtualFS.get(normalized.slice(1));
     }
-    if (!content) {
+    if (content === undefined) {
       throw new Error(`File not found: ${filePath}`);
     }
     return content;
@@ -120,6 +145,7 @@ class BrowserFileProvider extends FileProvider {
       await zip.loadAsync(jarContent);
       
       const extractedFiles = [];
+      const resourceFiles = [];
       let manifestText = null;
       
       // Extract all .class files
@@ -131,16 +157,21 @@ class BrowserFileProvider extends FileProvider {
 
         if (normalizedPath.toUpperCase() === 'META-INF/MANIFEST.MF') {
           manifestText = await zipEntry.async('text');
-        } else if (/\.class$/i.test(normalizedPath)) {
-          const content = await zipEntry.async('uint8array');
-          this.virtualFS.set(normalizedPath, content);
+        }
+
+        const content = await zipEntry.async('uint8array');
+        this.virtualFS.set(normalizedPath, content);
+        if (/\.class$/i.test(normalizedPath)) {
           extractedFiles.push(normalizedPath);
+        } else {
+          resourceFiles.push(normalizedPath);
         }
       }
       
       this.loadedJars.add(jarName);
       this.jarInfo.set(jarName, {
         classFiles: extractedFiles.sort(),
+        resourceFiles: resourceFiles.sort(),
         mainClass: this.getManifestMainClass(manifestText),
       });
       return extractedFiles;
@@ -213,14 +244,18 @@ class BrowserFileProvider extends FileProvider {
   /**
    * Return classes and the manifest entry point discovered for a loaded JAR.
    * @param {string} jarName - Original uploaded file name
-   * @returns {{classFiles: string[], mainClass: string|null}|null}
+   * @returns {{classFiles: string[], resourceFiles: string[], mainClass: string|null}|null}
    */
   getJarInfo(jarName) {
     const info = this.jarInfo.get(jarName);
     if (!info) {
       return null;
     }
-    return { classFiles: [...info.classFiles], mainClass: info.mainClass };
+    return {
+      classFiles: [...info.classFiles],
+      resourceFiles: [...info.resourceFiles],
+      mainClass: info.mainClass,
+    };
   }
 
   /**
