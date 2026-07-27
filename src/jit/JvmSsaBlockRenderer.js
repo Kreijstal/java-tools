@@ -162,9 +162,30 @@ function dispatchIrreducibleCfg(cfg, depths, islandIndex) {
 class JvmSsaBlockRenderer {
   constructor(jit, options = {}) {
     this.jit = jit;
-    this.enabled = options.structuredSsa === true ||
-      Boolean(typeof process !== "undefined" && process.env &&
-        process.env.JVM_ENABLE_STRUCTURED_SSA === "1");
+    const environment = typeof process !== "undefined" && process.env
+      ? process.env : {};
+    const explicitlyEnabled = options.structuredSsa === true ||
+      environment.JVM_ENABLE_STRUCTURED_SSA === "1";
+    this._enabled = options.structuredSsa !== false &&
+      environment.JVM_DISABLE_STRUCTURED_SSA !== "1";
+    // Verified primitive-array loop bodies are the part of this tier with a
+    // repeatable steady-state payoff, and compile() already rejects
+    // unsupported CFGs and opcodes before emitting code. Enable that
+    // conservative subset by default. Explicit structuredSsa=true retains the
+    // broader acyclic-region experiment used by positional-call benchmarks.
+    this.arrayLoopsOnly = !explicitlyEnabled;
+    Object.defineProperty(this, "enabled", {
+      configurable: true,
+      enumerable: true,
+      get: () => this._enabled,
+      set: (value) => {
+        this._enabled = Boolean(value);
+        // Runtime probe switches historically toggled .enabled directly to
+        // request the complete tier. Preserve that API while keeping only the
+        // array-loop subset enabled in an untouched default runtime.
+        if (value) this.arrayLoopsOnly = false;
+      },
+    });
     this.irreducibleSplittingEnabled = options.structuredIrreducibleSplitting === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_STRUCTURED_IRREDUCIBLE_SPLITTING === "1");
@@ -216,6 +237,20 @@ class JvmSsaBlockRenderer {
     };
     if (!this.enabled || !this.jit.canCompileSynchronously(method)) {
       return reject("disabled or asynchronous");
+    }
+    if (this.arrayLoopsOnly) {
+      const items = this.jit.getCodeItems(method);
+      const primitiveArrayOperation = items.some((item) => {
+        const instruction = item?.instruction;
+        const op = typeof instruction === "string"
+          ? instruction.trim().split(/\s+/)[0]
+          : instruction?.op;
+        return op === "arraylength" ||
+          /^(?:[bcdfils]aload|[bcdfils]astore)$/.test(op);
+      });
+      if (!this.jit.hasBackwardBranch(method) || !primitiveArrayOperation) {
+        return reject("default policy requires a primitive-array loop");
+      }
     }
     const code = method.attributes.find((attribute) => attribute.type === "code");
     if (!code) return reject("missing code attribute");
@@ -420,6 +455,9 @@ class JvmSsaBlockRenderer {
     }
     const methodIsStatic = (method.flags || []).includes("static") ||
       (Number(method.accessFlags) & 0x0008) !== 0;
+    const entryArrayLocalSlots = new Set(
+      method.jvmStructuredEntryArrayLocals || []);
+    const entryArrayDataVariable = (slot) => `ssaEntryArrayData${slot}`;
     const localZeroAssigned = items.some((item) => {
       const instruction = item?.instruction, op = opOf(instruction);
       return op === "astore_0" ||
@@ -721,10 +759,16 @@ class JvmSsaBlockRenderer {
         const cached = localValues[slot];
         if (this.localValueNumberingEnabled && cached !== null) {
           reusedLocalLoadCount += 1;
+          if (entryArrayLocalSlots.has(slot)) {
+            arrayViews.set(cached, entryArrayDataVariable(slot));
+          }
           return cached;
         }
         const out = value();
         lines.push(`const ${out} = local${slot};`);
+        if (entryArrayLocalSlots.has(slot)) {
+          arrayViews.set(out, entryArrayDataVariable(slot));
+        }
         if (this.localValueNumberingEnabled) localValues[slot] = out;
         return out;
       };
@@ -1795,16 +1839,20 @@ class JvmSsaBlockRenderer {
     // generators otherwise inhibit the hot-loop optimizer even when they
     // yield only at distant safe points. The one-million-iteration cap keeps
     // atomic regions bounded independently of guest names or descriptors.
+    const guardedAtomicRegionLimit =
+      Number(method.jvmStructuredAtomicRegionMaxIterations) || 0;
     const atomicBoundedLoops = this.atomicBoundedLoopsEnabled &&
       structured.loopHeaders.size > 0 &&
-      allCountedLoops.size === structured.loopHeaders.size &&
-      boundedIterationProduct <= 1_000_000 &&
       (code.code.exceptionTable || []).length === 0 &&
-      !hasAtomicUnsafeOperation;
+      !hasAtomicUnsafeOperation &&
+      (allCountedLoops.size === structured.loopHeaders.size &&
+        boundedIterationProduct <= 1_000_000 ||
+        guardedAtomicRegionLimit > 0);
     if (atomicBoundedLoops) {
       useContinuations = false;
       for (const header of structured.loopHeaders) {
-        coarseCountedLoops.set(header, allCountedLoops.get(header));
+        coarseCountedLoops.set(header,
+          allCountedLoops.get(header) || guardedAtomicRegionLimit);
       }
     }
     const maximumCoarseTripCount = Math.max(1, ...coarseCountedLoops.values());
@@ -1874,6 +1922,9 @@ class JvmSsaBlockRenderer {
           // body deoptimizes or throws.  Ordinary scheduler entries retain the
           // canonical Frame spill/pop/result protocol below.
           lines.push("if (framelessEntry) {");
+          if (method.jvmStructuredRegionSpillOnReturn) {
+            lines.push("  spillLocals();");
+          }
           lines.push(plan.returnKind === "void"
             ? "  return helpers.returnVoid();"
             : `  return ${plan.returnValue};`);
@@ -2189,6 +2240,10 @@ class JvmSsaBlockRenderer {
       `let safePointBudget = ${entrySafePointBudget};`,
       ...declaredLocals.map((i) => `${immutableEntryLocals.has(i) ? "const" : "let"} local${i} = ${
         entryLocalInitialValues.has(i) ? entryLocalInitialValues.get(i) : `locals[${i}]`};`),
+      ...[...entryArrayLocalSlots]
+        .filter((slot) => declaredLocals.includes(slot))
+        .map((slot) =>
+          `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`),
       ...fieldReadCacheDeclarations,
       ...fieldReadCacheInitializations,
       `const spillLocals = () => {${spillSlots.map((i) => ` locals[${i}] = ${

@@ -74,7 +74,7 @@ targets. They must never contain a game method-name allowlist.
 | Array/field/call guest-body scalarization | disabled | Correct and faster, but only reaches about 13 images/s |
 | Fused wrapper/raster regions | disabled | About 20% faster alone, but below the absolute acceptance target |
 | Basic SSA companions/value numbering | disabled | Correct but neutral in the final A/B |
-| Structured SSA block renderer | disabled | Correct and +6.10%, but misses the complete hot body and 20 images/s target |
+| Structured SSA block renderer | primitive-array loops | Default verified subset; broader acyclic-region experiment remains opt-in |
 | Cross-block guarded field cache | removed | Final counter-free A/B regressed by 2.13% |
 | Partial numeric Wasm | available | Excellent for complete numeric loops; poor when imports/exits dominate |
 
@@ -87,6 +87,8 @@ Experimental controls are `JVM_ENABLE_SCALAR_GUEST_BODIES=1`,
 scalar guest bodies, fused renderer regions, and structured SSA as one composed
 configuration; explicit component probe switches are applied afterward and can
 override it for an A/B.
+`JVM_DISABLE_STRUCTURED_SSA=1` disables the default verified
+primitive-array-loop subset for a baseline differential.
 
 ### Accepted and rejected results at a glance
 
@@ -5185,6 +5187,128 @@ two-run averages were 5.482 s wall and 1.582 s measured pipeline with sampling
 off, versus 5.540 s and 1.596 s on: approximately 1.1% wall overhead and 0.9%
 pipeline overhead. Deadline misses remained two in all four runs.
 
+### Full-track Node control does not reproduce the slowdown
+
+`dekobloko-work/scripts/benchmark-guest-mixer-node.js` now runs the same guest
+driver, original game JAR, decoded sample bank, and raw track descriptor
+directly in Node. It records the Node/V8 versions, relevant `JVM_*` gates,
+repository commits and dirty states, input hashes, phase timings, and tier
+counters. The Node audio sink is deliberately non-blocking and discards PCM,
+so this is a guest-compute throughput control rather than an audio-pacing test.
+
+On 2026-07-27, the complete `Art_Deko_remix_NORMAL` track produced exactly the
+same 2,793,984 frames and checksum `0x4756a903` in both environments. With the
+same 1/128 generated-method and 1/16 scheduler sampling as the browser:
+
+| measurement | Node 26.4 / V8 14.6 | Firefox 151 telemetry |
+|---|---:|---:|
+| audio represented | 126.711 s | 126.711 s |
+| mixer | 7.206 s | 94.253 s |
+| PCM conversion | 1.626 s | 34.874 s |
+| output write | 0.182 s | 2.229 s |
+| complete measured pipeline | 9.014 s | 131.356 s |
+| steady chunk average | 1.627 ms | 23.889 ms |
+| 23.22 ms deadline misses | 1 / 5,457 | 2,476 / 5,457 |
+| pipeline throughput | 14.06x real time | 0.965x real time |
+
+Thus normal Node did **not** reproduce the failure: Firefox's measured pipeline
+was 14.57 times slower. Both profiles named the same generated hot bodies,
+starting with `mi.b([III)V`, `ei.b([III)V`, `ol.a([III)V`, and `mi.c([III)V`.
+Even `node --jitless`, stopped after 12 seconds, remained 2.75x real time with
+an 8.41 ms steady chunk average. This suggests that merely selecting the
+JVM.js generated JavaScript tier is insufficient to recreate the observed
+failure under V8.
+
+This is not yet a controlled engine-only comparison. Firefox submitted the
+telemetry from remote address `100.88.76.3`; Node ran on `kreijstalnuc`, a
+13th-generation Intel Core i7-1360P. Hardware, power policy, and browser task
+scheduling are therefore still confounders. Run the checked-in Node command on
+the Firefox host before concluding that the full 14.57x difference belongs to
+SpiderMonkey:
+
+```bash
+node scripts/benchmark-guest-mixer-node.js --profile-timings
+```
+
+The comparison used java-tools commit
+`3ab45904f2061720c11a1f783caa3a39108739f0`, JVM bundle
+`fbdc712f7c86c52934cb12dbf32d42072d7c067e5a61bc38e9818b5c1b160c85`,
+untouched game JAR
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+driver JAR
+`62510b9a8a75f31eacb45cc55f9fd2bfcec9a8e54cfe58120be7d0c31c9dafde`,
+track descriptor
+`5e88dc300cdaf63f66219fe266d4484cbd815e4bcd27f5deba528c5bf863ca5b`,
+and sample bank
+`ebd1e0a0c3fcebfdd380f373c1a158f33a9c6a7fab3e0618994a69ffda07c2f2`.
+
+### Default primitive-array SSA and synchronous class literals
+
+The remote 195-chunk profile then exposed two generic tiering problems:
+
+1. any `ldc SomeClass.class` made an otherwise supported complete caller an
+   `async function`, even when the literal target had already been loaded;
+2. the verified structured SSA array-loop tier remained disabled unless the
+   complete experimental renderer pipeline was requested.
+
+Class literals now use a loaded-only synchronous lookup. A genuinely cold
+literal reconstructs the exact PC and operand state and transiently deopts
+before loading; the warmed body reuses the canonical `java.lang.Class` object.
+Resolving the literal still does not initialize its target. This changes the
+diagnostic driver from `generated-async` to `generated-sync` without matching
+its class or method name.
+
+The structured renderer now admits verified primitive-array loops by default.
+It still rejects unsupported descriptors, CFGs, stack shapes, opcodes, and
+exception semantics. The broader acyclic/positional experiment remains behind
+the explicit `structuredSsa=true` switch. This narrow policy avoids displacing
+the established direct-integer-call tier while covering the `int[]`/`byte[]`
+mixer kernels identified by profiling.
+
+Three interleaved full-track Node runs per configuration measured:
+
+| metric | structured off median | default array-loop median | change |
+|---|---:|---:|---:|
+| wall time | 9.352 s | 5.103 s | -45.4% |
+| measured pipeline | 8.696 s | 4.455 s | -48.8% |
+| mixer | 6.886 s | 2.648 s | -61.5% |
+| steady 512-frame chunk | 1.569 ms | 0.780 ms | -50.3% |
+
+All six runs generated 2,793,984 frames with checksum `0x4756a903` and one
+cold deadline miss. The default path entered 143,836 structured regions per
+run; the off control entered zero. The exact command accepts
+`--structured-ssa default|on|off`, so this result can be repeated without
+changing a source tree or environment:
+
+```bash
+node scripts/benchmark-guest-mixer-node.js \
+  --no-prepare --structured-ssa default
+```
+
+This is a Node throughput result, not the Firefox acceptance result. Applying
+the Node mixer ratio mechanically to the remote profile would put its ordinary
+steady chunks below the 23.22 ms audio deadline, but Firefox must be measured
+after rebuilding the production bundle before that can be claimed.
+
+The rebuilt production bundle
+`85899abdf7ba008d0c99763546d5e54691722eb93c22fa25dd13f2e124ffadd3`
+was then measured in local headless Firefox with three clean interleaved
+`structuredSsa=off/default` runs of the 195-chunk `Game Lose` track:
+
+| metric | off median | default median | change |
+|---|---:|---:|---:|
+| steady chunk | 7.28 ms | 4.79 ms | -34.2% |
+| first-32 warmup chunk | 11.94 ms | 13.66 ms | +14.4% |
+| deadline misses | 2 / 195 | 2 / 195 | unchanged |
+| PCM-conversion aggregate | 382 ms | 429 ms | +12.3% |
+
+The steady-state improvement is repeatable in Firefox, but it does not remove
+cold compilation/allocation spikes; maximum chunks remained 166-176 ms off and
+237-251 ms by default. The remote Firefox host that reported a 29.36 ms steady
+average must rerun the new bundle before its result can be inferred. A purely
+proportional 34.2% improvement would be about 19.3 ms and therefore below the
+23.22 ms deadline, but that number is a projection rather than telemetry.
+
 Profiling provenance is guest driver source
 `9d4986ad061f40a75b157b56ca0169d180fd2ac02e7250c175bf5e4719fa98be`,
 driver JAR
@@ -5197,6 +5321,133 @@ sample bank
 `ebd1e0a0c3fcebfdd380f373c1a158f33a9c6a7fab3e0618994a69ffda07c2f2`,
 and WebAudio bridge
 `234207c030cdb23bfc735e1e885bf8dab68f58dec21e959b11129a52d173a1bd`.
+
+### Exclusive Firefox attribution after primitive-array SSA
+
+Inclusive sampling had been repeatedly blaming every wrapper in the same call
+chain for the complete elapsed time. A selective exclusive timer now admits
+one diagnostic root, clocks only its generated subtree, subtracts nested
+generated/frameless/fused calls, and records parent-child edges. Root selection
+is diagnostic configuration; neither compilation nor optimization depends on
+these method names. Entries outside the selected subtree do not format a
+method key or read the clock.
+
+The production bundle
+`9ade9b6f565ec92466a23f584eb706044712b0c5b4aec18f616669a5df1a0f8e`
+was measured in local headless Firefox 146 with the 195-chunk `Deko Bloko Game
+Lose` track. The unprofiled control (`profile=0`) had a 5.09 ms steady chunk
+average. Exact timing rooted at `mi.b([III)V` had a 5.25 ms steady average:
+about 3.1% observer overhead. Both runs had two deadline misses, no page/JVM
+errors, and checksum `0xe5069a58`.
+
+The broad root covered 415 ms after the first audio scheduler yield. Its
+dominant paths were:
+
+| generated region | inclusive time | exclusive self time | interpretation |
+|---|---:|---:|---|
+| `mi.c([III)V` | 275 ms | 21 ms | voice/output traversal |
+| `ol.a([III)V` | 244 ms | 14 ms | forwarding layer inside that traversal |
+| `ei.b([III)V` | 230 ms | 49 ms | per-voice sample rendering |
+| `ei.b([IIIII)I` | 178 ms | 49 ms | inner renderer dispatcher/body |
+| `ei.b(II[B[IIIIIIILei;II)I` | 52 ms | 52 ms | structured primitive-array kernel |
+| `ei.c(II[B[IIIIIIIILei;II)I` | 46 ms | 46 ms | alternate structured kernel |
+| `ia.c()Z` | 90 ms | 38 ms | sequencer/update branch |
+
+The rows are nested and must not be added as independent costs. Separate clean
+root passes corroborated the structure: `mi.c` was 256 ms inclusive,
+`ei.b([IIIII)I` was 171 ms, `ia.c` was 111 ms, and the two leaf kernels were
+61 ms and 44 ms. Their steady chunk averages remained 4.13-4.98 ms, and every
+run produced the same checksum with no runtime errors.
+
+The other large hot loop is not below `mi.b`: the guest driver's inline
+int-to-PCM16 conversion and checksum loop took 0.36-0.44 seconds over the same
+195 chunks, while `SourceDataLine.write` took only about 43 ms in the broad
+pass. The broad pass measured 832 ms of whole-track mixing and 438 ms of PCM
+conversion. Therefore browser audio output is not the CPU bottleneck on this
+host. The remaining steady cost is split between generated guest mixing
+(especially the nested `mi.c → ol.a → ei.b` renderer path) and primitive-array
+PCM conversion. Cold first-play latency remains separate: maximum pipeline
+chunks were 232-255 ms and are dominated by warmup/compilation rather than
+steady audio.
+
+The exact diagnostic URL form is:
+
+```text
+/audio-diagnostics/?profile=0&exclusiveRoot=<Class.method(descriptor)>
+```
+
+Submitted results include exclusive rows and edges, selected tier gates, input
+and bundle hashes, repository commit/tree identities, dirty state, tracked
+patch hash, and relevant environment variables.
+
+### Embedded primitive-array regions remove Firefox PCM conversion
+
+The exclusive measurements revealed that the diagnostic driver's in-method
+`int[]` to interleaved PCM16 `byte[]` conversion was spending roughly
+0.36-0.50 seconds per 195 chunks in Firefox. Optimizing the complete driver
+method did not reliably reach this loop: the interpreter executes a 1024
+bytecode burst, so it can cross the loop header many times before method-entry
+tiering observes it.
+
+The JIT now extracts verified bounded primitive-array loops from larger
+call-, allocation-, scheduler-, or handler-bearing methods. Selection uses
+verifier stack depths, CFG edges, opcodes, constants, and local-slot
+relationships, never guest class or method names. A generic structured SSA
+region handles the admitted opcode subset. A fully verified saturating
+`int[]`-to-two-`byte[]` store plus rolling-hash shape receives a direct scalar
+kernel. Both generated callers and interpreter loop-header OSR enter the same
+region. Debugging, tracing, invalid arrays, an excessive trip count, and other
+failed guards retain canonical execution before optimized side effects.
+
+On Node 26.4 / V8 14.6, the 195-chunk `Deko Bloko Game Lose` control measured
+152.808 ms conversion with `--inline-loop-regions off` and 1.976 ms with it
+on, a 98.7% reduction. All 195 loops entered the region, 24 through
+interpreter OSR. Both runs produced checksum `0xe5069a58`, completed with no
+guest error, and wrote 99,840 frames.
+
+Production bundle
+`00f28307b1ba39fe56bf958555eb3b4b6a68c0f846084b94e95a9780881f70f5`
+was then tested in local headless Firefox 146. An instrumented run proved
+195/195 region entries, including 185 interpreter-OSR entries. It measured
+12.001 ms total conversion, a 2.70 ms steady chunk average, one cold deadline
+miss, no underruns, no page errors, and the expected checksum.
+
+Three clean, interleaved, sampling-disabled Firefox runs per configuration
+measured:
+
+| metric | regions off median | regions on median | change |
+|---|---:|---:|---:|
+| PCM conversion | 456.0 ms | 12.0 ms | -97.4% |
+| complete measured pipeline | 1,234.0 ms | 818.0 ms | -33.7% |
+| steady 512-frame chunk | 5.02 ms | 2.81 ms | -44.0% |
+| deadline misses | 1 / 195 | 1 / 195 | unchanged |
+
+Every A/B run used game JAR
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+driver JAR
+`62510b9a8a75f31eacb45cc55f9fd2bfcec9a8e54cfe58120be7d0c31c9dafde`,
+sample bank
+`ebd1e0a0c3fcebfdd380f373c1a158f33a9c6a7fab3e0618994a69ffda07c2f2`,
+and `Game Lose` descriptor
+`1c675bf7eab1d2e0f6e2ab9d987696773c25be2c5cc2f12c18c7560423fdd1f9`.
+All six runs had checksum `0xe5069a58`, zero guest errors, and zero page
+errors. The optimized runs had zero WebAudio underruns; one of the three
+disabled controls reported one underrun.
+
+The remaining one-to-two misses per short run are cold mixer/JIT events:
+maximum pipeline chunks remained 230-253 ms while the steady mean was far
+below the 23.22 ms deadline. The earlier remote 5,088-chunk result had 669
+misses and a 16.20 ms steady mean, but used a bundle where the conversion
+region only covered late chunks. That host must rerun bundle
+`00f28307...` before attributing its residual misses; the local result cannot
+substitute for remote telemetry.
+
+The differential controls are:
+
+```text
+/audio-diagnostics/?profile=0&inlineLoops=off
+/audio-diagnostics/?profile=0&inlineLoops=on
+```
 
 ### Real soundtrack through guest Java
 

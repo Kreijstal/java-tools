@@ -1358,6 +1358,30 @@ class JVM {
       if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
           thread.status !== 'runnable') break;
 
+      // A whole method may still be warming while a verified bounded
+      // primitive-array loop inside it is already hot. Enter the cached scalar
+      // region at its exact header from the interpreter quantum; no method
+      // identity participates, and invalid/debuggable states retain the
+      // ordinary instruction path.
+      const inlineRegions = this.jit.inlineLoopRegionPcCache.get(
+        currentFrame.method);
+      if (inlineRegions && inlineRegions.has(currentFrame.pc)) {
+        try {
+          if (this.jit.tryRunInlineLoopRegionOsr(currentFrame, thread)) {
+            executedBytecodes++;
+            continue;
+          }
+        } catch (e) {
+          const item = currentFrame.instructions[currentFrame.pc];
+          const label = item && item.labelDef;
+          const currentPc = label
+            ? parseInt(label.substring(1, label.length - 1))
+            : -1;
+          this.handleException(e, currentPc, thread);
+          break;
+        }
+      }
+
       // Never step across a debugger breakpoint inside one quantum. The
       // outer execute loop observes it immediately after this tick.
       if (executed > 0 && this.debugManager.breakpoints.size > 0) {
@@ -1710,7 +1734,7 @@ class JVM {
    * @param {string} classNameWithSlashes - Class name with slashes (e.g., "java/lang/String")
    * @returns {Promise<Object>} The Class object
    */
-  async getClassObject(classNameWithSlashes) {
+  getClassObjectSync(classNameWithSlashes) {
     // Check cache first
     if (this.classObjectCache.has(classNameWithSlashes)) {
       return this.classObjectCache.get(classNameWithSlashes);
@@ -1729,8 +1753,11 @@ class JVM {
       return classObj;
     }
 
-    // Load class data for regular classes
-    let classData = await this.loadClassByName(classNameWithSlashes);
+    // Class literals do not initialize their target, but resolving a cold
+    // literal can still require asynchronous archive I/O. Generated
+    // synchronous bodies use this loaded-only path and deopt before the ldc
+    // when it returns null; the interpreter then performs normal loading.
+    let classData = this.classes[classNameWithSlashes];
     if (!classData && this.jre[classNameWithSlashes]) {
       const jreClass = this.jre[classNameWithSlashes];
       classData = {
@@ -1749,10 +1776,7 @@ class JVM {
       this.classes[classNameWithSlashes] = classData;
       this.classEpoch += 1;
     }
-    if (!classData) {
-      throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
-    }
-
+    if (!classData) return null;
 
     const classObj = {
       type: "java/lang/Class",
@@ -1760,6 +1784,16 @@ class JVM {
     };
     this.classObjectCache.set(classNameWithSlashes, classObj);
     return classObj;
+  }
+
+  async getClassObject(classNameWithSlashes) {
+    const loaded = this.getClassObjectSync(classNameWithSlashes);
+    if (loaded) return loaded;
+    const classData = await this.loadClassByName(classNameWithSlashes);
+    if (!classData) {
+      throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
+    }
+    return this.getClassObjectSync(classNameWithSlashes);
   }
 
   async initializeClassIfNeeded(className, thread) {

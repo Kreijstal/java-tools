@@ -242,7 +242,7 @@ public class StructuredByteArrays {
 }
 `);
   const jvm = new JVM({ classpath, jit: {
-    warmupThreshold: 0, structuredSsa: true, profileMethods: false,
+    warmupThreshold: 0, profileMethods: false,
   } });
   await jvm.loadClassByName('StructuredByteArrays');
   jvm.classInitializationState.set('StructuredByteArrays', 'INITIALIZED');
@@ -280,6 +280,145 @@ public class StructuredByteArrays {
   await invoke(jvm, thread, 'StructuredByteArrays', 'fill', '([BI)V', [output, 255]);
   t.deepEqual(output.slice(), [-1, -1, -1],
     'direct bastore paths narrow values to signed bytes');
+  t.end();
+});
+
+test('baseline generated methods scalarize bounded primitive-array loop regions', async (t) => {
+  const classpath = compileJavaFixture(t, 'InlineArrayRegionHarness', `
+public class InlineArrayRegionHarness {
+  static int touches;
+  static int result;
+  static void touch() { touches++; }
+  static void convert(int[] mixed, byte[] pcm, int hash) {
+    touch();
+    try {
+      for (int frame = 0; frame < mixed.length; frame++) {
+        int sample = mixed[frame] >> 8;
+        if (sample < -32768) sample = -32768;
+        if (sample > 32767) sample = 32767;
+        int offset = frame * 2;
+        pcm[offset] = (byte) sample;
+        pcm[offset + 1] = (byte) (sample >> 8);
+        hash = hash * 31 + pcm[offset];
+        hash = hash * 31 + pcm[offset + 1];
+      }
+      touch();
+      result = hash;
+    } catch (ArrayIndexOutOfBoundsException exception) {
+      result = -77;
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, profileMethods: false,
+  } });
+  await jvm.loadClassByName('InlineArrayRegionHarness');
+  jvm.classInitializationState.set('InlineArrayRegionHarness', 'INITIALIZED');
+  jvm.classes.InlineArrayRegionHarness.staticFields.set('touches:I', 0);
+  jvm.classes.InlineArrayRegionHarness.staticFields.set('result:I', 0);
+  const thread = {
+    id: 0, name: 'inline-array-region', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const mixed = [0x123400, -0x123400, 0x7fffffff, -0x80000000];
+  mixed.type = '[I';
+  const pcm = new Array(8).fill(0);
+  pcm.type = '[B';
+
+  await invoke(jvm, thread, 'InlineArrayRegionHarness',
+    'convert', '([I[BI)V', [mixed, pcm, 17]);
+  const method = await jvm.findMethodInHierarchy(
+    'InlineArrayRegionHarness', 'convert', '([I[BI)V');
+  const generated = jvm.jit.codegenCache.get(method);
+  t.equal(generated?.jvmInlineLoopRegionCount, 1,
+    'a name-independent region is embedded in the surrounding baseline body');
+  t.ok(jvm.jit.inlineLoopRegionRunCount > 0,
+    'the bounded array loop executes through its scalar region');
+  t.deepEqual(pcm.slice(), [52, 18, -52, -19, -1, 127, 0, -128],
+    'region stores preserve signed byte narrowing and saturation');
+  const expectedHash = pcm.reduce((hash, value) =>
+    (Math.imul(hash, 31) + value) | 0, 17);
+  const fields = jvm.classes.InlineArrayRegionHarness.staticFields;
+  t.equal(fields.get('result:I'), expectedHash,
+    'scalar live-out locals are spilled back into the surrounding method');
+  t.equal(fields.get('touches:I'), 2,
+    'calls before and after the extracted region retain their effects');
+
+  const plan = jvm.jit.compileInlinePrimitiveLoopRegions(method)[0];
+  const osrFrame = new Frame(method);
+  osrFrame.className = 'InlineArrayRegionHarness';
+  osrFrame.pc = plan.header;
+  osrFrame.locals[0] = mixed;
+  osrFrame.locals[1] = pcm;
+  osrFrame.locals[2] = 17;
+  osrFrame.locals[plan.counterSlot] = 0;
+  thread.callStack.push(osrFrame);
+  t.ok(jvm.jit.tryRunInlineLoopRegionOsr(osrFrame, thread),
+    'an interpreted frame enters the verified region at its loop header');
+  t.equal(osrFrame.pc, plan.exit,
+    'region OSR resumes at the original bytecode loop exit');
+  thread.callStack.pop();
+
+  const shortPcm = new Array(2).fill(0);
+  shortPcm.type = '[B';
+  await invoke(jvm, thread, 'InlineArrayRegionHarness',
+    'convert', '([I[BI)V', [mixed, shortPcm, 17]);
+  t.equal(fields.get('result:I'), -77,
+    'an array exception resumes in the original surrounding handler');
+  t.end();
+});
+
+test('loaded class literals keep arbitrary hot-loop callers synchronous', async (t) => {
+  const classpath = compileJavaFixture(t, 'ClassLiteralLoopHarness', `
+class ArbitraryLiteralTarget {
+  static int initialized;
+  static { initialized = 1; }
+}
+public class ClassLiteralLoopHarness {
+  static Class<?> seen;
+  static int visit(int count) {
+    int value = 0;
+    for (int index = 0; index < count; index++) value += index;
+    seen = ArbitraryLiteralTarget.class;
+    return value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, structuredSsa: false, profileMethods: false,
+  } });
+  await jvm.loadClassByName('ClassLiteralLoopHarness');
+  jvm.classInitializationState.set('ClassLiteralLoopHarness', 'INITIALIZED');
+  const thread = {
+    id: 0, name: 'class-literal-loop', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  t.equal(jvm.getClassObjectSync('ArbitraryLiteralTarget'), null,
+    'a genuinely cold literal target requests the normal loading path');
+  await invoke(jvm, thread, 'ClassLiteralLoopHarness', 'visit', '(I)I', [8]);
+  const method = await jvm.findMethodInHierarchy(
+    'ClassLiteralLoopHarness', 'visit', '(I)I');
+  const generated = jvm.jit.codegenCache.get(method);
+  t.ok(generated?.jvmSynchronous,
+    'the class literal no longer makes the complete caller asynchronous');
+  const fields = jvm.classes.ClassLiteralLoopHarness.staticFields;
+  const classObject = fields.get('seen:Ljava/lang/Class;');
+  t.equal(classObject, jvm.getClassObjectSync('ArbitraryLiteralTarget'),
+    'cold deopt and loaded synchronous lookup preserve Class identity');
+  t.notEqual(
+    jvm.classInitializationState.get('ArbitraryLiteralTarget'), 'INITIALIZED',
+    'resolving the class literal does not initialize its target');
+
+  fields.set('seen:Ljava/lang/Class;', null);
+  await invoke(jvm, thread, 'ClassLiteralLoopHarness', 'visit', '(I)I', [8]);
+  t.equal(fields.get('seen:Ljava/lang/Class;'), classObject,
+    'the warmed synchronous body reuses the resolved literal');
   t.end();
 });
 
@@ -430,6 +569,16 @@ test('exclusive region timing subtracts nested generated and fused time', (t) =>
   const jit = jvm.jit;
   jit.exclusiveTimingsEnabled = true;
   jit.exclusiveTimingRootKey = 'ArbitraryRoot.work()V';
+  const unrelatedFrame = new Frame({
+    name: 'work', descriptor: '()V', attributes: [],
+  });
+  unrelatedFrame.className = 'Unrelated';
+  t.notOk(jit.matchesExclusiveTimingRoot(unrelatedFrame),
+    'an unrelated generated entry is rejected without starting a clock');
+  t.notOk(jit.shouldBeginExclusiveTimingKey('Unrelated.work()V'),
+    'a positional entry outside the selected root is rejected');
+  t.ok(jit.shouldBeginExclusiveTimingKey('ArbitraryRoot.work()V'),
+    'the selected positional root is admitted');
   const times = [0, 2, 5, 9];
   jit.monotonicNow = () => times.shift();
   t.equal(jit.beginExclusiveTiming('Unrelated.work()V', 'generated-sync'), null,
@@ -4680,6 +4829,7 @@ public class DirectIntegerInlineHarness {
 `);
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
+    structuredSsa: false,
   } });
   for (const className of ['DirectIntegerInlineHarness', 'DirectIntegerLeafTarget']) {
     await jvm.loadClassByName(className);
@@ -4734,6 +4884,7 @@ public class DirectIntegerInlineHarness {
 
   const coldJvm = new JVM({ classpath, jit: {
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
+    structuredSsa: false,
   } });
   await coldJvm.loadClassByName('DirectIntegerInlineHarness');
   await coldJvm.loadClassByName('DirectIntegerLeafTarget');
@@ -4781,6 +4932,7 @@ public class IntermethodCallJitHarness {
 `);
   const jvm = new JVM({ classpath, jit: {
     warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: true,
+    structuredSsa: false,
   } });
   const classes = [
     'IntermethodCallJitHarness',
