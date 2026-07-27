@@ -324,6 +324,17 @@ function convertAttribute(attribute, invokeDynamicMap) {
     return attribute; // Structure is the same
   }
 
+  if (attribute.type === 'localvariabletable' || attribute.type === 'localvariabletypetable') {
+    return {
+      ...attribute,
+      vars: ensureArray(attribute.vars).map((variable) => ({
+        ...variable,
+        name: parseStringLiteral(variable.name),
+        descriptor: parseStringLiteral(variable.descriptor),
+      })),
+    };
+  }
+
   if (attribute.type === 'attribute' && attribute.attribute.type === 'sourcefile') {
       return attribute;
   }

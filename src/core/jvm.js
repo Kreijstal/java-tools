@@ -72,6 +72,29 @@ const JIT_TICK_SLOW = Object.freeze({ slow: true, skipJit: false });
 const JIT_TICK_SLOW_AFTER_PROBE = Object.freeze({ slow: true, skipJit: true });
 const PRIMITIVE_ARRAY_COMPONENTS = new Set(["Z", "B", "C", "S", "I", "J", "F", "D"]);
 
+function staticFieldInitialValue(jvm, field) {
+  const descriptor = field && field.descriptor;
+  let value = field && field.value;
+  const hasConstantValue = value !== null && value !== undefined;
+  if (hasConstantValue && value && typeof value === "object"
+      && Object.prototype.hasOwnProperty.call(value, "value")) {
+    value = value.value;
+  }
+  if (hasConstantValue) {
+    if (descriptor === "Ljava/lang/String;") return jvm.internString(value);
+    if (descriptor === "J") {
+      if (typeof value === "bigint") return value;
+      return BigInt(String(value).replace(/[lL]$/, ""));
+    }
+    if (descriptor === "F") return Math.fround(Number(value));
+    if (descriptor === "D") return Number(value);
+    if (["Z", "B", "C", "S", "I"].includes(descriptor)) return Number(value) | 0;
+  }
+  if (descriptor === "J") return BigInt(0);
+  if (["Z", "B", "C", "S", "I", "F", "D"].includes(descriptor)) return 0;
+  return null;
+}
+
 function arrayComponentType(descriptor) {
   if (typeof descriptor !== "string" || descriptor[0] !== "[") return null;
   const component = descriptor.slice(1);
@@ -436,26 +459,7 @@ class JVM {
       const field = fieldItem.field;
       const fieldKey = `${field.name}:${field.descriptor}`;
 
-      // Set default value based on descriptor
-      let defaultValue = null;
-      if (
-        field.descriptor === "I" ||
-        field.descriptor === "B" ||
-        field.descriptor === "S"
-      ) {
-        defaultValue = 0; // int, byte, short
-      } else if (field.descriptor === "J") {
-        defaultValue = BigInt(0); // long
-      } else if (field.descriptor === "F" || field.descriptor === "D") {
-        defaultValue = 0.0; // float, double
-      } else if (field.descriptor === "Z") {
-        defaultValue = 0; // boolean (false)
-      } else if (field.descriptor === "C") {
-        defaultValue = 0; // char ('\0')
-      }
-      // Object references default to null
-
-      classData.staticFields[fieldKey] = defaultValue;
+      classData.staticFields[fieldKey] = staticFieldInitialValue(this, field);
     }
 
     // Execute static initializer (<clinit>) if it exists
@@ -1113,6 +1117,21 @@ class JVM {
         slowPathSamples: value.slowPathSamples || 0,
       }));
     return { rate: profile.rate, rows };
+  }
+
+  configureSchedulerTimings(rate = 0) {
+    const numericRate = Number(rate);
+    if (!Number.isFinite(numericRate) || numericRate <= 0) {
+      this._schedulerTimingProfile = null;
+      return null;
+    }
+    this._schedulerTimingProfile = {
+      rate: Math.max(1, Math.floor(numericRate)),
+      random: 0x9e3779b9,
+      methods: new WeakMap(),
+      samples: new Map(),
+    };
+    return this.getSchedulerTimingSnapshot();
   }
 
   resetSchedulerTimings() {
@@ -1831,26 +1850,7 @@ class JVM {
             const field = fieldItem.field;
             const fieldKey = `${field.name}:${field.descriptor}`;
 
-            // Set default value based on descriptor
-            let defaultValue = null;
-            if (
-              field.descriptor === "I" ||
-              field.descriptor === "B" ||
-              field.descriptor === "S"
-            ) {
-              defaultValue = 0; // int, byte, short
-            } else if (field.descriptor === "J") {
-              defaultValue = BigInt(0); // long
-            } else if (field.descriptor === "F" || field.descriptor === "D") {
-              defaultValue = 0.0; // float, double
-            } else if (field.descriptor === "Z") {
-              defaultValue = 0; // boolean (false)
-            } else if (field.descriptor === "C") {
-              defaultValue = 0; // char ('\0')
-            }
-            // Object references default to null
-
-            classData.staticFields.set(fieldKey, defaultValue);
+            classData.staticFields.set(fieldKey, staticFieldInitialValue(this, field));
 
             if (this.verbose) {
               console.log(

@@ -1,8 +1,19 @@
 const fs = require('fs');
+const { getFileProvider } = require('../../../core/classLoader');
+const { withThrows } = require('../../helpers');
 
-function loadFile(obj, filePath) {
-  obj.path = String(filePath);
-  obj.buffer = fs.readFileSync(obj.path);
+async function loadFile(obj, filePath) {
+  obj.path = filePath && filePath.value !== undefined
+    ? String(filePath.value)
+    : String(filePath);
+  try {
+    obj.buffer = await getFileProvider().readFile(obj.path);
+  } catch (providerError) {
+    if (!fs || typeof fs.readFileSync !== 'function') {
+      throw providerError;
+    }
+    obj.buffer = fs.readFileSync(obj.path);
+  }
   obj.pos = 0;
   obj.closed = false;
 }
@@ -16,13 +27,13 @@ function ensureOpen(jvm, obj) {
 module.exports = {
   super: 'java/io/InputStream',
   methods: {
-    '<init>(Ljava/lang/String;)V': (jvm, obj, args) => {
-      loadFile(obj, args[0]);
-    },
+    '<init>(Ljava/lang/String;)V': withThrows(async (jvm, obj, args) => {
+      await loadFile(obj, args[0]);
+    }, ['java/io/FileNotFoundException', 'java/io/IOException']),
 
-    '<init>(Ljava/io/File;)V': (jvm, obj, args) => {
-      loadFile(obj, args[0].path);
-    },
+    '<init>(Ljava/io/File;)V': withThrows(async (jvm, obj, args) => {
+      await loadFile(obj, args[0].path);
+    }, ['java/io/FileNotFoundException', 'java/io/IOException']),
 
     'read()I': (jvm, obj, args) => {
       ensureOpen(jvm, obj);

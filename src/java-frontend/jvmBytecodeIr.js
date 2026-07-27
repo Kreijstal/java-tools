@@ -396,7 +396,11 @@ function emitValue(value, state) {
   if (value.kind === 'LocalValue') {
     const local = state.locals.get(value.local);
     if (!local || typeof local.slotHint !== 'number') return null;
-    state.instructions.push(createJvmInstruction(loadOpcodeForDescriptor(local.descriptor), [String(local.slotHint)]));
+    state.instructions.push(createJvmInstruction(
+      loadOpcodeForDescriptor(local.descriptor),
+      [String(local.slotHint)],
+      { localId: local.id },
+    ));
     const stack = slotWidthFromDescriptor(local.descriptor);
     state.maxStack = Math.max(state.maxStack, stack);
     return { descriptor: local.descriptor, stack };
@@ -544,8 +548,16 @@ function emitValue(value, state) {
     const local = state.locals.get(value.target);
     const emitted = emitValue(value.value, state);
     if (!local || !emitted || emitted.descriptor !== local.descriptor || typeof local.slotHint !== 'number') return null;
-    state.instructions.push(createJvmInstruction(storeOpcodeForDescriptor(local.descriptor), [String(local.slotHint)]));
-    state.instructions.push(createJvmInstruction(loadOpcodeForDescriptor(local.descriptor), [String(local.slotHint)]));
+    state.instructions.push(createJvmInstruction(
+      storeOpcodeForDescriptor(local.descriptor),
+      [String(local.slotHint)],
+      { localId: local.id },
+    ));
+    state.instructions.push(createJvmInstruction(
+      loadOpcodeForDescriptor(local.descriptor),
+      [String(local.slotHint)],
+      { localId: local.id },
+    ));
     const stack = slotWidthFromDescriptor(local.descriptor);
     state.maxStack = Math.max(state.maxStack, emitted.stack, stack);
     return { descriptor: local.descriptor, stack };
@@ -553,8 +565,12 @@ function emitValue(value, state) {
   if (value.kind === 'PostUpdateValue') {
     const local = state.locals.get(value.target);
     if (!local || local.descriptor !== 'I' || typeof local.slotHint !== 'number') return null;
-    state.instructions.push(createJvmInstruction('iload', [String(local.slotHint)]));
-    state.instructions.push(createJvmInstruction('iinc', [String(local.slotHint), value.operator === '--' ? '-1' : '1']));
+    state.instructions.push(createJvmInstruction('iload', [String(local.slotHint)], { localId: local.id }));
+    state.instructions.push(createJvmInstruction(
+      'iinc',
+      [String(local.slotHint), value.operator === '--' ? '-1' : '1'],
+      { localId: local.id },
+    ));
     state.maxStack = Math.max(state.maxStack, 1);
     return { descriptor: 'I', stack: 1 };
   }
@@ -562,18 +578,34 @@ function emitValue(value, state) {
     const local = state.locals.get(value.target);
     if (!local || local.descriptor !== value.type || typeof local.slotHint !== 'number') return null;
     if (local.descriptor === 'I') {
-      state.instructions.push(createJvmInstruction('iinc', [String(local.slotHint), value.operator === '--' ? '-1' : '1']));
-      state.instructions.push(createJvmInstruction('iload', [String(local.slotHint)]));
+      state.instructions.push(createJvmInstruction(
+        'iinc',
+        [String(local.slotHint), value.operator === '--' ? '-1' : '1'],
+        { localId: local.id },
+      ));
+      state.instructions.push(createJvmInstruction('iload', [String(local.slotHint)], { localId: local.id }));
       state.maxStack = Math.max(state.maxStack, 1);
       return { descriptor: 'I', stack: 1 };
     }
     const prefix = { J: 'l', F: 'f', D: 'd' }[local.descriptor];
     if (!prefix) return null;
-    state.instructions.push(createJvmInstruction(`${prefix}load`, [String(local.slotHint)]));
+    state.instructions.push(createJvmInstruction(
+      `${prefix}load`,
+      [String(local.slotHint)],
+      { localId: local.id },
+    ));
     state.instructions.push(createJvmInstruction(`${prefix}const_1`));
     state.instructions.push(createJvmInstruction(`${prefix}${value.operator === '--' ? 'sub' : 'add'}`));
-    state.instructions.push(createJvmInstruction(`${prefix}store`, [String(local.slotHint)]));
-    state.instructions.push(createJvmInstruction(`${prefix}load`, [String(local.slotHint)]));
+    state.instructions.push(createJvmInstruction(
+      `${prefix}store`,
+      [String(local.slotHint)],
+      { localId: local.id },
+    ));
+    state.instructions.push(createJvmInstruction(
+      `${prefix}load`,
+      [String(local.slotHint)],
+      { localId: local.id },
+    ));
     const stack = slotWidthFromDescriptor(local.descriptor);
     state.maxStack = Math.max(state.maxStack, stack * 2);
     return { descriptor: local.descriptor, stack };
@@ -832,7 +864,132 @@ function falseBranchOpcodeForCompare(value, descriptor) {
   return null;
 }
 
+function trueBranchOpcodeForCompare(value, descriptor) {
+  if (descriptor === 'I' || descriptor === 'Z' || descriptor === 'B' || descriptor === 'C' || descriptor === 'S') {
+    return {
+      '==': 'if_icmpeq',
+      '!=': 'if_icmpne',
+      '<': 'if_icmplt',
+      '>': 'if_icmpgt',
+      '<=': 'if_icmple',
+      '>=': 'if_icmpge',
+    }[value.operator] || null;
+  }
+  if (typeof descriptor === 'string' && (descriptor.startsWith('L') || descriptor.startsWith('['))) {
+    return {
+      '==': 'if_acmpeq',
+      '!=': 'if_acmpne',
+    }[value.operator] || null;
+  }
+  return null;
+}
+
+function booleanLiteralValue(value) {
+  return value && value.kind === 'LiteralValue' && value.type === 'Z'
+    ? Boolean(value.value)
+    : null;
+}
+
+function emitTrueBranch(condition, trueLabel, state) {
+  const literal = booleanLiteralValue(condition);
+  if (literal !== null) {
+    if (literal) state.instructions.push(createJvmInstruction('goto', [trueLabel]));
+    return true;
+  }
+  if (condition && condition.kind === 'ConditionalValue') {
+    const consequent = booleanLiteralValue(condition.consequent);
+    const alternate = booleanLiteralValue(condition.alternate);
+    if (alternate === false) {
+      const falseLabel = `Lshort_false_${state.nextLabel++}`;
+      if (!emitFalseBranch(condition.condition, falseLabel, state)
+          || !emitTrueBranch(condition.consequent, trueLabel, state)) return false;
+      state.instructions.push(createJvmInstruction('nop', [], { label: falseLabel }));
+      return true;
+    }
+    if (consequent === true) {
+      return emitTrueBranch(condition.condition, trueLabel, state)
+        && emitTrueBranch(condition.alternate, trueLabel, state);
+    }
+    if (consequent === false && alternate === true) {
+      return emitFalseBranch(condition.condition, trueLabel, state);
+    }
+  }
+  if (condition && condition.kind === 'CompareValue') {
+    const left = emitValue(condition.left, state);
+    const right = emitValue(condition.right, state);
+    if (!left || !right || left.descriptor !== right.descriptor) return false;
+    if (left.descriptor === 'J') {
+      const branch = {
+        '==': 'ifeq',
+        '!=': 'ifne',
+        '<': 'iflt',
+        '>': 'ifgt',
+        '<=': 'ifle',
+        '>=': 'ifge',
+      }[condition.operator];
+      if (!branch) return false;
+      state.instructions.push(createJvmInstruction('lcmp'));
+      state.instructions.push(createJvmInstruction(branch, [trueLabel]));
+      state.maxStack = Math.max(state.maxStack, 4);
+      return true;
+    }
+    if (left.descriptor === 'F' || left.descriptor === 'D') {
+      const cmp = left.descriptor === 'F'
+        ? (condition.operator === '>' || condition.operator === '>=' ? 'fcmpl' : 'fcmpg')
+        : (condition.operator === '>' || condition.operator === '>=' ? 'dcmpl' : 'dcmpg');
+      const branch = {
+        '==': 'ifeq',
+        '!=': 'ifne',
+        '<': 'iflt',
+        '>': 'ifgt',
+        '<=': 'ifle',
+        '>=': 'ifge',
+      }[condition.operator];
+      if (!branch) return false;
+      state.instructions.push(createJvmInstruction(cmp));
+      state.instructions.push(createJvmInstruction(branch, [trueLabel]));
+      state.maxStack = Math.max(state.maxStack, slotWidthFromDescriptor(left.descriptor) * 2);
+      return true;
+    }
+    const branch = trueBranchOpcodeForCompare(condition, left.descriptor);
+    if (!branch) return false;
+    state.instructions.push(createJvmInstruction(branch, [trueLabel]));
+    state.maxStack = Math.max(state.maxStack, left.stack + right.stack);
+    return true;
+  }
+  const emitted = emitValue(condition, state);
+  if (!emitted || emitted.descriptor !== 'Z') return false;
+  state.instructions.push(createJvmInstruction('ifne', [trueLabel]));
+  state.maxStack = Math.max(state.maxStack, emitted.stack);
+  return true;
+}
+
 function emitFalseBranch(condition, falseLabel, state) {
+  const literal = booleanLiteralValue(condition);
+  if (literal !== null) {
+    if (!literal) state.instructions.push(createJvmInstruction('goto', [falseLabel]));
+    return true;
+  }
+  if (condition && condition.kind === 'ConditionalValue') {
+    const consequent = booleanLiteralValue(condition.consequent);
+    const alternate = booleanLiteralValue(condition.alternate);
+    // javac-style short-circuit values arrive in Java IR as ternaries:
+    // A && B -> A ? B : false; A || B -> A ? true : B.
+    if (alternate === false) {
+      return emitFalseBranch(condition.condition, falseLabel, state)
+        && emitFalseBranch(condition.consequent, falseLabel, state);
+    }
+    if (consequent === true) {
+      const trueLabel = `Lshort_true_${state.nextLabel++}`;
+      if (!emitTrueBranch(condition.condition, trueLabel, state)
+          || !emitFalseBranch(condition.alternate, falseLabel, state)) return false;
+      state.instructions.push(createJvmInstruction('nop', [], { label: trueLabel }));
+      return true;
+    }
+    if (consequent === false && alternate === true) {
+      return emitTrueBranch(condition.condition, falseLabel, state);
+    }
+  }
   if (condition && condition.kind === 'CompareValue') {
     const left = emitValue(condition.left, state);
     const right = emitValue(condition.right, state);
@@ -1002,7 +1159,8 @@ function staticInitializerMethod(classIr) {
     maxLocals: 0,
   };
   for (const field of classIr.fields || []) {
-    if (!(field.access || []).includes('static') || !field.initializer) continue;
+    if (!(field.access || []).includes('static') || !field.initializer
+        || (field.meta && field.meta.constantValue !== undefined)) continue;
     const value = emitValue(field.initializer, state);
     if (!value || value.descriptor !== field.descriptor) {
       return null;
@@ -1023,6 +1181,19 @@ function staticInitializerMethod(classIr) {
     instructions,
     sourceNodeKind: 'SyntheticStaticInitializer',
   });
+}
+
+function constantValueForField(field) {
+  const access = new Set(field.access || []);
+  const value = field.initializer;
+  if (!access.has('static') || !access.has('final') || !value || value.kind !== 'LiteralValue') return undefined;
+  if (!['Z', 'B', 'S', 'I', 'J', 'F', 'D', 'Ljava/lang/String;'].includes(field.descriptor)) return undefined;
+  if (field.descriptor === 'Ljava/lang/String;') {
+    return JSON.stringify(String(value.value));
+  }
+  if (field.descriptor === 'Z') return value.value === true || value.value === 'true' ? '1' : '0';
+  const raw = value.raw === undefined ? value.value : value.raw;
+  return raw === undefined || raw === null ? undefined : String(raw);
 }
 
 function classAttributesForIr(classIr, sourceFile) {
@@ -1121,7 +1292,11 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
         unsupported.push(`unsupported assignment to ${op.target} in ${method.name}`);
         return;
       }
-      instructions.push(createJvmInstruction(storeOpcodeForDescriptor(local.descriptor), [String(local.slotHint)]));
+      instructions.push(createJvmInstruction(
+        storeOpcodeForDescriptor(local.descriptor),
+        [String(local.slotHint)],
+        { localId: local.id },
+      ));
     } else if (op.op === 'arrayStore') {
       const args = op.args || [];
       const array = emitValue(args[0], state);
@@ -1362,7 +1537,11 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
           unsupported.push(`unsupported catch local in ${method.name}: id=${catchClause.local}, expected=${catchClause.descriptor}, actual=${local ? local.descriptor : 'missing'}, slot=${local ? local.slotHint : 'missing'}`);
           return;
         }
-        instructions.push(createJvmInstruction(storeOpcodeForDescriptor(local.descriptor), [String(local.slotHint)], { label: handlerLabel }));
+        instructions.push(createJvmInstruction(
+          storeOpcodeForDescriptor(local.descriptor),
+          [String(local.slotHint)],
+          { label: handlerLabel, localId: local.id },
+        ));
         state.maxStack = Math.max(state.maxStack, 1);
         for (const child of catchClause.bodyOps || []) emitOp(child);
         instructions.push(createJvmInstruction('nop', [], { label: catchEnd }));
@@ -1609,12 +1788,40 @@ function javaIrToJvmBytecodeIr(javaIr, options = {}) {
   const classes = (javaIr.classes || []).map((classIr) => {
     const methods = [];
     let hasConstructor = false;
+    const constantFields = new Set((classIr.fields || [])
+      .filter((field) => constantValueForField(field) !== undefined)
+      .map((field) => field.name));
     for (const method of classIr.methods || []) {
       if (method.name === '<init>') hasConstructor = true;
-      const lowered = lowerJavaIrMethod(method, classIr, options);
+      const methodToLower = method.name === '<clinit>' && method.sourceNodeKind === 'SyntheticStaticInitializer'
+        ? {
+          ...method,
+          blocks: (method.blocks || []).map((block) => ({
+            ...block,
+            ops: (block.ops || []).filter((op) =>
+              !(op.op === 'putStaticField' && op.owner === classIr.internalName && constantFields.has(op.name))),
+          })),
+        }
+        : method;
+      const lowered = lowerJavaIrMethod(methodToLower, classIr, options);
       unsupported.push(...lowered.unsupported.map((reason) => ({ owner: classIr.name, method: method.name, reason })));
-      methods.push(lowered.method);
+      const emptySyntheticInitializer = methodToLower.name === '<clinit>'
+        && methodToLower.sourceNodeKind === 'SyntheticStaticInitializer'
+        && lowered.method.instructions.length === 1
+        && lowered.method.instructions[0].opcode === 'return';
+      if (!emptySyntheticInitializer) methods.push(lowered.method);
     }
+    const fields = (classIr.fields || []).map((field) => {
+      const constantValue = constantValueForField(field);
+      if (constantValue === undefined) return field;
+      return {
+        ...field,
+        meta: {
+          ...(field.meta || {}),
+          constantValue,
+        },
+      };
+    });
     const bytecodeClass = createJvmBytecodeClass({
       name: classIr.name,
       packageName: classIr.packageName,
@@ -1624,7 +1831,7 @@ function javaIrToJvmBytecodeIr(javaIr, options = {}) {
       attributes: classAttributesForIr(classIr, options.sourceFileName || `${classIr.name}.java`),
       superName: classIr.superName || 'java/lang/Object',
       interfaces: classIr.interfaces || [],
-      fields: classIr.fields || [],
+      fields,
       methods,
     });
     if (!hasConstructor && !(bytecodeClass.access || []).includes('interface')) {

@@ -91,6 +91,11 @@ second read-only Java buffer that can drift away from the active file.
 Decompilation and compilation are still different operations internally.
 Decompiled output can expose compiler bugs or unsupported source constructs;
 successful decompilation does not guarantee successful recompilation.
+Compiler-produced classes retain ranged local-variable names, literal
+`static final` constants, and direct short-circuit control flow, so their Java
+view is intended to remain readable. It is nevertheless equivalent regenerated
+source rather than the original source text: imports, formatting, casts,
+compound assignments, and nested-class layout can legitimately differ.
 
 ## Run view
 

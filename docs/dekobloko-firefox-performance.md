@@ -5039,3 +5039,227 @@ Validation after the lexical emitter change: 691/691 focused JIT assertions,
 38/38 scheduler/browser assertions, the 400-invocation three-runtime
 differential, and `npm run build:bundle` all passed. The bundle retained only
 the four existing webpack warnings.
+
+## 2026-07-27: remote sound-bank attribution after profiling was fixed
+
+The ordinary launcher accidentally converted absent `timingRate` and
+`schedulerRate` query parameters through `Number(null)`. Both values became
+zero and were clamped to one, so the supposedly lightweight default measured
+every generated method and scheduler entry. The temporary launcher now enables
+method timing only with `?timings=1`, uses the intended 128/256 defaults for
+explicit profiling, and serves ordinary runs with timing disabled. A clean
+Firefox 1509 check then reached the first compressed block in 4.87 seconds,
+painted the first nonblack frame in about 10 seconds, and sustained 47–49
+presentations/s on the local host.
+
+Remote session `ms3glqkc-dxomsxlc` loaded the same
+`ec527ac4f556593e3550444d4f88f485e361e81b6cbd6a527dd95c144fa326a9`
+bundle with timing disabled. Its JavaScript calibration was 172.41 million
+iterations/s versus 714.29 million/s locally. The nine initial compressed
+blocks took 34.5 seconds after applet entry and the first visible frame arrived
+at 43.84 seconds, versus about 10 seconds locally. This approximately 4×
+startup and rendering difference tracks the independent JavaScript
+calibration; download, server-side inflate, and Canvas upload do not explain
+it.
+
+The manual report at 94.56 seconds captured the runnable resource thread in
+the original sound-bank chain:
+
+`bi.a()[B` → `bi.b()Lud;` → archive/resource callers.
+
+The innermost active bytecode was the outer signed-byte saturation mixer after
+the already optimized `kj.a(II)[I` synthesizer call. The session had completed
+17 host inflates but continued creating PCM, while presentation fell to
+roughly 0–9 FPS. Native-long Wasm was active for two structurally selected
+methods, so this is not the old failure to route the fixed-point synthesizer.
+
+A generic candidate added signed byte loads/stores, virtual-call boundaries,
+and reference returns to the scalar resume compiler. It made the exact
+138-instruction outer mixer eligible without consulting guest names. The
+expanded checked-in audio benchmark produced identical PCM checksum
+`-598032378`, but the isolated Node median moved only from 23.58 to 22.42 ms
+(4.9%). The exact Firefox candidate was neutral/slightly worse: first nonblack
+10.10 versus 9.91 seconds and 847 versus about 860 presentations at 30 seconds.
+The runtime path and its unit fixture were therefore reverted. The benchmark
+retains the complete outer sound-bank differential and reports the actually
+selected entry/resume tiers so this low-value experiment is not repeated.
+
+Whole-application Wasm-first mode was also rejected: its same-JAR Firefox
+window measured 14.29 changed images/s, compared with roughly 32 on the
+structured default in nearby sampled runs. The live `0.0.0.0:3771` launcher
+therefore remains on the proven `ec527ac4…` structured bundle. Reaching 30 FPS
+on the remote machine requires reducing the complete procedural PCM
+synthesizer/resource-thread cost or moving that work off the browser main
+thread; scalarizing only the outer byte mixer and globally preferring Wasm are
+both insufficient.
+
+## 2026-07-27: guest-Java PCM push diagnostic
+
+The soundtrack diagnostic originally measured a pure-JavaScript mixer writing
+one completed `Float32Array` to WebAudio. That establishes a useful browser
+ceiling, but omits the actual game boundary. The checked-in
+`benchmarks/JavaPcmPushDiagnostic.java` now generates 16-bit mono PCM inside
+guest Java in 512-frame chunks and uses the same
+`SourceDataLine.available()`/`write()`/`drain()` sequence as FunOrb. Its hot
+fill method is called repeatedly so normal JIT warmup can occur; keeping the
+entire synthesis loop in the one-shot `main` method initially produced a
+misleading 16.27 seconds of guest generation for two seconds of PCM.
+
+The Firefox runner is:
+
+```bash
+FIREFOX_EXECUTABLE_PATH=/path/to/firefox \
+JAVA_PCM_SECONDS=2 \
+npm run benchmark:pcm-push:firefox
+```
+
+The integrated diagnostic is also exposed by
+`dekobloko-work/scripts/serve-audio-diagnostics.js`. It compiles the Java class
+into an ignored local JAR and records the source, JAR, JVM bundle, and WebAudio
+bridge SHA-256 values.
+
+On headless Firefox 146, the first verified integrated run wrote 44,100 frames
+(88,200 bytes) through 87 Java `SourceDataLine.write` calls:
+
+- guest Java PCM generation: 91.0 ms;
+- `SourceDataLine.write`, including the JVM.js bridge, byte copies, PCM
+  conversion, `AudioBuffer` creation, and scheduling: 9.0 ms;
+- producer backpressure wait: 1.67 seconds;
+- push wall time: 1.81 seconds, followed by a 168 ms drain;
+- worst browser event-loop stall: 8.0 ms;
+- WebAudio underruns: zero;
+- Java/bridge frame counts: both 44,100;
+- PCM checksum: `eff06eed`.
+
+This result does **not** support “pushing PCM to WebAudio is the dominant
+cost” on the measured host. Once the Java fill loop warms into the JIT, bridge
+writes account for about 9 ms across two seconds of audio. It instead provides
+a realistic control for remote machines: if the same button reports large
+`Java synthesis CPU`, the guest loop/JIT is responsible; large
+`SourceDataLine.write` points to copies/conversion/scheduling; underruns with
+low CPU point to scheduler or backpressure behavior.
+
+The WebAudio diagnostics now count queue underruns and accumulated gap time.
+The instrumentation is evaluated only at each PCM write and does not scan the
+buffer a second time. Provenance for the integrated run was JVM bundle
+`ec527ac4f556593e3550444d4f88f485e361e81b6cbd6a527dd95c144fa326a9`,
+Java source
+`bf8db3970b339877cf92c5d6a5f52a063908980ea5ad7b28ad33798897e45124`,
+generated JAR
+`4ccfe4df55d1af94e021dfe3328cc9f96df1057f92d91209a1779c5d0410740b`,
+and WebAudio bridge
+`234207c030cdb23bfc735e1e885bf8dab68f58dec21e959b11129a52d173a1bd`.
+
+### Deadline and sampled method profiling
+
+Aggregate mixer CPU was enough to prove the remote failure, but not enough to
+optimize it. The diagnostic now records the latency of every 512-frame output
+chunk against its 23.22 ms deadline. It reports per-phase maxima, first-32
+warmup versus steady averages, deadline misses and longest consecutive miss
+streak, and buckets at 5, 10, 15, 20, deadline, 30, and 50 ms. This bookkeeping
+uses the `System.nanoTime` reads already surrounding mix, conversion, wait, and
+write; the additional comparisons do not retain or scan PCM.
+
+Two generic JVM samplers run only while the selected track is active:
+
+- scheduler ownership samples 1/16 execution slices and therefore observes
+  interpreted, generated, and inlined work according to the active guest frame;
+- generated-method timing samples 1/128 generated entries and reports inclusive
+  estimates, which can overlap when sampled methods are nested.
+
+Neither sampler enables invocation counting, debugger tracing, or guest-name
+selection. `?profile=0` disables both while retaining exact chunk measurements;
+`schedulerSampleRate` and `jitSampleRate` change their rates. A five-second
+progress event makes partial long-track profiles remotely visible before stop.
+
+The first Firefox 146.0.1 profile completed the 195-chunk `Game Lose` track
+with two deadline misses. Its first 32 chunks averaged 12.19 ms and its
+remaining 163 averaged 7.60 ms. The worst pipeline chunk was 176 ms, almost
+entirely a 173 ms mixer event. Scheduler samples attributed the largest
+estimated synchronous share to `mi.b([III)V`; generated-entry samples then
+identified `mi.c([III)V` and the `ei` sample-mixing bodies beneath it. These
+identities are profiler output, not optimizer predicates.
+
+An interleaved off/on/off/on check measured observer cost. Median-like
+two-run averages were 5.482 s wall and 1.582 s measured pipeline with sampling
+off, versus 5.540 s and 1.596 s on: approximately 1.1% wall overhead and 0.9%
+pipeline overhead. Deadline misses remained two in all four runs.
+
+Profiling provenance is guest driver source
+`9d4986ad061f40a75b157b56ca0169d180fd2ac02e7250c175bf5e4719fa98be`,
+driver JAR
+`62510b9a8a75f31eacb45cc55f9fd2bfcec9a8e54cfe58120be7d0c31c9dafde`,
+untouched `dekobloko.jar`
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+JVM bundle
+`fbdc712f7c86c52934cb12dbf32d42072d7c067e5a61bc38e9818b5c1b160c85`,
+sample bank
+`ebd1e0a0c3fcebfdd380f373c1a158f33a9c6a7fab3e0618994a69ffda07c2f2`,
+and WebAudio bridge
+`234207c030cdb23bfc735e1e885bf8dab68f58dec21e959b11129a52d173a1bd`.
+
+### Real soundtrack through guest Java
+
+The first audio-diagnostics page still routed `Play track` through its
+JavaScript mixer; only the separate synthetic control entered Java. This was a
+UI/implementation mismatch. It was briefly replaced with a host-rendered WAV
+pushed by guest Java, which still omitted the expensive operation under
+investigation and was removed.
+
+`Play track through Java` now places the selected raw `ui` descriptor and a
+binary decoded `ud` sample bank in the browser JVM virtual filesystem. It runs
+`JavaFunOrbTrackPlayer` from a small driver JAR after loading the untouched
+`dekobloko.jar`; the driver does not repackage game classes. Guest `ui`
+parses the track; original guest `ia`, `mi`, and `ei` synthesize every
+512-frame chunk; guest Java performs saturation and PCM16LE conversion, checks
+`SourceDataLine.available()`, and writes each chunk through the JVM.js WebAudio
+bridge. There is no host-rendered WAV and the integrated page no longer exposes
+the two-second synthetic control.
+
+Sample decompression is deliberately outside this measurement: `bi`/`va`
+samples are decoded once while preparing the bank. Object construction,
+sequencing, voice mixing, PCM conversion, pacing, and output are all guest Java.
+This separates steady music mixing from the already measured archive/sample
+unpacking startup problem.
+
+Browser `FileInputStream` previously tried webpack's disabled Node `fs`
+fallback and failed with `readFileSync is not a function`. It now reads the
+active browser `FileProvider`, retaining Node filesystem fallback and signed
+Java-byte semantics. Reflective instance fields now use the normal
+owner-qualified JVM slot and `Field.setBoolean` is implemented; those changes
+are required to recover private `ui.y` sample IDs and disable `ia` looping
+without naming methods in the optimizer.
+
+A Firefox 146.0.1 stop-after-3.5-seconds check on
+`Deko Bloko Titlescreen` reported:
+
+- guest sample-bank construction: 400 ms;
+- guest track parse/hydration: 160 ms;
+- original guest `mi.b` mixer CPU: 853 ms;
+- guest PCM saturation/conversion: 375 ms;
+- 162 guest Java `SourceDataLine.write` calls: 35 ms;
+- backpressure wait: 2.48 seconds;
+- 82,944 Java/bridge frames (3.76 seconds), with equal counts;
+- zero underruns and zero queued-gap time;
+- worst event-loop stall: 288 ms;
+- non-silent sampled PCM with peak amplitude 0.782959;
+- no browser or JVM errors.
+
+This is the first integrated measurement that actually charges the recovered
+guest music mixer. On this run mixer plus PCM conversion consumed 1.228 seconds
+for 3.76 seconds of audio, or 3.06x real time. The output bridge itself remained
+small at 35 ms; the meaningful guest costs are mixer execution, conversion,
+and first-play object/class preparation.
+
+Current provenance is guest-mixer source
+`ffdeec82e5ac272045b0524141333f0b852d7d1437d61aa0c4fc0a31f079e2a7`,
+decoded sample bank
+`ebd1e0a0c3fcebfdd380f373c1a158f33a9c6a7fab3e0618994a69ffda07c2f2`,
+untouched `dekobloko.jar`
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+generated driver JAR
+`30b9dc891b93cb9f725fa9450fbd05342a5f3d648044ef2695293a5b774e180b`,
+JVM bundle
+`0845384d96705a0a8018fa8ae3fcff44c63c792d52170ede7376790320b02a66`,
+and WebAudio bridge
+`234207c030cdb23bfc735e1e885bf8dab68f58dec21e959b11129a52d173a1bd`.

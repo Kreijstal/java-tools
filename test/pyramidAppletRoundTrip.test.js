@@ -57,3 +57,37 @@ test('minimal compiler accepts decompiled PyramidApplet array and support-field 
   }
   t.end();
 });
+
+test('frontend-produced PyramidApplet bytecode decompiles back to readable source shapes', (t) => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'sources', 'PyramidApplet.java'), 'utf8');
+  const compiled = compileJavaSource(source, { sourceLevel: '8' });
+  const outer = compiled.classes.find((item) => item.internalName === 'PyramidApplet');
+  const outerIr = compiled.bytecodeIr.classes.find((item) => item.internalName === 'PyramidApplet');
+
+  t.ok(outer, 'outer applet class is compiled');
+  t.match(outer.jasmin, /\.localvariabletable/, 'compiler preserves source local-variable metadata');
+  t.match(outer.jasmin, /\.constantvalue 10\.0/, 'compile-time final fields use ConstantValue metadata');
+  t.notOk(
+    outerIr.methods.some((method) => method.name === '<clinit>'),
+    'literal static finals do not create a redundant class initializer',
+  );
+
+  const decompiled = decompileClassBytes(assembleJasminBytes(outer.jasmin), {
+    allowFallback: true,
+    preserveFieldNames: true,
+  });
+  t.match(decompiled, /double\[\]\[\] vertices = /, 'reused reference slots recover their ranged debug names');
+  t.match(decompiled, /for \(double x = -GRID_SIZE; x <= GRID_SIZE;/, 'floating-point counting loops reconstruct as for loops');
+  t.match(
+    decompiled,
+    /if \(v1\[2\] < near && v2\[2\] < near\)/,
+    'short-circuit AND guards remain structured',
+  );
+  t.match(
+    decompiled,
+    /backBuffer == null \|\| this\.backBuffer\.getWidth/,
+    'nested short-circuit OR guards remain structured',
+  );
+  t.notOk(/\bstackIn_|\bvar\d+\b|^\s+L\d+:/m.test(decompiled), 'compiler artifacts do not leak into reconstructed source');
+  t.end();
+});

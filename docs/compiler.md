@@ -87,6 +87,27 @@ The normal compiler entry points fail before writing an invalid partial body.
 Unsupported syntax is reported as `UnsupportedJavaSyntaxError` with the
 responsible compiler phase.
 
+## Compile/decompile source fidelity
+
+Compiler output carries a `LocalVariableTable` built from Java IR source locals.
+Its bytecode ranges distinguish different variables that reuse the same JVM
+slot, so decompiling a compiler-produced class recovers names such as loop
+indices and scoped array temporaries instead of `varN` placeholders.
+
+Compile-time `static final` primitive and string literals use the class-file
+`ConstantValue` attribute. They therefore decompile as field initializers and
+do not create a redundant synthetic `static {}` block. Conditional lowering
+also emits direct short-circuit branches; the decompiler reconstructs the
+corresponding `&&` and `||` guards without operand-stack carrier variables.
+
+The result is source-equivalent, not a byte-for-byte restoration of the input
+text. Imports, formatting, redundant casts, compound assignments, and nested
+class presentation may differ because a class file does not retain those source
+choices. The PyramidApplet regression compiles with this frontend, decompiles
+the emitted class, and checks local names, constants, counting loops, and
+short-circuit guards without relying on class or method names in the compiler
+or decompiler.
+
 ## Browser API
 
 The browser bundle exposes single-source compilation:

@@ -1840,8 +1840,7 @@ function decompileCode(code, method, cls, localState, options = {}) {
   const preferOwnedStructurer = options.forceOwnedStructurer === true
     || tableHasTrivialCheckedHandler(code)
     || (codeItemsForSelection.length > 128
-      && !(hasArrayLength && !(code.exceptionTable || []).length
-        && controlTransfers / codeItemsForSelection.length <= 0.05)
+      && controlTransfers / codeItemsForSelection.length > 0.05
       && !hasSuppressedCleanup);
   if (process.env.CFR_JS_PROFILE_METHODS === '1') {
     console.error(`[cfr-selector] ${cls.className}.${method.name}${method.descriptor} items=${codeItemsForSelection.length} transfers=${controlTransfers} array=${hasArrayLength} suppressed=${hasSuppressedCleanup} owned=${preferOwnedStructurer}`);
@@ -1892,6 +1891,7 @@ function decompileCode(code, method, cls, localState, options = {}) {
   if (usableDecompileLines(structured) && !dropsExceptionTable) return structured;
   if (structured && process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
     console.error(`${cls.className}.${method.name}${method.descriptor}: legacy range output rejected (${structured.length} lines)`);
+    console.error(structured.join('\n'));
   }
 
   if (!preferOwnedStructurer) {
@@ -4615,14 +4615,22 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const value = pop(stack);
       const pureReference = value && /^(?:this|[A-Za-z_$][A-Za-z0-9_$]*)$/.test(value.code);
       if (value && value.code && !value.synthetic && !pureReference) {
-        const discardedName = localState.nextSyntheticName('discarded');
-        lines.push(`${simplifyType(value.type)} ${discardedName} = ${value.code};`);
+        if (value.statementExpression) {
+          lines.push(`${value.code};`);
+        } else {
+          const discardedName = localState.nextSyntheticName('discarded');
+          lines.push(`${simplifyType(value.type)} ${discardedName} = ${value.code};`);
+        }
       }
       continue;
     }
     if (op === 'pop2') {
       const value = pop(stack);
-      if (!isCategory2(value)) pop(stack);
+      if (!isCategory2(value)) {
+        pop(stack);
+      } else if (value && value.code && value.statementExpression) {
+        lines.push(`${value.code};`);
+      }
       continue;
     }
     if (op === 'swap') {
@@ -4956,7 +4964,7 @@ function emitVirtualCall(lines, stack, arg, localState) {
     if (ref.name === 'clone' && returnType === 'Object' && simplifyType(receiver.type).endsWith('[]')) {
       stack.push(expr(`(Object) ${call}`, 'Object', 90));
     } else {
-      stack.push(expr(call, returnType));
+      stack.push(expr(call, returnType, 100, { statementExpression: true }));
     }
   }
 }
@@ -4972,7 +4980,7 @@ function emitStaticCall(lines, stack, arg, currentInternalClassName, localState)
   if (returnType === 'void') {
     lines.push(`${call};`);
   } else {
-    stack.push(expr(call, returnType));
+    stack.push(expr(call, returnType, 100, { statementExpression: true }));
   }
 }
 
@@ -5809,6 +5817,14 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       continue;
     }
 
+    const shortCircuitIf = tryDecompileShortCircuitIfAt(codeItems, index, end, context, stack);
+    if (shortCircuitIf) {
+      lines.push(...shortCircuitIf.lines);
+      stack.splice(0, stack.length, ...shortCircuitIf.stack);
+      index = shortCircuitIf.next;
+      continue;
+    }
+
     const ifBlock = tryDecompileIfAt(codeItems, index, end, context, stack);
     if (ifBlock) {
       lines.push(...ifBlock.lines);
@@ -6091,7 +6107,8 @@ function rewriteTryWithResources(lines) {
     }
 
     const declarationStart = resources[0].lineIndex;
-    const primaryIndex = declarationStart > 0 && /^Object var\d+ = null;$/.test(out[declarationStart - 1].trim())
+    const primaryIndex = declarationStart > 0
+      && /^(?:Object|Throwable) [A-Za-z_$][A-Za-z0-9_$]* = null;$/.test(out[declarationStart - 1].trim())
       ? declarationStart - 1
       : declarationStart;
     const headerResources = resources.map((resource) => `${resource.type} ${resource.name} = ${resource.initializer}`).join('; ');
@@ -6144,7 +6161,7 @@ function collectPrecedingResourceInitializers(lines, tryIndex) {
 }
 
 function parseResourceInitializer(line) {
-  const match = /^\s*(?:(?:Object|[A-Za-z_$][A-Za-z0-9_.$<>\[\]?]*)\s+)?(var\d+)\s*=\s*(new\s+([A-Za-z_$][A-Za-z0-9_.$]*)(?:\([^;]*\)))\s*;\s*$/.exec(line);
+  const match = /^\s*(?:(?:Object|[A-Za-z_$][A-Za-z0-9_.$<>\[\]?]*)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(new\s+([A-Za-z_$][A-Za-z0-9_.$]*)(?:\([^;]*\)))\s*;\s*$/.exec(line);
   if (!match) return null;
   return {
     name: match[1],
@@ -6209,6 +6226,8 @@ function updateVariableName(updateLine) {
   let match = /^([A-Za-z_$][A-Za-z0-9_$]*)(?:\+\+|--);$/.exec(updateLine);
   if (match) return match[1];
   match = /^([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:\+=|-=)\s*[^;]+;$/.exec(updateLine);
+  if (match) return match[1];
+  match = /^([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*\1\s*[+-]\s*[^;]+;$/.exec(updateLine);
   return match ? match[1] : '';
 }
 
@@ -6700,6 +6719,98 @@ function tryDecompileStackTernaryAt(codeItems, index, end, context, stack) {
   const nextStack = condition.stack.slice();
   nextStack.push(conditionalExpr(condition.condition, trueValue, falseValue));
   return { next, stack: nextStack };
+}
+
+function shortCircuitIfLines(condition, bodyLines) {
+  const lines = [`if (${condition.code}) {`];
+  indentLines(bodyLines).forEach((line) => lines.push(line));
+  lines.push('}');
+  return lines;
+}
+
+// Recover the two canonical branch-only encodings of a short-circuit guard:
+// every false edge skips one body (`a && b`), or every early true edge enters
+// one body while the final false edge skips it (`a || b`).  This operates on
+// CFG shape and expression-only prefixes, independent of source names.
+function tryDecompileShortCircuitIfAt(codeItems, index, end, context, stack) {
+  const firstBranchIndex = findNextConditionalBranch(codeItems, index, end);
+  if (firstBranchIndex === -1
+      || !conditionPrefixIsExpressionOnly(codeItems, index, firstBranchIndex)) return null;
+  const firstBranch = getInstructionAt(codeItems, firstBranchIndex);
+  const firstTarget = context.labelIndex.get(firstBranch.arg);
+  if (firstTarget === undefined || firstTarget <= firstBranchIndex || firstTarget > end) return null;
+
+  // AND: a sequence of conditionals all jumps over the same fallthrough body.
+  const andConditions = [];
+  let cursor = index;
+  let branchIndex = firstBranchIndex;
+  let conditionStack = stack.slice();
+  while (branchIndex < firstTarget) {
+    const branch = getInstructionAt(codeItems, branchIndex);
+    if (!branch || !isConditionalBranch(branch.op)
+        || context.labelIndex.get(branch.arg) !== firstTarget
+        || !conditionPrefixIsExpressionOnly(codeItems, cursor, branchIndex)) break;
+    const evaluated = evaluateConditionPrefix(codeItems, cursor, branchIndex, context, conditionStack, true);
+    if (!evaluated || evaluated.prefixLines.length) break;
+    andConditions.push(evaluated.condition);
+    conditionStack = evaluated.stack;
+    cursor = branchIndex + 1;
+    branchIndex = findNextConditionalBranch(codeItems, cursor, firstTarget);
+    if (branchIndex === -1) break;
+  }
+  if (andConditions.length >= 2) {
+    const body = decompileRange(codeItems, cursor, firstTarget, context, []);
+    if (body.ok && !body.stack.length
+        && !body.lines.some((line) => FALLBACK_LINE_COMMENT.test(String(line))
+          || FALLBACK_PLACEHOLDER.test(String(line)))) {
+      const condition = andConditions.reduce((left, right) => binaryExpr(left, '&&', right, 'boolean'));
+      return {
+        lines: shortCircuitIfLines(condition, body.lines),
+        next: firstTarget,
+        stack: conditionStack,
+      };
+    }
+  }
+
+  // OR: early true branches enter a shared body; the final false branch skips
+  // that body.  The body label is the first branch target.
+  const bodyStart = firstTarget;
+  const orConditions = [];
+  cursor = index;
+  conditionStack = stack.slice();
+  branchIndex = firstBranchIndex;
+  while (branchIndex < bodyStart) {
+    const branch = getInstructionAt(codeItems, branchIndex);
+    if (!branch || !isConditionalBranch(branch.op)
+        || !conditionPrefixIsExpressionOnly(codeItems, cursor, branchIndex)) return null;
+    const target = context.labelIndex.get(branch.arg);
+    if (target === undefined) return null;
+    const nextBranch = findNextConditionalBranch(codeItems, branchIndex + 1, bodyStart);
+    const finalBranch = nextBranch === -1;
+    if ((!finalBranch && target !== bodyStart)
+        || (finalBranch && (target <= bodyStart || target > end))) return null;
+    const evaluated = evaluateConditionPrefix(
+      codeItems, cursor, branchIndex, context, conditionStack, finalBranch);
+    if (!evaluated || evaluated.prefixLines.length) return null;
+    orConditions.push(evaluated.condition);
+    conditionStack = evaluated.stack;
+    if (finalBranch) {
+      if (orConditions.length < 2) return null;
+      const body = decompileRange(codeItems, bodyStart, target, context, []);
+      if (!body.ok || body.stack.length
+          || body.lines.some((line) => FALLBACK_LINE_COMMENT.test(String(line))
+            || FALLBACK_PLACEHOLDER.test(String(line)))) return null;
+      const condition = orConditions.reduce((left, right) => binaryExpr(left, '||', right, 'boolean'));
+      return {
+        lines: shortCircuitIfLines(condition, body.lines),
+        next: target,
+        stack: conditionStack,
+      };
+    }
+    cursor = branchIndex + 1;
+    branchIndex = nextBranch;
+  }
+  return null;
 }
 
 function evaluateStackOnlyRange(codeItems, start, end, context, initialStack) {
@@ -7728,14 +7839,15 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   const scopedDeclared = new Set();
   const paramNames = [];
   const localTable = collectLocalVariableTable(code);
+  const codeItems = (code && code.codeItems) || [];
+  const labelIndexes = buildLabelIndex(codeItems);
   const slotKinds = new Map();
   const slotLastKind = new Map();
   const catchStoreTypes = new Map();
   const monitorStorePcs = new Set();
   const castStoreTypes = new Map();
   if (code) {
-    const codeItems = code.codeItems || [];
-    const labels = buildLabelIndex(codeItems);
+    const labels = labelIndexes;
     for (const entry of code.exceptionTable || []) {
       const handlerIndex = labels.get(entry.handlerLbl || entry.handlerLabel);
       if (handlerIndex === undefined) continue;
@@ -7789,6 +7901,10 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
 
   const debugLocalsBySlot = new Map();
   localTable.forEach((local) => {
+    const startIndex = labelIndexes.get(String(local.startLbl || '').replace(/:$/, ''));
+    const endIndex = labelIndexes.get(String(local.endLbl || '').replace(/:$/, ''));
+    local.startPc = codePcAtOrAfter(codeItems, startIndex, Number.NEGATIVE_INFINITY);
+    local.endPc = codePcAtOrAfter(codeItems, endIndex, Number.POSITIVE_INFINITY);
     if (!debugLocalsBySlot.has(local.index)) debugLocalsBySlot.set(local.index, []);
     debugLocalsBySlot.get(local.index).push(local);
   });
@@ -7826,6 +7942,24 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   let syntheticCounter = 0;
   let constructorInvocation = null;
 
+  function debugLocalAt(index, pc, fallbackType = 'Object') {
+    const locals = debugLocalsBySlot.get(index) || [];
+    if (!locals.length) return null;
+    const numericPc = Number(pc);
+    const active = Number.isFinite(numericPc)
+      ? locals.filter((local) => local.startPc <= numericPc && numericPc < local.endPc)
+      : locals;
+    const candidates = active.length ? active : (locals.length === 1 ? locals : []);
+    if (!candidates.length) return null;
+    const requested = simplifyType(fallbackType);
+    const exact = candidates.find((local) => simplifyType(descriptorToJavaType(local.descriptor)) === requested);
+    const selected = exact || candidates[0];
+    return {
+      name: sanitizeJavaIdentifier(selected.name, `var${index}`),
+      type: descriptorToJavaType(selected.descriptor),
+    };
+  }
+
   function localKey(index, fallbackType = 'Object', forceReferenceVariant = false) {
     const type = simplifyType(fallbackType);
     const intCategory = new Set(['boolean', 'byte', 'char', 'short', 'int']);
@@ -7856,15 +7990,18 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   }
 
   function ensure(index, fallbackType = 'Object', forceReferenceVariant = false,
-    ignoreTraversalBinding = false) {
+    ignoreTraversalBinding = false, pc = null) {
     const requestedType = simplifyType(fallbackType);
     const key = requestedType === 'Object' && !forceReferenceVariant
       && !ignoreTraversalBinding && currentReferenceKeys.has(index)
       ? currentReferenceKeys.get(index)
       : localKey(index, fallbackType, forceReferenceVariant);
     if (!names.has(key)) {
-      const base = debugNames.get(index) || `var${index}`;
-      const hasDebugVariant = typeof key === 'string' && key.endsWith(':ref') && debugTypes.has(index);
+      const rangedDebugLocal = debugLocalAt(index, pc, requestedType);
+      const base = (rangedDebugLocal && rangedDebugLocal.name) || debugNames.get(index) || `var${index}`;
+      const rangedDebugType = rangedDebugLocal && rangedDebugLocal.type;
+      const hasDebugVariant = typeof key === 'string' && key.endsWith(':ref')
+        && Boolean(rangedDebugType || debugTypes.has(index));
       const slotIndex = Number(String(key).split(':')[0]);
       const hasCategoryConflict = (slotKinds.get(slotIndex) || new Set()).size > 1;
       const keyKind = typeof key === 'string' ? key.slice(key.indexOf(':') + 1) : null;
@@ -7887,7 +8024,8 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
     }
     if (!types.has(key)) {
       const type = simplifyType(fallbackType);
-      const debugType = debugTypes.get(index);
+      const rangedDebugLocal = debugLocalAt(index, pc, type);
+      const debugType = (rangedDebugLocal && rangedDebugLocal.type) || debugTypes.get(index);
       const safeReferenceType = debugType && (debugType.endsWith('[]') || debugType === 'String') ? debugType : 'Object';
       types.set(key, type === 'Object' ? safeReferenceType : type);
     }
@@ -8077,7 +8215,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
           .sort((a, b) => b.pc - a.pc)[0];
         if (prior) key = prior.key;
       }
-      if (!key) key = ensure(index, fallbackType);
+      if (!key) key = ensure(index, fallbackType, false, false, pc);
       if (fallbackType === 'Object' && Number.isFinite(Number(pc))) {
         objectLoadBindings.set(Number(pc), key);
       }
@@ -8117,7 +8255,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       // subsequently select the nearest reaching definition by pc.
       const key = ensure(index, effectiveType,
         Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement || concreteReference,
-        Number.isFinite(Number(pc)));
+        Number.isFinite(Number(pc)), pc);
       if (!['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double'].includes(simplifyType(inferred))) {
         currentReferenceKeys.set(index, key);
         if (Number.isFinite(Number(pc))) {
@@ -8143,7 +8281,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       // reference accesses are collapsed to Object.
       const plainSuspended = plainRefSlots && plainRefSlots.has(index);
       if (plainSuspended) plainRefSlots.delete(index);
-      const key = ensure(index, catchType, true);
+      const key = ensure(index, catchType, true, false, pc);
       if (plainSuspended) plainRefSlots.add(index);
       if (preferredName && ![...names.entries()].some(([otherKey, name]) =>
         otherKey !== key && Number(String(otherKey).split(':')[0]) !== Number(index) && name === preferredName)) {
@@ -8183,10 +8321,22 @@ function collectLocalVariableTable(code) {
         index,
         name: variable.name,
         descriptor: variable.descriptor,
+        startLbl: variable.startLbl || variable.startLabel,
+        endLbl: variable.endLbl || variable.endLabel,
       });
     }
   }
   return locals;
+}
+
+function codePcAtOrAfter(codeItems, startIndex, fallback) {
+  if (!Number.isFinite(Number(startIndex))) return fallback;
+  for (let index = Number(startIndex); index < codeItems.length; index += 1) {
+    if (Number.isFinite(Number(codeItems[index] && codeItems[index].pc))) {
+      return Number(codeItems[index].pc);
+    }
+  }
+  return fallback;
 }
 
 function sanitizeJavaIdentifier(name, fallback) {

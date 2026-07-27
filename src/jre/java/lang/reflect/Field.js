@@ -1,5 +1,35 @@
 const { withThrows } = require('../../../helpers');
 
+function declaringClassName(fieldObj) {
+  const declaringClass = fieldObj._declaringClass;
+  return declaringClass && declaringClass._classData &&
+    declaringClass._classData.ast &&
+    declaringClass._classData.ast.classes[0] &&
+    declaringClass._classData.ast.classes[0].className;
+}
+
+function instanceKey(fieldObj) {
+  const owner = declaringClassName(fieldObj);
+  return owner ? `${owner}.${fieldObj._fieldData.name}` : fieldObj._fieldData.name;
+}
+
+function getInstanceValue(fieldObj, obj) {
+  const key = instanceKey(fieldObj);
+  if (obj.fields && Object.prototype.hasOwnProperty.call(obj.fields, key)) {
+    return obj.fields[key];
+  }
+  return obj[key] !== undefined ? obj[key] : obj[fieldObj._fieldData.name];
+}
+
+function setInstanceValue(fieldObj, obj, value) {
+  const key = instanceKey(fieldObj);
+  if (obj.fields) {
+    obj.fields[key] = value;
+  } else {
+    obj[key] = value;
+  }
+}
+
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
@@ -110,7 +140,7 @@ module.exports = {
             message: `Cannot get field ${fieldName} from null object`,
           };
         }
-        return obj[fieldName];
+        return getInstanceValue(fieldObj, obj);
       }
     }, [
       'java/lang/NullPointerException',
@@ -139,7 +169,7 @@ module.exports = {
             message: `Cannot set field ${fieldName} on null object`,
           };
         }
-        obj[fieldName] = value;
+        setInstanceValue(fieldObj, obj, value);
       }
     }, [
       'java/lang/NullPointerException',
@@ -198,7 +228,7 @@ module.exports = {
             message: `Cannot get field ${fieldName} from null object`,
           };
         }
-        return obj[fieldName];
+        return getInstanceValue(fieldObj, obj);
       }
     }, [
       'java/lang/NullPointerException',
@@ -225,8 +255,22 @@ module.exports = {
             message: `Cannot set field ${fieldName} on null object`,
           };
         }
-        obj[fieldName] = value;
+        setInstanceValue(fieldObj, obj, value);
       }
+    }, [
+      'java/lang/NullPointerException',
+      'java/lang/IllegalArgumentException',
+      'java/lang/IllegalAccessException',
+    ]),
+    'setBoolean(Ljava/lang/Object;Z)V': withThrows((jvm, fieldObj, args) => {
+      const obj = args[0];
+      if (obj === null) {
+        throw {
+          type: 'java/lang/NullPointerException',
+          message: `Cannot set field ${fieldObj._fieldData.name} on null object`,
+        };
+      }
+      setInstanceValue(fieldObj, obj, args[1] ? 1 : 0);
     }, [
       'java/lang/NullPointerException',
       'java/lang/IllegalArgumentException',

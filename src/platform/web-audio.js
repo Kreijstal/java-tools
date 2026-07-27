@@ -12,6 +12,8 @@
   let sampledFrames = 0;
   let nonSilentSampledFrames = 0;
   let peakSampledAmplitude = 0;
+  let underrunCount = 0;
+  let underrunSeconds = 0;
   const activeOutputs = new Set();
 
   function resumeSharedAudioContext() {
@@ -64,6 +66,7 @@
       this.bytesPerFrame = Math.max(1, options.channels || 1) *
         Math.max(1, (options.bitDepth || 16) / 8);
       this.closed = false;
+      this.hasScheduledAudio = false;
       activeOutputs.add(this);
     }
 
@@ -136,9 +139,15 @@
         }
       };
 
-      const startTime = Math.max(this.context.currentTime, this.scheduledTime);
+      const now = this.context.currentTime;
+      if (this.hasScheduledAudio && this.scheduledTime < now) {
+        underrunCount += 1;
+        underrunSeconds += now - this.scheduledTime;
+      }
+      const startTime = Math.max(now, this.scheduledTime);
       source.start(startTime);
       this.scheduledTime = startTime + audioBuffer.duration;
+      this.hasScheduledAudio = true;
     }
 
     available() {
@@ -264,6 +273,8 @@
       sampledFrames,
       nonSilentSampledFrames,
       peakSampledAmplitude: Math.round(peakSampledAmplitude * 1000000) / 1000000,
+      underruns: underrunCount,
+      underrunSeconds: Math.round(underrunSeconds * 1000) / 1000,
       queuedSeconds: Math.round(queuedSeconds * 1000) / 1000,
       maxOutputQueueSeconds: Math.round(maxOutputQueueSeconds * 1000) / 1000,
     };

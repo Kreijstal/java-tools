@@ -4,6 +4,8 @@ const test = require('tape');
 const path = require('path');
 
 const File = require('../src/jre/java/io/File');
+const FileInputStream = require('../src/jre/java/io/FileInputStream');
+const ReflectField = require('../src/jre/java/lang/reflect/Field');
 const HashMap = require('../src/jre/java/util/HashMap');
 const Hashtable = require('../src/jre/java/util/Hashtable');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
@@ -28,6 +30,10 @@ const ByteBuffer = require('../src/jre/java/nio/ByteBuffer');
 const Random = require('../src/jre/java/util/Random');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
 const { decodePng } = require('../src/io/gifDecoder');
+const {
+  getFileProvider,
+  setFileProvider,
+} = require('../src/core/classLoader');
 
 function jvmStub() {
   return {
@@ -259,6 +265,51 @@ test('CRC32 treats signed Java bytes as unsigned octets', (t) => {
   CRC32.methods['update([BII)V'](null, obj, [[-1, 0, 127, -128], 0, 4]);
 
   t.equal(CRC32.methods['getValue()J'](null, obj, []), 0xba5e3ff4n);
+  t.end();
+});
+
+test('FileInputStream reads browser virtual files without a Node fs backend', async (t) => {
+  const previousProvider = getFileProvider();
+  setFileProvider({
+    async readFile(filePath) {
+      t.equal(filePath, 'track.wav', 'the Java String path is normalized');
+      return new Uint8Array([0, 127, 128, 255]);
+    },
+  });
+  t.teardown(() => setFileProvider(previousProvider));
+  const input = {};
+  await FileInputStream.methods['<init>(Ljava/lang/String;)V'](
+    null, input, [{ value: 'track.wav' }]);
+  const target = [0, 0, 0, 0];
+  const count = FileInputStream.methods['read([BII)I'](
+    null, input, [target, 0, target.length]);
+  t.equal(count, 4, 'the virtual file is readable through Java IO');
+  t.deepEqual(target, [0, 127, -128, -1],
+    'browser bytes preserve Java signed-byte semantics');
+  t.end();
+});
+
+test('reflective fields use normal JVM instance storage', (t) => {
+  const declaringClass = {
+    _classData: { ast: { classes: [{ className: 'ui' }] } },
+  };
+  const arrayField = {
+    _declaringClass: declaringClass,
+    _fieldData: { name: 'y', descriptor: '[I', accessFlags: 0 },
+  };
+  const booleanField = {
+    _declaringClass: declaringClass,
+    _fieldData: { name: 'w', descriptor: 'Z', accessFlags: 0 },
+  };
+  const values = [3, 7, 11];
+  const object = { fields: { 'ui.y': values, 'ui.w': 1 } };
+  t.equal(ReflectField.methods['get(Ljava/lang/Object;)Ljava/lang/Object;'](
+    null, arrayField, [object]), values,
+  'Field.get reads the owner-qualified instance slot');
+  ReflectField.methods['setBoolean(Ljava/lang/Object;Z)V'](
+    null, booleanField, [object, 0]);
+  t.equal(object.fields['ui.w'], 0,
+    'Field.setBoolean writes the owner-qualified instance slot');
   t.end();
 });
 

@@ -46,6 +46,13 @@ function formatStringConstant(str) {
   }).join("")}"`;
 }
 
+function formatUtfReference(value) {
+  const text = String(value === undefined || value === null ? "" : value);
+  return /^(?:(?:[a-zA-Z_$\(<]|\[[A-Z\[])[\w$;/\[\]()<>*+\-]*)$/.test(text)
+    ? text
+    : formatStringConstant(text);
+}
+
 /**
  * Formats a double constant to match Krakatau's output format
  * @param {Number} value - The double value to format
@@ -1159,7 +1166,7 @@ function unparseDataStructures(cls, constantPool, options = {}) {
         `        .localvariabletable`,
         ...attr.vars.map(
           (v) =>
-            `            ${v.index} is ${v.name} ${v.descriptor} from ${v.startLbl} to ${v.endLbl}`,
+            `            ${v.index} is ${formatUtfReference(v.name)} ${formatUtfReference(v.descriptor)} from ${v.startLbl} to ${v.endLbl}`,
         ),
         `        .end localvariabletable`,
       ];

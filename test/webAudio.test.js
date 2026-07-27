@@ -11,6 +11,7 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
   let contextCreations = 0;
   let resumeCalls = 0;
   let stopCalls = 0;
+  let lastContext = null;
   class FakeAudioContext {
     constructor() {
       contextCreations += 1;
@@ -18,6 +19,7 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
       this.currentTime = 0;
       this.sampleRate = 44100;
       this.destination = {};
+      lastContext = this;
     }
 
     resume() {
@@ -92,11 +94,20 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
     "a silent sampled frame is distinguished from audible PCM");
   t.equal(diagnostics.peakSampledAmplitude, 0,
     "the sampled peak exposes silence");
+  t.equal(diagnostics.underruns, 0,
+    "the first PCM write does not count as an underrun");
   t.equal(output.available(), 4092,
     "available reports negotiated free bytes after queued PCM");
+  lastContext.currentTime = 0.1;
+  output.write(new Uint8Array([0, 0, 0, 0]));
+  const starvedDiagnostics = audioPlatform.getWebAudioDiagnostics();
+  t.equal(starvedDiagnostics.underruns, 1,
+    "a write arriving after the scheduled queue expired counts as an underrun");
+  t.ok(starvedDiagnostics.underrunSeconds > 0,
+    "diagnostics include the duration of the audio gap");
   output.end();
   const closedDiagnostics = audioPlatform.getWebAudioDiagnostics();
-  t.equal(stopCalls, 1, "closing an output cancels queued browser audio");
+  t.equal(stopCalls, 2, "closing an output cancels queued browser audio");
   t.equal(closedDiagnostics.activeOutputs, 0,
     "closed outputs no longer contribute to queue diagnostics");
   t.equal(closedDiagnostics.closedOutputs, 1, "closed outputs are counted");

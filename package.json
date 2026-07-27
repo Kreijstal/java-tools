@@ -13,6 +13,7 @@
     "benchmark:jvm:intermethod": "node scripts/benchmarkIntermethodCalls.js",
     "benchmark:jvm:dekobloko-hot-loops": "node scripts/benchmarkDekoblokoHotLoops.js",
     "benchmark:jvm:dekobloko-audio": "node scripts/benchmarkDekoblokoAudioSynthesis.js",
+    "benchmark:pcm-push:firefox": "node scripts/benchmarkJavaPcmPushFirefox.js",
     "benchmark:jvm:dekobloko-renderer-traffic": "node scripts/benchmarkDekoblokoRendererTraffic.js",
     "benchmark:jvm:dekobloko-trace-replay": "node scripts/benchmarkDekoblokoTraceReplay.js",
     "benchmark:jvm:dekobloko-regions": "node scripts/benchmarkDekoblokoRegionSuite.js",

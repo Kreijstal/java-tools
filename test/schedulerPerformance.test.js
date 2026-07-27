@@ -61,6 +61,28 @@ test('scheduler wall-time sampling can be enabled without process environment', 
   t.end();
 });
 
+test('scheduler wall-time sampling can be reconfigured at runtime', (t) => {
+  const jvm = new JVM();
+  t.equal(jvm.getSchedulerTimingSnapshot(), null,
+    'sampling starts disabled');
+  t.deepEqual(jvm.configureSchedulerTimings(32), {
+    rate: 32,
+    rows: [],
+  }, 'a browser diagnostic can enable sampling for one region');
+  jvm._schedulerTimingProfile.samples.set('Fixture.work()V', {
+    samples: 1,
+    totalMs: 2,
+    maxMs: 2,
+  });
+  t.equal(jvm.getSchedulerTimingSnapshot().rows.length, 1,
+    'the enabled region records samples');
+  t.equal(jvm.configureSchedulerTimings(0), null,
+    'zero disables sampling');
+  t.equal(jvm.getSchedulerTimingSnapshot(), null,
+    'disabled sampling retains no stale region');
+  t.end();
+});
+
 test('class initialization remains owned until bytecode clinit returns', async (t) => {
   const clinit = {
     name: '<clinit>',
