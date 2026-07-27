@@ -824,7 +824,8 @@ class KrakatauWorkspace {
     refs.forEach(ref => modifiedClasses.add(ref.className));
 
     // Step 2: Apply the rename operation to the in-memory ASTs.
-    renameMethod(this, symbolIdentifier.className, symbolIdentifier.memberName, newName);
+    renameMethod(this, symbolIdentifier.className, symbolIdentifier.memberName, newName,
+      symbolIdentifier.descriptor);
 
     // Step 3: Reassemble only the affected classes
     const modifiedAsts = { classes: [], constantPools: [] };
@@ -848,7 +849,8 @@ class KrakatauWorkspace {
     refs.forEach(ref => modifiedClasses.add(ref.className));
 
     // Step 2: Apply the rename operation to the in-memory ASTs.
-    renameField(this, symbolIdentifier.className, symbolIdentifier.memberName, newName);
+    renameField(this, symbolIdentifier.className, symbolIdentifier.memberName, newName,
+      symbolIdentifier.descriptor);
 
     // Step 3: Reassemble only the affected classes
     const modifiedAsts = { classes: [], constantPools: [] };

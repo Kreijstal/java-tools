@@ -15,6 +15,7 @@ function usage(exitCode) {
   stream.write(`  --silent                  Accepted for CFR CLI compatibility\n`);
   stream.write(`  --classpath <path>        Classpath used for hierarchy/type resolution\n`);
   stream.write(`  --diagnostics-json <file> Write machine-readable fallback diagnostics\n`);
+  stream.write(`  --preserve-field-names <file> Preserve field names listed one per line\n`);
   stream.write(`  --detect-obfuscation-guards Report hostile overrides such as throwing toString methods\n`);
   stream.write(`  --fail-on-hard-failure    Exit non-zero on invalid output markers or panics\n`);
   stream.write(`  --fail-on-fallback        Exit non-zero on hard failures or valid state-machine fallbacks\n`);
@@ -28,6 +29,7 @@ function parseArgs(argv) {
     omitHeader: false,
     classpath: '',
     diagnosticsJson: '',
+    preserveFieldNames: null,
     detectObfuscationGuards: false,
     failOnHardFailure: false,
     failOnFallback: false,
@@ -53,6 +55,10 @@ function parseArgs(argv) {
     } else if (arg === '--diagnostics-json') {
       if (i + 1 >= argv.length) throw new Error(`${arg} requires a file`);
       options.diagnosticsJson = argv[++i];
+    } else if (arg === '--preserve-field-names') {
+      if (i + 1 >= argv.length) throw new Error(`${arg} requires a file`);
+      options.preserveFieldNames = new Set(fs.readFileSync(argv[++i], 'utf8')
+        .split(/\r?\n/).map((name) => name.trim()).filter(Boolean));
     } else if (arg === '--detect-obfuscation-guards') {
       options.detectObfuscationGuards = true;
     } else if (arg === '--fail-on-fallback') {

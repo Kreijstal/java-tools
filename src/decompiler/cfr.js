@@ -453,7 +453,7 @@ function decompileClassAst(cls, options = {}) {
 
   fields.forEach((item) => {
     for (const annotation of item.field.annotations || []) out.push(`    ${formatAnnotation(annotation)}`);
-    out.push(`    ${formatField(item.field, cls.className)}`);
+    out.push(`    ${formatField(item.field, cls.className, options.exceptionModel, undefined, renderOptions)}`);
   });
   const syntheticConstructor = syntheticAbstractSubclassConstructor(cls, className, options.exceptionModel);
   if ((fields.length || enumConstants.length) && (methods.length || syntheticConstructor)) {
@@ -735,7 +735,7 @@ function formatEnumConstants(cls, constants, options) {
   const rendered = formatStaticInitializer(code, state, cls, options);
   const className = simpleClassName(cls.className || 'Enum');
   return constants.map((item) => {
-    const fieldName = sourceFieldName(cls.className, item.field.name);
+    const fieldName = sourceFieldName(cls.className, item.field.name, options);
     const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
     const pattern = new RegExp(`${escaped}\\s*=\\s*(?:\\([^;=]+?\\)\\s*)*new\\s+([A-Za-z_$][A-Za-z0-9_$.]*)\\(([^;]*)\\);`);
     const match = pattern.exec(rendered);
@@ -770,7 +770,7 @@ function extractInterfaceFieldInitializers(cls, options) {
   }
   const fieldNames = new Set((cls.items || [])
     .filter((item) => item.type === 'field' && item.field)
-    .map((item) => sourceFieldName(cls.className, item.field.name)));
+    .map((item) => sourceFieldName(cls.className, item.field.name, options)));
   if (!assignments.length || assignments.some(([name]) => !fieldNames.has(name))) return result;
   for (const [name, value] of assignments) result.values.set(name, value);
   result.consumedClinit = true;
@@ -859,7 +859,7 @@ function formatEnumConstantSubclass(head, subclass, options) {
     .filter((item) => item.type === 'field' && item.field)
     .filter((item) => !shouldSkipField(subclass, item.field));
   for (const item of fields) {
-    memberTexts.push(formatField(item.field, subclass.className, options.exceptionModel));
+    memberTexts.push(formatField(item.field, subclass.className, options.exceptionModel, undefined, options));
   }
 
   const methods = (subclass.items || [])
@@ -994,7 +994,7 @@ function formatClassDeclaration(cls, displayName, model) {
   return declaration;
 }
 
-function formatField(field, owner, model, initializerOverride = undefined) {
+function formatField(field, owner, model, initializerOverride = undefined, renderOptions = null) {
   const ignoredFlags = new Set(['synthetic', 'enum']);
   // A JVM blank-final assignment can be expressed through receiver shapes that
   // javac does not recognize as a source-level definite-assignment to `this`
@@ -1014,7 +1014,7 @@ function formatField(field, owner, model, initializerOverride = undefined) {
   const initializer = initializerOverride !== undefined
     ? ` = ${initializerOverride}`
     : (field.value !== null && field.value !== undefined ? ` = ${formatLiteral(field.value, type)}` : '');
-  return `${prefix}${type} ${sourceFieldName(owner, field.name)}${initializer};`;
+  return `${prefix}${type} ${sourceFieldName(owner, field.name, renderOptions)}${initializer};`;
 }
 
 // Raised when the decompiler cannot produce valid Java for a method and would
@@ -4768,7 +4768,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       // A live stack value that reads this same field (e.g. the old value dup_x1'd
       // below the store target in a post-increment `f[x++]=v` idiom) would re-read
       // the *mutated* field after this assignment. Spill such reads to a temp first.
-      materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name), lines, localState);
+      materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name, localState), lines, localState);
       lines.push(`${formatStaticField(ref, localState)} = ${value.code};`);
       continue;
     }
@@ -4777,7 +4777,7 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       const rawOwner = pop(stack);
       const owner = rawOwner.localThis ? rawOwner
         : coerceExpressionForType(rawOwner, javaTypeFromInternalName(ref.owner));
-      stack.push(expr(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name)}`, descriptorToJavaType(ref.descriptor), 100, {
+      stack.push(expr(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name, localState)}`, descriptorToJavaType(ref.descriptor), 100, {
         qualifiedType: qualifiedReferenceTypeFromDescriptor(ref.descriptor),
       }));
       continue;
@@ -4794,8 +4794,8 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
         : coerceExpressionForType(rawOwner, javaTypeFromInternalName(ref.owner));
       // Spill any live stack value that reads this field before mutating it, so a
       // post-increment index (`this.r[this.n++] = v`) keeps its pre-increment value.
-      materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name), lines, localState);
-      lines.push(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name)} = ${value.code};`);
+      materializeStackFieldReads(stack, sourceFieldName(ref.owner, ref.name, localState), lines, localState);
+      lines.push(`${wrap(owner, 100)}.${sourceFieldName(ref.owner, ref.name, localState)} = ${value.code};`);
       continue;
     }
 
@@ -7903,6 +7903,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
 
   return {
     paramNames,
+    preserveFieldNames: renderOptions && renderOptions.preserveFieldNames,
     recordConstructorInvocation(target, args) {
       if (!constructorInvocation) constructorInvocation = { target, args: args.slice() };
     },
@@ -8274,7 +8275,7 @@ function parseMultiANewArrayInstruction(instruction) {
 }
 
 function formatStaticField(ref, localState = null) {
-  const fieldName = sourceFieldName(ref.owner, ref.name);
+  const fieldName = sourceFieldName(ref.owner, ref.name, localState);
   const currentOwner = localState && localState.currentInternalClassName;
   const classNameCollision = currentOwner && simpleClassName(currentOwner) === fieldName;
   const localCollision = localState && localState.hasLocalName && localState.hasLocalName(fieldName);
@@ -8293,7 +8294,11 @@ function renderArrayReceiver(value) {
   return /^new\s/.test(rendered) ? `(${rendered})` : rendered;
 }
 
-function sourceFieldName(owner, name) {
+function sourceFieldName(owner, name, options = null) {
+  const preserved = options && options.preserveFieldNames;
+  if (preserved === true
+      || (preserved instanceof Set && preserved.has(name))
+      || (Array.isArray(preserved) && preserved.includes(name))) return name;
   if (String(owner || '').includes('/')) return name;
   return `field_${name}`;
 }
