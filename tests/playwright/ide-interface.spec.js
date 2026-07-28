@@ -125,6 +125,44 @@ test.describe('Java tools IDE', () => {
     await expect(page.locator('.ide-debug-line')).toHaveCount(0, { timeout: 20000 });
   });
 
+  test('stepping highlights the current opcode in the bytecode view', async ({ page }) => {
+    await page.evaluate(() => window.javaToolsIde.actions.debugPath('/src/Main.java'));
+    await expect(page.locator('.ide-debug-line')).toBeVisible({ timeout: 20000 });
+
+    // Reveal the bytecode panel so ace renders the marker/gutter DOM.
+    await page.evaluate(() => window.javaToolsIde.reveal('bytecode'));
+
+    await page.waitForFunction(
+      () => {
+        const marker = Object.values(window.aceEditor.session.getMarkers())
+          .find((entry) => entry.clazz === 'ace_execution_marker');
+        return marker !== undefined;
+      },
+      null,
+      { timeout: 20000 },
+    );
+    await expect(page.locator('#disassembly-editor .ace_execution_marker')).toBeVisible();
+    await expect(
+      page.locator('#disassembly-editor .ace_gutter-cell.ace_execution_line'),
+    ).toBeVisible();
+
+    const rowBefore = await page.evaluate(() => Object.values(
+      window.aceEditor.session.getMarkers(),
+    ).find((entry) => entry.clazz === 'ace_execution_marker').range.start.row);
+
+    // The marker must follow execution to a different opcode line.
+    await page.evaluate(() => window.stepInstruction());
+    await page.waitForFunction(
+      (previousRow) => {
+        const marker = Object.values(window.aceEditor.session.getMarkers())
+          .find((entry) => entry.clazz === 'ace_execution_marker');
+        return marker && marker.range.start.row !== previousRow;
+      },
+      rowBefore,
+      { timeout: 20000 },
+    );
+  });
+
   test('boots without console errors', async ({ page }) => {
     const errors = [];
     page.on('console', (message) => {

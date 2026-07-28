@@ -1770,11 +1770,28 @@ function updateDebugDisplay() {
             editors.forEach((editor) => {
               editor.setValue(cleanContent, -1);
               editor.session.clearBreakpoints();
+              if (editor.__executionMarkerId != null) {
+                editor.session.removeMarker(editor.__executionMarkerId);
+                editor.__executionMarkerId = null;
+              }
               if (currentExecutionLine !== -1) {
                 editor.session.setBreakpoint(
                   currentExecutionLine,
                   "ace_execution_line",
                 );
+                if (window.ace && typeof window.ace.require === "function") {
+                  const AceRange = window.ace.require("ace/range").Range;
+                  editor.__executionMarkerId = editor.session.addMarker(
+                    new AceRange(
+                      currentExecutionLine,
+                      0,
+                      currentExecutionLine,
+                      Number.MAX_SAFE_INTEGER,
+                    ),
+                    "ace_execution_marker",
+                    "fullLine",
+                  );
+                }
                 editor.scrollToLine(currentExecutionLine + 1, true, true);
               }
               editor.clearSelection();

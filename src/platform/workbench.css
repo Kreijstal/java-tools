@@ -1004,9 +1004,17 @@ button.workspace-file:hover {
   flex: 1 1 auto;
 }
 
-#debug-code-editor .ace_gutter-cell.ace_execution_line {
+#debug-code-editor .ace_gutter-cell.ace_execution_line,
+#disassembly-editor .ace_gutter-cell.ace_execution_line {
   background: var(--accent);
   color: #06251a;
+}
+
+.ace_execution_marker {
+  position: absolute;
+  background: rgba(78, 201, 176, 0.2);
+  border-left: 2px solid var(--accent);
+  z-index: 4;
 }
 
 .runtime-toolbar,

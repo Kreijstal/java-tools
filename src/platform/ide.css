@@ -498,6 +498,19 @@ body.ide-body {
   z-index: 4;
 }
 
+/* Current opcode in the bytecode/disassembly view while stepping */
+.ace_execution_marker {
+  position: absolute;
+  background: rgba(104, 211, 145, 0.22);
+  border-left: 2px solid var(--ide-success);
+  z-index: 4;
+}
+
+#disassembly-editor .ace_gutter-cell.ace_execution_line {
+  background: var(--ide-success);
+  color: #06251a;
+}
+
 /* ---------- Dialogs ---------- */
 
 dialog.ide-dialog {
