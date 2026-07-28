@@ -21,6 +21,8 @@ const jitTimingFilter = (process.env.PROBE_JIT_TIMING_FILTER || '').split(',')
   .map((value) => value.trim()).filter(Boolean);
 const traceMethod = process.env.PROBE_TRACE_METHOD || '';
 const traceOutput = process.env.PROBE_TRACE_OUTPUT || '';
+const traceAfterChangedFrames = nonNegativeInteger(
+  'PROBE_TRACE_AFTER_CHANGED_FRAMES', 0);
 const fusedRegionsOverride = process.env.PROBE_FUSED_REGIONS === undefined
   ? null : process.env.PROBE_FUSED_REGIONS === '1';
 const directFusedCallsOverride = process.env.PROBE_DIRECT_FUSED_CALLS === undefined
@@ -54,6 +56,15 @@ function positiveNumber(name, fallback) {
   const value = Number(process.env[name] || fallback);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive number`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(name, fallback) {
+  const raw = process.env[name];
+  const value = raw === undefined || raw === '' ? fallback : Number(raw);
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`);
   }
   return value;
 }
@@ -150,7 +161,7 @@ function animationEstimate(changes) {
     });
     await page.addInitScript(({ sampleStride, animationChangeTarget, collectJitMethods, collectJitTimings,
       collectSchedulerTimings, schedulerSampleRate, collectExclusiveTimings, exclusiveRoot,
-      timingSampleRate, timingFilter, methodTraceKey,
+      timingSampleRate, timingFilter, methodTraceKey, traceAfterChanges,
       fusedRegions, directFusedCalls, scalarLoops, scalarSsa, structuredSsa,
       structuredSplit, structuredDeferredCalls, ordinaryAdaptive,
       rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache, wasmStructured }) => {
@@ -296,12 +307,22 @@ function animationEstimate(changes) {
       let animatedChangeCount = 0;
       const sample = (now) => {
         const jvm = window.jvmDebug?.debugController?.jvm;
-        if (jvm?.jit) jvm.jit.profileMethods = collectJitMethods;
+        // Method-entry capture needs canonical child Frames. Positional calls
+        // intentionally omit them on the normal hot path, while profileMethods
+        // already routes those calls through runGeneratedFrame. Reuse that
+        // diagnostic-only gate whenever a trace target is armed.
+        if (jvm?.jit) {
+          jvm.jit.profileMethods =
+            collectJitMethods || Boolean(methodTraceKey);
+        }
         if (jvm?.jit) {
           jvm.jit.profileTimings = collectJitTimings;
           jvm.jit.methodTimingSampleRate = timingSampleRate;
           jvm.jit.methodTimingFilter = timingFilter.length ? new Set(timingFilter) : null;
-          jvm.jit.methodEntryTraceKey = methodTraceKey || null;
+          jvm.jit.methodEntryTraceKey =
+            animatedChangeCount >= traceAfterChanges
+              ? methodTraceKey || null
+              : null;
           jvm.jit.exclusiveTimingsEnabled = collectExclusiveTimings;
           jvm.jit.exclusiveTimingRootKey = exclusiveRoot || null;
         }
@@ -393,6 +414,7 @@ function animationEstimate(changes) {
       timingSampleRate: jitTimingSampleRate,
       timingFilter: jitTimingFilter,
       methodTraceKey: traceMethod,
+      traceAfterChanges: traceAfterChangedFrames,
       fusedRegions: fusedRegionsOverride,
       directFusedCalls: directFusedCallsOverride,
       scalarLoops: scalarLoopsOverride,
@@ -513,6 +535,7 @@ function animationEstimate(changes) {
     result.jitTimingSampleRate = jitTimingSampleRate;
     result.jitTimingFilter = jitTimingFilter;
     result.traceMethod = traceMethod || null;
+    result.traceAfterChangedFrames = traceAfterChangedFrames;
     result.fusedRegions = fusedRegionsOverride;
     result.scalarLoopsEnabled = scalarLoopsOverride;
     result.scalarSsaEnabled = scalarSsaOverride;

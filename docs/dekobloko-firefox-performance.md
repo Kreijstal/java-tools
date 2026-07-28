@@ -5152,6 +5152,48 @@ generated JAR
 and WebAudio bridge
 `234207c030cdb23bfc735e1e885bf8dab68f58dec21e959b11129a52d173a1bd`.
 
+### Moving logo-animation replay (2026-07-28)
+
+The first focused browser scene page repeatedly invoked one captured renderer
+state and retained one surface hash. It was useful as a renderer throughput
+control, but it was not an animation benchmark.
+
+The replacement capture waits for two visible changed frames, then captures a
+canonical entry to the active logo renderer. `PROBE_TRACE_AFTER_CHANGED_FRAMES`
+is a generic profiler gate; it avoids selecting an earlier asset-preparation
+invocation. Trace capture also enables existing method profiling while the
+target is armed, which makes positional frameless calls materialize canonical
+child Frames for `saveState` without changing normal execution. A separate JIT
+bug was fixed: an unset target previously compared `null === null` and could
+capture the first generated method under a null identity. The focused JIT suite
+now asserts that no state serialization occurs until an arbitrary target
+identity is configured.
+
+The Dekobloko-side harness does not hardcode the obfuscated progress field. It
+counts integer `getstatic` operands in the captured bytecode, requires one
+candidate to have at least four reads and twice the next candidate's count,
+then feeds that verified input `0,25,…,175` in a loop. It hashes every full
+640×480 surface and fails unless at least half of consecutive frames change.
+Thus a fixed renderer replay can no longer pass as animation.
+
+Node 26.4 measured 40/40 distinct surfaces and 39/39 changed transitions at
+104.00 frames/s with an 8.227 ms median guest frame. Three clean headless
+Firefox 146 paced runs measured 45.73, 42.55, and 42.61 moving frames/s
+(42.61 median), 17–18 ms median guest time, 19–20 ms median
+guest-plus-upload time, 30/30 distinct surfaces, 29/29 changed transitions,
+identical temporal sequence hash `1456157722`, and no page or JVM errors.
+
+The measured browser bundle was
+`1744b7e37dd670e7c3f668d5fa2645baab27b63ad8b18f1460aa83e677311f0f`;
+the method-entry trace was
+`5b49fe4d0739167c0db566a8753661610fe357f82fe2e4398b5049582daa0a79`;
+the classes JAR was
+`b7e6941c374dce4eeb9230690b618935dadda78372977b1888d8f447f167bb16`;
+and the source game JAR was
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`.
+The manifests record repository commits, trees, dirty state, tracked-patch
+hashes, environment gates, and the explicit JIT configuration.
+
 ### Deadline and sampled method profiling
 
 Aggregate mixer CPU was enough to prove the remote failure, but not enough to

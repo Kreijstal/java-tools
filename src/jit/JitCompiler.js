@@ -677,7 +677,9 @@ class JitCompiler {
     const frameMethodKey = needsMethodKey
       ? `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`
       : null;
-    if (this.methodEntryTraceKey === frameMethodKey && !this.methodEntryTrace && frame.pc === 0) {
+    if (this.methodEntryTraceKey &&
+        this.methodEntryTraceKey === frameMethodKey &&
+        !this.methodEntryTrace && frame.pc === 0) {
       try {
         this.methodEntryTrace = {
           methodKey: frameMethodKey,

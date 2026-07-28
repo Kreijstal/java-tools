@@ -546,6 +546,35 @@ test('unsampled generated-method timing avoids guest identity formatting', (t) =
   t.end();
 });
 
+test('method-entry tracing remains inactive until a target identity is configured', (t) => {
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, profileMethods: false, profileTimings: false,
+  } });
+  const method = { name: 'arbitraryEntry', descriptor: '()V', attributes: [] };
+  const frame = new Frame(method);
+  frame.className = 'ArbitraryOwner';
+  const generated = () => ({ returned: true });
+  generated.jvmSynchronous = true;
+  let saveStateCalls = 0;
+  jvm.saveState = () => {
+    saveStateCalls += 1;
+    return { format: 'test-state' };
+  };
+
+  jvm.jit.runGeneratedFrame(generated, frame, { status: 'runnable' }, false);
+  t.equal(jvm.jit.methodEntryTrace, null,
+    'an unset trace target does not capture the first generated method');
+  t.equal(saveStateCalls, 0, 'an unset target does not serialize JVM state');
+
+  jvm.jit.methodEntryTraceKey = 'ArbitraryOwner.arbitraryEntry()V';
+  jvm.jit.runGeneratedFrame(generated, frame, { status: 'runnable' }, false);
+  t.equal(jvm.jit.methodEntryTrace?.methodKey,
+    'ArbitraryOwner.arbitraryEntry()V',
+    'the configured arbitrary identity is captured at bytecode entry');
+  t.equal(saveStateCalls, 1, 'the matching target serializes state exactly once');
+  t.end();
+});
+
 test('generated bodies expose profiler identities without runtime probes', (t) => {
   const jvm = new JVM({ jit: { profileMethods: false } });
   const method = { name: 'renamedHotBody', descriptor: '([II)V' };
