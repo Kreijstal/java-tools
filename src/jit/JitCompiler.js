@@ -4281,6 +4281,11 @@ class JitCompiler {
       target.positionalInvoker =
         generated.jvmRestoringDirectPositionalBody.bind(null, this, plan);
       target.positionalInvoker.jvmDebugGuarded = true;
+      // The restoring scalar ABI reconstructs an omitted child Frame at the
+      // precise throwing operation. Its caller must therefore retain the
+      // invoke pc and operands until the ordinary exception dispatcher has
+      // processed that reconstructed frame.
+      target.positionalInvoker.jvmRestoresExceptionFrames = true;
       return target.positionalInvoker;
     }
     const argumentsList = Array.from(

@@ -581,6 +581,22 @@ class JvmSsaBlockRenderer {
       `stack.length = ${operandValues.length};`,
       `helpers.materialize(frame, locals, stack, ${pc});`,
     ];
+    // A synchronous guest call can throw after installing its child Frame.
+    // If that child catches the exception, its eventual return must resume
+    // this frame after the invoke with only the operands below the arguments.
+    // If no child was installed (for example, a direct JRE intrinsic threw),
+    // the exception belongs to this frame and must retain the invoke pc and
+    // complete pre-call stack for normal handler dispatch.
+    const materializeCallExceptionLines = (
+      preCallValues, postCallValues, pc, childCanResume = "true",
+    ) => [
+      `if (${childCanResume} && thread.callStack.items.length && ` +
+        "thread.callStack.peek() !== frame) {",
+      ...materializeLines(postCallValues, pc + 1).map((line) => `  ${line}`),
+      "} else {",
+      ...materializeLines(preCallValues, pc).map((line) => `  ${line}`),
+      "}",
+    ];
     const stageOperandLines = (operandValues) => [
       ...operandValues.map((expression, i) => `stack[${i}] = ${expression};`),
       `stack.length = ${operandValues.length};`,
@@ -1473,7 +1489,8 @@ class JvmSsaBlockRenderer {
                   ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
                 `let ${out};`,
                 `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                ...materializeCallExceptionLines(callStack, stack, index)
+                  .map((line) => `  ${line}`),
                 `  throw ${caught};`, "}",
                 `if (${out} === helpers.asyncInvokeSentinel()) {`,
                 asynchronousFallbackMarker, "}",
@@ -1524,7 +1541,9 @@ class JvmSsaBlockRenderer {
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
               `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
-              ...materializeLines(callStack, index).map((line) => `  ${line}`), `  throw ${caught};`, "}",
+              ...materializeCallExceptionLines(callStack, stack, index)
+                .map((line) => `  ${line}`),
+              `  throw ${caught};`, "}",
               `if (${out} === helpers.asyncInvokeSentinel()) {`,
               ...(resumableVoidCall ? [asynchronousCallMarker] : [
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
@@ -1551,7 +1570,11 @@ class JvmSsaBlockRenderer {
                 `      !helpers.jvm.debugManager.isClassJitDeopted(${positionalTarget}.lookupClass))) {`,
                 `  try { ${out} = ${positionalTarget}.invoke(${args.join(", ")}${
                   args.length ? ", " : ""}thread); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `    ${line}`),
+                ...materializeCallExceptionLines(
+                  callStack, stack, index,
+                  `!${positionalTarget}.invoke.jvmRestoresExceptionFrames`,
+                )
+                  .map((line) => `    ${line}`),
                 `    throw ${caught};`, "  }",
                 `  if (${out} === helpers.asyncInvokeSentinel()) {`,
                 ...fallbackLines.map((line) => `    ${line}`),

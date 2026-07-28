@@ -888,3 +888,45 @@ public class NestedEhCallee {
   t.ok(riskySt && riskySt.nestedCalls > 0, 'EH callee ran nested');
   t.end();
 });
+
+test('structured SSA resumes after a nested callee catches with wasm disabled', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'NestedEhJsFallback', `
+public class NestedEhJsFallback {
+  int[] tab = null;
+  int risky(int i) {
+    try {
+      return tab[i & 7];
+    } catch (NullPointerException e) {
+      return 5;
+    }
+  }
+  public int drive(int[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += risky(i) + (i & 1);
+    out[0] = sum;
+    return sum;
+  }
+}
+`, { JVM_WASM_JIT: '0', JVM_WASM_STRUCTURED: '0' });
+  const n = 64;
+  let expected = 0;
+  for (let i = 0; i < n; i++) expected = (expected + 5 + (i & 1)) | 0;
+  const out = [0];
+  out.type = '[I';
+  const recv = {
+    type: 'NestedEhJsFallback',
+    fields: { 'NestedEhJsFallback.tab': null },
+    hashCode: 17,
+  };
+  await invoke(
+    jvm, thread, 'NestedEhJsFallback', 'drive', '([II)I', [recv, out, n],
+  );
+  t.equal(out[0], expected, 'callee return resumes the caller after the invoke');
+  const drive = await jvm.findMethodInHierarchy(
+    'NestedEhJsFallback', 'drive', '([II)I',
+  );
+  const generated = jvm.jit.getGeneratedFunction(drive);
+  t.ok(generated && generated.jvmStructuredSsa,
+    'caller used the structured SSA tier');
+  t.end();
+});
