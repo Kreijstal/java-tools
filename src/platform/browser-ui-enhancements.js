@@ -36,6 +36,11 @@ const STEP_BUTTON_IDS = [
 
 // Global state for UI compatibility
 let jvmDebug = null;
+// Sample manifest (dist/data/manifest.json): describes the shipped .java
+// sample sources, their classes, launch modes, and cross-file dependency
+// closures. Samples are compiled lazily in the browser on first use.
+let sampleManifest = null;
+const SAMPLE_DATA_BASE = "./data";
 let currentState = {
   status: "stopped",
   pc: null,
@@ -785,30 +790,27 @@ async function initializeJVM() {
       }
 
       try {
-        // Detect environment and determine data.zip URL
-        const dataUrl = await getDataZipUrl();
-        log(`Attempting to load data from: ${dataUrl}`, "info");
+        // Fetch the sample manifest; the .java sources it lists are fetched
+        // and compiled in-browser lazily, the first time a sample is used.
+        const manifestUrl = `${SAMPLE_DATA_BASE}/manifest.json`;
+        log(`Loading sample manifest from: ${manifestUrl}`, "info");
 
-        const response = await fetch(dataUrl);
+        const response = await fetch(manifestUrl);
         if (!response.ok) {
           throw new Error(
-            `Data package fetch failed (${response.status}): ${response.statusText}`,
+            `Sample manifest fetch failed (${response.status}): ${response.statusText}`,
           );
         }
-
-        const buffer = await response.arrayBuffer();
-        const uint8Array = new Uint8Array(buffer);
-        log(`Data package fetched, size: ${uint8Array.length} bytes`, "info");
-
-        // Load as JAR archive since data.zip is essentially a zip file
-        const extractedFiles = await jvmDebug.fileProvider.loadJarArchive(
-          uint8Array,
-          "data.zip",
-        );
+        sampleManifest = await response.json();
         log(
-          `Data package loaded with ${extractedFiles.length} class files`,
+          `Sample manifest lists ${sampleManifest.samples.length} sources ` +
+          `(${sampleManifest.totalClasses} classes, compiled on demand)`,
           "info",
         );
+
+        // Lazily compiled sample classes land in /samples; make the bare
+        // class name (e.g. Hello.class) resolvable through it.
+        jvmDebug.fileProvider.addClasspathRoot("/samples");
 
         // Initialize the debug environment
         await jvmDebug.initialize();
@@ -825,13 +827,13 @@ async function initializeJVM() {
         setupAWTIntegration();
 
         log(
-          `Real JVM Debug initialized with ${extractedFiles.length} sample classes`,
+          `Real JVM Debug initialized with ${sampleManifest.samples.length} lazy sample sources`,
           "success",
         );
         await populateSampleClasses();
         await initializeMethodBrowser();
       } catch (err) {
-        log(`Failed to load data package: ${err.message}`, "error");
+        log(`Failed to load sample manifest: ${err.message}`, "error");
         log("JVM initialization failed - mock functions will remain active", "error");
         return; // Exit early but don't throw - let mock functions remain
       }
@@ -868,32 +870,53 @@ async function initializeJVM() {
 }
 
 /**
- * Detect if we're running on GitHub Pages and return appropriate data.zip URL
+ * Ensure a sample class is present in the virtual classpath, lazily fetching
+ * and compiling its .java source (and that source's cross-file dependency
+ * closure) with the in-browser Java frontend on first use. Non-sample paths
+ * are left untouched so uploaded classes and JARs behave as before.
+ * @param {string} classPath - e.g. "Hello.class" or "Hello"
+ * @returns {Promise<boolean>} - true if the class is now resolvable
  */
-async function getDataZipUrl() {
-  const hostname = window.location.hostname;
-  const isGitHubPages = hostname.includes("github.io");
+async function ensureSampleClass(classPath) {
+  if (!jvmDebug || !sampleManifest || !classPath) return false;
+  const normalized = String(classPath).replace(/^\.?\/+/, "");
+  const withExtension = normalized.endsWith(".class")
+    ? normalized
+    : `${normalized}.class`;
+  if (await jvmDebug.fileProvider.exists(withExtension)) return true;
 
-  if (isGitHubPages) {
-    // For GitHub Pages, try the release artifact URL first
-    const releaseUrl =
-      "https://github.com/Kreijstal/java-tools/releases/download/latest-data/data.zip";
-    try {
-      const testResponse = await fetch(releaseUrl, { method: "HEAD" });
-      if (testResponse.ok) {
-        log("Using GitHub release artifact URL for data.zip", "info");
-        return releaseUrl;
-      }
-    } catch (e) {
-      log(
-        "GitHub release artifact not accessible, falling back to local",
-        "warning",
+  const internalName = withExtension.replace(/\.class$/, "");
+  const sample = sampleManifest.samples.find((entry) =>
+    entry.classes.includes(internalName));
+  if (!sample) return false;
+
+  // Fetch the sample plus its cross-file dependency closure into /samples so
+  // the compiler can resolve sibling types, then compile them all at once.
+  // Sources stay next to the classes, enabling source-level debugging.
+  const workspace = await jvmDebug.ensureWorkspace();
+  workspace.mkdirSync("/samples", { recursive: true });
+  const sourceNames = [...(sample.dependsOn || []), sample.source];
+  for (const sourceName of sourceNames) {
+    const sourcePath = `/samples/${sourceName}`;
+    if (workspace.existsSync(sourcePath)) continue;
+    const response = await fetch(`${SAMPLE_DATA_BASE}/${sourceName}`);
+    if (!response.ok) {
+      throw new Error(
+        `Sample source fetch failed (${response.status}): ${sourceName}`,
       );
     }
+    workspace.writeFileSync(sourcePath, await response.text());
   }
-
-  // Default to local path for development and fallback
-  return "./data.zip";
+  const compiled = jvmDebug.compileWorkspace(
+    sourceNames.map((sourceName) => `/samples/${sourceName}`),
+    { sourceRoot: "/samples", outputDir: "/samples" },
+  );
+  log(
+    `Compiled sample ${sample.source} → ` +
+    compiled.artifacts.map((artifact) => artifact.internalName).join(", "),
+    "success",
+  );
+  return jvmDebug.fileProvider.exists(withExtension);
 }
 
 function sampleCategory(classPath, launchMode) {
@@ -970,25 +993,35 @@ async function populateSampleClasses() {
   const sampleSelect = document.getElementById(DOM_IDS.SAMPLE_CLASS_SELECT);
   if (sampleSelect && jvmDebug) {
     try {
-      // Get available classes from the JVM debug instance
-      const availableClasses = await jvmDebug.listFiles();
-      log(`Found ${availableClasses.length} classes in data.zip`, "info");
-
-      const classFiles = availableClasses.filter((file) => file.endsWith(".class"));
-      const runnableChecks = await Promise.all(classFiles.map(async (classPath) => {
-        try {
-          const launchInfo = await jvmDebug.getClassLaunchInfo(classPath);
-          return launchInfo.launchMode
-            ? { classPath, launchMode: launchInfo.launchMode }
-            : null;
-        } catch (error) {
-          log(`Skipping unreadable sample ${classPath}: ${error.message}`, "warning");
-          return null;
-        }
-      }));
-      const runnableEntries = runnableChecks
-        .filter(Boolean)
-        .sort((left, right) => left.classPath.localeCompare(right.classPath));
+      let runnableEntries;
+      let totalClassCount;
+      if (sampleManifest) {
+        // Launch modes were computed at build time; nothing to compile yet.
+        runnableEntries = sampleManifest.samples
+          .flatMap((sample) => sample.runnable)
+          .map(({ classPath, launchMode }) => ({ classPath, launchMode }));
+        totalClassCount = sampleManifest.totalClasses;
+        log(`Manifest lists ${runnableEntries.length} runnable samples`, "info");
+      } else {
+        // No manifest (e.g. classes came from an uploaded JAR): enumerate the
+        // already-loaded classpath and probe each class.
+        const availableClasses = await jvmDebug.listFiles();
+        const classFiles = availableClasses.filter((file) => file.endsWith(".class"));
+        totalClassCount = classFiles.length;
+        const runnableChecks = await Promise.all(classFiles.map(async (classPath) => {
+          try {
+            const launchInfo = await jvmDebug.getClassLaunchInfo(classPath);
+            return launchInfo.launchMode
+              ? { classPath, launchMode: launchInfo.launchMode }
+              : null;
+          } catch (error) {
+            log(`Skipping unreadable sample ${classPath}: ${error.message}`, "warning");
+            return null;
+          }
+        }));
+        runnableEntries = runnableChecks.filter(Boolean);
+      }
+      runnableEntries.sort((left, right) => left.classPath.localeCompare(right.classPath));
       const runnableClasses = runnableEntries.map((entry) => entry.classPath);
 
       sampleSelect.innerHTML =
@@ -1011,13 +1044,13 @@ async function populateSampleClasses() {
       renderSampleCatalog(sampleSelect, runnableEntries);
       log(
         `Exposed ${runnableClasses.length} runnable samples; ` +
-        `${classFiles.length - runnableClasses.length} support classes remain inspectable only`,
+        `${totalClassCount - runnableClasses.length} support classes remain inspectable only`,
         "success",
       );
       window.dispatchEvent(new CustomEvent("javatools:samples-populated", {
         detail: {
           runnableClasses: [...runnableClasses],
-          hiddenSupportClassCount: classFiles.length - runnableClasses.length,
+          hiddenSupportClassCount: totalClassCount - runnableClasses.length,
         },
       }));
 
@@ -1315,6 +1348,9 @@ async function loadVirtualClass(selectedClass) {
 
   try {
     log(`Loading class: ${selectedClass}`, "info");
+
+    // Samples ship as .java sources; compile lazily on first use.
+    await ensureSampleClass(selectedClass);
 
     // Get the class data from the JVM's loaded files
     const classData = await jvmDebug.fileProvider.readFile(selectedClass);
@@ -2396,6 +2432,7 @@ window.__realLoadSampleClass = loadSampleClass;
 window.__realLoadClassFile = loadClassFile;
 window.updateButtons = updateButtons;
 window.loadVirtualClass = loadVirtualClass;
+window.ensureSampleClass = ensureSampleClass;
 window.loadSampleClass = loadSampleClass;
 window.loadClassFile = loadClassFile;
 window.clearOutput = clearOutput;

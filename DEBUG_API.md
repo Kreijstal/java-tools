@@ -188,8 +188,9 @@ Initialization options:
 - `dataPackage`: load a decoded data-package object;
 - `dataUrl`: fetch a JSON data-package URL.
 
-`dataUrl` expects JSON. Do not pass the workbench’s ZIP archive to this option;
-the workbench fetches and extracts `data.zip` through its file provider.
+`dataUrl` expects JSON. The workbench itself no longer ships an archive of
+sample classes: it fetches `data/manifest.json` and lazily compiles the listed
+`.java` sources in the browser on first use.
 
 ### Upload and start
 

@@ -9,7 +9,7 @@ const exampleUsage = `
 const jvmDebug = new JVMDebug.BrowserJVMDebug();
 await jvmDebug.initialize();
 
-// 2. Load HelloWorld class (this is already in the data.zip)
+// 2. Load HelloWorld class (shipped as a lazily compiled sample source)
 // No need to manually load since it's included in the build
 
 // 3. Create HelloWorld applet instance

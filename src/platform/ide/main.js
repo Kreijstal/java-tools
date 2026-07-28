@@ -363,26 +363,9 @@ function waitForJvmReady(timeoutMs = 90000) {
   });
 }
 
-/**
- * Move the flat data.zip sample classpath into a /samples directory so the
- * explorer root stays clean. Class-name lookups keep working through the
- * /samples classpath root.
- */
-function relocateSamples(jvmDebug) {
-  const provider = jvmDebug.fileProvider;
-  if (provider.getWorkspaceFileSystem()) return; // already a workspace: nothing to migrate
-  for (const key of Array.from(provider.virtualFS.keys())) {
-    if (key.startsWith('/') || key.startsWith('samples/')) continue;
-    const value = provider.virtualFS.get(key);
-    provider.virtualFS.delete(key);
-    provider.virtualFS.set(`samples/${key}`, value);
-  }
-}
-
 async function bootWorkspace() {
   setStatus('Starting JVM runtime…', 'info');
   const jvmDebug = await waitForJvmReady();
-  relocateSamples(jvmDebug);
   const workspace = await jvmDebug.ensureWorkspace();
   jvmDebug.fileProvider.addClasspathRoot('/samples');
   context.workspace = workspace;

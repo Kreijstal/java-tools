@@ -27,7 +27,7 @@
     "run:jar": "node scripts/runJar.js",
     "build:java": "node scripts/compileJava.js sources/*.java --out sources",
     "build:bundle": "node scripts/generate-jre-index && webpack --mode production",
-    "generate": "npm run build:java && node scripts/generateData.js",
+    "generate": "node scripts/generateData.js",
     "build": "npm run generate && npm run build:bundle && node scripts/buildSite.js",
     "clean": "find sources -name '*.class' -delete && rm -rf dist",
     "pretest": "node scripts/generate-jre-index.js &&npm run build:java",
