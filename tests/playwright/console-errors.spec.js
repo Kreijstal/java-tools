@@ -12,7 +12,7 @@ test.describe('Console Error Detection', () => {
     });
 
     // Load the debug interface
-    await page.goto('/dist/index.html', { timeout: 10000 });
+    await page.goto('/dist/classic.html', { timeout: 10000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 });
     
     // Wait for initialization

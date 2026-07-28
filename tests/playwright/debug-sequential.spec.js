@@ -1,7 +1,7 @@
 const { test, expect } = require('@playwright/test');
 
 test('debug sequential loading issue', async ({ page }) => {
-  await page.goto('/dist/index.html', { timeout: 10000 });
+  await page.goto('/dist/classic.html', { timeout: 10000 });
   await page.waitForLoadState('networkidle', { timeout: 10000 });
   await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
   await page.waitForTimeout(3000);

@@ -1,0 +1,700 @@
+/* Java Tools IDE shell styles. Layout chrome comes from golden-layout's base +
+ * dark theme css; this file styles the toolbar, explorer, and panel content. */
+
+:root {
+  --ide-bg: #1e1e1e;
+  --ide-panel: #252526;
+  --ide-border: #3e3e42;
+  --ide-fg: #d4d4d4;
+  --ide-accent: #569cd6;
+  --ide-accent-soft: #9cdcfe;
+  --ide-error: #f44747;
+  --ide-success: #68d391;
+  --ide-warning: #ffcc02;
+}
+
+html, body {
+  height: 100%;
+}
+
+body.ide-body {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  font-family: "Segoe UI", "Ubuntu", sans-serif;
+  font-size: 13px;
+  background: var(--ide-bg);
+  color: var(--ide-fg);
+  overflow: hidden;
+}
+
+/* ---------- Toolbar ---------- */
+
+#ideToolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--ide-panel);
+  border-bottom: 1px solid var(--ide-border);
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+#ideToolbar .ide-brand {
+  font-weight: 600;
+  color: var(--ide-accent);
+  margin-right: 8px;
+}
+
+#ideToolbar .ide-spacer {
+  flex: 1 1 auto;
+}
+
+.ide-menu {
+  position: relative;
+  display: inline-block;
+}
+
+.ide-menu > button,
+#ideToolbar > button {
+  background: transparent;
+  color: var(--ide-fg);
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 4px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.ide-menu > button:hover,
+#ideToolbar > button:hover {
+  background: #3c3c3c;
+}
+
+#ideToolbar button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.ide-menu-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  left: 0;
+  min-width: 220px;
+  background: #2d2d30;
+  border: 1px solid var(--ide-border);
+  border-radius: 4px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5);
+  z-index: 300;
+  padding: 4px 0;
+}
+
+.ide-menu.open .ide-menu-dropdown {
+  display: block;
+}
+
+.ide-menu-dropdown button,
+.ide-menu-dropdown a {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--ide-fg);
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.ide-menu-dropdown button:hover,
+.ide-menu-dropdown a:hover {
+  background: #094771;
+}
+
+.ide-menu-dropdown .shortcut {
+  color: #888;
+  font-size: 11px;
+}
+
+.ide-menu-dropdown hr {
+  border: none;
+  border-top: 1px solid var(--ide-border);
+  margin: 4px 0;
+}
+
+#ideToolbar select {
+  background: #3c3c3c;
+  color: var(--ide-fg);
+  border: 1px solid var(--ide-border);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-size: 12px;
+  max-width: 240px;
+}
+
+#ideToolbar a.classic-link {
+  color: var(--ide-accent-soft);
+  font-size: 12px;
+  text-decoration: none;
+  margin-left: 8px;
+}
+
+#ideToolbar a.classic-link:hover {
+  text-decoration: underline;
+}
+
+#status {
+  font-size: 12px;
+  color: #999;
+  max-width: 34vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#status.success { color: var(--ide-success); }
+#status.error { color: var(--ide-error); }
+#status.info { color: var(--ide-accent-soft); }
+
+/* ---------- GoldenLayout host ---------- */
+
+#gl-root {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 0;
+}
+
+/* Panels are pre-rendered in #ide-panels and adopted by layout components. */
+#ide-panels {
+  display: none;
+}
+
+.ide-panel-content {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  background: var(--ide-bg);
+  overflow: hidden;
+}
+
+.ide-panel-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--ide-border);
+  background: var(--ide-panel);
+  flex: 0 0 auto;
+}
+
+.ide-panel-toolbar button {
+  background: transparent;
+  border: none;
+  color: var(--ide-fg);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 6px;
+  border-radius: 3px;
+}
+
+.ide-panel-toolbar button:hover {
+  background: #3c3c3c;
+}
+
+.ide-panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+
+/* ---------- Explorer ---------- */
+
+#explorerTree {
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  font-size: 13px;
+  user-select: none;
+}
+
+#explorerTree ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#explorerTree li > .tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  cursor: pointer;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+#explorerTree li > .tree-row:hover {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+#explorerTree li > .tree-row.active {
+  background: #094771;
+}
+
+#explorerTree .tree-toggle {
+  width: 12px;
+  flex: 0 0 auto;
+  font-size: 9px;
+  color: #999;
+}
+
+#explorerTree .tree-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#explorerTree .tree-dirty {
+  color: var(--ide-warning);
+  margin-left: 2px;
+}
+
+.explorer-empty {
+  padding: 10px;
+  color: #888;
+  font-size: 12px;
+}
+
+/* ---------- Context menu ---------- */
+
+#ideContextMenu {
+  position: fixed;
+  z-index: 500;
+  display: none;
+  min-width: 200px;
+  background: #2d2d30;
+  border: 1px solid var(--ide-border);
+  border-radius: 4px;
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.5);
+  padding: 4px 0;
+}
+
+#ideContextMenu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--ide-fg);
+  padding: 6px 14px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+#ideContextMenu button:hover {
+  background: #094771;
+}
+
+#ideContextMenu hr {
+  border: none;
+  border-top: 1px solid var(--ide-border);
+  margin: 4px 0;
+}
+
+/* ---------- Editors ---------- */
+
+.ide-editor-host {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.ide-editor-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  font-size: 12px;
+  background: #2d2d30;
+  border-bottom: 1px solid var(--ide-border);
+  color: #bbb;
+  flex: 0 0 auto;
+}
+
+.ide-editor-banner button {
+  background: #0e639c;
+  border: none;
+  color: white;
+  border-radius: 3px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.ide-editor-banner button:hover {
+  background: #1177bb;
+}
+
+.ide-editor-ace {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ---------- Terminal / Output / Display panels ---------- */
+
+#xterm-container {
+  width: 100%;
+  height: 100%;
+  background: #1e1e1e;
+}
+
+#output {
+  font-family: "Courier New", monospace;
+  font-size: 12px;
+  padding: 6px 8px;
+  line-height: 1.45;
+}
+
+#output .log-entry.error { color: var(--ide-error); }
+#output .log-entry.success { color: var(--ide-success); }
+#output .log-entry.warning { color: var(--ide-warning); }
+#output .log-entry.info { color: #9e9e9e; }
+#output .log-entry.debug { color: #6a6a6a; }
+
+#awt-container {
+  padding: 10px;
+}
+
+.display-placeholder {
+  color: #888;
+  font-size: 12px;
+  padding: 10px;
+}
+
+/* ---------- Debug panel ---------- */
+
+#panel-debug .ide-panel-body {
+  display: grid;
+  grid-template-columns: minmax(230px, 300px) 1fr 1fr 1fr;
+  gap: 8px;
+  padding: 8px;
+  overflow: auto;
+}
+
+.debug-section h4 {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--ide-accent-soft);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.debug-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 8px;
+}
+
+.debug-controls button {
+  background: #3c3c3c;
+  color: var(--ide-fg);
+  border: 1px solid var(--ide-border);
+  border-radius: 3px;
+  font-size: 12px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.debug-controls button:hover:not(:disabled) {
+  background: #4c4c4c;
+}
+
+.debug-controls button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.debug-breakpoints {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.debug-breakpoints input {
+  width: 70px;
+  background: #3c3c3c;
+  border: 1px solid var(--ide-border);
+  color: var(--ide-fg);
+  border-radius: 3px;
+  padding: 3px 6px;
+  font-size: 12px;
+}
+
+#panel-debug select {
+  background: #3c3c3c;
+  color: var(--ide-fg);
+  border: 1px solid var(--ide-border);
+  border-radius: 3px;
+  font-size: 12px;
+  padding: 2px 4px;
+  max-width: 100%;
+}
+
+.debug-display {
+  font-family: "Courier New", monospace;
+  font-size: 11px;
+  background: var(--ide-panel);
+  border: 1px solid var(--ide-border);
+  border-radius: 3px;
+  padding: 6px;
+  min-height: 90px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.debug-display .state-item .key {
+  color: var(--ide-accent-soft);
+}
+
+/* ---------- Bytecode panel ---------- */
+
+#panel-bytecode .ide-panel-body {
+  display: flex;
+  flex-direction: column;
+}
+
+#disassembly-info {
+  padding: 4px 8px;
+  font-size: 12px;
+  color: #999;
+  border-bottom: 1px solid var(--ide-border);
+  flex: 0 0 auto;
+}
+
+#disassembly-editor {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+/* ---------- Dialogs ---------- */
+
+dialog.ide-dialog {
+  background: #2d2d30;
+  color: var(--ide-fg);
+  border: 1px solid var(--ide-border);
+  border-radius: 6px;
+  padding: 16px;
+  min-width: 340px;
+}
+
+dialog.ide-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.5);
+}
+
+dialog.ide-dialog h3 {
+  margin: 0 0 10px;
+  font-size: 14px;
+  color: var(--ide-accent);
+}
+
+dialog.ide-dialog input {
+  width: 100%;
+  box-sizing: border-box;
+  background: #3c3c3c;
+  border: 1px solid var(--ide-border);
+  color: var(--ide-fg);
+  border-radius: 3px;
+  padding: 6px 8px;
+  font-size: 13px;
+  margin-bottom: 6px;
+}
+
+dialog.ide-dialog .dialog-hint {
+  font-size: 11px;
+  color: #999;
+  margin-bottom: 10px;
+  min-height: 14px;
+}
+
+dialog.ide-dialog .dialog-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+dialog.ide-dialog button {
+  background: #3c3c3c;
+  border: 1px solid var(--ide-border);
+  color: var(--ide-fg);
+  border-radius: 3px;
+  padding: 5px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+dialog.ide-dialog button.primary {
+  background: #0e639c;
+  border-color: #0e639c;
+  color: white;
+}
+
+/* GoldenLayout tweaks for the dark look */
+.lm_header .lm_tab {
+  font-family: "Segoe UI", "Ubuntu", sans-serif;
+  font-size: 12px;
+}
+
+/* Legacy-compat elements required by browser-ui-enhancements.js */
+#legacy-compat {
+  display: none;
+}
+
+/* ---------- Mobile layout ---------- */
+/* GoldenLayout's docking is pointer-driven; small / coarse-pointer devices
+ * get a one-view-at-a-time layout instead (see ide/mobileLayout.js). */
+
+body.ide-mobile #ideToolbar {
+  flex-wrap: wrap;
+  row-gap: 4px;
+}
+
+body.ide-mobile #status {
+  max-width: 60vw;
+}
+
+.ide-mobile-root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.ide-mobile-viewbar {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  flex: 0 0 auto;
+  background: var(--ide-panel);
+  border-bottom: 1px solid var(--ide-border);
+  padding: 2px 4px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.ide-mobile-viewbar button {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ide-fg);
+  font-size: 13px;
+  padding: 8px 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ide-mobile-viewbar button.active {
+  color: var(--ide-accent-soft);
+  border-bottom-color: var(--ide-accent);
+}
+
+.ide-mobile-viewhost {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 0;
+}
+
+.ide-mobile-view {
+  display: none;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+.ide-mobile-view.active {
+  display: flex;
+  flex-direction: column;
+}
+
+.ide-mobile-view .ide-panel-content {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.ide-mobile-editortabs {
+  display: flex;
+  gap: 2px;
+  overflow-x: auto;
+  flex: 0 0 auto;
+  background: #2d2d30;
+  border-bottom: 1px solid var(--ide-border);
+  -webkit-overflow-scrolling: touch;
+}
+
+.ide-mobile-editortab {
+  display: flex;
+  align-items: center;
+  background: var(--ide-panel);
+  border-right: 1px solid var(--ide-border);
+}
+
+.ide-mobile-editortab.active {
+  background: var(--ide-bg);
+}
+
+.ide-mobile-editortab button {
+  background: transparent;
+  border: none;
+  color: var(--ide-fg);
+  font-size: 12px;
+  padding: 7px 4px 7px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.ide-mobile-editortab.active button {
+  color: var(--ide-accent-soft);
+}
+
+.ide-mobile-editortab button.close {
+  padding: 7px 8px 7px 4px;
+  color: #888;
+}
+
+.ide-mobile-editorhost {
+  flex: 1 1 auto;
+  position: relative;
+  min-height: 0;
+}
+
+.ide-mobile-editor {
+  display: none;
+  width: 100%;
+  height: 100%;
+}
+
+.ide-mobile-editor.active {
+  display: flex;
+}
+
+.ide-mobile-editor .ide-editor-host {
+  flex: 1 1 auto;
+}
+
+body.ide-mobile #panel-debug .ide-panel-body {
+  grid-template-columns: 1fr;
+}

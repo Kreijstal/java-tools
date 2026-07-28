@@ -83,7 +83,11 @@ const server = http.createServer((req, res) => {
   }
 
   let filePath;
-  if (normalizedPath.startsWith('/examples/')) {
+  if (normalizedPath === '/examples/data.zip') {
+    // The raw example pages fetch ./data.zip relative to /examples/; the
+    // package only exists in dist, so alias it there.
+    filePath = path.join(PUBLIC_DIR, 'dist', 'data.zip');
+  } else if (normalizedPath.startsWith('/examples/')) {
     // Serve examples from the root directory for development access
     filePath = path.join(PUBLIC_DIR, normalizedPath);
   } else if (normalizedPath.startsWith('/dist/')) {

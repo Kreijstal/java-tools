@@ -3,7 +3,7 @@ const { test, expect } = require('@playwright/test');
 test.describe('Hello Class Debugging Test', () => {
   test('should load Hello.class, start debugging, and check disassembly content', async ({ page }) => {
     // Navigate to the debug interface
-    await page.goto('/dist/index.html', { timeout: 10000 });
+    await page.goto('/dist/classic.html', { timeout: 10000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 });
 
     console.log('=== Starting Hello.class debugging test ===');

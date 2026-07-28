@@ -46,11 +46,12 @@
   "license": "AGPLv3",
   "description": "Java bytecode analysis and JVM implementation tools",
   "dependencies": {
-    "@zenfs/core": "^2.6.1",
     "@modelcontextprotocol/sdk": "^1.21.1",
+    "@zenfs/core": "^2.6.1",
     "crc-32": "^1.2.2",
     "decimal.js": "^10.4.3",
     "diff": "^9.0.0",
+    "golden-layout": "^2.6.0",
     "jpeg-js": "^0.4.4",
     "jszip": "^3.10.1",
     "jvm_parser": "^0.0.13",

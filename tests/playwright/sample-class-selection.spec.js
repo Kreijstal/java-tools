@@ -3,7 +3,7 @@ const { test, expect } = require('@playwright/test');
 test.describe('Sample Class Selection UI', () => {
   test.beforeEach(async ({ page }) => {
     // Navigate to the debug interface
-    await page.goto('/dist/index.html', { timeout: 10000 });
+    await page.goto('/dist/classic.html', { timeout: 10000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 });
   });
 

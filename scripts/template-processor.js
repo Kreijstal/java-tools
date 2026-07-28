@@ -169,8 +169,10 @@ function addUIElementIds(htmlContent) {
  * Add data.zip download section for GitHub Pages deployment
  */
 function addDataZipDownloadSection(htmlContent) {
-    // Find the sample classes section and add download section before it
-    const sampleClassesPattern = /(<h4>📚 Sample Classes[^<]*<\/h4>)/;
+    // Insert the download section before the sample catalog picker. (The old
+    // anchor, an <h4>📚 Sample Classes</h4> heading, was removed in the UI
+    // rework, which silently disabled this insertion.)
+    const sampleClassesPattern = /(<details id="sampleCatalog")/;
     const downloadSection = `
         <!-- Data Package Download Section for GitHub Pages -->
         <details class="sample-download">

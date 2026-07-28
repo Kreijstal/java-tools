@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Java Tools IDE</title>
+  <link rel="icon" href="data:,">
+
+  <link rel="stylesheet" href="./lib/xterm.css">
+  <link rel="stylesheet" href="./lib/goldenlayout-base.css">
+  <link rel="stylesheet" href="./lib/goldenlayout-dark-theme.css">
+  <link rel="stylesheet" href="./ide.css">
+
+  <script src="./lib/ace.js"></script>
+  <script src="./lib/theme-monokai.js"></script>
+  <script src="./lib/mode-java.js"></script>
+  <script src="./lib/xterm.js"></script>
+  <script src="./lib/addon-fit.js"></script>
+
+  <!-- Runtime: JVM, terminal/System bridge, AWT, audio, legacy APIs -->
+  <script src="./jvm-debug.js"></script>
+  <script src="./browser-ui-enhancements.js"></script>
+  <script src="./awt.js"></script>
+  <script src="./web-audio.js"></script>
+  <script src="./web-legacy.js"></script>
+
+  <!-- IDE shell (GoldenLayout + explorer + editors) -->
+  <script src="./ide-ui.js" defer></script>
+</head>
+<body class="ide-body">
+  <header id="ideToolbar">
+    <span class="ide-brand">Java Tools IDE</span>
+
+    <div class="ide-menu" data-menu>
+      <button type="button" data-menu-button>File</button>
+      <div class="ide-menu-dropdown">
+        <button type="button" id="menuNewFile">New File… <span class="shortcut">Ctrl+N</span></button>
+        <button type="button" id="menuNewFolder">New Folder…</button>
+        <hr>
+        <button type="button" id="menuOpenDisk">Open from disk…</button>
+        <hr>
+        <button type="button" id="menuSave">Save <span class="shortcut">Ctrl+S</span></button>
+        <button type="button" id="menuDownload">Download active file</button>
+        <hr>
+        <a href="./data.zip" download="java-class-samples.zip">Download sample classes</a>
+      </div>
+    </div>
+
+    <div class="ide-menu" data-menu>
+      <button type="button" data-menu-button>Build</button>
+      <div class="ide-menu-dropdown">
+        <button type="button" id="menuCompile">Compile <span class="shortcut">Ctrl+B</span></button>
+        <button type="button" id="menuAssemble">Assemble .j</button>
+      </div>
+    </div>
+
+    <button type="button" id="runBtn" title="Compile if needed, then run the active file">▶ Run</button>
+    <button type="button" id="debugBtn" title="Start paused in the debugger">🐞 Debug</button>
+
+    <span class="ide-spacer"></span>
+
+    <select id="sampleClassSelect" title="Built-in runnable samples"></select>
+    <button type="button" id="loadSampleBtn" title="Load the selected sample into the JVM and bytecode view">Load sample</button>
+
+    <span id="status">Booting…</span>
+    <a class="classic-link" href="./classic.html">Classic workbench</a>
+  </header>
+
+  <main id="gl-root"></main>
+
+  <!-- Panel bodies live here until GoldenLayout components adopt them. -->
+  <div id="ide-panels">
+    <div id="panel-explorer" class="ide-panel-content">
+      <div class="ide-panel-toolbar">
+        <button type="button" id="explorerNewFileBtn" title="New file">📄+</button>
+        <button type="button" id="explorerNewFolderBtn" title="New folder">📁+</button>
+        <button type="button" id="explorerUploadBtn" title="Upload a file from disk into the workspace">⬆</button>
+        <button type="button" id="explorerRefreshBtn" title="Refresh tree">⟳</button>
+      </div>
+      <div class="ide-panel-body">
+        <ul id="explorerTree"></ul>
+      </div>
+    </div>
+
+    <div id="panel-terminal" class="ide-panel-content">
+      <div id="xterm-container"></div>
+    </div>
+
+    <div id="panel-output" class="ide-panel-content">
+      <div class="ide-panel-toolbar">
+        <button type="button" id="outputClearBtn" title="Clear log">🗑 Clear</button>
+      </div>
+      <div class="ide-panel-body">
+        <div id="output"></div>
+      </div>
+    </div>
+
+    <div id="panel-display" class="ide-panel-content">
+      <div class="ide-panel-body">
+        <div class="display-placeholder">AWT / applet output appears here when a graphical program runs.</div>
+        <div id="awt-container"></div>
+      </div>
+    </div>
+
+    <div id="panel-debug" class="ide-panel-content">
+      <div class="ide-panel-body">
+        <div class="debug-section">
+          <h4>Controls</h4>
+          <div class="debug-controls">
+            <button type="button" id="pauseBtn">⏸ Pause</button>
+            <button type="button" id="continueBtn">⏵ Continue</button>
+            <button type="button" id="stepIntoBtn">Step Into</button>
+            <button type="button" id="stepOverBtn">Step Over</button>
+            <button type="button" id="stepOutBtn">Step Out</button>
+            <button type="button" id="stepInstructionBtn">Step Insn</button>
+            <button type="button" id="finishBtn">Finish</button>
+            <button type="button" id="rewindBtn">Rewind</button>
+          </div>
+          <div class="debug-breakpoints">
+            <input type="number" id="breakpointInput" placeholder="PC" min="0">
+            <button type="button" id="setBreakpointBtn">Set BP</button>
+            <button type="button" id="clearBreakpointsBtn">Clear</button>
+          </div>
+          <h4>Thread</h4>
+          <select id="threadSelect" disabled>
+            <option>No active threads</option>
+          </select>
+          <h4>Execution</h4>
+          <div id="executionState" class="debug-display"></div>
+        </div>
+        <div class="debug-section">
+          <h4>Operand Stack</h4>
+          <div id="stackDisplay" class="debug-display"></div>
+        </div>
+        <div class="debug-section">
+          <h4>Locals</h4>
+          <div id="localsDisplay" class="debug-display"></div>
+        </div>
+        <div class="debug-section">
+          <h4>Call Stack</h4>
+          <div id="callStackDisplay" class="debug-display"></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="panel-bytecode" class="ide-panel-content">
+      <div class="ide-panel-body">
+        <div id="disassembly-info">No class loaded into the JVM yet.</div>
+        <div id="disassembly-editor"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Context menu for the explorer tree -->
+  <div id="ideContextMenu"></div>
+
+  <!-- Dialogs -->
+  <dialog id="promptDialog" class="ide-dialog">
+    <h3 id="promptDialogTitle">New file</h3>
+    <input type="text" id="promptDialogInput" spellcheck="false">
+    <div class="dialog-hint" id="promptDialogHint"></div>
+    <div class="dialog-buttons">
+      <button type="button" id="promptDialogCancel">Cancel</button>
+      <button type="button" class="primary" id="promptDialogOk">OK</button>
+    </div>
+  </dialog>
+
+  <!-- Hidden inputs + elements the runtime layer expects to exist -->
+  <div id="legacy-compat">
+    <input type="file" id="classFileInput" accept=".class,.jar,.zip">
+    <input type="file" id="stateFileInput" accept=".json">
+    <input type="file" id="ideUploadInput" multiple>
+    <select id="jarMainClassSelect"></select>
+  </div>
+</body>
+</html>

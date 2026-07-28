@@ -2,7 +2,7 @@ const { test, expect } = require('@playwright/test');
 
 test('download data.zip from debug interface', async ({ page }) => {
   // Navigate to the debug interface
-  await page.goto('/dist/index.html');
+  await page.goto('/dist/classic.html');
 
   // Wait for the page to load
   await page.waitForLoadState('networkidle');
@@ -13,8 +13,9 @@ test('download data.zip from debug interface', async ({ page }) => {
   await expect(downloadSection).toBeVisible();
   await downloadSection.locator('summary').click();
 
-  // Now check that the download link is visible
-  const downloadLink = page.locator('a[href="./data.zip"]');
+  // Now check that the download link is visible. Scope to the section: the
+  // File menu contains its own data.zip link.
+  const downloadLink = downloadSection.locator('a[href="./data.zip"]');
   await expect(downloadLink).toBeVisible();
   await expect(downloadLink).toContainText('data.zip');
 

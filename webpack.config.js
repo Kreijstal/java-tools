@@ -1,7 +1,7 @@
 const path = require('path');
 const browserBabel = require('./config/browser-babel');
 
-module.exports = {
+const jvmDebugConfig = {
   mode: 'production',
   entry: './src/platform/browser-entry.js',
   output: {
@@ -74,3 +74,20 @@ module.exports = {
   },
   devtool: 'source-map'
 };
+
+// The IDE shell is a plain page-controller bundle: it drives the globals the
+// jvm-debug bundle installs (window.JVMDebug, window.jvmDebug, window.ace,
+// window.Terminal) and only bundles golden-layout, so it must not claim a
+// UMD library global of its own.
+const ideUiConfig = {
+  mode: 'production',
+  entry: './src/platform/ide/main.js',
+  output: {
+    filename: 'ide-ui.js',
+    path: path.resolve(__dirname, 'dist')
+  },
+  module: jvmDebugConfig.module,
+  devtool: 'source-map'
+};
+
+module.exports = [jvmDebugConfig, ideUiConfig];

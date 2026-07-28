@@ -4,7 +4,7 @@ const path = require('path');
 
 test.describe('Java tools workbench', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/dist/index.html');
+    await page.goto('/dist/classic.html');
     await page.waitForFunction(
       () => document.querySelectorAll('#sampleClassSelect option').length > 2,
       null,
