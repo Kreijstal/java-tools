@@ -5170,27 +5170,39 @@ now asserts that no state serialization occurs until an arbitrary target
 identity is configured.
 
 The Dekobloko-side harness does not hardcode the obfuscated progress field. It
-counts integer `getstatic` operands in the captured bytecode, requires one
-candidate to have at least four reads and twice the next candidate's count,
-then feeds that verified input `0,25,…,175` in a loop. It hashes every full
-640×480 surface and fails unless at least half of consecutive frames change.
-Thus a fixed renderer replay can no longer pass as animation.
+counts integer `getstatic` operands in the captured bytecode and requires one
+candidate to have at least four reads and twice the next candidate's count.
+The initial replacement used `0,25,…,175`; this proved that the scene moved,
+but it was still only an eight-phase throughput probe, not the original
+animation timeline.
 
-Node 26.4 measured 40/40 distinct surfaces and 39/39 changed transitions at
-104.00 frames/s with an 8.227 ms median guest frame. Three clean headless
-Firefox 146 paced runs measured 45.73, 42.55, and 42.61 moving frames/s
-(42.61 median), 17–18 ms median guest time, 19–20 ms median
-guest-plus-upload time, 30/30 distinct surfaces, 29/29 changed transitions,
-identical temporal sequence hash `1456157722`, and no page or JVM errors.
+The original guest lifecycle was subsequently audited end to end. It
+initializes the progress value to zero, increments it before drawing, renders
+1 through 250 at a 20 ms scheduler period, then takes its completion branch at
+251. The current diagnostic replays all 250 visible states, resets the captured
+initial raster only at the lifecycle boundary, and requires each complete loop
+to produce the same 307,200-pixel hash sequence. It deliberately excludes the
+raster array's extra sentinel element.
+
+Node 26.4 rendered two complete loops at 150.93 states/s with a 6.312 ms median
+guest state. Three clean headless Firefox 146.0.1 paced runs measured 34.06,
+35.63, and 33.63 states/s (34.06 median). Both runtimes produced loop hash
+`1069931322`, combined sequence hash `2650786977`, first hash `2929241493`,
+last hash `2521474463`, 175 unique surfaces, and 349/499 changed transitions.
+Firefox produced no page or JVM errors. The older 104 FPS Node and 42.61 FPS
+Firefox numbers are retained only as phase-jump throughput history and must not
+be cited as original-logo playback.
 
 The measured browser bundle was
-`1744b7e37dd670e7c3f668d5fa2645baab27b63ad8b18f1460aa83e677311f0f`;
+`537299a0ff80342f0133e537bf4c082a8ea61b3e66074f066234a4eb892f7dee`;
 the method-entry trace was
 `5b49fe4d0739167c0db566a8753661610fe357f82fe2e4398b5049582daa0a79`;
 the classes JAR was
 `b7e6941c374dce4eeb9230690b618935dadda78372977b1888d8f447f167bb16`;
 and the source game JAR was
 `a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`.
+The audited timeline was
+`93d87afcc1fd552a9247c8d84298a053a94cc3e89e8fcc896733fe75f0183490`.
 The manifests record repository commits, trees, dirty state, tracked-patch
 hashes, environment gates, and the explicit JIT configuration.
 
@@ -5556,3 +5568,61 @@ JVM bundle
 `0845384d96705a0a8018fa8ae3fcff44c63c792d52170ede7376790320b02a66`,
 and WebAudio bridge
 `234207c030cdb23bfc735e1e885bf8dab68f58dec21e959b11129a52d173a1bd`.
+
+## 2026-07-28: epoch-cached generated-region guards
+
+> Correction: the measurements in this section used the eight-phase
+> `0,25,…,175` moving-renderer probe. They establish the guard-cache A/B result
+> for that synthetic workload, but they are not measurements of the original
+> Jagex-logo timeline. The audited 1…250 timeline and superseding playback
+> measurements are documented in “Moving logo-animation replay” above.
+
+The moving 640×480 guest animation initially measured 42.61 FPS median in
+three clean headless Firefox 146 runs. A low-overhead Gecko profile showed
+`FusedRegionCompiler.guard` as a direct leaf in 129 of 4,000 one-millisecond
+samples. The animation entered verified fused regions about 98,951 times over
+30 frames, so each entry was repeating class-map and bytecode-identity walks
+whose answers could not change without a JVM class lifecycle event.
+
+Fused regions now cache only the stable portion of a successful guard against
+`classEpoch` and `classInitializationEpoch`. Exact wrapper identity, live
+mode/feature statics, thread/call-stack ownership, debugger and breakpoint
+state, and tracing state remain checked at every entry before side effects.
+Advancing either lifecycle epoch repeats initialization and dependency
+identity verification. The structured SSA renderer applies the same rule to
+its generated class-initialization sets, including direct and
+exception-restoring positional bodies. Selection and caching use resolved
+owners, identities, and epochs; there is no guest method-name table.
+
+The focused JIT suite passes 722/722 assertions, including unchanged-epoch
+reuse, class-epoch bytecode invalidation, initialization-epoch invalidation,
+debugger fallback, operand preservation, and pre-side-effect fallback. The
+production bundle built successfully with its four existing size/dynamic
+dependency warnings.
+
+Bundle
+`537299a0ff80342f0133e537bf4c082a8ea61b3e66074f066234a4eb892f7dee`
+produced these clean Firefox 146.0.1 results:
+
+| run | displayed FPS | guest median | guest + upload median | hash total |
+|---|---:|---:|---:|---:|
+| 1 | 48.62 | 15 ms | 17 ms | 56 ms |
+| 2 | 48.39 | 15 ms | 17 ms | 53 ms |
+| 3 | 41.21 | 16 ms | 19 ms | 56 ms |
+
+On that phase-jump probe, the 48.39 median is 13.6% above the earlier 42.61
+median. The guest body
+fits a 60 FPS budget at its 15–16 ms median, but upload plus the diagnostic-only
+full 307,200-pixel hash keeps the displayed loop below 60. All three runs had
+29/29 changed transitions, temporal sequence hash `1456157722`, and no page or
+JVM errors. Node 26.4 measured 126.30, 126.72, and 142.96 FPS (126.72 median)
+with 40/40 distinct full surfaces, versus the earlier 104.00 FPS result. These
+numbers must not be reused as original-logo playback rates.
+
+The post-change Gecko window contained 3,998 samples and only 16 inclusive
+`guard` samples. The next largest optimizer-controlled self-time is the large
+structured geometry body. Its generated JavaScript declares roughly 170 JVM
+locals and retains long cross-block local/join-slot copy chains. The next
+generic experiment should simplify SSA copies and phis, or split a verified
+region at safe boundaries; method-name-selected kernels are neither necessary
+nor justified by this profile.

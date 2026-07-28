@@ -595,6 +595,17 @@ class FusedRegionCompiler {
     if (typeof process !== "undefined" && process.env &&
         (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1" ||
          process.env.JVM_PROFILE_HOT_METHODS_WITH_JIT === "1")) return false;
+    // The remaining checks prove linkage facts that can change only when a
+    // class is loaded/replaced or finishes initialization. Raster-heavy
+    // callers can enter the same region thousands of times per frame, so
+    // repeating every class-map lookup and bytecode-identity walk at each
+    // triangle is disproportionately expensive. Keep all live entry guards
+    // above this point, and reuse only a successful linkage proof while both
+    // lifecycle epochs remain unchanged.
+    const classEpoch = this.jvm.classEpoch || 0;
+    const initializationEpoch = this.jvm.classInitializationEpoch || 0;
+    if (region.guardClassEpoch === classEpoch &&
+        region.guardInitializationEpoch === initializationEpoch) return true;
     for (const owner of region.initializedOwners || [
       ...region.dependencies.map((dependency) => dependency.owner),
       ...region.staticOwners,
@@ -618,6 +629,8 @@ class FusedRegionCompiler {
         if (!codeAttr || codeAttr.code.codeItems !== dependency.codeItems) return false;
       }
     }
+    region.guardClassEpoch = classEpoch;
+    region.guardInitializationEpoch = initializationEpoch;
     return true;
   }
 

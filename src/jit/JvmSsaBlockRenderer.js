@@ -224,8 +224,34 @@ class JvmSsaBlockRenderer {
     this.guardedBooleanSiteCount = 0;
     this.guardedBooleanFallbackCount = 0;
     this.restoredDirectExceptionFrameCount = 0;
+    // Generated bodies retain only an index into this table. A successful
+    // proof is reusable until either class lifecycle epoch advances.
+    this.classInitializationGuards = [];
     this.lastCompileError = null;
     this.lastRejectionReason = null;
+  }
+
+  registerClassInitializationGuard(owners) {
+    const guard = {
+      owners: [...new Set(owners)],
+      classEpoch: -1,
+      initializationEpoch: -1,
+    };
+    const id = this.classInitializationGuards.length;
+    this.classInitializationGuards.push(guard);
+    return id;
+  }
+
+  verifyClassInitializationGuard(guard) {
+    if (!guard) return false;
+    for (const owner of guard.owners) {
+      if (this.jit.jvm.classInitializationState.get(owner) !== "INITIALIZED") {
+        return false;
+      }
+    }
+    guard.classEpoch = this.jit.jvm.classEpoch || 0;
+    guard.initializationEpoch = this.jit.jvm.classInitializationEpoch || 0;
+    return true;
   }
 
   compile(method) {
@@ -2048,9 +2074,18 @@ class JvmSsaBlockRenderer {
       declarations.push(`let ${variable} = 0;`);
       for (let slot = 0; slot < island.maxDepth; slot += 1) declarations.push(`let ${island.transfer}${slot};`);
     }
-    const staticEntryGuard = directStaticOwners.size
-      ? `if (${[...directStaticOwners].map((owner) =>
-        `helpers.jvm.classInitializationState.get(${JSON.stringify(owner)}) !== "INITIALIZED"`).join(" || ")}) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }`
+    const staticInitializationGuardId = directStaticOwners.size
+      ? this.registerClassInitializationGuard(directStaticOwners) : -1;
+    const staticInitializationGuardDeclaration = staticInitializationGuardId >= 0
+      ? `const ssaClassInitializationGuard = helpers.structuredSsa.classInitializationGuards[${staticInitializationGuardId}];`
+      : null;
+    const staticEntryGuard = staticInitializationGuardId >= 0
+      ? "if ((ssaClassInitializationGuard.classEpoch !== (helpers.jvm.classEpoch || 0) || " +
+        "ssaClassInitializationGuard.initializationEpoch !== " +
+        "(helpers.jvm.classInitializationEpoch || 0)) && " +
+        "!helpers.structuredSsa.verifyClassInitializationGuard(" +
+        "ssaClassInitializationGuard)) { helpers.skipJitOnce(frame); " +
+        "return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }"
       : null;
     const directStaticDeclarations = [...directStaticSites.values()].map((direct) =>
       `const ${direct.variable} = helpers.directStaticTargets[${direct.targetId}].fields;`);
@@ -2233,6 +2268,7 @@ class JvmSsaBlockRenderer {
     ) => ["'use strict';",
       "const locals = frame.locals;", "const stack = frame.stack.items;",
       "if ((!framelessEntry && frame.pc !== 0) || (initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks)) { helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'structured SSA entry' }; }",
+      staticInitializationGuardDeclaration,
       staticEntryGuard,
       ...directStaticDeclarations,
       guardedStaticBooleanEntryGuard,
@@ -2272,10 +2308,21 @@ class JvmSsaBlockRenderer {
           entryArguments.set(slot++, `argument${index + receiverSlots}`);
         }
         const owners = [...new Set([directMethodOwner, ...directStaticOwners])];
+        const directInitializationGuardId =
+          this.registerClassInitializationGuard(owners);
+        const directInitializationGuardDeclaration =
+          `const ssaDirectClassInitializationGuard = ` +
+          `helpers.structuredSsa.classInitializationGuards[${directInitializationGuardId}];`;
+        const directInitializationCondition =
+          "((ssaDirectClassInitializationGuard.classEpoch !== " +
+          "(helpers.jvm.classEpoch || 0) || " +
+          "ssaDirectClassInitializationGuard.initializationEpoch !== " +
+          "(helpers.jvm.classInitializationEpoch || 0)) && " +
+          "!helpers.structuredSsa.verifyClassInitializationGuard(" +
+          "ssaDirectClassInitializationGuard))";
         const directGuardConditions = [
           "helpers.needsBytecodeChecks()",
-          ...owners.map((owner) =>
-            `helpers.jvm.classInitializationState.get(${JSON.stringify(owner)}) !== "INITIALIZED"`),
+          directInitializationCondition,
         ];
         const directGuard = directGuardConditions.length
           ? `if (${directGuardConditions.join(" || ")}) ` +
@@ -2292,6 +2339,7 @@ class JvmSsaBlockRenderer {
           : null;
         directPositionalSource = [
           "'use strict';",
+          directInitializationGuardDeclaration,
           directGuard,
           ...directStaticDeclarations,
           directBooleanGuard,
@@ -2329,12 +2377,23 @@ class JvmSsaBlockRenderer {
           entryArguments.set(slot++, `argument${index + receiverSlots}`);
         }
         const owners = [...new Set([directMethodOwner, ...directStaticOwners])];
+        const restoringInitializationGuardId =
+          this.registerClassInitializationGuard(owners);
+        const restoringInitializationGuardDeclaration =
+          `const ssaRestoringClassInitializationGuard = ` +
+          `helpers.structuredSsa.classInitializationGuards[${restoringInitializationGuardId}];`;
+        const restoringInitializationCondition =
+          "((ssaRestoringClassInitializationGuard.classEpoch !== " +
+          "(helpers.jvm.classEpoch || 0) || " +
+          "ssaRestoringClassInitializationGuard.initializationEpoch !== " +
+          "(helpers.jvm.classInitializationEpoch || 0)) && " +
+          "!helpers.structuredSsa.verifyClassInitializationGuard(" +
+          "ssaRestoringClassInitializationGuard))";
         const directGuardConditions = [
           "helpers.profileMethods",
           "helpers.needsBytecodeChecks()",
           "thread.status !== 'runnable'",
-          ...owners.map((owner) =>
-            `helpers.jvm.classInitializationState.get(${JSON.stringify(owner)}) !== "INITIALIZED"`),
+          restoringInitializationCondition,
         ];
         const directGuard =
           `if (${directGuardConditions.join(" || ")}) { ` +
@@ -2387,6 +2446,7 @@ class JvmSsaBlockRenderer {
         ].filter(Boolean);
         restoringDirectPositionalSource = [
           "'use strict';",
+          restoringInitializationGuardDeclaration,
           directGuard,
           "let frame = null;",
           "let locals = null;",

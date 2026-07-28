@@ -1196,6 +1196,7 @@ public final class ArbitraryRestoringRaster {
     };
     destination[0] = 1234;
     jvm.classInitializationState.set(className, 'INITIALIZING');
+    jvm.classInitializationEpoch += 1;
     t.equal(direct(receiver, 0, 0, 2, guardThread),
       jvm.jit.asyncInvokeSentinel(),
     'class initialization guard falls back before entering the scalar body');
@@ -1204,6 +1205,7 @@ public final class ArbitraryRestoringRaster {
     t.equal(guardThread.callStack.size(), 0,
       'a guarded fallback does not create an omitted child frame');
     jvm.classInitializationState.set(className, 'INITIALIZED');
+    jvm.classInitializationEpoch += 1;
 
     jvm.debugManager.enable();
     t.equal(direct(receiver, 0, 0, 2, guardThread),
@@ -3603,6 +3605,12 @@ public class ScalarFeatureHarness {
     'initialized static target is read directly without the generic helper');
   t.ok(structured.generated.jvmStructuredSource.includes('.get("staticBias:I")'),
     'direct static access retains a live read from the canonical field map');
+  t.ok(structured.generated.jvmStructuredSource.includes(
+    'structuredSsa.classInitializationGuards'),
+  'structured entry uses an epoch-keyed class-initialization proof');
+  t.notOk(structured.generated.jvmStructuredSource.includes(
+    'classInitializationState.get('),
+  'the hot structured entry does not repeat class-state map lookups');
   structured.jvm.classes.ScalarFeatureHarness.staticFields.set('staticBias:I', 9);
   const changedStaticOut = [0, 0];
   changedStaticOut.type = '[I';
@@ -3612,6 +3620,7 @@ public class ScalarFeatureHarness {
     'direct static target observes values changed after compilation');
 
   structured.jvm.classInitializationState.set('ScalarFeatureHarness', 'UNINITIALIZED');
+  structured.jvm.classInitializationEpoch += 1;
   const guardedStaticOut = [0, 0];
   guardedStaticOut.type = '[I';
   const guardedStaticFrame = new Frame(structured.method);
@@ -4015,12 +4024,39 @@ test('fused entry guards fall back before consuming operands or side effects', (
   t.equal(caller.stack.items.length, 8, 'debug fallback leaves operands intact');
 
   jvm.debugManager.disable();
+  const originalFindMethod = jvm.findMethod.bind(jvm);
+  let linkageLookups = 0;
+  jvm.findMethod = (...args) => {
+    linkageLookups += 1;
+    return originalFindMethod(...args);
+  };
   result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
   t.ok(result.handled, 'the same structurally cached region runs after guards clear');
   t.equal(sideEffects, 1, 'unguarded invocation enters the fused kernel once');
   t.equal(caller.stack.items.length, 0, 'successful fused void call consumes its operands');
-  t.equal(jvm.jit.fusedRunCount, 1, 'successful fused execution is counted');
-  t.equal(jvm.jit.fusedGuardedFallbackCount, 2, 'both guarded fallbacks are counted');
+  t.equal(linkageLookups, 1, 'the first successful entry verifies dependency linkage');
+
+  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
+  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  t.ok(result.handled, 'an unchanged lifecycle epoch reuses the linkage proof');
+  t.equal(linkageLookups, 1, 'the cached proof skips repeated dependency lookup');
+
+  caller.stack.items.push(1, 2, 3, 4, 5, 6, 7, 8);
+  jvm.debugManager.enable();
+  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  t.notOk(result.handled, 'live debugger guards still run with cached linkage');
+  t.equal(caller.stack.items.length, 8, 'a cached-linkage fallback preserves operands');
+  jvm.debugManager.disable();
+
+  wrapper.attributes[0].code.codeItems = codeItems.slice();
+  jvm.classEpoch += 1;
+  result = jvm.jit.fusedRegions.tryInvoke(site, target, caller, thread);
+  t.notOk(result.handled, 'a class lifecycle change revalidates bytecode identity');
+  t.equal(linkageLookups, 2, 'the advanced epoch performs dependency lookup again');
+  t.equal(sideEffects, 2, 'failed revalidation occurs before fused side effects');
+  t.equal(caller.stack.items.length, 8, 'failed revalidation preserves caller operands');
+  t.equal(jvm.jit.fusedRunCount, 2, 'successful fused executions are counted');
+  t.equal(jvm.jit.fusedGuardedFallbackCount, 4, 'all guarded fallbacks are counted');
   t.end();
 });
 
