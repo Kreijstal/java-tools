@@ -105,6 +105,26 @@ test.describe('Java tools IDE', () => {
     );
   });
 
+  test('debugging highlights the paused source line in the editor', async ({ page }) => {
+    // Debug the seeded Main.java: it pauses on entry of main(), whose first
+    // statement (the println) is on line 3 of the seed source.
+    await page.evaluate(() => window.javaToolsIde.actions.debugPath('/src/Main.java'));
+    await expect(page.locator('.ide-debug-line')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('#executionState')).toContainText('Main.java:3');
+
+    const markerRow = await page.evaluate(() => {
+      const doc = window.javaToolsIde.documents.getDocument('/src/Main.java');
+      const markers = doc.editor.session.getMarkers();
+      const marker = Object.values(markers).find((m) => m.clazz === 'ide-debug-line');
+      return marker ? marker.range.start.row : null;
+    });
+    expect(markerRow).toBe(2); // 0-based row for source line 3
+
+    // Running to completion must clear the highlight.
+    await page.evaluate(() => window.continue_());
+    await expect(page.locator('.ide-debug-line')).toHaveCount(0, { timeout: 20000 });
+  });
+
   test('boots without console errors', async ({ page }) => {
     const errors = [];
     page.on('console', (message) => {

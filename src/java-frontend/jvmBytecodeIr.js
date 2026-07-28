@@ -1256,6 +1256,21 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
   let hasExplicitReturn = false;
 
   function emitOp(op) {
+    // Propagate the Java IR op's source line onto every instruction it emits.
+    // Nested ops (loop/if bodies) run their own emitOp first, so instructions
+    // they already tagged keep their more specific line.
+    const startIndex = instructions.length;
+    emitOpInner(op);
+    if (typeof op.sourceLine === 'number') {
+      for (let index = startIndex; index < instructions.length; index += 1) {
+        if (typeof instructions[index].sourceLine !== 'number') {
+          instructions[index].sourceLine = op.sourceLine;
+        }
+      }
+    }
+  }
+
+  function emitOpInner(op) {
     if (op.op === 'println' || op.op === 'print') {
       let descriptor = '()V';
       let argStack = 0;

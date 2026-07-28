@@ -137,6 +137,7 @@ function createEditorComponent(container, state) {
     if (doc.editor) doc.editor.resize();
   });
   container.on('destroy', () => {
+    if (debugHighlight.doc === doc) debugHighlight = { doc: null, markerId: null };
     if (doc.editor) doc.editor.destroy();
     openDocuments.delete(doc.path);
     if (activeDocumentPath === doc.path) activeDocumentPath = null;
@@ -273,6 +274,50 @@ function renameOpenDocuments(oldPath, newPath) {
   }
 }
 
+// ---------- Debug current-line highlight ----------
+
+let debugHighlight = { doc: null, markerId: null };
+
+function clearSourceHighlight() {
+  if (debugHighlight.doc && debugHighlight.doc.editor && debugHighlight.markerId !== null) {
+    try {
+      debugHighlight.doc.editor.session.removeMarker(debugHighlight.markerId);
+    } catch (error) {
+      // The editor may already be destroyed; nothing to clean up then.
+    }
+  }
+  debugHighlight = { doc: null, markerId: null };
+}
+
+/**
+ * Highlight the paused line in the given source file, opening it if needed.
+ * Activates the tab without stealing keyboard focus from the debug controls.
+ */
+function highlightSourceLine(filePath, line) {
+  clearSourceHighlight();
+  const path = normalizePath(filePath);
+  let doc = openDocuments.get(path);
+  if (!doc) {
+    doc = openFile(path);
+  } else if (!context.mobileLayout) {
+    const item = doc.container.parent;
+    const stack = item && item.parentItem;
+    if (stack && typeof stack.setActiveComponentItem === 'function') {
+      stack.setActiveComponentItem(item, false);
+    }
+  }
+  if (!doc || !doc.editor) return;
+  const Range = window.ace.require('ace/range').Range;
+  const row = Math.max(0, line - 1);
+  const markerId = doc.editor.session.addMarker(
+    new Range(row, 0, row, Number.MAX_SAFE_INTEGER),
+    'ide-debug-line',
+    'fullLine',
+  );
+  doc.editor.scrollToLine(row, true, false, () => {});
+  debugHighlight = { doc, markerId };
+}
+
 module.exports = {
   createEditorComponent,
   openFile,
@@ -284,4 +329,6 @@ module.exports = {
   renameOpenDocuments,
   reloadClassViewer,
   findEditorStack,
+  highlightSourceLine,
+  clearSourceHighlight,
 };

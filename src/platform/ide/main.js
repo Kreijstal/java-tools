@@ -31,6 +31,27 @@ window.addEventListener('javatools:class-loaded', (event) => {
   lastLoadedClassPath = (event.detail && event.detail.classPath) || lastLoadedClassPath;
 });
 
+// Source-level debugging: whenever the debugger pauses on a PC that maps to a
+// source line (LineNumberTable), highlight that line in the backing .java.
+window.addEventListener('javatools:debug-state', (event) => {
+  const state = event.detail || {};
+  if (
+    state.executionState === 'paused'
+    && typeof state.sourceLine === 'number'
+    && state.sourceFile
+    && state.className
+  ) {
+    const sourcePath = actions.findSourceFileForClass(state.className, state.sourceFile);
+    if (sourcePath) {
+      documents.highlightSourceLine(sourcePath, state.sourceLine);
+      return;
+    }
+  }
+  if (state.executionState !== 'paused') {
+    documents.clearSourceHighlight();
+  }
+});
+
 // ---------- Layout ----------
 
 const panelHandles = new Map(); // panel key -> ComponentItem

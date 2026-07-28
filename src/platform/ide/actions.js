@@ -223,6 +223,40 @@ function debugPath(filePath) {
   return runPath(filePath, { debug: true });
 }
 
+/**
+ * Locate the workspace source file for a paused class: resolve the class file
+ * through the classpath, step out of its package directory, and look for the
+ * SourceFile name there; fall back to a workspace-wide basename search.
+ */
+function findSourceFileForClass(className, sourceFileName) {
+  const workspace = context.workspace;
+  if (!workspace || !sourceFileName) return null;
+  try {
+    const resolved = jvm().fileProvider.resolveVirtualPath(`${className}.class`);
+    if (resolved) {
+      let dir = parentPath(normalizePath(resolved));
+      const packagePath = className.includes('/')
+        ? className.slice(0, className.lastIndexOf('/'))
+        : '';
+      if (packagePath && dir.endsWith(`/${packagePath}`)) {
+        dir = dir.slice(0, dir.length - packagePath.length - 1) || '/';
+      }
+      const candidate = joinPath(dir, sourceFileName);
+      if (workspace.existsSync(candidate)) return candidate;
+    }
+  } catch (error) {
+    // Fall through to the workspace-wide search.
+  }
+  const suffix = `/${sourceFileName}`;
+  for (const relativePath of workspace.listFiles('/')) {
+    const absolute = normalizePath(relativePath);
+    if (absolute.endsWith(suffix) || absolute === normalizePath(sourceFileName)) {
+      return absolute;
+    }
+  }
+  return null;
+}
+
 module.exports = {
   compileJavaFile,
   assembleJasminFile,
@@ -232,4 +266,5 @@ module.exports = {
   runPath,
   debugPath,
   internalNameOfClassFile,
+  findSourceFileForClass,
 };

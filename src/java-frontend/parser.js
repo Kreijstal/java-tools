@@ -1156,6 +1156,17 @@ class ParserImpl {
   }
 
   parseStatement() {
+    // Stamp every statement with the position of its first token so later
+    // stages (LineNumberTable emission) know which source line it came from.
+    const startToken = this.peek();
+    const statement = this.parseStatementInner();
+    if (statement && !statement.range && startToken && startToken.range) {
+      statement.range = startToken.range;
+    }
+    return statement;
+  }
+
+  parseStatementInner() {
     const token = this.peek();
     if (!token) {
       return ast.createNode('UnsupportedStatement', { reason: 'end-of-input-statement' });

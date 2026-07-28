@@ -3154,9 +3154,15 @@ class JVM {
       label: instructionLabel,
     };
   }
-  getSourceFileName(method) {
-    /* HARDENED: Implemented stub */
-    throw new Error("getSourceFileName is not implemented");
+  getSourceFileName(className) {
+    const classData = this.classes[className];
+    if (!classData || !classData.ast || !classData.ast.classes) return null;
+    const item = classData.ast.classes[0].items.find(
+      (entry) => entry.attribute && entry.attribute.type === "sourcefile",
+    );
+    if (!item || item.attribute.value === undefined) return null;
+    // convert_tree stores the SourceFile constant with surrounding quotes.
+    return String(item.attribute.value).replace(/^"|"$/g, "");
   }
 
   getDisassemblyView() {

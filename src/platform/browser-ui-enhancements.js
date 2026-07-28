@@ -1608,8 +1608,14 @@ function updateDebugDisplay() {
       const breakpoints = jvmDebug.getBreakpoints
         ? jvmDebug.getBreakpoints()
         : [];
-      statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null && state.pc !== undefined ? state.pc : ""}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + state.method.descriptor : "N/A"}</span></div><div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div><div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${breakpoints.join(", ")}]</span></div>`;
+      const sourcePosition = typeof state.sourceLine === "number"
+        ? `<div class="state-item"><span class="key">Source:</span> <span class="value">${state.sourceFile || "?"}:${state.sourceLine}</span></div>`
+        : "";
+      statusDiv.innerHTML = `<div class="state-item"><span class="key">Status:</span> <span class="value">${state.executionState}</span></div><div class="state-item"><span class="key">PC:</span> <span class="value">${state.pc !== null && state.pc !== undefined ? state.pc : ""}</span></div><div class="state-item"><span class="key">Method:</span> <span class="value">${state.method ? state.method.name + state.method.descriptor : "N/A"}</span></div>${sourcePosition}<div class="state-item"><span class="key">Call Depth:</span> <span class="value">${state.callStackDepth}</span></div><div class="state-item"><span class="key">Breakpoints:</span> <span class="value">[${breakpoints.join(", ")}]</span></div>`;
     }
+
+    // Let embedding UIs (the IDE shell) react to the new debug position.
+    window.dispatchEvent(new CustomEvent("javatools:debug-state", { detail: state }));
 
     // Update thread dropdown
     const threadSelect = document.getElementById("threadSelect");

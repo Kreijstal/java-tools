@@ -490,6 +490,14 @@ body.ide-body {
   min-height: 0;
 }
 
+/* Current-line highlight while the debugger is paused (ace fullLine marker) */
+.ide-debug-line {
+  position: absolute;
+  background: rgba(86, 156, 214, 0.22);
+  border-left: 2px solid var(--ide-warning);
+  z-index: 4;
+}
+
 /* ---------- Dialogs ---------- */
 
 dialog.ide-dialog {

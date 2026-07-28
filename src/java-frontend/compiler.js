@@ -962,6 +962,32 @@ function localVariableTable(method, instructions) {
   return entries.length ? { type: 'localvariabletable', vars: entries } : null;
 }
 
+function lineNumberTable(instructions) {
+  const entries = [];
+  let previousLine = null;
+  instructions.forEach((instruction, index) => {
+    const line = instruction.sourceLine;
+    if (typeof line !== 'number' || line === previousLine) return;
+    // Same label precedence as formatInstruction so the entry references the
+    // label under which the instruction was actually rendered.
+    const label = instruction.label
+      || (typeof instruction.offset === 'number' ? `L${instruction.offset}` : `L${index}`);
+    entries.push({ label, lineNumber: line });
+    previousLine = line;
+  });
+  return entries;
+}
+
+function lineNumberTableLines(instructions) {
+  const entries = lineNumberTable(instructions || []);
+  if (!entries.length) return [];
+  return [
+    '    .linenumbertable',
+    ...entries.map((entry) => `        ${entry.label} ${entry.lineNumber}`),
+    '    .end linenumbertable',
+  ];
+}
+
 function localVariableTableLines(attribute) {
   if (!attribute || !Array.isArray(attribute.vars) || !attribute.vars.length) return [];
   return [
@@ -990,6 +1016,7 @@ function methodLines(method) {
       const catchType = entry.catchType || entry.catch_type || 'any';
       lines.push(`    .catch ${jasminUtf(catchType)} from ${entry.startLabel} to ${entry.endLabel} using ${entry.handlerLabel}`);
     }
+    lines.push(...lineNumberTableLines(method.instructions || []));
     lines.push(...localVariableTableLines(localVariableTable(method, method.instructions || [])));
     lines.push('    .end code');
   }
