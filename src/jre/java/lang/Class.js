@@ -13,6 +13,37 @@ function classNameFor(classObj) {
 function runtimeClassName(obj) {
   return obj && (obj._className || obj.type);
 }
+
+function descriptorForClassObject(classObj) {
+  if (!classObj) return '';
+  if (classObj.isPrimitive) {
+    const primitiveDescriptors = {
+      int: 'I',
+      long: 'J',
+      double: 'D',
+      float: 'F',
+      char: 'C',
+      short: 'S',
+      byte: 'B',
+      boolean: 'Z',
+    };
+    const descriptor = primitiveDescriptors[classObj.name];
+    if (descriptor) return descriptor;
+    throw {
+      type: 'java/lang/IllegalArgumentException',
+      message: `Unknown primitive type: ${classObj.name}`,
+    };
+  }
+  const className = classNameFor(classObj);
+  if (!className) {
+    throw {
+      type: 'java/lang/IllegalArgumentException',
+      message: 'Class has no runtime name',
+    };
+  }
+  return className.startsWith('[') ? className : `L${className};`;
+}
+
 const { withThrows } = require('../../helpers');
 
 module.exports = {
@@ -256,29 +287,8 @@ module.exports = {
       const methodName = String(args[0]);
       const paramTypes = args[1];
 
-      const getDescriptor = (paramClass) => {
-        if (!paramClass) return '';
-        if (paramClass.isPrimitive) {
-          switch (paramClass.name) {
-            case 'int': return 'I';
-            case 'long': return 'J';
-            case 'double': return 'D';
-            case 'float': return 'F';
-            case 'char': return 'C';
-            case 'short': return 'S';
-            case 'byte': return 'B';
-            case 'boolean': return 'Z';
-            default:
-              throw {
-                type: 'java/lang/IllegalArgumentException',
-                message: `Unknown primitive type: ${paramClass.name}`,
-              };
-          }
-        }
-        const paramClassName = paramClass._classData.ast.classes[0].className;
-        return `L${paramClassName};`;
-      };
-      const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;
+      const targetDescriptor =
+        `(${paramTypes.map(descriptorForClassObject).join('')})`;
 
       let currentClass = classObj._classData;
       while (currentClass) {
@@ -329,30 +339,8 @@ module.exports = {
       const classData = classObj._classData;
       const methods = classData.ast.classes[0].items.filter(item => item.type === 'method');
 
-      const getDescriptor = (paramClass) => {
-        if (!paramClass) return '';
-        if (paramClass.isPrimitive) {
-          switch (paramClass.name) {
-            case 'int': return 'I';
-            case 'long': return 'J';
-            case 'double': return 'D';
-            case 'float': return 'F';
-            case 'char': return 'C';
-            case 'short': return 'S';
-            case 'byte': return 'B';
-            case 'boolean': return 'Z';
-            default:
-              throw {
-                type: 'java/lang/IllegalArgumentException',
-                message: `Unknown primitive type: ${paramClass.name}`,
-              };
-          }
-        }
-        const paramClassName = paramClass._classData.ast.classes[0].className;
-        return `L${paramClassName};`;
-      };
-
-      const targetDescriptor = `(${paramTypes.map(getDescriptor).join('')})`;
+      const targetDescriptor =
+        `(${paramTypes.map(descriptorForClassObject).join('')})`;
       
       const method = methods.find(m => {
         const d = m.method.descriptor;

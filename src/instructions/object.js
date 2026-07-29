@@ -30,6 +30,7 @@ function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
 // check keeps synthetic/JRE objects with unusual layouts on the full resolver.
 const resolvedInstanceFieldKey = Symbol('resolvedInstanceFieldKey');
 const resolvedStaticFieldSite = Symbol('resolvedStaticFieldSite');
+const resolvedStaticInitialization = Symbol('resolvedStaticInitialization');
 const SYNC_STATIC_FALLBACK = Symbol('syncStaticFallback');
 function resolveInstanceFieldKeyAtSite(jvm, objRef, instruction, className, fieldName) {
   if (instruction && typeof instruction === 'object') {
@@ -116,7 +117,23 @@ function readStaticFieldSite(jvm, site) {
 
 function getstaticSync(frame, instruction, jvm, thread) {
   const [_, className, [fieldName, descriptor]] = instruction.arg;
-  const state = jvm.classInitializationState.get(className);
+  let initialization = instruction && instruction[resolvedStaticInitialization];
+  if (!initialization || initialization.jvm !== jvm) {
+    initialization = {
+      jvm,
+      token: jvm.getClassInitializationToken(className),
+    };
+    if (instruction && typeof instruction === 'object') {
+      try {
+        Object.defineProperty(instruction, resolvedStaticInitialization, {
+          configurable: true, writable: true, value: initialization,
+        });
+      } catch (_) {
+        // Frozen diagnostic fixtures retain the uncached token lookup.
+      }
+    }
+  }
+  const state = initialization.token.state;
   if (state !== 'INITIALIZED' &&
       !(state === 'INITIALIZING' &&
         jvm.classInitializationOwners.get(className) === thread.id)) {

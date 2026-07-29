@@ -1,7 +1,11 @@
 'use strict';
 
 const test = require('tape');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
+const { JVM } = require('../src/core/jvm');
 
 const File = require('../src/jre/java/io/File');
 const FileInputStream = require('../src/jre/java/io/FileInputStream');
@@ -56,6 +60,145 @@ test('Class.newInstance reports InstantiationException for primitive classes', a
     error = caught;
   }
   t.equal(error && error.type, 'java/lang/InstantiationException');
+  t.end();
+});
+
+test('Class reflective method lookup preserves array parameter descriptors', async (t) => {
+  const method = {
+    name: 'mix',
+    descriptor: '([II)V',
+    flags: ['public'],
+  };
+  const owner = {
+    type: 'java/lang/Class',
+    _classData: {
+      ast: {
+        classes: [{
+          className: 'AudioScheduler',
+          superClassName: null,
+          items: [{ type: 'method', method }],
+        }],
+      },
+    },
+  };
+  const intArray = {
+    type: 'java/lang/Class',
+    className: '[I',
+    _classData: {
+      isArray: true,
+      className: '[I',
+      componentType: 'I',
+    },
+  };
+  const intClass = { isPrimitive: true, name: 'int' };
+  const parameters = [intArray, intClass];
+
+  const declared = Class.methods[
+    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+  ]({}, owner, ['mix', parameters]);
+  const inherited = await Class.methods[
+    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+  ]({}, owner, ['mix', parameters]);
+
+  t.equal(declared._methodData, method,
+    'declared lookup encodes int[] as [I rather than L[I;');
+  t.equal(inherited._methodData, method,
+    'public lookup uses the same array descriptor encoding');
+  t.end();
+});
+
+test('reflective constructors run their body through nested calls', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(),
+    'jvm-reflective-constructor-'));
+  t.teardown(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'ReflectiveConstructorHarness.java');
+  fs.writeFileSync(source, `
+public final class ReflectiveConstructorHarness {
+  static int result;
+  private static final class Value {
+    int value;
+    private Value(int input) {
+      super();
+      value = adjust(input);
+    }
+    private int adjust(int input) {
+      return input * 3;
+    }
+  }
+  public static void main(String[] args) throws Exception {
+    java.lang.reflect.Constructor<Value> constructor =
+      Value.class.getDeclaredConstructor(int.class);
+    constructor.setAccessible(true);
+    result = constructor.newInstance(Integer.valueOf(7)).value;
+  }
+}
+`);
+  execFileSync('javac', ['-source', '8', '-target', '8', '-d', directory,
+    source], { stdio: 'ignore' });
+  const jvm = new JVM({ classpath: directory, jit: { enabled: false } });
+  await jvm.run('ReflectiveConstructorHarness');
+  t.equal(jvm.classes.ReflectiveConstructorHarness.staticFields.get('result:I'),
+    21, 'the requested constructor, super call, and nested helper all finish');
+  t.end();
+});
+
+test('generated void methods complete reflective calls with a null result', async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(),
+    'jvm-reflective-generated-void-'));
+  t.teardown(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const source = path.join(directory, 'ReflectiveGeneratedVoidHarness.java');
+  fs.writeFileSync(source, `
+public final class ReflectiveGeneratedVoidHarness {
+  static int result;
+  static int calls;
+  static int valueAfter;
+  static int nullResult;
+  private void fill(int[] values, int increment) {
+    calls++;
+    values[2] += increment;
+  }
+  public static void main(String[] args) throws Exception {
+    ReflectiveGeneratedVoidHarness owner =
+      new ReflectiveGeneratedVoidHarness();
+    java.lang.reflect.Method method =
+      ReflectiveGeneratedVoidHarness.class.getDeclaredMethod(
+        "fill", int[].class, int.class);
+    method.setAccessible(true);
+    int[] values = { 1, 2, 3 };
+    Object returned = method.invoke(owner, values, Integer.valueOf(7));
+    valueAfter = values[2];
+    nullResult = returned == null ? 1 : 0;
+    result = calls * 100 + nullResult * 10 + valueAfter;
+  }
+}
+`);
+  execFileSync('javac', ['-source', '8', '-target', '8', '-d', directory,
+    source], { stdio: 'ignore' });
+  const jvm = new JVM({ classpath: directory, jit: {
+    warmupThreshold: 0,
+    preferWholeMethodJs: true,
+  } });
+  await jvm.run('ReflectiveGeneratedVoidHarness');
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('calls:I'),
+    1,
+    'the reflected target runs once',
+  );
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('nullResult:I'),
+    1,
+    'Method.invoke observes the generated void return as null',
+  );
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('valueAfter:I'),
+    10,
+    'the reflected target receives the original array and boxed integer',
+  );
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('result:I'),
+    120,
+    'the generated target returns null to Method.invoke before caller pop/branch',
+  );
   t.end();
 });
 

@@ -38,6 +38,8 @@ function syncSiteState(instruction, descriptor) {
     target0: undefined,
     receiverClass1: null,
     target1: undefined,
+    initializationJvm: null,
+    initializationToken: null,
   };
   if (instruction && typeof instruction === 'object') {
     try {
@@ -136,7 +138,11 @@ function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
     state.target1 = undefined;
   }
   if (kind === 'static') {
-    const init = jvm.classInitializationState.get(className);
+    if (state.initializationJvm !== jvm) {
+      state.initializationJvm = jvm;
+      state.initializationToken = jvm.getClassInitializationToken(className);
+    }
+    const init = state.initializationToken.state;
     if (init !== 'INITIALIZED' &&
         !(init === 'INITIALIZING' &&
           jvm.classInitializationOwners.get(className) === thread.id)) {

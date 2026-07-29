@@ -49,6 +49,25 @@ function _aload(frame, kind) {
   const arrayRef = frame.stack.pop();
 
   if (arrayRef === null || arrayRef === undefined) {
+    if (typeof process !== "undefined" && process.env &&
+        process.env.JVM_DEBUG_NULL_ARRAY === "1") {
+      const receiver = frame.locals && frame.locals[0];
+      const fields = receiver && receiver.fields
+        ? Object.fromEntries(Object.entries(receiver.fields).map(([key, fieldValue]) => [
+          key,
+          diagnosticScalar(fieldValue),
+        ]))
+        : null;
+      console.error("[null-array-load]", JSON.stringify({
+        owner: diagnosticScalar(frame.className),
+        method: `${frame.method && frame.method.name}${frame.method && frame.method.descriptor || ""}`,
+        pc: frame.pc - 1,
+        index: diagnosticScalar(index),
+        receiverType: diagnosticScalar(receiver && receiver.type),
+        fields,
+        locals: (frame.locals || []).map(diagnosticScalar),
+      }));
+    }
     throw {
       type: "java/lang/NullPointerException",
       message: `Attempted to load from null array in ${frame.method.name}`,

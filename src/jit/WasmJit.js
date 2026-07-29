@@ -77,6 +77,7 @@ const {
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   MATH_INTRINSICS,
+  mathIntrinsicFunction,
   Unsupported,
   NestedDeopt,
   isGuestThrow,
@@ -504,10 +505,8 @@ class MethodTranslator {
     }
     const wParams = params.map(descToWasm);
     const wRet = descToWasm(ret);
-    const jsFn = Math[name];
-    const fn = ret === 'F'
-      ? (...args) => Math.fround(jsFn(...args))
-      : (...args) => jsFn(...args);
+    const fn = mathIntrinsicFunction(name, descriptor);
+    if (!fn) throw new Unsupported(`Math.${name}${descriptor} unsupported`);
     return {
       params: wParams,
       ret: wRet,

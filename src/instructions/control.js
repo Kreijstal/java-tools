@@ -18,6 +18,19 @@ function targetPcFor(frame, label) {
   return target === undefined ? -1 : target;
 }
 
+function isReflectiveTarget(thread, frame) {
+  return thread.isAwaitingReflectiveCall &&
+    (!thread.reflectiveCallFrame || thread.reflectiveCallFrame === frame);
+}
+
+function completeReflectiveCall(thread, value) {
+  const resolver = thread.reflectiveCallResolver;
+  thread.isAwaitingReflectiveCall = false;
+  thread.reflectiveCallResolver = null;
+  thread.reflectiveCallFrame = null;
+  resolver(value);
+}
+
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
     if (thread.pendingException) {
@@ -25,9 +38,8 @@ module.exports = {
     }
     thread.callStack.pop();
     jvm.completeClassInitialization(frame);
-    if (thread.isAwaitingReflectiveCall) {
-      thread.reflectiveCallResolver(null);
-      thread.isAwaitingReflectiveCall = false;
+    if (isReflectiveTarget(thread, frame)) {
+      completeReflectiveCall(thread, null);
     }
   },
   ireturn: (frame, instruction, jvm, thread) => {
@@ -36,9 +48,8 @@ module.exports = {
     }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
-    if (thread.isAwaitingReflectiveCall) {
-      thread.reflectiveCallResolver(returnValue);
-      thread.isAwaitingReflectiveCall = false;
+    if (isReflectiveTarget(thread, frame)) {
+      completeReflectiveCall(thread, returnValue);
     } else if (!thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(returnValue);
     }
@@ -49,9 +60,8 @@ module.exports = {
     }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
-    if (thread.isAwaitingReflectiveCall) {
-      thread.reflectiveCallResolver(returnValue);
-      thread.isAwaitingReflectiveCall = false;
+    if (isReflectiveTarget(thread, frame)) {
+      completeReflectiveCall(thread, returnValue);
     } else if (!thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(returnValue);
     }
@@ -353,9 +363,8 @@ module.exports = {
       }
       const returnValue = frame.stack.pop();
       thread.callStack.pop();
-      if (thread.isAwaitingReflectiveCall) {
-        thread.reflectiveCallResolver(returnValue);
-        thread.isAwaitingReflectiveCall = false;
+      if (isReflectiveTarget(thread, frame)) {
+        completeReflectiveCall(thread, returnValue);
       } else if (!thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(returnValue);
       }
@@ -366,9 +375,8 @@ module.exports = {
       }
       const returnValue = frame.stack.pop();
       thread.callStack.pop();
-      if (thread.isAwaitingReflectiveCall) {
-        thread.reflectiveCallResolver(returnValue);
-        thread.isAwaitingReflectiveCall = false;
+      if (isReflectiveTarget(thread, frame)) {
+        completeReflectiveCall(thread, returnValue);
       } else if (!thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(returnValue);
       }
@@ -379,9 +387,8 @@ module.exports = {
       }
       const returnValue = frame.stack.pop();
       thread.callStack.pop();
-      if (thread.isAwaitingReflectiveCall) {
-        thread.reflectiveCallResolver(returnValue);
-        thread.isAwaitingReflectiveCall = false;
+      if (isReflectiveTarget(thread, frame)) {
+        completeReflectiveCall(thread, returnValue);
       } else if (!thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(returnValue);
       }

@@ -250,6 +250,30 @@ const MATH_INTRINSICS = new Set([
   'sqrt', 'pow', 'floor', 'ceil', 'log', 'exp',
 ]);
 
+function mathIntrinsicFunction(name, descriptor) {
+  const { params, ret } = parseMethodDescriptor(descriptor);
+  if (ret === 'J' || params.includes('J')) {
+    // WebAssembly i64 imports receive and return BigInt. JavaScript Math
+    // rejects BigInt, and converting through Number would lose exact long
+    // values. Java Math exposes only these three long overloads.
+    if (name === 'abs' && descriptor === '(J)J') {
+      return (value) => BigInt.asIntN(64, value < 0n ? -value : value);
+    }
+    if (name === 'max' && descriptor === '(JJ)J') {
+      return (left, right) => left > right ? left : right;
+    }
+    if (name === 'min' && descriptor === '(JJ)J') {
+      return (left, right) => left < right ? left : right;
+    }
+    return null;
+  }
+  const jsFn = Math[name];
+  if (typeof jsFn !== 'function') return null;
+  return ret === 'F'
+    ? (...args) => Math.fround(jsFn(...args))
+    : (...args) => jsFn(...args);
+}
+
 // Control-flow exception (per-block demotion, callee-link deferral, whole-
 // method rejection) thrown thousands of times per boot: V8's stack capture in
 // the Error constructor was ~1s of a profiled run, so skip it — nothing ever
@@ -423,6 +447,7 @@ module.exports = {
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   MATH_INTRINSICS,
+  mathIntrinsicFunction,
   Unsupported,
   NestedDeopt,
   isGuestThrow,
