@@ -987,6 +987,11 @@ function writeAnnotationElementValue(writer, elementValue, builder) {
     writer.writeUint16(builder.addUtf8(parseStringLiteral(elementValue.constName || '')));
     return;
   }
+  if (type === 'class') {
+    writer.writeUint8('c'.charCodeAt(0));
+    writer.writeUint16(builder.addUtf8(parseStringLiteral(value || '')));
+    return;
+  }
   writer.writeUint8('s'.charCodeAt(0));
   writer.writeUint16(builder.addUtf8(parseStringLiteral(value || '')));
 }

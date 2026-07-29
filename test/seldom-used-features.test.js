@@ -33,6 +33,16 @@ Is private: true
 Is static: false`,
   },
   {
+    name: "AnnotationClassLiteralTest",
+    description:
+      "Annotations resolve reference, primitive class literals and enums",
+    shouldFail: false,
+    expectedOutput: `=== Annotation Class Literal Test ===
+Type: java.lang.String
+Primitive: int
+Level: HIGH`,
+  },
+  {
     name: "TryWithResourcesTest",
     description: "Try-with-resources and suppressed exceptions - should pass",
     shouldFail: false,

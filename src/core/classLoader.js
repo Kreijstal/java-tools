@@ -70,6 +70,27 @@ function parseAnnotationsFromAst(ast) {
     /* HARDENED: Replaced quiet failure with an explicit error */
     throw new Error(`resolveString failed: unhandled constant pool entry type ${entry.tag}`);
   }
+
+  function classDescriptorToInternalName(descriptor) {
+    if (typeof descriptor !== 'string') {
+      return null;
+    }
+    if (descriptor.startsWith('L') && descriptor.endsWith(';')) {
+      return descriptor.slice(1, -1);
+    }
+    const primitiveMap = {
+      Z: 'boolean',
+      B: 'byte',
+      C: 'char',
+      S: 'short',
+      I: 'int',
+      J: 'long',
+      F: 'float',
+      D: 'double',
+      V: 'void',
+    };
+    return primitiveMap[descriptor] || descriptor;
+  }
   
   // Helper function to resolve annotation element values
   function resolveAnnotationValue(tag, valueIndex) {
@@ -86,15 +107,54 @@ function parseAnnotationsFromAst(ast) {
         throw new Error(`resolveAnnotationValue failed: expected string at index ${valueIndex}, but found tag ${entry.tag}`);
       }
       return entry.info.bytes;
-    } else if (tag === 73) { // 'I' - Integer
-      /* HARDENED: Replaced quiet failure with an explicit error */
-      if (entry.tag !== 3) {
-        throw new Error(`resolveAnnotationValue failed: expected integer at index ${valueIndex}, but found tag ${entry.tag}`);
-      }
+    }
+
+    if (tag === 73 || tag === 74 || tag === 68 || tag === 70 ||
+        tag === 90 || tag === 66 || tag === 67 || tag === 83) {
       return entry.info.bytes;
     }
     
     return entry.info;
+  }
+
+  function parseAnnotationElementValue(tag, value) {
+    const tagChar = typeof tag === 'number' ? String.fromCharCode(tag) : tag;
+
+    if (tagChar === 'e') {
+      const descriptor = resolveString(value.type_name_index);
+      return {
+        type: 'enum',
+        descriptor,
+        className: classDescriptorToInternalName(descriptor),
+        constName: resolveString(value.const_name_index),
+      };
+    }
+
+    if (tagChar === 'c') {
+      const descriptor = resolveString(value.class_info_index);
+      return {
+        type: 'class',
+        descriptor,
+        className: classDescriptorToInternalName(descriptor),
+      };
+    }
+
+    if (tagChar === '@') {
+      return {
+        type: 'annotation',
+        annotationValue: parseAnnotation(value.annotation_value || value),
+      };
+    }
+
+    if (tagChar === '[') {
+      return (value.values || []).map(element =>
+        parseAnnotationElementValue(element.tag, element.value));
+    }
+
+    if (value && value.const_value_index !== undefined) {
+      return resolveAnnotationValue(tag, value.const_value_index);
+    }
+    return null;
   }
   
   // Helper function specifically for annotation type resolution
@@ -116,47 +176,21 @@ function parseAnnotationsFromAst(ast) {
     
     return resolveString(index);
   }
-  
-  // Parse class-level annotations from the new AST structure
-  if (ast.ast.attributes) {
-    ast.ast.attributes.forEach(attr => {
-      /* HARDENED: Replaced defensive optional chaining with direct access */
-      const attrName = attr.attribute_name_index.name.info.bytes;
-      if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-        result.classAnnotations = attr.info.annotations.map(annotation => {
-          const typeName = resolveAnnotationType(annotation.type_index);
-          const elements = {};
 
-          if (annotation.element_value_pairs) {
-            annotation.element_value_pairs.forEach(pair => {
-              const elementName = resolveString(pair.element_name_index);
-
-              // Parse element value based on tag
-              const tag = pair.value.tag;
-              let elementValue;
-              if (tag === 101) { // 'e' - Enum
-                elementValue = {
-                  type: 'enum',
-                  typeName: resolveString(pair.value.value.type_name_index),
-                  constName: resolveString(pair.value.value.const_name_index),
-                };
-              } else {
-                elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-              }
-
-              if (elementName && elementValue !== undefined) {
-                elements[elementName] = elementValue;
-              }
-            });
-          }
-
-          return {
-            type: typeName,
-            elements: elements
-          };
-        });
+  function parseAnnotation(annotation) {
+    const elements = {};
+    for (const pair of annotation.element_value_pairs || []) {
+      const elementName = resolveString(pair.element_name_index);
+      const elementValue = parseAnnotationElementValue(
+        pair.value.tag, pair.value.value);
+      if (elementName && elementValue !== undefined && elementValue !== null) {
+        elements[elementName] = elementValue;
       }
-    });
+    }
+    return {
+      type: resolveAnnotationType(annotation.type_index),
+      elements,
+    };
   }
 
   // Parse class-level annotations from the new AST structure
@@ -165,38 +199,7 @@ function parseAnnotationsFromAst(ast) {
       /* HARDENED: Replaced defensive optional chaining with direct access */
       const attrName = attr.attribute_name_index.name.info.bytes;
       if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-        result.classAnnotations = attr.info.annotations.map(annotation => {
-          const typeName = resolveAnnotationType(annotation.type_index);
-          const elements = {};
-
-          if (annotation.element_value_pairs) {
-            annotation.element_value_pairs.forEach(pair => {
-              const elementName = resolveString(pair.element_name_index);
-
-              // Parse element value based on tag
-              const tag = pair.value.tag;
-              let elementValue;
-              if (tag === 101) { // 'e' - Enum
-                elementValue = {
-                  type: 'enum',
-                  typeName: resolveString(pair.value.value.type_name_index),
-                  constName: resolveString(pair.value.value.const_name_index),
-                };
-              } else {
-                elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-              }
-
-              if (elementName && elementValue !== undefined) {
-                elements[elementName] = elementValue;
-              }
-            });
-          }
-
-          return {
-            type: typeName,
-            elements: elements
-          };
-        });
+        result.classAnnotations = attr.info.annotations.map(parseAnnotation);
       }
     });
   }
@@ -211,38 +214,8 @@ function parseAnnotationsFromAst(ast) {
           /* HARDENED: Replaced defensive optional chaining with direct access */
           const attrName = attr.attribute_name_index.name.info.bytes;
           if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-            result.fieldAnnotations[fieldName] = attr.info.annotations.map(annotation => {
-              const typeName = resolveAnnotationType(annotation.type_index);
-              const elements = {};
-              
-              if (annotation.element_value_pairs) {
-                annotation.element_value_pairs.forEach(pair => {
-                  const elementName = resolveString(pair.element_name_index);
-                  
-                  // Parse element value based on tag
-                  const tag = pair.value.tag;
-                  let elementValue;
-                  if (tag === 101) { // 'e' - Enum
-                    elementValue = {
-                      type: 'enum',
-                      typeName: resolveString(pair.value.value.type_name_index),
-                      constName: resolveString(pair.value.value.const_name_index),
-                    };
-                  } else {
-                    elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-                  }
-                  
-                  if (elementName && elementValue !== undefined) {
-                    elements[elementName] = elementValue;
-                  }
-                });
-              }
-              
-              return {
-                type: typeName,
-                elements: elements
-              };
-            });
+            result.fieldAnnotations[fieldName] =
+              attr.info.annotations.map(parseAnnotation);
           }
         });
       }
@@ -259,37 +232,8 @@ function parseAnnotationsFromAst(ast) {
           /* HARDENED: Replaced defensive optional chaining with direct access */
           const attrName = attr.attribute_name_index.name.info.bytes;
           if (attrName === 'RuntimeVisibleAnnotations' && attr.info.annotations) {
-            result.methodAnnotations[methodName] = attr.info.annotations.map(annotation => {
-              const typeName = resolveAnnotationType(annotation.type_index);
-              const elements = {};
-              
-              if (annotation.element_value_pairs) {
-                annotation.element_value_pairs.forEach(pair => {
-                  const elementName = resolveString(pair.element_name_index);
-                  
-                  const tag = pair.value.tag;
-                  let elementValue;
-                  if (tag === 101) { // 'e' - Enum
-                    elementValue = {
-                      type: 'enum',
-                      typeName: resolveString(pair.value.value.type_name_index),
-                      constName: resolveString(pair.value.value.const_name_index),
-                    };
-                  } else {
-                    elementValue = resolveAnnotationValue(tag, pair.value.value.const_value_index);
-                  }
-                  
-                  if (elementName && elementValue !== undefined) {
-                    elements[elementName] = elementValue;
-                  }
-                });
-              }
-              
-              return {
-                type: typeName,
-                elements: elements
-              };
-            });
+            result.methodAnnotations[methodName] =
+              attr.info.annotations.map(parseAnnotation);
           }
         });
       }

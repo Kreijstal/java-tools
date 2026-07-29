@@ -4,7 +4,11 @@ const {
   loadClassByPathSync: loadConvertedClass,
 } = require("./classLoader");
 const { parseDescriptor } = require("../parsing/typeParser");
-const { primitiveTypeDescriptors, arrayPrimitiveTypeDescriptors } = require("./constants");
+const {
+  ASYNC_METHOD_SENTINEL,
+  primitiveTypeDescriptors,
+  arrayPrimitiveTypeDescriptors,
+} = require("./constants");
 const {
   formatInstruction,
   unparseDataStructures,
@@ -3365,6 +3369,108 @@ class JVM {
 
   createAnnotationProxy(annotation) {
     const jvm = this;
+    const primitiveDescriptors = {
+      Z: "boolean",
+      B: "byte",
+      C: "char",
+      S: "short",
+      I: "int",
+      J: "long",
+      F: "float",
+      D: "double",
+      V: "void",
+    };
+    const normalizeClassName = (value) => {
+      if (!value || typeof value !== "string") return null;
+      if (primitiveDescriptors[value]) return primitiveDescriptors[value];
+      if (value.startsWith("L") && value.endsWith(";")) {
+        return value.slice(1, -1);
+      }
+      return value;
+    };
+    const formatValue = (value) => {
+      if (value && value.type === "class") {
+        return `${normalizeClassName(value.className || value.descriptor)}.class`;
+      }
+      if (value && value.type === "enum") {
+        const owner = normalizeClassName(value.className || value.descriptor);
+        return `${owner.replace(/\//g, ".")}.${value.constName}`;
+      }
+      if (value && value.type === "annotation") {
+        return `@${value.annotationValue.type.replace(/\//g, ".")}`;
+      }
+      if (Array.isArray(value)) {
+        return `{${value.map(formatValue).join(", ")}}`;
+      }
+      if (typeof value === "string") return `\"${value}\"`;
+      return String(value);
+    };
+    const resolveElement = async (rawValue, thread) => {
+      if (Array.isArray(rawValue)) {
+        const values = [];
+        for (const item of rawValue) {
+          const value = await resolveElement(item, thread);
+          if (value === ASYNC_METHOD_SENTINEL) return value;
+          values.push(value);
+        }
+        return values;
+      }
+
+      if (rawValue && rawValue.type === "class") {
+        const className = normalizeClassName(
+          rawValue.className || rawValue.descriptor);
+        if (!className) {
+          throw new Error("Class annotation element has no descriptor");
+        }
+        return jvm.getClassObject(className);
+      }
+
+      if (rawValue && rawValue.type === "enum") {
+        const enumClassName = normalizeClassName(
+          rawValue.className || rawValue.descriptor);
+        if (!enumClassName) {
+          throw new Error("Enum annotation element has no class descriptor");
+        }
+        await jvm.loadClassByName(enumClassName);
+        if (thread &&
+            await jvm.initializeClassIfNeeded(enumClassName, thread)) {
+          return ASYNC_METHOD_SENTINEL;
+        }
+
+        const descriptor = rawValue.descriptor || `L${enumClassName};`;
+        const fieldKey = `${rawValue.constName}:${descriptor}`;
+        const classData = jvm.classes[enumClassName];
+        if (classData && classData.staticFields instanceof Map &&
+            classData.staticFields.has(fieldKey)) {
+          return classData.staticFields.get(fieldKey);
+        }
+        const jreFields = jvm.jre[enumClassName] &&
+          jvm.jre[enumClassName].staticFields;
+        if (jreFields instanceof Map && jreFields.has(fieldKey)) {
+          return jreFields.get(fieldKey);
+        }
+        if (jreFields && Object.prototype.hasOwnProperty.call(
+          jreFields, fieldKey)) {
+          return jreFields[fieldKey];
+        }
+        throw new Error(
+          `Enum constant not found: ${enumClassName}.` +
+          `${rawValue.constName} with fieldKey ${fieldKey}`);
+      }
+
+      if (rawValue && rawValue.type === "annotation") {
+        if (!rawValue.annotationValue) {
+          throw new Error("Nested annotation element has no annotation value");
+        }
+        return jvm.createAnnotationProxy(rawValue.annotationValue);
+      }
+
+      if (typeof rawValue === "string") {
+        return jvm.internString(rawValue);
+      }
+      if (typeof rawValue === "boolean") return rawValue ? 1 : 0;
+      return rawValue;
+    };
     const proxy = {
       type: annotation.type,
       _annotationData: annotation,
@@ -3379,13 +3485,7 @@ class JVM {
         let elementsStr = "";
         if (annotation.elements) {
           elementsStr = Object.entries(annotation.elements)
-            .map(([key, value]) => {
-              let valueStr = value;
-              if (typeof value === "string") {
-                valueStr = `\"${value}\"`;
-              }
-              return `${key}=${valueStr}`;
-            })
+            .map(([key, value]) => `${key}=${formatValue(value)}`)
             .join(", ");
         }
         return jvm.internString(
@@ -3395,24 +3495,49 @@ class JVM {
     };
 
     if (annotation.elements) {
+      const annotationClass = jvm.classes[annotation.type];
+      const annotationMethods = annotationClass && annotationClass.ast &&
+        annotationClass.ast.classes && annotationClass.ast.classes[0] &&
+        annotationClass.ast.classes[0].items || [];
       Object.keys(annotation.elements).forEach((elementName) => {
         const elementValue = annotation.elements[elementName];
         let methodSignature;
-        let methodImplementation;
+        const declaredMethod = annotationMethods.find(item =>
+          item.type === "method" && item.method &&
+          item.method.name === elementName &&
+          item.method.descriptor.startsWith("()"));
 
-        if (typeof elementValue === "string") {
+        if (declaredMethod) {
+          methodSignature = `${elementName}${declaredMethod.method.descriptor}`;
+        } else if (elementValue && elementValue.type === "class") {
+          methodSignature = `${elementName}()Ljava/lang/Class;`;
+        } else if (elementValue && elementValue.type === "enum") {
+          const descriptor = elementValue.descriptor ||
+            `L${elementValue.className};`;
+          methodSignature = `${elementName}()${descriptor}`;
+        } else if (elementValue && elementValue.type === "annotation") {
+          methodSignature =
+            `${elementName}()L${elementValue.annotationValue.type};`;
+        } else if (typeof elementValue === "string") {
           methodSignature = `${elementName}()Ljava/lang/String;`;
-          methodImplementation = () => jvm.internString(String(elementValue));
         } else if (typeof elementValue === "number") {
           methodSignature = `${elementName}()I`;
-          methodImplementation = () => elementValue;
+        } else if (typeof elementValue === "boolean") {
+          methodSignature = `${elementName}()Z`;
+        } else if (Array.isArray(elementValue)) {
+          methodSignature = `${elementName}()[Ljava/lang/Object;`;
         } else {
-          // Default/fallback for other types
           methodSignature = `${elementName}()Ljava/lang/Object;`;
-          methodImplementation = () => elementValue;
         }
 
-        proxy[methodSignature] = methodImplementation;
+        proxy[methodSignature] = async (thread) => {
+          const resolved = await resolveElement(elementValue, thread);
+          const returnDescriptor = methodSignature.slice(elementName.length + 2);
+          if (Array.isArray(resolved) && returnDescriptor.startsWith("[")) {
+            resolved.type = returnDescriptor;
+          }
+          return resolved;
+        };
       });
     }
 

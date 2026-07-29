@@ -327,9 +327,19 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   if (boxedObj._annotationData) {
     const methodKey = methodName + descriptor;
     if (typeof boxedObj[methodKey] === "function") {
-      const result = boxedObj[methodKey]();
+      let result = boxedObj[methodKey](thread);
+      if (result && typeof result.then === "function") {
+        result = await result;
+      }
+      if (result === ASYNC_METHOD_SENTINEL) {
+        frame.stack.push(obj);
+        for (const arg of args) frame.stack.push(arg);
+        frame.pc--;
+        return;
+      }
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== "V" && returnType !== "void" && result !== undefined) {
+        if (typeof result === "boolean") result = result ? 1 : 0;
         frame.stack.push(result);
       }
       return;
@@ -860,9 +870,19 @@ async function invokeinterface(frame, instruction, jvm, thread) {
   if (boxedObj._annotationData) {
     const methodKey = methodName + descriptor;
     if (typeof boxedObj[methodKey] === "function") {
-      const result = boxedObj[methodKey]();
+      let result = boxedObj[methodKey](thread);
+      if (result && typeof result.then === "function") {
+        result = await result;
+      }
+      if (result === ASYNC_METHOD_SENTINEL) {
+        frame.stack.push(obj);
+        for (const arg of args) frame.stack.push(arg);
+        frame.pc--;
+        return;
+      }
       const { returnType } = parseDescriptor(descriptor);
       if (returnType !== "V" && returnType !== "void" && result !== undefined) {
+        if (typeof result === "boolean") result = result ? 1 : 0;
         frame.stack.push(result);
       }
       return;

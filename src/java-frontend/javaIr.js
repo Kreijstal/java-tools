@@ -140,7 +140,15 @@ function annotationInternalName(name, context = {}) {
   return raw;
 }
 
-function parseAnnotationElementTokens(tokens = []) {
+function annotationClassDescriptor(parts, context = {}) {
+  const name = (parts || []).join('.');
+  const primitive = PRIMITIVE_DESCRIPTOR_BY_NAME[name];
+  if (primitive) return primitive;
+  const owner = resolveClassInternalNameFromParts(parts, context);
+  return owner ? `L${owner};` : null;
+}
+
+function parseAnnotationElementTokens(tokens = [], context = {}) {
   const elements = {};
   const parts = splitTopLevelByComma(tokens);
   for (const part of parts) {
@@ -167,14 +175,21 @@ function parseAnnotationElementTokens(tokens = []) {
         && valueTokens[0].kind === 'identifier'
         && tokenText(valueTokens[1]) === '.'
         && valueTokens[2].kind === 'identifier') {
-      const enumOwner = valueTokens[0].text === 'RetentionPolicy'
-        ? 'java/lang/annotation/RetentionPolicy'
-        : valueTokens[0].text;
-      elements[name] = {
-        type: 'enum',
-        typeName: `L${enumOwner};`,
-        constName: valueTokens[2].text,
-      };
+      if (valueTokens[2].text === 'class') {
+        const descriptor = annotationClassDescriptor(
+          [valueTokens[0].text], context);
+        elements[name] = { type: 'class', descriptor };
+      } else {
+        const enumOwner = valueTokens[0].text === 'RetentionPolicy'
+          ? 'java/lang/annotation/RetentionPolicy'
+          : resolveClassInternalNameFromParts(
+            [valueTokens[0].text], context) || valueTokens[0].text;
+        elements[name] = {
+          type: 'enum',
+          typeName: `L${enumOwner};`,
+          constName: valueTokens[2].text,
+        };
+      }
     } else {
       elements[name] = valueTokens.map(tokenText).join('');
     }
@@ -189,7 +204,8 @@ function annotationsMeta(annotations, context = {}) {
       elements: {},
     };
     if (annotation.values && Array.isArray(annotation.values.tokens)) {
-      meta.elements = parseAnnotationElementTokens(annotation.values.tokens);
+      meta.elements = parseAnnotationElementTokens(
+        annotation.values.tokens, context);
     } else if (Array.isArray(annotation.values)) {
       for (const pair of annotation.values) {
         if (!pair || pair.kind !== 'ElementValuePair') continue;
@@ -197,6 +213,18 @@ function annotationsMeta(annotations, context = {}) {
           meta.elements[pair.name] = pair.value.literalKind === 'number'
             ? Number(String(pair.value.value).replace(/[lLfFdD]$/, ''))
             : pair.value.value;
+        }
+        else if (pair.value && pair.value.kind === 'ClassLiteralExpression') {
+          meta.elements[pair.name] = {
+            type: 'class',
+            descriptor: typeDescriptor(pair.value.literalType, context),
+          };
+        }
+        else if (pair.value && pair.value.kind === 'FieldAccessExpression' &&
+            pair.value.name === 'class') {
+          const descriptor = annotationClassDescriptor(
+            chainParts(pair.value.target), context);
+          meta.elements[pair.name] = { type: 'class', descriptor };
         }
         else if (pair.value && pair.value.kind === 'FieldAccessExpression') {
           const parts = chainParts(pair.value.target);
@@ -208,12 +236,25 @@ function annotationsMeta(annotations, context = {}) {
       meta.elements.value = annotation.values.literalKind === 'number'
         ? Number(String(annotation.values.value).replace(/[lLfFdD]$/, ''))
         : annotation.values.value;
+    } else if (annotation.values &&
+        annotation.values.kind === 'ClassLiteralExpression') {
+      meta.elements.value = {
+        type: 'class',
+        descriptor: typeDescriptor(annotation.values.literalType, context),
+      };
+    } else if (annotation.values &&
+        annotation.values.kind === 'FieldAccessExpression' &&
+        annotation.values.name === 'class') {
+      const descriptor = annotationClassDescriptor(
+        chainParts(annotation.values.target), context);
+      meta.elements.value = { type: 'class', descriptor };
     } else if (annotation.values && annotation.values.kind === 'FieldAccessExpression') {
       const parts = chainParts(annotation.values.target);
       const owner = resolveClassInternalNameFromParts(parts, context) || parts.join('/');
       meta.elements.value = { type: 'enum', typeName: `L${owner};`, constName: annotation.values.name };
     } else if (annotation.value && Array.isArray(annotation.value.tokens)) {
-      meta.elements = parseAnnotationElementTokens(annotation.value.tokens);
+      meta.elements = parseAnnotationElementTokens(
+        annotation.value.tokens, context);
     }
     return meta;
   }).filter((annotation) => annotation.type);

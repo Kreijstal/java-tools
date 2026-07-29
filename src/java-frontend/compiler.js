@@ -375,6 +375,7 @@ function formatInstructionOperands(instruction) {
 
 function annotationElementType(value) {
   if (value && typeof value === 'object' && value.type === 'enum') return `enum ${value.typeName}`;
+  if (value && typeof value === 'object' && value.type === 'class') return 'class';
   if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'double';
   if (typeof value === 'boolean') return 'boolean';
   return 'string';
@@ -382,6 +383,7 @@ function annotationElementType(value) {
 
 function annotationElementValue(value) {
   if (value && typeof value === 'object' && value.type === 'enum') return value.constName;
+  if (value && typeof value === 'object' && value.type === 'class') return value.descriptor;
   if (typeof value === 'string') return escapeJasminStringLiteral(value);
   if (typeof value === 'boolean') return value ? '1' : '0';
   return String(value);
