@@ -31,7 +31,10 @@ const Thread = require('../src/jre/java/lang/Thread');
 const ThreadGroup = require('../src/jre/java/lang/ThreadGroup');
 const JNI = require('../src/core/jni');
 const ByteBuffer = require('../src/jre/java/nio/ByteBuffer');
+const NioPath = require('../src/jre/java/nio/file/Path');
 const Random = require('../src/jre/java/util/Random');
+const Collectors = require('../src/jre/java/util/stream/Collectors');
+const Stream = require('../src/jre/java/util/stream/Stream');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
 const { decodePng } = require('../src/io/gifDecoder');
 const {
@@ -81,6 +84,88 @@ test('Class.newInstance reports InstantiationException for primitive classes', a
     error = caught;
   }
   t.equal(error && error.type, 'java/lang/InstantiationException');
+  t.end();
+});
+
+test('Path startsWith and endsWith compare path elements', (t) => {
+  const startsWith = NioPath.methods['startsWith(Ljava/nio/file/Path;)Z'];
+  const endsWith = NioPath.methods['endsWith(Ljava/nio/file/Path;)Z'];
+  const nioPath = (value) => ({ type: 'java/nio/file/Path', path: value });
+
+  t.equal(startsWith(null, nioPath('/foo/barbaz'), [nioPath('/foo/bar')]), 0,
+    'a partial element prefix does not match');
+  t.equal(startsWith(null, nioPath('/foo/bar'), [nioPath('/foo')]), 1,
+    'a complete absolute element prefix matches');
+  t.equal(endsWith(null, nioPath('/foo/bar'), [nioPath('bar')]), 1,
+    'an absolute path can end with a relative path');
+  t.equal(endsWith(null, nioPath('/foo/bar'), [nioPath('/bar')]), 0,
+    'an absolute suffix must include the complete rooted path');
+  t.equal(endsWith(null, nioPath('foo/bar'), [nioPath('bar')]), 1,
+    'relative suffixes compare complete elements');
+  t.equal(startsWith(null, nioPath(''), [nioPath('')]), 1,
+    'the empty path starts with itself');
+  t.equal(startsWith(null, nioPath('foo'), [nioPath('')]), 0,
+    'a non-empty path does not start with the empty path');
+  t.end();
+});
+
+test('Stream toMap collector evaluates key and value mappers', async (t) => {
+  const calls = [];
+  const keyMapper = {
+    methods: {
+      'apply(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+        calls.push(`key:${args[0]}`);
+        return `key-${args[0]}`;
+      },
+    },
+  };
+  const valueMapper = {
+    methods: {
+      'apply(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+        calls.push(`value:${args[0]}`);
+        return args[0] * 10;
+      },
+    },
+  };
+  const collector = Collectors.staticMethods[
+    'toMap(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;'
+  ](null, null, [keyMapper, valueMapper]);
+  const result = await Stream.methods[
+    'collect(Ljava/util/stream/Collector;)Ljava/lang/Object;'
+  ](jvmStub(), { array: [2, 3] }, [collector], null);
+
+  t.deepEqual(calls, ['key:2', 'value:2', 'key:3', 'value:3'],
+    'both mapper functions run once per stream element');
+  t.equal(HashMap.methods['get(Ljava/lang/Object;)Ljava/lang/Object;'](
+    jvmStub(), result, ['key-2'],
+  ), 20, 'the mapped key addresses the mapped value');
+  t.equal(HashMap.methods['get(Ljava/lang/Object;)Ljava/lang/Object;'](
+    jvmStub(), result, ['key-3'],
+  ), 30, 'all mapped entries are retained');
+  t.equal(result.map.size, 2, 'the collector returns a two-entry HashMap');
+  t.end();
+});
+
+test('Stream toMap collector rejects duplicate keys', async (t) => {
+  const mapper = (callback) => ({
+    methods: {
+      'apply(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) =>
+        callback(args[0]),
+    },
+  });
+  const collector = Collectors.staticMethods[
+    'toMap(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;'
+  ](null, null, [mapper(() => 'same'), mapper((value) => value)]);
+  let error = null;
+  try {
+    await Stream.methods[
+      'collect(Ljava/util/stream/Collector;)Ljava/lang/Object;'
+    ](jvmStub(), { array: [1, 2] }, [collector], null);
+  } catch (caught) {
+    error = caught;
+  }
+
+  t.equal(error && error.type, 'java/lang/IllegalStateException');
   t.end();
 });
 
