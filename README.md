@@ -70,6 +70,8 @@ npm install
   behavior, Java documents, Run, Debug, xterm, and JARs
 - [Java compiler](docs/compiler.md) — command line, Node.js API, browser API,
   supported input, and limitations
+- [Interactive Java shell](docs/jshell.md) — compile and run Java snippets in a
+  persistent `jvm.js` session
 - [Assembler and disassembler](docs/assembly.md)
 - [Unified CLI, MCP, and LSP tooling](docs/tooling.md)
 - [Debugger API](DEBUG_API.md)
@@ -90,6 +92,18 @@ node scripts/jvm-cli.js disassemble build/classes/Hello.class --stdout
 
 See [docs/compiler.md](docs/compiler.md) for multi-file compilation and the
 Node.js/browser APIs.
+
+#### Run the interactive Java shell
+
+```bash
+npm run jshell
+```
+
+The shell compiles snippets with the repository JavaScript compiler and runs
+them in one persistent `jvm.js` instance. Variables, methods, types, imports,
+and their static state remain available to later snippets. It does not invoke
+the JDK `jshell` executable. See [docs/jshell.md](docs/jshell.md) for commands,
+piped use, the Node.js API, and current language limitations.
 
 #### Run the native JavaScript CFR-style decompiler
 

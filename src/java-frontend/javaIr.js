@@ -344,7 +344,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   const directory = sourcePathIsDirectory
     ? pathModule.resolve(sourcePath)
     : pathModule.dirname(pathModule.resolve(sourcePath));
-  const useCache = fileSystem === hostFs;
+  const useCache = fileSystem === hostFs && options.cacheSourceMetadata !== false;
   if (useCache && SOURCE_METADATA_CACHE.has(directory)) return SOURCE_METADATA_CACHE.get(directory);
   const metadata = {
     classBySimpleName: new Map(),
@@ -4521,10 +4521,19 @@ function lowerSameClassMethodCall(expression, context) {
   if (!expression || expression.kind !== 'MethodInvocationExpression' || expression.target) {
     return null;
   }
-  if (!context.methodByName.has(expression.name)) {
+  const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
+  if (!rawArgs.every(Boolean)) return null;
+  const owner = context.methodOwnerInternalName || context.classInternalName;
+  const inheritedMethod = selectUserMethodDescriptorInHierarchy(
+    owner,
+    expression.name,
+    rawArgs,
+    context,
+    context.currentMethodIsStatic ? true : null,
+  );
+  if (!context.methodByName.has(expression.name) && !inheritedMethod) {
     const outerMethod = context.outerMethodByName && context.outerMethodByName.get(expression.name);
     if (!outerMethod || !context.outerClassInternalName) return null;
-    const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
     const method = selectUserMethodDescriptor(context.outerClassInternalName, expression.name, rawArgs, context, outerMethod.isStatic)
       || outerMethod;
     const args = prepareMethodArguments(method, rawArgs);
@@ -4544,16 +4553,15 @@ function lowerSameClassMethodCall(expression, context) {
     }
     return null;
   }
-  const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
-  const owner = context.methodOwnerInternalName || context.classInternalName;
-  const method = selectUserMethodDescriptor(owner, expression.name, rawArgs, context, null)
+  const method = inheritedMethod
+    || selectUserMethodDescriptor(owner, expression.name, rawArgs, context, null)
     || context.methodByName.get(expression.name);
   const args = prepareMethodArguments(method, rawArgs);
   if (method.isStatic && args) {
     return {
       kind: 'MethodCallValue',
       type: method.returnDescriptor,
-      owner,
+      owner: method.declaredOwner || owner,
       name: method.name,
       descriptor: method.descriptor,
       invokeKind: 'static',
@@ -5443,8 +5451,9 @@ function lowerExpressionToJavaIrValue(expression, context) {
   }
   const leadingConcatMethodChain = lowerLeadingConcatMethodChain(expression, context);
   if (leadingConcatMethodChain) return leadingConcatMethodChain;
-  if (expression && expression.kind === 'MethodInvocationExpression' && !expression.target && context.methodByName.has(expression.name)) {
-    return lowerSameClassMethodCall(expression, context);
+  if (expression && expression.kind === 'MethodInvocationExpression' && !expression.target) {
+    const sameClassCall = lowerSameClassMethodCall(expression, context);
+    if (sameClassCall) return sameClassCall;
   }
   if (expression && expression.kind === 'MethodInvocationExpression' && !expression.target) {
     const inherited = lowerInheritedInstanceMethodCall(expression, context);

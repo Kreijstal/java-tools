@@ -2,6 +2,9 @@
   "name": "jvm_tools",
   "version": "0.0.1",
   "main": "index.js",
+  "bin": {
+    "java-tools-jshell": "scripts/jshell.js"
+  },
   "scripts": {
     "test": "node scripts/run-tests.js",
     "test:specific": "node scripts/run-tests.js",
@@ -25,6 +28,7 @@
     "test:all": "npm test && npm run test:playwright",
     "serve": "node scripts/serve.js",
     "run:jar": "node scripts/runJar.js",
+    "jshell": "node scripts/jshell.js",
     "build:java": "node scripts/compileJava.js sources/*.java --out sources",
     "build:bundle": "node scripts/generate-jre-index && webpack --mode production",
     "generate": "node scripts/generateData.js",
