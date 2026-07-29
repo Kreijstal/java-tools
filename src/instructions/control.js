@@ -25,9 +25,8 @@ module.exports = {
     }
     thread.callStack.pop();
     jvm.completeClassInitialization(frame);
-    if (thread.isAwaitingReflectiveCall) {
-      thread.reflectiveCallResolver(null);
-      thread.isAwaitingReflectiveCall = false;
+    if (frame.reflectiveCallResolver) {
+      frame.reflectiveCallResolver(null);
     }
   },
   ireturn: (frame, instruction, jvm, thread) => {
@@ -36,9 +35,8 @@ module.exports = {
     }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
-    if (thread.isAwaitingReflectiveCall) {
-      thread.reflectiveCallResolver(returnValue);
-      thread.isAwaitingReflectiveCall = false;
+    if (frame.reflectiveCallResolver) {
+      frame.reflectiveCallResolver(returnValue);
     } else if (!thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(returnValue);
     }
@@ -49,9 +47,8 @@ module.exports = {
     }
     const returnValue = frame.stack.pop();
     thread.callStack.pop();
-    if (thread.isAwaitingReflectiveCall) {
-      thread.reflectiveCallResolver(returnValue);
-      thread.isAwaitingReflectiveCall = false;
+    if (frame.reflectiveCallResolver) {
+      frame.reflectiveCallResolver(returnValue);
     } else if (!thread.callStack.isEmpty()) {
       thread.callStack.peek().stack.push(returnValue);
     }
@@ -353,9 +350,8 @@ module.exports = {
       }
       const returnValue = frame.stack.pop();
       thread.callStack.pop();
-      if (thread.isAwaitingReflectiveCall) {
-        thread.reflectiveCallResolver(returnValue);
-        thread.isAwaitingReflectiveCall = false;
+      if (frame.reflectiveCallResolver) {
+        frame.reflectiveCallResolver(returnValue);
       } else if (!thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(returnValue);
       }
@@ -366,9 +362,8 @@ module.exports = {
       }
       const returnValue = frame.stack.pop();
       thread.callStack.pop();
-      if (thread.isAwaitingReflectiveCall) {
-        thread.reflectiveCallResolver(returnValue);
-        thread.isAwaitingReflectiveCall = false;
+      if (frame.reflectiveCallResolver) {
+        frame.reflectiveCallResolver(returnValue);
       } else if (!thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(returnValue);
       }
@@ -379,9 +374,8 @@ module.exports = {
       }
       const returnValue = frame.stack.pop();
       thread.callStack.pop();
-      if (thread.isAwaitingReflectiveCall) {
-        thread.reflectiveCallResolver(returnValue);
-        thread.isAwaitingReflectiveCall = false;
+      if (frame.reflectiveCallResolver) {
+        frame.reflectiveCallResolver(returnValue);
       } else if (!thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(returnValue);
       }

@@ -97,7 +97,9 @@ function pushBytecodeInvokeFrame(frame, thread, target, params, receiver, isStat
   if (target.method && target.method.name === '<init>' &&
       typeof process !== 'undefined' && process.env &&
       String(process.env.JVM_DEBUG_CONSTRUCTORS || '').split(',').includes(target.owner)) {
-    console.error(`[constructor] sync push ${target.owner}${target.method.descriptor}`);
+    console.error(`[constructor] sync push ${target.owner}${target.method.descriptor} from ` +
+      `${frame.className}.${frame.method && frame.method.name}` +
+      `${frame.method && frame.method.descriptor || ''}@${frame.pc - 1}`);
   }
 }
 
@@ -181,7 +183,9 @@ function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
       typeof receiver === 'number' || typeof receiver === 'boolean' ||
       receiver._annotationData || receiver.methodHandle) return SYNC_INVOKE_FALLBACK;
   let receiverClassName = kind === 'special' ? className : runtimeClassName(receiver);
-  if (!receiverClassName || receiverClassName.startsWith('[')) return SYNC_INVOKE_FALLBACK;
+  if (typeof receiverClassName !== 'string' || receiverClassName.startsWith('[')) {
+    return SYNC_INVOKE_FALLBACK;
+  }
   let target;
   if (state.receiverClass0 === receiverClassName) target = state.target0;
   else if (state.receiverClass1 === receiverClassName) target = state.target1;
@@ -323,6 +327,7 @@ async function invokevirtual(frame, instruction, jvm, thread) {
   }
 
   let currentClassName = runtimeClassName(boxedObj);
+  if (typeof currentClassName !== 'string') currentClassName = className;
 
   if (boxedObj._annotationData) {
     const methodKey = methodName + descriptor;
@@ -478,7 +483,10 @@ async function invokestatic(frame, instruction, jvm, thread) {
   // treating the whole class as a platform stub leaves its arguments on the
   // operand stack and corrupts the next instruction.
   if (jvm.jre[className] && !jvm.jre[className].applicationFallback) {
-    return;
+    throw {
+      type: 'java/lang/NoSuchMethodError',
+      message: `${className}.${methodName}${descriptor}`,
+    };
   }
 
   // Otherwise, it must be a user-defined class.
@@ -529,9 +537,16 @@ async function invokestatic(frame, instruction, jvm, thread) {
       assignArgsToLocals(newFrame.locals, args, params, 0);
       thread.callStack.push(newFrame);
     }
+  } else if (!resolvedClassData) {
+    throw {
+      type: 'java/lang/NoClassDefFoundError',
+      message: className,
+    };
   } else {
-    // Method not found - this is expected for some JVM methods that aren't implemented
-    // Don't throw an error, just return silently
+    throw {
+      type: 'java/lang/NoSuchMethodError',
+      message: `${className}.${methodName}${descriptor}`,
+    };
   }
 }
 
@@ -655,132 +670,169 @@ async function invokespecial(frame, instruction, jvm, thread) {
   }
 }
 
+function internalNameFromJavaType(type) {
+  if (typeof type !== "string") return type;
+  return type.replace(/\./g, "/");
+}
+
+function bootstrapReference(bsm) {
+  return bsm && bsm.method_ref && bsm.method_ref.value
+    ? bsm.method_ref.value.reference
+    : null;
+}
+
+function popArguments(frame, descriptor) {
+  const { params } = parseDescriptor(descriptor);
+  const args = new Array(params.length);
+  for (let i = params.length - 1; i >= 0; i -= 1) {
+    args[i] = frame.stack.pop();
+  }
+  return { args, params };
+}
+
+function stringifyConcatValue(value, type) {
+  if (value === null || value === undefined) return "null";
+  if (value && typeof value === "object" && value.value !== undefined) {
+    return String(value.value);
+  }
+  if (value && typeof value === "object" && value.toString) {
+    return value.toString();
+  }
+  return formatJavaNumber(value, type);
+}
+
+function resolveInvokeDynamicSite(className, frame, instruction, jvm) {
+  const invokeDynamicInfo = instruction.arg || {};
+  const nameAndType = invokeDynamicInfo.nameAndType || {};
+  const classData = jvm.classes[className];
+  const bootstrapMethods = classData && classData.ast &&
+    classData.ast.classes[0].bootstrapMethods;
+  const bsm = bootstrapMethods &&
+    bootstrapMethods[invokeDynamicInfo.bootstrap_method_attr_index];
+  const reference = bootstrapReference(bsm);
+  if (!reference) {
+    throw new Error(
+      `BootstrapMethodError: missing bootstrap method for ${className}.` +
+      `${frame.method.name}${frame.method.descriptor}`,
+    );
+  }
+
+  const bootstrapClass = reference.className;
+  if (bootstrapClass === "java/lang/invoke/StringConcatFactory") {
+    const staticArguments = bsm.arguments || [];
+    return {
+      kind: "stringConcat",
+      descriptor: nameAndType.descriptor,
+      recipe: staticArguments[0] ? staticArguments[0].value : "\u0001",
+      constants: staticArguments.slice(1).map((argument) => argument.value),
+    };
+  }
+
+  if (bootstrapClass === "java/lang/invoke/LambdaMetafactory") {
+    const staticArguments = bsm.arguments || [];
+    const implementation = staticArguments.find(
+      (argument) => argument && argument.type === "MethodHandle",
+    );
+    if (!implementation || !implementation.value) {
+      throw new Error(
+        `BootstrapMethodError: LambdaMetafactory site ${nameAndType.name}` +
+        `${nameAndType.descriptor} has no implementation handle`,
+      );
+    }
+    const invokedType = parseDescriptor(nameAndType.descriptor);
+    return {
+      kind: "lambda",
+      descriptor: nameAndType.descriptor,
+      interfaceClass: internalNameFromJavaType(invokedType.returnType),
+      interfaceMethodName: nameAndType.name,
+      methodHandle: new MethodHandle(
+        implementation.value.kind,
+        implementation.value.reference,
+      ),
+    };
+  }
+
+  throw new Error(
+    `Unsupported invokedynamic bootstrap: ${bootstrapClass}.` +
+    `${reference.nameAndType.name}${reference.nameAndType.descriptor}`,
+  );
+}
+
+function executeInvokeDynamicSite(site, frame, jvm) {
+  if (site.kind === "lambda") {
+    const { args: capturedArgs } = popArguments(frame, site.descriptor);
+    frame.stack.push({
+      type: site.interfaceClass,
+      methodHandle: site.methodHandle,
+      capturedArgs,
+      functionalMethodName: site.interfaceMethodName,
+    });
+    return;
+  }
+
+  if (site.kind === "stringConcat") {
+    const { args: dynamicArgs, params } = popArguments(frame, site.descriptor);
+    let result = "";
+    let dynamicIndex = 0;
+    let constantIndex = 0;
+    for (const character of String(site.recipe)) {
+      if (character === "\u0001") {
+        result += stringifyConcatValue(
+          dynamicArgs[dynamicIndex],
+          params[dynamicIndex],
+        );
+        dynamicIndex += 1;
+      } else if (character === "\u0002") {
+        result += stringifyConcatValue(site.constants[constantIndex], null);
+        constantIndex += 1;
+      } else {
+        result += character;
+      }
+    }
+    frame.stack.push(jvm.newString(result));
+  }
+}
+
 async function invokedynamic(frame, instruction, jvm, thread) {
   const className = jvm.findClassNameForMethod(frame.method);
   const pc = frame.pc - 1;
-  const cacheKey = `${className}.${frame.method.name}.${pc}`;
-
-  // Check cache first
-  const cachedCallSite = jvm.invokedynamicCache.get(cacheKey);
-  if (cachedCallSite) {
-    const runnable = {
-      type: "java/lang/Runnable",
-      methodHandle: cachedCallSite.target,
-    };
-    frame.stack.push(runnable);
-    return;
+  const cacheKey =
+    `${className}.${frame.method.name}${frame.method.descriptor}@${pc}`;
+  let site = jvm.invokedynamicCache.get(cacheKey);
+  if (!site) {
+    site = resolveInvokeDynamicSite(className, frame, instruction, jvm);
+    jvm.invokedynamicCache.set(cacheKey, site);
   }
+  executeInvokeDynamicSite(site, frame, jvm);
+}
 
-  // 1. Get the pre-resolved info from the instruction argument
-  const invokeDynamicInfo = instruction.arg;
-  const bsmAttrIndex = invokeDynamicInfo.bootstrap_method_attr_index;
-  const nameAndType = invokeDynamicInfo.nameAndType;
-
-  // 2. Get the bootstrap method from the class's attribute
-  const classData = jvm.classes[className];
-  const bsm = classData.ast.classes[0].bootstrapMethods[bsmAttrIndex];
-
-  // 3. Prepare arguments for the bootstrap method call
-  const lookup = new Lookup();
-  const invokedName = nameAndType.name;
-  const invokedType = new MethodType(nameAndType.descriptor);
-
-  const staticArgs = bsm.arguments.map((arg) => {
-    if (arg.type === "MethodHandle") {
-      return new MethodHandle(arg.value.kind, arg.value.reference);
+async function resolveDefaultInterfaceMethod(
+  jvm,
+  interfaceNames,
+  methodName,
+  descriptor,
+  visited = new Set(),
+) {
+  for (const interfaceName of interfaceNames || []) {
+    if (visited.has(interfaceName)) continue;
+    visited.add(interfaceName);
+    const classData = jvm.classes[interfaceName] ||
+      await jvm.loadClassByName(interfaceName);
+    if (!classData || !classData.ast || !classData.ast.classes[0]) continue;
+    const method = jvm.findMethod(classData, methodName, descriptor);
+    if (method && (!method.flags || !method.flags.includes('abstract'))) {
+      return { className: interfaceName, method };
     }
-    if (arg.type === "MethodType") {
-      return new MethodType(arg.value);
-    }
-    return arg.value;
-  });
-
-  const bsmArgs = [lookup, invokedName, invokedType, ...staticArgs];
-
-  if (
-    bsm.method_ref.value.reference.className ===
-    "java/lang/invoke/StringConcatFactory"
-  ) {
-    const recipe = bsm.arguments[0].value;
-    const { params } = parseDescriptor(nameAndType.descriptor);
-    const dynamicArgs = [];
-    for (let i = 0; i < params.length; i++) {
-      dynamicArgs.unshift(frame.stack.pop());
-    }
-
-    let result = "";
-    let argIndex = 0;
-    for (let i = 0; i < recipe.length; i++) {
-      const char = recipe.charAt(i);
-      if (char === "\u0001") {
-        const arg = dynamicArgs[argIndex];
-        const paramType = params[argIndex];
-
-        argIndex++;
-        // Convert Java objects to strings properly
-        if (arg && typeof arg === "object" && arg.value !== undefined) {
-          // Java String object
-          result += arg.value;
-        } else if (arg && typeof arg === "object" && arg.toString) {
-          result += arg.toString();
-        } else {
-          result += formatJavaNumber(arg, paramType);
-        }
-      } else {
-        result += char;
-      }
-    }
-    // Runtime string concatenation should produce a new, non-interned string.
-    frame.stack.push(jvm.newString(result));
-    return;
+    const inherited = await resolveDefaultInterfaceMethod(
+      jvm,
+      classData.ast.classes[0].interfaces,
+      methodName,
+      descriptor,
+      visited,
+    );
+    if (inherited) return inherited;
   }
-
-  // The next step is to actually invoke the bsm.method_ref with these args.
-  // We can reuse the invokestatic logic for this.
-
-  // 4. Push arguments onto the stack for the BSM call.
-  // The BSM arguments are pushed onto the stack of the *current* frame.
-  bsmArgs.forEach((arg) => frame.stack.push(arg));
-
-  // 5. Create a fake instruction to pass to the invokestatic handler.
-  const bsmInstruction = {
-    op: "invokestatic",
-    arg: [
-      "Method",
-      bsm.method_ref.value.reference.className,
-      [
-        bsm.method_ref.value.reference.nameAndType.name,
-        bsm.method_ref.value.reference.nameAndType.descriptor,
-      ],
-    ],
-  };
-
-  // 6. Call the invokestatic handler directly.
-  await invokestatic(frame, bsmInstruction, jvm, thread);
-
-  // After the BSM runs, the CallSite object is on the stack.
-  const callSite = frame.stack.pop();
-
-  // Store the newly created CallSite in the cache
-  jvm.invokedynamicCache.set(cacheKey, callSite);
-
-  const targetMethodHandle = callSite.target;
-
-  // For a lambda, the result of invokedynamic is a functional interface object (e.g., Runnable).
-  // When its method is called (e.g., run()), the target method handle is invoked.
-  if (
-    bsm.method_ref.value.reference.className ===
-    "java/lang/invoke/LambdaMetafactory"
-  ) {
-    // Create a functional interface object (e.g., Runnable).
-    const functionalInterface = {
-      type: invokedType.returnType, // The functional interface type
-      methodHandle: targetMethodHandle, // The implementation of the interface's method
-    };
-
-    // Push the resulting functional interface object onto the stack.
-    frame.stack.push(functionalInterface);
-  }
+  return null;
 }
 
 async function invokeinterface(frame, instruction, jvm, thread) {
@@ -808,27 +860,37 @@ async function invokeinterface(frame, instruction, jvm, thread) {
 
   // For a functional interface with method handle (lambdas)
   if (boxedObj.methodHandle) {
-    // It's a lambda. Push the args back for invokestatic.
-    for (const arg of args) {
+    const targetMethodHandle = boxedObj.methodHandle;
+    const targetReference = targetMethodHandle.reference;
+    const targetNameAndType = targetReference.nameAndType;
+    const invocationArgs = [...(boxedObj.capturedArgs || []), ...args];
+    for (const arg of invocationArgs) {
       frame.stack.push(arg);
     }
-
-    const targetMethodHandle = boxedObj.methodHandle;
-
-    // Now, invoke the target method. It's a static method in this case.
     const lambdaInstruction = {
-      op: "invokestatic",
+      op: targetMethodHandle.kind,
       arg: [
         "Method",
-        targetMethodHandle.reference.className,
+        targetReference.className,
         [
-          targetMethodHandle.reference.nameAndType.name,
-          targetMethodHandle.reference.nameAndType.descriptor,
+          targetNameAndType.name,
+          targetNameAndType.descriptor,
         ],
       ],
     };
-
-    await invokestatic(frame, lambdaInstruction, jvm, thread);
+    if (targetMethodHandle.kind === "invokeStatic") {
+      await invokestatic(frame, lambdaInstruction, jvm, thread);
+    } else if (targetMethodHandle.kind === "invokeVirtual") {
+      await invokevirtual(frame, lambdaInstruction, jvm, thread);
+    } else if (targetMethodHandle.kind === "invokeInterface") {
+      await invokeinterface(frame, lambdaInstruction, jvm, thread);
+    } else if (targetMethodHandle.kind === "invokeSpecial") {
+      await invokespecial(frame, lambdaInstruction, jvm, thread);
+    } else {
+      throw new Error(
+        `Unsupported lambda MethodHandle kind: ${targetMethodHandle.kind}`,
+      );
+    }
     return;
   }
 
@@ -840,12 +902,15 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     jreClass.methods &&
     jreClass.methods[methodName + descriptor]
   ) {
-    const result = jreClass.methods[methodName + descriptor](
+    let result = jreClass.methods[methodName + descriptor](
       jvm,
       boxedObj,
       args,
       thread,
     );
+    if (result && typeof result.then === "function") {
+      result = await result;
+    }
     const { returnType } = parseDescriptor(descriptor);
     if (returnType !== "V" && returnType !== "void" && result !== undefined) {
       if (typeof result === "boolean") {
@@ -878,6 +943,9 @@ async function invokeinterface(frame, instruction, jvm, thread) {
     }
     if (jreMethod) {
       let result = jreMethod(jvm, boxedObj, args, thread);
+      if (result && typeof result.then === 'function') {
+        result = await result;
+      }
       if (result !== ASYNC_METHOD_SENTINEL) {
         const { returnType } = parseDescriptor(descriptor);
         if (returnType !== "V" && returnType !== "void" && result !== undefined) {
@@ -921,6 +989,20 @@ async function invokeinterface(frame, instruction, jvm, thread) {
         const newFrame = new Frame(method);
         newFrame.className = currentClassName; // Add className to the frame
         newFrame.locals[0] = boxedObj; // 'this'
+        assignArgsToLocals(newFrame.locals, args, params, 1);
+        thread.callStack.push(newFrame);
+        return;
+      }
+      const defaultTarget = await resolveDefaultInterfaceMethod(
+        jvm,
+        classData.ast.classes[0].interfaces,
+        methodName,
+        descriptor,
+      );
+      if (defaultTarget) {
+        const newFrame = new Frame(defaultTarget.method);
+        newFrame.className = defaultTarget.className;
+        newFrame.locals[0] = boxedObj;
         assignArgsToLocals(newFrame.locals, args, params, 1);
         thread.callStack.push(newFrame);
         return;

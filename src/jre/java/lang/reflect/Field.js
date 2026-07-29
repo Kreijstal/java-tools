@@ -71,10 +71,7 @@ module.exports = {
             message: className,
           };
         }
-        return {
-          type: 'java/lang/Class',
-          _classData: classData,
-        };
+        return jvm.getClassObject(className);
       } else if (descriptor.startsWith('[')) {
         // Array type - for now return Object.class
         return {
@@ -98,6 +95,10 @@ module.exports = {
         // Static field - get from class static fields
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
+        const descriptorKey = `${fieldName}:${fieldData.descriptor}`;
+        if (classData.staticFields && classData.staticFields.has(descriptorKey)) {
+          return classData.staticFields.get(descriptorKey);
+        }
         if (classData.staticFields && classData.staticFields.has(fieldName)) {
           return classData.staticFields.get(fieldName);
         }

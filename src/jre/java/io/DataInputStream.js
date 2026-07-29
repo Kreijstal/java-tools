@@ -15,6 +15,43 @@ function readBytes(jvm, obj, count) {
   return bytes;
 }
 
+function readModifiedUtf(jvm, obj) {
+  const lengthBytes = readBytes(jvm, obj, 2);
+  const byteLength = (lengthBytes[0] << 8) | lengthBytes[1];
+  const bytes = readBytes(jvm, obj, byteLength);
+  const chars = [];
+  for (let index = 0; index < bytes.length;) {
+    const first = bytes[index++];
+    if (first > 0 && first <= 0x7f) {
+      chars.push(first);
+      continue;
+    }
+    if ((first & 0xe0) === 0xc0 && index < bytes.length) {
+      const second = bytes[index++];
+      if ((second & 0xc0) !== 0x80) {
+        throw { type: 'java/io/UTFDataFormatException' };
+      }
+      chars.push(((first & 0x1f) << 6) | (second & 0x3f));
+      continue;
+    }
+    if ((first & 0xf0) === 0xe0 && index + 1 < bytes.length) {
+      const second = bytes[index++];
+      const third = bytes[index++];
+      if ((second & 0xc0) !== 0x80 || (third & 0xc0) !== 0x80) {
+        throw { type: 'java/io/UTFDataFormatException' };
+      }
+      chars.push(
+        ((first & 0x0f) << 12) |
+        ((second & 0x3f) << 6) |
+        (third & 0x3f),
+      );
+      continue;
+    }
+    throw { type: 'java/io/UTFDataFormatException' };
+  }
+  return jvm.newString(String.fromCharCode(...chars));
+}
+
 module.exports = {
   super: 'java/io/FilterInputStream',
   interfaces: ['java/io/DataInput'],
@@ -23,6 +60,7 @@ module.exports = {
     '<init>(Ljava/io/InputStream;)V': (jvm, obj, args) => {
       const inputStream = args[0];
       obj.in = inputStream;
+      if (obj.fields) obj.fields['java/io/FilterInputStream.in'] = inputStream;
     },
     
     'read([BII)I': (jvm, obj, args) => {
@@ -107,6 +145,10 @@ module.exports = {
       new Uint8Array(buffer).set(bytes);
       return new DataView(buffer).getFloat64(0, false);
     }, ['java/io/EOFException']),
+    'readUTF()Ljava/lang/String;': withThrows(
+      (jvm, obj) => readModifiedUtf(jvm, obj),
+      ['java/io/EOFException', 'java/io/UTFDataFormatException'],
+    ),
     'readFully([B)V': withThrows((jvm, obj, args) => {
       const bytes = readBytes(jvm, obj, args[0].length);
       for (let index = 0; index < bytes.length; index += 1) args[0][index] = bytes[index];

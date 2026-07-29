@@ -1083,7 +1083,6 @@ class JvmSsaBlockRenderer {
               ...(directKey ? [
                 `if (${object}.fields) {`,
                 `  ${object}.fields[${JSON.stringify(directKey)}] = ${stored};`,
-                `  ${object}[${JSON.stringify(fieldPlan.fieldName)}] = ${stored};`,
                 "} else {",
                 `  helpers.putFieldAt(${site}, ${object}, ${stored});`,
                 "}",

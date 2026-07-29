@@ -44,6 +44,14 @@ module.exports = {
       obj.stackTrace = [];
       obj.suppressedExceptions = [];
     },
+    '<init>(Ljava/lang/String;Ljava/lang/Throwable;ZZ)V': (jvm, obj, args) => {
+      obj.message = args[0];
+      obj.cause = args[1];
+      obj.suppressionEnabled = args[2] !== 0;
+      obj.writableStackTrace = args[3] !== 0;
+      obj.stackTrace = obj.writableStackTrace ? [] : null;
+      obj.suppressedExceptions = obj.suppressionEnabled ? [] : null;
+    },
     'getMessage()Ljava/lang/String;': (jvm, obj, args) => {
       return obj.message;
     },

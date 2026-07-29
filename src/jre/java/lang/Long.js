@@ -32,6 +32,19 @@ module.exports = {
         return BigInt(0);
       }
     },
+    'sum(JJ)J': (jvm, obj, args) =>
+      BigInt.asIntN(64, BigInt(args[0]) + BigInt(args[1])),
+    'max(JJ)J': (jvm, obj, args) =>
+      BigInt(args[0]) >= BigInt(args[1]) ? BigInt(args[0]) : BigInt(args[1]),
+    'min(JJ)J': (jvm, obj, args) =>
+      BigInt(args[0]) <= BigInt(args[1]) ? BigInt(args[0]) : BigInt(args[1]),
+    'compare(JJ)I': (jvm, obj, args) =>
+      BigInt(args[0]) < BigInt(args[1]) ? -1 :
+        (BigInt(args[0]) > BigInt(args[1]) ? 1 : 0),
+    'hashCode(J)I': (jvm, obj, args) => {
+      const value = BigInt.asUintN(64, BigInt(args[0]));
+      return Number(BigInt.asIntN(32, value ^ (value >> 32n)));
+    },
     'valueOf(J)Ljava/lang/Long;': (jvm, obj, args) => {
       const longObj = {
         type: 'java/lang/Long',

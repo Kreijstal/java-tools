@@ -55,6 +55,7 @@ module.exports = {
     "NaN:D": Number.NaN,
   },
   staticMethods: {
+    'sum(DD)D': (jvm, obj, args) => args[0] + args[1],
     'compare(DD)I': (jvm, obj, args) => {
       const [left, right] = args;
       if (left < right) return -1;

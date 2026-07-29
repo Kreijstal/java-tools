@@ -18,13 +18,29 @@ function copyCollection(src) {
 }
 
 function compareValues(a, b) {
-  const as = a && a.value !== undefined ? String(a.value) : String(a);
-  const bs = b && b.value !== undefined ? String(b.value) : String(b);
+  const av = a && a.value !== undefined ? a.value : a;
+  const bv = b && b.value !== undefined ? b.value : b;
+  if ((typeof av === 'number' || typeof av === 'bigint') &&
+      (typeof bv === 'number' || typeof bv === 'bigint')) {
+    return av < bv ? -1 : (av > bv ? 1 : 0);
+  }
+  const as = String(av);
+  const bs = String(bv);
   return as.localeCompare(bs);
 }
 
 function sortedArray(obj) {
   return Array.from(ensureSet(obj)).sort(compareValues);
+}
+
+function subset(obj, predicate) {
+  const values = sortedArray(obj).filter(predicate);
+  return {
+    type: 'java/util/TreeSet',
+    set: new Set(values),
+    items: new Set(values),
+    comparator: obj.comparator || null,
+  };
 }
 
 module.exports = {
@@ -39,5 +55,13 @@ module.exports = {
     'iterator()Ljava/util/Iterator;': (jvm, obj) => ({ type: 'java/util/Iterator', array: sortedArray(obj), index: 0, lastIndex: -1 }),
     'first()Ljava/lang/Object;': (jvm, obj) => sortedArray(obj)[0] || null,
     'last()Ljava/lang/Object;': (jvm, obj) => { const a = sortedArray(obj); return a.length ? a[a.length - 1] : null; },
+    'tailSet(Ljava/lang/Object;)Ljava/util/SortedSet;': (jvm, obj, args) =>
+      subset(obj, (value) => compareValues(value, args[0]) >= 0),
+    'headSet(Ljava/lang/Object;)Ljava/util/SortedSet;': (jvm, obj, args) =>
+      subset(obj, (value) => compareValues(value, args[0]) < 0),
+    'subSet(Ljava/lang/Object;Ljava/lang/Object;)Ljava/util/SortedSet;':
+      (jvm, obj, args) => subset(obj, (value) =>
+        compareValues(value, args[0]) >= 0 &&
+        compareValues(value, args[1]) < 0),
   },
 };

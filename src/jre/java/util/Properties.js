@@ -64,6 +64,15 @@ module.exports = {
         items: new Set(keyStrings)
       };
     },
+    'entrySet()Ljava/util/Set;': (jvm, obj) => ({
+      type: 'java/util/HashSet',
+      items: new Set(Array.from(obj.properties, ([key, value]) => ({
+        type: 'java/util/Map$Entry',
+        key,
+        value,
+        backingMap: obj,
+      }))),
+    }),
     'clear()V': (jvm, obj, args) => {
       obj.properties.clear();
     },

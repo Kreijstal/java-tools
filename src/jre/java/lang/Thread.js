@@ -53,7 +53,11 @@ function initializeThread(jvm, obj, { runnable = null, name = null } = {},
 module.exports = {
   super: 'java/lang/Object',
   interfaces: ['java/lang/Runnable'],
-  staticFields: {},
+  staticFields: {
+    MIN_PRIORITY: 1,
+    NORM_PRIORITY: 5,
+    MAX_PRIORITY: 10,
+  },
   staticMethods: {
     'currentThread()Ljava/lang/Thread;': (jvm, obj, args) => {
       const internalThread = jvm.threads[jvm.currentThreadIndex];
@@ -81,9 +85,19 @@ module.exports = {
     'setDaemon(Z)V': (jvm, obj, args) => {
       obj.daemon = args[0];
     },
+    'isDaemon()Z': (jvm, obj) => obj.daemon ? 1 : 0,
     'setPriority(I)V': (jvm, obj, args) => {
-      obj.priority = args[0];
+      const priority = Number(args[0]);
+      if (priority < 1 || priority > 10) {
+        throw {
+          type: 'java/lang/IllegalArgumentException',
+          message: `priority out of range: ${priority}`,
+        };
+      }
+      obj.priority = priority;
     },
+    'getPriority()I': (jvm, obj) =>
+      obj.priority === undefined ? 5 : obj.priority,
     'getName()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.name);
     },

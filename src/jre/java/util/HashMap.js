@@ -13,7 +13,8 @@ function fieldValue(obj, name) {
   if (!obj) return undefined;
   if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
   if (obj.fields) {
-    const exact = Object.keys(obj.fields).find((key) => key.endsWith(`.${name}`));
+    const exact = Object.keys(obj.fields).find((key) =>
+      key.endsWith(`.${name}`) || key.includes(`.${name}:`));
     if (exact) return obj.fields[exact];
   }
   return undefined;
@@ -25,7 +26,59 @@ function bitSetKey(obj) {
   return bits.join(',');
 }
 
-function canonicalKey(key) {
+const hashFieldCache = new WeakMap();
+
+function declaredValueHashFields(jvm, type) {
+  const classData = jvm && jvm.classes && jvm.classes[type];
+  if (!classData) return null;
+  if (hashFieldCache.has(classData)) return hashFieldCache.get(classData);
+  const items = classData && classData.ast && classData.ast.classes[0] &&
+    classData.ast.classes[0].items;
+  if (!items) return false;
+  let equals = false;
+  let hashCodeMethod = null;
+  for (const item of items) {
+    if (item.type !== 'method' || !item.method) continue;
+    if (item.method.name === 'equals' &&
+        item.method.descriptor === '(Ljava/lang/Object;)Z') equals = true;
+    if (item.method.name === 'hashCode' &&
+        item.method.descriptor === '()I') hashCodeMethod = item.method;
+  }
+  if (!equals || !hashCodeMethod) {
+    hashFieldCache.set(classData, null);
+    return null;
+  }
+
+  const code = (hashCodeMethod.attributes || []).find((attribute) =>
+    attribute.type === 'code' && attribute.code);
+  const fields = [];
+  for (const item of code && code.code.codeItems || []) {
+    const instruction = item && item.instruction;
+    if (!instruction || instruction.op !== 'getfield' ||
+        !Array.isArray(instruction.arg) || !Array.isArray(instruction.arg[2])) continue;
+    const owner = instruction.arg[1];
+    const name = instruction.arg[2][0];
+    const key = `${owner}.${name}`;
+    if (!fields.includes(key)) fields.push(key);
+  }
+  const result = fields.length > 0 ? fields : null;
+  hashFieldCache.set(classData, result);
+  return result;
+}
+
+function identityKey(key) {
+  if (!Object.prototype.hasOwnProperty.call(key, '__hashMapIdentity')) {
+    Object.defineProperty(key, '__hashMapIdentity', {
+      value: HashMapIdentity.next++,
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return `object:${key.__hashMapIdentity}`;
+}
+
+function canonicalKey(key, jvm, seen = new WeakSet()) {
   if (key === null || key === undefined) return 'null';
   if (typeof key === 'number') return `number:${key}`;
   if (typeof key === 'bigint') return `bigint:${key.toString()}`;
@@ -37,21 +90,21 @@ function canonicalKey(key) {
 
   switch (type) {
     case 'org/benf/cfr/reader/bytecode/analysis/parse/utils/Pair':
-      return `${type}:${canonicalKey(fieldValue(key, 'x'))}:${canonicalKey(fieldValue(key, 'y'))}`;
+      return `${type}:${canonicalKey(fieldValue(key, 'x'), jvm, seen)}:${canonicalKey(fieldValue(key, 'y'), jvm, seen)}`;
     case 'org/benf/cfr/reader/bytecode/analysis/variables/Slot':
       return `${type}:${String(fieldValue(key, 'idx'))}`;
     case 'org/benf/cfr/reader/bytecode/analysis/variables/Ident':
       return `${type}:${String(fieldValue(key, 'stackpos'))}:${String(fieldValue(key, 'idx'))}`;
     case 'org/benf/cfr/reader/bytecode/analysis/parse/utils/SSAIdent':
-      return `${type}:${canonicalKey(fieldValue(key, 'val'))}`;
+      return `${type}:${canonicalKey(fieldValue(key, 'val'), jvm, seen)}`;
     case 'org/benf/cfr/reader/bytecode/analysis/variables/NamedVariableDefault':
       return `${type}:${javaString(fieldValue(key, 'name'))}`;
     case 'org/benf/cfr/reader/bytecode/analysis/variables/NamedVariableFromHint':
       return `${type}:${javaString(fieldValue(key, 'name'))}:${String(fieldValue(key, 'slot'))}:${String(fieldValue(key, 'idx'))}`;
     case 'org/benf/cfr/reader/bytecode/analysis/parse/lvalue/LocalVariable':
-      return `${type}:${canonicalKey(fieldValue(key, 'name'))}:${String(fieldValue(key, 'idx'))}:${canonicalKey(fieldValue(key, 'ident'))}`;
+      return `${type}:${canonicalKey(fieldValue(key, 'name'), jvm, seen)}:${String(fieldValue(key, 'idx'))}:${canonicalKey(fieldValue(key, 'ident'), jvm, seen)}`;
     case 'org/benf/cfr/reader/bytecode/analysis/parse/lvalue/SentinelLocalClassLValue':
-      return `${type}:${canonicalKey(fieldValue(key, 'localClassType'))}`;
+      return `${type}:${canonicalKey(fieldValue(key, 'localClassType'), jvm, seen)}`;
     case 'org/benf/cfr/reader/bytecode/analysis/types/JavaRefTypeInstance':
       return `${type}:${javaString(fieldValue(key, 'className'))}`;
     case 'org/benf/cfr/reader/bytecode/analysis/types/RawJavaType':
@@ -62,8 +115,8 @@ function canonicalKey(key) {
       break;
   }
 
-  if (type && type.endsWith('$SentinelNV')) {
-    return `${type}:${canonicalKey(fieldValue(key, 'typeInstance'))}`;
+  if (typeof type === 'string' && type.endsWith('$SentinelNV')) {
+    return `${type}:${canonicalKey(fieldValue(key, 'typeInstance'), jvm, seen)}`;
   }
 
   if (Object.prototype.hasOwnProperty.call(key, 'value')) {
@@ -82,15 +135,18 @@ function canonicalKey(key) {
     }
   }
 
-  if (!Object.prototype.hasOwnProperty.call(key, '__hashMapIdentity')) {
-    Object.defineProperty(key, '__hashMapIdentity', {
-      value: HashMapIdentity.next++,
-      enumerable: false,
-      configurable: false,
-      writable: false,
-    });
+  const valueHashFields = typeof type === 'string'
+    ? declaredValueHashFields(jvm, type)
+    : null;
+  if (key.fields && valueHashFields) {
+    if (seen.has(key)) return identityKey(key);
+    seen.add(key);
+    const fields = valueHashFields.map((name) =>
+      `${name}=${canonicalKey(key.fields[name], jvm, seen)}`);
+    seen.delete(key);
+    return `${type}:{${fields.join(',')}}`;
   }
-  return `object:${key.__hashMapIdentity}`;
+  return identityKey(key);
 }
 
 const HashMapIdentity = { next: 1 };
@@ -98,7 +154,7 @@ const HashMapIdentity = { next: 1 };
 function javaEquals(jvm, a, b) {
   if (a === b) return true;
   if (a === null || a === undefined || b === null || b === undefined) return false;
-  if (canonicalKey(a) === canonicalKey(b)) return true;
+  if (canonicalKey(a, jvm) === canonicalKey(b, jvm)) return true;
 
   const at = classNameOf(a);
   if (at && at === classNameOf(b)) {
@@ -134,8 +190,9 @@ function entriesFrom(collection) {
 
 function putEntry(jvm, obj, key, value) {
   const map = ensureMap(obj);
-  const ckey = canonicalKey(key);
+  const ckey = canonicalKey(key, jvm);
   const existing = map.get(ckey);
+  debugKey(jvm, 'put', key, ckey, !!existing);
   const oldValue = existing ? existing.value : undefined;
   map.set(ckey, { type: 'java/util/Map$Entry', key, value, backingMap: obj });
   return oldValue === undefined ? null : oldValue;
@@ -149,6 +206,14 @@ function copyEntries(jvm, target, source) {
 
 function mapValues(obj) {
   return Array.from(ensureMap(obj).values());
+}
+
+function debugKey(jvm, operation, key, canonical, found) {
+  const filter = typeof process !== 'undefined' && process.env
+    ? process.env.JVM_DEBUG_HASHMAP_KEY
+    : null;
+  if (!filter || classNameOf(key) !== filter) return;
+  console.error(`[hashmap] ${operation} type=${filter} key=${canonical} found=${found}`);
 }
 
 module.exports = {
@@ -178,17 +243,19 @@ module.exports = {
     'isEmpty()Z': (jvm, obj, args) => ensureMap(obj).size === 0 ? 1 : 0,
     'put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => putEntry(jvm, obj, args[0], args[1]),
     'get(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
-      const entry = ensureMap(obj).get(canonicalKey(args[0]));
+      const ckey = canonicalKey(args[0], jvm);
+      const entry = ensureMap(obj).get(ckey);
+      debugKey(jvm, 'get', args[0], ckey, !!entry);
       return entry ? entry.value : null;
     },
-    'containsKey(Ljava/lang/Object;)Z': (jvm, obj, args) => ensureMap(obj).has(canonicalKey(args[0])) ? 1 : 0,
+    'containsKey(Ljava/lang/Object;)Z': (jvm, obj, args) => ensureMap(obj).has(canonicalKey(args[0], jvm)) ? 1 : 0,
     'containsValue(Ljava/lang/Object;)Z': (jvm, obj, args) => {
       const value = args[0];
       return mapValues(obj).some((entry) => javaEquals(jvm, entry.value, value)) ? 1 : 0;
     },
     'remove(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
       const map = ensureMap(obj);
-      const ckey = canonicalKey(args[0]);
+      const ckey = canonicalKey(args[0], jvm);
       const entry = map.get(ckey);
       map.delete(ckey);
       return entry ? entry.value : null;
@@ -217,7 +284,7 @@ module.exports = {
     'putIfAbsent(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
       const key = args[0];
       const map = ensureMap(obj);
-      const ckey = canonicalKey(key);
+      const ckey = canonicalKey(key, jvm);
       const existing = map.get(ckey);
       if (!existing) {
         map.set(ckey, { type: 'java/util/Map$Entry', key, value: args[1], backingMap: obj });
@@ -227,28 +294,28 @@ module.exports = {
     },
     'replace(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
       const map = ensureMap(obj);
-      const ckey = canonicalKey(args[0]);
+      const ckey = canonicalKey(args[0], jvm);
       const entry = map.get(ckey);
       if (!entry) return null;
       const oldValue = entry.value;
       entry.value = args[1];
       return oldValue;
     },
-    'computeIfAbsent(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;': (jvm, obj, args) => {
+    'computeIfAbsent(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;': async (jvm, obj, args, thread) => {
       const key = args[0];
       const mappingFunction = args[1];
       const map = ensureMap(obj);
-      const ckey = canonicalKey(key);
+      const ckey = canonicalKey(key, jvm);
       const existing = map.get(ckey);
       if (existing) return existing.value;
       if (!mappingFunction) return null;
-      const newValue = mappingFunction.methods['apply(Ljava/lang/Object;)Ljava/lang/Object;'](null, mappingFunction, [key]);
+      const newValue = await invokeFunctional(jvm, mappingFunction, [key], thread);
       if (newValue === null || newValue === undefined) return null;
       map.set(ckey, { type: 'java/util/Map$Entry', key, value: newValue, backingMap: obj });
       return newValue;
     },
     'getOrDefault(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
-      const entry = ensureMap(obj).get(canonicalKey(args[0]));
+      const entry = ensureMap(obj).get(canonicalKey(args[0], jvm));
       return entry ? entry.value : args[1];
     },
   },
@@ -257,3 +324,4 @@ module.exports = {
     DEFAULT_INITIAL_CAPACITY: 16,
   },
 };
+const { invokeFunctional } = require('../../functional');

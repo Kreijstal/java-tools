@@ -743,19 +743,24 @@ class JreBootstrap {
     const classItems = [];
     if (jreClassDef) {
       // Add fields
-      if (jreClassDef.fields) {
-        for (const fieldSig in jreClassDef.fields) {
+      const declaredFields = new Set(Object.keys(jreClassDef.fields || {}));
+      for (const fieldSig of Object.keys(jreClassDef.staticFields || {})) {
+        declaredFields.add(fieldSig.replace(/'/g, ''));
+      }
+      for (const fieldSig of declaredFields) {
           const colon = fieldSig.indexOf(":");
           if (colon === -1) continue;
+          const isStatic = Object.keys(jreClassDef.staticFields || {})
+            .some((key) => key.replace(/'/g, '') === fieldSig);
           classItems.push({
             type: "field",
             field: {
               name: fieldSig.substring(0, colon),
               descriptor: fieldSig.substring(colon + 1),
-              flags: ["public"],
+              accessFlags: isStatic ? 0x0009 : 0x0001,
+              flags: isStatic ? ["public", "static"] : ["public"],
             },
           });
-        }
       }
       // Add regular methods
       if (jreClassDef.methods) {
