@@ -74,7 +74,7 @@ module.exports = {
       const self = jvm.jre["javax/sound/sampled/SourceDataLine"];
       self.methods["open(Ljavax/sound/sampled/AudioFormat;)V"](jvm, obj, args);
     },
-    "write([BII)I": withThrows((jvm, obj, args) => {
+    "write([BII)I": withThrows((jvm, obj, args, thread) => {
       const [buffer, offset, len] = args;
 
       if (!obj.audioOutput || !obj.isOpen) {
@@ -86,6 +86,15 @@ module.exports = {
 
       try {
         obj.audioOutput.write(toAudioBytes(buffer, offset, len));
+        if (thread && obj.audioOutput &&
+            typeof obj.audioOutput.queuedSeconds === "function" &&
+            obj.audioOutput.queuedSeconds() < 0.04) {
+          jvm._audioPriority = {
+            thread,
+            output: obj.audioOutput,
+            until: jvm.clock.millis() + 50,
+          };
+        }
         return len;
       } catch (error) {
         console.error("Audio write error:", error.message);

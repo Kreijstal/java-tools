@@ -5179,19 +5179,34 @@ animation timeline.
 The original guest lifecycle was subsequently audited end to end. It
 initializes the progress value to zero, increments it before drawing, renders
 1 through 250 at a 20 ms scheduler period, then takes its completion branch at
-251. The current diagnostic replays all 250 visible states, resets the captured
-initial raster only at the lifecycle boundary, and requires each complete loop
-to produce the same 307,200-pixel hash sequence. It deliberately excludes the
-raster array's extra sentinel element.
+251. The current diagnostic replays all 250 visible states and requires each
+complete loop to produce the same 307,200-pixel hash sequence. It deliberately
+excludes the raster array's extra sentinel element.
 
-Node 26.4 rendered two complete loops at 150.93 states/s with a 6.312 ms median
-guest state. Three clean headless Firefox 146.0.1 paced runs measured 34.06,
-35.63, and 33.63 states/s (34.06 median). Both runtimes produced loop hash
-`1069931322`, combined sequence hash `2650786977`, first hash `2929241493`,
-last hash `2521474463`, 175 unique surfaces, and 349/499 changed transitions.
-Firefox produced no page or JVM errors. The older 104 FPS Node and 42.61 FPS
-Firefox numbers are retained only as phase-jump throughput history and must not
-be cited as original-logo playback.
+The first full-timeline version still omitted the outer render path's
+per-frame framebuffer clear. Resetting only at a loop boundary left stale
+pixels and visible trails, so its hashes are invalid. The corrected harness
+finds the unique `()V` guest method that repeatedly reads the recovered raster
+field and stores zero without handlers, and executes that clear before every
+captured render. This is structural diagnostic selection, not an optimizer
+method-name rule.
+
+Node 26.4 rendered two corrected loops at 143.02 states/s with a 6.739 ms
+median guest state. Three clean headless Firefox 146.0.1 paced runs measured
+34.38, 31.45, and 34.56 states/s (34.38 median). Both runtimes produced loop
+hash `1711060353`, combined sequence hash `4093121037`, first hash
+`2929241493`, last hash `3053477317`, 225 unique surfaces, and 449/499 changed
+transitions. Firefox produced no page or JVM errors. Visual checkpoints at the
+reveal, highlight sweep, and completed logo no longer retain fragments from
+prior frames. The older 104 FPS Node and 42.61 FPS Firefox numbers are retained
+only as phase-jump throughput history and must not be cited as original-logo
+playback.
+
+One remote report measured 0.92 FPS, 1,079.9 ms median guest time, and
+7,923.696 scheduler slices per state. Its telemetry showed tier `generated`,
+mode `tight`, and zero structured/fused/scalar counters: it deliberately
+disabled the optimized path. The diagnostic now labels that choice “Slow
+control (optimizations off)” and warns prominently when selected.
 
 The measured browser bundle was
 `537299a0ff80342f0133e537bf4c082a8ea61b3e66074f066234a4eb892f7dee`;
@@ -5626,3 +5641,159 @@ locals and retains long cross-block local/join-slot copy chains. The next
 generic experiment should simplify SSA copies and phis, or split a verified
 region at safe boundaries; method-name-selected kernels are neither necessary
 nor justified by this profile.
+
+## 2026-07-29: archive, BZip2, kerning, and initialization-site audit
+
+This pass targeted bytecode and data-flow shapes only. No optimizer decision
+uses the guest names `eh`, `kh`, `ad`, `td`, or `mm`; those identities appear
+only in the diagnostic probe that reports which real game bodies exercised a
+generic rule.
+
+The three archive/reader bodies are not ordinary reducible scalar loops:
+
+- the 430-item reader/archive body has 15 retreating edges and an irreducible
+  CFG;
+- the 451-item cache reader has two retreating edges but fails structured
+  operand-stack verification;
+- the 758-item archive unpacker has 16 retreating edges and a verified
+  `dup_x2` form that the structured renderer cannot yet represent.
+
+All three also carry a boolean static across guest calls. Partial Wasm must
+continue rejecting that shape until every exit has a verifier-backed spill:
+losing the boolean local can change arbitrary control flow. A measured
+experiment that merely exposed the real backedges to the existing large
+switch-based JavaScript compiler increased Firefox first-paint time to
+35.477 seconds, so it was reverted. This is important negative evidence:
+making an existing tier accept more methods is not automatically an
+optimization.
+
+The retained generic changes are:
+
+- resolved instance fields in baseline generated bodies use their verified
+  owner-qualified object slot directly, with the generic resolver as fallback;
+- resolved static fields use direct map/object targets guarded by stable
+  class-initialization tokens;
+- interpreted `getstatic`, bytecode static calls, generated static calls, and
+  generated static fields reuse the same stable tokens instead of repeating a
+  `classInitializationState.get` at every hot site;
+- direct mutations and state restore refresh those tokens, preserving debugger
+  and snapshot semantics;
+- call-bearing structured SSA methods can cache non-volatile field reads, but
+  every guest call or field write invalidates the cache;
+- array-field values snapshot their raw storage companion, so invalidating or
+  rebinding a field cache cannot retarget an older live SSA array reference.
+
+The real BZip2 body compiles all 139/139 Wasm blocks and completed one measured
+run with zero exits. Its structured-JavaScript fallback now has 21 verified
+field caches and 37 direct sentinel-checked array loads. The real font-kerning
+body compiled 45/55 Wasm blocks, completed three measured runs with zero exits,
+and its structured fallback has two field caches. These are structural
+results, not guest-identity special cases.
+
+An opt-in dense-array policy was also added for experimentation. It requires a
+substantial method, at least 24 primitive-array operations, a real backedge,
+only statically linkable calls, and no dynamic calls. Enabling it by default
+moved Wasm compilation earlier but worsened the clean three-run Firefox
+first-paint median from 16.405 to 17.481 seconds. It remains disabled by
+default (`JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST=1`) rather than shipping that
+regression.
+
+The final pre-load-spike interleaved control pair painted in 19.144 seconds for
+the old bundle and 18.563 seconds for the retained optimized build; the
+corresponding archive windows were 7.168 and 6.798 seconds. This is only a
+modest paired improvement and is not enough evidence for a broad speedup
+claim. Later three-run measurements became invalid for comparison because
+unrelated QEMU and Wine processes saturated the host: the optimized runs were
+20.247, 32.491, and 46.799 seconds, while a contemporaneous old-bundle control
+took 57.266 seconds. All recorded runs had zero page/runtime errors.
+
+The focused JIT suite passes 958/958 assertions. It checks structural
+dense-array selection and rejection, static-token invalidation, 100 warm
+interpreted static reads with one initial map lookup, 100 generated static
+reads with no repeated lookup, and array-field cache invalidation across guest
+effects. Scheduler/JIT edge tests pass 127/127, and the production build
+completes with only the existing four webpack size/dynamic-dependency warnings.
+
+Reproducibility:
+
+- java-tools commit before the dirty working changes:
+  `b70840200e76c9a135ac3df4b8c05c215b220266`;
+- final bundle SHA-256:
+  `8d1baab37604a7ea572e99cac1f0d387583366adfb453236cfb433b9bf821432`;
+- untouched `dekobloko.jar` SHA-256:
+  `a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`;
+- Node `v26.4.0`, npm `12.0.1`, Firefox Playwright build 1509;
+- browser query gate `schedulerRate=256`, default structured optimizer,
+  default Wasm JIT, dense-array Wasm-first disabled;
+- the java-tools tree was dirty with pre-existing audio, renderer, IDE, and
+  documentation work as well as this pass.
+
+## 2026-07-29: missing title instruments were a launcher override
+
+The title-screen music defect was not caused by WebAudio, stereo conversion,
+asset corruption, or the guest Vorbis implementation. The game launcher had
+registered an application-specific JRE override for the guest method with
+descriptor `(I)[F`; that override returned `null` for every packet. The normal
+guest caller treats `null` as “no overlap samples for this packet”, so it
+continued through the archive and constructed correctly sized, entirely
+zero-filled PCM buffers. This also explains why the isolated audio diagnostic,
+which did not install the launcher override, always sounded correct.
+
+The launcher override was removed. No guest class or method identity was added
+to the JIT, and a speculative structural JIT bailout was discarded after the
+override was found.
+
+The instrumented Firefox game then matched the standalone decoder exactly for
+the three title samples that had been silent:
+
+| decoded length | nonzero samples | FNV checksum |
+|---:|---:|---:|
+| 10,654 | 10,291 | 3,217,290,969 |
+| 13,203 | 12,098 | 2,371,258,599 |
+| 161,752 | 115,114 | 1,724,468,494 |
+
+The first large live decode likewise changed from 0 nonzero bytes to 302,827
+nonzero bytes out of 400,787. The title-mix report recorded no silent voices,
+and every observed voice backed by those samples changed its destination
+buffer.
+
+Validation used Firefox Playwright build 1509, production JVM bundle SHA-256
+`f32a24990fec7b742e3e9ed3dcda204efa361b4d485cec76a5676a3ea6379b82`,
+untouched game JAR SHA-256
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+and trace JAR SHA-256
+`67d907f87a071db647981a3cfe39c090ad334754394403c27bf1b759dcd3614f`.
+The focused JIT suite passed 963/963 assertions and the production bundle
+built successfully with the four existing size/dynamic-dependency warnings.
+
+## 2026-07-29: short sound effects and AudioWorklet startup buffering
+
+After restoring the music decoder, music was audible but the separate
+sound-effect output was not. Browser telemetry showed that this was downstream
+of the guest mixer: the 8 KiB `SourceDataLine` repeatedly supplied nonzero PCM
+with peaks up to roughly 0.5, while the 64 KiB music line played normally.
+
+The AudioWorklet used the same 80 ms startup cushion for both outputs. At
+22,050 Hz that is 1,764 frames, but the effect line naturally publishes
+512-frame regions and many observed short outputs contained only 1,024–1,536
+frames. Their PCM reached the worklet queue but could be replaced or closed
+before the processor ever started.
+
+Worklet startup now retains the 80 ms ceiling for continuous streams while
+limiting the threshold to the output's first natural coalesced region. The
+music line therefore remains at 1,764 frames and the effect line starts at 512
+frames. This is derived from negotiated format and buffer sizes; it contains
+no game, class, method, or track identity.
+
+The focused WebAudio test passes 34/34 assertions. Its fake worklet verifies
+that one 512-frame region both meets the effect-line threshold and is posted to
+the processor. A clean Firefox probe of the deployed game reported a running
+audio context and these live contracts:
+
+| line buffer | coalesced region | startup threshold |
+|---:|---:|---:|
+| 65,536 bytes | 2,048 frames | 1,764 frames |
+| 8,192 bytes | 512 frames | 512 frames |
+
+The deployed production bundle SHA-256 is
+`2fa7b65f454986bbdbd7849260b661817f67a35b30185bd0213c6493be1c8145`.

@@ -1,3 +1,7 @@
+const {
+  classInitializationTokenFor,
+} = require('./utils');
+
 function runtimeClassName(objRef) {
   if (typeof objRef === 'string' || objRef instanceof String) {
     return 'java/lang/String';
@@ -116,7 +120,8 @@ function readStaticFieldSite(jvm, site) {
 
 function getstaticSync(frame, instruction, jvm, thread) {
   const [_, className, [fieldName, descriptor]] = instruction.arg;
-  const state = jvm.classInitializationState.get(className);
+  const state =
+    classInitializationTokenFor(jvm, instruction, className).state;
   if (state !== 'INITIALIZED' &&
       !(state === 'INITIALIZING' &&
         jvm.classInitializationOwners.get(className) === thread.id)) {

@@ -10,11 +10,16 @@ const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
 const HandwrittenPolygonRaster = require("./HandwrittenPolygonRaster");
 const HandwrittenTiledBlit = require("./HandwrittenTiledBlit");
 const HandwrittenPerspectiveSpan = require("./HandwrittenPerspectiveSpan");
+const HandwrittenAffineSpriteRaster = require("./HandwrittenAffineSpriteRaster");
 const monoArray = require("./monoArray");
 const {
   normalizeArrayLoad,
   normalizeArrayStore,
 } = require("../instructions/utils");
+const {
+  isReflectiveTarget,
+  completeReflectiveCall,
+} = require("../instructions/control");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
@@ -118,6 +123,13 @@ class JitCompiler {
     this.perspectiveSpanIntrinsicCache = new WeakMap();
     this.perspectiveSpanRunCount = 0;
     this.perspectiveSpanGuardedFallbackCount = 0;
+    this.affineSpriteRasterEnabled =
+      options.affineSpriteRaster !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_AFFINE_SPRITE_RASTER === "1");
+    this.affineSpriteRasterIntrinsicCache = new WeakMap();
+    this.affineSpriteRasterRunCount = 0;
+    this.affineSpriteRasterGuardedFallbackCount = 0;
     this.semanticBilinearSamplerRunCount = 0;
     this.semanticBilinearSamplerFallbackCount = 0;
     this.transparentIntBlitRunCount = 0;
@@ -256,6 +268,12 @@ class JitCompiler {
       options.longArithmeticWasmFirst !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_LONG_ARITHMETIC_WASM_FIRST === "1");
+    this.arrayKernelWasmFirstMethods = new WeakMap();
+    this.arrayKernelWasmFirstMethodCount = 0;
+    this.arrayKernelWasmFirstEnabled =
+      options.arrayKernelWasmFirst === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.rendererPipelineEnabled = options.rendererPipeline === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
@@ -396,7 +414,8 @@ class JitCompiler {
     }
     const wasmPriorityLoop = this.wasmJit.enabled &&
       (this.isOversizedLoopMethod(frame.method) ||
-        this.isLongArithmeticLoopMethod(frame.method));
+        this.isLongArithmeticLoopMethod(frame.method) ||
+        this.isArrayKernelWasmFirstMethod(frame.method));
     const wholeMethodPreferred =
       this.prefersWholeMethodJs(frame.method) && !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
@@ -524,6 +543,45 @@ class JitCompiler {
     return selected;
   }
 
+  isArrayKernelWasmFirstMethod(method) {
+    if (!this.arrayKernelWasmFirstEnabled ||
+        !method || method.name === "<init>" || method.name === "<clinit>") {
+      return false;
+    }
+    if (this.arrayKernelWasmFirstMethods.has(method)) {
+      return this.arrayKernelWasmFirstMethods.get(method);
+    }
+    const codeItems = this.getCodeItems(method);
+    let instructionCount = 0;
+    let primitiveArrayAccessCount = 0;
+    let staticCallCount = 0;
+    let nonStaticCallCount = 0;
+    for (const item of codeItems) {
+      const op = getOp(item && item.instruction);
+      if (!op) continue;
+      instructionCount += 1;
+      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
+        primitiveArrayAccessCount += 1;
+      }
+      if (op === "invokestatic") staticCallCount += 1;
+      else if (op === "invokevirtual" || op === "invokeinterface" ||
+          op === "invokespecial") nonStaticCallCount += 1;
+    }
+    // Dense primitive-array kernels with only statically linkable helpers are
+    // a better fit for Wasm than a JavaScript generator: the loops keep
+    // unboxed indices/values and linked helper calls stay in one module.
+    // Require substantial bytecode and array density so ordinary archive/UI
+    // methods do not pay module compilation or Wasm/JS transition costs.
+    const selected = instructionCount >= 192 &&
+      primitiveArrayAccessCount >= 24 &&
+      staticCallCount <= 32 &&
+      nonStaticCallCount === 0 &&
+      this.hasBackwardBranch(method);
+    this.arrayKernelWasmFirstMethods.set(method, selected);
+    if (selected) this.arrayKernelWasmFirstMethodCount += 1;
+    return selected;
+  }
+
   prefersWholeMethodJs(method) {
     return this.preferWholeMethodJs ||
       this.adaptiveCodegenMethods.has(method);
@@ -600,8 +658,15 @@ class JitCompiler {
       }
       return HANDLED_RESULT;
     }
-    if (result && result.returned && result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(result.value);
+    if (result && result.returned) {
+      if (isReflectiveTarget(thread, frame)) {
+        completeReflectiveCall(
+          thread,
+          result.value === RETURN_VOID ? null : result.value,
+        );
+      } else if (result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
+        thread.callStack.peek().stack.push(result.value);
+      }
     }
     return HANDLED_RESULT;
   }
@@ -3055,21 +3120,60 @@ class JitCompiler {
       }
       case "getfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
+        const site = this.fieldSites[fieldSiteId];
+        if (site.directInstanceKey) {
+          const key = JSON.stringify(site.directInstanceKey);
+          return `{ const object = stack[sp - 1]; stack[sp - 1] = ` +
+            `(object !== null && object !== undefined && object.fields && ` +
+            `object.fields[${key}] !== undefined) ? object.fields[${key}] : ` +
+            `helpers.getFieldAt(${fieldSiteId}, object); } ${goNext}`;
+        }
         return `stack[sp - 1] = helpers.getFieldAt(${fieldSiteId}, stack[sp - 1]); ${goNext}`;
       }
       case "putfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
+        const site = this.fieldSites[fieldSiteId];
+        if (site.directInstanceKey) {
+          const key = JSON.stringify(site.directInstanceKey);
+          const fieldName = JSON.stringify(site.fieldName);
+          return `{ const value = stack[--sp]; const object = stack[--sp]; ` +
+            `if (object !== null && object !== undefined && object.fields && ` +
+            `Object.prototype.hasOwnProperty.call(object.fields, ${key})) { ` +
+            `object.fields[${key}] = value; object[${fieldName}] = value; ` +
+            `} else { helpers.putFieldAt(${fieldSiteId}, object, value); } } ${goNext}`;
+        }
         return `{ const value = stack[--sp]; helpers.putFieldAt(${fieldSiteId}, stack[--sp], value); } ${goNext}`;
       }
       case "getstatic":
         if (this.compileSynchronous) {
           const fieldSiteId = this.registerFieldSite(instruction.arg);
+          const direct = this.registerDirectStaticTarget(fieldSiteId);
+          if (direct) {
+            const target = `helpers.directStaticTargets[${direct.targetId}]`;
+            const read = direct.kind === "map"
+              ? `${target}.fields.get(${JSON.stringify(direct.key)})`
+              : `${target}.fields[${JSON.stringify(direct.key)}]`;
+            return `{ const target = ${target}; if (!target.initializationToken.initialized) { ` +
+              `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+              `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
+              `reason: "class initialization at direct synchronous getstatic" }; } ` +
+              `stack[sp++] = ${read}; } ${goNext}`;
+          }
           return `{ const value = helpers.getStaticSyncAt(${fieldSiteId}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack[sp++] = value; } ${goNext}`;
         }
         return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack[sp++] = value; } ${goNext}`;
       case "putstatic":
         if (this.compileSynchronous) {
           const fieldSiteId = this.registerFieldSite(instruction.arg);
+          const direct = this.registerDirectStaticTarget(fieldSiteId, true);
+          if (direct?.kind === "map") {
+            const target = `helpers.directStaticTargets[${direct.targetId}]`;
+            return `{ const target = ${target}; if (!target.initializationToken.initialized) { ` +
+              `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+              `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
+              `reason: "class initialization at direct synchronous putstatic" }; } ` +
+              `target.fields.set(${JSON.stringify(direct.key)}, stack[--sp]); } ${goNext}`;
+          }
           return `{ const changed = helpers.putStaticSyncAt(${fieldSiteId}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
         }
         return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[sp - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } sp -= 1; } ${goNext}`;
@@ -3757,6 +3861,7 @@ class JitCompiler {
       className,
       fieldName,
       descriptor,
+      initializationToken: this.jvm.getClassInitializationToken(className),
       directKey: `${className}.${fieldName}`,
       directInstanceKey,
       instanceKeys: new Map(),
@@ -3888,6 +3993,7 @@ class JitCompiler {
     }
     if (!target || (forWrite && target.kind !== "map")) return null;
     site.staticTarget = target;
+    target.initializationToken = site.initializationToken;
     const targetId = this.directStaticTargets.length;
     this.directStaticTargets.push(target);
     return { targetId, kind: target.kind, key: target.key, className: site.className };
@@ -3896,7 +4002,7 @@ class JitCompiler {
   getStaticSyncAt(id) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated static field site ${id}`);
-    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+    if (!site.initializationToken.initialized) {
       return STATIC_DEOPT;
     }
     let target = site.staticTarget;
@@ -3915,7 +4021,7 @@ class JitCompiler {
   putStaticSyncAt(id, value) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated static field site ${id}`);
-    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+    if (!site.initializationToken.initialized) {
       return STATIC_DEOPT;
     }
     let target = site.staticTarget;
@@ -4106,6 +4212,8 @@ class JitCompiler {
       declaredClassName,
       methodName,
       descriptor,
+      initializationToken:
+        this.jvm.getClassInitializationToken(declaredClassName),
       ...parseDescriptor(descriptor),
       targets: new Map(),
     };
@@ -4147,7 +4255,7 @@ class JitCompiler {
     }
     const fast = site.fastIntrinsic;
     if (fast) {
-      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED" ||
+      if (!site.initializationToken.initialized ||
           this.jvm.debugManager.isClassJitDeopted(fast.lookupClass)) {
         return ASYNC_INVOKE;
       }
@@ -4166,7 +4274,7 @@ class JitCompiler {
     }
     const target = site.fastStaticTarget;
     if (target) {
-      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED") {
+      if (!site.initializationToken.initialized) {
         return ASYNC_INVOKE;
       }
       return this.tryInvokeResolvedTarget(site, target, frame, thread);
@@ -4220,6 +4328,9 @@ class JitCompiler {
 
   tryInvokeSync(op, frame, instruction, thread) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const initializationToken = op === "invokestatic"
+      ? this.jvm.getClassInitializationToken(declaredClassName)
+      : null;
     return this.tryInvokeSyncSite({
       op,
       declaredClassName,
@@ -4227,6 +4338,7 @@ class JitCompiler {
       descriptor,
       ...parseDescriptor(descriptor),
       targets: new Map(),
+      initializationToken,
     }, frame, thread);
   }
 
@@ -4281,6 +4393,11 @@ class JitCompiler {
       target.positionalInvoker =
         generated.jvmRestoringDirectPositionalBody.bind(null, this, plan);
       target.positionalInvoker.jvmDebugGuarded = true;
+      // The restoring scalar ABI reconstructs an omitted child Frame at the
+      // precise throwing operation. Its caller must therefore retain the
+      // invoke pc and operands until the ordinary exception dispatcher has
+      // processed that reconstructed frame.
+      target.positionalInvoker.jvmRestoresExceptionFrames = true;
       return target.positionalInvoker;
     }
     const argumentsList = Array.from(
@@ -4297,7 +4414,7 @@ class JitCompiler {
       local += site.params[index] === "long" || site.params[index] === "double" ? 2 : 1;
     }
     const staticGuard = site.op === "invokestatic"
-      ? `if (jit.jvm.classInitializationState.get(plan.staticOwner) !== "INITIALIZED") return plan.asyncInvoke;`
+      ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
     const tracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
@@ -4424,6 +4541,7 @@ class JitCompiler {
         jit: this,
         target,
         Frame,
+        staticInitialization: site.initializationToken,
         method,
         methodKey,
         generated,
@@ -4477,7 +4595,7 @@ class JitCompiler {
       : `plan.method(plan.jvm, ${receiver}, [${
         callArguments.join(", ")}], thread)`;
     const staticGuard = site.op === "invokestatic"
-      ? `if (plan.jvm.classInitializationState.get(plan.staticOwner) !== "INITIALIZED") return plan.asyncInvoke;`
+      ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
     const source = [
       "'use strict';",
@@ -4502,6 +4620,7 @@ class JitCompiler {
         method: target.method,
         direct,
         staticOwner: site.declaredClassName,
+        staticInitialization: site.initializationToken,
         asyncMethod: ASYNC_METHOD_SENTINEL,
         asyncInvoke: ASYNC_INVOKE,
         returnVoid: RETURN_VOID,
@@ -4517,7 +4636,7 @@ class JitCompiler {
   tryInvokeSyncSite(site, frame, thread) {
     const { op, declaredClassName, methodName, descriptor, params, returnType } = site;
     if (op === "invokestatic" &&
-        this.jvm.classInitializationState.get(declaredClassName) !== "INITIALIZED") {
+        !site.initializationToken.initialized) {
       return ASYNC_INVOKE;
     }
 
@@ -4590,11 +4709,21 @@ class JitCompiler {
       const structuralIntrinsic = op === "invokestatic"
         ? this.getSynchronousIntrinsic(method, descriptor)
         : null;
-      const pendingIntrinsicOwners = op === "invokestatic" && !structuralIntrinsic
-        ? HandwrittenPolygonRaster.candidateDependencies(this, method, descriptor)
+      const pendingIntrinsicCandidates =
+        op === "invokestatic" && !structuralIntrinsic ? [
+          ...(HandwrittenPolygonRaster.candidateDependencies(
+            this, method, descriptor) || []),
+          ...(HandwrittenAffineSpriteRaster.candidateDependencies(
+            this, method, descriptor) || []),
+        ] : null;
+      const pendingIntrinsicOwners = pendingIntrinsicCandidates?.length
+        ? [...new Set(pendingIntrinsicCandidates)]
         : null;
       if (!normallySupported && !fusedCandidate &&
-          !structuralIntrinsic && !pendingIntrinsicOwners) return ASYNC_INVOKE;
+          !structuralIntrinsic &&
+          (!pendingIntrinsicOwners || pendingIntrinsicOwners.length === 0)) {
+        return ASYNC_INVOKE;
+      }
       target = {
         method,
         lookupClass,
@@ -4945,6 +5074,17 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
+    if (HandwrittenAffineSpriteRaster.DESCRIPTOR.test(descriptor)) {
+      if (this.affineSpriteRasterIntrinsicCache.has(method)) {
+        return this.affineSpriteRasterIntrinsicCache.get(method);
+      }
+      const affineSpriteRaster = HandwrittenAffineSpriteRaster.createIntrinsic(
+        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+      if (affineSpriteRaster) {
+        this.affineSpriteRasterIntrinsicCache.set(method, affineSpriteRaster);
+        return affineSpriteRaster;
+      }
+    }
     if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
       if (this.perspectiveSpanIntrinsicCache.has(method)) {
         return this.perspectiveSpanIntrinsicCache.get(method);
@@ -6586,7 +6726,8 @@ class JitCompiler {
     } else if (intrinsic.jvmDirectKind === "polygonFlatRaster" ||
         intrinsic.jvmDirectKind === "polygonAlphaRaster" ||
         intrinsic.jvmDirectKind === "tiledIntArrayBlit" ||
-        intrinsic.jvmDirectKind === "perspectiveTexturedSpan") {
+        intrinsic.jvmDirectKind === "perspectiveTexturedSpan" ||
+        intrinsic.jvmDirectKind === "affineSpriteRaster") {
       if (typeof intrinsic.jvmPositional !== "function") return null;
       direct.positionalId = this.directSynchronousIntrinsics.length;
       this.directSynchronousIntrinsics.push(intrinsic.jvmPositional);

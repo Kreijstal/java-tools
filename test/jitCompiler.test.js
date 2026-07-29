@@ -10,15 +10,36 @@ const { JVM } = require('../src/core/jvm');
 const { _test: wasmJitTest } = require('../src/jit/WasmJit');
 const {
   supportsWasmTryTable,
+  mathIntrinsicFunction,
 } = require('../src/jit/wasmShared');
 const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
 const HandwrittenFusedGradient = require('../src/jit/HandwrittenFusedGradient');
+const HandwrittenAffineSpriteRaster =
+  require('../src/jit/HandwrittenAffineSpriteRaster');
 const invokeHandlers = require('../src/instructions/invoke');
+const objectHandlers = require('../src/instructions/object');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const awt = require('../src/platform/awt');
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
+
+test('Wasm Math imports preserve exact Java long semantics', (t) => {
+  const abs = mathIntrinsicFunction('abs', '(J)J');
+  const max = mathIntrinsicFunction('max', '(JJ)J');
+  const min = mathIntrinsicFunction('min', '(JJ)J');
+  const minimumLong = -0x8000000000000000n;
+  t.equal(abs(-37n), 37n, 'long abs never crosses through Number');
+  t.equal(abs(minimumLong), minimumLong,
+    'Long.MIN_VALUE abs preserves Java overflow semantics');
+  t.equal(max(0x7fffffffffffffffn, -1n), 0x7fffffffffffffffn,
+    'long max remains exact above Number safe-integer range');
+  t.equal(min(-0x8000000000000000n, 1n), minimumLong,
+    'long min remains exact below Number safe-integer range');
+  t.equal(mathIntrinsicFunction('sqrt', '(J)J'), null,
+    'nonexistent long Math overloads stay outside the intrinsic tier');
+  t.end();
+});
 
 test('handwritten region fingerprints ignore guest class and method names', (t) => {
   const shape = (owner, dependency, methodName, fieldName, constant = 7) => ({
@@ -42,6 +63,207 @@ test('handwritten region fingerprints ignore guest class and method names', (t) 
   t.equal(renamed, original,
     'consistent owner, member, and descriptor renaming leaves the shape unchanged');
   t.notEqual(altered, original, 'an altered bytecode constant changes the verified shape');
+  t.end();
+});
+
+test('affine sprite raster preserves Java sampling and rejects before writes', (t) => {
+  const { roundedFloorDivide, runRaster } = HandwrittenAffineSpriteRaster._test;
+  for (let numerator = -7; numerator <= 7; numerator += 1) {
+    t.equal(roundedFloorDivide(3, numerator), Math.floor(numerator / 3),
+      `verified division helper preserves floor semantics for ${numerator}`);
+  }
+
+  const base = {
+    width: 2,
+    height: 2,
+    source: Int32Array.from([10, 20, 30, 40]),
+    mask: null,
+    destination: new Int32Array(4),
+    clipOuterStart: 0,
+    clipOuterEnd: 2,
+    clipInnerStart: 0,
+    clipInnerEnd: 2,
+    surfaceStride: 2,
+  };
+  const args = [0, 2, 0, 0, 2, 2, 0, 0, 0, -1];
+  t.ok(runRaster(base, args), 'ordinary affine raster input is accepted');
+  t.deepEqual(Array.from(base.destination), [10, 20, 30, 40],
+    'column scan writes the same moving source coordinates');
+
+  const masked = {
+    ...base,
+    mask: Int8Array.from([1, 0, 1, 1]),
+    destination: new Int32Array(4),
+  };
+  t.ok(runRaster(masked, args), 'masked affine raster input is accepted');
+  t.deepEqual(Array.from(masked.destination), [10, 0, 30, 40],
+    'mask coordinates independently suppress source pixels');
+
+  const invalidDestination = Int32Array.from([101, 102, 103]);
+  const invalid = {
+    ...base,
+    destination: invalidDestination,
+  };
+  t.notOk(runRaster(invalid, args), 'short destination rejects the fast path');
+  t.deepEqual(Array.from(invalidDestination), [101, 102, 103],
+    'bounds rejection happens before the first destination write');
+
+  const negativeSourceX = {
+    ...base,
+    destination: Int32Array.from([201, 202, 203, 204]),
+  };
+  t.notOk(runRaster(negativeSourceX,
+    [0, 2, 0, 0, 2, 2, 0, 0, -4, -1]),
+  'unsupported negative remainder rejects the fast path');
+  t.deepEqual(Array.from(negativeSourceX.destination), [201, 202, 203, 204],
+    'source-coordinate rejection is also side-effect free');
+  t.end();
+});
+
+function referenceAffineSpriteRaster(data, inputArgs) {
+  const divide = (numerator, denominator) => (numerator / denominator) | 0;
+  const floorDivide = (denominator, numerator) => {
+    const sign = numerator >>> 31;
+    return (divide((numerator + sign) | 0, denominator) - sign) | 0;
+  };
+  const args = inputArgs.map(value => value | 0);
+  const [outerStart, outerEnd, leftStart, leftEnd, rightStart, rightEnd,
+    dim, blend, sourceOffset, maskOverride] = args;
+  const outerSpan = (outerEnd - outerStart) | 0;
+  let firstOuter = outerStart;
+  if (firstOuter < data.clipOuterStart) firstOuter = data.clipOuterStart;
+  let lastOuter = outerEnd;
+  if (lastOuter > data.clipOuterEnd) lastOuter = data.clipOuterEnd;
+  for (let outer = firstOuter; outer < lastOuter; outer += 1) {
+    let maskX = divide((
+      Math.imul(data.width, (outer - outerStart) | 0) +
+      (outerSpan >> 1)
+    ) | 0, outerSpan);
+    if (maskX >= data.width) maskX = (data.width - 1) | 0;
+    const sourceX = ((maskX + sourceOffset) | 0) % data.width;
+    if (maskOverride >= 0) maskX = maskOverride;
+    const leftDelta = (leftEnd - leftStart) | 0;
+    const rightDelta = (rightEnd - rightStart) | 0;
+    const left = (
+      Math.imul(leftStart, outerSpan) +
+      Math.imul(leftDelta, (outer - outerStart) | 0) +
+      (leftDelta >> 1)
+    ) | 0;
+    const right = (
+      Math.imul(rightStart, outerSpan) +
+      Math.imul(rightDelta, (outer - outerStart) | 0) +
+      (rightDelta >> 1)
+    ) | 0;
+    const innerSpan = (right - left) | 0;
+    let firstInner = floorDivide(
+      outerSpan, (left + (outerSpan >> 1)) | 0);
+    if (firstInner < data.clipInnerStart) firstInner = data.clipInnerStart;
+    let lastInner = floorDivide(
+      outerSpan, (right + (outerSpan >> 1)) | 0);
+    if (lastInner > data.clipInnerEnd) lastInner = data.clipInnerEnd;
+    if (lastInner <= firstInner) continue;
+    let sourceFixed = (
+      Math.imul(data.height,
+        (Math.imul(firstInner, outerSpan) - left) | 0) +
+      (innerSpan >> 1)
+    ) | 0;
+    let sourceFixedLast = (
+      Math.imul(data.height,
+        (Math.imul((lastInner - 1) | 0, outerSpan) - left) | 0) +
+      (innerSpan >> 1)
+    ) | 0;
+    if (sourceFixed <= -innerSpan) sourceFixed = (-innerSpan + 1) | 0;
+    const sourceLimit = Math.imul(data.height, innerSpan);
+    if (sourceFixed >= sourceLimit) sourceFixed = (sourceLimit - 1) | 0;
+    if (sourceFixedLast >= sourceLimit) {
+      sourceFixedLast = (sourceLimit - 1) | 0;
+    }
+    let sourceStep = 0;
+    if (sourceFixedLast > sourceFixed) {
+      sourceStep = divide(
+        (sourceFixedLast - sourceFixed) | 0,
+        (lastInner - firstInner - 1) | 0);
+    }
+    let destinationIndex =
+      (Math.imul(firstInner, data.surfaceStride) + outer) | 0;
+    for (let inner = firstInner; inner < lastInner; inner += 1) {
+      const sourceY = divide(sourceFixed, innerSpan);
+      const sourceRow = Math.imul(sourceY, data.width);
+      let color = data.source[(sourceRow + sourceX) | 0] | 0;
+      if (color !== 0 &&
+          (!data.mask || (data.mask[(sourceRow + maskX) | 0] | 0) !== 0)) {
+        if (dim) color = (color >> 1) & 8355711;
+        if (blend) {
+          color = (
+            color + ((data.destination[destinationIndex] >> 1) & 8355711)
+          ) | 0;
+        }
+        data.destination[destinationIndex] = color;
+      }
+      destinationIndex = (destinationIndex + data.surfaceStride) | 0;
+      sourceFixed = (sourceFixed + sourceStep) | 0;
+    }
+  }
+}
+
+test('affine sprite raster differentially matches 200 moving invocations', (t) => {
+  const { runRaster } = HandwrittenAffineSpriteRaster._test;
+  let randomState = 0x51f15e;
+  const random = () => {
+    randomState = (Math.imul(randomState, 1664525) + 1013904223) >>> 0;
+    return randomState;
+  };
+  const failures = [];
+  for (let invocation = 0; invocation < 200; invocation += 1) {
+    const width = 1 + random() % 6;
+    const height = 1 + random() % 6;
+    const source = Int32Array.from({ length: width * height }, () =>
+      random() % 5 === 0 ? 0 : random() & 0xffffff);
+    const mask = invocation % 3 === 0
+      ? Int8Array.from({ length: width * height }, () => random() & 1)
+      : null;
+    const initial = Int32Array.from({ length: 16 * 16 }, () =>
+      random() & 0xffffff);
+    const actual = initial.slice();
+    const expected = initial.slice();
+    const outerStart = random() % 4;
+    const outerSpan = 2 + random() % 8;
+    const leftStart = random() % 4;
+    const leftEnd = random() % 4;
+    const drawWidth = 1 + random() % 7;
+    const args = [
+      outerStart,
+      outerStart + outerSpan,
+      leftStart,
+      leftEnd,
+      leftStart + drawWidth,
+      leftEnd + drawWidth,
+      random() & 1,
+      random() & 1,
+      random() % width,
+      invocation % 4 === 0 ? random() % width : -1,
+    ];
+    const shared = {
+      width,
+      height,
+      source,
+      mask,
+      clipOuterStart: random() % 4,
+      clipOuterEnd: 12 + random() % 5,
+      clipInnerStart: random() % 4,
+      clipInnerEnd: 12 + random() % 5,
+      surfaceStride: 16,
+    };
+    referenceAffineSpriteRaster({ ...shared, destination: expected }, args);
+    const accepted = runRaster({ ...shared, destination: actual }, args);
+    if (!accepted ||
+        actual.some((value, index) => value !== expected[index])) {
+      failures.push({ invocation, accepted, args, actual, expected });
+      break;
+    }
+  }
+  t.equal(failures.length, 0,
+    'all moving, clipped, masked, dimmed, and blended surfaces are bit exact');
   t.end();
 });
 
@@ -165,6 +387,59 @@ test('long-arithmetic loop policy selects Wasm by opcode shape, not method ident
     'constructors retain their observable initialization policy');
   t.equal(jvm.jit.longArithmeticWasmFirstMethodCount, 1,
     'the runtime counter records a structurally selected method once');
+  t.end();
+});
+
+test('dense nested array kernels select Wasm without guest-name matching', (t) => {
+  const jvm = new JVM({
+    jit: { warmupThreshold: 0, arrayKernelWasmFirst: true },
+  });
+  const shape = (name, {
+    primitiveArrayAccesses = 24, referenceArrayAccesses = 0,
+    length = 192, backward = true,
+    nonStaticCall = false,
+  } = {}) => {
+    const totalArrayAccesses =
+      primitiveArrayAccesses + referenceArrayAccesses;
+    const codeItems = Array.from({ length }, (_unused, index) => ({
+      labelDef: index === 0 ? 'Lentry:' : `L${index}:`,
+      instruction: index < referenceArrayAccesses
+        ? 'aaload'
+        : index < totalArrayAccesses
+          ? 'iaload'
+          : index === totalArrayAccesses && nonStaticCall
+          ? { op: 'invokevirtual',
+            arg: ['Method', 'ArbitraryReceiver', ['leaf', '()V']] }
+          : index === length - 1 && backward
+            ? { op: 'goto', arg: 'Lentry' }
+            : 'nop',
+    }));
+    return {
+      name,
+      descriptor: '([[I[I)V',
+      flags: ['private', 'static'],
+      attributes: [{ type: 'code', code: { codeItems, exceptionTable: [] } }],
+    };
+  };
+  t.ok(jvm.jit.isArrayKernelWasmFirstMethod(shape('renamedArchiveKernel')),
+    'bytecode size, array density, and a backedge select the Wasm policy');
+  t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
+    shape('anotherName', { primitiveArrayAccesses: 23 })),
+  'a sparse array body retains the ordinary generated tier');
+  t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
+    shape('referenceHeavyName', {
+      primitiveArrayAccesses: 0,
+      referenceArrayAccesses: 24,
+    })),
+  'reference-array traffic does not satisfy primitive-array density');
+  t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
+    shape('acyclicName', { backward: false })),
+  'an acyclic array helper avoids module compilation overhead');
+  t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
+    shape('dynamicName', { nonStaticCall: true })),
+  'a dynamic call boundary retains the single-tier JavaScript policy');
+  t.equal(jvm.jit.arrayKernelWasmFirstMethodCount, 1,
+    'the structural selection is counted once');
   t.end();
 });
 
@@ -693,6 +968,29 @@ test('generated JIT admits call-free post-increment field helpers structurally',
   t.equal(object.fields['ArbitraryCounter.value'], 42,
     'post-increment stores the incremented value');
 
+  const alternateObject = {
+    type: 'ArbitraryCounter',
+    fields: { 'LegacyCounter.value': 9 },
+  };
+  const alternateFrame = new Frame(method);
+  alternateFrame.className = 'ArbitraryCounter';
+  alternateFrame.locals[0] = alternateObject;
+  const alternateStack = new Stack();
+  alternateStack.push(alternateFrame);
+  const alternateResult = generated(
+    alternateFrame,
+    { status: 'runnable', callStack: alternateStack },
+    jvm.jit,
+    false,
+  );
+  t.equal(alternateResult.value, 9,
+    'generated putfield reads an alternate owner-qualified slot');
+  t.equal(alternateObject.fields['LegacyCounter.value'], 10,
+    'generated putfield updates the resolved alternate slot');
+  t.notOk(Object.prototype.hasOwnProperty.call(
+    alternateObject.fields, 'ArbitraryCounter.value'),
+  'generated putfield does not invent the direct slot on unusual objects');
+
   const disabled = new JVM({ jit: {
     warmupThreshold: 0, profileMethods: false, postIncrementHelpers: false,
   } });
@@ -717,6 +1015,66 @@ test('initialized static fields stay on the synchronous generated fast path', (t
   t.equal(changed, true, 'warm putstatic completes synchronously');
   t.equal(jvm.classes.FastStatics.staticFields.get('value:I'), 42,
     'warm putstatic updates the field');
+  t.end();
+});
+
+test('resolved class initialization uses stable hot-site tokens', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classes.ArbitraryStaticOwner = {
+    ast: { classes: [{ superClassName: null, items: [] }] },
+    staticFields: new Map([['value:I', 37]]),
+  };
+  jvm.classInitializationState.set('ArbitraryStaticOwner', 'INITIALIZED');
+  const site = jvm.jit.registerFieldSite(
+    ['Field', 'ArbitraryStaticOwner', ['value', 'I']]);
+  let stateLookups = 0;
+  const originalGet = jvm.classInitializationState.get;
+  jvm.classInitializationState.get = function countedGet(...args) {
+    stateLookups += 1;
+    return originalGet.apply(this, args);
+  };
+  for (let iteration = 0; iteration < 100; iteration += 1) {
+    t.equal(jvm.jit.getStaticSyncAt(site), 37,
+      'resolved static access retains the current value');
+  }
+  t.equal(stateLookups, 0,
+    'warm static accesses do not repeat class-state Map lookups');
+  jvm.classInitializationState.set('ArbitraryStaticOwner', 'UNINITIALIZED');
+  t.equal(jvm.jit.getStaticSyncAt(site), jvm.jit.staticDeopt(),
+    'an observed lifecycle change invalidates the stable token');
+  jvm.classInitializationState.set('ArbitraryStaticOwner', 'INITIALIZED');
+  t.equal(jvm.jit.getStaticSyncAt(site), 37,
+    'the same token resumes after initialization is published');
+  t.end();
+});
+
+test('interpreted warm getstatic sites reuse class-initialization tokens', (t) => {
+  const jvm = new JVM({ jit: { enabled: false } });
+  jvm.classes.ArbitraryStaticOwner = {
+    ast: { classes: [{ superClassName: null, items: [] }] },
+    staticFields: new Map([['value:I', 19]]),
+  };
+  jvm.classInitializationState.set('ArbitraryStaticOwner', 'INITIALIZED');
+  const instruction = { op: 'getstatic',
+    arg: ['Field', 'ArbitraryStaticOwner', ['value', 'I']] };
+  const frame = { stack: new Stack() };
+  const thread = { id: 7 };
+  let stateLookups = 0;
+  const originalGet = jvm.classInitializationState.get;
+  jvm.classInitializationState.get = function countedGet(...args) {
+    stateLookups += 1;
+    return originalGet.apply(this, args);
+  };
+  for (let iteration = 0; iteration < 100; iteration += 1) {
+    objectHandlers.getstaticSync(frame, instruction, jvm, thread);
+    t.equal(frame.stack.pop(), 19, 'warm interpreted static read stays exact');
+  }
+  t.equal(stateLookups, 1,
+    'the interpreted site resolves initialization state only once');
+  jvm.classInitializationState.set('ArbitraryStaticOwner', 'ERRONEOUS');
+  t.equal(objectHandlers.getstaticSync(frame, instruction, jvm, thread),
+    objectHandlers.SYNC_STATIC_FALLBACK,
+  'the stable token observes lifecycle changes without another map lookup');
   t.end();
 });
 
@@ -755,6 +1113,34 @@ test('generated call sites execute proven synchronous JRE leaves directly', (t) 
     'javax/sound/sampled/SourceDataLine', 'javax/sound/sampled/SourceDataLine',
     'drain', '()V'), null,
   'declared async JRE methods retain the canonical scheduler path');
+  t.end();
+});
+
+test('ad-hoc static generated calls carry initialization tokens', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classInitializationState.set('ArbitraryStaticTarget', 'INITIALIZED');
+  const instruction = {
+    op: 'invokestatic',
+    arg: ['Method', 'ArbitraryStaticTarget', ['work', '()V']],
+  };
+  const frame = new Frame({
+    name: 'caller', descriptor: '()V',
+    attributes: [{ type: 'code', code: {
+      codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
+    } }],
+  });
+  let capturedSite = null;
+  const original = jvm.jit.tryInvokeSyncSite;
+  jvm.jit.tryInvokeSyncSite = (site) => {
+    capturedSite = site;
+    return null;
+  };
+  jvm.jit.tryInvokeSync('invokestatic', frame, instruction, {});
+  jvm.jit.tryInvokeSyncSite = original;
+  t.ok(capturedSite.initializationToken,
+    'the ad-hoc static site carries a class-initialization token');
+  t.ok(capturedSite.initializationToken.initialized,
+    'the token exposes the initialized target state');
   t.end();
 });
 
@@ -3595,6 +3981,11 @@ public class ScalarFeatureHarness {
     'structured SSA preserves array, field, remainder, and static-call effects');
   t.ok(structured.generated?.jvmStructuredSsa,
     'array/field/call loop selects structured SSA without method-name recognition');
+  t.ok(structured.generated?.jvmStructuredFieldReadCacheCount >= 2,
+    'call-bearing loops cache non-volatile fields between effect boundaries');
+  t.ok(structured.generated?.jvmStructuredSource.includes(
+    'ssaFieldCache0Valid = false'),
+  'calls invalidate cached field values before another guest effect');
   t.ok(structured.repeatedGenerated?.jvmStructuredFieldReadCacheCount >= 2,
     'call-free structured loops cache non-volatile fields by receiver identity');
   t.equal(structured.volatileGenerated?.jvmStructuredFieldReadCacheCount, 0,

@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Node.js](https://img.shields.io/badge/node.js-18.x%20%7C%2020.x-green.svg)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/node.js-20.x-green.svg)](https://nodejs.org/)
 [![Java](https://img.shields.io/badge/java-11%20%7C%2017-orange.svg)](https://adoptopenjdk.net/)
 
 A comprehensive toolkit for Java bytecode analysis, manipulation, and execution. This project provides advanced tools for working with Java `.class` files, including a custom JVM implementation, web-based debugging interface, and extensive bytecode analysis capabilities.

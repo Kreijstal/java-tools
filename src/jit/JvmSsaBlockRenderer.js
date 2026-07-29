@@ -453,31 +453,29 @@ class JvmSsaBlockRenderer {
     });
     const fieldReadCaches = new Map();
     const fieldReadCacheSites = new Map();
-    if (!hasUnknownFieldEffect) {
-      for (let index = 0; index < items.length; index += 1) {
-        const instruction = items[index]?.instruction;
-        if (opOf(instruction) !== "getfield" ||
-            !this.jit.canEliminateFieldRead(instruction.arg)) continue;
-        const key = JSON.stringify(instruction.arg);
-        let cache = fieldReadCaches.get(key);
-        if (!cache) {
-          const number = fieldReadCaches.size;
-          const site = fieldSites.get(index);
-          cache = {
-            object: `ssaFieldCache${number}Object`,
-            value: `ssaFieldCache${number}Value`,
-            valid: `ssaFieldCache${number}Valid`,
-            data: `ssaFieldCache${number}ArrayData`,
-            site,
-            indexes: [],
-            isArray: this.jit.fieldSites[site]?.descriptor?.startsWith("[") === true,
-            directKey: this.jit.fieldSites[site]?.directInstanceKey || null,
-          };
-          fieldReadCaches.set(key, cache);
-        }
-        cache.indexes.push(index);
-        fieldReadCacheSites.set(index, cache);
+    for (let index = 0; index < items.length; index += 1) {
+      const instruction = items[index]?.instruction;
+      if (opOf(instruction) !== "getfield" ||
+          !this.jit.canEliminateFieldRead(instruction.arg)) continue;
+      const key = JSON.stringify(instruction.arg);
+      let cache = fieldReadCaches.get(key);
+      if (!cache) {
+        const number = fieldReadCaches.size;
+        const site = fieldSites.get(index);
+        cache = {
+          object: `ssaFieldCache${number}Object`,
+          value: `ssaFieldCache${number}Value`,
+          valid: `ssaFieldCache${number}Valid`,
+          data: `ssaFieldCache${number}ArrayData`,
+          site,
+          indexes: [],
+          isArray: this.jit.fieldSites[site]?.descriptor?.startsWith("[") === true,
+          directKey: this.jit.fieldSites[site]?.directInstanceKey || null,
+        };
+        fieldReadCaches.set(key, cache);
       }
+      cache.indexes.push(index);
+      fieldReadCacheSites.set(index, cache);
     }
     const methodIsStatic = (method.flags || []).includes("static") ||
       (Number(method.accessFlags) & 0x0008) !== 0;
@@ -496,9 +494,15 @@ class JvmSsaBlockRenderer {
         op === "aload" && Number(instruction?.arg) === 0;
     };
     for (const cache of fieldReadCaches.values()) {
-      cache.eagerThis = !methodIsStatic && !localZeroAssigned &&
+      cache.eagerThis = !hasUnknownFieldEffect &&
+        !methodIsStatic && !localZeroAssigned &&
         cache.indexes.every(directlyLoadsThis);
     }
+    const invalidateFieldReadCaches = () =>
+      [...fieldReadCaches.values()].flatMap((cache) => [
+        `${cache.valid} = false;`,
+        ...(cache.isArray ? [`${cache.data} = null;`] : []),
+      ]);
     // javac has to give source-level temporaries a value before the first
     // structured try/loop join.  Decompiled methods can consequently start
     // with dozens of `iconst_0; istore` / `aconst_null; astore` pairs.  The
@@ -580,6 +584,22 @@ class JvmSsaBlockRenderer {
       ...operandValues.map((expression, i) => `stack[${i}] = ${expression};`),
       `stack.length = ${operandValues.length};`,
       `helpers.materialize(frame, locals, stack, ${pc});`,
+    ];
+    // A synchronous guest call can throw after installing its child Frame.
+    // If that child catches the exception, its eventual return must resume
+    // this frame after the invoke with only the operands below the arguments.
+    // If no child was installed (for example, a direct JRE intrinsic threw),
+    // the exception belongs to this frame and must retain the invoke pc and
+    // complete pre-call stack for normal handler dispatch.
+    const materializeCallExceptionLines = (
+      preCallValues, postCallValues, pc, childCanResume = "true",
+    ) => [
+      `if (${childCanResume} && thread.callStack.items.length && ` +
+        "thread.callStack.peek() !== frame) {",
+      ...materializeLines(postCallValues, pc + 1).map((line) => `  ${line}`),
+      "} else {",
+      ...materializeLines(preCallValues, pc).map((line) => `  ${line}`),
+      "}",
     ];
     const stageOperandLines = (operandValues) => [
       ...operandValues.map((expression, i) => `stack[${i}] = ${expression};`),
@@ -763,6 +783,7 @@ class JvmSsaBlockRenderer {
       // value only within the block and only until a call/static write, so a
       // scheduler safe point or arbitrary guest effect can never stale it.
       const directStaticBlockValues = new Map();
+      const fieldArraySnapshots = new Map();
       // A successful primitive load proves that the same array/index pair is
       // non-null and in bounds for the remainder of this straight-line basic
       // block. Java primitive arrays never contain `undefined`, so a raw
@@ -1118,7 +1139,6 @@ class JvmSsaBlockRenderer {
             lines.push(`const ${object} = ${objectInput};`);
             if (cache?.eagerThis) {
               lines.push(`const ${out} = ${cache.value};`);
-              if (cache.isArray) arrayViews.set(out, cache.data);
             } else {
               lines.push(`if (${object} === null || ${object} === undefined) {`,
                 ...materializeLines([...stack, object], index).map((line) => `  ${line}`),
@@ -1133,20 +1153,34 @@ class JvmSsaBlockRenderer {
                 `  ${cache.value} = ${out};`,
                 ...(cache.isArray ? [`  ${cache.data} = helpers.arrayData(${out});`] : []),
                 `  ${cache.valid} = true;`, "}");
-              if (cache.isArray) arrayViews.set(out, cache.data);
             } else if (!cache) {
               lines.push(`const ${out} = ${directRead};`);
+            }
+            if (cache?.isArray) {
+              // The field cache may be invalidated or rebound by a later
+              // guest call/write while this earlier array reference remains
+              // live on the SSA operand stack. Snapshot its storage companion
+              // so future cache maintenance cannot retarget this value.
+              let dataSnapshot = fieldArraySnapshots.get(cache);
+              if (!dataSnapshot) {
+                dataSnapshot = value();
+                lines.push(`const ${dataSnapshot} = ${cache.data};`);
+                fieldArraySnapshots.set(cache, dataSnapshot);
+              }
+              arrayViews.set(out, dataSnapshot);
             }
             stack.push(out);
           }
         } else if (op === "putfield") {
+          fieldArraySnapshots.clear();
           const storedInput = pop(), objectInput = pop(), site = fieldSites.get(index);
           if (storedInput === null || objectInput === null || site === undefined) valid = false;
           else {
             const object = value(), stored = value();
             const fieldPlan = this.jit.fieldSites[site];
             const directKey = fieldPlan?.directInstanceKey || null;
-            lines.push(`const ${object} = ${objectInput};`, `const ${stored} = ${storedInput};`,
+            lines.push(...invalidateFieldReadCaches(),
+              `const ${object} = ${objectInput};`, `const ${stored} = ${storedInput};`,
               `if (${object} === null || ${object} === undefined) {`,
               ...materializeLines([...stack, object, stored], index).map((line) => `  ${line}`),
               `  helpers.putFieldAt(${site}, ${object}, ${stored});`, "}",
@@ -1215,6 +1249,8 @@ class JvmSsaBlockRenderer {
         } else if (op === "invokestatic" || op === "invokevirtual" ||
             op === "invokespecial" || op === "invokeinterface") {
           directStaticBlockValues.clear();
+          fieldArraySnapshots.clear();
+          lines.push(...invalidateFieldReadCaches());
           const site = callSites.get(index);
           if (!site || stack.length < site.argumentCount) valid = false;
           else if (site.directJre) {
@@ -1328,7 +1364,8 @@ class JvmSsaBlockRenderer {
           } else if ((site.directIntrinsic?.kind === "polygonFlatRaster" ||
               site.directIntrinsic?.kind === "polygonAlphaRaster" ||
               site.directIntrinsic?.kind === "tiledIntArrayBlit" ||
-              site.directIntrinsic?.kind === "perspectiveTexturedSpan") &&
+              site.directIntrinsic?.kind === "perspectiveTexturedSpan" ||
+              site.directIntrinsic?.kind === "affineSpriteRaster") &&
               Number.isInteger(site.directIntrinsic.positionalId) &&
               site.directIntrinsic.returnsVoid) {
             const callStack = [...stack];
@@ -1346,7 +1383,7 @@ class JvmSsaBlockRenderer {
                 `if (${result} === helpers.asyncInvokeSentinel()) {`,
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'guarded polygon raster fallback' };", "}");
+                "  return { deopt: true, transient: true, reason: 'guarded direct raster fallback' };", "}");
             }
           } else if (site.directIntrinsic?.kind === "maskedColorBlit" &&
               site.directIntrinsic.paramCount === 9 && site.directIntrinsic.returnsVoid) {
@@ -1473,7 +1510,8 @@ class JvmSsaBlockRenderer {
                   ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
                 `let ${out};`,
                 `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                ...materializeCallExceptionLines(callStack, stack, index)
+                  .map((line) => `  ${line}`),
                 `  throw ${caught};`, "}",
                 `if (${out} === helpers.asyncInvokeSentinel()) {`,
                 asynchronousFallbackMarker, "}",
@@ -1524,7 +1562,9 @@ class JvmSsaBlockRenderer {
               ...(deferMaterialization
                 ? stageOperandLines(callStack) : materializeLines(callStack, index + 1)),
               `try { ${out} = helpers.tryInvokeSyncAt(${site.id}, frame, thread); } catch (${caught}) {`,
-              ...materializeLines(callStack, index).map((line) => `  ${line}`), `  throw ${caught};`, "}",
+              ...materializeCallExceptionLines(callStack, stack, index)
+                .map((line) => `  ${line}`),
+              `  throw ${caught};`, "}",
               `if (${out} === helpers.asyncInvokeSentinel()) {`,
               ...(resumableVoidCall ? [asynchronousCallMarker] : [
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
@@ -1551,7 +1591,11 @@ class JvmSsaBlockRenderer {
                 `      !helpers.jvm.debugManager.isClassJitDeopted(${positionalTarget}.lookupClass))) {`,
                 `  try { ${out} = ${positionalTarget}.invoke(${args.join(", ")}${
                   args.length ? ", " : ""}thread); } catch (${caught}) {`,
-                ...materializeLines(callStack, index).map((line) => `    ${line}`),
+                ...materializeCallExceptionLines(
+                  callStack, stack, index,
+                  `!${positionalTarget}.invoke.jvmRestoresExceptionFrames`,
+                )
+                  .map((line) => `    ${line}`),
                 `    throw ${caught};`, "  }",
                 `  if (${out} === helpers.asyncInvokeSentinel()) {`,
                 ...fallbackLines.map((line) => `    ${line}`),

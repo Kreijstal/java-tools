@@ -4,6 +4,9 @@ const Stack = require("../core/stack");
 const path = require("path");
 const { MethodHandle, MethodType, Lookup } = require("../jre/java/lang/invoke");
 const { ASYNC_METHOD_SENTINEL } = require("../core/constants");
+const {
+  classInitializationTokenFor,
+} = require('./utils');
 
 const resolvedSyncInvokeSite = Symbol('resolvedSyncInvokeSite');
 const SYNC_INVOKE_FALLBACK = Symbol('syncInvokeFallback');
@@ -136,7 +139,8 @@ function invokeBytecodeSync(frame, instruction, jvm, thread, kind) {
     state.target1 = undefined;
   }
   if (kind === 'static') {
-    const init = jvm.classInitializationState.get(className);
+    const init =
+      classInitializationTokenFor(jvm, instruction, className).state;
     if (init !== 'INITIALIZED' &&
         !(init === 'INITIALIZING' &&
           jvm.classInitializationOwners.get(className) === thread.id)) {
