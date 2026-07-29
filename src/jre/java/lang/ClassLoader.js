@@ -1,4 +1,105 @@
 const { withThrows } = require('../../helpers');
+const fs = require('fs');
+const path = require('path');
+const JSZip = require('jszip');
+
+const runtimeModuleCache = new Map();
+
+function javaString(value) {
+  if (value && value.type === 'java/lang/String' &&
+      Object.prototype.hasOwnProperty.call(value, 'value')) {
+    return String(value.value);
+  }
+  return String(value);
+}
+
+function byteArrayInputStream(bytes) {
+  const array = Array.from(bytes, (value) => value > 127 ? value - 256 : value);
+  array.type = '[B';
+  return {
+    type: 'java/io/ByteArrayInputStream',
+    buf: array,
+    pos: 0,
+    mark: 0,
+    count: array.length,
+  };
+}
+
+async function zipResource(jvm, archivePath, resource, prefix = '') {
+  const resolved = path.resolve(archivePath);
+  let zip = jvm.jarCache.get(resolved) || runtimeModuleCache.get(resolved);
+  if (!zip) {
+    let bytes = await fs.promises.readFile(resolved);
+    if (resolved.endsWith('.jmod') && bytes[0] === 0x4a && bytes[1] === 0x4d) {
+      bytes = bytes.subarray(4);
+    }
+    zip = await JSZip.loadAsync(bytes);
+    if (resolved.endsWith('.jmod')) runtimeModuleCache.set(resolved, zip);
+    else jvm.jarCache.set(resolved, zip);
+  }
+  const entry = zip.file(prefix + resource);
+  return entry ? entry.async('uint8array') : null;
+}
+
+async function classpathResource(jvm, resource) {
+  for (const classpathEntry of jvm.classpath || []) {
+    const lower = String(classpathEntry).toLowerCase();
+    if (lower.endsWith('.jar') || lower.endsWith('.zip')) {
+      const bytes = await zipResource(jvm, classpathEntry, resource);
+      if (bytes) return bytes;
+    } else {
+      const file = path.join(classpathEntry, resource);
+      try {
+        return await fs.promises.readFile(file);
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+    }
+  }
+
+  const homes = [];
+  if (process.env.JVMJS_JAVA_HOME) {
+    homes.push(process.env.JVMJS_JAVA_HOME);
+  } else {
+    if (process.env.JAVA_HOME) homes.push(process.env.JAVA_HOME);
+    try {
+      for (const name of fs.readdirSync('/usr/lib/jvm')) {
+        homes.push(path.join('/usr/lib/jvm', name));
+      }
+    } catch (_) {
+      // No conventional local JDK installation.
+    }
+  }
+  for (const home of [...new Set(homes)]) {
+    const rtJar = path.join(home, 'lib', 'rt.jar');
+    try {
+      if (fs.statSync(rtJar).isFile()) {
+        const bytes = await zipResource(jvm, rtJar, resource);
+        if (bytes) return bytes;
+      }
+    } catch (_) {
+      // Modular JDKs do not contain rt.jar.
+    }
+    const modules = path.join(home, 'jmods');
+    let files;
+    try {
+      files = fs.readdirSync(modules).filter((name) => name.endsWith('.jmod'));
+    } catch (_) {
+      continue;
+    }
+    files.sort((a, b) => (a === 'java.base.jmod' ? -1 : b === 'java.base.jmod' ? 1 : a.localeCompare(b)));
+    for (const file of files) {
+      const bytes = await zipResource(
+        jvm,
+        path.join(modules, file),
+        resource,
+        'classes/',
+      );
+      if (bytes) return bytes;
+    }
+  }
+  return null;
+}
 
 module.exports = {
   super: {
@@ -141,15 +242,9 @@ module.exports = {
       return obj.methods['findResource(Ljava/lang/String;)Ljava/net/URL;'] ?
         obj.methods['findResource(Ljava/lang/String;)Ljava/net/URL;'].call(null, jvm, obj, [name]) : null;
     },
-    'getResourceAsStream(Ljava/lang/String;)Ljava/io/InputStream;': (jvm, obj, args) => {
-      const name = args[0];
-      const url = obj.methods['getResource(Ljava/lang/String;)Ljava/net/URL;'].call(null, jvm, obj, [name]);
-      if (url) {
-        // In a real implementation, this would create an InputStream from the URL
-        // For now, return null as this is mock behavior
-        return null;
-      }
-      return null;
+    'getResourceAsStream(Ljava/lang/String;)Ljava/io/InputStream;': async (jvm, obj, args) => {
+      const bytes = await classpathResource(jvm, javaString(args[0]));
+      return bytes ? byteArrayInputStream(bytes) : null;
     },
     'findResource(Ljava/lang/String;)Ljava/net/URL;': (jvm, obj, args) => {
       // Default implementation returns null - subclasses should override
@@ -162,6 +257,12 @@ module.exports = {
   },
   staticFields: {},
   staticMethods: {
+    'getSystemClassLoader()Ljava/lang/ClassLoader;': (jvm) => jvm.systemClassLoader,
+    'getSystemResources(Ljava/lang/String;)Ljava/util/Enumeration;': () => ({
+      type: 'java/util/Enumeration',
+      array: [],
+      index: 0,
+    }),
     'getSystemResource(Ljava/lang/String;)Ljava/net/URL;': (jvm, obj, args) => {
       const systemLoader = module.exports.methods['getSystemClassLoader()Ljava/lang/ClassLoader;'].call(null, jvm, {});
       if (systemLoader) {

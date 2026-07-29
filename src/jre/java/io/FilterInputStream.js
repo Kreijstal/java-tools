@@ -5,6 +5,7 @@ module.exports = {
     '<init>(Ljava/io/InputStream;)V': (jvm, obj, args) => {
       const inputStream = args[0];
       obj.in = inputStream;
+      if (obj.fields) obj.fields['java/io/FilterInputStream.in'] = inputStream;
     },
     
     'read()I': (jvm, obj, args) => {

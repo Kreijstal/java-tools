@@ -43,5 +43,12 @@ module.exports = {
         }
       }
     },
+    'newCondition()Ljava/util/concurrent/locks/Condition;': (jvm, obj) => ({
+      type: 'java/util/concurrent/locks/Condition',
+      lock: obj,
+      waitingThreads: [],
+    }),
+    'isHeldByCurrentThread()Z': (jvm, obj, args, thread) =>
+      obj.ownerThread === thread ? 1 : 0,
   },
 };

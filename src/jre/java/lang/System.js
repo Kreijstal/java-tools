@@ -1,6 +1,7 @@
 'use strict';
 const process = require('process');
 const path = require('path');
+const os = require('os');
 const { withThrows } = require('../../helpers');
 function javaString(value) {
   if (value === null || value === undefined) return '';
@@ -12,6 +13,13 @@ module.exports = {
   super: 'java/lang/Object',
   staticFields: new Map(),
   staticMethods: {
+    'mapLibraryName(Ljava/lang/String;)Ljava/lang/String;': (jvm, obj, args) => {
+      const name = String(args[0] && args[0].value !== undefined ? args[0].value : args[0]);
+      const mapped = os.type() === 'Windows_NT'
+        ? `${name}.dll`
+        : (os.type() === 'Darwin' ? `lib${name}.dylib` : `lib${name}.so`);
+      return jvm.newString(mapped);
+    },
     'getProperties()Ljava/util/Properties;': (jvm) => {
       return {
         type: 'java/util/Properties',
@@ -29,6 +37,23 @@ module.exports = {
       const key = javaString(args[0]);
       const value = typeof process !== 'undefined' && process.env ? process.env[key] : undefined;
       return value === undefined ? null : jvm.internString(value);
+    },
+    'getenv()Ljava/util/Map;': (jvm) => {
+      const map = new Map();
+      const environment = typeof process !== 'undefined' && process.env ? process.env : {};
+      for (const [key, value] of Object.entries(environment)) {
+        const javaKey = jvm.internString(key);
+        map.set(`java/lang/String:${key}`, {
+          type: 'java/util/Map$Entry',
+          key: javaKey,
+          value: jvm.internString(value),
+        });
+      }
+      return {
+        type: 'java/util/HashMap',
+        map,
+        sizeCache: map.size,
+      };
     },
     'setOut(Ljava/io/PrintStream;)V': (jvm, obj, args) => {
       const systemClass = jvm.classes['java/lang/System'];
@@ -142,7 +167,18 @@ module.exports = {
       const props = new Map();
       props.set('java.version', '1.8.0');
       props.set('java.vendor', 'JVM Tools Mock');
-      props.set('os.name', 'Linux');
+      props.set('java.home',
+        process.env.JVMJS_JAVA_HOME || process.env.JAVA_HOME || '');
+      const hostOs = os.type();
+      props.set('os.name',
+        hostOs === 'Darwin' ? 'Mac OS X' :
+          (hostOs === 'Windows_NT' ? 'Windows' : hostOs));
+      props.set('os.arch', os.arch());
+      props.set('os.version', os.release());
+      props.set('file.encoding', 'UTF-8');
+      props.set('sun.jnu.encoding', 'UTF-8');
+      props.set('user.language', 'en');
+      props.set('user.country', 'US');
       props.set('user.dir', process.cwd ? process.cwd() : '/tmp');
       props.set('java.class.path', Array.isArray(jvm.classpath) ? jvm.classpath.join(path.delimiter) : String(jvm.classpath || '.'));
       props.set('file.separator', path.sep);

@@ -501,6 +501,8 @@ module.exports = {
 
 const classJre = module.exports;
 
+classJre.methods['desiredAssertionStatus0(Ljava/lang/Class;)Z'] = () => 0;
+
 classJre.methods['getField(Ljava/lang/String;)Ljava/lang/reflect/Field;'] = (jvm, classObj, args, thread) => (
   classJre.methods['getDeclaredField(Ljava/lang/String;)Ljava/lang/reflect/Field;'](jvm, classObj, args, thread)
 );

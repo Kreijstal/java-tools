@@ -3900,7 +3900,7 @@ class JitCompiler {
       return objRef[site.directKey] ?? objRef[site.fieldName];
     }
 
-    const runtimeType = objRef.type || objRef._className || site.className;
+    const runtimeType = objRef._className || objRef.type || site.className;
     if (Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)) {
       return objRef.fields[site.directKey];
     }
@@ -3922,7 +3922,7 @@ class JitCompiler {
       throw { type: "java/lang/NullPointerException", message: null };
     }
     if (!objRef.fields) objRef.fields = {};
-    const runtimeType = objRef.type || objRef._className || site.className;
+    const runtimeType = objRef._className || objRef.type || site.className;
     let fieldKey = Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)
       ? site.directKey
       : site.instanceKeys.get(runtimeType);
@@ -3932,7 +3932,6 @@ class JitCompiler {
       site.instanceKeys.set(runtimeType, fieldKey);
     }
     objRef.fields[fieldKey] = value;
-    objRef[site.fieldName] = value;
   }
 
   resolveStaticFieldSite(site, forWrite = false) {
@@ -4058,7 +4057,6 @@ class JitCompiler {
     if (!objRef.fields) objRef.fields = {};
     const fieldKey = resolveInstanceFieldKey(this.jvm, objRef, className, fieldName) || `${className}.${fieldName}`;
     objRef.fields[fieldKey] = value;
-    objRef[fieldName] = value;
   }
 
   getStatic(arg, thread) {
@@ -4191,6 +4189,7 @@ class JitCompiler {
     }
     return {
       type: className,
+      _className: className,
       fields,
       hashCode: this.jvm.nextHashCode++,
       isLocked: false,

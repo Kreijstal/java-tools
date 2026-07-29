@@ -418,26 +418,43 @@ class JVM {
       methodCache.set(descriptor, resolved);
       return resolved;
     };
-    // First check JNI registry for registered native methods
+    let resolvedClassName = className;
+    const visited = new Set();
+    while (resolvedClassName && !this.jre[resolvedClassName] &&
+           !visited.has(resolvedClassName)) {
+      visited.add(resolvedClassName);
+      const nativeMethod = this.jni.findNativeMethod(
+        resolvedClassName,
+        methodName,
+        descriptor,
+      );
+      if (nativeMethod) return remember(nativeMethod);
+
+      const classData = this.classes[resolvedClassName];
+      const classAst = classData && classData.ast &&
+        classData.ast.classes && classData.ast.classes[0];
+      if (!classAst) return remember(null);
+      const guestOverride = (classAst.items || []).some((item) =>
+        item.type === "method" && item.method &&
+        item.method.name === methodName &&
+        item.method.descriptor === descriptor);
+      if (guestOverride) return remember(null);
+      resolvedClassName = classAst.superClassName || null;
+    }
+    if (!resolvedClassName) return remember(null);
+
     const nativeMethod = this.jni.findNativeMethod(
-      className,
+      resolvedClassName,
       methodName,
       descriptor,
     );
-    if (nativeMethod) {
-      return remember(nativeMethod);
-    }
-
-    // It's not a JNI method. Only proceed if it's a JRE class.
-    if (!this.jre[className]) {
-      return remember(null);
-    }
+    if (nativeMethod) return remember(nativeMethod);
 
     // Continue with original JRE method lookup.  Several existing JRE
     // shims use either `super: "java/lang/Object"` or
     // `super: { type: "java/lang/Object" }`; normalize both forms so
     // method lookup works consistently through the JRE hierarchy.
-    let currentClass = this.jre[className];
+    let currentClass = this.jre[resolvedClassName];
     while (currentClass) {
       const methodKey = `${methodName}${descriptor}`;
 
@@ -1810,6 +1827,24 @@ class JVM {
     let classData = this.classes[classNameWithSlashes];
     if (!classData && this.jre[classNameWithSlashes]) {
       const jreClass = this.jre[classNameWithSlashes];
+      const staticFields = jreClass.staticFields instanceof Map
+        ? jreClass.staticFields
+        : new Map(Object.entries(jreClass.staticFields || {}));
+      const reflectedFields = Array.from(staticFields.keys()).map((rawKey) => {
+        const key = String(rawKey).replace(/^'|'$/g, '');
+        const separator = key.indexOf(':');
+        const name = separator === -1 ? key : key.slice(0, separator);
+        const descriptor = separator === -1 ? 'Ljava/lang/Object;' : key.slice(separator + 1);
+        return {
+          type: 'field',
+          field: {
+            name,
+            descriptor,
+            accessFlags: 0x0008,
+            flags: ['static'],
+          },
+        };
+      });
       classData = {
         isJreStub: true,
         ast: {
@@ -1818,10 +1853,10 @@ class JVM {
             superClassName: jreClass.super || 'java/lang/Object',
             interfaces: jreClass.interfaces || [],
             flags: [],
-            items: [],
+            items: reflectedFields,
           }],
         },
-        staticFields: jreClass.staticFields || new Map(),
+        staticFields,
       };
       this.classes[classNameWithSlashes] = classData;
       this.classEpoch += 1;
@@ -2503,6 +2538,16 @@ class JVM {
         if (Array.isArray(value) || ArrayBuffer.isView(value)) return `[${value.length}]`;
         if (typeof value.type !== "string") return "<object>";
         const summary = { type: value.type };
+        if (value.type === "java/lang/String") {
+          if (Object.prototype.hasOwnProperty.call(value, "value")) {
+            summary.value = String(value.value);
+          } else if (value instanceof String) {
+            summary.value = String(value);
+          }
+        }
+        if (value.type === "java/lang/Class" && value.className) {
+          summary.className = value.className;
+        }
         const fields = value.fields;
         if (fields && typeof fields === "object") {
           summary.fields = {};
@@ -2515,8 +2560,32 @@ class JVM {
               summary.fields[name] = `${fieldValue}n`;
             } else if (Array.isArray(fieldValue) || ArrayBuffer.isView(fieldValue)) {
               summary.fields[name] = `[${fieldValue.length}]`;
+            } else if (fieldValue && fieldValue.type === "java/lang/String" &&
+                       (fieldValue instanceof String ||
+                        Object.prototype.hasOwnProperty.call(fieldValue, "value"))) {
+              summary.fields[name] = String(
+                Object.prototype.hasOwnProperty.call(fieldValue, "value")
+                  ? fieldValue.value
+                  : fieldValue,
+              );
             } else {
-              summary.fields[name] = `<${fieldValue.type || "object"}>`;
+              let nestedName = null;
+              if (fieldValue && fieldValue.fields) {
+                const namedField = Object.entries(fieldValue.fields).find(([fieldName]) =>
+                  fieldName.endsWith(".name"));
+                const namedValue = namedField && namedField[1];
+                if (namedValue && namedValue.type === "java/lang/String" &&
+                    (namedValue instanceof String ||
+                     Object.prototype.hasOwnProperty.call(namedValue, "value"))) {
+                  nestedName = String(
+                    Object.prototype.hasOwnProperty.call(namedValue, "value")
+                      ? namedValue.value
+                      : namedValue,
+                  );
+                }
+              }
+              summary.fields[name] =
+                `<${fieldValue.type || "object"}${nestedName ? ` name=${nestedName}` : ""}>`;
             }
           }
         }

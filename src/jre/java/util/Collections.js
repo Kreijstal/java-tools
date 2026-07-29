@@ -72,6 +72,8 @@ module.exports = {
       return changed ? 1 : 0;
     },
     'unmodifiableMap(Ljava/util/Map;)Ljava/util/Map;': (jvm, obj, args) => args[0],
+    'unmodifiableCollection(Ljava/util/Collection;)Ljava/util/Collection;':
+      (jvm, obj, args) => args[0],
     'newSetFromMap(Ljava/util/Map;)Ljava/util/Set;': (jvm, obj, args) => {
       const backing = args[0];
       if (!backing.map) backing.map = new Map();

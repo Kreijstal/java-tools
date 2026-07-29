@@ -33,6 +33,7 @@ module.exports = {
     'MIN_VALUE:I': -2147483648,
   },
   staticMethods: {
+    'numberOfLeadingZeros(I)I': (jvm, obj, args) => Math.clz32(args[0]),
     'toBinaryString(I)Ljava/lang/String;': (jvm, obj, args) => {
       const intValue = args[0];
       // Use unsigned right shift to get the 32-bit two's complement representation
@@ -72,6 +73,10 @@ module.exports = {
     'signum(I)I': (jvm, obj, args) => args[0] > 0 ? 1 : (args[0] < 0 ? -1 : 0),
     'compare(II)I': (jvm, obj, args) => args[0] < args[1] ? -1 : (args[0] > args[1] ? 1 : 0),
     'compareUnsigned(II)I': (jvm, obj, args) => (args[0] >>> 0) < (args[1] >>> 0) ? -1 : ((args[0] >>> 0) > (args[1] >>> 0) ? 1 : 0),
+    'sum(II)I': (jvm, obj, args) => (args[0] + args[1]) | 0,
+    'max(II)I': (jvm, obj, args) => Math.max(args[0], args[1]) | 0,
+    'min(II)I': (jvm, obj, args) => Math.min(args[0], args[1]) | 0,
+    'hashCode(I)I': (jvm, obj, args) => args[0] | 0,
     'bitCount(I)I': (jvm, obj, args) => { let v = args[0] >>> 0, c = 0; while (v) { v &= v - 1; c++; } return c; },
     'highestOneBit(I)I': (jvm, obj, args) => { let v = args[0] | 0; if (v === 0) return 0; v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16; return v - (v >>> 1); },
     'lowestOneBit(I)I': (jvm, obj, args) => args[0] & -args[0],

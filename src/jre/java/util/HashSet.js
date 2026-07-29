@@ -218,6 +218,10 @@ module.exports = {
       index: 0,
       lastIndex: -1,
     }),
+    'stream()Ljava/util/stream/Stream;': (jvm, obj) => ({
+      type: 'java/util/stream/Stream',
+      array: Array.from(ensureSet(obj)),
+    }),
     'toArray()[Ljava/lang/Object;': (jvm, obj) => {
       const array = Array.from(ensureSet(obj));
       array.type = '[Ljava/lang/Object;';

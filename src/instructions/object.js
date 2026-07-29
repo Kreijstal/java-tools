@@ -322,10 +322,17 @@ module.exports = {
       jvm, objRef, instruction, className, fieldName,
     );
     const value = fieldKey ? objRef.fields[fieldKey] : undefined;
-    if (jvm._debugGetfield && jvm._debugGetfield === `${className}.${fieldName}` &&
-        Array.isArray(value)) {
+    if (jvm._debugGetfield && jvm._debugGetfield === `${className}.${fieldName}`) {
       const locals = (frame.locals || []).slice(0, 5).map((l) => (l !== null && typeof l === 'object' ? `<${l.type}${l.__dbgId ? '#' + l.__dbgId : ''}>` : String(l))).join(' ');
-      console.error(`[getfield] ${className}.${fieldName} in ${frame.className || '?'}.${frame.method && frame.method.name}@${frame.pc} locals=[${locals}] [len ${value.length}] ${value.slice(0, 48).join(',')}`);
+      let rendered;
+      if (Array.isArray(value) || ArrayBuffer.isView(value)) {
+        rendered = `[len ${value.length}] ${Array.from(value).slice(0, 48).join(',')}`;
+      } else if (value !== null && typeof value === 'object') {
+        rendered = `<${value._className || value.type || 'object'}>`;
+      } else {
+        rendered = String(value);
+      }
+      console.error(`[getfield] ${className}.${fieldName} in ${frame.className || '?'}.${frame.method && frame.method.name}@${frame.pc} locals=[${locals}] ${rendered}`);
     }
     frame.stack.push(value);
   },
@@ -525,6 +532,14 @@ module.exports = {
       return;
     }
 
+    if (typeof process !== 'undefined' && process.env.JVM_DEBUG_CHECKCAST) {
+      console.error('[checkcast] failure', {
+        targetClassName,
+        runtimeClassName: runtimeClassName(objRef),
+        keys: objRef && typeof objRef === 'object' ? Object.keys(objRef) : [],
+        fieldKeys: objRef && objRef.fields ? Object.keys(objRef.fields) : [],
+      });
+    }
     throw {
       type: 'java/lang/ClassCastException',
       message: `${runtimeClassName(objRef)} cannot be cast to ${targetClassName}` +

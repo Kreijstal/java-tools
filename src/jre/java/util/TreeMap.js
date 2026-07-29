@@ -15,6 +15,11 @@ function unwrapComparable(value) {
   if (value === null || value === undefined) return value;
   if (typeof value === 'number' || typeof value === 'string') return value;
   if (Object.prototype.hasOwnProperty.call(value, 'value')) return value.value;
+  if (value.fields) {
+    const numericField = Object.keys(value.fields).find((key) =>
+      /\.(address|value)(?::[JI])?$/.test(key));
+    if (numericField !== undefined) return value.fields[numericField];
+  }
   if (value.type === 'java/lang/String' || value instanceof String) return String(value);
   if (typeof value.toString === 'function') return value.toString();
   return value;
@@ -23,7 +28,13 @@ function compareKeys(a, b) {
   const av = unwrapComparable(a);
   const bv = unwrapComparable(b);
   if (av === bv) return 0;
-  if (typeof av === 'number' && typeof bv === 'number') return av < bv ? -1 : 1;
+  if ((typeof av === 'number' || typeof av === 'bigint') &&
+      (typeof bv === 'number' || typeof bv === 'bigint')) {
+    if (typeof av === typeof bv) return av < bv ? -1 : 1;
+    const an = typeof av === 'bigint' ? av : BigInt(av);
+    const bn = typeof bv === 'bigint' ? bv : BigInt(bv);
+    return an < bn ? -1 : (an > bn ? 1 : 0);
+  }
   const as = String(av);
   const bs = String(bv);
   return as < bs ? -1 : (as > bs ? 1 : 0);
@@ -63,6 +74,11 @@ module.exports = {
     },
     'comparator()Ljava/util/Comparator;': (jvm, obj) => obj.comparator || null,
     'firstKey()Ljava/lang/Object;': (jvm, obj) => { const e = sortedEntries(obj)[0]; return e ? e[0] : null; },
+    'firstEntry()Ljava/util/Map$Entry;': (jvm, obj) => {
+      const map = ensureMap(obj);
+      const entry = sortedEntries(obj)[0];
+      return entry ? makeEntry(jvm, map, entry[0]) : null;
+    },
     'lastKey()Ljava/lang/Object;': (jvm, obj) => { const e = sortedEntries(obj); return e.length ? e[e.length - 1][0] : null; },
     'floorKey(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
       let found = null;
@@ -127,5 +143,33 @@ module.exports = {
       });
       return makeTreeMap(jvm, entries, obj.comparator || null);
     },
+    'put(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+      const map = ensureMap(obj);
+      const existing = Array.from(map.keys()).find((key) => compareKeys(key, args[0]) === 0);
+      const oldValue = existing === undefined ? null : map.get(existing);
+      if (existing !== undefined) map.delete(existing);
+      map.set(args[0], args[1]);
+      obj.sizeCache = map.size;
+      return oldValue;
+    },
+    'remove(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+      const map = ensureMap(obj);
+      const existing = Array.from(map.keys()).find((key) => compareKeys(key, args[0]) === 0);
+      if (existing === undefined) return null;
+      const oldValue = map.get(existing);
+      map.delete(existing);
+      obj.sizeCache = map.size;
+      return oldValue;
+    },
+    'remove(Ljava/lang/Object;Ljava/lang/Object;)Z': (jvm, obj, args) => {
+      const map = ensureMap(obj);
+      const existing = Array.from(map.keys()).find((key) => compareKeys(key, args[0]) === 0);
+      if (existing === undefined || map.get(existing) !== args[1]) return 0;
+      map.delete(existing);
+      obj.sizeCache = map.size;
+      return 1;
+    },
+    'isEmpty()Z': (jvm, obj) => ensureMap(obj).size === 0 ? 1 : 0,
+    'size()I': (jvm, obj) => ensureMap(obj).size,
   },
 };

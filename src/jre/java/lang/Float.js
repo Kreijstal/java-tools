@@ -41,6 +41,14 @@ function javaFloatString(value) {
   return s;
 }
 
+function floatBits(value) {
+  if (Number.isNaN(value)) return 0x7fc00000;
+  const buffer = new ArrayBuffer(4);
+  const view = new DataView(buffer);
+  view.setFloat32(0, value, false);
+  return view.getInt32(0, false);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
@@ -107,6 +115,18 @@ module.exports = {
     'isFinite(F)Z': (jvm, obj, args) => {
       return isFinite(args[0]) ? 1 : 0;
     },
+    'compare(FF)I': (jvm, obj, args) => {
+      const left = Math.fround(args[0]);
+      const right = Math.fround(args[1]);
+      if (left < right) return -1;
+      if (left > right) return 1;
+      const leftBits = floatBits(left);
+      const rightBits = floatBits(right);
+      return leftBits === rightBits ? 0 : (leftBits < rightBits ? -1 : 1);
+    },
+    'sum(FF)F': (jvm, obj, args) => Math.fround(args[0] + args[1]),
+    'max(FF)F': (jvm, obj, args) => Math.fround(Math.max(args[0], args[1])),
+    'min(FF)F': (jvm, obj, args) => Math.fround(Math.min(args[0], args[1])),
     'toString(F)Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(javaFloatString(args[0]));
     },

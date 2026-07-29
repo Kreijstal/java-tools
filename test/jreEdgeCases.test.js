@@ -416,7 +416,7 @@ test('File constructors coerce Java String objects without value fields', (t) =>
   t.end();
 });
 
-test('HashMap.computeIfAbsent does not record null mapping results', (t) => {
+test('HashMap.computeIfAbsent does not record null mapping results', async (t) => {
   const map = {};
   const fn = {
     methods: {
@@ -425,7 +425,9 @@ test('HashMap.computeIfAbsent does not record null mapping results', (t) => {
   };
 
   HashMap.methods['<init>()V'](null, map, []);
-  const value = HashMap.methods['computeIfAbsent(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;'](null, map, ['k', fn]);
+  const value = await HashMap.methods[
+    'computeIfAbsent(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;'
+  ](null, map, ['k', fn]);
 
   t.equal(value, null);
   t.equal(HashMap.methods['containsKey(Ljava/lang/Object;)Z'](null, map, ['k']), 0);

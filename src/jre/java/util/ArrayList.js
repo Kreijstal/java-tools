@@ -160,6 +160,10 @@ module.exports = {
     },
     'iterator()Ljava/util/Iterator;': (jvm, obj) => iteratorFor(jvm, backingArray(obj)),
     'listIterator()Ljava/util/ListIterator;': (jvm, obj) => iteratorFor(jvm, backingArray(obj)),
+    'stream()Ljava/util/stream/Stream;': (jvm, obj) => ({
+      type: 'java/util/stream/Stream',
+      array: backingArray(obj).slice(),
+    }),
     'toArray()[Ljava/lang/Object;': (jvm, obj) => {
       const out = backingArray(obj).slice();
       out.type = '[Ljava/lang/Object;';

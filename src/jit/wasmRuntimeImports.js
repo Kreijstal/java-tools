@@ -236,6 +236,7 @@ function addNewImport(reg, jvm, className) {
   const name = `new_${className}`.replace(/[^\w]/g, '_');
   return reg.addImport(name, [], [T.ref], () => ({
     type: className,
+    _className: className,
     fields: { ...template },
     hashCode: jvm.nextHashCode++,
     isLocked: false,
