@@ -50,6 +50,11 @@ async function invokeFunctional(jvm, functional, args, thread) {
   const handle = functional && functional.methodHandle;
   const reference = handle && handle.reference;
   if (!handle || !reference || !reference.nameAndType) {
+    const directApply = functional && functional.methods &&
+      functional.methods['apply(Ljava/lang/Object;)Ljava/lang/Object;'];
+    if (typeof directApply === 'function') {
+      return directApply(jvm, functional, args || [], thread);
+    }
     throw new Error('Object is not a MethodHandle-backed functional interface');
   }
   const name = reference.nameAndType.name;

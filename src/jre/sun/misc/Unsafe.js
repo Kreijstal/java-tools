@@ -1,10 +1,9 @@
-const os = require('os');
-
 const unsafe = {
   type: 'sun/misc/Unsafe',
 };
 
-const nativeLittleEndian = os.endianness() === 'LE';
+const nativeLittleEndian =
+  new Uint8Array(new Uint16Array([1]).buffer)[0] === 1;
 const offsets = new Map();
 let nextOffset = 1n;
 
