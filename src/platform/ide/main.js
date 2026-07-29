@@ -303,6 +303,15 @@ function wireToolbar() {
     if (!select.value) throw new Error('Pick a sample first');
     await window.loadVirtualClass(select.value);
     reveal('bytecode');
+    // Lazy compilation just wrote the sample's .java (and dependencies) into
+    // /samples of the shared workspace: show them and open the source.
+    explorer.refreshTree();
+    const sourcePath = typeof window.findSampleSourcePath === 'function'
+      ? window.findSampleSourcePath(select.value)
+      : null;
+    if (sourcePath && context.workspace.existsSync(sourcePath)) {
+      documents.openFile(sourcePath);
+    }
   }));
 
   // Explorer panel toolbar

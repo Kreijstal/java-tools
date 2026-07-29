@@ -919,6 +919,22 @@ async function ensureSampleClass(classPath) {
   return jvmDebug.fileProvider.exists(withExtension);
 }
 
+/**
+ * Workspace path of the .java source that defines a sample class, or null if
+ * the class does not come from the sample manifest (e.g. an uploaded JAR).
+ * @param {string} classPath - e.g. "Hello.class" or "Hello"
+ * @returns {string|null} - e.g. "/samples/Hello.java"
+ */
+function findSampleSourcePath(classPath) {
+  if (!sampleManifest || !classPath) return null;
+  const internalName = String(classPath)
+    .replace(/^\.?\/+/, "")
+    .replace(/\.class$/, "");
+  const sample = sampleManifest.samples.find((entry) =>
+    entry.classes.includes(internalName));
+  return sample ? `/samples/${sample.source}` : null;
+}
+
 function sampleCategory(classPath, launchMode) {
   const modeLabel = launchMode === "applet" ? "Applets" : "Applications";
   const withoutExtension = classPath.replace(/\.class$/, "");
@@ -2450,6 +2466,7 @@ window.__realLoadClassFile = loadClassFile;
 window.updateButtons = updateButtons;
 window.loadVirtualClass = loadVirtualClass;
 window.ensureSampleClass = ensureSampleClass;
+window.findSampleSourcePath = findSampleSourcePath;
 window.loadSampleClass = loadSampleClass;
 window.loadClassFile = loadClassFile;
 window.clearOutput = clearOutput;

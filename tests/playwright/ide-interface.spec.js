@@ -103,6 +103,16 @@ test.describe('Java tools IDE', () => {
       null,
       { timeout: 10000 },
     );
+
+    // Loading a sample lazily compiles its .java into /samples of the
+    // workspace: the explorer must pick the new files up and the source must
+    // open in its own editor tab.
+    await expect(page.locator('#explorerTree .tree-row[data-path="/samples/Hello.java"]')).toBeVisible();
+    await expect(page.locator('.lm_tab[title="Hello.java"]')).toBeVisible();
+    const activePath = await page.evaluate(
+      () => window.javaToolsIde.documents.getActiveDocument().path,
+    );
+    expect(activePath).toBe('/samples/Hello.java');
   });
 
   test('debugging highlights the paused source line in the editor', async ({ page }) => {
