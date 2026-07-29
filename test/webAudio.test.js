@@ -129,7 +129,9 @@ test("WebAudio unlocks before a delayed SourceDataLine open", async (t) => {
     coalesceDelayMs: 0,
   });
   const buffersBefore = closedDiagnostics.scheduledBuffers;
-  coalesced.write(new Uint8Array([0, 0, 1, 0]));
+  const reusablePcm = new Uint8Array([0, 0, 1, 0]);
+  coalesced.write(reusablePcm);
+  reusablePcm.fill(127);
   t.equal(audioPlatform.getWebAudioDiagnostics().scheduledBuffers, buffersBefore,
     "a partial continuous region remains staged");
   t.equal(coalesced.available(), 4092,
@@ -219,6 +221,7 @@ test("WebAudio starts short effect lines after their first region", async (t) =>
   const listeners = new Map();
   let factory = null;
   let workletOptions = null;
+  let workletNode = null;
   const posted = [];
   class FakeAudioContext {
     constructor() {
@@ -233,6 +236,7 @@ test("WebAudio starts short effect lines after their first region", async (t) =>
   class FakeAudioWorkletNode {
     constructor(_context, _name, options) {
       workletOptions = options;
+      workletNode = this;
       this.port = {
         onmessage: null,
         postMessage(message) { posted.push(message); },
@@ -288,6 +292,22 @@ test("WebAudio starts short effect lines after their first region", async (t) =>
   t.equal(audioPlatform.getWebAudioDiagnostics().outputFormats[0]
     .workletStartFrames, 512,
   "telemetry exposes the per-line startup threshold");
+  let drained = false;
+  output.once("drain", () => { drained = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  t.equal(drained, false,
+    "worklet drain waits while published PCM remains queued");
+  workletNode.port.onmessage({ data: { type: "queue", frames: 0 } });
+  await new Promise(resolve => setTimeout(resolve, 0));
+  t.equal(drained, true,
+    "worklet drain completes after the processor reports an empty queue");
+  output.write(new Uint8Array(512 * 2 * 2));
+  output.flush();
+  const flush = posted.find(message => message.type === "flush");
+  t.deepEqual(flush, { type: "flush", generation: 1 },
+    "flush advances the worklet generation");
+  t.equal(output.queuedSeconds(), 0,
+    "flush clears the main-thread worklet queue accounting");
   output.end();
   t.end();
 });

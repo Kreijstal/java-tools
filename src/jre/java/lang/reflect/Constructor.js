@@ -1,6 +1,10 @@
 const Frame = require('../../../../core/frame');
 const { ASYNC_METHOD_SENTINEL } = require('../../../../core/constants');
 const { withThrows } = require('../../../helpers');
+const { parseDescriptor } = require('../../../../parsing/typeParser');
+const {
+  assignReflectiveArguments,
+} = require('../../../../core/reflectionArguments');
 
 function classNameFor(classObj) {
   return classObj && (classObj.className ||
@@ -30,15 +34,6 @@ function constructorDescriptor(constructorObj) {
   const parameters = parameterTypes.map(descriptorForClass);
   if (parameters.some((descriptor) => !descriptor)) return null;
   return `(${parameters.join('')})V`;
-}
-
-function unboxConstructorArgument(value) {
-  if (value && typeof value === 'object' && value.value !== undefined &&
-      typeof value.type === 'string' &&
-      value.type.startsWith('java/lang/')) {
-    return value.value;
-  }
-  return value;
 }
 
 module.exports = {
@@ -73,8 +68,16 @@ module.exports = {
         normalizedClassName,
         activeThread,
       );
+      const classData = newObj && newObj._classData ||
+        jvm.classes[normalizedClassName];
+      if (!classData) {
+        throw {
+          type: 'java/lang/InstantiationException',
+          message: `${normalizedClassName}.${descriptor}`,
+        };
+      }
       const constructor = jvm.findMethod(
-        jvm.classes[normalizedClassName],
+        classData,
         '<init>',
         descriptor,
       );
@@ -89,15 +92,16 @@ module.exports = {
       const constructorFrame = new Frame(constructor);
       constructorFrame.className = normalizedClassName;
       constructorFrame.locals[0] = newObj;
-      let localIndex = 1;
-      for (const argument of constructorArgs) {
-        constructorFrame.locals[localIndex++] =
-          unboxConstructorArgument(argument);
-      }
+      assignReflectiveArguments(
+        constructorFrame.locals,
+        constructorArgs,
+        parseDescriptor(descriptor).params,
+        1,
+      );
       activeThread.isAwaitingReflectiveCall = true;
       activeThread.reflectiveCallFrame = constructorFrame;
       activeThread.reflectiveCallResolver = () => {
-        callingFrame.stack.push(newObj);
+        if (callingFrame) callingFrame.stack.push(newObj);
       };
       activeThread.callStack.push(constructorFrame);
       return ASYNC_METHOD_SENTINEL;

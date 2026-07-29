@@ -28,7 +28,7 @@ function completeReflectiveCall(thread, value) {
   thread.isAwaitingReflectiveCall = false;
   thread.reflectiveCallResolver = null;
   thread.reflectiveCallFrame = null;
-  resolver(value);
+  return typeof resolver === 'function' ? resolver(value) : undefined;
 }
 
 module.exports = {
@@ -406,3 +406,9 @@ module.exports = {
       // No operation
     },
 };
+
+// Keep protocol helpers out of the opcode-handler spread in instructions/index.
+Object.defineProperties(module.exports, {
+  isReflectiveTarget: { value: isReflectiveTarget },
+  completeReflectiveCall: { value: completeReflectiveCall },
+});

@@ -38,6 +38,27 @@ const {
   getFileProvider,
   setFileProvider,
 } = require('../src/core/classLoader');
+const {
+  completeReflectiveCall,
+} = require('../src/instructions/control');
+
+const JAVAC_AVAILABLE = (() => {
+  try {
+    execFileSync('javac', ['-version'], { stdio: 'ignore' });
+    return true;
+  } catch (_) {
+    return false;
+  }
+})();
+
+function compileHarness(directory, filename, source) {
+  const sourcePath = path.join(directory, filename);
+  fs.writeFileSync(sourcePath, source);
+  execFileSync('javac', [
+    '-source', '8', '-target', '8', '-d', directory, sourcePath,
+  ], { stdio: 'ignore' });
+  return sourcePath;
+}
 
 function jvmStub() {
   return {
@@ -104,22 +125,37 @@ test('Class reflective method lookup preserves array parameter descriptors', asy
     'declared lookup encodes int[] as [I rather than L[I;');
   t.equal(inherited._methodData, method,
     'public lookup uses the same array descriptor encoding');
+  let nullParameterError = null;
+  try {
+    Class.methods[
+      'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+    ]({}, owner, ['mix', [intClass, null]]);
+  } catch (error) {
+    nullParameterError = error;
+  }
+  t.equal(nullParameterError && nullParameterError.type,
+    'java/lang/IllegalArgumentException',
+  'a null parameter type cannot silently shorten a method descriptor');
   t.end();
 });
 
 test('reflective constructors run their body through nested calls', async (t) => {
+  if (!JAVAC_AVAILABLE) {
+    t.skip('javac is unavailable');
+    t.end();
+    return;
+  }
   const directory = fs.mkdtempSync(path.join(os.tmpdir(),
     'jvm-reflective-constructor-'));
   t.teardown(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const source = path.join(directory, 'ReflectiveConstructorHarness.java');
-  fs.writeFileSync(source, `
+  compileHarness(directory, 'ReflectiveConstructorHarness.java', `
 public final class ReflectiveConstructorHarness {
   static int result;
   private static final class Value {
     int value;
-    private Value(int input) {
+    private Value(long wide, double fraction, boolean enabled, int input) {
       super();
-      value = adjust(input);
+      value = adjust((int) wide + (int) fraction + (enabled ? input : 0));
     }
     private int adjust(int input) {
       return input * 3;
@@ -127,27 +163,33 @@ public final class ReflectiveConstructorHarness {
   }
   public static void main(String[] args) throws Exception {
     java.lang.reflect.Constructor<Value> constructor =
-      Value.class.getDeclaredConstructor(int.class);
+      Value.class.getDeclaredConstructor(
+        long.class, double.class, boolean.class, int.class);
     constructor.setAccessible(true);
-    result = constructor.newInstance(Integer.valueOf(7)).value;
+    result = constructor.newInstance(
+      Long.valueOf(4L), Double.valueOf(2.0), Boolean.TRUE,
+      Integer.valueOf(7)).value;
   }
 }
 `);
-  execFileSync('javac', ['-source', '8', '-target', '8', '-d', directory,
-    source], { stdio: 'ignore' });
   const jvm = new JVM({ classpath: directory, jit: { enabled: false } });
   await jvm.run('ReflectiveConstructorHarness');
   t.equal(jvm.classes.ReflectiveConstructorHarness.staticFields.get('result:I'),
-    21, 'the requested constructor, super call, and nested helper all finish');
+    39,
+  'wide and boxed constructor arguments reach the requested nested body');
   t.end();
 });
 
 test('generated void methods complete reflective calls with a null result', async (t) => {
+  if (!JAVAC_AVAILABLE) {
+    t.skip('javac is unavailable');
+    t.end();
+    return;
+  }
   const directory = fs.mkdtempSync(path.join(os.tmpdir(),
     'jvm-reflective-generated-void-'));
   t.teardown(() => fs.rmSync(directory, { recursive: true, force: true }));
-  const source = path.join(directory, 'ReflectiveGeneratedVoidHarness.java');
-  fs.writeFileSync(source, `
+  compileHarness(directory, 'ReflectiveGeneratedVoidHarness.java', `
 public final class ReflectiveGeneratedVoidHarness {
   static int result;
   static int calls;
@@ -172,8 +214,6 @@ public final class ReflectiveGeneratedVoidHarness {
   }
 }
 `);
-  execFileSync('javac', ['-source', '8', '-target', '8', '-d', directory,
-    source], { stdio: 'ignore' });
   const jvm = new JVM({ classpath: directory, jit: {
     warmupThreshold: 0,
     preferWholeMethodJs: true,
@@ -199,6 +239,25 @@ public final class ReflectiveGeneratedVoidHarness {
     120,
     'the generated target returns null to Method.invoke before caller pop/branch',
   );
+  t.end();
+});
+
+test('reflective completion clears state before invoking its resolver', (t) => {
+  const frame = {};
+  const thread = {
+    isAwaitingReflectiveCall: true,
+    reflectiveCallFrame: frame,
+    reflectiveCallResolver() {
+      throw new Error('resolver failed');
+    },
+  };
+  t.throws(() => completeReflectiveCall(thread, null), /resolver failed/);
+  t.equal(thread.isAwaitingReflectiveCall, false,
+    'a throwing resolver cannot leave reflective mode active');
+  t.equal(thread.reflectiveCallResolver, null,
+    'a throwing resolver is detached before it runs');
+  t.equal(thread.reflectiveCallFrame, null,
+    'a throwing resolver cannot capture the next returning frame');
   t.end();
 });
 
@@ -537,6 +596,27 @@ test('disabled SourceDataLine applies backpressure', (t) => {
 
   if (previous === undefined) delete process.env.JVM_DISABLE_AUDIO;
   else process.env.JVM_DISABLE_AUDIO = previous;
+  t.end();
+});
+
+test('SourceDataLine audio priority uses the scheduler clock', (t) => {
+  const output = {
+    write() {},
+    queuedSeconds() { return 0; },
+  };
+  const line = { audioOutput: output, isOpen: true };
+  const thread = { id: 7, status: 'runnable' };
+  const jvm = {
+    clock: { millis() { return 1250; } },
+    _audioPriority: null,
+  };
+  SourceDataLine.methods['write([BII)I'](
+    jvm, line, [[0, 0], 0, 2], thread,
+  );
+  t.equal(jvm._audioPriority.until, 1300,
+    'the priority deadline is derived from the scheduler clock');
+  t.equal(jvm._audioPriority.thread, thread,
+    'the producing guest thread receives temporary priority');
   t.end();
 });
 

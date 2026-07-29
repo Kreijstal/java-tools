@@ -1,3 +1,28 @@
+const resolvedClassInitializationToken = Symbol('resolvedClassInitializationToken');
+
+function classInitializationTokenFor(jvm, instruction, className) {
+  let initialization =
+    instruction && instruction[resolvedClassInitializationToken];
+  if (!initialization || initialization.jvm !== jvm) {
+    initialization = {
+      jvm,
+      token: jvm.getClassInitializationToken(className),
+    };
+    if (instruction && typeof instruction === 'object') {
+      try {
+        Object.defineProperty(instruction, resolvedClassInitializationToken, {
+          configurable: true,
+          writable: true,
+          value: initialization,
+        });
+      } catch (_) {
+        // Frozen diagnostic fixtures retain the uncached token lookup.
+      }
+    }
+  }
+  return initialization.token;
+}
+
 function normalizeArrayLoad(value, kind, arrayRef) {
   if (!kind) {
     kind = arrayRef.type === "[B" || arrayRef.type === "[Z" ? "baload"
@@ -167,6 +192,7 @@ function _astore(frame, kind) {
 }
 
 module.exports = {
+  classInitializationTokenFor,
   _aload,
   _astore,
   normalizeArrayLoad,

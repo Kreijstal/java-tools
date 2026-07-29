@@ -2,6 +2,9 @@ const Frame = require('../../../../core/frame');
 const { parseDescriptor } = require('../../../../parsing/typeParser');
 const { ASYNC_METHOD_SENTINEL } = require('../../../../core/constants');
 const { withThrows } = require('../../../helpers');
+const {
+  assignReflectiveArguments,
+} = require('../../../../core/reflectionArguments');
 
 // Method.invoke must return boxed objects for primitive-returning methods;
 // callers checkcast to the wrapper type (e.g. (Long) m.invoke(...)).
@@ -25,28 +28,6 @@ function boxReflectiveReturn(descriptor, value) {
     case 'F': return box('java/lang/Float', Number(value));
     case 'D': return box('java/lang/Double', Number(value));
     default: return value;
-  }
-}
-
-function unboxReflectiveArgument(parameterType, value) {
-  const boxedValue = value && typeof value === 'object' &&
-    Object.prototype.hasOwnProperty.call(value, 'value')
-    ? value.value : value;
-  switch (parameterType) {
-    case 'boolean': return boxedValue ? 1 : 0;
-    case 'byte':
-    case 'short':
-    case 'char':
-    case 'int':
-      return Number(boxedValue) | 0;
-    case 'long':
-      return typeof boxedValue === 'bigint'
-        ? boxedValue : BigInt(Math.trunc(Number(boxedValue)));
-    case 'float':
-    case 'double':
-      return Number(boxedValue);
-    default:
-      return value;
   }
 }
 
@@ -143,12 +124,9 @@ module.exports = {
         newFrame.locals[localIndex++] = obj;
       }
       if (methodArgs) {
-        for (let index = 0; index < methodArgs.length; index += 1) {
-          newFrame.locals[localIndex] =
-            unboxReflectiveArgument(params[index], methodArgs[index]);
-          localIndex += params[index] === 'long' || params[index] === 'double'
-            ? 2 : 1;
-        }
+        assignReflectiveArguments(
+          newFrame.locals, methodArgs, params, localIndex,
+        );
       }
 
       const thread = jvm.threads[jvm.currentThreadIndex];
@@ -160,7 +138,9 @@ module.exports = {
       // synchronous so the fast interpreter cannot resume the caller before
       // its reflected result has been materialized.
       thread.reflectiveCallResolver = (ret) => {
-        callingFrame.stack.push(boxReflectiveReturn(descriptor, ret));
+        if (callingFrame) {
+          callingFrame.stack.push(boxReflectiveReturn(descriptor, ret));
+        }
       };
       thread.callStack.push(newFrame);
 

@@ -241,6 +241,7 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
             if (event.data && event.data.type === "queue") {
               this.workletQueuedFrames = Math.max(0,
                 Number(event.data.frames) || 0);
+              this.maybeFlushDrainCallbacks();
             } else if (event.data && event.data.type === "underrun") {
               this.underruns += 1;
               underrunCount += 1;
@@ -281,7 +282,9 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
       if (this.context.state === "suspended" && typeof this.context.resume === "function") {
         resumeSharedAudioContext();
       }
-      this.stagedChunks.push(bytes);
+      // Staging outlives the guest write call, whose backing byte array may
+      // be reused immediately for the next mixer region.
+      this.stagedChunks.push(new Uint8Array(bytes));
       this.stagedByteLength += bytes.length;
       this.stagedFrames += frameCount;
       if (this.stagedFrames >= this.coalesceFrames) {
@@ -570,11 +573,15 @@ registerProcessor("jvm-source-data-line", JVMSourceDataLineProcessor);`;
         return;
       }
       this.scheduleStaged();
-      if (this.pendingSources === 0) {
-        setTimeout(callback, 0);
-      } else {
-        this.drainCallbacks.push(callback);
-      }
+      this.drainCallbacks.push(callback);
+      this.maybeFlushDrainCallbacks();
+    }
+
+    maybeFlushDrainCallbacks() {
+      const drained = this.workletNode
+        ? this.stagedFrames === 0 && this.workletQueuedFrames === 0
+        : this.pendingSources === 0;
+      if (drained) this.flushDrainCallbacks();
     }
 
     flushDrainCallbacks() {

@@ -92,7 +92,7 @@ module.exports = {
           jvm._audioPriority = {
             thread,
             output: obj.audioOutput,
-            until: Date.now() + 50,
+            until: jvm.clock.millis() + 50,
           };
         }
         return len;

@@ -15,7 +15,12 @@ function runtimeClassName(obj) {
 }
 
 function descriptorForClassObject(classObj) {
-  if (!classObj) return '';
+  if (!classObj) {
+    throw {
+      type: 'java/lang/IllegalArgumentException',
+      message: 'Parameter type must not be null',
+    };
+  }
   if (classObj.isPrimitive) {
     const primitiveDescriptors = {
       int: 'I',

@@ -395,14 +395,19 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
     jit: { warmupThreshold: 0, arrayKernelWasmFirst: true },
   });
   const shape = (name, {
-    arrayAccesses = 24, length = 192, backward = true,
+    primitiveArrayAccesses = 24, referenceArrayAccesses = 0,
+    length = 192, backward = true,
     nonStaticCall = false,
   } = {}) => {
+    const totalArrayAccesses =
+      primitiveArrayAccesses + referenceArrayAccesses;
     const codeItems = Array.from({ length }, (_unused, index) => ({
       labelDef: index === 0 ? 'Lentry:' : `L${index}:`,
-      instruction: index < arrayAccesses
-        ? (index & 1 ? 'aaload' : 'iaload')
-        : index === arrayAccesses && nonStaticCall
+      instruction: index < referenceArrayAccesses
+        ? 'aaload'
+        : index < totalArrayAccesses
+          ? 'iaload'
+          : index === totalArrayAccesses && nonStaticCall
           ? { op: 'invokevirtual',
             arg: ['Method', 'ArbitraryReceiver', ['leaf', '()V']] }
           : index === length - 1 && backward
@@ -419,8 +424,14 @@ test('dense nested array kernels select Wasm without guest-name matching', (t) =
   t.ok(jvm.jit.isArrayKernelWasmFirstMethod(shape('renamedArchiveKernel')),
     'bytecode size, array density, and a backedge select the Wasm policy');
   t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
-    shape('anotherName', { arrayAccesses: 23 })),
+    shape('anotherName', { primitiveArrayAccesses: 23 })),
   'a sparse array body retains the ordinary generated tier');
+  t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
+    shape('referenceHeavyName', {
+      primitiveArrayAccesses: 0,
+      referenceArrayAccesses: 24,
+    })),
+  'reference-array traffic does not satisfy primitive-array density');
   t.notOk(jvm.jit.isArrayKernelWasmFirstMethod(
     shape('acyclicName', { backward: false })),
   'an acyclic array helper avoids module compilation overhead');
@@ -957,6 +968,29 @@ test('generated JIT admits call-free post-increment field helpers structurally',
   t.equal(object.fields['ArbitraryCounter.value'], 42,
     'post-increment stores the incremented value');
 
+  const alternateObject = {
+    type: 'ArbitraryCounter',
+    fields: { 'LegacyCounter.value': 9 },
+  };
+  const alternateFrame = new Frame(method);
+  alternateFrame.className = 'ArbitraryCounter';
+  alternateFrame.locals[0] = alternateObject;
+  const alternateStack = new Stack();
+  alternateStack.push(alternateFrame);
+  const alternateResult = generated(
+    alternateFrame,
+    { status: 'runnable', callStack: alternateStack },
+    jvm.jit,
+    false,
+  );
+  t.equal(alternateResult.value, 9,
+    'generated putfield reads an alternate owner-qualified slot');
+  t.equal(alternateObject.fields['LegacyCounter.value'], 10,
+    'generated putfield updates the resolved alternate slot');
+  t.notOk(Object.prototype.hasOwnProperty.call(
+    alternateObject.fields, 'ArbitraryCounter.value'),
+  'generated putfield does not invent the direct slot on unusual objects');
+
   const disabled = new JVM({ jit: {
     warmupThreshold: 0, profileMethods: false, postIncrementHelpers: false,
   } });
@@ -1079,6 +1113,34 @@ test('generated call sites execute proven synchronous JRE leaves directly', (t) 
     'javax/sound/sampled/SourceDataLine', 'javax/sound/sampled/SourceDataLine',
     'drain', '()V'), null,
   'declared async JRE methods retain the canonical scheduler path');
+  t.end();
+});
+
+test('ad-hoc static generated calls carry initialization tokens', (t) => {
+  const jvm = new JVM({ jit: { warmupThreshold: 0 } });
+  jvm.classInitializationState.set('ArbitraryStaticTarget', 'INITIALIZED');
+  const instruction = {
+    op: 'invokestatic',
+    arg: ['Method', 'ArbitraryStaticTarget', ['work', '()V']],
+  };
+  const frame = new Frame({
+    name: 'caller', descriptor: '()V',
+    attributes: [{ type: 'code', code: {
+      codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
+    } }],
+  });
+  let capturedSite = null;
+  const original = jvm.jit.tryInvokeSyncSite;
+  jvm.jit.tryInvokeSyncSite = (site) => {
+    capturedSite = site;
+    return null;
+  };
+  jvm.jit.tryInvokeSync('invokestatic', frame, instruction, {});
+  jvm.jit.tryInvokeSyncSite = original;
+  t.ok(capturedSite.initializationToken,
+    'the ad-hoc static site carries a class-initialization token');
+  t.ok(capturedSite.initializationToken.initialized,
+    'the token exposes the initialized target state');
   t.end();
 });
 

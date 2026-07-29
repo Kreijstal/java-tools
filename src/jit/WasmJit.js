@@ -64,7 +64,8 @@
 
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const {
-  addTimeImport, addNewArrayImport, addANewArrayImport, addNewImport,
+  addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
+  addNewImport,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -76,8 +77,6 @@ const {
   getOp, descToWasm, toWasmValue, parseMethodDescriptor, sig,
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
-  MATH_INTRINSICS,
-  mathIntrinsicFunction,
   Unsupported,
   NestedDeopt,
   isGuestThrow,
@@ -495,23 +494,7 @@ class MethodTranslator {
   }
 
   mathIntrinsic(ins) {
-    const [, className, [name, descriptor]] = ins.arg;
-    if (className !== 'java/lang/Math' || !MATH_INTRINSICS.has(name)) {
-      throw new Unsupported(`invoke ${className}.${name}`);
-    }
-    const { params, ret } = parseMethodDescriptor(descriptor);
-    if (![...params, ret].every((c) => 'IJFD'.includes(c))) {
-      throw new Unsupported(`Math.${name}${descriptor} non-numeric`);
-    }
-    const wParams = params.map(descToWasm);
-    const wRet = descToWasm(ret);
-    const fn = mathIntrinsicFunction(name, descriptor);
-    if (!fn) throw new Unsupported(`Math.${name}${descriptor} unsupported`);
-    return {
-      params: wParams,
-      ret: wRet,
-      idx: this.addImport(`math_${name}_${descriptor}`.replace(/[^\w]/g, '_'), wParams, [wRet], fn),
-    };
+    return addMathImport(this, ins);
   }
 
   // invokestatic bound directly to another compiled wasm method. A callee

@@ -16,6 +16,10 @@ const {
   normalizeArrayLoad,
   normalizeArrayStore,
 } = require("../instructions/utils");
+const {
+  isReflectiveTarget,
+  completeReflectiveCall,
+} = require("../instructions/control");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
@@ -556,7 +560,7 @@ class JitCompiler {
       const op = getOp(item && item.instruction);
       if (!op) continue;
       instructionCount += 1;
-      if (/^(?:[abcdfils]aload|[abcdfils]astore|arraylength)$/.test(op)) {
+      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
         primitiveArrayAccessCount += 1;
       }
       if (op === "invokestatic") staticCallCount += 1;
@@ -655,14 +659,11 @@ class JitCompiler {
       return HANDLED_RESULT;
     }
     if (result && result.returned) {
-      const reflectiveReturn = thread.isAwaitingReflectiveCall &&
-        (!thread.reflectiveCallFrame || thread.reflectiveCallFrame === frame);
-      if (reflectiveReturn) {
-        const resolver = thread.reflectiveCallResolver;
-        thread.isAwaitingReflectiveCall = false;
-        thread.reflectiveCallResolver = null;
-        thread.reflectiveCallFrame = null;
-        resolver(result.value === RETURN_VOID ? null : result.value);
+      if (isReflectiveTarget(thread, frame)) {
+        completeReflectiveCall(
+          thread,
+          result.value === RETURN_VOID ? null : result.value,
+        );
       } else if (result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
         thread.callStack.peek().stack.push(result.value);
       }
@@ -3136,7 +3137,8 @@ class JitCompiler {
           const key = JSON.stringify(site.directInstanceKey);
           const fieldName = JSON.stringify(site.fieldName);
           return `{ const value = stack[--sp]; const object = stack[--sp]; ` +
-            `if (object !== null && object !== undefined && object.fields) { ` +
+            `if (object !== null && object !== undefined && object.fields && ` +
+            `Object.prototype.hasOwnProperty.call(object.fields, ${key})) { ` +
             `object.fields[${key}] = value; object[${fieldName}] = value; ` +
             `} else { helpers.putFieldAt(${fieldSiteId}, object, value); } } ${goNext}`;
         }
@@ -4326,6 +4328,9 @@ class JitCompiler {
 
   tryInvokeSync(op, frame, instruction, thread) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const initializationToken = op === "invokestatic"
+      ? this.jvm.getClassInitializationToken(declaredClassName)
+      : null;
     return this.tryInvokeSyncSite({
       op,
       declaredClassName,
@@ -4333,6 +4338,7 @@ class JitCompiler {
       descriptor,
       ...parseDescriptor(descriptor),
       targets: new Map(),
+      initializationToken,
     }, frame, thread);
   }
 

@@ -19,6 +19,10 @@ const {
   syncFallback,
   syncInvokeFallback,
 } = dispatch;
+const {
+  isReflectiveTarget,
+  completeReflectiveCall,
+} = require("../instructions/control");
 const Frame = require("./frame");
 const DebugManager = require("../debug/DebugManager");
 const JNI = require("./jni");
@@ -1175,9 +1179,11 @@ class JVM {
 
   _prepareSchedulerTick() {
     // On each tick, check for threads that need to be woken up.
+    const audioPriority = this._audioPriority;
     const hasTimedThread = this.threads.some((t) =>
       (t.status === 'SLEEPING' && t.sleepUntil !== undefined) ||
-      (t.status === 'WAITING' && t.waitDeadline !== undefined));
+      (t.status === 'WAITING' && t.waitDeadline !== undefined)) ||
+      Boolean(audioPriority);
     const schedulerNow = hasTimedThread ? this.clock.millis() : 0;
     for (const t of this.threads) {
       if (t.status === "SLEEPING" && schedulerNow >= t.sleepUntil) {
@@ -1232,10 +1238,9 @@ class JVM {
 
     // console.error(`Tick. Current thread: ${this.currentThreadIndex}. Statuses: ${this.threads.map(t => `${t.id}:${t.status}`).join(', ')}`);
 
-    const audioPriority = this._audioPriority;
     if (audioPriority && audioPriority.thread &&
         audioPriority.thread.status === "runnable" &&
-        Date.now() <= audioPriority.until &&
+        schedulerNow <= audioPriority.until &&
         audioPriority.output &&
         typeof audioPriority.output.queuedSeconds === "function" &&
         audioPriority.output.queuedSeconds() < 0.12) {
@@ -1345,17 +1350,12 @@ class JVM {
       const popped = callStack.pop();
       this.completeClassInitialization(popped);
       
-      if (thread.isAwaitingReflectiveCall &&
-          (!thread.reflectiveCallFrame ||
-            thread.reflectiveCallFrame === popped)) {
+      if (isReflectiveTarget(thread, popped)) {
         let ret = null;
         if (!popped.stack.isEmpty()) {
           ret = popped.stack.pop();
         }
-        await thread.reflectiveCallResolver(ret);
-        thread.isAwaitingReflectiveCall = false;
-        thread.reflectiveCallResolver = null;
-        thread.reflectiveCallFrame = null;
+        await completeReflectiveCall(thread, ret);
       }
       return { completed: false };
     }
