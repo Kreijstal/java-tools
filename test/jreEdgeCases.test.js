@@ -1,9 +1,15 @@
 'use strict';
 
 const test = require('tape');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { execFileSync } = require('child_process');
+const { JVM } = require('../src/core/jvm');
 
 const File = require('../src/jre/java/io/File');
+const FileInputStream = require('../src/jre/java/io/FileInputStream');
+const ReflectField = require('../src/jre/java/lang/reflect/Field');
 const HashMap = require('../src/jre/java/util/HashMap');
 const Hashtable = require('../src/jre/java/util/Hashtable');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
@@ -28,6 +34,31 @@ const ByteBuffer = require('../src/jre/java/nio/ByteBuffer');
 const Random = require('../src/jre/java/util/Random');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
 const { decodePng } = require('../src/io/gifDecoder');
+const {
+  getFileProvider,
+  setFileProvider,
+} = require('../src/core/classLoader');
+const {
+  completeReflectiveCall,
+} = require('../src/instructions/control');
+
+const JAVAC_AVAILABLE = (() => {
+  try {
+    execFileSync('javac', ['-version'], { stdio: 'ignore' });
+    return true;
+  } catch (_) {
+    return false;
+  }
+})();
+
+function compileHarness(directory, filename, source) {
+  const sourcePath = path.join(directory, filename);
+  fs.writeFileSync(sourcePath, source);
+  execFileSync('javac', [
+    '-source', '8', '-target', '8', '-d', directory, sourcePath,
+  ], { stdio: 'ignore' });
+  return sourcePath;
+}
 
 function jvmStub() {
   return {
@@ -50,6 +81,183 @@ test('Class.newInstance reports InstantiationException for primitive classes', a
     error = caught;
   }
   t.equal(error && error.type, 'java/lang/InstantiationException');
+  t.end();
+});
+
+test('Class reflective method lookup preserves array parameter descriptors', async (t) => {
+  const method = {
+    name: 'mix',
+    descriptor: '([II)V',
+    flags: ['public'],
+  };
+  const owner = {
+    type: 'java/lang/Class',
+    _classData: {
+      ast: {
+        classes: [{
+          className: 'AudioScheduler',
+          superClassName: null,
+          items: [{ type: 'method', method }],
+        }],
+      },
+    },
+  };
+  const intArray = {
+    type: 'java/lang/Class',
+    className: '[I',
+    _classData: {
+      isArray: true,
+      className: '[I',
+      componentType: 'I',
+    },
+  };
+  const intClass = { isPrimitive: true, name: 'int' };
+  const parameters = [intArray, intClass];
+
+  const declared = Class.methods[
+    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+  ]({}, owner, ['mix', parameters]);
+  const inherited = await Class.methods[
+    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+  ]({}, owner, ['mix', parameters]);
+
+  t.equal(declared._methodData, method,
+    'declared lookup encodes int[] as [I rather than L[I;');
+  t.equal(inherited._methodData, method,
+    'public lookup uses the same array descriptor encoding');
+  let nullParameterError = null;
+  try {
+    Class.methods[
+      'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+    ]({}, owner, ['mix', [intClass, null]]);
+  } catch (error) {
+    nullParameterError = error;
+  }
+  t.equal(nullParameterError && nullParameterError.type,
+    'java/lang/IllegalArgumentException',
+  'a null parameter type cannot silently shorten a method descriptor');
+  t.end();
+});
+
+test('reflective constructors run their body through nested calls', async (t) => {
+  if (!JAVAC_AVAILABLE) {
+    t.skip('javac is unavailable');
+    t.end();
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(),
+    'jvm-reflective-constructor-'));
+  t.teardown(() => fs.rmSync(directory, { recursive: true, force: true }));
+  compileHarness(directory, 'ReflectiveConstructorHarness.java', `
+public final class ReflectiveConstructorHarness {
+  static int result;
+  private static final class Value {
+    int value;
+    private Value(long wide, double fraction, boolean enabled, int input) {
+      super();
+      value = adjust((int) wide + (int) fraction + (enabled ? input : 0));
+    }
+    private int adjust(int input) {
+      return input * 3;
+    }
+  }
+  public static void main(String[] args) throws Exception {
+    java.lang.reflect.Constructor<Value> constructor =
+      Value.class.getDeclaredConstructor(
+        long.class, double.class, boolean.class, int.class);
+    constructor.setAccessible(true);
+    result = constructor.newInstance(
+      Long.valueOf(4L), Double.valueOf(2.0), Boolean.TRUE,
+      Integer.valueOf(7)).value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath: directory, jit: { enabled: false } });
+  await jvm.run('ReflectiveConstructorHarness');
+  t.equal(jvm.classes.ReflectiveConstructorHarness.staticFields.get('result:I'),
+    39,
+  'wide and boxed constructor arguments reach the requested nested body');
+  t.end();
+});
+
+test('generated void methods complete reflective calls with a null result', async (t) => {
+  if (!JAVAC_AVAILABLE) {
+    t.skip('javac is unavailable');
+    t.end();
+    return;
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(),
+    'jvm-reflective-generated-void-'));
+  t.teardown(() => fs.rmSync(directory, { recursive: true, force: true }));
+  compileHarness(directory, 'ReflectiveGeneratedVoidHarness.java', `
+public final class ReflectiveGeneratedVoidHarness {
+  static int result;
+  static int calls;
+  static int valueAfter;
+  static int nullResult;
+  private void fill(int[] values, int increment) {
+    calls++;
+    values[2] += increment;
+  }
+  public static void main(String[] args) throws Exception {
+    ReflectiveGeneratedVoidHarness owner =
+      new ReflectiveGeneratedVoidHarness();
+    java.lang.reflect.Method method =
+      ReflectiveGeneratedVoidHarness.class.getDeclaredMethod(
+        "fill", int[].class, int.class);
+    method.setAccessible(true);
+    int[] values = { 1, 2, 3 };
+    Object returned = method.invoke(owner, values, Integer.valueOf(7));
+    valueAfter = values[2];
+    nullResult = returned == null ? 1 : 0;
+    result = calls * 100 + nullResult * 10 + valueAfter;
+  }
+}
+`);
+  const jvm = new JVM({ classpath: directory, jit: {
+    warmupThreshold: 0,
+    preferWholeMethodJs: true,
+  } });
+  await jvm.run('ReflectiveGeneratedVoidHarness');
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('calls:I'),
+    1,
+    'the reflected target runs once',
+  );
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('nullResult:I'),
+    1,
+    'Method.invoke observes the generated void return as null',
+  );
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('valueAfter:I'),
+    10,
+    'the reflected target receives the original array and boxed integer',
+  );
+  t.equal(
+    jvm.classes.ReflectiveGeneratedVoidHarness.staticFields.get('result:I'),
+    120,
+    'the generated target returns null to Method.invoke before caller pop/branch',
+  );
+  t.end();
+});
+
+test('reflective completion clears state before invoking its resolver', (t) => {
+  const frame = {};
+  const thread = {
+    isAwaitingReflectiveCall: true,
+    reflectiveCallFrame: frame,
+    reflectiveCallResolver() {
+      throw new Error('resolver failed');
+    },
+  };
+  t.throws(() => completeReflectiveCall(thread, null), /resolver failed/);
+  t.equal(thread.isAwaitingReflectiveCall, false,
+    'a throwing resolver cannot leave reflective mode active');
+  t.equal(thread.reflectiveCallResolver, null,
+    'a throwing resolver is detached before it runs');
+  t.equal(thread.reflectiveCallFrame, null,
+    'a throwing resolver cannot capture the next returning frame');
   t.end();
 });
 
@@ -264,6 +472,51 @@ test('CRC32 treats signed Java bytes as unsigned octets', (t) => {
   t.end();
 });
 
+test('FileInputStream reads browser virtual files without a Node fs backend', async (t) => {
+  const previousProvider = getFileProvider();
+  setFileProvider({
+    async readFile(filePath) {
+      t.equal(filePath, 'track.wav', 'the Java String path is normalized');
+      return new Uint8Array([0, 127, 128, 255]);
+    },
+  });
+  t.teardown(() => setFileProvider(previousProvider));
+  const input = {};
+  await FileInputStream.methods['<init>(Ljava/lang/String;)V'](
+    null, input, [{ value: 'track.wav' }]);
+  const target = [0, 0, 0, 0];
+  const count = FileInputStream.methods['read([BII)I'](
+    null, input, [target, 0, target.length]);
+  t.equal(count, 4, 'the virtual file is readable through Java IO');
+  t.deepEqual(target, [0, 127, -128, -1],
+    'browser bytes preserve Java signed-byte semantics');
+  t.end();
+});
+
+test('reflective fields use normal JVM instance storage', (t) => {
+  const declaringClass = {
+    _classData: { ast: { classes: [{ className: 'ui' }] } },
+  };
+  const arrayField = {
+    _declaringClass: declaringClass,
+    _fieldData: { name: 'y', descriptor: '[I', accessFlags: 0 },
+  };
+  const booleanField = {
+    _declaringClass: declaringClass,
+    _fieldData: { name: 'w', descriptor: 'Z', accessFlags: 0 },
+  };
+  const values = [3, 7, 11];
+  const object = { fields: { 'ui.y': values, 'ui.w': 1 } };
+  t.equal(ReflectField.methods['get(Ljava/lang/Object;)Ljava/lang/Object;'](
+    null, arrayField, [object]), values,
+  'Field.get reads the owner-qualified instance slot');
+  ReflectField.methods['setBoolean(Ljava/lang/Object;Z)V'](
+    null, booleanField, [object, 0]);
+  t.equal(object.fields['ui.w'], 0,
+    'Field.setBoolean writes the owner-qualified instance slot');
+  t.end();
+});
+
 test('headless SourceDataLine discard sink closes cleanly', (t) => {
   const obj = {};
   const format = {
@@ -345,6 +598,27 @@ test('disabled SourceDataLine applies backpressure', (t) => {
 
   if (previous === undefined) delete process.env.JVM_DISABLE_AUDIO;
   else process.env.JVM_DISABLE_AUDIO = previous;
+  t.end();
+});
+
+test('SourceDataLine audio priority uses the scheduler clock', (t) => {
+  const output = {
+    write() {},
+    queuedSeconds() { return 0; },
+  };
+  const line = { audioOutput: output, isOpen: true };
+  const thread = { id: 7, status: 'runnable' };
+  const jvm = {
+    clock: { millis() { return 1250; } },
+    _audioPriority: null,
+  };
+  SourceDataLine.methods['write([BII)I'](
+    jvm, line, [[0, 0], 0, 2], thread,
+  );
+  t.equal(jvm._audioPriority.until, 1300,
+    'the priority deadline is derived from the scheduler clock');
+  t.equal(jvm._audioPriority.thread, thread,
+    'the producing guest thread receives temporary priority');
   t.end();
 });
 

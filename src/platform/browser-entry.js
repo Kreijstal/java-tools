@@ -239,6 +239,12 @@ class BrowserJVMDebug {
       console.error('Failed to run class:', error);
       const wrapped = new Error(`Run failed: ${thrownValueMessage(error)}`);
       wrapped.cause = error;
+      if (error && typeof error.stack === 'string') {
+        wrapped.causeStack = error.stack;
+      }
+      if (error && error.jvmGuestLocation) {
+        wrapped.jvmGuestLocation = error.jvmGuestLocation;
+      }
       if (error && typeof error.type === 'string') {
         wrapped.jvmExceptionType = error.type;
         wrapped.jvmExceptionMessage = thrownValueMessage(error);

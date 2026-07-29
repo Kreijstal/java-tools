@@ -18,12 +18,12 @@ function verifyBuildPrerequisites(distDir) {
     }
     console.log('  ✓ Browser bundle found');
     
-    const dataPath = path.join(distDir, 'data.zip');
-    if (!fs.existsSync(dataPath)) {
-        console.error('❌ Data package not found! Run npm run generate first');
+    const manifestPath = path.join(distDir, 'data', 'manifest.json');
+    if (!fs.existsSync(manifestPath)) {
+        console.error('❌ Sample data manifest not found! Run npm run generate first');
         process.exit(1);
     }
-    console.log('  ✓ Data package found');
+    console.log('  ✓ Sample data manifest found');
     
     return true;
 }

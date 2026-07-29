@@ -83,7 +83,11 @@ const server = http.createServer((req, res) => {
   }
 
   let filePath;
-  if (normalizedPath.startsWith('/examples/')) {
+  if (normalizedPath.startsWith('/examples/data/')) {
+    // The raw example pages fetch ./data/* (sample manifest + sources)
+    // relative to /examples/; the data only exists in dist, so alias it.
+    filePath = path.join(PUBLIC_DIR, 'dist', 'data', normalizedPath.slice('/examples/data/'.length));
+  } else if (normalizedPath.startsWith('/examples/')) {
     // Serve examples from the root directory for development access
     filePath = path.join(PUBLIC_DIR, normalizedPath);
   } else if (normalizedPath.startsWith('/dist/')) {

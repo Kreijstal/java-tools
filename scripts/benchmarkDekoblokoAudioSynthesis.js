@@ -39,6 +39,16 @@ function intArray(length, values = []) {
   return array;
 }
 
+function referenceArray(type, length, values = []) {
+  const array = new Array(length).fill(null);
+  for (let index = 0; index < values.length && index < length; index += 1) {
+    array[index] = values[index];
+  }
+  array.type = `[L${type};`;
+  array.elementType = type;
+  return array;
+}
+
 function envelope() {
   return {
     type: 'sd',
@@ -92,6 +102,17 @@ function synthesizer() {
   };
 }
 
+function soundBank() {
+  return {
+    type: 'bi',
+    fields: {
+      'bi.b': referenceArray('kj', 10, [synthesizer()]),
+      'bi.c': 0,
+      'bi.a': 0,
+    },
+  };
+}
+
 function sentinelFrame() {
   return new Frame({
     name: 'benchmarkCaller',
@@ -108,7 +129,7 @@ function sentinelFrame() {
   });
 }
 
-async function createRuntime(tier) {
+async function createRuntime(tier, scalarLoops = false) {
   process.env.JVM_WASM_JIT = '1';
   process.env.JVM_WASM_STRUCTURED = '1';
   const jvm = new JVM({
@@ -117,14 +138,15 @@ async function createRuntime(tier) {
       warmupThreshold: 0,
       preferWholeMethodJs: true,
       profileMethods: false,
-      scalarLoops: false,
+      scalarLoops,
+      scalarGuestBodies: scalarLoops,
       structuredSsa: true,
       postIncrementHelpers: true,
       longArithmeticWasmFirst: tier.longArithmeticWasmFirst,
       fusedRegions: false,
     },
   });
-  for (const className of ['an', 'hj', 'kj', 'sd']) {
+  for (const className of ['an', 'bi', 'hj', 'kj', 'sd']) {
     const classData = await jvm.loadClassByName(className);
     if (!classData.staticFields) classData.staticFields = new Map();
     jvm.classInitializationState.set(className, 'INITIALIZED');
@@ -137,6 +159,7 @@ async function createRuntime(tier) {
     statics.set(`${field}:[I`, intArray(5));
   }
   const method = await jvm.findMethodInHierarchy('kj', 'a', '(II)[I');
+  const mixerMethod = await jvm.findMethodInHierarchy('bi', 'a', '()[B');
   const envelopeMethod = await jvm.findMethodInHierarchy('sd', 'a', '(I)I');
   const thread = {
     id: 1,
@@ -147,16 +170,20 @@ async function createRuntime(tier) {
   };
   jvm.threads = [thread];
   jvm.currentThreadIndex = 0;
-  return { jvm, method, envelopeMethod, thread, receiver: synthesizer() };
+  return {
+    jvm, method, mixerMethod, envelopeMethod, thread,
+    receiver: synthesizer(), mixerReceiver: soundBank(),
+  };
 }
 
-async function invoke(runtime) {
+async function invokeMethod(runtime, method, receiver, args) {
   const caller = sentinelFrame();
-  const frame = new Frame(runtime.method);
-  frame.className = 'kj';
-  frame.locals[0] = runtime.receiver;
-  frame.locals[1] = samples;
-  frame.locals[2] = 1000;
+  const frame = new Frame(method);
+  frame.className = receiver.type;
+  frame.locals[0] = receiver;
+  args.forEach((value, index) => {
+    frame.locals[index + 1] = value;
+  });
   runtime.thread.status = 'runnable';
   runtime.thread.callStack.push(caller);
   runtime.thread.callStack.push(frame);
@@ -167,11 +194,29 @@ async function invoke(runtime) {
   }
   const output = caller.stack.pop();
   runtime.thread.callStack.pop();
+  return { output, ticks };
+}
+
+async function invoke(runtime) {
+  const { output, ticks } = await invokeMethod(
+    runtime, runtime.method, runtime.receiver, [samples, 1000],
+  );
   let checksum = 0;
   for (let index = 0; index < samples; index += 97) {
     checksum = Math.imul(checksum ^ output[index], 16777619) | 0;
   }
   return { checksum, ticks };
+}
+
+async function invokeMixer(runtime) {
+  const { output, ticks } = await invokeMethod(
+    runtime, runtime.mixerMethod, runtime.mixerReceiver, [],
+  );
+  let checksum = 0;
+  for (let index = 0; index < output.length; index += 97) {
+    checksum = Math.imul(checksum ^ (output[index] & 0xff), 16777619) | 0;
+  }
+  return { checksum, ticks, bytes: output.length };
 }
 
 function median(values) {
@@ -215,7 +260,42 @@ async function main() {
     throw new Error(`audio differential failed: ${results.map((result) =>
       `${result.tier}=${result.checksum}`).join(', ')}`);
   }
-  process.stdout.write(`${JSON.stringify({ jar, samples, rounds, warmups, results }, null, 2)}\n`);
+  const mixerResults = [];
+  for (const scalarLoops of [false, true]) {
+    const runtime = await createRuntime(tiers[1], scalarLoops);
+    for (let index = 0; index < warmups; index += 1) await invokeMixer(runtime);
+    const elapsed = [];
+    const ticks = [];
+    let checksum = 0;
+    let bytes = 0;
+    for (let index = 0; index < rounds; index += 1) {
+      const started = process.hrtime.bigint();
+      const result = await invokeMixer(runtime);
+      elapsed.push(Number(process.hrtime.bigint() - started) / 1e6);
+      ticks.push(result.ticks);
+      checksum = result.checksum;
+      bytes = result.bytes;
+    }
+    const body = runtime.jvm.jit.codegenCache.get(runtime.mixerMethod);
+    mixerResults.push({
+      configuration: scalarLoops ? 'scalar-loops-enabled' : 'scalar-loops-disabled',
+      medianMs: median(elapsed),
+      bytesPerSecond: bytes * 1000 / median(elapsed),
+      bytes,
+      checksum,
+      schedulerTicks: ticks,
+      entryTier: body?.jvmStructuredSsa ? 'structured'
+        : body?.jvmScalarLoop ? 'scalar' : body?.jvmSynchronous ? 'generated' : 'interpreted',
+      resumeTier: body?.jvmScalarResumeBody ? 'scalar' : 'baseline',
+    });
+  }
+  if (mixerResults[0].checksum !== mixerResults[1].checksum) {
+    throw new Error(`mixer differential failed: ${mixerResults.map((result) =>
+      `${result.configuration}=${result.checksum}`).join(', ')}`);
+  }
+  process.stdout.write(`${JSON.stringify({
+    jar, samples, rounds, warmups, results, mixerResults,
+  }, null, 2)}\n`);
 }
 
 main().catch((error) => {

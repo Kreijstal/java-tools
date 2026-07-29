@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
-[![Node.js](https://img.shields.io/badge/node.js-18.x%20%7C%2020.x-green.svg)](https://nodejs.org/)
+[![Node.js](https://img.shields.io/badge/node.js-20.x-green.svg)](https://nodejs.org/)
 [![Java](https://img.shields.io/badge/java-11%20%7C%2017-orange.svg)](https://adoptopenjdk.net/)
 
 A comprehensive toolkit for Java bytecode analysis, manipulation, and execution. This project provides advanced tools for working with Java `.class` files, including a custom JVM implementation, web-based debugging interface, and extensive bytecode analysis capabilities.
@@ -181,10 +181,22 @@ slots, and renders the CFG through lexical `while`, `if`, labeled `break`, and
 arithmetic, synchronous static calls, and rethrow-only handlers are supported;
 throwing operations and bounded loop safe points reconstruct the exact JVM PC,
 locals, and operand order. Selection uses descriptors and verified bytecode/CFG
-properties, never class or method names. Enable it with
-`jit: { structuredSsa: true }`, `JVM_ENABLE_STRUCTURED_SSA=1`, or the Firefox
-probe switch `PROBE_STRUCTURED_SSA=1`. It remains off by default pending broader
-coverage and the 20 changed-images/s acceptance target.
+properties, never class or method names. The verified primitive-array-loop
+subset is enabled by default; `jit: { structuredSsa: false }` or
+`JVM_DISABLE_STRUCTURED_SSA=1` restores baseline generated code for a
+differential. `jit: { structuredSsa: true }`,
+`JVM_ENABLE_STRUCTURED_SSA=1`, or the Firefox probe switch
+`PROBE_STRUCTURED_SSA=1` enables the broader acyclic-region experiment.
+
+Large methods with verified bounded primitive-array loops can also enter those
+loops as embedded scalar regions before the surrounding method becomes hot.
+The detector uses descriptors, verifier stack depths, CFG edges, opcodes,
+constants, and local-value relationships; it does not use guest class or method
+names. Interpreter loop-header OSR and generated callers share the same region,
+while debugger/tracing state and failed array guards stay on the canonical
+path before any optimized side effect. This is enabled by default. Use
+`jit: { inlineLoopRegions: false }` or
+`JVM_DISABLE_INLINE_LOOP_REGIONS=1` for a differential.
 
 To compose the three renderer experiments without independent switches, use
 `jit: { rendererPipeline: true }`, `JVM_ENABLE_RENDERER_PIPELINE=1`, or

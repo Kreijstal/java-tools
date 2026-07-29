@@ -2,7 +2,7 @@ const { test, expect } = require('@playwright/test');
 
 test('Real debug controller integration - stepInstruction works', async ({ page }) => {
   // Navigate to the examples debug interface (now with real debug controller)
-  await page.goto('/examples/debug-web-interface.html', { timeout: 10000 });
+  await page.goto('/dist/classic.html', { timeout: 10000 });
   await page.waitForLoadState('networkidle', { timeout: 10000 });
 
   console.log('=== Testing Real JVM Debug Controller Integration ===');
@@ -16,13 +16,13 @@ test('Real debug controller integration - stepInstruction works', async ({ page 
   console.log('✅ Real JVM Debug Controller initialized');
 
   // Load HelloWorld sample class
-  await page.selectOption('#sampleClassSelect', 'HelloWorld');
+  await page.selectOption('#sampleClassSelect', 'Hello.class');
   await page.click('#loadBtn');
   
   // Wait for class to load
   await page.waitForFunction(() => {
     const statusDiv = document.querySelector('#status');
-    return statusDiv && statusDiv.textContent.includes('Sample class loaded: HelloWorld');
+    return statusDiv && statusDiv.textContent.includes('Class loaded: Hello');
   }, { timeout: 5000 });
 
   console.log('✅ HelloWorld.class loaded successfully');
@@ -89,7 +89,7 @@ test('Real debug controller integration - stepInstruction works', async ({ page 
 
 test('Mock debug functions throw errors when called directly', async ({ page }) => {
   // Navigate to the examples debug interface
-  await page.goto('/examples/debug-web-interface.html', { timeout: 10000 });
+  await page.goto('/dist/classic.html', { timeout: 10000 });
   await page.waitForLoadState('networkidle', { timeout: 10000 });
 
   console.log('=== Testing Mock Functions Throw Errors ===');

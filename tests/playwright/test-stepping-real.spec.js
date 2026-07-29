@@ -2,7 +2,7 @@ const { test, expect } = require('@playwright/test');
 
 test('Test stepping functionality shows the issue', async ({ page }) => {
   // Go to the debug interface (dist version with real JVM)
-  await page.goto('/dist/index.html', { timeout: 10000 });
+  await page.goto('/dist/classic.html', { timeout: 10000 });
   await page.waitForLoadState('networkidle', { timeout: 10000 });
   await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
   await page.waitForTimeout(3000);

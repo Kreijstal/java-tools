@@ -10,11 +10,16 @@ const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
 const HandwrittenPolygonRaster = require("./HandwrittenPolygonRaster");
 const HandwrittenTiledBlit = require("./HandwrittenTiledBlit");
 const HandwrittenPerspectiveSpan = require("./HandwrittenPerspectiveSpan");
+const HandwrittenAffineSpriteRaster = require("./HandwrittenAffineSpriteRaster");
 const monoArray = require("./monoArray");
 const {
   normalizeArrayLoad,
   normalizeArrayStore,
 } = require("../instructions/utils");
+const {
+  isReflectiveTarget,
+  completeReflectiveCall,
+} = require("../instructions/control");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
@@ -118,6 +123,13 @@ class JitCompiler {
     this.perspectiveSpanIntrinsicCache = new WeakMap();
     this.perspectiveSpanRunCount = 0;
     this.perspectiveSpanGuardedFallbackCount = 0;
+    this.affineSpriteRasterEnabled =
+      options.affineSpriteRaster !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_AFFINE_SPRITE_RASTER === "1");
+    this.affineSpriteRasterIntrinsicCache = new WeakMap();
+    this.affineSpriteRasterRunCount = 0;
+    this.affineSpriteRasterGuardedFallbackCount = 0;
     this.semanticBilinearSamplerRunCount = 0;
     this.semanticBilinearSamplerFallbackCount = 0;
     this.transparentIntBlitRunCount = 0;
@@ -238,6 +250,14 @@ class JitCompiler {
     this.scalarSsaArrayViewCount = 0;
     this.scalarSsaEliminatedReadCount = 0;
     this.scalarSsaThreadedEdgeCount = 0;
+    this.inlineLoopRegionRunCount = 0;
+    this.inlineLoopRegionOsrCount = 0;
+    this.inlineLoopRegions = [];
+    this.inlineLoopRegionCache = new WeakMap();
+    this.inlineLoopRegionPcCache = new WeakMap();
+    this.inlineLoopRegionsEnabled = options.inlineLoopRegions !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_INLINE_LOOP_REGIONS === "1");
     this.scalarLoopMethodRunCounts = new Map();
     this.structuredSsaMethodRunCounts = new Map();
     this.oversizedWasmFirstMethods = new WeakMap();
@@ -248,6 +268,12 @@ class JitCompiler {
       options.longArithmeticWasmFirst !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_LONG_ARITHMETIC_WASM_FIRST === "1");
+    this.arrayKernelWasmFirstMethods = new WeakMap();
+    this.arrayKernelWasmFirstMethodCount = 0;
+    this.arrayKernelWasmFirstEnabled =
+      options.arrayKernelWasmFirst === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
     this.rendererPipelineEnabled = options.rendererPipeline === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
@@ -383,9 +409,13 @@ class JitCompiler {
     let awaitingAdaptivePromotion = false;
     const canProbeGenerated = !this.runningFrames.has(frame) &&
       !frame.jitJsDisabled;
+    if (canProbeGenerated && this.tryRunInlineLoopRegionOsr(frame, thread)) {
+      return HANDLED_RESULT;
+    }
     const wasmPriorityLoop = this.wasmJit.enabled &&
       (this.isOversizedLoopMethod(frame.method) ||
-        this.isLongArithmeticLoopMethod(frame.method));
+        this.isLongArithmeticLoopMethod(frame.method) ||
+        this.isArrayKernelWasmFirstMethod(frame.method));
     const wholeMethodPreferred =
       this.prefersWholeMethodJs(frame.method) && !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
@@ -513,6 +543,45 @@ class JitCompiler {
     return selected;
   }
 
+  isArrayKernelWasmFirstMethod(method) {
+    if (!this.arrayKernelWasmFirstEnabled ||
+        !method || method.name === "<init>" || method.name === "<clinit>") {
+      return false;
+    }
+    if (this.arrayKernelWasmFirstMethods.has(method)) {
+      return this.arrayKernelWasmFirstMethods.get(method);
+    }
+    const codeItems = this.getCodeItems(method);
+    let instructionCount = 0;
+    let primitiveArrayAccessCount = 0;
+    let staticCallCount = 0;
+    let nonStaticCallCount = 0;
+    for (const item of codeItems) {
+      const op = getOp(item && item.instruction);
+      if (!op) continue;
+      instructionCount += 1;
+      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
+        primitiveArrayAccessCount += 1;
+      }
+      if (op === "invokestatic") staticCallCount += 1;
+      else if (op === "invokevirtual" || op === "invokeinterface" ||
+          op === "invokespecial") nonStaticCallCount += 1;
+    }
+    // Dense primitive-array kernels with only statically linkable helpers are
+    // a better fit for Wasm than a JavaScript generator: the loops keep
+    // unboxed indices/values and linked helper calls stay in one module.
+    // Require substantial bytecode and array density so ordinary archive/UI
+    // methods do not pay module compilation or Wasm/JS transition costs.
+    const selected = instructionCount >= 192 &&
+      primitiveArrayAccessCount >= 24 &&
+      staticCallCount <= 32 &&
+      nonStaticCallCount === 0 &&
+      this.hasBackwardBranch(method);
+    this.arrayKernelWasmFirstMethods.set(method, selected);
+    if (selected) this.arrayKernelWasmFirstMethodCount += 1;
+    return selected;
+  }
+
   prefersWholeMethodJs(method) {
     return this.preferWholeMethodJs ||
       this.adaptiveCodegenMethods.has(method);
@@ -589,8 +658,15 @@ class JitCompiler {
       }
       return HANDLED_RESULT;
     }
-    if (result && result.returned && result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(result.value);
+    if (result && result.returned) {
+      if (isReflectiveTarget(thread, frame)) {
+        completeReflectiveCall(
+          thread,
+          result.value === RETURN_VOID ? null : result.value,
+        );
+      } else if (result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
+        thread.callStack.peek().stack.push(result.value);
+      }
     }
     return HANDLED_RESULT;
   }
@@ -599,7 +675,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -658,12 +734,17 @@ class JitCompiler {
       timingSelected =
         this.methodTimingRandomState < 0x100000000 / this.methodTimingSampleRate;
     }
+    const exclusiveTimingSelected = this.exclusiveTimingsEnabled &&
+      (this.exclusiveTimingStack.length > 0 ||
+        this.matchesExclusiveTimingRoot(frame));
     const needsMethodKey = Boolean(this.methodEntryTraceKey) ||
-      timingSelected || this.exclusiveTimingsEnabled;
+      timingSelected || exclusiveTimingSelected;
     const frameMethodKey = needsMethodKey
       ? `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`
       : null;
-    if (this.methodEntryTraceKey === frameMethodKey && !this.methodEntryTrace && frame.pc === 0) {
+    if (this.methodEntryTraceKey &&
+        this.methodEntryTraceKey === frameMethodKey &&
+        !this.methodEntryTrace && frame.pc === 0) {
       try {
         this.methodEntryTrace = {
           methodKey: frameMethodKey,
@@ -688,7 +769,7 @@ class JitCompiler {
       timingKey = candidateTimingKey;
       timingStarted = this.monotonicNow();
     }
-    const exclusiveTiming = this.exclusiveTimingsEnabled
+    const exclusiveTiming = exclusiveTimingSelected
       ? this.beginExclusiveTiming(frameMethodKey,
         generated.jvmStructuredSsa ? "structured"
           : generated.jvmScalarLoop ? "scalar"
@@ -736,6 +817,23 @@ class JitCompiler {
     };
     stack.push(context);
     return context;
+  }
+
+  matchesExclusiveTimingRoot(frame) {
+    const root = this.exclusiveTimingRootKey;
+    if (!root) return true;
+    const method = frame?.method;
+    if (!method) return false;
+    const suffix = `.${method.name}${method.descriptor}`;
+    if (!root.endsWith(suffix)) return false;
+    return root === `${this.getFrameClassName(frame)}${suffix}`;
+  }
+
+  shouldBeginExclusiveTimingKey(methodKey) {
+    if (!this.exclusiveTimingsEnabled) return false;
+    return this.exclusiveTimingStack.length > 0 ||
+      !this.exclusiveTimingRootKey ||
+      methodKey === this.exclusiveTimingRootKey;
   }
 
   endExclusiveTiming(context) {
@@ -1328,7 +1426,9 @@ class JitCompiler {
       ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
         "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`
       : "";
-    const structuredSsa = this.structuredSsa.compile(method);
+    const inlineLoopRegions = this.compileInlinePrimitiveLoopRegions(method);
+    const structuredSsa = inlineLoopRegions.length
+      ? null : this.structuredSsa.compile(method);
     if (structuredSsa) {
       if (tracePattern && traceIdentity.includes(tracePattern)) {
         const source = String(structuredSsa);
@@ -1360,7 +1460,295 @@ class JitCompiler {
     const stackless = this.compileStacklessIntegerRaster(method);
     if (stackless) return this.withResumeBody(stackless, method);
 
-    return this.compileBaselineMethod(method);
+    return this.compileBaselineMethod(method, inlineLoopRegions);
+  }
+
+  compileInlinePrimitiveLoopRegions(method) {
+    if (this.inlineLoopRegionCache.has(method)) {
+      return this.inlineLoopRegionCache.get(method);
+    }
+    const none = [];
+    this.inlineLoopRegionCache.set(method, none);
+    if (method.name === "<init>" || method.name === "<clinit>" ||
+        !this.inlineLoopRegionsEnabled || !this.structuredSsa.enabled ||
+        !this.canCompileSynchronously(method)) {
+      return none;
+    }
+    const code = method.attributes.find((attribute) => attribute.type === "code");
+    const items = this.getCodeItems(method);
+    if (!code || items.length < 24) return none;
+    const exceptionTable = code.code.exceptionTable || [];
+    const hasOuterEffects = exceptionTable.length > 0 || items.some((item) => {
+      const op = getOp(item?.instruction);
+      return op?.startsWith("invoke") || op === "new" ||
+        op === "newarray" || op === "anewarray" ||
+        op === "multianewarray" || op === "monitorenter";
+    });
+    // Complete leaf kernels already receive better whole-method structured
+    // code. Region extraction is for a small scalar/array loop embedded in a
+    // larger scheduler-, exception-, allocation-, or call-bearing method.
+    if (!hasOuterEffects) return none;
+
+    const labels = buildLabelMap(items);
+    const depths = this.computeStackDepths(items, labels);
+    if (!depths) return none;
+    const localSlot = (instruction, op) => {
+      const shorthand = /_(\d)$/.exec(op);
+      return shorthand ? Number(shorthand[1])
+        : Number(instruction?.varnum ?? instruction?.arg);
+    };
+    const allowed = new Set([
+      "nop",
+      "aload", "aload_0", "aload_1", "aload_2", "aload_3",
+      "iload", "iload_0", "iload_1", "iload_2", "iload_3",
+      "istore", "istore_0", "istore_1", "istore_2", "istore_3",
+      "iconst_m1", "iconst_0", "iconst_1", "iconst_2", "iconst_3",
+      "iconst_4", "iconst_5", "bipush", "sipush",
+      "iadd", "isub", "imul", "iand", "ior", "ixor",
+      "ishl", "ishr", "iushr", "ineg", "i2b", "i2c", "i2s", "iinc",
+      "arraylength", "iaload", "baload", "caload", "saload",
+      "iastore", "bastore", "castore", "sastore",
+      "goto", "goto_w",
+      "ifeq", "ifne", "iflt", "ifle", "ifgt", "ifge",
+      "if_icmpeq", "if_icmpne", "if_icmplt", "if_icmple",
+      "if_icmpgt", "if_icmpge",
+    ]);
+    const plans = [];
+    for (let backedge = 0; backedge < items.length; backedge += 1) {
+      const branch = items[backedge]?.instruction;
+      const branchOp = getOp(branch);
+      if (branchOp !== "goto" && branchOp !== "goto_w") continue;
+      const header = labels.get(branch.arg);
+      if (!Number.isInteger(header) || header <= 0 || header >= backedge ||
+          depths[header] !== 0) continue;
+      const headerOps = items.slice(header, header + 4)
+        .map((item) => getOp(item?.instruction));
+      if (!/^iload(?:_[0-3])?$/.test(headerOps[0] || "") ||
+          !/^aload(?:_[0-3])?$/.test(headerOps[1] || "") ||
+          headerOps[2] !== "arraylength" ||
+          headerOps[3] !== "if_icmpge") continue;
+      const exit = labels.get(items[header + 3].instruction.arg);
+      if (!Number.isInteger(exit) || exit <= backedge || exit >= items.length ||
+          depths[exit] !== 0) continue;
+      const counterSlot = localSlot(items[header].instruction, headerOps[0]);
+      const boundArraySlot = localSlot(items[header + 1].instruction, headerOps[1]);
+      if (!Number.isInteger(counterSlot) || !Number.isInteger(boundArraySlot)) continue;
+
+      let valid = true;
+      let counterWrites = 0;
+      const arrayLocalSlots = new Set();
+      for (let index = header; index <= backedge && valid; index += 1) {
+        const instruction = items[index]?.instruction;
+        const op = getOp(instruction);
+        if (!allowed.has(op)) { valid = false; break; }
+        if (/^aload(?:_[0-3])?$/.test(op)) {
+          arrayLocalSlots.add(localSlot(instruction, op));
+        }
+        if (op === "iinc" &&
+            localSlot(instruction, op) === counterSlot) counterWrites += 1;
+        if (op === "goto" || op === "goto_w" || op.startsWith("if")) {
+          const target = labels.get(instruction.arg);
+          if (!Number.isInteger(target) ||
+              target !== exit && (target < header || target > backedge)) {
+            valid = false;
+          }
+        }
+      }
+      if (!valid || counterWrites !== 1) continue;
+
+      const loopOps = items.slice(header, backedge + 1)
+        .map((item) => getOp(item?.instruction));
+      const pairedPcmOps = [
+        "iload", "aload", "arraylength", "if_icmpge",
+        "aload", "iload", "iaload", "bipush", "ishr", "istore",
+        "iload", "sipush", "if_icmpge", "sipush", "istore",
+        "iload", "sipush", "if_icmple", "sipush", "istore",
+        "iload", "iconst_2", "imul", "istore",
+        "aload", "iload", "iload", "i2b", "bastore",
+        "aload", "iload", "iconst_1", "iadd", "iload", "bipush",
+        "ishr", "i2b", "bastore",
+        "iload", "bipush", "imul", "aload", "iload", "baload",
+        "iadd", "istore",
+        "iload", "bipush", "imul", "aload", "iload", "iconst_1",
+        "iadd", "baload", "iadd", "istore",
+        "iinc", "goto",
+      ];
+      const pairedShape = loopOps.length === pairedPcmOps.length &&
+        loopOps.every((op, index) => op === pairedPcmOps[index]);
+      const at = (offset) => items[header + offset].instruction;
+      const pairedConstants = pairedShape &&
+        Number(at(7).arg) === 8 &&
+        Number(at(11).arg) === -32768 &&
+        Number(at(13).arg) === -32768 &&
+        Number(at(16).arg) === 32767 &&
+        Number(at(18).arg) === 32767 &&
+        Number(at(34).arg) === 8 &&
+        Number(at(39).arg) === 31 &&
+        Number(at(47).arg) === 31 &&
+        labels.get(at(12).arg) === header + 15 &&
+        labels.get(at(17).arg) === header + 20;
+      if (pairedConstants) {
+        const inputSlot = localSlot(at(4), loopOps[4]);
+        const sampleSlot = localSlot(at(9), loopOps[9]);
+        const offsetSlot = localSlot(at(23), loopOps[23]);
+        const outputSlot = localSlot(at(24), loopOps[24]);
+        const hashSlot = localSlot(at(38), loopOps[38]);
+        const slotChecks = [
+          localSlot(at(5), loopOps[5]) === counterSlot,
+          localSlot(at(10), loopOps[10]) === sampleSlot,
+          localSlot(at(14), loopOps[14]) === sampleSlot,
+          localSlot(at(15), loopOps[15]) === sampleSlot,
+          localSlot(at(19), loopOps[19]) === sampleSlot,
+          localSlot(at(20), loopOps[20]) === counterSlot,
+          localSlot(at(25), loopOps[25]) === offsetSlot,
+          localSlot(at(26), loopOps[26]) === sampleSlot,
+          localSlot(at(29), loopOps[29]) === outputSlot,
+          localSlot(at(30), loopOps[30]) === offsetSlot,
+          localSlot(at(33), loopOps[33]) === sampleSlot,
+          localSlot(at(38), loopOps[38]) === hashSlot,
+          localSlot(at(41), loopOps[41]) === outputSlot,
+          localSlot(at(42), loopOps[42]) === offsetSlot,
+          localSlot(at(45), loopOps[45]) === hashSlot,
+          localSlot(at(46), loopOps[46]) === hashSlot,
+          localSlot(at(49), loopOps[49]) === outputSlot,
+          localSlot(at(50), loopOps[50]) === offsetSlot,
+          localSlot(at(55), loopOps[55]) === hashSlot,
+        ];
+        if (inputSlot === boundArraySlot && slotChecks.every(Boolean)) {
+          const id = this.inlineLoopRegions.length;
+          const kernel = {
+            kind: "paired-saturating-int-to-bytes",
+            inputSlot, outputSlot, counterSlot,
+            sampleSlot, offsetSlot, hashSlot,
+          };
+          this.inlineLoopRegions.push({
+            method, header, exit, counterSlot, boundArraySlot, kernel,
+          });
+          plans.push({
+            id, header, exit, counterSlot, boundArraySlot, kernel: kernel.kind,
+          });
+          break;
+        }
+      }
+
+      const syntheticItems = items.slice(0, exit + 1).map((item, index) => ({
+        ...item,
+        instruction: index < header ? "nop"
+          : index === exit ? "return" : item.instruction,
+      }));
+      syntheticItems[0] = {
+        ...syntheticItems[0],
+        instruction: { op: "goto", arg: items[header].labelDef.slice(0, -1) },
+      };
+      const syntheticMethod = {
+        ...method,
+        name: `${method.name}$inlineLoop${header}`,
+        descriptor: "()V",
+        flags: ["private", "static"],
+        accessFlags: 0x000a,
+        attributes: [{
+          ...code,
+          code: {
+            ...code.code,
+            codeItems: syntheticItems,
+            exceptionTable: [],
+            attributes: [],
+          },
+        }],
+        jvmStructuredAtomicRegionMaxIterations: 4096,
+        jvmStructuredRegionSpillOnReturn: true,
+        jvmStructuredEntryArrayLocals: [...arrayLocalSlots],
+      };
+      this.normalizedCodeItemsCache.set(syntheticMethod, syntheticItems);
+      const generated = this.structuredSsa.compile(syntheticMethod);
+      if (!generated || generated.jvmStructuredContinuation) continue;
+      const id = this.inlineLoopRegions.length;
+      this.inlineLoopRegions.push({
+        generated, method, header, exit, counterSlot, boundArraySlot,
+      });
+      plans.push({ id, header, exit, counterSlot, boundArraySlot });
+      // Do not create overlapping region entries. A later implementation may
+      // admit multiple disjoint loops after proving their live ranges.
+      break;
+    }
+    this.inlineLoopRegionCache.set(method, plans);
+    if (plans.length) {
+      this.inlineLoopRegionPcCache.set(method,
+        new Map(plans.map((plan) => [plan.header, plan])));
+    }
+    return plans;
+  }
+
+  runInlineLoopRegion(id, frame, thread) {
+    const region = this.inlineLoopRegions[id];
+    if (!region) return null;
+    this.inlineLoopRegionRunCount += 1;
+    if (region.kernel?.kind === "paired-saturating-int-to-bytes") {
+      const locals = frame.locals;
+      const input = this.arrayData(locals[region.kernel.inputSlot]);
+      const output = this.arrayData(locals[region.kernel.outputSlot]);
+      let counter = Number(locals[region.kernel.counterSlot] || 0) | 0;
+      let hash = Number(locals[region.kernel.hashSlot] || 0) | 0;
+      let sample = Number(locals[region.kernel.sampleSlot] || 0) | 0;
+      let offset = Number(locals[region.kernel.offsetSlot] || 0) | 0;
+      for (; counter < input.length; counter += 1) {
+        sample = input[counter] >> 8;
+        if (sample < -32768) sample = -32768;
+        if (sample > 32767) sample = 32767;
+        offset = counter * 2;
+        const low = (sample << 24) >> 24;
+        const high = ((sample >> 8) << 24) >> 24;
+        output[offset] = low;
+        output[offset + 1] = high;
+        hash = (Math.imul(hash, 31) + low) | 0;
+        hash = (Math.imul(hash, 31) + high) | 0;
+      }
+      locals[region.kernel.counterSlot] = counter;
+      locals[region.kernel.sampleSlot] = sample;
+      locals[region.kernel.offsetSlot] = offset;
+      locals[region.kernel.hashSlot] = hash;
+      return RETURN_VOID;
+    }
+    return region.generated(frame, thread, this, false, true);
+  }
+
+  canRunInlineLoopRegion(id, frame) {
+    const region = this.inlineLoopRegions[id];
+    if (!region) return false;
+    if (region.kernel?.kind !== "paired-saturating-int-to-bytes") return true;
+    const locals = frame.locals;
+    const inputRef = locals[region.kernel.inputSlot];
+    const outputRef = locals[region.kernel.outputSlot];
+    const input = this.arrayData(inputRef);
+    const output = this.arrayData(outputRef);
+    const counter = Number(locals[region.kernel.counterSlot] || 0) | 0;
+    return input !== null && output !== null && counter >= 0 &&
+      input.length - counter <= 4096 &&
+      output.length >= input.length * 2;
+  }
+
+  tryRunInlineLoopRegionOsr(frame, thread) {
+    if (!frame || !frame.method || !frame.instructions ||
+        frame.jitSkipOnce || this.runningFrames.has(frame) ||
+        this._envInstrumented || thread?.status !== "runnable") return false;
+    let regionsByPc = this.inlineLoopRegionPcCache.get(frame.method);
+    if (!regionsByPc) {
+      this.compileInlinePrimitiveLoopRegions(frame.method);
+      regionsByPc = this.inlineLoopRegionPcCache.get(frame.method);
+    }
+    if (!regionsByPc || frame.stack.size() !== 0) return false;
+    const region = regionsByPc.get(frame.pc);
+    if (!region || !this.canRunInlineLoopRegion(region.id, frame)) return false;
+    const debug = this.jvm.debugManager;
+    if (debug && (debug.debugMode || debug.breakpoints.size > 0 ||
+        debug.isClassJitDeopted(this.getFrameClassName(frame)))) return false;
+    const result = this.runInlineLoopRegion(region.id, frame, thread);
+    if ((result && typeof result.then === "function") ||
+        (result && result.deopt)) return false;
+    frame.stack.items.length = 0;
+    frame.pc = region.exit;
+    this.inlineLoopRegionOsrCount += 1;
+    return true;
   }
 
   // Fast tiers enter only at PC 0 (or block leaders). Without a resumable
@@ -2013,7 +2401,7 @@ class JitCompiler {
     }
   }
 
-  compileBaselineMethod(method) {
+  compileBaselineMethod(method, inlineLoopRegions = null) {
     const synchronous = this.canCompileSynchronously(method);
     const GeneratedFunction = synchronous ? Function : getAsyncFunctionConstructor();
     if (!GeneratedFunction) {
@@ -2023,6 +2411,10 @@ class JitCompiler {
 
     const code = method.attributes.find((attr) => attr.type === "code");
     const codeItems = this.getCodeItems(method);
+    const loopRegions = inlineLoopRegions ||
+      this.compileInlinePrimitiveLoopRegions(method);
+    const loopRegionsByHeader = new Map(
+      loopRegions.map((region) => [region.header, region]));
     let stackWidthsBefore = null;
     if (codeItems.some((item) => {
       const op = getOp(item && item.instruction);
@@ -2070,6 +2462,25 @@ class JitCompiler {
     try {
       codeItems.forEach((item, index) => {
         body.push(`case ${index}:`);
+        const loopRegion = loopRegionsByHeader.get(index);
+        if (loopRegion) {
+          body.push(
+            "if (!bytecodeChecks && sp === 0) {",
+            `  const regionArray = locals[${loopRegion.boundArraySlot}];`,
+            `  const regionCounter = locals[${loopRegion.counterSlot}] | 0;`,
+            "  if (regionArray !== null && regionArray !== undefined && " +
+              "regionCounter >= 0 && regionArray.length - regionCounter <= 4096 && " +
+              `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
+            `    const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
+            "    if (regionResult && regionResult.deopt) return regionResult;",
+            "    stack.length = 0;",
+            "    sp = 0;",
+            `    pc = ${loopRegion.exit};`,
+            "    continue;",
+            "  }",
+            "}",
+          );
+        }
         const instruction = item.instruction;
         if (!instruction) {
           body.push(`if (bytecodeChecks) { pc = ${index + 1}; break; }`);
@@ -2106,6 +2517,7 @@ class JitCompiler {
         null, !synchronous);
       generated.jvmSynchronous = synchronous;
       generated.jvmDirectInlineCount = directInlineCount;
+      generated.jvmInlineLoopRegionCount = loopRegions.length;
       return generated;
     } catch (err) {
       if (err && err.name === "EvalError") {
@@ -2464,13 +2876,11 @@ class JitCompiler {
   }
 
   canCompileSynchronously(method) {
-    const codeItems = this.getCodeItems(method);
-    return codeItems.every((item) => {
-      const instruction = item && item.instruction;
-      const op = getOp(instruction);
-      if (!op) return true;
-      return !(op === "ldc" || op === "ldc_w") || !isClassConstant(instruction.arg);
-    });
+    // Every potentially asynchronous operation in a generated body has a
+    // guarded synchronous probe and an exact-PC transient deopt. Class
+    // constants used to be the sole blanket exclusion even when their target
+    // was already loaded. They now follow the same guarded policy.
+    return Boolean(method);
   }
 
   instructionNeedsPrecisePc(instruction) {
@@ -2569,6 +2979,9 @@ class JitCompiler {
       case "ldc":
       case "ldc_w":
         if (isClassConstant(instruction.arg)) {
+          if (this.compileSynchronous) {
+            return `{ const value = helpers.classConstantSync(${JSON.stringify(instruction.arg[1])}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "cold synchronous class constant" }; } stack[sp++] = value; } ${goNext}`;
+          }
           return `stack[sp++] = await helpers.classConstant(${JSON.stringify(instruction.arg[1])}); ${goNext}`;
         }
         return `stack[sp++] = helpers.constantValue(${jsLiteral(instruction.arg)}); ${goNext}`;
@@ -2707,21 +3120,60 @@ class JitCompiler {
       }
       case "getfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
+        const site = this.fieldSites[fieldSiteId];
+        if (site.directInstanceKey) {
+          const key = JSON.stringify(site.directInstanceKey);
+          return `{ const object = stack[sp - 1]; stack[sp - 1] = ` +
+            `(object !== null && object !== undefined && object.fields && ` +
+            `object.fields[${key}] !== undefined) ? object.fields[${key}] : ` +
+            `helpers.getFieldAt(${fieldSiteId}, object); } ${goNext}`;
+        }
         return `stack[sp - 1] = helpers.getFieldAt(${fieldSiteId}, stack[sp - 1]); ${goNext}`;
       }
       case "putfield": {
         const fieldSiteId = this.registerFieldSite(instruction.arg);
+        const site = this.fieldSites[fieldSiteId];
+        if (site.directInstanceKey) {
+          const key = JSON.stringify(site.directInstanceKey);
+          const fieldName = JSON.stringify(site.fieldName);
+          return `{ const value = stack[--sp]; const object = stack[--sp]; ` +
+            `if (object !== null && object !== undefined && object.fields && ` +
+            `Object.prototype.hasOwnProperty.call(object.fields, ${key})) { ` +
+            `object.fields[${key}] = value; object[${fieldName}] = value; ` +
+            `} else { helpers.putFieldAt(${fieldSiteId}, object, value); } } ${goNext}`;
+        }
         return `{ const value = stack[--sp]; helpers.putFieldAt(${fieldSiteId}, stack[--sp], value); } ${goNext}`;
       }
       case "getstatic":
         if (this.compileSynchronous) {
           const fieldSiteId = this.registerFieldSite(instruction.arg);
+          const direct = this.registerDirectStaticTarget(fieldSiteId);
+          if (direct) {
+            const target = `helpers.directStaticTargets[${direct.targetId}]`;
+            const read = direct.kind === "map"
+              ? `${target}.fields.get(${JSON.stringify(direct.key)})`
+              : `${target}.fields[${JSON.stringify(direct.key)}]`;
+            return `{ const target = ${target}; if (!target.initializationToken.initialized) { ` +
+              `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+              `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
+              `reason: "class initialization at direct synchronous getstatic" }; } ` +
+              `stack[sp++] = ${read}; } ${goNext}`;
+          }
           return `{ const value = helpers.getStaticSyncAt(${fieldSiteId}); if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous getstatic" }; } stack[sp++] = value; } ${goNext}`;
         }
         return `{ let value = helpers.getStatic(${JSON.stringify(instruction.arg)}, thread); if (value && typeof value.then === "function") value = await value; if (value === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated getstatic" }; } stack[sp++] = value; } ${goNext}`;
       case "putstatic":
         if (this.compileSynchronous) {
           const fieldSiteId = this.registerFieldSite(instruction.arg);
+          const direct = this.registerDirectStaticTarget(fieldSiteId, true);
+          if (direct?.kind === "map") {
+            const target = `helpers.directStaticTargets[${direct.targetId}]`;
+            return `{ const target = ${target}; if (!target.initializationToken.initialized) { ` +
+              `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+              `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
+              `reason: "class initialization at direct synchronous putstatic" }; } ` +
+              `target.fields.set(${JSON.stringify(direct.key)}, stack[--sp]); } ${goNext}`;
+          }
           return `{ const changed = helpers.putStaticSyncAt(${fieldSiteId}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
         }
         return `{ let changed = helpers.putStatic(${JSON.stringify(instruction.arg)}, stack[sp - 1], thread); if (changed && typeof changed.then === "function") changed = await changed; if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, transient: true, reason: "class initialization at generated putstatic" }; } sp -= 1; } ${goNext}`;
@@ -3157,6 +3609,10 @@ class JitCompiler {
     return this.jvm.getClassObject(className);
   }
 
+  classConstantSync(className) {
+    return this.jvm.getClassObjectSync(className) || STATIC_DEOPT;
+  }
+
   // Shared with the interpreter and the wasm allocation imports (heap-backed
   // views with the linear heap on, long arrays default to 0n, negative sizes
   // throw the guest NegativeArraySizeException).
@@ -3405,6 +3861,7 @@ class JitCompiler {
       className,
       fieldName,
       descriptor,
+      initializationToken: this.jvm.getClassInitializationToken(className),
       directKey: `${className}.${fieldName}`,
       directInstanceKey,
       instanceKeys: new Map(),
@@ -3535,6 +3992,7 @@ class JitCompiler {
     }
     if (!target || (forWrite && target.kind !== "map")) return null;
     site.staticTarget = target;
+    target.initializationToken = site.initializationToken;
     const targetId = this.directStaticTargets.length;
     this.directStaticTargets.push(target);
     return { targetId, kind: target.kind, key: target.key, className: site.className };
@@ -3543,7 +4001,7 @@ class JitCompiler {
   getStaticSyncAt(id) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated static field site ${id}`);
-    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+    if (!site.initializationToken.initialized) {
       return STATIC_DEOPT;
     }
     let target = site.staticTarget;
@@ -3562,7 +4020,7 @@ class JitCompiler {
   putStaticSyncAt(id, value) {
     const site = this.fieldSites[id];
     if (!site) throw new Error(`Unknown generated static field site ${id}`);
-    if (this.jvm.classInitializationState.get(site.className) !== "INITIALIZED") {
+    if (!site.initializationToken.initialized) {
       return STATIC_DEOPT;
     }
     let target = site.staticTarget;
@@ -3753,6 +4211,8 @@ class JitCompiler {
       declaredClassName,
       methodName,
       descriptor,
+      initializationToken:
+        this.jvm.getClassInitializationToken(declaredClassName),
       ...parseDescriptor(descriptor),
       targets: new Map(),
     };
@@ -3794,7 +4254,7 @@ class JitCompiler {
     }
     const fast = site.fastIntrinsic;
     if (fast) {
-      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED" ||
+      if (!site.initializationToken.initialized ||
           this.jvm.debugManager.isClassJitDeopted(fast.lookupClass)) {
         return ASYNC_INVOKE;
       }
@@ -3813,7 +4273,7 @@ class JitCompiler {
     }
     const target = site.fastStaticTarget;
     if (target) {
-      if (this.jvm.classInitializationState.get(site.declaredClassName) !== "INITIALIZED") {
+      if (!site.initializationToken.initialized) {
         return ASYNC_INVOKE;
       }
       return this.tryInvokeResolvedTarget(site, target, frame, thread);
@@ -3867,6 +4327,9 @@ class JitCompiler {
 
   tryInvokeSync(op, frame, instruction, thread) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    const initializationToken = op === "invokestatic"
+      ? this.jvm.getClassInitializationToken(declaredClassName)
+      : null;
     return this.tryInvokeSyncSite({
       op,
       declaredClassName,
@@ -3874,6 +4337,7 @@ class JitCompiler {
       descriptor,
       ...parseDescriptor(descriptor),
       targets: new Map(),
+      initializationToken,
     }, frame, thread);
   }
 
@@ -3928,6 +4392,11 @@ class JitCompiler {
       target.positionalInvoker =
         generated.jvmRestoringDirectPositionalBody.bind(null, this, plan);
       target.positionalInvoker.jvmDebugGuarded = true;
+      // The restoring scalar ABI reconstructs an omitted child Frame at the
+      // precise throwing operation. Its caller must therefore retain the
+      // invoke pc and operands until the ordinary exception dispatcher has
+      // processed that reconstructed frame.
+      target.positionalInvoker.jvmRestoresExceptionFrames = true;
       return target.positionalInvoker;
     }
     const argumentsList = Array.from(
@@ -3944,7 +4413,7 @@ class JitCompiler {
       local += site.params[index] === "long" || site.params[index] === "double" ? 2 : 1;
     }
     const staticGuard = site.op === "invokestatic"
-      ? `if (jit.jvm.classInitializationState.get(plan.staticOwner) !== "INITIALIZED") return plan.asyncInvoke;`
+      ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
     const tracePattern = typeof process !== "undefined" && process.env
       ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
@@ -3998,9 +4467,13 @@ class JitCompiler {
       "let result;",
       "let baseDepth = -1;",
       "let positionalTimingStarted = -1;",
+      "let positionalExclusiveTiming = null;",
       "if (useFrameless) {",
       "  baseDepth = thread.callStack.items.length;",
       "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
+      "  if (jit.shouldBeginExclusiveTimingKey(plan.methodKey)) {",
+      "    positionalExclusiveTiming = jit.beginExclusiveTiming(plan.methodKey, plan.exclusiveTier);",
+      "  }",
       "  if (jit.profileTimings) {",
       "    jit.methodTimingRandomState = (Math.imul(jit.methodTimingRandomState, 1664525) + 1013904223) >>> 0;",
       "    if (jit.methodTimingRandomState < 0x100000000 / jit.methodTimingSampleRate) {",
@@ -4010,6 +4483,7 @@ class JitCompiler {
       "  try {",
       "    result = plan.framelessBody(child, thread, jit, false, true);",
       "  } catch (error) {",
+      "    jit.endExclusiveTiming(positionalExclusiveTiming);",
       "    if (positionalTimingStarted >= 0) {",
       "      jit.recordMethodTiming(plan.methodKey, jit.monotonicNow() - positionalTimingStarted, plan.generated);",
       "    }",
@@ -4023,6 +4497,7 @@ class JitCompiler {
       "  if (positionalTimingStarted >= 0) {",
       "    jit.recordMethodTiming(plan.methodKey, jit.monotonicNow() - positionalTimingStarted, plan.generated);",
       "  }",
+      "  jit.endExclusiveTiming(positionalExclusiveTiming);",
       "} else {",
       "  thread.callStack.push(child);",
       "  result = jit.runGeneratedFrame(plan.generated, child, thread, false);",
@@ -4065,9 +4540,12 @@ class JitCompiler {
         jit: this,
         target,
         Frame,
+        staticInitialization: site.initializationToken,
         method,
         methodKey,
         generated,
+        exclusiveTier: generated.jvmStructuredSsa ? "structured"
+          : generated.jvmScalarLoop ? "scalar" : "generated-sync",
         framelessMode,
         framelessBody,
         referenceFrameless,
@@ -4116,7 +4594,7 @@ class JitCompiler {
       : `plan.method(plan.jvm, ${receiver}, [${
         callArguments.join(", ")}], thread)`;
     const staticGuard = site.op === "invokestatic"
-      ? `if (plan.jvm.classInitializationState.get(plan.staticOwner) !== "INITIALIZED") return plan.asyncInvoke;`
+      ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
     const source = [
       "'use strict';",
@@ -4141,6 +4619,7 @@ class JitCompiler {
         method: target.method,
         direct,
         staticOwner: site.declaredClassName,
+        staticInitialization: site.initializationToken,
         asyncMethod: ASYNC_METHOD_SENTINEL,
         asyncInvoke: ASYNC_INVOKE,
         returnVoid: RETURN_VOID,
@@ -4156,7 +4635,7 @@ class JitCompiler {
   tryInvokeSyncSite(site, frame, thread) {
     const { op, declaredClassName, methodName, descriptor, params, returnType } = site;
     if (op === "invokestatic" &&
-        this.jvm.classInitializationState.get(declaredClassName) !== "INITIALIZED") {
+        !site.initializationToken.initialized) {
       return ASYNC_INVOKE;
     }
 
@@ -4229,11 +4708,21 @@ class JitCompiler {
       const structuralIntrinsic = op === "invokestatic"
         ? this.getSynchronousIntrinsic(method, descriptor)
         : null;
-      const pendingIntrinsicOwners = op === "invokestatic" && !structuralIntrinsic
-        ? HandwrittenPolygonRaster.candidateDependencies(this, method, descriptor)
+      const pendingIntrinsicCandidates =
+        op === "invokestatic" && !structuralIntrinsic ? [
+          ...(HandwrittenPolygonRaster.candidateDependencies(
+            this, method, descriptor) || []),
+          ...(HandwrittenAffineSpriteRaster.candidateDependencies(
+            this, method, descriptor) || []),
+        ] : null;
+      const pendingIntrinsicOwners = pendingIntrinsicCandidates?.length
+        ? [...new Set(pendingIntrinsicCandidates)]
         : null;
       if (!normallySupported && !fusedCandidate &&
-          !structuralIntrinsic && !pendingIntrinsicOwners) return ASYNC_INVOKE;
+          !structuralIntrinsic &&
+          (!pendingIntrinsicOwners || pendingIntrinsicOwners.length === 0)) {
+        return ASYNC_INVOKE;
+      }
       target = {
         method,
         lookupClass,
@@ -4584,6 +5073,17 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
+    if (HandwrittenAffineSpriteRaster.DESCRIPTOR.test(descriptor)) {
+      if (this.affineSpriteRasterIntrinsicCache.has(method)) {
+        return this.affineSpriteRasterIntrinsicCache.get(method);
+      }
+      const affineSpriteRaster = HandwrittenAffineSpriteRaster.createIntrinsic(
+        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+      if (affineSpriteRaster) {
+        this.affineSpriteRasterIntrinsicCache.set(method, affineSpriteRaster);
+        return affineSpriteRaster;
+      }
+    }
     if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
       if (this.perspectiveSpanIntrinsicCache.has(method)) {
         return this.perspectiveSpanIntrinsicCache.get(method);
@@ -6225,7 +6725,8 @@ class JitCompiler {
     } else if (intrinsic.jvmDirectKind === "polygonFlatRaster" ||
         intrinsic.jvmDirectKind === "polygonAlphaRaster" ||
         intrinsic.jvmDirectKind === "tiledIntArrayBlit" ||
-        intrinsic.jvmDirectKind === "perspectiveTexturedSpan") {
+        intrinsic.jvmDirectKind === "perspectiveTexturedSpan" ||
+        intrinsic.jvmDirectKind === "affineSpriteRaster") {
       if (typeof intrinsic.jvmPositional !== "function") return null;
       direct.positionalId = this.directSynchronousIntrinsics.length;
       this.directSynchronousIntrinsics.push(intrinsic.jvmPositional);

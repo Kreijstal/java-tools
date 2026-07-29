@@ -72,6 +72,36 @@ async function setupAceEditor() {
     console.log('  ✓ ACE editor and dependencies copied successfully');
 }
 
+// Function to copy GoldenLayout css from node_modules (js is bundled into ide-ui.js)
+async function setupGoldenLayoutAssets() {
+    const glCssDir = path.join(process.cwd(), 'node_modules', 'golden-layout', 'dist', 'css');
+    const targets = [
+        ['goldenlayout-base.css', path.join(glCssDir, 'goldenlayout-base.css')],
+        ['goldenlayout-dark-theme.css', path.join(glCssDir, 'themes', 'goldenlayout-dark-theme.css')],
+    ];
+    ensureDirectory(libDir);
+    for (const [name, source] of targets) {
+        const target = path.join(libDir, name);
+        if (!fs.existsSync(source)) {
+            throw new Error(`GoldenLayout asset missing: ${source}. Please run: npm install golden-layout`);
+        }
+        if (!fs.existsSync(target)) {
+            copyFile(source, target);
+        }
+    }
+    // The dark theme references ../img/lm_*.png icons relative to the page.
+    const glImgDir = path.join(process.cwd(), 'node_modules', 'golden-layout', 'dist', 'img');
+    const imgTargetDir = path.join(distDir, 'img');
+    ensureDirectory(imgTargetDir);
+    for (const imageName of fs.readdirSync(glImgDir)) {
+        const target = path.join(imgTargetDir, imageName);
+        if (!fs.existsSync(target)) {
+            copyFile(path.join(glImgDir, imageName), target);
+        }
+    }
+    console.log('  ✓ GoldenLayout css + icons ready');
+}
+
 // Function to copy XTerm.js from node_modules
 async function setupXtermLibrary() {
     const xtermCSS = path.join(process.cwd(), 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
@@ -119,6 +149,10 @@ async function buildSite() {
     console.log('📦 Setting up XTerm.js...');
     await setupXtermLibrary();
 
+    // Step 2.6: Setup GoldenLayout css for the IDE shell
+    console.log('📦 Setting up GoldenLayout...');
+    await setupGoldenLayoutAssets();
+
     // Step 3: Copy browser UI enhancement module to dist for inclusion
     console.log('📋 Copying browser UI enhancements...');
     const browserUISource = path.join(srcDir, 'platform', 'browser-ui-enhancements.js');
@@ -153,14 +187,31 @@ async function buildSite() {
     const webLegacyTarget = path.join(distDir, 'web-legacy.js');
     copyFile(webLegacySource, webLegacyTarget);
 
-    // Step 4: Process and enhance the debug web interface
-    console.log('📄 Processing debug interface template...');
+    // Step 3.8: Copy the IDE shell page and styles. The webpack build emits
+    // dist/ide-ui.js (see webpack.config.js).
+    console.log('🖥️  Copying IDE shell...');
+    copyFile(
+        path.join(srcDir, 'platform', 'ide.html'),
+        path.join(distDir, 'index.html')
+    );
+    copyFile(
+        path.join(srcDir, 'platform', 'ide.css'),
+        path.join(distDir, 'ide.css')
+    );
+    if (!fs.existsSync(path.join(distDir, 'ide-ui.js'))) {
+        console.log('  ⚠️  dist/ide-ui.js not found - run "npm run build:bundle" (webpack) to build the IDE bundle');
+    }
+
+    // Step 4: Process and enhance the classic debug web interface.
+    // The IDE is the primary page (index.html); the previous workbench stays
+    // available as classic.html.
+    console.log('📄 Processing classic debug interface template...');
     const debugInterfacePath = path.join(examplesDir, 'debug-web-interface.html');
-    const indexPath = path.join(distDir, 'index.html');
+    const classicPath = path.join(distDir, 'classic.html');
 
     const htmlContent = readFile(debugInterfacePath);
     const enhancedHtml = processDebugInterfaceTemplate(htmlContent);
-    writeFile(indexPath, enhancedHtml);
+    writeFile(classicPath, enhancedHtml);
 
 
     console.log('✅ Site build complete!');

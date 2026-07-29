@@ -15,6 +15,7 @@ const {
 } = require('../instructions/object');
 const {
   T, NPE, AIOOBE, MATH_INTRINSICS, Unsupported,
+  mathIntrinsicFunction,
   descToWasm, toWasmValue, parseMethodDescriptor,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
@@ -173,10 +174,8 @@ function addMathImport(reg, ins) {
   }
   const wParams = params.map(descToWasm);
   const wRet = descToWasm(ret);
-  const jsFn = Math[name];
-  const fn = ret === 'F'
-    ? (...args) => Math.fround(jsFn(...args))
-    : (...args) => jsFn(...args);
+  const fn = mathIntrinsicFunction(name, descriptor);
+  if (!fn) throw new Unsupported(`Math.${name}${descriptor} unsupported`);
   return {
     params: wParams,
     ret: wRet,

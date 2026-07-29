@@ -414,6 +414,8 @@ function attributeLines(attributes = []) {
       lines.push(`.sourcefile ${escapeJasminStringLiteral(attribute.value)}`);
     } else if (attribute.type === 'exceptions' && Array.isArray(attribute.exceptions) && attribute.exceptions.length) {
       lines.push(`.exceptions ${attribute.exceptions.join(' ')}`);
+    } else if (attribute.type === 'constantvalue' && attribute.value !== undefined) {
+      lines.push(`.constantvalue ${attribute.value}`);
     }
   }
   return lines;
@@ -427,6 +429,9 @@ function memberAttributesFromMeta(meta = {}) {
   }
   if (meta && Array.isArray(meta.annotations) && meta.annotations.length) {
     attributes.push({ type: 'RuntimeVisibleAnnotations', annotations: meta.annotations });
+  }
+  if (meta && meta.constantValue !== undefined) {
+    attributes.push({ type: 'constantvalue', value: meta.constantValue });
   }
   return attributes;
 }
@@ -921,6 +926,78 @@ function stackMapFrameLines(frame) {
   ];
 }
 
+function localVariableTable(method, instructions) {
+  const locals = method && method.meta && Array.isArray(method.meta.locals)
+    ? method.meta.locals
+    : [];
+  if (!locals.length || !instructions.length) return null;
+
+  const entries = [];
+  for (const local of locals) {
+    if (!local || typeof local.slotHint !== 'number' || !local.name || !local.descriptor) continue;
+    const uses = [];
+    instructions.forEach((instruction, index) => {
+      if (instruction.localId === local.id) uses.push(index);
+    });
+    const parameter = String(local.id || '').startsWith('param:');
+    if (!uses.length && !parameter) continue;
+
+    const startIndex = parameter ? 0 : uses[0];
+    const lastUse = uses.length ? uses[uses.length - 1] : 0;
+    const endIndex = Math.min(instructions.length - 1, Math.max(startIndex + 1, lastUse + 1));
+    if (endIndex <= startIndex) continue;
+
+    const startInstruction = instructions[startIndex];
+    const endInstruction = instructions[endIndex];
+    if (!startInstruction.label) startInstruction.label = `L${startIndex}`;
+    if (!endInstruction.label) endInstruction.label = `L${endIndex}`;
+    entries.push({
+      index: local.slotHint,
+      name: local.name,
+      descriptor: local.descriptor,
+      startLbl: startInstruction.label,
+      endLbl: endInstruction.label,
+    });
+  }
+  return entries.length ? { type: 'localvariabletable', vars: entries } : null;
+}
+
+function lineNumberTable(instructions) {
+  const entries = [];
+  let previousLine = null;
+  instructions.forEach((instruction, index) => {
+    const line = instruction.sourceLine;
+    if (typeof line !== 'number' || line === previousLine) return;
+    // Same label precedence as formatInstruction so the entry references the
+    // label under which the instruction was actually rendered.
+    const label = instruction.label
+      || (typeof instruction.offset === 'number' ? `L${instruction.offset}` : `L${index}`);
+    entries.push({ label, lineNumber: line });
+    previousLine = line;
+  });
+  return entries;
+}
+
+function lineNumberTableLines(instructions) {
+  const entries = lineNumberTable(instructions || []);
+  if (!entries.length) return [];
+  return [
+    '    .linenumbertable',
+    ...entries.map((entry) => `        ${entry.label} ${entry.lineNumber}`),
+    '    .end linenumbertable',
+  ];
+}
+
+function localVariableTableLines(attribute) {
+  if (!attribute || !Array.isArray(attribute.vars) || !attribute.vars.length) return [];
+  return [
+    '    .localvariabletable',
+    ...attribute.vars.map((variable) =>
+      `        ${variable.index} is ${jasminUtf(variable.name)} ${jasminUtf(variable.descriptor)} from ${variable.startLbl} to ${variable.endLbl}`),
+    '    .end localvariabletable',
+  ];
+}
+
 function methodLines(method) {
   const lines = [];
   const access = jasminAccess(method.access || []);
@@ -939,6 +1016,8 @@ function methodLines(method) {
       const catchType = entry.catchType || entry.catch_type || 'any';
       lines.push(`    .catch ${jasminUtf(catchType)} from ${entry.startLabel} to ${entry.endLabel} using ${entry.handlerLabel}`);
     }
+    lines.push(...lineNumberTableLines(method.instructions || []));
+    lines.push(...localVariableTableLines(localVariableTable(method, method.instructions || [])));
     lines.push('    .end code');
   }
   lines.push('.end method');
@@ -1128,7 +1207,7 @@ function directAttribute(attribute) {
 
 function canDirectAssembleClass(classIr) {
   const allowedClassAttributes = new Set(['SourceFile', 'Signature']);
-  const allowedMemberAttributes = new Set(['Signature', 'exceptions']);
+  const allowedMemberAttributes = new Set(['Signature', 'exceptions', 'constantvalue']);
   if (classAttributesFromIr(classIr).some((attribute) => !allowedClassAttributes.has(attribute.type))) return false;
   if ((classIr.fields || []).some((field) => memberAttributesFromMeta(field.meta)
     .some((attribute) => !allowedMemberAttributes.has(attribute.type)))) return false;
@@ -1166,7 +1245,9 @@ function directClassAst(classIr) {
             handlerLbl: entry.handlerLabel || entry.handlerLbl,
             catchType: entry.catchType || 'any',
           })),
-          attributes: [],
+          attributes: [
+            localVariableTable(method, compacted.instructions),
+          ].filter(Boolean),
         },
       });
     }

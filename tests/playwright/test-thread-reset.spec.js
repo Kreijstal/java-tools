@@ -3,7 +3,7 @@ const { test, expect } = require('@playwright/test');
 test.describe('Thread Reset Issue Test', () => {
   test('should reset thread array when loading a class for debugging multiple times', async ({ page }) => {
     // Navigate to the debug interface
-    await page.goto('/dist/index.html', { timeout: 10000 });
+    await page.goto('/dist/classic.html', { timeout: 10000 });
     await page.waitForLoadState('networkidle', { timeout: 10000 });
 
     console.log('=== Thread Reset Test ===');

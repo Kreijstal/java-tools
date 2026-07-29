@@ -19,6 +19,10 @@ const {
   syncFallback,
   syncInvokeFallback,
 } = dispatch;
+const {
+  isReflectiveTarget,
+  completeReflectiveCall,
+} = require("../instructions/control");
 const Frame = require("./frame");
 const DebugManager = require("../debug/DebugManager");
 const JNI = require("./jni");
@@ -30,6 +34,34 @@ const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
 const { createClock } = require('./fakeClock');
+
+class ClassInitializationStateMap extends Map {
+  constructor(jvm, entries = []) {
+    super();
+    this.jvm = jvm;
+    for (const [className, state] of entries) super.set(className, state);
+  }
+
+  set(className, state) {
+    super.set(className, state);
+    const token = this.jvm?.classInitializationTokens?.get(className);
+    if (token) {
+      token.state = state;
+      token.initialized = state === "INITIALIZED";
+    }
+    return this;
+  }
+
+  delete(className) {
+    const deleted = super.delete(className);
+    const token = this.jvm?.classInitializationTokens?.get(className);
+    if (token) {
+      token.state = undefined;
+      token.initialized = false;
+    }
+    return deleted;
+  }
+}
 
 let browserYieldChannel = null;
 const browserYieldQueue = [];
@@ -72,6 +104,29 @@ const JIT_TICK_SLOW = Object.freeze({ slow: true, skipJit: false });
 const JIT_TICK_SLOW_AFTER_PROBE = Object.freeze({ slow: true, skipJit: true });
 const PRIMITIVE_ARRAY_COMPONENTS = new Set(["Z", "B", "C", "S", "I", "J", "F", "D"]);
 
+function staticFieldInitialValue(jvm, field) {
+  const descriptor = field && field.descriptor;
+  let value = field && field.value;
+  const hasConstantValue = value !== null && value !== undefined;
+  if (hasConstantValue && value && typeof value === "object"
+      && Object.prototype.hasOwnProperty.call(value, "value")) {
+    value = value.value;
+  }
+  if (hasConstantValue) {
+    if (descriptor === "Ljava/lang/String;") return jvm.internString(value);
+    if (descriptor === "J") {
+      if (typeof value === "bigint") return value;
+      return BigInt(String(value).replace(/[lL]$/, ""));
+    }
+    if (descriptor === "F") return Math.fround(Number(value));
+    if (descriptor === "D") return Number(value);
+    if (["Z", "B", "C", "S", "I"].includes(descriptor)) return Number(value) | 0;
+  }
+  if (descriptor === "J") return BigInt(0);
+  if (["Z", "B", "C", "S", "I", "F", "D"].includes(descriptor)) return 0;
+  return null;
+}
+
 function arrayComponentType(descriptor) {
   if (typeof descriptor !== "string" || descriptor[0] !== "[") return null;
   const component = descriptor.slice(1);
@@ -95,8 +150,14 @@ class JVM {
     // Bumped on every class registration; closed-world analyses (class
     // hierarchy, devirtualization facts) memoize against it.
     this.classEpoch = 0;
-    this.classInitializationState = new Map();
+    this.classInitializationState = new ClassInitializationStateMap(this);
     this.classInitializationOwners = new Map();
+    // Generated call/field sites retain these stable token objects. Java
+    // class initialization is monotonic during ordinary execution, so a hot
+    // site can read one boolean property instead of performing a Map lookup
+    // on every invocation. State restoration refreshes the existing tokens
+    // before generated code is discarded or resumed.
+    this.classInitializationTokens = new Map();
     // Separate from classEpoch because a loaded class can become initialized
     // without registering another class. Link-time JIT decisions that depend
     // on initialized statics memoize against both epochs.
@@ -453,26 +514,7 @@ class JVM {
       const field = fieldItem.field;
       const fieldKey = `${field.name}:${field.descriptor}`;
 
-      // Set default value based on descriptor
-      let defaultValue = null;
-      if (
-        field.descriptor === "I" ||
-        field.descriptor === "B" ||
-        field.descriptor === "S"
-      ) {
-        defaultValue = 0; // int, byte, short
-      } else if (field.descriptor === "J") {
-        defaultValue = BigInt(0); // long
-      } else if (field.descriptor === "F" || field.descriptor === "D") {
-        defaultValue = 0.0; // float, double
-      } else if (field.descriptor === "Z") {
-        defaultValue = 0; // boolean (false)
-      } else if (field.descriptor === "C") {
-        defaultValue = 0; // char ('\0')
-      }
-      // Object references default to null
-
-      classData.staticFields[fieldKey] = defaultValue;
+      classData.staticFields[fieldKey] = staticFieldInitialValue(this, field);
     }
 
     // Execute static initializer (<clinit>) if it exists
@@ -1132,6 +1174,21 @@ class JVM {
     return { rate: profile.rate, rows };
   }
 
+  configureSchedulerTimings(rate = 0) {
+    const numericRate = Number(rate);
+    if (!Number.isFinite(numericRate) || numericRate <= 0) {
+      this._schedulerTimingProfile = null;
+      return null;
+    }
+    this._schedulerTimingProfile = {
+      rate: Math.max(1, Math.floor(numericRate)),
+      random: 0x9e3779b9,
+      methods: new WeakMap(),
+      samples: new Map(),
+    };
+    return this.getSchedulerTimingSnapshot();
+  }
+
   resetSchedulerTimings() {
     const profile = this._schedulerTimingProfile;
     if (profile) profile.samples.clear();
@@ -1139,9 +1196,11 @@ class JVM {
 
   _prepareSchedulerTick() {
     // On each tick, check for threads that need to be woken up.
+    const audioPriority = this._audioPriority;
     const hasTimedThread = this.threads.some((t) =>
       (t.status === 'SLEEPING' && t.sleepUntil !== undefined) ||
-      (t.status === 'WAITING' && t.waitDeadline !== undefined));
+      (t.status === 'WAITING' && t.waitDeadline !== undefined)) ||
+      Boolean(audioPriority);
     const schedulerNow = hasTimedThread ? this.clock.millis() : 0;
     for (const t of this.threads) {
       if (t.status === "SLEEPING" && schedulerNow >= t.sleepUntil) {
@@ -1195,6 +1254,18 @@ class JVM {
     }
 
     // console.error(`Tick. Current thread: ${this.currentThreadIndex}. Statuses: ${this.threads.map(t => `${t.id}:${t.status}`).join(', ')}`);
+
+    if (audioPriority && audioPriority.thread &&
+        audioPriority.thread.status === "runnable" &&
+        schedulerNow <= audioPriority.until &&
+        audioPriority.output &&
+        typeof audioPriority.output.queuedSeconds === "function" &&
+        audioPriority.output.queuedSeconds() < 0.12) {
+      const priorityIndex = this.threads.indexOf(audioPriority.thread);
+      if (priorityIndex >= 0) this.currentThreadIndex = priorityIndex;
+    } else if (audioPriority) {
+      this._audioPriority = null;
+    }
 
     let thread = this.threads[this.currentThreadIndex];
 
@@ -1296,12 +1367,12 @@ class JVM {
       const popped = callStack.pop();
       this.completeClassInitialization(popped);
       
-      if (popped.reflectiveCallResolver) {
+      if (isReflectiveTarget(thread, popped)) {
         let ret = null;
         if (!popped.stack.isEmpty()) {
           ret = popped.stack.pop();
         }
-        await popped.reflectiveCallResolver(ret);
+        await completeReflectiveCall(thread, ret);
       }
       return { completed: false };
     }
@@ -1353,6 +1424,30 @@ class JVM {
       const currentFrame = callStack.isEmpty() ? null : callStack.peek();
       if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
           thread.status !== 'runnable') break;
+
+      // A whole method may still be warming while a verified bounded
+      // primitive-array loop inside it is already hot. Enter the cached scalar
+      // region at its exact header from the interpreter quantum; no method
+      // identity participates, and invalid/debuggable states retain the
+      // ordinary instruction path.
+      const inlineRegions = this.jit.inlineLoopRegionPcCache.get(
+        currentFrame.method);
+      if (inlineRegions && inlineRegions.has(currentFrame.pc)) {
+        try {
+          if (this.jit.tryRunInlineLoopRegionOsr(currentFrame, thread)) {
+            executedBytecodes++;
+            continue;
+          }
+        } catch (e) {
+          const item = currentFrame.instructions[currentFrame.pc];
+          const label = item && item.labelDef;
+          const currentPc = label
+            ? parseInt(label.substring(1, label.length - 1))
+            : -1;
+          this.handleException(e, currentPc, thread);
+          break;
+        }
+      }
 
       // Never step across a debugger breakpoint inside one quantum. The
       // outer execute loop observes it immediately after this tick.
@@ -1706,7 +1801,7 @@ class JVM {
    * @param {string} classNameWithSlashes - Class name with slashes (e.g., "java/lang/String")
    * @returns {Promise<Object>} The Class object
    */
-  async getClassObject(classNameWithSlashes) {
+  getClassObjectSync(classNameWithSlashes) {
     // Check cache first
     if (this.classObjectCache.has(classNameWithSlashes)) {
       return this.classObjectCache.get(classNameWithSlashes);
@@ -1725,8 +1820,11 @@ class JVM {
       return classObj;
     }
 
-    // Load class data for regular classes
-    let classData = await this.loadClassByName(classNameWithSlashes);
+    // Class literals do not initialize their target, but resolving a cold
+    // literal can still require asynchronous archive I/O. Generated
+    // synchronous bodies use this loaded-only path and deopt before the ldc
+    // when it returns null; the interpreter then performs normal loading.
+    let classData = this.classes[classNameWithSlashes];
     if (!classData && this.jre[classNameWithSlashes]) {
       const jreClass = this.jre[classNameWithSlashes];
       const staticFields = jreClass.staticFields instanceof Map
@@ -1763,10 +1861,7 @@ class JVM {
       this.classes[classNameWithSlashes] = classData;
       this.classEpoch += 1;
     }
-    if (!classData) {
-      throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
-    }
-
+    if (!classData) return null;
 
     const classObj = {
       type: "java/lang/Class",
@@ -1774,6 +1869,16 @@ class JVM {
     };
     this.classObjectCache.set(classNameWithSlashes, classObj);
     return classObj;
+  }
+
+  async getClassObject(classNameWithSlashes) {
+    const loaded = this.getClassObjectSync(classNameWithSlashes);
+    if (loaded) return loaded;
+    const classData = await this.loadClassByName(classNameWithSlashes);
+    if (!classData) {
+      throw { type: 'java/lang/ClassNotFoundException', message: classNameWithSlashes };
+    }
+    return this.getClassObjectSync(classNameWithSlashes);
   }
 
   async initializeClassIfNeeded(className, thread) {
@@ -1802,7 +1907,7 @@ class JVM {
       console.log(`Initializing class: ${className}`);
     }
 
-    this.classInitializationState.set(className, "INITIALIZING");
+    this._setClassInitializationState(className, "INITIALIZING");
     this.classInitializationOwners.set(className, thread.id);
 
     // For JRE classes, we should already have them preloaded in this.classes
@@ -1835,6 +1940,11 @@ class JVM {
         );
         if (wasSuperPushed) {
           this.classInitializationState.delete(className);
+          const token = this.classInitializationTokens.get(className);
+          if (token) {
+            token.state = undefined;
+            token.initialized = false;
+          }
           this.classInitializationOwners.delete(className);
           return true;
         }
@@ -1864,26 +1974,7 @@ class JVM {
             const field = fieldItem.field;
             const fieldKey = `${field.name}:${field.descriptor}`;
 
-            // Set default value based on descriptor
-            let defaultValue = null;
-            if (
-              field.descriptor === "I" ||
-              field.descriptor === "B" ||
-              field.descriptor === "S"
-            ) {
-              defaultValue = 0; // int, byte, short
-            } else if (field.descriptor === "J") {
-              defaultValue = BigInt(0); // long
-            } else if (field.descriptor === "F" || field.descriptor === "D") {
-              defaultValue = 0.0; // float, double
-            } else if (field.descriptor === "Z") {
-              defaultValue = 0; // boolean (false)
-            } else if (field.descriptor === "C") {
-              defaultValue = 0; // char ('\0')
-            }
-            // Object references default to null
-
-            classData.staticFields.set(fieldKey, defaultValue);
+            classData.staticFields.set(fieldKey, staticFieldInitialValue(this, field));
 
             if (this.verbose) {
               console.log(
@@ -1977,7 +2068,7 @@ class JVM {
     if (this.classInitializationState.get(className) !== "INITIALIZED") {
       this.classInitializationEpoch += 1;
     }
-    this.classInitializationState.set(className, "INITIALIZED");
+    this._setClassInitializationState(className, "INITIALIZED");
     this.classInitializationOwners.delete(className);
     this._wakeClassInitializationWaiters(className);
   }
@@ -1993,9 +2084,36 @@ class JVM {
     const className = frame && frame.initializingClassName;
     if (!className) return;
     delete frame.initializingClassName;
-    this.classInitializationState.set(className, "ERRONEOUS");
+    this._setClassInitializationState(className, "ERRONEOUS");
     this.classInitializationOwners.delete(className);
     this._wakeClassInitializationWaiters(className);
+  }
+
+  getClassInitializationToken(className) {
+    let token = this.classInitializationTokens.get(className);
+    if (!token) {
+      const state = this.classInitializationState.get(className);
+      token = { state, initialized: state === "INITIALIZED" };
+      this.classInitializationTokens.set(className, token);
+    }
+    return token;
+  }
+
+  _setClassInitializationState(className, state) {
+    this.classInitializationState.set(className, state);
+    const token = this.classInitializationTokens.get(className);
+    if (token) {
+      token.state = state;
+      token.initialized = state === "INITIALIZED";
+    }
+  }
+
+  _refreshClassInitializationTokens() {
+    for (const [className, token] of this.classInitializationTokens) {
+      const state = this.classInitializationState.get(className);
+      token.state = state;
+      token.initialized = state === "INITIALIZED";
+    }
   }
 
   _wakeClassInitializationWaiters(className) {
@@ -2390,6 +2508,24 @@ class JVM {
   }
 
   handleException(exception, pc, thread) {
+    // Host exceptions retain their JavaScript stack, but normal JVM unwinding
+    // removes guest frames before BrowserJVMDebug can report them. Attach the
+    // deepest guest location once, on the exceptional path only, so failures
+    // such as an accidental BigInt/Number coercion identify the generated
+    // method and bytecode PC that caused them.
+    if (exception instanceof Error && !exception.jvmGuestLocation) {
+      const failingFrame = thread.callStack.isEmpty()
+        ? null : thread.callStack.peek();
+      if (failingFrame) {
+        const failingMethod = failingFrame.method || {};
+        exception.jvmGuestLocation = {
+          className: failingFrame.className || null,
+          methodName: failingMethod.name || null,
+          descriptor: failingMethod.descriptor || null,
+          pc: Number.isInteger(pc) && pc >= 0 ? pc : failingFrame.pc,
+        };
+      }
+    }
     if (this._envDebugThrow ||
         this._envDebugThrowType && exception &&
           exception.type === this._envDebugThrowType) {
@@ -2681,7 +2817,9 @@ class JVM {
     this._restoreSaveStateThreadRefs(decoded);
     this.currentThreadIndex = Math.min(state.currentThreadIndex || 0,
       Math.max(0, this.threads.length - 1));
-    this.classInitializationState = new Map(state.classInitializationState || []);
+    this.classInitializationState = new ClassInitializationStateMap(
+      this, state.classInitializationState || []);
+    this._refreshClassInitializationTokens();
     this.classInitializationOwners = new Map();
     for (const thread of this.threads) {
       for (const frame of thread.callStack.items) {
@@ -2822,7 +2960,9 @@ class JVM {
       }),
     );
     this.currentThreadIndex = state.currentThreadIndex;
-    this.classInitializationState = new Map(state.classInitializationState);
+    this.classInitializationState = new ClassInitializationStateMap(
+      this, state.classInitializationState);
+    this._refreshClassInitializationTokens();
     this.nextHashCode = state.nextHashCode;
     if (state.debugManager) {
       this.debugManager.deserialize(state.debugManager);
@@ -3187,9 +3327,15 @@ class JVM {
       label: instructionLabel,
     };
   }
-  getSourceFileName(method) {
-    /* HARDENED: Implemented stub */
-    throw new Error("getSourceFileName is not implemented");
+  getSourceFileName(className) {
+    const classData = this.classes[className];
+    if (!classData || !classData.ast || !classData.ast.classes) return null;
+    const item = classData.ast.classes[0].items.find(
+      (entry) => entry.attribute && entry.attribute.type === "sourcefile",
+    );
+    if (!item || item.attribute.value === undefined) return null;
+    // convert_tree stores the SourceFile constant with surrounding quotes.
+    return String(item.attribute.value).replace(/^"|"$/g, "");
   }
 
   getDisassemblyView() {

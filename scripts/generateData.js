@@ -1,111 +1,159 @@
 #!/usr/bin/env node
 
 /**
- * Generate data for the JVM Debug Interface GitHub Pages site
- * This script prepares sample class files and creates metadata for the web interface
+ * Generate sample data for the JVM Debug Interface GitHub Pages site.
+ *
+ * The browser toolchain compiles Java itself, so instead of shipping
+ * pre-compiled classes in a data.zip we ship the .java sources plus a
+ * manifest. The browser fetches the manifest at boot (tiny), populates the
+ * sample picker from it, and lazily fetches + compiles a sample's source
+ * (and its cross-file dependency closure) the first time it is selected.
  */
 
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const frontend = require('../src/java-frontend');
 
-console.log('🔧 Generating data for JVM Debug Interface...');
+console.log('🔧 Generating sample data for the JVM Debug Interface...');
 
-// Ensure sources are compiled
-console.log('📁 Compiling Java sources...');
-try {
-    execSync('npm run build:java', { stdio: 'inherit' });
-} catch (error) {
-    console.error('❌ Failed to compile Java sources:', error.message);
-    process.exit(1);
-}
-
-// Ensure dist directory exists
-const distDir = path.join(process.cwd(), 'dist');
-if (!fs.existsSync(distDir)) {
-    fs.mkdirSync(distDir, { recursive: true });
-}
-
-// Create data directory in dist
+const rootDir = process.cwd();
+const sourcesDir = path.join(rootDir, 'sources');
+const distDir = path.join(rootDir, 'dist');
 const dataDir = path.join(distDir, 'data');
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-}
 
-// Copy compiled class files to data directory
-console.log('📄 Copying class files...');
-const sourcesDir = path.join(process.cwd(), 'sources');
-const classFiles = fs.readdirSync(sourcesDir).filter(file => file.endsWith('.class'));
+const sourceFiles = fs.readdirSync(sourcesDir)
+  .filter((file) => file.endsWith('.java'))
+  .sort();
 
-const classMetadata = [];
-
-classFiles.forEach(file => {
-    const srcPath = path.join(sourcesDir, file);
-    const destPath = path.join(dataDir, file);
-    
-    fs.copyFileSync(srcPath, destPath);
-    
-    // Get file stats for metadata
-    const stats = fs.statSync(srcPath);
-    const className = file.replace('.class', '');
-    
-    classMetadata.push({
-        name: className,
-        filename: file,
-        size: stats.size,
-        description: getClassDescription(className)
-    });
-    
-    console.log(`  ✓ ${file} (${stats.size} bytes)`);
-});
-
-// Generate metadata file
-const metadata = {
-    generated: new Date().toISOString(),
-    classes: classMetadata,
-    totalFiles: classFiles.length,
-    totalSize: classMetadata.reduce((sum, cls) => sum + cls.size, 0)
-};
-
-fs.writeFileSync(
-    path.join(dataDir, 'metadata.json'), 
-    JSON.stringify(metadata, null, 2)
+// Compile everything with the repository frontend (the same compiler that
+// ships in the browser bundle). Class files land next to their sources so the
+// Node test fixtures stay available; the compile result drives the manifest.
+console.log(`📁 Compiling ${sourceFiles.length} Java sources with the JS frontend...`);
+const result = frontend.compileJavaFiles(
+  sourceFiles.map((file) => path.join(sourcesDir, file)),
+  { outputDir: sourcesDir },
 );
 
-// Create a zip file containing all class files for easy download
-console.log('📦 Creating data.zip...');
-try {
-    const zipPath = path.join(distDir, 'data.zip');
-    execSync(`cd "${dataDir}" && zip -r "${zipPath}" *.class metadata.json`, { stdio: 'pipe' });
-    console.log(`  ✓ Created data.zip (${fs.statSync(zipPath).size} bytes)`);
-
-    // Also place data.zip next to the raw debug interface template so that
-    // examples/debug-web-interface.html (served at /examples/...) can fetch
-    // its "./data.zip". This file is gitignored and regenerated on every build.
-    const examplesZipPath = path.join(process.cwd(), 'examples', 'data.zip');
-    fs.copyFileSync(zipPath, examplesZipPath);
-    console.log(`  ✓ Copied data.zip to examples/ for the raw debug interface`);
-} catch (error) {
-    console.warn('⚠️  Warning: Could not create data.zip (zip command not available)');
+// Group emitted classes by the source file they came from.
+const classesBySource = new Map(sourceFiles.map((file) => [file, []]));
+const definingSource = new Map(); // internalName -> source file
+for (const classEntry of result.classes) {
+  const source = classEntry.sourceFile;
+  if (!classesBySource.has(source)) classesBySource.set(source, []);
+  classesBySource.get(source).push(classEntry);
+  definingSource.set(classEntry.internalName, source);
 }
 
-console.log(`✅ Generated data for ${classFiles.length} class files`);
-console.log(`📊 Total size: ${metadata.totalSize} bytes`);
-
-function getClassDescription(className) {
-    const descriptions = {
-        'Hello': 'Simple Hello World program demonstrating basic output',
-        'VerySimple': 'Basic arithmetic demonstration (3-2=1)',
-        'RuntimeArithmetic': 'Comprehensive arithmetic operations showcase',
-        'Calculator': 'Static method calls with parameters',
-        'StringConcatMethod': 'String concatenation using String.concat() method',
-        'SimpleStringConcat': 'Compile-time optimized string concatenation',
-        'ConstantsTest': 'Integer constant instructions (iconst_0 through iconst_5)',
-        'SmallDivisionTest': 'Integer division and remainder operations',
-        'ExceptionTest': 'Exception handling demonstration',
-        'TestMethods': 'Various method patterns for testing',
-        'InvokeVirtualTest': 'Virtual method invocation examples'
-    };
-    
-    return descriptions[className] || `${className} class file for JVM execution`;
+function referencedInternalNames(jasmin) {
+  const refs = new Set();
+  for (const match of jasmin.matchAll(/\b(?:Field|Method|InterfaceMethod)\s+(\S+)\s/g)) refs.add(match[1]);
+  for (const match of jasmin.matchAll(/\b(?:new|checkcast|instanceof|anewarray)\s+(\S+)/g)) refs.add(match[1]);
+  for (const match of jasmin.matchAll(/^\s*\.super\s+(\S+)/gm)) refs.add(match[1]);
+  for (const match of jasmin.matchAll(/^\s*\.implements\s+(\S+)/gm)) refs.add(match[1]);
+  return refs;
 }
+
+// Direct cross-file dependencies: source -> Set<source>.
+const directDeps = new Map();
+for (const [source, classes] of classesBySource) {
+  const own = new Set(classes.map((classEntry) => classEntry.internalName));
+  const deps = new Set();
+  for (const classEntry of classes) {
+    for (const ref of referencedInternalNames(classEntry.jasmin)) {
+      const provider = definingSource.get(ref);
+      if (provider && provider !== source && !own.has(ref)) deps.add(provider);
+    }
+  }
+  directDeps.set(source, deps);
+}
+
+function dependencyClosure(source) {
+  const closure = new Set();
+  const queue = [...(directDeps.get(source) || [])];
+  while (queue.length) {
+    const dep = queue.pop();
+    if (closure.has(dep)) continue;
+    closure.add(dep);
+    for (const transitive of directDeps.get(dep) || []) queue.push(transitive);
+  }
+  return [...closure].sort();
+}
+
+function superClassOf(jasmin) {
+  const match = jasmin.match(/^\s*\.super\s+(\S+)/m);
+  return match ? match[1] : null;
+}
+
+const jasminByInternalName = new Map(
+  result.classes.map((classEntry) => [classEntry.internalName, classEntry.jasmin]),
+);
+
+function launchModeOf(classEntry) {
+  // Same semantics as BrowserJVMDebug.getClassLaunchInfo, evaluated at build
+  // time: applet if the superclass chain reaches java/applet/Applet, else
+  // application if there is a public static main(String[]).
+  const visited = new Set();
+  let current = classEntry.internalName;
+  while (current && !visited.has(current)) {
+    visited.add(current);
+    const jasmin = jasminByInternalName.get(current);
+    if (!jasmin) break;
+    const superName = superClassOf(jasmin);
+    if (superName === 'java/applet/Applet') return 'applet';
+    if (!superName || superName === 'java/lang/Object') break;
+    current = superName;
+  }
+  const mainMatch = classEntry.jasmin.match(
+    /^\s*\.method\s+([\w $]*)\bmain\b\s*:\s*\(\[Ljava\/lang\/String;\)V/m,
+  );
+  if (mainMatch && /\bpublic\b/.test(mainMatch[1]) && /\bstatic\b/.test(mainMatch[1])) {
+    return 'application';
+  }
+  return null;
+}
+
+const samples = sourceFiles.map((source) => {
+  const classes = (classesBySource.get(source) || [])
+    .slice()
+    .sort((left, right) => left.internalName.localeCompare(right.internalName));
+  const runnable = classes
+    .map((classEntry) => ({ classEntry, launchMode: launchModeOf(classEntry) }))
+    .filter((entry) => entry.launchMode)
+    .map((entry) => ({
+      classPath: `${entry.classEntry.internalName}.class`,
+      launchMode: entry.launchMode,
+    }));
+  return {
+    source,
+    classes: classes.map((classEntry) => classEntry.internalName),
+    runnable,
+    dependsOn: dependencyClosure(source),
+  };
+});
+
+// Reset dist/data and write sources + manifest. Also drop the retired
+// data.zip artifacts so stale copies cannot be served or shipped.
+fs.rmSync(dataDir, { recursive: true, force: true });
+fs.rmSync(path.join(distDir, 'data.zip'), { force: true });
+fs.rmSync(path.join(rootDir, 'examples', 'data.zip'), { force: true });
+fs.mkdirSync(dataDir, { recursive: true });
+
+console.log('📄 Copying sample sources...');
+for (const source of sourceFiles) {
+  fs.copyFileSync(path.join(sourcesDir, source), path.join(dataDir, source));
+}
+
+const manifest = {
+  generated: new Date().toISOString(),
+  totalSources: samples.length,
+  totalClasses: result.classes.length,
+  samples,
+};
+fs.writeFileSync(
+  path.join(dataDir, 'manifest.json'),
+  JSON.stringify(manifest, null, 2),
+);
+
+const runnableCount = samples.reduce((sum, sample) => sum + sample.runnable.length, 0);
+console.log(`✅ Wrote ${sourceFiles.length} sources + manifest.json to dist/data`);
+console.log(`📊 ${result.classes.length} classes, ${runnableCount} runnable samples`);

@@ -2,6 +2,9 @@ const Frame = require('../../../../core/frame');
 const { parseDescriptor } = require('../../../../parsing/typeParser');
 const { ASYNC_METHOD_SENTINEL } = require('../../../../core/constants');
 const { withThrows } = require('../../../helpers');
+const {
+  assignReflectiveArguments,
+} = require('../../../../core/reflectionArguments');
 
 // Method.invoke must return boxed objects for primitive-returning methods;
 // callers checkcast to the wrapper type (e.g. (Long) m.invoke(...)).
@@ -121,19 +124,23 @@ module.exports = {
         newFrame.locals[localIndex++] = obj;
       }
       if (methodArgs) {
-        for (const arg of methodArgs) {
-          newFrame.locals[localIndex++] = arg;
-        }
+        assignReflectiveArguments(
+          newFrame.locals, methodArgs, params, localIndex,
+        );
       }
 
       const thread = jvm.threads[jvm.currentThreadIndex];
       const callingFrame = thread.callStack.peek();
 
+      thread.isAwaitingReflectiveCall = true;
+      thread.reflectiveCallFrame = newFrame;
       // Return bytecodes hand the resolver a concrete JVM value. Keep this
       // synchronous so the fast interpreter cannot resume the caller before
       // its reflected result has been materialized.
-      newFrame.reflectiveCallResolver = (ret) => {
-        callingFrame.stack.push(boxReflectiveReturn(descriptor, ret));
+      thread.reflectiveCallResolver = (ret) => {
+        if (callingFrame) {
+          callingFrame.stack.push(boxReflectiveReturn(descriptor, ret));
+        }
       };
       thread.callStack.push(newFrame);
 

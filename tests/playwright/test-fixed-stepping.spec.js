@@ -2,7 +2,7 @@ const { test, expect } = require('@playwright/test');
 
 test('Fixed stepping functionality - real JVM implementation sequential steps', async ({ page }) => {
   // Navigate to the examples debug interface
-  await page.goto('/examples/debug-web-interface.html', { timeout: 10000 });
+  await page.goto('/dist/classic.html', { timeout: 10000 });
   await page.waitForLoadState('networkidle', { timeout: 10000 });
   await page.waitForSelector('#sampleClassSelect', { timeout: 10000 });
   await page.waitForTimeout(3000);

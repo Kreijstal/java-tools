@@ -6398,6 +6398,22 @@ function lowerStructuredAssignmentMethodInvocation(expression, context, sourceNo
 }
 
 function lowerStatementToJavaIrOps(statement, context) {
+  const ops = lowerStatementToJavaIrOpsInner(statement, context);
+  // Tag each op with the source line of the statement it was lowered from.
+  // Ops lowered from nested statements were already tagged by the recursive
+  // call, so only fill in the gaps.
+  const line = statement && statement.range && statement.range.start
+    ? statement.range.start.line
+    : null;
+  if (typeof line === 'number') {
+    for (const op of ops) {
+      if (op && typeof op.sourceLine !== 'number') op.sourceLine = line;
+    }
+  }
+  return ops;
+}
+
+function lowerStatementToJavaIrOpsInner(statement, context) {
   if (!statement) return [];
   if (statement.kind === 'BlockStatement') {
     return (statement.statements || []).flatMap((child) => lowerStatementToJavaIrOps(child, context));

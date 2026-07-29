@@ -14,6 +14,41 @@ class BrowserFileProvider extends FileProvider {
       : new Map(); // Map-compatible <string, Uint8Array>
     this.loadedJars = new Set(); // Track loaded JAR files
     this.jarInfo = new Map(); // Map<string, { classFiles: string[], resourceFiles: string[], mainClass: string|null }>
+    // Directories treated as classpath roots: a lookup for `p/Foo.class` that
+    // misses at the top level retries as `<root>/p/Foo.class`. This lets the
+    // IDE run classes that were compiled next to their sources (javac
+    // semantics) instead of forcing every artifact to the workspace root.
+    this.classpathRoots = [];
+  }
+
+  /**
+   * Register a directory as a classpath root for class-name lookups.
+   * @param {string} rootPath - Workspace directory, e.g. '/src'
+   */
+  addClasspathRoot(rootPath) {
+    const normalized = this.normalizePath(rootPath).replace(/\/+$/, '');
+    if (!normalized) return;
+    if (!this.classpathRoots.includes(normalized)) {
+      this.classpathRoots.unshift(normalized);
+    }
+  }
+
+  resolveVirtualPath(filePath) {
+    const normalized = this.normalizePath(filePath);
+    const candidates = [normalized];
+    if (normalized.startsWith('./')) candidates.push(normalized.slice(2));
+    if (normalized.startsWith('/')) candidates.push(normalized.slice(1));
+    for (const candidate of candidates) {
+      if (this.virtualFS.has(candidate)) return candidate;
+    }
+    const bare = normalized.replace(/^\.?\/+/, '');
+    for (const root of this.classpathRoots) {
+      const rooted = `${root}/${bare}`;
+      if (this.virtualFS.has(rooted)) return rooted;
+      const rootedBare = rooted.replace(/^\/+/, '');
+      if (this.virtualFS.has(rootedBare)) return rootedBare;
+    }
+    return null;
   }
 
   /**
@@ -44,17 +79,7 @@ class BrowserFileProvider extends FileProvider {
    * @returns {Promise<boolean>} - True if file exists
    */
   async exists(filePath) {
-    const normalized = this.normalizePath(filePath);
-    if (this.virtualFS.has(normalized)) {
-      return true;
-    }
-    if (normalized.startsWith('./')) {
-      return this.virtualFS.has(normalized.slice(2));
-    }
-    if (normalized.startsWith('/')) {
-      return this.virtualFS.has(normalized.slice(1));
-    }
-    return false;
+    return this.resolveVirtualPath(filePath) !== null;
   }
 
   /**
@@ -63,18 +88,11 @@ class BrowserFileProvider extends FileProvider {
    * @returns {Promise<Uint8Array>} - File content as bytes
    */
   async readFile(filePath) {
-    const normalized = this.normalizePath(filePath);
-    let content = this.virtualFS.get(normalized);
-    if (content === undefined && normalized.startsWith('./')) {
-      content = this.virtualFS.get(normalized.slice(2));
-    }
-    if (content === undefined && normalized.startsWith('/')) {
-      content = this.virtualFS.get(normalized.slice(1));
-    }
-    if (content === undefined) {
+    const resolved = this.resolveVirtualPath(filePath);
+    if (resolved === null) {
       throw new Error(`File not found: ${filePath}`);
     }
-    return content;
+    return this.virtualFS.get(resolved);
   }
 
   /**

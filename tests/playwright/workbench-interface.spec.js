@@ -4,7 +4,7 @@ const path = require('path');
 
 test.describe('Java tools workbench', () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/dist/index.html');
+    await page.goto('/dist/classic.html');
     await page.waitForFunction(
       () => document.querySelectorAll('#sampleClassSelect option').length > 2,
       null,
@@ -39,14 +39,26 @@ test.describe('Java tools workbench', () => {
     expect(options).toContain('PyramidApplet.class');
     expect(options).not.toContain('Animal.class');
 
+    // The dropdown must mirror the manifest's build-time launch analysis.
+    const manifestRunnable = await page.evaluate(async () => {
+      const response = await fetch('./data/manifest.json');
+      const manifest = await response.json();
+      return manifest.samples.flatMap((sample) =>
+        sample.runnable.map((entry) => entry.classPath)).sort();
+    });
+    expect([...options].sort()).toEqual(manifestRunnable);
+
+    // Spot-check that lazily compiled classes really have the claimed
+    // launch mode (compiling all 125 samples here would be too slow).
     const invalidTargets = await page.evaluate(async (classPaths) => {
       const invalid = [];
       for (const classPath of classPaths) {
+        await window.ensureSampleClass(classPath);
         const launchInfo = await window.jvmDebug.getClassLaunchInfo(classPath);
         if (!launchInfo.launchMode) invalid.push(classPath);
       }
       return invalid;
-    }, options);
+    }, ['Hello.class', 'PyramidApplet.class', 'MainApp.class', 'VerySimple.class']);
     expect(invalidTargets).toEqual([]);
 
     await page.locator('#sampleCatalog > summary').click();
@@ -327,7 +339,13 @@ test.describe('Java tools workbench', () => {
   test('opens a JAR, browses and assembles a class, then runs it', async ({ page }) => {
     const pageErrors = [];
     page.on('pageerror', (error) => pageErrors.push(error.message));
-    const archive = fs.readFileSync(path.join(__dirname, '../../dist/data.zip'));
+    // Build the archive fixture from the compiled sources (no shipped zip).
+    const JSZip = require('jszip');
+    const zip = new JSZip();
+    for (const name of ['Hello.class', 'VerySimple.class', 'RuntimeArithmetic.class', 'Calculator.class']) {
+      zip.file(name, fs.readFileSync(path.join(__dirname, '../../sources', name)));
+    }
+    const archive = await zip.generateAsync({ type: 'nodebuffer' });
 
     await page.locator('#classFileInput').setInputFiles({
       name: 'sample-program.jar',

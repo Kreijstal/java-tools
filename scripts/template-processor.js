@@ -24,7 +24,6 @@ function processDebugInterfaceTemplate(htmlContent) {
     htmlContent = addBreakpointUI(htmlContent);
     htmlContent = updateFileInputs(htmlContent);
     htmlContent = addUIElementIds(htmlContent);
-    htmlContent = addDataZipDownloadSection(htmlContent);
 
     console.log('  ✓ Template processed successfully');
     return htmlContent;
@@ -163,37 +162,6 @@ function addUIElementIds(htmlContent) {
     htmlContent = htmlContent.replace(outputConsolePattern, '$1\n                <button onclick="clearOutput()" style="float: right; font-size: 10px; padding: 2px 6px;">Clear</button>');
     
     return htmlContent;
-}
-
-/**
- * Add data.zip download section for GitHub Pages deployment
- */
-function addDataZipDownloadSection(htmlContent) {
-    // Find the sample classes section and add download section before it
-    const sampleClassesPattern = /(<h4>📚 Sample Classes[^<]*<\/h4>)/;
-    const downloadSection = `
-        <!-- Data Package Download Section for GitHub Pages -->
-        <details class="sample-download">
-            <summary>📦 Download bundle</summary>
-            <div class="button-group" style="margin-top: 8px;">
-                <a href="./data.zip" download="java-class-samples.zip" style="
-                    display: inline-block; 
-                    background-color: #0e639c; 
-                    color: white; 
-                    padding: 6px 12px; 
-                    text-decoration: none; 
-                    border-radius: 3px; 
-                    font-family: inherit; 
-                    font-size: 12px;
-                    border: none;
-                ">Download data.zip</a>
-            </div>
-            <div class="download-note">Includes the same sample classes used in the browser list.</div>
-        </details>
-        
-        $1`;
-    
-    return htmlContent.replace(sampleClassesPattern, downloadSection);
 }
 
 /**

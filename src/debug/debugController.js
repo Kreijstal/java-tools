@@ -202,6 +202,18 @@ class DebugController {
       callStackDepth: thread.callStack.size()
     };
     
+    // Best-effort source mapping from the method's LineNumberTable/SourceFile
+    // attributes; absent tables simply leave these null.
+    let sourceLine = null;
+    let sourceFile = null;
+    try {
+      const mapping = this.jvm.getSourceLineMapping(currentPc, frame.method);
+      if (mapping && typeof mapping.line === 'number') sourceLine = mapping.line;
+      sourceFile = this.jvm.getSourceFileName(frame.className);
+    } catch (error) {
+      // Source info is advisory; never let it break state reporting.
+    }
+
     return {
       executionState: this.executionState,
       currentThreadId: this.jvm.currentThreadIndex,
@@ -210,6 +222,9 @@ class DebugController {
       locals: frame.locals,
       callStackDepth: thread.callStack.size(),
       method: { name: frame.method.name, descriptor: frame.method.descriptor },
+      className: frame.className,
+      sourceLine,
+      sourceFile,
       breakpoints: Array.from(this.jvm.debugManager.breakpoints)
     };
   }
