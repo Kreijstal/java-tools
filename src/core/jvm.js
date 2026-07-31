@@ -204,7 +204,8 @@ class JVM {
     const configuredYieldStrategy =
       options.eventLoopYieldStrategy ?? env.JVM_EVENT_LOOP_YIELD_STRATEGY;
     this.eventLoopYieldStrategy =
-      configuredYieldStrategy === "timer" ? "timer" : "message-channel";
+      configuredYieldStrategy === "message-channel"
+        ? "message-channel" : "timer";
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
@@ -806,7 +807,7 @@ class JVM {
     return objRef;
   }
 
-  setupAppletDebugMode(className, mainThread, appletObj) {
+  async setupAppletDebugMode(className, mainThread, appletObj) {
     // Store minimal applet info for method sequencing
     mainThread.appletInfo = {
       instance: appletObj,
@@ -815,7 +816,7 @@ class JVM {
     };
 
     // Start with constructor - this will be debugged step-by-step
-    this.setupNextAppletMethod(mainThread);
+    await this.setupNextAppletMethod(mainThread);
   }
 
   // Helper method to create a proper Graphics object connected to DOM canvas
@@ -866,7 +867,7 @@ class JVM {
     return graphicsObj;
   }
 
-  setupNextAppletMethod(mainThread) {
+  async setupNextAppletMethod(mainThread) {
     const appletInfo = mainThread.appletInfo;
     if (!appletInfo || appletInfo.nextMethods.length === 0) {
       // No more methods to set up
@@ -888,7 +889,7 @@ class JVM {
         return;
       }
     } else if (methodName === 'init') {
-      const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
+      const initMethod = await this.findMethodInHierarchy(className, 'init', '()V');
       if (initMethod) {
         const initFrame = new Frame(initMethod);
         initFrame.className = className;
@@ -897,7 +898,7 @@ class JVM {
         return;
       }
     } else if (methodName === 'start') {
-      const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
+      const startMethod = await this.findMethodInHierarchy(className, 'start', '()V');
       if (startMethod) {
         const startFrame = new Frame(startMethod);
         startFrame.className = className;
@@ -906,7 +907,11 @@ class JVM {
         return;
       }
     } else if (methodName === 'paint') {
-      const paintMethod = this.findMethod({ ast: this.classes[className].ast }, 'paint', '(Ljava/awt/Graphics;)V');
+      const paintMethod = await this.findMethodInHierarchy(
+        className,
+        'paint',
+        '(Ljava/awt/Graphics;)V',
+      );
       if (paintMethod) {
         const paintFrame = new Frame(paintMethod);
         paintFrame.className = className;
@@ -920,7 +925,7 @@ class JVM {
     }
 
     // If method not found, try next method recursively
-    this.setupNextAppletMethod(mainThread);
+    await this.setupNextAppletMethod(mainThread);
   }
 
   async executeAppletLifecycle(className, mainThread, appletObj) {
@@ -940,8 +945,10 @@ class JVM {
       await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
-    // Call init() method if it exists
-    const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
+    // Applet lifecycle methods are virtual. A concrete applet commonly keeps
+    // init() on the leaf class while inheriting start() from a reusable game
+    // shell, so resolve both through the normal class hierarchy.
+    const initMethod = await this.findMethodInHierarchy(className, 'init', '()V');
     if (initMethod) {
       mainThread.status = "runnable";
       const initFrame = new Frame(initMethod);
@@ -954,8 +961,7 @@ class JVM {
       await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
-    // Call start() method if it exists
-    const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
+    const startMethod = await this.findMethodInHierarchy(className, 'start', '()V');
     if (startMethod) {
       mainThread.status = "runnable";
       const startFrame = new Frame(startMethod);
@@ -1473,7 +1479,7 @@ class JVM {
 
           if (shouldSetupNextAppletMethod) {
             await this.executeInstruction(instruction, currentFrame, thread);
-            this.setupNextAppletMethod(thread);
+            await this.setupNextAppletMethod(thread);
             break;
           }
 

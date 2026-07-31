@@ -816,6 +816,60 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
   t.end();
 });
 
+test('AWT presentation recovers when an animation callback is starved', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = (callback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  };
+  const uploads = [];
+  const context = {
+    createImageData(width, height) {
+      return { width, height, data: new Uint8ClampedArray(width * height * 4) };
+    },
+    putImageData(image) {
+      uploads.push(Array.from(image.data));
+    },
+  };
+  const target = {
+    _width: 2,
+    _height: 1,
+    _canvasElement: { width: 2, height: 1, getContext: () => context },
+  };
+  const jvm = { eventLoopYieldMs: 16 };
+  const graphics = { _component: target };
+  const image = {
+    _producer: { width: 2, height: 1, pixels: [0x112233, 0xaabbcc] },
+  };
+  const draw = Graphics.methods[
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'
+  ];
+
+  draw(jvm, graphics, [image, 0, 0, null]);
+  draw(jvm, graphics, [image, 0, 0, null]);
+  t.equal(callbacks.length, 1,
+    'one animation callback owns the coalesced frame');
+  setTimeout(() => {
+    t.equal(uploads.length, 1,
+      'the fallback timer uploads the latest completed surface');
+    t.equal(jvm._awtPresentationStats.presented, 1,
+      'the recovered upload is counted as a presentation');
+    t.equal(jvm._awtPresentationStats.presentationFallbacks, 1,
+      'diagnostics identify the starved-animation recovery');
+    t.notOk(target._presentScheduled,
+      'the fallback clears the coalescing latch');
+    // A late callback from the starved queue must not upload twice or clear a
+    // newer presentation token.
+    callbacks.shift()(0);
+    t.equal(uploads.length, 1,
+      'the late animation callback is harmless');
+    if (previousRaf === undefined) delete global.requestAnimationFrame;
+    else global.requestAnimationFrame = previousRaf;
+    t.end();
+  }, 60);
+});
+
 test('headless AWT blits expose an uncapped coalesced presentation boundary', (t) => {
   const target = { _width: 2, _height: 1 };
   const jvm = {};

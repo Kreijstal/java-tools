@@ -24,6 +24,12 @@ test('idle scheduler waits instead of spinning zero-delay tasks', (t) => {
   const timerJvm = new JVM({ eventLoopYieldStrategy: 'timer' });
   t.equal(timerJvm.eventLoopYieldStrategy, 'timer',
     'browser callers can select a paint-friendly timer yield');
+  const defaultJvm = new JVM();
+  t.equal(defaultJvm.eventLoopYieldStrategy, 'timer',
+    'paint-friendly timer yielding is the default');
+  const messageJvm = new JVM({ eventLoopYieldStrategy: 'message-channel' });
+  t.equal(messageJvm.eventLoopYieldStrategy, 'message-channel',
+    'latency-sensitive callers can explicitly select MessageChannel yielding');
   t.end();
 });
 
