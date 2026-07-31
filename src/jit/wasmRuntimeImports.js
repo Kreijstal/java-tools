@@ -51,7 +51,34 @@ function pushImportFor(reg, t) {
   }
 }
 
-function addArrayImports(reg, methodName) {
+function addTypedArrayStoreImports(reg, methodName) {
+  const checkedStore = (op, t, narrow) => {
+    reg.addImport(`aset_${op}`, [T.ref, T.i32, t], [], (a, i, v) => {
+      if (a === null || a === undefined) {
+        throw NPE(`Attempted store on null array in ${methodName}`);
+      }
+      const stored = narrow ? narrow(a, v) : v;
+      if (!monoArray.store(a, i, stored)) {
+        throw AIOOBE(i, monoArray.len(a));
+      }
+    });
+  };
+  // Wasm import signatures already coerce i32/i64/f32/f64 values to the
+  // exact primitive width. Only the three i32-backed narrow array kinds need
+  // additional work when the JVM array uses a plain JavaScript Array.
+  checkedStore('iastore', T.i32, null);
+  checkedStore('lastore', T.i64, null);
+  checkedStore('fastore', T.f32, null);
+  checkedStore('dastore', T.f64, null);
+  checkedStore('aastore', T.ref, null);
+  checkedStore('bastore', T.i32, (a, v) =>
+    a.type === '[Z' || a.elementType === 'boolean'
+      ? v & 1 : (v << 24) >> 24);
+  checkedStore('castore', T.i32, (_a, v) => v & 0xffff);
+  checkedStore('sastore', T.i32, (_a, v) => (v << 16) >> 16);
+}
+
+function addArrayImports(reg, methodName, typedArrayStores = true) {
   const mk = (suffix, t) => {
     // monoArray keeps each backing class (plain Array vs wasm-heap TypedArray
     // views) on its own monomorphic keyed IC — one shared `a[i]` site over
@@ -68,16 +95,21 @@ function addArrayImports(reg, methodName) {
         const value = monoArray.load(a, i);
         if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
         return t === T.ref ? value : toWasmValue(t, value);
-      };
+    };
     reg.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
-    reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-      if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${methodName}`);
-      if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
-        throw AIOOBE(i, monoArray.len(a));
-      }
-    });
+    if (!typedArrayStores) {
+      reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+        if (a === null || a === undefined) {
+          throw NPE(`Attempted store on null array in ${methodName}`);
+        }
+        if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+          throw AIOOBE(i, monoArray.len(a));
+        }
+      });
+    }
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+  if (typedArrayStores) addTypedArrayStoreImports(reg, methodName);
   reg.addImport('alen', [T.ref], [T.i32], (a) => {
     if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${methodName}`);
     return monoArray.len(a);
@@ -265,6 +297,7 @@ module.exports = {
   addRuntimeImports,
   pushImportFor,
   addArrayImports,
+  addTypedArrayStoreImports,
   addFieldImport,
   addMathImport,
   addTimeImport,

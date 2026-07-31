@@ -77,6 +77,8 @@ npm install
 - [Debugger API](DEBUG_API.md)
 - [Decompiler](docs/decompiler.md)
 - [Language server protocol](docs/lsp.md)
+- [Handwritten kernel retirement](docs/handwritten-kernel-retirement.md) —
+  generic compiler targets, differential oracles, and measurements
 
 ### Basic Usage
 
@@ -202,6 +204,14 @@ differential. `jit: { structuredSsa: true }`,
 `JVM_ENABLE_STRUCTURED_SSA=1`, or the Firefox probe switch
 `PROBE_STRUCTURED_SSA=1` enables the broader acyclic-region experiment.
 
+Complete raster, blit, polygon, affine, and sampler translations are not a
+production JIT tier. Normal execution derives their arithmetic and control flow
+from bytecode through structured SSA. Historical handwritten replacements
+remain available only as differential oracles with
+`jit: { guestKernelOracles: true }` or
+`JVM_ENABLE_GUEST_KERNEL_ORACLES=1`; this switch must not be used for production
+performance results.
+
 Large methods with verified bounded primitive-array loops can also enter those
 loops as embedded scalar regions before the surrounding method becomes hot.
 The detector uses descriptors, verifier stack depths, CFG edges, opcodes,
@@ -212,14 +222,13 @@ path before any optimized side effect. This is enabled by default. Use
 `jit: { inlineLoopRegions: false }` or
 `JVM_DISABLE_INLINE_LOOP_REGIONS=1` for a differential.
 
-To compose the three renderer experiments without independent switches, use
+To compose the generic renderer tiers without independent switches, use
 `jit: { rendererPipeline: true }`, `JVM_ENABLE_RENDERER_PIPELINE=1`, or
-`PROBE_RENDERER_PIPELINE=1`. This enables broad scalar guest bodies, fused
-wrapper/raster regions, and structured SSA together; individual probe switches
-can still override a component for differential runs. The measured composed
-median was 13.0388 changed images/s with structured SSA versus 12.1244 without
-it (+7.54%), with matching accepted hashes and no browser errors; the combined
-pipeline remains opt-in because it is still below the 20 images/s target.
+`PROBE_RENDERER_PIPELINE=1`. This enables broad scalar guest bodies and
+structured SSA together. Large wrapper/raster fusion is a separate experiment
+and requires `jit: { fusedRegions: true }`, `JVM_ENABLE_FUSED_REGIONS=1`, or its
+browser probe. Older measurements that described renderer-pipeline as enabling
+fusion refer to the historical configuration.
 
 On the measured Dekobloko Firefox workload, scalarizing the large model/face
 guest body and combining it with the verified renderer region raised throughput

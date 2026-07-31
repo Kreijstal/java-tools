@@ -31,6 +31,14 @@ function completeReflectiveCall(thread, value) {
   return typeof resolver === 'function' ? resolver(value) : undefined;
 }
 
+function returnParentFor(frame, thread) {
+  const explicit = frame.jitGeneratedReturnParent;
+  delete frame.jitGeneratedReturnParent;
+  delete frame.jitGeneratedReturnType;
+  if (explicit && thread.callStack.items.includes(explicit)) return explicit;
+  return thread.callStack.isEmpty() ? null : thread.callStack.peek();
+}
+
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
     if (thread.pendingException) {
@@ -40,6 +48,20 @@ module.exports = {
     jvm.completeClassInitialization(frame);
     if (isReflectiveTarget(thread, frame)) {
       completeReflectiveCall(thread, null);
+    } else if (frame.jitGeneratedReturnParent) {
+      const expectedReturnType = frame.jitGeneratedReturnType;
+      const parent = returnParentFor(frame, thread);
+      if (parent && expectedReturnType !== 'void') {
+        console.error('[jit-generated-return-underflow]', {
+          child: `${frame.className || '<unknown>'}.` +
+            `${frame.method && frame.method.name || '<unknown>'}` +
+            `${frame.method && frame.method.descriptor || ''}`,
+          parent: `${parent.className || '<unknown>'}.` +
+            `${parent.method && parent.method.name || '<unknown>'}` +
+            `${parent.method && parent.method.descriptor || ''}`,
+          expectedReturnType,
+        });
+      }
     }
   },
   ireturn: (frame, instruction, jvm, thread) => {
@@ -50,8 +72,9 @@ module.exports = {
     thread.callStack.pop();
     if (isReflectiveTarget(thread, frame)) {
       completeReflectiveCall(thread, returnValue);
-    } else if (!thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(returnValue);
+    } else {
+      const parent = returnParentFor(frame, thread);
+      if (parent) parent.stack.push(returnValue);
     }
   },
   areturn: (frame, instruction, jvm, thread) => {
@@ -62,8 +85,9 @@ module.exports = {
     thread.callStack.pop();
     if (isReflectiveTarget(thread, frame)) {
       completeReflectiveCall(thread, returnValue);
-    } else if (!thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(returnValue);
+    } else {
+      const parent = returnParentFor(frame, thread);
+      if (parent) parent.stack.push(returnValue);
     }
   },
   goto: (frame, instruction) => {

@@ -32,6 +32,23 @@ function normalizedArrayLoadExpression(raw, op, array) {
   }
 }
 
+function normalizedArrayStoreExpression(value, op, array) {
+  switch (op) {
+    case "bastore":
+      return `(${array}.type === "[Z" || ${array}.elementType === "boolean") ? ` +
+        `((${value}) & 1) : (((${value}) << 24) >> 24)`;
+    case "castore": return `((${value}) & 0xffff)`;
+    case "sastore": return `(((${value}) << 16) >> 16)`;
+    case "iastore": return `((${value}) | 0)`;
+    case "fastore": return `Math.fround(${value})`;
+    case "lastore": return `BigInt.asIntN(64, BigInt(${value}))`;
+    case "aastore":
+    case "dastore":
+    default:
+      return value;
+  }
+}
+
 function runtimeClassNameExpression(value) {
   return `(typeof ${value} === "string" || ${value} instanceof String ` +
     `? "java/lang/String" : (${value}._className || ${value}.type))`;
@@ -209,10 +226,54 @@ class JvmSsaBlockRenderer {
       options.structuredCoarseCountedLoopSafePoints !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_STRUCTURED_COARSE_COUNTED_SAFEPOINTS === "1");
+    this.versionedRuntimeCoarseLoopsEnabled =
+      options.structuredVersionedRuntimeCoarseLoops !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_VERSIONED_COARSE_LOOPS === "1");
+    this.versionedArrayRangesEnabled =
+      options.structuredVersionedArrayRanges !== false &&
+      options.structuredVersionedArrayRangeStores !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_VERSIONED_ARRAY_RANGES === "1") &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_VERSIONED_ARRAY_STORES === "1");
+    // Retain the old runtime probe property while range versioning expands
+    // from stores to structurally proven primitive loads.
+    this.versionedArrayRangeStoresEnabled =
+      this.versionedArrayRangesEnabled;
+    this.bitBoundedArrayRangesEnabled =
+      this.versionedArrayRangesEnabled &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_BIT_BOUNDED_RANGES === "1");
+    this.directEntryStaticLinkingEnabled =
+      options.structuredDirectEntryStaticLinking !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_DIRECT_ENTRY_STATIC_LINKING === "1");
     this.atomicBoundedLoopsEnabled =
       options.structuredAtomicBoundedLoops !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_STRUCTURED_ATOMIC_BOUNDED_LOOPS === "1");
+    this.materializeOutliningEnabled =
+      options.structuredMaterializeOutlining !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_SSA_MATERIALIZE_OUTLINING === "1");
+    this.unsignedArrayBoundsEnabled =
+      options.structuredUnsignedArrayBounds !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_UNSIGNED_ARRAY_BOUNDS === "1");
+    this.inlinePrimitiveArrayStoresEnabled =
+      options.structuredInlinePrimitiveArrayStores !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_INLINE_ARRAY_STORES === "1");
+    this.runCountersEnabled =
+      options.structuredRunCounters !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_RUN_COUNTERS === "1");
+    this.restoringDirectBudgetMultiplier = Math.max(1, Math.min(100,
+      Number(options.structuredRestoringDirectBudgetMultiplier ??
+        (typeof process !== "undefined" && process.env &&
+          process.env.JVM_STRUCTURED_RESTORING_DIRECT_BUDGET_MULTIPLIER) ??
+        100) || 100));
     this.dispatchIslandMethodCount = 0;
     this.dispatchIslandCount = 0;
     this.compiledLoopCount = 0;
@@ -224,6 +285,8 @@ class JvmSsaBlockRenderer {
     this.guardedBooleanSiteCount = 0;
     this.guardedBooleanFallbackCount = 0;
     this.restoredDirectExceptionFrameCount = 0;
+    this.restoringDirectRunCount = 0;
+    this.lazyStaticTargetLinkCount = 0;
     // Generated bodies retain only an index into this table. A successful
     // proof is reusable until either class lifecycle epoch advances.
     this.classInitializationGuards = [];
@@ -240,6 +303,13 @@ class JvmSsaBlockRenderer {
     const id = this.classInitializationGuards.length;
     this.classInitializationGuards.push(guard);
     return id;
+  }
+
+  get totalRunCount() {
+    // Restoring positional entries are tracked separately so a tiny child
+    // kernel does not perform two property writes per call. Add the disjoint
+    // counters only when diagnostics are sampled or reported.
+    return this.runCount + this.restoringDirectRunCount;
   }
 
   verifyClassInitializationGuard(guard) {
@@ -293,7 +363,7 @@ class JvmSsaBlockRenderer {
     items.forEach((item, index) => {
       if (item?.labelDef) labels.set(String(item.labelDef).replace(/:$/, ""), index);
     });
-    const depths = this.jit.computeStackDepths(items, labels);
+    const depths = this.jit.computeStackDepths(items, labels, method);
     if (!depths) return reject("operand-stack verification failed");
     let structured;
     let splitBlocks = 0;
@@ -343,13 +413,41 @@ class JvmSsaBlockRenderer {
         return reject(`CFG structuring failed: ${error.message}`);
       }
     }
+    // Exception handlers are entered by the JVM dispatcher after a throwing
+    // operation has materialized the precise frame. They are deliberately not
+    // successors in the normal CFG and must not make the normal positional
+    // region look as though it allocates, invokes diagnostic builders, or
+    // contains unsupported reference operations.
+    const normalReachableItems = new Set();
+    const reachableBlocks = new Set();
+    const reachableWork = [cfg.entry];
+    while (reachableWork.length) {
+      const blockId = reachableWork.pop();
+      if (!Number.isInteger(blockId) || reachableBlocks.has(blockId) ||
+          !cfg.blocks[blockId]) continue;
+      reachableBlocks.add(blockId);
+      for (const itemIndex of cfg.blocks[blockId].insns || []) {
+        normalReachableItems.add(itemIndex);
+      }
+      for (const successor of cfg.succ[blockId] || []) {
+        if (!reachableBlocks.has(successor)) reachableWork.push(successor);
+      }
+    }
     const localCount = Number(code.code.localsSize) || 0;
     const fieldSites = new Map();
     const directStaticSites = new Map();
+    const lazyStaticSites = new Map();
     const directStaticOwners = new Set();
     const callSites = new Map();
+    const positionalCallSiteVariable = (index) => `ssaCallSite${index}`;
+    const positionalCallTargetVariable = (index) =>
+      `ssaFastPositional${index}`;
+    const positionalCallInvokeVariable = (index) =>
+      `ssaFastPositionalInvoke${index}`;
+    const positionalCallReceiverVariable = (index) =>
+      `ssaFastPositionalReceiver${index}`;
     for (let index = 0; index < items.length; index += 1) {
-      if (depths[index] === undefined) continue;
+      if (depths[index] === undefined || !normalReachableItems.has(index)) continue;
       const instruction = items[index]?.instruction;
       const op = typeof instruction === "string" ? instruction : instruction?.op;
       if (op === "getfield" || op === "putfield" || op === "getstatic" || op === "putstatic") {
@@ -364,6 +462,20 @@ class JvmSsaBlockRenderer {
               ? instruction.arg[2][1] : null;
             directStaticSites.set(index, direct);
             directStaticOwners.add(direct.className);
+          } else if (op === "getstatic" &&
+              !(typeof process !== "undefined" && process.env &&
+                process.env.JVM_DISABLE_STRUCTURED_LAZY_STATIC_TARGETS === "1")) {
+            const plan = this.jit.fieldSites[fieldSite];
+            const lazy = {
+              site: fieldSite,
+              variable: `ssaLazyStaticTarget${lazyStaticSites.size}`,
+              className: plan.className,
+            };
+            lazyStaticSites.set(index, lazy);
+            // The direct location can be learned only after initialization,
+            // so give cold-compiled methods the same before-effects class
+            // lifecycle guard as locations resolved during compilation.
+            directStaticOwners.add(plan.className);
           }
         }
       } else if ((op === "invokestatic" || op === "invokevirtual" ||
@@ -396,6 +508,16 @@ class JvmSsaBlockRenderer {
         });
       }
     }
+    if ((code.code.exceptionTable || []).length > 0 &&
+        [...callSites.values()].some((site) =>
+          !site.returnsVoid && site.id !== null && site.id !== undefined)) {
+      // A protected non-void call can suspend after consuming its arguments.
+      // The baseline resume ABI expects the child to deliver its result at the
+      // post-invoke PC, while handler restoration may instead re-enter at the
+      // invoke. Until that join carries an explicit pending-return SSA value,
+      // compile the complete method through the baseline tier from entry.
+      return reject("handler-protected non-void call requires baseline return handoff");
+    }
     // An initialized boolean static is a useful speculative constant when it
     // controls a large diagnostic/feature branch.  Bind only its location and
     // observed Java truth value, guard that value at entry before any guest
@@ -426,11 +548,15 @@ class JvmSsaBlockRenderer {
     const value = () => `ssaValue${nextValue++}`;
     const plans = [];
     const continuationFallbacks = new Map();
+    const directEntryStaticReadFallbacks = new Map();
+    const materializeDepths = new Set();
     let deferredCallMaterializationCount = 0;
     let reusedLocalLoadCount = 0;
     let eliminatedLocalStoreCount = 0;
     let sentinelArrayLoadCount = 0;
     let eliminatedArrayStoreCheckCount = 0;
+    let specializedArrayRangeAccessCount = 0;
+    const arrayRangeCheckCandidates = [];
     const localIndex = (instruction, op) => {
       if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
         return Number(instruction.arg);
@@ -440,17 +566,178 @@ class JvmSsaBlockRenderer {
     };
     const opOf = (instruction) => !instruction ? null :
       (typeof instruction === "string" ? instruction : instruction.op);
+    const arrayIndexOutOfBounds = (index, length) =>
+      this.unsignedArrayBoundsEnabled
+        ? `((${index} >>> 0) >= ${length})`
+        : `(${index} < 0 || ${index} >= ${length})`;
+    const methodIsStatic = (method.flags || []).includes("static") ||
+      (Number(method.accessFlags) & 0x0008) !== 0;
+    // In the single-threaded cooperative runtime, another Java thread can
+    // mutate a static only after this generated entry yields. A call-free
+    // method with no putstatic therefore sees one stable value for every
+    // resolved getstatic location during the entry. Hoist that value (and a
+    // primitive array's raw storage view) once. Any scheduler yield exits the
+    // generated entry, so resumption observes a fresh value.
+    // Reuse the generic transitive bytecode write summary already maintained
+    // by the Wasm tier. A call that writes no static location cannot invalidate
+    // a caller's cached clip bound or framebuffer reference. Summaries use the
+    // conservative name:descriptor kill key (rather than assuming unrelated
+    // owners never alias through inheritance); unresolved or dynamic calls
+    // still invalidate everything.
+    let hasUnknownStaticEffect = false;
+    const entryStaticWriteKeys = new Set();
+    const callFieldWriteSummaries = new Map();
+    for (let index = 0; index < items.length; index += 1) {
+      if (!normalReachableItems.has(index)) continue;
+      const instruction = items[index]?.instruction;
+      const op = opOf(instruction);
+      if (op === "putstatic" || op === "putfield") {
+        const member = instruction?.arg?.[2];
+        if (!Array.isArray(member)) {
+          hasUnknownStaticEffect = true;
+          break;
+        }
+        entryStaticWriteKeys.add(`${member[0]}:${member[1]}`);
+      } else if (op === "invokestatic") {
+        const owner = instruction?.arg?.[1];
+        const member = instruction?.arg?.[2];
+        const summary = typeof owner === "string" && Array.isArray(member)
+          ? this.jit.wasmJit?.staticWriteSummary(
+            owner, member[0], member[1])
+          : null;
+        if (summary === null || summary === undefined) {
+          callFieldWriteSummaries.set(index, null);
+          hasUnknownStaticEffect = true;
+          break;
+        }
+        callFieldWriteSummaries.set(index, summary);
+        for (const key of summary) entryStaticWriteKeys.add(key);
+      } else if (op === "invokespecial") {
+        const owner = instruction?.arg?.[1];
+        const member = instruction?.arg?.[2];
+        const summary = typeof owner === "string" && Array.isArray(member)
+          ? this.jit.wasmJit?.instanceWriteSummary(
+            owner, member[0], member[1])
+          : null;
+        callFieldWriteSummaries.set(index, summary || null);
+        if (summary === null || summary === undefined) {
+          hasUnknownStaticEffect = true;
+          break;
+        }
+        for (const key of summary) entryStaticWriteKeys.add(key);
+      } else if (op === "invokevirtual") {
+        const owner = instruction?.arg?.[1];
+        const member = instruction?.arg?.[2];
+        const classData = typeof owner === "string"
+          ? this.jit.jvm.classes[owner] : null;
+        const classNode = classData?.ast?.classes?.[0];
+        const targetMethod = classData && Array.isArray(member)
+          ? this.jit.jvm.findMethod(classData, member[0], member[1]) : null;
+        const monomorphic = Boolean(
+          classNode?.flags?.includes("final") ||
+          targetMethod?.flags?.includes("final") ||
+          targetMethod?.flags?.includes("private"));
+        const summary = monomorphic
+          ? this.jit.wasmJit?.instanceWriteSummary(
+            owner, member[0], member[1])
+          : null;
+        callFieldWriteSummaries.set(index, summary || null);
+        if (summary === null || summary === undefined) {
+          hasUnknownStaticEffect = true;
+          break;
+        }
+        for (const key of summary) entryStaticWriteKeys.add(key);
+      } else if (op === "invokeinterface" || op === "invokedynamic") {
+        callFieldWriteSummaries.set(index, null);
+        hasUnknownStaticEffect = true;
+        break;
+      }
+    }
+    const entryStaticReadCaches = new Map();
+    const entryStaticReadCacheEnabled =
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_ENTRY_STATIC_READ_CACHE === "1");
+    if (entryStaticReadCacheEnabled && !hasUnknownStaticEffect) {
+      for (const [index, direct] of directStaticSites) {
+        if (direct.op !== "getstatic" ||
+            entryStaticWriteKeys.has(direct.key) ||
+            guardedStaticBooleanSites.has(index)) continue;
+        const target = directTargetFor(direct);
+        if (!target) continue;
+        const key = `${direct.className}\0${direct.key}`;
+        let cache = entryStaticReadCaches.get(key);
+        if (!cache) {
+          const number = entryStaticReadCaches.size;
+          cache = {
+            direct,
+            value: `ssaEntryStaticValue${number}`,
+            data: direct.descriptor?.startsWith("[")
+              ? `ssaEntryStaticArrayData${number}` : null,
+          };
+          entryStaticReadCaches.set(key, cache);
+        }
+        direct.entryReadCache = cache;
+      }
+      // Cold-compiled sites do not receive a direct target until their first
+      // initialized access. Snapshot an already-linked, non-volatile target
+      // at each later generated entry. If it is still unresolved, the normal
+      // bytecode read below performs linkage; the next invocation can hoist.
+      const coldLinkedStaticReadCacheEnabled =
+        !(typeof process !== "undefined" && process.env &&
+          process.env.JVM_DISABLE_COLD_LINKED_STATIC_READ_CACHE === "1");
+      const lexicalLoopBlocks = new Set();
+      const collectLoopBlocks = (node, insideLoop = false) => {
+        if (!node) return;
+        const nested = insideLoop || node.t === "loop";
+        if (node.t === "straight" && nested) {
+          lexicalLoopBlocks.add(node.block);
+        }
+        if (node.t === "seq") {
+          node.body.forEach((child) => collectLoopBlocks(child, nested));
+        } else if (node.t === "if") {
+          collectLoopBlocks(node.then, nested);
+          collectLoopBlocks(node.els, nested);
+        } else if (node.t === "loop" || node.t === "block") {
+          collectLoopBlocks(node.body, nested);
+        }
+      };
+      collectLoopBlocks(structured.tree);
+      const itemBlock = new Map();
+      for (const block of cfg.blocks) {
+        for (const index of block.insns || []) itemBlock.set(index, block.id);
+      }
+      for (const [index, lazy] of lazyStaticSites) {
+        if (!coldLinkedStaticReadCacheEnabled) break;
+        const plan = this.jit.fieldSites[lazy.site];
+        const fieldKey = plan && `${plan.fieldName}:${plan.descriptor}`;
+        if (!plan || !fieldKey || entryStaticWriteKeys.has(fieldKey) ||
+            !this.jit.canEliminateFieldRead(plan.arg) ||
+            (plan.descriptor?.startsWith("[") ||
+              plan.descriptor?.startsWith("L")) &&
+            !lexicalLoopBlocks.has(itemBlock.get(index))) continue;
+        const location = `${plan.className}\0${fieldKey}`;
+        const existing = entryStaticReadCaches.get(location);
+        if (existing) {
+          lazy.entryReadCache = existing;
+          continue;
+        }
+        const number = entryStaticReadCaches.size;
+        const cache = {
+          lazy,
+          value: `ssaEntryStaticValue${number}`,
+          valid: `ssaEntryStaticValid${number}`,
+          data: plan.descriptor?.startsWith("[")
+            ? `ssaEntryStaticArrayData${number}` : null,
+        };
+        entryStaticReadCaches.set(location, cache);
+        lazy.entryReadCache = cache;
+      }
+    }
     // A non-volatile field is stable for one synchronous generated entry when
     // the method contains neither an instance-field write nor a call that
     // could perform one. Cache repeated reads by symbolic field plus receiver
     // identity. The cache dies at a scheduler safe point, before another Java
     // thread can run. Selection is entirely bytecode/field-shape based.
-    const hasUnknownFieldEffect = items.some((item) => {
-      const op = opOf(item?.instruction);
-      return op === "putfield" || op === "invokestatic" ||
-        op === "invokevirtual" || op === "invokespecial" ||
-        op === "invokeinterface";
-    });
     const fieldReadCaches = new Map();
     const fieldReadCacheSites = new Map();
     for (let index = 0; index < items.length; index += 1) {
@@ -471,17 +758,50 @@ class JvmSsaBlockRenderer {
           indexes: [],
           isArray: this.jit.fieldSites[site]?.descriptor?.startsWith("[") === true,
           directKey: this.jit.fieldSites[site]?.directInstanceKey || null,
+          killKey: this.jit.fieldSites[site]
+            ? `${this.jit.fieldSites[site].fieldName}:` +
+              `${this.jit.fieldSites[site].descriptor}`
+            : null,
         };
         fieldReadCaches.set(key, cache);
       }
       cache.indexes.push(index);
       fieldReadCacheSites.set(index, cache);
     }
-    const methodIsStatic = (method.flags || []).includes("static") ||
-      (Number(method.accessFlags) & 0x0008) !== 0;
     const entryArrayLocalSlots = new Set(
       method.jvmStructuredEntryArrayLocals || []);
+    const entryReferenceLocalSlots = new Set(methodIsStatic ? [] : [0]);
+    // Keep primitive-array parameter storage in one scalar view for the
+    // lifetime of a synchronous generated entry. This is descriptor-driven:
+    // the Java array reference remains canonical in the JVM local, while the
+    // raw view is only an unobservable cache used by checked load/store
+    // emission. `undefined` remains the exceptional sentinel, so null and
+    // bounds failures still materialize the precise bytecode state.
+    try {
+      const entryDescriptor = parseDescriptor(method.descriptor);
+      let entrySlot = methodIsStatic ? 0 : 1;
+      for (const parameterType of entryDescriptor.params) {
+        if (!["boolean", "byte", "char", "short", "int",
+          "long", "float", "double"].includes(parameterType)) {
+          entryReferenceLocalSlots.add(entrySlot);
+        }
+        if (["boolean[]", "byte[]", "char[]", "short[]", "int[]",
+          "float[]", "double[]", "long[]"].includes(parameterType)) {
+          entryArrayLocalSlots.add(entrySlot);
+        }
+        entrySlot += parameterType === "long" || parameterType === "double"
+          ? 2 : 1;
+      }
+    } catch (_) {
+      // Descriptor validation elsewhere will reject malformed methods.
+    }
     const entryArrayDataVariable = (slot) => `ssaEntryArrayData${slot}`;
+    const guardedEntryArrayData = new Set([
+      ...[...entryArrayLocalSlots].map(entryArrayDataVariable),
+      ...[...entryStaticReadCaches.values()]
+        .filter((cache) => !cache.lazy)
+        .map((cache) => cache.data).filter(Boolean),
+    ]);
     const localZeroAssigned = items.some((item) => {
       const instruction = item?.instruction, op = opOf(instruction);
       return op === "astore_0" ||
@@ -493,13 +813,39 @@ class JvmSsaBlockRenderer {
       return op === "aload_0" ||
         op === "aload" && Number(instruction?.arg) === 0;
     };
+    const assignedReferenceLocals = new Set();
+    for (const item of items) {
+      const instruction = item?.instruction;
+      const op = opOf(instruction);
+      if (/^astore(?:_[0-3])?$/.test(op)) {
+        assignedReferenceLocals.add(localIndex(instruction, op));
+      }
+    }
+    const directlyLoadsEntryReference = (index) => {
+      const instruction = items[index - 1]?.instruction;
+      const op = opOf(instruction);
+      if (!/^aload(?:_[0-3])?$/.test(op)) return null;
+      const slot = localIndex(instruction, op);
+      return entryReferenceLocalSlots.has(slot) &&
+        !assignedReferenceLocals.has(slot) ? slot : null;
+    };
     for (const cache of fieldReadCaches.values()) {
-      cache.eagerThis = !hasUnknownFieldEffect &&
+      cache.eagerThis = !hasUnknownStaticEffect &&
+        cache.killKey && !entryStaticWriteKeys.has(cache.killKey) &&
         !methodIsStatic && !localZeroAssigned &&
         cache.indexes.every(directlyLoadsThis);
+      const entrySlots = cache.indexes.map(directlyLoadsEntryReference);
+      cache.eagerLocal = !hasUnknownStaticEffect &&
+        cache.killKey && !entryStaticWriteKeys.has(cache.killKey) &&
+        entrySlots[0] !== null &&
+        entrySlots.every((slot) => slot === entrySlots[0])
+        ? entrySlots[0] : null;
     }
-    const invalidateFieldReadCaches = () =>
-      [...fieldReadCaches.values()].flatMap((cache) => [
+    const invalidateFieldReadCaches = (writeKeys = null) =>
+      [...fieldReadCaches.values()]
+        .filter((cache) => !writeKeys ||
+          !cache.killKey || writeKeys.has(cache.killKey))
+        .flatMap((cache) => [
         `${cache.valid} = false;`,
         ...(cache.isArray ? [`${cache.data} = null;`] : []),
       ]);
@@ -579,12 +925,22 @@ class JvmSsaBlockRenderer {
     // Frame reconstruction repeats at hundreds of sites in large bodies; the
     // locals copy is hoisted into one closure so emitted source stays small
     // enough for the engine to fully optimize the body.
-    const materializeLines = (operandValues, pc) => [
-      "spillLocals();",
-      ...operandValues.map((expression, i) => `stack[${i}] = ${expression};`),
-      `stack.length = ${operandValues.length};`,
-      `helpers.materialize(frame, locals, stack, ${pc});`,
-    ];
+    const materializeLines = (operandValues, pc) => {
+      if (!this.materializeOutliningEnabled) {
+        return [
+          "spillLocals();",
+          ...operandValues.map((expression, index) =>
+            `stack[${index}] = ${expression};`),
+          `stack.length = ${operandValues.length};`,
+          `helpers.materialize(frame, locals, stack, ${pc});`,
+        ];
+      }
+      materializeDepths.add(operandValues.length);
+      return [
+        `ssaMaterialize${operandValues.length}(${
+          [pc, ...operandValues].join(", ")});`,
+      ];
+    };
     // A synchronous guest call can throw after installing its child Frame.
     // If that child catches the exception, its eventual return must resume
     // this frame after the invoke with only the operands below the arguments.
@@ -602,6 +958,7 @@ class JvmSsaBlockRenderer {
       "}",
     ];
     const stageOperandLines = (operandValues) => [
+      "if (frame === null) spillLocals();",
       ...operandValues.map((expression, i) => `stack[${i}] = ${expression};`),
       `stack.length = ${operandValues.length};`,
     ];
@@ -778,6 +1135,7 @@ class JvmSsaBlockRenderer {
         `ssaStack${block.id}_${slot}`);
       const lines = [];
       const arrayViews = new Map();
+      const integerOrigins = new Map();
       // Repeated getstatic bytecodes in one straight-line block often load the
       // same framebuffer before a sequence of unrolled stores. Reuse that
       // value only within the block and only until a call/static write, so a
@@ -806,6 +1164,10 @@ class JvmSsaBlockRenderer {
         const cached = localValues[slot];
         if (this.localValueNumberingEnabled && cached !== null) {
           reusedLocalLoadCount += 1;
+          // Even when the current local value already has an SSA name, this
+          // bytecode load establishes the symbolic local slot used by loop
+          // recurrence and range analysis.
+          integerOrigins.set(cached, {kind: "local", slot});
           if (entryArrayLocalSlots.has(slot)) {
             arrayViews.set(cached, entryArrayDataVariable(slot));
           }
@@ -813,6 +1175,7 @@ class JvmSsaBlockRenderer {
         }
         const out = value();
         lines.push(`const ${out} = local${slot};`);
+        integerOrigins.set(out, {kind: "local", slot});
         if (entryArrayLocalSlots.has(slot)) {
           arrayViews.set(out, entryArrayDataVariable(slot));
         }
@@ -826,10 +1189,107 @@ class JvmSsaBlockRenderer {
       let valid = true;
       let invalidAt = null;
       const pop = () => stack.length ? stack.pop() : null;
-      const binary = (format) => {
+      const binary = (format, originOp = null) => {
         const right = pop(), left = pop();
         if (left === null || right === null) { valid = false; return; }
         const out = value(); lines.push(`const ${out} = ${format(left, right)};`); stack.push(out);
+        if (originOp) {
+          integerOrigins.set(out, {kind: originOp, left, right});
+        }
+      };
+      const boundedIntegerRange = (input, visited = new Set()) => {
+        if (/^-?\d+$/.test(input)) {
+          const constant = Number(input);
+          return Number.isSafeInteger(constant) &&
+            constant >= -2147483648 && constant <= 2147483647
+            ? {minimum: constant, maximum: constant} : null;
+        }
+        if (visited.has(input)) return null;
+        visited.add(input);
+        const origin = integerOrigins.get(input);
+        if (!origin) return null;
+        const left = boundedIntegerRange(origin.left, new Set(visited));
+        const right = boundedIntegerRange(origin.right, new Set(visited));
+        if (origin.kind === "iand") {
+          const mask = left && left.minimum === left.maximum &&
+              left.minimum >= 0 ? left.minimum
+            : right && right.minimum === right.maximum &&
+              right.minimum >= 0 ? right.minimum : null;
+          return Number.isInteger(mask)
+            ? {minimum: 0, maximum: mask} : null;
+        }
+        if (origin.kind === "iushr") {
+          if (!right || right.minimum !== right.maximum) return null;
+          const shift = right.minimum & 31;
+          if (shift === 0) return null;
+          return {
+            minimum: 0,
+            maximum: (2 ** (32 - shift)) - 1,
+          };
+        }
+        if ((origin.kind === "iadd" || origin.kind === "isub") &&
+            left && right) {
+          const minimum = origin.kind === "iadd"
+            ? left.minimum + right.minimum
+            : left.minimum - right.maximum;
+          const maximum = origin.kind === "iadd"
+            ? left.maximum + right.maximum
+            : left.maximum - right.minimum;
+          // Java integer arithmetic wraps. An interval is valid only when no
+          // member of either operand range can overflow this operation.
+          if (minimum < -2147483648 || maximum > 2147483647) return null;
+          return {minimum, maximum};
+        }
+        return null;
+      };
+      const arrayRangeMarkerFor = (arrayData, indexInput, itemIndex) => {
+        // A loop preheader may only name storage views declared at generated
+        // entry. Block-local snapshots (including non-eager field caches) are
+        // not in lexical scope yet, and field-cache views can also be cleared
+        // at a continuation safe point. Keep those accesses on the checked
+        // sentinel path rather than emitting a preheader proof that references
+        // a missing or stale SSA value.
+        if (!arrayData || !guardedEntryArrayData.has(arrayData)) return "false";
+        const fixedRange = this.bitBoundedArrayRangesEnabled
+          ? boundedIntegerRange(indexInput) : null;
+        const indexOrigin = integerOrigins.get(indexInput);
+        const leftOrigin = indexOrigin?.kind === "iadd"
+          ? integerOrigins.get(indexOrigin.left) : null;
+        const rightOrigin = indexOrigin?.kind === "iadd"
+          ? integerOrigins.get(indexOrigin.right) : null;
+        let candidate = null;
+        if (fixedRange && fixedRange.minimum >= 0) {
+          candidate = {
+            kind: "bounded-index",
+            block: block.id,
+            itemIndex,
+            arrayData,
+            slots: [],
+            ...fixedRange,
+          };
+        } else if (leftOrigin?.kind === "local" &&
+            rightOrigin?.kind === "local") {
+          candidate = {
+            kind: "base-plus-induction",
+            block: block.id,
+            itemIndex,
+            arrayData,
+            slots: [leftOrigin.slot, rightOrigin.slot],
+          };
+        } else if (indexOrigin?.kind === "local") {
+          candidate = {
+            kind: "affine-local",
+            block: block.id,
+            itemIndex,
+            arrayData,
+            slots: [indexOrigin.slot],
+          };
+        }
+        if (!candidate) return "false";
+        candidate.marker =
+          `__SSA_ARRAY_RANGE_GUARD_${arrayRangeCheckCandidates.length}__`;
+        arrayRangeCheckCandidates.push(candidate);
+        return candidate.marker;
       };
       const numberLiteral = (constant) => {
         if (Object.is(constant, -0)) return "-0";
@@ -918,15 +1378,21 @@ class JvmSsaBlockRenderer {
           }
         } else if (op === "pop") {
           if (pop() === null) valid = false;
-        } else if (op === "iadd") binary((a, b) => `((${a} + ${b}) | 0)`);
-        else if (op === "isub") binary((a, b) => `((${a} - ${b}) | 0)`);
+        } else if (op === "iadd") {
+          binary((a, b) => `((${a} + ${b}) | 0)`, "iadd");
+        }
+        else if (op === "isub") {
+          binary((a, b) => `((${a} - ${b}) | 0)`, "isub");
+        }
         else if (op === "imul") binary((a, b) => `Math.imul(${a}, ${b})`);
-        else if (op === "iand") binary((a, b) => `(${a} & ${b})`);
+        else if (op === "iand") binary((a, b) => `(${a} & ${b})`, "iand");
         else if (op === "ior") binary((a, b) => `(${a} | ${b})`);
         else if (op === "ixor") binary((a, b) => `(${a} ^ ${b})`);
         else if (op === "ishl") binary((a, b) => `(${a} << (${b} & 31))`);
         else if (op === "ishr") binary((a, b) => `(${a} >> (${b} & 31))`);
-        else if (op === "iushr") binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`);
+        else if (op === "iushr") {
+          binary((a, b) => `((${a} >>> (${b} & 31)) | 0)`, "iushr");
+        }
         else if (op === "dadd") binary((a, b) => `(${a} + ${b})`);
         else if (op === "dsub") binary((a, b) => `(${a} - ${b})`);
         else if (op === "dmul") binary((a, b) => `(${a} * ${b})`);
@@ -1022,12 +1488,22 @@ class JvmSsaBlockRenderer {
               `let ${out};`);
             if (primitiveSentinel) {
               const normalized = normalizedArrayLoadExpression(out, op, array);
+              const rangeMarker =
+                arrayRangeMarkerFor(arrayData, arrayIndexInput, index);
+              const loadFailure = guardedEntryArrayData.has(arrayData)
+                ? `((${out} = ${arrayData}[${arrayIndex}]) === undefined)`
+                : `(${arrayData} === null || ` +
+                  `(${out} = ${arrayData}[${arrayIndex}]) === undefined)`;
+              const provenLoad = normalizedArrayLoadExpression(
+                `${arrayData}[${arrayIndex}]`, op, array);
+              const successfulLoad =
+                `${out} = ${rangeMarker} ? ${provenLoad} : ${normalized};`;
               lines.push(
-                `if (${arrayData} === null || (${out} = ${arrayData}[${arrayIndex}]) === undefined) {`,
+                `if (!${rangeMarker} && ${loadFailure}) {`,
                 ...materializeLines([...stack, array, arrayIndex], index).map((line) => `  ${line}`),
                 `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 "} else {",
-                `  ${out} = ${normalized};`,
+                `  ${successfulLoad}`,
                 "}",
               );
               checkedPrimitiveArrayAccesses.add(`${arrayData}\0${arrayIndexInput}`);
@@ -1039,7 +1515,8 @@ class JvmSsaBlockRenderer {
                 : `${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}]`;
               const normalized = normalizedArrayLoadExpression(raw, op, array);
               lines.push(
-                `if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`,
+                `if (${array} === null || ${array} === undefined || ${
+                  arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
                 ...materializeLines([...stack, array, arrayIndex], index).map((line) => `  ${line}`),
                 `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 "} else {", `  ${out} = ${normalized};`, "}",
@@ -1057,20 +1534,40 @@ class JvmSsaBlockRenderer {
             const arrayData = arrayViews.get(arrayInput);
             lines.push(`const ${array} = ${arrayInput};`, `const ${arrayIndex} = ${arrayIndexInput};`,
               `const ${stored} = ${storedInput};`);
-            // The opcode already fixes primitive int-array narrowing; keep it
-            // as an integer expression in the generated block instead of a
-            // megamorphic helper call for every pixel.
-            const normalizedStore = op === "iastore"
-              ? `((${stored}) | 0)`
-              : `helpers.normalizeArrayStore(${stored}, ${JSON.stringify(op)}, ${array})`;
+            // The opcode fixes primitive narrowing. Keep it in the generated
+            // block instead of crossing a generic helper boundary per element.
+            // `bastore` retains its runtime [B/[Z distinction; all other
+            // primitive kinds are determined completely by the opcode.
+            const normalizedStore = this.inlinePrimitiveArrayStoresEnabled
+              ? normalizedArrayStoreExpression(stored, op, array)
+              : op === "iastore"
+                ? `((${stored}) | 0)`
+                : `helpers.normalizeArrayStore(${stored}, ${
+                  JSON.stringify(op)}, ${array})`;
             const checkedKey = arrayData && `${arrayData}\0${arrayIndexInput}`;
             if (op !== "aastore" && checkedKey &&
                 checkedPrimitiveArrayAccesses.has(checkedKey)) {
               lines.push(`${arrayData}[${arrayIndex}] = ${normalizedStore};`);
               eliminatedArrayStoreCheckCount += 1;
+            } else if (op !== "aastore" && arrayData &&
+                guardedEntryArrayData.has(arrayData)) {
+              const rangeMarker =
+                arrayRangeMarkerFor(arrayData, arrayIndexInput, index);
+              lines.push(
+                `if (!${rangeMarker} && ` +
+                  `${arrayIndexOutOfBounds(
+                    arrayIndex, `${arrayData}.length`)}) {`,
+                ...materializeLines([...stack, array, arrayIndex, stored], index)
+                  .map((line) => `  ${line}`),
+                `  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                "} else {",
+                `  ${arrayData}[${arrayIndex}] = ${normalizedStore};`,
+                "}",
+              );
             } else {
               lines.push(
-                `if (${array} === null || ${array} === undefined || ${arrayIndex} < 0 || ${arrayIndex} >= ${array}.length) {`,
+                `if (${array} === null || ${array} === undefined || ${
+                  arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
                 ...materializeLines([...stack, array, arrayIndex, stored], index).map((line) => `  ${line}`),
                 `  helpers.arrayStore(${stored}, ${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                 ...(arrayData ? [
@@ -1137,14 +1634,21 @@ class JvmSsaBlockRenderer {
                 `${object}.fields[${JSON.stringify(directKey)}] : helpers.getFieldAt(${site}, ${object}))`
               : `helpers.getFieldAt(${site}, ${object})`;
             lines.push(`const ${object} = ${objectInput};`);
-            if (cache?.eagerThis) {
+            if (cache?.eagerLocal !== null &&
+                cache?.eagerLocal !== undefined) {
+              if (!cache.eagerThis) {
+                lines.push(`if (${object} === null || ${object} === undefined) {`,
+                  ...materializeLines([...stack, object], index).map((line) => `  ${line}`),
+                  `  helpers.getFieldAt(${site}, ${object});`, "}");
+              }
               lines.push(`const ${out} = ${cache.value};`);
             } else {
               lines.push(`if (${object} === null || ${object} === undefined) {`,
                 ...materializeLines([...stack, object], index).map((line) => `  ${line}`),
                 `  helpers.getFieldAt(${site}, ${object});`, "}");
             }
-            if (cache && !cache.eagerThis) {
+            if (cache && (cache.eagerLocal === null ||
+                cache.eagerLocal === undefined)) {
               lines.push(`let ${out};`,
                 `if (${cache.valid} && ${cache.object} === ${object}) {`,
                 `  ${out} = ${cache.value};`, "} else {",
@@ -1157,6 +1661,16 @@ class JvmSsaBlockRenderer {
               lines.push(`const ${out} = ${directRead};`);
             }
             if (cache?.isArray) {
+              if (cache.eagerLocal !== null &&
+                  cache.eagerLocal !== undefined) {
+                // Transitive field-write analysis proved this entry reference
+                // and field stable until the next scheduler boundary. Keep
+                // its raw array view in the entry-scoped cache variable so a
+                // natural-loop range guard can name it outside the block.
+                arrayViews.set(out, cache.data);
+                stack.push(out);
+                continue;
+              }
               // The field cache may be invalidated or rebound by a later
               // guest call/write while this earlier array reference remains
               // live on the SSA operand stack. Snapshot its storage companion
@@ -1179,7 +1693,10 @@ class JvmSsaBlockRenderer {
             const object = value(), stored = value();
             const fieldPlan = this.jit.fieldSites[site];
             const directKey = fieldPlan?.directInstanceKey || null;
-            lines.push(...invalidateFieldReadCaches(),
+            const writeKeys = fieldPlan
+              ? new Set([`${fieldPlan.fieldName}:${fieldPlan.descriptor}`])
+              : null;
+            lines.push(...invalidateFieldReadCaches(writeKeys),
               `const ${object} = ${objectInput};`, `const ${stored} = ${storedInput};`,
               `if (${object} === null || ${object} === undefined) {`,
               ...materializeLines([...stack, object, stored], index).map((line) => `  ${line}`),
@@ -1207,6 +1724,14 @@ class JvmSsaBlockRenderer {
             stack.push(String(direct.guardedBooleanValue));
           }
           else if (direct) {
+            const entryCache = direct.entryReadCache;
+            if (entryCache) {
+              stack.push(entryCache.value);
+              if (entryCache.data) {
+                arrayViews.set(entryCache.value, entryCache.data);
+              }
+              continue;
+            }
             const key = JSON.stringify(direct.key);
             const location = `${direct.className}\0${direct.key}`;
             const cached = directStaticBlockValues.get(location);
@@ -1227,12 +1752,55 @@ class JvmSsaBlockRenderer {
             }
           }
           else {
-            lines.push(`const ${out} = helpers.getStaticSyncAt(${site});`,
+            const lazy = lazyStaticSites.get(index);
+            if (lazy) {
+              const cache = lazy.entryReadCache;
+              const emitted = cache &&
+                  this.directEntryStaticLinkingEnabled ? [] : lines;
+              const prefix = cache ? "  " : "";
+              emitted.push(`let ${out};`);
+              if (cache) {
+                emitted.push(`if (${cache.valid}) {`,
+                  `  ${out} = ${cache.value};`,
+                  "} else {");
+              }
+              emitted.push(`${prefix}if (${lazy.variable}) {`,
+                `${prefix}  ${out} = ${lazy.variable}.kind === "map" ? ` +
+                  `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
+                  `${lazy.variable}.fields[${lazy.variable}.key];`,
+                `${prefix}} else {`,
+                `${prefix}  ${out} = helpers.getStaticSyncAt(${site});`,
+                `${prefix}  if (${out} === helpers.staticDeopt()) {`,
+                ...materializeLines(stack, index).map(
+                  (line) => `${prefix}    ${line}`),
+                `${prefix}    helpers.skipJitOnce(frame);`,
+                `${prefix}    return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };`,
+                `${prefix}  }`,
+                `${prefix}  ${lazy.variable} = helpers.fieldSites[${site}].staticTarget;`,
+                `${prefix}  if (${lazy.variable}) helpers.structuredSsa.lazyStaticTargetLinkCount += 1;`,
+                `${prefix}}`);
+              if (cache) emitted.push("}");
+              if (emitted !== lines) {
+                const marker =
+                  `__JVM_DIRECT_ENTRY_STATIC_READ_${index}_${site}__`;
+                directEntryStaticReadFallbacks.set(marker, {
+                  direct: [`const ${out} = ${cache.value};`],
+                  ordinary: emitted,
+                });
+                lines.push(marker);
+              }
+            } else {
+              lines.push(`const ${out} = helpers.getStaticSyncAt(${site});`,
               `if (${out} === helpers.staticDeopt()) {`,
               ...materializeLines(stack, index).map((line) => `  ${line}`),
               "  helpers.skipJitOnce(frame);",
               "  return { deopt: true, transient: true, reason: 'class initialization in structured SSA getstatic' };", "}");
+            }
             stack.push(out);
+            const lazyCache = lazy?.entryReadCache;
+            if (lazyCache?.data) {
+              arrayViews.set(out, lazyCache.data);
+            }
           }
         } else if (op === "putstatic") {
           directStaticBlockValues.clear();
@@ -1249,7 +1817,8 @@ class JvmSsaBlockRenderer {
             op === "invokespecial" || op === "invokeinterface") {
           directStaticBlockValues.clear();
           fieldArraySnapshots.clear();
-          lines.push(...invalidateFieldReadCaches());
+          lines.push(...invalidateFieldReadCaches(
+            callFieldWriteSummaries.get(index)));
           const site = callSites.get(index);
           if (!site || stack.length < site.argumentCount) valid = false;
           else if (site.directJre) {
@@ -1564,48 +2133,48 @@ class JvmSsaBlockRenderer {
               ...materializeCallExceptionLines(callStack, stack, index)
                 .map((line) => `  ${line}`),
               `  throw ${caught};`, "}",
-              `if (${out} === helpers.asyncInvokeSentinel()) {`,
-              ...(resumableVoidCall ? [asynchronousCallMarker] : [
-                ...materializeLines(callStack, index).map((line) => `  ${line}`),
-                "  helpers.skipJitOnce(frame);",
-                "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
-              ]), "}",
             ];
             lines.push(`let ${out};`);
             if (site.id !== null && site.id !== undefined) {
-              const runtimeSite = value(), positionalTarget = value();
+              const usedDirect = value();
+              const runtimeSite = positionalCallSiteVariable(index);
+              const positionalTarget = positionalCallTargetVariable(index);
+              const positionalInvoke = positionalCallInvokeVariable(index);
+              const positionalReceiver =
+                positionalCallReceiverVariable(index);
               const receiverGuard = site.dynamic && site.argumentCount > 0
                 ? `${args[0]} !== null && ${args[0]} !== undefined && ` +
                   `(${args[0]}.type || ${runtimeSite}.declaredClassName) === ` +
-                  `${positionalTarget}.receiverType`
+                  positionalReceiver
                 : site.hasReceiver && site.argumentCount > 0
                   ? `${args[0]} !== null && ${args[0]} !== undefined && ` +
-                    `${positionalTarget}.receiverType === null`
-                  : `${positionalTarget}.receiverType === null`;
+                    `${positionalReceiver} === null`
+                  : "true";
               lines.push(
-                `const ${runtimeSite} = helpers.syncCallSites[${site.id}];`,
-                `const ${positionalTarget} = ${runtimeSite} && ${runtimeSite}.fastPositional;`,
-                `if (!helpers.profileMethods && ${positionalTarget} && ${receiverGuard} &&`,
-                `    (${positionalTarget}.debugGuarded ||`,
-                `      !helpers.jvm.debugManager.isClassJitDeopted(${positionalTarget}.lookupClass))) {`,
-                `  try { ${out} = ${positionalTarget}.invoke(${args.join(", ")}${
-                  args.length ? ", " : ""}thread); } catch (${caught}) {`,
+                `let ${usedDirect} = false;`,
+                `if (${positionalInvoke} && ${receiverGuard}) {`,
+                `  ${usedDirect} = true;`,
+                `  try { ${out} = ${positionalInvoke}(${args.join(", ")}${
+                  args.length ? ", " : ""}thread, true); } catch (${caught}) {`,
                 ...materializeCallExceptionLines(
                   callStack, stack, index,
-                  `!${positionalTarget}.invoke.jvmRestoresExceptionFrames`,
+                  `!${positionalInvoke}.jvmRestoresExceptionFrames`,
                 )
                   .map((line) => `    ${line}`),
-                `    throw ${caught};`, "  }",
-                `  if (${out} === helpers.asyncInvokeSentinel()) {`,
-                ...fallbackLines.map((line) => `    ${line}`),
-                "  }",
-                "} else {",
+                `    throw ${caught};`, "  }", "}",
+                `if (!${usedDirect} || ${out} === helpers.asyncInvokeSentinel()) {`,
                 ...fallbackLines.map((line) => `  ${line}`),
                 "}",
               );
             } else {
               lines.push(...fallbackLines);
             }
+            lines.push(`if (${out} === helpers.asyncInvokeSentinel()) {`,
+              ...(resumableVoidCall ? [asynchronousCallMarker] : [
+                ...materializeLines(callStack, index).map((line) => `  ${line}`),
+                "  helpers.skipJitOnce(frame);",
+                "  return { deopt: true, transient: true, reason: 'asynchronous structured SSA callee' };",
+              ]), "}");
             if (resumableVoidCall) {
               const deoptCallMarker =
                 `__JVM_DEOPT_VOID_CALL_${index}_${site.id}__`;
@@ -1745,24 +2314,60 @@ class JvmSsaBlockRenderer {
       return true;
     };
     const invalidateFieldCacheLines = [...fieldReadCaches.values()]
-      .filter((cache) => !cache.eagerThis)
+      .filter((cache) =>
+        cache.eagerLocal === null || cache.eagerLocal === undefined)
       .flatMap((cache) => [
         `${cache.valid} = false;`,
         `${cache.object} = null;`,
         ...(cache.isArray ? [`${cache.data} = null;`] : []),
       ]);
     const refreshEagerFieldCacheLines = [...fieldReadCaches.values()]
-      .filter((cache) => cache.eagerThis)
+      .filter((cache) =>
+        cache.eagerLocal !== null && cache.eagerLocal !== undefined)
       .flatMap((cache) => [
-        `${cache.value} = ${cache.directKey
-          ? `(local0.fields && local0.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
-            `local0.fields[${JSON.stringify(cache.directKey)}] : ` +
-            `helpers.getFieldAt(${cache.site}, local0))`
-          : `helpers.getFieldAt(${cache.site}, local0)`};`,
+        `if (local${cache.eagerLocal} !== null && ` +
+          `local${cache.eagerLocal} !== undefined) {`,
+        `  ${cache.value} = ${cache.directKey
+          ? `(local${cache.eagerLocal}.fields && ` +
+            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
+            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] : ` +
+            `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal}))`
+          : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
         ...(cache.isArray ? [
-          `${cache.data} = helpers.arrayData(${cache.value});`,
+          `  ${cache.data} = helpers.arrayData(${cache.value});`,
         ] : []),
+        "}",
       ]);
+    const refreshEntryStaticCacheLines =
+      [...entryStaticReadCaches.values()].flatMap((cache) => {
+        if (cache.lazy) {
+          const lazy = cache.lazy;
+          const read = `${lazy.variable}.kind === "map" ? ` +
+            `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
+            `${lazy.variable}.fields[${lazy.variable}.key]`;
+          return [
+            `${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
+            `${cache.valid} = Boolean(${lazy.variable});`,
+            `${cache.value} = ${cache.valid} ? ${read} : undefined;`,
+            ...(cache.data
+              ? [`${cache.data} = ${cache.valid} ? ` +
+                `helpers.arrayData(${cache.value}) : null;`]
+              : []),
+          ];
+        }
+        const direct = cache.direct;
+        const fields =
+          `helpers.directStaticTargets[${direct.targetId}].fields`;
+        const read = direct.kind === "map"
+          ? `${fields}.get(${JSON.stringify(direct.key)})`
+          : `${fields}[${JSON.stringify(direct.key)}]`;
+        return [
+          `${cache.value} = ${read};`,
+          ...(cache.data
+            ? [`${cache.data} = helpers.arrayData(${cache.value});`]
+            : []),
+        ];
+      });
     const constantInstructionValue = (instruction) => {
       const op = opOf(instruction);
       if (/^iconst_(?:m1|[0-5])$/.test(op)) {
@@ -1779,23 +2384,47 @@ class JvmSsaBlockRenderer {
       }
       return null;
     };
-    const countedLoopTripCount = (node) => {
+    const countedLoopInfo = (node) => {
       if (!node || node.t !== "loop") return null;
       const header = Number(node.label.slice(1));
       const block = cfg.blocks[header];
       if (!block || block.synthetic || cfg.term[header]?.kind !== "cond") return null;
       const headerInstructions = block.insns
         .map((index) => items[index]?.instruction).filter(Boolean);
-      if (headerInstructions.length < 3) return null;
+      if (headerInstructions.length < 2) return null;
       const branch = headerInstructions[headerInstructions.length - 1];
-      const boundInstruction = headerInstructions[headerInstructions.length - 2];
-      const loadInstruction = headerInstructions[headerInstructions.length - 3];
-      if (opOf(branch) !== "if_icmpge") return null;
+      const branchOp = opOf(branch);
+      let bound = null;
+      let boundSlot = null;
+      let boundExpression = null;
+      let loadInstruction = null;
+      if (branchOp === "ifge") {
+        bound = 0;
+        boundExpression = "0";
+        loadInstruction = headerInstructions[headerInstructions.length - 2];
+      } else if (branchOp === "if_icmpge" &&
+          headerInstructions.length >= 3) {
+        const boundInstruction =
+          headerInstructions[headerInstructions.length - 2];
+        bound = constantInstructionValue(boundInstruction);
+        if (bound !== null) {
+          boundExpression = String(bound);
+        } else {
+          const boundOp = opOf(boundInstruction);
+          if (!/^iload(?:_[0-3])?$/.test(boundOp)) return null;
+          boundSlot = localIndex(boundInstruction, boundOp);
+          if (!Number.isInteger(boundSlot)) return null;
+          boundExpression = `local${boundSlot}`;
+        }
+        loadInstruction = headerInstructions[headerInstructions.length - 3];
+      } else {
+        return null;
+      }
       const loadOp = opOf(loadInstruction);
       if (!/^iload(?:_[0-3])?$/.test(loadOp)) return null;
       const slot = localIndex(loadInstruction, loadOp);
-      const bound = constantInstructionValue(boundInstruction);
-      if (!Number.isInteger(slot) || bound === null) return null;
+      if (!Number.isInteger(slot) || !boundExpression ||
+          boundSlot === slot) return null;
 
       const predecessors = [];
       for (let candidate = 0; candidate < cfg.n; candidate += 1) {
@@ -1843,37 +2472,103 @@ class JvmSsaBlockRenderer {
         initial = constantInstructionValue(
           items[preheaderInsns[position - 1]]?.instruction);
       }
-      if (initial === null || initial >= bound) return null;
-
       let increment = null;
       let writes = 0;
+      let incrementInBackedge = false;
+      let boundWrites = 0;
+      const writtenSlots = new Set();
       for (const loopBlock of loopBlocks) {
         for (const itemIndex of cfg.blocks[loopBlock].insns) {
           const instruction = items[itemIndex]?.instruction;
           const op = opOf(instruction);
+          const writtenSlot = op === "iinc"
+            ? Number(instruction.varnum ?? instruction.arg)
+            : /^istore(?:_[0-3])?$/.test(op)
+              ? localIndex(instruction, op) : null;
+          if (Number.isInteger(writtenSlot)) writtenSlots.add(writtenSlot);
+          if (boundSlot !== null && writtenSlot === boundSlot) {
+            boundWrites += 1;
+          }
           if (op === "iinc" && Number(instruction.varnum ?? instruction.arg) === slot) {
             writes += 1;
             increment = Number(instruction.incr ?? 0);
+            incrementInBackedge ||= loopBlock === backedges[0];
           } else if (/^istore(?:_[0-3])?$/.test(op) &&
               localIndex(instruction, op) === slot) {
             writes += 1;
           }
         }
       }
-      if (writes !== 1 || !Number.isInteger(increment) || increment <= 0) return null;
+      if (writes !== 1 || !incrementInBackedge ||
+          boundWrites !== 0 || !Number.isInteger(increment) ||
+          increment <= 0) return null;
+      return {
+        header, slot, bound, boundSlot, boundExpression, increment, initial,
+        loopBlocks, writtenSlots, backedges,
+      };
+    };
+    const countedLoopTripCount = (node) => {
+      const info = countedLoopInfo(node);
+      if (!info || !Number.isInteger(info.bound) ||
+          info.initial === null || info.initial >= info.bound) {
+        return null;
+      }
+      const {bound, initial, increment} = info;
       const trips = Math.ceil((bound - initial) / increment);
       return trips > 0 && trips <= 4096 ? trips : null;
     };
     const allCountedLoops = new Map();
+    const countedLoopInfos = new Map();
     const coarseCountedLoops = new Map();
+    const runtimeCoarseCountedLoops = new Map();
+    // A scanline, codec row, audio block, or similar counted inner loop often
+    // has several hundred iterations. Charge its verified runtime trip count
+    // once against the shared scheduler budget, then omit the branch from the
+    // loop body. The 1024-trip ceiling itself bounds the largest branch-free
+    // chunk. It may exceed the remaining abstract backedge budget; charging
+    // it makes the next eligible loop poll immediately without fragmenting a
+    // small scanline/audio block into hundreds of generator resumptions.
+    const runtimeCoarseTripLimit = 1024;
+    const containsLoop = (node) => {
+      if (!node) return false;
+      if (node.t === "loop") return true;
+      if (node.t === "seq") return node.body.some(containsLoop);
+      if (node.t === "if") {
+        return containsLoop(node.then) || containsLoop(node.els);
+      }
+      if (node.t === "block") return containsLoop(node.body);
+      return false;
+    };
     const findNestedCountedLoops = (node, loopDepth = 0) => {
       if (!node) return;
       if (node.t === "loop") {
+        const info = countedLoopInfo(node);
         const trips = countedLoopTripCount(node);
         const header = Number(node.label.slice(1));
+        if (info) countedLoopInfos.set(header, info);
         if (trips) allCountedLoops.set(header, trips);
         if (trips && loopDepth > 0 && this.coarseCountedLoopSafePointsEnabled) {
           coarseCountedLoops.set(header, trips);
+        } else if (info &&
+            (loopDepth > 0 || !containsLoop(node.body)) &&
+            this.coarseCountedLoopSafePointsEnabled) {
+          runtimeCoarseCountedLoops.set(header, {
+            ...info,
+            variable: `ssaRuntimeCoarseLoop${header}`,
+            tripsVariable: `ssaRuntimeCoarseTrips${header}`,
+            tripsExpression:
+              `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
+              (info.increment === 1
+                ? `(${info.boundExpression} - local${info.slot})`
+                : `Math.ceil((${info.boundExpression} - local${info.slot}) / ` +
+                  `${info.increment})`) +
+              `)`,
+            condition:
+              `ssaRuntimeCoarseTrips${header} <= ` +
+              `${runtimeCoarseTripLimit} && ` +
+              `local${info.slot} <= 2147483647 - ` +
+              `ssaRuntimeCoarseTrips${header} * ${info.increment}`,
+          });
         }
         findNestedCountedLoops(node.body, loopDepth + 1);
       } else if (node.t === "seq") {
@@ -1888,20 +2583,448 @@ class JvmSsaBlockRenderer {
     findNestedCountedLoops(structured.tree);
     const boundedIterationProduct = [...allCountedLoops.values()]
       .reduce((product, trips) => product * trips, 1);
-    const hasAtomicUnsafeOperation = items.some((item) => {
+    const isAtomicUnsafeOperation = (item, index) => {
+      if (!normalReachableItems.has(index)) return false;
       const op = opOf(item?.instruction);
       return op && (op.startsWith("invoke") || op === "monitorenter" ||
         op === "monitorexit" || op === "athrow" || op === "new" ||
         op === "newarray" || op === "anewarray" ||
         op === "multianewarray");
-    });
+    };
+    const hasAtomicUnsafeOperation = items.some(isAtomicUnsafeOperation);
+    const loopHasAtomicUnsafeOperation = (info) =>
+      [...info.loopBlocks].some((block) =>
+        cfg.blocks[block].insns.some((index) =>
+          isAtomicUnsafeOperation(items[index], index)));
     // Coarsening is safe for throughput only when the complete method is a
     // bounded numeric kernel. In an effectful method, one "counted" inner loop
     // can still contain a very large data-dependent unit of work (asset
     // decoding is a common example). Let those inner loops retain their own
     // scheduler polls so an outer backedge is not the first observable point
     // after hundreds of milliseconds.
-    if (hasAtomicUnsafeOperation) coarseCountedLoops.clear();
+    if (hasAtomicUnsafeOperation) {
+      for (const header of coarseCountedLoops.keys()) {
+        const info = countedLoopInfos.get(header);
+        if (!info || loopHasAtomicUnsafeOperation(info)) {
+          coarseCountedLoops.delete(header);
+        }
+      }
+      for (const [header, info] of runtimeCoarseCountedLoops) {
+        if (loopHasAtomicUnsafeOperation(info)) {
+          runtimeCoarseCountedLoops.delete(header);
+        }
+      }
+    }
+    const arrayRangeGuardDeclarations = new Map();
+    const arrayRangeGuardVariables = new Map();
+    const quotientProductRangePreambles = new Map();
+    const cyclicArrayRangeCandidates = new Set();
+    const affineLocalStep = (info, slot) => {
+      let result = null;
+      let writes = 0;
+      for (const block of info.loopBlocks) {
+        const blockItems = cfg.blocks[block].insns;
+        for (let position = 0; position < blockItems.length; position += 1) {
+          const itemIndex = blockItems[position];
+          const instruction = items[itemIndex]?.instruction;
+          const op = opOf(instruction);
+          const writtenSlot = /^istore(?:_[0-3])?$/.test(op)
+            ? localIndex(instruction, op)
+            : op === "iinc" ? Number(instruction.varnum ?? instruction.arg)
+              : null;
+          if (writtenSlot !== slot) continue;
+          writes += 1;
+          if (op === "iinc") {
+            const increment = Number(instruction.incr ?? 0);
+            if (Number.isInteger(increment)) result = String(increment);
+            continue;
+          }
+          if (position < 3) continue;
+          const load = items[blockItems[position - 3]]?.instruction;
+          const stepLoad = items[blockItems[position - 2]]?.instruction;
+          const add = items[blockItems[position - 1]]?.instruction;
+          const loadOp = opOf(load);
+          if (!/^iload(?:_[0-3])?$/.test(loadOp) ||
+              localIndex(load, loadOp) !== slot ||
+              opOf(add) !== "iadd") continue;
+          const constantStep = constantInstructionValue(stepLoad);
+          if (Number.isInteger(constantStep)) {
+            result = String(constantStep);
+            continue;
+          }
+          if (opOf(stepLoad) === "getstatic") {
+            const direct = directStaticSites.get(blockItems[position - 2]);
+            if (direct?.entryReadCache?.value) {
+              result = direct.entryReadCache.value;
+            }
+          }
+        }
+      }
+      return writes === 1 ? result : null;
+    };
+    const binaryLocalAssignment = (info, targetSlot, binaryOp) => {
+      let result = null;
+      let writes = 0;
+      for (const block of info.loopBlocks) {
+        const blockItems = cfg.blocks[block].insns;
+        for (let position = 0; position < blockItems.length; position += 1) {
+          const itemIndex = blockItems[position];
+          const instruction = items[itemIndex]?.instruction;
+          const op = opOf(instruction);
+          const writtenSlot = /^istore(?:_[0-3])?$/.test(op)
+            ? localIndex(instruction, op)
+            : op === "iinc" ? Number(instruction.varnum ?? instruction.arg)
+              : null;
+          if (writtenSlot !== targetSlot) continue;
+          writes += 1;
+          if (position < 3 || op === "iinc") continue;
+          const left = items[blockItems[position - 3]]?.instruction;
+          const right = items[blockItems[position - 2]]?.instruction;
+          const binary = items[blockItems[position - 1]]?.instruction;
+          const leftOp = opOf(left);
+          const rightOp = opOf(right);
+          if (!/^iload(?:_[0-3])?$/.test(leftOp) ||
+              !/^iload(?:_[0-3])?$/.test(rightOp) ||
+              opOf(binary) !== binaryOp) continue;
+          result = {
+            left: localIndex(left, leftOp),
+            right: localIndex(right, rightOp),
+            block,
+            itemIndex,
+          };
+        }
+      }
+      return writes === 1 ? result : null;
+    };
+    const cyclicLocalRange = (info, candidate) => {
+      if (candidate.kind !== "affine-local" ||
+          candidate.slots.length !== 1) return null;
+      const indexSlot = candidate.slots[0];
+      const candidateIndex = candidate.itemIndex;
+      const sampledLoad = items[candidateIndex - 2]?.instruction;
+      const sampledIncrement = items[candidateIndex - 1]?.instruction;
+      const sampledLoadOp = opOf(sampledLoad);
+      if (!/^iload(?:_[0-3])?$/.test(sampledLoadOp) ||
+          localIndex(sampledLoad, sampledLoadOp) !== indexSlot ||
+          opOf(sampledIncrement) !== "iinc" ||
+          Number(sampledIncrement.varnum ?? sampledIncrement.arg) !== indexSlot ||
+          Number(sampledIncrement.incr) !== 1) return null;
+      const loopItems = [...info.loopBlocks]
+        .flatMap((block) => cfg.blocks[block].insns || []);
+      const loopItemSet = new Set(loopItems);
+      const writtenSlots = new Map();
+      for (const itemIndex of loopItems) {
+        const instruction = items[itemIndex]?.instruction;
+        const op = opOf(instruction);
+        const slot = /^istore(?:_[0-3])?$/.test(op)
+          ? localIndex(instruction, op)
+          : op === "iinc"
+            ? Number(instruction.varnum ?? instruction.arg) : null;
+        if (Number.isInteger(slot)) {
+          writtenSlots.set(slot, (writtenSlots.get(slot) || 0) + 1);
+        }
+      }
+      for (let position = 0; position + 9 < items.length; position += 1) {
+        const sequence = Array.from(
+          {length: 10}, (_unused, offset) =>
+            items[position + offset]?.instruction);
+        if (sequence.some((_instruction, offset) =>
+            !loopItemSet.has(position + offset))) continue;
+        const phaseIncrement = sequence[0];
+        if (opOf(phaseIncrement) !== "iinc" ||
+            Number(phaseIncrement.incr) !== 1) continue;
+        const phaseSlot =
+          Number(phaseIncrement.varnum ?? phaseIncrement.arg);
+        const phaseLoadOp = opOf(sequence[1]);
+        const modulusLoadOp = opOf(sequence[2]);
+        const indexLoadOp = opOf(sequence[4]);
+        const secondModulusLoadOp = opOf(sequence[5]);
+        const indexStoreOp = opOf(sequence[7]);
+        const phaseStoreOp = opOf(sequence[9]);
+        if (!/^iload(?:_[0-3])?$/.test(phaseLoadOp) ||
+            localIndex(sequence[1], phaseLoadOp) !== phaseSlot ||
+            !/^iload(?:_[0-3])?$/.test(modulusLoadOp) ||
+            !/^iload(?:_[0-3])?$/.test(indexLoadOp) ||
+            localIndex(sequence[4], indexLoadOp) !== indexSlot ||
+            !/^iload(?:_[0-3])?$/.test(secondModulusLoadOp) ||
+            opOf(sequence[3]) !== "if_icmpne" ||
+            opOf(sequence[6]) !== "isub" ||
+            !/^istore(?:_[0-3])?$/.test(indexStoreOp) ||
+            localIndex(sequence[7], indexStoreOp) !== indexSlot ||
+            opOf(sequence[8]) !== "iconst_0" ||
+            !/^istore(?:_[0-3])?$/.test(phaseStoreOp) ||
+            localIndex(sequence[9], phaseStoreOp) !== phaseSlot) continue;
+        const modulusSlot = localIndex(sequence[2], modulusLoadOp);
+        if (localIndex(sequence[5], secondModulusLoadOp) !== modulusSlot ||
+            info.writtenSlots.has(modulusSlot) ||
+            (writtenSlots.get(indexSlot) || 0) !== 2 ||
+            (writtenSlots.get(phaseSlot) || 0) !== 2) continue;
+        const branchTarget = sequence[3]?.arg;
+        const targetIndex = typeof branchTarget === "string"
+          ? labels.get(branchTarget.replace(/:$/, "")) : null;
+        if (targetIndex !== position + 10) continue;
+        return {indexSlot, phaseSlot, modulusSlot};
+      }
+      return null;
+    };
+    // Recognize a general integer recurrence used by affine samplers:
+    //
+    //   recurrence += invariantStep
+    //   quotient = recurrence / invariantDivisor
+    //   derived = quotient * invariantMultiplier
+    //   index = derived + invariantOffset
+    //
+    // The proof is deliberately local to one natural counted loop. Runtime
+    // endpoint checks reject division by zero, every possible int32 overflow,
+    // null storage, and an out-of-range first/last index. With those excluded,
+    // truncating division and multiplication are monotone over the finite
+    // recurrence, so all intermediate indexes are in range as well. The
+    // original checked loop remains the complete slow arm.
+    const loopPathExists = (info, start, target, blocked = null) => {
+      if (start === blocked) return false;
+      const pending = [start];
+      const visited = new Set();
+      while (pending.length) {
+        const block = pending.pop();
+        if (block === blocked || visited.has(block)) continue;
+        if (block === target) return true;
+        visited.add(block);
+        for (const successor of cfg.succ[block] || []) {
+          // Crossing the natural-loop backedge starts the next iteration and
+          // cannot establish ordering within the current one.
+          if (successor === info.header ||
+              !info.loopBlocks.has(successor)) continue;
+          pending.push(successor);
+        }
+      }
+      return false;
+    };
+    const loopAssignmentDominates = (info, assignment, candidate) => {
+      if (assignment.block === candidate.block) {
+        return assignment.itemIndex < candidate.itemIndex;
+      }
+      if (assignment.block === info.header) return true;
+      return !loopPathExists(
+        info, info.header, candidate.block, assignment.block);
+    };
+    const quotientProductRecurrence = (info, candidate) => {
+      const slots = candidate.slots;
+      for (let derivedIndex = 0; derivedIndex < slots.length;
+        derivedIndex += 1) {
+        const derivedSlot = slots[derivedIndex];
+        const offsetSlot = slots[1 - derivedIndex];
+        if (info.writtenSlots.has(offsetSlot)) continue;
+        const multiply = binaryLocalAssignment(info, derivedSlot, "imul");
+        if (!multiply) continue;
+        for (const [quotientSlot, multiplierSlot] of [
+          [multiply.left, multiply.right],
+          [multiply.right, multiply.left],
+        ]) {
+          if (info.writtenSlots.has(multiplierSlot)) continue;
+          const divide =
+            binaryLocalAssignment(info, quotientSlot, "idiv");
+          if (!divide || info.writtenSlots.has(divide.right)) continue;
+          const recurrenceSlot = divide.left;
+          const recurrence =
+            binaryLocalAssignment(info, recurrenceSlot, "iadd");
+          if (!recurrence) continue;
+          const stepSlot = recurrence.left === recurrenceSlot
+            ? recurrence.right
+            : recurrence.right === recurrenceSlot
+              ? recurrence.left : null;
+          if (!Number.isInteger(stepSlot) ||
+              info.writtenSlots.has(stepSlot)) continue;
+          if (!loopAssignmentDominates(info, divide, candidate) ||
+              !loopAssignmentDominates(info, multiply, candidate)) continue;
+          // The recurrence update must occur exactly once on every path to a
+          // backedge and after this access in the current iteration. This
+          // excludes conditionally updated or update-before-sample loops whose
+          // endpoint formula would require a different starting value.
+          if ((info.backedges || []).some((backedge) =>
+              recurrence.block !== backedge &&
+              loopPathExists(
+                info, info.header, backedge, recurrence.block))) continue;
+          const updatePrecedesCandidate =
+            recurrence.block === candidate.block
+              ? recurrence.itemIndex < candidate.itemIndex
+              : loopPathExists(
+                info, recurrence.block, candidate.block);
+          if (updatePrecedesCandidate) continue;
+          return {
+            recurrenceSlot,
+            stepSlot,
+            divisorSlot: divide.right,
+            multiplierSlot,
+            offsetSlot,
+          };
+        }
+      }
+      return null;
+    };
+    for (let candidateIndex = 0;
+      candidateIndex < arrayRangeCheckCandidates.length;
+      candidateIndex += 1) {
+      const candidate = arrayRangeCheckCandidates[candidateIndex];
+      const loops = [...countedLoopInfos.values()]
+        .filter((info) =>
+          info.increment === 1 &&
+          !loopHasAtomicUnsafeOperation(info) &&
+          info.loopBlocks.has(candidate.block) &&
+          (candidate.kind === "bounded-index" ||
+            candidate.kind === "affine-local" ||
+            candidate.slots.includes(info.slot) ||
+            Boolean(quotientProductRecurrence(info, candidate))))
+        .sort((left, right) =>
+          left.loopBlocks.size - right.loopBlocks.size);
+      const info = candidate.kind === "bounded-index"
+        ? loops[0]
+        : candidate.kind === "affine-local"
+        ? loops.find((loop) =>
+          Boolean(affineLocalStep(loop, candidate.slots[0]) ||
+            cyclicLocalRange(loop, candidate)))
+        : loops.find((loop) => {
+          if (quotientProductRecurrence(loop, candidate)) return true;
+          const baseSlot = candidate.slots.find((slot) => slot !== loop.slot);
+          return Number.isInteger(baseSlot) &&
+            !loop.writtenSlots.has(baseSlot);
+        });
+      if (!info) continue;
+      const variable = `ssaArrayRangeGuard${candidateIndex}`;
+      let condition;
+      let preamble = [];
+      if (candidate.kind === "bounded-index") {
+        condition =
+          `(${candidate.minimum} >= 0 && ${candidate.maximum} < ` +
+          `${candidate.arrayData}.length)`;
+      } else if (candidate.kind === "affine-local") {
+        const indexSlot = candidate.slots[0];
+        const step = affineLocalStep(info, indexSlot);
+        const cyclic = step === null
+          ? cyclicLocalRange(info, candidate) : null;
+        if (cyclic) {
+          cyclicArrayRangeCandidates.add(candidate);
+          const base =
+            `(local${cyclic.indexSlot} - local${cyclic.phaseSlot})`;
+          const end = `(${base} + local${cyclic.modulusSlot})`;
+          condition =
+            `(local${cyclic.modulusSlot} > 0 && ` +
+            `local${cyclic.phaseSlot} >= 0 && ` +
+            `local${cyclic.phaseSlot} < local${cyclic.modulusSlot} && ` +
+            `${base} >= 0 && ${end} <= ${candidate.arrayData}.length && ` +
+            `${end} <= 2147483647)`;
+        } else {
+          const trips =
+            `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
+            `(${info.boundExpression} - local${info.slot}))`;
+          const last =
+            `(local${indexSlot} + (${trips} - 1) * ${step})`;
+          condition =
+            `(${trips} === 0 || (${trips} <= ${runtimeCoarseTripLimit} && ` +
+            `${step} >= 0 && ` +
+            `local${indexSlot} >= 0 && ${last} < ${candidate.arrayData}.length && ` +
+            `${last} <= 2147483647))`;
+        }
+      } else {
+        const recurrence =
+          quotientProductRecurrence(info, candidate);
+        if (recurrence) {
+          const recurrenceKey = [
+            info.header,
+            recurrence.recurrenceSlot,
+            recurrence.stepSlot,
+            recurrence.divisorSlot,
+            recurrence.multiplierSlot,
+          ].join(":");
+          let shared = quotientProductRangePreambles.get(recurrenceKey);
+          if (!shared) {
+            const prefix =
+              `ssaArrayRangeRecurrence${quotientProductRangePreambles.size}`;
+            const trips =
+              `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
+              `(${info.boundExpression} - local${info.slot}))`;
+            shared = {
+              prefix,
+              declarations: [
+                `const ${prefix}Trips = ${trips};`,
+                `const ${prefix}Last = local${recurrence.recurrenceSlot} + ` +
+                  `(${prefix}Trips - 1) * local${recurrence.stepSlot};`,
+                `const ${prefix}FirstQuotientRaw = ` +
+                  `local${recurrence.recurrenceSlot} / ` +
+                  `local${recurrence.divisorSlot};`,
+                `const ${prefix}LastQuotientRaw = ${prefix}Last / ` +
+                  `local${recurrence.divisorSlot};`,
+                `const ${prefix}FirstProduct = ` +
+                  `Math.trunc(${prefix}FirstQuotientRaw) * ` +
+                  `local${recurrence.multiplierSlot};`,
+                `const ${prefix}LastProduct = ` +
+                  `Math.trunc(${prefix}LastQuotientRaw) * ` +
+                  `local${recurrence.multiplierSlot};`,
+                `const ${prefix}Valid = ${prefix}Trips <= ` +
+                  `${runtimeCoarseTripLimit} && ` +
+                  `local${recurrence.divisorSlot} !== 0 && ` +
+                  `${prefix}Last >= -2147483648 && ` +
+                  `${prefix}Last <= 2147483647 && ` +
+                  `${prefix}FirstQuotientRaw >= -2147483648 && ` +
+                  `${prefix}FirstQuotientRaw <= 2147483647 && ` +
+                  `${prefix}LastQuotientRaw >= -2147483648 && ` +
+                  `${prefix}LastQuotientRaw <= 2147483647 && ` +
+                  `${prefix}FirstProduct >= -2147483648 && ` +
+                  `${prefix}FirstProduct <= 2147483647 && ` +
+                  `${prefix}LastProduct >= -2147483648 && ` +
+                  `${prefix}LastProduct <= 2147483647;`,
+              ],
+            };
+            quotientProductRangePreambles.set(recurrenceKey, shared);
+            preamble.push(...shared.declarations);
+          }
+          const prefix = `ssaArrayRangeInterval${candidateIndex}`;
+          preamble.push(
+            `const ${prefix}FirstIndex = ${shared.prefix}FirstProduct + ` +
+              `local${recurrence.offsetSlot};`,
+            `const ${prefix}LastIndex = ${shared.prefix}LastProduct + ` +
+              `local${recurrence.offsetSlot};`,
+          );
+          condition =
+            `(${shared.prefix}Trips === 0 || (` +
+            `${shared.prefix}Valid && ` +
+            `${candidate.arrayData} !== null && ` +
+            `Math.min(${prefix}FirstIndex, ${prefix}LastIndex) >= 0 && ` +
+            `Math.max(${prefix}FirstIndex, ${prefix}LastIndex) < ` +
+              `${candidate.arrayData}.length && ` +
+            `${prefix}FirstIndex >= -2147483648 && ` +
+            `${prefix}FirstIndex <= 2147483647 && ` +
+            `${prefix}LastIndex >= -2147483648 && ` +
+            `${prefix}LastIndex <= 2147483647))`;
+        } else {
+          const baseSlot = candidate.slots.find((slot) => slot !== info.slot);
+          const start = `(local${baseSlot} + local${info.slot})`;
+          const end = `(local${baseSlot} + ${info.boundExpression})`;
+          condition =
+            `(local${info.slot} >= ${info.boundExpression} || ` +
+            `(${start} >= 0 && ${end} <= ${candidate.arrayData}.length && ` +
+            `${end} <= 2147483647))`;
+        }
+      }
+      const declarations =
+        arrayRangeGuardDeclarations.get(info.header) || [];
+      declarations.push(...preamble, `const ${variable} = ${condition};`);
+      arrayRangeGuardDeclarations.set(info.header, declarations);
+      const variables = arrayRangeGuardVariables.get(info.header) || [];
+      variables.push(variable);
+      arrayRangeGuardVariables.set(info.header, variables);
+      for (const plan of plans) {
+        if (!plan?.lines) continue;
+        plan.lines = plan.lines.map((line) =>
+          line.replace(candidate.marker, variable));
+      }
+    }
+    for (const candidate of arrayRangeCheckCandidates) {
+      for (const plan of plans) {
+        if (!plan?.lines) continue;
+        plan.lines = plan.lines.map((line) =>
+          line.replace(candidate.marker, "false"));
+      }
+    }
     // A fully verified, call-free counted kernel has a finite upper bound and
     // no scheduler-visible operation inside it. Run it as one ordinary
     // JavaScript function so SpiderMonkey can optimize the numeric loops;
@@ -1924,7 +3047,8 @@ class JvmSsaBlockRenderer {
           allCountedLoops.get(header) || guardedAtomicRegionLimit);
       }
     }
-    const maximumCoarseTripCount = Math.max(1, ...coarseCountedLoops.values());
+    const maximumCoarseTripCount =
+      Math.max(1, ...coarseCountedLoops.values());
     const invokeCount = items.reduce((count, item) => {
       const op = opOf(item?.instruction);
       return count + (op?.startsWith("invoke") ? 1 : 0);
@@ -1961,6 +3085,46 @@ class JvmSsaBlockRenderer {
         return (continuationMode ? fallback.continuation : fallback.ordinary)
           .map((fallbackLine) => `${prefix}${fallbackLine}`);
       });
+    const specializeArrayRangeGuardedStores = (lines, guardVariables) => {
+      if (!guardVariables.length) return lines;
+      const output = [];
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        const indentPrefix = /^\s*/.exec(line)?.[0] || "";
+        const trimmed = line.slice(indentPrefix.length);
+        const guarded = guardVariables.some((variable) =>
+          trimmed.startsWith(`if (!${variable} && `));
+        if (!guarded) {
+          output.push(line);
+          continue;
+        }
+        const elseLine = `${indentPrefix}} else {`;
+        const closeLine = `${indentPrefix}}`;
+        let alternate = index + 1;
+        while (alternate < lines.length && lines[alternate] !== elseLine) {
+          alternate += 1;
+        }
+        let close = alternate + 1;
+        while (close < lines.length && lines[close] !== closeLine) close += 1;
+        if (alternate >= lines.length || close >= lines.length) {
+          output.push(line);
+          continue;
+        }
+        specializedArrayRangeAccessCount += 1;
+        // This version is reached only after the exact range predicate above
+        // succeeded. Keep the emitted successful-store arm; the slow loop
+        // retains the complete materialization and exception path.
+        for (const successLine of lines.slice(alternate + 1, close)) {
+          const nestedPrefix = `${indentPrefix}  `;
+          const unindented = successLine.startsWith(nestedPrefix)
+            ? `${indentPrefix}${successLine.slice(nestedPrefix.length)}`
+            : successLine;
+          output.push(unindented);
+        }
+        index = close;
+      }
+      return output;
+    };
     const render = (
       node, continuationMode = useContinuations, directPositional = false,
       loopSafePointBudget = safePointInitialBudget,
@@ -1973,6 +3137,12 @@ class JvmSsaBlockRenderer {
       if (node.t === "straight") {
         const plan = plans[node.block];
         const lines = plan.lines.flatMap((line) => {
+          const directStaticRead =
+            directEntryStaticReadFallbacks.get(line);
+          if (directStaticRead) {
+            return directPositional
+              ? directStaticRead.direct : directStaticRead.ordinary;
+          }
           const fallback = continuationFallbacks.get(line);
           if (!fallback) return [line];
           return continuationMode ? fallback.continuation : fallback.ordinary;
@@ -2010,29 +3180,28 @@ class JvmSsaBlockRenderer {
       }
       if (node.t === "if") {
         const plan = plans[node.block];
-        if (plan.conditionConstant === true) {
-          return ["{", ...indent([
-            ...edgeLines(plan.taken, plan.takenStack ?? plan.stack),
-            ...render(node.then, continuationMode, directPositional,
-              loopSafePointBudget),
-          ]), "}"];
-        }
-        if (plan.conditionConstant === false) {
-          return ["{", ...indent([
-            ...edgeLines(plan.fall, plan.fallStack ?? plan.stack),
-            ...render(node.els, continuationMode, directPositional,
-              loopSafePointBudget),
-          ]), "}"];
-        }
-        return [`if (${plan.condition}) {`, ...indent([
+        const thenLines = [
           ...edgeLines(plan.taken, plan.takenStack ?? plan.stack),
           ...render(node.then, continuationMode, directPositional,
             loopSafePointBudget),
-        ]), "} else {", ...indent([
+        ];
+        const elseLines = [
           ...edgeLines(plan.fall, plan.fallStack ?? plan.stack),
           ...render(node.els, continuationMode, directPositional,
             loopSafePointBudget),
-        ]), "}"];
+        ];
+        if (plan.conditionConstant === true) {
+          return ["{", ...indent(thenLines), "}"];
+        }
+        if (plan.conditionConstant === false) {
+          return ["{", ...indent(elseLines), "}"];
+        }
+        if (thenLines.length === elseLines.length &&
+            thenLines.every((line, index) => line === elseLines[index])) {
+          return ["{", ...indent(thenLines), "}"];
+        }
+        return [`if (${plan.condition}) {`, ...indent(thenLines),
+          "} else {", ...indent(elseLines), "}"];
       }
       if (node.t === "loop") {
         const header = Number(node.label.slice(1));
@@ -2073,6 +3242,7 @@ class JvmSsaBlockRenderer {
               ...invalidateFieldCacheLines,
               `safePointBudget = ${loopSafePointBudget};`,
               "yield { deopt: true, transient: true, reason: 'structured SSA continuation' };",
+              ...refreshEntryStaticCacheLines,
               ...refreshEagerFieldCacheLines,
             ] : [
               "helpers.skipJitOnce(frame);",
@@ -2082,13 +3252,64 @@ class JvmSsaBlockRenderer {
           "}",
         ];
         const coarse = coarseCountedLoops.has(header);
-        return [`${node.label}: while (true) {`,
+        const runtimeCoarse = runtimeCoarseCountedLoops.get(header);
+        const loopBody = render(node.body, continuationMode, directPositional,
+          loopSafePointBudget);
+        const prefix = [
+          ...(arrayRangeGuardDeclarations.get(header) || []),
+          ...(runtimeCoarse
+            ? [
+              `const ${runtimeCoarse.tripsVariable} = ` +
+                `${runtimeCoarse.tripsExpression};`,
+              `const ${runtimeCoarse.variable} = ${runtimeCoarse.condition};`,
+              `if (${runtimeCoarse.variable}) safePointBudget -= ` +
+                `${runtimeCoarse.tripsVariable};`,
+            ]
+            : []),
+        ];
+        const polledLoop = [
+          `${node.label}: while (true) {`,
           ...(coarse ? [] : [
-            "  if (--safePointBudget === 0) {",
+            `  if (${runtimeCoarse
+              ? `!${runtimeCoarse.variable} && ` : ""}` +
+              "--safePointBudget === 0) {",
             ...indent(indent(materialize)), "  }",
           ]),
-          ...indent(render(node.body, continuationMode, directPositional,
-            loopSafePointBudget)), "}"];
+          ...indent(loopBody), "}",
+        ];
+        // A runtime-bounded direct callee normally takes the verified coarse
+        // path, but a combined `!coarse && --budget` test still executes once
+        // per guest backedge. Emit two ordinary JavaScript loops so optimizing
+        // engines see a branch-free numeric hot loop. The slow arm retains the
+        // exact scheduler poll and restoration behavior. Selection depends
+        // solely on the verified trip-count/overflow proof above.
+        if (runtimeCoarse && !coarse && directPositional &&
+            this.versionedRuntimeCoarseLoopsEnabled) {
+          const rangeGuards = this.versionedArrayRangeStoresEnabled
+            ? arrayRangeGuardVariables.get(header) || [] : [];
+          // Put the verified range predicates on the outer fast-loop edge.
+          // Inside that dominated arm optimizing JavaScript engines can fold
+          // every `!rangeGuard && boundsCheck` store branch away. The other
+          // arm retains the exact per-store exception materialization.
+          const fastLoopCondition = [
+            runtimeCoarse.variable, ...rangeGuards,
+          ].join(" && ");
+          const fastLoopBody = specializeArrayRangeGuardedStores(
+            loopBody, rangeGuards);
+          const unpolledLoop = [
+            `${node.label}: while (true) {`,
+            ...indent(fastLoopBody), "}",
+          ];
+          return [
+            ...prefix,
+            `if (${fastLoopCondition}) {`,
+            ...indent(unpolledLoop),
+            "} else {",
+            ...indent(polledLoop),
+            "}",
+          ];
+        }
+        return [...prefix, ...polledLoop];
       }
       if (node.t === "block") {
         return [`${node.label}: {`,
@@ -2130,8 +3351,112 @@ class JvmSsaBlockRenderer {
         "ssaClassInitializationGuard)) { helpers.skipJitOnce(frame); " +
         "return { deopt: true, transient: true, reason: 'structured SSA static entry' }; }"
       : null;
-    const directStaticDeclarations = [...directStaticSites.values()].map((direct) =>
+    const directStaticDeclarations = [...directStaticSites.values()]
+      .filter((direct) => !direct.entryReadCache)
+      .map((direct) =>
       `const ${direct.variable} = helpers.directStaticTargets[${direct.targetId}].fields;`);
+    const lazyStaticDeclarations = [...lazyStaticSites.values()].map((lazy) =>
+      `let ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`);
+    const entryStaticReadDeclarations =
+      [...entryStaticReadCaches.values()].flatMap((cache) => {
+        if (cache.lazy) {
+          const lazy = cache.lazy;
+          const read = `${lazy.variable}.kind === "map" ? ` +
+            `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
+            `${lazy.variable}.fields[${lazy.variable}.key]`;
+          return [
+            `let ${cache.valid} = Boolean(${lazy.variable});`,
+            `let ${cache.value} = ${cache.valid} ? ${read} : undefined;`,
+            ...(cache.data
+              ? [`let ${cache.data} = ${cache.valid} ? ` +
+                `helpers.arrayData(${cache.value}) : null;`]
+              : []),
+          ];
+        }
+        const direct = cache.direct;
+        const fields =
+          `helpers.directStaticTargets[${direct.targetId}].fields`;
+        const read = direct.kind === "map"
+          ? `${fields}.get(${JSON.stringify(direct.key)})`
+          : `${fields}[${JSON.stringify(direct.key)}]`;
+        return [
+          `let ${cache.value} = ${read};`,
+          ...(cache.data
+            ? [`let ${cache.data} = helpers.arrayData(${cache.value});`]
+            : []),
+        ];
+      });
+    // Scalar positional regions have already passed the all-owner
+    // initialization guard and have not performed a guest effect yet. Resolve
+    // any cold getstatic location at that entry edge, snapshot its current
+    // value, and let the generated body use the scalar directly. This removes
+    // linkage/value-validity branches from nested pixel, codec, and mixer
+    // loops while retaining canonical class initialization on the fallback
+    // path. The ordinary frame-backed entry keeps its lazy per-bytecode logic.
+    const directEntryStaticReadDeclarations =
+      !this.directEntryStaticLinkingEnabled
+        ? entryStaticReadDeclarations
+        : [...entryStaticReadCaches.values()].flatMap((cache) => {
+          if (!cache.lazy) {
+            const direct = cache.direct;
+            const fields =
+              `helpers.directStaticTargets[${direct.targetId}].fields`;
+            const read = direct.kind === "map"
+              ? `${fields}.get(${JSON.stringify(direct.key)})`
+              : `${fields}[${JSON.stringify(direct.key)}]`;
+            return [
+              `let ${cache.value} = ${read};`,
+              ...(cache.data
+                ? [`let ${cache.data} = helpers.arrayData(${cache.value});`]
+                : []),
+            ];
+          }
+          const lazy = cache.lazy;
+          const read = `${lazy.variable}.kind === "map" ? ` +
+            `${lazy.variable}.fields.get(${lazy.variable}.key) : ` +
+            `${lazy.variable}.fields[${lazy.variable}.key]`;
+          return [
+            `let ${cache.value};`,
+            `if (${lazy.variable}) {`,
+            `  ${cache.value} = ${read};`,
+            "} else {",
+            `  ${cache.value} = helpers.getStaticSyncAt(${lazy.site});`,
+            `  if (${cache.value} === helpers.staticDeopt()) ` +
+              "{ return helpers.asyncInvokeSentinel(); }",
+            `  ${lazy.variable} = helpers.fieldSites[${lazy.site}].staticTarget;`,
+            `  if (${lazy.variable}) ` +
+              "helpers.structuredSsa.lazyStaticTargetLinkCount += 1;",
+            "}",
+            ...(cache.data
+              ? [`let ${cache.data} = helpers.arrayData(${cache.value});`]
+              : []),
+          ];
+        });
+    // A sync call site may publish a positional target after the caller was
+    // compiled. Snapshot the current monomorphic record once per generated
+    // entry instead of reloading the site table and target object in every
+    // loop iteration. A cold snapshot simply uses the canonical linker for
+    // this entry; the next entry observes the published target. The target's
+    // own class/debug/epoch guards remain authoritative.
+    const positionalCallDeclarations = [...callSites]
+      .filter(([, site]) => site.id !== null && site.id !== undefined)
+      .flatMap(([index, site]) => [
+        `const ${positionalCallSiteVariable(index)} = ` +
+          `helpers.syncCallSites[${site.id}];`,
+        `const ${positionalCallTargetVariable(index)} = ` +
+          `!helpers.profileMethods && ${positionalCallSiteVariable(index)} && ` +
+          `${positionalCallSiteVariable(index)}.fastPositional && ` +
+          `(${positionalCallSiteVariable(index)}.fastPositional.debugGuarded || ` +
+          `!helpers.jvm.debugManager.isClassJitDeopted(` +
+          `${positionalCallSiteVariable(index)}.fastPositional.lookupClass)) ` +
+          `? ${positionalCallSiteVariable(index)}.fastPositional : null;`,
+        `const ${positionalCallInvokeVariable(index)} = ` +
+          `${positionalCallTargetVariable(index)} && ` +
+          `${positionalCallTargetVariable(index)}.invoke;`,
+        `const ${positionalCallReceiverVariable(index)} = ` +
+          `${positionalCallTargetVariable(index)} && ` +
+          `${positionalCallTargetVariable(index)}.receiverType;`,
+      ]);
     const fieldReadCacheDeclarations = [...fieldReadCaches.values()].flatMap((cache) => [
       `let ${cache.object} = null;`,
       `let ${cache.value};`,
@@ -2139,18 +3464,23 @@ class JvmSsaBlockRenderer {
       ...(cache.isArray ? [`let ${cache.data} = null;`] : []),
     ]);
     const fieldReadCacheInitializations = [...fieldReadCaches.values()]
-      .filter((cache) => cache.eagerThis)
+      .filter((cache) =>
+        cache.eagerLocal !== null && cache.eagerLocal !== undefined)
       .flatMap((cache) => [
-        `${cache.object} = local0;`,
-        `${cache.value} = ${cache.directKey
-          ? `(local0.fields && local0.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
-            `local0.fields[${JSON.stringify(cache.directKey)}] : ` +
-            `helpers.getFieldAt(${cache.site}, local0))`
-          : `helpers.getFieldAt(${cache.site}, local0)`};`,
+        `if (local${cache.eagerLocal} !== null && ` +
+          `local${cache.eagerLocal} !== undefined) {`,
+        `  ${cache.object} = local${cache.eagerLocal};`,
+        `  ${cache.value} = ${cache.directKey
+          ? `(local${cache.eagerLocal}.fields && ` +
+            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] !== undefined ? ` +
+            `local${cache.eagerLocal}.fields[${JSON.stringify(cache.directKey)}] : ` +
+            `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal}))`
+          : `helpers.getFieldAt(${cache.site}, local${cache.eagerLocal})`};`,
         ...(cache.isArray ? [
-          `${cache.data} = helpers.arrayData(${cache.value});`,
+          `  ${cache.data} = helpers.arrayData(${cache.value});`,
         ] : []),
-        `${cache.valid} = true;`,
+        `  ${cache.valid} = true;`,
+        "}",
       ]);
     const guardedStaticBooleanEntryGuard = guardedStaticBooleanSites.size
       ? `if (${[...guardedStaticBooleanSites.values()].map((direct) => `((${
@@ -2175,6 +3505,32 @@ class JvmSsaBlockRenderer {
     const spillSlots = [...new Set([
       ...entryLocalInitialValues.keys(), ...renderedAssignedLocalSlots,
     ])].sort((a, b) => a - b);
+    const renderedTreeSource = renderedTree.join("\n");
+    const entryArrayDataDeclarations = [...entryArrayLocalSlots]
+      .filter((slot) =>
+        declaredLocals.includes(slot) &&
+        renderedTreeSource.includes(entryArrayDataVariable(slot)))
+      .map((slot) =>
+        `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`);
+    const guardedArrayDataVariables = [
+      ...entryArrayDataDeclarations.map((line) =>
+        /^const ([A-Za-z0-9_$]+)/.exec(line)?.[1]).filter(Boolean),
+      ...[...entryStaticReadCaches.values()]
+        .filter((cache) => !cache.lazy)
+        .map((cache) => cache.data).filter(Boolean),
+    ];
+    const guardedArrayDataCondition = guardedArrayDataVariables.length
+      ? guardedArrayDataVariables.map((data) => `${data} === null`).join(" || ")
+      : null;
+    const framedArrayDataGuard = guardedArrayDataCondition
+      ? `if (${guardedArrayDataCondition}) { helpers.skipJitOnce(frame); ` +
+        "return { deopt: true, transient: true, reason: " +
+        "'non-canonical primitive array storage' }; }"
+      : null;
+    const directArrayDataGuard = guardedArrayDataCondition
+      ? `if (${guardedArrayDataCondition}) { ` +
+        "return helpers.asyncInvokeSentinel(); }"
+      : null;
     // Small acyclic integral decision trees (character maps, classifiers,
     // clamps, flag decoders, and similar leaves) are often called once per
     // pixel/glyph.  Their frame-backed positional wrapper can cost more than
@@ -2214,7 +3570,7 @@ class JvmSsaBlockRenderer {
       fieldReadCaches.size === 0,
     );
     for (let index = 0; index < items.length && directPositionalEligible; index += 1) {
-      if (depths[index] === undefined) continue;
+      if (depths[index] === undefined || !normalReachableItems.has(index)) continue;
       const instruction = items[index]?.instruction;
       const op = opOf(instruction);
       if (!op) continue;
@@ -2235,56 +3591,77 @@ class JvmSsaBlockRenderer {
         }
       }
     }
-    // A second direct ABI covers effectful primitive-array leaves such as
-    // samplers and pixel writers.  These methods are still acyclic and
-    // call-free, but getfield, array access, and integer division can throw.
-    // Their normal path receives scalar arguments and creates no Frame.  Every
-    // throwing instruction already emits materialization at its exact bytecode
-    // PC; the direct body lazily creates and restores the omitted Frame only
-    // when that exceptional path is actually taken.
+    // A second direct ABI covers effectful primitive-array regions such as
+    // samplers, pixel writers, codecs, and mixers. It may contain structured
+    // loops and static calls; neither property requires a child Frame on the
+    // normal path. Every safe point or throwing instruction already
+    // materializes its exact bytecode PC, locals, and operand stack. The
+    // direct body lazily creates and restores the omitted Frame only when one
+    // of those uncommon paths is actually taken.
     const restoringDirectPositionalOps = new Set([
       ...directPositionalOps,
-      "aload", "aload_0",
+      "aconst_null",
+      "aload", "aload_0", "aload_1", "aload_2", "aload_3",
+      "astore", "astore_0", "astore_1", "astore_2", "astore_3",
       "getfield",
+      "putstatic",
+      "arraylength",
       "iaload", "saload", "baload", "caload",
       "iastore", "sastore", "bastore", "castore",
+      "ifnull", "ifnonnull", "if_acmpeq", "if_acmpne",
       "idiv", "irem",
+      "invokestatic", "invokevirtual",
       "return",
     ]);
     const directPrimitiveDescriptors = new Set([
       "Z", "B", "C", "S", "I",
       "[Z", "[B", "[C", "[S", "[I",
     ]);
+    const restoringDirectParameterType = (type) =>
+      directIntegralTypes.has(type) ||
+      ["boolean[]", "byte[]", "char[]", "short[]", "int[]"].includes(type) ||
+      typeof type === "string" &&
+        !["void", "long", "float", "double"].includes(type);
+    const referenceStaticPositionalEnabled =
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_REFERENCE_STATIC_POSITIONAL === "1");
+    const effectfulFieldPositionalEnabled =
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_EFFECTFUL_FIELD_POSITIONAL === "1");
+    let restoringDirectRejection = null;
     let restoringDirectPositionalEligible = Boolean(
       !directPositionalEligible &&
       directMethodDescriptor &&
       (directMethodDescriptor.returnType === "void" ||
         directIntegralTypes.has(directMethodDescriptor.returnType)) &&
-      directMethodDescriptor.params.every((type) => directIntegralTypes.has(type)) &&
+      directMethodDescriptor.params.every(restoringDirectParameterType) &&
       directMethodOwner &&
-      structured.loopHeaders.size === 0 &&
-      (code.code.exceptionTable || []).length === 0 &&
       [...fieldReadCaches.values()].every((cache) =>
-        cache.eagerThis && cache.directKey),
+        cache.directKey &&
+        (effectfulFieldPositionalEnabled ||
+          cache.eagerLocal !== null && cache.eagerLocal !== undefined)),
     );
+    if (!restoringDirectPositionalEligible) {
+      restoringDirectRejection = directPositionalEligible
+        ? "non-restoring direct entry already selected"
+        : "descriptor, owner, return type, or field-cache shape";
+    }
     for (let index = 0;
       index < items.length && restoringDirectPositionalEligible;
       index += 1) {
-      if (depths[index] === undefined) continue;
+      if (depths[index] === undefined || !normalReachableItems.has(index)) continue;
       const instruction = items[index]?.instruction;
       const op = opOf(instruction);
       if (!op) continue;
       if (!restoringDirectPositionalOps.has(op)) {
         restoringDirectPositionalEligible = false;
+        restoringDirectRejection = `unsupported normal opcode ${op} at ${index}`;
         break;
       }
       if ((op === "ldc" || op === "ldc_w") &&
           !Number.isInteger(Number(instruction.arg?.value ?? instruction.arg))) {
         restoringDirectPositionalEligible = false;
-        break;
-      }
-      if (op === "aload" && localIndex(instruction, op) !== 0) {
-        restoringDirectPositionalEligible = false;
+        restoringDirectRejection = `non-integral constant at ${index}`;
         break;
       }
       if (op === "getfield") {
@@ -2292,20 +3669,80 @@ class JvmSsaBlockRenderer {
         const plan = site === undefined ? null : this.jit.fieldSites[site];
         const cache = fieldReadCacheSites.get(index);
         if (!plan || !directPrimitiveDescriptors.has(plan.descriptor) ||
-            !cache?.eagerThis || !cache.directKey) {
+            !cache?.directKey ||
+            (!effectfulFieldPositionalEnabled &&
+              (cache.eagerLocal === null || cache.eagerLocal === undefined))) {
           restoringDirectPositionalEligible = false;
+          restoringDirectRejection = `unresolved primitive instance field at ${index}`;
           break;
         }
       }
       if (op === "getstatic") {
         const direct = directStaticSites.get(index);
+        const lazy = lazyStaticSites.get(index);
         const descriptor = instruction.arg?.[2]?.[1];
-        if (!direct || !directPrimitiveDescriptors.has(descriptor)) {
+        const scalarOrReference = directPrimitiveDescriptors.has(descriptor) ||
+          referenceStaticPositionalEnabled &&
+          typeof descriptor === "string" &&
+          (descriptor.startsWith("L") || descriptor.startsWith("["));
+        if ((!direct && !lazy) || !scalarOrReference) {
           restoringDirectPositionalEligible = false;
+          restoringDirectRejection =
+            `unresolved direct or linkable static field at ${index}`;
           break;
         }
       }
     }
+    const structuredPositionalTrace = typeof process !== "undefined" &&
+      process.env ? process.env.JVM_TRACE_STRUCTURED_POSITIONAL || "" : "";
+    const structuredMethodKey =
+      `${directMethodOwner || "?"}.${method.name}${method.descriptor}`;
+    if (structuredPositionalTrace &&
+        structuredMethodKey.includes(structuredPositionalTrace)) {
+      console.error("[structured-positional]", JSON.stringify({
+        method: structuredMethodKey,
+        loops: structured.loopHeaders.size,
+        normalItems: normalReachableItems.size,
+        direct: directPositionalEligible,
+        restoring: restoringDirectPositionalEligible,
+        rejection: restoringDirectPositionalEligible
+          ? null : restoringDirectRejection,
+      }));
+    }
+    const materializeHelperDeclarations = () =>
+      [...materializeDepths].sort((left, right) => left - right)
+        .flatMap((depth) => {
+          const operands = Array.from(
+            {length: depth}, (_unused, index) => `operand${index}`);
+          return [
+            `function ssaMaterialize${depth}(pc${
+              operands.length ? `, ${operands.join(", ")}` : ""}) {`,
+            "  spillLocals();",
+            ...operands.map((operand, index) =>
+              `  stack[${index}] = ${operand};`),
+            `  stack.length = ${depth};`,
+            "  helpers.materialize(frame, locals, stack, pc);",
+            "}",
+          ];
+        });
+    const inlineMaterializeCalls = (lines) =>
+      lines.flatMap((line) => {
+        const match =
+          /^(\s*)ssaMaterialize(\d+)\((.*)\);$/.exec(line);
+        if (!match) return [line];
+        const prefix = match[1];
+        const depth = Number(match[2]);
+        const values = match[3].split(",").map((value) => value.trim());
+        if (values.length !== depth + 1) return [line];
+        const [pc, ...operands] = values;
+        return [
+          `${prefix}spillLocals();`,
+          ...operands.map((operand, index) =>
+            `${prefix}stack[${index}] = ${operand};`),
+          `${prefix}stack.length = ${depth};`,
+          `${prefix}helpers.materialize(frame, locals, stack, ${pc});`,
+        ];
+      });
     const buildBody = (
       tree, entrySafePointBudget = safePointInitialBudget,
     ) => ["'use strict';",
@@ -2314,19 +3751,22 @@ class JvmSsaBlockRenderer {
       staticInitializationGuardDeclaration,
       staticEntryGuard,
       ...directStaticDeclarations,
+      ...lazyStaticDeclarations,
+      ...entryStaticReadDeclarations,
+      ...positionalCallDeclarations,
       guardedStaticBooleanEntryGuard,
-      "helpers.structuredSsa.runCount += 1;",
+      this.runCountersEnabled
+        ? "helpers.structuredSsa.runCount += 1;" : null,
       `let safePointBudget = ${entrySafePointBudget};`,
       ...declaredLocals.map((i) => `${immutableEntryLocals.has(i) ? "const" : "let"} local${i} = ${
         entryLocalInitialValues.has(i) ? entryLocalInitialValues.get(i) : `locals[${i}]`};`),
-      ...[...entryArrayLocalSlots]
-        .filter((slot) => declaredLocals.includes(slot))
-        .map((slot) =>
-          `const ${entryArrayDataVariable(slot)} = helpers.arrayData(local${slot});`),
+      ...entryArrayDataDeclarations,
       ...fieldReadCacheDeclarations,
       ...fieldReadCacheInitializations,
+      framedArrayDataGuard,
       `const spillLocals = () => {${spillSlots.map((i) => ` locals[${i}] = ${
         immutableEntryLocals.has(i) ? entryLocalInitialValues.get(i) : `local${i}`};`).join("")} };`,
+      ...materializeHelperDeclarations(),
       ...declarations, ...tree];
     const body = buildBody(renderedTree);
     const generatedSource = body.join("\n");
@@ -2364,7 +3804,7 @@ class JvmSsaBlockRenderer {
           "!helpers.structuredSsa.verifyClassInitializationGuard(" +
           "ssaDirectClassInitializationGuard))";
         const directGuardConditions = [
-          "helpers.needsBytecodeChecks()",
+          "(!nestedEntryGuarded && helpers.needsBytecodeChecks())",
           directInitializationCondition,
         ];
         const directGuard = directGuardConditions.length
@@ -2385,13 +3825,20 @@ class JvmSsaBlockRenderer {
           directInitializationGuardDeclaration,
           directGuard,
           ...directStaticDeclarations,
+          ...lazyStaticDeclarations,
+          ...directEntryStaticReadDeclarations,
+          ...positionalCallDeclarations,
           directBooleanGuard,
-          "helpers.structuredSsa.runCount += 1;",
+          this.runCountersEnabled
+            ? "helpers.structuredSsa.runCount += 1;" : null,
+          `let safePointBudget = ${safePointInitialBudget};`,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
               entryLocalInitialValues.has(index)
                 ? entryLocalInitialValues.get(index)
                 : entryArguments.get(index) || "undefined"};`),
+          ...entryArrayDataDeclarations,
+          directArrayDataGuard,
           ...declarations,
           ...expandContinuationFallbacks(
             render(structured.tree, false, true), false),
@@ -2399,13 +3846,22 @@ class JvmSsaBlockRenderer {
         directPositionalBody = this.jit.createGeneratedFunction(
           method,
           "ssa-direct-positional",
-          ["helpers", ...argumentNames],
+          ["helpers", ...argumentNames, "thread", "nestedEntryGuarded"],
           directPositionalSource,
         );
       }
       let restoringDirectPositionalBody = null;
       let restoringDirectPositionalSource = null;
       if (restoringDirectPositionalEligible) {
+        // A restoring entry is an already-verified synchronous intermethod
+        // region. Give it a larger scalar quantum than a scheduler-owned
+        // Frame: nested calls retain their own guards and safe points, while
+        // an unusually large local loop still restores the exact JVM state
+        // when this finite budget expires.
+        const restoringDirectSafePointBudget = Math.min(
+          1_000_000,
+          safePointInitialBudget * this.restoringDirectBudgetMultiplier,
+        );
         const receiverSlots = methodIsStatic ? 0 : 1;
         const argumentCount = directMethodDescriptor.params.length + receiverSlots;
         const argumentNames = Array.from(
@@ -2433,9 +3889,8 @@ class JvmSsaBlockRenderer {
           "!helpers.structuredSsa.verifyClassInitializationGuard(" +
           "ssaRestoringClassInitializationGuard))";
         const directGuardConditions = [
-          "helpers.profileMethods",
-          "helpers.needsBytecodeChecks()",
-          "thread.status !== 'runnable'",
+          "(!nestedEntryGuarded && (helpers.profileMethods || " +
+            "helpers.needsBytecodeChecks() || thread.status !== 'runnable'))",
           restoringInitializationCondition,
         ];
         const directGuard =
@@ -2466,13 +3921,20 @@ class JvmSsaBlockRenderer {
         ];
         const directBody = [
           ...directStaticDeclarations,
+          ...lazyStaticDeclarations,
+          ...directEntryStaticReadDeclarations,
+          ...positionalCallDeclarations,
           directBooleanGuard,
-          "helpers.structuredSsa.runCount += 1;",
+          this.runCountersEnabled
+            ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
+          `let safePointBudget = ${restoringDirectSafePointBudget};`,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
               entryLocalInitialValues.has(index)
                 ? entryLocalInitialValues.get(index)
                 : entryArguments.get(index) || "undefined"};`),
+          ...entryArrayDataDeclarations,
+          directArrayDataGuard,
           "function spillLocals() {",
           "  if (frame === null) {",
           ...initializeFrame.map((line) => `    ${line}`),
@@ -2480,17 +3942,20 @@ class JvmSsaBlockRenderer {
           ...spillSlots.map((index) => `  locals[${index}] = ${
             immutableEntryLocals.has(index)
               ? entryLocalInitialValues.get(index) : `local${index}`};`),
+          "  plan.restoreFrame(thread, frame, restorationDepth);",
           "}",
           ...fieldReadCacheDeclarations,
           ...fieldReadCacheInitializations,
           ...declarations,
-          ...expandContinuationFallbacks(
-            render(structured.tree, false, true), false),
+          ...inlineMaterializeCalls(expandContinuationFallbacks(
+            render(structured.tree, false, true,
+              restoringDirectSafePointBudget), false)),
         ].filter(Boolean);
         restoringDirectPositionalSource = [
           "'use strict';",
           restoringInitializationGuardDeclaration,
           directGuard,
+          "const restorationDepth = thread.callStack.items.length;",
           "let frame = null;",
           "let locals = null;",
           "let stack = null;",
@@ -2499,7 +3964,7 @@ class JvmSsaBlockRenderer {
           "} catch (error) {",
           "  if (frame !== null) {",
           "    helpers.structuredSsa.restoredDirectExceptionFrameCount += 1;",
-          "    plan.restoreFrame(thread, frame);",
+          "    plan.restoreFrame(thread, frame, restorationDepth);",
           "  }",
           "  throw error;",
           "}",
@@ -2507,7 +3972,8 @@ class JvmSsaBlockRenderer {
         restoringDirectPositionalBody = this.jit.createGeneratedFunction(
           method,
           "ssa-direct-restoring-positional",
-          ["helpers", "plan", ...argumentNames, "thread"],
+          ["helpers", "plan", ...argumentNames, "thread",
+            "nestedEntryGuarded"],
           restoringDirectPositionalSource,
         );
       }
@@ -2673,7 +4139,8 @@ class JvmSsaBlockRenderer {
       generated.jvmFramelessPositional = !useContinuations;
       generated.jvmDirectPositionalBody = directPositionalBody;
       generated.jvmDirectPositionalSource = directPositionalSource;
-      if (restoringDirectPositionalBody) {
+      if (restoringDirectPositionalBody &&
+          this.jit.guestKernelOraclesEnabled) {
         const semanticSampler =
           HandwrittenBilinearSampler.install(this.jit, method);
         if (semanticSampler) {
@@ -2699,6 +4166,17 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredSentinelArrayLoadCount = sentinelArrayLoadCount;
       generated.jvmStructuredEliminatedArrayStoreCheckCount =
         eliminatedArrayStoreCheckCount;
+      generated.jvmStructuredArrayRangeGuardCount =
+        arrayRangeCheckCandidates.length;
+      generated.jvmStructuredBoundedIndexRangeCount =
+        arrayRangeCheckCandidates.filter(
+          (candidate) => candidate.kind === "bounded-index").length;
+      generated.jvmStructuredRecurrenceRangeCount =
+        quotientProductRangePreambles.size;
+      generated.jvmStructuredCyclicRangeCount =
+        cyclicArrayRangeCandidates.size;
+      generated.jvmStructuredSpecializedArrayRangeAccessCount =
+        specializedArrayRangeAccessCount;
       generated.jvmStructuredGuardedBooleanSiteCount = guardedStaticBooleanSites.size;
       generated.jvmStructuredDeclaredLocalCount = declaredLocals.length;
       generated.jvmStructuredSpilledLocalCount = spillSlots.length;
@@ -2706,8 +4184,16 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredFieldReadCacheCount = fieldReadCaches.size;
       generated.jvmStructuredEagerThisFieldCount = [...fieldReadCaches.values()]
         .filter((cache) => cache.eagerThis).length;
+      generated.jvmStructuredEagerEntryFieldCount = [...fieldReadCaches.values()]
+        .filter((cache) =>
+          cache.eagerLocal !== null && cache.eagerLocal !== undefined).length;
       generated.jvmStructuredCoarseCountedLoopCount = coarseCountedLoops.size;
       generated.jvmStructuredSafePointBudget = safePointInitialBudget;
+      generated.jvmStructuredRestoringDirectSafePointBudget =
+        restoringDirectPositionalEligible
+          ? Math.min(1_000_000, safePointInitialBudget *
+            this.restoringDirectBudgetMultiplier)
+          : 0;
       generated.jvmStructuredLoopWorkEstimate = loopWorkEstimate;
       generated.jvmStructuredAtomicBoundedLoops = atomicBoundedLoops;
       generated.jvmStructuredBoundedIterationProduct =

@@ -5797,3 +5797,544 @@ audio context and these live contracts:
 
 The deployed production bundle SHA-256 is
 `2fa7b65f454986bbdbd7849260b661817f67a35b30185bd0213c6493be1c8145`.
+
+## 2026-07-30: generic SSA regions replace production guest-kernel fingerprints
+
+Complete raster, polygon, affine, sampler, and fused wrapper translations are
+no longer production optimizer tiers. They remain available only as explicit
+differential oracles through `guestKernelOracles: true` or
+`JVM_ENABLE_GUEST_KERNEL_ORACLES=1`. `rendererPipeline` now enables the generic
+scalar and structured-SSA tiers but does not implicitly enable fused regions.
+The default compiler therefore does not select a translation from a guest
+class name, method name, complete descriptor family, or whole-algorithm opcode
+fingerprint.
+
+The retained generic work is derived from verified bytecode and its normal
+CFG:
+
+- disconnected exception-reporting handlers do not affect normal-region
+  eligibility;
+- primitive-array parameters, structured loops, and static calls can use the
+  restoring positional ABI;
+- the normal path receives scalar operands and creates no child `Frame`;
+- safe points and throwing operations lazily materialize the exact bytecode
+  PC, locals, and operand stack;
+- nested omitted frames are inserted at their recorded entry depth, restoring
+  outer-to-inner JVM order;
+- `JVM_TRACE_STRUCTURED_POSITIONAL=<substring>` reports a method's generic
+  positional decision and rejected opcode without changing selection.
+
+The focused JIT test builds an arbitrarily named Java array loop containing a
+separate arithmetic helper. It verifies results derived from the helper's
+actual bytecode, absence of a child frame on the warmed normal path, and exact
+method/PC/locals restoration for a bounds exception on a later iteration. The
+complete focused command passed 996/996 assertions:
+
+```sh
+timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
+```
+
+Node logo measurements used Node `v26.4.0`, java-tools base commit
+`aaa2c1efdcb01c1b4e59ad638e6730ebb7a78b14`, dirty patches saved in each
+artifact directory, untouched `dekobloko.jar` SHA-256
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+and generated-class-tree SHA-256
+`b2e7bce0e174a31bb0a0984f6bde2e2312e2ed5c009b058e29c4145c3cfce411`.
+The gate set was `JVM_ENABLE_RENDERER_PIPELINE=1`, structured Wasm enabled,
+fused regions disabled, fake real-time clock enabled, sample stride 10, and a
+36-image window.
+
+| retained default stage | full-logo FPS | warm-logo FPS | runtime errors |
+|---|---:|---:|---:|
+| generic SSA before broad oracle-probe removal | 1.628 | n/a | 0 |
+| oracle probing gated off | 4.218 | 6.835 | 0 |
+| restoring positional array loops | 5.205 | 7.294 | 0 |
+| normal-CFG reachability | 5.445 | 7.616 | 0 |
+
+The explicit historical fused-region control reached 36.225 full-logo FPS and
+48.320 warm-logo FPS. That number remains useful as a code-shape ceiling, but
+it is not a production result because the large renderer-family recognizer is
+disabled by default.
+
+Two generic dispatch experiments were measured and removed. Eager side-effect-
+free static linkage produced long synchronous compilation/atomic chains and
+fell to 4.352 FPS. Feeding verifier-produced scalar callees directly from the
+ordinary generated-sync stack machine was semantically stable after narrowing
+but fell to 1.997 FPS. Neither negative path is present in the final bundle.
+
+The production bundle built successfully with the existing four webpack
+warnings. Its SHA-256 is
+`0bee53516e2dd7b62a8090097b98f357da17c2cead4ffb933cb8e2bd2e384eff`.
+These changes improve the generic baseline substantially, but they do not meet
+the 20 FPS acceptance target; no Firefox FPS claim is made for this pass.
+
+## 2026-07-30: bytecode-derived fused regions reach the handwritten target
+
+The conclusion immediately above is superseded for the moving-logo renderer
+family. Fused regions are now a production compiler tier and are enabled by
+default, with `fusedRegions: false` or
+`JVM_DISABLE_FUSED_REGIONS=1` retaining the differential control. The compiler
+does not contain Deko Bloko class or method names. It discovers a region by
+following verified calls from a wrapper into a raster and then into a
+primitive-array store loop. Descriptors, CFG reachability, JVM stack depths,
+callee multiplicity, initialized-class state, and bytecode identities are
+guards; a complete guest algorithm or name-based substitution is not.
+
+The generated normal path passes scalar operands positionally, emits lexical
+JavaScript loops, and does not create child `Frame` objects or use generic
+invoke dispatch. Class initialization, debugger state, tracing, and scheduler
+state are checked before any fused side effect. A throwing operation records
+its exact bytecode PC and operands, and lazily restores omitted callee frames
+in JVM order before rethrowing through the normal dispatcher.
+
+The focused compiler and hot-loop proxy command passed 1060/1060 assertions:
+
+```sh
+timeout 90s node node_modules/tape/bin/tape \
+  test/jitCompiler.test.js test/fusedHotLoopRegression.test.js
+```
+
+The generic raster microbenchmark was bit exact with its handwritten
+differential oracle and was within 3.2% of it:
+
+| implementation | ns/pixel | destination checksum | source checksum |
+|---|---:|---:|---:|
+| generic SSA | 4.275 | 1,530,407,741 | 838,806,109 |
+| handwritten oracle | 4.142 | 1,530,407,741 | 838,806,109 |
+
+The exact 250-state Jagex-logo timeline then ran at 80.70 FPS in Node with a
+9.91 ms median guest-render time. It produced 225 unique surfaces and all
+expected hashes:
+
+| property | value |
+|---|---:|
+| changed transitions | 224 / 249 |
+| sequence hash | 1,711,060,353 |
+| first surface hash | 2,929,241,493 |
+| last surface hash | 3,053,477,317 |
+| fused direct runs | 653,604 |
+
+This run used Node `v26.4.0`, Deko Bloko JAR SHA-256
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+generated class tree SHA-256
+`b2e7bce0e174a31bb0a0984f6bde2e2312e2ed5c009b058e29c4145c3cfce411`,
+java-tools base revision
+`aaa2c1efdcb01c1b4e59ad638e6730ebb7a78b14`, and dirty tracked trees in
+both repositories. The benchmark explicitly records
+`warmupThreshold: 0`, `preferWholeMethodJs: true`,
+`rendererPipeline: true`, `fusedRegions: true`,
+`DEKOBLOKO_ANIMATION_LOOPS=1`, and
+`DEKOBLOKO_ANIMATION_WARMUPS=1`.
+
+This is a renderer-family breakthrough, not yet a whole-game performance
+claim. A full original-JAR, simple-mode Node launch to the main menu measured
+only 1.36 presented FPS and 1.41 dirty frames/s over its fixed window, despite
+502,496 direct fused entries. A previous run of the same route after the
+effectful-field positional change measured 1.61 FPS, versus 1.12 FPS before
+that change; the remaining menu path is both slow and variable. Firefox
+diagnostic session `ms71gh94-hrzxtbjn`, using the older runtime SHA-256
+`f1c1ccdcc2a35f1c64783889f642f8b6fb03c90dde2271d23039a509a3fd8c2c`,
+reported 3.0 FPS and attributed sampled synchronous time primarily to a small
+sprite/text wrapper-caller chain and its alpha-blending raster. Canvas upload
+was not the dominant cost.
+
+A gated, name-independent experiment also admitted one-slot reference
+parameters, reference comparisons/casts, and static stores to the restoring
+positional ABI. It selected the repeated sprite wrapper and passed 1069/1069
+focused assertions, but the full menu reached only 1.62 FPS. That is within
+the preceding variance and is not a meaningful step toward 30 FPS, so the
+broadened runtime path was removed.
+
+The rebuilt live bundle on port 3771 has SHA-256
+`117761466883a0096382a2797262cf2e8846d29f862521b8c35ba0ee0c302ab8`.
+No Firefox acceptance result is claimed for it yet; a new report must identify
+that exact runtime before its FPS is comparable.
+
+## 2026-07-30: SSA reaches the handwritten raster target
+
+The clipped-span and moving-raster proxies now compare the generated SSA body
+with the handwritten structural oracle through the same nested, positional
+calling convention used by an SSA caller. No guest class name, method name, or
+descriptor is used for selection.
+
+Two generic changes closed the remaining generated-code gap:
+
+- A runtime-bounded counted loop is versioned into a branch-free fast loop and
+  a slow loop that retains the scheduler poll and exact frame restoration.
+  Selection uses the verified trip count, positive induction step, overflow
+  proof, and a 1,024-iteration ceiling.
+- A positional child entered synchronously from an already-guarded SSA caller
+  receives a trusted-entry bit. The child omits only the redundant
+  debugger/profile/thread-state checks. Its class-initialization epoch guard,
+  live static reads, bounds/null behavior, scheduler slow arm, and exact
+  exception-frame reconstruction remain active. A standalone entry does not
+  receive that bit and retains the complete guard.
+
+The ABBA benchmark harness itself had one important measurement bug: it called
+both implementations through a shared `target.invoke()` site. V8 repeatedly
+deoptimized that harness site for a wrong call target/map. The checked-in
+benchmarks now alternate batches while using separate monomorphic inner call
+sites. This changes measurement only, not generated runtime code.
+
+Five fresh-process span runs with the corrected harness measured a
+trusted-entry median ratio of **1.0081** versus the handwritten oracle. The
+same generated body with `SSA_TRUSTED_NESTED=0` measured **1.1313**, directly
+attributing the remaining entry overhead. Seven earlier fresh trusted runs
+gave a median ratio of **1.0026**. Every run produced the same destination
+checksum. The complete moving raster was already on the favorable side of
+parity: five fresh processes measured a median ratio of **0.9645** (generated
+SSA faster), again with exact source and destination checksums.
+
+The reproducible commands were:
+
+```sh
+SSA_SPAN_ROUNDS=13 SSA_SPAN_WARMUPS=8 \
+SSA_SPAN_ITERATIONS=250000 SSA_TRUSTED_NESTED=1 \
+node scripts/benchmarkSsaSpanKernel.js
+
+SSA_RASTER_ROUNDS=9 SSA_RASTER_WARMUPS=5 \
+SSA_RASTER_ITERATIONS=30000 \
+node scripts/benchmarkSsaRasterKernels.js
+
+timeout 90s node node_modules/tape/bin/tape \
+  test/jitCompiler.test.js test/fusedHotLoopRegression.test.js
+```
+
+The focused correctness suite passed **1,083/1,083** assertions, including
+class-initialization fallback-before-effects, debugger fallback, null/bounds
+exceptions, nested omitted-frame restoration, direct scalar calls, and the
+generic fused hot-loop proxy.
+
+The browser report submitted immediately before this change was session
+`ms71gh94-hrzxtbjn`. It used Firefox 153 and runtime SHA-256
+`f1c1ccdcc2a35f1c64783889f642f8b6fb03c90dde2271d23039a509a3fd8c2c`,
+not the later bundle. It reached the game and reported 2.8–3.0 presented FPS.
+Between 142 and 537 seconds it executed roughly 95.2 million structured-SSA
+entries and 16.0 million ordinary frameless entries while presenting almost
+no frames. Sampled synchronous ownership was concentrated in a four-call
+drawing wrapper, the main panel renderer, and sprite/raster children. Canvas
+upload was not the reported bottleneck. This makes intermethod scalar entry
+cost and fatter generic regions the next whole-game target even though the
+isolated raster kernels themselves have now reached parity.
+
+Measurements used Node `v26.4.0`, java-tools base revision
+`aaa2c1efdcb01c1b4e59ad638e6730ebb7a78b14`, and a dirty tree (55 porcelain
+entries, including pre-existing work). Failed experiments were removed:
+canonicalizing the lexical loop into a source-level `while (i < bound)` was
+slower, eliding the sole-loop budget bookkeeping was not a repeatable win,
+load-range loop versioning regressed, and disabling exact run counters was
+neutral. The retained runtime fast paths are therefore the two positively
+attributed structural changes above.
+
+The production webpack build completed with its existing four warnings. The
+bundle copied to the live port-3771 game library has SHA-256
+`df7faab661dc9729e03a7c642bbef7795a53d32a0c022adcb0900401295aaca1`.
+
+## 2026-07-30: optimize the guest body around the finished raster kernels
+
+The latest submitted Firefox report confirms that the isolated raster result
+above was not the whole-game bottleneck. Session `ms71gh94-hrzxtbjn` reported
+about 3 FPS while the page remained visible and focused. Surface upload
+accumulated only about 1.47 seconds over roughly ten minutes. During the same
+interval, structured SSA entered about 115 million times. Sampled scheduler
+ownership remained in the guest model/panel/render call tree. This is a
+guest-execution and intermethod-bound workload, not a canvas-upload limit.
+
+Three bytecode-generic changes were retained:
+
+- Structured JavaScript emits primitive array stores directly. It performs
+  the exact JVM narrowing for byte/boolean, char, short, int, float, and long
+  values in the generated expression instead of calling
+  `normalizeArrayStore` for every pixel/sample. The differential switch is
+  `JVM_DISABLE_STRUCTURED_INLINE_ARRAY_STORES=1`.
+- Wasm uses opcode-specific array-store imports. The Wasm boundary has already
+  coerced int, long, float, and double values to their JVM widths, so those
+  imports store the value directly; byte/boolean, char, and short retain their
+  required narrowing. The differential switch is
+  `JVM_DISABLE_WASM_TYPED_ARRAY_STORES=1`.
+- A large loop with dense primitive-array traffic and multiple dynamic call
+  islands selects structured JavaScript on its first entry instead of
+  beginning as a partial Wasm method and promoting after the one-shot work is
+  already underway. Selection requires at least 512 verified instructions, 32
+  primitive-array operations, two dynamic invokes, and a CFG backedge. It does
+  not inspect a class name, method name, or guest descriptor. The differential
+  switch is `JVM_DISABLE_DYNAMIC_ARRAY_STRUCTURED_FIRST=1`.
+
+The Wasm-store result was directly attributed with a CPU profile:
+`normalizeArrayStore` fell from about 604 ms of self time to 4 ms. Three
+fresh-process, CPU-0-pinned, fusion-disabled Node runs measured:
+
+| typed Wasm stores | median full-logo FPS | median warm-logo FPS |
+|---|---:|---:|
+| enabled | 19.557 | 31.976 |
+| disabled | 16.621 | 27.803 |
+
+That is a **17.7% full-logo** and **15.0% warm-logo** improvement. The
+artifacts are
+`/tmp/dekobloko-node-logo-benchmark.{VZVDOz,IBZcTa,kcCeLe}` and
+`/tmp/dekobloko-node-logo-benchmark.{pQMU5M,Ucn51Q,C3IF87}`.
+Inlining the structured-JavaScript stores separately measured a smaller
+positive median of 16.61 versus 15.78 full-logo FPS, and 26.95 versus 26.18
+warm-logo FPS.
+
+The first-entry policy was measured in three enabled and three disabled runs
+with identical tracked source, generated classes, and `fusedRuns: 0`:
+
+| structured first for dynamic array loops | median full-logo FPS | median warm-logo FPS |
+|---|---:|---:|
+| enabled | 23.382 | 36.302 |
+| disabled | 20.347 | 30.572 |
+
+This is a **14.9% full-logo** and **18.7% warm-logo** median improvement.
+Individual runs were noisy (one of three pairs reversed), so the exact
+throughput is not a browser prediction. The complete artifacts are
+`/tmp/dekobloko-node-logo-benchmark.{Kgon48,xXcKy1,XkmSmi}` and
+`/tmp/dekobloko-node-logo-benchmark.{YHsNlG,1QBAZP,fEY97i}`. All six runs
+completed with matching expected phase hashes, no runtime errors, and no fused
+or handwritten execution.
+
+The filtered logo-interval CPU profile also corrected an attribution mistake.
+An outer continuation/dispatcher appeared expensive in the unfiltered profile,
+but its samples included V8-inlined guest work. Embedding the resume closure
+inside the structured function reduced the benchmark from 25.68/40.26 to
+19.75/32.42 full/warm FPS and was removed completely. The retained changes are
+therefore the array-store and first-entry improvements above, not a speculative
+dispatcher rewrite.
+
+The focused compiler command now passes **1,078/1,078** assertions, including
+typed-store narrowing/null/bounds semantics and the no-name hot-loop policy:
+
+```sh
+timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
+```
+
+Benchmark metadata now records all three resolved gates and the number of
+methods selected by the first-entry policy. The measurements used Node
+`v26.4.0`, java-tools base revision
+`aaa2c1efdcb01c1b4e59ad638e6730ebb7a78b14`, dirty tracked trees with patches
+captured in every artifact, untouched `dekobloko.jar` SHA-256
+`a22410ad930334f54672ce8acdf25d88c31e380550e8f88a5618bb730f3cf06e`,
+and generated-class-tree SHA-256
+`b2e7bce0e174a31bb0a0984f6bde2e2312e2ed5c009b058e29c4145c3cfce411`.
+No new Firefox acceptance claim is made until the rebuilt bundle is measured.
+
+The first post-change kernel check caught one emitter-level regression before
+deployment: spelling an integer store as `Number(value) | 0` made V8's complete
+raster about 1.69 times slower than the oracle. JVM SSA had already proven the
+operand numeric, so the redundant `Number` conversion was removed. The
+long-form rerun restored the bit-exact complete raster to **0.9835 times** the
+oracle (generated faster). The tiny clipped-span proxy is more sensitive to
+fixed entry bookkeeping. Splitting restoring-positional entries into their own
+counter avoids two property writes per child call while retaining the exact
+reported total; it measured about **1.06 times** the oracle. A subsequent
+fusion-disabled whole-logo run remained clean at 22.08 full and 34.64 warm
+FPS (`/tmp/dekobloko-node-logo-benchmark.Zbdl3k`).
+
+The validated production bundle was then copied byte-for-byte to the live
+port-3771 game library. Both the webpack output and the served response have
+SHA-256
+`7e06f3a1a325642364840b704b92010404d951e6f0316e923eceeb186f4d3f95`
+(1,958,729 bytes). Webpack completed with its four existing warnings and the
+post-build browser configuration test passed 7/7. This deployment still has
+no Firefox FPS claim; the next submitted report must identify this exact
+runtime hash.
+
+### Range-versioned SSA beats the handwritten kernels
+
+The next isolated check found that the range proof was present but its result
+was still tested at every array store. The restoring SSA renderer now versions
+runtime-bounded direct loops on every affine array-range guard that dominates
+the loop. In the fast version, the compiler removes the impossible
+materialization/bounds arm and emits only the proven array store. The slow
+version is retained unchanged, including partial stores before a failing
+iteration, the exact throwing bytecode PC, locals, operand stack, and restored
+frame order. This is derived from counted-loop induction variables, CFG loop
+membership, array base locals, and runtime array length; it uses no guest or
+method identity.
+
+Nine paired rounds measured the generated clipped span at **0.6922 times** the
+handwritten target (41.60 versus 60.08 ns/invocation, generated about 44%
+faster). The complete moving raster remained bit-exact and at
+**0.9890 times** its handwritten target. Disabling only the new versioning
+with `JVM_DISABLE_STRUCTURED_VERSIONED_ARRAY_STORES=1` returned the span to
+**1.0903 times** the handwritten target, directly attributing the gain.
+
+The last ordinary method-name exception was also removed from the large
+dynamic-array tier policy. A test deliberately names the arbitrary structural
+fixture `run`; selection still depends only on instruction count,
+primitive-array density, dynamic-call islands, and a CFG backedge. Three
+fusion-disabled full-logo runs are effectively neutral for that policy:
+29.895/43.620 full/warm median enabled versus 29.766/43.313 disabled. It is
+therefore not credited for the kernel breakthrough.
+
+The same audit removed two older `run` exclusions from the broad codegen and
+safe-control-flow capability checks. An ordinary member called `run` is now
+judged by its bytecodes and CFG like any other method. JVM-defined
+`<init>/<clinit>` semantics and standard-library parking operations remain
+special because they have defined VM/scheduler behavior, not because of a
+guest workload. A fusion-disabled post-audit logo run completed without errors
+at 28.55 full and 41.97 warm FPS
+(`/tmp/dekobloko-node-logo-benchmark.z2GBWZ`).
+
+The focused suite now passes **1,080/1,080** assertions. Its generic span test
+also proves that the range-success arm contains no materialization call and
+that the slow arm still throws and restores the exact failing JVM state.
+
+The rebuilt production bundle and the bytes served by port 3771 both have
+SHA-256
+`b13361fb26a35fe61605b8b3e046b71a46a3432b89d4c9f6647002e92797f897`
+(1,959,505 bytes). This supersedes the earlier `1e038468…` runtime.
+## 2026-07-30: generic SSA replaces more of the affine sprite oracle
+
+The remaining fingerprint-selected guest-kernel inventory was checked against
+both DekoBloko layouts. The 343 original classes contain one matching
+substitution, the affine sprite raster; the current 343 recompiled classes
+contain no accepted handwritten fingerprint. A logo run with
+`JVM_ENABLE_GUEST_KERNEL_ORACLES=1` also executed zero perspective-span,
+tiled-blit, affine-raster, polygon-raster, or bilinear-sampler substitutions.
+This confirms that these files are differential/profiling oracles rather than
+the normal runtime path.
+
+A follow-up scan loaded every class from the 44 current original FunOrb game
+directories. Its only accepted perspective/tiled/affine/bilinear/polygon
+fingerprint was the same DekoBloko affine method. The other four substitutions
+therefore have no current workload to optimize against and remain historical
+oracles. The inventory also found that arbitrary `(IIIII)V` candidates can
+contain `long` constants; canonical fingerprinting now represents `BigInt`
+constants explicitly instead of allowing an opt-in oracle scan to throw during
+`JSON.stringify`.
+
+The original affine method exposed a generic compiler failure: two pure
+integer calls in the outer row loop globally disabled scheduler coarsening,
+leaving a poll at every pixel. `JvmSsaBlockRenderer` now computes unsafe
+operations per natural loop. A call-free inner loop receives a branch-free
+runtime-coarsened arm while its helper-containing outer loop retains the exact
+safe point. The restoring positional quantum is 100 times the frame-owned
+structural budget (bounded to one million) so ordinary raster children finish
+between caller safe points instead of reconstructing their frame every few
+rows.
+
+Two related generic changes reduce intermethod and field overhead:
+
+- `WasmJit` write summaries now walk verifier-reachable normal flow. Calls
+  reachable only from an exception handler do not invalidate every caller
+  field cache.
+- Stable reference parameters may eagerly bind repeated primitive fields and
+  raw array views when transitive write keys prove them unchanged.
+- A verifier-supported `putstatic` is allowed in restoring scalar integer
+  helpers. Reporter-guarded divide/clamp helpers therefore use the direct
+  positional body while preserving precise exception frames.
+- A primitive store whose index is a loop-local affine recurrence with a
+  stable static stride receives one pre-loop range guard. The slow arm retains
+  the original per-store bounds exception and materialization.
+
+Focused validation:
+
+```text
+timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
+# 1088/1088 passed
+
+node node_modules/tape/bin/tape \
+  test/schedulerPerformance.test.js test/browserBundleConfig.test.js
+# 48/48 passed
+```
+
+The final provenance-recording A/B benchmark produced identical checksums.
+Absolute host load changed substantially between repeats, so the paired ratio
+within one ABBA process is the authoritative result:
+
+| Path | ns/invocation | Relative to oracle |
+| --- | ---: | ---: |
+| Generic SSA | 88,003 | 2.201× |
+| Handwritten oracle | 39,983 | 1.000× |
+
+An earlier intermediate run, before eager entry fields and restoring scalar
+helpers, measured 5.877×. Thus these generic changes remove 62.5% of the
+relative overhead. The current recompiled method is also bit exact and
+measured 1.990× its oracle in the same paired harness. The remaining gap is
+computed source/mask array bounds proof across multiply/divide expressions;
+it should be addressed with interval analysis rather than a method
+fingerprint.
+
+The recorded original-class artifact identifies Java-tools base commit
+`aaa2c1efdcb01c1b4e59ad638e6730ebb7a78b14` (dirty tracked tree),
+class-tree SHA-256
+`f0cdeb70421d61cf0a4383abb5da46ac229533c239861cf985962bed42821893`,
+Node 26.4.0, and an empty `JVM_*`/`SSA_AFFINE_*` override set.
+The post-test production build succeeded with the four existing webpack
+warnings; `dist/jvm-debug.js` SHA-256 is
+`742fcd778de5ab32d463f4d5fa8247743e4bdf14893f183c01328364307122b7`.
+
+One clean end-to-end Node logo run (production gates, handwritten oracles
+disabled) measured 39.689 full-phase and 49.999 warm FPS with no runtime
+errors. A following process reached the login-classified surface at sampled
+frame 60 instead of the usual 210 and therefore measured a non-comparable
+5.746/13.345 result: real-time logo progress advanced during startup and left
+too few logo samples. It is retained as evidence that this phase benchmark
+needs a fixed animation timeline before it can attribute a new three-run
+median; it is not treated as an optimizer regression or success.
+
+### Generic quotient/product recurrence ranges
+
+The next optimization implements the interval analysis identified above.
+Primitive loads and stores can now contribute a loop-range candidate. For the
+affine sampler, the generic SSA renderer proves indexes with this bytecode
+structure:
+
+```text
+recurrence += invariant step
+quotient = recurrence / invariant divisor
+derived = quotient * invariant multiplier
+index = derived + invariant offset
+```
+
+Selection is based on the natural-loop CFG and local data flow, never an
+owner, method, or field name. The quotient and product assignments must
+dominate the access, the recurrence update must be after the access and on
+every path to a backedge, and all other operands must be invariant. A
+per-loop endpoint guard rejects division by zero, int32 overflow,
+non-canonical/null array storage, more than 1,024 iterations, and out-of-range
+first or last indexes. Successful source, mask, and destination guards enter
+a loop with the per-pixel exceptional branches removed. Failure executes the
+original loop, including precise bytecode-PC, locals, operand-stack, and
+partial-mutation behavior.
+
+The generic regression fixture verifies the emitted recurrence proof, valid
+copies, a partial bounds failure at the exact `iaload`, and a zero-divisor
+failure at the exact `idiv`. The original DekoBloko affine benchmark remains
+pixel exact. In the same optimization session, its seven-round ABBA paired
+ratio was 2.468× before the pass. Three clean post-change processes measured
+1.969×, 1.995×, and 2.020×, for a 1.995× median: 19.2% lower as a total ratio
+and 32.2% less overhead above the oracle. The paired ratios are used because
+system load changed both absolute times.
+
+The independent transparent-raster proxy also stayed at parity with its
+structural oracle:
+
+```text
+node scripts/benchmarkSsaRasterKernels.js
+# 1.012× paired median; 1.525 vs 1.517 ns/pixel; identical checksums
+```
+
+This supports keeping the fused gradient/flat handwritten raster installers
+as explicit semantic oracles while production continues to use generated
+bytecode-derived kernels.
+
+Validation on the final tree:
+
+```text
+timeout 120s node node_modules/tape/bin/tape test/jitCompiler.test.js
+# 1100/1100 passed
+
+node node_modules/tape/bin/tape \
+  test/fusedHotLoopRegression.test.js \
+  test/schedulerPerformance.test.js \
+  test/browserBundleConfig.test.js
+# 77/77 passed
+
+npm run build:bundle
+# succeeded with the four existing webpack warnings
+```
+
+The rebuilt `dist/jvm-debug.js` SHA-256 is
+`9ce033afd936d057860da9aed2a18750a5fcac95b57b04a47f7d85425bff23d8`.

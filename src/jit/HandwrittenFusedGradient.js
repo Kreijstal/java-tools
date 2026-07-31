@@ -60,6 +60,7 @@ function fingerprintMethods(jit, methods, options = {}) {
       return [kind, owner, member, descriptor];
     }
     if (Array.isArray(arg)) return arg.map((value) => canonicalArg(value));
+    if (typeof arg === "bigint") return ["BigInt", arg.toString()];
     if (arg && typeof arg === "object") {
       return Object.fromEntries(Object.entries(arg).map(([key, value]) =>
         [key, canonicalArg(value)]));

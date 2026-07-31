@@ -9,9 +9,9 @@ class FusedRegionCompiler {
   constructor(jit, options = {}) {
     this.jit = jit;
     this.jvm = jit.jvm;
-    this.enabled = options.fusedRegions === true ||
-      Boolean(typeof process !== "undefined" && process.env &&
-        process.env.JVM_ENABLE_FUSED_REGIONS === "1");
+    this.enabled = options.fusedRegions !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_FUSED_REGIONS === "1");
     // Fingerprint-selected translations are differential oracles and code-shape
     // targets, not a production compiler tier. Keep them opt-in so normal
     // execution proves the bytecode-derived kernels themselves are fast.
@@ -702,6 +702,28 @@ class FusedRegionCompiler {
     const argNames = params.map((_, index) => `a${index}`);
     const reachableBlocks = new Set(structured.rpo);
     const declarations = [];
+    const writtenStatics = new Set([...verified.reachable]
+      .map((index) => codeItems[index] && codeItems[index].instruction)
+      .filter((instruction) => getOp(instruction) === "putstatic")
+      .map((instruction) => JSON.stringify(instruction.arg)));
+    const hoistedStatics = new Map();
+    for (const index of verified.reachable) {
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      if (getOp(instruction) !== "getstatic") continue;
+      const key = JSON.stringify(instruction.arg);
+      const staticIndex = region.staticIndex.get(key);
+      if (staticIndex === undefined || writtenStatics.has(key) ||
+          !this.jit.canEliminateFieldRead(instruction.arg) ||
+          hoistedStatics.has(staticIndex)) continue;
+      const name = `s${staticIndex}`;
+      hoistedStatics.set(staticIndex, name);
+      declarations.push(
+        `const ${name}=region.staticTargets[${staticIndex}].kind==="map"?` +
+        `region.staticTargets[${staticIndex}].fields.get(` +
+        `region.staticTargets[${staticIndex}].key):` +
+        `region.staticTargets[${staticIndex}].fields[` +
+        `region.staticTargets[${staticIndex}].key];`);
+    }
     let argIndex = 0;
     for (let index = 0; index < verified.localsSize; index += 1) {
       if (localTypes[index]) {
@@ -819,7 +841,7 @@ class FusedRegionCompiler {
             const staticIndex =
               region.staticIndex.get(JSON.stringify(instruction.arg));
             if (staticIndex === undefined) throw new Error("unresolved static");
-            expressions.push(
+            expressions.push(hoistedStatics.get(staticIndex) ||
               `(region.staticTargets[${staticIndex}].kind==="map"?` +
               `region.staticTargets[${staticIndex}].fields.get(` +
               `region.staticTargets[${staticIndex}].key):` +

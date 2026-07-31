@@ -10,8 +10,19 @@ const { parseDescriptor } = require('../src/parsing/typeParser');
 
 const classpath = path.resolve(process.argv[2] || '');
 const iterations = Number(process.argv[3] || 200);
+const benchmarkEnabled =
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK === '1';
+const benchmarkIterations = Number(
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK_ITERATIONS || 2000);
+const benchmarkRounds = Number(
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK_ROUNDS || 7);
+const benchmarkWarmups = Number(
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK_WARMUPS || 4);
 if (!process.argv[2] || !fs.statSync(classpath, { throwIfNoEntry: false })?.isDirectory() ||
-    !Number.isInteger(iterations) || iterations <= 0) {
+    !Number.isInteger(iterations) || iterations <= 0 ||
+    !Number.isInteger(benchmarkIterations) || benchmarkIterations <= 0 ||
+    !Number.isInteger(benchmarkRounds) || benchmarkRounds <= 0 ||
+    !Number.isInteger(benchmarkWarmups) || benchmarkWarmups <= 0) {
   console.error('Usage: node scripts/differentialFusedRenderers.js <class-directory> [iterations]');
   process.exit(2);
 }
@@ -180,6 +191,91 @@ function assertPixels(left, right, label) {
   }
 }
 
+function checksum(values) {
+  let value = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    value = (Math.imul(value, 31) + (values[index] | 0)) | 0;
+  }
+  return value;
+}
+
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function benchmarkKernels(generic, oracle, cases) {
+  let genericCursor = 0;
+  let oracleCursor = 0;
+  const genericBatch = () => {
+    for (let call = 0; call < benchmarkIterations; call += 1) {
+      generic.kernel(...cases[genericCursor++ & (cases.length - 1)]);
+    }
+  };
+  const oracleBatch = () => {
+    for (let call = 0; call < benchmarkIterations; call += 1) {
+      oracle.kernel(...cases[oracleCursor++ & (cases.length - 1)]);
+    }
+  };
+  for (let warmup = 0; warmup < benchmarkWarmups; warmup += 1) {
+    generic.destination.fill(warmup);
+    oracle.destination.fill(warmup);
+    genericCursor = 0;
+    oracleCursor = 0;
+    if ((warmup & 1) === 0) {
+      genericBatch();
+      oracleBatch();
+    } else {
+      oracleBatch();
+      genericBatch();
+    }
+  }
+  const genericElapsed = [];
+  const oracleElapsed = [];
+  let genericChecksum = 0;
+  let oracleChecksum = 0;
+  for (let round = 0; round < benchmarkRounds; round += 1) {
+    generic.destination.fill(round);
+    oracle.destination.fill(round);
+    genericCursor = 0;
+    oracleCursor = 0;
+    let genericRound = 0;
+    let oracleRound = 0;
+    const order = (round & 1) === 0
+      ? ['generic', 'oracle', 'oracle', 'generic']
+      : ['oracle', 'generic', 'generic', 'oracle'];
+    for (const name of order) {
+      const started = process.hrtime.bigint();
+      if (name === 'generic') genericBatch();
+      else oracleBatch();
+      const elapsed = Number(process.hrtime.bigint() - started);
+      if (name === 'generic') genericRound += elapsed;
+      else oracleRound += elapsed;
+    }
+    assertPixels(generic.destination, oracle.destination,
+      `timed round ${round}`);
+    genericElapsed.push(genericRound);
+    oracleElapsed.push(oracleRound);
+    genericChecksum ^= checksum(generic.destination);
+    oracleChecksum ^= checksum(oracle.destination);
+  }
+  const pairedRatios = genericElapsed.map(
+    (elapsed, index) => elapsed / oracleElapsed[index]);
+  return {
+    iterationsPerSample: benchmarkIterations * 2,
+    rounds: benchmarkRounds,
+    warmups: benchmarkWarmups,
+    genericNanosecondsPerInvocation:
+      median(genericElapsed) / (benchmarkIterations * 2),
+    oracleNanosecondsPerInvocation:
+      median(oracleElapsed) / (benchmarkIterations * 2),
+    pairedRatios,
+    medianPairedRatio: median(pairedRatios),
+    checksum: genericChecksum,
+    oracleChecksum,
+  };
+}
+
 function generatedShape(region) {
   const wrapper = String(region.wrapperKernel);
   const raster = String(region.rasterKernel);
@@ -233,6 +329,15 @@ function generatedShape(region) {
     configureRegion(baseline, baselineCandidate, baselinePixels);
     const region = configureRegion(fused, fusedCandidate, fusedPixels);
     const targetRegion = configureRegion(target, targetCandidate, targetPixels);
+    if (process.env.JVM_DUMP_FUSED_KERNELS === '1') {
+      process.stderr.write(`\n/* ${descriptor} generated wrapper */\n` +
+        `${region.wrapperKernel.jvmLexicalFusedSource || region.wrapperKernel}\n` +
+        `\n/* ${descriptor} generated raster */\n` +
+        `${region.rasterKernel.jvmLexicalFusedSource || region.rasterKernel}\n` +
+        `\n/* ${descriptor} generated scanline */\n` +
+        `${region.scanlineKernel.jvmLexicalFusedSource || region.scanlineKernel}\n` +
+        `\n/* ${descriptor} compact target */\n${targetRegion.rasterKernel}\n`);
+    }
     const shape = generatedShape(region);
     if (shape.handwrittenInstalled || shape.forbiddenRuntimeDispatch.length ||
         !shape.positionalWrapper || !shape.structuredWrapper ||
@@ -289,6 +394,28 @@ function generatedShape(region) {
       throw new Error(`Handwritten target ran ${handwrittenTargetRuns}/${iterations} ` +
         `times for ${descriptor}`);
     }
+    let benchmark = null;
+    if (benchmarkEnabled) {
+      const benchmarkRandom = {
+        value: (descriptor.length * 0x85ebca6b) >>> 0,
+      };
+      const cases = Array.from({ length: 64 }, () =>
+        argumentsFor(fusedCandidate.family, benchmarkRandom, region));
+      const genericKernel = region.wrapperKernel.bind(
+        null, region.executionState, region, fused.jvm.jit);
+      const oracleKernel = targetRegion.wrapperKernel.bind(
+        null, targetRegion.executionState, targetRegion, target.jvm.jit);
+      benchmark = benchmarkKernels({
+        kernel: genericKernel,
+        destination: fusedPixels,
+      }, {
+        kernel: oracleKernel,
+        destination: targetPixels,
+      }, cases);
+      if (benchmark.checksum !== benchmark.oracleChecksum) {
+        throw new Error(`Timed checksum mismatch for ${descriptor}`);
+      }
+    }
     report.push({ descriptor, iterations, changedPixels,
       compactGradientInstalled: Boolean(region.semanticGradientRasterPlan),
       compactFlatInstalled: Boolean(region.semanticFlatRasterPlan),
@@ -300,7 +427,8 @@ function generatedShape(region) {
       handwrittenTargetRuns,
       compactGradientRuns: (fused.jvm.jit.semanticFusedRasterRunCount | 0) - beforeGradient,
       compactFlatRuns: (fused.jvm.jit.semanticFusedFlatRasterRunCount | 0) - beforeFlat,
-      compactFlatRejection: region.semanticFlatRasterRejection || null });
+      compactFlatRejection: region.semanticFlatRasterRejection || null,
+      benchmark });
   }
   process.stdout.write(`${JSON.stringify({ ok: true, classpath, report }, null, 2)}\n`);
 })().catch((error) => {

@@ -193,12 +193,15 @@ function compiledCode(runtime) {
   for (const item of runtime.jvm.classes[className].ast.classes[0].items) {
     if (item.type !== 'method') continue;
     const generated = runtime.jvm.jit.codegenCache.get(item.method);
-    const sourceText = generated?.jvmStructuredSource;
+    const sourceText = generated?.jvmRestoringDirectPositionalSource ||
+      generated?.jvmStructuredSource;
     if (!sourceText) continue;
     result[item.method.name] = {
       bytes: Buffer.byteLength(sourceText),
       synchronousCallSites: (sourceText.match(/helpers\.tryInvokeSyncAt/g) || []).length,
       materializations: (sourceText.match(/helpers\.materialize/g) || []).length,
+      source: process.env.DEKOBLOKO_TRAFFIC_PRINT_SOURCE === '1'
+        ? sourceText : undefined,
     };
   }
   return result;

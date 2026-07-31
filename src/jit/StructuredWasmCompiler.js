@@ -240,7 +240,11 @@ class StructuredWasmCompiler {
     this.nextLocal = fn.params.length + 2;
 
     addRuntimeImports(this, this.box);
-    addArrayImports(this, this.method.name);
+    addArrayImports(
+      this,
+      this.method.name,
+      this.wasmJit.typedArrayStoresEnabled,
+    );
 
     // Linear-heap array caches: per receiver SSA value, three locals holding
     // the array's byte base (-1 = null or not heap-backed), length, and a
@@ -873,8 +877,10 @@ class StructuredWasmCompiler {
         out.push(...this.heapAccessSeq(node, HEAP_STORE[op], use(2), t));
         return finish();
       }
+      const storeImport = this.wasmJit.typedArrayStoresEnabled
+        ? `aset_${op}` : `aset_${sig(t)}`;
       out.push(...use(0), ...use(1), ...use(2), OP.call,
-        ...uleb(this.importIndexByName.get(`aset_${sig(t)}`)));
+        ...uleb(this.importIndexByName.get(storeImport)));
       return finish();
     }
     if (op === 'arraylength') {
@@ -1042,9 +1048,11 @@ class StructuredWasmCompiler {
       ...idx, OP.local_get, ...uleb(c.len), OP.i32_ge_u, OP.if, 0x40,
       ...idx, OP.local_get, ...uleb(c.len), OP.call, ...uleb(this.aioobIdx), OP.end,
     ];
+    const storeImport = this.wasmJit.typedArrayStoresEnabled
+      ? `aset_${node.op}` : `aset_${sig(importT)}`;
     const importCall = storeSeq
       ? [...arr, ...idx, ...storeSeq, OP.call,
-        ...uleb(this.importIndexByName.get(`aset_${sig(importT)}`))]
+        ...uleb(this.importIndexByName.get(storeImport))]
       : [...arr, ...idx, OP.call,
         ...uleb(this.importIndexByName.get(`aget_${sig(importT)}`))];
     const heapOp = [OP[acc.op], ...uleb(acc.shift), ...uleb(0)];

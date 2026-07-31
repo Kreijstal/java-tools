@@ -43,7 +43,7 @@ const WASM_NATIVE_LONG_OPS = new Set([
 // Keep the capability structural: no guest class or method identity participates.
 const EXTENDED_TIER_OPCODES_ENABLED = true;
 const EXTENDED_TIER_OPCODES = EXTENDED_TIER_OPCODES_ENABLED ? [
-  "i2c", "i2s", "dup_x1", "instanceof",
+  "i2c", "i2s", "dup_x1", "dup2_x2", "instanceof",
   "ladd", "land", "laload", "lastore", "lconst_0", "lconst_1",
   "lload", "lload_0", "lload_1", "lload_2", "lload_3", "lneg", "lor", "lrem", "lshl",
   "lstore", "lstore_0", "lstore_1", "lstore_2", "lstore_3", "lsub", "lushr",
@@ -104,6 +104,14 @@ class JitCompiler {
     // argument slicing, and generic call dispatch.
     this.directJreIntrinsics = [];
     this.directSynchronousIntrinsics = [];
+    // Whole guest algorithms are useful differential oracles, but they are
+    // not a compiler tier. Production code must be derived from the loaded
+    // bytecode through the generic SSA/block renderer. Keep the historical
+    // raster/blit/polygon substitutions available only for explicit A/B tests.
+    this.guestKernelOraclesEnabled =
+      options.guestKernelOracles === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_GUEST_KERNEL_ORACLES === "1");
     this.polygonRasterIntrinsicCache = new WeakMap();
     this.polygonRasterRunCount = 0;
     this.polygonRasterGuardedFallbackCount = 0;
@@ -124,6 +132,7 @@ class JitCompiler {
     this.perspectiveSpanRunCount = 0;
     this.perspectiveSpanGuardedFallbackCount = 0;
     this.affineSpriteRasterEnabled =
+      this.guestKernelOraclesEnabled &&
       options.affineSpriteRaster !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_AFFINE_SPRITE_RASTER === "1");
@@ -183,6 +192,10 @@ class JitCompiler {
       Number(options.adaptiveCodegenTimeThresholdMs ?? 8) || 0);
     this.adaptiveCodegenTimeSampleInterval = Math.max(1,
       Number(options.adaptiveCodegenTimeSampleInterval) || 64);
+    this.largeAcyclicCallTreesEnabled =
+      options.largeAcyclicCallTrees !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_LARGE_ACYCLIC_CALL_TREES === "1");
     const configuredWholeMethodEscalation =
       options.adaptiveWholeMethodEscalationThreshold ??
       (typeof process !== "undefined" && process.env
@@ -238,6 +251,8 @@ class JitCompiler {
     this.syncInlinedCallCount = 0;
     this.syncReusedFrameCount = 0;
     this.syncIntrinsicCallCount = 0;
+    this.syncOperandUnderflowFallbackCount = 0;
+    this.reportedSyncOperandUnderflows = new Set();
     this.intrinsicArrayCopyNoopCount = 0;
     this.intrinsicArrayCopyWithinCount = 0;
     this.fusedRunCount = 0;
@@ -258,6 +273,10 @@ class JitCompiler {
     this.inlineLoopRegionsEnabled = options.inlineLoopRegions !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_INLINE_LOOP_REGIONS === "1");
+    this.scalarBoundedInlineRegionsEnabled =
+      options.scalarBoundedInlineRegions === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_SCALAR_BOUNDED_INLINE_REGIONS === "1");
     this.scalarLoopMethodRunCounts = new Map();
     this.structuredSsaMethodRunCounts = new Map();
     this.oversizedWasmFirstMethods = new WeakMap();
@@ -274,6 +293,12 @@ class JitCompiler {
       options.arrayKernelWasmFirst === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
+    this.dynamicArrayStructuredFirstMethods = new WeakMap();
+    this.dynamicArrayStructuredFirstMethodCount = 0;
+    this.dynamicArrayStructuredFirstEnabled =
+      options.dynamicArrayStructuredFirst !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_DYNAMIC_ARRAY_STRUCTURED_FIRST === "1");
     this.rendererPipelineEnabled = options.rendererPipeline === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
@@ -307,7 +332,7 @@ class JitCompiler {
       (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
     this.wasmJit = new WasmJit(jvm, this);
     const regionOptions = this.rendererPipelineEnabled
-      ? { ...options, fusedRegions: true, structuredSsa: true }
+      ? { ...options, structuredSsa: true }
       : options;
     this.fusedRegions = new FusedRegionCompiler(this, regionOptions);
     this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
@@ -417,7 +442,9 @@ class JitCompiler {
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method));
     const wholeMethodPreferred =
-      this.prefersWholeMethodJs(frame.method) && !wasmPriorityLoop;
+      (this.prefersWholeMethodJs(frame.method) ||
+        this.isDynamicArrayStructuredFirstMethod(frame.method)) &&
+      !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       let codegenEligible = this.isCodegenSupported(frame.method);
       if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
@@ -582,6 +609,43 @@ class JitCompiler {
     return selected;
   }
 
+  isDynamicArrayStructuredFirstMethod(method) {
+    if (!this.dynamicArrayStructuredFirstEnabled ||
+        !method || method.name === "<init>" || method.name === "<clinit>") {
+      return false;
+    }
+    if (this.dynamicArrayStructuredFirstMethods.has(method)) {
+      return this.dynamicArrayStructuredFirstMethods.get(method);
+    }
+    let instructionCount = 0;
+    let primitiveArrayAccessCount = 0;
+    let dynamicCallCount = 0;
+    for (const item of this.getCodeItems(method)) {
+      const op = getOp(item && item.instruction);
+      if (!op) continue;
+      instructionCount += 1;
+      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
+        primitiveArrayAccessCount += 1;
+      } else if (op === "invokevirtual" || op === "invokeinterface" ||
+          op === "invokespecial") {
+        dynamicCallCount += 1;
+      }
+    }
+    // A large primitive-array loop with several dynamic call islands cannot
+    // stay in one Wasm module: each island exits to JavaScript and resumes
+    // later. Structured JavaScript can instead retain the verified operand
+    // values and link monomorphic callees positionally. Select only a large,
+    // dense shape so ordinary object/UI methods do not pay its cold compile
+    // cost.
+    const selected = instructionCount >= 512 &&
+      primitiveArrayAccessCount >= 32 &&
+      dynamicCallCount >= 2 &&
+      this.hasBackwardBranch(method);
+    this.dynamicArrayStructuredFirstMethods.set(method, selected);
+    if (selected) this.dynamicArrayStructuredFirstMethodCount += 1;
+    return selected;
+  }
+
   prefersWholeMethodJs(method) {
     return this.preferWholeMethodJs ||
       this.adaptiveCodegenMethods.has(method);
@@ -659,13 +723,31 @@ class JitCompiler {
       return HANDLED_RESULT;
     }
     if (result && result.returned) {
+      const explicitReturnParent = frame.jitGeneratedReturnParent;
+      const explicitReturnType = frame.jitGeneratedReturnType;
+      delete frame.jitGeneratedReturnParent;
+      delete frame.jitGeneratedReturnType;
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(
           thread,
           result.value === RETURN_VOID ? null : result.value,
         );
-      } else if (result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(result.value);
+      } else if (result.value !== RETURN_VOID) {
+        const frames = thread.callStack.items;
+        const returnParent = explicitReturnParent &&
+            frames.includes(explicitReturnParent)
+          ? explicitReturnParent
+          : !thread.callStack.isEmpty() ? thread.callStack.peek() : null;
+        if (returnParent) returnParent.stack.push(result.value);
+      } else if (explicitReturnParent && explicitReturnType !== "void") {
+        console.error("[jit-generated-return-underflow]", {
+          child: `${frame.className || "<unknown>"}.` +
+            `${frame.method?.name || "<unknown>"}${frame.method?.descriptor || ""}`,
+          parent: `${explicitReturnParent.className || "<unknown>"}.` +
+            `${explicitReturnParent.method?.name || "<unknown>"}` +
+            `${explicitReturnParent.method?.descriptor || ""}`,
+          expectedReturnType: explicitReturnType,
+        });
       }
     }
     return HANDLED_RESULT;
@@ -675,7 +757,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} syncOperandUnderflowFallbacks=${this.syncOperandUnderflowFallbackCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.totalRunCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredLazyStatics=${this.structuredSsa.lazyStaticTargetLinkCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -1066,7 +1148,6 @@ class JitCompiler {
       this.isJitSafeConstructor(method, codeItems);
     if ((method.name === "<init>" && !safeConstructor) ||
         method.name === "<clinit>" ||
-        allowEffectfulCalls && method.name === "run" ||
         !safeConstructor && !allowEffectfulCalls &&
         !this.experimentalControlFlow &&
         normalFlowContains(codeItems, (instruction, op) =>
@@ -1226,7 +1307,7 @@ class JitCompiler {
     // move a call (and its arbitrary scheduling effects) across that boundary.
     // Invokes that exist only in an exception handler do not disqualify a
     // compute body: the generated exception table preserves those paths.
-    if (method.name === "<init>" || method.name === "<clinit>" || method.name === "run") {
+    if (method.name === "<init>" || method.name === "<clinit>") {
       return false;
     }
     if (this.hasOnlyNoOpExceptionHandlers(method, codeItems)) {
@@ -1280,15 +1361,21 @@ class JitCompiler {
 
   hasCallDenseComputeShape(method, codeItems) {
     if (method.name === "<init>" || method.name === "<clinit>") return false;
-    // Small forwarding/call-chain helpers can be hot without containing a
-    // loop or arithmetic of their own. Keep this a bytecode-shape decision;
-    // supported-op and control-flow checks still run at the caller.
+    // Forwarding/call-chain bodies can be hot without containing a loop or
+    // arithmetic of their own. This includes larger acyclic decision trees
+    // that select several numeric kernels per entry. Keep this a bytecode-
+    // shape decision; supported-op and control-flow checks still run at the
+    // caller, and the large form excludes backedges.
     const instructions = codeItems.filter((item) => item && item.instruction);
-    if (instructions.length > 64) return false;
-    return instructions.filter((item) => {
+    const invokeCount = instructions.filter((item) => {
       const op = getOp(item.instruction);
       return op && op.startsWith("invoke");
-    }).length >= 2;
+    }).length;
+    if (instructions.length <= 64) return invokeCount >= 2;
+    return this.largeAcyclicCallTreesEnabled &&
+      instructions.length <= 2048 &&
+      invokeCount >= 4 &&
+      !this.hasBackwardBranch(method);
   }
 
   getLabelMap(frame) {
@@ -1440,6 +1527,11 @@ class JitCompiler {
           continuation: Boolean(structuredSsa.jvmStructuredContinuation),
           resumeBody: Boolean(structuredSsa.jvmResumeBody),
         }));
+        if (typeof process !== "undefined" && process.env &&
+            process.env.JVM_TRACE_JIT_SOURCE === "1") {
+          console.error("[jit-generated-source] " + traceIdentity + "\n" +
+            (structuredSsa.jvmStructuredSource || source));
+        }
       }
       return this.withResumeBody(structuredSsa, method);
     }
@@ -1484,14 +1576,22 @@ class JitCompiler {
         op === "newarray" || op === "anewarray" ||
         op === "multianewarray" || op === "monitorenter";
     });
+    const hasMonitorRegion = items.some((item) =>
+      getOp(item?.instruction) === "monitorenter");
     // Complete leaf kernels already receive better whole-method structured
     // code. Region extraction is for a small scalar/array loop embedded in a
     // larger scheduler-, exception-, allocation-, or call-bearing method.
     if (!hasOuterEffects) return none;
 
     const labels = buildLabelMap(items);
-    const depths = this.computeStackDepths(items, labels);
-    if (!depths) return none;
+    // Some large obfuscated methods have verifier-consistent normal flow but
+    // deliberately awkward, disconnected exception-table joins that defeat
+    // this inexpensive whole-method depth pass. Existing array-length regions
+    // still require that proof. A scalar natural-loop candidate can instead
+    // be verified in its isolated synthetic method after handlers and
+    // unreachable outer blocks have been removed.
+    const computedDepths = this.computeStackDepths(items, labels, method);
+    const depths = computedDepths || [];
     const localSlot = (instruction, op) => {
       const shorthand = /_(\d)$/.exec(op);
       return shorthand ? Number(shorthand[1])
@@ -1587,7 +1687,7 @@ class JitCompiler {
         Number(at(47).arg) === 31 &&
         labels.get(at(12).arg) === header + 15 &&
         labels.get(at(17).arg) === header + 20;
-      if (pairedConstants) {
+      if (this.guestKernelOraclesEnabled && pairedConstants) {
         const inputSlot = localSlot(at(4), loopOps[4]);
         const sampleSlot = localSlot(at(9), loopOps[9]);
         const offsetSlot = localSlot(at(23), loopOps[23]);
@@ -1671,6 +1771,149 @@ class JitCompiler {
       // admit multiple disjoint loops after proving their live ranges.
       break;
     }
+    // A javac loop embedded in archive/image readers is often bounded by a
+    // scalar chunk length rather than array.length, and obfuscation may place
+    // its backedge on a conditional branch followed by one shared exit
+    // trampoline. Extract that natural loop with the same SSA renderer. This
+    // is a CFG/local/bytecode proof: no owner, member, or descriptor identity
+    // participates.
+    if (!plans.length && !computedDepths && hasMonitorRegion &&
+        this.scalarBoundedInlineRegionsEnabled) {
+      const scalarRegionAllowed = new Set([
+        ...allowed,
+        "getstatic",
+      ]);
+      for (let backedge = 0; backedge < items.length; backedge += 1) {
+        const branch = items[backedge]?.instruction;
+        const branchOp = getOp(branch);
+        if (!branchOp?.startsWith("if")) continue;
+        const header = labels.get(branch.arg);
+        if (!Number.isInteger(header) || header <= 0 ||
+            header >= backedge ||
+            computedDepths && depths[header] !== 0) continue;
+
+        const headerOps = items.slice(header, header + 3)
+          .map((item) => getOp(item?.instruction));
+        if (!/^iload(?:_[0-3])?$/.test(headerOps[0] || "") ||
+            !/^iload(?:_[0-3])?$/.test(headerOps[1] || "") ||
+            headerOps[2] !== "if_icmpgt") continue;
+        const boundSlot = localSlot(items[header].instruction, headerOps[0]);
+        const counterSlot =
+          localSlot(items[header + 1].instruction, headerOps[1]);
+        const bodyTarget = labels.get(items[header + 2].instruction.arg);
+        if (!Number.isInteger(boundSlot) || !Number.isInteger(counterSlot) ||
+            boundSlot === counterSlot ||
+            !Number.isInteger(bodyTarget) ||
+            bodyTarget <= header + 2 || bodyTarget > backedge) continue;
+
+        // Include the common conditional-backedge fall trampoline when it is
+        // a single goto. All exits from the candidate must converge on the
+        // same original bytecode PC so the canonical Frame has one precise
+        // resume location after the atomic region returns.
+        let end = backedge;
+        const fallInstruction = items[backedge + 1]?.instruction;
+        if (getOp(fallInstruction) === "goto" ||
+            getOp(fallInstruction) === "goto_w") end += 1;
+        const outsideTargets = new Set();
+        let valid = true;
+        let counterWrites = 0;
+        let primitiveArrayTraffic = 0;
+        const arrayLocalSlots = new Set();
+        for (let index = header; index <= end && valid; index += 1) {
+          const instruction = items[index]?.instruction;
+          const op = getOp(instruction);
+          if (!scalarRegionAllowed.has(op)) {
+            valid = false;
+            break;
+          }
+          if (/^aload(?:_[0-3])?$/.test(op)) {
+            arrayLocalSlots.add(localSlot(instruction, op));
+          }
+          if (op === "iinc") {
+            const slot = localSlot(instruction, op);
+            if (slot === boundSlot) {
+              valid = false;
+              break;
+            }
+            if (slot === counterSlot) {
+              if (Number(instruction.incr) !== 1) {
+                valid = false;
+                break;
+              }
+              counterWrites += 1;
+            }
+          } else if (/^istore(?:_[0-3])?$/.test(op) &&
+              localSlot(instruction, op) === boundSlot) {
+            valid = false;
+            break;
+          }
+          if (op?.endsWith("aload") || op?.endsWith("astore")) {
+            primitiveArrayTraffic += 1;
+          }
+          if (op === "goto" || op === "goto_w" || op.startsWith("if")) {
+            const target = labels.get(instruction.arg);
+            if (!Number.isInteger(target)) {
+              valid = false;
+              break;
+            }
+            if (target < header || target > end) outsideTargets.add(target);
+          }
+        }
+        if (!valid || counterWrites !== 1 || primitiveArrayTraffic === 0 ||
+            outsideTargets.size !== 1) continue;
+        const exit = [...outsideTargets][0];
+        if (computedDepths && depths[exit] !== 0) continue;
+
+        // Preserve labels/PCs from the original method but make every block
+        // outside the natural loop unreachable. The one converged exit is a
+        // synthetic void return that spills live locals for the original
+        // baseline body to resume at `exit`.
+        const syntheticItems = items.map((item, index) => ({
+          ...item,
+          instruction: index >= header && index <= end
+            ? item.instruction : index === exit ? "return" : "nop",
+        }));
+        syntheticItems[0] = {
+          ...syntheticItems[0],
+          instruction: {
+            op: "goto",
+            arg: items[header].labelDef.slice(0, -1),
+          },
+        };
+        const syntheticMethod = {
+          ...method,
+          name: `${method.name}$inlineScalarLoop${header}`,
+          descriptor: "()V",
+          flags: ["private", "static"],
+          accessFlags: 0x000a,
+          attributes: [{
+            ...code,
+            code: {
+              ...code.code,
+              codeItems: syntheticItems,
+              exceptionTable: [],
+              attributes: [],
+            },
+          }],
+          jvmStructuredAtomicRegionMaxIterations: 4096,
+          jvmStructuredRegionSpillOnReturn: true,
+          jvmStructuredEntryArrayLocals: [...arrayLocalSlots],
+        };
+        this.normalizedCodeItemsCache.set(syntheticMethod, syntheticItems);
+        const generated = this.structuredSsa.compile(syntheticMethod);
+        if (!generated || generated.jvmStructuredContinuation) continue;
+        const id = this.inlineLoopRegions.length;
+        this.inlineLoopRegions.push({
+          generated, method, header, exit, counterSlot, boundSlot,
+          scalarBounded: true, maximumIterations: 4096,
+        });
+        plans.push({
+          id, header, exit, counterSlot, boundSlot,
+          scalarBounded: true,
+        });
+        break;
+      }
+    }
     this.inlineLoopRegionCache.set(method, plans);
     if (plans.length) {
       this.inlineLoopRegionPcCache.set(method,
@@ -1715,6 +1958,13 @@ class JitCompiler {
   canRunInlineLoopRegion(id, frame) {
     const region = this.inlineLoopRegions[id];
     if (!region) return false;
+    if (region.scalarBounded) {
+      const counter = Number(frame.locals[region.counterSlot]);
+      const bound = Number(frame.locals[region.boundSlot]);
+      const remaining = bound - counter;
+      return Number.isInteger(counter) && Number.isInteger(bound) &&
+        remaining >= 0 && remaining <= region.maximumIterations;
+    }
     if (region.kernel?.kind !== "paired-saturating-int-to-bytes") return true;
     const locals = frame.locals;
     const inputRef = locals[region.kernel.inputSlot];
@@ -1798,7 +2048,7 @@ class JitCompiler {
         !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return null;
     if (codeItems.length < 6 || codeItems.length > 1024) return null;
     const labels = buildLabelMap(codeItems);
-    const depths = this.computeStackDepths(codeItems, labels);
+    const depths = this.computeStackDepths(codeItems, labels, method);
     if (!depths) return null;
     const reachable = new Set(depths.map((depth, index) => depth === undefined ? -1 : index)
       .filter((index) => index >= 0));
@@ -2418,7 +2668,7 @@ class JitCompiler {
     let stackWidthsBefore = null;
     if (codeItems.some((item) => {
       const op = getOp(item && item.instruction);
-      return op === "dup_x2" || op === "dup2";
+      return op === "dup_x2" || op === "dup2" || op === "dup2_x2";
     })) {
       const analysis = buildSsa({
         codeItems,
@@ -2464,22 +2714,36 @@ class JitCompiler {
         body.push(`case ${index}:`);
         const loopRegion = loopRegionsByHeader.get(index);
         if (loopRegion) {
-          body.push(
-            "if (!bytecodeChecks && sp === 0) {",
-            `  const regionArray = locals[${loopRegion.boundArraySlot}];`,
-            `  const regionCounter = locals[${loopRegion.counterSlot}] | 0;`,
-            "  if (regionArray !== null && regionArray !== undefined && " +
-              "regionCounter >= 0 && regionArray.length - regionCounter <= 4096 && " +
-              `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
-            `    const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
-            "    if (regionResult && regionResult.deopt) return regionResult;",
-            "    stack.length = 0;",
-            "    sp = 0;",
-            `    pc = ${loopRegion.exit};`,
-            "    continue;",
-            "  }",
-            "}",
-          );
+          if (loopRegion.scalarBounded) {
+            body.push(
+              "if (!bytecodeChecks && sp === 0 && " +
+                `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
+              `  const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
+              "  if (regionResult && regionResult.deopt) return regionResult;",
+              "  stack.length = 0;",
+              "  sp = 0;",
+              `  pc = ${loopRegion.exit};`,
+              "  continue;",
+              "}",
+            );
+          } else {
+            body.push(
+              "if (!bytecodeChecks && sp === 0) {",
+              `  const regionArray = locals[${loopRegion.boundArraySlot}];`,
+              `  const regionCounter = locals[${loopRegion.counterSlot}] | 0;`,
+              "  if (regionArray !== null && regionArray !== undefined && " +
+                "regionCounter >= 0 && regionArray.length - regionCounter <= 4096 && " +
+                `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
+              `    const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
+              "    if (regionResult && regionResult.deopt) return regionResult;",
+              "    stack.length = 0;",
+              "    sp = 0;",
+              `    pc = ${loopRegion.exit};`,
+              "    continue;",
+              "  }",
+              "}",
+            );
+          }
         }
         const instruction = item.instruction;
         if (!instruction) {
@@ -2553,7 +2817,7 @@ class JitCompiler {
     }
 
     const labels = buildLabelMap(codeItems);
-    const depths = this.computeStackDepths(codeItems, labels);
+    const depths = this.computeStackDepths(codeItems, labels, method);
     if (!depths) return null;
     const leaders = new Set([0]);
     const terminal = new Set([
@@ -2839,8 +3103,34 @@ class JitCompiler {
     }
   }
 
-  computeStackDepths(codeItems, labels) {
+  computeStackDepths(codeItems, labels, method = null) {
+    this.lastStackDepthError = null;
+    const rejectDepths = (reason, index, op, details = null) => {
+      this.lastStackDepthError = { reason, index, op, details };
+      return null;
+    };
     const depths = new Array(codeItems.length);
+    let stackWidthsBefore = null;
+    if (codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op === "dup2" || op === "dup2_x2";
+    })) {
+      const code = method?.attributes?.find((attribute) =>
+        attribute.type === "code");
+      const analysis = buildSsa({
+        codeItems,
+        exceptionTable: code?.code?.exceptionTable || [],
+        method,
+      });
+      if (!analysis || analysis.rejected || !analysis.stackKindsBefore) {
+        return rejectDepths("category analysis failed", -1, null,
+          analysis?.reason || null);
+      }
+      stackWidthsBefore = new Map();
+      for (const [index, kinds] of analysis.stackKindsBefore) {
+        stackWidthsBefore.set(index, kinds.map(kindWidth));
+      }
+    }
     const pending = [0];
     depths[0] = 0;
     const terminal = new Set([
@@ -2850,10 +3140,17 @@ class JitCompiler {
       const index = pending.pop();
       const instruction = codeItems[index] && codeItems[index].instruction;
       const op = getOp(instruction);
-      const effect = stackEffect(instruction);
-      if (effect === null) return null;
+      const effect = stackEffect(
+        instruction, stackWidthsBefore && stackWidthsBefore.get(index));
+      if (effect === null) {
+        return rejectDepths("unknown stack effect", index, op);
+      }
       const after = depths[index] + effect;
-      if (after < 0) return null;
+      if (after < 0) {
+        return rejectDepths("operand stack underflow", index, op, {
+          before: depths[index], effect,
+        });
+      }
       const successors = [];
       if (op === "goto" || op === "goto_w") {
         successors.push(branchTargetIndex(instruction, labels));
@@ -2863,12 +3160,18 @@ class JitCompiler {
         successors.push(index + 1);
       }
       for (const successor of successors) {
-        if (successor === undefined || successor < 0 || successor >= codeItems.length) return null;
+        if (successor === undefined || successor < 0 ||
+            successor >= codeItems.length) {
+          return rejectDepths("invalid control-flow successor", index, op,
+            { successor });
+        }
         if (depths[successor] === undefined) {
           depths[successor] = after;
           pending.push(successor);
         } else if (depths[successor] !== after) {
-          return null;
+          return rejectDepths("operand-stack join mismatch", index, op, {
+            successor, expected: depths[successor], actual: after,
+          });
         }
       }
     }
@@ -3004,6 +3307,43 @@ class JitCompiler {
           return `{ const value1 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value1; } ${goNext}`;
         }
         return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+      }
+      case "dup2_x2": {
+        if (!stackWidthsBefore || stackWidthsBefore.length < 2) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unverified dup2_x2 stack widths" };`;
+        }
+        const top = stackWidthsBefore.length - 1;
+        if (stackWidthsBefore[top] === 2) {
+          if (stackWidthsBefore[top - 1] === 2) {
+            // Form 4: ..., value2(category 2), value1(category 2)
+            return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+          }
+          if (stackWidthsBefore.length < 3 ||
+              stackWidthsBefore[top - 1] !== 1 ||
+              stackWidthsBefore[top - 2] !== 1) {
+            return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "invalid dup2_x2 form 3" };`;
+          }
+          // Form 3: ..., value3(category 1), value2(category 1),
+          // value1(category 2)
+          return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+        }
+        if (stackWidthsBefore[top] !== 1 ||
+            stackWidthsBefore[top - 1] !== 1 ||
+            stackWidthsBefore.length < 3) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "invalid dup2_x2 top pair" };`;
+        }
+        if (stackWidthsBefore[top - 2] === 2) {
+          // Form 2: ..., value3(category 2), value2(category 1),
+          // value1(category 1)
+          return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+        }
+        if (stackWidthsBefore.length < 4 ||
+            stackWidthsBefore[top - 2] !== 1 ||
+            stackWidthsBefore[top - 3] !== 1) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "invalid dup2_x2 form 1" };`;
+        }
+        // Form 1: four category-1 values.
+        return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; const value4 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value4; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
       }
       case "pop": return `sp -= 1; ${goNext}`;
       case "iadd": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] + b) | 0; } ${goNext}`;
@@ -4346,6 +4686,26 @@ class JitCompiler {
     if (!target || target.positionalInvoker === null) return null;
     if (target.positionalInvoker) return target.positionalInvoker;
     const { method, lookupClass, generated } = target;
+    const positionalTracePattern = typeof process !== "undefined" && process.env
+      ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+    const positionalTraceKey = method
+      ? `${lookupClass}.${method.name}${site.descriptor}` : "";
+    const positionalTrace = Boolean(
+      positionalTracePattern && positionalTraceKey.includes(positionalTracePattern));
+    if (positionalTrace) {
+      console.error("[positional-selection]", JSON.stringify({
+        method: positionalTraceKey,
+        synchronous: generated?.jvmSynchronous === true,
+        direct: typeof generated?.jvmDirectPositionalBody === "function",
+        restoring:
+          typeof generated?.jvmRestoringDirectPositionalBody === "function",
+        intrinsic: Boolean(target.intrinsic),
+        inline: Boolean(target.inlineIntegerRegion),
+        memoized: Boolean(target.memoizedIntegralLeaf),
+        fused: Boolean(method && this.fusedRegions.enabled &&
+          this.fusedRegions.mayFuse(method)),
+      }));
+    }
     if (!method || !generated || generated.jvmSynchronous !== true ||
         target.intrinsic || target.inlineIntegerRegion || target.memoizedIntegralLeaf ||
         this.fusedRegions.enabled && this.fusedRegions.mayFuse(method)) {
@@ -4384,9 +4744,13 @@ class JitCompiler {
         method,
         lookupClass,
         semantic: generated.jvmRestoringDirectPositionalPlan || null,
-        restoreFrame: (thread, child) => {
+        restoreFrame: (thread, child, restorationDepth) => {
           const frames = thread.callStack.items;
-          if (!frames.includes(child)) frames.push(child);
+          if (frames.includes(child)) return;
+          const insertion = Number.isInteger(restorationDepth)
+            ? Math.max(0, Math.min(restorationDepth, frames.length))
+            : frames.length;
+          frames.splice(insertion, 0, child);
         },
       };
       target.positionalInvoker =
@@ -4415,8 +4779,7 @@ class JitCompiler {
     const staticGuard = site.op === "invokestatic"
       ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
-    const tracePattern = typeof process !== "undefined" && process.env
-      ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+    const tracePattern = positionalTracePattern;
     const methodKey = `${lookupClass}.${method.name}${site.descriptor}`;
     const trace = Boolean(tracePattern && methodKey.includes(tracePattern));
     const traceEntry = trace
@@ -4709,6 +5072,7 @@ class JitCompiler {
         ? this.getSynchronousIntrinsic(method, descriptor)
         : null;
       const pendingIntrinsicCandidates =
+        this.guestKernelOraclesEnabled &&
         op === "invokestatic" && !structuralIntrinsic ? [
           ...(HandwrittenPolygonRaster.candidateDependencies(
             this, method, descriptor) || []),
@@ -4764,6 +5128,15 @@ class JitCompiler {
             receiverType: null,
             debugGuarded: positional.jvmDebugGuarded === true,
           };
+          const tracePattern = typeof process !== "undefined" && process.env
+            ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+          const traceKey = `${lookupClass}.${method.name}${descriptor}`;
+          if (tracePattern && traceKey.includes(tracePattern)) {
+            console.error("[positional-published]", JSON.stringify({
+              method: traceKey,
+              debugGuarded: site.fastPositional.debugGuarded,
+            }));
+          }
         }
       } else if (op === "invokespecial") {
         // Private/super helpers are monomorphic by bytecode semantics. Cache
@@ -4857,6 +5230,32 @@ class JitCompiler {
 
   tryInvokeResolvedTarget(site, target, frame, thread) {
     const { op, descriptor, params, returnType } = site;
+    const receiverSlots = op === "invokestatic" ? 0 : 1;
+    const availableOperands = frame.stack.items.length;
+    const requiredOperands = params.length + receiverSlots;
+    if (availableOperands < requiredOperands) {
+      this.syncOperandUnderflowFallbackCount += 1;
+      const callerMethod = frame.method || {};
+      const caller = `${frame.className || callerMethod.className || "<unknown>"}.` +
+        `${callerMethod.name || "<unknown>"}${callerMethod.descriptor || ""}`;
+      const callee = `${target.lookupClass || site.declaredClassName || "<unknown>"}.` +
+        `${target.method?.name || site.methodName || "<unknown>"}${descriptor}`;
+      const signature = `${caller}@${frame.pc}:${op}:${callee}:` +
+        `${availableOperands}/${requiredOperands}`;
+      if (!this.reportedSyncOperandUnderflows.has(signature)) {
+        this.reportedSyncOperandUnderflows.add(signature);
+        console.error("[jit-sync-operand-underflow]", {
+          caller,
+          callerPc: frame.pc,
+          callee,
+          op,
+          availableOperands,
+          requiredOperands,
+          hostStack: new Error("generated invocation operand underflow").stack,
+        });
+      }
+      return ASYNC_INVOKE;
+    }
     const {
       method, lookupClass, inlineIntegerRegion, memoizedIntegralLeaf, generated,
     } = target;
@@ -4879,9 +5278,9 @@ class JitCompiler {
         }
       }
     }
-    const receiver = op === "invokestatic"
-      ? null
-      : frame.stack.items[frame.stack.items.length - params.length - 1];
+    const receiver = receiverSlots
+      ? frame.stack.items[availableOperands - params.length - 1]
+      : null;
     if (this.jvm.debugManager.isClassJitDeopted(lookupClass)) return ASYNC_INVOKE;
     if (this.fusedRegions.enabled) {
       const fused = this.fusedRegions.tryInvoke(site, target, frame, thread);
@@ -4948,6 +5347,8 @@ class JitCompiler {
     delete child.jitSkipOnce;
     delete child.jitJsDisabled;
     delete child.jitAdaptiveEntryCounted;
+    delete child.jitGeneratedReturnParent;
+    delete child.jitGeneratedReturnType;
     child.className = lookupClass;
     let localIndex = 0;
     if (op !== "invokestatic") {
@@ -4958,13 +5359,21 @@ class JitCompiler {
       child.locals[localIndex] = frame.stack.items[argumentBase + i];
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
-    frame.stack.items.length = argumentBase - (op === "invokestatic" ? 0 : 1);
+    frame.stack.items.length = argumentBase - receiverSlots;
     thread.callStack.push(child);
     const result = this.runGeneratedFrame(generated, child, thread, false);
     if (result && typeof result.then === "function") {
       throw new Error("Synchronous generated method returned a Promise");
     }
-    if (result.deopt) return result;
+    if (result.deopt) {
+      // Omitted/generated frame restoration can insert more than one caller
+      // around a suspended child. Record the verified immediate parent rather
+      // than assuming whichever Frame is on top when the child eventually
+      // returns is the correct operand-stack recipient.
+      child.jitGeneratedReturnParent = frame;
+      child.jitGeneratedReturnType = returnType;
+      return result;
+    }
     target.freeFrame = child;
     if (memoKey !== NO_MEMO_KEY) {
       if (memoizedIntegralLeaf.values.size >= memoizedIntegralLeaf.maxEntries) {
@@ -4992,7 +5401,8 @@ class JitCompiler {
     const code = method.attributes.find((attribute) => attribute.type === "code");
     const codeItems = code && this.getCodeItems(method);
     const labels = codeItems && buildLabelMap(codeItems);
-    const depths = codeItems && this.computeStackDepths(codeItems, labels);
+    const depths = codeItems &&
+      this.computeStackDepths(codeItems, labels, method);
     if (!code || !depths || codeItems.length > 4096) {
       this.memoizedIntegralLeafCache.set(method, null);
       return null;
@@ -5073,46 +5483,56 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
-    if (HandwrittenAffineSpriteRaster.DESCRIPTOR.test(descriptor)) {
-      if (this.affineSpriteRasterIntrinsicCache.has(method)) {
-        return this.affineSpriteRasterIntrinsicCache.get(method);
-      }
-      const affineSpriteRaster = HandwrittenAffineSpriteRaster.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      if (affineSpriteRaster) {
-        this.affineSpriteRasterIntrinsicCache.set(method, affineSpriteRaster);
-        return affineSpriteRaster;
-      }
+    // The only production intrinsic recognized from guest bytecode is the
+    // small, general primitive-array memmove idiom below. Avoid canonicalizing
+    // every arbitrary callee merely to discover that large guest-kernel
+    // oracles are disabled.
+    if (!this.guestKernelOraclesEnabled &&
+        descriptor !== "([II[III)V") {
+      return null;
     }
-    if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
-      if (this.perspectiveSpanIntrinsicCache.has(method)) {
-        return this.perspectiveSpanIntrinsicCache.get(method);
+    if (this.guestKernelOraclesEnabled) {
+      if (HandwrittenAffineSpriteRaster.DESCRIPTOR.test(descriptor)) {
+        if (this.affineSpriteRasterIntrinsicCache.has(method)) {
+          return this.affineSpriteRasterIntrinsicCache.get(method);
+        }
+        const affineSpriteRaster = HandwrittenAffineSpriteRaster.createIntrinsic(
+          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+        if (affineSpriteRaster) {
+          this.affineSpriteRasterIntrinsicCache.set(method, affineSpriteRaster);
+          return affineSpriteRaster;
+        }
       }
-      const perspectiveSpan = HandwrittenPerspectiveSpan.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      if (perspectiveSpan) {
-        this.perspectiveSpanIntrinsicCache.set(method, perspectiveSpan);
-        return perspectiveSpan;
+      if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
+        if (this.perspectiveSpanIntrinsicCache.has(method)) {
+          return this.perspectiveSpanIntrinsicCache.get(method);
+        }
+        const perspectiveSpan = HandwrittenPerspectiveSpan.createIntrinsic(
+          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+        if (perspectiveSpan) {
+          this.perspectiveSpanIntrinsicCache.set(method, perspectiveSpan);
+          return perspectiveSpan;
+        }
       }
-    }
-    if (descriptor === "([II)V" || descriptor === "([III)V") {
-      if (this.polygonRasterIntrinsicCache.has(method)) {
-        return this.polygonRasterIntrinsicCache.get(method);
+      if (descriptor === "([II)V" || descriptor === "([III)V") {
+        if (this.polygonRasterIntrinsicCache.has(method)) {
+          return this.polygonRasterIntrinsicCache.get(method);
+        }
+        const polygon = HandwrittenPolygonRaster.createIntrinsic(
+          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+        // A structurally referenced span owner may not have been loaded on the
+        // first cold query. Cache only a positive proof so a later hot call can
+        // retry after ordinary class loading completes.
+        if (polygon) {
+          this.polygonRasterIntrinsicCache.set(method, polygon);
+          return polygon;
+        }
       }
-      const polygon = HandwrittenPolygonRaster.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      // A structurally referenced span owner may not have been loaded on the
-      // first cold query.  Cache only a positive proof so a later hot call can
-      // retry after ordinary class loading completes.
-      if (polygon) {
-        this.polygonRasterIntrinsicCache.set(method, polygon);
-        return polygon;
+      if (descriptor === HandwrittenTiledBlit.DESCRIPTOR) {
+        const tiledBlit = HandwrittenTiledBlit.createIntrinsic(
+          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
+        if (tiledBlit) return tiledBlit;
       }
-    }
-    if (descriptor === HandwrittenTiledBlit.DESCRIPTOR) {
-      const tiledBlit = HandwrittenTiledBlit.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      if (tiledBlit) return tiledBlit;
     }
     const codeItems = this.getCodeItems(method);
     const rawOps = codeItems
@@ -5154,6 +5574,12 @@ class JitCompiler {
       intrinsic.jvmDirectKind = "primitiveArrayCopy";
       return intrinsic;
     }
+
+    // Everything below this point is a complete guest rendering algorithm,
+    // selected by a long opcode/constant fingerprint and replaced by
+    // handwritten JavaScript. It remains available as a differential oracle,
+    // but normal execution must compile those bytecodes through structured SSA.
+    if (!this.guestKernelOraclesEnabled) return null;
 
     if (descriptor === "(IIII)V") {
       const spanOps = [
@@ -5289,7 +5715,8 @@ class JitCompiler {
       const codeVerified =
         (!exceptionTable.length ||
           this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
-        Boolean(this.computeStackDepths(codeItems, buildLabelMap(codeItems)));
+        Boolean(this.computeStackDepths(
+          codeItems, buildLabelMap(codeItems), method));
       if (!codeVerified || ops.length !== gradientOps.length ||
           !gradientOps.every((op, index) => ops[index] === op)) return null;
       const constants = codeItems.filter((item) =>
@@ -5387,7 +5814,8 @@ class JitCompiler {
       const codeVerified =
         (!exceptionTable.length ||
           this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
-        Boolean(this.computeStackDepths(codeItems, buildLabelMap(codeItems)));
+        Boolean(this.computeStackDepths(
+          codeItems, buildLabelMap(codeItems), method));
       if (!codeVerified || ops.length !== transparentIntBlitOps.length ||
           !transparentIntBlitOps.every((op, index) => ops[index] === op)) return null;
       const intrinsic = (stack, base) => this.transparentIntBlitDirect(
@@ -7002,7 +7430,7 @@ function expandWideInstruction(instruction) {
   return { op, arg: parts[1] };
 }
 
-function stackEffect(instruction) {
+function stackEffect(instruction, stackWidthsBefore = null) {
   const op = getOp(instruction);
   if (!op || op === "nop" || op === "goto" || op === "goto_w" || op === "iinc" ||
       op === "ineg" || op === "i2b" || op === "i2s" || op === "i2c" ||
@@ -7023,7 +7451,14 @@ function stackEffect(instruction) {
   if (op === "dup") return 1;
   if (op === "dup_x1") return 1;
   if (op === "dup_x2") return 1;
-  if (op === "dup2") return 2;
+  if (op === "dup2") {
+    if (!stackWidthsBefore || stackWidthsBefore.length < 1) return null;
+    return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? 1 : 2;
+  }
+  if (op === "dup2_x2") {
+    if (!stackWidthsBefore || stackWidthsBefore.length < 2) return null;
+    return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? 1 : 2;
+  }
   if (op === "putfield") return -2;
   if (op.endsWith("aload") || [
     "iadd", "isub", "imul", "idiv", "irem", "ishl", "ishr", "iushr",

@@ -65,7 +65,7 @@
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const {
   addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
-  addNewImport,
+  addNewImport, addTypedArrayStoreImports,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -241,14 +241,21 @@ class MethodTranslator {
           return t === T.ref ? value : toWasmValue(t, value);
         };
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
-      self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-        if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${name}`);
-        if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
-          throw AIOOBE(i, monoArray.len(a));
-        }
-      });
+      if (!self.wasmJit.typedArrayStoresEnabled) {
+        self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+          if (a === null || a === undefined) {
+            throw NPE(`Attempted store on null array in ${name}`);
+          }
+          if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+            throw AIOOBE(i, monoArray.len(a));
+          }
+        });
+      }
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+    if (self.wasmJit.typedArrayStoresEnabled) {
+      addTypedArrayStoreImports(self, name);
+    }
     self.addImport('alen', [T.ref], [T.i32], (a) => {
       if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${name}`);
       return monoArray.len(a);
@@ -1632,7 +1639,9 @@ class MethodTranslator {
       } else if (op in ARRAY_STORE) {
         const t = ARRAY_STORE[op];
         pop(); pop(T.i32); pop(T.ref);
-        emit(OP.call, ...uleb(this.importIndexByName.get(`aset_${sig(t)}`)));
+        const storeImport = this.wasmJit.typedArrayStoresEnabled
+          ? `aset_${op}` : `aset_${sig(t)}`;
+        emit(OP.call, ...uleb(this.importIndexByName.get(storeImport)));
       } else if (op === 'arraylength') {
         pop(T.ref);
         emit(OP.call, ...uleb(this.importIndexByName.get('alen')));
@@ -1949,6 +1958,8 @@ class WasmJit {
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.fieldCacheEnabled = env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
+    this.typedArrayStoresEnabled =
+      env.JVM_DISABLE_WASM_TYPED_ARRAY_STORES !== '1';
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
@@ -2404,8 +2415,29 @@ class WasmJit {
     if (!method || (method.flags || []).includes('static') !== !instance) return null;
     const code = method.attributes && method.attributes.find((a) => a.type === 'code');
     if (!code) return null;
+    const codeItems = code.code.codeItems;
+    // Exception reporters are entered only by the JVM exception dispatcher;
+    // they are not normal successors of the protected bytecodes. Summarize
+    // the verifier-reachable normal graph so a handler-only StringBuilder or
+    // wrapper call does not make an otherwise pure arithmetic helper appear
+    // to mutate arbitrary caller state. If the generic verifier cannot prove
+    // the graph, retain the previous conservative whole-method scan.
+    let normalDepths = null;
+    const jit = this.jvm.jit;
+    if (jit && typeof jit.computeStackDepths === 'function') {
+      const labels = new Map();
+      codeItems.forEach((item, index) => {
+        if (!item?.labelDef) return;
+        const label = item.labelDef.endsWith(':')
+          ? item.labelDef.slice(0, -1) : item.labelDef;
+        labels.set(label, index);
+      });
+      normalDepths = jit.computeStackDepths(codeItems, labels);
+    }
     const keys = new Set();
-    for (const item of code.code.codeItems) {
+    for (let index = 0; index < codeItems.length; index += 1) {
+      if (normalDepths && normalDepths[index] === undefined) continue;
+      const item = codeItems[index];
       if (!item.instruction) continue;
       const op = getOp(item.instruction);
       if (op === 'putfield' || op === 'putstatic') {
