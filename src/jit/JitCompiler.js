@@ -1192,6 +1192,11 @@ class JitCompiler {
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
+      // drem/l2d were the only opcodes left rejecting orbdefence's hot
+      // ja.a(B)I, which took the slow scheduler path on 100% of its samples
+      // and 66% of scheduler time. stackEffect already scored both; only the
+      // emitter cases and this gate entry were missing.
+      "drem", "l2d",
     ]);
 
     const hasNumericHotPath = codeItems.some((item) => {
@@ -3368,6 +3373,9 @@ class JitCompiler {
       case "fmul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] * b); } ${goNext}`;
       case "fdiv": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] / b); } ${goNext}`;
       case "frem": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] % b); } ${goNext}`;
+      // Doubles need no rounding step, unlike frem above: JS % on two doubles
+      // already matches the JVM's drem for every finite and non-finite case.
+      case "drem": return `{ const b = stack[--sp]; stack[sp - 1] = stack[sp - 1] % b; } ${goNext}`;
       case "fneg": return `stack[sp - 1] = Math.fround(-stack[sp - 1]); ${goNext}`;
       case "i2d": return goNext;
       case "i2b": return `stack[sp - 1] = (stack[sp - 1] << 24) >> 24; ${goNext}`;
@@ -3384,6 +3392,9 @@ class JitCompiler {
       // operand in BigInt() before operating, and mixing throws in JS, so the
       // generated tier must convert identically.
       case "l2i": return `{ const value = stack[sp - 1]; stack[sp - 1] = Number(BigInt.asIntN(32, typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value))))); } ${goNext}`;
+      // Number() widens a BigInt long and leaves an already-Number long
+      // (uninitialized field) alone, so no typeof branch is needed here.
+      case "l2d": return `stack[sp - 1] = Number(stack[sp - 1]); ${goNext}`;
       case "lxor": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) ^ BigInt(b)); } ${goNext}`;
       case "ladd": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) + BigInt(b)); } ${goNext}`;
       case "lsub": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) - BigInt(b)); } ${goNext}`;
@@ -3751,6 +3762,7 @@ class JitCompiler {
         case "fmul": stack.push(Math.fround(stack.pop() * stack.pop())); break;
         case "fdiv": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a / b)); break; }
         case "frem": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a % b)); break; }
+        case "drem": { const b = stack.pop(); const a = stack.pop(); stack.push(a % b); break; }
         case "fneg": stack.push(Math.fround(-stack.pop())); break;
         case "i2d": break;
         case "i2l": stack.push(BigInt(stack.pop())); break;
@@ -3761,6 +3773,7 @@ class JitCompiler {
         case "i2b": stack.push((stack.pop() << 24) >> 24); break;
         case "d2i": stack.push(Math.trunc(stack.pop()) | 0); break;
         case "l2i": stack.push(Number(BigInt.asIntN(32, stack.pop()))); break;
+        case "l2d": stack.push(Number(stack.pop())); break;
         case "lxor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
         case "ldiv": {
           const b = stack.pop();
