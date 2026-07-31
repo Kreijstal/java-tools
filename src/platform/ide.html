@@ -100,6 +100,21 @@
       </div>
     </div>
 
+    <div id="panel-shell" class="ide-panel-content">
+      <div class="ide-panel-toolbar">
+        <button type="button" id="shellRunBtn" title="Evaluate">▶ Run</button>
+        <button type="button" id="shellClearBtn" title="Clear log">🗑 Clear</button>
+      </div>
+      <div class="ide-panel-body">
+        <div id="shellLog" class="shell-log"></div>
+        <div class="shell-prompt">
+          <span class="shell-caret">&gt;</span>
+          <input type="text" id="shellInput" class="shell-input" autocomplete="off"
+                 spellcheck="false" placeholder="Java expression, or :help">
+        </div>
+      </div>
+    </div>
+
     <div id="panel-debug" class="ide-panel-content">
       <div class="ide-panel-body">
         <div class="debug-section">

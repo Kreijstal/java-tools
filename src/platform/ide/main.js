@@ -12,6 +12,7 @@ const mobile = require('./mobileLayout');
 const documents = require('./documents');
 const explorer = require('./explorer');
 const actions = require('./actions');
+const shell = require('./shell');
 const {
   byId,
   parentPath,
@@ -147,6 +148,7 @@ function layoutConfig() {
                 bottomPanel('output', 'Output'),
                 bottomPanel('display', 'Display'),
                 bottomPanel('debug', 'Debug'),
+                bottomPanel('shell', 'Shell'),
                 bottomPanel('bytecode', 'Bytecode'),
               ],
             },
@@ -401,6 +403,7 @@ function boot() {
 
   initLayout();
   wireToolbar();
+  shell.initShell();
   explorer.refreshTree();
 
   bootWorkspace().catch((error) => {
