@@ -33,7 +33,7 @@
     "serve": "node scripts/serve.js",
     "run:jar": "node scripts/runJar.js",
     "jshell": "node scripts/jshell.js",
-    "build:java": "node scripts/compileJava.js sources/*.java --out sources",
+    "build:java": "node scripts/compileJava.js sources/*.java sources/pkg/demo/*.java --out sources",
     "build:bundle": "node scripts/generate-jre-index && webpack --mode production",
     "generate": "node scripts/generateData.js",
     "build": "npm run generate && npm run build:bundle && node scripts/buildSite.js",

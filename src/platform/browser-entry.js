@@ -426,6 +426,17 @@ class BrowserJVMDebug {
   }
 
   /**
+   * Compile and run a Java snippet against the live heap.
+   * Requires debug mode; the snippet is guest code with full side effects.
+   * @param {string} source - a Java expression or block of statements
+   * @param {object} options - { stepBudget, sourceLevel }
+   * @returns {Promise<object>} - Evaluated value and generated class names
+   */
+  async evaluate(source, options = {}) {
+    return this.debugController.evaluate(source, options);
+  }
+
+  /**
    * Get available variable names for locals
    * @returns {Array} - Local variable names
    */

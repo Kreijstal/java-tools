@@ -7,6 +7,11 @@ class DebugManager {
     this.isPaused = true;
     this.breakpoints = new Set();
     this.breakpointLocations = new Map(); // pc -> Set<className>
+    // pc -> Set<"Class" | "Class.method(descriptor)">.  A pc listed here fires
+    // only inside a matching frame.  Breakpoints registered without a strict
+    // location keep the historical behaviour of firing at that bytecode offset
+    // in any method, so existing callers are unaffected.
+    this.strictBreakpointLocations = new Map();
     this.jitDeoptedClasses = new Set();
   }
 
@@ -40,6 +45,41 @@ class DebugManager {
     this.runMode = mode;
   }
 
+  static locationKey(location) {
+    if (!location || !location.className) return null;
+    if (!location.methodName) return location.className;
+    return `${location.className}.${location.methodName}${location.descriptor || ''}`;
+  }
+
+  /**
+   * Register a breakpoint that fires only in the given class (and method, when
+   * one is supplied), rather than at that bytecode offset everywhere.
+   */
+  addStrictBreakpoint(pc, location) {
+    const key = DebugManager.locationKey(location);
+    if (!key) {
+      throw new Error('A strict breakpoint requires at least a className');
+    }
+    this.addBreakpoint(pc, location);
+    const keys = this.strictBreakpointLocations.get(pc) || new Set();
+    keys.add(key);
+    this.strictBreakpointLocations.set(pc, keys);
+    return { pc, location: key };
+  }
+
+  /**
+   * Decide whether execution should stop at `pc` inside `location`.
+   * Unlocated breakpoints match anywhere; strict ones must match the frame.
+   */
+  shouldBreakAt(pc, location = null) {
+    if (!this.breakpoints.has(pc)) return false;
+    const keys = this.strictBreakpointLocations.get(pc);
+    if (!keys || keys.size === 0) return true;
+    if (!location || !location.className) return false;
+    if (keys.has(location.className)) return true;
+    return keys.has(DebugManager.locationKey(location));
+  }
+
   addBreakpoint(pc, location = null) {
     this.breakpoints.add(pc);
     if (location && location.className) {
@@ -52,6 +92,7 @@ class DebugManager {
 
   removeBreakpoint(pc, location = null) {
     this.breakpoints.delete(pc);
+    this.strictBreakpointLocations.delete(pc);
     if (location && location.className) {
       const classNames = this.breakpointLocations.get(pc);
       if (classNames) {
@@ -69,6 +110,7 @@ class DebugManager {
   clearBreakpoints() {
     this.breakpoints.clear();
     this.breakpointLocations.clear();
+    this.strictBreakpointLocations.clear();
     this.jitDeoptedClasses.clear();
   }
 

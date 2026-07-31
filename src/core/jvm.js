@@ -1028,7 +1028,14 @@ class JVM {
                 const currentPc = label
                   ? parseInt(label.substring(1, label.length - 1))
                   : -1;
-                if (this.debugManager.breakpoints.has(currentPc)) {
+                // A bare offset matches anywhere; a located breakpoint must
+                // also match the frame's class/method, so an offset such as 6
+                // no longer stops in every method that reaches it.
+                if (this.debugManager.shouldBreakAt(currentPc, {
+                  className: frame.className,
+                  methodName: frame.method && frame.method.name,
+                  descriptor: frame.method && frame.method.descriptor,
+                })) {
                   this.debugManager.pause();
                 }
               }
@@ -1770,6 +1777,7 @@ class JVM {
           if (classData && classData.ast) {
             this.classes[classNameWithSlashes] = classData;
             this.classEpoch += 1;
+            this._notifyClassLoaded(classNameWithSlashes, classData);
             return classData;
           }
           continue;
@@ -1781,6 +1789,7 @@ class JVM {
           if (classData && classData.ast) {
             this.classes[classNameWithSlashes] = classData;
             this.classEpoch += 1;
+            this._notifyClassLoaded(classNameWithSlashes, classData);
             return classData;
           }
         } catch (error) {
@@ -3017,8 +3026,42 @@ class JVM {
   disableDebugMode() {
     this.debugManager.disable();
   }
+  /**
+   * Observe lazy class loading.  A debugger needs this to arm a breakpoint on
+   * a class that has not been reached yet: the location cannot be resolved
+   * until the class exists, and by the time it is running it is too late.
+   */
+  onClassLoaded(listener) {
+    if (typeof listener !== 'function') return () => {};
+    if (!this._classLoadListeners) this._classLoadListeners = [];
+    this._classLoadListeners.push(listener);
+    return () => {
+      this._classLoadListeners =
+        this._classLoadListeners.filter((entry) => entry !== listener);
+    };
+  }
+
+  _notifyClassLoaded(className, classData) {
+    if (!this._classLoadListeners || !this._classLoadListeners.length) return;
+    for (const listener of [...this._classLoadListeners]) {
+      try {
+        listener(className, classData);
+      } catch (error) {
+        // A misbehaving observer must never break class loading.
+        if (this.verbose) {
+          console.error(`class-load listener failed: ${error.message}`);
+        }
+      }
+    }
+  }
+
   addBreakpoint(pc) {
     this.debugManager.addBreakpoint(pc, this.getCurrentBreakpointLocation());
+  }
+
+  /** Breakpoint bound to a specific class/method rather than a bare offset. */
+  addLocatedBreakpoint(pc, location) {
+    return this.debugManager.addStrictBreakpoint(pc, location);
   }
   removeBreakpoint(pc) {
     this.debugManager.removeBreakpoint(pc, this.getCurrentBreakpointLocation());
