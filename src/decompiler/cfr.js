@@ -5719,7 +5719,49 @@ function decompileStructuredControlFlow(code, method, cls, localState) {
   return coalesceDefaultConstructorBody(lines, method);
 }
 
+// The matcher cascade below is speculative: at each index it offers the range to
+// ~15 matchers in turn, and a matcher that decompiles a sub-range only to reject
+// it leaves that work to be done again by the next matcher, and again one level
+// up.  On ordinary methods the repetition is invisible.  On aceofskies/eg.class
+// -- one 968-instruction method with 29 gotos -- it explodes: 50,000 calls in 59
+// seconds resolving just 25 distinct (start,end) pairs, climbing forever, so the
+// class never finishes decompiling at any timeout.  Three other games wedge the
+// same way (kickabout os.class among them).
+//
+// The tree is re-computation, not recursion: instrumenting an in-progress set
+// showed a range is never re-entered while still on the stack.  So caching each
+// range's result collapses the explosion to one computation per distinct
+// subproblem.
+//
+// The key carries the incoming operand stack, not just the bounds: the same
+// bytecode range decompiles differently under a different stack, so bounds alone
+// would hand back another subproblem's answer.
+function rangeCacheKey(start, end, stack) {
+  let key = `${start}:${end}`;
+  for (const entry of stack) key += `${entry && entry.type}${entry && entry.code}`;
+  return key;
+}
+
 function decompileRange(codeItems, start, end, context, initialStack = []) {
+  const cache = context.__rangeCache || (context.__rangeCache = new Map());
+  const cacheKey = rangeCacheKey(start, end, initialStack);
+  const cached = cache.get(cacheKey);
+  if (cached) {
+    // Callers pass a live stack and read their own array back afterwards, so a
+    // cache hit has to reproduce the mutation, not just the return value.
+    initialStack.splice(0, initialStack.length, ...cached.stack);
+    return cached.ok
+      ? { ok: true, lines: cached.lines.slice(), stack: initialStack }
+      : { ok: false, lines: cached.lines.slice() };
+  }
+  const record = (result) => {
+    cache.set(cacheKey, {
+      ok: result.ok,
+      lines: result.lines.slice(),
+      stack: (result.stack || initialStack).slice(),
+    });
+    return result;
+  };
   const stack = initialStack;
   const lines = [];
   let index = start;
@@ -5863,12 +5905,12 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       if (process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
         console.error(`${context.cls.className}.${context.method.name}${context.method.descriptor}: range structurer stopped at pc ${codeItems[index].pc} (${instruction.op})`);
       }
-      return { ok: false, lines };
+      return record({ ok: false, lines });
     }
     lines.push(...one);
     index += 1;
   }
-  return { ok: true, lines, stack };
+  return record({ ok: true, lines, stack });
 }
 
 // javac.js emits the normal `dup; astore lock; monitorenter ... aload lock;
