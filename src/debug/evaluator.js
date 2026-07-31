@@ -230,8 +230,15 @@ function describeValue(jvm, value) {
   if (typeof value === 'bigint') {
     return { value: value.toString(), display: value.toString(), type: 'long' };
   }
-  if (typeof value === 'number' || typeof value === 'boolean') {
-    return { value, display: String(value), type: typeof value };
+  if (typeof value === 'boolean') {
+    return { value, display: String(value), type: 'boolean' };
+  }
+  if (typeof value === 'number') {
+    // A boxed result carries its Java type; a bare JS number reached here
+    // unboxed, so int and double are indistinguishable.  Reporting the JS
+    // `typeof` instead printed "1035 (number)" in a Java debugger, which is
+    // worse than saying nothing.
+    return { value, display: String(value) };
   }
   if (typeof value === 'object' && value.type === 'java/lang/String') {
     const text = typeof jvm.toJsString === 'function'

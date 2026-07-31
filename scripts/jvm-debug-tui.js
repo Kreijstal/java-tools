@@ -16,8 +16,8 @@ const DebugController = require('../src/debug/debugController');
 
 const KEY_HELP = [
   'c/F5 continue', 'n/F10 step over', 's/F11 step into', 'o/F12 step out',
-  'i step insn', 'f finish', 'r rewind', 'b set bp', 'Tab focus prompt',
-  'q quit',
+  'i step insn', 'f finish', 'r rewind', 'b set bp',
+  ': / Enter / Tab prompt', 'q quit',
 ].join('  |  ');
 
 const PROMPT_HELP = [
@@ -116,15 +116,22 @@ function createUi() {
     width: '60%', height: '27%', border, style,
     scrollable: true, alwaysScroll: true, tags: true,
   });
+  // Nothing else on screen says whether keystrokes go to the prompt or to the
+  // single-key commands, and the two do very different things, so the gutter
+  // reports which one has the keyboard.
+  const gutter = blessed.box({
+    parent: screen, bottom: 0, left: 0, width: 2, height: 1,
+    tags: true, content: '{grey-fg}·{/grey-fg} ',
+  });
   const prompt = blessed.textbox({
-    parent: screen, bottom: 0, left: 0, width: '100%', height: 1,
+    parent: screen, bottom: 0, left: 2, width: '100%-2', height: 1,
     inputOnFocus: true, style: { fg: 'white' },
   });
   const status = blessed.box({
     parent: screen, bottom: 1, left: 0, width: '100%', height: 1,
     tags: true, style: { fg: 'black', bg: 'cyan' },
   });
-  return { screen, code, locals, stack, threads, log, prompt, status };
+  return { screen, code, locals, stack, threads, log, prompt, status, gutter };
 }
 
 async function main() {
@@ -147,7 +154,13 @@ async function main() {
     }
     while (lines.length > 500) lines.shift();
     ui.log.setContent(lines.join('\n'));
+    // blessed derives the scroll height from the *rendered* box, so asking for
+    // the bottom before a render silently does nothing: once the pane filled
+    // up, the newest line -- the answer just asked for -- stayed below the
+    // fold while stale output held the screen.
+    ui.screen.render();
     ui.log.setScrollPerc(100);
+    ui.screen.render();
   };
 
   const render = () => {
@@ -225,6 +238,19 @@ async function main() {
     render();
   };
 
+  // ---------- prompt focus ----------
+  const setGutter = (focused) => {
+    ui.gutter.setContent(focused ? '{cyan-fg}>{/cyan-fg} ' : '{grey-fg}·{/grey-fg} ');
+    ui.screen.render();
+  };
+  const focusPrompt = (seed = '') => {
+    ui.prompt.setValue(seed);
+    ui.prompt.focus();
+    ui.screen.render();
+  };
+  ui.prompt.on('focus', () => setGutter(true));
+  ui.prompt.on('blur', () => setGutter(false));
+
   // ---------- key bindings ----------
   const keys = {
     'C-c': () => process.exit(0),
@@ -243,7 +269,13 @@ async function main() {
       const state = controller.getCurrentState();
       guard('breakpoint', () => controller.setBreakpoint(state.pc));
     },
-    tab: () => ui.prompt.focus(),
+    tab: () => focusPrompt(),
+    // Typing ":b Work.tick" straight at the screen used to be swallowed a
+    // letter at a time by the command keys -- ":" is not bound, but "b" sets a
+    // breakpoint and "o" steps out.  Opening the prompt on ":" is what every
+    // other modal tool does and removes the trap entirely.
+    ':': () => focusPrompt(':'),
+    enter: () => focusPrompt(),
     '?': () => say(PROMPT_HELP, 'grey'),
   };
   for (const [key, handler] of Object.entries(keys)) {
@@ -318,6 +350,13 @@ async function main() {
         controller.selectThread(Number(match[1]));
         return say(`selected thread ${match[1]}`, 'grey');
       }
+      // Anything still starting with ":" is a mistyped command, not Java.
+      // Passing it to the evaluator produced a compiler error that named the
+      // colon rather than saying the command does not exist.
+      if (line.startsWith(':')) {
+        return say(`unknown command "${line.split(/\s/)[0]}" — :help lists them` +
+          ' (an expression needs no colon: press Enter or Tab instead)', 'red');
+      }
       const result = await controller.evaluate(line);
       const shown = result.kind === 'statements'
         ? 'ok' : `${result.display}${result.type ? ` (${result.type})` : ''}`;
@@ -332,7 +371,11 @@ async function main() {
   ui.prompt.on('submit', async (value) => {
     ui.prompt.clearValue();
     await runPrompt(value);
-    ui.prompt.focus();
+    // Hand the keyboard back to the single-key commands, the way ":" behaves
+    // in any modal editor.  Staying in the prompt would mean "c" typed after a
+    // command silently did nothing instead of continuing execution.
+    ui.screen.focusPop();
+    setGutter(false);
   });
   // Typing a fully-qualified Java method by hand is miserable, so Tab inside
   // the prompt completes class and method names against the loaded classes.
@@ -364,10 +407,19 @@ async function main() {
     }
     return baseListener(ch, key);
   };
-  ui.prompt.key(['escape'], () => ui.screen.focusPop());
+  const leavePrompt = () => {
+    ui.prompt.clearValue();
+    ui.screen.focusPop();
+    setGutter(false);
+  };
+  ui.prompt.key(['escape'], leavePrompt);
+  // blessed's textbox cancels input on Escape without telling the screen, which
+  // left the gutter claiming focus the prompt no longer had.
+  ui.prompt.on('cancel', leavePrompt);
 
   say(`JVM debugger — ${KEY_HELP}`, 'grey');
-  say('Prompt: Tab to focus, then a Java expression or :help', 'grey');
+  say('Prompt: press : (or Enter/Tab), then a Java expression or :help', 'grey');
+  setGutter(false);
 
   try {
     await controller.start(options.className, { args: options.args });
