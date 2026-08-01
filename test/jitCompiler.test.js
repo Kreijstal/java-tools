@@ -2813,6 +2813,7 @@ public final class GenericSpanShape {
     warmupThreshold: 0,
     structuredSsa: true,
     guestKernelOracles: false,
+    checkedLeafDirectPositional: true,
   } });
   const genericClassData = await genericJvm.loadClassByName(genericClass);
   genericJvm.classInitializationState.set(genericClass, 'INITIALIZED');
@@ -2852,6 +2853,14 @@ public final class GenericSpanShape {
     'the range-proven fast loop contains only the direct array store');
   t.ok(slowBounds > fastStore,
   'the slow loop retains the throwing bounds/materialization branch');
+  const checkedLeaf = genericSpan.jvmCheckedLeafDirectPositionalBody;
+  const checkedLeafSource =
+    genericSpan.jvmCheckedLeafDirectPositionalSource || '';
+  t.equal(typeof checkedLeaf, 'function',
+    'one bounded call-free loop publishes a compact checked leaf ABI');
+  t.notOk(checkedLeafSource.includes('helpers.materialize(') ||
+      checkedLeafSource.includes('helpers.arrayStore('),
+  'the checked leaf contains no successful-path Frame or array helper');
   const runGenericSpan = (x, y, count, color, debug = false) => {
     const genericThread = {
       status: 'runnable', pendingException: null, callStack: new Stack(),
@@ -2879,6 +2888,27 @@ public final class GenericSpanShape {
     'entry static cache leaves the previous surface untouched after rebinding');
   t.deepEqual(reboundStaticPixels.slice(8, 12), [0, 0, 22, 22],
     'the next generated entry reloads the rebound static surface');
+
+  reboundStaticPixels.fill(0);
+  const checkedThread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  checkedLeaf(genericJvm.jit, 1, 1, 2, 29, checkedThread, true);
+  t.deepEqual(reboundStaticPixels.slice(8, 12), [0, 29, 29, 0],
+    'the compact leaf preserves valid clipped stores');
+
+  const rejectedPixels = new Array(10).fill(0);
+  rejectedPixels.type = '[I';
+  genericFields.set('right:I', 20);
+  genericFields.set('pixels:[I', rejectedPixels);
+  t.equal(checkedLeaf(
+    genericJvm.jit, 7, 0, 5, 44, checkedThread, true),
+  genericJvm.jit.asyncInvokeSentinel(),
+  'a failed leaf range predicate returns to canonical invocation');
+  t.ok(rejectedPixels.every((value) => value === 0),
+    'checked-leaf rejection occurs before its first guest effect');
+  genericFields.set('right:I', 8);
+  genericFields.set('pixels:[I', reboundStaticPixels);
 
   reboundStaticPixels.fill(0);
   const debuggerFallback = runGenericSpan(0, 1, 2, 33, true);
@@ -3109,6 +3139,84 @@ public final class CyclicArrayRangeHarness {
   t.end();
 });
 
+test('structured SSA versions scaled and carried induction indexes',
+  async (t) => {
+  const className = 'ScaledCarriedArrayRangeHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class ScaledCarriedArrayRangeHarness {
+  static int walk(int[] values, int bound) {
+    int previous = bound - 1;
+    int sum = 0;
+    for (int current = 0; current < bound; current++) {
+      sum += values[previous << 1];
+      sum += values[(previous << 1) + 1];
+      sum += values[current << 1];
+      sum += values[(current << 1) + 1];
+      previous = current;
+    }
+    return sum;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'walk', '([II)I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.equal(generated?.jvmStructuredScaledIndexRangeCount, 4,
+    'four shifted current/previous accesses receive structural range proofs');
+  t.equal(generated?.jvmStructuredSpecializedArrayRangeAccessCount, 4,
+    'the guarded direct loop removes all four successful-path checks');
+
+  const run = (values, bound) => {
+    const frame = new Frame(method);
+    frame.className = className;
+    frame.locals.splice(0, 2, values, bound);
+    const thread = {
+      status: 'runnable', pendingException: null, callStack: new Stack(),
+    };
+    thread.callStack.push(frame);
+    let result = null;
+    let error = null;
+    try {
+      result = generated(frame, thread, jvm.jit, false);
+    } catch (thrown) {
+      error = thrown;
+    }
+    return {frame, result, error};
+  };
+  const values = [1, 2, 3, 4, 5, 6, 7, 8];
+  values.type = '[I';
+  const valid = run(values, 4);
+  t.equal(valid.error, null,
+    'the scaled fast loop executes valid carried indexes');
+  t.equal(valid.result?.value, 72,
+    'current and previous pairs retain exact Java ordering');
+
+  const short = [1, 2, 3, 4, 5, 6, 7];
+  short.type = '[I';
+  const failed = run(short, 4);
+  const loadPcs = jvm.jit.getCodeItems(method)
+    .map((item, index) => ({item, index}))
+    .filter(({item}) =>
+      (item.instruction?.op || item.instruction) === 'iaload')
+    .map(({index}) => index);
+  t.equal(failed.error?.type, 'java/lang/ArrayIndexOutOfBoundsException',
+    'a failed scaled guard retains the Java bounds exception');
+  t.equal(failed.frame.pc, loadPcs[1],
+    'the second carried load records its exact failing bytecode PC');
+  t.equal(failed.frame.locals[3], 7,
+    'the slow loop retains the first load and local mutation');
+  t.deepEqual(failed.frame.stack.items, [7, short, 7],
+    'the failing scaled load reconstructs its exact operands');
+  t.end();
+});
+
 test('handler-protected non-void calls keep their parent frame visible',
   async (t) => {
   const className = 'HandledReturnHandoffHarness';
@@ -3140,11 +3248,19 @@ public final class HandledReturnHandoffHarness {
   const method = await jvm.findMethodInHierarchy(
     className, 'parent', '(I)I');
   const generated = jvm.jit.structuredSsa.compile(method);
-  t.equal(generated, null,
-    'the handler-bearing parent stays on the complete baseline tier');
-  t.equal(jvm.jit.structuredSsa.lastRejectionReason,
-    'handler-protected non-void call requires baseline return handoff',
-  'the structural rejection identifies the unsupported return join');
+  t.ok(generated?.jvmStructuredSsa,
+    'the renderer retains the verified positional candidate');
+  t.equal(typeof generated?.jvmRestoringDirectPositionalBody, 'function',
+    'the protected call publishes a restoring positional entry');
+  t.ok(generated.jvmStructuredRequiresBaselineFramedEntry,
+    'the call and handler shape marks the ordinary frame ABI unsafe');
+  const selected = jvm.jit.compileMethod(method);
+  t.notOk(selected.jvmStructuredSsa,
+    'ordinary frame entry uses the baseline pending-return handoff');
+  t.ok(selected.jvmStructuredPositionalOnly,
+    'tier selection records that SSA is retained only as a positional body');
+  t.equal(typeof selected.jvmRestoringDirectPositionalBody, 'function',
+    'baseline selection preserves the verified nested-call kernel');
   t.end();
 });
 
@@ -4975,6 +5091,147 @@ test('structured JVM SSA guards and folds initialized boolean static control flo
   t.end();
 });
 
+test('structured JVM SSA prunes immutable local copies of guarded booleans', (t) => {
+  const flagField = ['Field', 'UnrelatedRasterOptions', ['diagnostics', 'Z']];
+  const instructions = [
+    { op: 'getstatic', arg: flagField }, 'istore_2',
+    'iconst_0', 'istore_1',
+    'iload_1', 'iload_0', { op: 'if_icmpge', arg: 'Lreturn' },
+    'iload_2', { op: 'ifne', arg: 'Ldiagnostic' },
+    { op: 'iinc', varnum: 1, incr: 1 },
+    'iload_2', { op: 'ifeq', arg: 'Lloop' },
+    { op: 'goto', arg: 'Lreturn' },
+    { op: 'sipush', arg: 100 }, 'istore_1',
+    'iload_1', 'ireturn',
+  ];
+  const method = {
+    name: 'arbitraryGuardedLoop', descriptor: '(I)I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 4 ? 'Lloop:' : index === 13 ? 'Ldiagnostic:'
+          : index === 15 ? 'Lreturn:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '3', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  jvm.classes.UnrelatedRasterOptions = {
+    staticFields: new Map([['diagnostics:Z', 0]]),
+    ast: { classes: [{ superClassName: null, items: [] }] },
+  };
+  jvm.classInitializationState.set('UnrelatedRasterOptions', 'INITIALIZED');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the copied-boolean loop compiles without any guest identity gate');
+  t.equal(generated.jvmStructuredPrunedBooleanCfgBranchCount, 2,
+    'both branches consuming the immutable copied local are pruned');
+  t.equal(generated.jvmStructuredGuardedBooleanSiteCount, 1,
+    'the originating static location is guarded once before guest effects');
+
+  const frame = new Frame(method);
+  frame.locals[0] = 6;
+  const stack = new Stack();
+  stack.push(frame);
+  const result = generated(frame,
+    { status: 'runnable', callStack: stack }, jvm.jit, false);
+  t.deepEqual(result, { returned: true, value: 6 },
+    'the selected boolean path preserves loop results');
+
+  jvm.classes.UnrelatedRasterOptions.staticFields.set('diagnostics:Z', 1);
+  const changedFrame = new Frame(method);
+  changedFrame.locals[0] = 6;
+  changedFrame.locals[1] = 73;
+  const changedStack = new Stack();
+  changedStack.push(changedFrame);
+  const changed = generated(changedFrame,
+    { status: 'runnable', callStack: changedStack }, jvm.jit, false);
+  t.ok(changed.deopt && changed.transient,
+    'a changed source static falls back before executing the pruned CFG');
+  t.equal(changedFrame.locals[1], 73,
+    'the entry guard precedes every local or guest-state side effect');
+  t.end();
+});
+
+test('integer leaf inlining ignores unreachable diagnostic catch tails', (t) => {
+  const method = {
+    name: 'arbitraryProtectedAnd', descriptor: '(II)I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { labelDef: 'Lstart:', instruction: 'iload_0' },
+        { labelDef: 'L1:', instruction: 'iload_1' },
+        { labelDef: 'L2:', instruction: 'iand' },
+        { labelDef: 'Lend:', instruction: 'ireturn' },
+        { labelDef: 'Lhandler:', instruction: 'astore_2' },
+        { labelDef: 'L5:', instruction: 'iconst_m1' },
+        { labelDef: 'L6:', instruction: 'ireturn' },
+      ],
+      localsSize: '3', stackSize: '2',
+      exceptionTable: [{ start: 'Lstart', end: 'Lend', handler: 'Lhandler', catchType: 0 }],
+    } }],
+  };
+  const jvm = new JVM({ jit: { profileMethods: false } });
+  const plan = jvm.jit.getInlineIntegerPlan(method, ['int', 'int'], 'int');
+  t.ok(plan && plan.result,
+    'a non-throwing normal CFG is inlined despite an obfuscator catch tail');
+  t.ok(plan.statements.join(' ').includes('&'),
+    'the plan is derived from the normal integer bytecodes');
+  t.end();
+});
+
+test('counted-loop proofs follow a dominating split induction update', (t) => {
+  const flagField = ['Field', 'SplitBackedgeOptions', ['diagnostics', 'Z']];
+  const instructions = [
+    { op: 'getstatic', arg: flagField }, { op: 'istore', arg: 4 },
+    'iconst_0', 'istore_2', 'iload_1', 'ineg', 'istore_3',
+    'iload_3', { op: 'ifge', arg: 'Lreturn' },
+    'aload_0', 'iload_2', 'iload_2', 'iastore',
+    { op: 'iinc', varnum: 2, incr: 1 },
+    { op: 'iinc', varnum: 3, incr: 1 },
+    { op: 'iload', arg: 4 }, { op: 'ifne', arg: 'Lreturn' },
+    { op: 'iload', arg: 4 }, { op: 'ifeq', arg: 'Lloop' },
+    'return',
+  ];
+  const method = {
+    name: 'arbitrarySplitBackedge', descriptor: '([II)V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 7 ? 'Lloop:' : index === 19 ? 'Lreturn:'
+          : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '5', stackSize: '3', exceptionTable: [],
+    } }],
+  };
+  const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
+  jvm.classes.SplitBackedgeOptions = {
+    staticFields: new Map([['diagnostics:Z', 0]]),
+    ast: { classes: [{ superClassName: null, items: [] }] },
+  };
+  jvm.classInitializationState.set('SplitBackedgeOptions', 'INITIALIZED');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the split-backedge array loop compiles structurally');
+  t.equal(generated.jvmStructuredCountedLoopCount, 1,
+    'the unique update is accepted because it dominates the backedge');
+  t.ok(generated.jvmStructuredArrayRangeGuardCount >= 1 &&
+      generated.jvmStructuredSource.includes('ssaArrayRangeGuard'),
+    'the dominance proof unlocks a versioned array-loop guard');
+
+  const destination = new Array(8).fill(-1);
+  destination.type = '[I';
+  const frame = new Frame(method);
+  frame.locals.splice(0, 2, destination, destination.length);
+  const stack = new Stack();
+  stack.push(frame);
+  const result = generated(frame,
+    { status: 'runnable', callStack: stack }, jvm.jit, false);
+  t.ok(result?.returned, 'the ordinary generated entry returns normally');
+  t.deepEqual(destination.slice(), [0, 1, 2, 3, 4, 5, 6, 7],
+    'the branch-free fast arm preserves every store');
+  t.end();
+});
+
 test('structured JVM SSA splits bounded irreducible integer regions without name gates', (t) => {
   const instructions = [
     'iload_0', { op: 'ifne', arg: 'Lsecondary' },
@@ -5491,7 +5748,7 @@ public final class StructuredConstantStepRangeHarness {
   t.end();
 });
 
-test('structured SSA keeps block-local field array views out of loop preheaders',
+test('structured SSA versions eager field-array views at loop preheaders',
   async (t) => {
   const className = 'StructuredFieldArrayRangeHarness';
   const classpath = compileJavaFixture(t, className, `
@@ -5525,8 +5782,8 @@ public final class StructuredFieldArrayRangeHarness {
   const sourceText = generated?.jvmStructuredSource || '';
   t.ok(generated?.jvmStructuredSsa,
     'the field-array counted loop still selects structured SSA');
-  t.notOk(sourceText.includes('ssaArrayRangeGuard'),
-    'no loop-preheader proof names a field view declared inside its body');
+  t.ok(sourceText.includes('ssaArrayRangeGuard'),
+    'an entry-stable field view receives a loop-preheader range proof');
   t.ok(sourceText.includes('ssaRuntimeCoarseTrips') &&
       !/ssaRuntimeCoarseTrips\d+ < safePointBudget/.test(sourceText),
     'the bounded block is not fragmented by a smaller abstract poll budget');
@@ -5559,7 +5816,7 @@ public final class StructuredFieldArrayRangeHarness {
   t.equal(error, null,
     'executing the loop never references an undeclared SSA temporary');
   t.deepEqual(destination.slice(), source.slice(),
-    'the checked field-array path preserves every element');
+    'the versioned field-array path preserves every element');
   t.end();
 });
 

@@ -200,6 +200,168 @@ Brick-A-Brac painted its first visible frame at 20.17 seconds and presented
 still not a gameplay FPS result and is below the acceptance target. The
 focused JIT suite passed 1,198/1,198 assertions before that build.
 
+## 2026-08-01 complete-kernel continuation
+
+This pass continued through every remaining historical oracle family without
+enabling any complete guest algorithm in production. Selection and analysis
+remain independent of guest owner and member names.
+
+The generic renderer gained four reusable mechanisms:
+
+- handler-bearing methods with a protected non-void call are still rendered
+  far enough to publish a verified restoring positional kernel, but their
+  ordinary `Frame` entry uses the baseline pending-return handoff. This split
+  fixed a live `rp.a(ZZI)V -> pg.c(I)Z` operand underflow without throwing away
+  the unrelated affine kernel solely because it has a handler;
+- eager read-only primitive-array instance fields now participate in the same
+  endpoint range proofs as array parameters and statics. A field-backed proof
+  disables lexical continuation so another Java thread cannot rebind the
+  field between proof and use;
+- shifted current/carried induction values such as
+  `vertices[(previous << 1) + 1]` receive a guarded range version after the
+  initializer, unique carried assignment, ordering, and every backedge are
+  verified. Polygon scan conversion removes four successful-path checks;
+- acyclic restoring entries inline their cold spill statements instead of
+  allocating a spill closure on every successful call.
+
+The real DekoBloko affine benchmark remained bit exact and published the
+generic positional ABI. A representative Node 26.4.0 run measured 34,678 ns
+per invocation versus 18,186 ns for the historical oracle (paired ratio
+1.958x), improved from 47,207 ns at the start of the pass. The standalone
+generic clipped span measured 51.51 ns versus 75.67 ns for its handwritten
+counterpart, so that historical span is no longer a useful production fast
+path.
+
+The four-family proxy remains intentionally adversarial. A representative
+seven-round run after the range/copy changes reported exact checksums and the
+following generated metadata:
+
+| Family | Generic shape observed |
+| --- | --- |
+| tiled blit | 2 loops, 2 range guards, cyclic source proof |
+| perspective span | 3 loops, 4 range guards, 2 bit-bounded ranges |
+| bilinear sampler | acyclic, 3 entry field caches |
+| polygon raster | 2 loops, 4 shifted/carried ranges |
+
+Node timings remain tier-sensitive and are not an FPS claim. The persistent
+gaps are approximately 2x for tiled/perspective, 1.6x for bilinear, and 2.4x
+for polygon in the latest process. Polygon's main remaining cost is repeated
+entry into its generated span child, not the span body in isolation.
+
+An experimental checked-leaf ABI was therefore built for a single bounded,
+call-free loop. Its guards dominate every guest effect; rejection returns to
+canonical invocation before the first write, and focused tests verify valid
+stores plus short-array rejection. It reduced the Node polygon proxy from
+5.83 us to 5.10 us in one paired process. Firefox A/B rejected it decisively:
+the comparable animated Brick-A-Brac menu window fell from 9.20 FPS to 2.60
+FPS and then 0.50 FPS on a repeat. The selector is consequently **off by
+default** and available only through `checkedLeafDirectPositional=true` or
+`JVM_ENABLE_CHECKED_LEAF_POSITIONAL=1`. The proxy enables it explicitly so the
+experiment stays reproducible; production does not.
+
+The safe Firefox run used bundle SHA-256
+`da8ede1cb22422510d952198ba8b5abb249f8b24cae65ce5961e42af653e37b1`.
+After a 90-second post-first-frame wait and the same click sequence, a
+20.004-second window presented 184 frames (9.20 FPS), with no page/runtime
+errors and no recurrence of the operand underflow. The screenshot was the
+animated title/menu login dialog rather than gameplay, so the result is below
+the 30 FPS goal and is not an acceptance result.
+
+Focused verification after the production rollback passed 1,215/1,215 JIT
+assertions. The production build completed with the four existing webpack
+warnings. The served rollback bundle currently has SHA-256
+`fb29a83a2a19f396c7a2f0ae1686b6b47d4734954cc64c21bf551c67974855e8`;
+it retains the checked-leaf compiler only behind the disabled experimental
+gate.
+
+### Guarded obfuscator CFG and split-induction breakthrough
+
+The 9.20 FPS sample above was an outlier. A final clean rollback measurement
+with bundle SHA-256
+`6564be93586aa56dd11140d8108318aa1086c4a4c3fe76ea22562c86f57643f9`
+presented 30 frames in 20.022 seconds (1.50 FPS). That value is the safe
+baseline for the following same-machine measurements.
+
+Time profiling then exposed two generic shapes that the toy kernels had not
+reproduced:
+
+- an initialized boolean static was copied once to an immutable integer local
+  and tested repeatedly inside an otherwise numeric raster. Those branches
+  created an irreducible CFG. The compiler now resolves the boolean location,
+  guards its observed value before every guest effect, rewrites only direct
+  `iload`/`ifeq` or `ifne` consumers of the uniquely written local, and proves
+  that the originating read received the normal entry guard. The affected
+  live raster changed from an irreducible fallback to five structured loops
+  with ten branches pruned;
+- tiny pure integer helpers were hidden behind unreachable catch-and-format
+  tails. The integer-leaf verifier now walks only normal CFG successors and
+  still applies its non-throwing opcode whitelist. Eight protected calls in
+  the raster consequently inline as scalar expressions, removing the reason
+  its ordinary entry required the baseline pending-return ABI.
+
+Bundle SHA-256
+`aa13e7829d3e86c0fc9c4eb4fba7e0dd3f77f4bba2e292a2b0af295c674e370e`
+painted its first visible frame in 18.17 seconds and then presented 145 frames
+in 20.019 seconds (7.24 FPS). There were no page/runtime errors. The formerly
+dominant raster no longer appeared among the sampled synchronous blockers.
+
+The next blocker used a unique `iinc` that dominated every natural-loop
+backedge but lived in the block immediately before the literal backedge,
+separated by the same inert boolean guard. Counted-loop verification now uses
+a path/dominance proof instead of requiring the update and backedge to share a
+basic block. Verified integer-leaf calls are also treated as the scalar,
+non-throwing operations they become after emission. For a nested scanline over
+an initialized static primitive array this enables:
+
+- one entry endpoint/overflow/array-length guard;
+- a branch-free typed-array fast loop, with the complete checked loop as its
+  slow arm;
+- one runtime trip-count charge instead of a scheduler test for every pixel;
+- canonical safe-point fallback between scanlines if the outer region exceeds
+  its time quantum.
+
+The transformation is descriptor-, owner-, member-, and constant-independent.
+It does not speculate on first-use-linked array fields; those retain the
+canonical checked path until a later compilation can resolve their location.
+Single long static-array loops retain lexical continuation and refresh their
+static snapshots after a Java-thread yield.
+
+Bundle SHA-256
+`95a95d8db7eb0ab4340f56e6ddbf17127b27d8769da77f537493b61f99deff00`
+painted its first visible frame in 18.25 seconds. After the same 90-second
+warmup, its 20.022-second window presented 332 frames (16.58 FPS), with no
+errors. The previous 146 ms / 64 ms-maximum raster blocker disappeared; its
+remaining wrapper samples totaled 4 ms. This is an 11.1x improvement over the
+clean 1.50 FPS baseline, but it remains below the 30 FPS acceptance goal.
+
+Reproduction metadata: the java-tools base commit was
+`69650d38b6778c883a30c0c9da8540cf04373d39`; the tree was dirty with the five
+tracked optimizer/benchmark/test/documentation files described by this
+section. The served original `brickabrac.jar` SHA-256 was
+`91284c0ec25fa4f8913876c78be9d80d273d8dd567d5b92950f1795f37b3c95d`.
+The page used `mode=structured`, `yield=timer`, handwritten oracles off,
+checked-leaf positional off, a 90,000 ms post-first-frame warmup, and a 20,000
+ms requested measurement window.
+
+A deliberately sampled follow-up (`timings=1`, rate 1/256) presented 11.12
+FPS, demonstrating material profiler cost. It found no remaining dominant
+historical raster kernel: the largest generated samples were isolated asset
+or model-construction calls, while presentation performed 625 Wasm swizzles
+and 422 ms of copy work over the complete run. Future live profiling must
+therefore separate recurring animation time from one-shot asset/model work;
+re-enabling handwritten raster algorithms would no longer address the
+measured top blocker.
+
+The focused suite now has 1,228 assertions, including copied-boolean guard
+fallback, unreachable diagnostic-tail leaf inlining, split-update dominance,
+range-versioned output, static rebinding, continuation refresh, and exact
+exception-state coverage. The four-family Node proxy remains checksum exact;
+the latest representative process measured generic/oracle ratios of 3.03x
+(tiled), 2.03x (perspective), 1.56x (bilinear), and 2.26x (polygon). These
+microbenchmark gaps remain optimizer targets, but the live A/B shows that the
+newly admitted guest bodies—not complete handwritten substitutions—produced
+the large Firefox gain.
+
 ## Verification
 
 The focused differential checks are:

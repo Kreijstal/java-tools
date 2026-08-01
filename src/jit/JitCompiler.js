@@ -22,6 +22,7 @@ const {
 } = require("../instructions/control");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
+const { buildCfgFromCode } = require("../decompiler/structurer");
 const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
@@ -157,6 +158,14 @@ class JitCompiler {
       options.positionalGeneratedCalls !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_POSITIONAL_GENERATED_CALLS === "1");
+    // Compact checked leaves improve the Node proxy but currently regress the
+    // real SpiderMonkey renderer. Keep the verified ABI available for focused
+    // experiments without selecting it in production until a browser A/B
+    // demonstrates a win.
+    this.checkedLeafDirectPositionalEnabled =
+      options.checkedLeafDirectPositional === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_CHECKED_LEAF_POSITIONAL === "1");
     this.adaptiveFramelessPositionalEnabled =
       options.adaptiveFramelessPositional !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -4736,6 +4745,8 @@ class JitCompiler {
         method: positionalTraceKey,
         synchronous: generated?.jvmSynchronous === true,
         direct: typeof generated?.jvmDirectPositionalBody === "function",
+        checkedLeaf:
+          typeof generated?.jvmCheckedLeafDirectPositionalBody === "function",
         restoring:
           typeof generated?.jvmRestoringDirectPositionalBody === "function",
         intrinsic: Boolean(target.intrinsic),
@@ -4769,6 +4780,20 @@ class JitCompiler {
       target.positionalInvoker =
         generated.jvmDirectPositionalBody.bind(null, this);
       target.positionalInvoker.jvmDebugGuarded = true;
+      return target.positionalInvoker;
+    }
+    if (this.checkedLeafDirectPositionalEnabled &&
+        typeof generated.jvmCheckedLeafDirectPositionalBody === "function") {
+      // A single bounded call-free loop can publish a compact checked leaf:
+      // all class/debug/array predicates execute before its first guest
+      // effect, while predicate failure returns to the canonical call path.
+      // Keeping cold Frame restoration out of this body lets JavaScript
+      // engines inline it into loop-bearing callers without a handwritten
+      // guest algorithm or identity-specific recognizer.
+      target.positionalInvoker =
+        generated.jvmCheckedLeafDirectPositionalBody.bind(null, this);
+      target.positionalInvoker.jvmDebugGuarded = true;
+      target.positionalInvoker.jvmCheckedLeaf = true;
       return target.positionalInvoker;
     }
     if (typeof generated.jvmRestoringDirectPositionalBody === "function") {
@@ -6925,8 +6950,33 @@ class JitCompiler {
     if (returnType !== "int" || !params.every((type) => type === "int") || depth > 4 ||
         state.active.has(method)) return null;
     const code = method.attributes.find((attr) => attr.type === "code");
-    if (!code || (code.code.exceptionTable || []).length) return null;
-    const items = this.getCodeItems(method).filter((item) => item && item.instruction);
+    if (!code) return null;
+    let items = this.getCodeItems(method);
+    if ((code.code.exceptionTable || []).length) {
+      // Obfuscators commonly wrap a pure integer helper in a catch/rethrow
+      // diagnostic tail.  Exception handlers are not normal CFG successors,
+      // so retain only blocks reachable from bytecode entry.  The opcode
+      // whitelist below still proves that the retained body cannot throw;
+      // consequently omitting the diagnostic-only handler preserves exact
+      // Java behavior without recognizing any owner or method identity.
+      const cfg = buildCfgFromCode(items);
+      if (!cfg) return null;
+      const reachableBlocks = new Set();
+      const reachableItems = new Set();
+      const work = [cfg.entry];
+      while (work.length) {
+        const block = work.pop();
+        if (!Number.isInteger(block) || reachableBlocks.has(block) ||
+            !cfg.blocks[block]) continue;
+        reachableBlocks.add(block);
+        for (const index of cfg.blocks[block].insns || []) {
+          reachableItems.add(index);
+        }
+        for (const successor of cfg.succ[block] || []) work.push(successor);
+      }
+      items = items.filter((item, index) => reachableItems.has(index));
+    }
+    items = items.filter((item) => item && item.instruction);
     const instructions = items.map((item) => item.instruction);
     const labels = buildLabelMap(items);
     if (instructions.length > 64 || state.instructionCount + instructions.length > 256) return null;

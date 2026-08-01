@@ -64,6 +64,7 @@ async function createRuntime(directory) {
     structuredSsa: true,
     fusedRegions: false,
     guestKernelOracles: false,
+    checkedLeafDirectPositional: true,
   } });
   const classData = await jvm.loadClassByName(className);
   classData.staticFieldsInitialized = true;
@@ -90,7 +91,10 @@ function compileBody(runtime, name, descriptor) {
   const generated = runtime.jvm.jit.structuredSsa.compile(method);
   const body = generated?.jvmRestoringDirectPositionalBody;
   if (!generated?.jvmStructuredSsa || typeof body !== 'function') {
-    throw new Error(`generic SSA did not compile ${name}${descriptor}`);
+    const reason = runtime.jvm.jit.structuredSsa.lastRejectionReason ||
+      runtime.jvm.jit.structuredSsa.lastCompileError?.stack || '';
+    throw new Error(`generic SSA did not compile ${name}${descriptor}` +
+      (reason ? `: ${reason}` : ''));
   }
   const dumpPattern = process.env.SSA_KERNEL_DUMP_METHOD || '';
   if (dumpPattern && `${name}${descriptor}`.includes(dumpPattern)) {
@@ -451,6 +455,8 @@ function runPolygonOracle(destination, vertices, color) {
         rangeGuards: result.generated.jvmStructuredArrayRangeGuardCount,
         boundedIndexRanges:
           result.generated.jvmStructuredBoundedIndexRangeCount,
+        scaledIndexRanges:
+          result.generated.jvmStructuredScaledIndexRangeCount,
         cyclicRanges: result.generated.jvmStructuredCyclicRangeCount,
         specializedRangeAccesses:
           result.generated.jvmStructuredSpecializedArrayRangeAccessCount,
