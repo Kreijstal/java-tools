@@ -620,6 +620,10 @@ function runPolygonOracle(destination, vertices, color) {
       'polygonEdgeY:I', 'polygonEdgeActiveEnd:I',
       'polygonEdgePairCursor:I', 'polygonEdgeExpiredStart:I',
     ]) runtime.classData.staticFields.set(key, 0);
+    if (process.env.SSA_KERNEL_PRECOMPILE_POLYGON_CHILDREN === '1') {
+      compileBody(runtime, 'polygonQuickSortEdges', '([III)V');
+      compileBody(runtime, 'polygonSortActiveEdges', '([III)V');
+    }
     const polygonEdge = compileBody(
       runtime, 'polygonEdgeFill', '([II)V');
     const oracleFields = new Map([
