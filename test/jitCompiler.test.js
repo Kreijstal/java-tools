@@ -2297,6 +2297,9 @@ public final class ArbitraryOutlinedDirectArrayLoop {
       true, 'the generic spill-cost decision selects the outlined helper');
     t.equal(target.generated.jvmStructuredCaptureFreeRestoringSpills, true,
       'the outlined body keeps successful scalar locals out of a closure');
+    t.equal(target.generated.jvmStructuredRestoringFrameSlotCount,
+      target.generated.jvmStructuredSpilledLocalCount,
+    'entry arguments share their JVM-local restoration slots instead of being duplicated');
     t.ok(target.generated.jvmRestoringDirectPositionalSource.includes(
       'materializeDirectFrame('),
     'throwing operations call the capture-free materialization helper');
@@ -3031,6 +3034,8 @@ public final class GenericSpanShape {
   const genericRows = genericJvm.jit.structuredSsa.compile(genericRowsMethod);
   t.equal(genericRows?.jvmStructuredCapturedCheckedLeafCallCount, 1,
     'a generic caller snapshots one verified checked-child static capture set');
+  t.equal(genericRows?.jvmStructuredLexicalVoidFastPathCallCount, 1,
+    'a proven synchronous void child keeps fallback bookkeeping off its success path');
   t.notOk(genericRows.jvmStructuredContinuation,
     'captured child statics resume canonically rather than surviving a scheduler slice');
   const runGenericRows = (color, debug = false) => {
@@ -3629,6 +3634,10 @@ public final class RenamedShrinkingWindowHarness {
     'the generated metadata records the structural proof');
   t.equal(generated?.jvmStructuredShrinkingArrayWindowAccessCount, 12,
     'the proof covers every primitive load and store in the window');
+  t.ok(sourceText.includes('ssaShrinkingArrayWindow0Delta') &&
+      !sourceText.includes('Math.floor') &&
+      !sourceText.includes('OuterTrips *'),
+  'equal shrinking-window trip counts collapse to one algebraic guard');
   t.notOk(sourceText.includes('safePointBudget') ||
       sourceText.includes('helpers.arrayLoad(') ||
       sourceText.includes('helpers.arrayStore(') ||
@@ -4225,6 +4234,17 @@ public final class ArbitraryStaticSummaryLoop {
     bias++;
   }
 
+  private static int recursivePure(int value) {
+    if (value <= 0) return 0;
+    return value + recursivePure(value - 1);
+  }
+
+  private static void recursiveWriteBias(int count) {
+    if (count <= 0) return;
+    bias++;
+    recursiveWriteBias(count - 1);
+  }
+
   private static void writeScale(ArbitraryStaticSummaryLoop self) {
     self.scale++;
   }
@@ -4242,6 +4262,23 @@ public final class ArbitraryStaticSummaryLoop {
     for (int index = 0; index < count; index++) {
       sum += bias + pure(index) + other;
       writeBias();
+    }
+    return sum;
+  }
+
+  static int recursivePureLoop(int count) {
+    int sum = 0;
+    for (int index = 0; index < count; index++) {
+      sum += bias + recursivePure(index) + other;
+    }
+    return sum;
+  }
+
+  static int recursiveWritingLoop(int count) {
+    int sum = 0;
+    for (int index = 0; index < count; index++) {
+      sum += bias + other;
+      recursiveWriteBias(1);
     }
     return sum;
   }
@@ -4282,12 +4319,20 @@ public final class ArbitraryStaticSummaryLoop {
       className, 'pureInstanceLoop', '(I)I');
     const writingInstanceLoop = await jvm.findMethodInHierarchy(
       className, 'writingInstanceLoop', '(I)I');
+    const recursivePureLoop = await jvm.findMethodInHierarchy(
+      className, 'recursivePureLoop', '(I)I');
+    const recursiveWritingLoop = await jvm.findMethodInHierarchy(
+      className, 'recursiveWritingLoop', '(I)I');
     const pureGenerated = jvm.jit.structuredSsa.compile(pureLoop);
     const writingGenerated = jvm.jit.structuredSsa.compile(writingLoop);
     const pureInstanceGenerated =
       jvm.jit.structuredSsa.compile(pureInstanceLoop);
     const writingInstanceGenerated =
       jvm.jit.structuredSsa.compile(writingInstanceLoop);
+    const recursivePureGenerated =
+      jvm.jit.structuredSsa.compile(recursivePureLoop);
+    const recursiveWritingGenerated =
+      jvm.jit.structuredSsa.compile(recursiveWritingLoop);
     const entryCacheCount = (generated) =>
       (generated.jvmStructuredSource
         .match(/(?:const|let) ssaEntryStaticValue/g) || []).length;
@@ -4295,6 +4340,10 @@ public final class ArbitraryStaticSummaryLoop {
       'a transitively pure static call preserves both caller static caches');
     t.equal(entryCacheCount(writingGenerated), 1,
       'a callee write invalidates only the matching static cache key');
+    t.equal(entryCacheCount(recursivePureGenerated), 2,
+      'a pure direct-recursive callee preserves caller static caches');
+    t.equal(entryCacheCount(recursiveWritingGenerated), 1,
+      'a recursive callee still reports its concrete static write');
     const eagerFieldCacheCount = (generated) =>
       (generated.jvmStructuredSource
         .match(/ssaFieldCache\d+Object = local0/g) || []).length;
@@ -4319,6 +4368,14 @@ public final class ArbitraryStaticSummaryLoop {
       'the writing callee remains visible on every later loop iteration');
     t.equal(classData.staticFields.get('bias:I'), 4,
       'the transitive write summary never hides the callee side effect');
+    t.equal(execute(
+      recursivePureLoop, recursivePureGenerated, 3).value, 37,
+    'cached values across pure recursion preserve exact guest results');
+    t.equal(execute(
+      recursiveWritingLoop, recursiveWritingGenerated, 3).value, 36,
+    'recursive writes remain visible on every later loop iteration');
+    t.equal(classData.staticFields.get('bias:I'), 7,
+      'recursive summary convergence retains the recursive write effect');
 
     const receiver = {
       type: className,

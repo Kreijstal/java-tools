@@ -751,6 +751,7 @@ class JvmSsaBlockRenderer {
     let restoringCoarseLoopDeoptCount = 0;
     let rangeDominatedArithmeticGuardCount = 0;
     const rangeDominatedArithmeticGuards = new Set();
+    const lexicalVoidFastPathSites = new Set();
     const arrayRangeCheckCandidates = [];
     // Keep every primitive entry-array access available to whole-region
     // proofs, including affine local+constant indexes that an ordinary
@@ -2009,11 +2010,11 @@ class JvmSsaBlockRenderer {
               const normalized = normalizedArrayLoadExpression(
                 raw, op, array, arrayKind);
               lines.push(
-                `if (${array} === null || ${array} === undefined || ${
-                  arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
-                ...materializeLines([...stack, array, arrayIndex], index).map((line) => `  ${line}`),
-                `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
-                "} else {", `  ${out} = ${normalized};`, "}",
+                  `if (${array} === null || ${array} === undefined || ${
+                    arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
+                  ...materializeLines([...stack, array, arrayIndex], index).map((line) => `  ${line}`),
+                  `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
+                  "} else {", `  ${out} = ${normalized};`, "}",
               );
             }
             stack.push(out);
@@ -2631,6 +2632,7 @@ class JvmSsaBlockRenderer {
             }
             if (!valid) continue;
             const out = value(), caught = value();
+            let inlineCheckedLeafVoidFastPath = false;
             const deferMaterialization = this.deferredCallMaterializationEnabled;
             const resumableVoidCall = site.returnsVoid;
             const asynchronousCallMarker =
@@ -2689,6 +2691,18 @@ class JvmSsaBlockRenderer {
                 directCheckedLeafNoThrow &&
                 typeof site.directCheckedLeaf?.inlineSource === "string"
                   ? site.directCheckedLeaf.inlineSource : null;
+              const inlineCheckedLeafReturnExpressions = inlineCheckedLeafSource
+                ? [...inlineCheckedLeafSource.matchAll(/\breturn\s+([^;]+);/g)]
+                  .map((match) => match[1].trim()) : [];
+              const inlineCheckedLeafVoid = Boolean(
+                inlineCheckedLeafSource && site.returnsVoid &&
+                inlineCheckedLeafReturnExpressions.length > 0 &&
+                inlineCheckedLeafReturnExpressions.every((expression) =>
+                  expression === "helpers.returnVoid()" ||
+                  expression === "helpers.asyncInvokeSentinel()"),
+              );
+              if (inlineCheckedLeafVoid) lexicalVoidFastPathSites.add(index);
+              inlineCheckedLeafVoidFastPath = inlineCheckedLeafVoid;
               const inlineCheckedLeafLabel =
                 `ssaInlineCheckedLeaf${index}`;
               const inlineCheckedLeafFallbackMarker =
@@ -2724,7 +2738,16 @@ class JvmSsaBlockRenderer {
                       /\bnestedEntryGuarded\b/g, "true");
                     return rewritten.replace(
                       /\breturn\s+([^;]+);/g,
-                      `{ ${out} = $1; break ${inlineCheckedLeafLabel}; }`);
+                      (_return, expression) => {
+                        if (!inlineCheckedLeafVoid) {
+                          return `{ ${out} = ${expression}; ` +
+                            `break ${inlineCheckedLeafLabel}; }`;
+                        }
+                        const success = expression.trim() ===
+                          "helpers.returnVoid()";
+                        return `{ ${out} = ${success}; ` +
+                          `break ${inlineCheckedLeafLabel}; }`;
+                      });
                   });
                   // Captured values already have caller-local SSA names.
                   // Substitute the child's entry aliases, and remove
@@ -2805,11 +2828,13 @@ class JvmSsaBlockRenderer {
                   `    throw ${caught};`, "  }",
                 ]),
                 "}",
-                `if (!${usedDirect} || ${out} === helpers.asyncInvokeSentinel()) {`,
+                `if (!${usedDirect} || ${inlineCheckedLeafVoid
+                  ? `!${out}`
+                  : `${out} === helpers.asyncInvokeSentinel()`}) {`,
                 ...(inlineCheckedLeafLines
                   ? [inlineCheckedLeafFallbackMarker]
                   : fallbackLines.map((line) => `  ${line}`)),
-                "}",
+                ...(inlineCheckedLeafVoid ? [] : ["}"]),
               );
             } else {
               lines.push(...fallbackLines);
@@ -2867,6 +2892,7 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
                 "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };", "}");
             }
+            if (inlineCheckedLeafVoidFastPath) lines.push("}");
           }
         } else if (op === "goto" || op === "goto_w") {
           const edge = edgeLines(cfg.term[block.id].target, stack);
@@ -6393,6 +6419,7 @@ class JvmSsaBlockRenderer {
       let inlinedRestoringSpills = false;
       let captureFreeRestoringSpills = false;
       let outlinedCaptureFreeRestoringSpills = false;
+      let restoringFrameSlotCount = 0;
       if (restoringDirectPositionalEligible) {
         // A restoring entry is an already-verified synchronous intermethod
         // region. Give it a larger scalar quantum than a scheduler-owned
@@ -6505,14 +6532,24 @@ class JvmSsaBlockRenderer {
         const restoringRenderedWithSpills =
           outlinedCaptureFreeRestoringSpills
             ? restoringRendered : inlineMaterializeCalls(restoringRendered);
-        const restoringFrameSlots = captureFreeRestoringSpills
-          ? [...entryArguments.keys(), ...spillSlots] : [];
-        const restoringFrameValues = captureFreeRestoringSpills
-          ? [
-            ...entryArguments.keys().map((index) => `local${index}`),
-            ...spillSlots.map((index) => immutableEntryLocals.has(index)
-              ? entryLocalInitialValues.get(index) : `local${index}`),
-          ] : [];
+        // Entry arguments are also ordinary JVM locals.  Do not mention a
+        // slot twice in a cold restoring-frame array merely because it is
+        // both an argument and subsequently assigned.  Besides avoiding
+        // redundant restoration writes, the unique value list prevents the
+        // host compiler from keeping duplicate materialization operands live
+        // across successful hot loops.  Unused arguments remain represented
+        // through entryArgumentValue(), preserving complete Frame state.
+        const restoringFrameEntries = captureFreeRestoringSpills
+          ? new Map([...entryArguments.keys()].map((index) => [
+            index, entryArgumentValue(index),
+          ])) : new Map();
+        for (const index of spillSlots) {
+          restoringFrameEntries.set(index, immutableEntryLocals.has(index)
+            ? entryLocalInitialValues.get(index) : `local${index}`);
+        }
+        const restoringFrameSlots = [...restoringFrameEntries.keys()];
+        const restoringFrameValues = [...restoringFrameEntries.values()];
+        restoringFrameSlotCount = restoringFrameSlots.length;
         const restoringFrameLayoutId = captureFreeRestoringSpills
           ? this.restoringFrameLayouts.push(restoringFrameSlots) - 1 : -1;
         const restoreCaptureFreeFrame = (indentation) => [
@@ -6701,7 +6738,30 @@ class JvmSsaBlockRenderer {
           checkedLeafCoarseLoopHeaders.add(shape.innerHeader);
           arrayRangeGuardDataVariables.set(
             shape.variable, shape.arrayData);
-          checkedLeafTripDeclarations.push(
+          if (shape.window === shape.stride * 2) {
+            const delta = `${prefix}Delta`;
+            const maximumTrips = Math.min(
+              runtimeCoarseTripLimit, Math.floor(Math.sqrt(1_000_000)));
+            checkedLeafTripDeclarations.push(
+              `const ${threshold} = local${shape.lowerSlot} + ` +
+                `${shape.window};`,
+              `let ${shape.variable} = ` +
+                `local${shape.lowerSlot} <= ${2147483647 - shape.window};`,
+              `if (${shape.variable} && ` +
+                `local${shape.upperSlot} >= ${threshold}) {`,
+              `  const ${delta} = local${shape.upperSlot} - ` +
+                `local${shape.lowerSlot};`,
+              `  ${shape.variable} = ` +
+                `(` +
+                `local${shape.lowerSlot} >= 0 && ` +
+                `local${shape.upperSlot} <= ${shape.arrayData}.length && ` +
+                `${delta} % ${shape.stride} === 0 && ` +
+                `${delta} / ${shape.stride} - 1 <= ${maximumTrips});`,
+              `}`,
+              `if (!${shape.variable}) ` +
+                "return helpers.asyncInvokeSentinel();",
+            );
+          } else checkedLeafTripDeclarations.push(
             `const ${threshold} = local${shape.lowerSlot} + ` +
               `${shape.window};`,
             `const ${outerTrips} = local${shape.upperSlot} < ${threshold} ` +
@@ -7202,6 +7262,8 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredLexicalCheckedLeafCallCount =
         [...callSites.values()].filter((site) =>
           typeof site.directCheckedLeaf?.inlineSource === "string").length;
+      generated.jvmStructuredLexicalVoidFastPathCallCount =
+        lexicalVoidFastPathSites.size;
       generated.jvmStructuredLexicalCheckedLeafWrapper = Boolean(
         checkedLeafDirectPositionalBody && lexicalCheckedLeafWrapper);
       generated.jvmStructuredNestedRuntimeCheckedLeaf = Boolean(
@@ -7261,6 +7323,8 @@ class JvmSsaBlockRenderer {
         prunedBooleanCfgBranches;
       generated.jvmStructuredDeclaredLocalCount = declaredLocals.length;
       generated.jvmStructuredSpilledLocalCount = spillSlots.length;
+      generated.jvmStructuredRestoringFrameSlotCount =
+        restoringFrameSlotCount;
       generated.jvmStructuredImmutableEntryLocalCount = immutableEntryLocals.size;
       generated.jvmStructuredFieldReadCacheCount = fieldReadCaches.size;
       generated.jvmStructuredEagerThisFieldCount = [...fieldReadCaches.values()]

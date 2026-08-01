@@ -2373,9 +2373,12 @@ class WasmJit {
     const memo = this.writeSummaries.get(key);
     if (memo && (memo.keys !== null || memo.epoch === this.compileEpoch)) return memo.keys;
     if (inProgress) {
-      // recursion: pessimistic on the cycle member, and do not memoize —
-      // the outer walk still accumulates its own writes correctly
-      if (inProgress.has(key)) return null;
+      // A direct-static recursion edge adds no effects beyond the method body
+      // already being scanned. Treat the backedge as an empty delta; the
+      // outer walk still accumulates every direct write and every non-cyclic
+      // callee in the strongly connected component. Returning "unknown" here
+      // unnecessarily invalidates otherwise exact caller field summaries.
+      if (inProgress.has(key)) return EMPTY_WRITE_SET;
     } else {
       inProgress = new Set();
     }
