@@ -7332,7 +7332,8 @@ class JitCompiler {
       paramCount: parsed.params.length,
       returnsVoid: parsed.returnType === "void",
       noThrow: true,
-      inlineSource: typeof capturedBody === "function" &&
+      inlineSource: generated.jvmStructuredRecursiveArrayPartitionCheckedLeaf
+        ? null : typeof capturedBody === "function" &&
         typeof capturedSource === "string" ? capturedSource :
         typeof ordinarySource === "string" ? ordinarySource : null,
       captures: typeof capturedBody === "function" &&

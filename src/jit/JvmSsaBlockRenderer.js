@@ -2766,7 +2766,8 @@ class JvmSsaBlockRenderer {
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 `  throw ${caught};`, "}");
             }
-          } else if (site.directFused && site.directFused.returnsVoid &&
+          } else if (!site.selfRecursive && site.directFused &&
+              site.directFused.returnsVoid &&
               site.directFused.paramCount === site.argumentCount) {
             const callStack = [...stack];
             const args = new Array(site.argumentCount);
@@ -2887,6 +2888,9 @@ class JvmSsaBlockRenderer {
                 .map((line) => `  ${line}`),
               `  throw ${caught};`, "}",
             ];
+            if (site.selfRecursive) {
+              lines.push(`/*__SSA_SELF_RECURSIVE_REGION_START_${index}__*/`);
+            }
             lines.push(`let ${out};`);
             if (site.id !== null && site.id !== undefined) {
               const usedDirect = value();
@@ -3034,6 +3038,7 @@ class JvmSsaBlockRenderer {
                   marker: selfRecursiveMarker,
                   ordinary: positionalRawCall,
                   args: [...args],
+                  result: out,
                 });
               }
               lines.push(
@@ -3124,6 +3129,9 @@ class JvmSsaBlockRenderer {
                 "  return { deopt: true, transient: true, reason: 'thread yielded in structured SSA callee' };", "}");
             }
             if (inlineCheckedLeafVoidFastPath) lines.push("}");
+            if (site.selfRecursive) {
+              lines.push(`/*__SSA_SELF_RECURSIVE_REGION_END_${index}__*/`);
+            }
           }
         } else if (op === "goto" || op === "goto_w") {
           const edge = edgeLines(cfg.term[block.id].target, stack);
@@ -3914,6 +3922,162 @@ class JvmSsaBlockRenderer {
         };
       }
       return null;
+    })();
+    const recursiveArrayPartitionLeaf = (() => {
+      const rejectRecursive = (reason) => {
+        if (typeof process !== "undefined" && process.env &&
+            process.env.JVM_TRACE_STRUCTURED_RECURSIVE_ARRAY === "1") {
+          console.error("[structured-recursive-array]", reason);
+        }
+        return null;
+      };
+      let recursiveDescriptor = null;
+      try { recursiveDescriptor = parseDescriptor(method.descriptor); } catch (_) {}
+      if (!methodIsStatic || !recursiveDescriptor ||
+          recursiveDescriptor.returnType !== "void" ||
+          recursiveDescriptor.params.length !== 3 ||
+          !recursiveDescriptor.params[0]?.endsWith("[]") ||
+          !recursiveDescriptor.params.slice(1).every((type) =>
+            ["boolean", "byte", "char", "short", "int"].includes(type)) ||
+          (code.code.exceptionTable || []).length !== 0 ||
+          entryArrayLocalSlots.size !== 1 || callSites.size !== 2 ||
+          [...callSites.values()].some((site) =>
+            !site.selfRecursive || !site.returnsVoid) ||
+          structured.loopHeaders.size !== 1) return rejectRecursive(
+        `entry handlers=${(code.code.exceptionTable || []).length} ` +
+        `arrays=${entryArrayLocalSlots.size} calls=${callSites.size} ` +
+        `loops=${structured.loopHeaders.size}`);
+      const arraySlot = [...entryArrayLocalSlots][0];
+      if (assignedReferenceLocals.has(arraySlot) ||
+          !entryArrayKinds.has(arraySlot)) return rejectRecursive("array slot");
+      const arrayData = entryArrayDataVariable(arraySlot);
+      const header = [...structured.loopHeaders][0];
+      const loop = countedLoopInfos.get(header);
+      if (!loop || !Number.isInteger(loop.boundSlot) ||
+          loop.initial !== null || loop.increment <= 0) return rejectRecursive(
+        `counted loop=${Boolean(loop)} initial=${loop?.initial} ` +
+        `increment=${loop?.increment} bound=${loop?.boundSlot}`);
+      const stride = loop.increment;
+      const loadSlot = (instruction, prefix = "i") => {
+        const op = opOf(instruction);
+        return new RegExp(`^${prefix}load(?:_[0-3])?$`).test(op)
+          ? localIndex(instruction, op) : null;
+      };
+      const storeSlot = (instruction) => {
+        const op = opOf(instruction);
+        return /^istore(?:_[0-3])?$/.test(op)
+          ? localIndex(instruction, op) : null;
+      };
+      const preheaderItems = cfg.blocks[loop.preheader]?.insns || [];
+      let lowerSlot = null;
+      for (let position = 3; position < preheaderItems.length; position += 1) {
+        const left = items[preheaderItems[position - 3]]?.instruction;
+        const step = items[preheaderItems[position - 2]]?.instruction;
+        const add = items[preheaderItems[position - 1]]?.instruction;
+        const store = items[preheaderItems[position]]?.instruction;
+        if (constantInstructionValue(step) === stride &&
+            opOf(add) === "iadd" && storeSlot(store) === loop.slot) {
+          lowerSlot = loadSlot(left);
+        }
+      }
+      if (!Number.isInteger(lowerSlot) || lowerSlot === loop.boundSlot) {
+        return rejectRecursive("lower slot");
+      }
+      let pivotSlot = null;
+      const headerItem = cfg.blocks[header]?.insns?.[0] ?? 0;
+      for (let index = 1; index < headerItem; index += 1) {
+        if (loadSlot(items[index - 1]?.instruction) === lowerSlot) {
+          const candidate = storeSlot(items[index]?.instruction);
+          if (Number.isInteger(candidate) && candidate !== lowerSlot &&
+              candidate !== loop.boundSlot && candidate !== loop.slot) {
+            if (pivotSlot !== null && pivotSlot !== candidate) return null;
+            pivotSlot = candidate;
+          }
+        }
+      }
+      if (!Number.isInteger(pivotSlot)) return rejectRecursive("pivot slot");
+
+      const primitiveArrayOps = new Set([
+        "iaload", "saload", "baload", "caload", "daload", "faload",
+        "laload", "iastore", "sastore", "bastore", "castore",
+        "dastore", "fastore", "lastore",
+      ]);
+      const forbiddenOps = new Set([
+        "getfield", "putfield", "getstatic", "putstatic", "arraylength",
+        "idiv", "irem", "athrow", "new", "newarray", "anewarray",
+        "multianewarray", "monitorenter", "monitorexit", "checkcast",
+        "instanceof", "aaload", "aastore",
+      ]);
+      const primitiveItems = [];
+      for (let index = 0; index < items.length; index += 1) {
+        if (!normalReachableItems.has(index)) continue;
+        const op = opOf(items[index]?.instruction);
+        if (forbiddenOps.has(op)) return rejectRecursive(`forbidden ${op}`);
+        if (op?.startsWith("invoke") && !callSites.get(index)?.selfRecursive) {
+          return rejectRecursive(`foreign call ${index}`);
+        }
+        if (primitiveArrayOps.has(op)) primitiveItems.push(index);
+      }
+      const allowedIndexSlots = new Set([
+        lowerSlot, loop.slot, pivotSlot,
+      ]);
+      const accesses = primitiveArrayAccessCandidates;
+      const coveredItems = new Set(accesses.map((access) => access.itemIndex));
+      const implicitlyCoveredStores = primitiveItems.filter((itemIndex) =>
+        !coveredItems.has(itemIndex));
+      if (!primitiveItems.length || implicitlyCoveredStores.some((itemIndex) =>
+        !opOf(items[itemIndex]?.instruction)?.endsWith("astore")) ||
+          accesses.some((access) =>
+            access.arrayData !== arrayData ||
+            !primitiveItems.includes(access.itemIndex) ||
+            !allowedIndexSlots.has(access.indexAffine?.slot) ||
+            !Number.isInteger(access.indexAffine?.offset) ||
+            access.indexAffine.offset < 0 ||
+            access.indexAffine.offset >= stride)) return rejectRecursive(
+        `accesses primitive=${primitiveItems.length} candidates=${accesses.length} ` +
+        `slots=${[...allowedIndexSlots].join(",")}`);
+
+      const decodeCall = (index) => {
+        const highSlot = loadSlot(items[index - 1]?.instruction);
+        if (!Number.isInteger(highSlot)) return null;
+        const directLow = loadSlot(items[index - 2]?.instruction);
+        if (Number.isInteger(directLow)) {
+          const loadedArray = loadSlot(items[index - 3]?.instruction, "a");
+          return loadedArray === arraySlot
+            ? {lowSlot: directLow, lowOffset: 0, highSlot} : null;
+        }
+        if (opOf(items[index - 2]?.instruction) !== "iadd" ||
+            constantInstructionValue(items[index - 3]?.instruction) !== stride) {
+          return null;
+        }
+        const lowSlot = loadSlot(items[index - 4]?.instruction);
+        const loadedArray = loadSlot(items[index - 5]?.instruction, "a");
+        return loadedArray === arraySlot && Number.isInteger(lowSlot)
+          ? {lowSlot, lowOffset: stride, highSlot} : null;
+      };
+      const recursiveCalls = [...callSites.keys()].map(decodeCall);
+      if (recursiveCalls.some((call) => !call)) return rejectRecursive(
+        `call decode ${JSON.stringify(recursiveCalls)}`);
+      const hasLowerPartition = recursiveCalls.some((call) =>
+        call.lowSlot === lowerSlot && call.lowOffset === 0 &&
+        call.highSlot === pivotSlot);
+      const hasUpperPartition = recursiveCalls.some((call) =>
+        call.lowSlot === pivotSlot && call.lowOffset === stride &&
+        call.highSlot === loop.boundSlot);
+      if (!hasLowerPartition || !hasUpperPartition) return rejectRecursive(
+        `partition calls ${JSON.stringify(recursiveCalls)}`);
+
+      const variable = `ssaRecursiveArrayWindowGuard${header}`;
+      for (const access of accesses) {
+        access.structuralGuard = variable;
+        if (access.rangeCandidate) {
+          access.rangeCandidate.structuralGuard = variable;
+        }
+      }
+      return {
+        variable, arrayData, arraySlot, header, stride,
+        lowerSlot, upperSlot: loop.boundSlot, accesses,
+      };
     })();
     const arrayRangeGuardDeclarations = new Map();
     const arrayRangeGuardVariables = new Map();
@@ -6098,8 +6262,39 @@ class JvmSsaBlockRenderer {
               `${positionalCallInvokeVariable(call.index)}) && true) {`,
           ).join("if (true) {");
         }
+        specialized = specialized
+          .split(`/*__SSA_SELF_RECURSIVE_REGION_START_${call.index}__*/\n`)
+          .join("")
+          .split(`/*__SSA_SELF_RECURSIVE_REGION_END_${call.index}__*/\n`)
+          .join("");
       }
       return specialized;
+    };
+    const specializeCheckedLeafSelfRecursiveCalls = (
+      source, tier, rawWorker = false,
+    ) => {
+      if (!selfRecursiveCallExpressions.size) return source;
+      const functionName =
+        this.jit.generatedSource(method, tier, "").functionName;
+      const lines = source.split("\n");
+      for (const call of [...selfRecursiveCallExpressions.values()]
+        .sort((left, right) => right.index - left.index)) {
+        const startMarker =
+          `/*__SSA_SELF_RECURSIVE_REGION_START_${call.index}__*/`;
+        const endMarker =
+          `/*__SSA_SELF_RECURSIVE_REGION_END_${call.index}__*/`;
+        const start = lines.findIndex((line) => line.trim() === startMarker);
+        const end = lines.findIndex((line, index) =>
+          index > start && line.trim() === endMarker);
+        if (start < 0 || end < 0) return null;
+        const indentation = /^\s*/.exec(lines[start])?.[0] || "";
+        const direct = rawWorker
+          ? `${functionName}(${call.args.join(", ")});`
+          : `${functionName}(helpers, ${call.args.join(", ")}` +
+            `${call.args.length ? ", " : ""}thread, 2);`;
+        lines.splice(start, end - start + 1, `${indentation}${direct}`);
+      }
+      return lines.join("\n");
     };
     const fieldReadCacheDeclarations = [...fieldReadCaches.values()].flatMap((cache) => [
       `let ${cache.object} = null;`,
@@ -6989,6 +7184,8 @@ class JvmSsaBlockRenderer {
       let capturedCheckedLeafDirectPositionalBody = null;
       let capturedCheckedLeafDirectPositionalSource = null;
       let capturedCheckedLeafDirectPositionalPlan = null;
+      let recursiveArrayWorkerBody = null;
+      let recursiveArrayWorkerSource = null;
       let nestedRuntimeCountedRegion = false;
       let transactionalAcyclicCheckedLeaf = false;
       let lexicalCheckedLeafWrapper = false;
@@ -7383,6 +7580,24 @@ class JvmSsaBlockRenderer {
               "return helpers.asyncInvokeSentinel();",
           );
         }
+        if (recursiveArrayPartitionLeaf) {
+          const shape = recursiveArrayPartitionLeaf;
+          const delta = `ssaRecursiveArrayWindow${shape.header}Delta`;
+          checkedLeafCoarseLoopHeaders.add(shape.header);
+          arrayRangeGuardDataVariables.set(shape.variable, shape.arrayData);
+          checkedLeafTripDeclarations.push(
+            `const ${delta} = local${shape.upperSlot} - ` +
+              `local${shape.lowerSlot};`,
+            `const ${shape.variable} = (` +
+              `local${shape.lowerSlot} >= 0 && ` +
+              `local${shape.upperSlot} >= local${shape.lowerSlot} && ` +
+              `local${shape.upperSlot} <= ${shape.arrayData}.length && ` +
+              `${delta} % ${shape.stride} === 0 && ` +
+              `${delta} / ${shape.stride} <= ${runtimeCoarseTripLimit});`,
+            `if (!${shape.variable}) ` +
+              "return helpers.asyncInvokeSentinel();",
+          );
+        }
         const deepestCountedLoop = countedRegionLoops.at(-1) || null;
         const loopItems = deepestCountedLoop
           ? new Set([...deepestCountedLoop.loopBlocks].flatMap(
@@ -7453,9 +7668,11 @@ class JvmSsaBlockRenderer {
         const checkedLeafShape = this.checkedLeafDirectPositionalEnabled &&
           (((singleLoop && (atomicBoundedLoops ||
               runtimeCoarseCountedLoops.has(singleLoopHeader)) ||
-            nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf) ||
+            nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
+            recursiveArrayPartitionLeaf) ||
             transactionalAcyclicShape) &&
-            callSites.size === 0 ||
+            (callSites.size === 0 || recursiveArrayPartitionLeaf &&
+              [...callSites.values()].every((site) => site.selfRecursive)) ||
             lexicalCheckedLeafWrapperShape) &&
           items.every((item, index) => {
             const op = opOf(item?.instruction);
@@ -7463,8 +7680,16 @@ class JvmSsaBlockRenderer {
             if (!transactionalAcyclicShape &&
                 throwingOrDynamicOps.has(op)) return false;
             return !effectOps.has(op) || transactionalAcyclicShape ||
+              recursiveArrayPartitionLeaf ||
               loopItems.has(index);
           });
+        if (recursiveArrayPartitionLeaf && typeof process !== "undefined" &&
+            process.env?.JVM_TRACE_STRUCTURED_RECURSIVE_ARRAY === "1") {
+          console.error("[structured-recursive-array] checked shape", {
+            checkedLeafShape,
+            effects: reachableEffectItems,
+          });
+        }
         if (checkedLeafShape) {
           let checkedLeafRenderedTree = render(
             structured.tree, false, true,
@@ -7474,6 +7699,19 @@ class JvmSsaBlockRenderer {
             checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
               let rewritten = line;
               for (const access of shrinkingArrayWindowLeaf.accesses) {
+                rewritten = rewritten.split(
+                  `false /*${access.marker}*/`).join(guard);
+              }
+              return rewritten;
+            });
+            checkedLeafRenderedTree = specializeArrayRangeGuardedStores(
+              checkedLeafRenderedTree, [guard]);
+          }
+          if (recursiveArrayPartitionLeaf) {
+            const guard = recursiveArrayPartitionLeaf.variable;
+            checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
+              let rewritten = line;
+              for (const access of recursiveArrayPartitionLeaf.accesses) {
                 rewritten = rewritten.split(
                   `false /*${access.marker}*/`).join(guard);
               }
@@ -7500,7 +7738,63 @@ class JvmSsaBlockRenderer {
               .map((line) => line.replace(/\blocal\d+\b/g,
                 (name) => aliases.get(name) || name));
           };
-          const checkedLeafBody = compactCheckedLeafEntryLocals([
+          if (recursiveArrayPartitionLeaf) {
+            let workerBody = compactCheckedLeafEntryLocals([
+              ...declaredLocals.map((index) =>
+                `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
+                  entryLocalInitialValues.has(index)
+                    ? entryLocalInitialValues.get(index)
+                    : entryArgumentValue(index) || "undefined"};`),
+              `const ${entryArrayDataVariable(
+                recursiveArrayPartitionLeaf.arraySlot)} = argument0;`,
+              ...declarations,
+              ...checkedLeafTree,
+            ].filter(Boolean));
+            recursiveArrayWorkerSource =
+              specializeCheckedLeafSelfRecursiveCalls(
+                ["'use strict';", ...workerBody].join("\n"),
+                "ssa-recursive-array-worker", true,
+              );
+            if (recursiveArrayWorkerSource) {
+              recursiveArrayWorkerSource = recursiveArrayWorkerSource
+                .split("helpers.returnVoid()").join("ssaReturnVoid");
+              if (!recursiveArrayWorkerSource.includes("helpers.") &&
+                  !recursiveArrayWorkerSource.includes("spillLocals(") &&
+                  !recursiveArrayWorkerSource.includes("throw ") &&
+                  !recursiveArrayWorkerSource.includes("try {")) {
+                recursiveArrayWorkerBody = this.jit.createGeneratedFunction(
+                  method,
+                  "ssa-recursive-array-worker",
+                  argumentNames,
+                  recursiveArrayWorkerSource,
+                  null, false, false,
+                  {ssaReturnVoid: this.jit.returnVoid()},
+                );
+              }
+            }
+          }
+          let checkedLeafBody = recursiveArrayWorkerBody
+            ? [
+              this.runCountersEnabled
+                ? "if (nestedEntryGuarded !== 2) " +
+                  "helpers.structuredSsa.restoringDirectRunCount += 1;"
+                : null,
+              `const ${entryArrayDataVariable(
+                recursiveArrayPartitionLeaf.arraySlot)} = ` +
+                `helpers.arrayData(argument0);`,
+              directArrayDataGuard,
+              ...[
+                recursiveArrayPartitionLeaf.lowerSlot,
+                recursiveArrayPartitionLeaf.upperSlot,
+              ].map((slot) =>
+                `const local${slot} = ${entryArgumentValue(slot)};`),
+              ...checkedLeafTripDeclarations,
+              `return ssaRecursiveArrayWorker(${[
+                entryArrayDataVariable(recursiveArrayPartitionLeaf.arraySlot),
+                ...argumentNames.slice(1),
+              ].join(", ")});`,
+            ].filter(Boolean)
+            : compactCheckedLeafEntryLocals([
             ...directStaticDeclarations,
             ...lazyStaticDeclarations,
             ...directEntryStaticReadDeclarations,
@@ -7508,6 +7802,7 @@ class JvmSsaBlockRenderer {
             this.runCountersEnabled
               ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
             ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
+              recursiveArrayPartitionLeaf ||
               transactionalAcyclicShape || lexicalCheckedLeafWrapperShape
               ? [] : [
               `let safePointBudget = ${restoringDirectSafePointBudget};`,
@@ -7526,13 +7821,41 @@ class JvmSsaBlockRenderer {
             ...declarations,
             ...checkedLeafTree,
           ].filter(Boolean));
-          const unsafeCheckedLeafLine = checkedLeafBody.some((line) =>
+          let checkedLeafRecursiveSpecialized =
+            !recursiveArrayPartitionLeaf || Boolean(recursiveArrayWorkerBody);
+          if (recursiveArrayPartitionLeaf && !recursiveArrayWorkerBody) {
+            const specialized = specializeCheckedLeafSelfRecursiveCalls(
+              checkedLeafBody.join("\n"),
+              "ssa-checked-leaf-positional",
+            );
+            if (specialized === null) checkedLeafRecursiveSpecialized = false;
+            else {
+              checkedLeafRecursiveSpecialized = true;
+              checkedLeafBody = specialized.split("\n");
+            }
+          }
+          const unsafeCheckedLeafLine = !checkedLeafRecursiveSpecialized ||
+            checkedLeafBody.some((line) =>
             line.includes("spillLocals(") ||
             line.includes("helpers.materialize(") ||
             line.includes("helpers.arrayLoad(") ||
             line.includes("helpers.arrayStore(") ||
             line.includes("__SSA_PRIMITIVE_ARRAY_ACCESS_") ||
             line.includes("throw ") || line.includes("try {"));
+          if (recursiveArrayPartitionLeaf && unsafeCheckedLeafLine &&
+              typeof process !== "undefined" &&
+              process.env?.JVM_TRACE_STRUCTURED_RECURSIVE_ARRAY === "1") {
+            console.error("[structured-recursive-array] unsafe", {
+              checkedLeafRecursiveSpecialized,
+              lines: checkedLeafBody.filter((line) =>
+                line.includes("spillLocals(") ||
+                line.includes("helpers.materialize(") ||
+                line.includes("helpers.arrayLoad(") ||
+                line.includes("helpers.arrayStore(") ||
+                line.includes("__SSA_PRIMITIVE_ARRAY_ACCESS_") ||
+                line.includes("throw ") || line.includes("try {")),
+            });
+          }
           if (!unsafeCheckedLeafLine) {
             checkedLeafDirectPositionalSource = [
               "'use strict';",
@@ -7547,6 +7870,10 @@ class JvmSsaBlockRenderer {
                 ["helpers", ...argumentNames, "thread",
                   "nestedEntryGuarded"],
                 checkedLeafDirectPositionalSource,
+                null, false, false,
+                recursiveArrayWorkerBody
+                  ? {ssaRecursiveArrayWorker: recursiveArrayWorkerBody}
+                  : null,
               );
             // Positional generated callers invoke a checked child only after
             // their own scheduler/debug entry guard has succeeded. Publish a
@@ -7558,12 +7885,25 @@ class JvmSsaBlockRenderer {
             trustedCheckedLeafDirectPositionalSource =
               checkedLeafDirectPositionalSource.replace(
                 /\bnestedEntryGuarded\b/g, "true");
+            if (recursiveArrayPartitionLeaf) {
+              const checkedName = this.jit.generatedSource(
+                method, "ssa-checked-leaf-positional", "").functionName;
+              const trustedName = this.jit.generatedSource(
+                method, "ssa-trusted-checked-leaf-positional", "").functionName;
+              trustedCheckedLeafDirectPositionalSource =
+                trustedCheckedLeafDirectPositionalSource
+                  .split(checkedName).join(trustedName);
+            }
             trustedCheckedLeafDirectPositionalBody =
               this.jit.createGeneratedFunction(
                 method,
                 "ssa-trusted-checked-leaf-positional",
                 ["helpers", ...argumentNames, "thread"],
                 trustedCheckedLeafDirectPositionalSource,
+                null, false, false,
+                recursiveArrayWorkerBody
+                  ? {ssaRecursiveArrayWorker: recursiveArrayWorkerBody}
+                  : null,
               );
             transactionalAcyclicCheckedLeaf = transactionalAcyclicShape;
             const capturedCaches = [...entryStaticReadCaches.values()];
@@ -7602,6 +7942,7 @@ class JvmSsaBlockRenderer {
                 this.runCountersEnabled
                   ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
                 ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
+                  recursiveArrayPartitionLeaf ||
                   transactionalAcyclicShape || lexicalCheckedLeafWrapperShape
                   ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
@@ -7874,6 +8215,12 @@ class JvmSsaBlockRenderer {
         checkedLeafDirectPositionalBody && shrinkingArrayWindowLeaf);
       generated.jvmStructuredShrinkingArrayWindowAccessCount =
         shrinkingArrayWindowLeaf?.accesses.length || 0;
+      generated.jvmStructuredRecursiveArrayPartitionCheckedLeaf = Boolean(
+        checkedLeafDirectPositionalBody && recursiveArrayPartitionLeaf);
+      generated.jvmStructuredRecursiveArrayPartitionAccessCount =
+        recursiveArrayPartitionLeaf?.accesses.length || 0;
+      generated.jvmStructuredRecursiveArrayPartitionWorkerSource =
+        recursiveArrayWorkerBody ? recursiveArrayWorkerSource : null;
       generated.jvmStructuredBoundedIndexRangeCount =
         arrayRangeCheckCandidates.filter(
           (candidate) => candidate.kind === "bounded-index").length;

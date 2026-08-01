@@ -3682,6 +3682,118 @@ public final class RenamedShrinkingWindowHarness {
   t.end();
 });
 
+test('structured SSA lowers recursive primitive-array partitions generically', async (t) => {
+  const className = 'RenamedRecursivePartitionHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class RenamedRecursivePartitionHarness {
+  static void partitionRecords(int[] cells, int floor, int ceiling) {
+    if (ceiling <= floor + 4) return;
+    int pivot = floor;
+    int value0 = cells[pivot];
+    int value1 = cells[pivot + 1];
+    int value2 = cells[pivot + 2];
+    int value3 = cells[pivot + 3];
+    for (int cursor = floor + 4; cursor < ceiling; cursor += 4) {
+      int key = cells[cursor + 1];
+      if (key < value1) {
+        cells[pivot] = cells[cursor];
+        cells[pivot + 1] = key;
+        cells[pivot + 2] = cells[cursor + 2];
+        cells[pivot + 3] = cells[cursor + 3];
+        pivot += 4;
+        cells[cursor] = cells[pivot];
+        cells[cursor + 1] = cells[pivot + 1];
+        cells[cursor + 2] = cells[pivot + 2];
+        cells[cursor + 3] = cells[pivot + 3];
+      }
+    }
+    cells[pivot] = value0;
+    cells[pivot + 1] = value1;
+    cells[pivot + 2] = value2;
+    cells[pivot + 3] = value3;
+    partitionRecords(cells, floor, pivot);
+    partitionRecords(cells, pivot + 4, ceiling);
+  }
+
+  static void changedRecursion(int[] cells, int floor, int ceiling) {
+    if (ceiling <= floor + 4) return;
+    int pivot = floor;
+    for (int cursor = floor + 4; cursor < ceiling; cursor += 4) {
+      if (cells[cursor + 1] < cells[pivot + 1]) pivot += 4;
+    }
+    changedRecursion(cells, floor, pivot);
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+    checkedLeafDirectPositional: true,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'partitionRecords', '([III)V');
+  const generated = jvm.jit.getGeneratedFunction(method);
+  const checked = generated?.jvmCheckedLeafDirectPositionalBody;
+  const sourceText = generated?.jvmCheckedLeafDirectPositionalSource || '';
+  const workerSource =
+    generated?.jvmStructuredRecursiveArrayPartitionWorkerSource || '';
+  t.equal(typeof checked, 'function',
+    'an arbitrarily named recursive partition publishes a checked leaf');
+  t.equal(generated?.jvmStructuredRecursiveArrayPartitionCheckedLeaf, true,
+    'the generated metadata records the structural recursive proof');
+  t.ok(sourceText.includes('ssaRecursiveArrayWorker'),
+    'the checked entry converts the JVM array once before entering its worker');
+  t.notOk(workerSource.includes('helpers.') ||
+      workerSource.includes('arrayData(') ||
+      workerSource.includes('__SSA_PRIMITIVE_ARRAY_ACCESS_'),
+  'recursive worker calls contain no JVM dispatch or checked-array helpers');
+
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  const cells = [
+    100, 9, 102, 103,
+    200, 2, 202, 203,
+    300, 7, 302, 303,
+    400, 1, 402, 403,
+  ];
+  cells.type = '[I';
+  t.notEqual(checked(jvm.jit, cells, 0, 16, thread, true),
+    jvm.jit.asyncInvokeSentinel(),
+  'an aligned in-bounds record window enters the recursive worker');
+  t.deepEqual(cells.slice(), [
+    400, 1, 402, 403,
+    200, 2, 202, 203,
+    300, 7, 302, 303,
+    100, 9, 102, 103,
+  ], 'the generated recursive worker preserves record ordering and payloads');
+
+  for (const [label, input, floor, ceiling] of [
+    ['misaligned', [100, 9, 102, 103, 200, 2, 202, 203], 0, 7],
+    ['out-of-bounds', [100, 9, 102, 103, 200, 2, 202, 203], 0, 12],
+  ]) {
+    input.type = '[I';
+    const before = input.slice();
+    t.equal(checked(jvm.jit, input, floor, ceiling, thread, true),
+      jvm.jit.asyncInvokeSentinel(),
+    `${label} input returns to canonical execution`);
+    t.deepEqual(input.slice(), before,
+      `${label} rejection precedes the first recursive-array effect`);
+  }
+
+  const changed = await jvm.findMethodInHierarchy(
+    className, 'changedRecursion', '([III)V');
+  const changedGenerated = jvm.jit.getGeneratedFunction(changed);
+  t.equal(changedGenerated?.jvmStructuredRecursiveArrayPartitionCheckedLeaf,
+    false, 'an altered recursion shape is rejected structurally');
+  t.equal(changedGenerated?.jvmCheckedLeafDirectPositionalBody, null,
+    'the rejected shape retains the restoring implementation');
+  t.end();
+});
+
 test('structured SSA publishes transactional acyclic checked leaves', async (t) => {
   const className = 'TransactionalAcyclicLeafHarness';
   const classpath = compileJavaFixture(t, className, `
