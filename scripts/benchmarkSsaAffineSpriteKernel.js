@@ -227,6 +227,13 @@ function benchmarkPair(generic, oracle) {
     ? null : await loadRuntime(resolvedSemanticClassDirectory);
   const {jvm, owner, method, semantic} = await loadRuntime(
     resolvedClassDirectory, semanticRuntime);
+  // Use a second runtime for the exact installed handwritten comparator so
+  // its live static destination does not perturb the generic runtime between
+  // paired calls. Both sides execute the same measured classfiles; the
+  // optional semantic directory is only a structural-analysis fallback.
+  const oracleRuntime = await loadRuntime(
+    resolvedClassDirectory, semanticRuntime);
+  const oracleJvm = oracleRuntime.jvm;
   const sourcePixels = intArray(width * height, index =>
     index % 11 === 0 ? 0 : Math.imul(index + 1, 0x10203));
   const genericDestination = intArray(width * height, () => 0);
@@ -242,10 +249,25 @@ function benchmarkPair(generic, oracle) {
   writeStatic(jvm, fields.surfaceStride, width);
   writeStatic(jvm, fields.destination, genericDestination);
 
+  const oracleFields = oracleRuntime.semantic.fields;
+  writeStatic(oracleJvm, oracleFields.clipOuterStart, 0);
+  writeStatic(oracleJvm, oracleFields.clipOuterEnd, width);
+  writeStatic(oracleJvm, oracleFields.clipInnerStart, 0);
+  writeStatic(oracleJvm, oracleFields.clipInnerEnd, height);
+  writeStatic(oracleJvm, oracleFields.surfaceStride, width);
+  writeStatic(oracleJvm, oracleFields.destination, oracleDestination);
+
   const generated = jvm.jit.structuredSsa.compile(method);
   if (!generated?.jvmStructuredSsa ||
       typeof generated.jvmRestoringDirectPositionalBody !== 'function') {
-    throw new Error('generic SSA did not publish a restoring positional body');
+    if (process.env.SSA_AFFINE_PRINT_FAILED_SOURCE === '1' &&
+        jvm.jit.structuredSsa.lastFailedSource) {
+      process.stderr.write(`${jvm.jit.structuredSsa.lastFailedSource}\n`);
+    }
+    const reason = jvm.jit.structuredSsa.lastCompileError?.stack ||
+      jvm.jit.structuredSsa.lastRejectionReason || 'unknown rejection';
+    throw new Error(
+      `generic SSA did not publish a restoring positional body: ${reason}`);
   }
   // Static fields were deliberately populated after class loading. Link their
   // ordinary direct locations exactly as a warmed generated entry does.
@@ -264,6 +286,35 @@ function benchmarkPair(generic, oracle) {
   }};
   const mask = {type: fields.maskPixels[1], fields: {
     [jvm.jit.fieldSites[maskPixelsSite].directInstanceKey]: maskPixels,
+  }};
+  oracleJvm.jit.affineSpriteRasterEnabled = true;
+  const oracleAsync = Symbol('affine handwritten fallback');
+  const oracleReturn = Symbol('affine handwritten return');
+  const oracleIntrinsic = HandwrittenAffineSpriteRaster.createIntrinsic(
+    oracleJvm.jit, oracleRuntime.method, oracleRuntime.method.descriptor, {
+      ASYNC_INVOKE: oracleAsync,
+      RETURN_VOID: oracleReturn,
+    });
+  if (!oracleIntrinsic || typeof oracleIntrinsic.jvmPositional !== 'function') {
+    throw new Error('exact handwritten affine intrinsic did not install');
+  }
+  const oracleSpriteWidthSite =
+    oracleJvm.jit.registerFieldSite(oracleFields.spriteWidth);
+  const oracleSpriteHeightSite =
+    oracleJvm.jit.registerFieldSite(oracleFields.spriteHeight);
+  const oracleSpritePixelsSite =
+    oracleJvm.jit.registerFieldSite(oracleFields.spritePixels);
+  const oracleMaskPixelsSite =
+    oracleJvm.jit.registerFieldSite(oracleFields.maskPixels);
+  const oracleSprite = {type: oracleFields.spriteWidth[1], fields: {
+    [oracleJvm.jit.fieldSites[oracleSpriteWidthSite].directInstanceKey]: width,
+    [oracleJvm.jit.fieldSites[oracleSpriteHeightSite].directInstanceKey]: height,
+    [oracleJvm.jit.fieldSites[oracleSpritePixelsSite].directInstanceKey]:
+      sourcePixels,
+  }};
+  const oracleMask = {type: oracleFields.maskPixels[1], fields: {
+    [oracleJvm.jit.fieldSites[oracleMaskPixelsSite].directInstanceKey]:
+      maskPixels,
   }};
   const arguments_ = [
     0, width, 0, 0, height, height,
@@ -301,6 +352,9 @@ function benchmarkPair(generic, oracle) {
   }
 
   const body = generated.jvmRestoringDirectPositionalBody;
+  if (process.env.SSA_AFFINE_DUMP_SOURCE === '1') {
+    process.stderr.write(`${generated.jvmRestoringDirectPositionalSource}\n`);
+  }
   const generic = {
     destination: genericDestination,
     invoke() {
@@ -322,9 +376,20 @@ function benchmarkPair(generic, oracle) {
   const oracle = {
     destination: oracleDestination,
     invoke() {
-      if (!HandwrittenAffineSpriteRaster._test.runRaster(
-        oracleData, arguments_)) {
-        throw new Error('handwritten oracle rejected benchmark input');
+      if (process.env.SSA_AFFINE_FIXED_CEILING === '1') {
+        if (!HandwrittenAffineSpriteRaster._test.runRaster(
+          oracleData, arguments_)) {
+          throw new Error('fixed affine ceiling rejected benchmark input');
+        }
+        return;
+      }
+      const result = oracleIntrinsic.jvmPositional(
+        oracleSprite, oracleMask, ...arguments_);
+      if (result === oracleAsync) {
+        throw new Error('exact handwritten affine entry fell back');
+      }
+      if (result !== oracleReturn) {
+        throw new Error('exact handwritten affine entry returned unexpectedly');
       }
     },
   };
@@ -352,7 +417,11 @@ function benchmarkPair(generic, oracle) {
   process.stdout.write(`${JSON.stringify({
     node: process.version,
     classDirectory: resolvedClassDirectory,
-    oracleClassDirectory: resolvedSemanticClassDirectory,
+    oracleClassDirectory: resolvedClassDirectory,
+    semanticClassDirectory: resolvedSemanticClassDirectory,
+    oracleKind: process.env.SSA_AFFINE_FIXED_CEILING === '1'
+      ? 'fixed-inner-kernel-ceiling'
+      : 'exact-dynamic-guarded-handwritten',
     structuralTarget: {
       owner,
       descriptor: method.descriptor,
@@ -381,7 +450,8 @@ function benchmarkPair(generic, oracle) {
     provenance: {
       javaTools: repositoryMetadata(path.resolve(__dirname, '..')),
       measuredClasses: hashClassTree(resolvedClassDirectory),
-      oracleClasses: hashClassTree(resolvedSemanticClassDirectory),
+      oracleClasses: hashClassTree(resolvedClassDirectory),
+      semanticClasses: hashClassTree(resolvedSemanticClassDirectory),
       environment: Object.fromEntries(
         Object.entries(process.env)
           .filter(([name]) => name.startsWith('JVM_') ||
@@ -400,6 +470,38 @@ function benchmarkPair(generic, oracle) {
       recurrenceRanges: generated.jvmStructuredRecurrenceRangeCount,
       specializedRangeAccesses:
         generated.jvmStructuredSpecializedArrayRangeAccessCount,
+      coalescedRangeGuards:
+        generated.jvmStructuredCoalescedArrayRangeGuardCount,
+      dominatedFieldReceiverChecks:
+        generated.jvmStructuredDominatedFieldReceiverCheckCount,
+      dominatedEntryReferenceNullBranches:
+        generated.jvmStructuredDominatedEntryReferenceNullBranchCount,
+      eliminatedTerminalBreaks:
+        generated.jvmStructuredEliminatedTerminalBreakCount,
+      eliminatedStructuredBlocks:
+        generated.jvmStructuredEliminatedBlockCount,
+      restoringRangeGuardDeopts:
+        generated.jvmStructuredRestoringRangeGuardDeoptCount,
+      restoringCoarseLoopDeopts:
+        generated.jvmStructuredRestoringCoarseLoopDeoptCount,
+      rangeDominatedArithmeticGuards:
+        generated.jvmStructuredRangeDominatedArithmeticGuardCount,
+      loopInvariantDivisorGuards:
+        generated.jvmStructuredLoopInvariantDivisorGuardCount,
+      restoringDirectFieldLayouts:
+        generated.jvmStructuredRestoringDirectFieldLayoutCount,
+      restoringSpillCalls:
+        generated.jvmStructuredRestoringSpillCallCount,
+      restoringSpillInlineCost:
+        generated.jvmStructuredRestoringSpillInlineCost,
+      inlinedRestoringSpills:
+        generated.jvmStructuredInlinedRestoringSpills,
+      captureFreeRestoringSpills:
+        generated.jvmStructuredCaptureFreeRestoringSpills,
+      eagerFieldReceiverNullChecks:
+        generated.jvmStructuredEagerFieldReceiverNullCheckCount,
+      rangeGuardDataVariables:
+        generated.jvmStructuredRangeGuardDataVariableCount,
       source: process.env.SSA_AFFINE_PRINT_SOURCE === '1'
         ? generated.jvmRestoringDirectPositionalSource
         : undefined,

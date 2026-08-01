@@ -731,6 +731,14 @@ public class StructuredByteArrays {
   static void fillFloats(float[] values, float value) {
     for (int i = 0; i < values.length; i++) values[i] = value;
   }
+  static void countTrue(boolean[] values, int[] out) {
+    int count = 0;
+    for (int i = 0; i < values.length; i++) if (values[i]) count++;
+    out[0] = count;
+  }
+  static void fillBooleans(boolean[] values, int value) {
+    for (int i = 0; i < values.length; i++) values[i] = value != 0;
+  }
 }
 `);
   const jvm = new JVM({ classpath, jit: {
@@ -755,6 +763,9 @@ public class StructuredByteArrays {
     'StructuredByteArrays', 'sumInto', '([B[I)V');
   t.ok(jvm.jit.codegenCache.get(sumMethod)?.jvmStructuredSsa,
     'byte-array loop selects structured SSA');
+  t.notOk(jvm.jit.codegenCache.get(sumMethod).jvmStructuredSource.includes(
+    '.type === "[Z"'),
+  'the byte[] descriptor removes the per-element byte/boolean type test');
   const normalizeArrayLoad = jvm.jit.normalizeArrayLoad;
   let normalizedLoadCalls = 0;
   jvm.jit.normalizeArrayLoad = function countedNormalizeArrayLoad(...args) {
@@ -778,6 +789,25 @@ public class StructuredByteArrays {
   await invoke(jvm, thread, 'StructuredByteArrays', 'fill', '([BI)V', [output, 255]);
   t.deepEqual(output.slice(), [-1, -1, -1],
     'direct bastore paths narrow values to signed bytes');
+
+  const booleans = [0, 1, 2, 0];
+  booleans.type = '[Z';
+  const trueCount = [0];
+  trueCount.type = '[I';
+  await invoke(jvm, thread, 'StructuredByteArrays', 'countTrue', '([Z[I)V',
+    [booleans, trueCount]);
+  t.equal(trueCount[0], 2,
+    'a statically boolean baload still normalizes every truthy element to one');
+  const countTrueMethod = await jvm.findMethodInHierarchy(
+    'StructuredByteArrays', 'countTrue', '([Z[I)V');
+  const countTrueSource =
+    jvm.jit.codegenCache.get(countTrueMethod)?.jvmStructuredSource || '';
+  t.notOk(countTrueSource.includes('.type === "[Z"'),
+    'the boolean[] descriptor removes the same runtime kind test');
+  await invoke(jvm, thread, 'StructuredByteArrays', 'fillBooleans', '([ZI)V',
+    [booleans, 0]);
+  t.deepEqual(booleans.slice(), [0, 0, 0, 0],
+    'statically boolean bastore preserves zero/one normalization');
   const floats = [0, 0, 0];
   floats.type = '[F';
   await invoke(jvm, thread, 'StructuredByteArrays',
@@ -2119,6 +2149,16 @@ public final class ArbitraryDirectArrayLoop {
     'the verified loop publishes the generic restoring positional entry');
     t.ok(target.generated.jvmStructuredLoopCount > 0,
       'the direct entry comes from a structured loop rather than an acyclic leaf');
+    t.equal(target.generated.jvmStructuredInlinedRestoringSpills, true,
+      'a bounded loop inlines its cold Frame reconstruction within budget');
+    t.equal(target.generated.jvmStructuredCaptureFreeRestoringSpills, true,
+      'loop reconstruction uses the capture-free cold helper');
+    t.ok(target.generated.jvmStructuredRestoringSpillCallCount > 0 &&
+      target.generated.jvmStructuredRestoringSpillInlineCost <= 512,
+    'the generic decision is derived from spill sites and live JVM state');
+    t.notOk(target.generated.jvmRestoringDirectPositionalSource.includes(
+      'function spillLocals()'),
+    'the successful loop does not capture scalar locals in a spill closure');
     const reusableFrame = target.freeFrame;
 
     const generic = jvm.jit.tryInvokeSyncAt;
@@ -2841,22 +2881,21 @@ public final class GenericSpanShape {
     'generic span SSA hoists stable statics and versions its affine store range');
   const spanSource = genericSpan.jvmRestoringDirectPositionalSource;
   const fastArmMatch =
-    /if \(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)/.exec(spanSource);
+    /if \(!\(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)\)/.exec(
+      spanSource);
   const fastArmStart = fastArmMatch?.index ?? -1;
   const fastStoreMatch = /ssaEntryStaticArrayData\d+\[ssaValue\d+\] =/
     .exec(spanSource.slice(fastArmStart));
   const fastStore = fastStoreMatch
     ? fastArmStart + fastStoreMatch.index : -1;
-  const slowBoundsMatch = /if \(!ssaArrayRangeGuard\d+ &&/
-    .exec(spanSource.slice(fastArmStart));
-  const slowBounds = slowBoundsMatch
-    ? fastArmStart + slowBoundsMatch.index : -1;
+  const rangeDeopt = spanSource.indexOf(
+    "reason: 'structured SSA range guard'", fastArmStart);
   t.ok(fastArmStart >= 0 && fastStore > fastArmStart &&
-      slowBounds > fastStore &&
-      !spanSource.slice(fastArmStart, fastStore).includes('ssaMaterialize'),
-    'the range-proven fast loop contains only the direct array store');
-  t.ok(slowBounds > fastStore,
-  'the slow loop retains the throwing bounds/materialization branch');
+      rangeDeopt > fastArmStart && rangeDeopt < fastStore,
+    'the restoring entry deopts at a failed guard then runs one direct-store loop');
+  t.notOk(/if \(!ssaArrayRangeGuard\d+ &&/.test(
+    spanSource.slice(fastStore)),
+  'the restoring function does not duplicate a checked slow loop');
   const checkedLeaf = genericSpan.jvmCheckedLeafDirectPositionalBody;
   const checkedLeafSource =
     genericSpan.jvmCheckedLeafDirectPositionalSource || '';
@@ -3172,6 +3211,353 @@ public final class CyclicArrayRangeHarness {
   t.end();
 });
 
+test('structured SSA proves complete nested cyclic array layouts', async (t) => {
+  const className = 'NestedCyclicArrayRangeHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class NestedCyclicArrayRangeHarness {
+  static void copy(int destinationIndex, int sourceWidth, int rowCount,
+      int sourceRow, byte tag, int[] destination, int copyWidth,
+      int[] source, int destinationRowSkip, int sourceX,
+      int sourceIndex, int sourceHeight) {
+    if (tag != -64) return;
+    int sourceStartX = sourceX;
+    int sourceCycle = sourceHeight * sourceWidth;
+    for (int row = 0; row < rowCount; row++) {
+      for (int column = 0; column < copyWidth; column++) {
+        destination[destinationIndex++] = source[sourceIndex++];
+        if (++sourceX == sourceWidth) {
+          sourceIndex -= sourceWidth;
+          sourceX = 0;
+        }
+      }
+      destinationIndex += destinationRowSkip;
+      sourceIndex = sourceIndex - sourceX + sourceStartX + sourceWidth;
+      sourceX = sourceStartX;
+      if (++sourceRow == sourceHeight) {
+        sourceRow = 0;
+        sourceIndex -= sourceCycle;
+      }
+    }
+  }
+
+  static void callCopy(int[] destination, int[] source, int item) {
+    int sourceX = item & 3;
+    int sourceRow = item & 2;
+    copy(0, 4, 2, sourceRow, (byte) -64, destination, 4,
+      source, 0, sourceX, sourceRow * 4 + sourceX, 3);
+  }
+
+  static void altered(int destinationIndex, int sourceWidth, int rowCount,
+      int sourceRow, byte tag, int[] destination, int copyWidth,
+      int[] source, int destinationRowSkip, int sourceX,
+      int sourceIndex, int sourceHeight) {
+    if (tag != -64) return;
+    int sourceStartX = sourceX;
+    int sourceCycle = sourceHeight * sourceWidth;
+    for (int row = 0; row < rowCount; row++) {
+      for (int column = 0; column < copyWidth; column++) {
+        destination[destinationIndex++] = source[sourceIndex++];
+        if (++sourceX == sourceWidth) {
+          sourceIndex -= sourceWidth;
+          sourceX = 0;
+        }
+      }
+      destinationIndex += destinationRowSkip;
+      sourceIndex += sourceWidth;
+      sourceX = sourceStartX;
+      if (++sourceRow == sourceHeight) {
+        sourceRow = 0;
+        sourceIndex -= sourceCycle;
+      }
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+    checkedLeafDirectPositional: true,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const descriptor = '(IIIIB[II[IIIII)V';
+  const method = await jvm.findMethodInHierarchy(
+    className, 'copy', descriptor);
+  const generated = jvm.jit.getGeneratedFunction(method);
+  const checked = generated?.jvmCheckedLeafDirectPositionalBody;
+  const checkedSource =
+    generated?.jvmCheckedLeafDirectPositionalSource || '';
+  const trustedChecked =
+    generated?.jvmTrustedCheckedLeafDirectPositionalBody;
+  const trustedCheckedSource =
+    generated?.jvmTrustedCheckedLeafDirectPositionalSource || '';
+  t.equal(generated?.jvmStructuredHoistedArrayRangeGuardCount, 2,
+    'both destination and full cyclic source rectangles are entry guarded');
+  t.equal(typeof checked, 'function',
+    'a fully bounded nested numeric region publishes a checked leaf');
+  t.equal(typeof trustedChecked, 'function',
+    'the checked leaf also publishes a trusted nested-call entry');
+  t.notOk(trustedCheckedSource.includes('nestedEntryGuarded'),
+    'the trusted entry specializes the already-dominated outer guard');
+  t.ok(trustedCheckedSource.includes(
+    'ssaRestoringClassInitializationGuard'),
+  'the trusted entry retains its class-initialization epoch guard');
+  const nestedPositional = jvm.jit.getPositionalGeneratedInvoker({
+    op: 'invokestatic', descriptor, params: new Array(12),
+  }, { method, lookupClass: className, generated });
+  t.equal(nestedPositional?.jvmRawInvoke, trustedChecked,
+    'generated positional call sites select the trusted nested ABI');
+  t.notOk(checkedSource.includes('safePointBudget') ||
+      checkedSource.includes('ssaRuntimeCoarse') ||
+      checkedSource.includes('helpers.arrayLoad(') ||
+      checkedSource.includes('helpers.arrayStore('),
+  'the atomic checked leaf contains no dead scheduler or checked-array path');
+  const outerLoop = checkedSource.indexOf('L3: while');
+  const rangeBailout = checkedSource.indexOf(
+    'if (!(ssaArrayRangeGuard0 && ssaArrayRangeGuard1))');
+  t.ok(rangeBailout >= 0 && rangeBailout < outerLoop,
+    'the combined layout guard executes once before the outer loop');
+
+  const source = Array.from({length: 12}, (_unused, index) => index);
+  source.type = '[I';
+  const destination = new Array(8).fill(-1);
+  destination.type = '[I';
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  const valid = checked(jvm.jit,
+    0, 4, 2, 2, -64, destination, 4,
+    source, 0, 2, 10, 3, thread, true);
+  t.notEqual(valid, jvm.jit.asyncInvokeSentinel(),
+    'a valid dynamic rectangular layout enters the checked leaf');
+  t.deepEqual(destination.slice(), [10, 11, 8, 9, 2, 3, 0, 1],
+    'the leaf preserves horizontal and vertical wrap order exactly');
+
+  destination.fill(-1);
+  const trustedValid = trustedChecked(jvm.jit,
+    0, 4, 2, 2, -64, destination, 4,
+    source, 0, 2, 10, 3, thread);
+  t.notEqual(trustedValid, jvm.jit.asyncInvokeSentinel(),
+    'the trusted nested-call entry accepts the same valid layout');
+  t.deepEqual(destination.slice(), [10, 11, 8, 9, 2, 3, 0, 1],
+    'trusted entry execution preserves the checked leaf result');
+
+  destination.fill(63);
+  jvm.classInitializationState.set(className, 'UNINITIALIZED');
+  jvm.classInitializationEpoch += 1;
+  t.equal(trustedChecked(jvm.jit,
+    0, 4, 2, 2, -64, destination, 4,
+    source, 0, 2, 10, 3, thread),
+  jvm.jit.asyncInvokeSentinel(),
+  'the trusted entry still rejects a changed class lifecycle');
+  t.ok(destination.every((value) => value === 63),
+    'class-lifecycle rejection precedes every trusted-entry write');
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  jvm.classInitializationEpoch += 1;
+
+  const shortSource = source.slice(0, 11);
+  shortSource.type = '[I';
+  const untouched = new Array(8).fill(77);
+  untouched.type = '[I';
+  t.equal(checked(jvm.jit,
+    0, 4, 2, 2, -64, untouched, 4,
+    shortSource, 0, 2, 10, 3, thread, true),
+  jvm.jit.asyncInvokeSentinel(),
+  'an incomplete backing rectangle rejects the checked entry');
+  t.equal(trustedChecked(jvm.jit,
+    0, 4, 2, 2, -64, untouched, 4,
+    shortSource, 0, 2, 10, 3, thread),
+  jvm.jit.asyncInvokeSentinel(),
+  'the trusted entry retains the same before-effects range rejection');
+  t.ok(untouched.every((value) => value === 77),
+    'the rejected layout performs no guest write');
+  t.equal(checked(jvm.jit,
+    0, 4, 1025, 2, -64, untouched, 4,
+    source, 0, 2, 10, 3, thread, true),
+  jvm.jit.asyncInvokeSentinel(),
+  'an oversized dynamic trip count retains scheduler-owned execution');
+
+  const callerMethod = await jvm.findMethodInHierarchy(
+    className, 'callCopy', '([I[II)V');
+  const callerGenerated = jvm.jit.getGeneratedFunction(callerMethod);
+  const callerChecked = callerGenerated?.jvmCheckedLeafDirectPositionalBody;
+  const callerCheckedSource =
+    callerGenerated?.jvmCheckedLeafDirectPositionalSource || '';
+  t.equal(typeof callerChecked, 'function',
+    'a capture-free checked child is inserted into a checked wrapper caller');
+  t.equal(callerGenerated?.jvmStructuredLexicalCheckedLeafCallCount, 1,
+    'the generic tier records one lexical checked-leaf call');
+  t.equal(callerGenerated?.jvmStructuredLexicalCheckedLeafWrapper, true,
+    'the call-only wrapper records its before-effects bailout proof');
+  t.notOk(callerCheckedSource.includes('ssaFastPositional') ||
+      callerCheckedSource.includes('tryInvokeSyncAt') ||
+      callerCheckedSource.includes('helpers.materialize(') ||
+      callerCheckedSource.includes('new plan.Frame'),
+  'the wrapper checked leaf contains no child dispatch or Frame fallback');
+  const callerDestination = new Array(8).fill(-1);
+  callerDestination.type = '[I';
+  t.notEqual(callerChecked(jvm.jit, callerDestination, source, 2,
+    thread, true), jvm.jit.asyncInvokeSentinel(),
+  'the wrapper admits a layout satisfying the inserted child assumptions');
+  t.deepEqual(callerDestination.slice(), [10, 11, 8, 9, 2, 3, 0, 1],
+    'the lexical wrapper preserves the child cyclic writes');
+  const callerRejected = new Array(8).fill(91);
+  callerRejected.type = '[I';
+  t.equal(callerChecked(jvm.jit, callerRejected, shortSource, 2,
+    thread, true), jvm.jit.asyncInvokeSentinel(),
+  'a failed inserted-child layout returns to the canonical caller');
+  t.ok(callerRejected.every((value) => value === 91),
+    'the wrapper rejection occurs before the child first effect');
+
+  const frame = new Frame(method);
+  frame.className = className;
+  const partial = new Array(8).fill(0);
+  partial.type = '[I';
+  frame.locals.splice(0, 12,
+    0, 4, 2, 2, -64, partial, 4,
+    shortSource, 0, 2, 10, 3);
+  thread.callStack.push(frame);
+  let error = null;
+  try {
+    generated(frame, thread, jvm.jit, false);
+  } catch (thrown) {
+    error = thrown;
+  }
+  const loadPc = jvm.jit.getCodeItems(method).findIndex((item) =>
+    (item.instruction?.op || item.instruction) === 'iaload');
+  t.equal(error?.type, 'java/lang/ArrayIndexOutOfBoundsException',
+    'a rejected leaf resumes the canonical throwing execution');
+  t.deepEqual(partial.slice(0, 3), [10, 0, 0],
+    'canonical fallback retains writes before the exceptional access');
+  t.equal(frame.pc, loadPc,
+    'canonical fallback records the precise exceptional bytecode PC');
+  thread.callStack.pop();
+
+  const altered = await jvm.findMethodInHierarchy(
+    className, 'altered', descriptor);
+  const alteredGenerated = jvm.jit.structuredSsa.compile(altered);
+  t.equal(alteredGenerated?.jvmStructuredHoistedArrayRangeGuardCount, 1,
+    'an altered row recurrence does not receive the rectangular source proof');
+  t.equal(alteredGenerated?.jvmCheckedLeafDirectPositionalBody, null,
+    'an unproved nested source access retains the restoring implementation');
+  t.end();
+});
+
+test('structured SSA publishes transactional acyclic checked leaves', async (t) => {
+  const className = 'TransactionalAcyclicLeafHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class TransactionalAcyclicLeafHarness {
+  int[] source;
+  int divisor;
+  static int[] destination;
+  void copyDivided(int index) {
+    int value = source[index] / divisor;
+    destination[index] = value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+    checkedLeafDirectPositional: true,
+  } });
+  const classData = await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const destination = new Array(4).fill(77);
+  destination.type = '[I';
+  classData.staticFields.set('destination:[I', destination);
+  const method = await jvm.findMethodInHierarchy(
+    className, 'copyDivided', '(I)V');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  const checked = generated?.jvmCheckedLeafDirectPositionalBody;
+  const sourceText = generated?.jvmCheckedLeafDirectPositionalSource || '';
+  t.equal(typeof checked, 'function',
+    'one final array effect admits a transactional checked leaf');
+  t.equal(generated?.jvmStructuredTransactionalAcyclicCheckedLeaf, true,
+    'the structural tier records its transactional proof');
+  t.notOk(sourceText.includes('new plan.Frame') ||
+      sourceText.includes('helpers.materialize(') ||
+      sourceText.includes('helpers.arrayLoad(') ||
+      sourceText.includes('helpers.arrayStore(') ||
+      sourceText.includes('ArithmeticException'),
+  'the checked leaf contains only pre-effect bailouts');
+
+  const values = [20, 30, 40, 50];
+  values.type = '[I';
+  const receiver = {
+    type: className,
+    fields: {
+      [`${className}.source`]: values,
+      [`${className}.divisor`]: 10,
+    },
+  };
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  t.notEqual(checked(jvm.jit, receiver, 2, thread, true),
+    jvm.jit.asyncInvokeSentinel(),
+  'canonical fields and arrays enter the checked leaf');
+  t.deepEqual(destination.slice(), [77, 77, 4, 77],
+    'the admitted leaf preserves the final Java store');
+
+  receiver.fields[`${className}.source`] = values.slice(0, 1);
+  receiver.fields[`${className}.source`].type = '[I';
+  t.equal(checked(jvm.jit, receiver, 2, thread, true),
+    jvm.jit.asyncInvokeSentinel(),
+  'a source bounds failure returns to canonical execution');
+  t.deepEqual(destination.slice(), [77, 77, 4, 77],
+    'source rejection occurs before the destination effect');
+  receiver.fields[`${className}.source`] = values;
+  receiver.fields[`${className}.divisor`] = 0;
+  t.equal(checked(jvm.jit, receiver, 1, thread, true),
+    jvm.jit.asyncInvokeSentinel(),
+  'division by zero returns to precise canonical execution');
+  t.deepEqual(destination.slice(), [77, 77, 4, 77],
+    'arithmetic rejection also occurs before the destination effect');
+  t.end();
+});
+
+test('structured SSA proves nonzero divisors from crossing predicates',
+  async (t) => {
+    const className = 'CrossingDivisionHarness';
+    const classpath = compileJavaFixture(t, className, `
+public final class CrossingDivisionHarness {
+  static int crossing(int y0, int y1, int y, int x0, int x1) {
+    if ((y0 <= y && y < y1) || (y1 <= y && y < y0)) {
+      return x0 + (y - y0) * (x1 - x0) / (y1 - y0);
+    }
+    return 0;
+  }
+  static int unsafe(int y0, int y1, int y, int x0, int x1) {
+    return x0 + (y - y0) * (x1 - x0) / (y1 - y0);
+  }
+}
+`);
+    const jvm = new JVM({ classpath, jit: {
+      warmupThreshold: 0, structuredSsa: true, guestKernelOracles: false,
+    } });
+    await jvm.loadClassByName(className);
+    jvm.classInitializationState.set(className, 'INITIALIZED');
+    const descriptor = '(IIIII)I';
+    const crossing = await jvm.findMethodInHierarchy(
+      className, 'crossing', descriptor);
+    const unsafe = await jvm.findMethodInHierarchy(
+      className, 'unsafe', descriptor);
+    const crossingGenerated = jvm.jit.structuredSsa.compile(crossing);
+    const unsafeGenerated = jvm.jit.structuredSsa.compile(unsafe);
+    t.equal(crossingGenerated?.jvmStructuredDominatedArithmeticGuardCount, 1,
+      'both crossing arms prove the unordered endpoints unequal');
+    t.notOk(crossingGenerated?.jvmRestoringDirectPositionalSource
+      ?.includes('ArithmeticException'),
+    'the dominated division omits its impossible exceptional arm');
+    t.ok(unsafeGenerated?.jvmRestoringDirectPositionalSource
+      ?.includes('ArithmeticException'),
+    'an unguarded divisor retains exact arithmetic exception machinery');
+    t.end();
+  });
+
 test('structured SSA versions scaled and carried induction indexes',
   async (t) => {
   const className = 'ScaledCarriedArrayRangeHarness';
@@ -3247,6 +3633,56 @@ public final class ScaledCarriedArrayRangeHarness {
     'the slow loop retains the first load and local mutation');
   t.deepEqual(failed.frame.stack.items, [7, short, 7],
     'the failing scaled load reconstructs its exact operands');
+  t.end();
+});
+
+test('structured SSA coalesces identical load and store range guards',
+  async (t) => {
+  const className = 'CoalescedArrayRangeHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class CoalescedArrayRangeHarness {
+  static void bump(int[] values, int start, int count) {
+    for (int index = 0; index < count; index++) {
+      values[start + index] = values[start + index] + 1;
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'bump', '([III)V');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.equal(generated?.jvmStructuredArrayRangeGuardCount, 2,
+    'the load and store each contribute an independently verified access');
+  t.equal(generated?.jvmStructuredCoalescedArrayRangeGuardCount, 1,
+    'identical access predicates share one generated entry guard');
+  const declarations = generated.jvmRestoringDirectPositionalSource.match(
+    /const ssaArrayRangeGuard\d+ =/g) || [];
+  t.equal(declarations.length, 1,
+    'the restoring source computes the shared range predicate once');
+
+  const values = [1, 2, 3, 4, 5];
+  values.type = '[I';
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  const result = generated.jvmRestoringDirectPositionalBody(
+    jvm.jit, {
+      target: { freeFrame: null }, Frame, lookupClass: className, method,
+      restoreFrame(targetThread, frame, depth) {
+        targetThread.callStack.items.splice(depth, 0, frame);
+      },
+    }, values, 1, 3, thread, true);
+  t.equal(result, jvm.jit.returnVoid(),
+    'the coalesced guard accepts the valid Java range');
+  t.deepEqual(Array.from(values), [1, 3, 4, 5, 5],
+    'load/store ordering and mutations remain exact');
   t.end();
 });
 
@@ -3393,11 +3829,15 @@ public final class NestedRasterShape {
   const source = generated?.jvmRestoringDirectPositionalSource || '';
   t.ok(generated?.jvmStructuredSsa,
     'the nested raster selects the generic structured SSA tier');
-  t.ok(/if \(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)/.test(source),
-    'the call-free inner pixel loop receives a range-versioned fast arm');
+  t.ok(/if \(!\(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)\)/.test(source) &&
+      source.includes("reason: 'structured SSA range guard'"),
+    'the call-free inner pixel loop deopts before its range-proven fast arm');
   const pollCount = (source.match(/--safePointBudget === 0/g) || []).length;
-  t.ok(pollCount >= 2,
-    'the slow inner arm and the helper-containing outer loop retain polls');
+  t.equal(generated.jvmStructuredRestoringCoarseLoopDeoptCount, 1,
+    'the helper-containing outer loop versions its trip-count proof');
+  t.ok(source.includes("reason: 'structured SSA coarse loop guard'") &&
+      pollCount === 0,
+    'an oversized outer loop restores at its header instead of polling every row');
   const fastArm = source.indexOf('&& ssaArrayRangeGuard');
   const fastStore = source.indexOf('] =', fastArm);
   t.ok(fastArm >= 0 && fastStore > fastArm &&
@@ -5212,6 +5652,83 @@ test('integer leaf inlining ignores unreachable diagnostic catch tails', (t) => 
   t.end();
 });
 
+test('guarded integer leaves deopt before diagnostic effects and restore arithmetic failures',
+  async (t) => {
+  const className = 'GuardedIntegerLeafHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class GuardedIntegerLeafHarness {
+  static int diagnostic;
+
+  static int rounded(int tag, int denominator, int numerator) {
+    int sign = numerator >>> 31;
+    if (tag != 23841) diagnostic = tag;
+    return ((numerator + sign) / denominator) - sign;
+  }
+
+  static void fill(int[] destination, int tag, int denominator) {
+    for (int index = 0; index < destination.length; index++) {
+      destination[index] = rounded(tag, denominator, index - 4);
+    }
+  }
+}
+`);
+  const jvm = new JVM({classpath, jit: {
+    warmupThreshold: 0, structuredSsa: true, profileMethods: false,
+  }});
+  const classData = await jvm.loadClassByName(className);
+  classData.staticFieldsInitialized = true;
+  classData.staticFields.set('diagnostic:I', 0);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const thread = {
+    id: 0, name: 'guarded-integer-leaf', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+
+  const valid = new Array(8).fill(99);
+  valid.type = '[I';
+  await invoke(jvm, thread, className, 'fill', '([III)V',
+    [valid, 23841, 3]);
+  t.deepEqual(valid.slice(), [-2, -1, -1, -1, 0, 0, 0, 1],
+    'the guarded lexical division preserves signed rounded results');
+  const fillMethod = await jvm.findMethodInHierarchy(
+    className, 'fill', '([III)V');
+  const generated = jvm.jit.codegenCache.get(fillMethod);
+  const generatedSource = generated?.jvmStructuredSource || '';
+  t.ok(generated?.jvmStructuredSsa &&
+      generatedSource.includes('guarded inline integer leaf'),
+    'the caller contains a structural tag/divisor guard');
+  t.notOk(generatedSource.includes('tryInvokeSyncAt'),
+    'the accepted path contains no generic call dispatch');
+  t.equal(classData.staticFields.get('diagnostic:I'), 0,
+    'the accepted guard never executes the diagnostic branch');
+
+  const diagnostic = new Array(2).fill(0);
+  diagnostic.type = '[I';
+  await invoke(jvm, thread, className, 'fill', '([III)V',
+    [diagnostic, 17, 2]);
+  t.equal(classData.staticFields.get('diagnostic:I'), 17,
+    'a failed tag guard resumes canonical execution before the helper effect');
+  t.deepEqual(diagnostic.slice(), [-2, -2],
+    'canonical helper execution preserves the rejected call results');
+
+  const arithmetic = new Array(2).fill(73);
+  arithmetic.type = '[I';
+  let thrown = null;
+  try {
+    await invoke(jvm, thread, className, 'fill', '([III)V',
+      [arithmetic, 23841, 0]);
+  } catch (error) {
+    thrown = error;
+  }
+  t.equal(thrown?.type, 'java/lang/ArithmeticException',
+    'a zero divisor is restored to the canonical helper exception path');
+  t.deepEqual(arithmetic.slice(), [73, 73],
+    'the arithmetic failure occurs before the caller store side effect');
+  t.end();
+});
+
 test('counted-loop proofs follow a dominating split induction update', (t) => {
   const flagField = ['Field', 'SplitBackedgeOptions', ['diagnostics', 'Z']];
   const instructions = [
@@ -5790,9 +6307,9 @@ public final class StructuredFieldArrayRangeHarness {
   byte[] destination;
   static int calls;
 
-  void copy() {
+  static void copy(StructuredFieldArrayRangeHarness self) {
     for (int index = 0; index < 512; index++) {
-      destination[index] = (byte) source[index];
+      self.destination[index] = (byte) self.source[index];
     }
     touch();
   }
@@ -5810,7 +6327,8 @@ public final class StructuredFieldArrayRangeHarness {
   const classData = await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');
   classData.staticFields.set('calls:I', 0);
-  const method = await jvm.findMethodInHierarchy(className, 'copy', '()V');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'copy', `(L${className};)V`);
   const generated = jvm.jit.structuredSsa.compile(method);
   const sourceText = generated?.jvmStructuredSource || '';
   t.ok(generated?.jvmStructuredSsa,
@@ -5820,6 +6338,8 @@ public final class StructuredFieldArrayRangeHarness {
   t.ok(sourceText.includes('ssaRuntimeCoarseTrips') &&
       !/ssaRuntimeCoarseTrips\d+ < safePointBudget/.test(sourceText),
     'the bounded block is not fragmented by a smaller abstract poll budget');
+  t.ok(generated.jvmStructuredDominatedFieldReceiverCheckCount >= 1,
+    'range-proven field arrays remove repeated receiver checks only in the fast loop');
 
   const source = Array.from({ length: 512 },
     (_unused, index) => index & 0x7f);
@@ -5850,6 +6370,47 @@ public final class StructuredFieldArrayRangeHarness {
     'executing the loop never references an undeclared SSA temporary');
   t.deepEqual(destination.slice(), source.slice(),
     'the versioned field-array path preserves every element');
+
+  const runExceptional = (exceptionReceiver) => {
+    const exceptionalFrame = new Frame(method);
+    exceptionalFrame.className = className;
+    exceptionalFrame.locals[0] = exceptionReceiver;
+    const exceptionalThread = {
+      status: 'runnable', pendingException: null, callStack: new Stack(),
+    };
+    exceptionalThread.callStack.push(exceptionalFrame);
+    let thrown = null;
+    let result = null;
+    try {
+      result = generated(exceptionalFrame, exceptionalThread, jvm.jit, false);
+    } catch (error) {
+      thrown = error;
+    }
+    return {frame: exceptionalFrame, thrown, result};
+  };
+  const codeItems = jvm.jit.getCodeItems(method);
+  const firstGetfieldPc = codeItems.findIndex((item) =>
+    (item.instruction?.op || item.instruction) === 'getfield');
+  const nullReceiver = runExceptional(null);
+  t.equal(nullReceiver.thrown?.type, 'java/lang/NullPointerException',
+    'a failed non-null field-range fact retains the receiver exception');
+  t.equal(nullReceiver.frame.pc, firstGetfieldPc,
+    'the slow path records the exact throwing getfield PC');
+
+  const nullSourceReceiver = {
+    type: className,
+    fields: {
+      [`${className}.source`]: null,
+      [`${className}.destination`]: destination,
+    },
+  };
+  const nullSource = runExceptional(nullSourceReceiver);
+  const firstLoadPc = codeItems.findIndex((item) =>
+    (item.instruction?.op || item.instruction) === 'iaload');
+  t.equal(nullSource.thrown?.type, 'java/lang/NullPointerException',
+    'a null cached array rejects the range version and throws canonically');
+  t.equal(nullSource.frame.pc, firstLoadPc,
+    'the null field array records the exact throwing load PC');
   t.end();
 });
 

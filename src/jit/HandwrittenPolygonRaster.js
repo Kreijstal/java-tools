@@ -383,9 +383,7 @@ function candidateDependencies(jit, wrapperMethod, descriptor) {
   return spanCalls.length === 1 ? [spanCalls[0].arg[1]] : null;
 }
 
-function createIntrinsic(jit, wrapperMethod, descriptor, sentinels) {
-  const plan = analyze(jit, wrapperMethod, descriptor);
-  if (!plan) return null;
+function createIntrinsicForPlan(jit, plan, sentinels) {
   const { ASYNC_INVOKE, RETURN_VOID } = sentinels;
   const locations = plan.locations;
 
@@ -613,6 +611,11 @@ function createIntrinsic(jit, wrapperMethod, descriptor, sentinels) {
   return intrinsic;
 }
 
+function createIntrinsic(jit, wrapperMethod, descriptor, sentinels) {
+  const plan = analyze(jit, wrapperMethod, descriptor);
+  return plan ? createIntrinsicForPlan(jit, plan, sentinels) : null;
+}
+
 module.exports = {
   analyze,
   candidateDependencies,
@@ -620,5 +623,6 @@ module.exports = {
   _test: {
     KNOWN_FLAT_FINGERPRINTS,
     KNOWN_ALPHA_FINGERPRINTS,
+    createIntrinsicForPlan,
   },
 };

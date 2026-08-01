@@ -4797,8 +4797,11 @@ class JitCompiler {
       // Keeping cold Frame restoration out of this body lets JavaScript
       // engines inline it into loop-bearing callers without a handwritten
       // guest algorithm or identity-specific recognizer.
-      target.positionalInvoker =
-        generated.jvmCheckedLeafDirectPositionalBody.bind(null, this);
+      const nestedBody =
+        typeof generated.jvmTrustedCheckedLeafDirectPositionalBody === "function"
+          ? generated.jvmTrustedCheckedLeafDirectPositionalBody
+          : generated.jvmCheckedLeafDirectPositionalBody;
+      target.positionalInvoker = nestedBody.bind(null, this);
       target.positionalInvoker.jvmDebugGuarded = true;
       target.positionalInvoker.jvmCheckedLeaf = true;
       // Generated callers already hold the JIT helper object. Expose the raw
@@ -4807,7 +4810,7 @@ class JitCompiler {
       // bound entry remains the public/cold ABI and preserves existing call
       // sites. Selection is based solely on the verified checked-leaf shape.
       target.positionalInvoker.jvmRawInvoke =
-        generated.jvmCheckedLeafDirectPositionalBody;
+        nestedBody;
       return target.positionalInvoker;
     }
     if (typeof generated.jvmRestoringDirectPositionalBody === "function") {
@@ -6925,7 +6928,10 @@ class JitCompiler {
       return this.inlineIntegerRegionCache.get(method);
     }
     const plan = this.getInlineIntegerPlan(method, params, returnType);
-    if (!plan) return null;
+    // The standalone stack ABI has no canonical call-site Frame to resume
+    // when a speculative normal-path guard fails. Guarded plans are reserved
+    // for structured callers, which can materialize the exact invoke PC.
+    if (!plan || plan.guards.length > 0) return null;
     const inline = this.createGeneratedFunction(method, "inline-integer", ["stack", "base"],
       `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`);
     inline.jvmPlan = plan;
@@ -6948,7 +6954,7 @@ class JitCompiler {
     }
     const state = {
       active: new Set(), statements: [], nextTemp: 0,
-      instructionCount: 0, methodCount: 0,
+      instructionCount: 0, methodCount: 0, guards: [],
     };
     const result = this.emitInlineIntegerMethod(method, params, returnType, args, state, 0);
     if (result === null) return null;
@@ -6958,6 +6964,7 @@ class JitCompiler {
       receiverSlots,
       inputCount: args.length,
       methodCount: state.methodCount,
+      guards: state.guards,
     };
     this.inlineIntegerPlanCache.set(method, plan);
     return plan;
@@ -7145,7 +7152,17 @@ class JitCompiler {
           if (!Number.isInteger(target) || target <= index || target >= instructions.length) return null;
           const fallLocals = [...locals], fallStack = [...stack];
           const branchStatements = emitStraightRange(index + 1, target, fallLocals, fallStack);
-          if (!branchStatements || fallStack.length !== stack.length) return null;
+          if (!branchStatements || fallStack.length !== stack.length) {
+            // The taken edge bypasses an unsupported diagnostic/effect path.
+            // Publish that edge as a call-site precondition: a structured
+            // caller can deopt at the invoke before the helper has executed
+            // any bytecode, while the admitted path remains a pure integer
+            // expression. This is derived solely from the verified forward
+            // CFG and works for arbitrary obfuscator guards.
+            state.guards.push(`(${condition})`);
+            index = target - 1;
+            continue;
+          }
           const phis = [];
           const mergedLocals = [...locals], mergedStack = [...stack];
           const merge = (before, after, assign) => {
@@ -7193,6 +7210,24 @@ class JitCompiler {
           case "iadd": valid = binary((a, b) => `((${a} + ${b}) | 0)`); break;
           case "isub": valid = binary((a, b) => `((${a} - ${b}) | 0)`); break;
           case "imul": valid = binary((a, b) => `Math.imul(${a}, ${b})`); break;
+          case "idiv": {
+            const divisor = pop(), dividend = pop();
+            valid = dividend !== null && divisor !== null;
+            if (valid) {
+              state.guards.push(`(${divisor} !== 0)`);
+              stack.push(materialize(`((${dividend} / ${divisor}) | 0)`));
+            }
+            break;
+          }
+          case "irem": {
+            const divisor = pop(), dividend = pop();
+            valid = dividend !== null && divisor !== null;
+            if (valid) {
+              state.guards.push(`(${divisor} !== 0)`);
+              stack.push(materialize(`((${dividend} % ${divisor}) | 0)`));
+            }
+            break;
+          }
           case "iand": valid = binary((a, b) => `(${a} & ${b})`); break;
           case "ior": valid = binary((a, b) => `(${a} | ${b})`); break;
           case "ixor": valid = binary((a, b) => `(${a} ^ ${b})`); break;
@@ -7251,7 +7286,13 @@ class JitCompiler {
     const { params, returnType } = parseDescriptor(descriptor);
     const plan = this.getInlineIntegerPlan(method, params, returnType);
     if (!plan || plan.receiverSlots) return null;
-    return { statements: plan.statements, result: plan.result, paramCount: params.length };
+    return {
+      statements: plan.statements,
+      result: plan.result,
+      guards: plan.guards,
+      paramCount: params.length,
+      className,
+    };
   }
 
   getCompileTimeCheckedLeaf(instruction) {
@@ -7272,6 +7313,9 @@ class JitCompiler {
       generated?.jvmCapturedCheckedLeafDirectPositionalBody;
     const capturedPlan =
       generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
+    const capturedSource =
+      generated?.jvmCapturedCheckedLeafDirectPositionalSource;
+    const ordinarySource = generated?.jvmCheckedLeafDirectPositionalSource;
     const body = typeof capturedBody === "function"
       ? capturedBody : generated?.jvmCheckedLeafDirectPositionalBody;
     if (typeof body !== "function") return null;
@@ -7285,6 +7329,10 @@ class JitCompiler {
       id,
       paramCount: parsed.params.length,
       returnsVoid: parsed.returnType === "void",
+      noThrow: true,
+      inlineSource: typeof capturedBody === "function" &&
+        typeof capturedSource === "string" ? capturedSource :
+        typeof ordinarySource === "string" ? ordinarySource : null,
       captures: typeof capturedBody === "function" &&
         Array.isArray(capturedPlan?.captures)
         ? capturedPlan.captures : [],

@@ -416,6 +416,212 @@ compiler linkage, proxy, tests, and this documentation update. Command:
 npm run benchmark:jvm:ssa-kernel-targets
 ```
 
+## 2026-08-01 cyclic rectangle parity
+
+The tiled proxy's earlier `2.824x` result mixed two different questions. The
+generic side received all twelve dynamic guest operands and retained JVM entry
+and exceptional semantics. The old `runTiledOracle` accepted only destination,
+source, and a case number; it hardcoded width, height, row count, copy width,
+and stride, omitted every entry/layout guard, and was small enough for V8 to
+inline into the measurement batch. It remains useful as an explicitly selected
+fixed-specialization ceiling (`SSA_TILED_FIXED_CEILING=1`), but it is not an
+equivalent handwritten retirement gate.
+
+The default comparator now invokes the exact positional function installed by
+the handwritten intrinsic, factored through its `createRun` factory rather
+than copied into the benchmark. It therefore includes its dynamic operands,
+bytecode/debug/class-state guards, `arrayData` resolution, integer narrowing,
+complete preflight before the first write, fallbacks, and runtime counter.
+Generic SSA then added the assumptions that implementation relies on as
+verified compiler facts:
+
+- a one-dimensional increment/wrap recurrence is extended through an
+  enclosing counted row loop only after verifying the row normalization,
+  entry-phase restore, row increment/reset, cycle subtraction, invariant
+  locals, unique write counts, and the preheader `height * width` definition;
+- one entry predicate proves positive dimensions, valid horizontal/vertical
+  phases, non-overflowing cycle size, and the complete backing rectangle;
+- all destination and source guards must dominate the outermost entry before
+  a nested checked leaf can be published. A partially proved recurrence keeps
+  the restoring implementation, preventing a fallback after an earlier row
+  has already written;
+- dynamic nested trip counts are capped and charged once. The admitted checked
+  leaf has no scheduler branch, checked array helper, `Frame`, or restoring
+  slow twin;
+- checked-leaf SSA removes invariant parameter aliases and one-use arithmetic
+  values, folds single-exit CFG blocks, and emits shared range-predicate values
+  for product/base/end and outer trips/inner trips/stride/final index. Each
+  assumption is therefore computed once.
+
+None of these decisions reads a guest class name, method name, descriptor, or
+fingerprint. An altered row recurrence in the unit fixture is rejected from
+the checked-leaf tier.
+
+Three fresh Node 26.4.0 processes, 10 warmup batches and seven paired rounds
+per process, produced exact checksums and these generic/dynamic-handwritten
+paired medians:
+
+| Process | generic ns/invocation | handwritten ns/invocation | paired ratio |
+| --- | ---: | ---: | ---: |
+| 1 | 538.97 | 546.97 | **0.985x** |
+| 2 | 542.11 | 546.36 | **0.992x** |
+| 3 | 542.79 | 554.33 | **0.981x** |
+
+The three-process median is **0.985x**, and every process is at or below the
+requested `1.01x` ceiling. The checksum on both sides was `-2077411136` in all
+three processes. Reproduction command:
+
+```sh
+for run in 1 2 3; do
+  SSA_KERNEL_TARGET_ITERATIONS=10000 \
+  SSA_KERNEL_TARGET_ROUNDS=7 \
+  SSA_KERNEL_TARGET_WARMUPS=10 \
+  node scripts/benchmarkSsaHandwrittenKernelTargets.js
+done
+```
+
+This establishes proxy parity for the dynamic tiled implementation. The
+historical module remains checked in until the real guest differential/live
+path confirms that the same verified checked leaf is selected there; the
+fixed-specialization ceiling is not used to veto retirement because it omits
+the handwritten implementation's required guards.
+
+### Capture-free caller fusion closes the fixed tiled ceiling
+
+A follow-up source diff explained why the optional fixed ceiling could still
+appear roughly 1.3--1.4x faster than a standalone generic entry. Its JavaScript
+function accepts only destination, source, and a case number; nine layout
+operands are constants, both arrays are already raw backing arrays, and it has
+no JVM entry or all-or-nothing layout guard. The generic checked body accepted
+all twelve dynamic operands and was invoked as a separate 15-argument
+JavaScript function (including helpers, thread, and the guarded-entry flag).
+
+The generic compiler already inserted checked children lexically when they
+captured static targets. It accidentally withheld the same source from a
+capture-free checked child, leaving the tiled family behind a cached function
+pointer and preventing host constant propagation. Checked-leaf discovery now
+publishes ordinary capture-free source as well. A call-only, handler-free,
+forward wrapper can itself publish a checked leaf when it has exactly one
+lexically available, non-throwing checked child and no other guest effect or
+throwing operation. A failed child layout returns the async sentinel before
+the first child effect; canonical execution therefore still owns the exact
+exception path.
+
+The benchmark now includes `tiled-blit-compiled-caller`, whose Java caller
+computes the changing phase from `item` but supplies the repeated layout
+constants in bytecode. Its generated source contains the two array/layout
+predicates and both nested loops in one function, with no cached child call,
+`tryInvokeSyncAt`, `Frame`, operand materialization, or method dispatch.
+Selection uses checked-leaf properties and CFG/effect verification only; it
+does not inspect class names, method names, descriptors, or fingerprints.
+
+Three fresh Node 26.4.0 processes (12 warmups, nine paired rounds, 10,000
+invocations per batch) produced matching checksums:
+
+| Family | process paired ratios | Status |
+| --- | ---: | --- |
+| tiled standalone / exact dynamic handwritten | 0.972x, 0.982x, 0.986x | passes 1.01x |
+| tiled compiled caller / fixed specialized ceiling | **0.868x, 0.872x, 0.866x** | generic is faster |
+
+The compiled-caller medians were 202.89/233.57, 206.19/238.65, and
+206.78/239.92 generic/ceiling ns per invocation. This closes the apparent
+fixed-ceiling gap through generic interprocedural optimization rather than by
+teaching the optimizer a tiled method identity.
+
+### Trusted nested entries remove the remaining standalone call-shape gap
+
+A later long-sample rerun exposed an intermittent 1.11--1.15x regression in
+the standalone tiled row even though the compiled Java caller remained faster
+than the fixed ceiling. The JavaScript and optimized-machine-code diff located
+the difference at entry rather than in the blit: the dynamic generic checked
+leaf was 3,532 bytes of optimized code versus 3,512 bytes for the exact
+handwritten entry, and still accepted a dynamic `nestedEntryGuarded` operand.
+The compiled caller already proved that operand true, but a large separately
+compiled leaf was not reliably inlined and specialized by V8.
+
+Checked leaves now publish a second, generic trusted-nested ABI. It is selected
+only by a generated caller after that caller's scheduler/debug entry guard has
+succeeded. The specialized child still retains its class-lifecycle epoch,
+array-view, trip-count, and complete range predicates, so rejection remains
+before the first guest effect. No owner, method name, descriptor, fingerprint,
+or tiled-loop identity participates in publication or selection. The original
+dynamic guarded entry remains available for untrusted entry.
+
+On Node 26.4.0 the trusted entry reduced the tiled function's optimized code
+from 3,532 to 3,320 bytes. With an unusually busy host pinned to one CPU and
+V8 concurrent recompilation disabled, three 50,000-invocation, 12-warmup,
+11-round processes produced standalone generic/exact-handwritten paired
+medians of **0.866x, 0.839x, and 0.879x**. The lexically fused caller/fixed
+ceiling medians were **0.769x, 0.770x, and 0.728x**. Every checksum matched.
+The absolute nanoseconds are intentionally not used from that run because the
+host load average exceeded 30; the paired ratios and optimized-code diff are
+the reproducible evidence.
+
+```sh
+for run in 1 2 3; do
+  taskset -c 15 env \
+    SSA_KERNEL_TARGET_ITERATIONS=50000 \
+    SSA_KERNEL_TARGET_ROUNDS=11 \
+    SSA_KERNEL_TARGET_WARMUPS=12 \
+    node --no-concurrent-recompilation \
+      scripts/benchmarkSsaHandwrittenKernelTargets.js
+done
+```
+
+## 2026-08-01 full comparator audit and lexical checked leaves
+
+Extending the tiled audit to the other proxy rows found two more comparator
+errors. `runBilinearOracle` was a stripped arithmetic implementation without
+the installed intrinsic's class/debug, receiver-layout, source-bounds,
+destination-location/bounds, fallback, or counter work. The perspective row
+called only `runKernel`, omitting the installed positional wrapper's same
+entry and complete-span preflight. The default benchmark now invokes the
+exact functions installed by `HandwrittenBilinearSampler` and
+`HandwrittenPerspectiveSpan`; their stripped functions remain explicitly
+named ceilings, not retirement gates.
+
+The polygon proxy is different: its Java fixture is a direct per-row edge
+intersection algorithm, while `HandwrittenPolygonRaster` replaces a shared
+edge-table method suite. They produce the same selected convex images but are
+not state- or rounding-equivalent in general. An attempted cross-comparison
+correctly produced different hashes and was removed. The existing polygon row
+is now labelled `equivalent-scanline-ceiling`; a same-bytecode historical gate
+is still required before the historical polygon implementation can be
+retired.
+
+Generic compiler improvements from this audit are independent of every guest
+identity:
+
+- an acyclic, handler-free, call-free method with exactly one final primitive
+  array effect can publish a transactional checked leaf. Exceptional field,
+  source-load, division, and destination-store paths return to canonical
+  execution before that effect, without embedding a `Frame` reconstruction in
+  the hot body;
+- a verified non-throwing checked child can be lexically inserted into its
+  structured caller. Captured static values are substituted into block-local
+  SSA names and the caller's class guard covers the child/capture owners, so a
+  scanline loop contains neither JavaScript call dispatch nor `try/catch`;
+- forward CFG inequality facts are killed on local writes, closed
+  transitively, and intersected at joins. Both arms of a crossing predicate
+  can therefore prove the same unordered endpoint inequality and remove an
+  impossible `idiv` exception arm without recognizing polygon code.
+
+Three fresh Node 26.4.0 processes (10 warmups, seven paired rounds) produced:
+
+| Family | process paired ratios | Status |
+| --- | ---: | --- |
+| tiled, exact dynamic handwritten | 0.846x, 0.970x, 1.005x | passes 1.01x |
+| perspective, exact dynamic handwritten | 0.798x, 0.772x, 0.781x | passes 1.01x |
+| bilinear, exact dynamic handwritten | 0.107x, 0.110x, 0.112x | passes 1.01x |
+| polygon, equivalent scanline ceiling | 1.140x, 1.150x, 1.156x | **not parity** |
+
+All rows retained identical paired destination checksums. Polygon improved
+from roughly 1.49x before lexical child insertion to a 1.15x three-process
+median, but it remains above the requested 1.01x ceiling. The full retirement
+goal therefore remains open; fused gradient/flat, affine, and the remaining
+historical span families also require equivalent-comparator audits rather than
+being inferred from this four-row proxy.
+
 ## Verification
 
 The focused differential checks are:

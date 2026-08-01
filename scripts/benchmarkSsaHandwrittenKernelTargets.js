@@ -9,6 +9,8 @@ const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const Perspective = require('../src/jit/HandwrittenPerspectiveSpan');
+const Tiled = require('../src/jit/HandwrittenTiledBlit');
+const Bilinear = require('../src/jit/HandwrittenBilinearSampler');
 
 const root = path.resolve(__dirname, '..');
 const source = path.join(
@@ -69,6 +71,10 @@ async function createRuntime(directory) {
   const classData = await jvm.loadClassByName(className);
   classData.staticFieldsInitialized = true;
   jvm.classInitializationState.set(className, 'INITIALIZED');
+  tiledOracleRun = Tiled._test.createRun(jvm.jit, className, className, {
+    ASYNC_INVOKE: false,
+    RETURN_VOID: true,
+  });
   return { jvm, classData };
 }
 
@@ -88,8 +94,18 @@ function compileBody(runtime, name, descriptor) {
   const method = runtime.jvm.findMethod(
     runtime.classData, name, descriptor);
   if (!method) throw new Error(`missing fixture method ${name}${descriptor}`);
-  const generated = runtime.jvm.jit.structuredSsa.compile(method);
+  // Use the public cached JIT path. Besides matching production tier
+  // selection, this makes an already compiled checked leaf available for
+  // structural call-site insertion in methods compiled later in the fixture.
+  const generated = runtime.jvm.jit.getGeneratedFunction(method);
   const body = generated?.jvmRestoringDirectPositionalBody;
+  const checkedLeafBody = generated?.jvmCheckedLeafDirectPositionalBody;
+  const trustedCheckedLeafBody =
+    generated?.jvmTrustedCheckedLeafDirectPositionalBody;
+  const capturedCheckedLeafBody =
+    generated?.jvmCapturedCheckedLeafDirectPositionalBody;
+  const capturedCheckedLeafPlan =
+    generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
   if (!generated?.jvmStructuredSsa || typeof body !== 'function') {
     const reason = runtime.jvm.jit.structuredSsa.lastRejectionReason ||
       runtime.jvm.jit.structuredSsa.lastCompileError?.stack || '';
@@ -98,13 +114,30 @@ function compileBody(runtime, name, descriptor) {
   }
   const dumpPattern = process.env.SSA_KERNEL_DUMP_METHOD || '';
   if (dumpPattern && `${name}${descriptor}`.includes(dumpPattern)) {
+    const dumpTier = process.env.SSA_KERNEL_DUMP_TIER;
+    const dumpedSource = dumpTier === 'trusted-checked-leaf'
+      ? generated.jvmTrustedCheckedLeafDirectPositionalSource
+      : dumpTier === 'captured-checked-leaf'
+      ? generated.jvmCapturedCheckedLeafDirectPositionalSource
+      : dumpTier === 'checked-leaf'
+        ? generated.jvmCheckedLeafDirectPositionalSource
+        : generated.jvmRestoringDirectPositionalSource;
     process.stderr.write(`/* ${name}${descriptor} */\n` +
-      `${generated.jvmRestoringDirectPositionalSource || ''}\n`);
+      `${dumpedSource || ''}\n`);
   }
-  return { method, generated, body, plan: planFor(method) };
+  return {
+    method, generated, body, checkedLeafBody, trustedCheckedLeafBody,
+    capturedCheckedLeafBody, capturedCheckedLeafPlan,
+    plan: planFor(method),
+  };
 }
 
 function benchmarkPair(name, generic, oracle, pixelsPerInvocation) {
+  // Tiny runs are useful for checking compilation and checksums, but include
+  // lazy JavaScript compilation/tiering in the timed sample.  Label them so a
+  // focused smoke validation cannot be mistaken for steady-state throughput.
+  const timingQualified =
+    iterations >= 1000 && rounds >= 3 && warmups >= 4;
   let genericCursor = 0;
   let oracleCursor = 0;
   const genericBatch = () => {
@@ -164,8 +197,22 @@ function benchmarkPair(name, generic, oracle, pixelsPerInvocation) {
   }
   const pairedRatios = genericElapsed.map(
     (elapsed, index) => elapsed / oracleElapsed[index]);
+  const medianPairedRatio = median(pairedRatios);
+  const comparison = !timingQualified
+    ? 'inconclusive-smoke-run'
+    : medianPairedRatio < 1
+      ? 'generic-faster'
+      : medianPairedRatio > 1
+        ? 'generic-slower'
+        : 'equal';
   return {
     name,
+    timingKind: timingQualified ? 'steady-state' : 'smoke-not-steady-state',
+    timingQualified,
+    timingWarning: timingQualified ? undefined :
+      'timed sample is too small for a throughput comparison',
+    ratioMeaning: 'generic elapsed / oracle elapsed; below 1.0 means generic is faster',
+    comparison,
     iterationsPerSample: iterations * 2,
     rounds,
     warmups,
@@ -174,7 +221,10 @@ function benchmarkPair(name, generic, oracle, pixelsPerInvocation) {
       median(genericElapsed) / (iterations * 2),
     oracleNanosecondsPerInvocation:
       median(oracleElapsed) / (iterations * 2),
-    medianPairedRatio: median(pairedRatios),
+    medianPairedRatio,
+    genericSpeedupVsOracle: timingQualified
+      ? 1 / medianPairedRatio
+      : undefined,
     pairedRatios,
     checksum: genericChecksum,
     oracleChecksum,
@@ -182,7 +232,7 @@ function benchmarkPair(name, generic, oracle, pixelsPerInvocation) {
   };
 }
 
-function runTiledOracle(destination, source, item) {
+function runTiledFixedCeiling(destination, source, item) {
   let destinationIndex = 0;
   const sourceWidth = 32;
   const rowCount = 8;
@@ -211,6 +261,11 @@ function runTiledOracle(destination, source, item) {
     }
   }
 }
+
+// The retirement comparator invokes the exact positional implementation used
+// by the installed handwritten intrinsic. Keep the fixed workload above as an
+// explicitly selected code-generation ceiling, not as the retirement gate.
+let tiledOracleRun = null;
 
 function runBilinearOracle(receiver, destination, destinationIndex,
   sourceX, sourceY, fractionX, fractionY) {
@@ -318,6 +373,18 @@ function runPolygonOracle(destination, vertices, color) {
       invoke(item) {
         const sourceX = item & 15;
         const sourceRow = item & 15;
+        if (tiled.trustedCheckedLeafBody) {
+          return tiled.trustedCheckedLeafBody(runtime.jvm.jit,
+            0, 32, 8, sourceRow, -64, tiledGenericDestination, 16,
+            tiledSource, 16, sourceX, sourceRow * 32 + sourceX, 16,
+            thread);
+        }
+        if (tiled.checkedLeafBody) {
+          return tiled.checkedLeafBody(runtime.jvm.jit,
+            0, 32, 8, sourceRow, -64, tiledGenericDestination, 16,
+            tiledSource, 16, sourceX, sourceRow * 32 + sourceX, 16,
+            thread, trustedNestedEntry);
+        }
         return tiled.body(runtime.jvm.jit, tiled.plan,
           0, 32, 8, sourceRow, -64, tiledGenericDestination, 16,
           tiledSource, 16, sourceX, sourceRow * 32 + sourceX, 16,
@@ -326,9 +393,53 @@ function runPolygonOracle(destination, vertices, color) {
     }, {
       destination: tiledOracleDestination,
       invoke(item) {
-        runTiledOracle(tiledOracleDestination, tiledSource, item);
+        if (process.env.SSA_TILED_FIXED_CEILING === '1') {
+          runTiledFixedCeiling(tiledOracleDestination, tiledSource, item);
+          return;
+        }
+        const sourceX = item & 15;
+        const sourceRow = item & 15;
+        tiledOracleRun(
+          0, 32, 8, sourceRow, -64, tiledOracleDestination, 16,
+          tiledSource, 16, sourceX, sourceRow * 32 + sourceX, 16);
       },
     }, 128);
+    tiledResult.oracleKind = process.env.SSA_TILED_FIXED_CEILING === '1'
+      ? 'fixed-specialized-ceiling' : 'dynamic-guarded-handwritten';
+    tiledResult.genericEntryKind = tiled.trustedCheckedLeafBody
+      ? 'trusted-nested-checked-leaf' : tiled.checkedLeafBody
+        ? 'dynamic-checked-leaf' : 'restoring-positional';
+
+    // Keep a second tiled row where the constant layout operands are visible
+    // at a compiled Java call site. This is the fair code-generation ceiling
+    // for interprocedural specialization: unlike runTiledFixedCeiling it must
+    // still retain the JVM entry and array-layout guards that make the call
+    // semantically valid for arbitrary Java arrays.
+    const tiledCaller = compileBody(runtime, 'tiledBlitFromCaller',
+      '([I[II)V');
+    const tiledCallerGenericDestination = intArray(256, () => 0);
+    const tiledCallerCeilingDestination = intArray(256, () => 0);
+    const tiledCallerResult = benchmarkPair('tiled-blit-compiled-caller', {
+      destination: tiledCallerGenericDestination,
+      generated: tiledCaller.generated,
+      invoke(item) {
+        if (tiledCaller.checkedLeafBody) {
+          return tiledCaller.checkedLeafBody(runtime.jvm.jit,
+            tiledCallerGenericDestination, tiledSource, item,
+            thread, trustedNestedEntry);
+        }
+        return tiledCaller.body(runtime.jvm.jit, tiledCaller.plan,
+          tiledCallerGenericDestination, tiledSource, item,
+          thread, trustedNestedEntry);
+      },
+    }, {
+      destination: tiledCallerCeilingDestination,
+      invoke(item) {
+        runTiledFixedCeiling(tiledCallerCeilingDestination, tiledSource, item);
+      },
+    }, 128);
+    tiledCallerResult.oracleKind = 'fixed-specialized-ceiling';
+    tiledCallerResult.genericEntryKind = 'lexically-fused-checked-leaf';
 
     const perspective = compileBody(runtime, 'perspectiveSpan',
       '([I[IIIIIIIIIIIIII)V');
@@ -336,6 +447,16 @@ function runPolygonOracle(destination, vertices, color) {
       index % 13 === 0 ? 0 : Math.imul(index + 3, 0x10203));
     const perspectiveGenericDestination = intArray(256, () => 0);
     const perspectiveOracleDestination = intArray(256, () => 0);
+    const perspectiveFields = new Map([
+      ['clip', true], ['clipRight', 128], ['lowDetail', true],
+      ['centerX', 64], ['opaque', false],
+    ]);
+    const perspectiveHandwritten = Perspective._test.createRun(
+      runtime.jvm.jit,
+      ['clip', 'clipRight', 'lowDetail', 'centerX', 'opaque'].map(
+        (key) => ({ kind: 'map', fields: perspectiveFields, key })),
+      [className], className,
+      { ASYNC_INVOKE: false, RETURN_VOID: true });
     const perspectiveResult = benchmarkPair('perspective-span', {
       destination: perspectiveGenericDestination,
       generated: perspective.generated,
@@ -349,13 +470,24 @@ function runPolygonOracle(destination, vertices, color) {
     }, {
       destination: perspectiveOracleDestination,
       invoke(item) {
-        Perspective._test.runKernel(
-          perspectiveOracleDestination, texture, 0,
+        if (process.env.SSA_PERSPECTIVE_FIXED_CEILING === '1') {
+          Perspective._test.runKernel(
+            perspectiveOracleDestination, texture, 0,
+            item & 7, 96 + (item & 15), 65536 + item * 31, 128,
+            8192 + item * 17, 4096 + item * 11, 1 << 20,
+            256, 192, 1024, true, 128, 64, true, false);
+          return;
+        }
+        perspectiveHandwritten(
+          perspectiveOracleDestination, texture, 0, 0, 0,
           item & 7, 96 + (item & 15), 65536 + item * 31, 128,
           8192 + item * 17, 4096 + item * 11, 1 << 20,
-          256, 192, 1024, true, 128, 64, true, false);
+          256, 192, 1024);
       },
     }, 96);
+    perspectiveResult.oracleKind =
+      process.env.SSA_PERSPECTIVE_FIXED_CEILING === '1'
+        ? 'fixed-inner-kernel-ceiling' : 'dynamic-guarded-handwritten';
 
     const bilinearSource = intArray(64 * 64, index =>
       index % 11 === 0 ? 0 : Math.imul(index + 5, 0x10101));
@@ -372,8 +504,20 @@ function runPolygonOracle(destination, vertices, color) {
         [`${className}.source`]: bilinearSource,
       },
     };
-    const oracleReceiver = {
-      width: 64, height: 64, source: bilinearSource,
+    const bilinearHandwritten = Bilinear._test.installStructurallyVerified(
+      runtime.jvm.jit, bilinear.method);
+    if (!bilinearHandwritten) {
+      throw new Error('exact handwritten bilinear shape did not verify');
+    }
+    bilinearHandwritten.plan.destination = {
+      kind: 'map',
+      fields: new Map([
+        ['bilinearDestination:[I', bilinearOracleDestination],
+      ]),
+      key: 'bilinearDestination:[I',
+    };
+    const bilinearHandwrittenInvocationPlan = {
+      semantic: bilinearHandwritten.plan,
     };
     const bilinearResult = benchmarkPair('bilinear-sampler', {
       destination: bilinearGenericDestination,
@@ -381,6 +525,11 @@ function runPolygonOracle(destination, vertices, color) {
       invoke(item) {
         const x = 1 + (item * 17 % 62);
         const y = 1 + (item * 29 % 62);
+        if (bilinear.checkedLeafBody) {
+          return bilinear.checkedLeafBody(runtime.jvm.jit,
+            receiver, item, x, y, item * 193, item * 317,
+            thread, trustedNestedEntry);
+        }
         return bilinear.body(runtime.jvm.jit, bilinear.plan,
           receiver, item, x, y, item * 193, item * 317,
           thread, trustedNestedEntry);
@@ -390,10 +539,20 @@ function runPolygonOracle(destination, vertices, color) {
       invoke(item) {
         const x = 1 + (item * 17 % 62);
         const y = 1 + (item * 29 % 62);
-        runBilinearOracle(oracleReceiver, bilinearOracleDestination,
-          item, x, y, item * 193, item * 317);
+        if (process.env.SSA_BILINEAR_FIXED_CEILING === '1') {
+          runBilinearOracle({ width: 64, height: 64, source: bilinearSource },
+            bilinearOracleDestination, item, x, y,
+            item * 193, item * 317);
+          return;
+        }
+        bilinearHandwritten.body(runtime.jvm.jit,
+          bilinearHandwrittenInvocationPlan, receiver, item, x, y,
+          item * 193, item * 317, thread);
       },
     }, 1);
+    bilinearResult.oracleKind =
+      process.env.SSA_BILINEAR_FIXED_CEILING === '1'
+        ? 'fixed-specialized-ceiling' : 'dynamic-guarded-handwritten';
 
     const polygonGenericDestination = intArray(64 * 64, () => 0);
     const polygonOracleDestination = intArray(64 * 64, () => 0);
@@ -440,6 +599,7 @@ function runPolygonOracle(destination, vertices, color) {
           0xff000000 | Math.imul(item + 1, 0x10203));
       },
     }, 1600);
+    polygonResult.oracleKind = 'equivalent-scanline-ceiling';
 
     if (process.env.JVM_DUMP_SSA_KERNEL_TARGETS === '1') {
       for (const [name, compiled] of [
@@ -470,10 +630,28 @@ function runPolygonOracle(destination, vertices, color) {
           result.generated.jvmStructuredCoalescedSsaCopyCount,
         dominatedArithmeticGuards:
           result.generated.jvmStructuredDominatedArithmeticGuardCount,
+        restoringCoarseLoopDeopts:
+          result.generated.jvmStructuredRestoringCoarseLoopDeoptCount,
         capturedCheckedLeafCalls:
           result.generated.jvmStructuredCapturedCheckedLeafCallCount,
+        lexicalCheckedLeafCalls:
+          result.generated.jvmStructuredLexicalCheckedLeafCallCount,
+        lexicalCheckedLeafWrapper:
+          result.generated.jvmStructuredLexicalCheckedLeafWrapper,
         fieldReadCaches: result.generated.jvmStructuredFieldReadCacheCount,
         coarseLoops: result.generated.jvmStructuredCoarseCountedLoopCount,
+        nestedRuntimeCheckedLeaf:
+          result.generated.jvmStructuredNestedRuntimeCheckedLeaf,
+        transactionalAcyclicCheckedLeaf:
+          result.generated.jvmStructuredTransactionalAcyclicCheckedLeaf,
+        restoringSpillCalls:
+          result.generated.jvmStructuredRestoringSpillCallCount,
+        restoringSpillInlineCost:
+          result.generated.jvmStructuredRestoringSpillInlineCost,
+        inlinedRestoringSpills:
+          result.generated.jvmStructuredInlinedRestoringSpills,
+        captureFreeRestoringSpills:
+          result.generated.jvmStructuredCaptureFreeRestoringSpills,
         handwrittenInstalled: Boolean(
           result.generated.jvmRestoringDirectPositionalPlan),
       },
@@ -482,7 +660,8 @@ function runPolygonOracle(destination, vertices, color) {
       ok: true,
       node: process.version,
       results: [
-        tiledResult, perspectiveResult, bilinearResult, polygonResult,
+        tiledResult, tiledCallerResult, perspectiveResult, bilinearResult,
+        polygonResult,
       ].map(sanitize),
     }, null, 2)}\n`);
   } finally {

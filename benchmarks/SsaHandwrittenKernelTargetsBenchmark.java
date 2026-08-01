@@ -43,6 +43,13 @@ public final class SsaHandwrittenKernelTargetsBenchmark {
         }
     }
 
+    static void tiledBlitFromCaller(int[] destination, int[] source, int item) {
+        int sourceX = item & 15;
+        int sourceRow = item & 15;
+        tiledBlit(0, 32, 8, sourceRow, (byte) -64, destination, 16,
+            source, 16, sourceX, sourceRow * 32 + sourceX, 16);
+    }
+
     static void perspectiveSpan(int[] destination, int[] texture,
             int unusedCoordinate, int unusedColor, int destinationIndex,
             int startX, int endX, int shade, int shadeStep,
