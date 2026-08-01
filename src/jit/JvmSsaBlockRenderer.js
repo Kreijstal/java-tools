@@ -752,6 +752,12 @@ class JvmSsaBlockRenderer {
     let rangeDominatedArithmeticGuardCount = 0;
     const rangeDominatedArithmeticGuards = new Set();
     const arrayRangeCheckCandidates = [];
+    // Keep every primitive entry-array access available to whole-region
+    // proofs, including affine local+constant indexes that an ordinary
+    // monotonic counted-loop guard cannot prove by itself.  A later proof may
+    // version a complete shrinking-window region before its first effect.
+    const primitiveArrayAccessCandidates = [];
+    let nextPrimitiveArrayAccessMarker = 0;
     const localIndex = (instruction, op) => {
       if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
         return Number(instruction.arg);
@@ -1636,7 +1642,34 @@ class JvmSsaBlockRenderer {
         }
         return null;
       };
-      const arrayRangeMarkerFor = (arrayData, indexInput, itemIndex) => {
+      const affineLocalOffset = (input, visited = new Set()) => {
+        if (/^-?\d+$/.test(input)) {
+          const offset = Number(input);
+          return Number.isSafeInteger(offset)
+            ? {slot: null, offset} : null;
+        }
+        if (visited.has(input)) return null;
+        visited.add(input);
+        const origin = integerOrigins.get(input);
+        if (!origin) return null;
+        if (origin.kind === "local") {
+          return {slot: origin.slot, offset: 0};
+        }
+        if (origin.kind !== "iadd" && origin.kind !== "isub") return null;
+        const left = affineLocalOffset(origin.left, new Set(visited));
+        const right = affineLocalOffset(origin.right, new Set(visited));
+        if (!left || !right) return null;
+        if (origin.kind === "isub" && right.slot !== null) return null;
+        if (left.slot !== null && right.slot !== null) return null;
+        const offset = origin.kind === "iadd"
+          ? left.offset + right.offset : left.offset - right.offset;
+        if (!Number.isSafeInteger(offset) || offset < -2147483648 ||
+            offset > 2147483647) return null;
+        return {slot: left.slot ?? right.slot, offset};
+      };
+      const arrayRangeMarkerFor = (
+        arrayData, indexInput, itemIndex, arrayOp, store,
+      ) => {
         // A loop preheader may only name storage views declared at generated
         // entry. Block-local snapshots (including non-eager field caches) are
         // not in lexical scope yet, and field-cache views can also be cleared
@@ -1644,6 +1677,18 @@ class JvmSsaBlockRenderer {
         // sentinel path rather than emitting a preheader proof that references
         // a missing or stale SSA value.
         if (!arrayData || !guardedEntryArrayData.has(arrayData)) return "false";
+        const access = {
+          block: block.id,
+          itemIndex,
+          arrayData,
+          indexInput,
+          indexAffine: affineLocalOffset(indexInput),
+          op: arrayOp,
+          store: Boolean(store),
+          marker: `__SSA_PRIMITIVE_ARRAY_ACCESS_${
+            nextPrimitiveArrayAccessMarker++}__`,
+        };
+        primitiveArrayAccessCandidates.push(access);
         const fixedRange = this.bitBoundedArrayRangesEnabled
           ? boundedIntegerRange(indexInput) : null;
         const indexOrigin = integerOrigins.get(indexInput);
@@ -1718,9 +1763,10 @@ class JvmSsaBlockRenderer {
             slots: [indexOrigin.slot],
           };
         }
-        if (!candidate) return "false";
-        candidate.marker =
-          `__SSA_ARRAY_RANGE_GUARD_${arrayRangeCheckCandidates.length}__`;
+        if (!candidate) return access.marker;
+        Object.assign(candidate, access);
+        candidate.primitiveAccess = access;
+        access.rangeCandidate = candidate;
         arrayRangeCheckCandidates.push(candidate);
         return candidate.marker;
       };
@@ -1934,7 +1980,8 @@ class JvmSsaBlockRenderer {
               const normalized = normalizedArrayLoadExpression(
                 out, op, array, arrayKind);
               const rangeMarker =
-                arrayRangeMarkerFor(arrayData, arrayIndexInput, index);
+                arrayRangeMarkerFor(
+                  arrayData, arrayIndexInput, index, op, false);
               const loadFailure =
                 unconditionallyNonNullEntryArrayData.has(arrayData)
                 ? `((${out} = ${arrayData}[${arrayIndex}]) === undefined)`
@@ -2001,7 +2048,8 @@ class JvmSsaBlockRenderer {
             } else if (op !== "aastore" && arrayData &&
                 guardedEntryArrayData.has(arrayData)) {
               const rangeMarker =
-                arrayRangeMarkerFor(arrayData, arrayIndexInput, index);
+                arrayRangeMarkerFor(
+                  arrayData, arrayIndexInput, index, op, true);
               lines.push(
                 `if (!${rangeMarker} && ` +
                   `${arrayIndexOutOfBounds(
@@ -3445,6 +3493,169 @@ class JvmSsaBlockRenderer {
         });
       }
     }
+    const shrinkingArrayWindowLeaf = (() => {
+      if ((code.code.exceptionTable || []).length !== 0 ||
+          callSites.size !== 0 || entryArrayLocalSlots.size !== 1) return null;
+      const arraySlot = [...entryArrayLocalSlots][0];
+      if (assignedReferenceLocals.has(arraySlot) ||
+          !entryArrayKinds.has(arraySlot)) return null;
+      const arrayData = entryArrayDataVariable(arraySlot);
+      const primitiveArrayOps = new Set([
+        "iaload", "saload", "baload", "caload", "daload", "faload",
+        "laload", "iastore", "sastore", "bastore", "castore",
+        "dastore", "fastore", "lastore",
+      ]);
+      const forbiddenOps = new Set([
+        "getfield", "putfield", "getstatic", "putstatic", "arraylength",
+        "idiv", "irem", "athrow", "new", "newarray", "anewarray",
+        "multianewarray", "monitorenter", "monitorexit", "checkcast",
+        "instanceof", "aaload", "aastore",
+      ]);
+      const reachablePrimitiveItems = [];
+      for (let index = 0; index < items.length; index += 1) {
+        if (!normalReachableItems.has(index)) continue;
+        const op = opOf(items[index]?.instruction);
+        if (op?.startsWith("invoke") || forbiddenOps.has(op)) return null;
+        if (primitiveArrayOps.has(op)) reachablePrimitiveItems.push(index);
+      }
+      if (reachablePrimitiveItems.length === 0 ||
+          primitiveArrayAccessCandidates.length !==
+            reachablePrimitiveItems.length ||
+          primitiveArrayAccessCandidates.some((access) =>
+            access.arrayData !== arrayData ||
+            !reachablePrimitiveItems.includes(access.itemIndex))) return null;
+
+      const loadSlot = (instruction) => {
+        const op = opOf(instruction);
+        return /^iload(?:_[0-3])?$/.test(op)
+          ? localIndex(instruction, op) : null;
+      };
+      const storeSlot = (instruction) => {
+        const op = opOf(instruction);
+        if (op === "iinc") return Number(instruction.varnum ?? instruction.arg);
+        return /^istore(?:_[0-3])?$/.test(op)
+          ? localIndex(instruction, op) : null;
+      };
+      const outerCandidates = [];
+      for (const header of structured.loopHeaders) {
+        if (countedLoopInfos.has(header)) continue;
+        const block = cfg.blocks[header];
+        const blockItems = block?.insns || [];
+        if (blockItems.length !== 5 || cfg.term[header]?.kind !== "cond") continue;
+        const upperSlot = loadSlot(items[blockItems[0]]?.instruction);
+        const lowerSlot = loadSlot(items[blockItems[1]]?.instruction);
+        const window = constantInstructionValue(
+          items[blockItems[2]]?.instruction);
+        if (!Number.isInteger(upperSlot) || !Number.isInteger(lowerSlot) ||
+            upperSlot === lowerSlot || !Number.isInteger(window) ||
+            window <= 0 ||
+            opOf(items[blockItems[3]]?.instruction) !== "iadd" ||
+            opOf(items[blockItems[4]]?.instruction) !== "if_icmplt") continue;
+        const loopBlocks = naturalLoopBlocksFor(header);
+        const term = cfg.term[header];
+        if (!loopBlocks || loopBlocks.has(term.taken) ||
+            !loopBlocks.has(term.fall)) continue;
+        outerCandidates.push({
+          header, upperSlot, lowerSlot, window, loopBlocks,
+        });
+      }
+      for (const outer of outerCandidates) {
+        const innerCandidates = [...countedLoopInfos.values()].filter((info) =>
+          info.boundSlot === outer.upperSlot && info.increment > 0 &&
+          info.initial === null && outer.loopBlocks.has(info.header) &&
+          [...info.loopBlocks].every((block) => outer.loopBlocks.has(block)));
+        if (innerCandidates.length !== 1) continue;
+        const inner = innerCandidates[0];
+        const stride = inner.increment;
+        if (outer.window !== stride * 2 || outer.window > 2147483647) continue;
+
+        const preheaderItems = cfg.blocks[inner.preheader]?.insns || [];
+        let matchingInitialization = 0;
+        for (let position = 3; position < preheaderItems.length; position += 1) {
+          const left = items[preheaderItems[position - 3]]?.instruction;
+          const right = items[preheaderItems[position - 2]]?.instruction;
+          const add = items[preheaderItems[position - 1]]?.instruction;
+          const store = items[preheaderItems[position]]?.instruction;
+          if (loadSlot(left) === outer.lowerSlot &&
+              constantInstructionValue(right) === stride &&
+              opOf(add) === "iadd" && storeSlot(store) === inner.slot &&
+              /^istore(?:_[0-3])?$/.test(opOf(store))) {
+            matchingInitialization += 1;
+          }
+        }
+        if (matchingInitialization !== 1) continue;
+
+        const upperWrites = [];
+        let lowerWrites = 0;
+        let unexpectedInnerWrites = 0;
+        for (let block = 0; block < cfg.n; block += 1) {
+          if (!cfg.blocks[block] || cfg.blocks[block].synthetic) continue;
+          for (const itemIndex of cfg.blocks[block].insns || []) {
+            if (!normalReachableItems.has(itemIndex)) continue;
+            const instruction = items[itemIndex]?.instruction;
+            const op = opOf(instruction);
+            const slot = storeSlot(instruction);
+            if (slot === outer.lowerSlot) lowerWrites += 1;
+            if (slot === outer.upperSlot) {
+              upperWrites.push({block, op, increment:
+                op === "iinc" ? Number(instruction.incr ?? 0) : null});
+            }
+            if (slot === inner.slot) {
+              const isIncrement = op === "iinc" &&
+                inner.loopBlocks.has(block) &&
+                Number(instruction.incr ?? 0) === stride;
+              const isInitialization =
+                block === inner.preheader &&
+                /^istore(?:_[0-3])?$/.test(op);
+              if (!isIncrement && !isInitialization) unexpectedInnerWrites += 1;
+            }
+          }
+        }
+        if (lowerWrites !== 0 || unexpectedInnerWrites !== 0 ||
+            upperWrites.length !== 1 || upperWrites[0].op !== "iinc" ||
+            upperWrites[0].increment !== -stride ||
+            inner.loopBlocks.has(upperWrites[0].block)) continue;
+        const outerHeaderItem = cfg.blocks[outer.header].insns[0];
+        const outerBackedges = allCfgPredecessors[outer.header].filter(
+          (block) => cfg.blocks[block]?.insns?.[0] >= outerHeaderItem);
+        if (outerBackedges.length !== 1 ||
+            outerBackedges[0] !== upperWrites[0].block) continue;
+
+        const accesses = primitiveArrayAccessCandidates;
+        if (accesses.some((access) =>
+          !inner.loopBlocks.has(access.block) ||
+          access.indexAffine?.slot !== inner.slot ||
+          !Number.isInteger(access.indexAffine.offset))) continue;
+        const minimumOffset = Math.min(...accesses.map(
+          (access) => access.indexAffine.offset));
+        const maximumOffset = Math.max(...accesses.map(
+          (access) => access.indexAffine.offset));
+        if (minimumOffset < -stride || maximumOffset >= stride) continue;
+
+        const storeItems = accesses.filter((access) => access.store);
+        if (storeItems.length === 0 || storeItems.some((access) =>
+          !inner.loopBlocks.has(access.block))) continue;
+        const variable = `ssaShrinkingArrayWindowGuard${outer.header}`;
+        for (const access of accesses) {
+          access.structuralGuard = variable;
+          if (access.rangeCandidate) {
+            access.rangeCandidate.structuralGuard = variable;
+          }
+        }
+        return {
+          variable, arrayData, arraySlot,
+          outerHeader: outer.header,
+          innerHeader: inner.header,
+          lowerSlot: outer.lowerSlot,
+          upperSlot: outer.upperSlot,
+          innerSlot: inner.slot,
+          window: outer.window,
+          stride,
+          accesses,
+        };
+      }
+      return null;
+    })();
     const arrayRangeGuardDeclarations = new Map();
     const arrayRangeGuardVariables = new Map();
     const arrayRangeGuardDataVariables = new Map();
@@ -3988,6 +4199,7 @@ class JvmSsaBlockRenderer {
       candidateIndex < arrayRangeCheckCandidates.length;
       candidateIndex += 1) {
       const candidate = arrayRangeCheckCandidates[candidateIndex];
+      if (candidate.structuralGuard) continue;
       const loops = [...countedLoopInfos.values()]
         .filter((info) =>
           info.increment === 1 &&
@@ -4352,11 +4564,13 @@ class JvmSsaBlockRenderer {
           line.replace(candidate.marker, variable));
       }
     }
-    for (const candidate of arrayRangeCheckCandidates) {
+    for (const candidate of primitiveArrayAccessCandidates) {
+      const fallback = candidate.structuralGuard
+        ? `false /*${candidate.marker}*/` : "false";
       for (const plan of plans) {
         if (!plan?.lines) continue;
         plan.lines = plan.lines.map((line) =>
-          line.replace(candidate.marker, "false"));
+          line.split(candidate.marker).join(fallback));
       }
     }
     if (fieldBackedArrayRangeCandidateCount > 0) {
@@ -6477,6 +6691,39 @@ class JvmSsaBlockRenderer {
               "return helpers.asyncInvokeSentinel();",
           );
         }
+        if (shrinkingArrayWindowLeaf) {
+          const shape = shrinkingArrayWindowLeaf;
+          const prefix = `ssaShrinkingArrayWindow${shape.outerHeader}`;
+          const threshold = `${prefix}Threshold`;
+          const outerTrips = `${prefix}OuterTrips`;
+          const innerTrips = `${prefix}InnerTrips`;
+          checkedLeafCoarseLoopHeaders.add(shape.outerHeader);
+          checkedLeafCoarseLoopHeaders.add(shape.innerHeader);
+          arrayRangeGuardDataVariables.set(
+            shape.variable, shape.arrayData);
+          checkedLeafTripDeclarations.push(
+            `const ${threshold} = local${shape.lowerSlot} + ` +
+              `${shape.window};`,
+            `const ${outerTrips} = local${shape.upperSlot} < ${threshold} ` +
+              `? 0 : Math.floor((local${shape.upperSlot} - ${threshold}) / ` +
+              `${shape.stride}) + 1;`,
+            `const ${innerTrips} = ${outerTrips} === 0 ? 0 : ` +
+              `(local${shape.upperSlot} - local${shape.lowerSlot}) / ` +
+              `${shape.stride} - 1;`,
+            `const ${shape.variable} = ` +
+              `(local${shape.lowerSlot} <= ${2147483647 - shape.window} && ` +
+              `(${outerTrips} === 0 || (` +
+              `local${shape.lowerSlot} >= 0 && ` +
+              `local${shape.upperSlot} <= ${shape.arrayData}.length && ` +
+              `(local${shape.upperSlot} - local${shape.lowerSlot}) % ` +
+              `${shape.stride} === 0 && ${outerTrips} <= ` +
+              `${runtimeCoarseTripLimit} && ${innerTrips} >= 0 && ` +
+              `${innerTrips} <= ${runtimeCoarseTripLimit} && ` +
+              `${outerTrips} * ${innerTrips} <= 1000000)));`,
+            `if (!${shape.variable}) ` +
+              "return helpers.asyncInvokeSentinel();",
+          );
+        }
         const deepestCountedLoop = countedRegionLoops.at(-1) || null;
         const loopItems = deepestCountedLoop
           ? new Set([...deepestCountedLoop.loopBlocks].flatMap(
@@ -6547,8 +6794,10 @@ class JvmSsaBlockRenderer {
         const checkedLeafShape = this.checkedLeafDirectPositionalEnabled &&
           (((singleLoop && (atomicBoundedLoops ||
               runtimeCoarseCountedLoops.has(singleLoopHeader)) ||
-            nestedRuntimeCountedRegion) || transactionalAcyclicShape) &&
-            callSites.size === 0 || lexicalCheckedLeafWrapperShape) &&
+            nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf) ||
+            transactionalAcyclicShape) &&
+            callSites.size === 0 ||
+            lexicalCheckedLeafWrapperShape) &&
           items.every((item, index) => {
             const op = opOf(item?.instruction);
             if (!op || !normalReachableItems.has(index)) return true;
@@ -6558,9 +6807,22 @@ class JvmSsaBlockRenderer {
               loopItems.has(index);
           });
         if (checkedLeafShape) {
-          const checkedLeafRenderedTree = render(
+          let checkedLeafRenderedTree = render(
             structured.tree, false, true,
             restoringDirectSafePointBudget, true, true);
+          if (shrinkingArrayWindowLeaf) {
+            const guard = shrinkingArrayWindowLeaf.variable;
+            checkedLeafRenderedTree = checkedLeafRenderedTree.map((line) => {
+              let rewritten = line;
+              for (const access of shrinkingArrayWindowLeaf.accesses) {
+                rewritten = rewritten.split(
+                  `false /*${access.marker}*/`).join(guard);
+              }
+              return rewritten;
+            });
+            checkedLeafRenderedTree = specializeArrayRangeGuardedStores(
+              checkedLeafRenderedTree, [guard]);
+          }
           const checkedLeafTree = compactCheckedLeafLines(
             transactionalAcyclicShape
               ? transactionalizeAcyclicLeafLines(checkedLeafRenderedTree)
@@ -6586,8 +6848,9 @@ class JvmSsaBlockRenderer {
             directBooleanGuard,
             this.runCountersEnabled
               ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
-            ...(nestedRuntimeCountedRegion || transactionalAcyclicShape ||
-              lexicalCheckedLeafWrapperShape ? [] : [
+            ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
+              transactionalAcyclicShape || lexicalCheckedLeafWrapperShape
+              ? [] : [
               `let safePointBudget = ${restoringDirectSafePointBudget};`,
             ]),
             ...declaredLocals.map((index) =>
@@ -6678,8 +6941,9 @@ class JvmSsaBlockRenderer {
                 ...captureDeclarations,
                 this.runCountersEnabled
                   ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
-                ...(nestedRuntimeCountedRegion || transactionalAcyclicShape ||
-                  lexicalCheckedLeafWrapperShape ? [] : [
+                ...(nestedRuntimeCountedRegion || shrinkingArrayWindowLeaf ||
+                  transactionalAcyclicShape || lexicalCheckedLeafWrapperShape
+                  ? [] : [
                   `let safePointBudget = ${restoringDirectSafePointBudget};`,
                 ]),
                 ...declaredLocals.map((index) =>
@@ -6944,6 +7208,10 @@ class JvmSsaBlockRenderer {
         checkedLeafDirectPositionalBody && nestedRuntimeCountedRegion);
       generated.jvmStructuredTransactionalAcyclicCheckedLeaf = Boolean(
         checkedLeafDirectPositionalBody && transactionalAcyclicCheckedLeaf);
+      generated.jvmStructuredShrinkingArrayWindowCheckedLeaf = Boolean(
+        checkedLeafDirectPositionalBody && shrinkingArrayWindowLeaf);
+      generated.jvmStructuredShrinkingArrayWindowAccessCount =
+        shrinkingArrayWindowLeaf?.accesses.length || 0;
       generated.jvmStructuredBoundedIndexRangeCount =
         arrayRangeCheckCandidates.filter(
           (candidate) => candidate.kind === "bounded-index").length;

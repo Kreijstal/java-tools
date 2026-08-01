@@ -3566,6 +3566,114 @@ public final class NestedCyclicArrayRangeHarness {
   t.end();
 });
 
+test('structured SSA versions shrinking primitive-array windows generically', async (t) => {
+  const className = 'RenamedShrinkingWindowHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class RenamedShrinkingWindowHarness {
+  static void reorder(int[] cells, int floor, int ceiling) {
+    while (ceiling >= floor + 8) {
+      int ordered = 1;
+      for (int cursor = floor + 4; cursor < ceiling; cursor += 4) {
+        int left = cells[cursor - 4];
+        int right = cells[cursor];
+        if (left > right) {
+          ordered = 0;
+          cells[cursor - 4] = right;
+          cells[cursor] = left;
+          int temporary = cells[cursor - 2];
+          cells[cursor - 2] = cells[cursor + 2];
+          cells[cursor + 2] = temporary;
+          temporary = cells[cursor - 1];
+          cells[cursor - 1] = cells[cursor + 3];
+          cells[cursor + 3] = temporary;
+        }
+      }
+      if (ordered != 0) return;
+      ceiling -= 4;
+    }
+  }
+
+  static void changedReach(int[] cells, int floor, int ceiling) {
+    while (ceiling >= floor + 8) {
+      int ordered = 1;
+      for (int cursor = floor + 4; cursor < ceiling; cursor += 4) {
+        int left = cells[cursor - 4];
+        int right = cells[cursor];
+        if (left > right) {
+          ordered = 0;
+          cells[cursor + 4] = left;
+        }
+      }
+      if (ordered != 0) return;
+      ceiling -= 4;
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+    checkedLeafDirectPositional: true,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'reorder', '([III)V');
+  const generated = jvm.jit.getGeneratedFunction(method);
+  const checked = generated?.jvmCheckedLeafDirectPositionalBody;
+  const sourceText = generated?.jvmCheckedLeafDirectPositionalSource || '';
+  t.equal(typeof checked, 'function',
+    'a renamed shrinking-window shape publishes a checked leaf');
+  t.equal(generated?.jvmStructuredShrinkingArrayWindowCheckedLeaf, true,
+    'the generated metadata records the structural proof');
+  t.equal(generated?.jvmStructuredShrinkingArrayWindowAccessCount, 12,
+    'the proof covers every primitive load and store in the window');
+  t.notOk(sourceText.includes('safePointBudget') ||
+      sourceText.includes('helpers.arrayLoad(') ||
+      sourceText.includes('helpers.arrayStore(') ||
+      sourceText.includes('helpers.materialize('),
+  'the admitted leaf contains no poll, checked access, or Frame path');
+
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  const cells = [
+    5, 9, 50, 51,
+    1, 9, 10, 11,
+    3, 9, 30, 31,
+  ];
+  cells.type = '[I';
+  t.notEqual(checked(jvm.jit, cells, 0, 12, thread, true),
+    jvm.jit.asyncInvokeSentinel(),
+  'an aligned in-bounds window enters the specialized leaf');
+  t.deepEqual(cells.slice(), [
+    1, 9, 10, 11,
+    3, 9, 30, 31,
+    5, 9, 50, 51,
+  ], 'the generated leaf preserves record ordering and payload swaps');
+
+  for (const [label, input, floor, ceiling] of [
+    ['misaligned', [5, 9, 50, 51, 1, 9, 10, 11, 3, 9, 30, 31], 0, 10],
+    ['out-of-bounds', [5, 9, 50, 51, 1, 9, 10, 11], 0, 12],
+  ]) {
+    input.type = '[I';
+    const before = input.slice();
+    t.equal(checked(jvm.jit, input, floor, ceiling, thread, true),
+      jvm.jit.asyncInvokeSentinel(),
+    `${label} input returns to canonical execution`);
+    t.deepEqual(input.slice(), before,
+      `${label} rejection precedes the first array effect`);
+  }
+
+  const changed = await jvm.findMethodInHierarchy(
+    className, 'changedReach', '([III)V');
+  const changedGenerated = jvm.jit.getGeneratedFunction(changed);
+  t.equal(changedGenerated?.jvmCheckedLeafDirectPositionalBody, null,
+    'an access outside the verified record window is rejected structurally');
+  t.end();
+});
+
 test('structured SSA publishes transactional acyclic checked leaves', async (t) => {
   const className = 'TransactionalAcyclicLeafHarness';
   const classpath = compileJavaFixture(t, className, `
