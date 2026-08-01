@@ -528,6 +528,8 @@ class JvmSsaBlockRenderer {
       `ssaFastPositional${index}`;
     const positionalCallInvokeVariable = (index) =>
       `ssaFastPositionalInvoke${index}`;
+    const positionalCallRawInvokeVariable = (index) =>
+      `ssaFastPositionalRawInvoke${index}`;
     const positionalCallReceiverVariable = (index) =>
       `ssaFastPositionalReceiver${index}`;
     for (let index = 0; index < items.length; index += 1) {
@@ -576,7 +578,11 @@ class JvmSsaBlockRenderer {
           ? null : this.jit.getCompileTimeIntegerLeaf(instruction);
         const directIntrinsic = directJre || !isStatic || inline
           ? null : this.jit.getCompileTimeSynchronousIntrinsic(instruction);
-        const directFused = directJre || !isStatic || inline || directIntrinsic
+        const directCheckedLeaf = directJre || !isStatic || inline ||
+          directIntrinsic ? null :
+          this.jit.getCompileTimeCheckedLeaf(instruction);
+        const directFused = directJre || !isStatic || inline || directIntrinsic ||
+          directCheckedLeaf
           ? null : this.jit.fusedRegions.getCompileTimeDirectCall(instruction);
         callSites.set(index, {
           id: directJre || inline || directIntrinsic
@@ -588,6 +594,7 @@ class JvmSsaBlockRenderer {
           directJre,
           inline,
           directIntrinsic,
+          directCheckedLeaf,
           directFused,
         });
       }
@@ -2291,6 +2298,21 @@ class JvmSsaBlockRenderer {
               const runtimeSite = positionalCallSiteVariable(index);
               const positionalTarget = positionalCallTargetVariable(index);
               const positionalInvoke = positionalCallInvokeVariable(index);
+              const positionalRawInvoke =
+                positionalCallRawInvokeVariable(index);
+              const positionalRawCaptures =
+                (site.directCheckedLeaf?.captures || []).flatMap(
+                  (capture, captureIndex, captures) => {
+                    let offset = 0;
+                    for (let earlier = 0; earlier < captureIndex; earlier += 1) {
+                      offset += captures[earlier].data ? 2 : 1;
+                    }
+                    const values = [`ssaCallCapture${index}_${offset}`];
+                    if (capture.data) {
+                      values.push(`ssaCallCapture${index}_${offset + 1}`);
+                    }
+                    return values;
+                  });
               const positionalReceiver =
                 positionalCallReceiverVariable(index);
               const receiverGuard = site.dynamic && site.argumentCount > 0
@@ -2303,10 +2325,16 @@ class JvmSsaBlockRenderer {
                   : "true";
               lines.push(
                 `let ${usedDirect} = false;`,
-                `if (${positionalInvoke} && ${receiverGuard}) {`,
+                `if ((${positionalRawInvoke} || ${positionalInvoke}) && ${receiverGuard}) {`,
                 `  ${usedDirect} = true;`,
-                `  try { ${out} = ${positionalInvoke}(${args.join(", ")}${
-                  args.length ? ", " : ""}thread, true); } catch (${caught}) {`,
+                `  try { ${out} = ${positionalRawInvoke} ? ` +
+                  `${positionalRawInvoke}(helpers${args.length ? ", " : ""}` +
+                  `${args.join(", ")}${positionalRawCaptures.length
+                    ? `${args.length ? ", " : ""}${positionalRawCaptures.join(", ")}`
+                    : ""}${args.length || positionalRawCaptures.length
+                    ? ", " : ", "}thread, true) : ` +
+                  `${positionalInvoke}(${args.join(", ")}${
+                    args.length ? ", " : ""}thread, true); } catch (${caught}) {`,
                 ...materializeCallExceptionLines(
                   callStack, stack, index,
                   `!${positionalInvoke}.jvmRestoresExceptionFrames`,
@@ -2461,12 +2489,66 @@ class JvmSsaBlockRenderer {
       }
     }
 
+    // Bytecode stack staging can create long chains such as
+    // `const v7 = v3; const v9 = v7;`. Both names are immutable SSA values,
+    // so retaining the aliases only enlarges the optimizing compiler's graph
+    // and increases register pressure in numeric kernels. Coalesce only
+    // exact, top-level SSA-to-SSA declarations; locals, transfer slots, field
+    // caches, and nested lexical declarations are intentionally excluded.
+    // This is ordinary SSA copy propagation and is independent of guest
+    // identity or algorithm shape.
+    let coalescedSsaCopyCount = 0;
+    for (const plan of plans) {
+      if (!plan?.lines?.length) continue;
+      const aliases = new Map();
+      const resolveAlias = (name) => {
+        const visited = new Set();
+        let current = name;
+        while (aliases.has(current) && !visited.has(current)) {
+          visited.add(current);
+          current = aliases.get(current);
+        }
+        return current;
+      };
+      const removed = new Set();
+      for (let index = 0; index < plan.lines.length; index += 1) {
+        const match = /^const (ssaValue\d+) = (ssaValue\d+);$/.exec(
+          plan.lines[index]);
+        if (!match) continue;
+        aliases.set(match[1], resolveAlias(match[2]));
+        removed.add(index);
+        coalescedSsaCopyCount += 1;
+      }
+      if (!aliases.size) continue;
+      const substitute = (source) => {
+        if (typeof source !== "string") return source;
+        return source.replace(/\bssaValue\d+\b/g,
+          (name) => resolveAlias(name));
+      };
+      plan.lines = plan.lines
+        .filter((_line, index) => !removed.has(index))
+        .map(substitute);
+      plan.condition = substitute(plan.condition);
+      plan.returnValue = substitute(plan.returnValue);
+      if (plan.stack) plan.stack = plan.stack.map(substitute);
+      if (plan.takenStack) plan.takenStack = plan.takenStack.map(substitute);
+      if (plan.fallStack) plan.fallStack = plan.fallStack.map(substitute);
+    }
+
     // Generator continuations preserve lexical SSA locals across a cooperative
     // browser yield. Guarded static constants are rechecked before resuming;
     // if another Java thread changed one, the exact materialized bytecode state
     // resumes in the baseline body instead of re-entering stale lexical state.
     let useContinuations = this.continuationsEnabled &&
       structured.loopHeaders.size > 0;
+    if ([...callSites.values()].some((site) =>
+      Array.isArray(site.directCheckedLeaf?.captures) &&
+      site.directCheckedLeaf.captures.length > 0)) {
+      // Captured non-volatile child statics are stable for one synchronous
+      // scheduler slice. If this caller reaches a safe point, resume through
+      // the canonical frame so the next execution snapshots fresh values.
+      useContinuations = false;
+    }
     const guardedStaticBooleanStateMatches = () => {
       for (const direct of guardedStaticBooleanSites.values()) {
         const target = directTargetFor(direct);
@@ -2568,6 +2650,8 @@ class JvmSsaBlockRenderer {
         loadInstruction = headerInstructions[headerInstructions.length - 2];
       } else if (branchOp === "if_icmpge" &&
           headerInstructions.length >= 3) {
+        const boundItemIndex =
+          block.insns[block.insns.length - 2];
         const boundInstruction =
           headerInstructions[headerInstructions.length - 2];
         bound = constantInstructionValue(boundInstruction);
@@ -2575,10 +2659,22 @@ class JvmSsaBlockRenderer {
           boundExpression = String(bound);
         } else {
           const boundOp = opOf(boundInstruction);
-          if (!/^iload(?:_[0-3])?$/.test(boundOp)) return null;
-          boundSlot = localIndex(boundInstruction, boundOp);
-          if (!Number.isInteger(boundSlot)) return null;
-          boundExpression = `local${boundSlot}`;
+          if (/^iload(?:_[0-3])?$/.test(boundOp)) {
+            boundSlot = localIndex(boundInstruction, boundOp);
+            if (!Number.isInteger(boundSlot)) return null;
+            boundExpression = `local${boundSlot}`;
+          } else if (boundOp === "getstatic") {
+            // An entry-snapshotted, read-only scalar static is as invariant
+            // as an unmodified bound local for this generated invocation.
+            // This admits ordinary raster/codec row loops whose dimensions
+            // javac reads directly from a static field at the header.
+            const direct = directStaticSites.get(boundItemIndex);
+            if (!direct?.entryReadCache?.value ||
+                direct.descriptor !== "I") return null;
+            boundExpression = direct.entryReadCache.value;
+          } else {
+            return null;
+          }
         }
         loadInstruction = headerInstructions[headerInstructions.length - 3];
       } else {
@@ -2772,6 +2868,78 @@ class JvmSsaBlockRenderer {
       }
     };
     findNestedCountedLoops(structured.tree);
+    const allCfgPredecessors = Array.from({length: cfg.n}, () => []);
+    for (let block = 0; block < cfg.n; block += 1) {
+      for (const successor of cfg.succ[block] || []) {
+        allCfgPredecessors[successor].push(block);
+      }
+    }
+    const naturalLoopBlocksFor = (header) => {
+      const headerItem = cfg.blocks[header]?.insns?.[0];
+      if (!Number.isInteger(headerItem)) return null;
+      const backedges = allCfgPredecessors[header].filter((predecessor) =>
+        cfg.blocks[predecessor]?.insns?.[0] >= headerItem);
+      if (backedges.length !== 1) return null;
+      const loopBlocks = new Set([header, backedges[0]]);
+      const pending = [backedges[0]];
+      while (pending.length) {
+        const current = pending.pop();
+        for (const predecessor of allCfgPredecessors[current]) {
+          if (loopBlocks.has(predecessor)) continue;
+          loopBlocks.add(predecessor);
+          if (predecessor !== header) pending.push(predecessor);
+        }
+      }
+      return loopBlocks;
+    };
+    const postDecrementLoopInfos = new Map();
+    for (const header of structured.loopHeaders) {
+      const block = cfg.blocks[header];
+      const blockItems = block?.insns || [];
+      if (blockItems.length < 3 || cfg.term[header]?.kind !== "cond") continue;
+      const load = items[blockItems[blockItems.length - 3]]?.instruction;
+      const decrement = items[blockItems[blockItems.length - 2]]?.instruction;
+      const branch = items[blockItems[blockItems.length - 1]]?.instruction;
+      const loadOp = opOf(load);
+      const slot = /^iload(?:_[0-3])?$/.test(loadOp)
+        ? localIndex(load, loadOp) : null;
+      if (!Number.isInteger(slot) || opOf(decrement) !== "iinc" ||
+          Number(decrement.varnum ?? decrement.arg) !== slot ||
+          Number(decrement.incr ?? 0) !== -1 || opOf(branch) !== "ifle") {
+        continue;
+      }
+      const loopBlocks = naturalLoopBlocksFor(header);
+      const term = cfg.term[header];
+      if (!loopBlocks || loopBlocks.has(term.taken) ||
+          !loopBlocks.has(term.fall)) continue;
+      const writtenSlots = new Set();
+      for (const loopBlock of loopBlocks) {
+        for (const itemIndex of cfg.blocks[loopBlock]?.insns || []) {
+          const instruction = items[itemIndex]?.instruction;
+          const op = opOf(instruction);
+          const writtenSlot = op === "iinc"
+            ? Number(instruction.varnum ?? instruction.arg)
+            : /^istore(?:_[0-3])?$/.test(op)
+              ? localIndex(instruction, op) : null;
+          if (Number.isInteger(writtenSlot)) writtenSlots.add(writtenSlot);
+        }
+      }
+      postDecrementLoopInfos.set(header, {
+        header, slot, loopBlocks, writtenSlots,
+        postDecrement: true, increment: 1, initial: null,
+        bound: 0, boundSlot: null, boundExpression: "0",
+      });
+      if (this.coarseCountedLoopSafePointsEnabled) {
+        runtimeCoarseCountedLoops.set(header, {
+          header, slot, loopBlocks, writtenSlots, postDecrement: true,
+          variable: `ssaRuntimeCoarseLoop${header}`,
+          tripsVariable: `ssaRuntimeCoarseTrips${header}`,
+          tripsExpression: `Math.max(0, local${slot})`,
+          condition: `ssaRuntimeCoarseTrips${header} <= ` +
+            `${runtimeCoarseTripLimit}`,
+        });
+      }
+    }
     const boundedIterationProduct = [...allCountedLoops.values()]
       .reduce((product, trips) => product * trips, 1);
     const isAtomicUnsafeOperation = (item, index) => {
@@ -2818,6 +2986,22 @@ class JvmSsaBlockRenderer {
     const quotientProductRangePreambles = new Map();
     const cyclicArrayRangeCandidates = new Set();
     let fieldBackedArrayRangeCandidateCount = 0;
+    let hoistedArrayRangeGuardCount = 0;
+    const trustedHoistedRangeGuards = new Set();
+    const rangeBailoutGuardsByHeader = new Map();
+    const hasEffectBeforeLoopHeader = (header) => {
+      const first = cfg.blocks[header]?.insns?.[0];
+      if (!Number.isInteger(first)) return true;
+      for (let index = 0; index < first; index += 1) {
+        if (!normalReachableItems.has(index)) continue;
+        const op = opOf(items[index]?.instruction);
+        if (!op || /^(?:[ai]load(?:_[0-3])?|[ai]store(?:_[0-3])?|iinc|iconst_(?:m1|[0-5])|bipush|sipush|ldc|ldc_w|iadd|isub|imul|idiv|irem|iand|ior|ixor|ishl|ishr|iushr|ineg|arraylength|getstatic|goto|goto_w|if.*|return|ireturn)$/.test(op)) {
+          continue;
+        }
+        return true;
+      }
+      return false;
+    };
     const affineLocalStep = (info, slot) => {
       let result = null;
       let writes = 0;
@@ -3145,7 +3329,7 @@ class JvmSsaBlockRenderer {
             Boolean(quotientProductRecurrence(info, candidate))))
         .sort((left, right) =>
           left.loopBlocks.size - right.loopBlocks.size);
-      const info = candidate.kind === "bounded-index"
+      let info = candidate.kind === "bounded-index"
         ? loops[0]
         : candidate.kind === "affine-local"
         ? loops.find((loop) =>
@@ -3160,20 +3344,93 @@ class JvmSsaBlockRenderer {
           return Number.isInteger(baseSlot) &&
             !loop.writtenSlots.has(baseSlot);
         });
+      if (!info && (candidate.kind === "bounded-index" ||
+          candidate.kind === "affine-local")) {
+        info = [...postDecrementLoopInfos.values()]
+          .filter((loop) => loop.loopBlocks.has(candidate.block))
+          .sort((left, right) =>
+            left.loopBlocks.size - right.loopBlocks.size)[0] || null;
+      }
       if (!info) continue;
+      const enclosingCountedLoops = [...countedLoopInfos.values()]
+        .filter((loop) => loop.header !== info.header &&
+          loop.loopBlocks.has(info.header))
+        .sort((left, right) => right.loopBlocks.size - left.loopBlocks.size);
+      const outermostCountedLoop = enclosingCountedLoops[0] || null;
+      const enclosingPostDecrementLoops = [...postDecrementLoopInfos.values()]
+        .filter((loop) => loop.loopBlocks.has(info.header))
+        .sort((left, right) =>
+          right.loopBlocks.size - left.loopBlocks.size);
+      const outermostPostDecrementLoop =
+        enclosingPostDecrementLoops[0] || null;
       const variable = `ssaArrayRangeGuard${candidateIndex}`;
       let condition;
       let preamble = [];
+      let declarationHeader = info.header;
       if (candidate.kind === "bounded-index") {
         condition =
           `(${candidate.minimum} >= 0 && ${candidate.maximum} < ` +
           `${candidate.arrayData}.length)`;
+        const outer = outermostCountedLoop || outermostPostDecrementLoop;
+        if (outer) {
+          declarationHeader = outer.header;
+        }
       } else if (candidate.kind === "affine-local") {
         const indexSlot = candidate.slots[0];
         const step = affineLocalStep(info, indexSlot);
         const cyclic = step === null
           ? cyclicLocalRange(info, candidate) : null;
-        if (cyclic) {
+        const postDecrementOuter = !info.postDecrement && !cyclic && step !== null &&
+          outermostPostDecrementLoop && info.initial === 0 &&
+          Number.isInteger(info.bound) && info.bound > 0
+          ? outermostPostDecrementLoop : null;
+        let countedOuterSkipSlot = null;
+        if (!info.postDecrement && !cyclic && step !== null &&
+            outermostCountedLoop && info.initial === 0) {
+          const outerOnlyWrites = [];
+          for (const loopBlock of outermostCountedLoop.loopBlocks) {
+            if (info.loopBlocks.has(loopBlock)) continue;
+            const blockItems = cfg.blocks[loopBlock]?.insns || [];
+            for (let position = 3; position < blockItems.length; position += 1) {
+              const store = items[blockItems[position]]?.instruction;
+              const storeOp = opOf(store);
+              if (!/^istore(?:_[0-3])?$/.test(storeOp) ||
+                  localIndex(store, storeOp) !== indexSlot) continue;
+              const left = items[blockItems[position - 3]]?.instruction;
+              const right = items[blockItems[position - 2]]?.instruction;
+              const add = items[blockItems[position - 1]]?.instruction;
+              const leftOp = opOf(left), rightOp = opOf(right);
+              if (!/^iload(?:_[0-3])?$/.test(leftOp) ||
+                  localIndex(left, leftOp) !== indexSlot ||
+                  !/^iload(?:_[0-3])?$/.test(rightOp) ||
+                  opOf(add) !== "iadd") continue;
+              outerOnlyWrites.push(localIndex(right, rightOp));
+            }
+          }
+          if (outerOnlyWrites.length === 1 &&
+              !outermostCountedLoop.writtenSlots.has(outerOnlyWrites[0])) {
+            countedOuterSkipSlot = outerOnlyWrites[0];
+          }
+        }
+        const writesInPostDecrementOuter = postDecrementOuter
+          ? [...postDecrementOuter.loopBlocks].flatMap((block) =>
+            cfg.blocks[block]?.insns || []).filter((itemIndex) => {
+            const instruction = items[itemIndex]?.instruction;
+            const op = opOf(instruction);
+            return op === "iinc"
+              ? Number(instruction.varnum ?? instruction.arg) === indexSlot
+              : /^istore(?:_[0-3])?$/.test(op) &&
+                localIndex(instruction, op) === indexSlot;
+          }).length : 0;
+        if (info.postDecrement && step !== null) {
+          const trips = `Math.max(0, local${info.slot})`;
+          const last = `(local${indexSlot} + (${trips} - 1) * ${step})`;
+          condition =
+            `(${trips} === 0 || (${trips} <= ` +
+            `${runtimeCoarseTripLimit} && ${step} >= 0 && ` +
+            `local${indexSlot} >= 0 && ${last} < ` +
+            `${candidate.arrayData}.length && ${last} <= 2147483647))`;
+        } else if (cyclic) {
           cyclicArrayRangeCandidates.add(candidate);
           const base =
             `(local${cyclic.indexSlot} - local${cyclic.phaseSlot})`;
@@ -3184,6 +3441,38 @@ class JvmSsaBlockRenderer {
             `local${cyclic.phaseSlot} < local${cyclic.modulusSlot} && ` +
             `${base} >= 0 && ${end} <= ${candidate.arrayData}.length && ` +
             `${end} <= 2147483647)`;
+        } else if (Number.isInteger(countedOuterSkipSlot)) {
+          const outerTrips =
+            `(local${outermostCountedLoop.slot} >= ` +
+            `${outermostCountedLoop.boundExpression} ? 0 : ` +
+            `(${outermostCountedLoop.boundExpression} - ` +
+            `local${outermostCountedLoop.slot}))`;
+          const innerTrips =
+            `Math.max(0, ${info.boundExpression})`;
+          const rowStride =
+            `(${innerTrips} * ${step} + local${countedOuterSkipSlot})`;
+          const last = `(local${indexSlot} + (${outerTrips} - 1) * ` +
+            `${rowStride} + (${innerTrips} - 1) * ${step})`;
+          condition =
+            `(${outerTrips} === 0 || ${innerTrips} === 0 || (` +
+            `${outerTrips} <= ${runtimeCoarseTripLimit} && ` +
+            `${innerTrips} <= ${runtimeCoarseTripLimit} && ${step} >= 0 && ` +
+            `local${countedOuterSkipSlot} >= 0 && ` +
+            `local${indexSlot} >= 0 && ${last} < ` +
+            `${candidate.arrayData}.length && ${last} <= 2147483647))`;
+          declarationHeader = outermostCountedLoop.header;
+        } else if (postDecrementOuter && writesInPostDecrementOuter === 1) {
+          const outerTrips =
+            `Math.max(0, local${postDecrementOuter.slot})`;
+          const totalTrips = `(${outerTrips} * ${info.bound})`;
+          const last =
+            `(local${indexSlot} + (${totalTrips} - 1) * ${step})`;
+          condition =
+            `(${totalTrips} === 0 || (${outerTrips} <= ` +
+            `${runtimeCoarseTripLimit} && ${step} >= 0 && ` +
+            `local${indexSlot} >= 0 && ${last} < ` +
+            `${candidate.arrayData}.length && ${last} <= 2147483647))`;
+          declarationHeader = postDecrementOuter.header;
         } else {
           const trips =
             `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
@@ -3199,11 +3488,18 @@ class JvmSsaBlockRenderer {
       } else if (candidate.kind === "scaled-local") {
         const relation = scaledCountedLocalRelation(info, candidate);
         if (!relation) continue;
-        const trips =
-          `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
-          `(${info.boundExpression} - local${info.slot}))`;
+        const boundInvariantInOuterLoops =
+          info.boundSlot === null || enclosingCountedLoops.every((loop) =>
+            !loop.writtenSlots.has(info.boundSlot));
+        const hoistScaledGuard = Boolean(
+          outermostCountedLoop && info.initial === 0 &&
+          boundInvariantInOuterLoops);
+        const trips = hoistScaledGuard
+          ? `Math.max(0, ${info.boundExpression})`
+          : `(local${info.slot} >= ${info.boundExpression} ? 0 : ` +
+            `(${info.boundExpression} - local${info.slot}))`;
         const firstCounter = relation.kind === "carried"
-          ? "0" : `local${info.slot}`;
+          ? "0" : hoistScaledGuard ? "0" : `local${info.slot}`;
         const first = `(${firstCounter} * ${candidate.scale} + ` +
           `${candidate.offset})`;
         const last = `((${info.boundExpression} - 1) * ` +
@@ -3213,6 +3509,7 @@ class JvmSsaBlockRenderer {
           `${first} >= 0 && ${last} >= ${first} && ` +
           `${last} <= 2147483647 && ` +
           `${last} < ${candidate.arrayData}.length))`;
+        if (hoistScaledGuard) declarationHeader = outermostCountedLoop.header;
       } else {
         const recurrence =
           quotientProductRecurrence(info, candidate);
@@ -3308,9 +3605,18 @@ class JvmSsaBlockRenderer {
       }
       condition = `(${candidate.arrayData} !== null && ${condition})`;
       const declarations =
-        arrayRangeGuardDeclarations.get(info.header) || [];
+        arrayRangeGuardDeclarations.get(declarationHeader) || [];
       declarations.push(...preamble, `const ${variable} = ${condition};`);
-      arrayRangeGuardDeclarations.set(info.header, declarations);
+      arrayRangeGuardDeclarations.set(declarationHeader, declarations);
+      if (declarationHeader !== info.header) {
+        hoistedArrayRangeGuardCount += 1;
+        if (!hasEffectBeforeLoopHeader(declarationHeader)) {
+          trustedHoistedRangeGuards.add(variable);
+          const bailouts = rangeBailoutGuardsByHeader.get(declarationHeader) || [];
+          bailouts.push(variable);
+          rangeBailoutGuardsByHeader.set(declarationHeader, bailouts);
+        }
+      }
       const variables = arrayRangeGuardVariables.get(info.header) || [];
       variables.push(variable);
       arrayRangeGuardVariables.set(info.header, variables);
@@ -3392,6 +3698,25 @@ class JvmSsaBlockRenderer {
       });
     const specializeArrayRangeGuardedStores = (lines, guardVariables) => {
       if (!guardVariables.length) return lines;
+      const specializeGuardedValue = (line) => {
+        for (const variable of guardVariables) {
+          const marker = ` = ${variable} ? `;
+          const conditional = line.indexOf(marker);
+          const alternate = line.lastIndexOf(" : ");
+          if (conditional < 0 || alternate <= conditional + marker.length) {
+            continue;
+          }
+          // This arm is dominated by `variable === true`. The successful
+          // checked-load expression is the text before the conditional's
+          // alternate separator; retaining the ternary costs one branch per
+          // pixel and prevents the engine from seeing an ordinary typed-array
+          // loop. Emission controls this single-line expression shape, so no
+          // guest syntax or identity participates in the rewrite.
+          return `${line.slice(0, conditional)} = ` +
+            `${line.slice(conditional + marker.length, alternate)};`;
+        }
+        return line;
+      };
       const output = [];
       for (let index = 0; index < lines.length; index += 1) {
         const line = lines[index];
@@ -3428,9 +3753,152 @@ class JvmSsaBlockRenderer {
           const unindented = successLine.startsWith(nestedPrefix)
             ? `${indentPrefix}${successLine.slice(nestedPrefix.length)}`
             : successLine;
-          output.push(unindented);
+          output.push(specializeGuardedValue(unindented));
         }
         index = close;
+      }
+      return output;
+    };
+    // `structure()` represents a natural counted loop as an infinite labelled
+    // loop whose first node branches to either the exit or the body. That is a
+    // convenient CFG-preserving form, but it leaves optimizing JavaScript
+    // engines with an extra branch, two SSA aliases, and an explicit continue
+    // on every guest iteration. Recover the ordinary while-loop form when the
+    // counted-loop proof and the emitted header agree exactly. This is a
+    // generated-source canonicalization: it is driven only by the verified
+    // induction slot/bound and never by a guest owner, method, or descriptor.
+    const canonicalCountedLoop = (header, label, lines) => {
+      const info = countedLoopInfos.get(header);
+      if (!info || !Number.isInteger(info.slot) || !info.boundExpression ||
+          lines.length < 5) return null;
+      const first = /^const (ssaValue\d+) = local(\d+);$/.exec(lines[0]);
+      if (!first || Number(first[2]) !== info.slot) return null;
+      const second = /^const (ssaValue\d+) = (.+);$/.exec(lines[1]);
+      let conditionLine;
+      let conditionIndex;
+      if (second && second[2] === info.boundExpression &&
+          lines[2] === `if (${first[1]} >= ${second[1]}) {`) {
+        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+        conditionIndex = 2;
+      } else if (lines[1] ===
+          `if (${first[1]} >= ${info.boundExpression}) {`) {
+        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+        conditionIndex = 1;
+      } else {
+        return null;
+      }
+      let alternate = -1;
+      let depth = 0;
+      for (let index = conditionIndex; index < lines.length; index += 1) {
+        const trimmed = lines[index].trim();
+        if (index > conditionIndex && depth === 1 && trimmed === "} else {") {
+          alternate = index;
+          break;
+        }
+        if (trimmed.endsWith("{")) depth += 1;
+        if (trimmed === "}" || trimmed.startsWith("} else")) depth -= 1;
+      }
+      if (alternate < 0 || lines[lines.length - 1] !== "}") return null;
+      const unindentOne = (line) => line.startsWith("  ")
+        ? line.slice(2) : line;
+      const exit = lines.slice(conditionIndex + 1, alternate).map(unindentOne);
+      const body = lines.slice(alternate + 1, -1).map(unindentOne);
+      if (body[body.length - 1]?.trim() === `continue ${label};`) body.pop();
+      return {
+        condition: conditionLine,
+        body,
+        exit,
+      };
+    };
+    // Javac lowers `while (remaining-- > 0)` to load/iinc/ifle at the loop
+    // header. It is not an increasing counted loop, but it is still a common
+    // finite numeric-loop shape. Preserve the post-decrement value and move
+    // the header test into JavaScript's while condition, eliminating the
+    // infinite-loop/if/continue scaffold without assuming a trip bound.
+    const canonicalPostDecrementLoop = (label, lines) => {
+      if (lines.length < 8) return null;
+      const oldValue = /^const (ssaValue\d+) = local(\d+);$/.exec(lines[0]);
+      if (!oldValue) return null;
+      const nextValue = new RegExp(
+        `^const (ssaValue\\d+) = \\(${oldValue[1]} \\+ -1\\) \\| 0;$`,
+      ).exec(lines[1]);
+      if (!nextValue || lines[2] !==
+          `local${oldValue[2]} = ${nextValue[1]};` ||
+          lines[3] !== `if (${oldValue[1]} <= 0) {`) return null;
+      let alternate = -1;
+      let depth = 0;
+      for (let index = 3; index < lines.length; index += 1) {
+        const trimmed = lines[index].trim();
+        if (index > 3 && depth === 1 && trimmed === "} else {") {
+          alternate = index;
+          break;
+        }
+        if (trimmed.endsWith("{")) depth += 1;
+        if (trimmed === "}" || trimmed.startsWith("} else")) depth -= 1;
+      }
+      if (alternate < 0 || lines[lines.length - 1] !== "}") return null;
+      const unindentOne = (line) => line.startsWith("  ")
+        ? line.slice(2) : line;
+      const exit = lines.slice(4, alternate).map(unindentOne);
+      const body = [
+        ...lines.slice(0, 3),
+        ...lines.slice(alternate + 1, -1).map(unindentOne),
+      ];
+      if (body[body.length - 1]?.trim() === `continue ${label};`) body.pop();
+      return {
+        condition: `local${oldValue[2]} > 0`,
+        body,
+        exit,
+      };
+    };
+    let dominatedArithmeticGuardCount = 0;
+    const specializeNonZeroBranch = (plan, lines) => {
+      const match = /^(ssaValue\d+) !== 0$/.exec(plan.condition || "");
+      if (!match) return lines;
+      const equivalent = new Set([match[1]]);
+      const learnAlias = (line) => {
+        const declaration = /^\s*const (ssaValue\d+) = ([A-Za-z_$][\w$]*);$/.exec(line);
+        const assignment = /^\s*(local\d+) = ([A-Za-z_$][\w$]*);$/.exec(line);
+        const alias = declaration || assignment;
+        if (!alias || !equivalent.has(alias[2])) return false;
+        const size = equivalent.size;
+        equivalent.add(alias[1]);
+        return equivalent.size !== size;
+      };
+      // The conditional plan commonly stores the tested stack value into a
+      // local immediately before branching; seed that equivalence before
+      // walking the selected successor.
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const line of plan.lines || []) changed = learnAlias(line) || changed;
+      }
+      const output = [];
+      for (let index = 0; index < lines.length; index += 1) {
+        const line = lines[index];
+        learnAlias(line);
+        const zeroCheck = /^([\s]*)if \(([A-Za-z_$][\w$]*) === 0\) \{$/.exec(line);
+        if (!zeroCheck || !equivalent.has(zeroCheck[2])) {
+          output.push(line);
+          continue;
+        }
+        let depth = 1;
+        let close = index + 1;
+        for (; close < lines.length && depth > 0; close += 1) {
+          const trimmed = lines[close].trim();
+          if (trimmed.endsWith("{")) depth += 1;
+          if (trimmed === "}") depth -= 1;
+          if (trimmed.startsWith("} else")) break;
+        }
+        if (depth !== 0) {
+          output.push(line);
+          continue;
+        }
+        // This is the renderer-owned idiv/irem exceptional arm. The branch
+        // edge proved the divisor nonzero, so retaining it only bloats and
+        // inhibits the surrounding numeric region.
+        dominatedArithmeticGuardCount += 1;
+        index = close - 1;
       }
       return output;
     };
@@ -3438,12 +3906,13 @@ class JvmSsaBlockRenderer {
       node, continuationMode = useContinuations, directPositional = false,
       loopSafePointBudget = safePointInitialBudget,
       checkedLeafOnly = false,
+      rangeBailout = false,
     ) => {
       if (!node) return [];
       if (node.t === "seq") {
         return node.body.flatMap((child) =>
           render(child, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly));
+            loopSafePointBudget, checkedLeafOnly, rangeBailout));
       }
       if (node.t === "straight") {
         const plan = plans[node.block];
@@ -3491,15 +3960,15 @@ class JvmSsaBlockRenderer {
       }
       if (node.t === "if") {
         const plan = plans[node.block];
-        const thenLines = [
+        const thenLines = specializeNonZeroBranch(plan, [
           ...edgeLines(plan.taken, plan.takenStack ?? plan.stack),
           ...render(node.then, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly),
-        ];
+            loopSafePointBudget, checkedLeafOnly, rangeBailout),
+        ]);
         const elseLines = [
           ...edgeLines(plan.fall, plan.fallStack ?? plan.stack),
           ...render(node.els, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly),
+            loopSafePointBudget, checkedLeafOnly, rangeBailout),
         ];
         if (plan.conditionConstant === true) {
           return ["{", ...indent(thenLines), "}"];
@@ -3567,9 +4036,17 @@ class JvmSsaBlockRenderer {
         const rangeGuards = this.versionedArrayRangeStoresEnabled
           ? arrayRangeGuardVariables.get(header) || [] : [];
         const loopBody = render(node.body, continuationMode, directPositional,
-          loopSafePointBudget, checkedLeafOnly);
+          loopSafePointBudget, checkedLeafOnly, rangeBailout);
+        const countedLoop = canonicalCountedLoop(header, node.label, loopBody) ||
+          canonicalPostDecrementLoop(node.label, loopBody);
+        const entryBailoutGuards = directPositional && rangeBailout
+          ? rangeBailoutGuardsByHeader.get(header) || [] : [];
         const prefix = [
           ...(arrayRangeGuardDeclarations.get(header) || []),
+          ...(entryBailoutGuards.length
+            ? [`if (!(${entryBailoutGuards.join(" && ")})) ` +
+              "return helpers.asyncInvokeSentinel();"]
+            : []),
           ...(runtimeCoarse
             ? [
               `const ${runtimeCoarse.tripsVariable} = ` +
@@ -3581,15 +4058,35 @@ class JvmSsaBlockRenderer {
             : []),
         ];
         const polledLoop = [
-          `${node.label}: while (true) {`,
+          `${node.label}: while (${countedLoop
+            ? countedLoop.condition : "true"}) {`,
           ...(coarse ? [] : [
             `  if (${runtimeCoarse
               ? `!${runtimeCoarse.variable} && ` : ""}` +
               "--safePointBudget === 0) {",
             ...indent(indent(materialize)), "  }",
           ]),
-          ...indent(loopBody), "}",
+          ...indent(countedLoop ? countedLoop.body : loopBody), "}",
+          ...(countedLoop ? countedLoop.exit : []),
         ];
+        const rangeBailoutFastLoop = Boolean(
+          directPositional && rangeBailout && (coarse || runtimeCoarse) &&
+          rangeGuards.length > 0 &&
+          rangeGuards.every((guard) =>
+            trustedHoistedRangeGuards.has(guard)) &&
+          countedLoopInfos.get(header)?.initial === 0 &&
+          countedLoopInfos.get(header)?.increment === 1);
+        if (rangeBailoutFastLoop) {
+          return [
+            ...prefix,
+            `${node.label}: while (${countedLoop
+              ? countedLoop.condition : "true"}) {`,
+            ...indent(specializeArrayRangeGuardedStores(
+              countedLoop ? countedLoop.body : loopBody, rangeGuards)),
+            "}",
+            ...(countedLoop ? countedLoop.exit : []),
+          ];
+        }
         // A runtime-bounded direct callee normally takes the verified coarse
         // path, but a combined `!coarse && --budget` test still executes once
         // per guest backedge. Emit two ordinary JavaScript loops so optimizing
@@ -3609,10 +4106,12 @@ class JvmSsaBlockRenderer {
             ...rangeGuards,
           ].join(" && ");
           const fastLoopBody = specializeArrayRangeGuardedStores(
-            loopBody, rangeGuards);
+            countedLoop ? countedLoop.body : loopBody, rangeGuards);
           const unpolledLoop = [
-            `${node.label}: while (true) {`,
+            `${node.label}: while (${countedLoop
+              ? countedLoop.condition : "true"}) {`,
             ...indent(fastLoopBody), "}",
+            ...(countedLoop ? countedLoop.exit : []),
           ];
           if (checkedLeafOnly) {
             // This entry is published only for a single, bounded, call-free
@@ -3642,7 +4141,7 @@ class JvmSsaBlockRenderer {
       if (node.t === "block") {
         return [`${node.label}: {`,
           ...indent(render(node.body, continuationMode, directPositional,
-            loopSafePointBudget, checkedLeafOnly)), "}"];
+            loopSafePointBudget, checkedLeafOnly, rangeBailout)), "}"];
       }
       if (node.t === "break") return [`break ${node.label};`];
       if (node.t === "continue") return [`continue ${node.label};`];
@@ -3766,9 +4265,52 @@ class JvmSsaBlockRenderer {
     // loop iteration. A cold snapshot simply uses the canonical linker for
     // this entry; the next entry observes the published target. The target's
     // own class/debug/epoch guards remain authoritative.
-    const positionalCallDeclarations = [...callSites]
+    const positionalParentOwner = method.className ||
+      this.jit.jvm.findClassNameForMethod?.(method) || null;
+    const positionalCallDeclarationsFor = () => [...callSites]
       .filter(([, site]) => site.id !== null && site.id !== undefined)
-      .flatMap(([index, site]) => [
+      .flatMap(([index, site]) => {
+        const trustedCapturedLeaf =
+          Array.isArray(site.directCheckedLeaf?.captures) &&
+          site.directCheckedLeaf.captures.length > 0;
+        const captures = trustedCapturedLeaf &&
+          Array.isArray(site.directCheckedLeaf?.captures)
+          ? site.directCheckedLeaf.captures : [];
+        const captureLines = [];
+        const captureArguments = [];
+        for (let captureIndex = 0; captureIndex < captures.length;
+          captureIndex += 1) {
+          const capture = captures[captureIndex];
+          const fields =
+            `helpers.directStaticTargets[${capture.targetId}].fields`;
+          const valueName =
+            `ssaCallCapture${index}_${captureArguments.length}`;
+          captureLines.push(`const ${valueName} = ${capture.kind === "map"
+            ? `${fields}.get(${JSON.stringify(capture.key)})`
+            : `${fields}[${JSON.stringify(capture.key)}]`};`);
+          captureArguments.push(valueName);
+          if (capture.data) {
+            const dataName =
+              `ssaCallCapture${index}_${captureArguments.length}`;
+            captureLines.push(
+              `const ${dataName} = helpers.arrayData(${valueName});`);
+            captureArguments.push(dataName);
+          }
+        }
+        const rawBody = `ssaFastPositionalRawBody${index}`;
+        const directRawLines = site.directCheckedLeaf && trustedCapturedLeaf
+          ? [
+            `const ${rawBody} = ` +
+              `helpers.directCheckedLeafBodies[${site.directCheckedLeaf.id}];`,
+            ...captureLines,
+            `const ${positionalCallRawInvokeVariable(index)} = ${rawBody};`,
+          ]
+          : [
+            `const ${positionalCallRawInvokeVariable(index)} = ` +
+              `${positionalCallTargetVariable(index)} && ` +
+              `${positionalCallTargetVariable(index)}.rawInvoke;`,
+          ];
+        return [
         `const ${positionalCallSiteVariable(index)} = ` +
           `helpers.syncCallSites[${site.id}];`,
         `const ${positionalCallTargetVariable(index)} = ` +
@@ -3781,10 +4323,16 @@ class JvmSsaBlockRenderer {
         `const ${positionalCallInvokeVariable(index)} = ` +
           `${positionalCallTargetVariable(index)} && ` +
           `${positionalCallTargetVariable(index)}.invoke;`,
+        ...directRawLines,
         `const ${positionalCallReceiverVariable(index)} = ` +
           `${positionalCallTargetVariable(index)} && ` +
           `${positionalCallTargetVariable(index)}.receiverType;`,
-      ]);
+        ];
+      });
+    const positionalCallDeclarations =
+      positionalCallDeclarationsFor();
+    const directPositionalCallDeclarations =
+      positionalCallDeclarations;
     const fieldReadCacheDeclarations = [...fieldReadCaches.values()].flatMap((cache) => [
       `let ${cache.object} = null;`,
       `let ${cache.value};`,
@@ -3886,8 +4434,7 @@ class JvmSsaBlockRenderer {
     const directIntegralTypes = new Set([
       "boolean", "byte", "char", "short", "int",
     ]);
-    const directMethodOwner = method.className ||
-      this.jit.jvm.findClassNameForMethod?.(method) || null;
+    const directMethodOwner = positionalParentOwner;
     let directPositionalEligible = Boolean(
       directMethodDescriptor &&
       directIntegralTypes.has(directMethodDescriptor.returnType) &&
@@ -4155,7 +4702,7 @@ class JvmSsaBlockRenderer {
           ...directStaticDeclarations,
           ...lazyStaticDeclarations,
           ...directEntryStaticReadDeclarations,
-          ...positionalCallDeclarations,
+          ...directPositionalCallDeclarations,
           directBooleanGuard,
           this.runCountersEnabled
             ? "helpers.structuredSsa.runCount += 1;" : null,
@@ -4182,6 +4729,9 @@ class JvmSsaBlockRenderer {
       let restoringDirectPositionalSource = null;
       let checkedLeafDirectPositionalBody = null;
       let checkedLeafDirectPositionalSource = null;
+      let capturedCheckedLeafDirectPositionalBody = null;
+      let capturedCheckedLeafDirectPositionalSource = null;
+      let capturedCheckedLeafDirectPositionalPlan = null;
       if (restoringDirectPositionalEligible) {
         // A restoring entry is an already-verified synchronous intermethod
         // region. Give it a larger scalar quantum than a scheduler-owned
@@ -4284,13 +4834,13 @@ class JvmSsaBlockRenderer {
         const restoringRenderedTree = inlineRestoringSpillCalls(
           inlineMaterializeCalls(expandContinuationFallbacks(
             render(structured.tree, false, true,
-              restoringDirectSafePointBudget), false)),
+              restoringDirectSafePointBudget, false, true), false)),
         );
         const directBody = [
           ...directStaticDeclarations,
           ...lazyStaticDeclarations,
           ...directEntryStaticReadDeclarations,
-          ...positionalCallDeclarations,
+          ...directPositionalCallDeclarations,
           directBooleanGuard,
           this.runCountersEnabled
             ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
@@ -4410,6 +4960,68 @@ class JvmSsaBlockRenderer {
                   "nestedEntryGuarded"],
                 checkedLeafDirectPositionalSource,
               );
+            const capturedCaches = [...entryStaticReadCaches.values()];
+            if (capturedCaches.length > 0 &&
+                capturedCaches.every((cache) => cache.direct) &&
+                lazyStaticSites.size === 0 &&
+                guardedStaticBooleanSites.size === 0) {
+              const captureArguments = [];
+              const captureDeclarations = [];
+              const captures = [];
+              for (const cache of capturedCaches) {
+                const valueArgument =
+                  `ssaCapturedStatic${captureArguments.length}`;
+                captureArguments.push(valueArgument);
+                captureDeclarations.push(
+                  `const ${cache.value} = ${valueArgument};`);
+                const capture = {
+                  targetId: cache.direct.targetId,
+                  kind: cache.direct.kind,
+                  key: cache.direct.key,
+                  data: Boolean(cache.data),
+                };
+                if (cache.data) {
+                  const dataArgument =
+                    `ssaCapturedStatic${captureArguments.length}`;
+                  captureArguments.push(dataArgument);
+                  captureDeclarations.push(
+                    `const ${cache.data} = ${dataArgument};`);
+                }
+                captures.push(capture);
+              }
+              const capturedBody = [
+                ...captureDeclarations,
+                this.runCountersEnabled
+                  ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
+                `let safePointBudget = ${restoringDirectSafePointBudget};`,
+                ...declaredLocals.map((index) =>
+                  `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
+                    entryLocalInitialValues.has(index)
+                      ? entryLocalInitialValues.get(index)
+                      : entryArguments.get(index) || "undefined"};`),
+                ...entryArrayDataDeclarations,
+                directArrayDataGuard,
+                ...declarations,
+                ...checkedLeafTree,
+              ].filter(Boolean);
+              capturedCheckedLeafDirectPositionalSource = [
+                "'use strict';",
+                restoringInitializationGuardDeclaration,
+                directGuard,
+                ...capturedBody,
+              ].join("\n");
+              capturedCheckedLeafDirectPositionalBody =
+                this.jit.createGeneratedFunction(
+                  method,
+                  "ssa-captured-checked-leaf-positional",
+                  ["helpers", ...argumentNames, ...captureArguments,
+                    "thread", "nestedEntryGuarded"],
+                  capturedCheckedLeafDirectPositionalSource,
+                );
+              capturedCheckedLeafDirectPositionalPlan = {
+                captures,
+              };
+            }
           }
         }
       }
@@ -4593,6 +5205,12 @@ class JvmSsaBlockRenderer {
         checkedLeafDirectPositionalBody;
       generated.jvmCheckedLeafDirectPositionalSource =
         checkedLeafDirectPositionalSource;
+      generated.jvmCapturedCheckedLeafDirectPositionalBody =
+        capturedCheckedLeafDirectPositionalBody;
+      generated.jvmCapturedCheckedLeafDirectPositionalSource =
+        capturedCheckedLeafDirectPositionalSource;
+      generated.jvmCapturedCheckedLeafDirectPositionalPlan =
+        capturedCheckedLeafDirectPositionalPlan;
       generated.jvmAdaptivePositionalBody = adaptivePositionalBody;
       generated.jvmAdaptivePositionalSource = adaptivePositionalSource;
       generated.jvmAdaptivePositionalOrdinary =
@@ -4610,6 +5228,16 @@ class JvmSsaBlockRenderer {
         eliminatedArrayStoreCheckCount;
       generated.jvmStructuredArrayRangeGuardCount =
         arrayRangeCheckCandidates.length;
+      generated.jvmStructuredHoistedArrayRangeGuardCount =
+        hoistedArrayRangeGuardCount;
+      generated.jvmStructuredCoalescedSsaCopyCount =
+        coalescedSsaCopyCount;
+      generated.jvmStructuredDominatedArithmeticGuardCount =
+        dominatedArithmeticGuardCount;
+      generated.jvmStructuredCapturedCheckedLeafCallCount =
+        [...callSites.values()].filter((site) =>
+          Array.isArray(site.directCheckedLeaf?.captures) &&
+          site.directCheckedLeaf.captures.length > 0).length;
       generated.jvmStructuredBoundedIndexRangeCount =
         arrayRangeCheckCandidates.filter(
           (candidate) => candidate.kind === "bounded-index").length;

@@ -2807,6 +2807,10 @@ public final class GenericSpanShape {
       pixels[base + index] = color;
     }
   }
+
+  static void rows(int color) {
+    for (int y = 0; y < 2; y++) span(0, y, 2, color);
+  }
 }
 `);
   const genericJvm = new JVM({ classpath: genericClasspath, jit: {
@@ -2861,6 +2865,30 @@ public final class GenericSpanShape {
   t.notOk(checkedLeafSource.includes('helpers.materialize(') ||
       checkedLeafSource.includes('helpers.arrayStore('),
   'the checked leaf contains no successful-path Frame or array helper');
+  const genericRowsMethod = await genericJvm.findMethodInHierarchy(
+    genericClass, 'rows', '(I)V');
+  const genericRows = genericJvm.jit.structuredSsa.compile(genericRowsMethod);
+  t.equal(genericRows?.jvmStructuredCapturedCheckedLeafCallCount, 1,
+    'a generic caller snapshots one verified checked-child static capture set');
+  t.notOk(genericRows.jvmStructuredContinuation,
+    'captured child statics resume canonically rather than surviving a scheduler slice');
+  const runGenericRows = (color, debug = false) => {
+    const rowsThread = {
+      status: 'runnable', pendingException: null, callStack: new Stack(),
+    };
+    const rowsFrame = new Frame(genericRowsMethod);
+    rowsFrame.className = genericClass;
+    rowsFrame.locals[0] = color;
+    rowsThread.callStack.push(rowsFrame);
+    const result = genericRows(
+      rowsFrame, rowsThread, genericJvm.jit, debug, false);
+    return { result, frame: rowsFrame, thread: rowsThread };
+  };
+  firstStaticPixels.fill(0);
+  runGenericRows(17);
+  t.deepEqual(firstStaticPixels.slice(0, 10),
+    [17, 17, 0, 0, 0, 0, 0, 0, 17, 17],
+    'captured checked child preserves repeated generated caller stores');
   const runGenericSpan = (x, y, count, color, debug = false) => {
     const genericThread = {
       status: 'runnable', pendingException: null, callStack: new Stack(),
@@ -2888,6 +2916,11 @@ public final class GenericSpanShape {
     'entry static cache leaves the previous surface untouched after rebinding');
   t.deepEqual(reboundStaticPixels.slice(8, 12), [0, 0, 22, 22],
     'the next generated entry reloads the rebound static surface');
+  reboundStaticPixels.fill(0);
+  runGenericRows(23);
+  t.deepEqual(reboundStaticPixels.slice(0, 10),
+    [23, 23, 0, 0, 0, 0, 0, 0, 23, 23],
+    'captured child reloads a rebound static surface at the next caller entry');
 
   reboundStaticPixels.fill(0);
   const checkedThread = {
@@ -4789,7 +4822,7 @@ test('structured JVM SSA feeds operand values across block joins', (t) => {
   const method = structuredSsaJoinMethod();
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa, 'verified reducible loop selects the structured SSA renderer');
-  t.ok(generated.jvmStructuredSource.includes('while (true)') &&
+  t.ok(generated.jvmStructuredSource.includes('while (') &&
       !generated.jvmStructuredSource.includes('switch (pc)'),
     'renderer emits lexical JavaScript control flow instead of a bytecode dispatcher');
   t.ok(/ssaStack\d+_0 = ssaValue\d+/.test(generated.jvmStructuredSource),

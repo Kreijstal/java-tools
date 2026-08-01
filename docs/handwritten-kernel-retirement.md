@@ -362,6 +362,60 @@ microbenchmark gaps remain optimizer targets, but the live A/B shows that the
 newly admitted guest bodies—not complete handwritten substitutions—produced
 the large Firefox gain.
 
+## 2026-08-01 parity correction and captured checked leaves
+
+Disabling a handwritten production selector is not the same thing as retiring
+its implementation. The historical files remain required performance oracles
+until the bytecode-derived path is comparably fast for every covered family.
+Exact pixels plus a faster live workload are necessary, but they do not waive
+this per-kernel throughput gate. In particular, the four proxy gaps recorded
+above mean that tiled, perspective, bilinear, and polygon kernels are **not yet
+retired** and must not be deleted.
+
+This continuation reduced generic overhead without recognizing a guest owner
+or member name:
+
+- generated natural counted loops and javac post-decrement loops are rendered
+  as ordinary JavaScript `while` loops rather than infinite loops containing a
+  header branch and explicit continue;
+- nonzero CFG edges remove their dominated `idiv`/`irem` zero check;
+- range analysis hoists fixed, nested-counted, and post-decrement endpoint
+  guards when failure can return to canonical execution before the first guest
+  effect; the retained slow arm still owns exact exception restoration;
+- a verified checked child leaf can publish a second fixed-arity body whose
+  non-volatile static values and raw primitive-array view are supplied by its
+  generated caller. The caller snapshots those locations once per synchronous
+  scheduler slice. A safe point resumes through the canonical frame, so a
+  later slice observes static rebinding. The child keeps its own class,
+  debugger, and range guards and returns to canonical child invocation before
+  its first write when a guard fails.
+
+The captured child removes six static-map reads and one array-view lookup from
+each polygon scanline call. Three clean Node 26.4.0 processes, seven paired
+rounds each, remained checksum exact:
+
+| Family | process paired medians | three-process median | Status |
+| --- | ---: | ---: | --- |
+| tiled blit | 2.816x, 2.824x, 2.893x | **2.824x** | not parity |
+| perspective span | 1.711x, 1.937x, 1.931x | **1.931x** | not parity |
+| bilinear sampler | 1.535x, 1.556x, 1.520x | **1.535x** | not parity |
+| polygon raster | 1.704x, 1.521x, 1.513x | **1.521x** | not parity |
+
+The polygon median improves on the preceding 2.26x result, and perspective
+improves on 2.03x, but neither result satisfies the retirement gate. Firefox
+was intentionally not used as a success claim while the fast Node proxy still
+fails parity. The next work remains method-entry layout proof for cyclic tiled
+rows, whole-span destination/texture preflight for perspective, and a compact
+acyclic exceptional ABI for the one-pixel sampler.
+
+Reproduction base: java-tools
+`ec84410f3d650e6949851f3616b51b0668af6922`, dirty with the generic renderer,
+compiler linkage, proxy, tests, and this documentation update. Command:
+
+```sh
+npm run benchmark:jvm:ssa-kernel-targets
+```
+
 ## Verification
 
 The focused differential checks are:

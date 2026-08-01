@@ -111,6 +111,9 @@ class JitCompiler {
     // argument slicing, and generic call dispatch.
     this.directJreIntrinsics = [];
     this.directSynchronousIntrinsics = [];
+    this.directCheckedLeafBodies = [];
+    this.directCheckedLeafBodyIds = new WeakMap();
+    this.codegenCompiling = new WeakSet();
     // Whole guest algorithms are useful differential oracles, but they are
     // not a compiler tier. Production code must be derived from the loaded
     // bytecode through the generic SSA/block renderer. Keep the historical
@@ -799,6 +802,8 @@ class JitCompiler {
     if (this.codegenCache.has(method)) {
       return this.codegenCache.get(method);
     }
+    if (this.codegenCompiling.has(method)) return null;
+    this.codegenCompiling.add(method);
     try {
       const generated = this.compileMethod(method);
       this.codegenCache.set(method, generated);
@@ -806,6 +811,8 @@ class JitCompiler {
     } catch (err) {
       this.codegenCompileErrors.set(method, err);
       return null;
+    } finally {
+      this.codegenCompiling.delete(method);
     }
   }
 
@@ -4794,6 +4801,13 @@ class JitCompiler {
         generated.jvmCheckedLeafDirectPositionalBody.bind(null, this);
       target.positionalInvoker.jvmDebugGuarded = true;
       target.positionalInvoker.jvmCheckedLeaf = true;
+      // Generated callers already hold the JIT helper object. Expose the raw
+      // fixed-arity body alongside the canonical bound entry so they can call
+      // a normal JavaScript function that optimizing engines may inline. The
+      // bound entry remains the public/cold ABI and preserves existing call
+      // sites. Selection is based solely on the verified checked-leaf shape.
+      target.positionalInvoker.jvmRawInvoke =
+        generated.jvmCheckedLeafDirectPositionalBody;
       return target.positionalInvoker;
     }
     if (typeof generated.jvmRestoringDirectPositionalBody === "function") {
@@ -5210,6 +5224,7 @@ class JitCompiler {
         if (positional && !site.fastPositional) {
           site.fastPositional = {
             invoke: positional,
+            rawInvoke: positional.jvmRawInvoke || null,
             lookupClass,
             receiverType: null,
             debugGuarded: positional.jvmDebugGuarded === true,
@@ -5235,6 +5250,7 @@ class JitCompiler {
         if (positional && !site.fastPositional) {
           site.fastPositional = {
             invoke: positional,
+            rawInvoke: positional.jvmRawInvoke || null,
             lookupClass,
             receiverType: null,
             debugGuarded: positional.jvmDebugGuarded === true,
@@ -5258,6 +5274,7 @@ class JitCompiler {
         if (direct && !site.fastPositional) {
           site.fastPositional = {
             invoke: direct,
+            rawInvoke: direct.jvmRawInvoke || null,
             lookupClass,
             receiverType: targetClassName,
             debugGuarded: direct.jvmDebugGuarded === true,
@@ -7235,6 +7252,43 @@ class JitCompiler {
     const plan = this.getInlineIntegerPlan(method, params, returnType);
     if (!plan || plan.receiverSlots) return null;
     return { statements: plan.statements, result: plan.result, paramCount: params.length };
+  }
+
+  getCompileTimeCheckedLeaf(instruction) {
+    if (!this.checkedLeafDirectPositionalEnabled || !instruction ||
+        !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+      return null;
+    }
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    const parsed = parseDescriptor(descriptor);
+    const generated = this.getGeneratedFunction(method);
+    const capturedBody =
+      generated?.jvmCapturedCheckedLeafDirectPositionalBody;
+    const capturedPlan =
+      generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
+    const body = typeof capturedBody === "function"
+      ? capturedBody : generated?.jvmCheckedLeafDirectPositionalBody;
+    if (typeof body !== "function") return null;
+    let id = this.directCheckedLeafBodyIds.get(body);
+    if (!Number.isInteger(id)) {
+      id = this.directCheckedLeafBodies.length;
+      this.directCheckedLeafBodies.push(body);
+      this.directCheckedLeafBodyIds.set(body, id);
+    }
+    return {
+      id,
+      paramCount: parsed.params.length,
+      returnsVoid: parsed.returnType === "void",
+      captures: typeof capturedBody === "function" &&
+        Array.isArray(capturedPlan?.captures)
+        ? capturedPlan.captures : [],
+    };
   }
 
   getCompileTimeSynchronousIntrinsic(instruction) {

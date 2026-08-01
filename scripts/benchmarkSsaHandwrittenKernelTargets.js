@@ -357,13 +357,13 @@ function runPolygonOracle(destination, vertices, color) {
       },
     }, 96);
 
-    const bilinear = compileBody(runtime, 'bilinearSample', '(IIIII)V');
     const bilinearSource = intArray(64 * 64, index =>
       index % 11 === 0 ? 0 : Math.imul(index + 5, 0x10101));
     const bilinearGenericDestination = intArray(64, () => 0);
     const bilinearOracleDestination = intArray(64, () => 0);
     runtime.classData.staticFields.set(
       'bilinearDestination:[I', bilinearGenericDestination);
+    const bilinear = compileBody(runtime, 'bilinearSample', '(IIIII)V');
     const receiver = {
       type: className,
       fields: {
@@ -395,10 +395,6 @@ function runPolygonOracle(destination, vertices, color) {
       },
     }, 1);
 
-    // Compile the ordinary child first so the caller can link its positional
-    // generated entry without depending on a warm interpreter invocation.
-    compileBody(runtime, 'polygonSpan', '(IIII)V');
-    const polygon = compileBody(runtime, 'polygonFill', '([II)V');
     const polygonGenericDestination = intArray(64 * 64, () => 0);
     const polygonOracleDestination = intArray(64 * 64, () => 0);
     runtime.classData.staticFields.set(
@@ -409,6 +405,14 @@ function runPolygonOracle(destination, vertices, color) {
     runtime.classData.staticFields.set('polygonClipRight:I', 64);
     runtime.classData.staticFields.set('polygonClipTop:I', 0);
     runtime.classData.staticFields.set('polygonClipBottom:I', 64);
+    // Measure the steady-state initialized shape. The previous ordering
+    // compiled these methods before installing their static field values,
+    // permanently benchmarking first-link fallback branches that neither the
+    // handwritten implementation nor a warmed application retains.
+    // Compile the ordinary child first so the caller can link its positional
+    // generated entry without depending on a warm interpreter invocation.
+    compileBody(runtime, 'polygonSpan', '(IIII)V');
+    const polygon = compileBody(runtime, 'polygonFill', '([II)V');
     const polygonCases = Array.from({ length: 64 }, (_unused, item) =>
       intArray(12, index => {
         const shape = [
@@ -460,6 +464,14 @@ function runPolygonOracle(destination, vertices, color) {
         cyclicRanges: result.generated.jvmStructuredCyclicRangeCount,
         specializedRangeAccesses:
           result.generated.jvmStructuredSpecializedArrayRangeAccessCount,
+        hoistedRangeGuards:
+          result.generated.jvmStructuredHoistedArrayRangeGuardCount,
+        coalescedSsaCopies:
+          result.generated.jvmStructuredCoalescedSsaCopyCount,
+        dominatedArithmeticGuards:
+          result.generated.jvmStructuredDominatedArithmeticGuardCount,
+        capturedCheckedLeafCalls:
+          result.generated.jvmStructuredCapturedCheckedLeafCallCount,
         fieldReadCaches: result.generated.jvmStructuredFieldReadCacheCount,
         coarseLoops: result.generated.jvmStructuredCoarseCountedLoopCount,
         handwrittenInstalled: Boolean(
