@@ -386,6 +386,19 @@ class JvmSsaBlockRenderer {
     return [frame, locals, stack];
   }
 
+  materializeDirectFrame(layoutId, plan, thread, restorationDepth, frame,
+    values, pc, operands) {
+    const state = this.restoreDirectFrame(
+      layoutId, plan, thread, restorationDepth, frame, values);
+    const stack = state[2];
+    stack.length = operands.length;
+    for (let index = 0; index < operands.length; index += 1) {
+      stack[index] = operands[index];
+    }
+    this.jit.materialize(state[0], state[1], stack, pc);
+    return state;
+  }
+
   compile(method) {
     this.lastCompileError = null;
     this.lastRejectionReason = null;
@@ -6165,6 +6178,7 @@ class JvmSsaBlockRenderer {
       let restoringSpillInlineCost = 0;
       let inlinedRestoringSpills = false;
       let captureFreeRestoringSpills = false;
+      let outlinedCaptureFreeRestoringSpills = false;
       if (restoringDirectPositionalEligible) {
         // A restoring entry is an already-verified synchronous intermethod
         // region. Give it a larger scalar quantum than a scheduler-owned
@@ -6247,12 +6261,13 @@ class JvmSsaBlockRenderer {
               ? entryLocalInitialValues.get(index) : `local${index}`};`),
           "plan.restoreFrame(thread, frame, restorationDepth);",
         ];
-        const restoringRenderedWithSpills = inlineMaterializeCalls(
-          expandContinuationFallbacks(
-            render(structured.tree, false, true,
-              restoringDirectSafePointBudget, false, true), false));
-        restoringSpillCallCount = restoringRenderedWithSpills.reduce(
-          (count, line) => count + (/spillLocals\(\);$/.test(line) ? 1 : 0), 0);
+        const restoringRendered = expandContinuationFallbacks(
+          render(structured.tree, false, true,
+            restoringDirectSafePointBudget, false, true), false);
+        restoringSpillCallCount = restoringRendered.reduce(
+          (count, line) => count +
+            (/spillLocals\(\);$/.test(line) ||
+             /^\s*ssaMaterialize\d+\(.*\);$/.test(line) ? 1 : 0), 0);
         // Outlining a spill helper makes every scalar local escape into its
         // closure context, including successful loop iterations that never
         // reconstruct a Frame. Duplicate the cold restoration statements
@@ -6267,8 +6282,15 @@ class JvmSsaBlockRenderer {
           this.loopInlineRestoringSpillsEnabled &&
             structured.loopHeaders.size > 0 && spillSlots.length <= 48 &&
             restoringSpillInlineCost <= this.loopInlineRestoringSpillBudget;
-        captureFreeRestoringSpills = inlinedRestoringSpills &&
-          structured.loopHeaders.size > 0;
+        outlinedCaptureFreeRestoringSpills =
+          this.loopInlineRestoringSpillsEnabled &&
+          structured.loopHeaders.size > 0 && spillSlots.length <= 48 &&
+          restoringSpillCallCount > 0 && !inlinedRestoringSpills;
+        captureFreeRestoringSpills = structured.loopHeaders.size > 0 &&
+          (inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills);
+        const restoringRenderedWithSpills =
+          outlinedCaptureFreeRestoringSpills
+            ? restoringRendered : inlineMaterializeCalls(restoringRendered);
         const restoringFrameSlots = captureFreeRestoringSpills
           ? [...entryArguments.keys(), ...spillSlots] : [];
         const restoringFrameValues = captureFreeRestoringSpills
@@ -6289,7 +6311,8 @@ class JvmSsaBlockRenderer {
           `${indentation}stack = ssaRestoringFrameState[2];`,
         ];
         const inlineRestoringSpillCalls = (lines) =>
-          !inlinedRestoringSpills ? lines : lines.flatMap((line) => {
+          !(inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills)
+            ? lines : lines.flatMap((line) => {
             const conditional = /^(\s*)if \(frame === null\) spillLocals\(\);$/.exec(line);
             if (conditional) {
               if (captureFreeRestoringSpills) {
@@ -6315,6 +6338,27 @@ class JvmSsaBlockRenderer {
           });
         let restoringRenderedTree = inlineRestoringSpillCalls(
           restoringRenderedWithSpills);
+        if (outlinedCaptureFreeRestoringSpills) {
+          restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
+            const match = /^(\s*)ssaMaterialize(\d+)\((.*)\);$/.exec(line);
+            if (!match) return [line];
+            const depth = Number(match[2]);
+            const values = match[3].split(",").map((value) => value.trim());
+            if (values.length !== depth + 1) return [line];
+            const [pc, ...operands] = values;
+            const indentation = match[1];
+            return [
+              `${indentation}ssaRestoringFrameState = ` +
+                `helpers.structuredSsa.materializeDirectFrame(` +
+                `${restoringFrameLayoutId}, plan, thread, restorationDepth, ` +
+                `frame, [${restoringFrameValues.join(", ")}], ${pc}, ` +
+                `[${operands.join(", ")}]);`,
+              `${indentation}frame = ssaRestoringFrameState[0];`,
+              `${indentation}locals = ssaRestoringFrameState[1];`,
+              `${indentation}stack = ssaRestoringFrameState[2];`,
+            ];
+          });
+        }
         if (restoringDirectFieldLayoutSlots.size) {
           restoringRenderedTree = (() => {
             const lines = [...restoringRenderedTree];
@@ -6357,7 +6401,8 @@ class JvmSsaBlockRenderer {
           directArrayDataGuard,
           captureFreeRestoringSpills
             ? "let ssaRestoringFrameState = null;" : null,
-          ...(inlinedRestoringSpills ? [] : [
+          ...(inlinedRestoringSpills || outlinedCaptureFreeRestoringSpills
+            ? [] : [
             "function spillLocals() {",
             ...restoringSpillLines.map((line) => `  ${line}`),
             "}",
@@ -6937,6 +6982,8 @@ class JvmSsaBlockRenderer {
         inlinedRestoringSpills;
       generated.jvmStructuredCaptureFreeRestoringSpills =
         captureFreeRestoringSpills;
+      generated.jvmStructuredOutlinedCaptureFreeRestoringSpills =
+        outlinedCaptureFreeRestoringSpills;
       generated.jvmStructuredEagerFieldReceiverNullCheckCount =
         eagerFieldReceiverNullChecks.size;
       generated.jvmStructuredRangeGuardDataVariableCount =

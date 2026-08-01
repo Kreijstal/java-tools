@@ -2221,6 +2221,121 @@ public final class ArbitraryDirectArrayLoop {
     t.end();
   });
 
+test('large restoring loops outline capture-free exception materialization',
+  async (t) => {
+    const className = 'ArbitraryOutlinedDirectArrayLoop';
+    const classpath = compileJavaFixture(t, className, `
+public final class ArbitraryOutlinedDirectArrayLoop {
+  private static int transform(int value) {
+    return (value * 13 + 7) & 255;
+  }
+
+  private static void store(int[] destination, int index, int value) {
+    destination[index] = value;
+  }
+
+  private static void fill(int[] destination, int start, int count, int seed) {
+    for (int index = 0; index < count; index++) {
+      store(destination, start + index, transform(seed + index));
+    }
+  }
+
+  static void invoke(int[] destination, int start, int count, int seed) {
+    fill(destination, start, count, seed);
+  }
+}
+`);
+    const jvm = new JVM({ classpath, jit: {
+      warmupThreshold: 0,
+      profileMethods: false,
+      preferWholeMethodJs: true,
+      structuredSsa: true,
+      structuredLoopInlineRestoringSpillBudget: 0,
+    } });
+    await jvm.loadClassByName(className);
+    jvm.classInitializationState.set(className, 'INITIALIZED');
+    const caller = await jvm.findMethodInHierarchy(
+      className, 'invoke', '([IIII)V');
+    const child = await jvm.findMethodInHierarchy(
+      className, 'fill', '([IIII)V');
+    const leaf = await jvm.findMethodInHierarchy(
+      className, 'store', '([III)V');
+    const generated = jvm.jit.structuredSsa.compile(caller);
+
+    const execute = (destination, start, count, seed) => {
+      const frame = new Frame(caller);
+      frame.className = className;
+      frame.locals.splice(0, 4, destination, start, count, seed);
+      const thread = {
+        id: 0,
+        name: 'outlined-direct-array-loop-test',
+        status: 'runnable',
+        pendingException: null,
+        callStack: new Stack(),
+      };
+      thread.callStack.push(frame);
+      let error;
+      try {
+        generated(frame, thread, jvm.jit, false);
+      } catch (thrown) {
+        error = thrown;
+      }
+      return { thread, error };
+    };
+
+    const destination = new Array(16).fill(-1);
+    destination.type = '[I';
+    execute(destination, 2, 6, 10);
+    const site = jvm.jit.syncCallSites.find((candidate) =>
+      candidate?.methodName === 'fill' && candidate.fastStaticTarget);
+    const target = site?.fastStaticTarget;
+    t.ok(target?.generated?.jvmRestoringDirectPositionalBody,
+      'the arbitrary child publishes a restoring positional body');
+    t.equal(target.generated.jvmStructuredInlinedRestoringSpills, false,
+      'the zero inline budget keeps large cold materialization out of the body');
+    t.equal(target.generated.jvmStructuredOutlinedCaptureFreeRestoringSpills,
+      true, 'the generic spill-cost decision selects the outlined helper');
+    t.equal(target.generated.jvmStructuredCaptureFreeRestoringSpills, true,
+      'the outlined body keeps successful scalar locals out of a closure');
+    t.ok(target.generated.jvmRestoringDirectPositionalSource.includes(
+      'materializeDirectFrame('),
+    'throwing operations call the capture-free materialization helper');
+    t.notOk(target.generated.jvmRestoringDirectPositionalSource.includes(
+      'function spillLocals()'),
+    'the successful loop contains no local-capturing spill closure');
+
+    const bounds = execute(destination, 15, 2, 40);
+    t.equal(bounds.error?.type, 'java/lang/ArrayIndexOutOfBoundsException',
+      'the outlined path preserves the Java bounds exception');
+    t.equal(bounds.thread.callStack.size(), 3,
+      'both omitted child Frames are reconstructed exactly once');
+    const restoredOuter = bounds.thread.callStack.items[1];
+    const restored = bounds.thread.callStack.peek();
+    const childItems = jvm.jit.getCodeItems(child);
+    const invokePc = childItems.findIndex((item) =>
+      item.instruction?.op === 'invokestatic' &&
+      item.instruction.arg?.[2]?.[0] === 'store');
+    t.equal(restoredOuter.method, child,
+      'the outer reconstructed Frame retains the loop method');
+    t.equal(restoredOuter.pc, invokePc,
+      'the outer reconstructed Frame retains the exact invoke PC');
+    t.deepEqual(restoredOuter.locals.slice(0, 5),
+      [destination, 15, 2, 40, 1],
+    'the outer reconstructed Frame retains its exact live locals');
+    const leafItems = jvm.jit.getCodeItems(leaf);
+    const storePc = leafItems.findIndex((item) =>
+      (item.instruction?.op || item.instruction) === 'iastore');
+    t.equal(restored.method, leaf,
+      'the reconstructed Frame retains the throwing method');
+    t.equal(restored.pc, storePc,
+      'the reconstructed Frame retains the exact throwing bytecode PC');
+    t.deepEqual(restored.locals.slice(0, 3), [destination, 16, 28],
+      'the reconstructed Frame retains its exact live locals');
+    t.deepEqual(restored.stack.items, [destination, 16, 28],
+      'the reconstructed Frame retains the exact throwing operands');
+    t.end();
+  });
+
 test('reference-parameter array loops use the generic restoring positional ABI',
   async (t) => {
     const className = 'ArbitraryReferenceArrayLoop';
