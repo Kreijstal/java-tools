@@ -7,6 +7,8 @@ const {
 } = require("../decompiler/structurer");
 const { splitIrreducibleTerms } = require("../decompiler/exceptionStructurer");
 const { parseDescriptor } = require("../parsing/typeParser");
+const { buildSsa } = require("../analysis/opgraph/ssa");
+const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const HandwrittenBilinearSampler = require("./HandwrittenBilinearSampler");
 const STRUCTURED_CONTINUATION = Symbol("jvm.structuredSsaContinuation");
 
@@ -453,6 +455,25 @@ class JvmSsaBlockRenderer {
     });
     const depths = this.jit.computeStackDepths(items, labels, method);
     if (!depths) return reject("operand-stack verification failed");
+    let verifiedStackWidthsBefore = null;
+    if (items.some((item) => {
+      const instruction = item?.instruction;
+      return (typeof instruction === "string"
+        ? instruction.trim().split(/\s+/)[0] : instruction?.op) === "dup2";
+    })) {
+      const analysis = buildSsa({
+        codeItems: items,
+        exceptionTable: code.code.exceptionTable || [],
+        method,
+      });
+      if (!analysis || analysis.rejected || !analysis.stackKindsBefore) {
+        return reject("operand category verification failed");
+      }
+      verifiedStackWidthsBefore = new Map();
+      for (const [index, kinds] of analysis.stackKindsBefore) {
+        verifiedStackWidthsBefore.set(index, kinds.map(kindWidth));
+      }
+    }
     let prunedBooleanCfgBranches = 0;
     const prunedBooleanBranchTargets = new Map();
     const prunedBooleanReadIndexes = new Set();
@@ -1687,6 +1708,23 @@ class JvmSsaBlockRenderer {
         if (this.localValueNumberingEnabled) localValues[slot] = out;
         return out;
       };
+      const copyValueMetadata = (source, target) => {
+        if (arrayViews.has(source)) {
+          arrayViews.set(target, arrayViews.get(source));
+        }
+        if (arrayKinds.has(source)) {
+          arrayKinds.set(target, arrayKinds.get(source));
+        }
+        if (integerOrigins.has(source)) {
+          integerOrigins.set(target, integerOrigins.get(source));
+        }
+        if (localLoads.has(source)) {
+          localLoads.set(target, localLoads.get(source));
+        }
+        if (entryReferenceLoads.has(source)) {
+          entryReferenceLoads.set(target, entryReferenceLoads.get(source));
+        }
+      };
       let condition = null;
       let conditionConstant = null;
       let returnKind = null;
@@ -1944,8 +1982,7 @@ class JvmSsaBlockRenderer {
             const out = value();
             lines.push(`const ${out} = ${input};`);
             stack.push(out, out);
-            if (arrayViews.has(input)) arrayViews.set(out, arrayViews.get(input));
-            if (arrayKinds.has(input)) arrayKinds.set(out, arrayKinds.get(input));
+            copyValueMetadata(input, out);
           }
         } else if (op === "dup2") {
           // The interpreter and generated tiers treat dup2 as the two
@@ -1955,11 +1992,21 @@ class JvmSsaBlockRenderer {
           if (topInput === null || underInput === null) valid = false;
           else {
             const top = value(), under = value();
-            lines.push(`const ${top} = ${topInput};`, `const ${under} = ${underInput};`,
-              `if (typeof ${top} === "bigint") {`,
-              ...materializeLines([...stack, under, top], index).map((line) => `  ${line}`),
-              "  helpers.skipJitOnce(frame);",
-              "  return { deopt: true, transient: true, reason: 'category-2 dup2 in structured SSA' };", "}");
+            const widths = verifiedStackWidthsBefore?.get(index) || [];
+            const categoryOnePair = widths.length >= 2 &&
+              widths.at(-1) === 1 && widths.at(-2) === 1;
+            lines.push(`const ${top} = ${topInput};`,
+              `const ${under} = ${underInput};`);
+            if (!categoryOnePair) {
+              lines.push(`if (typeof ${top} === "bigint") {`,
+                ...materializeLines([...stack, under, top], index)
+                  .map((line) => `  ${line}`),
+                "  helpers.skipJitOnce(frame);",
+                "  return { deopt: true, transient: true, " +
+                  "reason: 'category-2 dup2 in structured SSA' };", "}");
+            }
+            copyValueMetadata(topInput, top);
+            copyValueMetadata(underInput, under);
             stack.push(under, top, under, top);
           }
         } else if (op === "pop") {
@@ -7273,6 +7320,7 @@ class JvmSsaBlockRenderer {
             line.includes("helpers.materialize(") ||
             line.includes("helpers.arrayLoad(") ||
             line.includes("helpers.arrayStore(") ||
+            line.includes("__SSA_PRIMITIVE_ARRAY_ACCESS_") ||
             line.includes("throw ") || line.includes("try {"));
           if (!unsafeCheckedLeafLine) {
             checkedLeafDirectPositionalSource = [

@@ -10222,6 +10222,58 @@ public final class GeneratedDup2X2Harness {
   t.end();
 });
 
+test('structured SSA preserves verified category-one dup2 aliases', async (t) => {
+  const classpath = compileJavaFixture(t, 'RenamedDup2AliasHarness', `
+public final class RenamedDup2AliasHarness {
+  static void change(int[] values, int delta) {
+    for (int index = 0; index < values.length; index++) {
+      values[index] += delta;
+    }
+  }
+}
+`);
+  const jvm = new JVM({
+    classpath,
+    jit: {
+      warmupThreshold: 0,
+      structuredSsa: true,
+      preferWholeMethodJs: true,
+      profileMethods: true,
+    },
+  });
+  await jvm.loadClassByName('RenamedDup2AliasHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'RenamedDup2AliasHarness', 'change', '([II)V');
+  const ops = jvm.jit.getCodeItems(method)
+    .map((item) => typeof item.instruction === 'string'
+      ? item.instruction : item.instruction && item.instruction.op);
+  t.ok(ops.includes('dup2'),
+    'the renamed javac fixture contains a category-one dup2 pair');
+
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the arbitrary bytecode shape selects the generic structured tier: ' +
+      jvm.jit.structuredSsa.lastRejectionReason);
+  t.notOk(generated.jvmStructuredSource.includes('category-2 dup2'),
+    'verifier widths remove the runtime BigInt category test');
+
+  const values = [41, 7];
+  values.type = '[I';
+  const thread = {
+    id: 0, name: 'renamed-dup2-alias', callStack: new Stack(),
+    status: 'runnable', pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  await invoke(jvm, thread, 'RenamedDup2AliasHarness', 'change',
+    '([II)V', [values, 1]);
+  t.equal(values[0], 42,
+    'duplicated array and index aliases retain the exact update semantics');
+  t.equal(values[1], 8,
+    'every loop iteration updates its selected array element once');
+  t.end();
+});
+
 test('generated post-increment helpers preserve nearby call paths', async (t) => {
   const classpath = compileJavaFixture(t, 'GeneratedPostIncrementCallHarness', `
 public class GeneratedPostIncrementCallHarness {
