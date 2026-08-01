@@ -1139,6 +1139,7 @@ class JvmSsaBlockRenderer {
       [...entryStaticReadCaches.values()]
         .map((cache) => cache.data).filter(Boolean));
     const entryStaticArrayLocalViews = new Map();
+    const entryStaticArrayLocalInitializers = new Map();
     if ((code.code.exceptionTable || []).length === 0) {
       const entryItems = new Set(cfg.blocks[cfg.entry]?.insns || []);
       const cfgPredecessors = cfg.blocks.map(() => []);
@@ -1196,6 +1197,10 @@ class JvmSsaBlockRenderer {
           data: cache.data,
           descriptor: cache.descriptor,
           blocks: loopBlocks,
+        });
+        entryStaticArrayLocalInitializers.set(slot, {
+          value: cache.value,
+          storeIndex: index + 1,
         });
       }
     }
@@ -1322,6 +1327,16 @@ class JvmSsaBlockRenderer {
         }
         break;
       }
+    }
+    // The entry-static proof above establishes a unique astore and an
+    // already-initialized, entry-cached source. Generated entries reject null
+    // array parameters and unresolved classes before executing the body, so
+    // this copy is observationally identical when placed in the scalar local
+    // declaration. Treat it as an immutable entry value instead of carrying
+    // a mutable JVM-local alias through every later loop.
+    for (const [slot, initializer] of entryStaticArrayLocalInitializers) {
+      entryLocalInitialValues.set(slot, initializer.value);
+      foldedEntryStoreIndexes.add(initializer.storeIndex);
     }
     // Forward must-facts for local integer comparisons. This proves common
     // guarded divisions such as `(y - y0) * dx / (y1 - y0)`: either side of
@@ -5713,7 +5728,7 @@ class JvmSsaBlockRenderer {
         ];
         const polledLoop = [
           `${node.label}: while (${countedLoop
-            ? countedLoop.condition : "true"}) {`,
+              ? countedLoop.condition : "true"}) {`,
           ...(coarse ? [] : [
             `  if (${runtimeCoarse
               ? `!${runtimeCoarse.variable} && ` : ""}` +
@@ -6233,11 +6248,28 @@ class JvmSsaBlockRenderer {
       const assignment = /\blocal(\d+)\s*=/.exec(line);
       if (assignment) renderedAssignedLocalSlots.add(Number(assignment[1]));
     }
+    // Lexically inlined checked leaves deliberately reuse compact localN
+    // names inside their own block scope. Reading assignments back from the
+    // rendered text therefore confuses child locals with the caller's JVM
+    // slots. Derive caller mutability from its verified bytecodes instead;
+    // folded entry stores already live in the declaration and are excluded.
+    const callerAssignedLocalSlots = new Set();
+    for (let index = 0; index < items.length; index += 1) {
+      if (!normalReachableItems.has(index) ||
+          foldedEntryStoreIndexes.has(index)) continue;
+      const instruction = items[index]?.instruction;
+      const op = opOf(instruction);
+      const slot = op === "iinc"
+        ? Number(instruction.varnum ?? instruction.arg)
+        : /^[adfil]store(?:_[0-3])?$/.test(op || "")
+          ? localIndex(instruction, op) : null;
+      if (Number.isInteger(slot)) callerAssignedLocalSlots.add(slot);
+    }
     const declaredLocals = [...renderedLocalSlots].sort((a, b) => a - b);
     const immutableEntryLocals = new Set([...entryLocalInitialValues.keys()]
-      .filter((slot) => !renderedAssignedLocalSlots.has(slot)));
+      .filter((slot) => !callerAssignedLocalSlots.has(slot)));
     const spillSlots = [...new Set([
-      ...entryLocalInitialValues.keys(), ...renderedAssignedLocalSlots,
+      ...entryLocalInitialValues.keys(), ...callerAssignedLocalSlots,
     ])].sort((a, b) => a - b);
     const renderedTreeSource = renderedTree.join("\n");
     const entryArrayDataDeclarations = [...entryArrayLocalSlots]
@@ -6481,8 +6513,29 @@ class JvmSsaBlockRenderer {
       sourceLines, checkedLeafSemantics = true,
     ) => {
       let lines = [...sourceLines];
+      const inlineCheckedLeafLineIndexes = () => {
+        const indexes = new Set();
+        let depth = 0;
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index];
+          if (depth === 0 &&
+              /^\s*ssaInlineCheckedLeaf\d+: \{$/.test(line)) {
+            depth = 1;
+            indexes.add(index);
+            continue;
+          }
+          if (depth === 0) continue;
+          indexes.add(index);
+          depth += (line.match(/\{/g) || []).length -
+            (line.match(/\}/g) || []).length;
+        }
+        return indexes;
+      };
+      const initialInlineIndexes = inlineCheckedLeafLineIndexes();
       const selfRecursiveProtectedValues = new Set(lines
-        .filter((line) => line.includes("__SSA_SELF_RECURSIVE_CALL_"))
+        .filter((line, index) =>
+          line.includes("__SSA_SELF_RECURSIVE_CALL_") ||
+          initialInlineIndexes.has(index))
         .flatMap((line) => [...line.matchAll(/\bssaValue\d+\b/g)]
           .map((match) => match[0])));
       // Restoring bodies expose the coarse-loop and range predicates as
@@ -6508,9 +6561,13 @@ class JvmSsaBlockRenderer {
       // snapshots, they do not need a distinct SSA register.
       const aliases = new Map();
       const removedAliases = new Set();
+      const aliasInlineIndexes = inlineCheckedLeafLineIndexes();
       for (let index = 0; index < lines.length; index += 1) {
+        if (aliasInlineIndexes.has(index)) continue;
         const match = /^\s*const (ssaValue\d+) = local(\d+);$/.exec(lines[index]);
-        if (!match || renderedAssignedLocalSlots.has(Number(match[2]))) {
+        const assignedLocals = checkedLeafSemantics
+          ? renderedAssignedLocalSlots : callerAssignedLocalSlots;
+        if (!match || assignedLocals.has(Number(match[2]))) {
           continue;
         }
         if (selfRecursiveProtectedValues.has(match[1])) continue;
@@ -6518,10 +6575,12 @@ class JvmSsaBlockRenderer {
         removedAliases.add(index);
       }
       if (aliases.size) {
+        const replacementInlineIndexes = inlineCheckedLeafLineIndexes();
         lines = lines
-          .filter((_line, index) => !removedAliases.has(index))
-          .map((line) => line.replace(/\bssaValue\d+\b/g,
-            (name) => aliases.get(name) || name));
+          .map((line, index) => replacementInlineIndexes.has(index)
+            ? line : line.replace(/\bssaValue\d+\b/g,
+              (name) => aliases.get(name) || name))
+          .filter((_line, index) => !removedAliases.has(index));
       }
 
       // Inline one-use pure arithmetic snapshots when none of the referenced
@@ -6530,9 +6589,11 @@ class JvmSsaBlockRenderer {
       // proven raw store in a checked leaf.
       for (;;) {
         const counts = occurrenceCounts();
+        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let declarationIndex = 0;
           declarationIndex < lines.length; declarationIndex += 1) {
+          if (inlineIndexes.has(declarationIndex)) continue;
           const declaration =
             new RegExp(`^(\\s*)const (${compactTemporaryPattern}) = (.+);$`)
               .exec(lines[declarationIndex]);
@@ -6545,7 +6606,7 @@ class JvmSsaBlockRenderer {
             useIndex = index;
             break;
           }
-          if (useIndex < 0) continue;
+          if (useIndex < 0 || inlineIndexes.has(useIndex)) continue;
           const rawArrayLoad = /ssaEntry(?:Array|StaticArray)Data\d+\[/.test(
             declaration[3]);
           const immediateRawStore = rawArrayLoad &&
@@ -6576,8 +6637,10 @@ class JvmSsaBlockRenderer {
       // access, but avoid a second one-use SSA register for the new value.
       for (;;) {
         const counts = occurrenceCounts();
+        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let index = 0; index + 1 < lines.length; index += 1) {
+          if (inlineIndexes.has(index) || inlineIndexes.has(index + 1)) continue;
           const declaration = /^(\s*)const (ssaValue\d+) = (.+);$/.exec(lines[index]);
           if (!declaration || counts.get(declaration[2]) !== 2) continue;
           const assignment = new RegExp(
@@ -6598,8 +6661,11 @@ class JvmSsaBlockRenderer {
       // Render it as a direct local update and compare the updated local.
       for (;;) {
         const counts = occurrenceCounts();
+        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let index = 0; index + 2 < lines.length; index += 1) {
+          if (inlineIndexes.has(index) || inlineIndexes.has(index + 1) ||
+              inlineIndexes.has(index + 2)) continue;
           const next = /^(\s*)const (ssaValue\d+) = (.+);$/.exec(lines[index]);
           if (!next || counts.get(next[2]) !== 3) continue;
           const assignment = new RegExp(
@@ -6622,8 +6688,10 @@ class JvmSsaBlockRenderer {
       // identical and exposes a conventional induction variable to the host.
       for (;;) {
         const counts = occurrenceCounts();
+        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let index = 0; index + 1 < lines.length; index += 1) {
+          if (inlineIndexes.has(index) || inlineIndexes.has(index + 1)) continue;
           const snapshot =
             /^(\s*)const (ssaValue\d+) = (local\d+);$/.exec(lines[index]);
           if (!snapshot || counts.get(snapshot[2]) !== 2) continue;
@@ -6646,9 +6714,11 @@ class JvmSsaBlockRenderer {
       // bytecode/register pair without moving the potentially throwing load.
       for (;;) {
         const counts = occurrenceCounts();
+        const inlineIndexes = inlineCheckedLeafLineIndexes();
         let changed = false;
         for (let declarationIndex = 0;
           declarationIndex < lines.length; declarationIndex += 1) {
+          if (inlineIndexes.has(declarationIndex)) continue;
           const declaration =
             /^\s*let (ssaValue\d+);$/.exec(lines[declarationIndex]);
           if (!declaration || counts.get(declaration[1]) !== 3) continue;
@@ -6658,7 +6728,8 @@ class JvmSsaBlockRenderer {
           for (let index = declarationIndex + 1; index < lines.length; index += 1) {
             if (assignmentPattern.test(lines[index])) assignmentIndexes.push(index);
           }
-          if (assignmentIndexes.length !== 1) continue;
+          if (assignmentIndexes.length !== 1 ||
+              inlineIndexes.has(assignmentIndexes[0])) continue;
           const assignment = assignmentPattern.exec(lines[assignmentIndexes[0]]);
           lines[declarationIndex] = '';
           lines[assignmentIndexes[0]] =
@@ -6734,8 +6805,10 @@ class JvmSsaBlockRenderer {
       // checked-leaf rewrites above.
       for (;;) {
         const counts = occurrenceCounts();
+        const inlineIndexes = inlineCheckedLeafLineIndexes();
         const previousLength = lines.length;
-        lines = lines.filter((line) => {
+        lines = lines.filter((line, index) => {
+          if (inlineIndexes.has(index)) return true;
           const declaration = /^\s*const (ssaValue\d+) = (.+);$/.exec(line);
           return !declaration || counts.get(declaration[1]) !== 1 ||
             /\bhelpers\.|\bnew\b|\[[^\]]+\]/.test(declaration[2]);
