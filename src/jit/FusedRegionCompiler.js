@@ -5,6 +5,63 @@ const HandwrittenFusedFlat = require("./HandwrittenFusedFlat");
 
 const BAILOUT = Symbol("jit.fused.bailout");
 
+// Emit the already verified scanline bytecode directly into a raster body.
+// This is used only by a trusted raster entered after the wrapper has proved
+// the complete destination/row layout. The plan contains parameter roles
+// derived from bytecode data flow; no owner, method, or descriptor identity
+// participates in the decision.
+function emitTrustedScanline(plan, args, temp) {
+  if (!plan || String(args[plan.tag]).trim() !== String(plan.tagValue)) {
+    return null;
+  }
+  const index = temp();
+  const count = temp();
+  const dest = temp();
+  const lines = [
+    "{",
+    `let ${index}=(${args[plan.index]})|0;`,
+    `const ${count}=(${args[plan.count]})|0;`,
+    `const ${dest}=${args[plan.array]};`,
+    `if(${count}>0){`,
+  ];
+  if (plan.kind === "packed-color") {
+    const colors = plan.accumulators.map(() => temp());
+    const steps = plan.steps.map(() => temp());
+    const offset = temp();
+    lines.push(
+      `let ${colors[0]}=(${args[plan.accumulators[0]]})|0;`,
+      `let ${colors[1]}=(${args[plan.accumulators[1]]})|0;`,
+      `let ${colors[2]}=(${args[plan.accumulators[2]]})|0;`,
+      `const ${steps[0]}=(${args[plan.steps[0]]})|0;`,
+      `const ${steps[1]}=(${args[plan.steps[1]]})|0;`,
+      `const ${steps[2]}=(${args[plan.steps[2]]})|0;`,
+      `for(let ${offset}=0;${offset}<${count};${offset}+=1){`,
+      `${dest}[${index}]=(((${dest}[${index}]>>1)&8355711)+` +
+        `((${colors[0]}>>9)&65280)+((${colors[1]}>>1)&16711680)+` +
+        `((${colors[2]}>>17)&255))|0;`,
+      `${index}=(${index}+1)|0;`,
+      `${colors[0]}=(${colors[0]}+${steps[0]})|0;`,
+      `${colors[1]}=(${colors[1]}+${steps[1]})|0;`,
+      `${colors[2]}=(${colors[2]}+${steps[2]})|0;`,
+      "}",
+    );
+  } else if (plan.kind === "constant-color") {
+    const color = temp();
+    const offset = temp();
+    lines.push(
+      `const ${color}=(${args[plan.color]})|0;`,
+      `for(let ${offset}=0;${offset}<${count};${offset}+=1){`,
+      `${dest}[${index}]=(${color}+((${dest}[${index}]&16711422)>>1))|0;`,
+      `${index}=(${index}+1)|0;`,
+      "}",
+    );
+  } else {
+    return null;
+  }
+  lines.push("}", "}");
+  return lines;
+}
+
 class FusedRegionCompiler {
   constructor(jit, options = {}) {
     this.jit = jit;
@@ -352,11 +409,20 @@ class FusedRegionCompiler {
       const site = this.jit.fieldSites[region.staticSiteIds[index]];
       return site && site.descriptor === "Z";
     });
+    region.falseGuardStaticIndices = new Set(region.staticTargets
+      .map((target, index) => region.falseGuardTargets.includes(target)
+        ? index : -1)
+      .filter((index) => index >= 0));
 
     let compileStage = "scanline";
     try {
       region.scanlineKernel = this.compileKernel(scanlineMethod, scanline, region, "scanline");
-      const semanticScanline = this.compileSemanticScanline(scanlineMethod, scanline, region);
+      const semanticScanlinePlan = analyzeScanline(scanlineMethod, scanline);
+      region.semanticScanlinePlan = semanticScanlinePlan;
+      const semanticScanline = semanticScanlinePlan
+        ? this.compileSemanticScanline(
+          scanlineMethod, scanline, region, semanticScanlinePlan)
+        : null;
       if (semanticScanline) {
         region.scanlineKernel = semanticScanline;
         this.jit.semanticFusedScanlineCount =
@@ -364,32 +430,39 @@ class FusedRegionCompiler {
       }
       compileStage = "raster";
       region.rasterKernel = this.compileKernel(rasterMethod, raster, region, "raster");
-      const semanticRaster = this.semanticRasterKernelsEnabled
-        ? analyzeGradientRaster(
-          rasterMethod, raster, region,
-          semanticScanline && analyzeScanline(scanlineMethod, scanline))
-        : null;
-      if (semanticRaster) {
-        region.semanticGradientRasterPlan = semanticRaster;
+      const gradientRasterPlan = analyzeGradientRaster(
+        rasterMethod, raster, region, semanticScanlinePlan);
+      const flatRasterPlan = gradientRasterPlan ? null : analyzeFlatRaster(
+        rasterMethod, raster, region, semanticScanlinePlan);
+      region.genericRasterSafetyPlan = gradientRasterPlan || flatRasterPlan;
+      if (region.genericRasterSafetyPlan) {
+        region.trustedRasterStaticIndices = [...new Set([
+          region.genericRasterSafetyPlan.heightStatic,
+          region.genericRasterSafetyPlan.widthStatic,
+          region.genericRasterSafetyPlan.rowsStatic,
+          region.genericRasterSafetyPlan.strideStatic,
+        ])];
+        region.trustedRasterKernel = this.compileLexicalKernel(
+          rasterMethod, raster, region, "raster", {
+            capturedStaticIndices: region.trustedRasterStaticIndices,
+            failureRole: "trusted-raster",
+            trustedScanlinePlan: semanticScanlinePlan,
+          });
+      }
+      if (this.semanticRasterKernelsEnabled && gradientRasterPlan) {
+        region.semanticGradientRasterPlan = gradientRasterPlan;
         region.rasterKernel = HandwrittenFusedGradient.installRaster(
-          region, this.jit, semanticRaster);
+          region, this.jit, gradientRasterPlan);
         region.directRasterKernel = region.rasterKernel.directKernel;
         this.jit.semanticFusedRasterCount =
           (this.jit.semanticFusedRasterCount | 0) + 1;
-      } else {
-        const flatRaster = this.semanticRasterKernelsEnabled
-          ? analyzeFlatRaster(
-            rasterMethod, raster, region,
-            semanticScanline && analyzeScanline(scanlineMethod, scanline))
-          : null;
-        if (flatRaster) {
-          region.semanticFlatRasterPlan = flatRaster;
+      } else if (this.semanticRasterKernelsEnabled && flatRasterPlan) {
+          region.semanticFlatRasterPlan = flatRasterPlan;
           region.rasterKernel = HandwrittenFusedFlat.installRaster(
-            region, this.jit, flatRaster);
+            region, this.jit, flatRasterPlan);
           region.directRasterKernel = region.rasterKernel.directKernel;
           this.jit.semanticFusedFlatRasterCount =
             (this.jit.semanticFusedFlatRasterCount | 0) + 1;
-        }
       }
       compileStage = "wrapper";
       region.wrapperKernel = this.compileKernel(wrapperMethod, wrapper, region, "wrapper");
@@ -399,6 +472,14 @@ class FusedRegionCompiler {
         region.wrapperKernel = semanticWrapper;
         this.jit.semanticFusedWrapperCount =
           (this.jit.semanticFusedWrapperCount | 0) + 1;
+      } else if (region.genericRasterSafetyPlan &&
+          region.trustedRasterKernel && !region.directRasterKernel) {
+        const bridge = this.compileTrustedRasterBridge(
+          rasterMethod, region, region.genericRasterSafetyPlan);
+        if (bridge) {
+          region.generatedRasterKernel = region.rasterKernel;
+          region.rasterKernel = bridge;
+        }
       }
       compileStage = "invoker";
       region.invokeWrapper = createPositionalInvoker(
@@ -672,10 +753,11 @@ class FusedRegionCompiler {
   // block edge are assigned to fixed join slots; Java operand-stack state is
   // otherwise absent. This is the generic counterpart of the structured
   // handwritten target and is selected solely from the verified CFG.
-  compileLexicalKernel(method, verified, region, role) {
+  compileLexicalKernel(method, verified, region, role, options = {}) {
+    const failureRole = options.failureRole || role;
     const reject = (stage, error) => {
       if (!region.lexicalKernelFailures) region.lexicalKernelFailures = {};
-      region.lexicalKernelFailures[role] = {
+      region.lexicalKernelFailures[failureRole] = {
         stage, message: String(error && error.message || error),
       };
       return null;
@@ -693,6 +775,11 @@ class FusedRegionCompiler {
     const descriptor = parseDescriptor(method.descriptor);
     const callByIndex = new Map(verified.calls.map((call) => [call.index, call]));
     const params = descriptor.params;
+    const capturedStaticNames = (options.capturedStaticIndices || [])
+      .map((_index, capture) => `c${capture}`);
+    const capturedStaticByIndex = new Map(
+      (options.capturedStaticIndices || []).map((index, capture) =>
+        [index, capturedStaticNames[capture]]));
     const localTypes = [];
     let parameterLocal = 0;
     for (const type of params) {
@@ -717,17 +804,26 @@ class FusedRegionCompiler {
           hoistedStatics.has(staticIndex)) continue;
       const name = `s${staticIndex}`;
       hoistedStatics.set(staticIndex, name);
-      declarations.push(
-        `const ${name}=region.staticTargets[${staticIndex}].kind==="map"?` +
-        `region.staticTargets[${staticIndex}].fields.get(` +
-        `region.staticTargets[${staticIndex}].key):` +
-        `region.staticTargets[${staticIndex}].fields[` +
-        `region.staticTargets[${staticIndex}].key];`);
+      if (region.falseGuardStaticIndices?.has(staticIndex)) {
+        declarations.push(`const ${name}=0;`);
+      } else if (capturedStaticByIndex.has(staticIndex)) {
+        declarations.push(`const ${name}=${capturedStaticByIndex.get(staticIndex)};`);
+      } else {
+        declarations.push(
+          `const ${name}=region.staticTargets[${staticIndex}].kind==="map"?` +
+          `region.staticTargets[${staticIndex}].fields.get(` +
+          `region.staticTargets[${staticIndex}].key):` +
+          `region.staticTargets[${staticIndex}].fields[` +
+          `region.staticTargets[${staticIndex}].key];`);
+      }
     }
     let argIndex = 0;
     for (let index = 0; index < verified.localsSize; index += 1) {
       if (localTypes[index]) {
-        const input = argNames[argIndex++];
+        const parameter = argIndex++;
+        const input = options.constantArguments?.has(parameter)
+          ? options.constantArguments.get(parameter)
+          : argNames[parameter];
         declarations.push(`let l${index}=${isIntType(localTypes[index])
           ? `${input}|0` : input};`);
       } else {
@@ -743,6 +839,7 @@ class FusedRegionCompiler {
     }
 
     let temporary = 0;
+    let trustedScanlineInlineCount = 0;
     const temp = () => `v${temporary++}`;
     const localsSnapshot = () =>
       `[${Array.from({ length: verified.localsSize }, (_unused, index) =>
@@ -902,8 +999,18 @@ class FusedRegionCompiler {
                 `${args.join(",")});`);
             } else if (role === "raster" &&
                 memberKey(call) === region.family.scanlineKey) {
-              lines.push(`region.scanlineKernel(state,region,helpers,` +
-                `${args.join(",")});`);
+              if (options.trustedScanlinePlan) {
+                const trustedLines = emitTrustedScanline(
+                  options.trustedScanlinePlan, args, temp);
+                if (!trustedLines) {
+                  throw new Error("trusted scanline arguments do not preserve the verified tag");
+                }
+                lines.push(...trustedLines);
+                trustedScanlineInlineCount += 1;
+              } else {
+                lines.push(`region.scanlineKernel(state,region,helpers,` +
+                  `${args.join(",")});`);
+              }
             } else if (call && call.kind === "integer-inline") {
               const output = temp();
               const substitute = (source) => source.replace(
@@ -1037,9 +1144,16 @@ class FusedRegionCompiler {
       const owner = role === "wrapper" ? region.wrapperOwner
         : role === "raster" ? region.rasterOwner : region.scanlineOwner;
       const generated = this.jit.createGeneratedFunction(method,
-        `fused-${region.family.name}-lexical-${role}`,
-        ["state", "region", "helpers", ...argNames], body.join("\n"), owner);
+        `fused-${region.family.name}-lexical-${failureRole}`,
+        ["state", "region", "helpers", ...argNames, ...capturedStaticNames],
+        body.join("\n"), owner);
       generated.jvmLexicalFusedKernel = true;
+      generated.jvmTrustedFusedRaster = Boolean(options.trustedScanlinePlan);
+      generated.jvmTrustedScanlineInlineCount = trustedScanlineInlineCount;
+      generated.jvmGuardedFalseStaticCount =
+        region.falseGuardStaticIndices?.size || 0;
+      generated.jvmCapturedStaticCount = capturedStaticNames.length;
+      generated.jvmConstantArgumentCount = options.constantArguments?.size || 0;
       generated.jvmLexicalFusedSource = body.join("\n");
       this.jit.lexicalFusedKernelCount =
         (this.jit.lexicalFusedKernelCount | 0) + 1;
@@ -1257,8 +1371,8 @@ class FusedRegionCompiler {
       ["state", "region", "helpers", ...argNames], body.join("\n"), owner);
   }
 
-  compileSemanticScanline(method, verified, region) {
-    const plan = analyzeScanline(method, verified);
+  compileSemanticScanline(method, verified, region, analyzedPlan = null) {
+    const plan = analyzedPlan || analyzeScanline(method, verified);
     if (!plan) return null;
     const descriptor = parseDescriptor(method.descriptor);
     const args = descriptor.params.map((_, index) => `a${index}`);
@@ -1305,26 +1419,120 @@ class FusedRegionCompiler {
       ["state", "region", "helpers", ...args], body.join("\n"), region.scanlineOwner);
   }
 
+  compileTrustedRasterBridge(method, region, plan) {
+    if (!plan || !Number.isInteger(plan.destinationParameter) ||
+        !Number.isInteger(plan.tagParameter) ||
+        !Number.isInteger(plan.tagValue)) return null;
+    const descriptor = parseDescriptor(method.descriptor);
+    const args = descriptor.params.map((_, index) => `a${index}`);
+    const fallback = `return region.generatedRasterKernel(state,region,helpers,` +
+      `${args.join(",")});`;
+    const staticRead = (index) =>
+      `(region.staticTargets[${index}].kind==="map"?` +
+      `region.staticTargets[${index}].fields.get(region.staticTargets[${index}].key):` +
+      `region.staticTargets[${index}].fields[region.staticTargets[${index}].key])`;
+    const staticNames = new Map([
+      [plan.heightStatic, "rasterHeight"],
+      [plan.widthStatic, "rasterWidth"],
+      [plan.rowsStatic, "rasterRows"],
+      [plan.strideStatic, "rasterStride"],
+    ]);
+    const captureArguments = (region.trustedRasterStaticIndices || [])
+      .map((index) => staticNames.get(index) || staticRead(index));
+    // Without relying on renderer-specific coordinate positions, validate
+    // every proven entry parameter that can reach a row-table index. Success
+    // proves every row-table load used by the child. Rejection occurs before
+    // the first raster side effect.
+    const rowConditions = (plan.rowParameters || [])
+      .map((parameter, candidate) => {
+        const name = `rasterRowCandidate${candidate}`;
+        return {
+          declaration: `const ${name}=(${args[parameter]}|0)>0?(${args[parameter]}|0):0;`,
+          condition: `(${name}<rasterHeight&&` +
+            `rasterRows[${name}]!==Math.imul(${name},rasterStride))`,
+        };
+      });
+    const body = [
+      "\"use strict\";",
+      `const rasterHeight=${staticRead(plan.heightStatic)}|0;`,
+      `const rasterWidth=${staticRead(plan.widthStatic)}|0;`,
+      `const rasterRows=${staticRead(plan.rowsStatic)};`,
+      `const rasterStride=${staticRead(plan.strideStatic)}|0;`,
+      `const rasterDest=${args[plan.destinationParameter]};`,
+      ...rowConditions.map(({ declaration }) => declaration),
+      `if((${args[plan.tagParameter]}|0)!==${plan.tagValue}||` +
+        "rasterDest==null||rasterRows==null||rasterHeight<=0||" +
+        "rasterRows.length<rasterHeight||" +
+        "rasterDest.length<(Math.imul(rasterHeight-1,rasterStride)+rasterWidth|0)||" +
+        `${rowConditions.map(({ condition }) => condition).join("||")}){${fallback}}`,
+      `return region.trustedRasterKernel(state,region,helpers,` +
+        `${[...args, ...captureArguments].join(",")});`,
+    ];
+    const generated = this.jit.createGeneratedFunction(method,
+      `fused-${region.family.name}-trusted-raster-bridge`,
+      ["state", "region", "helpers", ...args], body.join("\n"),
+      region.rasterOwner);
+    generated.jvmTrustedRasterBridge = true;
+    generated.jvmTrustedRasterBridgeRowCandidateCount = rowConditions.length;
+    return generated;
+  }
+
   compileSemanticWrapper(method, verified, region) {
     const plan = analyzePermutationWrapper(method, verified, region, this.jit);
     if (!plan) return null;
     region.semanticWrapperPlan = plan;
+    if (region.genericRasterSafetyPlan && !region.directRasterKernel) {
+      const rasterParameters = parseDescriptor(
+        region.rasterMethod.descriptor).params.length;
+      const templates = [...plan.templates.values()];
+      const constantArguments = new Map();
+      for (let parameter = 0; parameter < rasterParameters; parameter += 1) {
+        const expression = templates[0]?.arguments[parameter];
+        if (/^-?\d+$/.test(String(expression)) && templates.every(
+          (template) => template.arguments[parameter] === expression)) {
+          constantArguments.set(parameter, expression);
+        }
+      }
+      if (constantArguments.size) {
+        const specialized = this.compileLexicalKernel(
+          region.rasterMethod, region.raster, region, "raster", {
+            capturedStaticIndices: region.trustedRasterStaticIndices,
+            constantArguments,
+            failureRole: "constant-trusted-raster",
+            trustedScanlinePlan: region.semanticScanlinePlan,
+          });
+        if (specialized) {
+          region.trustedRasterKernel = specialized;
+          region.trustedRasterConstantArguments = constantArguments;
+        }
+      }
+    }
     const descriptor = parseDescriptor(method.descriptor);
     const args = descriptor.params.map((_, index) => `a${index}`);
     const fallback = `return region.generatedWrapperKernel(state,region,helpers,${args.join(",")});`;
     const relation = (left, right) =>
       `((${left}<${right})?0:((${left}===${right})?1:2))`;
     const [first, second, third] = plan.keys.map((parameter) => args[parameter]);
-    const rasterPlan = region.semanticGradientRasterPlan || region.semanticFlatRasterPlan;
+    const rasterPlan = region.semanticGradientRasterPlan ||
+      region.semanticFlatRasterPlan || region.genericRasterSafetyPlan;
     const direct = Boolean(rasterPlan && region.directRasterKernel);
+    const trusted = Boolean(!direct && rasterPlan && region.trustedRasterKernel);
     const staticRead = (index) =>
       `(region.staticTargets[${index}].kind==="map"?` +
       `region.staticTargets[${index}].fields.get(region.staticTargets[${index}].key):` +
       `region.staticTargets[${index}].fields[region.staticTargets[${index}].key])`;
+    const trustedStaticValues = rasterPlan ? new Map([
+      [rasterPlan.heightStatic, "rasterHeight"],
+      [rasterPlan.widthStatic, "rasterWidth"],
+      [rasterPlan.rowsStatic, "rasterRows"],
+      [rasterPlan.strideStatic, "rasterStride"],
+    ]) : new Map();
+    const trustedCaptureArguments = (region.trustedRasterStaticIndices || [])
+      .map((index) => trustedStaticValues.get(index) || staticRead(index));
     const body = ["\"use strict\";",
       ...plan.booleanParameters.map((parameter) =>
         `if((${args[parameter]}|0)!==1){${fallback}}`),
-      ...(direct ? [
+      ...(direct || trusted ? [
         `const rasterHeight=${staticRead(rasterPlan.heightStatic)}|0;`,
         `const rasterWidth=${staticRead(rasterPlan.widthStatic)}|0;`,
         `const rasterRows=${staticRead(rasterPlan.rowsStatic)};`,
@@ -1334,8 +1542,11 @@ class FusedRegionCompiler {
       "switch(order){",
     ];
     for (const [order, template] of [...plan.templates].sort((a, b) => a[0] - b[0])) {
-      if (direct) {
-        const gradient = Boolean(region.semanticGradientRasterPlan);
+      if (direct || trusted) {
+        const gradient = Boolean(region.semanticGradientRasterPlan ||
+          (!region.semanticFlatRasterPlan &&
+            region.genericRasterSafetyPlan &&
+            region.semanticScanlinePlan?.kind === "packed-color"));
         const dest = template.arguments[gradient ? 12 : 8];
         const yTop = template.arguments[gradient ? 11 : 7];
         const yMid = template.arguments[gradient ? 3 : 1];
@@ -1350,8 +1561,11 @@ class FusedRegionCompiler {
             "(rasterMid<rasterHeight&&rasterRows[rasterMid]!==Math.imul(rasterMid,rasterStride)))" +
             `{${fallback}}`,
           `state.outerPc=${template.pc};state.outerExtra=undefined;`,
-          `region.directRasterKernel(rasterHeight,rasterWidth,rasterRows,rasterStride,` +
-            `${template.arguments.join(",")});`,
+          direct
+            ? `region.directRasterKernel(rasterHeight,rasterWidth,rasterRows,rasterStride,` +
+              `${template.arguments.join(",")});`
+            : `region.trustedRasterKernel(state,region,helpers,` +
+              `${[...template.arguments, ...trustedCaptureArguments].join(",")});`,
           "break;}");
       } else {
         body.push(`case ${order}:`,
@@ -1683,10 +1897,19 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
   if (!scanlinePlan || scanlinePlan.kind !== "constant-color") return reject("scanline");
   let descriptor;
   try { descriptor = parseDescriptor(method.descriptor); } catch (_) { return reject("descriptor"); }
+  const byteParameters = descriptor.params
+    .map((type, parameter) => ({ type, parameter }))
+    .filter(({ type }) => type === "byte");
+  const arrayParameters = descriptor.params
+    .map((type, parameter) => ({ type, parameter }))
+    .filter(({ type }) => type === "int[]");
   if (descriptor.returnType !== "void" || descriptor.params.length !== 9 ||
-      descriptor.params[5] !== "byte" || descriptor.params[8] !== "int[]" ||
-      descriptor.params.some((type, index) =>
-        index !== 8 && !isIntType(type))) return reject("parameter shape");
+      byteParameters.length !== 1 || arrayParameters.length !== 1 ||
+      descriptor.params.some((type) => type !== "int[]" && !isIntType(type))) {
+    return reject("parameter shape");
+  }
+  const tagParameter = byteParameters[0].parameter;
+  const destinationParameter = arrayParameters[0].parameter;
 
   const ops = [...verified.reachable].map((index) =>
     getOp(verified.codeItems[index] && verified.codeItems[index].instruction)).filter(Boolean);
@@ -1719,7 +1942,7 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
   const height = remaining[0];
   const stride = remaining[1];
   if (!height || !stride || width.count <= height.count) return reject("static roles");
-  const tagValues = comparedParameterConstants(method, verified, 5);
+  const tagValues = comparedParameterConstants(method, verified, tagParameter);
   if (tagValues.length !== 1) return reject(`tag values=${tagValues.join(",")}`);
   const childCalls = verified.calls.filter((call) => call.kind === "child");
   const lastChildIndex = Math.max(...childCalls.map((call) => call.index));
@@ -1737,12 +1960,185 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
     widthStatic: staticIndex(width),
     rowsStatic: staticIndex(rows[0]),
     strideStatic: staticIndex(stride),
+    destinationParameter,
+    tagParameter,
     tagValue: tagValues[0],
     singleLowerScanline: !hasLowerBackedge,
   };
   if (Object.values(plan).some((value) => value === undefined)) return reject("unresolved static");
+  plan.rowParameters = analyzeStaticArrayIndexParameters(
+    method, verified, region, plan.rowsStatic);
+  if (!plan.rowParameters?.length) return reject("row-index provenance");
   region.semanticFlatRasterRejection = null;
   return plan;
+}
+
+// Compute which entry parameters can reach indexes of loads from one resolved
+// static array. Values are abstract provenance sets, joined across the normal
+// CFG (including loops). Unsupported or ambiguous flow rejects the proof; it
+// never weakens the checked raster fallback.
+function analyzeStaticArrayIndexParameters(method, verified, region, targetStatic) {
+  const descriptor = parseDescriptor(method.descriptor);
+  const items = verified.codeItems;
+  const labels = verified.labels;
+  const constant = () => ({ params: new Set(), statics: new Set(), unknown: false });
+  const unknown = () => ({ params: new Set(), statics: new Set(), unknown: true });
+  const parameter = (index) => ({
+    params: new Set([index]), statics: new Set(), unknown: false,
+  });
+  const staticValue = (index) => ({
+    params: new Set(), statics: new Set([index]), unknown: false,
+  });
+  const copyValue = (value) => ({
+    params: new Set(value.params), statics: new Set(value.statics),
+    unknown: value.unknown,
+  });
+  const unionValue = (left, right) => ({
+    params: new Set([...left.params, ...right.params]),
+    statics: new Set([...left.statics, ...right.statics]),
+    unknown: left.unknown || right.unknown,
+  });
+  const valueKey = (value) => `${value.unknown ? 1 : 0}:` +
+    `${[...value.params].sort((a, b) => a - b).join(",")}:` +
+    `${[...value.statics].sort((a, b) => a - b).join(",")}`;
+  const cloneState = (state) => ({
+    locals: state.locals.map(copyValue),
+    stack: state.stack.map(copyValue),
+  });
+  const initial = {
+    locals: Array.from({ length: verified.localsSize }, unknown),
+    stack: [],
+  };
+  let slot = 0;
+  descriptor.params.forEach((type, index) => {
+    initial.locals[slot] = parameter(index);
+    slot += type === "long" || type === "double" ? 2 : 1;
+  });
+  const states = new Array(items.length);
+  states[0] = initial;
+  const work = [0];
+  const queued = new Set(work);
+  const rowLoads = new Map();
+  const mergeState = (index, incoming) => {
+    if (!verified.reachable.has(index)) return;
+    const existing = states[index];
+    if (!existing) {
+      states[index] = cloneState(incoming);
+      if (!queued.has(index)) { queued.add(index); work.push(index); }
+      return;
+    }
+    if (existing.stack.length !== incoming.stack.length) throw new Error("provenance stack join");
+    let changed = false;
+    for (let local = 0; local < existing.locals.length; local += 1) {
+      const merged = unionValue(existing.locals[local], incoming.locals[local]);
+      if (valueKey(merged) !== valueKey(existing.locals[local])) {
+        existing.locals[local] = merged; changed = true;
+      }
+    }
+    for (let stackIndex = 0; stackIndex < existing.stack.length; stackIndex += 1) {
+      const merged = unionValue(existing.stack[stackIndex], incoming.stack[stackIndex]);
+      if (valueKey(merged) !== valueKey(existing.stack[stackIndex])) {
+        existing.stack[stackIndex] = merged; changed = true;
+      }
+    }
+    if (changed && !queued.has(index)) { queued.add(index); work.push(index); }
+  };
+  try {
+    while (work.length) {
+      const index = work.shift();
+      queued.delete(index);
+      const state = cloneState(states[index]);
+      const instruction = items[index] && items[index].instruction;
+      const op = getOp(instruction);
+      const pop = () => state.stack.pop();
+      const push = (value) => state.stack.push(value);
+      const binary = () => {
+        const right = pop(), left = pop();
+        if (!left || !right) throw new Error("provenance stack underflow");
+        push(unionValue(left, right));
+      };
+      let terminal = false;
+      if (!op || op === "nop") {
+        // no effect
+      } else if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+        push(copyValue(state.locals[localIndex(instruction, op)] || unknown()));
+      } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+        const value = pop();
+        if (!value) throw new Error("provenance stack underflow");
+        state.locals[localIndex(instruction, op)] = value;
+      } else if (op === "aconst_null" || /^iconst_(?:m1|[0-5])$/.test(op) ||
+          ["bipush", "sipush"].includes(op)) {
+        push(constant());
+      } else if (op === "ldc" || op === "ldc_w") {
+        push(typeof instruction.arg === "number" ? constant() : unknown());
+      } else if (op === "checkcast") {
+        // Provenance is unchanged.
+      } else if (op === "dup") {
+        const value = pop();
+        if (!value) throw new Error("provenance stack underflow");
+        push(copyValue(value)); push(value);
+      } else if (op === "pop") {
+        if (!pop()) throw new Error("provenance stack underflow");
+      } else if (["iadd", "isub", "imul", "iand", "ior", "ixor",
+          "ishl", "ishr", "iushr", "idiv", "irem"].includes(op)) {
+        binary();
+      } else if (op === "ineg") {
+        if (!state.stack.length) throw new Error("provenance stack underflow");
+      } else if (op === "iinc") {
+        // Adding a constant retains the local's provenance.
+      } else if (op === "getstatic") {
+        const staticIndex = region.staticIndex.get(JSON.stringify(instruction.arg));
+        push(staticIndex === undefined ? unknown() : staticValue(staticIndex));
+      } else if (op === "putstatic") {
+        if (!pop()) throw new Error("provenance stack underflow");
+      } else if (op === "iaload") {
+        const arrayIndex = pop(), array = pop();
+        if (!arrayIndex || !array) throw new Error("provenance stack underflow");
+        const previous = rowLoads.get(index);
+        rowLoads.set(index, {
+          array: previous ? unionValue(previous.array, array) : copyValue(array),
+          index: previous ? unionValue(previous.index, arrayIndex) : copyValue(arrayIndex),
+        });
+        push(unknown());
+      } else if (op === "iastore") {
+        if (!pop() || !pop() || !pop()) throw new Error("provenance stack underflow");
+      } else if (op === "invokestatic") {
+        const parsed = parseDescriptor(instruction.arg[2][1]);
+        for (let argument = 0; argument < parsed.params.length; argument += 1) {
+          if (!pop()) throw new Error("provenance stack underflow");
+        }
+        if (parsed.returnType !== "void") push(unknown());
+      } else if (op === "goto" || op === "goto_w") {
+        terminal = true;
+        mergeState(branchTarget(instruction, labels), state);
+      } else if (op && op.startsWith("if")) {
+        const operands = op.startsWith("if_icmp") || op.startsWith("if_acmp") ? 2 : 1;
+        for (let operand = 0; operand < operands; operand += 1) {
+          if (!pop()) throw new Error("provenance stack underflow");
+        }
+        terminal = true;
+        mergeState(branchTarget(instruction, labels), state);
+        if (index + 1 < items.length) mergeState(index + 1, state);
+      } else if (op === "return" || op === "athrow") {
+        terminal = true;
+      } else {
+        return null;
+      }
+      if (!terminal && index + 1 < items.length) mergeState(index + 1, state);
+    }
+  } catch (_) {
+    return null;
+  }
+  const parameters = new Set();
+  let matchedLoads = 0;
+  for (const { array, index } of rowLoads.values()) {
+    if (!array.statics.has(targetStatic)) continue;
+    matchedLoads += 1;
+    if (array.unknown || array.params.size || array.statics.size !== 1 ||
+        index.unknown || index.statics.size) return null;
+    for (const parameterIndex of index.params) parameters.add(parameterIndex);
+  }
+  return matchedLoads > 0 ? [...parameters].sort((a, b) => a - b) : null;
 }
 
 function comparedParameterConstants(method, verified, parameter) {
