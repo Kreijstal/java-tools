@@ -1,7 +1,13 @@
 const { parseDescriptor } = require("../parsing/typeParser");
-const { buildCfgFromCode, structure } = require("../decompiler/structurer");
+const {
+  buildCfgFromCode,
+  structure,
+  succOfTerm,
+  succAllOfTerm,
+} = require("../decompiler/structurer");
 const HandwrittenFusedGradient = require("./HandwrittenFusedGradient");
 const HandwrittenFusedFlat = require("./HandwrittenFusedFlat");
+const { MATH_INTRINSICS } = require("./wasmShared");
 
 const BAILOUT = Symbol("jit.fused.bailout");
 
@@ -119,6 +125,85 @@ function canonicalIntegerArithmetic(left, right, operator) {
     return `((${left}+${rightNegated})|0)`;
   }
   return `((${left}${operator}${right})|0)`;
+}
+
+function integerLiteral(expression) {
+  const match = /^(-?(?:0|[1-9]\d*))$/.exec(String(expression));
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isSafeInteger(value) ? value | 0 : null;
+}
+
+function foldIntegerComparison(left, operator, right) {
+  const leftValue = integerLiteral(left);
+  const rightValue = integerLiteral(right);
+  if (leftValue === null || rightValue === null) return null;
+  switch (operator) {
+    case "===": return leftValue === rightValue;
+    case "!==": return leftValue !== rightValue;
+    case "<": return leftValue < rightValue;
+    case "<=": return leftValue <= rightValue;
+    case ">": return leftValue > rightValue;
+    case ">=": return leftValue >= rightValue;
+    default: return null;
+  }
+}
+
+// Convert branches over a read-only boolean into single CFG edges when the
+// fused entry guard has already established that boolean's value. This is a
+// small SCCP/DCE pass over arbitrary bytecode: it discovers the static-to-local
+// copy and every consuming branch, and never refers to guest identities or a
+// renderer layout.
+function pruneEntryGuardedBooleanBranches(cfg, verified, region) {
+  if (!region.falseGuardStaticIndices?.size) return 0;
+  const items = verified.codeItems;
+  const writes = new Map();
+  for (const index of verified.reachable) {
+    const instruction = items[index] && items[index].instruction;
+    const op = getOp(instruction);
+    if (/^istore(?:_[0-3])?$/.test(op)) {
+      const local = localIndex(instruction, op);
+      writes.set(local, (writes.get(local) || 0) + 1);
+    } else if (op === "iinc") {
+      const local = Number(instruction.varnum ?? instruction.arg);
+      writes.set(local, (writes.get(local) || 0) + 1);
+    }
+  }
+  const guardedLocals = new Set();
+  for (let index = 0; index + 1 < items.length; index += 1) {
+    const read = items[index] && items[index].instruction;
+    if (getOp(read) !== "getstatic") continue;
+    const staticIndex = region.staticIndex.get(JSON.stringify(read.arg));
+    if (!region.falseGuardStaticIndices.has(staticIndex)) continue;
+    const store = items[index + 1] && items[index + 1].instruction;
+    const storeOp = getOp(store);
+    if (!/^istore(?:_[0-3])?$/.test(storeOp)) continue;
+    const local = localIndex(store, storeOp);
+    if (writes.get(local) === 1) guardedLocals.add(local);
+  }
+  let pruned = 0;
+  for (const block of cfg.blocks) {
+    if (cfg.term[block.id]?.kind !== "cond" || block.insns.length < 2) continue;
+    const branchIndex = block.insns[block.insns.length - 1];
+    const loadIndex = block.insns[block.insns.length - 2];
+    const branchOp = getOp(items[branchIndex] && items[branchIndex].instruction);
+    const load = items[loadIndex] && items[loadIndex].instruction;
+    const loadOp = getOp(load);
+    if ((branchOp !== "ifeq" && branchOp !== "ifne") ||
+        !/^iload(?:_[0-3])?$/.test(loadOp) ||
+        !guardedLocals.has(localIndex(load, loadOp))) continue;
+    const term = cfg.term[block.id];
+    cfg.term[block.id] = {
+      kind: "goto",
+      target: branchOp === "ifeq" ? term.taken : term.fall,
+    };
+    pruned += 1;
+  }
+  if (pruned) {
+    cfg.succ = cfg.term.map(succOfTerm);
+    cfg.succAll = cfg.term.map(succAllOfTerm);
+  }
+  return pruned;
 }
 
 class FusedRegionCompiler {
@@ -506,12 +591,12 @@ class FusedRegionCompiler {
             capturedStaticIndices: region.trustedRasterStaticIndices,
             failureRole: "trusted-raster",
             trustedScanlinePlan: semanticScanlinePlan,
+            trustedArrayStaticIndices: [
+              region.genericRasterSafetyPlan.rowsStatic,
+            ],
+            trustedDivisorGuards:
+              region.genericRasterSafetyPlan.divisorGuardPlan,
           });
-        if (flatRasterPlan) {
-          const loweredFlatRaster = this.compileVerifiedFlatRaster(
-            rasterMethod, region, flatRasterPlan);
-          if (loweredFlatRaster) region.trustedRasterKernel = loweredFlatRaster;
-        }
       }
       if (this.semanticRasterKernelsEnabled && gradientRasterPlan) {
         region.semanticGradientRasterPlan = gradientRasterPlan;
@@ -529,7 +614,9 @@ class FusedRegionCompiler {
             (this.jit.semanticFusedFlatRasterCount | 0) + 1;
       }
       compileStage = "wrapper";
-      region.wrapperKernel = this.compileKernel(wrapperMethod, wrapper, region, "wrapper");
+      region.generatedRasterKernel = region.rasterKernel;
+      region.wrapperKernel = this.compileKernel(
+        wrapperMethod, wrapper, region, "wrapper");
       const semanticWrapper = this.compileSemanticWrapper(wrapperMethod, wrapper, region);
       if (semanticWrapper) {
         region.generatedWrapperKernel = region.wrapperKernel;
@@ -541,7 +628,6 @@ class FusedRegionCompiler {
         const bridge = this.compileTrustedRasterBridge(
           rasterMethod, region, region.genericRasterSafetyPlan);
         if (bridge) {
-          region.generatedRasterKernel = region.rasterKernel;
           region.rasterKernel = bridge;
         }
       }
@@ -624,6 +710,13 @@ class FusedRegionCompiler {
       call.native = this.jvm._jreFindMethod(call.owner, call.name, call.descriptor);
       let parsed;
       try { parsed = parseDescriptor(call.descriptor); } catch (_) { return false; }
+      if (call.owner === "java/lang/Math" &&
+          MATH_INTRINSICS.has(call.name) && parsed.returnType === "int" &&
+          parsed.params.every((type) => type === "int") &&
+          typeof Math[call.name] === "function") {
+        call.kind = "math-intrinsic";
+        continue;
+      }
       if (typeof call.native === "function" && parsed.returnType === "int" &&
           parsed.params.every((type) => type === "int")) {
         call.kind = "integer-native";
@@ -828,9 +921,12 @@ class FusedRegionCompiler {
     };
     let cfg;
     let structured;
+    let prunedGuardedBooleanBranches = 0;
     try {
       cfg = buildCfgFromCode(verified.codeItems);
       if (!cfg || cfg.term.some((term) => term.kind === "switch")) return null;
+      prunedGuardedBooleanBranches =
+        pruneEntryGuardedBooleanBranches(cfg, verified, region);
       structured = structure(cfg);
     } catch (error) {
       return reject("structure", error);
@@ -845,14 +941,39 @@ class FusedRegionCompiler {
       (options.capturedStaticIndices || []).map((index, capture) =>
         [index, capturedStaticNames[capture]]));
     const localTypes = [];
+    const parameterLocals = [];
     let parameterLocal = 0;
-    for (const type of params) {
+    for (let parameter = 0; parameter < params.length; parameter += 1) {
+      const type = params[parameter];
+      parameterLocals[parameter] = parameterLocal;
       localTypes[parameterLocal] = type;
       parameterLocal += type === "long" || type === "double" ? 2 : 1;
     }
     const argNames = params.map((_, index) => `a${index}`);
+    let trustedScanlineHelper = null;
+    if (options.trustedScanlinePlan && region.scanlineMethod) {
+      const childDescriptor = parseDescriptor(region.scanlineMethod.descriptor);
+      const childArgs = childDescriptor.params.map(
+        (_unused, index) => `f0a${index}`);
+      const emittedArgs = [...childArgs];
+      emittedArgs[options.trustedScanlinePlan.tag] =
+        String(options.trustedScanlinePlan.tagValue);
+      let childTemporary = 0;
+      const childLines = emitTrustedScanline(
+        options.trustedScanlinePlan, emittedArgs,
+        () => `f0v${childTemporary++}`);
+      // Outline only small repeated children. Larger children expose enough
+      // arithmetic for the host optimizer to benefit from call-site context;
+      // duplicating a tiny counted loop mainly inflates the parent. The cost
+      // decision uses emitted IR size, not the child descriptor or identity.
+      if (childLines && childLines.length <= 16) {
+        trustedScanlineHelper =
+          `function f0(${childArgs.join(",")}){${childLines.join("\n")}}`;
+      }
+    }
     const reachableBlocks = new Set(structured.rpo);
     const declarations = [];
+    if (trustedScanlineHelper) declarations.push(trustedScanlineHelper);
     const writtenStatics = new Set([...verified.reachable]
       .map((index) => codeItems[index] && codeItems[index].instruction)
       .filter((instruction) => getOp(instruction) === "putstatic")
@@ -881,6 +1002,57 @@ class FusedRegionCompiler {
           `region.staticTargets[${staticIndex}].key];`);
       }
     }
+    const trustedArrayExpressions = new Set(
+      (options.trustedArrayStaticIndices || [])
+        .map((index) => hoistedStatics.get(index))
+        .filter(Boolean));
+    const trustedDivisorPcs = new Set(
+      options.trustedDivisorGuards?.coveredPcs || []);
+    // Sparse conditional constant propagation for immutable entry facts. This
+    // intentionally handles only facts proven for the complete method: a
+    // constant parameter that is never assigned, or a non-parameter local
+    // with one assignment directly from a literal / entry-guarded static.
+    // It is independent of guest names and leaves all mutable locals alone.
+    const localWrites = new Map();
+    const localStoreSites = new Map();
+    for (const index of verified.reachable) {
+      const instruction = codeItems[index] && codeItems[index].instruction;
+      const op = getOp(instruction);
+      if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+        const local = localIndex(instruction, op);
+        localWrites.set(local, (localWrites.get(local) || 0) + 1);
+        localStoreSites.set(local, index);
+      } else if (op === "iinc") {
+        const local = Number(instruction.varnum ?? instruction.arg);
+        localWrites.set(local, (localWrites.get(local) || 0) + 1);
+      }
+    }
+    const constantLocals = new Map();
+    for (const [parameter, expression] of options.constantArguments || []) {
+      const local = parameterLocals[parameter];
+      if (Number.isInteger(local) && !localWrites.has(local) &&
+          integerLiteral(expression) !== null) {
+        constantLocals.set(local, String(integerLiteral(expression)));
+      }
+    }
+    for (const [local, count] of localWrites) {
+      if (count !== 1 || localTypes[local]) continue;
+      const storeIndex = localStoreSites.get(local);
+      const source = codeItems[storeIndex - 1] &&
+        codeItems[storeIndex - 1].instruction;
+      const sourceOp = getOp(source);
+      const literal = constantValue(source, sourceOp);
+      if (literal !== null && integerLiteral(literal) !== null) {
+        constantLocals.set(local, String(integerLiteral(literal)));
+        continue;
+      }
+      if (sourceOp === "getstatic") {
+        const staticIndex = region.staticIndex.get(JSON.stringify(source.arg));
+        if (region.falseGuardStaticIndices?.has(staticIndex)) {
+          constantLocals.set(local, "0");
+        }
+      }
+    }
     let argIndex = 0;
     for (let index = 0; index < verified.localsSize; index += 1) {
       if (localTypes[index]) {
@@ -904,6 +1076,8 @@ class FusedRegionCompiler {
 
     let temporary = 0;
     let trustedScanlineInlineCount = 0;
+    let foldedConstantBranches = 0;
+    let dominatedArithmeticGuardCount = 0;
     const temp = () => `v${temporary++}`;
     const localsSnapshot = () =>
       `[${Array.from({ length: verified.localsSize }, (_unused, index) =>
@@ -943,9 +1117,14 @@ class FusedRegionCompiler {
           planningOp = op;
           if (!op || op === "nop") continue;
           if (/^[ai]load(?:_[0-3])?$/.test(op)) {
-            const output = temp();
-            lines.push(`const ${output}=l${localIndex(instruction, op)};`);
-            expressions.push(output);
+            const local = localIndex(instruction, op);
+            if (constantLocals.has(local)) {
+              expressions.push(constantLocals.get(local));
+            } else {
+              const output = temp();
+              lines.push(`const ${output}=l${local};`);
+              expressions.push(output);
+            }
           } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
             const input = pop();
             if (input === undefined) throw new Error("stack underflow");
@@ -995,9 +1174,11 @@ class FusedRegionCompiler {
             }
             const divisor = temp();
             lines.push(`const ${divisor}=${divisorExpression};`);
-            lines.push(`if(${divisor}===0)${captureThrow(index,
-              [dividend, divisor],
-              '{type:"java/lang/ArithmeticException",message:"/ by zero"}')}`);
+            if (!trustedDivisorPcs.has(index)) {
+              lines.push(`if(${divisor}===0)${captureThrow(index,
+                [dividend, divisor],
+                '{type:"java/lang/ArithmeticException",message:"/ by zero"}')}`);
+            }
             expressions.push(op === "idiv"
               ? `((${dividend}/${divisor})|0)`
               : `((${dividend}%${divisor})|0)`);
@@ -1035,12 +1216,14 @@ class FusedRegionCompiler {
               throw new Error("stack underflow");
             }
             const output = temp();
-            lines.push(`if(${array}==null)${captureThrow(index,
-              [array, arrayIndex],
-              '{type:"java/lang/NullPointerException",message:null}')}`);
-            lines.push(`if((${arrayIndex}|0)<0||(${arrayIndex}|0)>=${array}.length)` +
-              captureThrow(index, [array, arrayIndex],
-                '{type:"java/lang/ArrayIndexOutOfBoundsException",message:null}'));
+            if (!trustedArrayExpressions.has(array)) {
+              lines.push(`if(${array}==null)${captureThrow(index,
+                [array, arrayIndex],
+                '{type:"java/lang/NullPointerException",message:null}')}`);
+              lines.push(`if((${arrayIndex}|0)<0||(${arrayIndex}|0)>=${array}.length)` +
+                captureThrow(index, [array, arrayIndex],
+                  '{type:"java/lang/ArrayIndexOutOfBoundsException",message:null}'));
+            }
             lines.push(`const ${output}=${array}[${arrayIndex}|0];`);
             expressions.push(output);
           } else if (op === "iastore") {
@@ -1071,13 +1254,22 @@ class FusedRegionCompiler {
             } else if (role === "raster" &&
                 memberKey(call) === region.family.scanlineKey) {
               if (options.trustedScanlinePlan) {
-                const trustedLines = emitTrustedScanline(
-                  options.trustedScanlinePlan, args, temp);
-                if (!trustedLines) {
+                const tag = options.trustedScanlinePlan.tag;
+                const tagValue = options.trustedScanlinePlan.tagValue;
+                if (String(args[tag]).trim() !== String(tagValue)) {
                   throw new Error("trusted scanline arguments do not preserve the verified tag");
                 }
-                lines.push(...trustedLines);
-                trustedScanlineInlineCount += 1;
+                if (trustedScanlineHelper) {
+                  lines.push(`f0(${args.join(",")});`);
+                } else {
+                  const trustedLines = emitTrustedScanline(
+                    options.trustedScanlinePlan, args, temp);
+                  if (!trustedLines) {
+                    throw new Error("trusted scanline could not be emitted");
+                  }
+                  lines.push(...trustedLines);
+                  trustedScanlineInlineCount += 1;
+                }
               } else {
                 lines.push(`region.scanlineKernel(state,region,helpers,` +
                   `${args.join(",")});`);
@@ -1092,6 +1284,8 @@ class FusedRegionCompiler {
                   substitute(statement)),
                 `${output}=${substitute(call.inline.result)};`, "}");
               expressions.push(`(${output}|0)`);
+            } else if (call && call.kind === "math-intrinsic") {
+              expressions.push(`(Math.${call.name}(${args.join(",")})|0)`);
             } else if (call && call.kind === "integer-native") {
               const nativeIndex = region.nativeCalls.length;
               region.nativeCalls.push(call.native);
@@ -1110,7 +1304,8 @@ class FusedRegionCompiler {
               if (parsed.returnType !== "void") expressions.push("undefined");
             }
             if (parsed.returnType !== "void" &&
-                !(call && (call.kind === "integer-native" ||
+                !(call && (call.kind === "math-intrinsic" ||
+                  call.kind === "integer-native" ||
                   call.kind === "integer-inline" ||
                   call.kind === "early-bailout"))) {
               throw new Error("unsupported call result");
@@ -1128,7 +1323,9 @@ class FusedRegionCompiler {
               if (left === undefined || right === undefined || !compare) {
                 throw new Error("invalid conditional stack");
               }
-              condition = canonicalIntegerComparison(left, compare, right);
+              const folded = foldIntegerComparison(left, compare, right);
+              condition = folded === null
+                ? canonicalIntegerComparison(left, compare, right) : folded;
             } else {
               const input = pop();
               const compare = {
@@ -1138,7 +1335,9 @@ class FusedRegionCompiler {
               if (input === undefined || !compare) {
                 throw new Error("invalid conditional stack");
               }
-              condition = `${input}${compare}`;
+              const operator = compare.slice(0, compare.length - 1);
+              const folded = foldIntegerComparison(input, operator, "0");
+              condition = folded === null ? `${input}${compare}` : folded;
             }
           } else if (op === "return") {
             lines.push("return;");
@@ -1169,6 +1368,33 @@ class FusedRegionCompiler {
       return expressions.map((expression, slot) =>
         `j${target}_${slot}=${expression};`);
     };
+    const specializeNonZeroBranch = (plan, lines, taken) => {
+      const match = /^([A-Za-z_$][\w$]*)(===|!==)0$/.exec(
+        String(plan.condition));
+      if (!match || (match[2] === "!==") !== taken) return lines;
+      const equivalent = new Set([match[1]]);
+      const learnAlias = (line) => {
+        const declaration = /^\s*const ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*);$/.exec(line);
+        const assignment = /^\s*([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*);$/.exec(line);
+        const alias = declaration || assignment;
+        if (!alias || !equivalent.has(alias[2])) return;
+        equivalent.add(alias[1]);
+      };
+      let changed = true;
+      while (changed) {
+        const size = equivalent.size;
+        for (const line of plan.lines || []) learnAlias(line);
+        changed = equivalent.size !== size;
+      }
+      return lines.filter((line) => {
+        learnAlias(line);
+        const zeroCheck = /^\s*if\(([A-Za-z_$][\w$]*)===0\)\{.*java\/lang\/ArithmeticException/.exec(
+          line);
+        if (!zeroCheck || !equivalent.has(zeroCheck[1])) return true;
+        dominatedArithmeticGuardCount += 1;
+        return false;
+      });
+    };
     const indent = (lines) => lines.map((line) => `  ${line}`);
     const render = (node) => {
       if (!node) return [];
@@ -1186,15 +1412,23 @@ class FusedRegionCompiler {
       if (node.t === "if") {
         const plan = plans[node.block];
         const term = cfg.term[node.block];
-        if (!plan.condition || term.kind !== "cond") {
+        if (plan.condition === null || term.kind !== "cond") {
           throw new Error("missing lexical fused condition");
         }
+        if (typeof plan.condition === "boolean") {
+          foldedConstantBranches += 1;
+          const target = plan.condition ? term.taken : term.fall;
+          const child = plan.condition ? node.then : node.els;
+          return [...edgeLines(target, plan.stack), ...render(child)];
+        }
+        const thenLines = specializeNonZeroBranch(plan,
+          [...edgeLines(term.taken, plan.stack), ...render(node.then)], true);
+        const elseLines = specializeNonZeroBranch(plan,
+          [...edgeLines(term.fall, plan.stack), ...render(node.els)], false);
         return [`if(${plan.condition}){`,
-          ...indent([...edgeLines(term.taken, plan.stack),
-            ...render(node.then)]),
+          ...indent(thenLines),
           "}else{",
-          ...indent([...edgeLines(term.fall, plan.stack),
-            ...render(node.els)]),
+          ...indent(elseLines),
           "}"];
       }
       if (node.t === "loop") {
@@ -1212,12 +1446,13 @@ class FusedRegionCompiler {
     try {
       const body = ["\"use strict\";", ...declarations,
         ...render(structured.tree)];
+      const source = body.join("\n");
       const owner = role === "wrapper" ? region.wrapperOwner
         : role === "raster" ? region.rasterOwner : region.scanlineOwner;
       const generated = this.jit.createGeneratedFunction(method,
         `fused-${region.family.name}-lexical-${failureRole}`,
         ["state", "region", "helpers", ...argNames, ...capturedStaticNames],
-        body.join("\n"), owner);
+        source, owner);
       generated.jvmLexicalFusedKernel = true;
       generated.jvmTrustedFusedRaster = Boolean(options.trustedScanlinePlan);
       generated.jvmTrustedScanlineInlineCount = trustedScanlineInlineCount;
@@ -1225,7 +1460,13 @@ class FusedRegionCompiler {
         region.falseGuardStaticIndices?.size || 0;
       generated.jvmCapturedStaticCount = capturedStaticNames.length;
       generated.jvmConstantArgumentCount = options.constantArguments?.size || 0;
-      generated.jvmLexicalFusedSource = body.join("\n");
+      generated.jvmFoldedConstantBranchCount = foldedConstantBranches;
+      generated.jvmPrunedGuardedBooleanBranchCount =
+        prunedGuardedBooleanBranches;
+      generated.jvmTrustedArrayStaticCount = trustedArrayExpressions.size;
+      generated.jvmDominatedArithmeticGuardCount =
+        dominatedArithmeticGuardCount;
+      generated.jvmLexicalFusedSource = source;
       this.jit.lexicalFusedKernelCount =
         (this.jit.lexicalFusedKernelCount | 0) + 1;
       return generated;
@@ -1393,6 +1634,8 @@ class FusedRegionCompiler {
               ...call.inline.statements.map((statement) => substitute(statement)),
               `${result}=${substitute(call.inline.result)};`, "}");
             expressions.push(`(${result}|0)`);
+          } else if (call && call.kind === "math-intrinsic") {
+            expressions.push(`(Math.${call.name}(${args.join(",")})|0)`);
           } else if (call && call.kind === "integer-native") {
             const nativeIndex = region.nativeCalls.length;
             region.nativeCalls.push(callByIndex.get(index).native);
@@ -1404,7 +1647,8 @@ class FusedRegionCompiler {
             body.push("throw helpers.fusedBailout();");
           }
           if (parsed.returnType !== "void" &&
-              !(call && (call.kind === "integer-native" || call.kind === "integer-inline" ||
+              !(call && (call.kind === "math-intrinsic" ||
+                call.kind === "integer-native" || call.kind === "integer-inline" ||
                 call.kind === "early-bailout"))) throw new Error("unsupported call result");
         } else if (op === "goto" || op === "goto_w") {
           body.push(...transfer(expressions, branchTarget(instruction, labels))); terminated = true;
@@ -1498,10 +1742,20 @@ class FusedRegionCompiler {
     const args = descriptor.params.map((_, index) => `a${index}`);
     const fallback = `return region.generatedRasterKernel(state,region,helpers,` +
       `${args.join(",")});`;
-    const staticRead = (index) =>
-      `(region.staticTargets[${index}].kind==="map"?` +
-      `region.staticTargets[${index}].fields.get(region.staticTargets[${index}].key):` +
-      `region.staticTargets[${index}].fields[region.staticTargets[${index}].key])`;
+    const captures = {};
+    const capturedStatics = new Map();
+    const staticRead = (index) => {
+      if (capturedStatics.has(index)) return capturedStatics.get(index);
+      const target = region.staticTargets[index];
+      if (!target || !target.fields) return "undefined";
+      const name = `sf${capturedStatics.size}`;
+      captures[name] = target.fields;
+      const expression = target.kind === "map"
+        ? `${name}.get(${JSON.stringify(target.key)})`
+        : `${name}[${JSON.stringify(target.key)}]`;
+      capturedStatics.set(index, expression);
+      return expression;
+    };
     const staticNames = new Map([
       [plan.heightStatic, "rasterHeight"],
       [plan.widthStatic, "rasterWidth"],
@@ -1523,6 +1777,14 @@ class FusedRegionCompiler {
             `rasterRows[${name}]!==Math.imul(${name},rasterStride))`,
         };
       });
+    const divisorConditions = (plan.divisorGuardPlan?.guards || []).map(
+      (guard) => guard.kind === "nonzero-parameter"
+        ? `((${args[guard.parameter]}|0)===0)`
+        : `((${args[guard.left]}|0)===(${args[guard.right]}|0))`);
+    const provenConditions = [
+      ...rowConditions.map(({ condition }) => condition),
+      ...divisorConditions,
+    ];
     const body = [
       "\"use strict\";",
       `const rasterHeight=${staticRead(plan.heightStatic)}|0;`,
@@ -1535,139 +1797,16 @@ class FusedRegionCompiler {
         "rasterDest==null||rasterRows==null||rasterHeight<=0||" +
         "rasterRows.length<rasterHeight||" +
         "rasterDest.length<(Math.imul(rasterHeight-1,rasterStride)+rasterWidth|0)||" +
-        `${rowConditions.map(({ condition }) => condition).join("||")}){${fallback}}`,
+        `${provenConditions.join("||")}){${fallback}}`,
       `return region.trustedRasterKernel(state,region,helpers,` +
         `${[...args, ...captureArguments].join(",")});`,
     ];
     const generated = this.jit.createGeneratedFunction(method,
       `fused-${region.family.name}-trusted-raster-bridge`,
       ["state", "region", "helpers", ...args], body.join("\n"),
-      region.rasterOwner);
+      region.rasterOwner, false, false, captures);
     generated.jvmTrustedRasterBridge = true;
     generated.jvmTrustedRasterBridgeRowCandidateCount = rowConditions.length;
-    return generated;
-  }
-
-  // Lower a fully verified affine-edge triangle into the same compact control
-  // vocabulary that a source compiler would use. The admission proof is
-  // descriptor/CFG/opcode/callee based and supplies every parameter/static
-  // role; this emitter never examines a class or method name. The surrounding
-  // bridge proves the destination and row layout before entering this body,
-  // while the original lexical raster remains the exact exceptional fallback.
-  compileVerifiedFlatRaster(method, region, plan) {
-    const roles = plan.affineEdgeParameters;
-    if (!roles || !region.semanticScanlinePlan ||
-        region.semanticScanlinePlan.kind !== "constant-color") return null;
-    const descriptor = parseDescriptor(method.descriptor);
-    const args = descriptor.params.map((_, index) => `a${index}`);
-    const required = ["xTop", "yMid", "xBottom", "yBottom", "color",
-      "xMid", "yTop", "destination"];
-    if (required.some((role) => !Number.isInteger(roles[role]) ||
-        roles[role] < 0 || roles[role] >= args.length)) return null;
-    const value = (role) => args[roles[role]];
-
-    const scanSource = [
-      '"use strict";',
-      "index|=0;count|=0;color|=0;",
-      "for(let offset=0;offset<count;offset+=1){",
-      "dest[index]=(color+((dest[index]&16711422)>>1))|0;",
-      "index=(index+1)|0;}",
-    ].join("\n");
-    const scan = this.jit.createGeneratedFunction(method,
-      `fused-${region.family.name}-verified-flat-scan`,
-      ["dest", "index", "count", "color"], scanSource,
-      region.scanlineOwner);
-    const drawRowSource = [
-      '"use strict";',
-      "const xLeft=leftFixed>>16;",
-      "if(width<=xLeft)return;",
-      "let count=((rightFixed>>16)-xLeft)|0;",
-      "if(count===0)return;",
-      "if(((xLeft+count)|0)>=width)count=(((width-xLeft)|0)-1)|0;",
-      "if(xLeft>=0)scan(dest,(rowBase+xLeft)|0,count,color);",
-      "else scan(dest,rowBase,(count+xLeft)|0,color);",
-    ].join("\n");
-    const drawRow = this.jit.createGeneratedFunction(method,
-      `fused-${region.family.name}-verified-flat-row`,
-      ["dest", "rowBase", "width", "leftFixed", "rightFixed", "color"],
-      drawRowSource, region.rasterOwner, false, false, { scan });
-
-    const body = [
-      '"use strict";',
-      `let xTop=${value("xTop")}|0;`,
-      `let yMid=${value("yMid")}|0;`,
-      `let xBottom=${value("xBottom")}|0;`,
-      `let yBottom=${value("yBottom")}|0;`,
-      `const color=${value("color")}|0;`,
-      `let xMid=${value("xMid")}|0;`,
-      `let yTop=${value("yTop")}|0;`,
-      `const dest=${value("destination")};`,
-      "const height=c0|0,width=c1|0,rows=c2,stride=c3|0;",
-      "if(yBottom<0||yTop>=height)return;",
-      "if(xTop<0&&xMid<0&&xBottom<0)return;",
-      "if(xTop>=width&&xMid>=width&&xBottom>=width)return;",
-      "const fullHeight=(yBottom-yTop)|0;",
-      "let left=0,right=0,leftStep=0,rightStep=0,middleOnRight=0;",
-      "if(yMid!==yTop){",
-      "left=xTop<<16;right=left;",
-      "const upperHeight=(yMid-yTop)|0;",
-      "rightStep=(((xBottom-xTop)|0)<<16)/fullHeight|0;",
-      "leftStep=(((xMid-xTop)|0)<<16)/upperHeight|0;",
-      "if(leftStep>rightStep){const swap=leftStep;leftStep=rightStep;" +
-        "rightStep=swap;middleOnRight=1;}",
-      "if(yTop<0){if(yMid>=0){const advance=(-yTop)|0;" +
-        "left=(left+Math.imul(advance,leftStep))|0;" +
-        "right=(right+Math.imul(advance,rightStep))|0;yTop=0;}else{" +
-        "const advance=(yMid-yTop)|0;" +
-        "left=(left+Math.imul(leftStep,advance))|0;" +
-        "right=(right+Math.imul(rightStep,advance))|0;yTop=yMid;}}",
-      "if(yTop<yMid){let rowBase=rows[yTop]|0;while(yTop<yMid){" +
-        "drawRow(dest,rowBase,width,left,right,color);yTop=(yTop+1)|0;" +
-        "if(yTop>=height)return;left=(left+leftStep)|0;" +
-        "right=(right+rightStep)|0;rowBase=(rowBase+stride)|0;}}",
-      "const lowerHeight=(yBottom-yMid)|0;",
-      "if(lowerHeight!==0){const bottom=xBottom<<16;" +
-        "if(middleOnRight!==0)right=xMid<<16;else left=xMid<<16;" +
-        "rightStep=((bottom-right)|0)/lowerHeight|0;" +
-        "leftStep=((bottom-left)|0)/lowerHeight|0;}else{" +
-        "rightStep=0;leftStep=0;}",
-      "}else{",
-      "if(yTop!==yBottom){const lowerHeight=(yBottom-yTop)|0;" +
-        "if(xMid<=xTop){leftStep=(((xBottom-xMid)|0)<<16)/lowerHeight|0;" +
-        "rightStep=(((xBottom-xTop)|0)<<16)/fullHeight|0;" +
-        "left=xMid<<16;right=xTop<<16;}else{left=xTop<<16;right=xMid<<16;" +
-        "leftStep=(((xBottom-xTop)|0)<<16)/fullHeight|0;" +
-        "rightStep=(((xBottom-xMid)|0)<<16)/lowerHeight|0;}}else{" +
-        "leftStep=0;rightStep=0;left=xTop<<16;right=xMid<<16;}",
-      "if(yTop<0){const advance=Math.min((-yTop)|0,(yMid-yTop)|0)|0;" +
-        "left=(left+Math.imul(advance,leftStep))|0;" +
-        "right=(right+Math.imul(advance,rightStep))|0;yTop=0;}}",
-      "if(yTop<0){const advance=(-yTop)|0;" +
-        "left=(left+Math.imul(leftStep,advance))|0;" +
-        "right=(right+Math.imul(rightStep,advance))|0;yTop=0;}",
-      "let rowBase=rows[yTop]|0;",
-      plan.singleLowerScanline
-        ? "if(yTop<yBottom)drawRow(dest,rowBase,width,left,right,color);return;"
-        : "while(yTop<yBottom){drawRow(dest,rowBase,width,left,right,color);" +
-          "yTop=(yTop+1)|0;if(yTop>=height)return;" +
-          "left=(left+leftStep)|0;right=(right+rightStep)|0;" +
-          "rowBase=(rowBase+stride)|0;}",
-    ].join("\n");
-    const generated = this.jit.createGeneratedFunction(method,
-      `fused-${region.family.name}-verified-flat-raster`,
-      ["state", "region", "helpers", ...args, "c0", "c1", "c2", "c3"],
-      body, region.rasterOwner, false, false, { drawRow });
-    generated.jvmLexicalFusedKernel = true;
-    generated.jvmTrustedFusedRaster = true;
-    generated.jvmVerifiedFlatRaster = true;
-    generated.jvmTrustedScanlineInlineCount = 0;
-    generated.jvmGuardedFalseStaticCount =
-      region.falseGuardStaticIndices?.size || 0;
-    generated.jvmCapturedStaticCount = 4;
-    generated.jvmConstantArgumentCount = 0;
-    generated.jvmLexicalFusedSource = body;
-    generated.jvmVerifiedFlatScanSource = scanSource;
-    generated.jvmVerifiedFlatRowSource = drawRowSource;
     return generated;
   }
 
@@ -1694,6 +1833,11 @@ class FusedRegionCompiler {
             constantArguments,
             failureRole: "constant-trusted-raster",
             trustedScanlinePlan: region.semanticScanlinePlan,
+            trustedArrayStaticIndices: [
+              region.genericRasterSafetyPlan.rowsStatic,
+            ],
+            trustedDivisorGuards:
+              region.genericRasterSafetyPlan.divisorGuardPlan,
           });
         if (specialized) {
           region.trustedRasterKernel = specialized;
@@ -1737,22 +1881,31 @@ class FusedRegionCompiler {
     ];
     for (const [order, template] of [...plan.templates].sort((a, b) => a[0] - b[0])) {
       if (direct || trusted) {
-        const gradient = Boolean(region.semanticGradientRasterPlan ||
-          (!region.semanticFlatRasterPlan &&
-            region.genericRasterSafetyPlan &&
-            region.semanticScanlinePlan?.kind === "packed-color"));
-        const dest = template.arguments[gradient ? 12 : 8];
-        const yTop = template.arguments[gradient ? 11 : 7];
-        const yMid = template.arguments[gradient ? 3 : 1];
+        const dest = template.arguments[rasterPlan.destinationParameter];
+        const rowCandidates = (rasterPlan.rowParameters || []).map(
+          (parameter, candidate) => ({
+            name: `rasterRowCandidate${order}_${candidate}`,
+            expression: template.arguments[parameter],
+          }));
+        const divisorConditions = (rasterPlan.divisorGuardPlan?.guards || [])
+          .map((guard) => guard.kind === "nonzero-parameter"
+            ? `((${template.arguments[guard.parameter]}|0)===0)`
+            : `((${template.arguments[guard.left]}|0)===` +
+              `(${template.arguments[guard.right]}|0))`);
+        const provenConditions = [
+          ...rowCandidates.map(({ name }) =>
+            `(${name}<rasterHeight&&rasterRows[${name}]!==` +
+              `Math.imul(${name},rasterStride))`),
+          ...divisorConditions,
+        ];
         body.push(`case ${order}:{`,
           `const rasterDest=${dest};`,
-          `const rasterTop=(${yTop}|0)>0?(${yTop}|0):0;`,
-          `const rasterMid=(${yMid}|0)>0?(${yMid}|0):0;`,
+          ...rowCandidates.map(({ name, expression }) =>
+            `const ${name}=(${expression}|0)>0?(${expression}|0):0;`),
           "if(rasterDest==null||rasterRows==null||rasterHeight<=0||" +
             "rasterRows.length<rasterHeight||" +
             "rasterDest.length<(Math.imul(rasterHeight-1,rasterStride)+rasterWidth|0)||" +
-            "(rasterTop<rasterHeight&&rasterRows[rasterTop]!==Math.imul(rasterTop,rasterStride))||" +
-            "(rasterMid<rasterHeight&&rasterRows[rasterMid]!==Math.imul(rasterMid,rasterStride)))" +
+            provenConditions.join("||") + ")" +
             `{${fallback}}`,
           `state.outerPc=${template.pc};state.outerExtra=undefined;`,
           direct
@@ -1904,7 +2057,10 @@ function analyzePermutationWrapper(method, verified, region, jit) {
       }
     }
   }
-  if (templates.size !== 13) return reject(`ordering count ${templates.size}`);
+  // Every probed weak ordering is retained independently. Unseen relations
+  // use the generated fallback, so admission does not depend on a renderer-
+  // specific count of sort outcomes.
+  if (!templates.size) return reject("no stable orderings");
   region.semanticWrapperRejection = null;
   return { keys, booleanParameters, templates };
 }
@@ -2044,16 +2200,22 @@ function analyzeGradientRaster(method, verified, region, scanlinePlan) {
   if (!scanlinePlan || scanlinePlan.kind !== "packed-color") return null;
   let descriptor;
   try { descriptor = parseDescriptor(method.descriptor); } catch (_) { return null; }
-  if (descriptor.returnType !== "void" || descriptor.params.length !== 17 ||
-      descriptor.params[7] !== "byte" || descriptor.params[12] !== "int[]" ||
-      descriptor.params.some((type, index) =>
-        index !== 12 && !isIntType(type))) return null;
+  const byteParameters = descriptor.params
+    .map((type, parameter) => ({ type, parameter }))
+    .filter(({ type }) => type === "byte");
+  const arrayParameters = descriptor.params
+    .map((type, parameter) => ({ type, parameter }))
+    .filter(({ type }) => type === "int[]");
+  if (descriptor.returnType !== "void" || byteParameters.length !== 1 ||
+      arrayParameters.length !== 1 || descriptor.params.some((type) =>
+        type !== "int[]" && !isIntType(type))) return null;
+  const tagParameter = byteParameters[0].parameter;
+  const destinationParameter = arrayParameters[0].parameter;
   const ops = [...verified.reachable].map((index) =>
     getOp(verified.codeItems[index] && verified.codeItems[index].instruction)).filter(Boolean);
   const count = (op) => ops.filter((candidate) => candidate === op).length;
   const scanlineCalls = verified.calls.filter((call) => call.kind === "child").length;
-  if (scanlineCalls < 2 || count("idiv") < 8 || count("ishl") < 8 ||
-      count("imul") < 4 || count("iaload") < 1 || count("putstatic") !== 0) return null;
+  if (scanlineCalls < 1 || count("iaload") < 1 || count("putstatic") !== 0) return null;
 
   const groups = new Map();
   verified.staticRefs.forEach((ref, order) => {
@@ -2078,8 +2240,17 @@ function analyzeGradientRaster(method, verified, region, scanlinePlan) {
     widthStatic: staticIndex(width),
     rowsStatic: staticIndex(rows[0]),
     strideStatic: staticIndex(stride),
+    destinationParameter,
+    tagParameter,
   };
   if (Object.values(plan).some((index) => index === undefined)) return null;
+  const tagValues = comparedParameterConstants(method, verified, tagParameter);
+  if (tagValues.length !== 1) return null;
+  plan.tagValue = tagValues[0];
+  plan.rowParameters = analyzeStaticArrayIndexParameters(
+    method, verified, region, plan.rowsStatic);
+  if (!plan.rowParameters?.length) return null;
+  plan.divisorGuardPlan = analyzeLinearDivisorGuards(method, verified, region);
   return plan;
 }
 
@@ -2097,8 +2268,8 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
   const arrayParameters = descriptor.params
     .map((type, parameter) => ({ type, parameter }))
     .filter(({ type }) => type === "int[]");
-  if (descriptor.returnType !== "void" || descriptor.params.length !== 9 ||
-      byteParameters.length !== 1 || arrayParameters.length !== 1 ||
+  if (descriptor.returnType !== "void" || byteParameters.length !== 1 ||
+      arrayParameters.length !== 1 ||
       descriptor.params.some((type) => type !== "int[]" && !isIntType(type))) {
     return reject("parameter shape");
   }
@@ -2109,8 +2280,7 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
     getOp(verified.codeItems[index] && verified.codeItems[index].instruction)).filter(Boolean);
   const count = (op) => ops.filter((candidate) => candidate === op).length;
   const scanlineCalls = verified.calls.filter((call) => call.kind === "child").length;
-  if (scanlineCalls !== 6 || count("idiv") !== 8 || count("ishl") !== 16 ||
-      count("imul") !== 8 || count("iaload") !== 2 || count("putstatic") !== 0) {
+  if (scanlineCalls < 1 || count("iaload") < 1 || count("putstatic") !== 0) {
     return reject(`opcode shape calls=${scanlineCalls} idiv=${count("idiv")} ` +
       `ishl=${count("ishl")} imul=${count("imul")} iaload=${count("iaload")} ` +
       `putstatic=${count("putstatic")}`);
@@ -2158,25 +2328,12 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
     tagParameter,
     tagValue: tagValues[0],
     singleLowerScanline: !hasLowerBackedge,
-    // The accepted descriptor has seven geometric/color integer operands,
-    // followed by the uniquely derived byte tag and destination roles above.
-    // Exact opcode/callee multiplicities make this mapping part of the
-    // verified affine-edge family rather than a method-identity shortcut.
-    affineEdgeParameters: {
-      xTop: 0,
-      yMid: 1,
-      xBottom: 2,
-      yBottom: 3,
-      color: 4,
-      xMid: 6,
-      yTop: 7,
-      destination: destinationParameter,
-    },
   };
   if (Object.values(plan).some((value) => value === undefined)) return reject("unresolved static");
   plan.rowParameters = analyzeStaticArrayIndexParameters(
     method, verified, region, plan.rowsStatic);
   if (!plan.rowParameters?.length) return reject("row-index provenance");
+  plan.divisorGuardPlan = analyzeLinearDivisorGuards(method, verified, region);
   region.semanticFlatRasterRejection = null;
   return plan;
 }
@@ -2216,6 +2373,7 @@ function analyzeStaticArrayIndexParameters(method, verified, region, targetStati
   const initial = {
     locals: Array.from({ length: verified.localsSize }, unknown),
     stack: [],
+    nonzero: new Set(),
   };
   let slot = 0;
   descriptor.params.forEach((type, index) => {
@@ -2347,6 +2505,294 @@ function analyzeStaticArrayIndexParameters(method, verified, region, targetStati
     for (const parameterIndex of index.params) parameters.add(parameterIndex);
   }
   return matchedLoads > 0 ? [...parameters].sort((a, b) => a - b) : null;
+}
+
+// Prove integer divisors safe using affine entry values and branch facts. The
+// abstract domain is deliberately small and exact: affine sums of entry
+// integer parameters, plus nonzero facts intersected at CFG joins. A resolved
+// false entry guard participates in SCCP, and x ^ -1 remains affine as -x-1.
+// Multiplication, loads, calls, and other lossy operations become unknown.
+// Consequently each omitted check has a bytecode/dataflow proof; unfamiliar
+// methods simply retain their ordinary arithmetic guard.
+function analyzeLinearDivisorGuards(method, verified, region = null) {
+  const debug = typeof process !== "undefined" && process.env &&
+    process.env.JVM_DEBUG_LINEAR_DIVISORS === "1";
+  const reject = (reason) => {
+    if (debug) console.error("[linear-divisors]", method.descriptor, reason);
+    return null;
+  };
+  const descriptor = parseDescriptor(method.descriptor);
+  const items = verified.codeItems;
+  const unknown = () => ({ unknown: true, constant: 0, terms: new Map() });
+  const affine = (constant = 0, terms = new Map()) => ({
+    unknown: false, constant: constant | 0, terms: new Map(terms),
+  });
+  const parameter = (index) => affine(0, new Map([[index, 1]]));
+  const copy = (value) => value.unknown ? unknown() : affine(value.constant, value.terms);
+  const key = (value) => value.unknown ? "?" : `${value.constant}:` +
+    [...value.terms].sort((a, b) => a[0] - b[0])
+      .map(([index, coefficient]) => `${index}=${coefficient}`).join(",");
+  const combine = (left, right, sign) => {
+    if (!left || !right || left.unknown || right.unknown) return unknown();
+    const terms = new Map(left.terms);
+    for (const [index, coefficient] of right.terms) {
+      const next = (terms.get(index) || 0) + sign * coefficient;
+      if (next) terms.set(index, next); else terms.delete(index);
+    }
+    return affine((left.constant + sign * right.constant) | 0, terms);
+  };
+  const initial = {
+    locals: Array.from({ length: verified.localsSize }, unknown),
+    stack: [],
+  };
+  let slot = 0;
+  descriptor.params.forEach((type, index) => {
+    initial.locals[slot] = isIntType(type) ? parameter(index) : unknown();
+    slot += type === "long" || type === "double" ? 2 : 1;
+  });
+  const states = new Array(items.length);
+  states[0] = initial;
+  const work = [0];
+  const queued = new Set(work);
+  const divisors = new Map();
+  const pathProvenDivisors = new Map();
+  const cloneState = (state) => ({
+    locals: state.locals.map(copy), stack: state.stack.map(copy),
+    nonzero: new Set(state.nonzero),
+  });
+  const mergeState = (index, incoming) => {
+    if (!verified.reachable.has(index)) return;
+    const existing = states[index];
+    if (!existing) {
+      states[index] = cloneState(incoming);
+      if (!queued.has(index)) { queued.add(index); work.push(index); }
+      return;
+    }
+    if (existing.stack.length !== incoming.stack.length) {
+      throw new Error("linear divisor stack join");
+    }
+    let changed = false;
+    const mergeValue = (left, right) => key(left) === key(right) ? left : unknown();
+    for (let local = 0; local < existing.locals.length; local += 1) {
+      const merged = mergeValue(existing.locals[local], incoming.locals[local]);
+      if (key(merged) !== key(existing.locals[local])) {
+        existing.locals[local] = merged; changed = true;
+      }
+    }
+    for (let index = 0; index < existing.stack.length; index += 1) {
+      const merged = mergeValue(existing.stack[index], incoming.stack[index]);
+      if (key(merged) !== key(existing.stack[index])) {
+        existing.stack[index] = merged; changed = true;
+      }
+    }
+    for (const fact of [...existing.nonzero]) {
+      if (!incoming.nonzero.has(fact)) {
+        existing.nonzero.delete(fact);
+        changed = true;
+      }
+    }
+    if (changed && !queued.has(index)) { queued.add(index); work.push(index); }
+  };
+  try {
+    while (work.length) {
+      const index = work.shift();
+      queued.delete(index);
+      const state = cloneState(states[index]);
+      const instruction = items[index] && items[index].instruction;
+      const op = getOp(instruction);
+      const pop = () => state.stack.pop();
+      const push = (value) => state.stack.push(value);
+      const popBinary = () => {
+        const right = pop(), left = pop();
+        if (!left || !right) throw new Error("linear divisor stack underflow");
+        return { left, right };
+      };
+      let terminal = false;
+      if (!op || op === "nop") {
+        // no effect
+      } else if (/^[ai]load(?:_[0-3])?$/.test(op)) {
+        push(copy(state.locals[localIndex(instruction, op)] || unknown()));
+      } else if (/^[ai]store(?:_[0-3])?$/.test(op)) {
+        const value = pop();
+        if (!value) throw new Error("linear divisor stack underflow");
+        state.locals[localIndex(instruction, op)] = value;
+      } else if (op === "aconst_null") {
+        push(unknown());
+      } else if (/^iconst_(?:m1|[0-5])$/.test(op) ||
+          ["bipush", "sipush", "ldc", "ldc_w"].includes(op)) {
+        const literal = constantValue(instruction, op);
+        push(literal !== null && integerLiteral(literal) !== null
+          ? affine(integerLiteral(literal)) : unknown());
+      } else if (op === "checkcast") {
+        // value unchanged
+      } else if (op === "dup") {
+        const value = pop();
+        if (!value) throw new Error("linear divisor stack underflow");
+        push(copy(value)); push(value);
+      } else if (op === "pop") {
+        if (!pop()) throw new Error("linear divisor stack underflow");
+      } else if (op === "iadd" || op === "isub") {
+        const { left, right } = popBinary();
+        push(combine(left, right, op === "iadd" ? 1 : -1));
+      } else if (op === "ineg") {
+        const value = pop();
+        if (!value) throw new Error("linear divisor stack underflow");
+        push(value.unknown ? unknown() : affine(-value.constant,
+          new Map([...value.terms].map(([parameter, coefficient]) =>
+            [parameter, -coefficient]))));
+      } else if (op === "idiv" || op === "irem") {
+        const { left: _dividend, right: divisor } = popBinary();
+        if (op === "idiv") {
+          const existing = divisors.get(index);
+          divisors.set(index, existing && key(existing) !== key(divisor)
+            ? unknown() : copy(divisor));
+          const proven = !divisor.unknown && state.nonzero.has(key(divisor));
+          pathProvenDivisors.set(index,
+            pathProvenDivisors.has(index)
+              ? pathProvenDivisors.get(index) && proven : proven);
+        }
+        push(unknown());
+      } else if (op === "ixor") {
+        const { left, right } = popBinary();
+        const complement = (value) => value.unknown ? unknown() :
+          affine((-value.constant - 1) | 0,
+            new Map([...value.terms].map(([parameter, coefficient]) =>
+              [parameter, -coefficient])));
+        if (!left.unknown && left.constant === -1 && !left.terms.size) {
+          push(complement(right));
+        } else if (!right.unknown && right.constant === -1 && !right.terms.size) {
+          push(complement(left));
+        } else {
+          push(unknown());
+        }
+      } else if (["imul", "iand", "ior", "ishl", "ishr", "iushr"]
+        .includes(op)) {
+        popBinary(); push(unknown());
+      } else if (op === "iinc") {
+        const local = Number(instruction.varnum ?? instruction.arg);
+        const increment = affine(Number(instruction.incr || 0));
+        state.locals[local] = combine(
+          state.locals[local] || unknown(), increment, 1);
+      } else if (op === "getstatic") {
+        const staticIndex = region?.staticIndex.get(JSON.stringify(instruction.arg));
+        push(region?.falseGuardStaticIndices?.has(staticIndex)
+          ? affine(0) : unknown());
+      } else if (op === "putstatic") {
+        if (!pop()) throw new Error("linear divisor stack underflow");
+      } else if (op === "iaload") {
+        if (!pop() || !pop()) throw new Error("linear divisor stack underflow");
+        push(unknown());
+      } else if (op === "iastore") {
+        if (!pop() || !pop() || !pop()) {
+          throw new Error("linear divisor stack underflow");
+        }
+      } else if (op === "invokestatic") {
+        const parsed = parseDescriptor(instruction.arg[2][1]);
+        for (let argument = 0; argument < parsed.params.length; argument += 1) {
+          if (!pop()) throw new Error("linear divisor stack underflow");
+        }
+        if (parsed.returnType !== "void") push(unknown());
+      } else if (op === "goto" || op === "goto_w") {
+        terminal = true;
+        mergeState(branchTarget(instruction, verified.labels), state);
+      } else if (op && op.startsWith("if")) {
+        const binary = op.startsWith("if_icmp") || op.startsWith("if_acmp");
+        const right = pop();
+        const left = binary ? pop() : null;
+        if (!right || binary && !left) {
+          throw new Error("linear divisor stack underflow");
+        }
+        const compared = binary ? combine(left, right, -1) : right;
+        const comparedKey = compared && !compared.unknown ? key(compared) : null;
+        const takenProvesNonzero = new Set([
+          "ifne", "iflt", "ifgt", "if_icmpne", "if_icmplt", "if_icmpgt",
+        ]).has(op);
+        const fallProvesNonzero = new Set([
+          "ifeq", "ifge", "ifle", "if_icmpeq", "if_icmpge", "if_icmple",
+        ]).has(op);
+        const takenState = cloneState(state);
+        const fallState = cloneState(state);
+        if (comparedKey) {
+          if (takenProvesNonzero) takenState.nonzero.add(comparedKey);
+          if (fallProvesNonzero) fallState.nonzero.add(comparedKey);
+        }
+        terminal = true;
+        let constantOutcome = null;
+        if (!binary || op.startsWith("if_icmp")) {
+          if (compared && !compared.unknown && !compared.terms.size) {
+            const value = compared.constant | 0;
+            if (op.endsWith("eq")) constantOutcome = value === 0;
+            else if (op.endsWith("ne")) constantOutcome = value !== 0;
+            else if (op.endsWith("lt")) constantOutcome = value < 0;
+            else if (op.endsWith("ge")) constantOutcome = value >= 0;
+            else if (op.endsWith("gt")) constantOutcome = value > 0;
+            else if (op.endsWith("le")) constantOutcome = value <= 0;
+          }
+        }
+        if (constantOutcome !== false) {
+          mergeState(branchTarget(instruction, verified.labels), takenState);
+        }
+        if (constantOutcome !== true && index + 1 < items.length) {
+          mergeState(index + 1, fallState);
+        }
+      } else if (op === "return" || op === "athrow") {
+        terminal = true;
+      } else {
+        return reject(`unsupported opcode ${op} at ${index}`);
+      }
+      if (!terminal && index + 1 < items.length) mergeState(index + 1, state);
+    }
+  } catch (error) {
+    return reject(error && error.message || error);
+  }
+  const divisionCount = [...verified.reachable].filter((index) =>
+    getOp(items[index] && items[index].instruction) === "idiv").length;
+  if (!divisionCount || divisors.size !== divisionCount) {
+    return reject(`division coverage ${divisors.size}/${divisionCount}`);
+  }
+  const guards = new Map();
+  const coveredPcs = [];
+  for (const [index, divisor] of divisors) {
+    if (divisor.unknown) continue;
+    if (pathProvenDivisors.get(index)) {
+      coveredPcs.push(index);
+      continue;
+    }
+    const terms = [...divisor.terms];
+    if (terms.length === 0) {
+      if (divisor.constant === 0) continue;
+      coveredPcs.push(index);
+      continue;
+    }
+    let guard;
+    if (divisor.constant === 0 && terms.length === 1 &&
+        Math.abs(terms[0][1]) === 1) {
+      guard = { kind: "nonzero-parameter", parameter: terms[0][0] };
+    } else if (divisor.constant === 0 && terms.length === 2 &&
+        terms[0][1] === -terms[1][1] && Math.abs(terms[0][1]) === 1) {
+      guard = {
+        kind: "distinct-parameters",
+        left: terms[0][0], right: terms[1][0],
+      };
+    } else {
+      continue;
+    }
+    guards.set(JSON.stringify(guard), guard);
+    coveredPcs.push(index);
+  }
+  if (!coveredPcs.length) return reject("no affine divisors");
+  if (debug) {
+    console.error("[linear-divisors]", method.descriptor,
+      `covered ${coveredPcs.length}/${divisionCount} ` +
+      `path-proven ${[...pathProvenDivisors.values()].filter(Boolean).length}`,
+      [...divisors].map(([pc, divisor]) =>
+        `${pc}:${key(divisor)}${pathProvenDivisors.get(pc) ? "!" : ""}`).join(" "));
+  }
+  return {
+    divisionCount,
+    coveredPcs,
+    guards: [...guards.values()],
+  };
 }
 
 function comparedParameterConstants(method, verified, parameter) {

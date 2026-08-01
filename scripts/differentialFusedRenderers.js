@@ -526,7 +526,8 @@ function generatedShape(region) {
         }
         const captures = region.trustedRasterStaticIndices.map((index) =>
           readTarget(region.staticTargets[index]));
-        const targetPlan = targetRegion.semanticFlatRasterPlan;
+        const targetPlan = targetRegion.semanticGradientRasterPlan ||
+          targetRegion.semanticFlatRasterPlan;
         const targetLayout = [
           readTarget(targetRegion.staticTargets[targetPlan.heightStatic]) | 0,
           readTarget(targetRegion.staticTargets[targetPlan.widthStatic]) | 0,
