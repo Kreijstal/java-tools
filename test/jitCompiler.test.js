@@ -3008,7 +3008,7 @@ public final class GenericSpanShape {
     /if \(!\(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)\)/.exec(
       spanSource);
   const fastArmStart = fastArmMatch?.index ?? -1;
-  const fastStoreMatch = /ssaEntryStaticArrayData\d+\[ssaValue\d+\] =/
+  const fastStoreMatch = /ssaEntryStaticArrayData\d+\[[^\n]+\] =/
     .exec(spanSource.slice(fastArmStart));
   const fastStore = fastStoreMatch
     ? fastArmStart + fastStoreMatch.index : -1;

@@ -6477,11 +6477,22 @@ class JvmSsaBlockRenderer {
           `${prefix}helpers.materialize(frame, locals, stack, ${pc});`,
         ];
       });
-    const compactCheckedLeafLines = (sourceLines) => {
+    const compactCheckedLeafLines = (
+      sourceLines, checkedLeafSemantics = true,
+    ) => {
       let lines = [...sourceLines];
-      const compactTemporaryPattern =
-        "(?:ssaValue\\d+|ssaRuntimeCoarse(?:Trips|Loop)\\d+|" +
-        "ssaArrayRangeGuard\\d+)";
+      const selfRecursiveProtectedValues = new Set(lines
+        .filter((line) => line.includes("__SSA_SELF_RECURSIVE_CALL_"))
+        .flatMap((line) => [...line.matchAll(/\bssaValue\d+\b/g)]
+          .map((match) => match[0])));
+      // Restoring bodies expose the coarse-loop and range predicates as
+      // explicit guard sites used by deoptimization and diagnostics. Keep
+      // those names stable there; checked leaves have no restoring contract
+      // and may freely propagate the predicates as ordinary SSA values.
+      const compactTemporaryPattern = checkedLeafSemantics
+        ? "(?:ssaValue\\d+|ssaRuntimeCoarse(?:Trips|Loop)\\d+|" +
+          "ssaArrayRangeGuard\\d+)"
+        : "ssaValue\\d+";
       const occurrenceCounts = () => {
         const counts = new Map();
         for (const line of lines) {
@@ -6502,6 +6513,7 @@ class JvmSsaBlockRenderer {
         if (!match || renderedAssignedLocalSlots.has(Number(match[2]))) {
           continue;
         }
+        if (selfRecursiveProtectedValues.has(match[1])) continue;
         aliases.set(match[1], `local${match[2]}`);
         removedAliases.add(index);
       }
@@ -6525,6 +6537,7 @@ class JvmSsaBlockRenderer {
             new RegExp(`^(\\s*)const (${compactTemporaryPattern}) = (.+);$`)
               .exec(lines[declarationIndex]);
           if (!declaration || counts.get(declaration[2]) !== 2) continue;
+          if (selfRecursiveProtectedValues.has(declaration[2])) continue;
           let useIndex = -1;
           const usePattern = new RegExp(`\\b${declaration[2]}\\b`);
           for (let index = declarationIndex + 1; index < lines.length; index += 1) {
@@ -6539,6 +6552,7 @@ class JvmSsaBlockRenderer {
             useIndex === declarationIndex + 1 &&
             /ssaEntry(?:Array|StaticArray)Data\d+\[.+\] =/.test(lines[useIndex]);
           if (rawArrayLoad && !immediateRawStore ||
+              !checkedLeafSemantics && /\s[\/%]\s/.test(declaration[3]) ||
               /\bhelpers\.|\bnew\b/.test(declaration[3])) continue;
           const referencedLocals = [...declaration[3].matchAll(/\blocal(\d+)\b/g)]
             .map((match) => Number(match[1]));
@@ -6696,23 +6710,25 @@ class JvmSsaBlockRenderer {
       // the renderer's assignment-in-condition/constant-ternary scaffold to
       // one raw load and one ordinary guard. This applies to any primitive
       // array view and index expression, not to a particular sampler.
-      for (let index = 0; index + 5 < lines.length; index += 1) {
-        const declaration = /^(\s*)let (ssaValue\d+);$/.exec(lines[index]);
-        if (!declaration) continue;
-        const name = declaration[2];
-        const load = new RegExp(
-          `^${declaration[1]}if \\(!false && \\(\\(${name} = (.+)\\) === undefined\\)\\) \\{$`,
-        ).exec(lines[index + 1]);
-        if (!load || lines[index + 2] !==
-            `${declaration[1]}  return helpers.asyncInvokeSentinel();` ||
-            lines[index + 3] !== `${declaration[1]}} else {` ||
-            !new RegExp(`^${declaration[1]}  ${name} = false \\? .+ : \\(\\(${name}\\) \\| 0\\);$`)
-              .test(lines[index + 4]) ||
-            lines[index + 5] !== `${declaration[1]}}`) continue;
-        lines.splice(index, 6,
-          `${declaration[1]}const ${name} = ${load[1]};`,
-          `${declaration[1]}if (${name} === undefined) ` +
-            "return helpers.asyncInvokeSentinel();");
+      if (checkedLeafSemantics) {
+        for (let index = 0; index + 5 < lines.length; index += 1) {
+          const declaration = /^(\s*)let (ssaValue\d+);$/.exec(lines[index]);
+          if (!declaration) continue;
+          const name = declaration[2];
+          const load = new RegExp(
+            `^${declaration[1]}if \\(!false && \\(\\(${name} = (.+)\\) === undefined\\)\\) \\{$`,
+          ).exec(lines[index + 1]);
+          if (!load || lines[index + 2] !==
+              `${declaration[1]}  return helpers.asyncInvokeSentinel();` ||
+              lines[index + 3] !== `${declaration[1]}} else {` ||
+              !new RegExp(`^${declaration[1]}  ${name} = false \\? .+ : \\(\\(${name}\\) \\| 0\\);$`)
+                .test(lines[index + 4]) ||
+              lines[index + 5] !== `${declaration[1]}}`) continue;
+          lines.splice(index, 6,
+            `${declaration[1]}const ${name} = ${load[1]};`,
+            `${declaration[1]}if (${name} === undefined) ` +
+              "return helpers.asyncInvokeSentinel();");
+        }
       }
       // Remove pure SSA declarations left without a consumer after the
       // checked-leaf rewrites above.
@@ -7123,6 +7139,8 @@ class JvmSsaBlockRenderer {
             return lines;
           })();
         }
+        restoringRenderedTree = compactCheckedLeafLines(
+          restoringRenderedTree, false);
         const directBody = [
           ...directStaticDeclarations,
           ...lazyStaticDeclarations,
