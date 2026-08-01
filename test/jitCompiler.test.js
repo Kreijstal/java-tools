@@ -1221,6 +1221,13 @@ test('generated bodies expose profiler identities without runtime probes', (t) =
   t.equal(generated.name, 'jvm$structured_ssa$ArbitraryOwner$renamedHotBody__II_V',
     'generated function name is visible to native stack sampling');
   t.equal(generated(), 7, 'the profiler label does not change generated behavior');
+  const captured = jvm.jit.createGeneratedFunction(method, 'structured-ssa',
+    ['value'], '"use strict"; return addend + value;', 'ArbitraryOwner',
+    false, false, { addend: 5 });
+  t.equal(captured(7), 12,
+    'generated helpers can capture a compile-time monomorphic dependency');
+  t.notOk(String(captured).includes('function anonymous'),
+    'captured helpers retain the profiler-visible generated function name');
   t.end();
 });
 

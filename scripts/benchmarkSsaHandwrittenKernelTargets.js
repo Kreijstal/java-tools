@@ -11,6 +11,7 @@ const Stack = require('../src/core/stack');
 const Perspective = require('../src/jit/HandwrittenPerspectiveSpan');
 const Tiled = require('../src/jit/HandwrittenTiledBlit');
 const Bilinear = require('../src/jit/HandwrittenBilinearSampler');
+const Polygon = require('../src/jit/HandwrittenPolygonRaster');
 
 const root = path.resolve(__dirname, '..');
 const source = path.join(
@@ -106,11 +107,12 @@ function compileBody(runtime, name, descriptor) {
     generated?.jvmCapturedCheckedLeafDirectPositionalBody;
   const capturedCheckedLeafPlan =
     generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
-  if (!generated?.jvmStructuredSsa || typeof body !== 'function') {
+  if (!(generated?.jvmStructuredSsa || generated?.jvmStructuredPositionalOnly) ||
+      typeof body !== 'function') {
     const reason = runtime.jvm.jit.structuredSsa.lastRejectionReason ||
       runtime.jvm.jit.structuredSsa.lastCompileError?.stack || '';
     throw new Error(`generic SSA did not compile ${name}${descriptor}` +
-      (reason ? `: ${reason}` : ''));
+      (reason ? `: ${reason}` : '') + ` keys=${Object.keys(generated || {})}`);
   }
   const dumpPattern = process.env.SSA_KERNEL_DUMP_METHOD || '';
   if (dumpPattern && `${name}${descriptor}`.includes(dumpPattern)) {
@@ -601,6 +603,79 @@ function runPolygonOracle(destination, vertices, color) {
     }, 1600);
     polygonResult.oracleKind = 'equivalent-scanline-ceiling';
 
+    // Exercise the edge-table algorithm implemented by the historical
+    // polygon intrinsic itself. The Java fixture mirrors that complete state
+    // machine, including scratch sorting and all published cursor fields, so
+    // this row is a same-algorithm comparator rather than the simpler
+    // equivalent convex-scanline ceiling above.
+    const polygonEdgeGenericDestination = intArray(64 * 64, () => 0);
+    const polygonEdgeOracleDestination = intArray(64 * 64, () => 0);
+    const polygonEdgeGenericScratch = intArray(24, () => 0);
+    runtime.classData.staticFields.set(
+      'polygonDestination:[I', polygonEdgeGenericDestination);
+    runtime.classData.staticFields.set(
+      'polygonEdgeScratch:[I', polygonEdgeGenericScratch);
+    for (const key of [
+      'polygonEdgeCount:I', 'polygonEdgeLeft:I', 'polygonEdgeRight:I',
+      'polygonEdgeY:I', 'polygonEdgeActiveEnd:I',
+      'polygonEdgePairCursor:I', 'polygonEdgeExpiredStart:I',
+    ]) runtime.classData.staticFields.set(key, 0);
+    const polygonEdge = compileBody(
+      runtime, 'polygonEdgeFill', '([II)V');
+    const oracleFields = new Map([
+      ['count', 0], ['scratch', intArray(24, () => 0)],
+      ['left', 0], ['right', 0], ['y', 0], ['activeEnd', 0],
+      ['pairCursor', 0], ['expiredStart', 0],
+      ['clipTop', 0], ['clipBottom', 64], ['clipLeft', 0],
+      ['clipRight', 64], ['surfaceWidth', 64],
+      ['pixels', polygonEdgeOracleDestination],
+    ]);
+    const mapLocation = (key) => ({ kind: 'map', fields: oracleFields, key });
+    const polygonHandwritten = Polygon._test.createIntrinsicForPlan(
+      runtime.jvm.jit, {
+        alpha: false,
+        classOwners: [className],
+        locations: Object.fromEntries([
+          'count', 'scratch', 'left', 'right', 'y', 'activeEnd',
+          'pairCursor', 'expiredStart', 'clipTop', 'clipBottom',
+          'clipLeft', 'clipRight', 'surfaceWidth', 'pixels',
+        ].map((key) => [key, mapLocation(key)])),
+      }, { ASYNC_INVOKE: false, RETURN_VOID: true });
+    const polygonHandwrittenRun =
+      polygonHandwritten.jvmDirectData.run;
+    const polygonEdgeResult = benchmarkPair('polygon-edge-table', {
+      destination: polygonEdgeGenericDestination,
+      generated: polygonEdge.generated,
+      invoke(item) {
+        return polygonEdge.body(runtime.jvm.jit, polygonEdge.plan,
+          polygonCases[item],
+          0xff000000 | Math.imul(item + 1, 0x10203),
+          thread, trustedNestedEntry);
+      },
+    }, {
+      destination: polygonEdgeOracleDestination,
+      invoke(item) {
+        return polygonHandwrittenRun(polygonCases[item],
+          0xff000000 | Math.imul(item + 1, 0x10203), 0);
+      },
+    }, 1600);
+    polygonEdgeResult.oracleKind = 'exact-edge-table-handwritten';
+
+    const genericState = [
+      'polygonEdgeCount:I', 'polygonEdgeLeft:I', 'polygonEdgeRight:I',
+      'polygonEdgeY:I', 'polygonEdgeActiveEnd:I',
+      'polygonEdgePairCursor:I', 'polygonEdgeExpiredStart:I',
+    ].map((key) => runtime.classData.staticFields.get(key) | 0);
+    const oracleState = [
+      'count', 'left', 'right', 'y', 'activeEnd',
+      'pairCursor', 'expiredStart',
+    ].map((key) => oracleFields.get(key) | 0);
+    if (JSON.stringify(genericState) !== JSON.stringify(oracleState) ||
+        checksum(polygonEdgeGenericScratch) !==
+          checksum(oracleFields.get('scratch'))) {
+      throw new Error('polygon edge-table state differs from handwritten oracle');
+    }
+
     if (process.env.JVM_DUMP_SSA_KERNEL_TARGETS === '1') {
       for (const [name, compiled] of [
         ['tiled-blit', tiled],
@@ -661,7 +736,7 @@ function runPolygonOracle(destination, vertices, color) {
       node: process.version,
       results: [
         tiledResult, tiledCallerResult, perspectiveResult, bilinearResult,
-        polygonResult,
+        polygonResult, polygonEdgeResult,
       ].map(sanitize),
     }, null, 2)}\n`);
   } finally {

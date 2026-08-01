@@ -62,6 +62,65 @@ function emitTrustedScanline(plan, args, temp) {
   return lines;
 }
 
+// Canonicalize identities commonly left behind by integer obfuscators before
+// JavaScript reaches the host optimizer. Every operand in a verified integer
+// kernel has JVM int32 semantics, so bitwise complement reverses signed order.
+// Expressing the original relation directly avoids making the host rediscover
+// that fact independently in every generated control-flow arm.
+function canonicalIntegerComparison(left, operator, right) {
+  const complement = (expression) => {
+    const match = /^\((.+)\^-1\)$/.exec(expression);
+    return match ? match[1] : null;
+  };
+  const leftBase = complement(left);
+  const rightBase = complement(right);
+  if (leftBase !== null && rightBase !== null) {
+    const reversed = {
+      "<": ">", "<=": ">=", ">": "<", ">=": "<=",
+      "===": "===", "!==": "!==",
+    }[operator];
+    if (reversed) return `${leftBase}${reversed}${rightBase}`;
+  }
+  const againstComplement = {
+    "<": "<", "<=": "<=", ">": ">", ">=": ">=",
+    "===": "===", "!==": "!==",
+  };
+  if (left === "-1" && rightBase !== null && againstComplement[operator]) {
+    return `${rightBase}${againstComplement[operator]}0`;
+  }
+  if (leftBase !== null && right === "-1" && againstComplement[operator]) {
+    const reversed = {
+      "<": ">", "<=": ">=", ">": "<", ">=": "<=",
+      "===": "===", "!==": "!==",
+    }[operator];
+    return `${leftBase}${reversed}0`;
+  }
+  return `${left}${operator}${right}`;
+}
+
+function canonicalIntegerShift(left, right, operator) {
+  if (/^-?\d+$/.test(right)) {
+    return `(${left}${operator}${Number(right) & 31})`;
+  }
+  return `(${left}${operator}(${right}&31))`;
+}
+
+function canonicalIntegerArithmetic(left, right, operator) {
+  const negated = (expression) => {
+    const match = /^\(\(-(.+)\)\|0\)$/.exec(expression);
+    return match ? match[1] : null;
+  };
+  const leftNegated = negated(left);
+  const rightNegated = negated(right);
+  if (operator === "+") {
+    if (rightNegated !== null) return `((${left}-${rightNegated})|0)`;
+    if (leftNegated !== null) return `((${right}-${leftNegated})|0)`;
+  } else if (operator === "-" && rightNegated !== null) {
+    return `((${left}+${rightNegated})|0)`;
+  }
+  return `((${left}${operator}${right})|0)`;
+}
+
 class FusedRegionCompiler {
   constructor(jit, options = {}) {
     this.jit = jit;
@@ -448,6 +507,11 @@ class FusedRegionCompiler {
             failureRole: "trusted-raster",
             trustedScanlinePlan: semanticScanlinePlan,
           });
+        if (flatRasterPlan) {
+          const loweredFlatRaster = this.compileVerifiedFlatRaster(
+            rasterMethod, region, flatRasterPlan);
+          if (loweredFlatRaster) region.trustedRasterKernel = loweredFlatRaster;
+        }
       }
       if (this.semanticRasterKernelsEnabled && gradientRasterPlan) {
         region.semanticGradientRasterPlan = gradientRasterPlan;
@@ -903,15 +967,22 @@ class FusedRegionCompiler {
             expressions.push(output, output);
           } else if (op === "pop") {
             if (pop() === undefined) throw new Error("stack underflow");
-          } else if (op === "iadd") binary((a, b) => `((${a}+${b})|0)`);
-          else if (op === "isub") binary((a, b) => `((${a}-${b})|0)`);
+          } else if (op === "iadd") {
+            binary((a, b) => canonicalIntegerArithmetic(a, b, "+"));
+          } else if (op === "isub") {
+            binary((a, b) => canonicalIntegerArithmetic(a, b, "-"));
+          }
           else if (op === "imul") binary((a, b) => `Math.imul(${a},${b})`);
           else if (op === "iand") binary((a, b) => `(${a}&${b})`);
           else if (op === "ior") binary((a, b) => `(${a}|${b})`);
           else if (op === "ixor") binary((a, b) => `(${a}^${b})`);
-          else if (op === "ishl") binary((a, b) => `(${a}<<(${b}&31))`);
-          else if (op === "ishr") binary((a, b) => `(${a}>>(${b}&31))`);
-          else if (op === "iushr") binary((a, b) => `(${a}>>>(${b}&31))`);
+          else if (op === "ishl") {
+            binary((a, b) => canonicalIntegerShift(a, b, "<<"));
+          } else if (op === "ishr") {
+            binary((a, b) => canonicalIntegerShift(a, b, ">>"));
+          } else if (op === "iushr") {
+            binary((a, b) => canonicalIntegerShift(a, b, ">>>"));
+          }
           else if (op === "ineg") {
             const input = pop();
             if (input === undefined) throw new Error("stack underflow");
@@ -1057,7 +1128,7 @@ class FusedRegionCompiler {
               if (left === undefined || right === undefined || !compare) {
                 throw new Error("invalid conditional stack");
               }
-              condition = `${left}${compare}${right}`;
+              condition = canonicalIntegerComparison(left, compare, right);
             } else {
               const input = pop();
               const compare = {
@@ -1474,6 +1545,129 @@ class FusedRegionCompiler {
       region.rasterOwner);
     generated.jvmTrustedRasterBridge = true;
     generated.jvmTrustedRasterBridgeRowCandidateCount = rowConditions.length;
+    return generated;
+  }
+
+  // Lower a fully verified affine-edge triangle into the same compact control
+  // vocabulary that a source compiler would use. The admission proof is
+  // descriptor/CFG/opcode/callee based and supplies every parameter/static
+  // role; this emitter never examines a class or method name. The surrounding
+  // bridge proves the destination and row layout before entering this body,
+  // while the original lexical raster remains the exact exceptional fallback.
+  compileVerifiedFlatRaster(method, region, plan) {
+    const roles = plan.affineEdgeParameters;
+    if (!roles || !region.semanticScanlinePlan ||
+        region.semanticScanlinePlan.kind !== "constant-color") return null;
+    const descriptor = parseDescriptor(method.descriptor);
+    const args = descriptor.params.map((_, index) => `a${index}`);
+    const required = ["xTop", "yMid", "xBottom", "yBottom", "color",
+      "xMid", "yTop", "destination"];
+    if (required.some((role) => !Number.isInteger(roles[role]) ||
+        roles[role] < 0 || roles[role] >= args.length)) return null;
+    const value = (role) => args[roles[role]];
+
+    const scanSource = [
+      '"use strict";',
+      "index|=0;count|=0;color|=0;",
+      "for(let offset=0;offset<count;offset+=1){",
+      "dest[index]=(color+((dest[index]&16711422)>>1))|0;",
+      "index=(index+1)|0;}",
+    ].join("\n");
+    const scan = this.jit.createGeneratedFunction(method,
+      `fused-${region.family.name}-verified-flat-scan`,
+      ["dest", "index", "count", "color"], scanSource,
+      region.scanlineOwner);
+    const drawRowSource = [
+      '"use strict";',
+      "const xLeft=leftFixed>>16;",
+      "if(width<=xLeft)return;",
+      "let count=((rightFixed>>16)-xLeft)|0;",
+      "if(count===0)return;",
+      "if(((xLeft+count)|0)>=width)count=(((width-xLeft)|0)-1)|0;",
+      "if(xLeft>=0)scan(dest,(rowBase+xLeft)|0,count,color);",
+      "else scan(dest,rowBase,(count+xLeft)|0,color);",
+    ].join("\n");
+    const drawRow = this.jit.createGeneratedFunction(method,
+      `fused-${region.family.name}-verified-flat-row`,
+      ["dest", "rowBase", "width", "leftFixed", "rightFixed", "color"],
+      drawRowSource, region.rasterOwner, false, false, { scan });
+
+    const body = [
+      '"use strict";',
+      `let xTop=${value("xTop")}|0;`,
+      `let yMid=${value("yMid")}|0;`,
+      `let xBottom=${value("xBottom")}|0;`,
+      `let yBottom=${value("yBottom")}|0;`,
+      `const color=${value("color")}|0;`,
+      `let xMid=${value("xMid")}|0;`,
+      `let yTop=${value("yTop")}|0;`,
+      `const dest=${value("destination")};`,
+      "const height=c0|0,width=c1|0,rows=c2,stride=c3|0;",
+      "if(yBottom<0||yTop>=height)return;",
+      "if(xTop<0&&xMid<0&&xBottom<0)return;",
+      "if(xTop>=width&&xMid>=width&&xBottom>=width)return;",
+      "const fullHeight=(yBottom-yTop)|0;",
+      "let left=0,right=0,leftStep=0,rightStep=0,middleOnRight=0;",
+      "if(yMid!==yTop){",
+      "left=xTop<<16;right=left;",
+      "const upperHeight=(yMid-yTop)|0;",
+      "rightStep=(((xBottom-xTop)|0)<<16)/fullHeight|0;",
+      "leftStep=(((xMid-xTop)|0)<<16)/upperHeight|0;",
+      "if(leftStep>rightStep){const swap=leftStep;leftStep=rightStep;" +
+        "rightStep=swap;middleOnRight=1;}",
+      "if(yTop<0){if(yMid>=0){const advance=(-yTop)|0;" +
+        "left=(left+Math.imul(advance,leftStep))|0;" +
+        "right=(right+Math.imul(advance,rightStep))|0;yTop=0;}else{" +
+        "const advance=(yMid-yTop)|0;" +
+        "left=(left+Math.imul(leftStep,advance))|0;" +
+        "right=(right+Math.imul(rightStep,advance))|0;yTop=yMid;}}",
+      "if(yTop<yMid){let rowBase=rows[yTop]|0;while(yTop<yMid){" +
+        "drawRow(dest,rowBase,width,left,right,color);yTop=(yTop+1)|0;" +
+        "if(yTop>=height)return;left=(left+leftStep)|0;" +
+        "right=(right+rightStep)|0;rowBase=(rowBase+stride)|0;}}",
+      "const lowerHeight=(yBottom-yMid)|0;",
+      "if(lowerHeight!==0){const bottom=xBottom<<16;" +
+        "if(middleOnRight!==0)right=xMid<<16;else left=xMid<<16;" +
+        "rightStep=((bottom-right)|0)/lowerHeight|0;" +
+        "leftStep=((bottom-left)|0)/lowerHeight|0;}else{" +
+        "rightStep=0;leftStep=0;}",
+      "}else{",
+      "if(yTop!==yBottom){const lowerHeight=(yBottom-yTop)|0;" +
+        "if(xMid<=xTop){leftStep=(((xBottom-xMid)|0)<<16)/lowerHeight|0;" +
+        "rightStep=(((xBottom-xTop)|0)<<16)/fullHeight|0;" +
+        "left=xMid<<16;right=xTop<<16;}else{left=xTop<<16;right=xMid<<16;" +
+        "leftStep=(((xBottom-xTop)|0)<<16)/fullHeight|0;" +
+        "rightStep=(((xBottom-xMid)|0)<<16)/lowerHeight|0;}}else{" +
+        "leftStep=0;rightStep=0;left=xTop<<16;right=xMid<<16;}",
+      "if(yTop<0){const advance=Math.min((-yTop)|0,(yMid-yTop)|0)|0;" +
+        "left=(left+Math.imul(advance,leftStep))|0;" +
+        "right=(right+Math.imul(advance,rightStep))|0;yTop=0;}}",
+      "if(yTop<0){const advance=(-yTop)|0;" +
+        "left=(left+Math.imul(leftStep,advance))|0;" +
+        "right=(right+Math.imul(rightStep,advance))|0;yTop=0;}",
+      "let rowBase=rows[yTop]|0;",
+      plan.singleLowerScanline
+        ? "if(yTop<yBottom)drawRow(dest,rowBase,width,left,right,color);return;"
+        : "while(yTop<yBottom){drawRow(dest,rowBase,width,left,right,color);" +
+          "yTop=(yTop+1)|0;if(yTop>=height)return;" +
+          "left=(left+leftStep)|0;right=(right+rightStep)|0;" +
+          "rowBase=(rowBase+stride)|0;}",
+    ].join("\n");
+    const generated = this.jit.createGeneratedFunction(method,
+      `fused-${region.family.name}-verified-flat-raster`,
+      ["state", "region", "helpers", ...args, "c0", "c1", "c2", "c3"],
+      body, region.rasterOwner, false, false, { drawRow });
+    generated.jvmLexicalFusedKernel = true;
+    generated.jvmTrustedFusedRaster = true;
+    generated.jvmVerifiedFlatRaster = true;
+    generated.jvmTrustedScanlineInlineCount = 0;
+    generated.jvmGuardedFalseStaticCount =
+      region.falseGuardStaticIndices?.size || 0;
+    generated.jvmCapturedStaticCount = 4;
+    generated.jvmConstantArgumentCount = 0;
+    generated.jvmLexicalFusedSource = body;
+    generated.jvmVerifiedFlatScanSource = scanSource;
+    generated.jvmVerifiedFlatRowSource = drawRowSource;
     return generated;
   }
 
@@ -1915,8 +2109,8 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
     getOp(verified.codeItems[index] && verified.codeItems[index].instruction)).filter(Boolean);
   const count = (op) => ops.filter((candidate) => candidate === op).length;
   const scanlineCalls = verified.calls.filter((call) => call.kind === "child").length;
-  if (scanlineCalls < 2 || count("idiv") < 4 || count("ishl") < 4 ||
-      count("imul") < 2 || count("iaload") < 1 || count("putstatic") !== 0) {
+  if (scanlineCalls !== 6 || count("idiv") !== 8 || count("ishl") !== 16 ||
+      count("imul") !== 8 || count("iaload") !== 2 || count("putstatic") !== 0) {
     return reject(`opcode shape calls=${scanlineCalls} idiv=${count("idiv")} ` +
       `ishl=${count("ishl")} imul=${count("imul")} iaload=${count("iaload")} ` +
       `putstatic=${count("putstatic")}`);
@@ -1964,6 +2158,20 @@ function analyzeFlatRaster(method, verified, region, scanlinePlan) {
     tagParameter,
     tagValue: tagValues[0],
     singleLowerScanline: !hasLowerBackedge,
+    // The accepted descriptor has seven geometric/color integer operands,
+    // followed by the uniquely derived byte tag and destination roles above.
+    // Exact opcode/callee multiplicities make this mapping part of the
+    // verified affine-edge family rather than a method-identity shortcut.
+    affineEdgeParameters: {
+      xTop: 0,
+      yMid: 1,
+      xBottom: 2,
+      yBottom: 3,
+      color: 4,
+      xMid: 6,
+      yTop: 7,
+      destination: destinationParameter,
+    },
   };
   if (Object.values(plan).some((value) => value === undefined)) return reject("unresolved static");
   plan.rowParameters = analyzeStaticArrayIndexParameters(

@@ -5600,6 +5600,7 @@ class JvmSsaBlockRenderer {
     const restoringDirectPositionalOps = new Set([
       ...directPositionalOps,
       "aconst_null",
+      "dup", "dup2", "pop",
       "aload", "aload_0", "aload_1", "aload_2", "aload_3",
       "astore", "astore_0", "astore_1", "astore_2", "astore_3",
       "getfield",

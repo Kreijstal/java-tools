@@ -7,6 +7,14 @@ public final class SsaHandwrittenKernelTargetsBenchmark {
     static int polygonClipRight = 64;
     static int polygonClipTop = 0;
     static int polygonClipBottom = 64;
+    static int[] polygonEdgeScratch;
+    static int polygonEdgeCount;
+    static int polygonEdgeLeft;
+    static int polygonEdgeRight;
+    static int polygonEdgeY;
+    static int polygonEdgeActiveEnd;
+    static int polygonEdgePairCursor;
+    static int polygonEdgeExpiredStart;
 
     int width;
     int height;
@@ -198,5 +206,161 @@ public final class SsaHandwrittenKernelTargetsBenchmark {
             }
             if (left <= right) polygonSpan(left, y, right - left + 1, color);
         }
+    }
+
+    static void polygonQuickSortEdges(int[] scratch, int start, int end) {
+        if (end <= start + 4) return;
+        int pivotIndex = start;
+        int pivot0 = scratch[pivotIndex];
+        int pivot1 = scratch[pivotIndex + 1];
+        int pivot2 = scratch[pivotIndex + 2];
+        int pivot3 = scratch[pivotIndex + 3];
+        for (int index = start + 4; index < end; index += 4) {
+            int sortValue = scratch[index + 1];
+            if (sortValue < pivot1) {
+                scratch[pivotIndex] = scratch[index];
+                scratch[pivotIndex + 1] = sortValue;
+                scratch[pivotIndex + 2] = scratch[index + 2];
+                scratch[pivotIndex + 3] = scratch[index + 3];
+                pivotIndex += 4;
+                scratch[index] = scratch[pivotIndex];
+                scratch[index + 1] = scratch[pivotIndex + 1];
+                scratch[index + 2] = scratch[pivotIndex + 2];
+                scratch[index + 3] = scratch[pivotIndex + 3];
+            }
+        }
+        scratch[pivotIndex] = pivot0;
+        scratch[pivotIndex + 1] = pivot1;
+        scratch[pivotIndex + 2] = pivot2;
+        scratch[pivotIndex + 3] = pivot3;
+        polygonQuickSortEdges(scratch, start, pivotIndex);
+        polygonQuickSortEdges(scratch, pivotIndex + 4, end);
+    }
+
+    static void polygonSortActiveEdges(int[] scratch, int start, int end) {
+        while (end >= start + 8) {
+            int sorted = 1;
+            for (int index = start + 4; index < end; index += 4) {
+                int leftX = scratch[index - 4];
+                int rightX = scratch[index];
+                if (leftX > rightX) {
+                    sorted = 0;
+                    scratch[index - 4] = rightX;
+                    scratch[index] = leftX;
+                    int swap = scratch[index - 2];
+                    scratch[index - 2] = scratch[index + 2];
+                    scratch[index + 2] = swap;
+                    swap = scratch[index - 1];
+                    scratch[index - 1] = scratch[index + 3];
+                    scratch[index + 3] = swap;
+                }
+            }
+            if (sorted != 0) return;
+            end -= 4;
+        }
+    }
+
+    static void polygonEdgeFill(int[] vertices, int color) {
+        int vertexLength = vertices.length;
+        int[] scratch = polygonEdgeScratch;
+        int edgeCount = 0;
+        int previous = vertexLength - 2;
+        for (int current = 0; current < vertexLength; current += 2) {
+            int previousY = vertices[previous + 1];
+            int currentY = vertices[current + 1];
+            if (previousY < currentY) {
+                scratch[edgeCount++] = vertices[previous];
+                scratch[edgeCount++] = previousY;
+                scratch[edgeCount++] = vertices[current];
+                scratch[edgeCount++] = currentY;
+            } else if (currentY < previousY) {
+                scratch[edgeCount++] = vertices[current];
+                scratch[edgeCount++] = currentY;
+                scratch[edgeCount++] = vertices[previous];
+                scratch[edgeCount++] = previousY;
+            }
+            previous = current;
+        }
+
+        polygonQuickSortEdges(scratch, 0, edgeCount);
+        int y = scratch[1];
+        if (y < polygonClipTop) y = polygonClipTop;
+        int activeEnd = 0;
+        while (activeEnd < edgeCount) {
+            int edgeY = scratch[activeEnd + 1];
+            if (y < edgeY) break;
+            int x0 = scratch[activeEnd];
+            int x1 = scratch[activeEnd + 2];
+            int y1 = scratch[activeEnd + 3];
+            int step = ((x1 - x0) << 16) / (y1 - edgeY);
+            int fixed = (x0 << 16) + 32768;
+            scratch[activeEnd] = fixed + (y - edgeY) * step;
+            scratch[activeEnd + 2] = step;
+            activeEnd += 4;
+        }
+        int expiredStart = 0;
+        int pairCursor = activeEnd;
+        int storedActiveEnd = activeEnd;
+        int storedExpiredStart = expiredStart;
+        int storedPairCursor = pairCursor;
+        y--;
+        int outputLeft = polygonEdgeLeft;
+        int outputRight = polygonEdgeRight;
+
+        while (true) {
+            if (pairCursor < activeEnd) {
+                outputLeft = scratch[pairCursor] >> 16;
+                outputRight = scratch[pairCursor + 4] >> 16;
+                scratch[pairCursor] += scratch[pairCursor + 2];
+                scratch[pairCursor + 4] += scratch[pairCursor + 6];
+                pairCursor += 8;
+                storedPairCursor = pairCursor;
+                polygonSpan(outputLeft, y, outputRight - outputLeft, color);
+                continue;
+            }
+
+            y++;
+            if (y >= polygonClipBottom) break;
+            int newExpiredStart = expiredStart;
+            while (activeEnd < edgeCount) {
+                int edgeY = scratch[activeEnd + 1];
+                if (y < edgeY) break;
+                int x0 = scratch[activeEnd];
+                int x1 = scratch[activeEnd + 2];
+                int y1 = scratch[activeEnd + 3];
+                int step = ((x1 - x0) << 16) / (y1 - edgeY);
+                scratch[activeEnd] = (x0 << 16) + 32768;
+                scratch[activeEnd + 2] = step;
+                activeEnd += 4;
+            }
+            for (int index = newExpiredStart; index < activeEnd; index += 4) {
+                int endY = scratch[index + 3];
+                if (y >= endY) {
+                    scratch[index] = scratch[newExpiredStart];
+                    scratch[index + 1] = scratch[newExpiredStart + 1];
+                    scratch[index + 2] = scratch[newExpiredStart + 2];
+                    scratch[index + 3] = scratch[newExpiredStart + 3];
+                    newExpiredStart += 4;
+                }
+            }
+            if (newExpiredStart == edgeCount) {
+                edgeCount = 0;
+                break;
+            }
+            expiredStart = newExpiredStart;
+            polygonSortActiveEdges(scratch, expiredStart, activeEnd);
+            storedExpiredStart = expiredStart;
+            storedActiveEnd = activeEnd;
+            pairCursor = expiredStart;
+        }
+
+        polygonEdgeCount = edgeCount;
+        polygonEdgeScratch = scratch;
+        polygonEdgeLeft = outputLeft;
+        polygonEdgeRight = outputRight;
+        polygonEdgeY = y;
+        polygonEdgeActiveEnd = storedActiveEnd;
+        polygonEdgePairCursor = storedPairCursor;
+        polygonEdgeExpiredStart = storedExpiredStart;
     }
 }

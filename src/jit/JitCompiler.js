@@ -1002,15 +1002,17 @@ class JitCompiler {
   }
 
   createGeneratedFunction(method, tier, parameters, source,
-    ownerOverride = null, asynchronous = false, generator = false) {
+    ownerOverride = null, asynchronous = false, generator = false,
+    captures = null) {
     const labeled = this.generatedSource(method, tier, source, ownerOverride);
     // Function constructors themselves remain anonymous in Gecko profiles.
     // Return a named literal so stack sampling exposes the guest identity.
     const prefix = generator ? "function* " : asynchronous ? "async function " : "function ";
-    const factory = new Function(`"use strict"; return ${prefix}` +
+    const captureNames = captures ? Object.keys(captures) : [];
+    const factory = new Function(...captureNames, `"use strict"; return ${prefix}` +
       `${labeled.functionName}(${parameters.join(",")}) {\n` +
       `${labeled.source}\n}`);
-    const generated = factory();
+    const generated = factory(...captureNames.map((name) => captures[name]));
     generated.jvmSourceUrl = labeled.url;
     return generated;
   }

@@ -153,8 +153,10 @@ function nextRandom(state) {
   return state.value;
 }
 
-function argumentsFor(family, random, region) {
-  const coordinate = () => 2 + nextRandom(random) % 60;
+function argumentsFor(family, random, region, wideCoordinates = false) {
+  const coordinate = () => wideCoordinates
+    ? -32 + nextRandom(random) % 128
+    : 2 + nextRandom(random) % 60;
   const color = () => nextRandom(random) & 0xffffff;
   let args;
   if (family.wrapper === '(IIIIIIII)V') {
@@ -300,6 +302,55 @@ function readTarget(target) {
     ? target.fields.get(target.key) : target.fields[target.key];
 }
 
+function verifyTrustedRasterBridge(region, helpers, family) {
+  if (!region.rasterKernel.jvmTrustedRasterBridge) return 0;
+  const random = { value: 0x51f15e5d };
+  const wrapperArgs = [argumentsFor(family, random, region)];
+  const captured = captureRasterArguments(region, helpers, wrapperArgs);
+  if (!captured || captured.length !== 1) {
+    throw new Error('Could not capture trusted-raster guard operands');
+  }
+  const plan = region.genericRasterSafetyPlan;
+  const rasterArgs = captured[0];
+  const destination = rasterArgs[plan.destinationParameter];
+  const before = [...destination];
+  const originalFallback = region.generatedRasterKernel;
+  let fallbacks = 0;
+  region.generatedRasterKernel = () => {
+    assertPixels(destination, before,
+      `trusted bridge fallback ${fallbacks + 1} preceded side effects`);
+    fallbacks += 1;
+  };
+  try {
+    const badTag = [...rasterArgs];
+    badTag[plan.tagParameter] = (plan.tagValue + 1) | 0;
+    region.rasterKernel(region.executionState, region, helpers, ...badTag);
+
+    const shortDestination = [...rasterArgs];
+    shortDestination[plan.destinationParameter] = [];
+    region.rasterKernel(
+      region.executionState, region, helpers, ...shortDestination);
+
+    const rowsTarget = region.staticTargets[plan.rowsStatic];
+    const rows = readTarget(rowsTarget);
+    const rowParameter = plan.rowParameters[0];
+    const row = Math.max(0, rasterArgs[rowParameter] | 0);
+    const originalRow = rows[row];
+    rows[row] = (originalRow + 1) | 0;
+    try {
+      region.rasterKernel(region.executionState, region, helpers, ...rasterArgs);
+    } finally {
+      rows[row] = originalRow;
+    }
+  } finally {
+    region.generatedRasterKernel = originalFallback;
+  }
+  if (fallbacks !== 3) {
+    throw new Error(`Trusted raster bridge performed ${fallbacks}/3 guarded fallbacks`);
+  }
+  return fallbacks;
+}
+
 function generatedShape(region) {
   const wrapper = String(region.wrapperKernel);
   const raster = String(region.rasterKernel);
@@ -317,6 +368,8 @@ function generatedShape(region) {
     trustedRasterBridge: Boolean(region.rasterKernel.jvmTrustedRasterBridge),
     lexicalScanline: Boolean(region.scanlineKernel.jvmLexicalFusedKernel),
     trustedRaster: Boolean(region.trustedRasterKernel?.jvmTrustedFusedRaster),
+    verifiedFlatRaster:
+      Boolean(region.trustedRasterKernel?.jvmVerifiedFlatRaster),
     trustedScanlineInlines:
       region.trustedRasterKernel?.jvmTrustedScanlineInlineCount || 0,
     trustedConstantArguments:
@@ -332,8 +385,9 @@ function generatedShape(region) {
       ? wrapper.includes('switch(order)')
       : Boolean(region.wrapperKernel.jvmLexicalFusedKernel),
     scalarRasterLocals:
-      /\blet l\d+/.test(region.rasterKernel.jvmTrustedRasterBridge
-        ? trustedRaster : raster) &&
+      (region.trustedRasterKernel?.jvmVerifiedFlatRaster ||
+       /\blet l\d+/.test(region.rasterKernel.jvmTrustedRasterBridge
+         ? trustedRaster : raster)) &&
       (region.rasterKernel.jvmLexicalFusedKernel ||
         region.rasterKernel.jvmTrustedRasterBridge || raster.includes('switch (pc)')),
     rasterPcSwitch: (region.rasterKernel.jvmTrustedRasterBridge
@@ -414,7 +468,8 @@ function generatedShape(region) {
         fusedPixels[index] = value;
         targetPixels[index] = value;
       }
-      const args = argumentsFor(baselineCandidate.family, random, region);
+      const args = argumentsFor(
+        baselineCandidate.family, random, region, (iteration & 1) !== 0);
       await invokeBaseline(baseline, baselineCandidate, args,
         `${descriptor} iteration ${iteration}`);
       const state = region.executionState;
@@ -436,6 +491,8 @@ function generatedShape(region) {
       throw new Error(`Handwritten target ran ${handwrittenTargetRuns}/${iterations} ` +
         `times for ${descriptor}`);
     }
+    const bridgeGuardChecks = verifyTrustedRasterBridge(
+      region, fused.jvm.jit, fusedCandidate.family);
     let benchmark = null;
     let rasterBenchmark = null;
     if (benchmarkEnabled) {
@@ -506,6 +563,7 @@ function generatedShape(region) {
       compactFlatRuns: (fused.jvm.jit.semanticFusedFlatRasterRunCount | 0) - beforeFlat,
       compactFlatRejection: region.semanticFlatRasterRejection || null,
       genericRasterSafetyPlan: region.genericRasterSafetyPlan || null,
+      bridgeGuardChecks,
       benchmark, rasterBenchmark });
   }
   process.stdout.write(`${JSON.stringify({ ok: true, classpath, report }, null, 2)}\n`);
