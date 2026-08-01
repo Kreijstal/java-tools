@@ -31,6 +31,12 @@ const NO_MEMO_KEY = Symbol("jit.memo.no-key");
 const HANDLED_RESULT = Object.freeze({ handled: true });
 const UNHANDLED_RESULT = Object.freeze({ handled: false });
 const WASM_EXITED_RESULT = Object.freeze({ handled: false, wasmExited: true });
+// ACC_SYNCHRONIZED has no bytecode: the monitor is implied by the flag and is
+// entered/released by the interpreter around the frame. Generated code runs a
+// body without going through those hooks, so a compiled or linked synchronized
+// method would execute with the lock dropped. Keep them interpreted.
+const isSynchronizedMethod = (method) =>
+  !!method && (method.flags || []).includes("synchronized");
 const WASM_NATIVE_LONG_OPS = new Set([
   "i2l", "l2i", "ladd", "land", "lcmp", "ldiv", "lmul", "lneg",
   "lor", "lrem", "lshl", "lshr", "lsub", "lushr", "lxor",
@@ -1536,6 +1542,26 @@ class JitCompiler {
             process.env.JVM_TRACE_JIT_SOURCE === "1") {
           console.error("[jit-generated-source] " + traceIdentity + "\n" +
             (structuredSsa.jvmStructuredSource || source));
+        }
+      }
+      if (structuredSsa.jvmStructuredRequiresBaselineFramedEntry) {
+        // Keep the renderer's verified scalar ABI for nested synchronous
+        // calls, but do not use its ordinary Frame ABI. A protected non-void
+        // call can suspend after consuming operands, and only the baseline
+        // body currently implements that pending-return handoff at arbitrary
+        // frame PCs. This split is structural and independent of guest names.
+        const baseline = this.compileBaselineMethod(method, inlineLoopRegions);
+        if (baseline) {
+          baseline.jvmStructuredPositionalOnly = true;
+          baseline.jvmRestoringDirectPositionalBody =
+            structuredSsa.jvmRestoringDirectPositionalBody;
+          baseline.jvmRestoringDirectPositionalSource =
+            structuredSsa.jvmRestoringDirectPositionalSource;
+          if (structuredSsa.jvmRestoringDirectPositionalPlan) {
+            baseline.jvmRestoringDirectPositionalPlan =
+              structuredSsa.jvmRestoringDirectPositionalPlan;
+          }
+          return baseline;
         }
       }
       return this.withResumeBody(structuredSsa, method);
@@ -4845,6 +4871,15 @@ class JitCompiler {
       "let positionalTimingStarted = -1;",
       "let positionalExclusiveTiming = null;",
       "if (useFrameless) {",
+      // A frameless entry runs the body with no Frame on the call stack, so the
+      // implied ACC_SYNCHRONIZED monitor is entered against the child Frame that
+      // already exists for locals and released explicitly below -- CallStack.pop
+      // never sees this call. Contention degrades to the ordinary deopt path,
+      // which restores the child and lets the scheduler block on it.
+      "  if (child.isSynchronizedMethod && !child.monitorEntered &&",
+      "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
+      "    result = { deopt: true, reason: 'synchronized monitor contended' };",
+      "  } else {",
       "  baseDepth = thread.callStack.items.length;",
       "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
       "  if (jit.shouldBeginExclusiveTimingKey(plan.methodKey)) {",
@@ -4874,11 +4909,21 @@ class JitCompiler {
       "    jit.recordMethodTiming(plan.methodKey, jit.monotonicNow() - positionalTimingStarted, plan.generated);",
       "  }",
       "  jit.endExclusiveTiming(positionalExclusiveTiming);",
+      "  }",
       "} else {",
       "  thread.callStack.push(child);",
+      // The implied monitor of a synchronized callee has to be held before its
+      // body runs. Uncontended entry is a couple of field writes and stays in
+      // generated code; a contended one yields to the scheduler as BLOCKED and
+      // the interpreter re-enters the already-pushed child once it is free.
+      "  if (child.isSynchronizedMethod && !child.monitorEntered &&",
+      "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
+      "    result = { deopt: true, reason: 'synchronized monitor contended' };",
+      "  } else {",
       "  result = jit.runGeneratedFrame(plan.generated, child, thread, false);",
       "  if (result && typeof result.then === 'function') {",
       "    throw new Error('Synchronous positional method returned a Promise');",
+      "  }",
       "  }",
       "}",
       traceResult,
@@ -4897,6 +4942,9 @@ class JitCompiler {
       "    }",
       "  }",
       "  return result;",
+      "}",
+      "if (useFrameless && child.monitorEntered === true) {",
+      "  jit.jvm.exitFrameMonitor(child);",
       "}",
       "if (adaptiveFrameless && !useFrameless && !target.framelessRejected) {",
       "  target.framelessWarmCompletions = (target.framelessWarmCompletions || 0) + 1;",
@@ -5374,6 +5422,15 @@ class JitCompiler {
     }
     frame.stack.items.length = argumentBase - receiverSlots;
     thread.callStack.push(child);
+    // See the positional emitter: a synchronized callee must hold its monitor
+    // before its body runs, and a contended entry becomes an ordinary deopt so
+    // the scheduler can block this thread on the already-pushed child.
+    if (child.isSynchronizedMethod && !child.monitorEntered &&
+        !this.jvm.enterFrameMonitorIfNeeded(child, thread)) {
+      child.jitGeneratedReturnParent = frame;
+      child.jitGeneratedReturnType = returnType;
+      return { deopt: true, reason: "synchronized monitor contended" };
+    }
     const result = this.runGeneratedFrame(generated, child, thread, false);
     if (result && typeof result.then === "function") {
       throw new Error("Synchronous generated method returned a Promise");
@@ -7281,6 +7338,11 @@ class JitCompiler {
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
     thread.callStack.push(child);
+    if (child.isSynchronizedMethod && !child.monitorEntered &&
+        !this.jvm.enterFrameMonitorIfNeeded(child, thread)) {
+      // Contended: leave the child pushed and let the scheduler resume it.
+      return { deopt: true, reason: "synchronized monitor contended" };
+    }
     if (this.wasmJit.enabled) {
       // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
       // can prove numeric loops covered by a wrap-and-rethrow diagnostic

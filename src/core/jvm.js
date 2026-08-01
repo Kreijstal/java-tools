@@ -1,4 +1,7 @@
 const Stack = require("./stack");
+const CallStack = require("./callStack");
+const { releaseFrameMonitor } = CallStack;
+const FRAME_STATIC_KIND = Symbol("frame.staticKind");
 const {
   loadClassByPath,
   loadClassByPathSync: loadConvertedClass,
@@ -645,7 +648,7 @@ class JVM {
     const mainThread = {
       id: 0,
       name: "main",
-      callStack: new Stack(),
+      callStack: new CallStack(),
       status: "runnable",
       pendingException: null,
     };
@@ -1090,7 +1093,7 @@ class JVM {
           thread = {
             id: this.threads.length,
             name: 'AWT-EventQueue-0',
-            callStack: new Stack(),
+            callStack: new CallStack(),
             status: 'terminated',
             pendingException: null,
           };
@@ -1309,6 +1312,13 @@ class JVM {
     if (frame.pc >= frame.instructions.length) {
       return JIT_TICK_SLOW;
     }
+    // This fast path enters the frame without going through executeTick, so it
+    // owns the implied ACC_SYNCHRONIZED acquisition too. A contended monitor
+    // parks the thread; the slow path then finds it BLOCKED and reschedules.
+    if (frame.isSynchronizedMethod && !frame.monitorEntered &&
+        !this.enterFrameMonitorIfNeeded(frame, thread)) {
+      return JIT_TICK_SLOW;
+    }
 
     try {
       const jitResult = this.jit.tryRunFrame(frame, thread);
@@ -1390,6 +1400,18 @@ class JVM {
       return { completed: false };
     }
 
+    // Enter the implied monitor before anything executes in this frame -- the
+    // JIT attempt below included. Leaving pc untouched makes the scheduler
+    // retry this frame once the owner releases, exactly like monitorenter.
+    if (frame.isSynchronizedMethod && !frame.monitorEntered &&
+        !this.enterFrameMonitorIfNeeded(frame, thread)) {
+      if (this.threads.length > 0) {
+        this.currentThreadIndex =
+          (this.currentThreadIndex + 1) % this.threads.length;
+      }
+      return { completed: false };
+    }
+
     try {
       // Generated JavaScript and Wasm entries normally complete
       // synchronously. Do not force a Promise/microtask round trip for those
@@ -1437,6 +1459,13 @@ class JVM {
       const currentFrame = callStack.isEmpty() ? null : callStack.peek();
       if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
           thread.status !== 'runnable') break;
+
+      // An invoke earlier in this burst may have pushed a synchronized frame;
+      // it must not execute before its monitor is held. This runs per bytecode,
+      // so the overwhelmingly common non-synchronized case stays two property
+      // reads and never reaches the call.
+      if (currentFrame.isSynchronizedMethod && !currentFrame.monitorEntered &&
+          !this.enterFrameMonitorIfNeeded(currentFrame, thread)) break;
 
       // A whole method may still be warming while a verified bounded
       // primitive-array loop inside it is already hot. Enter the cached scalar
@@ -2649,6 +2678,71 @@ class JVM {
   // operand stack. Returns true when dispatched. Shared by the interpreter's
   // unwinding above and the wasm tiers' nested EH-callee links (a nested -3
   // dispatches inside the callee's scratch frame before it is materialized).
+  // The object a synchronized method locks: the receiver for instance methods,
+  // the declaring class's Class object for static ones -- the same object
+  // `synchronized (Foo.class)` would lock, so the two forms exclude each other.
+  frameMonitorObject(frame) {
+    if (frame.monitorObject) return frame.monitorObject;
+    // Memoised: this runs on every synchronized call, and a raw flags.includes()
+    // here was an array scan per acquisition.
+    const method = frame.method;
+    let isStatic = method && method[FRAME_STATIC_KIND];
+    if (isStatic === undefined) {
+      isStatic = ((method && method.flags) || []).includes("static");
+      if (method) method[FRAME_STATIC_KIND] = isStatic;
+    }
+    const target = isStatic
+      ? (frame.className ? this.getClassObjectSync(frame.className) : null)
+      : frame.locals[0];
+    if (!target || typeof target !== "object") return null;
+    frame.monitorObject = target;
+    return target;
+  }
+
+  /**
+   * Enter a synchronized method's implied monitor before its first instruction.
+   * Returns false when the monitor is owned by another thread; the caller must
+   * leave the frame at its current pc so the entry is retried once the
+   * scheduler marks the thread runnable again (same protocol as monitorenter).
+   */
+  enterFrameMonitorIfNeeded(frame, thread) {
+    if (!frame.isSynchronizedMethod || frame.monitorEntered) return true;
+    const monitor = this.frameMonitorObject(frame);
+    // A missing monitor (no receiver, unloaded class) must not wedge the
+    // thread; running unsynchronized matches the previous behaviour. It still
+    // counts: the flag is set, so the release path must be allowed to clear it.
+    // Skipping the count here left monitorEntered stuck true on a pooled frame,
+    // which then skipped acquisition entirely on its next use.
+    if (!monitor) {
+      frame.monitorEntered = true;
+      return true;
+    }
+    if (!monitor.isLocked) {
+      monitor.isLocked = true;
+      monitor.lockOwner = thread.id;
+      monitor.lockCount = 1;
+    } else if (monitor.lockOwner === thread.id) {
+      monitor.lockCount++;
+    } else {
+      thread.status = "BLOCKED";
+      thread.blockingOn = monitor;
+      return false;
+    }
+    frame.monitorEntered = true;
+    frame.monitorOwnerThreadId = thread.id;
+    return true;
+  }
+
+  /**
+   * Release a synchronized frame's monitor. Ordinary returns and unwinds do not
+   * need this: CallStack.pop() releases whatever the retiring frame held, which
+   * is what lets the generated tiers return without any monitor bookkeeping.
+   */
+  exitFrameMonitor(frame) {
+    if (!frame || !frame.monitorEntered) return;
+    releaseFrameMonitor(frame);
+  }
+
   dispatchExceptionInFrame(frame, exception, pcToCheck) {
     const table = frame.exceptionTable;
     if (!table) return false;
@@ -2793,7 +2887,7 @@ class JVM {
     this.threads = [];
     for (const snapshot of decoded.threads || []) {
       const properties = snapshot.properties || {};
-      const thread = { ...properties, callStack: new Stack() };
+      const thread = { ...properties, callStack: new CallStack() };
       if (properties.sleepRemaining !== undefined) {
         thread.sleepUntil = restoredAt + Number(properties.sleepRemaining);
         delete thread.sleepRemaining;
@@ -2951,7 +3045,7 @@ class JVM {
         const thread = {
           id: threadState.id,
           status: threadState.status,
-          callStack: new Stack(),
+          callStack: new CallStack(),
         };
         for (const frameState of threadState.callStack) {
           const method = await this.findMethodInHierarchy(

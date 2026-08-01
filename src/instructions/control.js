@@ -386,7 +386,7 @@ module.exports = {
         delete thread.pendingException;
       }
       const returnValue = frame.stack.pop();
-      thread.callStack.pop();
+    thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
       } else if (!thread.callStack.isEmpty()) {
@@ -398,7 +398,7 @@ module.exports = {
         delete thread.pendingException;
       }
       const returnValue = frame.stack.pop();
-      thread.callStack.pop();
+    thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
       } else if (!thread.callStack.isEmpty()) {
@@ -410,7 +410,7 @@ module.exports = {
         delete thread.pendingException;
       }
       const returnValue = frame.stack.pop();
-      thread.callStack.pop();
+    thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
       } else if (!thread.callStack.isEmpty()) {

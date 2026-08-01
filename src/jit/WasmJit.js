@@ -2462,6 +2462,10 @@ class WasmJit {
     const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
       .find((m) => m.name === name && m.descriptor === descriptor);
     if (!method || !(method.flags || []).includes('static')) return null;
+    // ACC_SYNCHRONIZED is implied by the flag, not by bytecode, so the monitor
+    // only exists on the interpreter's frame path. A linked call runs the body
+    // with no frame at all, which would silently drop the lock.
+    if ((method.flags || []).includes('synchronized')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method; // partial-link deopts materialize a Frame
@@ -2500,6 +2504,8 @@ class WasmJit {
     if (!method) return null;
     const flags = method.flags || [];
     if (flags.includes('static') || flags.includes('abstract') || flags.includes('native')) return null;
+    // See findReadyStatic: a linked call has no frame, so it has no monitor.
+    if (flags.includes('synchronized')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method;
