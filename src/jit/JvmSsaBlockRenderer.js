@@ -60,6 +60,54 @@ function runtimeClassNameExpression(value) {
     `? "java/lang/String" : (${value}._className || ${value}.type))`;
 }
 
+function compactOneUseGuardTemporaries(sourceLines) {
+  let lines = [...sourceLines];
+  const namePattern =
+    "ssa(?:RuntimeCoarse(?:Trips|Loop)|ArrayRangeGuard)\\d+";
+  for (;;) {
+    const counts = new Map();
+    for (const line of lines) {
+      for (const match of line.matchAll(
+        new RegExp(`\\b${namePattern}\\b`, "g"))) {
+        counts.set(match[0], (counts.get(match[0]) || 0) + 1);
+      }
+    }
+    let changed = false;
+    for (let declarationIndex = 0;
+      declarationIndex < lines.length; declarationIndex += 1) {
+      const declaration = new RegExp(
+        `^(\\s*)const (${namePattern}) = (.+);$`,
+      ).exec(lines[declarationIndex]);
+      if (!declaration || counts.get(declaration[2]) !== 2 ||
+          /\bhelpers\.|\bnew\b/.test(declaration[3])) continue;
+      const usePattern = new RegExp(`\\b${declaration[2]}\\b`);
+      let useIndex = -1;
+      for (let index = declarationIndex + 1; index < lines.length; index += 1) {
+        if (usePattern.test(lines[index])) {
+          useIndex = index;
+          break;
+        }
+      }
+      if (useIndex < 0) continue;
+      const referencedLocals = [
+        ...declaration[3].matchAll(/\blocal(\d+)\b/g),
+      ].map((match) => Number(match[1]));
+      const localChanged = referencedLocals.some((slot) => {
+        const assignment = new RegExp(`\\blocal${slot}\\s*=(?!=)`);
+        return lines.slice(declarationIndex + 1, useIndex)
+          .some((line) => assignment.test(line));
+      });
+      if (localChanged) continue;
+      lines[useIndex] = lines[useIndex].replace(
+        usePattern, `(${declaration[3]})`);
+      lines[declarationIndex] = "";
+      changed = true;
+    }
+    if (!changed) return lines;
+    lines = lines.filter(Boolean);
+  }
+}
+
 // Makes one multiple-entry strongly connected component reducible by routing
 // every edge into its entries through a synthetic single dispatcher header:
 // each rerouted edge records its destination in a per-island state variable and
@@ -624,6 +672,7 @@ class JvmSsaBlockRenderer {
     const lazyStaticSites = new Map();
     const directStaticOwners = new Set();
     const callSites = new Map();
+    const selfRecursiveCallExpressions = new Map();
     const positionalCallSiteVariable = (index) => `ssaCallSite${index}`;
     const positionalCallTargetVariable = (index) =>
       `ssaFastPositional${index}`;
@@ -674,6 +723,14 @@ class JvmSsaBlockRenderer {
         }
         if (!descriptor || !Array.isArray(descriptor.params)) return reject(`invalid call shape at ${index}`);
         const isStatic = op === "invokestatic";
+        const callOwner = instruction.arg[1];
+        const callMember = instruction.arg[2];
+        const callOwnerClass = typeof callOwner === "string"
+          ? this.jit.jvm.classes[callOwner] : null;
+        const resolvedCallMethod = isStatic && callOwnerClass
+          ? this.jit.jvm.findMethod(
+            callOwnerClass, callMember[0], callMember[1]) : null;
+        const selfRecursive = resolvedCallMethod === method;
         const directJre = this.jit.getCompileTimeDirectJre(op, instruction);
         const inline = directJre || !isStatic
           ? null : this.jit.getCompileTimeIntegerLeaf(instruction);
@@ -704,6 +761,7 @@ class JvmSsaBlockRenderer {
           directIntrinsic,
           directCheckedLeaf,
           directFused,
+          selfRecursive,
         });
       }
     }
@@ -2924,7 +2982,7 @@ class JvmSsaBlockRenderer {
                       "helpers.structuredSsa.restoringDirectRunCount += 1;") &&
                     !/^let safePointBudget = \d+;$/.test(line.trim()) &&
                     !/^if \(.+\) safePointBudget -= .+;$/.test(line.trim()));
-                  return childLines;
+                  return compactOneUseGuardTemporaries(childLines);
                 })() : null;
               const receiverGuard = site.dynamic && site.argumentCount > 0
                 ? `${args[0]} !== null && ${args[0]} !== undefined && ` +
@@ -2945,6 +3003,24 @@ class JvmSsaBlockRenderer {
                   checkedLeaf: ["return helpers.asyncInvokeSentinel();"],
                 });
               }
+              const positionalRawCall = `${positionalRawInvoke} ? ` +
+                `${positionalRawInvoke}(helpers${args.length ? ", " : ""}` +
+                `${args.join(", ")}${positionalRawCaptures.length
+                  ? `${args.length ? ", " : ""}${positionalRawCaptures.join(", ")}`
+                  : ""}${args.length || positionalRawCaptures.length
+                  ? ", " : ", "}thread, true) : ` +
+                `${positionalInvoke}(${args.join(", ")}${
+                  args.length ? ", " : ""}thread, true)`;
+              const selfRecursiveMarker = site.selfRecursive
+                ? `/*__SSA_SELF_RECURSIVE_CALL_${index}__*/` : "";
+              if (site.selfRecursive) {
+                selfRecursiveCallExpressions.set(index, {
+                  index,
+                  marker: selfRecursiveMarker,
+                  ordinary: positionalRawCall,
+                  args: [...args],
+                });
+              }
               lines.push(
                 `let ${usedDirect} = false;`,
                 `if (${inlineCheckedLeafLines
@@ -2956,26 +3032,14 @@ class JvmSsaBlockRenderer {
                   ...inlineCheckedLeafLines.map((line) => `    ${line}`),
                   "  }",
                 ] : directCheckedLeafNoThrow ? [
-                  `  ${out} = ${positionalRawInvoke} ? ` +
-                    `${positionalRawInvoke}(helpers${args.length ? ", " : ""}` +
-                    `${args.join(", ")}${positionalRawCaptures.length
-                      ? `${args.length ? ", " : ""}${positionalRawCaptures.join(", ")}`
-                      : ""}${args.length || positionalRawCaptures.length
-                      ? ", " : ", "}thread, true) : ` +
-                    `${positionalInvoke}(${args.join(", ")}${
-                      args.length ? ", " : ""}thread, true);`,
+                  `  ${out} = ${selfRecursiveMarker}${positionalRawCall};`,
                 ] : [
-                  `  try { ${out} = ${positionalRawInvoke} ? ` +
-                    `${positionalRawInvoke}(helpers${args.length ? ", " : ""}` +
-                    `${args.join(", ")}${positionalRawCaptures.length
-                      ? `${args.length ? ", " : ""}${positionalRawCaptures.join(", ")}`
-                      : ""}${args.length || positionalRawCaptures.length
-                      ? ", " : ", "}thread, true) : ` +
-                    `${positionalInvoke}(${args.join(", ")}${
-                      args.length ? ", " : ""}thread, true); } catch (${caught}) {`,
+                  `  try { ${out} = ${selfRecursiveMarker}${
+                    positionalRawCall}; } catch (${caught}) {`,
                   ...materializeCallExceptionLines(
                     callStack, stack, index,
-                    `!${positionalInvoke}.jvmRestoresExceptionFrames`,
+                    site.selfRecursive ? "false" :
+                      `!${positionalInvoke}.jvmRestoresExceptionFrames`,
                   ).map((line) => `    ${line}`),
                   `    throw ${caught};`, "  }",
                 ]),
@@ -3517,9 +3581,10 @@ class JvmSsaBlockRenderer {
               `)`,
             condition:
               `ssaRuntimeCoarseTrips${header} <= ` +
-              `${runtimeCoarseTripLimit} && ` +
-              `local${info.slot} <= 2147483647 - ` +
-              `ssaRuntimeCoarseTrips${header} * ${info.increment}`,
+              `${runtimeCoarseTripLimit}` +
+              (info.increment === 1 ? "" :
+                ` && local${info.slot} <= 2147483647 - ` +
+                `ssaRuntimeCoarseTrips${header} * ${info.increment}`),
           });
         }
         findNestedCountedLoops(node.body, loopDepth + 1);
@@ -3665,9 +3730,10 @@ class JvmSsaBlockRenderer {
               : `Math.ceil((${info.boundExpression} - local${info.slot}) / ` +
                 `${info.increment})`) + `)`,
           condition:
-            `ssaRuntimeCoarseTrips${header} <= ${runtimeCoarseTripLimit} && ` +
-            `local${info.slot} <= 2147483647 - ` +
-            `ssaRuntimeCoarseTrips${header} * ${info.increment}`,
+            `ssaRuntimeCoarseTrips${header} <= ${runtimeCoarseTripLimit}` +
+            (info.increment === 1 ? "" :
+              ` && local${info.slot} <= 2147483647 - ` +
+              `ssaRuntimeCoarseTrips${header} * ${info.increment}`),
         });
       }
     }
@@ -4890,12 +4956,11 @@ class JvmSsaBlockRenderer {
             `${prefix}LastIndex <= 2147483647))`;
         } else {
           const baseSlot = candidate.slots.find((slot) => slot !== info.slot);
-          const start = `(local${baseSlot} + local${info.slot})`;
-          const end = `(local${baseSlot} + ${info.boundExpression})`;
+          const trips = `(${info.boundExpression} - local${info.slot})`;
+          const start = `((local${baseSlot} + local${info.slot}) | 0)`;
           condition =
             `(local${info.slot} >= ${info.boundExpression} || ` +
-            `(${start} >= 0 && ${end} <= ${candidate.arrayData}.length && ` +
-            `${end} <= 2147483647))`;
+            `((${start} >>> 0) <= ${candidate.arrayData}.length - ${trips}))`;
         }
       }
       if (eagerEntryFieldArrayData.has(candidate.arrayData) ||
@@ -5925,8 +5990,11 @@ class JvmSsaBlockRenderer {
     // own class/debug/epoch guards remain authoritative.
     const positionalParentOwner = method.className ||
       this.jit.jvm.findClassNameForMethod?.(method) || null;
-    const positionalCallDeclarationsFor = () => [...callSites]
-      .filter(([, site]) => site.id !== null && site.id !== undefined)
+    const positionalCallDeclarationsFor = (
+      omitSelfRecursive = false,
+    ) => [...callSites]
+      .filter(([, site]) => site.id !== null && site.id !== undefined &&
+        !(omitSelfRecursive && site.selfRecursive))
       .flatMap(([index, site]) => {
         const trustedCapturedLeaf =
           Array.isArray(site.directCheckedLeaf?.captures) &&
@@ -5992,7 +6060,32 @@ class JvmSsaBlockRenderer {
     const positionalCallDeclarations =
       positionalCallDeclarationsFor();
     const directPositionalCallDeclarations =
-      positionalCallDeclarations;
+      positionalCallDeclarationsFor(true);
+    const restoringDirectPositionalCallDeclarations =
+      directPositionalCallDeclarations;
+    const specializeSelfRecursiveCalls = (
+      source, tier, includePlan, functionNameOverride = null,
+    ) => {
+      if (!selfRecursiveCallExpressions.size) return source;
+      const functionName = functionNameOverride ||
+        this.jit.generatedSource(method, tier, "").functionName;
+      let specialized = source;
+      for (const call of selfRecursiveCallExpressions.values()) {
+        const direct = `${functionName}(helpers, ${includePlan ? "plan, " : ""}` +
+          `${call.args.join(", ")}${call.args.length ? ", " : ""}` +
+          "thread, 2)";
+        specialized = specialized.split(
+          `${call.marker}${call.ordinary}`).join(direct);
+        const site = callSites.get(call.index);
+        if (site) {
+          specialized = specialized.split(
+            `if ((${positionalCallRawInvokeVariable(call.index)} || ` +
+              `${positionalCallInvokeVariable(call.index)}) && true) {`,
+          ).join("if (true) {");
+        }
+      }
+      return specialized;
+    };
     const fieldReadCacheDeclarations = [...fieldReadCaches.values()].flatMap((cache) => [
       `let ${cache.object} = null;`,
       `let ${cache.value};`,
@@ -6386,10 +6479,14 @@ class JvmSsaBlockRenderer {
       });
     const compactCheckedLeafLines = (sourceLines) => {
       let lines = [...sourceLines];
+      const compactTemporaryPattern =
+        "(?:ssaValue\\d+|ssaRuntimeCoarse(?:Trips|Loop)\\d+|" +
+        "ssaArrayRangeGuard\\d+)";
       const occurrenceCounts = () => {
         const counts = new Map();
         for (const line of lines) {
-          for (const match of line.matchAll(/\bssaValue\d+\b/g)) {
+          for (const match of line.matchAll(new RegExp(
+            `\\b${compactTemporaryPattern}\\b`, "g"))) {
             counts.set(match[0], (counts.get(match[0]) || 0) + 1);
           }
         }
@@ -6425,7 +6522,8 @@ class JvmSsaBlockRenderer {
         for (let declarationIndex = 0;
           declarationIndex < lines.length; declarationIndex += 1) {
           const declaration =
-            /^(\s*)const (ssaValue\d+) = (.+);$/.exec(lines[declarationIndex]);
+            new RegExp(`^(\\s*)const (${compactTemporaryPattern}) = (.+);$`)
+              .exec(lines[declarationIndex]);
           if (!declaration || counts.get(declaration[2]) !== 2) continue;
           let useIndex = -1;
           const usePattern = new RegExp(`\\b${declaration[2]}\\b`);
@@ -6745,7 +6843,7 @@ class JvmSsaBlockRenderer {
           "ssaDirectClassInitializationGuard))";
         const directGuardConditions = [
           "(!nestedEntryGuarded && helpers.needsBytecodeChecks())",
-          directInitializationCondition,
+          `(nestedEntryGuarded !== 2 && ${directInitializationCondition})`,
         ];
         const directGuard = directGuardConditions.length
           ? `if (${directGuardConditions.join(" || ")}) ` +
@@ -6760,7 +6858,7 @@ class JvmSsaBlockRenderer {
             "helpers.structuredSsa.guardedBooleanFallbackCount += 1; " +
             "return helpers.asyncInvokeSentinel(); }"
           : null;
-        directPositionalSource = [
+        directPositionalSource = specializeSelfRecursiveCalls([
           "'use strict';",
           directInitializationGuardDeclaration,
           directGuard,
@@ -6770,7 +6868,10 @@ class JvmSsaBlockRenderer {
           ...directPositionalCallDeclarations,
           directBooleanGuard,
           this.runCountersEnabled
-            ? "helpers.structuredSsa.runCount += 1;" : null,
+            ? selfRecursiveCallExpressions.size
+              ? "if (nestedEntryGuarded !== 2) " +
+                "helpers.structuredSsa.runCount += 1;"
+              : "helpers.structuredSsa.runCount += 1;" : null,
           `let safePointBudget = ${safePointInitialBudget};`,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
@@ -6782,7 +6883,7 @@ class JvmSsaBlockRenderer {
           ...declarations,
           ...expandContinuationFallbacks(
             render(structured.tree, false, true), false),
-        ].filter(Boolean).join("\n");
+        ].filter(Boolean).join("\n"), "ssa-direct-positional", false);
         directPositionalBody = this.jit.createGeneratedFunction(
           method,
           "ssa-direct-positional",
@@ -6853,7 +6954,7 @@ class JvmSsaBlockRenderer {
         const directGuardConditions = [
           "(!nestedEntryGuarded && (helpers.profileMethods || " +
             "helpers.needsBytecodeChecks() || thread.status !== 'runnable'))",
-          restoringInitializationCondition,
+          `(nestedEntryGuarded !== 2 && ${restoringInitializationCondition})`,
         ];
         const directGuard =
           `if (${directGuardConditions.join(" || ")}) { ` +
@@ -7026,10 +7127,13 @@ class JvmSsaBlockRenderer {
           ...directStaticDeclarations,
           ...lazyStaticDeclarations,
           ...directEntryStaticReadDeclarations,
-          ...directPositionalCallDeclarations,
+          ...restoringDirectPositionalCallDeclarations,
           directBooleanGuard,
           this.runCountersEnabled
-            ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
+            ? selfRecursiveCallExpressions.size
+              ? "if (nestedEntryGuarded !== 2) " +
+                "helpers.structuredSsa.restoringDirectRunCount += 1;"
+              : "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,
           `let safePointBudget = ${restoringDirectSafePointBudget};`,
           ...declaredLocals.map((index) =>
             `${immutableEntryLocals.has(index) ? "const" : "let"} local${index} = ${
@@ -7051,7 +7155,7 @@ class JvmSsaBlockRenderer {
           ...declarations,
           ...restoringRenderedTree,
         ].filter(Boolean);
-        restoringDirectPositionalSource = [
+        restoringDirectPositionalSource = specializeSelfRecursiveCalls([
           "'use strict';",
           restoringInitializationGuardDeclaration,
           directGuard,
@@ -7068,13 +7172,29 @@ class JvmSsaBlockRenderer {
           "  }",
           "  throw error;",
           "}",
-        ].join("\n");
+        ].join("\n"), "ssa-direct-restoring-positional", true);
+        const restoringSentinelCaptures = {};
+        if (restoringDirectPositionalSource.includes(
+          "helpers.returnVoid()")) {
+          restoringDirectPositionalSource = restoringDirectPositionalSource
+            .split("helpers.returnVoid()").join("ssaReturnVoid");
+          restoringSentinelCaptures.ssaReturnVoid =
+            this.jit.returnVoid();
+        }
+        if (restoringDirectPositionalSource.includes(
+          "helpers.asyncInvokeSentinel()")) {
+          restoringDirectPositionalSource = restoringDirectPositionalSource
+            .split("helpers.asyncInvokeSentinel()").join("ssaAsyncInvoke");
+          restoringSentinelCaptures.ssaAsyncInvoke =
+            this.jit.asyncInvokeSentinel();
+        }
         restoringDirectPositionalBody = this.jit.createGeneratedFunction(
           method,
           "ssa-direct-restoring-positional",
           ["helpers", "plan", ...argumentNames, "thread",
             "nestedEntryGuarded"],
           restoringDirectPositionalSource,
+          null, false, false, restoringSentinelCaptures,
         );
 
         const singleLoopHeader = structured.loopHeaders.size === 1

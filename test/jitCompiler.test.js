@@ -3440,8 +3440,8 @@ public final class NestedCyclicArrayRangeHarness {
       checkedSource.includes('helpers.arrayStore('),
   'the atomic checked leaf contains no dead scheduler or checked-array path');
   const outerLoop = checkedSource.indexOf('L3: while');
-  const rangeBailout = checkedSource.indexOf(
-    'if (!(ssaArrayRangeGuard0 && ssaArrayRangeGuard1))');
+  const rangeBailout = checkedSource.search(
+    /if \(!\([^\n]*\.length[^\n]*&&[^\n]*\.length[^\n]*\)\)/);
   t.ok(rangeBailout >= 0 && rangeBailout < outerLoop,
     'the combined layout guard executes once before the outer loop');
 
@@ -3921,6 +3921,56 @@ public final class CoalescedArrayRangeHarness {
     'the coalesced guard accepts the valid Java range');
   t.deepEqual(Array.from(values), [1, 3, 4, 5, 5],
     'load/store ordering and mutations remain exact');
+  t.end();
+});
+
+test('structured SSA binds verified renamed static self recursion directly',
+  async (t) => {
+  const className = 'ArbitraryRecursivePartition';
+  const classpath = compileJavaFixture(t, className, `
+public final class ArbitraryRecursivePartition {
+  static int combine(int[] values, int lower, int upper) {
+    if (upper - lower == 1) return values[lower];
+    int middle = (lower + upper) >>> 1;
+    return combine(values, lower, middle) +
+        combine(values, middle, upper);
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'combine', '([III)I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  const source = generated?.jvmRestoringDirectPositionalSource || '';
+  t.equal(typeof generated?.jvmRestoringDirectPositionalBody, 'function',
+    'an arbitrary recursive shape publishes a restoring positional body');
+  t.ok(source.includes('thread, 2)') &&
+      !source.includes('const ssaCallSite'),
+  'exact self calls bind to the generated body without dispatch snapshots');
+
+  const values = [1, 2, 3, 4, 5, 6, 7, 8];
+  values.type = '[I';
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  const plan = {
+    target: { freeFrame: null }, Frame, lookupClass: className, method,
+    restoreFrame(targetThread, frame, depth) {
+      targetThread.callStack.items.splice(depth, 0, frame);
+    },
+  };
+  const result = generated.jvmRestoringDirectPositionalBody(
+    jvm.jit, plan, values, 0, values.length, thread, true);
+  t.equal(result, 36,
+    'direct recursive calls preserve the scalar result');
+  t.equal(thread.callStack.size(), 0,
+    'successful recursion does not materialize child Frames');
   t.end();
 });
 
