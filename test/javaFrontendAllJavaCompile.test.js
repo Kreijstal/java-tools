@@ -89,7 +89,7 @@ test('repository Java frontend builds every provided .java file without host com
       fallbackUnsupportedTypes: false,
     });
 
-    t.equal(inputPaths.length, 148, 'all provided Java sources are covered by the regression set');
+    t.equal(inputPaths.length, 154, 'all provided Java sources are covered by the regression set');
     t.equal(result.backend, 'java-frontend', 'batch compile uses the repository Java frontend backend');
     t.equal(result.results.length, inputPaths.length, 'one frontend compile result is recorded per source file');
     const writtenPaths = result.written.map((entry) => entry.outputPath);
