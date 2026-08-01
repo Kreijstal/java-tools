@@ -2297,9 +2297,8 @@ public final class ArbitraryOutlinedDirectArrayLoop {
       true, 'the generic spill-cost decision selects the outlined helper');
     t.equal(target.generated.jvmStructuredCaptureFreeRestoringSpills, true,
       'the outlined body keeps successful scalar locals out of a closure');
-    t.equal(target.generated.jvmStructuredRestoringFrameSlotCount,
-      target.generated.jvmStructuredSpilledLocalCount,
-    'entry arguments share their JVM-local restoration slots instead of being duplicated');
+    t.equal(target.generated.jvmStructuredRestoringFrameSlotCount, 5,
+    'restoration retains four entry arguments and one distinct spill slot exactly once');
     t.ok(target.generated.jvmRestoringDirectPositionalSource.includes(
       'materializeDirectFrame('),
     'throwing operations call the capture-free materialization helper');
