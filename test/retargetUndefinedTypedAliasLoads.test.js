@@ -160,3 +160,24 @@ test('skips undefined array load when compatible parameter is ambiguous', (t) =>
   t.deepEqual(code.codeItems[0].instruction, { op: 'aload', arg: '8' });
   t.end();
 });
+
+test('does not treat the reference value of aastore as an array parameter alias', (t) => {
+  const method = {
+    flags: ['static'],
+    descriptor: '([Lvl;BLvl;Z)V',
+  };
+  const code = {
+    codeItems: [
+      { instruction: { op: 'aload', arg: '5' } },
+      { instruction: { op: 'iload', arg: '6' } },
+      { instruction: { op: 'aload', arg: '7' } },
+      { instruction: 'aastore' },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(rewriteCode(code, method), 0);
+  t.deepEqual(code.codeItems[2].instruction, { op: 'aload', arg: '7' });
+  t.end();
+});

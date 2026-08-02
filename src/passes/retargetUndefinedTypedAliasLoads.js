@@ -89,15 +89,20 @@ function findCompatibleArrayParameter(items, loadIndex, method) {
 function expectedArrayDescriptorAtUse(items, loadIndex) {
   for (let i = nextInstructionIndex(items, loadIndex), seen = 0; i >= 0 && seen < 8; i = nextInstructionIndex(items, i), seen += 1) {
     const itemOp = op(items[i]);
-    if (itemOp === 'faload' || itemOp === 'fastore') return '[F';
-    if (itemOp === 'daload' || itemOp === 'dastore') return '[D';
-    if (itemOp === 'laload' || itemOp === 'lastore') return '[J';
-    if (itemOp === 'iaload' || itemOp === 'iastore') return '[I';
-    if (itemOp === 'baload' || itemOp === 'bastore') return '[B';
-    if (itemOp === 'caload' || itemOp === 'castore') return '[C';
-    if (itemOp === 'saload' || itemOp === 'sastore') return '[S';
-    if (itemOp === 'aaload') return '[[*';
-    if (itemOp === 'aastore') return '[L*';
+    // An array load consumes the array reference and an index; an array store
+    // additionally consumes the value.  Do not infer that the starting aload
+    // is the array reference unless those intervening operands were produced.
+    // In particular, an aload immediately before aastore is its value operand,
+    // not an undefined alias of an array parameter.
+    if ((itemOp === 'faload' && seen >= 1) || (itemOp === 'fastore' && seen >= 2)) return '[F';
+    if ((itemOp === 'daload' && seen >= 1) || (itemOp === 'dastore' && seen >= 2)) return '[D';
+    if ((itemOp === 'laload' && seen >= 1) || (itemOp === 'lastore' && seen >= 2)) return '[J';
+    if ((itemOp === 'iaload' && seen >= 1) || (itemOp === 'iastore' && seen >= 2)) return '[I';
+    if ((itemOp === 'baload' && seen >= 1) || (itemOp === 'bastore' && seen >= 2)) return '[B';
+    if ((itemOp === 'caload' && seen >= 1) || (itemOp === 'castore' && seen >= 2)) return '[C';
+    if ((itemOp === 'saload' && seen >= 1) || (itemOp === 'sastore' && seen >= 2)) return '[S';
+    if (itemOp === 'aaload' && seen >= 1) return '[[*';
+    if (itemOp === 'aastore' && seen >= 2) return '[L*';
     if (itemOp === 'arraylength') return '[*';
     if (!isSimpleStackProducer(items[i])) return null;
   }
