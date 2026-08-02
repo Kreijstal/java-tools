@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Java Applet Loader (jvm.js)
 // @namespace    kreijstal.java-tools
-// @version      0.1.0
-// @description  Scans pages for <applet> tags and re-runs them in the browser
-//               with jvm.js — no Java plugin, no appletviewer.
+// @version      0.2.0
+// @description  Scans pages for <applet> tags and re-runs them inline in the
+//               browser with jvm.js — no Java plugin, no appletviewer, no iframe.
 // @author       kreijstal
 // @match        *://*
 // @grant        none
@@ -13,8 +13,9 @@
 (function () {
   'use strict';
 
-  // Where the applet viewer lives. Change this to your deployed copy.
-  const VIEWER_URL = 'http://localhost:3000/dist/applet-viewer.html';
+  // Base directory that holds applet-engine.js and jvm-debug.js.
+  // Change to your deployed copy (or set window.JAVA_APPLET_BASE first).
+  const BASE = 'http://localhost:3000/dist/';
 
   // Legacy <applet> selector plus the old object/embed variants.
   const APPLET_SELECTOR = 'applet, object[classid*="java"], embed[type*="java-applet"]';
@@ -39,20 +40,16 @@
       if (n) params[n] = v;
     }
 
-    const pageUrl = location.href;
-    // Resolve codebase relative to the page (defaults to the page's dir).
     let codebaseUrl;
     try {
-      codebaseUrl = new URL(codebase || '.', pageUrl).href;
+      codebaseUrl = new URL(codebase || '.', location.href).href;
     } catch (_) {
-      codebaseUrl = new URL('.', pageUrl).href;
+      codebaseUrl = new URL('.', location.href).href;
     }
-    // The applet class name (code may be "Kite" or "Kite.class").
     const className = code.replace(/\.class$/i, '');
 
     let archiveUrl = null;
     if (archive) {
-      // Multiple archives are space-separated; take the first.
       const first = archive.split(/\s+/)[0];
       try {
         archiveUrl = new URL(first, codebaseUrl).href;
@@ -65,56 +62,61 @@
   }
 
   /**
-   * Build the viewer URL for a descriptor.
-   */
-  function buildViewerUrl(desc) {
-    const q = new URLSearchParams();
-    q.set('class', desc.className);
-    q.set('w', String(desc.width));
-    q.set('h', String(desc.height));
-    q.set('embed', '1');
-    if (desc.name) q.set('name', desc.name);
-    if (desc.archiveUrl) {
-      q.set('url', desc.archiveUrl);
-    } else {
-      q.set('codebase', desc.codebaseUrl);
-    }
-    for (const [k, v] of Object.entries(desc.params)) {
-      q.set(k, v);
-    }
-    return VIEWER_URL + '?' + q.toString();
-  }
-
-  /**
-   * Replace an <applet> element with the jvm.js viewer iframe.
+   * Replace an <applet> element with an inline host div and run the applet.
    */
   function replaceApplet(desc) {
-    const frame = document.createElement('iframe');
-    frame.src = buildViewerUrl(desc);
-    frame.width = String(desc.width);
-    frame.height = String(desc.height);
-    frame.style.border = '1px solid #999';
-    frame.style.maxWidth = '100%';
-    frame.setAttribute('scrolling', 'no');
+    const host = document.createElement('div');
+    host.style.cssText =
+      'width:' + desc.width + 'px;height:' + desc.height + 'px;' +
+      'max-width:100%;overflow:hidden;background:#fff;border:1px solid #999;' +
+      'position:relative;box-sizing:border-box;display:inline-block;';
+    const loading = document.createElement('div');
+    loading.style.cssText =
+      'position:absolute;inset:0;display:flex;align-items:center;' +
+      'justify-content:center;font:13px system-ui,sans-serif;color:#666;' +
+      'background:#f7f7f7;';
+    loading.textContent = '☕ Starting ' + desc.className + ' with jvm.js…';
+    host.appendChild(loading);
+    desc.el.replaceWith(host);
 
-    const placeholder = document.createElement('div');
-    placeholder.style.cssText =
-      'font: 12px system-ui, sans-serif; color: #666; padding: 8px;' +
-      ' background: #f6f6f6; border: 1px dashed #bbb; margin-bottom: 8px;';
-    placeholder.textContent = '☕ Re-running applet ' +
-      (desc.className || '?') + ' with jvm.js…';
+    // Load the inline engine and run the applet directly in this page.
+    const loadScript = (src) => new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = src;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('Failed to load ' + src));
+      document.head.appendChild(s);
+    });
 
-    desc.el.replaceWith(placeholder, frame);
+    (async () => {
+      if (!window.JavaAppletEngine) {
+        await loadScript(BASE + 'applet-engine.js');
+      }
+      await window.JavaAppletEngine.runApplet({
+        container: host,
+        className: desc.className,
+        archiveUrl: desc.archiveUrl,
+        codebase: desc.archiveUrl ? null : desc.codebaseUrl,
+        width: desc.width,
+        height: desc.height,
+        params: desc.params,
+        base: BASE,
+        onProgress: (msg) => { loading.textContent = msg; },
+      });
+    })().catch((err) => {
+      console.error('[jvm.js applet loader]', desc.className, err);
+      loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
+    });
+
     console.log('[jvm.js applet loader]', desc.className,
-      desc.archiveUrl || desc.codebaseUrl,
-      desc.params);
+      desc.archiveUrl || desc.codebaseUrl, desc.params);
   }
 
   function scan() {
     const applets = document.querySelectorAll(APPLET_SELECTOR);
     for (const el of applets) {
       const desc = parseApplet(el);
-      if (!desc.className) continue; // not a real applet tag
+      if (!desc.className) continue;
       replaceApplet(desc);
     }
     if (applets.length) {
@@ -122,7 +124,6 @@
     }
   }
 
-  // Run after the DOM settles; also re-scan when the page mutates.
   function init() {
     setTimeout(scan, 250);
     const observer = new MutationObserver((mutations) => {
