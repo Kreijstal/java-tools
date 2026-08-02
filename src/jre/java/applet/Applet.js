@@ -19,6 +19,13 @@ module.exports = {
         canvas.height = 600;
         canvas.style.border = '1px solid #ccc';
         canvas.style.background = 'white';
+        // Keep the synthetic applet surface out of the applet's own layout and
+        // behind its real components: components added by the applet (panels,
+        // canvases) flow in the container's grid above this backdrop canvas.
+        canvas.style.position = 'absolute';
+        canvas.style.left = '0';
+        canvas.style.top = '0';
+        canvas.style.zIndex = '-1';
         
         // Store reference to canvas element
         obj._awtComponent.canvasElement = canvas;
@@ -208,7 +215,7 @@ module.exports = {
               
               // Execute the paint method synchronously
               const originalStackSize = currentThread.callStack.size();
-              const maxIterations = 200000; // Allow heavier paint loops to complete
+              const maxIterations = 5000000; // Allow heavier paint loops to complete
               let iterations = 0;
               
               while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {

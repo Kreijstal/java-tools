@@ -80,6 +80,9 @@ class IGraphics {
     drawRect(x, y, width, height) {}
     /** @param {number} x @param {number} y @param {number} width @param {number} height */
     fillOval(x, y, width, height) {}
+    /** @param {number} x @param {number} y @param {number} width @param {number} height
+     *  @param {number} startAngleDeg @param {number} arcAngleDeg */
+    fillArc(x, y, width, height, startAngleDeg, arcAngleDeg) {}
     /** @param {number} x @param {number} y @param {number} width @param {number} height */
     drawOval(x, y, width, height) {}
     /** @param {AwtFont} font */
@@ -743,6 +746,23 @@ class CanvasGraphics {
         this.ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
         this.ctx.fill();
     }
+
+    /** Fill a pie-slice arc.
+     * @param {number} x @param {number} y @param {number} width @param {number} height
+     * @param {number} startAngleDeg @param {number} arcAngleDeg */
+    fillArc(x, y, width, height, startAngleDeg, arcAngleDeg) {
+        const rx = Math.max(0, width / 2);
+        const ry = Math.max(0, height / 2);
+        const cx = x + rx;
+        const cy = y + ry;
+        const start = -startAngleDeg * Math.PI / 180;
+        const sweep = -arcAngleDeg * Math.PI / 180;
+        this.ctx.beginPath();
+        this.ctx.moveTo(cx, cy);
+        this.ctx.ellipse(cx, cy, rx, ry, 0, start, start + sweep, false);
+        this.ctx.closePath();
+        this.ctx.fill();
+    }
     
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     drawOval(x, y, width, height) {
@@ -884,6 +904,9 @@ class MockGraphics {
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */
     fillOval(x, y, width, height) { 
         this.operations.push(`fillOval(${x}, ${y}, ${width}, ${height})`);
+    }
+    fillArc(x, y, width, height, startAngleDeg, arcAngleDeg) { 
+        this.operations.push(`fillArc(${x}, ${y}, ${width}, ${height}, ${startAngleDeg}, ${arcAngleDeg})`);
     }
     
     /** @override @param {number} x @param {number} y @param {number} width @param {number} height */

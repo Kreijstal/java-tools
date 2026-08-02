@@ -58,6 +58,9 @@ module.exports = {
           for (const listener of obj._adjustmentListeners) {
             dispatchAdjustmentEvent(jvm, obj, listener);
           }
+          // Legacy pre-1.1 model: post SCROLL_ABSOLUTE up the hierarchy.
+          const { postScrollEvent } = require('./legacyEvents');
+          postScrollEvent(jvm, obj, 606); // Event.SCROLL_ABSOLUTE
         });
       }
     },
@@ -85,6 +88,20 @@ module.exports = {
         obj._awtElement.style.writingMode = 'bt-lr';
         obj._awtElement.style.height = '120px';
       }
+    },
+
+    '<init>(IIIIII)V': (jvm, obj, args) => {
+      // Legacy six-argument constructor used by pre-1.1 applets.
+      const baseInit = jvm._jreFindMethod(obj.type, '<init>', '()V');
+      if (baseInit) {
+        baseInit(jvm, obj, []);
+      }
+      obj._orientation = args[0];
+      obj._value = args[1];
+      obj._visibleAmount = args[2];
+      obj._minimum = args[3];
+      obj._maximum = args[4];
+      updateDomRange(obj);
     },
 
     'getValue()I': (jvm, obj, args) => obj._value,

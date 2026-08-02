@@ -170,6 +170,11 @@ module.exports = {
       const charStr = String.fromCharCode(charCode);
       return jvm.internString(charStr);
     },
+    "valueOf(I)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(String(args[0])),
+    "valueOf(J)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(String(args[0])),
+    "valueOf(F)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(String(args[0])),
+    "valueOf(D)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(String(args[0])),
+    "valueOf(Z)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(args[0] ? 'true' : 'false'),
     "join(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;": (jvm, obj, args) => {
       const delimiter = stringValue(args[0]);
       const elements = Array.isArray(args[1]) ? args[1] : [];

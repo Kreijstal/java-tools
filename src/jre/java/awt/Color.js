@@ -1,7 +1,7 @@
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
-    'RED:Ljava/awt/Color;': {
+    'red:Ljava/awt/Color;': {
       type: 'java/awt/Color',
       value: { r: 255, g: 0, b: 0, a: 255 },
     },
@@ -20,6 +20,38 @@ module.exports = {
     'white:Ljava/awt/Color;': {
       type: 'java/awt/Color',
       value: { r: 255, g: 255, b: 255, a: 255 },
+    },
+    'green:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 0, g: 255, b: 0, a: 255 },
+    },
+    'blue:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 0, g: 0, b: 255, a: 255 },
+    },
+    'yellow:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 255, g: 255, b: 0, a: 255 },
+    },
+    'cyan:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 0, g: 255, b: 255, a: 255 },
+    },
+    'magenta:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 255, g: 0, b: 255, a: 255 },
+    },
+    'orange:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 255, g: 200, b: 0, a: 255 },
+    },
+    'pink:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 255, g: 175, b: 175, a: 255 },
+    },
+    'darkGray:Ljava/awt/Color;': {
+      type: 'java/awt/Color',
+      value: { r: 64, g: 64, b: 64, a: 255 },
     },
   },
   methods: {

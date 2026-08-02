@@ -24,6 +24,15 @@ const normalizeConstraint = (constraint) => {
   return null;
 };
 
+const matchesCard = (container, component, currentName) => {
+  const cards = container._cards || {};
+  for (const name of Object.keys(cards)) {
+    if (cards[name] === component) return name === currentName;
+  }
+  // Components not registered as named cards fall back to their constraint
+  return component._layoutConstraint === currentName;
+};
+
 const applyLayout = (obj) => {
   if (typeof document === 'undefined') return;
   const containerEl = ensureAwtElement(obj);
@@ -91,6 +100,49 @@ const applyLayout = (obj) => {
     } else {
       containerEl.style.justifyContent = 'center';
     }
+    return;
+  }
+
+  if (layout.type === 'java/awt/GridLayout') {
+    containerEl.style.display = 'grid';
+    const rows = layout._rows || 0;
+    const cols = layout._cols || 0;
+    const hgap = layout._hgap || 0;
+    const vgap = layout._vgap || 0;
+    containerEl.style.gap = `${vgap}px ${hgap}px`;
+    containerEl.style.gridTemplateColumns = cols > 0
+      ? `repeat(${cols}, minmax(0, 1fr))`
+      : 'repeat(auto-fit, minmax(0, 1fr))';
+    containerEl.style.gridTemplateRows = rows > 0
+      ? `repeat(${rows}, minmax(0, 1fr))`
+      : 'auto';
+    containerEl.style.alignItems = 'stretch';
+    containerEl.style.justifyItems = 'stretch';
+    const componentEls = (obj._components || [])
+      .map(getComponentElement)
+      .filter(Boolean);
+    for (const el of componentEls) {
+      if (!containerEl.contains(el)) containerEl.appendChild(el);
+      el.style.gridRow = 'auto';
+      el.style.gridColumn = 'auto';
+      el.style.alignSelf = 'stretch';
+      el.style.justifySelf = 'stretch';
+    }
+    return;
+  }
+
+  if (layout.type === 'java/awt/CardLayout') {
+    containerEl.style.display = 'block';
+    const current = obj._currentCard;
+    const components = obj._components || [];
+    for (const component of components) {
+      const el = getComponentElement(component);
+      if (!el) continue;
+      if (!containerEl.contains(el)) containerEl.appendChild(el);
+      const isActive = current == null || matchesCard(obj, component, current);
+      el.style.display = isActive ? 'block' : 'none';
+    }
+    return;
   }
 };
 
@@ -165,6 +217,26 @@ module.exports = {
     'add(Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) => {
       const component = args[0];
       return addComponent(obj, component);
+    },
+
+    // Legacy pre-1.1 API: add(String name, Component comp) — the name is the
+    // layout constraint (used by CardLayout for card names, BorderLayout regions).
+    'add(Ljava/lang/String;Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) => {
+      const name = args[0];
+      const component = args[1];
+      if (component) {
+        component._layoutConstraint = normalizeConstraint(name);
+      }
+      return addComponent(obj, component);
+    },
+
+    'add(Ljava/lang/String;Ljava/awt/Component;)V': (jvm, obj, args) => {
+      const name = args[0];
+      const component = args[1];
+      if (component) {
+        component._layoutConstraint = normalizeConstraint(name);
+      }
+      addComponent(obj, component);
     },
 
     'add(Ljava/awt/Component;Ljava/lang/Object;)V': (jvm, obj, args) => {
