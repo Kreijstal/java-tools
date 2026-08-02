@@ -1,5 +1,5 @@
 "use strict";
-// Handwritten structured replacement for a fused gradient triangle region.
+// Historical fused-gradient oracle retained only for differential benchmarks.
 // Derived from and validated
 // bit-exact against the generated fused kernels on captured scene workloads
 // (2140-triangle vk scene, FNV hash equality), then measured at 9.9x the
@@ -121,6 +121,15 @@ function install(region, jit, options = {}) {
   const writeStatic = (i, value) => {
     if (targets[i].kind === "map") targets[i].fields.set(targets[i].key, value);
     else targets[i].fields[targets[i].key] = value;
+    if (targets[i].versionCell) {
+      if (targets[i].versionCell.captureCaches) {
+        for (const cache of targets[i].versionCell.captureCaches) {
+          cache.dirty = true;
+          cache.specializedMatches = false;
+          for (const key of cache.derivedGuardKeys) cache[key] = undefined;
+        }
+      }
+    }
   };
 
   function scan(dest, index, count, green, greenStep, red, redStep, blue, blueStep) {

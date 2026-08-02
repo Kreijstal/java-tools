@@ -1,6 +1,6 @@
 "use strict";
 
-// Compact implementation of the structurally verified constant-colour
+// Historical implementation of the structurally verified constant-colour
 // triangle raster family.  Parameter and static-field roles are supplied by
 // FusedRegionCompiler's bytecode analysis; no guest class or method identity
 // is used here.

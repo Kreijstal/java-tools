@@ -10,6 +10,7 @@ const { JVM } = require('../src/core/jvm');
 const File = require('../src/jre/java/io/File');
 const FileInputStream = require('../src/jre/java/io/FileInputStream');
 const ReflectField = require('../src/jre/java/lang/reflect/Field');
+const Unsafe = require('../src/jre/sun/misc/Unsafe');
 const HashMap = require('../src/jre/java/util/HashMap');
 const Hashtable = require('../src/jre/java/util/Hashtable');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
@@ -599,6 +600,49 @@ test('reflective fields use normal JVM instance storage', (t) => {
     null, booleanField, [object, 0]);
   t.equal(object.fields['ui.w'], 0,
     'Field.setBoolean writes the owner-qualified instance slot');
+  t.end();
+});
+
+test('reflective and Unsafe static writes invalidate JIT capture containers',
+  (t) => {
+  const staticFields = new Map([['value:I', 1]]);
+  const invalidated = [];
+  const jvm = {
+    jit: {
+      markStaticContainerChanged(fields) {
+        invalidated.push(fields);
+      },
+    },
+  };
+  const classData = {
+    staticFields,
+    ast: { classes: [{ className: 'StaticWriteHarness' }] },
+  };
+  const declaringClass = { _classData: classData };
+  const field = {
+    _declaringClass: declaringClass,
+    _fieldData: { name: 'value', descriptor: 'I', accessFlags: 0x0008 },
+  };
+
+  ReflectField.methods['setInt(Ljava/lang/Object;I)V'](
+    jvm, field, [null, 7]);
+  t.equal(staticFields.get('value:I'), 7,
+    'reflection updates the canonical descriptor-qualified static slot');
+  t.equal(invalidated.shift(), staticFields,
+    'reflection invalidates capture caches for the static container');
+
+  const offset = Unsafe.methods[
+    'staticFieldOffset(Ljava/lang/reflect/Field;)J'
+  ](jvm, null, [field]);
+  const base = Unsafe.methods[
+    'staticFieldBase(Ljava/lang/reflect/Field;)Ljava/lang/Object;'
+  ](jvm, null, [field]);
+  Unsafe.methods['putInt(Ljava/lang/Object;JI)V'](
+    jvm, null, [base, offset, 11]);
+  t.equal(staticFields.get('value:I'), 11,
+    'Unsafe updates the same canonical static slot');
+  t.equal(invalidated.shift(), staticFields,
+    'Unsafe invalidates capture caches for the static container');
   t.end();
 });
 

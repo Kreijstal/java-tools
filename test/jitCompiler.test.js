@@ -16,9 +16,10 @@ const {
   addTypedArrayStoreImports,
 } = require('../src/jit/wasmRuntimeImports');
 const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
-const HandwrittenFusedGradient = require('../src/jit/HandwrittenFusedGradient');
+const HandwrittenFusedGradient =
+  require('../scripts/oracles/FusedGradientOracle');
 const HandwrittenAffineSpriteRaster =
-  require('../src/jit/HandwrittenAffineSpriteRaster');
+  require('../scripts/oracles/AffineSpriteRasterOracle');
 const invokeHandlers = require('../src/instructions/invoke');
 const objectHandlers = require('../src/instructions/object');
 const controlHandlers = require('../src/instructions/control');
@@ -2975,6 +2976,16 @@ public final class GenericSpanShape {
   static void rows(int color) {
     for (int y = 0; y < 2; y++) span(0, y, 2, color);
   }
+
+  static void dynamicRows(int item, int color) {
+    for (int row = 0; row < 16; row++) {
+      int sample = item + row;
+      int x = sample * 17 % 80 - 8;
+      int y = sample & 63;
+      int count = 8 + sample * 13 % 56;
+      span(x, y, count, color + row * 0x10203);
+    }
+  }
 }
 `);
   const genericJvm = new JVM({ classpath: genericClasspath, jit: {
@@ -3037,6 +3048,24 @@ public final class GenericSpanShape {
     'a proven synchronous void child keeps fallback bookkeeping off its success path');
   t.notOk(genericRows.jvmStructuredContinuation,
     'captured child statics resume canonically rather than surviving a scheduler slice');
+  const dynamicRowsMethod = await genericJvm.findMethodInHierarchy(
+    genericClass, 'dynamicRows', '(II)V');
+  const dynamicRows = genericJvm.jit.structuredSsa.compile(dynamicRowsMethod);
+  const dynamicRowsPreflighted =
+    dynamicRows?.jvmPreflightedCheckedLeafDirectPositionalBody;
+  const dynamicRowsPreflightedSource =
+    dynamicRows?.jvmPreflightedCheckedLeafDirectPositionalSource || '';
+  t.equal(typeof dynamicRowsPreflighted, 'function',
+    'a range-proven loop caller publishes an explicitly preflighted ABI');
+  t.notOk(dynamicRowsPreflightedSource.includes(
+    'ssaRestoringClassInitializationGuard') ||
+      dynamicRowsPreflightedSource.includes('ssaCallCaptureCache') ||
+      dynamicRowsPreflightedSource.includes('ssaCheckedAdmissionVerifier'),
+  'preflighted emission excludes caller-owned checks without source rewriting');
+  t.equal(dynamicRows?.jvmPreflightedCheckedLeafStaticVerifier?.(), true,
+    'the separate caller-side static verifier admits initialized captures');
+  t.deepEqual(dynamicRows?.jvmPreflightedCheckedLeafArgumentSlots, [0, 1],
+    'the separate caller contract identifies every range-guarded argument');
   const runGenericRows = (color, debug = false) => {
     const rowsThread = {
       status: 'runnable', pendingException: null, callStack: new Stack(),
@@ -3054,6 +3083,14 @@ public final class GenericSpanShape {
   t.deepEqual(firstStaticPixels.slice(0, 10),
     [17, 17, 0, 0, 0, 0, 0, 0, 17, 17],
     'captured checked child preserves repeated generated caller stores');
+  firstStaticPixels.fill(0);
+  const dynamicThread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  const dynamicResult = dynamicRowsPreflighted(
+    genericJvm.jit, 0, 31, dynamicThread);
+  t.notEqual(dynamicResult, genericJvm.jit.asyncInvokeSentinel(),
+    'the directly emitted preflighted body accepts its proven contract');
   const runGenericSpan = (x, y, count, color, debug = false) => {
     const genericThread = {
       status: 'runnable', pendingException: null, callStack: new Stack(),

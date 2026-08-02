@@ -1,12 +1,12 @@
 "use strict";
 
-// Structurally verified replacement for a source-wrapping two-dimensional
+// Historical oracle for a source-wrapping two-dimensional
 // int-array blit.  The original method is intentionally awkward obfuscated
 // bytecode with a diagnostic recursion branch and exception reporter around a
 // tiny copy loop.  On the proven normal path this kernel removes repeated
 // scalar-tier safe points and scheduler re-entry.
 
-const { fingerprintMethods } = require("./HandwrittenFusedGradient");
+const { fingerprintMethods } = require("./FusedGradientOracle");
 
 const DESCRIPTOR = "(IIIIB[II[IIIII)V";
 const KNOWN_FINGERPRINTS = new Set([

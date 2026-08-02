@@ -2107,7 +2107,7 @@ Firefox results (20 scene passes of the 2140-triangle stream, hash-identical):
 win in Firefox — engine non-transfer again — and the handwritten kernel is
 18.3x in V8.)
 
-Deployment: `src/jit/HandwrittenFusedGradient.js`, installed by
+Historical deployment: `HandwrittenFusedGradient.js`, formerly installed by
 `FusedRegionCompiler.compile` behind (a) an exact bytecode fingerprint of
 wrapper+raster+scanline (4128814000 for dekobloko — these shared obfuscated
 classes are arg-reordered per build, so a shape match is not enough), and
@@ -2115,15 +2115,16 @@ classes are arg-reordered per build, so a shape match is not enough), and
 delegates to the generated kernel before any side effect when anything is
 non-standard. With both passed, no path in the handwritten raster can throw,
 so the generated kernel's per-scanline guards and state-capture snapshots are
-provably dead. Kill switch: `JVM_DISABLE_HANDWRITTEN_FUSED=1`. Validated by
+provably dead. Its former kill switch was
+`JVM_DISABLE_HANDWRITTEN_FUSED=1`. Validated by
 the 2140-triangle hash gate, 400+800 randomized differential iterations
 (including an extended ±30 out-of-bounds coordinate range), 299 jit tests,
 clean boot, and acceptance.
 
-This describes the historical deployment. As of 2026-07-27 the fingerprint
-translation is an opt-in differential/code-shape oracle
-(`JVM_ENABLE_HANDWRITTEN_FUSED=1`), not a default runtime tier. Production
-performance must come from bytecode-derived generated kernels.
+This describes the historical deployment. The translation now lives only at
+`scripts/oracles/FusedGradientOracle.js`; it is invoked directly by the
+differential benchmark and cannot be selected by the production runtime.
+Production performance comes from bytecode-derived generated kernels.
 
 Acceptance: 13.79 / 14.46 / 14.81 → **median 14.46, new best** (prior 14.12).
 

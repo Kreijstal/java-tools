@@ -43,8 +43,6 @@ const ordinaryAdaptiveOverride =
     ? null : process.env.PROBE_ORDINARY_ADAPTIVE === '1';
 const rendererPipelineOverride = process.env.PROBE_RENDERER_PIPELINE === undefined
   ? null : process.env.PROBE_RENDERER_PIPELINE === '1';
-const handwrittenFusedOverride = process.env.PROBE_HANDWRITTEN_FUSED === undefined
-  ? null : process.env.PROBE_HANDWRITTEN_FUSED === '1';
 const wasmJitOverride = process.env.PROBE_WASM_JIT === undefined
   ? null : process.env.PROBE_WASM_JIT === '1';
 const wasmFieldCacheOverride = process.env.PROBE_WASM_FIELD_CACHE === undefined
@@ -164,7 +162,7 @@ function animationEstimate(changes) {
       timingSampleRate, timingFilter, methodTraceKey, traceAfterChanges,
       fusedRegions, directFusedCalls, scalarLoops, scalarSsa, structuredSsa,
       structuredSplit, structuredDeferredCalls, ordinaryAdaptive,
-      rendererPipeline, handwrittenFused, wasmJit, wasmFieldCache, wasmStructured }) => {
+      rendererPipeline, wasmJit, wasmFieldCache, wasmStructured }) => {
       const probe = window.__dekoblokoFrameProbe = {
         started: performance.now(),
         surfaceAt: null,
@@ -340,9 +338,6 @@ function animationEstimate(changes) {
         if (jvm?.jit?.fusedRegions && directFusedCalls !== null) {
           jvm.jit.fusedRegions.directCallsEnabled = directFusedCalls;
         }
-        if (jvm?.jit?.fusedRegions && handwrittenFused !== null) {
-          jvm.jit.fusedRegions.handwrittenKernelsEnabled = handwrittenFused;
-        }
         if (jvm?.jit?.wasmJit && wasmJit !== null) {
           jvm.jit.wasmJit.enabled = wasmJit;
         }
@@ -424,7 +419,6 @@ function animationEstimate(changes) {
       structuredDeferredCalls: structuredDeferredCallsOverride,
       ordinaryAdaptive: ordinaryAdaptiveOverride,
       rendererPipeline: rendererPipelineOverride,
-      handwrittenFused: handwrittenFusedOverride,
       wasmJit: wasmJitOverride,
       wasmFieldCache: wasmFieldCacheOverride,
       wasmStructured: wasmStructuredOverride,

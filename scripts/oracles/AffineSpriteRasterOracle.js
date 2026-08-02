@@ -1,6 +1,6 @@
 "use strict";
 
-// Semantic replacement for a column-oriented affine sprite/mask rasterizer.
+// Historical oracle for a column-oriented affine sprite/mask rasterizer.
 // Recognition is independent of guest class, method, and field names:
 //
 // - the complete descriptor and verified CFG/stack shape must match;
@@ -13,8 +13,8 @@
 // A rejected entry therefore delegates to the canonical implementation with
 // no fused side effect and retains its normal Java exception semantics.
 
-const FusedRegionCompiler = require("./FusedRegionCompiler");
-const { fingerprintMethods } = require("./HandwrittenFusedGradient");
+const FusedRegionCompiler = require("../../src/jit/FusedRegionCompiler");
+const { fingerprintMethods } = require("./FusedGradientOracle");
 
 const DESCRIPTOR = /^\(L[^;]+;L[^;]+;IIIIIIZZII\)V$/;
 const KNOWN_CALLER_FINGERPRINTS = new Set([

@@ -1,11 +1,11 @@
 "use strict";
 
-// Direct kernel for the classic eight-pixel perspective-textured scanline.
+// Historical oracle for the classic eight-pixel perspective-textured scanline.
 // Installation is gated by a complete, identity-canonicalized bytecode
 // fingerprint plus descriptor, field-relationship, handler, and static-field
 // checks. Guest owner/member names are never used for selection.
 
-const { fingerprintMethods } = require("./HandwrittenFusedGradient");
+const { fingerprintMethods } = require("./FusedGradientOracle");
 
 const DESCRIPTOR = "([I[IIIIIIIIIIIIII)V";
 const KNOWN_FINGERPRINTS = new Set([

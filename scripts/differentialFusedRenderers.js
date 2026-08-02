@@ -7,6 +7,8 @@ const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const { parseDescriptor } = require('../src/parsing/typeParser');
+const FusedGradientOracle = require('./oracles/FusedGradientOracle');
+const FusedFlatOracle = require('./oracles/FusedFlatOracle');
 
 const classpath = path.resolve(process.argv[2] || '');
 const iterations = Number(process.argv[3] || 200);
@@ -51,7 +53,6 @@ async function createRuntime(jitOptions = {}) {
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     fusedRegions: false,
-    handwrittenFusedKernels: false,
     ...jitOptions,
   } });
   for (const className of classNames(classpath)) {
@@ -102,6 +103,11 @@ function writeTarget(target, value) {
   else target.fields[target.key] = value;
 }
 
+function readTarget(target) {
+  return target.kind === 'map'
+    ? target.fields.get(target.key) : target.fields[target.key];
+}
+
 function configureRegion(runtime, candidate, pixels) {
   const compiler = runtime.jvm.jit.fusedRegions;
   const { wrapper, raster, rasterMethod, scanlineMethod } = candidate.discovered;
@@ -119,7 +125,7 @@ function configureRegion(runtime, candidate, pixels) {
   for (const arg of compiler.staticRefs(scanlineMethod)) setField(runtime, arg, defaultValue(arg[2][1]));
   const region = compiler.compile(candidate.method, candidate.owner);
   if (!region) throw new Error(`Could not compile verified ${candidate.family.name} region`);
-  const rasterPlan = region.semanticGradientRasterPlan || region.semanticFlatRasterPlan;
+  const rasterPlan = region.genericRasterSafetyPlan;
   if (rasterPlan) {
     writeTarget(region.staticTargets[rasterPlan.heightStatic], 64);
     writeTarget(region.staticTargets[rasterPlan.widthStatic], 64);
@@ -127,6 +133,59 @@ function configureRegion(runtime, candidate, pixels) {
       Array.from({ length: 64 }, (_, row) => row * 64));
     writeTarget(region.staticTargets[rasterPlan.strideStatic], 64);
   }
+  return region;
+}
+
+function installRasterOracle(region, jit) {
+  const plan = region.genericRasterSafetyPlan;
+  const scanlineKind = region.semanticScanlinePlan?.kind;
+  if (!plan || (scanlineKind !== 'packed-color' &&
+      scanlineKind !== 'constant-color')) {
+    throw new Error('verified raster has no benchmark-oracle plan');
+  }
+  if (scanlineKind === 'packed-color') {
+    region.semanticGradientRasterPlan = plan;
+    region.rasterKernel = FusedGradientOracle.installRaster(region, jit, plan);
+  } else {
+    region.semanticFlatRasterPlan = plan;
+    region.rasterKernel = FusedFlatOracle.installRaster(region, jit, plan);
+  }
+  region.directRasterKernel = region.rasterKernel.directKernel;
+  const wrapperPlan = region.semanticWrapperPlan;
+  if (!wrapperPlan) return region;
+  const argumentCount = parseDescriptor(
+    region.wrapperMethod.descriptor).params.length;
+  const argumentNames = Array.from(
+    { length: argumentCount }, (_unused, index) => `a${index}`);
+  const evaluators = new Map([...wrapperPlan.templates].map(
+    ([order, template]) => [order, new Function(
+      'region', 'helpers', 'state', ...argumentNames,
+      `"use strict";return [${template.arguments.join(',')}];`)]));
+  const relation = (left, right) => left < right ? 0 : left === right ? 1 : 2;
+  region.wrapperKernel = function benchmarkOracleWrapper(
+    state, regionArg, helpers, ...args) {
+    if (wrapperPlan.booleanParameters.some(
+      (parameter) => (args[parameter] | 0) !== 1)) {
+      return region.generatedWrapperKernel(
+        state, regionArg, helpers, ...args);
+    }
+    const [first, second, third] = wrapperPlan.keys.map(
+      (parameter) => args[parameter] | 0);
+    const order = relation(first, second) * 9 +
+      relation(first, third) * 3 + relation(second, third);
+    const evaluator = evaluators.get(order);
+    if (!evaluator) {
+      return region.generatedWrapperKernel(
+        state, regionArg, helpers, ...args);
+    }
+    const rasterArgs = evaluator(region, helpers, state, ...args);
+    const height = readTarget(region.staticTargets[plan.heightStatic]) | 0;
+    const width = readTarget(region.staticTargets[plan.widthStatic]) | 0;
+    const rows = readTarget(region.staticTargets[plan.rowsStatic]);
+    const stride = readTarget(region.staticTargets[plan.strideStatic]) | 0;
+    return region.directRasterKernel(
+      height, width, rows, stride, ...rasterArgs);
+  };
   return region;
 }
 
@@ -400,11 +459,11 @@ function generatedShape(region) {
 
 (async () => {
   const baseline = await createRuntime();
-  const fused = await createRuntime({ semanticFusedRasters: false });
-  // The plan-driven compact raster is the handwritten target. It is enabled
-  // only in this differential oracle; the measured/generated runtime above
-  // must remain independent from it.
-  const target = await createRuntime({ semanticFusedRasters: true });
+  const fused = await createRuntime();
+  // Historical compact implementations live in this benchmark process only.
+  // Production FusedRegionCompiler has no import, option, or execution path
+  // that can select them.
+  const target = await createRuntime();
   const descriptors = ['(IIIIIIIIIIIIZIII)V', '(IIIIIIII)V'];
   const report = [];
   for (const descriptor of descriptors) {
@@ -422,7 +481,8 @@ function generatedShape(region) {
     const targetPixels = new Array(64 * 64);
     configureRegion(baseline, baselineCandidate, baselinePixels);
     const region = configureRegion(fused, fusedCandidate, fusedPixels);
-    const targetRegion = configureRegion(target, targetCandidate, targetPixels);
+    const targetRegion = installRasterOracle(
+      configureRegion(target, targetCandidate, targetPixels), target.jvm.jit);
     if (process.env.JVM_DUMP_FUSED_KERNELS === '1') {
       process.stderr.write(`\n/* ${descriptor} generated wrapper */\n` +
         `${region.wrapperKernel.jvmLexicalFusedSource || region.wrapperKernel}\n` +

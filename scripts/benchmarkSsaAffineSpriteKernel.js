@@ -9,7 +9,7 @@ const {JVM} = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const HandwrittenAffineSpriteRaster =
-  require('../src/jit/HandwrittenAffineSpriteRaster');
+  require('./oracles/AffineSpriteRasterOracle');
 
 const classDirectory = process.argv[2];
 const semanticClassDirectory = process.argv[3] || classDirectory;

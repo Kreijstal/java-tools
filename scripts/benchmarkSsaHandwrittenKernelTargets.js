@@ -8,10 +8,10 @@ const { execFileSync } = require('child_process');
 const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
-const Perspective = require('../src/jit/HandwrittenPerspectiveSpan');
-const Tiled = require('../src/jit/HandwrittenTiledBlit');
-const Bilinear = require('../src/jit/HandwrittenBilinearSampler');
-const Polygon = require('../src/jit/HandwrittenPolygonRaster');
+const Perspective = require('./oracles/PerspectiveSpanOracle');
+const Tiled = require('./oracles/TiledBlitOracle');
+const Bilinear = require('./oracles/BilinearSamplerOracle');
+const Polygon = require('./oracles/PolygonRasterOracle');
 
 const root = path.resolve(__dirname, '..');
 const source = path.join(
@@ -21,6 +21,7 @@ const iterations = positiveInteger('SSA_KERNEL_TARGET_ITERATIONS', 10000);
 const rounds = positiveInteger('SSA_KERNEL_TARGET_ROUNDS', 7);
 const warmups = positiveInteger('SSA_KERNEL_TARGET_WARMUPS', 4);
 const trustedNestedEntry = process.env.SSA_TRUSTED_NESTED !== '0';
+const targetFilter = process.env.SSA_KERNEL_TARGET_FILTER || '';
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -121,10 +122,19 @@ function compileBody(runtime, name, descriptor) {
     generated?.jvmCapturedCheckedLeafDirectPositionalBody;
   const capturedCheckedLeafPlan =
     generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
+  const preflightedCheckedLeafBody =
+    generated?.jvmPreflightedCheckedLeafDirectPositionalBody;
+  const preflightedCheckedLeafVerifier =
+    generated?.jvmPreflightedCheckedLeafStaticVerifier;
+  const preflightedCheckedLeafArgumentSlots =
+    generated?.jvmPreflightedCheckedLeafArgumentSlots;
+  const preflightedCheckedLeafArgumentLimit =
+    generated?.jvmPreflightedCheckedLeafArgumentLimit;
   if (!(generated?.jvmStructuredSsa || generated?.jvmStructuredPositionalOnly) ||
       typeof body !== 'function') {
     const reason = runtime.jvm.jit.structuredSsa.lastRejectionReason ||
-      runtime.jvm.jit.structuredSsa.lastCompileError?.stack || '';
+      runtime.jvm.jit.structuredSsa.lastCompileError?.stack ||
+      runtime.jvm.jit.codegenCompileErrors.get(method)?.stack || '';
     throw new Error(`generic SSA did not compile ${name}${descriptor}` +
       (reason ? `: ${reason}` : '') + ` keys=${Object.keys(generated || {})}`);
   }
@@ -144,11 +154,22 @@ function compileBody(runtime, name, descriptor) {
   return {
     method, generated, body, checkedLeafBody, trustedCheckedLeafBody,
     capturedCheckedLeafBody, capturedCheckedLeafPlan,
+    preflightedCheckedLeafBody, preflightedCheckedLeafVerifier,
+    preflightedCheckedLeafArgumentSlots,
+    preflightedCheckedLeafArgumentLimit,
     plan: planFor(method),
   };
 }
 
 function benchmarkPair(name, generic, oracle, pixelsPerInvocation) {
+  if (targetFilter && name !== targetFilter) {
+    return {
+      name,
+      skipped: true,
+      skippedByFilter: targetFilter,
+      generated: generic.generated,
+    };
+  }
   // Tiny runs are useful for checking compilation and checksums, but include
   // lazy JavaScript compilation/tiering in the timed sample.  Label them so a
   // focused smoke validation cannot be mistaken for steady-state throughput.
@@ -583,11 +604,35 @@ function runPolygonOracle(destination, vertices, color) {
     compileBody(runtime, 'polygonSpan', '(IIII)V');
     const polygonSpanCaller = compileBody(
       runtime, 'polygonSpanFromCaller', '(II)V');
+    const polygonSpanArgumentRows = Array.from({length: 64}, (_unused, item) => [
+      item,
+      0xff000000 | Math.imul(item + 1, 0x10203),
+    ]);
+    const polygonSpanPreflighted = Boolean(
+      polygonSpanCaller.preflightedCheckedLeafBody &&
+      polygonSpanCaller.preflightedCheckedLeafVerifier?.() &&
+      Number.isInteger(polygonSpanCaller.preflightedCheckedLeafArgumentLimit) &&
+      polygonSpanCaller.preflightedCheckedLeafArgumentSlots?.every((slot) =>
+        polygonSpanArgumentRows.every((row) =>
+          row[slot] >= -polygonSpanCaller.preflightedCheckedLeafArgumentLimit &&
+          row[slot] <= polygonSpanCaller.preflightedCheckedLeafArgumentLimit)));
     const polygonSpanResult = benchmarkPair('polygon-span', {
       destination: polygonSpanGenericDestination,
       generated: polygonSpanCaller.generated,
       invoke(item) {
         const color = 0xff000000 | Math.imul(item + 1, 0x10203);
+        if (polygonSpanPreflighted) {
+          return polygonSpanCaller.preflightedCheckedLeafBody(
+            runtime.jvm.jit, item, color, thread);
+        }
+        if (polygonSpanCaller.trustedCheckedLeafBody) {
+          return polygonSpanCaller.trustedCheckedLeafBody(
+            runtime.jvm.jit, item, color, thread);
+        }
+        if (polygonSpanCaller.checkedLeafBody) {
+          return polygonSpanCaller.checkedLeafBody(
+            runtime.jvm.jit, item, color, thread, trustedNestedEntry);
+        }
         return polygonSpanCaller.body(runtime.jvm.jit,
           polygonSpanCaller.plan, item, color, thread, 2);
       },
@@ -606,7 +651,13 @@ function runPolygonOracle(destination, vertices, color) {
     }, 36 * 16);
     polygonSpanResult.oracleKind = 'equivalent-flat-span-ceiling';
     polygonSpanResult.genericEntryKind =
-      'lexically-fused-loop-caller';
+      polygonSpanPreflighted
+        ? 'preflighted-lexically-fused-loop-caller'
+        : polygonSpanCaller.trustedCheckedLeafBody
+        ? 'trusted-lexically-fused-loop-caller'
+        : polygonSpanCaller.checkedLeafBody
+          ? 'checked-lexically-fused-loop-caller'
+          : 'lexically-fused-loop-caller';
 
     const polygonGenericDestination = intArray(64 * 64, () => 0);
     const polygonOracleDestination = intArray(64 * 64, () => 0);
@@ -754,6 +805,8 @@ function runPolygonOracle(destination, vertices, color) {
           result.generated.jvmStructuredHoistedArrayRangeGuardCount,
         coalescedSsaCopies:
           result.generated.jvmStructuredCoalescedSsaCopyCount,
+        eliminatedDeadLocalStores:
+          result.generated.jvmStructuredEliminatedDeadLocalStoreCount,
         dominatedArithmeticGuards:
           result.generated.jvmStructuredDominatedArithmeticGuardCount,
         restoringCoarseLoopDeopts:
@@ -778,6 +831,8 @@ function runPolygonOracle(destination, vertices, color) {
           result.generated.jvmStructuredInlinedRestoringSpills,
         captureFreeRestoringSpills:
           result.generated.jvmStructuredCaptureFreeRestoringSpills,
+        provenCheckedCallAdmissions:
+          result.generated.jvmStructuredProvenCheckedCallAdmissionCount,
         handwrittenInstalled: Boolean(
           result.generated.jvmRestoringDirectPositionalPlan),
       },

@@ -16,7 +16,8 @@ WebAudio queue, coupling low gameplay FPS to audible music gaps.
 
 ## Historical optimization
 
-`HandwrittenAffineSpriteRaster` replaces the verified guest body with one
+The historical `AffineSpriteRasterOracle` replaces the verified guest body
+only inside the differential benchmark with one
 positional JavaScript kernel:
 
 - Selection uses the complete descriptor, verified CFG and stack depths,
@@ -30,17 +31,16 @@ positional JavaScript kernel:
   their current values remain live.
 - A class/debugger guard and complete array/layout preflight run before the
   first destination write. Rejected entries execute the canonical JVM method.
-- `JVM_DISABLE_AFFINE_SPRITE_RASTER=1` or JIT option
-  `affineSpriteRaster: false` provides a same-bundle differential control.
 - Runtime counters expose successful runs and guarded fallbacks.
 
 The structured SSA caller feeds the 12 operands positionally, avoiding generic
 call dispatch, a child `Frame`, operand-stack materialization, and generator
 continuations inside the raster body.
 
-That implementation is now an opt-in differential oracle, not a production
-compiler tier. `guestKernelOracles` defaults to false and the normal runtime
-derives the complete method from its bytecode through `JvmSsaBlockRenderer`.
+That implementation is now a benchmark-only differential oracle, not a
+production compiler tier. It lives in `scripts/oracles/` and the normal
+runtime derives the complete method from bytecode through
+`JvmSsaBlockRenderer`.
 The historical measurements below remain useful as the performance target and
 as evidence that this guest body mattered; they are not measurements of the
 current production selection policy.
@@ -48,7 +48,7 @@ current production selection policy.
 ## Generic SSA replacement (2026-07-30)
 
 The exact original classfile was used to compare the current generated
-restoring-positional body against `HandwrittenAffineSpriteRaster.runRaster`.
+restoring-positional body against `AffineSpriteRasterOracle.runRaster`.
 The optimizer does not inspect the guest owner or member name. Four generic
 changes close part of the former gap:
 

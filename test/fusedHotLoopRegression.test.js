@@ -137,14 +137,18 @@ test('generic fused hot-loop proxy stays scalar, lexical, and direct', (t) => {
     structuredSsa: true,
     directFusedCalls: true,
     lexicalFusedKernels: true,
-    handwrittenFusedKernels: false,
-    semanticFusedRasters: false,
   } });
   const compiler = jvm.jit.fusedRegions;
+  const loadedOracleModules = Object.keys(require.cache).filter((filename) =>
+    filename.includes('/scripts/oracles/') ||
+    /\/Handwritten[^/]*\.js$/.test(filename));
+  t.deepEqual(loadedOracleModules, [],
+    'loading the production JVM imports no historical kernel oracle');
+  t.notOk(Object.hasOwn(compiler, 'handwrittenKernelsEnabled') ||
+      Object.hasOwn(compiler, 'semanticRasterKernelsEnabled'),
+  'the production compiler exposes no historical-kernel selection gates');
   // Make the regression independent of a developer's experimental env gates.
   compiler.lexicalKernelsEnabled = true;
-  compiler.handwrittenKernelsEnabled = false;
-  compiler.semanticRasterKernelsEnabled = false;
 
   const proxy = makeProxy();
   install(jvm, proxy.owners.wrapper, proxy.wrapper);
@@ -170,8 +174,8 @@ test('generic fused hot-loop proxy stays scalar, lexical, and direct', (t) => {
   t.ok(region, 'the three-method region compiles without an identity allowlist');
   t.equal(region && region.family.name, 'bytecode-region',
     'the generic bytecode family is selected');
-  t.equal(jvm.jit.handwrittenFusedRegionCount | 0, 0,
-    'no handwritten target is installed');
+  t.notOk(Object.hasOwn(region, 'handwrittenWrapperKernel'),
+    'production regions expose no benchmark-oracle kernel slot');
 
   const wrapperSource = region && region.wrapperKernel.jvmLexicalFusedSource;
   const rasterSource = region && region.rasterKernel.jvmLexicalFusedSource;
@@ -237,8 +241,6 @@ test('generic fused hot-loop proxy stays scalar, lexical, and direct', (t) => {
   t.equal(jvm.jit.structuredSsa.runCount, 1,
     'the caller remains in one structured invocation across the complete loop');
   t.ok(callStack.isEmpty(), 'the structured caller returns normally');
-  t.equal(jvm.jit.handwrittenFusedRunCount | 0, 0,
-    'the handwritten target never executes');
   t.equal(pixels[0], invocations, 'the first destination value is correct');
   t.equal(pixels[pixels.length - 1], invocations,
     'the final destination value is correct');

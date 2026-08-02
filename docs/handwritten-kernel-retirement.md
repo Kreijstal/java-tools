@@ -3,8 +3,9 @@
 This note tracks the conversion of the old complete-algorithm JavaScript
 substitutions into targets for generic bytecode-derived compilation. The
 production optimizer must not select a class or method by name. The historical
-modules remain opt-in differential oracles through `guestKernelOracles` or
-`semanticFusedRasters`; neither option is enabled by default.
+modules now live under `scripts/oracles/`: production modules do not import
+them and no JIT option or environment variable can select them. Benchmark
+drivers invoke them directly as differential and performance references.
 
 ## Current inventory
 
@@ -24,6 +25,22 @@ The proxy fixture and its driver are
 `scripts/benchmarkSsaHandwrittenKernelTargets.js`. The Java identities are used
 only by the benchmark driver to find its entry points. No optimizer source
 contains those identities.
+
+## Physical retirement (2026-08-02)
+
+The seven historical `Handwritten*` modules were moved from `src/jit/` to
+`scripts/oracles/`. Their production imports, runtime options, environment
+gates, counters, late-link retry path, and semantic replacement slots were
+removed. `FusedRegionCompiler`, `JitCompiler`, and `JvmSsaBlockRenderer` can no
+longer install or execute them.
+
+`test/fusedHotLoopRegression.test.js` asserts that loading the production JVM
+does not load an oracle module and that compiled regions expose no oracle slot.
+`npm run test:performance:jvm-kernel-proxy` is the approximately three-second
+paired CI gate. It requires exact checksums and uses relaxed per-family timing
+limits to catch large regressions without making normal CI depend on sub-2%
+timing noise. The slower three-process `<= 1.01` measurement remains the strict
+retirement/performance acceptance protocol.
 
 ## Generic changes
 
@@ -53,8 +70,7 @@ Environment for the measurements below:
 - javac: `11.0.31`, fixture target Java 8
 - DekoBloko classes:
   `/home/kreijstal/git/dekobloko-work/classes-original`
-- ordinary generic configuration: `structuredSsa=true`,
-  `guestKernelOracles=false`, `semanticFusedRasters=false`
+- ordinary generic configuration: `structuredSsa=true`
 
 The real-bytecode fused differential executed 200 gradient and 200 flat
 wrapper calls with identical destination pixels. The generic runtime installed
@@ -114,8 +130,8 @@ acceptable production fix.
 
 ## 2026-07-31 continuation
 
-The follow-up pass kept every historical implementation behind its existing
-oracle gate and added two bytecode-derived mechanisms:
+The follow-up pass kept every historical implementation as a benchmark oracle
+and added two bytecode-derived mechanisms:
 
 - integer interval propagation now proves ranges such as
   `(value & mask) + (value >>> shift)`. The emitted fast loop is guarded by
@@ -576,12 +592,12 @@ the installed intrinsic's class/debug, receiver-layout, source-bounds,
 destination-location/bounds, fallback, or counter work. The perspective row
 called only `runKernel`, omitting the installed positional wrapper's same
 entry and complete-span preflight. The default benchmark now invokes the
-exact functions installed by `HandwrittenBilinearSampler` and
-`HandwrittenPerspectiveSpan`; their stripped functions remain explicitly
+exact functions retained by `BilinearSamplerOracle` and
+`PerspectiveSpanOracle`; their stripped functions remain explicitly
 named ceilings, not retirement gates.
 
 The polygon proxy is different: its Java fixture is a direct per-row edge
-intersection algorithm, while `HandwrittenPolygonRaster` replaces a shared
+intersection algorithm, while `PolygonRasterOracle` models a shared
 edge-table method suite. They produce the same selected convex images but are
 not state- or rounding-equivalent in general. An attempted cross-comparison
 correctly produced different hashes and was removed. The existing polygon row

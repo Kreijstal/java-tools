@@ -22,6 +22,7 @@
     "benchmark:jvm:ssa-span-kernel": "node scripts/benchmarkSsaSpanKernel.js",
     "benchmark:jvm:ssa-affine-sprite": "node scripts/benchmarkSsaAffineSpriteKernel.js",
     "benchmark:jvm:ssa-kernel-targets": "node scripts/benchmarkSsaHandwrittenKernelTargets.js",
+    "test:performance:jvm-kernel-proxy": "node scripts/checkSsaKernelPerformance.js",
     "benchmark:jvm:dekobloko-trace-replay": "node scripts/benchmarkDekoblokoTraceReplay.js",
     "benchmark:jvm:dekobloko-regions": "node scripts/benchmarkDekoblokoRegionSuite.js",
     "trace:dekobloko:derive-region": "node scripts/deriveDekoblokoRegionTrace.js",

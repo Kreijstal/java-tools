@@ -5,8 +5,6 @@ const {
   succOfTerm,
   succAllOfTerm,
 } = require("../decompiler/structurer");
-const HandwrittenFusedGradient = require("./HandwrittenFusedGradient");
-const HandwrittenFusedFlat = require("./HandwrittenFusedFlat");
 const { MATH_INTRINSICS } = require("./wasmShared");
 
 const BAILOUT = Symbol("jit.fused.bailout");
@@ -213,21 +211,6 @@ class FusedRegionCompiler {
     this.enabled = options.fusedRegions !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_FUSED_REGIONS === "1");
-    // Fingerprint-selected translations are differential oracles and code-shape
-    // targets, not a production compiler tier. Keep them opt-in so normal
-    // execution proves the bytecode-derived kernels themselves are fast.
-    this.handwrittenKernelsEnabled =
-      (options.handwrittenFusedKernels === true ||
-        Boolean(typeof process !== "undefined" && process.env &&
-          process.env.JVM_ENABLE_HANDWRITTEN_FUSED === "1")) &&
-      !(typeof process !== "undefined" && process.env &&
-        process.env.JVM_DISABLE_HANDWRITTEN_FUSED === "1");
-    // Compact handwritten raster translations are experimental until the
-    // checked differential corpus proves every structurally accepted CFG.
-    // The generated fused wrapper/raster kernels remain the default.
-    this.semanticRasterKernelsEnabled = options.semanticFusedRasters === true ||
-      Boolean(typeof process !== "undefined" && process.env &&
-        process.env.JVM_ENABLE_SEMANTIC_FUSED_RASTERS === "1");
     this.directCallsEnabled = options.directFusedCalls !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_DIRECT_FUSED_CALLS === "1");
@@ -383,9 +366,7 @@ class FusedRegionCompiler {
         `${region.wrapperOwner}.${region.wrapperMethod.name}${region.wrapperMethod.descriptor}`,
         "fused-bytecode-region")
       : null;
-    const wrapperKernel = region.handwrittenWrapperKernel &&
-      this.handwrittenKernelsEnabled
-      ? region.handwrittenWrapperKernel : region.wrapperKernel;
+    const wrapperKernel = region.wrapperKernel;
     try {
       wrapperKernel(state, region, this.jit,
         a0, a1, a2, a3, a4, a5, a6, a7,
@@ -448,9 +429,7 @@ class FusedRegionCompiler {
         `${region.wrapperOwner}.${region.wrapperMethod.name}${region.wrapperMethod.descriptor}`,
         "fused-bytecode-region")
       : null;
-    const wrapperKernel = region.handwrittenWrapperKernel &&
-      this.handwrittenKernelsEnabled
-      ? region.handwrittenWrapperKernel : region.wrapperKernel;
+    const wrapperKernel = region.wrapperKernel;
     const invokeWrapper = region.invokeWrapper || (region.invokeWrapper =
       createPositionalInvoker(site.params.length));
     try {
@@ -598,21 +577,6 @@ class FusedRegionCompiler {
               region.genericRasterSafetyPlan.divisorGuardPlan,
           });
       }
-      if (this.semanticRasterKernelsEnabled && gradientRasterPlan) {
-        region.semanticGradientRasterPlan = gradientRasterPlan;
-        region.rasterKernel = HandwrittenFusedGradient.installRaster(
-          region, this.jit, gradientRasterPlan);
-        region.directRasterKernel = region.rasterKernel.directKernel;
-        this.jit.semanticFusedRasterCount =
-          (this.jit.semanticFusedRasterCount | 0) + 1;
-      } else if (this.semanticRasterKernelsEnabled && flatRasterPlan) {
-          region.semanticFlatRasterPlan = flatRasterPlan;
-          region.rasterKernel = HandwrittenFusedFlat.installRaster(
-            region, this.jit, flatRasterPlan);
-          region.directRasterKernel = region.rasterKernel.directKernel;
-          this.jit.semanticFusedFlatRasterCount =
-            (this.jit.semanticFusedFlatRasterCount | 0) + 1;
-      }
       compileStage = "wrapper";
       region.generatedRasterKernel = region.rasterKernel;
       region.wrapperKernel = this.compileKernel(
@@ -642,14 +606,6 @@ class FusedRegionCompiler {
       return null;
     }
     this.lastCompileFailure = null;
-    if (this.handwrittenKernelsEnabled && HandwrittenFusedGradient.matches(this.jit, region)) {
-      // Kept separate from wrapperKernel so the probe can live-toggle
-      // handwrittenKernelsEnabled per run for differential attribution.
-      region.handwrittenWrapperKernel =
-        HandwrittenFusedGradient.install(region, this.jit);
-      this.jit.handwrittenFusedRegionCount =
-        (this.jit.handwrittenFusedRegionCount | 0) + 1;
-    }
     return region;
   }
 
@@ -1208,7 +1164,9 @@ class FusedRegionCompiler {
               `region.staticTargets[${staticIndex}].fields.set(` +
               `region.staticTargets[${staticIndex}].key,${input});else ` +
               `region.staticTargets[${staticIndex}].fields[` +
-              `region.staticTargets[${staticIndex}].key]=${input};`);
+              `region.staticTargets[${staticIndex}].key]=${input};` +
+              `if(region.staticTargets[${staticIndex}].versionCell?.captureCaches)` +
+              `jit.markStaticTargetChanged(region.staticTargets[${staticIndex}]);`);
           } else if (op === "iaload") {
             const arrayIndex = pop();
             const array = pop();
@@ -1601,7 +1559,7 @@ class FusedRegionCompiler {
           const value = pop();
           const staticIndex = region.staticIndex.get(JSON.stringify(instruction.arg));
           if (staticIndex === undefined) throw new Error("unresolved static");
-          body.push(`if(region.staticTargets[${staticIndex}].kind==="map")region.staticTargets[${staticIndex}].fields.set(region.staticTargets[${staticIndex}].key,${value});else region.staticTargets[${staticIndex}].fields[region.staticTargets[${staticIndex}].key]=${value};`);
+          body.push(`if(region.staticTargets[${staticIndex}].kind==="map")region.staticTargets[${staticIndex}].fields.set(region.staticTargets[${staticIndex}].key,${value});else region.staticTargets[${staticIndex}].fields[region.staticTargets[${staticIndex}].key]=${value};if(region.staticTargets[${staticIndex}].versionCell?.captureCaches)jit.markStaticTargetChanged(region.staticTargets[${staticIndex}]);`);
         } else if (op === "iaload") {
           const arrayIndex = pop(); const array = pop(); const value = temp();
           body.push(`if(${array}==null) ${captureThrow(index, [array, arrayIndex],

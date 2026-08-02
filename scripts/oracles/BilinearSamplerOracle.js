@@ -1,6 +1,6 @@
 "use strict";
 
-// Compact semantic lowering for a verified, acyclic, four-neighbour
+// Historical semantic oracle for a verified, acyclic, four-neighbour
 // fixed-point sampler.  The matcher is deliberately independent of guest
 // owner/member names: it uses the descriptor, canonicalized bytecodes,
 // constants, control flow, and repeated field-reference relationships.
@@ -14,7 +14,7 @@
 
 const {
   fingerprintMethods,
-} = require("./HandwrittenFusedGradient");
+} = require("./FusedGradientOracle");
 
 const KNOWN_FINGERPRINTS = new Set([
   1541484005,

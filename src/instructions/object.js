@@ -422,6 +422,7 @@ module.exports = {
       const currentClassData = jvm.classes[currentClassName];
       if (currentClassData && currentClassData.staticFields && currentClassData.staticFields.has(fieldKey)) {
         currentClassData.staticFields.set(fieldKey, value);
+        jvm.jit?.markStaticLocationChanged(currentClassData.staticFields, fieldKey);
         return;
       }
 
@@ -433,6 +434,7 @@ module.exports = {
     const classData = jvm.classes[className];
     if (classData && classData.staticFields) {
       classData.staticFields.set(fieldKey, value);
+      jvm.jit?.markStaticLocationChanged(classData.staticFields, fieldKey);
       return;
     }
 

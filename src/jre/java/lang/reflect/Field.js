@@ -30,6 +30,15 @@ function setInstanceValue(fieldObj, obj, value) {
   }
 }
 
+function setStaticValue(jvm, fieldData, classData, value) {
+  if (!classData.staticFields) classData.staticFields = new Map();
+  const descriptorKey = `${fieldData.name}:${fieldData.descriptor}`;
+  const key = classData.staticFields.has(descriptorKey)
+    ? descriptorKey : fieldData.name;
+  classData.staticFields.set(key, value);
+  jvm.jit?.markStaticContainerChanged(classData.staticFields);
+}
+
 module.exports = {
   super: 'java/lang/reflect/AccessibleObject',
   staticFields: {},
@@ -158,10 +167,7 @@ module.exports = {
         // Static field - set in class static fields
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (!classData.staticFields) {
-          classData.staticFields = new Map();
-        }
-        classData.staticFields.set(fieldName, value);
+        setStaticValue(jvm, fieldData, classData, value);
       } else {
         // Instance field
         if (obj === null) {
@@ -245,10 +251,7 @@ module.exports = {
       if (fieldData.accessFlags & 0x0008) { // ACC_STATIC
         const declaringClass = fieldObj._declaringClass;
         const classData = declaringClass._classData;
-        if (!classData.staticFields) {
-          classData.staticFields = new Map();
-        }
-        classData.staticFields.set(fieldName, value);
+        setStaticValue(jvm, fieldData, classData, value);
       } else {
         if (obj === null) {
           throw {

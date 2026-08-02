@@ -7,10 +7,6 @@ const {
 const WasmJit = require("./WasmJit");
 const FusedRegionCompiler = require("./FusedRegionCompiler");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
-const HandwrittenPolygonRaster = require("./HandwrittenPolygonRaster");
-const HandwrittenTiledBlit = require("./HandwrittenTiledBlit");
-const HandwrittenPerspectiveSpan = require("./HandwrittenPerspectiveSpan");
-const HandwrittenAffineSpriteRaster = require("./HandwrittenAffineSpriteRaster");
 const monoArray = require("./monoArray");
 const {
   normalizeArrayLoad,
@@ -104,6 +100,8 @@ class JitCompiler {
     // constant values. loadState replaces the JIT after replacing static maps,
     // so a binding cannot outlive the canonical container it references.
     this.directStaticTargets = [];
+    this.staticFieldVersionCells = new WeakMap();
+    this.checkedLeafCaptureCaches = [];
     this.initializedStaticReadTargets = new Map();
     this.initializedStaticWriteTargets = new Map();
     // JRE methods may publish a final-receiver positional intrinsic. Generated
@@ -122,35 +120,6 @@ class JitCompiler {
       options.guestKernelOracles === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_GUEST_KERNEL_ORACLES === "1");
-    this.polygonRasterIntrinsicCache = new WeakMap();
-    this.polygonRasterRunCount = 0;
-    this.polygonRasterGuardedFallbackCount = 0;
-    this.polygonRasterFallbackEntry = 0;
-    this.polygonRasterFallbackVertices = 0;
-    this.polygonRasterFallbackCoordinate = 0;
-    this.polygonRasterFallbackDegenerate = 0;
-    this.polygonRasterFallbackSurface = 0;
-    this.polygonRasterFallbackScratch = 0;
-    this.tiledBlitRunCount = 0;
-    this.tiledBlitGuardedFallbackCount = 0;
-    this.tiledBlitFallbackEntry = 0;
-    this.tiledBlitFallbackTag = 0;
-    this.tiledBlitFallbackArrays = 0;
-    this.tiledBlitFallbackLayout = 0;
-    this.tiledBlitFallbackBounds = 0;
-    this.perspectiveSpanIntrinsicCache = new WeakMap();
-    this.perspectiveSpanRunCount = 0;
-    this.perspectiveSpanGuardedFallbackCount = 0;
-    this.affineSpriteRasterEnabled =
-      this.guestKernelOraclesEnabled &&
-      options.affineSpriteRaster !== false &&
-      !(typeof process !== "undefined" && process.env &&
-        process.env.JVM_DISABLE_AFFINE_SPRITE_RASTER === "1");
-    this.affineSpriteRasterIntrinsicCache = new WeakMap();
-    this.affineSpriteRasterRunCount = 0;
-    this.affineSpriteRasterGuardedFallbackCount = 0;
-    this.semanticBilinearSamplerRunCount = 0;
-    this.semanticBilinearSamplerFallbackCount = 0;
     this.transparentIntBlitRunCount = 0;
     this.transparentIntBlitSlowPathCount = 0;
     this.clippedGradientRunCount = 0;
@@ -3567,7 +3536,9 @@ class JitCompiler {
               `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
               `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
               `reason: "class initialization at direct synchronous putstatic" }; } ` +
-              `target.fields.set(${JSON.stringify(direct.key)}, stack[--sp]); } ${goNext}`;
+              `target.fields.set(${JSON.stringify(direct.key)}, stack[--sp]); ` +
+              `if (target.versionCell.captureCaches) ` +
+              `helpers.markStaticTargetChanged(target); } ${goNext}`;
           }
           return `{ const changed = helpers.putStaticSyncAt(${fieldSiteId}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
         }
@@ -4390,9 +4361,146 @@ class JitCompiler {
     if (!target || (forWrite && target.kind !== "map")) return null;
     site.staticTarget = target;
     target.initializationToken = site.initializationToken;
+    target.versionCell = this.getStaticFieldVersionCell(
+      target.fields, target.key);
     const targetId = this.directStaticTargets.length;
     this.directStaticTargets.push(target);
     return { targetId, kind: target.kind, key: target.key, className: site.className };
+  }
+
+  getStaticFieldVersionCell(fields, key) {
+    let cells = this.staticFieldVersionCells.get(fields);
+    if (!cells) {
+      cells = new Map();
+      this.staticFieldVersionCells.set(fields, cells);
+    }
+    let cell = cells.get(key);
+    if (!cell) {
+      cell = { value: 0, captureCaches: null };
+      cells.set(key, cell);
+    }
+    return cell;
+  }
+
+  markStaticTargetChanged(target) {
+    if (!target) return;
+    const caches = target.versionCell?.captureCaches;
+    if (!caches) return;
+    for (const cache of caches) {
+      cache.dirty = true;
+      cache.specializedMatches = false;
+      for (const key of cache.derivedGuardKeys) cache[key] = undefined;
+    }
+  }
+
+  markStaticLocationChanged(fields, key) {
+    if (!fields || key === undefined) return;
+    const caches = this.staticFieldVersionCells.get(fields)
+      ?.get(key)?.captureCaches;
+    if (!caches) return;
+    for (const cache of caches) {
+      cache.dirty = true;
+      cache.specializedMatches = false;
+      for (const guardKey of cache.derivedGuardKeys) {
+        cache[guardKey] = undefined;
+      }
+    }
+  }
+
+  markStaticContainerChanged(fields) {
+    if (!fields) return;
+    const cells = this.staticFieldVersionCells.get(fields);
+    if (!cells) return;
+    const caches = new Set();
+    for (const cell of cells.values()) {
+      for (const cache of cell.captureCaches || []) caches.add(cache);
+    }
+    for (const cache of caches) {
+      cache.dirty = true;
+      cache.specializedMatches = false;
+      for (const guardKey of cache.derivedGuardKeys) {
+        cache[guardKey] = undefined;
+      }
+    }
+  }
+
+  registerCheckedLeafCaptureCache(captures) {
+    const entries = captures.map((capture) => {
+      const target = this.directStaticTargets[capture.targetId];
+      if (!target) throw new Error("missing checked-leaf static capture");
+      const cell = target.versionCell || this.getStaticFieldVersionCell(
+        target.fields, target.key);
+      target.versionCell = cell;
+      return { capture, target, cell };
+    });
+    const cache = {
+      entries,
+      dirty: true,
+      derivedGuardKeys: [],
+      specializedMatches: false,
+      specializationInitialized: false,
+    };
+    let valueCount = 0;
+    for (const { capture } of entries) {
+      cache[`value${valueCount++}`] = undefined;
+      cache[`specializedValue${valueCount - 1}`] = undefined;
+      if (capture.data) {
+        cache[`value${valueCount++}`] = undefined;
+        cache[`specializedValue${valueCount - 1}`] = undefined;
+      }
+    }
+    for (const entry of entries) {
+      if (!entry.cell.captureCaches) entry.cell.captureCaches = new Set();
+      entry.cell.captureCaches.add(cache);
+    }
+    const id = this.checkedLeafCaptureCaches.length;
+    this.checkedLeafCaptureCaches.push(cache);
+    this.refreshCheckedLeafCaptureCache(id);
+    for (let index = 0; index < valueCount; index += 1) {
+      cache[`specializedValue${index}`] = cache[`value${index}`];
+    }
+    cache.specializedMatches = true;
+    cache.specializationInitialized = true;
+    return id;
+  }
+
+  refreshCheckedLeafCaptureCache(id) {
+    const cache = this.checkedLeafCaptureCaches[id];
+    if (!cache) throw new Error("missing checked-leaf capture cache");
+    let valueIndex = 0;
+    let specializedMatches = true;
+    for (let index = 0; index < cache.entries.length; index += 1) {
+      const { capture, target } = cache.entries[index];
+      const value = target.kind === "map"
+        ? target.fields.get(target.key) : target.fields[target.key];
+      cache[`value${valueIndex}`] = value;
+      if (cache.specializationInitialized &&
+          cache[`specializedValue${valueIndex}`] !== value) {
+        specializedMatches = false;
+      }
+      valueIndex += 1;
+      if (capture.data) {
+        const data = this.arrayData(value);
+        cache[`value${valueIndex}`] = data;
+        if (cache.specializationInitialized &&
+            cache[`specializedValue${valueIndex}`] !== data) {
+          specializedMatches = false;
+        }
+        valueIndex += 1;
+      }
+    }
+    cache.specializedMatches = specializedMatches;
+    cache.dirty = false;
+    return cache;
+  }
+
+  registerCheckedLeafCaptureDerivedGuard(id) {
+    const cache = this.checkedLeafCaptureCaches[id];
+    if (!cache) throw new Error("missing checked-leaf capture cache");
+    const key = `guard${cache.derivedGuardKeys.length}`;
+    cache.derivedGuardKeys.push(key);
+    cache[key] = undefined;
+    return key;
   }
 
   getStaticSyncAt(id) {
@@ -4431,6 +4539,7 @@ class JitCompiler {
       site.staticTarget = target;
     }
     target.fields.set(target.key, value);
+    this.markStaticTargetChanged(target);
     return true;
   }
 
@@ -4524,6 +4633,7 @@ class JitCompiler {
       throw new Error(`Unsupported putstatic: ${className}.${fieldName}`);
     }
     target.fields.set(target.key, value);
+    this.markStaticTargetChanged(target);
     return true;
   }
 
@@ -5176,27 +5286,14 @@ class JitCompiler {
       const structuralIntrinsic = op === "invokestatic"
         ? this.getSynchronousIntrinsic(method, descriptor)
         : null;
-      const pendingIntrinsicCandidates =
-        this.guestKernelOraclesEnabled &&
-        op === "invokestatic" && !structuralIntrinsic ? [
-          ...(HandwrittenPolygonRaster.candidateDependencies(
-            this, method, descriptor) || []),
-          ...(HandwrittenAffineSpriteRaster.candidateDependencies(
-            this, method, descriptor) || []),
-        ] : null;
-      const pendingIntrinsicOwners = pendingIntrinsicCandidates?.length
-        ? [...new Set(pendingIntrinsicCandidates)]
-        : null;
       if (!normallySupported && !fusedCandidate &&
-          !structuralIntrinsic &&
-          (!pendingIntrinsicOwners || pendingIntrinsicOwners.length === 0)) {
+          !structuralIntrinsic) {
         return ASYNC_INVOKE;
       }
       target = {
         method,
         lookupClass,
         intrinsic: structuralIntrinsic,
-        pendingIntrinsicOwners,
         inlineIntegerRegion: normallySupported &&
           (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
           ? this.getInlineIntegerRegion(method, params, returnType)
@@ -5367,25 +5464,7 @@ class JitCompiler {
     const {
       method, lookupClass, inlineIntegerRegion, memoizedIntegralLeaf, generated,
     } = target;
-    let intrinsic = target.intrinsic;
-    if (!intrinsic && Array.isArray(target.pendingIntrinsicOwners) &&
-        target.pendingIntrinsicOwners.every((owner) => this.jvm.classes[owner])) {
-      // Dependencies are now loaded.  This is the sole retry: a full-shape
-      // mismatch is permanent, while a match is installed into both the
-      // target and monomorphic call-site cache.
-      target.pendingIntrinsicOwners = null;
-      intrinsic = this.getSynchronousIntrinsic(method, descriptor);
-      if (intrinsic) {
-        target.intrinsic = intrinsic;
-        if (op === "invokestatic") {
-          site.fastIntrinsic = {
-            intrinsic,
-            lookupClass,
-            methodKey: `${lookupClass}.${method.name}${descriptor}`,
-          };
-        }
-      }
-    }
+    const intrinsic = target.intrinsic;
     const receiver = receiverSlots
       ? frame.stack.items[availableOperands - params.length - 1]
       : null;
@@ -5607,49 +5686,6 @@ class JitCompiler {
     if (!this.guestKernelOraclesEnabled &&
         descriptor !== "([II[III)V") {
       return null;
-    }
-    if (this.guestKernelOraclesEnabled) {
-      if (HandwrittenAffineSpriteRaster.DESCRIPTOR.test(descriptor)) {
-        if (this.affineSpriteRasterIntrinsicCache.has(method)) {
-          return this.affineSpriteRasterIntrinsicCache.get(method);
-        }
-        const affineSpriteRaster = HandwrittenAffineSpriteRaster.createIntrinsic(
-          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-        if (affineSpriteRaster) {
-          this.affineSpriteRasterIntrinsicCache.set(method, affineSpriteRaster);
-          return affineSpriteRaster;
-        }
-      }
-      if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
-        if (this.perspectiveSpanIntrinsicCache.has(method)) {
-          return this.perspectiveSpanIntrinsicCache.get(method);
-        }
-        const perspectiveSpan = HandwrittenPerspectiveSpan.createIntrinsic(
-          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-        if (perspectiveSpan) {
-          this.perspectiveSpanIntrinsicCache.set(method, perspectiveSpan);
-          return perspectiveSpan;
-        }
-      }
-      if (descriptor === "([II)V" || descriptor === "([III)V") {
-        if (this.polygonRasterIntrinsicCache.has(method)) {
-          return this.polygonRasterIntrinsicCache.get(method);
-        }
-        const polygon = HandwrittenPolygonRaster.createIntrinsic(
-          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-        // A structurally referenced span owner may not have been loaded on the
-        // first cold query. Cache only a positive proof so a later hot call can
-        // retry after ordinary class loading completes.
-        if (polygon) {
-          this.polygonRasterIntrinsicCache.set(method, polygon);
-          return polygon;
-        }
-      }
-      if (descriptor === HandwrittenTiledBlit.DESCRIPTOR) {
-        const tiledBlit = HandwrittenTiledBlit.createIntrinsic(
-          this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-        if (tiledBlit) return tiledBlit;
-      }
     }
     const codeItems = this.getCodeItems(method);
     const rawOps = codeItems
@@ -7318,6 +7354,52 @@ class JitCompiler {
     const capturedSource =
       generated?.jvmCapturedCheckedLeafDirectPositionalSource;
     const ordinarySource = generated?.jvmCheckedLeafDirectPositionalSource;
+    const rawAdmissionPlan =
+      generated?.jvmStructuredCheckedLeafAdmissionPlan;
+    let admissionPlan = null;
+    if (rawAdmissionPlan?.kind === "record-window") {
+      const slotArguments = new Map();
+      let slot = 0;
+      for (let argument = 0; argument < parsed.params.length; argument += 1) {
+        slotArguments.set(slot, argument);
+        slot += parsed.params[argument] === "long" ||
+          parsed.params[argument] === "double" ? 2 : 1;
+      }
+      const arrayArgument = slotArguments.get(rawAdmissionPlan.arraySlot);
+      const lowerArgument = slotArguments.get(rawAdmissionPlan.lowerSlot);
+      const upperArgument = slotArguments.get(rawAdmissionPlan.upperSlot);
+      if (Number.isInteger(arrayArgument) &&
+          Number.isInteger(lowerArgument) &&
+          Number.isInteger(upperArgument) &&
+          Number.isInteger(rawAdmissionPlan.stride) &&
+          rawAdmissionPlan.stride > 0) {
+        admissionPlan = {
+          kind: rawAdmissionPlan.kind,
+          arrayArgument,
+          lowerArgument,
+          upperArgument,
+          stride: rawAdmissionPlan.stride,
+          maximumRecords: Number.isInteger(rawAdmissionPlan.maximumRecords) &&
+            rawAdmissionPlan.maximumRecords > 0
+            ? rawAdmissionPlan.maximumRecords : null,
+          guardVariable: rawAdmissionPlan.guardVariable,
+        };
+      }
+    } else if (rawAdmissionPlan?.kind === "clipped-affine-fill") {
+      const integerKeys = [
+        "xArgument", "yArgument", "countArgument", "valueArgument",
+        "topCapture", "bottomCapture", "leftCapture", "rightCapture",
+        "widthCapture", "arrayCapture", "arrayDataCapture", "maximumTrips",
+      ];
+      if (integerKeys.every((key) =>
+        Number.isInteger(rawAdmissionPlan[key]) &&
+        rawAdmissionPlan[key] >= 0)) {
+        admissionPlan = Object.fromEntries([
+          ["kind", rawAdmissionPlan.kind],
+          ...integerKeys.map((key) => [key, rawAdmissionPlan[key]]),
+        ]);
+      }
+    }
     const body = typeof capturedBody === "function"
       ? capturedBody : generated?.jvmCheckedLeafDirectPositionalBody;
     if (typeof body !== "function") return null;
@@ -7339,6 +7421,7 @@ class JitCompiler {
       captures: typeof capturedBody === "function" &&
         Array.isArray(capturedPlan?.captures)
         ? capturedPlan.captures : [],
+      admissionPlan,
     };
   }
 
