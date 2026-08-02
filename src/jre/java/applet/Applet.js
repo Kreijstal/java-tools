@@ -7,16 +7,18 @@ module.exports = {
   methods: {
     '<init>()V': (jvm, obj, args) => {
       // Initialize applet as a Panel
+      const width = (jvm && jvm._appletWidth) || 800;
+      const height = (jvm && jvm._appletHeight) || 600;
       obj._awtComponent = new awtFramework.Canvas();
-      obj._awtComponent.setSize(800, 600); // Default applet size
-      obj._width = 800;
-      obj._height = 600;
+      obj._awtComponent.setSize(width, height);
+      obj._width = width;
+      obj._height = height;
       
       // Create and attach canvas to DOM if in browser environment
       if (typeof document !== 'undefined') {
         const canvas = document.createElement('canvas');
-        canvas.width = 800;
-        canvas.height = 600;
+        canvas.width = width;
+        canvas.height = height;
         canvas.style.border = '1px solid #ccc';
         canvas.style.background = 'white';
         // Keep the synthetic applet surface out of the applet's own layout and

@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>KiteModeler — applet tag demo (jvm.js userscript)</title>
+  <style>
+    body { font: 15px system-ui, sans-serif; padding: 20px; background: #fafafa; color: #222; }
+    h1 { font-size: 20px; }
+    .note { color: #666; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>KiteModeler</h1>
+  <p class="note">This page contains a classic <code>&lt;applet&gt;</code> tag.
+    The jvm.js loader userscript scans it and re-runs the applet in the
+    browser with no Java plugin.</p>
+
+  <applet code="Kite.class" codebase="../../dist/demo/kite/" width=710 height=400 align=bottom></applet>
+
+  <p class="note"><a href="https://www.grc.nasa.gov/www/k-12/airplane/kiteprog.html">Source:
+    NASA GRC Beginner's Guide to Aeronautics.</a></p>
+
+  <!-- Injected by the userscript harness in real usage; here for the demo. -->
+  <script src="./java-applet-loader.user.js"></script>
+</body>
+</html>
