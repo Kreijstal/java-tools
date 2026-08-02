@@ -3723,6 +3723,25 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // stack-out assignments would place Java statements after return/throw.
     const regularSuccessors = (cfg.succ[blockId] || []).filter((successor) =>
       successor != null && !handlerEntries.has(cfg.blocks[successor].headLabel));
+
+    // A dup-filled array can remain live in two operand-stack slots when a
+    // conditional splits the basic block before the element store. Rendering
+    // each outgoing slot independently would turn the one JVM allocation into
+    // two `new T[n]` expressions. Spill the shared expression once while its
+    // object identity is still visible; successor carriers then copy the same
+    // Java reference even though their expression metadata is reconstructed.
+    if (regularSuccessors.length) {
+      const exitValueCounts = new Map();
+      for (const value of exitStack) {
+        exitValueCounts.set(value, (exitValueCounts.get(value) || 0) + 1);
+      }
+      for (const [value, count] of exitValueCounts) {
+        if (!value || count < 2 || (!value.newArraySpill && !value.arrayLiteral) ||
+            !/^new\b/.test(value.code)) continue;
+        materializeNewArraySpill(value, lines, localState);
+      }
+    }
+
     if (regularSuccessors.length) exitStack.forEach((value, slot) => {
       requireRenderedTypeImport(options, value.qualifiedType || value.type);
       const rawStoredValue = renderStoreExpression(value);
