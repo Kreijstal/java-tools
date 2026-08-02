@@ -161,6 +161,22 @@ L32: areturn
 .end class
 `;
 
+const TERMINAL_DEAD_DUP_ARRAY = `.version 52 0
+.class public super TerminalDeadDupArray
+.super java/lang/Object
+
+.method public static value : ()I
+    .code stack 3 locals 0
+L0: iconst_1
+L1: anewarray java/lang/String
+L4: dup
+L5: bipush 7
+L7: ireturn
+    .end code
+.end method
+.end class
+`;
+
 const INLINE_PRIMITIVE_ARRAY_STORE = `.version 52 0
 .class public super InlinePrimitiveArrayStore
 .super java/lang/Object
@@ -504,6 +520,24 @@ test('dup-filled reference arrays retain identity across a conditional value bra
     t.notOk(
       /String\[] ([A-Za-z_$][A-Za-z0-9_$]*) = new String\[1\];[\s\S]*String\[] [A-Za-z_$][A-Za-z0-9_$]* = new String\[1\]/.test(source),
       'the conditional store and following call do not receive separate allocations');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('dead duplicated arrays in terminal blocks do not emit after return', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-terminal-dead-array-'));
+  try {
+    const source = decompileFixture(tempDir, 'TerminalDeadDupArray', TERMINAL_DEAD_DUP_ARRAY);
+
+    t.match(source, /return 7;/, 'the terminal return is retained');
+    t.notOk(/return 7;[\s\S]*new String\[1\]/.test(source),
+      'the dead duplicated allocation is not materialized after return');
+    fs.writeFileSync(path.join(tempDir, 'TerminalDeadDupArray.java'), source);
+    execFileSync('javac', ['-g:none', '-d', tempDir,
+      path.join(tempDir, 'TerminalDeadDupArray.java')]);
+    t.pass('the terminal block output recompiles without unreachable statements');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
