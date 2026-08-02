@@ -50,6 +50,20 @@ function checksum(values) {
   return value;
 }
 
+function runPolygonSpanOracle(destination, x, y, count, color) {
+  if (y < 0 || y >= 64) return;
+  if (x < 0) {
+    count = (count + x) | 0;
+    x = 0;
+  }
+  if (((x + count) | 0) > 64) count = (64 - x) | 0;
+  if (count <= 0) return;
+  let pixel = (Math.imul(y, 64) + x) | 0;
+  for (const end = pixel + count; pixel < end; pixel += 1) {
+    destination[pixel] = color | 0;
+  }
+}
+
 function compileFixture() {
   const directory = fs.mkdtempSync(
     path.join(os.tmpdir(), 'jvm-ssa-kernel-targets-'));
@@ -556,23 +570,63 @@ function runPolygonOracle(destination, vertices, color) {
       process.env.SSA_BILINEAR_FIXED_CEILING === '1'
         ? 'fixed-specialized-ceiling' : 'dynamic-guarded-handwritten';
 
-    const polygonGenericDestination = intArray(64 * 64, () => 0);
-    const polygonOracleDestination = intArray(64 * 64, () => 0);
+    const polygonSpanGenericDestination = intArray(64 * 64, () => 0);
+    const polygonSpanOracleDestination = intArray(64 * 64, () => 0);
     runtime.classData.staticFields.set(
-      'polygonDestination:[I', polygonGenericDestination);
+      'polygonDestination:[I', polygonSpanGenericDestination);
     runtime.classData.staticFields.set('polygonWidth:I', 64);
     runtime.classData.staticFields.set('polygonHeight:I', 64);
     runtime.classData.staticFields.set('polygonClipLeft:I', 0);
     runtime.classData.staticFields.set('polygonClipRight:I', 64);
     runtime.classData.staticFields.set('polygonClipTop:I', 0);
     runtime.classData.staticFields.set('polygonClipBottom:I', 64);
+    const polygonSpan = compileBody(runtime, 'polygonSpan', '(IIII)V');
+    const polygonSpanCaptures = (
+      polygonSpan.capturedCheckedLeafPlan?.captures || []).flatMap((capture) => {
+      const target = runtime.jvm.jit.directStaticTargets[capture.targetId];
+      const value = target.kind === 'map'
+        ? target.fields.get(target.key) : target.fields[target.key];
+      return capture.data
+        ? [value, runtime.jvm.jit.arrayData(value)] : [value];
+    });
+    const polygonSpanResult = benchmarkPair('polygon-span', {
+      destination: polygonSpanGenericDestination,
+      generated: polygonSpan.generated,
+      invoke(item) {
+        const x = (item * 17 % 80) - 8;
+        const y = item & 63;
+        const count = 8 + (item * 13 % 56);
+        const color = 0xff000000 | Math.imul(item + 1, 0x10203);
+        if (polygonSpan.capturedCheckedLeafBody) {
+          return polygonSpan.capturedCheckedLeafBody(runtime.jvm.jit,
+            x, y, count, color, ...polygonSpanCaptures, thread, 2);
+        }
+        return polygonSpan.trustedCheckedLeafBody(runtime.jvm.jit,
+          x, y, count, color, thread);
+      },
+    }, {
+      destination: polygonSpanOracleDestination,
+      invoke(item) {
+        runPolygonSpanOracle(polygonSpanOracleDestination,
+          (item * 17 % 80) - 8, item & 63, 8 + (item * 13 % 56),
+          0xff000000 | Math.imul(item + 1, 0x10203));
+      },
+    }, 36);
+    polygonSpanResult.oracleKind = 'equivalent-flat-span-ceiling';
+    polygonSpanResult.genericEntryKind =
+      polygonSpan.capturedCheckedLeafBody
+        ? 'captured-checked-leaf' : 'trusted-checked-leaf';
+
+    const polygonGenericDestination = intArray(64 * 64, () => 0);
+    const polygonOracleDestination = intArray(64 * 64, () => 0);
+    runtime.classData.staticFields.set(
+      'polygonDestination:[I', polygonGenericDestination);
     // Measure the steady-state initialized shape. The previous ordering
     // compiled these methods before installing their static field values,
     // permanently benchmarking first-link fallback branches that neither the
     // handwritten implementation nor a warmed application retains.
     // Compile the ordinary child first so the caller can link its positional
     // generated entry without depending on a warm interpreter invocation.
-    compileBody(runtime, 'polygonSpan', '(IIII)V');
     const polygon = compileBody(runtime, 'polygonFill', '([II)V');
     const polygonCases = Array.from({ length: 64 }, (_unused, item) =>
       intArray(12, index => {
@@ -740,7 +794,7 @@ function runPolygonOracle(destination, vertices, color) {
       node: process.version,
       results: [
         tiledResult, tiledCallerResult, perspectiveResult, bilinearResult,
-        polygonResult, polygonEdgeResult,
+        polygonSpanResult, polygonResult, polygonEdgeResult,
       ].map(sanitize),
     }, null, 2)}\n`);
   } finally {
