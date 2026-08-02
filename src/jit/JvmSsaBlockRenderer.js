@@ -2857,6 +2857,15 @@ class JvmSsaBlockRenderer {
               if (args[argument] === null) valid = false;
             }
             if (!valid) continue;
+            const positionalArgumentArrayData = args.map((argument) => {
+              const data = arrayViews.get(argument) ||
+                entryStaticArrayLocalViews.get(
+                  localLoads.get(argument))?.data || null;
+              return data ? {
+                data,
+                nonNull: unconditionallyNonNullEntryArrayData.has(data),
+              } : null;
+            });
             const out = value(), caught = value();
             let inlineCheckedLeafVoidFastPath = false;
             const deferMaterialization = this.deferredCallMaterializationEnabled;
@@ -2949,8 +2958,28 @@ class JvmSsaBlockRenderer {
                         childLines[1] || "")) {
                     childLines = childLines.slice(2);
                   }
+                  const fedNonNullEntryArrays = new Set();
                   childLines = childLines.map((line) => {
                     let rewritten = line;
+                    const entryArray = /^([\s]*)const (ssaEntryArrayData\d+) = helpers\.arrayData\(argument(\d+)\);$/.exec(
+                      rewritten);
+                    if (entryArray) {
+                      const argument = Number(entryArray[3]);
+                      const view = positionalArgumentArrayData[argument];
+                      if (view) {
+                        rewritten = entryArray[2] === view.data
+                          ? ""
+                          : `${entryArray[1]}const ${entryArray[2]} = ${view.data};`;
+                        if (view.nonNull) {
+                          fedNonNullEntryArrays.add(entryArray[2]);
+                        }
+                      }
+                    }
+                    if (!rewritten) return "";
+                    const nullGuard = /^\s*if \((ssaEntryArrayData\d+) === null\) \{ return helpers\.asyncInvokeSentinel\(\); \}$/.exec(
+                      rewritten);
+                    if (nullGuard &&
+                        fedNonNullEntryArrays.has(nullGuard[1])) return "";
                     for (let argument = args.length - 1;
                       argument >= 0; argument -= 1) {
                       rewritten = rewritten.replace(
@@ -2977,7 +3006,7 @@ class JvmSsaBlockRenderer {
                         return `{ ${out} = ${success}; ` +
                           `break ${inlineCheckedLeafLabel}; }`;
                       });
-                  });
+                  }).filter(Boolean);
                   // Captured values already have caller-local SSA names.
                   // Substitute the child's entry aliases, and remove
                   // per-entry accounting/safe-point bookkeeping: a lexical
@@ -6241,6 +6270,9 @@ class JvmSsaBlockRenderer {
       positionalCallDeclarationsFor();
     const directPositionalCallDeclarations =
       positionalCallDeclarationsFor(true);
+    const directPositionalCallCaptureDeclarations =
+      directPositionalCallDeclarations.filter((line) =>
+        /^const ssaCallCapture\d+_\d+ = /.test(line));
     const restoringDirectPositionalCallDeclarations =
       directPositionalCallDeclarations;
     const specializeSelfRecursiveCalls = (
@@ -6705,6 +6737,7 @@ class JvmSsaBlockRenderer {
           `${prefix}helpers.materialize(frame, locals, stack, ${pc});`,
         ];
       });
+    const eliminatedCheckedLeafLocalSlots = new Set();
     const compactCheckedLeafLines = (
       sourceLines, checkedLeafSemantics = true,
     ) => {
@@ -6926,6 +6959,9 @@ class JvmSsaBlockRenderer {
           }
           if (assignmentIndexes.length !== 1 ||
               inlineIndexes.has(assignmentIndexes[0])) continue;
+          const earlyUse = new RegExp(`\\b${declaration[1]}\\b`);
+          if (lines.slice(declarationIndex + 1, assignmentIndexes[0])
+            .some((line) => earlyUse.test(line))) continue;
           const assignment = assignmentPattern.exec(lines[assignmentIndexes[0]]);
           lines[declarationIndex] = '';
           lines[assignmentIndexes[0]] =
@@ -6995,6 +7031,89 @@ class JvmSsaBlockRenderer {
             `${declaration[1]}const ${name} = ${load[1]};`,
             `${declaration[1]}if (${name} === undefined) ` +
               "return helpers.asyncInvokeSentinel();");
+        }
+
+        // Checked leaves have already proved that their normal path cannot
+        // materialize a Frame. Source-level JVM temporaries therefore need
+        // not survive merely for a hypothetical spill. Propagate a simple
+        // SSA alias only when its sole textual definition dominates every
+        // read inside the same lexical scope; remove write-only aliases after
+        // their value-producing instruction has already executed. Loop
+        // induction variables and branch-carried locals necessarily have
+        // multiple definitions or reads outside that scope and are retained.
+        const localDeclarations = new Map();
+        const localAssignments = new Map();
+        const localReads = new Map();
+        for (let index = 0; index < lines.length; index += 1) {
+          const declaration = /^\s*let (local\d+) = undefined;$/.exec(
+            lines[index]);
+          if (declaration) localDeclarations.set(declaration[1], index);
+          const assignment = /^(\s*)(local\d+) = (ssaValue\d+);$/.exec(
+            lines[index]);
+          if (assignment) {
+            const values = localAssignments.get(assignment[2]) || [];
+            values.push({
+              index,
+              indentation: assignment[1].length,
+              value: assignment[3],
+            });
+            localAssignments.set(assignment[2], values);
+          }
+          for (const match of lines[index].matchAll(/\blocal\d+\b/g)) {
+            const name = match[0];
+            if (declaration?.[1] === name || assignment?.[2] === name &&
+                match.index === assignment[1].length) continue;
+            const reads = localReads.get(name) || [];
+            reads.push(index);
+            localReads.set(name, reads);
+          }
+        }
+        const removeLocalLines = new Set();
+        for (const [name, assignments] of localAssignments) {
+          const declarationIndex = localDeclarations.get(name);
+          const reads = localReads.get(name) || [];
+          if (!reads.length && assignments.length > 0) {
+            if (Number.isInteger(declarationIndex)) {
+              removeLocalLines.add(declarationIndex);
+            }
+            for (const assignment of assignments) {
+              removeLocalLines.add(assignment.index);
+            }
+            eliminatedCheckedLeafLocalSlots.add(
+              Number(name.slice("local".length)));
+            continue;
+          }
+          if (assignments.length !== 1 || !reads.length) continue;
+          const assignment = assignments[0];
+          let scopeEnd = lines.length;
+          for (let index = assignment.index + 1;
+            index < lines.length; index += 1) {
+            const trimmed = lines[index].trim();
+            const indentation = lines[index].length -
+              lines[index].trimStart().length;
+            if (trimmed.startsWith("}") &&
+                indentation < assignment.indentation) {
+              scopeEnd = index;
+              break;
+            }
+          }
+          if (reads.some((index) =>
+            index <= assignment.index || index >= scopeEnd)) continue;
+          const readPattern = new RegExp(`\\b${name}\\b`, "g");
+          for (const index of reads) {
+            lines[index] = lines[index].replace(
+              readPattern, assignment.value);
+          }
+          if (Number.isInteger(declarationIndex)) {
+            removeLocalLines.add(declarationIndex);
+          }
+          removeLocalLines.add(assignment.index);
+          eliminatedCheckedLeafLocalSlots.add(
+            Number(name.slice("local".length)));
+        }
+        if (removeLocalLines.size) {
+          lines = lines.filter((_line, index) =>
+            !removeLocalLines.has(index));
         }
       }
       // Remove pure SSA declarations left without a consumer after the
@@ -7775,8 +7894,14 @@ class JvmSsaBlockRenderer {
             const aliases = new Map([...entryArguments]
               .filter(([slot]) => !renderedAssignedLocalSlots.has(slot))
               .map(([slot]) => [`local${slot}`, entryArgumentValue(slot)]));
-            if (!aliases.size) return bodyLines;
-            return bodyLines
+            const withoutEliminatedLocals = bodyLines.filter((line) => {
+              const declaration =
+                /^\s*(?:const|let) local(\d+) = .+;$/.exec(line);
+              return !declaration ||
+                !eliminatedCheckedLeafLocalSlots.has(Number(declaration[1]));
+            });
+            if (!aliases.size) return withoutEliminatedLocals;
+            return withoutEliminatedLocals
               .filter((line) => {
                 const declaration =
                   /^\s*(?:const|let) (local\d+) = .+;$/.exec(line);
@@ -7845,6 +7970,7 @@ class JvmSsaBlockRenderer {
             ...directStaticDeclarations,
             ...lazyStaticDeclarations,
             ...directEntryStaticReadDeclarations,
+            ...directPositionalCallCaptureDeclarations,
             directBooleanGuard,
             this.runCountersEnabled
               ? "helpers.structuredSsa.restoringDirectRunCount += 1;" : null,

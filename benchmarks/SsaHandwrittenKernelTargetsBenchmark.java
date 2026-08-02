@@ -186,6 +186,16 @@ public final class SsaHandwrittenKernelTargetsBenchmark {
         }
     }
 
+    static void polygonSpanFromCaller(int item, int color) {
+        for (int row = 0; row < 16; row++) {
+            int sample = item + row;
+            int x = sample * 17 % 80 - 8;
+            int y = sample & 63;
+            int count = 8 + sample * 13 % 56;
+            polygonSpan(x, y, count, color + row * 0x10203);
+        }
+    }
+
     static void polygonFill(int[] vertices, int color) {
         int pairs = vertices.length >> 1;
         for (int y = 0; y < polygonHeight; y++) {

@@ -580,42 +580,33 @@ function runPolygonOracle(destination, vertices, color) {
     runtime.classData.staticFields.set('polygonClipRight:I', 64);
     runtime.classData.staticFields.set('polygonClipTop:I', 0);
     runtime.classData.staticFields.set('polygonClipBottom:I', 64);
-    const polygonSpan = compileBody(runtime, 'polygonSpan', '(IIII)V');
-    const polygonSpanCaptures = (
-      polygonSpan.capturedCheckedLeafPlan?.captures || []).flatMap((capture) => {
-      const target = runtime.jvm.jit.directStaticTargets[capture.targetId];
-      const value = target.kind === 'map'
-        ? target.fields.get(target.key) : target.fields[target.key];
-      return capture.data
-        ? [value, runtime.jvm.jit.arrayData(value)] : [value];
-    });
+    compileBody(runtime, 'polygonSpan', '(IIII)V');
+    const polygonSpanCaller = compileBody(
+      runtime, 'polygonSpanFromCaller', '(II)V');
     const polygonSpanResult = benchmarkPair('polygon-span', {
       destination: polygonSpanGenericDestination,
-      generated: polygonSpan.generated,
+      generated: polygonSpanCaller.generated,
       invoke(item) {
-        const x = (item * 17 % 80) - 8;
-        const y = item & 63;
-        const count = 8 + (item * 13 % 56);
         const color = 0xff000000 | Math.imul(item + 1, 0x10203);
-        if (polygonSpan.capturedCheckedLeafBody) {
-          return polygonSpan.capturedCheckedLeafBody(runtime.jvm.jit,
-            x, y, count, color, ...polygonSpanCaptures, thread, 2);
-        }
-        return polygonSpan.trustedCheckedLeafBody(runtime.jvm.jit,
-          x, y, count, color, thread);
+        return polygonSpanCaller.body(runtime.jvm.jit,
+          polygonSpanCaller.plan, item, color, thread, 2);
       },
     }, {
       destination: polygonSpanOracleDestination,
       invoke(item) {
-        runPolygonSpanOracle(polygonSpanOracleDestination,
-          (item * 17 % 80) - 8, item & 63, 8 + (item * 13 % 56),
-          0xff000000 | Math.imul(item + 1, 0x10203));
+        const color = 0xff000000 | Math.imul(item + 1, 0x10203);
+        for (let row = 0; row < 16; row += 1) {
+          const sample = item + row;
+          runPolygonSpanOracle(polygonSpanOracleDestination,
+            (sample * 17 % 80) - 8, sample & 63,
+            8 + (sample * 13 % 56),
+            color + Math.imul(row, 0x10203));
+        }
       },
-    }, 36);
+    }, 36 * 16);
     polygonSpanResult.oracleKind = 'equivalent-flat-span-ceiling';
     polygonSpanResult.genericEntryKind =
-      polygonSpan.capturedCheckedLeafBody
-        ? 'captured-checked-leaf' : 'trusted-checked-leaf';
+      'lexically-fused-loop-caller';
 
     const polygonGenericDestination = intArray(64 * 64, () => 0);
     const polygonOracleDestination = intArray(64 * 64, () => 0);

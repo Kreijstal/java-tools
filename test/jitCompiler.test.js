@@ -3597,6 +3597,10 @@ public final class RenamedShrinkingWindowHarness {
     }
   }
 
+  static void applyWindow(int[] cells, int floor, int ceiling) {
+    reorder(cells, floor, ceiling);
+  }
+
   static void changedReach(int[] cells, int floor, int ceiling) {
     while (ceiling >= floor + 8) {
       int ordered = 1;
@@ -3642,6 +3646,25 @@ public final class RenamedShrinkingWindowHarness {
       sourceText.includes('helpers.arrayStore(') ||
       sourceText.includes('helpers.materialize('),
   'the admitted leaf contains no poll, checked access, or Frame path');
+  t.notOk(/\blocal(?:5|6|7)\b/.test(sourceText),
+    'write-only and single-definition source temporaries leave the checked leaf');
+
+  const wrapperMethod = await jvm.findMethodInHierarchy(
+    className, 'applyWindow', '([III)V');
+  const wrapperGenerated = jvm.jit.getGeneratedFunction(wrapperMethod);
+  const wrapperChecked =
+    wrapperGenerated?.jvmCheckedLeafDirectPositionalBody;
+  const wrapperSource =
+    wrapperGenerated?.jvmCheckedLeafDirectPositionalSource || '';
+  t.equal(typeof wrapperChecked, 'function',
+    'an arbitrarily named wrapper receives the lexical checked child');
+  t.equal(wrapperGenerated?.jvmStructuredLexicalCheckedLeafCallCount, 1,
+    'the wrapper is selected by verified call and CFG structure');
+  t.equal((wrapperSource.match(/helpers\.arrayData\(/g) || []).length, 1,
+    'the lexical child consumes the caller raw-array operand without re-extracting it');
+  t.notOk(wrapperSource.includes(
+    'const ssaEntryArrayData0 = ssaEntryArrayData0'),
+  'same-slot operand feeding does not introduce a temporal-dead-zone alias');
 
   const thread = {
     status: 'runnable', pendingException: null, callStack: new Stack(),
@@ -3660,6 +3683,36 @@ public final class RenamedShrinkingWindowHarness {
     3, 9, 30, 31,
     5, 9, 50, 51,
   ], 'the generated leaf preserves record ordering and payload swaps');
+
+  const wrappedCells = [
+    5, 9, 50, 51,
+    1, 9, 10, 11,
+    3, 9, 30, 31,
+  ];
+  wrappedCells.type = '[I';
+  t.notEqual(wrapperChecked(
+    jvm.jit, wrappedCells, 0, 12, thread, true),
+  jvm.jit.asyncInvokeSentinel(),
+  'the fed operand preserves valid wrapper execution');
+  t.deepEqual(wrappedCells.slice(), [
+    1, 9, 10, 11,
+    3, 9, 30, 31,
+    5, 9, 50, 51,
+  ], 'the lexical wrapper preserves every payload mutation');
+
+  const wrappedRejected = [
+    5, 9, 50, 51,
+    1, 9, 10, 11,
+    3, 9, 30, 31,
+  ];
+  wrappedRejected.type = '[I';
+  const wrappedBefore = wrappedRejected.slice();
+  t.equal(wrapperChecked(
+    jvm.jit, wrappedRejected, 0, 10, thread, true),
+  jvm.jit.asyncInvokeSentinel(),
+  'a fed operand retains the child range fallback');
+  t.deepEqual(wrappedRejected.slice(), wrappedBefore,
+    'the wrapper range fallback still precedes every effect');
 
   for (const [label, input, floor, ceiling] of [
     ['misaligned', [5, 9, 50, 51, 1, 9, 10, 11, 3, 9, 30, 31], 0, 10],
