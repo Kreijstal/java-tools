@@ -5,6 +5,7 @@
 // old applets like NASA's KiteModeler use for zooming and panning.
 
 const awtFramework = require('../../../platform/awt.js');
+const browserInput = require('../../../platform/browser-awt-input.js');
 const { postMouseEvent } = require('./legacyEvents');
 
 function attachMouseInteraction(jvm, obj, canvas) {
@@ -86,6 +87,11 @@ module.exports = {
         obj._awtComponent = new awtFramework.Canvas();
         obj._awtComponent.canvasElement = canvas;
         attachMouseInteraction(jvm, obj, canvas);
+        // Modern AWT games register MouseListener/MouseMotionListener and
+        // KeyListener instances on the concrete Canvas.  Bind this visible
+        // DOM surface to that Java component; the applet's backdrop bridge is
+        // not an ancestor and therefore cannot observe these browser events.
+        browserInput.attachBrowserInput(jvm, canvas, obj);
       }
     },
   },

@@ -7023,6 +7023,51 @@ public final class StructuredAliasFallbackHarness {
   ].join('\n'));
   t.deepEqual(outOfScope, ['ssaValue1'],
     'the AST scope graph rejects nested declarations used from outer scope');
+
+  const escapedInlineResult = [
+    'let ssaValue13;',
+    '{',
+    '  let inlineValue0;',
+    '  inlineValue0 = 7;',
+    '  ssaValue13 = inlineValue0;',
+    '}',
+    'helpers.consume(ssaValue13);',
+  ].join('\n');
+  t.equal(structuredRendererTest.sinkSingleAssignmentSsaDeclarations(
+    escapedInlineResult), escapedInlineResult,
+  'const sinking keeps an inlined result visible to its outer consumer');
+  const localResult = [
+    'let ssaValue14;',
+    '{',
+    '  ssaValue14 = 9;',
+    '  helpers.consume(ssaValue14);',
+    '}',
+  ].join('\n');
+  const sunkLocalResult = structuredRendererTest
+    .sinkSingleAssignmentSsaDeclarations(localResult);
+  t.notOk(sunkLocalResult.includes('let ssaValue14;'),
+    'the AST transform removes a declaration whose uses stay in the block');
+  t.ok(sunkLocalResult.includes('const ssaValue14 = 9;'),
+    'the definition becomes a block-local const');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    sunkLocalResult), [], 'the sunk declaration remains lexically valid');
+
+  const guardedEscapedResult = [
+    'let ssaValue54;',
+    'if (helpers.guard()) {',
+    '  {',
+    '    const inlineValue1 = 11;',
+    '    ssaValue54 = inlineValue1;',
+    '  }',
+    '}',
+    'if (ssaValue54 !== undefined) helpers.consume(ssaValue54);',
+  ].join('\n');
+  t.equal(structuredRendererTest.sinkSingleAssignmentSsaDeclarations(
+    guardedEscapedResult), guardedEscapedResult,
+  'conditional inline results remain declared outside their defining branch');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    guardedEscapedResult), [],
+  'the Safari-style missing-variable shape remains lexically bound');
   t.end();
 });
 
@@ -8852,6 +8897,20 @@ public class DirectIntegerInlineHarness {
     'computeScopedGuarded', '([I)V', [structuredOut]);
   t.equal(structuredOut[0], scopedGuardedExpected,
     'structured callers evaluate inline temporaries before dependent guards');
+  const structuredMethod = await structuredJvm.findMethodInHierarchy(
+    'DirectIntegerInlineHarness', 'computeScopedGuarded', '([I)V');
+  const structuredGenerated = structuredJvm.jit.codegenCache.get(
+    structuredMethod);
+  const optionalSsaSources = Object.entries(structuredGenerated || {})
+    .filter(([name, source]) => name.endsWith('Source') &&
+      name !== 'jvmStructuredSource' && typeof source === 'string' &&
+      source.includes('ssa'));
+  t.ok(optionalSsaSources.length > 0,
+    'the fixture emits at least one optional positional SSA source');
+  t.deepEqual(optionalSsaSources.flatMap(([name, source]) =>
+    structuredRendererTest.unboundGeneratedSsaIdentifiers(source)
+      .map((identifier) => `${name}:${identifier}`)), [],
+  'every installed optional positional source passes the final AST scope audit');
 
   jvm.debugManager.addBreakpoint(0, { className: 'DirectIntegerLeafTarget' });
   const debugOut = [0];
@@ -10338,6 +10397,56 @@ public class GeneratedLoopConstructorHarness {
     }
   }
 
+  static class RethrowingValues extends Base {
+    int sum;
+
+    RethrowingValues(int[] values) {
+      for (int i = 0; i < values.length; i++) {
+        try {
+          sum += values[i];
+        } catch (RuntimeException error) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  static class ProtectedCallingValues extends Base {
+    int sum;
+
+    int read(int[] values, int index) {
+      return values[index];
+    }
+
+    ProtectedCallingValues(int[] values) {
+      for (int i = 0; i < values.length; i++) {
+        try {
+          sum += read(values, i);
+        } catch (RuntimeException error) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  static class ReferenceValues extends Base {
+    int count;
+
+    ReferenceValues(Object[] values) {
+      for (int i = 0; i < values.length; i++) {
+        if (values[i] != null) count++;
+      }
+    }
+
+    static int count(Object[] values) {
+      int result = 0;
+      for (int i = 0; i < values.length; i++) {
+        if (values[i] != null) result++;
+      }
+      return result;
+    }
+  }
+
   static class NestedAllocation extends Base {
     Object marker;
 
@@ -10391,6 +10500,114 @@ public class GeneratedLoopConstructorHarness {
     'the hot constructor uses the structured SSA body');
   t.ok(jvm.jit.codegenCache.get(forwardingConstructor)?.jvmStructuredSsa,
     'the superclass forwarding call stays generated');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$RethrowingValues');
+  const rethrowingConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$RethrowingValues', '<init>', '([I)V');
+  const rethrowingItems = jvm.jit.getCodeItems(rethrowingConstructor);
+  t.ok(rethrowingConstructor.attributes.find((attribute) =>
+    attribute.type === 'code').code.exceptionTable.length > 0,
+  'the fixture retains a protected constructor loop');
+  t.ok(jvm.jit.hasOnlyNoOpExceptionHandlers(
+    rethrowingConstructor, rethrowingItems),
+  'its handlers are structurally proven to only rethrow');
+  t.ok(jvm.jit.isJitSafeConstructor(rethrowingConstructor),
+    'a protected loop constructor with rethrow-only handlers is admitted');
+  t.ok(jvm.jit.isCodegenSupported(rethrowingConstructor),
+    'the protected constructor can use whole-method JavaScript');
+  const rethrowingReceiver = jvm.jit.allocateObject(
+    'GeneratedLoopConstructorHarness$RethrowingValues');
+  await invoke(jvm, thread,
+    'GeneratedLoopConstructorHarness$RethrowingValues', '<init>', '([I)V',
+    [rethrowingReceiver, [3, 5, 7, 11]]);
+  t.equal(rethrowingReceiver.fields[
+    'GeneratedLoopConstructorHarness$RethrowingValues.sum'], 26,
+  'the generated protected constructor preserves its loop effects');
+  t.ok(jvm.jit.codegenCache.get(rethrowingConstructor)?.jvmStructuredSsa,
+    'the protected constructor executes through structured SSA');
+  const coldBaseline = jvm.jit.compileBaselineMethod(rethrowingConstructor);
+  t.notOk(coldBaseline.jvmStructuredSsa,
+    'a cold baseline body represents compilation before dependencies settle');
+  jvm.jit.codegenCache.set(rethrowingConstructor, coldBaseline);
+  jvm.jit.invocationCounts.set(rethrowingConstructor, 8);
+  const coldConstructorEntry = jvm.jit.getGeneratedFunction(
+    rethrowingConstructor);
+  t.equal(coldConstructorEntry, coldBaseline,
+    'the active call retains its stable baseline entry during promotion');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const upgradedConstructor = jvm.jit.codegenCache.get(
+    rethrowingConstructor);
+  t.ok(upgradedConstructor?.jvmStructuredSsa,
+    'a hot protected loop constructor upgrades at a JavaScript safe point');
+  t.equal(jvm.jit.structuredConstructorUpgradeCount, 1,
+    'the successful structural upgrade is recorded once');
+
+  const positionalBaseline = jvm.jit.compileBaselineMethod(
+    rethrowingConstructor);
+  const positionalBody = () => undefined;
+  const compileStructured = jvm.jit.structuredSsa.compile;
+  jvm.jit.structuredSsa.compile = () => ({
+    jvmStructuredRequiresBaselineFramedEntry: true,
+    jvmRestoringDirectPositionalBody: positionalBody,
+    jvmRestoringDirectPositionalSource: 'return undefined;',
+  });
+  jvm.jit.codegenCache.set(rethrowingConstructor, positionalBaseline);
+  jvm.jit.structuredConstructorRetryState.delete(rethrowingConstructor);
+  jvm.jit.invocationCounts.set(rethrowingConstructor, 8);
+  const upgradedPositionalConstructor = jvm.jit.getGeneratedFunction(
+    rethrowingConstructor);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  jvm.jit.structuredSsa.compile = compileStructured;
+  t.equal(upgradedPositionalConstructor, positionalBaseline,
+    'the active protected call retains its baseline frame entry');
+  const upgradedPositionalCache = jvm.jit.codegenCache.get(
+    rethrowingConstructor);
+  t.equal(upgradedPositionalCache.jvmRestoringDirectPositionalBody,
+    positionalBody,
+  'the safe-point upgrade augments its structured positional entry');
+  t.equal(jvm.jit.structuredConstructorUpgradeCount, 2,
+    'the positional structural upgrade is recorded once');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$ProtectedCallingValues');
+  const protectedCallingConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$ProtectedCallingValues', '<init>',
+    '([I)V');
+  const protectedCallingStructured = jvm.jit.structuredSsa.compile(
+    protectedCallingConstructor);
+  t.ok(protectedCallingStructured?.jvmStructuredRequiresBaselineFramedEntry,
+    'a protected non-void child call retains the baseline Frame entry');
+  t.equal(typeof protectedCallingStructured.jvmRestoringDirectPositionalBody,
+    'function',
+  'its verified direct-super call remains valid in the restoring entry');
+  const protectedCallingSelected = jvm.jit.compileMethod(
+    protectedCallingConstructor);
+  t.equal(typeof protectedCallingSelected.jvmRestoringDirectPositionalBody,
+    'function',
+  'tier selection preserves the constructor restoring entry');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$ReferenceValues');
+  const referenceConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$ReferenceValues', '<init>',
+    '([Ljava/lang/Object;)V');
+  const referenceStructured = jvm.jit.structuredSsa.compile(
+    referenceConstructor);
+  t.equal(typeof referenceStructured?.jvmRestoringDirectPositionalBody,
+    'function',
+  'reference-array loads are admitted by the verified constructor proof');
+  const referenceCounter = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$ReferenceValues', 'count',
+    '([Ljava/lang/Object;)I');
+  const referenceCounterStructured = jvm.jit.structuredSsa.compile(
+    referenceCounter);
+  t.equal(referenceCounterStructured?.jvmRestoringDirectPositionalBody, null,
+    'the same reference-array load stays outside an ordinary restoring ABI');
+  t.ok(String(referenceCounterStructured
+    ?.jvmStructuredRestoringDirectRejection).includes(
+      'reference-array load outside a verified constructor'),
+  'the structural rejection reports the bounded capability gate');
 
   await jvm.loadClassByName(
     'GeneratedLoopConstructorHarness$NestedAllocation');

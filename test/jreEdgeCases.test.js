@@ -38,6 +38,26 @@ const Random = require('../src/jre/java/util/Random');
 const Collectors = require('../src/jre/java/util/stream/Collectors');
 const Stream = require('../src/jre/java/util/stream/Stream');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
+
+test('Math.round(double) returns a JVM long with Java edge semantics', (t) => {
+  const jvm = new JVM({verbose: false});
+  const round = jvm._jreFindMethod('java/lang/Math', 'round', '(D)J');
+  t.equal(typeof round, 'function', 'the exact double-to-long descriptor resolves through the JVM');
+  t.equal(round(jvm, null, [1.4]), 1n, 'rounds down below the midpoint');
+  t.equal(round(jvm, null, [1.5]), 2n, 'rounds up at a positive midpoint');
+  t.equal(round(jvm, null, [-1.5]), -1n, 'rounds a negative midpoint toward positive infinity');
+  t.equal(round(jvm, null, [-1.6]), -2n, 'rounds down below a negative midpoint');
+  t.equal(round(jvm, null, [NaN]), 0n, 'converts NaN to zero');
+  t.equal(round(jvm, null, [Infinity]), 9223372036854775807n,
+    'saturates positive infinity to Long.MAX_VALUE');
+  t.equal(round(jvm, null, [-Infinity]), -9223372036854775808n,
+    'saturates negative infinity to Long.MIN_VALUE');
+  t.equal(round(jvm, null, [Number.MAX_VALUE]), 9223372036854775807n,
+    'saturates an out-of-range finite double to Long.MAX_VALUE');
+  t.equal(round(jvm, null, [-Number.MAX_VALUE]), -9223372036854775808n,
+    'saturates an out-of-range finite double to Long.MIN_VALUE');
+  t.end();
+});
 const { decodePng } = require('../src/io/gifDecoder');
 const {
   getFileProvider,

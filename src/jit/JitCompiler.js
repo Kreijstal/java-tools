@@ -68,6 +68,10 @@ class JitCompiler {
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
     this.codegenSupportCache = new WeakMap();
+    this.structuredConstructorRetryState = new WeakMap();
+    this.structuredConstructorUpgradePending = new WeakSet();
+    this.structuredConstructorUpgradeCount = 0;
+    this.lastStructuredConstructorUpgrade = null;
     this.adaptiveCodegenSupportCache = new WeakMap();
     this.adaptiveCodegenMethods = new WeakSet();
     this.adaptiveCodegenCounts = new WeakMap();
@@ -769,7 +773,37 @@ class JitCompiler {
       return null;
     }
     if (this.codegenCache.has(method)) {
-      return this.codegenCache.get(method);
+      const cached = this.codegenCache.get(method);
+      // A loop constructor can first execute while one of its call/static
+      // dependencies is still initializing. Structured SSA correctly
+      // declines that cold compilation, but the baseline body must not become
+      // a permanent ceiling after all dependencies resolve. Some protected
+      // methods deliberately retain their baseline Frame entry while exposing
+      // a structured positional entry to verified callers. Either entry is a
+      // useful upgrade over a cold baseline, so retry until one is available.
+      // Retries are bounded and exponentially spaced.
+      if (cached && !cached.jvmStructuredSsa &&
+          !cached.jvmRestoringDirectPositionalBody &&
+          this.structuredSsa.enabled &&
+          this.isJitSafeConstructor(method) && this.hasBackwardBranch(method) &&
+          !this.codegenCompiling.has(method)) {
+        const count = this.invocationCounts.get(method) || 0;
+        const state = this.structuredConstructorRetryState.get(method) || {
+          next: Math.max(8, this.warmupThreshold),
+          delay: 8,
+          attempts: 0,
+        };
+        if (count >= state.next && state.attempts < 16) {
+          this.scheduleStructuredCacheUpgrade(method, cached);
+          state.attempts += 1;
+          state.delay = Math.min(8192, Math.max(8, state.delay * 4));
+          state.next = count + state.delay;
+          this.structuredConstructorRetryState.set(method, state);
+        } else {
+          this.structuredConstructorRetryState.set(method, state);
+        }
+      }
+      return cached;
     }
     if (this.codegenCompiling.has(method)) return null;
     this.codegenCompiling.add(method);
@@ -1150,9 +1184,10 @@ class JitCompiler {
       supportCache.set(method, false);
       return false;
     }
-    if (!allowEffectfulCalls && hasExperimentalControlFlow(codeItems) &&
-      !this.experimentalControlFlow &&
-      !this.hasJitSafeControlFlow(method, codeItems)) {
+    if (!safeConstructor && !allowEffectfulCalls &&
+        hasExperimentalControlFlow(codeItems) &&
+        !this.experimentalControlFlow &&
+        !this.hasJitSafeControlFlow(method, codeItems)) {
       supportCache.set(method, false);
       return false;
     }
@@ -1243,12 +1278,16 @@ class JitCompiler {
       return false;
     }
     const code = method.attributes.find((attribute) => attribute.type === "code");
-    if (!code || (code.code.exceptionTable || []).length !== 0) return false;
+    if (!code) return false;
+    const exceptionTable = code.code.exceptionTable || [];
+    if (exceptionTable.length &&
+        !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return false;
 
     // The only constructor call may initialize this object through its direct
     // superclass. This deliberately excludes allocation/initialization of
-    // nested objects, this(...) chains, and try/finally construction shapes.
-    // Those retain the canonical interpreter path.
+    // nested objects, this(...) chains, and effectful recovery/finally
+    // construction shapes. Bare or wrap-and-rethrow diagnostic handlers are
+    // admitted by the proof above because they do not alter normal flow.
     const instructions = codeItems
       .map((item) => item && item.instruction)
       .filter(Boolean);
@@ -1539,16 +1578,8 @@ class JitCompiler {
         // frame PCs. This split is structural and independent of guest names.
         const baseline = this.compileBaselineMethod(method, inlineLoopRegions);
         if (baseline) {
-          baseline.jvmStructuredPositionalOnly = true;
-          baseline.jvmRestoringDirectPositionalBody =
-            structuredSsa.jvmRestoringDirectPositionalBody;
-          baseline.jvmRestoringDirectPositionalSource =
-            structuredSsa.jvmRestoringDirectPositionalSource;
-          if (structuredSsa.jvmRestoringDirectPositionalPlan) {
-            baseline.jvmRestoringDirectPositionalPlan =
-              structuredSsa.jvmRestoringDirectPositionalPlan;
-          }
-          return baseline;
+          return this.attachStructuredPositionalEntry(
+            baseline, structuredSsa);
         }
       }
       return this.withResumeBody(structuredSsa, method);
@@ -1571,6 +1602,67 @@ class JitCompiler {
     if (stackless) return this.withResumeBody(stackless, method);
 
     return this.compileBaselineMethod(method, inlineLoopRegions);
+  }
+
+  attachStructuredPositionalEntry(baseline, structured) {
+    if (!baseline || !structured?.jvmRestoringDirectPositionalBody) {
+      return baseline;
+    }
+    baseline.jvmStructuredPositionalOnly = true;
+    baseline.jvmRestoringDirectPositionalBody =
+      structured.jvmRestoringDirectPositionalBody;
+    baseline.jvmRestoringDirectPositionalSource =
+      structured.jvmRestoringDirectPositionalSource;
+    if (structured.jvmRestoringDirectPositionalPlan) {
+      baseline.jvmRestoringDirectPositionalPlan =
+        structured.jvmRestoringDirectPositionalPlan;
+    }
+    return baseline;
+  }
+
+  scheduleStructuredCacheUpgrade(method, cached) {
+    if (this.structuredConstructorUpgradePending.has(method)) return;
+    this.structuredConstructorUpgradePending.add(method);
+    const upgrade = () => {
+      this.structuredConstructorUpgradePending.delete(method);
+      if (this.codegenCache.get(method) !== cached ||
+          this.codegenCompiling.has(method)) return;
+      this.codegenCompiling.add(method);
+      try {
+        const structured = this.structuredSsa.compile(method);
+        this.lastStructuredConstructorUpgrade = {
+          structured: Boolean(structured?.jvmStructuredSsa),
+          direct: Boolean(structured?.jvmDirectPositionalBody),
+          positional: Boolean(structured?.jvmRestoringDirectPositionalBody),
+          requiresBaseline: Boolean(
+            structured?.jvmStructuredRequiresBaselineFramedEntry),
+          rejection: this.structuredSsa.lastRejectionReason || null,
+          restoringRejection:
+            structured?.jvmStructuredRestoringDirectRejection || null,
+          astRejections:
+            structured?.jvmStructuredPositionalAstRejections || [],
+          error: this.structuredSsa.lastCompileError
+            ? String(this.structuredSsa.lastCompileError.message ||
+              this.structuredSsa.lastCompileError) : null,
+        };
+        const upgraded = structured?.jvmStructuredRequiresBaselineFramedEntry
+          ? this.attachStructuredPositionalEntry(cached, structured)
+          : structured ? this.withResumeBody(structured, method) : null;
+        if (upgraded?.jvmStructuredSsa ||
+            upgraded?.jvmRestoringDirectPositionalBody) {
+          this.codegenCache.set(method, upgraded);
+          this.structuredConstructorRetryState.delete(method);
+          this.structuredConstructorUpgradeCount += 1;
+        }
+      } catch (error) {
+        this.codegenCompileErrors.set(method, error);
+      } finally {
+        this.codegenCompiling.delete(method);
+      }
+    };
+    if (typeof setTimeout === "function") setTimeout(upgrade, 0);
+    else if (typeof queueMicrotask === "function") queueMicrotask(upgrade);
+    else Promise.resolve().then(upgrade);
   }
 
   compileInlinePrimitiveLoopRegions(method) {

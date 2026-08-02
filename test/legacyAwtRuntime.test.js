@@ -3,6 +3,7 @@
 const test = require('tape');
 const Stack = require('../src/core/stack');
 const Applet = require('../src/jre/java/applet/Applet');
+const Canvas = require('../src/jre/java/awt/Canvas');
 const CardLayout = require('../src/jre/java/awt/CardLayout');
 const Color = require('../src/jre/java/awt/Color');
 const Component = require('../src/jre/java/awt/Component');
@@ -405,6 +406,26 @@ test('Applet backdrop remains visible inside its stacking context', (t) => {
     t.equal(root.style.zIndex, '0');
     t.equal(applet._canvasElement.style.zIndex, '-1');
     t.ok(root.contains(applet._canvasElement));
+  } finally {
+    global.document = oldDocument;
+  }
+  t.end();
+});
+
+test('java.awt.Canvas attaches modern browser input to its visible surface', (t) => {
+  const oldDocument = global.document;
+  global.document = {
+    createElement: (tagName) => {
+      const created = element(tagName);
+      if (tagName === 'canvas') created.getContext = () => ({});
+      return created;
+    },
+  };
+  try {
+    const component = {};
+    Canvas.methods['<init>()V']({}, component, []);
+    t.ok(component._canvasElement._jvmAwtInputAttached,
+      'the concrete canvas receives the modern listener bridge');
   } finally {
     global.document = oldDocument;
   }

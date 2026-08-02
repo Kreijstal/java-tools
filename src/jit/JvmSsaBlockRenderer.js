@@ -190,6 +190,106 @@ function unboundGeneratedSsaIdentifiers(source) {
   return [...unbound];
 }
 
+function sinkSingleAssignmentSsaDeclarations(source) {
+  if (typeof source !== "string" || source.length === 0) return source;
+  const parsed = parseGeneratedStatements(source);
+  const nodeScopes = new WeakMap();
+  const scopeParents = new WeakMap();
+  const declarations = new Map();
+  const assignments = new Map();
+  const declarationIdentifiers = new WeakSet();
+  const assignmentTargets = new WeakSet();
+  const reads = new Map();
+  const children = (node) => Object.entries(node).flatMap(([key, child]) => {
+    if (key === "start" || key === "end" || key === "loc" ||
+        key === "range") return [];
+    if (Array.isArray(child)) {
+      return child.filter((entry) => entry && typeof entry.type === "string");
+    }
+    return child && typeof child.type === "string" ? [child] : [];
+  });
+  const index = (node, parent = null, scope = null) => {
+    if (!node || typeof node !== "object") return;
+    let activeScope = scope;
+    if (node.type === "BlockStatement") {
+      activeScope = node;
+      scopeParents.set(activeScope, scope);
+    }
+    nodeScopes.set(node, activeScope);
+    if (node.type === "VariableDeclaration" && node.kind === "let" &&
+        node.declarations.length === 1) {
+      const declarator = node.declarations[0];
+      if (declarator.id?.type === "Identifier" && !declarator.init &&
+          declarator.id.name.startsWith("ssaValue")) {
+        declarationIdentifiers.add(declarator.id);
+        declarations.set(declarator.id.name, {statement: node, scope: activeScope});
+      }
+    } else if (node.type === "ExpressionStatement" &&
+        node.expression?.type === "AssignmentExpression" &&
+        node.expression.operator === "=" &&
+        node.expression.left?.type === "Identifier" &&
+        node.expression.left.name.startsWith("ssaValue")) {
+      const name = node.expression.left.name;
+      assignmentTargets.add(node.expression.left);
+      const values = assignments.get(name) || [];
+      values.push({
+        statement: node,
+        expression: node.expression.right,
+        scope: activeScope,
+        parent,
+      });
+      assignments.set(name, values);
+    }
+    for (const child of children(node)) index(child, node, activeScope);
+  };
+  index(parsed.program);
+  walkJavaScriptAst(parsed.program, (node, parent) => {
+    if (node.type !== "Identifier" || !node.name.startsWith("ssaValue") ||
+        declarationIdentifiers.has(node) || assignmentTargets.has(node)) return;
+    if (parent?.type === "MemberExpression" && parent.property === node &&
+        !parent.computed) return;
+    if ((parent?.type === "Property" || parent?.type === "MethodDefinition") &&
+        parent.key === node && !parent.computed && !parent.shorthand) return;
+    const values = reads.get(node.name) || [];
+    values.push({node, scope: nodeScopes.get(node)});
+    reads.set(node.name, values);
+  });
+  const scopeContains = (outer, inner) => {
+    for (let scope = inner; scope; scope = scopeParents.get(scope)) {
+      if (scope === outer) return true;
+    }
+    return false;
+  };
+  const edits = [];
+  for (const [name, declaration] of declarations) {
+    const writes = assignments.get(name) || [];
+    const uses = reads.get(name) || [];
+    if (writes.length !== 1 || uses.length === 0) continue;
+    const assignment = writes[0];
+    if (assignment.parent?.type !== "BlockStatement" || !assignment.scope ||
+        uses.some((use) => use.node.start <= assignment.statement.end ||
+          !scopeContains(assignment.scope, use.scope))) continue;
+    const rhsStart = assignment.expression.start - parsed.offset;
+    const rhsEnd = assignment.expression.end - parsed.offset;
+    edits.push({
+      start: declaration.statement.start - parsed.offset,
+      end: declaration.statement.end - parsed.offset,
+      replacement: "",
+    }, {
+      start: assignment.statement.start - parsed.offset,
+      end: assignment.statement.end - parsed.offset,
+      replacement: `const ${name} = ${source.slice(rhsStart, rhsEnd)};`,
+    });
+  }
+  edits.sort((left, right) => right.start - left.start || right.end - left.end);
+  let rewritten = source;
+  for (const edit of edits) {
+    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
+      rewritten.slice(edit.end);
+  }
+  return rewritten;
+}
+
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
   switch (op) {
     case "baload":
@@ -8109,14 +8209,16 @@ class JvmSsaBlockRenderer {
       "dup", "dup2", "pop",
       "aload", "aload_0", "aload_1", "aload_2", "aload_3",
       "astore", "astore_0", "astore_1", "astore_2", "astore_3",
-      "getfield",
+      "getfield", "putfield",
       "putstatic",
+      "i2d", "d2i",
+      "newarray",
       "arraylength",
-      "iaload", "saload", "baload", "caload",
+      "iaload", "saload", "baload", "caload", "aaload",
       "iastore", "sastore", "bastore", "castore",
       "ifnull", "ifnonnull", "if_acmpeq", "if_acmpne",
       "idiv", "irem",
-      "invokestatic", "invokevirtual",
+      "invokestatic", "invokevirtual", "invokeinterface", "invokespecial",
       "return",
     ]);
     const directPrimitiveDescriptors = new Set([
@@ -8136,7 +8238,6 @@ class JvmSsaBlockRenderer {
         process.env.JVM_DISABLE_EFFECTFUL_FIELD_POSITIONAL === "1");
     let restoringDirectRejection = null;
     let restoringDirectPositionalEligible = Boolean(
-      !directPositionalEligible &&
       directMethodDescriptor &&
       (directMethodDescriptor.returnType === "void" ||
         directIntegralTypes.has(directMethodDescriptor.returnType)) &&
@@ -8148,9 +8249,8 @@ class JvmSsaBlockRenderer {
           cache.eagerLocal !== null && cache.eagerLocal !== undefined)),
     );
     if (!restoringDirectPositionalEligible) {
-      restoringDirectRejection = directPositionalEligible
-        ? "non-restoring direct entry already selected"
-        : "descriptor, owner, return type, or field-cache shape";
+      restoringDirectRejection =
+        "descriptor, owner, return type, or field-cache shape";
     }
     for (let index = 0;
       index < items.length && restoringDirectPositionalEligible;
@@ -8164,6 +8264,20 @@ class JvmSsaBlockRenderer {
         restoringDirectRejection = `unsupported normal opcode ${op} at ${index}`;
         break;
       }
+      if (op === "invokespecial" &&
+          !this.jit.isJitSafeConstructor(method, items)) {
+        restoringDirectPositionalEligible = false;
+        restoringDirectRejection =
+          `unverified special invocation at ${index}`;
+        break;
+      }
+      if (op === "aaload" &&
+          !this.jit.isJitSafeConstructor(method, items)) {
+        restoringDirectPositionalEligible = false;
+        restoringDirectRejection =
+          `reference-array load outside a verified constructor at ${index}`;
+        break;
+      }
       if ((op === "ldc" || op === "ldc_w") &&
           !Number.isInteger(Number(instruction.arg?.value ?? instruction.arg))) {
         restoringDirectPositionalEligible = false;
@@ -8173,13 +8287,18 @@ class JvmSsaBlockRenderer {
       if (op === "getfield") {
         const site = fieldSites.get(index);
         const plan = site === undefined ? null : this.jit.fieldSites[site];
-        const cache = fieldReadCacheSites.get(index);
-        if (!plan || !directPrimitiveDescriptors.has(plan.descriptor) ||
-            !cache?.directKey ||
+        const scalarOrReference = plan &&
+          (directPrimitiveDescriptors.has(plan.descriptor) ||
+            referenceStaticPositionalEnabled &&
+            typeof plan.descriptor === "string" &&
+            (plan.descriptor.startsWith("L") ||
+              plan.descriptor.startsWith("[")));
+        if (!scalarOrReference ||
             (!effectfulFieldPositionalEnabled &&
-              (cache.eagerLocal === null || cache.eagerLocal === undefined))) {
+              !fieldReadCacheSites.get(index)?.directKey)) {
           restoringDirectPositionalEligible = false;
-          restoringDirectRejection = `unresolved primitive instance field at ${index}`;
+          restoringDirectRejection =
+            `unsupported primitive instance field at ${index}`;
           break;
         }
       }
@@ -8451,39 +8570,12 @@ class JvmSsaBlockRenderer {
         lines = lines.filter(Boolean);
       }
 
-      // Turn a separately declared, singly assigned load result into a const
-      // at its definition point. This shortens its live range and removes one
-      // bytecode/register pair without moving the potentially throwing load.
-      for (;;) {
-        const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
-        let changed = false;
-        for (let declarationIndex = 0;
-          declarationIndex < lines.length; declarationIndex += 1) {
-          if (inlineIndexes.has(declarationIndex)) continue;
-          const declaration =
-            /^\s*let (ssaValue\d+);$/.exec(lines[declarationIndex]);
-          if (!declaration || counts.get(declaration[1]) !== 3) continue;
-          const assignmentPattern = new RegExp(
-            `^(\\s*)${declaration[1]} = (.+);$`);
-          const assignmentIndexes = [];
-          for (let index = declarationIndex + 1; index < lines.length; index += 1) {
-            if (assignmentPattern.test(lines[index])) assignmentIndexes.push(index);
-          }
-          if (assignmentIndexes.length !== 1 ||
-              inlineIndexes.has(assignmentIndexes[0])) continue;
-          const earlyUse = new RegExp(`\\b${declaration[1]}\\b`);
-          if (lines.slice(declarationIndex + 1, assignmentIndexes[0])
-            .some((line) => earlyUse.test(line))) continue;
-          const assignment = assignmentPattern.exec(lines[assignmentIndexes[0]]);
-          lines[declarationIndex] = '';
-          lines[assignmentIndexes[0]] =
-            `${assignment[1]}const ${declaration[1]} = ${assignment[2]};`;
-          changed = true;
-        }
-        if (!changed) break;
-        lines = lines.filter(Boolean);
-      }
+      // Turn a separately declared, singly assigned result into a const at its
+      // definition point. The AST proof keeps the declaration outside when a
+      // later use escapes the assignment's lexical block (for example, an
+      // inlined leaf result consumed after its wrapper block).
+      lines = sinkSingleAssignmentSsaDeclarations(lines.join("\n"))
+        .split("\n").filter(Boolean);
       lines = lines.map((line) => line.replace(
         /if \(!\((.+) !== (.+)\)\) \{/,
         'if ($1 === $2) {'));
@@ -8765,7 +8857,25 @@ class JvmSsaBlockRenderer {
     const body = buildBody(renderedTree);
     const generatedSource = body.join("\n");
     try {
+      const positionalAstRejections = [];
       const createStructuredFunction = (tier, parameters, source, ...options) => {
+        // Optional positional tiers are assembled from independently optimized
+        // regions (ordinary blocks, cold restoration edges, and inlined
+        // callees).  A declaration can therefore become lexically narrower
+        // than one of its surviving uses even though the JavaScript parser
+        // accepts the function.  Never install such a tier: the canonical
+        // framed structured body remains the semantics-preserving fallback.
+        // Audit the final AST, after every specialization, so this protects
+        // every method shape without recognizing guest classes or methods.
+        const unbound = unboundGeneratedSsaIdentifiers(source);
+        if (unbound.length) {
+          if (tier === "structured-ssa") {
+            throw new Error(
+              `unbound structured SSA identifiers: ${unbound.join(", ")}`);
+          }
+          positionalAstRejections.push({ tier, unbound });
+          return null;
+        }
         return this.jit.createGeneratedFunction(
           method, tier, parameters, source, ...options);
       };
@@ -8879,7 +8989,12 @@ class JvmSsaBlockRenderer {
       let captureFreeRestoringSpills = false;
       let outlinedCaptureFreeRestoringSpills = false;
       let restoringFrameSlotCount = 0;
-      if (restoringDirectPositionalEligible) {
+      // The preferred direct entry can still be rejected by the final AST
+      // scope audit after specialization. Prove restoring eligibility
+      // independently above and emit it only when no direct body survived,
+      // so a valid fallback is not lost because an earlier candidate existed.
+      if (restoringDirectPositionalEligible &&
+          (requiresBaselineFramedEntry || !directPositionalBody)) {
         // A restoring entry is an already-verified synchronous intermethod
         // region. Give it a larger scalar quantum than a scheduler-owned
         // Frame: nested calls retain their own guards and safe points, while
@@ -10378,10 +10493,13 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredCountedLoopCount = countedLoopInfos.size;
       generated.jvmStructuredSafePointBudget = safePointInitialBudget;
       generated.jvmStructuredRestoringDirectSafePointBudget =
-        restoringDirectPositionalEligible
+        restoringDirectPositionalBody
           ? Math.min(1_000_000, safePointInitialBudget *
             this.restoringDirectBudgetMultiplier)
           : 0;
+      generated.jvmStructuredRestoringDirectRejection =
+        restoringDirectPositionalEligible ? null : restoringDirectRejection;
+      generated.jvmStructuredPositionalAstRejections = positionalAstRejections;
       generated.jvmStructuredLoopWorkEstimate = loopWorkEstimate;
       generated.jvmStructuredAtomicBoundedLoops = atomicBoundedLoops;
       generated.jvmStructuredBoundedIterationProduct =
@@ -10413,5 +10531,6 @@ class JvmSsaBlockRenderer {
 module.exports = JvmSsaBlockRenderer;
 module.exports._test = {
   isIrreducibleError,
+  sinkSingleAssignmentSsaDeclarations,
   unboundGeneratedSsaIdentifiers,
 };
