@@ -8669,6 +8669,10 @@ class DirectIntegerLeafTarget {
   static int transform(int value) {
     return ((value + 7) * 3) ^ (value >>> 5);
   }
+  static int guarded(int value) {
+    if ((value & 63) == 63) return "abc".length() + value;
+    return value * 3;
+  }
 }
 public class DirectIntegerInlineHarness {
   public static void compute(int[] out) {
@@ -8677,6 +8681,11 @@ public class DirectIntegerInlineHarness {
       value = DirectIntegerLeafTarget.transform(value + i);
     }
     out[0] = value;
+  }
+  public static void computeGuarded(int[] out) {
+    int sum = 0;
+    for (int i = 0; i < 128; i++) sum += DirectIntegerLeafTarget.guarded(i);
+    out[0] = sum;
   }
 }
 `);
@@ -8717,6 +8726,18 @@ public class DirectIntegerInlineHarness {
     'generated source contains one structural direct-inline site');
   t.equal(jvm.jit.syncCallSites.filter(Boolean).length, 0,
     'direct inline creates no runtime dispatch call site');
+
+  const guardedOut = [0];
+  guardedOut.type = '[I';
+  await invoke(jvm, thread, 'DirectIntegerInlineHarness',
+    'computeGuarded', '([I)V', [guardedOut]);
+  let guardedExpected = 0;
+  for (let i = 0; i < 128; i++) {
+    guardedExpected = (guardedExpected +
+      ((i & 63) === 63 ? i + 3 : Math.imul(i, 3))) | 0;
+  }
+  t.equal(guardedOut[0], guardedExpected,
+    'failed direct-inline guards resume the canonical helper at the invoke');
 
   jvm.debugManager.addBreakpoint(0, { className: 'DirectIntegerLeafTarget' });
   const debugOut = [0];

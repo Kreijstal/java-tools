@@ -3570,10 +3570,18 @@ class JitCompiler {
           if (directInline) {
             this.compileDirectInlineCount += 1;
             const base = `inlineBase${this.compileDirectInlineCount}`;
+            const substituteBase = (source) => source.split("base").join(base);
             const statements = directInline.statements
-              .map((line) => line.split("base").join(base)).join(" ");
-            const result = directInline.result.split("base").join(base);
-            return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
+              .map(substituteBase).join(" ");
+            const result = substituteBase(directInline.result);
+            const guard = directInline.guards?.length
+              ? directInline.guards.map((condition) =>
+                `(${substituteBase(condition)})`).join(" && ")
+              : null;
+            const guardFailure = guard
+              ? `if (!(${guard})) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "guarded direct integer inline" }; }`
+              : "";
+            return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} ${guardFailure} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
           }
           const callSiteId = this.registerSyncCallSite(op, instruction);
           return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
