@@ -105,7 +105,7 @@ module.exports = {
               const { runFrame } = require('../awt/legacyEvents');
               await runFrame(jvm, clickFrame, {
                 thread: currentThread,
-                maxIterations: 1000,
+                maxIterations: 500000,
                 label: `${obj.type}.handleClick`,
               });
             }

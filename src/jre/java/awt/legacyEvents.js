@@ -7,6 +7,7 @@
 // their boolean result so the bubbling can stop once the event is handled.
 
 const Frame = require('../../../core/frame');
+const IntegerClass = require('../lang/Integer');
 
 const ACTION_EVENT = 1001;
 const MOUSE_DOWN = 501;
@@ -228,8 +229,10 @@ async function postMouseEvent(jvm, source, id, x, y, modifiers = 0, clickCount =
 /**
  * Post a legacy scroll event (SCROLL_ABSOLUTE 605 etc.) from a scrollbar.
  */
-async function postScrollEvent(jvm, source, id) {
-  const evt = makeEvent({ id, target: source, arg: source });
+async function postScrollEvent(jvm, source, id, value) {
+  const arg = IntegerClass.staticMethods['valueOf(I)Ljava/lang/Integer;'](
+    jvm, null, [value | 0]);
+  const evt = makeEvent({ id, target: source, arg });
   return enqueueLegacyDispatch(jvm, () => postEvent(jvm, source, evt));
 }
 

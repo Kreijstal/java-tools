@@ -154,6 +154,34 @@ test('legacy guest calls restore reflective state and browser posts serialize', 
   t.equal(maximumActiveLookups, 1,
     'browser-originated legacy events do not overlap on the shared thread');
 
+  let scrollEvent = null;
+  const scrollThread = { callStack: new Stack(), status: 'runnable' };
+  const scrollMethod = {
+    name: 'handleEvent',
+    attributes: [{ type: 'code', code: {
+      localsSize: '2', stackSize: '1', codeItems: [], exceptionTable: [],
+    } }],
+  };
+  const scrollJvm = {
+    threads: [scrollThread],
+    currentThreadIndex: 0,
+    async findMethodInHierarchy() { return scrollMethod; },
+    async executeTick() {
+      const frame = scrollThread.callStack.peek();
+      scrollEvent = frame.locals[1];
+      scrollThread.callStack.pop();
+      scrollThread.reflectiveCallResolver(0);
+      return { completed: false };
+    },
+  };
+  const scrollbar = { type: 'java/awt/Scrollbar', _parent: null };
+  await legacyEvents.postScrollEvent(scrollJvm, scrollbar, 605, 37);
+  t.equal(scrollEvent.target, scrollbar,
+    'legacy scroll events retain the scrollbar as their target');
+  t.equal(scrollEvent.arg.type, 'java/lang/Integer');
+  t.equal(scrollEvent.arg.value, 37,
+    'legacy scroll events box the current scrollbar value as their argument');
+
   const originalNow = Date.now;
   Date.now = () => 4242;
   try {
@@ -291,7 +319,7 @@ test('legacy text, color, and primitive string contracts are preserved', (t) => 
   t.equal(StringClass.staticMethods['valueOf(D)Ljava/lang/String;'](
     jvm, null, [0]), '0.0');
   t.equal(StringClass.staticMethods['valueOf(D)Ljava/lang/String;'](
-    jvm, null, [5e-324]), '5E-324');
+    jvm, null, [5e-324]), '4.9E-324');
   t.end();
 });
 

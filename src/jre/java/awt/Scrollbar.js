@@ -15,7 +15,7 @@ const dispatchAdjustmentEvent = async (jvm, source, listener) => {
   const { runFrame } = require('./legacyEvents');
   await runFrame(jvm, eventFrame, {
     thread: currentThread,
-    maxIterations: 1000,
+    maxIterations: 500000,
     label: `${listener.type}.adjustmentValueChanged`,
   });
 };
@@ -57,7 +57,7 @@ module.exports = {
           }
           // Legacy pre-1.1 model: post SCROLL_ABSOLUTE up the hierarchy.
           const { postScrollEvent } = require('./legacyEvents');
-          postScrollEvent(jvm, obj, 605).catch((error) => {
+          postScrollEvent(jvm, obj, 605, obj._value).catch((error) => {
             console.error('AWT Scrollbar legacy dispatch failed:', error);
           }); // Event.SCROLL_ABSOLUTE
         });
