@@ -126,6 +126,41 @@ L21: areturn
 .end class
 `;
 
+const BRANCHED_REFERENCE_ARRAY_ARGUMENT = `.version 52 0
+.class public super BranchedReferenceArrayArgument
+.super java/lang/Object
+
+.method public static consume : ([Ljava/lang/String;)Ljava/lang/String;
+    .code stack 2 locals 1
+L0: aload_0
+L1: iconst_0
+L2: aaload
+L3: areturn
+    .end code
+.end method
+
+.method public static call : (Z)Ljava/lang/String;
+    .code stack 4 locals 1
+L10: iconst_1
+L11: anewarray java/lang/String
+L14: dup
+L15: iconst_0
+L16: iload_0
+L17: ifeq L26
+L20: goto L24
+L23: athrow
+L24: ldc "enabled"
+L25: goto L28
+L27: athrow
+L26: ldc "disabled"
+L28: aastore
+L29: invokestatic Method BranchedReferenceArrayArgument consume ([Ljava/lang/String;)Ljava/lang/String;
+L32: areturn
+    .end code
+.end method
+.end class
+`;
+
 const INLINE_PRIMITIVE_ARRAY_STORE = `.version 52 0
 .class public super InlinePrimitiveArrayStore
 .super java/lang/Object
@@ -452,6 +487,23 @@ test('dup-filled reference arrays retain their elements when passed directly to 
       'direct call argument includes the value recorded by aastore');
     t.notOk(/consume\(new String\[1\]\)/.test(source),
       'direct call argument is not emitted as a null-filled allocation');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('dup-filled reference arrays retain identity across a conditional value branch', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-branched-array-argument-'));
+  try {
+    const source = decompileFixture(tempDir, 'BranchedReferenceArrayArgument',
+      BRANCHED_REFERENCE_ARRAY_ARGUMENT);
+    const allocations = source.match(/new String(?:\[1\]|\[\]\{)/g) || [];
+
+    t.equal(allocations.length, 1, 'the duplicated operand stack reference is allocated once');
+    t.notOk(
+      /String\[] ([A-Za-z_$][A-Za-z0-9_$]*) = new String\[1\];[\s\S]*String\[] [A-Za-z_$][A-Za-z0-9_$]* = new String\[1\]/.test(source),
+      'the conditional store and following call do not receive separate allocations');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

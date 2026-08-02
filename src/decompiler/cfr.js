@@ -3718,6 +3718,22 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     else if (op === 'tableswitch' || op === 'lookupswitch') pop(exitStack);
     if (exitStack.some((value) => value.code.includes('stack-underflow'))) throw new Error('stack dataflow underflow');
 
+    // A dup-filled array can remain live in two operand-stack slots when a
+    // conditional splits the basic block before the element store. Rendering
+    // each outgoing slot independently would turn the one JVM allocation into
+    // two `new T[n]` expressions. Spill the shared expression once while its
+    // object identity is still visible; successor carriers then copy the same
+    // Java reference even though their expression metadata is reconstructed.
+    const exitValueCounts = new Map();
+    for (const value of exitStack) {
+      exitValueCounts.set(value, (exitValueCounts.get(value) || 0) + 1);
+    }
+    for (const [value, count] of exitValueCounts) {
+      if (!value || count < 2 || (!value.newArraySpill && !value.arrayLiteral) ||
+          !/^new\b/.test(value.code)) continue;
+      materializeNewArraySpill(value, lines, localState);
+    }
+
     // A terminal block has no outgoing operand stack.  Obfuscated methods can
     // leave dead values beneath a return instruction; materializing those as
     // stack-out assignments would place Java statements after return/throw.
