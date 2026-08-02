@@ -3936,6 +3936,9 @@ public final class CrossingDivisionHarness {
   static int unsafe(int y0, int y1, int y, int x0, int x1) {
     return x0 + (y - y0) * (x1 - x0) / (y1 - y0);
   }
+  static int literalRemainder(int value) {
+    return value % 37;
+  }
 }
 `);
     const jvm = new JVM({ classpath, jit: {
@@ -3948,8 +3951,11 @@ public final class CrossingDivisionHarness {
       className, 'crossing', descriptor);
     const unsafe = await jvm.findMethodInHierarchy(
       className, 'unsafe', descriptor);
+    const literal = await jvm.findMethodInHierarchy(
+      className, 'literalRemainder', '(I)I');
     const crossingGenerated = jvm.jit.structuredSsa.compile(crossing);
     const unsafeGenerated = jvm.jit.structuredSsa.compile(unsafe);
+    const literalGenerated = jvm.jit.structuredSsa.compile(literal);
     t.equal(crossingGenerated?.jvmStructuredDominatedArithmeticGuardCount, 1,
       'both crossing arms prove the unordered endpoints unequal');
     t.notOk(crossingGenerated?.jvmRestoringDirectPositionalSource
@@ -3958,6 +3964,11 @@ public final class CrossingDivisionHarness {
     t.ok(unsafeGenerated?.jvmRestoringDirectPositionalSource
       ?.includes('ArithmeticException'),
     'an unguarded divisor retains exact arithmetic exception machinery');
+    t.equal(literalGenerated?.jvmStructuredDominatedArithmeticGuardCount, 1,
+      'a nonzero integer literal proves its own divisor guard');
+    t.notOk(literalGenerated?.jvmRestoringDirectPositionalSource
+      ?.includes('ArithmeticException'),
+    'literal division omits its statically impossible exceptional arm');
     t.end();
   });
 

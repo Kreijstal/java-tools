@@ -1345,6 +1345,7 @@ class JvmSsaBlockRenderer {
     // by local writes and intersected at joins, so no loop-iteration or
     // predecessor-specific assumption can leak into a generated block.
     const dominatedNonZeroDivisionItems = new Set();
+    const literalNonZeroDivisionItems = new Set();
     let cfgDominatedArithmeticGuardCount = 0;
     {
       const relationKey = (kind, left, right) =>
@@ -2152,7 +2153,12 @@ class JvmSsaBlockRenderer {
           else {
             const dividend = value(), divisor = value(), out = value();
             lines.push(`const ${dividend} = ${dividendInput};`, `const ${divisor} = ${divisorInput};`);
-            if (dominatedNonZeroDivisionItems.has(index)) {
+            const literalDivisor = /^-?\d+$/.test(divisorInput)
+              ? Number(divisorInput) : 0;
+            if (literalDivisor !== 0) {
+              literalNonZeroDivisionItems.add(index);
+              cfgDominatedArithmeticGuardCount += 1;
+            } else if (dominatedNonZeroDivisionItems.has(index)) {
               cfgDominatedArithmeticGuardCount += 1;
             } else {
               lines.push(`if (${divisor} === 0) {`,
@@ -7788,6 +7794,10 @@ class JvmSsaBlockRenderer {
           "daload", "faload", "laload",
           ...primitiveArrayStoreOps,
         ]);
+        const provenNonThrowingArithmeticItem = (op, index) =>
+          (op === "idiv" || op === "irem") &&
+          (dominatedNonZeroDivisionItems.has(index) ||
+            literalNonZeroDivisionItems.has(index));
         const reachableEffectItems = items
           .map((item, index) => ({
             index,
@@ -7827,7 +7837,9 @@ class JvmSsaBlockRenderer {
           items.every((item, index) => {
             const op = opOf(item?.instruction);
             if (!op || !normalReachableItems.has(index)) return true;
-            return !throwingOrDynamicOps.has(op) && !effectOps.has(op);
+            return (!throwingOrDynamicOps.has(op) ||
+                provenNonThrowingArithmeticItem(op, index)) &&
+              !effectOps.has(op);
           });
         lexicalCheckedLeafWrapper = lexicalCheckedLeafWrapperShape;
         const checkedLeafShape = this.checkedLeafDirectPositionalEnabled &&
@@ -7843,7 +7855,8 @@ class JvmSsaBlockRenderer {
             const op = opOf(item?.instruction);
             if (!op || !normalReachableItems.has(index)) return true;
             if (!transactionalAcyclicShape &&
-                throwingOrDynamicOps.has(op)) return false;
+                throwingOrDynamicOps.has(op) &&
+                !provenNonThrowingArithmeticItem(op, index)) return false;
             return !effectOps.has(op) || transactionalAcyclicShape ||
               recursiveArrayPartitionLeaf ||
               loopItems.has(index);
