@@ -347,6 +347,13 @@ module.exports = {
       }
     },
 
+    'fillArc(IIIIII)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      if (graphicsContext && graphicsContext.fillArc) {
+        graphicsContext.fillArc(args[0], args[1], args[2], args[3], args[4], args[5]);
+      }
+    },
+
     'drawOval(IIII)V': (jvm, obj, args) => {
       const graphicsContext = obj._awtGraphics;
       if (graphicsContext && graphicsContext.drawOval) {
