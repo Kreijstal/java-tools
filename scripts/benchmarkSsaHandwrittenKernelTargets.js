@@ -730,7 +730,9 @@ function runPolygonOracle(destination, vertices, color) {
         ['tiled-blit', tiled],
         ['perspective-span', perspective],
         ['bilinear-sampler', bilinear],
+        ['polygon-span', polygonSpanCaller],
         ['polygon-raster', polygon],
+        ['polygon-edge-table', polygonEdge],
       ]) {
         process.stderr.write(`\n/* ${name} */\n` +
           `${compiled.generated.jvmRestoringDirectPositionalSource}\n`);

@@ -838,6 +838,8 @@ class JvmSsaBlockRenderer {
     // version a complete shrinking-window region before its first effect.
     const primitiveArrayAccessCandidates = [];
     let nextPrimitiveArrayAccessMarker = 0;
+    const deferredStaticArrayAccesses = [];
+    let nextDeferredStaticArrayAccessMarker = 0;
     const localIndex = (instruction, op) => {
       if (instruction && typeof instruction === "object" && instruction.arg !== undefined) {
         return Number(instruction.arg);
@@ -1988,6 +1990,26 @@ class JvmSsaBlockRenderer {
         arrayRangeCheckCandidates.push(candidate);
         return candidate.marker;
       };
+      const deferredStaticArrayAccessFor = (
+        arrayInput, indexInput, itemIndex, directLines,
+      ) => {
+        const view = entryStaticArrayLocalViews.get(
+          localLoads.get(arrayInput));
+        if (!view || view.blocks.has(block.id) ||
+            !Number.isInteger(itemIndex)) return null;
+        const marker = `__SSA_DEFERRED_STATIC_ARRAY_ACCESS_${
+          nextDeferredStaticArrayAccessMarker++}__`;
+        const access = {
+          block: block.id,
+          itemIndex,
+          arrayData: view.data,
+          indexAffine: affineLocalOffset(indexInput),
+          marker,
+          directLines,
+        };
+        deferredStaticArrayAccesses.push(access);
+        return access;
+      };
       const numberLiteral = (constant) => {
         if (Object.is(constant, -0)) return "-0";
         if (constant !== constant) return "NaN";
@@ -2203,8 +2225,12 @@ class JvmSsaBlockRenderer {
           else {
             const array = value(), arrayIndex = value(), out = value();
             const arrayData = arrayViews.get(arrayInput);
+            const deferredStaticView = !arrayData
+              ? entryStaticArrayLocalViews.get(localLoads.get(arrayInput))
+              : null;
             const arrayKind = this.staticPrimitiveArrayKindsEnabled
-              ? arrayKinds.get(arrayInput) || null : null;
+              ? arrayKinds.get(arrayInput) ||
+                deferredStaticView?.descriptor || null : null;
             const primitiveSentinel = op !== "aaload" && arrayData;
             lines.push(`const ${array} = ${arrayInput};`, `const ${arrayIndex} = ${arrayIndexInput};`,
               `let ${out};`);
@@ -2240,6 +2266,14 @@ class JvmSsaBlockRenderer {
                 : `${array}.elements ? ${array}.elements[${arrayIndex}] : ${array}[${arrayIndex}]`;
               const normalized = normalizedArrayLoadExpression(
                 raw, op, array, arrayKind);
+              const deferred = deferredStaticView && op !== "aaload"
+                ? deferredStaticArrayAccessFor(
+                  arrayInput, arrayIndexInput, index, [
+                    `${out} = ${normalizedArrayLoadExpression(
+                      `${deferredStaticView.data}[${arrayIndex}]`,
+                      op, array, arrayKind)};`,
+                  ]) : null;
+              if (deferred) lines.push(`/*${deferred.marker}:start*/`);
               lines.push(
                   `if (${array} === null || ${array} === undefined || ${
                     arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
@@ -2247,6 +2281,7 @@ class JvmSsaBlockRenderer {
                   `  ${out} = helpers.arrayLoad(${arrayIndex}, ${array}, frame, ${JSON.stringify(op)});`,
                   "} else {", `  ${out} = ${normalized};`, "}",
               );
+              if (deferred) lines.push(`/*${deferred.marker}:end*/`);
             }
             stack.push(out);
           }
@@ -2258,8 +2293,12 @@ class JvmSsaBlockRenderer {
           else {
             const array = value(), arrayIndex = value(), stored = value();
             const arrayData = arrayViews.get(arrayInput);
+            const deferredStaticView = !arrayData
+              ? entryStaticArrayLocalViews.get(localLoads.get(arrayInput))
+              : null;
             const arrayKind = this.staticPrimitiveArrayKindsEnabled
-              ? arrayKinds.get(arrayInput) || null : null;
+              ? arrayKinds.get(arrayInput) ||
+                deferredStaticView?.descriptor || null : null;
             lines.push(`const ${array} = ${arrayInput};`, `const ${arrayIndex} = ${arrayIndexInput};`,
               `const ${stored} = ${storedInput};`);
             // The opcode fixes primitive narrowing. Keep it in the generated
@@ -2294,6 +2333,13 @@ class JvmSsaBlockRenderer {
                 "}",
               );
             } else {
+              const deferred = deferredStaticView && op !== "aastore"
+                ? deferredStaticArrayAccessFor(
+                  arrayInput, arrayIndexInput, index, [
+                    `${deferredStaticView.data}[${arrayIndex}] = ` +
+                      `${normalizedStore};`,
+                  ]) : null;
+              if (deferred) lines.push(`/*${deferred.marker}:start*/`);
               lines.push(
                 `if (${array} === null || ${array} === undefined || ${
                   arrayIndexOutOfBounds(arrayIndex, `${array}.length`)}) {`,
@@ -2306,6 +2352,7 @@ class JvmSsaBlockRenderer {
                 `} else if (${array}.elements) {`, `  ${array}.elements[${arrayIndex}] = ${normalizedStore};`,
                 "} else {", `  ${array}[${arrayIndex}] = ${normalizedStore};`, "}",
               );
+              if (deferred) lines.push(`/*${deferred.marker}:end*/`);
             }
           }
         } else if (op === "newarray") {
@@ -3076,7 +3123,24 @@ class JvmSsaBlockRenderer {
                   result: out,
                 });
               }
-              lines.push(
+              if (inlineCheckedLeafLines && receiverGuard === "true") {
+                // A static lexical child has no dispatch or receiver
+                // predicate: its body is already present in this generated
+                // region.  Do not manufacture a `usedDirect` flag and a
+                // constant `if (true)` around every loop invocation.  The
+                // child's own before-effects admission result remains the
+                // sole fallback predicate, preserving exact canonical
+                // execution when an assumption is not satisfied.
+                lines.push(
+                  `${inlineCheckedLeafLabel}: {`,
+                  ...inlineCheckedLeafLines.map((line) => `  ${line}`),
+                  "}",
+                  `if (${inlineCheckedLeafVoid
+                    ? `!${out}`
+                    : `${out} === helpers.asyncInvokeSentinel()`}) {`,
+                  inlineCheckedLeafFallbackMarker,
+                  ...(inlineCheckedLeafVoid ? [] : ["}"]));
+              } else lines.push(
                 `let ${usedDirect} = false;`,
                 `if (${inlineCheckedLeafLines
                   ? receiverGuard
@@ -3105,8 +3169,7 @@ class JvmSsaBlockRenderer {
                 ...(inlineCheckedLeafLines
                   ? [inlineCheckedLeafFallbackMarker]
                   : fallbackLines.map((line) => `  ${line}`)),
-                ...(inlineCheckedLeafVoid ? [] : ["}"]),
-              );
+                ...(inlineCheckedLeafVoid ? [] : ["}"]));
             } else {
               lines.push(...fallbackLines);
             }
@@ -3296,6 +3359,11 @@ class JvmSsaBlockRenderer {
       plan.lines = plan.lines
         .filter((_line, index) => !removed.has(index))
         .map(substitute);
+      for (const access of deferredStaticArrayAccesses) {
+        if (plans[access.block] === plan) {
+          access.directLines = access.directLines.map(substitute);
+        }
+      }
       for (const [object, data] of [...eagerFieldReceiverNullChecks]) {
         const resolvedObject = resolveAlias(object);
         if (resolvedObject === object) continue;
@@ -4118,6 +4186,7 @@ class JvmSsaBlockRenderer {
     const arrayRangeGuardVariables = new Map();
     const arrayRangeGuardDataVariables = new Map();
     const arrayRangeGuardNonZeroLocals = new Map();
+    const packedArrayCapacityFacts = [];
     const arrayRangeGuardByCondition = new Map();
     const tripBoundedArrayRangeGuards = new Set();
     const countedRangeTripValues = new Map();
@@ -5239,6 +5308,25 @@ class JvmSsaBlockRenderer {
         bailouts.push(variable);
         rangeBailoutGuardsByHeader.set(declarationHeader, bailouts);
       }
+      if (selectedPackedAppend &&
+          trustedHoistedRangeGuards.has(variable) &&
+          Number.isInteger(selectedPackedAppend.slot) &&
+          Number.isInteger(selectedPackedAppend.incrementsPerTrip) &&
+          selectedPackedAppend.incrementsPerTrip > 0) {
+        const lastItem = Math.max(...[...info.loopBlocks].flatMap(
+          (loopBlock) => cfg.blocks[loopBlock]?.insns || []));
+        if (!packedArrayCapacityFacts.some((fact) =>
+          fact.arrayData === candidate.arrayData &&
+          fact.cursorSlot === selectedPackedAppend.slot &&
+          fact.lastItem === lastItem)) {
+          packedArrayCapacityFacts.push({
+            arrayData: candidate.arrayData,
+            cursorSlot: selectedPackedAppend.slot,
+            stride: selectedPackedAppend.incrementsPerTrip,
+            lastItem,
+          });
+        }
+      }
       const variables = arrayRangeGuardVariables.get(info.header) || [];
       variables.push(variable);
       arrayRangeGuardVariables.set(info.header, variables);
@@ -5249,6 +5337,72 @@ class JvmSsaBlockRenderer {
         if (!plan?.lines) continue;
         plan.lines = plan.lines.map((line) =>
           line.replace(candidate.marker, variable));
+      }
+    }
+    const provenDeferredStaticArrayAccesses = new Set();
+    const localWriteSlot = (instruction) => {
+      const op = opOf(instruction);
+      if (op === "iinc") {
+        return Number(instruction.varnum ?? instruction.arg);
+      }
+      return /^[a-z]store(?:_[0-3])?$/.test(op)
+        ? localIndex(instruction, op) : null;
+    };
+    const matchingCursorLoopForWrite = (fact, cursorSlot, itemIndex) =>
+      [...countedLoopInfos.values()].some((loop) =>
+        loop.slot === cursorSlot && loop.boundSlot === fact.cursorSlot &&
+        loop.increment === fact.stride && loop.loopBlocks.has(
+          cfg.blocks.find((candidateBlock) =>
+            candidateBlock?.insns?.includes(itemIndex))?.id));
+    for (const access of deferredStaticArrayAccesses) {
+      const affine = access.indexAffine;
+      if (!Number.isInteger(affine?.slot) ||
+          !Number.isInteger(affine.offset)) continue;
+      for (const fact of packedArrayCapacityFacts) {
+        if (fact.arrayData !== access.arrayData ||
+            fact.lastItem >= access.itemIndex || affine.offset < 0 ||
+            affine.offset >= fact.stride) continue;
+        const loop = [...countedLoopInfos.values()].find((candidateLoop) =>
+          candidateLoop.slot === affine.slot &&
+          candidateLoop.boundSlot === fact.cursorSlot &&
+          candidateLoop.increment === fact.stride &&
+          candidateLoop.loopBlocks.has(access.block) &&
+          candidateLoop.header !== access.block);
+        if (!loop) continue;
+        const writes = [];
+        for (let itemIndex = fact.lastItem + 1;
+          itemIndex <= access.itemIndex; itemIndex += 1) {
+          if (!normalReachableItems.has(itemIndex)) continue;
+          const instruction = items[itemIndex]?.instruction;
+          if (localWriteSlot(instruction) === affine.slot) {
+            writes.push({itemIndex, instruction});
+          }
+        }
+        const initializations = writes.filter(({itemIndex, instruction}) => {
+          const op = opOf(instruction);
+          return /^istore(?:_[0-3])?$/.test(op) && itemIndex > 0 &&
+            constantInstructionValue(items[itemIndex - 1]?.instruction) === 0;
+        });
+        const increments = writes.filter(({instruction}) =>
+          opOf(instruction) === "iinc" &&
+          Number(instruction.incr ?? 0) === fact.stride);
+        if (initializations.length !== 1 ||
+            writes.length !== initializations.length + increments.length ||
+            increments.some(({itemIndex}) =>
+              !matchingCursorLoopForWrite(
+                fact, affine.slot, itemIndex))) continue;
+        let boundChanged = false;
+        for (let itemIndex = fact.lastItem + 1;
+          itemIndex <= access.itemIndex; itemIndex += 1) {
+          if (localWriteSlot(items[itemIndex]?.instruction) ===
+              fact.cursorSlot) {
+            boundChanged = true;
+            break;
+          }
+        }
+        if (boundChanged) continue;
+        provenDeferredStaticArrayAccesses.add(access.marker);
+        break;
       }
     }
     for (const candidate of primitiveArrayAccessCandidates) {
@@ -5644,6 +5798,34 @@ class JvmSsaBlockRenderer {
       };
     };
     let dominatedArithmeticGuardCount = cfgDominatedArithmeticGuardCount;
+    const deferredStaticArrayAccessByMarker = new Map(
+      deferredStaticArrayAccesses.map((access) => [access.marker, access]));
+    const specializeDeferredStaticArrayAccessLines = (lines, trusted) => {
+      const output = [];
+      for (let index = 0; index < lines.length; index += 1) {
+        const start = /^\/\*(__SSA_DEFERRED_STATIC_ARRAY_ACCESS_\d+__):start\*\/$/
+          .exec(lines[index]);
+        if (!start) {
+          output.push(lines[index]);
+          continue;
+        }
+        const access = deferredStaticArrayAccessByMarker.get(start[1]);
+        const end = `/*${start[1]}:end*/`;
+        let close = index + 1;
+        while (close < lines.length && lines[close] !== end) close += 1;
+        if (!access || close >= lines.length) {
+          output.push(lines[index]);
+          continue;
+        }
+        if (trusted && provenDeferredStaticArrayAccesses.has(start[1])) {
+          output.push(...access.directLines);
+        } else {
+          output.push(...lines.slice(index + 1, close));
+        }
+        index = close;
+      }
+      return output;
+    };
     const removeTerminalBreakTo = (node, label) => {
       if (!node) return node;
       if (node.t === "break" && node.label === label) {
@@ -5748,7 +5930,8 @@ class JvmSsaBlockRenderer {
             : continuationMode ? fallback.continuation : fallback.ordinary;
           return expandLines(selected);
         });
-        const lines = expandLines(plan.lines);
+        const lines = expandLines(specializeDeferredStaticArrayAccessLines(
+          plan.lines, directPositional && rangeBailout));
         if (plan.returnKind && plan.returnKind !== "throw") {
           if (directPositional) {
             lines.push(plan.returnKind === "void"
@@ -8451,6 +8634,8 @@ class JvmSsaBlockRenderer {
         eagerFieldReceiverNullChecks.size;
       generated.jvmStructuredRangeGuardDataVariableCount =
         arrayRangeGuardDataVariables.size;
+      generated.jvmStructuredProvenDeferredStaticArrayAccessCount =
+        provenDeferredStaticArrayAccesses.size;
       generated.jvmStructuredGuardedBooleanSiteCount = guardedStaticBooleanSites.size;
       generated.jvmStructuredPrunedBooleanCfgBranchCount =
         prunedBooleanCfgBranches;
