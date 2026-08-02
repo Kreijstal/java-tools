@@ -6175,11 +6175,9 @@ class JvmSsaBlockRenderer {
       .filter(([, site]) => site.id !== null && site.id !== undefined &&
         !(omitSelfRecursive && site.selfRecursive))
       .flatMap(([index, site]) => {
-        const trustedCapturedLeaf =
-          Array.isArray(site.directCheckedLeaf?.captures) &&
-          site.directCheckedLeaf.captures.length > 0;
-        const captures = trustedCapturedLeaf &&
-          Array.isArray(site.directCheckedLeaf?.captures)
+        const compileTimeCheckedLeaf = Boolean(site.directCheckedLeaf);
+        const captures = compileTimeCheckedLeaf &&
+          Array.isArray(site.directCheckedLeaf.captures)
           ? site.directCheckedLeaf.captures : [];
         const captureLines = [];
         const captureArguments = [];
@@ -6205,18 +6203,21 @@ class JvmSsaBlockRenderer {
           }
         }
         const rawBody = `ssaFastPositionalRawBody${index}`;
-        const directRawLines = site.directCheckedLeaf && trustedCapturedLeaf
-          ? [
+        if (compileTimeCheckedLeaf) {
+          return [
             `const ${rawBody} = ` +
               `helpers.directCheckedLeafBodies[${site.directCheckedLeaf.id}];`,
             ...captureLines,
             `const ${positionalCallRawInvokeVariable(index)} = ${rawBody};`,
-          ]
-          : [
-            `const ${positionalCallRawInvokeVariable(index)} = ` +
-              `${positionalCallTargetVariable(index)} && ` +
-              `${positionalCallTargetVariable(index)}.rawInvoke;`,
+            `const ${positionalCallInvokeVariable(index)} = null;`,
+            `const ${positionalCallReceiverVariable(index)} = null;`,
           ];
+        }
+        const directRawLines = [
+          `const ${positionalCallRawInvokeVariable(index)} = ` +
+            `${positionalCallTargetVariable(index)} && ` +
+            `${positionalCallTargetVariable(index)}.rawInvoke;`,
+        ];
         return [
         `const ${positionalCallSiteVariable(index)} = ` +
           `helpers.syncCallSites[${site.id}];`,
@@ -7012,6 +7013,51 @@ class JvmSsaBlockRenderer {
       }
       return lines;
     };
+    const strengthReduceAffineStoreLoops = (sourceLines) => {
+      const lines = [...sourceLines];
+      for (let index = 0; index + 4 < lines.length; index += 1) {
+        const opening = /^(\s*)(L\d+): while \((local\d+) < (local\d+)\) \{$/
+          .exec(lines[index]);
+        if (!opening) continue;
+        const indentation = opening[1];
+        const induction = opening[3];
+        const bound = opening[4];
+        const alias = new RegExp(
+          `^${indentation}  const (ssaValue\\d+) = ${induction};$`)
+          .exec(lines[index + 1]);
+        const store = new RegExp(
+          `^${indentation}  ([A-Za-z_$][\\w$]*)\\[(.+)\\] = (.+);$`)
+          .exec(lines[index + 2]);
+        if (!alias || !store ||
+            lines[index + 4] !== `${indentation}}`) continue;
+        const update = lines[index + 3]
+          .replace(/[()\s]/g, "");
+        if (update !== `${induction}=${alias[1]}+1|0;`) continue;
+        const normalizedIndex = store[2].replace(/[()\s]/g, "");
+        const localNames = [...new Set(
+          [...store[2].matchAll(/\blocal\d+\b/g)]
+            .map((match) => match[0]))];
+        if (localNames.length !== 1) continue;
+        const base = localNames[0];
+        if (base === induction || base === bound ||
+            !([`${base}+${alias[1]}|0`,
+              `${alias[1]}+${base}|0`].includes(normalizedIndex)) ||
+            new RegExp(`\\b(?:${alias[1]}|${induction}|${base})\\b`)
+              .test(store[3])) continue;
+        const suffix = opening[2].slice(1);
+        const end = `ssaAffineStoreEnd${suffix}`;
+        lines.splice(index, 5,
+          `${indentation}const ${end} = ${base} + ${bound};`,
+          `${indentation}${induction} = ${base} + ${induction};`,
+          `${indentation}${opening[2]}: while (${induction} < ${end}) {`,
+          `${indentation}  ${store[1]}[${induction}] = ${store[3]};`,
+          `${indentation}  ${induction} += 1;`,
+          `${indentation}}`,
+          `${indentation}${induction} -= ${base};`);
+        index += 6;
+      }
+      return lines;
+    };
     const transactionalizeAcyclicLeafLines = (sourceLines) => {
       const lines = [...sourceLines];
       const output = [];
@@ -7720,10 +7766,11 @@ class JvmSsaBlockRenderer {
             checkedLeafRenderedTree = specializeArrayRangeGuardedStores(
               checkedLeafRenderedTree, [guard]);
           }
-          const checkedLeafTree = compactCheckedLeafLines(
+          let checkedLeafTree = compactCheckedLeafLines(
             transactionalAcyclicShape
               ? transactionalizeAcyclicLeafLines(checkedLeafRenderedTree)
               : checkedLeafRenderedTree);
+          checkedLeafTree = strengthReduceAffineStoreLoops(checkedLeafTree);
           const compactCheckedLeafEntryLocals = (bodyLines) => {
             const aliases = new Map([...entryArguments]
               .filter(([slot]) => !renderedAssignedLocalSlots.has(slot))
