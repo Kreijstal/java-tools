@@ -20,44 +20,30 @@ module.exports = {
       if (!container) return;
       container._cards = container._cards || {};
       container._cardOrder = container._cardOrder || [];
-      if (name && !(name in container._cards)) {
-        container._cardOrder.push(name);
-      }
-      container._cards[name || String(container._cardOrder.length)] = component;
-      if (!container._currentCard) {
-        container._currentCard = name || String(container._cardOrder.length);
-      }
+      const key = name || String(container._cardOrder.length);
+      if (!(key in container._cards)) container._cardOrder.push(key);
+      container._cards[key] = component;
+      if (container._currentCard == null) container._currentCard = key;
     },
     'show(Ljava/awt/Container;Ljava/lang/String;)V': (jvm, obj, args) => {
       const container = args[0];
       const name = normalizeCardName(args[1]);
-      if (!container) return;
+      if (!container || !container._cards || !(name in container._cards)) return;
       container._currentCard = name;
-      // Re-run the container layout so only the active card is visible
-      const doLayout = jvm.findMethod(
-        jvm.classes['java/awt/Container'],
-        'doLayout',
-        '()V',
-      );
-      if (doLayout && !(jvm.overrides && jvm.overrides['java/awt/Container'] &&
-          jvm.overrides['java/awt/Container'].methods &&
-          jvm.overrides['java/awt/Container'].methods['doLayout()V'])) {
-        // execute synchronously via direct call
-      }
-      if (container.doLayout) {
-        container.doLayout(jvm, container, []);
-      }
+      layoutContainer(jvm, container);
     },
     'first(Ljava/awt/Container;)V': (jvm, obj, args) => {
       const container = args[0];
       if (container && container._cardOrder && container._cardOrder.length) {
         container._currentCard = container._cardOrder[0];
+        layoutContainer(jvm, container);
       }
     },
     'last(Ljava/awt/Container;)V': (jvm, obj, args) => {
       const container = args[0];
       if (container && container._cardOrder && container._cardOrder.length) {
         container._currentCard = container._cardOrder[container._cardOrder.length - 1];
+        layoutContainer(jvm, container);
       }
     },
   },
@@ -68,4 +54,10 @@ function normalizeCardName(value) {
   if (typeof value === 'string') return value;
   if (value.value != null) return String(value.value);
   return String(value);
+}
+
+function layoutContainer(jvm, container) {
+  const doLayout = jvm._jreFindMethod(
+    'java/awt/Container', 'doLayout', '()V');
+  if (doLayout) doLayout(jvm, container, []);
 }

@@ -12,17 +12,12 @@ const dispatchAdjustmentEvent = async (jvm, source, listener) => {
 
   const currentThread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
   if (!currentThread) return;
-  currentThread.callStack.push(eventFrame);
-  currentThread.status = 'runnable';
-
-  const originalStackSize = currentThread.callStack.size();
-  let iterations = 0;
-  const maxIterations = 1000;
-  while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
-    const result = await jvm.executeTick();
-    iterations++;
-    if (result && result.completed) break;
-  }
+  const { runFrame } = require('./legacyEvents');
+  await runFrame(jvm, eventFrame, {
+    thread: currentThread,
+    maxIterations: 1000,
+    label: `${listener.type}.adjustmentValueChanged`,
+  });
 };
 
 const updateDomRange = (obj) => {
@@ -56,11 +51,15 @@ module.exports = {
         input.addEventListener('input', () => {
           obj._value = parseInt(input.value, 10) || 0;
           for (const listener of obj._adjustmentListeners) {
-            dispatchAdjustmentEvent(jvm, obj, listener);
+            dispatchAdjustmentEvent(jvm, obj, listener).catch((error) => {
+              console.error('AWT Scrollbar adjustment dispatch failed:', error);
+            });
           }
           // Legacy pre-1.1 model: post SCROLL_ABSOLUTE up the hierarchy.
           const { postScrollEvent } = require('./legacyEvents');
-          postScrollEvent(jvm, obj, 606); // Event.SCROLL_ABSOLUTE
+          postScrollEvent(jvm, obj, 605).catch((error) => {
+            console.error('AWT Scrollbar legacy dispatch failed:', error);
+          }); // Event.SCROLL_ABSOLUTE
         });
       }
     },

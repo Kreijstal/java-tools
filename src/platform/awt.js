@@ -755,11 +755,12 @@ class CanvasGraphics {
         const ry = Math.max(0, height / 2);
         const cx = x + rx;
         const cy = y + ry;
+        const sweepDeg = Math.max(-360, Math.min(360, arcAngleDeg));
         const start = -startAngleDeg * Math.PI / 180;
-        const sweep = -arcAngleDeg * Math.PI / 180;
+        const sweep = -sweepDeg * Math.PI / 180;
         this.ctx.beginPath();
         this.ctx.moveTo(cx, cy);
-        this.ctx.ellipse(cx, cy, rx, ry, 0, start, start + sweep, false);
+        this.ctx.ellipse(cx, cy, rx, ry, 0, start, start + sweep, sweep < 0);
         this.ctx.closePath();
         this.ctx.fill();
     }
@@ -1009,6 +1010,8 @@ const awtModules = {
     // Mock classes for CLI testing
     MockGraphics,
     MockImage,
+
+    _test: { CanvasGraphics },
 };
 
 // Handle different module systems

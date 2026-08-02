@@ -35,7 +35,10 @@ function dispatchClick(jvm, obj) {
   // (handleEvent/action overrides). Falls back to ActionListener if the
   // event is not consumed anywhere.
   const { postActionEvent } = require('./legacyEvents');
-  postActionEvent(jvm, obj, obj.label || '').then((handled) => {
+  postActionEvent(jvm, obj, obj.label || '').catch((error) => {
+    console.error('AWT Button legacy action dispatch failed:', error);
+    return false;
+  }).then((handled) => {
     if (handled) return;
     // Modern path: dispatch to registered ActionListeners.
     const eventObj = {

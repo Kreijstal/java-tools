@@ -81,7 +81,6 @@ module.exports = {
         if (obj._canvasElement && obj._canvasElement.getContext) {
           const ctx = obj._canvasElement.getContext('2d');
           if (ctx) {
-            const awtFramework = require('../../../platform/awt.js');
             graphics = { type: 'java/awt/Graphics', _awtGraphics: new awtFramework.CanvasGraphics(ctx), _component: obj };
           }
         }
@@ -90,11 +89,14 @@ module.exports = {
         graphics = { type: 'java/awt/Graphics', _component: obj };
       }
       if (!graphics) return;
-      const classData = jvm.classes[obj.type];
-      if (!classData) return;
-      const paintMethod = jvm.findMethod(classData, 'update', '(Ljava/awt/Graphics;)V') ||
-        jvm.findMethod(classData, 'paint', '(Ljava/awt/Graphics;)V');
-      if (!paintMethod) return;
+      const { isJreDefault, runFrame } = require('./legacyEvents');
+      const updateMethod = await jvm.findMethodInHierarchy(
+        obj.type, 'update', '(Ljava/awt/Graphics;)V');
+      const paintMethod = !isJreDefault(updateMethod)
+        ? updateMethod
+        : await jvm.findMethodInHierarchy(
+          obj.type, 'paint', '(Ljava/awt/Graphics;)V');
+      if (!paintMethod || isJreDefault(paintMethod)) return;
       const Frame = require('../../../core/frame');
       const paintFrame = new Frame(paintMethod);
       paintFrame.className = obj.type;
@@ -102,16 +104,10 @@ module.exports = {
       paintFrame.locals[1] = graphics;
       const thread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
       if (!thread) return;
-      thread.callStack.push(paintFrame);
-      thread.status = 'runnable';
-      const originalStackSize = thread.callStack.size();
-      let iterations = 0;
-      const maxIterations = 500000;
-      while (thread.callStack.size() >= originalStackSize && iterations < maxIterations) {
-        const result = await jvm.executeTick();
-        iterations++;
-        if (result && result.completed) break;
-      }
+      await runFrame(jvm, paintFrame, {
+        thread,
+        label: `${obj.type}.repaint`,
+      });
     },
 
     // ── Legacy (pre-1.1) event model: postEvent → handleEvent → action ──
@@ -122,12 +118,8 @@ module.exports = {
     'handleEvent(Ljava/awt/Event;)Z': async (jvm, obj, args) => {
       const evt = args[0];
       if (!evt) return 0;
-      // Default dispatch used when a guest class does not override handleEvent.
-      if (evt.id === 401) { // java.awt.Event.ACTION_EVENT
-        const { invokeAction } = require('./legacyEvents');
-        return invokeAction(jvm, obj, evt, evt.arg) ? 1 : 0;
-      }
-      return 0;
+      const { dispatchDefaultEvent } = require('./legacyEvents');
+      return (await dispatchDefaultEvent(jvm, obj, evt)) ? 1 : 0;
     },
 
     'action(Ljava/awt/Event;Ljava/lang/Object;)Z': (jvm, obj, args) => {
@@ -137,7 +129,7 @@ module.exports = {
 
     'postEvent(Ljava/awt/Event;)Z': async (jvm, obj, args) => {
       const { postEvent } = require('./legacyEvents');
-      return postEvent(jvm, obj, args[0]) ? 1 : 0;
+      return (await postEvent(jvm, obj, args[0])) ? 1 : 0;
     },
     
     'setVisible(Z)V': (jvm, obj, args) => {

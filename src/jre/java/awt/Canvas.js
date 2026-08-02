@@ -16,25 +16,55 @@ function attachMouseInteraction(jvm, obj, canvas) {
       modifiers: ((e.shiftKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.altKey ? 8 : 0)),
     };
   };
+  let moveDispatching = false;
+  let pendingMove = null;
+  const reportFailure = (promise) => promise.catch((error) => {
+    console.error('AWT Canvas mouse dispatch failed:', error);
+    return false;
+  });
+  const pumpMove = () => {
+    if (moveDispatching || !pendingMove) return;
+    const move = pendingMove;
+    pendingMove = null;
+    moveDispatching = true;
+    reportFailure(postMouseEvent(
+      jvm, obj, move.id, move.x, move.y, move.modifiers, move.clickCount,
+    )).finally(() => {
+      moveDispatching = false;
+      pumpMove();
+    });
+  };
   canvas.addEventListener('mousedown', (e) => {
     obj._mouseDown = true;
     const { x, y, modifiers } = toLocal(e);
-    postMouseEvent(jvm, obj, 501, x, y, modifiers, e.detail || 1); // MOUSE_DOWN
+    reportFailure(postMouseEvent(
+      jvm, obj, 501, x, y, modifiers, e.detail || 1,
+    )); // MOUSE_DOWN
     e.preventDefault();
   });
   canvas.addEventListener('mousemove', (e) => {
     const { x, y, modifiers } = toLocal(e);
-    postMouseEvent(jvm, obj, obj._mouseDown ? 506 : 503, x, y, modifiers); // MOUSE_DRAG / MOUSE_MOVE
+    pendingMove = {
+      id: obj._mouseDown ? 506 : 503,
+      x,
+      y,
+      modifiers,
+      clickCount: e.detail || 0,
+    }; // MOUSE_DRAG / MOUSE_MOVE
+    pumpMove();
     e.preventDefault();
   });
   canvas.addEventListener('mouseup', (e) => {
     obj._mouseDown = false;
     const { x, y, modifiers } = toLocal(e);
-    postMouseEvent(jvm, obj, 502, x, y, modifiers, e.detail || 1); // MOUSE_UP
+    reportFailure(postMouseEvent(
+      jvm, obj, 502, x, y, modifiers, e.detail || 1,
+    )); // MOUSE_UP
     e.preventDefault();
   });
   canvas.addEventListener('mouseleave', () => {
     obj._mouseDown = false;
+    pendingMove = null;
   });
 }
 
