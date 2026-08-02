@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400" width="100%" height="100%">
+  <!-- Ground Shadow -->
+  <ellipse cx="200" cy="245" rx="90" ry="15" fill="#e0d4c8" />
+
+  <!-- Mug Handle -->
+  <path d="M 260 130 C 320 130, 320 210, 250 210" fill="none" stroke="#4a2c20" stroke-width="12" stroke-linecap="round" />
+  <path d="M 260 130 C 320 130, 320 210, 250 210" fill="none" stroke="#f4e8da" stroke-width="6" stroke-linecap="round" />
+
+  <!-- Mug Body -->
+  <rect x="130" y="100" width="140" height="135" rx="25" fill="#f9f1e6" stroke="#4a2c20" stroke-width="6" />
+
+  <!-- Coffee Inside -->
+  <ellipse cx="200" cy="110" rx="60" ry="15" fill="#3a1f10" stroke="#4a2c20" stroke-width="5" />
+  <ellipse cx="200" cy="110" rx="50" ry="9" fill="#4d2b18" />
+
+  <!-- Steam -->
+  <path d="M 180 80 Q 160 50, 190 40 T 180 10" fill="none" stroke="#e3d6c8" stroke-width="6" stroke-linecap="round" />
+  <path d="M 210 85 Q 230 60, 200 45 T 215 15" fill="none" stroke="#e3d6c8" stroke-width="4" stroke-linecap="round" />
+  <circle cx="155" cy="55" r="4" fill="#e3d6c8" />
+  <circle cx="165" cy="45" r="3" fill="#e3d6c8" />
+
+  <!-- JS Sticker -->
+  <g transform="translate(140, 145) rotate(-4)">
+    <rect x="0" y="0" width="55" height="45" rx="6" fill="#fbc02d" stroke="#4a2c20" stroke-width="3" />
+    <text x="7" y="32" font-family="Arial, sans-serif" font-weight="bold" font-size="28" fill="#283593">JS</text>
+  </g>
+
+  <!-- WASM Sticker (Simplified puzzle piece) -->
+  <g transform="translate(195, 140) rotate(6)">
+    <path d="M 10 10 L 25 10 C 25 0, 40 0, 40 10 L 55 10 L 55 25 C 65 25, 65 40, 55 40 L 55 55 L 40 55 C 40 65, 25 65, 25 55 L 10 55 L 10 40 C 0 40, 0 25, 10 25 Z" fill="#5c6bc0" stroke="#4a2c20" stroke-width="3" />
+    <text x="11" y="38" font-family="Arial, sans-serif" font-weight="bold" font-size="12" fill="#ffffff">WASM</text>
+  </g>
+
+  <!-- Text: jvm.js -->
+  <text x="200" y="310" font-family="Arial, sans-serif" font-weight="bold" font-size="64" text-anchor="middle">
+    <tspan fill="#283593">jvm</tspan><tspan fill="#f57c00">.js</tspan>
+  </text>
+</svg>
