@@ -16,6 +16,7 @@ const Hashtable = require('../src/jre/java/util/Hashtable');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
 const Matcher = require('../src/jre/java/util/regex/Matcher');
 const StringClass = require('../src/jre/java/lang/String');
+const Character = require('../src/jre/java/lang/Character');
 const CRC32 = require('../src/jre/java/util/zip/CRC32');
 const SourceDataLine = require('../src/jre/javax/sound/sampled/SourceDataLine');
 const AudioSystem = require('../src/jre/javax/sound/sampled/AudioSystem');
@@ -74,6 +75,18 @@ function jvmStub() {
     },
   };
 }
+
+test('Character.toTitleCase supports the char descriptor', (t) => {
+  const toTitleCase = Character.staticMethods['toTitleCase(C)C'];
+  t.equal(typeof toTitleCase, 'function', 'the exact JRE method is registered');
+  t.equal(toTitleCase(null, null, ['a'.charCodeAt(0)]), 'A'.charCodeAt(0),
+    'lowercase ASCII is converted to title case');
+  t.equal(toTitleCase(null, null, ['A'.charCodeAt(0)]), 'A'.charCodeAt(0),
+    'existing title case is preserved');
+  t.equal(toTitleCase(null, null, [0x00b5]), 0x039c,
+    'Unicode title casing follows Java for the micro sign');
+  t.end();
+});
 
 test('Class.newInstance reports InstantiationException for primitive classes', async (t) => {
   let error = null;

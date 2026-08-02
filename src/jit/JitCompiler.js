@@ -2507,6 +2507,7 @@ class JitCompiler {
         } else if (op === "invokestatic") {
           const plan = inlinePlans.get(index);
           if (plan) {
+            const callStack = [...expressions];
             const args = new Array(plan.paramCount);
             for (let argument = args.length - 1; argument >= 0; argument -= 1) {
               args[argument] = pop();
@@ -2518,6 +2519,14 @@ class JitCompiler {
               (_match, argument) => `(${args[Number(argument)]})`);
             body.push(`let ${result};`, "{");
             body.push(...plan.statements.map(substitute));
+            if (plan.guards?.length) {
+              const guard = plan.guards.map((condition) =>
+                `(${substitute(condition)})`).join(" && ");
+              body.push(`if (!(${guard})) {`,
+                ...materialize(callStack, index),
+                "helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'guarded scalar integer inline' };",
+                "}");
+            }
             body.push(`${result} = ${substitute(plan.result)};`, "}");
             expressions.push(result);
           } else {
@@ -6999,13 +7008,13 @@ class JitCompiler {
       args[index] = `stack[base + ${index}]`;
     }
     const state = {
-      active: new Set(), statements: [], nextTemp: 0,
+      active: new Set(), declarations: [], statements: [], nextTemp: 0,
       instructionCount: 0, methodCount: 0, guards: [],
     };
     const result = this.emitInlineIntegerMethod(method, params, returnType, args, state, 0);
     if (result === null) return null;
     const plan = {
-      statements: state.statements,
+      statements: [...state.declarations, ...state.statements],
       result,
       receiverSlots,
       inputCount: args.length,
@@ -7062,7 +7071,8 @@ class JitCompiler {
     const pop = () => stack.length ? stack.pop() : null;
     const materialize = (expression) => {
       const temporary = `inlineValue${state.nextTemp++}`;
-      state.statements.push(`const ${temporary} = ${expression};`);
+      state.declarations.push(`let ${temporary};`);
+      state.statements.push(`${temporary} = ${expression};`);
       return temporary;
     };
     const binary = (format) => {
@@ -7077,7 +7087,8 @@ class JitCompiler {
       const rangePop = () => rangeStack.length ? rangeStack.pop() : null;
       const rangeMaterialize = (expression) => {
         const temporary = `inlineValue${state.nextTemp++}`;
-        statements.push(`const ${temporary} = ${expression};`);
+        state.declarations.push(`let ${temporary};`);
+        statements.push(`${temporary} = ${expression};`);
         return temporary;
       };
       const rangeBinary = (format) => {
@@ -7215,7 +7226,8 @@ class JitCompiler {
             if (before === after) return true;
             if (before === undefined || after === undefined) return false;
             const phi = `inlineValue${state.nextTemp++}`;
-            state.statements.push(`let ${phi} = ${before};`);
+            state.declarations.push(`let ${phi};`);
+            state.statements.push(`${phi} = ${before};`);
             phis.push(`${phi} = ${after};`);
             assign(phi);
             return true;

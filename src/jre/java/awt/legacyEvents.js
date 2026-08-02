@@ -7,6 +7,7 @@
 // their boolean result so the bubbling can stop once the event is handled.
 
 const Frame = require('../../../core/frame');
+const CallStack = require('../../../core/callStack');
 const IntegerClass = require('../lang/Integer');
 
 const ACTION_EVENT = 1001;
@@ -33,14 +34,42 @@ function yieldToEventLoop() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
+function runnableEventThread(jvm, requested) {
+  if (requested?.status === 'runnable') return requested;
+  if (requested?.status === 'terminated' && requested.callStack?.isEmpty()) {
+    return requested;
+  }
+
+  const shared = jvm._awtEventThread;
+  if (shared?.callStack?.isEmpty() &&
+      (shared.status === 'runnable' || shared.status === 'terminated')) {
+    return shared;
+  }
+
+  const ids = (jvm.threads || []).map((thread) => Number(thread.id))
+    .filter(Number.isFinite);
+  const thread = {
+    id: ids.length ? Math.max(...ids) + 1 : 0,
+    name: 'AWT-EventQueue-0',
+    callStack: new CallStack(),
+    status: 'terminated',
+    pendingException: null,
+  };
+  if (!Array.isArray(jvm.threads)) jvm.threads = [];
+  jvm.threads.push(thread);
+  if (!shared) jvm._awtEventThread = thread;
+  return thread;
+}
+
 /**
  * Push and drain one AWT-owned guest frame without monopolizing the browser.
  * Frames that exceed the cap are removed so they cannot resume later without
  * the bookkeeping that their caller installed.
  */
 async function runFrame(jvm, frame, options = {}) {
-  const thread = options.thread ||
+  const requested = options.thread ||
     jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+  const thread = runnableEventThread(jvm, requested);
   if (!thread) return { completed: false, iterations: 0, limitReached: false };
 
   const maxIterations = options.maxIterations || 500000;

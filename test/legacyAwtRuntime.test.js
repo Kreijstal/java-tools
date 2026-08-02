@@ -194,6 +194,43 @@ test('legacy guest calls restore reflective state and browser posts serialize', 
   t.end();
 });
 
+test('legacy frame dispatch never wakes a monitor-blocked guest thread', async (t) => {
+  const monitor = { isLocked: true, lockOwner: 7, lockCount: 1 };
+  const outerFrame = { name: 'blocked-owner' };
+  const blockedThread = {
+    id: 2,
+    callStack: new Stack(),
+    status: 'BLOCKED',
+    blockingOn: monitor,
+    pendingException: null,
+  };
+  blockedThread.callStack.push(outerFrame);
+  const jvm = {
+    threads: [blockedThread],
+    currentThreadIndex: 0,
+    async executeTick() {
+      const eventThread = this.threads.find((thread) => thread !== blockedThread);
+      eventThread.callStack.pop();
+      eventThread.status = 'terminated';
+      return { completed: false };
+    },
+  };
+  const eventFrame = { name: 'browser-event' };
+  const result = await legacyEvents.runFrame(jvm, eventFrame, {
+    thread: blockedThread,
+  });
+
+  t.ok(result.completed, 'the event completes on an independent AWT thread');
+  t.equal(blockedThread.status, 'BLOCKED', 'the contended guest remains blocked');
+  t.equal(blockedThread.blockingOn, monitor, 'the pending monitor is retained');
+  t.equal(blockedThread.callStack.size(), 1,
+    'the blocked guest stack is not changed by browser dispatch');
+  t.equal(blockedThread.callStack.peek(), outerFrame,
+    'the original monitor-protected frame remains current');
+  t.equal(jvm.threads.length, 2, 'an AWT event thread owns the callback');
+  t.end();
+});
+
 test('legacy default dispatch includes enter, exit, and key handlers', async (t) => {
   const lookups = [];
   const jvm = {

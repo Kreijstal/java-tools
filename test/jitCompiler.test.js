@@ -6963,6 +6963,69 @@ public final class StructuredFieldArrayRangeHarness {
   t.end();
 });
 
+test('structured SSA copy propagation rewrites deferred call edges', async (t) => {
+  const className = 'StructuredAliasFallbackHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class StructuredAliasFallbackHarness {
+  static final class Reader {
+    int value;
+    int next() { return value; }
+  }
+  static final class Box {
+    int value;
+    void read(Reader reader) { value = reader.next(); }
+  }
+  Box box;
+  void decode(Reader reader) {
+    box = new Box();
+    box.read(reader);
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await Promise.all([
+    jvm.loadClassByName(className),
+    jvm.loadClassByName(`${className}$Reader`),
+    jvm.loadClassByName(`${className}$Box`),
+  ]);
+  for (const loaded of [className, `${className}$Reader`, `${className}$Box`]) {
+    jvm.classInitializationState.set(loaded, 'INITIALIZED');
+  }
+  const method = await jvm.findMethodInHierarchy(
+    className, 'decode', `(L${className}$Reader;)V`);
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the constructor and deferred call compile through structured SSA');
+  t.ok(generated.jvmStructuredCoalescedSsaCopyCount >= 1,
+    'bytecode stack copies are coalesced without guest identity rules');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    generated.jvmStructuredSource), [],
+  'ordinary, asynchronous, deopt, and yield edges bind every SSA value');
+
+  const rejected = structuredRendererTest.unboundGeneratedSsaIdentifiers([
+    'const ssaValue0 = 1;',
+    'if (thread.status !== "runnable") {',
+    '  helpers.materialize(frame, ssaValue1);',
+    '}',
+  ].join('\n'));
+  t.deepEqual(rejected, ['ssaValue1'],
+    'the AST audit catches values referenced only on cold alternate edges');
+  const outOfScope = structuredRendererTest.unboundGeneratedSsaIdentifiers([
+    'let ssaValue0;',
+    '{',
+    '  const ssaValue1 = 7;',
+    '}',
+    'ssaValue0 = ssaValue1;',
+  ].join('\n'));
+  t.deepEqual(outOfScope, ['ssaValue1'],
+    'the AST scope graph rejects nested declarations used from outer scope');
+  t.end();
+});
+
 test('structured JVM SSA emits atomic kernels for fully bounded counted loops', async (t) => {
   const classpath = compileJavaFixture(t, 'StructuredAtomicHarness', `
 public class StructuredAtomicHarness {
@@ -8673,6 +8736,12 @@ class DirectIntegerLeafTarget {
     if ((value & 63) == 63) return "abc".length() + value;
     return value * 3;
   }
+  static int scopedGuarded(int value) {
+    int selected = value;
+    if ((value & 1) != 0) selected = (value + 5) * 3;
+    if ((selected & 63) == 63) return "abc".length() + selected;
+    return selected * 7;
+  }
 }
 public class DirectIntegerInlineHarness {
   public static void compute(int[] out) {
@@ -8685,6 +8754,13 @@ public class DirectIntegerInlineHarness {
   public static void computeGuarded(int[] out) {
     int sum = 0;
     for (int i = 0; i < 128; i++) sum += DirectIntegerLeafTarget.guarded(i);
+    out[0] = sum;
+  }
+  public static void computeScopedGuarded(int[] out) {
+    int sum = 0;
+    for (int i = 0; i < 128; i++) {
+      sum += DirectIntegerLeafTarget.scopedGuarded(i);
+    }
     out[0] = sum;
   }
 }
@@ -8738,6 +8814,44 @@ public class DirectIntegerInlineHarness {
   }
   t.equal(guardedOut[0], guardedExpected,
     'failed direct-inline guards resume the canonical helper at the invoke');
+
+  const scopedGuardedOut = [0];
+  scopedGuardedOut.type = '[I';
+  await invoke(jvm, thread, 'DirectIntegerInlineHarness',
+    'computeScopedGuarded', '([I)V', [scopedGuardedOut]);
+  let scopedGuardedExpected = 0;
+  for (let i = 0; i < 128; i++) {
+    const selected = (i & 1) !== 0 ? Math.imul((i + 5) | 0, 3) : i;
+    const value = (selected & 63) === 63
+      ? (selected + 3) | 0 : Math.imul(selected, 7);
+    scopedGuardedExpected = (scopedGuardedExpected + value) | 0;
+  }
+  t.equal(scopedGuardedOut[0], scopedGuardedExpected,
+    'branch-local inline values remain available to later guards and results');
+
+  const structuredJvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
+    structuredSsa: true,
+  } });
+  for (const className of ['DirectIntegerInlineHarness', 'DirectIntegerLeafTarget']) {
+    await structuredJvm.loadClassByName(className);
+    structuredJvm.classInitializationState.set(className, 'INITIALIZED');
+  }
+  const structuredThread = {
+    id: 0,
+    name: 'structured-direct-integer-inline-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  structuredJvm.threads = [structuredThread];
+  structuredJvm.currentThreadIndex = 0;
+  const structuredOut = [0];
+  structuredOut.type = '[I';
+  await invoke(structuredJvm, structuredThread, 'DirectIntegerInlineHarness',
+    'computeScopedGuarded', '([I)V', [structuredOut]);
+  t.equal(structuredOut[0], scopedGuardedExpected,
+    'structured callers evaluate inline temporaries before dependent guards');
 
   jvm.debugManager.addBreakpoint(0, { className: 'DirectIntegerLeafTarget' });
   const debugOut = [0];

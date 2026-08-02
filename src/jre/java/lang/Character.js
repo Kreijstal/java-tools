@@ -32,6 +32,8 @@ module.exports = {
       const charStr = String.fromCharCode(ch);
       return charStr.toLowerCase().charCodeAt(0);
     },
+    "toTitleCase(C)C": (jvm, obj, args) =>
+      module.exports.staticMethods["toUpperCase(C)C"](jvm, obj, args),
     "forDigit(II)C": (jvm, obj, args) => {
       const digit = args[0];
       const radix = args[1];
