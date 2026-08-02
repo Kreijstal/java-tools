@@ -1,4 +1,7 @@
 const Stack = require("./stack");
+const CallStack = require("./callStack");
+const { releaseFrameMonitor } = CallStack;
+const FRAME_STATIC_KIND = Symbol("frame.staticKind");
 const {
   loadClassByPath,
   loadClassByPathSync: loadConvertedClass,
@@ -204,7 +207,8 @@ class JVM {
     const configuredYieldStrategy =
       options.eventLoopYieldStrategy ?? env.JVM_EVENT_LOOP_YIELD_STRATEGY;
     this.eventLoopYieldStrategy =
-      configuredYieldStrategy === "timer" ? "timer" : "message-channel";
+      configuredYieldStrategy === "message-channel"
+        ? "message-channel" : "timer";
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
@@ -644,7 +648,7 @@ class JVM {
     const mainThread = {
       id: 0,
       name: "main",
-      callStack: new Stack(),
+      callStack: new CallStack(),
       status: "runnable",
       pendingException: null,
     };
@@ -806,7 +810,7 @@ class JVM {
     return objRef;
   }
 
-  setupAppletDebugMode(className, mainThread, appletObj) {
+  async setupAppletDebugMode(className, mainThread, appletObj) {
     // Store minimal applet info for method sequencing
     mainThread.appletInfo = {
       instance: appletObj,
@@ -815,7 +819,7 @@ class JVM {
     };
 
     // Start with constructor - this will be debugged step-by-step
-    this.setupNextAppletMethod(mainThread);
+    await this.setupNextAppletMethod(mainThread);
   }
 
   // Helper method to create a proper Graphics object connected to DOM canvas
@@ -866,7 +870,7 @@ class JVM {
     return graphicsObj;
   }
 
-  setupNextAppletMethod(mainThread) {
+  async setupNextAppletMethod(mainThread) {
     const appletInfo = mainThread.appletInfo;
     if (!appletInfo || appletInfo.nextMethods.length === 0) {
       // No more methods to set up
@@ -888,7 +892,7 @@ class JVM {
         return;
       }
     } else if (methodName === 'init') {
-      const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
+      const initMethod = await this.findMethodInHierarchy(className, 'init', '()V');
       if (initMethod) {
         const initFrame = new Frame(initMethod);
         initFrame.className = className;
@@ -897,7 +901,7 @@ class JVM {
         return;
       }
     } else if (methodName === 'start') {
-      const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
+      const startMethod = await this.findMethodInHierarchy(className, 'start', '()V');
       if (startMethod) {
         const startFrame = new Frame(startMethod);
         startFrame.className = className;
@@ -906,7 +910,11 @@ class JVM {
         return;
       }
     } else if (methodName === 'paint') {
-      const paintMethod = this.findMethod({ ast: this.classes[className].ast }, 'paint', '(Ljava/awt/Graphics;)V');
+      const paintMethod = await this.findMethodInHierarchy(
+        className,
+        'paint',
+        '(Ljava/awt/Graphics;)V',
+      );
       if (paintMethod) {
         const paintFrame = new Frame(paintMethod);
         paintFrame.className = className;
@@ -920,7 +928,7 @@ class JVM {
     }
 
     // If method not found, try next method recursively
-    this.setupNextAppletMethod(mainThread);
+    await this.setupNextAppletMethod(mainThread);
   }
 
   async executeAppletLifecycle(className, mainThread, appletObj) {
@@ -940,8 +948,10 @@ class JVM {
       await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
-    // Call init() method if it exists
-    const initMethod = this.findMethod({ ast: this.classes[className].ast }, 'init', '()V');
+    // Applet lifecycle methods are virtual. A concrete applet commonly keeps
+    // init() on the leaf class while inheriting start() from a reusable game
+    // shell, so resolve both through the normal class hierarchy.
+    const initMethod = await this.findMethodInHierarchy(className, 'init', '()V');
     if (initMethod) {
       mainThread.status = "runnable";
       const initFrame = new Frame(initMethod);
@@ -954,8 +964,7 @@ class JVM {
       await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
-    // Call start() method if it exists
-    const startMethod = this.findMethod({ ast: this.classes[className].ast }, 'start', '()V');
+    const startMethod = await this.findMethodInHierarchy(className, 'start', '()V');
     if (startMethod) {
       mainThread.status = "runnable";
       const startFrame = new Frame(startMethod);
@@ -1022,7 +1031,14 @@ class JVM {
                 const currentPc = label
                   ? parseInt(label.substring(1, label.length - 1))
                   : -1;
-                if (this.debugManager.breakpoints.has(currentPc)) {
+                // A bare offset matches anywhere; a located breakpoint must
+                // also match the frame's class/method, so an offset such as 6
+                // no longer stops in every method that reaches it.
+                if (this.debugManager.shouldBreakAt(currentPc, {
+                  className: frame.className,
+                  methodName: frame.method && frame.method.name,
+                  descriptor: frame.method && frame.method.descriptor,
+                })) {
                   this.debugManager.pause();
                 }
               }
@@ -1077,7 +1093,7 @@ class JVM {
           thread = {
             id: this.threads.length,
             name: 'AWT-EventQueue-0',
-            callStack: new Stack(),
+            callStack: new CallStack(),
             status: 'terminated',
             pendingException: null,
           };
@@ -1296,6 +1312,13 @@ class JVM {
     if (frame.pc >= frame.instructions.length) {
       return JIT_TICK_SLOW;
     }
+    // This fast path enters the frame without going through executeTick, so it
+    // owns the implied ACC_SYNCHRONIZED acquisition too. A contended monitor
+    // parks the thread; the slow path then finds it BLOCKED and reschedules.
+    if (frame.isSynchronizedMethod && !frame.monitorEntered &&
+        !this.enterFrameMonitorIfNeeded(frame, thread)) {
+      return JIT_TICK_SLOW;
+    }
 
     try {
       const jitResult = this.jit.tryRunFrame(frame, thread);
@@ -1377,6 +1400,18 @@ class JVM {
       return { completed: false };
     }
 
+    // Enter the implied monitor before anything executes in this frame -- the
+    // JIT attempt below included. Leaving pc untouched makes the scheduler
+    // retry this frame once the owner releases, exactly like monitorenter.
+    if (frame.isSynchronizedMethod && !frame.monitorEntered &&
+        !this.enterFrameMonitorIfNeeded(frame, thread)) {
+      if (this.threads.length > 0) {
+        this.currentThreadIndex =
+          (this.currentThreadIndex + 1) % this.threads.length;
+      }
+      return { completed: false };
+    }
+
     try {
       // Generated JavaScript and Wasm entries normally complete
       // synchronously. Do not force a Promise/microtask round trip for those
@@ -1424,6 +1459,13 @@ class JVM {
       const currentFrame = callStack.isEmpty() ? null : callStack.peek();
       if (!currentFrame || currentFrame.pc >= currentFrame.instructions.length ||
           thread.status !== 'runnable') break;
+
+      // An invoke earlier in this burst may have pushed a synchronized frame;
+      // it must not execute before its monitor is held. This runs per bytecode,
+      // so the overwhelmingly common non-synchronized case stays two property
+      // reads and never reaches the call.
+      if (currentFrame.isSynchronizedMethod && !currentFrame.monitorEntered &&
+          !this.enterFrameMonitorIfNeeded(currentFrame, thread)) break;
 
       // A whole method may still be warming while a verified bounded
       // primitive-array loop inside it is already hot. Enter the cached scalar
@@ -1473,7 +1515,7 @@ class JVM {
 
           if (shouldSetupNextAppletMethod) {
             await this.executeInstruction(instruction, currentFrame, thread);
-            this.setupNextAppletMethod(thread);
+            await this.setupNextAppletMethod(thread);
             break;
           }
 
@@ -1764,6 +1806,7 @@ class JVM {
           if (classData && classData.ast) {
             this.classes[classNameWithSlashes] = classData;
             this.classEpoch += 1;
+            this._notifyClassLoaded(classNameWithSlashes, classData);
             return classData;
           }
           continue;
@@ -1775,6 +1818,7 @@ class JVM {
           if (classData && classData.ast) {
             this.classes[classNameWithSlashes] = classData;
             this.classEpoch += 1;
+            this._notifyClassLoaded(classNameWithSlashes, classData);
             return classData;
           }
         } catch (error) {
@@ -2634,6 +2678,71 @@ class JVM {
   // operand stack. Returns true when dispatched. Shared by the interpreter's
   // unwinding above and the wasm tiers' nested EH-callee links (a nested -3
   // dispatches inside the callee's scratch frame before it is materialized).
+  // The object a synchronized method locks: the receiver for instance methods,
+  // the declaring class's Class object for static ones -- the same object
+  // `synchronized (Foo.class)` would lock, so the two forms exclude each other.
+  frameMonitorObject(frame) {
+    if (frame.monitorObject) return frame.monitorObject;
+    // Memoised: this runs on every synchronized call, and a raw flags.includes()
+    // here was an array scan per acquisition.
+    const method = frame.method;
+    let isStatic = method && method[FRAME_STATIC_KIND];
+    if (isStatic === undefined) {
+      isStatic = ((method && method.flags) || []).includes("static");
+      if (method) method[FRAME_STATIC_KIND] = isStatic;
+    }
+    const target = isStatic
+      ? (frame.className ? this.getClassObjectSync(frame.className) : null)
+      : frame.locals[0];
+    if (!target || typeof target !== "object") return null;
+    frame.monitorObject = target;
+    return target;
+  }
+
+  /**
+   * Enter a synchronized method's implied monitor before its first instruction.
+   * Returns false when the monitor is owned by another thread; the caller must
+   * leave the frame at its current pc so the entry is retried once the
+   * scheduler marks the thread runnable again (same protocol as monitorenter).
+   */
+  enterFrameMonitorIfNeeded(frame, thread) {
+    if (!frame.isSynchronizedMethod || frame.monitorEntered) return true;
+    const monitor = this.frameMonitorObject(frame);
+    // A missing monitor (no receiver, unloaded class) must not wedge the
+    // thread; running unsynchronized matches the previous behaviour. It still
+    // counts: the flag is set, so the release path must be allowed to clear it.
+    // Skipping the count here left monitorEntered stuck true on a pooled frame,
+    // which then skipped acquisition entirely on its next use.
+    if (!monitor) {
+      frame.monitorEntered = true;
+      return true;
+    }
+    if (!monitor.isLocked) {
+      monitor.isLocked = true;
+      monitor.lockOwner = thread.id;
+      monitor.lockCount = 1;
+    } else if (monitor.lockOwner === thread.id) {
+      monitor.lockCount++;
+    } else {
+      thread.status = "BLOCKED";
+      thread.blockingOn = monitor;
+      return false;
+    }
+    frame.monitorEntered = true;
+    frame.monitorOwnerThreadId = thread.id;
+    return true;
+  }
+
+  /**
+   * Release a synchronized frame's monitor. Ordinary returns and unwinds do not
+   * need this: CallStack.pop() releases whatever the retiring frame held, which
+   * is what lets the generated tiers return without any monitor bookkeeping.
+   */
+  exitFrameMonitor(frame) {
+    if (!frame || !frame.monitorEntered) return;
+    releaseFrameMonitor(frame);
+  }
+
   dispatchExceptionInFrame(frame, exception, pcToCheck) {
     const table = frame.exceptionTable;
     if (!table) return false;
@@ -2778,7 +2887,7 @@ class JVM {
     this.threads = [];
     for (const snapshot of decoded.threads || []) {
       const properties = snapshot.properties || {};
-      const thread = { ...properties, callStack: new Stack() };
+      const thread = { ...properties, callStack: new CallStack() };
       if (properties.sleepRemaining !== undefined) {
         thread.sleepUntil = restoredAt + Number(properties.sleepRemaining);
         delete thread.sleepRemaining;
@@ -2936,7 +3045,7 @@ class JVM {
         const thread = {
           id: threadState.id,
           status: threadState.status,
-          callStack: new Stack(),
+          callStack: new CallStack(),
         };
         for (const frameState of threadState.callStack) {
           const method = await this.findMethodInHierarchy(
@@ -3011,8 +3120,42 @@ class JVM {
   disableDebugMode() {
     this.debugManager.disable();
   }
+  /**
+   * Observe lazy class loading.  A debugger needs this to arm a breakpoint on
+   * a class that has not been reached yet: the location cannot be resolved
+   * until the class exists, and by the time it is running it is too late.
+   */
+  onClassLoaded(listener) {
+    if (typeof listener !== 'function') return () => {};
+    if (!this._classLoadListeners) this._classLoadListeners = [];
+    this._classLoadListeners.push(listener);
+    return () => {
+      this._classLoadListeners =
+        this._classLoadListeners.filter((entry) => entry !== listener);
+    };
+  }
+
+  _notifyClassLoaded(className, classData) {
+    if (!this._classLoadListeners || !this._classLoadListeners.length) return;
+    for (const listener of [...this._classLoadListeners]) {
+      try {
+        listener(className, classData);
+      } catch (error) {
+        // A misbehaving observer must never break class loading.
+        if (this.verbose) {
+          console.error(`class-load listener failed: ${error.message}`);
+        }
+      }
+    }
+  }
+
   addBreakpoint(pc) {
     this.debugManager.addBreakpoint(pc, this.getCurrentBreakpointLocation());
+  }
+
+  /** Breakpoint bound to a specific class/method rather than a bare offset. */
+  addLocatedBreakpoint(pc, location) {
+    return this.debugManager.addStrictBreakpoint(pc, location);
   }
   removeBreakpoint(pc) {
     this.debugManager.removeBreakpoint(pc, this.getCurrentBreakpointLocation());

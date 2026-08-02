@@ -1,6 +1,6 @@
 "use strict";
 
-// Semantic replacement for the polygon edge-table rasterizer used by several
+// Historical oracle for the polygon edge-table rasterizer used by several
 // Jagex-era software renderers.  Recognition is deliberately independent of
 // class, method, and field names:
 //
@@ -12,8 +12,8 @@
 // then checks class/debug state and validates every array/layout assumption
 // before changing a guest static or destination pixel.
 
-const { allocPrimitiveArray } = require("../instructions/object");
-const { fingerprintMethods } = require("./HandwrittenFusedGradient");
+const { allocPrimitiveArray } = require("../../src/instructions/object");
+const { fingerprintMethods } = require("./FusedGradientOracle");
 
 // These are compiler-layout variants of the same audited source algorithm.
 // Names are canonicalized out of every value.  Keep a variant only after its
@@ -109,6 +109,15 @@ function readLocation(location) {
 function writeLocation(location, value) {
   if (location.kind === "map") location.fields.set(location.key, value);
   else location.fields[location.key] = value;
+  if (location.versionCell) {
+    if (location.versionCell.captureCaches) {
+      for (const cache of location.versionCell.captureCaches) {
+        cache.dirty = true;
+        cache.specializedMatches = false;
+        for (const key of cache.derivedGuardKeys) cache[key] = undefined;
+      }
+    }
+  }
 }
 
 function ownerOf(ref) {
@@ -383,9 +392,7 @@ function candidateDependencies(jit, wrapperMethod, descriptor) {
   return spanCalls.length === 1 ? [spanCalls[0].arg[1]] : null;
 }
 
-function createIntrinsic(jit, wrapperMethod, descriptor, sentinels) {
-  const plan = analyze(jit, wrapperMethod, descriptor);
-  if (!plan) return null;
+function createIntrinsicForPlan(jit, plan, sentinels) {
   const { ASYNC_INVOKE, RETURN_VOID } = sentinels;
   const locations = plan.locations;
 
@@ -613,6 +620,11 @@ function createIntrinsic(jit, wrapperMethod, descriptor, sentinels) {
   return intrinsic;
 }
 
+function createIntrinsic(jit, wrapperMethod, descriptor, sentinels) {
+  const plan = analyze(jit, wrapperMethod, descriptor);
+  return plan ? createIntrinsicForPlan(jit, plan, sentinels) : null;
+}
+
 module.exports = {
   analyze,
   candidateDependencies,
@@ -620,5 +632,6 @@ module.exports = {
   _test: {
     KNOWN_FLAT_FINGERPRINTS,
     KNOWN_ALPHA_FINGERPRINTS,
+    createIntrinsicForPlan,
   },
 };

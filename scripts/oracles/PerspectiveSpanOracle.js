@@ -1,11 +1,11 @@
 "use strict";
 
-// Direct kernel for the classic eight-pixel perspective-textured scanline.
+// Historical oracle for the classic eight-pixel perspective-textured scanline.
 // Installation is gated by a complete, identity-canonicalized bytecode
 // fingerprint plus descriptor, field-relationship, handler, and static-field
 // checks. Guest owner/member names are never used for selection.
 
-const { fingerprintMethods } = require("./HandwrittenFusedGradient");
+const { fingerprintMethods } = require("./FusedGradientOracle");
 
 const DESCRIPTOR = "([I[IIIIIIIIIIIIII)V";
 const KNOWN_FINGERPRINTS = new Set([
@@ -142,65 +142,7 @@ function runKernel(destinationData, textureData, destinationIndex,
   }
 }
 
-function createIntrinsic(jit, method, descriptor, sentinels) {
-  if (descriptor !== DESCRIPTOR || !(method.flags || []).includes("static")) {
-    return null;
-  }
-  const code = method.attributes.find(
-    (attribute) => attribute.type === "code")?.code;
-  if (!code || (code.exceptionTable || []).length !== 0) return null;
-  const fingerprint = fingerprintMethods(jit, [method]);
-  if (typeof process !== "undefined" && process.env &&
-      process.env.JVM_PRINT_PERSPECTIVE_SPAN_FINGERPRINT === "1") {
-    console.error(`perspective span fingerprint: ${fingerprint}`);
-  }
-  if (!KNOWN_FINGERPRINTS.has(fingerprint)) return null;
-
-  const staticReads = jit.getCodeItems(method)
-    .map((item) => item && item.instruction)
-    .filter((instruction) => getOp(instruction) === "getstatic" &&
-      Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]))
-    .map((instruction) => instruction.arg);
-  if (staticReads.length !== 8 ||
-      staticReads.map((field) => field[2][1]).join("") !== "ZIIZIZIZ" ||
-      !sameField(staticReads[1], staticReads[2]) ||
-      !sameField(staticReads[4], staticReads[6]) ||
-      !sameField(staticReads[5], staticReads[7]) ||
-      sameField(staticReads[0], staticReads[3]) ||
-      sameField(staticReads[0], staticReads[5]) ||
-      sameField(staticReads[3], staticReads[5]) ||
-      sameField(staticReads[1], staticReads[4])) {
-    return null;
-  }
-
-  const selectedFields = [
-    staticReads[0], // horizontal clipping enabled
-    staticReads[1], // horizontal clip limit
-    staticReads[3], // texture detail/layout mode
-    staticReads[4], // horizontal perspective origin
-    staticReads[5], // opaque texture mode
-  ];
-  const owners = [...new Set(selectedFields.map((field) => field[1]))];
-  for (const field of selectedFields) {
-    const ownerClass = jit.jvm.classes[field[1]];
-    const declaration = ownerClass?.ast?.classes?.[0]?.items?.find((item) =>
-      item?.type === "field" &&
-      item.field?.name === field[2][0] &&
-      item.field?.descriptor === field[2][1]);
-    if (!declaration || (declaration.field.flags || []).includes("volatile")) {
-      return null;
-    }
-  }
-  const targets = selectedFields.map((field) => {
-    const site = jit.registerFieldSite(field);
-    const direct = jit.registerDirectStaticTarget(site);
-    return direct ? jit.directStaticTargets[direct.targetId] : null;
-  });
-  if (targets.some((target) => !target)) return null;
-
-  const methodOwner = jit.jvm.findClassNameForMethod?.(method) ||
-    selectedFields[0][1];
-  if (!methodOwner) return null;
+function createRun(jit, targets, owners, methodOwner, sentinels) {
   const { ASYNC_INVOKE, RETURN_VOID } = sentinels;
   const fallback = () => {
     jit.perspectiveSpanGuardedFallbackCount =
@@ -208,7 +150,7 @@ function createIntrinsic(jit, method, descriptor, sentinels) {
     return ASYNC_INVOKE;
   };
 
-  function run(destination, texture, unusedCoordinate, unusedColor,
+  return function run(destination, texture, unusedCoordinate, unusedColor,
     destinationIndex, startX, endX, shade, shadeStep,
     uNumerator, vNumerator, wNumerator, uStep, vStep, wStep) {
     if (jit._envInstrumented || jit.needsBytecodeChecks() ||
@@ -272,7 +214,69 @@ function createIntrinsic(jit, method, descriptor, sentinels) {
     jit.perspectiveSpanRunCount =
       (jit.perspectiveSpanRunCount | 0) + 1;
     return RETURN_VOID;
+  };
+}
+
+function createIntrinsic(jit, method, descriptor, sentinels) {
+  if (descriptor !== DESCRIPTOR || !(method.flags || []).includes("static")) {
+    return null;
   }
+  const code = method.attributes.find(
+    (attribute) => attribute.type === "code")?.code;
+  if (!code || (code.exceptionTable || []).length !== 0) return null;
+  const fingerprint = fingerprintMethods(jit, [method]);
+  if (typeof process !== "undefined" && process.env &&
+      process.env.JVM_PRINT_PERSPECTIVE_SPAN_FINGERPRINT === "1") {
+    console.error(`perspective span fingerprint: ${fingerprint}`);
+  }
+  if (!KNOWN_FINGERPRINTS.has(fingerprint)) return null;
+
+  const staticReads = jit.getCodeItems(method)
+    .map((item) => item && item.instruction)
+    .filter((instruction) => getOp(instruction) === "getstatic" &&
+      Array.isArray(instruction.arg) && Array.isArray(instruction.arg[2]))
+    .map((instruction) => instruction.arg);
+  if (staticReads.length !== 8 ||
+      staticReads.map((field) => field[2][1]).join("") !== "ZIIZIZIZ" ||
+      !sameField(staticReads[1], staticReads[2]) ||
+      !sameField(staticReads[4], staticReads[6]) ||
+      !sameField(staticReads[5], staticReads[7]) ||
+      sameField(staticReads[0], staticReads[3]) ||
+      sameField(staticReads[0], staticReads[5]) ||
+      sameField(staticReads[3], staticReads[5]) ||
+      sameField(staticReads[1], staticReads[4])) {
+    return null;
+  }
+
+  const selectedFields = [
+    staticReads[0], // horizontal clipping enabled
+    staticReads[1], // horizontal clip limit
+    staticReads[3], // texture detail/layout mode
+    staticReads[4], // horizontal perspective origin
+    staticReads[5], // opaque texture mode
+  ];
+  const owners = [...new Set(selectedFields.map((field) => field[1]))];
+  for (const field of selectedFields) {
+    const ownerClass = jit.jvm.classes[field[1]];
+    const declaration = ownerClass?.ast?.classes?.[0]?.items?.find((item) =>
+      item?.type === "field" &&
+      item.field?.name === field[2][0] &&
+      item.field?.descriptor === field[2][1]);
+    if (!declaration || (declaration.field.flags || []).includes("volatile")) {
+      return null;
+    }
+  }
+  const targets = selectedFields.map((field) => {
+    const site = jit.registerFieldSite(field);
+    const direct = jit.registerDirectStaticTarget(site);
+    return direct ? jit.directStaticTargets[direct.targetId] : null;
+  });
+  if (targets.some((target) => !target)) return null;
+
+  const methodOwner = jit.jvm.findClassNameForMethod?.(method) ||
+    selectedFields[0][1];
+  if (!methodOwner) return null;
+  const run = createRun(jit, targets, owners, methodOwner, sentinels);
 
   const intrinsic = (stack, base) => run(
     stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
@@ -290,6 +294,7 @@ module.exports = {
   createIntrinsic,
   _test: {
     KNOWN_FINGERPRINTS,
+    createRun,
     runKernel,
     shadePixel,
   },

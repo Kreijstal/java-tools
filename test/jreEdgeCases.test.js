@@ -10,6 +10,7 @@ const { JVM } = require('../src/core/jvm');
 const File = require('../src/jre/java/io/File');
 const FileInputStream = require('../src/jre/java/io/FileInputStream');
 const ReflectField = require('../src/jre/java/lang/reflect/Field');
+const Unsafe = require('../src/jre/sun/misc/Unsafe');
 const HashMap = require('../src/jre/java/util/HashMap');
 const Hashtable = require('../src/jre/java/util/Hashtable');
 const Pattern = require('../src/jre/java/util/regex/Pattern');
@@ -31,7 +32,10 @@ const Thread = require('../src/jre/java/lang/Thread');
 const ThreadGroup = require('../src/jre/java/lang/ThreadGroup');
 const JNI = require('../src/core/jni');
 const ByteBuffer = require('../src/jre/java/nio/ByteBuffer');
+const NioPath = require('../src/jre/java/nio/file/Path');
 const Random = require('../src/jre/java/util/Random');
+const Collectors = require('../src/jre/java/util/stream/Collectors');
+const Stream = require('../src/jre/java/util/stream/Stream');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
 const { decodePng } = require('../src/io/gifDecoder');
 const {
@@ -81,6 +85,88 @@ test('Class.newInstance reports InstantiationException for primitive classes', a
     error = caught;
   }
   t.equal(error && error.type, 'java/lang/InstantiationException');
+  t.end();
+});
+
+test('Path startsWith and endsWith compare path elements', (t) => {
+  const startsWith = NioPath.methods['startsWith(Ljava/nio/file/Path;)Z'];
+  const endsWith = NioPath.methods['endsWith(Ljava/nio/file/Path;)Z'];
+  const nioPath = (value) => ({ type: 'java/nio/file/Path', path: value });
+
+  t.equal(startsWith(null, nioPath('/foo/barbaz'), [nioPath('/foo/bar')]), 0,
+    'a partial element prefix does not match');
+  t.equal(startsWith(null, nioPath('/foo/bar'), [nioPath('/foo')]), 1,
+    'a complete absolute element prefix matches');
+  t.equal(endsWith(null, nioPath('/foo/bar'), [nioPath('bar')]), 1,
+    'an absolute path can end with a relative path');
+  t.equal(endsWith(null, nioPath('/foo/bar'), [nioPath('/bar')]), 0,
+    'an absolute suffix must include the complete rooted path');
+  t.equal(endsWith(null, nioPath('foo/bar'), [nioPath('bar')]), 1,
+    'relative suffixes compare complete elements');
+  t.equal(startsWith(null, nioPath(''), [nioPath('')]), 1,
+    'the empty path starts with itself');
+  t.equal(startsWith(null, nioPath('foo'), [nioPath('')]), 0,
+    'a non-empty path does not start with the empty path');
+  t.end();
+});
+
+test('Stream toMap collector evaluates key and value mappers', async (t) => {
+  const calls = [];
+  const keyMapper = {
+    methods: {
+      'apply(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+        calls.push(`key:${args[0]}`);
+        return `key-${args[0]}`;
+      },
+    },
+  };
+  const valueMapper = {
+    methods: {
+      'apply(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) => {
+        calls.push(`value:${args[0]}`);
+        return args[0] * 10;
+      },
+    },
+  };
+  const collector = Collectors.staticMethods[
+    'toMap(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;'
+  ](null, null, [keyMapper, valueMapper]);
+  const result = await Stream.methods[
+    'collect(Ljava/util/stream/Collector;)Ljava/lang/Object;'
+  ](jvmStub(), { array: [2, 3] }, [collector], null);
+
+  t.deepEqual(calls, ['key:2', 'value:2', 'key:3', 'value:3'],
+    'both mapper functions run once per stream element');
+  t.equal(HashMap.methods['get(Ljava/lang/Object;)Ljava/lang/Object;'](
+    jvmStub(), result, ['key-2'],
+  ), 20, 'the mapped key addresses the mapped value');
+  t.equal(HashMap.methods['get(Ljava/lang/Object;)Ljava/lang/Object;'](
+    jvmStub(), result, ['key-3'],
+  ), 30, 'all mapped entries are retained');
+  t.equal(result.map.size, 2, 'the collector returns a two-entry HashMap');
+  t.end();
+});
+
+test('Stream toMap collector rejects duplicate keys', async (t) => {
+  const mapper = (callback) => ({
+    methods: {
+      'apply(Ljava/lang/Object;)Ljava/lang/Object;': (jvm, obj, args) =>
+        callback(args[0]),
+    },
+  });
+  const collector = Collectors.staticMethods[
+    'toMap(Ljava/util/function/Function;Ljava/util/function/Function;)Ljava/util/stream/Collector;'
+  ](null, null, [mapper(() => 'same'), mapper((value) => value)]);
+  let error = null;
+  try {
+    await Stream.methods[
+      'collect(Ljava/util/stream/Collector;)Ljava/lang/Object;'
+    ](jvmStub(), { array: [1, 2] }, [collector], null);
+  } catch (caught) {
+    error = caught;
+  }
+
+  t.equal(error && error.type, 'java/lang/IllegalStateException');
   t.end();
 });
 
@@ -517,6 +603,49 @@ test('reflective fields use normal JVM instance storage', (t) => {
   t.end();
 });
 
+test('reflective and Unsafe static writes invalidate JIT capture containers',
+  (t) => {
+  const staticFields = new Map([['value:I', 1]]);
+  const invalidated = [];
+  const jvm = {
+    jit: {
+      markStaticContainerChanged(fields) {
+        invalidated.push(fields);
+      },
+    },
+  };
+  const classData = {
+    staticFields,
+    ast: { classes: [{ className: 'StaticWriteHarness' }] },
+  };
+  const declaringClass = { _classData: classData };
+  const field = {
+    _declaringClass: declaringClass,
+    _fieldData: { name: 'value', descriptor: 'I', accessFlags: 0x0008 },
+  };
+
+  ReflectField.methods['setInt(Ljava/lang/Object;I)V'](
+    jvm, field, [null, 7]);
+  t.equal(staticFields.get('value:I'), 7,
+    'reflection updates the canonical descriptor-qualified static slot');
+  t.equal(invalidated.shift(), staticFields,
+    'reflection invalidates capture caches for the static container');
+
+  const offset = Unsafe.methods[
+    'staticFieldOffset(Ljava/lang/reflect/Field;)J'
+  ](jvm, null, [field]);
+  const base = Unsafe.methods[
+    'staticFieldBase(Ljava/lang/reflect/Field;)Ljava/lang/Object;'
+  ](jvm, null, [field]);
+  Unsafe.methods['putInt(Ljava/lang/Object;JI)V'](
+    jvm, null, [base, offset, 11]);
+  t.equal(staticFields.get('value:I'), 11,
+    'Unsafe updates the same canonical static slot');
+  t.equal(invalidated.shift(), staticFields,
+    'Unsafe invalidates capture caches for the static container');
+  t.end();
+});
+
 test('headless SourceDataLine discard sink closes cleanly', (t) => {
   const obj = {};
   const format = {
@@ -729,6 +858,60 @@ test('AWT producer blits coalesce dirty presentation on animation frames', (t) =
   if (previousRaf === undefined) delete global.requestAnimationFrame;
   else global.requestAnimationFrame = previousRaf;
   t.end();
+});
+
+test('AWT presentation recovers when an animation callback is starved', (t) => {
+  const previousRaf = global.requestAnimationFrame;
+  const callbacks = [];
+  global.requestAnimationFrame = (callback) => {
+    callbacks.push(callback);
+    return callbacks.length;
+  };
+  const uploads = [];
+  const context = {
+    createImageData(width, height) {
+      return { width, height, data: new Uint8ClampedArray(width * height * 4) };
+    },
+    putImageData(image) {
+      uploads.push(Array.from(image.data));
+    },
+  };
+  const target = {
+    _width: 2,
+    _height: 1,
+    _canvasElement: { width: 2, height: 1, getContext: () => context },
+  };
+  const jvm = { eventLoopYieldMs: 16 };
+  const graphics = { _component: target };
+  const image = {
+    _producer: { width: 2, height: 1, pixels: [0x112233, 0xaabbcc] },
+  };
+  const draw = Graphics.methods[
+    'drawImage(Ljava/awt/Image;IILjava/awt/image/ImageObserver;)Z'
+  ];
+
+  draw(jvm, graphics, [image, 0, 0, null]);
+  draw(jvm, graphics, [image, 0, 0, null]);
+  t.equal(callbacks.length, 1,
+    'one animation callback owns the coalesced frame');
+  setTimeout(() => {
+    t.equal(uploads.length, 1,
+      'the fallback timer uploads the latest completed surface');
+    t.equal(jvm._awtPresentationStats.presented, 1,
+      'the recovered upload is counted as a presentation');
+    t.equal(jvm._awtPresentationStats.presentationFallbacks, 1,
+      'diagnostics identify the starved-animation recovery');
+    t.notOk(target._presentScheduled,
+      'the fallback clears the coalescing latch');
+    // A late callback from the starved queue must not upload twice or clear a
+    // newer presentation token.
+    callbacks.shift()(0);
+    t.equal(uploads.length, 1,
+      'the late animation callback is harmless');
+    if (previousRaf === undefined) delete global.requestAnimationFrame;
+    else global.requestAnimationFrame = previousRaf;
+    t.end();
+  }, 60);
 });
 
 test('headless AWT blits expose an uncapped coalesced presentation boundary', (t) => {

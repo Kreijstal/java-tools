@@ -719,3 +719,43 @@ body.ide-mobile #status {
 body.ide-mobile #panel-debug .ide-panel-body {
   grid-template-columns: 1fr;
 }
+
+/* ---------- Debug shell ---------- */
+.shell-log {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  font-family: var(--ide-mono, monospace);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 6px 8px;
+}
+.shell-line { padding: 1px 0; }
+.shell-input-line, .shell-line.shell-input { color: #7fb3ff; }
+.shell-line.shell-result { color: #d7dae0; }
+.shell-line.shell-note { color: #8a929e; }
+.shell-line.shell-error { color: #ff8080; }
+.shell-prompt {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid var(--ide-border, #2c313a);
+  padding: 4px 8px;
+}
+.shell-caret { color: #7fb3ff; font-family: var(--ide-mono, monospace); }
+.shell-input {
+  flex: 1 1 auto;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: inherit;
+  font-family: var(--ide-mono, monospace);
+  font-size: 12px;
+  padding: 3px 0;
+}
+#panel-shell .ide-panel-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}

@@ -105,12 +105,13 @@ module.exports = {
       obj.threadGroup || null,
     'start()V': async (jvm, threadObject, args, currentThread) => {
       const Stack = require('../../../core/stack');
+      const CallStack = require('../../../core/callStack');
       const Frame = require('../../../core/frame');
       const target = threadObject.runnable || threadObject;
 
       const newThread = {
         id: jvm.threads.length,
-        callStack: new Stack(),
+        callStack: new CallStack(),
         status: 'runnable',
         javaThread: threadObject,
       };

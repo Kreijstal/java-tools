@@ -65,7 +65,7 @@
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const {
   addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
-  addNewImport,
+  addNewImport, addTypedArrayStoreImports,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -241,14 +241,21 @@ class MethodTranslator {
           return t === T.ref ? value : toWasmValue(t, value);
         };
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
-      self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-        if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${name}`);
-        if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
-          throw AIOOBE(i, monoArray.len(a));
-        }
-      });
+      if (!self.wasmJit.typedArrayStoresEnabled) {
+        self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+          if (a === null || a === undefined) {
+            throw NPE(`Attempted store on null array in ${name}`);
+          }
+          if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+            throw AIOOBE(i, monoArray.len(a));
+          }
+        });
+      }
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+    if (self.wasmJit.typedArrayStoresEnabled) {
+      addTypedArrayStoreImports(self, name);
+    }
     self.addImport('alen', [T.ref], [T.i32], (a) => {
       if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${name}`);
       return monoArray.len(a);
@@ -1632,7 +1639,9 @@ class MethodTranslator {
       } else if (op in ARRAY_STORE) {
         const t = ARRAY_STORE[op];
         pop(); pop(T.i32); pop(T.ref);
-        emit(OP.call, ...uleb(this.importIndexByName.get(`aset_${sig(t)}`)));
+        const storeImport = this.wasmJit.typedArrayStoresEnabled
+          ? `aset_${op}` : `aset_${sig(t)}`;
+        emit(OP.call, ...uleb(this.importIndexByName.get(storeImport)));
       } else if (op === 'arraylength') {
         pop(T.ref);
         emit(OP.call, ...uleb(this.importIndexByName.get('alen')));
@@ -1949,6 +1958,8 @@ class WasmJit {
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.fieldCacheEnabled = env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
+    this.typedArrayStoresEnabled =
+      env.JVM_DISABLE_WASM_TYPED_ARRAY_STORES !== '1';
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
@@ -2362,9 +2373,12 @@ class WasmJit {
     const memo = this.writeSummaries.get(key);
     if (memo && (memo.keys !== null || memo.epoch === this.compileEpoch)) return memo.keys;
     if (inProgress) {
-      // recursion: pessimistic on the cycle member, and do not memoize —
-      // the outer walk still accumulates its own writes correctly
-      if (inProgress.has(key)) return null;
+      // A direct-static recursion edge adds no effects beyond the method body
+      // already being scanned. Treat the backedge as an empty delta; the
+      // outer walk still accumulates every direct write and every non-cyclic
+      // callee in the strongly connected component. Returning "unknown" here
+      // unnecessarily invalidates otherwise exact caller field summaries.
+      if (inProgress.has(key)) return EMPTY_WRITE_SET;
     } else {
       inProgress = new Set();
     }
@@ -2404,8 +2418,29 @@ class WasmJit {
     if (!method || (method.flags || []).includes('static') !== !instance) return null;
     const code = method.attributes && method.attributes.find((a) => a.type === 'code');
     if (!code) return null;
+    const codeItems = code.code.codeItems;
+    // Exception reporters are entered only by the JVM exception dispatcher;
+    // they are not normal successors of the protected bytecodes. Summarize
+    // the verifier-reachable normal graph so a handler-only StringBuilder or
+    // wrapper call does not make an otherwise pure arithmetic helper appear
+    // to mutate arbitrary caller state. If the generic verifier cannot prove
+    // the graph, retain the previous conservative whole-method scan.
+    let normalDepths = null;
+    const jit = this.jvm.jit;
+    if (jit && typeof jit.computeStackDepths === 'function') {
+      const labels = new Map();
+      codeItems.forEach((item, index) => {
+        if (!item?.labelDef) return;
+        const label = item.labelDef.endsWith(':')
+          ? item.labelDef.slice(0, -1) : item.labelDef;
+        labels.set(label, index);
+      });
+      normalDepths = jit.computeStackDepths(codeItems, labels);
+    }
     const keys = new Set();
-    for (const item of code.code.codeItems) {
+    for (let index = 0; index < codeItems.length; index += 1) {
+      if (normalDepths && normalDepths[index] === undefined) continue;
+      const item = codeItems[index];
       if (!item.instruction) continue;
       const op = getOp(item.instruction);
       if (op === 'putfield' || op === 'putstatic') {
@@ -2430,6 +2465,10 @@ class WasmJit {
     const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
       .find((m) => m.name === name && m.descriptor === descriptor);
     if (!method || !(method.flags || []).includes('static')) return null;
+    // ACC_SYNCHRONIZED is implied by the flag, not by bytecode, so the monitor
+    // only exists on the interpreter's frame path. A linked call runs the body
+    // with no frame at all, which would silently drop the lock.
+    if ((method.flags || []).includes('synchronized')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method; // partial-link deopts materialize a Frame
@@ -2468,6 +2507,8 @@ class WasmJit {
     if (!method) return null;
     const flags = method.flags || [];
     if (flags.includes('static') || flags.includes('abstract') || flags.includes('native')) return null;
+    // See findReadyStatic: a linked call has no frame, so it has no monitor.
+    if (flags.includes('synchronized')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method;

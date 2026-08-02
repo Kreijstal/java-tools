@@ -26,7 +26,8 @@ const jvmDebugConfig = {
   resolve: {
     alias: {
       // Isomorphic window module - use browser implementation for webpack builds
-      'window': path.resolve(__dirname, 'src/isomorphic/window.browser.js')
+      'window': path.resolve(__dirname, 'src/isomorphic/window.browser.js'),
+      'os': path.resolve(__dirname, 'src/isomorphic/os.browser.js')
     },
     fallback: {
       // Provide browser-compatible alternatives for Node.js modules
@@ -36,7 +37,6 @@ const jvmDebugConfig = {
       "stream": require.resolve("stream-browserify"),
       "buffer": require.resolve("buffer/"),
       "process": require.resolve("process/browser"),
-      "os": false, // Make os return false instead of trying to load it
       "v8": false, // Make v8 return false instead of trying to load it
       "crypto": false,
       "zlib": false,

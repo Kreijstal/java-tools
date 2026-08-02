@@ -23,6 +23,67 @@ function stringHash(value) {
   return hash;
 }
 
+function pathParts(value) {
+  const text = stringValue(value);
+  if (text === '') return { root: '', elements: [], empty: true };
+  const normalized = path.normalize(text);
+  const root = path.parse(normalized).root;
+  const remainder = normalized.slice(root.length);
+  return {
+    root,
+    elements: remainder === '' ? [] : remainder.split(path.sep).filter(Boolean),
+    empty: false,
+  };
+}
+
+function pathPartEquals(left, right) {
+  return path.sep === '\\'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+function rootsEqual(left, right) {
+  return pathPartEquals(left, right);
+}
+
+function elementsEqualAt(left, right, offset) {
+  for (let i = 0; i < right.length; i++) {
+    if (!pathPartEquals(left[offset + i], right[i])) return false;
+  }
+  return true;
+}
+
+function startsWithPath(value, prefixValue) {
+  const valueParts = pathParts(value);
+  const prefixParts = pathParts(prefixValue);
+  if (valueParts.empty || prefixParts.empty) {
+    return valueParts.empty && prefixParts.empty;
+  }
+  if (Boolean(valueParts.root) !== Boolean(prefixParts.root)) return false;
+  if (valueParts.root && !rootsEqual(valueParts.root, prefixParts.root)) return false;
+  if (prefixParts.elements.length > valueParts.elements.length) return false;
+  return elementsEqualAt(valueParts.elements, prefixParts.elements, 0);
+}
+
+function endsWithPath(value, suffixValue) {
+  const valueParts = pathParts(value);
+  const suffixParts = pathParts(suffixValue);
+  if (valueParts.empty || suffixParts.empty) {
+    return valueParts.empty && suffixParts.empty;
+  }
+  if (suffixParts.root) {
+    if (!valueParts.root || !rootsEqual(valueParts.root, suffixParts.root)) return false;
+    if (valueParts.elements.length !== suffixParts.elements.length) return false;
+    return elementsEqualAt(valueParts.elements, suffixParts.elements, 0);
+  }
+  if (suffixParts.elements.length > valueParts.elements.length) return false;
+  return elementsEqualAt(
+    valueParts.elements,
+    suffixParts.elements,
+    valueParts.elements.length - suffixParts.elements.length,
+  );
+}
+
 module.exports = {
   isInterface: true,
   super: null,
@@ -53,9 +114,9 @@ module.exports = {
       return makePath(path.isAbsolute(other) ? other : path.join(obj.path, other));
     },
     'startsWith(Ljava/nio/file/Path;)Z': (jvm, obj, args) =>
-      path.normalize(obj.path).startsWith(path.normalize(stringValue(args[0]))) ? 1 : 0,
+      startsWithPath(obj.path, args[0]) ? 1 : 0,
     'endsWith(Ljava/nio/file/Path;)Z': (jvm, obj, args) =>
-      path.normalize(obj.path).endsWith(path.normalize(stringValue(args[0]))) ? 1 : 0,
+      endsWithPath(obj.path, args[0]) ? 1 : 0,
     'compareTo(Ljava/nio/file/Path;)I': (jvm, obj, args) => {
       const other = stringValue(args[0]);
       return obj.path < other ? -1 : (obj.path > other ? 1 : 0);

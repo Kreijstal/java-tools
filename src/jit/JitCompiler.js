@@ -7,10 +7,6 @@ const {
 const WasmJit = require("./WasmJit");
 const FusedRegionCompiler = require("./FusedRegionCompiler");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
-const HandwrittenPolygonRaster = require("./HandwrittenPolygonRaster");
-const HandwrittenTiledBlit = require("./HandwrittenTiledBlit");
-const HandwrittenPerspectiveSpan = require("./HandwrittenPerspectiveSpan");
-const HandwrittenAffineSpriteRaster = require("./HandwrittenAffineSpriteRaster");
 const monoArray = require("./monoArray");
 const {
   normalizeArrayLoad,
@@ -22,6 +18,7 @@ const {
 } = require("../instructions/control");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
+const { buildCfgFromCode } = require("../decompiler/structurer");
 const { capturesBooleanStatic, isNoOpExceptionHandler } = WasmJit._test;
 
 const RETURN_VOID = Symbol("jit.return.void");
@@ -31,6 +28,12 @@ const NO_MEMO_KEY = Symbol("jit.memo.no-key");
 const HANDLED_RESULT = Object.freeze({ handled: true });
 const UNHANDLED_RESULT = Object.freeze({ handled: false });
 const WASM_EXITED_RESULT = Object.freeze({ handled: false, wasmExited: true });
+// ACC_SYNCHRONIZED has no bytecode: the monitor is implied by the flag and is
+// entered/released by the interpreter around the frame. Generated code runs a
+// body without going through those hooks, so a compiled or linked synchronized
+// method would execute with the lock dropped. Keep them interpreted.
+const isSynchronizedMethod = (method) =>
+  !!method && (method.flags || []).includes("synchronized");
 const WASM_NATIVE_LONG_OPS = new Set([
   "i2l", "l2i", "ladd", "land", "lcmp", "ldiv", "lmul", "lneg",
   "lor", "lrem", "lshl", "lshr", "lsub", "lushr", "lxor",
@@ -43,7 +46,7 @@ const WASM_NATIVE_LONG_OPS = new Set([
 // Keep the capability structural: no guest class or method identity participates.
 const EXTENDED_TIER_OPCODES_ENABLED = true;
 const EXTENDED_TIER_OPCODES = EXTENDED_TIER_OPCODES_ENABLED ? [
-  "i2c", "i2s", "dup_x1", "instanceof",
+  "i2c", "i2s", "dup_x1", "dup2_x2", "instanceof",
   "ladd", "land", "laload", "lastore", "lconst_0", "lconst_1",
   "lload", "lload_0", "lload_1", "lload_2", "lload_3", "lneg", "lor", "lrem", "lshl",
   "lstore", "lstore_0", "lstore_1", "lstore_2", "lstore_3", "lsub", "lushr",
@@ -97,6 +100,8 @@ class JitCompiler {
     // constant values. loadState replaces the JIT after replacing static maps,
     // so a binding cannot outlive the canonical container it references.
     this.directStaticTargets = [];
+    this.staticFieldVersionCells = new WeakMap();
+    this.checkedLeafCaptureCaches = [];
     this.initializedStaticReadTargets = new Map();
     this.initializedStaticWriteTargets = new Map();
     // JRE methods may publish a final-receiver positional intrinsic. Generated
@@ -104,34 +109,17 @@ class JitCompiler {
     // argument slicing, and generic call dispatch.
     this.directJreIntrinsics = [];
     this.directSynchronousIntrinsics = [];
-    this.polygonRasterIntrinsicCache = new WeakMap();
-    this.polygonRasterRunCount = 0;
-    this.polygonRasterGuardedFallbackCount = 0;
-    this.polygonRasterFallbackEntry = 0;
-    this.polygonRasterFallbackVertices = 0;
-    this.polygonRasterFallbackCoordinate = 0;
-    this.polygonRasterFallbackDegenerate = 0;
-    this.polygonRasterFallbackSurface = 0;
-    this.polygonRasterFallbackScratch = 0;
-    this.tiledBlitRunCount = 0;
-    this.tiledBlitGuardedFallbackCount = 0;
-    this.tiledBlitFallbackEntry = 0;
-    this.tiledBlitFallbackTag = 0;
-    this.tiledBlitFallbackArrays = 0;
-    this.tiledBlitFallbackLayout = 0;
-    this.tiledBlitFallbackBounds = 0;
-    this.perspectiveSpanIntrinsicCache = new WeakMap();
-    this.perspectiveSpanRunCount = 0;
-    this.perspectiveSpanGuardedFallbackCount = 0;
-    this.affineSpriteRasterEnabled =
-      options.affineSpriteRaster !== false &&
-      !(typeof process !== "undefined" && process.env &&
-        process.env.JVM_DISABLE_AFFINE_SPRITE_RASTER === "1");
-    this.affineSpriteRasterIntrinsicCache = new WeakMap();
-    this.affineSpriteRasterRunCount = 0;
-    this.affineSpriteRasterGuardedFallbackCount = 0;
-    this.semanticBilinearSamplerRunCount = 0;
-    this.semanticBilinearSamplerFallbackCount = 0;
+    this.directCheckedLeafBodies = [];
+    this.directCheckedLeafBodyIds = new WeakMap();
+    this.codegenCompiling = new WeakSet();
+    // Whole guest algorithms are useful differential oracles, but they are
+    // not a compiler tier. Production code must be derived from the loaded
+    // bytecode through the generic SSA/block renderer. Keep the historical
+    // raster/blit/polygon substitutions available only for explicit A/B tests.
+    this.guestKernelOraclesEnabled =
+      options.guestKernelOracles === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_GUEST_KERNEL_ORACLES === "1");
     this.transparentIntBlitRunCount = 0;
     this.transparentIntBlitSlowPathCount = 0;
     this.clippedGradientRunCount = 0;
@@ -142,6 +130,14 @@ class JitCompiler {
       options.positionalGeneratedCalls !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_POSITIONAL_GENERATED_CALLS === "1");
+    // Compact checked leaves improve the Node proxy but currently regress the
+    // real SpiderMonkey renderer. Keep the verified ABI available for focused
+    // experiments without selecting it in production until a browser A/B
+    // demonstrates a win.
+    this.checkedLeafDirectPositionalEnabled =
+      options.checkedLeafDirectPositional === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_CHECKED_LEAF_POSITIONAL === "1");
     this.adaptiveFramelessPositionalEnabled =
       options.adaptiveFramelessPositional !== false &&
       !(typeof process !== "undefined" && process.env &&
@@ -183,6 +179,10 @@ class JitCompiler {
       Number(options.adaptiveCodegenTimeThresholdMs ?? 8) || 0);
     this.adaptiveCodegenTimeSampleInterval = Math.max(1,
       Number(options.adaptiveCodegenTimeSampleInterval) || 64);
+    this.largeAcyclicCallTreesEnabled =
+      options.largeAcyclicCallTrees !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_LARGE_ACYCLIC_CALL_TREES === "1");
     const configuredWholeMethodEscalation =
       options.adaptiveWholeMethodEscalationThreshold ??
       (typeof process !== "undefined" && process.env
@@ -238,6 +238,8 @@ class JitCompiler {
     this.syncInlinedCallCount = 0;
     this.syncReusedFrameCount = 0;
     this.syncIntrinsicCallCount = 0;
+    this.syncOperandUnderflowFallbackCount = 0;
+    this.reportedSyncOperandUnderflows = new Set();
     this.intrinsicArrayCopyNoopCount = 0;
     this.intrinsicArrayCopyWithinCount = 0;
     this.fusedRunCount = 0;
@@ -258,6 +260,10 @@ class JitCompiler {
     this.inlineLoopRegionsEnabled = options.inlineLoopRegions !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_INLINE_LOOP_REGIONS === "1");
+    this.scalarBoundedInlineRegionsEnabled =
+      options.scalarBoundedInlineRegions === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_SCALAR_BOUNDED_INLINE_REGIONS === "1");
     this.scalarLoopMethodRunCounts = new Map();
     this.structuredSsaMethodRunCounts = new Map();
     this.oversizedWasmFirstMethods = new WeakMap();
@@ -274,6 +280,12 @@ class JitCompiler {
       options.arrayKernelWasmFirst === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ARRAY_KERNEL_WASM_FIRST === "1");
+    this.dynamicArrayStructuredFirstMethods = new WeakMap();
+    this.dynamicArrayStructuredFirstMethodCount = 0;
+    this.dynamicArrayStructuredFirstEnabled =
+      options.dynamicArrayStructuredFirst !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_DYNAMIC_ARRAY_STRUCTURED_FIRST === "1");
     this.rendererPipelineEnabled = options.rendererPipeline === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
@@ -307,7 +319,7 @@ class JitCompiler {
       (process.env.JVM_TRACE || process.env.JVM_PROFILE_HOT_METHODS === "1"));
     this.wasmJit = new WasmJit(jvm, this);
     const regionOptions = this.rendererPipelineEnabled
-      ? { ...options, fusedRegions: true, structuredSsa: true }
+      ? { ...options, structuredSsa: true }
       : options;
     this.fusedRegions = new FusedRegionCompiler(this, regionOptions);
     this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
@@ -417,7 +429,9 @@ class JitCompiler {
         this.isLongArithmeticLoopMethod(frame.method) ||
         this.isArrayKernelWasmFirstMethod(frame.method));
     const wholeMethodPreferred =
-      this.prefersWholeMethodJs(frame.method) && !wasmPriorityLoop;
+      (this.prefersWholeMethodJs(frame.method) ||
+        this.isDynamicArrayStructuredFirstMethod(frame.method)) &&
+      !wasmPriorityLoop;
     if (wholeMethodPreferred && canProbeGenerated) {
       let codegenEligible = this.isCodegenSupported(frame.method);
       if (!codegenEligible && this.adaptiveConstructorCallersEnabled &&
@@ -582,6 +596,43 @@ class JitCompiler {
     return selected;
   }
 
+  isDynamicArrayStructuredFirstMethod(method) {
+    if (!this.dynamicArrayStructuredFirstEnabled ||
+        !method || method.name === "<init>" || method.name === "<clinit>") {
+      return false;
+    }
+    if (this.dynamicArrayStructuredFirstMethods.has(method)) {
+      return this.dynamicArrayStructuredFirstMethods.get(method);
+    }
+    let instructionCount = 0;
+    let primitiveArrayAccessCount = 0;
+    let dynamicCallCount = 0;
+    for (const item of this.getCodeItems(method)) {
+      const op = getOp(item && item.instruction);
+      if (!op) continue;
+      instructionCount += 1;
+      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
+        primitiveArrayAccessCount += 1;
+      } else if (op === "invokevirtual" || op === "invokeinterface" ||
+          op === "invokespecial") {
+        dynamicCallCount += 1;
+      }
+    }
+    // A large primitive-array loop with several dynamic call islands cannot
+    // stay in one Wasm module: each island exits to JavaScript and resumes
+    // later. Structured JavaScript can instead retain the verified operand
+    // values and link monomorphic callees positionally. Select only a large,
+    // dense shape so ordinary object/UI methods do not pay its cold compile
+    // cost.
+    const selected = instructionCount >= 512 &&
+      primitiveArrayAccessCount >= 32 &&
+      dynamicCallCount >= 2 &&
+      this.hasBackwardBranch(method);
+    this.dynamicArrayStructuredFirstMethods.set(method, selected);
+    if (selected) this.dynamicArrayStructuredFirstMethodCount += 1;
+    return selected;
+  }
+
   prefersWholeMethodJs(method) {
     return this.preferWholeMethodJs ||
       this.adaptiveCodegenMethods.has(method);
@@ -659,13 +710,31 @@ class JitCompiler {
       return HANDLED_RESULT;
     }
     if (result && result.returned) {
+      const explicitReturnParent = frame.jitGeneratedReturnParent;
+      const explicitReturnType = frame.jitGeneratedReturnType;
+      delete frame.jitGeneratedReturnParent;
+      delete frame.jitGeneratedReturnType;
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(
           thread,
           result.value === RETURN_VOID ? null : result.value,
         );
-      } else if (result.value !== RETURN_VOID && !thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(result.value);
+      } else if (result.value !== RETURN_VOID) {
+        const frames = thread.callStack.items;
+        const returnParent = explicitReturnParent &&
+            frames.includes(explicitReturnParent)
+          ? explicitReturnParent
+          : !thread.callStack.isEmpty() ? thread.callStack.peek() : null;
+        if (returnParent) returnParent.stack.push(result.value);
+      } else if (explicitReturnParent && explicitReturnType !== "void") {
+        console.error("[jit-generated-return-underflow]", {
+          child: `${frame.className || "<unknown>"}.` +
+            `${frame.method?.name || "<unknown>"}${frame.method?.descriptor || ""}`,
+          parent: `${explicitReturnParent.className || "<unknown>"}.` +
+            `${explicitReturnParent.method?.name || "<unknown>"}` +
+            `${explicitReturnParent.method?.descriptor || ""}`,
+          expectedReturnType: explicitReturnType,
+        });
       }
     }
     return HANDLED_RESULT;
@@ -675,7 +744,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.runCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} syncOperandUnderflowFallbacks=${this.syncOperandUnderflowFallbackCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.totalRunCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredLazyStatics=${this.structuredSsa.lazyStaticTargetLinkCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -702,6 +771,8 @@ class JitCompiler {
     if (this.codegenCache.has(method)) {
       return this.codegenCache.get(method);
     }
+    if (this.codegenCompiling.has(method)) return null;
+    this.codegenCompiling.add(method);
     try {
       const generated = this.compileMethod(method);
       this.codegenCache.set(method, generated);
@@ -709,6 +780,8 @@ class JitCompiler {
     } catch (err) {
       this.codegenCompileErrors.set(method, err);
       return null;
+    } finally {
+      this.codegenCompiling.delete(method);
     }
   }
 
@@ -898,15 +971,17 @@ class JitCompiler {
   }
 
   createGeneratedFunction(method, tier, parameters, source,
-    ownerOverride = null, asynchronous = false, generator = false) {
+    ownerOverride = null, asynchronous = false, generator = false,
+    captures = null) {
     const labeled = this.generatedSource(method, tier, source, ownerOverride);
     // Function constructors themselves remain anonymous in Gecko profiles.
     // Return a named literal so stack sampling exposes the guest identity.
     const prefix = generator ? "function* " : asynchronous ? "async function " : "function ";
-    const factory = new Function(`"use strict"; return ${prefix}` +
+    const captureNames = captures ? Object.keys(captures) : [];
+    const factory = new Function(...captureNames, `"use strict"; return ${prefix}` +
       `${labeled.functionName}(${parameters.join(",")}) {\n` +
       `${labeled.source}\n}`);
-    const generated = factory();
+    const generated = factory(...captureNames.map((name) => captures[name]));
     generated.jvmSourceUrl = labeled.url;
     return generated;
   }
@@ -1066,7 +1141,6 @@ class JitCompiler {
       this.isJitSafeConstructor(method, codeItems);
     if ((method.name === "<init>" && !safeConstructor) ||
         method.name === "<clinit>" ||
-        allowEffectfulCalls && method.name === "run" ||
         !safeConstructor && !allowEffectfulCalls &&
         !this.experimentalControlFlow &&
         normalFlowContains(codeItems, (instruction, op) =>
@@ -1111,6 +1185,11 @@ class JitCompiler {
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
+      // drem/l2d were the only opcodes left rejecting orbdefence's hot
+      // ja.a(B)I, which took the slow scheduler path on 100% of its samples
+      // and 66% of scheduler time. stackEffect already scored both; only the
+      // emitter cases and this gate entry were missing.
+      "drem", "l2d",
     ]);
 
     const hasNumericHotPath = codeItems.some((item) => {
@@ -1226,7 +1305,7 @@ class JitCompiler {
     // move a call (and its arbitrary scheduling effects) across that boundary.
     // Invokes that exist only in an exception handler do not disqualify a
     // compute body: the generated exception table preserves those paths.
-    if (method.name === "<init>" || method.name === "<clinit>" || method.name === "run") {
+    if (method.name === "<init>" || method.name === "<clinit>") {
       return false;
     }
     if (this.hasOnlyNoOpExceptionHandlers(method, codeItems)) {
@@ -1280,15 +1359,21 @@ class JitCompiler {
 
   hasCallDenseComputeShape(method, codeItems) {
     if (method.name === "<init>" || method.name === "<clinit>") return false;
-    // Small forwarding/call-chain helpers can be hot without containing a
-    // loop or arithmetic of their own. Keep this a bytecode-shape decision;
-    // supported-op and control-flow checks still run at the caller.
+    // Forwarding/call-chain bodies can be hot without containing a loop or
+    // arithmetic of their own. This includes larger acyclic decision trees
+    // that select several numeric kernels per entry. Keep this a bytecode-
+    // shape decision; supported-op and control-flow checks still run at the
+    // caller, and the large form excludes backedges.
     const instructions = codeItems.filter((item) => item && item.instruction);
-    if (instructions.length > 64) return false;
-    return instructions.filter((item) => {
+    const invokeCount = instructions.filter((item) => {
       const op = getOp(item.instruction);
       return op && op.startsWith("invoke");
-    }).length >= 2;
+    }).length;
+    if (instructions.length <= 64) return invokeCount >= 2;
+    return this.largeAcyclicCallTreesEnabled &&
+      instructions.length <= 2048 &&
+      invokeCount >= 4 &&
+      !this.hasBackwardBranch(method);
   }
 
   getLabelMap(frame) {
@@ -1440,6 +1525,31 @@ class JitCompiler {
           continuation: Boolean(structuredSsa.jvmStructuredContinuation),
           resumeBody: Boolean(structuredSsa.jvmResumeBody),
         }));
+        if (typeof process !== "undefined" && process.env &&
+            process.env.JVM_TRACE_JIT_SOURCE === "1") {
+          console.error("[jit-generated-source] " + traceIdentity + "\n" +
+            (structuredSsa.jvmStructuredSource || source));
+        }
+      }
+      if (structuredSsa.jvmStructuredRequiresBaselineFramedEntry) {
+        // Keep the renderer's verified scalar ABI for nested synchronous
+        // calls, but do not use its ordinary Frame ABI. A protected non-void
+        // call can suspend after consuming operands, and only the baseline
+        // body currently implements that pending-return handoff at arbitrary
+        // frame PCs. This split is structural and independent of guest names.
+        const baseline = this.compileBaselineMethod(method, inlineLoopRegions);
+        if (baseline) {
+          baseline.jvmStructuredPositionalOnly = true;
+          baseline.jvmRestoringDirectPositionalBody =
+            structuredSsa.jvmRestoringDirectPositionalBody;
+          baseline.jvmRestoringDirectPositionalSource =
+            structuredSsa.jvmRestoringDirectPositionalSource;
+          if (structuredSsa.jvmRestoringDirectPositionalPlan) {
+            baseline.jvmRestoringDirectPositionalPlan =
+              structuredSsa.jvmRestoringDirectPositionalPlan;
+          }
+          return baseline;
+        }
       }
       return this.withResumeBody(structuredSsa, method);
     }
@@ -1484,14 +1594,22 @@ class JitCompiler {
         op === "newarray" || op === "anewarray" ||
         op === "multianewarray" || op === "monitorenter";
     });
+    const hasMonitorRegion = items.some((item) =>
+      getOp(item?.instruction) === "monitorenter");
     // Complete leaf kernels already receive better whole-method structured
     // code. Region extraction is for a small scalar/array loop embedded in a
     // larger scheduler-, exception-, allocation-, or call-bearing method.
     if (!hasOuterEffects) return none;
 
     const labels = buildLabelMap(items);
-    const depths = this.computeStackDepths(items, labels);
-    if (!depths) return none;
+    // Some large obfuscated methods have verifier-consistent normal flow but
+    // deliberately awkward, disconnected exception-table joins that defeat
+    // this inexpensive whole-method depth pass. Existing array-length regions
+    // still require that proof. A scalar natural-loop candidate can instead
+    // be verified in its isolated synthetic method after handlers and
+    // unreachable outer blocks have been removed.
+    const computedDepths = this.computeStackDepths(items, labels, method);
+    const depths = computedDepths || [];
     const localSlot = (instruction, op) => {
       const shorthand = /_(\d)$/.exec(op);
       return shorthand ? Number(shorthand[1])
@@ -1587,7 +1705,7 @@ class JitCompiler {
         Number(at(47).arg) === 31 &&
         labels.get(at(12).arg) === header + 15 &&
         labels.get(at(17).arg) === header + 20;
-      if (pairedConstants) {
+      if (this.guestKernelOraclesEnabled && pairedConstants) {
         const inputSlot = localSlot(at(4), loopOps[4]);
         const sampleSlot = localSlot(at(9), loopOps[9]);
         const offsetSlot = localSlot(at(23), loopOps[23]);
@@ -1671,6 +1789,149 @@ class JitCompiler {
       // admit multiple disjoint loops after proving their live ranges.
       break;
     }
+    // A javac loop embedded in archive/image readers is often bounded by a
+    // scalar chunk length rather than array.length, and obfuscation may place
+    // its backedge on a conditional branch followed by one shared exit
+    // trampoline. Extract that natural loop with the same SSA renderer. This
+    // is a CFG/local/bytecode proof: no owner, member, or descriptor identity
+    // participates.
+    if (!plans.length && !computedDepths && hasMonitorRegion &&
+        this.scalarBoundedInlineRegionsEnabled) {
+      const scalarRegionAllowed = new Set([
+        ...allowed,
+        "getstatic",
+      ]);
+      for (let backedge = 0; backedge < items.length; backedge += 1) {
+        const branch = items[backedge]?.instruction;
+        const branchOp = getOp(branch);
+        if (!branchOp?.startsWith("if")) continue;
+        const header = labels.get(branch.arg);
+        if (!Number.isInteger(header) || header <= 0 ||
+            header >= backedge ||
+            computedDepths && depths[header] !== 0) continue;
+
+        const headerOps = items.slice(header, header + 3)
+          .map((item) => getOp(item?.instruction));
+        if (!/^iload(?:_[0-3])?$/.test(headerOps[0] || "") ||
+            !/^iload(?:_[0-3])?$/.test(headerOps[1] || "") ||
+            headerOps[2] !== "if_icmpgt") continue;
+        const boundSlot = localSlot(items[header].instruction, headerOps[0]);
+        const counterSlot =
+          localSlot(items[header + 1].instruction, headerOps[1]);
+        const bodyTarget = labels.get(items[header + 2].instruction.arg);
+        if (!Number.isInteger(boundSlot) || !Number.isInteger(counterSlot) ||
+            boundSlot === counterSlot ||
+            !Number.isInteger(bodyTarget) ||
+            bodyTarget <= header + 2 || bodyTarget > backedge) continue;
+
+        // Include the common conditional-backedge fall trampoline when it is
+        // a single goto. All exits from the candidate must converge on the
+        // same original bytecode PC so the canonical Frame has one precise
+        // resume location after the atomic region returns.
+        let end = backedge;
+        const fallInstruction = items[backedge + 1]?.instruction;
+        if (getOp(fallInstruction) === "goto" ||
+            getOp(fallInstruction) === "goto_w") end += 1;
+        const outsideTargets = new Set();
+        let valid = true;
+        let counterWrites = 0;
+        let primitiveArrayTraffic = 0;
+        const arrayLocalSlots = new Set();
+        for (let index = header; index <= end && valid; index += 1) {
+          const instruction = items[index]?.instruction;
+          const op = getOp(instruction);
+          if (!scalarRegionAllowed.has(op)) {
+            valid = false;
+            break;
+          }
+          if (/^aload(?:_[0-3])?$/.test(op)) {
+            arrayLocalSlots.add(localSlot(instruction, op));
+          }
+          if (op === "iinc") {
+            const slot = localSlot(instruction, op);
+            if (slot === boundSlot) {
+              valid = false;
+              break;
+            }
+            if (slot === counterSlot) {
+              if (Number(instruction.incr) !== 1) {
+                valid = false;
+                break;
+              }
+              counterWrites += 1;
+            }
+          } else if (/^istore(?:_[0-3])?$/.test(op) &&
+              localSlot(instruction, op) === boundSlot) {
+            valid = false;
+            break;
+          }
+          if (op?.endsWith("aload") || op?.endsWith("astore")) {
+            primitiveArrayTraffic += 1;
+          }
+          if (op === "goto" || op === "goto_w" || op.startsWith("if")) {
+            const target = labels.get(instruction.arg);
+            if (!Number.isInteger(target)) {
+              valid = false;
+              break;
+            }
+            if (target < header || target > end) outsideTargets.add(target);
+          }
+        }
+        if (!valid || counterWrites !== 1 || primitiveArrayTraffic === 0 ||
+            outsideTargets.size !== 1) continue;
+        const exit = [...outsideTargets][0];
+        if (computedDepths && depths[exit] !== 0) continue;
+
+        // Preserve labels/PCs from the original method but make every block
+        // outside the natural loop unreachable. The one converged exit is a
+        // synthetic void return that spills live locals for the original
+        // baseline body to resume at `exit`.
+        const syntheticItems = items.map((item, index) => ({
+          ...item,
+          instruction: index >= header && index <= end
+            ? item.instruction : index === exit ? "return" : "nop",
+        }));
+        syntheticItems[0] = {
+          ...syntheticItems[0],
+          instruction: {
+            op: "goto",
+            arg: items[header].labelDef.slice(0, -1),
+          },
+        };
+        const syntheticMethod = {
+          ...method,
+          name: `${method.name}$inlineScalarLoop${header}`,
+          descriptor: "()V",
+          flags: ["private", "static"],
+          accessFlags: 0x000a,
+          attributes: [{
+            ...code,
+            code: {
+              ...code.code,
+              codeItems: syntheticItems,
+              exceptionTable: [],
+              attributes: [],
+            },
+          }],
+          jvmStructuredAtomicRegionMaxIterations: 4096,
+          jvmStructuredRegionSpillOnReturn: true,
+          jvmStructuredEntryArrayLocals: [...arrayLocalSlots],
+        };
+        this.normalizedCodeItemsCache.set(syntheticMethod, syntheticItems);
+        const generated = this.structuredSsa.compile(syntheticMethod);
+        if (!generated || generated.jvmStructuredContinuation) continue;
+        const id = this.inlineLoopRegions.length;
+        this.inlineLoopRegions.push({
+          generated, method, header, exit, counterSlot, boundSlot,
+          scalarBounded: true, maximumIterations: 4096,
+        });
+        plans.push({
+          id, header, exit, counterSlot, boundSlot,
+          scalarBounded: true,
+        });
+        break;
+      }
+    }
     this.inlineLoopRegionCache.set(method, plans);
     if (plans.length) {
       this.inlineLoopRegionPcCache.set(method,
@@ -1715,6 +1976,13 @@ class JitCompiler {
   canRunInlineLoopRegion(id, frame) {
     const region = this.inlineLoopRegions[id];
     if (!region) return false;
+    if (region.scalarBounded) {
+      const counter = Number(frame.locals[region.counterSlot]);
+      const bound = Number(frame.locals[region.boundSlot]);
+      const remaining = bound - counter;
+      return Number.isInteger(counter) && Number.isInteger(bound) &&
+        remaining >= 0 && remaining <= region.maximumIterations;
+    }
     if (region.kernel?.kind !== "paired-saturating-int-to-bytes") return true;
     const locals = frame.locals;
     const inputRef = locals[region.kernel.inputSlot];
@@ -1798,7 +2066,7 @@ class JitCompiler {
         !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return null;
     if (codeItems.length < 6 || codeItems.length > 1024) return null;
     const labels = buildLabelMap(codeItems);
-    const depths = this.computeStackDepths(codeItems, labels);
+    const depths = this.computeStackDepths(codeItems, labels, method);
     if (!depths) return null;
     const reachable = new Set(depths.map((depth, index) => depth === undefined ? -1 : index)
       .filter((index) => index >= 0));
@@ -2418,7 +2686,7 @@ class JitCompiler {
     let stackWidthsBefore = null;
     if (codeItems.some((item) => {
       const op = getOp(item && item.instruction);
-      return op === "dup_x2" || op === "dup2";
+      return op === "dup_x2" || op === "dup2" || op === "dup2_x2";
     })) {
       const analysis = buildSsa({
         codeItems,
@@ -2464,22 +2732,36 @@ class JitCompiler {
         body.push(`case ${index}:`);
         const loopRegion = loopRegionsByHeader.get(index);
         if (loopRegion) {
-          body.push(
-            "if (!bytecodeChecks && sp === 0) {",
-            `  const regionArray = locals[${loopRegion.boundArraySlot}];`,
-            `  const regionCounter = locals[${loopRegion.counterSlot}] | 0;`,
-            "  if (regionArray !== null && regionArray !== undefined && " +
-              "regionCounter >= 0 && regionArray.length - regionCounter <= 4096 && " +
-              `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
-            `    const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
-            "    if (regionResult && regionResult.deopt) return regionResult;",
-            "    stack.length = 0;",
-            "    sp = 0;",
-            `    pc = ${loopRegion.exit};`,
-            "    continue;",
-            "  }",
-            "}",
-          );
+          if (loopRegion.scalarBounded) {
+            body.push(
+              "if (!bytecodeChecks && sp === 0 && " +
+                `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
+              `  const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
+              "  if (regionResult && regionResult.deopt) return regionResult;",
+              "  stack.length = 0;",
+              "  sp = 0;",
+              `  pc = ${loopRegion.exit};`,
+              "  continue;",
+              "}",
+            );
+          } else {
+            body.push(
+              "if (!bytecodeChecks && sp === 0) {",
+              `  const regionArray = locals[${loopRegion.boundArraySlot}];`,
+              `  const regionCounter = locals[${loopRegion.counterSlot}] | 0;`,
+              "  if (regionArray !== null && regionArray !== undefined && " +
+                "regionCounter >= 0 && regionArray.length - regionCounter <= 4096 && " +
+                `helpers.canRunInlineLoopRegion(${loopRegion.id}, frame)) {`,
+              `    const regionResult = helpers.runInlineLoopRegion(${loopRegion.id}, frame, thread);`,
+              "    if (regionResult && regionResult.deopt) return regionResult;",
+              "    stack.length = 0;",
+              "    sp = 0;",
+              `    pc = ${loopRegion.exit};`,
+              "    continue;",
+              "  }",
+              "}",
+            );
+          }
         }
         const instruction = item.instruction;
         if (!instruction) {
@@ -2553,7 +2835,7 @@ class JitCompiler {
     }
 
     const labels = buildLabelMap(codeItems);
-    const depths = this.computeStackDepths(codeItems, labels);
+    const depths = this.computeStackDepths(codeItems, labels, method);
     if (!depths) return null;
     const leaders = new Set([0]);
     const terminal = new Set([
@@ -2839,8 +3121,34 @@ class JitCompiler {
     }
   }
 
-  computeStackDepths(codeItems, labels) {
+  computeStackDepths(codeItems, labels, method = null) {
+    this.lastStackDepthError = null;
+    const rejectDepths = (reason, index, op, details = null) => {
+      this.lastStackDepthError = { reason, index, op, details };
+      return null;
+    };
     const depths = new Array(codeItems.length);
+    let stackWidthsBefore = null;
+    if (codeItems.some((item) => {
+      const op = getOp(item && item.instruction);
+      return op === "dup2" || op === "dup2_x2";
+    })) {
+      const code = method?.attributes?.find((attribute) =>
+        attribute.type === "code");
+      const analysis = buildSsa({
+        codeItems,
+        exceptionTable: code?.code?.exceptionTable || [],
+        method,
+      });
+      if (!analysis || analysis.rejected || !analysis.stackKindsBefore) {
+        return rejectDepths("category analysis failed", -1, null,
+          analysis?.reason || null);
+      }
+      stackWidthsBefore = new Map();
+      for (const [index, kinds] of analysis.stackKindsBefore) {
+        stackWidthsBefore.set(index, kinds.map(kindWidth));
+      }
+    }
     const pending = [0];
     depths[0] = 0;
     const terminal = new Set([
@@ -2850,10 +3158,17 @@ class JitCompiler {
       const index = pending.pop();
       const instruction = codeItems[index] && codeItems[index].instruction;
       const op = getOp(instruction);
-      const effect = stackEffect(instruction);
-      if (effect === null) return null;
+      const effect = stackEffect(
+        instruction, stackWidthsBefore && stackWidthsBefore.get(index));
+      if (effect === null) {
+        return rejectDepths("unknown stack effect", index, op);
+      }
       const after = depths[index] + effect;
-      if (after < 0) return null;
+      if (after < 0) {
+        return rejectDepths("operand stack underflow", index, op, {
+          before: depths[index], effect,
+        });
+      }
       const successors = [];
       if (op === "goto" || op === "goto_w") {
         successors.push(branchTargetIndex(instruction, labels));
@@ -2863,12 +3178,18 @@ class JitCompiler {
         successors.push(index + 1);
       }
       for (const successor of successors) {
-        if (successor === undefined || successor < 0 || successor >= codeItems.length) return null;
+        if (successor === undefined || successor < 0 ||
+            successor >= codeItems.length) {
+          return rejectDepths("invalid control-flow successor", index, op,
+            { successor });
+        }
         if (depths[successor] === undefined) {
           depths[successor] = after;
           pending.push(successor);
         } else if (depths[successor] !== after) {
-          return null;
+          return rejectDepths("operand-stack join mismatch", index, op, {
+            successor, expected: depths[successor], actual: after,
+          });
         }
       }
     }
@@ -3005,6 +3326,43 @@ class JitCompiler {
         }
         return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
       }
+      case "dup2_x2": {
+        if (!stackWidthsBefore || stackWidthsBefore.length < 2) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unverified dup2_x2 stack widths" };`;
+        }
+        const top = stackWidthsBefore.length - 1;
+        if (stackWidthsBefore[top] === 2) {
+          if (stackWidthsBefore[top - 1] === 2) {
+            // Form 4: ..., value2(category 2), value1(category 2)
+            return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+          }
+          if (stackWidthsBefore.length < 3 ||
+              stackWidthsBefore[top - 1] !== 1 ||
+              stackWidthsBefore[top - 2] !== 1) {
+            return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "invalid dup2_x2 form 3" };`;
+          }
+          // Form 3: ..., value3(category 1), value2(category 1),
+          // value1(category 2)
+          return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; stack[sp++] = value1; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+        }
+        if (stackWidthsBefore[top] !== 1 ||
+            stackWidthsBefore[top - 1] !== 1 ||
+            stackWidthsBefore.length < 3) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "invalid dup2_x2 top pair" };`;
+        }
+        if (stackWidthsBefore[top - 2] === 2) {
+          // Form 2: ..., value3(category 2), value2(category 1),
+          // value1(category 1)
+          return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+        }
+        if (stackWidthsBefore.length < 4 ||
+            stackWidthsBefore[top - 2] !== 1 ||
+            stackWidthsBefore[top - 3] !== 1) {
+          return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "invalid dup2_x2 form 1" };`;
+        }
+        // Form 1: four category-1 values.
+        return `{ const value1 = stack[--sp]; const value2 = stack[--sp]; const value3 = stack[--sp]; const value4 = stack[--sp]; stack[sp++] = value2; stack[sp++] = value1; stack[sp++] = value4; stack[sp++] = value3; stack[sp++] = value2; stack[sp++] = value1; } ${goNext}`;
+      }
       case "pop": return `sp -= 1; ${goNext}`;
       case "iadd": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] + b) | 0; } ${goNext}`;
       case "isub": return `{ const b = stack[--sp]; stack[sp - 1] = (stack[sp - 1] - b) | 0; } ${goNext}`;
@@ -3028,6 +3386,9 @@ class JitCompiler {
       case "fmul": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] * b); } ${goNext}`;
       case "fdiv": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] / b); } ${goNext}`;
       case "frem": return `{ const b = stack[--sp]; stack[sp - 1] = Math.fround(stack[sp - 1] % b); } ${goNext}`;
+      // Doubles need no rounding step, unlike frem above: JS % on two doubles
+      // already matches the JVM's drem for every finite and non-finite case.
+      case "drem": return `{ const b = stack[--sp]; stack[sp - 1] = stack[sp - 1] % b; } ${goNext}`;
       case "fneg": return `stack[sp - 1] = Math.fround(-stack[sp - 1]); ${goNext}`;
       case "i2d": return goNext;
       case "i2b": return `stack[sp - 1] = (stack[sp - 1] << 24) >> 24; ${goNext}`;
@@ -3044,6 +3405,9 @@ class JitCompiler {
       // operand in BigInt() before operating, and mixing throws in JS, so the
       // generated tier must convert identically.
       case "l2i": return `{ const value = stack[sp - 1]; stack[sp - 1] = Number(BigInt.asIntN(32, typeof value === "bigint" ? value : BigInt(Math.trunc(Number(value))))); } ${goNext}`;
+      // Number() widens a BigInt long and leaves an already-Number long
+      // (uninitialized field) alone, so no typeof branch is needed here.
+      case "l2d": return `stack[sp - 1] = Number(stack[sp - 1]); ${goNext}`;
       case "lxor": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) ^ BigInt(b)); } ${goNext}`;
       case "ladd": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) + BigInt(b)); } ${goNext}`;
       case "lsub": return `{ const b = stack[--sp]; stack[sp - 1] = BigInt.asIntN(64, BigInt(stack[sp - 1]) - BigInt(b)); } ${goNext}`;
@@ -3172,7 +3536,9 @@ class JitCompiler {
               `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
               `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
               `reason: "class initialization at direct synchronous putstatic" }; } ` +
-              `target.fields.set(${JSON.stringify(direct.key)}, stack[--sp]); } ${goNext}`;
+              `target.fields.set(${JSON.stringify(direct.key)}, stack[--sp]); ` +
+              `if (target.versionCell.captureCaches) ` +
+              `helpers.markStaticTargetChanged(target); } ${goNext}`;
           }
           return `{ const changed = helpers.putStaticSyncAt(${fieldSiteId}, stack[sp - 1]); if (changed === helpers.staticDeopt()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "class initialization at synchronous putstatic" }; } sp -= 1; } ${goNext}`;
         }
@@ -3411,6 +3777,7 @@ class JitCompiler {
         case "fmul": stack.push(Math.fround(stack.pop() * stack.pop())); break;
         case "fdiv": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a / b)); break; }
         case "frem": { const b = stack.pop(); const a = stack.pop(); stack.push(Math.fround(a % b)); break; }
+        case "drem": { const b = stack.pop(); const a = stack.pop(); stack.push(a % b); break; }
         case "fneg": stack.push(Math.fround(-stack.pop())); break;
         case "i2d": break;
         case "i2l": stack.push(BigInt(stack.pop())); break;
@@ -3421,6 +3788,7 @@ class JitCompiler {
         case "i2b": stack.push((stack.pop() << 24) >> 24); break;
         case "d2i": stack.push(Math.trunc(stack.pop()) | 0); break;
         case "l2i": stack.push(Number(BigInt.asIntN(32, stack.pop()))); break;
+        case "l2d": stack.push(Number(stack.pop())); break;
         case "lxor": { const b = stack.pop(); const a = stack.pop(); stack.push(a ^ b); break; }
         case "ldiv": {
           const b = stack.pop();
@@ -3993,9 +4361,146 @@ class JitCompiler {
     if (!target || (forWrite && target.kind !== "map")) return null;
     site.staticTarget = target;
     target.initializationToken = site.initializationToken;
+    target.versionCell = this.getStaticFieldVersionCell(
+      target.fields, target.key);
     const targetId = this.directStaticTargets.length;
     this.directStaticTargets.push(target);
     return { targetId, kind: target.kind, key: target.key, className: site.className };
+  }
+
+  getStaticFieldVersionCell(fields, key) {
+    let cells = this.staticFieldVersionCells.get(fields);
+    if (!cells) {
+      cells = new Map();
+      this.staticFieldVersionCells.set(fields, cells);
+    }
+    let cell = cells.get(key);
+    if (!cell) {
+      cell = { value: 0, captureCaches: null };
+      cells.set(key, cell);
+    }
+    return cell;
+  }
+
+  markStaticTargetChanged(target) {
+    if (!target) return;
+    const caches = target.versionCell?.captureCaches;
+    if (!caches) return;
+    for (const cache of caches) {
+      cache.dirty = true;
+      cache.specializedMatches = false;
+      for (const key of cache.derivedGuardKeys) cache[key] = undefined;
+    }
+  }
+
+  markStaticLocationChanged(fields, key) {
+    if (!fields || key === undefined) return;
+    const caches = this.staticFieldVersionCells.get(fields)
+      ?.get(key)?.captureCaches;
+    if (!caches) return;
+    for (const cache of caches) {
+      cache.dirty = true;
+      cache.specializedMatches = false;
+      for (const guardKey of cache.derivedGuardKeys) {
+        cache[guardKey] = undefined;
+      }
+    }
+  }
+
+  markStaticContainerChanged(fields) {
+    if (!fields) return;
+    const cells = this.staticFieldVersionCells.get(fields);
+    if (!cells) return;
+    const caches = new Set();
+    for (const cell of cells.values()) {
+      for (const cache of cell.captureCaches || []) caches.add(cache);
+    }
+    for (const cache of caches) {
+      cache.dirty = true;
+      cache.specializedMatches = false;
+      for (const guardKey of cache.derivedGuardKeys) {
+        cache[guardKey] = undefined;
+      }
+    }
+  }
+
+  registerCheckedLeafCaptureCache(captures) {
+    const entries = captures.map((capture) => {
+      const target = this.directStaticTargets[capture.targetId];
+      if (!target) throw new Error("missing checked-leaf static capture");
+      const cell = target.versionCell || this.getStaticFieldVersionCell(
+        target.fields, target.key);
+      target.versionCell = cell;
+      return { capture, target, cell };
+    });
+    const cache = {
+      entries,
+      dirty: true,
+      derivedGuardKeys: [],
+      specializedMatches: false,
+      specializationInitialized: false,
+    };
+    let valueCount = 0;
+    for (const { capture } of entries) {
+      cache[`value${valueCount++}`] = undefined;
+      cache[`specializedValue${valueCount - 1}`] = undefined;
+      if (capture.data) {
+        cache[`value${valueCount++}`] = undefined;
+        cache[`specializedValue${valueCount - 1}`] = undefined;
+      }
+    }
+    for (const entry of entries) {
+      if (!entry.cell.captureCaches) entry.cell.captureCaches = new Set();
+      entry.cell.captureCaches.add(cache);
+    }
+    const id = this.checkedLeafCaptureCaches.length;
+    this.checkedLeafCaptureCaches.push(cache);
+    this.refreshCheckedLeafCaptureCache(id);
+    for (let index = 0; index < valueCount; index += 1) {
+      cache[`specializedValue${index}`] = cache[`value${index}`];
+    }
+    cache.specializedMatches = true;
+    cache.specializationInitialized = true;
+    return id;
+  }
+
+  refreshCheckedLeafCaptureCache(id) {
+    const cache = this.checkedLeafCaptureCaches[id];
+    if (!cache) throw new Error("missing checked-leaf capture cache");
+    let valueIndex = 0;
+    let specializedMatches = true;
+    for (let index = 0; index < cache.entries.length; index += 1) {
+      const { capture, target } = cache.entries[index];
+      const value = target.kind === "map"
+        ? target.fields.get(target.key) : target.fields[target.key];
+      cache[`value${valueIndex}`] = value;
+      if (cache.specializationInitialized &&
+          cache[`specializedValue${valueIndex}`] !== value) {
+        specializedMatches = false;
+      }
+      valueIndex += 1;
+      if (capture.data) {
+        const data = this.arrayData(value);
+        cache[`value${valueIndex}`] = data;
+        if (cache.specializationInitialized &&
+            cache[`specializedValue${valueIndex}`] !== data) {
+          specializedMatches = false;
+        }
+        valueIndex += 1;
+      }
+    }
+    cache.specializedMatches = specializedMatches;
+    cache.dirty = false;
+    return cache;
+  }
+
+  registerCheckedLeafCaptureDerivedGuard(id) {
+    const cache = this.checkedLeafCaptureCaches[id];
+    if (!cache) throw new Error("missing checked-leaf capture cache");
+    const key = `guard${cache.derivedGuardKeys.length}`;
+    cache.derivedGuardKeys.push(key);
+    cache[key] = undefined;
+    return key;
   }
 
   getStaticSyncAt(id) {
@@ -4034,6 +4539,7 @@ class JitCompiler {
       site.staticTarget = target;
     }
     target.fields.set(target.key, value);
+    this.markStaticTargetChanged(target);
     return true;
   }
 
@@ -4127,6 +4633,7 @@ class JitCompiler {
       throw new Error(`Unsupported putstatic: ${className}.${fieldName}`);
     }
     target.fields.set(target.key, value);
+    this.markStaticTargetChanged(target);
     return true;
   }
 
@@ -4346,6 +4853,28 @@ class JitCompiler {
     if (!target || target.positionalInvoker === null) return null;
     if (target.positionalInvoker) return target.positionalInvoker;
     const { method, lookupClass, generated } = target;
+    const positionalTracePattern = typeof process !== "undefined" && process.env
+      ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+    const positionalTraceKey = method
+      ? `${lookupClass}.${method.name}${site.descriptor}` : "";
+    const positionalTrace = Boolean(
+      positionalTracePattern && positionalTraceKey.includes(positionalTracePattern));
+    if (positionalTrace) {
+      console.error("[positional-selection]", JSON.stringify({
+        method: positionalTraceKey,
+        synchronous: generated?.jvmSynchronous === true,
+        direct: typeof generated?.jvmDirectPositionalBody === "function",
+        checkedLeaf:
+          typeof generated?.jvmCheckedLeafDirectPositionalBody === "function",
+        restoring:
+          typeof generated?.jvmRestoringDirectPositionalBody === "function",
+        intrinsic: Boolean(target.intrinsic),
+        inline: Boolean(target.inlineIntegerRegion),
+        memoized: Boolean(target.memoizedIntegralLeaf),
+        fused: Boolean(method && this.fusedRegions.enabled &&
+          this.fusedRegions.mayFuse(method)),
+      }));
+    }
     if (!method || !generated || generated.jvmSynchronous !== true ||
         target.intrinsic || target.inlineIntegerRegion || target.memoizedIntegralLeaf ||
         this.fusedRegions.enabled && this.fusedRegions.mayFuse(method)) {
@@ -4372,6 +4901,30 @@ class JitCompiler {
       target.positionalInvoker.jvmDebugGuarded = true;
       return target.positionalInvoker;
     }
+    if (this.checkedLeafDirectPositionalEnabled &&
+        typeof generated.jvmCheckedLeafDirectPositionalBody === "function") {
+      // A single bounded call-free loop can publish a compact checked leaf:
+      // all class/debug/array predicates execute before its first guest
+      // effect, while predicate failure returns to the canonical call path.
+      // Keeping cold Frame restoration out of this body lets JavaScript
+      // engines inline it into loop-bearing callers without a handwritten
+      // guest algorithm or identity-specific recognizer.
+      const nestedBody =
+        typeof generated.jvmTrustedCheckedLeafDirectPositionalBody === "function"
+          ? generated.jvmTrustedCheckedLeafDirectPositionalBody
+          : generated.jvmCheckedLeafDirectPositionalBody;
+      target.positionalInvoker = nestedBody.bind(null, this);
+      target.positionalInvoker.jvmDebugGuarded = true;
+      target.positionalInvoker.jvmCheckedLeaf = true;
+      // Generated callers already hold the JIT helper object. Expose the raw
+      // fixed-arity body alongside the canonical bound entry so they can call
+      // a normal JavaScript function that optimizing engines may inline. The
+      // bound entry remains the public/cold ABI and preserves existing call
+      // sites. Selection is based solely on the verified checked-leaf shape.
+      target.positionalInvoker.jvmRawInvoke =
+        nestedBody;
+      return target.positionalInvoker;
+    }
     if (typeof generated.jvmRestoringDirectPositionalBody === "function") {
       // A verified acyclic field/primitive-array leaf can use the same scalar
       // call ABI without eagerly constructing its child Frame.  Its generated
@@ -4384,9 +4937,13 @@ class JitCompiler {
         method,
         lookupClass,
         semantic: generated.jvmRestoringDirectPositionalPlan || null,
-        restoreFrame: (thread, child) => {
+        restoreFrame: (thread, child, restorationDepth) => {
           const frames = thread.callStack.items;
-          if (!frames.includes(child)) frames.push(child);
+          if (frames.includes(child)) return;
+          const insertion = Number.isInteger(restorationDepth)
+            ? Math.max(0, Math.min(restorationDepth, frames.length))
+            : frames.length;
+          frames.splice(insertion, 0, child);
         },
       };
       target.positionalInvoker =
@@ -4415,8 +4972,7 @@ class JitCompiler {
     const staticGuard = site.op === "invokestatic"
       ? `if (!plan.staticInitialization.initialized) return plan.asyncInvoke;`
       : "";
-    const tracePattern = typeof process !== "undefined" && process.env
-      ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+    const tracePattern = positionalTracePattern;
     const methodKey = `${lookupClass}.${method.name}${site.descriptor}`;
     const trace = Boolean(tracePattern && methodKey.includes(tracePattern));
     const traceEntry = trace
@@ -4469,6 +5025,15 @@ class JitCompiler {
       "let positionalTimingStarted = -1;",
       "let positionalExclusiveTiming = null;",
       "if (useFrameless) {",
+      // A frameless entry runs the body with no Frame on the call stack, so the
+      // implied ACC_SYNCHRONIZED monitor is entered against the child Frame that
+      // already exists for locals and released explicitly below -- CallStack.pop
+      // never sees this call. Contention degrades to the ordinary deopt path,
+      // which restores the child and lets the scheduler block on it.
+      "  if (child.isSynchronizedMethod && !child.monitorEntered &&",
+      "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
+      "    result = { deopt: true, reason: 'synchronized monitor contended' };",
+      "  } else {",
       "  baseDepth = thread.callStack.items.length;",
       "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
       "  if (jit.shouldBeginExclusiveTimingKey(plan.methodKey)) {",
@@ -4498,11 +5063,21 @@ class JitCompiler {
       "    jit.recordMethodTiming(plan.methodKey, jit.monotonicNow() - positionalTimingStarted, plan.generated);",
       "  }",
       "  jit.endExclusiveTiming(positionalExclusiveTiming);",
+      "  }",
       "} else {",
       "  thread.callStack.push(child);",
+      // The implied monitor of a synchronized callee has to be held before its
+      // body runs. Uncontended entry is a couple of field writes and stays in
+      // generated code; a contended one yields to the scheduler as BLOCKED and
+      // the interpreter re-enters the already-pushed child once it is free.
+      "  if (child.isSynchronizedMethod && !child.monitorEntered &&",
+      "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
+      "    result = { deopt: true, reason: 'synchronized monitor contended' };",
+      "  } else {",
       "  result = jit.runGeneratedFrame(plan.generated, child, thread, false);",
       "  if (result && typeof result.then === 'function') {",
       "    throw new Error('Synchronous positional method returned a Promise');",
+      "  }",
       "  }",
       "}",
       traceResult,
@@ -4521,6 +5096,9 @@ class JitCompiler {
       "    }",
       "  }",
       "  return result;",
+      "}",
+      "if (useFrameless && child.monitorEntered === true) {",
+      "  jit.jvm.exitFrameMonitor(child);",
       "}",
       "if (adaptiveFrameless && !useFrameless && !target.framelessRejected) {",
       "  target.framelessWarmCompletions = (target.framelessWarmCompletions || 0) + 1;",
@@ -4708,26 +5286,14 @@ class JitCompiler {
       const structuralIntrinsic = op === "invokestatic"
         ? this.getSynchronousIntrinsic(method, descriptor)
         : null;
-      const pendingIntrinsicCandidates =
-        op === "invokestatic" && !structuralIntrinsic ? [
-          ...(HandwrittenPolygonRaster.candidateDependencies(
-            this, method, descriptor) || []),
-          ...(HandwrittenAffineSpriteRaster.candidateDependencies(
-            this, method, descriptor) || []),
-        ] : null;
-      const pendingIntrinsicOwners = pendingIntrinsicCandidates?.length
-        ? [...new Set(pendingIntrinsicCandidates)]
-        : null;
       if (!normallySupported && !fusedCandidate &&
-          !structuralIntrinsic &&
-          (!pendingIntrinsicOwners || pendingIntrinsicOwners.length === 0)) {
+          !structuralIntrinsic) {
         return ASYNC_INVOKE;
       }
       target = {
         method,
         lookupClass,
         intrinsic: structuralIntrinsic,
-        pendingIntrinsicOwners,
         inlineIntegerRegion: normallySupported &&
           (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
           ? this.getInlineIntegerRegion(method, params, returnType)
@@ -4760,10 +5326,20 @@ class JitCompiler {
         if (positional && !site.fastPositional) {
           site.fastPositional = {
             invoke: positional,
+            rawInvoke: positional.jvmRawInvoke || null,
             lookupClass,
             receiverType: null,
             debugGuarded: positional.jvmDebugGuarded === true,
           };
+          const tracePattern = typeof process !== "undefined" && process.env
+            ? process.env.JVM_TRACE_POSITIONAL_GENERATED || "" : "";
+          const traceKey = `${lookupClass}.${method.name}${descriptor}`;
+          if (tracePattern && traceKey.includes(tracePattern)) {
+            console.error("[positional-published]", JSON.stringify({
+              method: traceKey,
+              debugGuarded: site.fastPositional.debugGuarded,
+            }));
+          }
         }
       } else if (op === "invokespecial") {
         // Private/super helpers are monomorphic by bytecode semantics. Cache
@@ -4776,6 +5352,7 @@ class JitCompiler {
         if (positional && !site.fastPositional) {
           site.fastPositional = {
             invoke: positional,
+            rawInvoke: positional.jvmRawInvoke || null,
             lookupClass,
             receiverType: null,
             debugGuarded: positional.jvmDebugGuarded === true,
@@ -4799,6 +5376,7 @@ class JitCompiler {
         if (direct && !site.fastPositional) {
           site.fastPositional = {
             invoke: direct,
+            rawInvoke: direct.jvmRawInvoke || null,
             lookupClass,
             receiverType: targetClassName,
             debugGuarded: direct.jvmDebugGuarded === true,
@@ -4857,31 +5435,39 @@ class JitCompiler {
 
   tryInvokeResolvedTarget(site, target, frame, thread) {
     const { op, descriptor, params, returnType } = site;
+    const receiverSlots = op === "invokestatic" ? 0 : 1;
+    const availableOperands = frame.stack.items.length;
+    const requiredOperands = params.length + receiverSlots;
+    if (availableOperands < requiredOperands) {
+      this.syncOperandUnderflowFallbackCount += 1;
+      const callerMethod = frame.method || {};
+      const caller = `${frame.className || callerMethod.className || "<unknown>"}.` +
+        `${callerMethod.name || "<unknown>"}${callerMethod.descriptor || ""}`;
+      const callee = `${target.lookupClass || site.declaredClassName || "<unknown>"}.` +
+        `${target.method?.name || site.methodName || "<unknown>"}${descriptor}`;
+      const signature = `${caller}@${frame.pc}:${op}:${callee}:` +
+        `${availableOperands}/${requiredOperands}`;
+      if (!this.reportedSyncOperandUnderflows.has(signature)) {
+        this.reportedSyncOperandUnderflows.add(signature);
+        console.error("[jit-sync-operand-underflow]", {
+          caller,
+          callerPc: frame.pc,
+          callee,
+          op,
+          availableOperands,
+          requiredOperands,
+          hostStack: new Error("generated invocation operand underflow").stack,
+        });
+      }
+      return ASYNC_INVOKE;
+    }
     const {
       method, lookupClass, inlineIntegerRegion, memoizedIntegralLeaf, generated,
     } = target;
-    let intrinsic = target.intrinsic;
-    if (!intrinsic && Array.isArray(target.pendingIntrinsicOwners) &&
-        target.pendingIntrinsicOwners.every((owner) => this.jvm.classes[owner])) {
-      // Dependencies are now loaded.  This is the sole retry: a full-shape
-      // mismatch is permanent, while a match is installed into both the
-      // target and monomorphic call-site cache.
-      target.pendingIntrinsicOwners = null;
-      intrinsic = this.getSynchronousIntrinsic(method, descriptor);
-      if (intrinsic) {
-        target.intrinsic = intrinsic;
-        if (op === "invokestatic") {
-          site.fastIntrinsic = {
-            intrinsic,
-            lookupClass,
-            methodKey: `${lookupClass}.${method.name}${descriptor}`,
-          };
-        }
-      }
-    }
-    const receiver = op === "invokestatic"
-      ? null
-      : frame.stack.items[frame.stack.items.length - params.length - 1];
+    const intrinsic = target.intrinsic;
+    const receiver = receiverSlots
+      ? frame.stack.items[availableOperands - params.length - 1]
+      : null;
     if (this.jvm.debugManager.isClassJitDeopted(lookupClass)) return ASYNC_INVOKE;
     if (this.fusedRegions.enabled) {
       const fused = this.fusedRegions.tryInvoke(site, target, frame, thread);
@@ -4948,6 +5534,8 @@ class JitCompiler {
     delete child.jitSkipOnce;
     delete child.jitJsDisabled;
     delete child.jitAdaptiveEntryCounted;
+    delete child.jitGeneratedReturnParent;
+    delete child.jitGeneratedReturnType;
     child.className = lookupClass;
     let localIndex = 0;
     if (op !== "invokestatic") {
@@ -4958,13 +5546,30 @@ class JitCompiler {
       child.locals[localIndex] = frame.stack.items[argumentBase + i];
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
-    frame.stack.items.length = argumentBase - (op === "invokestatic" ? 0 : 1);
+    frame.stack.items.length = argumentBase - receiverSlots;
     thread.callStack.push(child);
+    // See the positional emitter: a synchronized callee must hold its monitor
+    // before its body runs, and a contended entry becomes an ordinary deopt so
+    // the scheduler can block this thread on the already-pushed child.
+    if (child.isSynchronizedMethod && !child.monitorEntered &&
+        !this.jvm.enterFrameMonitorIfNeeded(child, thread)) {
+      child.jitGeneratedReturnParent = frame;
+      child.jitGeneratedReturnType = returnType;
+      return { deopt: true, reason: "synchronized monitor contended" };
+    }
     const result = this.runGeneratedFrame(generated, child, thread, false);
     if (result && typeof result.then === "function") {
       throw new Error("Synchronous generated method returned a Promise");
     }
-    if (result.deopt) return result;
+    if (result.deopt) {
+      // Omitted/generated frame restoration can insert more than one caller
+      // around a suspended child. Record the verified immediate parent rather
+      // than assuming whichever Frame is on top when the child eventually
+      // returns is the correct operand-stack recipient.
+      child.jitGeneratedReturnParent = frame;
+      child.jitGeneratedReturnType = returnType;
+      return result;
+    }
     target.freeFrame = child;
     if (memoKey !== NO_MEMO_KEY) {
       if (memoizedIntegralLeaf.values.size >= memoizedIntegralLeaf.maxEntries) {
@@ -4992,7 +5597,8 @@ class JitCompiler {
     const code = method.attributes.find((attribute) => attribute.type === "code");
     const codeItems = code && this.getCodeItems(method);
     const labels = codeItems && buildLabelMap(codeItems);
-    const depths = codeItems && this.computeStackDepths(codeItems, labels);
+    const depths = codeItems &&
+      this.computeStackDepths(codeItems, labels, method);
     if (!code || !depths || codeItems.length > 4096) {
       this.memoizedIntegralLeafCache.set(method, null);
       return null;
@@ -5073,46 +5679,13 @@ class JitCompiler {
   }
 
   getSynchronousIntrinsic(method, descriptor) {
-    if (HandwrittenAffineSpriteRaster.DESCRIPTOR.test(descriptor)) {
-      if (this.affineSpriteRasterIntrinsicCache.has(method)) {
-        return this.affineSpriteRasterIntrinsicCache.get(method);
-      }
-      const affineSpriteRaster = HandwrittenAffineSpriteRaster.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      if (affineSpriteRaster) {
-        this.affineSpriteRasterIntrinsicCache.set(method, affineSpriteRaster);
-        return affineSpriteRaster;
-      }
-    }
-    if (descriptor === HandwrittenPerspectiveSpan.DESCRIPTOR) {
-      if (this.perspectiveSpanIntrinsicCache.has(method)) {
-        return this.perspectiveSpanIntrinsicCache.get(method);
-      }
-      const perspectiveSpan = HandwrittenPerspectiveSpan.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      if (perspectiveSpan) {
-        this.perspectiveSpanIntrinsicCache.set(method, perspectiveSpan);
-        return perspectiveSpan;
-      }
-    }
-    if (descriptor === "([II)V" || descriptor === "([III)V") {
-      if (this.polygonRasterIntrinsicCache.has(method)) {
-        return this.polygonRasterIntrinsicCache.get(method);
-      }
-      const polygon = HandwrittenPolygonRaster.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      // A structurally referenced span owner may not have been loaded on the
-      // first cold query.  Cache only a positive proof so a later hot call can
-      // retry after ordinary class loading completes.
-      if (polygon) {
-        this.polygonRasterIntrinsicCache.set(method, polygon);
-        return polygon;
-      }
-    }
-    if (descriptor === HandwrittenTiledBlit.DESCRIPTOR) {
-      const tiledBlit = HandwrittenTiledBlit.createIntrinsic(
-        this, method, descriptor, { ASYNC_INVOKE, RETURN_VOID, STATIC_DEOPT });
-      if (tiledBlit) return tiledBlit;
+    // The only production intrinsic recognized from guest bytecode is the
+    // small, general primitive-array memmove idiom below. Avoid canonicalizing
+    // every arbitrary callee merely to discover that large guest-kernel
+    // oracles are disabled.
+    if (!this.guestKernelOraclesEnabled &&
+        descriptor !== "([II[III)V") {
+      return null;
     }
     const codeItems = this.getCodeItems(method);
     const rawOps = codeItems
@@ -5154,6 +5727,12 @@ class JitCompiler {
       intrinsic.jvmDirectKind = "primitiveArrayCopy";
       return intrinsic;
     }
+
+    // Everything below this point is a complete guest rendering algorithm,
+    // selected by a long opcode/constant fingerprint and replaced by
+    // handwritten JavaScript. It remains available as a differential oracle,
+    // but normal execution must compile those bytecodes through structured SSA.
+    if (!this.guestKernelOraclesEnabled) return null;
 
     if (descriptor === "(IIII)V") {
       const spanOps = [
@@ -5289,7 +5868,8 @@ class JitCompiler {
       const codeVerified =
         (!exceptionTable.length ||
           this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
-        Boolean(this.computeStackDepths(codeItems, buildLabelMap(codeItems)));
+        Boolean(this.computeStackDepths(
+          codeItems, buildLabelMap(codeItems), method));
       if (!codeVerified || ops.length !== gradientOps.length ||
           !gradientOps.every((op, index) => ops[index] === op)) return null;
       const constants = codeItems.filter((item) =>
@@ -5387,7 +5967,8 @@ class JitCompiler {
       const codeVerified =
         (!exceptionTable.length ||
           this.hasOnlyNoOpExceptionHandlers(method, codeItems)) &&
-        Boolean(this.computeStackDepths(codeItems, buildLabelMap(codeItems)));
+        Boolean(this.computeStackDepths(
+          codeItems, buildLabelMap(codeItems), method));
       if (!codeVerified || ops.length !== transparentIntBlitOps.length ||
           !transparentIntBlitOps.every((op, index) => ops[index] === op)) return null;
       const intrinsic = (stack, base) => this.transparentIntBlitDirect(
@@ -6385,7 +6966,10 @@ class JitCompiler {
       return this.inlineIntegerRegionCache.get(method);
     }
     const plan = this.getInlineIntegerPlan(method, params, returnType);
-    if (!plan) return null;
+    // The standalone stack ABI has no canonical call-site Frame to resume
+    // when a speculative normal-path guard fails. Guarded plans are reserved
+    // for structured callers, which can materialize the exact invoke PC.
+    if (!plan || plan.guards.length > 0) return null;
     const inline = this.createGeneratedFunction(method, "inline-integer", ["stack", "base"],
       `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`);
     inline.jvmPlan = plan;
@@ -6408,7 +6992,7 @@ class JitCompiler {
     }
     const state = {
       active: new Set(), statements: [], nextTemp: 0,
-      instructionCount: 0, methodCount: 0,
+      instructionCount: 0, methodCount: 0, guards: [],
     };
     const result = this.emitInlineIntegerMethod(method, params, returnType, args, state, 0);
     if (result === null) return null;
@@ -6418,6 +7002,7 @@ class JitCompiler {
       receiverSlots,
       inputCount: args.length,
       methodCount: state.methodCount,
+      guards: state.guards,
     };
     this.inlineIntegerPlanCache.set(method, plan);
     return plan;
@@ -6427,8 +7012,33 @@ class JitCompiler {
     if (returnType !== "int" || !params.every((type) => type === "int") || depth > 4 ||
         state.active.has(method)) return null;
     const code = method.attributes.find((attr) => attr.type === "code");
-    if (!code || (code.code.exceptionTable || []).length) return null;
-    const items = this.getCodeItems(method).filter((item) => item && item.instruction);
+    if (!code) return null;
+    let items = this.getCodeItems(method);
+    if ((code.code.exceptionTable || []).length) {
+      // Obfuscators commonly wrap a pure integer helper in a catch/rethrow
+      // diagnostic tail.  Exception handlers are not normal CFG successors,
+      // so retain only blocks reachable from bytecode entry.  The opcode
+      // whitelist below still proves that the retained body cannot throw;
+      // consequently omitting the diagnostic-only handler preserves exact
+      // Java behavior without recognizing any owner or method identity.
+      const cfg = buildCfgFromCode(items);
+      if (!cfg) return null;
+      const reachableBlocks = new Set();
+      const reachableItems = new Set();
+      const work = [cfg.entry];
+      while (work.length) {
+        const block = work.pop();
+        if (!Number.isInteger(block) || reachableBlocks.has(block) ||
+            !cfg.blocks[block]) continue;
+        reachableBlocks.add(block);
+        for (const index of cfg.blocks[block].insns || []) {
+          reachableItems.add(index);
+        }
+        for (const successor of cfg.succ[block] || []) work.push(successor);
+      }
+      items = items.filter((item, index) => reachableItems.has(index));
+    }
+    items = items.filter((item) => item && item.instruction);
     const instructions = items.map((item) => item.instruction);
     const labels = buildLabelMap(items);
     if (instructions.length > 64 || state.instructionCount + instructions.length > 256) return null;
@@ -6580,7 +7190,17 @@ class JitCompiler {
           if (!Number.isInteger(target) || target <= index || target >= instructions.length) return null;
           const fallLocals = [...locals], fallStack = [...stack];
           const branchStatements = emitStraightRange(index + 1, target, fallLocals, fallStack);
-          if (!branchStatements || fallStack.length !== stack.length) return null;
+          if (!branchStatements || fallStack.length !== stack.length) {
+            // The taken edge bypasses an unsupported diagnostic/effect path.
+            // Publish that edge as a call-site precondition: a structured
+            // caller can deopt at the invoke before the helper has executed
+            // any bytecode, while the admitted path remains a pure integer
+            // expression. This is derived solely from the verified forward
+            // CFG and works for arbitrary obfuscator guards.
+            state.guards.push(`(${condition})`);
+            index = target - 1;
+            continue;
+          }
           const phis = [];
           const mergedLocals = [...locals], mergedStack = [...stack];
           const merge = (before, after, assign) => {
@@ -6628,6 +7248,24 @@ class JitCompiler {
           case "iadd": valid = binary((a, b) => `((${a} + ${b}) | 0)`); break;
           case "isub": valid = binary((a, b) => `((${a} - ${b}) | 0)`); break;
           case "imul": valid = binary((a, b) => `Math.imul(${a}, ${b})`); break;
+          case "idiv": {
+            const divisor = pop(), dividend = pop();
+            valid = dividend !== null && divisor !== null;
+            if (valid) {
+              state.guards.push(`(${divisor} !== 0)`);
+              stack.push(materialize(`((${dividend} / ${divisor}) | 0)`));
+            }
+            break;
+          }
+          case "irem": {
+            const divisor = pop(), dividend = pop();
+            valid = dividend !== null && divisor !== null;
+            if (valid) {
+              state.guards.push(`(${divisor} !== 0)`);
+              stack.push(materialize(`((${dividend} % ${divisor}) | 0)`));
+            }
+            break;
+          }
           case "iand": valid = binary((a, b) => `(${a} & ${b})`); break;
           case "ior": valid = binary((a, b) => `(${a} | ${b})`); break;
           case "ixor": valid = binary((a, b) => `(${a} ^ ${b})`); break;
@@ -6686,7 +7324,105 @@ class JitCompiler {
     const { params, returnType } = parseDescriptor(descriptor);
     const plan = this.getInlineIntegerPlan(method, params, returnType);
     if (!plan || plan.receiverSlots) return null;
-    return { statements: plan.statements, result: plan.result, paramCount: params.length };
+    return {
+      statements: plan.statements,
+      result: plan.result,
+      guards: plan.guards,
+      paramCount: params.length,
+      className,
+    };
+  }
+
+  getCompileTimeCheckedLeaf(instruction) {
+    if (!this.checkedLeafDirectPositionalEnabled || !instruction ||
+        !Array.isArray(instruction.arg) ||
+        !Array.isArray(instruction.arg[2])) return null;
+    const [, className, [methodName, descriptor]] = instruction.arg;
+    if (this.jvm.classInitializationState.get(className) !== "INITIALIZED") {
+      return null;
+    }
+    const classData = this.jvm.classes[className];
+    if (!classData) return null;
+    const method = this.jvm.findMethod(classData, methodName, descriptor);
+    if (!method || !(method.flags || []).includes("static")) return null;
+    const parsed = parseDescriptor(descriptor);
+    const generated = this.getGeneratedFunction(method);
+    const capturedBody =
+      generated?.jvmCapturedCheckedLeafDirectPositionalBody;
+    const capturedPlan =
+      generated?.jvmCapturedCheckedLeafDirectPositionalPlan;
+    const capturedSource =
+      generated?.jvmCapturedCheckedLeafDirectPositionalSource;
+    const ordinarySource = generated?.jvmCheckedLeafDirectPositionalSource;
+    const rawAdmissionPlan =
+      generated?.jvmStructuredCheckedLeafAdmissionPlan;
+    let admissionPlan = null;
+    if (rawAdmissionPlan?.kind === "record-window") {
+      const slotArguments = new Map();
+      let slot = 0;
+      for (let argument = 0; argument < parsed.params.length; argument += 1) {
+        slotArguments.set(slot, argument);
+        slot += parsed.params[argument] === "long" ||
+          parsed.params[argument] === "double" ? 2 : 1;
+      }
+      const arrayArgument = slotArguments.get(rawAdmissionPlan.arraySlot);
+      const lowerArgument = slotArguments.get(rawAdmissionPlan.lowerSlot);
+      const upperArgument = slotArguments.get(rawAdmissionPlan.upperSlot);
+      if (Number.isInteger(arrayArgument) &&
+          Number.isInteger(lowerArgument) &&
+          Number.isInteger(upperArgument) &&
+          Number.isInteger(rawAdmissionPlan.stride) &&
+          rawAdmissionPlan.stride > 0) {
+        admissionPlan = {
+          kind: rawAdmissionPlan.kind,
+          arrayArgument,
+          lowerArgument,
+          upperArgument,
+          stride: rawAdmissionPlan.stride,
+          maximumRecords: Number.isInteger(rawAdmissionPlan.maximumRecords) &&
+            rawAdmissionPlan.maximumRecords > 0
+            ? rawAdmissionPlan.maximumRecords : null,
+          guardVariable: rawAdmissionPlan.guardVariable,
+        };
+      }
+    } else if (rawAdmissionPlan?.kind === "clipped-affine-fill") {
+      const integerKeys = [
+        "xArgument", "yArgument", "countArgument", "valueArgument",
+        "topCapture", "bottomCapture", "leftCapture", "rightCapture",
+        "widthCapture", "arrayCapture", "arrayDataCapture", "maximumTrips",
+      ];
+      if (integerKeys.every((key) =>
+        Number.isInteger(rawAdmissionPlan[key]) &&
+        rawAdmissionPlan[key] >= 0)) {
+        admissionPlan = Object.fromEntries([
+          ["kind", rawAdmissionPlan.kind],
+          ...integerKeys.map((key) => [key, rawAdmissionPlan[key]]),
+        ]);
+      }
+    }
+    const body = typeof capturedBody === "function"
+      ? capturedBody : generated?.jvmCheckedLeafDirectPositionalBody;
+    if (typeof body !== "function") return null;
+    let id = this.directCheckedLeafBodyIds.get(body);
+    if (!Number.isInteger(id)) {
+      id = this.directCheckedLeafBodies.length;
+      this.directCheckedLeafBodies.push(body);
+      this.directCheckedLeafBodyIds.set(body, id);
+    }
+    return {
+      id,
+      paramCount: parsed.params.length,
+      returnsVoid: parsed.returnType === "void",
+      noThrow: true,
+      inlineSource: generated.jvmStructuredRecursiveArrayPartitionCheckedLeaf
+        ? null : typeof capturedBody === "function" &&
+        typeof capturedSource === "string" ? capturedSource :
+        typeof ordinarySource === "string" ? ordinarySource : null,
+      captures: typeof capturedBody === "function" &&
+        Array.isArray(capturedPlan?.captures)
+        ? capturedPlan.captures : [],
+      admissionPlan,
+    };
   }
 
   getCompileTimeSynchronousIntrinsic(instruction) {
@@ -6840,6 +7576,11 @@ class JitCompiler {
       localIndex += params[i] === "long" || params[i] === "double" ? 2 : 1;
     }
     thread.callStack.push(child);
+    if (child.isSynchronizedMethod && !child.monitorEntered &&
+        !this.jvm.enterFrameMonitorIfNeeded(child, thread)) {
+      // Contended: leave the child pushed and let the scheduler resume it.
+      return { deopt: true, reason: "synchronized monitor contended" };
+    }
     if (this.wasmJit.enabled) {
       // Ask the Wasm tier before rejecting the child on JS-JIT policy. Wasm
       // can prove numeric loops covered by a wrap-and-rethrow diagnostic
@@ -7002,7 +7743,7 @@ function expandWideInstruction(instruction) {
   return { op, arg: parts[1] };
 }
 
-function stackEffect(instruction) {
+function stackEffect(instruction, stackWidthsBefore = null) {
   const op = getOp(instruction);
   if (!op || op === "nop" || op === "goto" || op === "goto_w" || op === "iinc" ||
       op === "ineg" || op === "i2b" || op === "i2s" || op === "i2c" ||
@@ -7023,7 +7764,14 @@ function stackEffect(instruction) {
   if (op === "dup") return 1;
   if (op === "dup_x1") return 1;
   if (op === "dup_x2") return 1;
-  if (op === "dup2") return 2;
+  if (op === "dup2") {
+    if (!stackWidthsBefore || stackWidthsBefore.length < 1) return null;
+    return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? 1 : 2;
+  }
+  if (op === "dup2_x2") {
+    if (!stackWidthsBefore || stackWidthsBefore.length < 2) return null;
+    return stackWidthsBefore[stackWidthsBefore.length - 1] === 2 ? 1 : 2;
+  }
   if (op === "putfield") return -2;
   if (op.endsWith("aload") || [
     "iadd", "isub", "imul", "idiv", "irem", "ishl", "ishr", "iushr",
