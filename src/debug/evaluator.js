@@ -42,16 +42,11 @@ const BOX_TYPES = new Map([
   ['java/lang/Boolean', 'boolean'],
 ]);
 
-function isProbablyStatements(source) {
-  return /;\s*$/.test(source.trim()) || /^\s*[{}]/.test(source) ||
-    /^\s*(if|for|while|do|switch|try|return|throw|synchronized)\b/.test(source);
-}
-
-function snippetVariants(className, source, resultType = RESULT_TYPE) {
+function snippetVariants(className, source, resultType = RESULT_TYPE, isStatementSnippet) {
   const body = source.trim();
   const variants = [];
-  if (!isProbablyStatements(body)) {
-    const expression = body.replace(/;\s*$/, '');
+  if (!isStatementSnippet(body)) {
+    const expression = body.endsWith(';') ? body.slice(0, -1).trimEnd() : body;
     variants.push({
       kind: 'expression',
       resultType,
@@ -67,7 +62,7 @@ function snippetVariants(className, source, resultType = RESULT_TYPE) {
     resultType: null,
     source: `public class ${className} {\n` +
       `  public static void ${ENTRY_METHOD}() {\n` +
-      `    ${body}${/[;}]\s*$/.test(body) ? '' : ';'}\n` +
+      `    ${body}${isStatementSnippet(body) ? '' : ';'}\n` +
       '  }\n}\n',
   });
   return variants;
@@ -105,16 +100,20 @@ function loadFrontend() {
       if (typeof frontend.compileJavaSource !== 'function') {
         throw new Error('Java frontend did not export compileJavaSource');
       }
-      return frontend.compileJavaSource;
+      if (typeof frontend.isStatementSnippet !== 'function') {
+        throw new Error('Java frontend did not export isStatementSnippet');
+      }
+      return frontend;
     });
   }
   return frontendPromise;
 }
 
 async function compileSnippet(className, source, options, resultType = RESULT_TYPE) {
-  const compileJavaSource = await loadFrontend();
+  const frontend = await loadFrontend();
+  const { compileJavaSource, isStatementSnippet } = frontend;
   const failures = [];
-  for (const variant of snippetVariants(className, source, resultType)) {
+  for (const variant of snippetVariants(className, source, resultType, isStatementSnippet)) {
     try {
       const compiled = compileJavaSource(variant.source, {
         sourceFileName: `${className}.java`,

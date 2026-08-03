@@ -6,6 +6,7 @@ module.exports = {
   ...require('./errors'),
   ...require('./lexer'),
   ...require('./parser'),
+  ...require('./snippets'),
   ...require('./semantic'),
   ...require('./frontend'),
   ...require('./compiler'),
