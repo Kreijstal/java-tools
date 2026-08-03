@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/jvm-js-logo.svg" alt="jvm.js" width="140">
+</p>
+
 # JVM Tools - Advanced Java Bytecode Analysis & Execution
 
 [![CI](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml/badge.svg)](https://github.com/Kreijstal/java-tools/actions/workflows/ci.yml)
