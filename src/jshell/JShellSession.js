@@ -41,13 +41,18 @@ function supportedType(type) {
   return Boolean(type) && type.kind !== 'UnsupportedType';
 }
 
-function validMember(member) {
+function validMember(member, source) {
   if (member.kind === 'FieldDeclaration') {
     if (!supportedType(member.fieldType) || !Array.isArray(member.declarators) ||
         member.declarators.length === 0) {
       return false;
     }
-    return member.declarators.every((declarator) => Boolean(declarator.name));
+    const tokens = tokenizeJava(source).tokens;
+    return member.declarators.every((declarator) => {
+      const nameIndex = tokens.findIndex((token) => token.text === declarator.name);
+      return Boolean(declarator.name) && nameIndex !== -1 &&
+        (!tokens[nameIndex - 1] || tokens[nameIndex - 1].text !== '.');
+    });
   }
   if (member.kind === 'MethodDeclaration') {
     return supportedType(member.returnType) &&
@@ -67,7 +72,7 @@ function classifyMemberDetails(source, imports) {
     }
     const member = declaration.body[0];
     const kind = MEMBER_KINDS.get(member.kind);
-    return kind && validMember(member)
+    return kind && validMember(member, source)
       ? { kind, name: memberName(member), member }
       : null;
   } catch (_) {
