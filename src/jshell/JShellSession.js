@@ -4,7 +4,13 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { JVM } = require('../core/jvm');
-const { compileJavaSource, parseJava } = require('../java-frontend');
+const {
+  compileJavaSource,
+  hasStatementTerminator,
+  isStatementSnippet,
+  parseJava,
+  tokenizeJava,
+} = require('../java-frontend');
 
 const MEMBER_KINDS = new Map([
   ['FieldDeclaration', 'variable'],
@@ -35,17 +41,13 @@ function supportedType(type) {
   return Boolean(type) && type.kind !== 'UnsupportedType';
 }
 
-function validMember(member, source) {
+function validMember(member) {
   if (member.kind === 'FieldDeclaration') {
     if (!supportedType(member.fieldType) || !Array.isArray(member.declarators) ||
         member.declarators.length === 0) {
       return false;
     }
-    return member.declarators.every((declarator) => {
-      if (!declarator.name) return false;
-      const escapedName = declarator.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      return new RegExp(`\\s+${escapedName}(?:\\s|=|,|;|\\[)`).test(source);
-    });
+    return member.declarators.every((declarator) => Boolean(declarator.name));
   }
   if (member.kind === 'MethodDeclaration') {
     return supportedType(member.returnType) &&
@@ -55,7 +57,7 @@ function validMember(member, source) {
   return MEMBER_KINDS.has(member.kind);
 }
 
-function classifyMember(source, imports) {
+function classifyMemberDetails(source, imports) {
   const importText = imports.length ? `${imports.join('\n')}\n` : '';
   try {
     const document = parseJava(`${importText}class JShellMemberProbe {\n${source}\n}`);
@@ -65,50 +67,89 @@ function classifyMember(source, imports) {
     }
     const member = declaration.body[0];
     const kind = MEMBER_KINDS.get(member.kind);
-    return kind && validMember(member, source)
-      ? { kind, name: memberName(member) }
+    return kind && validMember(member)
+      ? { kind, name: memberName(member), member }
       : null;
   } catch (_) {
     return null;
   }
 }
 
-function ensurePublicStatic(source) {
-  const match = /^(\s*)((?:(?:public|protected|private|static|final|abstract|synchronized|native|strictfp|transient|volatile)\s+)*)([\s\S]*)$/.exec(source);
-  const indent = match[1];
-  const modifiers = match[2].trim().split(/\s+/).filter(Boolean);
-  const remainder = match[3];
-  const retained = modifiers.filter((modifier) =>
-    modifier !== 'public' && modifier !== 'protected' &&
-    modifier !== 'private' && modifier !== 'static');
-  const prefix = ['public', 'static', ...retained].join(' ');
-  return `${indent}${prefix} ${remainder}`;
+function classifyMember(source, imports) {
+  const details = classifyMemberDetails(source, imports);
+  return details && { kind: details.kind, name: details.name };
 }
 
-function ensureStatementTerminator(source) {
-  const trimmed = source.trim();
-  if (!trimmed || /[;}]\s*$/.test(trimmed)) return source;
-  return `${source};`;
+function ensurePublicStatic(source, member) {
+  const tokens = tokenizeJava(source).tokens;
+  if (!tokens.length) return source;
+  const modifiers = (member.modifiers || []).map((modifier) => modifier.name);
+  const removable = new Set(['public', 'protected', 'private', 'static']);
+  const removedOffsets = new Set();
+  let modifierIndex = 0;
+  for (const token of tokens) {
+    if (modifierIndex >= modifiers.length) break;
+    if (token.text !== modifiers[modifierIndex]) continue;
+    if (removable.has(token.text)) removedOffsets.add(token.range.startOffset);
+    modifierIndex += 1;
+  }
+  let normalized = '';
+  let offset = 0;
+  for (const token of tokens) {
+    if (!removedOffsets.has(token.range.startOffset)) continue;
+    normalized += source.slice(offset, token.range.startOffset);
+    offset = token.range.endOffset;
+  }
+  normalized += source.slice(offset);
+  const firstToken = tokens[0];
+  return `${source.slice(0, firstToken.range.startOffset)}public static ` +
+    normalized.slice(firstToken.range.startOffset);
 }
 
 function candidateKinds(source, imports) {
   let memberSource = source;
-  let member = classifyMember(memberSource, imports);
-  if (member && member.kind === 'variable' && !/;\s*$/.test(memberSource.trim())) {
+  let member = classifyMemberDetails(memberSource, imports);
+  if (member && member.kind === 'variable' && !hasStatementTerminator(memberSource)) {
     memberSource = `${memberSource};`;
-  }
-  if (!member && !/;\s*$/.test(source.trim())) {
+    member = classifyMemberDetails(memberSource, imports);
+  } else if (!member && !hasStatementTerminator(source)) {
     memberSource = `${source};`;
-    member = classifyMember(memberSource, imports);
+    member = classifyMemberDetails(memberSource, imports);
   }
-  if (member) return [{ ...member, body: ensurePublicStatic(memberSource) }];
-  if (/;\s*$/.test(source.trim()) || /^[{}]/.test(source.trim())) {
+  if (member) {
+    return [{
+      kind: member.kind,
+      name: member.name,
+      body: ensurePublicStatic(memberSource, member.member),
+    }];
+  }
+  if (isStatementSnippet(source)) {
     return [{ kind: 'statement', body: source }];
   }
   return [
     { kind: 'expression', body: source },
-    { kind: 'statement', body: ensureStatementTerminator(source) },
+    { kind: 'statement', body: hasStatementTerminator(source) ? source : `${source};` },
   ];
+}
+
+function parseImportSnippet(source) {
+  try {
+    const importSource = hasStatementTerminator(source) ? source : `${source};`;
+    const document = parseJava(`${importSource}\nclass JShellImportProbe {}`);
+    const imports = document.root.imports || [];
+    const declarations = document.root.typeDeclarations || [];
+    if (imports.length !== 1 || declarations.length !== 1 ||
+        declarations[0].kind !== 'ClassDeclaration') return null;
+    return imports[0];
+  } catch (_) {
+    return null;
+  }
+}
+
+function formatImport(importDeclaration) {
+  const name = importDeclaration.name.parts.join('.');
+  return `import ${importDeclaration.isStatic ? 'static ' : ''}${name}` +
+    `${importDeclaration.isWildcard ? '.*' : ''};`;
 }
 
 function sourceForCandidate(className, previousClass, imports, candidate) {
@@ -190,14 +231,17 @@ class JShellSession {
     const source = String(rawSource || '').trim();
     if (!source) return { status: 'empty', kind: 'empty' };
 
-    if (/^import\s+(?:static\s+)?[A-Za-z_$][\w$]*(?:\.[A-Za-z_$*][\w$*]*)*\s*;?$/.test(source)) {
-      const normalizedImport = /;\s*$/.test(source) ? source : `${source};`;
+    const importDeclaration = parseImportSnippet(source);
+    if (importDeclaration) {
+      const normalizedImport = formatImport(importDeclaration);
       if (!this.imports.includes(normalizedImport)) this.imports.push(normalizedImport);
       const result = {
         status: 'accepted',
         kind: 'import',
         source: normalizedImport,
-        name: normalizedImport.replace(/^import\s+/, '').replace(/;$/, ''),
+        name: `${importDeclaration.isStatic ? 'static ' : ''}` +
+          `${importDeclaration.name.parts.join('.')}` +
+          `${importDeclaration.isWildcard ? '.*' : ''}`,
       };
       this.snippets.push(result);
       return result;
