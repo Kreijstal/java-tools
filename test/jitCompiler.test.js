@@ -16,6 +16,7 @@ const {
   addTypedArrayStoreImports,
 } = require('../src/jit/wasmRuntimeImports');
 const { _test: structuredRendererTest } = require('../src/jit/JvmSsaBlockRenderer');
+const { substituteStackArguments } = require('../src/jit/astSubstitutions');
 const HandwrittenFusedGradient =
   require('../scripts/oracles/FusedGradientOracle');
 const HandwrittenAffineSpriteRaster =
@@ -43,6 +44,23 @@ test('Wasm Math imports preserve exact Java long semantics', (t) => {
     'long min remains exact below Number safe-integer range');
   t.equal(mathIntrinsicFunction('sqrt', '(J)J'), null,
     'nonexistent long Math overloads stay outside the intrinsic tier');
+  t.end();
+});
+
+test('inline stack substitutions operate on JavaScript AST nodes', (t) => {
+  const arguments_ = ['firstArgument', 'secondArgument'];
+  t.equal(
+    substituteStackArguments(
+      'const value = stack[base + 1]; const text = "stack[base + 1]";',
+      arguments_),
+    'const value = (secondArgument); const text = "stack[base + 1]";',
+    'statement substitutions leave string literals untouched',
+  );
+  t.equal(
+    substituteStackArguments('stack[base + 0] + stack[base + 1]', arguments_, true),
+    '(firstArgument) + (secondArgument)',
+    'expression substitutions replace only matching member expressions',
+  );
   t.end();
 });
 
