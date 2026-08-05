@@ -11,11 +11,12 @@
  *   <script>
  *     JavaAppletEngine.runApplet({
  *       container: document.getElementById('applet-host'),
- *       className: 'Kite',
- *       codebase: 'http://host/path/to/classes/',   // or archiveUrl:
- *       archiveUrl: 'http://host/applet.jar',
+ *       className: 'MyApplet',
+ *       codebase: 'http://host/path/to/classes/',   // and/or archives:
+ *       archiveUrls: ['http://host/applet.jar'],
  *       width: 710, height: 400,
  *       params: { foo: 'bar' },                     // applet parameters
+ *       bundleUrl: '/dist/jvm-debug.js',            // optional
  *       onProgress: (msg) => { ... }                // optional
  *     });
  *   </script>
@@ -32,24 +33,32 @@
 
   let depsPromise = null;
 
-  function loadScript(src) {
+  function loadScript(src, integrity) {
     return new Promise((resolve, reject) => {
       const s = document.createElement('script');
       s.src = src;
+      // Third-party CDN code runs with full page privileges here, so pin it.
+      if (integrity) {
+        s.integrity = integrity;
+        s.crossOrigin = 'anonymous';
+        s.referrerPolicy = 'no-referrer';
+      }
       s.onload = () => resolve();
       s.onerror = () => reject(new Error('Failed to load ' + src));
       document.head.appendChild(s);
     });
   }
 
-  async function ensureDeps(base) {
+  async function ensureDeps(bundleUrl) {
     if (depsPromise) return depsPromise;
     depsPromise = (async () => {
       if (!global.JSZip) {
-        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js');
+        await loadScript(
+          'https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js',
+          'sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg==');
       }
       if (!global.JVMDebug) {
-        await loadScript(base + 'jvm-debug.js');
+        await loadScript(bundleUrl);
       }
     })();
     return depsPromise;
@@ -89,17 +98,25 @@
   }
 
   // Fetch <Class>.class from a codebase on demand (the classic applet form:
-  // <applet code="Kite.class" codebase="..."> with no archive).
+  // <applet code="MyApplet.class" codebase="..."> with no archive).
   function installCodebaseLoader(debug, jvm, codebase) {
     const base = codebase.endsWith('/') ? codebase : codebase + '/';
     const orig = jvm.loadClassByName.bind(jvm);
+    // Misses are cached so a class the codebase does not host is not re-fetched
+    // on every resolution attempt -- JRE-internal lookups miss constantly.
+    const missing = new Set();
     jvm.loadClassByName = async (className) => {
-      const local = await orig(className).catch(() => null);
+      // orig may throw synchronously, in which case .catch() is not on the
+      // return value at all and the rejection escapes.
+      const local = await Promise.resolve()
+        .then(() => orig(className))
+        .catch(() => null);
       if (local && local.ast) return local;
       const slash = String(className).replace(/\./g, '/');
+      if (missing.has(slash)) return null;
       try {
         const resp = await fetch(base + slash + '.class');
-        if (!resp.ok) return null;
+        if (!resp.ok) { missing.add(slash); return null; }
         debug.fileProvider.virtualFS.set(slash + '.class',
           new Uint8Array(await resp.arrayBuffer()));
         return await orig(className);
@@ -111,11 +128,16 @@
 
   // Keep each canvas buffer matched to its laid-out size so drawImage blits
   // at 1:1 (real AWT behaviour, no letterboxing/distortion).
+  //
+  // Assigning canvas.width/height clears the canvas, and this runs on a timer,
+  // so it must only fire when the size genuinely changed -- otherwise it blanks
+  // the applet between paints. Sub-pixel layout jitter is ignored for the same
+  // reason.
   function syncCanvasBuffers(host) {
     host.querySelectorAll('canvas').forEach((c) => {
-      const w = c.clientWidth || c.offsetWidth;
-      const h = c.clientHeight || c.offsetHeight;
-      if (w > 0 && h > 0 && (Math.abs(c.width - w) > 1 || Math.abs(c.height - h) > 1)) {
+      const w = Math.round(c.clientWidth || c.offsetWidth);
+      const h = Math.round(c.clientHeight || c.offsetHeight);
+      if (w > 0 && h > 0 && (c.width !== w || c.height !== h)) {
         c.width = w;
         c.height = h;
       }
@@ -127,11 +149,16 @@
       container,
       className,
       archiveUrl = null,
+      archiveUrls = null,
       codebase = null,
       width = 800,
       height = 600,
       params = {},
       base = DEFAULT_BASE,
+      // jvm-debug.js is a webpack output in dist/ while applet-engine.js is
+      // checked in under examples/applet-loader/, so a single base directory
+      // cannot locate both. Callers serving them together can ignore this.
+      bundleUrl = base + 'jvm-debug.js',
       onProgress = () => {},
     } = options || {};
 
@@ -150,9 +177,9 @@
     container.appendChild(loading);
 
     onProgress('Loading the jvm.js runtime…');
-    await ensureDeps(base);
+    await ensureDeps(bundleUrl);
     if (!global.JVMDebug || !global.JVMDebug.BrowserJVMDebug) {
-      throw new Error('jvm.js bundle not available at ' + base);
+      throw new Error('jvm.js bundle not available at ' + bundleUrl);
     }
     global.JSZip = global.JSZip || global.window.JSZip;
 
@@ -170,19 +197,31 @@
     jvm.appletParameters = Object.keys(params).length ? params : null;
     if (codebase) jvm.appletCodeBase = codebase;
 
-    if (archiveUrl) {
-      onProgress('Downloading ' + archiveUrl + '…');
-      const n = await loadArchive(debug, archiveUrl);
-      onProgress('Loaded ' + n + ' classes.');
-    } else if (codebase) {
-      onProgress('Resolving ' + className + ' from ' + codebase + '…');
-      installCodebaseLoader(debug, jvm, codebase);
-      const classData = await jvm.loadClassByName(className).catch(() => null);
-      if (!classData || !classData.ast) {
-        throw new Error('Could not load ' + className + ' from ' + codebase);
-      }
-    } else {
-      throw new Error('runApplet: provide archiveUrl or codebase');
+    // archiveUrl (singular) is kept for direct callers; the loader passes the
+    // full comma-separated list from the applet tag's archive attribute.
+    const archives = archiveUrls && archiveUrls.length
+      ? archiveUrls
+      : (archiveUrl ? [archiveUrl] : []);
+
+    if (!archives.length && !codebase) {
+      throw new Error('runApplet: provide archiveUrls/archiveUrl or codebase');
+    }
+
+    for (const url of archives) {
+      onProgress('Downloading ' + url + '…');
+      const n = await loadArchive(debug, url);
+      onProgress('Loaded ' + n + ' classes from ' + url + '.');
+    }
+
+    // A codebase is still useful alongside archives: applets routinely pull
+    // classes and resources that were never packed into the jars.
+    if (codebase) installCodebaseLoader(debug, jvm, codebase);
+
+    onProgress('Resolving ' + className + '…');
+    const classData = await Promise.resolve(jvm.loadClassByName(className)).catch(() => null);
+    if (!classData || !classData.ast) {
+      throw new Error('Could not load ' + className + ' from ' +
+        (archives.length ? archives.join(', ') : codebase));
     }
 
     onProgress('Starting ' + className + '…');
@@ -192,14 +231,22 @@
       loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
     });
 
-    // Once the applet's canvas exists, move it into the host and keep its
-    // buffer in sync with the laid-out size.
+    // Once the applet's canvas exists, move it into the host.
+    //
+    // document.querySelector('.awt-applet-root') matched the FIRST root in the
+    // document, so on a page with two applets the second engine instance stole
+    // the first one's canvas and the first host stayed stuck on its loading
+    // message. Claim only roots that no host has adopted yet.
     const started = Date.now();
     const watch = setInterval(() => {
-      const root = document.querySelector('.awt-applet-root');
-      if (root && root.parentNode !== container) {
-        container.appendChild(root);
-        loading.remove();
+      if (!container.querySelector('.awt-applet-root')) {
+        const roots = document.querySelectorAll('.awt-applet-root');
+        for (const root of roots) {
+          if (root.closest('.jvmjs-applet-host')) continue;
+          container.appendChild(root);
+          loading.remove();
+          break;
+        }
       }
       syncCanvasBuffers(container);
       if (Date.now() - started > 60000) clearInterval(watch);

@@ -5,7 +5,7 @@
 // @description  Scans pages for <applet> tags and re-runs them inline in the
 //               browser with jvm.js — no Java plugin, no appletviewer, no iframe.
 // @author       kreijstal
-// @match        *://*
+// @match        *://*/*
 // @grant        none
 // @run-at       document-idle
 // ==/UserScript==
@@ -14,8 +14,16 @@
   'use strict';
 
   // Base directory that holds applet-engine.js and jvm-debug.js.
-  // Change to your deployed copy (or set window.JAVA_APPLET_BASE first).
-  const BASE = 'http://localhost:3000/dist/';
+  // The README documents window.JAVA_APPLET_BASE as the override, so honour it
+  // rather than forcing every consumer to edit this file.
+  const BASE = (typeof window.JAVA_APPLET_BASE === 'string' && window.JAVA_APPLET_BASE)
+    ? window.JAVA_APPLET_BASE
+    : 'http://localhost:3000/examples/applet-loader/';
+
+  // jvm-debug.js is a webpack output in dist/, not next to applet-engine.js.
+  const BUNDLE = (typeof window.JAVA_APPLET_BUNDLE === 'string' && window.JAVA_APPLET_BUNDLE)
+    ? window.JAVA_APPLET_BUNDLE
+    : 'http://localhost:3000/dist/jvm-debug.js';
 
   // Legacy <applet> selector plus the old object/embed variants.
   const APPLET_SELECTOR = 'applet, object[classid*="java"], embed[type*="java-applet"]';
@@ -25,20 +33,29 @@
    */
   function parseApplet(el) {
     const attr = (name) => el.getAttribute(name) || '';
-    const code = attr('code').trim();
-    const codebase = attr('codebase').trim();
-    const archive = attr('archive').trim();
-    const width = parseInt(attr('width'), 10) || 300;
-    const height = parseInt(attr('height'), 10) || 300;
-    const name = attr('name').trim();
 
-    // <param name="x" value="y"> children
+    // <param name="x" value="y"> children. Collected first because the legacy
+    // object/embed forms carry code/codebase/archive as params rather than
+    // attributes -- without the fallback those elements parse to an empty
+    // className and get silently skipped.
     const params = {};
     for (const p of el.querySelectorAll('param')) {
       const n = (p.getAttribute('name') || '').trim();
       const v = (p.getAttribute('value') || '').trim();
       if (n) params[n] = v;
     }
+    const paramCI = (name) => {
+      const key = Object.keys(params).find((k) => k.toLowerCase() === name);
+      return key ? params[key] : '';
+    };
+    const launchField = (name) => (attr(name).trim() || paramCI(name).trim());
+
+    const code = launchField('code');
+    const codebase = launchField('codebase');
+    const archive = launchField('archive');
+    const width = parseInt(attr('width'), 10) || 300;
+    const height = parseInt(attr('height'), 10) || 300;
+    const name = attr('name').trim();
 
     let codebaseUrl;
     try {
@@ -48,17 +65,22 @@
     }
     const className = code.replace(/\.class$/i, '');
 
-    let archiveUrl = null;
-    if (archive) {
-      const first = archive.split(/\s+/)[0];
+    // The applet spec defines `archive` as a comma-separated list. Splitting on
+    // whitespace kept only "a.jar," from "a.jar, b.jar" -- a broken URL -- and
+    // dropped every jar after the first, so applets whose classes span several
+    // archives could never resolve.
+    const archiveUrls = [];
+    for (const nameRef of archive.split(',')) {
+      const trimmed = nameRef.trim();
+      if (!trimmed) continue;
       try {
-        archiveUrl = new URL(first, codebaseUrl).href;
+        archiveUrls.push(new URL(trimmed, codebaseUrl).href);
       } catch (_) {
-        archiveUrl = null;
+        // Skip the unresolvable entry, keep the rest of the list.
       }
     }
 
-    return { el, className, codebaseUrl, archiveUrl, width, height, name, params };
+    return { el, className, codebaseUrl, archiveUrls, width, height, name, params };
   }
 
   /**
@@ -95,12 +117,15 @@
       await window.JavaAppletEngine.runApplet({
         container: host,
         className: desc.className,
-        archiveUrl: desc.archiveUrl,
-        codebase: desc.archiveUrl ? null : desc.codebaseUrl,
+        archiveUrls: desc.archiveUrls,
+        // Keep the codebase even when archives are present: applets routinely
+        // load extra classes and resources that are not inside the jars.
+        codebase: desc.codebaseUrl,
         width: desc.width,
         height: desc.height,
         params: desc.params,
         base: BASE,
+        bundleUrl: BUNDLE,
         onProgress: (msg) => { loading.textContent = msg; },
       });
     })().catch((err) => {
@@ -109,18 +134,29 @@
     });
 
     console.log('[jvm.js applet loader]', desc.className,
-      desc.archiveUrl || desc.codebaseUrl, desc.params);
+      desc.archiveUrls.length ? desc.archiveUrls : desc.codebaseUrl, desc.params);
   }
+
+  // An element whose className could not be determined is left in the DOM, so
+  // without this it would be re-parsed on every mutation for the page's life.
+  const seen = new WeakSet();
 
   function scan() {
     const applets = document.querySelectorAll(APPLET_SELECTOR);
+    let replaced = 0;
     for (const el of applets) {
+      if (seen.has(el)) continue;
+      seen.add(el);
       const desc = parseApplet(el);
-      if (!desc.className) continue;
+      if (!desc.className) {
+        console.warn('[jvm.js applet loader] skipping applet with no code attribute', el);
+        continue;
+      }
       replaceApplet(desc);
+      replaced++;
     }
-    if (applets.length) {
-      console.log('[jvm.js applet loader] replaced', applets.length, 'applet(s)');
+    if (replaced) {
+      console.log('[jvm.js applet loader] replaced', replaced, 'applet(s)');
     }
   }
 
@@ -129,7 +165,11 @@
     const observer = new MutationObserver((mutations) => {
       for (const m of mutations) {
         for (const node of m.addedNodes) {
-          if (node.nodeType === 1 && node.matches && node.matches(APPLET_SELECTOR)) {
+          if (node.nodeType !== 1) continue;
+          // Applets are usually inserted inside a container subtree rather than
+          // as the added node itself, so matching only the node missed them.
+          if ((node.matches && node.matches(APPLET_SELECTOR)) ||
+              (node.querySelector && node.querySelector(APPLET_SELECTOR))) {
             scan();
             return;
           }

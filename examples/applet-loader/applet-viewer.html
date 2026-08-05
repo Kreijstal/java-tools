@@ -6,7 +6,9 @@
   <title>Java Applet Viewer — jvm.js</title>
   <link rel="icon" href="data:,">
   <!-- JSZip for JAR/ZIP extraction in browser -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
+          integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg=="
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
   <!-- jvm.js bundle (provides window.JVMDebug) -->
   <script src="./jvm-debug.js"></script>
   <style>
@@ -266,12 +268,52 @@ if (pageParams.get('embed') === '1') {
 }
 const requestedClass = pageParams.get('class') || null;
 const remoteCodebase = pageParams.get('codebase') || null;
-const requestedWidth = Math.max(100, parseInt(pageParams.get('w') || '0', 10) || 800);
-const requestedHeight = Math.max(100, parseInt(pageParams.get('h') || '0', 10) || 600);
+// The viewer is deep-linkable and driven by width/height read off arbitrary
+// third-party <applet> tags, so these flow straight into canvas.width in
+// Applet.js. Without an upper bound a hostile tag can request a canvas buffer
+// large enough to hang the tab.
+const MAX_APPLET_DIMENSION = 4096;
+const clampDimension = (raw, fallback) =>
+  Math.min(MAX_APPLET_DIMENSION, Math.max(100, parseInt(raw || '0', 10) || fallback));
+const requestedWidth = clampDimension(pageParams.get('w'), 800);
+const requestedHeight = clampDimension(pageParams.get('h'), 600);
+// Reserved viewer controls, not applet parameters. 'embed' belongs here too:
+// it is chrome-hiding state the loader adds, and leaking it would make
+// getParameter("embed") return an internal flag instead of null.
+const VIEWER_RESERVED_PARAMS = ['url', 'class', 'codebase', 'w', 'h', 'embed'];
 const appletParameters = {};
 for (const [key, value] of pageParams) {
-  if (['url', 'class', 'codebase', 'w', 'h'].includes(key)) continue;
+  if (VIEWER_RESERVED_PARAMS.includes(key)) continue;
   appletParameters[key] = value;
+}
+
+// ZIP entry paths come from an untrusted archive and are rendered into
+// innerHTML, so they must not be able to carry markup.
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// A hung archive or codebase host would otherwise leave the loading screen
+// spinning forever with no way to report the failure.
+const FETCH_TIMEOUT_MS = 30000;
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw new Error('Request timed out after ' + (FETCH_TIMEOUT_MS / 1000) + 's: ' + url);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Size the stage to the applet's declared size.
@@ -283,8 +325,17 @@ function applyRequestedSize() {
     stage.style.maxWidth = '100%';
     const canvas = document.getElementById('loadingCanvas');
     if (canvas) {
-      canvas.style.width = requestedWidth + 'px';
-      canvas.style.height = requestedHeight + 'px';
+      // renderLoadingCanvas() draws at absolute coordinates tuned for the
+      // markup-declared 800x600 buffer, so stretching that buffer to a
+      // different aspect ratio distorts and mispositions everything. Scale it
+      // uniformly and letterbox instead.
+      const scale = Math.min(requestedWidth / canvas.width, requestedHeight / canvas.height, 1);
+      canvas.style.width = Math.round(canvas.width * scale) + 'px';
+      canvas.style.height = Math.round(canvas.height * scale) + 'px';
+      canvas.style.position = 'absolute';
+      canvas.style.left = '50%';
+      canvas.style.top = '50%';
+      canvas.style.transform = 'translate(-50%, -50%)';
       canvas.style.maxWidth = '100%';
     }
   }
@@ -438,7 +489,7 @@ async function loadJarFromUrl() {
   setProgress(2, 'Downloading archive…', 'Fetching ' + url + '.', 2, true);
   try {
     await ensureJvm();
-    const response = await fetch(url);
+    const response = await fetchWithTimeout(url);
     if (!response.ok) throw new Error('HTTP ' + response.status + ' ' + response.statusText);
 
     // Real download progress
@@ -536,7 +587,7 @@ async function processJarBytes(bytes, jarName) {
   selectedClassIndex = -1;
   renderClassList();
   document.getElementById('classCard').style.display = '';
-  document.getElementById('allFiles').innerHTML = allEntries.map(f => '<div style="padding:2px 0;">📄 ' + f + '</div>').join('');
+  document.getElementById('allFiles').innerHTML = allEntries.map(f => '<div style="padding:2px 0;">📄 ' + escapeHtml(f) + '</div>').join('');
 
   const count = appletClasses.length;
   setProgress(9, 'Classes ready',
@@ -609,7 +660,7 @@ function renderClassList() {
     const tag = entry.isApplet ? '<span class="tag">Applet</span>' : '';
     const sel = i === selectedClassIndex ? ' selected' : '';
     return '<div class="class-item' + sel + '" data-index="' + i + '" onclick="selectClass(' + i + ')">' +
-      '<span>' + entry.displayName + '</span>' + tag + '</div>';
+      '<span>' + escapeHtml(entry.displayName) + '</span>' + tag + '</div>';
   }).join('');
   updateButtons();
 }
@@ -696,7 +747,7 @@ function configureJvm(jvm) {
 }
 
 // When no archive is provided (raw .class files served from a codebase, like
-// the classic <applet code="Kite.class">), fetch <Class>.class on demand and
+// the classic <applet code="MyApplet.class">), fetch <Class>.class on demand and
 // feed it into the browser virtual filesystem.
 function installRemoteCodebaseLoader(jvm, codebase) {
   const base = codebase.endsWith('/') ? codebase : codebase + '/';
@@ -708,7 +759,7 @@ function installRemoteCodebaseLoader(jvm, codebase) {
     const virtualPath = slashName + '.class';
     const url = base + slashName + '.class';
     try {
-      const resp = await fetch(url);
+      const resp = await fetchWithTimeout(url);
       if (!resp.ok) return null;
       const bytes = new Uint8Array(await resp.arrayBuffer());
       jvmDebug.fileProvider.virtualFS.set(virtualPath, bytes);

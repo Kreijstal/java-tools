@@ -33,9 +33,21 @@ the page and the applet.
    ```
 
 2. Serve the repo root (or copy `applet-engine.js` + `dist/jvm-debug.js` to
-   your static host). Update `BASE` at the top of
-   `java-applet-loader.user.js` (or set `window.JAVA_APPLET_BASE`) to point
-   at that directory.
+   your static host).
+
+   The two files do not live in the same directory in this repo —
+   `applet-engine.js` is checked in under `examples/applet-loader/` while
+   `jvm-debug.js` is a build output in `dist/` — so they are configured
+   separately:
+
+   | Setting | Points at | Default |
+   | --- | --- | --- |
+   | `window.JAVA_APPLET_BASE` | directory holding `applet-engine.js` | `http://localhost:3000/examples/applet-loader/` |
+   | `window.JAVA_APPLET_BUNDLE` | the `jvm-debug.js` file | `http://localhost:3000/dist/jvm-debug.js` |
+
+   Set them before the userscript runs, or edit `BASE`/`BUNDLE` at the top of
+   `java-applet-loader.user.js`. If you serve both files from one directory,
+   point them at the same place.
 
 3. Install `java-applet-loader.user.js` in Tampermonkey / Violentmonkey /
    Greasemonkey, or include it on any page that still has applet tags:
@@ -44,22 +56,11 @@ the page and the applet.
    <script src="java-applet-loader.user.js"></script>
    ```
 
-## Demo
-
-`KiteModeler.demo.html` contains the original NASA KiteModeler applet tag:
-
-```html
-<applet code="Kite.class" codebase="../../dist/demo/kite/" width=710 height=400></applet>
-```
-
-Serve the repo root, open the demo page, and the loader replaces the applet
-with the running jvm.js viewer inline.
-
 ## Supported applet tag forms
 
 ```html
 <!-- class files served from the codebase (classic form) -->
-<applet code="Kite.class" codebase="../javplts/kite/" width=710 height=400>
+<applet code="MyApplet.class" codebase="classes/" width=710 height=400>
   <param name="param1" value="value1">
 </applet>
 
