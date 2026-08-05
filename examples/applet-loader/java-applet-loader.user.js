@@ -102,7 +102,9 @@
   }
 
   /**
-   * Replace an <applet> element with an inline host div and run the applet.
+   * Swap an <applet> element for an inline host div and return the launch
+   * options for it. Launching is left to the caller so a page's applets can be
+   * started as a batch rather than one at a time.
    */
   function replaceApplet(desc) {
     const host = document.createElement('div');
@@ -119,32 +121,30 @@
     host.appendChild(loading);
     desc.el.replaceWith(host);
 
-    (async () => {
-      await ensureEngine();
-      await window.JavaAppletEngine.runApplet({
-        container: host,
-        className: desc.className,
-        archiveUrls: desc.archiveUrls,
-        // Keep the codebase even when archives are present: applets routinely
-        // load extra classes and resources that are not inside the jars.
-        codebase: desc.codebaseUrl,
-        width: desc.width,
-        height: desc.height,
-        params: desc.params,
-        // <applet name=...> is how applets on a page addressed each other
-        // through AppletContext.getApplet(name).
-        name: desc.name,
-        base: BASE,
-        bundleUrl: BUNDLE,
-        onProgress: (msg) => { loading.textContent = msg; },
-      });
-    })().catch((err) => {
-      console.error('[jvm.js applet loader]', desc.className, err);
-      loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
-    });
-
     console.log('[jvm.js applet loader]', desc.className,
       desc.archiveUrls.length ? desc.archiveUrls : desc.codebaseUrl, desc.params);
+
+    return {
+      container: host,
+      className: desc.className,
+      archiveUrls: desc.archiveUrls,
+      // Keep the codebase even when archives are present: applets routinely
+      // load extra classes and resources that are not inside the jars.
+      codebase: desc.codebaseUrl,
+      width: desc.width,
+      height: desc.height,
+      params: desc.params,
+      // <applet name=...> is how applets on a page addressed each other
+      // through AppletContext.getApplet(name).
+      name: desc.name,
+      base: BASE,
+      bundleUrl: BUNDLE,
+      onProgress: (msg) => { loading.textContent = msg; },
+      _onError: (err) => {
+        console.error('[jvm.js applet loader]', desc.className, err);
+        loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
+      },
+    };
   }
 
   // An element whose className could not be determined is left in the DOM, so
@@ -153,7 +153,7 @@
 
   function scan() {
     const applets = document.querySelectorAll(APPLET_SELECTOR);
-    let replaced = 0;
+    const batch = [];
     for (const el of applets) {
       if (seen.has(el)) continue;
       seen.add(el);
@@ -162,12 +162,22 @@
         console.warn('[jvm.js applet loader] skipping applet with no code attribute', el);
         continue;
       }
-      replaceApplet(desc);
-      replaced++;
+      batch.push(replaceApplet(desc));
     }
-    if (replaced) {
-      console.log('[jvm.js applet loader] replaced', replaced, 'applet(s)');
-    }
+    if (!batch.length) return;
+
+    console.log('[jvm.js applet loader] replaced', batch.length, 'applet(s)');
+
+    // The whole scan launches together: a page's applets were all constructed
+    // before any was started, which is what lets the first start() see the
+    // others through AppletContext.getApplets().
+    (async () => {
+      await ensureEngine();
+      await window.JavaAppletEngine.runApplets(batch);
+    })().catch((err) => {
+      console.error('[jvm.js applet loader] batch launch failed', err);
+      for (const options of batch) options._onError(err);
+    });
   }
 
   function init() {

@@ -96,9 +96,9 @@ Enumeration all = getAppletContext().getApplets();
 Applets from *different* codebases get separate JVMs and cannot see each
 other, as before.
 
-One ordering caveat: `getApplets()` only reports applets constructed so far,
-so the first applet's `start()` sees just itself. Applets that need the full
-set should look it up lazily rather than in `start()`.
+Every applet on the page is constructed and `init()`ed before any of them is
+started, as a browser did, so the very first `start()` already sees the whole
+page through `getApplets()`.
 
 ## Notes
 

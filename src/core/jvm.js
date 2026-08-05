@@ -675,7 +675,9 @@ class JVM {
 
     if (isApplet) {
       // Handle applet execution
-      await this.runApplet(className, mainThread);
+      await this.runApplet(className, mainThread, {
+        deferStart: !!options.deferAppletStart,
+      });
     } else {
       // Handle regular class with main method
       const mainFrame = new Frame(mainMethod);
@@ -693,17 +695,17 @@ class JVM {
     }
   }
 
-  async runApplet(className, mainThread) {
+  async runApplet(className, mainThread, options = {}) {
     // Create applet instance with proper field initialization
     const appletObj = await this.createAppletInstance(className);
-    
+
     // In debug mode, set up applet for step-by-step debugging
     if (this.debugManager.debugMode && this.debugManager.isPaused) {
       return this.setupAppletDebugMode(className, mainThread, appletObj);
     }
 
     // Non-debug mode: execute all methods to completion (original behavior)
-    return this.executeAppletLifecycle(className, mainThread, appletObj);
+    return this.executeAppletLifecycle(className, mainThread, appletObj, options);
   }
 
   async executeUntilStackBelow(thread, stackSize) {
@@ -931,9 +933,9 @@ class JVM {
     await this.setupNextAppletMethod(mainThread);
   }
 
-  async executeAppletLifecycle(className, mainThread, appletObj) {
+  async executeAppletLifecycle(className, mainThread, appletObj, options = {}) {
     // Original behavior: execute all methods to completion
-    
+
     // Find and call constructor
     const constructorMethod = this.findMethod({ ast: this.classes[className].ast }, '<init>', '()V');
     if (constructorMethod) {
@@ -964,14 +966,35 @@ class JVM {
       await this.executeUntilStackBelow(mainThread, originalStackSize);
     }
 
+    // A page's applets were all constructed before any of them was started, so
+    // AppletContext.getApplets() saw the full set from the first start(). An
+    // embedder hosting several applets defers the start phase to preserve that;
+    // a lone applet starts immediately, as before.
+    if (options.deferStart) {
+      if (!this._deferredAppletStarts) this._deferredAppletStarts = [];
+      this._deferredAppletStarts.push({ className, mainThread, appletObj });
+      return;
+    }
+
+    return this.startApplet(className, mainThread, appletObj);
+  }
+
+  /** The start half of the applet lifecycle: start() followed by a repaint. */
+  async startApplet(className, mainThread, appletObj) {
     const startMethod = await this.findMethodInHierarchy(className, 'start', '()V');
     if (startMethod) {
       mainThread.status = "runnable";
+      // A deferred start resumes a thread that ran dry during construction and
+      // was dropped from the scheduler. Pushing onto an unregistered thread
+      // leaves the frame parked forever, because executeTick never visits it.
+      if (!this.threads.includes(mainThread)) {
+        this.threads.push(mainThread);
+      }
       const startFrame = new Frame(startMethod);
       startFrame.className = className;
       startFrame.locals[0] = appletObj;
       mainThread.callStack.push(startFrame);
-      
+
       // Execute start to completion
       const originalStackSize = mainThread.callStack.size();
       await this.executeUntilStackBelow(mainThread, originalStackSize);
@@ -983,6 +1006,19 @@ class JVM {
       mainThread.status = "runnable";
       await repaintMethod(this, appletObj, []);
     }
+  }
+
+  /**
+   * Start every applet held back by deferStart, in construction order.
+   * Safe to call when none are pending.
+   */
+  async startDeferredApplets() {
+    const pending = this._deferredAppletStarts || [];
+    this._deferredAppletStarts = [];
+    for (const entry of pending) {
+      await this.startApplet(entry.className, entry.mainThread, entry.appletObj);
+    }
+    return pending.length;
   }
 
   async execute() {

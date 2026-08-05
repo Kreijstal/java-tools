@@ -218,7 +218,7 @@
     return entry;
   }
 
-  async function runApplet(options) {
+  async function launchApplet(options, deferStart) {
     const {
       container,
       className,
@@ -285,9 +285,11 @@
       jvm._appletWidth = width;
       jvm._appletHeight = height;
 
-      onProgress('Starting ' + className + '…');
+      onProgress(deferStart
+        ? 'Constructing ' + className + '…'
+        : 'Starting ' + className + '…');
       // Real applets run indefinitely (their own threads), so do not await.
-      jvm.run(className).catch((err) => {
+      jvm.run(className, { deferAppletStart: deferStart }).catch((err) => {
         console.error('[jvm.js applet]', err);
         loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
       });
@@ -312,8 +314,45 @@
       if (Date.now() - started > 60000) clearInterval(watch);
     }, 100);
 
+    return { debug, entry };
+  }
+
+  async function runApplet(options) {
+    const { debug } = await launchApplet(options, false);
     return debug;
   }
 
-  global.JavaAppletEngine = { runApplet, _runtimes: runtimes };
+  /**
+   * Run several applets as one page would: every applet is constructed and
+   * init()ed before any of them is started, so the first start() already sees
+   * the whole set through AppletContext.getApplets(). Starting each applet as
+   * it was found meant the first one only ever saw itself.
+   */
+  async function runApplets(list) {
+    const descriptors = Array.isArray(list) ? list : [];
+    const launched = [];
+    const entries = [];
+
+    for (const options of descriptors) {
+      try {
+        const result = await launchApplet(options, true);
+        launched.push(result.debug);
+        if (!entries.includes(result.entry)) entries.push(result.entry);
+      } catch (err) {
+        // One failed applet must not hold back the rest of the page.
+        console.error('[jvm.js applet]', err);
+        if (options && typeof options._onError === 'function') options._onError(err);
+        launched.push(null);
+      }
+    }
+
+    // Everything is constructed; release the start phase in document order.
+    for (const entry of entries) {
+      const { jvm } = await entry.ready;
+      await jvm.startDeferredApplets();
+    }
+    return launched;
+  }
+
+  global.JavaAppletEngine = { runApplet, runApplets, _runtimes: runtimes };
 })(window);
