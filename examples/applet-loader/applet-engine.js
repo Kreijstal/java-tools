@@ -24,6 +24,12 @@
 (function (global) {
   'use strict';
 
+  // Concurrent hosts can both race past a "is it loaded yet" check and inject
+  // this script twice. A second evaluation would install a fresh module state
+  // -- including the runtime cache below -- so applets that should share a JVM
+  // would each get their own. Keep the first copy.
+  if (global.JavaAppletEngine) return;
+
   // Directory that holds jvm-debug.js. Override by setting
   // window.JAVA_APPLET_BASE before including this script.
   const DEFAULT_BASE =
@@ -32,6 +38,16 @@
       : '';
 
   let depsPromise = null;
+
+  // One JVM per codebase, matching the classic plugin: applets sharing a
+  // codebase shared a VM, and therefore their loaded classes and statics. That
+  // is what makes AppletContext.getApplets() and direct inter-applet calls
+  // work. Applets from different codebases stay isolated, as they were.
+  const runtimes = new Map();
+
+  function runtimeKey(archives, codebase) {
+    return JSON.stringify([codebase || '', archives.slice().sort()]);
+  }
 
   function loadScript(src, integrity) {
     return new Promise((resolve, reject) => {
@@ -144,6 +160,64 @@
     });
   }
 
+  function waitUntil(predicate, timeoutMs, label) {
+    return new Promise((resolve, reject) => {
+      const started = Date.now();
+      const tick = () => {
+        if (predicate()) return resolve();
+        if (Date.now() - started > timeoutMs) {
+          return reject(new Error('Timed out waiting for ' + label));
+        }
+        setTimeout(tick, 20);
+      };
+      tick();
+    });
+  }
+
+  // Build (or reuse) the JVM that serves a codebase, with its archives loaded.
+  function acquireRuntime(archives, codebase, bundleUrl, onProgress) {
+    const key = runtimeKey(archives, codebase);
+    const existing = runtimes.get(key);
+    if (existing) return existing;
+
+    const entry = { ready: null, queue: Promise.resolve() };
+    entry.ready = (async () => {
+      onProgress('Loading the jvm.js runtime…');
+      await ensureDeps(bundleUrl);
+      if (!global.JVMDebug || !global.JVMDebug.BrowserJVMDebug) {
+        throw new Error('jvm.js bundle not available at ' + bundleUrl);
+      }
+      global.JSZip = global.JSZip || global.window.JSZip;
+
+      const debug = new global.JVMDebug.BrowserJVMDebug();
+      if (codebase) debug.debugController.options.appletCodeBase = codebase;
+
+      onProgress('Initializing the browser JVM…');
+      await debug.initialize();
+      const jvm = debug.debugController.jvm;
+      if (codebase) jvm.appletCodeBase = codebase;
+
+      for (const url of archives) {
+        onProgress('Downloading ' + url + '…');
+        const n = await loadArchive(debug, url);
+        onProgress('Loaded ' + n + ' classes from ' + url + '.');
+      }
+      // A codebase is still useful alongside archives: applets routinely pull
+      // classes and resources that were never packed into the jars.
+      if (codebase) installCodebaseLoader(debug, jvm, codebase);
+
+      // Exposed for debugging. A list, because a page can hold several.
+      if (!Array.isArray(global.jvmDebugInstances)) global.jvmDebugInstances = [];
+      global.jvmDebugInstances.push(debug);
+      global.jvmDebug = debug;
+
+      return { debug, jvm };
+    })();
+
+    runtimes.set(key, entry);
+    return entry;
+  }
+
   async function runApplet(options) {
     const {
       container,
@@ -154,6 +228,7 @@
       width = 800,
       height = 600,
       params = {},
+      name = null,
       base = DEFAULT_BASE,
       // jvm-debug.js is a webpack output in dist/ while applet-engine.js is
       // checked in under examples/applet-loader/, so a single base directory
@@ -164,6 +239,15 @@
 
     if (!container) throw new Error('runApplet: container is required');
     if (!className) throw new Error('runApplet: className is required');
+
+    // archiveUrl (singular) is kept for direct callers; the loader passes the
+    // full comma-separated list from the applet tag's archive attribute.
+    const archives = archiveUrls && archiveUrls.length
+      ? archiveUrls
+      : (archiveUrl ? [archiveUrl] : []);
+    if (!archives.length && !codebase) {
+      throw new Error('runApplet: provide archiveUrls/archiveUrl or codebase');
+    }
 
     injectStyles();
     container.classList.add('jvmjs-applet-host');
@@ -176,78 +260,54 @@
     loading.textContent = '☕ Starting ' + className + ' with jvm.js…';
     container.appendChild(loading);
 
-    onProgress('Loading the jvm.js runtime…');
-    await ensureDeps(bundleUrl);
-    if (!global.JVMDebug || !global.JVMDebug.BrowserJVMDebug) {
-      throw new Error('jvm.js bundle not available at ' + bundleUrl);
-    }
-    global.JSZip = global.JSZip || global.window.JSZip;
+    const entry = acquireRuntime(archives, codebase, bundleUrl, onProgress);
+    const { debug, jvm } = await entry.ready;
 
-    const debug = new global.JVMDebug.BrowserJVMDebug();
-    global.jvmDebug = debug;
-    debug.debugController.options.appletParameters = params;
-    if (codebase) debug.debugController.options.appletCodeBase = codebase;
+    // Applets on a shared JVM must start one at a time: each stakes a pending
+    // descriptor that the guest's <init> consumes, so overlapping launches
+    // would hand an applet the wrong container, size and parameters.
+    const launch = async () => {
+      onProgress('Resolving ' + className + '…');
+      const classData = await Promise.resolve(jvm.loadClassByName(className))
+        .catch(() => null);
+      if (!classData || !classData.ast) {
+        throw new Error('Could not load ' + className + ' from ' +
+          (archives.length ? archives.join(', ') : codebase));
+      }
 
-    onProgress('Initializing the browser JVM…');
-    await debug.initialize();
+      jvm._pendingApplet = {
+        container, width, height, name,
+        params: Object.keys(params).length ? params : null,
+        codeBase: codebase,
+        documentBase: (global.location && global.location.href) || null,
+      };
+      // Legacy fallbacks for guests that reach for the JVM-level values.
+      jvm._appletWidth = width;
+      jvm._appletHeight = height;
 
-    const jvm = debug.debugController.jvm;
-    jvm._appletWidth = width;
-    jvm._appletHeight = height;
-    jvm.appletParameters = Object.keys(params).length ? params : null;
-    if (codebase) jvm.appletCodeBase = codebase;
+      onProgress('Starting ' + className + '…');
+      // Real applets run indefinitely (their own threads), so do not await.
+      jvm.run(className).catch((err) => {
+        console.error('[jvm.js applet]', err);
+        loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
+      });
 
-    // archiveUrl (singular) is kept for direct callers; the loader passes the
-    // full comma-separated list from the applet tag's archive attribute.
-    const archives = archiveUrls && archiveUrls.length
-      ? archiveUrls
-      : (archiveUrl ? [archiveUrl] : []);
+      // Released once the guest has taken the descriptor, which is the point
+      // the next applet can safely stake its own.
+      await waitUntil(() => jvm._pendingApplet === null, 30000,
+        className + ' to start');
+    };
 
-    if (!archives.length && !codebase) {
-      throw new Error('runApplet: provide archiveUrls/archiveUrl or codebase');
-    }
+    const done = entry.queue.then(launch, launch);
+    // Keep the chain alive for the next applet even if this one failed.
+    entry.queue = done.catch(() => undefined);
+    await done;
 
-    for (const url of archives) {
-      onProgress('Downloading ' + url + '…');
-      const n = await loadArchive(debug, url);
-      onProgress('Loaded ' + n + ' classes from ' + url + '.');
-    }
-
-    // A codebase is still useful alongside archives: applets routinely pull
-    // classes and resources that were never packed into the jars.
-    if (codebase) installCodebaseLoader(debug, jvm, codebase);
-
-    onProgress('Resolving ' + className + '…');
-    const classData = await Promise.resolve(jvm.loadClassByName(className)).catch(() => null);
-    if (!classData || !classData.ast) {
-      throw new Error('Could not load ' + className + ' from ' +
-        (archives.length ? archives.join(', ') : codebase));
-    }
-
-    onProgress('Starting ' + className + '…');
-    // Real applets run indefinitely (their own threads), so do not await.
-    jvm.run(className).catch((err) => {
-      console.error('[jvm.js applet]', err);
-      loading.textContent = '✗ Applet failed: ' + (err && err.message || err);
-    });
-
-    // Once the applet's canvas exists, move it into the host.
-    //
-    // document.querySelector('.awt-applet-root') matched the FIRST root in the
-    // document, so on a page with two applets the second engine instance stole
-    // the first one's canvas and the first host stayed stuck on its loading
-    // message. Claim only roots that no host has adopted yet.
+    // Applet.js renders into the container it was handed, so nothing needs
+    // relocating; just drop the placeholder once a surface exists.
     const started = Date.now();
     const watch = setInterval(() => {
-      if (!container.querySelector('.awt-applet-root')) {
-        const roots = document.querySelectorAll('.awt-applet-root');
-        for (const root of roots) {
-          if (root.closest('.jvmjs-applet-host')) continue;
-          container.appendChild(root);
-          loading.remove();
-          break;
-        }
-      }
+      if (container.querySelector('canvas')) loading.remove();
       syncCanvasBuffers(container);
       if (Date.now() - started > 60000) clearInterval(watch);
     }, 100);
@@ -255,5 +315,5 @@
     return debug;
   }
 
-  global.JavaAppletEngine = { runApplet };
+  global.JavaAppletEngine = { runApplet, _runtimes: runtimes };
 })(window);

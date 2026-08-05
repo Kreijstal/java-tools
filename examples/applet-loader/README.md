@@ -70,6 +70,36 @@ the page and the applet.
 </applet>
 ```
 
+## Several applets on one page
+
+Applets that share a **codebase** share one JVM, which is how the classic
+plugin worked: it kept a page's applets in a single VM, isolating them by
+class loader rather than by runtime. So they share loaded classes and
+statics, and can find and call each other:
+
+```html
+<applet code="PeerApplet.class" codebase="classes/" name="alpha" width=160 height=120>
+  <param name="peer" value="beta">
+</applet>
+<applet code="PeerApplet.class" codebase="classes/" name="beta" width=160 height=120>
+  <param name="peer" value="alpha">
+</applet>
+```
+
+```java
+Applet other = getAppletContext().getApplet("beta");
+((PeerApplet) other).ping(1);          // direct call into the other applet
+
+Enumeration all = getAppletContext().getApplets();
+```
+
+Applets from *different* codebases get separate JVMs and cannot see each
+other, as before.
+
+One ordering caveat: `getApplets()` only reports applets constructed so far,
+so the first applet's `start()` sees just itself. Applets that need the full
+set should look it up lazily rather than in `start()`.
+
 ## Notes
 
 - Archives/class files fetched from a **different** origin still need CORS

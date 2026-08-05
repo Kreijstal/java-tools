@@ -83,6 +83,24 @@
     return { el, className, codebaseUrl, archiveUrls, width, height, name, params };
   }
 
+  // Every applet on the page shares one engine load. Checking
+  // window.JavaAppletEngine per applet let two hosts both pass the check before
+  // either script finished, injecting the engine twice; each copy then had its
+  // own runtime cache, so applets that should have shared a JVM did not.
+  let enginePromise = null;
+  function ensureEngine() {
+    if (window.JavaAppletEngine) return Promise.resolve();
+    if (enginePromise) return enginePromise;
+    enginePromise = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = BASE + 'applet-engine.js';
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error('Failed to load ' + s.src));
+      document.head.appendChild(s);
+    });
+    return enginePromise;
+  }
+
   /**
    * Replace an <applet> element with an inline host div and run the applet.
    */
@@ -101,19 +119,8 @@
     host.appendChild(loading);
     desc.el.replaceWith(host);
 
-    // Load the inline engine and run the applet directly in this page.
-    const loadScript = (src) => new Promise((resolve, reject) => {
-      const s = document.createElement('script');
-      s.src = src;
-      s.onload = () => resolve();
-      s.onerror = () => reject(new Error('Failed to load ' + src));
-      document.head.appendChild(s);
-    });
-
     (async () => {
-      if (!window.JavaAppletEngine) {
-        await loadScript(BASE + 'applet-engine.js');
-      }
+      await ensureEngine();
       await window.JavaAppletEngine.runApplet({
         container: host,
         className: desc.className,
@@ -124,6 +131,9 @@
         width: desc.width,
         height: desc.height,
         params: desc.params,
+        // <applet name=...> is how applets on a page addressed each other
+        // through AppletContext.getApplet(name).
+        name: desc.name,
         base: BASE,
         bundleUrl: BUNDLE,
         onProgress: (msg) => { loading.textContent = msg; },
