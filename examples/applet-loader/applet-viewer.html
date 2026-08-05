@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Java Applet Viewer — jvm.js</title>
+  <link rel="icon" href="data:,">
+  <!-- JSZip for JAR/ZIP extraction in browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"
+          integrity="sha512-XMVd28F1oH/O71fzwBnV7HucLxVwtxf26XV8P4wPk26EDxuGZ91N8bsOttmnomcCD3CS5ZMRL50H0GgOHvegtg=="
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <!-- jvm.js bundle (provides window.JVMDebug) -->
+  <script src="./jvm-debug.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: #f5f7fb;
+      background: radial-gradient(circle at 50% 20%, #263553 0, #141a27 48%, #0b0e15 100%);
+      font: 15px system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 24px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      max-width: 1100px;
+      width: 100%;
+      margin-bottom: 20px;
+    }
+    header img { width: 72px; height: 72px; object-fit: contain; }
+    h1 { margin: 0 0 4px; font-size: clamp(22px, 4vw, 34px); }
+    header p { margin: 0; color: #aebad0; font-size: 14px; }
+
+    .card {
+      background: rgba(20, 27, 41, .88);
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 11px;
+      padding: 18px 20px;
+      width: 100%;
+      max-width: 1100px;
+      margin-bottom: 18px;
+    }
+    .card h2 { font-size: 14px; margin-bottom: 12px; color: #b9c7de; text-transform: uppercase; letter-spacing: .06em; }
+
+    .url-bar { display: flex; gap: 10px; flex-wrap: wrap; }
+    .url-bar input[type="text"] {
+      flex: 1 1 340px;
+      padding: 11px 13px;
+      border: 1px solid rgba(255,255,255,.16);
+      border-radius: 8px;
+      color: #fff;
+      background: rgba(8,11,18,.72);
+      font: inherit;
+      outline: none;
+    }
+    .url-bar input[type="text"]:focus { border-color: #69c7aa; }
+
+    .btn {
+      padding: 11px 18px;
+      border: 1px solid rgba(255,255,255,.16);
+      border-radius: 8px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+      transition: background .12s ease, border-color .12s ease;
+    }
+    .btn:active { transform: scale(.97); }
+    .btn-primary { background: #1d6f5c; color: #fff; border-color: #1d6f5c; }
+    .btn-primary:hover:not(:disabled) { background: #248a72; }
+    .btn-secondary { background: rgba(255,255,255,.07); color: #e4e9f3; }
+    .btn-secondary:hover:not(:disabled) { background: rgba(255,255,255,.12); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+
+    .divider {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 14px 0;
+      color: #556;
+      font-size: 12px;
+    }
+    .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: rgba(255,255,255,.12); }
+
+    /* ── Applet stage + loading screen (port of serve-game-library.js) ── */
+    #appletStage {
+      position: relative;
+      width: 800px;
+      height: 600px;
+      max-width: 100%;
+      overflow: hidden;
+      background: #000;
+      border-radius: 8px;
+      box-shadow: 0 18px 55px rgba(0,0,0,.42);
+    }
+    #loader {
+      position: absolute;
+      z-index: 10;
+      inset: 0;
+      width: 800px;
+      height: 600px;
+      background: #000;
+      display: block;
+    }
+    #loader.complete { display: none; }
+    #loadingCanvas { display: block; width: 800px; height: 600px; background: #000; }
+    #loader.error #loadingCanvas { outline: 2px solid #8f2b35; outline-offset: -2px; }
+    .loader-accessible {
+      position: absolute;
+      width: 1px; height: 1px;
+      padding: 0; margin: -1px;
+      overflow: hidden;
+      clip: rect(0, 0, 0, 0);
+      white-space: nowrap;
+      border: 0;
+    }
+    .awt-applet-root {
+      position: relative;
+      z-index: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #fff;
+    }
+    .awt-applet-root canvas {
+      image-rendering: pixelated;
+    }
+    #appletStatus { margin-top: 12px; color: #aebad0; font-size: 13px; min-height: 20px; }
+
+    /* ── Embed mode (userscript iframe): hide the page chrome ── */
+    body.embed { padding: 0; background: #000; }
+    body.embed header,
+    body.embed .card:not(:has(#appletStage)) {
+      display: none !important;
+    }
+    body.embed .card:has(#appletStage) {
+      background: none;
+      border: none;
+      padding: 0;
+      margin: 0;
+      max-width: none;
+    }
+    body.embed #appletStage {
+      border-radius: 0;
+      box-shadow: none;
+    }
+    body.embed #appletStatus { display: none; }
+
+    /* ── Class list ── */
+    .class-list {
+      max-height: 160px;
+      overflow-y: auto;
+      border: 1px solid rgba(255,255,255,.12);
+      border-radius: 8px;
+      background: rgba(8,11,18,.72);
+      font-size: 13px;
+    }
+    .class-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .class-item:last-child { border-bottom: none; }
+    .class-item:hover { background: rgba(255,255,255,.06); }
+    .class-item.selected { background: #1d6f5c; color: #fff; }
+    .class-item .tag {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: rgba(255,255,255,.1);
+      color: #69c7aa;
+      font-weight: 700;
+      text-transform: uppercase;
+      flex-shrink: 0;
+    }
+    .class-item.selected .tag { background: rgba(255,255,255,.18); color: #fff; }
+    details { margin-top: 10px; }
+    details summary { cursor: pointer; color: #93a2bd; font-size: 13px; }
+    #allFiles { font-size: 12px; color: #93a2bd; max-height: 140px; overflow-y: auto; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <img src="./jvm-js-logo.svg" alt="jvm.js">
+    <div>
+      <h1>Java Applet Viewer</h1>
+      <p>jvm.js · run Java applets in the browser, no plugins</p>
+    </div>
+  </header>
+
+  <!-- URL input card -->
+  <div class="card">
+    <h2>Load an applet archive</h2>
+    <div class="url-bar">
+      <input type="text" id="jarUrl" placeholder="https://example.com/applet.jar  (or .zip)">
+      <button class="btn btn-primary" id="loadUrlBtn">Load from URL</button>
+    </div>
+    <div class="divider">or</div>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <input type="file" id="jarFileInput" accept=".jar,.zip" style="display:none">
+      <button class="btn btn-secondary" onclick="document.getElementById('jarFileInput').click()">Choose .jar / .zip file…</button>
+      <span id="jarFileName" style="font-size:13px; color:#93a2bd;"></span>
+    </div>
+  </div>
+
+  <!-- Applet stage card -->
+  <div class="card" style="display:flex; flex-direction:column; align-items:center;">
+    <h2 style="align-self:flex-start;">Applet output</h2>
+    <main id="appletStage">
+      <div id="loader" aria-live="polite">
+        <canvas id="loadingCanvas" width="800" height="600" aria-label="Applet startup progress"></canvas>
+        <div class="loader-accessible">
+          <div id="status">Preparing the browser JVM…</div>
+          <p id="loadingDetail">Startup progress will appear here.</p>
+          <div id="progressTrack" role="progressbar" aria-label="Applet startup progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progressFill"></div>
+          </div>
+          <span id="stageLabel">Stage 1 of 16 · 0%</span>
+          <span id="elapsed">Elapsed 0s</span>
+        </div>
+      </div>
+    </main>
+    <div id="appletStatus">Load an applet archive to begin.</div>
+  </div>
+
+  <!-- Class list (shown after archive load) -->
+  <div class="card" id="classCard" style="display:none;">
+    <h2>Classes in archive</h2>
+    <div id="classList" class="class-list"></div>
+    <details>
+      <summary>Show all extracted files</summary>
+      <div id="allFiles"></div>
+    </details>
+    <div style="margin-top:12px; display:flex; gap:10px; flex-wrap:wrap;">
+      <button class="btn btn-primary" id="runAppletBtn" disabled>▶ Run Selected Applet</button>
+      <button class="btn btn-secondary" id="runMainBtn" disabled>Run as Main Class</button>
+    </div>
+  </div>
+
+<script>
+// ── Global state ──────────────────────────────────────────────────
+let jvmDebug = null;
+let loadedJarName = null;
+let jarClassFiles = [];           // [{ path, className, displayName, isApplet }]
+let selectedClassIndex = -1;
+
+// Deep-link / userscript options from the query string:
+//   ?url=<archive>            jar/zip to load (or ?codebase=<url> for raw .class)
+//   ?class=<Name>             applet/main class to run after loading
+//   ?w=&h=                    applet size (defaults 800x600)
+//   ?codebase=<url>           base URL to fetch <Class>.class files on demand
+//   ?embed=1                  hide the page chrome (iframe/userscript use)
+//   ?param=value...           applet parameters (getParameter)
+const pageParams = new URLSearchParams(location.search);
+if (pageParams.get('embed') === '1') {
+  document.documentElement.classList.add('embed');
+  document.body.classList.add('embed');
+}
+const requestedClass = pageParams.get('class') || null;
+const remoteCodebase = pageParams.get('codebase') || null;
+// The viewer is deep-linkable and driven by width/height read off arbitrary
+// third-party <applet> tags, so these flow straight into canvas.width in
+// Applet.js. Without an upper bound a hostile tag can request a canvas buffer
+// large enough to hang the tab.
+const MAX_APPLET_DIMENSION = 4096;
+const clampDimension = (raw, fallback) =>
+  Math.min(MAX_APPLET_DIMENSION, Math.max(100, parseInt(raw || '0', 10) || fallback));
+const requestedWidth = clampDimension(pageParams.get('w'), 800);
+const requestedHeight = clampDimension(pageParams.get('h'), 600);
+// Reserved viewer controls, not applet parameters. 'embed' belongs here too:
+// it is chrome-hiding state the loader adds, and leaking it would make
+// getParameter("embed") return an internal flag instead of null.
+const VIEWER_RESERVED_PARAMS = ['url', 'class', 'codebase', 'w', 'h', 'embed'];
+const appletParameters = {};
+for (const [key, value] of pageParams) {
+  if (VIEWER_RESERVED_PARAMS.includes(key)) continue;
+  appletParameters[key] = value;
+}
+
+// ZIP entry paths come from an untrusted archive and are rendered into
+// innerHTML, so they must not be able to carry markup.
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// A hung archive or codebase host would otherwise leave the loading screen
+// spinning forever with no way to report the failure.
+const FETCH_TIMEOUT_MS = 30000;
+async function fetchWithTimeout(url, options) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      throw new Error('Request timed out after ' + (FETCH_TIMEOUT_MS / 1000) + 's: ' + url);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Size the stage to the applet's declared size.
+function applyRequestedSize() {
+  const stage = document.getElementById('appletStage');
+  if (stage) {
+    stage.style.width = requestedWidth + 'px';
+    stage.style.height = requestedHeight + 'px';
+    stage.style.maxWidth = '100%';
+    const canvas = document.getElementById('loadingCanvas');
+    if (canvas) {
+      // renderLoadingCanvas() draws at absolute coordinates tuned for the
+      // markup-declared 800x600 buffer, so stretching that buffer to a
+      // different aspect ratio distorts and mispositions everything. Scale it
+      // uniformly and letterbox instead.
+      const scale = Math.min(requestedWidth / canvas.width, requestedHeight / canvas.height, 1);
+      canvas.style.width = Math.round(canvas.width * scale) + 'px';
+      canvas.style.height = Math.round(canvas.height * scale) + 'px';
+      canvas.style.position = 'absolute';
+      canvas.style.left = '50%';
+      canvas.style.top = '50%';
+      canvas.style.transform = 'translate(-50%, -50%)';
+      canvas.style.maxWidth = '100%';
+    }
+  }
+}
+
+// ── Loading screen state (ported from serve-game-library.js) ──────
+const loader = document.getElementById('loader');
+const appletStage = document.getElementById('appletStage');
+const loadingCanvas = document.getElementById('loadingCanvas');
+const loadingContext = loadingCanvas.getContext('2d');
+const statusEl = document.getElementById('status');
+const loadingDetail = document.getElementById('loadingDetail');
+const progressTrack = document.getElementById('progressTrack');
+const progressFill = document.getElementById('progressFill');
+const stageLabel = document.getElementById('stageLabel');
+const elapsed = document.getElementById('elapsed');
+const startedAt = performance.now();
+
+const loadingLogo = new Image();
+let loadingLogoReady = false;
+loadingLogo.addEventListener('load', () => { loadingLogoReady = true; renderLoadingCanvas(); });
+loadingLogo.src = './jvm-js-logo.svg';
+
+const canvasLines = (text, maxWidth, maxLines) => {
+  const words = String(text || '').replace(/\s+/g, ' ').trim().split(' ');
+  const lines = [];
+  let line = '';
+  for (const word of words) {
+    const candidate = line ? line + ' ' + word : word;
+    if (line && loadingContext.measureText(candidate).width > maxWidth) {
+      lines.push(line);
+      line = word;
+      if (lines.length === maxLines) break;
+    } else {
+      line = candidate;
+    }
+  }
+  if (lines.length < maxLines && line) lines.push(line);
+  if (words.length && lines.length === maxLines) {
+    const last = lines.length - 1;
+    while (lines[last].length > 1 &&
+        loadingContext.measureText(lines[last] + '…').width > maxWidth) {
+      lines[last] = lines[last].slice(0, -1);
+    }
+    if (!lines[last].endsWith(words[words.length - 1])) lines[last] += '…';
+  }
+  return lines;
+};
+
+function renderLoadingCanvas() {
+  const width = loadingCanvas.width;
+  const height = loadingCanvas.height;
+  const value = Number(progressTrack.getAttribute('aria-valuenow') || 0);
+  const failed = loader.classList.contains('error');
+  loadingContext.fillStyle = '#000';
+  loadingContext.fillRect(0, 0, width, height);
+  loadingContext.textAlign = 'center';
+  loadingContext.textBaseline = 'middle';
+  if (loadingLogoReady) {
+    loadingContext.drawImage(loadingLogo, 300, 30, 200, 200);
+  } else {
+    loadingContext.fillStyle = '#fff';
+    loadingContext.font = 'bold 26px Arial, sans-serif';
+    loadingContext.fillText('jvm.js', width / 2, 190);
+  }
+  loadingContext.fillStyle = failed ? '#ff858c' : '#d8d8d8';
+  loadingContext.font = 'bold 16px Arial, sans-serif';
+  loadingContext.fillText(statusEl.textContent, width / 2, 245);
+  const barX = 190, barY = 280, barWidth = 420, barHeight = 18;
+  loadingContext.fillStyle = '#111';
+  loadingContext.fillRect(barX, barY, barWidth, barHeight);
+  loadingContext.strokeStyle = failed ? '#c94d58' : '#8e8e8e';
+  loadingContext.lineWidth = 1;
+  loadingContext.strokeRect(barX + .5, barY + .5, barWidth - 1, barHeight - 1);
+  const fillWidth = Math.max(0, Math.round((barWidth - 4) * value / 100));
+  loadingContext.fillStyle = failed ? '#a52f3a' : '#4b9c82';
+  loadingContext.fillRect(barX + 2, barY + 2, fillWidth, barHeight - 4);
+  loadingContext.textAlign = 'left';
+  loadingContext.fillStyle = '#a8a8a8';
+  loadingContext.font = '12px Arial, sans-serif';
+  loadingContext.fillText(stageLabel.textContent, barX, 322);
+  loadingContext.textAlign = 'right';
+  loadingContext.fillText(elapsed.textContent, barX + barWidth, 322);
+  loadingContext.textAlign = 'center';
+  loadingContext.fillStyle = '#bcbcbc';
+  loadingContext.font = '13px Arial, sans-serif';
+  const lines = canvasLines(loadingDetail.textContent, 580, failed ? 5 : 3);
+  lines.forEach((line, index) => {
+    loadingContext.fillText(line, width / 2, 365 + index * 19);
+  });
+  if (failed) {
+    loadingContext.fillStyle = '#8f8f8f';
+    loadingContext.font = '12px Arial, sans-serif';
+    loadingContext.fillText(
+      'Loading failed — check the browser console for details.',
+      width / 2, 485);
+  }
+}
+
+const elapsedTimer = setInterval(() => {
+  elapsed.textContent = 'Elapsed ' + Math.floor((performance.now() - startedAt) / 1000) + 's';
+  if (!loader.classList.contains('complete')) renderLoadingCanvas();
+}, 250);
+
+function setProgress(percent, label, detail, stage, busy) {
+  const value = Math.max(0, Math.min(100, Math.round(percent)));
+  statusEl.textContent = label;
+  loadingDetail.textContent = detail;
+  stageLabel.textContent = 'Stage ' + stage + ' of 16 · ' + value + '%';
+  progressFill.style.width = value + '%';
+  progressTrack.setAttribute('aria-valuenow', String(value));
+  progressTrack.classList.toggle('busy', Boolean(busy));
+  renderLoadingCanvas();
+  if (label) document.getElementById('appletStatus').textContent = label;
+}
+
+function showLoadingError(message) {
+  loader.classList.add('error');
+  setProgress(0, 'Loading failed', String(message), 16, false);
+  document.getElementById('appletStatus').textContent = 'Error: ' + message;
+}
+
+function resetLoader() {
+  loader.classList.remove('complete', 'error');
+  loader.classList.remove('error');
+  renderLoadingCanvas();
+}
+
+// ── JVM init ──────────────────────────────────────────────────────
+async function ensureJvm() {
+  if (jvmDebug) return jvmDebug;
+  setProgress(1, 'Downloading the JVM runtime…', 'Loading the Java bytecode engine and browser services.', 1, true);
+  if (!window.JVMDebug || !window.JVMDebug.BrowserJVMDebug) {
+    throw new Error('jvm-debug.js not loaded. Is the script available?');
+  }
+  window.JSZip = window.JSZip || JSZip;
+  setProgress(5, 'Creating the browser JVM…', 'Configuring the runtime and browser services.', 3, true);
+  jvmDebug = new window.JVMDebug.BrowserJVMDebug();
+  window.jvmDebug = jvmDebug;
+  setProgress(6, 'Initializing Java…', 'Preparing classes, memory, and the applet environment.', 3, true);
+  await jvmDebug.initialize();
+  return jvmDebug;
+}
+
+// ── Load from URL (with progress) ─────────────────────────────────
+document.getElementById('loadUrlBtn').addEventListener('click', loadJarFromUrl);
+async function loadJarFromUrl() {
+  const url = document.getElementById('jarUrl').value.trim();
+  if (!url) return;
+  resetLoader();
+  setProgress(2, 'Downloading archive…', 'Fetching ' + url + '.', 2, true);
+  try {
+    await ensureJvm();
+    const response = await fetchWithTimeout(url);
+    if (!response.ok) throw new Error('HTTP ' + response.status + ' ' + response.statusText);
+
+    // Real download progress
+    const total = Number(response.headers.get('content-length')) || 0;
+    const reader = response.body.getReader();
+    const chunks = [];
+    let loaded = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      loaded += value.byteLength;
+      if (total) {
+        setProgress(2 + (loaded / total) * 2, 'Downloading archive…',
+          ((loaded / 1048576).toFixed(1)) + ' of ' + (total / 1048576).toFixed(1) + ' MiB received.', 2, true);
+      }
+    }
+    const bytes = new Uint8Array(loaded);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+
+    const jarName = url.split('/').pop().split('?')[0] || 'downloaded.zip';
+    await processJarBytes(bytes, jarName);
+  } catch (err) {
+    console.error(err);
+    showLoadingError(err.message);
+  }
+}
+
+// ── Load from file input ──────────────────────────────────────────
+document.getElementById('jarFileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('jarFileName').textContent = file.name;
+  resetLoader();
+  setProgress(2, 'Reading ' + file.name + '…', 'Loading the archive from your computer.', 2, true);
+  try {
+    await ensureJvm();
+    const buffer = await file.arrayBuffer();
+    await processJarBytes(new Uint8Array(buffer), file.name);
+  } catch (err) {
+    console.error(err);
+    showLoadingError(err.message);
+  }
+});
+
+// ── Process archive bytes ─────────────────────────────────────────
+async function processJarBytes(bytes, jarName) {
+  setProgress(7, 'Indexing classes…', 'Reading ' + jarName + ' and resolving its classes.', 4, true);
+  const zip = new JSZip();
+  await zip.loadAsync(bytes);
+
+  const classEntries = [];
+  const allEntries = [];
+
+  for (const [path, entry] of Object.entries(zip.files)) {
+    if (entry.dir) continue;
+    const normPath = path.replace(/\\/g, '/');
+    allEntries.push(normPath);
+    if (!normPath.endsWith('.class')) continue;
+    const content = await entry.async('uint8array');
+    jvmDebug.fileProvider.virtualFS.set(normPath, content);
+    classEntries.push({ path: normPath, content });
+  }
+
+  if (classEntries.length === 0) {
+    throw new Error('No .class files found in archive');
+  }
+
+  setProgress(8, 'Installing browser services…', 'Connecting graphics, files, and networking.', 5, true);
+
+  const appletClasses = [];
+  const regularClasses = [];
+  for (const entry of classEntries) {
+    const className = entry.path.replace(/\.class$/i, '');
+    let isApplet = false;
+    try {
+      const jvm = jvmDebug.debugController.jvm;
+      const loaded = await jvm.loadClassByName(className).catch(() => null);
+      if (loaded && loaded.ast) {
+        // Prefer the async hierarchy walker; fall back to the sync version
+        // present in older bundles (works for direct Applet subclasses).
+        const detect = jvm.isAppletClassAsync || jvm.isAppletClass;
+        if (typeof detect === 'function') {
+          isApplet = await detect.call(jvm, loaded);
+        }
+      }
+    } catch (_) { /* ignore */ }
+    const info = { path: entry.path, className, displayName: className.replace(/\//g, '.'), isApplet };
+    if (isApplet) appletClasses.push(info); else regularClasses.push(info);
+  }
+
+  jarClassFiles = [...appletClasses, ...regularClasses];
+  loadedJarName = jarName;
+  selectedClassIndex = -1;
+  renderClassList();
+  document.getElementById('classCard').style.display = '';
+  document.getElementById('allFiles').innerHTML = allEntries.map(f => '<div style="padding:2px 0;">📄 ' + escapeHtml(f) + '</div>').join('');
+
+  const count = appletClasses.length;
+  setProgress(9, 'Classes ready',
+    classEntries.length + ' classes indexed (' + count + ' applet' + (count !== 1 ? 's' : '') + ').', 5, false);
+
+  // Auto-select and run: the ?class= param wins, otherwise the first applet.
+  let targetIndex = -1;
+  if (requestedClass) {
+    const match = jarClassFiles.find((e) =>
+      e.className === requestedClass || e.displayName === requestedClass ||
+      e.displayName.endsWith('.' + requestedClass) || e.className.endsWith('/' + requestedClass));
+    if (match) targetIndex = jarClassFiles.indexOf(match);
+  }
+  if (targetIndex === -1 && appletClasses.length === 1) {
+    targetIndex = jarClassFiles.indexOf(appletClasses[0]);
+  }
+  if (targetIndex !== -1) {
+    selectedClassIndex = targetIndex;
+    renderClassList();
+    if (jarClassFiles[targetIndex].isApplet) {
+      await runSelectedApplet();
+    } else {
+      await runSelectedMain();
+    }
+  }
+}
+
+// Codebase-only mode (no archive): run ?class= straight from the remote
+// codebase, fetching .class files on demand.
+async function runFromCodebase(className) {
+  resetLoader();
+  setProgress(7, 'Indexing classes…', 'Resolving ' + className + ' from ' + remoteCodebase, 4, true);
+  try {
+    await ensureJvm();
+    const jvm = jvmDebug.debugController.jvm;
+    configureJvm(jvm);
+    // Probe the main class so we can classify it as applet vs application.
+    const classData = await jvm.loadClassByName(className).catch(() => null);
+    if (!classData || !classData.ast) {
+      throw new Error('Could not fetch ' + className + ' from ' + remoteCodebase);
+    }
+    const entry = {
+      path: className.replace(/\./g, '/') + '.class',
+      className: className.replace(/\./g, '/'),
+      displayName: className.replace(/\./g, '/').replace(/\//g, '.'),
+      isApplet: false,
+    };
+    const detect = jvm.isAppletClassAsync || jvm.isAppletClass;
+    if (typeof detect === 'function') {
+      entry.isApplet = !!(await detect.call(jvm, classData));
+    }
+    jarClassFiles = [entry];
+    selectedClassIndex = 0;
+    renderClassList();
+    document.getElementById('classCard').style.display = '';
+    if (entry.isApplet) {
+      await runSelectedApplet();
+    } else {
+      await runSelectedMain();
+    }
+  } catch (err) {
+    console.error(err);
+    showLoadingError(err.message);
+  }
+}
+
+// ── Class list UI ─────────────────────────────────────────────────
+function renderClassList() {
+  document.getElementById('classList').innerHTML = jarClassFiles.map((entry, i) => {
+    const tag = entry.isApplet ? '<span class="tag">Applet</span>' : '';
+    const sel = i === selectedClassIndex ? ' selected' : '';
+    return '<div class="class-item' + sel + '" data-index="' + i + '" onclick="selectClass(' + i + ')">' +
+      '<span>' + escapeHtml(entry.displayName) + '</span>' + tag + '</div>';
+  }).join('');
+  updateButtons();
+}
+
+function selectClass(i) {
+  selectedClassIndex = i;
+  renderClassList();
+}
+
+function updateButtons() {
+  const entry = selectedClassIndex >= 0 ? jarClassFiles[selectedClassIndex] : null;
+  document.getElementById('runAppletBtn').disabled = !entry || !entry.isApplet;
+  document.getElementById('runMainBtn').disabled = !entry;
+}
+
+// ── Run the selected applet ───────────────────────────────────────
+document.getElementById('runAppletBtn').addEventListener('click', runSelectedApplet);
+document.getElementById('runMainBtn').addEventListener('click', runSelectedMain);
+
+function prepareStage() {
+  // Remove any previous applet root so each run starts clean
+  const old = appletStage.querySelector('.awt-applet-root');
+  if (old) old.remove();
+  const oldContainer = document.getElementById('awt-container');
+  if (oldContainer) oldContainer.remove();
+  resetLoader();
+}
+
+async function runSelectedApplet() {
+  const entry = jarClassFiles[selectedClassIndex];
+  if (!entry || !entry.isApplet) return;
+  prepareStage();
+  setProgress(10, 'Starting ' + entry.displayName + '…', 'The JVM is running. Waiting for the applet canvas.', 6, true);
+  try {
+    await ensureJvm();
+    jvmDebug.debugController.reset();
+    // reset() replaces the JVM with a fresh instance — grab it AFTER.
+    const jvm = jvmDebug.debugController.jvm;
+    configureJvm(jvm);
+    // The applet runs indefinitely (event loop / threads), so jvm.run() may
+    // never resolve. Watch for the canvas independently (like the game
+    // library launcher does) and let the loader complete on first paint.
+    const ready = waitForFirstFrame(entry.displayName);
+    window.__runPromise = jvm.run(entry.className).catch((err) => {
+      console.error(err);
+      showLoadingError(err.message);
+    });
+    await ready;
+  } catch (err) {
+    console.error(err);
+    showLoadingError(err.message);
+  }
+}
+
+async function runSelectedMain() {
+  const entry = jarClassFiles[selectedClassIndex];
+  if (!entry) return;
+  prepareStage();
+  setProgress(10, 'Running ' + entry.displayName + '…', 'The JVM is executing the main method.', 6, true);
+  try {
+    await ensureJvm();
+    jvmDebug.debugController.reset();
+    // reset() replaces the JVM with a fresh instance — grab it AFTER.
+    const jvm = jvmDebug.debugController.jvm;
+    configureJvm(jvm);
+    await jvm.run(entry.className);
+    setProgress(16, 'Run completed', 'The main method returned.', 16, false);
+    setTimeout(() => loader.classList.add('complete'), 450);
+  } catch (err) {
+    console.error(err);
+    showLoadingError(err.message);
+  }
+}
+
+// Apply applet tag parameters (from ?class/codebase/w/h/params) to a JVM.
+function configureJvm(jvm) {
+  jvm._appletWidth = requestedWidth;
+  jvm._appletHeight = requestedHeight;
+  jvm.appletParameters = Object.keys(appletParameters).length ? appletParameters : null;
+  if (remoteCodebase) {
+    jvm.appletCodeBase = remoteCodebase;
+    installRemoteCodebaseLoader(jvm, remoteCodebase);
+  }
+}
+
+// When no archive is provided (raw .class files served from a codebase, like
+// the classic <applet code="MyApplet.class">), fetch <Class>.class on demand and
+// feed it into the browser virtual filesystem.
+function installRemoteCodebaseLoader(jvm, codebase) {
+  const base = codebase.endsWith('/') ? codebase : codebase + '/';
+  const origLoad = jvm.loadClassByName.bind(jvm);
+  jvm.loadClassByName = async (className) => {
+    const loaded = await origLoad(className).catch(() => null);
+    if (loaded && loaded.ast) return loaded;
+    const slashName = String(className).replace(/\./g, '/');
+    const virtualPath = slashName + '.class';
+    const url = base + slashName + '.class';
+    try {
+      const resp = await fetchWithTimeout(url);
+      if (!resp.ok) return null;
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      jvmDebug.fileProvider.virtualFS.set(virtualPath, bytes);
+      return await origLoad(className);
+    } catch (_) {
+      return null;
+    }
+  };
+}
+
+// Watch for the applet canvas, move it into the stage, then declare ready
+function waitForFirstFrame(gameName, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    // Sync each component canvas buffer to its laid-out CSS size so the
+    // applet blits at 1:1 (like real AWT drawImage) instead of being
+    // letterboxed/scaled down by object-fit.
+    const syncCanvasBuffers = () => {
+      let changed = false;
+      appletStage.querySelectorAll('.awt-applet-root canvas').forEach((c) => {
+        const w = c.clientWidth || c.offsetWidth;
+        const h = c.clientHeight || c.offsetHeight;
+        if (w > 0 && h > 0 && (Math.abs(c.width - w) > 1 || Math.abs(c.height - h) > 1)) {
+          c.width = w;
+          c.height = h;
+          changed = true;
+        }
+      });
+      return changed;
+    };
+    const watch = setInterval(() => {
+      const canvas = document.querySelector('.awt-applet-root canvas');
+      if (!canvas || !canvas.width || !canvas.height) {
+        setProgress(16, 'Painting the first frame…', 'The applet is running. Waiting for the canvas.', 16, true);
+        if (Date.now() - started > timeoutMs) {
+          clearInterval(watch);
+          showLoadingError('The applet did not paint a frame within ' + (timeoutMs / 1000) + 's.');
+          resolve();
+        }
+        return;
+      }
+      const appletRoot = canvas.closest('.awt-applet-root');
+      if (appletRoot && appletRoot.parentNode !== appletStage) {
+        appletStage.appendChild(appletRoot);
+      }
+      // Keep syncing until the buffer matches the laid-out size (layout is
+      // not flushed on the first tick), then declare ready.
+      const synced = syncCanvasBuffers();
+      const elapsed = Date.now() - started;
+      if (synced && elapsed > 400) {
+        setProgress(100, 'Applet ready', gameName + ' is running.', 16, false);
+        clearInterval(watch);
+        setTimeout(() => loader.classList.add('complete'), 450);
+        resolve();
+      } else if (elapsed > 8000) {
+        setProgress(100, 'Applet ready', gameName + ' is running.', 16, false);
+        clearInterval(watch);
+        setTimeout(() => loader.classList.add('complete'), 450);
+        resolve();
+      }
+    }, 100);
+  });
+}
+
+// ── Auto-load from ?url= / ?codebase= query params ───────────────
+window.addEventListener('DOMContentLoaded', async () => {
+  applyRequestedSize();
+  renderLoadingCanvas();
+  const params = new URLSearchParams(location.search);
+  const autoUrl = params.get('url');
+  if (autoUrl) {
+    document.getElementById('jarUrl').value = autoUrl;
+    await loadJarFromUrl();
+  } else if (remoteCodebase && requestedClass) {
+    await runFromCodebase(requestedClass);
+  }
+});
+
+// Drag & drop
+document.addEventListener('dragover', (e) => e.preventDefault());
+document.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  const file = e.dataTransfer.files[0];
+  if (!file || !/\.(jar|zip)$/i.test(file.name)) return;
+  document.getElementById('jarFileName').textContent = file.name;
+  resetLoader();
+  setProgress(2, 'Reading ' + file.name + '…', 'Loading the archive from drag & drop.', 2, true);
+  try {
+    await ensureJvm();
+    const buffer = await file.arrayBuffer();
+    await processJarBytes(new Uint8Array(buffer), file.name);
+  } catch (err) {
+    console.error(err);
+    showLoadingError(err.message);
+  }
+});
+</script>
+</body>
+</html>

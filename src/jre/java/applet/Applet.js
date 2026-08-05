@@ -6,17 +6,42 @@ module.exports = {
   super: 'java/awt/Panel',
   methods: {
     '<init>()V': (jvm, obj, args) => {
+      // A page can host several applets, and under the classic plugin applets
+      // sharing a codebase shared one VM. Size, parameters, codebase and name
+      // therefore cannot live on the JVM -- the second applet would overwrite
+      // the first. The embedder stakes a descriptor for the launch it is about
+      // to start and this consumes it, so each applet keeps its own.
+      const pending = (jvm && jvm._pendingApplet) || null;
+      if (jvm) jvm._pendingApplet = null;
+
+      if (pending) {
+        if (pending.params) obj._parameters = pending.params;
+        if (pending.codeBase) obj._codeBase = pending.codeBase;
+        if (pending.documentBase) obj._documentBase = pending.documentBase;
+        obj._appletName = pending.name || null;
+      }
+
+      // Register for AppletContext.getApplet(name)/getApplets(): applets on one
+      // page could find and call each other, which is why <applet name=...>
+      // existed. Only meaningful because they share this JVM.
+      if (jvm) {
+        if (!jvm._appletRegistry) jvm._appletRegistry = [];
+        jvm._appletRegistry.push(obj);
+      }
+
       // Initialize applet as a Panel
+      const width = (pending && pending.width) || (jvm && jvm._appletWidth) || 800;
+      const height = (pending && pending.height) || (jvm && jvm._appletHeight) || 600;
       obj._awtComponent = new awtFramework.Canvas();
-      obj._awtComponent.setSize(800, 600); // Default applet size
-      obj._width = 800;
-      obj._height = 600;
+      obj._awtComponent.setSize(width, height);
+      obj._width = width;
+      obj._height = height;
       
       // Create and attach canvas to DOM if in browser environment
       if (typeof document !== 'undefined') {
         const canvas = document.createElement('canvas');
-        canvas.width = 800;
-        canvas.height = 600;
+        canvas.width = width;
+        canvas.height = height;
         canvas.style.border = '1px solid #ccc';
         canvas.style.background = 'white';
         // Keep the synthetic applet surface out of the applet's own layout and
@@ -33,8 +58,15 @@ module.exports = {
         jvm._awtCanvasElement = canvas;
         browserInput.attachBrowserInput(jvm, canvas);
         
-        // Add canvas to DOM - look for AWT container or create one
-        let awtContainer = document.getElementById('awt-container');
+        // Add canvas to DOM. An embedder that hosts several applets supplies a
+        // container per applet; without one, fall back to the page-global
+        // element the debug UI uses. That global lookup is why two applets used
+        // to land in the same div, the second reusing the first's root below.
+        let awtContainer = (pending && pending.container) ||
+          (jvm && jvm._appletContainer) || null;
+        if (!awtContainer) {
+          awtContainer = document.getElementById('awt-container');
+        }
         if (!awtContainer) {
           awtContainer = document.createElement('div');
           awtContainer.id = 'awt-container';
@@ -150,7 +182,12 @@ module.exports = {
     },
 
     'getAppletContext()Ljava/applet/AppletContext;': (jvm, obj, args) => {
-      return obj._appletContext || { type: 'java/applet/AppletContext' };
+      if (!obj._appletContext) {
+        // Bound to this JVM so the context can reach the applet registry that
+        // getApplet()/getApplets() read.
+        obj._appletContext = { type: 'java/applet/AppletContext', _jvm: jvm };
+      }
+      return obj._appletContext;
     },
 
     'getCodeBase()Ljava/net/URL;': (jvm, obj, args) => {
