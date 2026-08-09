@@ -10318,6 +10318,12 @@ class JvmSsaBlockRenderer {
             iterator,
             pc: Number.isInteger(step.value?.structuredResumePc)
               ? step.value.structuredResumePc : frame.pc,
+            // A frameless adaptive iterator can require several ordinary
+            // scheduler turns after it restores its child Frame. Preserve
+            // that origin across every yield so the eventual completion pops
+            // the restored child exactly once instead of restarting it from
+            // a materialized loop PC.
+            framelessEntry: continuation?.framelessEntry === true,
           };
           return step.value;
         }
