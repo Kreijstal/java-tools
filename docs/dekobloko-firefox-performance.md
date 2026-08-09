@@ -6339,3 +6339,69 @@ npm run build:bundle
 
 The rebuilt `dist/jvm-debug.js` SHA-256 is
 `9ce033afd936d057860da9aed2a18750a5fcac95b57b04a47f7d85425bff23d8`.
+
+### AST-safe SSA aliasing and Miner Disturbance renderer triage
+
+An August 2, 2026 Miner Disturbance Firefox report exposed a generic compiler
+correctness failure after about 127 seconds of startup:
+
+```text
+ReferenceError: ssaValue2 is not defined
+```
+
+The generated constructor/call sequence had removed an immutable SSA copy from
+its ordinary block, but deferred asynchronous, deoptimization, and
+scheduler-yield materialization still referenced the removed name. The defect
+was not related to a game owner, member name, or descriptor. SSA copy discovery
+and identifier replacement now operate on an Acorn JavaScript AST. Every
+renderer-owned alternate edge is rewritten with the complete method alias
+graph, and every generated ABI is rejected before installation if its AST
+scope graph contains an unbound SSA identifier.
+
+That scope audit immediately found a second generic defect in restoring direct
+bodies: a later live-range pass could move a singly assigned `let` declaration
+inside an inlined integral-leaf block while its uses remained outside. The pass
+now promotes the binding only when the AST proves the declaration and write are
+in the same lexical scope. Regression fixtures cover both the
+constructor-to-virtual-call continuation shape and nested integral leaves;
+neither fixture contains a game class or method identity. The original failing
+Miner Disturbance parser method still coalesces 72 SSA copies and has zero
+unbound identifiers. Its pixel-span direct body also executes without a
+JavaScript `ReferenceError`.
+
+The same telemetry separated presentation from guest rendering. During a
+102-second Firefox interval, canvas presentation used only 194 ms for upload
+and 117 ms for software blits, while sampled guest ownership was dominated by
+the large model/face body `sl.a(IIIILpb;III)V`, followed by its triangle/raster
+chain. This rules out canvas upload as the 0.9 FPS cause for that report. A
+generic exact-int-static branch specialization was tested on the innermost
+1,024-pixel span and then removed: 3,000 direct spans measured 9.16 ms without
+the experiment and 9.26 ms with it. V8 already optimized enough of that branch,
+so the extra runtime guard did not earn its complexity.
+
+Validation and deployment facts:
+
+```text
+timeout 90s node node_modules/tape/bin/tape test/jitCompiler.test.js
+# 1385/1385 passed
+
+npm run test:performance:jvm-kernel-proxy
+# all seven checksum/ratio gates passed
+
+npm run build:bundle
+# succeeded with the four existing webpack warnings
+```
+
+- Java-tools base commit: `fb28a225654574ecacc379abfb8998e588110ed6`
+  with tracked optimizer/test/documentation changes present.
+- Miner Disturbance JAR SHA-256:
+  `1cfc8680848d1695207e742638f46e8b42528380694ba2f66480484adaa3c344`.
+- Deployed production bundle SHA-256:
+  `a507b7e7a950c1660c1a00fe530bfa8989818df5e90ca459c9270694271732f1`.
+- The first Node control used default production JIT gates plus
+  `--profile-jit`; it passed the former SSA crash but did not reach a measurable
+  menu in 150 seconds because the remote launch path terminated its main thread
+  in the Vorbis/audio decoder with `ArrayIndexOutOfBoundsException` at
+  `b.c()I@2`. A 30-second diagnostic repeat used only
+  `JVM_DEBUG_THROW_TYPE=java/lang/ArrayIndexOutOfBoundsException` and reproduced
+  that separate guest stack. It is therefore not reported as an FPS result.

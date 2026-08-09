@@ -9,11 +9,278 @@ const { splitIrreducibleTerms } = require("../decompiler/exceptionStructurer");
 const { parseDescriptor } = require("../parsing/typeParser");
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
+const { parse: parseJavaScript } = require("acorn");
 const STRUCTURED_CONTINUATION = Symbol("jvm.structuredSsaContinuation");
 
 function isIrreducibleError(error) {
   return error instanceof IrreducibleError ||
     error?.name === "IrreducibleError" && Array.isArray(error.edges);
+}
+
+function walkJavaScriptAst(node, visit, parent = null) {
+  if (!node || typeof node !== "object") return;
+  visit(node, parent);
+  for (const [key, child] of Object.entries(node)) {
+    if (key === "start" || key === "end" || key === "loc" ||
+        key === "range") continue;
+    if (Array.isArray(child)) {
+      for (const entry of child) walkJavaScriptAst(entry, visit, node);
+    } else if (child && typeof child.type === "string") {
+      walkJavaScriptAst(child, visit, node);
+    }
+  }
+}
+
+function parseGeneratedStatements(source) {
+  const prefix = "function* __jvmSsaAstWrapper() {\n";
+  const wrapped = `${prefix}${source}\n}`;
+  const program = parseJavaScript(wrapped, {
+    ecmaVersion: "latest",
+    ranges: true,
+  });
+  return {
+    offset: prefix.length,
+    statements: program.body[0].body.body,
+    program,
+  };
+}
+
+function rewriteGeneratedJavaScript(source, resolveIdentifier,
+  removedStatements = []) {
+  if (typeof source !== "string" || source.length === 0) return source;
+  const parsed = parseGeneratedStatements(source);
+  const removed = removedStatements.map((statement) => ({
+    start: statement.start - parsed.offset,
+    end: statement.end - parsed.offset,
+  }));
+  const edits = removed.map((range) => ({...range, replacement: ""}));
+  walkJavaScriptAst(parsed.program, (node, parent) => {
+    if (node.type !== "Identifier") return;
+    if (parent?.type === "MemberExpression" && parent.property === node &&
+        !parent.computed) return;
+    if ((parent?.type === "Property" || parent?.type === "MethodDefinition") &&
+        parent.key === node && !parent.computed && !parent.shorthand) return;
+    if ((parent?.type === "LabeledStatement" ||
+        parent?.type === "BreakStatement" ||
+        parent?.type === "ContinueStatement") && parent.label === node) return;
+    const replacement = resolveIdentifier(node.name);
+    if (replacement === node.name) return;
+    const start = node.start - parsed.offset;
+    const end = node.end - parsed.offset;
+    if (removed.some((range) => start >= range.start && end <= range.end)) return;
+    edits.push({start, end, replacement});
+  });
+  edits.sort((left, right) => right.start - left.start || right.end - left.end);
+  let rewritten = source;
+  for (const edit of edits) {
+    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
+      rewritten.slice(edit.end);
+  }
+  return rewritten;
+}
+
+function rewriteGeneratedExpression(source, resolveIdentifier) {
+  if (typeof source !== "string" || source.length === 0) return source;
+  const prefix = "function __jvmSsaExpressionWrapper() { return (";
+  const wrapped = `${prefix}${source}); }`;
+  const program = parseJavaScript(wrapped, {ecmaVersion: "latest"});
+  const edits = [];
+  walkJavaScriptAst(program, (node, parent) => {
+    if (node.type !== "Identifier") return;
+    if (parent?.type === "MemberExpression" && parent.property === node &&
+        !parent.computed) return;
+    const replacement = resolveIdentifier(node.name);
+    if (replacement !== node.name) {
+      edits.push({
+        start: node.start - prefix.length,
+        end: node.end - prefix.length,
+        replacement,
+      });
+    }
+  });
+  edits.sort((left, right) => right.start - left.start);
+  let rewritten = source;
+  for (const edit of edits) {
+    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
+      rewritten.slice(edit.end);
+  }
+  return rewritten;
+}
+
+function analyzeGeneratedSsaScopes(source, candidates = null) {
+  const parsed = parseGeneratedStatements(source);
+  const parents = new WeakMap();
+  const nodeScopes = new WeakMap();
+  const declarationIdentifiers = new WeakSet();
+  const scopes = [];
+  const createScope = (parent) => {
+    const scope = {parent, bindings: new Map()};
+    scopes.push(scope);
+    return scope;
+  };
+  const rootScope = createScope(null);
+  const isCandidate = (name) => candidates
+    ? candidates.has(name) : name.startsWith("ssaValue");
+  const children = (node) => Object.entries(node).flatMap(([key, child]) => {
+    if (key === "start" || key === "end" || key === "loc" ||
+        key === "range") return [];
+    if (Array.isArray(child)) {
+      return child.filter((entry) => entry && typeof entry.type === "string");
+    }
+    return child && typeof child.type === "string" ? [child] : [];
+  });
+  const declarePattern = (pattern, scope, declaration = null,
+    declarator = null) => {
+    if (!pattern) return;
+    if (pattern.type === "Identifier") {
+      declarationIdentifiers.add(pattern);
+      if (isCandidate(pattern.name)) {
+        scope.bindings.set(pattern.name, {
+          name: pattern.name,
+          scope,
+          declaration,
+          declarator,
+          references: [],
+        });
+      }
+      return;
+    }
+    if (pattern.type === "RestElement") {
+      declarePattern(pattern.argument, scope, declaration, declarator);
+    } else if (pattern.type === "AssignmentPattern") {
+      declarePattern(pattern.left, scope, declaration, declarator);
+    } else if (pattern.type === "ArrayPattern") {
+      for (const element of pattern.elements) {
+        declarePattern(element, scope, declaration, declarator);
+      }
+    } else if (pattern.type === "ObjectPattern") {
+      for (const property of pattern.properties) {
+        declarePattern(
+          property.value || property.argument, scope, declaration, declarator);
+      }
+    }
+  };
+  const define = (node, scope, parent = null) => {
+    if (!node || typeof node !== "object") return;
+    if (parent) parents.set(node, parent);
+    nodeScopes.set(node, scope);
+    if (node.type === "FunctionDeclaration" ||
+        node.type === "FunctionExpression" ||
+        node.type === "ArrowFunctionExpression") {
+      if (node.id) declarePattern(node.id, scope);
+      const functionScope = createScope(scope);
+      for (const parameter of node.params) {
+        declarePattern(parameter, functionScope);
+      }
+      define(node.body, functionScope, node);
+      return;
+    }
+    if (node.type === "BlockStatement") {
+      const blockScope = createScope(scope);
+      nodeScopes.set(node, blockScope);
+      for (const statement of node.body) define(statement, blockScope, node);
+      return;
+    }
+    if (node.type === "CatchClause") {
+      const catchScope = createScope(scope);
+      nodeScopes.set(node, catchScope);
+      declarePattern(node.param, catchScope);
+      define(node.body, catchScope, node);
+      return;
+    }
+    if (node.type === "ForStatement" || node.type === "ForInStatement" ||
+        node.type === "ForOfStatement" || node.type === "SwitchStatement") {
+      const controlScope = createScope(scope);
+      nodeScopes.set(node, controlScope);
+      for (const child of children(node)) define(child, controlScope, node);
+      return;
+    }
+    if (node.type === "VariableDeclaration") {
+      for (const declarator of node.declarations) {
+        declarePattern(declarator.id, scope, node, declarator);
+      }
+    }
+    for (const child of children(node)) define(child, scope, node);
+  };
+  define(parsed.program, rootScope);
+
+  const unbound = new Set();
+  walkJavaScriptAst(parsed.program, (node, parent) => {
+    if (node.type !== "Identifier" || !isCandidate(node.name) ||
+        declarationIdentifiers.has(node)) return;
+    if (parent?.type === "MemberExpression" && parent.property === node &&
+        !parent.computed) return;
+    if ((parent?.type === "Property" || parent?.type === "MethodDefinition") &&
+        parent.key === node && !parent.computed && !parent.shorthand) return;
+    if ((parent?.type === "LabeledStatement" ||
+        parent?.type === "BreakStatement" ||
+        parent?.type === "ContinueStatement") && parent.label === node) return;
+    let scope = nodeScopes.get(node) || rootScope;
+    let binding = null;
+    while (scope && !binding) {
+      binding = scope.bindings.get(node.name) || null;
+      scope = scope.parent;
+    }
+    if (!binding) {
+      unbound.add(node.name);
+      return;
+    }
+    const assignment = parent?.type === "AssignmentExpression" &&
+      parent.left === node ? parent : null;
+    binding.references.push({
+      identifier: node,
+      scope: nodeScopes.get(node),
+      isWrite: Boolean(assignment ||
+        parent?.type === "UpdateExpression" && parent.argument === node),
+      assignment,
+    });
+  });
+  return {parsed, parents, scopes, unbound: [...unbound]};
+}
+
+function unboundGeneratedSsaIdentifiers(source, candidates = null) {
+  return analyzeGeneratedSsaScopes(source, candidates).unbound;
+}
+
+function promoteSingleAssignmentSsaBindings(source, candidates) {
+  const analysis = analyzeGeneratedSsaScopes(source, candidates);
+  const {parsed, parents, scopes} = analysis;
+  const edits = [];
+  for (const scope of scopes) {
+    for (const variable of scope.bindings.values()) {
+      const {declarator, declaration} = variable;
+      if (declaration?.kind !== "let" || !declarator ||
+          declaration.declarations.length !== 1 || declarator.init) continue;
+      const writes = variable.references.filter((reference) =>
+        reference.isWrite);
+      if (writes.length !== 1 || writes[0].scope !== variable.scope) continue;
+      const assignment = writes[0].assignment;
+      const assignmentStatement = parents.get(assignment);
+      if (assignment?.type !== "AssignmentExpression" ||
+          assignment.operator !== "=" ||
+          assignment.left !== writes[0].identifier ||
+          assignmentStatement?.type !== "ExpressionStatement") continue;
+      if (variable.references.some((reference) =>
+        reference !== writes[0] &&
+        reference.identifier.start < assignment.end)) continue;
+      edits.push({
+        start: declaration.start - parsed.offset,
+        end: declaration.end - parsed.offset,
+        replacement: "",
+      }, {
+        start: assignmentStatement.start - parsed.offset,
+        end: assignmentStatement.start - parsed.offset,
+        replacement: "const ",
+      });
+    }
+  }
+  edits.sort((left, right) => right.start - left.start || right.end - left.end);
+  let rewritten = source;
+  for (const edit of edits) {
+    rewritten = rewritten.slice(0, edit.start) + edit.replacement +
+      rewritten.slice(edit.end);
+  }
+  return rewritten;
 }
 
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
@@ -815,7 +1082,12 @@ class JvmSsaBlockRenderer {
       }
     }
     let nextValue = 0;
-    const value = () => `ssaValue${nextValue++}`;
+    const ssaValueNames = new Set();
+    const value = () => {
+      const name = `ssaValue${nextValue++}`;
+      ssaValueNames.add(name);
+      return name;
+    };
     const plans = [];
     // SSA names are unique across the method. Preserve their integer
     // provenance beyond block simulation so a later, entry-guarded checked
@@ -3769,49 +4041,89 @@ class JvmSsaBlockRenderer {
       }
     }
 
-    // Bytecode stack staging can create long chains such as
-    // `const v7 = v3; const v9 = v7;`. Both names are immutable SSA values,
-    // so retaining the aliases only enlarges the optimizing compiler's graph
-    // and increases register pressure in numeric kernels. Coalesce only
-    // exact, top-level SSA-to-SSA declarations; locals, transfer slots, field
-    // caches, and nested lexical declarations are intentionally excluded.
-    // This is ordinary SSA copy propagation and is independent of guest
-    // identity or algorithm shape.
+    // Bytecode stack staging can create long chains of immutable SSA copies.
+    // Discover those declarations from the JavaScript AST and rewrite only
+    // Identifier nodes. Generated strings, comments, property names, and
+    // similarly spelled guest members are never optimizer inputs.
     let coalescedSsaCopyCount = 0;
+    const aliases = new Map();
+    const removedDeclarationsByPlan = new Map();
+    const resolveAlias = (name) => {
+      const visited = new Set();
+      let current = name;
+      while (aliases.has(current) && !visited.has(current)) {
+        visited.add(current);
+        current = aliases.get(current);
+      }
+      return current;
+    };
     for (const plan of plans) {
       if (!plan?.lines?.length) continue;
-      const aliases = new Map();
-      const resolveAlias = (name) => {
-        const visited = new Set();
-        let current = name;
-        while (aliases.has(current) && !visited.has(current)) {
-          visited.add(current);
-          current = aliases.get(current);
+      const planSource = plan.lines.join("\n");
+      const parsedPlan = parseGeneratedStatements(planSource);
+      const removedDeclarations = [];
+      for (const statement of parsedPlan.statements) {
+        if (statement.type !== "VariableDeclaration" ||
+            statement.kind !== "const" || statement.declarations.length !== 1) {
+          continue;
         }
-        return current;
-      };
-      const removed = new Set();
-      for (let index = 0; index < plan.lines.length; index += 1) {
-        const match = /^const (ssaValue\d+) = (ssaValue\d+);$/.exec(
-          plan.lines[index]);
-        if (!match) continue;
-        aliases.set(match[1], resolveAlias(match[2]));
-        removed.add(index);
+        const declaration = statement.declarations[0];
+        if (declaration.id?.type !== "Identifier" ||
+            declaration.init?.type !== "Identifier" ||
+            !ssaValueNames.has(declaration.id.name) ||
+            !ssaValueNames.has(declaration.init.name)) continue;
+        aliases.set(
+          declaration.id.name, resolveAlias(declaration.init.name));
+        removedDeclarations.push(statement);
         coalescedSsaCopyCount += 1;
       }
-      if (!aliases.size) continue;
-      const substitute = (source) => {
-        if (typeof source !== "string") return source;
-        return source.replace(/\bssaValue\d+\b/g,
-          (name) => resolveAlias(name));
-      };
-      plan.lines = plan.lines
-        .filter((_line, index) => !removed.has(index))
-        .map(substitute);
-      for (const access of deferredStaticArrayAccesses) {
-        if (plans[access.block] === plan) {
-          access.directLines = access.directLines.map(substitute);
+      if (removedDeclarations.length) {
+        removedDeclarationsByPlan.set(plan, removedDeclarations);
+      }
+    }
+    if (aliases.size) {
+      const rewriteStatements = (lines, removed = []) =>
+        rewriteGeneratedJavaScript(
+          lines.join("\n"), resolveAlias, removed,
+        ).split("\n").filter(Boolean);
+      const rewriteExpression = (expression) =>
+        rewriteGeneratedExpression(expression, resolveAlias);
+      for (const plan of plans) {
+        if (!plan?.lines?.length) continue;
+        plan.lines = rewriteStatements(
+          plan.lines, removedDeclarationsByPlan.get(plan) || []);
+        plan.condition = rewriteExpression(plan.condition);
+        plan.returnValue = rewriteExpression(plan.returnValue);
+        if (plan.stack) plan.stack = plan.stack.map(rewriteExpression);
+        if (plan.takenStack) {
+          plan.takenStack = plan.takenStack.map(rewriteExpression);
         }
+        if (plan.fallStack) {
+          plan.fallStack = plan.fallStack.map(rewriteExpression);
+        }
+      }
+      // Call, static-read, and checked-leaf fallbacks are emitted out of line
+      // and expanded only after the ordinary block has been rendered.  They
+      // nevertheless consume the same method-global SSA values as the plans
+      // owning their markers, so rewrite every alternate edge once with the
+      // complete method alias graph.
+      for (const fallback of continuationFallbacks.values()) {
+        fallback.continuation = rewriteStatements(fallback.continuation);
+        fallback.ordinary = rewriteStatements(fallback.ordinary);
+        if (fallback.checkedLeaf) {
+          fallback.checkedLeaf = rewriteStatements(fallback.checkedLeaf);
+        }
+      }
+      for (const fallback of directEntryStaticReadFallbacks.values()) {
+        fallback.direct = rewriteStatements(fallback.direct);
+        fallback.ordinary = rewriteStatements(fallback.ordinary);
+      }
+      for (const fallback of directCheckedAdmissionFallbacks.values()) {
+        fallback.direct = rewriteStatements(fallback.direct);
+        fallback.ordinary = rewriteStatements(fallback.ordinary);
+      }
+      for (const access of deferredStaticArrayAccesses) {
+        access.directLines = rewriteStatements(access.directLines);
       }
       for (const [object, data] of [...eagerFieldReceiverNullChecks]) {
         const resolvedObject = resolveAlias(object);
@@ -3831,11 +4143,6 @@ class JvmSsaBlockRenderer {
         localLoads.delete(load);
         localLoads.set(resolvedLoad, slot);
       }
-      plan.condition = substitute(plan.condition);
-      plan.returnValue = substitute(plan.returnValue);
-      if (plan.stack) plan.stack = plan.stack.map(substitute);
-      if (plan.takenStack) plan.takenStack = plan.takenStack.map(substitute);
-      if (plan.fallStack) plan.fallStack = plan.fallStack.map(substitute);
     }
 
     // Generator continuations preserve lexical SSA locals across a cooperative
@@ -8245,36 +8552,11 @@ class JvmSsaBlockRenderer {
       // Turn a separately declared, singly assigned load result into a const
       // at its definition point. This shortens its live range and removes one
       // bytecode/register pair without moving the potentially throwing load.
-      for (;;) {
-        const counts = occurrenceCounts();
-        const inlineIndexes = inlineCheckedLeafLineIndexes();
-        let changed = false;
-        for (let declarationIndex = 0;
-          declarationIndex < lines.length; declarationIndex += 1) {
-          if (inlineIndexes.has(declarationIndex)) continue;
-          const declaration =
-            /^\s*let (ssaValue\d+);$/.exec(lines[declarationIndex]);
-          if (!declaration || counts.get(declaration[1]) !== 3) continue;
-          const assignmentPattern = new RegExp(
-            `^(\\s*)${declaration[1]} = (.+);$`);
-          const assignmentIndexes = [];
-          for (let index = declarationIndex + 1; index < lines.length; index += 1) {
-            if (assignmentPattern.test(lines[index])) assignmentIndexes.push(index);
-          }
-          if (assignmentIndexes.length !== 1 ||
-              inlineIndexes.has(assignmentIndexes[0])) continue;
-          const earlyUse = new RegExp(`\\b${declaration[1]}\\b`);
-          if (lines.slice(declarationIndex + 1, assignmentIndexes[0])
-            .some((line) => earlyUse.test(line))) continue;
-          const assignment = assignmentPattern.exec(lines[assignmentIndexes[0]]);
-          lines[declarationIndex] = '';
-          lines[assignmentIndexes[0]] =
-            `${assignment[1]}const ${declaration[1]} = ${assignment[2]};`;
-          changed = true;
-        }
-        if (!changed) break;
-        lines = lines.filter(Boolean);
-      }
+      // Scope analysis is mandatory here: moving a declaration from an outer
+      // block into a conditional inline region would make later uses unbound.
+      lines = promoteSingleAssignmentSsaBindings(
+        lines.join("\n"), ssaValueNames,
+      ).split("\n").filter(Boolean);
       lines = lines.map((line) => line.replace(
         /if \(!\((.+) !== (.+)\)\) \{/,
         'if ($1 === $2) {'));
@@ -8556,7 +8838,16 @@ class JvmSsaBlockRenderer {
     const body = buildBody(renderedTree);
     const generatedSource = body.join("\n");
     try {
-      const generatedBody = this.jit.createGeneratedFunction(method, "structured-ssa",
+      const createStructuredFunction = (tier, parameters, source, ...options) => {
+        const unbound = unboundGeneratedSsaIdentifiers(source, ssaValueNames);
+        if (unbound.length) {
+          throw new Error(
+            `unbound generated SSA identifiers in ${tier}: ${unbound.join(", ")}`);
+        }
+        return this.jit.createGeneratedFunction(
+          method, tier, parameters, source, ...options);
+      };
+      const generatedBody = createStructuredFunction("structured-ssa",
         ["frame", "thread", "helpers", "initialBytecodeChecks", "framelessEntry"], generatedSource,
         null, false, useContinuations);
       let directPositionalBody = null;
@@ -8637,8 +8928,7 @@ class JvmSsaBlockRenderer {
           ...expandContinuationFallbacks(
             render(structured.tree, false, true), false),
         ].filter(Boolean).join("\n"), "ssa-direct-positional", false);
-        directPositionalBody = this.jit.createGeneratedFunction(
-          method,
+        directPositionalBody = createStructuredFunction(
           "ssa-direct-positional",
           ["helpers", ...argumentNames, "thread", "nestedEntryGuarded"],
           directPositionalSource,
@@ -9003,8 +9293,7 @@ class JvmSsaBlockRenderer {
           restoringSentinelCaptures.ssaAsyncInvoke =
             this.jit.asyncInvokeSentinel();
         }
-        restoringDirectPositionalBody = this.jit.createGeneratedFunction(
-          method,
+        restoringDirectPositionalBody = createStructuredFunction(
           "ssa-direct-restoring-positional",
           ["helpers", "plan", ...argumentNames, "thread",
             "nestedEntryGuarded"],
@@ -9483,8 +9772,7 @@ class JvmSsaBlockRenderer {
                   !recursiveArrayWorkerSource.includes("spillLocals(") &&
                   !recursiveArrayWorkerSource.includes("throw ") &&
                   !recursiveArrayWorkerSource.includes("try {")) {
-                recursiveArrayWorkerBody = this.jit.createGeneratedFunction(
-                  method,
+                recursiveArrayWorkerBody = createStructuredFunction(
                   "ssa-recursive-array-worker",
                   argumentNames,
                   recursiveArrayWorkerSource,
@@ -9649,8 +9937,7 @@ class JvmSsaBlockRenderer {
               ...checkedLeafBody,
             ].join("\n");
             checkedLeafDirectPositionalBody =
-              this.jit.createGeneratedFunction(
-                method,
+              createStructuredFunction(
                 "ssa-checked-leaf-positional",
                 ["helpers", ...argumentNames, "thread",
                   "nestedEntryGuarded"],
@@ -9677,8 +9964,7 @@ class JvmSsaBlockRenderer {
               ...trustedCheckedLeafBody,
             ].join("\n");
             trustedCheckedLeafDirectPositionalBody =
-              this.jit.createGeneratedFunction(
-                method,
+              createStructuredFunction(
                 "ssa-trusted-checked-leaf-positional",
                 ["helpers", ...argumentNames, "thread"],
                 trustedCheckedLeafDirectPositionalSource,
@@ -9705,8 +9991,7 @@ class JvmSsaBlockRenderer {
                 ...preflightedCheckedLeafBody,
               ].join("\n");
               preflightedCheckedLeafDirectPositionalBody =
-                this.jit.createGeneratedFunction(
-                  method,
+                createStructuredFunction(
                   "ssa-preflighted-checked-leaf-positional",
                   ["helpers", ...argumentNames, "thread"],
                   preflightedCheckedLeafDirectPositionalSource,
@@ -9781,8 +10066,7 @@ class JvmSsaBlockRenderer {
                 ...capturedBody,
               ].join("\n");
               capturedCheckedLeafDirectPositionalBody =
-                this.jit.createGeneratedFunction(
-                  method,
+                createStructuredFunction(
                   "ssa-captured-checked-leaf-positional",
                   ["helpers", ...argumentNames, ...captureArguments,
                     "thread", "nestedEntryGuarded"],
@@ -9817,8 +10101,7 @@ class JvmSsaBlockRenderer {
             "helpers.ordinaryAdaptiveFramelessRunCount += 1;");
         }
         adaptivePositionalSource = adaptiveBody.join("\n");
-        const adaptiveGeneratedBody = this.jit.createGeneratedFunction(
-          method,
+        const adaptiveGeneratedBody = createStructuredFunction(
           "structured-ssa-adaptive-positional",
           ["frame", "thread", "helpers", "initialBytecodeChecks", "framelessEntry"],
           adaptivePositionalSource,
@@ -10206,4 +10489,7 @@ class JvmSsaBlockRenderer {
 }
 
 module.exports = JvmSsaBlockRenderer;
-module.exports._test = { isIrreducibleError };
+module.exports._test = {
+  isIrreducibleError,
+  unboundGeneratedSsaIdentifiers,
+};

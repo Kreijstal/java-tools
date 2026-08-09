@@ -6963,6 +6963,123 @@ public final class StructuredFieldArrayRangeHarness {
   t.end();
 });
 
+test('structured SSA copy propagation rewrites deferred call edges',
+  async (t) => {
+  const className = 'StructuredAliasFallbackHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class StructuredAliasFallbackHarness {
+  static final class Reader {
+    int value;
+    int next() { return value; }
+  }
+  static final class Box {
+    int value;
+    void read(Reader reader) { value = reader.next(); }
+  }
+
+  Box box;
+
+  void decode(Reader reader) {
+    box = new Box();
+    box.read(reader);
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await Promise.all([
+    jvm.loadClassByName(className),
+    jvm.loadClassByName(`${className}$Reader`),
+    jvm.loadClassByName(`${className}$Box`),
+  ]);
+  for (const loaded of [className, `${className}$Reader`, `${className}$Box`]) {
+    jvm.classInitializationState.set(loaded, 'INITIALIZED');
+  }
+  const method = await jvm.findMethodInHierarchy(
+    className, 'decode', `(L${className}$Reader;)V`);
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the constructor/call sequence compiles through structured SSA');
+  t.ok(generated.jvmStructuredCoalescedSsaCopyCount >= 1,
+    'bytecode stack copies are coalesced without a guest identity rule');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    generated.jvmStructuredSource), [],
+  'ordinary, asynchronous, deopt, and scheduler-yield edges bind every SSA value');
+
+  const rejected = structuredRendererTest.unboundGeneratedSsaIdentifiers([
+    'const ssaValue0 = 1;',
+    'if (thread.status !== "runnable") {',
+    '  helpers.materialize(frame, ssaValue1);',
+    '}',
+  ].join('\n'));
+  t.deepEqual(rejected, ['ssaValue1'],
+    'the AST audit catches a value referenced only on a cold alternate edge');
+  const outOfScope = structuredRendererTest.unboundGeneratedSsaIdentifiers([
+    'let ssaValue0;',
+    '{',
+    '  const ssaValue1 = 7;',
+    '}',
+    'ssaValue0 = ssaValue1;',
+  ].join('\n'));
+  t.deepEqual(outOfScope, ['ssaValue1'],
+    'the AST scope graph rejects a declaration moved into a nested block');
+  t.end();
+});
+
+test('structured SSA keeps inlined leaf results in their lexical scope',
+  async (t) => {
+  const className = 'StructuredInlineScopeHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class StructuredInlineScopeHarness {
+  static int mask(int value, int bits) {
+    return value & bits;
+  }
+
+  static void transform(int[] values) {
+    for (int index = 0; index < values.length; index++) {
+      int low = mask(values[index], 255);
+      values[index] = mask(low, 127);
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'transform', '([I)V');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the arbitrary array loop with integral leaves compiles');
+  t.equal(typeof generated.jvmRestoringDirectPositionalBody, 'function',
+    'the verified loop publishes its direct restoring ABI');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    generated.jvmRestoringDirectPositionalSource), [],
+  'scope-aware promotion leaves every direct-body value lexically bound');
+
+  const values = [0x1234, 0x80ff, 0x7f, -1];
+  values.type = '[I';
+  const result = generated.jvmRestoringDirectPositionalBody(
+    jvm.jit,
+    {target: {freeFrame: null}},
+    values,
+    {status: 'runnable', callStack: {items: []}},
+    1,
+  );
+  t.equal(result, jvm.jit.returnVoid(),
+    'the direct positional loop returns its canonical void sentinel');
+  t.deepEqual(values.slice(), [0x34, 0x7f, 0x7f, 0x7f],
+    'nested inlined leaves preserve every transformed value');
+  t.end();
+});
+
 test('structured JVM SSA emits atomic kernels for fully bounded counted loops', async (t) => {
   const classpath = compileJavaFixture(t, 'StructuredAtomicHarness', `
 public class StructuredAtomicHarness {
