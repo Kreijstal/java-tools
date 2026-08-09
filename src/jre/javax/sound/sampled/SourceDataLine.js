@@ -103,7 +103,7 @@ module.exports = {
           message: "Audio write failed: " + error.message,
         };
       }
-    }, ["java/lang/IllegalStateException", "java/io/IOException"]),
+    }, ["java/lang/IllegalStateException", "java/io/IOException"], []),
     "available()I": (jvm, obj, args) => {
       // A discard sink drains instantaneously. Reporting it as permanently
       // empty makes games spend every cycle decoding audio that nobody can

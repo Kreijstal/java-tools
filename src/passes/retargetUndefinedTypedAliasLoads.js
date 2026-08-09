@@ -38,6 +38,12 @@ function rewriteCode(code, methodOrOptions = {}, maybeOptions = {}) {
     const stale = aloadLocal(items[i]);
     if (stale == null || entryDefinitions.has(stale) ||
         hasDominatingDefinition(cfg, dominators, analysis, i, stale)) continue;
+    // A merge can have a valid definition on every incoming path without any
+    // one store dominating the use.  Such a local is not undefined, and
+    // replacing it with a same-typed parameter silently changes which array or
+    // object the bytecode accesses.  This repair pass is only sound when the
+    // reaching-definition analysis found no source at all.
+    if (hasAnyReachingDefinition(analysis, i, stale)) continue;
     const owner = fieldOwnerAtUse(items, i);
     const isAliasCopy = owner == null && astoreLocal(items[nextInstructionIndex(items, i)]) != null;
     if (!owner && !isAliasCopy) {
@@ -190,6 +196,11 @@ function hasDominatingDefinition(cfg, dominators, analysis, index, local) {
     if (!def || !instructionDominates(cfg, dominators, def.index, index)) return false;
   }
   return true;
+}
+
+function hasAnyReachingDefinition(analysis, index, local) {
+  const reaching = analysis.before[index] && analysis.before[index].get(String(local));
+  return Boolean(reaching && reaching.size > 0);
 }
 
 function nextInstructionIndex(items, index) {

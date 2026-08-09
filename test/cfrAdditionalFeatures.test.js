@@ -553,6 +553,55 @@ LUncheckedReturn: return
 .end class
 `;
 
+const SOURCE_DATA_LINE_WRITE_JASMIN = `.version 52 0
+.class public super SourceDataLineWrite
+.super java/lang/Object
+
+.method public <init> : ()V
+    .code stack 1 locals 1
+L0: aload_0
+L1: invokespecial Method java/lang/Object <init> ()V
+L2: return
+    .end code
+.end method
+
+.method public write : (Ljavax/sound/sampled/SourceDataLine;[B)I
+    .code stack 4 locals 3
+L0: aload_1
+L1: aload_2
+L2: iconst_0
+L3: aload_2
+L4: arraylength
+L5: invokeinterface InterfaceMethod javax/sound/sampled/SourceDataLine write ([BII)I 4
+L10: ireturn
+    .end code
+.end method
+.end class
+`;
+
+const SOURCE_DATA_LINE_OPEN_JASMIN = `.version 52 0
+.class public super SourceDataLineOpen
+.super java/lang/Object
+
+.method public <init> : ()V
+    .code stack 1 locals 1
+L0: aload_0
+L1: invokespecial Method java/lang/Object <init> ()V
+L2: return
+    .end code
+.end method
+
+.method public callOpen : (Ljavax/sound/sampled/SourceDataLine;Ljavax/sound/sampled/AudioFormat;)V
+    .code stack 2 locals 3
+L0: aload_1
+L1: aload_2
+L2: invokeinterface InterfaceMethod javax/sound/sampled/SourceDataLine open (Ljavax/sound/sampled/AudioFormat;)V 2
+L7: return
+    .end code
+.end method
+.end class
+`;
+
 const STATIC_INITIALIZER_JASMIN = `.version 52 0
 .class public super org/benf/cfr/tests/StaticInitializerTest
 .super java/lang/Object
@@ -801,6 +850,27 @@ function decompileFixture(tempDir, name, source) {
   assembleJasminSource(source, classPath);
   return decompileClassFile(classPath);
 }
+
+test('CFR-JS distinguishes native runtime failures from Java declared throws', (t) => {
+  withTempDir('cfr-jre-declared-throws-', (tempDir) => {
+    const writeSource = decompileFixture(
+      tempDir,
+      'SourceDataLineWrite',
+      SOURCE_DATA_LINE_WRITE_JASMIN,
+    );
+    const openSource = decompileFixture(
+      tempDir,
+      'SourceDataLineOpen',
+      SOURCE_DATA_LINE_OPEN_JASMIN,
+    );
+
+    t.notOk(/decompiledCheckedException/.test(writeSource),
+      'SourceDataLine.write does not gain a checked-exception boundary absent from its Java API');
+    t.match(openSource, /catch \(Throwable decompiledCheckedException\)/,
+      'a SourceDataLine.open call still gains the boundary required by its declared checked exception');
+    t.end();
+  });
+});
 
 test('CFR-JS reconstructs additional expression and declaration features', (t) => {
   t.plan(30);

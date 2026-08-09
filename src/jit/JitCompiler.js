@@ -73,6 +73,8 @@ class JitCompiler {
     this.structuredConstructorUpgradeCount = 0;
     this.lastStructuredConstructorUpgrade = null;
     this.adaptiveCodegenSupportCache = new WeakMap();
+    this.adaptiveCodegenDependencyPending = new WeakSet();
+    this.adaptiveCodegenDependencyEpoch = new WeakMap();
     this.adaptiveCodegenMethods = new WeakSet();
     this.adaptiveCodegenCounts = new WeakMap();
     this.adaptiveCodegenFrameHeat = new WeakMap();
@@ -468,6 +470,9 @@ class JitCompiler {
       awaitingAdaptivePromotion = !codegenEligible &&
         !this.isSupported(frame.method);
       if (codegenEligible) canRunGenerated = this.canRun(frame, true);
+    }
+    if (this.adaptiveCodegenDependencyPending.has(frame.method)) {
+      awaitingAdaptivePromotion = true;
     }
     // Structural rejection and permanent deoptimization are method-stable.
     // Remember them on the frame so interpreted bytecodes do not repeat the
@@ -1163,6 +1168,12 @@ class JitCompiler {
     if (supportCache.has(method)) {
       return supportCache.get(method);
     }
+    if (allowEffectfulCalls &&
+        this.adaptiveCodegenDependencyPending.has(method) &&
+        this.adaptiveCodegenDependencyEpoch.get(method) ===
+          (this.jvm.classEpoch || 0)) {
+      return false;
+    }
 
     const code = method.attributes.find((attr) => attr.type === "code");
     if (!code) {
@@ -1183,6 +1194,34 @@ class JitCompiler {
           instruction.arg[2][0] === "<init>")) {
       supportCache.set(method, false);
       return false;
+    }
+    const safeInitializationCalls = !safeConstructor && allowEffectfulCalls
+      ? this.hasOnlyJitSafeInitializationCalls(codeItems) : true;
+    if (safeInitializationCalls !== true) {
+      // Adaptive compilation can start after an arbitrary number of
+      // interpreter invocations.  Only omit a constructor boundary when its
+      // complete initialization is already proven synchronous; otherwise a
+      // cold/deoptimized constructor may leave the caller suspended between
+      // `new`/`dup` and `invokespecial`, where replaying either side would
+      // change the operand stack.  The proof follows constant-pool targets
+      // and constructor bytecodes, independent of guest names.
+      // An unloaded target is not a stable rejection: the first interpreted
+      // invocation may load it and make the proof available to the next hot
+      // entry.
+      if (safeInitializationCalls === null) {
+        this.adaptiveCodegenDependencyPending.add(method);
+        this.adaptiveCodegenDependencyEpoch.set(
+          method, this.jvm.classEpoch || 0);
+      } else {
+        this.adaptiveCodegenDependencyPending.delete(method);
+        this.adaptiveCodegenDependencyEpoch.delete(method);
+        supportCache.set(method, false);
+      }
+      return false;
+    }
+    if (allowEffectfulCalls) {
+      this.adaptiveCodegenDependencyPending.delete(method);
+      this.adaptiveCodegenDependencyEpoch.delete(method);
     }
     if (!safeConstructor && !allowEffectfulCalls &&
         hasExperimentalControlFlow(codeItems) &&
@@ -1269,6 +1308,26 @@ class JitCompiler {
 
     supportCache.set(method, supported);
     return supported;
+  }
+
+  hasOnlyJitSafeInitializationCalls(codeItems) {
+    for (const item of codeItems || []) {
+      const instruction = item && item.instruction;
+      if (getOp(instruction) !== "invokespecial" ||
+          !Array.isArray(instruction.arg) ||
+          !Array.isArray(instruction.arg[2]) ||
+          instruction.arg[2][0] !== "<init>") continue;
+      const className = instruction.arg[1];
+      const descriptor = instruction.arg[2][1];
+      if (this.resolveSynchronousJreMethod(
+        className, className, "<init>", descriptor)) continue;
+      const classData = this.jvm.classes[className];
+      const constructor = classData &&
+        this.jvm.findMethod(classData, "<init>", descriptor);
+      if (!classData || !constructor) return null;
+      if (!this.isJitSafeConstructor(constructor)) return false;
+    }
+    return true;
   }
 
   isJitSafeConstructor(method, codeItems = this.getCodeItems(method)) {
@@ -3707,13 +3766,13 @@ class JitCompiler {
       case "if_acmpne": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
       case "athrow": return `throw stack[--sp];`;
       case "return":
-        return `helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
+        return `{ if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "generated return with active child" }; } helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() }; }`;
       case "areturn":
       case "ireturn":
       case "lreturn":
       case "freturn":
       case "dreturn":
-        return `{ const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
+        return `{ if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "generated return with active child" }; } const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
       default:
         return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
     }
@@ -4294,6 +4353,16 @@ class JitCompiler {
           if (Array.isArray(item) || ArrayBuffer.isView(item)) return `[${item.length}]`;
           return typeof item.type === "string" ? `<${item.type}>` : "<object>";
         };
+        const activeThread = this.jvm.threads[this.jvm.currentThreadIndex];
+        const callStack = activeThread?.callStack?.items || [];
+        const callers = callStack.slice(Math.max(0, callStack.length - 8))
+          .map((activeFrame) => ({
+            owner: scalar(activeFrame.className),
+            method: `${activeFrame.method && activeFrame.method.name || "<unknown>"}` +
+              `${activeFrame.method && activeFrame.method.descriptor || ""}`,
+            pc: activeFrame.pc,
+            locals: (activeFrame.locals || []).map(scalar),
+          }));
         console.error("[array-store-oob:jitted]", JSON.stringify({
           owner: scalar(frame.className),
           method: `${frame.method && frame.method.name}${frame.method && frame.method.descriptor || ""}`,
@@ -4301,6 +4370,7 @@ class JitCompiler {
           index: scalar(index),
           length: monoArray.len(arrayRef),
           locals: (frame.locals || []).map(scalar),
+          callers,
         }));
       }
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };

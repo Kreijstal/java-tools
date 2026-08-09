@@ -361,6 +361,63 @@ Lreturn:
 .end class
 `;
 
+const INVARIANT_CONDITIONAL_BACKEDGE_FANOUT = `.version 52 0
+.class public super InvariantConditionalBackedgeFanout
+.super java/lang/Object
+
+.field public static FLAG I
+
+.method public static fill : (I[I)[I
+    .code stack 4 locals 5
+        getstatic Field InvariantConditionalBackedgeFanout FLAG I
+        istore 4
+        iload_0
+        newarray int
+        astore_2
+        iconst_0
+        istore_3
+Lfill:
+        iload_3
+        iload_0
+        if_icmpge LafterFill
+        aload_2
+        iload_3
+        bipush 10
+        iastore
+        iinc 3 1
+        iload 4
+        ifne LafterFill
+        iload 4
+        ifeq Lfill
+        goto LafterFill
+Ldead:
+        aconst_null
+        athrow
+LafterFill:
+        aload_1
+        ifnull Lreturn
+        iconst_0
+        istore_3
+Lcopy:
+        iload_3
+        iload_0
+        if_icmpge Lreturn
+        aload_2
+        iload_3
+        aload_1
+        iload_3
+        iaload
+        iastore
+        iinc 3 1
+        goto Lcopy
+Lreturn:
+        aload_2
+        areturn
+    .end code
+.end method
+.end class
+`;
+
 function decompileFixture(tempDir, name, source) {
   const classFile = path.join(tempDir, `${name}.class`);
   assembleJasminSource(source, classFile);
@@ -412,6 +469,39 @@ test('multi-value operand-stack backedges retain their distinct CFG edges', (t) 
     t.equal(execFileSync('java', ['-cp', tempDir, 'MultiValueBackedgeRunner'],
       { encoding: 'utf8', timeout: 5000 }), '[1, 1, 1, 1]',
     'the recompiled loop increments and terminates with the original result');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('invariant conditional loop fanouts retain their exact CFG edges', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(),
+    'cfr-invariant-backedge-fanout-'));
+  try {
+    const source = decompileFixture(tempDir,
+      'InvariantConditionalBackedgeFanout',
+      INVARIANT_CONDITIONAL_BACKEDGE_FANOUT);
+    t.match(source, /while \(true\) \{\s*switch \(statePc\)/,
+      'two-stage invariant latches use the exact CFG state machine');
+
+    fs.writeFileSync(path.join(tempDir,
+      'InvariantConditionalBackedgeFanout.java'), source);
+    fs.writeFileSync(path.join(tempDir,
+      'InvariantConditionalBackedgeFanoutRunner.java'),
+    'import java.util.Arrays; public class InvariantConditionalBackedgeFanoutRunner {' +
+      'public static void main(String[] a) {' +
+      'System.out.print(Arrays.toString(InvariantConditionalBackedgeFanout.fill(3, null)));' +
+      'System.out.print(Arrays.toString(InvariantConditionalBackedgeFanout.fill(3, new int[]{1,2,3})));' +
+      '}}');
+    execFileSync('javac', ['-g:none', '-d', tempDir,
+      path.join(tempDir, 'InvariantConditionalBackedgeFanout.java'),
+      path.join(tempDir, 'InvariantConditionalBackedgeFanoutRunner.java')]);
+    t.equal(execFileSync('java', ['-cp', tempDir,
+      'InvariantConditionalBackedgeFanoutRunner'], {
+      encoding: 'utf8', timeout: 5000,
+    }), '[10, 10, 10][1, 2, 3]',
+    'the recompiled fanout preserves both loop bodies and their array target');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
