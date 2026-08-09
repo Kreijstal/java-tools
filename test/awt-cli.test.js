@@ -122,6 +122,41 @@ test('browser AWT input bridge translates DOM input for guest listeners', (t) =>
     t.end();
 });
 
+test('browser AWT input bridge scopes a concrete canvas to its Java component', (t) => {
+    const handlers = new Map();
+    const canvas = {
+        width: 320, height: 200, style: {},
+        addEventListener: (name, handler) => handlers.set(name, handler),
+        getBoundingClientRect: () => ({ left: 0, top: 0, width: 320, height: 200 }),
+        focus: () => {},
+    };
+    const calls = [];
+    const jvm = {
+        enqueueAwtEventInvocation: (listener, method, descriptor, event) =>
+            calls.push({ listener, method, descriptor, event }),
+    };
+    const firstListener = { type: 'FirstListener' };
+    const secondListener = { type: 'SecondListener' };
+    const first = { _visible: true, _canvasElement: canvas,
+        _listeners: { mouse: [firstListener] } };
+    const second = { _visible: true, _listeners: { mouse: [secondListener] } };
+    browserInput.registerInputComponent(jvm, first, 'mouse');
+    browserInput.registerInputComponent(jvm, second, 'mouse');
+    browserInput.attachBrowserInput(jvm, canvas, first);
+    handlers.get('mousedown')({
+        clientX: 12, clientY: 34, button: 0, buttons: 1, detail: 1,
+        shiftKey: false, ctrlKey: false, metaKey: false, altKey: false,
+        preventDefault() {},
+    });
+
+    t.equal(calls.length, 1, 'one concrete canvas dispatches only one component');
+    t.equal(calls[0].listener, firstListener,
+        'the event reaches the listener registered on the clicked component');
+    t.equal(jvm._awtFocusedComponent, first,
+        'mousedown focuses the Java component owning the concrete canvas');
+    t.end();
+});
+
 test('AWT framework - Component hierarchy', (t) => {
     const frame = new Frame('Test Frame');
     const canvas = new Canvas();

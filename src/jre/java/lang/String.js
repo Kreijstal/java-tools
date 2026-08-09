@@ -1,4 +1,7 @@
 const { withThrows } = require('../../helpers');
+const LongClass = require('./Long');
+const FloatClass = require('./Float');
+const DoubleClass = require('./Double');
 
 
 function fieldStringValue(obj, fieldName) {
@@ -170,6 +173,14 @@ module.exports = {
       const charStr = String.fromCharCode(charCode);
       return jvm.internString(charStr);
     },
+    "valueOf(I)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(String(args[0])),
+    "valueOf(J)Ljava/lang/String;": (jvm, obj, args) =>
+      LongClass.staticMethods['toString(J)Ljava/lang/String;'](jvm, null, args),
+    "valueOf(F)Ljava/lang/String;": (jvm, obj, args) =>
+      FloatClass.staticMethods['toString(F)Ljava/lang/String;'](jvm, null, args),
+    "valueOf(D)Ljava/lang/String;": (jvm, obj, args) =>
+      DoubleClass.staticMethods['toString(D)Ljava/lang/String;'](jvm, null, args),
+    "valueOf(Z)Ljava/lang/String;": (jvm, obj, args) => jvm.internString(args[0] ? 'true' : 'false'),
     "join(Ljava/lang/CharSequence;[Ljava/lang/CharSequence;)Ljava/lang/String;": (jvm, obj, args) => {
       const delimiter = stringValue(args[0]);
       const elements = Array.isArray(args[1]) ? args[1] : [];

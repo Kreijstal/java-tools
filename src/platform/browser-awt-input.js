@@ -36,7 +36,7 @@ function unregisterInputComponent(jvm, component, kind) {
 
 function focusInputComponent(jvm, component) {
   jvm._awtFocusedComponent = component;
-  const canvas = jvm._awtCanvasElement;
+  const canvas = component?._canvasElement || jvm._awtCanvasElement;
   if (canvas && typeof canvas.focus === 'function') canvas.focus({ preventScroll: true });
   component._focused = true;
 }
@@ -107,7 +107,11 @@ function keyEvent(source, id, event) {
   };
 }
 
-function targets(jvm, kind, focusedOnly = false) {
+function targets(jvm, kind, focusedOnly = false, source = null) {
+  if (source) {
+    return source._visible !== false && source._listeners?.[kind]?.length
+      ? [source] : [];
+  }
   if (focusedOnly && jvm._awtFocusedComponent?._listeners?.[kind]?.length) {
     return [jvm._awtFocusedComponent];
   }
@@ -115,8 +119,9 @@ function targets(jvm, kind, focusedOnly = false) {
     .filter(component => component && component._visible !== false);
 }
 
-function queueForComponents(jvm, kind, methodName, makeEvent, focusedOnly = false) {
-  for (const component of targets(jvm, kind, focusedOnly)) {
+function queueForComponents(jvm, kind, methodName, makeEvent, focusedOnly = false,
+  source = null) {
+  for (const component of targets(jvm, kind, focusedOnly, source)) {
     const event = makeEvent(component);
     for (const listener of component._listeners?.[kind] || []) {
       jvm.enqueueAwtEventInvocation(listener, methodName,
@@ -126,7 +131,7 @@ function queueForComponents(jvm, kind, methodName, makeEvent, focusedOnly = fals
   }
 }
 
-function attachBrowserInput(jvm, canvas) {
+function attachBrowserInput(jvm, canvas, source = null) {
   if (!canvas || canvas._jvmAwtInputAttached || typeof canvas.addEventListener !== 'function') return;
   canvas._jvmAwtInputAttached = true;
   canvas.tabIndex = 0;
@@ -134,12 +139,13 @@ function attachBrowserInput(jvm, canvas) {
 
   const mouse = (domName, kind, methodName, id) => canvas.addEventListener(domName, event => {
     if (domName === 'mousedown') {
-      const preferred = targets(jvm, 'key', false)[0] || targets(jvm, kind, false)[0];
+      const preferred = targets(jvm, 'key', false, source)[0] ||
+        targets(jvm, kind, false, source)[0];
       if (preferred) focusInputComponent(jvm, preferred);
       else canvas.focus({ preventScroll: true });
     }
     queueForComponents(jvm, kind, methodName,
-      component => mouseEvent(canvas, component, id, event));
+      component => mouseEvent(canvas, component, id, event), false, source);
     event.preventDefault();
   });
   mouse('mousedown', 'mouse', 'mousePressed', 501);
@@ -150,7 +156,8 @@ function attachBrowserInput(jvm, canvas) {
   canvas.addEventListener('mousemove', event => {
     const dragged = event.buttons !== 0;
     queueForComponents(jvm, 'mouseMotion', dragged ? 'mouseDragged' : 'mouseMoved',
-      component => mouseEvent(canvas, component, dragged ? 506 : 503, event));
+      component => mouseEvent(canvas, component, dragged ? 506 : 503, event),
+      false, source);
     event.preventDefault();
   });
   canvas.addEventListener('wheel', event => {
@@ -160,30 +167,32 @@ function attachBrowserInput(jvm, canvas) {
       wheelRotation: event.deltaY === 0 ? 0 : event.deltaY > 0 ? 1 : -1,
       preciseWheelRotation: event.deltaY,
       scrollAmount: 1,
-    }));
+    }), false, source);
     event.preventDefault();
   }, { passive: false });
   canvas.addEventListener('keydown', event => {
     queueForComponents(jvm, 'key', 'keyPressed',
-      component => keyEvent(component, 401, event), true);
+      component => keyEvent(component, 401, event), true, source);
     if (keyChar(event) !== 0xffff) {
       queueForComponents(jvm, 'key', 'keyTyped',
-        component => keyEvent(component, 400, event), true);
+        component => keyEvent(component, 400, event), true, source);
     }
     event.preventDefault();
   });
   canvas.addEventListener('keyup', event => {
     queueForComponents(jvm, 'key', 'keyReleased',
-      component => keyEvent(component, 402, event), true);
+      component => keyEvent(component, 402, event), true, source);
     event.preventDefault();
   });
   canvas.addEventListener('focus', event => {
     queueForComponents(jvm, 'focus', 'focusGained', component =>
-      baseInputEvent('java/awt/event/FocusEvent', component, 1004, event), true);
+      baseInputEvent('java/awt/event/FocusEvent', component, 1004, event), true,
+      source);
   });
   canvas.addEventListener('blur', event => {
     queueForComponents(jvm, 'focus', 'focusLost', component =>
-      baseInputEvent('java/awt/event/FocusEvent', component, 1005, event), true);
+      baseInputEvent('java/awt/event/FocusEvent', component, 1005, event), true,
+      source);
     if (jvm._awtFocusedComponent) jvm._awtFocusedComponent._focused = false;
   });
   canvas.addEventListener('contextmenu', event => event.preventDefault());

@@ -68,7 +68,13 @@ class JitCompiler {
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
     this.codegenSupportCache = new WeakMap();
+    this.structuredConstructorRetryState = new WeakMap();
+    this.structuredConstructorUpgradePending = new WeakSet();
+    this.structuredConstructorUpgradeCount = 0;
+    this.lastStructuredConstructorUpgrade = null;
     this.adaptiveCodegenSupportCache = new WeakMap();
+    this.adaptiveCodegenDependencyPending = new WeakSet();
+    this.adaptiveCodegenDependencyEpoch = new WeakMap();
     this.adaptiveCodegenMethods = new WeakSet();
     this.adaptiveCodegenCounts = new WeakMap();
     this.adaptiveCodegenFrameHeat = new WeakMap();
@@ -465,6 +471,9 @@ class JitCompiler {
         !this.isSupported(frame.method);
       if (codegenEligible) canRunGenerated = this.canRun(frame, true);
     }
+    if (this.adaptiveCodegenDependencyPending.has(frame.method)) {
+      awaitingAdaptivePromotion = true;
+    }
     // Structural rejection and permanent deoptimization are method-stable.
     // Remember them on the frame so interpreted bytecodes do not repeat the
     // full JS-JIT policy check on every scheduler tick. The Wasm tier still
@@ -769,7 +778,37 @@ class JitCompiler {
       return null;
     }
     if (this.codegenCache.has(method)) {
-      return this.codegenCache.get(method);
+      const cached = this.codegenCache.get(method);
+      // A loop constructor can first execute while one of its call/static
+      // dependencies is still initializing. Structured SSA correctly
+      // declines that cold compilation, but the baseline body must not become
+      // a permanent ceiling after all dependencies resolve. Some protected
+      // methods deliberately retain their baseline Frame entry while exposing
+      // a structured positional entry to verified callers. Either entry is a
+      // useful upgrade over a cold baseline, so retry until one is available.
+      // Retries are bounded and exponentially spaced.
+      if (cached && !cached.jvmStructuredSsa &&
+          !cached.jvmRestoringDirectPositionalBody &&
+          this.structuredSsa.enabled &&
+          this.isJitSafeConstructor(method) && this.hasBackwardBranch(method) &&
+          !this.codegenCompiling.has(method)) {
+        const count = this.invocationCounts.get(method) || 0;
+        const state = this.structuredConstructorRetryState.get(method) || {
+          next: Math.max(8, this.warmupThreshold),
+          delay: 8,
+          attempts: 0,
+        };
+        if (count >= state.next && state.attempts < 16) {
+          this.scheduleStructuredCacheUpgrade(method, cached);
+          state.attempts += 1;
+          state.delay = Math.min(8192, Math.max(8, state.delay * 4));
+          state.next = count + state.delay;
+          this.structuredConstructorRetryState.set(method, state);
+        } else {
+          this.structuredConstructorRetryState.set(method, state);
+        }
+      }
+      return cached;
     }
     if (this.codegenCompiling.has(method)) return null;
     this.codegenCompiling.add(method);
@@ -1129,6 +1168,12 @@ class JitCompiler {
     if (supportCache.has(method)) {
       return supportCache.get(method);
     }
+    if (allowEffectfulCalls &&
+        this.adaptiveCodegenDependencyPending.has(method) &&
+        this.adaptiveCodegenDependencyEpoch.get(method) ===
+          (this.jvm.classEpoch || 0)) {
+      return false;
+    }
 
     const code = method.attributes.find((attr) => attr.type === "code");
     if (!code) {
@@ -1150,9 +1195,38 @@ class JitCompiler {
       supportCache.set(method, false);
       return false;
     }
-    if (!allowEffectfulCalls && hasExperimentalControlFlow(codeItems) &&
-      !this.experimentalControlFlow &&
-      !this.hasJitSafeControlFlow(method, codeItems)) {
+    const safeInitializationCalls = !safeConstructor && allowEffectfulCalls
+      ? this.hasOnlyJitSafeInitializationCalls(codeItems) : true;
+    if (safeInitializationCalls !== true) {
+      // Adaptive compilation can start after an arbitrary number of
+      // interpreter invocations.  Only omit a constructor boundary when its
+      // complete initialization is already proven synchronous; otherwise a
+      // cold/deoptimized constructor may leave the caller suspended between
+      // `new`/`dup` and `invokespecial`, where replaying either side would
+      // change the operand stack.  The proof follows constant-pool targets
+      // and constructor bytecodes, independent of guest names.
+      // An unloaded target is not a stable rejection: the first interpreted
+      // invocation may load it and make the proof available to the next hot
+      // entry.
+      if (safeInitializationCalls === null) {
+        this.adaptiveCodegenDependencyPending.add(method);
+        this.adaptiveCodegenDependencyEpoch.set(
+          method, this.jvm.classEpoch || 0);
+      } else {
+        this.adaptiveCodegenDependencyPending.delete(method);
+        this.adaptiveCodegenDependencyEpoch.delete(method);
+        supportCache.set(method, false);
+      }
+      return false;
+    }
+    if (allowEffectfulCalls) {
+      this.adaptiveCodegenDependencyPending.delete(method);
+      this.adaptiveCodegenDependencyEpoch.delete(method);
+    }
+    if (!safeConstructor && !allowEffectfulCalls &&
+        hasExperimentalControlFlow(codeItems) &&
+        !this.experimentalControlFlow &&
+        !this.hasJitSafeControlFlow(method, codeItems)) {
       supportCache.set(method, false);
       return false;
     }
@@ -1236,6 +1310,26 @@ class JitCompiler {
     return supported;
   }
 
+  hasOnlyJitSafeInitializationCalls(codeItems) {
+    for (const item of codeItems || []) {
+      const instruction = item && item.instruction;
+      if (getOp(instruction) !== "invokespecial" ||
+          !Array.isArray(instruction.arg) ||
+          !Array.isArray(instruction.arg[2]) ||
+          instruction.arg[2][0] !== "<init>") continue;
+      const className = instruction.arg[1];
+      const descriptor = instruction.arg[2][1];
+      if (this.resolveSynchronousJreMethod(
+        className, className, "<init>", descriptor)) continue;
+      const classData = this.jvm.classes[className];
+      const constructor = classData &&
+        this.jvm.findMethod(classData, "<init>", descriptor);
+      if (!classData || !constructor) return null;
+      if (!this.isJitSafeConstructor(constructor)) return false;
+    }
+    return true;
+  }
+
   isJitSafeConstructor(method, codeItems = this.getCodeItems(method)) {
     if (!method || method.name !== "<init>" ||
         (method.flags || []).includes("static") ||
@@ -1243,12 +1337,16 @@ class JitCompiler {
       return false;
     }
     const code = method.attributes.find((attribute) => attribute.type === "code");
-    if (!code || (code.code.exceptionTable || []).length !== 0) return false;
+    if (!code) return false;
+    const exceptionTable = code.code.exceptionTable || [];
+    if (exceptionTable.length &&
+        !this.hasOnlyNoOpExceptionHandlers(method, codeItems)) return false;
 
     // The only constructor call may initialize this object through its direct
     // superclass. This deliberately excludes allocation/initialization of
-    // nested objects, this(...) chains, and try/finally construction shapes.
-    // Those retain the canonical interpreter path.
+    // nested objects, this(...) chains, and effectful recovery/finally
+    // construction shapes. Bare or wrap-and-rethrow diagnostic handlers are
+    // admitted by the proof above because they do not alter normal flow.
     const instructions = codeItems
       .map((item) => item && item.instruction)
       .filter(Boolean);
@@ -1539,16 +1637,8 @@ class JitCompiler {
         // frame PCs. This split is structural and independent of guest names.
         const baseline = this.compileBaselineMethod(method, inlineLoopRegions);
         if (baseline) {
-          baseline.jvmStructuredPositionalOnly = true;
-          baseline.jvmRestoringDirectPositionalBody =
-            structuredSsa.jvmRestoringDirectPositionalBody;
-          baseline.jvmRestoringDirectPositionalSource =
-            structuredSsa.jvmRestoringDirectPositionalSource;
-          if (structuredSsa.jvmRestoringDirectPositionalPlan) {
-            baseline.jvmRestoringDirectPositionalPlan =
-              structuredSsa.jvmRestoringDirectPositionalPlan;
-          }
-          return baseline;
+          return this.attachStructuredPositionalEntry(
+            baseline, structuredSsa);
         }
       }
       return this.withResumeBody(structuredSsa, method);
@@ -1571,6 +1661,67 @@ class JitCompiler {
     if (stackless) return this.withResumeBody(stackless, method);
 
     return this.compileBaselineMethod(method, inlineLoopRegions);
+  }
+
+  attachStructuredPositionalEntry(baseline, structured) {
+    if (!baseline || !structured?.jvmRestoringDirectPositionalBody) {
+      return baseline;
+    }
+    baseline.jvmStructuredPositionalOnly = true;
+    baseline.jvmRestoringDirectPositionalBody =
+      structured.jvmRestoringDirectPositionalBody;
+    baseline.jvmRestoringDirectPositionalSource =
+      structured.jvmRestoringDirectPositionalSource;
+    if (structured.jvmRestoringDirectPositionalPlan) {
+      baseline.jvmRestoringDirectPositionalPlan =
+        structured.jvmRestoringDirectPositionalPlan;
+    }
+    return baseline;
+  }
+
+  scheduleStructuredCacheUpgrade(method, cached) {
+    if (this.structuredConstructorUpgradePending.has(method)) return;
+    this.structuredConstructorUpgradePending.add(method);
+    const upgrade = () => {
+      this.structuredConstructorUpgradePending.delete(method);
+      if (this.codegenCache.get(method) !== cached ||
+          this.codegenCompiling.has(method)) return;
+      this.codegenCompiling.add(method);
+      try {
+        const structured = this.structuredSsa.compile(method);
+        this.lastStructuredConstructorUpgrade = {
+          structured: Boolean(structured?.jvmStructuredSsa),
+          direct: Boolean(structured?.jvmDirectPositionalBody),
+          positional: Boolean(structured?.jvmRestoringDirectPositionalBody),
+          requiresBaseline: Boolean(
+            structured?.jvmStructuredRequiresBaselineFramedEntry),
+          rejection: this.structuredSsa.lastRejectionReason || null,
+          restoringRejection:
+            structured?.jvmStructuredRestoringDirectRejection || null,
+          astRejections:
+            structured?.jvmStructuredPositionalAstRejections || [],
+          error: this.structuredSsa.lastCompileError
+            ? String(this.structuredSsa.lastCompileError.message ||
+              this.structuredSsa.lastCompileError) : null,
+        };
+        const upgraded = structured?.jvmStructuredRequiresBaselineFramedEntry
+          ? this.attachStructuredPositionalEntry(cached, structured)
+          : structured ? this.withResumeBody(structured, method) : null;
+        if (upgraded?.jvmStructuredSsa ||
+            upgraded?.jvmRestoringDirectPositionalBody) {
+          this.codegenCache.set(method, upgraded);
+          this.structuredConstructorRetryState.delete(method);
+          this.structuredConstructorUpgradeCount += 1;
+        }
+      } catch (error) {
+        this.codegenCompileErrors.set(method, error);
+      } finally {
+        this.codegenCompiling.delete(method);
+      }
+    };
+    if (typeof setTimeout === "function") setTimeout(upgrade, 0);
+    else if (typeof queueMicrotask === "function") queueMicrotask(upgrade);
+    else Promise.resolve().then(upgrade);
   }
 
   compileInlinePrimitiveLoopRegions(method) {
@@ -2507,6 +2658,7 @@ class JitCompiler {
         } else if (op === "invokestatic") {
           const plan = inlinePlans.get(index);
           if (plan) {
+            const callStack = [...expressions];
             const args = new Array(plan.paramCount);
             for (let argument = args.length - 1; argument >= 0; argument -= 1) {
               args[argument] = pop();
@@ -2518,6 +2670,14 @@ class JitCompiler {
               (_match, argument) => `(${args[Number(argument)]})`);
             body.push(`let ${result};`, "{");
             body.push(...plan.statements.map(substitute));
+            if (plan.guards?.length) {
+              const guard = plan.guards.map((condition) =>
+                `(${substitute(condition)})`).join(" && ");
+              body.push(`if (!(${guard})) {`,
+                ...materialize(callStack, index),
+                "helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'guarded scalar integer inline' };",
+                "}");
+            }
             body.push(`${result} = ${substitute(plan.result)};`, "}");
             expressions.push(result);
           } else {
@@ -3570,10 +3730,18 @@ class JitCompiler {
           if (directInline) {
             this.compileDirectInlineCount += 1;
             const base = `inlineBase${this.compileDirectInlineCount}`;
+            const substituteBase = (source) => source.split("base").join(base);
             const statements = directInline.statements
-              .map((line) => line.split("base").join(base)).join(" ");
-            const result = directInline.result.split("base").join(base);
-            return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
+              .map(substituteBase).join(" ");
+            const result = substituteBase(directInline.result);
+            const guard = directInline.guards?.length
+              ? directInline.guards.map((condition) =>
+                `(${substituteBase(condition)})`).join(" && ")
+              : null;
+            const guardFailure = guard
+              ? `if (!(${guard})) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "guarded direct integer inline" }; }`
+              : "";
+            return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} ${guardFailure} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
           }
           const callSiteId = this.registerSyncCallSite(op, instruction);
           return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
@@ -3598,13 +3766,13 @@ class JitCompiler {
       case "if_acmpne": return `{ const b = stack[--sp]; const a = stack[--sp]; if (a !== b) pc = ${target(instruction.arg)}; else pc = ${next}; } break;`;
       case "athrow": return `throw stack[--sp];`;
       case "return":
-        return `helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() };`;
+        return `{ if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "generated return with active child" }; } helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: helpers.returnVoid() }; }`;
       case "areturn":
       case "ireturn":
       case "lreturn":
       case "freturn":
       case "dreturn":
-        return `{ const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
+        return `{ if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "generated return with active child" }; } const ret = stack[--sp]; helpers.materializeCached(frame, locals, stack, sp, ${next}); thread.callStack.pop(); return { returned: true, value: ret }; }`;
       default:
         return `helpers.materializeCached(frame, locals, stack, sp, ${index}); return { deopt: true, reason: "unsupported generated opcode ${op}" };`;
     }
@@ -4185,6 +4353,16 @@ class JitCompiler {
           if (Array.isArray(item) || ArrayBuffer.isView(item)) return `[${item.length}]`;
           return typeof item.type === "string" ? `<${item.type}>` : "<object>";
         };
+        const activeThread = this.jvm.threads[this.jvm.currentThreadIndex];
+        const callStack = activeThread?.callStack?.items || [];
+        const callers = callStack.slice(Math.max(0, callStack.length - 8))
+          .map((activeFrame) => ({
+            owner: scalar(activeFrame.className),
+            method: `${activeFrame.method && activeFrame.method.name || "<unknown>"}` +
+              `${activeFrame.method && activeFrame.method.descriptor || ""}`,
+            pc: activeFrame.pc,
+            locals: (activeFrame.locals || []).map(scalar),
+          }));
         console.error("[array-store-oob:jitted]", JSON.stringify({
           owner: scalar(frame.className),
           method: `${frame.method && frame.method.name}${frame.method && frame.method.descriptor || ""}`,
@@ -4192,6 +4370,7 @@ class JitCompiler {
           index: scalar(index),
           length: monoArray.len(arrayRef),
           locals: (frame.locals || []).map(scalar),
+          callers,
         }));
       }
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
@@ -6991,13 +7170,13 @@ class JitCompiler {
       args[index] = `stack[base + ${index}]`;
     }
     const state = {
-      active: new Set(), statements: [], nextTemp: 0,
+      active: new Set(), declarations: [], statements: [], nextTemp: 0,
       instructionCount: 0, methodCount: 0, guards: [],
     };
     const result = this.emitInlineIntegerMethod(method, params, returnType, args, state, 0);
     if (result === null) return null;
     const plan = {
-      statements: state.statements,
+      statements: [...state.declarations, ...state.statements],
       result,
       receiverSlots,
       inputCount: args.length,
@@ -7054,7 +7233,8 @@ class JitCompiler {
     const pop = () => stack.length ? stack.pop() : null;
     const materialize = (expression) => {
       const temporary = `inlineValue${state.nextTemp++}`;
-      state.statements.push(`const ${temporary} = ${expression};`);
+      state.declarations.push(`let ${temporary};`);
+      state.statements.push(`${temporary} = ${expression};`);
       return temporary;
     };
     const binary = (format) => {
@@ -7069,7 +7249,8 @@ class JitCompiler {
       const rangePop = () => rangeStack.length ? rangeStack.pop() : null;
       const rangeMaterialize = (expression) => {
         const temporary = `inlineValue${state.nextTemp++}`;
-        statements.push(`const ${temporary} = ${expression};`);
+        state.declarations.push(`let ${temporary};`);
+        statements.push(`${temporary} = ${expression};`);
         return temporary;
       };
       const rangeBinary = (format) => {
@@ -7207,7 +7388,8 @@ class JitCompiler {
             if (before === after) return true;
             if (before === undefined || after === undefined) return false;
             const phi = `inlineValue${state.nextTemp++}`;
-            state.statements.push(`let ${phi} = ${before};`);
+            state.declarations.push(`let ${phi};`);
+            state.statements.push(`${phi} = ${before};`);
             phis.push(`${phi} = ${after};`);
             assign(phi);
             return true;

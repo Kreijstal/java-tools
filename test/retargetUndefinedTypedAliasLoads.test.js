@@ -160,3 +160,54 @@ test('skips undefined array load when compatible parameter is ambiguous', (t) =>
   t.deepEqual(code.codeItems[0].instruction, { op: 'aload', arg: '8' });
   t.end();
 });
+
+test('does not replace a merge-local array with a compatible parameter', (t) => {
+  const method = {
+    flags: [],
+    descriptor: '(Z[I)V',
+  };
+  const code = {
+    codeItems: [
+      { instruction: 'iload_1' },
+      { instruction: { op: 'ifeq', arg: 'Lright' } },
+      { instruction: 'iconst_1' },
+      { instruction: { op: 'newarray', arg: 'int' } },
+      { instruction: { op: 'astore', arg: '22' } },
+      { instruction: { op: 'goto', arg: 'Ljoin' } },
+      { labelDef: 'Lright:', instruction: 'iconst_1' },
+      { instruction: { op: 'newarray', arg: 'int' } },
+      { instruction: { op: 'astore', arg: '22' } },
+      { labelDef: 'Ljoin:', instruction: { op: 'aload', arg: '22' } },
+      { instruction: 'iconst_0' },
+      { instruction: { op: 'bipush', arg: '10' } },
+      { instruction: 'iastore' },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(rewriteCode(code, method), 0);
+  t.deepEqual(code.codeItems[9].instruction, { op: 'aload', arg: '22' });
+  t.end();
+});
+
+test('does not treat the reference value of aastore as an array parameter alias', (t) => {
+  const method = {
+    flags: ['static'],
+    descriptor: '([Lvl;BLvl;Z)V',
+  };
+  const code = {
+    codeItems: [
+      { instruction: { op: 'aload', arg: '5' } },
+      { instruction: { op: 'iload', arg: '6' } },
+      { instruction: { op: 'aload', arg: '7' } },
+      { instruction: 'aastore' },
+      { instruction: 'return' },
+    ],
+    exceptionTable: [],
+  };
+
+  t.equal(rewriteCode(code, method), 0);
+  t.deepEqual(code.codeItems[2].instruction, { op: 'aload', arg: '7' });
+  t.end();
+});

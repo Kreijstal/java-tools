@@ -29,6 +29,140 @@ const awt = require('../src/platform/awt');
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
 
+test('operand-stack clearing preserves generated backing-array aliases', (t) => {
+  const stack = new Stack();
+  const generatedAlias = stack.items;
+  stack.push(17);
+  stack.clear();
+  const exception = {type: 'java/lang/RuntimeException'};
+  stack.push(exception);
+
+  t.equal(stack.items, generatedAlias,
+    'exception dispatch clears the existing backing array');
+  t.deepEqual(generatedAlias, [exception],
+    'a live generated caller observes the caught exception operand');
+  t.end();
+});
+
+test('generated returns retain a parent while a child Frame is active', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedReturnGuardHarness', `
+public class GeneratedReturnGuardHarness {
+  public static int value() { return 7; }
+}
+`);
+  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  await jvm.loadClassByName('GeneratedReturnGuardHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'GeneratedReturnGuardHarness', 'value', '()I');
+  const generated = jvm.jit.compileBaselineMethod(method);
+  const frame = new Frame(method);
+  frame.className = 'GeneratedReturnGuardHarness';
+  const activeChild = new Frame(method);
+  activeChild.className = 'GeneratedReturnGuardHarness';
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null,
+    callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  thread.callStack.push(activeChild);
+
+  const suspended = generated(frame, thread, jvm.jit, false);
+  t.ok(suspended?.deopt && suspended.transient,
+    'the generated return suspends instead of popping another Frame');
+  t.equal(suspended?.reason, 'generated return with active child',
+    'the suspension reports the structural call-stack invariant');
+  t.deepEqual(thread.callStack.items, [frame, activeChild],
+    'both the returning parent and active child remain scheduler-visible');
+
+  thread.callStack.pop();
+  const completed = generated(frame, thread, jvm.jit, false);
+  t.ok(completed?.returned, 'the parent returns after its child retires');
+  t.equal(completed?.value, 7, 'the replayed return preserves its operand');
+  t.equal(thread.callStack.size(), 0, 'the parent removes only its own Frame');
+  t.end();
+});
+
+test('structured returns materialize instead of retiring an active child', async (t) => {
+  const classpath = compileJavaFixture(t, 'StructuredReturnGuardHarness', `
+public class StructuredReturnGuardHarness {
+  public static int value() { return 11; }
+}
+`);
+  const jvm = new JVM({classpath, jit: {
+    warmupThreshold: 0, structuredSsa: true,
+  }});
+  await jvm.loadClassByName('StructuredReturnGuardHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredReturnGuardHarness', 'value', '()I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the fixture uses the structured return implementation');
+  const frame = new Frame(method);
+  frame.className = 'StructuredReturnGuardHarness';
+  const activeChild = new Frame(method);
+  activeChild.className = 'StructuredReturnGuardHarness';
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null,
+    callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  thread.callStack.push(activeChild);
+
+  const suspended = generated(frame, thread, jvm.jit, false);
+  t.ok(suspended?.deopt && suspended.transient,
+    'the structured return suspends while another Frame is active');
+  t.equal(suspended?.reason, 'structured SSA return with active child',
+    'the structural invariant selects the canonical fallback');
+  t.deepEqual(thread.callStack.items, [frame, activeChild],
+    'the structured return does not pop the child Frame');
+  t.equal(frame.pc, 1, 'the parent resumes at its return bytecode');
+  t.deepEqual(frame.stack.items, [11],
+    'the return operand is reconstructed for canonical execution');
+  t.end();
+});
+
+test('structured deoptimization preserves block-local stores', async (t) => {
+  const classpath = compileJavaFixture(t, 'StructuredLocalSpillHarness', `
+public class StructuredLocalSpillHarness {
+  public static int value(Object input, int[] absent) {
+    Object retained = input;
+    int length = absent.length;
+    return retained == null ? length + 1 : length;
+  }
+}
+`);
+  const jvm = new JVM({classpath, jit: {
+    warmupThreshold: 0, structuredSsa: true,
+  }});
+  await jvm.loadClassByName('StructuredLocalSpillHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredLocalSpillHarness', 'value', '(Ljava/lang/Object;[I)I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the fixture uses structured local value numbering');
+  const retained = {type: 'java/lang/Object', fields: {}};
+  const frame = new Frame(method);
+  frame.className = 'StructuredLocalSpillHarness';
+  frame.locals[0] = retained;
+  frame.locals[1] = null;
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null,
+    callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  let thrown = null;
+  try {
+    generated(frame, thread, jvm.jit, false);
+  } catch (error) {
+    thrown = error;
+  }
+  t.equal(thrown?.type, 'java/lang/NullPointerException',
+    'the later throwing operation follows canonical JVM semantics');
+  t.equal(frame.locals[2], retained,
+    'a same-block local needed after the throw is present in the Frame');
+  t.end();
+});
+
 test('Wasm Math imports preserve exact Java long semantics', (t) => {
   const abs = mathIntrinsicFunction('abs', '(J)J');
   const max = mathIntrinsicFunction('max', '(JJ)J');
@@ -4333,7 +4467,7 @@ public final class NestedRasterShape {
   t.ok(/if \(!\(ssaRuntimeCoarseLoop\d+ && ssaArrayRangeGuard\d+\)\)/.test(source) &&
       source.includes("reason: 'structured SSA range guard'"),
     'the call-free inner pixel loop deopts before its range-proven fast arm');
-  const pollCount = (source.match(/--safePointBudget === 0/g) || []).length;
+  const pollCount = (source.match(/--safePointBudget <= 0/g) || []).length;
   t.equal(generated.jvmStructuredRestoringCoarseLoopDeoptCount, 1,
     'the helper-containing outer loop versions its trip-count proof');
   t.ok(source.includes("reason: 'structured SSA coarse loop guard'") &&
@@ -5806,6 +5940,55 @@ function structuredSsaJoinMethod() {
   };
 }
 
+function invertedCountedLoopMethod() {
+  const instructions = [
+    'iconst_0', 'istore_1', 'iload_1', 'iload_0',
+    { op: 'if_icmplt', arg: 'Lbody' },
+    'iload_1', 'ireturn',
+    { op: 'iinc', varnum: 1, incr: 1 },
+    { op: 'goto', arg: 'Lheader' },
+  ];
+  return {
+    name: 'invertedCountedLoop', descriptor: '(I)I',
+    flags: ['public', 'static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: instructions.map((instruction, index) => ({
+        labelDef: index === 2 ? 'Lheader:' :
+          index === 7 ? 'Lbody:' : `L${index}:`,
+        instruction,
+      })),
+      localsSize: '2', stackSize: '2', exceptionTable: [],
+    } }],
+  };
+}
+
+test('structured SSA recognizes javac inverted counted-loop layout', (t) => {
+  const jvm = new JVM({ jit: {
+    structuredSsa: true,
+    structuredAtomicBoundedLoops: false,
+    profileMethods: false,
+  } });
+  const method = invertedCountedLoopMethod();
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the structurally inverted loop selects structured SSA');
+  t.equal(generated.jvmStructuredCountedLoopCount, 1,
+    'the taken-body/fallthrough-exit layout retains its induction proof');
+  t.ok(generated.jvmStructuredSource.includes('while (local1 < local0)') &&
+      !generated.jvmStructuredSource.includes('if (ssaValue'),
+    'the inverted header canonicalizes to one ordinary counted loop');
+
+  const frame = new Frame(method);
+  frame.locals[0] = 17;
+  const callStack = new Stack();
+  callStack.push(frame);
+  const result = generated(frame,
+    { status: 'runnable', callStack }, jvm.jit, false);
+  t.deepEqual(result, { returned: true, value: 17 },
+    'the canonical loop preserves the original taken-body semantics');
+  t.end();
+});
+
 test('structured JVM SSA feeds operand values across block joins', (t) => {
   const jvm = new JVM({ jit: { structuredSsa: true, profileMethods: false } });
   const method = structuredSsaJoinMethod();
@@ -6468,9 +6651,68 @@ public class ArbitraryAssetWork {
     'effectful methods do not hide a large inner loop behind an outer poll');
   t.ok(generated.jvmStructuredSafePointBudget < 10000,
     'verified per-iteration work scales the scheduler polling interval');
+  t.equal(generated.jvmAdaptivePositionalBody, null,
+    'call-bearing continuations stay on the Frame-backed resume ABI');
   t.notOk(generated.jvmStructuredSource.includes(
     'if (helpers.continueStructuredQuantum(thread)) { safePointBudget = 10000;'),
   'generated source does not retain the old fixed 10k-backedge deadline check');
+  t.end();
+});
+
+test('a coarse loop does not shrink unrelated later loop budgets', async (t) => {
+  const className = 'SequentialLoopBudgetShape';
+  const classpath = compileJavaFixture(t, className, `
+public final class SequentialLoopBudgetShape {
+  static int publish(int value) { return value ^ 0x55aa; }
+  static int work(int count) {
+    int value = 0;
+    for (int pass = 0; pass < 1; pass++) {
+      for (int index = 0; index < 256; index++) value += index;
+    }
+    for (int index = 0; index < count; index++) value = publish(value + index);
+    return value;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, structuredSsa: true, profileMethods: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'work', '(I)I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  const source = generated?.jvmStructuredSource || '';
+  t.ok(generated?.jvmStructuredSsa,
+    'the sequential nested/effectful loop shape selects structured SSA');
+  t.ok(generated.jvmStructuredCoarseCountedLoopCount >= 1,
+    'the fixed inner arithmetic loop is admitted as a coarse loop');
+  t.ok(generated.jvmStructuredSafePointBudget >= 64,
+    'the shared budget is not globally divided by the coarse trip count');
+  t.ok(source.includes('safePointBudget -= 256;'),
+    'the admitted loop charges its own verified trip count once');
+  t.ok(source.includes('--safePointBudget <= 0'),
+    'the later effectful loop observes a coarse charge crossing zero');
+
+  const thread = {
+    id: 0, name: 'sequential-loop-budget',
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  jvm._nextEventLoopYieldAt = Number.POSITIVE_INFINITY;
+  const frame = new Frame(method);
+  frame.className = className;
+  frame.locals[0] = 3;
+  thread.callStack.push(frame);
+  const result = generated(frame, thread, jvm.jit, false);
+  let expected = 32640;
+  for (let index = 0; index < 3; index += 1) {
+    expected = (expected + index) ^ 0x55aa;
+  }
+  t.ok(result?.returned, 'the complete generated invocation returns inline');
+  t.equal(result?.value, expected | 0,
+    'coarse accounting preserves the Java result');
   t.end();
 });
 
@@ -6976,9 +7218,7 @@ public final class StructuredAliasFallbackHarness {
     int value;
     void read(Reader reader) { value = reader.next(); }
   }
-
   Box box;
-
   void decode(Reader reader) {
     box = new Box();
     box.read(reader);
@@ -7002,12 +7242,12 @@ public final class StructuredAliasFallbackHarness {
     className, 'decode', `(L${className}$Reader;)V`);
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa,
-    'the constructor/call sequence compiles through structured SSA');
+    'the constructor and deferred call compile through structured SSA');
   t.ok(generated.jvmStructuredCoalescedSsaCopyCount >= 1,
-    'bytecode stack copies are coalesced without a guest identity rule');
+    'bytecode stack copies are coalesced without guest identity rules');
   t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
     generated.jvmStructuredSource), [],
-  'ordinary, asynchronous, deopt, and scheduler-yield edges bind every SSA value');
+  'ordinary, asynchronous, deopt, and yield edges bind every SSA value');
 
   const rejected = structuredRendererTest.unboundGeneratedSsaIdentifiers([
     'const ssaValue0 = 1;',
@@ -7025,7 +7265,52 @@ public final class StructuredAliasFallbackHarness {
     'ssaValue0 = ssaValue1;',
   ].join('\n'));
   t.deepEqual(outOfScope, ['ssaValue1'],
-    'the AST scope graph rejects a declaration moved into a nested block');
+    'the AST scope graph rejects nested declarations used from outer scope');
+
+  const escapedInlineResult = [
+    'let ssaValue13;',
+    '{',
+    '  let inlineValue0;',
+    '  inlineValue0 = 7;',
+    '  ssaValue13 = inlineValue0;',
+    '}',
+    'helpers.consume(ssaValue13);',
+  ].join('\n');
+  t.equal(structuredRendererTest.sinkSingleAssignmentSsaDeclarations(
+    escapedInlineResult), escapedInlineResult,
+  'const sinking keeps an inlined result visible to its outer consumer');
+  const localResult = [
+    'let ssaValue14;',
+    '{',
+    '  ssaValue14 = 9;',
+    '  helpers.consume(ssaValue14);',
+    '}',
+  ].join('\n');
+  const sunkLocalResult = structuredRendererTest
+    .sinkSingleAssignmentSsaDeclarations(localResult);
+  t.notOk(sunkLocalResult.includes('let ssaValue14;'),
+    'the AST transform removes a declaration whose uses stay in the block');
+  t.ok(sunkLocalResult.includes('const ssaValue14 = 9;'),
+    'the definition becomes a block-local const');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    sunkLocalResult), [], 'the sunk declaration remains lexically valid');
+
+  const guardedEscapedResult = [
+    'let ssaValue54;',
+    'if (helpers.guard()) {',
+    '  {',
+    '    const inlineValue1 = 11;',
+    '    ssaValue54 = inlineValue1;',
+    '  }',
+    '}',
+    'if (ssaValue54 !== undefined) helpers.consume(ssaValue54);',
+  ].join('\n');
+  t.equal(structuredRendererTest.sinkSingleAssignmentSsaDeclarations(
+    guardedEscapedResult), guardedEscapedResult,
+  'conditional inline results remain declared outside their defining branch');
+  t.deepEqual(structuredRendererTest.unboundGeneratedSsaIdentifiers(
+    guardedEscapedResult), [],
+  'the Safari-style missing-variable shape remains lexically bound');
   t.end();
 });
 
@@ -8786,6 +9071,16 @@ class DirectIntegerLeafTarget {
   static int transform(int value) {
     return ((value + 7) * 3) ^ (value >>> 5);
   }
+  static int guarded(int value) {
+    if ((value & 63) == 63) return "abc".length() + value;
+    return value * 3;
+  }
+  static int scopedGuarded(int value) {
+    int selected = value;
+    if ((value & 1) != 0) selected = (value + 5) * 3;
+    if ((selected & 63) == 63) return "abc".length() + selected;
+    return selected * 7;
+  }
 }
 public class DirectIntegerInlineHarness {
   public static void compute(int[] out) {
@@ -8794,6 +9089,18 @@ public class DirectIntegerInlineHarness {
       value = DirectIntegerLeafTarget.transform(value + i);
     }
     out[0] = value;
+  }
+  public static void computeGuarded(int[] out) {
+    int sum = 0;
+    for (int i = 0; i < 128; i++) sum += DirectIntegerLeafTarget.guarded(i);
+    out[0] = sum;
+  }
+  public static void computeScopedGuarded(int[] out) {
+    int sum = 0;
+    for (int i = 0; i < 128; i++) {
+      sum += DirectIntegerLeafTarget.scopedGuarded(i);
+    }
+    out[0] = sum;
   }
 }
 `);
@@ -8834,6 +9141,70 @@ public class DirectIntegerInlineHarness {
     'generated source contains one structural direct-inline site');
   t.equal(jvm.jit.syncCallSites.filter(Boolean).length, 0,
     'direct inline creates no runtime dispatch call site');
+
+  const guardedOut = [0];
+  guardedOut.type = '[I';
+  await invoke(jvm, thread, 'DirectIntegerInlineHarness',
+    'computeGuarded', '([I)V', [guardedOut]);
+  let guardedExpected = 0;
+  for (let i = 0; i < 128; i++) {
+    guardedExpected = (guardedExpected +
+      ((i & 63) === 63 ? i + 3 : Math.imul(i, 3))) | 0;
+  }
+  t.equal(guardedOut[0], guardedExpected,
+    'failed direct-inline guards resume the canonical helper at the invoke');
+
+  const scopedGuardedOut = [0];
+  scopedGuardedOut.type = '[I';
+  await invoke(jvm, thread, 'DirectIntegerInlineHarness',
+    'computeScopedGuarded', '([I)V', [scopedGuardedOut]);
+  let scopedGuardedExpected = 0;
+  for (let i = 0; i < 128; i++) {
+    const selected = (i & 1) !== 0 ? Math.imul((i + 5) | 0, 3) : i;
+    const value = (selected & 63) === 63
+      ? (selected + 3) | 0 : Math.imul(selected, 7);
+    scopedGuardedExpected = (scopedGuardedExpected + value) | 0;
+  }
+  t.equal(scopedGuardedOut[0], scopedGuardedExpected,
+    'branch-local inline values remain available to later guards and results');
+
+  const structuredJvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, profileMethods: false,
+    structuredSsa: true,
+  } });
+  for (const className of ['DirectIntegerInlineHarness', 'DirectIntegerLeafTarget']) {
+    await structuredJvm.loadClassByName(className);
+    structuredJvm.classInitializationState.set(className, 'INITIALIZED');
+  }
+  const structuredThread = {
+    id: 0,
+    name: 'structured-direct-integer-inline-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  structuredJvm.threads = [structuredThread];
+  structuredJvm.currentThreadIndex = 0;
+  const structuredOut = [0];
+  structuredOut.type = '[I';
+  await invoke(structuredJvm, structuredThread, 'DirectIntegerInlineHarness',
+    'computeScopedGuarded', '([I)V', [structuredOut]);
+  t.equal(structuredOut[0], scopedGuardedExpected,
+    'structured callers evaluate inline temporaries before dependent guards');
+  const structuredMethod = await structuredJvm.findMethodInHierarchy(
+    'DirectIntegerInlineHarness', 'computeScopedGuarded', '([I)V');
+  const structuredGenerated = structuredJvm.jit.codegenCache.get(
+    structuredMethod);
+  const optionalSsaSources = Object.entries(structuredGenerated || {})
+    .filter(([name, source]) => name.endsWith('Source') &&
+      name !== 'jvmStructuredSource' && typeof source === 'string' &&
+      source.includes('ssa'));
+  t.ok(optionalSsaSources.length > 0,
+    'the fixture emits at least one optional positional SSA source');
+  t.deepEqual(optionalSsaSources.flatMap(([name, source]) =>
+    structuredRendererTest.unboundGeneratedSsaIdentifiers(source)
+      .map((identifier) => `${name}:${identifier}`)), [],
+  'every installed optional positional source passes the final AST scope audit');
 
   jvm.debugManager.addBreakpoint(0, { className: 'DirectIntegerLeafTarget' });
   const debugOut = [0];
@@ -10225,10 +10596,18 @@ public class AdaptiveConstructorCallerHarness {
     int value;
   }
 
+  static class ComplexBox {
+    int[][][] values = new int[2][2][4];
+  }
+
   public static void compute(int[] out, int value) {
     Box box = new Box();
     box.value = value;
     out[0] = box.value * 3;
+  }
+
+  public static ComplexBox complex() {
+    return new ComplexBox();
   }
 
   static int read(Box box) {
@@ -10255,6 +10634,7 @@ public class AdaptiveConstructorCallerHarness {
     },
   });
   await jvm.loadClassByName('AdaptiveConstructorCallerHarness');
+  await jvm.loadClassByName('AdaptiveConstructorCallerHarness$Box');
   const thread = {
     id: 0, name: 'adaptive-constructor-caller', callStack: new Stack(),
     status: 'runnable', pendingException: null,
@@ -10288,6 +10668,13 @@ public class AdaptiveConstructorCallerHarness {
   t.ok(jvm.jit.isCodegenSupported(constructor, true),
     'a forwarding constructor does not create an interpreted boundary');
 
+  await jvm.loadClassByName('AdaptiveConstructorCallerHarness$ComplexBox');
+  const complex = await jvm.findMethodInHierarchy(
+    'AdaptiveConstructorCallerHarness', 'complex',
+    '()LAdaptiveConstructorCallerHarness$ComplexBox;');
+  t.notOk(jvm.jit.isCodegenSupported(complex, true),
+    'a caller retains a Frame boundary around a nontrivial constructor');
+
   const guarded = await jvm.findMethodInHierarchy(
     'AdaptiveConstructorCallerHarness', 'guarded',
     '([ILAdaptiveConstructorCallerHarness$Box;)V');
@@ -10317,6 +10704,56 @@ public class GeneratedLoopConstructorHarness {
 
     Values(int limit) {
       for (int i = 0; i < limit; i++) sum += i;
+    }
+  }
+
+  static class RethrowingValues extends Base {
+    int sum;
+
+    RethrowingValues(int[] values) {
+      for (int i = 0; i < values.length; i++) {
+        try {
+          sum += values[i];
+        } catch (RuntimeException error) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  static class ProtectedCallingValues extends Base {
+    int sum;
+
+    int read(int[] values, int index) {
+      return values[index];
+    }
+
+    ProtectedCallingValues(int[] values) {
+      for (int i = 0; i < values.length; i++) {
+        try {
+          sum += read(values, i);
+        } catch (RuntimeException error) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  static class ReferenceValues extends Base {
+    int count;
+
+    ReferenceValues(Object[] values) {
+      for (int i = 0; i < values.length; i++) {
+        if (values[i] != null) count++;
+      }
+    }
+
+    static int count(Object[] values) {
+      int result = 0;
+      for (int i = 0; i < values.length; i++) {
+        if (values[i] != null) result++;
+      }
+      return result;
     }
   }
 
@@ -10373,6 +10810,114 @@ public class GeneratedLoopConstructorHarness {
     'the hot constructor uses the structured SSA body');
   t.ok(jvm.jit.codegenCache.get(forwardingConstructor)?.jvmStructuredSsa,
     'the superclass forwarding call stays generated');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$RethrowingValues');
+  const rethrowingConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$RethrowingValues', '<init>', '([I)V');
+  const rethrowingItems = jvm.jit.getCodeItems(rethrowingConstructor);
+  t.ok(rethrowingConstructor.attributes.find((attribute) =>
+    attribute.type === 'code').code.exceptionTable.length > 0,
+  'the fixture retains a protected constructor loop');
+  t.ok(jvm.jit.hasOnlyNoOpExceptionHandlers(
+    rethrowingConstructor, rethrowingItems),
+  'its handlers are structurally proven to only rethrow');
+  t.ok(jvm.jit.isJitSafeConstructor(rethrowingConstructor),
+    'a protected loop constructor with rethrow-only handlers is admitted');
+  t.ok(jvm.jit.isCodegenSupported(rethrowingConstructor),
+    'the protected constructor can use whole-method JavaScript');
+  const rethrowingReceiver = jvm.jit.allocateObject(
+    'GeneratedLoopConstructorHarness$RethrowingValues');
+  await invoke(jvm, thread,
+    'GeneratedLoopConstructorHarness$RethrowingValues', '<init>', '([I)V',
+    [rethrowingReceiver, [3, 5, 7, 11]]);
+  t.equal(rethrowingReceiver.fields[
+    'GeneratedLoopConstructorHarness$RethrowingValues.sum'], 26,
+  'the generated protected constructor preserves its loop effects');
+  t.ok(jvm.jit.codegenCache.get(rethrowingConstructor)?.jvmStructuredSsa,
+    'the protected constructor executes through structured SSA');
+  const coldBaseline = jvm.jit.compileBaselineMethod(rethrowingConstructor);
+  t.notOk(coldBaseline.jvmStructuredSsa,
+    'a cold baseline body represents compilation before dependencies settle');
+  jvm.jit.codegenCache.set(rethrowingConstructor, coldBaseline);
+  jvm.jit.invocationCounts.set(rethrowingConstructor, 8);
+  const coldConstructorEntry = jvm.jit.getGeneratedFunction(
+    rethrowingConstructor);
+  t.equal(coldConstructorEntry, coldBaseline,
+    'the active call retains its stable baseline entry during promotion');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const upgradedConstructor = jvm.jit.codegenCache.get(
+    rethrowingConstructor);
+  t.ok(upgradedConstructor?.jvmStructuredSsa,
+    'a hot protected loop constructor upgrades at a JavaScript safe point');
+  t.equal(jvm.jit.structuredConstructorUpgradeCount, 1,
+    'the successful structural upgrade is recorded once');
+
+  const positionalBaseline = jvm.jit.compileBaselineMethod(
+    rethrowingConstructor);
+  const positionalBody = () => undefined;
+  const compileStructured = jvm.jit.structuredSsa.compile;
+  jvm.jit.structuredSsa.compile = () => ({
+    jvmStructuredRequiresBaselineFramedEntry: true,
+    jvmRestoringDirectPositionalBody: positionalBody,
+    jvmRestoringDirectPositionalSource: 'return undefined;',
+  });
+  jvm.jit.codegenCache.set(rethrowingConstructor, positionalBaseline);
+  jvm.jit.structuredConstructorRetryState.delete(rethrowingConstructor);
+  jvm.jit.invocationCounts.set(rethrowingConstructor, 8);
+  const upgradedPositionalConstructor = jvm.jit.getGeneratedFunction(
+    rethrowingConstructor);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  jvm.jit.structuredSsa.compile = compileStructured;
+  t.equal(upgradedPositionalConstructor, positionalBaseline,
+    'the active protected call retains its baseline frame entry');
+  const upgradedPositionalCache = jvm.jit.codegenCache.get(
+    rethrowingConstructor);
+  t.equal(upgradedPositionalCache.jvmRestoringDirectPositionalBody,
+    positionalBody,
+  'the safe-point upgrade augments its structured positional entry');
+  t.equal(jvm.jit.structuredConstructorUpgradeCount, 2,
+    'the positional structural upgrade is recorded once');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$ProtectedCallingValues');
+  const protectedCallingConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$ProtectedCallingValues', '<init>',
+    '([I)V');
+  const protectedCallingStructured = jvm.jit.structuredSsa.compile(
+    protectedCallingConstructor);
+  t.ok(protectedCallingStructured?.jvmStructuredRequiresBaselineFramedEntry,
+    'a protected non-void child call retains the baseline Frame entry');
+  t.equal(typeof protectedCallingStructured.jvmRestoringDirectPositionalBody,
+    'function',
+  'its verified direct-super call remains valid in the restoring entry');
+  const protectedCallingSelected = jvm.jit.compileMethod(
+    protectedCallingConstructor);
+  t.equal(typeof protectedCallingSelected.jvmRestoringDirectPositionalBody,
+    'function',
+  'tier selection preserves the constructor restoring entry');
+
+  await jvm.loadClassByName(
+    'GeneratedLoopConstructorHarness$ReferenceValues');
+  const referenceConstructor = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$ReferenceValues', '<init>',
+    '([Ljava/lang/Object;)V');
+  const referenceStructured = jvm.jit.structuredSsa.compile(
+    referenceConstructor);
+  t.equal(typeof referenceStructured?.jvmRestoringDirectPositionalBody,
+    'function',
+  'reference-array loads are admitted by the verified constructor proof');
+  const referenceCounter = await jvm.findMethodInHierarchy(
+    'GeneratedLoopConstructorHarness$ReferenceValues', 'count',
+    '([Ljava/lang/Object;)I');
+  const referenceCounterStructured = jvm.jit.structuredSsa.compile(
+    referenceCounter);
+  t.equal(referenceCounterStructured?.jvmRestoringDirectPositionalBody, null,
+    'the same reference-array load stays outside an ordinary restoring ABI');
+  t.ok(String(referenceCounterStructured
+    ?.jvmStructuredRestoringDirectRejection).includes(
+      'reference-array load outside a verified constructor'),
+  'the structural rejection reports the bounded capability gate');
 
   await jvm.loadClassByName(
     'GeneratedLoopConstructorHarness$NestedAllocation');

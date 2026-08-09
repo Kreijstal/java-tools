@@ -33,8 +33,7 @@ function walkJavaScriptAst(node, visit, parent = null) {
 
 function parseGeneratedStatements(source) {
   const prefix = "function* __jvmSsaAstWrapper() {\n";
-  const wrapped = `${prefix}${source}\n}`;
-  const program = parseJavaScript(wrapped, {
+  const program = parseJavaScript(`${prefix}${source}\n}`, {
     ecmaVersion: "latest",
     ranges: true,
   });
@@ -82,8 +81,9 @@ function rewriteGeneratedJavaScript(source, resolveIdentifier,
 function rewriteGeneratedExpression(source, resolveIdentifier) {
   if (typeof source !== "string" || source.length === 0) return source;
   const prefix = "function __jvmSsaExpressionWrapper() { return (";
-  const wrapped = `${prefix}${source}); }`;
-  const program = parseJavaScript(wrapped, {ecmaVersion: "latest"});
+  const program = parseJavaScript(`${prefix}${source}); }`, {
+    ecmaVersion: "latest",
+  });
   const edits = [];
   walkJavaScriptAst(program, (node, parent) => {
     if (node.type !== "Identifier") return;
@@ -243,8 +243,15 @@ function unboundGeneratedSsaIdentifiers(source, candidates = null) {
 }
 
 function promoteSingleAssignmentSsaBindings(source, candidates) {
+  if (typeof source !== "string" || source.length === 0) return source;
   const analysis = analyzeGeneratedSsaScopes(source, candidates);
   const {parsed, parents, scopes} = analysis;
+  const scopeContains = (outer, inner) => {
+    for (let scope = inner; scope; scope = scope.parent) {
+      if (scope === outer) return true;
+    }
+    return false;
+  };
   const edits = [];
   for (const scope of scopes) {
     for (const variable of scope.bindings.values()) {
@@ -253,16 +260,21 @@ function promoteSingleAssignmentSsaBindings(source, candidates) {
           declaration.declarations.length !== 1 || declarator.init) continue;
       const writes = variable.references.filter((reference) =>
         reference.isWrite);
-      if (writes.length !== 1 || writes[0].scope !== variable.scope) continue;
+      if (writes.length !== 1) continue;
       const assignment = writes[0].assignment;
       const assignmentStatement = parents.get(assignment);
+      const assignmentParent = parents.get(assignmentStatement);
       if (assignment?.type !== "AssignmentExpression" ||
           assignment.operator !== "=" ||
           assignment.left !== writes[0].identifier ||
-          assignmentStatement?.type !== "ExpressionStatement") continue;
-      if (variable.references.some((reference) =>
-        reference !== writes[0] &&
-        reference.identifier.start < assignment.end)) continue;
+          assignmentStatement?.type !== "ExpressionStatement" ||
+          assignmentParent?.type !== "BlockStatement" ||
+          !writes[0].scope) continue;
+      const reads = variable.references.filter((reference) =>
+        reference !== writes[0]);
+      if (reads.length === 0 || reads.some((reference) =>
+        reference.identifier.start <= assignmentStatement.end ||
+        !scopeContains(writes[0].scope, reference.scope))) continue;
       edits.push({
         start: declaration.start - parsed.offset,
         end: declaration.end - parsed.offset,
@@ -281,6 +293,10 @@ function promoteSingleAssignmentSsaBindings(source, candidates) {
       rewritten.slice(edit.end);
   }
   return rewritten;
+}
+
+function sinkSingleAssignmentSsaDeclarations(source) {
+  return promoteSingleAssignmentSsaBindings(source);
 }
 
 function normalizedArrayLoadExpression(raw, op, array, arrayKind = null) {
@@ -2325,6 +2341,7 @@ class JvmSsaBlockRenderer {
       let conditionConstant = null;
       let returnKind = null;
       let returnValue = null;
+      let returnIndex = null;
       let valid = true;
       let invalidAt = null;
       const pop = () => stack.length ? stack.pop() : null;
@@ -2604,11 +2621,6 @@ class JvmSsaBlockRenderer {
             else if (this.localValueNumberingEnabled && localValues[slot] === input) {
               eliminatedLocalStoreCount += 1;
             }
-            else if (liveLocalsOutByBlock[block.id] &&
-                !liveLocalsOutByBlock[block.id].has(slot)) {
-              eliminatedLocalStoreCount += 1;
-              eliminatedDeadLocalStoreCount += 1;
-            }
             else lines.push(`local${slot} = ${input};`);
             localValues[slot] = this.localValueNumberingEnabled ? input : null;
           }
@@ -2781,11 +2793,7 @@ class JvmSsaBlockRenderer {
             const previous = readLocal(slot);
             const out = value();
             lines.push(`const ${out} = (${previous} + ${increment}) | 0;`);
-            if (liveLocalsOutByBlock[block.id] &&
-                !liveLocalsOutByBlock[block.id].has(slot)) {
-              eliminatedDeadLocalStoreCount += 1;
-              eliminatedLocalStoreCount += 1;
-            } else lines.push(`local${slot} = ${out};`);
+            lines.push(`local${slot} = ${out};`);
             localValues[slot] = out;
           }
         } else if (op === "arraylength") {
@@ -3227,20 +3235,20 @@ class JvmSsaBlockRenderer {
               const out = value();
               const substitute = (source) => source.replace(/stack\[base \+ (\d+)\]/g,
                 (_match, argument) => `(${args[Number(argument)]})`);
+              lines.push(`let ${out};`, "{",
+                ...site.inline.statements.map((statement) => `  ${substitute(statement)}`));
               if (site.inline.guards?.length) {
                 const guard = site.inline.guards
                   .map((condition) => substitute(condition))
                   .join(" && ");
-                lines.push(`if (!(${guard})) {`,
+                lines.push(`  if (!(${guard})) {`,
                   ...materializeLines(callStack, index)
-                    .map((line) => `  ${line}`),
-                  "  helpers.skipJitOnce(frame);",
-                  "  return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };",
-                  "}");
+                    .map((line) => `    ${line}`),
+                  "    helpers.skipJitOnce(frame);",
+                  "    return { deopt: true, transient: true, reason: 'guarded inline integer leaf' };",
+                  "  }");
               }
-              lines.push(`let ${out};`, "{",
-                ...site.inline.statements.map((statement) => `  ${substitute(statement)}`),
-                `  ${out} = ${substitute(site.inline.result)};`, "}");
+              lines.push(`  ${out} = ${substitute(site.inline.result)};`, "}");
               stack.push(out);
             }
           } else if (site.directIntrinsic?.kind === "primitiveArrayCopy" &&
@@ -4021,10 +4029,17 @@ class JvmSsaBlockRenderer {
             op === "freturn" || op === "lreturn") {
           returnValue = pop();
           if (returnValue === null || stack.length !== 0) valid = false;
-          else returnKind = "value";
+          else {
+            returnKind = "value";
+            returnIndex = index;
+          }
         }
         else if (op === "return") {
-          if (stack.length !== 0) valid = false; else returnKind = "void";
+          if (stack.length !== 0) valid = false;
+          else {
+            returnKind = "void";
+            returnIndex = index;
+          }
         }
         else valid = false;
         if (!valid) { invalidAt = { index, op }; break; }
@@ -4037,14 +4052,19 @@ class JvmSsaBlockRenderer {
           if (!edge) return reject(`invalid fall edge from block ${block.id}`);
           lines.push(...edge);
         }
-        plans[block.id] = { lines, returnKind, returnValue, stack: [...stack] };
+        plans[block.id] = {
+          lines, returnKind, returnValue, returnIndex, stack: [...stack],
+        };
       }
     }
 
-    // Bytecode stack staging can create long chains of immutable SSA copies.
-    // Discover those declarations from the JavaScript AST and rewrite only
-    // Identifier nodes. Generated strings, comments, property names, and
-    // similarly spelled guest members are never optimizer inputs.
+    // Bytecode stack staging creates immutable SSA-copy chains. Discover the
+    // declarations through the JavaScript AST, then apply one method-wide
+    // alias graph to normal blocks and every deferred edge. Cold async/deopt
+    // continuations consume the same SSA namespace, so a per-block text
+    // rewrite can otherwise delete a declaration while leaving those uses
+    // behind. Identifier nodes—not generated text, comments, or property
+    // names—are the only rewrite targets.
     let coalescedSsaCopyCount = 0;
     const aliases = new Map();
     const removedDeclarationsByPlan = new Map();
@@ -4059,8 +4079,7 @@ class JvmSsaBlockRenderer {
     };
     for (const plan of plans) {
       if (!plan?.lines?.length) continue;
-      const planSource = plan.lines.join("\n");
-      const parsedPlan = parseGeneratedStatements(planSource);
+      const parsedPlan = parseGeneratedStatements(plan.lines.join("\n"));
       const removedDeclarations = [];
       for (const statement of parsedPlan.statements) {
         if (statement.type !== "VariableDeclaration" ||
@@ -4072,8 +4091,7 @@ class JvmSsaBlockRenderer {
             declaration.init?.type !== "Identifier" ||
             !ssaValueNames.has(declaration.id.name) ||
             !ssaValueNames.has(declaration.init.name)) continue;
-        aliases.set(
-          declaration.id.name, resolveAlias(declaration.init.name));
+        aliases.set(declaration.id.name, resolveAlias(declaration.init.name));
         removedDeclarations.push(statement);
         coalescedSsaCopyCount += 1;
       }
@@ -4254,11 +4272,12 @@ class JvmSsaBlockRenderer {
       let boundSlot = null;
       let boundExpression = null;
       let loadInstruction = null;
-      if (branchOp === "ifge") {
+      const bodyOnTaken = branchOp === "iflt" || branchOp === "if_icmplt";
+      if (branchOp === "ifge" || branchOp === "iflt") {
         bound = 0;
         boundExpression = "0";
         loadInstruction = headerInstructions[headerInstructions.length - 2];
-      } else if (branchOp === "if_icmpge" &&
+      } else if ((branchOp === "if_icmpge" || branchOp === "if_icmplt") &&
           headerInstructions.length >= 3) {
         const boundItemIndex =
           block.insns[block.insns.length - 2];
@@ -4328,9 +4347,15 @@ class JvmSsaBlockRenderer {
         }
       }
       const term = cfg.term[header];
-      // The conservative form is `counter >= constant -> exit`, with the
-      // fall-through entering the natural loop body.
-      if (loopBlocks.has(term.taken) || !loopBlocks.has(term.fall)) return null;
+      // Accept both equivalent layouts emitted by javac. Small exit arms are
+      // normally `counter >= bound -> exit`; when the exit arm is much larger
+      // than the loop body javac inverts it to `counter < bound -> body` and
+      // places the exit on fall-through. The induction proof is identical.
+      if (bodyOnTaken
+        ? (!loopBlocks.has(term.taken) || loopBlocks.has(term.fall))
+        : (loopBlocks.has(term.taken) || !loopBlocks.has(term.fall))) {
+        return null;
+      }
 
       let initial = null;
       const preheaderInsns = cfg.blocks[preheaders[0]].insns;
@@ -4400,6 +4425,7 @@ class JvmSsaBlockRenderer {
       return {
         header, slot, bound, boundSlot, boundExpression, increment, initial,
         loopBlocks, writtenSlots, backedges, preheader: preheaders[0],
+        bodyOnTaken,
       };
     };
     const countedLoopTripCount = (node) => {
@@ -6796,8 +6822,6 @@ class JvmSsaBlockRenderer {
           allCountedLoops.get(header) || guardedAtomicRegionLimit);
       }
     }
-    const maximumCoarseTripCount =
-      Math.max(1, ...coarseCountedLoops.values());
     const invokeCount = items.reduce((count, item) => {
       const op = opOf(item?.instruction);
       return count + (op?.startsWith("invoke") ? 1 : 0);
@@ -6820,11 +6844,12 @@ class JvmSsaBlockRenderer {
     const structuralPollBudget = hasAtomicUnsafeOperation
       ? Math.max(64, Math.min(10000, Math.floor(16384 / loopWorkEstimate)))
       : 10000;
-    // Charge the outer safe point once per completed bounded inner loop. This
-    // retains approximately the original 10k-iteration scheduler quantum
-    // without executing a second branch in every inner-loop iteration.
-    const safePointInitialBudget = Math.max(
-      1, Math.floor(structuralPollBudget / maximumCoarseTripCount));
+    // Keep the shared counter in guest-iteration units. Each admitted coarse
+    // loop charges its verified trip count once; unrelated later loops must not
+    // inherit a globally divided budget merely because an earlier loop happened
+    // to be large. Poll sites use <= 0 so a coarse charge may cross the boundary
+    // without losing the next scheduler check.
+    const safePointInitialBudget = structuralPollBudget;
     const indent = (lines) => lines.map((line) => `  ${line}`);
     const expandContinuationFallbacks = (lines, continuationMode) =>
       lines.flatMap((line) => {
@@ -7079,14 +7104,25 @@ class JvmSsaBlockRenderer {
       const second = /^const (ssaValue\d+) = (.+);$/.exec(lines[1]);
       let conditionLine;
       let conditionIndex;
+      let bodyOnThen = false;
       if (second && second[2] === info.boundExpression &&
           lines[2] === `if (${first[1]} >= ${second[1]}) {`) {
         conditionLine = `local${info.slot} < ${info.boundExpression}`;
         conditionIndex = 2;
+      } else if (second && second[2] === info.boundExpression &&
+          lines[2] === `if (${first[1]} < ${second[1]}) {`) {
+        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+        conditionIndex = 2;
+        bodyOnThen = true;
       } else if (lines[1] ===
           `if (${first[1]} >= ${info.boundExpression}) {`) {
         conditionLine = `local${info.slot} < ${info.boundExpression}`;
         conditionIndex = 1;
+      } else if (lines[1] ===
+          `if (${first[1]} < ${info.boundExpression}) {`) {
+        conditionLine = `local${info.slot} < ${info.boundExpression}`;
+        conditionIndex = 1;
+        bodyOnThen = true;
       } else {
         return null;
       }
@@ -7104,8 +7140,10 @@ class JvmSsaBlockRenderer {
       if (alternate < 0 || lines[lines.length - 1] !== "}") return null;
       const unindentOne = (line) => line.startsWith("  ")
         ? line.slice(2) : line;
-      const exit = lines.slice(conditionIndex + 1, alternate).map(unindentOne);
-      const body = lines.slice(alternate + 1, -1).map(unindentOne);
+      const thenLines = lines.slice(conditionIndex + 1, alternate).map(unindentOne);
+      const elseLines = lines.slice(alternate + 1, -1).map(unindentOne);
+      const exit = bodyOnThen ? elseLines : thenLines;
+      const body = bodyOnThen ? thenLines : elseLines;
       if (body[body.length - 1]?.trim() === `continue ${label};`) body.pop();
       return {
         condition: conditionLine,
@@ -7315,6 +7353,14 @@ class JvmSsaBlockRenderer {
             ? "  return helpers.returnVoid();"
             : `  return ${plan.returnValue};`);
           lines.push("}");
+          lines.push("if (thread.callStack.peek() !== frame) {");
+          lines.push(...materializeLines(
+            plan.returnKind === "void" ? [] : [plan.returnValue],
+            plan.returnIndex,
+          ).map((line) => `  ${line}`));
+          lines.push("  helpers.skipJitOnce(frame);");
+          lines.push("  return { deopt: true, transient: true, reason: 'structured SSA return with active child' };");
+          lines.push("}");
           lines.push("spillLocals();");
           lines.push("stack.length = 0;");
           lines.push(`frame.pc = ${items.length};`);
@@ -7460,6 +7506,9 @@ class JvmSsaBlockRenderer {
             ? [`if (!(${entryBailoutGuards.join(" && ")})) ` +
               "return helpers.asyncInvokeSentinel();"]
             : []),
+          ...(coarse && !checkedLeafOnly
+            ? [`safePointBudget -= ${coarseCountedLoops.get(header)};`]
+            : []),
           ...(runtimeCoarse
             ? [
               `const ${runtimeCoarse.tripsVariable} = ` +
@@ -7476,7 +7525,7 @@ class JvmSsaBlockRenderer {
           ...(coarse ? [] : [
             `  if (${runtimeCoarse
               ? `!${runtimeCoarse.variable} && ` : ""}` +
-              "--safePointBudget === 0) {",
+              "--safePointBudget <= 0) {",
             ...indent(indent(materialize)), "  }",
           ]),
           ...indent(countedLoop ? countedLoop.body : loopBody), "}",
@@ -8207,14 +8256,16 @@ class JvmSsaBlockRenderer {
       "dup", "dup2", "pop",
       "aload", "aload_0", "aload_1", "aload_2", "aload_3",
       "astore", "astore_0", "astore_1", "astore_2", "astore_3",
-      "getfield",
+      "getfield", "putfield",
       "putstatic",
+      "i2d", "d2i",
+      "newarray",
       "arraylength",
-      "iaload", "saload", "baload", "caload",
+      "iaload", "saload", "baload", "caload", "aaload",
       "iastore", "sastore", "bastore", "castore",
       "ifnull", "ifnonnull", "if_acmpeq", "if_acmpne",
       "idiv", "irem",
-      "invokestatic", "invokevirtual",
+      "invokestatic", "invokevirtual", "invokeinterface", "invokespecial",
       "return",
     ]);
     const directPrimitiveDescriptors = new Set([
@@ -8234,7 +8285,6 @@ class JvmSsaBlockRenderer {
         process.env.JVM_DISABLE_EFFECTFUL_FIELD_POSITIONAL === "1");
     let restoringDirectRejection = null;
     let restoringDirectPositionalEligible = Boolean(
-      !directPositionalEligible &&
       directMethodDescriptor &&
       (directMethodDescriptor.returnType === "void" ||
         directIntegralTypes.has(directMethodDescriptor.returnType)) &&
@@ -8246,9 +8296,8 @@ class JvmSsaBlockRenderer {
           cache.eagerLocal !== null && cache.eagerLocal !== undefined)),
     );
     if (!restoringDirectPositionalEligible) {
-      restoringDirectRejection = directPositionalEligible
-        ? "non-restoring direct entry already selected"
-        : "descriptor, owner, return type, or field-cache shape";
+      restoringDirectRejection =
+        "descriptor, owner, return type, or field-cache shape";
     }
     for (let index = 0;
       index < items.length && restoringDirectPositionalEligible;
@@ -8262,6 +8311,20 @@ class JvmSsaBlockRenderer {
         restoringDirectRejection = `unsupported normal opcode ${op} at ${index}`;
         break;
       }
+      if (op === "invokespecial" &&
+          !this.jit.isJitSafeConstructor(method, items)) {
+        restoringDirectPositionalEligible = false;
+        restoringDirectRejection =
+          `unverified special invocation at ${index}`;
+        break;
+      }
+      if (op === "aaload" &&
+          !this.jit.isJitSafeConstructor(method, items)) {
+        restoringDirectPositionalEligible = false;
+        restoringDirectRejection =
+          `reference-array load outside a verified constructor at ${index}`;
+        break;
+      }
       if ((op === "ldc" || op === "ldc_w") &&
           !Number.isInteger(Number(instruction.arg?.value ?? instruction.arg))) {
         restoringDirectPositionalEligible = false;
@@ -8271,13 +8334,18 @@ class JvmSsaBlockRenderer {
       if (op === "getfield") {
         const site = fieldSites.get(index);
         const plan = site === undefined ? null : this.jit.fieldSites[site];
-        const cache = fieldReadCacheSites.get(index);
-        if (!plan || !directPrimitiveDescriptors.has(plan.descriptor) ||
-            !cache?.directKey ||
+        const scalarOrReference = plan &&
+          (directPrimitiveDescriptors.has(plan.descriptor) ||
+            referenceStaticPositionalEnabled &&
+            typeof plan.descriptor === "string" &&
+            (plan.descriptor.startsWith("L") ||
+              plan.descriptor.startsWith("[")));
+        if (!scalarOrReference ||
             (!effectfulFieldPositionalEnabled &&
-              (cache.eagerLocal === null || cache.eagerLocal === undefined))) {
+              !fieldReadCacheSites.get(index)?.directKey)) {
           restoringDirectPositionalEligible = false;
-          restoringDirectRejection = `unresolved primitive instance field at ${index}`;
+          restoringDirectRejection =
+            `unsupported primitive instance field at ${index}`;
           break;
         }
       }
@@ -8838,11 +8906,24 @@ class JvmSsaBlockRenderer {
     const body = buildBody(renderedTree);
     const generatedSource = body.join("\n");
     try {
+      const positionalAstRejections = [];
       const createStructuredFunction = (tier, parameters, source, ...options) => {
+        // Optional positional tiers are assembled from independently optimized
+        // regions (ordinary blocks, cold restoration edges, and inlined
+        // callees).  A declaration can therefore become lexically narrower
+        // than one of its surviving uses even though the JavaScript parser
+        // accepts the function.  Never install such a tier: the canonical
+        // framed structured body remains the semantics-preserving fallback.
+        // Audit the final AST, after every specialization, so this protects
+        // every method shape without recognizing guest classes or methods.
         const unbound = unboundGeneratedSsaIdentifiers(source, ssaValueNames);
         if (unbound.length) {
-          throw new Error(
-            `unbound generated SSA identifiers in ${tier}: ${unbound.join(", ")}`);
+          if (tier === "structured-ssa") {
+            throw new Error(
+              `unbound structured SSA identifiers: ${unbound.join(", ")}`);
+          }
+          positionalAstRejections.push({ tier, unbound });
+          return null;
         }
         return this.jit.createGeneratedFunction(
           method, tier, parameters, source, ...options);
@@ -8957,7 +9038,12 @@ class JvmSsaBlockRenderer {
       let captureFreeRestoringSpills = false;
       let outlinedCaptureFreeRestoringSpills = false;
       let restoringFrameSlotCount = 0;
-      if (restoringDirectPositionalEligible) {
+      // The preferred direct entry can still be rejected by the final AST
+      // scope audit after specialization. Prove restoring eligibility
+      // independently above and emit it only when no direct body survived,
+      // so a valid fallback is not lost because an earlier candidate existed.
+      if (restoringDirectPositionalEligible &&
+          (requiresBaselineFramedEntry || !directPositionalBody)) {
         // A restoring entry is an already-verified synchronous intermethod
         // region. Give it a larger scalar quantum than a scheduler-owned
         // Frame: nested calls retain their own guards and safe points, while
@@ -10082,7 +10168,15 @@ class JvmSsaBlockRenderer {
       let adaptivePositionalBody = null;
       let adaptivePositionalSource = null;
       let ordinaryAdaptive = false;
-      if (useContinuations && this.jit.adaptiveFramelessPositionalEnabled) {
+      // A continuation with nested invokes may have already materialized or
+      // restored child frames when its scheduler budget expires. Keep those
+      // methods on the canonical Frame-backed continuation ABI: promoting a
+      // later invocation to a frameless iterator can otherwise replay a
+      // stateful child call after the caller is restored. Call-free loops have
+      // no intermethod state at a safe point and remain eligible for the
+      // enlarged adaptive quantum.
+      if (useContinuations && callSites.size === 0 &&
+          this.jit.adaptiveFramelessPositionalEnabled) {
         const adaptiveSafePointBudget = Math.min(
           1_000_000,
           safePointInitialBudget * this.jit.adaptiveFramelessBudgetMultiplier,
@@ -10456,10 +10550,13 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredCountedLoopCount = countedLoopInfos.size;
       generated.jvmStructuredSafePointBudget = safePointInitialBudget;
       generated.jvmStructuredRestoringDirectSafePointBudget =
-        restoringDirectPositionalEligible
+        restoringDirectPositionalBody
           ? Math.min(1_000_000, safePointInitialBudget *
             this.restoringDirectBudgetMultiplier)
           : 0;
+      generated.jvmStructuredRestoringDirectRejection =
+        restoringDirectPositionalEligible ? null : restoringDirectRejection;
+      generated.jvmStructuredPositionalAstRejections = positionalAstRejections;
       generated.jvmStructuredLoopWorkEstimate = loopWorkEstimate;
       generated.jvmStructuredAtomicBoundedLoops = atomicBoundedLoops;
       generated.jvmStructuredBoundedIterationProduct =
@@ -10491,5 +10588,6 @@ class JvmSsaBlockRenderer {
 module.exports = JvmSsaBlockRenderer;
 module.exports._test = {
   isIrreducibleError,
+  sinkSingleAssignmentSsaDeclarations,
   unboundGeneratedSsaIdentifiers,
 };

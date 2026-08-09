@@ -54,6 +54,13 @@ function fieldMetadataFromKey(key, isStatic) {
   };
 }
 
+function declaredThrowsForImplementation(implementation) {
+  if (Array.isArray(implementation.__declaredThrows)) {
+    return implementation.__declaredThrows.slice();
+  }
+  return Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [];
+}
+
 function loadClass(file) {
   try {
     return require(file);
@@ -89,7 +96,7 @@ function buildMetadata() {
       if (!methods.has(name)) methods.set(name, []);
       methods.get(name).push({
         name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: false,
-        throwsTypes: Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [],
+        throwsTypes: declaredThrowsForImplementation(implementation),
       });
     }
     for (const [key, implementation] of Object.entries(classDef.staticMethods || {})) {
@@ -99,7 +106,7 @@ function buildMetadata() {
       if (!staticMethods.has(name)) staticMethods.set(name, []);
       staticMethods.get(name).push({
         name, descriptor, returnDescriptor: returnDescriptor(descriptor), isStatic: true,
-        throwsTypes: Array.isArray(implementation.__throws) ? implementation.__throws.slice() : [],
+        throwsTypes: declaredThrowsForImplementation(implementation),
       });
     }
     classes.set(internalName, {

@@ -1,4 +1,19 @@
 
+const LONG_MIN_VALUE = -9223372036854775808n;
+const LONG_MAX_VALUE = 9223372036854775807n;
+const LONG_EXCLUSIVE_UPPER_BOUND = 2 ** 63;
+
+function roundDoubleToLong(value) {
+  // Java specifies Math.round(double) as (long)floor(value + 0.5d).  The
+  // floating-to-long conversion saturates infinities and out-of-range finite
+  // values, while NaN converts to zero.  JVM longs are represented as BigInt.
+  const rounded = Math.floor(value + 0.5);
+  if (Number.isNaN(rounded)) return 0n;
+  if (rounded >= LONG_EXCLUSIVE_UPPER_BOUND) return LONG_MAX_VALUE;
+  if (rounded <= -LONG_EXCLUSIVE_UPPER_BOUND) return LONG_MIN_VALUE;
+  return BigInt(rounded);
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {
@@ -63,6 +78,9 @@ module.exports = {
     },
     'round(F)I': (jvm, obj, args) => {
       return Math.round(args[0]);
+    },
+    'round(D)J': (jvm, obj, args) => {
+      return roundDoubleToLong(args[0]);
     },
     'random()D': (jvm, obj, args) => {
       return jvm.clock.random();

@@ -72,12 +72,64 @@ module.exports = {
       }
     },
     
-    'repaint()V': (jvm, obj, args) => {
-      // Trigger repaint - simplified implementation
-      const graphics = obj.getGraphics ? obj.getGraphics() : null;
-      if (graphics) {
-        obj['update(Ljava/awt/Graphics;)V'](jvm, obj, [graphics]);
+    'repaint()V': async (jvm, obj, args) => {
+      // Trigger repaint - execute the component's own update()/paint() bytecode.
+      // Guest classes do not expose JRE methods as object properties, so the
+      // graphics context must be built here, bound to the component's canvas.
+      let graphics = null;
+      if (typeof document !== 'undefined') {
+        if (obj._canvasElement && obj._canvasElement.getContext) {
+          const ctx = obj._canvasElement.getContext('2d');
+          if (ctx) {
+            graphics = { type: 'java/awt/Graphics', _awtGraphics: new awtFramework.CanvasGraphics(ctx), _component: obj };
+          }
+        }
+        if (!graphics) graphics = jvm.createGraphicsObject(obj);
+      } else {
+        graphics = { type: 'java/awt/Graphics', _component: obj };
       }
+      if (!graphics) return;
+      const { isJreDefault, runFrame } = require('./legacyEvents');
+      const updateMethod = await jvm.findMethodInHierarchy(
+        obj.type, 'update', '(Ljava/awt/Graphics;)V');
+      const paintMethod = !isJreDefault(updateMethod)
+        ? updateMethod
+        : await jvm.findMethodInHierarchy(
+          obj.type, 'paint', '(Ljava/awt/Graphics;)V');
+      if (!paintMethod || isJreDefault(paintMethod)) return;
+      const Frame = require('../../../core/frame');
+      const paintFrame = new Frame(paintMethod);
+      paintFrame.className = obj.type;
+      paintFrame.locals[0] = obj;
+      paintFrame.locals[1] = graphics;
+      const thread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
+      if (!thread) return;
+      await runFrame(jvm, paintFrame, {
+        thread,
+        label: `${obj.type}.repaint`,
+      });
+    },
+
+    // ── Legacy (pre-1.1) event model: postEvent → handleEvent → action ──
+    // A button click posts a java.awt.Event which bubbles up the component
+    // hierarchy; each level's handleEvent() may consume it, and the default
+    // handleEvent() routes ACTION_EVENT to action(Event, Object). Guest
+    // overrides run as real bytecode (see Button.js legacyEvents helper).
+    'handleEvent(Ljava/awt/Event;)Z': async (jvm, obj, args) => {
+      const evt = args[0];
+      if (!evt) return 0;
+      const { dispatchDefaultEvent } = require('./legacyEvents');
+      return (await dispatchDefaultEvent(jvm, obj, evt)) ? 1 : 0;
+    },
+
+    'action(Ljava/awt/Event;Ljava/lang/Object;)Z': (jvm, obj, args) => {
+      // Default: unhandled.
+      return 0;
+    },
+
+    'postEvent(Ljava/awt/Event;)Z': async (jvm, obj, args) => {
+      const { postEvent } = require('./legacyEvents');
+      return (await postEvent(jvm, obj, args[0])) ? 1 : 0;
     },
     
     'setVisible(Z)V': (jvm, obj, args) => {

@@ -11,7 +11,7 @@ const {
 } = require('./structurer');
 const { structureMethod } = require('./exceptionStructurer');
 const { listRegionSplitCandidates, applyRegionSplit } = require('../passes/regionSplit');
-const { jreClassInfo } = require('../java-frontend/jreMetadata');
+const { jreClassInfo, jreMethodCandidates } = require('../java-frontend/jreMetadata');
 const { JavaParser } = require('../java-frontend/parser');
 const { tokenizeJava } = require('../java-frontend/lexer');
 
@@ -1313,6 +1313,7 @@ function exceptionSuperType(type, model) {
 function buildExceptionModel(classes) {
   const methodThrows = new Map(); // `owner#name#descriptor` -> [internal throw names]
   const superOf = new Map();      // owner internal name -> superclass internal name
+  const interfacesOf = new Map(); // owner internal name -> implemented/extended interfaces
   const classInfo = new Map();    // owner internal name -> parsed class
   const sourceNameToInternal = new Map(); // rendered Java type -> owner internal name
   const instantiatedTypes = new Set();
@@ -1322,6 +1323,7 @@ function buildExceptionModel(classes) {
     classInfo.set(owner, cls);
     sourceNameToInternal.set(javaTypeFromInternalName(owner), owner);
     if (cls.superClassName) superOf.set(owner, cls.superClassName);
+    interfacesOf.set(owner, (cls.interfaces || []).slice());
     for (const item of cls.items || []) {
       if (item.type !== 'method' || !item.method) continue;
       const code = getCode(item.method);
@@ -1332,12 +1334,13 @@ function buildExceptionModel(classes) {
         }
       }
       const attr = (item.method.attributes || []).find((a) => a && a.type === 'exceptions');
-      if (attr && Array.isArray(attr.exceptions) && attr.exceptions.length) {
-        methodThrows.set(`${owner}#${item.method.name}#${item.method.descriptor}`, attr.exceptions.slice());
-      }
+      methodThrows.set(
+        `${owner}#${item.method.name}#${item.method.descriptor}`,
+        attr && Array.isArray(attr.exceptions) ? attr.exceptions.slice() : [],
+      );
     }
   }
-  return { methodThrows, superOf, classInfo, sourceNameToInternal, instantiatedTypes };
+  return { methodThrows, superOf, interfacesOf, classInfo, sourceNameToInternal, instantiatedTypes };
 }
 
 function hasUnimplementedAbstractMethods(cls, model) {
@@ -1420,35 +1423,28 @@ function commonExceptionSourceType(sourceTypes, model) {
 // Declared throws for owner.name:descriptor, resolving inherited declarations up
 // the corpus hierarchy. Returns null when the method is unknown (e.g. a JDK call).
 function resolveMethodThrows(owner, name, descriptor, model) {
-  let current = owner;
   const seen = new Set();
-  while (model && current && !seen.has(current)) {
+  const pending = [owner];
+  while (model && pending.length > 0) {
+    const current = pending.shift();
+    if (!current || seen.has(current)) continue;
     seen.add(current);
-    const found = model.methodThrows.get(`${current}#${name}#${descriptor}`);
-    if (found) return found;
+    const key = `${current}#${name}#${descriptor}`;
+    if (model.methodThrows.has(key)) return model.methodThrows.get(key);
     const sup = model.superOf.get(current);
-    if (!sup) break;
-    current = sup;
+    if (sup) pending.push(sup);
+    if (model.interfacesOf) pending.push(...(model.interfacesOf.get(current) || []));
   }
   return resolveJdkMethodThrows(owner, name, descriptor);
 }
 
 function resolveJdkMethodThrows(owner, name, descriptor) {
-  let current = owner;
-  const seen = new Set();
-  while (current && !seen.has(current)) {
-    seen.add(current);
-    const info = jreClassInfo(current);
-    if (!info) return null;
-    const candidates = [
-      ...(info.methods.get(name) || []),
-      ...(info.staticMethods.get(name) || []),
-    ];
-    const method = candidates.find((candidate) => candidate.descriptor === descriptor);
-    if (method) return method.throwsTypes;
-    current = info.superName;
-  }
-  return null;
+  const instanceMethod = jreMethodCandidates(owner, name, false)
+    .find((candidate) => candidate.descriptor === descriptor);
+  if (instanceMethod) return instanceMethod.throwsTypes;
+  const staticMethod = jreMethodCandidates(owner, name, true)
+    .find((candidate) => candidate.descriptor === descriptor);
+  return staticMethod ? staticMethod.throwsTypes : null;
 }
 
 const INVOKE_OPS = new Set(['invokevirtual', 'invokestatic', 'invokespecial', 'invokeinterface']);
@@ -3613,6 +3609,60 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       && predecessors.length >= 2
       && predecessors.some((predecessor) => predecessor >= block.id);
   });
+  // Some obfuscators split one loop latch into two consecutive tests of an
+  // invariant local. One arm leaves the loop while the second arm either
+  // returns to the header or falls through to the same exit. Nesting several
+  // such latches inside an exception region gives the Java structurer two
+  // source-identical exits from different loops; folding those exits can join
+  // the continuation of one loop to the body of another. Preserve the exact
+  // CFG with the state-machine renderer for this shape. The test is entirely
+  // structural: a unary int-local condition, the same local in its successor,
+  // a lexical backedge, and no assignment to that local inside the loop.
+  const conditionalIntLocal = (block) => {
+    if (!block || !block.insns || block.insns.length < 2) return null;
+    const terminator = getInstructionFromItem(
+      codeItems[block.insns[block.insns.length - 1]]);
+    if (!terminator || !/^if(?:eq|ne|lt|le|gt|ge)$/.test(terminator.op)) {
+      return null;
+    }
+    const load = getInstructionFromItem(
+      codeItems[block.insns[block.insns.length - 2]]);
+    const parsed = load && parseLoadIndex(load.op, load.arg);
+    return parsed && parsed.type === 'int' ? parsed.index : null;
+  };
+  const blockStart = (block) => block && block.insns && block.insns.length
+    ? block.insns[0] : Number.POSITIVE_INFINITY;
+  const hasInvariantConditionalBackedgeFanout = cfg.blocks.some((first) => {
+    const local = conditionalIntLocal(first);
+    if (local === null) return false;
+    for (const secondId of cfg.succ[first.id] || []) {
+      const second = cfg.blocks[secondId];
+      if (conditionalIntLocal(second) !== local) continue;
+      const backTargets = (cfg.succ[secondId] || []).filter((target) =>
+        blockStart(cfg.blocks[target]) <= blockStart(first));
+      for (const headerId of backTargets) {
+        const headerStart = blockStart(cfg.blocks[headerId]);
+        const latchEnd = Math.max(blockStart(first), blockStart(second));
+        let reassigned = false;
+        for (const block of cfg.blocks) {
+          const start = blockStart(block);
+          if (start < headerStart || start > latchEnd) continue;
+          for (const itemIndex of block.insns || []) {
+            const instruction = getInstructionFromItem(codeItems[itemIndex]);
+            const store = instruction &&
+              parseStoreIndex(instruction.op, instruction.arg);
+            if (store && store.index === local) {
+              reassigned = true;
+              break;
+            }
+          }
+          if (reassigned) break;
+        }
+        if (!reassigned) return true;
+      }
+    }
+    return false;
+  });
   // The multi-value backedge state machine cannot represent synchronized
   // regions (it renders the lowered monitor plumbing as plain code). When a
   // synchronized method also has this shape, do NOT bail to the fallbacks:
@@ -3625,13 +3675,26 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     useStateMachine = true;
     stateMachineReason = 'multi-value operand stack carried across a CFG backedge';
   }
+  if (!useStateMachine && hasInvariantConditionalBackedgeFanout &&
+      !syncHandlers.size) {
+    useStateMachine = true;
+    stateMachineReason =
+      'invariant conditional fanout carried across a CFG backedge';
+  }
 
+  // Reducible, handler-free Java follows the verifier's assignment edges, so
+  // javac can prove bytecode locals initialized without executing synthetic
+  // default stores at every method entry. Dispatcher and exception shapes
+  // obscure that proof at source level and deliberately retain their defaults.
+  const initializeLiftedLocals = useStateMachine || handlerEntries.size > 0 ||
+    syncHandlers.size > 0 || hasMultiValueStackBackedge ||
+    hasInvariantConditionalBackedgeFanout;
   const stackInName = (blockId, slot) => `stackIn_${blockId}_${slot}`;
   const stackOutName = (blockId, slot) => `stackOut_${blockId}_${slot}`;
   const structuredCarrierType = [...handlerEntries.values()].every((type) =>
     type === 'RuntimeException' || type === 'java.lang.RuntimeException')
     ? 'RuntimeException' : 'Throwable';
-  const declarations = localState.liftAllDeclarations();
+  const declarations = localState.liftAllDeclarations(initializeLiftedLocals);
   for (const block of cfg.blocks) {
     if (!handlerEntries.has(block.headLabel)) {
       const entryValues = entryStacks.get(block.id) || [];
@@ -3723,6 +3786,25 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
     // stack-out assignments would place Java statements after return/throw.
     const regularSuccessors = (cfg.succ[blockId] || []).filter((successor) =>
       successor != null && !handlerEntries.has(cfg.blocks[successor].headLabel));
+
+    // A dup-filled array can remain live in two operand-stack slots when a
+    // conditional splits the basic block before the element store. Rendering
+    // each outgoing slot independently would turn the one JVM allocation into
+    // two `new T[n]` expressions. Spill the shared expression once while its
+    // object identity is still visible; successor carriers then copy the same
+    // Java reference even though their expression metadata is reconstructed.
+    if (regularSuccessors.length) {
+      const exitValueCounts = new Map();
+      for (const value of exitStack) {
+        exitValueCounts.set(value, (exitValueCounts.get(value) || 0) + 1);
+      }
+      for (const [value, count] of exitValueCounts) {
+        if (!value || count < 2 || (!value.newArraySpill && !value.arrayLiteral) ||
+            !/^new\b/.test(value.code)) continue;
+        materializeNewArraySpill(value, lines, localState);
+      }
+    }
+
     if (regularSuccessors.length) exitStack.forEach((value, slot) => {
       requireRenderedTypeImport(options, value.qualifiedType || value.type);
       const rawStoredValue = renderStoreExpression(value);
@@ -3897,7 +3979,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
           methodReturnType(method));
       }
     }
-    declarations.push(...localState.liftAllDeclarations());
+    declarations.push(...localState.liftAllDeclarations(initializeLiftedLocals));
     const redundantStackInAliases = new Map();
     if (!useStateMachine) {
       for (const [target, state] of edgeStackInSources) {
@@ -8217,7 +8299,7 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
     markDeclared(index) {
       declared.add(ensure(index));
     },
-    liftAllDeclarations() {
+    liftAllDeclarations(initialize = true) {
       const lines = [];
       const keys = [...names.keys()].sort((a, b) => Number(String(a).split(':')[0]) - Number(String(b).split(':')[0]));
       for (const key of keys) {
@@ -8225,7 +8307,9 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
         declared.add(key);
         liftedDeclared.add(key);
         const type = simplifyType(types.get(key));
-        lines.push(`${type} ${names.get(key)} = ${defaultValueForType(type)};`);
+        lines.push(initialize
+          ? `${type} ${names.get(key)} = ${defaultValueForType(type)};`
+          : `${type} ${names.get(key)};`);
       }
       return lines;
     },

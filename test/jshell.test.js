@@ -67,6 +67,18 @@ test('JShell accepts declarations without a trailing semicolon', (t) => {
   t.end();
 });
 
+test('JShell snippet classification uses parsed Java syntax', (t) => {
+  const member = candidateKinds('private static final int answer = 42;', [])[0];
+  t.equal(member.kind, 'variable');
+  t.match(member.body, /public static\s+final int answer = 42;/,
+    'member modifiers are normalized from the parsed declaration');
+  t.equal(candidateKinds('if (true) { }', [])[0].kind, 'statement',
+    'structured statements are recognized without source regexes');
+  t.equal(candidateKinds('1 + 1', [])[0].kind, 'expression',
+    'expressions remain expression candidates');
+  t.end();
+});
+
 test('JShell multiline completion ignores delimiters in strings and comments', (t) => {
   t.equal(snippetComplete('int twice(int x) {'), false);
   t.equal(snippetComplete('int twice(int x) {\\n return x * 2;\\n}'), true);
@@ -100,7 +112,8 @@ test('JShell CLI retains variables, mutations, and methods across snippets', (t)
 
 test('JShell CLI supports imports and reset', (t) => {
   const result = runShell([
-    'import java.util.*',
+    'import /* a parsed comment */ java.util.*',
+    'import static java.util.Collections.*',
     '/imports',
     '/reset',
     '/list',
@@ -110,7 +123,9 @@ test('JShell CLI supports imports and reset', (t) => {
 
   t.equal(result.status, 0, result.stderr);
   t.match(result.stdout, /\|  imported java\.util\.\*/);
+  t.match(result.stdout, /\|  imported static java\.util\.Collections\.\*/);
   t.match(result.stdout, /1 : import java\.util\.\*;/);
+  t.match(result.stdout, /2 : import static java\.util\.Collections\.\*;/);
   t.match(result.stdout, /\|  reset/);
   t.match(result.stdout, /\|  \(none\)/);
   t.end();
