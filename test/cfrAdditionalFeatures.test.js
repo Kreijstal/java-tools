@@ -28,6 +28,26 @@ test('rendered type imports omit fully qualified nested-type collisions', (t) =>
   t.end();
 });
 
+test('duplicate local cleanup removes bare redeclarations using the parsed AST', (t) => {
+  const lines = [
+    'int var0 = 0;',
+    'long var2;',
+    'int var0;',
+    'long var2 = 7L;',
+    'var0 = 3;',
+  ];
+
+  cfrInternals.rewriteDuplicateLocalDeclarations(lines);
+
+  t.deepEqual(lines, [
+    'int var0 = 0;',
+    'long var2;',
+    'var2 = 7L;',
+    'var0 = 3;',
+  ], 'bare duplicates disappear and initialized duplicates become assignments');
+  t.end();
+});
+
 const ADDITIONAL_FEATURES_JASMIN = `.version 52 0
 .class public super org/benf/cfr/tests/AdditionalFeatureTest
 .super java/lang/Object

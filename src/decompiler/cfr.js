@@ -1588,6 +1588,12 @@ function statementCompletesAbruptly(statement) {
 
 function formatStaticInitializer(code, localState, cls, options = {}) {
   const body = code ? decompileCode(code, { name: '<clinit>', descriptor: '()V', flags: ['static'] }, cls, localState, options) : [];
+  // Static initializers pass through the same CFG/local reconstruction as
+  // ordinary methods. A lifted JVM slot can therefore be emitted once with a
+  // default initializer and once as a bare declaration discovered while
+  // rendering the structured body. Java gives both declarations the same
+  // initializer scope, so normalize them before adding any missing locals.
+  rewriteDuplicateLocalDeclarations(body);
   const missingDeclarations = localState.missingDeclarations(body);
   if (missingDeclarations.length) body.unshift(...missingDeclarations);
   replaceArrayContents(body, normalizeSyntheticVariableScopes(body));
@@ -2956,6 +2962,7 @@ function localDeclarationsFromStatement(source) {
           resources.push({
             name: item.name,
             type: `${baseType}${'[]'.repeat(Number(item.dimensions) || 0)}`,
+            initialized: item.initializer != null,
             inFor: false,
             inCatch: false,
             inResource: true,
@@ -2976,6 +2983,7 @@ function localDeclarationsFromStatement(source) {
   return (declaration.declarators || []).map((item) => ({
     name: item.name,
     type: `${baseType}${'[]'.repeat(Number(item.dimensions) || 0)}`,
+    initialized: item.initializer != null,
     inFor,
     inCatch: false,
   }));
@@ -3054,6 +3062,15 @@ function rewriteDuplicateLocalDeclarations(lines) {
     const declaration = declarations[0];
     if (declaration.inCatch || declaration.inResource) continue;
     if (!seen.has(declaration.name)) { seen.add(declaration.name); continue; }
+    // A second declaration without an initializer has no executable effect;
+    // after the first declaration it must disappear rather than becoming the
+    // invalid expression statement `name;`. This decision comes from the
+    // parsed declaration AST, not source-pattern rewriting.
+    if (!declaration.initialized && !declaration.inFor) {
+      lines.splice(i, 1);
+      i -= 1;
+      continue;
+    }
     lines[i] = stripDeclarationType(lines[i], declaration.name, declaration.inFor);
   }
 }
@@ -9084,5 +9101,6 @@ module.exports = {
     formatFloat,
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
+    rewriteDuplicateLocalDeclarations,
   },
 };
