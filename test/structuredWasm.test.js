@@ -479,6 +479,35 @@ public class StructuredAlloc {
   t.end();
 });
 
+test('partial wasm leaves reference returns on the canonical tier', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredPartialReference', `
+public class StructuredPartialReference {
+  public static Object drive(Object[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += i;
+    Object result = String.valueOf(sum);
+    out[0] = result;
+    return result;
+  }
+}
+`);
+  const out = [null];
+  out.type = '[Ljava/lang/Object;';
+  await invoke(jvm, thread, 'StructuredPartialReference', 'drive',
+    '([Ljava/lang/Object;I)Ljava/lang/Object;', [out, 100]);
+  t.equal(String(out[0]), '4950',
+    'the canonical tier preserves the reference result after the loop');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredPartialReference', 'drive',
+    '([Ljava/lang/Object;I)Ljava/lang/Object;');
+  const state = jvm.jit.wasmJit.state.get(method);
+  t.equal(state?.status, 'failed',
+    'the partial reference-return module is not installed');
+  t.equal(state?.failReason, 'partial module has a reference return',
+    'the rejection is structural and independent of method identity');
+  t.end();
+});
+
 test('compiled newarray throws a catchable NegativeArraySizeException', async (t) => {
   const { jvm, thread } = await makeHarness(t, 'StructuredNegSize', `
 public class StructuredNegSize {

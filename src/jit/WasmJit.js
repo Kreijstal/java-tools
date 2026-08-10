@@ -1957,6 +1957,7 @@ class WasmJit {
     this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
+    this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
     this.fieldCacheEnabled = env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
     this.typedArrayStoresEnabled =
       env.JVM_DISABLE_WASM_TYPED_ARRAY_STORES !== '1';
@@ -2143,6 +2144,17 @@ class WasmJit {
         structuredMeta = null;
       }
       const primary = structuredMeta || meta;
+      // A partial module may stop after consuming a reference-producing call
+      // or immediately before object construction, then resume through the
+      // canonical scheduler. Until every such edge carries a verifier-backed
+      // reference return slot, do not let it publish a successful non-void
+      // completion to an already-resumed caller. Primitive and void kernels
+      // retain partial Wasm, as do reference-returning methods whose complete
+      // normal flow stays inside one module.
+      if (!primary.fullyCompiled &&
+          (primary.retChar === 'L' || primary.retChar === '[')) {
+        throw new Unsupported('partial module has a reference return');
+      }
       // A partial module can leave and later resume with locals captured
       // before its first compiled block. Until boolean-static values have a
       // verifier-backed spill proof across every unsupported edge, keep this
@@ -2316,6 +2328,26 @@ class WasmJit {
         return { handled: true, deopted: true };
       }
       throw err;
+    }
+
+    if (this.traceMethodPattern && st.key &&
+        st.key.includes(this.traceMethodPattern)) {
+      const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
+      console.error('[wasmjit-transition] ' + JSON.stringify({
+        method: st.key,
+        nested,
+        osr,
+        entryBlock: blk,
+        status,
+        framePc: frame.pc,
+        stackDepth: frame.stack.items.length,
+        returnedValueType: meta.box.ret === undefined ? 'undefined'
+          : meta.box.ret === null ? 'null'
+            : meta.box.ret && (meta.box.ret.type || meta.box.ret._className) ||
+              typeof meta.box.ret,
+        top: top && `${top.className || '?'}.${
+          top.method?.name || '?'}${top.method?.descriptor || ''}`,
+      }));
     }
 
     if (status === -3) {

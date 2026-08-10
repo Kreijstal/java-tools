@@ -2862,6 +2862,14 @@ class JitCompiler {
     }
     this.compileLabelMap = buildLabelMap(codeItems);
     this.compileSynchronous = synchronous;
+    const syncCallTracePattern = typeof process !== "undefined" && process.env
+      ? process.env.JVM_TRACE_SYNC_CALLS || "" : "";
+    const syncCallTraceIdentity = syncCallTracePattern
+      ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
+        "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`
+      : "";
+    this.compileTraceSyncCalls = Boolean(syncCallTracePattern &&
+      syncCallTraceIdentity.includes(syncCallTracePattern));
     this.compileDirectInlineCount = 0;
     let directInlineCount = 0;
     const body = [
@@ -2942,6 +2950,7 @@ class JitCompiler {
     } finally {
       this.compileLabelMap = null;
       this.compileSynchronous = false;
+      this.compileTraceSyncCalls = false;
       this.compileDirectInlineCount = 0;
     }
 
@@ -2952,10 +2961,23 @@ class JitCompiler {
     body.push("thread.callStack.pop();");
     body.push("return { returned: true, value: helpers.returnVoid() };");
 
+    const generatedSource = body.join("\n");
+    const tracePattern = typeof process !== "undefined" && process.env
+      ? process.env.JVM_TRACE_JIT_METHOD || "" : "";
+    if (tracePattern && process.env.JVM_TRACE_JIT_SOURCE === "1") {
+      const traceIdentity =
+        `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
+          "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`;
+      if (traceIdentity.includes(tracePattern)) {
+        console.error("[jit-generated-source] " + traceIdentity + "\n" +
+          generatedSource);
+      }
+    }
+
     try {
       const generated = this.createGeneratedFunction(method,
         synchronous ? "generated-sync" : "generated-async",
-        ["frame", "thread", "helpers", "initialBytecodeChecks"], body.join("\n"),
+        ["frame", "thread", "helpers", "initialBytecodeChecks"], generatedSource,
         null, !synchronous);
       generated.jvmSynchronous = synchronous;
       generated.jvmDirectInlineCount = directInlineCount;
@@ -3744,7 +3766,10 @@ class JitCompiler {
             return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} ${guardFailure} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
           }
           const callSiteId = this.registerSyncCallSite(op, instruction);
-          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
+          const traceCall = this.compileTraceSyncCalls
+            ? `helpers.traceSyncCallAt(${callSiteId}, frame, thread, value, sp);`
+            : "";
+          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); ${traceCall} if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { return { deopt: true, transient: true, reason: "synchronous ${op} left active child" }; } if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
         }
         return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
@@ -4903,6 +4928,30 @@ class JitCompiler {
       targets: new Map(),
     };
     return id;
+  }
+
+  traceSyncCallAt(id, frame, thread, value, scalarDepth) {
+    const site = this.syncCallSites[id];
+    const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
+    const identity = (candidate) => candidate
+      ? `${candidate.className || "?"}.${candidate.method?.name || "?"}${
+        candidate.method?.descriptor || ""}` : null;
+    console.error("[jit-sync-call] " + JSON.stringify({
+      caller: identity(frame),
+      callerPc: frame.pc,
+      target: site && `${site.declaredClassName}.${site.methodName}${
+        site.descriptor}`,
+      scalarDepth,
+      materializedDepth: frame.stack.items.length,
+      result: value === ASYNC_INVOKE ? "async"
+        : value === RETURN_VOID ? "void"
+          : value && value.deopt ? `deopt:${value.reason || "unspecified"}`
+            : value === null ? "null"
+              : value === undefined ? "undefined"
+                : value && (value.type || value._className) || typeof value,
+      top: identity(top),
+      callerOwnsStack: top === frame,
+    }));
   }
 
   getCompileTimeDirectJre(op, instruction) {

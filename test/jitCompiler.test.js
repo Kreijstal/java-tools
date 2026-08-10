@@ -82,6 +82,50 @@ public class GeneratedReturnGuardHarness {
   t.end();
 });
 
+test('baseline callers stop immediately when synchronous dispatch leaves a child', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedInvokeChildGuardHarness', `
+public class GeneratedInvokeChildGuardHarness {
+  private static int child() { return 7; }
+  public static int caller() { return child(); }
+}
+`);
+  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  await jvm.loadClassByName('GeneratedInvokeChildGuardHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'GeneratedInvokeChildGuardHarness', 'caller', '()I');
+  const generated = jvm.jit.compileBaselineMethod(method);
+  const frame = new Frame(method);
+  frame.className = 'GeneratedInvokeChildGuardHarness';
+  const activeChild = new Frame(method);
+  activeChild.className = 'ArbitrarySchedulerVisibleChild';
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null,
+    callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  const originalInvoke = jvm.jit.tryInvokeSyncAt;
+  jvm.jit.tryInvokeSyncAt = () => {
+    thread.callStack.push(activeChild);
+    return jvm.jit.returnVoid();
+  };
+  t.teardown(() => { jvm.jit.tryInvokeSyncAt = originalInvoke; });
+
+  let result;
+  t.doesNotThrow(() => { result = generated(frame, thread, jvm.jit, false); },
+    'a missing non-void result cannot underflow the generated operand stack');
+  t.ok(result?.deopt && result.transient,
+    'the caller yields to the scheduler while its child owns execution');
+  t.equal(result?.reason, 'synchronous invokestatic left active child',
+    'the call boundary reports the structural ownership failure');
+  t.equal(frame.pc, 1,
+    'the caller remains at the verified post-invoke continuation');
+  t.deepEqual(frame.stack.items, [],
+    'the caller does not fabricate or consume a return operand');
+  t.deepEqual(thread.callStack.items, [frame, activeChild],
+    'both frames remain visible to canonical scheduling');
+  t.end();
+});
+
 test('structured returns materialize instead of retiring an active child', async (t) => {
   const classpath = compileJavaFixture(t, 'StructuredReturnGuardHarness', `
 public class StructuredReturnGuardHarness {
