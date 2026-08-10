@@ -434,7 +434,7 @@ test('dead-flag discovery: rejects writes guarded by the same field', (t) => {
   t.end();
 });
 
-test('dead-flag discovery: accepts terminal self-increment int sentinel when enabled', (t) => {
+test('dead-flag discovery: rejects terminal self-increment int sentinels', (t) => {
   const ast = astWithClasses([
     {
       className: 'client',
@@ -474,7 +474,11 @@ test('dead-flag discovery: accepts terminal self-increment int sentinel when ena
     allowIntFlags: true,
     allowTerminalSelfIncrementFlags: true,
   });
-  t.ok(enabled.fields.includes('client.G'));
+  // A terminal store is still a real state transition. The method can run
+  // again, at which point consumers observe a non-zero value. A previous
+  // opt-in ignored this write and folded live sentinels in complete gamepacks.
+  t.notOk(enabled.fields.includes('client.G'));
+  t.ok(enabled.rejected.includes('client.G'));
   t.end();
 });
 

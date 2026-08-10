@@ -535,7 +535,6 @@ function runDeadStaticBoolFlag(astRoot, options = {}) {
 
 function discoverDeadStaticFlags(astRoot, options = {}) {
   const allowIntFlags = !!options.allowIntFlags;
-  const allowTerminalSelfIncrementFlags = !!options.allowTerminalSelfIncrementFlags;
   const allowMutuallyGuardedFalseCycles = !!options.allowMutuallyGuardedFalseCycles;
   const candidates = collectZeroStaticFields(astRoot, { allowIntFlags });
   const writesByField = collectStaticWrites(astRoot, candidates);
@@ -546,9 +545,6 @@ function discoverDeadStaticFlags(astRoot, options = {}) {
 
   for (const [key, writes] of writesByField) {
     for (const write of writes) {
-      if (allowTerminalSelfIncrementFlags && isTerminalSelfIncrementWrite(write, key, candidates)) {
-        continue;
-      }
       // A write that can only ever store zero cannot make the field true, so
       // it needs no reachability argument at all.
       if (writesOnlyZero(write.codeItems, write.index)) continue;
@@ -661,53 +657,6 @@ function findCyclicDependencies(deps, rejected) {
     if (!rejected.has(key) && !indices.has(key)) visit(key);
   }
   return cyclic;
-}
-
-function isTerminalSelfIncrementWrite(write, key, candidates) {
-  const candidate = candidates.get(key);
-  if (!candidate || candidate.desc !== 'I') return false;
-  const putInsn = write.codeItems[write.index] && write.codeItems[write.index].instruction;
-  if (getOp(putInsn) !== 'putstatic') return false;
-  const load = previousInstruction(write.codeItems, write.index);
-  if (!load || !ILOAD_OPS.has(getOp(load.item.instruction))) return false;
-  const local = localOf(getOp(load.item.instruction), getArg(load.item.instruction));
-  if (local == null) return false;
-  const inc = previousInstruction(write.codeItems, load.index);
-  if (!inc || getOp(inc.item.instruction) !== 'iinc' || localOfIinc(inc.item.instruction) !== local) return false;
-  if (!isLocalLoadedFromField(write.codeItems, key, local, inc.index)) return false;
-  return hasOnlyTerminalFlowAfter(write.codeItems, write.index);
-}
-
-function isLocalLoadedFromField(codeItems, key, local, beforeIdx) {
-  for (let i = 0; i < beforeIdx; i += 1) {
-    const item = codeItems[i];
-    const insn = item && item.instruction;
-    if (!insn || getOp(insn) !== 'getstatic') continue;
-    const ref = fieldRefOf(getArg(insn));
-    if (!ref || fieldKey(ref) !== key) continue;
-    const next = nextInstruction(codeItems, i);
-    if (!next || !ISTORE_OPS.has(getOp(next.item.instruction))) continue;
-    if (localOf(getOp(next.item.instruction), getArg(next.item.instruction)) === local) return true;
-  }
-  return false;
-}
-
-function hasOnlyTerminalFlowAfter(codeItems, index) {
-  const labels = collectLabelIndices(codeItems);
-  for (let i = index + 1; i < codeItems.length; i += 1) {
-    const item = codeItems[i];
-    const insn = item && item.instruction;
-    if (!insn) continue;
-    const op = getOp(insn);
-    if (op === 'return' || op === 'athrow') continue;
-    if (op === 'goto') {
-      const target = labels.get(trimLabel(getArg(insn)));
-      if (target == null || target <= index) return false;
-      continue;
-    }
-    return false;
-  }
-  return true;
 }
 
 function collectZeroStaticFields(astRoot, opts) {
