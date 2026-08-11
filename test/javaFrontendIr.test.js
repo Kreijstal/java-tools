@@ -46,6 +46,63 @@ public class RefArraySmoke {
 }
 `;
 
+const STATIC_ARRAY_OVERLOAD_SMOKE_SOURCE = `
+public class StaticArrayOverloadSmoke {
+  static byte[] bytes;
+  static String[] strings;
+  static int index() { return 0; }
+  static void choose(int marker, byte[] value, int x, int y) {}
+  static void choose(int marker, String value, int x, int y) {}
+  static void call() {
+    choose(index(), strings[index()], 0, 0);
+  }
+}
+`;
+
+const INSTANCE_SUBTYPE_OVERLOAD_SMOKE_SOURCE = `
+class InstanceSubtypeBase {}
+class InstanceSubtypeLeaf extends InstanceSubtypeBase {}
+class InstanceSubtypeSink {
+  void accept(java.awt.Component value) {}
+  void accept(InstanceSubtypeBase value) {}
+}
+public class InstanceSubtypeOverloadSmoke {
+  static void call(InstanceSubtypeSink sink, InstanceSubtypeLeaf value) {
+    sink.accept(value);
+  }
+}
+`;
+
+const LOCAL_STATE_SWITCH_SMOKE_SOURCE = `
+public class LocalStateSwitchSmoke {
+  static int run(int initial) {
+    class State {
+      int state;
+      int total;
+      State(int value) { this.state = value; }
+      void step() {
+        stateLoop: while (true) {
+          switch (state) {
+            case 0:
+              total = 7;
+              state = 1;
+              continue stateLoop;
+            case 1:
+              total += 3;
+              return;
+            default:
+              return;
+          }
+        }
+      }
+    }
+    State state = new State(initial);
+    state.step();
+    return state.total;
+  }
+}
+`;
+
 const ARRAY_INITIALIZER_SMOKE_SOURCE = `
 public class ArrayInitializerSmoke {
   public static void main(String[] args) {
@@ -765,6 +822,57 @@ test('array load and store compile through IR', (t) => {
   t.ok(initializerOpcodes.includes('bastore'), 'byte array initializer stores are emitted');
   t.ok(initializerOpcodes.includes('iastore'), 'int array initializer stores are emitted');
   t.ok(initializerOpcodes.includes('checkcast'), 'array-to-reference assignment coercion is emitted');
+  t.end();
+});
+
+test('static overload resolution uses an array access own type before context', (t) => {
+  const result = frontend.compileJavaSource(STATIC_ARRAY_OVERLOAD_SMOKE_SOURCE, {
+    sourceFileName: 'StaticArrayOverloadSmoke.java',
+  });
+  const call = result.bytecodeIr.classes[0].methods
+    .find((method) => method.name === 'call').instructions
+    .find((instruction) => instruction.opcode === 'invokestatic' &&
+      instruction.operands && instruction.operands[2] === 'choose');
+
+  t.equal(result.bytecodeIr.status, 'complete',
+    'same-arity array overloads compile completely');
+  t.equal(call && call.operands[3], '(ILjava/lang/String;II)V',
+    'the selected overload follows the String[] element type, not declaration order');
+  t.end();
+});
+
+test('instance overload resolution follows the argument class hierarchy', (t) => {
+  const result = frontend.compileJavaSource(INSTANCE_SUBTYPE_OVERLOAD_SMOKE_SOURCE, {
+    sourceFileName: 'InstanceSubtypeOverloadSmoke.java',
+  });
+  const call = result.bytecodeIr.classes
+    .find((classIr) => classIr.internalName === 'InstanceSubtypeOverloadSmoke')
+    .methods.find((method) => method.name === 'call').instructions
+    .find((instruction) => instruction.opcode === 'invokevirtual' &&
+      instruction.operands && instruction.operands[2] === 'accept');
+
+  t.equal(result.bytecodeIr.status, 'complete',
+    'same-arity reference overloads compile completely');
+  t.equal(call && call.operands[3], '(LInstanceSubtypeBase;)V',
+    'the nearest assignable superclass wins over an unrelated reference type');
+  t.end();
+});
+
+test('local state classes lower declared fields and switch selectors', (t) => {
+  const result = frontend.compileJavaSource(LOCAL_STATE_SWITCH_SMOKE_SOURCE, {
+    sourceFileName: 'LocalStateSwitchSmoke.java',
+  });
+  t.equal(result.bytecodeIr.status, 'complete',
+    'a local class state machine compiles completely');
+  const stateClass = result.javaIr.classes.find((classIr) =>
+    classIr.internalName.endsWith('$State'));
+  t.ok(stateClass, 'the local class is emitted as a synthetic class');
+  t.deepEqual((stateClass?.fields || []).map((field) => field.name),
+    ['state', 'total'],
+    'declared state fields are retained without unrelated outer captures');
+  const step = stateClass?.methods.find((method) => method.name === 'step');
+  t.ok(JSON.stringify(step).includes('"op":"switch"'),
+    'the unqualified field selector lowers to an integer switch');
   t.end();
 });
 

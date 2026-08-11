@@ -145,6 +145,33 @@ test('Java parser structures Java 7 expression forms without fallback nodes', (t
   t.end();
 });
 
+test('Java parser distinguishes a parenthesized cast operand from a second cast', (t) => {
+  const source = `
+    class CastArgument {
+      static void accept(int marker, java.awt.Canvas canvas, int x, int y) {}
+      static void call(Object value) {
+        accept(-1, (java.awt.Canvas) (value), 0, 0);
+      }
+    }
+  `;
+  const document = frontend.parseJava(source);
+  const callMethod = document.root.typeDeclarations[0].body.find(
+    (member) => member.kind === 'MethodDeclaration' && member.name === 'call');
+  const invocation = callMethod.body.statements[0].expression;
+
+  t.equal(invocation.kind, 'MethodInvocationExpression',
+    'the statement remains a structured invocation');
+  t.equal(invocation.arguments.length, 4,
+    'the parenthesized cast operand does not consume the following argument');
+  t.equal(invocation.arguments[1].kind, 'CastExpression',
+    'the declared type remains the outer cast');
+  t.equal(invocation.arguments[1].expression.kind, 'ParenthesizedExpression',
+    'the cast value remains a parenthesized expression');
+  t.equal(invocation.arguments[1].expression.expression.name, 'value',
+    'the parenthesized identifier is preserved as the cast operand');
+  t.end();
+});
+
 test('Java parser parses every repo Java source file outside vendored dependencies', (t) => {
   const repoRoot = path.resolve(__dirname, '..');
   const files = collectJavaFiles(repoRoot)

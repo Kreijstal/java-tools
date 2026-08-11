@@ -1010,10 +1010,19 @@ class JvmSsaBlockRenderer {
         const callMember = instruction.arg[2];
         const callOwnerClass = typeof callOwner === "string"
           ? this.jit.jvm.classes[callOwner] : null;
-        const resolvedCallMethod = isStatic && callOwnerClass
+        const resolvedCallMethod = callOwnerClass
           ? this.jit.jvm.findMethod(
             callOwnerClass, callMember[0], callMember[1]) : null;
-        const selfRecursive = resolvedCallMethod === method;
+        const ownerDefinition = callOwnerClass?.ast?.classes?.[0] || null;
+        const ownerIsFinal = (ownerDefinition?.flags || []).includes("final") ||
+          (Number(ownerDefinition?.accessFlags) & 0x0010) !== 0;
+        const resolvedFlags = resolvedCallMethod?.flags || [];
+        const targetCannotOverride = isStatic || op === "invokespecial" ||
+          ownerIsFinal || resolvedFlags.includes("final") ||
+          resolvedFlags.includes("private") ||
+          (Number(resolvedCallMethod?.accessFlags) & (0x0010 | 0x0002)) !== 0;
+        const selfRecursive = resolvedCallMethod === method &&
+          targetCannotOverride;
         const directJre = this.jit.getCompileTimeDirectJre(op, instruction);
         const inline = directJre || !isStatic
           ? null : this.jit.getCompileTimeIntegerLeaf(instruction);
@@ -1066,6 +1075,11 @@ class JvmSsaBlockRenderer {
       (code.code.exceptionTable || []).length > 0 &&
       [...callSites.values()].some((site) =>
         !site.returnsVoid && site.id !== null && site.id !== undefined);
+    const hasSelfRecursiveCall = [...callSites.values()].some(
+      (site) => site.selfRecursive);
+    const hasIndependentlySuspendableCall = [...callSites.values()].some(
+      (site) => !site.selfRecursive &&
+        site.id !== null && site.id !== undefined);
     // An initialized boolean static is a useful speculative constant when it
     // controls a large diagnostic/feature branch.  Bind only its location and
     // observed Java truth value, guard that value at entry before any guest
@@ -2240,7 +2254,6 @@ class JvmSsaBlockRenderer {
       // value only within the block and only until a call/static write, so a
       // scheduler safe point or arbitrary guest effect can never stale it.
       const directStaticBlockValues = new Map();
-      const fieldArraySnapshots = new Map();
       // A successful primitive load proves that the same array/index pair is
       // non-null and in bounds for the remainder of this straight-line basic
       // block. Java primitive arrays never contain `undefined`, so a raw
@@ -3049,18 +3062,13 @@ class JvmSsaBlockRenderer {
               // guest call/write while this earlier array reference remains
               // live on the SSA operand stack. Snapshot its storage companion
               // so future cache maintenance cannot retarget this value.
-              let dataSnapshot = fieldArraySnapshots.get(cache);
-              if (!dataSnapshot) {
-                dataSnapshot = value();
-                lines.push(`const ${dataSnapshot} = ${cache.data};`);
-                fieldArraySnapshots.set(cache, dataSnapshot);
-              }
+              const dataSnapshot = value();
+              lines.push(`const ${dataSnapshot} = ${cache.data};`);
               arrayViews.set(out, dataSnapshot);
             }
             stack.push(out);
           }
         } else if (op === "putfield") {
-          fieldArraySnapshots.clear();
           const storedInput = pop(), objectInput = pop(), site = fieldSites.get(index);
           if (storedInput === null || objectInput === null || site === undefined) valid = false;
           else {
@@ -3203,7 +3211,6 @@ class JvmSsaBlockRenderer {
         } else if (op === "invokestatic" || op === "invokevirtual" ||
             op === "invokespecial" || op === "invokeinterface") {
           directStaticBlockValues.clear();
-          fieldArraySnapshots.clear();
           lines.push(...invalidateFieldReadCaches(
             callFieldWriteSummaries.get(index)));
           const site = callSites.get(index);
@@ -7830,6 +7837,7 @@ class JvmSsaBlockRenderer {
     const positionalCallDeclarationsFor = (
       omitSelfRecursive = false,
       alwaysRefreshCaptures = false,
+      forceCanonicalCalls = false,
     ) => {
       const lines = [];
       const captureSections = [];
@@ -7879,7 +7887,17 @@ class JvmSsaBlockRenderer {
           }
         }
         const rawBody = `ssaFastPositionalRawBody${index}`;
-        if (compileTimeCheckedLeaf) {
+        if (forceCanonicalCalls) {
+          lines.push(
+            `const ${positionalCallSiteVariable(index)} = ` +
+              `helpers.syncCallSites[${site.id}];`,
+            ...captureLines,
+            `const ${positionalCallTargetVariable(index)} = null;`,
+            `const ${positionalCallInvokeVariable(index)} = null;`,
+            `const ${positionalCallRawInvokeVariable(index)} = null;`,
+            `const ${positionalCallReceiverVariable(index)} = null;`,
+          );
+        } else if (compileTimeCheckedLeaf) {
           lines.push(
             `const ${rawBody} = ` +
               `helpers.directCheckedLeafBodies[${site.directCheckedLeaf.id}];`,
@@ -7921,8 +7939,16 @@ class JvmSsaBlockRenderer {
       }
       return {lines, captureSections};
     };
+    // A continuation that owns both recursive calls and independent scheduler
+    // handoffs cannot safely mix lexical continuation state with nested
+    // positional children.  The method's own Frame was already retained for
+    // this shape; keep its child calls canonical as well so every non-void
+    // return has one unambiguous JVM operand-stack owner.  This is derived
+    // entirely from resolved call identities and CFG shape.
+    const canonicalNestedCalls = useContinuations &&
+      hasSelfRecursiveCall && hasIndependentlySuspendableCall;
     const positionalCallDeclarationSet =
-      positionalCallDeclarationsFor(false, true);
+      positionalCallDeclarationsFor(false, true, canonicalNestedCalls);
     const positionalCallDeclarations = positionalCallDeclarationSet.lines;
     const directPositionalCallDeclarationSet =
       positionalCallDeclarationsFor(true);
@@ -8307,11 +8333,20 @@ class JvmSsaBlockRenderer {
         (effectfulFieldPositionalEnabled ||
           cache.eagerLocal !== null && cache.eagerLocal !== undefined)),
     );
-    const hasSelfRecursiveCall = [...callSites.values()].some(
-      (site) => site.selfRecursive);
-    const hasIndependentlySuspendableCall = [...callSites.values()].some(
-      (site) => !site.selfRecursive &&
-        site.id !== null && site.id !== undefined);
+    // A handler-protected ordinary method with a non-void child needs the
+    // canonical caller Frame to own the child's eventual return operand.  The
+    // same proof already selects the baseline framed entry above; publishing
+    // a restoring positional entry would bypass that decision and can resume
+    // the caller with the invoke operands shifted after a scheduler handoff.
+    // Verified constructors are retained: their restricted invokespecial
+    // graph is proven separately by isJitSafeConstructor.
+    if (restoringDirectPositionalEligible &&
+        requiresBaselineFramedEntry &&
+        !this.jit.isJitSafeConstructor(method, items)) {
+      restoringDirectPositionalEligible = false;
+      restoringDirectRejection =
+        "handler-protected non-void call requires a canonical caller frame";
+    }
     // Direct self-recursion omits one JVM Frame per recursive level. That is
     // safe for a closed recursive kernel: any scalar deopt unwinds through
     // every generated invocation and restores the omitted levels in order.
@@ -10372,6 +10407,7 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredRequiresBaselineFramedEntry =
         requiresBaselineFramedEntry;
       generated.jvmStructuredContinuation = useContinuations;
+      generated.jvmStructuredCanonicalNestedCalls = canonicalNestedCalls;
       // A call-bearing body may leave a scheduler-visible child Frame. The
       // positional wrapper can restore one omitted caller immediately beneath
       // that child, so ordinary acyclic call graphs retain their fast scalar

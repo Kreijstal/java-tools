@@ -4772,14 +4772,20 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
     if (op === 'arraylength') {
       const array = pop(stack);
       let rendered = array;
+      let genericArrayLength = false;
       if (!simplifyType(array.type).endsWith('[]')) {
         if (array.type === 'Object') localState.refineExpressionType(array, 'Object[]');
         // The verifier proves an array here even when a reused source local was
-        // inferred as another reference type. Cast through Object when needed.
+        // inferred as another reference type. A collapsed carrier can merge
+        // primitive and reference arrays, so Object[] is not a valid generic
+        // receiver. java.lang.reflect.Array preserves arraylength for every
+        // verifier-valid array kind (including the exact null exception).
         const refined = localState.sourceTypeForName(array.code);
-        if (!refined || !refined.endsWith('[]')) rendered = coerceExpressionForType(array, 'Object[]');
+        if (!refined || !refined.endsWith('[]')) genericArrayLength = true;
       }
-      stack.push(expr(`${wrap(rendered, 100)}.length`, 'int'));
+      stack.push(expr(genericArrayLength
+        ? `java.lang.reflect.Array.getLength(${array.code})`
+        : `${wrap(rendered, 100)}.length`, 'int'));
       continue;
     }
 
@@ -8080,6 +8086,9 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
   const currentReferenceKeys = new Map();
   const referenceDefinitions = new Map();
   const objectLoadBindings = new Map();
+  const objectSlotReachability = code ? computeObjectSlotReachability(code) : null;
+  const objectLoadReachability = new Map((objectSlotReachability?.loads || [])
+    .map((load) => [`${load.slot}:${load.pc}`, load.reaching]));
   let syntheticCounter = 0;
   let constructorInvocation = null;
 
@@ -8353,10 +8362,28 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
     load(index, fallbackType = 'Object', pc = null) {
       let key = null;
       if (fallbackType === 'Object' && Number.isFinite(Number(pc))) {
-        const prior = (referenceDefinitions.get(index) || [])
-          .filter((item) => item.pc < Number(pc))
-          .sort((a, b) => b.pc - a.pc)[0];
-        if (prior) key = prior.key;
+        const reachingPcs = objectLoadReachability.get(
+          `${index}:${Number(pc)}`);
+        const keysByPc = new Map((referenceDefinitions.get(index) || [])
+          .map((definition) => [definition.pc, definition.key]));
+        const reachingKeys = new Set((reachingPcs || [])
+          .map((storePc) => keysByPc.get(storePc))
+          .filter((candidate) => candidate !== undefined));
+        if (reachingKeys.size === 1) {
+          key = [...reachingKeys][0];
+        } else if (Array.isArray(reachingPcs) && reachingPcs.length === 0 &&
+            initiallyDeclared.has(index)) {
+          // Recursive CFG rendering can visit a later store before an earlier
+          // block. With no bytecode store reaching this load, retain the
+          // declared parameter/receiver binding rather than the renderer's
+          // traversal-time current key.
+          key = index;
+        } else {
+          const prior = (referenceDefinitions.get(index) || [])
+            .filter((item) => item.pc < Number(pc))
+            .sort((a, b) => b.pc - a.pc)[0];
+          if (prior) key = prior.key;
+        }
       }
       if (!key) key = ensure(index, fallbackType, false, false, pc);
       if (fallbackType === 'Object' && Number.isFinite(Number(pc))) {
@@ -8396,7 +8423,12 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       // block must not select the variable family for an earlier normal store.
       // Stores with a bytecode pc are bound from their own value/type; loads
       // subsequently select the nearest reaching definition by pc.
-      const key = ensure(index, effectiveType,
+      const initialType = initiallyDeclared.has(index)
+        ? simplifyType(types.get(index)) : null;
+      const storesIntoDeclaredReference = initialType &&
+        !primitiveTypes.has(initialType) && !primitiveTypes.has(effectiveType) &&
+        isSourceReferenceTypeAssignable(effectiveType, initialType, exceptionModel);
+      const key = storesIntoDeclaredReference ? index : ensure(index, effectiveType,
         Boolean(catchType) || Boolean(castType) || monitorStore || typedArrayElement || concreteReference,
         Number.isFinite(Number(pc)), pc);
       if (!['boolean', 'byte', 'char', 'short', 'int', 'long', 'float', 'double'].includes(simplifyType(inferred))) {
@@ -8411,7 +8443,11 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       }
       const name = names.get(key);
       const upgradeBlocked = typeof key === 'string' && key.endsWith(':ref') && isPlainForced(index);
-      if (!upgradeBlocked && (!types.has(key) || (types.get(key) === 'Object' && effectiveType !== 'Object'))) types.set(key, effectiveType);
+      if (!upgradeBlocked && !initiallyDeclared.has(key) &&
+          (!types.has(key) ||
+            (types.get(key) === 'Object' && effectiveType !== 'Object'))) {
+        types.set(key, effectiveType);
+      }
       const rendered = coerceExpressionForType(renderStoreExpression(value), types.get(key));
       if (!declared.has(key)) {
         declared.add(key);

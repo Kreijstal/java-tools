@@ -222,7 +222,11 @@ function parseBigInt(value) {
     return BigInt(value);
   }
   if (typeof value === 'string') {
-    return BigInt(value);
+    const trimmed = value.trim();
+    const normalized = /[lL]$/.test(trimmed)
+      ? trimmed.slice(0, -1)
+      : trimmed;
+    return BigInt(normalized);
   }
   throw new Error(`Unable to parse BigInt value from ${value}`);
 }
@@ -701,7 +705,15 @@ function resolveLdc2Index(builder, arg) {
   if (arg && typeof arg === 'object' && arg.type === 'Double') {
     return builder.addDouble(arg.value);
   }
-  return builder.addLong(arg);
+  // Generated Jasmin can retain a decimal ldc2_w operand as text when it was
+  // produced by a nested unary expression. A decimal/exponent token is
+  // unambiguously a double; only integral text (or an L-suffixed value) is a
+  // long. Preserve that distinction before BigInt parsing.
+  if (typeof arg === 'string' &&
+      /[.eE]/.test(arg) && Number.isFinite(Number(arg))) {
+    return builder.addDouble(Number(arg));
+  }
+  return builder.addLong(parseBigInt(arg));
 }
 
 function resolveBootstrapArgumentIndex(argument, builder) {

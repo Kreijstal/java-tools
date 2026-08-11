@@ -606,6 +606,17 @@ class FusedRegionCompiler {
       return null;
     }
     this.lastCompileFailure = null;
+    if (typeof process !== "undefined" && process.env &&
+        process.env.JVM_DEBUG_FUSED_REGIONS === "1") {
+      console.error("[fused-region] " + JSON.stringify({
+        wrapper: `${wrapperOwner}.${wrapperMethod.name}${wrapperMethod.descriptor}`,
+        raster: `${rasterRef.owner}.${rasterMethod.name}${rasterMethod.descriptor}`,
+        scanline: `${scanlineRef.owner}.${scanlineMethod.name}${scanlineMethod.descriptor}`,
+        semanticScanline: Boolean(region.semanticScanlinePlan),
+        semanticRaster: Boolean(region.genericRasterSafetyPlan),
+        semanticWrapper: Boolean(region.generatedWrapperKernel),
+      }));
+    }
     return region;
   }
 

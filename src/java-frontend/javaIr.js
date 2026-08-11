@@ -2537,6 +2537,84 @@ function methodMatchesArguments(method, args, isStatic = null) {
   });
 }
 
+function referenceConversionDistance(source, target, context) {
+  if (source === target) return 0;
+  if (typeof source !== 'string' || typeof target !== 'string') return null;
+  const sourceIsReference = source.startsWith('L') || source.startsWith('[');
+  const targetIsReference = target.startsWith('L') || target.startsWith('[');
+  if (!sourceIsReference || !targetIsReference) return null;
+  if (source.startsWith('[')) {
+    if (target === 'Ljava/lang/Object;' || target === 'Ljava/lang/Cloneable;' ||
+        target === 'Ljava/io/Serializable;') return 1;
+    if (!target.startsWith('[')) return null;
+    const sourceComponent = source.slice(1);
+    const targetComponent = target.slice(1);
+    if (sourceComponent.length === 1 || targetComponent.length === 1) {
+      return sourceComponent === targetComponent ? 1 : null;
+    }
+    const componentDistance = referenceConversionDistance(
+      sourceComponent, targetComponent, context);
+    return componentDistance === null ? null : componentDistance + 1;
+  }
+  if (target.startsWith('[')) return null;
+  const sourceOwner = internalNameFromDescriptor(source);
+  const targetOwner = internalNameFromDescriptor(target);
+  if (!sourceOwner || !targetOwner) return null;
+  const visited = new Set();
+  const pending = [{owner: sourceOwner, distance: 0}];
+  while (pending.length > 0) {
+    const current = pending.shift();
+    if (!current.owner || visited.has(current.owner)) continue;
+    if (current.owner === targetOwner) return current.distance;
+    visited.add(current.owner);
+    const superName = context.classSuperByInternalName &&
+      context.classSuperByInternalName.get(current.owner);
+    if (superName) pending.push({owner: superName, distance: current.distance + 1});
+    const interfaces = context.classInterfacesByInternalName &&
+      context.classInterfacesByInternalName.get(current.owner);
+    for (const iface of interfaces || []) {
+      pending.push({owner: iface, distance: current.distance + 1});
+    }
+  }
+  // Every reference is assignable to Object even when the source hierarchy
+  // belongs to an external class that is absent from the current source set.
+  return targetOwner === 'java/lang/Object' ? 100 : null;
+}
+
+function userMethodMatchScore(method, args, context, isStatic = null) {
+  if (!method || !Array.isArray(method.parameterDescriptors) ||
+      isStatic !== null && Boolean(method.isStatic) !== isStatic) return null;
+  const prepared = prepareMethodArguments(method, args);
+  if (!prepared) return null;
+  let score = method.isVarargs ? 1000 : 0;
+  for (let index = 0; index < prepared.length; index += 1) {
+    const argument = args[index];
+    const parameter = method.parameterDescriptors[index];
+    if (!argument || !parameter) continue;
+    if (argument.type === parameter) continue;
+    if (argument.literalKind === 'null' &&
+        (parameter.startsWith('L') || parameter.startsWith('['))) {
+      score += 100;
+      continue;
+    }
+    const distance = referenceConversionDistance(argument.type, parameter, context);
+    if (distance !== null) {
+      score += distance;
+      continue;
+    }
+    // Retain the frontend's established primitive conversion behavior. An
+    // explicit reference CastValue already carries its target descriptor and
+    // therefore reaches the reference-distance path above.
+    if (!(argument.type.startsWith('L') || argument.type.startsWith('[')) &&
+        !(parameter.startsWith('L') || parameter.startsWith('['))) {
+      score += 10;
+      continue;
+    }
+    return null;
+  }
+  return score;
+}
+
 function prepareMethodArguments(method, args) {
   if (!method) return null;
   if (!Array.isArray(method.parameterDescriptors)) {
@@ -2705,7 +2783,15 @@ function selectUserMethodDescriptor(owner, name, args, context, isStatic = null)
       && candidate.parameterDescriptors.length === args.length
       && args.every((arg, index) => arg && arg.type === candidate.parameterDescriptors[index])
     ));
-    const method = exact || candidates.find((candidate) => methodMatchesArguments(candidate, args, isStatic));
+    const ranked = candidates
+      .map((candidate, index) => ({
+        candidate,
+        index,
+        score: userMethodMatchScore(candidate, args, context, isStatic),
+      }))
+      .filter((entry) => entry.score !== null)
+      .sort((left, right) => left.score - right.score || left.index - right.index);
+    const method = exact || ranked[0]?.candidate;
     if (method) return method;
   }
   const methods = context.classMethodsByInternalName && context.classMethodsByInternalName.get(owner);
@@ -3222,7 +3308,50 @@ function registerSyntheticClassMembers(classIr, context) {
   context.classFieldsByInternalName.set(classIr.internalName, fields);
 }
 
-function captureValuesForLocalClass(context) {
+function localClassDeclaredNames(declaration) {
+  const names = new Set();
+  const visit = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    if (Array.isArray(node.parameters)) {
+      for (const parameter of node.parameters) {
+        if (parameter && parameter.name) names.add(parameter.name);
+      }
+    }
+    if (Array.isArray(node.declarators)) {
+      for (const declarator of node.declarators) {
+        if (declarator && declarator.name) names.add(declarator.name);
+      }
+    }
+    if (node.parameter && node.parameter.name) names.add(node.parameter.name);
+    for (const value of Object.values(node)) visit(value);
+  };
+  visit(declaration);
+  return names;
+}
+
+function localClassReferencedIdentifiers(declaration) {
+  const names = new Set();
+  const visit = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child);
+      return;
+    }
+    if (node.kind === 'Identifier' && node.name) names.add(node.name);
+    for (const value of Object.values(node)) visit(value);
+  };
+  visit(declaration);
+  return names;
+}
+
+function captureValuesForLocalClass(context, declaration = null) {
+  const referenced = declaration
+    ? localClassReferencedIdentifiers(declaration) : null;
+  const declared = declaration ? localClassDeclaredNames(declaration) : null;
   const captures = [];
   if (!context.currentMethodIsStatic && context.localByName && context.localByName.has('this')) {
     const thisLocal = context.localByName.get('this');
@@ -3235,6 +3364,7 @@ function captureValuesForLocalClass(context) {
   }
   for (const local of context.locals || []) {
     if (!local || local.name === 'this' || !local.id || !local.id.startsWith('local:')) continue;
+    if (referenced && (!referenced.has(local.name) || declared.has(local.name))) continue;
     captures.push({
       name: local.name,
       fieldName: `val$${local.name}`,
@@ -3248,7 +3378,7 @@ function captureValuesForLocalClass(context) {
 function lowerLocalClassDeclaration(statement, context) {
   const declaration = statement && statement.declaration;
   if (!declaration || !isClassLikeDeclaration(declaration)) return null;
-  const captures = captureValuesForLocalClass(context);
+  const captures = captureValuesForLocalClass(context, declaration);
   const owner = `${context.classInternalName}$${declaration.name}`;
   context.classBySimpleName.set(declaration.name, owner);
   context.classBySimpleName.set(`${context.className}.${declaration.name}`, owner);
@@ -3256,6 +3386,11 @@ function lowerLocalClassDeclaration(statement, context) {
     context.constructorCaptureArgsByOwner.set(owner, captures.map((capture) => capture.value));
   }
   const classTypeParameters = buildTypeParameterErasureMap(declaration.typeParameters || []);
+  const classTypeContext = {
+    typeParameters: classTypeParameters,
+    classBySimpleName: context.classBySimpleName,
+    fallbackUnsupportedTypes: context.fallbackUnsupportedTypes === true,
+  };
   const fieldByName = new Map();
   const fields = [];
   for (const capture of captures) {
@@ -3274,10 +3409,51 @@ function lowerLocalClassDeclaration(statement, context) {
       isStatic: false,
     });
   }
+  for (const member of declaration.body || []) {
+    if (member.kind !== 'FieldDeclaration') continue;
+    for (const declarator of member.declarators || []) {
+      const descriptor = typeDescriptor(member.fieldType, classTypeContext);
+      fields.push(createJavaIrField({
+        name: declarator.name,
+        descriptor,
+        access: modifierNames(member.modifiers),
+        initializer: null,
+        meta: { signature: typeSignature(member.fieldType, classTypeContext) },
+      }));
+      fieldByName.set(declarator.name, {
+        owner,
+        name: declarator.name,
+        descriptor,
+        signature: typeSignature(member.fieldType, classTypeContext),
+        isStatic: modifierNames(member.modifiers).includes('static'),
+      });
+    }
+  }
+  const methodByName = new Map();
+  const methodOverloadsByName = new Map();
+  for (const member of declaration.body || []) {
+    if (member.kind !== 'MethodDeclaration' && member.kind !== 'ConstructorDeclaration') continue;
+    const name = member.kind === 'ConstructorDeclaration' ? '<init>' : member.name;
+    const descriptor = methodDescriptor(member, classTypeContext);
+    const summary = {
+      name,
+      descriptor,
+      returnDescriptor: descriptor.slice(descriptor.indexOf(')') + 1),
+      parameterDescriptors: parameterDescriptorsFromMethodDescriptor(descriptor) || [],
+      isStatic: modifierNames(member.modifiers).includes('static'),
+      isVarargs: (member.parameters || []).some((parameter) => parameter.isVarargs),
+    };
+    methodByName.set(name, summary);
+    if (!methodOverloadsByName.has(name)) methodOverloadsByName.set(name, []);
+    methodOverloadsByName.get(name).push(summary);
+  }
+  context.classMethodsByInternalName.set(owner, methodByName);
+  context.classMethodOverloadsByInternalName.set(owner, methodOverloadsByName);
+  context.classFieldsByInternalName.set(owner, fieldByName);
   const classContext = {
     className: declaration.name,
     classInternalName: owner,
-    methodByName: new Map(),
+    methodByName,
     localByName: new Map(),
     classBySimpleName: context.classBySimpleName,
     classMethodsByInternalName: context.classMethodsByInternalName,
@@ -3291,15 +3467,45 @@ function lowerLocalClassDeclaration(statement, context) {
     isInterface: false,
     superName: 'java/lang/Object',
     typeParameters: classTypeParameters,
+    fallbackUnsupportedTypes: context.fallbackUnsupportedTypes === true,
     syntheticClasses: context.syntheticClasses,
+    instanceFieldInitializers: [],
+    instanceInitializerBlocks: [],
+    staticInitializerOps: [],
     allocateLambdaClassName: context.allocateLambdaClassName,
     constructorCaptureArgsByOwner: context.constructorCaptureArgsByOwner,
   };
-  const methods = [createCapturedClassConstructor(classContext, captures)];
+  for (const member of declaration.body || []) {
+    if (member.kind !== 'FieldDeclaration') continue;
+    for (const declarator of member.declarators || []) {
+      if (!declarator.initializer) continue;
+      const field = fieldByName.get(declarator.name);
+      const value = lowerExpressionToJavaIrValueAsDescriptor(
+        declarator.initializer, classContext, field.descriptor);
+      if (!value) continue;
+      if (field.isStatic) {
+        classContext.staticInitializerOps.push(createJavaIrOp('putStaticField', {
+          owner, name: field.name, descriptor: field.descriptor, value,
+          sourceNodeKind: member.kind,
+        }));
+      } else {
+        classContext.instanceFieldInitializers.push({
+          name: field.name, descriptor: field.descriptor, value,
+          sourceNodeKind: member.kind,
+        });
+      }
+    }
+  }
+  const hasConstructor = (declaration.body || []).some(
+    (member) => member.kind === 'ConstructorDeclaration');
+  const methods = hasConstructor ? [] : [createCapturedClassConstructor(classContext, captures)];
   for (const member of declaration.body || []) {
     if (member.kind === 'MethodDeclaration' || member.kind === 'ConstructorDeclaration') {
       methods.push(lowerMethodToJavaIr(member, classContext, member.modifiers && modifierNames(member.modifiers).includes('static') ? 0 : 1));
     }
+  }
+  if (classContext.staticInitializerOps.length > 0) {
+    methods.push(createClassInitializerMethod(classContext));
   }
   const classIr = createJavaIrClass({
     name: declaration.name,
@@ -4421,27 +4627,47 @@ function lowerStaticUserMethodCall(expression, context, targetNameOverride = nul
   const ownerOverloads = context.classMethodOverloadsByInternalName
     && context.classMethodOverloadsByInternalName.get(owner);
   const candidates = ownerOverloads && ownerOverloads.get(expression.name);
-  const contextualMethod = Array.isArray(candidates)
-    ? candidates.find((candidate) => candidate.isStatic
-      && candidate.parameterDescriptors.length === (expression.arguments || []).length) : null;
-  const rawArgs = (expression.arguments || []).map((argument, index) => {
-    const expected = contextualMethod && contextualMethod.parameterDescriptors[index];
-    return (expected && lowerExpressionToJavaIrValueAsDescriptor(argument, context, expected))
-      || lowerExpressionToJavaIrValue(argument, context);
-  });
-  const method = selectUserMethodDescriptorInHierarchy(owner, expression.name, rawArgs, context, true);
-  if (!method) return null;
-  const args = prepareMethodArguments(method, rawArgs);
-  if (!args) return null;
-  return {
-    kind: 'MethodCallValue',
-    type: method.returnDescriptor,
-    owner: method.declaredOwner || owner,
-    name: method.name,
-    descriptor: method.descriptor,
-    invokeKind: 'static',
-    args,
+  const buildCall = (method, rawArgs) => {
+    if (!method || !rawArgs.every(Boolean)) return null;
+    const args = prepareMethodArguments(method, rawArgs);
+    if (!args) return null;
+    return {
+      kind: 'MethodCallValue',
+      type: method.returnDescriptor,
+      owner: method.declaredOwner || owner,
+      name: method.name,
+      descriptor: method.descriptor,
+      invokeKind: 'static',
+      args,
+    };
   };
+  // Resolve arguments from their own expression types first. Selecting the
+  // first same-arity overload as context can coerce an array access toward an
+  // unrelated overload before overload resolution has seen its real type.
+  const rawArgs = (expression.arguments || []).map((argument) =>
+    lowerExpressionToJavaIrValue(argument, context));
+  if (rawArgs.every(Boolean)) {
+    const method = selectUserMethodDescriptorInHierarchy(
+      owner, expression.name, rawArgs, context, true);
+    const call = buildCall(method, rawArgs);
+    if (call) return call;
+  }
+  // Nulls and other genuinely context-dependent expressions still need an
+  // expected descriptor. Try every viable overload independently instead of
+  // allowing declaration order to choose one.
+  const contextualCandidates = Array.isArray(candidates)
+    ? candidates.filter((candidate) => candidate.isStatic &&
+      candidate.parameterDescriptors.length ===
+        (expression.arguments || []).length)
+    : [];
+  for (const candidate of contextualCandidates) {
+    const contextualArgs = (expression.arguments || []).map(
+      (argument, index) => lowerExpressionToJavaIrValueAsDescriptor(
+        argument, context, candidate.parameterDescriptors[index]));
+    const call = buildCall(candidate, contextualArgs);
+    if (call) return call;
+  }
+  return null;
 }
 
 function lowerKnownStaticMethodCall(expression, context) {
@@ -6593,7 +6819,12 @@ function lowerStatementToJavaIrOpsInner(statement, context) {
     // byte, short, and char selectors as well, all of which are widened here.
     const value = coerceValueToDescriptor(rawValue, 'I');
     if (!value || value.type !== 'I') {
-      return [javaIrUnsupported('unsupported switch expression', { sourceNodeKind: statement.expression && statement.expression.kind })];
+      const expressionShape = statement.expression
+        ? `${statement.expression.kind || 'unknown'}:${statement.expression.name || statement.expression.operator || ''}`
+        : 'null';
+      return [javaIrUnsupported(
+        `unsupported switch expression method=${context.currentMethodName || '<unknown>'} expression=${expressionShape} value=${rawValue ? `${rawValue.kind}:${rawValue.type}` : 'null'}`,
+        { sourceNodeKind: statement.expression && statement.expression.kind })];
     }
     const groups = [];
     for (const group of statement.groups || []) {
@@ -7163,7 +7394,7 @@ function lowerStatementToJavaIrOpsInner(statement, context) {
       sourceNodeKind: statement.expression && statement.expression.kind,
       text: statement.expression && statement.expression.text
         ? statement.expression.text
-        : `unsupported expression method=${context.currentMethodName || '<unknown>'} kind=${statement.expression ? statement.expression.kind : 'null'}${statement.expression && statement.expression.name ? ` name=${statement.expression.name}` : ''}${statement.expression && statement.expression.target ? ` target=${statement.expression.target.kind}` : ''} args=${statement.expression && Array.isArray(statement.expression.arguments) ? statement.expression.arguments.length : 0}`,
+        : `unsupported expression method=${context.currentMethodName || '<unknown>'} kind=${statement.expression ? statement.expression.kind : 'null'}${statement.expression && statement.expression.name ? ` name=${statement.expression.name}` : ''}${statement.expression && statement.expression.target ? ` target=${statement.expression.target.kind}${statement.expression.target.name ? `:${statement.expression.target.name}` : ''}` : ''} args=${statement.expression && Array.isArray(statement.expression.arguments) ? statement.expression.arguments.length : 0}`,
     })];
   }
   if (statement.kind === 'LocalVariableDeclarationStatement') {

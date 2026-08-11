@@ -4596,7 +4596,7 @@ public final class RecursiveSchedulerHandoffHarness {
     abstract Node first();
     abstract Node next();
   }
-  static void visit(Node node) {
+  void visit(Node node) {
     node.active = false;
     Node child = node.first();
     while (child != null) {
@@ -4626,6 +4626,13 @@ public final class RecursiveSchedulerHandoffHarness {
     'the rejection records the generic call-graph proof that failed');
   t.notOk(generated.jvmFramelessPositional,
     'the remaining positional entry is explicitly Frame-backed');
+  t.equal(generated.jvmStructuredContinuation, true,
+    'the loop retains its cooperative structured continuation');
+  t.equal(generated.jvmStructuredCanonicalNestedCalls, true,
+    'mixed recursive scheduler handoffs keep nested calls canonical');
+  t.match(generated.jvmStructuredSource,
+    /const ssaFastPositional\d+ = null;/,
+    'the generated continuation cannot enter a positional child');
   t.end();
 });
 
@@ -4662,17 +4669,20 @@ public final class HandledReturnHandoffHarness {
   const generated = jvm.jit.structuredSsa.compile(method);
   t.ok(generated?.jvmStructuredSsa,
     'the renderer retains the verified positional candidate');
-  t.equal(typeof generated?.jvmRestoringDirectPositionalBody, 'function',
-    'the protected call publishes a restoring positional entry');
   t.ok(generated.jvmStructuredRequiresBaselineFramedEntry,
     'the call and handler shape marks the ordinary frame ABI unsafe');
+  t.notOk(generated?.jvmRestoringDirectPositionalBody,
+    'the protected non-void handoff does not bypass the framed-entry proof');
+  t.equal(generated.jvmStructuredRestoringDirectRejection,
+    'handler-protected non-void call requires a canonical caller frame',
+    'the positional rejection records the scheduler ownership invariant');
   const selected = jvm.jit.compileMethod(method);
   t.notOk(selected.jvmStructuredSsa,
     'ordinary frame entry uses the baseline pending-return handoff');
-  t.ok(selected.jvmStructuredPositionalOnly,
-    'tier selection records that SSA is retained only as a positional body');
-  t.equal(typeof selected.jvmRestoringDirectPositionalBody, 'function',
-    'baseline selection preserves the verified nested-call kernel');
+  t.notOk(selected.jvmStructuredPositionalOnly,
+    'tier selection does not retain an unsafe positional-only body');
+  t.notOk(selected.jvmRestoringDirectPositionalBody,
+    'baseline selection keeps the protected caller wholly frame-backed');
   t.end();
 });
 
@@ -7510,6 +7520,69 @@ public final class StructuredFieldArrayRangeHarness {
     'a null cached array rejects the range version and throws canonically');
   t.equal(nullSource.frame.pc, firstLoadPc,
     'the null field array records the exact throwing load PC');
+  t.end();
+});
+
+test('structured SSA snapshots field arrays after receiver-cache rebinding',
+  async (t) => {
+  const className = 'StructuredFieldArrayAliasHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class StructuredFieldArrayAliasHarness {
+  Object[] values;
+
+  static void compare(StructuredFieldArrayAliasHarness first,
+      StructuredFieldArrayAliasHarness second, int[] out) {
+    out[0] = first.values[0] == second.values[1] ? 1 : 0;
+    out[1] = second.values[1] == null ? -1 : 7;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(className, 'compare',
+    `(L${className};L${className};[I)V`);
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmStructuredSsa,
+    'the two-receiver field-array method selects structured SSA');
+
+  const shared = { type: 'java/lang/Object', fields: {} };
+  const firstValues = [shared];
+  firstValues.type = '[Ljava/lang/Object;';
+  const secondValues = [{ type: 'java/lang/Object', fields: {} }, shared];
+  secondValues.type = '[Ljava/lang/Object;';
+  const first = {
+    type: className,
+    fields: { [`${className}.values`]: firstValues },
+  };
+  const second = {
+    type: className,
+    fields: { [`${className}.values`]: secondValues },
+  };
+  const out = [0, 0];
+  out.type = '[I';
+  const frame = new Frame(method);
+  frame.className = className;
+  frame.locals[0] = first;
+  frame.locals[1] = second;
+  frame.locals[2] = out;
+  const thread = {
+    status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  let error = null;
+  try {
+    generated(frame, thread, jvm.jit, false);
+  } catch (thrown) {
+    error = thrown;
+  }
+  t.equal(error, null, 'receiver cache rebinding completes without an exception');
+  t.deepEqual(out.slice(), [1, 7],
+    'each loaded array keeps the backing storage of its own receiver');
   t.end();
 });
 

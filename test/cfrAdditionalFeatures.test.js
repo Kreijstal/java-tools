@@ -537,6 +537,25 @@ LObjectEmptyReturn: areturn
     .end code
 .end method
 
+.method public mixedPrimitiveArrayLength : (Z)I
+    .code stack 2 locals 3
+LmixedStart: aconst_null
+LmixedNullStore: astore_2
+LmixedFlag: iload_1
+LmixedJoinIf: ifeq LmixedJoin
+LmixedLength: iconst_2
+LmixedNew: newarray float
+LmixedStoreArray: astore_2
+LmixedJoin: aload_2
+LmixedNull: ifnonnull LmixedLengthRead
+LmixedEmpty: iconst_m1
+LmixedEmptyReturn: ireturn
+LmixedLengthRead: aload_2
+LmixedArrayLength: arraylength
+LmixedReturn: ireturn
+    .end code
+.end method
+
 .method public booleanOrOne : (ZZ)I
     .code stack 1 locals 3
 LBooleanOrOneStart: iload_1
@@ -566,6 +585,34 @@ LUncheckedStore: istore_1
 LUncheckedEnd: goto LUncheckedReturn
 LUncheckedHandler: astore_1
 LUncheckedReturn: return
+    .end code
+.end method
+
+.method public static rebindParameterAfterLoop : (Ljava/lang/Object;I)I
+    .code stack 2 locals 4
+Lrebind0: aload_0
+Lrebind1: instanceof java/lang/String
+Lrebind4: ifne LrebindJoin
+Lrebind7: new java/lang/String
+Lrebind10: dup
+Lrebind11: invokespecial Method java/lang/String <init> ()V
+Lrebind14: astore_2
+Lrebind15: iconst_0
+Lrebind16: istore_3
+LrebindLoop: iload_3
+Lrebind19: iload_1
+Lrebind20: if_icmpge LrebindAssign
+Lrebind23: aload_0
+Lrebind24: invokevirtual Method java/lang/Object hashCode ()I
+Lrebind27: pop
+Lrebind28: iinc 3 1
+Lrebind31: goto LrebindLoop
+LrebindAssign: aload_2
+Lrebind35: astore_0
+LrebindJoin: aload_0
+Lrebind37: checkcast java/lang/String
+Lrebind40: invokevirtual Method java/lang/String length ()I
+Lrebind43: ireturn
     .end code
 .end method
 
@@ -893,7 +940,7 @@ test('CFR-JS distinguishes native runtime failures from Java declared throws', (
 });
 
 test('CFR-JS reconstructs additional expression and declaration features', (t) => {
-  t.plan(30);
+  t.plan(33);
   withTempDir('cfr-additional-', (tempDir) => {
     const source = decompileFixture(tempDir, 'AdditionalFeatureTest', ADDITIONAL_FEATURES_JASMIN);
 
@@ -928,12 +975,21 @@ test('CFR-JS reconstructs additional expression and declaration features', (t) =
       'primitive array opcodes refine an Object[] carrier to the verifier array type');
     t.match(source, /Object\[\] (\w+) = [^;]*;[\s\S]*?\1 = \(Object\[\]\) \(Object\) \(\w+\);/,
       'post-emission Object[] refinement casts earlier Object assignments');
+    t.match(source,
+      /mixedPrimitiveArrayLength\(boolean param0\)[\s\S]*?java\.lang\.reflect\.Array\.getLength\([A-Za-z_$][A-Za-z0-9_$]*\)/,
+      'arraylength preserves primitive arrays held by a collapsed reference carrier');
     t.match(source, /int booleanOrOne\(boolean param0, boolean param1\) \{\s*return param0 \? 1 : \(?param1 \? 1 : 0\)?;\s*}/,
       'mixed int/boolean ternary branches materialize verifier booleans as ints');
     t.match(source, /void writePrimitiveCarrier\(Object param0\) \{\s*\(\(int\[\]\) \(param0\)\)\[0\] = 7;\s*}/,
       'primitive array stores cast incompatible reference carriers at the lvalue');
     t.notOk(/if \(false\) throw \(NumberFormatException\) null;/.test(source),
       'unchecked catches do not receive a synthetic reachability anchor');
+    t.match(source,
+      /rebindParameterAfterLoop\(Object param0, int param1\)[\s\S]*?param0\.hashCode\(\)/,
+      'a later slot store cannot rename an earlier parameter load by CFG traversal order');
+    t.match(source,
+      /rebindParameterAfterLoop\(Object param0, int param1\)[\s\S]*?param0 = [^;]+;[\s\S]*?\(String\) \(param0\)/,
+      'a compatible subtype store and both join predecessors retain the declared parameter');
     t.ok(cfrInternals.isCheckedThrow('java/io/IOException'),
       'genuinely checked catches remain classified for javac reachability anchors');
   });

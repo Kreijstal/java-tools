@@ -264,6 +264,16 @@ function isSupportedTypeNode(type) {
   return true;
 }
 
+function canStartPrefixExpression(token) {
+  if (!token) return false;
+  if (isNameToken(token) ||
+      ['string', 'char', 'number'].includes(token.kind)) return true;
+  return [
+    '(', 'new', 'this', 'super', 'true', 'false', 'null',
+    '+', '-', '!', '~', '++', '--',
+  ].includes(token.text);
+}
+
 class TokenExpressionParser {
   constructor(owner, tokens) {
     this.owner = owner;
@@ -337,7 +347,9 @@ class TokenExpressionParser {
     }
     if (token.text === '(') {
       const close = findMatchingInTokens(this.tokens, this.index, '(', ')');
-      if (close > this.index && close < this.tokens.length - 1 && looksLikeCastType(this.tokens.slice(this.index + 1, close))) {
+      if (close > this.index && close < this.tokens.length - 1 &&
+          canStartPrefixExpression(this.tokens[close + 1]) &&
+          looksLikeCastType(this.tokens.slice(this.index + 1, close))) {
         const type = this.owner.typeFromTokens(this.tokens.slice(this.index + 1, close));
         if (type.kind !== 'UnsupportedType') {
           this.index = close + 1;
