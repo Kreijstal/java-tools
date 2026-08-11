@@ -126,6 +126,71 @@ public class GeneratedInvokeChildGuardHarness {
   t.end();
 });
 
+test('baseline callers do not replay a consumed asynchronous child call', async (t) => {
+  const classpath = compileJavaFixture(t, 'GeneratedAsyncChildGuardHarness', `
+public class GeneratedAsyncChildGuardHarness {
+  private static void child(int value) { }
+  public static int caller(int value) { child(value); return value + 1; }
+}
+`);
+  const jvm = new JVM({classpath, jit: {warmupThreshold: 0}});
+  await jvm.loadClassByName('GeneratedAsyncChildGuardHarness');
+  const method = await jvm.findMethodInHierarchy(
+    'GeneratedAsyncChildGuardHarness', 'caller', '(I)I');
+  const generated = jvm.jit.compileBaselineMethod(method);
+  const frame = new Frame(method);
+  frame.className = 'GeneratedAsyncChildGuardHarness';
+  frame.locals[0] = 41;
+  const activeChild = new Frame(method);
+  activeChild.className = 'ArbitrarySchedulerVisibleChild';
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null,
+    callStack: new Stack(),
+  };
+  thread.callStack.push(frame);
+  const originalInvoke = jvm.jit.tryInvokeSyncAt;
+  let consumesInvocation = true;
+  jvm.jit.tryInvokeSyncAt = (_id, caller, currentThread) => {
+    if (consumesInvocation) {
+      caller.stack.pop();
+      activeChild.jitGeneratedReturnParent = caller;
+    } else {
+      delete activeChild.jitGeneratedReturnParent;
+    }
+    currentThread.callStack.push(activeChild);
+    return jvm.jit.asyncInvokeSentinel();
+  };
+  t.teardown(() => { jvm.jit.tryInvokeSyncAt = originalInvoke; });
+
+  const result = generated(frame, thread, jvm.jit, false);
+  t.ok(result?.deopt && result.transient,
+    'the dispatched asynchronous child suspends the generated caller');
+  t.equal(result?.reason, 'asynchronous invokestatic left active child',
+    'the consumed-call handoff is distinguished from a cold fallback');
+  t.equal(frame.pc, 2,
+    'the caller retains its verified post-invoke continuation');
+  t.deepEqual(frame.stack.items, [],
+    'the already-consumed argument is not reconstructed for replay');
+  t.deepEqual(thread.callStack.items, [frame, activeChild],
+    'the scheduler retains both the caller and dispatched child');
+
+  thread.callStack.pop();
+  frame.pc = 0;
+  frame.stack.clear();
+  consumesInvocation = false;
+  const initialization = generated(frame, thread, jvm.jit, false);
+  t.ok(initialization?.deopt && initialization.transient,
+    'an unconsumed asynchronous child also suspends the generated caller');
+  t.equal(initialization?.reason,
+    'asynchronous callee from synchronous invokestatic',
+    'class-initialization-style handoff remains a cold replay');
+  t.equal(frame.pc, 1,
+    'the caller returns to the invoke that has not executed yet');
+  t.deepEqual(frame.stack.items, [41],
+    'the unconsumed invocation operands remain available for retry');
+  t.end();
+});
+
 test('structured returns materialize instead of retiring an active child', async (t) => {
   const classpath = compileJavaFixture(t, 'StructuredReturnGuardHarness', `
 public class StructuredReturnGuardHarness {
@@ -1724,6 +1789,8 @@ test('generated instance-call operand underflow falls back before callee executi
     op: 'invokevirtual',
     availableOperands: 1,
     requiredOperands: 2,
+    callerLocals: ['undefined'],
+    callStack: [],
     hostStack: 'string',
   }, 'diagnostic identifies the structural producer and consumer');
   t.end();
@@ -2010,6 +2077,160 @@ test('acyclic reference-returning callees execute positionally without child Fra
     'ArbitraryReferenceOwner.arbitraryReferenceLeaf(Ljava/lang/Object;Z)Ljava/lang/Object;'
   )?.samples, timingBefore + 1,
   'sampled timing attributes a frameless positional reference body');
+  t.end();
+});
+
+test('contended synchronized frameless entries restore above their caller', (t) => {
+  const method = {
+    name: 'arbitrarySynchronizedFloat', descriptor: '()F',
+    flags: ['synchronized'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { labelDef: 'L0:', instruction: 'fconst_1' },
+        { labelDef: 'L1:', instruction: 'freturn' },
+      ],
+      exceptionTable: [], localsSize: '1', stackSize: '1',
+    } }],
+  };
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, structuredSsa: true,
+  } });
+  jvm.classes.ArbitrarySynchronizedOwner = {
+    staticFields: new Map(),
+    ast: { classes: [{ superClassName: null, items: [
+      { type: 'method', method },
+    ] }] },
+  };
+  jvm.classInitializationState.set(
+    'ArbitrarySynchronizedOwner', 'INITIALIZED');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.ok(generated?.jvmFramelessPositional,
+    'the call-free float getter publishes its frameless scalar ABI');
+  const site = {
+    op: 'invokevirtual', declaredClassName: 'ArbitrarySynchronizedOwner',
+    methodName: method.name, descriptor: method.descriptor,
+    params: [], returnType: 'float',
+    initializationToken: { initialized: true },
+  };
+  const target = {
+    method, lookupClass: 'ArbitrarySynchronizedOwner', generated,
+  };
+  const positional = jvm.jit.getPositionalGeneratedInvoker(site, target);
+  const parentMethod = {
+    name: 'caller', descriptor: '()V', attributes: [{ type: 'code', code: {
+      codeItems: [], exceptionTable: [], localsSize: '0', stackSize: '0',
+    } }],
+  };
+  const parent = new Frame(parentMethod);
+  const receiver = {
+    type: 'ArbitrarySynchronizedOwner', fields: {},
+    isLocked: true, lockOwner: 99, lockCount: 1, waitSet: [],
+  };
+  const thread = {
+    id: 7, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  thread.callStack.push(parent);
+  const result = positional(receiver, thread);
+
+  t.ok(result?.deopt,
+    'monitor contention exits through the canonical child-frame path');
+  t.equal(thread.callStack.items.length, 2,
+    'the omitted synchronized child is restored exactly once');
+  t.equal(thread.callStack.items[0], parent,
+    'the caller retains its original stack position');
+  t.equal(thread.callStack.peek().method, method,
+    'the contended child is restored above the caller for scheduling');
+  t.equal(thread.status, 'BLOCKED',
+    'the scheduler observes the monitor-contended child');
+  receiver.isLocked = false;
+  receiver.lockOwner = null;
+  receiver.lockCount = 0;
+  thread.status = 'runnable';
+  const child = thread.callStack.peek();
+  t.ok(jvm.enterFrameMonitorIfNeeded(child, thread),
+    'the restored child can acquire the released monitor');
+  const completion = jvm.jit.tryRunFrame(child, thread);
+  t.ok(completion?.handled,
+    'the scheduler-visible child completes through the normal JIT entry');
+  t.deepEqual(parent.stack.items, [1],
+    'the non-void synchronized return reaches the original caller');
+  t.end();
+});
+
+test('acyclic call-bearing structured bodies retain their scalar entry', (t) => {
+  const leaf = {
+    name: 'arbitraryNestedLeaf', descriptor: '()I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { labelDef: 'L0:', instruction: { op: 'bipush', arg: 23 } },
+        { labelDef: 'L1:', instruction: 'ireturn' },
+      ],
+      exceptionTable: [], localsSize: '0', stackSize: '1',
+    } }],
+  };
+  const caller = {
+    name: 'arbitraryCallBearingBody', descriptor: '()I', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      codeItems: [
+        { labelDef: 'C0:', instruction: { op: 'invokestatic',
+          arg: ['Method', 'ArbitraryCallBearingOwner',
+            [leaf.name, leaf.descriptor]] } },
+        { labelDef: 'C1:', instruction: 'ireturn' },
+      ],
+      exceptionTable: [], localsSize: '0', stackSize: '1',
+    } }],
+  };
+  const jvm = new JVM({ jit: {
+    warmupThreshold: 0, preferWholeMethodJs: true, structuredSsa: true,
+  } });
+  jvm.classes.ArbitraryCallBearingOwner = {
+    staticFields: new Map(),
+    ast: { classes: [{ superClassName: null, items: [
+      { type: 'method', method: leaf },
+      { type: 'method', method: caller },
+    ] }] },
+  };
+  jvm.classInitializationState.set('ArbitraryCallBearingOwner', 'INITIALIZED');
+
+  const generated = jvm.jit.structuredSsa.compile(caller);
+  t.ok(generated?.jvmStructuredSsa,
+    'the arbitrary call-bearing fixture compiles through structured SSA');
+  t.equal(generated?.jvmFramelessPositional, true,
+    'an acyclic nested call keeps the restorable scalar entry');
+
+  const site = {
+    op: 'invokestatic', declaredClassName: 'ArbitraryCallBearingOwner',
+    methodName: caller.name, descriptor: caller.descriptor,
+    params: [], returnType: 'int',
+    initializationToken: { initialized: true },
+  };
+  let observedChild = null;
+  const observedGenerated = (child, thread) => {
+    observedChild = child;
+    t.notOk(thread.callStack.items.includes(child),
+      'the fast positional wrapper omits the acyclic caller Frame');
+    return 23;
+  };
+  observedGenerated.jvmSynchronous = true;
+  observedGenerated.jvmFramelessPositional =
+    generated.jvmFramelessPositional;
+  const target = {
+    method: caller, lookupClass: 'ArbitraryCallBearingOwner',
+    generated: observedGenerated,
+  };
+  const positional = jvm.jit.getPositionalGeneratedInvoker(site, target);
+  t.ok(positional, 'the scalar positional ABI remains available');
+  const parent = new Frame(leaf);
+  parent.className = 'ArbitraryCallBearingOwner';
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  thread.callStack.push(parent);
+  t.equal(positional(thread), 23,
+    'the scalar positional entry preserves the nested return value');
+  t.ok(observedChild, 'the call-bearing body receives a concrete child Frame');
+  t.deepEqual(thread.callStack.items, [parent],
+    'the scalar call leaves its parent stack unchanged');
   t.end();
 });
 
@@ -4362,6 +4583,49 @@ public final class ArbitraryRecursivePartition {
     'direct recursive calls preserve the scalar result');
   t.equal(thread.callStack.size(), 0,
     'successful recursion does not materialize child Frames');
+  t.end();
+});
+
+test('recursive methods with suspendable child calls retain JVM Frames',
+  async (t) => {
+  const className = 'RecursiveSchedulerHandoffHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class RecursiveSchedulerHandoffHarness {
+  abstract static class Node {
+    boolean active;
+    abstract Node first();
+    abstract Node next();
+  }
+  static void visit(Node node) {
+    node.active = false;
+    Node child = node.first();
+    while (child != null) {
+      visit(child);
+      child = node.next();
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  await jvm.loadClassByName(className);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(
+    className, 'visit', `(L${className}$Node;)V`);
+  const generated = jvm.jit.structuredSsa.compile(method);
+
+  t.ok(generated?.jvmStructuredSsa,
+    'the mixed recursive call graph still receives structured compilation');
+  t.notOk(generated.jvmRestoringDirectPositionalBody,
+    'the recursive region does not omit Frames across suspendable children');
+  t.equal(generated.jvmStructuredRestoringDirectRejection,
+    'self recursion mixed with independently suspendable calls',
+    'the rejection records the generic call-graph proof that failed');
+  t.notOk(generated.jvmFramelessPositional,
+    'the remaining positional entry is explicitly Frame-backed');
   t.end();
 });
 

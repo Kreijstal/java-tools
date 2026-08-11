@@ -3521,6 +3521,17 @@ class JvmSsaBlockRenderer {
                 .map((line) => `  ${line}`),
               `  throw ${caught};`, "}",
             ];
+            const asynchronousActiveChildLines = [
+              `if (${out} === helpers.asyncInvokeSentinel()) {`,
+              "  const activeChild = thread.callStack.items[thread.callStack.items.length - 1];",
+              "  if (activeChild !== frame && activeChild && " +
+                "activeChild.jitGeneratedReturnParent === frame) {",
+              ...materializeLines(stack, index + 1).map((line) => `  ${line}`),
+              "    return { deopt: true, transient: true, " +
+                "reason: 'asynchronous structured SSA callee left active child' };",
+              "  }",
+              "}",
+            ];
             const checkedAdmissionPlan = site.returnsVoid &&
               site.directCheckedLeaf?.noThrow === true &&
               ["record-window", "clipped-affine-fill"].includes(
@@ -3901,7 +3912,8 @@ class JvmSsaBlockRenderer {
             } else {
               lines.push(...fallbackLines);
             }
-            lines.push(`if (${out} === helpers.asyncInvokeSentinel()) {`,
+            lines.push(...asynchronousActiveChildLines,
+              `if (${out} === helpers.asyncInvokeSentinel()) {`,
               ...(resumableVoidCall ? [asynchronousCallMarker] : [
                 ...materializeLines(callStack, index).map((line) => `  ${line}`),
                 "  helpers.skipJitOnce(frame);",
@@ -8295,8 +8307,29 @@ class JvmSsaBlockRenderer {
         (effectfulFieldPositionalEnabled ||
           cache.eagerLocal !== null && cache.eagerLocal !== undefined)),
     );
-    if (!restoringDirectPositionalEligible) {
+    const hasSelfRecursiveCall = [...callSites.values()].some(
+      (site) => site.selfRecursive);
+    const hasIndependentlySuspendableCall = [...callSites.values()].some(
+      (site) => !site.selfRecursive &&
+        site.id !== null && site.id !== undefined);
+    // Direct self-recursion omits one JVM Frame per recursive level. That is
+    // safe for a closed recursive kernel: any scalar deopt unwinds through
+    // every generated invocation and restores the omitted levels in order.
+    // It is not safe when the same method can suspend in an independently
+    // dispatched child. The scheduler may complete that child before an
+    // omitted recursive caller is resumed, leaving the caller at its
+    // post-invoke PC without the child whose return owns that transition.
+    // Keep this mixed call graph on the ordinary Frame-backed positional ABI.
+    // This proof is solely over resolved call-site structure; names and guest
+    // identities never participate.
+    if (restoringDirectPositionalEligible && hasSelfRecursiveCall &&
+        hasIndependentlySuspendableCall) {
+      restoringDirectPositionalEligible = false;
       restoringDirectRejection =
+        "self recursion mixed with independently suspendable calls";
+    }
+    if (!restoringDirectPositionalEligible) {
+      restoringDirectRejection ||=
         "descriptor, owner, return type, or field-cache shape";
     }
     for (let index = 0;
@@ -10339,7 +10372,16 @@ class JvmSsaBlockRenderer {
       generated.jvmStructuredRequiresBaselineFramedEntry =
         requiresBaselineFramedEntry;
       generated.jvmStructuredContinuation = useContinuations;
-      generated.jvmFramelessPositional = !useContinuations;
+      // A call-bearing body may leave a scheduler-visible child Frame. The
+      // positional wrapper can restore one omitted caller immediately beneath
+      // that child, so ordinary acyclic call graphs retain their fast scalar
+      // entry. Mixed self-recursion is different: several omitted instances
+      // can own the same independently dispatched child transition. Keep that
+      // verified shape Frame-backed, matching the restoring-direct admission
+      // rule above, without penalizing every method that merely has a call.
+      generated.jvmFramelessPositional =
+        !useContinuations &&
+        !(hasSelfRecursiveCall && hasIndependentlySuspendableCall);
       generated.jvmDirectPositionalBody = directPositionalBody;
       generated.jvmDirectPositionalSource = directPositionalSource;
       generated.jvmRestoringDirectPositionalBody = restoringDirectPositionalBody;

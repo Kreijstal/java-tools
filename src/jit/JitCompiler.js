@@ -2696,6 +2696,12 @@ class JitCompiler {
                 body.push(...materialize(beforeCall, index));
                 body.push(`throw ${caught};`, "}");
                 body.push(`if (${value} === helpers.asyncInvokeSentinel()) {`);
+                body.push("const activeChild = thread.callStack.items[thread.callStack.items.length - 1];",
+                  "if (activeChild !== frame && activeChild && " +
+                    "activeChild.jitGeneratedReturnParent === frame) {",
+                  ...spillLocals(),
+                  "return { deopt: true, transient: true, reason: 'asynchronous scalar callee left active child' };",
+                  "}");
                 body.push(...materialize(beforeCall, index));
                 body.push("helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'asynchronous scalar callee' };", "}");
                 body.push(`if (${value} && ${value}.deopt) {`, ...spillLocals(), `return ${value};`, "}");
@@ -3220,7 +3226,7 @@ class JitCompiler {
           body.push(`helpers.materialize(frame, locals, stack, ${index + 1});`);
           const value = temp();
           body.push(`const ${value} = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread);`);
-          body.push(`if (${value} === helpers.asyncInvokeSentinel()) { helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous stackless raster callee" }; }`);
+          body.push(`if (${value} === helpers.asyncInvokeSentinel()) { const activeChild = thread.callStack.items[thread.callStack.items.length - 1]; if (activeChild !== frame && activeChild && activeChild.jitGeneratedReturnParent === frame) { return { deopt: true, transient: true, reason: "asynchronous stackless raster callee left active child" }; } helpers.materialize(frame, locals, stack, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous stackless raster callee" }; }`);
           body.push(`if (${value} && ${value}.deopt) return ${value};`);
           body.push(`if (${value} !== helpers.returnVoid()) stack.push(${value});`);
           body.push(`if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in stackless raster callee" };`);
@@ -3769,7 +3775,7 @@ class JitCompiler {
           const traceCall = this.compileTraceSyncCalls
             ? `helpers.traceSyncCallAt(${callSiteId}, frame, thread, value, sp);`
             : "";
-          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); ${traceCall} if (value === helpers.asyncInvokeSentinel()) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { return { deopt: true, transient: true, reason: "synchronous ${op} left active child" }; } if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
+          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); ${traceCall} if (value === helpers.asyncInvokeSentinel()) { const activeChild = thread.callStack.items[thread.callStack.items.length - 1]; if (activeChild !== frame && activeChild && activeChild.jitGeneratedReturnParent === frame) { return { deopt: true, transient: true, reason: "asynchronous ${op} left active child" }; } helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { return { deopt: true, transient: true, reason: "synchronous ${op} left active child" }; } if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
         }
         return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
@@ -5253,6 +5259,13 @@ class JitCompiler {
       "let positionalTimingStarted = -1;",
       "let positionalExclusiveTiming = null;",
       "if (useFrameless) {",
+      // Record the canonical insertion point before attempting the implied
+      // synchronized-method monitor. A contended monitor is itself a deopt:
+      // the child must be restored above its caller even though its generated
+      // body never started. Leaving the sentinel -1 here would make
+      // Array.splice insert the child below the caller, resume the caller at
+      // its post-invoke PC, and lose a non-void return operand.
+      "  baseDepth = thread.callStack.items.length;",
       // A frameless entry runs the body with no Frame on the call stack, so the
       // implied ACC_SYNCHRONIZED monitor is entered against the child Frame that
       // already exists for locals and released explicitly below -- CallStack.pop
@@ -5262,7 +5275,6 @@ class JitCompiler {
       "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
       "    result = { deopt: true, reason: 'synchronized monitor contended' };",
       "  } else {",
-      "  baseDepth = thread.callStack.items.length;",
       "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
       "  if (jit.shouldBeginExclusiveTimingKey(plan.methodKey)) {",
       "    positionalExclusiveTiming = jit.beginExclusiveTiming(plan.methodKey, plan.exclusiveTier);",
@@ -5684,6 +5696,22 @@ class JitCompiler {
           op,
           availableOperands,
           requiredOperands,
+          callerLocals: frame.locals.slice(0, 8).map((value) =>
+            value === null ? "null" : value === undefined ? "undefined"
+              : value && (value._className || value.type) || typeof value),
+          callStack: thread?.callStack?.items?.slice(-12).map((candidate) => ({
+            method: `${candidate.className || "<unknown>"}.` +
+              `${candidate.method?.name || "<unknown>"}` +
+              `${candidate.method?.descriptor || ""}`,
+            pc: candidate.pc,
+            operands: candidate.stack?.items?.length,
+            generatedParent: candidate.jitGeneratedReturnParent
+              ? `${candidate.jitGeneratedReturnParent.className || "<unknown>"}.` +
+                `${candidate.jitGeneratedReturnParent.method?.name || "<unknown>"}` +
+                `${candidate.jitGeneratedReturnParent.method?.descriptor || ""}`
+              : null,
+            generatedReturnType: candidate.jitGeneratedReturnType || null,
+          })),
           hostStack: new Error("generated invocation operand underflow").stack,
         });
       }
