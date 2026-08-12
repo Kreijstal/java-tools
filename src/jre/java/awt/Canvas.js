@@ -2,7 +2,7 @@
 // Every Canvas gets a real HTML canvas element so paint()/getGraphics()
 // target a surface of its own. Mouse interaction is dispatched through the
 // legacy pre-1.1 event model (mouseDown/mouseDrag/mouseUp overrides), which
-// old applets like NASA's KiteModeler use for zooming and panning.
+// old applets use for zooming and panning.
 
 const awtFramework = require('../../../platform/awt.js');
 const browserInput = require('../../../platform/browser-awt-input.js');

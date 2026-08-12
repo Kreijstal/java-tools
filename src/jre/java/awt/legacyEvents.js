@@ -1,6 +1,6 @@
 // Legacy (pre-1.1) AWT event dispatch helpers.
 //
-// Old applets (e.g. NASA's KiteModeler) never use ActionListener. They
+// Old applets never use ActionListener. They
 // override handleEvent(Event) / action(Event, Object) on their panels and
 // rely on Component.postEvent() bubbling a java.awt.Event up the component
 // hierarchy. These helpers execute the guest bytecode overrides and capture
