@@ -1,4 +1,5 @@
 const { parseDescriptor } = require("../parsing/typeParser");
+const { substituteStackArguments } = require("./astSubstitutions");
 const {
   buildCfgFromCode,
   structure,
@@ -1245,13 +1246,11 @@ class FusedRegionCompiler {
               }
             } else if (call && call.kind === "integer-inline") {
               const output = temp();
-              const substitute = (source) => source.replace(
-                /stack\[base \+ (\d+)\]/g,
-                (_match, argument) => `(${args[Number(argument)]})`);
+              const substitute = (source) => substituteStackArguments(source, args);
               lines.push(`let ${output};`, "{",
                 ...call.inline.statements.map((statement) =>
                   substitute(statement)),
-                `${output}=${substitute(call.inline.result)};`, "}");
+                `${output}=${substituteStackArguments(call.inline.result, args, true)};`, "}");
               expressions.push(`(${output}|0)`);
             } else if (call && call.kind === "math-intrinsic") {
               expressions.push(`(Math.${call.name}(${args.join(",")})|0)`);
@@ -1597,11 +1596,10 @@ class FusedRegionCompiler {
             body.push(`region.scanlineKernel(state,region,helpers,${args.join(",")});`);
           } else if (call && call.kind === "integer-inline") {
             const result = temp();
-            const substitute = (source) => source.replace(/stack\[base \+ (\d+)\]/g,
-              (_match, argument) => `(${args[Number(argument)]})`);
+            const substitute = (source) => substituteStackArguments(source, args);
             body.push(`let ${result};`, "{",
               ...call.inline.statements.map((statement) => substitute(statement)),
-              `${result}=${substitute(call.inline.result)};`, "}");
+              `${result}=${substituteStackArguments(call.inline.result, args, true)};`, "}");
             expressions.push(`(${result}|0)`);
           } else if (call && call.kind === "math-intrinsic") {
             expressions.push(`(Math.${call.name}(${args.join(",")})|0)`);

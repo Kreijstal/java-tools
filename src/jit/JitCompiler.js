@@ -7,6 +7,7 @@ const {
 const WasmJit = require("./WasmJit");
 const FusedRegionCompiler = require("./FusedRegionCompiler");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
+const { substituteStackArguments } = require("./astSubstitutions");
 const monoArray = require("./monoArray");
 const {
   normalizeArrayLoad,
@@ -2666,19 +2667,18 @@ class JitCompiler {
             }
             if (!valid) return null;
             const result = temp();
-            const substitute = (source) => source.replace(/stack\[base \+ (\d+)\]/g,
-              (_match, argument) => `(${args[Number(argument)]})`);
+            const substitute = (source) => substituteStackArguments(source, args);
             body.push(`let ${result};`, "{");
             body.push(...plan.statements.map(substitute));
             if (plan.guards?.length) {
               const guard = plan.guards.map((condition) =>
-                `(${substitute(condition)})`).join(" && ");
+                `(${substituteStackArguments(condition, args, true)})`).join(" && ");
               body.push(`if (!(${guard})) {`,
                 ...materialize(callStack, index),
                 "helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: 'guarded scalar integer inline' };",
                 "}");
             }
-            body.push(`${result} = ${substitute(plan.result)};`, "}");
+            body.push(`${result} = ${substituteStackArguments(plan.result, args, true)};`, "}");
             expressions.push(result);
           } else {
             const site = callSites.get(index);
