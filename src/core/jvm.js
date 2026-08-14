@@ -46,7 +46,12 @@ class ClassInitializationStateMap extends Map {
   }
 
   set(className, state) {
+    const previous = super.get(className);
     super.set(className, state);
+    if (previous !== state && Number.isFinite(
+      this.jvm?.classInitializationEpoch)) {
+      this.jvm.classInitializationEpoch += 1;
+    }
     const token = this.jvm?.classInitializationTokens?.get(className);
     if (token) {
       token.state = state;
@@ -57,6 +62,9 @@ class ClassInitializationStateMap extends Map {
 
   delete(className) {
     const deleted = super.delete(className);
+    if (deleted && Number.isFinite(this.jvm?.classInitializationEpoch)) {
+      this.jvm.classInitializationEpoch += 1;
+    }
     const token = this.jvm?.classInitializationTokens?.get(className);
     if (token) {
       token.state = undefined;
@@ -150,6 +158,8 @@ class JVM {
     this.threads = [];
     this.currentThreadIndex = 0;
     this.classes = {}; // className -> { ast, constantPool }
+    this._methodClassNames = new WeakMap();
+    this._indexedMethodClassData = new Map();
     // Bumped on every class registration; closed-world analyses (class
     // hierarchy, devirtualization facts) memoize against it.
     this.classEpoch = 0;
@@ -189,7 +199,10 @@ class JVM {
     this.appletParameters = options.appletParameters || null;
     this.appletCodeBase = options.appletCodeBase || null;
     this.nextHashCode = 1;
-    this.maxStackDepth = options.maxStackDepth || 1024;
+    const configuredMaxStackDepth = Number(
+      options.maxStackDepth ?? env.JVM_MAX_STACK_DEPTH);
+    this.maxStackDepth = Number.isSafeInteger(configuredMaxStackDepth) &&
+      configuredMaxStackDepth > 0 ? configuredMaxStackDepth : 1024;
     // Linear heap for primitive arrays: TypedArray views over one wasm
     // memory, so compiled code can access elements without import crossings.
     const wasmHeapEnabled = options.wasmHeap ?? env.JVM_WASM_HEAP === '1';
@@ -212,6 +225,12 @@ class JVM {
     const configuredBurst = options.interpreterBurst ??
       env.JVM_INTERPRETER_BURST;
     this.interpreterBurst = Math.max(1, Number(configuredBurst) || 1024);
+    const configuredGeneratedBurst = options.generatedSchedulerBurst ??
+      env.JVM_GENERATED_SCHEDULER_BURST;
+    this.generatedSchedulerBurst = Math.max(1,
+      Math.min(256, Number(configuredGeneratedBurst) || 64));
+    this.generatedSchedulerBurstFrames = 0;
+    this.generatedSchedulerBurstBatches = 0;
     this._nextEventLoopYieldAt = Date.now() + this.eventLoopYieldMs;
     this._hotMethodCounts = new Map();
     // process.env property reads go through libuv (~600ns for the set below);
@@ -995,8 +1014,15 @@ class JVM {
         const fastResult = this._tryExecuteSynchronousJitTick(scheduled);
         let result;
         if (fastResult && fastResult.slow) {
-          if (timingSample) timingSample.slowPath = true;
-          result = this.executeTick(BURST_TICK_OPTIONS, scheduled, fastResult.skipJit);
+          const interpreterResult = this._tryExecuteSynchronousInterpreterTick(
+            scheduled, fastResult.skipJit);
+          if (interpreterResult && interpreterResult.slow) {
+            if (timingSample) timingSample.slowPath = true;
+            result = this.executeTick(
+              BURST_TICK_OPTIONS, scheduled, interpreterResult.skipJit);
+          } else {
+            result = interpreterResult;
+          }
         } else {
           result = fastResult;
         }
@@ -1300,44 +1326,94 @@ class JVM {
     return { thread, callStack: thread.callStack, schedulerNow };
   }
 
+  _advanceSchedulerThread() {
+    const count = this.threads.length;
+    if (count === 0) return;
+    const current = this.threads[this.currentThreadIndex];
+    // JVM.js multiplexes every Java thread onto one host JavaScript thread.
+    // Weighting this serial scheduler by Thread.priority can therefore starve
+    // a low-priority loader behind a permanently runnable animation thread;
+    // HotSpot can schedule those threads concurrently and treats priority as
+    // a platform-dependent hint. Preserve bounded progress with fair
+    // round-robin scheduling. Deadline-sensitive audio uses the explicit
+    // short-lived scheduler override in _prepareSchedulerTick instead.
+    this.currentThreadIndex = (this.currentThreadIndex + 1) % count;
+  }
+
   _tryExecuteSynchronousJitTick(scheduled) {
     if (scheduled.completed) return TICK_COMPLETE;
     if (scheduled.idle) return JIT_TICK_SLOW;
 
     const { thread, callStack } = scheduled;
-    if (callStack.size() > this.maxStackDepth || callStack.isEmpty()) {
-      return JIT_TICK_SLOW;
-    }
-    const frame = callStack.peek();
-    if (frame.pc >= frame.instructions.length) {
-      return JIT_TICK_SLOW;
-    }
-    // This fast path enters the frame without going through executeTick, so it
-    // owns the implied ACC_SYNCHRONIZED acquisition too. A contended monitor
-    // parks the thread; the slow path then finds it BLOCKED and reschedules.
-    if (frame.isSynchronizedMethod && !frame.monitorEntered &&
-        !this.enterFrameMonitorIfNeeded(frame, thread)) {
-      return JIT_TICK_SLOW;
-    }
+    let completedFrames = 0;
+    for (; completedFrames < this.generatedSchedulerBurst;
+      completedFrames += 1) {
+      if (callStack.size() > this.maxStackDepth || callStack.isEmpty()) break;
+      const frame = callStack.peek();
+      if (frame.pc >= frame.instructions.length ||
+          thread.status !== "runnable") break;
+      // This fast path enters the frame without going through executeTick, so
+      // it owns the implied ACC_SYNCHRONIZED acquisition too. Contention ends
+      // the burst and lets canonical scheduling park/resume the thread.
+      if (frame.isSynchronizedMethod && !frame.monitorEntered &&
+          !this.enterFrameMonitorIfNeeded(frame, thread)) break;
 
-    try {
-      const jitResult = this.jit.tryRunFrame(frame, thread);
+      let jitResult;
+      try {
+        jitResult = this.jit.tryRunFrame(frame, thread);
+      } catch (error) {
+        return this._failSynchronousJitTick(error, thread);
+      }
       if (jitResult && typeof jitResult.then === "function") {
         return jitResult.then(
           (resolved) => this._finishSynchronousJitTick(resolved),
           (error) => this._failSynchronousJitTick(error, thread),
         );
       }
-      return this._finishSynchronousJitTick(jitResult);
-    } catch (error) {
-      return this._failSynchronousJitTick(error, thread);
+      if (!jitResult.handled) {
+        if (completedFrames > 0) {
+          this.generatedSchedulerBurstFrames += completedFrames;
+          this.generatedSchedulerBurstBatches += 1;
+        }
+        return JIT_TICK_SLOW_AFTER_PROBE;
+      }
+      // Generated methods are already atomic between their own verified safe
+      // points. Continue through the same Java thread's newly exposed child or
+      // parent Frame without a full all-thread scan, but retain a bounded
+      // scheduling and browser-event deadline.
+      if ((completedFrames & 7) === 7 &&
+          Date.now() >= this._nextEventLoopYieldAt) {
+        completedFrames += 1;
+        break;
+      }
     }
+    if (completedFrames > 0) {
+      this.generatedSchedulerBurstFrames += completedFrames;
+      this.generatedSchedulerBurstBatches += 1;
+    }
+    if (callStack.isEmpty()) {
+      thread.status = "terminated";
+      if (this.threads.every((candidate) =>
+        candidate.status === "terminated")) return TICK_COMPLETE;
+      if (this.threads.length > 0) {
+        this._advanceSchedulerThread();
+      }
+      return TICK_CONTINUE;
+    }
+    if (callStack.size() > this.maxStackDepth ||
+        callStack.peek().pc >= callStack.peek().instructions.length) {
+      return JIT_TICK_SLOW;
+    }
+    if (this.threads.length > 0) {
+      this._advanceSchedulerThread();
+    }
+    return TICK_CONTINUE;
   }
 
   _finishSynchronousJitTick(jitResult) {
     if (!jitResult.handled) return JIT_TICK_SLOW_AFTER_PROBE;
     if (this.threads.length > 0) {
-      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+      this._advanceSchedulerThread();
     }
     return TICK_CONTINUE;
   }
@@ -1351,7 +1427,107 @@ class JVM {
     const currentPc = label ? parseInt(label.substring(1, label.length - 1)) : -1;
     this.handleException(error, currentPc, thread);
     if (this.threads.length > 0) {
-      this.currentThreadIndex = (this.currentThreadIndex + 1) % this.threads.length;
+      this._advanceSchedulerThread();
+    }
+    return TICK_CONTINUE;
+  }
+
+  _tryExecuteSynchronousInterpreterTick(scheduled, skipJit = false) {
+    if (scheduled.completed) return TICK_COMPLETE;
+    if (scheduled.idle) return {slow: true, skipJit};
+    const {thread, callStack} = scheduled;
+    if (callStack.size() > this.maxStackDepth || callStack.isEmpty()) {
+      return {slow: true, skipJit};
+    }
+    const entryFrame = callStack.peek();
+    if (entryFrame.pc >= entryFrame.instructions.length ||
+        entryFrame.isSynchronizedMethod && !entryFrame.monitorEntered) {
+      return {slow: true, skipJit};
+    }
+    // This path is deliberately narrower than executeTick: it only removes the
+    // Promise/microtask cost when the already prepared bytecode handlers prove
+    // that the complete same-frame quantum is synchronous. Calls and returns
+    // still end the quantum at exactly the existing Frame boundary.
+    if (this.debugManager.debugMode || this.verbose || this._envTrace ||
+        this._envProfileHot) return {slow: true, skipJit};
+    prepareSyncInstructions(
+      entryFrame.instructions, entryFrame.method, entryFrame.exceptionTable);
+
+    const instructions = entryFrame.instructions;
+    const inlineRegions = this.jit.inlineLoopRegionPcCache.get(
+      entryFrame.method);
+    let executedBytecodes = 0;
+    for (let executed = 0; executed < this.interpreterBurst; executed += 1) {
+      if (entryFrame.pc >= instructions.length ||
+          thread.status !== "runnable") break;
+      // The canonical slow path owns inline-loop OSR and its exception PC
+      // reconstruction. Do not duplicate that state machine here.
+      if (inlineRegions?.has(entryFrame.pc)) {
+        return {slow: true, skipJit: true};
+      }
+      const instructionItem = instructions[entryFrame.pc];
+      const instruction = instructionItem?.instruction;
+      if (!instruction) {
+        entryFrame.pc += 1;
+        executedBytecodes += 1;
+        continue;
+      }
+      const handler = instructionItem[syncHandler];
+      if (!handler) {
+        return {slow: true, skipJit: true};
+      }
+      entryFrame.pc += 1;
+      executedBytecodes += 1;
+      try {
+        const handlerResult = handler(
+          entryFrame,
+          instructionItem[syncInstruction],
+          this,
+          thread,
+        );
+        if (handlerResult && typeof handlerResult.then === "function" ||
+            handlerResult === syncFallback ||
+            handlerResult === syncInvokeFallback) {
+          // Async-capable handlers are uncommon after initialization. They
+          // already consumed this instruction exactly as executeTick would, so
+          // finish that one operation without replaying it, then yield through
+          // the ordinary scheduler protocol.
+          const finish = async () => {
+            let resolved = handlerResult;
+            if (resolved && typeof resolved.then === "function") {
+              resolved = await resolved;
+            }
+            if (resolved === syncFallback ||
+                resolved === syncInvokeFallback) {
+              await dispatch(entryFrame, instruction, this, thread);
+            }
+            if (this.threads.length > 0) {
+              this._advanceSchedulerThread();
+            }
+            return TICK_CONTINUE;
+          };
+          return finish().catch((error) =>
+            this._failSynchronousInterpreterTick(
+              error, thread, instructionItem));
+        }
+      } catch (error) {
+        return this._failSynchronousInterpreterTick(
+          error, thread, instructionItem);
+      }
+      if (callStack.items[callStack.items.length - 1] !== entryFrame ||
+          thread.status !== "runnable") break;
+    }
+    if (this.threads.length > 0) this._advanceSchedulerThread();
+    return TICK_CONTINUE;
+  }
+
+  _failSynchronousInterpreterTick(error, thread, instructionItem) {
+    const label = instructionItem?.labelDef;
+    const currentPc = label
+      ? parseInt(label.substring(1, label.length - 1)) : -1;
+    this.handleException(error, currentPc, thread);
+    if (this.threads.length > 0) {
+      this._advanceSchedulerThread();
     }
     return TICK_CONTINUE;
   }
@@ -1370,9 +1546,15 @@ class JVM {
     const { thread, callStack } = scheduled;
 
     if (callStack.size() > this.maxStackDepth) {
+      const guestStack = callStack.items.slice(-32).map((candidate) => {
+        const method = candidate.method || {};
+        return `${candidate.className || method.className || "?"}.` +
+          `${method.name || "?"}${method.descriptor || ""}@${candidate.pc}`;
+      });
       const error = {
         type: "java/lang/StackOverflowError",
-        message: "Stack overflow",
+        message: `Stack overflow (${callStack.size()} frames): ` +
+          guestStack.join(" -> "),
       };
       this.handleException(error, -1, thread);
       return { completed: false };
@@ -1380,13 +1562,20 @@ class JVM {
 
     if (callStack.isEmpty()) {
       thread.status = "terminated";
-      this.currentThreadIndex =
-        (this.currentThreadIndex + 1) % this.threads.length;
+      this._advanceSchedulerThread();
       return { completed: false };
     }
 
     const frame = callStack.peek();
     if (frame.pc >= frame.instructions.length) {
+      if (frame.jitFrameHandoffTrace) {
+        console.error('[jvm-frame-handoff-fallthrough] ' + JSON.stringify({
+          ...frame.jitFrameHandoffTrace,
+          childPc: frame.pc,
+          childInstructions: frame.instructions.length,
+          childDepth: frame.stack.items.length,
+        }));
+      }
       const popped = callStack.pop();
       this.completeClassInitialization(popped);
       
@@ -1406,8 +1595,7 @@ class JVM {
     if (frame.isSynchronizedMethod && !frame.monitorEntered &&
         !this.enterFrameMonitorIfNeeded(frame, thread)) {
       if (this.threads.length > 0) {
-        this.currentThreadIndex =
-          (this.currentThreadIndex + 1) % this.threads.length;
+        this._advanceSchedulerThread();
       }
       return { completed: false };
     }
@@ -1424,8 +1612,7 @@ class JVM {
         }
         if (jitResult.handled) {
           if (this.threads.length > 0) {
-            this.currentThreadIndex =
-              (this.currentThreadIndex + 1) % this.threads.length;
+            this._advanceSchedulerThread();
           }
           return { completed: false };
         }
@@ -1441,8 +1628,7 @@ class JVM {
         : -1;
       this.handleException(e, currentPc, thread);
       if (this.threads.length > 0) {
-        this.currentThreadIndex =
-          (this.currentThreadIndex + 1) % this.threads.length;
+        this._advanceSchedulerThread();
       }
       return { completed: false };
     }
@@ -1570,8 +1756,7 @@ class JVM {
     }
 
     if (this.threads.length > 0) {
-      this.currentThreadIndex =
-        (this.currentThreadIndex + 1) % this.threads.length;
+      this._advanceSchedulerThread();
     }
 
     return { completed: false, bytecodes: executedBytecodes };
@@ -1730,6 +1915,16 @@ class JVM {
     return classData;
   }
 
+  // Every class registration goes through here so world-baked compiled code
+  // can be notified synchronously: speculative monomorphic wasm links read a
+  // per-module "specok" flag that must drop before a receiver of the new
+  // class can reach them mid-run.
+  bumpClassEpoch() {
+    this.classEpoch += 1;
+    const wasmJit = this.jit && this.jit.wasmJit;
+    if (wasmJit && wasmJit.onClassEpochBump) wasmJit.onClassEpochBump();
+  }
+
   createArrayClass(arrayClassName) {
     // Create a synthetic array class
     const arrayClass = {
@@ -1749,7 +1944,7 @@ class JVM {
     
     // Store it in the classes registry
     this.classes[arrayClassName] = arrayClass;
-    this.classEpoch += 1;
+    this.bumpClassEpoch();
     return arrayClass;
   }
 
@@ -1805,7 +2000,7 @@ class JVM {
           const classData = await this.loadClassFromJar(cp, classNameWithSlashes);
           if (classData && classData.ast) {
             this.classes[classNameWithSlashes] = classData;
-            this.classEpoch += 1;
+            this.bumpClassEpoch();
             this._notifyClassLoaded(classNameWithSlashes, classData);
             return classData;
           }
@@ -1817,7 +2012,7 @@ class JVM {
           const classData = await this.loadClassAsync(classFilePath);
           if (classData && classData.ast) {
             this.classes[classNameWithSlashes] = classData;
-            this.classEpoch += 1;
+            this.bumpClassEpoch();
             this._notifyClassLoaded(classNameWithSlashes, classData);
             return classData;
           }
@@ -1903,7 +2098,7 @@ class JVM {
         staticFields,
       };
       this.classes[classNameWithSlashes] = classData;
-      this.classEpoch += 1;
+      this.bumpClassEpoch();
     }
     if (!classData) return null;
 
@@ -2109,9 +2304,6 @@ class JVM {
   }
 
   _markClassInitialized(className) {
-    if (this.classInitializationState.get(className) !== "INITIALIZED") {
-      this.classInitializationEpoch += 1;
-    }
     this._setClassInitializationState(className, "INITIALIZED");
     this.classInitializationOwners.delete(className);
     this._wakeClassInitializationWaiters(className);
@@ -3079,20 +3271,20 @@ class JVM {
   }
 
   findClassNameForMethod(method) {
+    const cached = method && this._methodClassNames.get(method);
+    if (cached) return cached;
     for (const [className, classData] of Object.entries(this.classes)) {
-      if (
-        classData &&
-        classData.ast &&
-        classData.ast.classes &&
-        classData.ast.classes[0]
-      ) {
-        const methods = classData.ast.classes[0].items.filter(
-          (item) => item.type === "method",
-        );
-        if (methods.some((item) => item.method === method)) {
-          return className;
+      if (!classData?.ast?.classes?.[0]) continue;
+      if (this._indexedMethodClassData.get(className) !== classData) {
+        for (const item of classData.ast.classes[0].items || []) {
+          if (item.type === "method" && item.method) {
+            this._methodClassNames.set(item.method, className);
+          }
         }
+        this._indexedMethodClassData.set(className, classData);
       }
+      const indexed = method && this._methodClassNames.get(method);
+      if (indexed) return indexed;
     }
     return null;
   }

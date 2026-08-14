@@ -69,6 +69,10 @@ async function createRuntime(directory, tier) {
     enabled: tier !== 'wasm',
     warmupThreshold: 0,
     preferWholeMethodJs: tier === 'javascript',
+    // Match the production renderer pipeline. Without this explicit setting,
+    // the benchmark measures the legacy baseline generator for call-only
+    // numeric loops and mislabels that result as the current JavaScript JIT.
+    structuredSsa: tier === 'javascript',
     profileMethods: profileJit,
   } });
   if (previousWasm === undefined) delete process.env.JVM_WASM_JIT;
@@ -163,7 +167,8 @@ function compiledMethodKinds(runtime) {
     .filter((item) => item.type === 'method').map((item) => item.method);
   return methods.reduce((out, method) => {
     const generated = runtime.jvm.jit.codegenCache.get(method);
-    if (generated) out[method.name] = generated.jvmSynchronous ? 'sync' : 'async';
+    if (generated) out[method.name] = generated.jvmStructuredSsa
+      ? 'structured' : generated.jvmSynchronous ? 'baseline' : 'async';
     return out;
   }, {});
 }

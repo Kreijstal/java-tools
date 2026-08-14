@@ -306,3 +306,110 @@ test('loop-phi field receiver: cache refills as the walk advances', async (t) =>
   t.ok(metaOf(jvm, 'ChainWalk.chainSum([ILNode;I)V'), 'chainSum is compiled');
   t.end();
 });
+
+
+const THIS_ELIDE_SOURCE = `
+public class ThisElide {
+  public static int drive(int[] out, Reader r, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) { r.p = 0; s = (s * 31) + r.u16(); }
+    out[0] = s;
+    return s;
+  }
+  public static int drivePriv(int[] out, Reader r, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) { s = (s * 31) + r.priv(); }
+    out[0] = s;
+    return s;
+  }
+}
+class Reader {
+  byte[] d;
+  int p;
+  int u8() { return d[p++] & 0xff; }
+  int u16() { int h = u8(); return (h << 8) | u8(); }
+  int priv() { return go(); }
+  private int go() { return p + 11; }
+}
+class AltA extends Reader { int u16() { return 1; } int priv() { return 2; } }
+class AltB extends Reader { int u16() { return 3; } int priv() { return 4; } }
+class ReaderSub extends Reader { int u8() { return 7; } }
+`;
+
+// Three u16/priv impls keep the drive() sites out of the inliner, so the
+// Reader callees compile as their own modules (the shapes under test).
+const THIS_ELIDE_PRELOAD = ['Reader', 'AltA', 'AltB'];
+
+function accum31(per, n) {
+  let s = 0;
+  for (let i = 0; i < n; i += 1) s = (Math.imul(s, 31) + per) | 0;
+  return s;
+}
+
+test('`this` receivers elide inline guards: callee stays fully compiled', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'ThisElide', THIS_ELIDE_SOURCE, THIS_ELIDE_PRELOAD);
+  const out = [0];
+  out.type = '[I';
+  const d = [0x12, 0x34, 0, 0];
+  d.type = '[B';
+  const reader = { type: 'Reader', fields: { 'Reader.d': d, 'Reader.p': 0 } };
+  const n = 4000;
+  await invoke(jvm, thread, 'ThisElide', 'drive', '([ILReader;I)I', [out, reader, n]);
+  t.equal(out[0], accum31(0x1234, n), 'unpack loop result matches');
+  const meta = metaOf(jvm, 'Reader.u16()I');
+  t.ok(meta && meta.structured, 'u16 compiled by the structured backend');
+  t.ok(meta.inlinedCalls >= 2, 'both u8 calls inlined');
+  t.equal(meta.elidedThisGuards, 2, 'both guards elided for the `this` receiver');
+  t.equal(meta.deoptStubCount, 0, 'no guard-miss deopt stubs remain');
+  t.equal(meta.speculations, 0, 'no instanceof guards recorded');
+  t.ok(meta.specSites && meta.specSites.length === 2, 'elided sites still record specSites');
+  t.ok(meta.fullyCompiled, 'guard-elided module is fully compiled');
+  t.end();
+});
+
+test('elided module invalidates when a later class overrides the target', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'ThisElide', THIS_ELIDE_SOURCE, THIS_ELIDE_PRELOAD);
+  const out = [0];
+  out.type = '[I';
+  const d = [0x12, 0x34, 0, 0];
+  d.type = '[B';
+  const reader = { type: 'Reader', fields: { 'Reader.d': d, 'Reader.p': 0 } };
+  const n = 4000;
+  await invoke(jvm, thread, 'ThisElide', 'drive', '([ILReader;I)I', [out, reader, n]);
+  const before = metaOf(jvm, 'Reader.u16()I');
+  t.ok(before && before.fullyCompiled && before.specSites.length === 2,
+    'elided speculative module in place');
+
+  // ReaderSub overrides u8 but inherits u16: a ReaderSub receiver entering
+  // the stale module would take the elided Reader.u8 pick and read the array
+  // (0x1234) instead of dispatching the override (0x0707).
+  await jvm.loadClassByName('ReaderSub');
+  jvm.classInitializationState.set('ReaderSub', 'INITIALIZED');
+  const sub = { type: 'ReaderSub', fields: { 'Reader.d': d, 'Reader.p': 0 } };
+  await invoke(jvm, thread, 'ThisElide', 'drive', '([ILReader;I)I', [out, sub, n]);
+  t.equal(out[0], accum31(0x0707, n),
+    'ReaderSub receiver dispatches the override after the world grew');
+  await invoke(jvm, thread, 'ThisElide', 'drive', '([ILReader;I)I', [out, reader, n]);
+  t.equal(out[0], accum31(0x1234, n), 'Reader receiver still reads the array correctly');
+  t.end();
+});
+
+test('private helper via invokespecial elides the null guard on `this`', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'ThisElide', THIS_ELIDE_SOURCE, THIS_ELIDE_PRELOAD);
+  const out = [0];
+  out.type = '[I';
+  const reader = { type: 'Reader', fields: { 'Reader.d': null, 'Reader.p': 30 } };
+  const n = 4000;
+  await invoke(jvm, thread, 'ThisElide', 'drivePriv', '([ILReader;I)I', [out, reader, n]);
+  t.equal(out[0], accum31(41, n), 'private-helper loop result matches');
+  const meta = metaOf(jvm, 'Reader.priv()I');
+  t.ok(meta && meta.structured, 'priv compiled by the structured backend');
+  t.equal(meta.elidedThisGuards, 1, 'guard on the private helper elided');
+  t.equal(meta.deoptStubCount, 0, 'no deopt stub');
+  t.ok(meta.fullyCompiled, 'guard-elided module fully compiled');
+  // javac 11+ emits invokevirtual for private calls (nestmates), which
+  // records one revalidation specSite; -source 8 fixtures emit
+  // invokespecial, which records none. Both must elide guard-free.
+  t.equal(meta.speculations, 0, 'no instanceof guards recorded');
+  t.end();
+});

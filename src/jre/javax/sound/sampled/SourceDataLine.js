@@ -85,7 +85,11 @@ module.exports = {
       }
 
       try {
-        obj.audioOutput.write(toAudioBytes(buffer, offset, len));
+        if (obj.audioOutput.acceptsGuestByteArraySlices === true) {
+          obj.audioOutput.write(buffer, offset, len);
+        } else {
+          obj.audioOutput.write(toAudioBytes(buffer, offset, len));
+        }
         if (thread && obj.audioOutput &&
             typeof obj.audioOutput.queuedSeconds === "function" &&
             obj.audioOutput.queuedSeconds() < 0.04) {

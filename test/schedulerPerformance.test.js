@@ -40,6 +40,37 @@ test('deterministic scheduler never waits on wall time', (t) => {
   t.end();
 });
 
+test('serial scheduler does not starve low-priority guest work', (t) => {
+  const jvm = new JVM();
+  const high = {
+    status: 'runnable', javaThread: {priority: 10}, callStack: new Stack(),
+  };
+  const low = {
+    status: 'runnable', javaThread: {priority: 1}, callStack: new Stack(),
+  };
+  jvm.threads = [high, low];
+  jvm.currentThreadIndex = 0;
+  const selections = [0, 0];
+  for (let quantum = 0; quantum < 20; quantum += 1) {
+    selections[jvm.currentThreadIndex] += 1;
+    jvm._advanceSchedulerThread();
+  }
+  t.deepEqual(selections, [10, 10],
+    'one host thread gives both guest priorities bounded progress');
+  t.end();
+});
+
+test('scheduler stack limit is configurable for recursive-call diagnostics', (t) => {
+  const configured = new JVM({ maxStackDepth: 73 });
+  const invalid = new JVM({ maxStackDepth: 0 });
+
+  t.equal(configured.maxStackDepth, 73,
+    'diagnostic runs can lower the guest stack limit without changing bytecode');
+  t.equal(invalid.maxStackDepth, 1024,
+    'invalid stack limits retain the production default');
+  t.end();
+});
+
 test('scheduler wall-time sampling can be enabled without process environment', (t) => {
   const jvm = new JVM({ schedulerTimingRate: 256 });
   t.ok(jvm._schedulerTimingProfile,
@@ -249,6 +280,36 @@ test('warm async-capable handlers remain inside an interpreter quantum', async (
   t.end();
 });
 
+test('synchronous interpreter quanta do not manufacture a Promise', (t) => {
+  const method = {
+    name: 'synchronousInterpreterQuantum', descriptor: '()V', flags: ['static'],
+    attributes: [{type: 'code', code: {
+      localsSize: '1', exceptionTable: [],
+      codeItems: [
+        {instruction: 'iconst_0'},
+        {instruction: 'istore_0'},
+        {instruction: {op: 'iinc', varnum: 0, incr: 1}},
+        {instruction: 'return'},
+      ],
+    }}],
+  };
+  const jvm = new JVM({interpreterBurst: 16, jit: {enabled: false}});
+  const thread = {id: 0, status: 'runnable', callStack: new Stack()};
+  const frame = new Frame(method);
+  thread.callStack.push(frame);
+  jvm.threads = [thread];
+  const scheduled = {thread, callStack: thread.callStack, schedulerNow: 0};
+
+  const result = jvm._tryExecuteSynchronousInterpreterTick(scheduled, true);
+  t.notOk(result && typeof result.then === 'function',
+    'a fully synchronous bytecode quantum returns directly');
+  t.equal(frame.locals[0], 1,
+    'the allocation-free path executes the complete same-frame body');
+  t.ok(thread.callStack.isEmpty(),
+    'the normal return retires the frame through the canonical handler');
+  t.end();
+});
+
 test('synchronous generated entries do not manufacture a Promise', (t) => {
   const method = {
     name: 'constant',
@@ -315,6 +376,44 @@ test('the execution scheduler keeps synchronous generated ticks off the Promise 
     'the scheduler fast path itself stays synchronous');
   t.notOk(result.slow, 'the generated frame did not fall back to executeTick');
   t.equal(thread.callStack.size(), 0, 'the generated return completed the frame');
+  t.end();
+});
+
+test('the scheduler batches bounded same-thread generated frames', (t) => {
+  const method = {
+    name: 'complete', descriptor: '()V', flags: ['static'],
+    attributes: [{ type: 'code', code: {
+      localsSize: '0', exceptionTable: [],
+      codeItems: [
+        { labelDef: 'L0:', instruction: 'iconst_1' },
+        { labelDef: 'L1:', instruction: 'iconst_2' },
+        { labelDef: 'L2:', instruction: 'iadd' },
+        { labelDef: 'L3:', instruction: 'pop' },
+        { labelDef: 'L4:', instruction: 'return' },
+      ],
+    } }],
+  };
+  const jvm = new JVM({ generatedSchedulerBurst: 8,
+    jit: { warmupThreshold: 0 } });
+  const thread = { id: 0, status: 'runnable', callStack: new Stack() };
+  const parent = new Frame(method);
+  parent.className = 'ArbitraryOwner';
+  const child = new Frame(method);
+  child.className = 'ArbitraryOwner';
+  thread.callStack.push(parent);
+  thread.callStack.push(child);
+  jvm.threads = [thread];
+
+  const result = jvm._tryExecuteSynchronousJitTick(
+    jvm._prepareSchedulerTick());
+  t.notOk(result.slow,
+    'two warmed frames complete without a scheduler slow-path round trip');
+  t.equal(thread.callStack.size(), 0,
+    'the bounded burst executes the exposed parent after its child');
+  t.equal(jvm.generatedSchedulerBurstFrames, 2,
+    'the burst accounts for both generated frames');
+  t.equal(jvm.generatedSchedulerBurstBatches, 1,
+    'the two frames share one scheduler batch');
   t.end();
 });
 

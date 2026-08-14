@@ -14,7 +14,7 @@ function roundDoubleToLong(value) {
   return BigInt(rounded);
 }
 
-module.exports = {
+const MathClass = {
   super: 'java/lang/Object',
   staticFields: {
     'PI:D': Math.PI,
@@ -88,3 +88,52 @@ module.exports = {
   },
   methods: {},
 };
+
+// Pure JRE leaves publish their positional implementations to the generic
+// compiler. This metadata belongs to the library implementation: codegen does
+// not need a java/lang/Math name table and still guards static initialization
+// before entering one of these functions.
+const directStaticIntrinsics = {
+  'max(II)I': Math.max,
+  'max(JJ)J': (left, right) => left > right ? left : right,
+  'max(FF)F': Math.max,
+  'max(DD)D': Math.max,
+  'min(II)I': Math.min,
+  'min(JJ)J': (left, right) => left < right ? left : right,
+  'min(FF)F': Math.min,
+  'min(DD)D': Math.min,
+  'pow(DD)D': Math.pow,
+  'atan2(DD)D': Math.atan2,
+  'atan(D)D': Math.atan,
+  'sin(D)D': Math.sin,
+  'cos(D)D': Math.cos,
+  'acos(D)D': Math.acos,
+  'asin(D)D': Math.asin,
+  'tan(D)D': Math.tan,
+  'exp(D)D': Math.exp,
+  'log(D)D': Math.log,
+  'rint(D)D': (value) => MathClass.staticMethods['rint(D)D'](
+    null, null, [value]),
+  'floor(D)D': Math.floor,
+  'sqrt(D)D': Math.sqrt,
+  'abs(I)I': Math.abs,
+  'abs(J)J': (value) => value < 0 ? -value : value,
+  'abs(F)F': Math.abs,
+  'abs(D)D': Math.abs,
+  'ceil(D)D': Math.ceil,
+  'round(F)I': Math.round,
+  'round(D)J': roundDoubleToLong,
+};
+
+for (const [signature, intrinsic] of Object.entries(directStaticIntrinsics)) {
+  const method = MathClass.staticMethods[signature];
+  method.jvmDirectFinal = true;
+  method.jvmDirectIntrinsic = intrinsic;
+  // Direct-intrinsic lowering must carry its heap effects just like a
+  // bytecode callee.  Every implementation in this table is a pure scalar
+  // operation, so callers may retain unrelated instance-field read caches.
+  // An intrinsic without this explicit metadata remains fully conservative.
+  method.jvmDirectFieldWriteKeys = Object.freeze([]);
+}
+
+module.exports = MathClass;

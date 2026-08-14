@@ -7,6 +7,7 @@ const {
 const WasmJit = require("./WasmJit");
 const FusedRegionCompiler = require("./FusedRegionCompiler");
 const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
+const HotCallGraphRegionCompiler = require("./HotCallGraphRegionCompiler");
 const monoArray = require("./monoArray");
 const {
   normalizeArrayLoad,
@@ -51,6 +52,11 @@ const EXTENDED_TIER_OPCODES = EXTENDED_TIER_OPCODES_ENABLED ? [
   "lload", "lload_0", "lload_1", "lload_2", "lload_3", "lneg", "lor", "lrem", "lshl",
   "lstore", "lstore_0", "lstore_1", "lstore_2", "lstore_3", "lsub", "lushr",
 ] : [];
+const PRIMITIVE_ARRAY_ACCESS_OPCODES = new Set([
+  "baload", "bastore", "caload", "castore", "daload", "dastore",
+  "faload", "fastore", "iaload", "iastore", "laload", "lastore",
+  "saload", "sastore",
+]);
 
 class JitCompiler {
   constructor(jvm, options = {}) {
@@ -64,10 +70,14 @@ class JitCompiler {
     this.deoptedMethods = new WeakSet();
     this.invocationCounts = new WeakMap();
     this.backwardBranchCache = new WeakMap();
+    this.controlFlowBackedgeCache = new WeakMap();
     this.warmupThreshold = options.warmupThreshold ?? 2;
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
+    this.stableGeneratedEntries = new WeakMap();
+    this.stableGeneratedEntryRunCount = 0;
     this.codegenSupportCache = new WeakMap();
+    this.shortSupportedHelperCache = new WeakMap();
     this.structuredConstructorRetryState = new WeakMap();
     this.structuredConstructorUpgradePending = new WeakSet();
     this.structuredConstructorUpgradeCount = 0;
@@ -76,6 +86,16 @@ class JitCompiler {
     this.adaptiveCodegenDependencyPending = new WeakSet();
     this.adaptiveCodegenDependencyEpoch = new WeakMap();
     this.adaptiveCodegenMethods = new WeakSet();
+    // Some hot loop bodies contain cold allocation/constructor islands. The
+    // baseline generator cannot safely replay those boundaries after an
+    // asynchronous handoff, while the structured renderer verifies and
+    // materializes each boundary precisely. Track those bodies separately so
+    // a failed structured compilation can never fall through to baseline.
+    this.structuredOnlyCodegenMethods = new WeakSet();
+    this.structuredUnsafeConstructorCallersEnabled =
+      options.structuredUnsafeConstructorCallers !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_STRUCTURED_UNSAFE_CONSTRUCTOR_CALLERS === "1");
     this.adaptiveCodegenCounts = new WeakMap();
     this.adaptiveCodegenFrameHeat = new WeakMap();
     const envHotLoopConstructors =
@@ -95,6 +115,33 @@ class JitCompiler {
     this.codegenCompileErrors = new WeakMap();
     this.syncCallSites = [];
     this.nextSyncCallSiteId = 1;
+    this.legacySyncCallSites = new Map();
+    this.generatedTargetsByMethod = new WeakMap();
+    this.generatedTargetUpgradePublicationCount = 0;
+    this.eagerMonomorphicCallsEnabled =
+      options.eagerMonomorphicCalls !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_EAGER_MONOMORPHIC_CALLS === "1");
+    const eagerMonomorphicCallMaxCodeItems = Number(
+      options.eagerMonomorphicCallMaxCodeItems ??
+      (typeof process !== "undefined" && process.env
+        ? process.env.JVM_EAGER_MONOMORPHIC_CALL_MAX_CODE_ITEMS
+        : undefined));
+    this.eagerMonomorphicCallMaxCodeItems =
+      Number.isFinite(eagerMonomorphicCallMaxCodeItems) &&
+      eagerMonomorphicCallMaxCodeItems > 0
+        ? Math.floor(eagerMonomorphicCallMaxCodeItems) : 96;
+    this.eagerMonomorphicCallLinkCount = 0;
+    // Positional adapters are code-shape templates. Many independent call
+    // sites reach the same method and used to parse an identical Function for
+    // every site during asset loading. Cache the unbound template by resolved
+    // method and ABI shape; each site still binds its own live linkage plan.
+    this.positionalGeneratedEntryTemplates = new WeakMap();
+    this.positionalJreEntryTemplates = new WeakMap();
+    this.positionalGeneratedTemplateCompileCount = 0;
+    this.positionalGeneratedTemplateReuseCount = 0;
+    this.positionalJreTemplateCompileCount = 0;
+    this.positionalJreTemplateReuseCount = 0;
     this.fieldSites = [];
     this.nextFieldSiteId = 1;
     // Loaded class hierarchies are immutable. Cache definitive synchronous
@@ -114,6 +161,11 @@ class JitCompiler {
     // callers bind that function once instead of repeating native lookup,
     // argument slicing, and generic call dispatch.
     this.directJreIntrinsics = [];
+    this.directJreInitializationTokens = [];
+    this.directStaticJreIntrinsicsEnabled =
+      options.directStaticJreIntrinsics !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_DIRECT_STATIC_JRE_INTRINSICS === "1");
     this.directSynchronousIntrinsics = [];
     this.directCheckedLeafBodies = [];
     this.directCheckedLeafBodyIds = new WeakMap();
@@ -148,17 +200,30 @@ class JitCompiler {
       options.adaptiveFramelessPositional !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_ADAPTIVE_FRAMELESS_POSITIONAL === "1");
+    this.compiledCallChainsEnabled =
+      options.compiledCallChains === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_COMPILED_CALL_CHAINS === "1");
+    this.compiledCallChainRunCount = 0;
+    this.hotCallGraphRegions = new HotCallGraphRegionCompiler(this, options);
     this.ordinaryAdaptiveFramelessPositionalEnabled =
       options.ordinaryAdaptiveFramelessPositional === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_ORDINARY_ADAPTIVE_FRAMELESS === "1");
     this.ordinaryAdaptiveFramelessRunCount = 0;
     this.referenceFramelessPositionalRunCount = 0;
+    this.framePositionalCallCount = 0;
+    this.framePositionalFallbackCount = 0;
+    this.framePositionalCallsEnabled =
+      options.framePositionalCalls === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_FRAME_POSITIONAL_CALLS === "1");
     this.adaptiveFramelessBudgetMultiplier = Math.max(1, Math.min(100,
       Number(options.adaptiveFramelessBudgetMultiplier ??
         (typeof process !== "undefined" && process.env &&
           process.env.JVM_ADAPTIVE_FRAMELESS_BUDGET_MULTIPLIER) ?? 8) || 8));
     this.inlineIntegerRegionCache = new WeakMap();
+    this.directInlineIntegerRegionCache = new WeakMap();
     this.inlineIntegerPlanCache = new WeakMap();
     this.memoizedIntegralLeafCache = new WeakMap();
     this.memoizedIntegralLeavesEnabled =
@@ -196,7 +261,13 @@ class JitCompiler {
         : undefined);
     this.adaptiveWholeMethodEscalationThreshold =
       configuredWholeMethodEscalation === undefined
-        ? 16
+        // One elapsed-time/entry-hot JavaScript promotion is already runtime
+        // evidence that this workload contains effectful call islands. Keep
+        // explicitly selected oversized/long kernels Wasm-first, but stop
+        // paying partial Wasm entry/exit probes for every ordinary method.
+        // Deployments can raise this threshold or set zero to disable the
+        // workload-wide escalation.
+        ? 1
         : Math.max(0, Number(configuredWholeMethodEscalation) || 0);
     this.adaptiveWholeMethodPromotionCount = 0;
     this.adaptiveWholeMethodEscalationCount = 0;
@@ -226,6 +297,14 @@ class JitCompiler {
     this.methodEntryTrace = null;
     const jitEnvironment = typeof process !== "undefined" && process.env
       ? process.env : {};
+    this.frameHandoffTracePattern = jitEnvironment.JVM_TRACE_FRAME_HANDOFF || "";
+    this.frameHandoffTracePc = jitEnvironment.JVM_TRACE_FRAME_HANDOFF_PC === undefined
+      ? null : Number(jitEnvironment.JVM_TRACE_FRAME_HANDOFF_PC);
+    this.frameMaterializeTracePattern =
+      jitEnvironment.JVM_TRACE_FRAME_MATERIALIZE || "";
+    this.frameMaterializeTracePc =
+      jitEnvironment.JVM_TRACE_FRAME_MATERIALIZE_PC === undefined
+        ? null : Number(jitEnvironment.JVM_TRACE_FRAME_MATERIALIZE_PC);
     const envPreferWholeMethodJs = jitEnvironment.JVM_PREFER_WHOLE_METHOD_JS;
     const generatedBodyDefault =
       jitEnvironment.JVM_WASM_JIT === "0" ||
@@ -292,6 +371,12 @@ class JitCompiler {
       options.dynamicArrayStructuredFirst !== false &&
       !(typeof process !== "undefined" && process.env &&
         process.env.JVM_DISABLE_DYNAMIC_ARRAY_STRUCTURED_FIRST === "1");
+    this.callGraphStructuredFirstMethods = new WeakMap();
+    this.callGraphStructuredFirstMethodCount = 0;
+    this.callGraphStructuredFirstEnabled =
+      options.callGraphStructuredFirst !== false &&
+      !(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DISABLE_CALL_GRAPH_STRUCTURED_FIRST === "1");
     this.rendererPipelineEnabled = options.rendererPipeline === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_RENDERER_PIPELINE === "1");
@@ -329,6 +414,19 @@ class JitCompiler {
       : options;
     this.fusedRegions = new FusedRegionCompiler(this, regionOptions);
     this.structuredSsa = new JvmSsaBlockRenderer(this, regionOptions);
+    // A method's independently selected tier is not necessarily the best
+    // representation when that method becomes part of a closed hot graph.
+    // Keep graph-owned structured lowering separate from the canonical
+    // codegen cache: its Method identity remains the fallback/invalidation
+    // authority, while the region may jointly emit a scalar SSA body.
+    this.regionStructuredCandidates = new WeakMap();
+    this.regionStructuredCandidateCompiling = new WeakSet();
+    this.regionStructuredLeafCandidateCache = new WeakMap();
+    this.regionStructuredCandidateCompileCount = 0;
+    this.graphOwnedStructuredCandidatesEnabled =
+      options.graphOwnedStructuredCandidates === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_GRAPH_OWNED_STRUCTURED_CANDIDATES === "1");
   }
 
   requiresOpaqueControlInterpreter(method, codeItems) {
@@ -386,6 +484,15 @@ class JitCompiler {
       this.supportCache.set(method, false);
       return false;
     }
+    const backward = this.hasControlFlowBackedge(method, codeItems);
+    this.backwardBranchCache.set(method, backward);
+    return backward;
+  }
+
+  hasControlFlowBackedge(method, codeItems = this.getCodeItems(method)) {
+    if (this.controlFlowBackedgeCache.has(method)) {
+      return this.controlFlowBackedgeCache.get(method);
+    }
     const labels = buildLabelMap(codeItems);
     const backward = codeItems.some((item, index) => {
       const instruction = item && item.instruction;
@@ -394,8 +501,34 @@ class JitCompiler {
       const target = instruction && typeof instruction === "object" ? labels.get(instruction.arg) : undefined;
       return target !== undefined && target <= index;
     });
-    this.backwardBranchCache.set(method, backward);
+    this.controlFlowBackedgeCache.set(method, backward);
     return backward;
+  }
+
+  hasConstructorBeforeOrInsideBackwardLoop(method, codeItems = null) {
+    const items = codeItems || this.getCodeItems(method);
+    const labels = buildLabelMap(items);
+    const constructorIndexes = [];
+    for (let index = 0; index < items.length; index += 1) {
+      const instruction = items[index]?.instruction;
+      if (getOp(instruction) === "invokespecial" &&
+          Array.isArray(instruction?.arg) &&
+          Array.isArray(instruction.arg[2]) &&
+          instruction.arg[2][0] === "<init>") {
+        constructorIndexes.push(index);
+      }
+    }
+    if (!constructorIndexes.length) return false;
+    return items.some((item, index) => {
+      const instruction = item?.instruction;
+      const op = getOp(instruction);
+      if (!op || (op !== "goto" && !op.startsWith("if"))) return false;
+      const target = typeof instruction === "object"
+        ? labels.get(instruction.arg) : undefined;
+      return Number.isInteger(target) && target <= index &&
+        constructorIndexes.some((constructorIndex) =>
+          constructorIndex <= index);
+    });
   }
 
   getCodeItems(method) {
@@ -419,6 +552,9 @@ class JitCompiler {
   }
 
   tryRunFrame(frame, thread) {
+    const stableResult = this.tryRunStableGeneratedFrame(frame, thread);
+    if (stableResult) return stableResult;
+
     // SpiderMonkey pays a high cost for frequent Wasm -> JS -> Wasm exits.
     // When the whole method has a generated implementation, prefer that
     // single tier over partial Wasm. Compilation is intentionally allowed to
@@ -492,14 +628,92 @@ class JitCompiler {
       return UNHANDLED_RESULT;
     }
 
-    const methodKey = `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`;
+    const generated = this.getGeneratedFunction(frame.method);
+    if (!generated && this.structuredOnlyCodegenMethods.has(frame.method)) {
+      // Adaptive admission may prove only that this constructor-bearing
+      // caller is safe for the structured renderer. If that renderer rejects
+      // a later detail, the legacy runner is not a valid fallback: it cannot
+      // suspend and replay an arbitrary new/dup/invokespecial boundary. Keep
+      // the complete method on the canonical interpreter instead.
+      return UNHANDLED_RESULT;
+    }
+
+    if (generated && (!this.wasmJit.enabled ||
+        this.prefersWholeMethodJs(frame.method)) &&
+        (frame.method.name !== "<init>" ||
+        generated.jvmStructuredSsa ||
+        generated.jvmRestoringDirectPositionalBody)) {
+      let stableEntry = this.stableGeneratedEntries.get(frame.method);
+      if (!stableEntry) {
+        stableEntry = { jit: this, generated };
+        this.stableGeneratedEntries.set(frame.method, stableEntry);
+      } else {
+        stableEntry.generated = generated;
+      }
+      frame.jitStableGeneratedEntry = stableEntry;
+    }
+    return this.runSelectedGeneratedFrame(generated, frame, thread);
+  }
+
+  tryRunStableGeneratedFrame(frame, thread) {
+    if (!this.enabled || !frame || !frame.method || !frame.instructions ||
+        frame.jitJsDisabled || this.runningFrames.has(frame) ||
+        this._envInstrumented) return null;
+    const stableEntry = frame.jitStableGeneratedEntry ||
+      this.stableGeneratedEntries.get(frame.method);
+    if (!stableEntry || stableEntry.jit !== this || !stableEntry.generated) {
+      return null;
+    }
+    if (this.wasmJit.enabled && !this.prefersWholeMethodJs(frame.method)) {
+      return null;
+    }
+    if (frame.jitSkipOnce) {
+      // Leave the marker for canRun below. Consuming it in this preliminary
+      // probe would let the ordinary tier re-enter during the same tick,
+      // skipping the one canonical interpreter step requested by deopt.
+      return null;
+    }
+    if (this.deoptedMethods.has(frame.method)) {
+      frame.jitJsDisabled = true;
+      return null;
+    }
+    const debug = this.jvm.debugManager;
+    if (debug.debugMode && debug.runMode !== "continuing" ||
+        debug.isClassJitDeopted(this.getFrameClassName(frame))) {
+      return null;
+    }
+    frame.jitStableGeneratedEntry = stableEntry;
+    this.stableGeneratedEntryRunCount += 1;
+    return this.runSelectedGeneratedFrame(
+      stableEntry.generated, frame, thread);
+  }
+
+  runSelectedGeneratedFrame(generated, frame, thread) {
+    // A method can first publish a baseline body and upgrade to structured SSA
+    // after its dependencies initialize. Stable generated entries intentionally
+    // bypass ordinary tier admission, so without this one-time PC-0 audit such
+    // a warmed loop could never become a region root. The attached plan makes
+    // the check disappear after the first attempt.
+    if (frame?.pc === 0 && generated?.jvmHotCallGraphFramedSource &&
+        !generated.jvmHotCallGraphRegionPlan &&
+        this.shouldCompileHotCallGraphRegion(frame.method)) {
+      this.compileHotCallGraphRegion(frame.method);
+    }
+    generated = this.refreshHotCallGraphRegionAtEntry(generated, frame);
+    if ((frame.pc === 0 ||
+         generated?.jvmHotCallGraphHasContinuation?.(frame)) &&
+        typeof generated?.jvmHotCallGraphFramedBody === "function") {
+      generated = generated.jvmHotCallGraphFramedBody;
+    }
+    const methodKey = this.profileMethods
+      ? `${this.getFrameClassName(frame)}.${frame.method.name}${frame.method.descriptor}`
+      : null;
     if (this.profileMethods) {
       this.methodRunCounts.set(methodKey, (this.methodRunCounts.get(methodKey) || 0) + 1);
     }
     this.runningFrames.add(frame);
     let result;
     try {
-      const generated = this.getGeneratedFunction(frame.method);
       result = generated
         ? this.runGeneratedFrame(generated, frame, thread)
         : this.runFrame(frame, thread);
@@ -583,7 +797,7 @@ class JitCompiler {
       const op = getOp(item && item.instruction);
       if (!op) continue;
       instructionCount += 1;
-      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
+      if (PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op) || op === "arraylength") {
         primitiveArrayAccessCount += 1;
       }
       if (op === "invokestatic") staticCallCount += 1;
@@ -620,7 +834,7 @@ class JitCompiler {
       const op = getOp(item && item.instruction);
       if (!op) continue;
       instructionCount += 1;
-      if (/^(?:[bcdfils]aload|[bcdfils]astore|arraylength)$/.test(op)) {
+      if (PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op) || op === "arraylength") {
         primitiveArrayAccessCount += 1;
       } else if (op === "invokevirtual" || op === "invokeinterface" ||
           op === "invokespecial") {
@@ -633,12 +847,40 @@ class JitCompiler {
     // values and link monomorphic callees positionally. Select only a large,
     // dense shape so ordinary object/UI methods do not pay its cold compile
     // cost.
-    const selected = instructionCount >= 512 &&
+    const selected = instructionCount >= 384 &&
       primitiveArrayAccessCount >= 32 &&
       dynamicCallCount >= 2 &&
-      this.hasBackwardBranch(method);
+      this.hasControlFlowBackedge(method);
     this.dynamicArrayStructuredFirstMethods.set(method, selected);
     if (selected) this.dynamicArrayStructuredFirstMethodCount += 1;
+    return selected;
+  }
+
+  isCallGraphStructuredFirstMethod(method) {
+    if (!this.callGraphStructuredFirstEnabled || !method ||
+        method.name === "<init>" || method.name === "<clinit>") return false;
+    if (this.callGraphStructuredFirstMethods.has(method)) {
+      return this.callGraphStructuredFirstMethods.get(method);
+    }
+    let instructionCount = 0;
+    let callCount = 0;
+    for (const item of this.getCodeItems(method)) {
+      const op = getOp(item?.instruction);
+      if (!op) continue;
+      instructionCount += 1;
+      if (op === "invokestatic" || op === "invokevirtual" ||
+          op === "invokeinterface" || op === "invokespecial") callCount += 1;
+    }
+    // Partial-loop extraction is counterproductive for a body that repeatedly
+    // crosses method boundaries: it prevents the full structured compiler
+    // from publishing call metadata, so a loop or dense fan-out caller can
+    // never become a jointly lowered region root. Require either substantial
+    // fan-out, a backedge, or high call density; call-free numeric kernels
+    // retain their existing scalar/Wasm policies.
+    const selected = instructionCount >= 128 &&
+      (callCount >= 16 || callCount >= 8 && this.hasBackwardBranch(method));
+    this.callGraphStructuredFirstMethods.set(method, selected);
+    if (selected) this.callGraphStructuredFirstMethodCount += 1;
     return selected;
   }
 
@@ -647,7 +889,30 @@ class JitCompiler {
       this.adaptiveCodegenMethods.has(method);
   }
 
+  shouldCompileHotCallGraphRegion(method) {
+    if (!this.hotCallGraphRegions.enabled || !method) return false;
+    const generated = this.codegenCache.get(method);
+    if (generated?.jvmHotCallGraphRegionPlan) return true;
+    // Loops are not the only useful region roots. A frequently entered small
+    // caller can dominate execution by repeatedly crossing into loop-bearing
+    // descendants; keeping the old backward-branch requirement stranded that
+    // caller above the jointly lowered graph. Adaptive promotion is runtime
+    // heat evidence, so admit any promoted structured caller that actually
+    // publishes call edges. Leaves still use their ordinary positional ABI.
+    const callSites = generated?.jvmStructuredRegionCallSites;
+    const warmedLoop = this.hasBackwardBranch(method) &&
+      // canRun deliberately compiles a backward-branch method on its first
+      // entry, before the ordinary threshold. Stable entries then stop
+      // incrementing invocationCounts, so "observed at least once" is the
+      // matching heat proof for a loop root.
+      (this.invocationCounts.get(method) || 0) > 0;
+    return Array.isArray(callSites) && callSites.length > 0 &&
+      (warmedLoop || this.adaptiveCodegenMethods.has(method) ||
+        this.isDynamicArrayStructuredFirstMethod(method));
+  }
+
   observeAdaptiveCodegenHeat(frame) {
+    if (this.adaptiveCodegenMethods.has(frame.method)) return false;
     if (frame.pc === 0 && !frame.jitAdaptiveEntryCounted) {
       frame.jitAdaptiveEntryCounted = true;
       const count = (this.adaptiveCodegenCounts.get(frame.method) || 0) + 1;
@@ -714,6 +979,7 @@ class JitCompiler {
       }
       if (!result.transient) {
         this.deoptedMethods.add(frame.method);
+        this.hotCallGraphRegions.markMethodDeoptimized(frame.method);
         frame.jitJsDisabled = true;
       }
       return HANDLED_RESULT;
@@ -735,6 +1001,16 @@ class JitCompiler {
           ? explicitReturnParent
           : !thread.callStack.isEmpty() ? thread.callStack.peek() : null;
         if (returnParent) returnParent.stack.push(result.value);
+        if (frame.jitFrameHandoffTrace) {
+          console.error("[jvm-frame-handoff-return] " + JSON.stringify({
+            ...frame.jitFrameHandoffTrace, tier: "generated",
+            childDepth: frame.stack.items.length,
+            parentDepth: returnParent ? returnParent.stack.items.length : null,
+            parentPc: returnParent?.pc ?? null,
+            valueType: result.value === null ? "null" : typeof result.value,
+          }));
+          delete frame.jitFrameHandoffTrace;
+        }
       } else if (explicitReturnParent && explicitReturnType !== "void") {
         console.error("[jit-generated-return-underflow]", {
           child: `${frame.className || "<unknown>"}.` +
@@ -753,7 +1029,7 @@ class JitCompiler {
     const rows = [...this.methodRunCounts.entries()]
       .sort((a, b) => b[1] - a[1])
       .slice(0, Math.max(0, limit));
-    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} syncOperandUnderflowFallbacks=${this.syncOperandUnderflowFallbackCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.totalRunCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredLazyStatics=${this.structuredSsa.lazyStaticTargetLinkCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
+    console.error(`JIT generated=${this.generatedRunCount} sync=${this.syncGeneratedRunCount} inlined=${this.syncInlinedCallCount} intrinsics=${this.syncIntrinsicCallCount} eagerMonomorphicLinks=${this.eagerMonomorphicCallLinkCount} hotGraphModules=${this.hotCallGraphRegions.moduleCompileCount} hotGraphRuns=${this.hotCallGraphRegions.runCount} hotGraphFallbacks=${this.hotCallGraphRegions.guardFallbackCount} syncOperandUnderflowFallbacks=${this.syncOperandUnderflowFallbackCount} reusedFrames=${this.syncReusedFrameCount} adaptiveWholeMethod=${this.adaptiveWholeMethodPromotionCount} adaptiveEscalations=${this.adaptiveWholeMethodEscalationCount} structuredSsa=${this.structuredSsa.totalRunCount} structuredSsaSafePoints=${this.structuredSsa.safePointCount} structuredLazyStatics=${this.structuredSsa.lazyStaticTargetLinkCount} structuredSplitMethods=${this.structuredSsa.splitMethodCount} structuredSplitBlocks=${this.structuredSsa.splitBlockCount} inlineLoopRegions=${this.inlineLoopRegionRunCount} inlineLoopOsr=${this.inlineLoopRegionOsrCount} scalarLoops=${this.scalarLoopRunCount} scalarSafePoints=${this.scalarLoopSafePointCount} scalarSsa=${this.scalarSsaRunCount} scalarArrayViews=${this.scalarSsaArrayViewCount} scalarEliminatedReads=${this.scalarSsaEliminatedReadCount} scalarThreadedEdges=${this.scalarSsaThreadedEdgeCount} fused=${this.fusedRunCount} fusedDirect=${this.fusedDirectRunCount} fusedFallback=${this.fusedGuardedFallbackCount} restoredFrames=${this.fusedRestoredExceptionFrameCount} runner=${this.runnerRunCount}`);
     for (const [method, count] of rows) {
       const deopts = this.methodDeoptCounts.get(method) || 0;
       console.error(`  ${count.toLocaleString()} runs ${method}${deopts ? ` (${deopts} deopt)` : ""}`);
@@ -779,18 +1055,16 @@ class JitCompiler {
     }
     if (this.codegenCache.has(method)) {
       const cached = this.codegenCache.get(method);
-      // A loop constructor can first execute while one of its call/static
-      // dependencies is still initializing. Structured SSA correctly
-      // declines that cold compilation, but the baseline body must not become
-      // a permanent ceiling after all dependencies resolve. Some protected
-      // methods deliberately retain their baseline Frame entry while exposing
-      // a structured positional entry to verified callers. Either entry is a
-      // useful upgrade over a cold baseline, so retry until one is available.
-      // Retries are bounded and exponentially spaced.
+      // A verified loop constructor can initially retain its baseline Frame
+      // entry while exposing a structured positional body to callers. Retry
+      // that narrow structural case after additional invocation evidence;
+      // broad late retries caused compiler churn in large applications.
+      const retryableLoop = method.name === "<init>" &&
+        this.isJitSafeConstructor(method) && this.hasBackwardBranch(method);
       if (cached && !cached.jvmStructuredSsa &&
           !cached.jvmRestoringDirectPositionalBody &&
           this.structuredSsa.enabled &&
-          this.isJitSafeConstructor(method) && this.hasBackwardBranch(method) &&
+          retryableLoop &&
           !this.codegenCompiling.has(method)) {
         const count = this.invocationCounts.get(method) || 0;
         const state = this.structuredConstructorRetryState.get(method) || {
@@ -815,6 +1089,10 @@ class JitCompiler {
     try {
       const generated = this.compileMethod(method);
       this.codegenCache.set(method, generated);
+      if (generated?.jvmHotCallGraphFramedSource &&
+          this.shouldCompileHotCallGraphRegion(method)) {
+        this.compileHotCallGraphRegion(method);
+      }
       return generated;
     } catch (err) {
       this.codegenCompileErrors.set(method, err);
@@ -822,6 +1100,129 @@ class JitCompiler {
     } finally {
       this.codegenCompiling.delete(method);
     }
+  }
+
+  getStructuredRegionCandidate(method, canonical = null) {
+    const ordinary = canonical || this.codegenCache.get(method) ||
+      this.getGeneratedFunction(method);
+    if (ordinary?.jvmStructuredSsa) return ordinary;
+    if (!this.graphOwnedStructuredCandidatesEnabled &&
+        !this.isGraphOwnedStructuredLeafCandidate(method)) return null;
+    const cached = this.regionStructuredCandidates.get(method);
+    if (cached) return cached;
+    if (!this.structuredSsa.enabled ||
+        this.regionStructuredCandidateCompiling.has(method) ||
+        !this.canCompileSynchronously(method)) return null;
+    this.regionStructuredCandidateCompiling.add(method);
+    try {
+      const candidate = this.structuredSsa.compile(method);
+      if (!candidate?.jvmStructuredSsa) return null;
+      this.regionStructuredCandidates.set(method, candidate);
+      this.regionStructuredCandidateCompileCount += 1;
+      return candidate;
+    } catch (error) {
+      this.codegenCompileErrors.set(method, error);
+      return null;
+    } finally {
+      this.regionStructuredCandidateCompiling.delete(method);
+    }
+  }
+
+  isGraphOwnedStructuredLeafCandidate(method) {
+    if (!method || method.name === "<init>" || method.name === "<clinit>" ||
+        isSynchronizedMethod(method)) return false;
+    if (this.regionStructuredLeafCandidateCache.has(method)) {
+      return this.regionStructuredLeafCandidateCache.get(method);
+    }
+    const items = this.getCodeItems(method);
+    let primitiveArrayAccesses = 0;
+    let calls = 0;
+    for (const item of items) {
+      const op = getOp(item?.instruction);
+      if (PRIMITIVE_ARRAY_ACCESS_OPCODES.has(op)) {
+        primitiveArrayAccesses += 1;
+      } else if (op === "invokestatic" || op === "invokevirtual" ||
+          op === "invokeinterface" || op === "invokespecial" ||
+          op === "invokedynamic") {
+        calls += 1;
+      }
+    }
+    const code = method.attributes?.find((attribute) =>
+      attribute.type === "code")?.code;
+    // These leaves are precisely the case where an independently selected
+    // baseline/Wasm tier prevents a caller-owned graph from passing scalar
+    // operands across a very frequent edge. Jointly lower only a bounded,
+    // call-free primitive-array loop. The structured renderer still performs
+    // the complete CFG, stack, exception, and positional-ABI verification;
+    // this predicate merely decides whether that verification is worth
+    // requesting from a graph.
+    const selected = items.length >= 16 && items.length <= 512 &&
+      primitiveArrayAccesses >= 4 && calls === 0 &&
+      this.hasBackwardBranch(method) &&
+      (code?.exceptionTable?.length || 0) === 0;
+    this.regionStructuredLeafCandidateCache.set(method, selected);
+    return selected;
+  }
+
+  compileHotCallGraphRegion(method, options) {
+    return this.hotCallGraphRegions.compile(method, options);
+  }
+
+  maybeExpandHotCallGraphRegion(site) {
+    const callerMethod = site?.callerMethod;
+    if (!callerMethod || !this.hotCallGraphRegions.enabled) return;
+    const generated = this.codegenCache.get(callerMethod);
+    const plan = generated?.jvmHotCallGraphRegionPlan;
+    const dirty = this.hotCallGraphRegions.isPlanDirty(plan);
+    // Publication marks every dependent root dirty. With blind periodic
+    // probing disabled, a stable plan has no new information to inspect; do
+    // not rescan all boundary target/source identities at every dynamic call.
+    if (!dirty &&
+        this.hotCallGraphRegions.expansionProbeInterval === 0) return;
+    if (dirty) return;
+    const probeCount = (this.hotCallGraphRegions.expansionProbeCounts.get(
+      callerMethod) || 0) + 1;
+    this.hotCallGraphRegions.expansionProbeCounts.set(
+      callerMethod, probeCount);
+    const periodicProbe =
+      this.hotCallGraphRegions.expansionProbeInterval > 0 &&
+      probeCount % this.hotCallGraphRegions.expansionProbeInterval === 0;
+    if (!periodicProbe ||
+        !this.hotCallGraphRegions.hasExpandableBoundaryChange(plan)) return;
+    this.hotCallGraphRegions.stateExpansionCount += 1;
+    this.hotCallGraphRegions.markCallSiteFeedback(site);
+  }
+
+  refreshHotCallGraphRegionAtEntry(generated, frame) {
+    const plan = generated?.jvmHotCallGraphRegionPlan;
+    if (!plan || frame?.pc !== 0 ||
+        !this.hotCallGraphRegions.isPlanDirty(plan)) return generated;
+    if (plan.backendEligible &&
+        plan.entryCount + 1 <
+          this.hotCallGraphRegions.expansionEntryThreshold) {
+      return generated;
+    }
+    if (plan.backendEligible &&
+        this.hotCallGraphRegions.expandableBoundaryCount(plan) === 0) {
+      // Republishing the same generated identity can conservatively mark its
+      // dependants dirty even though no boundary target/source changed. Once
+      // the entry audit proves that there is nothing to add, acknowledge the
+      // event instead of rescanning it on every subsequent activation.
+      this.hotCallGraphRegions.dirtyRoots.delete(frame.method);
+      this.hotCallGraphRegions.lastExpansionAttempts.set(frame.method,
+        this.hotCallGraphRegions.captureExpandableBoundaryStates(plan));
+      return generated;
+    }
+    // A root may publish many child targets during one long activation. A
+    // module compiled at any of those call sites cannot affect that active
+    // invocation. Consume all accumulated target/type feedback once here,
+    // before the next activation selects its framed regional body.
+    this.hotCallGraphRegions.dirtyExpansionCount += 1;
+    this.compileHotCallGraphRegion(frame.method, {
+      forceExpansion: true,
+      ignoreExpansionAttempt: true,
+    });
+    return generated;
   }
 
   runGeneratedFrame(generated, frame, thread, initialBytecodeChecks) {
@@ -1011,13 +1412,17 @@ class JitCompiler {
 
   createGeneratedFunction(method, tier, parameters, source,
     ownerOverride = null, asynchronous = false, generator = false,
-    captures = null) {
+    captures = null, hoistedSource = null) {
     const labeled = this.generatedSource(method, tier, source, ownerOverride);
     // Function constructors themselves remain anonymous in Gecko profiles.
     // Return a named literal so stack sampling exposes the guest identity.
     const prefix = generator ? "function* " : asynchronous ? "async function " : "function ";
     const captureNames = captures ? Object.keys(captures) : [];
-    const factory = new Function(...captureNames, `"use strict"; return ${prefix}` +
+    // Hoisted declarations evaluate once in the factory scope; the sourceURL
+    // pragma inside the returned function's body names the whole script, so
+    // profilers attribute the hoisted helpers to the same generated URL.
+    const factory = new Function(...captureNames, `"use strict"; ${
+      hoistedSource ? `\n${hoistedSource}\n` : ""}return ${prefix}` +
       `${labeled.functionName}(${parameters.join(",")}) {\n` +
       `${labeled.source}\n}`);
     const generated = factory(...captureNames.map((name) => captures[name]));
@@ -1208,7 +1613,24 @@ class JitCompiler {
       // An unloaded target is not a stable rejection: the first interpreted
       // invocation may load it and make the proof available to the next hot
       // entry.
-      if (safeInitializationCalls === null) {
+      const structuredOnly = safeInitializationCalls === false &&
+        this.structuredUnsafeConstructorCallersEnabled &&
+        this.structuredSsa.enabled &&
+        this.hasConstructorBeforeOrInsideBackwardLoop(method, codeItems) &&
+        codeItems.some((item) =>
+          PRIMITIVE_ARRAY_ACCESS_OPCODES.has(getOp(item?.instruction)));
+      if (structuredOnly) {
+        // This only admits the method to the adaptive heat counter. The full
+        // CFG/stack/exception proof still happens in compileMethod, which is
+        // barred above from falling through to the baseline generator.
+        this.structuredOnlyCodegenMethods.add(method);
+        if (typeof process !== "undefined" && process.env &&
+            process.env.JVM_TRACE_STRUCTURED_ONLY === "1") {
+          console.error("[jit-structured-only-admission] " +
+            `${this.jvm.findClassNameForMethod?.(method) || method.className || "unknown"}.` +
+            `${method.name}${method.descriptor}`);
+        }
+      } else if (safeInitializationCalls === null) {
         this.adaptiveCodegenDependencyPending.add(method);
         this.adaptiveCodegenDependencyEpoch.set(
           method, this.jvm.classEpoch || 0);
@@ -1217,7 +1639,7 @@ class JitCompiler {
         this.adaptiveCodegenDependencyEpoch.delete(method);
         supportCache.set(method, false);
       }
-      return false;
+      if (!structuredOnly) return false;
     }
     if (allowEffectfulCalls) {
       this.adaptiveCodegenDependencyPending.delete(method);
@@ -1255,7 +1677,8 @@ class JitCompiler {
       "ifnull", "iload", "iload_0", "iload_1", "iload_2", "iload_3",
       "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
       "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
-      "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return",
+      "lookupswitch", "tableswitch",
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
@@ -1372,7 +1795,28 @@ class JitCompiler {
     }
     const trivialForwarder = instructions.length === 3 &&
       getOp(instructions[2]) === "return";
-    return trivialForwarder || this.hasBackwardBranch(method);
+
+    // javac emits field initializers after the direct-super call. A common
+    // form consists entirely of constants, array allocation and field stores.
+    // It is just as scheduler-safe as a forwarding constructor: it contains
+    // no Java call or control-flow edge at which generated execution could
+    // suspend and later replay a partially initialized receiver. Keep the
+    // proof deliberately structural. The ordinary codegen opcode gate still
+    // verifies every instruction before such a constructor is compiled.
+    const linearFieldInitializer =
+      getOp(instructions[instructions.length - 1]) === "return" &&
+      instructions.slice(2, -1).every((instruction) => {
+        const op = getOp(instruction);
+        return op && !op.startsWith("invoke") && !op.startsWith("if") &&
+          op !== "goto" && op !== "goto_w" &&
+          op !== "tableswitch" && op !== "lookupswitch" &&
+          op !== "jsr" && op !== "jsr_w" && op !== "ret" &&
+          op !== "monitorenter" && op !== "monitorexit" &&
+          op !== "athrow" && op !== "getstatic" && op !== "putstatic" &&
+          !op.endsWith("return");
+      });
+    return trivialForwarder || linearFieldInitializer ||
+      this.hasBackwardBranch(method);
   }
 
   hasJitSafeMonitorBody(codeItems) {
@@ -1436,8 +1880,14 @@ class JitCompiler {
   }
 
   isShortSupportedHelper(method) {
+    if (this.shortSupportedHelperCache.has(method)) {
+      return this.shortSupportedHelperCache.get(method);
+    }
     const codeItems = this.getCodeItems(method);
-    if (codeItems.filter((item) => item.instruction).length > 32) return false;
+    if (codeItems.filter((item) => item.instruction).length > 32) {
+      this.shortSupportedHelperCache.set(method, false);
+      return false;
+    }
     const allowed = new Set([
       "aaload", "aastore", "aconst_null", "aload", "aload_0", "aload_1", "aload_2",
       "aload_3", "areturn", "arraylength", "baload", "bastore", "bipush", "caload",
@@ -1452,7 +1902,10 @@ class JitCompiler {
       "invokeinterface", "invokestatic", "invokevirtual", "ireturn", "putfield",
       "putstatic", "return", "saload", "sastore", "sipush",
     ]);
-    return codeItems.every((item) => !item.instruction || allowed.has(getOp(item.instruction)));
+    const supported = codeItems.every((item) =>
+      !item.instruction || allowed.has(getOp(item.instruction)));
+    this.shortSupportedHelperCache.set(method, supported);
+    return supported;
   }
 
   hasCallDenseComputeShape(method, codeItems) {
@@ -1490,6 +1943,18 @@ class JitCompiler {
   }
 
   materialize(frame, locals, stack, pc) {
+    const tracePattern = this.frameMaterializeTracePattern;
+    const tracePc = this.frameMaterializeTracePc;
+    if (tracePattern && (!Number.isInteger(tracePc) || pc === tracePc)) {
+      const identity = `${frame.className || "?"}.${frame.method?.name || "?"}${
+        frame.method?.descriptor || ""}`;
+      if (identity.includes(tracePattern)) {
+        console.error("[jvm-frame-materialize] " + JSON.stringify({
+          frame: identity, pc, depth: stack.length,
+          host: new Error("frame materialization").stack,
+        }));
+      }
+    }
     frame.locals = locals;
     frame.stack.items = stack;
     frame.pc = pc;
@@ -1548,18 +2013,23 @@ class JitCompiler {
     if (!jvm || !thread || thread.status !== "runnable") return false;
     const debug = jvm.debugManager;
     if (debug && (debug.debugMode || debug.breakpoints.size > 0)) return false;
-    if (jvm.clock && jvm.clock.enabled) return false;
-    const now = Date.now();
-    if (!(now < jvm._nextEventLoopYieldAt)) return false;
+    if (jvm.clock && jvm.clock.enabled && !jvm.clock.realtime) return false;
+    const wallNow = Date.now();
+    if (!(wallNow < jvm._nextEventLoopYieldAt)) return false;
+    // Sleep/wait deadlines live in the guest clock domain. A realtime fake
+    // clock deliberately uses a reproducible epoch which need not resemble
+    // Date.now(), so comparing those deadlines with wall time makes every
+    // parked thread appear overdue and spills every generated quantum.
+    const schedulerNow = jvm.clock ? jvm.clock.millis() : wallNow;
     const threads = jvm.threads || [];
     for (let index = 0; index < threads.length; index += 1) {
       const other = threads[index];
       if (other === thread) continue;
       if (other.status === "runnable") return false;
       if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
-          now >= Number(other.sleepUntil)) return false;
+          schedulerNow >= Number(other.sleepUntil)) return false;
       if (other.status === "WAITING" && other.waitDeadline !== undefined &&
-          now >= Number(other.waitDeadline)) return false;
+          schedulerNow >= Number(other.waitDeadline)) return false;
     }
     return true;
   }
@@ -1575,17 +2045,18 @@ class JitCompiler {
     if (!jvm || !thread || thread.status !== "runnable") return false;
     const debug = jvm.debugManager;
     if (debug && (debug.debugMode || debug.breakpoints.size > 0)) return false;
-    if (jvm.clock && jvm.clock.enabled) return false;
-    const now = Date.now();
-    if (!(now < jvm._nextEventLoopYieldAt)) return false;
+    if (jvm.clock && jvm.clock.enabled && !jvm.clock.realtime) return false;
+    const wallNow = Date.now();
+    if (!(wallNow < jvm._nextEventLoopYieldAt)) return false;
+    const schedulerNow = jvm.clock ? jvm.clock.millis() : wallNow;
     const threads = jvm.threads || [];
     for (let index = 0; index < threads.length; index += 1) {
       const other = threads[index];
       if (other === thread) continue;
       if (other.status === "SLEEPING" && other.sleepUntil !== undefined &&
-          now >= Number(other.sleepUntil)) return false;
+          schedulerNow >= Number(other.sleepUntil)) return false;
       if (other.status === "WAITING" && other.waitDeadline !== undefined &&
-          now >= Number(other.waitDeadline)) return false;
+          schedulerNow >= Number(other.waitDeadline)) return false;
     }
     return true;
   }
@@ -1609,7 +2080,23 @@ class JitCompiler {
       ? `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
         "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`
       : "";
-    const inlineLoopRegions = this.compileInlinePrimitiveLoopRegions(method);
+    // A structured-only method was admitted specifically because only the
+    // complete CFG can preserve an allocation/call continuation. Extracting a
+    // smaller baseline loop first would discard that proof and then reject
+    // the required whole-method entry below.
+    // A method selected as a hot call-graph root must keep its complete CFG.
+    // Extracting a baseline loop first makes `inlineLoopRegions.length` block
+    // structured compilation below, so the graph tier is published only by a
+    // later retry after the long-running invocation is already mid-frame.
+    // Prefer the whole structured body at the initial entry; the selection is
+    // derived solely from bytecode size, array density, dynamic calls, and a
+    // backedge. Ordinary methods retain the smaller local-region policy.
+    const wholeGraphCandidate = this.hotCallGraphRegions.enabled &&
+      (this.isDynamicArrayStructuredFirstMethod(method) ||
+        this.isCallGraphStructuredFirstMethod(method));
+    const inlineLoopRegions = this.structuredOnlyCodegenMethods.has(method) ||
+      wholeGraphCandidate
+      ? [] : this.compileInlinePrimitiveLoopRegions(method);
     const structuredSsa = inlineLoopRegions.length
       ? null : this.structuredSsa.compile(method);
     if (structuredSsa) {
@@ -1625,16 +2112,22 @@ class JitCompiler {
         }));
         if (typeof process !== "undefined" && process.env &&
             process.env.JVM_TRACE_JIT_SOURCE === "1") {
+          const structuredSource =
+            structuredSsa.jvmStructuredSource || source;
+          const aroundLine = Number(
+            process.env.JVM_TRACE_JIT_SOURCE_AROUND_LINE || 0);
+          const tracedSource = aroundLine > 0
+            ? structuredSource.split("\n").slice(
+              Math.max(0, aroundLine - 16), aroundLine + 15,
+            ).map((line, offset) =>
+              `${Math.max(1, aroundLine - 15) + offset}: ${line}`).join("\n")
+            : structuredSource;
           console.error("[jit-generated-source] " + traceIdentity + "\n" +
-            (structuredSsa.jvmStructuredSource || source));
+            tracedSource);
         }
       }
       if (structuredSsa.jvmStructuredRequiresBaselineFramedEntry) {
-        // Keep the renderer's verified scalar ABI for nested synchronous
-        // calls, but do not use its ordinary Frame ABI. A protected non-void
-        // call can suspend after consuming operands, and only the baseline
-        // body currently implements that pending-return handoff at arbitrary
-        // frame PCs. This split is structural and independent of guest names.
+        if (this.structuredOnlyCodegenMethods.has(method)) return null;
         const baseline = this.compileBaselineMethod(method, inlineLoopRegions);
         if (baseline) {
           return this.attachStructuredPositionalEntry(
@@ -1653,6 +2146,12 @@ class JitCompiler {
               this.structuredSsa.lastCompileError),
         }));
       }
+    }
+    if (this.structuredOnlyCodegenMethods.has(method)) {
+      // Admission of this method relied on the structured renderer's exact
+      // allocation/call continuation semantics. Do not silently substitute a
+      // baseline body whose constructor replay rules are less capable.
+      return null;
     }
     const scalarLoop = this.compileScalarIntegerLoop(method);
     if (scalarLoop) return this.withResumeBody(scalarLoop, method);
@@ -1705,11 +2204,15 @@ class JitCompiler {
               this.structuredSsa.lastCompileError) : null,
         };
         const upgraded = structured?.jvmStructuredRequiresBaselineFramedEntry
-          ? this.attachStructuredPositionalEntry(cached, structured)
+          ? this.structuredOnlyCodegenMethods.has(method) ||
+              !structured.jvmStructuredContinuation
+            ? null
+            : this.attachStructuredPositionalEntry(cached, structured)
           : structured ? this.withResumeBody(structured, method) : null;
         if (upgraded?.jvmStructuredSsa ||
             upgraded?.jvmRestoringDirectPositionalBody) {
           this.codegenCache.set(method, upgraded);
+          this.publishGeneratedTargetUpgrade(method, upgraded);
           this.structuredConstructorRetryState.delete(method);
           this.structuredConstructorUpgradeCount += 1;
         }
@@ -1722,6 +2225,64 @@ class JitCompiler {
     if (typeof setTimeout === "function") setTimeout(upgrade, 0);
     else if (typeof queueMicrotask === "function") queueMicrotask(upgrade);
     else Promise.resolve().then(upgrade);
+  }
+
+  trackGeneratedTarget(method, target, site) {
+    if (!method || !target || !site) return;
+    let entries = this.generatedTargetsByMethod.get(method);
+    if (!entries) {
+      entries = new Set();
+      this.generatedTargetsByMethod.set(method, entries);
+    }
+    entries.add({ target, site });
+  }
+
+  publishGeneratedTargetUpgrade(method, generated, options = {}) {
+    const stableEntry = this.stableGeneratedEntries.get(method);
+    if (stableEntry && generated) stableEntry.generated = generated;
+    if (generated && !options.regionEntryOnly) {
+      this.hotCallGraphRegions?.markGeneratedTargetUpgrade(method);
+    }
+    const entries = this.generatedTargetsByMethod.get(method);
+    if (!entries || !generated) return;
+    for (const entry of entries) {
+      const { target, site } = entry;
+      target.generated = generated;
+      target.positionalInvoker = undefined;
+      target.preferFrameless = false;
+      target.framelessRejected = false;
+      target.framelessBudgetYields = 0;
+      target.framelessWarmCompletions = 0;
+      const positional = this.getPositionalGeneratedInvoker(site, target);
+      const ownsStatic = site.fastStaticTarget === target;
+      const ownsSpecial = site.fastSpecialTarget === target;
+      const ownsDynamic = site.fastDynamicTarget?.target === target;
+      if (ownsDynamic) site.fastDynamicTarget.positional = positional;
+      if (target.targetClassName && site.fastPositionalTargets) {
+        if (positional) {
+          site.fastPositionalTargets[target.targetClassName] = {
+            invoke: positional,
+            rawInvoke: positional.jvmRawInvoke || null,
+            lookupClass: target.lookupClass,
+            receiverType: target.targetClassName,
+            debugGuarded: positional.jvmDebugGuarded === true,
+          };
+        } else {
+          delete site.fastPositionalTargets[target.targetClassName];
+        }
+      }
+      if (ownsStatic || ownsSpecial || ownsDynamic) {
+        site.fastPositional = positional ? {
+          invoke: positional,
+          rawInvoke: positional.jvmRawInvoke || null,
+          lookupClass: target.lookupClass,
+          receiverType: ownsDynamic
+            ? site.fastDynamicTarget.targetClassName : null,
+          debugGuarded: positional.jvmDebugGuarded === true,
+        } : null;
+      }
+      this.generatedTargetUpgradePublicationCount += 1;
+    }
   }
 
   compileInlinePrimitiveLoopRegions(method) {
@@ -2261,7 +2822,7 @@ class JitCompiler {
         const plan = this.getCompileTimeIntegerLeaf(instruction);
         if (plan) inlinePlans.set(index, plan);
         else callSites.set(index, {
-          id: this.registerSyncCallSite(op, instruction),
+          id: this.registerSyncCallSite(op, instruction, method, index),
           op,
           ...parseDescriptor(instruction.arg[2][1]),
         });
@@ -2888,7 +3449,7 @@ class JitCompiler {
       "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
       "let osrCountdown = 10007;",
       `while (pc < ${codeItems.length}) {`,
-      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; pc = osr.resumePc; sp = stack.length; } }",
+      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; if (osr.deopted) return { deopt: true, transient: true, reason: 'wasm OSR left active child' }; pc = osr.resumePc; sp = stack.length; } }",
       synchronous
         // A synchronous baseline body also keeps its complete locals/operand
         // state in JavaScript between polls. As with structured SSA, another
@@ -2950,6 +3511,7 @@ class JitCompiler {
         }
         body.push(this.emitInstruction(
           instruction, index, stackWidthsBefore && stackWidthsBefore.get(index),
+          method,
         ));
       });
       directInlineCount = this.compileDirectInlineCount;
@@ -2975,8 +3537,16 @@ class JitCompiler {
         `${method?.className || this.jvm.findClassNameForMethod?.(method) ||
           "unknown"}.${method?.name || "unknown"}${method?.descriptor || ""}`;
       if (traceIdentity.includes(tracePattern)) {
+        const aroundLine = Number(
+          process.env.JVM_TRACE_JIT_SOURCE_AROUND_LINE || 0);
+        const tracedSource = aroundLine > 0
+          ? generatedSource.split("\n").slice(
+            Math.max(0, aroundLine - 16), aroundLine + 15,
+          ).map((line, offset) =>
+            `${Math.max(1, aroundLine - 15) + offset}: ${line}`).join("\n")
+          : generatedSource;
         console.error("[jit-generated-source] " + traceIdentity + "\n" +
-          generatedSource);
+          tracedSource);
       }
     }
 
@@ -3220,7 +3790,8 @@ class JitCompiler {
             body.push(`pc = ${index + 1}; continue;`);
             body.push("}");
           }
-          const callSiteId = this.registerSyncCallSite(op, instruction);
+          const callSiteId = this.registerSyncCallSite(
+            op, instruction, method, index);
           const parsed = parseDescriptor(instruction.arg[2][1]);
           body.push(...saveStack(expressions));
           body.push(`helpers.materialize(frame, locals, stack, ${index + 1});`);
@@ -3362,6 +3933,16 @@ class JitCompiler {
         successors.push(branchTargetIndex(instruction, labels));
       } else if (op && op.startsWith("if")) {
         successors.push(index + 1, branchTargetIndex(instruction, labels));
+      } else if (op === "tableswitch") {
+        for (const label of instruction.labels || []) {
+          successors.push(labels.get(label));
+        }
+        successors.push(labels.get(instruction.defaultLbl));
+      } else if (op === "lookupswitch") {
+        for (const pair of instruction.arg?.pairs || []) {
+          if (Array.isArray(pair)) successors.push(labels.get(pair[1]));
+        }
+        successors.push(labels.get(instruction.arg?.defaultLabel));
       } else if (!terminal.has(op) && index + 1 < codeItems.length) {
         successors.push(index + 1);
       }
@@ -3406,7 +3987,8 @@ class JitCompiler {
     return (op === "ldc" || op === "ldc_w") && isClassConstant(instruction.arg);
   }
 
-  emitInstruction(instruction, index, stackWidthsBefore = null) {
+  emitInstruction(instruction, index, stackWidthsBefore = null,
+    callerMethod = null) {
     const op = getOp(instruction);
     const next = index + 1;
     // In normal execution, straight-line cases fall through to the next case
@@ -3750,7 +4332,13 @@ class JitCompiler {
               : "stack[sp++] = directResult;";
             const args = Array.from({ length: directJre.argumentCount }, (_unused, offset) =>
               `stack[directBase + ${offset}]`).join(", ");
-            return `{ const directBase = sp - ${directJre.argumentCount}; const directResult = helpers.directJreIntrinsics[${directJre.id}](${args}); sp = directBase; ${result} } ${goNext}`;
+            const initializationGuard = directJre.isStatic
+              ? `if (!helpers.directJreInitializationTokens[${directJre.id}].initialized) { ` +
+                `helpers.materializeCached(frame, locals, stack, sp, ${index}); ` +
+                `helpers.skipJitOnce(frame); return { deopt: true, transient: true, ` +
+                `reason: "class initialization at direct synchronous JRE call" }; } `
+              : "";
+            return `{ ${initializationGuard}const directBase = sp - ${directJre.argumentCount}; const directResult = helpers.directJreIntrinsics[${directJre.id}](${args}); sp = directBase; ${result} } ${goNext}`;
           }
           const directInline = op === "invokestatic" && !this.profileMethods
             ? this.getCompileTimeIntegerLeaf(instruction)
@@ -3771,13 +4359,24 @@ class JitCompiler {
               : "";
             return `{ if (bytecodeChecks) { helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "debuggable direct integer inline" }; } const ${base} = sp - ${directInline.paramCount}; ${statements} ${guardFailure} stack[${base}] = ${result}; sp = ${base} + 1; } ${goNext}`;
           }
-          const callSiteId = this.registerSyncCallSite(op, instruction);
+          const callSiteId = this.registerSyncCallSite(
+            op, instruction, callerMethod, index);
           const traceCall = this.compileTraceSyncCalls
             ? `helpers.traceSyncCallAt(${callSiteId}, frame, thread, value, sp);`
             : "";
           return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); const value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); ${traceCall} if (value === helpers.asyncInvokeSentinel()) { const activeChild = thread.callStack.items[thread.callStack.items.length - 1]; if (activeChild !== frame && activeChild && activeChild.jitGeneratedReturnParent === frame) { return { deopt: true, transient: true, reason: "asynchronous ${op} left active child" }; } helpers.materializeCached(frame, locals, stack, sp, ${index}); helpers.skipJitOnce(frame); return { deopt: true, transient: true, reason: "asynchronous callee from synchronous ${op}" }; } if (value && value.deopt) return value; sp = stack.length; if (thread.callStack.items[thread.callStack.items.length - 1] !== frame) { return { deopt: true, transient: true, reason: "synchronous ${op} left active child" }; } if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") return { deopt: true, transient: true, reason: "thread yielded in synchronous ${op}" }; } ${goNext}`;
         }
-        return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSync(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
+        {
+          // Async-capable generated bodies still execute the overwhelming
+          // majority of their calls synchronously. Give them the same stable
+          // call-site record as synchronous bodies. The previous path created
+          // a fresh site and rebound an identical positional adapter on every
+          // invocation; only the genuine async fallback needs the serialized
+          // instruction below.
+          const callSiteId = this.registerSyncCallSite(
+            op, instruction, callerMethod, index);
+          return `{ helpers.materializeCached(frame, locals, stack, sp, ${next}); let value = helpers.tryInvokeSyncAt(${callSiteId}, frame, thread); if (value === helpers.asyncInvokeSentinel()) value = await helpers.invoke(${JSON.stringify(op)}, frame, ${JSON.stringify(instruction)}, thread, ${index}); if (value && value.deopt) return value; sp = stack.length; if (value !== helpers.returnVoid()) stack[sp++] = value; if (thread.status !== "runnable") { helpers.materializeCached(frame, locals, stack, sp, ${next}); return { deopt: true, reason: "thread yielded in generated ${op}" }; } } ${goNext}`;
+        }
       case "goto": return `pc = ${target(instruction.arg)}; break;`;
       case "ifeq": return `if (stack[--sp] === 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
       case "ifne": return `if (stack[--sp] !== 0) pc = ${target(instruction.arg)}; else pc = ${next}; break;`;
@@ -3829,12 +4428,43 @@ class JitCompiler {
     frame.pc = pc;
     const prep = this.wasmJit.prepare(frame);
     if (!prep || stackLength !== 0) return null;
+    const module = prep.osr === true && prep.st.osr
+      ? prep.st.osr : prep.st;
+    // An OSR caller is already live in generated JavaScript. A partial Wasm
+    // module may exit after a call at a continuation with carried operands;
+    // resuming the still-active JS body would then duplicate scheduler
+    // ownership or lose the callee's return value. Partial modules remain
+    // valid as ordinary Frame entries, where execute() returns directly to
+    // the scheduler. OSR is restricted to modules that cannot take such an
+    // exit, independent of any guest method identity.
+    if (!module.meta.fullyCompiled || module.meta.deoptableCalls > 0) {
+      return null;
+    }
     const result = this.wasmJit.execute(frame, thread, prep.st, prep.blk, true);
+    const tracePattern = this.wasmJit.traceMethodPattern || "";
+    const identity = tracePattern
+      ? `${frame.className || "?"}.${frame.method?.name || "?"}${
+        frame.method?.descriptor || ""}` : "";
+    if (tracePattern && identity.includes(tracePattern)) {
+      const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
+      console.error("[wasmjit-osr-probe] " + JSON.stringify({
+        method: identity, entryPc: pc, resumePc: frame.pc,
+        entryStackDepth: stackLength, exitStackDepth: frame.stack.items.length,
+        returned: result.returned === true, deopted: result.deopted === true,
+        top: top ? `${top.className || "?"}.${top.method?.name || "?"}${
+          top.method?.descriptor || ""}` : null,
+        callerOwnsStack: top === frame,
+      }));
+    }
     if (result.returned) {
       return {
         returned: true,
         value: prep.st.meta.retChar === "V" ? RETURN_VOID : prep.st.meta.box.ret,
       };
+    }
+    if (result.deopted || !thread.callStack.isEmpty() &&
+        thread.callStack.peek() !== frame) {
+      return { deopted: true, resumePc: frame.pc };
     }
     return { resumePc: frame.pc };
   }
@@ -3863,6 +4493,12 @@ class JitCompiler {
         const osr = this.wasmOsrProbe(frame, thread, pc, stack.length);
         if (osr) {
           if (osr.returned) return { returned: true, value: osr.value };
+          if (osr.deopted) {
+            return {
+              deopt: true, transient: true,
+              reason: 'wasm OSR left active child',
+            };
+          }
           pc = osr.resumePc; // transient exit: resume interpreting there
         }
       }
@@ -4316,6 +4952,39 @@ class JitCompiler {
     }
     const value = monoArray.load(arrayRef, index);
     if (value === monoArray.OOB) {
+      if (typeof process !== "undefined" && process.env &&
+          process.env.JVM_DEBUG_ARRAY_OOB === "1") {
+        const scalar = (item) => {
+          if (item === null || item === undefined) return item;
+          if (typeof item === "bigint") return `${item}n`;
+          if (typeof item !== "object") return item;
+          if (Array.isArray(item) || ArrayBuffer.isView(item)) {
+            return `[${item.length}]`;
+          }
+          return typeof item.type === "string" ? `<${item.type}>` : "<object>";
+        };
+        const activeThread = this.jvm.threads[this.jvm.currentThreadIndex];
+        const callStack = activeThread?.callStack?.items || [];
+        const callers = callStack.slice(Math.max(0, callStack.length - 8))
+          .map((activeFrame) => ({
+            owner: scalar(activeFrame.className),
+            method: `${activeFrame.method?.name || "<unknown>"}` +
+              `${activeFrame.method?.descriptor || ""}`,
+            pc: activeFrame.pc,
+            locals: (activeFrame.locals || []).map(scalar),
+          }));
+        console.error("[array-load-oob:jitted]", JSON.stringify({
+          owner: scalar(frame.className),
+          method: `${frame.method?.name || "<unknown>"}` +
+            `${frame.method?.descriptor || ""}`,
+          pc: frame.pc - 1,
+          kind,
+          index: scalar(index),
+          length: monoArray.len(arrayRef),
+          locals: (frame.locals || []).map(scalar),
+          callers,
+        }));
+      }
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
     }
     return normalizeArrayLoad(value, kind, arrayRef);
@@ -4920,7 +5589,8 @@ class JitCompiler {
     return ASYNC_INVOKE;
   }
 
-  registerSyncCallSite(op, instruction) {
+  registerSyncCallSite(op, instruction, callerMethod = null,
+    callerPc = null) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
     const id = this.nextSyncCallSiteId++;
     this.syncCallSites[id] = {
@@ -4928,12 +5598,64 @@ class JitCompiler {
       declaredClassName,
       methodName,
       descriptor,
+      callerMethod,
+      callerPc: Number.isInteger(callerPc) ? callerPc : null,
       initializationToken:
         this.jvm.getClassInitializationToken(declaredClassName),
       ...parseDescriptor(descriptor),
       targets: new Map(),
+      jreTargets: new Map(),
     };
     return id;
+  }
+
+  // A loaded static or special target is monomorphic by bytecode semantics.
+  // Compile only bounded synchronous helpers while the caller is being built,
+  // so its generated prologue can capture one immutable positional function.
+  // This is deliberately descriptor/CFG driven: no owner or member identity
+  // participates, and every ordinary class/debug/exception guard remains in
+  // the positional entry selected by getPositionalGeneratedInvoker.
+  primeMonomorphicSyncCallSite(id, method, lookupClass) {
+    const site = this.syncCallSites[id];
+    if (!this.eagerMonomorphicCallsEnabled || this.profileMethods || !site ||
+        !method || method.name === "<init>" || method.name === "<clinit>" ||
+        (site.op !== "invokestatic" && site.op !== "invokespecial") ||
+        site.fastPositional ||
+        site.op === "invokestatic" && !site.initializationToken.initialized) {
+      return false;
+    }
+    const items = this.getCodeItems(method);
+    if (!items.length ||
+        items.length > this.eagerMonomorphicCallMaxCodeItems ||
+        !this.canCompileSynchronously(method) ||
+        this.fusedRegions.enabled && this.fusedRegions.mayFuse(method)) {
+      return false;
+    }
+    const targetClassName = lookupClass || site.declaredClassName;
+    let target = site.targets.get(targetClassName);
+    if (!target) {
+      target = {
+        method,
+        lookupClass: targetClassName,
+        generated: this.getGeneratedFunction(method),
+      };
+      if (!target.generated?.jvmSynchronous) return false;
+      site.targets.set(targetClassName, target);
+      this.trackGeneratedTarget(method, target, site);
+    }
+    const positional = this.getPositionalGeneratedInvoker(site, target);
+    if (!positional) return false;
+    if (site.op === "invokestatic") site.fastStaticTarget = target;
+    else site.fastSpecialTarget = target;
+    site.fastPositional = {
+      invoke: positional,
+      rawInvoke: positional.jvmRawInvoke || null,
+      lookupClass: targetClassName,
+      receiverType: null,
+      debugGuarded: positional.jvmDebugGuarded === true,
+    };
+    this.eagerMonomorphicCallLinkCount += 1;
+    return true;
   }
 
   traceSyncCallAt(id, frame, thread, value, scalarDepth) {
@@ -4960,11 +5682,31 @@ class JitCompiler {
     }));
   }
 
+  linkStructuredCallChild(frame, thread, entryDepth, returnType) {
+    const frames = thread?.callStack?.items;
+    if (!frame || !Array.isArray(frames) ||
+        !Number.isInteger(entryDepth) || frames.length <= entryDepth) {
+      return false;
+    }
+    const child = frames[entryDepth];
+    if (!child || child === frame) return false;
+    if (!child.jitGeneratedReturnParent) {
+      child.jitGeneratedReturnParent = frame;
+    }
+    if (child.jitGeneratedReturnParent === frame) {
+      child.jitGeneratedReturnType = returnType;
+    }
+    return child.jitGeneratedReturnParent === frame;
+  }
+
   getCompileTimeDirectJre(op, instruction) {
-    if (this.profileMethods || op === "invokestatic" ||
+    if (this.profileMethods ||
         !instruction || !Array.isArray(instruction.arg) ||
         !Array.isArray(instruction.arg[2])) return null;
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
+    if (op === "invokestatic" && !this.directStaticJreIntrinsicsEnabled) {
+      return null;
+    }
     const method = this.resolveSynchronousJreMethod(
       declaredClassName, declaredClassName, methodName, descriptor);
     if (typeof method?.jvmDirectIntrinsic !== "function" ||
@@ -4973,16 +5715,48 @@ class JitCompiler {
     try { parsed = parseDescriptor(descriptor); } catch (_) { return null; }
     const id = this.directJreIntrinsics.length;
     this.directJreIntrinsics.push(method.jvmDirectIntrinsic);
+    const isStatic = op === "invokestatic";
+    this.directJreInitializationTokens.push(isStatic
+      ? this.jvm.getClassInitializationToken(declaredClassName) : null);
     return {
       id,
-      argumentCount: parsed.params.length + 1,
+      argumentCount: parsed.params.length + (isStatic ? 0 : 1),
       returnsVoid: parsed.returnType === "void",
+      isStatic,
+      fieldWriteKeys: Array.isArray(method.jvmDirectFieldWriteKeys)
+        ? [...method.jvmDirectFieldWriteKeys] : null,
     };
   }
 
   tryInvokeSyncAt(id, frame, thread) {
+    this.hotCallGraphRegions.recordGenericCallSite(id, frame);
     const site = this.syncCallSites[id];
     if (!site) return ASYNC_INVOKE;
+    const stack = frame.stack.items;
+    const receiverIndex = stack.length - site.params.length - 1;
+    const receiver = site.op === "invokestatic"
+      ? null : stack[receiverIndex];
+    if (site.op !== "invokestatic" &&
+        (receiver === null || receiver === undefined)) {
+      throw { type: "java/lang/NullPointerException", message: null };
+    }
+    let framePositional = null;
+    if (site.op === "invokestatic" || site.op === "invokespecial") {
+      framePositional = site.fastPositional;
+    } else {
+      const receiverType = receiver.type || site.declaredClassName;
+      framePositional = site.fastPositionalTargets?.[receiverType] || null;
+    }
+    if (this.framePositionalCallsEnabled &&
+        framePositional?.invoke?.jvmCanonicalFrameAdapter === true) {
+      const positionalResult = this.tryInvokeFramePositional(
+        site, framePositional.invoke, frame, thread);
+      if (positionalResult !== ASYNC_INVOKE) {
+        this.framePositionalCallCount += 1;
+        return positionalResult;
+      }
+      this.framePositionalFallbackCount += 1;
+    }
     const jre = site.fastJreTarget;
     if (jre) {
       const receiver = site.op === "invokestatic" ? null
@@ -5060,26 +5834,70 @@ class JitCompiler {
         throw { type: "java/lang/NullPointerException", message: null };
       }
       if ((receiver.type || site.declaredClassName) === dynamic.targetClassName) {
+        this.maybeExpandHotCallGraphRegion(site);
         return this.tryInvokeResolvedTarget(site, dynamic.target, frame, thread);
       }
     }
     return this.tryInvokeSyncSite(site, frame, thread);
   }
 
+  tryInvokeFramePositional(site, invoke, frame, thread) {
+    const receiverSlots = site.op === "invokestatic" ? 0 : 1;
+    const argumentCount = site.params.length + receiverSlots;
+    const stack = frame.stack.items;
+    const base = stack.length - argumentCount;
+    if (base < 0) return ASYNC_INVOKE;
+    let result;
+    switch (argumentCount) {
+      case 0: result = invoke(thread); break;
+      case 1: result = invoke(stack[base], thread); break;
+      case 2: result = invoke(stack[base], stack[base + 1], thread); break;
+      case 3: result = invoke(
+        stack[base], stack[base + 1], stack[base + 2], thread); break;
+      case 4: result = invoke(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        thread); break;
+      case 5: result = invoke(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], thread); break;
+      case 6: result = invoke(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], thread); break;
+      case 7: result = invoke(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], stack[base + 6], thread); break;
+      case 8: result = invoke(
+        stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
+        stack[base + 4], stack[base + 5], stack[base + 6], stack[base + 7],
+        thread); break;
+      default: return ASYNC_INVOKE;
+    }
+    if (result === ASYNC_INVOKE) return ASYNC_INVOKE;
+    if (result && result.deopt) {
+      const child = result.jvmPositionalChild || null;
+      delete result.jvmPositionalChild;
+      if (!child || child === frame ||
+          !thread.callStack.items.includes(child)) return ASYNC_INVOKE;
+      child.jitGeneratedReturnParent = frame;
+      child.jitGeneratedReturnType = site.returnType;
+    }
+    stack.length = base;
+    return result;
+  }
+
   tryInvokeSync(op, frame, instruction, thread) {
     const [, declaredClassName, [methodName, descriptor]] = instruction.arg;
-    const initializationToken = op === "invokestatic"
-      ? this.jvm.getClassInitializationToken(declaredClassName)
-      : null;
-    return this.tryInvokeSyncSite({
-      op,
-      declaredClassName,
-      methodName,
-      descriptor,
-      ...parseDescriptor(descriptor),
-      targets: new Map(),
-      initializationToken,
-    }, frame, thread);
+    const key = `${op}\0${declaredClassName}\0${methodName}\0${descriptor}`;
+    let site = this.legacySyncCallSites.get(key);
+    if (!site) {
+      const id = this.registerSyncCallSite(
+        op, instruction, frame?.method || null,
+        Number.isInteger(frame?.pc) ? frame.pc : null);
+      site = this.syncCallSites[id];
+      site.id = id;
+      this.legacySyncCallSites.set(key, site);
+    }
+    return this.tryInvokeSyncAt(site.id, frame, thread);
   }
 
   getPositionalGeneratedInvoker(site, target) {
@@ -5109,8 +5927,13 @@ class JitCompiler {
           this.fusedRegions.mayFuse(method)),
       }));
     }
+    if (target.inlineIntegerRegion) {
+      target.positionalInvoker = this.getDirectInlineIntegerRegion(
+        method, site.params, site.returnType);
+      return target.positionalInvoker;
+    }
     if (!method || !generated || generated.jvmSynchronous !== true ||
-        target.intrinsic || target.inlineIntegerRegion || target.memoizedIntegralLeaf ||
+        target.intrinsic || target.memoizedIntegralLeaf ||
         this.fusedRegions.enabled && this.fusedRegions.mayFuse(method)) {
       target.positionalInvoker = null;
       return null;
@@ -5124,7 +5947,26 @@ class JitCompiler {
       target.positionalInvoker = null;
       return null;
     }
-    if (typeof generated.jvmDirectPositionalBody === "function") {
+    if (this.shouldCompileHotCallGraphRegion(method) &&
+        !generated.jvmHotCallGraphRegionPlan) {
+      this.compileHotCallGraphRegion(method);
+    }
+    const resumableHotGraphPositional =
+      this.hotCallGraphRegions.enabled &&
+      generated.jvmStructuredContinuation === true &&
+      typeof generated.jvmAdaptivePositionalBody === "function";
+    if (!resumableHotGraphPositional &&
+        typeof generated.jvmHotCallGraphDirectPositionalBody === "function") {
+      target.positionalInvoker =
+        generated.jvmHotCallGraphDirectPositionalBody.bind(null, this);
+      target.positionalInvoker.jvmDebugGuarded = true;
+      target.positionalInvoker.jvmRestoresExceptionFrames = true;
+      target.positionalInvoker.jvmRawInvoke =
+        generated.jvmHotCallGraphDirectPositionalBody;
+      return target.positionalInvoker;
+    }
+    if (!resumableHotGraphPositional &&
+        typeof generated.jvmDirectPositionalBody === "function") {
       // This structurally proven acyclic integral leaf has its own scalar ABI:
       // bind the JIT helpers once and let the SSA caller feed operands straight
       // into the generated body. The caller's trailing thread argument is an
@@ -5135,7 +5977,8 @@ class JitCompiler {
       target.positionalInvoker.jvmDebugGuarded = true;
       return target.positionalInvoker;
     }
-    if (this.checkedLeafDirectPositionalEnabled &&
+    if (!resumableHotGraphPositional &&
+        this.checkedLeafDirectPositionalEnabled &&
         typeof generated.jvmCheckedLeafDirectPositionalBody === "function") {
       // A single bounded call-free loop can publish a compact checked leaf:
       // all class/debug/array predicates execute before its first guest
@@ -5159,7 +6002,8 @@ class JitCompiler {
         nestedBody;
       return target.positionalInvoker;
     }
-    if (typeof generated.jvmRestoringDirectPositionalBody === "function") {
+    if (!resumableHotGraphPositional &&
+        typeof generated.jvmRestoringDirectPositionalBody === "function") {
       // A verified acyclic field/primitive-array leaf can use the same scalar
       // call ABI without eagerly constructing its child Frame.  Its generated
       // body materializes a cached Frame only at a throwing bytecode, then this
@@ -5220,7 +6064,18 @@ class JitCompiler {
       : "";
     const immediateFramelessBody = generated.jvmFramelessPositional === true
       ? generated : null;
-    const adaptiveFramelessBody = generated.jvmAdaptivePositionalBody || null;
+    // A continuation-capable region must own the iterator from its first
+    // positional invocation. Running its finite ordinary module first can
+    // exhaust the scalar budget, reconstruct the root at a mid-method PC, and
+    // permanently resume method-at-a-time. The framed regional body keeps one
+    // canonical root Frame across scheduler yields while every internal node
+    // remains scalar/local to the module.
+    const hotGraphFramedBody = resumableHotGraphPositional &&
+      typeof generated.jvmHotCallGraphFramedBody === "function"
+      ? generated.jvmHotCallGraphFramedBody : null;
+    const adaptiveFramelessBody = hotGraphFramedBody ||
+      generated.jvmAdaptivePositionalBody || null;
+    const canonicalGeneratedBody = hotGraphFramedBody || generated;
     // Reference-returning adaptive entries can hand an object back while a
     // nested scheduler-visible continuation still owns it. Keep those calls on
     // the canonical child-Frame path. Acyclic entries explicitly marked
@@ -5242,6 +6097,7 @@ class JitCompiler {
       staticGuard,
       traceEntry,
       "const target = plan.target;",
+      "if (target.freeFrame && jit.profileMethods) jit.syncReusedFrameCount += 1;",
       "const child = target.freeFrame || new plan.Frame(plan.method);",
       "target.freeFrame = null;",
       "child.pc = 0;",
@@ -5249,6 +6105,8 @@ class JitCompiler {
       "delete child.jitSkipOnce;",
       "delete child.jitJsDisabled;",
       "delete child.jitAdaptiveEntryCounted;",
+      "delete child.jitGeneratedReturnParent;",
+      "delete child.jitGeneratedReturnType;",
       "child.className = plan.lookupClass;",
       ...localAssignments,
       "const adaptiveFrameless = plan.framelessMode === 2;",
@@ -5276,6 +6134,7 @@ class JitCompiler {
       "    result = { deopt: true, reason: 'synchronized monitor contended' };",
       "  } else {",
       "  if (plan.referenceFrameless) jit.referenceFramelessPositionalRunCount += 1;",
+      "  if (plan.compiledCallChain) jit.compiledCallChainRunCount += 1;",
       "  if (jit.shouldBeginExclusiveTimingKey(plan.methodKey)) {",
       "    positionalExclusiveTiming = jit.beginExclusiveTiming(plan.methodKey, plan.exclusiveTier);",
       "  }",
@@ -5314,7 +6173,7 @@ class JitCompiler {
       "      !jit.jvm.enterFrameMonitorIfNeeded(child, thread)) {",
       "    result = { deopt: true, reason: 'synchronized monitor contended' };",
       "  } else {",
-      "  result = jit.runGeneratedFrame(plan.generated, child, thread, false);",
+      "  result = jit.runGeneratedFrame(plan.canonicalGeneratedBody, child, thread, false);",
       "  if (result && typeof result.then === 'function') {",
       "    throw new Error('Synchronous positional method returned a Promise');",
       "  }",
@@ -5335,6 +6194,7 @@ class JitCompiler {
       "      target.preferFrameless = true;",
       "    }",
       "  }",
+      "  result.jvmPositionalChild = child;",
       "  return result;",
       "}",
       "if (useFrameless && child.monitorEntered === true) {",
@@ -5352,8 +6212,22 @@ class JitCompiler {
         : "return useFrameless ? result : result.value;",
     ].filter(Boolean).join("\n");
     try {
-      const entry = this.createGeneratedFunction(method, "positional-entry",
-        ["plan", ...argumentsList, "thread"], source, lookupClass);
+      let templates = this.positionalGeneratedEntryTemplates.get(method);
+      if (!templates) {
+        templates = new Map();
+        this.positionalGeneratedEntryTemplates.set(method, templates);
+      }
+      const templateKey = `${lookupClass}\0${site.op}\0${site.descriptor}\0${
+        trace ? 1 : 0}`;
+      let entry = templates.get(templateKey);
+      if (entry) {
+        this.positionalGeneratedTemplateReuseCount += 1;
+      } else {
+        entry = this.createGeneratedFunction(method, "positional-entry",
+          ["plan", ...argumentsList, "thread"], source, lookupClass);
+        templates.set(templateKey, entry);
+        this.positionalGeneratedTemplateCompileCount += 1;
+      }
       const plan = {
         jit: this,
         target,
@@ -5362,10 +6236,12 @@ class JitCompiler {
         method,
         methodKey,
         generated,
+        canonicalGeneratedBody,
         exclusiveTier: generated.jvmStructuredSsa ? "structured"
           : generated.jvmScalarLoop ? "scalar" : "generated-sync",
         framelessMode,
         framelessBody,
+        compiledCallChain: generated.jvmCompiledCallChain === true,
         referenceFrameless,
         adaptiveThreshold: 4,
         adaptiveYieldThreshold: 4,
@@ -5384,6 +6260,7 @@ class JitCompiler {
             : value && (value._className || value.type) || typeof value,
       };
       target.positionalInvoker = entry.bind(null, plan);
+      target.positionalInvoker.jvmCanonicalFrameAdapter = true;
       return target.positionalInvoker;
     } catch (_) {
       target.positionalInvoker = null;
@@ -5404,8 +6281,9 @@ class JitCompiler {
       { length: argumentCount }, (_unused, index) => `argument${index}`);
     const receiver = receiverSlots ? "argument0" : "null";
     const callArguments = argumentsList.slice(receiverSlots);
-    const direct = receiverSlots === 1 &&
-      typeof target.method.jvmDirectIntrinsic === "function"
+    const direct = typeof target.method.jvmDirectIntrinsic === "function" &&
+      (receiverSlots === 1 || this.directStaticJreIntrinsicsEnabled) &&
+      target.method.jvmDirectFinal === true
       ? target.method.jvmDirectIntrinsic : null;
     const invocation = direct
       ? `plan.direct(${argumentsList.join(", ")})`
@@ -5430,8 +6308,22 @@ class JitCompiler {
         name: site.methodName,
         descriptor: site.descriptor,
       };
-      const entry = this.createGeneratedFunction(identity, "positional-jre",
-        ["plan", ...argumentsList, "thread"], source, target.targetClassName);
+      let templates = this.positionalJreEntryTemplates.get(target.method);
+      if (!templates) {
+        templates = new Map();
+        this.positionalJreEntryTemplates.set(target.method, templates);
+      }
+      const templateKey = `${target.targetClassName}\0${site.op}\0${
+        site.methodName}\0${site.descriptor}\0${direct ? 1 : 0}`;
+      let entry = templates.get(templateKey);
+      if (entry) {
+        this.positionalJreTemplateReuseCount += 1;
+      } else {
+        entry = this.createGeneratedFunction(identity, "positional-jre",
+          ["plan", ...argumentsList, "thread"], source, target.targetClassName);
+        templates.set(templateKey, entry);
+        this.positionalJreTemplateCompileCount += 1;
+      }
       const plan = {
         jvm: this.jvm,
         method: target.method,
@@ -5476,11 +6368,20 @@ class JitCompiler {
     const wholeMethodCaller = this.prefersWholeMethodJs(frame.method);
     const keepStaticForWasm = op === "invokestatic" &&
       this.wasmJit.enabled && !wholeMethodCaller;
+    const cachedJreTarget = !keepStaticForWasm &&
+      site.jreTargets?.get(targetClassName);
+    if (cachedJreTarget) {
+      site.fastJreTarget = cachedJreTarget;
+      return this.tryInvokeSynchronousJre(
+        site, cachedJreTarget, frame, thread);
+    }
     const synchronousJre = keepStaticForWasm ? null
       : this.resolveSynchronousJreMethod(
         targetClassName, declaredClassName, methodName, descriptor);
     if (synchronousJre) {
       const target = { targetClassName, method: synchronousJre };
+      if (!site.jreTargets) site.jreTargets = new Map();
+      site.jreTargets.set(targetClassName, target);
       site.fastJreTarget = target;
       const positional = this.getPositionalJreInvoker(site, target);
       if (positional && !site.fastPositional) {
@@ -5533,6 +6434,7 @@ class JitCompiler {
       target = {
         method,
         lookupClass,
+        targetClassName,
         intrinsic: structuralIntrinsic,
         inlineIntegerRegion: normallySupported &&
           (op === "invokestatic" || op === "invokevirtual" || op === "invokeinterface")
@@ -5552,6 +6454,7 @@ class JitCompiler {
       }
       if (normallySupported && !target.intrinsic && !target.inlineIntegerRegion) {
         target.generated = this.getGeneratedFunction(method);
+        this.trackGeneratedTarget(method, target, site);
       }
       site.targets.set(targetClassName, target);
       if (op === "invokestatic" && target.intrinsic) {
@@ -5598,29 +6501,64 @@ class JitCompiler {
             debugGuarded: positional.jvmDebugGuarded === true,
           };
         }
-      } else if ((op === "invokevirtual" || op === "invokeinterface") &&
-          !site.fastDynamicTarget) {
+      } else if (op === "invokevirtual" || op === "invokeinterface") {
+        // A virtual bytecode site may be polymorphic. Each resolved receiver
+        // target still deserves its own positional adapter; limiting adapter
+        // creation to the first monomorphic fast slot forced every secondary
+        // receiver through a child Frame on every invocation.
         const positional = this.getPositionalGeneratedInvoker(site, target);
-        site.fastDynamicTarget = { targetClassName, target, positional };
-        if (target.intrinsic) {
-          site.fastDynamicIntrinsic = {
-            targetClassName,
-            intrinsic: target.intrinsic,
-            positional: typeof target.intrinsic.jvmPositional === "function"
-              ? target.intrinsic.jvmPositional : null,
-            lookupClass,
-            methodKey: `${lookupClass}.${method.name}${descriptor}`,
-          };
-        }
-        const direct = site.fastDynamicIntrinsic?.positional || positional;
-        if (direct && !site.fastPositional) {
-          site.fastPositional = {
+        const intrinsicPositional = typeof target.intrinsic?.jvmPositional ===
+          "function" ? target.intrinsic.jvmPositional : null;
+        const direct = intrinsicPositional || positional;
+        if (direct) {
+          if (!site.fastPositionalTargets) {
+            site.fastPositionalTargets = Object.create(null);
+          }
+          site.fastPositionalTargets[targetClassName] = {
             invoke: direct,
             rawInvoke: direct.jvmRawInvoke || null,
             lookupClass,
             receiverType: targetClassName,
             debugGuarded: direct.jvmDebugGuarded === true,
           };
+        }
+        if (!site.fastDynamicTarget) {
+          site.fastDynamicTarget = { targetClassName, target, positional };
+          if (target.intrinsic) {
+            site.fastDynamicIntrinsic = {
+              targetClassName,
+              intrinsic: target.intrinsic,
+              positional: typeof target.intrinsic.jvmPositional === "function"
+                ? target.intrinsic.jvmPositional : null,
+              lookupClass,
+              methodKey: `${lookupClass}.${method.name}${descriptor}`,
+            };
+          }
+          const monomorphicDirect =
+            site.fastDynamicIntrinsic?.positional || positional;
+          if (monomorphicDirect && !site.fastPositional) {
+            site.fastPositional = {
+              invoke: monomorphicDirect,
+              rawInvoke: monomorphicDirect.jvmRawInvoke || null,
+              lookupClass,
+              receiverType: targetClassName,
+              debugGuarded: monomorphicDirect.jvmDebugGuarded === true,
+            };
+          }
+          // Runtime receiver feedback closes this exact caller/bytecode edge.
+          if (site.callerMethod &&
+              this.shouldCompileHotCallGraphRegion(site.callerMethod)) {
+            const callerGenerated = this.codegenCache.get(site.callerMethod);
+            const callerPlan = callerGenerated?.jvmHotCallGraphRegionPlan;
+            this.hotCallGraphRegions.markCallSiteFeedback(site);
+            // Establish the first usable plan immediately. Later target/type
+            // discoveries are batched by the region entry, but without an
+            // initial plan a positional root has no shared entry at which it
+            // could consume pending feedback.
+            if (!callerPlan || !callerPlan.backendEligible) {
+              this.compileHotCallGraphRegion(site.callerMethod);
+            }
+          }
         }
       }
     }
@@ -5793,6 +6731,23 @@ class JitCompiler {
     delete child.jitGeneratedReturnParent;
     delete child.jitGeneratedReturnType;
     child.className = lookupClass;
+    if (this.frameHandoffTracePattern) {
+      const parentIdentity = `${frame.className || "?"}.${frame.method?.name || "?"}${
+        frame.method?.descriptor || ""}`;
+      if (parentIdentity.includes(this.frameHandoffTracePattern) &&
+          (!Number.isInteger(this.frameHandoffTracePc) ||
+           frame.pc === this.frameHandoffTracePc)) {
+        child.jitFrameHandoffTrace = {
+          parent: parentIdentity,
+          parentPc: frame.pc,
+          child: `${child.className || "?"}.${child.method?.name || "?"}${
+            child.method?.descriptor || ""}`,
+          dispatchedBy: "generated",
+        };
+        console.error("[jvm-frame-handoff-push] " + JSON.stringify(
+          child.jitFrameHandoffTrace));
+      }
+    }
     let localIndex = 0;
     if (op !== "invokestatic") {
       child.locals[0] = receiver;
@@ -7235,6 +8190,42 @@ class JitCompiler {
     return inline;
   }
 
+  getDirectInlineIntegerRegion(method, params, returnType) {
+    if (this.directInlineIntegerRegionCache.has(method)) {
+      return this.directInlineIntegerRegionCache.get(method);
+    }
+    if (returnType !== "int" || !params.every((type) => type === "int")) {
+      this.directInlineIntegerRegionCache.set(method, null);
+      return null;
+    }
+    const receiverSlots = (method.flags || []).includes("static") ? 0 : 1;
+    const argumentNames = Array.from(
+      { length: params.length + receiverSlots },
+      (_unused, index) => `argument${index}`,
+    );
+    const plan = this.buildInlineIntegerPlan(
+      method, params, returnType, argumentNames);
+    if (!plan || plan.guards.length > 0) {
+      this.directInlineIntegerRegionCache.set(method, null);
+      return null;
+    }
+    const raw = this.createGeneratedFunction(
+      method,
+      "inline-integer-positional",
+      ["helpers", ...argumentNames],
+      `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`,
+    );
+    raw.jvmInlineInteger = true;
+    const direct = raw.bind(null, this);
+    direct.jvmRawInvoke = raw;
+    // The structured caller owns the debugger/class guard and its loop safe
+    // points. A receiver-type mismatch never enters this body.
+    direct.jvmDebugGuarded = false;
+    direct.jvmInlineInteger = true;
+    this.directInlineIntegerRegionCache.set(method, direct);
+    return direct;
+  }
+
   getInlineIntegerPlan(method, params, returnType) {
     if (this.inlineIntegerPlanCache.has(method)) {
       return this.inlineIntegerPlanCache.get(method);
@@ -7246,6 +8237,13 @@ class JitCompiler {
     for (let index = 0; index < args.length; index += 1) {
       args[index] = `stack[base + ${index}]`;
     }
+    const plan = this.buildInlineIntegerPlan(method, params, returnType, args);
+    this.inlineIntegerPlanCache.set(method, plan);
+    return plan;
+  }
+
+  buildInlineIntegerPlan(method, params, returnType, args) {
+    const receiverSlots = (method.flags || []).includes("static") ? 0 : 1;
     const state = {
       active: new Set(), declarations: [], statements: [], nextTemp: 0,
       instructionCount: 0, methodCount: 0, guards: [],
@@ -7260,7 +8258,6 @@ class JitCompiler {
       methodCount: state.methodCount,
       guards: state.guards,
     };
-    this.inlineIntegerPlanCache.set(method, plan);
     return plan;
   }
 
@@ -8040,6 +9037,8 @@ function stackEffect(instruction, stackWidthsBefore = null) {
     "lcmp", "dcmpg", "dcmpl", "fcmpg", "fcmpl",
   ].includes(op)) return -1;
   if (op.endsWith("astore")) return -3;
+  if (op === "monitorenter" || op === "monitorexit") return -1;
+  if (op === "tableswitch" || op === "lookupswitch") return -1;
   if (op.startsWith("if_icmp") || op.startsWith("if_acmp")) return -2;
   if (["ifeq", "ifne", "iflt", "ifge", "ifgt", "ifle", "ifnull", "ifnonnull"].includes(op)) {
     return -1;
@@ -8068,9 +9067,19 @@ function hasExperimentalControlFlow(codeItems) {
   });
 }
 
+const normalFlowInvokeCache = new WeakMap();
+
 function normalFlowContainsInvoke(codeItems) {
-  return normalFlowContains(codeItems, (_instruction, op) =>
+  if (codeItems && typeof codeItems === "object" &&
+      normalFlowInvokeCache.has(codeItems)) {
+    return normalFlowInvokeCache.get(codeItems);
+  }
+  const result = normalFlowContains(codeItems, (_instruction, op) =>
     Boolean(op && op.startsWith("invoke")));
+  if (codeItems && typeof codeItems === "object") {
+    normalFlowInvokeCache.set(codeItems, result);
+  }
+  return result;
 }
 
 function normalFlowContains(codeItems, predicate) {
@@ -8263,7 +9272,13 @@ function jsLiteral(value) {
   return JSON.stringify(value);
 }
 
+const labelMapCache = new WeakMap();
+
 function buildLabelMap(codeItems) {
+  if (codeItems && typeof codeItems === "object") {
+    const cached = labelMapCache.get(codeItems);
+    if (cached) return cached;
+  }
   const labels = new Map();
   codeItems.forEach((item, index) => {
     if (item && item.labelDef) {
@@ -8271,6 +9286,9 @@ function buildLabelMap(codeItems) {
       labels.set(label, index);
     }
   });
+  if (codeItems && typeof codeItems === "object") {
+    labelMapCache.set(codeItems, labels);
+  }
   return labels;
 }
 
@@ -8288,4 +9306,5 @@ module.exports._test = {
   localReadBeforeWrite,
   normalizeIntrinsicCompilerIdioms,
   stripProvenDeadEntryInitializers,
+  buildLabelMap,
 };

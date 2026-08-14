@@ -290,7 +290,10 @@ module.exports = {
     },
     'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': withThrows(async (jvm, classObj, args) => {
       const methodName = String(args[0]);
-      const paramTypes = args[1];
+      // OpenJDK treats a null varargs array as an empty parameter list for
+      // Class.getMethod/getDeclaredMethod. Individual null elements remain
+      // invalid and are rejected by descriptorForClassObject below.
+      const paramTypes = args[1] || [];
 
       const targetDescriptor =
         `(${paramTypes.map(descriptorForClassObject).join('')})`;
@@ -328,7 +331,7 @@ module.exports = {
     }, ['java/lang/NoSuchMethodException', 'java/lang/IllegalArgumentException']),
     'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;': withThrows((jvm, classObj, args) => {
       const methodNameObj = args[0];
-      const paramTypes = args[1];
+      const paramTypes = args[1] || [];
 
       let methodName;
       if (typeof methodNameObj === 'string') {

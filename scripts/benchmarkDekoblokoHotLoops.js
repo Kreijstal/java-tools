@@ -17,10 +17,12 @@ const invocations = positiveInteger('DEKOBLOKO_TOY_INVOCATIONS', 100);
 const passes = positiveInteger('DEKOBLOKO_TOY_PASSES', 40);
 const rounds = positiveInteger('DEKOBLOKO_TOY_ROUNDS', 5);
 const warmups = positiveInteger('DEKOBLOKO_TOY_WARMUPS', 3);
+const dumpDirectory = process.env.DEKOBLOKO_TOY_DUMP_DIR
+  ? path.resolve(process.env.DEKOBLOKO_TOY_DUMP_DIR) : null;
 const vertices = 128;
 const faces = 192;
 const descriptor = `(L${modelClass};II)I`;
-const shapes = [
+const allShapes = [
   { name: 'vertices', method: 'benchmarkVertices',
     work: invocations * passes * vertices },
   { name: 'faces', method: 'benchmarkFaces',
@@ -28,14 +30,32 @@ const shapes = [
   { name: 'combined', method: 'renderModel',
     work: invocations * passes * (vertices + faces) },
 ];
-const tiers = [
+const allTiers = [
   { name: 'generated', jit: { scalarLoops: false, scalarGuestBodies: false,
     structuredSsa: false, fusedRegions: false } },
   { name: 'scalar', jit: { scalarLoops: true, scalarGuestBodies: true,
     scalarSsaOptimizations: false, structuredSsa: false, fusedRegions: false } },
   { name: 'structured', jit: { scalarLoops: true, scalarGuestBodies: true,
     scalarSsaOptimizations: false, structuredSsa: true, fusedRegions: false } },
+  { name: 'wasm', wasm: true, jit: { enabled: false,
+    scalarLoops: false, scalarGuestBodies: false, structuredSsa: false,
+    fusedRegions: false } },
 ];
+const selectedNames = (environmentName, available) => {
+  const requested = (process.env[environmentName] || '').split(',')
+    .map((value) => value.trim()).filter(Boolean);
+  if (!requested.length) return available;
+  const known = new Map(available.map((entry) => [entry.name, entry]));
+  const unknown = requested.filter((name) => !known.has(name));
+  if (unknown.length) {
+    throw new Error(`${environmentName} contains unknown values: ${unknown.join(', ')}`);
+  }
+  return requested.map((name) => known.get(name));
+};
+const shapes = selectedNames('DEKOBLOKO_TOY_SHAPES', allShapes);
+const tiers = process.env.DEKOBLOKO_TOY_TIERS
+  ? selectedNames('DEKOBLOKO_TOY_TIERS', allTiers)
+  : allTiers.filter((tier) => !tier.wasm);
 
 function positiveInteger(name, fallback) {
   const value = Number(process.env[name] || fallback);
@@ -84,39 +104,52 @@ function nativeResults(directory) {
     elapsed.get(shape.name), checksums.get(shape.name)));
 }
 
-function intArray(length, initialize) {
-  const result = Array.from({ length }, (_unused, index) => initialize(index) | 0);
-  result.type = '[I';
+function primitiveArray(runtime, descriptor, length, initialize) {
+  const primitiveName = {
+    '[Z': 'boolean', '[B': 'byte', '[C': 'char', '[S': 'short',
+    '[I': 'int', '[J': 'long', '[F': 'float', '[D': 'double',
+  }[descriptor];
+  const result = runtime.jvm.jit.newPrimitiveArray(length, primitiveName);
+  for (let index = 0; index < length; index += 1) {
+    result[index] = initialize(index);
+  }
   return result;
 }
 
-function shortArray(length, initialize) {
-  const result = Array.from({ length }, (_unused, index) => (initialize(index) << 16) >> 16);
-  result.type = '[S';
-  return result;
-}
-
-function createModel() {
+function createModel(runtime) {
   return { type: modelClass, fields: {
-    [`${modelClass}.x`]: intArray(vertices, (index) => ((index * 37) & 1023) - 512),
-    [`${modelClass}.y`]: intArray(vertices, (index) => ((index * 53) & 511) - 256),
-    [`${modelClass}.z`]: intArray(vertices, (index) => ((index * 97) & 1023) + 256),
-    [`${modelClass}.faceA`]: shortArray(faces, (index) => index % vertices),
-    [`${modelClass}.faceB`]: shortArray(faces, (index) => (index * 7 + 3) % vertices),
-    [`${modelClass}.faceC`]: shortArray(faces, (index) => (index * 13 + 11) % vertices),
-    [`${modelClass}.projectedX`]: intArray(vertices, () => 0),
-    [`${modelClass}.projectedY`]: intArray(vertices, () => 0),
-    [`${modelClass}.colors`]: intArray(faces, () => 0),
+    [`${modelClass}.x`]: primitiveArray(runtime, '[I', vertices,
+      (index) => ((index * 37) & 1023) - 512),
+    [`${modelClass}.y`]: primitiveArray(runtime, '[I', vertices,
+      (index) => ((index * 53) & 511) - 256),
+    [`${modelClass}.z`]: primitiveArray(runtime, '[I', vertices,
+      (index) => ((index * 97) & 1023) + 256),
+    [`${modelClass}.faceA`]: primitiveArray(runtime, '[S', faces,
+      (index) => index % vertices),
+    [`${modelClass}.faceB`]: primitiveArray(runtime, '[S', faces,
+      (index) => (index * 7 + 3) % vertices),
+    [`${modelClass}.faceC`]: primitiveArray(runtime, '[S', faces,
+      (index) => (index * 13 + 11) % vertices),
+    [`${modelClass}.projectedX`]: primitiveArray(runtime, '[I', vertices,
+      () => 0),
+    [`${modelClass}.projectedY`]: primitiveArray(runtime, '[I', vertices,
+      () => 0),
+    [`${modelClass}.colors`]: primitiveArray(runtime, '[I', faces, () => 0),
   } };
 }
 
 async function createRuntime(directory, tier) {
+  const previousWasm = process.env.JVM_WASM_JIT;
+  if (tier.wasm) process.env.JVM_WASM_JIT = '1';
+  else delete process.env.JVM_WASM_JIT;
   const jvm = new JVM({ classpath: [directory], jit: {
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     profileMethods: false,
     ...tier.jit,
-  } });
+  }, wasmHeap: Boolean(tier.wasm) });
+  if (previousWasm === undefined) delete process.env.JVM_WASM_JIT;
+  else process.env.JVM_WASM_JIT = previousWasm;
   for (const name of [className, modelClass]) {
     const classData = await jvm.loadClassByName(name);
     if (!classData.staticFields) classData.staticFields = new Map();
@@ -133,7 +166,9 @@ async function createRuntime(directory, tier) {
   for (const shape of shapes) {
     methods.set(shape.name, await jvm.findMethodInHierarchy(className, shape.method, descriptor));
   }
-  return { jvm, thread, model: createModel(), methods };
+  const runtime = { jvm, thread, methods };
+  runtime.model = createModel(runtime);
+  return runtime;
 }
 
 function sentinelFrame() {
@@ -175,17 +210,32 @@ function compiledKinds(runtime) {
   return result;
 }
 
-function compiledCode(runtime) {
+function compiledCode(runtime, tierName) {
   const result = {};
+  if (dumpDirectory) fs.mkdirSync(dumpDirectory, { recursive: true });
   for (const item of runtime.jvm.classes[className].ast.classes[0].items) {
     if (item.type !== 'method') continue;
     const generated = runtime.jvm.jit.codegenCache.get(item.method);
     const source = generated?.jvmStructuredSource;
     if (!source) continue;
+    if (dumpDirectory) {
+      fs.writeFileSync(path.join(
+        dumpDirectory, `${tierName}-${item.method.name}.js`), source);
+    }
     result[item.method.name] = {
       bytes: Buffer.byteLength(source),
       arraySlowPaths: (source.match(/helpers\.arrayLoad|helpers\.arrayStore/g) || []).length,
       materializations: (source.match(/helpers\.materialize/g) || []).length,
+      arrayRangeCandidates:
+        generated.jvmStructuredArrayRangeGuardCount || 0,
+      emittedArrayRangeGuards:
+        (source.match(/const ssaArrayRangeGuard\d+ =/g) || []).length,
+      hoistedArrayRangeGuards:
+        generated.jvmStructuredHoistedArrayRangeGuardCount || 0,
+      fieldArrayLocalViews:
+        generated.jvmStructuredEntryFieldArrayLocalViewCount || 0,
+      indirectArrayRangeGuards:
+        generated.jvmStructuredIndirectArrayRangeCount || 0,
     };
   }
   return result;
@@ -217,7 +267,11 @@ async function tierResults(directory, tier) {
     summary.structuredEntries = runtime.jvm.jit.structuredSsa.runCount - structuredBefore;
     summary.scalarEntries = runtime.jvm.jit.scalarLoopRunCount - scalarBefore;
     summary.compiledMethods = compiledKinds(runtime);
-    summary.structuredCode = compiledCode(runtime);
+    summary.structuredCode = compiledCode(runtime, tier.name);
+    if (tier.wasm) {
+      summary.wasmRuns = runtime.jvm.jit.wasmJit.runCount;
+      summary.wasmCompiles = runtime.jvm.jit.wasmJit.compiled.length;
+    }
     results.push(summary);
   }
   return results;

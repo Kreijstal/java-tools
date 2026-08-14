@@ -127,6 +127,7 @@ const stringCharAtMethod = withThrows((jvm, obj, args) => {
 }, ['java/lang/StringIndexOutOfBoundsException']);
 
 stringLengthMethod.jvmDirectFinal = true;
+stringLengthMethod.jvmDirectFieldWriteKeys = Object.freeze([]);
 stringLengthMethod.jvmDirectIntrinsic = (receiver) => {
   if (receiver === null || receiver === undefined) {
     throw { type: 'java/lang/NullPointerException', message: null };
@@ -134,6 +135,7 @@ stringLengthMethod.jvmDirectIntrinsic = (receiver) => {
   return (typeof receiver === 'string' ? receiver : stringValue(receiver)).length;
 };
 stringCharAtMethod.jvmDirectFinal = true;
+stringCharAtMethod.jvmDirectFieldWriteKeys = Object.freeze([]);
 stringCharAtMethod.jvmDirectIntrinsic = (receiver, rawIndex) => {
   if (receiver === null || receiver === undefined) {
     throw { type: 'java/lang/NullPointerException', message: null };

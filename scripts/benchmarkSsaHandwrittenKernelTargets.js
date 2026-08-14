@@ -711,6 +711,12 @@ function runPolygonOracle(destination, vertices, color) {
       'polygonDestination:[I', polygonEdgeGenericDestination);
     runtime.classData.staticFields.set(
       'polygonEdgeScratch:[I', polygonEdgeGenericScratch);
+    // This harness replaces statics out of band rather than executing the
+    // guest putstatic bytecode. Publish the same version invalidation that the
+    // JVM performs for a real static write so compiled capture guards cannot
+    // retain the preceding polygon benchmark's destination.
+    runtime.jvm.jit.markStaticContainerChanged(
+      runtime.classData.staticFields);
     for (const key of [
       'polygonEdgeCount:I', 'polygonEdgeLeft:I', 'polygonEdgeRight:I',
       'polygonEdgeY:I', 'polygonEdgeActiveEnd:I',

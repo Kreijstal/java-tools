@@ -16,6 +16,7 @@ const OP = {
   br: 0x0c, br_if: 0x0d, br_table: 0x0e, return: 0x0f, call: 0x10,
   drop: 0x1a, select: 0x1b,
   local_get: 0x20, local_set: 0x21, local_tee: 0x22,
+  global_get: 0x23, global_set: 0x24,
   ref_null: 0xd0, ref_is_null: 0xd1,
   i32_const: 0x41, i64_const: 0x42, f32_const: 0x43, f64_const: 0x44,
   i32_eqz: 0x45, i32_eq: 0x46, i32_ne: 0x47, i32_lt_s: 0x48, i32_gt_s: 0x4a,
@@ -317,8 +318,45 @@ class NestedDeopt extends Error {
 // Assemble a single-function module exporting `run`. Caller provides the
 // import declarations ({name, params, results}), the main signature, local
 // declarations (wasm types in index order after params) and the body bytes.
+// One mutable zero-initialized global of type t, exported as "retv". Return
+// values travel through it instead of a wasm->js ret_* import call: the
+// standalone entry and every nested-call bridge read exports.retv.value once
+// after run() reports -1, saving a JS boundary crossing per non-void return.
+function retvGlobalEntry(t) {
+  const zero = t === T.i64 ? [0x42, 0x00]
+    : t === T.f32 ? [0x43, 0x00, 0x00, 0x00, 0x00]
+      : t === T.f64 ? [0x44, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        : t === T.ref ? [0xd0, 0x6f]
+          : [0x41, 0x00];
+  return [t, 0x01, ...zero, 0x0b];
+}
+
+// Body of the direct-link wrapper: forward the java params, supply entry
+// block 0 and the nested-call fuel budget, run the main function, then push
+// the retv global so a wasm->wasm caller receives [status, value] without
+// any JS boundary. Mirrors the JS bridges' full[] tail exactly.
+function runvWrapperBody(paramCount, mainIdx, retvType) {
+  const out = [0]; // no locals
+  for (let i = 0; i < paramCount; i++) out.push(OP.local_get, ...uleb(i));
+  out.push(OP.i32_const, ...sleb(0));
+  out.push(OP.i32_const, ...sleb(100_000_000));
+  out.push(OP.call, ...uleb(mainIdx));
+  if (retvType) out.push(OP.global_get, ...uleb(0));
+  out.push(OP.end);
+  return out;
+}
+
+// Mutable i32 global (init 1) exported as "specok": the world-validity flag
+// for speculative monomorphic direct links. The jit zeroes every registered
+// instance's flag on each class load; entry/nested revalidation sets it back
+// once the module's baked speculations are re-verified. Defined AFTER retv so
+// no existing global index shifts.
+function specokGlobalEntry() {
+  return [T.i32, 0x01, 0x41, 0x01, 0x0b];
+}
+
 function assembleModule({ importDecls, mainParams, mainResults, declared, body, profilerName,
-  importMemory }) {
+  importMemory, retvType, runvWrapper, specokGlobal }) {
   const typeKey = (p, r) => `${p.join(',')}|${r.join(',')}`;
   const types = [];
   const typeIndex = new Map();
@@ -352,14 +390,49 @@ function assembleModule({ importDecls, mainParams, mainResults, declared, body, 
   const exportName = [...'run'].map((c) => c.charCodeAt(0));
   const profilerNameSection = profilerName
     ? wasmFunctionNameSection(mainIdx, profilerName) : [];
+  const globalEntries = [
+    ...(retvType ? [retvGlobalEntry(retvType)] : []),
+    ...(specokGlobal ? [specokGlobalEntry()] : []),
+  ];
+  const globalSection = globalEntries.length
+    ? section(6, [globalEntries.length, ...globalEntries.flat()]) : [];
+  const retvName = [...'retv'].map((c) => c.charCodeAt(0));
+  const specokName = [...'specok'].map((c) => c.charCodeAt(0));
+  const specokIdx = retvType ? 1 : 0;
+  // The runv wrapper takes the java params only (block 0 / fuel are
+  // supplied inside) and returns [status, value] for direct wasm->wasm
+  // callers. Only real method modules ask for it: their main signature is
+  // (params..., blk, fuel) -> [status].
+  const paramOnly = runvWrapper ? mainParams.slice(0, mainParams.length - 2) : [];
+  const runvType = runvWrapper
+    ? internType(paramOnly, retvType ? [T.i32, retvType] : [T.i32]) : 0;
+  const runvBody = runvWrapper
+    ? runvWrapperBody(paramOnly.length, mainIdx, retvType) : [];
+  const runvName = [...'runv'].map((c) => c.charCodeAt(0));
+  const exportEntries = [
+    [exportName.length, ...exportName, 0x00, ...uleb(mainIdx)],
+    ...(runvWrapper
+      ? [[runvName.length, ...runvName, 0x00, ...uleb(mainIdx + 1)]] : []),
+    ...(retvType ? [[retvName.length, ...retvName, 0x03, 0]] : []),
+    ...(specokGlobal
+      ? [[specokName.length, ...specokName, 0x03, ...uleb(specokIdx)]] : []),
+  ];
+  const functionSection = runvWrapper
+    ? [2, ...uleb(mainType), ...uleb(runvType)]
+    : [1, ...uleb(mainType)];
+  const codeSection = runvWrapper
+    ? [2, ...uleb(funcBody.length), ...funcBody,
+      ...uleb(runvBody.length), ...runvBody]
+    : [1, ...uleb(funcBody.length), ...funcBody];
 
   return Uint8Array.from([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
     ...section(1, vec(types)),
     ...section(2, vec(importEntries)),
-    ...section(3, [1, ...uleb(mainType)]),
-    ...section(7, [1, exportName.length, ...exportName, 0x00, ...uleb(mainIdx)]),
-    ...section(10, [1, ...uleb(funcBody.length), ...funcBody]),
+    ...section(3, functionSection),
+    ...globalSection,
+    ...section(7, vec(exportEntries)),
+    ...section(10, codeSection),
     ...profilerNameSection,
   ]);
 }
@@ -451,7 +524,8 @@ module.exports = {
   Unsupported,
   NestedDeopt,
   isGuestThrow,
+  specokGlobalEntry,
   FUEL,
-  assembleModule,
+  assembleModule, retvGlobalEntry, runvWrapperBody,
   isNoOpExceptionHandler, catchesOnlyCheckedExceptions, liveExceptionRanges,
 };

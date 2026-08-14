@@ -38,6 +38,21 @@ const Random = require('../src/jre/java/util/Random');
 const Collectors = require('../src/jre/java/util/stream/Collectors');
 const Stream = require('../src/jre/java/util/stream/Stream');
 const ActionEvent = require('../src/jre/java/awt/event/ActionEvent');
+const SoftReference = require('../src/jre/java/lang/ref/SoftReference');
+
+test('SoftReference retains, returns, and clears its referent', (t) => {
+  const reference = {};
+  const referent = { value: 7 };
+  SoftReference.methods['<init>(Ljava/lang/Object;)V'](
+    null, reference, [referent]);
+  const Reference = require('../src/jre/java/lang/ref/Reference');
+  t.equal(Reference.methods['get()Ljava/lang/Object;'](
+    null, reference), referent, 'get inherits Reference semantics');
+  Reference.methods['clear()V'](null, reference);
+  t.equal(Reference.methods['get()Ljava/lang/Object;'](
+    null, reference), null, 'clear releases the referent');
+  t.end();
+});
 
 test('Math.round(double) returns a JVM long with Java edge semantics', (t) => {
   const jvm = new JVM({verbose: false});
@@ -244,6 +259,20 @@ test('Class reflective method lookup preserves array parameter descriptors', asy
     'declared lookup encodes int[] as [I rather than L[I;');
   t.equal(inherited._methodData, method,
     'public lookup uses the same array descriptor encoding');
+  const noArgs = {
+    name: 'ready', descriptor: '()V', flags: ['public'],
+  };
+  owner._classData.ast.classes[0].items.push({type: 'method', method: noArgs});
+  const nullDeclared = Class.methods[
+    'getDeclaredMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+  ]({}, owner, ['ready', null]);
+  const nullInherited = await Class.methods[
+    'getMethod(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;'
+  ]({}, owner, ['ready', null]);
+  t.equal(nullDeclared._methodData, noArgs,
+    'declared lookup treats a null varargs array as no parameters');
+  t.equal(nullInherited._methodData, noArgs,
+    'public lookup treats a null varargs array as no parameters');
   let nullParameterError = null;
   try {
     Class.methods[
@@ -781,6 +810,25 @@ test('SourceDataLine audio priority uses the scheduler clock', (t) => {
     'the priority deadline is derived from the scheduler clock');
   t.equal(jvm._audioPriority.thread, thread,
     'the producing guest thread receives temporary priority');
+  t.end();
+});
+
+test('SourceDataLine avoids copying for outputs that accept guest slices', (t) => {
+  const writes = [];
+  const output = {
+    acceptsGuestByteArraySlices: true,
+    write(...args) { writes.push(args); },
+  };
+  const line = { audioOutput: output, isOpen: true };
+  const samples = [-128, -1, 0, 127];
+
+  const written = SourceDataLine.methods['write([BII)I'](
+    { clock: { millis: () => 0 } }, line, [samples, 1, 2], null,
+  );
+  t.equal(written, 2, 'the Java Sound write count is unchanged');
+  t.equal(writes[0][0], samples, 'the output receives the original guest array');
+  t.deepEqual(writes[0].slice(1), [1, 2],
+    'the exact offset and length accompany the unallocated slice');
   t.end();
 });
 

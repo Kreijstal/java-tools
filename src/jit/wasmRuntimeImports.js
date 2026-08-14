@@ -174,15 +174,30 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
       throw { type: 'java/lang/NullPointerException', message: null };
     }
   };
+  const readInstance = (obj) => {
+    const key = resolveKey(obj);
+    if (obj.fields) return obj.fields[key];
+    return obj[key] ?? obj[fieldName];
+  };
+  const writeInstance = (obj, value) => {
+    const key = resolveKey(obj);
+    if (obj.fields) {
+      obj.fields[key] = value;
+    } else if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      obj[key] = value;
+    } else {
+      obj[fieldName] = value;
+    }
+  };
   const getInstance = t === T.i32
     ? (obj) => {
       requireObj(obj);
-      const value = obj.fields[resolveKey(obj)];
+      const value = readInstance(obj);
       return typeof value === 'boolean' ? (value ? 1 : 0) : value;
     }
     : t === T.ref
-      ? (obj) => { requireObj(obj); return obj.fields[resolveKey(obj)]; }
-      : (obj) => { requireObj(obj); return toWasmValue(t, obj.fields[resolveKey(obj)]); };
+      ? (obj) => { requireObj(obj); return readInstance(obj); }
+      : (obj) => { requireObj(obj); return toWasmValue(t, readInstance(obj)); };
   return {
     t,
     name,
@@ -190,7 +205,7 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
       ? reg.addImport(name, [T.ref], [t], getInstance)
       : reg.addImport(name, [T.ref, t], [], (obj, v) => {
         requireObj(obj);
-        obj.fields[resolveKey(obj)] = v;
+        writeInstance(obj, v);
       }),
   };
 }

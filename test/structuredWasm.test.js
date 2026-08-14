@@ -1,6 +1,7 @@
 'use strict';
 
 const test = require('tape');
+const { addFieldImport } = require('../src/jit/wasmRuntimeImports');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -11,6 +12,34 @@ const Stack = require('../src/core/stack');
 const { supportsWasmTryTable } = require('../src/jit/wasmShared');
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
+
+test('Wasm field imports support direct-property JRE objects', (t) => {
+  const imports = [];
+  const registry = {
+    importIndexByName: new Map(),
+    addImport(name, params, results, fn) {
+      const index = imports.length;
+      imports.push({ name, params, results, fn });
+      this.importIndexByName.set(name, index);
+      return index;
+    },
+  };
+  const jvm = { classes: {} };
+  const instruction = {
+    arg: ['Field', 'SyntheticJreObject', ['value', 'I']],
+  };
+  const getter = addFieldImport(registry, jvm, instruction, false, true);
+  const setter = addFieldImport(registry, jvm, instruction, false, false);
+  const object = { type: 'SyntheticJreObject', value: 41 };
+
+  t.equal(imports[getter.idx].fn(object), 41,
+    'getfield reads the same direct representation as the JS tiers');
+  imports[setter.idx].fn(object, 73);
+  t.equal(object.value, 73,
+    'putfield updates a direct property without manufacturing a field map');
+  t.notOk(object.fields, 'the object representation remains unchanged');
+  t.end();
+});
 
 function assertEhTierOrFallback(t, state) {
   if (WASM_TRY_TABLE_SUPPORTED) return true;

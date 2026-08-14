@@ -14,6 +14,8 @@
     "benchmark:canvas:firefox": "node scripts/benchmarkFirefoxCanvas.js",
     "benchmark:jit:fields": "node scripts/benchmarkJitFieldSites.js",
     "benchmark:jvm:intermethod": "node scripts/benchmarkIntermethodCalls.js",
+    "benchmark:jvm:hot-call-graph": "node scripts/benchmarkHotCallGraphRegion.js",
+    "benchmark:jvm:ssa-fixed-point": "node scripts/benchmarkSsaFixedPoint.js",
     "benchmark:jvm:dekobloko-hot-loops": "node scripts/benchmarkDekoblokoHotLoops.js",
     "benchmark:jvm:dekobloko-audio": "node scripts/benchmarkDekoblokoAudioSynthesis.js",
     "benchmark:pcm-push:firefox": "node scripts/benchmarkJavaPcmPushFirefox.js",

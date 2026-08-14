@@ -35,8 +35,17 @@ function returnParentFor(frame, thread) {
   const explicit = frame.jitGeneratedReturnParent;
   delete frame.jitGeneratedReturnParent;
   delete frame.jitGeneratedReturnType;
-  if (explicit && thread.callStack.items.includes(explicit)) return explicit;
-  return thread.callStack.isEmpty() ? null : thread.callStack.peek();
+  const parent = explicit && thread.callStack.items.includes(explicit)
+    ? explicit : thread.callStack.isEmpty() ? null : thread.callStack.peek();
+  if (frame.jitFrameHandoffTrace) {
+    console.error('[jvm-frame-handoff-return] ' + JSON.stringify({
+      ...frame.jitFrameHandoffTrace, tier: 'interpreted',
+      childDepth: frame.stack.items.length,
+      parentDepth: parent ? parent.stack.items.length : null,
+    }));
+    delete frame.jitFrameHandoffTrace;
+  }
+  return parent;
 }
 
 module.exports = {
@@ -389,8 +398,9 @@ module.exports = {
     thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
-      } else if (!thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(returnValue);
+      } else {
+        const parent = returnParentFor(frame, thread);
+        if (parent) parent.stack.push(returnValue);
       }
     },
     freturn: (frame, instruction, jvm, thread) => {
@@ -401,8 +411,9 @@ module.exports = {
     thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
-      } else if (!thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(returnValue);
+      } else {
+        const parent = returnParentFor(frame, thread);
+        if (parent) parent.stack.push(returnValue);
       }
     },
     lreturn: (frame, instruction, jvm, thread) => {
@@ -413,8 +424,9 @@ module.exports = {
     thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
-      } else if (!thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(returnValue);
+      } else {
+        const parent = returnParentFor(frame, thread);
+        if (parent) parent.stack.push(returnValue);
       }
     },
     goto_w: (frame, instruction) => {
