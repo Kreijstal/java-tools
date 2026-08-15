@@ -2245,6 +2245,10 @@ class WasmJit {
     this.directInstanceLinkEnabled = env.JVM_WASM_DIRECT_INSTANCE_LINK === '1';
     this.lateInstanceTargetsEnabled = env.JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS !== '1';
     this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
+    // Reference-return completeness test; see compile(). Opt-in: the
+    // relaxation is reasoned-out but UNMEASURED, so it does not run by
+    // default.
+    this.relaxedRefReturn = env.JVM_WASM_RELAXED_REF_RETURN === '1';
     this.hierarchy = new ClassHierarchy(jvm);
     this.structuredCompiles = 0;
     this.runCount = 0;
@@ -2570,7 +2574,32 @@ class WasmJit {
       // completion to an already-resumed caller. Primitive and void kernels
       // retain partial Wasm, as do reference-returning methods whose complete
       // normal flow stays inside one module.
-      if (!primary.fullyCompiled &&
+      //
+      // That last clause is what normalFlowFullyCompiled means, and it is the
+      // condition the hazard actually needs: a mid-method stop can only occur
+      // at a demoted block or a deopt site, and there are none. fullyCompiled
+      // is strictly stronger — the structured tier also clears it for any
+      // non-empty EXCEPTION TABLE, and the dispatcher tier for any demoted
+      // block whether or not normal flow can reach it. Neither adds a way for
+      // this module to publish a return value after a partial exit: an
+      // exception leaves through the EH protocol with the interpreter, not
+      // the ret box. Testing fullyCompiled here rejected reference-returning
+      // methods that merely contain a try/catch, and those rejects cascade —
+      // an unlinkable callee makes its caller partial, and a caller that also
+      // returns a reference is then rejected by this same rule. On Tomb
+      // Racer that chain accounted for 21% of guest-compiled loading time,
+      // rooted in leaves whose only disqualification was an exception table.
+      //
+      // OFF BY DEFAULT (JVM_WASM_RELAXED_REF_RETURN=1 enables it). The
+      // argument above is a reading of the code, not a measurement: the one
+      // A/B run so far landed on a machine whose baseline had drifted 2x, so
+      // it showed nothing either way. Admitting more partial modules can also
+      // backfire on its own terms — kta.a([II)V already runs at
+      // runs==exits, and partial wasm that exits on every entry is exactly
+      // what the whole-method-JS preference exists to avoid.
+      const refReturnComplete = this.relaxedRefReturn
+        ? primary.normalFlowFullyCompiled : primary.fullyCompiled;
+      if (!refReturnComplete &&
           (primary.retChar === 'L' || primary.retChar === '[')) {
         throw new Unsupported('partial module has a reference return');
       }
