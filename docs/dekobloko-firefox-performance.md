@@ -6583,3 +6583,107 @@ What the buckets are, since the names mislead:
 Two throwaway scripts generate these views from any `.cpuprofile`: self time per
 `src/jit`+`src/core` function, and self time per `node_modules` library. Both are
 a dozen lines and worth rewriting rather than hunting for.
+
+## 2026-08-16: phase-aligning the two profiles, and a reduced loop for the gap
+
+The previous section profiled jvm.js alone. Profiling HotSpot the same way
+changes the size of the problem, because the two profiles were not covering the
+same phase.
+
+**Bucket the JFR samples by time before reading them.** `jfr print --json
+--events jdk.ExecutionSample` over a `--jfr-profile` run of
+`scripts/run-jre-reflection-main-menu.js` gives 757 samples across 38 s. Read
+whole, that profile says the boot is dominated by one method,
+`iua.a([I[IIIIFFFFFFFFFFFFFFFF)V`, at 30.8% self. That is wrong for our purposes:
+bucketing by 2 s shows ~10 samples per window until t=18 s and ~95 per window
+after it. `iua.a` is the *menu render loop*, which starts once loading finishes.
+
+Restricted to the loading window (0..19 s) the JRE profile is
+**115 samples, i.e. about 2.30 s of CPU across all threads** — and the largest
+single entry in it is `BufferedImage.getRGB`, which is the probe harness, not
+the game. HotSpot does not have a loading hot loop. It is I/O- and
+sleep-bound at roughly 10% of one core, which is also why `/usr/bin/time`
+reported 65% CPU for the whole JRE run: nearly all of that CPU was the render
+loop after the menu appeared.
+
+So the loading-phase comparison is **2.30 s of HotSpot CPU against roughly 132 s
+of ours** (152.3 s wall less 19.8 s idle). The 7.5x whole-process CPU ratio in
+the previous section understates the loading gap badly, because it divides by a
+JRE number that is mostly post-menu rendering. Both figures are real; they
+answer different questions, and the loading one is the one the 5x goal is about.
+
+### The two profiles do not share a hot method
+
+Attributing every jvm.js sample to its nearest enclosing guest frame:
+
+| guest method | our time | share | of which |
+|---|---|---|---|
+| `npa/b(Lffa;I)V` | 8.28 s | 5.4% | guest 22%, jit 71% |
+| `vma/b()[B` | 6.49 s | 4.3% | guest 78% |
+| `kta/a([II)V` | 4.26 s | 2.8% | guest 50%, jit 41% |
+| `fg/b(I)[F` | 4.18 s | 2.7% | guest 90% |
+
+None of these is hot on HotSpot; in the loading window all four together account
+for under 0.1 s there. More importantly **57.4% of our boot is not under any
+guest method at all**, and the flattest possible statement of the gap is that
+the top guest method is 5.4% of the profile. There is no single hot loop to fix.
+
+By tier, guest-attributed time is 32.2% `generated-sync`, 23.8%
+`hot-call-graph-framed-region`, 23.1% `structured-ssa`, 11.5% `positional-entry`.
+`generated-sync` is the weakest tier and the largest one.
+
+### `npa.b` is the representative shape
+
+`npa.b(ffa, int)` is a nested tile-grid walk. Per cell its body issues a 9-arg
+`invokeinterface`, two narrow interface getters, an `invokestatic` factory, a
+`checkcast`, and three `invokevirtual` calls around a small object cache, with
+almost no arithmetic between them. It spends 8.23 s of its 8.28 s on
+`generated-sync` — it never leaves the weakest tier — and its internal split is
+**35.2% `tryInvokeResolvedTarget`, 20.7% `tryInvokeSyncAt`, 22.3% guest code**.
+It is a call-boundary loop, not a compute loop.
+
+### The reduced loop
+
+`benchmarks/TileDispatchHotLoop.java` plus
+`scripts/benchmarkTileDispatchHotLoop.js` reproduce that shape in about six
+seconds instead of a three-minute boot, with a HotSpot checksum as the oracle.
+Four shapes, all `(int, int) -> int`: `arith` (control, no calls), `iface` (one
+monomorphic interface call), `poly` (the same site with three implementations),
+and `tile` (the profiled per-cell mix).
+
+The existing `CallBoundaryHotLoop` could not stand in for this. It covers
+*static* calls only, and its harness forces `JVM_WASM_JIT=1`; the boot profile
+contains **no wasm tier at all**, so that harness measures a tier the boot never
+reaches. The new runner leaves the JIT enabled and inherits `JVM_*` from the
+environment, matching how the launcher constructs the JVM.
+
+Run under the launcher's flags at 200k iterations, medians of 3 after 3 warmups:
+
+| shape | HotSpot | jvm.js | slowdown |
+|---|---|---|---|
+| arith | 4.09 ns/iter | 49.40 ns/iter | 12.1x |
+| iface | 0.92 ns/iter | 593.35 ns/iter | 642x |
+| poly | 6.79 ns/iter | 772.05 ns/iter | 114x |
+| tile | 18.17 ns/iter | 4931.99 ns/iter | 272x |
+
+The `iface` denominator is small because HotSpot inlines a monomorphic interface
+call to nothing. That is not a defect in the fixture — it is the finding. We
+charge roughly 590 ns for a call site HotSpot makes free. (Both call loops carry
+a loop-carried dependency through the call argument; without it HotSpot folds the
+loop to a closed form and the ratio divides by a denominator containing no call.
+The `arith` control moved 7.5x -> 12.1x across two runs purely on native-side
+variance, so treat one run of these as an order of magnitude, not a measurement.)
+
+It reproduces the boot pathology rather than merely being slow. Profiling the
+`tile` shape alone and applying the same bucketing as the boot profile:
+
+| | boot `npa.b` | reduced `tile` |
+|---|---|---|
+| `tryInvokeResolvedTarget` | 35.2% | 28.0% |
+| `tryInvokeSyncAt` | 20.7% | 8.8% |
+| dispatch total | ~56% | 59.4% |
+| guest code | 22.3% | 19.4% |
+| tier | `generated-sync` 99% | `generated-sync` 100% |
+
+Same helpers, same rank order, same split, same tier. Iterate on the call
+boundary here, not on a three-minute boot.
