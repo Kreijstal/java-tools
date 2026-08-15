@@ -1339,11 +1339,17 @@ class MethodTranslator {
     // totals are incomparable, but "how much normal flow falls back to the
     // interpreter" is — and a gap-free structured module must always win.
     this.uncoveredItems = 0;
+    // Which opcodes the gap is made of. "partial" is not actionable on its
+    // own; "partial because of these three opcodes" is.
+    this.uncoveredOpcodes = new Map();
     for (const b of normalReachable) {
       if (this.supportedBlocks.has(b)) continue;
       const end = b + 1 < N ? this.blockStarts[b + 1] : this.items.length;
       for (let i = this.blockStarts[b]; i < end; i++) {
-        if (this.items[i] && this.items[i].instruction) this.uncoveredItems += 1;
+        if (!(this.items[i] && this.items[i].instruction)) continue;
+        this.uncoveredItems += 1;
+        const op = getOp(this.items[i].instruction) || '?';
+        this.uncoveredOpcodes.set(op, (this.uncoveredOpcodes.get(op) || 0) + 1);
       }
     }
 
@@ -2201,6 +2207,7 @@ class MethodTranslator {
       // link them as nested callees (every link path checks this flag)
       usedEh: !!this.ehMethod,
       uncoveredItems: this.uncoveredItems,
+      uncoveredOpcodes: this.uncoveredOpcodes,
       fieldCacheCount: this.fieldCaches.size,
     };
   }
@@ -2424,6 +2431,7 @@ class WasmJit {
         runs: st.runs || 0,
         exits: st.exits || 0,
         fuelExits: st.fuelExits || 0,
+        uncovered: st.uncovered ? Object.fromEntries(st.uncovered) : undefined,
         reasons: Object.fromEntries([...row.reasons]
           .sort((left, right) => right[1] - left[1])),
       };
@@ -2501,6 +2509,7 @@ class WasmJit {
     // method again while its translator is still discovering callees.
     st.status = 'compiling';
     let validatingBytes = null; // last bytes handed to WebAssembly.Module, for reject dumps
+    let primaryMeta = null; // census-only: the meta a partial-module reject saw
     try {
       let structuredMeta = null;
       if (this.structuredEnabled) {
@@ -2553,6 +2562,7 @@ class WasmJit {
         throw new Unsupported('partial module captures a boolean static');
       }
       const primary = structuredMeta || meta;
+      primaryMeta = primary;
       // A partial module may stop after consuming a reference-producing call
       // or immediately before object construction, then resume through the
       // canonical scheduler. Until every such edge carries a verifier-backed
@@ -2669,6 +2679,12 @@ class WasmJit {
       }
       st.status = 'failed';
       st.failReason = err.message;
+      // A partial-module reject names the restriction but not the coverage
+      // gap behind it; the opcode histogram is what says which gap to close.
+      if (this.census && primaryMeta && primaryMeta.uncoveredOpcodes) {
+        st.uncovered = [...primaryMeta.uncoveredOpcodes]
+          .sort((left, right) => right[1] - left[1]).slice(0, 8);
+      }
       if (this.debug) console.error(`[wasmjit] rejected ${st.key}: ${err.message}`);
     }
   }
