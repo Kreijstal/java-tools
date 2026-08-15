@@ -196,6 +196,12 @@ async function tierResults(runtime, native) {
         meta.deoptStubCount ?? '?'} uncovered=${meta.uncoveredItems ?? '?'} ` +
         `usedEh=${meta.usedEh ?? '?'} structured=${meta.structured ?? '?'} ` +
         `demotes=[${demotes.join(', ')}] reason=${state.failReason || ''}`);
+      if (meta.importStats instanceof Map) {
+        const hot = [...meta.importStats.entries()].filter(([, n]) => n > 0)
+          .sort((a, b) => b[1] - a[1]).slice(0, 12)
+          .map(([n, c]) => `${n}=${c}`).join(' ');
+        if (hot) console.log(`       imports: ${hot}`);
+      }
     }
   }
   return rows;

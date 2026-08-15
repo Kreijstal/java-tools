@@ -326,6 +326,7 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
     prefix,
     valueSlots: [start, ...argSlots],
     hasHeapWrite: bodies.some((b) => b.hasHeapWrite),
+    elided: elide,
   };
 }
 
@@ -372,6 +373,24 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     }
   }
 
+  // Interior receiver-is-this detection mirrors inlineCalls: the callee is an
+  // instance method, so its slot 0 holds its own `this` unless something
+  // stores over it. A zero-arg interior invoke directly following aload_0 at
+  // an untargeted item then has this body's receiver as its receiver — and
+  // the branch guard (or outer elision) already bounds that receiver's
+  // runtime class by `className`, so planInstanceSite can elide its guard.
+  const calleeThisStable = !items.some((it) => {
+    const op2 = getOp(it.instruction);
+    if (!op2) return false;
+    if (/^[ilfda]store_0$/.test(op2)) return true;
+    return /^[ilfda]store$/.test(op2) && String(it.instruction.arg) === '0';
+  });
+  const targeted = collectRefdLabels(items);
+  for (const entry of code.exceptionTable || []) {
+    for (const l of [entry.start, entry.end, entry.handler]) {
+      if (typeof l === 'string') targeted.add(l.endsWith(':') ? l.slice(0, -1) : l);
+    }
+  }
   const base = alloc.next;
   alloc.next = base + (Number(code.localsSize) || paramEnd);
   const prefix = `IN${ctx.k++}_`;
@@ -382,11 +401,19 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     const op = getOp(item.instruction);
     const lbl = item.labelDef ? prefix + item.labelDef : undefined;
     if (reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
-      // a deopt at (or inside) this interior site replays the flattened body
-      // from the outer call — unsound once a heap write has happened
-      if (heapWrite) return null;
-      const site = planInstanceSite(ctx, item.instruction, op, className, alloc, depth + 1);
+      const prevOp = idx > 0 ? getOp(items[idx - 1].instruction) : null;
+      const interiorRecvIsThis = calleeThisStable &&
+        !(item.labelDef && targeted.has(item.labelDef.slice(0, -1))) &&
+        (prevOp === 'aload_0' ||
+          (prevOp === 'aload' && String(items[idx - 1].instruction.arg) === '0'));
+      const site = planInstanceSite(ctx, item.instruction, op, className, alloc,
+        depth + 1, interiorRecvIsThis);
       if (!site) return null;
+      // a deopt at (or inside) this interior site replays the flattened body
+      // from the outer call — unsound once a heap write has happened. An
+      // elided site emits no guard and no deopt stub, so nothing there can
+      // replay; heap writes before it are fine.
+      if (heapWrite && !site.elided) return null;
       site.items.forEach((s, si) => out.push(si === 0 && lbl ? { ...s, labelDef: lbl } : s));
       out.push({ labelDef: `${site.prefix}RET:`, instruction: 'nop' });
       if (site.hasHeapWrite) heapWrite = true;

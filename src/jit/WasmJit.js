@@ -712,7 +712,11 @@ class MethodTranslator {
   // spills its typed slots before every instance call.
   compiledInstanceCallee(ins, itemIndex, underTypes, op) {
     const [, owner, [name, descriptor]] = ins.arg;
-    if (name === '<init>' || name === '<clinit>') {
+    // invokespecial <init> is statically bound to exactly the named owner's
+    // constructor; it is linkable when that constructor compiles fully, so
+    // the linked call runs all-or-nothing (completes or throws) exactly like
+    // native construction. Partial exits mid-<init> stay excluded below.
+    if (name === '<clinit>' || (name === '<init>' && op !== 'invokespecial')) {
       throw new Unsupported(`${op} ${owner}.${name}`);
     }
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -737,9 +741,19 @@ class MethodTranslator {
       return st;
     };
     if (op === 'invokespecial') {
-      const impl = hierarchy.resolveSpecial(this.className, owner, name, descriptor);
+      const impl = name === '<init>'
+        ? hierarchy.resolveInit(owner, descriptor)
+        : hierarchy.resolveSpecial(this.className, owner, name, descriptor);
       if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
       direct = readyOrThrow(impl.className);
+      if (name === '<init>') {
+        // all-or-nothing: a constructor target must be unable to hand the
+        // call back mid-body — it either completes or throws
+        const m = (direct.callee || direct).meta;
+        if (!m.fullyCompiled || m.deoptableCalls || m.usedEh) {
+          throw new Unsupported(`<init> ${owner} target not fully compiled`);
+        }
+      }
     } else {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;
@@ -1940,6 +1954,13 @@ class MethodTranslator {
         else if (writes.size) emit(...this.killSeqWhere((entry) => writes.has(entry.killKey)));
         const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
         if (retC !== 'V') push(descToWasm(retC));
+      } else if (op === 'invokespecial' && ins.arg[1] === 'java/lang/Object' &&
+          ins.arg[2][0] === '<init>' && ins.arg[2][1] === '()V') {
+        // java/lang/Object.<init> is empty (a no-op JRE stub here); the
+        // receiver of a super()/new Object() call is never null
+        if (!stack.length) throw new Unsupported('invokespecial underflow');
+        pop();
+        emit(OP.drop);
       } else if (op === 'invokevirtual' || op === 'invokeinterface' || op === 'invokespecial') {
         const argCount = parseMethodDescriptor(ins.arg[2][1]).params.length + 1;
         if (stack.length < argCount) throw new Unsupported(`${op} stack underflow`);

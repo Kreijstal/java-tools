@@ -115,6 +115,16 @@ class StructuredWasmCompiler {
     if (this.importIndexByName.has(name)) return this.importIndexByName.get(name);
     const idx = this.importDecls.length;
     let wrapped = fn;
+    if (process.env.JVM_WASM_IMPORT_STATS === '1') {
+      if (!this.importStats) this.importStats = new Map();
+      const stats = this.importStats;
+      const inner = wrapped;
+      stats.set(name, 0);
+      wrapped = (...args) => {
+        stats.set(name, stats.get(name) + 1);
+        return inner(...args);
+      };
+    }
     if (this.ehMethod) {
       const box = this.box;
       wrapped = (...args) => {
@@ -269,6 +279,12 @@ class StructuredWasmCompiler {
     // its entry before real emission, so kill sites always see the full set.
     this.fieldCaches = new Map();
 
+    // instanceof verdict caches (SSA-keyed like the above): a verdict is an
+    // immutable property of the object's identity — later class loads cannot
+    // change what an existing object is an instance of — so entries are
+    // killed only when the receiver's SSA value is redefined.
+    this.castCaches = new Map();
+
     const localFor = (value) => {
       let idx = this.localOf.get(value);
       if (idx === undefined) {
@@ -415,6 +431,7 @@ class StructuredWasmCompiler {
       specEpoch: this.jvm.classEpoch || 0,
       deoptStubCount: this.deoptBlocks.size,
       arrayCacheCount: this.arrayCaches.size,
+      importStats: this.importStats || null,
     };
   }
 
@@ -897,7 +914,27 @@ class StructuredWasmCompiler {
       return finish();
     }
     if (op === 'arraylength') {
-      out.push(...use(0), OP.call, ...uleb(this.importIndexByName.get('alen')));
+      const alenIdx = this.importIndexByName.get('alen');
+      if (this.heap) {
+        // serve the length from the array's base/len cache (filled once per
+        // run); null or non-heap arrays fall back to the import, which
+        // keeps the guest NPE
+        this.heapImports();
+        this.usedHeap = true;
+        const c = this.arrayCacheFor(node.args[0]);
+        const arr = this.useOf(node.args[0]);
+        out.push(
+          OP.local_get, ...uleb(c.filled), OP.i32_eqz, OP.if, 0x40,
+          ...arr, OP.call, ...uleb(this.abaseIdx), OP.local_set, ...uleb(c.base),
+          ...arr, OP.call, ...uleb(this.alen0Idx), OP.local_set, ...uleb(c.len),
+          OP.i32_const, ...sleb(1), OP.local_set, ...uleb(c.filled), OP.end,
+          OP.local_get, ...uleb(c.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
+          OP.if, T.i32,
+          OP.local_get, ...uleb(c.len),
+          OP.else, ...arr, OP.call, ...uleb(alenIdx), OP.end);
+        return finish();
+      }
+      out.push(...use(0), OP.call, ...uleb(alenIdx));
       return finish();
     }
 
@@ -939,6 +976,22 @@ class StructuredWasmCompiler {
       if (!isGet) {
         out.push(...this.killSeqWhere((entry) => (
           entry.kind === (isStatic ? 's' : 'f') && entry.killKey === killKey)));
+        // Write-through: after the aliasing kills, this receiver's own cache
+        // holds the just-stored value, so the next read hits instead of
+        // refilling through the import. The entry must be the one the READ
+        // path keys on (the get-import name), not this put-import's name.
+        // Non-ref fields only — a primitive reader value can never key
+        // dependent array/field caches, so a hit that skips the refill
+        // path's dependent kills stays sound.
+        if (caching && field.t !== T.ref) {
+          const readField = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, true);
+          const cacheKey = isStatic
+            ? `s|${readField.name}` : `f|${node.args[0].id}|${readField.name}`;
+          const entry = this.fieldCacheFor(cacheKey, readField.t, killKey,
+            isStatic ? 's' : 'f', isStatic ? null : node.args[0].id);
+          out.push(...use(isStatic ? 0 : 1), OP.local_set, ...uleb(entry.valLocal));
+          out.push(OP.i32_const, ...sleb(1), OP.local_set, ...uleb(entry.filledLocal));
+        }
       }
       return finish();
     }
@@ -949,6 +1002,14 @@ class StructuredWasmCompiler {
     // get a flag check + exit stub right after the import call.
     if (op === 'invokestatic' || op === 'invokevirtual' ||
         op === 'invokespecial' || op === 'invokeinterface') {
+      if (op === 'invokespecial') {
+        const [, sOwner, [sName, sDesc]] = node.imm;
+        if (sName === '<init>' && sDesc === '()V' && sOwner === 'java/lang/Object') {
+          // java/lang/Object.<init> is empty (a no-op JRE stub here); the
+          // receiver of a super()/new Object() call is never null
+          return;
+        }
+      }
       const call = op === 'invokestatic'
         ? this.staticCallImport(node)
         : this.instanceCallImport(node, op);
@@ -1056,6 +1117,19 @@ class StructuredWasmCompiler {
       if (!this.origIdx || this.origIdx[node.itemIdx] !== -1) {
         throw new Unsupported(`op ${op}`);
       }
+      if (op === 'instanceof' && (!this.wasmJit || this.wasmJit.fieldCacheEnabled !== false)) {
+        // guard-shaped instanceof runs per loop iteration on a loop-invariant
+        // receiver: cache the verdict per SSA value instead of crossing into
+        // JS every time
+        const importIdx = this.castImport(op, node.imm);
+        const c = this.castCacheFor(node.args[0], node.imm);
+        out.push(
+          OP.local_get, ...uleb(c.filled), OP.i32_eqz, OP.if, 0x40,
+          ...use(0), OP.call, ...uleb(importIdx), OP.local_set, ...uleb(c.verdict),
+          OP.i32_const, ...sleb(1), OP.local_set, ...uleb(c.filled), OP.end,
+          OP.local_get, ...uleb(c.verdict));
+        return finish();
+      }
       out.push(...use(0), OP.call, ...uleb(this.castImport(op, node.imm)));
       return finish();
     }
@@ -1160,6 +1234,11 @@ class StructuredWasmCompiler {
         seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filledLocal));
       }
     }
+    for (const e of this.castCaches.values()) {
+      if (e.recvId === id) {
+        seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filled));
+      }
+    }
     return seq;
   }
 
@@ -1193,6 +1272,22 @@ class StructuredWasmCompiler {
   // loaded (source, target) pair is immutable, a failed checkcast throws the
   // guest CCE (which unwinds past this frame exactly like the interpreter's),
   // and a live object's class chain is always loaded.
+  // verdict/filled locals for `value instanceof target`; killed only when
+  // the receiver's SSA value is redefined (cacheKillsFor)
+  castCacheFor(value, target) {
+    const key = `${value.id}|${target}`;
+    let entry = this.castCaches.get(key);
+    if (!entry) {
+      const verdict = this.nextLocal++;
+      this.declared.push(T.i32);
+      const filled = this.nextLocal++;
+      this.declared.push(T.i32);
+      entry = { verdict, filled, recvId: value.id };
+      this.castCaches.set(key, entry);
+    }
+    return entry;
+  }
+
   castImport(op, target) {
     if (typeof target !== 'string') throw new Unsupported(`${op} target`);
     const known = target === 'java/lang/Object' || target.startsWith('[') ||
@@ -1339,7 +1434,11 @@ class StructuredWasmCompiler {
   // that can exit run under the scratch-frame protocol.
   instanceCallImport(node, op) {
     const [, owner, [name, descriptor]] = node.imm;
-    if (name === '<init>' || name === '<clinit>') {
+    // invokespecial <init> is statically bound to exactly the named owner's
+    // constructor; it is linkable when that constructor compiles fully, so
+    // the linked call runs all-or-nothing (completes or throws) exactly like
+    // native construction. Partial exits mid-<init> stay excluded below.
+    if (name === '<clinit>' || (name === '<init>' && op !== 'invokespecial')) {
       throw new Unsupported(`${op} ${owner}.${name}`);
     }
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -1363,9 +1462,19 @@ class StructuredWasmCompiler {
     let direct = null;
     let resolvedCone = null;
     if (op === 'invokespecial') {
-      const impl = hierarchy.resolveSpecial(this.className, owner, name, descriptor);
+      const impl = name === '<init>'
+        ? hierarchy.resolveInit(owner, descriptor)
+        : hierarchy.resolveSpecial(this.className, owner, name, descriptor);
       if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
       direct = readyOrThrow(impl.className);
+      if (name === '<init>') {
+        // all-or-nothing: a constructor target must be unable to hand the
+        // call back mid-body — it either completes or throws
+        const m = (direct.callee || direct).meta;
+        if (!m.fullyCompiled || m.deoptableCalls || m.usedEh) {
+          throw new Unsupported(`<init> ${owner} target not fully compiled`);
+        }
+      }
     } else {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;

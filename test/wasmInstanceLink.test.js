@@ -453,3 +453,93 @@ test('complete monomorphic cone links with only a null check and survives a late
   t.equal(out[0], referenceMono(n, 5, spinGear), 'Gear receiver still correct');
   t.end();
 });
+
+const CTOR_SOURCE = `
+public class CtorLink {
+  public static int drive(int[] out, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+      Box b = new Box(i, s);
+      s = (s + b.a * 3 + b.b) & 0xfffff;
+    }
+    out[0] = s;
+    return s;
+  }
+}
+class Box { int a; int b; Box(int a, int b) { this.a = a; this.b = b + 1; } }
+`;
+
+function referenceCtor(n) {
+  let s = 0;
+  for (let i = 0; i < n; i += 1) {
+    const a = i; const b = (s + 1) | 0;
+    s = ((s + Math.imul(a, 3) + b) | 0) & 0xfffff;
+  }
+  return s;
+}
+
+test('invokespecial <init> links to a fully compiled constructor', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'CtorLink', CTOR_SOURCE, {
+    JVM_WASM_DIRECT_INSTANCE_LINK: '1',
+  });
+  await jvm.loadClassByName('Box');
+  jvm.classInitializationState.set('Box', 'INITIALIZED');
+  const n = 6000;
+  const out = [0];
+  out.type = '[I';
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'CtorLink', 'drive', '([II)I', [out, n]);
+    t.equal(out[0], referenceCtor(n),
+      `round ${round}: constructed fields read back correctly`);
+  }
+  const st = stateOf(jvm, 'CtorLink.drive([II)I');
+  t.ok(st, 'drive compiled to wasm');
+  t.notOk([...st.meta.demoteReasons.values()].some((r) => /<init>/.test(r)),
+    'the constructor call no longer demotes the caller');
+  t.ok(st.meta.fullyCompiled, 'the caller compiles fully around the new+<init>');
+  t.end();
+});
+
+const CTOR_PARTIAL_SOURCE = `
+public class CtorPartial {
+  public static int drive(int[] out, int n) {
+    int s = 0;
+    for (int i = 0; i < n; i++) {
+      Wild w = new Wild(i);
+      s = (s + w.v) & 0xfffff;
+    }
+    out[0] = s;
+    return s;
+  }
+}
+class Wild {
+  int v;
+  Wild(int i) {
+    if (i < 0) throw new RuntimeException("never");
+    this.v = (i * 7) ^ 3;
+  }
+}
+`;
+
+function referenceWild(n) {
+  let s = 0;
+  for (let i = 0; i < n; i += 1) s = ((s + (Math.imul(i, 7) ^ 3)) | 0) & 0xfffff;
+  return s;
+}
+
+test('a constructor that cannot fully compile refuses the link and stays correct', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'CtorPartial', CTOR_PARTIAL_SOURCE, {
+    JVM_WASM_DIRECT_INSTANCE_LINK: '1',
+  });
+  await jvm.loadClassByName('Wild');
+  jvm.classInitializationState.set('Wild', 'INITIALIZED');
+  const n = 6000;
+  const out = [0];
+  out.type = '[I';
+  for (let round = 0; round < 3; round += 1) {
+    await invoke(jvm, thread, 'CtorPartial', 'drive', '([II)I', [out, n]);
+    t.equal(out[0], referenceWild(n),
+      `round ${round}: partial-ctor path stays correct`);
+  }
+  t.end();
+});
