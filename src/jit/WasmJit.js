@@ -2680,10 +2680,21 @@ class WasmJit {
       st.status = 'failed';
       st.failReason = err.message;
       // A partial-module reject names the restriction but not the coverage
-      // gap behind it; the opcode histogram is what says which gap to close.
-      if (this.census && primaryMeta && primaryMeta.uncoveredOpcodes) {
-        st.uncovered = [...primaryMeta.uncoveredOpcodes]
-          .sort((left, right) => right[1] - left[1]).slice(0, 8);
+      // gap behind it. The demote reason is the actionable half — the opcode
+      // histogram showed these gaps are made of plain iload/getfield, so the
+      // blocks are excluded structurally, not for an unsupported instruction.
+      if (this.census && primaryMeta) {
+        const tally = new Map();
+        for (const reason of (primaryMeta.demoteReasons || new Map()).values()) {
+          tally.set(reason, (tally.get(reason) || 0) + 1);
+        }
+        for (const [op, count] of primaryMeta.uncoveredOpcodes || []) {
+          tally.set(`op:${op}`, count);
+        }
+        if (tally.size) {
+          st.uncovered = [...tally]
+            .sort((left, right) => right[1] - left[1]).slice(0, 8);
+        }
       }
       if (this.debug) console.error(`[wasmjit] rejected ${st.key}: ${err.message}`);
     }
