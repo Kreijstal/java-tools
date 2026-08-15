@@ -569,6 +569,10 @@ class JitCompiler {
   }
 
   tryRunFrame(frame, thread) {
+    // Ask the wasm gate before any JS tier can win, so the census can account
+    // for methods the JS tier claims first. Diagnostic mode only; a no-op
+    // unless JVM_WASM_CENSUS_SHADOW=1.
+    if (this.wasmJit.censusShadow) this.wasmJit.censusProbe(frame);
     const stableResult = this.tryRunStableGeneratedFrame(frame, thread);
     if (stableResult) return stableResult;
 

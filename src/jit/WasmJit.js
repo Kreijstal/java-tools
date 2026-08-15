@@ -2259,6 +2259,13 @@ class WasmJit {
     this.censusPath = env.JVM_WASM_CENSUS_FILE || '';
     this.census = (env.JVM_WASM_CENSUS === '1' || this.censusPath)
       ? new Map() : null;
+    // The JS tier is consulted first and, when it wins, the wasm gate is
+    // never asked — those methods are absent from the census entirely, so it
+    // cannot say whether wasm COULD have covered them. Shadow mode asks
+    // anyway, purely for accounting: the verdict is recorded and discarded,
+    // nothing runs. It compiles modules that go unused, so it is slow and
+    // strictly a diagnostic.
+    this.censusShadow = !!this.census && env.JVM_WASM_CENSUS_SHADOW === '1';
     if (this.census && typeof process !== 'undefined' && process.on) {
       process.on('exit', () => this.dumpCensus());
     }
@@ -2446,6 +2453,16 @@ class WasmJit {
       console.error(`[wasm-census] ${row.method} attempts=${row.attempts} ` +
         `status=${row.status} runs=${row.runs} exits=${row.exits} ` +
         `fuelExits=${row.fuelExits} :: ${reasons}`);
+    }
+  }
+
+  // Shadow accounting only: record what the gate would decide, run nothing.
+  censusProbe(frame) {
+    if (!this.censusShadow) return;
+    try {
+      this.prepare(frame);
+    } catch (err) {
+      if (this.debug) console.error(`[wasm-census] probe threw: ${err.message}`);
     }
   }
 
