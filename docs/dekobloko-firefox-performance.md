@@ -648,6 +648,13 @@ forgotten.
   from a length-124 array. Reverted. The cost is still worth removing, but the
   coalescing has to happen at emit time, where the emitter knows the scopes —
   not by pattern-matching emitted text afterwards.
+  **Correction:** that crash was misattributed. The identical signature —
+  `dh.a(IIILan;IIIB)V`, `saload` index 576 into length 124 — reproduces under
+  `JVM_JIT_WARMUP=1` on unmodified sources, so it is a pre-existing latent
+  miscompile that surfaces whenever compilation timing shifts, not a
+  consequence of the coalescing change. The revert stands on the scope defect
+  alone. `JVM_JIT_WARMUP=1` crashes in about 30 s and is the fastest known
+  reproducer for it.
 - **Blanket-JITing `run()` is unsafe.** Observed `im.run`/`qk.run` frames include
   lifecycle, monitor/wait, and I/O behavior. The compiler excludes `run()` for
   good reason; eligibility must be structural and scheduler-safe, not based on
@@ -6514,6 +6521,32 @@ A CPU profile of one boot (152.3 s, sampling costs ~2%) attributes as follows.
 | node-modules | 7620 | 5.0 |
 | gc | 6472 | 4.3 |
 | interpreter:opcode | 5623 | 3.7 |
+
+### The gap is CPU work, not threads and not idle
+
+Measure both runtimes with `/usr/bin/time -v` before theorising about either.
+
+| | wall | CPU time | CPU% | post-logo |
+|---|---|---|---|---|
+| JRE (OpenJDK 11.0.31) | 42.6 s | **28.0 s** | 65% | 14.05 s |
+| jvm.js | 181.9 s | **210.8 s** | 115% | 149.63 s |
+
+jvm.js burns **7.5x more CPU for identical work**. Two popular explanations are
+both refuted by this table:
+
+- **It is not parallelism.** The JRE runs at 65% of ONE core. It is not
+  exploiting multiple cores, so mapping Java threads onto `worker_threads` with
+  a SharedArrayBuffer heap — a runtime redesign — would not close this gap.
+- **It is not idle.** The JRE is idle ~35% of its wall time, proportionally
+  *more* than jvm.js's 13%. JFR on the same run records 55.15 s of
+  `jdk.ThreadSleep` across 1406 events in a 39 s run: the guest sleeps a lot on
+  both runtimes, and it costs the JRE no wall time because the sleeps overlap.
+  jvm.js's scheduler is single-threaded and cooperative, so it only shows as
+  idle when all guest threads are blocked at once — which is why the same guest
+  behaviour looks like a "stall" here and like nothing there.
+
+Idle is therefore necessary (it is the guest's own `Thread.sleep`, via the
+`fsa.a(IJ)V` wrapper), not removable, and not where the gap lives.
 
 The arithmetic this forces: **guest code is only 24% of the boot.** At literally
 zero runtime overhead the guest work alone is 36.8 s, or 2.8x the JRE. So 5x is
