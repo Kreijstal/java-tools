@@ -484,6 +484,36 @@ function fillPhiArgs(blocks, rpo, isJoin, makeValue, paramSlots) {
     }
     if (seed) block.predIds = ['entry', ...block.predIds];
   }
+
+  // The pass above visits blocks once in RPO, so a phi whose arguments only
+  // become kinded later keeps kind null. A loop-header phi for a slot first
+  // assigned INSIDE the loop is exactly that shape: at the header its args are
+  // (undef from before the loop, the body's phi, still unkinded), which merges
+  // to null and is never revisited.
+  //
+  // That is not cosmetic. Consumers treat a null-kinded phi as a dead slot:
+  // StructuredWasmCompiler's fuel-exit spill skips it, so the value the wasm
+  // module computed is never written back to frame.locals and the interpreter
+  // resumes on the stale entry value. On Tomb Racer's kr.e that dropped slot
+  // 27 (a byte[6]) and slots 30-34, and the guest died with an index past the
+  // end of the array those slots held.
+  //
+  // Iterate to a fixpoint so every phi carrying a defined value gets its kind.
+  // Only null kinds are filled; an already-kinded phi keeps its kind, and a
+  // genuine CONFLICT stays CONFLICT (still excluded from spills, which is the
+  // documented behaviour for type-conflicted joins).
+  let kindsChanged = true;
+  while (kindsChanged) {
+    kindsChanged = false;
+    for (const blockId of rpo) {
+      for (const phi of blocks[blockId].phis) {
+        if (phi.kind !== null || !phi.args || !phi.args.length) continue;
+        const merged = phi.args.reduce(
+          (kind, arg) => mergeKind(kind, arg ? arg.kind : null), null);
+        if (merged !== null) { phi.kind = merged; kindsChanged = true; }
+      }
+    }
+  }
 }
 
 function pruneTrivialPhis(fn) {

@@ -260,6 +260,7 @@ class StructuredWasmCompiler {
       this,
       this.method.name,
       this.wasmJit.typedArrayStoresEnabled,
+      `${this.className}.${this.method.name}${this.method.descriptor}`,
     );
 
     // Linear-heap array caches: per receiver SSA value, three locals holding
@@ -347,6 +348,24 @@ class StructuredWasmCompiler {
       } catch (err) {
         if (!(err instanceof Unsupported)) throw err;
         this.demoted.set(id, err.message);
+      }
+    }
+    // Debug bisection: force specific blocks to fall back to the interpreter.
+    // A demoted block is by construction the interpreter's behaviour, so if
+    // demoting a block makes a miscompile disappear, that block's lowering is
+    // the one at fault. JVM_WASM_DEMOTE_BLOCKS=<method-substring>:<id,id,...>
+    const forced = process.env.JVM_WASM_DEMOTE_BLOCKS || '';
+    if (forced) {
+      const colon = forced.lastIndexOf(':');
+      const pattern = colon < 0 ? '' : forced.slice(0, colon);
+      const key = `${this.className}.${this.method.name}${this.method.descriptor}`;
+      if (!pattern || key.includes(pattern)) {
+        for (const raw of forced.slice(colon + 1).split(',')) {
+          const id = Number(raw.trim());
+          if (Number.isInteger(id) && treeBlocks.includes(id)) {
+            this.demoted.set(id, 'forced (JVM_WASM_DEMOTE_BLOCKS)');
+          }
+        }
       }
     }
     if (this.demoted.has(cfg.entry)) {

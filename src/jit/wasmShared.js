@@ -288,7 +288,11 @@ class Unsupported extends Error {
   }
 }
 
-const FUEL = 5_000_000;
+// Block transfers allowed per wasm run before the module spills and hands
+// back to the interpreter. Overridable for debugging: a fuel exit is the only
+// point where a structured module writes its SSA values back to frame.locals,
+// so raising it isolates whether a miscompile lives in that spill path.
+const FUEL = Number(process.env.JVM_WASM_FUEL || 5_000_000);
 
 // Guest exceptions are plain objects with a string `type` (never Error
 // instances); host errors (TypeError, NestedDeopt, ...) are everything else.

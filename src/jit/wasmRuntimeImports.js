@@ -27,6 +27,85 @@ const {
   normalizeArrayStore,
 } = require('../instructions/utils');
 
+/*
+ * Debug: record every array access made by a matching method, so the SAME
+ * method compiled by the two backends can be diffed access-for-access. Both
+ * backends route array access through these imports, so the trace is directly
+ * comparable and the first differing line names the operation that diverges --
+ * which per-block bisection cannot do cheaply, because heavily demoted modules
+ * exit on nearly every entry and never finish.
+ *
+ * JVM_WASM_TRACE_ARRAYS=<method substring>, JVM_WASM_TRACE_ARRAYS_OUT=<file>.
+ */
+const ARRAY_TRACE_PATTERN = process.env.JVM_WASM_TRACE_ARRAYS || '';
+// A full verbatim trace does not fit: kr.e crashes millions of accesses in.
+// Instead hash every access into fixed-size chunks, so two runs can be
+// compared chunk-for-chunk to find the first differing window in constant
+// memory, and keep only the last TAIL accesses verbatim for the crash site.
+const ARRAY_TRACE_CHUNK = Number(process.env.JVM_WASM_TRACE_ARRAYS_CHUNK || 50000);
+const ARRAY_TRACE_TAIL = Number(process.env.JVM_WASM_TRACE_ARRAYS_TAIL || 400);
+// Verbatim capture of one access window, for zooming in on the differing
+// chunk that the hashes identify.
+const ARRAY_TRACE_FROM = Number(process.env.JVM_WASM_TRACE_ARRAYS_FROM || 0);
+const ARRAY_TRACE_TO = Number(process.env.JVM_WASM_TRACE_ARRAYS_TO || 0);
+const arrayTraceWindow = [];
+const arrayTraceChunks = [];
+const arrayTraceTail = [];
+let arrayTraceCount = 0;
+let arrayTraceHash = 0x811c9dc5;
+let arrayTraceInstalled = false;
+
+function arrayTracer(methodName) {
+  if (!ARRAY_TRACE_PATTERN || !String(methodName).includes(ARRAY_TRACE_PATTERN)) {
+    return null;
+  }
+  if (!arrayTraceInstalled && typeof process !== 'undefined' && process.on) {
+    arrayTraceInstalled = true;
+    process.on('exit', () => {
+      const out = process.env.JVM_WASM_TRACE_ARRAYS_OUT;
+      if (!out) return;
+      try {
+        const lines = [`# accesses=${arrayTraceCount} chunk=${ARRAY_TRACE_CHUNK}`];
+        arrayTraceChunks.forEach((h, n) => lines.push(`CHUNK ${n} ${h >>> 0}`));
+        if (arrayTraceWindow.length) {
+          lines.push('# window');
+          for (const w of arrayTraceWindow) lines.push(w);
+        }
+        lines.push('# tail');
+        for (const t of arrayTraceTail) lines.push(t);
+        require('fs').writeFileSync(out, lines.join('\n'));
+        console.error(`[wasm-array-trace] ${arrayTraceCount} accesses, ` +
+          `${arrayTraceChunks.length} chunks -> ${out}`);
+      } catch (err) {
+        console.error(`[wasm-array-trace] write failed: ${err.message}`);
+      }
+    });
+  }
+  return (op, a, i) => {
+    const len = a === null || a === undefined ? -1 : monoArray.len(a);
+    // FNV-1a over the access triple; order-sensitive, so any divergence in
+    // sequence, index, or array size changes the chunk hash.
+    let h = arrayTraceHash;
+    const s = `${op}|${len}|${i};`;
+    for (let k = 0; k < s.length; k += 1) {
+      h ^= s.charCodeAt(k);
+      h = Math.imul(h, 0x01000193);
+    }
+    arrayTraceHash = h;
+    arrayTraceCount += 1;
+    if (arrayTraceCount % ARRAY_TRACE_CHUNK === 0) {
+      arrayTraceChunks.push(arrayTraceHash);
+      arrayTraceHash = 0x811c9dc5;
+    }
+    if (ARRAY_TRACE_TO && arrayTraceCount >= ARRAY_TRACE_FROM
+        && arrayTraceCount < ARRAY_TRACE_TO) {
+      arrayTraceWindow.push(`${arrayTraceCount} ${op} len=${len} idx=${i}`);
+    }
+    arrayTraceTail.push(`${arrayTraceCount} ${op} len=${len} idx=${i}`);
+    if (arrayTraceTail.length > ARRAY_TRACE_TAIL) arrayTraceTail.shift();
+  };
+}
+
 function addRuntimeImports(reg, box) {
   reg.addImport('push_i', [T.i32], [], (v) => { box.frame.stack.push(v); });
   reg.addImport('push_l', [T.i64], [], (v) => { box.frame.stack.push(v); });
@@ -54,9 +133,11 @@ function pushImportFor(reg, t) {
   }
 }
 
-function addTypedArrayStoreImports(reg, methodName) {
+function addTypedArrayStoreImports(reg, methodName, traceKey = methodName) {
+  const trace = arrayTracer(traceKey);
   const checkedStore = (op, t, narrow) => {
     reg.addImport(`aset_${op}`, [T.ref, T.i32, t], [], (a, i, v) => {
+      if (trace) trace(op, a, i);
       if (a === null || a === undefined) {
         throw NPE(`Attempted store on null array in ${methodName}`);
       }
@@ -81,19 +162,22 @@ function addTypedArrayStoreImports(reg, methodName) {
   checkedStore('sastore', T.i32, (_a, v) => (v << 16) >> 16);
 }
 
-function addArrayImports(reg, methodName, typedArrayStores = true) {
+function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = methodName) {
+  const trace = arrayTracer(traceKey);
   const mk = (suffix, t) => {
     // monoArray keeps each backing class (plain Array vs wasm-heap TypedArray
     // views) on its own monomorphic keyed IC — one shared `a[i]` site over
     // that mix goes megamorphic and dominates the profile.
     const load = t === T.i32
       ? (a, i) => {
+        if (trace) trace(`aget_${suffix}`, a, i);
         if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
         const value = monoArray.load(a, i);
         if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
         return normalizeArrayLoad(value, null, a);
       }
       : (a, i) => {
+        if (trace) trace(`aget_${suffix}`, a, i);
         if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
         const value = monoArray.load(a, i);
         if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
@@ -102,6 +186,7 @@ function addArrayImports(reg, methodName, typedArrayStores = true) {
     reg.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
     if (!typedArrayStores) {
       reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+        if (trace) trace(`aset_${suffix}`, a, i);
         if (a === null || a === undefined) {
           throw NPE(`Attempted store on null array in ${methodName}`);
         }
@@ -112,7 +197,7 @@ function addArrayImports(reg, methodName, typedArrayStores = true) {
     }
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
-  if (typedArrayStores) addTypedArrayStoreImports(reg, methodName);
+  if (typedArrayStores) addTypedArrayStoreImports(reg, methodName, traceKey);
   reg.addImport('alen', [T.ref], [T.i32], (a) => {
     if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${methodName}`);
     return monoArray.len(a);
@@ -292,6 +377,7 @@ function addTimeImport(reg, jvm, ins) {
 }
 
 module.exports = {
+  arrayTracer,
   addRuntimeImports,
   pushImportFor,
   addArrayImports,

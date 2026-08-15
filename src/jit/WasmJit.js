@@ -65,7 +65,7 @@
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const {
   addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
-  addNewImport, addTypedArrayStoreImports,
+  addNewImport, addTypedArrayStoreImports, arrayTracer,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -231,6 +231,10 @@ class MethodTranslator {
   arrayImports() {
     const self = this;
     const name = this.method.name;
+    // Same array trace as the structured backend so the two tiers' accesses
+    // can be diffed one for one (see wasmRuntimeImports.arrayTracer).
+    const trace = arrayTracer(
+      `${this.className}.${this.method.name}${this.method.descriptor}`);
     const mk = (suffix, t) => {
       // Each import has one fixed result type, and element access goes through
       // monoArray so each backing class (plain Array vs the wasm-heap
@@ -238,12 +242,14 @@ class MethodTranslator {
       // `a[i]` site over that mix goes megamorphic and dominates the profile.
       const load = t === T.i32
         ? (a, i) => {
+          if (trace) trace(`aget_${suffix}`, a, i);
           if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${name}`);
           const value = monoArray.load(a, i);
           if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
           return normalizeArrayLoad(value, null, a);
         }
         : (a, i) => {
+          if (trace) trace(`aget_${suffix}`, a, i);
           if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${name}`);
           const value = monoArray.load(a, i);
           if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
@@ -252,6 +258,7 @@ class MethodTranslator {
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
       if (!self.wasmJit.typedArrayStoresEnabled) {
         self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+          if (trace) trace(`aset_${suffix}`, a, i);
           if (a === null || a === undefined) {
             throw NPE(`Attempted store on null array in ${name}`);
           }
@@ -263,7 +270,8 @@ class MethodTranslator {
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
     if (self.wasmJit.typedArrayStoresEnabled) {
-      addTypedArrayStoreImports(self, name);
+      addTypedArrayStoreImports(self, name,
+        `${self.className}.${self.method.name}${self.method.descriptor}`);
     }
     self.addImport('alen', [T.ref], [T.i32], (a) => {
       if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${name}`);
@@ -2532,7 +2540,13 @@ class WasmJit {
     // how the method gets its chance — so do not cache them as a refusal.
     if (st.status === 'cold' || st.status === 'deferred') return false;
     const meta = st.status === 'ready' ? st.meta : null;
-    const full = !!(meta && meta.fullyCompiled && meta.externalEntry.has(0));
+    // Debug bisection only: accept a PARTIAL module too, so that forcibly
+    // demoting blocks (JVM_WASM_DEMOTE_BLOCKS) does not simply hand the method
+    // back to the JS tier and hide the very miscompile being localised.
+    // Partial modules exit and resume interpreted, which is sound, just slow.
+    const full = process.env.JVM_WASM_PREFER_FORCE === '1'
+      ? !!(meta && meta.externalEntry.has(0))
+      : !!(meta && meta.fullyCompiled && meta.externalEntry.has(0));
     this.fullCoverage.set(method, full);
     if (full) this.fullCoverageWins += 1;
     return full;
@@ -2706,7 +2720,12 @@ class WasmJit {
         meta.runv = osrInstance.exports.runv || null;
         meta.specok = osrInstance.exports.specok || null;
         if (meta.specok) this.specokGlobals.push(meta.specok);
-        st.osr = { meta, run: osrInstance.exports.run };
+        // JVM_WASM_NO_OSR=1: keep the structured module but refuse the
+        // dispatcher OSR companion, so a fuel exit resumes ONLY in the
+        // interpreter. Separates "the spill wrote the wrong locals" from
+        // "the OSR module re-entered mid-method on those locals".
+        st.osr = process.env.JVM_WASM_NO_OSR === '1'
+          ? null : { meta, run: osrInstance.exports.run };
       } else {
         st.osr = null;
       }

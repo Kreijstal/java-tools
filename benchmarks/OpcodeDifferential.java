@@ -296,10 +296,82 @@ public class OpcodeDifferential {
     return acc;
   }
 
+  /*
+   * Many live locals carried across a long loop. A wasm run that exhausts its
+   * fuel budget is the ONE point where a structured module writes its SSA
+   * values back into frame.locals, and it only writes the slots the SSA
+   * builder recorded as reaching that block. Any live slot it misses keeps its
+   * method-entry value when the interpreter resumes, so a loop bound can come
+   * back stale and overrun its array by one. Tomb Racer's kr.e has 35 locals;
+   * the other shapes here have under ten, which is not enough pressure.
+   * Run with a small JVM_WASM_FUEL to force the spill path repeatedly.
+   */
+  public static int manyLocalsSpill(int n, int seed) {
+    int a0 = seed, a1 = seed + 1, a2 = seed + 2, a3 = seed + 3, a4 = seed + 4;
+    int a5 = seed + 5, a6 = seed + 6, a7 = seed + 7, a8 = seed + 8, a9 = seed + 9;
+    int b0 = seed ^ 11, b1 = seed ^ 12, b2 = seed ^ 13, b3 = seed ^ 14;
+    int b4 = seed ^ 15, b5 = seed ^ 16, b6 = seed ^ 17, b7 = seed ^ 18;
+    int c0 = 1, c1 = 2, c2 = 3, c3 = 4, c4 = 5, c5 = 6, c6 = 7, c7 = 8;
+    int bound = 64 + (Math.abs(seed) % 17);
+    byte[] out = new byte[bound];
+    int acc = seed;
+    for (int i = 0; i < n; i++) {
+      a0 += i; a1 ^= a0; a2 += a1; a3 ^= a2; a4 += a3;
+      a5 ^= a4; a6 += a5; a7 ^= a6; a8 += a7; a9 ^= a8;
+      b0 += a9; b1 ^= b0; b2 += b1; b3 ^= b2;
+      b4 += b3; b5 ^= b4; b6 += b5; b7 ^= b6;
+      c0 = (c0 + 1) & 31; c1 = (c1 + c0) & 31; c2 = (c2 + c1) & 31;
+      c3 = (c3 + c2) & 31; c4 = (c4 + c3) & 31; c5 = (c5 + c4) & 31;
+      c6 = (c6 + c5) & 31; c7 = (c7 + c6) & 31;
+      // bound is loaded from a local that must survive every spill/resume
+      for (int k = 0; k < bound; k++) out[k] = (byte) (a0 + k);
+      acc = mix(acc, out[(i + c7) % bound]);
+      acc = mix(acc, bound);
+    }
+    acc = mix(acc, a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9);
+    acc = mix(acc, b0 + b1 + b2 + b3 + b4 + b5 + b6 + b7);
+    return mix(acc, c0 + c1 + c2 + c3 + c4 + c5 + c6 + c7);
+  }
+
+  /*
+   * Locals whose FIRST assignment is inside a loop. At the loop header such a
+   * slot joins (undef from before the loop, the body's own definition), and a
+   * single RPO pass over the phis merges that to "no kind" because the body's
+   * value is not kinded yet. Consumers read an unkinded phi as a dead slot, so
+   * the fuel-exit spill used to drop it and the interpreter resumed on the
+   * stale entry value -- which is how Tomb Racer's kr.e lost the byte[6] in
+   * slot 27 and indexed past its end. Reference slots matter most: a dropped
+   * array reference means the next access uses the wrong array entirely.
+   * Run with a small JVM_WASM_FUEL so the spill path actually executes.
+   */
+  public static int loopLocalArrays(int n, int seed) {
+    int acc = seed;
+    for (int i = 0; i < n; i++) {
+      // every one of these slots is first written here, inside the loop
+      byte[] small = new byte[6];
+      int[] wide = new int[1 + (i & 15)];
+      int w = wide.length;
+      char[] chars = new char[w];
+      for (int k = 0; k < 6; k++) small[k] = (byte) (seed + i + k);
+      for (int k = 0; k < w; k++) { wide[k] = seed ^ (i * 31 + k); chars[k] = (char) (i + k); }
+      int j = 0;
+      while (j < w) { acc = mix(acc, wide[j] + chars[j]); j++; }
+      acc = mix(acc, small[i % 6]);
+      acc = mix(acc, w);
+      if ((i & 3) == 0) {
+        byte[] alt = new byte[3];
+        alt[i % 3] = (byte) i;
+        acc = mix(acc, alt[(i + 1) % 3]);
+      }
+    }
+    return acc;
+  }
+
   private static final String[] NAMES = {
     "shiftInt", "shiftLong", "narrowing", "divRem",
     "arrayKinds", "branches", "nestedLoops", "longMath",
     "compoundArray", "indirectIndex", "streamDecode", "staticLazyArrays",
+    "manyLocalsSpill", "loopLocalArrays",
   };
 
   static int dispatch(String name, int n, int seed) {
@@ -315,6 +387,8 @@ public class OpcodeDifferential {
     if (name.equals("indirectIndex")) return indirectIndex(n, seed);
     if (name.equals("streamDecode")) return streamDecode(n, seed);
     if (name.equals("staticLazyArrays")) return staticLazyArrays(n, seed);
+    if (name.equals("manyLocalsSpill")) return manyLocalsSpill(n, seed);
+    if (name.equals("loopLocalArrays")) return loopLocalArrays(n, seed);
     throw new IllegalArgumentException(name);
   }
 

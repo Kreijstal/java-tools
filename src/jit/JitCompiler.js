@@ -74,7 +74,18 @@ class JitCompiler {
     this.invocationCounts = new WeakMap();
     this.backwardBranchCache = new WeakMap();
     this.controlFlowBackedgeCache = new WeakMap();
-    this.warmupThreshold = options.warmupThreshold ?? 2;
+    this.warmupThreshold = options.warmupThreshold ??
+      Number(process.env.JVM_JIT_WARMUP || 2);
+    // A method containing a backward branch bypasses the warmup threshold and
+    // compiles on its FIRST invocation, because one call can run a long loop.
+    // Unconditionally, though, that is why Tomb Racer compiles 597 guest
+    // methods to service the 41 that hold 90% of guest time, at ~30s of
+    // synchronous codegen. Set this to also require N invocations before a
+    // loop-bearing method is compiled. Unset keeps the immediate-compile
+    // behaviour, since a genuinely long first loop would otherwise crawl in
+    // the interpreter.
+    this.loopWarmupThreshold = process.env.JVM_JIT_LOOP_WARMUP
+      ? Number(process.env.JVM_JIT_LOOP_WARMUP) : 0;
     this.codegenEnabled = options.codegen !== false;
     this.codegenCache = new WeakMap();
     this.stableGeneratedEntries = new WeakMap();
@@ -471,6 +482,12 @@ class JitCompiler {
     const count = (this.invocationCounts.get(frame.method) || 0) + 1;
     this.invocationCounts.set(frame.method, count);
     if (count < this.warmupThreshold && !this.hasBackwardBranch(frame.method)) {
+      return false;
+    }
+    // Loop-bearing methods otherwise compile on sight; JVM_JIT_LOOP_WARMUP
+    // makes them serve a (shorter) warmup too, to measure how much of the
+    // compile bill is methods that are touched once and never get hot.
+    if (this.loopWarmupThreshold && count < this.loopWarmupThreshold) {
       return false;
     }
     const supported = codegenEligible
