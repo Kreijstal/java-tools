@@ -561,6 +561,37 @@ boundary, materialize locals, stack depth/content, and the correct resume PC.
 Transient deoptimization must set `jitSkipOnce` when immediate re-entry would
 repeat the same exit.
 
+### A slot that looks dead may just be an unkinded phi
+
+A structured Wasm module writes SSA values back to `frame.locals` only at a
+mid-method exit, and only for slots in the block's `slotDefsIn` whose value has
+a kind. A phi left unkinded is therefore read as a *dead slot* and dropped from
+the spill, so the interpreter — or a dispatcher OSR module re-entering at that
+pc — resumes on whatever the last user of that reused frame left behind.
+
+An unkinded *loop-header* phi is exactly a loop-carried slot: an induction
+variable or a loop bound. Resuming a sequential fill loop on a stale counter
+overruns its array by however far the counter drifted, which reads as
+`Index N out of bounds for length N`. On Tomb Racer this crashed `kr.e`'s
+bit-stream decoder, where every loop bound is itself read from the stream.
+
+The cause was that `fillPhiArgs` derived kinds in a single reverse-postorder
+pass. When a loop-header phi takes its back-edge argument from another phi, one
+pass kinds the inner phi only *after* it has already given up on the header one.
+Kinds must be iterated to a fixpoint. That also makes the drop filter sound
+rather than merely lucky: `mergeKind` is identity on `null` and returns a
+distinct `CONFLICT`, so after the fixpoint an unkinded phi provably carries no
+typed value on any path, and every dropped slot is unassigned, an all-null phi
+closure, or a genuine type conflict the verifier makes unobservable.
+
+Two diagnostics exist for this class. `JVM_WASM_TRACE_RESUME=*` reports OSR
+re-entries that land on the pc a structured exit just left, separating slots
+DROPPED by the filter (had a reaching def — a real loss) from slots merely
+ABSENT from `slotDefsIn` (never assigned — sound). `JVM_WASM_CLEAR_DROPPED=1`
+zeroes dropped slots so an unsound drop fails loudly instead of decoding
+garbage. `JVM_WASM_NO_OSR_METHODS=<substr,...>` bisects one module's OSR
+companion out of a whole boot.
+
 ## Experiments that did not pay off
 
 Keep the negative results visible. They were tested and removed rather than
@@ -598,6 +629,25 @@ forgotten.
   about 59,921 raster calls consumed roughly 555 ms and 59,920 wrapper calls
   consumed roughly 692 ms inclusive. After fusion, the scanline helper was not
   the dominant remaining cost.
+- **A deterministic non-realtime clock was drastically worse, not faster.** The
+  scheduler's `_idleWaitDelay` returns 0 when the clock is deterministic and not
+  realtime, which looks like a free way to delete the 13% of Tomb Racer's boot
+  spent idle. Measured, `JVM_FAKE_TIME_REALTIME=0` took 173.2 s to finish the
+  logo alone against 21.5 s normally, and the boot timed out at 500 s. That idle
+  is the guest's own poll loop (4328 waits, 97% as `SLEEPING(timed)x2
+  WAITINGx3`, mean 4.8 ms) and is proportional to wall time, so it shrinks as
+  CPU work drops rather than being separately removable.
+- **Detecting SSA copies by line match instead of by parse is unsound.** The
+  copy-coalescing pass in `JvmSsaBlockRenderer` parses every generated plan with
+  acorn on every compile just to find `const ssaValueA = ssaValueB;`, and acorn
+  is the entire `node-modules` bucket of the boot profile — 7.6 s, 5%. Matching
+  that shape with a regex over `plan.lines` passed 2762 tests and three boots,
+  then miscompiled: `parsedPlan.statements` are *top-level* statements only, so a
+  line scan also matches block-scoped copies, aliases them globally and deletes
+  their declarations. A profiled boot died on a jitted `saload` reading index 576
+  from a length-124 array. Reverted. The cost is still worth removing, but the
+  coalescing has to happen at emit time, where the emitter knows the scopes —
+  not by pattern-matching emitted text afterwards.
 - **Blanket-JITing `run()` is unsafe.** Observed `im.run`/`qk.run` frames include
   lifecycle, monitor/wait, and I/O behavior. The compiler excludes `run()` for
   good reason; eligibility must be structural and scheduler-safe, not based on
@@ -618,6 +668,38 @@ forgotten.
   slower here.
 
 ## Profiling without misleading yourself
+
+### For boot work, measure post-logo time on an otherwise idle machine
+
+Two mistakes have each been made more than once here, and both manufacture or
+hide almost any result.
+
+The first is reading wall time. `results[0].elapsedMs` from the launcher
+includes the ~21 s logo and startup; the metric boot work is judged on is
+`results[0].phaseTimings.postLogoToMenuMs`. A run reported as "188 s" is 155.8 s
+post-logo. That 32 s gap is larger than most effects being chased. (The launcher
+also intermittently reports `postLogoToMenuMs: 0` when logo detection misses;
+discard those runs rather than reading their wall time instead.)
+
+The second is comparing runs taken under different machine load. Measured
+2026-08-15, `report-NOOSR.json` and `report-NO1.json` are the *same*
+configuration and differ 200.4 s vs 166.0 s — about 20%. The long-quoted ~211 s
+baseline has wall 322.4 s against 211 s post-logo, an 111 s pre-logo phase versus
+~31 s when quiet: it was taken under heavy load and overstates the baseline, so
+"we improved from 220 s" was mostly a measurement artifact. This happens because
+bisect arms get launched concurrently, or a test suite runs on the other cores
+during a boot. Timing-sensitive unit tests also go flaky under that contention —
+three failures that vanished on a quiet re-run.
+
+So: report the median `postLogoToMenuMs` of at least three sequential runs with
+nothing else running, and interleave the A and B arms in the same quiet window.
+Sampling itself is cheap — `--cpu-profile` measured 152.3 s against 149.4 s
+without — so profiling overhead is never a valid explanation for a slow reading.
+Look for contention instead.
+
+When a change should only affect compile-time work, prefer an in-profile
+measurement over wall time: compare that bucket's size between two profiles.
+Bucket sizes are immune to machine load in a way total runtime is not.
 
 ### Measure the animation, not the four-minute wall clock
 
@@ -6405,3 +6487,46 @@ npm run build:bundle
   `b.c()I@2`. A 30-second diagnostic repeat used only
   `JVM_DEBUG_THROW_TYPE=java/lang/ArrayIndexOutOfBoundsException` and reproduced
   that separate guest stack. It is therefore not reported as an FPS result.
+
+## 2026-08-15: where Tomb Racer's post-logo boot actually goes
+
+Boot loading is a different axis from the Firefox animation work above: it is
+measured in Node, on `postLogoToMenuMs`, against HotSpot's 16.014 s for the same
+segment. Clean sequential runs measure 147.8 / 149.4 / 149.6 s, i.e. **9.3x
+HotSpot**. A CPU profile of one such boot (152.3 s, sampling costs ~2%)
+attributes as follows.
+
+| bucket | ms | % |
+|---|---|---|
+| runtime:jit | 41993 | 27.6 |
+| runtime:core | 24936 | 16.4 |
+| guest-compiled | 36777 | 24.2 |
+| idle | 19823 | 13.0 |
+| node-modules | 7620 | 5.0 |
+| gc | 6472 | 4.3 |
+| interpreter:opcode | 5623 | 3.7 |
+
+The arithmetic this forces: **guest code is only 24% of the boot.** At literally
+zero runtime overhead the guest work alone is 36.8 s, or 2.3x HotSpot. So 5x is
+reachable and 1.5x is not, but 5x means deleting roughly two thirds of all
+runtime overhead — and there is no hotspot to aim at, the largest single
+self-time entry being 5.6%.
+
+What the buckets are, since the names mislead:
+
+- `node-modules` is **entirely acorn**, i.e. the JIT parsing its own emitted
+  JavaScript. See the negative result above; the fix belongs at emit time.
+- `idle` is the **guest's own poll loop**, not scheduler slack. It is
+  proportional to wall time and shrinks as CPU work drops.
+- `runtime:jit` is mostly per-call and per-entry machinery, not codegen:
+  codegen is roughly 5 s of it. The largest items are
+  `tryInvokeResolvedTarget` (4.4 s, a sequential cascade of property checks per
+  call that wants to be one tag switch), `dispatcher` (3.3 s), and
+  `tryInvokeSyncAt` (2.8 s).
+- `runtime:core` is dominated by scheduler and interpreter plumbing:
+  `_tryExecuteSynchronousInterpreterTick` (8.6 s) plus `execute` (7.2 s) is
+  **15.8 s of scaffolding around only 5.6 s of actual interpreted opcodes**.
+
+Two throwaway scripts generate these views from any `.cpuprofile`: self time per
+`src/jit`+`src/core` function, and self time per `node_modules` library. Both are
+a dozen lines and worth rewriting rather than hunting for.
