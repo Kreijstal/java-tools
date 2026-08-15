@@ -10,6 +10,11 @@ const {
 
 const resolvedSyncInvokeSite = Symbol('resolvedSyncInvokeSite');
 const SYNC_INVOKE_FALLBACK = Symbol('syncInvokeFallback');
+const frameHandoffTracePattern = typeof process !== 'undefined' && process.env
+  ? process.env.JVM_TRACE_FRAME_HANDOFF || '' : '';
+const frameHandoffTracePc = typeof process !== 'undefined' && process.env &&
+  process.env.JVM_TRACE_FRAME_HANDOFF_PC !== undefined
+  ? Number(process.env.JVM_TRACE_FRAME_HANDOFF_PC) : null;
 
 function runtimeClassName(obj) {
   return obj && (obj._className || obj.type);
@@ -96,6 +101,21 @@ function pushBytecodeInvokeFrame(frame, thread, target, params, receiver, isStat
     start = 1;
   }
   assignArgsToLocals(child.locals, args, params, start);
+  if (frameHandoffTracePattern) {
+    const parentIdentity = `${frame.className || '?'}.${frame.method?.name || '?'}${
+      frame.method?.descriptor || ''}`;
+    if (parentIdentity.includes(frameHandoffTracePattern) &&
+        (!Number.isInteger(frameHandoffTracePc) || frame.pc === frameHandoffTracePc)) {
+      child.jitFrameHandoffTrace = {
+        parent: parentIdentity,
+        parentPc: frame.pc,
+        child: `${child.className || '?'}.${child.method?.name || '?'}${
+          child.method?.descriptor || ''}`,
+      };
+      console.error('[jvm-frame-handoff-push] ' + JSON.stringify(
+        child.jitFrameHandoffTrace));
+    }
+  }
   thread.callStack.push(child);
   if (target.method && target.method.name === '<init>' &&
       typeof process !== 'undefined' && process.env &&

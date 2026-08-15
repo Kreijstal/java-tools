@@ -31,6 +31,23 @@ function completeReflectiveCall(thread, value) {
   return typeof resolver === 'function' ? resolver(value) : undefined;
 }
 
+function returnParentFor(frame, thread) {
+  const explicit = frame.jitGeneratedReturnParent;
+  delete frame.jitGeneratedReturnParent;
+  delete frame.jitGeneratedReturnType;
+  const parent = explicit && thread.callStack.items.includes(explicit)
+    ? explicit : thread.callStack.isEmpty() ? null : thread.callStack.peek();
+  if (frame.jitFrameHandoffTrace) {
+    console.error('[jvm-frame-handoff-return] ' + JSON.stringify({
+      ...frame.jitFrameHandoffTrace, tier: 'interpreted',
+      childDepth: frame.stack.items.length,
+      parentDepth: parent ? parent.stack.items.length : null,
+    }));
+    delete frame.jitFrameHandoffTrace;
+  }
+  return parent;
+}
+
 module.exports = {
   return: (frame, instruction, jvm, thread) => {
     if (thread.pendingException) {
@@ -40,6 +57,20 @@ module.exports = {
     jvm.completeClassInitialization(frame);
     if (isReflectiveTarget(thread, frame)) {
       completeReflectiveCall(thread, null);
+    } else if (frame.jitGeneratedReturnParent) {
+      const expectedReturnType = frame.jitGeneratedReturnType;
+      const parent = returnParentFor(frame, thread);
+      if (parent && expectedReturnType !== 'void') {
+        console.error('[jit-generated-return-underflow]', {
+          child: `${frame.className || '<unknown>'}.` +
+            `${frame.method && frame.method.name || '<unknown>'}` +
+            `${frame.method && frame.method.descriptor || ''}`,
+          parent: `${parent.className || '<unknown>'}.` +
+            `${parent.method && parent.method.name || '<unknown>'}` +
+            `${parent.method && parent.method.descriptor || ''}`,
+          expectedReturnType,
+        });
+      }
     }
   },
   ireturn: (frame, instruction, jvm, thread) => {
@@ -50,8 +81,9 @@ module.exports = {
     thread.callStack.pop();
     if (isReflectiveTarget(thread, frame)) {
       completeReflectiveCall(thread, returnValue);
-    } else if (!thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(returnValue);
+    } else {
+      const parent = returnParentFor(frame, thread);
+      if (parent) parent.stack.push(returnValue);
     }
   },
   areturn: (frame, instruction, jvm, thread) => {
@@ -62,8 +94,9 @@ module.exports = {
     thread.callStack.pop();
     if (isReflectiveTarget(thread, frame)) {
       completeReflectiveCall(thread, returnValue);
-    } else if (!thread.callStack.isEmpty()) {
-      thread.callStack.peek().stack.push(returnValue);
+    } else {
+      const parent = returnParentFor(frame, thread);
+      if (parent) parent.stack.push(returnValue);
     }
   },
   goto: (frame, instruction) => {
@@ -362,11 +395,12 @@ module.exports = {
         delete thread.pendingException;
       }
       const returnValue = frame.stack.pop();
-      thread.callStack.pop();
+    thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
-      } else if (!thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(returnValue);
+      } else {
+        const parent = returnParentFor(frame, thread);
+        if (parent) parent.stack.push(returnValue);
       }
     },
     freturn: (frame, instruction, jvm, thread) => {
@@ -374,11 +408,12 @@ module.exports = {
         delete thread.pendingException;
       }
       const returnValue = frame.stack.pop();
-      thread.callStack.pop();
+    thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
-      } else if (!thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(returnValue);
+      } else {
+        const parent = returnParentFor(frame, thread);
+        if (parent) parent.stack.push(returnValue);
       }
     },
     lreturn: (frame, instruction, jvm, thread) => {
@@ -386,11 +421,12 @@ module.exports = {
         delete thread.pendingException;
       }
       const returnValue = frame.stack.pop();
-      thread.callStack.pop();
+    thread.callStack.pop();
       if (isReflectiveTarget(thread, frame)) {
         completeReflectiveCall(thread, returnValue);
-      } else if (!thread.callStack.isEmpty()) {
-        thread.callStack.peek().stack.push(returnValue);
+      } else {
+        const parent = returnParentFor(frame, thread);
+        if (parent) parent.stack.push(returnValue);
       }
     },
     goto_w: (frame, instruction) => {

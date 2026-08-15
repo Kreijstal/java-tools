@@ -1,3 +1,4 @@
+const { hasField } = require('../../../core/objectModel');
 const unsafe = {
   type: 'sun/misc/Unsafe',
 };
@@ -88,7 +89,7 @@ function readField(base, offset) {
   }
   for (const key of candidates) {
     if (base && Object.prototype.hasOwnProperty.call(base, key)) return base[key];
-    if (base && base.fields && Object.prototype.hasOwnProperty.call(base.fields, key)) {
+    if (base && base.fields && hasField(base.fields, key)) {
       return base.fields[key];
     }
   }
@@ -102,13 +103,14 @@ function readField(base, offset) {
   return undefined;
 }
 
-function writeField(base, offset, value) {
+function writeField(jvm, base, offset, value) {
   const field = offsetField(offset);
   const candidates = fieldCandidates(field);
   const staticFields = base && base._classData && base._classData.staticFields;
   if (staticFields instanceof Map) {
     const key = candidates.find((candidate) => staticFields.has(candidate)) || candidates[1];
     staticFields.set(key, value);
+    jvm.jit?.markStaticContainerChanged(staticFields);
     return;
   }
   for (const key of candidates) {
@@ -116,7 +118,7 @@ function writeField(base, offset, value) {
       base[key] = value;
       return;
     }
-    if (base && base.fields && Object.prototype.hasOwnProperty.call(base.fields, key)) {
+    if (base && base.fields && hasField(base.fields, key)) {
       base.fields[key] = value;
       return;
     }
@@ -168,9 +170,13 @@ const primitiveMethods = {
   'getIntVolatile(Ljava/lang/Object;J)I': (jvm, obj, args) =>
     readPrimitive(args[0], args[1], 4, 'getInt32'),
   'putInt(Ljava/lang/Object;JI)V': (jvm, obj, args) =>
-    writePrimitive(args[0], args[1], 4, 'setInt32', args[2]),
+    offsets.has(args[1])
+      ? writeField(jvm, args[0], args[1], args[2])
+      : writePrimitive(args[0], args[1], 4, 'setInt32', args[2]),
   'putIntVolatile(Ljava/lang/Object;JI)V': (jvm, obj, args) =>
-    writePrimitive(args[0], args[1], 4, 'setInt32', args[2]),
+    offsets.has(args[1])
+      ? writeField(jvm, args[0], args[1], args[2])
+      : writePrimitive(args[0], args[1], 4, 'setInt32', args[2]),
   'getLong(Ljava/lang/Object;J)J': (jvm, obj, args) =>
     readPrimitive(args[0], args[1], 8, 'getBigInt64'),
   'getLong(Ljava/lang/Object;I)J': (jvm, obj, args) =>
@@ -211,8 +217,8 @@ module.exports = {
     'getObject(Ljava/lang/Object;I)Ljava/lang/Object;': (jvm, obj, args) =>
       readField(args[0], args[1]),
     'putObject(Ljava/lang/Object;JLjava/lang/Object;)V': (jvm, obj, args) =>
-      writeField(args[0], args[1], args[2]),
+      writeField(jvm, args[0], args[1], args[2]),
     'putObject(Ljava/lang/Object;ILjava/lang/Object;)V': (jvm, obj, args) =>
-      writeField(args[0], args[1], args[2]),
+      writeField(jvm, args[0], args[1], args[2]),
   },
 };

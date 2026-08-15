@@ -44,3 +44,65 @@ test('class AST to class file can be executed', (t) => {
     t.end();
   }
 });
+
+test('class AST writer preserves textual negative double constants', (t) => {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'class-ast-double-'));
+  const outputClassPath = path.join(outputDir, 'NegativeDouble.class');
+  const assembly = `.version 52 0
+.class public super NegativeDouble
+.super java/lang/Object
+.method public static value : ()D
+  .code stack 2 locals 0
+    ldc2_w -128.0
+    dreturn
+  .end code
+.end method
+.end class
+`;
+  try {
+    const classAst = convertKrak2AstToClassAst(
+      parseKrak2Assembly(assembly), { sourceText: assembly });
+    const method = classAst.classes[0].items.find((item) =>
+      item.type === 'method' && item.method.name === 'value');
+    const constant = method.method.attributes
+      .find((attribute) => attribute.type === 'code').code.codeItems
+      .find((item) => item && item.op === 'ldc2_w');
+    constant.arg = '-128.0';
+
+    t.doesNotThrow(() => writeClassAstToClassFile(classAst, outputClassPath),
+      'a decimal ldc2_w token is assembled as a double rather than a long');
+    t.ok(fs.statSync(outputClassPath).size > 0,
+      'the class file is emitted');
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+    t.end();
+  }
+});
+
+test('class AST writer accepts Java-suffixed textual long constants', (t) => {
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'class-ast-long-'));
+  const outputClassPath = path.join(outputDir, 'SuffixedLong.class');
+  const assembly = `.version 52 0
+.class public super SuffixedLong
+.super java/lang/Object
+.method public static value : ()J
+  .code stack 2 locals 0
+    ldc2_w 4294967296L
+    lreturn
+  .end code
+.end method
+.end class
+`;
+  try {
+    const classAst = convertKrak2AstToClassAst(
+      parseKrak2Assembly(assembly), { sourceText: assembly });
+
+    t.doesNotThrow(() => writeClassAstToClassFile(classAst, outputClassPath),
+      'an L-suffixed ldc2_w token is normalized before BigInt parsing');
+    t.ok(fs.statSync(outputClassPath).size > 0,
+      'the class file is emitted');
+  } finally {
+    fs.rmSync(outputDir, { recursive: true, force: true });
+    t.end();
+  }
+});

@@ -1,6 +1,7 @@
 'use strict';
 
 const test = require('tape');
+const { addFieldImport } = require('../src/jit/wasmRuntimeImports');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -11,6 +12,34 @@ const Stack = require('../src/core/stack');
 const { supportsWasmTryTable } = require('../src/jit/wasmShared');
 
 const WASM_TRY_TABLE_SUPPORTED = supportsWasmTryTable();
+
+test('Wasm field imports support direct-property JRE objects', (t) => {
+  const imports = [];
+  const registry = {
+    importIndexByName: new Map(),
+    addImport(name, params, results, fn) {
+      const index = imports.length;
+      imports.push({ name, params, results, fn });
+      this.importIndexByName.set(name, index);
+      return index;
+    },
+  };
+  const jvm = { classes: {} };
+  const instruction = {
+    arg: ['Field', 'SyntheticJreObject', ['value', 'I']],
+  };
+  const getter = addFieldImport(registry, jvm, instruction, false, true);
+  const setter = addFieldImport(registry, jvm, instruction, false, false);
+  const object = { type: 'SyntheticJreObject', value: 41 };
+
+  t.equal(imports[getter.idx].fn(object), 41,
+    'getfield reads the same direct representation as the JS tiers');
+  imports[setter.idx].fn(object, 73);
+  t.equal(object.value, 73,
+    'putfield updates a direct property without manufacturing a field map');
+  t.notOk(object.fields, 'the object representation remains unchanged');
+  t.end();
+});
 
 function assertEhTierOrFallback(t, state) {
   if (WASM_TRY_TABLE_SUPPORTED) return true;
@@ -476,6 +505,35 @@ public class StructuredAlloc {
   t.equal(st.meta.demoteReasons.size, 0,
     `no demoted blocks (${[...st.meta.demoteReasons.values()].join(', ')})`);
   t.ok(st.meta.fullyCompiled, 'fully compiled: allocation never exits to the interpreter');
+  t.end();
+});
+
+test('partial wasm leaves reference returns on the canonical tier', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'StructuredPartialReference', `
+public class StructuredPartialReference {
+  public static Object drive(Object[] out, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += i;
+    Object result = String.valueOf(sum);
+    out[0] = result;
+    return result;
+  }
+}
+`);
+  const out = [null];
+  out.type = '[Ljava/lang/Object;';
+  await invoke(jvm, thread, 'StructuredPartialReference', 'drive',
+    '([Ljava/lang/Object;I)Ljava/lang/Object;', [out, 100]);
+  t.equal(String(out[0]), '4950',
+    'the canonical tier preserves the reference result after the loop');
+  const method = await jvm.findMethodInHierarchy(
+    'StructuredPartialReference', 'drive',
+    '([Ljava/lang/Object;I)Ljava/lang/Object;');
+  const state = jvm.jit.wasmJit.state.get(method);
+  t.equal(state?.status, 'failed',
+    'the partial reference-return module is not installed');
+  t.equal(state?.failReason, 'partial module has a reference return',
+    'the rejection is structural and independent of method identity');
   t.end();
 });
 

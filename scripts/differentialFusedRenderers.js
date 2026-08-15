@@ -7,11 +7,24 @@ const { JVM } = require('../src/core/jvm');
 const Frame = require('../src/core/frame');
 const Stack = require('../src/core/stack');
 const { parseDescriptor } = require('../src/parsing/typeParser');
+const FusedGradientOracle = require('./oracles/FusedGradientOracle');
+const FusedFlatOracle = require('./oracles/FusedFlatOracle');
 
 const classpath = path.resolve(process.argv[2] || '');
 const iterations = Number(process.argv[3] || 200);
+const benchmarkEnabled =
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK === '1';
+const benchmarkIterations = Number(
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK_ITERATIONS || 2000);
+const benchmarkRounds = Number(
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK_ROUNDS || 7);
+const benchmarkWarmups = Number(
+  process.env.FUSED_DIFFERENTIAL_BENCHMARK_WARMUPS || 4);
 if (!process.argv[2] || !fs.statSync(classpath, { throwIfNoEntry: false })?.isDirectory() ||
-    !Number.isInteger(iterations) || iterations <= 0) {
+    !Number.isInteger(iterations) || iterations <= 0 ||
+    !Number.isInteger(benchmarkIterations) || benchmarkIterations <= 0 ||
+    !Number.isInteger(benchmarkRounds) || benchmarkRounds <= 0 ||
+    !Number.isInteger(benchmarkWarmups) || benchmarkWarmups <= 0) {
   console.error('Usage: node scripts/differentialFusedRenderers.js <class-directory> [iterations]');
   process.exit(2);
 }
@@ -40,7 +53,6 @@ async function createRuntime(jitOptions = {}) {
     warmupThreshold: 0,
     preferWholeMethodJs: true,
     fusedRegions: false,
-    handwrittenFusedKernels: false,
     ...jitOptions,
   } });
   for (const className of classNames(classpath)) {
@@ -91,6 +103,11 @@ function writeTarget(target, value) {
   else target.fields[target.key] = value;
 }
 
+function readTarget(target) {
+  return target.kind === 'map'
+    ? target.fields.get(target.key) : target.fields[target.key];
+}
+
 function configureRegion(runtime, candidate, pixels) {
   const compiler = runtime.jvm.jit.fusedRegions;
   const { wrapper, raster, rasterMethod, scanlineMethod } = candidate.discovered;
@@ -108,7 +125,7 @@ function configureRegion(runtime, candidate, pixels) {
   for (const arg of compiler.staticRefs(scanlineMethod)) setField(runtime, arg, defaultValue(arg[2][1]));
   const region = compiler.compile(candidate.method, candidate.owner);
   if (!region) throw new Error(`Could not compile verified ${candidate.family.name} region`);
-  const rasterPlan = region.semanticGradientRasterPlan || region.semanticFlatRasterPlan;
+  const rasterPlan = region.genericRasterSafetyPlan;
   if (rasterPlan) {
     writeTarget(region.staticTargets[rasterPlan.heightStatic], 64);
     writeTarget(region.staticTargets[rasterPlan.widthStatic], 64);
@@ -116,6 +133,59 @@ function configureRegion(runtime, candidate, pixels) {
       Array.from({ length: 64 }, (_, row) => row * 64));
     writeTarget(region.staticTargets[rasterPlan.strideStatic], 64);
   }
+  return region;
+}
+
+function installRasterOracle(region, jit) {
+  const plan = region.genericRasterSafetyPlan;
+  const scanlineKind = region.semanticScanlinePlan?.kind;
+  if (!plan || (scanlineKind !== 'packed-color' &&
+      scanlineKind !== 'constant-color')) {
+    throw new Error('verified raster has no benchmark-oracle plan');
+  }
+  if (scanlineKind === 'packed-color') {
+    region.semanticGradientRasterPlan = plan;
+    region.rasterKernel = FusedGradientOracle.installRaster(region, jit, plan);
+  } else {
+    region.semanticFlatRasterPlan = plan;
+    region.rasterKernel = FusedFlatOracle.installRaster(region, jit, plan);
+  }
+  region.directRasterKernel = region.rasterKernel.directKernel;
+  const wrapperPlan = region.semanticWrapperPlan;
+  if (!wrapperPlan) return region;
+  const argumentCount = parseDescriptor(
+    region.wrapperMethod.descriptor).params.length;
+  const argumentNames = Array.from(
+    { length: argumentCount }, (_unused, index) => `a${index}`);
+  const evaluators = new Map([...wrapperPlan.templates].map(
+    ([order, template]) => [order, new Function(
+      'region', 'helpers', 'state', ...argumentNames,
+      `"use strict";return [${template.arguments.join(',')}];`)]));
+  const relation = (left, right) => left < right ? 0 : left === right ? 1 : 2;
+  region.wrapperKernel = function benchmarkOracleWrapper(
+    state, regionArg, helpers, ...args) {
+    if (wrapperPlan.booleanParameters.some(
+      (parameter) => (args[parameter] | 0) !== 1)) {
+      return region.generatedWrapperKernel(
+        state, regionArg, helpers, ...args);
+    }
+    const [first, second, third] = wrapperPlan.keys.map(
+      (parameter) => args[parameter] | 0);
+    const order = relation(first, second) * 9 +
+      relation(first, third) * 3 + relation(second, third);
+    const evaluator = evaluators.get(order);
+    if (!evaluator) {
+      return region.generatedWrapperKernel(
+        state, regionArg, helpers, ...args);
+    }
+    const rasterArgs = evaluator(region, helpers, state, ...args);
+    const height = readTarget(region.staticTargets[plan.heightStatic]) | 0;
+    const width = readTarget(region.staticTargets[plan.widthStatic]) | 0;
+    const rows = readTarget(region.staticTargets[plan.rowsStatic]);
+    const stride = readTarget(region.staticTargets[plan.strideStatic]) | 0;
+    return region.directRasterKernel(
+      height, width, rows, stride, ...rasterArgs);
+  };
   return region;
 }
 
@@ -142,8 +212,10 @@ function nextRandom(state) {
   return state.value;
 }
 
-function argumentsFor(family, random, region) {
-  const coordinate = () => 2 + nextRandom(random) % 60;
+function argumentsFor(family, random, region, wideCoordinates = false) {
+  const coordinate = () => wideCoordinates
+    ? -32 + nextRandom(random) % 128
+    : 2 + nextRandom(random) % 60;
   const color = () => nextRandom(random) & 0xffffff;
   let args;
   if (family.wrapper === '(IIIIIIII)V') {
@@ -180,28 +252,205 @@ function assertPixels(left, right, label) {
   }
 }
 
+function checksum(values) {
+  let value = 0;
+  for (let index = 0; index < values.length; index += 1) {
+    value = (Math.imul(value, 31) + (values[index] | 0)) | 0;
+  }
+  return value;
+}
+
+function median(values) {
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function benchmarkKernels(generic, oracle, cases, oracleCases = cases) {
+  if (cases.length !== oracleCases.length) {
+    throw new Error("Benchmark case counts differ");
+  }
+  let genericCursor = 0;
+  let oracleCursor = 0;
+  const genericBatch = () => {
+    for (let call = 0; call < benchmarkIterations; call += 1) {
+      generic.kernel(...cases[genericCursor++ & (cases.length - 1)]);
+    }
+  };
+  const oracleBatch = () => {
+    for (let call = 0; call < benchmarkIterations; call += 1) {
+      oracle.kernel(...oracleCases[oracleCursor++ & (oracleCases.length - 1)]);
+    }
+  };
+  for (let warmup = 0; warmup < benchmarkWarmups; warmup += 1) {
+    generic.destination.fill(warmup);
+    oracle.destination.fill(warmup);
+    genericCursor = 0;
+    oracleCursor = 0;
+    if ((warmup & 1) === 0) {
+      genericBatch();
+      oracleBatch();
+    } else {
+      oracleBatch();
+      genericBatch();
+    }
+  }
+  const genericElapsed = [];
+  const oracleElapsed = [];
+  let genericChecksum = 0;
+  let oracleChecksum = 0;
+  for (let round = 0; round < benchmarkRounds; round += 1) {
+    generic.destination.fill(round);
+    oracle.destination.fill(round);
+    genericCursor = 0;
+    oracleCursor = 0;
+    let genericRound = 0;
+    let oracleRound = 0;
+    const order = (round & 1) === 0
+      ? ['generic', 'oracle', 'oracle', 'generic']
+      : ['oracle', 'generic', 'generic', 'oracle'];
+    for (const name of order) {
+      const started = process.hrtime.bigint();
+      if (name === 'generic') genericBatch();
+      else oracleBatch();
+      const elapsed = Number(process.hrtime.bigint() - started);
+      if (name === 'generic') genericRound += elapsed;
+      else oracleRound += elapsed;
+    }
+    assertPixels(generic.destination, oracle.destination,
+      `timed round ${round}`);
+    genericElapsed.push(genericRound);
+    oracleElapsed.push(oracleRound);
+    genericChecksum ^= checksum(generic.destination);
+    oracleChecksum ^= checksum(oracle.destination);
+  }
+  const pairedRatios = genericElapsed.map(
+    (elapsed, index) => elapsed / oracleElapsed[index]);
+  return {
+    iterationsPerSample: benchmarkIterations * 2,
+    rounds: benchmarkRounds,
+    warmups: benchmarkWarmups,
+    genericNanosecondsPerInvocation:
+      median(genericElapsed) / (benchmarkIterations * 2),
+    oracleNanosecondsPerInvocation:
+      median(oracleElapsed) / (benchmarkIterations * 2),
+    pairedRatios,
+    medianPairedRatio: median(pairedRatios),
+    checksum: genericChecksum,
+    oracleChecksum,
+  };
+}
+
+function captureRasterArguments(region, helpers, cases) {
+  const captured = [];
+  const original = region.rasterKernel;
+  region.rasterKernel = (_state, _region, _helpers, ...args) => {
+    captured.push(args);
+  };
+  try {
+    for (const args of cases) {
+      region.wrapperKernel(region.executionState, region, helpers, ...args);
+    }
+  } finally {
+    region.rasterKernel = original;
+  }
+  return captured.length === cases.length ? captured : null;
+}
+
+function readTarget(target) {
+  return target.kind === 'map'
+    ? target.fields.get(target.key) : target.fields[target.key];
+}
+
+function verifyTrustedRasterBridge(region, helpers, family) {
+  if (!region.rasterKernel.jvmTrustedRasterBridge) return 0;
+  const random = { value: 0x51f15e5d };
+  const wrapperArgs = [argumentsFor(family, random, region)];
+  const captured = captureRasterArguments(region, helpers, wrapperArgs);
+  if (!captured || captured.length !== 1) {
+    throw new Error('Could not capture trusted-raster guard operands');
+  }
+  const plan = region.genericRasterSafetyPlan;
+  const rasterArgs = captured[0];
+  const destination = rasterArgs[plan.destinationParameter];
+  const before = [...destination];
+  const originalFallback = region.generatedRasterKernel;
+  let fallbacks = 0;
+  region.generatedRasterKernel = () => {
+    assertPixels(destination, before,
+      `trusted bridge fallback ${fallbacks + 1} preceded side effects`);
+    fallbacks += 1;
+  };
+  try {
+    const badTag = [...rasterArgs];
+    badTag[plan.tagParameter] = (plan.tagValue + 1) | 0;
+    region.rasterKernel(region.executionState, region, helpers, ...badTag);
+
+    const shortDestination = [...rasterArgs];
+    shortDestination[plan.destinationParameter] = [];
+    region.rasterKernel(
+      region.executionState, region, helpers, ...shortDestination);
+
+    const rowsTarget = region.staticTargets[plan.rowsStatic];
+    const rows = readTarget(rowsTarget);
+    const rowParameter = plan.rowParameters[0];
+    const row = Math.max(0, rasterArgs[rowParameter] | 0);
+    const originalRow = rows[row];
+    rows[row] = (originalRow + 1) | 0;
+    try {
+      region.rasterKernel(region.executionState, region, helpers, ...rasterArgs);
+    } finally {
+      rows[row] = originalRow;
+    }
+  } finally {
+    region.generatedRasterKernel = originalFallback;
+  }
+  if (fallbacks !== 3) {
+    throw new Error(`Trusted raster bridge performed ${fallbacks}/3 guarded fallbacks`);
+  }
+  return fallbacks;
+}
+
 function generatedShape(region) {
   const wrapper = String(region.wrapperKernel);
   const raster = String(region.rasterKernel);
+  const trustedRaster = region.trustedRasterKernel?.jvmLexicalFusedSource || '';
   const scanline = String(region.scanlineKernel);
-  const combined = `${wrapper}\n${raster}\n${scanline}`;
+  const combined = `${wrapper}\n${raster}\n${trustedRaster}\n${scanline}`;
   const forbidden = [
     'new Frame', 'tryInvokeSyncAt', 'runGeneratedFrame', '.stack.items',
   ].filter((token) => combined.includes(token));
   return {
     handwrittenInstalled: Boolean(region.handwrittenWrapperKernel),
     lexicalWrapper: Boolean(region.wrapperKernel.jvmLexicalFusedKernel),
-    lexicalRaster: Boolean(region.rasterKernel.jvmLexicalFusedKernel),
+    lexicalRaster: Boolean(region.rasterKernel.jvmLexicalFusedKernel ||
+      region.rasterKernel.jvmTrustedRasterBridge),
+    trustedRasterBridge: Boolean(region.rasterKernel.jvmTrustedRasterBridge),
     lexicalScanline: Boolean(region.scanlineKernel.jvmLexicalFusedKernel),
+    trustedRaster: Boolean(region.trustedRasterKernel?.jvmTrustedFusedRaster),
+    verifiedFlatRaster:
+      Boolean(region.trustedRasterKernel?.jvmVerifiedFlatRaster),
+    trustedScanlineInlines:
+      region.trustedRasterKernel?.jvmTrustedScanlineInlineCount || 0,
+    trustedConstantArguments:
+      region.trustedRasterKernel?.jvmConstantArgumentCount || 0,
+    trustedCapturedStatics:
+      region.trustedRasterKernel?.jvmCapturedStaticCount || 0,
+    trustedRasterSourceBytes:
+      region.trustedRasterKernel?.jvmLexicalFusedSource?.length || 0,
+    trustedRasterName: region.trustedRasterKernel?.name || null,
     positionalWrapper: region.wrapperKernel.length === 3 +
       parseDescriptor(region.wrapperMethod.descriptor).params.length,
     structuredWrapper: region.semanticWrapperPlan
       ? wrapper.includes('switch(order)')
       : Boolean(region.wrapperKernel.jvmLexicalFusedKernel),
     scalarRasterLocals:
-      /\blet l\d+/.test(raster) &&
-      (region.rasterKernel.jvmLexicalFusedKernel || raster.includes('switch (pc)')),
-    rasterPcSwitch: raster.includes('switch (pc)'),
+      (region.trustedRasterKernel?.jvmVerifiedFlatRaster ||
+       /\blet l\d+/.test(region.rasterKernel.jvmTrustedRasterBridge
+         ? trustedRaster : raster)) &&
+      (region.rasterKernel.jvmLexicalFusedKernel ||
+        region.rasterKernel.jvmTrustedRasterBridge || raster.includes('switch (pc)')),
+    rasterPcSwitch: (region.rasterKernel.jvmTrustedRasterBridge
+      ? trustedRaster : raster).includes('switch (pc)'),
     countedScalarScanline:
       scanline.includes('for(let offset=0;offset<count;offset+=1)'),
     forbiddenRuntimeDispatch: forbidden,
@@ -210,11 +459,11 @@ function generatedShape(region) {
 
 (async () => {
   const baseline = await createRuntime();
-  const fused = await createRuntime({ semanticFusedRasters: false });
-  // The plan-driven compact raster is the handwritten target. It is enabled
-  // only in this differential oracle; the measured/generated runtime above
-  // must remain independent from it.
-  const target = await createRuntime({ semanticFusedRasters: true });
+  const fused = await createRuntime();
+  // Historical compact implementations live in this benchmark process only.
+  // Production FusedRegionCompiler has no import, option, or execution path
+  // that can select them.
+  const target = await createRuntime();
   const descriptors = ['(IIIIIIIIIIIIZIII)V', '(IIIIIIII)V'];
   const report = [];
   for (const descriptor of descriptors) {
@@ -232,7 +481,19 @@ function generatedShape(region) {
     const targetPixels = new Array(64 * 64);
     configureRegion(baseline, baselineCandidate, baselinePixels);
     const region = configureRegion(fused, fusedCandidate, fusedPixels);
-    const targetRegion = configureRegion(target, targetCandidate, targetPixels);
+    const targetRegion = installRasterOracle(
+      configureRegion(target, targetCandidate, targetPixels), target.jvm.jit);
+    if (process.env.JVM_DUMP_FUSED_KERNELS === '1') {
+      process.stderr.write(`\n/* ${descriptor} generated wrapper */\n` +
+        `${region.wrapperKernel.jvmLexicalFusedSource || region.wrapperKernel}\n` +
+        `\n/* ${descriptor} generated raster */\n` +
+        `${region.rasterKernel.jvmLexicalFusedSource || region.rasterKernel}\n` +
+        `\n/* ${descriptor} generated scanline */\n` +
+        `${region.scanlineKernel.jvmLexicalFusedSource || region.scanlineKernel}\n` +
+        `\n/* ${descriptor} trusted generic raster */\n` +
+        `${region.trustedRasterKernel?.jvmLexicalFusedSource || ''}\n` +
+        `\n/* ${descriptor} compact target */\n${targetRegion.rasterKernel}\n`);
+    }
     const shape = generatedShape(region);
     if (shape.handwrittenInstalled || shape.forbiddenRuntimeDispatch.length ||
         !shape.positionalWrapper || !shape.structuredWrapper ||
@@ -267,7 +528,8 @@ function generatedShape(region) {
         fusedPixels[index] = value;
         targetPixels[index] = value;
       }
-      const args = argumentsFor(baselineCandidate.family, random, region);
+      const args = argumentsFor(
+        baselineCandidate.family, random, region, (iteration & 1) !== 0);
       await invokeBaseline(baseline, baselineCandidate, args,
         `${descriptor} iteration ${iteration}`);
       const state = region.executionState;
@@ -289,6 +551,66 @@ function generatedShape(region) {
       throw new Error(`Handwritten target ran ${handwrittenTargetRuns}/${iterations} ` +
         `times for ${descriptor}`);
     }
+    const bridgeGuardChecks = verifyTrustedRasterBridge(
+      region, fused.jvm.jit, fusedCandidate.family);
+    let benchmark = null;
+    let rasterBenchmark = null;
+    if (benchmarkEnabled) {
+      const benchmarkRandom = {
+        value: (descriptor.length * 0x85ebca6b) >>> 0,
+      };
+      const cases = Array.from({ length: 64 }, () =>
+        argumentsFor(fusedCandidate.family, benchmarkRandom, region));
+      const genericKernel = region.wrapperKernel.bind(
+        null, region.executionState, region, fused.jvm.jit);
+      const oracleKernel = targetRegion.wrapperKernel.bind(
+        null, targetRegion.executionState, targetRegion, target.jvm.jit);
+      benchmark = benchmarkKernels({
+        kernel: genericKernel,
+        destination: fusedPixels,
+      }, {
+        kernel: oracleKernel,
+        destination: targetPixels,
+      }, cases);
+      if (benchmark.checksum !== benchmark.oracleChecksum) {
+        throw new Error(`Timed checksum mismatch for ${descriptor}`);
+      }
+      if (region.rasterKernel.jvmTrustedRasterBridge &&
+          targetRegion.directRasterKernel) {
+        const genericRasterCases = captureRasterArguments(
+          region, fused.jvm.jit, cases);
+        const targetRasterCases = captureRasterArguments(
+          targetRegion, target.jvm.jit, cases);
+        if (!genericRasterCases || !targetRasterCases) {
+          throw new Error(`Could not capture one raster call per wrapper for ${descriptor}`);
+        }
+        const captures = region.trustedRasterStaticIndices.map((index) =>
+          readTarget(region.staticTargets[index]));
+        const targetPlan = targetRegion.semanticGradientRasterPlan ||
+          targetRegion.semanticFlatRasterPlan;
+        const targetLayout = [
+          readTarget(targetRegion.staticTargets[targetPlan.heightStatic]) | 0,
+          readTarget(targetRegion.staticTargets[targetPlan.widthStatic]) | 0,
+          readTarget(targetRegion.staticTargets[targetPlan.rowsStatic]),
+          readTarget(targetRegion.staticTargets[targetPlan.strideStatic]) | 0,
+        ];
+        rasterBenchmark = benchmarkKernels({
+          destination: fusedPixels,
+          kernel(...args) {
+            return region.trustedRasterKernel(
+              region.executionState, region, fused.jvm.jit, ...args, ...captures);
+          },
+        }, {
+          destination: targetPixels,
+          kernel(...args) {
+            return targetRegion.directRasterKernel(...targetLayout, ...args);
+          },
+        }, genericRasterCases, targetRasterCases);
+        if (rasterBenchmark.checksum !== rasterBenchmark.oracleChecksum) {
+          throw new Error(`Timed raster checksum mismatch for ${descriptor}`);
+        }
+      }
+    }
     report.push({ descriptor, iterations, changedPixels,
       compactGradientInstalled: Boolean(region.semanticGradientRasterPlan),
       compactFlatInstalled: Boolean(region.semanticFlatRasterPlan),
@@ -300,7 +622,10 @@ function generatedShape(region) {
       handwrittenTargetRuns,
       compactGradientRuns: (fused.jvm.jit.semanticFusedRasterRunCount | 0) - beforeGradient,
       compactFlatRuns: (fused.jvm.jit.semanticFusedFlatRasterRunCount | 0) - beforeFlat,
-      compactFlatRejection: region.semanticFlatRasterRejection || null });
+      compactFlatRejection: region.semanticFlatRasterRejection || null,
+      genericRasterSafetyPlan: region.genericRasterSafetyPlan || null,
+      bridgeGuardChecks,
+      benchmark, rasterBenchmark });
   }
   process.stdout.write(`${JSON.stringify({ ok: true, classpath, report }, null, 2)}\n`);
 })().catch((error) => {

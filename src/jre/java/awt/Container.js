@@ -24,6 +24,15 @@ const normalizeConstraint = (constraint) => {
   return null;
 };
 
+const matchesCard = (container, component, currentName) => {
+  const cards = container._cards || {};
+  for (const name of Object.keys(cards)) {
+    if (cards[name] === component) return name === currentName;
+  }
+  // Components not registered as named cards fall back to their constraint
+  return component._layoutConstraint === currentName;
+};
+
 const applyLayout = (obj) => {
   if (typeof document === 'undefined') return;
   const containerEl = ensureAwtElement(obj);
@@ -91,14 +100,83 @@ const applyLayout = (obj) => {
     } else {
       containerEl.style.justifyContent = 'center';
     }
+    return;
+  }
+
+  if (layout.type === 'java/awt/GridLayout') {
+    containerEl.style.display = 'grid';
+    const configuredRows = layout._rows || 0;
+    const configuredCols = layout._cols || 0;
+    const hgap = layout._hgap || 0;
+    const vgap = layout._vgap || 0;
+    containerEl.style.gap = `${vgap}px ${hgap}px`;
+    const componentEls = (obj._components || [])
+      .map(getComponentElement)
+      .filter(Boolean);
+    const componentCount = componentEls.length;
+    const rows = configuredRows > 0
+      ? configuredRows
+      : Math.max(1, Math.ceil(componentCount / configuredCols));
+    const cols = configuredRows > 0
+      ? Math.max(1, Math.ceil(componentCount / configuredRows))
+      : configuredCols;
+    containerEl.style.gridTemplateColumns =
+      `repeat(${Math.max(1, cols)}, minmax(0, 1fr))`;
+    containerEl.style.gridTemplateRows =
+      `repeat(${Math.max(1, rows)}, minmax(0, 1fr))`;
+    containerEl.style.alignItems = 'stretch';
+    containerEl.style.justifyItems = 'stretch';
+    for (const el of componentEls) {
+      if (!containerEl.contains(el)) containerEl.appendChild(el);
+      el.style.gridRow = 'auto';
+      el.style.gridColumn = 'auto';
+      el.style.alignSelf = 'stretch';
+      el.style.justifySelf = 'stretch';
+    }
+    return;
+  }
+
+  if (layout.type === 'java/awt/CardLayout') {
+    containerEl.style.display = 'block';
+    const current = obj._currentCard;
+    const components = obj._components || [];
+    for (const component of components) {
+      const el = getComponentElement(component);
+      if (!el) continue;
+      if (!containerEl.contains(el)) containerEl.appendChild(el);
+      const isActive = current == null || matchesCard(obj, component, current);
+      el.style.display = isActive ? 'block' : 'none';
+    }
+    return;
   }
 };
 
-const addComponent = (obj, component) => {
+const registerLayoutComponent = (jvm, obj, component, constraint) => {
+  const layout = obj._layout;
+  if (!layout || !layout.type) return;
+  const addWithObject = jvm._jreFindMethod(
+    layout.type,
+    'addLayoutComponent',
+    '(Ljava/awt/Component;Ljava/lang/Object;)V',
+  );
+  if (addWithObject) {
+    addWithObject(jvm, layout, [component, constraint]);
+    return;
+  }
+  const addWithName = jvm._jreFindMethod(
+    layout.type,
+    'addLayoutComponent',
+    '(Ljava/lang/String;Ljava/awt/Component;)V',
+  );
+  if (addWithName) addWithName(jvm, layout, [constraint, component]);
+};
+
+const addComponent = (jvm, obj, component, constraint = null) => {
   if (!component) return component;
   obj._components = obj._components || [];
   obj._components.push(component);
   component._parent = obj;
+  registerLayoutComponent(jvm, obj, component, constraint);
   const containerEl = ensureAwtElement(obj);
   const componentEl = getComponentElement(component);
   if (containerEl && componentEl && !containerEl.contains(componentEl)) {
@@ -164,7 +242,27 @@ module.exports = {
     
     'add(Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) => {
       const component = args[0];
-      return addComponent(obj, component);
+      return addComponent(jvm, obj, component);
+    },
+
+    // Legacy pre-1.1 API: add(String name, Component comp) — the name is the
+    // layout constraint (used by CardLayout for card names, BorderLayout regions).
+    'add(Ljava/lang/String;Ljava/awt/Component;)Ljava/awt/Component;': (jvm, obj, args) => {
+      const name = args[0];
+      const component = args[1];
+      if (component) {
+        component._layoutConstraint = normalizeConstraint(name);
+      }
+      return addComponent(jvm, obj, component, name);
+    },
+
+    'add(Ljava/lang/String;Ljava/awt/Component;)V': (jvm, obj, args) => {
+      const name = args[0];
+      const component = args[1];
+      if (component) {
+        component._layoutConstraint = normalizeConstraint(name);
+      }
+      addComponent(jvm, obj, component, name);
     },
 
     'add(Ljava/awt/Component;Ljava/lang/Object;)V': (jvm, obj, args) => {
@@ -173,7 +271,7 @@ module.exports = {
       if (component) {
         component._layoutConstraint = normalizeConstraint(constraint);
       }
-      addComponent(obj, component);
+      addComponent(jvm, obj, component, constraint);
     },
 
     'add(Ljava/awt/Component;Ljava/lang/Object;)Ljava/awt/Component;': (jvm, obj, args) => {
@@ -182,7 +280,7 @@ module.exports = {
       if (component) {
         component._layoutConstraint = normalizeConstraint(constraint);
       }
-      return addComponent(obj, component);
+      return addComponent(jvm, obj, component, constraint);
     },
     
     'remove(Ljava/awt/Component;)V': (jvm, obj, args) => {

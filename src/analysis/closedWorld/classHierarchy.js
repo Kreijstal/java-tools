@@ -125,6 +125,19 @@ class ClassHierarchy {
     if (caller && caller.superClassName === owner) return impl;
     return null;
   }
+
+  // Constructors are never inherited: invokespecial <init> binds to exactly
+  // the named owner's own constructor, from any caller, so resolution is an
+  // exact lookup with no superclass walk and no caller-shape restriction.
+  resolveInit(owner, descriptor) {
+    this.refresh();
+    const cls = this._classAst(owner);
+    if (!cls) return null;
+    const method = (cls.items || [])
+      .filter((i) => i.type === 'method').map((i) => i.method)
+      .find((m) => m.name === '<init>' && m.descriptor === descriptor);
+    return method ? { className: owner, method } : null;
+  }
 }
 
 module.exports = { ClassHierarchy };

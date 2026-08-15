@@ -36,7 +36,12 @@ class Stack {
 
   // Clear the stack
   clear() {
-    this.items = [];
+    // Generated JVM bodies cache this backing array in a scalar local. An
+    // exception can be dispatched re-entrantly while such a caller remains
+    // live (for example through a synchronous positional child). Preserve the
+    // array identity so clearing the JVM operand stack and pushing the caught
+    // exception are immediately visible to that generated caller.
+    this.items.length = 0;
   }
 }
 

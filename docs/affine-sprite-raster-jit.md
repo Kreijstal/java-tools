@@ -14,9 +14,10 @@ upload averaged about 0.95 ms per presented image. Long synchronous guest
 rendering intervals also prevented the guest audio producer from refilling its
 WebAudio queue, coupling low gameplay FPS to audible music gaps.
 
-## Optimization
+## Historical optimization
 
-`HandwrittenAffineSpriteRaster` replaces the verified guest body with one
+The historical `AffineSpriteRasterOracle` replaces the verified guest body
+only inside the differential benchmark with one
 positional JavaScript kernel:
 
 - Selection uses the complete descriptor, verified CFG and stack depths,
@@ -30,13 +31,83 @@ positional JavaScript kernel:
   their current values remain live.
 - A class/debugger guard and complete array/layout preflight run before the
   first destination write. Rejected entries execute the canonical JVM method.
-- `JVM_DISABLE_AFFINE_SPRITE_RASTER=1` or JIT option
-  `affineSpriteRaster: false` provides a same-bundle differential control.
 - Runtime counters expose successful runs and guarded fallbacks.
 
 The structured SSA caller feeds the 12 operands positionally, avoiding generic
 call dispatch, a child `Frame`, operand-stack materialization, and generator
 continuations inside the raster body.
+
+That implementation is now a benchmark-only differential oracle, not a
+production compiler tier. It lives in `scripts/oracles/` and the normal
+runtime derives the complete method from bytecode through
+`JvmSsaBlockRenderer`.
+The historical measurements below remain useful as the performance target and
+as evidence that this guest body mattered; they are not measurements of the
+current production selection policy.
+
+## Generic SSA replacement (2026-07-30)
+
+The exact original classfile was used to compare the current generated
+restoring-positional body against `AffineSpriteRasterOracle.runRaster`.
+The optimizer does not inspect the guest owner or member name. Four generic
+changes close part of the former gap:
+
+- scheduler coarsening is decided per natural loop, so calls in an outer row
+  loop no longer force a poll in a call-free inner pixel loop;
+- an affine destination index updated by a stable positive static stride gets
+  one versioned range guard, with the exceptional slow loop unchanged;
+- normal-flow write summaries exclude handler-only exception reporters, which
+  permits immutable argument fields and their primitive-array views to be
+  loaded once per generated entry; and
+- small integer helpers containing a guarded `putstatic`, division, and a
+  rethrow-only handler publish the generic restoring scalar ABI. The raster's
+  two division calls therefore execute without child `Frame` allocation or
+  generic dispatch.
+
+The checked-in benchmark discovers the audited bytecode shape structurally:
+
+```text
+node scripts/benchmarkSsaAffineSpriteKernel.js \
+  /path/to/original/classes
+```
+
+It runs an ABBA sequence for seven rounds, compares the complete destination
+checksum every round, and reports paired medians. On Node 26.4.0, 64×64,
+3,000 invocations per batch:
+
+| Generated layout | Generic SSA | Oracle | SSA/oracle |
+| --- | ---: | ---: | ---: |
+| Original classfile | 88,003 ns/invocation | 39,983 ns/invocation | 2.201× |
+| Recompiled classfile | 107,184 ns/invocation | 53,869 ns/invocation | 1.990× |
+
+The recompiled measurement uses the original audited shape only to construct
+the test data and oracle; the measured target is the 335-instruction
+decompile-plus-`javac` method. Both rows are bit exact. The generated original
+body reports two loops, four eager entry fields, and a runtime-versioned inner
+loop. The remaining roughly 2× gap was primarily the per-load exceptional
+bounds branches for computed sprite and mask coordinates. A later generic
+recurrence pass now proves the structurally common
+`(induction / invariant) * invariant + invariant` index range from its first
+and last values. It requires the quotient/product definitions to dominate the
+access and the recurrence update to execute on every natural-loop backedge
+after the access. Runtime guards reject null storage, division by zero,
+integer overflow, excessive trip counts, or either endpoint outside the
+array. The rejected arm is the unchanged checked loop.
+
+In the same optimization session, the original-class ABBA harness measured
+2.468× before this pass. Three clean post-change processes measured 1.969×,
+1.995×, and 2.020×, for a 1.995× median. This is a 19.2% reduction in the
+total ratio, or a 32.2% reduction in overhead above the oracle. Every process
+produced the exact same complete destination checksum. Absolute times varied
+with host load, so the paired ratios inside each ABBA process are
+authoritative.
+
+Before the entry-field and scalar-helper changes, the same original-classfile
+harness measured a 5.877× SSA/oracle ratio. The final authoritative paired run
+measured 2.201×, a 62.5% reduction in relative overhead while retaining exact
+JVM exception restoration. An immediately preceding run on a less-loaded host
+measured lower absolute times and a 2.440× paired ratio; absolute throughput is
+therefore not compared across those processes.
 
 ## Correctness
 

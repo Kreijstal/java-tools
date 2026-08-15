@@ -20,6 +20,9 @@ const {
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
 const {
+  instanceFieldTemplate, makeObjectRef, slabLayoutFor, makeSlabFields,
+} = require('../core/objectModel');
+const {
   normalizeArrayLoad,
   normalizeArrayStore,
 } = require('../instructions/utils');
@@ -51,7 +54,34 @@ function pushImportFor(reg, t) {
   }
 }
 
-function addArrayImports(reg, methodName) {
+function addTypedArrayStoreImports(reg, methodName) {
+  const checkedStore = (op, t, narrow) => {
+    reg.addImport(`aset_${op}`, [T.ref, T.i32, t], [], (a, i, v) => {
+      if (a === null || a === undefined) {
+        throw NPE(`Attempted store on null array in ${methodName}`);
+      }
+      const stored = narrow ? narrow(a, v) : v;
+      if (!monoArray.store(a, i, stored)) {
+        throw AIOOBE(i, monoArray.len(a));
+      }
+    });
+  };
+  // Wasm import signatures already coerce i32/i64/f32/f64 values to the
+  // exact primitive width. Only the three i32-backed narrow array kinds need
+  // additional work when the JVM array uses a plain JavaScript Array.
+  checkedStore('iastore', T.i32, null);
+  checkedStore('lastore', T.i64, null);
+  checkedStore('fastore', T.f32, null);
+  checkedStore('dastore', T.f64, null);
+  checkedStore('aastore', T.ref, null);
+  checkedStore('bastore', T.i32, (a, v) =>
+    a.type === '[Z' || a.elementType === 'boolean'
+      ? v & 1 : (v << 24) >> 24);
+  checkedStore('castore', T.i32, (_a, v) => v & 0xffff);
+  checkedStore('sastore', T.i32, (_a, v) => (v << 16) >> 16);
+}
+
+function addArrayImports(reg, methodName, typedArrayStores = true) {
   const mk = (suffix, t) => {
     // monoArray keeps each backing class (plain Array vs wasm-heap TypedArray
     // views) on its own monomorphic keyed IC — one shared `a[i]` site over
@@ -68,16 +98,21 @@ function addArrayImports(reg, methodName) {
         const value = monoArray.load(a, i);
         if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
         return t === T.ref ? value : toWasmValue(t, value);
-      };
+    };
     reg.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
-    reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-      if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${methodName}`);
-      if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
-        throw AIOOBE(i, monoArray.len(a));
-      }
-    });
+    if (!typedArrayStores) {
+      reg.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+        if (a === null || a === undefined) {
+          throw NPE(`Attempted store on null array in ${methodName}`);
+        }
+        if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+          throw AIOOBE(i, monoArray.len(a));
+        }
+      });
+    }
   };
   mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+  if (typedArrayStores) addTypedArrayStoreImports(reg, methodName);
   reg.addImport('alen', [T.ref], [T.i32], (a) => {
     if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${methodName}`);
     return monoArray.len(a);
@@ -142,15 +177,30 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
       throw { type: 'java/lang/NullPointerException', message: null };
     }
   };
+  const readInstance = (obj) => {
+    const key = resolveKey(obj);
+    if (obj.fields) return obj.fields[key];
+    return obj[key] ?? obj[fieldName];
+  };
+  const writeInstance = (obj, value) => {
+    const key = resolveKey(obj);
+    if (obj.fields) {
+      obj.fields[key] = value;
+    } else if (Object.prototype.hasOwnProperty.call(obj, key)) {
+      obj[key] = value;
+    } else {
+      obj[fieldName] = value;
+    }
+  };
   const getInstance = t === T.i32
     ? (obj) => {
       requireObj(obj);
-      const value = obj.fields[resolveKey(obj)];
+      const value = readInstance(obj);
       return typeof value === 'boolean' ? (value ? 1 : 0) : value;
     }
     : t === T.ref
-      ? (obj) => { requireObj(obj); return obj.fields[resolveKey(obj)]; }
-      : (obj) => { requireObj(obj); return toWasmValue(t, obj.fields[resolveKey(obj)]); };
+      ? (obj) => { requireObj(obj); return readInstance(obj); }
+      : (obj) => { requireObj(obj); return toWasmValue(t, readInstance(obj)); };
   return {
     t,
     name,
@@ -158,7 +208,7 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
       ? reg.addImport(name, [T.ref], [t], getInstance)
       : reg.addImport(name, [T.ref, t], [], (obj, v) => {
         requireObj(obj);
-        obj.fields[resolveKey(obj)] = v;
+        writeInstance(obj, v);
       }),
   };
 }
@@ -217,33 +267,13 @@ function addNewImport(reg, jvm, className) {
   }
   // Default field map precomputed once at compile time (the hierarchy above
   // an initialized class is loaded and immutable); each allocation clones it.
-  const template = {};
-  let currentClassName = className;
-  while (currentClassName) {
-    const cd = jvm.classes[currentClassName];
-    if (!cd || !cd.ast || !cd.ast.classes[0]) break;
-    for (const item of cd.ast.classes[0].items) {
-      if (item.type !== 'field') continue;
-      const d = item.field.descriptor;
-      let dv = null;
-      if (d === 'I' || d === 'B' || d === 'S' || d === 'Z' || d === 'C') dv = 0;
-      else if (d === 'J') dv = BigInt(0);
-      else if (d === 'F' || d === 'D') dv = 0.0;
-      template[`${currentClassName}.${item.field.name}`] = dv;
-    }
-    currentClassName = cd.ast.classes[0].superClassName;
-  }
+  const layout = slabLayoutFor(jvm, className);
+  const template = layout ? null : instanceFieldTemplate(jvm, className);
   const name = `new_${className}`.replace(/[^\w]/g, '_');
-  return reg.addImport(name, [], [T.ref], () => ({
-    type: className,
-    _className: className,
-    fields: { ...template },
-    hashCode: jvm.nextHashCode++,
-    isLocked: false,
-    lockOwner: null,
-    lockCount: 0,
-    waitSet: [],
-  }));
+  return reg.addImport(name, [], [T.ref], () => makeObjectRef(jvm, className,
+    layout
+      ? (makeSlabFields(jvm, layout) || instanceFieldTemplate(jvm, className))
+      : { ...template }));
 }
 
 // System time natives — like Math intrinsics they can never be compiled (JS
@@ -265,6 +295,7 @@ module.exports = {
   addRuntimeImports,
   pushImportFor,
   addArrayImports,
+  addTypedArrayStoreImports,
   addFieldImport,
   addMathImport,
   addTimeImport,

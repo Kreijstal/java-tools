@@ -156,6 +156,7 @@ function presentationStats(jvm) {
       blitCopyMs: 0,
       wasmSwizzles: 0,
       jsSwizzles: 0,
+      presentationFallbacks: 0,
     };
   }
   return jvm._awtPresentationStats;
@@ -239,11 +240,29 @@ function markSoftSurfaceDirty(jvm, comp) {
     return;
   }
   comp._presentScheduled = true;
+  const presentationToken = (comp._presentToken || 0) + 1;
+  comp._presentToken = presentationToken;
   if (stats) stats.scheduled += 1;
-  requestAnimationFrame(() => {
+  let fallbackTimer = null;
+  const present = (fallback) => {
+    if (!comp._presentScheduled || comp._presentToken !== presentationToken) {
+      return;
+    }
     comp._presentScheduled = false;
+    if (fallbackTimer !== null) clearTimeout(fallbackTimer);
+    if (fallback && stats) stats.presentationFallbacks += 1;
     presentSoftSurface(jvm, comp);
-  });
+  };
+  requestAnimationFrame(() => present(false));
+  // Firefox can indefinitely defer requestAnimationFrame while a JVM keeps a
+  // MessageChannel queue continuously runnable. Never leave the coalescing
+  // latch stuck in that state: a timer task publishes the latest completed
+  // surface if the next animation opportunity does not arrive promptly.
+  if (typeof setTimeout === 'function') {
+    const yieldMs = Math.max(1, Number(jvm && jvm.eventLoopYieldMs) || 16);
+    const fallbackMs = Math.max(17, Math.min(33, yieldMs + 4));
+    fallbackTimer = setTimeout(() => present(true), fallbackMs);
+  }
 }
 
 function colorToRgb(colorObj) {
@@ -325,6 +344,13 @@ module.exports = {
       const graphicsContext = obj._awtGraphics;
       if (graphicsContext && graphicsContext.fillOval) {
         graphicsContext.fillOval(args[0], args[1], args[2], args[3]);
+      }
+    },
+
+    'fillArc(IIIIII)V': (jvm, obj, args) => {
+      const graphicsContext = obj._awtGraphics;
+      if (graphicsContext && graphicsContext.fillArc) {
+        graphicsContext.fillArc(args[0], args[1], args[2], args[3], args[4], args[5]);
       }
     },
 

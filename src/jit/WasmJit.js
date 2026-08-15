@@ -65,7 +65,7 @@
 const { resolveInstanceFieldKey, runtimeClassName } = require('../instructions/object');
 const {
   addMathImport, addTimeImport, addNewArrayImport, addANewArrayImport,
-  addNewImport,
+  addNewImport, addTypedArrayStoreImports,
 } = require('./wasmRuntimeImports');
 const { ClassHierarchy } = require('../analysis/closedWorld/classHierarchy');
 const { revalidateSpeculations } = require('./wasmInline');
@@ -82,6 +82,7 @@ const {
   isGuestThrow,
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges,
+  retvGlobalEntry, runvWrapperBody, specokGlobalEntry,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
 const {
@@ -91,14 +92,20 @@ const {
 const { expandWideInstruction } = require('../instructions');
 
 const EMPTY_WRITE_SET = new Set();
+const capturesBooleanStaticCache = new WeakMap();
 
 function capturesBooleanStatic(method) {
+  if (method && capturesBooleanStaticCache.has(method)) {
+    return capturesBooleanStaticCache.get(method);
+  }
   const code = method && method.attributes &&
     method.attributes.find((attribute) => attribute.type === 'code');
   const items = code && code.code && code.code.codeItems;
   const localIndex = (instruction, op, prefix) => {
-    const compact = op.match(new RegExp(`^${prefix}_([0-3])$`));
-    if (compact) return Number(compact[1]);
+    if (op.length === prefix.length + 2 && op.startsWith(`${prefix}_`)) {
+      const compact = op.charCodeAt(op.length - 1) - 48;
+      if (compact >= 0 && compact <= 3) return compact;
+    }
     if (op !== prefix) return null;
     const value = instruction && typeof instruction === 'object'
       ? instruction.varnum ?? instruction.arg
@@ -106,7 +113,7 @@ function capturesBooleanStatic(method) {
     const numeric = Number(value);
     return Number.isInteger(numeric) ? numeric : null;
   };
-  return Boolean(items && items.some((item, index) => {
+  const result = Boolean(items && items.some((item, index) => {
     const instruction = item && item.instruction;
     if (!(getOp(instruction) === 'getstatic' &&
       Array.isArray(instruction.arg) &&
@@ -133,6 +140,8 @@ function capturesBooleanStatic(method) {
     }
     return false;
   }));
+  if (method) capturesBooleanStaticCache.set(method, result);
+  return result;
 }
 
 
@@ -241,14 +250,21 @@ class MethodTranslator {
           return t === T.ref ? value : toWasmValue(t, value);
         };
       self.addImport(`aget_${suffix}`, [T.ref, T.i32], [t], load);
-      self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
-        if (a === null || a === undefined) throw NPE(`Attempted store on null array in ${name}`);
-        if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
-          throw AIOOBE(i, monoArray.len(a));
-        }
-      });
+      if (!self.wasmJit.typedArrayStoresEnabled) {
+        self.addImport(`aset_${suffix}`, [T.ref, T.i32, t], [], (a, i, v) => {
+          if (a === null || a === undefined) {
+            throw NPE(`Attempted store on null array in ${name}`);
+          }
+          if (!monoArray.store(a, i, normalizeArrayStore(v, null, a))) {
+            throw AIOOBE(i, monoArray.len(a));
+          }
+        });
+      }
     };
     mk('i', T.i32); mk('l', T.i64); mk('f', T.f32); mk('d', T.f64); mk('r', T.ref);
+    if (self.wasmJit.typedArrayStoresEnabled) {
+      addTypedArrayStoreImports(self, name);
+    }
     self.addImport('alen', [T.ref], [T.i32], (a) => {
       if (a === null || a === undefined) throw NPE(`Attempted to get length of null array in ${name}`);
       return monoArray.len(a);
@@ -463,7 +479,10 @@ class MethodTranslator {
         if (obj === null || obj === undefined) {
           throw { type: 'java/lang/NullPointerException', message: null };
         }
-        const value = obj.fields[resolveKey(obj)];
+        const key = resolveKey(obj);
+        const value = obj.fields
+          ? obj.fields[key]
+          : (obj[key] ?? obj[fieldName]);
         return typeof value === 'boolean' ? (value ? 1 : 0) : value;
       }
       : t === T.ref
@@ -471,13 +490,16 @@ class MethodTranslator {
           if (obj === null || obj === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
-          return obj.fields[resolveKey(obj)];
+          const key = resolveKey(obj);
+          return obj.fields ? obj.fields[key] : (obj[key] ?? obj[fieldName]);
         }
         : (obj) => {
           if (obj === null || obj === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
-          return toWasmValue(t, obj.fields[resolveKey(obj)]);
+          const key = resolveKey(obj);
+          return toWasmValue(t,
+            obj.fields ? obj.fields[key] : (obj[key] ?? obj[fieldName]));
         };
     return {
       t,
@@ -488,7 +510,10 @@ class MethodTranslator {
           if (obj === null || obj === undefined) {
             throw { type: 'java/lang/NullPointerException', message: null };
           }
-          obj.fields[resolveKey(obj)] = v;
+          const key = resolveKey(obj);
+          if (obj.fields) obj.fields[key] = v;
+          else if (Object.prototype.hasOwnProperty.call(obj, key)) obj[key] = v;
+          else obj[fieldName] = v;
         }),
     };
   }
@@ -528,6 +553,40 @@ class MethodTranslator {
     const partial = !calleeMeta.fullyCompiled || calleeMeta.deoptableCalls > 0;
     if (partial && calleeSt.linkVetoed) {
       throw new Unsupported(`partial callee ${className}.${name} vetoed`);
+    }
+    // Direct wasm->wasm link: a fully-compiled callee with the identity
+    // slot->argument mapping is called through its runv export — the wasm
+    // engine calls the imported wasm function directly, with no JS bridge,
+    // argument marshalling, or frame bookkeeping on the path. The link pins
+    // this instance exactly like the non-partial bridge's pinned fallback; a
+    // caller recompile refreshes it. The status word is checked in wasm and
+    // traps on the (never-observed) nested exit that the bridge would have
+    // turned into an Error.
+    // An EH caller records what each import threw (box.lastThrown) so its
+    // catch_all can classify exceptions; a raw wasm import would bypass the
+    // recorder, so EH methods keep the JS bridge.
+    if (!partial && this.wasmJit && this.wasmJit.directStaticLinkEnabled &&
+        calleeMeta.runv && !this.ehMethod) {
+      const identity = calleeMeta.paramSlots.length === params.length &&
+        calleeMeta.paramSlots.every((p, i) => {
+          let slot = 0;
+          for (let k = 0; k < i; k++) slot += (params[k] === 'J' || params[k] === 'D') ? 2 : 1;
+          return p.slot === slot && p.t === descToWasm(params[i]);
+        });
+      if (identity) {
+        const key = `${className}.${name}${descriptor}`;
+        const importName = `dcall_${key}`.replace(/[^\w]/g, '_');
+        const wParams = params.map(descToWasm);
+        const wResults = ret === 'V' ? [T.i32] : [T.i32, descToWasm(ret)];
+        return {
+          argTypes: wParams,
+          underTypes: [],
+          partial: false,
+          direct: true,
+          retType: ret === 'V' ? null : descToWasm(ret),
+          idx: this.addImport(importName, wParams, wResults, calleeMeta.runv),
+        };
+      }
     }
     // A deopt resumes the caller interpreted just after the invoke; values
     // under the arguments ride through the import so the deopt path can
@@ -653,7 +712,11 @@ class MethodTranslator {
   // spills its typed slots before every instance call.
   compiledInstanceCallee(ins, itemIndex, underTypes, op) {
     const [, owner, [name, descriptor]] = ins.arg;
-    if (name === '<init>' || name === '<clinit>') {
+    // invokespecial <init> is statically bound to exactly the named owner's
+    // constructor; it is linkable when that constructor compiles fully, so
+    // the linked call runs all-or-nothing (completes or throws) exactly like
+    // native construction. Partial exits mid-<init> stay excluded below.
+    if (name === '<clinit>' || (name === '<init>' && op !== 'invokespecial')) {
       throw new Unsupported(`${op} ${owner}.${name}`);
     }
     const { params, ret } = parseMethodDescriptor(descriptor);
@@ -668,6 +731,7 @@ class MethodTranslator {
     // statically-bound target for every receiver
     let dispatch = null;
     let direct = null;
+    let resolvedCone = null;
     const readyOrThrow = (implClassName) => {
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
       if (!st) throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`);
@@ -677,11 +741,22 @@ class MethodTranslator {
       return st;
     };
     if (op === 'invokespecial') {
-      const impl = hierarchy.resolveSpecial(this.className, owner, name, descriptor);
+      const impl = name === '<init>'
+        ? hierarchy.resolveInit(owner, descriptor)
+        : hierarchy.resolveSpecial(this.className, owner, name, descriptor);
       if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
       direct = readyOrThrow(impl.className);
+      if (name === '<init>') {
+        // all-or-nothing: a constructor target must be unable to hand the
+        // call back mid-body — it either completes or throws
+        const m = (direct.callee || direct).meta;
+        if (!m.fullyCompiled || m.deoptableCalls || m.usedEh) {
+          throw new Unsupported(`<init> ${owner} target not fully compiled`);
+        }
+      }
     } else {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
+      resolvedCone = resolved;
       if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
       if (resolved.impls.size > 4) throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
       // Impls that cannot be linked (never-compiling entry, EH module,
@@ -768,6 +843,11 @@ class MethodTranslator {
             if (stats) stats.lateTargets += 1;
           }
         }
+      }
+      // A captured guard-elided module must re-check its baked class world
+      // before running; invalidation drops to the deopt path below.
+      if (calleeSt && !this.wasmJit.revalidateNestedCallee(calleeSt)) {
+        calleeSt = null;
       }
       if (!calleeSt) {
         // A new target that is unavailable or has writes not covered by the
@@ -870,6 +950,91 @@ class MethodTranslator {
       }
       return meta.box.ret;
     };
+    // Direct wasm->wasm fast path for the single-ready-target shape. The
+    // generic import above stays as the complete slow path — null receivers,
+    // unmatched classes, and late targets all fall back to it — so dispatch
+    // soundness is unchanged. The fast path adds only the never-exits
+    // invariant already accepted for static links: a fuel exit of a
+    // fully-compiled callee becomes a wasm trap on this already-fatal path.
+    let directLink = null;
+    if (this.wasmJit.directInstanceLinkEnabled && !this.ehMethod) {
+      const targets = direct ? [direct] : [...new Set(dispatch.values())];
+      const st = targets.length === 1 ? targets[0] : null;
+      const calleeMod = st && (st.callee || st);
+      const calleeMeta = calleeMod && calleeMod.meta;
+      // A guard-elided speculative callee can be raw-linked only through the
+      // class-set guard: directClasses is a closed set verified against the
+      // callee's baked picks at link time (revalidate now), and any class
+      // loaded later misses the guard into the generic path. invokespecial's
+      // bare null check admits future receiver classes, so it keeps the
+      // bridge for speculative callees.
+      const speculative = calleeMeta &&
+        calleeMeta.specSites && calleeMeta.specSites.length > 0;
+      const eligible = calleeMeta && calleeMeta.fullyCompiled &&
+        !calleeMeta.usedEh && !(calleeMeta.deoptableCalls > 0) &&
+        calleeMeta.runv && !st.linkVetoed &&
+        (!speculative ||
+          (!direct && this.wasmJit.revalidateNestedCallee(st)));
+      let identity = false;
+      if (eligible) {
+        const expected = [{slot: 0, t: T.ref}];
+        let expectedSlot = 1;
+        for (const p of params) {
+          expected.push({slot: expectedSlot, t: descToWasm(p)});
+          expectedSlot += (p === 'J' || p === 'D') ? 2 : 1;
+        }
+        identity = calleeMeta.paramSlots.length === expected.length &&
+          calleeMeta.paramSlots.every((p, i) => p.slot === expected[i].slot &&
+            p.t === expected[i].t);
+      }
+      if (identity) {
+        const directIdx = this.addImport(
+          `dcall_${key}_${itemIndex}`.replace(/[^\w]/g, '_'),
+          [T.ref, ...params.map(descToWasm)],
+          ret === 'V' ? [T.i32] : [T.i32, descToWasm(ret)],
+          calleeMeta.runv);
+        let guardIdx;
+        let specMono = false;
+        if (!direct) {
+          // A COMPLETE monomorphic cone needs no receiver-class guard at
+          // all: every loaded receiver was verified to dispatch to the
+          // single impl, the caller records the speculation, and the
+          // in-wasm specok flag (zeroed synchronously on every class load,
+          // re-armed by entry revalidation) closes the mid-run-load hole.
+          // Only a null check remains on the fast path.
+          if (resolvedCone && resolvedCone.complete &&
+              resolvedCone.impls.size === 1) {
+            specMono = true;
+            const implClassName =
+              [...resolvedCone.impls.values()][0].className;
+            if (!this.specSites) this.specSites = [];
+            this.specSites.push({
+              owner, name, descriptor, guards: [implClassName],
+            });
+            this.usesSpecok = true;
+          } else {
+            // Every runtime class known to dispatch to the linked target
+            // passes the guard; later-loaded classes fail it and take the
+            // generic import's late-target/miss protocol.
+            const directClasses = new Set();
+            for (const [runtimeClass, targetSt] of dispatch) {
+              if (targetSt === st) directClasses.add(runtimeClass);
+            }
+            guardIdx = this.addImport(
+              `dguard_${key}_${itemIndex}`.replace(/[^\w]/g, '_'),
+              [T.ref], [T.i32],
+              (r) => (r !== null && r !== undefined &&
+                directClasses.has(runtimeClassName(r))) ? 1 : 0);
+          }
+        }
+        directLink = {
+          directIdx, guardIdx, specMono,
+          specokIdx: this.desc.ret === 'V' ? 0 : 1,
+          retType: ret === 'V' ? null : descToWasm(ret),
+        };
+        this.directLinks = (this.directLinks || 0) + 1;
+      }
+    }
     // Resume pc and the patchable dispatch map live in one import per site.
     this.instanceSites = (this.instanceSites || 0) + 1;
     const importName = `vcall_${key}_${itemIndex}`.replace(/[^\w]/g, '_');
@@ -879,6 +1044,7 @@ class MethodTranslator {
       writes,
       leadGets: callerSlots.map((s) => this.localOfSlot.get(s)),
       idx: this.addImport(importName, wParams, results, fn),
+      directLink,
     };
   }
 
@@ -1395,6 +1561,53 @@ class MethodTranslator {
     return seq;
   }
 
+  // Guarded direct wasm->wasm instance call. Receiver and arguments are
+  // stashed once; a matching receiver calls the callee's runv import with no
+  // JS on the path, everything else rebuilds the generic dispatch import's
+  // exact operand layout. Stack shape afterwards matches callSeqWithUnders:
+  // [unders..., result?].
+  directInstanceCallSeq(bound) {
+    const { argTypes, underTypes, leadGets, directLink } = bound;
+    const seq = [];
+    const argScr = argTypes.map((t) => this.scratch(t));
+    for (let i = argTypes.length - 1; i >= 0; i--) seq.push(OP.local_set, ...uleb(argScr[i]));
+    const undScr = underTypes.map((t) => this.scratch(t));
+    for (let j = underTypes.length - 1; j >= 0; j--) seq.push(OP.local_set, ...uleb(undScr[j]));
+    for (let j = 0; j < underTypes.length; j++) seq.push(OP.local_get, ...uleb(undScr[j]));
+    if (directLink.guardIdx !== undefined) {
+      seq.push(OP.local_get, ...uleb(argScr[0]), OP.call, ...uleb(directLink.guardIdx));
+    } else {
+      // invokespecial is statically bound: the only guard is non-null.
+      // Speculative monomorphic links add the in-wasm specok flag (zeroed
+      // on every class load, re-armed by entry revalidation) — no JS on
+      // the guard path.
+      seq.push(OP.local_get, ...uleb(argScr[0]), OP.ref_is_null, OP.i32_eqz);
+      if (directLink.specMono) {
+        seq.push(OP.global_get, ...uleb(directLink.specokIdx), OP.i32_and);
+      }
+    }
+    seq.push(OP.if, directLink.retType === null ? 0x40 : directLink.retType);
+    for (let i = 0; i < argScr.length; i++) seq.push(OP.local_get, ...uleb(argScr[i]));
+    seq.push(OP.call, ...uleb(directLink.directIdx));
+    if (directLink.retType !== null) {
+      const sv = this.scratch(directLink.retType);
+      seq.push(OP.local_set, ...uleb(sv));
+      seq.push(OP.i32_const, ...sleb(-1), OP.i32_ne,
+        OP.if, 0x40, OP.unreachable, OP.end);
+      seq.push(OP.local_get, ...uleb(sv));
+    } else {
+      seq.push(OP.i32_const, ...sleb(-1), OP.i32_ne,
+        OP.if, 0x40, OP.unreachable, OP.end);
+    }
+    seq.push(OP.else);
+    for (const l of leadGets) seq.push(OP.local_get, ...uleb(l));
+    for (let j = 0; j < underTypes.length; j++) seq.push(OP.local_get, ...uleb(undScr[j]));
+    for (let i = 0; i < argScr.length; i++) seq.push(OP.local_get, ...uleb(argScr[i]));
+    seq.push(OP.call, ...uleb(bound.idx));
+    seq.push(OP.end);
+    return seq;
+  }
+
   spillSeq() {
     if (!this.paramSlots.length) return [];
     // One import call spilling every typed slot at once: exit stubs are
@@ -1632,7 +1845,9 @@ class MethodTranslator {
       } else if (op in ARRAY_STORE) {
         const t = ARRAY_STORE[op];
         pop(); pop(T.i32); pop(T.ref);
-        emit(OP.call, ...uleb(this.importIndexByName.get(`aset_${sig(t)}`)));
+        const storeImport = this.wasmJit.typedArrayStoresEnabled
+          ? `aset_${op}` : `aset_${sig(t)}`;
+        emit(OP.call, ...uleb(this.importIndexByName.get(storeImport)));
       } else if (op === 'arraylength') {
         pop(T.ref);
         emit(OP.call, ...uleb(this.importIndexByName.get('alen')));
@@ -1718,6 +1933,20 @@ class MethodTranslator {
           emit(...this.callSeqWithUnders(bound.idx, boundArgTypes, boundUnders));
         } else {
           emit(OP.call, ...uleb(bound.idx));
+          if (bound.direct) {
+            // runv returned [status, value]; verify the never-exits
+            // invariant in wasm and leave only the value on the stack.
+            if (bound.retType) {
+              const sv = this.scratch(bound.retType);
+              emit(OP.local_set, ...uleb(sv));
+              emit(OP.i32_const, ...sleb(-1), OP.i32_ne,
+                OP.if, 0x40, OP.unreachable, OP.end);
+              emit(OP.local_get, ...uleb(sv));
+            } else {
+              emit(OP.i32_const, ...sleb(-1), OP.i32_ne,
+                OP.if, 0x40, OP.unreachable, OP.end);
+            }
+          }
         }
         // kill only the field caches the callee may transitively write; an
         // unknowable callee (null summary) may put any field or static
@@ -1725,6 +1954,13 @@ class MethodTranslator {
         else if (writes.size) emit(...this.killSeqWhere((entry) => writes.has(entry.killKey)));
         const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
         if (retC !== 'V') push(descToWasm(retC));
+      } else if (op === 'invokespecial' && ins.arg[1] === 'java/lang/Object' &&
+          ins.arg[2][0] === '<init>' && ins.arg[2][1] === '()V') {
+        // java/lang/Object.<init> is empty (a no-op JRE stub here); the
+        // receiver of a super()/new Object() call is never null
+        if (!stack.length) throw new Unsupported('invokespecial underflow');
+        pop();
+        emit(OP.drop);
       } else if (op === 'invokevirtual' || op === 'invokeinterface' || op === 'invokespecial') {
         const argCount = parseMethodDescriptor(ins.arg[2][1]).params.length + 1;
         if (stack.length < argCount) throw new Unsupported(`${op} stack underflow`);
@@ -1733,8 +1969,12 @@ class MethodTranslator {
         // every instance site can deopt (map miss or partial target); the
         // caller's typed slots ride as leading import params and reach
         // frame.locals only on the deopt paths
-        emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes,
-          bound.leadGets));
+        if (bound.directLink) {
+          emit(...this.directInstanceCallSeq(bound));
+        } else {
+          emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes,
+            bound.leadGets));
+        }
         if (bound.writes === null) emit(...this.killSeqWhere(() => true));
         else if (bound.writes.size) {
           emit(...this.killSeqWhere((entry) => bound.writes.has(entry.killKey)));
@@ -1815,19 +2055,18 @@ class MethodTranslator {
       } else if (op === 'goto' || op === 'goto_w') {
         jump(this.blockOfTarget(this.targetOf(ins)), 0);
         return code; // block terminated
-      } else if (op === 'ireturn' || op === 'freturn') {
+      } else if (op === 'ireturn' || op === 'freturn' || op === 'lreturn' ||
+          op === 'dreturn' || op === 'areturn') {
+        // The value leaves twice: through the exported retv global for
+        // direct wasm->wasm callers (global.get is one instruction there),
+        // and through the ret_* import for JS entries (the import call is
+        // cheaper than a JS-side WebAssembly.Global.value read).
+        const retImport = op === 'ireturn' ? 'ret_i' : op === 'freturn' ? 'ret_f'
+          : op === 'lreturn' ? 'ret_l' : op === 'dreturn' ? 'ret_d' : 'ret_r';
         pop();
-        emit(OP.call, ...uleb(this.importIndexByName.get(op === 'ireturn' ? 'ret_i' : 'ret_f')));
-        emit(OP.i32_const, ...sleb(-1), OP.return);
-        return code;
-      } else if (op === 'lreturn' || op === 'dreturn') {
-        pop();
-        emit(OP.call, ...uleb(this.importIndexByName.get(op === 'lreturn' ? 'ret_l' : 'ret_d')));
-        emit(OP.i32_const, ...sleb(-1), OP.return);
-        return code;
-      } else if (op === 'areturn') {
-        pop();
-        emit(OP.call, ...uleb(this.importIndexByName.get('ret_r')));
+        emit(OP.global_set, ...uleb(0));
+        emit(OP.global_get, ...uleb(0));
+        emit(OP.call, ...uleb(this.importIndexByName.get(retImport)));
         emit(OP.i32_const, ...sleb(-1), OP.return);
         return code;
       } else if (op === 'return') {
@@ -1898,14 +2137,37 @@ class MethodTranslator {
     const exportName = [...'run'].map((c) => c.charCodeAt(0));
     const profilerNameSection = wasmFunctionNameSection(
       mainIdx, wasmProfilerName(this.className, this.method));
+    const retvType = this.desc.ret === 'V' ? null : descToWasm(this.desc.ret);
+    const globalEntries = [
+      ...(retvType ? [retvGlobalEntry(retvType)] : []),
+      ...(this.usesSpecok ? [specokGlobalEntry()] : []),
+    ];
+    const globalSection = globalEntries.length
+      ? section(6, [globalEntries.length, ...globalEntries.flat()]) : [];
+    const retvName = [...'retv'].map((c) => c.charCodeAt(0));
+    const specokName = [...'specok'].map((c) => c.charCodeAt(0));
+    const paramOnly = mainParams.slice(0, mainParams.length - 2);
+    const runvType = internType(paramOnly, retvType ? [T.i32, retvType] : [T.i32]);
+    const runvBody = runvWrapperBody(paramOnly.length, mainIdx, retvType);
+    const runvName = [...'runv'].map((c) => c.charCodeAt(0));
+    const exportEntries = [
+      [exportName.length, ...exportName, 0x00, ...uleb(mainIdx)],
+      [runvName.length, ...runvName, 0x00, ...uleb(mainIdx + 1)],
+      ...(retvType ? [[retvName.length, ...retvName, 0x03, 0]] : []),
+      ...(this.usesSpecok
+        ? [[specokName.length, ...specokName, 0x03, ...uleb(retvType ? 1 : 0)]]
+        : []),
+    ];
 
     const bytes = Uint8Array.from([
       0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
       ...section(1, vec(types)),
       ...section(2, vec(importEntries)),
-      ...section(3, [1, ...uleb(mainType)]),
-      ...section(7, [1, exportName.length, ...exportName, 0x00, ...uleb(mainIdx)]),
-      ...section(10, [1, ...uleb(funcBody.length), ...funcBody]),
+      ...section(3, [2, ...uleb(mainType), ...uleb(runvType)]),
+      ...globalSection,
+      ...section(7, vec(exportEntries)),
+      ...section(10, [2, ...uleb(funcBody.length), ...funcBody,
+        ...uleb(runvBody.length), ...runvBody]),
       ...profilerNameSection,
     ]);
 
@@ -1928,6 +2190,12 @@ class MethodTranslator {
       // partial target), so callers must give this module a real frame and
       // the NestedDeopt protocol even when it is fully compiled
       deoptableCalls: this.instanceSites || 0,
+      directLinks: this.directLinks || 0,
+      // Speculative monomorphic direct links bake the compile-time cone;
+      // prepare()'s gate revalidates these on entry and re-arms specok.
+      specSites: this.specSites || [],
+      speculations: 0,
+      specEpoch: this.jvm.classEpoch || 0,
       boxedCount: this.boxedSlots.size,
       // EH modules return -3 with the spill aimed at the top frame — never
       // link them as nested callees (every link path checks this flag)
@@ -1948,13 +2216,26 @@ class WasmJit {
     this.enabled = (env.JVM_WASM_JIT === '1' || browserDefault) && typeof WebAssembly !== 'undefined' &&
       !env.JVM_TRACE && env.JVM_PROFILE_HOT_METHODS !== '1';
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
+    this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
+    this.traceExitsOnly = env.JVM_TRACE_WASM_EXITS_ONLY === '1';
     this.fieldCacheEnabled = env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
+    this.typedArrayStoresEnabled =
+      env.JVM_DISABLE_WASM_TYPED_ARRAY_STORES !== '1';
     // Loop-bearing methods compile on first sight: warmup by invocation count
     // never fires for methods invoked once with a multi-minute loop (va.d).
     this.warmupThreshold = Number(env.JVM_WASM_JIT_WARMUP || 1);
     this.retryBackoffMax = Math.max(1, Number(env.JVM_WASM_JIT_RETRY_BACKOFF_MAX || 4096));
     this.structuredEnabled = env.JVM_WASM_STRUCTURED === '1';
     this.instanceLinkEnabled = env.JVM_WASM_DEVIRT !== '0';
+    // Direct wasm->wasm static links: eligible fully-compiled callees are
+    // called through their runv export with no JS bridge on the path.
+    this.directStaticLinkEnabled = env.JVM_WASM_DIRECT_STATIC_LINK === '1';
+    // Direct wasm->wasm instance links: a monomorphic-in-practice site calls
+    // its single ready fully-compiled target through runv behind an in-wasm
+    // null check (invokespecial) or a one-import receiver-class guard
+    // (invokevirtual/invokeinterface); every other receiver falls back to
+    // the generic dispatch import.
+    this.directInstanceLinkEnabled = env.JVM_WASM_DIRECT_INSTANCE_LINK === '1';
     this.lateInstanceTargetsEnabled = env.JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS !== '1';
     this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
     this.hierarchy = new ClassHierarchy(jvm);
@@ -1979,6 +2260,14 @@ class WasmJit {
     this.lateInstanceTargetInstalls = 0;
     this.lateInstanceTargetWriteRejects = 0;
     this.lateInstanceTargetNotReady = 0;
+    // Exported "specok" globals of live modules with speculative monomorphic
+    // links; zeroed synchronously on every class registration so mid-run
+    // receivers of new classes fall to the generic path.
+    this.specokGlobals = [];
+  }
+
+  onClassEpochBump() {
+    for (const g of this.specokGlobals) g.value = 0;
   }
 
   methodState(frame) {
@@ -2008,6 +2297,8 @@ class WasmJit {
       const dependencyChanged = st.deferredEpoch !== undefined &&
         st.deferredEpoch !== this.compileEpoch;
       const threshold = dependencyChanged ? 1 : (st.retryAfter || this.warmupThreshold);
+      // hasBackwardBranch is eligibility-aware and already excludes
+      // opaque-control methods; see the note on it in JitCompiler.
       if (st.entries < threshold || !this.jit.hasBackwardBranch(frame.method)) {
         return null;
       }
@@ -2016,18 +2307,20 @@ class WasmJit {
     }
     if (st.status !== 'ready') return null;
 
-    // Speculative modules (CHA instanceof guards from inlined instance calls)
-    // bake the compile-time world. They are excluded from every linking path
-    // (findReadyStatic/findReadyInstance), so this pre-entry check is the
-    // single gate: when the class world grew, re-run the plan-time site
-    // checks; the module survives when every speculated cone is unchanged
-    // (the common case — most loads are unrelated) and is dropped for a
-    // recompile only when one actually grew.
-    if (st.meta && st.meta.speculations &&
-        st.meta.specEpoch !== (this.jvm.classEpoch || 0)) {
-      if (st.meta.specSites &&
-          revalidateSpeculations(this.jvm, this.hierarchy, st.meta.specSites)) {
-        st.meta.specEpoch = this.jvm.classEpoch || 0;
+    // Speculative modules (CHA-based inlined instance calls — instanceof
+    // guards, guard-elided `this` sites, or speculative monomorphic direct
+    // links) bake the compile-time world. They are excluded from every
+    // static linking path, so this pre-entry check is the gate: when the
+    // class world grew, re-run the plan-time site checks; the module
+    // survives when every speculated cone is unchanged (the common case —
+    // most loads are unrelated), re-arming its in-wasm specok flag, and is
+    // dropped for a recompile only when one actually grew.
+    for (const m of [st.meta, st.osr && st.osr.meta]) {
+      if (!(m && m.specSites && m.specSites.length &&
+          m.specEpoch !== (this.jvm.classEpoch || 0))) continue;
+      if (revalidateSpeculations(this.jvm, this.hierarchy, m.specSites)) {
+        m.specEpoch = this.jvm.classEpoch || 0;
+        if (m.specok) m.specok.value = 1;
       } else {
         st.status = 'cold';
         st.entries = 0;
@@ -2131,14 +2424,30 @@ class WasmJit {
           (linkable(meta) || !linkable(structuredMeta))) {
         structuredMeta = null;
       }
-      const primary = structuredMeta || meta;
       // A partial module can leave and later resume with locals captured
       // before its first compiled block. Until boolean-static values have a
-      // verifier-backed spill proof across every unsupported edge, keep this
-      // uncommon shape in the generated/interpreted tiers. Treating a lost
-      // opaque-predicate local as true can skip arbitrary guest side effects.
-      if (!primary.fullyCompiled && capturesBooleanStatic(frame.method)) {
+      // verifier-backed spill proof across every unsupported edge, keep that
+      // shape out of wasm: treating a lost opaque-predicate local as true can
+      // skip arbitrary guest side effects. BOTH modules are checked, not just
+      // the primary one — the dispatcher module stays reachable through OSR
+      // entry even when the structured module is complete, so a partial
+      // dispatcher carries the same hazard.
+      if (capturesBooleanStatic(frame.method) &&
+          ((meta && !meta.fullyCompiled) ||
+            (structuredMeta && !structuredMeta.fullyCompiled))) {
         throw new Unsupported('partial module captures a boolean static');
+      }
+      const primary = structuredMeta || meta;
+      // A partial module may stop after consuming a reference-producing call
+      // or immediately before object construction, then resume through the
+      // canonical scheduler. Until every such edge carries a verifier-backed
+      // reference return slot, do not let it publish a successful non-void
+      // completion to an already-resumed caller. Primitive and void kernels
+      // retain partial Wasm, as do reference-returning methods whose complete
+      // normal flow stays inside one module.
+      if (!primary.fullyCompiled &&
+          (primary.retChar === 'L' || primary.retChar === '[')) {
+        throw new Unsupported('partial module has a reference return');
       }
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
@@ -2171,10 +2480,19 @@ class WasmJit {
       const instance = new WebAssembly.Instance(module, primary.importObject);
       st.meta = primary;
       st.run = instance.exports.run;
+      primary.retv = instance.exports.retv || null;
+      primary.runv = instance.exports.runv || null;
+      primary.specok = instance.exports.specok || null;
+      if (primary.specok) this.specokGlobals.push(primary.specok);
       if (structuredMeta && meta) {
         validatingBytes = meta.bytes;
         const osrModule = new WebAssembly.Module(meta.bytes);
-        st.osr = { meta, run: new WebAssembly.Instance(osrModule, meta.importObject).exports.run };
+        const osrInstance = new WebAssembly.Instance(osrModule, meta.importObject);
+        meta.retv = osrInstance.exports.retv || null;
+        meta.runv = osrInstance.exports.runv || null;
+        meta.specok = osrInstance.exports.specok || null;
+        if (meta.specok) this.specokGlobals.push(meta.specok);
+        st.osr = { meta, run: osrInstance.exports.run };
       } else {
         st.osr = null;
       }
@@ -2307,6 +2625,27 @@ class WasmJit {
       throw err;
     }
 
+    if (this.traceMethodPattern && st.key &&
+        st.key.includes(this.traceMethodPattern) &&
+        (!this.traceExitsOnly || status !== -1)) {
+      const top = thread.callStack.isEmpty() ? null : thread.callStack.peek();
+      console.error('[wasmjit-transition] ' + JSON.stringify({
+        method: st.key,
+        nested,
+        osr,
+        entryBlock: blk,
+        status,
+        framePc: frame.pc,
+        stackDepth: frame.stack.items.length,
+        returnedValueType: meta.box.ret === undefined ? 'undefined'
+          : meta.box.ret === null ? 'null'
+            : meta.box.ret && (meta.box.ret.type || meta.box.ret._className) ||
+              typeof meta.box.ret,
+        top: top && `${top.className || '?'}.${
+          top.method?.name || '?'}${top.method?.descriptor || ''}`,
+      }));
+    }
+
     if (status === -3) {
       // EH catch site: a guest exception was thrown at a precise pc inside a
       // live handler range. The spill import already wrote the locals
@@ -2362,9 +2701,12 @@ class WasmJit {
     const memo = this.writeSummaries.get(key);
     if (memo && (memo.keys !== null || memo.epoch === this.compileEpoch)) return memo.keys;
     if (inProgress) {
-      // recursion: pessimistic on the cycle member, and do not memoize —
-      // the outer walk still accumulates its own writes correctly
-      if (inProgress.has(key)) return null;
+      // A direct-static recursion edge adds no effects beyond the method body
+      // already being scanned. Treat the backedge as an empty delta; the
+      // outer walk still accumulates every direct write and every non-cyclic
+      // callee in the strongly connected component. Returning "unknown" here
+      // unnecessarily invalidates otherwise exact caller field summaries.
+      if (inProgress.has(key)) return EMPTY_WRITE_SET;
     } else {
       inProgress = new Set();
     }
@@ -2404,8 +2746,29 @@ class WasmJit {
     if (!method || (method.flags || []).includes('static') !== !instance) return null;
     const code = method.attributes && method.attributes.find((a) => a.type === 'code');
     if (!code) return null;
+    const codeItems = code.code.codeItems;
+    // Exception reporters are entered only by the JVM exception dispatcher;
+    // they are not normal successors of the protected bytecodes. Summarize
+    // the verifier-reachable normal graph so a handler-only StringBuilder or
+    // wrapper call does not make an otherwise pure arithmetic helper appear
+    // to mutate arbitrary caller state. If the generic verifier cannot prove
+    // the graph, retain the previous conservative whole-method scan.
+    let normalDepths = null;
+    const jit = this.jvm.jit;
+    if (jit && typeof jit.computeStackDepths === 'function') {
+      const labels = new Map();
+      codeItems.forEach((item, index) => {
+        if (!item?.labelDef) return;
+        const label = item.labelDef.endsWith(':')
+          ? item.labelDef.slice(0, -1) : item.labelDef;
+        labels.set(label, index);
+      });
+      normalDepths = jit.computeStackDepths(codeItems, labels);
+    }
     const keys = new Set();
-    for (const item of code.code.codeItems) {
+    for (let index = 0; index < codeItems.length; index += 1) {
+      if (normalDepths && normalDepths[index] === undefined) continue;
+      const item = codeItems[index];
       if (!item.instruction) continue;
       const op = getOp(item.instruction);
       if (op === 'putfield' || op === 'putstatic') {
@@ -2430,6 +2793,10 @@ class WasmJit {
     const method = clsAst.items.filter((i) => i.type === 'method').map((i) => i.method)
       .find((m) => m.name === name && m.descriptor === descriptor);
     if (!method || !(method.flags || []).includes('static')) return null;
+    // ACC_SYNCHRONIZED is implied by the flag, not by bytecode, so the monitor
+    // only exists on the interpreter's frame path. A linked call runs the body
+    // with no frame at all, which would silently drop the lock.
+    if ((method.flags || []).includes('synchronized')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method; // partial-link deopts materialize a Frame
@@ -2448,7 +2815,8 @@ class WasmJit {
     if (cm.boxedCount) return null;
     // speculative modules are entered only through prepare(), whose epoch
     // check invalidates them; a captured link would outlive that check
-    if (cm.speculations) return null;
+    // (guard-elided `this` sites are speculative with speculations === 0)
+    if (cm.speculations || (cm.specSites && cm.specSites.length)) return null;
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
     // partial callees deopt on demoted blocks; the entry block at least must
     // run in wasm or every call would deopt immediately
@@ -2468,6 +2836,8 @@ class WasmJit {
     if (!method) return null;
     const flags = method.flags || [];
     if (flags.includes('static') || flags.includes('abstract') || flags.includes('native')) return null;
+    // See findReadyStatic: a linked call has no frame, so it has no monitor.
+    if (flags.includes('synchronized')) return null;
     let st = this.state.get(method);
     if (!st) st = this.methodState({ method });
     if (!st.method) st.method = method;
@@ -2478,10 +2848,40 @@ class WasmJit {
     if (!st || st.status !== 'ready') return null;
     const cm = (st.callee || st).meta;
     if (cm.boxedCount) return null;
-    // same speculative-module exclusion as findReadyStatic
+    // Guarded speculative modules are excluded like findReadyStatic. Guard-
+    // elided modules (specSites without speculations) ARE returned: every
+    // instance-dispatch runner revalidates them per call
+    // (revalidateNestedCallee) and has a miss/deopt path when the baked
+    // world grew, while raw direct links exclude them at eligibility.
     if (cm.speculations) return null;
     if (cm.fullyCompiled || cm.normalFlowFullyCompiled) return st;
     return cm.externalEntry.has(0) ? st : null;
+  }
+
+  // Captured nested-dispatch targets bypass prepare()'s speculation gate.
+  // Before running one, re-check its baked class world: refresh the epoch
+  // when every speculated cone is unchanged (the common case), invalidate
+  // the module when one grew — the caller takes its existing miss/deopt
+  // path and the next compile rebuilds against the new world. Also rejects
+  // a target another path already invalidated (meta gone).
+  revalidateNestedCallee(st) {
+    const meta = (st.callee || st).meta;
+    if (!meta) return false;
+    if (!meta.specSites || !meta.specSites.length) return true;
+    if (meta.specEpoch === (this.jvm.classEpoch || 0)) return true;
+    if (revalidateSpeculations(this.jvm, this.hierarchy, meta.specSites)) {
+      meta.specEpoch = this.jvm.classEpoch || 0;
+      if (meta.specok) meta.specok.value = 1;
+      return true;
+    }
+    st.status = 'cold';
+    st.entries = 0;
+    st.retryAfter = 1;
+    st.meta = null;
+    st.run = null;
+    st.osr = null;
+    st.callee = null;
+    return false;
   }
 
   // A virtual-call import is built from the classes loaded at compile time.

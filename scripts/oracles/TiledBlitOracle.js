@@ -1,12 +1,12 @@
 "use strict";
 
-// Structurally verified replacement for a source-wrapping two-dimensional
+// Historical oracle for a source-wrapping two-dimensional
 // int-array blit.  The original method is intentionally awkward obfuscated
 // bytecode with a diagnostic recursion branch and exception reporter around a
 // tiny copy loop.  On the proven normal path this kernel removes repeated
 // scalar-tier safe points and scheduler re-entry.
 
-const { fingerprintMethods } = require("./HandwrittenFusedGradient");
+const { fingerprintMethods } = require("./FusedGradientOracle");
 
 const DESCRIPTOR = "(IIIIB[II[IIIII)V";
 const KNOWN_FINGERPRINTS = new Set([
@@ -17,53 +17,7 @@ function getOp(instruction) {
   return typeof instruction === "string" ? instruction : instruction && instruction.op;
 }
 
-function createIntrinsic(jit, method, descriptor, sentinels) {
-  if (descriptor !== DESCRIPTOR || !(method.flags || []).includes("static")) return null;
-  const items = jit.getCodeItems(method);
-  const fingerprint = fingerprintMethods(
-    jit, [method], { normalizeLdcStrings: true });
-  if (typeof process !== "undefined" && process.env &&
-      process.env.JVM_PRINT_TILED_BLIT_FINGERPRINT === "1") {
-    console.error(`tiled int blit fingerprint: ${fingerprint}`);
-  }
-  if (!KNOWN_FINGERPRINTS.has(fingerprint)) return null;
-
-  const code = method.attributes.find((attribute) => attribute.type === "code")?.code;
-  const handlers = code?.exceptionTable || [];
-  if (handlers.length !== 1 ||
-      handlers[0].catch_type !== "java/lang/RuntimeException") return null;
-
-  const instructions = items
-    .map((item) => item && item.instruction)
-    .filter((instruction) => getOp(instruction));
-  const booleanFields = instructions
-    .filter((instruction) => getOp(instruction) === "getstatic" &&
-      Array.isArray(instruction.arg) && instruction.arg?.[2]?.[1] === "Z")
-    .map((instruction) => instruction.arg);
-  const recursiveCalls = instructions
-    .filter((instruction) => getOp(instruction) === "invokestatic" &&
-      Array.isArray(instruction.arg) && instruction.arg?.[2]?.[1] === DESCRIPTOR);
-  if (booleanFields.length !== 1 || recursiveCalls.length !== 1 ||
-      instructions.filter((instruction) => getOp(instruction) === "iaload").length !== 1 ||
-      instructions.filter((instruction) => getOp(instruction) === "iastore").length !== 1) {
-    return null;
-  }
-  const methodOwner = recursiveCalls[0].arg[1];
-  const ownerClass = jit.jvm.classes[methodOwner];
-  const recursiveMethod = ownerClass && jit.jvm.findMethod(
-    ownerClass, recursiveCalls[0].arg[2][0], DESCRIPTOR);
-  if (recursiveMethod !== method) return null;
-
-  const flagOwner = booleanFields[0][1];
-  const flagName = booleanFields[0][2][0];
-  const flagClass = jit.jvm.classes[flagOwner];
-  if (!flagClass) return null;
-  const flag = flagClass.ast?.classes?.[0]?.items?.find((item) =>
-    item?.type === "field" &&
-    item.field?.name === flagName &&
-    item.field?.descriptor === "Z");
-  if (!flag || (flag.field.flags || []).includes("volatile")) return null;
-
+function createRun(jit, methodOwner, flagOwner, sentinels) {
   const { ASYNC_INVOKE, RETURN_VOID } = sentinels;
   function fallback(reason) {
     jit.tiledBlitGuardedFallbackCount =
@@ -73,7 +27,7 @@ function createIntrinsic(jit, method, descriptor, sentinels) {
     return ASYNC_INVOKE;
   }
 
-  function run(destinationIndex, sourceWidth, rowCount, sourceRow,
+  return function run(destinationIndex, sourceWidth, rowCount, sourceRow,
     tag, destination, copyWidth, source, destinationRowSkip,
     sourceX, sourceIndex, sourceHeight) {
     if (jit._envInstrumented || jit.needsBytecodeChecks() ||
@@ -104,8 +58,6 @@ function createIntrinsic(jit, method, descriptor, sentinels) {
         !Number.isInteger(destinationLength) || !Number.isInteger(sourceLength)) {
       return fallback("Arrays");
     }
-    // These bounds describe the normal tiled-image layout.  Exotic inputs
-    // retain the reporter/exception path without any preceding write.
     if (rowCount < 0 || rowCount > 1_000_000 ||
         copyWidth < 0 || copyWidth > 1_000_000 ||
         sourceWidth <= 0 || sourceX < 0 || sourceX >= sourceWidth ||
@@ -159,7 +111,57 @@ function createIntrinsic(jit, method, descriptor, sentinels) {
     }
     jit.tiledBlitRunCount = (jit.tiledBlitRunCount | 0) + 1;
     return RETURN_VOID;
+  };
+}
+
+function createIntrinsic(jit, method, descriptor, sentinels) {
+  if (descriptor !== DESCRIPTOR || !(method.flags || []).includes("static")) return null;
+  const items = jit.getCodeItems(method);
+  const fingerprint = fingerprintMethods(
+    jit, [method], { normalizeLdcStrings: true });
+  if (typeof process !== "undefined" && process.env &&
+      process.env.JVM_PRINT_TILED_BLIT_FINGERPRINT === "1") {
+    console.error(`tiled int blit fingerprint: ${fingerprint}`);
   }
+  if (!KNOWN_FINGERPRINTS.has(fingerprint)) return null;
+
+  const code = method.attributes.find((attribute) => attribute.type === "code")?.code;
+  const handlers = code?.exceptionTable || [];
+  if (handlers.length !== 1 ||
+      handlers[0].catch_type !== "java/lang/RuntimeException") return null;
+
+  const instructions = items
+    .map((item) => item && item.instruction)
+    .filter((instruction) => getOp(instruction));
+  const booleanFields = instructions
+    .filter((instruction) => getOp(instruction) === "getstatic" &&
+      Array.isArray(instruction.arg) && instruction.arg?.[2]?.[1] === "Z")
+    .map((instruction) => instruction.arg);
+  const recursiveCalls = instructions
+    .filter((instruction) => getOp(instruction) === "invokestatic" &&
+      Array.isArray(instruction.arg) && instruction.arg?.[2]?.[1] === DESCRIPTOR);
+  if (booleanFields.length !== 1 || recursiveCalls.length !== 1 ||
+      instructions.filter((instruction) => getOp(instruction) === "iaload").length !== 1 ||
+      instructions.filter((instruction) => getOp(instruction) === "iastore").length !== 1) {
+    return null;
+  }
+  const methodOwner = recursiveCalls[0].arg[1];
+  const ownerClass = jit.jvm.classes[methodOwner];
+  const recursiveMethod = ownerClass && jit.jvm.findMethod(
+    ownerClass, recursiveCalls[0].arg[2][0], DESCRIPTOR);
+  if (recursiveMethod !== method) return null;
+
+  const flagOwner = booleanFields[0][1];
+  const flagName = booleanFields[0][2][0];
+  const flagClass = jit.jvm.classes[flagOwner];
+  if (!flagClass) return null;
+  const flag = flagClass.ast?.classes?.[0]?.items?.find((item) =>
+    item?.type === "field" &&
+    item.field?.name === flagName &&
+    item.field?.descriptor === "Z");
+  if (!flag || (flag.field.flags || []).includes("volatile")) return null;
+
+  const run = createRun(jit, methodOwner, flagOwner, sentinels);
 
   const intrinsic = (stack, base) => run(
     stack[base], stack[base + 1], stack[base + 2], stack[base + 3],
@@ -174,5 +176,5 @@ function createIntrinsic(jit, method, descriptor, sentinels) {
 module.exports = {
   DESCRIPTOR,
   createIntrinsic,
-  _test: { KNOWN_FINGERPRINTS },
+  _test: { KNOWN_FINGERPRINTS, createRun },
 };

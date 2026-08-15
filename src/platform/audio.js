@@ -43,9 +43,16 @@ function createNodeSpeakerOutput(options) {
 class MockAudioOutput {
   constructor(options) {
     this.options = options;
+    // This sink discards the payload. SourceDataLine may pass the guest byte
+    // array and slice coordinates directly instead of allocating a Node Buffer
+    // that would immediately be thrown away.
+    this.acceptsGuestByteArraySlices = !(
+      typeof process !== 'undefined' && process.env &&
+      process.env.JVM_DISABLE_ZERO_COPY_DISCARD_AUDIO === '1'
+    );
   }
 
-  write(_data) {}
+  write(_data, _offset, _length) {}
 
   end() {}
 

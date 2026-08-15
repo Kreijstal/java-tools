@@ -1,6 +1,6 @@
 "use strict";
 
-// Compact semantic lowering for a verified, acyclic, four-neighbour
+// Historical semantic oracle for a verified, acyclic, four-neighbour
 // fixed-point sampler.  The matcher is deliberately independent of guest
 // owner/member names: it uses the descriptor, canonicalized bytecodes,
 // constants, control flow, and repeated field-reference relationships.
@@ -14,7 +14,7 @@
 
 const {
   fingerprintMethods,
-} = require("./HandwrittenFusedGradient");
+} = require("./FusedGradientOracle");
 
 const KNOWN_FINGERPRINTS = new Set([
   1541484005,
@@ -47,13 +47,13 @@ function countRef(refs, ref) {
     count + (refKey(candidate) === key ? 1 : 0), 0);
 }
 
-function analyze(jit, method) {
+function analyze(jit, method, allowUnknownFingerprint = false) {
   if (!method || method.descriptor !== "(IIIII)V") return null;
   const flags = method.flags || [];
   if (flags.includes("static") ||
       (Number(method.accessFlags) & 0x0008) !== 0) return null;
   const fingerprint = fingerprintMethods(jit, [method]);
-  if (!KNOWN_FINGERPRINTS.has(fingerprint)) return null;
+  if (!allowUnknownFingerprint && !KNOWN_FINGERPRINTS.has(fingerprint)) return null;
 
   const instanceIntRefs = [];
   const instanceArrayRefs = [];
@@ -87,7 +87,9 @@ function analyze(jit, method) {
   if (countRef(instanceIntRefs, widthRef) !== 5 ||
       countRef(instanceIntRefs, heightRef) !== 1 ||
       instanceArrayRefs.length !== 4 ||
-      staticArrayRefs.length !== 2) return null;
+      (allowUnknownFingerprint
+        ? staticArrayRefs.length < 1
+        : staticArrayRefs.length !== 2)) return null;
 
   return {
     fingerprint,
@@ -98,8 +100,8 @@ function analyze(jit, method) {
   };
 }
 
-function install(jit, method) {
-  const analysis = analyze(jit, method);
+function installAnalyzed(jit, method, allowUnknownFingerprint = false) {
+  const analysis = analyze(jit, method, allowUnknownFingerprint);
   if (!analysis) return null;
   const methodOwner = method.className ||
     jit.jvm.findClassNameForMethod?.(method) ||
@@ -245,10 +247,20 @@ function install(jit, method) {
   };
 }
 
+function install(jit, method) {
+  return installAnalyzed(jit, method, false);
+}
+
 module.exports = {
   analyze,
   install,
   _test: {
     KNOWN_FINGERPRINTS,
+    analyzeStructurally(jit, method) {
+      return analyze(jit, method, true);
+    },
+    installStructurallyVerified(jit, method) {
+      return installAnalyzed(jit, method, true);
+    },
   },
 };

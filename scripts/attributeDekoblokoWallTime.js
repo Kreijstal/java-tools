@@ -45,7 +45,6 @@ const maxRuns = argValue('--runs', Infinity);
 // run comes back invalid.
 const CONFIGS = [
   { name: 'baseline', env: {} },
-  { name: 'no-handwritten-gradient', env: { PROBE_HANDWRITTEN_FUSED: '0' } },
   { name: 'no-fused-regions', env: { PROBE_FUSED_REGIONS: '0' } },
   { name: 'no-structured-ssa', env: { PROBE_STRUCTURED_SSA: '0' } },
   { name: 'no-scalar-loops', env: { PROBE_SCALAR_LOOPS: '0' } },

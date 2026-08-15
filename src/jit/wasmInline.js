@@ -55,6 +55,7 @@
 const {
   getOp, parseMethodDescriptor, liveExceptionRanges, MATH_INTRINSICS,
 } = require('./wasmShared');
+const { collectRefdLabels } = require('../decompiler/structurer');
 
 const SHORT_LOCAL = /^([ilfda])(load|store)_([0-3])$/;
 const LONG_LOCAL = /^([ilfda])(load|store)$/;
@@ -226,17 +227,29 @@ function planStaticInline(ctx, ins, base, maxItems) {
 
 // Splices one instance-call site. depth 0 = a site in the original caller
 // (up to 2 impls); deeper sites are interior to a spliced body (monomorphic
-// only, guard miss deopts to the outer call site).
-function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth) {
+// only, guard miss deopts to the outer call site). recvIsThis marks sites
+// whose receiver is provably the caller's own `this` (zero-arg call fed by
+// aload_0 in a method that never stores slot 0): guards and their deopt
+// stubs are elided when the dispatch pick is decidable from the caller
+// class, keeping the module fully compiled — the site still records a
+// specSite so entry revalidation catches later-loaded overriders.
+function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThis) {
   if (!Array.isArray(ins.arg)) return null;
   const [, owner, [name, descriptor]] = ins.arg;
   if (name === '<init>' || name === '<clinit>') return null;
+  const { params } = parseMethodDescriptor(descriptor);
+  // With arguments on the stack the aload_0 before the invoke is the last
+  // argument, not the receiver.
+  if (params.length) recvIsThis = false;
   let impls;
   let guards = null; // instanceof classes aligned with impls; null = ifnonnull only
+  let elide = false;
   if (op === 'invokespecial') {
     const impl = ctx.hierarchy.resolveSpecial(callerClassName, owner, name, descriptor);
     if (!impl) return null;
     impls = [impl];
+    // statically bound and `this` is non-null by the JVM spec
+    elide = !!recvIsThis;
   } else {
     const r = ctx.hierarchy.resolveDispatch(owner, name, descriptor);
     // An incomplete cone hides receivers whose dispatch is unknown; an
@@ -259,17 +272,22 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth) {
     // (invokespecial needs no record: resolution walks the already-loaded
     // superclass chain, which later class loads cannot change)
     ctx.specSites.push({ owner, name, descriptor, guards });
+    // `this` has runtime class R <= callerClassName; if the caller class
+    // takes the most-derived guard, every R does too. If it only matches a
+    // later guard, a more-derived receiver could differ — keep the guards.
+    elide = !!recvIsThis && !!callerClassName &&
+      ctx.jvm.isInstanceOf(callerClassName, guards[0]);
   }
 
-  const { params } = parseMethodDescriptor(descriptor);
   const start = alloc.next;
   const prefix = `IN${ctx.k++}_`;
   const { slots: argSlots } = paramSlotsOf(params, start + 1);
   // Both impl bodies overlay the SAME chunk (branches are mutually
   // exclusive), so receiver/args are stored once and slot reuse is safe.
+  const buildImpls = elide ? [impls[0]] : impls;
   const bodies = [];
   let end = start;
-  for (const impl of impls) {
+  for (const impl of buildImpls) {
     const sub = { next: start };
     const body = buildCalleeBody(ctx, impl, sub, `${prefix}RET`, depth);
     if (!body) return null;
@@ -277,25 +295,28 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth) {
     if (sub.next > end) end = sub.next;
   }
   alloc.next = end;
-  if (guards) ctx.speculations += guards.length;
+  if (guards && !elide) ctx.speculations += guards.length;
+  if (elide) ctx.elidedThisGuards += 1;
 
   const items = [];
   for (let j = params.length - 1; j >= 0; j -= 1) {
     items.push({ instruction: { op: STORE_OP[params[j]] || 'astore', arg: String(argSlots[j]) } });
   }
   items.push({ instruction: { op: 'astore', arg: String(start) } });
-  if (guards) {
-    guards.forEach((cls, gi) => {
+  if (!elide) {
+    if (guards) {
+      guards.forEach((cls, gi) => {
+        items.push({ instruction: { op: 'aload', arg: String(start) } });
+        items.push({ instruction: { op: 'instanceof', arg: cls } });
+        items.push({ instruction: { op: 'ifne', arg: `${prefix}E${gi}` } });
+      });
+    } else {
       items.push({ instruction: { op: 'aload', arg: String(start) } });
-      items.push({ instruction: { op: 'instanceof', arg: cls } });
-      items.push({ instruction: { op: 'ifne', arg: `${prefix}E${gi}` } });
-    });
-  } else {
-    items.push({ instruction: { op: 'aload', arg: String(start) } });
-    items.push({ instruction: { op: 'ifnonnull', arg: `${prefix}E0` } });
+      items.push({ instruction: { op: 'ifnonnull', arg: `${prefix}E0` } });
+    }
+    items.push({ instruction: 'aconst_null', deoptMark: true });
+    items.push({ instruction: 'athrow' });
   }
-  items.push({ instruction: 'aconst_null', deoptMark: true });
-  items.push({ instruction: 'athrow' });
   bodies.forEach((body, bi) => {
     items.push({ labelDef: `${prefix}E${bi}:`, instruction: 'nop' });
     for (const b of body.items) items.push(b);
@@ -305,6 +326,7 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth) {
     prefix,
     valueSlots: [start, ...argSlots],
     hasHeapWrite: bodies.some((b) => b.hasHeapWrite),
+    elided: elide,
   };
 }
 
@@ -351,6 +373,24 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     }
   }
 
+  // Interior receiver-is-this detection mirrors inlineCalls: the callee is an
+  // instance method, so its slot 0 holds its own `this` unless something
+  // stores over it. A zero-arg interior invoke directly following aload_0 at
+  // an untargeted item then has this body's receiver as its receiver — and
+  // the branch guard (or outer elision) already bounds that receiver's
+  // runtime class by `className`, so planInstanceSite can elide its guard.
+  const calleeThisStable = !items.some((it) => {
+    const op2 = getOp(it.instruction);
+    if (!op2) return false;
+    if (/^[ilfda]store_0$/.test(op2)) return true;
+    return /^[ilfda]store$/.test(op2) && String(it.instruction.arg) === '0';
+  });
+  const targeted = collectRefdLabels(items);
+  for (const entry of code.exceptionTable || []) {
+    for (const l of [entry.start, entry.end, entry.handler]) {
+      if (typeof l === 'string') targeted.add(l.endsWith(':') ? l.slice(0, -1) : l);
+    }
+  }
   const base = alloc.next;
   alloc.next = base + (Number(code.localsSize) || paramEnd);
   const prefix = `IN${ctx.k++}_`;
@@ -361,11 +401,19 @@ function buildCalleeBody(ctx, impl, alloc, retLabel, depth) {
     const op = getOp(item.instruction);
     const lbl = item.labelDef ? prefix + item.labelDef : undefined;
     if (reachable.has(idx) && INSTANCE_INVOKE.test(op)) {
-      // a deopt at (or inside) this interior site replays the flattened body
-      // from the outer call — unsound once a heap write has happened
-      if (heapWrite) return null;
-      const site = planInstanceSite(ctx, item.instruction, op, className, alloc, depth + 1);
+      const prevOp = idx > 0 ? getOp(items[idx - 1].instruction) : null;
+      const interiorRecvIsThis = calleeThisStable &&
+        !(item.labelDef && targeted.has(item.labelDef.slice(0, -1))) &&
+        (prevOp === 'aload_0' ||
+          (prevOp === 'aload' && String(items[idx - 1].instruction.arg) === '0'));
+      const site = planInstanceSite(ctx, item.instruction, op, className, alloc,
+        depth + 1, interiorRecvIsThis);
       if (!site) return null;
+      // a deopt at (or inside) this interior site replays the flattened body
+      // from the outer call — unsound once a heap write has happened. An
+      // elided site emits no guard and no deopt stub, so nothing there can
+      // replay; heap writes before it are fine.
+      if (heapWrite && !site.elided) return null;
       site.items.forEach((s, si) => out.push(si === 0 && lbl ? { ...s, labelDef: lbl } : s));
       out.push({ labelDef: `${site.prefix}RET:`, instruction: 'nop' });
       if (site.hasHeapWrite) heapWrite = true;
@@ -393,7 +441,27 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     k: 0,
     speculations: 0,
     specSites: [],
+    elidedThisGuards: 0,
   };
+  // Slot 0 holds `this` for the whole method only when nothing ever stores
+  // over it (javac never does; obfuscated code may).
+  const thisSlotStable = options.callerIsStatic === false &&
+    !items.some((it) => {
+      const op = getOp(it.instruction);
+      if (!op) return false;
+      if (/^[ilfda]store_0$/.test(op)) return true;
+      return /^[ilfda]store$/.test(op) && String(it.instruction.arg) === '0';
+    });
+  // Every item carries a labelDef in krakatau output; only labels a branch,
+  // switch, or exception handler actually targets can bring a foreign stack.
+  const targetedLabels = collectRefdLabels(items);
+  for (const entry of codeAttr.code.exceptionTable || []) {
+    for (const l of [entry.start, entry.end, entry.handler]) {
+      if (typeof l === 'string') targetedLabels.add(l.endsWith(':') ? l.slice(0, -1) : l);
+    }
+  }
+  const isTargeted = (it) => !!it.labelDef &&
+    targetedLabels.has(it.labelDef.slice(0, -1));
   let budget = options.budget || 512;
   const labelIndex = new Map();
   items.forEach((it, i) => { if (it.labelDef) labelIndex.set(it.labelDef.slice(0, -1), i); });
@@ -428,7 +496,15 @@ function inlineCalls(jvm, codeAttr, options = {}) {
         continue;
       }
     } else if (ctx.hierarchy && INSTANCE_INVOKE.test(op) && budget > 0 && !inRange(i)) {
-      const site = planInstanceSite(ctx, item.instruction, op, options.callerClassName, alloc, 0);
+      // Receiver is provably `this` when the invoke (not itself a branch
+      // target — a jump landing here could bring a different stack) directly
+      // follows aload_0. Zero-arg is enforced inside planInstanceSite.
+      const prevOp = i > 0 ? getOp(items[i - 1].instruction) : null;
+      const recvIsThis = thisSlotStable && !isTargeted(item) &&
+        (prevOp === 'aload_0' ||
+          (prevOp === 'aload' && String(items[i - 1].instruction.arg) === '0'));
+      const site = planInstanceSite(
+        ctx, item.instruction, op, options.callerClassName, alloc, 0, recvIsThis);
       if (site && site.items.length + 1 <= budget) {
         site.items.forEach((s, si) => {
           out.push(si === 0 && item.labelDef ? { ...s, labelDef: item.labelDef } : s);
@@ -455,6 +531,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     deoptStubs,
     speculations: ctx.speculations,
     specSites: ctx.specSites,
+    elidedThisGuards: ctx.elidedThisGuards,
   };
 }
 

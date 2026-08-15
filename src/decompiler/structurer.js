@@ -620,6 +620,7 @@ module.exports = {
   uniquifyLabels,
   uniquifyCatchParameters,
   buildCfgFromCode,
+  collectRefdLabels,
   // exposed for reuse/testing
   reversePostorder,
   computeDominators,

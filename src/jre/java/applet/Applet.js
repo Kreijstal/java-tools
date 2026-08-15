@@ -19,6 +19,13 @@ module.exports = {
         canvas.height = 600;
         canvas.style.border = '1px solid #ccc';
         canvas.style.background = 'white';
+        // Keep the synthetic applet surface out of the applet's own layout and
+        // behind its real components: components added by the applet (panels,
+        // canvases) flow in the container's grid above this backdrop canvas.
+        canvas.style.position = 'absolute';
+        canvas.style.left = '0';
+        canvas.style.top = '0';
+        canvas.style.zIndex = '-1';
         
         // Store reference to canvas element
         obj._awtComponent.canvasElement = canvas;
@@ -53,6 +60,7 @@ module.exports = {
           appletRoot = document.createElement('div');
           appletRoot.className = 'awt-applet-root';
           appletRoot.style.position = 'relative';
+          appletRoot.style.zIndex = '0';
           appletRoot.style.boxSizing = 'border-box';
           awtContainer.appendChild(appletRoot);
         }
@@ -76,7 +84,7 @@ module.exports = {
             const clickX = Math.floor(event.clientX - rect.left);
             const clickY = Math.floor(event.clientY - rect.top);
 
-            const method = jvm.findMethod(jvm.classes[obj.type], 'handleClick', '(II)V');
+            const method = await jvm.findMethodInHierarchy(obj.type, 'handleClick', '(II)V');
             if (!method) {
               return;
             }
@@ -90,22 +98,16 @@ module.exports = {
 
             const currentThread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
             if (currentThread) {
-              currentThread.callStack.push(clickFrame);
               const threadIndex = jvm.threads.indexOf(currentThread);
               if (threadIndex >= 0) {
                 jvm.currentThreadIndex = threadIndex;
               }
-              currentThread.status = 'runnable';
-
-              const originalStackSize = currentThread.callStack.size();
-              let maxIterations = 1000;
-              let iterations = 0;
-
-              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
-                const result = await jvm.executeTick();
-                iterations++;
-                if (result && result.completed) break;
-              }
+              const { runFrame } = require('../awt/legacyEvents');
+              await runFrame(jvm, clickFrame, {
+                thread: currentThread,
+                maxIterations: 500000,
+                label: `${obj.type}.handleClick`,
+              });
             }
           });
         }
@@ -186,8 +188,10 @@ module.exports = {
           const graphicsObj = jvm.createGraphicsObject(obj);
           
           // Call the paint method using JVM method lookup
-          const paintMethod = jvm.findMethod(jvm.classes[obj.type], 'paint', '(Ljava/awt/Graphics;)V');
-          if (paintMethod) {
+          const paintMethod = await jvm.findMethodInHierarchy(
+            obj.type, 'paint', '(Ljava/awt/Graphics;)V');
+          const { isJreDefault, runFrame } = require('../awt/legacyEvents');
+          if (paintMethod && !isJreDefault(paintMethod)) {
             // Execute the actual paint method bytecode
             const Frame = require('../../../core/frame');
             const paintFrame = new Frame(paintMethod);
@@ -201,24 +205,13 @@ module.exports = {
             });
             
             // Get current thread to execute the paint method
-            const currentThread = jvm.threads[jvm.currentThreadIndex];
+            const currentThread = jvm.threads[jvm.currentThreadIndex] || jvm.threads[0];
             if (currentThread) {
-              currentThread.status = 'runnable';
-              currentThread.callStack.push(paintFrame);
-              
-              // Execute the paint method synchronously
-              const originalStackSize = currentThread.callStack.size();
-              const maxIterations = 200000; // Allow heavier paint loops to complete
-              let iterations = 0;
-              
-              while (currentThread.callStack.size() >= originalStackSize && iterations < maxIterations) {
-                const result = await jvm.executeTick();
-                iterations++;
-                if (result && result.completed) break;
-              }
-              if (iterations >= maxIterations) {
-                console.warn('Applet.paint exceeded iteration limit');
-              }
+              await runFrame(jvm, paintFrame, {
+                thread: currentThread,
+                maxIterations: 500000,
+                label: `${obj.type}.paint`,
+              });
             }
           } else if (obj['paint(Ljava/awt/Graphics;)V']) {
             // Fallback to direct method call

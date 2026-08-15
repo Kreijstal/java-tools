@@ -126,6 +126,57 @@ L21: areturn
 .end class
 `;
 
+const BRANCHED_REFERENCE_ARRAY_ARGUMENT = `.version 52 0
+.class public super BranchedReferenceArrayArgument
+.super java/lang/Object
+
+.method public static consume : ([Ljava/lang/String;)Ljava/lang/String;
+    .code stack 2 locals 1
+L0: aload_0
+L1: iconst_0
+L2: aaload
+L3: areturn
+    .end code
+.end method
+
+.method public static call : (Z)Ljava/lang/String;
+    .code stack 4 locals 1
+L10: iconst_1
+L11: anewarray java/lang/String
+L14: dup
+L15: iconst_0
+L16: iload_0
+L17: ifeq L26
+L20: goto L24
+L23: athrow
+L24: ldc "enabled"
+L25: goto L28
+L27: athrow
+L26: ldc "disabled"
+L28: aastore
+L29: invokestatic Method BranchedReferenceArrayArgument consume ([Ljava/lang/String;)Ljava/lang/String;
+L32: areturn
+    .end code
+.end method
+.end class
+`;
+
+const TERMINAL_DEAD_DUP_ARRAY = `.version 52 0
+.class public super TerminalDeadDupArray
+.super java/lang/Object
+
+.method public static value : ()I
+    .code stack 3 locals 0
+L0: iconst_1
+L1: anewarray java/lang/String
+L4: dup
+L5: bipush 7
+L7: ireturn
+    .end code
+.end method
+.end class
+`;
+
 const INLINE_PRIMITIVE_ARRAY_STORE = `.version 52 0
 .class public super InlinePrimitiveArrayStore
 .super java/lang/Object
@@ -310,6 +361,63 @@ Lreturn:
 .end class
 `;
 
+const INVARIANT_CONDITIONAL_BACKEDGE_FANOUT = `.version 52 0
+.class public super InvariantConditionalBackedgeFanout
+.super java/lang/Object
+
+.field public static FLAG I
+
+.method public static fill : (I[I)[I
+    .code stack 4 locals 5
+        getstatic Field InvariantConditionalBackedgeFanout FLAG I
+        istore 4
+        iload_0
+        newarray int
+        astore_2
+        iconst_0
+        istore_3
+Lfill:
+        iload_3
+        iload_0
+        if_icmpge LafterFill
+        aload_2
+        iload_3
+        bipush 10
+        iastore
+        iinc 3 1
+        iload 4
+        ifne LafterFill
+        iload 4
+        ifeq Lfill
+        goto LafterFill
+Ldead:
+        aconst_null
+        athrow
+LafterFill:
+        aload_1
+        ifnull Lreturn
+        iconst_0
+        istore_3
+Lcopy:
+        iload_3
+        iload_0
+        if_icmpge Lreturn
+        aload_2
+        iload_3
+        aload_1
+        iload_3
+        iaload
+        iastore
+        iinc 3 1
+        goto Lcopy
+Lreturn:
+        aload_2
+        areturn
+    .end code
+.end method
+.end class
+`;
+
 function decompileFixture(tempDir, name, source) {
   const classFile = path.join(tempDir, `${name}.class`);
   assembleJasminSource(source, classFile);
@@ -361,6 +469,39 @@ test('multi-value operand-stack backedges retain their distinct CFG edges', (t) 
     t.equal(execFileSync('java', ['-cp', tempDir, 'MultiValueBackedgeRunner'],
       { encoding: 'utf8', timeout: 5000 }), '[1, 1, 1, 1]',
     'the recompiled loop increments and terminates with the original result');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('invariant conditional loop fanouts retain their exact CFG edges', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(),
+    'cfr-invariant-backedge-fanout-'));
+  try {
+    const source = decompileFixture(tempDir,
+      'InvariantConditionalBackedgeFanout',
+      INVARIANT_CONDITIONAL_BACKEDGE_FANOUT);
+    t.match(source, /while \(true\) \{\s*switch \(statePc\)/,
+      'two-stage invariant latches use the exact CFG state machine');
+
+    fs.writeFileSync(path.join(tempDir,
+      'InvariantConditionalBackedgeFanout.java'), source);
+    fs.writeFileSync(path.join(tempDir,
+      'InvariantConditionalBackedgeFanoutRunner.java'),
+    'import java.util.Arrays; public class InvariantConditionalBackedgeFanoutRunner {' +
+      'public static void main(String[] a) {' +
+      'System.out.print(Arrays.toString(InvariantConditionalBackedgeFanout.fill(3, null)));' +
+      'System.out.print(Arrays.toString(InvariantConditionalBackedgeFanout.fill(3, new int[]{1,2,3})));' +
+      '}}');
+    execFileSync('javac', ['-g:none', '-d', tempDir,
+      path.join(tempDir, 'InvariantConditionalBackedgeFanout.java'),
+      path.join(tempDir, 'InvariantConditionalBackedgeFanoutRunner.java')]);
+    t.equal(execFileSync('java', ['-cp', tempDir,
+      'InvariantConditionalBackedgeFanoutRunner'], {
+      encoding: 'utf8', timeout: 5000,
+    }), '[10, 10, 10][1, 2, 3]',
+    'the recompiled fanout preserves both loop bodies and their array target');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
@@ -452,6 +593,41 @@ test('dup-filled reference arrays retain their elements when passed directly to 
       'direct call argument includes the value recorded by aastore');
     t.notOk(/consume\(new String\[1\]\)/.test(source),
       'direct call argument is not emitted as a null-filled allocation');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('dup-filled reference arrays retain identity across a conditional value branch', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-branched-array-argument-'));
+  try {
+    const source = decompileFixture(tempDir, 'BranchedReferenceArrayArgument',
+      BRANCHED_REFERENCE_ARRAY_ARGUMENT);
+    const allocations = source.match(/new String(?:\[1\]|\[\]\{)/g) || [];
+
+    t.equal(allocations.length, 1, 'the duplicated operand stack reference is allocated once');
+    t.notOk(
+      /String\[] ([A-Za-z_$][A-Za-z0-9_$]*) = new String\[1\];[\s\S]*String\[] [A-Za-z_$][A-Za-z0-9_$]* = new String\[1\]/.test(source),
+      'the conditional store and following call do not receive separate allocations');
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('dead duplicated arrays in terminal blocks do not emit after return', (t) => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cfr-terminal-dead-array-'));
+  try {
+    const source = decompileFixture(tempDir, 'TerminalDeadDupArray', TERMINAL_DEAD_DUP_ARRAY);
+
+    t.match(source, /return 7;/, 'the terminal return is retained');
+    t.notOk(/return 7;[\s\S]*new String\[1\]/.test(source),
+      'the dead duplicated allocation is not materialized after return');
+    fs.writeFileSync(path.join(tempDir, 'TerminalDeadDupArray.java'), source);
+    execFileSync('javac', ['-g:none', '-d', tempDir,
+      path.join(tempDir, 'TerminalDeadDupArray.java')]);
+    t.pass('the terminal block output recompiles without unreachable statements');
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }

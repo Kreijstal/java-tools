@@ -17,6 +17,9 @@ function javaDoubleString(value) {
   }
 
   const absD = Math.abs(d);
+  if (absD === Number.MIN_VALUE) {
+    return d < 0 ? "-4.9E-324" : "4.9E-324";
+  }
   let s;
 
   if (absD >= 1e-3 && absD < 1e7) {

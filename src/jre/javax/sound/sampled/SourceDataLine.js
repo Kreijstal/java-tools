@@ -85,7 +85,11 @@ module.exports = {
       }
 
       try {
-        obj.audioOutput.write(toAudioBytes(buffer, offset, len));
+        if (obj.audioOutput.acceptsGuestByteArraySlices === true) {
+          obj.audioOutput.write(buffer, offset, len);
+        } else {
+          obj.audioOutput.write(toAudioBytes(buffer, offset, len));
+        }
         if (thread && obj.audioOutput &&
             typeof obj.audioOutput.queuedSeconds === "function" &&
             obj.audioOutput.queuedSeconds() < 0.04) {
@@ -103,7 +107,7 @@ module.exports = {
           message: "Audio write failed: " + error.message,
         };
       }
-    }, ["java/lang/IllegalStateException", "java/io/IOException"]),
+    }, ["java/lang/IllegalStateException", "java/io/IOException"], []),
     "available()I": (jvm, obj, args) => {
       // A discard sink drains instantaneously. Reporting it as permanently
       // empty makes games spend every cycle decoding audio that nobody can
