@@ -2253,6 +2253,11 @@ class WasmJit {
         }
       });
     }
+    // key -> {reasons, st}; strong refs are fine, this is a diagnostic mode
+    this.census = env.JVM_WASM_CENSUS === '1' ? new Map() : null;
+    if (this.census && typeof process !== 'undefined' && process.on) {
+      process.on('exit', () => this.dumpCensus());
+    }
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
     this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
@@ -2285,12 +2290,18 @@ class WasmJit {
     // Object construction and class initialization have observable all-or-
     // nothing ordering. A partial Wasm exit around new/invokespecial can leave
     // an allocated object visible without having run the rest of <init>.
-    if (frame.method.name === '<init>' || frame.method.name === '<clinit>') return null;
+    if (frame.method.name === '<init>' || frame.method.name === '<clinit>') {
+      if (this.census) this._censusNote(frame, 'ctor-or-clinit');
+      return null;
+    }
     const debug = this.jvm.debugManager;
     if (debug && debug.debugMode) return null;
 
     const st = this.methodState(frame);
-    if (st.status === 'failed') return null;
+    if (st.status === 'failed') {
+      if (this.census) this._censusNote(frame, `failed:${st.failReason || '?'}`);
+      return null;
+    }
 
     if (st.status === 'cold') {
       st.entries += 1;
@@ -2300,12 +2311,25 @@ class WasmJit {
       // hasBackwardBranch is eligibility-aware and already excludes
       // opaque-control methods; see the note on it in JitCompiler.
       if (st.entries < threshold || !this.jit.hasBackwardBranch(frame.method)) {
+        if (this.census) {
+          this._censusNote(frame,
+            st.entries < threshold ? 'below-warmup' : 'no-supported-backedge');
+        }
         return null;
       }
       this.compile(frame, st);
-      if (st.status !== 'ready') return null;
+      if (st.status !== 'ready') {
+        if (this.census) {
+          this._censusNote(frame, st.status === 'failed'
+            ? `failed:${st.failReason || '?'}` : 'deferred');
+        }
+        return null;
+      }
     }
-    if (st.status !== 'ready') return null;
+    if (st.status !== 'ready') {
+      if (this.census) this._censusNote(frame, `not-ready:${st.status}`);
+      return null;
+    }
 
     // Speculative modules (CHA-based inlined instance calls — instanceof
     // guards, guard-elided `this` sites, or speculative monomorphic direct
@@ -2329,6 +2353,7 @@ class WasmJit {
         st.run = null;
         st.osr = null;
         st.callee = null;
+        if (this.census) this._censusNote(frame, 'speculation-invalidated');
         return null;
       }
     }
@@ -2337,18 +2362,61 @@ class WasmJit {
     // Enter only where the verifier shape is empty and the materialized JVM
     // operand stack agrees; non-empty shapes are reachable solely through a
     // compiled predecessor inside the same wasm run.
-    if (!frame.stack.isEmpty()) return null;
+    if (!frame.stack.isEmpty()) {
+      if (this.census) this._censusNote(frame, 'nonempty-operand-stack');
+      return null;
+    }
     const blk = st.meta.blockOfItem.get(frame.pc);
-    if (blk !== undefined && st.meta.externalEntry.has(blk)) return { st, blk };
+    if (blk !== undefined && st.meta.externalEntry.has(blk)) {
+      if (this.census) this._censusNote(frame, 'entered');
+      return { st, blk };
+    }
     // structured primary only admits pc 0; mid-method (loop OSR, fuel-exit
     // resume) entries go through the dispatcher module kept alongside it
     if (st.osr) {
       const oblk = st.osr.meta.blockOfItem.get(frame.pc);
       if (oblk !== undefined && st.osr.meta.externalEntry.has(oblk)) {
+        if (this.census) this._censusNote(frame, 'entered-osr');
         return { st, blk: oblk, osr: true };
       }
     }
+    if (this.census) this._censusNote(frame, 'no-external-entry-at-pc');
     return null;
+  }
+
+  // JVM_WASM_CENSUS=1 only: tally, per method, every outcome the wasm gate
+  // reached. Answers "why is this hot method not on the wasm tier" without
+  // reading a debug log — the state map is a WeakMap and cannot be walked.
+  _censusNote(frame, reason) {
+    if (!this.census) return;
+    const className = frame.className || frame.method.className || '?';
+    const key = `${className}.${frame.method.name}${frame.method.descriptor}`;
+    let row = this.census.get(key);
+    if (!row) {
+      row = { reasons: new Map(), st: null };
+      this.census.set(key, row);
+    }
+    if (!row.st) row.st = this.state.get(frame.method) || null;
+    row.reasons.set(reason, (row.reasons.get(reason) || 0) + 1);
+  }
+
+  dumpCensus() {
+    if (!this.census) return;
+    const rows = [...this.census].map(([key, row]) => {
+      let attempts = 0;
+      for (const count of row.reasons.values()) attempts += count;
+      return { key, row, attempts };
+    }).sort((left, right) => right.attempts - left.attempts);
+    console.error(`[wasm-census] ${rows.length} methods reached the wasm gate`);
+    for (const { key, row, attempts } of rows) {
+      const st = row.st || {};
+      const reasons = [...row.reasons]
+        .sort((left, right) => right[1] - left[1])
+        .map(([reason, count]) => `${reason}=${count}`).join(' ');
+      console.error(`[wasm-census] ${key} attempts=${attempts} ` +
+        `status=${st.status || '?'} runs=${st.runs || 0} exits=${st.exits || 0} ` +
+        `fuelExits=${st.fuelExits || 0} :: ${reasons}`);
+    }
   }
 
   tryRunFrame(frame, thread) {
