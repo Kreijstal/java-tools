@@ -2253,8 +2253,12 @@ class WasmJit {
         }
       });
     }
-    // key -> {reasons, st}; strong refs are fine, this is a diagnostic mode
-    this.census = env.JVM_WASM_CENSUS === '1' ? new Map() : null;
+    // key -> {reasons, st}; strong refs are fine, this is a diagnostic mode.
+    // JVM_WASM_CENSUS_FILE takes a path (%p expands to the pid) and implies
+    // the mode, since a multi-thousand-method dump does not survive stderr.
+    this.censusPath = env.JVM_WASM_CENSUS_FILE || '';
+    this.census = (env.JVM_WASM_CENSUS === '1' || this.censusPath)
+      ? new Map() : null;
     if (this.census && typeof process !== 'undefined' && process.on) {
       process.on('exit', () => this.dumpCensus());
     }
@@ -2401,21 +2405,47 @@ class WasmJit {
   }
 
   dumpCensus() {
-    if (!this.census) return;
+    if (!this.census || !this.census.size) return;
     const rows = [...this.census].map(([key, row]) => {
       let attempts = 0;
       for (const count of row.reasons.values()) attempts += count;
-      return { key, row, attempts };
-    }).sort((left, right) => right.attempts - left.attempts);
-    console.error(`[wasm-census] ${rows.length} methods reached the wasm gate`);
-    for (const { key, row, attempts } of rows) {
       const st = row.st || {};
-      const reasons = [...row.reasons]
-        .sort((left, right) => right[1] - left[1])
+      return {
+        method: key,
+        attempts,
+        status: st.status || '?',
+        runs: st.runs || 0,
+        exits: st.exits || 0,
+        fuelExits: st.fuelExits || 0,
+        reasons: Object.fromEntries([...row.reasons]
+          .sort((left, right) => right[1] - left[1])),
+      };
+    }).sort((left, right) => right.attempts - left.attempts);
+    // Attempt counts do NOT rank by time — a method entered once around a
+    // multi-second loop lands at the bottom — so the whole census must
+    // survive. Console output is truncated by the launcher's rolling child
+    // log; a file write is not.
+    const target = this.censusPath;
+    if (target) {
+      try {
+        const fs = require('fs');
+        const path = require('path');
+        const file = target.replace(/%p/g, String(process.pid));
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({ methods: rows }));
+        console.error(`[wasm-census] wrote ${rows.length} methods to ${file}`);
+        return;
+      } catch (err) {
+        console.error(`[wasm-census] file write failed: ${err.message}`);
+      }
+    }
+    console.error(`[wasm-census] ${rows.length} methods reached the wasm gate`);
+    for (const row of rows) {
+      const reasons = Object.entries(row.reasons)
         .map(([reason, count]) => `${reason}=${count}`).join(' ');
-      console.error(`[wasm-census] ${key} attempts=${attempts} ` +
-        `status=${st.status || '?'} runs=${st.runs || 0} exits=${st.exits || 0} ` +
-        `fuelExits=${st.fuelExits || 0} :: ${reasons}`);
+      console.error(`[wasm-census] ${row.method} attempts=${row.attempts} ` +
+        `status=${row.status} runs=${row.runs} exits=${row.exits} ` +
+        `fuelExits=${row.fuelExits} :: ${reasons}`);
     }
   }
 
