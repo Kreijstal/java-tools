@@ -137,6 +137,10 @@ test('generic fused hot-loop proxy stays scalar, lexical, and direct', (t) => {
     structuredSsa: true,
     directFusedCalls: true,
     lexicalFusedKernels: true,
+    // structuredSsa.runCount is asserted below. Production omits per-invocation
+    // counter mutations from emitted code (they obstruct host inlining across a
+    // hot call graph), so a counter-asserting test has to opt in.
+    structuredRunCounters: true,
   } });
   const compiler = jvm.jit.fusedRegions;
   const loadedOracleModules = Object.keys(require.cache).filter((filename) =>

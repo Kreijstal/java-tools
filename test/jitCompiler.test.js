@@ -8260,7 +8260,10 @@ public class ArbitraryAssetWork {
     jvm.jit, {target: {freeFrame: null}}, values, 1, thread, 1);
   t.equal(returned, values,
     'the scalar reference return preserves Java object identity');
-  t.deepEqual(values.slice(), [3, 5, 9],
+  // Array.from, not slice(): under JVM_WASM_HEAP the array is a TypedArray
+  // and slice() would keep that type, which deepEqual rejects against a
+  // plain array even when every element matches.
+  t.deepEqual(Array.from(values), [3, 5, 9],
     'reference-returning execution preserves loop effects');
   const floatReturn = await jvm.findMethodInHierarchy(
     'ArbitraryAssetWork', 'updateFloats', '(Ljava/lang/Object;I)[F');
@@ -8274,7 +8277,7 @@ public class ArbitraryAssetWork {
     jvm.jit, {target: {freeFrame: null}}, floatValues, 2, thread, 1);
   t.equal(returnedFloats, floatValues,
     'a primitive-array checkcast preserves the returned array identity');
-  t.deepEqual(floatValues.slice(), [2, 4],
+  t.deepEqual(Array.from(floatValues), [2, 4],
     'float-array loads and stores preserve float32 loop effects');
   t.end();
 });

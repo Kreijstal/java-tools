@@ -2297,6 +2297,8 @@ class WasmJit {
       const dependencyChanged = st.deferredEpoch !== undefined &&
         st.deferredEpoch !== this.compileEpoch;
       const threshold = dependencyChanged ? 1 : (st.retryAfter || this.warmupThreshold);
+      // hasBackwardBranch is eligibility-aware and already excludes
+      // opaque-control methods; see the note on it in JitCompiler.
       if (st.entries < threshold || !this.jit.hasBackwardBranch(frame.method)) {
         return null;
       }
@@ -2422,6 +2424,19 @@ class WasmJit {
           (linkable(meta) || !linkable(structuredMeta))) {
         structuredMeta = null;
       }
+      // A partial module can leave and later resume with locals captured
+      // before its first compiled block. Until boolean-static values have a
+      // verifier-backed spill proof across every unsupported edge, keep that
+      // shape out of wasm: treating a lost opaque-predicate local as true can
+      // skip arbitrary guest side effects. BOTH modules are checked, not just
+      // the primary one — the dispatcher module stays reachable through OSR
+      // entry even when the structured module is complete, so a partial
+      // dispatcher carries the same hazard.
+      if (capturesBooleanStatic(frame.method) &&
+          ((meta && !meta.fullyCompiled) ||
+            (structuredMeta && !structuredMeta.fullyCompiled))) {
+        throw new Unsupported('partial module captures a boolean static');
+      }
       const primary = structuredMeta || meta;
       // A partial module may stop after consuming a reference-producing call
       // or immediately before object construction, then resume through the
@@ -2433,14 +2448,6 @@ class WasmJit {
       if (!primary.fullyCompiled &&
           (primary.retChar === 'L' || primary.retChar === '[')) {
         throw new Unsupported('partial module has a reference return');
-      }
-      // A partial module can leave and later resume with locals captured
-      // before its first compiled block. Until boolean-static values have a
-      // verifier-backed spill proof across every unsupported edge, keep this
-      // uncommon shape in the generated/interpreted tiers. Treating a lost
-      // opaque-predicate local as true can skip arbitrary guest side effects.
-      if (!primary.fullyCompiled && capturesBooleanStatic(frame.method)) {
-        throw new Unsupported('partial module captures a boolean static');
       }
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via

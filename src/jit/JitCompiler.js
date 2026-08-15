@@ -480,14 +480,28 @@ class JitCompiler {
     return supported;
   }
 
+  // "Does this method have a loop the JIT may act on" — an ELIGIBILITY answer,
+  // not a structural one. `hasControlFlowBackedge` is the structural predicate;
+  // use that when you want the plain fact.
+  //
+  // Opaque-control methods report false here deliberately. That looks like a
+  // lie about a real backedge, and it does bar those methods from every tier,
+  // but it is load-bearing in two independent ways, both measured on Tomb
+  // Racer: letting them into the JS codegen tier miscompiles the boot outright
+  // (`IllegalStateException: Unrecognised component type: 120`), and letting
+  // this predicate report the structural truth to the wasm-first routing and
+  // region-formation callers below costs the boot >70 s even when every tier
+  // still refuses to compile them. So the restriction stays, stated explicitly
+  // at each tier entry (isSupported, isCodegenSupported, WasmJit.prepare) so
+  // that no tier depends on this predicate to enforce it.
+  //
+  // What was genuinely wrong and is now fixed: this used to also poison
+  // supportCache as a side effect of a structural query.
   hasBackwardBranch(method) {
     if (this.backwardBranchCache.has(method)) return this.backwardBranchCache.get(method);
     const codeItems = this.getCodeItems(method);
-    if (this.requiresOpaqueControlInterpreter(method, codeItems)) {
-      this.supportCache.set(method, false);
-      return false;
-    }
-    const backward = this.hasControlFlowBackedge(method, codeItems);
+    const backward = !this.requiresOpaqueControlInterpreter(method, codeItems) &&
+      this.hasControlFlowBackedge(method, codeItems);
     this.backwardBranchCache.set(method, backward);
     return backward;
   }
@@ -1590,6 +1604,10 @@ class JitCompiler {
     }
 
     const codeItems = this.getCodeItems(method);
+    // NOTE: no opaque-control rejection here, deliberately. Unlike isSupported,
+    // this tier has always accepted those methods once they pass warmup, and
+    // they are among the largest hot bodies in a Tomb Racer boot — adding the
+    // restriction here costs the boot >70 s.
     const safeConstructor = this.hotLoopConstructorsEnabled &&
       this.isJitSafeConstructor(method, codeItems);
     if ((method.name === "<init>" && !safeConstructor) ||
