@@ -245,6 +245,15 @@ class JVM {
     this._envTrace = !!env.JVM_TRACE;
     this._envProfileHot = env.JVM_PROFILE_HOT_METHODS === '1' ||
       env.JVM_PROFILE_HOT_METHODS_WITH_JIT === '1';
+    // Scheduler idle is wall time no tier can win back, so it needs its own
+    // attribution: a sampled profile can say how much there is, but not what
+    // the threads were waiting ON, which is what decides whether the wait is
+    // external latency or self-inflicted.
+    this._debugIdle = env.JVM_DEBUG_IDLE === '1';
+    this._idleReasons = this._debugIdle ? new Map() : null;
+    if (this._debugIdle && typeof process !== 'undefined' && process.on) {
+      process.on('exit', () => this.dumpIdleReasons());
+    }
     const schedulerTimingRate = Number(
       options.schedulerTimingRate ?? env.JVM_PROFILE_SCHEDULER_TIMES);
     this._schedulerTimingProfile = Number.isFinite(schedulerTimingRate) && schedulerTimingRate > 0
@@ -1507,10 +1516,12 @@ class JVM {
     scheduled = scheduled || this._prepareSchedulerTick();
     if (scheduled.completed) return { completed: true };
     if (scheduled.idle) {
-      await yieldToEventLoop(
-        this._idleWaitDelay(scheduled.schedulerNow),
-        this.eventLoopYieldStrategy,
-      );
+      const requestedMs = this._idleWaitDelay(scheduled.schedulerNow);
+      const startedAt = this._debugIdle ? Date.now() : 0;
+      await yieldToEventLoop(requestedMs, this.eventLoopYieldStrategy);
+      if (this._debugIdle) {
+        this._recordIdleReason(requestedMs, Date.now() - startedAt);
+      }
       return { completed: false };
     }
 
@@ -1750,6 +1761,44 @@ class JVM {
     if (!Number.isFinite(nextDeadline)) return this.eventLoopYieldMs;
     const remaining = Math.ceil(nextDeadline - schedulerNow);
     return Math.max(1, Math.min(this.eventLoopYieldMs, remaining));
+  }
+
+  // Tally why the scheduler had nothing to run, keyed by the composition of
+  // thread statuses. A wait whose threads are BLOCKED/WAITING with no deadline
+  // is waiting on an event (monitor, I/O); one dominated by SLEEPING threads
+  // is the guest's own poll loop. Only enabled by JVM_DEBUG_IDLE.
+  _recordIdleReason(requestedMs, actualMs) {
+    const counts = new Map();
+    for (const thread of this.threads) {
+      const status = thread.status || 'unknown';
+      const timed = (status === 'SLEEPING' && thread.sleepUntil !== undefined) ||
+        (status === 'WAITING' && thread.waitDeadline !== undefined);
+      const key = timed ? `${status}(timed)` : status;
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    const key = [...counts.entries()].sort()
+      .map(([status, count]) => `${status}x${count}`).join(' ') || '(no threads)';
+    const entry = this._idleReasons.get(key) ||
+      {waits: 0, requestedMs: 0, actualMs: 0};
+    entry.waits += 1;
+    entry.requestedMs += requestedMs;
+    entry.actualMs += actualMs;
+    this._idleReasons.set(key, entry);
+  }
+
+  dumpIdleReasons() {
+    if (!this._idleReasons || !this._idleReasons.size) return;
+    const rows = [...this._idleReasons.entries()]
+      .sort((left, right) => right[1].actualMs - left[1].actualMs);
+    const totalMs = rows.reduce((sum, [, entry]) => sum + entry.actualMs, 0);
+    console.error(`scheduler idle: ${(totalMs / 1000).toFixed(1)}s across ` +
+      `${rows.reduce((sum, [, entry]) => sum + entry.waits, 0)} waits`);
+    for (const [key, entry] of rows.slice(0, 20)) {
+      console.error(`  ${(entry.actualMs / 1000).toFixed(1)}s ` +
+        `(${(entry.actualMs * 100 / totalMs).toFixed(1)}%) ` +
+        `${entry.waits} waits, asked ${(entry.requestedMs / 1000).toFixed(1)}s, ` +
+        `mean ${(entry.actualMs / entry.waits).toFixed(1)}ms  ${key}`);
+    }
   }
 
   shouldPause(currentPc, frame) {
