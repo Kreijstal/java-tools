@@ -23,6 +23,13 @@
  *
  * Guest semantics are Java's: int is i32 with wrapping arithmetic, so the
  * checksum is compared against HotSpot's rather than assumed.
+ *
+ * Result: the handwritten internal-call variant runs at 1.63x HotSpot and
+ * benchmarkCallBoundaryHotLoop.js's structured tier runs the same loop at
+ * 1.6x, emitting a real loop with step inlined. Our codegen is AT this floor
+ * for this shape — do not read a codegen gap from the dispatcher tier's 48x,
+ * which is what that benchmark reported before it was made to set
+ * JVM_WASM_STRUCTURED=1 the way the game launcher does.
  */
 
 const fs = require('fs');

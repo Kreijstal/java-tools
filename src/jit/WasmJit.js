@@ -2661,6 +2661,18 @@ class WasmJit {
       st.calleeDeferredEpoch = undefined;
       this.compileEpoch += 1;
       if (!st.listed) { st.listed = true; this.compiled.push(st); }
+      // JVM_WASM_DUMP_ACCEPT=<dir> writes each accepted module so its wat can
+      // be diffed against hand-written wasm for the same Java method. The
+      // reject dump next to it only ever sees modules that failed to validate.
+      if (process.env.JVM_WASM_DUMP_ACCEPT && primary.bytes) {
+        const safe = st.key.replace(/[^\w.]/g, '_');
+        const dir = process.env.JVM_WASM_DUMP_ACCEPT;
+        try {
+          require('fs').mkdirSync(dir, { recursive: true });
+          require('fs').writeFileSync(`${dir}/${safe}.wasm`,
+            Buffer.from(primary.bytes));
+        } catch { /* dump only */ }
+      }
       if (this.debug) {
         console.error(`[wasmjit] ${isRecompile ? 'recompiled' : 'compiled'} ${st.key}: ${primary.bytes.length}B, ` +
           `${primary.supportedBlocks.size}/${primary.blockCount} blocks, ${primary.fieldCacheCount} field caches` +

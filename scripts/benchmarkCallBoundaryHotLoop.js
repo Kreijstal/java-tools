@@ -60,13 +60,21 @@ function nativeResults(directory) {
 
 async function createRuntime(directory) {
   const previousWasm = process.env.JVM_WASM_JIT;
+  const previousStructured = process.env.JVM_WASM_STRUCTURED;
   process.env.JVM_WASM_JIT = '1';
+  // The launcher runs games with JVM_WASM_STRUCTURED=1, so leaving it off
+  // here did not measure the production tier — it measured the dispatcher
+  // tier, whose block-dispatch br_table and per-block fuel checks cost 30x
+  // on this shape. Set it explicitly to 0 to compare the two.
+  if (previousStructured === undefined) process.env.JVM_WASM_STRUCTURED = '1';
   const jvm = new JVM({ classpath: [directory], jit: {
     enabled: false,
     warmupThreshold: 0,
   } });
   if (previousWasm === undefined) delete process.env.JVM_WASM_JIT;
   else process.env.JVM_WASM_JIT = previousWasm;
+  if (previousStructured === undefined) delete process.env.JVM_WASM_STRUCTURED;
+  else process.env.JVM_WASM_STRUCTURED = previousStructured;
   const classData = await jvm.loadClassByName(className);
   if (!classData.staticFields) classData.staticFields = new Map();
   classData.staticFieldsInitialized = true;
