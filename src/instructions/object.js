@@ -1,6 +1,9 @@
 const {
   classInitializationTokenFor,
 } = require('./utils');
+const {
+  newFields, loadHierarchy, makeObjectRef, hasField, enumerateFieldKeys,
+} = require('../core/objectModel');
 
 function runtimeClassName(objRef) {
   if (typeof objRef === 'string' || objRef instanceof String) {
@@ -14,7 +17,7 @@ function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
   let currentClassName = className;
   while (currentClassName) {
     const fieldKey = `${currentClassName}.${fieldName}`;
-    if (Object.prototype.hasOwnProperty.call(fields, fieldKey)) {
+    if (hasField(fields, fieldKey)) {
       return fieldKey;
     }
 
@@ -24,7 +27,7 @@ function resolveInstanceFieldKey(jvm, objRef, className, fieldName) {
       : null;
   }
 
-  return Object.keys(fields).find((fieldKey) =>
+  return enumerateFieldKeys(fields).find((fieldKey) =>
     fieldKey.endsWith(`.${fieldName}`));
 }
 
@@ -38,8 +41,7 @@ const SYNC_STATIC_FALLBACK = Symbol('syncStaticFallback');
 function resolveInstanceFieldKeyAtSite(jvm, objRef, instruction, className, fieldName) {
   if (instruction && typeof instruction === 'object') {
     const cached = instruction[resolvedInstanceFieldKey];
-    if (cached && objRef.fields &&
-        Object.prototype.hasOwnProperty.call(objRef.fields, cached)) {
+    if (cached && objRef.fields && hasField(objRef.fields, cached)) {
       return cached;
     }
   }
@@ -198,45 +200,10 @@ module.exports = {
       throw e;
     }
 
-    const fields = {};
-    let currentClassName = className;
-    while (currentClassName) {
-      const currentClassData = jvm.classes[currentClassName];
-      if (currentClassData) {
-        const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
-        for (const field of classFields) {
-          const descriptor = field.field.descriptor;
-          let defaultValue = null;
-          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S' || descriptor === 'Z' || descriptor === 'C') {
-            defaultValue = 0;
-          } else if (descriptor === 'J') {
-            defaultValue = BigInt(0);
-          } else if (descriptor === 'F' || descriptor === 'D') {
-            defaultValue = 0.0;
-          }
-          fields[`${currentClassName}.${field.field.name}`] = defaultValue;
-        }
-        const superClassName = currentClassData.ast.classes[0].superClassName;
-        if (superClassName) {
-          await jvm.loadClassByName(superClassName);
-        }
-        currentClassName = superClassName;
-      } else {
-        currentClassName = null;
-      }
-    }
+    await loadHierarchy(jvm, className);
+    const objRef = makeObjectRef(jvm, className, newFields(jvm, className));
 
-    const objRef = {
-      type: className,
-      _className: className,
-      fields,
-      hashCode: jvm.nextHashCode++,
-      isLocked: false,
-      lockOwner: null,
-      lockCount: 0,
-      waitSet: [],
-    };
-    
+
     // Add JavaScript toString method that calls Java toString
     objRef.toString = function() {
       const currentType = runtimeClassName(this);

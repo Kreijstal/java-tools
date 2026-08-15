@@ -22,6 +22,27 @@ class WasmHeap {
     this.limit = pages * 65536;
     this.top = 8; // offset 0 stays unused; fresh memory is already zeroed
     this.exhausted = false;
+    // Typed views for object-field access. The memory never grows, so these
+    // are created once and never detach.
+    this.i32 = new Int32Array(this.memory.buffer);
+    this.f64 = new Float64Array(this.memory.buffer);
+    this.i64 = new BigInt64Array(this.memory.buffer);
+  }
+
+  // Bump-allocate `bytes` of 8-aligned slab for one object's primitive
+  // instance fields. Returns the base offset, or -1 when the heap is spent —
+  // callers then keep the object's fields in a plain JS map.
+  allocObject(bytes) {
+    const base = (this.top + 7) & ~7;
+    if (base + bytes > this.limit) {
+      if (!this.exhausted) {
+        this.exhausted = true;
+        process.stderr.write(`[wasmheap] exhausted at ${this.limit} bytes; falling back to plain typed arrays\n`);
+      }
+      return -1;
+    }
+    this.top = base + bytes;
+    return base;
   }
 
   // TypedArray view for `desc` ('[I', '[B', ...) or null when desc is not a

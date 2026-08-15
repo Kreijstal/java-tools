@@ -37,6 +37,9 @@ const { JreBootstrap } = require("./jre-bootstrap");
 const JitCompiler = require("../jit/JitCompiler");
 const { encodeGraph, decodeGraph } = require("./stateCodec");
 const { createClock } = require('./fakeClock');
+const {
+  newFields, loadHierarchy, makeObjectRef,
+} = require('./objectModel');
 
 class ClassInitializationStateMap extends Map {
   constructor(jvm, entries = []) {
@@ -210,6 +213,10 @@ class JVM {
     this.wasmHeap = wasmHeapEnabled
       ? new (require('./wasmHeap').WasmHeap)(wasmHeapMb)
       : null;
+    // Primitive instance fields in that same memory at static per-class
+    // offsets (see core/objectModel.js). Requires the heap; off by default.
+    this.wasmFields = !!this.wasmHeap &&
+      (options.wasmFields ?? env.JVM_WASM_FIELDS === '1');
     this.clock = options.clock || createClock({
       fakeTime: options.fakeTime ?? env.JVM_FAKE_TIME,
       fakeTimeStep: options.fakeTimeStep ?? env.JVM_FAKE_TIME_STEP,
@@ -755,44 +762,8 @@ class JVM {
     });
 
     // Initialize fields properly like the 'new' instruction does
-    const fields = {};
-    let currentClassName = className;
-    while (currentClassName) {
-      const currentClassData = this.classes[currentClassName];
-      if (currentClassData) {
-        const classFields = currentClassData.ast.classes[0].items.filter(item => item.type === 'field');
-        for (const field of classFields) {
-          const descriptor = field.field.descriptor;
-          let defaultValue = null;
-          if (descriptor === 'I' || descriptor === 'B' || descriptor === 'S' || descriptor === 'Z' || descriptor === 'C') {
-            defaultValue = 0;
-          } else if (descriptor === 'J') {
-            defaultValue = BigInt(0);
-          } else if (descriptor === 'F' || descriptor === 'D') {
-            defaultValue = 0.0;
-          }
-          fields[`${currentClassName}.${field.field.name}`] = defaultValue;
-        }
-        const superClassName = currentClassData.ast.classes[0].superClassName;
-        if (superClassName) {
-          this.loadClassByName(superClassName);
-        }
-        currentClassName = superClassName;
-      } else {
-        currentClassName = null;
-      }
-    }
-
-    const objRef = {
-      type: className,
-      _className: className,
-      fields,
-      hashCode: this.nextHashCode++,
-      isLocked: false,
-      lockOwner: null,
-      lockCount: 0,
-      waitSet: [],
-    };
+    await loadHierarchy(this, className);
+    const objRef = makeObjectRef(this, className, newFields(this, className));
     if (this.appletParameters) {
       objRef._parameters = this.appletParameters;
     }

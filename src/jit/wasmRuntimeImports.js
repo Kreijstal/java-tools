@@ -20,6 +20,9 @@ const {
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
 const {
+  instanceFieldTemplate, makeObjectRef, slabLayoutFor, makeSlabFields,
+} = require('../core/objectModel');
+const {
   normalizeArrayLoad,
   normalizeArrayStore,
 } = require('../instructions/utils');
@@ -264,33 +267,13 @@ function addNewImport(reg, jvm, className) {
   }
   // Default field map precomputed once at compile time (the hierarchy above
   // an initialized class is loaded and immutable); each allocation clones it.
-  const template = {};
-  let currentClassName = className;
-  while (currentClassName) {
-    const cd = jvm.classes[currentClassName];
-    if (!cd || !cd.ast || !cd.ast.classes[0]) break;
-    for (const item of cd.ast.classes[0].items) {
-      if (item.type !== 'field') continue;
-      const d = item.field.descriptor;
-      let dv = null;
-      if (d === 'I' || d === 'B' || d === 'S' || d === 'Z' || d === 'C') dv = 0;
-      else if (d === 'J') dv = BigInt(0);
-      else if (d === 'F' || d === 'D') dv = 0.0;
-      template[`${currentClassName}.${item.field.name}`] = dv;
-    }
-    currentClassName = cd.ast.classes[0].superClassName;
-  }
+  const layout = slabLayoutFor(jvm, className);
+  const template = layout ? null : instanceFieldTemplate(jvm, className);
   const name = `new_${className}`.replace(/[^\w]/g, '_');
-  return reg.addImport(name, [], [T.ref], () => ({
-    type: className,
-    _className: className,
-    fields: { ...template },
-    hashCode: jvm.nextHashCode++,
-    isLocked: false,
-    lockOwner: null,
-    lockCount: 0,
-    waitSet: [],
-  }));
+  return reg.addImport(name, [], [T.ref], () => makeObjectRef(jvm, className,
+    layout
+      ? (makeSlabFields(jvm, layout) || instanceFieldTemplate(jvm, className))
+      : { ...template }));
 }
 
 // System time natives — like Math intrinsics they can never be compiled (JS

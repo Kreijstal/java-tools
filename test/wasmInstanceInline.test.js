@@ -189,7 +189,11 @@ test('structured field caches: fills hit, putfield kills, runs stay fresh', asyn
   const meta = metaOf(jvm, 'InstInline.drain([ILBase;I)I');
   t.ok(meta && meta.structured, 'drain compiled by the structured backend');
   const caching = process.env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
-  if (caching) t.ok(meta.fieldCacheCount >= 1, 'getfield registered a cache entry');
+  // Slab-backed fields compile to a raw load at a static offset, which needs
+  // no value cache at all — the stronger outcome, so assert that instead.
+  const slab = !!jvm.wasmFields;
+  if (slab) t.ok(meta.slabFieldSites >= 1, 'getfield compiled to a slab access');
+  else if (caching) t.ok(meta.fieldCacheCount >= 1, 'getfield registered a cache entry');
   else t.equal(meta.fieldCacheCount, 0, 'kill switch leaves no cache entries');
 
   // caches are per-run locals: a mutation between invokes must be seen
@@ -197,7 +201,8 @@ test('structured field caches: fills hit, putfield kills, runs stay fresh', asyn
   await invoke(jvm, thread, 'InstInline', 'drive', '([ILBase;I)I', [out, base, n]);
   t.equal(out[0], expectedSum(9, n), 'fresh run reads the mutated field');
   const drive = metaOf(jvm, 'InstInline.drive([ILBase;I)I');
-  if (caching) t.ok(drive && drive.fieldCacheCount >= 1, 'inlined val() getfield is cached');
+  if (slab) t.ok(drive && drive.slabFieldSites >= 1, 'inlined val() getfield is a slab access');
+  else if (caching) t.ok(drive && drive.fieldCacheCount >= 1, 'inlined val() getfield is cached');
   t.end();
 });
 

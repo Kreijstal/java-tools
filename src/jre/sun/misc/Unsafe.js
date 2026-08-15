@@ -1,3 +1,4 @@
+const { hasField } = require('../../../core/objectModel');
 const unsafe = {
   type: 'sun/misc/Unsafe',
 };
@@ -88,7 +89,7 @@ function readField(base, offset) {
   }
   for (const key of candidates) {
     if (base && Object.prototype.hasOwnProperty.call(base, key)) return base[key];
-    if (base && base.fields && Object.prototype.hasOwnProperty.call(base.fields, key)) {
+    if (base && base.fields && hasField(base.fields, key)) {
       return base.fields[key];
     }
   }
@@ -117,7 +118,7 @@ function writeField(jvm, base, offset, value) {
       base[key] = value;
       return;
     }
-    if (base && base.fields && Object.prototype.hasOwnProperty.call(base.fields, key)) {
+    if (base && base.fields && hasField(base.fields, key)) {
       base.fields[key] = value;
       return;
     }

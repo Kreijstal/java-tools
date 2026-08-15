@@ -10,6 +10,9 @@ const JvmSsaBlockRenderer = require("./JvmSsaBlockRenderer");
 const HotCallGraphRegionCompiler = require("./HotCallGraphRegionCompiler");
 const monoArray = require("./monoArray");
 const {
+  newFields, makeObjectRef, hasField,
+} = require("../core/objectModel");
+const {
   normalizeArrayLoad,
   normalizeArrayStore,
 } = require("../instructions/utils");
@@ -4272,7 +4275,7 @@ class JitCompiler {
           const fieldName = JSON.stringify(site.fieldName);
           return `{ const value = stack[--sp]; const object = stack[--sp]; ` +
             `if (object !== null && object !== undefined && object.fields && ` +
-            `Object.prototype.hasOwnProperty.call(object.fields, ${key})) { ` +
+            `${key} in object.fields) { ` +
             `object.fields[${key}] = value; object[${fieldName}] = value; ` +
             `} else { helpers.putFieldAt(${fieldSiteId}, object, value); } } ${goNext}`;
         }
@@ -5148,11 +5151,11 @@ class JitCompiler {
     }
 
     const runtimeType = objRef._className || objRef.type || site.className;
-    if (Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)) {
+    if (hasField(objRef.fields, site.directKey)) {
       return objRef.fields[site.directKey];
     }
     const cachedKey = site.instanceKeys.get(runtimeType);
-    if (cachedKey && Object.prototype.hasOwnProperty.call(objRef.fields, cachedKey)) {
+    if (cachedKey && hasField(objRef.fields, cachedKey)) {
       return objRef.fields[cachedKey];
     }
     const fieldKey = resolveInstanceFieldKey(
@@ -5170,10 +5173,10 @@ class JitCompiler {
     }
     if (!objRef.fields) objRef.fields = {};
     const runtimeType = objRef._className || objRef.type || site.className;
-    let fieldKey = Object.prototype.hasOwnProperty.call(objRef.fields, site.directKey)
+    let fieldKey = hasField(objRef.fields, site.directKey)
       ? site.directKey
       : site.instanceKeys.get(runtimeType);
-    if (!fieldKey || !Object.prototype.hasOwnProperty.call(objRef.fields, fieldKey)) {
+    if (!fieldKey || !hasField(objRef.fields, fieldKey)) {
       fieldKey = resolveInstanceFieldKey(this.jvm, objRef, site.className, site.fieldName)
         || site.directKey;
       site.instanceKeys.set(runtimeType, fieldKey);
@@ -5557,32 +5560,7 @@ class JitCompiler {
   }
 
   allocateObject(className) {
-    const fields = {};
-    let currentClassName = className;
-    while (currentClassName) {
-      const currentClassData = this.jvm.classes[currentClassName];
-      if (!currentClassData || !currentClassData.ast || !currentClassData.ast.classes[0]) break;
-      const classFields = currentClassData.ast.classes[0].items.filter((item) => item.type === "field");
-      for (const field of classFields) {
-        const descriptor = field.field.descriptor;
-        let defaultValue = null;
-        if (descriptor === "I" || descriptor === "B" || descriptor === "S" || descriptor === "Z" || descriptor === "C") defaultValue = 0;
-        else if (descriptor === "J") defaultValue = BigInt(0);
-        else if (descriptor === "F" || descriptor === "D") defaultValue = 0.0;
-        fields[`${currentClassName}.${field.field.name}`] = defaultValue;
-      }
-      currentClassName = currentClassData.ast.classes[0].superClassName;
-    }
-    return {
-      type: className,
-      _className: className,
-      fields,
-      hashCode: this.jvm.nextHashCode++,
-      isLocked: false,
-      lockOwner: null,
-      lockCount: 0,
-      waitSet: [],
-    };
+    return makeObjectRef(this.jvm, className, newFields(this.jvm, className));
   }
 
   asyncInvokeSentinel() {

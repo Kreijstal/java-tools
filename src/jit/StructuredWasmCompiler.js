@@ -38,6 +38,9 @@ const {
 } = require('./wasmRuntimeImports');
 const { inlineCalls } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
+const {
+  slabSlotFor, BASE_KEY: SLAB_BASE_KEY,
+} = require('../core/objectModel');
 const Frame = require('../core/frame');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
@@ -285,6 +288,14 @@ class StructuredWasmCompiler {
     // killed only when the receiver's SSA value is redefined.
     this.castCaches = new Map();
 
+    // Slab-base caches: per receiver SSA value, the byte base of that object's
+    // primitive field block (-1 = not slab-backed) and a filled flag. Like the
+    // array base, an object's slab base is immutable for its whole lifetime,
+    // so these are killed only when the SSA value is redefined.
+    this.slabFields = (this.jvm.wasmFields && this.jvm.wasmHeap) || null;
+    this.objCaches = new Map();
+    this.slabFieldSites = 0;
+
     const localFor = (value) => {
       let idx = this.localOf.get(value);
       if (idx === undefined) {
@@ -420,6 +431,9 @@ class StructuredWasmCompiler {
           cfg.blocks[id].insns.filter((i) => items[i] && items[i].instruction).length, 0),
       boxedCount: 0,
       fieldCacheCount: this.fieldCaches.size,
+      // getfield/putfield sites compiled to a raw slab load/store instead of
+      // a gf_/pf_ import (JVM_WASM_FIELDS); they need no value cache.
+      slabFieldSites: this.slabFieldSites,
       structured: true,
       inlinedCalls,
       elidedThisGuards,
@@ -943,9 +957,30 @@ class StructuredWasmCompiler {
       const isGet = op[0] === 'g';
       const isStatic = op.endsWith('static');
       const field = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, isGet);
-      const [, , [fieldName, descriptor]] = node.imm;
+      const [, fieldOwner, [fieldName, descriptor]] = node.imm;
       const killKey = `${fieldName}:${descriptor}`;
       const caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
+      // Slab path: the field has a static offset inside the wasm memory and
+      // its slot kind matches the wasm type the import would have produced
+      // (float fields keep an f64 slot for JS, so they stay on the import).
+      const slot = !isStatic && this.slabFields
+        ? slabSlotFor(this.jvm, fieldOwner, fieldName) : null;
+      const slotT = slot && (slot.kind === 'i32' ? T.i32
+        : slot.kind === 'f64' ? T.f64 : T.i64);
+      if (slot && slotT === field.t) {
+        this.slabFieldSites += 1;
+        out.push(...this.slabAccessSeq(node, slot, field.idx, isGet, use));
+        if (isGet) {
+          out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+          out.push(...this.cacheKillsFor(node.id));
+        } else {
+          // A raw store bypasses the pf_ import that other receivers' value
+          // caches were implicitly invalidated by, so kill them explicitly.
+          out.push(...this.killSeqWhere((entry) => (
+            entry.kind === 'f' && entry.killKey === killKey)));
+        }
+        return;
+      }
       if (isGet && caching) {
         const cacheKey = isStatic
           ? `s|${field.name}` : `f|${node.args[0].id}|${field.name}`;
@@ -1209,6 +1244,68 @@ class StructuredWasmCompiler {
     ];
   }
 
+  // base/filled locals for the slab block behind a receiver SSA value.
+  objCacheFor(objValue) {
+    let entry = this.objCaches.get(objValue.id);
+    if (!entry) {
+      const base = this.nextLocal++;
+      this.declared.push(T.i32);
+      const filled = this.nextLocal++;
+      this.declared.push(T.i32);
+      entry = { base, filled };
+      this.objCaches.set(objValue.id, entry);
+    }
+    return entry;
+  }
+
+  objImports() {
+    if (this.obaseIdx === undefined) {
+      this.obaseIdx = this.addImport('obase', [T.ref], [T.i32], (o) => {
+        if (!o || !o.fields) return -1;
+        const base = o.fields[SLAB_BASE_KEY];
+        return base === undefined ? -1 : base;
+      });
+    }
+  }
+
+  // getfield/putfield straight into the linear heap: fill the receiver's slab
+  // base on first touch, then `base >= 0` selects a raw load/store at the
+  // field's static offset over the gf_/pf_ import. A receiver whose class is
+  // not slab-backed (JRE stub, hierarchy not yet resolved, heap spent) reports
+  // base -1 and takes the import, so the two representations coexist.
+  slabAccessSeq(node, slot, fieldIdx, isGet, use) {
+    this.objImports();
+    this.usedHeap = true;
+    const cache = this.objCacheFor(node.args[0]);
+    const recv = use(0);
+    const align = slot.kind === 'i32' ? 2 : 3;
+    const memOp = slot.kind === 'i32'
+      ? (isGet ? OP.i32_load : OP.i32_store)
+      : slot.kind === 'f64'
+        ? (isGet ? OP.f64_load : OP.f64_store)
+        : (isGet ? OP.i64_load : OP.i64_store);
+    const raw = isGet
+      ? [OP.local_get, ...uleb(cache.base),
+        memOp, ...uleb(align), ...uleb(slot.offset)]
+      : [OP.local_get, ...uleb(cache.base), ...use(1),
+        memOp, ...uleb(align), ...uleb(slot.offset)];
+    const viaImport = isGet
+      ? [...recv, OP.call, ...uleb(fieldIdx)]
+      : [...recv, ...use(1), OP.call, ...uleb(fieldIdx)];
+    const blockT = isGet
+      ? (slot.kind === 'i32' ? T.i32 : slot.kind === 'f64' ? T.f64 : T.i64)
+      : 0x40;
+    return [
+      OP.local_get, ...uleb(cache.filled), OP.i32_eqz, OP.if, 0x40,
+      ...recv, OP.call, ...uleb(this.obaseIdx), OP.local_set, ...uleb(cache.base),
+      OP.i32_const, ...sleb(1), OP.local_set, ...uleb(cache.filled), OP.end,
+      OP.local_get, ...uleb(cache.base), OP.i32_const, ...sleb(0), OP.i32_ge_s,
+      OP.if, blockT,
+      ...raw,
+      OP.else, ...viaImport, OP.end,
+    ];
+  }
+
   fieldCacheFor(cacheKey, t, killKey, kind, recvId) {
     let entry = this.fieldCaches.get(cacheKey);
     if (!entry) {
@@ -1239,6 +1336,8 @@ class StructuredWasmCompiler {
         seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(e.filled));
       }
     }
+    const obj = this.objCaches.get(id);
+    if (obj) seq.push(OP.i32_const, ...sleb(0), OP.local_set, ...uleb(obj.filled));
     return seq;
   }
 

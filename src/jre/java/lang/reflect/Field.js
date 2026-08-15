@@ -1,4 +1,5 @@
 const { withThrows } = require('../../../helpers');
+const { hasField } = require('../../../../core/objectModel');
 
 function declaringClassName(fieldObj) {
   const declaringClass = fieldObj._declaringClass;
@@ -15,7 +16,7 @@ function instanceKey(fieldObj) {
 
 function getInstanceValue(fieldObj, obj) {
   const key = instanceKey(fieldObj);
-  if (obj.fields && Object.prototype.hasOwnProperty.call(obj.fields, key)) {
+  if (obj.fields && hasField(obj.fields, key)) {
     return obj.fields[key];
   }
   return obj[key] !== undefined ? obj[key] : obj[fieldObj._fieldData.name];
