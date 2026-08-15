@@ -249,7 +249,8 @@ class JVM {
     // attribution: a sampled profile can say how much there is, but not what
     // the threads were waiting ON, which is what decides whether the wait is
     // external latency or self-inflicted.
-    this._debugIdle = env.JVM_DEBUG_IDLE === '1';
+    this._debugIdle = env.JVM_DEBUG_IDLE === '1' || env.JVM_DEBUG_IDLE === 'frames';
+    this._debugIdleFrames = env.JVM_DEBUG_IDLE === 'frames';
     this._idleReasons = this._debugIdle ? new Map() : null;
     if (this._debugIdle && typeof process !== 'undefined' && process.on) {
       process.on('exit', () => this.dumpIdleReasons());
@@ -1776,8 +1777,23 @@ class JVM {
       const key = timed ? `${status}(timed)` : status;
       counts.set(key, (counts.get(key) || 0) + 1);
     }
-    const key = [...counts.entries()].sort()
+    // JVM_DEBUG_IDLE=frames also keys by the guest code each thread is parked
+    // in, which is what actually names a stall: the status composition alone
+    // says "two sleeping, three waiting" without saying what they wait for.
+    let key = [...counts.entries()].sort()
       .map(([status, count]) => `${status}x${count}`).join(' ') || '(no threads)';
+    if (this._debugIdleFrames) {
+      const where = this.threads.map((thread) => {
+        const frame = thread.callStack && !thread.callStack.isEmpty()
+          ? thread.callStack.peek() : null;
+        const method = frame && frame.method;
+        const at = method
+          ? `${frame.className || method.className || '?'}.${method.name}@${frame.pc}`
+          : '-';
+        return `${thread.status || '?'}:${at}`;
+      }).sort().join(' | ');
+      key = `${key}  ${where}`;
+    }
     const entry = this._idleReasons.get(key) ||
       {waits: 0, requestedMs: 0, actualMs: 0};
     entry.waits += 1;

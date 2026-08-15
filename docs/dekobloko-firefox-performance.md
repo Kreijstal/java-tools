@@ -6491,10 +6491,19 @@ npm run build:bundle
 ## 2026-08-15: where Tomb Racer's post-logo boot actually goes
 
 Boot loading is a different axis from the Firefox animation work above: it is
-measured in Node, on `postLogoToMenuMs`, against HotSpot's 16.014 s for the same
-segment. Clean sequential runs measure 147.8 / 149.4 / 149.6 s, i.e. **9.3x
-HotSpot**. A CPU profile of one such boot (152.3 s, sampling costs ~2%)
-attributes as follows.
+measured in Node, on `postLogoToMenuMs`. Clean sequential runs measure
+147.8 / 149.4 / 149.6 s.
+
+**Measure the JRE the same day, on the same idle machine.** The long-quoted
+16.014 s HotSpot figure is a stored number; `scripts/run-jre-reflection-main-menu.js
+--game tombracer` re-measured on 2026-08-15 gives **13.26 s** post-logo
+(logo 10.8 s, menu at 24.0 s, OpenJDK 11.0.31). So the real ratio is **11.3x**,
+not the 9.3x that dividing by the stored figure produces, and a 5x goal is 66 s
+rather than 80 s. Dividing today's number by a baseline captured on another day
+under other load is the same error this document warns about above; the JRE
+harness is cheap (39 s wall) and there is no excuse for not re-running it.
+
+A CPU profile of one boot (152.3 s, sampling costs ~2%) attributes as follows.
 
 | bucket | ms | % |
 |---|---|---|
@@ -6507,17 +6516,28 @@ attributes as follows.
 | interpreter:opcode | 5623 | 3.7 |
 
 The arithmetic this forces: **guest code is only 24% of the boot.** At literally
-zero runtime overhead the guest work alone is 36.8 s, or 2.3x HotSpot. So 5x is
-reachable and 1.5x is not, but 5x means deleting roughly two thirds of all
-runtime overhead — and there is no hotspot to aim at, the largest single
-self-time entry being 5.6%.
+zero runtime overhead the guest work alone is 36.8 s, or 2.8x the JRE. So 5x is
+reachable and 1.5x is not, but 5x (66 s) means deleting roughly three quarters
+of the ~115 s of non-guest time — and there is no hotspot to aim at, the largest
+single self-time entry being 5.6%.
 
 What the buckets are, since the names mislead:
 
 - `node-modules` is **entirely acorn**, i.e. the JIT parsing its own emitted
   JavaScript. See the negative result above; the fix belongs at emit time.
-- `idle` is the **guest's own poll loop**, not scheduler slack. It is
-  proportional to wall time and shrinks as CPU work drops.
+- `idle` is the **guest's own poll loop**, not scheduler slack — but it is NOT
+  spread evenly, and an earlier revision of this section was wrong to call it a
+  proportional tax. Bucketed over the boot it is ~0.1% almost everywhere, 45.8%
+  in the first 10 s, and then a 30-second window at 70-100 s that is ~50% idle.
+  That window is a stall with a location, not a tax.
+  `JVM_DEBUG_IDLE=frames` names where every thread is parked; 97% of all idle
+  has one composition — two threads sleeping in `fsa.a` and three worker
+  threads parked in `fia.run` / `jqa.run` / `ss.run` waiting for jobs — while
+  the profile shows the same window running `drawImage`, `bu.f()V` and
+  `kta.a([II)V`, i.e. the loading-screen animation.
+  It is not network: with `ALTERORB_JVMJS_NET_LOG=1` the TCP bridge carries
+  traffic only at t=1-29 s and t=116-118 s, about 25 KB in total, and nothing
+  at all during the stall. Assets come from the local cache.
 - `runtime:jit` is mostly per-call and per-entry machinery, not codegen:
   codegen is roughly 5 s of it. The largest items are
   `tryInvokeResolvedTarget` (4.4 s, a sequential cascade of property checks per
