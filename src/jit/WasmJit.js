@@ -2280,6 +2280,18 @@ class WasmJit {
     if (this.census && typeof process !== 'undefined' && process.on) {
       process.on('exit', () => this.dumpCensus());
     }
+    // See probeFullCoverage(). Opt-in: it makes the gate compile modules the
+    // JS tier might still win, which is a real up-front cost.
+    this.preferFullCoverage = env.JVM_WASM_PREFER_FULL_COVERAGE === '1';
+    // Bisection aid: restrict the preference to a comma-separated list of
+    // `Class.name(desc)ret` keys, so one miscompiling method can be isolated
+    // without disabling the whole policy.
+    this.preferFullCoverageOnly = env.JVM_WASM_PREFER_FULL_COVERAGE_ONLY
+      ? new Set(env.JVM_WASM_PREFER_FULL_COVERAGE_ONLY.split(','))
+      : null;
+    this.fullCoverage = new WeakMap(); // method -> settled boolean
+    this.fullCoverageProbes = 0;
+    this.fullCoverageWins = 0;
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
     this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
@@ -2428,10 +2440,19 @@ class WasmJit {
       let attempts = 0;
       for (const count of row.reasons.values()) attempts += count;
       const st = row.st || {};
+      // Whether the module COVERS the whole method, which is a different
+      // question from whether the gate let it in. A tier-preference rule can
+      // only safely take a method off the JS tier when wasm runs it end to
+      // end; admitting a partial module that exits on every entry is the
+      // kta.a([II)V failure mode (runs==exits) the JS preference exists to
+      // avoid. Recorded so that distinction can be measured, not guessed.
+      const meta = st.meta || (st.callee && st.callee.meta) || null;
       return {
         method: key,
         attempts,
         status: st.status || '?',
+        full: meta ? !!meta.fullyCompiled : undefined,
+        normalFull: meta ? !!meta.normalFlowFullyCompiled : undefined,
         runs: st.runs || 0,
         exits: st.exits || 0,
         fuelExits: st.fuelExits || 0,
@@ -2476,6 +2497,45 @@ class WasmJit {
     } catch (err) {
       if (this.debug) console.error(`[wasm-census] probe threw: ${err.message}`);
     }
+  }
+
+  // Does wasm cover this method END TO END? The JS tier is consulted first,
+  // so a method it can compile never reaches the gate at all — on Tomb Racer
+  // that is over half of guest-compiled time, and it is why relaxing gate
+  // rules (the reference-return test) measured flat: the relaxed rule sits
+  // downstream of a gate nothing asks. Order matters, so ask once here.
+  //
+  // The answer must be "covers the whole body", not "the gate would let it
+  // in". A partial module that leaves on every entry is the kta.a([II)V shape
+  // (runs==exits) the whole-method-JS preference exists to avoid, so
+  // fullyCompiled — no demoted block, no deopt site, no exception table — is
+  // the condition, plus a compiled pc-0 entry to enter through.
+  probeFullCoverage(frame) {
+    if (!this.preferFullCoverage || !this.enabled) return false;
+    const method = frame.method;
+    const known = this.fullCoverage.get(method);
+    if (known !== undefined) return known;
+    if (this.preferFullCoverageOnly) {
+      const className = frame.className || method.className || '?';
+      if (!this.preferFullCoverageOnly.has(
+        `${className}.${method.name}${method.descriptor}`)) return false;
+    }
+    this.fullCoverageProbes += 1;
+    try {
+      this.prepare(frame);
+    } catch (err) {
+      if (this.debug) console.error(`[wasm-coverage] probe threw: ${err.message}`);
+    }
+    const st = this.state.get(method);
+    if (!st) return false;
+    // Warmup and deferral are not verdicts — probing again later is exactly
+    // how the method gets its chance — so do not cache them as a refusal.
+    if (st.status === 'cold' || st.status === 'deferred') return false;
+    const meta = st.status === 'ready' ? st.meta : null;
+    const full = !!(meta && meta.fullyCompiled && meta.externalEntry.has(0));
+    this.fullCoverage.set(method, full);
+    if (full) this.fullCoverageWins += 1;
+    return full;
   }
 
   tryRunFrame(frame, thread) {

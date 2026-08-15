@@ -587,10 +587,16 @@ class JitCompiler {
     if (canProbeGenerated && this.tryRunInlineLoopRegionOsr(frame, thread)) {
       return HANDLED_RESULT;
     }
+    // The three predicates below match on static SHAPE. The fourth asks the
+    // wasm gate directly whether it covers this method end to end, which is
+    // evidence rather than a guess, and cannot select the partial-module
+    // shape the JS preference exists to avoid. Off unless
+    // JVM_WASM_PREFER_FULL_COVERAGE=1.
     const wasmPriorityLoop = this.wasmJit.enabled &&
       (this.isOversizedLoopMethod(frame.method) ||
         this.isLongArithmeticLoopMethod(frame.method) ||
-        this.isArrayKernelWasmFirstMethod(frame.method));
+        this.isArrayKernelWasmFirstMethod(frame.method) ||
+        this.wasmJit.probeFullCoverage(frame));
     const wholeMethodPreferred =
       (this.prefersWholeMethodJs(frame.method) ||
         this.isDynamicArrayStructuredFirstMethod(frame.method)) &&

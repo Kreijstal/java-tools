@@ -220,6 +220,29 @@ function censusSummary(ranked, census, guestTotal) {
     .reduce((sum, row) => sum + row.micros, 0);
   out.push(`${'—'.padStart(9)} ${(covered * 100 / guestTotal).toFixed(1)
     .padStart(7)} ${''.padStart(8)}  COVERED (entered + entered-osr)`);
+  // How much of the time the gate turned away, or was never asked about, sits
+  // in methods whose module COVERS the whole body. That is the only slice a
+  // tier-preference change could claim without risking the runs==exits
+  // thrash, so it is the honest size of that lever -- always smaller than the
+  // raw bucket totals above.
+  let fullElsewhere = 0;
+  let fullMethods = 0;
+  let compiledElsewhere = 0;
+  for (const row of ranked) {
+    const entry = censusRow(census, decodeURIComponent(row.key));
+    if (!entry || entry.full === undefined) continue;
+    const reason = dominantReason(entry);
+    if (reason === 'entered' || reason === 'entered-osr') continue;
+    compiledElsewhere += row.micros;
+    if (entry.full) { fullElsewhere += row.micros; fullMethods += 1; }
+  }
+  if (compiledElsewhere) {
+    out.push(`${(fullElsewhere / 1000).toFixed(0).padStart(9)} ` +
+      `${(fullElsewhere * 100 / guestTotal).toFixed(1).padStart(7)} ` +
+      `${String(fullMethods).padStart(8)}  ` +
+      `of which: NOT covered but module is fullyCompiled ` +
+      `(safe tier-preference headroom)`);
+  }
   return out.join('\n');
 }
 
