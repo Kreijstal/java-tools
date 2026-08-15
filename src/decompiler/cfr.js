@@ -1839,6 +1839,11 @@ function decompileCode(code, method, cls, localState, options = {}) {
   }
   const preferOwnedStructurer = options.forceOwnedStructurer === true
     || tableHasTrivialCheckedHandler(code)
+    // A ladder of conditional branches sharing one exit makes the legacy
+    // range recognizer explore overlapping suffixes repeatedly. Obfuscated
+    // boolean guards commonly use this shape; the CFG structurer handles it
+    // in one pass and avoids exponential decompile time.
+    || hasHighConditionalTargetFanIn(codeItemsForSelection)
     || (codeItemsForSelection.length > 128
       && controlTransfers / codeItemsForSelection.length > 0.05
       && !hasSuppressedCleanup);
@@ -1905,6 +1910,20 @@ function decompileCode(code, method, cls, localState, options = {}) {
   const lines = decompileLinearCodeItems(code.codeItems || [], method, cls, localState);
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return coalesceDefaultConstructorBody(lines, method);
+}
+
+function hasHighConditionalTargetFanIn(codeItems, minimumFanIn = 6) {
+  const targetCounts = new Map();
+  for (const item of codeItems || []) {
+    const instruction = getInstructionFromItem(item);
+    if (!instruction || !isConditionalBranch(instruction.op)) continue;
+    const target = String(instruction.arg || '').replace(/:$/, '');
+    if (!target) continue;
+    const count = (targetCounts.get(target) || 0) + 1;
+    if (count >= minimumFanIn) return true;
+    targetCounts.set(target, count);
+  }
+  return false;
 }
 
 function nopNormallyUnreachableBlocks(code) {
@@ -8956,6 +8975,7 @@ module.exports = {
     detectObfuscationGuards,
     formatDouble,
     formatFloat,
+    hasHighConditionalTargetFanIn,
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
   },
