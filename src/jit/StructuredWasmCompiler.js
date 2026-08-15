@@ -44,6 +44,10 @@ const {
 const Frame = require('../core/frame');
 
 const KIND_T = { I: T.i32, J: T.i64, F: T.f32, D: T.f64, A: T.ref };
+// Diagnostic A/B: clear (rather than leave stale) every slot a mid-method
+// exit's spill filter drops. See emitSpillResume.
+const CLEAR_DROPPED = typeof process !== 'undefined'
+  && process.env && process.env.JVM_WASM_CLEAR_DROPPED === '1';
 // Linear-heap element access per bytecode op: wasm load/store opcode and the
 // element size shift. baload/bastore also serve boolean arrays (Int8Array,
 // values 0/1); caload is the only unsigned load (Java char).
@@ -426,6 +430,10 @@ class StructuredWasmCompiler {
       retChar: parseMethodDescriptor(this.method.descriptor).ret,
       blockOfItem,
       supportedBlocks,
+      // resumeItem -> slots this block's exit writes back to frame.locals.
+      // Diagnostic only (JVM_WASM_TRACE_RESUME): lets a resume trace say which
+      // slots the OSR module then reads that this exit never wrote.
+      spillSlots: this.spillSlots || new Map(),
       externalEntry: new Set([0]),
       demoteReasons: this.demoted,
       blockCount: cfg.n,
@@ -670,19 +678,31 @@ class StructuredWasmCompiler {
   emitSpillResume(blockId, out, stub = null) {
     const block = this.blockOf(blockId);
     const spills = [];
+    const dropped = [];
+    const droppedSlots = [];
     for (const [slot, value] of block.slotDefsIn || []) {
       const t = KIND_T[value.kind];
-      if (t === undefined || value.op === 'undef') continue; // dead or conflicted
+      if (t === undefined || value.op === 'undef') { // dead or conflicted
+        dropped.push(`${slot}:${value.op}/${String(value.kind)}`);
+        droppedSlots.push(slot);
+        continue;
+      }
       spills.push({ slot, value, t });
     }
-    if (spills.length) {
+    if (spills.length || (CLEAR_DROPPED && droppedSlots.length)) {
       const slots = spills.map((s) => s.slot);
+      const clear = CLEAR_DROPPED ? droppedSlots : null;
       const box = this.box;
       const idx = this.addImport(
         `spill_h${blockId}`, spills.map((s) => s.t), [],
         (...values) => {
           const locals = box.frame.locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
+          // JVM_WASM_CLEAR_DROPPED=1: a slot the filter dropped keeps whatever
+          // the last user of this (reused) frame left in it. Clearing turns a
+          // plausible stale value into an obvious absent one, so an unsound
+          // drop fails loudly instead of decoding garbage.
+          if (clear) for (let i = 0; i < clear.length; i += 1) locals[clear[i]] = undefined;
         },
       );
       for (const { value } of spills) out.push(...this.useOf(value));
@@ -704,7 +724,11 @@ class StructuredWasmCompiler {
       out.push(OP.i32_const, ...sleb(stub.resumeIdx), OP.return);
       return;
     }
-    out.push(OP.i32_const, ...sleb(this.resumeItemOf(blockId)), OP.return);
+    const resumeItem = this.resumeItemOf(blockId);
+    if (!this.spillSlots) this.spillSlots = new Map();
+    this.spillSlots.set(resumeItem,
+      { slots: spills.map((s) => s.slot), dropped });
+    out.push(OP.i32_const, ...sleb(resumeItem), OP.return);
   }
 
   // The ORIGINAL caller item index the interpreter resumes at for this
@@ -1882,19 +1906,25 @@ class StructuredWasmCompiler {
   emitCallExitStub(node, site, unders, reexecute, out) {
     // locals as of the call, from the SSA snapshot (same filter as EH spill)
     const spills = [];
+    const droppedSlots = [];
     for (const [slot, value] of node.slotState || []) {
       const t = KIND_T[value.kind];
-      if (t === undefined || value.op === 'undef') continue; // dead or conflicted
+      if (t === undefined || value.op === 'undef') { // dead or conflicted
+        droppedSlots.push(slot);
+        continue;
+      }
       spills.push({ slot, value, t });
     }
-    if (spills.length) {
+    if (spills.length || (CLEAR_DROPPED && droppedSlots.length)) {
       const slots = spills.map((s) => s.slot);
+      const clear = CLEAR_DROPPED ? droppedSlots : null;
       const box = this.box;
       const idx = this.addImport(
         `call_spill_${site.resumeIdx}`, spills.map((s) => s.t), [],
         (...values) => {
           const locals = box.frame.locals;
           for (let i = 0; i < slots.length; i += 1) locals[slots[i]] = values[i];
+          if (clear) for (let i = 0; i < clear.length; i += 1) locals[clear[i]] = undefined;
         },
       );
       for (const { value } of spills) out.push(...this.useOf(value));

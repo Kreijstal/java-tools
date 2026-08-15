@@ -2233,6 +2233,9 @@ class WasmJit {
     this.debug = env.JVM_DEBUG_WASMJIT === '1';
     this.traceMethodPattern = env.JVM_TRACE_WASM_METHOD || '';
     this.traceExitsOnly = env.JVM_TRACE_WASM_EXITS_ONLY === '1';
+    this.traceResumePattern = env.JVM_WASM_TRACE_RESUME || '';
+    this.noOsrMethods = env.JVM_WASM_NO_OSR_METHODS
+      ? env.JVM_WASM_NO_OSR_METHODS.split(',').filter(Boolean) : null;
     this.fieldCacheEnabled = env.JVM_DISABLE_WASM_FIELD_CACHE !== '1';
     this.typedArrayStoresEnabled =
       env.JVM_DISABLE_WASM_TYPED_ARRAY_STORES !== '1';
@@ -2724,8 +2727,11 @@ class WasmJit {
         // dispatcher OSR companion, so a fuel exit resumes ONLY in the
         // interpreter. Separates "the spill wrote the wrong locals" from
         // "the OSR module re-entered mid-method on those locals".
-        st.osr = process.env.JVM_WASM_NO_OSR === '1'
-          ? null : { meta, run: osrInstance.exports.run };
+        // JVM_WASM_NO_OSR_METHODS=<substr,...> does the same for named methods
+        // only, so the offending module can be bisected out of a whole boot.
+        const osrBanned = process.env.JVM_WASM_NO_OSR === '1'
+          || (this.noOsrMethods && this.noOsrMethods.some((s) => st.key.includes(s)));
+        st.osr = osrBanned ? null : { meta, run: osrInstance.exports.run };
       } else {
         st.osr = null;
       }
@@ -2850,6 +2856,40 @@ class WasmJit {
   execute(frame, thread, st, blk, nested = false, osr = false) {
     const mod = osr && st.osr ? st.osr : st;
     const meta = mod.meta;
+    // Diagnostic: a structured fuel/deopt exit writes back only the slots its
+    // block's SSA state defines; the dispatcher OSR module's paramSlots is
+    // EVERY typed slot, so it reads slots that exit never wrote. Log the
+    // difference at each OSR entry.
+    if (this.traceResumePattern && osr && !st.osrLogged) {
+      st.osrLogged = true; // one line per method that ever re-enters via OSR
+      console.error('[wasm-osr-method] ' + st.key);
+    }
+    if (this.traceResumePattern && osr && st.lastExitSpill) {
+      const spilled = st.lastExitSpill;
+      const unwritten = meta.paramSlots
+        .filter((p) => !spilled.slots.includes(p.slot))
+        .map((p) => ({ slot: p.slot, t: p.t, v: frame.locals[p.slot] }));
+      // A slot the OSR module loads that the structured exit never wrote AND
+      // that holds no value at all is read as 0/null: state invented from
+      // nothing. That is the shape of the miscompile, so log only those.
+      const stale = unwritten.filter((u) => u.v === undefined);
+      // Only the IMMEDIATE handoff is evidence: if the interpreter advanced
+      // past the exit pc before this OSR entry, it has since written every
+      // slot it actually needed and an unwritten slot is simply dead.
+      const hazard = stale.length > 0 && frame.pc === spilled.pc;
+      if (this.traceResumePattern === '*'
+        ? hazard
+        : (st.key && st.key.includes(this.traceResumePattern))) {
+        console.error('[wasm-resume] ' + JSON.stringify({
+          method: st.key, blk, pc: frame.pc,
+          lastExitPc: spilled.pc, lastExitSpilled: spilled.slots,
+          // Slots the exit DROPPED (had a reaching def, filtered out) are a
+          // real loss; slots merely absent from slotDefsIn had no value.
+          droppedByExit: spilled.dropped,
+          staleSlotsOsrReads: stale.map((u) => `${u.slot}:${u.t}`),
+        }));
+      }
+    }
     meta.box.frame = frame;
     meta.box.ret = undefined;
     const args = new Array(meta.paramSlots.length + 2);
@@ -2929,6 +2969,14 @@ class WasmJit {
     // transient exit: locals already spilled by the stub; resume interpreter here
     st.exits += 1;
     if (status === frame.pc) st.fuelExits += 1; // fuel exit at entry pc is possible but rare
+    if (this.traceResumePattern && !osr && meta.spillSlots) {
+      const rec = meta.spillSlots.get(status);
+      st.lastExitSpill = {
+        pc: status,
+        slots: rec ? rec.slots : [],
+        dropped: rec ? rec.dropped : [],
+      };
+    }
     frame.pc = status;
     // A structured call-site deopt exits with the nested callee's frames
     // parked on the box (innermost first): materialize them above this frame

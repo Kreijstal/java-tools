@@ -286,3 +286,52 @@ test('ssa whole-jar depth differential vs op02', async (t) => {
   t.ok(accepted > 0, 'accepts a nonzero share of the jar');
   t.end();
 });
+
+// A slot first assigned inside an INNER loop reaches the inner header through
+// a phi whose back-edge argument is itself a phi. A single reverse-postorder
+// pass kinds the inner phi only after it has already given up on the header
+// one, leaving the header phi unkinded -- and an unkinded phi is read as a
+// dead slot, so a mid-method wasm exit drops it from the spill and the
+// interpreter resumes the loop on a stale counter. Kinds must reach a
+// fixpoint.
+test('ssa kinds a loop-carried phi whose back-edge arg is itself a phi', (t) => {
+  const fn = buildSsa({
+    method: { name: 'f', descriptor: '(I)V', flags: ['static'] },
+    exceptionTable: [],
+    codeItems: [
+      { pc: 0, instruction: 'iconst_0' },
+      { pc: 1, instruction: 'istore_1' },                              // i = 0
+      { pc: 2, labelDef: 'Louter:', instruction: 'iload_1' },
+      { pc: 3, instruction: 'iload_0' },
+      { pc: 4, instruction: { op: 'if_icmpge', arg: 'Ldone' } },
+      { pc: 5, instruction: 'iconst_0' },
+      { pc: 6, instruction: 'istore_2' },                              // j = 0
+      { pc: 7, labelDef: 'Linner:', instruction: 'iload_2' },
+      { pc: 8, instruction: 'iload_0' },
+      { pc: 9, instruction: { op: 'if_icmpge', arg: 'Lnext' } },
+      { pc: 10, instruction: 'iload_2' },
+      { pc: 11, instruction: { op: 'ifeq', arg: 'Lskip' } },
+      { pc: 12, instruction: 'iload_2' },
+      { pc: 13, instruction: 'istore_3' },                             // k = j
+      { pc: 14, labelDef: 'Lskip:', instruction: { op: 'iinc', varnum: '2', incr: '1' } },
+      { pc: 15, instruction: { op: 'goto', arg: 'Linner' } },
+      { pc: 16, labelDef: 'Lnext:', instruction: { op: 'iinc', varnum: '1', incr: '1' } },
+      { pc: 17, instruction: { op: 'goto', arg: 'Louter' } },
+      { pc: 18, labelDef: 'Ldone:', instruction: 'return' },
+    ],
+  });
+  t.notOk(fn.rejected, 'accepted');
+  const blocks = Array.isArray(fn.blocks) ? fn.blocks : Object.values(fn.blocks);
+  const unkinded = [];
+  for (const block of blocks) {
+    if (!block || !block.phis) continue;
+    for (const phi of block.phis) {
+      if (phi.kind !== null) continue;
+      // an all-undef phi is a genuinely unassigned slot, which is sound
+      if (!phi.args || !phi.args.some((a) => a && a.op !== 'undef')) continue;
+      unkinded.push(`block ${block.id} slot ${phi.origin && phi.origin.slot}`);
+    }
+  }
+  t.deepEqual(unkinded, [], 'no phi with a real argument is left unkinded');
+  t.end();
+});
