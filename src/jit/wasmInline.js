@@ -367,6 +367,12 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
     valueSlots: [start, ...argSlots],
     hasHeapWrite: bodies.some((b) => b.hasHeapWrite),
     elided: elide,
+    // The receiver slot is dead once the site's continuation is reached. Say
+    // so explicitly: a slot written on every trip through a loop is otherwise
+    // live-in at the header, which puts the receiver into a phi there — and a
+    // phi is a use the backend cannot fuse away, costing the site the very
+    // boundary crossing this whole shape exists to avoid.
+    deadReceiverSlot: start,
   };
 }
 
@@ -561,6 +567,15 @@ function inlineCalls(jvm, codeAttr, options = {}) {
         out.push({ labelDef: `${site.prefix}RET:`, instruction: 'nop' });
         origIdx.push(i + 1 < items.length ? i + 1 : -1);
         budget -= site.items.length + 1;
+        if (site.deadReceiverSlot !== undefined) {
+          // See deadReceiverSlot: kill the slot on the continuation so the
+          // receiver does not survive a loop back edge in a phi.
+          out.push({ instruction: 'aconst_null' });
+          origIdx.push(-1);
+          out.push({ instruction: { op: 'astore', arg: String(site.deadReceiverSlot) } });
+          origIdx.push(-1);
+          budget -= 2;
+        }
         inlined += 1;
         continue;
       }

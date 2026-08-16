@@ -418,3 +418,113 @@ test('private helper via invokespecial elides the null guard on `this`', async (
   t.equal(meta.speculations, 0, 'no instanceof guards recorded');
   t.end();
 });
+
+// --- fused receiver loads --------------------------------------------------
+// A receiver loaded out of an array and consumed only by the dispatch guard
+// and field reads is never materialized: each consumer takes (array, index).
+// The interesting path is the one that still needs the reference — the
+// guard-miss deopt stub, which rebuilds the interpreter's operand stack and
+// therefore has to recompute the element it no longer has.
+
+const FUSED_SOURCE = `
+public class FusedRecv {
+  public static int walk(int[] out, Cell[] cells, int n) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) sum += cells[i % 3].val();
+    out[0] = sum;
+    return sum;
+  }
+  public static void walkGuarded(int[] out, Cell[] cells, int n) {
+    int r;
+    try { r = walk(out, cells, n); } catch (NullPointerException e) { r = -42; }
+    out[0] = r;
+  }
+}
+interface Cell { int val(); }
+class CellA implements Cell { int f; public int val() { return f + 1; } }
+class CellB implements Cell { int f; public int val() { return f + 2; } }
+class CellC implements Cell { int f; public int val() { return f + 3; } }
+`;
+
+const CELL_CLASSES = ['CellA', 'CellB', 'CellC'];
+
+function cellArray(values) {
+  const cells = values.map((v, i) => (v === null ? null : {
+    type: CELL_CLASSES[i % 3],
+    fields: { [`${CELL_CLASSES[i % 3]}.f`]: v },
+  }));
+  cells.type = '[LCell;';
+  return cells;
+}
+
+function expectedWalk(fs, n) {
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum = (sum + fs[i % 3] + (i % 3) + 1) | 0;
+  return sum;
+}
+
+test('an array-loaded receiver is consumed without a load of its own', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'FusedRecv', FUSED_SOURCE, CELL_CLASSES,
+    { JVM_WASM_IMPORT_STATS: '1' });
+  const n = 3000;
+  const out = [0];
+  out.type = '[I';
+  const cells = cellArray([10, 20, 30]);
+  await invoke(jvm, thread, 'FusedRecv', 'walk', '([I[LCell;I)I', [out, cells, n]);
+  t.equal(out[0], expectedWalk([10, 20, 30], n), 'three-way walk matches the reference');
+
+  const meta = metaOf(jvm, 'FusedRecv.walk([I[LCell;I)I');
+  t.ok(meta && meta.structured, 'walk compiled by the structured backend');
+  t.ok(meta.inlinedCalls >= 1, 'the interface call was inlined');
+  t.ok(meta.deoptStubCount >= 1, 'the guard-miss deopt stub is present');
+  const imports = meta.importStats;
+  t.ok(imports instanceof Map, 'import census recorded');
+  const called = [...imports.entries()].filter(([, count]) => count > 0).map(([n2]) => n2);
+  t.ok(called.some((name) => name.startsWith('gidxat_')),
+    'the guard took the array and index directly');
+  t.ok(called.some((name) => name.startsWith('gfat_')),
+    'the field read took the array and index directly');
+  t.notOk(called.includes('aget_r'),
+    'no reference-array load import ran: the receiver never crossed the boundary');
+  t.end();
+});
+
+test('a fused receiver is rematerialized for the guard-miss deopt stub', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'FusedRecv', FUSED_SOURCE, CELL_CLASSES);
+  const n = 3000;
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'FusedRecv', 'walk', '([I[LCell;I)I',
+    [out, cellArray([1, 2, 3]), n]);
+  t.ok(metaOf(jvm, 'FusedRecv.walk([I[LCell;I)I'), 'walk is compiled before the miss');
+
+  // index 1 is null: the guard returns "no arm", the stub has to put the
+  // receiver back on the interpreter's operand stack, and the interpreter
+  // re-executes the invoke and throws.
+  const withHole = cellArray([1, null, 3]);
+  await invoke(jvm, thread, 'FusedRecv', 'walkGuarded', '([I[LCell;I)V',
+    [out, withHole, n]);
+  t.equal(out[0], -42, 'the null element NPEs through the rematerializing deopt stub');
+
+  // and the compiled path is still correct afterwards
+  await invoke(jvm, thread, 'FusedRecv', 'walk', '([I[LCell;I)I',
+    [out, cellArray([4, 5, 6]), n]);
+  t.equal(out[0], expectedWalk([4, 5, 6], n), 'later runs still compute the right sum');
+  t.end();
+});
+
+test('JVM_WASM_FUSE_RECEIVER=0 keeps the same results without fusing', async (t) => {
+  const { jvm, thread } = await makeHarness(t, 'FusedRecv', FUSED_SOURCE, CELL_CLASSES,
+    { JVM_WASM_FUSE_RECEIVER: '0', JVM_WASM_IMPORT_STATS: '1' });
+  const n = 3000;
+  const out = [0];
+  out.type = '[I';
+  await invoke(jvm, thread, 'FusedRecv', 'walk', '([I[LCell;I)I',
+    [out, cellArray([7, 8, 9]), n]);
+  t.equal(out[0], expectedWalk([7, 8, 9], n), 'unfused walk matches the same reference');
+  const imports = metaOf(jvm, 'FusedRecv.walk([I[LCell;I)I').importStats;
+  const called = [...imports.entries()].filter(([, count]) => count > 0).map(([n2]) => n2);
+  t.ok(called.includes('aget_r'), 'the kill switch restores the separate receiver load');
+  t.notOk(called.some((name) => name.startsWith('gidxat_')), 'and no fused guard');
+  t.end();
+});

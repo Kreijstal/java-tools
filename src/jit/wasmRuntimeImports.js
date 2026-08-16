@@ -213,7 +213,11 @@ function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = me
   });
 }
 
-function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
+// `elementOf` turns an instance field access into one that takes (array,
+// index) and loads the receiver itself. The caller uses it when the receiver's
+// only consumers are accesses like this one, so the element load never needs a
+// boundary crossing of its own. Everything downstream is unchanged.
+function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
   const [, className, [fieldName, descriptor]] = ins.arg;
   const t = descToWasm(descriptor[0]);
   if (isStaticOp) {
@@ -248,16 +252,16 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
         : reg.addImport(name, [t], [], (v) => container.set(key, v)),
     };
   }
-  const name = `${isGet ? 'gf' : 'pf'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
+  const name = `${isGet ? 'gf' : 'pf'}${elementOf ? 'at' : ''}_${className}_${fieldName}`
+    .replace(/[^\w]/g, '_');
   const keyCache = new Map();
-  // Almost every site is monomorphic; keep the last class's key one compare
-  // away instead of a Map lookup per access. The compare is on the object's
-  // dense class index rather than its class name: an integer compare, and it
-  // does not have to read a string out of a guest object on the hot path.
-  // -1 never collides with a real index, so objects without one (host-made
-  // refs, arrays) simply take the slow path every time, as before.
-  let cachedIndex = -1;
-  let cachedFieldKey;
+  // Storage key per receiver class, indexed by the object's dense class index
+  // (see classIndexOf): an array read, no string leaves the guest object on
+  // the hot path. A one-entry cache was enough while sites were assumed
+  // monomorphic, but a three-receiver site missed it on two calls in three and
+  // fell back to hashing the class name. Objects without an index — host-made
+  // refs, arrays — read through keyOf every time, as they always did.
+  const keyByIndex = [];
   const keyOf = (obj) => {
     const ct = obj._className || obj.type;
     let key = keyCache.get(ct);
@@ -269,9 +273,11 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
   };
   const resolveKey = (obj) => {
     const index = obj.cidx;
-    if (index !== undefined && index === cachedIndex) return cachedFieldKey;
+    if (index === undefined) return keyOf(obj);
+    const hit = keyByIndex[index];
+    if (hit !== undefined) return hit;
     const key = keyOf(obj);
-    if (index !== undefined) { cachedIndex = index; cachedFieldKey = key; }
+    keyByIndex[index] = key;
     return key;
   };
   const requireObj = (obj) => {
@@ -307,14 +313,45 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
         const value = readInstance(obj);
         return typeof value === 'boolean' ? (value ? 1 : 0) : value;
       }
-      const index = obj.cidx;
-      const value = fields[
-        index !== undefined && index === cachedIndex ? cachedFieldKey : resolveKey(obj)];
+      const value = fields[keyByIndex[obj.cidx] ?? resolveKey(obj)];
       return typeof value === 'boolean' ? (value ? 1 : 0) : value;
     }
     : t === T.ref
       ? (obj) => { requireObj(obj); return readInstance(obj); }
       : (obj) => { requireObj(obj); return toWasmValue(t, readInstance(obj)); };
+  if (elementOf) {
+    // int fields get their own flattened body rather than composing the two
+    // helpers: this import is called once per iteration of a polymorphic hot
+    // loop, and each closure frame it does not enter is worth about a
+    // nanosecond of the ~3 it costs.
+    const getFromArray = t !== T.i32 ? (array, i) => getInstance(elementOf(array, i))
+      : (array, i) => {
+        const u = i >>> 0;
+        const obj = Array.isArray(array) && u < array.length
+          ? array[u] : elementOf(array, i);
+        if (obj === null || obj === undefined) {
+          throw { type: 'java/lang/NullPointerException', message: null };
+        }
+        const fields = obj.fields;
+        if (fields === undefined) {
+          const value = readInstance(obj);
+          return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+        }
+        const value = fields[keyByIndex[obj.cidx] ?? resolveKey(obj)];
+        return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+      };
+    return {
+      t,
+      name,
+      idx: isGet
+        ? reg.addImport(name, [T.ref, T.i32], [t], getFromArray)
+        : reg.addImport(name, [T.ref, T.i32, t], [], (array, i, v) => {
+          const obj = elementOf(array, i);
+          requireObj(obj);
+          writeInstance(obj, v);
+        }),
+    };
+  }
   return {
     t,
     name,

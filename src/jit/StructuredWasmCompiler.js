@@ -31,8 +31,9 @@ const {
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   Unsupported, NestedDeopt, isGuestThrow, sig, assembleModule, liveExceptionRanges,
-  maxImpls,
+  maxImpls, NPE, AIOOBE,
 } = require('./wasmShared');
+const monoArray = require('./monoArray');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
   addTimeImport, addNewArrayImport, addANewArrayImport, addNewImport,
@@ -75,6 +76,40 @@ const HEAP_STORE = {
 // instances or lack the tag. The EH catch path must never swallow the latter.
 // Placeholder return value while the deopt flag is set; the wasm-side flag
 // check exits before the value is observed.
+// Constants and total arithmetic: no side effect, no throw, no heap read.
+// Deliberately a whitelist — idiv/irem/array/field/call ops are all absent, so
+// anything unrecognized is treated as impure.
+const PURE_OPS = new Set([
+  'bipush', 'sipush', 'aconst_null', 'iinc',
+  'ineg', 'lneg', 'fneg', 'dneg', 'lcmp', 'fcmpl', 'fcmpg', 'dcmpl', 'dcmpg',
+  'i2c',
+]);
+// The element load a fused consumer does for itself. Reference arrays are
+// plain JS Arrays; the zoo path covers the {elements} wrapper a few JRE-made
+// arrays still use. Throws the same guest NPE/AIOOBE the aaload import would.
+function arrayElement(array, i, where) {
+  if (array === null || array === undefined) {
+    throw NPE(`Attempted load on null array in ${where}`);
+  }
+  if (Array.isArray(array)) {
+    const u = i >>> 0;
+    if (u >= array.length) throw AIOOBE(i, array.length);
+    return array[u];
+  }
+  const value = monoArray.load(array, i);
+  if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(array));
+  return value;
+}
+
+function isPureNode(node) {
+  const op = node.op;
+  if (PURE_OPS.has(op)) return true;
+  if (op in ICONST || op in LCONST || op in FCONST || op in DCONST) return true;
+  if (CONVERT[op]) return true;
+  if (BIN_OPS[op]) return true;
+  return false;
+}
+
 function dummyRet(ret) {
   if (ret === 'V') return undefined;
   if (ret === 'J') return 0n;
@@ -214,6 +249,15 @@ class StructuredWasmCompiler {
     this.cfg = cfg;
     this.items = items;
     this.originalItems = codeAttr.code.codeItems;
+
+    // Receiver-load / guard pairs eligible for fusion into one crossing. The
+    // safety argument is entirely in the adjacency test: the two nodes must be
+    // consecutive in the block's pinned body order, so fusing them keeps the
+    // load at the same point, in the same order, executed exactly once — no
+    // rematerialization, no aliasing question, and the element still reaches
+    // its own local for every other consumer. Anything less adjacent simply
+    // does not fuse.
+    this.computeFusedReceiverLoads(fn);
 
     // Live handler ranges. With EH enabled (default), blocks they cover
     // compile anyway: every throwing op inside such a method is wrapped in
@@ -648,6 +692,104 @@ class StructuredWasmCompiler {
     for (const { phi } of copies) out.push(...this.cacheKillsFor(phi.id));
   }
 
+  // A receiver loaded out of an array and consumed only by a dispatch guard
+  // and field reads never needs to exist as a wasm value: each consumer takes
+  // (array, index) and loads the element on the JS side it was already going
+  // to cross to, which is one whole boundary crossing per iteration saved.
+  //
+  // Everything else that wants the reference — the guard-miss deopt stub
+  // rebuilding the interpreter's operand stack, a fuel exit spilling live
+  // slots, an exception spill — goes through useOf below and gets it
+  // recomputed from the same two SSA values. Those paths leave wasm anyway, so
+  // the crossing they pay is free in the only sense that matters.
+  //
+  // Two conditions make the recomputation equal to the original load, checked
+  // per candidate: every consumer must be one of the fusable kinds (so nothing
+  // observes the reference itself), and only pure nodes may execute between
+  // the load and any consumer on any path (so no store can change which object
+  // arr[i] names). The backward walk below is what proves the second — it
+  // terminates at the load's own block because the load dominates every use.
+  computeFusedReceiverLoads(fn) {
+    this.fusedGuardOfLoad = new Map();   // load -> guard node
+    this.fusedGuardArms = new Set();     // guards computed from (array, index)
+    this.fusedFieldReads = new Set();    // getfields taking (array, index)
+    this.rematLoads = new Map();         // load -> { array, index }
+    if (process.env.JVM_WASM_FUSE_RECEIVER === '0') return;
+    const blockById = new Map(fn.blocks.map((b) => [b.id, b]));
+    for (const block of fn.blocks) {
+      for (const load of block.body) {
+        if (load.op !== 'aaload' || load.kind !== 'A' || !load.uses.length) continue;
+        let guard = null;
+        const fields = new Set();
+        let ok = true;
+        for (const use of load.uses) {
+          if (use.op === 'invokestatic' && Array.isArray(use.imm) &&
+              use.imm[1] === GUARD_OWNER && use.args[0] === load) {
+            if (guard) { ok = false; break; }
+            guard = use;
+          } else if (use.op === 'getfield' && use.args[0] === load) {
+            fields.add(use);
+          } else { ok = false; break; }
+        }
+        const consumers = ok && guard ? new Set([guard, ...fields]) : null;
+        const impure = consumers ? [...consumers].filter((use) =>
+          !this.pathToUseIsPure(load, use, consumers, blockById)) : [];
+        // JVM_DEBUG_FUSE=1 prints why a receiver load did not fuse, which is
+        // always one of two things: a use that is not a guard or field read
+        // (a phi from a slot still live across a back edge is the usual one),
+        // or something impure on the path to a consumer.
+        if (process.env.JVM_DEBUG_FUSE === '1') {
+          console.error('[fuse]', `${this.className}.${this.method.name}`,
+            `load#${load.id}`, consumers ? 'candidate' : 'rejected',
+            `uses=${load.uses.map((u) => u.op).join(',')}`,
+            impure.length ? `impure->${impure.map((u) => u.op).join(',')}` : '');
+        }
+        if (!consumers || impure.length) continue;
+        this.fusedGuardOfLoad.set(load, guard);
+        this.fusedGuardArms.add(guard);
+        for (const field of fields) this.fusedFieldReads.add(field);
+        this.rematLoads.set(load, { array: load.args[0], index: load.args[1] });
+      }
+    }
+  }
+
+  // Walks back from `use` to the load, across predecessors, rejecting anything
+  // that is not pure or another consumer of the same load.
+  pathToUseIsPure(load, use, consumers, blockById) {
+    const clean = (node) => node === load || consumers.has(node) || isPureNode(node);
+    const scanRange = (body, from, to) => {
+      for (let i = from; i < to; i += 1) if (!clean(body[i])) return false;
+      return true;
+    };
+    const useBlock = blockById.get(use.block);
+    const loadBlock = blockById.get(load.block);
+    if (!useBlock || !loadBlock) return false;
+    const loadIdx = loadBlock.body.indexOf(load);
+    if (loadIdx < 0) return false;
+    if (use.block === load.block) {
+      const useIdx = useBlock.body.indexOf(use);
+      return useIdx > loadIdx && scanRange(loadBlock.body, loadIdx + 1, useIdx);
+    }
+    if (!scanRange(useBlock.body, 0, useBlock.body.indexOf(use))) return false;
+    const seen = new Set([use.block]);
+    const queue = [...useBlock.predIds];
+    while (queue.length) {
+      const id = queue.pop();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const block = blockById.get(id);
+      if (!block) return false;
+      if (id === load.block) {
+        if (!scanRange(block.body, loadIdx + 1, block.body.length)) return false;
+        continue; // the load's block ends the walk: it dominates every use
+      }
+      if (!scanRange(block.body, 0, block.body.length)) return false;
+      if (!block.predIds.length) return false; // reached entry without the load
+      queue.push(...block.predIds);
+    }
+    return true;
+  }
+
   mustLocal(value) {
     const idx = this.localOf.get(value);
     if (idx === undefined) throw new Unsupported(`no local for ${value.op} kind ${value.kind}`);
@@ -655,6 +797,11 @@ class StructuredWasmCompiler {
   }
 
   useOf(value) {
+    const remat = this.rematLoads && this.rematLoads.get(value);
+    if (remat) {
+      return [...this.useOf(remat.array), ...this.useOf(remat.index),
+        OP.call, ...uleb(this.importIndexByName.get('aget_r'))];
+    }
     return [OP.local_get, ...uleb(this.mustLocal(value))];
   }
 
@@ -952,6 +1099,13 @@ class StructuredWasmCompiler {
     // arrays
     if (ARRAY_LOAD[op] !== undefined) {
       const t = ARRAY_LOAD[op];
+      if (this.rematLoads.has(node)) {
+        // The element is recomputed inside each consumer, so nothing is loaded
+        // here — but caches keyed on this value still describe the PREVIOUS
+        // iteration's object and must be killed at exactly this point.
+        out.push(...this.cacheKillsFor(node.id));
+        return;
+      }
       if (this.heap && HEAP_LOAD[op]) {
         out.push(...this.heapAccessSeq(node, HEAP_LOAD[op], null, t));
         return finish();
@@ -1001,14 +1155,23 @@ class StructuredWasmCompiler {
     if (op === 'getstatic' || op === 'getfield' || op === 'putstatic' || op === 'putfield') {
       const isGet = op[0] === 'g';
       const isStatic = op.endsWith('static');
-      const field = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, isGet);
+      // A read whose receiver was fused away takes (array, index) and loads
+      // the element itself; `use(0)` is replaced by the load's two operands.
+      const fusedRemat = this.fusedFieldReads.has(node)
+        ? this.rematLoads.get(node.args[0]) : null;
+      const where = `${this.className}.${this.method.name}`;
+      const field = addFieldImport(this, this.jvm, { arg: node.imm }, isStatic, isGet,
+        fusedRemat ? ((array, i) => arrayElement(array, i, where)) : null);
+      const receiver = fusedRemat
+        ? [...this.useOf(fusedRemat.array), ...this.useOf(fusedRemat.index)]
+        : null;
       const [, fieldOwner, [fieldName, descriptor]] = node.imm;
       const killKey = `${fieldName}:${descriptor}`;
       const caching = !this.wasmJit || this.wasmJit.fieldCacheEnabled !== false;
       // Slab path: the field has a static offset inside the wasm memory and
       // its slot kind matches the wasm type the import would have produced
       // (float fields keep an f64 slot for JS, so they stay on the import).
-      const slot = !isStatic && this.slabFields
+      const slot = !isStatic && this.slabFields && !receiver
         ? slabSlotFor(this.jvm, fieldOwner, fieldName) : null;
       const slotT = slot && (slot.kind === 'i32' ? T.i32
         : slot.kind === 'f64' ? T.f64 : T.i64);
@@ -1036,7 +1199,7 @@ class StructuredWasmCompiler {
         // this exact SSA value already loaded this field successfully
         const loadSeq = isStatic
           ? [OP.call, ...uleb(field.idx)]
-          : [...use(0), OP.call, ...uleb(field.idx)];
+          : [...(receiver || use(0)), OP.call, ...uleb(field.idx)];
         // Dependent caches (arrays/fields keyed on a reader's value) are
         // killed on the refill path only — a hit reproduces the entry's
         // cached value verbatim. The entry is SHARED by every reader node of
@@ -1051,7 +1214,12 @@ class StructuredWasmCompiler {
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
         return;
       }
-      for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
+      if (receiver) {
+        out.push(...receiver);
+        for (let i = 1; i < node.args.length; i += 1) out.push(...use(i));
+      } else {
+        for (let i = 0; i < node.args.length; i += 1) out.push(...use(i));
+      }
       out.push(OP.call, ...uleb(field.idx));
       if (!isGet) {
         out.push(...this.killSeqWhere((entry) => (
@@ -1081,8 +1249,15 @@ class StructuredWasmCompiler {
     // dispatch map. Sites whose callee can hand the call back (deoptable)
     // get a flag check + exit stub right after the import call.
     if (op === 'invokestatic' && node.imm && node.imm[1] === GUARD_OWNER) {
-      out.push(...use(0));
-      out.push(OP.call, ...uleb(this.guardIndexImport(Number(node.imm[2][0]))));
+      const siteIndex = Number(node.imm[2][0]);
+      if (this.fusedGuardArms.has(node)) {
+        const remat = this.rematLoads.get(node.args[0]);
+        out.push(...this.useOf(remat.array), ...this.useOf(remat.index));
+        out.push(OP.call, ...uleb(this.guardIndexAtImport(siteIndex)));
+      } else {
+        out.push(...use(0));
+        out.push(OP.call, ...uleb(this.guardIndexImport(siteIndex)));
+      }
       out.push(OP.local_set, ...uleb(this.mustLocal(node)));
       return;
     }
@@ -1444,12 +1619,9 @@ class StructuredWasmCompiler {
   // chain of missed `instanceof` guards did). Memoized by the receiver's dense
   // class index, so the steady state is an array read and one boundary
   // crossing per call instead of one per arm.
-  guardIndexImport(siteIndex) {
+  guardArmLookup(siteIndex) {
     const classes = (this.guardSites || [])[siteIndex];
     if (!classes) throw new Unsupported('guard site');
-    const name = `gidx_${siteIndex}_${classes.join('_')}`.replace(/[^\w]/g, '_');
-    const existing = this.importIndexByName.get(name);
-    if (existing !== undefined) return existing;
     const jvm = this.jvm;
     const byIndex = [];
     const byName = new Map();
@@ -1460,7 +1632,7 @@ class StructuredWasmCompiler {
       }
       return -1;
     };
-    return this.addImport(name, [T.ref], [T.i32], (ref) => {
+    const lookup = (ref) => {
       if (ref === null || ref === undefined) return -1;
       const index = ref.cidx;
       if (index !== undefined) {
@@ -1474,6 +1646,37 @@ class StructuredWasmCompiler {
       let arm = byName.get(source);
       if (arm === undefined) { arm = armOf(ref); byName.set(source, arm); }
       return arm;
+    };
+    return { classes, lookup };
+  }
+
+  guardIndexImport(siteIndex) {
+    const { classes, lookup } = this.guardArmLookup(siteIndex);
+    const name = `gidx_${siteIndex}_${classes.join('_')}`.replace(/[^\w]/g, '_');
+    const existing = this.importIndexByName.get(name);
+    if (existing !== undefined) return existing;
+    return this.addImport(name, [T.ref], [T.i32], lookup);
+  }
+
+  // The same guard, fused with the array load that produces its receiver: one
+  // crossing returns BOTH the arm index and the element (wasm multi-value).
+  // The element still lands in the load's own local, so the deopt stub, the
+  // spill paths and the arm bodies read it exactly as before — this changes
+  // how many times the boundary is crossed, not what is on either side of it.
+  // The same guard taking (array, index) instead of the loaded receiver. A
+  // JS import CANNOT hand back two values instead — a multi-value return goes
+  // through the iterable protocol and measured 102 ns/call against 4.8 for a
+  // single i32, which is why the element is recomputed rather than returned.
+  guardIndexAtImport(siteIndex) {
+    const { classes, lookup } = this.guardArmLookup(siteIndex);
+    const name = `gidxat_${siteIndex}_${classes.join('_')}`.replace(/[^\w]/g, '_');
+    const existing = this.importIndexByName.get(name);
+    if (existing !== undefined) return existing;
+    const where = `${this.className}.${this.method.name}`;
+    return this.addImport(name, [T.ref, T.i32], [T.i32], (array, i) => {
+      const u = i >>> 0;
+      if (Array.isArray(array) && u < array.length) return lookup(array[u]);
+      return lookup(arrayElement(array, i, where));
     });
   }
 
