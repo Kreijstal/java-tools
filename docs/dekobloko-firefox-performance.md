@@ -7149,3 +7149,86 @@ Cumulative for the day: `iface` 73.66 -> 1.21 ns/iter (90.7x -> 1.5x), `poly`
 118.78 -> 18.97 (32x -> 5.1x). `tile` is still ~224x and still exits on
 `instanceof`, a static-field write and `invoke makeTile` — it has not been
 touched, and none of this has been measured against a real boot yet.
+
+## 2026-08-16 — tile is 224x because nothing about it is on the wasm tier
+
+`tile` had been carried in the table for a while as "still ~224x, still exits
+on instanceof, a static-field write and invoke makeTile". That description was
+true and useless, because it implied the wasm tier was running the method
+badly. It is not running it at all.
+
+The tier ladder is flat:
+
+| tier | tile ns/iter |
+|---|---|
+| interpreter only | 40701.81 |
+| JS tier | 2840.81 |
+| JS tier + wasm | 2840.52 |
+
+and the control confirms it from the other side: `JVM_WASM_JIT_WARMUP=2000`
+leaves `runTile` at `status=cold` — no module is ever built — for the same
+time. Whatever the wasm tier is doing, its contribution is zero.
+
+The JS-tier number is also not tile-specific. Per shape:
+
+| shape | calls/iter | JS tier ns/iter |
+|---|---|---|
+| arith | 0 | 52.37 |
+| iface | 1 | 225.83 |
+| poly | 1 | 316.53 |
+| tile | ~6 | 2748.87 |
+
+Roughly 250-450 ns per call site is simply what that tier costs. `iface` and
+`poly` are at 1.19 and 18.99 because they *inline on the wasm tier*; `tile` is
+what they look like when nothing inlines. So "why is tile 224x" is only ever
+the question "why does nothing inline here", and `JVM_WASM_CENSUS=1` plus a
+compile trace answers it as a chain where each link causes the next:
+
+1. `runTile`'s prologue allocates, so its entry block wants
+   `PlainCell.<init>`, and **constructors never get a module** — `prepare`
+   refuses them outright (`ctor-or-clinit`) because allocation and `<clinit>`
+   have observable all-or-nothing ordering.
+2. A demoted *entry* block makes the **structured tier decline the whole
+   method** (`structured fallback: entry demoted`). That is the tier that
+   inlines, so inlining is now off the table for every call in the body.
+3. On the dispatcher tier each call instead needs its callee to own a ready
+   module.
+4. The callees — `Cache.get`, `Tile.blend`, `Tile.hashCode`, `makeTile` — are
+   loop-free leaves, and the gate requires a backward branch, so the census
+   shows all of them at `no-supported-backedge` with `status=cold` forever.
+   Every loop-body block ends up `no ready impl`.
+5. The result is a `status=ready` module at **`runs=123 exits=123`**: entered,
+   exits on the first block, contributes nothing.
+
+Two things came out of chasing that chain.
+
+**`instanceof` was missing from the block compiler.** The structured compiler
+has handled it since it was written; the block compiler had only `checkcast`,
+so the ordinary cache-and-guard shape `if (x instanceof T) use((T) x)` demoted
+its block — and one demoted block in a loop body costs the whole method its
+module. The hierarchy question and its memo are the same as `checkcast`'s, so
+one import now serves both: `checkcast` yields the reference (null passes) or
+throws CCE, `instanceof` yields 0/1 and never throws. With the method's other
+blockers out of the way (a late compile), **2769.69 -> 931.82 ns/iter, 224x ->
+72x**, and the module goes from `runs=123 exits=123` to `runs=2 exits=0`.
+
+**The rebuild trigger was waiting on the wrong signal.** A module demoted
+because a class was absent or uninitialized waited on `classEpoch:compileEpoch`
+— which stops moving once the opening burst is over, while the classes its body
+touches are still being initialized around it. So the trigger fired 4 times
+early and never again, and raising `JVM_WASM_DEP_RECOMPILES` from 3 to 100
+changed nothing, because the budget was never what stopped it. `Unsupported`
+now carries the class that blocked it, and the module waits on *that class's*
+readiness. Absent, loaded and initialized are tracked separately because they
+clear different reasons at different times: `invoke X.m unresolved` goes on the
+load, `new X not initialized` only on the `<clinit>`. Adding
+`classInitializationEpoch` to the coarse version was tried first and rejected:
+it helped nothing and only made the fallback fire more often.
+
+Neither fix moves `tile` at the default warmup, and the honest reading is that
+they were prerequisites rather than the cure. What is left is links 1 and 4 of
+the chain, both structural: **constructors can never own a module**, and
+**loop-free leaf callees are never compiled even when a hot caller needs one to
+link**. Those are worth far more than this fixture suggests — real loading code
+is exactly this shape, small leaf calls and allocation, which is why the boot
+audit reads as call/alloc-bound with a quarter of guest time never compiled.
