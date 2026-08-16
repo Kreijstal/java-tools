@@ -20,6 +20,11 @@ const {
   isReflectiveTarget,
   completeReflectiveCall,
 } = require("../instructions/control");
+// Parsed once; see the matching set in instructions/invoke.js. Reading and
+// splitting this per constructor dispatch cost two allocations on every `new`.
+const debugConstructorOwners = new Set(
+  ((typeof process !== "undefined" && process.env
+    ? process.env.JVM_DEBUG_CONSTRUCTORS : "") || "").split(",").filter(Boolean));
 const { buildSsa } = require("../analysis/opgraph/ssa");
 const { kindWidth } = require("../analysis/opgraph/ssaTypes");
 const { buildCfgFromCode } = require("../decompiler/structurer");
@@ -8906,8 +8911,8 @@ class JitCompiler {
       frame.pc = invokePc;
       throw new Error(`Unsupported ${op}: ${targetClassName}.${methodName}${descriptor}`);
     }
-    if (methodName === "<init>" && typeof process !== "undefined" && process.env &&
-        String(process.env.JVM_DEBUG_CONSTRUCTORS || "").split(",").includes(targetClassName)) {
+    if (debugConstructorOwners.size && methodName === "<init>" &&
+        debugConstructorOwners.has(targetClassName)) {
       console.error(`[constructor] jit resolved ${targetClassName}${descriptor} ` +
         `from ${frame.className}.${frame.method && frame.method.name}@${invokePc}`);
     }

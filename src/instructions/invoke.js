@@ -15,6 +15,12 @@ const frameHandoffTracePattern = typeof process !== 'undefined' && process.env
 const frameHandoffTracePc = typeof process !== 'undefined' && process.env &&
   process.env.JVM_TRACE_FRAME_HANDOFF_PC !== undefined
   ? Number(process.env.JVM_TRACE_FRAME_HANDOFF_PC) : null;
+// Parsed once. This was read, string-coerced and split on EVERY constructor
+// dispatch — two allocations per `new` on the interpreter's hottest path, paid
+// in full by every run that never sets the variable.
+const debugConstructorOwners = new Set(
+  ((typeof process !== 'undefined' && process.env
+    ? process.env.JVM_DEBUG_CONSTRUCTORS : '') || '').split(',').filter(Boolean));
 
 function runtimeClassName(obj) {
   return obj && (obj._className || obj.type);
@@ -117,9 +123,8 @@ function pushBytecodeInvokeFrame(frame, thread, target, params, receiver, isStat
     }
   }
   thread.callStack.push(child);
-  if (target.method && target.method.name === '<init>' &&
-      typeof process !== 'undefined' && process.env &&
-      String(process.env.JVM_DEBUG_CONSTRUCTORS || '').split(',').includes(target.owner)) {
+  if (debugConstructorOwners.size && target.method &&
+      target.method.name === '<init>' && debugConstructorOwners.has(target.owner)) {
     console.error(`[constructor] sync push ${target.owner}${target.method.descriptor} from ` +
       `${frame.className}.${frame.method && frame.method.name}` +
       `${frame.method && frame.method.descriptor || ''}@${frame.pc - 1}`);
@@ -576,9 +581,8 @@ async function invokestatic(frame, instruction, jvm, thread) {
 
 async function invokespecial(frame, instruction, jvm, thread) {
   const [_, className, [methodName, descriptor]] = instruction.arg;
-  const debugConstructor = methodName === '<init>' &&
-    typeof process !== 'undefined' && process.env &&
-    String(process.env.JVM_DEBUG_CONSTRUCTORS || '').split(',').includes(className);
+  const debugConstructor = debugConstructorOwners.size &&
+    methodName === '<init>' && debugConstructorOwners.has(className);
   if (debugConstructor) {
     console.error(`[constructor] dispatch ${className}${descriptor} from ` +
       `${frame.className}.${frame.method && frame.method.name}@${frame.pc - 1}`);
