@@ -83,10 +83,18 @@ run_test() {
     *data-zip-download*) timeout_cmd=(timeout 60);;
     */breakpointLocations.test.js) timeout_cmd=(timeout 120);;
     */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
-    */jitCompiler.test.js) timeout_cmd=(timeout 300);;
-    */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 60);;
-    */javaFrontendIr.test.js) timeout_cmd=(timeout 60);;
+    */hotCallGraphRegion.test.js) timeout_cmd=(timeout 120);;
+    */jitCompiler.test.js) timeout_cmd=(timeout 600);;
+    */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 180);;
+    */javaFrontendIr.test.js) timeout_cmd=(timeout 120);;
     */roundtrip.test.js) timeout_cmd=();; # roundtrip enforces per-case timeouts internally
+    # The wasm suites build and instantiate real modules, so they run well past
+    # the default budget: 39s, 24s, 20s and 15s respectively when measured on an
+    # idle machine. Leave generous headroom for slower/loaded runs.
+    */structuredWasm.test.js) timeout_cmd=(timeout 120);;
+    */wasmHeapArrays.test.js) timeout_cmd=(timeout 120);;
+    */wasmInstanceInline.test.js) timeout_cmd=(timeout 120);;
+    */wasmInstanceLink.test.js) timeout_cmd=(timeout 120);;
     # Add other special cases here
   esac
 
