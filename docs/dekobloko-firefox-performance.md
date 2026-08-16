@@ -6789,3 +6789,69 @@ also died at 30 s on the already-known `dh.a(IIILan;IIIB)V` miscompile
 (`saload` index 576 into length 124, same method and pc as previously recorded),
 which is unrelated to these changes but is evidently reachable without
 `JVM_JIT_WARMUP=1`.
+
+## 2026-08-16: inlining integer getters, and the same lesson a second time
+
+`iface` is one interface call per iteration whose callee is `return w + bias`.
+We charged 422 ns for it where HotSpot charges under 2 — roughly 1500 cycles to
+perform an add — because the callee ran as a full generated *frame*. Profiling
+that shape alone shows the callee never even appears as its own tier entry: all
+the time is the caller's generated code plus the boundary machinery.
+
+The inline machinery already existed (`getInlineIntegerRegion`), but its opcode
+whitelist was **arithmetic only** — `iload`, `iconst`, `bipush`, `ldc`, the
+integer ALU ops, `if*`, `invokestatic`, `ireturn`. No `aload`, no `getfield`. So
+it could inline a pure function of its arguments and nothing else, which
+excludes essentially every real getter, including all of the `ffa` accessors
+that make `npa.b` call-dense.
+
+Two opcodes were added to the plan builder:
+
+- `aload_0`, admissible because every parameter is already proven `int`, so on
+  an instance method slot 0 is the *only* reference in scope.
+- `getfield`, restricted to a field whose declaring slot is statically known
+  (`directInstanceKey`), whose descriptor is `I`, and whose object operand is
+  literally the receiver expression — so no second object's nullness has to be
+  reasoned about. It emits the same guarded direct read the ordinary generated
+  tier uses, falling back to `getFieldAt`, which resolves nonstandard layouts
+  and throws the correct NPE. Because a field read *can* throw, unlike the rest
+  of the whitelist, it is refused outright when the body has an exception table,
+  since handler blocks are dropped from the CFG earlier in that function.
+
+The stack-ABI variant had no `helpers` parameter, so it is now built with one
+and bound, leaving every existing `(stack, base)` call site unchanged.
+
+| shape | before | after | vs. the session baseline |
+|---|---|---|---|
+| iface | 422 ns/iter | 226 | 590 -> 226 (-62%) |
+| poly | 548 | 334 | 775 -> 334 (-57%) |
+| tile | 3601 | 2857 | 4901 -> 2857 (-42%) |
+
+`poly` is now about 50x HotSpot rather than 114x.
+
+Two tier-counter assertions in `jitCompiler.test.js` changed and were updated
+rather than worked around: with the accessor inlined, `generatedRunCount` for
+that fixture falls 5 -> 1 (only the outer loop keeps a frame) and
+`syncReusedFrameCount` falls 3 -> 0 (there is no child frame left to recycle).
+The behavioural assertions in the same test — the returned values, and
+`runnerRunCount === 0` — still hold, which is what proves dispatch is intact.
+A new test covers the property that actually matters for soundness here: a
+getter inlined into a loop that writes the field between calls must observe each
+write, and it does (5, 7, 9, 11). Full suite 197/197 files, 8902 tests, exit 0.
+
+**And the boot did not move, again.** One run each, `firstMenuSurfaceElapsedMs`
+minus `firstFrameElapsedMs`: 157730 baseline, 152495 with the boundary fixes,
+152154 with getter inlining as well — 3.5% in total, against ~20% run-to-run
+variance. `postLogoToMenuMs` was 152288 and is 146733, which is the same story.
+
+That is now twice in one session that a large reduced-loop win produced nothing
+measurable on the boot, and the reason has not changed: the fixture is built
+from the boot's largest guest method, and that method is 5.4% of the boot. The
+call boundary is simply not where the 152 s is. The profile has been saying so
+from the start — 57.4% of the boot sits under no guest frame at all, and the
+single largest runtime item is the scheduler/interpreter tick pair
+(`_tryExecuteSynchronousInterpreterTick` plus `execute`, 15.8 s of scaffolding
+around 5.6 s of actual interpreted opcodes), which is more than twice the whole
+call boundary. Optimizing what a reduced loop measures is not the same as
+optimizing the boot, and the way to tell the difference is to scale every
+fixture percentage by its method's share before believing it.

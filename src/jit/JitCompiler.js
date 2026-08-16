@@ -8239,8 +8239,13 @@ class JitCompiler {
     // when a speculative normal-path guard fails. Guarded plans are reserved
     // for structured callers, which can materialize the exact invoke PC.
     if (!plan || plan.guards.length > 0) return null;
-    const inline = this.createGeneratedFunction(method, "inline-integer", ["stack", "base"],
+    // Bound rather than passed: an inlined field read needs the helper table
+    // for its fallback, while every existing call site keeps calling this as
+    // (stack, base).
+    const raw = this.createGeneratedFunction(
+      method, "inline-integer", ["helpers", "stack", "base"],
       `"use strict"; ${plan.statements.join(" ")} return ${plan.result};`);
+    const inline = raw.bind(null, this);
     inline.jvmPlan = plan;
     inline.jvmReceiverSlots = plan.receiverSlots;
     inline.jvmNested = plan.methodCount > 1;
@@ -8482,6 +8487,42 @@ class JitCompiler {
         }
         if ((op === "ldc" || op === "ldc_w") && Number.isInteger(Number(instruction.arg))) {
           stack.push(String(Number(instruction.arg) | 0));
+          continue;
+        }
+        // Every parameter is proven int above, so on an instance method slot 0
+        // is the only reference in scope and aload_0 is the only admissible
+        // reference load. Accepting it is what lets an ordinary getter inline
+        // instead of pushing a whole frame.
+        if (receiverSlots === 1 &&
+            (op === "aload_0" || (op === "aload" && Number(instruction.arg) === 0))) {
+          stack.push(args[0]);
+          continue;
+        }
+        if (op === "getfield") {
+          // Unlike the arithmetic whitelist, a field read can throw, so it is
+          // only admissible when no exception-handler blocks were dropped from
+          // the body above.
+          if ((code.code.exceptionTable || []).length) return null;
+          const objectExpression = pop();
+          // The receiver is the only reference that can be on this stack, and
+          // the call boundary has already null-checked it. Refuse anything else
+          // rather than reason about a second object's nullness.
+          if (objectExpression === null || objectExpression !== args[0]) return null;
+          const fieldSiteId = this.registerFieldSite(instruction.arg);
+          const fieldSite = this.fieldSites[fieldSiteId];
+          // The declaring slot must be known statically, and the value must be
+          // an int for the arithmetic that follows to stay exact.
+          if (!fieldSite.directInstanceKey) return null;
+          if (fieldSite.descriptor !== "I" && fieldSite.descriptor !== "int") return null;
+          const fieldKey = JSON.stringify(fieldSite.directInstanceKey);
+          // Same guarded direct read the ordinary generated tier emits; the
+          // fallback resolves nonstandard layouts and throws the correct NPE.
+          stack.push(materialize(
+            `((${objectExpression} !== null && ${objectExpression} !== undefined && `
+            + `${objectExpression}.fields !== undefined && `
+            + `${objectExpression}.fields[${fieldKey}] !== undefined) `
+            + `? ${objectExpression}.fields[${fieldKey}] `
+            + `: helpers.getFieldAt(${fieldSiteId}, ${objectExpression}))`));
           continue;
         }
         if (op && op.startsWith("if")) {

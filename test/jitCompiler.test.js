@@ -12252,9 +12252,61 @@ public class GeneratedInterfaceJitHarness {
     '([ILGeneratedInterfaceJitHarness$Value;)V', [out, value]);
   t.deepEqual(out, [7, 7, 7, 7], 'invokeinterface preserves dynamic dispatch and return values');
   t.equal(jvm.jit.runnerRunCount, 0, 'interface accessors avoid the bytecode runner');
-  t.equal(jvm.jit.generatedRunCount, 5, 'outer loop and interface accessor use generated code');
-  t.equal(jvm.jit.syncReusedFrameCount, 3,
-    'repeated interface calls recycle their completed child frame');
+  // The accessor body is aload_0/getfield/ireturn, which the inline-integer
+  // plan now covers, so the four calls are folded into the caller instead of
+  // each running as generated code. Only the outer loop keeps a frame; that
+  // also leaves no completed child frame to recycle. Dynamic dispatch is still
+  // proven by the returned values above and by the absence of runner fallback.
+  t.equal(jvm.jit.generatedRunCount, 1, 'only the outer loop needs generated code');
+  t.equal(jvm.jit.syncReusedFrameCount, 0,
+    'the inlined interface accessor pushes no child frame to recycle');
+  t.end();
+});
+
+test('an inlined integer getter observes writes made between calls', async (t) => {
+  const classpath = compileJavaFixture(t, 'InlineGetterFieldHarness', `
+public class InlineGetterFieldHarness {
+  interface Value { int get(); }
+  static class Counter implements Value {
+    int value;
+    public int get() { return value; }
+    void bump(int by) { value = value + by; }
+  }
+  public static void compute(int[] out, Value value) {
+    Counter counter = (Counter) value;
+    for (int i = 0; i < out.length; i++) {
+      out[i] = counter.get();
+      counter.bump(2);
+    }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 100 } });
+  await jvm.loadClassByName('InlineGetterFieldHarness');
+  await jvm.loadClassByName('InlineGetterFieldHarness$Counter');
+  const thread = {
+    id: 0,
+    name: 'inline-getter-field-test',
+    callStack: new Stack(),
+    status: 'runnable',
+    pendingException: null,
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const out = [0, 0, 0, 0];
+  const value = {
+    type: 'InlineGetterFieldHarness$Counter',
+    fields: { 'InlineGetterFieldHarness$Counter.value': 5 },
+  };
+  await invoke(jvm, thread, 'InlineGetterFieldHarness', 'compute',
+    '([ILInlineGetterFieldHarness$Value;)V', [out, value]);
+  // The getter body is inlined into the caller, so this is the assertion that
+  // the inlined read is a real load each time rather than a value captured
+  // once: each iteration must see the write the previous one made.
+  t.deepEqual(out, [5, 7, 9, 11], 'each inlined read observes the preceding write');
+  t.equal(value.fields['InlineGetterFieldHarness$Counter.value'], 13,
+    'the field ends at its final written value');
+  t.equal(jvm.jit.runnerRunCount, 0, 'the inlined getter avoids the bytecode runner');
   t.end();
 });
 
