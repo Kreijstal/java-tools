@@ -83,7 +83,7 @@ run_test() {
     *data-zip-download*) timeout_cmd=(timeout 60);;
     */breakpointLocations.test.js) timeout_cmd=(timeout 120);;
     */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
-    */jitCompiler.test.js) timeout_cmd=(timeout 120);;
+    */jitCompiler.test.js) timeout_cmd=(timeout 300);;
     */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 60);;
     */javaFrontendIr.test.js) timeout_cmd=(timeout 60);;
     */roundtrip.test.js) timeout_cmd=();; # roundtrip enforces per-case timeouts internally

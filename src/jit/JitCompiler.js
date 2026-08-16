@@ -3468,9 +3468,13 @@ class JitCompiler {
       "let pc = frame.pc;",
       "let bytecodesUntilYield = 10000;",
       "let bytecodeChecks = initialBytecodeChecks === undefined ? helpers.needsBytecodeChecks() : initialBytecodeChecks;",
-      "let osrCountdown = 10007;",
+      // Prime stride, as in the runner, so successive probes land on different
+      // pcs of a loop body. It must stay below bytecodesUntilYield: the quantum
+      // check below can end the activation, so a larger stride would make the
+      // probe unreachable whenever the quantum declines to continue.
+      "let osrCountdown = 9973;",
       `while (pc < ${codeItems.length}) {`,
-      "if (--osrCountdown === 0) { osrCountdown = 10007; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; if (osr.deopted) return { deopt: true, transient: true, reason: 'wasm OSR left active child' }; pc = osr.resumePc; sp = stack.length; } }",
+      "if (--osrCountdown === 0) { osrCountdown = 9973; helpers.materializeCached(frame, locals, stack, sp, pc); const osr = helpers.wasmOsrProbe(frame, thread, pc, sp); if (osr) { if (osr.returned) return { returned: true, value: osr.value }; if (osr.deopted) return { deopt: true, transient: true, reason: 'wasm OSR left active child' }; pc = osr.resumePc; sp = stack.length; } }",
       synchronous
         // A synchronous baseline body also keeps its complete locals/operand
         // state in JavaScript between polls. As with structured SSA, another
