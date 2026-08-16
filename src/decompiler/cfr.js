@@ -1841,6 +1841,11 @@ function decompileCode(code, method, cls, localState, options = {}) {
   }
   const preferOwnedStructurer = options.forceOwnedStructurer === true
     || tableHasTrivialCheckedHandler(code)
+    // A ladder of conditional branches sharing one exit makes the legacy
+    // range recognizer explore overlapping suffixes repeatedly. Obfuscated
+    // boolean guards commonly use this shape; the CFG structurer handles it
+    // in one pass and avoids exponential decompile time.
+    || hasHighConditionalTargetFanIn(codeItemsForSelection)
     || (codeItemsForSelection.length > 128
       && controlTransfers / codeItemsForSelection.length > 0.05
       && !hasSuppressedCleanup);
@@ -1907,6 +1912,20 @@ function decompileCode(code, method, cls, localState, options = {}) {
   const lines = decompileLinearCodeItems(code.codeItems || [], method, cls, localState);
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return coalesceDefaultConstructorBody(lines, method);
+}
+
+function hasHighConditionalTargetFanIn(codeItems, minimumFanIn = 6) {
+  const targetCounts = new Map();
+  for (const item of codeItems || []) {
+    const instruction = getInstructionFromItem(item);
+    if (!instruction || !isConditionalBranch(instruction.op)) continue;
+    const target = String(instruction.arg || '').replace(/:$/, '');
+    if (!target) continue;
+    const count = (targetCounts.get(target) || 0) + 1;
+    if (count >= minimumFanIn) return true;
+    targetCounts.set(target, count);
+  }
+  return false;
 }
 
 function nopNormallyUnreachableBlocks(code) {
@@ -4546,7 +4565,19 @@ function decompileLinearCodeItems(codeItems, method, cls, localState, options = 
       }
       const renderedValue = renderStoreExpression(value);
       localState.requireRenderedType(renderedValue.qualifiedType || renderedValue.type);
-      lines.push(localState.store(storeIndex.index, storeIndex.type, renderedValue, codeItem.pc));
+      // Spill before the store: a dup'd sibling still on the stack must keep
+      // the value this local held on the way in, not the one written here.
+      // Only resolve the name when something is still live on the stack that
+      // could read it: nameFor() registers the local, and calling it on every
+      // store perturbs name disambiguation (`words` -> `words_array`).
+      const spilled = stack.length
+        ? materializeStackLocalReads(
+          stack, localState.peekName(storeIndex.index, storeIndex.type), lines, localState,
+          renderedValue.code)
+        : null;
+      const storedValue = spilled
+        ? expr(spilled, renderedValue.type, 100) : renderedValue;
+      lines.push(localState.store(storeIndex.index, storeIndex.type, storedValue, codeItem.pc));
       continue;
     }
 
@@ -6875,6 +6906,24 @@ function shortCircuitIfLines(condition, bodyLines) {
   return lines;
 }
 
+// The OR merge folds the final branch's fallthrough edge into the shared body,
+// so that edge must reach the body with nothing on the way.  Anything
+// executable in between belongs to that path alone and would be dropped: the
+// merged form has no place left to put it, and the cursor jumps past it.  A
+// single trailing `goto` at the body is still a direct edge.
+function orFallthroughReachesBody(codeItems, fromInclusive, bodyStart, context) {
+  let seen = 0;
+  for (let i = fromInclusive; i < bodyStart; i += 1) {
+    const instruction = getInstructionAt(codeItems, i);
+    if (!instruction) continue;
+    seen += 1;
+    if (seen > 1) return false;
+    if (instruction.op !== 'goto'
+        || context.labelIndex.get(instruction.arg) !== bodyStart) return false;
+  }
+  return true;
+}
+
 // Recover the two canonical branch-only encodings of a short-circuit guard:
 // every false edge skips one body (`a && b`), or every early true edge enters
 // one body while the final false edge skips it (`a || b`).  This operates on
@@ -6943,6 +6992,7 @@ function tryDecompileShortCircuitIfAt(codeItems, index, end, context, stack) {
     conditionStack = evaluated.stack;
     if (finalBranch) {
       if (orConditions.length < 2) return null;
+      if (!orFallthroughReachesBody(codeItems, branchIndex + 1, bodyStart, context)) return null;
       const body = decompileRange(codeItems, bodyStart, target, context, []);
       if (!body.ok || body.stack.length
           || body.lines.some((line) => FALLBACK_LINE_COMMENT.test(String(line))
@@ -8198,6 +8248,18 @@ function makeLocalState(paramTypes, isStatic, code = null, plainRefSlots = null,
       const key = ensure(index, fallbackType);
       return names.get(key);
     },
+    // Non-mutating counterpart to nameFor: reports the name only if this local
+    // is already bound. ensure() would create the binding, and creating it
+    // early perturbs the `_suffix` disambiguation (`var2` -> `var2_array`).
+    // A local that has never been named cannot be referenced by any live stack
+    // expression, so null is the correct answer for callers that only want to
+    // know whether existing code mentions it.
+    peekName(index, fallbackType = 'Object') {
+      const key = simplifyType(fallbackType) === 'Object' && currentReferenceKeys.has(index)
+        ? currentReferenceKeys.get(index)
+        : localKey(index, fallbackType, false);
+      return names.has(key) ? names.get(key) : null;
+    },
     typeFor(index, fallbackType = 'Object') {
       const key = ensure(index, fallbackType);
       return types.get(key);
@@ -8937,6 +8999,39 @@ function materializeStackFieldReads(stack, fieldName, lines, localState) {
   }
 }
 
+// Before a local store, freeze any live stack expression that reads the same
+// local into a temp — the local equivalent of materializeStackFieldReads.
+//
+// `dup` leaves a second copy of an expression on the stack rather than a copy
+// of its value, so `a = b = a << 16` (iload/ishl/dup/istore a/istore b) would
+// render the surviving copy after `a` had already been overwritten, shifting an
+// already-shifted value. Spilling here keeps the pre-store value.
+//
+// The name check over-approximates exactly as the field version does, which is
+// always safe: spilling a pure re-read changes nothing.
+// Returns the temp introduced for `storedCode`, if any, so the store itself can
+// reuse it instead of re-evaluating the same expression — which is what javac
+// emitted in the first place for `a = b = expr`.
+function materializeStackLocalReads(stack, variableName, lines, localState, storedCode) {
+  if (!variableName) return null;
+  const escaped = variableName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const localRead = new RegExp(`(^|[^A-Za-z0-9_$.])${escaped}([^A-Za-z0-9_$]|$)`);
+  let reusable = null;
+  for (let i = 0; i < stack.length; i += 1) {
+    const value = stack[i];
+    if (!value || typeof value.code !== 'string') continue;
+    if (value.code === variableName) continue; // a bare re-read needs no temp
+    if (!localRead.test(value.code)) continue;
+    if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) continue;
+    const rendered = renderStoreExpression(value);
+    const name = localState.nextSyntheticName('localTemp');
+    lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
+    stack[i] = expr(name, value.type, 100);
+    if (storedCode !== undefined && rendered.code === storedCode) reusable = name;
+  }
+  return reusable;
+}
+
 function materializeStackArrayReads(stack, lines, localState) {
   for (let i = 0; i < stack.length; i += 1) {
     const value = stack[i];
@@ -9135,6 +9230,7 @@ module.exports = {
     detectObfuscationGuards,
     formatDouble,
     formatFloat,
+    hasHighConditionalTargetFanIn,
     javaTypeFromInternalName,
     normalizeLegacyClassFile,
     rewriteDuplicateLocalDeclarations,

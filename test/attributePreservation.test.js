@@ -242,7 +242,9 @@ test('assembler preserves constant values and debug tables', (t) => {
     t.ok(runtimeOutput.includes('REFL_ANSWER=42'), 'reflection should observe int constant value');
     t.ok(runtimeOutput.includes('REFL_GREETING=hi'), 'reflection should observe string constant value');
 
-    const javapDebug = execOrRecordSkip({ t, cleanupPaths, skipState }, 'javap', ['-classpath', outputDir, '-l', className], { encoding: 'utf8' });
+    // javap only emits the line-number and local-variable tables for -l when -c
+    // is also present; without it modern javap warns and prints neither.
+    const javapDebug = execOrRecordSkip({ t, cleanupPaths, skipState }, 'javap', ['-classpath', outputDir, '-c', '-l', className], { encoding: 'utf8' });
     if (skipState.shouldSkip) {
       return;
     }
