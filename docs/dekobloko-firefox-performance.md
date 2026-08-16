@@ -6977,3 +6977,108 @@ That is the third time this session that a real, verified mechanical improvement
 produced no wall-clock movement. The pattern is consistent and worth stating
 plainly: a block is only as compiled as its worst opcode, and a loop is only as
 fast as its most-demoted block.
+
+## 2026-08-16 — why an interface call cost 90x, and the crossing budget
+
+The reduced fixture said `iface` was 73.66 ns/iter against HotSpot's 0.81
+(90.7x) and `poly` 118.78 (32x). A layer-by-layer attribution fixture — the
+same loop with the call replaced by arithmetic, a static call, a monomorphic
+interface call, and the same call with 1/2/3 field reads in the callee — put
+the blame nowhere near dispatch:
+
+| shape | HotSpot | jvm.js |
+|---|---|---|
+| arithmetic only | 0.81 | 0.82 (1.0x) |
+| static call | 0.81 | 0.80 (1.0x, inlined) |
+| monomorphic interface call | 0.81 | 15.41 (19x) |
+
+A call that inlines is free. A call that does not costs ~100 ns, because it
+goes wasm → JS → dispatch map → callee module entry → back. So the question was
+never "why is dispatch slow", it was "why did this not inline".
+
+**Cause 1: the cone was never complete.** `planInstanceSite` requires
+`resolveDispatch(...).complete`, and completeness is cleared by any cone member
+that will not resolve — including the call's declared owner. Nothing forces an
+interface class to load; `invokeinterface` resolves through the receiver. So
+`Op`/`Cell` was absent while every implementor was loaded and compiled, and
+every interface call in the program was refused. `resolveDispatch` now reports
+*why*: `noHiddenReceivers` is true when the only missing members are classes
+absent from `jvm.classes` entirely, which therefore have no instances to slip
+past an `instanceof` guard. Later loads are covered the same way an overriding
+subclass already is (the site is recorded and re-checked when the epoch grows).
+**iface 90.7x -> 1.6x, in the default configuration.**
+
+Note that `JVM_WASM_DIRECT_INSTANCE_LINK` and `JVM_WASM_DIRECT_STATIC_LINK` are
+opt-in and off. With links on and the old code `iface` was 23.78 rather than
+73.66 — so no default-config measurement had ever seen them. Inlining beats
+linking outright (1.34), so it matters less now, but the earlier session's link
+numbers were measuring a tier the launcher does not enable.
+
+**Cause 2: the rebuild trigger watched the wrong thing.** `runPoly` compiled at
+first entry, bound its site to the generic import, and stayed there for 16M
+calls. The previous trigger (`classEpoch` changed, and exits since build) moves
+for neither half of this case: the classes were already *loaded* (the demote
+said "not initialized", which nothing versions), and a site sitting on the
+dispatch import never exits. It now compares a real world version,
+`classEpoch:compileEpoch`, stamped after the compile's own bump so a module
+cannot trigger its own rebuild — and fires only for modules the **structured**
+tier declined. That restriction is what keeps late instance-target installation
+winning on the dispatcher tier, where it serves a new implementor with zero
+exits; dropping the old exits condition without it re-broke five
+`wasmInstanceLink` tests. **poly 32x -> 13.2x.**
+
+**Cause 3: cone width takes the whole method down.** A site with more impls than
+the limit throws `megamorphic`, which demotes its block — and if that block is
+the loop body, the method never reaches wasm at all. A six-implementor interface
+measured 309 ns/call refused against 96 ns/call admitted at 16.
+`JVM_WASM_MAX_IMPLS` now exposes the limit; the default stays 4 until a boot
+A/B, because widening cones is exactly what `monoArray` was written to undo.
+
+### The crossing budget
+
+With inlining working, what is left is arithmetic over boundary crossings. Turn
+on `JVM_WASM_IMPORT_STATS=1` (now reported by the benchmark) and the loop is
+countable: `runPoly` was paying 4.0 import calls per iteration — one `aget_r`
+for the receiver, **two** `isof_` for a three-arm guard chain, one `gf_` for the
+field. A k-arm chain is (k+1)/2 crossings on average, because each arm is its
+own import.
+
+A standalone wasm module measures the crossing itself at **4.23 ns with an
+empty body**, and — this kills an appealing idea — an `i32`-only import costs
+exactly the same 4.23 ns, so the `externref` parameter is not the price and an
+integer-handle object table would buy nothing. The floor is the call.
+
+Three changes, each measured on the fixture:
+
+- **Fused guard chain.** `inlineCalls` emits one synthetic `invokestatic`
+  (`$wasmGuard`, the "method name" is an index into a returned site table) that
+  the structured backend compiles to a single import returning the matching arm
+  index; arm selection becomes integer compares inside wasm. A receiver no arm
+  claims returns -1 into the same deopt stub. 4.0 crossings -> 3.0.
+- **Dense class index.** Every object carries `cidx` from `makeObjectRef` — in
+  the literal, so guest objects keep the single hidden class that makes reading
+  it monomorphic — and guard/cast/field memos became array reads instead of
+  string-keyed `Map` lookups. `runtimeClassName` also checks the guest keys
+  before `instanceof String`, which costs a prototype walk on every object that
+  is not one (8.52 -> 7.03 ns per import call).
+- **Flattened hot import bodies.** The instance getter was three call frames
+  (null check, key resolve, field read) and the reference-array load went
+  through the array zoo plus a sentinel comparison; both are now straight-line.
+
+45.70 -> 33.89 -> 29.50 -> 22.29 ns/iter: **poly 13.2x -> 6.1x**, and 118.78 ->
+22.29 overall (32x -> 6.1x).
+
+**5x was the ask and it was not reached.** A clean profile over 60M iterations
+splits the remaining 22.29 ns as ~9.9 ns of wasm-to-JS wrappers (three
+crossings), 5.1 ns in the array-load body, 4.2 ns in the field-read body, 1.9 ns
+in the wasm. 5x is 17.4 ns, so even with both bodies at zero it is 14.5 ns —
+reachable in principle, but not by tuning bodies that are already a bounds check
+and a keyed load. The change that closes it is removing the third crossing: let
+the guard and field imports take `(array, index)` and recompute the element,
+which is worth a crossing plus the array-load body (~9 ns, landing near 3.5x).
+It is blocked on the site's deopt stub, which rebuilds the interpreter's operand
+stack from the materialized receiver — the stub would have to rematerialize it
+on its cold path first.
+
+`tile` is untouched at ~218x; it still exits on `instanceof`, a static-field
+write and `invoke makeTile`.
