@@ -7082,3 +7082,70 @@ on its cold path first.
 
 `tile` is untouched at ~218x; it still exits on `instanceof`, a static-field
 write and `invoke makeTile`.
+
+## 2026-08-16 — rematerializing the receiver, and the last crossing but two
+
+The previous section ended on a blocked item: the third crossing per iteration
+is the receiver load, and removing it means the guard and field imports take
+`(array, index)` and load the element themselves — blocked because the site's
+deopt stub rebuilds the interpreter's operand stack out of the materialized
+receiver, so there would be nothing to rebuild it from.
+
+The unblock is to stop treating "the receiver is a wasm value" as the only way
+to have one. A load that is *fused* is not emitted; instead the pair
+`(array, index)` is recorded, and `useOf` — the single choke point every emitter
+already goes through to turn an SSA value into wasm bytes — recomputes the
+element when something genuinely needs the reference. The hot path never
+materializes it; the guard-miss stub, the fuel exit and the exception spill each
+pay one extra array load on a path that was already leaving the loop.
+
+Fusion is refused unless both hold:
+
+- every use of the load is either the fused guard or a `getfield` on it, and
+- only *pure* nodes run between the load and any consumer on any path.
+
+"Pure" is a whitelist — constants, total arithmetic, conversions — and is
+deliberately missing `idiv`/`irem`, array access, field access and calls, so
+nothing that could throw, trap or write memory can be re-ordered across the
+recomputation. The check is a backward walk from each use across predecessors,
+terminating at the load's own block, which dominates every use.
+
+Two things had to be fixed before it fired even once, and both were invisible
+without tracing (`JVM_DEBUG_FUSE=1`):
+
+- **The receiver survives the back edge.** The inlined site stores the receiver
+  into a slot that is written every trip, so it is live-in at the loop header
+  and appears in a phi — an unfusable use, and the whole candidate was thrown
+  out. `wasmInline` now nulls the slot on the site's continuation
+  (`aconst_null; astore`), which is what the slot's liveness should have said in
+  the first place.
+- **The load and its guard are not adjacent.** Dumping the SSA showed
+  `iconst_3 irem aaload bipush iand invokestatic($wasmGuard)` — the call's own
+  integer arguments are evaluated in between. Pairing skips pure nodes.
+
+One subtlety worth writing down: a fused load still emits its **cache kills**.
+The field caches are keyed on the SSA value, and if the load emits nothing at
+all the kill never runs, so a cache survives an assignment it should not have.
+
+Also relevant, and cheap to get wrong: the first design returned the arm index
+*and* the element together via wasm multi-value, on the theory that one crossing
+carrying two things beats two crossings. It was a 20x regression — 135 ns/iter.
+A standalone measurement says a JS import returning multiple values costs
+**102 ns/call against 4.8 for a single `i32`**, because the result goes through
+the iterable protocol; reusing the returned array does not help. Multi-value
+returns from JS imports are not a tool available in this tier.
+
+`JVM_WASM_IMPORT_STATS=1` confirms the outcome directly: `aget_r` is gone, and
+`gidxat_` and `gfat_` are each called exactly once per iteration. **Two
+crossings, down from four at the start of the day.** poly 22.29 -> 18.97 ns/iter
+against HotSpot's 3.71, so **6.4x -> 5.1x**, with checksums matching. The
+remaining 18.97 is ~8.5 ns of crossing, and the rest is the two import bodies:
+a class-index lookup and arm compare, and a bounds-checked array load plus a
+keyed field read. `JVM_WASM_FUSE_RECEIVER=0` turns it off; a controlled A/B
+across the switch in the same three-shape configuration gives 19.92 fused
+against 21.98 unfused.
+
+Cumulative for the day: `iface` 73.66 -> 1.21 ns/iter (90.7x -> 1.5x), `poly`
+118.78 -> 18.97 (32x -> 5.1x). `tile` is still ~224x and still exits on
+`instanceof`, a static-field write and `invoke makeTile` — it has not been
+touched, and none of this has been measured against a real boot yet.
