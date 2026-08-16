@@ -280,11 +280,19 @@ function mathIntrinsicFunction(name, descriptor) {
 // the Error constructor was ~1s of a profiled run, so skip it — nothing ever
 // reads .stack, only .message.
 class Unsupported extends Error {
-  constructor(message) {
+  // `blockedOn` names the guest class whose absence, or merely whose
+  // uninitialized state, caused this refusal. It is what makes the demotion
+  // recoverable on a schedule rather than on a guess: the entry gate rebuilds
+  // the module when that class's readiness changes, instead of when any part
+  // of the world happens to move. Leave it null for permanent refusals (an
+  // unsupported opcode, a disabled feature) — those must never trigger a
+  // rebuild.
+  constructor(message, blockedOn = null) {
     const limit = Error.stackTraceLimit;
     Error.stackTraceLimit = 0;
     super(message);
     Error.stackTraceLimit = limit;
+    this.blockedOn = blockedOn;
   }
 }
 

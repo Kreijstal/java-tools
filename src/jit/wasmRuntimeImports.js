@@ -414,7 +414,7 @@ function addNewImport(reg, jvm, className) {
   // initialized class must reach the interpreter so <clinit> can run.
   if (jvm.classInitializationState.get(className) !== 'INITIALIZED' ||
       !jvm.classes[className]) {
-    throw new Unsupported(`new ${className} not initialized`);
+    throw new Unsupported(`new ${className} not initialized`, className);
   }
   // Default field map precomputed once at compile time (the hierarchy above
   // an initialized class is loaded and immutable); each allocation clones it.

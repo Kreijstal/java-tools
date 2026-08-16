@@ -184,6 +184,8 @@ class MethodTranslator {
       pendingException: null, lastThrown: null, throwPc: -1,
     };
     this.demoteReasons = new Map();
+    // Guest classes named by a recoverable refusal; see Unsupported.blockedOn.
+    this.demoteBlockers = new Set();
   }
 
   targetOf(ins) {
@@ -455,7 +457,7 @@ class MethodTranslator {
         }
         currentClassName = cd && cd.ast && cd.ast.classes[0] ? cd.ast.classes[0].superClassName : null;
       }
-      if (!container) throw new Unsupported(`unresolved static ${className}.${fieldName}`);
+      if (!container) throw new Unsupported(`unresolved static ${className}.${fieldName}`, className);
       const name = `${isGet ? 'gs' : 'ps'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
       const getStatic = t === T.i32
         ? () => {
@@ -760,7 +762,7 @@ class MethodTranslator {
       const impl = name === '<init>'
         ? hierarchy.resolveInit(owner, descriptor)
         : hierarchy.resolveSpecial(this.className, owner, name, descriptor);
-      if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`);
+      if (!impl) throw new Unsupported(`invokespecial ${owner}.${name} unresolved`, owner);
       direct = readyOrThrow(impl.className);
       if (name === '<init>') {
         // all-or-nothing: a constructor target must be unable to hand the
@@ -773,7 +775,7 @@ class MethodTranslator {
     } else {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;
-      if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
+      if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`, owner);
       // See the note on this limit in StructuredWasmCompiler.
       if (resolved.impls.size > maxImpls()) {
         throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
@@ -1071,17 +1073,26 @@ class MethodTranslator {
   // synchronous hierarchy walk (matching the JS tier's tryCheckCastSync) and
   // throw the guest ClassCastException on failure; an unknown class deopts to
   // the interpreter at the checkcast, which can load classes asynchronously.
-  checkcastImport(ins, itemIndex, underTypes) {
+  // Handles both checkcast and instanceof: the hierarchy question and its memo
+  // are identical, only the answer differs. checkcast yields the reference
+  // (null passes) or throws CCE; instanceof yields 0/1 and never throws. They
+  // are separated here because a cache-and-guard shape like
+  // `if (x instanceof T) use((T) x)` demotes its whole block on the opcode the
+  // compiler is missing, and demoting one block of a loop body costs the whole
+  // method its module — measured on runTile, where `instanceof` in the inner
+  // loop left a ready module at runs==exits, contributing nothing.
+  checkcastImport(ins, itemIndex, underTypes, op = 'checkcast') {
     // Opt-in: compiling casts is correct (see wasmInstanceLink tests) but
     // measured net-negative on dekobloko — it unlocks tiny deoptable
     // callees whose per-call partial-protocol overhead exceeds interpreting
     // them. Revisit when a larger region can keep these operations in wasm.
     if (!this.wasmJit || !this.wasmJit.instanceLinkEnabled ||
         !this.wasmJit.checkcastEnabled) {
-      throw new Unsupported('op checkcast');
+      throw new Unsupported(`op ${op}`);
     }
+    const isTest = op === 'instanceof';
     const target = ins.arg;
-    if (typeof target !== 'string') throw new Unsupported('op checkcast');
+    if (typeof target !== 'string') throw new Unsupported(`op ${op}`);
     const jvm = this.jvm;
     const callerBox = this.box;
     const underCount = underTypes.length;
@@ -1094,14 +1105,16 @@ class MethodTranslator {
     const slots = this.paramSlots.slice();
     const slotCount = slots.length;
     const verdicts = new Map();
-    const stats = this.siteStatsFor(`cast_${target}@${this.className}.${this.method.name}:${itemIndex}`);
+    const stats = this.siteStatsFor(`${isTest ? 'isof' : 'cast'}_${target}@${this.className}.${this.method.name}:${itemIndex}`);
     const fn = (...all) => {
       if (stats) stats.calls += 1;
       const ref = all[slotCount + underCount];
-      if (ref === null || ref === undefined) return null;
+      // null is an instance of nothing, but casts fine.
+      if (ref === null || ref === undefined) return isTest ? 0 : null;
       const source = runtimeClassName(ref);
       const memo = verdicts.get(source);
-      if (memo === true) return ref;
+      if (memo === true) return isTest ? 1 : ref;
+      if (memo === false && isTest) return 0;
       if (memo === undefined) {
         const sourceKnown = (typeof source === 'string' && source.startsWith('[')) ||
           jvm.classes[source] || jvm.jre[source];
@@ -1110,6 +1123,7 @@ class MethodTranslator {
         if (sourceKnown && targetKnown) {
           const ok = jvm.isInstanceOf(source, target);
           if (verdicts.size < 64) verdicts.set(source, ok);
+          if (isTest) return ok ? 1 : 0;
           if (ok) return ref;
         } else {
           if (stats) stats.deopts += 1;
@@ -1129,13 +1143,15 @@ class MethodTranslator {
       };
     };
     this.instanceSites = (this.instanceSites || 0) + 1;
-    const importName = `cast_${target}_${itemIndex}`.replace(/[^\w]/g, '_');
+    const importName = `${isTest ? 'isof' : 'cast'}_${target}_${itemIndex}`.replace(/[^\w]/g, '_');
     const slotTypes = slots.map((s) => this.slotTypes.get(s));
+    const result = isTest ? T.i32 : T.ref;
     return {
       argTypes: [T.ref],
+      result,
       underTypes,
       leadGets: slots.map((s) => this.localOfSlot.get(s)),
-      idx: this.addImport(importName, [...slotTypes, ...underTypes, T.ref], [T.ref], fn),
+      idx: this.addImport(importName, [...slotTypes, ...underTypes, T.ref], [result], fn),
     };
   }
 
@@ -1345,6 +1361,7 @@ class MethodTranslator {
       } catch (err) {
         if (!(err instanceof Unsupported)) throw err;
         this.demoteReasons.set(b, err.message);
+        if (err.blockedOn) this.demoteBlockers.add(err.blockedOn);
         blockBodies[b] = this.exitStub(b);
       }
     }
@@ -2006,13 +2023,13 @@ class MethodTranslator {
         }
         const retC = parseMethodDescriptor(ins.arg[2][1]).ret;
         if (retC !== 'V') push(descToWasm(retC));
-      } else if (op === 'checkcast') {
-        if (!stack.length) throw new Unsupported('checkcast on empty stack');
-        const bound = this.checkcastImport(ins, i, stack.slice(0, stack.length - 1));
+      } else if (op === 'checkcast' || op === 'instanceof') {
+        if (!stack.length) throw new Unsupported(`${op} on empty stack`);
+        const bound = this.checkcastImport(ins, i, stack.slice(0, stack.length - 1), op);
         pop(T.ref);
         emit(...this.callSeqWithUnders(bound.idx, bound.argTypes, bound.underTypes,
           bound.leadGets));
-        push(T.ref);
+        push(bound.result);
       } else if (op === 'pop') { pop(); emit(OP.drop); }
       else if (op === 'pop2') {
         const t = pop(); emit(OP.drop);
@@ -2208,6 +2225,7 @@ class MethodTranslator {
       supportedBlocks: this.supportedBlocks,
       externalEntry: this.externalEntry,
       demoteReasons: this.demoteReasons,
+      demoteBlockers: this.demoteBlockers,
       blockCount: this.blockStarts.length,
       fullyCompiled: this.supportedBlocks.size === this.blockStarts.length,
       normalFlowFullyCompiled: this.normalFlowFullyCompiled,
@@ -2338,12 +2356,39 @@ class WasmJit {
 
   // The world a deferrable demotion depends on: which classes exist
   // (classEpoch) and which modules are compiled (compileEpoch, bumped by every
-  // successful compile). Class *initialization* — the third input, and the one
-  // "new X not initialized" names — is not versioned anywhere, but it can only
-  // advance by running guest code, which loads classes and compiles modules,
-  // so this pair moves with it in practice.
+  // successful compile). Class *initialization* is deliberately absent: it is
+  // versioned (jvm.classInitializationEpoch) and adding it here was measured
+  // to help nothing while making this coarse trigger fire more often, because
+  // the rebuild budget is spent during the opening burst either way. Modules
+  // whose demotions named a class use depsMoved's precise path instead; this
+  // remains only for losses that name none.
   depWorldVersion() {
     return `${this.jvm.classEpoch || 0}:${this.compileEpoch}`;
+  }
+
+  // Readiness of the specific classes a module's demotions named: absent,
+  // loaded, or initialized. Both steps matter and they happen at different
+  // times — `invoke X.m unresolved` clears on the load, `new X not
+  // initialized` only on the <clinit> — so a single "is it there" bit would
+  // spend the rebuild budget on the first and never see the second.
+  blockerSignature(blockers) {
+    if (!blockers || !blockers.length) return '';
+    let sig = '';
+    for (const className of blockers) {
+      sig += !this.jvm.classes[className] ? '0'
+        : this.jvm.classInitializationState.get(className) === 'INITIALIZED' ? '2' : '1';
+    }
+    return sig;
+  }
+
+  // Has the world this module lost something to actually moved? When the
+  // demotions named classes, that question is exactly about those classes;
+  // the coarse world version is the fallback for losses that name none.
+  depsMoved(st) {
+    if (st.blockers && st.blockers.length) {
+      return this.blockerSignature(st.blockers) !== st.blockerSig;
+    }
+    return st.depWorld !== this.depWorldVersion();
   }
 
   methodState(frame) {
@@ -2413,9 +2458,9 @@ class WasmJit {
     // never exits at all. So rebuild here instead, and only when the world
     // that produced those demotions has actually changed — not on a timer or
     // an exit rate, both of which measured negative.
-    if (st.partialDeps && st.partialDepsStructured &&
-        st.depWorld !== this.depWorldVersion()) {
+    if (st.partialDeps && st.partialDepsStructured && this.depsMoved(st)) {
       st.depWorld = this.depWorldVersion();
+      st.blockerSig = this.blockerSignature(st.blockers);
       if ((st.depRecompiles || 0) < this.depRecompileLimit) {
         st.depRecompiles = (st.depRecompiles || 0) + 1;
         st.status = 'cold';
@@ -2648,6 +2693,7 @@ class WasmJit {
     try {
       let structuredMeta = null;
       let structuredDeferred = false;
+      let structuredBlocker = null;
       if (this.structuredEnabled) {
         try {
           const StructuredWasmCompiler = require('./StructuredWasmCompiler');
@@ -2660,6 +2706,7 @@ class WasmJit {
           // was lost, not one block. Recorded here because the dispatcher meta
           // built below cannot say why the better tier declined.
           structuredDeferred = DEFERRABLE_DEMOTE.test(err.message);
+          if (structuredDeferred && err.blockedOn) structuredBlocker = err.blockedOn;
           if (this.debug) console.error(`[wasmjit] structured fallback ${st.key}: ${err.message}`);
         }
       }
@@ -2817,10 +2864,18 @@ class WasmJit {
       // exiting, which is strictly better. See the late-target tests in
       // wasmInstanceLink.
       st.partialDepsStructured = structuredDeferred || !!(st.meta && st.meta.structured);
+      // Which classes have to change state before rebuilding could possibly
+      // help. When this is known the rebuild waits for exactly them, which is
+      // both more likely to succeed and far less likely to storm than waiting
+      // for any world movement at all.
+      const blockers = new Set(primary.demoteBlockers || []);
+      if (structuredBlocker) blockers.add(structuredBlocker);
+      st.blockers = [...blockers].sort();
       this.compileEpoch += 1;
       // Stamped after the bump this compile itself contributes, so a module
       // never triggers its own rebuild.
       st.depWorld = this.depWorldVersion();
+      st.blockerSig = this.blockerSignature(st.blockers);
       if (!st.listed) { st.listed = true; this.compiled.push(st); }
       // JVM_WASM_DUMP_ACCEPT=<dir> writes each accepted module so its wat can
       // be diffed against hand-written wasm for the same Java method. The
