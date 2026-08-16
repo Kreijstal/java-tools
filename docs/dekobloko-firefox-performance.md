@@ -6687,3 +6687,105 @@ It reproduces the boot pathology rather than merely being slow. Profiling the
 
 Same helpers, same rank order, same split, same tier. Iterate on the call
 boundary here, not on a three-minute boot.
+
+## 2026-08-16: optimizing the call boundary against the reduced loop
+
+Using `TileDispatchHotLoop` as the measurement loop rather than a boot. Note
+which number to read: the jvm.js side is stable to about 0.5% across runs
+(tile 4904.95 / 4886.90 / 4911.35 ns/iter), while the HotSpot denominator swings
+(12.81 / 16.99 / 13.43 for the same tile shape). **Track absolute jvm.js
+ns/iter, not the slowdown ratio** — the ratio's noise is almost entirely in the
+denominator, and a 0.5% signal is enough to accept or reject a change in six
+seconds.
+
+Four changes to the synchronous call boundary, each measured separately:
+
+| shape | before | after | change |
+|---|---|---|---|
+| iface | ~590 ns/iter | ~422 | -28% |
+| poly | ~775 | ~548 | -29% |
+| tile | ~4901 | ~3601 | -27% |
+
+**1. Stop deleting fields on a recycled frame (-22%, the largest single win).**
+`tryInvokeResolvedTarget` cleared five bookkeeping fields on the child frame
+with `delete` on every call. `delete` drops the object into dictionary mode, and
+this is the frame the JIT recycles through `target.freeFrame`, so every call
+through the boundary de-optimized the object it was about to run. All five
+fields are only ever tested for truthiness or identity, so assigning `undefined`
+is indistinguishable to every consumer. `returnParentFor` in
+`src/instructions/control.js` had the same pattern on the generated-to-
+interpreted return path and got the same treatment. Note that `Frame`'s
+constructor already carries a comment recording this exact lesson for the
+monitor fields; the call boundary had simply not been given it.
+
+**2. A polymorphic dynamic-target cache (-5 to -10%).** `site.fastDynamicTarget`
+is guarded by `if (!site.fastDynamicTarget)`, so only the *first* receiver type
+a virtual/interface site ever sees gets a fast slot. Every later type missed the
+whole fast cascade and re-ran the generic path — receiver reload, JRE lookup,
+map probe — on every call, even though `site.targets` already held its resolved
+target. `site.fastDynamicTargets` now keeps every resolved receiver type, keyed
+by class name, holding the same target object `site.targets` does (so an
+in-place generated-code upgrade stays visible through both). It is consulted
+only after the monomorphic slot misses, so all existing precedence is preserved,
+and types that resolve to a JRE method are never recorded in it, so JRE
+precedence is untouched. It is versioned against `jni.registryVersion`.
+
+**3. Test the feature flag before the lookup.** `tryInvokeSyncAt` computed
+`site.fastPositionalTargets?.[receiverType]` — a string-keyed dictionary access
+— on every virtual call, and only then checked whether frame-positional calls
+were enabled at all. Hoisting the flag skips the lookup entirely when the
+feature is off.
+
+**4. A negative cache for JRE resolution: measured, rejected, reverted.**
+`tryInvokeSyncSite` caches positive JRE lookups but has no negative cache, so for
+a guest method `resolveSynchronousJreMethod` runs per call and returns null every
+time. That method looks expensive — two registry lookups, `constructor.name`,
+and `Function.prototype.toString` scanned for a sentinel. Memoizing it on a
+4-tuple key measured **11% slower** (tile 3820 -> 4250). The reasoning was wrong:
+`_jreFindMethod` is *already* memoized against `jni.registryVersion`, so for a
+guest method it returns null immediately and the `toString` never ran. The
+change replaced two cheap cached map lookups with building a template-string key.
+Reverted. The lesson is the usual one — the expensive-looking line was not on
+the hot path, and only measurement said so.
+
+The remaining shape of the reduced loop after these changes is roughly equal
+parts `tryInvokeResolvedTarget`, `runGeneratedFrame`, `tryInvokeSyncAt` and
+`materializeCached`. `materialize` is already three assignments behind a trace
+check, so further progress there means changing the call-site protocol — not
+spilling before calls that cannot deopt — rather than micro-optimizing it.
+
+**Validation, and what the boot actually did.** Full suite: 8899 tests passed,
+0 failures. (The runner prints dot progress, not TAP, so grepping the log for
+`not ok` finds nothing whether or not anything failed — read the trailing
+`N tests passed` line and the exit code instead.) The reduced loop's checksums
+match HotSpot on every shape.
+
+The boot reached the main menu, and **the 27% did not transfer**:
+
+| | baseline | with the three changes |
+|---|---|---|
+| firstFrameElapsedMs | 16050 | 16024 |
+| firstMenuSurfaceElapsedMs | 173780 | 168519 |
+| menu minus first frame | 157730 | 152495 |
+
+That is 3.3%, on one run each, against a boot whose run-to-run variance is
+around 20%. **It is noise, not a win.** Nor is that surprising in hindsight, and
+the earlier attribution predicts it: `tryInvokeResolvedTarget` plus
+`tryInvokeSyncAt` are together about 7.2 s of a 152 s boot, so removing a
+quarter of them is worth ~2 s no matter how good the reduced loop looks.
+
+The lesson is about what the reduced loop is for. It faithfully reproduces
+`npa.b`'s *shape* — that was verified — but `npa.b` is only 5.4% of the boot,
+and no guest method is more. A fixture built from the largest single method
+necessarily over-represents that method's costs. It is the right tool for
+iterating on the call boundary in six seconds instead of three minutes; it is
+the wrong tool for predicting a whole-boot number, and a percentage measured on
+it must be multiplied by that method's share before being believed.
+
+`postLogoToMenuMs` was null on the optimized run because the logo-completion
+detector did not fire, so the comparison above uses `firstMenuSurfaceElapsedMs`
+anchored on a nearly identical `firstFrameElapsedMs`. One boot in this session
+also died at 30 s on the already-known `dh.a(IIILan;IIIB)V` miscompile
+(`saload` index 576 into length 124, same method and pc as previously recorded),
+which is unrelated to these changes but is evidently reachable without
+`JVM_JIT_WARMUP=1`.

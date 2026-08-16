@@ -33,8 +33,10 @@ function completeReflectiveCall(thread, value) {
 
 function returnParentFor(frame, thread) {
   const explicit = frame.jitGeneratedReturnParent;
-  delete frame.jitGeneratedReturnParent;
-  delete frame.jitGeneratedReturnType;
+  // Cleared by assignment, not delete: both are only ever tested for truthiness
+  // or identity, and deleting them de-shapes a frame that the JIT recycles.
+  frame.jitGeneratedReturnParent = undefined;
+  frame.jitGeneratedReturnType = undefined;
   const parent = explicit && thread.callStack.items.includes(explicit)
     ? explicit : thread.callStack.isEmpty() ? null : thread.callStack.peek();
   if (frame.jitFrameHandoffTrace) {

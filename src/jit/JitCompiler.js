@@ -5763,22 +5763,26 @@ class JitCompiler {
         (receiver === null || receiver === undefined)) {
       throw { type: "java/lang/NullPointerException", message: null };
     }
-    let framePositional = null;
-    if (site.op === "invokestatic" || site.op === "invokespecial") {
-      framePositional = site.fastPositional;
-    } else {
-      const receiverType = receiver.type || site.declaredClassName;
-      framePositional = site.fastPositionalTargets?.[receiverType] || null;
-    }
-    if (this.framePositionalCallsEnabled &&
-        framePositional?.invoke?.jvmCanonicalFrameAdapter === true) {
-      const positionalResult = this.tryInvokeFramePositional(
-        site, framePositional.invoke, frame, thread);
-      if (positionalResult !== ASYNC_INVOKE) {
-        this.framePositionalCallCount += 1;
-        return positionalResult;
+    // Test the feature flag before doing the lookup, not after. The virtual
+    // branch is a string-keyed dictionary access, and it used to run on every
+    // call even when frame-positional calls were switched off entirely.
+    if (this.framePositionalCallsEnabled) {
+      let framePositional = null;
+      if (site.op === "invokestatic" || site.op === "invokespecial") {
+        framePositional = site.fastPositional;
+      } else {
+        const receiverType = receiver.type || site.declaredClassName;
+        framePositional = site.fastPositionalTargets?.[receiverType] || null;
       }
-      this.framePositionalFallbackCount += 1;
+      if (framePositional?.invoke?.jvmCanonicalFrameAdapter === true) {
+        const positionalResult = this.tryInvokeFramePositional(
+          site, framePositional.invoke, frame, thread);
+        if (positionalResult !== ASYNC_INVOKE) {
+          this.framePositionalCallCount += 1;
+          return positionalResult;
+        }
+        this.framePositionalFallbackCount += 1;
+      }
     }
     const jre = site.fastJreTarget;
     if (jre) {
@@ -5856,9 +5860,23 @@ class JitCompiler {
       if (receiver === null || receiver === undefined) {
         throw { type: "java/lang/NullPointerException", message: null };
       }
-      if ((receiver.type || site.declaredClassName) === dynamic.targetClassName) {
+      const receiverType = receiver.type || site.declaredClassName;
+      if (receiverType === dynamic.targetClassName) {
         this.maybeExpandHotCallGraphRegion(site);
         return this.tryInvokeResolvedTarget(site, dynamic.target, frame, thread);
+      }
+      // Secondary receiver types at a polymorphic site. Without this they reach
+      // their already-resolved target only by re-running the whole generic
+      // path, including the JRE lookup, on every call. Types that resolve to a
+      // JRE method are never recorded here, so JRE precedence is unaffected.
+      const polymorphic = site.fastDynamicTargets;
+      if (polymorphic && site.fastDynamicTargetsVersion ===
+          (this.jvm.jni ? this.jvm.jni.registryVersion : 0)) {
+        const resolved = polymorphic[receiverType];
+        if (resolved !== undefined) {
+          this.maybeExpandHotCallGraphRegion(site);
+          return this.tryInvokeResolvedTarget(site, resolved, frame, thread);
+        }
       }
     }
     return this.tryInvokeSyncSite(site, frame, thread);
@@ -6545,6 +6563,19 @@ class JitCompiler {
             debugGuarded: direct.jvmDebugGuarded === true,
           };
         }
+        // The monomorphic slot below only ever holds the first receiver type.
+        // Keep every resolved receiver in a by-type map as well, so a
+        // polymorphic site does not walk the whole generic resolution path on
+        // each call for its second and subsequent types. The stored value is
+        // the same target object that site.targets holds, so an in-place
+        // generated-code upgrade is visible through both.
+        const registryVersion = this.jvm.jni ? this.jvm.jni.registryVersion : 0;
+        if (!site.fastDynamicTargets ||
+            site.fastDynamicTargetsVersion !== registryVersion) {
+          site.fastDynamicTargets = Object.create(null);
+          site.fastDynamicTargetsVersion = registryVersion;
+        }
+        site.fastDynamicTargets[targetClassName] = target;
         if (!site.fastDynamicTarget) {
           site.fastDynamicTarget = { targetClassName, target, positional };
           if (target.intrinsic) {
@@ -6748,11 +6779,15 @@ class JitCompiler {
     // frame never exposes values left by its previous invocation.
     if (this.needsBytecodeChecks()) child.locals.fill(undefined);
     child.stack.items.length = 0;
-    delete child.jitSkipOnce;
-    delete child.jitJsDisabled;
-    delete child.jitAdaptiveEntryCounted;
-    delete child.jitGeneratedReturnParent;
-    delete child.jitGeneratedReturnType;
+    // Assign undefined rather than deleting. Every consumer of these five
+    // fields tests them for truthiness or identity, so undefined and absent are
+    // indistinguishable, but `delete` on a recycled frame drops the object into
+    // dictionary mode on every single call through this boundary.
+    child.jitSkipOnce = undefined;
+    child.jitJsDisabled = undefined;
+    child.jitAdaptiveEntryCounted = undefined;
+    child.jitGeneratedReturnParent = undefined;
+    child.jitGeneratedReturnType = undefined;
     child.className = lookupClass;
     if (this.frameHandoffTracePattern) {
       const parentIdentity = `${frame.className || "?"}.${frame.method?.name || "?"}${
