@@ -78,6 +78,7 @@ const {
   NPE, AIOOBE,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   Unsupported,
+  blockedNames,
   NestedDeopt,
   isGuestThrow,
   FUEL,
@@ -98,6 +99,17 @@ const { expandWideInstruction } = require('../instructions');
 // feature) never match, so a module demoted only for those is never rebuilt.
 const DEFERRABLE_DEMOTE =
   /unresolved|not ready|not initialized|no ready impl|vetoed|not fully compiled/;
+
+// Of those, the ones no runtime mechanism can repair. A dispatcher-tier module
+// is otherwise left alone because late instance-target installation rescues a
+// dispatch site that merely missed — but that only ever helps a site that
+// COMPILED. A static callee that had no module yet, and a static field whose
+// cell did not exist, leave a demoted block with no import to install anything
+// into, so a rebuild is the only thing that can recover them. Measured on
+// runTile, whose last module was a dispatcher one demoted at the makeTile
+// call: the gate was skipped 548 times while its blocker signature had already
+// moved.
+const UNSERVICEABLE_DEMOTE = /callee not ready|unresolved static/;
 
 const EMPTY_WRITE_SET = new Set();
 const capturesBooleanStaticCache = new WeakMap();
@@ -457,7 +469,13 @@ class MethodTranslator {
         }
         currentClassName = cd && cd.ast && cd.ast.classes[0] ? cd.ast.classes[0].superClassName : null;
       }
-      if (!container) throw new Unsupported(`unresolved static ${className}.${fieldName}`, className);
+      if (!container) {
+        // Name the FIELD, not its class: static field cells are created
+        // lazily on first write, so the class is routinely initialized long
+        // before the cell exists and class readiness would never move again.
+        throw new Unsupported(`unresolved static ${className}.${fieldName}`,
+          `${className}.${fieldName}:${descriptor}`);
+      }
       const name = `${isGet ? 'gs' : 'ps'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
       const getStatic = t === T.i32
         ? () => {
@@ -559,7 +577,11 @@ class MethodTranslator {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
     if (!calleeSt || (calleeSt.callee || calleeSt).meta.boxedCount) {
-      throw new Unsupported(`invoke ${className}.${name}`);
+      // Name the callee METHOD, not its class: what has to change before a
+      // rebuild could link this site is that method owning a module, and its
+      // class is typically initialized already. See blockerSignature.
+      throw new Unsupported(`invoke ${className}.${name} callee not ready`,
+        `${className}.${name}${descriptor}`);
     }
     const calleeMeta = (calleeSt.callee || calleeSt).meta;
     if (calleeMeta.usedEh) {
@@ -750,11 +772,18 @@ class MethodTranslator {
     let dispatch = null;
     let direct = null;
     let resolvedCone = null;
+    // What each of these waits on is the IMPL METHOD owning a module, so that
+    // is what they name; its class is usually initialized well before it.
+    const implKey = (implClassName) => `${implClassName}.${name}${descriptor}`;
     const readyOrThrow = (implClassName) => {
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
-      if (!st) throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`);
+      if (!st) {
+        throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`,
+          implKey(implClassName));
+      }
       if (st.linkVetoed && !(st.callee || st).meta.fullyCompiled) {
-        throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`);
+        throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`,
+          implKey(implClassName));
       }
       return st;
     };
@@ -769,7 +798,12 @@ class MethodTranslator {
         // call back mid-body — it either completes or throws
         const m = (direct.callee || direct).meta;
         if (!m.fullyCompiled || m.deoptableCalls || m.usedEh) {
-          throw new Unsupported(`<init> ${owner} target not fully compiled`);
+          throw new Unsupported(`<init> ${owner} target not fully compiled`
+            + (this.wasmJit && this.wasmJit.debug
+              ? ` [full=${m.fullyCompiled} normalFlow=${m.normalFlowFullyCompiled}`
+                + ` deoptableCalls=${m.deoptableCalls} usedEh=${m.usedEh}`
+                + ` demotes=${JSON.stringify([...(m.demoteReasons || [])])}]` : ''),
+          implKey(impl.className));
         }
       }
     } else {
@@ -796,7 +830,12 @@ class MethodTranslator {
         readyByImpl.set(impl.className, st);
         if (st) readyCount += 1;
       }
-      if (!readyCount) throw new Unsupported(`invoke ${owner}.${name} no ready impl`);
+      if (!readyCount) {
+        // Any one impl gaining a module makes this site linkable, so wait on
+        // the whole cone rather than picking one arbitrarily.
+        throw new Unsupported(`invoke ${owner}.${name} no ready impl`,
+          [...resolved.impls.values()].map((impl) => implKey(impl.className)));
+      }
       dispatch = new Map();
       for (const [runtimeClass, impl] of resolved.targets) {
         const st = readyByImpl.get(impl.className);
@@ -1361,7 +1400,7 @@ class MethodTranslator {
       } catch (err) {
         if (!(err instanceof Unsupported)) throw err;
         this.demoteReasons.set(b, err.message);
-        if (err.blockedOn) this.demoteBlockers.add(err.blockedOn);
+        for (const name of blockedNames(err)) this.demoteBlockers.add(name);
         blockBodies[b] = this.exitStub(b);
       }
     }
@@ -2339,6 +2378,16 @@ class WasmJit {
     this.fullCoverageWins = 0;
     this.state = new WeakMap(); // method -> {entries, status, run, meta, key, runs, exits, fuelExits}
     this.compiled = [];
+    // Method key -> the compileEpoch at which it first reached `ready`. A
+    // demotion can name a callee METHOD rather than a class (the callee had no
+    // linkable module yet), and class readiness cannot see that change — the
+    // owning class is typically long since initialized. The epoch (rather than
+    // a plain set) is what lets a signature be asked "as of" a point in time:
+    // a compile routinely makes its own callees ready while running, so
+    // stamping readiness at the end would record a blocker as already cleared
+    // and the rebuild it should have triggered would never fire. See
+    // blockerSignature.
+    this.keyReadyEpoch = new Map();
     this.writeSummaries = new Map(); // `cls.name(desc)` -> {keys: Set|null, epoch}
     this.lateInstanceTargetAttempts = 0;
     this.lateInstanceTargetInstalls = 0;
@@ -2371,12 +2420,52 @@ class WasmJit {
   // times — `invoke X.m unresolved` clears on the load, `new X not
   // initialized` only on the <clinit> — so a single "is it there" bit would
   // spend the rebuild budget on the first and never see the second.
-  blockerSignature(blockers) {
+  // A blocker naming a callee METHOD (it carries a descriptor, so it contains
+  // '(' — a class name never does) asks a different question: not whether a
+  // class arrived, but whether that method now owns a module. Class readiness
+  // cannot answer it, since the owning class is usually initialized long
+  // before its methods compile, which left such a module waiting on a
+  // signature that could never move again. Readiness here is only a trigger:
+  // if the rebuild still cannot link the callee, the bit has already flipped
+  // and will not fire a second time.
+  // Does `Class.field:Desc` have a cell yet? Same superclass walk the field
+  // import does, so the answer is exactly the one that refused the block.
+  staticFieldResolves(blocker) {
+    const cut = blocker.lastIndexOf('.');
+    const colon = blocker.indexOf(':', cut);
+    if (cut < 0 || colon < 0) return false;
+    const fieldName = blocker.slice(cut + 1, colon);
+    const fieldKey = `${fieldName}${blocker.slice(colon)}`;
+    let current = blocker.slice(0, cut);
+    while (current) {
+      const cd = this.jvm.classes[current];
+      if (cd && cd.staticFields &&
+          (cd.staticFields.has(fieldKey) || cd.staticFields.has(fieldName))) return true;
+      current = cd && cd.ast && cd.ast.classes[0] ? cd.ast.classes[0].superClassName : null;
+    }
+    return false;
+  }
+
+  // `asOf` bounds which readiness counts: a compile stamps its signature as of
+  // the epoch it STARTED at, so callees it made ready along the way still read
+  // as blocked and the next entry sees the signature move.
+  blockerSignature(blockers, asOf = Infinity) {
     if (!blockers || !blockers.length) return '';
     let sig = '';
-    for (const className of blockers) {
-      sig += !this.jvm.classes[className] ? '0'
-        : this.jvm.classInitializationState.get(className) === 'INITIALIZED' ? '2' : '1';
+    for (const blocker of blockers) {
+      if (blocker.includes('(')) {
+        const epoch = this.keyReadyEpoch.get(blocker);
+        sig += (epoch !== undefined && epoch < asOf) ? '2' : '0';
+        continue;
+      }
+      // `Class.field:Desc` — a static field CELL. Class names carry neither
+      // ':' nor '(', and method keys are already taken above.
+      if (blocker.includes(':')) {
+        sig += this.staticFieldResolves(blocker) ? '2' : '0';
+        continue;
+      }
+      sig += !this.jvm.classes[blocker] ? '0'
+        : this.jvm.classInitializationState.get(blocker) === 'INITIALIZED' ? '2' : '1';
     }
     return sig;
   }
@@ -2458,7 +2547,8 @@ class WasmJit {
     // never exits at all. So rebuild here instead, and only when the world
     // that produced those demotions has actually changed — not on a timer or
     // an exit rate, both of which measured negative.
-    if (st.partialDeps && st.partialDepsStructured && this.depsMoved(st)) {
+    if (st.partialDeps && (st.partialDepsStructured || st.partialDepsUnserviceable) &&
+        this.depsMoved(st)) {
       st.depWorld = this.depWorldVersion();
       st.blockerSig = this.blockerSignature(st.blockers);
       if ((st.depRecompiles || 0) < this.depRecompileLimit) {
@@ -2685,6 +2775,10 @@ class WasmJit {
     const isRecompile = st.status === 'ready';
     const className = frame.className || (frame.method.className) || '?';
     st.key = `${className}.${frame.method.name}${frame.method.descriptor}`;
+    // The world this compile is about to read. Callee compiles it triggers
+    // will advance the epoch, so the blocker signature is stamped against
+    // this value rather than the one at the end. See blockerSignature.
+    const startEpoch = this.compileEpoch;
     // Prevent recursive static call graphs from trying to compile the same
     // method again while its translator is still discovering callees.
     st.status = 'compiling';
@@ -2693,7 +2787,7 @@ class WasmJit {
     try {
       let structuredMeta = null;
       let structuredDeferred = false;
-      let structuredBlocker = null;
+      let structuredBlockers = [];
       if (this.structuredEnabled) {
         try {
           const StructuredWasmCompiler = require('./StructuredWasmCompiler');
@@ -2706,7 +2800,7 @@ class WasmJit {
           // was lost, not one block. Recorded here because the dispatcher meta
           // built below cannot say why the better tier declined.
           structuredDeferred = DEFERRABLE_DEMOTE.test(err.message);
-          if (structuredDeferred && err.blockedOn) structuredBlocker = err.blockedOn;
+          if (structuredDeferred) structuredBlockers = blockedNames(err);
           if (this.debug) console.error(`[wasmjit] structured fallback ${st.key}: ${err.message}`);
         }
       }
@@ -2785,7 +2879,10 @@ class WasmJit {
         ? primary.normalFlowFullyCompiled : primary.fullyCompiled;
       if (!refReturnComplete &&
           (primary.retChar === 'L' || primary.retChar === '[')) {
-        throw new Unsupported('partial module has a reference return');
+        throw new Unsupported('partial module has a reference return'
+          + (this.debug
+            ? ` [normalFlow=${primary.normalFlowFullyCompiled} full=${primary.fullyCompiled}`
+              + ` demotes=${JSON.stringify([...(primary.demoteReasons || [])])}]` : ''));
       }
       if (asCallee) {
         // A linked callee spills into a real scratch frame and unwinds via
@@ -2848,6 +2945,11 @@ class WasmJit {
       const rank = (m) => (m.fullyCompiled ? 2 : m.normalFlowFullyCompiled ? 1 : 0);
       st.callee = st.osr && rank(st.osr.meta) > rank(st.meta) ? st.osr : null;
       st.status = 'ready';
+      // Stamped before this compile's own epoch bump, so "ready at epoch E"
+      // always compares strictly less than any later compile's start epoch.
+      if (st.key && !this.keyReadyEpoch.has(st.key)) {
+        this.keyReadyEpoch.set(st.key, this.compileEpoch);
+      }
       st.retryAfter = undefined;
       st.deferredEpoch = undefined;
       st.calleeDeferredEpoch = undefined;
@@ -2864,18 +2966,22 @@ class WasmJit {
       // exiting, which is strictly better. See the late-target tests in
       // wasmInstanceLink.
       st.partialDepsStructured = structuredDeferred || !!(st.meta && st.meta.structured);
+      // ...but a loss nothing can repair at runtime reopens the gate whatever
+      // tier produced the module. See UNSERVICEABLE_DEMOTE.
+      st.partialDepsUnserviceable = [...primary.demoteReasons.values()]
+        .some((reason) => UNSERVICEABLE_DEMOTE.test(reason));
       // Which classes have to change state before rebuilding could possibly
       // help. When this is known the rebuild waits for exactly them, which is
       // both more likely to succeed and far less likely to storm than waiting
       // for any world movement at all.
       const blockers = new Set(primary.demoteBlockers || []);
-      if (structuredBlocker) blockers.add(structuredBlocker);
+      for (const name of structuredBlockers) blockers.add(name);
       st.blockers = [...blockers].sort();
       this.compileEpoch += 1;
       // Stamped after the bump this compile itself contributes, so a module
       // never triggers its own rebuild.
       st.depWorld = this.depWorldVersion();
-      st.blockerSig = this.blockerSignature(st.blockers);
+      st.blockerSig = this.blockerSignature(st.blockers, startEpoch);
       if (!st.listed) { st.listed = true; this.compiled.push(st); }
       // JVM_WASM_DUMP_ACCEPT=<dir> writes each accepted module so its wat can
       // be diffed against hand-written wasm for the same Java method. The

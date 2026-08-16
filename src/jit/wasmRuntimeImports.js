@@ -235,7 +235,12 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet, elementOf = null) {
       }
       currentClassName = cd && cd.ast && cd.ast.classes[0] ? cd.ast.classes[0].superClassName : null;
     }
-    if (!container) throw new Unsupported(`unresolved static ${className}.${fieldName}`);
+    // See the matching site in WasmJit: this waits on the FIELD CELL, which is
+    // created lazily on first write, not on its class being initialized.
+    if (!container) {
+      throw new Unsupported(`unresolved static ${className}.${fieldName}`,
+        `${className}.${fieldName}:${descriptor}`);
+    }
     const name = `${isGet ? 'gs' : 'ps'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
     const getStatic = t === T.i32
       ? () => {

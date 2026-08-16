@@ -280,13 +280,20 @@ function mathIntrinsicFunction(name, descriptor) {
 // the Error constructor was ~1s of a profiled run, so skip it — nothing ever
 // reads .stack, only .message.
 class Unsupported extends Error {
-  // `blockedOn` names the guest class whose absence, or merely whose
-  // uninitialized state, caused this refusal. It is what makes the demotion
-  // recoverable on a schedule rather than on a guess: the entry gate rebuilds
-  // the module when that class's readiness changes, instead of when any part
-  // of the world happens to move. Leave it null for permanent refusals (an
-  // unsupported opcode, a disabled feature) — those must never trigger a
-  // rebuild.
+  // `blockedOn` names what has to change before this refusal could go away:
+  // a guest CLASS (absent, or merely uninitialized), or a callee METHOD that
+  // does not own a module yet — named as `Class.name(descriptor)`, which the
+  // signature tells apart by the '('. Either a single name or an array, for a
+  // refusal that waits on any of several (no impl in a cone is ready).
+  //
+  // It is what makes the demotion recoverable on a schedule rather than on a
+  // guess: the entry gate rebuilds the module when exactly those things move,
+  // instead of when any part of the world does. Leave it null for permanent
+  // refusals (an unsupported opcode, a disabled feature) — those must never
+  // trigger a rebuild. But note that a null on a RECOVERABLE refusal is worse
+  // than useless: the gate treats a non-empty blocker set as the complete
+  // account of what this module lost, so an unnamed recoverable loss becomes
+  // invisible rather than merely imprecise.
   constructor(message, blockedOn = null) {
     const limit = Error.stackTraceLimit;
     Error.stackTraceLimit = 0;
@@ -294,6 +301,13 @@ class Unsupported extends Error {
     Error.stackTraceLimit = limit;
     this.blockedOn = blockedOn;
   }
+}
+
+// The names a refusal waits on, as a list — blockedOn may be one or several,
+// and is absent on permanent refusals.
+function blockedNames(err) {
+  if (!err || !err.blockedOn) return [];
+  return Array.isArray(err.blockedOn) ? err.blockedOn : [err.blockedOn];
 }
 
 // Block transfers allowed per wasm run before the module spills and hands
@@ -541,6 +555,7 @@ module.exports = {
   MATH_INTRINSICS,
   mathIntrinsicFunction,
   Unsupported,
+  blockedNames,
   NestedDeopt,
   maxImpls,
   isGuestThrow,

@@ -468,6 +468,28 @@ class StructuredWasmCompiler {
     // Deopt stubs exit mid-method needing a real frame, so modules that have
     // them must take the partial-callee protocol (and are never pinned).
     const normalFlowFullyCompiled = this.demoted.size === 0 && this.deoptBlocks.size === 0;
+    // A guard-miss stub is a rare-path exit, but it still makes this module
+    // partial — and a partial module that returns a REFERENCE cannot be linked
+    // as a callee at all (see the reference-return rule in WasmJit.compile).
+    // For a reference-returning leaf that trade is backwards: the caller loses
+    // its entire loop to the tier so that one call in here can stay inlined.
+    // When the stubs are the only normal-flow gap, re-translate without
+    // inlining and take that module if it comes out linkable; otherwise keep
+    // the inlined one, so this can only add linkability, never remove it.
+    // Measured on TileDispatchHotLoop.makeTile, whose inlined cell.height was
+    // its only gap: without this, runTile exits at the makeTile call on every
+    // iteration and the whole grid walk stays off the tier.
+    if (inline && !normalFlowFullyCompiled && this.demoted.size === 0 &&
+        'L['.includes(parseMethodDescriptor(this.method.descriptor).ret)) {
+      let plain = null;
+      try {
+        plain = new StructuredWasmCompiler(this.jvm, this.method, this.className, this.wasmJit)
+          .translateWith(false);
+      } catch (err) {
+        if (!(err instanceof Unsupported)) throw err;
+      }
+      if (plain && plain.fullyCompiled) return plain;
+    }
     return {
       bytes,
       importObject: { env },
@@ -1322,7 +1344,9 @@ class StructuredWasmCompiler {
         for (const local of argScr) out.push(OP.local_get, ...uleb(local));
         out.push(OP.call, ...uleb(call.idx));
         if (node.kind !== 'V') out.push(OP.local_set, ...uleb(this.mustLocal(node)));
-        this.emitCallDeoptCheck(node, site, unders, out);
+        // `site`/`unders` are only prepared for deoptable sites; a
+        // never-exits fallback import has no flag to check.
+        if (call.deoptable) this.emitCallDeoptCheck(node, site, unders, out);
         out.push(OP.end);
         if (call.writes === null) out.push(...this.killSeqWhere(() => true));
         else if (call.writes && call.writes.size) {
@@ -1742,7 +1766,11 @@ class StructuredWasmCompiler {
     const calleeSt = this.wasmJit &&
       this.wasmJit.findReadyStatic(className, name, descriptor, true);
     const linked = calleeSt && (calleeSt.callee || calleeSt);
-    if (!linked) throw new Unsupported(`invoke ${className}.${name}`);
+    // Named by method key, not class: see the matching site in WasmJit.
+    if (!linked) {
+      throw new Unsupported(`invoke ${className}.${name} callee not ready`,
+        `${className}.${name}${descriptor}`);
+    }
     // java arg slot -> position in the wasm arg list
     const argPosBySlot = new Map();
     let slot = 0;
@@ -1851,12 +1879,18 @@ class StructuredWasmCompiler {
       throw new Unsupported('instance linking disabled');
     }
     const hierarchy = this.wasmJit.hierarchy;
+    // See the matching site in WasmJit: these wait on the impl METHOD.
+    const implKey = (implClassName) => `${implClassName}.${name}${descriptor}`;
     const readyOrThrow = (implClassName) => {
       const st = this.wasmJit.findReadyInstance(implClassName, name, descriptor);
-      if (!st) throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`);
+      if (!st) {
+        throw new Unsupported(`invoke ${owner}.${name} impl ${implClassName} not ready`,
+          implKey(implClassName));
+      }
       const m = (st.callee || st).meta;
       if (st.linkVetoed && !m.fullyCompiled) {
-        throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`);
+        throw new Unsupported(`partial callee ${implClassName}.${name} vetoed`,
+          implKey(implClassName));
       }
       return st;
     };
@@ -1874,7 +1908,12 @@ class StructuredWasmCompiler {
         // call back mid-body — it either completes or throws
         const m = (direct.callee || direct).meta;
         if (!m.fullyCompiled || m.deoptableCalls || m.usedEh) {
-          throw new Unsupported(`<init> ${owner} target not fully compiled`);
+          throw new Unsupported(`<init> ${owner} target not fully compiled`
+            + (this.wasmJit && this.wasmJit.debug
+              ? ` [full=${m.fullyCompiled} normalFlow=${m.normalFlowFullyCompiled}`
+                + ` deoptableCalls=${m.deoptableCalls} usedEh=${m.usedEh}`
+                + ` demotes=${JSON.stringify([...(m.demoteReasons || [])])}]` : ''),
+          implKey(impl.className));
         }
       }
     } else {
@@ -1905,7 +1944,11 @@ class StructuredWasmCompiler {
         readyByImpl.set(impl.className, st);
         if (st) readyCount += 1;
       }
-      if (!readyCount) throw new Unsupported(`invoke ${owner}.${name} no ready impl`);
+      if (!readyCount) {
+        // Any one impl gaining a module makes this site linkable.
+        throw new Unsupported(`invoke ${owner}.${name} no ready impl`,
+          [...resolved.impls.values()].map((impl) => implKey(impl.className)));
+      }
       dispatch = new Map();
       for (const [runtimeClass, impl] of resolved.targets) {
         const st = readyByImpl.get(impl.className);
@@ -1930,6 +1973,36 @@ class StructuredWasmCompiler {
       if (sub === null) { writes = null; break; }
       for (const k of sub) writes.add(k);
     }
+    // A statically-bound site whose single target has no exit of its own
+    // cannot deopt at all, so it needs no flag check after the call. Every
+    // path in fn/runNested that sets a flag is unreachable here: the
+    // dispatch-miss deopt is `dispatch`-only (invokespecial always has its
+    // callee), revalidateNestedCallee fires only for speculative modules,
+    // and the partial-exit paths need a callee that can stop mid-body.
+    //
+    // This is what makes constructor atomicity INDUCTIVE, which is the point.
+    // The <init> all-or-nothing rule asks whether a target can hand the call
+    // back mid-body, but it tested `deoptableCalls`, which counts linked
+    // calls whether or not they can actually deopt. So a constructor whose
+    // super() is java/lang/Object stayed atomic (that call is a no-op special
+    // case) while one whose super() is a GUEST constructor did not — even
+    // when that super was itself provably atomic. Two-level guest hierarchies
+    // were therefore unlinkable, and since an unlinkable <init> demotes the
+    // block that allocates, no method that allocates such a class could reach
+    // the tier. Measured on runTile: Tile.<init> -> Entry.<init> scored
+    // deoptableCalls=1, which cost makeTile its module and the whole loop its
+    // 16th block.
+    const directMod = direct && (direct.callee || direct);
+    const directMeta = directMod && directMod.meta;
+    const neverExits = !!(direct && directMeta && directMeta.fullyCompiled &&
+      !directMeta.boxedCount && !directMeta.deoptableCalls && !directMeta.usedEh &&
+      !(directMeta.specSites && directMeta.specSites.length));
+    // A later recompile may repoint the state at a module that CAN exit,
+    // while this caller has already been emitted with no check. Pin the
+    // link-time pair and fall back to it when that happens, exactly as the
+    // static never-exits path does.
+    const pinnedNeverExits = neverExits
+      ? { run: directMod.run, meta: directMeta } : null;
     const lateMissEpoch = new Map();
     const fn = (...args) => {
       const receiver = args[0];
@@ -1957,6 +2030,7 @@ class StructuredWasmCompiler {
       }
       return this.runNested(
         calleeSt, calleeSt.targetClassName, args, argPosBySlot, scratchFrames, dummy,
+        pinnedNeverExits,
       );
     };
     // Direct wasm->wasm fast path for the single-ready-target shape,
@@ -2045,7 +2119,7 @@ class StructuredWasmCompiler {
     return {
       idx: this.addImport(`${prefix}_${key}`.replace(/[^\w]/g, '_'), wParams, results, fn),
       writes,
-      deoptable: true,
+      deoptable: !neverExits,
       directLink,
     };
   }
@@ -2056,16 +2130,26 @@ class StructuredWasmCompiler {
   // anything; when it exits mid-method (or a deeper link deopts) parks the
   // callee frames on the box innermost-first and sets flag 2. Guest
   // exceptions from the callee propagate to this module's own wrap.
-  runNested(calleeSt, frameClassName, javaArgs, argPosBySlot, scratchFrames, dummy) {
+  runNested(calleeSt, frameClassName, javaArgs, argPosBySlot, scratchFrames, dummy,
+    pinned = null) {
     const box = this.box;
-    // A captured guard-elided module must re-check its baked class world
-    // before running; on invalidation nothing has run yet, so flag 1 makes
-    // the interpreter re-execute the invoke with full dynamic dispatch.
-    if (!this.wasmJit.revalidateNestedCallee(calleeSt)) {
+    let calleeMod = calleeSt.callee || calleeSt;
+    if (pinned) {
+      // The caller emitted no deopt check for this site because the target
+      // could not exit when it was linked. A recompile may have repointed the
+      // state at one that can; setting a flag nobody reads would silently
+      // drop the call's effect, so run the pinned link-time module instead.
+      const m = calleeMod.meta;
+      const stillNeverExits = !!(m && m.fullyCompiled && !m.boxedCount &&
+        !m.deoptableCalls && !m.usedEh && !(m.specSites && m.specSites.length));
+      if (!stillNeverExits) calleeMod = pinned;
+    } else if (!this.wasmJit.revalidateNestedCallee(calleeSt)) {
+      // A captured guard-elided module must re-check its baked class world
+      // before running; on invalidation nothing has run yet, so flag 1 makes
+      // the interpreter re-execute the invoke with full dynamic dispatch.
       box.deoptFlag = 1;
       return dummy;
     }
-    const calleeMod = calleeSt.callee || calleeSt;
     const meta = calleeMod.meta;
     // usedEh forces a scratch frame: a -3 exit spills into box.frame and
     // dispatches inside it below.
