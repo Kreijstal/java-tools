@@ -79,7 +79,15 @@ class ClassHierarchy {
   }
 
   _resolveDispatch(owner, name, descriptor) {
-    if (!this._classAst(owner)) return null;
+    // An unloaded owner is not a reason to give up. Nothing forces an interface
+    // class to load — invokeinterface resolves through the receiver — so the
+    // declared owner of a hot interface call is routinely absent while its
+    // implementors are present. `subclasses` is keyed by name and is built from
+    // the implementors' own `interfaces` lists, so the cone is still
+    // discoverable. The owner itself then drops out below as an unloaded member
+    // and clears `complete`, which is what the consumers that need a closed
+    // world already test; consumers that key on the exact runtime class stay
+    // correct because a receiver missing from the map deopts to the interpreter.
     const seen = new Set([owner]);
     const queue = [owner];
     const cone = [];

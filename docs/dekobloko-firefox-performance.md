@@ -6855,3 +6855,65 @@ around 5.6 s of actual interpreted opcodes), which is more than twice the whole
 call boundary. Optimizing what a reduced loop measures is not the same as
 optimizing the boot, and the way to tell the difference is to scale every
 fixture percentage by its method's share before believing it.
+
+## 2026-08-16: why the call shapes missed wasm, and the one-line cause
+
+Turning the wasm tier on for the reduced loop separates the shapes completely:
+
+| shape | wasm off | wasm on (before the fix) |
+|---|---|---|
+| arith | 49.22 ns/iter | **3.62** (1.1x HotSpot) |
+| iface | 226.76 | 229.35 |
+| poly | 322.95 | 321.34 |
+| tile | 2852.18 | 2771.54 |
+
+So the wasm tier reaches parity with HotSpot on straight-line integer code, and
+did nothing whatever for any shape containing a call. That is the whole answer
+to why the boot profile shows no wasm tier: loading is call-dense, and calls
+were falling off the tier.
+
+`JVM_DEBUG_WASMJIT=1` names the reason instead of leaving it to inference:
+
+    no compiled loop TileDispatchHotLoop.runIface(II)I:
+      2:invoke TileDispatchHotLoop$Cell.width unresolved
+
+Block 2 is the loop body. `ClassHierarchy._resolveDispatch` opened with
+`if (!this._classAst(owner)) return null` — give up when the call's declared
+owner is not a loaded class. **Nothing ever forces an interface class to load**:
+`invokeinterface` resolves through the receiver, so the interface is routinely
+absent while its implementors are present and compiled. A probe confirmed it
+exactly — the same query returns NULL before the interface is loaded and
+`targets=PlainCell complete=true` after.
+
+The rest of that function already degrades gracefully: a cone member with no
+loaded AST clears `complete` and is skipped, `subclasses` is keyed by name and
+is built from the implementors' own `interfaces` lists, and an empty target set
+still returns null. So the guard was the only thing standing in the way, and
+removing it yields `targets={PlainCell}, complete=false`. That is sound because
+the two kinds of consumer are already separated: everything needing a closed
+world tests `complete`, while the dispatch map keys on the exact runtime class,
+and a receiver missing from it deopts to the interpreter and re-executes the
+invoke with full dynamic dispatch. A later-loaded implementor was already
+handled that way whenever the owner was loaded but a subclass was not; this only
+extends an existing, already-handled case.
+
+    compiled TileDispatchHotLoop$PlainCell.width(I)I: 715B, 1/1 blocks
+    compiled TileDispatchHotLoop.runIface(II)I: 1167B, 4/4 blocks
+    vcall_...$Cell.width@runIface:24: calls=100000 deopts=0 scratch=0
+
+4/4 blocks means no exit stubs at all, and the interface call site links with
+zero deopts over 100000 calls.
+
+| shape | session baseline | now (wasm on) | vs HotSpot |
+|---|---|---|---|
+| arith | 49 | 3.64 | 0.8x |
+| iface | 590 | 72 (-88%) | ~60x, was 642x |
+| poly | 775 | 121 (-84%) | ~20x, was 114x |
+| tile | 4901 | 2855 (-42%) | ~215x |
+
+`tile` is unmoved because it needs more than dispatch. It compiles 9 of 16
+blocks and still exits on `checkcast`, a `new` whose class is not yet
+initialized, an unresolved static field, and several invokes — and, once
+partially compiled, it is not recompiled when those dependencies do become
+resolvable. Each is a separate piece of work; the dispatch fix alone does not
+reach it. Full suite 197/197 files, 8902 tests, exit 0.
