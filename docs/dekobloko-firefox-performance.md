@@ -6917,3 +6917,63 @@ initialized, an unresolved static field, and several invokes — and, once
 partially compiled, it is not recompiled when those dependencies do become
 resolvable. Each is a separate piece of work; the dispatch fix alone does not
 reach it. Full suite 197/197 files, 8902 tests, exit 0.
+
+## 2026-08-16: tile's checkcast and recompile — both fixed, tile still slow
+
+**checkcast did not need implementing.** It is already compiled as a per-site
+import, gated behind `JVM_WASM_CHECKCAST=1` and left opt-in because it measured
+net-negative on dekobloko. Enabling it takes `runTile` from 9/16 to 10/16 blocks
+and the cast site links cleanly — `calls=28 deopts=0` — but buys nothing, because
+28 is the whole population: the cast sits behind a cache miss, not in the hot
+path. Worth knowing before spending effort on it.
+
+**The recompile trigger was unreachable for the methods that need it.** The
+existing one lives in the exit handler and fires on `st.exits % 20000 === 0`.
+A method whose *loop body* is an exit stub never gets there: tracing `runTile`
+with `JVM_TRACE_WASM_METHOD` shows **13 wasm transitions across 20000
+iterations** — it enters, exits immediately, and stops being entered long before
+it could accumulate 20000 exits. The trigger is therefore dead exactly where the
+partial module is worst.
+
+The new trigger sits in the entry gate next to the speculative-revalidation
+check it mirrors, and fires on the event that can actually change the outcome:
+the class world grew since this module was built (`st.partialDeps &&
+st.depEpoch !== classEpoch`). Not a timer and not an exit rate — both of those
+measured -1.4 to -2.4 fps previously. `DEFERRABLE_DEMOTE` restricts it to demote
+reasons a class load can undo (unresolved dispatch, callee not ready,
+uninitialized `new`, unresolved static owner), so a module demoted only for an
+unsupported opcode is never rebuilt. `JVM_WASM_DEP_RECOMPILES` bounds it
+(default 3, 0 disables).
+
+**It must defer to late instance-target installation.** The first version broke
+four `wasmInstanceLink` tests. That path absorbs a newly loaded implementor into
+the *live* dispatch map with zero exits and no recompilation — strictly better
+than rebuilding — and a class load advances the epoch, so the naive rebuild
+threw the working module away before it could act. The fix is to require that
+the module has actually paid exits since it was built
+(`st.exits > st.depExits`), which is precisely the invariant those tests already
+assert (`st.exits === exitsBefore`). A module late installation can serve is now
+never rebuilt, and there is an explicit assertion for that.
+
+It works, and it is visible:
+
+    compiled ...runTile: 1809B, 10/16 blocks (exits: ... Cell.width unresolved;
+      Cache.get unresolved; makeTile; Tile.blend unresolved; static sink)
+    ...
+    compiled ...runTile: 4445B, 17/25 blocks, 3 field caches structured+osr
+      +3 inlined (exits: static sink; op instanceof; makeTile; op checkcast)
+
+The module escalates from 10/16 dispatcher blocks to 17/25 structured blocks
+with three inlined calls, and `Cell.width`, `Cache.get` and `Tile.blend` all
+resolve away.
+
+**And `tile` is still 2850 ns/iter, ~215x.** Unchanged. What is left exits the
+loop *body*, once or twice per iteration: `op instanceof`, an unresolved static
+field write (`sink`, every iteration), and `invoke makeTile`. Resolving dispatch
+does not help when three other opcode classes still demote the same block. Full
+suite 197/197 files, 8902 tests, exit 0.
+
+That is the third time this session that a real, verified mechanical improvement
+produced no wall-clock movement. The pattern is consistent and worth stating
+plainly: a block is only as compiled as its worst opcode, and a loop is only as
+fast as its most-demoted block.

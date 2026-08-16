@@ -280,6 +280,12 @@ test('a pure target loaded after compilation installs without deoptimizing', asy
   }
   t.ok(jvm.jit.wasmJit.lateInstanceTargetInstalls >= 1,
     'the call-site map recorded a late target installation');
+  // The dependency-driven rebuild must defer to late installation. Loading
+  // ShapeC advances the class epoch, which is the rebuild's trigger condition,
+  // but this module is being served without exiting, so rebuilding it would
+  // throw away a working module and lose the install above.
+  t.notOk(st && st.depRecompiles,
+    'a module served by late installation is not rebuilt');
   t.end();
 });
 

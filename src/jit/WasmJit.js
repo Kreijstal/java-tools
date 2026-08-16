@@ -91,6 +91,13 @@ const {
 } = require('../instructions/utils');
 const { expandWideInstruction } = require('../instructions');
 
+// Demote reasons a later class load can undo: an unresolved dispatch, a callee
+// whose module is not compiled yet, an uninitialized class at a `new`, or an
+// unresolved static owner. Permanent reasons (an unsupported opcode, a disabled
+// feature) never match, so a module demoted only for those is never rebuilt.
+const DEFERRABLE_DEMOTE =
+  /unresolved|not ready|not initialized|no ready impl|vetoed|not fully compiled/;
+
 const EMPTY_WRITE_SET = new Set();
 const capturesBooleanStaticCache = new WeakMap();
 
@@ -2256,6 +2263,11 @@ class WasmJit {
     this.directInstanceLinkEnabled = env.JVM_WASM_DIRECT_INSTANCE_LINK === '1';
     this.lateInstanceTargetsEnabled = env.JVM_DISABLE_WASM_LATE_INSTANCE_TARGETS !== '1';
     this.checkcastEnabled = env.JVM_WASM_CHECKCAST === '1';
+    // How many times a ready-but-partial module may be rebuilt after the class
+    // world grows. Bounded because unbounded rebuilding is the "recompile
+    // storm" that previously measured -1.4 to -2.4 fps; 0 disables it.
+    this.depRecompileLimit = env.JVM_WASM_DEP_RECOMPILES === undefined
+      ? 3 : Number(env.JVM_WASM_DEP_RECOMPILES);
     // Reference-return completeness test; see compile(). Opt-in: the
     // relaxation is reasoned-out but UNMEASURED, so it does not run by
     // default.
@@ -2374,6 +2386,31 @@ class WasmJit {
     if (st.status !== 'ready') {
       if (this.census) this._censusNote(frame, `not-ready:${st.status}`);
       return null;
+    }
+
+    // A module built while a callee's class was still unloaded keeps those
+    // blocks as exit stubs for good. The exit-count trigger in exitTo cannot
+    // rescue it: that needs 20000 exits, but a method whose loop body is an
+    // exit stub stops being entered long before it reaches them (measured: 13
+    // wasm transitions across 20000 iterations). So rebuild here instead, and
+    // only when the class world has actually grown since this module was
+    // built, which is the event that can change the outcome — not on a timer
+    // or an exit rate, both of which measured negative.
+    if (st.partialDeps && st.depEpoch !== (this.jvm.classEpoch || 0) &&
+        (st.exits || 0) > (st.depExits || 0)) {
+      st.depEpoch = this.jvm.classEpoch || 0;
+      if ((st.depRecompiles || 0) < this.depRecompileLimit) {
+        st.depRecompiles = (st.depRecompiles || 0) + 1;
+        st.status = 'cold';
+        st.entries = 0;
+        st.retryAfter = 1;
+        st.meta = null;
+        st.run = null;
+        st.osr = null;
+        st.callee = null;
+        if (this.census) this._censusNote(frame, 'dependency-world-grew');
+        return null;
+      }
     }
 
     // Speculative modules (CHA-based inlined instance calls — instanceof
@@ -2744,6 +2781,19 @@ class WasmJit {
       st.retryAfter = undefined;
       st.deferredEpoch = undefined;
       st.calleeDeferredEpoch = undefined;
+      // Remember whether any block was demoted for a reason that a later class
+      // load can undo, and the class world this module was built against. The
+      // entry gate uses both to rebuild a module whose callees have since
+      // become resolvable. See DEFERRABLE_DEMOTE.
+      st.partialDeps = [...primary.demoteReasons.values()]
+        .some((reason) => DEFERRABLE_DEMOTE.test(reason));
+      st.depEpoch = this.jvm.classEpoch || 0;
+      // Exit count at build time. The rebuild below only fires once this module
+      // has actually paid exits, which is what keeps it from preempting late
+      // instance-target installation: that path absorbs a newly loaded
+      // implementor into the live dispatch map without exiting the caller at
+      // all, so a module it can serve never gets rebuilt.
+      st.depExits = st.exits || 0;
       this.compileEpoch += 1;
       if (!st.listed) { st.listed = true; this.compiled.push(st); }
       // JVM_WASM_DUMP_ACCEPT=<dir> writes each accepted module so its wat can
