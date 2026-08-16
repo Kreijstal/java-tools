@@ -19,6 +19,14 @@ test('minimal compiler accepts decompiled PyramidApplet array and support-field 
       '-d', tempDir,
       sourcePath,
     ], { encoding: 'utf8' });
+    // The Applet API was removed in JDK 26, so the fixture cannot be built by a
+    // modern javac at all. That is a toolchain limitation rather than a
+    // regression, so skip the round-trip instead of failing it.
+    if (javac.status !== 0 && /package java\.applet does not exist/.test(javac.stderr || '')) {
+      t.skip('javac has no java.applet (removed in JDK 26+); skipping the javac round-trip');
+      t.end();
+      return;
+    }
     t.equal(javac.status, 0, `PyramidApplet fixture compiles: ${javac.stderr}`);
     if (javac.status !== 0) {
       t.end();

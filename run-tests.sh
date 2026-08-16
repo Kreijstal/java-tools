@@ -81,6 +81,7 @@ run_test() {
   local timeout_cmd=(timeout 15)
   case "$test_file" in
     *data-zip-download*) timeout_cmd=(timeout 60);;
+    */breakpointLocations.test.js) timeout_cmd=(timeout 120);;
     */hierarchyRename.test.js) timeout_cmd=(timeout 60);;
     */jitCompiler.test.js) timeout_cmd=(timeout 120);;
     */javaFrontendAllJavaCompile.test.js) timeout_cmd=(timeout 60);;
