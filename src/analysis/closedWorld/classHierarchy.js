@@ -65,10 +65,13 @@ class ClassHierarchy {
 
   // Complete dispatch table for a virtual/interface call on `owner` over the
   // loaded world: { targets: Map<concrete runtime class, impl>, impls:
-  // Map<implKey, impl>, complete }. Concrete cone members whose resolution is
-  // stub-tainted are silently absent from targets — their instances take the
-  // caller's runtime fallback path — and clear `complete`, which consumers
-  // that guard by instanceof (not by exact runtime class) must require.
+  // Map<implKey, impl>, complete, noHiddenReceivers }. Concrete cone members
+  // whose resolution is stub-tainted are silently absent from targets — their
+  // instances take the caller's runtime fallback path — and clear `complete`,
+  // which consumers that guard by instanceof (not by exact runtime class) must
+  // require. `noHiddenReceivers` is the weaker fact such consumers can also
+  // accept: completeness was lost only to cone members that are not loaded at
+  // all, so no instance of them exists to slip past a guard today.
   resolveDispatch(owner, name, descriptor) {
     this.refresh();
     const memoKey = `${owner}.${name}${descriptor}`;
@@ -101,18 +104,31 @@ class ClassHierarchy {
     const targets = new Map();
     const impls = new Map();
     let complete = true;
+    // Why completeness was lost matters. A cone member that is not in
+    // jvm.classes at all cannot currently have an instance, so it hides no
+    // receiver from an instanceof guard — the routine case is the declared
+    // owner of an interface call, which nothing forces to load. A member that
+    // IS registered but unusable here (a JRE stub, or a class whose own
+    // resolution failed) can have instances, and one of them could reach a
+    // guard for a supertype whose body it overrides. Only the second kind
+    // makes guard-based specialization unsound.
+    let hiddenReceivers = false;
     for (const member of cone) {
       const cls = this._classAst(member);
-      if (!cls) { complete = false; continue; }
+      if (!cls) {
+        complete = false;
+        if (this.jvm.classes[member]) hiddenReceivers = true;
+        continue;
+      }
       const flags = cls.flags || [];
       if (flags.includes('abstract') || flags.includes('interface')) continue;
       const impl = this.findImplementation(member, name, descriptor);
-      if (!impl) { complete = false; continue; }
+      if (!impl) { complete = false; hiddenReceivers = true; continue; }
       targets.set(member, impl);
       impls.set(`${impl.className}.${name}${descriptor}`, impl);
     }
     if (!targets.size) return null;
-    return { targets, impls, complete };
+    return { targets, impls, complete, noHiddenReceivers: !hiddenReceivers };
   }
 
   // invokespecial (non-<init>) is statically bound. Resolution walks up from

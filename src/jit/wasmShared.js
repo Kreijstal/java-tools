@@ -294,6 +294,13 @@ class Unsupported extends Error {
 // so raising it isolates whether a miscompile lives in that spill path.
 const FUEL = Number(process.env.JVM_WASM_FUEL || 5_000_000);
 
+// Largest dispatch cone an instance call site will compile a map for. Read per
+// call rather than captured, so a test or a boot experiment can move it with
+// JVM_WASM_MAX_IMPLS without reloading the module graph.
+function maxImpls() {
+  return Number(process.env.JVM_WASM_MAX_IMPLS) || 4;
+}
+
 // Guest exceptions are plain objects with a string `type` (never Error
 // instances); host errors (TypeError, NestedDeopt, ...) are everything else.
 // The EH import wrappers use this to decide catch-and-dispatch vs rethrow.
@@ -527,6 +534,7 @@ module.exports = {
   mathIntrinsicFunction,
   Unsupported,
   NestedDeopt,
+  maxImpls,
   isGuestThrow,
   specokGlobalEntry,
   FUEL,

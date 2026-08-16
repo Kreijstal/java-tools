@@ -69,6 +69,12 @@ const PLAIN_OK = new RegExp('^(nop|aconst_null|iconst_(m1|[0-5])|lconst_[01]|fco
 const CAST_OK = /^(checkcast|instanceof)$/;
 const INSTANCE_INVOKE = /^(invokevirtual|invokeinterface|invokespecial)$/;
 const HEAP_WRITE = /^(putfield|putstatic|[bcsilfda]astore)$/;
+// Synthetic invokestatic marking a fused guard: the "method name" is the index
+// into the returned guardSites table. Only the structured backend sees it, and
+// only because inlineCalls produced it — it never appears in real bytecode, and
+// the backend compiles it to one import rather than resolving anything.
+const GUARD_OWNER = '$wasmGuard';
+const GUARD_DESCRIPTOR = '(Ljava/lang/Object;)I';
 
 function supportedCalleeOp(op, ins) {
   if (SHORT_LOCAL.test(op) || LONG_LOCAL.test(op) || PLAIN_OK.test(op)) return true;
@@ -252,16 +258,29 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
     elide = !!recvIsThis;
   } else {
     const r = ctx.hierarchy.resolveDispatch(owner, name, descriptor);
-    // An incomplete cone hides receivers whose dispatch is unknown; an
-    // instanceof guard would wrongly catch them, so only complete cones
-    // qualify (the dispatch-map tier still serves incomplete ones).
-    if (!r || !r.complete) return null;
+    // An incomplete cone can hide receivers whose dispatch is unknown; an
+    // instanceof guard would wrongly catch them. `noHiddenReceivers` says the
+    // only members missing from the cone are classes that are not loaded at
+    // all, which therefore have no instances to hide — the ordinary case for
+    // an interface call, since nothing forces the interface itself to load.
+    // Classes loaded after this point are covered the same way an overriding
+    // subclass already is: the site is recorded below and re-checked when the
+    // class epoch grows.
+    if (!r || !(r.complete || r.noHiddenReceivers)) return null;
     impls = [...r.impls.values()];
-    if (impls.length < 1 || impls.length > (depth === 0 ? 2 : 1)) return null;
-    // most-derived first, or a subtype's receivers would take the supertype
-    // guard; then prove every loaded receiver lands on the guard owning it
-    if (impls.length === 2 && ctx.jvm.isInstanceOf(impls[1].className, impls[0].className)) {
-      impls.reverse();
+    if (impls.length < 1 ||
+        impls.length > (depth === 0 ? ctx.maxImpls : 1)) return null;
+    // Most-derived first, or a subtype's receivers would take the supertype
+    // guard. The chain is short, so an insertion sort by subtyping is enough;
+    // unrelated impls keep their order. The per-receiver check below is the
+    // actual proof — this only arranges the guards so it can pass.
+    for (let a = 1; a < impls.length; a += 1) {
+      for (let b = 0; b < a; b += 1) {
+        if (ctx.jvm.isInstanceOf(impls[a].className, impls[b].className)) {
+          impls.splice(b, 0, impls.splice(a, 1)[0]);
+          break;
+        }
+      }
     }
     for (const [recvClass, impl] of r.targets) {
       const g = impls.find((c) => ctx.jvm.isInstanceOf(recvClass, c.className));
@@ -295,6 +314,8 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
     if (sub.next > end) end = sub.next;
   }
   alloc.next = end;
+  // One scratch int above every body's slots, for the fused guard below.
+  const armSlot = alloc.next;
   if (guards && !elide) ctx.speculations += guards.length;
   if (elide) ctx.elidedThisGuards += 1;
 
@@ -304,7 +325,26 @@ function planInstanceSite(ctx, ins, op, callerClassName, alloc, depth, recvIsThi
   }
   items.push({ instruction: { op: 'astore', arg: String(start) } });
   if (!elide) {
-    if (guards) {
+    if (guards && guards.length > 1) {
+      // Fused guard. One `instanceof` per arm is one wasm->JS import call per
+      // arm, and a chain over k impls averages (k+1)/2 of them on every single
+      // call — measured at ~8 ns each, the dominant cost of a polymorphic site.
+      // A single import returns the arm index instead, and the arm selection
+      // becomes integer compares that stay inside wasm. A receiver matching no
+      // arm returns -1 and falls through to the same deopt stub as before.
+      const siteIndex = ctx.guardSites.length;
+      ctx.guardSites.push(guards);
+      alloc.next = armSlot + 1;
+      items.push({ instruction: { op: 'aload', arg: String(start) } });
+      items.push({ instruction: { op: 'invokestatic',
+        arg: [null, GUARD_OWNER, [String(siteIndex), GUARD_DESCRIPTOR]] } });
+      items.push({ instruction: { op: 'istore', arg: String(armSlot) } });
+      guards.forEach((cls, gi) => {
+        items.push({ instruction: { op: 'iload', arg: String(armSlot) } });
+        items.push({ instruction: { op: 'bipush', arg: String(gi) } });
+        items.push({ instruction: { op: 'if_icmpeq', arg: `${prefix}E${gi}` } });
+      });
+    } else if (guards) {
       guards.forEach((cls, gi) => {
         items.push({ instruction: { op: 'aload', arg: String(start) } });
         items.push({ instruction: { op: 'instanceof', arg: cls } });
@@ -438,9 +478,14 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     hierarchy: options.hierarchy || null,
     maxCalleeItems: options.maxCalleeItems || 96,
     maxDepth: options.maxDepth || 2,
+    // Guards for a top-level site are a straight-line instanceof chain, so
+    // widening past bimorphic costs one compare on the last arm and one extra
+    // callee body. Obfuscated game code dispatches three ways constantly.
+    maxImpls: options.maxImpls || 3,
     k: 0,
     speculations: 0,
     specSites: [],
+    guardSites: [],
     elidedThisGuards: 0,
   };
   // Slot 0 holds `this` for the whole method only when nothing ever stores
@@ -531,6 +576,7 @@ function inlineCalls(jvm, codeAttr, options = {}) {
     deoptStubs,
     speculations: ctx.speculations,
     specSites: ctx.specSites,
+    guardSites: ctx.guardSites,
     elidedThisGuards: ctx.elidedThisGuards,
   };
 }
@@ -557,4 +603,4 @@ function revalidateSpeculations(jvm, hierarchy, specSites) {
   return true;
 }
 
-module.exports = { inlineCalls, inlineStaticCalls: inlineCalls, revalidateSpeculations };
+module.exports = { inlineCalls, GUARD_OWNER, inlineStaticCalls: inlineCalls, revalidateSpeculations };

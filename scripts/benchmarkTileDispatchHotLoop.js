@@ -179,6 +179,21 @@ async function main() {
       row.jsNsPerIteration.toFixed(2).padStart(9)} ns/iter  slowdown=${
       row.slowdown.toFixed(1).padStart(7)}x  checksum=${row.checksum}`);
   }
+  // With JVM_WASM_IMPORT_STATS=1 every import is counted, which turns the
+  // remaining gap into a crossing budget: a guest object can only be touched
+  // from wasm through an import, so per-iteration import calls are the unit
+  // this tier is actually paying in.
+  const wasmJit = runtime.jvm.jit && runtime.jvm.jit.wasmJit;
+  if (process.env.JVM_WASM_IMPORT_STATS === '1' && wasmJit) {
+    for (const st of wasmJit.compiled || []) {
+      const stats = st.meta && st.meta.importStats;
+      if (!(stats instanceof Map)) continue;
+      const hot = [...stats.entries()].filter(([, n]) => n > 0)
+        .sort((a, b) => b[1] - a[1])
+        .map(([n, c]) => `${n}=${c}`).join(' ');
+      if (hot) console.log(`[imports] ${st.key}\n          ${hot}`);
+    }
+  }
 }
 
 main().catch((error) => {

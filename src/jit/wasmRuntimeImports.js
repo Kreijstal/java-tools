@@ -178,6 +178,15 @@ function addArrayImports(reg, methodName, typedArrayStores = true, traceKey = me
       }
       : (a, i) => {
         if (trace) trace(`aget_${suffix}`, a, i);
+        // Reference arrays are always plain JS Arrays, and this import sits in
+        // the inner loop of every polymorphic call site (the receiver load).
+        // Inlining that one case keeps it a single monomorphic keyed load
+        // instead of a call into the array zoo plus a sentinel comparison.
+        if (t === T.ref && Array.isArray(a)) {
+          const u = i >>> 0;
+          if (u < a.length) return a[u];
+          throw AIOOBE(i, a.length);
+        }
         if (a === null || a === undefined) throw NPE(`Attempted load on null array in ${methodName}`);
         const value = monoArray.load(a, i);
         if (value === monoArray.OOB) throw AIOOBE(i, monoArray.len(a));
@@ -241,20 +250,28 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
   }
   const name = `${isGet ? 'gf' : 'pf'}_${className}_${fieldName}`.replace(/[^\w]/g, '_');
   const keyCache = new Map();
-  // Almost every site is monomorphic; keep the last class's key one identity
-  // compare away instead of a Map lookup per access.
-  let cachedClassName;
+  // Almost every site is monomorphic; keep the last class's key one compare
+  // away instead of a Map lookup per access. The compare is on the object's
+  // dense class index rather than its class name: an integer compare, and it
+  // does not have to read a string out of a guest object on the hot path.
+  // -1 never collides with a real index, so objects without one (host-made
+  // refs, arrays) simply take the slow path every time, as before.
+  let cachedIndex = -1;
   let cachedFieldKey;
-  const resolveKey = (obj) => {
+  const keyOf = (obj) => {
     const ct = obj._className || obj.type;
-    if (ct === cachedClassName) return cachedFieldKey;
     let key = keyCache.get(ct);
     if (key === undefined) {
       key = resolveInstanceFieldKey(jvm, obj, className, fieldName) || `${className}.${fieldName}`;
       keyCache.set(ct, key);
     }
-    cachedClassName = ct;
-    cachedFieldKey = key;
+    return key;
+  };
+  const resolveKey = (obj) => {
+    const index = obj.cidx;
+    if (index !== undefined && index === cachedIndex) return cachedFieldKey;
+    const key = keyOf(obj);
+    if (index !== undefined) { cachedIndex = index; cachedFieldKey = key; }
     return key;
   };
   const requireObj = (obj) => {
@@ -279,8 +296,20 @@ function addFieldImport(reg, jvm, ins, isStaticOp, isGet) {
   };
   const getInstance = t === T.i32
     ? (obj) => {
-      requireObj(obj);
-      const value = readInstance(obj);
+      // Flattened on purpose: this is the single hottest import in a
+      // polymorphic call site, and the null check, key lookup and field read
+      // are three call frames otherwise.
+      if (obj === null || obj === undefined) {
+        throw { type: 'java/lang/NullPointerException', message: null };
+      }
+      const fields = obj.fields;
+      if (fields === undefined) {
+        const value = readInstance(obj);
+        return typeof value === 'boolean' ? (value ? 1 : 0) : value;
+      }
+      const index = obj.cidx;
+      const value = fields[
+        index !== undefined && index === cachedIndex ? cachedFieldKey : resolveKey(obj)];
       return typeof value === 'boolean' ? (value ? 1 : 0) : value;
     }
     : t === T.ref

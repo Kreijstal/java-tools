@@ -31,12 +31,13 @@ const {
   wasmProfilerName, parseMethodDescriptor, descToWasm,
   BRANCH_COND, BRANCH_ZERO, ICONST, BIN_OPS, ARRAY_LOAD, ARRAY_STORE,
   Unsupported, NestedDeopt, isGuestThrow, sig, assembleModule, liveExceptionRanges,
+  maxImpls,
 } = require('./wasmShared');
 const {
   addRuntimeImports, pushImportFor, addArrayImports, addFieldImport, addMathImport,
   addTimeImport, addNewArrayImport, addANewArrayImport, addNewImport,
 } = require('./wasmRuntimeImports');
-const { inlineCalls } = require('./wasmInline');
+const { inlineCalls, GUARD_OWNER } = require('./wasmInline');
 const { runtimeClassName } = require('../instructions/object');
 const {
   slabSlotFor, BASE_KEY: SLAB_BASE_KEY,
@@ -186,6 +187,7 @@ class StructuredWasmCompiler {
         this.origIdx = expanded.origIdx;
         this.deoptStubs = expanded.deoptStubs;
         this.didInline = true;
+        this.guardSites = expanded.guardSites || [];
         inlinedCalls = expanded.inlined;
         speculations = expanded.speculations;
         specSites = expanded.specSites;
@@ -1078,6 +1080,12 @@ class StructuredWasmCompiler {
     // callees, and devirtualized instance calls through a closed-world
     // dispatch map. Sites whose callee can hand the call back (deoptable)
     // get a flag check + exit stub right after the import call.
+    if (op === 'invokestatic' && node.imm && node.imm[1] === GUARD_OWNER) {
+      out.push(...use(0));
+      out.push(OP.call, ...uleb(this.guardIndexImport(Number(node.imm[2][0]))));
+      out.push(OP.local_set, ...uleb(this.mustLocal(node)));
+      return;
+    }
     if (op === 'invokestatic' || op === 'invokevirtual' ||
         op === 'invokespecial' || op === 'invokeinterface') {
       if (op === 'invokespecial') {
@@ -1430,6 +1438,45 @@ class StructuredWasmCompiler {
     return entry;
   }
 
+  // One import for a whole inlined guard chain: returns the index of the first
+  // arm whose class the receiver is an instance of, or -1 for null and for any
+  // receiver no arm claims (which reaches the site's deopt stub, exactly as a
+  // chain of missed `instanceof` guards did). Memoized by the receiver's dense
+  // class index, so the steady state is an array read and one boundary
+  // crossing per call instead of one per arm.
+  guardIndexImport(siteIndex) {
+    const classes = (this.guardSites || [])[siteIndex];
+    if (!classes) throw new Unsupported('guard site');
+    const name = `gidx_${siteIndex}_${classes.join('_')}`.replace(/[^\w]/g, '_');
+    const existing = this.importIndexByName.get(name);
+    if (existing !== undefined) return existing;
+    const jvm = this.jvm;
+    const byIndex = [];
+    const byName = new Map();
+    const armOf = (ref) => {
+      const source = runtimeClassName(ref);
+      for (let i = 0; i < classes.length; i += 1) {
+        if (jvm.isInstanceOf(source, classes[i])) return i;
+      }
+      return -1;
+    };
+    return this.addImport(name, [T.ref], [T.i32], (ref) => {
+      if (ref === null || ref === undefined) return -1;
+      const index = ref.cidx;
+      if (index !== undefined) {
+        const cached = byIndex[index];
+        if (cached !== undefined) return cached;
+        const arm = armOf(ref);
+        byIndex[index] = arm;
+        return arm;
+      }
+      const source = runtimeClassName(ref);
+      let arm = byName.get(source);
+      if (arm === undefined) { arm = armOf(ref); byName.set(source, arm); }
+      return arm;
+    });
+  }
+
   castImport(op, target) {
     if (typeof target !== 'string') throw new Unsupported(`${op} target`);
     const known = target === 'java/lang/Object' || target.startsWith('[') ||
@@ -1440,13 +1487,23 @@ class StructuredWasmCompiler {
     if (existing !== undefined) return existing;
     const jvm = this.jvm;
     const verdicts = new Map();
+    // Fast memo keyed by the object's dense class index (see classIndexOf):
+    // a plain array read, no string leaves the boundary. Refs without one —
+    // strings, arrays, host-made objects — fall back to the by-name map.
+    const byIndex = [];
     const verdictOf = (ref) => {
+      const index = ref.cidx;
+      if (index !== undefined) {
+        const cached = byIndex[index];
+        if (cached !== undefined) return cached;
+      }
       const source = runtimeClassName(ref);
       let ok = verdicts.get(source);
       if (ok === undefined) {
         ok = jvm.isInstanceOf(source, target);
         if (verdicts.size < 64) verdicts.set(source, ok);
       }
+      if (index !== undefined) byIndex[index] = ok;
       return ok;
     };
     if (op === 'checkcast') {
@@ -1621,7 +1678,14 @@ class StructuredWasmCompiler {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;
       if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
-      if (resolved.impls.size > 4) throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      // A wide cone builds a wide dispatch map, so the site is refused — and
+      // because a refused site demotes its block, a megamorphic call in a loop
+      // body keeps the whole method off this tier. Measured on a 6-implementor
+      // interface: 309 ns/call refused against 96 ns/call admitted at 16. The
+      // default stays at 4 until that is validated on a whole game boot.
+      if (resolved.impls.size > maxImpls()) {
+        throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      }
       // Impls that cannot be linked (never-compiling entry, EH module,
       // vetoed) just drop out of the map: their receivers miss at runtime
       // and deopt before anything runs, which is always sound. Only a site

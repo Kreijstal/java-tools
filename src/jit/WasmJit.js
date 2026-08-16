@@ -83,6 +83,7 @@ const {
   FUEL,
   isNoOpExceptionHandler, liveExceptionRanges,
   retvGlobalEntry, runvWrapperBody, specokGlobalEntry,
+  maxImpls,
 } = require('./wasmShared');
 const monoArray = require('./monoArray');
 const {
@@ -773,7 +774,10 @@ class MethodTranslator {
       const resolved = hierarchy.resolveDispatch(owner, name, descriptor);
       resolvedCone = resolved;
       if (!resolved) throw new Unsupported(`invoke ${owner}.${name} unresolved`);
-      if (resolved.impls.size > 4) throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      // See the note on this limit in StructuredWasmCompiler.
+      if (resolved.impls.size > maxImpls()) {
+        throw new Unsupported(`invoke ${owner}.${name} megamorphic`);
+      }
       // Impls that cannot be linked (never-compiling entry, EH module,
       // vetoed) drop out of the map: their receivers miss at runtime and
       // take the existing deopt-at-the-invoke path, which is always sound.
@@ -2332,6 +2336,16 @@ class WasmJit {
     for (const g of this.specokGlobals) g.value = 0;
   }
 
+  // The world a deferrable demotion depends on: which classes exist
+  // (classEpoch) and which modules are compiled (compileEpoch, bumped by every
+  // successful compile). Class *initialization* — the third input, and the one
+  // "new X not initialized" names — is not versioned anywhere, but it can only
+  // advance by running guest code, which loads classes and compiles modules,
+  // so this pair moves with it in practice.
+  depWorldVersion() {
+    return `${this.jvm.classEpoch || 0}:${this.compileEpoch}`;
+  }
+
   methodState(frame) {
     let st = this.state.get(frame.method);
     if (!st) {
@@ -2388,17 +2402,20 @@ class WasmJit {
       return null;
     }
 
-    // A module built while a callee's class was still unloaded keeps those
-    // blocks as exit stubs for good. The exit-count trigger in exitTo cannot
-    // rescue it: that needs 20000 exits, but a method whose loop body is an
-    // exit stub stops being entered long before it reaches them (measured: 13
-    // wasm transitions across 20000 iterations). So rebuild here instead, and
-    // only when the class world has actually grown since this module was
-    // built, which is the event that can change the outcome — not on a timer
-    // or an exit rate, both of which measured negative.
-    if (st.partialDeps && st.depEpoch !== (this.jvm.classEpoch || 0) &&
-        (st.exits || 0) > (st.depExits || 0)) {
-      st.depEpoch = this.jvm.classEpoch || 0;
+    // A module built while a dependency was merely pending keeps the loss for
+    // good: blocks stay exit stubs, and — more expensively — call sites that
+    // could have been inlined or direct-linked stay bound to the generic
+    // dispatch import (measured on runPoly: ~116 ns/call against ~1 ns when
+    // the same site inlines). The exit-count trigger in exitTo cannot rescue
+    // either: it needs 20000 exits, but a method whose loop body is an exit
+    // stub stops being entered long before that (measured: 13 wasm
+    // transitions across 20000 iterations), and a site on the dispatch import
+    // never exits at all. So rebuild here instead, and only when the world
+    // that produced those demotions has actually changed — not on a timer or
+    // an exit rate, both of which measured negative.
+    if (st.partialDeps && st.partialDepsStructured &&
+        st.depWorld !== this.depWorldVersion()) {
+      st.depWorld = this.depWorldVersion();
       if ((st.depRecompiles || 0) < this.depRecompileLimit) {
         st.depRecompiles = (st.depRecompiles || 0) + 1;
         st.status = 'cold';
@@ -2630,6 +2647,7 @@ class WasmJit {
     let primaryMeta = null; // census-only: the meta a partial-module reject saw
     try {
       let structuredMeta = null;
+      let structuredDeferred = false;
       if (this.structuredEnabled) {
         try {
           const StructuredWasmCompiler = require('./StructuredWasmCompiler');
@@ -2637,6 +2655,11 @@ class WasmJit {
           this.structuredCompiles += 1;
         } catch (err) {
           if (!(err instanceof Unsupported)) throw err;
+          // A structured rejection for a reason a later class load can undo is
+          // the strongest rebuild signal there is: the whole inlining backend
+          // was lost, not one block. Recorded here because the dispatcher meta
+          // built below cannot say why the better tier declined.
+          structuredDeferred = DEFERRABLE_DEMOTE.test(err.message);
           if (this.debug) console.error(`[wasmjit] structured fallback ${st.key}: ${err.message}`);
         }
       }
@@ -2781,20 +2804,23 @@ class WasmJit {
       st.retryAfter = undefined;
       st.deferredEpoch = undefined;
       st.calleeDeferredEpoch = undefined;
-      // Remember whether any block was demoted for a reason that a later class
-      // load can undo, and the class world this module was built against. The
-      // entry gate uses both to rebuild a module whose callees have since
-      // become resolvable. See DEFERRABLE_DEMOTE.
-      st.partialDeps = [...primary.demoteReasons.values()]
-        .some((reason) => DEFERRABLE_DEMOTE.test(reason));
-      st.depEpoch = this.jvm.classEpoch || 0;
-      // Exit count at build time. The rebuild below only fires once this module
-      // has actually paid exits, which is what keeps it from preempting late
-      // instance-target installation: that path absorbs a newly loaded
-      // implementor into the live dispatch map without exiting the caller at
-      // all, so a module it can serve never gets rebuilt.
-      st.depExits = st.exits || 0;
+      // Remember whether this module lost anything for a reason that a later
+      // class load can undo — a demoted block, or the structured tier itself
+      // declining. The entry gate rebuilds such a module once the world that
+      // produced the loss changes. See DEFERRABLE_DEMOTE.
+      st.partialDeps = structuredDeferred ||
+        [...primary.demoteReasons.values()]
+          .some((reason) => DEFERRABLE_DEMOTE.test(reason));
+      // Which loss it was. A structured module that merely demoted a block is
+      // left alone: on the dispatcher tier the same rebuild would discard
+      // modules that late instance-target installation already serves without
+      // exiting, which is strictly better. See the late-target tests in
+      // wasmInstanceLink.
+      st.partialDepsStructured = structuredDeferred || !!(st.meta && st.meta.structured);
       this.compileEpoch += 1;
+      // Stamped after the bump this compile itself contributes, so a module
+      // never triggers its own rebuild.
+      st.depWorld = this.depWorldVersion();
       if (!st.listed) { st.listed = true; this.compiled.push(st); }
       // JVM_WASM_DUMP_ACCEPT=<dir> writes each accepted module so its wat can
       // be diffed against hand-written wasm for the same Java method. The

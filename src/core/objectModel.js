@@ -64,10 +64,29 @@ async function loadHierarchy(jvm, className) {
 // template (the wasm `new` import) can hand over a fresh clone without
 // rebuilding it. Monitor state and identity hash live on the wrapper, never in
 // the field map.
+// Dense small integer per class name, handed to every object it creates. Guard
+// and cast imports are called once or twice per iteration of a hot loop, and
+// keying their memo by this integer instead of the class-name string is worth
+// ~3 ns of the ~8 ns they cost: an array index beats a string-keyed Map lookup,
+// and nothing crosses the wasm boundary as a string. Lives in the object
+// literal below rather than being attached later, so guest objects keep the
+// single hidden class that makes every read of it monomorphic.
+function classIndexOf(jvm, className) {
+  let indices = jvm._classIndices;
+  if (!indices) { indices = jvm._classIndices = new Map(); }
+  let index = indices.get(className);
+  if (index === undefined) {
+    index = indices.size;
+    indices.set(className, index);
+  }
+  return index;
+}
+
 function makeObjectRef(jvm, className, fields) {
   return {
     type: className,
     _className: className,
+    cidx: classIndexOf(jvm, className),
     fields,
     hashCode: jvm.nextHashCode++,
     isLocked: false,
@@ -293,6 +312,7 @@ module.exports = {
   newFields,
   loadHierarchy,
   makeObjectRef,
+  classIndexOf,
   slotKind,
   slabLayoutFor,
   slabSlotFor,
