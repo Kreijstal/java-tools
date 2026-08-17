@@ -367,11 +367,215 @@ public class OpcodeDifferential {
     return acc;
   }
 
+  /*
+   * kr.e's actual control-flow shape, which no shape above builds.
+   *
+   * Every shape above is a `for` loop, so its headers have exactly two
+   * predecessors and its induction variables are syntactically obvious. The
+   * method that motivated this oracle has 33 `while (true)` loops, 43 labels,
+   * 41 labeled continues, 22 labeled breaks and zero `for` loops -- the
+   * decompiler's rendering of obfuscated goto flow, now readable because the
+   * gamepack has been decompiled and recompiles cleanly.
+   *
+   * Why that difference matters: a labeled `continue` from an inner loop is an
+   * extra predecessor on an OUTER header, so one loop-carried value needs phis
+   * at several headers at once and a header phi can take its back-edge
+   * argument from another phi. Those are the phis a9d9138 had to kind to a
+   * fixpoint, and an unkinded one is dropped from a mid-method exit's spill and
+   * resumed stale (a597135). The reported kr.e signature was an index equal to
+   * the length, i.e. a fill loop resuming on a drifted counter, so each shape
+   * here keeps an index -- and in streamBoundLoops the BOUND too, since kr.e
+   * reads its loop bounds out of the bit stream -- live across several headers.
+   *
+   * Run these with a small JVM_WASM_FUEL: the spill/resume path is the
+   * mechanism, and at default fuel these loops may never exit mid-method.
+   */
+  public static int labeledBackEdges(int n, int seed) {
+    int[] data = new int[48];
+    int acc = seed;
+    int idx = 0;
+    int outer = 0;
+    L0: while (true) {
+      if (outer >= n) break L0;
+      outer++;
+      int inner = 0;
+      L1: while (true) {
+        if (inner >= 5) continue L0;
+        inner++;
+        idx = (idx + outer + inner) & 31;
+        data[idx] = mix(data[idx], acc + inner);
+        acc = mix(acc, data[idx]);
+        if ((acc & 7) == 3) continue L1;
+        if ((acc & 15) == 5) continue L0;
+      }
+    }
+    return acc;
+  }
+
+  // The index and the length are both live across two headers, and the bound
+  // check sits at the inner header. A resume on a stale idx indexes at exactly
+  // buf.length, which is the signature this whole file exists for.
+  public static int crossHeaderIndex(int n, int seed) {
+    int[] buf = new int[17];
+    int acc = seed;
+    int i = 0;
+    int guard = 0;
+    L0: while (true) {
+      if (guard >= n) break L0;
+      guard++;
+      L1: while (true) {
+        if (i >= buf.length) { i = 0; continue L0; }
+        buf[i] = mix(buf[i], acc + i);
+        acc = mix(acc, buf[i]);
+        i++;
+        if ((acc & 3) == 0) continue L0;
+        if ((acc & 31) == 7) break L1;
+      }
+      acc = mix(acc, i);
+    }
+    return acc;
+  }
+
+  // kr.e is a bit-stream decoder whose loop bounds are themselves read from the
+  // stream, so `take` is loop-carried rather than a constant -- an unkinded
+  // bound is as damaging as an unkinded counter.
+  public static int streamBoundLoops(int n, int seed) {
+    byte[] stream = new byte[64];
+    int k = 0;
+    while (k < stream.length) { stream[k] = (byte) (seed + k * 7); k++; }
+    int[] out = new int[32];
+    int acc = seed;
+    int pos = 0;
+    int rounds = 0;
+    L0: while (true) {
+      if (rounds >= n) break L0;
+      rounds++;
+      int take = (stream[pos & 63] & 7) + 1;
+      int w = 0;
+      L1: while (true) {
+        if (w >= take) continue L0;
+        int slot = (pos + w) & 31;
+        out[slot] = mix(out[slot], stream[(pos + w) & 63]);
+        acc = mix(acc, out[slot]);
+        w++;
+        pos++;
+        if ((acc & 63) == 11) continue L0;
+      }
+    }
+    return acc;
+  }
+
+  // A header phi whose back-edge argument is another phi, reached through
+  // labeled flow instead of a for-loop nest. One reverse-postorder pass kinds
+  // the inner phi only after giving up on the outer one.
+  public static int phiOfPhi(int n, int seed) {
+    int[] a = new int[24];
+    int acc = seed;
+    int x = seed & 7;
+    int y = 0;
+    int t = 0;
+    L0: while (true) {
+      if (t >= n) break L0;
+      t++;
+      int spins = 0;
+      L1: while (true) {
+        if (++spins > 6) break L1;
+        y = x;
+        x = (x + y + t) & 15;
+        a[x] = mix(a[x], y);
+        acc = mix(acc, a[x] + y);
+        if ((acc & 3) == 1) continue L1;
+        if ((acc & 7) == 2) continue L0;
+        break L1;
+      }
+      acc = mix(acc, x + y);
+    }
+    return acc;
+  }
+
+  // Four nested headers with exits jumping two and three levels out, so a
+  // single value is carried through headers it does not belong to.
+  public static int deepLabeledExit(int n, int seed) {
+    int[] g = new int[40];
+    int acc = seed;
+    int t = 0;
+    L0: while (true) {
+      if (t >= n) break L0;
+      t++;
+      int i = 0;
+      L1: while (true) {
+        if (i >= 3) continue L0;
+        i++;
+        int j = 0;
+        L2: while (true) {
+          if (j >= 3) continue L1;
+          j++;
+          int m = 0;
+          L3: while (true) {
+            if (m >= 3) continue L2;
+            m++;
+            int slot = (i * 9 + j * 3 + m) % g.length;
+            g[slot] = mix(g[slot], acc + i + j + m);
+            acc = mix(acc, g[slot]);
+            if ((acc & 7) == 0) continue L1;
+            if ((acc & 15) == 1) continue L0;
+            if ((acc & 31) == 2) break L2;
+          }
+        }
+      }
+    }
+    return acc;
+  }
+
+  /*
+   * The same labeled graph with NO call in the loop body: the mixing is
+   * inlined as acc*31+v, so the module contains no invoke and its blocks are
+   * pure arithmetic, array access and branches.
+   *
+   * Read the census counters carefully when judging whether these shapes reach
+   * the spill path. `exits` is the transient-exit count and increments whenever
+   * a module leaves mid-method with its locals spilled -- that IS the path
+   * a597135 named as the only point SSA values are written back to
+   * frame.locals, and every labeled shape here reports exits >= 1.
+   * `fuelExits` is NOT a general fuel counter: WasmJit only bumps it when the
+   * exit status equals the entry pc, which its own comment calls "possible but
+   * rare". A shape reporting exits=2 fuelExits=0 has exercised the spill twice;
+   * do not read the zero as "never spilled" (I did, and added this shape on
+   * that false premise -- it is kept because a call-free labeled loop is
+   * genuinely different codegen, not because it changed the fuel behaviour).
+   *
+   * Note this returns the same checksum as crossHeaderIndex by construction:
+   * the inlined mixing is arithmetically identical to mix(). The value being
+   * equal is expected; what differs is the emitted module.
+   */
+  public static int callFreeLabeledLoop(int n, int seed) {
+    int[] buf = new int[17];
+    int acc = seed;
+    int i = 0;
+    int guard = 0;
+    L0: while (true) {
+      if (guard >= n) break L0;
+      guard++;
+      L1: while (true) {
+        if (i >= buf.length) { i = 0; continue L0; }
+        buf[i] = buf[i] * 31 + (acc + i);
+        acc = acc * 31 + buf[i];
+        i++;
+        if ((acc & 3) == 0) continue L0;
+        if ((acc & 31) == 7) break L1;
+      }
+      acc = acc * 31 + i;
+    }
+    return acc;
+  }
+
   private static final String[] NAMES = {
     "shiftInt", "shiftLong", "narrowing", "divRem",
     "arrayKinds", "branches", "nestedLoops", "longMath",
     "compoundArray", "indirectIndex", "streamDecode", "staticLazyArrays",
     "manyLocalsSpill", "loopLocalArrays",
+    "labeledBackEdges", "crossHeaderIndex", "streamBoundLoops",
+    "phiOfPhi", "deepLabeledExit", "callFreeLabeledLoop",
   };
 
   static int dispatch(String name, int n, int seed) {
@@ -389,6 +593,12 @@ public class OpcodeDifferential {
     if (name.equals("staticLazyArrays")) return staticLazyArrays(n, seed);
     if (name.equals("manyLocalsSpill")) return manyLocalsSpill(n, seed);
     if (name.equals("loopLocalArrays")) return loopLocalArrays(n, seed);
+    if (name.equals("labeledBackEdges")) return labeledBackEdges(n, seed);
+    if (name.equals("crossHeaderIndex")) return crossHeaderIndex(n, seed);
+    if (name.equals("streamBoundLoops")) return streamBoundLoops(n, seed);
+    if (name.equals("phiOfPhi")) return phiOfPhi(n, seed);
+    if (name.equals("deepLabeledExit")) return deepLabeledExit(n, seed);
+    if (name.equals("callFreeLabeledLoop")) return callFreeLabeledLoop(n, seed);
     throw new IllegalArgumentException(name);
   }
 
