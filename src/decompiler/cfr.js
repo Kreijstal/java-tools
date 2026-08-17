@@ -8990,13 +8990,64 @@ function materializeStackFieldReads(stack, fieldName, lines, localState) {
   for (let i = 0; i < stack.length; i += 1) {
     const value = stack[i];
     if (!value || typeof value.code !== 'string') continue;
+    if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) {
+      materializeAggregateMemberReads(value, (code) => fieldRead.test(code), lines, localState, 'fieldTemp');
+      continue;
+    }
     if (!fieldRead.test(value.code)) continue;
-    if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) continue;
     const rendered = renderStoreExpression(value);
     const name = localState.nextSyntheticName('fieldTemp');
     lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
     stack[i] = expr(name, value.type, 100);
   }
+}
+
+// Freeze the members of an aggregate operand (array-literal elements,
+// string-builder pieces) that read the location being stored to.
+//
+// A scalar operand is consumed soon after it is pushed, but an aggregate stays
+// on the operand stack until it is rendered, so its members can outlive any
+// number of stores to the locals they read. A member left as a lazily-rendered
+// read therefore yields the value at render time instead of the value at its own
+// position in the sequence. This is what a dup-filled array literal looks like:
+//
+//   dup; iconst_0; iload v; iastore          // element 0 == v before the stores
+//   dup; iconst_1; iload v; iload w; iadd; dup; istore v; iastore
+//
+// where element 0 must keep the pre-store v. Note that the "a bare re-read needs
+// no temp" shortcut used for scalars must NOT be applied here: a bare read is
+// precisely the member that goes stale, and it is momentarily correct only until
+// the next store to the same local.
+function materializeAggregateMemberReads(value, readsTarget, lines, localState, prefix) {
+  if (!value) return;
+  if (value.arrayLiteral && value.arrayLiteral.elements) {
+    for (const [index, element] of value.arrayLiteral.elements) {
+      const frozen = freezeAggregateMember(element, readsTarget, lines, localState, prefix);
+      if (frozen) value.arrayLiteral.elements.set(index, frozen);
+    }
+  }
+  if (Array.isArray(value.stringBuilderPieces)) {
+    for (let i = 0; i < value.stringBuilderPieces.length; i += 1) {
+      const frozen = freezeAggregateMember(value.stringBuilderPieces[i], readsTarget, lines, localState, prefix);
+      if (frozen) value.stringBuilderPieces[i] = frozen;
+    }
+  }
+}
+
+function freezeAggregateMember(element, readsTarget, lines, localState, prefix) {
+  if (!element || typeof element.code !== 'string') return null;
+  if (element.arrayLiteral || element.stringBuilderPieces) {
+    materializeAggregateMemberReads(element, readsTarget, lines, localState, prefix);
+    return null;
+  }
+  // A non-foldable array is emitted as indexed assignment statements at its own
+  // position, so its elements cannot go stale the way a literal's can.
+  if (element.newArraySpill) return null;
+  if (!readsTarget(element.code)) return null;
+  const rendered = renderStoreExpression(element);
+  const name = localState.nextSyntheticName(prefix);
+  lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
+  return expr(name, element.type, 100);
 }
 
 // Before a local store, freeze any live stack expression that reads the same
@@ -9020,9 +9071,12 @@ function materializeStackLocalReads(stack, variableName, lines, localState, stor
   for (let i = 0; i < stack.length; i += 1) {
     const value = stack[i];
     if (!value || typeof value.code !== 'string') continue;
+    if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) {
+      materializeAggregateMemberReads(value, (code) => localRead.test(code), lines, localState, 'localTemp');
+      continue;
+    }
     if (value.code === variableName) continue; // a bare re-read needs no temp
     if (!localRead.test(value.code)) continue;
-    if (value.newArraySpill || value.arrayLiteral || value.stringBuilderPieces) continue;
     const rendered = renderStoreExpression(value);
     const name = localState.nextSyntheticName('localTemp');
     lines.push(`${simplifyType(rendered.type)} ${name} = ${rendered.code};`);
