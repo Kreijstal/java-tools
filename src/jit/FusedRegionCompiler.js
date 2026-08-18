@@ -457,6 +457,7 @@ class FusedRegionCompiler {
 
   mayFuse(method) {
     if (!this.enabled || !method || !(method.flags || []).includes("static")) return false;
+    if (this.jit.jitDenied(method)) return false;
     let descriptor;
     try { descriptor = parseDescriptor(method.descriptor); } catch (_) { return false; }
     if (descriptor.returnType !== "void") return false;
@@ -478,6 +479,13 @@ class FusedRegionCompiler {
     if (!discovered) return null;
     const { family, wrapper, rasterRef, rasterMethod, raster,
       scanlineRef, scanlineMethod, scanline } = discovered;
+    // JVM_JIT_DENY exists so a miscompile can be attributed to one class
+    // without disabling the whole tier, and a region compiles three methods
+    // from up to three classes. Honouring the deny list only in the JS tiers
+    // made denying any of them a no-op here, so a bisect over the classes in
+    // a fused region pointed away from the class that actually owned the bug.
+    if (this.jit.jitDenied(wrapperMethod) || this.jit.jitDenied(rasterMethod) ||
+        this.jit.jitDenied(scanlineMethod)) return null;
 
     const region = {
       family,

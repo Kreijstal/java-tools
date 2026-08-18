@@ -2506,6 +2506,14 @@ class WasmJit {
     }
     const debug = this.jvm.debugManager;
     if (debug && debug.debugMode) return null;
+    // JVM_JIT_DENY has to remove every compiled copy of a class's methods, or
+    // a bisect over classes reports the wrong owner. This tier consulted no
+    // deny list, so denying a class silently left its Wasm module compiled and
+    // running and the class looked innocent.
+    if (this.jit.jitDenied(frame.method)) {
+      if (this.census) this._censusNote(frame, 'jit-denied');
+      return null;
+    }
 
     const st = this.methodState(frame);
     if (st.status === 'failed') {
@@ -2776,6 +2784,13 @@ class WasmJit {
   }
 
   compile(frame, st, options = {}) {
+    // Callee compiles reach this without going through prepare(), so a denied
+    // class would still be inlined into another method's module.
+    if (this.jit.jitDenied(frame.method)) {
+      st.status = 'failed';
+      st.failReason = 'jit-denied';
+      return;
+    }
     const asCallee = options.asCallee === true;
     const isRecompile = st.status === 'ready';
     const className = frame.className || (frame.method.className) || '?';
