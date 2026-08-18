@@ -792,6 +792,72 @@ test('disabled SourceDataLine applies backpressure', (t) => {
   t.end();
 });
 
+test('SourceDataLine models the line draining in real time', (t) => {
+  // Neither backend reports occupancy, so before this model available() always
+  // claimed an empty buffer, the guest's own audio throttle never engaged, and
+  // the pump spun -- 161x the pump calls and 2.4x the post-logo load on Tomb
+  // Racer. 22050 Hz, 16-bit stereo is 88200 bytes/sec.
+  // The runner sets JVM_DISABLE_AUDIO=1 for the whole suite, and available()
+  // deliberately reports a FULL buffer in that mode -- maximum backpressure is
+  // the point of headless mode, and the test above pins it. The drain model
+  // only governs the enabled-audio path, so exercise that regime here.
+  // Supplying the sink explicitly keeps this hermetic: no real device is
+  // opened, and a sink with no available() of its own is precisely the case
+  // the drain model exists to cover.
+  const previousDisableAudio = process.env.JVM_DISABLE_AUDIO;
+  delete process.env.JVM_DISABLE_AUDIO;
+  setAudioOutputFactory(() => ({ write() {}, end() {},
+    once(_event, callback) { callback(); } }));
+  t.teardown(() => {
+    setAudioOutputFactory(null);
+    if (previousDisableAudio === undefined) delete process.env.JVM_DISABLE_AUDIO;
+    else process.env.JVM_DISABLE_AUDIO = previousDisableAudio;
+  });
+
+  let millis = 1000;
+  const jvm = {
+    clock: { millis: () => millis },
+    jre: { 'javax/sound/sampled/SourceDataLine': SourceDataLine },
+  };
+  const format = {
+    fields: {
+      'javax/sound/sampled/AudioFormat': {
+        channels: 2,
+        sampleSizeInBits: 16,
+        sampleRate: 22050,
+        signed: true,
+        bigEndian: false,
+      },
+    },
+  };
+  const obj = { requestedBufferSize: 8192 };
+  const available = () => SourceDataLine.methods['available()I'](jvm, obj, []);
+
+  SourceDataLine.methods['open(Ljavax/sound/sampled/AudioFormat;I)V'](
+    jvm, obj, [format, 8192]);
+  t.equal(available(), 8192, 'a freshly opened line has its whole buffer free');
+
+  const samples = new Array(8192).fill(0);
+  SourceDataLine.methods['write([BII)I'](jvm, obj, [samples, 0, 8192], null);
+  t.equal(available(), 0, 'a full buffer reports no space, so the guest throttles');
+
+  millis += 46;
+  t.equal(available(), 4057, 'the buffer frees at the line sample rate');
+
+  millis += 100;
+  t.equal(available(), 8192, 'the buffer never drains past empty');
+
+  SourceDataLine.methods['write([BII)I'](jvm, obj, [samples, 0, 4096], null);
+  t.equal(available(), 4096, 'a partial write leaves the remainder free');
+
+  SourceDataLine.methods['flush()V'](jvm, obj, []);
+  t.equal(available(), 8192, 'flush discards what was queued');
+
+  SourceDataLine.methods['close()V'](jvm, obj, []);
+  t.equal(obj.drainModel, null, 'closing the line drops the drain model');
+  t.end();
+});
+
 test('SourceDataLine audio priority uses the scheduler clock', (t) => {
   const output = {
     write() {},

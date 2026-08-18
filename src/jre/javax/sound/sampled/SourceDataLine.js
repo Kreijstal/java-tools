@@ -18,6 +18,64 @@ function toOutputOptions(formatFields, bufferSize) {
   };
 }
 
+// Neither backend can report buffer occupancy: MockAudioOutput discards the
+// payload and node's `speaker` is a plain stream. Without a model of the drain,
+// available() reports a permanently empty buffer, the guest's own throttle
+// never engages, and the audio pump spins -- on Tomb Racer that inflated the
+// pump from 5.7k to 920k calls and post-logo loading by 2.4x. Model the line
+// draining at its own sample rate so the producer sees real backpressure while
+// the samples still reach the device.
+function createDrainModel(options) {
+  const bytesPerFrame = Math.max(
+    1,
+    Math.ceil((options.bitDepth || 16) / 8) * (options.channels || 1),
+  );
+  const bytesPerSecond = Math.max(
+    1,
+    Math.round((options.sampleRate || 44100) * bytesPerFrame),
+  );
+  const capacity = Number.isFinite(options.bufferSize) && options.bufferSize > 0
+    ? options.bufferSize
+    : 4096;
+  let queued = 0;
+  let lastMillis = null;
+
+  function advance(nowMillis) {
+    if (!Number.isFinite(nowMillis)) return;
+    if (lastMillis === null) {
+      lastMillis = nowMillis;
+      return;
+    }
+    const elapsed = nowMillis - lastMillis;
+    if (elapsed <= 0) return;
+    lastMillis = nowMillis;
+    queued = Math.max(0, queued - (elapsed / 1000) * bytesPerSecond);
+  }
+
+  return {
+    capacity,
+    accept(nowMillis, len) {
+      advance(nowMillis);
+      queued = Math.min(capacity, queued + Math.max(0, len));
+    },
+    available(nowMillis) {
+      advance(nowMillis);
+      return Math.max(0, Math.floor(capacity - queued));
+    },
+    reset(nowMillis) {
+      lastMillis = Number.isFinite(nowMillis) ? nowMillis : null;
+      queued = 0;
+    },
+  };
+}
+
+function nowMillis(jvm) {
+  if (jvm && jvm.clock && typeof jvm.clock.millis === "function") {
+    return Number(jvm.clock.millis());
+  }
+  return Date.now();
+}
+
 function toAudioBytes(buffer, offset, len) {
   const slice = buffer.slice(offset, offset + len);
   if (typeof Buffer !== 'undefined') {
@@ -37,10 +95,11 @@ function openWithFormat(obj, format) {
     };
   }
 
+  const outputOptions = toOutputOptions(formatFields, obj.requestedBufferSize);
+  obj.drainModel = createDrainModel(outputOptions);
+
   try {
-    obj.audioOutput = createAudioOutput(
-      toOutputOptions(formatFields, obj.requestedBufferSize),
-    );
+    obj.audioOutput = createAudioOutput(outputOptions);
     obj.isOpen = true;
     obj.requestedFormat = format;
   } catch (error) {
@@ -90,6 +149,9 @@ module.exports = {
         } else {
           obj.audioOutput.write(toAudioBytes(buffer, offset, len));
         }
+        if (obj.drainModel) {
+          obj.drainModel.accept(nowMillis(jvm), len);
+        }
         if (thread && obj.audioOutput &&
             typeof obj.audioOutput.queuedSeconds === "function" &&
             obj.audioOutput.queuedSeconds() < 0.04) {
@@ -122,12 +184,18 @@ module.exports = {
       if (obj.audioOutput && typeof obj.audioOutput.available === "function") {
         return Math.max(0, Number(obj.audioOutput.available()) | 0);
       }
+      if (obj.drainModel) {
+        return obj.drainModel.available(nowMillis(jvm)) | 0;
+      }
       return Number.isFinite(obj.requestedBufferSize) &&
         obj.requestedBufferSize > 0
         ? obj.requestedBufferSize | 0
         : 4096;
     },
     "flush()V": (jvm, obj, args) => {
+      if (obj.drainModel) {
+        obj.drainModel.reset(nowMillis(jvm));
+      }
       if (obj.audioOutput && typeof obj.audioOutput.flush === "function") {
         obj.audioOutput.flush();
       }
@@ -157,6 +225,7 @@ module.exports = {
         }
         obj.audioOutput = null;
       }
+      obj.drainModel = null;
       obj.isOpen = false;
       obj.isStarted = false;
     },
