@@ -2,6 +2,11 @@ const Stack = require("./stack");
 const CallStack = require("./callStack");
 const { releaseFrameMonitor } = CallStack;
 const FRAME_STATIC_KIND = Symbol("frame.staticKind");
+// JVM_DEBUG_STATIC_WRITES=Class.field[,...]: wrap the named class's
+// staticFields Map so every write to that field logs a short stack.
+// Read once at load; the hook itself sits behind the INITIALIZED check.
+const DEBUG_STATIC_WRITES = (typeof process !== "undefined" &&
+  process.env && process.env.JVM_DEBUG_STATIC_WRITES) || "";
 const {
   loadClassByPath,
   loadClassByPathSync: loadConvertedClass,
@@ -2160,6 +2165,33 @@ class JVM {
     const state = className && this.classInitializationState.get(className);
     if (!className || state === "INITIALIZED") {
       return false;
+    }
+    if (DEBUG_STATIC_WRITES) {
+      for (const spec of DEBUG_STATIC_WRITES.split(",").filter(Boolean)) {
+        const [tracedClass, tracedField] = spec.split(".");
+        const classData = tracedClass === className && this.classes[className];
+        if (!classData || !(classData.staticFields instanceof Map) ||
+            classData.staticFields._tracedField) continue;
+        const plain = classData.staticFields;
+        const traced = new (class extends Map {
+          set(key, value) {
+            if (String(key).split(":")[0].replace(/'/g, "") === tracedField) {
+              this._writeCount = (this._writeCount || 0) + 1;
+              const shown = (value && (Array.isArray(value) ||
+                ArrayBuffer.isView(value))) ? `[len ${value.length}]` : value;
+              if (typeof value !== "number" || value === 0 ||
+                  value % 64 === 0) {
+                console.error(`[static-write] #${this._writeCount} `
+                  + `${tracedClass}.${key} = ${shown}\n`
+                  + new Error().stack.split("\n").slice(2, 6).join("\n"));
+              }
+            }
+            return super.set(key, value);
+          }
+        })(plain);
+        traced._tracedField = tracedField;
+        classData.staticFields = traced;
+      }
     }
 
     if (state === "ERRONEOUS") {

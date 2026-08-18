@@ -657,9 +657,14 @@ class MethodTranslator {
     const fn = (...all) => {
       const args = underCount ? all.slice(underCount) : all;
       const current = calleeSt.callee || calleeSt;
-      const calleeMod = ((partial && !current.meta.usedEh) ||
-        (current.meta.fullyCompiled && !current.meta.deoptableCalls &&
-          !current.meta.boxedCount && !current.meta.usedEh)) ? current : pinned;
+      // A dependency-world recompile resets the callee state (meta/run/callee
+      // all null) while this closure is still reachable from a running caller
+      // module; the pinned link-time pair is the designed fallback for every
+      // repointed state, so a reset state must take it too.
+      const currentMeta = current.meta;
+      const calleeMod = (currentMeta && ((partial && !currentMeta.usedEh) ||
+        (currentMeta.fullyCompiled && !currentMeta.deoptableCalls &&
+          !currentMeta.boxedCount && !currentMeta.usedEh))) ? current : pinned;
       const meta = calleeMod.meta;
       const full = new Array(meta.paramSlots.length + 2);
       for (let i = 0; i < meta.paramSlots.length; i++) {

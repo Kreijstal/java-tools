@@ -212,10 +212,18 @@ function sig(t) {
 }
 
 const NPE = (msg) => ({ type: 'java/lang/NullPointerException', message: msg });
-const AIOOBE = (i, len) => ({
-  type: 'java/lang/ArrayIndexOutOfBoundsException',
-  message: `Index ${i} out of bounds for length ${len}`,
-});
+const AIOOBE = (i, len) => {
+  if (typeof process !== 'undefined' && process.env &&
+      process.env.JVM_DEBUG_ARRAY_OOB === '1') {
+    console.error('[array-oob:wasm]', JSON.stringify({ index: i, length: len })
+      + '\n' + new Error().stack.split('\n').slice(2, 12)
+        .map((line) => line.trim()).join('\n'));
+  }
+  return {
+    type: 'java/lang/ArrayIndexOutOfBoundsException',
+    message: `Index ${i} out of bounds for length ${len}`,
+  };
+};
 
 const BRANCH_COND = {
   if_icmpeq: OP.i32_eq, if_icmpne: OP.i32_ne, if_icmplt: OP.i32_lt_s,

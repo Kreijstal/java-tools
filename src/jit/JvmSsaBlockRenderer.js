@@ -10947,6 +10947,32 @@ class JvmSsaBlockRenderer {
             return lines;
           })();
         }
+        // A sync-fallback call site restores the omitted frame (spliced at
+        // restorationDepth, pc 0) so the canonical child protocol has a
+        // caller Frame. When that call completes synchronously, every deopt/
+        // sentinel arm falls through and the body keeps executing — but
+        // nothing withdrew the restored frame, so a normal return stranded a
+        // pc-0 Frame on the call stack. The scheduler would later run that
+        // frame from scratch (re-executing the method) while the real caller
+        // had already continued — on Tomb Racer this re-ran nm.a after gga.b
+        // moved on and desynchronized the render pipeline. Withdraw the frame
+        // as soon as a call block completes normally; any later throwing or
+        // spilling site re-restores it through its own `frame === null`
+        // guard, and the propagating deopt/exception arms return before this
+        // line so a legitimately suspended frame stays put.
+        restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
+          const endMarker =
+            /^(\s*)\/\*__JVM_REGION_CALL_END_\d+__\*\/$/.exec(line);
+          if (!endMarker) return [line];
+          return [line,
+            `${endMarker[1]}if (frame !== null) {`,
+            `${endMarker[1]}  frame = helpers.structuredSsa` +
+              ".releaseUnwindFrame(plan, thread, frame);",
+            `${endMarker[1]}  locals = null;`,
+            `${endMarker[1]}  stack = null;`,
+            `${endMarker[1]}}`,
+          ];
+        });
         restoringRenderedTree = compactCheckedLeafLines(
           restoringRenderedTree, false);
         let directBody = [

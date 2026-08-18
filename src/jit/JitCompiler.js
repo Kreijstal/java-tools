@@ -249,6 +249,37 @@ class JitCompiler {
       options.framePositionalCalls === true ||
       Boolean(typeof process !== "undefined" && process.env &&
         process.env.JVM_ENABLE_FRAME_POSITIONAL_CALLS === "1");
+    this.debugPositionalDepth =
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DEBUG_POSITIONAL_DEPTH === "1");
+    // Read once: tryInvokeSyncAt and wasmOsrProbe are hot, and a
+    // process.env property access per call is not free in V8.
+    this.debugNonTopInvoke =
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_DEBUG_NONTOP_INVOKE === "1");
+    this.debugOsrSnapshotDir = (typeof process !== "undefined" && process.env &&
+      process.env.JVM_DEBUG_OSR_SNAPSHOT_DIR) || null;
+    if (this.debugPositionalDepth) {
+      const innerInvokeSync = this.tryInvokeSyncAt.bind(this);
+      this.tryInvokeSyncAt = (id, frame, thread) => {
+        const before = thread?.callStack?.items?.length ?? 0;
+        const value = innerInvokeSync(id, frame, thread);
+        const after = thread?.callStack?.items?.length ?? 0;
+        if (after > before && value !== ASYNC_INVOKE &&
+            !(value && value.deopt)) {
+          const site = this.syncCallSites[id];
+          console.error("[sync-depth-leak]", JSON.stringify({
+            site: site ? `${site.className || site.declaredClassName}.`
+              + `${site.methodName || "?"}${site.descriptor || ""}` : id,
+            before, after,
+            leaked: thread.callStack.items.slice(before).map((held) =>
+              `${held.className}.${held.method?.name}@pc${held.pc}`),
+          }) + "\n" + new Error().stack.split("\n").slice(2, 12)
+            .map((line) => line.trim()).join("\n"));
+        }
+        return value;
+      };
+    }
     this.adaptiveFramelessBudgetMultiplier = Math.max(1, Math.min(100,
       Number(options.adaptiveFramelessBudgetMultiplier ??
         (typeof process !== "undefined" && process.env &&
@@ -4530,7 +4561,78 @@ class JitCompiler {
     if (!module.meta.fullyCompiled || module.meta.deoptableCalls > 0) {
       return null;
     }
-    const result = this.wasmJit.execute(frame, thread, prep.st, prep.blk, true);
+    let result;
+    const snapshotDir = this.debugOsrSnapshotDir;
+    let entrySnapshot = null;
+    if (snapshotDir) {
+      try {
+        const seen = new Map();
+        let nextId = 1;
+        const encode = (held, depth) => {
+          if (held === null || held === undefined) return null;
+          if (typeof held === "bigint") return { __big: String(held) };
+          if (typeof held !== "object") return held;
+          if (seen.has(held)) return { __ref: seen.get(held) };
+          const id = nextId++;
+          seen.set(held, id);
+          if (Array.isArray(held) || ArrayBuffer.isView(held)) {
+            return { __id: id,
+              __typed: held.constructor ? held.constructor.name : "Array",
+              __arr: depth > 6 ? [] : Array.from(held,
+                (entry) => encode(entry, depth + 1)) };
+          }
+          const fields = {};
+          if (held.fields && depth <= 6) {
+            for (const [key, value] of Object.entries(held.fields)) {
+              fields[key] = encode(value, depth + 1);
+            }
+          }
+          return { __id: id, __guest: held.type || held._className || null,
+            fields };
+        };
+        entrySnapshot = { pc,
+          locals: frame.locals.map((held) => encode(held, 0)) };
+      } catch (snapshotError) {
+        entrySnapshot = { error: String(snapshotError) };
+      }
+    }
+    try {
+      // prep.blk indexes the module prepare() selected: the companion OSR
+      // module when prep.osr is set. execute() picks the module from its osr
+      // flag, so dropping it here ran the STRUCTURED PRIMARY at the
+      // companion's block id — a wrong entry point that silently corrupted
+      // state (kr.e's bzip2 selector on Tomb Racer, AIOOBE 6/6 downstream).
+      result = this.wasmJit.execute(
+        frame, thread, prep.st, prep.blk, true, prep.osr === true);
+    } catch (error) {
+      if (snapshotDir && entrySnapshot) {
+        try {
+          const fs = require("fs");
+          fs.writeFileSync(`${snapshotDir}/osr-snapshot-${frame.className}.json`,
+            JSON.stringify(entrySnapshot));
+        } catch (writeError) {
+          console.error("[osr-snapshot-write-failed]", String(writeError));
+        }
+      }
+      if (typeof process !== "undefined" && process.env &&
+          process.env.JVM_DEBUG_ARRAY_OOB === "1") {
+        console.error("[wasm-osr-throw]", JSON.stringify({
+          method: `${frame.className || "?"}.${frame.method?.name || "?"}${
+            frame.method?.descriptor || ""}`,
+          entryPc: pc,
+          entryBlock: prep.blk,
+          osrModule: prep.osr === true,
+          error: error && (error.message ||
+            (error.type ? `${error.type}: ${error.message}` : String(error))),
+          locals: (frame.locals || []).map((held) =>
+            held && typeof held === "object"
+              ? (Array.isArray(held) || ArrayBuffer.isView(held)
+                ? `[${held.length}]` : `<${held.type || "object"}>`)
+              : held),
+        }));
+      }
+      throw error;
+    }
     const tracePattern = this.wasmJit.traceMethodPattern || "";
     const identity = tracePattern
       ? `${frame.className || "?"}.${frame.method?.name || "?"}${
@@ -4547,9 +4649,11 @@ class JitCompiler {
       }));
     }
     if (result.returned) {
+      // `module` is the meta execute() actually ran (companion when
+      // prep.osr) — its box holds the return value, not the primary's.
       return {
         returned: true,
-        value: prep.st.meta.retChar === "V" ? RETURN_VOID : prep.st.meta.box.ret,
+        value: module.meta.retChar === "V" ? RETURN_VOID : module.meta.box.ret,
       };
     }
     if (result.deopted || !thread.callStack.isEmpty() &&
@@ -5072,8 +5176,45 @@ class JitCompiler {
           index: scalar(index),
           length: monoArray.len(arrayRef),
           locals: (frame.locals || []).map(scalar),
+          jsStack: new Error().stack.split("\n").slice(1, 26)
+            .map((line) => line.trim().replace(/^at /, "")
+              .replace(/ \(.*(jvm-generated:\/\/[^)?]*)[^)]*\)$/, " [$1]")
+              .replace(/ \(\/home[^)]*\/src\//, " (src/")),
           callers,
         }));
+        const debugStatics = process.env.JVM_DEBUG_ARRAY_OOB_STATICS || "";
+        for (const spec of debugStatics.split(",").filter(Boolean)) {
+          const [debugClass, debugField] = spec.split(".");
+          const live = {};
+          let cursor = debugClass;
+          while (cursor) {
+            const classData = this.jvm.classes[cursor];
+            if (classData && classData.staticFields) {
+              for (const [candidate, held] of classData.staticFields) {
+                if (String(candidate).split(":")[0].replace(/'/g, "") ===
+                    debugField) {
+                  live[`${cursor}#${candidate}`] = scalar(held);
+                }
+              }
+            }
+            cursor = classData?.ast?.classes?.[0]?.superClassName || null;
+          }
+          const cachedSites = this.fieldSites
+            .filter((site) => site && site.className === debugClass &&
+              site.fieldName === debugField && site.staticTarget)
+            .map((site) => ({
+              key: String(site.staticTarget.key),
+              kind: site.staticTarget.kind,
+              value: scalar(site.staticTarget.kind === "map"
+                ? site.staticTarget.fields.get(site.staticTarget.key)
+                : site.staticTarget.fields[site.staticTarget.key]),
+              sameContainer: site.staticTarget.fields ===
+                this.jvm.classes[debugClass]?.staticFields,
+            }));
+          console.error("[array-load-oob:statics]", JSON.stringify({
+            spec, live, cachedSites,
+          }));
+        }
       }
       throw { type: "java/lang/ArrayIndexOutOfBoundsException", message: `Index ${index} out of bounds for length ${monoArray.len(arrayRef)}` };
     }
@@ -5797,6 +5938,24 @@ class JitCompiler {
     this.hotCallGraphRegions.recordGenericCallSite(id, frame);
     const site = this.syncCallSites[id];
     if (!site) return ASYNC_INVOKE;
+    if (this.debugNonTopInvoke) {
+      const items = thread?.callStack?.items || [];
+      const top = items[items.length - 1];
+      if (top !== frame) {
+        console.error("[nontop-invoke]", JSON.stringify({
+          site: `${site.className || site.declaredClassName}.`
+            + `${site.methodName || site.name || "?"}${site.descriptor || ""}`,
+          op: site.op,
+          caller: `${frame.className}.${frame.method?.name}`
+            + `${frame.method?.descriptor || ""}@pc${frame.pc}`,
+          top: top ? `${top.className}.${top.method?.name}`
+            + `${top.method?.descriptor || ""}@pc${top.pc}` : null,
+          depth: items.length,
+          callerDepth: items.indexOf(frame),
+        }) + "\n" + new Error().stack.split("\n").slice(2, 14)
+          .map((line) => line.trim()).join("\n"));
+      }
+    }
     const stack = frame.stack.items;
     const receiverIndex = stack.length - site.params.length - 1;
     const receiver = site.op === "invokestatic"
@@ -6197,6 +6356,7 @@ class JitCompiler {
       "  (adaptiveFrameless && target.preferFrameless === true);",
       "let result;",
       "let baseDepth = -1;",
+      "const entryDepth = thread.callStack.items.length;",
       "let positionalTimingStarted = -1;",
       "let positionalExclusiveTiming = null;",
       "if (useFrameless) {",
@@ -6290,6 +6450,15 @@ class JitCompiler {
       "  }",
       "}",
       "target.freeFrame = child;",
+      "if (jit.debugPositionalDepth && thread.callStack.items.length !== entryDepth) {",
+      "  const frames = thread.callStack.items;",
+      "  console.error('[positional-depth-leak]', JSON.stringify({",
+      "    callee: plan.methodKey, useFrameless, entryDepth,",
+      "    depth: frames.length,",
+      "    leaked: frames.slice(entryDepth).map(f =>",
+      "      `${f.className}.${f.method && f.method.name}@pc${f.pc}`),",
+      "  }) + '\\n' + new Error().stack.split('\\n').slice(2, 12).join('\\n'));",
+      "}",
       site.returnType === "void"
         ? "return plan.returnVoid;"
         : "return useFrameless ? result : result.value;",

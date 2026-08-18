@@ -1446,6 +1446,13 @@ class StructuredWasmCompiler {
       this.alen0Idx = this.addImport('alen0', [T.ref], [T.i32], (a) => (
         a === null || a === undefined ? 0 : a.length));
       this.aioobIdx = this.addImport('err_aioob', [T.i32, T.i32], [], (i, len) => {
+        if (typeof process !== 'undefined' && process.env &&
+            process.env.JVM_DEBUG_ARRAY_OOB === '1') {
+          console.error('[array-oob:wasm-heap]', JSON.stringify({
+            index: i, length: len,
+          }) + '\n' + new Error().stack.split('\n').slice(2, 12)
+            .map((line) => line.trim()).join('\n'));
+        }
         throw {
           type: 'java/lang/ArrayIndexOutOfBoundsException',
           message: `Index ${i} out of bounds for length ${len}`,

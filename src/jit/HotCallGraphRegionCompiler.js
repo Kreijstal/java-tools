@@ -2209,13 +2209,21 @@ class HotCallGraphRegionCompiler {
       // stack. Its locally linked children run with the regional scheduler
       // marker, so loop polling remains owned by that root; if a child throws,
       // the child's restoring ABI appends its omitted frames beneath the
-      // existing root. We can therefore replace the root's entire generic
-      // call/PIC scaffold with a direct local call even when the child itself
-      // contains loops. Positional roots and omitted internal callers retain
-      // the full restoration scaffold unless the child is proven atomic.
-      if (!edge.node?.atomic && !fallbackInlineEdges?.has(edge) &&
-          (!generatorSource ||
-            hasRestoringTransientDeopt(edge.node?.generated))) continue;
+      // existing root and the exception propagates through the bare call.
+      //
+      // A transient DEOPT RETURN does not propagate that way. A non-atomic
+      // child's restoring body can return the async sentinel (entry guard) or
+      // a {deopt} object (nested asynchronous callee, class initialization,
+      // thread yield) after restoring its omitted frames onto the call stack.
+      // A bare-call lowering discards that result, so the root would keep
+      // executing past the call while the suspended child chain sits on the
+      // stack — on Tomb Racer this ran dh.a before ck.a's scatter and read a
+      // stale pq.f/aia.t (596-face leftovers against a 124-face model). Only
+      // atomic children (or exceptional-inline edges, whose guarded fallback
+      // re-runs the original checked span) may lose the scaffold; everyone
+      // else keeps the full result-checked call, still direct via the
+      // rawInvoke -> region-node redirection.
+      if (!edge.node?.atomic && !fallbackInlineEdges?.has(edge)) continue;
       const callArguments = rawCall.arguments.slice(1, -2).map((argument) =>
         source.slice(argument.start - prefix.length,
           argument.end - prefix.length));
@@ -2963,6 +2971,15 @@ class HotCallGraphRegionCompiler {
     body.jvmHotCallGraphElidedFieldCacheInvalidationCount =
       elidedFieldCacheInvalidations;
     body.jvmHotCallGraphRegionSource = moduleSource;
+    if (typeof process !== "undefined" && process.env &&
+        process.env.JVM_TRACE_REGION_SOURCE_DIR) {
+      try {
+        const fs = require("fs");
+        const rootKey = plan.root.key.replace(/[^A-Za-z0-9._-]/g, "_");
+        fs.writeFileSync(`${process.env.JVM_TRACE_REGION_SOURCE_DIR}/region-${
+          rootKey}-${this.moduleCompileCount}.js`, moduleSource);
+      } catch (_) {}
+    }
     this.moduleCompileCount += 1;
     this.outlinedLoopCount += outlinedLoops;
     this.outlinedLoopSourceBytes += outlinedLoopSourceBytes;
