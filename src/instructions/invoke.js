@@ -471,8 +471,14 @@ async function invokevirtual(frame, instruction, jvm, thread) {
     }
   }
 
+  // A raw number in a reference receiver slot is autoboxed above, so the
+  // unmodified message names java/lang/Integer and sends the reader hunting a
+  // boxing bug that does not exist. Report the condition that actually holds.
+  const receiverName = typeof obj === "number"
+    ? `int(${obj})`
+    : runtimeClassName(boxedObj) || typeof boxedObj;
   throw new Error(
-    `Unsupported invokevirtual: ${runtimeClassName(boxedObj) || typeof boxedObj}.${methodName}${descriptor} ` +
+    `Unsupported invokevirtual: ${receiverName}.${methodName}${descriptor} ` +
     `(declared ${className}, caller ${frame.className}.${frame.method && frame.method.name}${frame.method && frame.method.descriptor}, pc ${frame.pc - 1})`,
   );
 }

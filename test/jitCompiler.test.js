@@ -3783,6 +3783,9 @@ public final class ArbitraryEagerMonomorphicCallHarness {
     profileMethods: false,
     preferWholeMethodJs: true,
     structuredSsa: true,
+    // Opt in explicitly: eager monomorphic linking is off by default because it
+    // miscompiles (see the flag's comment in JitCompiler).
+    eagerMonomorphicCalls: true,
   }});
   await jvm.loadClassByName(className);
   jvm.classInitializationState.set(className, 'INITIALIZED');

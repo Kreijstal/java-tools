@@ -137,10 +137,22 @@ class JitCompiler {
     this.legacySyncCallSites = new Map();
     this.generatedTargetsByMethod = new WeakMap();
     this.generatedTargetUpgradePublicationCount = 0;
+    // OFF BY DEFAULT: this miscompiles. On Tomb Racer it corrupts a reference
+    // local in dj.b(IIIIII)V -- slot 10 holds the hr returned by an invoke, and
+    // with eager linking on it instead reads back a raw int, which faults at
+    // that local's first use as "Unsupported invokevirtual ... declared hr".
+    // Verified by A/B on an identical class tree: linking on => the fault every
+    // run at the same instruction with the same value; linking off => boots to
+    // the main menu. The defect was localized to this feature by elimination
+    // (the wasm tier, the interpreter's astore, frame recycling/aliasing, the
+    // generated call-site return path and the structured restore layouts were
+    // each instrumented and cleared), but the specific unsound step inside the
+    // link has NOT been identified, so the speculation stays off until it is.
+    // Re-enable with JVM_ENABLE_EAGER_MONOMORPHIC_CALLS=1 to investigate.
     this.eagerMonomorphicCallsEnabled =
-      options.eagerMonomorphicCalls !== false &&
-      !(typeof process !== "undefined" && process.env &&
-        process.env.JVM_DISABLE_EAGER_MONOMORPHIC_CALLS === "1");
+      options.eagerMonomorphicCalls === true ||
+      Boolean(typeof process !== "undefined" && process.env &&
+        process.env.JVM_ENABLE_EAGER_MONOMORPHIC_CALLS === "1");
     const eagerMonomorphicCallMaxCodeItems = Number(
       options.eagerMonomorphicCallMaxCodeItems ??
       (typeof process !== "undefined" && process.env
@@ -1511,9 +1523,29 @@ class JitCompiler {
     }
   }
 
+  // Diagnostic bisection: JVM_JIT_DENY=a,b refuses JIT admission for methods
+  // owned by those classes, so a miscompile can be attributed to one class
+  // without disabling the whole tier. Empty by default.
+  jitDenied(method) {
+    if (!this.jitDenyClasses) {
+      const raw = (typeof process !== "undefined" && process.env &&
+        process.env.JVM_JIT_DENY) || "";
+      this.jitDenyClasses = new Set(
+        raw.split(",").map((name) => name.trim()).filter(Boolean));
+    }
+    if (this.jitDenyClasses.size === 0) return false;
+    const owner = this.jvm.findClassNameForMethod?.(method) ||
+      method.className || "";
+    return this.jitDenyClasses.has(owner);
+  }
+
   isSupported(method) {
     if (this.supportCache.has(method)) {
       return this.supportCache.get(method);
+    }
+    if (this.jitDenied(method)) {
+      this.supportCache.set(method, false);
+      return false;
     }
 
     if (method.name === "<init>" || method.name === "<clinit>") {
@@ -1614,6 +1646,7 @@ class JitCompiler {
   }
 
   isCodegenSupported(method, allowEffectfulCalls = false) {
+    if (this.jitDenied(method)) return false;
     if (!allowEffectfulCalls && this.adaptiveCodegenMethods.has(method)) {
       return true;
     }
