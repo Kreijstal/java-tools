@@ -14348,3 +14348,170 @@ public class JitClassLiteralHarness {
     'class literal executes through a JIT tier');
   t.end();
 });
+
+test('Wasm OSR executes and reads back the module prepare() selected',
+  async (t) => {
+  const className = 'WasmOsrModuleSelectionHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class WasmOsrModuleSelectionHarness {
+  static int spin(int count) {
+    int total = 0;
+    for (int index = 0; index < count; index++) total += index;
+    return total;
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: { warmupThreshold: 0 } });
+  await jvm.loadClassByName(className);
+  const method = await jvm.findMethodInHierarchy(className, 'spin', '(I)I');
+
+  // prepare() answers with a block id indexed against the module IT chose:
+  // the companion dispatcher when it reports osr. execute() re-derives the
+  // module from that same flag, so losing the flag in between runs the
+  // structured primary at the companion's block id -- a valid-but-wrong
+  // entry point that resumes mid-method with desynchronized state rather
+  // than failing. Both modules are therefore given distinct block ids and
+  // distinct return boxes, and the probe must stay on one of them.
+  const companion = { meta: {
+    fullyCompiled: true, deoptableCalls: 0, retChar: 'I',
+    box: { ret: 4242 },
+  } };
+  const primary = { meta: {
+    fullyCompiled: true, deoptableCalls: 0, retChar: 'I',
+    box: { ret: 77 },
+  }, osr: companion };
+
+  const executions = [];
+  jvm.jit.wasmJit.enabled = true;
+  jvm.jit.wasmJit.execute = (_frame, _thread, module, block, nested, osr) => {
+    executions.push({ module, block, nested, osr });
+    return { returned: true };
+  };
+  const probe = (prep) => {
+    jvm.jit.wasmJit.prepare = () => prep;
+    const frame = new Frame(method);
+    frame.className = className;
+    const thread = {
+      id: 0, status: 'runnable', pendingException: null,
+      callStack: new Stack(),
+    };
+    thread.callStack.push(frame);
+    return jvm.jit.wasmOsrProbe(frame, thread, 0, 0);
+  };
+
+  const companionResult = probe({ st: primary, blk: 7, osr: true });
+  t.equal(executions.length, 1, 'the companion selection reaches execute()');
+  t.equal(executions[0].block, 7,
+    'the block id prepare() resolved is the one entered');
+  t.equal(executions[0].osr, true,
+    'execute() re-derives the companion from the flag prepare() reported');
+  t.ok(companionResult?.returned, 'a completed OSR reports its return');
+  t.equal(companionResult.value, 4242,
+    'the return value comes from the module that actually ran');
+
+  const primaryResult = probe({ st: primary, blk: 3 });
+  t.equal(executions.length, 2, 'an ordinary preparation also executes');
+  t.equal(executions[1].block, 3, 'the primary keeps its own block id');
+  t.notEqual(executions[1].osr, true,
+    'a preparation without the companion flag stays on the primary');
+  t.equal(primaryResult.value, 77,
+    'the primary reports its own return box');
+
+  const voidCompanion = { meta: {
+    fullyCompiled: true, deoptableCalls: 0, retChar: 'V',
+    box: { ret: 4242 },
+  } };
+  const voidResult = probe({
+    st: { meta: primary.meta, osr: voidCompanion }, blk: 1, osr: true,
+  });
+  t.equal(typeof voidResult.value, 'symbol',
+    'the return kind is read from the module that ran, not its sibling');
+
+  // The admission gate must judge the same module. A companion that cannot
+  // be entered is not redeemed by a fully compiled primary.
+  const partialCompanion = { meta: {
+    fullyCompiled: false, deoptableCalls: 0, retChar: 'I', box: { ret: 4242 },
+  } };
+  t.equal(probe({
+    st: { meta: primary.meta, osr: partialCompanion }, blk: 2, osr: true,
+  }), null, 'a partial companion is rejected behind a complete primary');
+  t.equal(executions.length, 3,
+    'the rejected companion runs no Wasm at all');
+  t.end();
+});
+
+test('restoring calls withdraw the frame their synchronous fallback restored',
+  async (t) => {
+  const className = 'RestoringSyncFallbackHarness';
+  const classpath = compileJavaFixture(t, className, `
+public final class RestoringSyncFallbackHarness {
+  interface Step { int apply(int value); }
+  static Step step;
+  static int root(int count) {
+    int total = 0;
+    for (int index = 0; index < count; index++) total += step.apply(index);
+    return total;
+  }
+  static final class Doubler implements Step {
+    public int apply(int value) { return value + value; }
+  }
+}
+`);
+  const jvm = new JVM({ classpath, jit: {
+    warmupThreshold: 0,
+    profileMethods: false,
+    structuredSsa: true,
+    guestKernelOracles: false,
+  } });
+  const classData = await jvm.loadClassByName(className);
+  await jvm.loadClassByName(`${className}$Doubler`);
+  jvm.classInitializationState.set(className, 'INITIALIZED');
+  jvm.classInitializationState.set(`${className}$Doubler`, 'INITIALIZED');
+  const method = await jvm.findMethodInHierarchy(className, 'root', '(I)I');
+  const generated = jvm.jit.structuredSsa.compile(method);
+  t.equal(typeof generated?.jvmRestoringDirectPositionalBody, 'function',
+    'an unlinked interface call publishes a restoring positional body');
+
+  // A restoring body runs frameless. Its synchronous fallback splices the
+  // omitted Frame in at restorationDepth so tryInvokeSyncAt has a canonical
+  // caller -- and every arm that propagates a suspension returns while that
+  // Frame is live. The normal completion path falls through instead, so
+  // nothing there withdrew it: a plain return stranded a pc-0 Frame that the
+  // scheduler later re-entered and ran from the top, re-executing a method
+  // whose real caller had already moved on.
+  const source = generated.jvmRestoringDirectPositionalSource;
+  const endMarkers = source.match(/__JVM_REGION_CALL_END_\d+__/g) || [];
+  t.ok(endMarkers.length > 0,
+    'the unlinked call survives as a real call block');
+  for (const marker of endMarkers) {
+    t.ok(new RegExp(`${marker}\\*/\\s*\\n\\s*if \\(frame !== null\\) \\{\\s*` +
+      '\\n\\s*frame = helpers\\.structuredSsa\\.releaseUnwindFrame\\(')
+      .test(source),
+    `a completed ${marker} withdraws any frame it restored`);
+  }
+
+  const receiver = {
+    type: `${className}$Doubler`, fields: {}, hashCode: jvm.nextHashCode++,
+  };
+  classData.staticFields.set(`step:L${className}$Step;`, receiver);
+  const thread = {
+    id: 0, status: 'runnable', pendingException: null, callStack: new Stack(),
+  };
+  jvm.threads = [thread];
+  jvm.currentThreadIndex = 0;
+  const plan = {
+    target: { freeFrame: null }, Frame, lookupClass: className, method,
+    restoreFrame(targetThread, frame, depth) {
+      targetThread.callStack.items.splice(depth, 0, frame);
+    },
+  };
+  const result = generated.jvmRestoringDirectPositionalBody(
+    jvm.jit, plan, 5, thread, true);
+  t.equal(result, 20,
+    'the cold interface call still produces the scalar result');
+  t.equal(thread.callStack.size(), 0,
+    'a normally completed call leaves no frame behind for the scheduler');
+  t.equal(plan.target.freeFrame !== null, true,
+    'the withdrawn frame returns to the plan for reuse');
+  t.end();
+});
