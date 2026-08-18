@@ -1502,10 +1502,38 @@ class JitCompiler {
     return { source: `${source}\n//# sourceURL=${url}`, url, functionName };
   }
 
+  dumpGeneratedSource(labeled, method, tier, ownerOverride, hoistedSource) {
+    const owner = ownerOverride || method?.className ||
+      this.jvm.findClassNameForMethod?.(method) || "unknown";
+    const name = method?.name || "unknown";
+    const filter = (process.env.JVM_DUMP_GENERATED_METHODS || "")
+      .split(",").map((entry) => entry.trim()).filter(Boolean);
+    if (filter.length && !filter.includes(owner) &&
+        !filter.includes(`${owner}.${name}`)) return;
+    try {
+      const fs = require("fs");
+      const dir = process.env.JVM_DUMP_GENERATED_DIR;
+      fs.mkdirSync(dir, { recursive: true });
+      const safe = `${owner}.${name}${method?.descriptor || ""}.${tier}`
+        .replace(/[^A-Za-z0-9_.$-]/g, "_");
+      fs.writeFileSync(`${dir}/${safe}.js`,
+        `${hoistedSource ? `${hoistedSource}\n` : ""}${labeled.source}\n`);
+    } catch { /* dump only */ }
+  }
+
   createGeneratedFunction(method, tier, parameters, source,
     ownerOverride = null, asynchronous = false, generator = false,
     captures = null, hoistedSource = null) {
     const labeled = this.generatedSource(method, tier, source, ownerOverride);
+    // Reading a miscompile means reading the code that was generated. The
+    // sourceURL only names it inside a debugger, so JVM_DUMP_GENERATED_DIR
+    // writes each body to disk; JVM_DUMP_GENERATED_METHODS=ck.a,p.a narrows
+    // the dump to the owners or owner.method pairs under suspicion.
+    if (typeof process !== "undefined" && process.env &&
+        process.env.JVM_DUMP_GENERATED_DIR) {
+      this.dumpGeneratedSource(labeled, method, tier, ownerOverride,
+        hoistedSource);
+    }
     // Function constructors themselves remain anonymous in Gecko profiles.
     // Return a named literal so stack sampling exposes the guest identity.
     const prefix = generator ? "function* " : asynchronous ? "async function " : "function ";
@@ -5182,6 +5210,30 @@ class JitCompiler {
               .replace(/ \(\/home[^)]*\/src\//, " (src/")),
           callers,
         }));
+        // Statics alone cannot say whether the *object* a frame is indexing
+        // is the one it should be. JVM_DEBUG_ARRAY_OOB_FIELDS=f,r names guest
+        // instance fields to print for every object local, which is what tells
+        // a stale reference apart from a corrupt one.
+        const debugFields = process.env.JVM_DEBUG_ARRAY_OOB_FIELDS || "";
+        if (debugFields) {
+          const wanted = new Set(debugFields.split(",").filter(Boolean));
+          const objects = [];
+          for (const item of (frame.locals || [])) {
+            if (!item || typeof item !== "object" || !item.fields) continue;
+            const picked = {};
+            for (const key of Object.keys(item.fields)) {
+              const name = String(key).split(".").pop();
+              if (wanted.has(name) || wanted.has(String(key))) {
+                picked[key] = scalar(item.fields[key]);
+              }
+            }
+            if (Object.keys(picked).length) {
+              objects.push({ type: scalar(item), fields: picked });
+            }
+          }
+          console.error("[array-load-oob:fields]",
+            JSON.stringify({ spec: debugFields, objects }));
+        }
         const debugStatics = process.env.JVM_DEBUG_ARRAY_OOB_STATICS || "";
         for (const spec of debugStatics.split(",").filter(Boolean)) {
           const [debugClass, debugField] = spec.split(".");
