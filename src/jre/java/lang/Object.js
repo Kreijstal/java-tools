@@ -7,6 +7,10 @@ module.exports = {
     '<init>()V': (jvm, obj, args) => {
       // Object constructor does nothing
     },
+    // Object.finalize is a no-op in the JDK too, and this VM never runs
+    // finalizers. It has to be declared all the same: without it the frontend
+    // cannot resolve `super.finalize()` and used to invent a descriptor for it.
+    'finalize()V': () => {},
     'getClass()Ljava/lang/Class;': async (jvm, obj, args) => {
       return await jvm.getClassObject(obj._className || obj.type);
     },

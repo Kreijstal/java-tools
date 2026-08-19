@@ -256,15 +256,6 @@ module.exports = {
       return addComponent(jvm, obj, component, name);
     },
 
-    'add(Ljava/lang/String;Ljava/awt/Component;)V': (jvm, obj, args) => {
-      const name = args[0];
-      const component = args[1];
-      if (component) {
-        component._layoutConstraint = normalizeConstraint(name);
-      }
-      addComponent(jvm, obj, component, name);
-    },
-
     'add(Ljava/awt/Component;Ljava/lang/Object;)V': (jvm, obj, args) => {
       const component = args[0];
       const constraint = args[1];
@@ -274,14 +265,6 @@ module.exports = {
       addComponent(jvm, obj, component, constraint);
     },
 
-    'add(Ljava/awt/Component;Ljava/lang/Object;)Ljava/awt/Component;': (jvm, obj, args) => {
-      const component = args[0];
-      const constraint = args[1];
-      if (component) {
-        component._layoutConstraint = normalizeConstraint(constraint);
-      }
-      return addComponent(jvm, obj, component, constraint);
-    },
     
     'remove(Ljava/awt/Component;)V': (jvm, obj, args) => {
       const component = args[0];

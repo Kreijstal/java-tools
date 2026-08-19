@@ -35,5 +35,27 @@ module.exports = {
     'keys()Ljava/util/Enumeration;': function(jvm, obj) {
       return { type: 'java/util/Enumeration', values: Array.from(obj.map.keys()), index: 0 };
     },
+    'elements()Ljava/util/Enumeration;': function(jvm, obj) {
+      return { type: 'java/util/Enumeration', values: Array.from(obj.map.values()), index: 0 };
+    },
+    'remove(Ljava/lang/Object;)Ljava/lang/Object;': function(jvm, obj, args) {
+      const old = obj.map.get(args[0]);
+      obj.map.delete(args[0]);
+      return old === undefined ? null : old;
+    },
+    'size()I': function(jvm, obj) {
+      return obj.map.size;
+    },
+    'clear()V': function(jvm, obj) {
+      obj.map.clear();
+    },
+    'contains(Ljava/lang/Object;)Z': function(jvm, obj, args) {
+      for (const value of obj.map.values()) if (value === args[0]) return 1;
+      return 0;
+    },
+    'containsValue(Ljava/lang/Object;)Z': function(jvm, obj, args) {
+      for (const value of obj.map.values()) if (value === args[0]) return 1;
+      return 0;
+    },
   }
 };

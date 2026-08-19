@@ -187,11 +187,6 @@ module.exports = {
       }
     },
 
-    'requestFocus()Z': (jvm, obj, args) => {
-      browserInput.focusInputComponent(jvm, obj);
-      return 1;
-    },
-
     'setFocusTraversalKeysEnabled(Z)V': (jvm, obj, args) => {
       obj._focusTraversalKeysEnabled = !!args[0];
     },

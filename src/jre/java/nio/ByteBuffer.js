@@ -164,6 +164,27 @@ module.exports = {
     'get()B': (jvm, obj) =>
       viewOf(obj).getInt8(relativeOffset(obj, 1)),
     'get(I)B': (jvm, obj, args) => viewOf(obj).getInt8(args[0]),
+    // Returns the buffer, not void - the frontend was inventing `([BII)V` for
+    // this because the model did not declare it, and that reference resolves to
+    // nothing at run time.
+    'get([BII)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
+      const [destination, offset, length] = args;
+      const view = viewOf(obj);
+      const start = relativeOffset(obj, length);
+      for (let index = 0; index < length; index += 1) {
+        destination[offset + index] = view.getInt8(start + index);
+      }
+      return obj;
+    },
+    'get([B)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
+      const destination = args[0];
+      const view = viewOf(obj);
+      const start = relativeOffset(obj, destination.length);
+      for (let index = 0; index < destination.length; index += 1) {
+        destination[index] = view.getInt8(start + index);
+      }
+      return obj;
+    },
     'put(B)Ljava/nio/ByteBuffer;': (jvm, obj, args) => {
       viewOf(obj).setInt8(putOffset(obj, 1), args[0]);
       return obj;

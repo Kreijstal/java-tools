@@ -18,6 +18,24 @@ function messageValue(message) {
   return String(message);
 }
 
+// Throwable declares printStackTrace three ways in the JDK: no argument, one
+// PrintWriter and one PrintStream. Modelling only two of them made the Java
+// frontend match `printStackTrace(System.out)` against the PrintWriter overload
+// and cast a PrintStream to it, which is a ClassCastException the moment the
+// catch block runs.
+function printThrowableTo(sink, obj) {
+  const className = obj.type.replace(/\//g, '.');
+  const message = obj.message;
+  const errorMsg = message ? `${className}: ${messageValue(message)}` : className;
+  if (sink && sink.println) {
+    sink.println(errorMsg);
+    sink.println('\tat <native method>');
+  } else {
+    console.error(errorMsg);
+    console.error('\tat <native method>');
+  }
+}
+
 module.exports = {
   super: 'java/lang/Object',
   staticFields: {},
@@ -96,6 +114,9 @@ module.exports = {
         console.error(errorMsg);
         console.error('\tat <native method>');
       }
+    },
+    'printStackTrace(Ljava/io/PrintStream;)V': (jvm, obj, args) => {
+      printThrowableTo(args[0], obj);
     },
     'addSuppressed(Ljava/lang/Throwable;)V': (jvm, obj, args) => {
       const suppressedException = args[0];

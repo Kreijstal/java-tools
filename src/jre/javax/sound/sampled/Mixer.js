@@ -6,6 +6,10 @@ const { getLineForInfo, isSourceDataLineInfo } = require('./lineSupport');
 // Everything routes to the same line factory AudioSystem.getLine() uses --
 // there is one output device, so picking it explicitly changes nothing.
 module.exports = {
+  // An interface in the JDK. The flag is what makes the Java frontend choose
+  // invokeinterface over invokevirtual, and a Methodref naming an interface links
+  // cleanly and then throws IncompatibleClassChangeError the first time it runs.
+  isInterface: true,
   super: 'javax/sound/sampled/Line',
   methods: {
     'getLine(Ljavax/sound/sampled/Line$Info;)Ljavax/sound/sampled/Line;':

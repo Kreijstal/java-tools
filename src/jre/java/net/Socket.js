@@ -32,36 +32,41 @@ function installApplicationKeepalive(nativeSocket) {
   nativeSocket.once('close', () => clearInterval(timer));
 }
 
+function connectSocket(obj, host, port) {
+  const nativeSocket = new net.Socket();
+  const socketId = allocId();
+  register(socketId, nativeSocket);
+
+  obj.socketId = socketId;
+  obj.isClosed = false;
+
+  // Node's connect is async. We fire and forget for now.
+  nativeSocket.connect(port, host, () => {
+    nativeSocket.setKeepAlive(true, 10000);
+    installApplicationKeepalive(nativeSocket);
+  });
+
+  // Prevent unhandled errors from crashing the process.
+  nativeSocket.on('error', (err) => {
+    // In a full implementation, this error should be stored and
+    // thrown as a Java exception on the next socket operation.
+    // For now, we just log it and prevent a crash.
+    console.error(`Socket error for ${host}:${port}:`, err.message);
+  });
+}
+
 module.exports = {
   super: 'java/lang/Object',
   methods: {
-    // Constructor
+    // Constructors. The JDK declares both an InetAddress and a String host form;
+    // modelling only the first made the Java frontend match `new Socket(host, port)`
+    // with a String host against it and cast the String to an InetAddress.
     '<init>(Ljava/net/InetAddress;I)V': (jvm, obj, args) => {
-      const address = args[0]; // This is an InetAddress object from our JRE
-      const port = args[1];
+      connectSocket(obj, javaStr(args[0].hostName), args[1]);
+    },
 
-      const host = javaStr(address.hostName);
-
-      const nativeSocket = new net.Socket();
-      const socketId = allocId();
-      register(socketId, nativeSocket);
-
-      obj.socketId = socketId;
-      obj.isClosed = false;
-
-      // Node's connect is async. We fire and forget for now.
-      nativeSocket.connect(port, host, () => {
-        nativeSocket.setKeepAlive(true, 10000);
-        installApplicationKeepalive(nativeSocket);
-      });
-
-      // Prevent unhandled errors from crashing the process.
-      nativeSocket.on('error', (err) => {
-        // In a full implementation, this error should be stored and
-        // thrown as a Java exception on the next socket operation.
-        // For now, we just log it and prevent a crash.
-        console.error(`Socket error for ${host}:${port}:`, err.message);
-      });
+    '<init>(Ljava/lang/String;I)V': (jvm, obj, args) => {
+      connectSocket(obj, javaStr(args[0]), args[1]);
     },
 
     'connect(Ljava/net/SocketAddress;)V': (jvm, obj, args) => {
