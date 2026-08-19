@@ -1,5 +1,13 @@
 'use strict';
 
+const {
+  op,
+  arg,
+  pushValue: utilsPushValue,
+  intLoadLocal,
+  parseParameterDescriptors,
+} = require('../utils/instructionUtils');
+
 const LEFT_OPS = {
   if_icmpgt: 'if_icmplt',
   if_icmpge: 'if_icmple',
@@ -339,17 +347,13 @@ function isIntLoad(item) {
 }
 
 function localIndex(item) {
-  const itemOp = op(item);
-  if (itemOp === 'iload') return String(arg(item));
-  return itemOp.slice(-1);
+  return intLoadLocal(item);
 }
 
 function pushValue(item) {
-  const itemOp = op(item);
-  if (itemOp === 'iconst_m1') return -1;
-  if (/^iconst_[0-5]$/.test(itemOp || '')) return Number(itemOp.slice(-1));
-  if (itemOp === 'bipush' || itemOp === 'sipush') return Number(arg(item));
-  if (itemOp === 'ldc') {
+  const val = utilsPushValue(item);
+  if (val != null) return val;
+  if (op(item) === 'ldc') {
     const value = arg(item);
     return Number.isInteger(value) ? value : null;
   }
@@ -362,16 +366,6 @@ function pushInstruction(value) {
   if (value >= -128 && value <= 127) return { op: 'bipush', arg: String(value) };
   if (value >= -32768 && value <= 32767) return { op: 'sipush', arg: String(value) };
   return { op: 'ldc', arg: value };
-}
-
-function op(item) {
-  const insn = item && item.instruction;
-  return typeof insn === 'string' ? insn : insn && insn.op;
-}
-
-function arg(item) {
-  const insn = item && item.instruction;
-  return insn && typeof insn === 'object' ? insn.arg : null;
 }
 
 function collectUsedLabels(codeItems = [], exceptionTable = []) {
@@ -422,26 +416,6 @@ function charParameterLocals(method) {
     local += (desc === 'J' || desc === 'D') ? 2 : 1;
   }
   return out;
-}
-
-function parseParameterDescriptors(descriptor) {
-  const close = descriptor.indexOf(')');
-  if (!descriptor.startsWith('(') || close < 0) return [];
-  const params = [];
-  for (let i = 1; i < close;) {
-    let start = i;
-    while (descriptor[i] === '[') i += 1;
-    if (descriptor[i] === 'L') {
-      const semi = descriptor.indexOf(';', i);
-      if (semi < 0 || semi > close) return params;
-      params.push(descriptor.slice(start, semi + 1));
-      i = semi + 1;
-    } else {
-      params.push(descriptor.slice(start, i + 1));
-      i += 1;
-    }
-  }
-  return params;
 }
 
 function methodReturnsChar(itemArg) {
