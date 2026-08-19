@@ -393,6 +393,23 @@ function computeStackMapFrames(method, classIr) {
 
   drain();
 
+  // A range no reachable instruction sits in cannot throw, so its handler is
+  // dead as well - and a handler that lands inside a dead run is not that run's
+  // first instruction, so it gets no frame of its own and the verifier rejects
+  // the branch target. javac drops such entries outright rather than keeping a
+  // handler for code that cannot execute.
+  if (Array.isArray(method.exceptionTable) && method.exceptionTable.length) {
+    method.exceptionTable = method.exceptionTable.filter((entry) => {
+      const start = labels.get(entry.startLabel);
+      const end = labels.get(entry.endLabel);
+      if (start == null || end == null) return true;
+      for (let index = start; index < end; index += 1) {
+        if (inputs[index]) return true;
+      }
+      return false;
+    });
+  }
+
   // Control does not fall out of a goto, a switch, or a return, so whatever sits
   // after one is unreachable unless something branches to it. Such code still
   // has to satisfy the verifier - it scans linearly and demands a frame wherever

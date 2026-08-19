@@ -37,6 +37,13 @@ module.exports = {
       return BigInt(v8.getHeapStatistics().heap_size_limit);
     },
 
+    // A hint in the JDK too, so doing nothing is a faithful implementation -
+    // but it has to be declared, because the Java frontend refuses to invent a
+    // descriptor on a JRE owner and games do call System.gc()'s sibling.
+    'gc()V': () => {},
+
+    'runFinalization()V': () => {},
+
     'exit(I)V': (jvm, _, args) => {
       // no-op
     },

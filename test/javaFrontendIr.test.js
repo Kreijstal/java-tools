@@ -864,8 +864,9 @@ test('local state classes lower declared fields and switch selectors', (t) => {
   });
   t.equal(result.bytecodeIr.status, 'complete',
     'a local class state machine compiles completely');
+  // javac names a local class Outer$NName; the counter is part of the name.
   const stateClass = result.javaIr.classes.find((classIr) =>
-    classIr.internalName.endsWith('$State'));
+    classIr.internalName.endsWith('$1State'));
   t.ok(stateClass, 'the local class is emitted as a synthetic class');
   t.deepEqual((stateClass?.fields || []).map((field) => field.name),
     ['state', 'total'],
@@ -3079,5 +3080,80 @@ test('a qualified nested JRE type in a field access keeps its binary name', (t) 
     'the owner is the nested binary name, not the package-join guess java/net/Proxy/Type');
   t.equal(read && read.operands[3], 'Ljava/net/Proxy$Type;',
     'the field descriptor uses the same binary name');
+  t.end();
+});
+
+test('two same-named local classes in one outer class get distinct binary names', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class LocalClassNameSmoke {
+      Runnable first() {
+        class Helper implements Runnable { public void run() {} }
+        return new Helper();
+      }
+      Runnable second() {
+        class Helper implements Runnable { public void run() {} }
+        return new Helper();
+      }
+      Runnable other() {
+        class Other implements Runnable { public void run() {} }
+        return new Other();
+      }
+    }
+  `, { sourceFileName: 'LocalClassNameSmoke.java' });
+  const names = result.bytecodeIr.classes.map((entry) => entry.internalName);
+  const locals = names.filter((name) => name.includes('Helper') || name.includes('Other'));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'the local classes compile completely');
+  // Verified against javac 11 on the same source: LC$1Helper, LC$2Helper, LC$1Other.
+  // The counter is per simple name and per immediately-enclosing class.
+  t.deepEqual(locals.sort(), [
+    'LocalClassNameSmoke$1Helper',
+    'LocalClassNameSmoke$1Other',
+    'LocalClassNameSmoke$2Helper',
+  ], 'each local class is named the way javac names it');
+  t.equal(new Set(locals).size, locals.length,
+    'no two local classes share a binary name, which would silently overwrite one');
+
+  const newOps = result.bytecodeIr.classes
+    .find((entry) => entry.internalName === 'LocalClassNameSmoke').methods
+    .filter((method) => method.name === 'first' || method.name === 'second')
+    .map((method) => method.instructions.find((instruction) => instruction.opcode === 'new'))
+    .map((instruction) => instruction && instruction.operands[0]);
+  t.deepEqual(newOps, ['LocalClassNameSmoke$1Helper', 'LocalClassNameSmoke$2Helper'],
+    'each method instantiates the Helper it actually declared');
+  t.end();
+});
+
+test('an exception handler over dead code is dropped instead of left frameless', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class DeadHandlerSmoke {
+      static class Res implements AutoCloseable {
+        public void close() {}
+      }
+      public static void main(String[] args) {
+        try (Res res = new Res()) {
+          System.out.println(res);
+        }
+      }
+    }
+  `, { sourceFileName: 'DeadHandlerSmoke.java' });
+
+  t.equal(result.bytecodeIr.status, 'complete', 'try-with-resources lowers completely');
+  const owner = result.bytecodeIr.classes.find((entry) => entry.internalName === 'DeadHandlerSmoke');
+  const main = owner.methods.find((method) => method.name === 'main');
+  const frameLabels = new Set((main.stackMapFrames || []).map((frame) => frame.label));
+  const frameless = (main.exceptionTable || [])
+    .filter((entry) => !frameLabels.has(entry.handlerLabel))
+    .map((entry) => entry.handlerLabel);
+
+  t.ok((main.exceptionTable || []).length > 0, 'the resource release is still protected by a handler');
+  // The verifier scans linearly and demands a frame at every branch target, and
+  // a handler is a branch target. Unreachable runs collapse to nops ending in
+  // athrow with a single frame at the run's first instruction, so a handler that
+  // lands anywhere else inside such a run can never have one - the class then
+  // fails to link with "Expecting a stackmap frame at branch target N". The only
+  // sound answer is to drop the entry: a range no reachable instruction sits in
+  // cannot throw, so its handler cannot run either.
+  t.deepEqual(frameless, [], 'every surviving handler has a stack map frame');
   t.end();
 });

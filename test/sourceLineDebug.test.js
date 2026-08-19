@@ -27,13 +27,25 @@ test('compiler emits SourceFile and LineNumberTable attributes', (t) => {
   const jasmin = result.classes[0].jasmin;
   t.match(jasmin, /\.sourcefile "LineDemo\.java"/, 'SourceFile attribute is emitted');
   t.match(jasmin, /\.linenumbertable/, 'LineNumberTable is emitted');
-  const table = jasmin.match(/\.linenumbertable([\s\S]*?)\.end linenumbertable/);
+  // The implicit constructor carries a table of its own - javac gives it the
+  // class declaration line - so pick the table out of main's method body rather
+  // than taking whichever one comes first.
+  const method = jasmin.match(/\.method public static main[\s\S]*?\.end method/);
+  t.ok(method, 'main is emitted');
+  const table = method[0].match(/\.linenumbertable([\s\S]*?)\.end linenumbertable/);
   t.ok(table, 'line number table is well formed');
   const lines = table[1].trim().split('\n').map((entry) => entry.trim());
   t.deepEqual(
     lines.map((entry) => entry.split(/\s+/)[1]),
     ['3', '4', '5', '6'],
     'one entry per statement line, in order',
+  );
+  const ctor = jasmin.match(/\.method public <init>[\s\S]*?\.end method/);
+  const ctorTable = ctor[0].match(/\.linenumbertable([\s\S]*?)\.end linenumbertable/);
+  t.deepEqual(
+    ctorTable[1].trim().split('\n').map((entry) => entry.trim().split(/\s+/)[1]),
+    ['1'],
+    'the implicit constructor points at the class declaration, the way javac does',
   );
   t.end();
 });

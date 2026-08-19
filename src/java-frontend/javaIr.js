@@ -3404,6 +3404,7 @@ function createCapturedClassConstructor(classContext, captures) {
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    allocateLocalClassName: classContext.allocateLocalClassName,
     constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
   const ops = [implicitSuperConstructorOp(context)];
@@ -3556,11 +3557,29 @@ function captureValuesForLocalClass(context, declaration = null) {
   return captures;
 }
 
+// javac names a local class `Outer$NName`, where N counts the local classes of
+// that simple name in the *immediately* enclosing class and starts at 1 (an
+// anonymous class uses the separate `Outer$N` space, so the two never collide).
+// The counter is not decoration: without it two same-named local classes in one
+// outer class - `Helper` declared in two different methods - produce the same
+// binary name and silently overwrite each other. A method context is rebuilt per
+// method, so the allocator has to live on the class context and be handed down.
+function makeLocalClassNameAllocator(internalName) {
+  const counts = new Map();
+  return (simpleName) => {
+    const next = (counts.get(simpleName) || 0) + 1;
+    counts.set(simpleName, next);
+    return `${internalName}$${next}${simpleName}`;
+  };
+}
+
 function lowerLocalClassDeclaration(statement, context) {
   const declaration = statement && statement.declaration;
   if (!declaration || !isClassLikeDeclaration(declaration)) return null;
   const captures = captureValuesForLocalClass(context, declaration);
-  const owner = `${context.classInternalName}$${declaration.name}`;
+  const owner = context.allocateLocalClassName
+    ? context.allocateLocalClassName(declaration.name)
+    : `${context.classInternalName}$1${declaration.name}`;
   context.classBySimpleName.set(declaration.name, owner);
   context.classBySimpleName.set(`${context.className}.${declaration.name}`, owner);
   if (context.constructorCaptureArgsByOwner) {
@@ -3654,6 +3673,7 @@ function lowerLocalClassDeclaration(statement, context) {
     instanceInitializerBlocks: [],
     staticInitializerOps: [],
     allocateLambdaClassName: context.allocateLambdaClassName,
+    allocateLocalClassName: makeLocalClassNameAllocator(owner),
     constructorCaptureArgsByOwner: context.constructorCaptureArgsByOwner,
   };
   for (const member of declaration.body || []) {
@@ -3772,6 +3792,7 @@ function lowerAnonymousClassToJavaIrValue(expression, targetDescriptor, context)
     typeParameters: new Map(),
     syntheticClasses: context.syntheticClasses,
     allocateLambdaClassName: context.allocateLambdaClassName,
+    allocateLocalClassName: makeLocalClassNameAllocator(owner),
     constructorCaptureArgsByOwner: context.constructorCaptureArgsByOwner,
   };
   const methods = [createCapturedClassConstructor(classContext, captures)];
@@ -7821,6 +7842,7 @@ function createEnumDefaultConstructor(classContext) {
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    allocateLocalClassName: classContext.allocateLocalClassName,
     constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
   const block = createJavaIrBlock('entry', {
@@ -7901,6 +7923,7 @@ function lowerEnumConstructorToJavaIr(method, classContext) {
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    allocateLocalClassName: classContext.allocateLocalClassName,
   };
   let ops = method.body && method.body.kind === 'BlockStatement'
     ? lowerStatementToJavaIrOps(method.body, context)
@@ -8356,6 +8379,7 @@ function createStaticInitializerContext(classContext) {
     currentReturnDescriptor: 'V',
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    allocateLocalClassName: classContext.allocateLocalClassName,
     constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
   classContext.staticInitializerContext = context;
@@ -8443,6 +8467,7 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     inferredUnknownFields: new Map(),
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    allocateLocalClassName: classContext.allocateLocalClassName,
     constructorCaptureArgsByOwner: classContext.constructorCaptureArgsByOwner,
   };
   const methodModifiers = modifierNames(method.modifiers);
@@ -8545,6 +8570,7 @@ function createInnerMemberDefaultConstructor(classContext) {
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
     allocateLambdaClassName: classContext.allocateLambdaClassName,
+    allocateLocalClassName: classContext.allocateLocalClassName,
   };
   const block = createJavaIrBlock('entry', {
     kind: 'EntryBlock',
@@ -8872,6 +8898,7 @@ function lowerAstToJavaIr(document, options = {}) {
         nextLambdaId += 1;
         return id;
       },
+      allocateLocalClassName: makeLocalClassNameAllocator(internalName),
     };
     if (isNonStaticMemberClass) {
       const outerDescriptor = `L${outerClassContext.classInternalName};`;
