@@ -264,14 +264,19 @@ function isSupportedTypeNode(type) {
   return true;
 }
 
-function canStartPrefixExpression(token) {
+// JLS 15.16: a cast to a reference type is `( ReferenceType )
+// UnaryExpressionNotPlusMinus`, so `+`, `-`, `++` and `--` cannot follow it -
+// `(var21) + "<br>"` is an addition, not a cast of `+"<br>"`. Only a primitive
+// cast may take them, as in `(int) -x`. Reading the reference form as a cast
+// silently turned a string concatenation into `checkcast var21` against a class
+// that does not exist, which verifies but dies at runtime.
+function canStartPrefixExpression(token, castsPrimitiveType = true) {
   if (!token) return false;
   if (isNameToken(token) ||
       ['string', 'char', 'number'].includes(token.kind)) return true;
-  return [
-    '(', 'new', 'this', 'super', 'true', 'false', 'null',
-    '+', '-', '!', '~', '++', '--',
-  ].includes(token.text);
+  const always = ['(', 'new', 'this', 'super', 'true', 'false', 'null', '!', '~'];
+  if (always.includes(token.text)) return true;
+  return castsPrimitiveType && ['+', '-', '++', '--'].includes(token.text);
 }
 
 class TokenExpressionParser {
@@ -348,10 +353,10 @@ class TokenExpressionParser {
     if (token.text === '(') {
       const close = findMatchingInTokens(this.tokens, this.index, '(', ')');
       if (close > this.index && close < this.tokens.length - 1 &&
-          canStartPrefixExpression(this.tokens[close + 1]) &&
           looksLikeCastType(this.tokens.slice(this.index + 1, close))) {
         const type = this.owner.typeFromTokens(this.tokens.slice(this.index + 1, close));
-        if (type.kind !== 'UnsupportedType') {
+        if (type.kind !== 'UnsupportedType'
+            && canStartPrefixExpression(this.tokens[close + 1], type.kind === 'PrimitiveType')) {
           this.index = close + 1;
           const expression = this.parsePrefix();
           if (expression) return ast.createNode('CastExpression', { castType: type, expression });
@@ -727,6 +732,7 @@ class ParserImpl {
   }
 
   parseClassDeclaration(prefix) {
+    const start = this.index;
     this.expect('class');
     const name = this.consumeName('class name');
     const typeParameters = this.parseOptionalTypeParameters();
@@ -744,6 +750,7 @@ class ParserImpl {
       implementsTypes: headerInfo.implementsTypes,
       permitsTypes: headerInfo.permitsTypes,
       body,
+      range: this.currentRangeFrom(start),
     });
   }
 

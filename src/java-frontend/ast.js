@@ -280,6 +280,9 @@ function classDeclaration(name, fields = {}) {
     implementsTypes: fields.implementsTypes || [],
     permitsTypes: fields.permitsTypes || [],
     body: fields.body || [],
+    // Kept so a synthesised default constructor can be attributed to the class
+    // declaration line the way javac attributes it; nothing else reads it.
+    range: fields.range,
   }, fields.meta);
 }
 

@@ -41,6 +41,21 @@ function verificationTypeForDescriptor(descriptor) {
   return TOP;
 }
 
+// The result of an aaload is the array's component type. Reporting it as Object
+// makes every later typed use of that value - a baload, an arraylength on a
+// nested array, a field store - fail verification even though the bytecode is
+// correct, because the frame the verifier reads is weaker than the code needs.
+function arrayComponentType(arrayType) {
+  if (arrayType === NULL) return NULL;
+  if (isObject(arrayType) && typeof arrayType.cls === 'string' && arrayType.cls.startsWith('[')) {
+    const component = arrayType.cls.slice(1);
+    if (component.startsWith('[') || component.startsWith('L')) {
+      return verificationTypeForDescriptor(component);
+    }
+  }
+  return objectType('java/lang/Object');
+}
+
 function descriptorParameters(descriptor) {
   const result = [];
   const end = descriptor.indexOf(')');
@@ -183,9 +198,9 @@ function transfer(instruction, input, index, classIr) {
     pop(frame);
     frame.stack.push(INTEGER);
   } else if (/^[ialfdbcs]aload$/.test(opcode)) {
-    pop(frame, 2);
+    const [, arrayRef] = pop(frame, 2);
     const types = { iaload: INTEGER, baload: INTEGER, caload: INTEGER, saload: INTEGER, laload: LONG, faload: FLOAT, daload: DOUBLE };
-    if (opcode === 'aaload') frame.stack.push(objectType('java/lang/Object'));
+    if (opcode === 'aaload') frame.stack.push(arrayComponentType(arrayRef));
     else frame.stack.push(types[opcode]);
   } else if (/^[ialfdbcs]astore$/.test(opcode)) pop(frame, 3);
   else if (opcode === 'getstatic') pushDescriptor(frame, memberDescriptor(instruction));
@@ -316,7 +331,10 @@ function computeStackMapFrames(method, classIr) {
       && !structuralTargets.has(index + 1)) targets.add(index + 1);
   });
   targets.delete(undefined);
-  targets.delete(0);
+  // The implicit frame at offset 0 covers entry by fallthrough only. When a
+  // branch or handler actually targets offset 0 the verifier demands a real
+  // entry there ("Expecting a stackmap frame at branch target 0"), so keep it.
+  if (!structuralTargets.has(0)) targets.delete(0);
   if (!targets.size) return [];
 
   const declared = declaredLocalTypes(method);
@@ -338,41 +356,81 @@ function computeStackMapFrames(method, classIr) {
       if (!queued.has(index)) { queue.push(index); queued.add(index); }
     }
   };
-  while (queue.length) {
-    const index = queue.shift();
-    queued.delete(index);
-    const input = inputs[index];
-    const instruction = instructions[index];
-    const output = transfer(instruction, input, index, classIr);
-    const opcode = instruction.opcode;
-    if (/^if/.test(opcode)) {
-      enqueue(labels.get(String(instruction.operands[0])), output);
-      enqueue(index + 1, output);
-    } else if (opcode === 'lookupswitch') {
-      enqueue(labels.get(String(instruction.defaultLabel)), output);
-      for (const pair of instruction.pairs || []) {
-        const label = Array.isArray(pair) ? pair[1] : pair && (pair.label || pair.lbl);
-        enqueue(labels.get(String(label)), output);
+  const RETURN_OPCODES = ['return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow'];
+  const drain = () => {
+    while (queue.length) {
+      const index = queue.shift();
+      queued.delete(index);
+      const input = inputs[index];
+      const instruction = instructions[index];
+      const output = transfer(instruction, input, index, classIr);
+      const opcode = instruction.opcode;
+      if (/^if/.test(opcode)) {
+        enqueue(labels.get(String(instruction.operands[0])), output);
+        enqueue(index + 1, output);
+      } else if (opcode === 'lookupswitch') {
+        enqueue(labels.get(String(instruction.defaultLabel)), output);
+        for (const pair of instruction.pairs || []) {
+          const label = Array.isArray(pair) ? pair[1] : pair && (pair.label || pair.lbl);
+          enqueue(labels.get(String(label)), output);
+        }
+      } else if (opcode === 'goto') {
+        enqueue(labels.get(String(instruction.operands[0])), output);
+      } else if (!RETURN_OPCODES.includes(opcode)) {
+        enqueue(index + 1, output);
       }
-      if (!structuralTargets.has(index + 1)) enqueue(index + 1, output);
-    } else if (opcode === 'goto') {
-      enqueue(labels.get(String(instruction.operands[0])), output);
-      if (!structuralTargets.has(index + 1)) enqueue(index + 1, output);
-    } else if (['return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow'].includes(opcode)) {
-      if (!structuralTargets.has(index + 1)) enqueue(index + 1, output);
-    } else if (!['return', 'ireturn', 'lreturn', 'freturn', 'dreturn', 'areturn', 'athrow'].includes(opcode)) {
-      enqueue(index + 1, output);
-    }
-    for (const entry of method.exceptionTable || []) {
-      const start = labels.get(entry.startLabel);
-      const end = labels.get(entry.endLabel);
-      if (start != null && end != null && index >= start && index < end) {
-        const handler = cloneFrame(input);
-        handler.stack = [objectType(entry.catchType && entry.catchType !== 'any' ? entry.catchType : 'java/lang/Throwable')];
-        enqueue(labels.get(entry.handlerLabel), handler);
+      for (const entry of method.exceptionTable || []) {
+        const start = labels.get(entry.startLabel);
+        const end = labels.get(entry.endLabel);
+        if (start != null && end != null && index >= start && index < end) {
+          const handler = cloneFrame(input);
+          handler.stack = [objectType(entry.catchType && entry.catchType !== 'any' ? entry.catchType : 'java/lang/Throwable')];
+          enqueue(labels.get(entry.handlerLabel), handler);
+        }
       }
     }
+  };
+
+  drain();
+
+  // Control does not fall out of a goto, a switch, or a return, so whatever sits
+  // after one is unreachable unless something branches to it. Such code still
+  // has to satisfy the verifier - it scans linearly and demands a frame wherever
+  // control cannot fall in, then type-checks any branch it finds there against
+  // that target's frame. Carrying the dead instructions therefore means keeping
+  // them consistent with live code, and they are not: a dead `goto` into a live
+  // join contradicted the join's own frame. Giving them a state derived from the
+  // preceding instruction instead was worse, because that state then merged into
+  // live joins and erased locals every real path assigns. So drop them the way a
+  // real compiler does - each dead run becomes nops ending in athrow, which needs
+  // exactly one frame, branches nowhere, and cannot fall into the live
+  // instruction that follows.
+  let replacedDeadCode = false;
+  for (let index = 0; index < instructions.length; index += 1) {
+    if (inputs[index]) continue;
+    const start = index;
+    while (index < instructions.length && !inputs[index]) index += 1;
+    const last = index - 1;
+    for (let dead = start; dead <= last; dead += 1) {
+      instructions[dead].opcode = dead === last ? 'athrow' : 'nop';
+      instructions[dead].operands = [];
+      delete instructions[dead].pairs;
+      delete instructions[dead].defaultLabel;
+    }
+    // The run keeps the locals of the instruction it follows rather than an
+    // empty frame: a dead run inside a try range is still checked against that
+    // range's handler, and the handler's frame already merges the preceding
+    // instruction's locals, so those are the ones guaranteed to be assignable.
+    // Only the locals matter there - a handler is always entered with just the
+    // exception on the stack.
+    inputs[start] = {
+      locals: (inputs[start - 1].locals || []).map(cloneType),
+      stack: [objectType('java/lang/Throwable')],
+    };
+    targets.add(start);
+    replacedDeadCode = true;
   }
+  if (replacedDeadCode) method.maxStack = Math.max(method.maxStack || 0, 1);
   return [...targets].sort((a, b) => a - b).filter((index) => inputs[index]).map((index) => ({
     label: instructions[index].label || `L${index}`,
     locals: frameLocalsForAttribute(inputs[index].locals),

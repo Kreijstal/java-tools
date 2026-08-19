@@ -836,12 +836,26 @@ function emitValue(value, state) {
       : (value.invokeKind === 'special' ? 'invokespecial' : (value.invokeKind === 'interface' ? 'invokeinterface' : 'invokevirtual'));
     const referenceKind = opcode === 'invokeinterface' || value.invokeKind === 'staticInterface' ? 'InterfaceMethod' : 'Method';
     const fields = opcode === 'invokeinterface' ? { count: String(1 + parameterSlotCount(value.descriptor)) } : {};
-    state.instructions.push(createJvmInstruction(opcode, [referenceKind, value.owner, value.name, value.descriptor], fields));
+    const owner = opcode === 'invokevirtual' ? virtualCallOwner(value) : value.owner;
+    state.instructions.push(createJvmInstruction(opcode, [referenceKind, owner, value.name, value.descriptor], fields));
     const stack = value.type === 'V' ? 0 : slotWidthFromDescriptor(value.type);
     state.maxStack = Math.max(state.maxStack, argStack, stack);
     return { descriptor: value.type, stack };
   }
   return null;
+}
+
+// These are final in java.lang.Object, so no type can redeclare them and the
+// reference is always to Object itself - which is also the only legal form when
+// the receiver is an interface, since a Methodref naming an interface is an
+// IncompatibleClassChangeError. javac emits `java/lang/Object.getClass` here too.
+const FINAL_OBJECT_METHODS = new Set(['getClass()Ljava/lang/Class;', 'notify()V', 'notifyAll()V',
+  'wait()V', 'wait(J)V', 'wait(JI)V']);
+
+function virtualCallOwner(value) {
+  return FINAL_OBJECT_METHODS.has(`${value.name}${value.descriptor}`)
+    ? 'java/lang/Object'
+    : value.owner;
 }
 
 function falseBranchOpcodeForCompare(value, descriptor) {
@@ -1113,7 +1127,20 @@ function emitConditionalValue(value, state) {
 }
 
 
-function defaultConstructorMethod(classIr) {
+// JLS 8.8.9: the default constructor takes the access modifier of the class it
+// belongs to - an enum's is always private. Hardcoding `public` handed every
+// package-private class a constructor anyone could call, which is a wider ABI
+// than the source declares.
+function defaultConstructorAccess(classAccess) {
+  const access = classAccess || [];
+  if (access.includes('enum')) return ['private'];
+  for (const modifier of ['public', 'protected', 'private']) {
+    if (access.includes(modifier)) return [modifier];
+  }
+  return [];
+}
+
+function defaultConstructorMethod(classIr, declarationLine = null) {
   const instructions = [
     createJvmInstruction('aload_0'),
     createJvmInstruction('invokespecial', ['Method', classIr.superName || 'java/lang/Object', '<init>', '()V']),
@@ -1130,11 +1157,16 @@ function defaultConstructorMethod(classIr) {
     maxStack = Math.max(maxStack, 1 + value.stack, 1 + state.maxStack);
   }
   instructions.push(createJvmInstruction('return'));
+  // javac attributes the synthesised body to the class declaration line, so a
+  // stack trace through an implicit constructor still points somewhere.
+  if (typeof declarationLine === 'number') {
+    for (const instruction of instructions) instruction.sourceLine = declarationLine;
+  }
   return createJvmBytecodeMethod({
     kind: 'Constructor',
     name: '<init>',
     descriptor: '()V',
-    access: ['public'],
+    access: defaultConstructorAccess(classIr.access),
     maxStack,
     maxLocals: 1,
     returnDescriptor: 'V',
@@ -1850,7 +1882,10 @@ function javaIrToJvmBytecodeIr(javaIr, options = {}) {
       methods,
     });
     if (!hasConstructor && !(bytecodeClass.access || []).includes('interface')) {
-      bytecodeClass.methods.unshift(defaultConstructorMethod(bytecodeClass));
+      bytecodeClass.methods.unshift(defaultConstructorMethod(
+        bytecodeClass,
+        classIr.meta ? classIr.meta.declarationLine : null,
+      ));
     }
     const clinit = methods.some((method) => method.name === '<clinit>') ? null : staticInitializerMethod(bytecodeClass);
     if (clinit) bytecodeClass.methods.push(clinit);

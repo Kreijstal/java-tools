@@ -16,8 +16,83 @@ const {
   jreClassInfo,
   jreFieldInfo,
   jreInternalNameForSimpleName,
+  JAVA_LANG_TYPES,
   jreMethodCandidates,
+  jreClassExists,
+  jreClassDeclaresMethods,
 } = require('./jreMetadata');
+
+// A wildcard import names a package, not a class, so the members cannot be
+// enumerated up front - and skipping it entirely left `new ObjectOutputStream()`
+// under `import java.io.*` resolving to the default package, which emits a class
+// reference that exists nowhere and dies at runtime rather than at compile time.
+// Resolution stays lazy and only fires once every stronger binding (a class in
+// this compilation, a single-type import, java.lang) has missed, which is the
+// order JLS 6.5.5 requires. An ambiguous name that two wildcard packages could
+// both supply is left unresolved rather than guessed.
+class ClassBySimpleNameMap extends Map {
+  constructor(entries, wildcardPackages) {
+    super(entries);
+    this.wildcardPackages = wildcardPackages || [];
+  }
+
+  resolveWildcard(key) {
+    if (typeof key !== 'string' || key.includes('.') || key.includes('/')) return null;
+    if (!this.wildcardPackages.length) return null;
+    const candidates = this.wildcardPackages.map((packageName) => `${packageName}/${key}`);
+    const known = candidates.filter((candidate) => jreClassExists(candidate));
+    if (known.length === 1) return known[0];
+    // The JRE metadata is a partial model of the JDK, so a miss is not proof the
+    // class is absent - java.io.ObjectOutputStream is real and simply unmodelled.
+    // Accepting an unverified candidate needs a second signal, or every unbound
+    // identifier under a wildcard import becomes a type: local names like `var4`
+    // were resolving to `java/io/var4` and derailing the lowering of the
+    // statements that used them. An initial capital is that signal - weak as a
+    // language rule, but exact on this corpus, where every declared type is
+    // lowercase and every JDK type referenced by simple name is capitalised.
+    // Only a candidate the JRE model actually knows is accepted. Guessing at an
+    // unmodelled one looked attractive - java.io.ObjectOutputStream is real and
+    // simply missing - but a simple name reaches here from qualified references
+    // too, so `jagdx.D3DCAPS` had its last segment claimed as `java/util/D3DCAPS`
+    // and four classes stopped compiling. An unmodelled JDK class is a gap in the
+    // model, and the repair belongs in src/jre, not in a guess here.
+    return null;
+  }
+
+  get(key) {
+    if (super.has(key)) return super.get(key);
+    return this.resolveWildcard(key) || undefined;
+  }
+
+  has(key) {
+    return super.has(key) || Boolean(this.resolveWildcard(key));
+  }
+}
+
+function wildcardImportPackages(document) {
+  const packages = [];
+  for (const importDeclaration of (document && document.root && document.root.imports) || []) {
+    if (!importDeclaration.isWildcard || importDeclaration.isStatic) continue;
+    const parts = importDeclaration.name && importDeclaration.name.parts;
+    if (!Array.isArray(parts) || !parts.length) continue;
+    packages.push(parts.join('/'));
+  }
+  return packages;
+}
+
+// Diagnostic for whole-game builds: a fabricated descriptor is a guess built
+// from the call site because no model of the owner carries the name. On a JRE
+// owner that is refused outright (see lowerStatementOnlyInstanceCall); on a user
+// class it is legitimate but still worth auditing, because a wrong guess links
+// cleanly and only fails when the call runs. Set JAVA_FRONTEND_FABRICATION_LOG
+// to a path to collect them; unset, this costs one property read per call.
+function recordFabricatedDescriptor(owner, name, descriptor) {
+  if (!process.env.JAVA_FRONTEND_FABRICATION_LOG) return;
+  try {
+    require('fs').appendFileSync(process.env.JAVA_FRONTEND_FABRICATION_LOG,
+      `${jreClassExists(owner) && jreClassDeclaresMethods(owner) ? 'JRE' : 'USER'}\t${owner}\t${name}\t${descriptor}\n`);
+  } catch (error) { /* survey only */ }
+}
 
 const JAVA_IR_SCHEMA_ID = 'java-tools.java-frontend.java-ir';
 const JAVA_IR_SCHEMA_VERSION = 1;
@@ -252,14 +327,12 @@ function classTypeInternalName(type, context = {}) {
     }
     return direct;
   }
-  if ([
-    'ArithmeticException', 'ArrayIndexOutOfBoundsException', 'Boolean', 'Byte',
-    'AutoCloseable', 'Character', 'Class', 'ClassCastException', 'Comparable', 'Double', 'Exception',
-    'Float', 'IllegalArgumentException', 'Integer', 'Iterable', 'Long', 'Math',
-    'InterruptedException', 'NegativeArraySizeException', 'NullPointerException', 'Object', 'RuntimeException',
-    'Runnable', 'Short', 'StackOverflowError', 'String', 'StringBuilder', 'System', 'Thread',
-    'Throwable', 'UnsupportedOperationException', 'Void',
-  ].includes(type.name)) {
+  // A class in the compilation unit's own package shadows the implicit
+  // java.lang import (JLS 6.4.1), so the corpus is consulted first here.
+  if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
+    return context.classBySimpleName.get(type.name);
+  }
+  if (JAVA_LANG_TYPES.has(type.name)) {
     return `java/lang/${type.name}`;
   }
   if ([
@@ -269,9 +342,6 @@ function classTypeInternalName(type, context = {}) {
   if (type.name === 'ReentrantLock') return 'java/util/concurrent/locks/ReentrantLock';
   if (type.name === 'Function') return 'java/util/function/Function';
   if (['Array', 'Field', 'Method', 'Modifier'].includes(type.name)) return `java/lang/reflect/${type.name}`;
-  if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
-    return context.classBySimpleName.get(type.name);
-  }
   const jreInternalName = jreInternalNameForSimpleName(type.name);
   if (jreInternalName) return jreInternalName;
   return String(type.name).replace(/\./g, '/');
@@ -282,6 +352,19 @@ function internalNameFromDescriptor(descriptor) {
     return descriptor.slice(1, -1);
   }
   return 'java/lang/Object';
+}
+
+// `int[].clone()` is a public member of the array type, while `Object.clone()` is
+// protected - an invokevirtual naming Object from an unrelated class is an
+// IllegalAccessError at resolution, which only shows up when the call runs. javac
+// emits the array descriptor as the owner for clone and java/lang/Object for
+// everything else an array inherits, and this follows it.
+function instanceCallOwner(receiverType, name, args) {
+  if (name === 'clone' && (args || []).length === 0
+      && typeof receiverType === 'string' && receiverType.startsWith('[')) {
+    return receiverType;
+  }
+  return internalNameFromDescriptor(receiverType);
 }
 
 function chainParts(expression) {
@@ -309,7 +392,27 @@ function resolveClassInternalNameFromParts(parts, context = {}) {
     return context.classBySimpleName.get(last);
   }
   if (normalized.length === 1) return constructorOwnerFromName(normalized[0], context);
+  // `vc.field_m.a(...)` is a call on a static field, not a static call on a class
+  // nested in - or in a package named after - `vc`. Either guess produces an owner
+  // (`vc/field_m`, `Vc$field_m`) that resolves to nothing, and the guessed return
+  // type then picked a `wk` constructor that does not exist either. This has to
+  // come before both guesses: obfuscated games only ever hit the package form,
+  // but an ordinary capitalised class name reaches the nested form with the same
+  // fabricated owner.
+  const headOwner = context.classBySimpleName && context.classBySimpleName.get(normalized[0]);
+  const headFields = headOwner && context.classFieldsByInternalName
+    && context.classFieldsByInternalName.get(headOwner);
+  if (headFields && headFields.has(normalized[1])) return null;
   if (/^[A-Z]/.test(normalized[0])) return `${normalized[0]}$${normalized.slice(1).join('$')}`;
+  // `java.net.Proxy.Type.DIRECT` reads a static field of a *nested* class, whose
+  // binary name is java/net/Proxy$Type. The package-join guess java/net/Proxy/Type
+  // names nothing, so the getstatic resolves to nothing the first time it runs.
+  // Take the longest prefix the JRE model carries and attach the remainder with `$`.
+  for (let split = normalized.length - 1; split >= 1; split -= 1) {
+    if (!jreClassExists(normalized.slice(0, split).join('/'))) continue;
+    const nested = `${normalized.slice(0, split).join('/')}$${normalized.slice(split).join('$')}`;
+    if (jreClassExists(nested)) return nested;
+  }
   return normalized.join('/');
 }
 
@@ -353,6 +456,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
     classMethodOverloadsByInternalName: new Map(),
     classSuperByInternalName: new Map(),
     classInterfacesByInternalName: new Map(),
+    classIsInterfaceByInternalName: new Map(),
   };
   let files = [];
   function collectJavaFiles(current, out = []) {
@@ -397,7 +501,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
     for (const declaration of document.root.typeDeclarations || []) collectNames(document, declaration);
   }
   function documentImportMap(document) {
-    const map = new Map(metadata.classBySimpleName);
+    const map = new ClassBySimpleNameMap(metadata.classBySimpleName, wildcardImportPackages(document));
     for (const importDeclaration of document.root.imports || []) {
       if (importDeclaration.isStatic || importDeclaration.isWildcard) continue;
       const parts = importDeclaration.name && importDeclaration.name.parts;
@@ -431,6 +535,9 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
       (isInterface ? (declaration.extendsTypes || []) : (declaration.implementsTypes || []))
         .map((type) => classTypeInternalName(type, classTypeContext)),
     );
+    // Whether the receiver's own type is an interface is what picks
+    // invokeinterface over invokevirtual - not where the method was declared.
+    metadata.classIsInterfaceByInternalName.set(internalName, isInterface);
     const fields = new Map();
     const methods = new Map();
     const overloads = new Map();
@@ -1753,7 +1860,7 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
           ? lowerLambdaToJavaIrValue({ kind: 'UnsupportedExpression', tokens: part }, 'Ljava/util/function/Function;', context)
           : null));
     if (!receiver || !args.every(Boolean)) break;
-    const owner = internalNameFromDescriptor(receiver.type);
+    const owner = instanceCallOwner(receiver.type, name, args);
     const method = methodDescriptorForInstanceCall(owner, name, args, context);
     const callArgs = prepareMethodArguments(method, args);
     if (method && callArgs) {
@@ -2223,6 +2330,11 @@ function lowerTokenExpressionToJavaIrValue(tokens, context) {
 }
 
 function methodDescriptorForInstanceCall(owner, name, args, context) {
+  // An array type owns exactly one method of its own; the rest it inherits from
+  // Object and is named through Object (see instanceCallOwner).
+  if (typeof owner === 'string' && owner.startsWith('[') && name === 'clone' && args.length === 0) {
+    return { descriptor: '()Ljava/lang/Object;', returnDescriptor: 'Ljava/lang/Object;', parameterDescriptors: [] };
+  }
   if (owner === 'java/lang/invoke/MethodHandle' && name === 'invoke') {
     const parameterDescriptors = args.map((arg) => {
       if (arg && typeof arg.type === 'string' && (arg.type.startsWith('L') || arg.type.startsWith('['))) {
@@ -2488,7 +2600,10 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
       descriptor: hierarchyExact.descriptor,
       returnDescriptor: hierarchyExact.returnDescriptor,
       parameterDescriptors: hierarchyExact.parameterDescriptors,
-      invokeKind: undefined,
+      // Inherited from a supertype, so the declaring type's own kind says
+      // nothing; an interface method reached through a superinterface is still
+      // an interface call.
+      invokeKind: ownerIsInterface(owner, context) ? 'interface' : undefined,
       isVarargs: hierarchyExact.isVarargs,
     };
   }
@@ -2500,7 +2615,9 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
         descriptor: inheritedExact.descriptor,
         returnDescriptor: inheritedExact.returnDescriptor,
         parameterDescriptors: inheritedExact.parameterDescriptors,
-        invokeKind: inheritedExact.declaredOwner === owner ? inheritedExact.invokeKind : undefined,
+        invokeKind: inheritedExact.declaredOwner === owner
+          ? inheritedExact.invokeKind
+          : (ownerIsInterface(owner, context) ? 'interface' : undefined),
         isVarargs: inheritedExact.isVarargs,
       };
     }
@@ -2513,6 +2630,24 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
       parameterDescriptors: overload.parameterDescriptors,
       invokeKind: overload.invokeKind,
       isVarargs: overload.isVarargs,
+    };
+  }
+  // A class reaches its inherited overloads through the superOwner recursion
+  // below, but an interface has no superclass - its supertypes are in
+  // classInterfacesByInternalName - so `ntb extends tv` never found tv's
+  // `a(byte, tv)` when the argument was an `ntb` and needed widening. The call
+  // then fell through to a descriptor built from the argument types,
+  // `a(byte, ntb)`, which resolves to nothing.
+  const hierarchyOverload = selectUserMethodDescriptorInHierarchy(owner, name, args, context, false);
+  if (hierarchyOverload) {
+    return {
+      descriptor: hierarchyOverload.descriptor,
+      returnDescriptor: hierarchyOverload.returnDescriptor,
+      parameterDescriptors: hierarchyOverload.parameterDescriptors,
+      invokeKind: hierarchyOverload.declaredOwner === owner
+        ? hierarchyOverload.invokeKind
+        : (ownerIsInterface(owner, context) ? 'interface' : undefined),
+      isVarargs: hierarchyOverload.isVarargs,
     };
   }
   if (superOwner && superOwner !== owner) {
@@ -2717,6 +2852,49 @@ function isJreVarargsMethod(owner, name, descriptor, isStatic) {
       && descriptor === '([Ljava/lang/Object;)Ljava/util/List;'))));
 }
 
+// A method-invocation conversion never narrows: `new Socket(host, port)` with a
+// String host cannot select `Socket(InetAddress,int)`. The descriptor fallbacks
+// below accept any reference-to-reference pair, because coerceValueToDescriptor
+// answers them with a checkcast - and that checkcast is a guaranteed
+// ClassCastException the first time the call runs, which nothing short of running
+// the code will reveal.
+//
+// The check is deliberately one-sided. src/jre models a subset of the JDK, and
+// their `interfaces` lists are the incomplete part (StringBuilder does not list
+// CharSequence, Integer does not list Comparable) while `super` has to be right
+// for the runtime to work at all. So only a narrowing to a *class* is refused;
+// anything involving an interface, an array, or a type the model does not carry
+// stays assignable, which keeps every conversion that used to compile.
+function jreNarrowsToUnrelatedClass(source, target) {
+  if (source === target) return false;
+  if (typeof source !== 'string' || typeof target !== 'string') return false;
+  if (!source.startsWith('L') || !target.startsWith('L')) return false;
+  if (target === 'Ljava/lang/Object;') return false;
+  const sourceName = source.slice(1, -1);
+  const targetName = target.slice(1, -1);
+  const targetInfo = jreClassInfo(targetName);
+  if (!targetInfo || targetInfo.isInterface) return false;
+  if (!jreClassInfo(sourceName)) return false;
+  const seen = new Set();
+  let current = sourceName;
+  while (current && !seen.has(current)) {
+    if (current === targetName) return false;
+    seen.add(current);
+    const info = jreClassInfo(current);
+    // An ancestor the model does not carry could still be the target; without it
+    // the types cannot be proven unrelated, so do not refuse.
+    if (!info) return false;
+    current = info.superName;
+  }
+  return true;
+}
+
+function jreCandidateNarrowsAnyArgument(parameterDescriptors, args) {
+  if (!Array.isArray(parameterDescriptors)) return false;
+  return args.some((arg, index) => arg && arg.literalKind !== 'null'
+    && jreNarrowsToUnrelatedClass(arg.type, parameterDescriptors[index]));
+}
+
 function selectJreMethodDescriptor(owner, name, args, isStatic) {
   if (isStatic && owner === 'java/util/Optional' && name === 'empty' && args.length === 0) {
     return { descriptor: '()Ljava/util/Optional;', returnDescriptor: 'Ljava/util/Optional;', parameterDescriptors: [], isStatic: true };
@@ -2760,8 +2938,10 @@ function selectJreMethodDescriptor(owner, name, args, isStatic) {
       && args.every((arg, index) => arg && arg.type === parameters[index]);
   });
   const method = exact
-    || candidatesWithParameters.find((candidate) => methodMatchesArguments(candidate, args, isStatic))
-    || candidates.find((candidate) => methodDescriptorMatchesArgs(candidate.descriptor, args));
+    || candidatesWithParameters.find((candidate) => methodMatchesArguments(candidate, args, isStatic)
+      && !jreCandidateNarrowsAnyArgument(candidate.parameterDescriptors, args))
+    || candidates.find((candidate) => methodDescriptorMatchesArgs(candidate.descriptor, args)
+      && !jreCandidateNarrowsAnyArgument(parameterDescriptorsFromMethodDescriptor(candidate.descriptor), args));
   if (!method) return null;
   return {
     descriptor: method.descriptor,
@@ -3219,6 +3399,7 @@ function createCapturedClassConstructor(classContext, captures) {
     classFieldsByInternalName: classContext.classFieldsByInternalName,
     classSuperByInternalName: classContext.classSuperByInternalName,
     classInterfacesByInternalName: classContext.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: classContext.classIsInterfaceByInternalName,
     typeParameters: classContext.typeParameters,
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
@@ -4458,7 +4639,7 @@ function lowerInstanceMethodCall(expression, context, receiverOverride = null) {
     };
   }
   if (!receiver || !args.every(Boolean)) return null;
-  let owner = internalNameFromDescriptor(receiver.type);
+  let owner = instanceCallOwner(receiver.type, expression.name, args);
   let method = contextualMethod || methodDescriptorForInstanceCall(owner, expression.name, args, context);
   if (!method && isCurrentThisExpression(expression.target)) {
     const inherited = methodDescriptorForInheritedInstanceCall(expression.name, args, context);
@@ -4519,24 +4700,52 @@ function lowerInheritedInstanceMethodCall(expression, context) {
   };
 }
 
+// invokevirtual against an interface is an IncompatibleClassChangeError, so what
+// picks the opcode is whether the receiver's own type is an interface - not
+// where the method happens to be declared. `java/awt/image/ImageConsumer` had no
+// model at all, and `eb extends ura` inherited `a(tu,int)` from a superinterface;
+// both were emitted as virtual and both blew up at run time.
+function ownerIsInterface(owner, context) {
+  if (context && context.classIsInterfaceByInternalName
+      && context.classIsInterfaceByInternalName.has(owner)) {
+    return Boolean(context.classIsInterfaceByInternalName.get(owner));
+  }
+  const classInfo = jreClassInfo(owner);
+  return Boolean(classInfo && classInfo.isInterface);
+}
+
+function unresolvedInvokeKind(owner, context) {
+  return ownerIsInterface(owner, context) ? 'interface' : 'virtual';
+}
+
 function lowerStatementOnlyInstanceCall(expression, context) {
   if (!expression || expression.kind !== 'MethodInvocationExpression' || !expression.target) return null;
   const receiver = lowerExpressionToJavaIrValue(expression.target, context);
   const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
   if (!receiver || !args.every(Boolean)) return null;
-  const owner = internalNameFromDescriptor(receiver.type);
+  const owner = instanceCallOwner(receiver.type, expression.name, args);
   const method = methodDescriptorForInstanceCall(owner, expression.name, args, context);
   const callArgs = method && method.parameterDescriptors
     ? prepareMethodArguments(method, args) || args.map((arg, index) => coerceValueToDescriptor(arg, method.parameterDescriptors[index]))
     : args;
   if (!callArgs.every(Boolean)) return null;
+  if (!method) {
+    recordFabricatedDescriptor(owner, expression.name, `(${callArgs.map((arg) => arg.type).join('')})V`);
+    // A JDK class is closed: a name the model does not carry cannot be added by
+    // this compilation, so a descriptor built from the call site is a guess, and
+    // a wrong guess links cleanly and then throws NoSuchMethodError the first
+    // time the call runs. `java/util/Hashtable.remove(Ljava/lang/Thread;)V` is
+    // what that looks like. Refusing here turns it into a compile error, where a
+    // missing method is visible as a gap in src/jre instead of a crash in a game.
+    if (jreClassExists(owner) && jreClassDeclaresMethods(owner)) return null;
+  }
   return {
     kind: 'MethodCallValue',
     type: method ? method.returnDescriptor : 'V',
     owner,
     name: expression.name,
     descriptor: method ? method.descriptor : `(${callArgs.map((arg) => arg.type).join('')})V`,
-    invokeKind: method && method.invokeKind ? method.invokeKind : 'virtual',
+    invokeKind: method && method.invokeKind ? method.invokeKind : unresolvedInvokeKind(owner, context),
     receiver,
     args: callArgs,
   };
@@ -4853,6 +5062,20 @@ function methodInvocationWithoutLeadingBang(expression) {
   return targetWithoutBang ? { ...expression, target: targetWithoutBang } : null;
 }
 
+// Recovering a call from the type its context wants is only sound when nothing
+// better is known about the callee. When the owner is a class we have read, its
+// declaration wins: fabricating `(...)I` for a method the source declares as
+// `(...)[B` produces a reference that resolves to nothing, and the caller that
+// asked for the wrong type is usually an overload candidate that should simply
+// have been rejected.
+function contradictsDeclaredReturn(owner, name, args, context, isStatic, expectedDescriptor) {
+  if (!owner || !context.classMethodOverloadsByInternalName
+    || !context.classMethodOverloadsByInternalName.has(owner)) return false;
+  const declared = selectUserMethodDescriptor(owner, name, args, context, isStatic);
+  return Boolean(declared && declared.returnDescriptor
+    && declared.returnDescriptor !== expectedDescriptor);
+}
+
 function lowerMethodInvocationWithExpectedDescriptor(expression, context, expectedDescriptor) {
   if (!expression || expression.kind !== 'MethodInvocationExpression' || !expectedDescriptor || expectedDescriptor === 'V') return null;
   const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
@@ -4870,6 +5093,7 @@ function lowerMethodInvocationWithExpectedDescriptor(expression, context, expect
     if (targetParts.length > 0 && !targetIsLocal && !targetIsField) {
       const owner = resolveClassInternalNameFromParts(targetParts, context);
       if (owner) {
+        if (contradictsDeclaredReturn(owner, expression.name, args, context, true, expectedDescriptor)) return null;
         return {
           kind: 'MethodCallValue',
           type: expectedDescriptor,
@@ -4884,10 +5108,12 @@ function lowerMethodInvocationWithExpectedDescriptor(expression, context, expect
     }
     const receiver = lowerExpressionToJavaIrValue(expression.target, context);
     if (receiver) {
+      const receiverOwner = instanceCallOwner(receiver.type, expression.name, args);
+      if (contradictsDeclaredReturn(receiverOwner, expression.name, args, context, false, expectedDescriptor)) return null;
       return {
         kind: 'MethodCallValue',
         type: expectedDescriptor,
-        owner: internalNameFromDescriptor(receiver.type),
+        owner: instanceCallOwner(receiver.type, expression.name, args),
         name: expression.name,
         descriptor: `(${args.map((arg) => arg.type).join('')})${expectedDescriptor}`,
         invokeKind: 'virtual',
@@ -4899,6 +5125,8 @@ function lowerMethodInvocationWithExpectedDescriptor(expression, context, expect
     return null;
   }
   const owner = context.currentMethodIsStatic ? context.classInternalName : context.classInternalName;
+  if (contradictsDeclaredReturn(owner, expression.name, args, context,
+    context.currentMethodIsStatic ? true : null, expectedDescriptor)) return null;
   return {
     kind: 'MethodCallValue',
     type: expectedDescriptor,
@@ -5077,14 +5305,29 @@ function lowerExpressionToJavaIrValue(expression, context) {
     const constructorOverloads = owner && context.classMethodOverloadsByInternalName
       && context.classMethodOverloadsByInternalName.get(owner);
     const constructorCandidates = constructorOverloads && constructorOverloads.get('<init>');
-    const contextualConstructor = Array.isArray(constructorCandidates)
-      ? constructorCandidates.find((candidate) => candidate.parameterDescriptors.length
-        === captureArgs.length + (expression.arguments || []).length) : null;
+    // Lowering an argument *as* a parameter descriptor rewrites it: an explicit
+    // `(ca) null` comes back typed as whatever the parameter is. Picking the
+    // contextual constructor by arity alone therefore let a same-arity overload
+    // that happens to be declared first retype the arguments, and the descriptor
+    // built from them named a constructor that does not exist - `ok(String,el,Z)`
+    // where the class declares `ok(String,el,ca)` and `ok(String,ca,boolean)`.
+    // Rank properly whenever the arguments carry their own types; the arity guess
+    // is only needed for arguments that cannot be lowered without an expected
+    // type, which is lambdas and bare array initializers.
+    const standaloneArgs = (expression.arguments || [])
+      .map((argument) => lowerExpressionToJavaIrValue(argument, context));
+    const rankedConstructor = standaloneArgs.every(Boolean)
+      ? selectUserMethodDescriptor(owner, '<init>', captureArgs.concat(standaloneArgs), context, false)
+      : null;
+    const contextualConstructor = rankedConstructor
+      || (Array.isArray(constructorCandidates)
+        ? constructorCandidates.find((candidate) => candidate.parameterDescriptors.length
+          === captureArgs.length + (expression.arguments || []).length) : null);
     const args = (expression.arguments || []).map((argument, index) => {
       const expected = contextualConstructor
         && contextualConstructor.parameterDescriptors[captureArgs.length + index];
       return (expected && lowerExpressionToJavaIrValueAsDescriptor(argument, context, expected))
-        || lowerExpressionToJavaIrValue(argument, context)
+        || standaloneArgs[index]
         || (expected && lowerLambdaToJavaIrValue(argument, expected, context));
     });
     if (!owner || !args.every(Boolean) || !captureArgs.every(Boolean)) return null;
@@ -5133,7 +5376,7 @@ function lowerExpressionToJavaIrValue(expression, context) {
       && !['ThisExpression', 'SuperExpression'].includes(expression.target.kind)) {
     const receiver = lowerExpressionToJavaIrValue(expression.target, context);
     const args = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
-    const owner = receiver && internalNameFromDescriptor(receiver.type);
+    const owner = receiver && instanceCallOwner(receiver.type, expression.name, args);
     if (receiver && owner && args.every(Boolean)) {
       const method = methodDescriptorForInstanceCall(owner, expression.name, args, context);
       const callArgs = prepareMethodArguments(method, args);
@@ -5774,12 +6017,22 @@ function coerceValueToDescriptor(value, descriptor) {
     };
   }
   if (value.kind === 'ArrayInitializerValue' && descriptor.startsWith('[')) {
+    // A bare `{1, 2}` carries no type of its own and takes the target's, but an
+    // initializer that came from `new rg[]{...}` already has one. Retyping that
+    // to an unrelated array - which overload resolution used to ask for, having
+    // picked a same-arity `rg(int[])` over `rg(rg[])` by declaration order - is
+    // not a coercion, so the mismatch has to be reported rather than papered
+    // over. Reference-to-reference stays legal: array covariance is real Java.
+    const primitiveComponent = (arrayDescriptor) => !/^[L[]/.test(arrayComponentDescriptor(arrayDescriptor));
+    if (value.type && value.type !== descriptor
+        && (primitiveComponent(value.type) || primitiveComponent(descriptor))) return null;
     const component = arrayComponentDescriptor(descriptor);
-    return {
-      ...value,
-      type: descriptor,
-      elements: (value.elements || []).map((element) => coerceValueToDescriptor(element, component)),
-    };
+    const elements = (value.elements || []).map((element) => coerceValueToDescriptor(element, component));
+    // An element that will not coerce means the whole initializer will not; the
+    // holes used to survive all the way to emission, where they surfaced as an
+    // "unsupported static field store".
+    if (!elements.every(Boolean)) return null;
+    return { ...value, type: descriptor, elements };
   }
   if (value.kind === 'LiteralValue' && value.literalKind === 'number' && ['I', 'J', 'F', 'D'].includes(descriptor)) {
     return { ...value, type: descriptor };
@@ -6126,6 +6379,25 @@ function declareShadowingContextLocal(context, name, descriptor, sourceNodeId = 
   context.locals.push(local);
   context.localByName.set(name, local);
   return local;
+}
+
+// A block is a scope: a local it declares stops being visible when it ends, and
+// any outer name it shadowed becomes visible again. Without this, a local
+// declared in one `case { ... }` stayed bound for every later case, so a name
+// that Java resolves to a field there was read from a dead local slot instead -
+// the frame at the switch head has no such local, so the class fails to verify.
+// Slots are not reclaimed; only the name bindings are scoped.
+function withBlockScope(context, run) {
+  const bindings = context.localByName;
+  const inherited = new Map(bindings);
+  try {
+    return run();
+  } finally {
+    for (const name of [...bindings.keys()]) {
+      if (!inherited.has(name)) bindings.delete(name);
+    }
+    for (const [name, local] of inherited) bindings.set(name, local);
+  }
 }
 
 function opsEndAbruptly(ops) {
@@ -6651,7 +6923,8 @@ function lowerStatementToJavaIrOps(statement, context) {
 function lowerStatementToJavaIrOpsInner(statement, context) {
   if (!statement) return [];
   if (statement.kind === 'BlockStatement') {
-    return (statement.statements || []).flatMap((child) => lowerStatementToJavaIrOps(child, context));
+    return withBlockScope(context, () => (statement.statements || [])
+      .flatMap((child) => lowerStatementToJavaIrOps(child, context)));
   }
   if (statement.kind === 'UnsupportedStatement' && statement.reason === 'local-type-declaration') {
     const ops = lowerLocalClassDeclaration(statement, context);
@@ -7777,6 +8050,7 @@ function createEnumConstantSubclass(constant, index, classContext) {
   }
   classContext.classSuperByInternalName.set(internalName, classContext.classInternalName);
   classContext.classInterfacesByInternalName.set(internalName, []);
+  classContext.classIsInterfaceByInternalName.set(internalName, false);
   classContext.classMethodsByInternalName.set(internalName, methodByName);
   return subclass;
 }
@@ -8072,6 +8346,7 @@ function createStaticInitializerContext(classContext) {
     classFieldsByInternalName: classContext.classFieldsByInternalName,
     classSuperByInternalName: classContext.classSuperByInternalName,
     classInterfacesByInternalName: classContext.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: classContext.classIsInterfaceByInternalName,
     outerClassInternalName: classContext.outerClassInternalName,
     outerFieldByName: classContext.outerFieldByName,
     outerMethodByName: classContext.outerMethodByName,
@@ -8161,6 +8436,7 @@ function lowerMethodToJavaIr(method, classContext, slotBase = 0) {
     typeParameters,
     classSuperByInternalName: classContext.classSuperByInternalName,
     classInterfacesByInternalName: classContext.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: classContext.classIsInterfaceByInternalName,
     currentMethodName: method.kind === 'ConstructorDeclaration' ? '<init>' : method.name,
     currentMethodIsStatic: modifierNames(method.modifiers).includes('static'),
     currentReturnDescriptor,
@@ -8311,7 +8587,7 @@ function lowerAstToJavaIr(document, options = {}) {
   const syntheticClasses = [];
   const unsupported = [];
 
-  const classBySimpleName = new Map();
+  const classBySimpleName = new ClassBySimpleNameMap([], wildcardImportPackages(document));
   const internalNameByDeclaration = new Map();
   for (const importDeclaration of document.root.imports || []) {
     if (importDeclaration.isStatic || importDeclaration.isWildcard) continue;
@@ -8352,6 +8628,9 @@ function lowerAstToJavaIr(document, options = {}) {
   const classMethodOverloadsByInternalName = sourcePrelude ? cloneNestedMap(sourcePrelude.classMethodOverloadsByInternalName) : new Map();
   const classFieldsByInternalName = sourcePrelude ? cloneNestedMap(sourcePrelude.classFieldsByInternalName) : new Map();
   const classSuperByInternalName = sourcePrelude ? new Map(sourcePrelude.classSuperByInternalName) : new Map();
+  const classIsInterfaceByInternalName = sourcePrelude
+    ? new Map(sourcePrelude.classIsInterfaceByInternalName)
+    : new Map();
   const classInterfacesByInternalName = sourcePrelude
     ? new Map(Array.from(sourcePrelude.classInterfacesByInternalName, ([owner, interfaces]) => [owner, interfaces.slice()]))
     : new Map();
@@ -8441,6 +8720,7 @@ function lowerAstToJavaIr(document, options = {}) {
       (isInterface ? (declaration.extendsTypes || []) : (declaration.implementsTypes || []))
         .map((type) => classTypeInternalName(type, descriptorContext)),
     );
+    classIsInterfaceByInternalName.set(internalNameByDeclaration.get(declaration), isInterface);
     for (const member of declaration.body || []) {
       if (isClassLikeDeclaration(member)) buildMethodMap(member);
     }
@@ -8545,6 +8825,11 @@ function lowerAstToJavaIr(document, options = {}) {
           ? `<${(declaration.typeParameters || []).map((parameter) => `${parameter.name}:${(parameter.bounds && parameter.bounds[0] ? typeSignature(parameter.bounds[0], classTypeContext) : 'Ljava/lang/Object;')}`).join('')}>Ljava/lang/Object;`
           : null,
         annotations: annotationsMeta(declaration.annotations, { classBySimpleName }),
+        // Only a synthesised default constructor needs this: it has no statement
+        // to take a line from, and javac points it at the class declaration.
+        declarationLine: declaration.range && declaration.range.start
+          ? declaration.range.start.line
+          : undefined,
       },
     });
     const methodByName = classMethodsByInternalName.get(internalName) || new Map();
@@ -8561,6 +8846,7 @@ function lowerAstToJavaIr(document, options = {}) {
       classFieldsByInternalName,
       classSuperByInternalName,
       classInterfacesByInternalName,
+      classIsInterfaceByInternalName,
       fieldByName,
       outerClassInternalName: outerClassContext && outerClassContext.classInternalName,
       outerFieldByName: outerClassContext && outerClassContext.fieldByName,

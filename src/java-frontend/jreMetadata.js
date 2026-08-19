@@ -136,6 +136,47 @@ function jreClassExists(internalName) {
   return metadata().classes.has(internalName);
 }
 
+// java.lang is implicitly imported into every compilation unit, so any simple
+// name in it has to resolve without a stub backing it. Deriving this from the
+// jvm.js stub tree instead left holes - ThreadDeath had no stub, so it was
+// emitted as the unqualified class `ThreadDeath` and failed to load. This is
+// the full set of public top-level java.lang classes.
+const JAVA_LANG_TYPES = new Set([
+  'AbstractMethodError', 'Appendable', 'ArithmeticException', 'ArrayIndexOutOfBoundsException',
+  'ArrayStoreException', 'AssertionError', 'AutoCloseable', 'Boolean', 'BootstrapMethodError',
+  'Byte', 'CharSequence', 'Character', 'Class', 'ClassCastException', 'ClassCircularityError',
+  'ClassFormatError', 'ClassLoader', 'ClassNotFoundException', 'ClassValue',
+  'CloneNotSupportedException', 'Cloneable', 'Comparable', 'Deprecated', 'Double', 'Enum',
+  'EnumConstantNotPresentException', 'Error', 'Exception', 'ExceptionInInitializerError',
+  'Float', 'FunctionalInterface', 'IllegalAccessError', 'IllegalAccessException',
+  'IllegalArgumentException', 'IllegalCallerException', 'IllegalMonitorStateException',
+  'IllegalStateException', 'IllegalThreadStateException', 'IncompatibleClassChangeError',
+  'IndexOutOfBoundsException', 'InheritableThreadLocal', 'InstantiationError',
+  'InstantiationException', 'Integer', 'InternalError', 'InterruptedException', 'Iterable',
+  'LayerInstantiationException', 'LinkageError', 'Long', 'Math', 'Module', 'ModuleLayer',
+  'NegativeArraySizeException', 'NoClassDefFoundError', 'NoSuchFieldError',
+  'NoSuchFieldException', 'NoSuchMethodError', 'NoSuchMethodException', 'NullPointerException',
+  'Number', 'NumberFormatException', 'Object', 'OutOfMemoryError', 'Override', 'Package',
+  'Process', 'ProcessBuilder', 'ProcessHandle', 'Readable', 'ReflectiveOperationException',
+  'Runnable', 'Runtime', 'RuntimeException', 'RuntimePermission', 'SafeVarargs',
+  'SecurityException', 'SecurityManager', 'Short', 'StackOverflowError', 'StackTraceElement',
+  'StackWalker', 'StrictMath', 'String', 'StringBuffer', 'StringBuilder',
+  'StringIndexOutOfBoundsException', 'SuppressWarnings', 'System', 'Thread', 'ThreadDeath',
+  'ThreadGroup', 'ThreadLocal', 'Throwable', 'TypeNotPresentException', 'UnknownError',
+  'UnsatisfiedLinkError', 'UnsupportedClassVersionError', 'UnsupportedOperationException',
+  'VerifyError', 'VirtualMachineError', 'Void',
+]);
+
+// Whether the model says anything about this class's own signatures. Some
+// entries are placeholders - `java/awt/image/ImageObserver` declares no methods
+// at all - so "the model does not have this method" only means the method is
+// absent when the class carries a method table to be absent from.
+function jreClassDeclaresMethods(internalName) {
+  const classInfo = jreClassInfo(internalName);
+  if (!classInfo) return false;
+  return classInfo.methods.size > 0 || classInfo.staticMethods.size > 0;
+}
+
 function jreInternalNameForSimpleName(name) {
   const matches = metadata().simpleNames.get(name);
   return matches && matches.length === 1 ? matches[0] : null;
@@ -192,9 +233,11 @@ function jreFieldInfo(internalName, fieldName) {
 
 module.exports = {
   jreClassExists,
+  jreClassDeclaresMethods,
   jreCanonicalInternalName,
   jreClassInfo,
   jreFieldInfo,
   jreInternalNameForSimpleName,
+  JAVA_LANG_TYPES,
   jreMethodCandidates,
 };

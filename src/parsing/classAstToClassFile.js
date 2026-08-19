@@ -1695,8 +1695,23 @@ function prepareInstruction(instruction, builder, currentOffset, bootstrapMethod
   if (LOCAL_INDEX_OPS.has(op)) {
     const arg = instruction.arg != null ? instruction.arg : instruction.index;
     const index = parseInteger(arg, 0);
-    if (index < 0 || index > 0xff) {
+    if (index < 0 || index > 0xffff) {
       throw new Error(`Local variable index out of range for ${op}: ${index}`);
+    }
+    // The u1 operand form cannot name slot 256 and above, so the instruction
+    // takes the wide prefix and a u2 index instead (JVMS 6.5 wide). Producers
+    // emit the plain mnemonic and do not track slot numbering, so choosing the
+    // encoding is this layer's job.
+    if (index > 0xff) {
+      return {
+        type: 'wide_local',
+        op: 'wide',
+        opcode: MNEMONIC_TO_OPCODE.wide,
+        baseOpcode: opcode,
+        index,
+        length: 4,
+        offset: currentOffset,
+      };
     }
     return { type: 'local', op, opcode, index, length: 2, offset: currentOffset };
   }
@@ -1704,11 +1719,25 @@ function prepareInstruction(instruction, builder, currentOffset, bootstrapMethod
   if (op === 'iinc') {
     const index = parseInteger(instruction.varnum != null ? instruction.varnum : instruction.index, 0);
     const constant = parseInteger(instruction.incr != null ? instruction.incr : instruction.const, 0);
-    if (index < 0 || index > 0xff) {
+    if (index < 0 || index > 0xffff) {
       throw new Error(`iinc index out of range: ${index}`);
     }
-    if (constant < -128 || constant > 127) {
+    if (constant < -32768 || constant > 32767) {
       throw new Error(`iinc constant out of range: ${constant}`);
+    }
+    // Same widening rule as the load/store forms: either operand overflowing
+    // its byte moves the whole instruction to the wide encoding.
+    if (index > 0xff || constant < -128 || constant > 127) {
+      return {
+        type: 'wide_iinc',
+        op: 'wide',
+        opcode: MNEMONIC_TO_OPCODE.wide,
+        baseOpcode: opcode,
+        index,
+        constant,
+        length: 6,
+        offset: currentOffset,
+      };
     }
     return { type: 'iinc', op, opcode, index, constant, length: 3, offset: currentOffset };
   }

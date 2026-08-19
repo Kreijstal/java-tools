@@ -2854,3 +2854,230 @@ test('fully qualified nested JRE types retain their binary owner', (t) => {
     'nested source type resolves to its JVM binary owner');
   t.end();
 });
+
+test('a typed array initializer keeps its own component type across overloads', (t) => {
+  const result = frontend.compileJavaSource(`
+    final class ArrayInitOverloadNode {
+      ArrayInitOverloadNode(int a, String b, int[] c) {}
+      ArrayInitOverloadNode(int a, String b, ArrayInitOverloadNode[] c) {}
+    }
+    public class ArrayInitOverloadSmoke {
+      static ArrayInitOverloadNode holder;
+      static void call() {
+        holder = new ArrayInitOverloadNode(1, "x",
+          new ArrayInitOverloadNode[]{ new ArrayInitOverloadNode(2, "y", new int[]{1, 2}) });
+      }
+    }
+  `, { sourceFileName: 'ArrayInitOverloadSmoke.java' });
+  const constructions = result.bytecodeIr.classes
+    .find((classIr) => classIr.internalName === 'ArrayInitOverloadSmoke')
+    .methods.find((method) => method.name === 'call').instructions
+    .filter((instruction) => instruction.opcode === 'invokespecial')
+    .map((instruction) => instruction.operands[3]);
+
+  t.equal(result.bytecodeIr.status, 'complete',
+    'a nested typed array initializer compiles completely');
+  t.ok(constructions.includes('(ILjava/lang/String;[LArrayInitOverloadNode;)V'),
+    'the reference-array overload wins over the same-arity int[] one declared first');
+  t.ok(constructions.includes('(ILjava/lang/String;[I)V'),
+    'the inner bare initializer still takes the int[] overload');
+  t.end();
+});
+
+test('a call on a static field is not resolved as a qualified class name', (t) => {
+  const result = frontend.compileJavaSource(`
+    final class StaticFieldCallTarget {
+      final int a(int p0) { return 0; }
+      final boolean a(int p0, String p1, String p2) { return false; }
+      final byte[] a(String p0, int p1, String p2) { return null; }
+    }
+    final class StaticFieldCallHolder {
+      static StaticFieldCallTarget field_m;
+    }
+    final class StaticFieldCallSink {
+      StaticFieldCallSink(int p0, java.awt.Component p1) {}
+      StaticFieldCallSink(byte[] p0, java.awt.Component p1) {}
+    }
+    public class StaticFieldCallSmoke {
+      static StaticFieldCallSink out;
+      static void call(java.awt.Component component) {
+        out = new StaticFieldCallSink(StaticFieldCallHolder.field_m.a("name", -123, ""), component);
+      }
+    }
+  `, { sourceFileName: 'StaticFieldCallSmoke.java' });
+  const call = result.bytecodeIr.classes
+    .find((classIr) => classIr.internalName === 'StaticFieldCallSmoke')
+    .methods.find((method) => method.name === 'call');
+  const invocation = call.instructions.find((instruction) => instruction.operands
+    && instruction.operands[2] === 'a');
+  const construction = call.instructions.find((instruction) => instruction.opcode === 'invokespecial'
+    && instruction.operands[1] === 'StaticFieldCallSink');
+
+  t.equal(result.bytecodeIr.status, 'complete',
+    'a call through a static field compiles completely');
+  t.equal(invocation && invocation.opcode, 'invokevirtual',
+    'the receiver is the field value, not a class named after the field');
+  t.equal(invocation && invocation.operands[1], 'StaticFieldCallTarget',
+    'the owner is the field type rather than a fabricated Holder$field_m');
+  t.equal(construction && construction.operands[3], '([BLjava/awt/Component;)V',
+    'the real return type then selects the constructor that exists');
+  t.end();
+});
+
+test('WComponentPeer is invoked as a class, matching the games own bytecode', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class MsPeerCallSmoke {
+      static int call(com.ms.awt.WComponentPeer peer) { return peer.getHwnd(); }
+    }
+  `, { sourceFileName: 'MsPeerCallSmoke.java' });
+  const invocation = result.bytecodeIr.classes[0].methods
+    .find((method) => method.name === 'call').instructions
+    .find((instruction) => instruction.operands && instruction.operands[2] === 'getHwnd');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'a WComponentPeer call compiles completely');
+  t.equal(invocation && invocation.opcode, 'invokevirtual',
+    'MSJVM declares WComponentPeer a class, so a Methodref - not invokeinterface - is legal');
+  t.equal(invocation && invocation.operands[0], 'Method',
+    'the constant pool entry is a Methodref');
+  t.end();
+});
+
+test('JDK interfaces modelled in src/jre are invoked through InterfaceMethodref', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class SoundLineCallSmoke {
+      static void call(javax.sound.sampled.SourceDataLine line, byte[] data) {
+        line.write(data, 0, data.length);
+        line.start();
+      }
+    }
+  `, { sourceFileName: 'SoundLineCallSmoke.java' });
+  const invocations = result.bytecodeIr.classes[0].methods
+    .find((method) => method.name === 'call').instructions
+    .filter((instruction) => instruction.operands
+      && ['write', 'start'].includes(instruction.operands[2]));
+
+  t.equal(result.bytecodeIr.status, 'complete', 'a SourceDataLine call compiles completely');
+  t.equal(invocations.length, 2, 'both line calls are emitted');
+  for (const invocation of invocations) {
+    // SourceDataLine, DataLine, Line and Mixer are all interfaces in the JDK. A
+    // Methodref naming one links and then throws IncompatibleClassChangeError the
+    // first time the call runs, which is why no verification sweep caught this.
+    t.equal(invocation.opcode, 'invokeinterface',
+      `${invocation.operands[2]} is dispatched as an interface method`);
+    t.equal(invocation.operands[0], 'InterfaceMethod',
+      `${invocation.operands[2]} uses an InterfaceMethodref constant`);
+  }
+  t.end();
+});
+
+test('a same-arity constructor overload does not retype an explicit cast argument', (t) => {
+  // Cross-file on purpose: this is how the games are laid out, and the defect only
+  // appears once the constructor overloads arrive through a separate class summary.
+  const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-castnull-'));
+  try {
+    fs.writeFileSync(path.join(sourceRoot, 'CastNullA.java'), 'interface CastNullA {}\n');
+    fs.writeFileSync(path.join(sourceRoot, 'CastNullB.java'), 'interface CastNullB {}\n');
+    fs.writeFileSync(path.join(sourceRoot, 'CastNullBase.java'),
+      'class CastNullBase {\n'
+      + '  CastNullBase(String s, CastNullA a) {}\n'
+      + '  CastNullBase(String s, CastNullB b, CastNullA a) {}\n'
+      + '}\n');
+    fs.writeFileSync(path.join(sourceRoot, 'CastNullLeaf.java'),
+      'final class CastNullLeaf extends CastNullBase {\n'
+      + '  boolean flag;\n'
+      + '  private CastNullLeaf(String s, CastNullB b, CastNullA a) { super(s, a); }\n'
+      + '  CastNullLeaf(String s, CastNullA a, boolean f) { this(s, a); this.flag = f; }\n'
+      + '  private CastNullLeaf(String s, CastNullA a) { super(s, a); }\n'
+      + '}\n');
+    const callerPath = path.join(sourceRoot, 'CastNullCtorSmoke.java');
+    fs.writeFileSync(callerPath,
+      'final class CastNullCtorSmoke {\n'
+      + '  CastNullLeaf made;\n'
+      + '  CastNullCtorSmoke() {\n'
+      + '    int v = 1;\n'
+      + '    this.made = new CastNullLeaf("", (CastNullA) null, v != 0);\n'
+      + '  }\n'
+      + '}\n');
+
+    const result = frontend.compileJavaFile(callerPath, {
+      sourceRoot, sourcePath: callerPath, sourceFileName: 'CastNullCtorSmoke.java',
+    });
+    const construction = result.bytecodeIr.classes
+      .find((classIr) => classIr.internalName === 'CastNullCtorSmoke')
+      .methods.find((method) => method.name === '<init>').instructions
+      .find((instruction) => instruction.opcode === 'invokespecial'
+        && instruction.operands[1] === 'CastNullLeaf');
+
+    t.equal(result.bytecodeIr.status, 'complete', 'the constructor call compiles completely');
+    // Lowering an argument as a parameter descriptor rewrites it, so choosing the
+    // contextual constructor by arity alone used to turn `(CastNullA) null` into a
+    // CastNullB and emit `(String,CastNullB,Z)V` - a constructor nothing declares.
+    t.equal(construction && construction.operands[3], '(Ljava/lang/String;LCastNullA;Z)V',
+      'the declared constructor is selected, not a mix of two overloads');
+  } finally {
+    fs.rmSync(sourceRoot, { recursive: true, force: true });
+  }
+  t.end();
+});
+
+test('a JRE overload is not selected by narrowing an argument to an unrelated class', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class SocketOverloadSmoke {
+      String host; int port;
+      java.net.Socket open() throws java.io.IOException {
+        return new java.net.Socket(this.host, this.port);
+      }
+    }
+  `, { sourceFileName: 'SocketOverloadSmoke.java' });
+  const open = result.bytecodeIr.classes[0].methods.find((method) => method.name === 'open');
+  const construction = open.instructions.find((instruction) => instruction.opcode === 'invokespecial'
+    && instruction.operands[1] === 'java/net/Socket');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'the socket construction compiles completely');
+  t.equal(construction && construction.operands[3], '(Ljava/lang/String;I)V',
+    'a String host keeps its own type instead of matching Socket(InetAddress,int)');
+  t.notOk(open.instructions.some((instruction) => instruction.opcode === 'checkcast'
+    && instruction.operands[0] === 'java/net/InetAddress'),
+  'no checkcast is invented to force the argument into the modelled overload');
+  t.end();
+});
+
+test('clone on an array names the array type, not Object', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class ArrayCloneSmoke {
+      static int[] copy(int[][] rows) { return (int[]) ((Object) rows[0].clone()); }
+    }
+  `, { sourceFileName: 'ArrayCloneSmoke.java' });
+  const invocation = result.bytecodeIr.classes[0].methods
+    .find((method) => method.name === 'copy').instructions
+    .find((instruction) => instruction.operands && instruction.operands[2] === 'clone');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'an array clone compiles completely');
+  // Object.clone() is protected, so naming Object here is an IllegalAccessError at
+  // resolution; javac emits the array descriptor as the owner. Verified against
+  // javac: only clone takes the array owner, hashCode/toString/equals keep Object.
+  t.equal(invocation && invocation.operands[1], '[I', 'the owner is the array type');
+  t.equal(invocation && invocation.operands[3], '()Ljava/lang/Object;',
+    'the array clone descriptor matches the one javac emits');
+  t.end();
+});
+
+test('a qualified nested JRE type in a field access keeps its binary name', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class NestedStaticFieldSmoke {
+      static boolean direct(java.net.Proxy proxy) {
+        return proxy.type() == java.net.Proxy.Type.DIRECT;
+      }
+    }
+  `, { sourceFileName: 'NestedStaticFieldSmoke.java' });
+  const read = result.bytecodeIr.classes[0].methods
+    .find((method) => method.name === 'direct').instructions
+    .find((instruction) => instruction.opcode === 'getstatic');
+
+  t.equal(result.bytecodeIr.status, 'complete', 'the nested static field read compiles completely');
+  t.equal(read && read.operands[1], 'java/net/Proxy$Type',
+    'the owner is the nested binary name, not the package-join guess java/net/Proxy/Type');
+  t.equal(read && read.operands[3], 'Ljava/net/Proxy$Type;',
+    'the field descriptor uses the same binary name');
+  t.end();
+});

@@ -126,68 +126,65 @@ function buildWideArg(body) {
   return parts.length ? parts.join(' ') : null;
 }
 
+// An ldc operand arrives as Jasmin source text, and the constant-pool tag is
+// decided entirely by the JavaScript type this returns: a leftover string
+// becomes a CONSTANT_String, so `ldc 65535` silently turns the int into the
+// text "65535". Every producer of Jasmin-shaped instructions has to run its
+// operands through here - the text parser and the direct assembler both do.
+function normalizeLdcArgument(op, arg) {
+  if (typeof arg !== 'string') return arg;
+  const trimmedArg = arg.trim();
+  const specialFloatingLiteral = parseSpecialFloatingLiteral(trimmedArg);
+  if (specialFloatingLiteral) return specialFloatingLiteral;
+
+  const longLiteralMatch = trimmedArg.match(/^(-?\d+)[lL]$/);
+  if (longLiteralMatch) {
+    try {
+      return BigInt(longLiteralMatch[1]);
+    } catch (e) {
+      return arg;
+    }
+  }
+
+  if (op === 'ldc2_w' && /^-?\d+$/.test(trimmedArg)) {
+    try {
+      return BigInt(trimmedArg);
+    } catch (e) {
+      return arg;
+    }
+  }
+
+  if (trimmedArg.startsWith('"') && trimmedArg.endsWith('"')) {
+    try {
+      return JSON.parse(trimmedArg);
+    } catch (e) {
+      return arg;
+    }
+  }
+  if (/[fF]$/.test(trimmedArg)) {
+    const floatVal = parseFloat(trimmedArg);
+    if (!isNaN(floatVal)) return { value: Math.fround(floatVal), type: 'Float' };
+    return arg;
+  }
+  if (trimmedArg.includes('e') || trimmedArg.includes('E') || trimmedArg.includes('.')) {
+    const doubleVal = parseFloat(trimmedArg);
+    if (!isNaN(doubleVal)) return { value: doubleVal, type: 'Double' };
+    return arg;
+  }
+  const numVal = Number(trimmedArg);
+  if (Number.isInteger(numVal)) return numVal;
+  return arg;
+}
+
+function isLdcOpcode(op) {
+  return op === 'ldc' || op === 'ldc_w' || op === 'ldc2_w';
+}
+
 function convertCodeItem(item, invokeDynamicMap) {
   if (!item) return null;
 
-  if (item.instruction && (item.instruction.op === 'ldc' || item.instruction.op === 'ldc_w' || item.instruction.op === 'ldc2_w')) {
-    const argStr = item.instruction.arg;
-    if (typeof argStr === 'string') {
-      const trimmedArg = argStr.trim();
-      const specialFloatingLiteral = parseSpecialFloatingLiteral(trimmedArg);
-      if (specialFloatingLiteral) {
-        item.instruction.arg = specialFloatingLiteral;
-        return item;
-      }
-      const longLiteralMatch = trimmedArg.match(/^(-?\d+)[lL]$/);
-
-      if (longLiteralMatch) {
-        try {
-          item.instruction.arg = BigInt(longLiteralMatch[1]);
-        } catch (e) {
-          // Leave as string if the literal overflows BigInt parsing expectations
-        }
-        return item;
-      }
-
-      if (item.instruction.op === 'ldc2_w' && /^-?\d+$/.test(trimmedArg)) {
-        try {
-          item.instruction.arg = BigInt(trimmedArg);
-        } catch (e) {
-          // Leave as string if parsing fails
-        }
-        return item;
-      }
-
-      // Check for string literals
-      if (trimmedArg.startsWith('"') && trimmedArg.endsWith('"')) {
-        try {
-          item.instruction.arg = JSON.parse(trimmedArg);
-        } catch (e) {
-          // Leave as string if parsing fails
-        }
-      } else if (/[fF]$/.test(trimmedArg)) {
-        const floatVal = parseFloat(trimmedArg);
-        if (!isNaN(floatVal)) {
-          item.instruction.arg = {
-            value: Math.fround(floatVal),
-            type: 'Float'
-          };
-        }
-      } else if (trimmedArg.includes('e') || trimmedArg.includes('E') || trimmedArg.includes('.')) {
-        const doubleVal = parseFloat(trimmedArg);
-        if (!isNaN(doubleVal)) {
-          item.instruction.arg = {
-            value: doubleVal,
-            type: 'Double'
-          };
-        }
-      } else {
-        const numVal = Number(trimmedArg);
-        if (Number.isInteger(numVal)) {
-          item.instruction.arg = numVal;
-        }
-      }
-    }
+  if (item.instruction && isLdcOpcode(item.instruction.op)) {
+    item.instruction.arg = normalizeLdcArgument(item.instruction.op, item.instruction.arg);
   }
 
   // Handle invokedynamic instructions
@@ -794,4 +791,4 @@ function convertKrak2AstToClassAst(krak2Ast, options = {}) {
   };
 }
 
-module.exports = { convertKrak2AstToClassAst };
+module.exports = { convertKrak2AstToClassAst, normalizeLdcArgument, isLdcOpcode };

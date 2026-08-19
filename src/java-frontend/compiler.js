@@ -8,7 +8,8 @@ const { validateAstDocument } = require('./serialization');
 const { JavaFrontendError, UnsupportedJavaSyntaxError } = require('./errors');
 const { assembleJasminBytes } = require('../utils/jasminAssembly');
 const { assembleClass } = require('../parsing/classAstToClassFile');
-const { jreCanonicalInternalName, jreClassInfo, jreInternalNameForSimpleName } = require('./jreMetadata');
+const { normalizeLdcArgument, isLdcOpcode } = require('../parsing/convert_krak2_ast');
+const { jreCanonicalInternalName, jreClassInfo, jreInternalNameForSimpleName, JAVA_LANG_TYPES } = require('./jreMetadata');
 
 const COMPILE_RESULT_SCHEMA_ID = 'java-tools.java-frontend.compile-result';
 const COMPILE_RESULT_SCHEMA_VERSION = 1;
@@ -37,14 +38,6 @@ const PRIMITIVE_DESCRIPTORS = Object.freeze({
   double: 'D',
 });
 
-const JAVA_LANG_TYPES = new Set([
-  'ArithmeticException', 'ArrayIndexOutOfBoundsException', 'Boolean', 'Byte',
-  'Character', 'Class', 'ClassCastException', 'Double', 'Exception', 'Float',
-  'IllegalArgumentException', 'Integer', 'InterruptedException', 'Long', 'NegativeArraySizeException',
-  'NullPointerException', 'RuntimeException', 'StackOverflowError', 'Throwable', 'UnsupportedOperationException',
-  'Comparable', 'Enum', 'Iterable', 'Math', 'Object', 'Runnable', 'Short', 'String', 'StringBuilder',
-  'System', 'Thread', 'Void',
-]);
 
 const JAVA_UTIL_TYPES = new Set([
   'ArrayList', 'Collection', 'Collections', 'Deque', 'HashMap', 'HashSet',
@@ -151,6 +144,11 @@ function classTypeInternalName(type, context = {}) {
       if (jreClassInfo(nested)) return nested;
     }
     return direct;
+  }
+  // A class in the compilation unit's own package shadows the implicit
+  // java.lang import, so the corpus has to be consulted before these tables.
+  if (context.classBySimpleName && context.classBySimpleName.has(type.name)) {
+    return context.classBySimpleName.get(type.name);
   }
   if (JAVA_LANG_TYPES.has(type.name)) {
     return `java/lang/${type.name}`;
@@ -701,12 +699,24 @@ function compileMethodDeclaration(method, classIr, options = {}) {
   return methodIr;
 }
 
+// JLS 8.8.9: the default constructor takes the access modifier of its class, and
+// an enum's is always private. See defaultConstructorAccess in jvmBytecodeIr.js -
+// the two synthesis sites have to make the same choice.
+function defaultConstructorAccess(classAccess) {
+  const access = classAccess || [];
+  if (access.includes('enum')) return ['private'];
+  for (const modifier of ['public', 'protected', 'private']) {
+    if (access.includes(modifier)) return [modifier];
+  }
+  return [];
+}
+
 function defaultConstructorIr(classIr) {
   return {
     kind: 'Constructor',
     name: '<init>',
     descriptor: '()V',
-    access: ['public'],
+    access: defaultConstructorAccess(classIr.access),
     maxStack: 1,
     maxLocals: 1,
     returnDescriptor: 'V',
@@ -926,7 +936,50 @@ function stackMapFrameLines(frame) {
   ];
 }
 
-function localVariableTable(method, instructions) {
+// Compaction renumbers instructions, so a label invented here as `L<index>` is
+// in a different numbering space from the `L<index>` labels that were named
+// after positions before compaction - and the two spaces collide. The assembler
+// then resolves a table entry to whichever instruction carries the duplicate
+// name later, which surfaced as a LocalVariableTable entry with negative
+// length. The text path needs none of this: it never compacts, so `L<index>`
+// there always names the instruction it came from.
+function compactedLabelAllocator(instructions) {
+  const used = new Set();
+  for (const instruction of instructions || []) {
+    if (instruction && instruction.label) used.add(instruction.label);
+  }
+  return (instruction, index) => {
+    if (instruction.label) return instruction.label;
+    let name = `L${index}`;
+    for (let attempt = 1; used.has(name); attempt += 1) name = `L${index}_${attempt}`;
+    used.add(name);
+    instruction.label = name;
+    return name;
+  };
+}
+
+// The Jasmin text path renders a .linenumbertable for every method; this path
+// did not, so every class over the size threshold - the biggest ones in a game,
+// which are also the ones worth debugging - produced stack traces with no line
+// numbers at all. Labels are synthesised the same way localVariableTable does,
+// because a line entry can land on an instruction no branch targets.
+function directLineNumberTable(instructions, allocateLabel) {
+  if (!instructions || !instructions.length) return null;
+  const lines = [];
+  let previousLine = null;
+  instructions.forEach((instruction, index) => {
+    const line = instruction.sourceLine;
+    if (typeof line !== 'number' || line === previousLine) return;
+    lines.push({ label: allocateLabel(instruction, index), lineNumber: line });
+    previousLine = line;
+  });
+  return lines.length ? { type: 'linenumbertable', lines } : null;
+}
+
+function localVariableTable(method, instructions, allocateLabel = (instruction, index) => {
+  if (!instruction.label) instruction.label = `L${index}`;
+  return instruction.label;
+}) {
   const locals = method && method.meta && Array.isArray(method.meta.locals)
     ? method.meta.locals
     : [];
@@ -947,16 +1000,12 @@ function localVariableTable(method, instructions) {
     const endIndex = Math.min(instructions.length - 1, Math.max(startIndex + 1, lastUse + 1));
     if (endIndex <= startIndex) continue;
 
-    const startInstruction = instructions[startIndex];
-    const endInstruction = instructions[endIndex];
-    if (!startInstruction.label) startInstruction.label = `L${startIndex}`;
-    if (!endInstruction.label) endInstruction.label = `L${endIndex}`;
     entries.push({
       index: local.slotHint,
       name: local.name,
       descriptor: local.descriptor,
-      startLbl: startInstruction.label,
-      endLbl: endInstruction.label,
+      startLbl: allocateLabel(instructions[startIndex], startIndex),
+      endLbl: allocateLabel(instructions[endIndex], endIndex),
     });
   }
   return entries.length ? { type: 'localvariabletable', vars: entries } : null;
@@ -1134,6 +1183,11 @@ function directInstruction(instruction) {
     value = { op, arg: [operands[0], operands[1]] };
   } else if (op === 'wide') {
     value = { op, arg: operands.join(' ') };
+  } else if (isLdcOpcode(op) && operands.length === 1) {
+    // The text backend hands its operands to the Jasmin parser, which types
+    // them before the assembler sees them. Nothing types them on this path, so
+    // do it here or every constant that needs an ldc becomes a String.
+    value = { op, arg: normalizeLdcArgument(op, operands[0]) };
   } else {
     value = { op, arg: operands.length === 1 ? operands[0] : operands.slice() };
   }
@@ -1147,6 +1201,20 @@ function compactDirectMethod(method) {
   const aliases = new Map();
   const compacted = [];
   let pendingLabels = [];
+  // Frames name their instruction as `label || L<index>`, and the Jasmin text
+  // path prints a label for every instruction, so a synthetic name always
+  // resolves there. Here only declared labels are written, so materialize the
+  // ones the frames rely on before compaction folds anything.
+  const frameLabels = new Set();
+  for (const frame of method.stackMapFrames || []) {
+    frameLabels.add(frame.label);
+    for (const type of [...(frame.locals || []), ...(frame.stack || [])]) {
+      if (type && typeof type === 'object' && type.type === 'Uninitialized') frameLabels.add(type.lbl);
+    }
+  }
+  (method.instructions || []).forEach((raw, index) => {
+    if (!raw.label && frameLabels.has(`L${index}`)) raw.label = `L${index}`;
+  });
   for (const raw of method.instructions || []) {
     const instruction = { ...raw, operands: (raw.operands || []).slice() };
     if (instruction.opcode === 'nop' && instruction.label) {
@@ -1187,6 +1255,11 @@ function compactDirectMethod(method) {
       instruction.defaultLabel = resolveLabel(instruction.defaultLabel);
     }
   }
+  // Compaction folds label-only nops away, so a frame that was anchored to one
+  // has to follow its label to the instruction that absorbed it, exactly as the
+  // branches and the exception table do.
+  const resolveFrameType = (type) => (type && typeof type === 'object' && type.type === 'Uninitialized'
+    ? { ...type, lbl: resolveLabel(type.lbl) } : type);
   return {
     instructions: compacted,
     exceptionTable: (method.exceptionTable || []).map((entry) => ({
@@ -1195,24 +1268,65 @@ function compactDirectMethod(method) {
       endLabel: resolveLabel(entry.endLabel || entry.endLbl),
       handlerLabel: resolveLabel(entry.handlerLabel || entry.handlerLbl),
     })),
+    stackMapFrames: orderedFrames(compacted, (method.stackMapFrames || []).map((frame) => ({
+      label: resolveLabel(frame.label),
+      locals: (frame.locals || []).map(resolveFrameType),
+      stack: (frame.stack || []).map(resolveFrameType),
+    }))),
   };
+}
+
+// Label-only nops collapse onto the instruction that follows them, so several
+// frames can end up sharing one label; the attribute encodes deltas, and a
+// repeated or out-of-order entry is a hard "bad offset" from the verifier.
+// Frames arrive in program order, and the surviving instruction is the last of
+// each collapsed group - it is also the one whose frame carries every incoming
+// edge, so keeping an earlier, narrower frame is what produced "Type X is not
+// assignable to null". Keep the last of each label and order them by where the
+// compacted code puts them.
+function orderedFrames(instructions, frames) {
+  const positions = new Map();
+  instructions.forEach((instruction, index) => {
+    if (instruction.label && !positions.has(instruction.label)) positions.set(instruction.label, index);
+  });
+  const byLabel = new Map();
+  for (const frame of frames) {
+    if (positions.has(frame.label)) byLabel.set(frame.label, frame);
+  }
+  return [...byLabel.values()]
+    .sort((left, right) => positions.get(left.label) - positions.get(right.label));
+}
+
+// The assembler infers an annotation element's tag from `typeof` when it is
+// handed a bare JS value, and `typeof 1` is "number", which is not a tag - the
+// element would be written as a string. The text path chose the tag in
+// annotationElementType; this is the same choice, made where the assembler can
+// see it.
+function directAnnotationElementValue(value) {
+  if (typeof value === 'number') return { type: Number.isInteger(value) ? 'int' : 'double', value };
+  return value;
 }
 
 function directAttribute(attribute) {
   if (!attribute) return null;
   if (attribute.type === 'SourceFile') return { type: 'sourcefile', value: attribute.value };
   if (attribute.type === 'Signature') return { type: 'signature', value: attribute.value };
+  if (attribute.type === 'RuntimeVisibleAnnotations') {
+    if (!Array.isArray(attribute.annotations) || !attribute.annotations.length) return null;
+    return {
+      type: 'runtime',
+      visibility: 'visible',
+      attr: {
+        type: 'annotations',
+        annotations: attribute.annotations.map((annotation) => ({
+          typeName: annotation.typeName || annotation.type,
+          elements: Object.entries(annotation.elements || {})
+            .map(([name, value]) => ({ name, value: directAnnotationElementValue(value) })),
+        })),
+      },
+    };
+  }
   return { ...attribute };
-}
-
-function canDirectAssembleClass(classIr) {
-  const allowedClassAttributes = new Set(['SourceFile', 'Signature']);
-  const allowedMemberAttributes = new Set(['Signature', 'exceptions', 'constantvalue']);
-  if (classAttributesFromIr(classIr).some((attribute) => !allowedClassAttributes.has(attribute.type))) return false;
-  if ((classIr.fields || []).some((field) => memberAttributesFromMeta(field.meta)
-    .some((attribute) => !allowedMemberAttributes.has(attribute.type)))) return false;
-  return (classIr.methods || []).every((method) => (method.attributes || [])
-    .every((attribute) => allowedMemberAttributes.has(attribute.type)));
 }
 
 function directClassAst(classIr) {
@@ -1233,6 +1347,29 @@ function directClassAst(classIr) {
     const compacted = compactDirectMethod(method);
     const attributes = (method.attributes || []).map(directAttribute).filter(Boolean);
     if (!(method.access || []).includes('abstract') && !(method.access || []).includes('native')) {
+      // Both tables name instructions by label and will invent one where the
+      // instruction has none, so they must run before the instructions are
+      // rendered - directInstruction only writes a labelDef for a label that
+      // already exists, and a table naming a label that was never written is an
+      // assembly error.
+      const allocateLabel = compactedLabelAllocator(compacted.instructions);
+      const codeAttributes = [
+        directLineNumberTable(compacted.instructions, allocateLabel),
+        localVariableTable(method, compacted.instructions, allocateLabel),
+        // This direct path exists only to keep very large classes off the
+        // Jasmin text assembler, so it has to carry everything that path
+        // carries. Omitting the frames made every class over the size
+        // threshold unverifiable on a real JVM while the small ones passed.
+        compacted.stackMapFrames.length ? {
+          type: 'stackmaptable',
+          frames: compacted.stackMapFrames.map((frame) => ({
+            type: 'full',
+            label: frame.label,
+            locals: frame.locals,
+            stack: frame.stack,
+          })),
+        } : null,
+      ].filter(Boolean);
       attributes.push({
         type: 'code',
         code: {
@@ -1245,9 +1382,7 @@ function directClassAst(classIr) {
             handlerLbl: entry.handlerLabel || entry.handlerLbl,
             catchType: entry.catchType || 'any',
           })),
-          attributes: [
-            localVariableTable(method, compacted.instructions),
-          ].filter(Boolean),
+          attributes: codeAttributes,
         },
       });
     }
@@ -1278,6 +1413,18 @@ function outputPathForClass(outputDir, internalName, pathModule = hostPath) {
   return pathModule.join(outputDir, `${internalName}.class`);
 }
 
+// The class AST is built straight from the IR and handed to the krak2
+// assembler. Rendering Jasmin text and parsing it back was a second producer of
+// the same AST, and a second producer has to agree with the first about
+// everything: twice it did not - ldc operands reached the assembler untyped
+// (every int constant became a String), and the direct path dropped the
+// LineNumberTable, so the biggest classes in a game had no line numbers in
+// their stack traces. Set JAVA_FRONTEND_ASSEMBLER=text to force the old
+// round-trip; it exists so the two can still be diffed, not as a fallback.
+function usesTextAssembler() {
+  return process.env.JAVA_FRONTEND_ASSEMBLER === 'text';
+}
+
 function writeClassFilesFromModel(classFileModel, outputDir, options = {}) {
   if (!outputDir) {
     throw new TypeError('outputDir is required to write class files');
@@ -1289,9 +1436,9 @@ function writeClassFilesFromModel(classFileModel, outputDir, options = {}) {
   for (const classModel of classFileModel.classes || []) {
     const outputPath = outputPathForClass(outputDir, classModel.internalName, pathModule);
     fileSystem.mkdirSync(pathModule.dirname(outputPath), { recursive: true });
-    const classBytes = classModel.jasmin.length > 500000
-        && classModel.bytecodeClass
-        && canDirectAssembleClass(classModel.bytecodeClass)
+    // A model that lost its IR - a JSON round-trip drops the non-enumerable
+    // bytecodeClass - has nothing but the text to assemble from.
+    const classBytes = classModel.bytecodeClass && !usesTextAssembler()
       ? assembleClass(directClassAst(classModel.bytecodeClass), options.assembly || {})
       : assembleJasminBytes(classModel.jasmin, options.assembly || {});
     fileSystem.writeFileSync(outputPath, classBytes);
