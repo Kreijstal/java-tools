@@ -3157,3 +3157,42 @@ test('an exception handler over dead code is dropped instead of left frameless',
   t.deepEqual(frameless, [], 'every surviving handler has a stack map frame');
   t.end();
 });
+
+test('a label on a for loop carries its continue target, not just its break target', (t) => {
+  const result = frontend.compileJavaSource(`
+    public class LabeledForSmoke {
+      static int run(int[] xs) {
+        int total = 0;
+        OUTER: for (int i = 0; i < xs.length; i = i + 1) {
+          if (xs[i] < 0) {
+            continue OUTER;
+          }
+          if (xs[i] == 99) {
+            break OUTER;
+          }
+          total = total + xs[i];
+        }
+        return total;
+      }
+    }
+  `, { sourceFileName: 'LabeledForSmoke.java' });
+
+  // A `for` lowers to its initializers followed by the loop, so a label on it
+  // used to land on a labeled *block*, which only has a break target - and JLS
+  // 14.16 lets `continue L` name exactly the loops a labeled block is not.
+  t.equal(result.bytecodeIr.status, 'complete', 'the labeled loop lowers completely');
+  t.deepEqual(result.bytecodeIr.unsupported || [], [], 'nothing is reported unsupported');
+
+  const run = result.bytecodeIr.classes
+    .find((entry) => entry.internalName === 'LabeledForSmoke').methods
+    .find((method) => method.name === 'run');
+  const targets = run.instructions
+    .filter((instruction) => instruction.opcode === 'goto')
+    .map((instruction) => instruction.operands[0]);
+  const labels = new Set(run.instructions.map((instruction) => instruction.label).filter(Boolean));
+  t.deepEqual(targets.filter((target) => !labels.has(target)), [],
+    'every jump the labelled loop emits lands on a label the method defines');
+  t.ok(targets.some((target) => /continue/.test(target)),
+    'the labelled continue reaches the loop update, not the end of a block');
+  t.end();
+});

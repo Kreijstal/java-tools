@@ -6961,6 +6961,22 @@ function lowerStatementToJavaIrOpsInner(statement, context) {
         && !bodyOps[0].label) {
       return [{ ...bodyOps[0], label: statement.label || null }];
     }
+    // A `for` lowers to its initializers followed by the loop, so the label
+    // lands on a plain labeled block, and a labeled block only knows how to be
+    // broken out of. `continue L` then has nowhere to go, even though JLS 14.16
+    // only allows `continue L` when L labels a loop in the first place. Put the
+    // label where it belongs - on the loop - and leave the initializers, which
+    // run once before it and cannot be reached by either jump, outside.
+    const loopIndex = bodyOps.length - 1;
+    if (bodyOps.length > 1
+        && ['ForStatement', 'EnhancedForStatement'].includes(statement.statement.kind)
+        && ['loop', 'doLoop'].includes(bodyOps[loopIndex].op)
+        && !bodyOps[loopIndex].label) {
+      return [
+        ...bodyOps.slice(0, loopIndex),
+        { ...bodyOps[loopIndex], label: statement.label || null },
+      ];
+    }
     return [createJavaIrOp('labeled', {
       label: statement.label || null,
       bodyOps,
@@ -7426,12 +7442,18 @@ function lowerStatementToJavaIrOpsInner(statement, context) {
         return resourceOps.initOps.concat(protectedTryOps);
       }
     }
-    return resourceOps.initOps.concat(createJavaIrOp('tryCatch', {
-      tryOps: protectedTryOps,
+    // JLS 14.20.3: the resource specification is part of the try statement, so a
+    // resource initializer that throws is caught by the statement's own catch
+    // clauses. Emitting the initializers ahead of the protected range left them
+    // unguarded - `try (R r = new R()) {} catch (Exception e) {}` propagated a
+    // throwing constructor straight out of the method - and it also put them
+    // outside the range a decompiler reads back as the resource specification.
+    return [createJavaIrOp('tryCatch', {
+      tryOps: resourceOps.initOps.concat(protectedTryOps),
       catches,
       finallyOps,
       sourceNodeKind: statement.kind,
-    }));
+    })];
   }
   if (statement.kind === 'ExpressionStatement') {
     const expression = statement.expression;
