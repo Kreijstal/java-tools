@@ -2656,6 +2656,22 @@ function methodDescriptorForInstanceCall(owner, name, args, context) {
   return null;
 }
 
+// coerceValueToDescriptor implements assignment conversion, which lets an int
+// constant narrow to byte, short or char. A method invocation does not get that
+// (JLS 5.3), so an applicability test built on it has to subtract it back out -
+// otherwise a call resolves to an overload the language never offered it.
+function narrowsAPrimitiveArgument(parameterDescriptors, args) {
+  if (!Array.isArray(parameterDescriptors)) return false;
+  return args.some((arg, index) => {
+    const parameter = parameterDescriptors[index];
+    if (!arg || typeof arg.type !== 'string' || typeof parameter !== 'string') return false;
+    if (arg.type === parameter) return false;
+    if (arg.type.startsWith('L') || arg.type.startsWith('[')) return false;
+    if (parameter.startsWith('L') || parameter.startsWith('[')) return false;
+    return primitiveWideningDistance(arg.type, parameter) === null;
+  });
+}
+
 function methodMatchesArguments(method, args, isStatic = null) {
   if (!method || !Array.isArray(method.parameterDescriptors)) {
     return false;
@@ -2666,6 +2682,7 @@ function methodMatchesArguments(method, args, isStatic = null) {
     return Boolean(prepareMethodArguments(method, args));
   }
   if (method.parameterDescriptors.length !== args.length) return false;
+  if (narrowsAPrimitiveArgument(method.parameterDescriptors, args)) return false;
   return args.every((arg, index) => {
     const coerced = arg && coerceValueToDescriptor(arg, method.parameterDescriptors[index]);
     return coerced && coerced.type === method.parameterDescriptors[index];
@@ -2716,6 +2733,25 @@ function referenceConversionDistance(source, target, context) {
   return targetOwner === 'java/lang/Object' ? 100 : null;
 }
 
+// JLS 5.1.2. Widening is the only primitive conversion a method invocation
+// gets for free; the distance keeps the nearer widening the more specific one.
+const PRIMITIVE_WIDENING_TARGETS = {
+  B: ['S', 'I', 'J', 'F', 'D'],
+  S: ['I', 'J', 'F', 'D'],
+  C: ['I', 'J', 'F', 'D'],
+  I: ['J', 'F', 'D'],
+  J: ['F', 'D'],
+  F: ['D'],
+};
+
+function primitiveWideningDistance(source, target) {
+  if (source === target) return 0;
+  const targets = PRIMITIVE_WIDENING_TARGETS[source];
+  if (!targets) return null;
+  const index = targets.indexOf(target);
+  return index === -1 ? null : index + 1;
+}
+
 function userMethodMatchScore(method, args, context, isStatic = null) {
   if (!method || !Array.isArray(method.parameterDescriptors) ||
       isStatic !== null && Boolean(method.isStatic) !== isStatic) return null;
@@ -2737,12 +2773,18 @@ function userMethodMatchScore(method, args, context, isStatic = null) {
       score += distance;
       continue;
     }
-    // Retain the frontend's established primitive conversion behavior. An
-    // explicit reference CastValue already carries its target descriptor and
+    // An explicit reference CastValue already carries its target descriptor and
     // therefore reaches the reference-distance path above.
     if (!(argument.type.startsWith('L') || argument.type.startsWith('[')) &&
         !(parameter.startsWith('L') || parameter.startsWith('['))) {
-      score += 10;
+      // Method invocation conversion (JLS 5.3) permits widening only. The
+      // narrowing an int constant enjoys in an assignment is not available
+      // here, so a candidate that needs one is simply not a candidate - and
+      // saying otherwise stops the hierarchy walk at a subclass whose method
+      // does not apply, hiding the inherited one that does.
+      const widening = primitiveWideningDistance(argument.type, parameter);
+      if (widening === null) return null;
+      score += widening;
       continue;
     }
     return null;

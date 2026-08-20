@@ -841,6 +841,41 @@ test('static overload resolution uses an array access own type before context', 
   t.end();
 });
 
+const CONSTANT_NARROWING_OVERLOAD_SOURCE = `
+public class NarrowingOverloadSmoke {
+  public static void call() { new NarrowingOverloadSub().go(); }
+}
+class NarrowingOverloadBase {
+  void a(int x, Object o) { }
+}
+class NarrowingOverloadSub extends NarrowingOverloadBase {
+  void a(byte x, Object o) { }
+  void go() { this.a(-83, this); }
+}
+`;
+
+test('an int constant does not narrow to reach a subclass overload', (t) => {
+  const result = frontend.compileJavaSource(CONSTANT_NARROWING_OVERLOAD_SOURCE, {
+    sourceFileName: 'NarrowingOverloadSmoke.java',
+  });
+  const call = result.bytecodeIr.classes
+    .find((classIr) => classIr.internalName === 'NarrowingOverloadSub')
+    .methods.find((method) => method.name === 'go').instructions
+    .find((instruction) => instruction.opcode === 'invokevirtual' &&
+      instruction.operands && instruction.operands[2] === 'a');
+
+  // Assignment conversion lets an int constant narrow to byte; method
+  // invocation conversion (JLS 5.3) does not. Treating the subclass's
+  // a(byte, Object) as applicable stopped the hierarchy walk there and silently
+  // called a different method than the one the language resolves to - it links,
+  // so nothing downstream catches it.
+  t.equal(result.bytecodeIr.status, 'complete',
+    'the narrowing-adjacent overload set compiles completely');
+  t.equal(call && call.operands[3], '(ILjava/lang/Object;)V',
+    'the inherited a(int, Object) wins over the subclass a(byte, Object)');
+  t.end();
+});
+
 test('instance overload resolution follows the argument class hierarchy', (t) => {
   const result = frontend.compileJavaSource(INSTANCE_SUBTYPE_OVERLOAD_SMOKE_SOURCE, {
     sourceFileName: 'InstanceSubtypeOverloadSmoke.java',
