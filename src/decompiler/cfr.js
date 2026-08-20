@@ -1846,6 +1846,11 @@ function decompileCode(code, method, cls, localState, options = {}) {
     // boolean guards commonly use this shape; the CFG structurer handles it
     // in one pass and avoids exponential decompile time.
     || hasHighConditionalTargetFanIn(codeItemsForSelection)
+    // Branch density is a proxy for how much the speculative recognizer will
+    // explore, and a poor one - compaction alone moves a method across it. It
+    // stays because the methods it steers away are also the ones whose local
+    // naming the two paths disagree about, and the CFG structurer is the one
+    // that gets them right; the budget below is the backstop, not this.
     || (codeItemsForSelection.length > 128
       && controlTransfers / codeItemsForSelection.length > 0.05
       && !hasSuppressedCleanup);
@@ -2767,6 +2772,14 @@ function normalizeSyntheticVariableScopes(lines) {
   const lifted = new Map();
   for (const name of used) {
     if (catchNames.has(name)) continue;
+    // A resource is scoped to its own try statement and Java 8 requires the
+    // header to be a declaration, so lifting one to method scope produces the
+    // illegal `try (name = new Resource())`. Two try-with-resources blocks that
+    // reuse a slot legitimately declare the same name twice - separate scopes,
+    // no conflict - which is exactly the case that otherwise looks like an
+    // escaping local.
+    const resourceDeclarations = resourceDeclarationCounts.get(name) || 0;
+    if (resourceDeclarations > 0 && resourceDeclarations === (declarationCounts.get(name) || 0)) continue;
     const declaration = declarations.get(name);
     const declaredInFor = declaration && /\bfor\s*\(/.test(String(lines[declaration.index]));
     let scopeEnd = lines.length - 1;
@@ -2993,6 +3006,11 @@ function localDeclarationsFromStatement(source) {
   }
   let declaration = statement;
   let inFor = false;
+  // A loop that carries a label is still a loop: without unwrapping it, a
+  // `L: for (int i = 0; …)` header hides its declaration from every pass that
+  // reasons about scopes, and the method-scope copy it duplicates survives.
+  while (declaration && declaration.kind === 'LabeledStatement') declaration = declaration.statement;
+  statement = declaration;
   if (statement && statement.kind === 'ForStatement') {
     declaration = statement.initializer;
     inFor = true;
@@ -3910,6 +3928,14 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
       const state = evaluate(blockId);
       return conditionForBranch(state.terminator, state.stack.slice(), false).code;
     },
+    condInverted(blockId) {
+      const state = evaluate(blockId);
+      return conditionForBranch(state.terminator, state.stack.slice(), true).code;
+    },
+    blockTerminates(blockId) {
+      const term = cfg.term[blockId];
+      return !!term && term.kind === 'return';
+    },
     switchValue(blockId) {
       const state = evaluate(blockId);
       return pop(state.stack.slice()).code;
@@ -3935,6 +3961,12 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         const syn = syntheticRender.get(id);
         return syn && syn.cond ? syn.cond : base.cond(id);
       },
+      condInverted(id) {
+        // A synthetic block prints one fixed condition; there is no expression to
+        // negate, so a rotation that needs the inverse simply does not apply.
+        return syntheticRender.get(id) ? null : base.condInverted(id);
+      },
+      blockTerminates: (id) => (syntheticRender.get(id) ? false : base.blockTerminates(id)),
       switchValue: (id) => base.switchValue(id),
       syncLock: (lockLocal, lockPc) => base.syncLock(lockLocal, lockPc),
     };
@@ -4091,7 +4123,7 @@ function decompileOwnedStructuredControlFlow(code, method, cls, localState, opti
         reason: stateMachineReason || 'state-machine fallback selected',
       });
     }
-    return coalesceDefaultConstructorBody(lines, method);
+    return coalesceDefaultConstructorBody(sinkForInitDeclarations(rewriteWhileLoopsAsFor(lines)), method);
   } catch (err) {
     // Expression reconstruction can still decline stack-carrying joins. The
     // old recognizers remain a safe fallback while that dataflow grows.
@@ -5848,9 +5880,21 @@ function decompileStructuredControlFlow(code, method, cls, localState) {
     labelIndex: buildLabelIndex(codeItems),
     exceptionTable: code.exceptionTable || [],
   };
-  const result = decompileRange(codeItems, 0, codeItems.length, context, []);
+  // Enough for every method in the corpora by a wide margin; the pathological
+  // shapes this guards against blow past it in the first fraction of a second.
+  context.__rangeBudget = 20000;
+  let result;
+  try {
+    result = decompileRange(codeItems, 0, codeItems.length, context, []);
+  } catch (error) {
+    if (!(error instanceof RangeBudgetExceeded)) throw error;
+    if (process.env.CFR_JS_DEBUG_STRUCTURER === '1') {
+      console.error(`${cls.className}.${method.name}${method.descriptor}: range recognizer exceeded its budget`);
+    }
+    return null;
+  }
   if (!result.ok) return null;
-  const lines = rewriteEmptyIfElse(rewriteTryWithResources(result.lines));
+  const lines = rewriteEmptyIfElse(mergeResourceTryIntoCatch(rewriteTryWithResources(result.lines)));
   if (lines[lines.length - 1] === 'return;') lines.pop();
   return coalesceDefaultConstructorBody(lines, method);
 }
@@ -5878,7 +5922,262 @@ function rangeCacheKey(start, end, stack) {
   return key;
 }
 
+// Unreachable code has no Java statement behind it, and decompiling it produces
+// nonsense rather than a miss you can see: a dead run reads as a throw of an
+// empty operand stack, and one `/* stack-underflow */` marker anywhere makes the
+// whole method's structured output unusable, so a perfectly good body is thrown
+// away over code that cannot execute. javac never emits dead code, but a
+// compiler that lowers it - java-tools' own frontend collapses each unreachable
+// run to nops ending in athrow - and obfuscators that plant it both do, so walk
+// the instructions the way the verifier does and let the range decompiler skip
+// what no path reaches.
+function branchTargetLabels(instruction) {
+  if (!instruction) return [];
+  if (instruction.op === 'tableswitch') {
+    return [...(instruction.labels || []), instruction.defaultLbl].filter(Boolean);
+  }
+  if (instruction.op === 'lookupswitch') {
+    const arg = instruction.arg || {};
+    return [...(arg.pairs || []).map((pair) => pair && pair[1]), arg.defaultLabel, arg.defaultLbl].filter(Boolean);
+  }
+  if (instruction.op === 'goto' || instruction.op === 'goto_w' || isConditionalBranch(instruction.op)) {
+    return [instruction.arg].filter(Boolean);
+  }
+  return [];
+}
+
+function computeReachableIndexes(codeItems, exceptionTable, labelIndex) {
+  const reachable = new Set();
+  const queue = [0];
+  const resolve = (label) => labelIndex.get(String(label || '').replace(/:$/, ''));
+  const visit = (index) => {
+    if (index === undefined || index < 0 || index >= codeItems.length) return;
+    if (reachable.has(index)) return;
+    queue.push(index);
+  };
+  while (queue.length) {
+    const index = queue.shift();
+    if (index === undefined || index < 0 || index >= codeItems.length) continue;
+    if (reachable.has(index)) continue;
+    reachable.add(index);
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction) { visit(index + 1); continue; }
+    const op = instruction.op;
+    for (const label of branchTargetLabels(instruction)) visit(resolve(label));
+    const stops = op === 'goto' || op === 'goto_w' || op === 'ret'
+      || op === 'tableswitch' || op === 'lookupswitch'
+      || op === 'return' || op === 'athrow' || RETURN_OPS.has(op);
+    if (!stops) visit(index + 1);
+
+    // A handler is reachable as soon as anything inside its protected range is.
+    // That can only be decided once the range's own reachability is known, so
+    // rescan the table on every step rather than after the normal edges settle.
+    for (const entry of exceptionTable || []) {
+      const rangeStart = resolve(entry.startLbl);
+      const rangeEnd = resolve(entry.endLbl);
+      if (rangeStart === undefined || rangeEnd === undefined) continue;
+      if (index < rangeStart || index >= rangeEnd) continue;
+      visit(resolve(entry.handlerLbl));
+    }
+  }
+  return reachable;
+}
+
+function reachableIndexesFor(codeItems, context) {
+  // A context assembled without an exception table cannot tell a dead handler
+  // from a live one, so it does not get to skip anything.
+  if (!Array.isArray(context.exceptionTable)) return null;
+  const cache = context.__reachableCache || (context.__reachableCache = new Map());
+  let reachable = cache.get(codeItems);
+  if (!reachable) {
+    reachable = computeReachableIndexes(
+      codeItems, context.exceptionTable, context.labelIndex || buildLabelIndex(codeItems));
+    cache.set(codeItems, reachable);
+    if (process.env.CFR_JS_DEBUG_REACH === '1') {
+      console.error(`[reach] ${codeItems.length} items, ${reachable.size} reachable`);
+    }
+  }
+  return reachable;
+}
+
+// javac lowers `try (R r = init) { body }` into a protected body, a copy of the
+// release code on the normal path, and a catch-all that releases and rethrows -
+// and it has emitted two different shapes of it over the years. javac 8 (and
+// java-tools' own frontend, which matches it) tracks the primary throwable in a
+// local and guards every close with a null test; javac 9+ drops the guards and
+// closes unconditionally. Both share the property this recognizer keys on: the
+// whole region between the end of the protected range and the handler's rethrow
+// does nothing but close resources and record suppressed exceptions. Verifying
+// that directly - rather than matching one instruction sequence - covers both
+// shapes, and any dead scaffolding a compiler leaves in the middle of them.
+const RESOURCE_CLEANUP_OPS = new Set([
+  'nop', 'goto', 'goto_w', 'athrow', 'aconst_null',
+  'if_acmpeq', 'if_acmpne', 'ifnull', 'ifnonnull',
+]);
+
+function isCatchAllHandlerType(catchType) {
+  return !catchType || catchType === 'any' || catchType === 'java/lang/Throwable';
+}
+
+function resourceCleanupCall(instruction) {
+  if (instruction.op !== 'invokevirtual' && instruction.op !== 'invokeinterface') return null;
+  let ref;
+  try {
+    ref = parseMemberRef(instruction.arg);
+  } catch (error) {
+    return null;
+  }
+  if (ref.name === 'close' && ref.descriptor === '()V') return { kind: 'close' };
+  if (ref.owner === 'java/lang/Throwable' && ref.name === 'addSuppressed'
+    && ref.descriptor === '(Ljava/lang/Throwable;)V') return { kind: 'suppress' };
+  return null;
+}
+
+// Walk the release region and report what it closes and where it ends, or null
+// the moment it does anything a release cannot do. `athrow` is allowed inside
+// because the rethrow is part of the shape; the region ends at the rethrow of
+// the very throwable the handler caught, which is what pins the far edge of the
+// construct - scanning for "the first instruction that is not release-like"
+// would run straight into whatever release-like code follows it.
+function analyzeResourceCleanup(codeItems, cleanupStart, handlerIndex, context) {
+  const handlerInstruction = getInstructionAt(codeItems, handlerIndex);
+  if (!handlerInstruction) return null;
+  const caught = parseStoreIndex(handlerInstruction.op, handlerInstruction.arg);
+  if (!caught || caught.type !== 'Object') return null;
+
+  const closedLocals = [];
+  let rethrowIndex = -1;
+  let previousLoad = null;
+  let index = cleanupStart;
+  for (; index < codeItems.length; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction) continue;
+    const op = instruction.op;
+    const load = parseLoadIndex(op, instruction.arg);
+    const store = parseStoreIndex(op, instruction.arg);
+    if (load && load.type !== 'Object') return null;
+    if (store && store.type !== 'Object') return null;
+    if (!load && !store && !RESOURCE_CLEANUP_OPS.has(op)) {
+      const call = resourceCleanupCall(instruction);
+      if (!call) break;
+      if (call.kind === 'close') {
+        if (!previousLoad) return null;
+        if (!closedLocals.includes(previousLoad.index)) closedLocals.push(previousLoad.index);
+      }
+    }
+    if (op === 'athrow' && previousLoad && previousLoad.index === caught.index && index > handlerIndex) {
+      rethrowIndex = index;
+    }
+    previousLoad = load || null;
+  }
+  if (rethrowIndex === -1 || !closedLocals.length) return null;
+
+  const after = rethrowIndex + 1;
+  // The rethrow pins the far edge, but only if the region is self-contained:
+  // release code branches within itself and, on the normal path, past the
+  // handler - never anywhere else. A branch that leaves means this is some
+  // other shape that merely happens to be built out of close calls.
+  // The normal-path jump to `after` is not required: a body that always throws
+  // leaves its copy of the release code unreachable, and javac emits it anyway.
+  for (let i = cleanupStart; i < after; i += 1) {
+    const instruction = getInstructionAt(codeItems, i);
+    if (!instruction) continue;
+    for (const label of branchTargetLabels(instruction)) {
+      const target = context.labelIndex.get(String(label || '').replace(/:$/, ''));
+      if (target === undefined || target < cleanupStart || target > after) return null;
+    }
+  }
+  return { after, closedLocals };
+}
+
+// A catch-all whose handler only releases and rethrows is compiler plumbing, not
+// a source-level catch clause. javac 8 emits two of them per resource - one that
+// records the primary throwable, one that runs the release - and both sit on the
+// same try range as the user's own `catch`, so a try/catch recognizer that takes
+// the exception table at face value sees three clauses with conflicting extents
+// and gives up on a method that has one plain catch in the source.
+function isResourceReleaseHandler(codeItems, handlerIndex, context) {
+  const handlerInstruction = getInstructionAt(codeItems, handlerIndex);
+  if (!handlerInstruction) return false;
+  const caught = parseStoreIndex(handlerInstruction.op, handlerInstruction.arg);
+  if (!caught || caught.type !== 'Object') return false;
+  let previousLoad = null;
+  for (let index = handlerIndex + 1; index < codeItems.length; index += 1) {
+    const instruction = getInstructionAt(codeItems, index);
+    if (!instruction) continue;
+    const op = instruction.op;
+    if (op === 'athrow') {
+      return !!previousLoad && previousLoad.index === caught.index;
+    }
+    const load = parseLoadIndex(op, instruction.arg);
+    const store = parseStoreIndex(op, instruction.arg);
+    if ((load && load.type !== 'Object') || (store && store.type !== 'Object')) return false;
+    if (!load && !store && !RESOURCE_CLEANUP_OPS.has(op) && !resourceCleanupCall(instruction)) return false;
+    previousLoad = load || null;
+  }
+  return false;
+}
+
+function tryDecompileResourceTryAt(codeItems, index, end, context, stack, lines) {
+  if (stack.length || !Array.isArray(lines)) return null;
+  const startLabel = labelName(codeItems[index]);
+  if (!startLabel) return null;
+
+  // javac 8 protects one body range with two catch-alls: an inner one that only
+  // records the primary throwable and rethrows, and an outer one that performs
+  // the release. Taking the inner handler would end the construct at its rethrow
+  // and leave the release code stranded, so take the outermost - the entry whose
+  // handler sits furthest along.
+  const entry = (context.exceptionTable || [])
+    .filter((candidate) => candidate.startLbl === startLabel && isCatchAllHandlerType(candidate.catch_type))
+    .sort((left, right) => (context.labelIndex.get(right.handlerLbl) ?? -1)
+      - (context.labelIndex.get(left.handlerLbl) ?? -1))[0];
+  if (!entry) return null;
+  const bodyEnd = context.labelIndex.get(entry.endLbl);
+  const handlerIndex = context.labelIndex.get(entry.handlerLbl);
+  if (bodyEnd === undefined || handlerIndex === undefined) return null;
+  if (bodyEnd <= index || bodyEnd > end || handlerIndex < bodyEnd) return null;
+
+  const cleanup = analyzeResourceCleanup(codeItems, bodyEnd, handlerIndex, context);
+  if (!cleanup) return null;
+  if (cleanup.after > end) return null;
+
+  // The initializers were already emitted as ordinary statements, and they are
+  // the only place the resource's declared name and type exist - the release
+  // code just loads a slot. Take them back off the emitted lines rather than
+  // re-deriving a name that would not match the one the body already uses.
+  const resources = collectPrecedingResourceInitializers(lines, lines.length);
+  if (resources.length !== cleanup.closedLocals.length) return null;
+
+  const body = decompileRange(codeItems, index, bodyEnd, context, []);
+  if (!body.ok || body.stack.length) return null;
+
+  let removeFrom = resources[0].lineIndex;
+  if (removeFrom > 0 && /^(?:Object|Throwable) [A-Za-z_$][A-Za-z0-9_$]* = null;$/.test(lines[removeFrom - 1].trim())) {
+    removeFrom -= 1;
+  }
+  lines.splice(removeFrom, lines.length - removeFrom);
+
+  const header = resources.map((resource) => `${resource.type} ${resource.name} = ${resource.initializer}`).join('; ');
+  const out = [`try (${header}) {`];
+  indentLines(body.lines).forEach((line) => out.push(line));
+  out.push('}');
+  return { lines: out, next: cleanup.after, stack: [] };
+}
+
+// The recognizer cascade is speculative, so its cost is not a function of the
+// method's size alone - it is a function of how many distinct ranges the
+// speculation reaches. Bounding that directly beats guessing from branch
+// density: the density proxy this replaced counted nops as instructions, so
+// merely compacting a class file moved a method across the threshold and
+// swapped its output for the CFG structurer's `while (true)` form.
+class RangeBudgetExceeded extends Error {}
+
 function decompileRange(codeItems, start, end, context, initialStack = []) {
+  if (context.__rangeBudget !== undefined) {
+    context.__rangeBudget -= 1;
+    if (context.__rangeBudget < 0) throw new RangeBudgetExceeded();
+  }
   const cache = context.__rangeCache || (context.__rangeCache = new Map());
   const cacheKey = rangeCacheKey(start, end, initialStack);
   const cached = cache.get(cacheKey);
@@ -5907,6 +6206,11 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       index += 1;
       continue;
     }
+    const reachable = reachableIndexesFor(codeItems, context);
+    if (reachable && !reachable.has(index)) {
+      index += 1;
+      continue;
+    }
 
     const synchronizedBlock = tryDecompileSynchronizedAt(codeItems, index, end, context, stack);
     if (synchronizedBlock) {
@@ -5929,6 +6233,14 @@ function decompileRange(codeItems, start, end, context, initialStack = []) {
       lines.push(...tryCatch.lines);
       stack.splice(0, stack.length, ...tryCatch.stack);
       index = tryCatch.next;
+      continue;
+    }
+
+    const resourceTry = tryDecompileResourceTryAt(codeItems, index, end, context, stack, lines);
+    if (resourceTry) {
+      lines.push(...resourceTry.lines);
+      stack.splice(0, stack.length, ...resourceTry.stack);
+      index = resourceTry.next;
       continue;
     }
 
@@ -6240,6 +6552,128 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// The CFG structurer's loops arrive as `L: while (cond) { … }` with the
+// initializer on the line before and the increment either as the last statement
+// or in front of every `continue`, which is a `for` loop written the long way.
+// Where the increment sits matters: in a `while` a `continue` skips whatever
+// trails the body, so the compiler repeats the increment at each continue, and
+// the `for` header is exactly the place that repetition collapses back into.
+// Which `continue`s belong to this loop: the unlabelled ones that are not
+// wrapped in a nested loop, plus any that name it. A nested loop's own continue
+// is none of this loop's business, and treating it as one gave up on every outer
+// loop that contains an inner one.
+function ownContinueIndexes(body, label) {
+  const nested = [];
+  let depth = 0;
+  const loopStack = [];
+  for (const raw of body) {
+    const line = String(raw);
+    const leading = (line.match(/^\s*\}+/) || [''])[0].replace(/[^}]/g, '').length;
+    const atLine = depth - leading;
+    while (loopStack.length && loopStack[loopStack.length - 1] > atLine) loopStack.pop();
+    nested.push(loopStack.length > 0);
+    depth += (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+    if (/^\s*(?:[A-Za-z_$][A-Za-z0-9_$]*:\s*)?(?:for|while)\s*\(.*\{\s*$/.test(line)
+      || /^\s*do\s*\{\s*$/.test(line)) loopStack.push(depth);
+  }
+  const own = [];
+  for (let index = 0; index < body.length; index += 1) {
+    const line = String(body[index]);
+    if (!/^\s*continue\b/.test(line)) continue;
+    const named = /^\s*continue\s+([A-Za-z_$][A-Za-z0-9_$]*);$/.exec(line);
+    if (named) {
+      if (named[1] === label) own.push(index);
+      else if (!nested[index]) return null; // names a loop that is not this one, from this level
+      continue;
+    }
+    if (!/^\s*continue;$/.test(line)) return null;
+    if (!nested[index]) own.push(index);
+  }
+  return own;
+}
+
+function loopUpdateStatement(body, label) {
+  const continues = ownContinueIndexes(body, label);
+  if (!continues) return null;
+  if (!continues.length) {
+    return { update: String(body[body.length - 1]).trim(), drop: [body.length - 1] };
+  }
+  const update = continues[0] > 0 ? String(body[continues[0] - 1]).trim() : null;
+  if (!update) return null;
+  if (!continues.every((index) => index > 0 && String(body[index - 1]).trim() === update)) return null;
+  const drop = continues.map((index) => index - 1);
+  if (String(body[body.length - 1]).trim() === update) drop.push(body.length - 1);
+  return { update, drop };
+}
+
+function rewriteWhileLoopsAsFor(lines) {
+  const out = lines.slice();
+  for (let index = 1; index < out.length; index += 1) {
+    const header = /^(\s*)(?:([A-Za-z_$][A-Za-z0-9_$]*):\s*)?while \((.*)\) \{$/.exec(String(out[index]));
+    if (!header) continue;
+    const [, indent, label, condition] = header;
+    if (condition === 'true') continue;
+    const end = enclosingBlockEndLine(out, index);
+    if (end === -1 || String(out[end]) !== `${indent}}`) continue;
+    const body = out.slice(index + 1, end).map((line) => String(line).slice(indent.length));
+    if (!body.length) continue;
+    const found = loopUpdateStatement(body, label);
+    if (!found) continue;
+    const variable = updateVariableName(found.update);
+    if (!variable) continue;
+    const initMatch = /^(?:(?:[A-Za-z_$][A-Za-z0-9_$]*(?:\[\])?|[A-Za-z_$][A-Za-z0-9_$.<>?, ]+)\s+)?([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*.+;$/
+      .exec(String(out[index - 1]).trim());
+    if (!initMatch || initMatch[1] !== variable) continue;
+    if (!new RegExp(`\\b${escapeRegExp(variable)}\\b`).test(condition)) continue;
+    const dropped = new Set(found.drop);
+    const kept = body.filter((_line, position) => !dropped.has(position));
+    // A `continue` that names the loop still needs the name: the label moves onto
+    // the `for` rather than being dropped with the `while` it was written on.
+    const keepsLabel = label && kept.some((line) => new RegExp(`\\b(?:break|continue)\\s+${escapeRegExp(label)}\\b`).test(line));
+    const forLines = [
+      `${indent}${keepsLabel ? `${label}: ` : ''}for (${String(out[index - 1]).trim().replace(/;$/, '')}; ${condition}; ${found.update.replace(/;$/, '')}) {`,
+      ...kept.map((line) => `${indent}${line}`),
+      `${indent}}`,
+    ];
+    out.splice(index - 1, end - index + 2, ...forLines);
+    index -= 1;
+  }
+  return out;
+}
+
+// Every local the CFG structurer produces is also declared at the top of the
+// method, because that is the only scope it can prove correct without looking at
+// where the value is used. A loop counter whose every mention sits inside one
+// `for` belongs in that `for`, which is where the source had it - and the
+// method-scope copy has to go, or the two declarations collide and the later one
+// loses its type.
+function sinkForInitDeclarations(lines) {
+  const out = lines.slice();
+  for (let index = 0; index < out.length; index += 1) {
+    const header = /^(\s*)(?:[A-Za-z_$][A-Za-z0-9_$]*:\s*)?for \((?:([A-Za-z_$][A-Za-z0-9_$.<>\[\], ]*?)\s+)?([A-Za-z_$][A-Za-z0-9_$]*) = [^;]*; /.exec(String(out[index]));
+    if (!header) continue;
+    const [, , headerType, name] = header;
+    const end = enclosingBlockEndLine(out, index);
+    if (end === -1) continue;
+    const declarationPattern = new RegExp(`^([A-Za-z_$][A-Za-z0-9_$.<>\\[\\], ]*?)\\s+${escapeRegExp(name)}(?: = [^;]+)?;$`);
+    const declarationIndex = out.findIndex((line, position) => position < index
+      && declarationPattern.test(String(line)));
+    if (declarationIndex === -1) continue;
+    const declaration = declarationPattern.exec(String(out[declarationIndex]));
+    const uses = new RegExp(`\\b${escapeRegExp(name)}\\b`);
+    const usedElsewhere = out.some((line, position) => position !== declarationIndex
+      && (position < index || position > end) && uses.test(String(line)));
+    if (usedElsewhere) continue;
+    if (!headerType) {
+      out[index] = String(out[index]).replace(
+        new RegExp(`for \\(${escapeRegExp(name)} = `), `for (${declaration[1]} ${name} = `);
+    }
+    out.splice(declarationIndex, 1);
+    index -= 1;
+  }
+  return out;
+}
+
 function pushLoopLines(lines, loopLines) {
   const forLoop = rewriteWhileAsFor(lines[lines.length - 1], loopLines);
   if (!forLoop) {
@@ -6293,6 +6727,40 @@ function rewriteTryWithResources(lines) {
     out[index] = `${leadingWhitespace(out[index])}try (${headerResources}) {`;
     out.splice(primaryIndex, index - primaryIndex);
     index = primaryIndex + 1;
+  }
+  return out;
+}
+
+// `try (R r = init) { body } catch (E e) { … }` is one statement in the source,
+// but the recognizers reach it as two: the catch clause protects a range whose
+// only contents are the resource construct. Emitting the nesting is correct Java
+// and wrong prose, so fold the pair back into the statement that was written.
+function enclosingBlockEndLine(lines, start) {
+  let depth = 0;
+  for (let index = start; index < lines.length; index += 1) {
+    const line = String(lines[index]);
+    const closers = (line.match(/^\s*\}+/) || [''])[0].replace(/[^}]/g, '').length;
+    if (index > start && depth - closers === 0) return index;
+    depth += (line.match(/\{/g) || []).length - (line.match(/\}/g) || []).length;
+  }
+  return -1;
+}
+
+function mergeResourceTryIntoCatch(lines) {
+  const out = lines.slice();
+  for (let index = 0; index < out.length; index += 1) {
+    const header = /^(\s*)try \{$/.exec(String(out[index]));
+    if (!header) continue;
+    const indent = header[1];
+    const end = enclosingBlockEndLine(out, index);
+    if (end === -1 || !new RegExp(`^${escapeRegExp(indent)}\\} (?:catch|finally)\\b`).test(String(out[end]))) continue;
+    const inner = new RegExp(`^${escapeRegExp(indent)}    try \\((.*)\\) \\{$`).exec(String(out[index + 1] || ''));
+    if (!inner) continue;
+    if (String(out[end - 1]) !== `${indent}    }`) continue;
+    if (enclosingBlockEndLine(out, index + 1) !== end - 1) continue;
+    const body = out.slice(index + 2, end - 1).map((line) => (String(line).startsWith('    ') ? String(line).slice(4) : line));
+    out.splice(index, end - index, `${indent}try (${inner[1]}) {`, ...body);
+    index += body.length;
   }
   return out;
 }
@@ -6416,6 +6884,10 @@ function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
 
   const entries = (context.exceptionTable || [])
     .filter((entry) => entry.startLbl === startLabel && entry.catch_type && entry.catch_type !== 'any')
+    .filter((entry) => {
+      const handlerIndex = context.labelIndex.get(entry.handlerLbl);
+      return handlerIndex === undefined || !isResourceReleaseHandler(codeItems, handlerIndex, context);
+    })
     .sort((a, b) => {
       const left = context.labelIndex.get(a.handlerLbl) ?? 0;
       const right = context.labelIndex.get(b.handlerLbl) ?? 0;
@@ -6428,8 +6900,18 @@ function tryDecompileTryCatchAt(codeItems, index, end, context, stack) {
   if (tryEnd === undefined || tryEnd <= index || tryEnd >= end) return null;
   const endGotoIndex = nextNonNopExecutableIndex(codeItems, tryEnd);
   const endInstruction = endGotoIndex === -1 ? null : getInstructionAt(codeItems, endGotoIndex);
-  if (!endInstruction || endInstruction.op !== 'goto') return null;
-  const afterIndex = context.labelIndex.get(endInstruction.arg);
+  const reachable = reachableIndexesFor(codeItems, context);
+  let afterIndex;
+  if (endInstruction && endInstruction.op === 'goto') {
+    afterIndex = context.labelIndex.get(endInstruction.arg);
+  } else if (reachable && endGotoIndex !== -1 && !reachable.has(endGotoIndex)) {
+    // A body that always throws has no jump past the handlers to emit, so what
+    // follows the protected range is whatever dead scaffolding the compiler left
+    // there. The construct then simply runs to the end of the enclosing range.
+    afterIndex = end;
+  } else {
+    return null;
+  }
   if (afterIndex === undefined || afterIndex <= tryEnd || afterIndex > end) return null;
 
   const handlers = [];

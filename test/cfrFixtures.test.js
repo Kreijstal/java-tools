@@ -105,6 +105,11 @@ test('CFR-JS classifies nested loop break and continue edges', (t) => {
   t.notOk(/^\s*\/\/\s*(if|goto|tableswitch|lookupswitch)\b/m.test(actual), 'PyramidApplet does not fall back to raw control-flow comments');
   t.match(actual, /for \(i = 0; i < vertices\.length;[\s\S]*if \(v\[2\] > 0\.2\)/, 'vertex projection loop is structured');
   t.match(actual, /for \(int __foreach_index32 = 0; __foreach_index32 < __foreach_array32\.length;[\s\S]*break;[\s\S]*}/, 'loop-exit goto is classified as break');
-  t.match(actual, /for \(int __foreach_index27 = 0; __foreach_index27 < __foreach_array27\.length;[\s\S]*if \(!\(normal\[2\] >= 0\.0\)\)/, 'outer face loop conditional skip is structured');
+  // The skip test may come back either as the branch condition negated in place
+  // (`normal[2] < 0.0`) or as the original wrapped in `!(…)`. The first is what
+  // the source said and is what the structurer produces now that it negates the
+  // comparison rather than the whole expression; both are the same predicate, so
+  // the assertion is on the structure around it.
+  t.match(actual, /for \(int __foreach_index27 = 0; __foreach_index27 < __foreach_array27\.length;[\s\S]*if \((?:!\(normal\[2\] >= 0\.0\)|normal\[2\] < 0\.0)\)/, 'outer face loop conditional skip is structured');
   t.notOk(/if \([^)]+\) \{\s*\} else \{/m.test(actual), 'empty then/else conditionals are inverted');
 });

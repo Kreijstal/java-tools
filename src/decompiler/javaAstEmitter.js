@@ -24,6 +24,64 @@ function catchParameter(name, types) {
   return formalParameter(name, parameterType);
 }
 
+// The CFG structurer expresses every loop as `while (true)` with the exit test
+// inside, which is faithful but not what anybody wrote: a plain `for` loop comes
+// back as an infinite loop whose false arm carries the entire rest of the method.
+// Rotating it back - hoisting the exit arm out and moving the test into the
+// header - is only sound when control cannot fall out of that arm into the next
+// iteration, so ask whether every path through it leaves.
+function alwaysExits(tree, render) {
+  if (!tree) return false;
+  switch (tree.t) {
+    case 'straight': return !!(render.blockTerminates && render.blockTerminates(tree.block));
+    case 'seq': return (tree.body || []).some((child) => alwaysExits(child, render));
+    case 'block': return alwaysExits(tree.body, render);
+    case 'loop': return true; // a `while (true)` is left by break/return, never by falling out
+    case 'if': return alwaysExits(tree.then, render) && alwaysExits(tree.els, render);
+    case 'switch': return !!tree.dflt && tree.cases.every((item) => alwaysExits(item.body, render))
+      && alwaysExits(tree.dflt, render);
+    case 'break': return true;
+    case 'continue': return true;
+    default: return false; // try/synchronized and anything new: assume it falls through
+  }
+}
+
+function referencesLabel(tree, label) {
+  if (!tree) return false;
+  switch (tree.t) {
+    case 'break':
+    case 'continue': return tree.label === label;
+    case 'seq': return (tree.body || []).some((child) => referencesLabel(child, label));
+    case 'block':
+    case 'loop':
+    case 'synchronized':
+    case 'try': return referencesLabel(tree.body, label)
+      || (tree.catches || []).some((item) => referencesLabel(item.body, label));
+    case 'if': return referencesLabel(tree.then, label) || referencesLabel(tree.els, label);
+    case 'switch': return (tree.cases || []).some((item) => referencesLabel(item.body, label))
+      || referencesLabel(tree.dflt, label);
+    default: return false;
+  }
+}
+
+// `{loop L, seq[straight, if]}` is the shape the structurer gives a loop whose
+// test sits at the top. The straight part has to be empty for the test to move
+// into the header - anything computed there runs before the test on every
+// iteration and must stay in the body.
+function rotatableLoop(tree, render) {
+  const body = tree.body;
+  if (!body || body.t !== 'seq' || (body.body || []).length < 2) return null;
+  const [head, branch, ...rest] = body.body;
+  if (!head || head.t !== 'straight' || !branch || branch.t !== 'if') return null;
+  if (render.straight(head.block).length) return null;
+  return { branch, rest };
+}
+
+function endsWithContinueTo(statements, label) {
+  const last = statements[statements.length - 1];
+  return !!last && last.kind === 'ContinueStatement' && last.label === label;
+}
+
 function treeToStatements(tree, render) {
   if (!tree) return [];
   switch (tree.t) {
@@ -33,21 +91,126 @@ function treeToStatements(tree, render) {
       label: tree.label,
       statement: block(treeToStatements(tree.body, render)),
     })];
-    case 'loop': return [createNode('LabeledStatement', {
-      label: tree.label,
-      statement: createNode('WhileStatement', {
-        condition: rawExpression('true'),
-        body: block(treeToStatements(tree.body, render)),
-      }),
-    })];
+    case 'loop': {
+      const rotatable = rotatableLoop(tree, render);
+      if (rotatable) {
+        const { branch, rest } = rotatable;
+        // Render in the order the untransformed tree would have: the condition,
+        // then the taken arm, then the fall arm. Reordering the *rendered*
+        // statements afterwards is safe; reordering the rendering is not, because
+        // expression reconstruction binds local names as it goes.
+        const taken = render.cond(branch.block);
+        const notTaken = render.condInverted ? render.condInverted(branch.block) : null;
+        const thenStatements = treeToStatements(branch.then, render);
+        const elseStatements = branch.els ? treeToStatements(branch.els, render) : [];
+        const restStatements = rest.flatMap((child) => treeToStatements(child, render));
+        const restExits = rest.length === 0 || rest.some((child) => alwaysExits(child, render));
+        const arms = [
+          {
+            condition: notTaken, bodyTree: branch.els, body: elseStatements,
+            exitTree: branch.then, exit: thenStatements,
+          },
+          {
+            condition: taken, bodyTree: branch.then, body: thenStatements,
+            exitTree: branch.els, exit: elseStatements,
+          },
+        ];
+        for (const arm of arms) {
+          if (!arm.condition || referencesLabel(arm.exitTree, tree.label)) continue;
+          const loopsBack = endsWithContinueTo(arm.body, tree.label);
+          // Two shapes reach here. Without trailing statements the other arm is
+          // the exit and has to leave on every path, or rotating it out would
+          // change an iteration into a fall-through. With trailing statements the
+          // other arm must be empty - the test simply falls past the loop - and
+          // the statements after it are the exit, which likewise has to leave.
+          if (rest.length === 0) {
+            if (!loopsBack || !alwaysExits(arm.exitTree, render)) continue;
+            return [
+              createNode('LabeledStatement', {
+                label: tree.label,
+                statement: createNode('WhileStatement', {
+                  condition: rawExpression(arm.condition),
+                  body: block(arm.body.slice(0, -1)),
+                }),
+              }),
+              ...arm.exit,
+            ];
+          }
+          // The trailing statements leave the loop, so nothing in them may jump
+          // back into it: a `continue` there is proof they are part of the loop
+          // body and not what follows it.
+          if (rest.some((child) => referencesLabel(child, tree.label))) continue;
+          if (arm.exit.length || !restExits || !referencesLabel(arm.bodyTree, tree.label)) continue;
+          // Falling off the end of the body used to land in the trailing
+          // statements; they are outside the loop now, so that path breaks.
+          const loopBody = loopsBack ? arm.body.slice(0, -1) : [
+            ...arm.body, createNode('BreakStatement', { label: null }),
+          ];
+          return [
+            createNode('LabeledStatement', {
+              label: tree.label,
+              statement: createNode('WhileStatement', {
+                condition: rawExpression(arm.condition),
+                body: block(loopBody),
+              }),
+            }),
+            ...restStatements,
+          ];
+        }
+        return [createNode('LabeledStatement', {
+          label: tree.label,
+          statement: createNode('WhileStatement', {
+            condition: rawExpression('true'),
+            body: block([
+              ...(taken === 'true' ? thenStatements : taken === 'false' ? elseStatements : [
+                !thenStatements.length && elseStatements.length && notTaken
+                  ? createNode('IfStatement', {
+                    condition: rawExpression(notTaken),
+                    consequent: block(elseStatements),
+                    alternate: null,
+                  })
+                  : createNode('IfStatement', {
+                    condition: rawExpression(taken),
+                    consequent: block(thenStatements),
+                    alternate: elseStatements.length ? block(elseStatements) : null,
+                  }),
+              ]),
+              ...restStatements,
+            ]),
+          }),
+        })];
+      }
+      return [createNode('LabeledStatement', {
+        label: tree.label,
+        statement: createNode('WhileStatement', {
+          condition: rawExpression('true'),
+          body: block(treeToStatements(tree.body, render)),
+        }),
+      })];
+    }
     case 'if': {
       const conditionSource = render.cond(tree.block);
       if (conditionSource === 'true') return treeToStatements(tree.then, render);
       if (conditionSource === 'false') return tree.els ? treeToStatements(tree.els, render) : [];
+      const thenStatements = treeToStatements(tree.then, render);
+      const elseStatements = tree.els ? treeToStatements(tree.els, render) : [];
+      // An arm that came out empty - a fall-through break the tree pass removed -
+      // leaves `if (c) {} else { … }`. Negating the branch condition is better
+      // than wrapping the original in `!(…)`: the inverse of `v[2] <= 0.2` is the
+      // `v[2] > 0.2` that was written, not a double negative.
+      const inverse = !thenStatements.length && elseStatements.length && render.condInverted
+        ? render.condInverted(tree.block) : null;
+      if (inverse) {
+        return [createNode('IfStatement', {
+          condition: rawExpression(inverse),
+          consequent: block(elseStatements),
+          alternate: null,
+        })];
+      }
       return [createNode('IfStatement', {
         condition: rawExpression(conditionSource),
-        consequent: block(treeToStatements(tree.then, render)),
-        alternate: tree.els ? block(treeToStatements(tree.els, render)) : null,
+        consequent: block(thenStatements),
+        alternate: elseStatements.length ? block(elseStatements) : null,
       })];
     }
     case 'switch': return [createNode('SwitchStatement', {

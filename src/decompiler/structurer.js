@@ -406,7 +406,148 @@ function printTree(tree, render = DEFAULT_RENDER) {
 // already resolved here (dead if-branches dropped), so this — not the raw
 // structurer tree — is what reachability analysis must inspect to match javac.
 function structuredStatements(tree, render = DEFAULT_RENDER) {
-  return treeToStatements(repairEmptyLoopExits(tree, []), render);
+  const repaired = repairEmptyLoopExits(tree, []);
+  return treeToStatements(flattenSequences(dropUnusedBlockLabels(dropTailBreaks(repaired, new Set()))), render);
+}
+
+// Unwrapping a labeled block leaves its body nested inside its parent's
+// sequence. The emitter does not care, but shape recognizers downstream read the
+// children positionally, so splice the nesting away.
+function flattenSequences(node) {
+  if (!node) return node;
+  switch (node.t) {
+    case 'seq': {
+      const body = [];
+      for (const child of node.body || []) {
+        const flat = flattenSequences(child);
+        if (flat && flat.t === 'seq') body.push(...(flat.body || []));
+        else if (flat) body.push(flat);
+      }
+      return { ...node, body };
+    }
+    case 'if':
+      return { ...node, then: flattenSequences(node.then), els: flattenSequences(node.els) };
+    case 'block':
+    case 'loop':
+    case 'synchronized':
+      return { ...node, body: flattenSequences(node.body) };
+    case 'try':
+      return {
+        ...node,
+        body: flattenSequences(node.body),
+        catches: (node.catches || []).map((item) => ({ ...item, body: flattenSequences(item.body) })),
+      };
+    case 'switch':
+      return {
+        ...node,
+        cases: (node.cases || []).map((item) => ({ ...item, body: flattenSequences(item.body) })),
+        dflt: flattenSequences(node.dflt),
+      };
+    default:
+      return node;
+  }
+}
+
+/**
+ * A `break L` whose block ends right where control would arrive anyway is the
+ * structurer spelling out a fall-through. It is what turns a plain `if` into
+ * `L: { if (c) { break L; } else { … break L; } }`, so removing it is most of
+ * the distance between the structurer's output and the source it came from.
+ *
+ * `tailLabels` holds the labels whose block ends exactly where the current node
+ * ends. A block hands its own label down to its body; a sequence hands the set
+ * to its last child only; both arms of an `if` end where the `if` does. Anything
+ * whose end is not the enclosing block's end - a loop body (the back edge), a
+ * switch arm (the next case), a guarded region - hands down nothing, which keeps
+ * every break it contains.
+ */
+function dropTailBreaks(node, tailLabels) {
+  if (!node) return node;
+  switch (node.t) {
+    case 'break':
+      return tailLabels.has(node.label) ? { t: 'seq', body: [] } : node;
+    case 'block': {
+      const inner = new Set([...tailLabels, node.label]);
+      node.body = dropTailBreaks(node.body, inner);
+      return node;
+    }
+    case 'seq': {
+      const body = node.body || [];
+      node.body = body.map((child, index) => dropTailBreaks(
+        child, index === body.length - 1 ? tailLabels : new Set()));
+      return node;
+    }
+    case 'if':
+      node.then = dropTailBreaks(node.then, tailLabels);
+      node.els = dropTailBreaks(node.els, tailLabels);
+      return node;
+    case 'loop':
+      node.body = dropTailBreaks(node.body, new Set());
+      return node;
+    case 'switch':
+      node.cases = (node.cases || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) }));
+      node.dflt = dropTailBreaks(node.dflt, new Set());
+      return node;
+    case 'synchronized':
+    case 'try':
+      node.body = dropTailBreaks(node.body, new Set());
+      node.catches = (node.catches || []).map((item) => ({ ...item, body: dropTailBreaks(item.body, new Set()) }));
+      return node;
+    default:
+      return node;
+  }
+}
+
+function labelIsReferenced(node, label) {
+  if (!node) return false;
+  switch (node.t) {
+    case 'break':
+    case 'continue': return node.label === label;
+    case 'seq': return (node.body || []).some((child) => labelIsReferenced(child, label));
+    case 'if': return labelIsReferenced(node.then, label) || labelIsReferenced(node.els, label);
+    case 'switch': return (node.cases || []).some((item) => labelIsReferenced(item.body, label))
+      || labelIsReferenced(node.dflt, label);
+    case 'block':
+    case 'loop':
+    case 'synchronized':
+    case 'try': return labelIsReferenced(node.body, label)
+      || (node.catches || []).some((item) => labelIsReferenced(item.body, label));
+    default: return false;
+  }
+}
+
+// Once the fall-through breaks are gone most labeled blocks have no jumps left
+// pointing at them, and a label nothing refers to is noise.
+function dropUnusedBlockLabels(node) {
+  if (!node) return node;
+  switch (node.t) {
+    case 'block': {
+      const body = dropUnusedBlockLabels(node.body);
+      if (labelIsReferenced(body, node.label)) return { ...node, body };
+      return body;
+    }
+    case 'seq':
+      return { ...node, body: (node.body || []).map(dropUnusedBlockLabels) };
+    case 'if':
+      return { ...node, then: dropUnusedBlockLabels(node.then), els: dropUnusedBlockLabels(node.els) };
+    case 'loop':
+    case 'synchronized':
+      return { ...node, body: dropUnusedBlockLabels(node.body) };
+    case 'try':
+      return {
+        ...node,
+        body: dropUnusedBlockLabels(node.body),
+        catches: (node.catches || []).map((item) => ({ ...item, body: dropUnusedBlockLabels(item.body) })),
+      };
+    case 'switch':
+      return {
+        ...node,
+        cases: (node.cases || []).map((item) => ({ ...item, body: dropUnusedBlockLabels(item.body) })),
+        dflt: dropUnusedBlockLabels(node.dflt),
+      };
+    default:
+      return node;
+  }
 }
 
 function repairEmptyLoopExits(node, loopLabels) {
