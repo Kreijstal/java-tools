@@ -3019,7 +3019,16 @@ function selectUserMethodDescriptor(owner, name, args, context, isStatic = null)
   const methods = context.classMethodsByInternalName && context.classMethodsByInternalName.get(owner);
   if (methods && methods.has(name)) {
     const method = methods.get(name);
-    if (methodMatchesArguments(method, args, isStatic)) return method;
+    // methodMatchesArguments decides applicability with coerceValueToDescriptor,
+    // which turns any reference into any other reference by inserting a cast -
+    // a downcast to an unrelated type included. That made this fallback accept a
+    // method the call could never invoke, and because it runs before the
+    // hierarchy walk it also hid the inherited method that did apply: an `s`
+    // argument picked `pk.a(vi,int)`, where vi is a *subclass* of s, instead of
+    // the inherited `a(pj,byte)`. userMethodMatchScore is the applicability rule
+    // the ranked path already uses - reference widening only - so ask it too.
+    if (methodMatchesArguments(method, args, isStatic)
+        && userMethodMatchScore(method, args, context, isStatic) !== null) return method;
   }
   return null;
 }
@@ -3701,6 +3710,17 @@ function lowerLocalClassDeclaration(statement, context) {
     classMethodsByInternalName: context.classMethodsByInternalName,
     classMethodOverloadsByInternalName: context.classMethodOverloadsByInternalName,
     classFieldsByInternalName: context.classFieldsByInternalName,
+    // The hierarchy maps have to travel with the method and overload maps.
+    // referenceConversionDistance walks classSuperByInternalName to widen an
+    // argument to a supertype parameter, and ownerIsInterface reads
+    // classIsInterfaceByInternalName to choose invokeinterface over
+    // invokevirtual; a context that carries the overloads but not the hierarchy
+    // resolves neither. A call written identically in a method and in a class
+    // declared inside that method compiled to `ul.a(ILck;)V` in the first and
+    // `ul.a(ILnk;)V` - a method that does not exist - in the second.
+    classSuperByInternalName: context.classSuperByInternalName,
+    classInterfacesByInternalName: context.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: context.classIsInterfaceByInternalName,
     fieldByName,
     outerClassInternalName: context.classInternalName,
     outerFieldByName: context.fieldByName,
@@ -3824,6 +3844,17 @@ function lowerAnonymousClassToJavaIrValue(expression, targetDescriptor, context)
     classMethodsByInternalName: context.classMethodsByInternalName,
     classMethodOverloadsByInternalName: context.classMethodOverloadsByInternalName,
     classFieldsByInternalName: context.classFieldsByInternalName,
+    // The hierarchy maps have to travel with the method and overload maps.
+    // referenceConversionDistance walks classSuperByInternalName to widen an
+    // argument to a supertype parameter, and ownerIsInterface reads
+    // classIsInterfaceByInternalName to choose invokeinterface over
+    // invokevirtual; a context that carries the overloads but not the hierarchy
+    // resolves neither. A call written identically in a method and in a class
+    // declared inside that method compiled to `ul.a(ILck;)V` in the first and
+    // `ul.a(ILnk;)V` - a method that does not exist - in the second.
+    classSuperByInternalName: context.classSuperByInternalName,
+    classInterfacesByInternalName: context.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: context.classIsInterfaceByInternalName,
     fieldByName,
     outerClassInternalName: context.classInternalName,
     outerFieldByName: context.fieldByName,
@@ -6030,6 +6061,15 @@ function lowerDecompilerConstructorInvocation(expression, context) {
   if (!owner || expression.name !== owner.split('/').pop().split('$').pop()) return null;
   const rawArgs = (expression.arguments || []).map((argument) => lowerExpressionToJavaIrValue(argument, context));
   if (!rawArgs.every(Boolean)) return null;
+  // Matching the method name against the cast type's simple name is only
+  // evidence of the decompiler's constructor idiom when the type has no such
+  // method. chess has a class `c` that inherits `lh.c(String,int,int,int,int)`,
+  // and `((c) x).c(...)` is an ordinary call to it - rewriting that to
+  // `new c(...)` dropped the receiver and named a constructor that never existed.
+  if (selectExactUserMethodDescriptorInHierarchy(owner, expression.name, rawArgs, context, false)
+      || selectUserMethodDescriptorInHierarchy(owner, expression.name, rawArgs, context, false)) {
+    return null;
+  }
   const method = methodDescriptorForConstructorCall(owner, rawArgs, context);
   const parameters = method.parameterDescriptors || parameterDescriptorsFromMethodDescriptor(method.descriptor) || [];
   const args = rawArgs.map((rawArg, index) => {
@@ -7902,6 +7942,17 @@ function createEnumDefaultConstructor(classContext) {
     classMethodsByInternalName: classContext.classMethodsByInternalName,
     classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
     classFieldsByInternalName: classContext.classFieldsByInternalName,
+    // The hierarchy maps have to travel with the method and overload maps.
+    // referenceConversionDistance walks classSuperByInternalName to widen an
+    // argument to a supertype parameter, and ownerIsInterface reads
+    // classIsInterfaceByInternalName to choose invokeinterface over
+    // invokevirtual; a context that carries the overloads but not the hierarchy
+    // resolves neither. A call written identically in a method and in a class
+    // declared inside that method compiled to `ul.a(ILck;)V` in the first and
+    // `ul.a(ILnk;)V` - a method that does not exist - in the second.
+    classSuperByInternalName: classContext.classSuperByInternalName,
+    classInterfacesByInternalName: classContext.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: classContext.classIsInterfaceByInternalName,
     typeParameters: classContext.typeParameters,
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,
@@ -7979,6 +8030,17 @@ function lowerEnumConstructorToJavaIr(method, classContext) {
     classMethodsByInternalName: classContext.classMethodsByInternalName,
     classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
     classFieldsByInternalName: classContext.classFieldsByInternalName,
+    // The hierarchy maps have to travel with the method and overload maps.
+    // referenceConversionDistance walks classSuperByInternalName to widen an
+    // argument to a supertype parameter, and ownerIsInterface reads
+    // classIsInterfaceByInternalName to choose invokeinterface over
+    // invokevirtual; a context that carries the overloads but not the hierarchy
+    // resolves neither. A call written identically in a method and in a class
+    // declared inside that method compiled to `ul.a(ILck;)V` in the first and
+    // `ul.a(ILnk;)V` - a method that does not exist - in the second.
+    classSuperByInternalName: classContext.classSuperByInternalName,
+    classInterfacesByInternalName: classContext.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: classContext.classIsInterfaceByInternalName,
     outerClassInternalName: classContext.outerClassInternalName,
     outerFieldByName: classContext.outerFieldByName,
     outerMethodByName: classContext.outerMethodByName,
@@ -8630,6 +8692,17 @@ function createInnerMemberDefaultConstructor(classContext) {
     classMethodsByInternalName: classContext.classMethodsByInternalName,
     classMethodOverloadsByInternalName: classContext.classMethodOverloadsByInternalName,
     classFieldsByInternalName: classContext.classFieldsByInternalName,
+    // The hierarchy maps have to travel with the method and overload maps.
+    // referenceConversionDistance walks classSuperByInternalName to widen an
+    // argument to a supertype parameter, and ownerIsInterface reads
+    // classIsInterfaceByInternalName to choose invokeinterface over
+    // invokevirtual; a context that carries the overloads but not the hierarchy
+    // resolves neither. A call written identically in a method and in a class
+    // declared inside that method compiled to `ul.a(ILck;)V` in the first and
+    // `ul.a(ILnk;)V` - a method that does not exist - in the second.
+    classSuperByInternalName: classContext.classSuperByInternalName,
+    classInterfacesByInternalName: classContext.classInterfacesByInternalName,
+    classIsInterfaceByInternalName: classContext.classIsInterfaceByInternalName,
     typeParameters: classContext.typeParameters,
     currentMethodIsStatic: false,
     syntheticClasses: classContext.syntheticClasses,

@@ -73,6 +73,70 @@ public class InstanceSubtypeOverloadSmoke {
 }
 `;
 
+const NESTED_CONTEXT_OVERLOAD_SMOKE_SOURCE = `
+class NestedCtxBase {}
+class NestedCtxLeaf extends NestedCtxBase {}
+class NestedCtxSink {
+  void accept(NestedCtxBase value) {}
+  void accept(NestedCtxSink value) {}
+}
+interface NestedCtxRunner { void run(NestedCtxLeaf value); }
+public class NestedCtxOverloadSmoke {
+  static NestedCtxSink sink;
+  static void plain(NestedCtxLeaf value) {
+    sink.accept(value);
+  }
+  static NestedCtxRunner viaLocalClass() {
+    class Local implements NestedCtxRunner {
+      public void run(NestedCtxLeaf value) {
+        sink.accept(value);
+      }
+    }
+    return new Local();
+  }
+  static NestedCtxRunner viaAnonymousClass() {
+    return new NestedCtxRunner() {
+      public void run(NestedCtxLeaf value) {
+        sink.accept(value);
+      }
+    };
+  }
+}
+`;
+
+const INAPPLICABLE_OVERLOAD_SMOKE_SOURCE = `
+class InapplicableBase {}
+class InapplicableMid extends InapplicableBase {}
+class InapplicableLeaf extends InapplicableMid {}
+class InapplicableSuper {
+  void pick(InapplicableBase value, byte flag) {}
+}
+class InapplicableOwner extends InapplicableSuper {
+  void pick(InapplicableLeaf value, int flag) {}
+}
+public class InapplicableOverloadSmoke {
+  static void call(InapplicableOwner owner, InapplicableMid value) {
+    owner.pick(value, (byte) 7);
+  }
+}
+`;
+
+const CONSTRUCTOR_NAME_COLLISION_SMOKE_SOURCE = `
+class CollisionBase {
+  final void other(String param0, int param1) {}
+  final void collide(String param0, int param1) {}
+}
+final class collide extends CollisionBase {
+  collide(byte[] param0) {}
+}
+public class ConstructorNameCollisionSmoke {
+  static void call(Object receiver) {
+    ((collide) (Object) receiver).other("x", 1);
+    ((collide) (Object) receiver).collide("y", 2);
+  }
+}
+`;
+
 const LOCAL_STATE_SWITCH_SMOKE_SOURCE = `
 public class LocalStateSwitchSmoke {
   static int run(int initial) {
@@ -890,6 +954,80 @@ test('instance overload resolution follows the argument class hierarchy', (t) =>
     'same-arity reference overloads compile completely');
   t.equal(call && call.operands[3], '(LInstanceSubtypeBase;)V',
     'the nearest assignable superclass wins over an unrelated reference type');
+  t.end();
+});
+
+// A local or anonymous class gets its own lowering context. When that context
+// carried the overload maps but not the class hierarchy maps, the same call
+// resolved one way in a method and another way inside a class declared in that
+// method - the second built the descriptor from the argument's own type, naming
+// a method that does not exist. steelsentinels shipped `ul.a(ILnk;)V` that way.
+test('overload resolution is identical inside local and anonymous classes', (t) => {
+  const result = frontend.compileJavaSource(NESTED_CONTEXT_OVERLOAD_SMOKE_SOURCE, {
+    sourceFileName: 'NestedCtxOverloadSmoke.java',
+  });
+  t.equal(result.bytecodeIr.status, 'complete',
+    'the nested-context overload set compiles completely');
+
+  const acceptDescriptors = result.bytecodeIr.classes.flatMap((classIr) =>
+    classIr.methods.flatMap((method) => (method.instructions || [])
+      .filter((instruction) => instruction.operands && instruction.operands[2] === 'accept')
+      .map((instruction) => ({
+        where: `${classIr.internalName}.${method.name}`,
+        descriptor: instruction.operands[3],
+      }))));
+
+  t.equal(acceptDescriptors.length, 3,
+    'the call appears once in the method, once in the local class and once in the anonymous class');
+  for (const call of acceptDescriptors) {
+    t.equal(call.descriptor, '(LNestedCtxBase;)V',
+      `${call.where} widens the argument to the declared parameter type`);
+  }
+  t.end();
+});
+
+// coerceValueToDescriptor turns any reference into any other by inserting a
+// cast, so an applicability test built on it accepts a *downcast* - a parameter
+// type that is a subclass of the argument. That let the by-name fallback in
+// selectUserMethodDescriptor claim a method the call could not invoke, and
+// because the fallback runs before the hierarchy walk it also hid the inherited
+// method that did apply. orbdefence shipped `pk.a(Lvi;I)V` for an `s` argument.
+test('an overload needing a downcast loses to the inherited one that applies', (t) => {
+  const result = frontend.compileJavaSource(INAPPLICABLE_OVERLOAD_SMOKE_SOURCE, {
+    sourceFileName: 'InapplicableOverloadSmoke.java',
+  });
+  t.equal(result.bytecodeIr.status, 'complete',
+    'the downcast-adjacent overload set compiles completely');
+  const call = result.bytecodeIr.classes
+    .find((classIr) => classIr.internalName === 'InapplicableOverloadSmoke')
+    .methods.find((method) => method.name === 'call').instructions
+    .find((instruction) => instruction.operands && instruction.operands[2] === 'pick');
+  t.equal(call && call.operands[3], '(LInapplicableBase;B)V',
+    'the applicable inherited overload wins over the subclass parameter it cannot reach');
+  t.end();
+});
+
+// `((Type) x).Type(args)` is how the decompiler writes some constructor calls,
+// but the name match alone is not evidence: chess has a class `c` that inherits
+// `lh.c(String,int,int,int,int)`, and rewriting that call to `new c(...)` threw
+// the receiver away and named a constructor that does not exist.
+test('a method whose name matches its class is a call, not a constructor', (t) => {
+  const result = frontend.compileJavaSource(CONSTRUCTOR_NAME_COLLISION_SMOKE_SOURCE, {
+    sourceFileName: 'ConstructorNameCollisionSmoke.java',
+  });
+  t.equal(result.bytecodeIr.status, 'complete',
+    'the name-collision source compiles completely');
+  const instructions = result.bytecodeIr.classes
+    .find((classIr) => classIr.internalName === 'ConstructorNameCollisionSmoke')
+    .methods.find((method) => method.name === 'call').instructions;
+  const collide = instructions.find((instruction) =>
+    instruction.operands && instruction.operands[2] === 'collide');
+  t.equal(collide && collide.opcode, 'invokevirtual',
+    'the inherited method is invoked on the receiver');
+  t.equal(collide && collide.operands[3], '(Ljava/lang/String;I)V',
+    'and it keeps the method descriptor rather than a constructor descriptor');
+  t.notOk(instructions.some((instruction) => instruction.opcode === 'new'),
+    'nothing is allocated: the receiver is not replaced by a fresh object');
   t.end();
 });
 

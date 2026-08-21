@@ -98,6 +98,20 @@ module.exports = {
     },
     'getPriority()I': (jvm, obj) =>
       obj.priority === undefined ? 5 : obj.priority,
+    // java/lang/Thread is closed, so a name this model does not carry cannot be
+    // supplied by the compilation that calls it: the frontend refuses to guess a
+    // descriptor for such a call and reports a compile error instead. setName is
+    // the write half of the getName below, and pixelate's ii names its threads.
+    'setName(Ljava/lang/String;)V': withThrows((jvm, obj, args) => {
+      const name = stringValue(args[0], null);
+      if (name === null) {
+        throw {
+          type: 'java/lang/NullPointerException',
+          message: 'name cannot be null',
+        };
+      }
+      obj.name = name;
+    }, ['java/lang/NullPointerException']),
     'getName()Ljava/lang/String;': (jvm, obj, args) => {
       return jvm.internString(obj.name);
     },

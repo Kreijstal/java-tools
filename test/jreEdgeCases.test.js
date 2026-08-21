@@ -29,6 +29,7 @@ const { encodePng } = require('../src/io/pngEncoder');
 const jpeg = require('jpeg-js');
 const Class = require('../src/jre/java/lang/Class');
 const Vector = require('../src/jre/java/util/Vector');
+const StringBuffer = require('../src/jre/java/lang/StringBuffer');
 const Thread = require('../src/jre/java/lang/Thread');
 const ThreadGroup = require('../src/jre/java/lang/ThreadGroup');
 const JNI = require('../src/core/jni');
@@ -430,6 +431,127 @@ test('Vector.insertElementAt inserts in order and checks its index', (t) => {
     error = caught;
   }
   t.equal(error && error.type, 'java/lang/ArrayIndexOutOfBoundsException');
+  t.end();
+});
+
+test('StringBuffer carries the same mutators as its StringBuilder twin', (t) => {
+  const methods = StringBuffer.methods;
+  const buffer = {};
+  methods['<init>(Ljava/lang/String;)V'](null, buffer, ['abc']);
+
+  t.equal(methods['charAt(I)C'](null, buffer, [0]), 97,
+    'charAt returns the char code, not a one-character string');
+
+  methods['setCharAt(IC)V'](null, buffer, [1, 'Z'.charCodeAt(0)]);
+  t.equal(buffer.value, 'aZc', 'setCharAt replaces in place and leaves the length alone');
+
+  methods['reverse()Ljava/lang/StringBuffer;'](null, buffer, []);
+  t.equal(buffer.value, 'cZa', 'reverse flips the whole buffer');
+
+  methods['setLength(I)V'](null, buffer, [2]);
+  t.equal(buffer.value, 'cZ', 'shrinking drops the tail');
+  methods['setLength(I)V'](null, buffer, [4]);
+  t.equal(buffer.value, 'cZ\0\0', 'growing pads with NUL, matching the JDK');
+  t.equal(methods['length()I'](null, buffer, []), 4,
+    'the padding counts towards the length');
+
+  // Both index-taking mutators report out-of-range the same way the JDK does.
+  for (const [name, args] of [['charAt(I)C', [4]], ['setCharAt(IC)V', [4, 65]],
+    ['charAt(I)C', [-1]], ['setLength(I)V', [-1]]]) {
+    let error = null;
+    try {
+      methods[name](null, { value: 'abc' }, args);
+    } catch (caught) {
+      error = caught;
+    }
+    t.equal(error && error.type, 'java/lang/StringIndexOutOfBoundsException',
+      `${name} rejects index ${args[0]}`);
+  }
+  t.end();
+});
+
+test('Thread.setName replaces the name getName reports and rejects null', (t) => {
+  const methods = Thread.methods;
+  const thread = { name: 'Thread-0' };
+  const jvm = { internString: (value) => value };
+
+  methods['setName(Ljava/lang/String;)V'](jvm, thread, ['loader']);
+  t.equal(methods['getName()Ljava/lang/String;'](jvm, thread, []), 'loader',
+    'setName is the write half of getName');
+
+  let error = null;
+  try {
+    methods['setName(Ljava/lang/String;)V'](jvm, thread, [null]);
+  } catch (caught) {
+    error = caught;
+  }
+  t.equal(error && error.type, 'java/lang/NullPointerException',
+    'a null name is rejected rather than silently stored');
+  t.equal(thread.name, 'loader', 'the rejected call left the old name in place');
+  t.end();
+});
+
+test('Vector.setSize pads with null when it grows and drops the tail when it shrinks', (t) => {
+  const vector = {};
+  const methods = Vector.methods;
+  methods['<init>()V'](null, vector, []);
+  methods['addElement(Ljava/lang/Object;)V'](null, vector, ['kept']);
+
+  methods['setSize(I)V'](null, vector, [3]);
+  t.deepEqual(vector.items, ['kept', null, null],
+    'growing fills the new slots with null, not with undefined');
+  t.equal(methods['size()I'](null, vector, []), 3,
+    'the padded slots count towards the logical size');
+
+  methods['setSize(I)V'](null, vector, [1]);
+  t.deepEqual(vector.items, ['kept'], 'shrinking discards the tail');
+  t.equal(methods['size()I'](null, vector, []), 1);
+
+  let error = null;
+  try {
+    methods['setSize(I)V'](null, vector, [-1]);
+  } catch (caught) {
+    error = caught;
+  }
+  t.equal(error && error.type, 'java/lang/ArrayIndexOutOfBoundsException',
+    'a negative size indexes below the array, as it does in the JDK');
+  t.end();
+});
+
+test('Vector legacy element mutators replace, remove and report by index', (t) => {
+  const vector = {};
+  const methods = Vector.methods;
+  methods['<init>()V'](null, vector, []);
+  methods['addElement(Ljava/lang/Object;)V'](null, vector, ['first']);
+  methods['addElement(Ljava/lang/Object;)V'](null, vector, ['second']);
+
+  methods['setElementAt(Ljava/lang/Object;I)V'](null, vector, ['replaced', 1]);
+  t.deepEqual(vector.items, ['first', 'replaced'],
+    'setElementAt takes the element first and the index second');
+  t.equal(vector.size, 2, 'replacing an element does not change the size');
+
+  t.equal(methods['removeElement(Ljava/lang/Object;)Z'](null, vector, ['absent']), 0,
+    'removeElement reports false when the element is not present');
+  t.equal(methods['removeElement(Ljava/lang/Object;)Z'](null, vector, ['first']), 1);
+  t.deepEqual(vector.items, ['replaced']);
+
+  methods['removeElementAt(I)V'](null, vector, [0]);
+  t.equal(methods['isEmpty()Z'](null, vector, []), 1,
+    'the size counter follows the removals');
+
+  for (const [name, args] of [
+    ['setElementAt(Ljava/lang/Object;I)V', ['x', 0]],
+    ['removeElementAt(I)V', [0]],
+  ]) {
+    let error = null;
+    try {
+      methods[name](null, vector, args);
+    } catch (caught) {
+      error = caught;
+    }
+    t.equal(error && error.type, 'java/lang/ArrayIndexOutOfBoundsException',
+      name + ' rejects an index at or past the size');
+  }
   t.end();
 });
 

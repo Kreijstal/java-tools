@@ -1318,6 +1318,12 @@ class JitCompiler {
   }
 
   runGeneratedFrame(generated, frame, thread, initialBytecodeChecks) {
+    // JVM_DEBUG_INVOKE_TRACE also covers generated frames: a JIT tier can run
+    // a method without ever calling CallStack.push, so a push-site trace alone
+    // reports only the interpreted half of an interleaving.
+    if (JitCompiler.debugInvokeTrace) {
+      this.traceGeneratedFrameEntry(frame);
+    }
     if (this.profileMethods) {
       this.generatedRunCount += 1;
       if (generated.jvmSynchronous) this.syncGeneratedRunCount += 1;
@@ -2185,6 +2191,37 @@ class JitCompiler {
   // Give those regions the ordinary wall-clock scheduler slice instead. Due
   // timers, debugger observability, deterministic clocks, and the browser
   // event-loop deadline still force an exact materialized safe point.
+  traceGeneratedFrameEntry(frame) {
+    const method = frame && frame.method;
+    if (!method) return;
+    const owner = frame.className || method.className || "?";
+    if (!JitCompiler.debugInvokeTrace.has(`${owner}.${method.name}`) &&
+        !JitCompiler.debugInvokeTrace.has(owner)) return;
+    const fields = ((process.env.JVM_DEBUG_INVOKE_FIELDS || "f")
+      .split(",").map((entry) => entry.trim()).filter(Boolean));
+    const seen = [];
+    (frame.locals || []).forEach((item, slot) => {
+      if (!item || typeof item !== "object" || !item.fields) return;
+      for (const key of Object.keys(item.fields)) {
+        if (!fields.includes(String(key).split(".").pop())) continue;
+        seen.push(`${slot}:${key}=${item.fields[key]}`);
+      }
+    });
+    const thread = this.jvm.threads?.[this.jvm.currentThreadIndex];
+    const depth = thread?.callStack?.items?.length;
+    const sameMethod = (thread?.callStack?.items || [])
+      .filter((item) => item && item.method === method).length;
+    const stackShape = (thread?.callStack?.items || []).map((item, index) => {
+      const owned = item?.className || item?.method?.className || "?";
+      return `${index}:${owned}.${item?.method?.name || "?"}@${item?.pc}`
+        + (item === frame ? "*" : "");
+    }).join(" ");
+    console.error(`[generated-frame] ${owner}.${method.name}`
+      + `${method.descriptor || ""} pc=${frame.pc} thread=${thread?.id}`
+      + `/${thread?.name || "?"} depth=${depth} activations=${sameMethod} `
+      + seen.join(" ") + ` || ${stackShape}`);
+  }
+
   continueStructuredQuantum(thread) {
     const jvm = this.jvm;
     if (!jvm || !thread || thread.status !== "runnable") return false;
@@ -5217,22 +5254,39 @@ class JitCompiler {
         const debugFields = process.env.JVM_DEBUG_ARRAY_OOB_FIELDS || "";
         if (debugFields) {
           const wanted = new Set(debugFields.split(",").filter(Boolean));
-          const objects = [];
-          for (const item of (frame.locals || [])) {
-            if (!item || typeof item !== "object" || !item.fields) continue;
-            const picked = {};
-            for (const key of Object.keys(item.fields)) {
-              const name = String(key).split(".").pop();
-              if (wanted.has(name) || wanted.has(String(key))) {
-                picked[key] = scalar(item.fields[key]);
+          const pickFields = (locals) => {
+            const objects = [];
+            (locals || []).forEach((item, slot) => {
+              if (!item || typeof item !== "object" || !item.fields) return;
+              const picked = {};
+              for (const key of Object.keys(item.fields)) {
+                const name = String(key).split(".").pop();
+                if (wanted.has(name) || wanted.has(String(key))) {
+                  picked[key] = scalar(item.fields[key]);
+                }
               }
-            }
-            if (Object.keys(picked).length) {
-              objects.push({ type: scalar(item), fields: picked });
-            }
-          }
-          console.error("[array-load-oob:fields]",
-            JSON.stringify({ spec: debugFields, objects }));
+              if (Object.keys(picked).length) {
+                objects.push({ slot, type: scalar(item), fields: picked });
+              }
+            });
+            return objects;
+          };
+          // Whether a caller has already advanced to the next object while
+          // this frame still draws the previous one is only visible by
+          // comparing the same field across the whole stack, so every frame
+          // is reported, not just the one that went out of bounds.
+          console.error("[array-load-oob:fields]", JSON.stringify({
+            spec: debugFields,
+            objects: pickFields(frame.locals),
+            callers: callStack.slice(Math.max(0, callStack.length - 8))
+              .map((activeFrame) => ({
+                owner: scalar(activeFrame.className),
+                method: `${activeFrame.method?.name || "<unknown>"}` +
+                  `${activeFrame.method?.descriptor || ""}`,
+                pc: activeFrame.pc,
+                objects: pickFields(activeFrame.locals),
+              })),
+          }));
         }
         const debugStatics = process.env.JVM_DEBUG_ARRAY_OOB_STATICS || "";
         for (const spec of debugStatics.split(",").filter(Boolean)) {
@@ -9661,6 +9715,13 @@ function getAsyncFunctionConstructor() {
     return null;
   }
 }
+
+JitCompiler.debugInvokeTrace = (() => {
+  const raw = (typeof process !== "undefined" && process.env &&
+    process.env.JVM_DEBUG_INVOKE_TRACE) || "";
+  if (!raw) return null;
+  return new Set(raw.split(",").map((entry) => entry.trim()).filter(Boolean));
+})();
 
 module.exports = JitCompiler;
 module.exports._test = {

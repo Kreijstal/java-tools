@@ -4939,6 +4939,37 @@ class JvmSsaBlockRenderer {
               `  helpers.linkStructuredCallChild(frame, thread, ${
                 callStackDepth}, ${JSON.stringify(site.returnType)});`,
               deoptCallMarker, "}");
+            // A callee that left a frame on the stack has not run to
+            // completion, whatever it returned. The check above it is reached
+            // only for the async sentinel and the one before that only for an
+            // explicit deopt, so a callee that pushed its frame and returned
+            // an ordinary value fell through every guard: the caller carried
+            // on and pushed its next call on top of the untouched child, which
+            // then ran against state the later call had already overwritten.
+            // The synchronous tier has always checked this unconditionally.
+            const leftActiveChildMarker =
+              `__JVM_LEFT_ACTIVE_CHILD_${index}_${site.id}__`;
+            continuationFallbacks.set(leftActiveChildMarker, {
+              continuation: [
+                ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
+                `    yield { deopt: true, transient: true, structuredResumePc: ${
+                  index + 1
+                }, reason: 'structured SSA callee left active child' };`,
+                ...(site.returnsVoid ? [] : [
+                  `    ${out} = frame.stack.items.pop();`,
+                ]),
+              ],
+              ordinary: [
+                ...materializeLines(stack, index + 1).map((line) => `    ${line}`),
+                "    return { deopt: true, transient: true, " +
+                  "reason: 'structured SSA callee left active child' };",
+              ],
+              checkedLeaf: ["    return helpers.asyncInvokeSentinel();"],
+            });
+            lines.push(
+              `/*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_${index}_${site.id}__*/`,
+              `if (thread.callStack.items.length > ${callStackDepth}) {`,
+              leftActiveChildMarker, "}");
             if (deferMaterialization) deferredCallMaterializationCount += 1;
             if (!site.returnsVoid) stack.push(out);
             const yieldedCallMarker =
@@ -10960,18 +10991,30 @@ class JvmSsaBlockRenderer {
         // spilling site re-restores it through its own `frame === null`
         // guard, and the propagating deopt/exception arms return before this
         // line so a legitimately suspended frame stays put.
+        // The left-active-child guard counts every Frame above the depth the
+        // call site sampled. In a restoring body the Frame this fallback
+        // spliced in itself sits there, so the guard has to be preceded by the
+        // same withdrawal the region end performs -- otherwise a normally
+        // completed call reads its own caller Frame as a stranded callee and
+        // deopts. Withdrawing twice is a no-op: the second is behind the same
+        // `frame !== null`.
+        const withdrawRestoredFrame = (indent) => [
+          `${indent}if (frame !== null) {`,
+          `${indent}  frame = helpers.structuredSsa` +
+            ".releaseUnwindFrame(plan, thread, frame);",
+          `${indent}  locals = null;`,
+          `${indent}  stack = null;`,
+          `${indent}}`,
+        ];
         restoringRenderedTree = restoringRenderedTree.flatMap((line) => {
           const endMarker =
             /^(\s*)\/\*__JVM_REGION_CALL_END_\d+__\*\/$/.exec(line);
-          if (!endMarker) return [line];
-          return [line,
-            `${endMarker[1]}if (frame !== null) {`,
-            `${endMarker[1]}  frame = helpers.structuredSsa` +
-              ".releaseUnwindFrame(plan, thread, frame);",
-            `${endMarker[1]}  locals = null;`,
-            `${endMarker[1]}  stack = null;`,
-            `${endMarker[1]}}`,
-          ];
+          if (endMarker) return [line, ...withdrawRestoredFrame(endMarker[1])];
+          const withdrawMarker =
+            /^(\s*)\/\*__JVM_LEFT_ACTIVE_CHILD_WITHDRAW_\d+_[^*]*__\*\/$/
+              .exec(line);
+          if (withdrawMarker) return withdrawRestoredFrame(withdrawMarker[1]);
+          return [line];
         });
         restoringRenderedTree = compactCheckedLeafLines(
           restoringRenderedTree, false);

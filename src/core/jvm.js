@@ -2179,10 +2179,21 @@ class JVM {
               this._writeCount = (this._writeCount || 0) + 1;
               const shown = (value && (Array.isArray(value) ||
                 ArrayBuffer.isView(value))) ? `[len ${value.length}]` : value;
-              if (typeof value !== "number" || value === 0 ||
+              const previous = super.get(key);
+              const wasShown = (previous && (Array.isArray(previous) ||
+                ArrayBuffer.isView(previous)))
+                ? `[len ${previous.length}]` : previous;
+              // A counter field is written once per element, so printing every
+              // write buries the run. JVM_DEBUG_STATIC_WRITES_EVERY=1 prints
+              // them all; the default samples, and always reports the value
+              // being overwritten so a reset still reveals the count it ended
+              // on. Do not read the sampled gaps as batched writes.
+              const every = typeof process !== "undefined" && process.env &&
+                process.env.JVM_DEBUG_STATIC_WRITES_EVERY === "1";
+              if (every || typeof value !== "number" || value === 0 ||
                   value % 64 === 0) {
                 console.error(`[static-write] #${this._writeCount} `
-                  + `${tracedClass}.${key} = ${shown}\n`
+                  + `${tracedClass}.${key} = ${shown} (was ${wasShown})\n`
                   + new Error().stack.split("\n").slice(2, 6).join("\n"));
               }
             }

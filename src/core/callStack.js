@@ -26,7 +26,45 @@ function releaseFrameMonitor(frame) {
   }
 }
 
+// JVM_DEBUG_INVOKE_TRACE=hi.a,i.a logs every entry to the named methods with
+// the guest fields named by JVM_DEBUG_INVOKE_FIELDS (default "f") read off any
+// object local. Reconstructing the real call order across tiers is otherwise
+// guesswork: a shared-buffer producer and consumer can interleave wrongly
+// without either one faulting where the interleaving happened.
+const DEBUG_INVOKE_TRACE = (typeof process !== "undefined" &&
+  process.env && process.env.JVM_DEBUG_INVOKE_TRACE) || "";
+const DEBUG_INVOKE_FIELDS = ((typeof process !== "undefined" &&
+  process.env && process.env.JVM_DEBUG_INVOKE_FIELDS) || "f")
+  .split(",").map((entry) => entry.trim()).filter(Boolean);
+const DEBUG_INVOKE_WANTED = new Set(
+  DEBUG_INVOKE_TRACE.split(",").map((entry) => entry.trim()).filter(Boolean));
+let debugInvokeSeq = 0;
+
+function traceInvoke(frame) {
+  const method = frame && frame.method;
+  if (!method) return;
+  const owner = frame.className || method.className || "?";
+  if (!DEBUG_INVOKE_WANTED.has(`${owner}.${method.name}`) &&
+      !DEBUG_INVOKE_WANTED.has(owner)) return;
+  const seen = [];
+  (frame.locals || []).forEach((item, slot) => {
+    if (!item || typeof item !== "object" || !item.fields) return;
+    for (const key of Object.keys(item.fields)) {
+      if (!DEBUG_INVOKE_FIELDS.includes(String(key).split(".").pop())) continue;
+      seen.push(`${slot}:${key}=${item.fields[key]}`);
+    }
+  });
+  debugInvokeSeq += 1;
+  console.error(`[invoke] #${debugInvokeSeq} ${owner}.${method.name}`
+    + `${method.descriptor || ""} ${seen.join(" ")}`);
+}
+
 class CallStack extends Stack {
+  push(frame) {
+    if (DEBUG_INVOKE_TRACE) traceInvoke(frame);
+    return super.push(frame);
+  }
+
   // Every method return goes through here.
   pop() {
     const items = this.items;
