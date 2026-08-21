@@ -1334,6 +1334,44 @@ function lowerJavaIrMethod(method, classIr = null, options = {}) {
       // Declarations affect the local table carried by Java IR; no stack code is emitted.
     } else if (op.op === 'assign') {
       const local = state.locals.get(op.target);
+      // javac lowers "x++", "++x", "x += 1", and "x = x + 1" on an int local
+      // to the single-slot iinc instruction (iinc x, 1). The JVM.js JIT's
+      // scalar-loop detector requires that exact shape for hot loops, so
+      // recognize the BinaryValue(+/- , LocalValue(same target), 1) pattern
+      // here instead of emitting iload/iconst_1/iadd/istore.
+      if (local && local.descriptor === 'I' && typeof local.slotHint === 'number' &&
+          op.value && op.value.kind === 'BinaryValue' &&
+          (op.value.operator === '+' || op.value.operator === '-')) {
+        const candidates = [op.value.left, op.value.right];
+        const targetIndex = candidates.findIndex((c) => c && c.kind === 'LocalValue' && c.local === op.target);
+        const literal = candidates[1 - targetIndex];
+        if (targetIndex >= 0 && literal && literal.kind === 'LiteralValue' && literal.type === 'I') {
+          const raw = String(literal.raw !== undefined && literal.raw !== null ? literal.raw : literal.value);
+          const n = Number(raw.replace(/[lLfFdD]$/, ''));
+          if (Number.isInteger(n)) {
+            if (op.value.operator === '+' && n === 1) {
+              instructions.push(createJvmInstruction('iinc', [String(local.slotHint), '1'], { localId: local.id }));
+            } else if (op.value.operator === '+' && n === -1) {
+              instructions.push(createJvmInstruction('iinc', [String(local.slotHint), '-1'], { localId: local.id }));
+            } else if (op.value.operator === '-' && targetIndex === 0 && n === 1) {
+              // x - 1 -> iinc x, -1 (only when the local is the left operand)
+              instructions.push(createJvmInstruction('iinc', [String(local.slotHint), '-1'], { localId: local.id }));
+            } else {
+              const value = emitValue(op.value, state);
+              if (!value || value.descriptor !== local.descriptor) {
+                unsupported.push(`unsupported assignment to ${op.target} in ${method.name}`);
+                return;
+              }
+              instructions.push(createJvmInstruction(
+                storeOpcodeForDescriptor(local.descriptor),
+                [String(local.slotHint)],
+                { localId: local.id },
+              ));
+            }
+            return;
+          }
+        }
+      }
       const value = emitValue(op.value, state);
       if (!local || !value || value.descriptor !== local.descriptor || typeof local.slotHint !== 'number') {
         unsupported.push(`unsupported assignment to ${op.target} in ${method.name}`);

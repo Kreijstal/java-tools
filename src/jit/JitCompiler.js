@@ -1696,7 +1696,7 @@ class JitCompiler {
       "ior", "irem", "ireturn", "ishl", "istore_1", "istore_2", "istore_3", "ineg", "ishr", "iushr", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor",
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
-      "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return", "saload", "sastore",
+      "monitorenter", "monitorexit", "multianewarray", "new", "newarray", "nop", "pop", "putfield", "putstatic", "return", "saload", "sastore",
       "sipush"
     ]);
 
@@ -1829,7 +1829,7 @@ class JitCompiler {
       "iand", "imul", "ineg", "iinc", "invokeinterface", "invokespecial", "invokestatic", "invokevirtual",
       "i2l", "ior", "irem", "ireturn", "ishl", "ishr", "iushr", "istore", "istore_0", "istore_1", "istore_2",
       "istore_3", "isub", "ixor", "l2i", "lcmp", "ldc", "ldc_w", "ldc2_w", "ldiv", "lmul", "lreturn", "lshr", "lxor", "multianewarray", "new", "newarray", "pop", "putfield", "putstatic", "return",
-      "lookupswitch", "tableswitch",
+      "lookupswitch", "nop", "tableswitch",
       ...(this.postIncrementHelpersEnabled ? ["dup_x1"] : []),
       ...EXTENDED_TIER_OPCODES,
       "monitorenter", "monitorexit", "saload", "sastore", "sipush",
@@ -9480,10 +9480,64 @@ function hasMonitorBytecode(codeItems) {
   });
 }
 
+function reachableInstructionIndexes(codeItems) {
+  // Forward CFG reachability from the method entry. The frontend terminates
+  // each unreachable dead run with an athrow (nops ending in athrow); those
+  // terminators must not count as real control flow, or a method whose only
+  // athrows are dead-code terminators is wrongly classified as
+  // experimental-control and barred from the JIT tiers.
+  const labels = buildLabelMap(codeItems);
+  const reachable = new Set();
+  const queue = [0];
+  while (queue.length > 0) {
+    const index = queue.pop();
+    if (!Number.isInteger(index) || index < 0 || index >= codeItems.length) continue;
+    if (reachable.has(index)) continue;
+    reachable.add(index);
+    const instruction = codeItems[index] && codeItems[index].instruction;
+    const op = getOp(instruction);
+    if (!op) {
+      queue.push(index + 1);
+      continue;
+    }
+    if (op === "goto" || op === "goto_w") {
+      const target = labels.get(instruction.arg);
+      if (Number.isInteger(target)) queue.push(target);
+    } else if (op.startsWith("if") || op.startsWith("if_") || op === "ifnull" || op === "ifnonnull") {
+      const target = labels.get(instruction.arg);
+      if (Number.isInteger(target)) queue.push(target);
+      queue.push(index + 1);
+    } else if (op === "tableswitch" || op === "lookupswitch") {
+      const arg = instruction.arg;
+      if (arg && typeof arg === "object") {
+        if (typeof arg.defaultLabel === "string") {
+          const t = labels.get(arg.defaultLabel);
+          if (Number.isInteger(t)) queue.push(t);
+        }
+        for (const c of arg.cases || []) {
+          if (c && typeof c.label === "string") {
+            const t = labels.get(c.label);
+            if (Number.isInteger(t)) queue.push(t);
+          }
+        }
+      }
+    } else if (op === "return" || op === "ireturn" || op === "lreturn" ||
+        op === "freturn" || op === "dreturn" || op === "areturn" ||
+        op === "athrow" || op === "jsr" || op === "jsr_w" || op === "ret") {
+      // no fall-through
+    } else {
+      queue.push(index + 1);
+    }
+  }
+  return reachable;
+}
+
 function hasExperimentalControlFlow(codeItems) {
-  return codeItems.some((item) => {
+  const reachable = reachableInstructionIndexes(codeItems);
+  return codeItems.some((item, index) => {
     const op = getOp(item && item.instruction);
-    return op === "athrow" || op === "monitorenter" || op === "monitorexit";
+    return (op === "athrow" || op === "monitorenter" || op === "monitorexit") &&
+      reachable.has(index);
   });
 }
 
