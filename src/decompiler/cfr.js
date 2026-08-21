@@ -117,7 +117,67 @@ function runtimeVisibleAnnotations(attributes, pool) {
     ? (attribute.info.annotations || []).map((annotation) => parseRawAnnotation(annotation, pool)) : [];
 }
 
+// A nested class's binary name (Outer$Inner) is not a type name in source: javac
+// reads `PyramidApplet$Face` as one top-level identifier and reports "cannot
+// find symbol" even with that exact class file on the classpath. The
+// InnerClasses attribute is what carries the source spelling, so record it as
+// classes are parsed and let type formatting consult it. Only entries that name
+// a real member class are recorded -- an anonymous class has inner_name_index 0
+// and a local class has no outer_class_info_index, and neither can be written
+// as a qualified name at all, so those keep their binary spelling rather than
+// being rewritten into something that does not parse.
+const nestedSourceNames = new Map();
+const JAVA_IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+function registerNestedSourceNames(classFileAst, pool) {
+  const utf8At = (index) => {
+    const entry = index ? (pool || [])[index] : null;
+    return entry && entry.tag === 1 && entry.info ? String(entry.info.bytes) : null;
+  };
+  const classAt = (index) => {
+    const entry = index ? (pool || [])[index] : null;
+    return entry && entry.tag === 7 && entry.info ? utf8At(entry.info.name_index) : null;
+  };
+  const attribute = ((classFileAst && classFileAst.attributes) || []).find((item) =>
+    item && item.attribute_name_index && item.attribute_name_index.name
+      && item.attribute_name_index.name.info
+      && item.attribute_name_index.name.info.bytes === 'InnerClasses');
+  for (const entry of (attribute && attribute.info && attribute.info.classes) || []) {
+    if (!entry || !entry.inner_name_index || !entry.outer_class_info_index) continue;
+    const inner = classAt(entry.inner_class_info_index);
+    const outer = classAt(entry.outer_class_info_index);
+    const simpleName = utf8At(entry.inner_name_index);
+    if (!inner || !outer || !simpleName) continue;
+    // An obfuscator is free to emit a simple name that is not an identifier;
+    // splicing that into a qualified name would produce source that parses
+    // even less well than the binary spelling it replaced.
+    if (!JAVA_IDENTIFIER.test(simpleName)) continue;
+    if (inner === outer) continue;
+    nestedSourceNames.set(inner.replace(/\//g, '.'), {
+      outer: outer.replace(/\//g, '.'), simpleName });
+  }
+}
+
+// Outer$Mid$Leaf needs every link resolved, and the outer entry may itself be
+// nested. Bail out on a cycle rather than spinning on a hand-written class file.
+function nestedSourceName(dottedBinaryName) {
+  let entry = nestedSourceNames.get(dottedBinaryName);
+  if (!entry) return null;
+  const parts = [];
+  const seen = new Set();
+  let current = dottedBinaryName;
+  while (entry) {
+    if (seen.has(current)) return null;
+    seen.add(current);
+    parts.unshift(entry.simpleName);
+    current = entry.outer;
+    entry = nestedSourceNames.get(current);
+  }
+  return `${current}.${parts.join('.')}`;
+}
+
 function convertParsedClass(parsed) {
+  registerNestedSourceNames(parsed.ast, parsed.constantPool);
   const converted = convertJson(parsed.ast, parsed.constantPool);
   const cls = (converted.classes || [])[0];
   if (!cls) return converted;
@@ -9639,7 +9699,11 @@ function simplifyType(type) {
   if (nestedJreTypes[raw]) return nestedJreTypes[raw];
   const text = /^(?:java|javax)\./.test(raw) ? raw.replace(/\$/g, '.') : raw;
   const arraySuffix = (text.match(/(?:\[\])+$/) || [''])[0];
-  const component = arraySuffix ? text.slice(0, -arraySuffix.length) : text;
+  const rawComponent = arraySuffix ? text.slice(0, -arraySuffix.length) : text;
+  // Only names the InnerClasses attribute vouched for are rewritten; a class
+  // genuinely called `ka$1` keeps its dollar, because `ka.1` is not a type.
+  const component = nestedSourceName(rawComponent) || rawComponent;
+  if (component !== rawComponent) return component + arraySuffix;
   if (/^java\.(?:lang|io|util)\.[^.]+$/.test(component)) {
     return component.slice(component.lastIndexOf('.') + 1) + arraySuffix;
   }

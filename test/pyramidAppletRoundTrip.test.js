@@ -50,7 +50,14 @@ test('minimal compiler accepts decompiled PyramidApplet array and support-field 
       'legal nested-class field names retain their binary linkage names',
     );
 
-    const result = compileJavaSource(decompiled, { sourceLevel: '8' });
+    // Only PyramidApplet.class was decompiled, so the unit references
+    // PyramidApplet.Face without declaring it -- javac needs -cp to compile the
+    // same source, and the frontend needs the same classpath for the same
+    // reason: it is where the type of Face's fields comes from.
+    const result = compileJavaSource(decompiled, {
+      sourceLevel: '8',
+      classpath: [tempDir],
+    });
     t.equal(result.bytecodeIr.status, 'complete', 'decompiled source lowers completely');
     t.equal(result.classes[0].internalName, 'PyramidApplet', 'outer applet is emitted');
     t.match(

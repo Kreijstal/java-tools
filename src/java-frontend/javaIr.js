@@ -636,6 +636,154 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   return metadata;
 }
 
+// Required lazily: the frontend is used in browser bundles that never pass a
+// classpath, and jvm_parser should not be pulled in for them.
+let classFileReader = null;
+function getClassFileAst(bytes) {
+  if (!classFileReader) {
+    const { getAST } = require('jvm_parser');
+    const { convertJson } = require('../parsing/convert_tree');
+    classFileReader = (input) => {
+      const parsed = getAST(input);
+      return convertJson(parsed.ast, parsed.constantPool);
+    };
+  }
+  return classFileReader(bytes);
+}
+
+const CLASSPATH_METADATA_CACHE = new Map();
+
+// javac answers "what type is f.color?" by reading Outer$Face.class off the
+// classpath, which is why a unit that references a type it does not declare
+// still compiles there. Without an equivalent, an argument whose type comes from
+// such a class has no descriptor, no overload is applicable, and a call like
+// g.setColor(f.color) cannot be lowered at all -- the decompiled PyramidApplet
+// round-trip fails exactly there. Read the same facts out of class files and
+// seed the maps sourceDirectoryMetadata already fills from sibling .java files.
+// Directories only: a jar needs an async reader and this path is synchronous.
+function classpathMetadata(classpath, options = {}) {
+  const roots = (Array.isArray(classpath) ? classpath : [classpath]).filter(Boolean);
+  if (roots.length === 0) return null;
+  const fileSystem = options.fileSystem || options.fs || hostFs;
+  const pathModule = options.pathModule || hostPath;
+  const resolved = roots.map((root) => pathModule.resolve(root));
+  const cacheKey = resolved.join(pathModule.delimiter);
+  const useCache = fileSystem === hostFs && options.cacheClasspathMetadata !== false;
+  if (useCache && CLASSPATH_METADATA_CACHE.has(cacheKey)) {
+    return CLASSPATH_METADATA_CACHE.get(cacheKey);
+  }
+  const metadata = {
+    classBySimpleName: new Map(),
+    classFieldsByInternalName: new Map(),
+    classMethodsByInternalName: new Map(),
+    classMethodOverloadsByInternalName: new Map(),
+    classSuperByInternalName: new Map(),
+    classInterfacesByInternalName: new Map(),
+    classIsInterfaceByInternalName: new Map(),
+  };
+  const collectClassFiles = (current, out) => {
+    let entries = [];
+    try {
+      entries = fileSystem.readdirSync(current, { withFileTypes: true });
+    } catch (_) {
+      return out;
+    }
+    for (const entry of entries) {
+      const full = pathModule.join(current, entry.name);
+      if (entry.isDirectory()) collectClassFiles(full, out);
+      else if (entry.isFile() && entry.name.endsWith('.class')) out.push(full);
+    }
+    return out;
+  };
+  const files = [];
+  for (const root of resolved) collectClassFiles(root, files);
+  for (const file of files) {
+    let cls = null;
+    try {
+      const parsed = getClassFileAst(new Uint8Array(fileSystem.readFileSync(file)));
+      cls = parsed && (parsed.classes || [])[0];
+    } catch (_) {
+      // Best effort, exactly like the source prelude: an unreadable or
+      // unsupported class file must not fail a compilation that never needed it.
+    }
+    if (!cls || !cls.className) continue;
+    const internalName = String(cls.className);
+    const flags = cls.flags || [];
+    const isInterface = flags.includes('interface');
+    addClassPreludeName(metadata.classBySimpleName,
+      internalName.slice(internalName.lastIndexOf('/') + 1).replace(/\$/g, '.'), internalName);
+    addClassPreludeName(metadata.classBySimpleName,
+      internalName.replace(/\$/g, '.').replace(/\//g, '.'), internalName);
+    metadata.classSuperByInternalName.set(internalName, cls.superClassName || 'java/lang/Object');
+    metadata.classInterfacesByInternalName.set(internalName, (cls.interfaces || []).map(String));
+    metadata.classIsInterfaceByInternalName.set(internalName, isInterface);
+    const fields = new Map();
+    const methods = new Map();
+    const overloads = new Map();
+    for (const item of cls.items || []) {
+      if (item && item.type === 'field' && item.field && item.field.name) {
+        const memberFlags = item.field.flags || [];
+        fields.set(item.field.name, {
+          owner: internalName,
+          name: item.field.name,
+          descriptor: item.field.descriptor,
+          signature: item.field.descriptor,
+          isStatic: memberFlags.includes('static'),
+        });
+      }
+      if (item && item.type === 'method' && item.method && item.method.name) {
+        const memberFlags = item.method.flags || [];
+        const descriptor = String(item.method.descriptor || '');
+        const closing = descriptor.indexOf(')');
+        if (closing < 0) continue;
+        const isStatic = memberFlags.includes('static');
+        const summary = {
+          name: item.method.name,
+          descriptor,
+          returnDescriptor: descriptor.slice(closing + 1),
+          parameterDescriptors: parameterDescriptorsFromMethodDescriptor(descriptor) || [],
+          isStatic,
+          isVarargs: memberFlags.includes('varargs'),
+          invokeKind: isInterface && !isStatic && item.method.name !== '<init>'
+            ? 'interface' : undefined,
+        };
+        // The first declaration wins the by-name slot, matching how the source
+        // prelude records it; every declaration is kept in the overload list,
+        // which is what the ranked resolution path actually reads.
+        if (!methods.has(summary.name)) methods.set(summary.name, summary);
+        if (!overloads.has(summary.name)) overloads.set(summary.name, []);
+        overloads.get(summary.name).push(summary);
+      }
+    }
+    metadata.classFieldsByInternalName.set(internalName, fields);
+    metadata.classMethodsByInternalName.set(internalName, methods);
+    metadata.classMethodOverloadsByInternalName.set(internalName, overloads);
+  }
+  if (useCache) CLASSPATH_METADATA_CACHE.set(cacheKey, metadata);
+  return metadata;
+}
+
+// A unit's own declarations outrank sibling sources, which outrank the
+// classpath: a class being recompiled must not be described by a stale class
+// file of itself.
+function mergePreludes(base, overlay) {
+  if (!base) return overlay;
+  if (!overlay) return base;
+  const merged = {
+    classBySimpleName: new Map(base.classBySimpleName),
+    classFieldsByInternalName: new Map(base.classFieldsByInternalName),
+    classMethodsByInternalName: new Map(base.classMethodsByInternalName),
+    classMethodOverloadsByInternalName: new Map(base.classMethodOverloadsByInternalName),
+    classSuperByInternalName: new Map(base.classSuperByInternalName),
+    classInterfacesByInternalName: new Map(base.classInterfacesByInternalName),
+    classIsInterfaceByInternalName: new Map(base.classIsInterfaceByInternalName),
+  };
+  for (const key of Object.keys(merged)) {
+    for (const [name, value] of overlay[key]) merged[key].set(name, value);
+  }
+  return merged;
+}
+
 function literalToJavaIrValue(expression) {
   if (!expression || expression.kind !== 'LiteralExpression') return null;
   if (expression.literalKind === 'string') {
@@ -8776,10 +8924,13 @@ function lowerAstToJavaIr(document, options = {}) {
   }
   for (const declaration of document.root.typeDeclarations || []) collectClassNames(declaration);
 
-  const sourcePrelude = sourceDirectoryMetadata(
-    options.sourceRoot || options.sourcePath,
-    Boolean(options.sourceRoot),
-    options,
+  const sourcePrelude = mergePreludes(
+    classpathMetadata(options.classpath, options),
+    sourceDirectoryMetadata(
+      options.sourceRoot || options.sourcePath,
+      Boolean(options.sourceRoot),
+      options,
+    ),
   );
   if (sourcePrelude) {
     for (const [name, internalName] of sourcePrelude.classBySimpleName) {
