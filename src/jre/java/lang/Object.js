@@ -3,6 +3,12 @@ const { withThrows } = require('../../helpers');
 module.exports = {
   super: null,
   staticFields: {},
+  // clone and finalize are protected on java.lang.Object. Everything else here
+  // is public, which is what the synthesiser assumes by default.
+  methodFlags: {
+    'clone()Ljava/lang/Object;': ['protected'],
+    'finalize()V': ['protected'],
+  },
   methods: {
     '<init>()V': (jvm, obj, args) => {
       // Object constructor does nothing

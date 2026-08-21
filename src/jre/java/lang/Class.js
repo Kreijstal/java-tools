@@ -207,13 +207,14 @@ module.exports = {
           return;
         }
 
-        const currentClassName = classData.ast.classes[0].className;
+        // Object.clone used to be excluded by name here because every
+        // synthesised JRE method was flagged public; it and finalize now carry
+        // their real protected flag, so the access test alone is enough.
         classData.ast.classes[0].items
           .filter(item =>
             item.type === 'method' &&
             item.method.flags.includes('public') &&
-            item.method.name !== '<init>' &&
-            !(currentClassName === 'java/lang/Object' && item.method.name === 'clone'))
+            item.method.name !== '<init>')
           .forEach(methodItem => {
             const key = methodItem.method.name + methodItem.method.descriptor;
             if (!allMethods[key]) {
@@ -259,24 +260,28 @@ module.exports = {
 
       const objectMethods = require('./Object.js');
       
-      const objectMethodAccessModifiers = {
-        'getClass': ['public', 'final', 'native'],
-        'hashCode': ['public', 'native'],
-        'equals': ['public'],
-        'toString': ['public'],
-        'clone': ['protected', 'native'],
-        'wait': ['public', 'final', 'native'],
-        'notify': ['public', 'final', 'native'],
-        'notifyAll': ['public', 'final', 'native'],
+      // Access lives in the Object model so there is a single source of truth;
+      // this table adds only the final/native decorations reflection reports.
+      // Spelling the access out here too meant a method the table forgot --
+      // finalize -- silently defaulted to public and turned up in getMethods().
+      const objectMethodDecorations = {
+        'getClass': ['final', 'native'],
+        'hashCode': ['native'],
+        'clone': ['native'],
+        'wait': ['final', 'native'],
+        'notify': ['final', 'native'],
+        'notifyAll': ['final', 'native'],
       };
-      
+
       Object.keys(objectMethods.methods).forEach(methodSignature => {
           const openParen = methodSignature.indexOf('(');
           const name = methodSignature.substring(0, openParen);
           const descriptor = methodSignature.substring(openParen);
           const key = name + descriptor;
-          
-          const flags = objectMethodAccessModifiers[name] || ['public'];
+
+          const access = (objectMethods.methodFlags &&
+            objectMethods.methodFlags[methodSignature]) || ['public'];
+          const flags = access.concat(objectMethodDecorations[name] || []);
           if (flags.includes('public') && !allMethods[key] && name !== '<init>') {
               allMethods[key] = {
                   type: 'java/lang/reflect/Method',

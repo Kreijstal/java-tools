@@ -11,6 +11,17 @@
 // Import the generated JRE index for real class implementations
 const jreClasses = require('../jre/index');
 
+// Synthesised JRE methods are public unless the model says otherwise. The
+// assumption is right almost everywhere, but not for the two protected members
+// of java/lang/Object: getMethods() reports only public methods, so declaring
+// clone and finalize public made every class report two methods real reflection
+// does not. A model opts out by listing `methodFlags` per descriptor.
+function jreMethodFlags(jreClassDef, methodSig) {
+  const declared = jreClassDef && jreClassDef.methodFlags &&
+    jreClassDef.methodFlags[methodSig];
+  return declared ? declared.slice() : ["public"];
+}
+
 function normalizeSuperClassName(superClassName) {
   if (!superClassName) {
     return null;
@@ -130,7 +141,7 @@ class JreBootstrap {
                         method: {
                           name: name,
                           descriptor: descriptor,
-                          flags: ["public"], // Assume public for JRE methods
+                          flags: jreMethodFlags(jreClassDef, methodSig),
                           attributes: [],
                         },
                       };
@@ -773,7 +784,7 @@ class JreBootstrap {
             method: {
               name: name,
               descriptor: descriptor,
-              flags: ["public"], // Assume public for JRE methods
+              flags: jreMethodFlags(jreClassDef, methodSig),
               attributes: [],
             },
           });

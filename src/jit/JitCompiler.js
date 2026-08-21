@@ -2141,7 +2141,11 @@ class JitCompiler {
     if (debug.breakpoints.size === 0) {
       return false;
     }
-    const item = frame.instructions[pc - 1];
+    // pc is the instruction about to run, not the one just run: both callers
+    // consult this before advancing. Reading pc - 1 asked whether a breakpoint
+    // sat on the *previous* bytecode, which stopped one instruction late with
+    // that instruction's effect already on the operand stack.
+    const item = frame.instructions[pc];
     if (!item || !item.labelDef) {
       return false;
     }
