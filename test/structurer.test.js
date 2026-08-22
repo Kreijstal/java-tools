@@ -50,7 +50,15 @@ function assertLabelsResolve(src) {
   }
 }
 
-test('straight-line diamond (if/else join) needs a labeled block', () => {
+// The structurer may always fall back on `L: { ... break L; }` around a merge;
+// it is correct, just not what a Java compiler emitted. Where the shape is
+// avoidable these tests pin that it *was* avoided.
+function assertNoLabeledBlock(src) {
+  const m = src.match(/^\s*L\d+:\s*\{/m);
+  assert.equal(m, null, `expected no labeled block in:\n${src}`);
+}
+
+test('straight-line diamond (if/else join) emits the merge once, unlabeled', () => {
   // 0: if -> 1 else 2 ; 1: goto 3 ; 2: goto 3 ; 3: return   (3 is the merge)
   const cfg = cfgFrom([
     { term: { kind: 'cond', taken: 1, fall: 2 } },
@@ -62,9 +70,15 @@ test('straight-line diamond (if/else join) needs a labeled block', () => {
   const src = printTree(tree);
   assertGotoFree(src);
   assertLabelsResolve(src);
-  assert.match(src, /L3: \{/);      // block around the merge
-  assert.match(src, /break L3;/);   // both arms break to it
-  assert.equal((src.match(/break L3;/g) || []).length, 2);
+  // The merge is what the structuring has to get right: block 3 dominates
+  // nothing but is reached from both arms, so it must appear exactly once,
+  // after the join - never duplicated into each arm.
+  assert.equal((src.match(/stmt_3\(\);/g) || []).length, 1);
+  assert.match(src, /^stmt_0\(\);\nif \(c0\) \{\n {2}stmt_1\(\);\n\} else \{\n {2}stmt_2\(\);\n\}\nstmt_3\(\);$/);
+  // A diamond needs no labeled block. Wrapping the merge in `L3: { ... }` and
+  // breaking to it from both arms is correct but is not what javac emitted, so
+  // dropTailBreaks unwraps it; guard against that regressing.
+  assertNoLabeledBlock(src);
 });
 
 test('exception region exit inside a loop exits the loop', () => {
@@ -118,7 +132,12 @@ test('loop with a merge inside and an exit break', () => {
   assertLabelsResolve(src);
   assert.match(src, /L1: while \(true\) \{/);
   assert.match(src, /continue L1;/);   // back edge 4->1
-  assert.match(src, /L4: \{/);          // merge node 4
+  // Merge node 4 is reached from both arms of the if at 1, so it must be
+  // emitted once, after the join - and inside the loop, since 4 carries the
+  // back edge. It needs no label of its own once the tail breaks are dropped.
+  assert.equal((src.match(/stmt_4\(\);/g) || []).length, 1);
+  assert.match(src, /\n {2}stmt_4\(\);\n {2}if \(c4\) \{\n {4}continue L1;/);
+  assertNoLabeledBlock(src);
 });
 
 test('switch structures each case without goto', () => {
