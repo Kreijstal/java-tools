@@ -1886,9 +1886,19 @@ function decompileCode(code, method, cls, localState, options = {}) {
   let controlTransfers = 0;
   let hasSuppressedCleanup = false;
   let hasArrayLength = false;
+  // `iinc x, n` is the compacted form of load/const/add/store. Counting it as
+  // one item lets a pure peephole rewrite shrink the density denominator
+  // without removing any work the recognizer does, which is enough on its own
+  // to push a method across the threshold below - the same method, compiled by
+  // two producers that differ only in whether they use the idiom, would route
+  // to different decompilers. Charge the idiom its expanded weight so the
+  // proxy measures the source shape rather than the encoding.
+  const IINC_EXPANDED_ITEMS = 4;
+  let selectionWeight = 0;
   for (const item of codeItemsForSelection) {
     const instruction = getInstructionFromItem(item);
     if (!instruction) continue;
+    selectionWeight += instruction.op === 'iinc' ? IINC_EXPANDED_ITEMS : 1;
     if (instruction.op === 'arraylength') hasArrayLength = true;
     if (isConditionalBranch(instruction.op) || instruction.op === 'goto' || instruction.op === 'goto_w'
       || instruction.op === 'tableswitch' || instruction.op === 'lookupswitch') controlTransfers += 1;
@@ -1911,11 +1921,11 @@ function decompileCode(code, method, cls, localState, options = {}) {
     // stays because the methods it steers away are also the ones whose local
     // naming the two paths disagree about, and the CFG structurer is the one
     // that gets them right; the budget below is the backstop, not this.
-    || (codeItemsForSelection.length > 128
-      && controlTransfers / codeItemsForSelection.length > 0.05
+    || (selectionWeight > 128
+      && controlTransfers / selectionWeight > 0.05
       && !hasSuppressedCleanup);
   if (process.env.CFR_JS_PROFILE_METHODS === '1') {
-    console.error(`[cfr-selector] ${cls.className}.${method.name}${method.descriptor} items=${codeItemsForSelection.length} transfers=${controlTransfers} array=${hasArrayLength} suppressed=${hasSuppressedCleanup} owned=${preferOwnedStructurer}`);
+    console.error(`[cfr-selector] ${cls.className}.${method.name}${method.descriptor} items=${codeItemsForSelection.length} weight=${selectionWeight} transfers=${controlTransfers} array=${hasArrayLength} suppressed=${hasSuppressedCleanup} owned=${preferOwnedStructurer}`);
   }
   const sharedExceptionStackJoin = decompileSharedExceptionStackJoin(code, method, cls, localState);
   if (usableDecompileLines(sharedExceptionStackJoin)) return sharedExceptionStackJoin;

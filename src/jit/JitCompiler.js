@@ -613,6 +613,12 @@ class JitCompiler {
     });
   }
 
+  getExceptionTable(method) {
+    const code = method && method.attributes &&
+      method.attributes.find((attr) => attr.type === "code");
+    return (code && code.code && code.code.exceptionTable) || [];
+  }
+
   getCodeItems(method) {
     if (this.normalizedCodeItemsCache.has(method)) {
       return this.normalizedCodeItemsCache.get(method);
@@ -1636,7 +1642,8 @@ class JitCompiler {
       this.supportCache.set(method, false);
       return false;
     }
-    if (hasExperimentalControlFlow(codeItems) && !this.experimentalControlFlow &&
+    if (hasExperimentalControlFlow(codeItems, this.getExceptionTable(method)) &&
+      !this.experimentalControlFlow &&
       !this.hasJitSafeControlFlow(method, codeItems)) {
       this.supportCache.set(method, false);
       return false;
@@ -1797,7 +1804,7 @@ class JitCompiler {
       this.adaptiveCodegenDependencyEpoch.delete(method);
     }
     if (!safeConstructor && !allowEffectfulCalls &&
-        hasExperimentalControlFlow(codeItems) &&
+        hasExperimentalControlFlow(codeItems, this.getExceptionTable(method)) &&
         !this.experimentalControlFlow &&
         !this.hasJitSafeControlFlow(method, codeItems)) {
       supportCache.set(method, false);
@@ -9480,15 +9487,54 @@ function hasMonitorBytecode(codeItems) {
   });
 }
 
-function reachableInstructionIndexes(codeItems) {
+// An exception-table entry may spell its range with labels or raw pcs, and the
+// label key differs by producer. Resolve whichever form is present.
+function exceptionEntryIndex(labels, entry, lblKeys, pcKey) {
+  for (const key of lblKeys) {
+    const label = entry && entry[key];
+    if (typeof label === "string") {
+      const index = labels.get(label);
+      if (Number.isInteger(index)) return index;
+    }
+  }
+  const pc = entry && entry[pcKey];
+  if (pc != null) {
+    const index = labels.get(`L${pc}`);
+    if (Number.isInteger(index)) return index;
+  }
+  return null;
+}
+
+function reachableInstructionIndexes(codeItems, exceptionTable) {
   // Forward CFG reachability from the method entry. The frontend terminates
   // each unreachable dead run with an athrow (nops ending in athrow); those
   // terminators must not count as real control flow, or a method whose only
   // athrows are dead-code terminators is wrongly classified as
   // experimental-control and barred from the JIT tiers.
+  //
+  // Normal flow alone does not reach a catch handler: its only predecessor is
+  // the implicit exception edge out of the protected range. Walking from the
+  // entry by itself therefore declares every handler body dead, which would
+  // hide a real `throw` in a catch block - and, worse, the monitorexit that
+  // javac plants in a synchronized method's own handler.
   const labels = buildLabelMap(codeItems);
   const reachable = new Set();
   const queue = [0];
+  const handlers = [];
+  for (const entry of exceptionTable || []) {
+    const handler = exceptionEntryIndex(
+      labels, entry, ["handlerLbl", "handlerLabel", "handler"], "handler_pc");
+    if (!Number.isInteger(handler)) continue;
+    handlers.push({
+      handler,
+      start: exceptionEntryIndex(
+        labels, entry, ["startLbl", "startLabel", "start"], "start_pc"),
+      end: exceptionEntryIndex(
+        labels, entry, ["endLbl", "endLabel", "end"], "end_pc"),
+      seeded: false,
+    });
+  }
+  const drain = () => {
   while (queue.length > 0) {
     const index = queue.pop();
     if (!Number.isInteger(index) || index < 0 || index >= codeItems.length) continue;
@@ -9529,11 +9575,34 @@ function reachableInstructionIndexes(codeItems) {
       queue.push(index + 1);
     }
   }
+  };
+  drain();
+  // A handler is live once anything it protects is live, and entering one can
+  // make a further range live, so iterate to a fixpoint rather than seeding
+  // every handler up front - dead code inside a dead try must stay dead.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const item of handlers) {
+      if (item.seeded) continue;
+      const from = Number.isInteger(item.start) ? item.start : 0;
+      const to = Number.isInteger(item.end) ? item.end : codeItems.length;
+      let protectedLive = false;
+      for (let index = from; index < to; index += 1) {
+        if (reachable.has(index)) { protectedLive = true; break; }
+      }
+      if (!protectedLive) continue;
+      item.seeded = true;
+      changed = true;
+      queue.push(item.handler);
+      drain();
+    }
+  }
   return reachable;
 }
 
-function hasExperimentalControlFlow(codeItems) {
-  const reachable = reachableInstructionIndexes(codeItems);
+function hasExperimentalControlFlow(codeItems, exceptionTable) {
+  const reachable = reachableInstructionIndexes(codeItems, exceptionTable);
   return codeItems.some((item, index) => {
     const op = getOp(item && item.instruction);
     return (op === "athrow" || op === "monitorenter" || op === "monitorexit") &&
