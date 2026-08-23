@@ -13,6 +13,7 @@
 const fs = require('fs');
 const path = require('path');
 const frontend = require('../src/java-frontend');
+const { createCompileProgressReporter } = require('./compile-progress');
 
 console.log('🔧 Generating sample data for the JVM Debug Interface...');
 
@@ -31,7 +32,12 @@ const sourceFiles = fs.readdirSync(sourcesDir)
 console.log(`📁 Compiling ${sourceFiles.length} Java sources with the JS frontend...`);
 const result = frontend.compileJavaFiles(
   sourceFiles.map((file) => path.join(sourcesDir, file)),
-  { outputDir: sourcesDir },
+  {
+    outputDir: sourcesDir,
+    // Whole-corpus compiles are long enough that a silent run is
+    // indistinguishable from a hung one; report each file as it lands.
+    onProgress: createCompileProgressReporter(),
+  },
 );
 
 // Group emitted classes by the source file they came from.

@@ -25,6 +25,9 @@ Options:
 
 - `--out <directory>` or `-d <directory>` selects the class-file output root.
 - `--source-level <number>` selects the parser source level.
+- `--progress` / `--no-progress` force per-file progress on or off. It is on by
+  default whenever more than one input is given, and prints to stderr so the
+  `Compiled <class> -> <path>` lines on stdout stay machine-readable.
 - `--help` prints the command reference.
 
 Package names become directories below the output root. A source file may emit
@@ -72,6 +75,45 @@ const result = frontend.compileJavaFiles([
     sourceLevel: 8
 });
 ```
+
+### Batch progress
+
+A batch compile of a few hundred files takes long enough that a silent run is
+indistinguishable from a hung one. Pass `onProgress` to follow it file by file:
+
+```javascript
+const result = frontend.compileJavaFiles(inputPaths, {
+    outputDir: "build/classes",
+    onProgress(event) {
+        if (event.event !== "file-end") return;
+        console.log(`[${event.completed}/${event.total}] ${event.inputPath}`);
+    }
+});
+```
+
+Every event carries `{ phase, event, total, completed }`; per-file events add
+`{ index, inputPath }`.
+
+- `phase` is `scan`, `compile`, or — from the browser workspace entry point —
+  `artifact`. `scan` is the pre-pass that parses every input to find classes
+  two files would both write; it runs before any class is emitted, and is
+  skipped entirely when no `outputDir` is set. `artifact` is the pass that reads
+  or assembles each emitted class back out, and counts classes rather than
+  inputs.
+- `event` is `start`, `file-start`, `file-end`, `file-error`, or `end`.
+  `file-end` for the compile phase also carries `status`, `classes`, `written`,
+  `unsupported`, `durationMs`, and the file's `result` entry. `file-error`
+  carries `error` and is emitted immediately before the error propagates, so the
+  hook always names the file that failed.
+- The hook runs synchronously between files. A browser caller that wants the
+  page to repaint must compile in slices or move the batch to a worker; the
+  hook does not make `compileJavaFiles` yield.
+- An exception thrown by the hook is not caught. Reporting is caller code, and
+  swallowing its failure would leave a long batch looking like it simply
+  stopped.
+
+`scripts/compile-progress.js` renders these events as terminal lines; both
+`scripts/compileJava.js` and `scripts/generateData.js` use it.
 
 Important result fields include:
 
@@ -140,6 +182,20 @@ const result = debug.compileWorkspace([
     sourceRoot: "/src",
     outputDir: "/classes",
     sourceLevel: 8
+});
+```
+
+`compileWorkspace` forwards `onProgress` to the same hook, and adds the
+`artifact` phase described above:
+
+```javascript
+const result = debug.compileWorkspace(paths, {
+    sourceRoot: "/src",
+    outputDir: "/classes",
+    onProgress(event) {
+        statusElement.textContent =
+            `${event.phase} ${event.completed}/${event.total} ${event.inputPath || ""}`;
+    }
 });
 ```
 

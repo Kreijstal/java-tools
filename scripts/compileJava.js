@@ -3,12 +3,17 @@
 
 const path = require('path');
 const frontend = require('../src/java-frontend');
+const { createCompileProgressReporter } = require('./compile-progress');
 
 function printUsage() {
-  console.log(`Usage: node scripts/compileJava.js <file.java> [file2.java ...] [--out <dir>] [--source-level <n>]
+  console.log(`Usage: node scripts/compileJava.js <file.java> [file2.java ...] [--out <dir>] [--source-level <n>] [--progress|--no-progress]
 
 Compiles Java source files with the repository Java frontend and internal Jasmin/classfile backend.
 No host javac backend or fallback is used. Unsupported constructs fail fast.
+
+Progress is reported on stderr, one line per file per phase, whenever more than
+one input is given; --no-progress silences it and --progress forces it on for a
+single file.
 `);
 }
 
@@ -25,6 +30,14 @@ function parseArgs(argv) {
         throw new Error(`${arg} requires an output directory`);
       }
       options.outputDir = argv[++i];
+      continue;
+    }
+    if (arg === '--progress') {
+      options.progress = true;
+      continue;
+    }
+    if (arg === '--no-progress') {
+      options.progress = false;
       continue;
     }
     if (arg === '--source-level') {
@@ -48,10 +61,15 @@ function main() {
     printUsage();
     return;
   }
+  const showProgress = parsed.options.progress !== undefined
+    ? parsed.options.progress
+    : parsed.inputPaths.length > 1;
   const options = {
     ...parsed.options,
     sourceFileName: parsed.inputPaths.length === 1 ? path.basename(parsed.inputPaths[0]) : undefined,
+    onProgress: showProgress ? createCompileProgressReporter() : undefined,
   };
+  delete options.progress;
   const result = frontend.compileJavaFiles(parsed.inputPaths, options);
   for (const written of result.written) {
     console.log(`Compiled ${written.binaryName} -> ${written.outputPath}`);

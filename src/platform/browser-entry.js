@@ -72,15 +72,42 @@ function compileJavaFilesForBrowser(inputPaths, options = {}) {
   if (!fileSystem) {
     throw new TypeError('Browser multi-file compilation requires a workspace filesystem');
   }
+  const report = typeof options.onProgress === 'function' ? options.onProgress : () => {};
   const result = compileJavaFiles(inputPaths, options);
   const writtenByInternalName = new Map(
     result.written.map((entry) => [entry.internalName, entry]),
   );
-  const artifacts = result.classes.map((classEntry) => {
+  // Reading or assembling every class back out is its own pass over the batch,
+  // so it gets its own phase: on a large workspace the compile phase would
+  // otherwise report 100% and then appear to stall here.
+  const artifactTotal = result.classes.length;
+  const artifactStartedAt = Date.now();
+  report({ phase: 'artifact', event: 'start', total: artifactTotal, completed: 0 });
+  const artifacts = result.classes.map((classEntry, index) => {
+    report({
+      phase: 'artifact',
+      event: 'file-start',
+      index,
+      total: artifactTotal,
+      completed: index,
+      internalName: classEntry.internalName,
+      inputPath: classEntry.sourceFile,
+    });
     const written = writtenByInternalName.get(classEntry.internalName);
     const bytes = written
       ? fileSystem.readFileSync(written.outputPath)
       : assembleJasminBytes(classEntry.jasmin, options.assembly || {});
+    report({
+      phase: 'artifact',
+      event: 'file-end',
+      index,
+      total: artifactTotal,
+      completed: index + 1,
+      internalName: classEntry.internalName,
+      inputPath: classEntry.sourceFile,
+      outputPath: written ? written.outputPath : null,
+      byteLength: bytes.length,
+    });
     return {
       internalName: classEntry.internalName,
       binaryName: classEntry.binaryName,
@@ -89,6 +116,13 @@ function compileJavaFilesForBrowser(inputPaths, options = {}) {
       jasmin: classEntry.jasmin,
       bytes: new Uint8Array(bytes),
     };
+  });
+  report({
+    phase: 'artifact',
+    event: 'end',
+    total: artifactTotal,
+    completed: artifactTotal,
+    durationMs: Date.now() - artifactStartedAt,
   });
   return { ...result, artifacts };
 }
@@ -492,7 +526,12 @@ class BrowserJVMDebug {
    * Compile Java source files from the browser workspace and emit class files
    * back into the same workspace.
    * @param {string[]} inputPaths
-   * @param {object} options
+   * @param {object} options - compile options. Pass `onProgress(event)` to
+   *   follow a large batch file by file; events are
+   *   `{ phase: 'scan'|'compile'|'artifact', event: 'start'|'file-start'|'file-end'|'file-error'|'end', total, completed, index?, inputPath? }`.
+   *   The hook runs synchronously between files, so a browser caller that wants
+   *   the DOM to repaint must compile in slices (or a worker) rather than
+   *   expecting this call to yield.
    */
   compileWorkspace(inputPaths, options = {}) {
     const workspace = this.fileProvider.getWorkspaceFileSystem();

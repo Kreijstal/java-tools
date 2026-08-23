@@ -26,6 +26,23 @@ function pathModuleFor(options = {}) {
   return options.pathModule || hostPath;
 }
 
+/**
+ * Wrap `options.onProgress` so callers of a batch compile can render per-file
+ * progress. Returns a no-op when no hook was supplied, so the emit sites can
+ * call it unconditionally.
+ *
+ * Every event carries `{ phase, event, total, completed }`; per-file events add
+ * `{ index, inputPath }`. A hook that throws is not caught: reporting is the
+ * caller's code, and swallowing its exception would hide the bug halfway
+ * through a long batch, leaving the compile looking like it simply stopped.
+ * @param {object} options
+ * @returns {(event: object) => void}
+ */
+function progressReporterFor(options = {}) {
+  const onProgress = options.onProgress;
+  return typeof onProgress === 'function' ? onProgress : () => {};
+}
+
 const PRIMITIVE_DESCRIPTORS = Object.freeze({
   void: 'V',
   boolean: 'Z',
@@ -1626,25 +1643,48 @@ function conflictOutputDir(outputDir, inputPath, index, options = {}) {
   return pathModule.join(outputDir, '.java-frontend-conflicts', `${index}_${safe}`);
 }
 
-function duplicateOutputIndexes(inputPaths, outputDir, options = {}) {
+function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = () => {}) {
   if (!outputDir) return new Set();
   const fileSystem = fileSystemFor(options);
   const pathModule = pathModuleFor(options);
   const outputOwners = new Map();
+  const total = inputPaths.length;
+  const startedAt = Date.now();
+  // This pre-pass parses every input before a single class is emitted, so on a
+  // large batch it is a visible share of the wall time. Report it as its own
+  // phase rather than letting the first compile event appear to hang.
+  report({ phase: 'scan', event: 'start', total, completed: 0 });
   for (const [index, inputPath] of inputPaths.entries()) {
-    const source = fileSystem.readFileSync(inputPath, 'utf8');
-    const document = parseJava(source, {
-      ...options,
-      sourcePath: inputPath,
-      sourceFileName: pathModule.basename(inputPath),
-    });
-    for (const internalName of collectDeclaredInternalNames(document)) {
+    report({ phase: 'scan', event: 'file-start', index, total, completed: index, inputPath });
+    let declaredNames;
+    try {
+      const source = fileSystem.readFileSync(inputPath, 'utf8');
+      const document = parseJava(source, {
+        ...options,
+        sourcePath: inputPath,
+        sourceFileName: pathModule.basename(inputPath),
+      });
+      declaredNames = collectDeclaredInternalNames(document);
+    } catch (error) {
+      report({ phase: 'scan', event: 'file-error', index, total, completed: index, inputPath, error });
+      throw error;
+    }
+    for (const internalName of declaredNames) {
       const outputPath = pathModule.resolve(outputPathForClass(outputDir, internalName, pathModule));
       if (!outputOwners.has(outputPath)) {
         outputOwners.set(outputPath, new Set());
       }
       outputOwners.get(outputPath).add(index);
     }
+    report({
+      phase: 'scan',
+      event: 'file-end',
+      index,
+      total,
+      completed: index + 1,
+      inputPath,
+      declaredClasses: declaredNames.length,
+    });
   }
   const duplicateIndexes = new Set();
   for (const owners of outputOwners.values()) {
@@ -1653,9 +1693,26 @@ function duplicateOutputIndexes(inputPaths, outputDir, options = {}) {
       duplicateIndexes.add(index);
     }
   }
+  report({
+    phase: 'scan',
+    event: 'end',
+    total,
+    completed: total,
+    duplicates: duplicateIndexes.size,
+    durationMs: Date.now() - startedAt,
+  });
   return duplicateIndexes;
 }
 
+/**
+ * Compile a batch of `.java` inputs, emitting class files when `outputDir` is
+ * set.
+ * @param {string[]} inputPaths
+ * @param {object} options - compile options; `onProgress(event)` receives
+ *   `{ phase: 'scan'|'compile', event: 'start'|'file-start'|'file-end'|'file-error'|'end', total, completed, index?, inputPath? }`
+ *   so a caller can report each file of a large batch as it happens.
+ * @returns {object} - compile result
+ */
 function compileJavaFiles(inputPaths, options = {}) {
   if (!Array.isArray(inputPaths)) {
     throw new TypeError('compileJavaFiles expects an array of .java input paths');
@@ -1664,7 +1721,8 @@ function compileJavaFiles(inputPaths, options = {}) {
     throw new TypeError('compileJavaFiles requires at least one .java input path');
   }
   const pathModule = pathModuleFor(options);
-  const duplicateIndexes = duplicateOutputIndexes(inputPaths, options.outputDir, options);
+  const report = progressReporterFor(options);
+  const duplicateIndexes = duplicateOutputIndexes(inputPaths, options.outputDir, options, report);
   const resolvedDirectories = inputPaths.map((inputPath) => pathModule.dirname(pathModule.resolve(inputPath)));
   let sourceRoot = resolvedDirectories[0];
   for (const directory of resolvedDirectories.slice(1)) {
@@ -1678,7 +1736,12 @@ function compileJavaFiles(inputPaths, options = {}) {
   const classes = [];
   const written = [];
   const unsupported = [];
+  const total = inputPaths.length;
+  const compileStartedAt = Date.now();
+  report({ phase: 'compile', event: 'start', total, completed: 0 });
   for (const [index, inputPath] of inputPaths.entries()) {
+    const fileStartedAt = Date.now();
+    report({ phase: 'compile', event: 'file-start', index, total, completed: index, inputPath });
     const outputDir = duplicateIndexes.has(index)
       ? conflictOutputDir(options.outputDir, inputPath, index, options)
       : options.outputDir;
@@ -1694,9 +1757,10 @@ function compileJavaFiles(inputPaths, options = {}) {
       result = compileJavaFile(inputPath, fileOptions);
     } catch (error) {
       error.message = `${inputPath}: ${error.message}`;
+      report({ phase: 'compile', event: 'file-error', index, total, completed: index, inputPath, error });
       throw error;
     }
-    results.push({
+    const fileResult = {
       inputPath,
       sourceFileName: fileOptions.sourceFileName,
       outputDir,
@@ -1704,6 +1768,21 @@ function compileJavaFiles(inputPaths, options = {}) {
       classes: result.classes,
       written: result.written,
       unsupported: result.bytecodeIr && Array.isArray(result.bytecodeIr.unsupported) ? result.bytecodeIr.unsupported : [],
+    };
+    results.push(fileResult);
+    report({
+      phase: 'compile',
+      event: 'file-end',
+      index,
+      total,
+      completed: index + 1,
+      inputPath,
+      status: fileResult.status,
+      classes: fileResult.classes.length,
+      written: (fileResult.written || []).length,
+      unsupported: fileResult.unsupported.length,
+      durationMs: Date.now() - fileStartedAt,
+      result: fileResult,
     });
     classes.push(...(result.classes || []));
     written.push(...(result.written || []));
@@ -1714,6 +1793,17 @@ function compileJavaFiles(inputPaths, options = {}) {
       })));
     }
   }
+  report({
+    phase: 'compile',
+    event: 'end',
+    total,
+    completed: total,
+    status: unsupported.length ? 'partial' : 'complete',
+    classes: classes.length,
+    written: written.length,
+    unsupported: unsupported.length,
+    durationMs: Date.now() - compileStartedAt,
+  });
   return {
     schema: COMPILE_RESULT_SCHEMA_ID,
     version: COMPILE_RESULT_SCHEMA_VERSION,
