@@ -141,20 +141,6 @@ async function buildSite() {
     ensureDirectory(distDir);
     verifyBuildPrerequisites(distDir);
 
-    // Step 1.5: Publish the production bundle name. Downstream embedders
-    // (e.g. the blank-github-cloner console) load jvm.js; keep jvm-debug.js
-    // for the IDE so both names serve identical bytes.
-    const debugBundle = path.join(distDir, 'jvm-debug.js');
-    const prodBundle = path.join(distDir, 'jvm.js');
-    fs.copyFileSync(debugBundle, prodBundle);
-    for (const suffix of ['.map', '.LICENSE.txt']) {
-        const sidecar = debugBundle + suffix;
-        if (fs.existsSync(sidecar)) {
-            fs.copyFileSync(sidecar, prodBundle + suffix);
-        }
-    }
-    console.log('  ✓ Published jvm.js alias of jvm-debug.js');
-
     // Step 2: Setup ACE editor from node_modules
     console.log('📦 Setting up ACE editor...');
     await setupAceEditor();
