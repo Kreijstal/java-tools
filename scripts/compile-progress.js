@@ -25,7 +25,8 @@ function createCompileProgressReporter(options = {}) {
       return;
     }
     if (event.event === 'end') {
-      write(`${phase} ${counter} done in ${event.durationMs} ms\n`);
+      const reused = event.reused ? ` (${event.reused} reused)` : '';
+      write(`${phase} ${counter} done in ${event.durationMs} ms${reused}\n`);
       return;
     }
     if (event.event === 'file-error') {
@@ -42,7 +43,7 @@ function createCompileProgressReporter(options = {}) {
     } else if (event.phase === 'artifact') {
       detail = ` -> ${event.internalName} (${event.byteLength} bytes)`;
     }
-    write(`${phase} ${counter} ${label}${detail}\n`);
+    write(`${phase} ${counter} ${label}${detail}${event.reused ? ' (cached)' : ''}\n`);
   };
 }
 

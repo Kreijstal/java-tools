@@ -25,6 +25,9 @@ Options:
 
 - `--out <directory>` or `-d <directory>` selects the class-file output root.
 - `--source-level <number>` selects the parser source level.
+- `--incremental` reuses class files a previous run already emitted; `--rebuild`
+  compiles everything and refreshes that cache. See
+  [Incremental builds](#incremental-builds).
 - `--progress` / `--no-progress` force per-file progress on or off. It is on by
   default whenever more than one input is given, and prints to stderr so the
   `Compiled <class> -> <path>` lines on stdout stay machine-readable.
@@ -115,6 +118,55 @@ Every event carries `{ phase, event, total, completed }`; per-file events add
 `scripts/compile-progress.js` renders these events as terminal lines; both
 `scripts/compileJava.js` and `scripts/generateData.js` use it.
 
+### Incremental builds
+
+`incremental` reuses the class files a previous run emitted, so an interrupted
+batch resumes where it stopped instead of starting over:
+
+```javascript
+const result = frontend.compileJavaFiles(inputPaths, {
+    outputDir: "build/classes",
+    incremental: true          // or { force: true } to rebuild and refresh
+});
+console.log(`${result.reused} of ${inputPaths.length} reused`);
+```
+
+Each input's build is recorded under `<outputDir>/.java-frontend-build/`, one
+gzipped entry per source, **written as soon as that source's class files are on
+disk**. A batch killed part-way through therefore keeps everything it had
+finished and loses at most the file it was working on. Reused inputs contribute
+the same `classes` and `written` entries a fresh compile would, so callers
+cannot tell them apart; `result.reused` and `results[i].reused` say which came
+from the cache, and progress events carry `reused: true`.
+
+On a 343-file decompiled game corpus this turns an 18.5 s rebuild into 0.2 s,
+and a build interrupted halfway resumes to a class tree byte-identical to a
+clean one.
+
+Invalidation is deliberately coarse. **Any change to any `.java` file under the
+source root rebuilds the whole batch**, including files that are not inputs:
+sibling declarations decide overload resolution, inherited members, and which
+simple name wins, so a sibling nobody asked to compile can still change what a
+file emits. Cheaper per-file dependency tracking would have to prove it did not,
+and constants inlined across class boundaries leave nothing behind to prove it
+with. The cache also invalidates on:
+
+- the compiler's own sources (`src/java-frontend`, `src/utils`, `src/parsing`)
+  changing, so an edited emitter never hands back output from the old one;
+- `sourceLevel`, `outputDir`, `sourceRoot`, assembly options, or
+  `JAVA_FRONTEND_ASSEMBLER` changing;
+- a recorded class file being deleted, truncated, or otherwise no longer the
+  size it was written at;
+- class files on `classpath` changing size or mtime.
+
+Two limits worth knowing. In a browser bundle the compiler's own sources are not
+on a filesystem to fingerprint, so the cache falls back to the package version
+and should be cleared by hand after a bundle rebuild. And a source that is
+deleted outright leaves its old class files in `outputDir`; the cache reuses
+what it recorded, it does not sweep the output tree. Deleting
+`<outputDir>/.java-frontend-build/` is always safe and always correct - the next
+build simply compiles everything.
+
 Important result fields include:
 
 - `status`: `complete` or `partial`;
@@ -123,7 +175,8 @@ Important result fields include:
 - `javaIr`: the serializable Java intermediate representation;
 - `bytecodeIr`: the serializable JVM bytecode representation;
 - `classFileModel`: the serializable class-file model;
-- `unsupported`: unsupported lowering diagnostics.
+- `unsupported`: unsupported lowering diagnostics;
+- `reused`: how many inputs came from the incremental cache.
 
 The normal compiler entry points fail before writing an invalid partial body.
 Unsupported syntax is reported as `UnsupportedJavaSyntaxError` with the

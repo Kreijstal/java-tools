@@ -10,6 +10,7 @@ const { assembleJasminBytes } = require('../utils/jasminAssembly');
 const { assembleClass } = require('../parsing/classAstToClassFile');
 const { normalizeLdcArgument, isLdcOpcode } = require('../parsing/convert_krak2_ast');
 const { jreCanonicalInternalName, jreClassInfo, jreInternalNameForSimpleName, JAVA_LANG_TYPES } = require('./jreMetadata');
+const { createBuildCache } = require('./buildCache');
 
 const COMPILE_RESULT_SCHEMA_ID = 'java-tools.java-frontend.compile-result';
 const COMPILE_RESULT_SCHEMA_VERSION = 1;
@@ -1643,7 +1644,7 @@ function conflictOutputDir(outputDir, inputPath, index, options = {}) {
   return pathModule.join(outputDir, '.java-frontend-conflicts', `${index}_${safe}`);
 }
 
-function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = () => {}) {
+function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = () => {}, cache = null, declaredNamesByInput = new Map()) {
   if (!outputDir) return new Set();
   const fileSystem = fileSystemFor(options);
   const pathModule = pathModuleFor(options);
@@ -1657,18 +1658,28 @@ function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = ()
   for (const [index, inputPath] of inputPaths.entries()) {
     report({ phase: 'scan', event: 'file-start', index, total, completed: index, inputPath });
     let declaredNames;
+    // A cached entry already recorded what this file declares, and the entry is
+    // only valid while no source in the tree has changed - so on a resumed
+    // build this pass costs a stat per file instead of a parse.
+    const cached = cache && cache.read(inputPath);
+    if (cached && Array.isArray(cached.declaredNames)) {
+      declaredNames = cached.declaredNames;
+    }
     try {
-      const source = fileSystem.readFileSync(inputPath, 'utf8');
-      const document = parseJava(source, {
-        ...options,
-        sourcePath: inputPath,
-        sourceFileName: pathModule.basename(inputPath),
-      });
-      declaredNames = collectDeclaredInternalNames(document);
+      if (!declaredNames) {
+        const source = fileSystem.readFileSync(inputPath, 'utf8');
+        const document = parseJava(source, {
+          ...options,
+          sourcePath: inputPath,
+          sourceFileName: pathModule.basename(inputPath),
+        });
+        declaredNames = collectDeclaredInternalNames(document);
+      }
     } catch (error) {
       report({ phase: 'scan', event: 'file-error', index, total, completed: index, inputPath, error });
       throw error;
     }
+    declaredNamesByInput.set(inputPath, declaredNames);
     for (const internalName of declaredNames) {
       const outputPath = pathModule.resolve(outputPathForClass(outputDir, internalName, pathModule));
       if (!outputOwners.has(outputPath)) {
@@ -1684,6 +1695,7 @@ function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = ()
       completed: index + 1,
       inputPath,
       declaredClasses: declaredNames.length,
+      reused: Boolean(cached),
     });
   }
   const duplicateIndexes = new Set();
@@ -1713,6 +1725,23 @@ function duplicateOutputIndexes(inputPaths, outputDir, options = {}, report = ()
  *   so a caller can report each file of a large batch as it happens.
  * @returns {object} - compile result
  */
+/**
+ * Sizes of the class files just written, so a later run can tell a recorded
+ * output from one that has since been deleted or truncated.
+ */
+function outputByteLengths(writtenEntries, options) {
+  const fileSystem = fileSystemFor(options);
+  const outputs = [];
+  for (const entry of writtenEntries || []) {
+    try {
+      outputs.push({ outputPath: entry.outputPath, byteLength: fileSystem.statSync(entry.outputPath).size });
+    } catch (_) {
+      outputs.push({ outputPath: entry.outputPath, byteLength: -1 });
+    }
+  }
+  return outputs;
+}
+
 function compileJavaFiles(inputPaths, options = {}) {
   if (!Array.isArray(inputPaths)) {
     throw new TypeError('compileJavaFiles expects an array of .java input paths');
@@ -1722,7 +1751,6 @@ function compileJavaFiles(inputPaths, options = {}) {
   }
   const pathModule = pathModuleFor(options);
   const report = progressReporterFor(options);
-  const duplicateIndexes = duplicateOutputIndexes(inputPaths, options.outputDir, options, report);
   const resolvedDirectories = inputPaths.map((inputPath) => pathModule.dirname(pathModule.resolve(inputPath)));
   let sourceRoot = resolvedDirectories[0];
   for (const directory of resolvedDirectories.slice(1)) {
@@ -1732,12 +1760,26 @@ function compileJavaFiles(inputPaths, options = {}) {
       sourceRoot = parent;
     }
   }
+  // The cache is keyed on the tree names resolve against, which is the root the
+  // per-file options below use - not the batch's common ancestor when the
+  // caller named one.
+  const cache = createBuildCache(options, pathModule.resolve(options.sourceRoot || sourceRoot));
+  const declaredNamesByInput = new Map();
+  const duplicateIndexes = duplicateOutputIndexes(
+    inputPaths,
+    options.outputDir,
+    options,
+    report,
+    cache,
+    declaredNamesByInput,
+  );
   const results = [];
   const classes = [];
   const written = [];
   const unsupported = [];
   const total = inputPaths.length;
   const compileStartedAt = Date.now();
+  let reusedCount = 0;
   report({ phase: 'compile', event: 'start', total, completed: 0 });
   for (const [index, inputPath] of inputPaths.entries()) {
     const fileStartedAt = Date.now();
@@ -1752,6 +1794,40 @@ function compileJavaFiles(inputPaths, options = {}) {
       sourcePath: inputPath,
       sourceFileName: pathModule.basename(inputPath),
     };
+    const reusable = cache && cache.read(inputPath);
+    if (reusable) {
+      const cachedResult = {
+        inputPath,
+        sourceFileName: fileOptions.sourceFileName,
+        outputDir,
+        status: reusable.status,
+        classes: reusable.classes,
+        written: reusable.written,
+        unsupported: reusable.unsupported || [],
+        reused: true,
+      };
+      results.push(cachedResult);
+      classes.push(...cachedResult.classes);
+      written.push(...cachedResult.written);
+      unsupported.push(...cachedResult.unsupported.map((entry) => ({ ...entry, sourcePath: inputPath })));
+      reusedCount += 1;
+      report({
+        phase: 'compile',
+        event: 'file-end',
+        index,
+        total,
+        completed: index + 1,
+        inputPath,
+        status: cachedResult.status,
+        classes: cachedResult.classes.length,
+        written: cachedResult.written.length,
+        unsupported: cachedResult.unsupported.length,
+        durationMs: Date.now() - fileStartedAt,
+        reused: true,
+        result: cachedResult,
+      });
+      continue;
+    }
     let result;
     try {
       result = compileJavaFile(inputPath, fileOptions);
@@ -1768,8 +1844,24 @@ function compileJavaFiles(inputPaths, options = {}) {
       classes: result.classes,
       written: result.written,
       unsupported: result.bytecodeIr && Array.isArray(result.bytecodeIr.unsupported) ? result.bytecodeIr.unsupported : [],
+      reused: false,
     };
     results.push(fileResult);
+    if (cache) {
+      // Recorded only once the class files are on disk, so a batch killed
+      // mid-file never claims to have finished it.
+      cache.write(inputPath, {
+        status: fileResult.status,
+        // The names the scan pass computes, which are the declared types only:
+        // recording the emitted classes instead would hand a resumed build a
+        // longer list than a fresh one and change what it calls a conflict.
+        declaredNames: declaredNamesByInput.get(inputPath) || [],
+        classes: fileResult.classes,
+        written: fileResult.written,
+        unsupported: fileResult.unsupported,
+        outputs: outputByteLengths(fileResult.written, options),
+      });
+    }
     report({
       phase: 'compile',
       event: 'file-end',
@@ -1782,6 +1874,7 @@ function compileJavaFiles(inputPaths, options = {}) {
       written: (fileResult.written || []).length,
       unsupported: fileResult.unsupported.length,
       durationMs: Date.now() - fileStartedAt,
+      reused: false,
       result: fileResult,
     });
     classes.push(...(result.classes || []));
@@ -1802,6 +1895,7 @@ function compileJavaFiles(inputPaths, options = {}) {
     classes: classes.length,
     written: written.length,
     unsupported: unsupported.length,
+    reused: reusedCount,
     durationMs: Date.now() - compileStartedAt,
   });
   return {
@@ -1813,6 +1907,7 @@ function compileJavaFiles(inputPaths, options = {}) {
     classes,
     written,
     unsupported,
+    reused: reusedCount,
     results,
   };
 }
