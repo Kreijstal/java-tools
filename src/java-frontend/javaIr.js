@@ -98,6 +98,21 @@ const JAVA_IR_SCHEMA_ID = 'java-tools.java-frontend.java-ir';
 const JAVA_IR_SCHEMA_VERSION = 1;
 const JAVA_IR_AST_META_KEY = 'javaFrontendJavaIr';
 const SOURCE_METADATA_CACHE = new Map();
+// Non-host filesystems (browser ZenFS workspaces) must cache too: without
+// this, every compiled file re-parses every sibling source -- quadratic
+// across a corpus and fatal in the browser. Keyed per filesystem instance so
+// distinct workspaces never collide; entries live as long as the workspace.
+const SOURCE_METADATA_BY_FS = new WeakMap();
+
+function sourceMetadataCacheFor(fileSystem) {
+  if (fileSystem === hostFs) return SOURCE_METADATA_CACHE;
+  let perFs = SOURCE_METADATA_BY_FS.get(fileSystem);
+  if (!perFs) {
+    perFs = new Map();
+    SOURCE_METADATA_BY_FS.set(fileSystem, perFs);
+  }
+  return perFs;
+}
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && Object.getPrototypeOf(value) === Object.prototype;
@@ -447,8 +462,9 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   const directory = sourcePathIsDirectory
     ? pathModule.resolve(sourcePath)
     : pathModule.dirname(pathModule.resolve(sourcePath));
-  const useCache = fileSystem === hostFs && options.cacheSourceMetadata !== false;
-  if (useCache && SOURCE_METADATA_CACHE.has(directory)) return SOURCE_METADATA_CACHE.get(directory);
+  const useCache = options.cacheSourceMetadata !== false;
+  const metadataCache = useCache ? sourceMetadataCacheFor(fileSystem) : null;
+  if (metadataCache && metadataCache.has(directory)) return metadataCache.get(directory);
   const metadata = {
     classBySimpleName: new Map(),
     classFieldsByInternalName: new Map(),
@@ -470,7 +486,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   try {
     files = collectJavaFiles(directory);
   } catch (_) {
-    if (useCache) SOURCE_METADATA_CACHE.set(directory, metadata);
+    if (metadataCache) metadataCache.set(directory, metadata);
     return metadata;
   }
   const documents = [];
@@ -5439,6 +5455,9 @@ function lowerExpressionToJavaIrValueAsDescriptor(expression, context, descripto
       && expression.operator === '!'
       && descriptor === 'Z') {
     const value = lowerExpressionToJavaIrValueAsDescriptor(expression.operand, context, 'Z');
+    if (!value && process.env.JAVAC_JS_DEBUG) {
+      console.error('[javac.js debug] ! operand unresolved:', JSON.stringify(expression.operand).slice(0, 400));
+    }
     if (value) return { kind: 'UnaryValue', type: 'Z', operator: '!', value };
   }
   const expectedCall = lowerMethodInvocationWithExpectedDescriptor(expression, context, descriptor);

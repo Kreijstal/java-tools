@@ -36,17 +36,10 @@ module.exports = {
         // Add canvas to DOM - look for AWT container or create one
         let awtContainer = document.getElementById('awt-container');
         if (!awtContainer) {
+          // Host pages pre-create #awt-container inside their applet stage;
+          // this fallback stays neutral so embedders never see debug chrome.
           awtContainer = document.createElement('div');
           awtContainer.id = 'awt-container';
-          awtContainer.style.cssText = 'margin: 10px 0; padding: 10px; border: 1px solid #ddd; background: #f9f9f9;';
-          
-          // Add title
-          const title = document.createElement('h3');
-          title.textContent = 'Java AWT/Applet Output';
-          title.style.cssText = 'margin: 0 0 10px 0; color: #333;';
-          awtContainer.appendChild(title);
-          
-          // Insert after output section or append to body
           const outputSection = document.getElementById('output')?.parentNode;
           if (outputSection && outputSection.parentNode) {
             outputSection.parentNode.insertBefore(awtContainer, outputSection.nextSibling);
