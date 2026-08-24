@@ -1001,6 +1001,25 @@ test('SourceDataLine audio priority uses the scheduler clock', (t) => {
   t.end();
 });
 
+test('suspended browser audio does not starve other JVM threads', (t) => {
+  const thread = { id: 7 };
+  const output = {
+    context: { state: 'suspended' },
+    queuedSeconds: () => 0,
+    write() {},
+  };
+  const line = { audioOutput: output, isOpen: true, drainModel: null };
+  const jvm = {
+    clock: { millis: () => 1250 },
+    _audioPriority: null,
+  };
+  SourceDataLine.methods['write([BII)I'](
+    jvm, line, [[1, 2, 3, 4], 0, 4], thread);
+  t.equal(jvm._audioPriority, null,
+    'a suspended AudioContext cannot renew scheduler priority');
+  t.end();
+});
+
 test('SourceDataLine avoids copying for outputs that accept guest slices', (t) => {
   const writes = [];
   const output = {

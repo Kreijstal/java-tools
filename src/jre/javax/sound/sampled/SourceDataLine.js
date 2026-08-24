@@ -158,6 +158,7 @@ module.exports = {
         }
         if (thread && obj.audioOutput &&
             typeof obj.audioOutput.queuedSeconds === "function" &&
+            obj.audioOutput.context?.state !== "suspended" &&
             obj.audioOutput.queuedSeconds() < 0.04) {
           jvm._audioPriority = {
             thread,
