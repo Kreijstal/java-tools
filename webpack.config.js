@@ -27,7 +27,10 @@ const jvmDebugConfig = {
     alias: {
       // Isomorphic window module - use browser implementation for webpack builds
       'window': path.resolve(__dirname, 'src/isomorphic/window.browser.js'),
-      'os': path.resolve(__dirname, 'src/isomorphic/os.browser.js')
+      'os': path.resolve(__dirname, 'src/isomorphic/os.browser.js'),
+      'net': path.resolve(__dirname, 'src/isomorphic/net.browser.js'),
+      'dns': path.resolve(__dirname, 'src/isomorphic/dns.browser.js'),
+      'zlib': path.resolve(__dirname, 'src/isomorphic/zlib.browser.js')
     },
     fallback: {
       // Provide browser-compatible alternatives for Node.js modules
@@ -39,9 +42,6 @@ const jvmDebugConfig = {
       "process": require.resolve("process/browser"),
       "v8": false, // Make v8 return false instead of trying to load it
       "crypto": false,
-      "zlib": false,
-      "dns": false,
-      "net": false,
       "url": require.resolve("url/"),
       // Handle node-fetch v3 and Node.js native modules
       "node-fetch": false, // Use browser fetch instead

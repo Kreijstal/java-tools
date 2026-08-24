@@ -28,6 +28,8 @@ tools/krakatau/Krakatau
 # Build output
 build/
 dist/
+!browser-runtime/
+!browser-runtime/**
 
 # Playwright test artifacts
 test-results/
