@@ -98,20 +98,26 @@ const JAVA_IR_SCHEMA_ID = 'java-tools.java-frontend.java-ir';
 const JAVA_IR_SCHEMA_VERSION = 1;
 const JAVA_IR_AST_META_KEY = 'javaFrontendJavaIr';
 const SOURCE_METADATA_CACHE = new Map();
-// Non-host filesystems (browser ZenFS workspaces) must cache too: without
-// this, every compiled file re-parses every sibling source -- quadratic
-// across a corpus and fatal in the browser. Keyed per filesystem instance so
-// distinct workspaces never collide; entries live as long as the workspace.
-const SOURCE_METADATA_BY_FS = new WeakMap();
+const SOURCE_METADATA_CACHE_BY_FILESYSTEM = new WeakMap();
 
-function sourceMetadataCacheFor(fileSystem) {
+function sourceMetadataCacheFor(fileSystem, options = {}) {
+  if (options.cacheSourceMetadata === false) return null;
   if (fileSystem === hostFs) return SOURCE_METADATA_CACHE;
-  let perFs = SOURCE_METADATA_BY_FS.get(fileSystem);
-  if (!perFs) {
-    perFs = new Map();
-    SOURCE_METADATA_BY_FS.set(fileSystem, perFs);
+  // Browser/editor filesystems are mutable and have no portable mtime contract,
+  // so callers must opt in after they have finished populating the source tree.
+  // Keep their entries scoped to the filesystem instance: two workspaces may
+  // use the same absolute paths without sharing metadata.
+  if (options.cacheSourceMetadata !== true
+    || (typeof fileSystem !== 'object' && typeof fileSystem !== 'function')
+    || fileSystem === null) {
+    return null;
   }
-  return perFs;
+  let cache = SOURCE_METADATA_CACHE_BY_FILESYSTEM.get(fileSystem);
+  if (!cache) {
+    cache = new Map();
+    SOURCE_METADATA_CACHE_BY_FILESYSTEM.set(fileSystem, cache);
+  }
+  return cache;
 }
 
 function isPlainObject(value) {
@@ -462,8 +468,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   const directory = sourcePathIsDirectory
     ? pathModule.resolve(sourcePath)
     : pathModule.dirname(pathModule.resolve(sourcePath));
-  const useCache = options.cacheSourceMetadata !== false;
-  const metadataCache = useCache ? sourceMetadataCacheFor(fileSystem) : null;
+  const metadataCache = sourceMetadataCacheFor(fileSystem, options);
   if (metadataCache && metadataCache.has(directory)) return metadataCache.get(directory);
   const metadata = {
     classBySimpleName: new Map(),
@@ -648,7 +653,7 @@ function sourceDirectoryMetadata(sourcePath, sourcePathIsDirectory = false, opti
   for (const document of documents) {
     for (const declaration of document.root.typeDeclarations || []) collectMembers(document, declaration);
   }
-  if (useCache) SOURCE_METADATA_CACHE.set(directory, metadata);
+  if (metadataCache) metadataCache.set(directory, metadata);
   return metadata;
 }
 

@@ -122,6 +122,46 @@ test('JavaFrontend.compile compiles an AST document and preserves serializable m
   t.end();
 });
 
+test('custom workspace filesystems can opt into filesystem-scoped source metadata caching', (t) => {
+  const sourceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-workspace-cache-'));
+  const outputDir = path.join(sourceRoot, 'classes');
+  const alphaPath = path.join(sourceRoot, 'Alpha.java');
+  const betaPath = path.join(sourceRoot, 'Beta.java');
+  fs.writeFileSync(alphaPath, 'class Alpha { Beta value; }');
+  fs.writeFileSync(betaPath, 'class Beta {}');
+
+  let sourceReads = 0;
+  const workspaceFs = {};
+  for (const key of Object.keys(fs)) {
+    workspaceFs[key] = typeof fs[key] === 'function' ? fs[key].bind(fs) : fs[key];
+  }
+  workspaceFs.readFileSync = (filePath, ...args) => {
+    if (String(filePath).endsWith('.java')) sourceReads += 1;
+    return fs.readFileSync(filePath, ...args);
+  };
+
+  try {
+    const options = {
+      fileSystem: workspaceFs,
+      pathModule: path,
+      sourceRoot,
+      outputDir,
+      cacheSourceMetadata: true,
+    };
+    frontend.compileJavaFile(alphaPath, options);
+    const readsAfterFirstCompile = sourceReads;
+    frontend.compileJavaFile(betaPath, options);
+
+    t.ok(readsAfterFirstCompile >= 3,
+      'the first compile reads its input and indexes both workspace sources');
+    t.equal(sourceReads, readsAfterFirstCompile + 1,
+      'the second compile reads only its own input and reuses workspace metadata');
+  } finally {
+    fs.rmSync(sourceRoot, { recursive: true, force: true });
+  }
+  t.end();
+});
+
 test('frontend emits verifier StackMapTable frames for branches and exception handlers', (t) => {
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'java-frontend-stackmaps-'));
   try {
